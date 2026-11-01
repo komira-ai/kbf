@@ -15,7 +15,7 @@ use support::{BEAT, Farm, OPERATOR, Pki, STATE, ci_token, client_config};
 #[tokio::test]
 async fn an_enrolled_updater_is_answered_over_mutual_tls() {
     let farm = Farm::start("farm-mtls").await;
-    let who = farm.pki.updater("d1", HostRole::Daemon);
+    let who = farm.pki.updater("d1", HostRole::DAEMON);
     farm.at(2_000);
     let (code, body) = farm.beat(&who, BEAT).await.expect("answered");
     assert_eq!((code, body.as_str()), (200, r#"{"reply":"nothing"}"#));
@@ -50,7 +50,7 @@ async fn a_client_without_a_certificate_of_this_farm_is_not_served() {
     assert!(refused.await.is_err(), "no client certificate");
 
     let other = Pki::new();
-    let forged = other.updater("d1", HostRole::Daemon);
+    let forged = other.updater("d1", HostRole::DAEMON);
     assert!(
         farm.beat(&forged, BEAT).await.is_err(),
         "another CA's certificate"
@@ -96,7 +96,7 @@ async fn ci_sets_the_state_and_the_operator_reads_it_over_https() {
         .await
         .expect("answered");
     assert_eq!(code, 200);
-    farm.beat(&farm.pki.updater("d1", HostRole::Daemon), BEAT)
+    farm.beat(&farm.pki.updater("d1", HostRole::DAEMON), BEAT)
         .await
         .expect("answered");
     let status = farm.status().await;
@@ -126,8 +126,8 @@ async fn after_a_restart_the_state_stands_and_an_updating_host_is_counted() {
     assert_eq!(status["quiet"], true);
 
     let (d1, d2) = (
-        farm.pki.updater("d1", HostRole::Daemon),
-        farm.pki.updater("d2", HostRole::Daemon),
+        farm.pki.updater("d1", HostRole::DAEMON),
+        farm.pki.updater("d2", HostRole::DAEMON),
     );
     let busy = BEAT.replace("}", r#","updating":"2.0"}"#);
     let (_, early) = farm.beat(&d1, &busy).await.expect("answered");
@@ -162,7 +162,7 @@ async fn bad_clients_do_not_stop_the_listener() {
         .await
         .expect("connected");
     drop(silent);
-    let who = farm.pki.updater("d1", HostRole::Daemon);
+    let who = farm.pki.updater("d1", HostRole::DAEMON);
     let (code, _) = farm.beat(&who, BEAT).await.expect("still served");
     assert_eq!(code, 200);
 }

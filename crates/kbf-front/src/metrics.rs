@@ -22,6 +22,8 @@ mod execute;
 pub use execute::{ErrorCause, ErrorCounts, ExecuteMetrics, OpenExecute};
 mod whole;
 pub use whole::WholeGauges;
+mod prediction;
+pub use prediction::{PREDICTION_AXES, PREDICTION_BUCKETS, PREDICTION_UNSET, PredictionTotals};
 mod shadow;
 pub use shadow::{SHADOW_SKIPS, ShadowBucket, ShadowLevel, ShadowTotals};
 mod tier;
@@ -223,7 +225,7 @@ impl Histogram {
 
     /// The `_bucket`, `_sum` and `_count` lines of family `name`, each with `labels`
     /// (`key="value"` pairs, comma-separated, or empty) before `le`.
-    fn render(&self, out: &mut String, name: &str, labels: &str) {
+    pub(crate) fn render(&self, out: &mut String, name: &str, labels: &str) {
         let sep = if labels.is_empty() { "" } else { "," };
         let mut cumulative = 0;
         let bounds = self.unit.bounds().iter().map(|&b| self.unit.print(b));
@@ -466,6 +468,10 @@ pub struct CacheMetrics {
     /// Finished attempts the learned-sizes shadow compared with its estimate, by the
     /// level the estimate came from and how the attempt fell (`kbf_estimator_shadow_total`).
     pub estimator_shadow: ShadowTotals,
+    /// The placement predictions: the operations given one, why the others got none, how
+    /// finished runs fell against theirs, and the nodes with a CPU quota under
+    /// `--placement-load on` (`kbf_prediction_*`, `kbf_placement_cpu_limited_nodes`).
+    pub prediction: PredictionTotals,
     /// Write-tier calls queued on or running on the blocking pool.
     pub tier_in_flight: Gauge,
     /// The wait of one write-tier call for a blocking-pool thread.
@@ -536,6 +542,7 @@ impl Default for CacheMetrics {
             sched_leases: Level::default(),
             sched_whole: WholeGauges::default(),
             estimator_shadow: ShadowTotals::default(),
+            prediction: PredictionTotals::default(),
             tier_in_flight: Gauge::default(),
             tier_wait: Histogram::new(Unit::Seconds),
             tier_call: Histogram::new(Unit::Seconds),
@@ -793,6 +800,7 @@ impl CacheMetrics {
         );
         self.sched_whole.render(&mut out);
         self.estimator_shadow.render(&mut out);
+        self.prediction.render(&mut out);
         out.gauge(
             "kbf_tier_in_flight",
             "Write-tier calls queued on or running on the blocking pool",

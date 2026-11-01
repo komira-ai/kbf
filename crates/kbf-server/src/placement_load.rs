@@ -2,7 +2,8 @@
 //!
 //! kbf builds every scheduler with an explicit load configuration ([`PlacementLoad::config`])
 //! instead of taking the scheduler library's default, so that raising the library's revision
-//! cannot change where the farm places work. The server takes it from this flag; the test
+//! cannot change where the farm places work: the mode from the flag and the profile switches
+//! written out in this file, which the tests pin. The server takes it from this flag; the test
 //! farm, the simulation cell and the estimator replay pass [`PlacementLoad::Off`].
 
 use kbf_sched::LoadConfig;
@@ -17,6 +18,23 @@ pub enum PlacementLoad {
     /// predicted to add.
     On,
 }
+
+/// What a lease with a learned profile is charged at least of its predicted cores, in
+/// thousandths (`f` of the scheduler: a constant-duty lease is charged all of them).
+pub const CPU_FLOOR_PERMILLE: u32 = 1000;
+/// Whether a key with a learned profile is charged its cores per minute and checked over the
+/// next half hour. Read only under `--usage-profiles on`, which gives the scheduler the curves
+/// to read; under `off` and `record` it has none, and the switch charges nothing.
+pub const PROFILE: bool = true;
+/// Whether a key with a learned profile is charged the profile's remaining maximum memory.
+pub const PROFILE_MEMORY: bool = true;
+/// The least share of its flat cores, in thousandths, a profile charges a lease (`g`).
+pub const PROFILE_FLOOR_PERMILLE: u32 = 750;
+/// How many minutes beyond the P90 of its key's wall time a new lease is charged for.
+pub const EXPECTED_LIFE_DELTA_MINUTES: u32 = 2;
+/// The node guard on flat memory, in thousandths: the flat memory charged to the leases of a
+/// worker, an action's own included, stays within the worker's memory.
+pub const FLAT_MEMORY_SLACK_PERMILLE: u32 = 0;
 
 impl PlacementLoad {
     /// The scheduler's name for this mode.
@@ -38,12 +56,20 @@ impl PlacementLoad {
         }
     }
 
-    /// The load configuration a scheduler is built with: this mode, and the scheduler's own
-    /// values for every other setting.
+    /// The load configuration a scheduler is built with: this mode, the profile switches
+    /// written out here (the values the scheduler library has today, which a raise of its
+    /// revision does not change under the farm), and the scheduler's own values for every
+    /// other setting.
     #[must_use]
     pub fn config(self) -> LoadConfig {
         LoadConfig {
             mode: self.mode(),
+            cpu_floor_permille: CPU_FLOOR_PERMILLE,
+            profile: PROFILE,
+            profile_memory: PROFILE_MEMORY,
+            profile_floor_permille: PROFILE_FLOOR_PERMILLE,
+            expected_life_delta_minutes: Some(EXPECTED_LIFE_DELTA_MINUTES),
+            flat_memory_slack_permille: Some(FLAT_MEMORY_SLACK_PERMILLE),
             ..LoadConfig::default()
         }
     }

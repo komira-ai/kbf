@@ -81,6 +81,7 @@ fn request<const N: usize>(qos: Qos, kind: LeaseKind, needs: [(&str, &str); N]) 
         needs: kbf_caps::Request::parse(needs).expect("a request"),
         hermetic: true,
         do_not_cache: true,
+        whole_worker: false,
     }
 }
 

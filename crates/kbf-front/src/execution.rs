@@ -512,6 +512,8 @@ pub struct ExecutionService<D> {
     defaulted_log: Quiet,
     /// The levels the `x-kbf-qos` header may name.
     qos_allow: QosAllow,
+    /// Every `action` lease owns its whole worker ([`Self::with_exclusive_actions`]).
+    exclusive_actions: bool,
     /// Holds the log lines of a header that asked for a level it was not granted to a
     /// few a minute.
     qos_log: Quiet,
@@ -544,6 +546,7 @@ impl<D> ExecutionService<D> {
             default_platform: DefaultPlatform::NONE,
             defaulted_log: Quiet::default(),
             qos_allow: QosAllow::DEFAULT,
+            exclusive_actions: false,
             qos_log: Quiet::default(),
         }
     }
@@ -553,6 +556,18 @@ impl<D> ExecutionService<D> {
     #[must_use]
     pub const fn with_qos_allow(mut self, allow: QosAllow) -> Self {
         self.qos_allow = allow;
+        self
+    }
+
+    /// This service, asking the scheduler that every `action` lease own the whole worker it
+    /// lands on, all its CPUs and all its memory, so that one action runs per worker (instead
+    /// of booking what the platform names or the default). Placement only: the action digest
+    /// is the client's, and `kbf-book-cpus` and `kbf-book-mem-gib` are still read, checked
+    /// and recorded as hints but do not change what is booked. A `whole_machine` or `vm`
+    /// lease is as it was.
+    #[must_use]
+    pub const fn with_exclusive_actions(mut self, on: bool) -> Self {
+        self.exclusive_actions = on;
         self
     }
 
@@ -844,6 +859,7 @@ impl<D> ExecutionService<D> {
                 resources: booked,
                 hermetic: true,
                 do_not_cache: decoded.do_not_cache,
+                whole_worker: self.exclusive_actions && kind == LeaseKind::Action,
                 needs,
             },
             call: None,

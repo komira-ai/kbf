@@ -3,7 +3,7 @@
 //! without building the server, `verify-assets attestations` without GitHub, and
 //! `sudo-test` and `crun-tests` without root or systemd.
 //!
-//! - Run under any name but `kbf-server`, `gh`, `sudo`, `uname`, `id`, `systemd-sysusers` or
+//! - Run under any name but `kbf-server`, `gh`, `sudo`, `syft`, `uname`, `id`, `systemd-sysusers` or
 //!   `systemd-tmpfiles`, it is cargo: it
 //!   appends its arguments as one line to `target/debug/cargo-args` in its working
 //!   directory, "builds" by hard-linking itself to `target/debug/kbf-server`, and
@@ -41,6 +41,9 @@
 //!   signing check and a job that runs it leaves its arguments in its log.
 //!   With `XTASK_FAKE_INSTALLER_VERSION=<stamp>` and the one argument `--version` it
 //!   prints `kbf-installer 0.1.0+<stamp>` instead.
+//! - Run as `rustc`, it fails (a toolchain that is not there).
+//! - Run as `llvm-profdata merge -sparse -f <list> -o <out>`, it writes the files the list names, joined,
+//!   to `<out>`, and fails when one begins `corrupt`.
 //! - Run as `gh attestation verify <file> <flags>`, it appends its arguments as one line
 //!   to `gh-args` next to it, and verifies the file when `attested` next to it holds
 //!   the line `<SHA-256 of the file> <flags>`: the store of attestations, each the file
@@ -63,14 +66,17 @@
 //!   `garbage` (a reply that is not JSON), `refuse-ref` (a ref is refused with HTTP 422
 //!   `Validation Failed`), `race` (another run made the ref first, with another message),
 //!   `lose-ref-502` / `lose-ref-422` (the next ref is stored, and its reply is lost as that
-//!   HTTP status), or `fail-get:<code>` (every GET of a ref fails with that status).
+//!   HTTP status), `fail-get:<code>` (every GET of a ref fails with that status), or
+//!   `draft-release:<tag>:<times>` (the first `<times>` GETs of that tag's release answer
+//!   404, as GitHub answers a release that is still a draft; it counts in `gh-draft-asked`).
 //! - Run as `gh api -X <METHOD> <path> [--input -]` (the method first: the issue calls of
 //!   `advisories`), it appends `{"args": [...], "body": <JSON or null>}` as one line to
 //!   `gh-calls` next to it, and answers `{"number": 42, "html_url": ...}`. It reads the
 //!   body from stdin only with `--input -` on its arguments, as `gh` does: a call without
 //!   one is sent with no body and refused with HTTP 422, as GitHub refuses an issue with
-//!   no title (a POST to a path ending in `/cancel` needs none). With `gh-fault` next to it holding `empty-reply`, it answers a write with
-//!   nothing at all (an HTTP 204), and with `fail-write` it refuses a write with HTTP 404, and with `conflict` with HTTP 409.
+//!   no title (a POST to a path ending in `/cancel` or `/rerun-failed-jobs` needs none). With `gh-fault` next to it holding `empty-reply`, it answers a write with
+//!   nothing at all (an HTTP 204), and with `fail-write` it refuses a write with HTTP 404, and with `conflict` with HTTP 409,
+//!   and with `refuse-rerun` it refuses a write to a path ending in `/rerun-failed-jobs` with HTTP 403.
 //! - Run as `gh release create|upload <tag> <files> --repo <repo> ...`, it copies each
 //!   file into `releases/<tag>/` next to it (create makes that directory and fails if
 //!   it exists; a file already there fails the command, as GitHub refuses an asset
@@ -82,6 +88,9 @@
 //! - Run as `uname` (by name, from PATH, or by path), it is a host that is no platform of
 //!   ours: `-s` prints `Linux` and `-m` prints `riscv64` (or `XTASK_FAKE_MACHINE` when set). Run as `id`, `-u` prints 1000
 //!   (a user that is not root).
+//! - Run as `syft`, it prints the file `syft.json` next to it on stdout: what syft prints of an
+//!   image. (`pkg-image-sbom` runs it with an empty environment, so what it was given is tested
+//!   with `env` in `src/pkg_image_sbom/tests.rs`.)
 //! - Run as `systemd-sysusers` or `systemd-tmpfiles` (by name, from PATH, or by path), it
 //!   appends `<name> <arguments>` as one line to `systemd-args` next to the fake's own
 //!   file and exits 0: the host's systemd, as `packaging/install.sh` calls it.
@@ -192,8 +201,8 @@ fn kbf_asked(argv0: &str) -> Option<ExitCode> {
             print!("{}", kbf_says(argv0).1);
             Some(ExitCode::FAILURE)
         }
-        // Long enough for any limit a test sets, short enough that a limit which is broken
-        // fails the test's own time assertion instead of hanging the suite.
+        // Long enough for any limit a test sets; a limit that is broken leaves the test
+        // running until the test runner's per-test limit ends it.
         Ok("hang") => {
             std::thread::sleep(std::time::Duration::from_secs(120));
             Some(ExitCode::FAILURE)
@@ -494,6 +503,21 @@ fn api(dir: &Path, path: &str) -> ExitCode {
         eprintln!("gh: Error (HTTP {code})");
         return ExitCode::FAILURE;
     }
+    if let Some(spec) = fault.trim().strip_prefix("draft-release:") {
+        let (tag, times) = spec.rsplit_once(':').expect("draft-release:<tag>:<times>");
+        if path.ends_with(&format!("/releases/tags/{tag}")) {
+            let counter = dir.join("gh-draft-asked");
+            let asked: u32 = std::fs::read_to_string(&counter)
+                .ok()
+                .and_then(|text| text.trim().parse().ok())
+                .unwrap_or(0);
+            std::fs::write(&counter, (asked + 1).to_string()).expect("gh-draft-asked");
+            if asked < times.parse::<u32>().expect("a count") {
+                eprintln!("gh: Not Found (HTTP 404)");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
     let store = api_store(dir);
     match store.get(path).cloned() {
         Some(answer) => {
@@ -628,13 +652,18 @@ fn issues_write(dir: &Path, args: &[String]) -> ExitCode {
         .open(dir.join("gh-calls"))
         .expect("gh-calls");
     writeln!(log, "{}", serde_json::json!({ "args": args, "body": body })).expect("gh-calls");
-    if body.is_null() && !args[3].ends_with("/cancel") {
+    let needs_no_body = args[3].ends_with("/cancel") || args[3].ends_with("/rerun-failed-jobs");
+    if body.is_null() && !needs_no_body {
         eprintln!("gh: Validation Failed (HTTP 422)");
         return ExitCode::FAILURE;
     }
     let fault = std::fs::read_to_string(dir.join("gh-fault")).unwrap_or_default();
     if fault == "conflict" {
         eprintln!("gh: Conflict (HTTP 409)");
+        return ExitCode::FAILURE;
+    }
+    if fault == "refuse-rerun" && args[3].ends_with("/rerun-failed-jobs") {
+        eprintln!("gh: Forbidden (HTTP 403)");
         return ExitCode::FAILURE;
     }
     if fault == "fail-write" {
@@ -764,6 +793,13 @@ fn systemd(name: &str, args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// `syft ...`: prints the SBOM a test wrote for it, the file `syft.json` next to it.
+fn syft(argv0: &str) -> ExitCode {
+    let json = std::fs::read_to_string(Path::new(argv0).with_file_name("syft.json"));
+    print!("{}", json.expect("syft.json"));
+    ExitCode::SUCCESS
+}
+
 /// `uname -s` and `uname -m` of a host with no platform of ours.
 fn uname(args: &[String]) -> ExitCode {
     match args {
@@ -776,6 +812,25 @@ fn uname(args: &[String]) -> ExitCode {
         }
         _ => return ExitCode::FAILURE,
     }
+    ExitCode::SUCCESS
+}
+
+/// `llvm-profdata merge -sparse -f <list> -o <out>`: writes the bytes of the files `<list>`
+/// names, one after another, to `<out>`; fails, as the tool does on a profile it cannot read,
+/// when one of them begins `corrupt`.
+fn llvm_profdata(args: &[String]) -> ExitCode {
+    assert_eq!(args.len(), 6, "merge -sparse -f <list> -o <out>: {args:?}");
+    assert_eq!(args[..3], ["merge", "-sparse", "-f"], "{args:?}");
+    let mut merged = Vec::new();
+    for name in std::fs::read_to_string(&args[3]).expect("list").lines() {
+        let bytes = std::fs::read(name).expect("input");
+        if bytes.starts_with(b"corrupt") {
+            eprintln!("llvm-profdata: invalid instrumentation profile data: {name}");
+            return ExitCode::FAILURE;
+        }
+        merged.extend_from_slice(&bytes);
+    }
+    std::fs::write(&args[5], merged).expect("out");
     ExitCode::SUCCESS
 }
 
@@ -803,8 +858,15 @@ fn main() -> ExitCode {
         gh(&argv0, &rest)
     } else if argv0.ends_with("/sudo") {
         sudo(&argv0, &rest)
+    } else if argv0.ends_with("/syft") {
+        syft(&argv0)
     } else if matches!(base, "systemd-sysusers" | "systemd-tmpfiles") {
         systemd(base, &rest)
+    } else if argv0.ends_with("/rustc") {
+        eprintln!("rustc: the toolchain is not installed");
+        ExitCode::FAILURE
+    } else if argv0.ends_with("/llvm-profdata") {
+        llvm_profdata(&rest)
     } else if argv0 == "uname" || argv0.ends_with("/uname") {
         uname(&rest)
     } else if argv0 == "id" || argv0.ends_with("/id") {

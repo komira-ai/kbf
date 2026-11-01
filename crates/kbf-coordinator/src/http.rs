@@ -7,7 +7,8 @@
 //! - **Control** (TLS, no client certificate): `POST /v1/desired` with CI's OIDC token as
 //!   the bearer and the desired state as JSON; `GET /v1/status` with the operator token as
 //!   the bearer; `GET /v1/convergence[?service=<name>]` with CI's OIDC token as the bearer
-//!   (the operator token is refused there; no query means `kbf`).
+//!   (the operator token is refused there; no query means `kbf`); `POST /v1/operator` with the
+//!   operator token as the bearer and an action as JSON (`crate::ops`; CI's token is refused).
 //!
 //! An answer is JSON, and an error is `{"error":"<code>"}` with a code from a closed set:
 //! never a claim value, a path or the text of an internal error.
@@ -25,6 +26,7 @@ use serde::Serialize;
 
 use crate::desired::KBF;
 use crate::identity::identity_of;
+use crate::ops::OperateError;
 use crate::service::{CiRefused, ConvergenceError, Coordinator, SetError};
 
 /// The path CI posts the desired state to.
@@ -36,8 +38,14 @@ pub const STATUS_PATH: &str = "/v1/status";
 /// The path CI reads whether the farm has converged from.
 pub const CONVERGENCE_PATH: &str = "/v1/convergence";
 
+/// The path an operator posts an action to.
+pub const OPERATOR_PATH: &str = "/v1/operator";
+
 /// The most bytes of a desired state read.
 pub const MAX_DESIRED_BYTES: usize = 4096;
+
+/// The most bytes of an operator action read.
+pub const MAX_OPERATOR_BYTES: usize = 4096;
 
 /// Which listener a request came in on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -114,6 +122,9 @@ where
         (Surface::Control, Method::POST, DESIRED_PATH) => {
             desired(coordinator, request, patience).await
         }
+        (Surface::Control, Method::POST, OPERATOR_PATH) => {
+            operator(coordinator, request, patience).await
+        }
         (Surface::Control, Method::GET, STATUS_PATH) => {
             match coordinator.status(bearer(&request)) {
                 Ok(status) => json(StatusCode::OK, &status),
@@ -136,7 +147,7 @@ where
             }
         }
         (Surface::Heartbeat, _, HEARTBEAT_PATH)
-        | (Surface::Control, _, DESIRED_PATH | STATUS_PATH | CONVERGENCE_PATH) => {
+        | (Surface::Control, _, DESIRED_PATH | OPERATOR_PATH | STATUS_PATH | CONVERGENCE_PATH) => {
             error(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed")
         }
         _ => error(StatusCode::NOT_FOUND, "not_found"),
@@ -180,9 +191,14 @@ where
         Some(HeartbeatRead {
             beat,
             services_dropped,
+            extras_dropped,
+            extras_dropped_facts,
         }) => {
             if let Some(why) = services_dropped {
                 coordinator.note_services_dropped(&identity, &why);
+            }
+            if let Some(why) = extras_dropped {
+                coordinator.note_extras_dropped(&identity, &why, &extras_dropped_facts);
             }
             json(StatusCode::OK, &coordinator.heartbeat(identity, beat))
         }
@@ -199,14 +215,45 @@ where
     let Some(body) = read(request, MAX_DESIRED_BYTES, patience).await else {
         return error(StatusCode::BAD_REQUEST, "bad_request");
     };
-    match coordinator.set_desired(token.as_deref(), &body).await {
-        Ok(desired) => json(StatusCode::OK, &desired),
+    match coordinator
+        .set_desired_noting(token.as_deref(), &body)
+        .await
+    {
+        Ok(set) => json(StatusCode::OK, &set),
         Err(SetError::Unauthorized(_)) => error(StatusCode::UNAUTHORIZED, "unauthorized"),
         Err(SetError::Unavailable) => error(StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
         Err(SetError::Forbidden) => error(StatusCode::FORBIDDEN, "forbidden"),
         Err(SetError::Invalid(_)) => error(StatusCode::BAD_REQUEST, "bad_request"),
-        Err(SetError::Store(why)) => {
+        Err(why @ (SetError::Store(_) | SetError::Ops(_))) => {
             tracing::error!(%why, "the desired state could not be stored");
+            error(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+        }
+    }
+}
+
+async fn operator<B>(coordinator: &Coordinator, request: Request<B>, patience: Duration) -> Answer
+where
+    B: Body,
+    B::Error: Into<BoxError>,
+{
+    // The token first: a caller without it costs no read of the body and learns nothing from
+    // its size or its stalling.
+    let token = bearer(&request).map(str::to_owned);
+    if coordinator.operator(token.as_deref()).is_err() {
+        return error(StatusCode::UNAUTHORIZED, "unauthorized");
+    }
+    let Some(body) = read(request, MAX_OPERATOR_BYTES, patience).await else {
+        return error(StatusCode::BAD_REQUEST, "bad_request");
+    };
+    match coordinator.operate(token.as_deref(), &body) {
+        Ok(entry) => json(StatusCode::OK, &entry),
+        Err(OperateError::Unauthorized(_)) => error(StatusCode::UNAUTHORIZED, "unauthorized"),
+        Err(why @ (OperateError::Invalid(_) | OperateError::Capped { .. })) => {
+            tracing::warn!(%why, "refused an operator action");
+            error(StatusCode::BAD_REQUEST, "bad_request")
+        }
+        Err(OperateError::Store(why)) => {
+            tracing::error!(%why, "the ops file could not be written");
             error(StatusCode::INTERNAL_SERVER_ERROR, "internal")
         }
     }

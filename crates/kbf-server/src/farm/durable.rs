@@ -79,6 +79,9 @@
 //!   deadline on the store's clock), kept until it is returned to placement, so a
 //!   successor process serves the node as the operator left it, and the other frontends
 //!   of the store apply it at their next intake poll;
+//! - `cordon-owner/<worker>`: who owns that cordon (`operator`, or `updater:<unit>`), read
+//!   for the node detail and written by nothing yet (`farm::cordon_owner`). A row of its
+//!   own, outside the `cordon/` scan, so a frontend that does not know it never reads it;
 //! - `est/<instance>/<platform>/<basis>/<shape>/<cfg>`: one size summary of the learned-sizes
 //!   shadow ([`crate::learned`]): a version byte and the estimator's own checksummed row.
 //!   Never in the transaction of a requeue or a finish: a summary an own-limit kill changed
@@ -291,7 +294,6 @@ pub enum StateError {
 /// The errors of the core's rows ([`js_store`]) are the farm's own, variant for variant. The
 /// core has no encode error of the log's kind: its codec's text is a row that cannot be
 /// written, which is [`StateError::Corrupt`] here.
-#[cfg(feature = "farm-core-js")]
 impl From<js_store::StateError> for StateError {
     fn from(error: js_store::StateError) -> Self {
         match error {
@@ -1201,7 +1203,6 @@ impl Farm {
     /// The store cannot be read or written, or holds a row that is not one the scheduler
     /// wrote.
     pub fn with_state(mut self, state: Option<StateStore>) -> Result<Self, StateError> {
-        #[cfg(feature = "farm-core-js")]
         if let super::driver::Driver::Js(js) = &mut self.driver {
             let epoch = js.keep_in(state, &self.settings)?;
             self.term = epoch.unwrap_or(self.term);
@@ -1605,9 +1606,16 @@ impl State {
         // over a store, so no client holds one for two frontends of a store to answer.
         self.side.machine = FarmMachine::new(durable.generation()?.unwrap_or(epoch));
         let now = self.engine.ambient.wall();
+        // The summaries come first: a queued operation is predicted from them as it is read
+        // back (`--placement-predictions`), by a lookup in memory. Off reads none and leaves
+        // them as they are.
+        if !self.side.learned.off() {
+            self.side.learned.restore(&durable.estimates()?);
+        }
         let mut recovered = Vec::new();
         let mut keyed = Vec::new();
         let mut walled = Vec::new();
+        let mut predicted = Vec::new();
         // A start takes up the operations that wait for a lease, and none that holds one:
         // the lease belongs to the frontend its node is connected to, which may be another
         // than this. A leased operation is taken up when its node says `Hello` here
@@ -1624,6 +1632,9 @@ impl State {
             if let Some(wall) = op.max_wall {
                 walled.push((op.operation, wall));
             }
+            if let Some(prediction) = self.side.predict_stored(&self.engine.sched, &op) {
+                predicted.push((op.operation, prediction));
+            }
             recovered.push(self.engine.take_stored(&mut self.side, op, now));
         }
         // The first blocks of ids are reserved here, past everything any frontend of the
@@ -1635,10 +1646,6 @@ impl State {
         self.engine.sched.restore_floors(stored.floors);
         self.engine.sched.restore_key_floors(stored.key_floors);
         let stored_names = stored.key_names;
-        // Off reads no size summaries and leaves them as they are.
-        if !self.side.learned.off() {
-            self.side.learned.restore(&durable.estimates()?);
-        }
         self.engine
             .sched
             .recover(epoch, first_operation, seqs.start, recovered);
@@ -1647,6 +1654,11 @@ impl State {
         // first placement round: the whole-node drain order and deadlines read it.
         for (operation, wall) in walled {
             self.engine.sched.set_max_wall(operation, wall);
+        }
+        // So is the predicted cost of a queued operation: it is not in the store, and the
+        // first placement round after the start reads it.
+        for (operation, prediction) in predicted {
+            self.engine.sched.set_cost(operation, prediction);
         }
         // The size keys come from the store's own rows, not from the requests: only `on`
         // reads them. A recovered lease keeps the request the store holds; a key floor

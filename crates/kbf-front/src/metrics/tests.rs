@@ -257,6 +257,10 @@ fn every_family_is_printed_once_with_its_type() {
             "kbf_sched_leases gauge",
             "kbf_estimator_shadow_total counter",
             "kbf_estimator_shadow_skipped_total counter",
+            "kbf_prediction_made_total counter",
+            "kbf_prediction_unset_total counter",
+            "kbf_prediction_vs_run_total counter",
+            "kbf_placement_cpu_limited_nodes gauge",
             "kbf_tier_in_flight gauge",
             "kbf_storage_open_write_fds gauge",
             "kbf_storage_write_pool_queue gauge",
@@ -414,6 +418,60 @@ fn the_shadow_totals_print_each_level_and_bucket_under_its_own_label() {
     assert_eq!(skips.len(), SHADOW_SKIPS.len());
     assert!(skips.contains(&r#"kbf_estimator_shadow_skipped_total{reason="no_os"} 4"#));
     assert!(skips.contains(&r#"kbf_estimator_shadow_skipped_total{reason="kind"} 0"#));
+}
+
+/// Catches: `made` printed under another series, a reason or an axis and bucket printed under
+/// another's label (a dashboard would read `cold` as `missing`, or `under` as `over`), a
+/// series missing from the scrape, a count of one pair leaking into its neighbour, and an
+/// index past the end that is not ignored.
+#[test]
+fn the_prediction_totals_print_each_series_under_its_own_label() {
+    let m = CacheMetrics::default();
+    m.prediction.set_made(11);
+    for (reason, label) in PREDICTION_UNSET.iter().enumerate() {
+        m.prediction.set_unset(reason, 100 + reason as u64);
+        assert_eq!(m.prediction.unset(reason), 100 + reason as u64, "{label}");
+    }
+    for (axis, bucket) in [(0, 2), (1, 0), (2, 1)] {
+        m.prediction
+            .set_vs_run(axis, bucket, 20 + (axis * 3 + bucket) as u64);
+    }
+    m.prediction.set_unset(99, 1);
+    m.prediction.set_vs_run(3, 0, 1);
+    m.prediction.set_vs_run(0, 3, 1);
+    m.prediction.set_cpu_limited_nodes(4);
+    assert_eq!(m.prediction.made(), 11);
+    assert_eq!(m.prediction.unset(99), 0);
+    assert_eq!(m.prediction.vs_run(3, 0), 0);
+    assert_eq!(m.prediction.vs_run(0, 3), 0);
+    assert_eq!(m.prediction.cpu_limited_nodes(), 4);
+
+    let text = m.render();
+    assert_eq!(
+        lines(&text, "kbf_prediction_made_total "),
+        ["kbf_prediction_made_total 11"]
+    );
+    let unset = lines(&text, "kbf_prediction_unset_total{");
+    assert_eq!(unset.len(), 8);
+    assert!(unset.contains(&r#"kbf_prediction_unset_total{reason="missing"} 100"#));
+    assert!(unset.contains(&r#"kbf_prediction_unset_total{reason="stale"} 101"#));
+    assert!(unset.contains(&r#"kbf_prediction_unset_total{reason="cold"} 102"#));
+    assert!(unset.contains(&r#"kbf_prediction_unset_total{reason="corrupt"} 103"#));
+    assert!(unset.contains(&r#"kbf_prediction_unset_total{reason="over_cap"} 104"#));
+    assert!(unset.contains(&r#"kbf_prediction_unset_total{reason="kind"} 105"#));
+    assert!(unset.contains(&r#"kbf_prediction_unset_total{reason="no_os"} 106"#));
+    assert!(unset.contains(&r#"kbf_prediction_unset_total{reason="no_subject"} 107"#));
+    let vs_run = lines(&text, "kbf_prediction_vs_run_total{");
+    assert_eq!(vs_run.len(), 9);
+    assert!(vs_run.contains(&r#"kbf_prediction_vs_run_total{axis="cpu",bucket="over"} 22"#));
+    assert!(vs_run.contains(&r#"kbf_prediction_vs_run_total{axis="mem",bucket="under"} 23"#));
+    assert!(vs_run.contains(&r#"kbf_prediction_vs_run_total{axis="life",bucket="fit"} 27"#));
+    assert!(vs_run.contains(&r#"kbf_prediction_vs_run_total{axis="cpu",bucket="under"} 0"#));
+    assert!(vs_run.contains(&r#"kbf_prediction_vs_run_total{axis="mem",bucket="over"} 0"#));
+    assert_eq!(
+        lines(&text, "kbf_placement_cpu_limited_nodes "),
+        ["kbf_placement_cpu_limited_nodes 4"]
+    );
 }
 
 /// Asserts that each cause of an Execute's end bumps its own series and no other: an

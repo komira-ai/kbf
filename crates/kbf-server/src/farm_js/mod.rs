@@ -11,30 +11,42 @@
 //!   says an operation is) and `doneof/` (the name and action of a finished operation).
 //! - [`load`]: the load of the store, with the checks `js-store` leaves to its embedder and
 //!   this server's reader makes.
+//! - [`ablation`]: the `kbf_ablation_*` counters that tell the rows of the placement ablation
+//!   apart on `/metrics`.
 //! - [`adapter`]: [`KbfAdapter`], the core's `Adapter`; [`host`]: what a host does around
-//!   the core's calls with it; [`record`]: the events it tells the invocation recorder;
+//!   the core's calls with it; the events it tells the invocation recorder are those of
+//!   [`crate::run_record::Recording`], which the farm's own side tells too;
 //!   [`open`]: the core's configuration, storage, metrics and admission.
 //!
-//! Nothing here is wired into the running server: the farm writes its rows through its own
-//! store layer and drives its own scheduler. The tests run the scenario of the store layer's
-//! golden files through `js-store` and require the same rows, and the scripted sessions of
-//! `tests/farm_core_trace` through the core and require the same text.
+//! `--scheduler-core js` runs the farm on these ([`crate::farm`] dispatches on the core, and
+//! `crate::farm::js` is the hot path over them): the rows go to the state store through
+//! `js-store`, and the scheduler is driven by `js-server-core`. The legacy core still writes
+//! its rows through its own store layer and drives its own scheduler. The tests run the
+//! scenario of the store layer's golden files through `js-store` and require the same rows,
+//! and the scripted sessions of `tests/farm_core_trace` through the core and require the
+//! same text.
 
+pub(crate) mod ablation;
 pub mod adapter;
 pub mod codec;
 pub mod dispatch;
 pub mod ext;
 mod facts;
 pub mod host;
+mod learning;
 pub mod load;
 pub mod open;
-mod record;
 mod report_hooks;
+pub(crate) mod usage;
 
 pub use adapter::{KbfAdapter, Outbound, Wall};
 pub use host::{Caller, Connection};
+#[cfg_attr(not(any(feature = "farm-core-js", test)), allow(unused_imports))]
+pub(crate) use learning::{Gate, write_behind_now, write_learned};
 pub use open::KbfObserver;
 
+#[cfg(test)]
+mod ablation_tests;
 #[cfg(test)]
 mod adapter_tests;
 #[cfg(test)]
@@ -50,8 +62,18 @@ mod failed_tests;
 #[cfg(test)]
 mod host_tests;
 #[cfg(test)]
+mod learning_tests;
+#[cfg(test)]
 mod load_tests;
+#[cfg(test)]
+mod placement_load_tests;
+#[cfg(test)]
+mod prediction_tests;
 #[cfg(test)]
 mod report_hooks_tests;
 #[cfg(test)]
 mod testing;
+#[cfg(test)]
+mod usage_on_tests;
+#[cfg(test)]
+mod usage_tests;

@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
 
 use kbf_estimator::Key;
-use kbf_front::{Finished, Recorder, Stage};
+use kbf_front::{Finished, Stage};
 use kbf_proto::worker::{self, LeaseOffer, Start, server_message};
 use kbf_sched::{DaemonInstance, FARM_RERUNS, Requeue, RequeueReason, Scheduler};
 use kbf_types::{
@@ -24,7 +24,8 @@ use super::handover::show;
 use super::{Detail, Outbound, START_VALIDITY_MS, StreamId, finished_of, refused_as, wire_lease};
 use crate::action_usage::Subject;
 use crate::learned::{Learned, Row};
-use crate::machine::{FarmMachine, Platform, Sent, Waiter, stored_name};
+use crate::machine::{Booked, FarmMachine, Platform, Sent, Waiter, stored_name};
+use crate::run_record::Recording;
 use crate::stamp::Stamp;
 
 /// A worker's newest stream.
@@ -68,11 +69,9 @@ pub(in crate::farm) struct Side {
     pub links: BTreeMap<WorkerId, Link>,
     /// Nodes whose drain has paused, once logged.
     pub paused: BTreeSet<WorkerId>,
-    /// Where the invocation record's lease and finish events go ([`record`](super::record)).
-    pub recorder: Recorder,
-    /// The operations a recorded call waits on: the only ones [`record`](super::record)
-    /// tells the recorder of. Each leaves at its end.
-    pub recorded: BTreeSet<OperationId>,
+    /// Where the invocation record's lease and finish events go, and the operations it is
+    /// told of.
+    pub recording: Recording,
     /// The detail of a report whose answer is not settled yet, by lease: the answer's
     /// `done/` row is made from it when the store is written, and the answer is settled
     /// with it once the store has taken the rows.
@@ -90,6 +89,9 @@ pub(in crate::farm) struct Side {
     /// The pack-write counts on the newest heartbeat of each node that sent any
     /// ([`Farm::note_pack_writes`](super::Farm::note_pack_writes)).
     pub pack_writes: BTreeMap<WorkerId, worker::PackWriteCounts>,
+    /// The input cache counts on the newest heartbeat of each node that sent any
+    /// ([`Farm::note_input_cache`](super::Farm::note_input_cache)).
+    pub input_caches: BTreeMap<WorkerId, worker::InputCacheCounts>,
     /// What the accepted node-load readings of each node that sent any come to
     /// ([`Farm::note_node_load`](super::Farm::note_node_load)).
     pub node_loads: super::node_load::NodeLoads,
@@ -108,13 +110,13 @@ impl Side {
             next_stream: 0,
             links: BTreeMap::new(),
             paused: BTreeSet::new(),
-            recorder: Recorder::off(),
-            recorded: BTreeSet::new(),
+            recording: Recording::new(),
             parked: BTreeMap::new(),
             learned: Learned::new(crate::learned::LearnedSizes::Off, 0, 0),
             watched: BTreeMap::new(),
             pack_reads: BTreeMap::new(),
             pack_writes: BTreeMap::new(),
+            input_caches: BTreeMap::new(),
             node_loads: BTreeMap::new(),
             failed: FailedActions::default(),
         }
@@ -245,7 +247,7 @@ impl Adapter for Side {
         let os_family = platform.map_or("-", |p| p.os_family);
         let isa = platform.map_or("-", |p| p.isa.as_str());
         tracing::info!(%operation, %lease, %node, key, %os_family, %isa, "lease granted");
-        self.record_granted(grant);
+        self.recording.granted(grant);
         self.send_for(view.sched, &grant.worker, grant.operation, |w| {
             server_message::Message::LeaseOffer(LeaseOffer {
                 lease_id: Some(wire_lease(grant.lease)),
@@ -303,11 +305,15 @@ impl Adapter for Side {
                     queued: w.queued,
                     started: now,
                 },
+                booked: Some(Booked {
+                    cpu_millis: start.resources.cpu_millis,
+                    memory_bytes: start.resources.memory_bytes,
+                }),
             });
         sent.into_iter()
             .for_each(|sent| self.machine.start(start.lease, sent));
         self.learned.on_start(start);
-        self.record_started(start);
+        self.recording.started(start);
     }
 
     /// Logs, as one WARN line, an operation the scheduler finishes failed: the failure
@@ -347,7 +353,7 @@ impl Adapter for Side {
 
     fn refuse(&mut self, _view: &View<'_>, refusal: &Refusal) {
         tracing::warn!(operation = %refusal.operation, reason = %refusal.reason, "operation refused");
-        self.record_refused(refusal);
+        self.recording.refused(refusal);
         let finished = refused_as(refusal);
         self.failed.count(Class::Farm);
         // A lease given up before the operation was refused may still be listed.
@@ -371,7 +377,7 @@ impl Adapter for Side {
     }
 
     fn requeued(&mut self, requeue: &Requeue) {
-        self.record_requeue(requeue);
+        self.recording.requeued(requeue);
     }
 
     fn learned_requeue(&mut self, view: &View<'_>, requeue: &Requeue) -> LearnedRequeue {
@@ -450,6 +456,7 @@ impl Adapter for Side {
                 operation: op.operation,
                 action: key.action,
                 stamp,
+                booked: None,
             };
             self.machine.start(grant.lease, sent);
         }
@@ -478,7 +485,7 @@ impl Adapter for Side {
     }
 
     fn followed(&mut self, operation: OperationId, finished: &Finished) {
-        self.record_followed(operation, finished);
+        self.recording.followed(operation, finished);
     }
 
     fn watched(&mut self) -> Vec<OperationId> {

@@ -34,8 +34,8 @@ crc32fast = "1.5.2"
 core-foundation = "0.10.1"
 # The MDM gate's grant key (kbf-mdm) and the Mac's check of the grants it signs
 # (kbf-mac-session: pure Rust, so the helper is checked for the macOS target on any
-# host, which ring's C build does not allow). One major for both, already in the tree
-# through ssh-key.
+# host, which ring's C build does not allow). Major 2 here; ssh-key 0.7 brings its own
+# major 3 (the key types it parses), which nothing here shares a type with.
 ed25519-dalek = { version = "2.2.0", default-features = false, features = ["std"] }
 # gzip for the tar.gz archives kbf-deploy installs (`mdm install`) and `cargo xtask
 # fetch` unpacks, and the deflate behind zip (below); the pure-Rust backend, no C zlib.
@@ -59,6 +59,9 @@ http-body = "1.1.0"
 # The registry client of kbf-image reads response bodies frame by frame. Already in the tree
 # through axum and tonic.
 http-body-util = "0.1.5"
+# HTTP-date text of `Date` and `Last-Modified` (tierstore-bench's fault proxy). Already in the
+# tree through hyper.
+httpdate = "1.0.3"
 # `wait4` and `kill` for a measured child process (kbf-daemon's `usage` module); the
 # standard library reaps children without returning their resource usage.
 libc = "0.2.190"
@@ -77,18 +80,23 @@ hyper-util = { version = "0.1.21", default-features = false }
 # (a lease id, say) is the same type in every kbf crate; a test in kbf-integration-test
 # reads Cargo.lock and refuses a second source. The revision is raised by a pull request
 # of its own that runs the whole CI, never along with other changes.
-js-agent-usage = { git = "https://github.com/komira-ai/jobscheduler", rev = "a826aba49ac204ea4189ba547907f32aa58467dd" }
-js-caps = { git = "https://github.com/komira-ai/jobscheduler", rev = "a826aba49ac204ea4189ba547907f32aa58467dd" }
-js-sched = { git = "https://github.com/komira-ai/jobscheduler", rev = "a826aba49ac204ea4189ba547907f32aa58467dd" }
-js-server-core = { git = "https://github.com/komira-ai/jobscheduler", rev = "a826aba49ac204ea4189ba547907f32aa58467dd" }
-js-sim = { git = "https://github.com/komira-ai/jobscheduler", rev = "a826aba49ac204ea4189ba547907f32aa58467dd" }
-js-sizing = { git = "https://github.com/komira-ai/jobscheduler", rev = "a826aba49ac204ea4189ba547907f32aa58467dd" }
-js-state = { git = "https://github.com/komira-ai/jobscheduler", rev = "a826aba49ac204ea4189ba547907f32aa58467dd" }
-js-store = { git = "https://github.com/komira-ai/jobscheduler", rev = "a826aba49ac204ea4189ba547907f32aa58467dd" }
-js-testkit = { git = "https://github.com/komira-ai/jobscheduler", rev = "a826aba49ac204ea4189ba547907f32aa58467dd" }
-js-types = { git = "https://github.com/komira-ai/jobscheduler", rev = "a826aba49ac204ea4189ba547907f32aa58467dd" }
-js-usage = { git = "https://github.com/komira-ai/jobscheduler", rev = "a826aba49ac204ea4189ba547907f32aa58467dd" }
-js-whole = { git = "https://github.com/komira-ai/jobscheduler", rev = "a826aba49ac204ea4189ba547907f32aa58467dd" }
+js-agent-usage = { git = "https://github.com/komira-ai/jobscheduler", rev = "f8fc1148c58879b055e44341de722b112c77f694" }
+js-caps = { git = "https://github.com/komira-ai/jobscheduler", rev = "f8fc1148c58879b055e44341de722b112c77f694" }
+js-sched = { git = "https://github.com/komira-ai/jobscheduler", rev = "f8fc1148c58879b055e44341de722b112c77f694" }
+js-server-core = { git = "https://github.com/komira-ai/jobscheduler", rev = "f8fc1148c58879b055e44341de722b112c77f694" }
+js-sim = { git = "https://github.com/komira-ai/jobscheduler", rev = "f8fc1148c58879b055e44341de722b112c77f694" }
+js-sizing = { git = "https://github.com/komira-ai/jobscheduler", rev = "f8fc1148c58879b055e44341de722b112c77f694" }
+js-state = { git = "https://github.com/komira-ai/jobscheduler", rev = "f8fc1148c58879b055e44341de722b112c77f694" }
+js-store = { git = "https://github.com/komira-ai/jobscheduler", rev = "f8fc1148c58879b055e44341de722b112c77f694" }
+js-testkit = { git = "https://github.com/komira-ai/jobscheduler", rev = "f8fc1148c58879b055e44341de722b112c77f694" }
+js-types = { git = "https://github.com/komira-ai/jobscheduler", rev = "f8fc1148c58879b055e44341de722b112c77f694" }
+js-usage = { git = "https://github.com/komira-ai/jobscheduler", rev = "f8fc1148c58879b055e44341de722b112c77f694" }
+js-whole = { git = "https://github.com/komira-ai/jobscheduler", rev = "f8fc1148c58879b055e44341de722b112c77f694" }
+# tierstore and objstore-s3 moved to the tierstore repository (https://github.com/komira-ai/tierstore).
+# Both are taken from it at this one revision. The revision is raised by a pull request of
+# its own that runs the whole CI, never along with other changes.
+objstore-s3 = { git = "https://github.com/komira-ai/tierstore", rev = "eb6cfae075b720f2203cd957cffd1ba3b586c999" } # v0.3.0
+tierstore = { git = "https://github.com/komira-ai/tierstore", rev = "eb6cfae075b720f2203cd957cffd1ba3b586c999" } # v0.3.0
 md-5 = "0.11.0"
 # macOS only (kbf-mac-session): OpenDirectory, for the per-lease users.
 objc2 = "0.6.5"
@@ -160,8 +168,9 @@ serde_json = "1.0.151"
 siphasher = "1.0.4"
 sha2 = "0.11.0"
 # OpenSSH signatures (`ssh-keygen -Y sign`) on operator erase requests (kbf-mdm): the
-# SSHSIG envelope and security-key (`sk-`) signature verification.
-ssh-key = { version = "0.6.7", default-features = false, features = ["alloc", "ed25519", "p256", "std"] }
+# SSHSIG envelope and security-key (`sk-`) signature verification. Pinned exactly while
+# 0.7 has only release candidates, so no other candidate slides in.
+ssh-key = { version = "=0.7.0-rc.11", default-features = false, features = ["alloc", "ed25519", "p256", "std"] }
 # Constant-time comparison of the operator API token (kbf-server). Already in the tree
 # through rustls.
 subtle = "2.6.1"
@@ -177,7 +186,7 @@ toml = { version = "1.1.8", default-features = false, features = ["display", "pa
 # RFC 3339 times in the MDM gate's signed messages. Already in the tree through
 # x509-parser.
 time = { version = "0.3.55", default-features = false, features = ["formatting", "macros", "parsing", "std"] }
-tokio = "1.53.2"
+tokio = "1.53.3"
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring"] }
 tonic = "0.14.6"
 tonic-prost = "0.14.6"
@@ -229,6 +238,7 @@ kbf-host = { path = "crates/kbf-host" }
 kbf-installer = { path = "crates/kbf-installer" }
 kbf-invocation = { path = "crates/kbf-invocation" }
 kbf-integration-test = { path = "crates/kbf-integration-test" }
+kbf-lease-client = { path = "crates/kbf-lease-client" }
 kbf-log = { path = "crates/kbf-log" }
 kbf-map = { path = "crates/kbf-map" }
 kbf-mapsync = { path = "crates/kbf-mapsync" }
@@ -247,6 +257,7 @@ kbf-proxy = { path = "crates/kbf-proxy" }
 kbf-raft = { path = "crates/kbf-raft" }
 kbf-route = { path = "crates/kbf-route" }
 kbf-sched = { path = "crates/kbf-sched" }
+kbf-seatbelt = { path = "crates/kbf-seatbelt" }
 kbf-segments = { path = "crates/kbf-segments" }
 kbf-server = { path = "crates/kbf-server" }
 kbf-setup = { path = "crates/kbf-setup" }
@@ -256,6 +267,7 @@ kbf-sim-cell = { path = "crates/kbf-sim-cell" }
 kbf-state = { path = "crates/kbf-state" }
 kbf-storage = { path = "crates/kbf-storage" }
 kbf-store = { path = "crates/kbf-store" }
+kbf-task-pack = { path = "crates/kbf-task-pack" }
 kbf-testkit = { path = "crates/kbf-testkit" }
 kbf-threads = { path = "crates/kbf-threads" }
 kbf-oidc = { path = "crates/kbf-oidc" }
@@ -269,9 +281,12 @@ kbf-unitfile = { path = "crates/kbf-unitfile" }
 kbf-update = { path = "crates/kbf-update" }
 kbf-updater = { path = "crates/kbf-updater" }
 kbf-usage = { path = "crates/kbf-usage" }
-# The hot/cold object store library; it depends on no kbf crate unless its `s3` feature is on
-# (kbf-integration-test keeps it so).
-tierstore = { path = "crates/tierstore" }
+# The contract between a host updater and a service's update hook, and the harness that proves a
+# hook keeps it; it depends on no other workspace crate (kbf-integration-test keeps it so).
+update-hook = { path = "crates/update-hook" }
+# The declaration loader, the widening comparer, the approval record and the transient-unit launcher
+# of the host updater; depends on update-hook alone (kbf-integration-test keeps it so).
+update-rights = { path = "crates/update-rights" }
 # The CI verbs (`cargo xtask`); kbf-integration-test reads the interpreter budget with its parser.
 xtask = { path = "crates/xtask" }
 

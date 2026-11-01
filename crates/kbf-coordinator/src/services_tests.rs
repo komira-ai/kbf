@@ -1,9 +1,10 @@
 //! Services as data: the file that defines them, and the decision across two services.
 
 use std::collections::BTreeMap;
+use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
 
-use kbf_types::HostRole::{Daemon, Frontend, MacDaemon, Storage};
+use kbf_types::HostRole;
 use kbf_updater::wire::{MAX_SERVICE_NAME, MAX_SERVICES, Reply};
 
 use crate::decide::decide_in;
@@ -59,12 +60,12 @@ fn kbf_is_built_in_as_data() {
     assert_eq!(kbf.name, KBF);
     assert!(kbf.after.is_empty());
     assert_eq!(kbf.roles.len(), 4);
-    for role in [Storage, Daemon, MacDaemon] {
-        assert_eq!(kbf.roles[&role], RoleDef::plain(), "{role:?}");
+    for role in [HostRole::STORAGE, HostRole::DAEMON, HostRole::MAC_DAEMON] {
+        assert_eq!(kbf.roles[role.name()], RoleDef::plain(), "{role:?}");
     }
-    let frontend = &kbf.roles[&Frontend];
+    let frontend = &kbf.roles["frontend"];
     assert!(frontend.never_last);
-    assert_eq!(frontend.after, [Storage, Daemon, MacDaemon]);
+    assert_eq!(frontend.after, ["storage", "daemon", "mac-daemon"]);
     assert_eq!(Services::default().get(KBF), Some(&kbf));
 }
 
@@ -76,7 +77,7 @@ fn a_services_file_defines_further_services() {
     let s = Services::parse(TWO).expect("parsed");
     let agent = s.get("agent").expect("defined");
     assert_eq!(agent.after, ["server"]);
-    let daemon = &agent.roles[&Daemon];
+    let daemon = &agent.roles["daemon"];
     assert_eq!((daemon.max_updating, daemon.min_up), (Some(2), Some(0)));
     assert!(!daemon.never_last);
     assert!(s.get(KBF).is_some() && s.get("server").is_some());
@@ -85,6 +86,7 @@ fn a_services_file_defines_further_services() {
     let dir = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "services-file");
     let path = dir.path().join("services.toml");
     std::fs::write(&path, TWO).expect("written");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("mode");
     assert_eq!(Services::from_file(&path).expect("read"), s);
     let missing = Services::from_file(&dir.path().join("nope.toml")).expect_err("refused");
     assert!(matches!(missing, ServicesError::Read(_)));
@@ -104,10 +106,10 @@ fn a_service_name_may_hold_digits_and_hyphens() {
 }
 
 /// Catches: a services file that is accepted although it cannot work: each refusal names
-/// what is wrong (not TOML or an unknown key, a bad or repeated name, kbf redefined, no roles,
-/// a role that is not a host role, a count over the limit, a role waiting for a role the
-/// service lacks, an `after` that names an unknown or later service, and a CI service that
-/// does not exist).
+/// what is wrong (not TOML or an unknown key, a bad or repeated name, kbf defined after
+/// another service, no roles, a role that is not a host role, a count over the limit, a
+/// role waiting for a role the service lacks, an `after` that names an unknown or later
+/// service, and a CI service that does not exist).
 #[test]
 fn a_services_file_that_cannot_work_is_refused() {
     let role = "[service.roles.daemon]\n";
@@ -128,11 +130,13 @@ fn a_services_file_that_cannot_work_is_refused() {
             "{bad:?}"
         );
     }
-    assert!(refusal(&svc("kbf", "", role)).contains("twice"));
+    let kbf_later = format!("{}{}", svc("a", "", role), svc("kbf", "", role));
+    assert!(refusal(&kbf_later).contains("first entry"));
     let twice = format!("{}{}", svc("a", "", role), svc("a", "", role));
     assert!(refusal(&twice).contains("twice"));
     assert!(refusal(&svc("a", "", "")).contains("no roles"));
     assert!(refusal(&svc("a", "", "[service.roles.cook]\n")).contains("cook is not a host role"));
+    assert!(refusal(&svc("a", "", "[service.roles.cache]\n")).contains("cache is not a host role"));
     assert!(
         refusal(&svc("a", "", "[service.roles.daemon]\nmin_up = 10001\n")).contains("over 10000")
     );
@@ -196,11 +200,11 @@ fn a_service_waits_for_the_services_it_comes_after() {
         f.record_in(
             "server",
             id("s1"),
-            Daemon,
+            HostRole::DAEMON,
             server,
             Duration::from_secs(seen),
         );
-        f.record_in("agent", id("a1"), Daemon, beat("1.0"), NOW);
+        f.record_in("agent", id("a1"), HostRole::DAEMON, beat("1.0"), NOW);
         f
     };
     let behind = fleet_of(beat("1.0"), 1_000);
@@ -228,8 +232,8 @@ fn a_host_updates_one_service_at_a_time() {
     let want = desired("2.0", 0, 0);
     let w = wants(&[("one", &want), ("two", &want)]);
     let mut f = Fleet::new(Duration::ZERO);
-    f.record_in("one", id("h"), Daemon, beat("1.0"), NOW);
-    f.record_in("two", id("h"), Daemon, beat("1.0"), NOW);
+    f.record_in("one", id("h"), HostRole::DAEMON, beat("1.0"), NOW);
+    f.record_in("two", id("h"), HostRole::DAEMON, beat("1.0"), NOW);
     assert!(!f.is_busy_besides("two", &id("h"), NOW));
     assert_eq!(ask(&s, &w, &f, "two", "h"), update("2.0"));
 
@@ -244,7 +248,7 @@ fn a_host_updates_one_service_at_a_time() {
         update("2.0"),
         "its own order repeats"
     );
-    f.record_in("two", id("h"), Daemon, beat("1.0"), NOW);
+    f.record_in("two", id("h"), HostRole::DAEMON, beat("1.0"), NOW);
     assert_eq!(
         ask(&s, &w, &f, "two", "h"),
         Reply::Nothing,
@@ -257,7 +261,13 @@ fn a_host_updates_one_service_at_a_time() {
         "aged out"
     );
 
-    f.record_in("one", id("h"), Daemon, updating(beat("1.0"), "2.0"), NOW);
+    f.record_in(
+        "one",
+        id("h"),
+        HostRole::DAEMON,
+        updating(beat("1.0"), "2.0"),
+        NOW,
+    );
     assert_eq!(
         ask(&s, &w, &f, "two", "h"),
         Reply::Nothing,
@@ -268,7 +278,7 @@ fn a_host_updates_one_service_at_a_time() {
         Reply::Nothing,
         "and not told again"
     );
-    f.record_in("one", id("h"), Daemon, beat("2.0"), NOW);
+    f.record_in("one", id("h"), HostRole::DAEMON, beat("2.0"), NOW);
     assert_eq!(ask(&s, &w, &f, "two", "h"), update("2.0"));
 }
 
@@ -284,12 +294,12 @@ fn a_lone_host_is_ordered_only_when_the_definition_allows_it() {
     let w = wants(&[("loose", &want), ("tight", &want)]);
     let mut f = Fleet::new(Duration::ZERO);
     for service in ["loose", "tight"] {
-        f.record_in(service, id("d1"), Daemon, beat("1.0"), NOW);
-        f.record_in(service, id("m1"), MacDaemon, beat("1.0"), NOW);
+        f.record_in(service, id("d1"), HostRole::DAEMON, beat("1.0"), NOW);
+        f.record_in(service, id("m1"), HostRole::MAC_DAEMON, beat("1.0"), NOW);
     }
     assert_eq!(ask(&s, &w, &f, "loose", "d1"), update("2.0"));
     assert_eq!(ask(&s, &w, &f, "tight", "d1"), Reply::Nothing);
-    f.record_in("tight", id("d2"), Daemon, beat("1.0"), NOW);
+    f.record_in("tight", id("d2"), HostRole::DAEMON, beat("1.0"), NOW);
     assert_eq!(ask(&s, &w, &f, "tight", "d1"), update("2.0"));
     assert_eq!(
         ask(&s, &w, &f, "loose", "m1"),
@@ -310,31 +320,37 @@ fn a_definitions_limits_and_waits_decide_over_the_desired_state() {
         [service.roles.storage]\nmax_updating = 1\nafter = [\"daemon\"]\nmin_up = 0\n";
     let s = Services::parse(text).expect("parsed");
     let mut want = desired("2.0", 0, 0);
-    want.max_updating.daemon = 4;
+    want.max_updating.set("daemon", 4);
     let w = wants(&[("svc", &want)]);
     let mut f = Fleet::new(Duration::ZERO);
-    f.record_in("svc", id("d1"), Daemon, beat("1.0"), NOW);
+    f.record_in("svc", id("d1"), HostRole::DAEMON, beat("1.0"), NOW);
     assert_eq!(
         ask(&s, &w, &f, "svc", "d1"),
         Reply::Nothing,
         "never the last"
     );
-    f.record_in("svc", id("d2"), Daemon, updating(beat("1.0"), "2.0"), NOW);
-    f.record_in("svc", id("d3"), Daemon, beat("1.0"), NOW);
+    f.record_in(
+        "svc",
+        id("d2"),
+        HostRole::DAEMON,
+        updating(beat("1.0"), "2.0"),
+        NOW,
+    );
+    f.record_in("svc", id("d3"), HostRole::DAEMON, beat("1.0"), NOW);
     assert_eq!(
         ask(&s, &w, &f, "svc", "d3"),
         Reply::Nothing,
         "the definition allows one at a time"
     );
-    f.record_in("svc", id("d2"), Daemon, beat("2.0"), NOW);
-    f.record_in("svc", id("t1"), Storage, beat("1.0"), NOW);
+    f.record_in("svc", id("d2"), HostRole::DAEMON, beat("2.0"), NOW);
+    f.record_in("svc", id("t1"), HostRole::STORAGE, beat("1.0"), NOW);
     assert_eq!(
         ask(&s, &w, &f, "svc", "t1"),
         Reply::Nothing,
         "storage waits for daemons"
     );
-    f.record_in("svc", id("d1"), Daemon, beat("2.0"), NOW);
-    f.record_in("svc", id("d3"), Daemon, beat("2.0"), NOW);
+    f.record_in("svc", id("d1"), HostRole::DAEMON, beat("2.0"), NOW);
+    f.record_in("svc", id("d3"), HostRole::DAEMON, beat("2.0"), NOW);
     assert_eq!(ask(&s, &w, &f, "svc", "t1"), update("2.0"));
 }
 

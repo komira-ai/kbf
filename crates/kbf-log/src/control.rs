@@ -284,6 +284,7 @@ const fn resources(r: &Resources) -> proto::Resources {
         gpus: r.gpus,
         vms: r.vms,
         leases: r.leases,
+        disk_bytes: r.disk_bytes,
     }
 }
 
@@ -320,12 +321,17 @@ fn node_caps(caps: &NodeCaps) -> proto::NodeCaps {
         consumables: caps
             .consumables
             .iter()
+            // A disk-gib amount is left out, so that binaries that predate enum value 5
+            // can read every log this binary writes. `from_consumable` does read value 5.
+            .filter(|&(&c, _)| c != Consumable::DiskGib)
             .map(|(&c, &amount)| proto::ConsumableAmount {
                 consumable: match c {
                     Consumable::Cpus => proto::Consumable::Cpus,
                     Consumable::MemGib => proto::Consumable::MemGib,
                     Consumable::NvmeGib => proto::Consumable::NvmeGib,
                     Consumable::Gpus => proto::Consumable::Gpus,
+                    // Filtered out above.
+                    Consumable::DiskGib => proto::Consumable::DiskGib,
                 }
                 .into(),
                 amount,
@@ -548,6 +554,7 @@ fn from_resources(
         memory_bytes: r.memory_bytes,
         gpus: r.gpus,
         vms: r.vms,
+        disk_bytes: r.disk_bytes,
         leases: r.leases,
     })
 }
@@ -581,8 +588,8 @@ fn from_node_caps(
         consumables: caps
             .consumables
             .into_iter()
-            .map(from_consumable)
-            .collect::<Result<BTreeMap<_, _>, _>>()?,
+            .filter_map(from_consumable)
+            .collect::<BTreeMap<_, _>>(),
         drivers: caps.drivers.into_iter().collect(),
         devices: caps
             .devices
@@ -597,20 +604,19 @@ fn from_node_caps(
     })
 }
 
-fn from_consumable(c: proto::ConsumableAmount) -> Result<(Consumable, u64), DecodeError> {
+/// An amount of a consumable this binary has a variant for. An amount whose value is
+/// unspecified or unnamed is skipped (`None`), and the rest of the command decodes as it
+/// would without it: a later binary may add a consumable.
+fn from_consumable(c: proto::ConsumableAmount) -> Option<(Consumable, u64)> {
     let consumable = match proto::Consumable::try_from(c.consumable) {
         Ok(proto::Consumable::Cpus) => Consumable::Cpus,
         Ok(proto::Consumable::MemGib) => Consumable::MemGib,
         Ok(proto::Consumable::NvmeGib) => Consumable::NvmeGib,
         Ok(proto::Consumable::Gpus) => Consumable::Gpus,
-        Ok(proto::Consumable::Unspecified) | Err(_) => {
-            return Err(DecodeError::UnknownValue {
-                field: "ConsumableAmount.consumable",
-                value: c.consumable,
-            });
-        }
+        Ok(proto::Consumable::DiskGib) => Consumable::DiskGib,
+        Ok(proto::Consumable::Unspecified) | Err(_) => return None,
     };
-    Ok((consumable, c.amount))
+    Some((consumable, c.amount))
 }
 
 fn from_request(r: proto::Request) -> Result<Request, DecodeError> {
@@ -638,6 +644,7 @@ fn from_request(r: proto::Request) -> Result<Request, DecodeError> {
         needs,
         hermetic: r.hermetic,
         do_not_cache: r.do_not_cache,
+        whole_worker: false,
     })
 }
 

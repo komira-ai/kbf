@@ -8,6 +8,7 @@
 //! [`crate::farm_js::dispatch`]; what the farm's driver does around a `Result`'s feed is the
 //! adapter's (`crate::farm_js::report_hooks`).
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -19,10 +20,12 @@ use kbf_types::sched::usage::NodeLoad;
 use kbf_types::{LeaseId, WorkerId};
 use tonic::Status;
 
-use super::JsFarm;
+use super::{JsFarm, wall_minute};
 use crate::farm::{Outbound, Reported, StreamId};
+use crate::farm_js::dispatch::{Ran, Took};
 use crate::farm_js::host::{Connection, stream_number};
-use crate::farm_js::{Wall, dispatch};
+use crate::farm_js::{Wall, dispatch, write_learned};
+use crate::learned::LearnedSizes;
 
 /// One `Result` being taken, counted until dropped ([`quiet`] waits for none).
 struct Taking<'a>(&'a AtomicUsize);
@@ -45,11 +48,12 @@ impl Drop for Taking<'_> {
 /// tick old.
 fn publish(js: &JsFarm) {
     let metrics = js.cache.metrics();
-    js.core.with(|view, _| {
+    js.core.with(|view, adapter| {
         let sched = view.sched();
         metrics.sched_queued.set(sched.queued_len() as u64);
         metrics.sched_leases.set(sched.leases_held() as u64);
         metrics.sched_whole.set(sched.whole_summary().as_ref());
+        adapter.publish_learned();
     });
 }
 
@@ -103,6 +107,7 @@ pub(crate) async fn heartbeat(
     running: Vec<LeaseId>,
     load: Option<NodeLoad>,
 ) -> bool {
+    let session = stream.0;
     // A heartbeat from a replaced stream is dropped and not acknowledged.
     let Some(stream) = js
         .core
@@ -110,15 +115,47 @@ pub(crate) async fn heartbeat(
     else {
         return false;
     };
+    // Kept for the usage side, which reads it after the core has answered.
+    let kept = js.usage.as_ref().and(load.clone());
     let beat = Beat::new(seq, running);
     let beat = match load {
         Some(load) => beat.with_load(load),
         None => beat,
     };
-    js.core
+    let acknowledged = js
+        .core
         .heartbeat(js.now(), worker, stream, beat)
         .await
-        .unwrap_or(false)
+        .unwrap_or(false);
+    // After the core let go of its lock. A beat is answered whatever usage does with it.
+    if let Some(usage) = js.usage.as_ref().filter(|_| acknowledged) {
+        let held = held_leases(js, worker, kept.as_ref());
+        let minute = wall_minute(js.ambient);
+        usage
+            .beat(worker.clone(), session, kept, held, minute)
+            .await;
+    }
+    acknowledged
+}
+
+/// The leases of `load`'s minutes that the core holds for `worker`, as the usage side names
+/// them. The core's own answer to "who holds this lease" has effects (a refusal is logged,
+/// a held result is owed), so the scheduler is asked what it holds, not what it would say.
+fn held_leases(
+    js: &JsFarm,
+    worker: &WorkerId,
+    load: Option<&NodeLoad>,
+) -> BTreeSet<js_types::LeaseId> {
+    let Some(load) = load else {
+        return BTreeSet::new();
+    };
+    let on = js.core.with(|view, _| view.sched().leases_on(worker));
+    load.minutes
+        .iter()
+        .map(|minute| minute.lease)
+        .filter(|lease| on.contains(lease))
+        .map(|lease| js_types::LeaseId::new(lease.term, lease.seq))
+        .collect()
 }
 
 /// [`Farm::report`](crate::farm::Farm::report).
@@ -132,18 +169,70 @@ pub(crate) async fn report(
     let _taking = Taking::of(&js.reports);
     let ambient = js.ambient;
     let wall: Wall = Arc::new(move || ambient.wall());
-    let ack = dispatch::report(&js.core, &js.cache, &wall, || js.now(), worker, result)
-        .await
-        .ok()
-        .flatten()?;
-    // A stale refusal of the lease the core still calls current: the scheduler took no
-    // answer from its Result. A daemon forgets a Result on any ack, so a refusal would lose
-    // it and leave the lease on the node; without one the daemon sends it again. A fenced
-    // core refuses every Result as stale, by design: that refusal stands.
-    let swallowed = !ack.accepted
-        && ack.reason == ResultAckReason::Stale as i32
-        && !js.fenced.load(Ordering::SeqCst)
-        && matches!(js.core.standing(worker, lease), Ok(Standing::Current(_)));
+    let mut ran = None;
+    let acked = dispatch::report_noting(
+        &js.core,
+        &js.cache,
+        &wall,
+        &|| js.now(),
+        worker,
+        result,
+        &mut ran,
+    )
+    .await
+    .ok()
+    .flatten();
+    // A result the core took is a run the usage side follows to its worker's next beat.
+    if let Some((
+        Ran {
+            action,
+            clean,
+            took,
+        },
+        usage,
+    )) = ran.zip(js.usage.as_ref())
+    {
+        match took {
+            Took::Accepted => {
+                usage.accepted(worker, lease, action, clean, wall_minute(js.ambient));
+            }
+            // Its run is not followed: a held result is acknowledged by the core later,
+            // where nothing tells the usage side, so it is counted and not learned.
+            Took::Held => usage.not_taken(false),
+            Took::Dropped => usage.not_taken(true),
+        }
+    }
+    // The summaries a kill changed are written now, after the core has let go of its lock.
+    if js.settings.learned != LearnedSizes::Off {
+        write_learned(&js.core, &js.learning_gate, false).await;
+    }
+    let ack = acked?;
+    let current = || matches!(js.core.standing(worker, lease), Ok(Standing::Current(_)));
+    answered(
+        ack,
+        js.fenced.load(Ordering::SeqCst),
+        &current,
+        lease,
+        worker,
+    )
+}
+
+/// The acknowledgement a `Result` of `lease` gets, from the one the core answered (`ack`):
+/// none for a stale refusal of a lease the core still calls current (`current`, asked only
+/// then), whose `Result` the scheduler took no answer from. A daemon forgets a `Result` on
+/// any ack, so a refusal would lose it and leave the lease on the node; without one the
+/// daemon sends it again. A fenced core refuses every `Result` as stale, by design: that
+/// refusal stands, as does any refusal for another reason. `current` is a trait object, not
+/// generic, so the farm and the tests share one body, whose branches are measured once.
+pub(super) fn answered(
+    ack: ResultAck,
+    fenced: bool,
+    current: &dyn Fn() -> bool,
+    lease: LeaseId,
+    worker: &WorkerId,
+) -> Option<ResultAck> {
+    let swallowed =
+        !ack.accepted && ack.reason == ResultAckReason::Stale as i32 && !fenced && current();
     if swallowed {
         tracing::error!(
             %lease, %worker,
@@ -157,7 +246,19 @@ pub(crate) async fn report(
 /// [`Farm::tick`](crate::farm::Farm::tick).
 pub(crate) async fn tick(js: &JsFarm) {
     js.core.tick(js.now()).await;
+    write_learned(&js.core, &js.learning_gate, true).await;
     publish(js);
+    if let Some(usage) = &js.usage {
+        usage.tick(wall_minute(js.ambient)).await;
+    }
+}
+
+/// [`Farm::finish_usage`](crate::farm::Farm::finish_usage).
+pub(crate) async fn finish_usage(js: &JsFarm) -> bool {
+    match &js.usage {
+        Some(usage) => usage.finish(wall_minute(js.ambient)).await,
+        None => true,
+    }
 }
 
 /// [`Dispatch::submit`](kbf_front::Dispatch::submit) for the farm.

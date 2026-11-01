@@ -89,16 +89,27 @@ pub struct Listeners {
     /// books, the others are what it climbs through when it passes its own memory
     /// limit, before a whole host (`--memory-ladder-gib`).
     pub memory_ladder: MemoryLadder,
+    /// Whether an action that passes its own memory limit runs again on the next rung
+    /// (`false` is `--no-memory-climb`: the kill finishes it, and the legacy core only).
+    pub memory_climb: bool,
     /// What a node that reports VM slots keeps for the host: its CPUs and memory,
     /// subtracted from what placement may book on it (`--vm-host-floor-cpus`,
     /// `--vm-host-floor-mem-gib`).
     pub vm_host_floor: HostFloor,
     /// Whether the farm shows `kbf-estimator` what finished (`--learned-sizes`).
     pub learned_sizes: crate::LearnedSizes,
+    /// Whether every `action` lease books the whole worker it lands on, so that one action
+    /// runs per worker (`--exclusive-actions`).
+    pub exclusive_actions: bool,
     /// Which core drives the farm's scheduling (`--scheduler-core`).
     pub scheduler_core: crate::SchedulerCore,
     /// Whether placement reads the load the nodes report (`--placement-load`).
     pub placement_load: crate::PlacementLoad,
+    /// Whether the scheduler is given the estimator's prediction of a new operation's cost
+    /// (`--placement-predictions`).
+    pub placement_predictions: crate::PlacementPredictions,
+    /// Whether the farm learns what its leases use (`--usage-profiles`).
+    pub usage_profiles: crate::UsageProfiles,
     /// The whole-node settings of the scheduler, if on (`--whole-node-max`).
     pub whole_node: Option<kbf_sched::WholeNodeConfig>,
     /// How long a finished operation is kept after its callers are answered, in which
@@ -217,6 +228,9 @@ pub enum ServeError {
     /// The pack store does not refuse to replace an object, or cannot be written to.
     #[error("--pack-store-endpoint: {0}")]
     Packs(String),
+    /// The executor stopped by itself.
+    #[error("--executor js-agent: {0}")]
+    Executor(String),
 }
 
 /// A server that is listening: the addresses it bound, and the future that serves
@@ -550,10 +564,26 @@ pub(crate) fn sweeping(members: Option<Arc<Members>>) -> Pin<Box<dyn Future<Outp
     }
 }
 
-/// Logs the core `farm` runs on, as its driver says (not as the flag does), in the words
-/// the all-in-one server and the frontend both use.
+/// Logs the core `farm` runs on, as its driver says (not as the flag does), and whether an
+/// own-limit kill climbs the ladder (`--no-memory-climb`), in the words the all-in-one server
+/// and the frontend both use.
 pub(crate) fn log_core(farm: &Farm) {
     tracing::info!("{}", farm.scheduler_core().start_line());
+    tracing::info!("{}", farm.usage_profiles().start_line());
+    tracing::info!(
+        "memory climb: {}",
+        if farm.memory_climb() { "on" } else { "off" }
+    );
+}
+
+/// The line a start logs when `--exclusive-actions` is on, and none when it is off.
+pub(crate) const EXCLUSIVE_LINE: &str = "exclusive-actions: on";
+
+/// Logs [`EXCLUSIVE_LINE`] at a start with `--exclusive-actions` on.
+pub(crate) fn log_exclusive(on: bool) {
+    if on {
+        tracing::info!("{EXCLUSIVE_LINE}");
+    }
 }
 
 /// Logs where the scheduler's state is, at every start. Not generic, unlike the binding
@@ -802,9 +832,11 @@ where
         memory: listeners.memory_ladder.first(),
         platform: listeners.default_platform,
         qos: listeners.qos_allowed,
+        exclusive_actions: listeners.exclusive_actions,
     };
     let farm = Farm::from_listeners(Arc::clone(&cache), &listeners).recording(recorder.clone());
     log_core(&farm);
+    log_exclusive(listeners.exclusive_actions);
     let durable = state.is_some();
     // Storage nodes register with a frontend that has a state store to keep them in.
     let members = members_of(state.as_ref(), None);
@@ -1059,6 +1091,8 @@ where
         if reapi_done {
             stop_api(api_stop, api_serve).await;
         }
+        // What the usage side learned and has not flushed yet.
+        farm.finish_usage().await;
         crate::history::finish(history).await;
         outcome
     };

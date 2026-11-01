@@ -512,6 +512,57 @@ async fn the_default_memory_is_the_one_the_service_is_given() {
     assert_eq!(submitted[2].request.resources.memory_bytes, 1 << 30);
 }
 
+/// Catches the exclusive-actions setting reaching the scheduler wrongly: off, no request
+/// owns a worker; on, an `action` does whatever it names (a named size is still read,
+/// checked and booked as the hint it is) and its booking and sources are as they were, but
+/// a `whole_machine` lease is not asked for as a whole worker, and a malformed size is
+/// refused as it is with the setting off.
+#[tokio::test]
+async fn exclusive_actions_ask_the_scheduler_for_a_whole_worker() {
+    use kbf_invocation::BookSource::{Default as Unnamed, Hint};
+    let jobs = [
+        job("plain", &[], false),
+        job(
+            "named",
+            &[(BOOK_CPUS_KEY, "2"), (BOOK_MEM_GIB_KEY, "8")],
+            false,
+        ),
+        job("whole", &[("kbf-lease", "whole_machine")], false),
+    ];
+    let mut seen = Vec::new();
+    for exclusive in [false, true] {
+        let script = Arc::new(Script::default());
+        let farm = if exclusive {
+            Farm::with_exclusive_actions(Arc::clone(&script)).await
+        } else {
+            Farm::with_execution(Arc::clone(&script)).await
+        };
+        for j in &jobs {
+            farm.upload(&j.blobs.iter().collect::<Vec<_>>()).await;
+            start(&farm, &j.action).await.expect("Execute");
+        }
+        let submitted = script.submitted();
+        let whole: Vec<bool> = submitted.iter().map(|s| s.request.whole_worker).collect();
+        let booked: Vec<_> = submitted.iter().map(|s| s.request.resources).collect();
+        let sources: Vec<_> = submitted
+            .iter()
+            .map(|s| (s.evidence.cpu_source, s.evidence.memory_source))
+            .collect();
+        assert_eq!(
+            whole,
+            [exclusive, exclusive, false],
+            "exclusive={exclusive}"
+        );
+        assert_eq!(
+            sources,
+            [(Unnamed, Unnamed), (Hint, Hint), (Unnamed, Unnamed)]
+        );
+        seen.push(booked);
+    }
+    // The booking the scheduler would otherwise use is the same either way.
+    assert_eq!(seen[0], seen[1]);
+}
+
 /// Catches: a named size that equals the default read as the default (the estimator
 /// would then lower an explicit client ask: the source decided by comparing the
 /// booked value to the default), one axis's key marking the other's source, a source

@@ -65,6 +65,8 @@ fn args_for<'a>(sha: &'a str, out: &'a str) -> Vec<&'a str> {
     let mut args = vec!["release", "fetch-previous", "--repo", REPO, "--sha", sha];
     args.extend(["--platform", "linux-x86_64", "--binary", "kbf"]);
     args.extend(["--binary", "kbf-server", "--out", out]);
+    // A release that is not found is asked for again with no pause between the asks.
+    args.extend(["--release-poll-secs", "0"]);
     args
 }
 
@@ -100,11 +102,12 @@ impl Fx {
     }
 
     /// The release `tag` of `commit` as the pipeline publishes it: a tarball for each of
-    /// [`ASSETS`] with its SBOM and bundle, and the `SHA256SUMS`; and the artifacts
+    /// [`ASSETS`] with its SBOM and bundle, the version facts of each `kbf`, and the `SHA256SUMS`; and the artifacts
     /// workflow's attestations of them. The tarball of `kbf-server` holds the entry
     /// `server_entry`.
     fn release_with(&self, tag: &str, commit: &str, server_entry: &str) {
         let mut assets = Vec::new();
+        let mut facts = Vec::new();
         for (binary, platform) in ASSETS {
             let entry = if binary == "kbf-server" {
                 server_entry
@@ -112,9 +115,16 @@ impl Fx {
                 binary
             };
             let tgz = tarball(entry, &asset_bytes(binary, platform, commit)).expect("tarball");
-            assets.push((format!("{binary}-{commit}-{platform}"), tgz));
+            let stem = format!("{binary}-{commit}-{platform}");
+            if binary == "kbf" {
+                facts.push((
+                    stem.clone(),
+                    format!("{{\"stem\":\"{stem}\"}}\n").into_bytes(),
+                ));
+            }
+            assets.push((stem, tgz));
         }
-        self.publish(tag, commit, &assets);
+        self.publish_with_facts(tag, commit, &assets, &facts);
     }
 
     /// The release `tag` of `commit`, whole.
@@ -332,6 +342,57 @@ fn a_tag_with_no_release_is_an_error_not_a_step_back_to_a_lower_tag() {
 }
 
 #[test]
+fn a_release_that_is_still_a_draft_is_waited_for_and_then_fetched() {
+    // Catches: GitHub's 404 for the previous tag's release while it is still a draft (its tag
+    // is pushed minutes before the release is published) taken as an error at the first ask,
+    // which turned every push to main in that window red; and a step back to a lower tag
+    // instead of waiting for the release before N.
+    let f = fx("draft");
+    let tags = [("v0.0.1", "ahead"), (TAG, "ahead")];
+    let mut more = found(TAG, PREV);
+    more.extend(annotated("v0.0.1", PREV));
+    f.github(&tags, more);
+    f.release(TAG, PREV);
+    std::fs::write(f.root.join("gh/gh-fault"), format!("draft-release:{TAG}:2")).expect("fault");
+    let (code, out, err) = f.run(&[], None);
+    assert_eq!(code, Some(0), "{err}");
+    assert_eq!(value(&out, "previous-tag"), TAG);
+    assert_eq!(names_in(&f.out()), ["kbf", "kbf-server"]);
+    assert!(err.contains("not found yet"), "{err}");
+    let asked = std::fs::read_to_string(f.root.join("gh/gh-draft-asked")).expect("asked");
+    assert_eq!(asked.trim(), "3", "two drafts, then the published release");
+}
+
+#[test]
+fn a_release_never_published_is_still_an_error_after_the_asks() {
+    // Catches: the wait made endless, or its end taken as "no previous release" (exit 0,
+    // `none`) instead of the error a missing release is.
+    let f = world("never-published");
+    std::fs::write(
+        f.root.join("gh/gh-fault"),
+        format!("draft-release:{TAG}:99"),
+    )
+    .expect("fault");
+    let ran = f.run(&["--release-attempts", "3"], None);
+    f.assert_refused(
+        ran,
+        &format!("releases/tags/{TAG}: not found (HTTP 404), asked 3 times"),
+    );
+    let asked = std::fs::read_to_string(f.root.join("gh/gh-draft-asked")).expect("asked");
+    assert_eq!(asked.trim(), "3");
+}
+
+#[test]
+fn no_asks_at_all_is_refused_as_a_usage_error() {
+    // Catches: `--release-attempts 0` taken as one ask, or as no ask (no previous release).
+    let f = world("zero-asks");
+    let (code, out, err) = f.run(&["--release-attempts", "0"], None);
+    assert_eq!(code, Some(2), "{err}");
+    assert_eq!(out, "");
+    assert!(err.contains("--release-attempts"), "{err}");
+}
+
+#[test]
 fn a_failed_call_is_an_error_and_never_no_tags() {
     // Catches: an API failure (HTTP 502) or an answer that is not JSON read as "no release
     // tags": exit 0 and `previous-source=none`, a green job on an N-1 test that never ran.
@@ -471,6 +532,33 @@ fn damage_no_sbom(f: &Fx) {
     let text = std::fs::read_to_string(&store).expect("attested");
     let kept: Vec<&str> = text.lines().filter(|l| !l.ends_with(SBOM)).collect();
     std::fs::write(&store, format!("{}\n", kept.join("\n"))).expect("write");
+}
+
+/// The release lists the `kbf` tarball and no longer its version facts: a release made before
+/// the build jobs recorded them.
+fn damage_no_version_facts(f: &Fx) {
+    let facts = format!("kbf-{PREV}-linux-x86_64.version.json");
+    std::fs::remove_file(f.asset(&facts)).expect("remove");
+    let sums = f.asset("SHA256SUMS");
+    let text = std::fs::read_to_string(&sums).expect("sums");
+    let kept: String = text
+        .lines()
+        .filter(|l| !l.ends_with(&facts))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    assert_ne!(kept, text, "the facts were listed");
+    std::fs::write(&sums, kept).expect("write");
+}
+
+#[test]
+fn a_previous_release_without_the_version_facts_of_its_kbf_is_refused() {
+    // Catches: the previous release read with the facts waived (as it was for the release made
+    // before the build jobs recorded them), so a release without them is unpacked and run.
+    let why = format!(
+        "kbf-{PREV}-linux-x86_64.tar.gz: its version facts kbf-{PREV}-linux-x86_64.version.json \
+         are not listed in SHA256SUMS"
+    );
+    refuses_damaged("no-version-facts", damage_no_version_facts, &why);
 }
 
 #[test]

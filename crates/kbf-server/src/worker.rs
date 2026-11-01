@@ -27,7 +27,7 @@
 //!   leaves out that was lost to a restart past its farm reruns answers the
 //!   operation's callers. The pack-read counts it carries, if any, are kept as the node's
 //!   newest for `/metrics` ([`Farm::note_pack_reads`]), and so are its pack-write counts
-//!   ([`Farm::note_pack_writes`]);
+//!   ([`Farm::note_pack_writes`]) and its input cache counts ([`Farm::note_input_cache`]);
 //! - a `Result` the deny list now refuses ends the stream, so it never reaches the
 //!   action cache. Otherwise it is accepted only from the node holding the
 //!   operation's current lease, and only if the action it names (if any) is the one
@@ -338,6 +338,7 @@ impl Session {
                 // has its counts on `/metrics`.
                 farm.note_pack_reads(worker, stream, beat.pack_reads);
                 farm.note_pack_writes(worker, stream, beat.pack_writes);
+                farm.note_input_cache(worker, stream, beat.input_cache);
                 // The accepted reading goes to the scheduler with the heartbeat.
                 let load = farm.note_node_load(worker, stream, beat.node_load.as_ref());
                 let running = beat

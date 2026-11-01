@@ -14,7 +14,8 @@
 # `id-token` or `attestations` permission.
 #
 # It is the only job of the beta stage that reads the run's artifacts, so it is the only one that
-# waits for the artifacts stage: pipeline.yml calls this workflow `needs: [artifacts]`, and calls
+# waits for the artifacts stage: pipeline.yml calls this workflow `needs: [artifacts-sign]` (the files
+# built, then attested and verified after ci), and calls
 # beta.yml (every other job, which builds what it runs) beside ci, with nothing to wait for.
 # This file has `workflow_call` alone, and the lint of beta.yml (beta_succeeds) holds it to the
 # same rules: a green run of both is a passed beta.

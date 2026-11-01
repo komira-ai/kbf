@@ -432,6 +432,9 @@ message Resources {
   uint64 vms = 4;
   // The most Action leases a node runs at once; unset: no cap.
   optional uint64 leases = 5;
+  // Bytes of scratch disk, added after format 1 (as an additive field): a log written before it
+  // has no field 6, which reads as 0 (books no disk), and 0 is not written.
+  uint64 disk_bytes = 6;
 }
 
 // A key and a value: a request property, or an exact capability a node reports.
@@ -491,6 +494,7 @@ enum Consumable {
   CONSUMABLE_MEM_GIB = 2;
   CONSUMABLE_NVME_GIB = 3;
   CONSUMABLE_GPUS = 4;
+  CONSUMABLE_DISK_GIB = 5;
 }
 
 // One execution request (kbf-sched's Request). `needs` is the capability request as the

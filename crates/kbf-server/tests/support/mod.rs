@@ -277,6 +277,7 @@ impl Cell {
             None,
             default_platform,
             kbf_server::LearnedSizes::Off,
+            true,
         )
         .await
     }
@@ -297,6 +298,35 @@ impl Cell {
             retention,
             ladder,
             StreamLimits::DEFAULT,
+        )
+        .await
+    }
+
+    /// A cell that books `ladder`'s first rung and never climbs it (`--no-memory-climb`), on
+    /// the legacy core whichever core the tests run on, with learned sizes `mode`, keeping its
+    /// scheduler's state in `state` if given.
+    pub async fn start_no_climb(
+        mode: kbf_server::LearnedSizes,
+        ladder: MemoryLadder,
+        state: Option<kbf_server::StateStore>,
+    ) -> Self {
+        let store = SharedStore::new();
+        let cache = Self::cold_cache(&store, None).await;
+        let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
+        Self::serve_with_map(
+            cache,
+            store,
+            None,
+            None,
+            wait,
+            retention,
+            ladder,
+            StreamLimits::DEFAULT,
+            None,
+            state,
+            kbf_front::DefaultPlatform::NONE,
+            mode,
+            false,
         )
         .await
     }
@@ -324,6 +354,7 @@ impl Cell {
             state,
             kbf_front::DefaultPlatform::NONE,
             mode,
+            true,
         )
         .await
     }
@@ -365,6 +396,7 @@ impl Cell {
             None,
             kbf_front::DefaultPlatform::NONE,
             kbf_server::LearnedSizes::Off,
+            true,
         )
         .await
     }
@@ -394,6 +426,7 @@ impl Cell {
             Some(state),
             kbf_front::DefaultPlatform::NONE,
             kbf_server::LearnedSizes::Off,
+            true,
         )
         .await
     }
@@ -421,6 +454,7 @@ impl Cell {
             Some(state),
             kbf_front::DefaultPlatform::NONE,
             kbf_server::LearnedSizes::Off,
+            true,
         )
         .await
     }
@@ -614,6 +648,7 @@ impl Cell {
             None,
             kbf_front::DefaultPlatform::NONE,
             kbf_server::LearnedSizes::Off,
+            true,
         )
         .await
     }
@@ -633,6 +668,7 @@ impl Cell {
         state: Option<kbf_server::StateStore>,
         default_platform: kbf_front::DefaultPlatform,
         learned: kbf_server::LearnedSizes,
+        climb: bool,
     ) -> Self {
         let listeners = Listeners {
             reapi: SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -646,10 +682,19 @@ impl Cell {
             default_platform,
             qos_allowed: kbf_front::QosAllow::DEFAULT,
             memory_ladder: ladder,
+            memory_climb: climb,
             vm_host_floor: kbf_server::HostFloor::default(),
             learned_sizes: learned,
-            scheduler_core: kbf_server::SchedulerCore::under_test(),
+            exclusive_actions: false,
+            // The js core cannot be told not to climb (the server refuses the flag with it).
+            scheduler_core: if climb {
+                kbf_server::SchedulerCore::under_test()
+            } else {
+                kbf_server::SchedulerCore::Legacy
+            },
             placement_load: kbf_server::PlacementLoad::Off,
+            placement_predictions: kbf_server::PlacementPredictions::Off,
+            usage_profiles: kbf_server::UsageProfiles::Off,
             whole_node: None,
             finished_retention: retention,
             shutdown_timeout: Duration::from_secs(10),
@@ -1208,6 +1253,7 @@ impl FakeDaemon {
             pack_reads: None,
             pack_writes: None,
             node_load: load,
+            input_cache: None,
         }));
         self.expect("HeartbeatAck", ack_of(seq)).await;
     }
@@ -1233,6 +1279,7 @@ impl FakeDaemon {
             pack_reads,
             pack_writes,
             node_load: None,
+            input_cache: None,
         }));
         seq
     }

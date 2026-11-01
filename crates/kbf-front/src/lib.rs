@@ -46,6 +46,12 @@
 //! layer it is empty metadata. [`routes`] and [`routes_with_execution`] allow every
 //! call.
 //!
+//! **The job-facing read.** A task on a worker holds a read grant ([`grants`]), not a client
+//! certificate, and fetches the inputs of its Action with `GET /<hex>/<size>`: [`job_read::JobRead`]
+//! answers, over any [`job_read::BlobSource`] (a [`Backend`] in a running frontend), only for the
+//! blobs in the grant's scope (its Action, Command and input tree). `kbf frontend --job-listen`
+//! serves it over HTTPS.
+//!
 //! **The build a call belongs to.** [`RequestMetadataLayer`], beside the
 //! authentication layer, reads each call's REAPI `RequestMetadata` header into a
 //! [`CallMetadata`] ([`call_metadata`]); its `tool_invocation_id` is the invocation id
@@ -68,11 +74,15 @@ mod described;
 mod dir_cache;
 mod execution;
 mod finished_row;
+pub mod grants;
 mod input_tree;
 mod input_walk;
+pub mod job_read;
+pub mod large_backfill;
 mod meta_log;
 pub mod metrics;
 mod operations;
+pub mod prepare_run;
 mod proxy;
 mod qos_header;
 mod recorder;
@@ -80,6 +90,7 @@ mod request_metadata;
 mod routed;
 mod segments;
 mod storage;
+pub mod store_metrics;
 mod wire;
 
 use std::sync::Arc;
@@ -128,9 +139,13 @@ pub use crate::input_tree::{ENTRY_OVERHEAD, InputTreeConfig};
 pub use crate::meta_log::{Leadership, MemoryMetaLog, MetaLog, MetaLogError};
 pub use crate::operations::OperationsService;
 pub use crate::proxy::{
-    CommitError, DEFAULT_INFLIGHT_BYTES, DEFAULT_UPLOAD_IDLE_TIMEOUT, Direction, MAX_COMMIT_BLOBS,
-    MAX_PACKED_BLOB_BYTES, MAX_UPLOAD_IDLE_TIMEOUT, Meter, Method, Owner, Owners, PackMetrics,
-    PackSettings, PackStore, Packs, Proxy,
+    Claim, Claimed, Clock, CommitError, DEFAULT_INFLIGHT_BYTES, DEFAULT_UPLOAD_IDLE_TIMEOUT,
+    Direction, Held, Ingested, IssuedKeySet, IssuedPackKey, LargeWriteThrough, MAX_COMMIT_BLOBS,
+    MAX_PACKED_BLOB_BYTES, MAX_UNTRUSTED_BLOB_BYTES, MAX_UNTRUSTED_LARGE_BYTES,
+    MAX_UNTRUSTED_MANIFEST_BYTES, MAX_UNTRUSTED_PACK_BYTES, MAX_UNTRUSTED_READ_BYTES,
+    MAX_UPLOAD_IDLE_TIMEOUT, MIN_SECRET_BYTES, Meter, Method, MintError, Owner, Owners,
+    PackKeyMint, PackMetrics, PackSettings, PackStore, Packs, Proxy, RejectReason, StoreError,
+    UntrustedLimits, VerifyingKeys, ingest, ingest_set,
 };
 pub use crate::qos_header::{BadQosAllow, QOS_HEADER, QosAllow};
 pub use crate::recorder::{
@@ -256,6 +271,7 @@ where
             memory: DEFAULT_RESOURCES.memory_bytes,
             platform: DefaultPlatform::NONE,
             qos: QosAllow::DEFAULT,
+            exclusive_actions: false,
         },
     )
 }
@@ -272,6 +288,9 @@ pub struct Defaults {
     /// The levels the `x-kbf-qos` header may name
     /// ([`ExecutionService::with_qos_allow`]).
     pub qos: QosAllow,
+    /// Whether every `action` lease owns the whole worker it lands on
+    /// ([`ExecutionService::with_exclusive_actions`]).
+    pub exclusive_actions: bool,
 }
 
 /// [`routes_with_authorizers`], each call that carries an invocation id sent to
@@ -303,7 +322,8 @@ where
         .with_progress(progress)
         .with_default_memory(defaults.memory)
         .with_default_platform(defaults.platform)
-        .with_qos_allow(defaults.qos),
+        .with_qos_allow(defaults.qos)
+        .with_exclusive_actions(defaults.exclusive_actions),
     )
     .max_decoding_message_size(MAX_MESSAGE_BYTES)
     .max_encoding_message_size(MAX_MESSAGE_BYTES);
@@ -346,7 +366,8 @@ where
             .with_progress(progress)
             .with_default_memory(defaults.memory)
             .with_default_platform(defaults.platform)
-            .with_qos_allow(defaults.qos);
+            .with_qos_allow(defaults.qos)
+            .with_exclusive_actions(defaults.exclusive_actions);
     let execution = ExecutionServer::new(service)
         .max_decoding_message_size(MAX_MESSAGE_BYTES)
         .max_encoding_message_size(MAX_MESSAGE_BYTES);

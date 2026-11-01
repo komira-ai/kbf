@@ -108,6 +108,7 @@ impl Rig {
                     hermetic: true,
                     do_not_cache: false,
                     needs,
+                    whole_worker: false,
                 },
                 call: None,
                 described: kbf_front::Described::default(),

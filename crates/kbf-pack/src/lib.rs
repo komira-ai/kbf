@@ -17,10 +17,18 @@
 //! - [`ReadCache`] is the bounded on-disk cache of blobs a reader keeps in front of the
 //!   store: least recently used out first, written with a temporary file and a rename,
 //!   checked by digest on every read.
+//! - [`Sweeper`] deletes the orphans under `cas/b/`: the packs a task wrote that nothing ever
+//!   recorded, once they are older than a grace period.
 //! - [`Adopter`] indexes, in place, the segments that storage members flushed to the cold store
 //!   before there were packs: a segment has the layout of a pack, so one record of the index
 //!   per segment, made from its footer, makes its blobs readable through [`Reader`]. It copies
 //!   nothing, and does nothing unless it is run; the operator tool `kbf-pack-adopt` runs it.
+//! - The task pack types ([`TaskManifest`], [`TaskPackKey`], [`check_shape`], [`write_pack`]) live
+//!   in the `kbf-task-pack` crate, which a static task binary links without this crate's index and
+//!   store client, and are re-exported here. They are the shared, pure contract of a pack written
+//!   by a task that has no store credential: one pack whose record at offset 0 is a JSON manifest,
+//!   under a key the frontend minted. The task that writes one and the frontend that ingests it use
+//!   these, so the two cannot drift. They do no I/O and hold no secret.
 //!
 //! Pack keys are `cas/d/<node>/<boot>/<seq>` for a daemon and `cas/f/<frontend>/<boot>/<seq>`
 //! for a frontend ([`PackKeys`]); the sequence number is sixteen hex digits, so a listing of
@@ -37,6 +45,7 @@ mod error;
 mod keys;
 mod packer;
 mod reader;
+mod sweep;
 
 pub use adopt::{
     AdoptConfig, AdoptError, AdoptMode, AdoptReport, AdoptRun, Adopter, CHECKPOINT_EVERY,
@@ -45,8 +54,20 @@ pub use adopt::{
 pub use cache::ReadCache;
 pub use digest::blob_digest;
 pub use error::{CacheError, PackError, ReadError};
+pub use kbf_task_pack::{
+    EMPTY_DIGEST, InputStats, LargeEntry, MAC_LEN, MANIFEST_VERSION, MANIFEST_VERSION_2,
+    MAX_BUILD_BYTES, MAX_LARGE, MAX_MANIFEST_BYTES, MAX_PACK_BYTES, MAX_PACK_RECORDS, MAX_PACKS,
+    MAX_PATH_BYTES, MAX_RECORD_BYTES, ManifestError, OutputDirectory, OutputFile, OutputSymlink,
+    PathError, ShapeError, Slot, SourceBytes, TaskKeyError, TaskManifest, TaskPackError,
+    TaskPackKey, Timing, Usage, WritePackError, check_build, check_records, check_shape, mac_input,
+    mac_input_v1, minute_of, read_manifest, read_manifest_with, write_pack, write_pack_with,
+};
 pub use keys::{PackKeys, WriterKind};
 pub use packer::{
     Blob, FRONTEND_PACK_BYTES, Packed, Packer, PackerConfig, StoredPack, check_create_only,
 };
 pub use reader::{DEFAULT_CONCURRENCY, DEFAULT_GAP, Fetch, Reader, ReaderConfig};
+pub use sweep::{
+    AgeOf, Claim, ClaimOf, DEFAULT_GRACE, INGEST_ALLOWANCE, MAX_KEY_LIFE, MIN_GRACE, SWEPT_PREFIX,
+    SweepConfig, SweepError, SweepGates, SweepReport, Sweeper, task_key_age,
+};

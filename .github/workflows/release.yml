@@ -6,8 +6,9 @@
 #
 # The run is started by one event and nothing else: the completion of a run of the pipeline
 # (`workflow_run`), and only a pipeline run that succeeded, for a push to main of this
-# repository. The pipeline is ci and the source tests of beta.yml (side by side), artifacts after ci and
-# the smoke on those artifacts after artifacts, and a closing job that needs all of them, so a release is
+# repository. The pipeline is ci, the source tests of beta.yml and the artifact builds (side by side),
+# the signing of those artifacts after ci, the smoke on the signed artifacts, and a closing job that
+# needs all of them, so a release is
 # cut only from a commit on which every job of every stage passed. No tag starts this
 # workflow (a tag the release bot makes would start a second run, and a hand-pushed `v*` tag
 # starts nothing, since only the release bot may create one), and there is no hand-started dry
@@ -316,14 +317,14 @@ jobs:
         if: ${{ steps.previous.outputs.previous != '' }}
         working-directory: previous
         run: sha256sum --check --strict SHA256SUMS
-      # The release before the build jobs recorded version facts has none, and this is the
-      # only check that waives them: the release being made (`release check dist`) never does.
-      # Remove the flag once the release before this one was made with the facts.
+      # The previous release is held to the same rules as this one: the version facts of its `kbf`,
+      # and the facts and the CycloneDX SBOM of its task image, are all listed. No flag waives them
+      # (the workflow lint refuses one on either `release check`).
       - name: Every one is an asset of the previous release's commit, with its bundle
         if: ${{ steps.previous.outputs.previous != '' }}
         env:
           PREVIOUS_COMMIT: ${{ steps.previous.outputs.previous-commit }}
-        run: cargo xtask release check previous --commit "$PREVIOUS_COMMIT" --without-version-facts
+        run: cargo xtask release check previous --commit "$PREVIOUS_COMMIT"
       - name: Verify the previous release's attestations as these were
         if: ${{ steps.previous.outputs.previous != '' }}
         env:

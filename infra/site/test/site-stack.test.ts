@@ -299,7 +299,10 @@ describe('context parameters', () => {
   });
   test('the domain defaults to kbf.dev and can be overridden', () => {
     expect(c.siteConfig(ctx(ok)).domain).toBe('kbf.dev');
-    expect(c.siteConfig(ctx({ ...ok, domain: 'docs.example.org' })).domain).toBe('docs.example.org');
+    expect(c.siteConfig(ctx({ ...ok, domain: 'docs.example.org', site: 'docs' })).domain).toBe('docs.example.org');
+  });
+  test('a domain that is not a known site needs a site id, so it never gets kbf\'s names', () => {
+    expect(() => c.siteConfig(ctx({ ...ok, domain: 'docs.example.org' }))).toThrow(/site/);
   });
   test.each([
     [{ githubRepoId: undefined }, /githubRepoId/],

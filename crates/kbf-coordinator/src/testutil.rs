@@ -6,7 +6,7 @@ use kbf_types::{HostRole, NodeId, ReleasePlatform};
 use kbf_updater::version::Version;
 use kbf_updater::wire::{Health, Heartbeat, Outcome, UpdateResult};
 
-use crate::desired::{Desired, MaxUpdating, MinUp};
+use crate::desired::{Desired, RoleLimits};
 use crate::fleet::Fleet;
 
 pub fn version(text: &str) -> Version {
@@ -30,6 +30,12 @@ pub fn beat(running: &str) -> Heartbeat {
         last_update: None,
         updating: None,
         services: None,
+        agent_features: Vec::new(),
+        step: None,
+        commit: None,
+        step_secs: Default::default(),
+        promotion_pending: false,
+        deferred: None,
     }
 }
 
@@ -44,10 +50,7 @@ pub fn updating(mut b: Heartbeat, target: &str) -> Heartbeat {
 }
 
 pub fn last(mut b: Heartbeat, target: &str, outcome: Outcome) -> Heartbeat {
-    b.last_update = Some(UpdateResult {
-        target: version(target),
-        outcome,
-    });
+    b.last_update = Some(UpdateResult::new(version(target), outcome));
     b
 }
 
@@ -56,8 +59,8 @@ pub fn last(mut b: Heartbeat, target: &str, outcome: Outcome) -> Heartbeat {
 pub fn desired(target: &str, storage: u32, frontend: u32) -> Desired {
     Desired {
         version: version(target),
-        max_updating: MaxUpdating::default(),
-        min_up: MinUp { storage, frontend },
+        max_updating: RoleLimits::max_updating_default(),
+        min_up: RoleLimits::from([("storage", storage), ("frontend", frontend)]),
     }
 }
 
@@ -65,7 +68,7 @@ pub fn desired(target: &str, storage: u32, frontend: u32) -> Desired {
 pub fn fleet(seen: Duration, hosts: &[(&str, HostRole, Heartbeat)]) -> Fleet {
     let mut fleet = Fleet::new(Duration::ZERO);
     for (name, role, b) in hosts {
-        fleet.record(id(name), *role, b.clone(), seen);
+        fleet.record(id(name), role.clone(), b.clone(), seen);
     }
     fleet
 }
@@ -82,10 +85,16 @@ use kbf_oidc::{AllowList, KeySource, OidcConfig, Verifier};
 use kbf_testkit::dir::TestDir;
 
 use crate::desired::DesiredStore;
+use crate::ops::OpsStore;
 use crate::service::{Clock, Coordinator};
 
 /// The operator token of the tests.
 pub const OPERATOR: &str = "operator-token-0123456789abcdef0123456789";
+
+/// The ops file of a rig's directory: the default of `--ops-file` beside `desired.json`.
+pub fn ops_of(dir: &TestDir) -> OpsStore {
+    OpsStore::open(&dir.path().join("desired.json.ops")).expect("an ops store")
+}
 
 /// A coordinator whose clock the test sets, over a state file in a directory of its own.
 pub struct Rig {
@@ -141,7 +150,8 @@ impl Rig {
             unreachable_verifier(),
             OPERATOR.to_owned(),
             clock_of(&clock),
-        );
+        )
+        .with_ops(ops_of(&dir));
         Self::of(coordinator, clock, dir)
     }
 
@@ -163,6 +173,7 @@ impl Rig {
         let store = DesiredStore::open(&dir.path().join("desired.json")).expect("a store");
         let (verifier, _) = static_verifier();
         Coordinator::new(store, verifier, OPERATOR.to_owned(), clock_of(clock))
+            .with_ops(ops_of(dir))
     }
 
     /// A coordinator on the same state file whose CI tokens are checked against the
@@ -182,6 +193,7 @@ impl Rig {
             OPERATOR.to_owned(),
             clock_of(clock),
         )
+        .with_ops(ops_of(dir))
     }
 
     pub fn restart(&mut self) {
@@ -205,4 +217,43 @@ impl Rig {
 /// A token CI would send, valid for the allow-list of the testkit, signed by its first key.
 pub fn ci_token() -> String {
     mint(&keys()[0], &good_claims(STATIC_ISSUER))
+}
+
+/// What a subscriber wrote.
+#[derive(Clone, Default)]
+pub struct Log(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl Log {
+    pub fn text(&self) -> String {
+        String::from_utf8(self.0.lock().expect("lock").clone()).expect("UTF-8")
+    }
+
+    /// Installs a subscriber that writes here, for as long as the guard lives.
+    pub fn install(&self) -> tracing::subscriber::DefaultGuard {
+        tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(self.clone())
+                .with_ansi(false)
+                .finish(),
+        )
+    }
+}
+
+impl std::io::Write for Log {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("lock").extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Log {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self {
+        self.clone()
+    }
 }

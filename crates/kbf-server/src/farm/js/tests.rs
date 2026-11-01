@@ -1,4 +1,5 @@
-//! Tests of the js core's construction (`super`), run in a build with `farm-core-js`.
+//! Tests of the js core's construction (`super`). Their farms name the js core, so they run
+//! the same in a build with `farm-core-js` and in one without.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,17 +12,30 @@ use kbf_state::fake::{Fake, Flaw};
 use kbf_state::{ManualClock, Store};
 
 use super::*;
-use crate::PlacementLoad;
 use crate::farm::EpochPolicy;
+use crate::learned::LearnedSizes;
 use crate::state_store::StateStore;
+use crate::{PlacementLoad, PlacementPredictions};
 
+mod ablation;
+mod exclusive;
 mod hot;
+mod learned;
+
+mod one_recorder;
+
+mod placement;
+
+mod usage;
+
+mod usage_on;
 
 mod views;
 
 fn farm() -> Farm {
-    Farm::new(
-        Arc::new(Cache::memory()),
+    Farm::on_core(
+        crate::SchedulerCore::Js,
+        Arc::new(Cache::memory()).into(),
         UNSERVABLE_WAIT,
         FINISHED_RETENTION,
     )
@@ -34,8 +48,7 @@ fn js(farm: &Farm) -> &JsFarm {
     }
 }
 
-/// Catches `Farm::new` building the legacy driver in a build with the feature (every farm
-/// suite would then run on the core it is not meant to test), a farm that takes a state
+/// Catches `Farm::on_core` building the legacy driver for the js core, a farm that takes a state
 /// store over without building its core over it (no epoch), and a term or lease epoch that
 /// is not the epoch the core opened under: `Welcome` and every lease id would name an epoch
 /// the store does not hold. The farm's ambient term is fixed to a value no process term
@@ -95,6 +108,7 @@ fn the_cores_configuration_carries_every_setting_of_the_farm() {
         Duration::from_secs(5),
         Duration::from_secs(6),
         &settings,
+        None,
     );
     assert_eq!(config.term, 11);
     assert_eq!(config.unservable_wait, Duration::from_secs(5));
@@ -108,7 +122,13 @@ fn the_cores_configuration_carries_every_setting_of_the_farm() {
         config.load.is_some(),
         "the placement mode is given explicitly"
     );
-    let bare = open::farm_config(11, Duration::ZERO, Duration::ZERO, &Settings::default());
+    let bare = open::farm_config(
+        11,
+        Duration::ZERO,
+        Duration::ZERO,
+        &Settings::default(),
+        None,
+    );
     assert!(bare.whole_node.is_none());
 }
 
@@ -129,9 +149,45 @@ fn the_builders_rebuild_the_core_and_keep_the_settings() {
     assert!(js.settings.whole_node.is_some());
 }
 
+/// Catches `--placement-predictions` not reaching the adapter of a js farm, in either order of
+/// the builders (the estimator is rebuilt by `with_learned_sizes`, which must not drop the mode)
+/// and a mode other than `on` handed to the scheduler.
+#[test]
+fn the_predictions_mode_reaches_the_adapter_in_either_order_of_the_builders() {
+    let hands = |farm: &Farm| js(farm).core.with(|_, adapter| adapter.hands_predictions());
+    for (mode, expected) in [
+        (PlacementPredictions::On, true),
+        (PlacementPredictions::Shadow, false),
+        (PlacementPredictions::Off, false),
+    ] {
+        let first = farm()
+            .with_learned_sizes(LearnedSizes::Shadow, 4 << 30)
+            .with_placement_predictions(mode);
+        let second = farm()
+            .with_placement_predictions(mode)
+            .with_learned_sizes(LearnedSizes::Shadow, 4 << 30);
+        assert_eq!(hands(&first), expected, "{mode:?}, learned first");
+        assert_eq!(hands(&second), expected, "{mode:?}, predictions first");
+    }
+}
+
 /// Catches a farm on the js driver that names the legacy core (the gauge
 /// `kbf_scheduler_core` and anything else reading it would say so too).
 #[test]
 fn a_js_farm_names_the_js_core() {
     assert_eq!(farm().scheduler_core(), crate::SchedulerCore::Js);
+}
+
+/// Catches a held cap lost on a farm that runs the legacy core in a build with the feature:
+/// `with_held_cap` checks for the js driver first, and a legacy farm must still get the cap.
+#[test]
+fn a_legacy_farm_in_a_js_build_takes_its_held_cap() {
+    let farm = Farm::on_core(
+        crate::SchedulerCore::Legacy,
+        Arc::new(Cache::memory()).into(),
+        UNSERVABLE_WAIT,
+        FINISHED_RETENTION,
+    )
+    .with_held_cap(3);
+    assert_eq!(farm.lock().engine.held_cap, 3);
 }

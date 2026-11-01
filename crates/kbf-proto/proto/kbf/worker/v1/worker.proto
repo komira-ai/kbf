@@ -373,6 +373,41 @@ message Heartbeat {
   // reads it and the read succeeded: a runtime that does not, a failed read, or a daemon
   // built before the field sends none, and a server built before it skips the field.
   NodeLoad node_load = 6;
+  // What the node's input cache has done since the daemon process started. Present only when
+  // the daemon's runtime has an input cache that opened: a runtime without one (also with the
+  // cache off), or a daemon built before the field, sends none, and a server built before it
+  // skips the field. Absent is not zero.
+  InputCacheCounts input_cache = 7;
+}
+
+// The counts of a daemon's input cache, cumulative since the daemon process started (they
+// start again from 0 when it restarts, as a counter may). The unit is the cache entry (one
+// blob, by digest and executable bit), not the file name a lease places it under.
+message InputCacheCounts {
+  // Entries written into the cache from the content store, and their bytes. An entry copied
+  // from its executable or plain sibling, or adopted from disk, is not a fill.
+  uint64 fills = 1;
+  uint64 fill_bytes = 2;
+  // Entries a lease found in the cache and used, and their bytes. A lease that waited for
+  // another's fill and then used the entry counts a hit; the lease that filled it does not.
+  uint64 hits = 3;
+  uint64 hit_bytes = 4;
+  // Entries removed to keep the byte budget or the free-space floor, and their bytes. An entry
+  // removed because it failed its check is not one.
+  uint64 evictions = 5;
+  uint64 evicted_bytes = 6;
+  // The node's shared tree store, when it has one.
+  TreeCounts trees = 7;
+}
+
+// The counts of a daemon's shared tree store, cumulative since the daemon process started.
+message TreeCounts {
+  // Trees built from cache entries.
+  uint64 builds = 1;
+  // Acquires that found the tree built.
+  uint64 hits = 2;
+  // Trees evicted.
+  uint64 evictions = 3;
 }
 
 // One reading of the cgroup that holds the node's actions. Every counter is cumulative

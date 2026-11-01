@@ -91,9 +91,40 @@ fn the_line_names_the_hint_and_the_derived_target_apart() {
         format!(
             "exit_code=0 mnemonic=- target_hint=\"//pkg:t\" wall_us=1000 {cgroup} key={} \
              cfg=7a3c1e9f0b2d4c68 target=\"cell//pkg:t\" target_kind=target outcome=oom \
-             lease={lease} node=node-a",
+             lease={lease} node=node-a booked_millicpus=- booked_memory_bytes=-",
             subject.key
         )
+    );
+}
+
+/// Catches: the booking a lease was granted left off its line, or written in other units
+/// than its `Start` carries (thousandths of a CPU, bytes), or one axis written as the
+/// other; and a lease the server never started given a made-up booking rather than `-`.
+#[test]
+fn the_line_ends_with_the_booking_the_lease_was_granted() {
+    let subject = Shapes::default().subject(described(&["cc"], &[]));
+    let measured = Measured::of(&report(Code::Ok, 0, Some(&usage()))).expect("measured");
+    let (lease, node) = (LeaseId::new(1, 2), WorkerId::new("n"));
+    let judged = Outcome::Failed(Failure::Timeout);
+    let booked = Booked {
+        cpu_millis: 5_000,
+        memory_bytes: 12 << 30,
+    };
+    let text = line(
+        &subject,
+        &measured.clone().booked(Some(booked)),
+        judged,
+        lease,
+        &node,
+    );
+    assert!(
+        text.ends_with(" node=n booked_millicpus=5000 booked_memory_bytes=12884901888"),
+        "{text}"
+    );
+    let text = line(&subject, &measured, judged, lease, &node);
+    assert!(
+        text.ends_with(" node=n booked_millicpus=- booked_memory_bytes=-"),
+        "{text}"
     );
 }
 
@@ -137,7 +168,8 @@ fn a_mac_lease_has_a_line_with_what_its_runtime_measured() {
             "exit_code=0 mnemonic=- target_hint=- wall_us=2000000 cpu_usage_us=2000000 \
              cpu_user_us=1500000 cpu_system_us=500000 cpu_periods=- cpu_throttled=- \
              throttled_us=- mem_peak=1048576 parallelism=1.00 numa_bytes=- numa_spread=- \
-             key={} cfg=- target=- target_kind=- outcome=ok lease={lease} node=mac-1",
+             key={} cfg=- target=- target_kind=- outcome=ok lease={lease} node=mac-1 booked_millicpus=- \
+             booked_memory_bytes=-",
             subject.key
         )
     );
@@ -150,7 +182,8 @@ fn a_mac_lease_has_a_line_with_what_its_runtime_measured() {
         line_of(&whole_machine),
         format!(
             "exit_code=0 mnemonic=- target_hint=- wall_us=7 {} key={} cfg=- target=- \
-             target_kind=- outcome=ok lease={lease} node=mac-1",
+             target_kind=- outcome=ok lease={lease} node=mac-1 booked_millicpus=- \
+             booked_memory_bytes=-",
             kbf_proto::no_cgroup_fields(),
             subject.key
         )

@@ -11,6 +11,7 @@ use kbf_testkit::dir::TestDir;
 use rcgen::{CertificateParams, CertifiedIssuer, IsCa, KeyPair};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use xtask::fetch::{self, Sha256, Unpack};
+use xtask::fetch_attested::{self, Request, Verifier};
 
 const XTASK: &str = env!("CARGO_BIN_EXE_xtask");
 const TOOL: &[u8] = b"a pinned tool";
@@ -262,4 +263,132 @@ fn flags_that_do_not_fit_together_exit_2() {
         assert!(err.contains(says), "{extra:?}: {err}");
     }
     assert!(!Path::new(out).exists());
+}
+
+/// A gzip tar holding the regular file `member` with the bytes `TOOL`.
+fn tool_archive(member: &str) -> Vec<u8> {
+    let mut h = tar::Header::new_ustar();
+    h.set_path(member).expect("path");
+    h.set_entry_type(tar::EntryType::Regular);
+    h.set_size(TOOL.len() as u64);
+    h.set_mode(0o755);
+    h.set_cksum();
+    let mut b = tar::Builder::new(Vec::new());
+    b.append(&h, TOOL).expect("append");
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    gz.write_all(&b.into_inner().expect("tar")).expect("gzip");
+    gz.finish().expect("gzip")
+}
+
+/// Answers every verification with `accept`.
+struct Answer(bool);
+
+impl Verifier for Answer {
+    fn verify(&self, _: &Path, _: &[String]) -> Result<(bool, String), xtask::Error> {
+        Ok((self.0, "refused by the fake".to_owned()))
+    }
+}
+
+fn attested<'a>(url: &'a str, bytes: &[u8], dir: &Path) -> Request<'a> {
+    Request {
+        url,
+        sha256: Sha256::of(bytes),
+        archive: dir.join("release/tool.tar.gz"),
+        member: "tool-1/tool".into(),
+        out: dir.join("tools/tool"),
+        repo: "owner/repo",
+        signer_workflow: "owner/repo/.github/workflows/release.yml",
+        source_ref: "refs/heads/main",
+        source_digest: "1f304ae75dbef20c9b01231b666b1e91e1f21743",
+    }
+}
+
+#[test]
+fn an_attested_download_over_https_installs_its_member_and_a_refused_one_installs_nothing() {
+    // Asserts: the archive served over TLS to a client that trusts the server's CA is written to
+    // --archive, handed to the verifier, and its member lands at --out with the verb's line;
+    // when the verifier refuses, the error says so and --out does not exist.
+    let archive = tool_archive("tool-1/tool");
+    let served = archive.clone();
+    let (base, ca) = serve(true, move |_, _| response("200 OK", &[], &served));
+    let url = format!("{base}/tool.tar.gz");
+    let roots = move || vec![ca.clone()];
+
+    let own = scratch("attested-ok");
+    let req = attested(&url, &archive, &own);
+    let line = fetch_attested::download_and_install(&req, &roots, &Answer(true)).expect("installs");
+    assert!(
+        line.starts_with(&format!("ok: {url} has SHA-256 {}", Sha256::of(&archive))),
+        "{line}"
+    );
+    assert_eq!(std::fs::read(&req.archive).expect("archive"), archive);
+    assert_eq!(std::fs::read(&req.out).expect("out"), TOOL);
+
+    let own = scratch("attested-refused");
+    let req = attested(&url, &archive, &own);
+    let err =
+        fetch_attested::download_and_install(&req, &roots, &Answer(false)).expect_err("refused");
+    assert!(err.to_string().contains("nothing was installed"), "{err}");
+    assert!(!req.out.exists());
+}
+
+#[test]
+fn an_attested_download_that_fails_is_an_error_naming_the_url_and_writes_nothing() {
+    // Asserts: a 404 from the server stops the verb before any file is written, and the
+    // verifier is not consulted.
+    let (base, ca) = serve(true, |_, _| response("404 Not Found", &[], b"gone"));
+    let url = format!("{base}/missing.tar.gz");
+    let own = scratch("attested-404");
+    let req = attested(&url, b"anything", &own);
+    let roots = move || vec![ca.clone()];
+    let err = fetch_attested::download_and_install(&req, &roots, &Answer(true)).expect_err("404");
+    assert!(err.to_string().contains(&url), "{err}");
+    assert!(!req.archive.exists() && !req.out.exists());
+}
+
+#[test]
+fn an_attested_member_that_leaves_the_archive_is_refused_before_the_roots_are_read() {
+    // Asserts: the usage error comes before the TLS roots are asked for (the closure panics if called).
+    let own = scratch("attested-member");
+    let mut req = attested("https://127.0.0.1:9/x", b"anything", &own);
+    req.member = "../tool".into();
+    let roots =
+        || -> Vec<CertificateDer<'static>> { panic!("roots read before the member was checked") };
+    let err =
+        fetch_attested::download_and_install(&req, &roots, &Answer(true)).expect_err("member");
+    assert!(err.to_string().contains("plain names"), "{err}");
+}
+
+#[test]
+fn the_fetch_attested_tool_verb_exits_1_when_the_download_fails_and_writes_nothing() {
+    // Asserts: the flags reach the verb (every one of them is required and parsed), an
+    // unreachable https url is an exit 1 naming the url, and neither --archive nor --out is made.
+    let own = scratch("attested-cli");
+    let archive = own.join("release/tool.tar.gz");
+    let out = own.join("tools/tool");
+    let url = "https://127.0.0.1:9/tool.tar.gz";
+    let result = Command::new(XTASK)
+        .args(["fetch-attested-tool", "--url", url, "--sha256", PIN])
+        .args(["--archive", archive.to_str().expect("utf-8")])
+        .args(["--member", "tool-1/tool"])
+        .args(["--out", out.to_str().expect("utf-8")])
+        .args(["--gh", "/nonexistent/gh", "--repo", "owner/repo"])
+        .args([
+            "--signer-workflow",
+            "owner/repo/.github/workflows/release.yml",
+        ])
+        .args(["--source-ref", "refs/heads/main"])
+        .args([
+            "--source-digest",
+            "1f304ae75dbef20c9b01231b666b1e91e1f21743",
+        ])
+        .output()
+        .expect("run xtask");
+    let err = String::from_utf8_lossy(&result.stderr);
+    assert_eq!(result.status.code(), Some(1), "{err}");
+    assert!(
+        err.starts_with(&format!("xtask: download {url}: ")),
+        "{err}"
+    );
+    assert!(!archive.exists() && !out.exists());
 }

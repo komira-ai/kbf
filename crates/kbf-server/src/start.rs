@@ -17,6 +17,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Duration;
 
+use kbf_front::store_metrics::{Counted, StoreMetrics};
 use kbf_front::{Cache, MetaLog};
 use kbf_log::FarmLogId;
 use kbf_meta::Retention;
@@ -31,11 +32,12 @@ use kbf_threads::disk::Statvfs;
 use kbf_tier::WriteTier;
 
 use crate::drain::Drain;
+use crate::key_file::cold_s3_store;
 use crate::local::LocalStore;
 use crate::startup_pass::StartPass;
 use crate::stores::{COLD_FILE_FLOOR, FILE_PREFIX_ROOT, Hot, StoreUri, Stores};
 use crate::write_tier::FLUSH_EVERY;
-use crate::{Args, RaftMetaLog, SERVER_VERSION, ServeError, bind_server_with_ui, s3_store};
+use crate::{Args, RaftMetaLog, SERVER_VERSION, ServeError, bind_server_with_ui};
 
 /// The server's thread sizes on a given machine shape: every CPU, then the overrides.
 pub fn sizes_on(args: &Args, topology: Topology) -> kbf_threads::Sizes {
@@ -201,6 +203,7 @@ where
 {
     args.check_scheduler_core()?;
     let stores = args.stores(&Statvfs)?;
+    args.check_cold_key_file()?;
     for line in stores.describe() {
         tracing::info!("{line}");
     }
@@ -218,7 +221,8 @@ where
             .await
         }
         StoreUri::S3(uri) => {
-            let store = s3_store(uri, |name| std::env::var(name).ok())?;
+            let file = args.cold_store_credentials_file.as_deref();
+            let store = cold_s3_store(uri, file, |name| std::env::var(name).ok())?;
             over(args, &stores, (store, None), &uri.prefix, shutdown).await
         }
     }
@@ -318,8 +322,12 @@ where
         invocations: policy.invocations_get.is_some(),
         blobs: policy.invocations_get.is_some() && policy.blobs_get.is_some(),
     };
+    // Every request to the cold store is counted into the cache's scrape.
+    let cold = Arc::new(StoreMetrics::cold());
+    let store = Counted::new(store, Arc::clone(&cold));
     let cache = Cache::open(meta, store, prefix)
         .await?
+        .with_cold_store_metrics(cold)
         .with_writes(args.write_config())
         .with_write_pool(args.write_pool_config())
         .with_durable_wait(args.durable_wait())

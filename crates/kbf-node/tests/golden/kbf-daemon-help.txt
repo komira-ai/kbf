@@ -59,12 +59,15 @@ Options:
           The server's worker listener, an `https://` URL (normally `--server`'s), that the container and native drivers read and write blobs through, over mutual TLS with this daemon's `--ca-cert`, `--cert`, `--key` and `--tls-server-name`. Plain `http://` is refused: the worker listener admits each blob call by the daemon's certificate. Every driver's blobs go through one transfer engine, over one connection, within the `--transfer-*` limits
 
       --data-dir <DIR>
-          The directory the daemon keeps everything in, on a local disk: `leases/` (lease directories, the container and native drivers), and under the container driver (and the native driver on macOS) `cache/` (the input cache, `docs/design/worker-cache.md`) and `trees/` (shared read-only input trees, `docs/design/fast-sandbox.md#4-shared-trees`). Made if missing; absolute. The cache and trees are on, sized from the filesystem: half and a quarter of its size less what it keeps free (5%, at least 1 GiB), and the cache evicts entries no running lease links to keep that much free. A directory another daemon owns, or that cannot be used, is left alone: the daemon warns and runs uncached.
+          The directory the daemon keeps everything in, on a local disk: `leases/` (lease directories, the container and native drivers), and under the container driver (and the native driver on macOS) `cache/` (the input cache, `docs/design/worker-cache.md`) and `trees/` (shared read-only input trees, `docs/design/fast-sandbox.md#4-shared-trees`). Made if missing; absolute. The cache and trees are on (unless `--no-input-cache`), sized from the filesystem: half and a quarter of its size less what it keeps free (5%, at least 1 GiB), and the cache evicts entries no running lease links to keep that much free. A directory another daemon owns, or that cannot be used, is left alone: the daemon warns and runs uncached.
           
           Default `/var/lib/kbf`. A daemon with the fake driver alone touches no directory unless this is given.
 
       --data-max-bytes <BYTES>
           Lowers the size the cache and the trees are budgeted from (half and a quarter of it), under the filesystem's automatic one
+
+      --no-input-cache
+          Switches the host input cache off: no `cache/` and no `trees/`, so every action fetches its inputs from the CAS into its own input root and no later action reuses them (no hard link or clone from either). Leaves what an earlier start put in `<data-dir>/cache` and `<data-dir>/trees` alone. Without a cache a lease reports no input statistics (`cache_hits` and the rest exist only with a cache). For measuring what the cache saves
 
       --output-max-depth <MAX_DEPTH>
           The deepest directory an output directory may hold, in levels below it (its own entries are level 1)

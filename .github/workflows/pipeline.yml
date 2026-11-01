@@ -1,21 +1,26 @@
 # The one pipeline of a push to main:
 #
-#   ci ----------------------------+
-#   beta (source tests) -----------+--> passed --> the release (release.yml)
-#   artifacts (after ci) -> smoke -+
+#   ci ------------------------------------------+
+#   beta (source tests) --------------------------+--> passed --> the release (release.yml)
+#   artifacts (build) --> artifacts-sign --> smoke +
+#                         (also needs ci)
 #
 # ci.yml is the pull-request gate, run again on the merged result. beta.yml runs the jobs of the
 # full suite that test the commit's source and build what they run (the whole nextest run, the
 # Arm run, Postgres, S3 stores, crun, the cells, macOS, the packages); they need nothing from any
 # other stage and start with ci, because they are the longest part of the pipeline (about an
-# hour). artifacts.yml builds, signs and attests the files of the commit, after ci (a commit that
-# fails the gate is not signed). smoke.yml, after artifacts, is the one job that tests THOSE files:
-# it installs the kbf of this run's artifacts (no run id, no rebuild) and runs the farm from it.
-# The release (release.yml) publishes the same files; it starts from this workflow's success and
-# from nothing else. Each stage is a called workflow (`workflow_call`), so the pull request and the
-# merge queue keep running ci.yml and artifacts.yml as before and a push to main runs each check
-# exactly once: none of the four has a push trigger of its own. `passed` needs all four, and
-# does nothing else: it is the end of the run for `watch`, and a skipped stage skips it.
+# hour). artifacts.yml is called twice. `artifacts` (stage build) builds and sums the files of the
+# commit and needs nothing, so its builds start with ci. `artifacts-sign` (stage sign) needs ci
+# and `artifacts` and attests and verifies those files (a commit that fails the gate is built but
+# never signed). Both calls are the one file, artifacts.yml, because the installers verify that
+# file as the signer of every attestation. smoke.yml, after artifacts-sign, is the one job that
+# tests THOSE files: it installs the kbf of this run's artifacts (no run id, no rebuild) and runs
+# the farm from it. The release (release.yml) publishes the same files; it starts from this
+# workflow's success and from nothing else. Each stage is a called workflow (`workflow_call`), so
+# the pull request and the merge queue keep running ci.yml and artifacts.yml as before and a push
+# to main runs each check exactly once: none of the four has a push trigger of its own. `passed`
+# needs every stage (the two artifacts calls included), and does nothing else: it is the end of
+# the run for `watch`, and a skipped stage skips it.
 #
 # Fail fast. GitHub cancels the rest of a run for a failed job only inside one matrix, never
 # across the jobs of a workflow, and a failed job does not stop the jobs that do not need it:
@@ -34,12 +39,16 @@
 # that: `release plan` measures from the highest release tag, not from the push, so the code of a
 # push that was replaced, or whose run failed, is in the next release. The release is a separate
 # workflow, started by the completion of this one (`workflow_run`) and only when it succeeded; it
-# has its own group that never cancels a run.
+# has its own group that never cancels a run. The builds of a push start with its pipeline, so a
+# push that waits in the group has built nothing yet.
 #
 # Least privilege. A called workflow gets at most what its caller job grants. Every stage gets
-# `contents: read`; only the artifacts stage is also granted the two scopes that sign build
-# provenance (`id-token`, `attestations`), under the same exact `if:` the signing jobs of
-# artifacts.yml carry, and those jobs alone use them. `watch` alone holds `actions: write`, to
+# `contents: read`; only the two calls of artifacts.yml are also granted the two scopes that sign
+# build provenance (`id-token`, `attestations`), under the same exact `if:` the signing jobs of
+# artifacts.yml carry (their own adds the sign stage), and those jobs alone use them: they are
+# skipped in the build call, which runs beside ci and so cannot sign (the build call has the grant
+# because a called workflow is checked against it statically; tests/pipeline_workflow requires
+# every signing job of artifacts.yml to be in the sign stage). `watch` alone holds `actions: write`, to
 # cancel this run, under the same exact `if:`, and its token is in the environment of the one step
 # that cancels, after everything it builds (the workflow lint, tests/workflows and
 # tests/pipeline_workflow).
@@ -61,6 +70,8 @@ jobs:
     uses: ./.github/workflows/ci.yml
     permissions:
       contents: read
+      # The `test` job of ci lists the run's jobs and artifacts to wait for the coverage shards.
+      actions: read
 
   # Tests the commit's source, beside ci: every job of beta.yml builds what it runs.
   beta:
@@ -69,18 +80,42 @@ jobs:
       contents: read
       attestations: read
 
+  # Builds and sums the files of the commit, beside ci: nothing in this call is signed (every job
+  # of artifacts.yml that signs is skipped in stage build), so a commit that fails ci is built but
+  # never signed. It is granted the scopes of the sign call below only because GitHub checks a
+  # called workflow's job permissions against the caller's grant statically, skipped jobs
+  # included: with `contents: read` alone the whole pipeline would fail at startup.
   artifacts:
-    needs: [ci]
     if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
     uses: ./.github/workflows/artifacts.yml
+    with:
+      stage: build
     permissions:
       contents: read
       id-token: write
       attestations: write
 
-  # Installs and tests the files `artifacts` built and attested in this run.
+  # Signs (attests) and verifies the files `artifacts` built, after ci. The same workflow file,
+  # because the signer identity the installers verify is that file. Its group is the build call's
+  # (`artifacts-${{ github.run_id }}`, cancel-in-progress false): the sign call waits for the
+  # build call, which it needs anyway, so the expression is unchanged.
+  artifacts-sign:
+    needs: [ci, artifacts]
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    uses: ./.github/workflows/artifacts.yml
+    with:
+      stage: sign
+      # The digests of the SHA256SUMS the build call published: the attest jobs refuse other sums.
+      sums_linux_sha256: ${{ needs.artifacts.outputs.sums_linux_sha256 }}
+      sums_darwin_arm64_sha256: ${{ needs.artifacts.outputs.sums_darwin_arm64_sha256 }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+
+  # Installs and tests the files `artifacts` built and `artifacts-sign` attested in this run.
   smoke:
-    needs: [artifacts]
+    needs: [artifacts-sign]
     uses: ./.github/workflows/smoke.yml
     permissions:
       contents: read
@@ -126,10 +161,10 @@ jobs:
   # Needs every stage and does nothing: the pipeline is green when this ran, and `watch` stops
   # when it has completed (a stage that failed or was cancelled skips it).
   passed:
-    needs: [ci, beta, artifacts, smoke]
+    needs: [ci, beta, artifacts, artifacts-sign, smoke]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       contents: read
     steps:
-      - run: echo "ci, beta, artifacts and smoke passed"
+      - run: echo "ci, beta, artifacts, artifacts-sign and smoke passed"

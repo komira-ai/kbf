@@ -384,6 +384,14 @@ The daemon heartbeats at the interval `Welcome` named. A `Heartbeat` carries:
   daemon without the flag, and one built before the field, send none, and a server built before it
   skips the field. The server keeps the newest of each node for `GET /metrics`
   (`kbf_pack_daemon_*`, [api.md](../api.md#get-metrics)).
+- `input_cache` (field 7, optional): the counts of the daemon's input cache since its process
+  started (`InputCacheCounts`: `fills`, `fill_bytes`, `hits`, `hit_bytes`, `evictions`,
+  `evicted_bytes`, and `trees` with the tree store's `builds`, `hits`, `evictions`), present only
+  when the runtime has an input cache open. A runtime without one, and a daemon built before the
+  field, send none (absent is not zero), and a server built before it skips the field. The server
+  keeps the newest of each node for `GET /metrics` (`kbf_node_input_cache_*`) and
+  `GET /v1/nodes/{id}` ([api.md](../api.md#input-cache-counts)); a restarted daemon counts again
+  from 0.
 - `node_load` (optional): one reading of the node's `actions/` cgroup (`NodeLoad`). `seq` counts up
   by one from 1 for each reading within a daemon process; `mono_usec` is the daemon's monotonic
   clock at the read of the CPU counter and `cpu_usage_usec` the cgroup's cumulative CPU time, so a

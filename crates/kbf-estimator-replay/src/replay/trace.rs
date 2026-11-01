@@ -129,6 +129,15 @@ impl Funnel {
 /// # Errors
 /// A file cannot be read, or a line is not a row (the error names the file and line).
 pub fn load(path: &Path, params: &Params) -> io::Result<Trace> {
+    Ok(build(read_rows(path)?, params))
+}
+
+/// Every row of the `*.jsonl` files of `path` (or of the one file it names), in file-name
+/// then line order.
+///
+/// # Errors
+/// A file cannot be read, or a line is not a row (the error names the file and line).
+pub fn read_rows(path: &Path) -> io::Result<Vec<Row>> {
     let mut rows = Vec::new();
     let files = if path.is_dir() {
         // An entry that cannot be read is skipped; a file that can be listed and not read
@@ -151,7 +160,7 @@ pub fn load(path: &Path, params: &Params) -> io::Result<Trace> {
             rows.push(row);
         }
     }
-    Ok(build(rows, params))
+    Ok(rows)
 }
 
 /// The trace of `rows`.

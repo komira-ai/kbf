@@ -12,10 +12,12 @@ publish.workspace = true
 # scripted session of it can be written down and compared. Test-only: a production build
 # carries none of it. This crate's own tests enable it through the dev-dependency on itself.
 testkit = []
-# The farm runs on the scheduler core of `src/farm_js` (`Driver::Js`, `src/farm/js`) where
-# `SchedulerCore::under_test` and `--scheduler-core js` name it. Test-only for now: no
-# default feature set turns it on, and `tests/farm_core_js_gate.rs` in kbf-integration-test
-# fails a manifest that does.
+# Test-only: `SchedulerCore::under_test()` names the js core (`Driver::Js`, `src/farm/js`)
+# instead of the legacy one, so that every farm test of the packages that reach it runs on the
+# js core. Both cores are in every build; `--scheduler-core` picks the one a server runs, and
+# nothing but tests reads `under_test()`. CI runs the fast tests once without the feature and
+# once with it and reports one coverage over both runs, so no default feature set may turn it
+# on: `tests/farm_core_js_gate.rs` in kbf-integration-test fails a manifest that does.
 farm-core-js = []
 
 [dependencies]
@@ -27,17 +29,24 @@ hex.workspace = true
 futures.workspace = true
 http-body.workspace = true
 http-body-util.workspace = true
-hyper-util = { workspace = true, features = ["tokio"] }
+# The job-facing read listener serves HTTP/1.1 over its own TLS connections (src/frontend/job_read.rs).
+hyper = { workspace = true, features = ["http1", "server"] }
+hyper-util = { workspace = true, features = ["service", "tokio"] }
 # The loop around the scheduler (src/farm_js): `KbfAdapter` is its `Adapter`.
 js-server-core.workspace = true
 # The scheduler's rows in the state store (src/farm_js): the farm's row codec and its
 # build-only rows are written against this crate's `RowCodec` and `Ext`.
 js-store.workspace = true
+# The ids a recorded run is told by, and the recorder the farm's usage side runs (src/farm_js/usage.rs).
+js-types.workspace = true
+js-usage.workspace = true
 kbf-auth.workspace = true
 kbf-ca.workspace = true
 kbf-front.workspace = true
 kbf-history.workspace = true
 kbf-invocation.workspace = true
+# The host executor's client of the job scheduler's lease server (src/executor).
+kbf-lease-client.workspace = true
 kbf-log.workspace = true
 kbf-map.workspace = true
 kbf-mapsync.workspace = true
@@ -68,9 +77,13 @@ kbf-tls.workspace = true
 kbf-types.workspace = true
 # The pages mounted under /ui (src/ui_mount.rs).
 kbf-ui.workspace = true
+# The `--usage-profiles` mode (src/usage_profiles.rs).
+kbf-usage.workspace = true
 percent-encoding.workspace = true
 prost.workspace = true
 prost-types.workspace = true
+# The random nonce of a task's pack key (src/executor/task.rs).
+ring.workspace = true
 rustix = { workspace = true, features = ["fs", "net", "process"] }
 serde.workspace = true
 serde_json.workspace = true
@@ -109,6 +122,8 @@ x509-parser.workspace = true
 kbf-segments.workspace = true
 # The deterministic simulation kernel's seeded random stream (src/machine.rs, tests/invocations_paging.rs).
 kbf-sim.workspace = true
+# An in-process lease server on loopback (tests/executor).
+kbf-lease-client = { workspace = true, features = ["fake"] }
 # The in-memory state store (src/start.rs, src/frontend, src/farm/durable and tests/), and a
 # Postgres database of its own for a test (tests/state_store_postgres.rs).
 kbf-pack-index = { workspace = true, features = ["test-database", "test-support"] }
@@ -120,7 +135,11 @@ libc.workspace = true
 postgres.workspace = true
 prost.workspace = true
 rcgen.workspace = true
+# The client of the job-facing read listener's tests: TLS over the farm CA, dialling an IP address
+# (src/frontend/job_read/tests.rs).
+rustls.workspace = true
 tokio = { workspace = true, features = ["io-util", "test-util"] }
+tokio-rustls.workspace = true
 # The codec of a raw call to each method of the worker listener's role table
 # (tests/worker_roles.rs).
 tonic-prost.workspace = true

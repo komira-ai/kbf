@@ -10,9 +10,9 @@ use std::time::Duration;
 use super::coordinator::{Coordinator, CoordinatorError};
 use super::local::{Ended, HostState, Local, LocalError, Staged, Trial};
 use crate::inventory::{Host, Role};
-use crate::ports::{Clock, Drain, Health, HealthCheck, PortError};
+use crate::ports::{Clock, Drain, Health, HealthCheck, Placed, PortError, Seen};
 use crate::version::Version;
-use crate::wire::{self, Heartbeat, Reply, ServiceReply};
+use crate::wire::{self, Answer, Heartbeat, Reply, ServiceReply};
 
 pub const COMMIT_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 pub const COMMIT_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -234,6 +234,9 @@ pub struct FakeDrain {
     pub drain_error: Arc<Mutex<Option<PortError>>>,
     pub leases_error: Arc<Mutex<Option<PortError>>>,
     pub undrain_error: Arc<Mutex<Option<PortError>>>,
+    pub placed_error: Arc<Mutex<Option<PortError>>>,
+    /// Whether the node is in placement before the roll; in placement unless a test says not.
+    pub placed: Arc<Mutex<Placed>>,
 }
 
 impl FakeDrain {
@@ -245,7 +248,15 @@ impl FakeDrain {
             drain_error: Arc::default(),
             leases_error: Arc::default(),
             undrain_error: Arc::default(),
+            placed_error: Arc::default(),
+            placed: Arc::new(Mutex::new(Placed::In)),
         }
+    }
+
+    /// The node is out of placement (an operator drained it) before the roll comes.
+    pub fn out_of_placement(&self) {
+        *lock(&self.placed) = Placed::Out;
+        *lock(&self.drained) = true;
     }
 
     pub fn is_drained(&self) -> bool {
@@ -254,6 +265,14 @@ impl FakeDrain {
 }
 
 impl Drain for FakeDrain {
+    fn placed(&self, _host: &Host) -> Result<Placed, PortError> {
+        self.events.push("placed");
+        if let Some(e) = lock(&self.placed_error).clone() {
+            return Err(e);
+        }
+        Ok(*lock(&self.placed))
+    }
+
     fn drain(&self, host: &Host, deadline: Option<Duration>) -> Result<(), PortError> {
         self.events.push(match deadline {
             Some(deadline) => format!("drain {} {}", host.alias, deadline.as_secs()),
@@ -285,6 +304,134 @@ impl Drain for FakeDrain {
             return Err(e);
         }
         *lock(&self.drained) = false;
+        Ok(())
+    }
+}
+
+/// A node as the frontend keeps it: serving until drained, serving again when uncordoned.
+/// Unlike [`FakeDrain`], what it says of its placement follows what was done to it.
+#[derive(Clone)]
+pub struct ServingNode {
+    pub serving: Arc<Mutex<bool>>,
+    /// The leases it holds; they run on while it is drained.
+    pub leases: Arc<Mutex<usize>>,
+    pub drain_error: Arc<Mutex<Option<PortError>>>,
+    pub undrain_error: Arc<Mutex<Option<PortError>>>,
+    /// How many drain calls reached it.
+    pub drain_calls: Arc<Mutex<usize>>,
+    /// A directory to look into whenever a drain call arrives, and whether it held anything.
+    pub watch: Arc<Mutex<Option<std::path::PathBuf>>>,
+    pub seen_at_drain: Arc<Mutex<Option<bool>>>,
+    /// The frontend knows no node here: reads say in placement, drain and undrain do nothing.
+    pub absent: Arc<Mutex<bool>>,
+    /// Out of placement as a plain cordon (no drain), which only an operator makes: the
+    /// updater's own cordon is always a drain.
+    pub cordoned: Arc<Mutex<bool>>,
+    /// Reads of the node fail with this.
+    pub read_error: Arc<Mutex<Option<PortError>>>,
+}
+
+impl ServingNode {
+    pub fn new() -> Self {
+        Self {
+            serving: Arc::new(Mutex::new(true)),
+            leases: Arc::default(),
+            drain_error: Arc::default(),
+            undrain_error: Arc::default(),
+            drain_calls: Arc::default(),
+            watch: Arc::default(),
+            seen_at_drain: Arc::default(),
+            absent: Arc::default(),
+            cordoned: Arc::default(),
+            read_error: Arc::default(),
+        }
+    }
+
+    /// The frontend has no node for the host.
+    pub fn no_node(&self) {
+        *lock(&self.absent) = true;
+    }
+
+    /// An operator uncordons it by hand.
+    pub fn operator_uncordons(&self) {
+        *lock(&self.serving) = true;
+    }
+
+    /// An operator cordons and drains it.
+    pub fn operator_drains(&self) {
+        *lock(&self.serving) = false;
+        *lock(&self.cordoned) = false;
+    }
+
+    /// An operator cordons it, with no drain: over the updater's drain or over a node
+    /// serving.
+    pub fn operator_cordons(&self) {
+        *lock(&self.serving) = false;
+        *lock(&self.cordoned) = true;
+    }
+
+    pub fn is_serving(&self) -> bool {
+        *lock(&self.serving)
+    }
+}
+
+impl Drain for ServingNode {
+    fn placed(&self, _host: &Host) -> Result<Placed, PortError> {
+        if let Some(e) = lock(&self.read_error).clone() {
+            return Err(e);
+        }
+        Ok(if self.is_serving() {
+            Placed::In
+        } else {
+            Placed::Out
+        })
+    }
+
+    fn placed_if_known(&self, host: &Host) -> Result<Option<Placed>, PortError> {
+        if *lock(&self.absent) {
+            return Ok(None);
+        }
+        self.placed(host).map(Some)
+    }
+
+    fn seen_if_known(&self, host: &Host) -> Result<Option<Seen>, PortError> {
+        Ok(self.placed_if_known(host)?.map(|placed| match placed {
+            Placed::In => Seen::Serving,
+            Placed::Out if *lock(&self.cordoned) => Seen::Cordoned,
+            Placed::Out => Seen::Draining,
+        }))
+    }
+
+    fn drain(&self, _host: &Host, _deadline: Option<Duration>) -> Result<(), PortError> {
+        *lock(&self.drain_calls) += 1;
+        if *lock(&self.absent) {
+            return Ok(());
+        }
+        if let Some(dir) = lock(&self.watch).clone() {
+            let held = std::fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_some());
+            *lock(&self.seen_at_drain) = Some(held);
+        }
+        if let Some(e) = lock(&self.drain_error).clone() {
+            return Err(e);
+        }
+        *lock(&self.serving) = false;
+        *lock(&self.cordoned) = false;
+        Ok(())
+    }
+
+    fn leases(&self, _host: &Host) -> Result<usize, PortError> {
+        if self.is_serving() {
+            return Err(PortError::other("serving again"));
+        }
+        Ok(*lock(&self.leases))
+    }
+
+    fn undrain(&self, _host: &Host) -> Result<(), PortError> {
+        if let Some(e) = lock(&self.undrain_error).clone() {
+            return Err(e);
+        }
+        *lock(&self.serving) = true;
+        *lock(&self.cordoned) = false;
         Ok(())
     }
 }
@@ -356,6 +503,11 @@ pub struct FakeCoordinator {
     pub service_script: Arc<Mutex<VecDeque<ServiceReply>>>,
     /// How many replies of the script were handed out.
     pub delivered: Arc<AtomicUsize>,
+    /// The `features` of the answer to a heartbeat that announces `agent_features`; none: a
+    /// coordinator that predates them, whose reply has no such field.
+    pub features: Arc<Mutex<Option<Vec<String>>>>,
+    /// The `halts` of every answer: the clear generation of each service cleared at least once.
+    pub halts: Arc<Mutex<std::collections::BTreeMap<String, u64>>>,
 }
 
 impl FakeCoordinator {
@@ -375,6 +527,25 @@ impl FakeCoordinator {
     pub fn reply(&self, reply: Result<Reply, CoordinatorError>) {
         *lock(&self.answer) = Some(reply);
     }
+
+    /// The coordinator advertises `names` to an agent that announces (`[]`: it knows the field
+    /// and supports none).
+    pub fn advertise(&self, names: &[&str]) {
+        *lock(&self.features) = Some(names.iter().map(|n| (*n).to_owned()).collect());
+    }
+
+    /// The generations the coordinator's answers carry from now on.
+    pub fn set_halts(&self, generations: &[(&str, u64)]) {
+        *lock(&self.halts) = generations
+            .iter()
+            .map(|(name, generation)| ((*name).to_owned(), *generation))
+            .collect();
+    }
+
+    /// The coordinator predates features: its replies carry none.
+    pub fn advertise_nothing_at_all(&self) {
+        *lock(&self.features) = None;
+    }
 }
 
 impl Coordinator for FakeCoordinator {
@@ -386,6 +557,19 @@ impl Coordinator for FakeCoordinator {
     fn heartbeat_services(&self, beat: &Heartbeat) -> Result<ServiceReply, CoordinatorError> {
         lock(&self.beats).push(beat.clone());
         Ok(self.next_service_reply())
+    }
+
+    fn heartbeat_answer(&self, beat: &Heartbeat) -> Result<Answer, CoordinatorError> {
+        lock(&self.beats).push(beat.clone());
+        let reply = lock(&self.answer)
+            .clone()
+            .unwrap_or(Ok(Reply::Nothing))?
+            .into();
+        Ok(Answer {
+            reply,
+            features: lock(&self.features).clone(),
+            halts: lock(&self.halts).clone(),
+        })
     }
 }
 

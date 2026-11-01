@@ -17,7 +17,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use js_server_core::{Config, Core, Observer};
+use js_server_core::{Config, Core, Observer, OpenError};
 use js_store::{EpochPolicy as StoredEpoch, StateError};
 use kbf_front::Backend;
 use kbf_state::Store;
@@ -49,13 +49,19 @@ pub fn config(
 /// with the memory ladder and floors, the loss requeues, the whole-node drain and caps
 /// (`--whole-node-max`) if they are set, and the wait of the orphan sweep, as
 /// [`Farm::new`](crate::farm::Farm::new) and its builders give the farm's own scheduler.
-#[cfg(feature = "farm-core-js")]
+///
+/// Under `--usage-profiles on` the configuration also carries the curves of `usage`, the farm's
+/// usage side, which the scheduler reads for an action that has a prediction; `record` and `off`
+/// carry none, and a farm with no usage side (no state store) has none to give. Every
+/// configuration built from one usage side carries the one source, so the core and what feeds it
+/// agree.
 #[must_use]
 pub(crate) fn farm_config(
     term: u64,
     unservable_wait: Duration,
     finished_retention: Duration,
     settings: &crate::farm::Settings,
+    usage: Option<&super::usage::Usage>,
 ) -> Config {
     let config = self::config(
         term,
@@ -67,6 +73,10 @@ pub(crate) fn farm_config(
     .with_memory_floors(settings.floors)
     .with_loss_requeues(kbf_sched::LOSS_REQUEUES)
     .with_orphan_wait(settings.orphan_wait);
+    let config = match usage {
+        Some(usage) if settings.usage.serves() => config.with_curves(usage.curves()),
+        _ => config,
+    };
     match &settings.whole_node {
         Some(whole) => config.with_whole_node(whole.clone()),
         None => config,
@@ -116,12 +126,23 @@ impl Observer for KbfObserver {
 /// The store cannot be read or written, or holds a row that is not one the scheduler wrote.
 pub fn open(
     config: &Config,
-    adapter: KbfAdapter,
+    mut adapter: KbfAdapter,
     store: Arc<dyn Store>,
     epoch: EpochPolicy,
     now: FarmTime,
 ) -> Result<Core<KbfAdapter>, StateError> {
+    // Read before the core exists: no caller waits for the store behind its lock.
+    adapter.restore_learned();
     let observer = KbfObserver::new(adapter.cache.clone());
-    let core = Core::open(config, adapter, storage(store, epoch), now)?;
+    let core =
+        Core::open(config, adapter, storage(store, epoch), now).map_err(|error| match error {
+            OpenError::State(state) => state,
+            // kbf never sets `memory_schedulable_percent`, whose default of 100 always
+            // validates, so this arm is not reached; it stays an error, not a panic.
+            OpenError::Config(percent) => StateError::Corrupt {
+                key: "memory_schedulable_percent".to_owned(),
+                why: percent.to_string(),
+            },
+        })?;
     Ok(core.with_observer(observer))
 }

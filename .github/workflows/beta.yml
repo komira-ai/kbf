@@ -426,12 +426,15 @@ jobs:
   # enforced); the daemon binary is built and started with each driver, which
   # detects the node through sysctl.
   #
-  # 75 minutes: a passing run took about 41 (run 39670620620) and the next, with the slot
+  # 85 minutes: a passing run took about 41 (run 39670620620) and the next, with the slot
   # clean's mutants added and slower test steps on the same runner type, passed every test
-  # step up to the last and was cancelled at 45 (run 39688515489).
+  # step up to the last and was cancelled at 45 (run 39688515489). The slot assertion and the
+  # package steps were jobs of their own (about 4 and 3.5 minutes of tests) and are steps here,
+  # so one runner is taken for them instead of three. Recent passing runs took 51 to 71 minutes
+  # before the fold; 71 plus those 8 is 79, so 95 leaves room for a slow runner.
   native-macos:
     runs-on: macos-latest
-    timeout-minutes: 75
+    timeout-minutes: 95
     permissions:
       contents: read
     env:
@@ -543,75 +546,37 @@ jobs:
       # its refusal to run as root (crates/kbf-guest/tests/as_root.rs).
       - run: cargo test -p kbf-guest --locked
       - run: cargo xtask sudo-test -p kbf-guest --test as_root
+      # The assertion that a pool user holds nothing a lease left (crates/kbf-driver-native/
+      # tests/slot_assert.rs): the baseline recorded at the start, and each probe seeing the
+      # state planted for it (a process, a launchd job, a semaphore, an attached image, a file
+      # in the home, a file in /private/tmp, a cron job) and green again after the clean. One
+      # test at a time: they make users at free uids.
+      - run: cargo xtask sudo-test -p kbf-driver-native --test slot_assert -- --test-threads=1 --nocapture
+        if: ${{ !cancelled() }}
+      # kbf-installer on a Mac as a user gets it (contract docs/design/kbf-installer.md section
+      # 7): the `.pkg` built by `cargo xtask pkg build` (a stub stands in for the binary until
+      # kbf-installer builds), opened by pkgutil and lsbom, installed by Installer and checked
+      # file by file and owner by owner (a root-owned /usr/local/kbf-installer tree, a 0700
+      # /var/db/kbf-installer); its LaunchDaemon not loaded and not running without
+      # /usr/local/etc/kbf/installer.toml, running with it; `check` refusing a user-owned prefix
+      # (skipped, and said so, while the binary is the stub); the Homebrew cask installing the
+      # package and its uninstall removing the package's files
+      # (crates/xtask/tests/pkg_macos.rs). The package as root through Installer, then the cask
+      # as this user.
+      - run: cargo xtask sudo-test -p xtask --test pkg_macos -- installer
+        if: ${{ !cancelled() }}
+        env:
+          # The oldest macOS the binaries support (the test signs with `--minos 14.0`).
+          MACOSX_DEPLOYMENT_TARGET: "14.0"
+      - run: cargo test -p xtask --test pkg_macos --locked -- --ignored homebrew
+        if: ${{ !cancelled() }}
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "14.0"
       # kbf-mac-provision on this VM, as root: what a hosted VM can prove (the header of
       # crates/kbf-mac-provision/tests/as_root.rs lists what it applies, asserts and
       # only reads). Last, because it changes this runner's settings.
       - run: cargo xtask sudo-test -p kbf-mac-provision --test as_root -- --test-threads=1 --nocapture
-      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
-
-  # The assertion that a pool user holds nothing a lease left (crates/kbf-driver-native/
-  # tests/slot_assert.rs), in a job of its own because native-macos is close to its limit:
-  # the baseline recorded at the start, and each probe seeing the state planted for it
-  # (a process, a launchd job, a semaphore, an attached image, a file in the home, a file
-  # in /private/tmp, a cron job) and green again after the clean. One test at a time: they
-  # make users at free uids.
-  native-macos-assert:
-    runs-on: macos-latest
-    timeout-minutes: 45
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - run: sw_vers
-      - run: uname -m
-      - run: rustup toolchain install
-      - run: cargo xtask sudo-test -p kbf-driver-native --test slot_assert -- --test-threads=1 --nocapture
-
-  # kbf-installer on a Mac as a user gets it (contract docs/design/kbf-installer.md section
-  # 7): the `.pkg` built by `cargo xtask pkg build` (a stub stands in for the binary until
-  # kbf-installer builds), opened by pkgutil and lsbom, installed by Installer and checked
-  # file by file and owner by owner (a root-owned /usr/local/kbf-installer tree, a 0700
-  # /var/db/kbf-installer); its LaunchDaemon not loaded and not running without
-  # /usr/local/etc/kbf/installer.toml, running with it; `check` refusing a user-owned prefix
-  # (skipped, and said so, while the binary is the stub); the Homebrew cask installing the
-  # package and its uninstall removing the package's files
-  # (crates/xtask/tests/pkg_macos.rs).
-  pkg-macos:
-    runs-on: macos-latest
-    timeout-minutes: 30
-    permissions:
-      contents: read
-    env:
-      # The oldest macOS the binaries support (the test signs with `--minos 14.0`).
-      MACOSX_DEPLOYMENT_TARGET: "14.0"
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - run: rustup toolchain install
-      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        id: cargo-cache
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
-          restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
-      - run: sw_vers
-      - run: brew --version
-      # The package as root through Installer, then the cask as this user.
-      - run: cargo xtask sudo-test -p xtask --test pkg_macos -- installer
-      - run: cargo test -p xtask --test pkg_macos --locked -- --ignored homebrew
+        if: ${{ !cancelled() }}
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
         with:

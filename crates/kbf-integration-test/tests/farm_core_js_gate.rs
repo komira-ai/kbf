@@ -1,8 +1,12 @@
-//! The `farm-core-js` feature of kbf-server stays out of every build a user runs.
+//! The `farm-core-js` feature of kbf-server stays out of every default feature set.
 //!
-//! The feature builds the farm on the js scheduler core, whose methods are not all written
-//! yet, and makes `--scheduler-core js` available. It is turned on only by a command line
-//! (`--features kbf-server/farm-core-js`). This test reads every `Cargo.toml` of the
+//! The feature makes `SchedulerCore::under_test()` name the js core, so the farm tests of the
+//! packages that reach it run on that core; both cores are in every build and
+//! `--scheduler-core` picks the one a server runs. CI runs the fast tests once without the
+//! feature and once with it and merges the two coverage runs, which only works while the
+//! feature is turned on by a command line alone (`--features kbf-server/farm-core-js`). A
+//! default list that carried it would run every test on the js core and leave the legacy
+//! one to the tests that name it. This test reads every `Cargo.toml` of the
 //! repository and requires:
 //!
 //! - kbf-server defines the feature (a renamed or removed feature would pass the rest

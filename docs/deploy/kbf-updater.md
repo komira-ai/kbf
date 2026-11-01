@@ -45,6 +45,19 @@ sit behind a load balancer of the farm's own (anything that stops sending to a b
   (`swap_abandoned`) before any ssh call.
 - `instance=` and `base=` are accepted on a `frontend` line only.
 
+## Which build is running
+
+`kbf-updater --version` prints the package version and the commit the binary was built from:
+
+```text
+kbf-updater 0.1.0+0123456789ab
+```
+
+The commit is the first 12 hex digits of the commit in the name of the release asset
+(`kbf-updater-<commit>-<platform>.tar.gz`); compare it with the release you meant to install. The
+package version alone does not tell two builds apart. A binary built outside the artifacts
+workflow prints `unknown` in place of the commit.
+
 ## The flags
 
 All are flags; none is read from the environment.
@@ -73,7 +86,20 @@ deadline of S s; nothing was installed and the leases run on; ...; node dm-node 
 drained`"), the node stays drained (cordoned) and its leases run on. To try again, start another
 roll: it drains the node again (a drain of a drained node does nothing) and waits again. To give
 the node back without installing, uncordon it (`POST /v1/nodes/{id}:uncordon`, or `kbf cluster`).
+(A host run by the [agent](#the-agent-mode) keeps a mark of the cordons the agent makes; a cordon
+given back by hand is noticed by the agent, see `--cordon-dir`.)
 The node drain at the frontend is the frontend's cordon and is not changed by this.
+
+The SSH roll gives back only a node whose cordon carries the roll's mark, and the frontend's cordon
+has no owner, so two limits follow; kbf#2166 (the cordon-owner issue) tracks the fix:
+
+- An operator who drains a node during the roll, after the roll's mark is written, has that drain
+  lifted at the give-back: the mark says the cordon is the roll's, and the frontend cannot tell two
+  drains apart.
+- When the frontend does not know the node yet at the drain, the roll drains it with no mark, and
+  the node is left out after the roll. The roll logs one warn line for it (`<node>: left out after
+  the roll: its cordon is not marked as this roll's ...; uncordon it by hand if it should serve`),
+  as it does for a node an operator drained before the roll; there is no other alert.
 
 ## What a roll does with a frontend pool member
 
@@ -170,7 +196,8 @@ mode 755), come from the `updater_user` item of `kbf-mac-provision` (a release a
 kbf-updater agent --coordinator <dns name>:<port> --channel NAME
                   (--state-dir DIR | --client-cert FILE --client-key FILE --ca FILE)
                   [--frontend <dns name>:<port>] [--enroll-frontend <dns name>:<port>]
-                  [--operator-api http://IP:PORT --token-file FILE] [--helper-socket PATH]
+                  [--operator-api http://IP:PORT --token-file FILE] [--cordon-dir DIR]
+                  [--helper-socket PATH]
                   [--service NAME,helper-socket=PATH[,SETTING=VALUE...]]...
                   [--heartbeat-secs N] [--drain-deadline-secs N] [--health-timeout-secs N]
                   [--health-poll-secs N] [--retry-secs N]
@@ -202,6 +229,27 @@ kbf-updater agent --coordinator <dns name>:<port> --channel NAME
   required with `--state-dir`.
 - `--channel`: the channel of the helper's allowlist. The version the coordinator names is looked
   up in it by the helper, never fetched by URL.
+- `--cordon-dir`: where the agent records that a cordon on the node is its own: one small file
+  per node and per unit it updates (`cordon-<node>.<unit>`, the unit being `kbf` or the
+  `--service` name), synced before the drain call and removed after the undrain worked. A retry
+  of an update that failed with the node left drained, and an agent restarted in the middle of an
+  update, give such a node back; a node an operator drained is left out. A host the frontend
+  knows no node for (a storage host with no daemon) gets no mark. A node counts as the agent's
+  while any unit's mark is on it, and an undrain by one unit gives the node back only when no
+  other unit's mark remains. Default: the `--state-dir`, else the directory of `--client-key`.
+  The agent checks at start that it can write there and does not start otherwise; with placed
+  files in a root-owned directory under the shipped unit's `ProtectSystem=strict`, name a writable
+  one (the unit's `StateDirectory`, `/var/lib/kbf-updater`, or a path in `ReadWritePaths=`).
+  **A cordon given back by hand** (`:uncordon`, `kbf cluster`) leaves the mark; the agent drops
+  the marks of a node whenever it reads that node serving: at start, at each heartbeat it spends
+  idle, and before an update's drain. The window in which a stale mark still means something is
+  therefore from the hand uncordon to the agent's next look: at most one heartbeat interval while
+  the agent is idle, up to the end of the update when it is in the middle of one, and for as long
+  as the agent is stopped, or the frontend cannot be reached. In that window an operator's new
+  drain of the node reads as the agent's own and is given back by the update that finds it. If
+  the agent is stopped, remove the file by hand: `<cordon dir>/cordon-<node>.<unit>`. The
+  frontend's node read names no cordon (no generation, no time), so nothing finer is possible
+  without changing it.
 - `--daemon-node`: for the agent of a **frontend host** that also runs a daemon: the daemon's node
   id. The agent drains that node around the frontend's update (with the operator token if the
   agent has one, else with its certificate, which names its own node only). Without it a frontend
@@ -336,6 +384,80 @@ is left alone for `--retry-secs` per service: a failure of one does not hold bac
 agent's log lines for a service are led by its name. A restart in the middle of a service's trial
 finishes that trial first, as for `kbf`.
 
+### tierstore as a service
+
+The coordinator rolls tierstore, as it rolls kbf, from a definition in its services file
+(`--services-file`). The definition is shipped as data, `crates/kbf-coordinator/src/tierstore.services.toml`,
+and is in force only when the services file holds it. Append it to the file as it is (after kbf's own
+entry if the file replaces kbf's), keep the file `0600`, and restart the coordinator, which reads the
+file once at start:
+
+```toml
+# tierstore as a service of the coordinator (docs/deploy/kbf-updater.md, "tierstore as a
+# service"). An entry of a services file: appended to the file named by --services-file
+# (after kbf's own entry if the file replaces it), it makes tierstore a service the
+# coordinator rolls to the hosts of the storage role.
+#
+# Six storage hosts is the farm this is written for: one updates at a time, and four of the
+# other five must stay up. The first host goes alone, and no other starts until it has beaten
+# healthy three times at the new version. A release that fails after its commit on two
+# hosts is rolled back by the coordinator to the last version that converged and baked.
+
+[[service]]
+name = "tierstore"
+bake_beats = 3
+canary = { count = 1 }
+rollback = "automatic"
+rollback_after_failed = { percent = 25, min_hosts = 2 }
+install_when_absent = false
+
+[service.selector]
+roles = ["storage"]
+
+[service.roles.storage]
+max_updating = 1
+min_up = 4
+```
+
+What each value is for, for a farm of six storage hosts:
+
+- `[service.roles.storage]` and `roles = ["storage"]`: tierstore is ordered to hosts of the storage
+  role and to no other. A host of another role that lists tierstore is not counted and is never
+  ordered it.
+- `max_updating = 1` and `min_up = 4`: one storage host updates at a time and four others must be
+  up while it does, so one storage host that is down, drained or excluded does not hold the roll; a
+  second one does, until one is back or `min_up` is lowered in the file. tierstore keeps serving through
+  its hand-over, and the canary, the bake and the automatic rollback still gate each step. A farm of
+  fewer than six storage hosts needs a smaller `min_up`.
+- One service per host updates at a time, but kbf and tierstore may update different hosts at once:
+  kbf restarting on one host while tierstore hands over on another.
+- `canary = { count = 1 }` and `bake_beats = 3`: one host goes alone, and no other starts until it has
+  sent three healthy beats at the new version; each host
+  after it holds its slot for the same three beats, so the next host starts only once the last one has
+  served healthy for that long.
+- `rollback = "automatic"` and `rollback_after_failed = { percent = 25, min_hosts = 2 }`: when a
+  release fails after its commit or at the release gate on the larger of 25% of the live hosts and
+  two (two of six), the coordinator marks the version bad and sets the desired version back to the last
+  one that converged and baked. It needs a last good version: the first version set is never rolled
+  back, only held.
+- `install_when_absent = false`: a host on which tierstore was declared and never registered is not
+  ordered it.
+
+The release workflow's CI token needs an allow-list entry with `services = ["tierstore"]` (the
+default is kbf alone): a `[[remote_operator]]` entry in the `--oidc-config` file beside kbf's, for
+`repository = "komira-ai/tierstore"` and `job_workflow_ref` that repository's release workflow on
+`main`, with `event_names = ["workflow_run"]` (see the allow-list above). A token admitted by kbf's
+entry still sets kbf alone. To roll a version, after it is published:
+
+```text
+cargo xtask deploy-farm --url <coordinator> --service tierstore --version <tierstore's version text>
+```
+
+It posts `{"version": ..., "service": "tierstore"}` (no `min_up`: the minimums are the definition's),
+reads `GET /v1/convergence?service=tierstore` until it says `converged`, and does not compare the
+coordinator's commit with the version, which is not a kbf commit. The convergence counts the hosts the
+selector names. kbf's own deploy is unchanged.
+
 ### Enrolling a host
 
 A host gets its updater certificate from the farm CA with a one-time token, with `kbf-updater enroll`:
@@ -436,6 +558,48 @@ coordinator is older than this field keeps working. The rule is equality, not or
 coordinator newer than the release (a rollback of the hosts) also fails; leave the variable unset
 for such a deploy. The variable is the operator's to set for the releases that need it.
 
+## Reading one host's row
+
+While rolling agents node by node, `kbf-deploy host-status` prints one host's row from the
+coordinator's `GET /v1/status`, so the whole status need not be read for one node. It only reads.
+
+```sh
+kbf-deploy host-status --coordinator https://coordinator.example:8443 \
+    --operator-token-file ~/.kbf/operator.token --node daemon-04 --ca-pem "$(cat farm-ca.pem)"
+```
+
+```text
+node_id: daemon-04
+service: kbf
+role: daemon
+platform: linux-x86_64
+version: 2.0
+health: healthy
+live: true
+up: false
+updating: 2.1
+last_update: none
+last_seen: 3s ago
+holds_slot: true
+hold: updating
+```
+
+- `--coordinator` is an `https://` URL with no path, or `host:port`; `--ca-pem` is the farm CA
+  (PEM text) the coordinator's certificate must chain to, as for `deploy-farm`, and without it
+  the system roots are used.
+- `--operator-token-file` names a file of yours with mode `0600` or `0400` that holds the operator
+  token; a file others can read is refused. The token is sent only as the `Authorization` header:
+  it is not an argument and is in no output.
+- `--service NAME` (default `kbf`) picks the service whose view of the host is printed; it is the
+  one with the `hold`. Under the row the text adds the host's exclusion (`excluded:`) and the
+  service's standing halt (`halt:`), when the status has them. `--json` prints the host's row,
+  as the status has it, as one JSON object on one line.
+- Exit 0: found. 1: the node (or the service) is not in the status, or the coordinator could not
+  be asked: `cannot connect`, `TLS error`, or an HTTP status (a 401 says the operator token was
+  refused). 2: bad arguments or a bad token file.
+
+(`kbf-deploy host status`, with a space, is the other verb: the deploy state of the host it runs on.)
+
 ## Turn on the gamma stage
 
 The last job of `release.yml`, `gamma`, tells the update coordinator "desired = this release" once
@@ -468,7 +632,7 @@ that runs no farm is unaffected. Nothing in this repository does any of them.
    workflow that may call. An entry's `services = [...]` (default `["kbf"]`) lists the services a
    token it admits may set, and a token never gets another entry's services: setting a service the
    admitting entry does not list is a 403 `forbidden` that changes nothing. The single table above
-   is one entry that lets CI set `kbf` only. The services must be defined (`kbf` is built in; others
+   is one entry that lets CI set `kbf` only. The services must be defined (`kbf` is shipped with the coordinator; others
    come from `--services-file`, which no longer takes `ci_services`: such a file is refused).
    Entries must name the same issuer, and two entries may not share a `repository_id` and a
    `job_workflow_ref`; such a file is refused at load.
@@ -531,7 +695,30 @@ says which form it needs, before it calls the coordinator. Anything else that se
 coordinator's desired version (a `POST /v1/desired` by hand) needs the same form, or no host
 will converge on it.
 
+`--services-file` is read once at start, under the rule of `--operator-token-file`: a regular file (not a symlink) owned by the coordinator's user with mode `0600` or `0400`, at most 1 MiB; a file that fails it stops the start. Treat it as secret-grade: a file whose first entry is named `kbf` replaces the shipped kbf definition, and can set `max_updating` up to 10000, `min_up = 0`, drop `never_last` and every `after`, so whoever controls the file controls kbf's rollout safety. A replaced kbf must be the first entry, wait for no service and have a role, and its desired state still names `min_up` for storage and frontend.
+
+A service may carry `install_when_absent = true` and a `[service.selector]` with `roles` (default: every role of the service) and `labels` (at most 8, key and value 1 to 32 bytes of `[a-z0-9-]`); a selector naming a role the service lacks is refused. Without a selector a host belongs to the service if it lists it, as always. With one, the coordinator decides who should run the service from the host's certificate role and the labels an operator set for it with `POST /v1/operator` (`set_labels`; a heartbeat can never set them). A selected, live host whose agent announced `heartbeat-v2` and that did not list the service is `missing`; one that reports it `absent` is `absent` and is ordered only with `install_when_absent`; one whose agent did not announce `heartbeat-v2` is `unmanaged` (not counted, not ordered); one an operator excluded is `excluded`. A silent host is `down` first of all. `GET /v1/convergence` shows `hosts: {missing, absent, excluded, unmanaged, deferred}` for a service with a selector, or any such host, and a service with a missing or absent host is `in_progress`; the status lists them with their reason. Exclusions apply to a service without a selector too. `deferred` counts the live hosts within the wait that follows their deferral of the desired version. This holds for `kbf` as for any service whose definition has a selector or an exclusion: a host that is not counted for `kbf` (excluded, or outside a `kbf` selector) has its beat not recorded, so it gets no `kbf` orders, is left out of the `kbf` convergence and appears only in `members`. Excluding a node from `kbf` therefore stops its `kbf` updates.
+
+A service entry may also set two rollout fields, both off by default (a coordinator before the change refuses a file that names them, so set them only after every coordinator runs the new build):
+
+- `bake_beats = N` (default 0, at most 100; a larger number is refused with `bake_beats is over 100`). A host at the desired version keeps the update slot it used until it has sent `N` healthy beats in a row at that version, not updating and not waiting for a promotion. An unhealthy or updating beat, a pending promotion, a different version, or a silence of 45 s or more between two beats starts the count again. The count is kept in the coordinator's memory only: a restart forgets it, and a host at the desired version bakes again. A host that is silent for 45 s or more stops holding the slot for baking. `GET /v1/convergence` is `in_progress`, not `converged`, while a live host is still baking.
+- `canary = { count = n }` (`n` from 1 to 10000; otherwise refused with `canary count is not 1 to 10000`). Until `n` hosts at the desired version have baked (`bake_beats` healthy beats, 0 meaning up at the version), the coordinator orders at most `n` hosts of the service: hosts that are updating, under an order, failed at the version, or at it all count as started, silent ones included. The hosts that go first are the live ones not yet started, hosts of roles that wait for no other role before the rest, then by node id. Every other host is held with `canary_wait`; a canary that cannot go yet (no free slot, too few hosts up, a role it waits for) holds them all, by design. A canary that fails leaves the service `blocked` and orders nobody else. The roles-and-labels form of the canary (`canary = { roles = [...], labels = {...} }`) is refused as an unknown field until host selectors land.
+
+A host whose heartbeat carries `promotion_pending` holds its update slot and does not count as up, whatever the definition says. The coordinator puts no bound of its own on a pending promotion. The design gives that bound to the updater (the service declaration's `promotion_ceiling_secs`, which turns an overdue promotion into a failed update, `after_commit`, while the agent keeps beating); no build implements it yet. A host that dies mid-promotion holds its slot until it is fixed, as an updating host does.
+
 The coordinator keeps its desired state per service name, and `kbf` is the only service it accepts unless `--services-file` defines more ([the design](../design/updates.md)): `POST /v1/desired` takes an optional `service` (absent means `kbf`; a name no file defines is a 400), and `GET /v1/status` adds `services` beside the unchanged `desired`, `services_dropped`, the number of heartbeats whose `services` list was bad and was dropped (the host is answered as a `kbf`-only host), and `per_service` (below). While `kbf` is the only service, the `--state-file` holds the single state in the form earlier coordinators wrote, so a downgrade to one of them starts on the same file; a file in the map form (`{"services": {...}}`), which a coordinator with a second service writes, is refused by an earlier build, and the operator then restores the file from before or writes `kbf`'s state alone in it.
+
+`--ops-file` (default: the `--state-file` name with `.ops` added) holds what an operator decides, apart from CI's desired state: the hosts excluded from a service, the labels on a host, and a ring of the last 64 operator changes (it also holds the per-service marks: `halt`, `halt_acked`, `last_good`, `bad` and `failure_acked`; a coordinator from before the rollback release knows all of them but `failure_acked`, which is written only after CI sets by hand a version marked bad, and refuses a file that holds it as an unknown key, so that rolling back across that release means moving the file aside). The coordinator creates the file at the first change and replaces it whole (a temporary file beside it, fsync, rename, directory fsync), owner-only; with no file nothing is excluded or labelled and the coordinator behaves as before. The reader is strict: a key it does not know, or a `schema` newer than the build's, stops the start with the flag and the path in the message, so a coordinator rolled back below the build that wrote the file does not ignore what it holds. To start without the file anyway, move it aside on purpose. The directory must be writable by the coordinator. `GET /v1/status` shows the file's content as `ops` once anything has been changed (before that the key is absent).
+
+`POST /v1/operator` on the control listener takes the operator token as the bearer (CI's OIDC token is refused with 401, as is no token) and one action as JSON, at most 4096 bytes:
+
+- `{"action":"exclude","service":"<name>","node_id":"<id>","reason":"<text>"}`: takes a host out of a service. The service must be one the coordinator manages; the reason is 1 to 256 bytes with no control character; a second exclusion of the same host and service replaces the first.
+- `{"action":"include","service":"<name>","node_id":"<id>"}`: removes the exclusion (no error when there is none).
+- `{"action":"set_labels","node_id":"<id>","labels":{"<key>":"<value>"}}`: replaces the host's labels; at most 8, each key and value 1 to 32 bytes of `[a-z0-9-]`; an empty object removes them. Only this call sets labels: a heartbeat that carries them changes nothing.
+
+The token is checked before the body is read (no token is a 401 whatever the body). The file holds at most 4096 hosts with labels and 4096 exclusions (`MAX_HOSTS` and `MAX_EXCLUDED` in `ops.rs`, the one place to raise them); an action that would add one more is a 400 and the log line names the cap. A label key given twice in one body is a 400.
+
+Each accepted action is written to the file before it takes effect (a failed write is a 500 and the old state stands), numbered, appended to the ring, and logged at info on the target `kbf_coordinator::audit` with `by`, `action`, `service`, `node_id` and `reason`; the answer is that entry. A bad body is a 400. The coordinator records these changes and shows them in the status; of the marks, only the bad versions and the acked failures of a service with `rollback = "automatic"` are read when it decides what a host is told.
 
 `cargo xtask deploy-farm` (one `run:` line):
 
@@ -541,7 +728,8 @@ The coordinator keeps its desired state per service name, and `kbf` is the only 
    again like the POST. A coordinator that has just restarted (the table says so) may not have
    heard from every host yet; a host it hears from later counts as one that joined;
 2. posts `{"version": <the version text above>, "min_up": {...}}` to `/v1/desired` (the per-role
-   limits are the coordinator's defaults), with an OIDC token for the audience that is the URL as
+   limits are the coordinator's defaults; for a service other than kbf the body is the version and
+   `"service"` only, see "tierstore as a service"), with an OIDC token for the audience that is the URL as
    written in the variable (the audience keeps a trailing `/` the variable has, which the URL
    the calls go to does not, so write the variable and the allow-list's `audience` alike). A 503
    on the POST is tried again, up to four times;
@@ -578,7 +766,16 @@ declares is a 404 `not_found`; a query that is not exactly `service=NAME` is a 4
 allow-list accepts may read any service's convergence; the read changes nothing. `GET /v1/status` adds, after its
 existing keys, `per_service`: for every managed service (`kbf` included) by name,
 `{"desired": <its desired state or null>, "roles": [{"role", "at_desired", "updating",
-"failed", "down"}]}`, the counts being those of `GET /v1/convergence` for the service.
+"failed", "down"}], "hosts": [...], "up": N, "slots_held": N, "convergence": {...}}`, the counts
+being those of `GET /v1/convergence` for the service. `hosts` is every host that heartbeated the
+service, by node id: the fields of the top-level `hosts` entries, with `up` and `holds_slot`
+counted for this service (a host ordered to update `other` holds `other`'s slot and is not up for
+it, while it holds nothing under `kbf`), and `hold`: the rule that keeps the coordinator from
+ordering the host now (`quiet`, `updating`, `busy_elsewhere`, `up_to_date`, `failed_here`,
+`deferred`, `no_slot`, `baking`, `canary_wait`, `waiting_for_role`, `waiting_for_service`, `min_up`, `not_a_member`, `no_desired`, `no_definition`; these spellings are public), or
+`null` when it would be ordered at its next heartbeat. `up` and `slots_held` count those hosts,
+and `convergence` is the answer of `GET /v1/convergence?service=NAME`. The top-level keys, and the
+top-level `hosts`, which are `kbf`'s, are unchanged. Two holds are for the rollout fields above: `baking` means every slot of the host's role is held and at least one holder is a host at the desired version that has not finished baking, and `canary_wait` means the service's canary gate is closed and the host is not one of the canaries. `deferred` means the host declined the update to the desired version and its wait (`defer_backoff`, never shorter than the host's own `retry_after`) has not ended.
 
 `cargo xtask deploy-farm --service NAME` (default `kbf`) deploys another service the same way.
 For `kbf` the requests are the ones listed above. For another service the POST body also has

@@ -64,7 +64,7 @@ const IDLE: Duration = Duration::from_millis(200);
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long the loop leaves a revert alone after one that failed.
-const REVERT_RETRY: Duration = Duration::from_secs(30);
+pub(super) const REVERT_RETRY: Duration = Duration::from_secs(30);
 
 pub const USAGE: &str = "usage: kbf-host-install --serve --socket PATH --socket-user NAME \
 [--window-secs N] [--layout installer|deb|rpm] \

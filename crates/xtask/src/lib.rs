@@ -8,6 +8,15 @@
 //!   advisories`, kept in one GitHub issue (opened, updated, or commented on and closed when
 //!   none remain) instead of failing a pull request. Exit 0 whatever it found; 1 when
 //!   cargo-deny or `gh` failed. `advisories.yml` runs it daily and on every push to `main`.
+//! - `wait-artifacts --repo <owner/repo> --run-id <id> --job-prefix <p> --artifact <name>...`
+//!   ([`wait_artifacts`]): the `test` job of the split coverage run waits until every named artifact
+//!   has been uploaded by the shards that run beside it (exit 1 when a shard failed, every shard
+//!   finished without one, or the looks ran out).
+//! - `profiles-complete --dir <dir> --prefix <p>...` ([`profiles_complete`]): exit 1 unless each
+//!   shard's prefix begins a non-empty `.profraw` file of the directory and no `.profraw` file
+//!   begins none of them (`--extension profdata` checks the shards' merged `.profdata` files).
+//! - `merge-profiles --dir <dir> --extension <e> [--prefix <p>] --out <file>` ([`merge_profiles`]): the
+//!   toolchain's `llvm-profdata merge -sparse` of the directory's `.profraw` or `.profdata` files.
 //! - `release farm-version --repo <owner/repo> --tag <tag> --commit <sha> [--output <file>]`
 //!   ([`release::farm_version`]): the version text the farm is told to converge on,
 //!   `<version>+g<12 hex digits of the commit>` as the hosts report it, read from the release's
@@ -31,9 +40,20 @@
 //! - `fetch --url <url> --sha256 <hex> --out <path> [--extract <format> [--member <path>]]`
 //!   ([`fetch`]): a pinned tool, downloaded over HTTPS and refused unless its SHA-256
 //!   matches, before anything is unpacked or written.
+//! - `fetch-attested-tool --url <url> --sha256 <hex> --archive <path> --member <path> --out <path> --gh
+//!   <program> --repo <owner/repo> --signer-workflow <path> --source-ref <ref> --source-digest <sha>`
+//!   ([`fetch_attested`]): a pinned release archive, refused unless its SHA-256 matches and `gh attestation
+//!   verify` accepts the file, and only then the member is taken out of that file.
 //! - `package --binary <path> --sbom <path> --platform <platform> --commit <sha> --out
 //!   <dir>` ([`package`]): one binary as a release asset, a tarball that is the same
 //!   bytes on every runner, and its SBOM, with their lines in `SHA256SUMS.<platform>`.
+//! - `stage-task-tree --binary <path> --out <dir>` ([`task_bundle::stage_tree`]): the signed `kbf-task` alone in
+//!   a new directory, the tree of the bundle.
+//! - `package-task-bundle --layout <dir> --sbom <path> --commit <sha> --out <dir>` ([`task_bundle`]):
+//!   the signed darwin `kbf-task`, packed by the pinned `js-bundle` into an OCI image layout, as
+//!   a tarball of that layout that is the same bytes on every runner, and the SBOM of the binary,
+//!   with their lines in `SHA256SUMS.darwin-arm64`. Refused unless the layout is one bundle of
+//!   `kbf-task` for darwin arm64.
 //! - `installer-tarball --binary <path> --platform <platform> --commit <sha> --units
 //!   <dir> --trust <dir> --sysusers <file> --tmpfiles <file> --needrestart <file> --out <dir>`
 //!   ([`installer_tarball`]): the files the Debian package ships, at the same paths and
@@ -52,10 +72,13 @@
 //!   attested tarball, it replaces and breaks the old `kbf-installer`, it holds the units
 //!   of the modes, the slice, the sysusers and tmpfiles files, the drop-in and a trust
 //!   directory that trusts the branch it is attested for, and nothing else.
-//! - `pkg-image-asset` ([`pkg_image_asset`]): the frontend or coordinator OCI image tarball as the
+//! - `pkg-image-asset` ([`pkg_image_asset`]): the frontend, coordinator or task OCI image tarball as the
 //!   release asset `kbf-<service>-image-<commit>-<platform>.oci.tar`, refused unless its program
-//!   is the attested `kbf` (frontend) or the built `kbf-coordinator`, it runs as a user that is
+//!   is the attested `kbf` (frontend) or the built `kbf-coordinator` or `kbf-task`, it runs as a user that is
 //!   not root with the service's entrypoint, and it is built for the platform.
+//! - `pkg-image-sbom` ([`pkg_image_sbom`]): the CycloneDX SBOM of the task image, read from its
+//!   layers with the pinned syft, as the release asset `kbf-task-image-<commit>-<platform>.cdx.json`
+//!   beside the image; with the same bytes for the same image.
 //! - [`pkg_version`] and [`pkg_size`] (no verb yet): the version a `kbf` package
 //!   carries, in the one form a deb and an rpm put in the same order, and the most a package
 //!   that carries a kbf release may weigh. `pkg-config` and `pkg-kbf-asset` take them up with
@@ -91,8 +114,14 @@
 //!   ([`pipeline_watch`]): the fail-fast of the push pipeline: cancel the run as soon as one of its jobs
 //!   has failed, and stop when the job `--last-job` has completed. Exit 0 whatever it saw; 1 only when
 //!   GitHub refuses the cancel.
+//! - `pipeline-rerun --repo <owner/repo> --run-id <id>` ([`pipeline_rerun`]): after a pipeline run has
+//!   completed, rerun its failed jobs once (first attempt only) when every failed job builds or moves
+//!   artifacts; a failed test or lint job, or an unknown one, means nothing is rerun. Exit 1 only
+//!   when GitHub refuses the rerun.
 //! - `runner-disk --path <path> --min-free-gb <n>` ([`runner_disk`]): exit 1 naming the disk
 //!   when the disk of `<path>` has less free space than the coverage run needs.
+//! - `static-elf <binary>` ([`static_elf`]): exit 1 unless the ELF64 binary is statically
+//!   linked: no `PT_INTERP` program header and no `DT_NEEDED` entry.
 //! - `crun-tests [--sudo <path>]` ([`crun_tests`]): the container driver's real-`crun`
 //!   tests on a hosted Linux runner, each test target in its own `Delegate=yes` system
 //!   unit.
@@ -119,12 +148,16 @@ pub mod darwin;
 pub mod deploy_farm;
 pub mod entitlements;
 pub mod fetch;
+pub mod fetch_attested;
 pub mod installer_tarball;
+pub mod merge_profiles;
 pub mod package;
+pub mod pipeline_rerun;
 pub mod pipeline_watch;
 pub mod pkg;
 pub mod pkg_asset;
 pub mod pkg_image_asset;
+pub mod pkg_image_sbom;
 pub mod pkg_install;
 pub mod pkg_kbf_asset;
 pub mod pkg_linux;
@@ -135,12 +168,16 @@ pub mod pkg_size;
 pub mod pkg_trust;
 pub mod pkg_upgrade;
 pub mod pkg_version;
+pub mod profiles_complete;
 pub mod prove_farm;
 pub mod release;
 pub mod runner_disk;
+pub mod static_elf;
 pub mod sudo_test;
 pub mod sums;
+pub mod task_bundle;
 pub mod version_facts;
+pub mod wait_artifacts;
 
 /// Why a verb failed.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -194,6 +231,12 @@ enum Verb {
     BuildCommit(BuildCommit),
     /// Keep the advisories `cargo deny` reports in one GitHub issue.
     Advisories(advisories::Args),
+    /// Wait until the sibling jobs of a split job have uploaded their artifacts.
+    WaitArtifacts(wait_artifacts::Args),
+    /// Refuse a directory of raw coverage profiles in which a shard's profiles are missing.
+    ProfilesComplete(profiles_complete::Args),
+    /// Merge a directory's coverage profiles into one indexed profile.
+    MergeProfiles(merge_profiles::Args),
     /// Set a published release as the farm's desired version on the update coordinator and
     /// wait for the farm to converge.
     DeployFarm(deploy_farm::Args),
@@ -201,8 +244,13 @@ enum Verb {
     ProveFarm(prove_farm::Args),
     /// Check that the runner's disk has the room the coverage run needs.
     RunnerDisk(runner_disk::Args),
+    /// Refuse a binary that has a dynamic loader (`PT_INTERP`) or a needed shared library
+    /// (`DT_NEEDED`).
+    StaticElf(static_elf::Args),
     /// Cancel the pipeline run when one of its jobs has failed, so its other jobs stop.
     PipelineWatch(pipeline_watch::Args),
+    /// Rerun the failed jobs of a completed pipeline run once, when all of them build or move artifacts.
+    PipelineRerun(pipeline_rerun::Args),
     /// Refuse a row the budget file gains against `--base`.
     BudgetDiff {
         /// The revision to compare with (on a pull request, the base branch).
@@ -239,6 +287,40 @@ enum Verb {
         #[arg(long)]
         member: Option<PathBuf>,
     },
+    /// Download a pinned release archive, check its SHA-256 and its build attestation (`gh attestation
+    /// verify`, with the pinned `gh`), and only then take `--member` out of the file that was checked.
+    FetchAttestedTool {
+        /// Where to download it from (HTTPS).
+        #[arg(long)]
+        url: String,
+        /// The SHA-256 of the download, 64 lowercase hex digits.
+        #[arg(long)]
+        sha256: fetch::Sha256,
+        /// Where the archive is written for `gh` to verify; must not exist.
+        #[arg(long)]
+        archive: PathBuf,
+        /// The regular file of the gzip tar to install: a relative path of plain names.
+        #[arg(long)]
+        member: PathBuf,
+        /// The file to install (mode 0755); its directory is created when missing.
+        #[arg(long)]
+        out: PathBuf,
+        /// The `gh` program.
+        #[arg(long)]
+        gh: PathBuf,
+        /// The repository the archive was built in, `<owner>/<repo>`.
+        #[arg(long)]
+        repo: String,
+        /// The signer workflow, `<owner>/<repo>/<path>`.
+        #[arg(long)]
+        signer_workflow: String,
+        /// The ref it was built on, `refs/heads/<branch>`.
+        #[arg(long)]
+        source_ref: String,
+        /// The commit it was built from, a full SHA.
+        #[arg(long)]
+        source_digest: String,
+    },
     /// Package one binary and its SBOM as release assets in `--out`.
     Package {
         /// The binary; its file name is the asset's name.
@@ -250,6 +332,31 @@ enum Verb {
         /// The platform it was built for.
         #[arg(long, value_enum)]
         platform: package::Platform,
+        /// The commit it was built from (on Actions, `GITHUB_SHA`).
+        #[arg(long)]
+        commit: String,
+        /// The directory the assets go in; created when missing.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Copy the signed `kbf-task` into a new directory, the one tree `js-bundle pack` packs.
+    StageTaskTree {
+        /// The binary; its file name must be `kbf-task`.
+        #[arg(long)]
+        binary: PathBuf,
+        /// The directory to make (its parent is created when missing; it must not exist).
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Package the signed darwin `kbf-task` bundle (an OCI image layout `js-bundle pack` wrote) and
+    /// its SBOM as release assets in `--out`.
+    PackageTaskBundle {
+        /// The layout directory (`oci-layout`, `index.json`, `blobs/sha256/`).
+        #[arg(long)]
+        layout: PathBuf,
+        /// The CycloneDX SBOM of the `kbf-task` binary.
+        #[arg(long)]
+        sbom: PathBuf,
         /// The commit it was built from (on Actions, `GITHUB_SHA`).
         #[arg(long)]
         commit: String,
@@ -389,8 +496,8 @@ enum Verb {
         #[arg(long)]
         verify_only: bool,
     },
-    /// The frontend or coordinator OCI image tarball as a release asset, refused unless its
-    /// program is the attested `kbf` (or the built `kbf-coordinator`), its entrypoint is the
+    /// The frontend, coordinator or task OCI image tarball as a release asset, refused unless its
+    /// program is the attested `kbf` (or the built `kbf-coordinator` or `kbf-task`), its entrypoint is the
     /// service's, it runs as a user that is not root and it is built for the platform.
     PkgImageAsset {
         /// The image tarball `docker buildx build --output type=docker,oci-mediatypes=true` wrote (with
@@ -409,7 +516,7 @@ enum Verb {
         /// The frontend's `kbf-<commit>-<platform>.tar.gz` whose `kbf` the image must hold.
         #[arg(long, conflicts_with = "binary")]
         kbf_tarball: Option<PathBuf>,
-        /// The coordinator's `kbf-coordinator` the image must hold (it has no tarball; not
+        /// The `kbf-coordinator` or `kbf-task` the image must hold (it has no tarball; not
         /// with `--verify-only`, where the build's file is not at hand).
         #[arg(long, conflicts_with = "verify_only")]
         binary: Option<PathBuf>,
@@ -421,6 +528,42 @@ enum Verb {
         )]
         out: Option<PathBuf>,
         /// Only check `--image`, which must be named as the asset; write nothing.
+        #[arg(long)]
+        verify_only: bool,
+    },
+    /// The CycloneDX SBOM of the task OCI image, read from its layers (the base's packages too), as
+    /// a release asset beside the image; or, with `--verify-only`, a check that the one beside the
+    /// signed image is the image's.
+    PkgImageSbom {
+        /// The image asset, `kbf-task-image-<commit>-<platform>.oci.tar`, in the directory its
+        /// SBOM and line of `SHA256SUMS.<platform>` go in.
+        #[arg(long)]
+        image: PathBuf,
+        /// The service the image runs (only the task image has an SBOM asset).
+        #[arg(long, value_enum)]
+        service: pkg_image_asset::Image,
+        /// The platform it was built for (`linux-x86_64`, `linux-arm64`).
+        #[arg(long, value_enum)]
+        platform: package::Platform,
+        /// The commit it was built from (`$GITHUB_SHA`).
+        #[arg(long)]
+        commit: String,
+        /// The pinned syft program that reads the image.
+        #[arg(
+            long,
+            required_unless_present = "verify_only",
+            conflicts_with = "verify_only"
+        )]
+        syft: Option<PathBuf>,
+        /// The time the SBOM carries, seconds since 1970: the commit's time
+        /// (`source-date-epoch`), so the same image has the same SBOM.
+        #[arg(
+            long,
+            required_unless_present = "verify_only",
+            conflicts_with = "verify_only"
+        )]
+        source_date_epoch: Option<u64>,
+        /// Only check the SBOM beside `--image`; run nothing and write nothing.
         #[arg(long)]
         verify_only: bool,
     },
@@ -618,6 +761,10 @@ enum Sums {
         /// Append the result to this file (on Actions, `GITHUB_STEP_SUMMARY`).
         #[arg(long)]
         summary: Option<PathBuf>,
+        /// Append `sha256=<hex>`, the digest of the result, to this file (on Actions,
+        /// `GITHUB_OUTPUT`).
+        #[arg(long)]
+        digest_output: Option<PathBuf>,
     },
 }
 
@@ -699,11 +846,6 @@ enum ReleaseVerb {
         /// The commit the assets were built from, a full SHA.
         #[arg(long)]
         commit: String,
-        /// Do not require the version facts of each `kbf` tarball: for the release made
-        /// before the build jobs recorded them (the previous release, read by the first
-        /// release that has them). Facts without their tarball are still refused.
-        #[arg(long)]
-        without_version_facts: bool,
     },
     /// Create release `--tag` with every file of `<dir>`, or add the files it lacks;
     /// an asset it holds must be one of them, byte for byte.
@@ -851,8 +993,14 @@ enum BuildCommit {
     },
     /// The `kbf` in the release tarball `<tarball>` (`<name>-<commit>-<platform>.tar.gz`)
     /// names `<commit>` and a release build, as `check --json` finds, run on the bytes
-    /// that ship.
-    CheckAsset { tarball: PathBuf, commit: String },
+    /// that ship. With `--plain`, only the `--version` line is checked, for a binary that has no
+    /// `--version --json` (kbf-updater).
+    CheckAsset {
+        tarball: PathBuf,
+        commit: String,
+        #[arg(long)]
+        plain: bool,
+    },
     /// A plain build, two override stamps and a malformed override, from the checkout.
     Stamps { commit: String },
 }
@@ -900,7 +1048,7 @@ fn source_date_epoch(root: &Path, commit: &str, output: &Path) -> Result<String,
 }
 
 /// What the image of `service` must hold, from the flags: the frontend wants `--kbf-tarball`
-/// always, the coordinator wants `--binary` unless only verifying.
+/// always, the coordinator and the task image want `--binary` unless only verifying.
 fn image_reference<'a>(
     service: pkg_image_asset::Image,
     tarball: Option<&'a Path>,
@@ -910,13 +1058,18 @@ fn image_reference<'a>(
     use pkg_image_asset::{Image, Reference};
     match (service, tarball, binary, verify_only) {
         (Image::Frontend, Some(t), None, _) => Ok(Some(Reference::KbfTarball(t))),
-        (Image::Coordinator, None, Some(b), false) => Ok(Some(Reference::Binary(b))),
-        (Image::Coordinator, None, None, true) => Ok(None),
+        (Image::Coordinator | Image::Task, None, Some(b), false) => Ok(Some(Reference::Binary(b))),
+        (Image::Coordinator | Image::Task, None, None, true) => Ok(None),
         (Image::Frontend, ..) => Err(Error::Failed(
             "the frontend image is checked against --kbf-tarball, and only that".to_owned(),
         )),
         (Image::Coordinator, ..) => Err(Error::Failed(
             "the coordinator image is checked against --binary (not with --verify-only, \
+             which makes the other checks alone)"
+                .to_owned(),
+        )),
+        (Image::Task, ..) => Err(Error::Failed(
+            "the task image is checked against --binary (not with --verify-only, \
              which makes the other checks alone)"
                 .to_owned(),
         )),
@@ -979,12 +1132,17 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             commit,
             json,
         }) => Ok(vec![build_commit::check(&binary, &commit, json)?]),
-        Verb::BuildCommit(BuildCommit::CheckAsset { tarball, commit }) => {
+        Verb::BuildCommit(BuildCommit::CheckAsset {
+            tarball,
+            commit,
+            plain,
+        }) => {
             let scratch_in = root.join("target");
             Ok(vec![build_commit::check_asset(
                 &scratch_in,
                 &tarball,
                 &commit,
+                !plain,
             )?])
         }
         Verb::BuildCommit(BuildCommit::Stamps { commit }) => {
@@ -1009,10 +1167,15 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             root: &root,
         }),
         Verb::Advisories(args) => advisories::run(&args, &root, &cargo_program()),
+        Verb::WaitArtifacts(args) => wait_artifacts::run(&args, &root, &cargo_program()),
+        Verb::ProfilesComplete(args) => profiles_complete::run(&args),
+        Verb::MergeProfiles(args) => merge_profiles::run(&args, &root),
         Verb::DeployFarm(args) => deploy_farm::run(&args),
         Verb::ProveFarm(args) => prove_farm::run(&args),
         Verb::RunnerDisk(args) => runner_disk::run(&args),
+        Verb::StaticElf(args) => static_elf::run(&args),
         Verb::PipelineWatch(args) => pipeline_watch::run(&args),
+        Verb::PipelineRerun(args) => pipeline_rerun::run(&args),
         Verb::BudgetDiff { base } => Ok(vec![budget_diff(&root, &base)?]),
         Verb::SourceDateEpoch { commit, output } => {
             source_date_epoch(&root, &commit, &output).map(|line| vec![line])
@@ -1028,6 +1191,32 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             let roots = fetch::host_roots();
             Ok(vec![fetch::fetch(&url, &sha256, &unpack, &out, &roots)?])
         }
+        Verb::FetchAttestedTool {
+            url,
+            sha256,
+            archive,
+            member,
+            out,
+            gh,
+            repo,
+            signer_workflow,
+            source_ref,
+            source_digest,
+        } => fetch_attested::fetch_attested_tool(
+            &fetch_attested::Request {
+                url: &url,
+                sha256,
+                archive,
+                member,
+                out,
+                repo: &repo,
+                signer_workflow: &signer_workflow,
+                source_ref: &source_ref,
+                source_digest: &source_digest,
+            },
+            &gh,
+        )
+        .map(|line| vec![line]),
         Verb::Package {
             binary,
             sbom,
@@ -1035,6 +1224,15 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             commit,
             out,
         } => package::package(&binary, &sbom, platform, &commit, &out),
+        Verb::StageTaskTree { binary, out } => {
+            task_bundle::stage_tree(&binary, &out).map(|line| vec![line])
+        }
+        Verb::PackageTaskBundle {
+            layout,
+            sbom,
+            commit,
+            out,
+        } => task_bundle::package_task_bundle(&layout, &sbom, &commit, &out),
         Verb::InstallerTarball {
             binary,
             platform,
@@ -1147,6 +1345,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
                 binary.as_deref(),
                 verify_only,
             )?;
+            let base = service.base(platform)?;
             pkg_image_asset::asset(
                 &image,
                 &commit,
@@ -1158,9 +1357,35 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
                     image: service,
                     platform,
                     reference,
+                    base: base.as_ref(),
                 },
             )
         }
+        Verb::PkgImageSbom {
+            image,
+            service,
+            platform,
+            commit,
+            syft,
+            source_date_epoch,
+            verify_only,
+        } => match (&syft, source_date_epoch, verify_only) {
+            (Some(syft), Some(epoch), false) => {
+                // Under the build tree, named for this process: syft's home and cache.
+                let scratch = root
+                    .join("target")
+                    .join(format!("pkg-image-sbom-{}", std::process::id()));
+                pkg_image_sbom::make(
+                    &image,
+                    service,
+                    &commit,
+                    platform,
+                    epoch,
+                    &mut pkg_image_sbom::syft_process(syft, &scratch),
+                )
+            }
+            _ => pkg_image_sbom::verify(&image, service, &commit, platform),
+        },
         Verb::PkgMacosAsset {
             package,
             commit,
@@ -1284,7 +1509,13 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             dir,
             expect,
             summary,
-        }) => sums::assemble(&dir, expect.as_deref(), summary.as_deref()),
+            digest_output,
+        }) => sums::assemble(
+            &dir,
+            expect.as_deref(),
+            summary.as_deref(),
+            digest_output.as_deref(),
+        ),
         Verb::VerifyAssets(VerifyAssets::Sums { dir }) => {
             Ok(vec![sums::verify_sums(&dir, fetch::Sha256::of)?])
         }
@@ -1303,18 +1534,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
         }) => Ok(vec![release::main_control(
             &gh, &repo, &on_main, &off_main,
         )?]),
-        Verb::Release(ReleaseVerb::Check {
-            dir,
-            commit,
-            without_version_facts,
-        }) => {
-            let pairing = if without_version_facts {
-                version_facts::Pairing::Waived
-            } else {
-                version_facts::Pairing::Required
-            };
-            release::check(&dir, &commit, pairing)
-        }
+        Verb::Release(ReleaseVerb::Check { dir, commit }) => release::check(&dir, &commit),
         Verb::Release(ReleaseVerb::Verify { subject, output }) => {
             let verified = release::verify::verify(&subject.subject())?;
             let line = format!("set-hash={}", verified.set_hash.as_str());

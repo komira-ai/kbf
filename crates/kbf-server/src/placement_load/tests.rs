@@ -47,8 +47,8 @@ fn the_flag_defaults_to_off_and_takes_off_and_on() {
 }
 
 /// Catches a mode mapped to another of the scheduler's (`off` placing by load, `on`
-/// booked), and a configuration that changes a setting other than the mode: kbf takes
-/// the scheduler's own values for the rest.
+/// booked), and a configuration that changes a setting other than the mode and the profile
+/// switches kbf writes out: kbf takes the scheduler's own values for the rest.
 #[test]
 fn each_mode_maps_to_the_schedulers_and_changes_nothing_else() {
     let theirs = |ours: PlacementLoad| ours.mode();
@@ -59,10 +59,37 @@ fn each_mode_maps_to_the_schedulers_and_changes_nothing_else() {
             ours.config(),
             LoadConfig {
                 mode: ours.mode(),
+                cpu_floor_permille: 1000,
+                profile: true,
+                profile_memory: true,
+                profile_floor_permille: 750,
+                expected_life_delta_minutes: Some(2),
+                flat_memory_slack_permille: Some(0),
                 ..LoadConfig::default()
             }
         );
     }
+}
+
+/// Pins the profile switches the farm gives every scheduler, as numbers and not as the
+/// scheduler library's defaults: a raise of the library's revision that changes one of its
+/// defaults leaves the farm's placement as it is, and a change of these values is a change
+/// of kbf's. The values are the library's today and have not been measured on a farm.
+#[test]
+fn the_profile_switches_are_written_out_and_pinned() {
+    for mode in PlacementLoad::value_variants() {
+        let config = mode.config();
+        assert_eq!(config.cpu_floor_permille, 1000, "{mode:?}");
+        assert!(config.profile, "{mode:?}");
+        assert!(config.profile_memory, "{mode:?}");
+        assert_eq!(config.profile_floor_permille, 750, "{mode:?}");
+        assert_eq!(config.expected_life_delta_minutes, Some(2), "{mode:?}");
+        assert_eq!(config.flat_memory_slack_permille, Some(0), "{mode:?}");
+    }
+    assert_eq!(super::CPU_FLOOR_PERMILLE, 1000);
+    assert_eq!(super::PROFILE_FLOOR_PERMILLE, 750);
+    assert_eq!(super::EXPECTED_LIFE_DELTA_MINUTES, 2);
+    assert_eq!(super::FLAT_MEMORY_SLACK_PERMILLE, 0);
 }
 
 /// Catches `off` carried as `Some(false)` (a farm that does not place by load would send a

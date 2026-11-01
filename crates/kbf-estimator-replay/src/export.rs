@@ -12,7 +12,9 @@
 //! and only attempts with a run record (calls with no invocation id leave none); a build's
 //! actions are read from its record, which is in memory for `--invocation-memory` or in
 //! history for the retention class; node capacity is a point in time; the API writes 0 for
-//! an unmeasured peak or wall, which the row records as absent.
+//! an unmeasured peak or wall, which the row records as absent; the invocation and build ids
+//! come from the run record (`invocation_id`, `correlated_invocations_id`), so a server that
+//! predates them gives rows without, and the walk's own invocation is never put in their place.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -266,6 +268,15 @@ fn row_of(v: &Value, nodes: &BTreeMap<String, Node>) -> Result<Row, String> {
     let queued_us = micros(need("queued")?)?;
     let usage = v.get("usage").filter(|u| u.is_object());
     let shape_key = |key: &str| v["shape"][key].as_str().unwrap_or("-").to_owned();
+    let times = &v["reapi_times"];
+    let spans = [
+        ("input_fetch_start", "input_fetch_completed"),
+        ("execution_start", "execution_completed"),
+        ("output_upload_start", "output_upload_completed"),
+    ]
+    .map(|(from, to)| phase_us(times, from, to))
+    .into_iter()
+    .collect::<Result<Vec<_>, String>>()?;
     Ok(Row {
         run_id: need("run_id")?.to_owned(),
         instance: need("instance")?.to_owned(),
@@ -285,10 +296,30 @@ fn row_of(v: &Value, nodes: &BTreeMap<String, Node>) -> Result<Row, String> {
         ended_us: time("ended")?,
         node_capacity: known.and_then(|n| n.capacity),
         basis: usage.and_then(|u| str_of(u, "basis")).map(str::to_owned),
-        operation: str_of(v, "operation").map(str::to_owned),
-        booked_millicpus: usage.and_then(|u| u["booked_millicpus"].as_u64()),
+        // The run route writes the operation id as a number (`operation_id`), left out for a
+        // run with none. The text is its decimal form. No server wrote another key: the
+        // exporter never read the run's operation, so no export file holds one to keep.
+        operation: v["operation_id"].as_u64().map(|id| id.to_string()),
+        // The run's own key is the lease's grant, written for every attempt; the usage block's
+        // is what the daemon reported, which an older server wrote for a Mac only.
+        booked_millicpus: v["booked_millicpus"]
+            .as_u64()
+            .or_else(|| usage.and_then(|u| u["booked_millicpus"].as_u64())),
         node_cpu_pressure_centi: usage.and_then(|u| u["node_cpu_pressure_centi"].as_u64()),
+        invocation_id: str_of(v, "invocation_id").map(str::to_owned),
+        correlated_invocations_id: str_of(v, "correlated_invocations_id").map(str::to_owned),
+        phase_times: str_of(v, "phase_times").map(str::to_owned),
+        fetch_us: spans[0],
+        execution_us: spans[1],
+        pack_us: spans[2],
+        lease: str_of(v, "lease").map(str::to_owned),
     })
+}
+
+/// The time between two of a run's REAPI times, when it has both and they are in order.
+fn phase_us(times: &Value, from: &str, to: &str) -> Result<Option<u64>, String> {
+    let at = |key: &str| str_of(times, key).map(micros).transpose();
+    Ok(at(from)?.zip(at(to)?).and_then(|(a, b)| b.checked_sub(a)))
 }
 
 /// The cgroup block. The read API writes 0 for a wall or peak that was not measured, so

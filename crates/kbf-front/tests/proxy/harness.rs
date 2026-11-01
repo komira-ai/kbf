@@ -121,6 +121,13 @@ pub struct Fake {
     pub break_with: Option<tonic::Code>,
     /// What the calls counted by `away` are answered with (UNAVAILABLE if none).
     pub away_code: Option<tonic::Code>,
+    /// The next this many Writes are answered `STALE_MAP` once `stale_after` of their
+    /// messages have been read.
+    pub stale: AtomicUsize,
+    /// The messages of a Write that are read before it is answered `STALE_MAP`.
+    pub stale_after: usize,
+    /// The generation a `STALE_MAP` answer names.
+    pub stale_generation: u64,
 }
 
 struct DropFlag(Arc<AtomicBool>);
@@ -186,6 +193,28 @@ impl Fake {
             away_code: Some(code),
             ..Self::default()
         })
+    }
+
+    /// A node that answers its first `calls` Writes `STALE_MAP` naming `generation`, after
+    /// it has read `after` messages of each, and serves after them.
+    pub fn stale_for(calls: usize, generation: u64, after: usize) -> Arc<Self> {
+        Arc::new(Self {
+            stale: AtomicUsize::new(calls),
+            stale_after: after,
+            stale_generation: generation,
+            ..Self::default()
+        })
+    }
+
+    /// `STALE_MAP` as a node answers it: FAILED_PRECONDITION with its generation in the
+    /// map generation entry.
+    fn stale_map(&self) -> Status {
+        let mut status = Status::failed_precondition("STALE_MAP");
+        status.metadata_mut().insert(
+            "kbf-map-generation",
+            self.stale_generation.to_string().parse().expect("metadata"),
+        );
+        status
     }
 
     /// A node whose Reads send two chunks and then end with `code`.
@@ -294,6 +323,14 @@ impl ByteStream for Fake {
         while let Some(m) = s.message().await? {
             if i == 0 {
                 self.note("Write", &m.resource_name, &metadata);
+            }
+            if i == self.stale_after
+                && self
+                    .stale
+                    .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
+                    .is_ok()
+            {
+                return Err(self.stale_map());
             }
             if self.fail_writes_after == Some(i) {
                 return Err(Status::unavailable("going away mid-upload"));
@@ -596,6 +633,51 @@ impl MapSource for Switch {
                 at_least,
                 reason: "nothing newer".to_owned(),
             })
+        })
+    }
+}
+
+/// A map the frontend gets newer ones of: it holds the first of `maps`, and each fetch
+/// moves it to the next (the last stays), as the frontend's map moves when a fetch brings a
+/// newer one.
+pub struct Advancing {
+    maps: Vec<Arc<Map>>,
+    at: AtomicUsize,
+    /// How many times the frontend has fetched.
+    pub fetches: AtomicUsize,
+}
+
+impl Advancing {
+    pub fn new(maps: Vec<Arc<Map>>) -> Arc<Self> {
+        Arc::new(Self {
+            maps,
+            at: AtomicUsize::new(0),
+            fetches: AtomicUsize::new(0),
+        })
+    }
+
+    fn view(&self) -> MapView {
+        MapView {
+            map: Arc::clone(&self.maps[self.at.load(SeqCst)]),
+            previous: None,
+            earlier: Vec::new(),
+        }
+    }
+}
+
+impl MapSource for Advancing {
+    fn current(&self) -> Option<MapView> {
+        Some(self.view())
+    }
+
+    fn refetch(&self, _: u64) -> BoxFuture<'_, Result<MapView, RefetchError>> {
+        Box::pin(async move {
+            self.fetches.fetch_add(1, SeqCst);
+            let last = self.maps.len() - 1;
+            let _ = self
+                .at
+                .fetch_update(SeqCst, SeqCst, |n| Some((n + 1).min(last)));
+            Ok(self.view())
         })
     }
 }

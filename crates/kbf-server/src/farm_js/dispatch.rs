@@ -10,7 +10,7 @@
 //! operator's action) it is asked for directly.
 //!
 //! Left to the host, because the core has no hook for them: the `action usage:` line of a
-//! report, the invocation record's measurement of it ([`KbfAdapter::record_ran`]) and the
+//! report, the invocation record's measurement of it ([`Recording::ran`](crate::run_record::Recording::ran)) and the
 //! node memory pressure line (all made after the feed in the farm's own driver, from the
 //! answer the feed returned), and the scheduler gauges of `/metrics`.
 
@@ -23,12 +23,13 @@ use js_store::{Ext as _, Progress};
 use kbf_front::{Backend, Stage, Submission, Ticket};
 use kbf_proto::worker::{self, ResultAck, ResultAckReason};
 use kbf_sched::DaemonInstance;
-use kbf_types::{ActionKey, FarmTime, LeaseId, OperationId, WorkerId};
+use kbf_types::{ActionKey, FarmTime, LeaseId, OperationId, Outcome, WorkerId};
 use tonic::Status;
 
 use super::adapter::{KbfAdapter, Wall, wire_lease};
 use super::ext::KbfExt;
 use super::host::{Caller, Connection};
+use super::learning::{Ask, Sized};
 use crate::action_usage::{Measured, Shapes};
 use crate::answer;
 use crate::farm::Reported;
@@ -128,6 +129,13 @@ pub fn submit(
     // Outside the lock: hashes the action's shape and drops its argv and paths.
     let usage = shapes.subject(std::mem::take(&mut submission.described));
     let shape = submission.call.as_ref().map(|_| usage.recorded());
+    let sized = Sized {
+        kind: submission.request.kind,
+        gpus: submission.request.resources.gpus,
+        memory_bytes: submission.request.resources.memory_bytes,
+        cpu_millis: submission.request.resources.cpu_millis,
+        evidence: submission.evidence,
+    };
     let call = submission
         .call
         .take()
@@ -142,15 +150,34 @@ pub fn submit(
         usage,
         platform: Platform::of(&submission.request.needs),
     };
+    // The prediction (`--placement-predictions`) is asked for in a hold of the core of its own,
+    // before the submit's: the core charges it from the operation's first placement round.
+    // `shadow` hands the core nothing.
+    let (forecast, on) = core.with(|view, adapter| {
+        let ask = Ask {
+            request: &submission.request,
+            instance: &caller.key.instance,
+            platform: &caller.platform,
+            subject: &caller.usage,
+        };
+        (
+            adapter.forecast_submit(view, &sized, ask),
+            adapter.hands_predictions(),
+        )
+    });
+    let prediction = forecast.and_then(Result::ok).filter(|_| on);
     let (sender, stage) = tokio::sync::watch::channel(Stage::Queued);
     let enrol = |adapter: &mut KbfAdapter, admitted: &Admitted| {
         adapter.enrol(admitted, caller, call, sender);
     };
     let admitted = core
-        .submit(now, submission.request, &parcel, enrol)
+        .submit_with(now, submission.request, &parcel, None, prediction, enrol)
         .map_err(unavailable)?;
     // A caller that joined an operation that holds a lease sees it executing.
-    core.with(|view, adapter| adapter.mark_joined(view, &admitted));
+    core.with(|view, adapter| {
+        adapter.mark_joined(view, &admitted);
+        adapter.learn_submit(view, &admitted, &sized, forecast);
+    });
     Ok(Ticket {
         name: stored_name(admitted.operation),
         instance,
@@ -233,9 +260,49 @@ pub async fn report(
     core: &Core<KbfAdapter>,
     cache: &Backend,
     wall: &Wall,
-    now: impl Fn() -> FarmTime,
+    now: &(dyn Fn() -> FarmTime + Sync),
     worker: &WorkerId,
     result: worker::Result,
+) -> Result<Option<ResultAck>, Denied> {
+    report_noting(core, cache, wall, now, worker, result, &mut None).await
+}
+
+/// How a run that reported ended, for what the farm learns from it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Ran {
+    /// The action the lease ran.
+    pub(crate) action: ActionKey,
+    /// Whether the run ended on its own (it completed, with any exit code): not killed, lost,
+    /// timed out or stored badly.
+    pub(crate) clean: bool,
+    /// How the core took the `Result`.
+    pub(crate) took: Took,
+}
+
+/// How the core took a `Result` it did not refuse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Took {
+    /// Accepted, and its record written or not needed.
+    Accepted,
+    /// Taken, its record not written yet: acknowledged once it is.
+    Held,
+    /// Taken, and its record dropped unwritten over the cap: never acknowledged.
+    Dropped,
+}
+
+/// [`report`], leaving in `ran` what the lease ran, how it ended and how the core took the
+/// `Result` (not for a refused one).
+///
+/// # Errors
+/// The core's admission refuses the host.
+pub(crate) async fn report_noting(
+    core: &Core<KbfAdapter>,
+    cache: &Backend,
+    wall: &Wall,
+    now: &(dyn Fn() -> FarmTime + Sync),
+    worker: &WorkerId,
+    result: worker::Result,
+    ran: &mut Option<Ran>,
 ) -> Result<Option<ResultAck>, Denied> {
     let Some(wire) = result.lease_id else {
         return Ok(None);
@@ -252,13 +319,22 @@ pub async fn report(
     };
     // The lease id is this process's, so the run it reports was started for this
     // operation; a daemon that says it ran another action is refused all the same.
-    let (sent, recorded) = core.with(|view, adapter| {
+    let (sent, recorded, keyed) = core.with(|view, adapter| {
         (
             adapter.sent(view, operation, lease),
-            adapter.is_recorded(operation),
+            adapter.recording.is_recorded(operation),
+            adapter
+                .first_waiter(view.sched(), operation)
+                .map(|(_, waiter)| waiter.key.clone()),
         )
     });
-    let Some(Sent { action, stamp, .. }) = sent else {
+    let Some(Sent {
+        action,
+        stamp,
+        booked,
+        ..
+    }) = sent
+    else {
         return Ok(Some(refusal(wire, ResultAckReason::UnknownLease)));
     };
     if let Some(named) = &result.action_digest
@@ -271,12 +347,13 @@ pub async fn report(
     let ran_on = (worker, stamp);
     // Read before `outcome`, which drops a failed run's result. What the report measured
     // is kept for the hooks around the feed (`action usage:` line, the invocation record).
-    let measured = Measured::of(&result);
+    let measured = Measured::of(&result).map(|m| m.booked(booked));
     let run = recorded.then(|| {
         let usage = measured.as_ref().map(Measured::usage);
-        run_record::of(&result, usage, stamp, read())
+        run_record::of(&result, usage, stamp, read(), booked)
     });
     let (outcome, detail) = answer::outcome(cache, read, lease, ran_on, result).await;
+    let clean = matches!(outcome, Outcome::Completed { .. });
     let report = Report {
         operation,
         lease,
@@ -291,9 +368,34 @@ pub async fn report(
     let taken = core.report(now(), worker, report, park).await;
     // None: the ack is sent when the store has taken the record, or never.
     let (accepted, reason) = match taken {
-        Taken::Accepted => (true, ResultAckReason::Accepted),
+        Taken::Accepted => {
+            let took = Took::Accepted;
+            *ran = keyed.map(|action| Ran {
+                action,
+                clean,
+                took,
+            });
+            (true, ResultAckReason::Accepted)
+        }
         Taken::Refused(reason) => (false, acked(reason)),
-        Taken::Held | Taken::Dropped => return Ok(None),
+        Taken::Held => {
+            let took = Took::Held;
+            *ran = keyed.map(|action| Ran {
+                action,
+                clean,
+                took,
+            });
+            return Ok(None);
+        }
+        Taken::Dropped => {
+            let took = Took::Dropped;
+            *ran = keyed.map(|action| Ran {
+                action,
+                clean,
+                took,
+            });
+            return Ok(None);
+        }
     };
     Ok(Some(ResultAck {
         lease_id: Some(wire_lease(lease)),
@@ -318,6 +420,7 @@ impl KbfAdapter {
                     queued: waiter.queued,
                     started: waiter.queued,
                 },
+                booked: None,
             })
         })
     }

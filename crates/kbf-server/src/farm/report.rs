@@ -130,19 +130,20 @@ impl Farm {
         let wire_lease = result.lease_id?;
         let _taking = self.in_flight();
         let lease = LeaseId::new(wire_lease.term, wire_lease.seq);
-        let (standing, recorded) = {
+        let (standing, recorded, booked) = {
             let mut state = self.lock();
             let standing = state.standing(lease, worker);
             let recorded = standing
                 .as_ref()
-                .is_ok_and(|(operation, ..)| state.side.is_recorded(*operation));
+                .is_ok_and(|(operation, ..)| state.side.recording.is_recorded(*operation));
             // A copy of a result the scheduler took whose finish waits for the store is
             // acknowledged with the first, to the node that sent the first: a copy from
             // another node, which never held the lease, is owed nothing.
             if matches!(standing, Err(Verdict::Held)) {
                 state.engine.owed.entry(lease).or_insert(worker.clone());
             }
-            (standing, recorded)
+            let booked = state.side.machine.sent(lease).and_then(|sent| sent.booked);
+            (standing, recorded, booked)
         };
         let (operation, action, stamp) = match standing {
             Ok(holding) => holding,
@@ -166,11 +167,11 @@ impl Farm {
         }
         let ran_on = (worker, stamp);
         // Read before `outcome`, which drops a failed run's result.
-        let measured = Measured::of(&result);
+        let measured = Measured::of(&result).map(|m| m.booked(booked));
         let exit_code = action_usage::exit_code(&result);
         let run = recorded.then(|| {
             let usage = measured.as_ref().map(Measured::usage);
-            run_record::of(&result, usage, stamp, self.ambient.wall())
+            run_record::of(&result, usage, stamp, self.ambient.wall(), booked)
         });
         let wall = || self.ambient.wall();
         let (outcome, detail) = answer::outcome(&self.cache, wall, lease, ran_on, result).await;
@@ -329,7 +330,7 @@ impl State {
                 Some(killed) => run_record::killed(run, killed),
                 None => run,
             };
-            self.side.record_ran(operation, lease, run);
+            self.side.recording.ran(operation, lease, run);
         }
         let (operation, node) = (name, worker);
         // `-` when the worker reported no run (a failure before the action executed).
@@ -412,7 +413,9 @@ impl State {
             }
             _ => (None, None),
         };
-        self.side.record_finished(answer, &finished, stored, reason);
+        self.side
+            .recording
+            .finished(answer, &finished, stored, reason);
         self.keep_finished(answer.operation, answer.waiters.clone());
         // A result whose finish waited for the store is acknowledged to its sender's
         // newest stream: the store has taken the row.

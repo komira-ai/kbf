@@ -513,6 +513,27 @@ What the code does today:
   its `gpu` count, and what its platform asks of a worker (`Request::needs`). The
   scheduler raises the memory of a new submission to its action key's memory floor,
   if it has one (see "Memory kills" below).
+- With `--exclusive-actions` on, the front sets `Request.whole_worker` on every `action`
+  request (not on a `whole_machine` or `vm` one). The request still carries the booking
+  above, which the front computes as before and which stays the record of what the
+  platform named, but the scheduler resolves it per worker: the request books the
+  worker's full capacity (all its CPUs, memory and GPUs), has room only on a worker that
+  holds no lease, and places no other lease beside it, as a whole-host action does. The
+  `Start` carries that capacity. It is placed by the same round, and while it waits the
+  scheduler holds a reservation for it on a worker. The action digest is untouched. A hint
+  (`kbf-book-cpus`, `kbf-book-mem-gib`) is read and recorded but not booked. An own-limit
+  memory kill has no larger rung (see "Memory kills"): the operation finishes
+  `Failed(OutOfMemory)` and leaves no memory floor. The control log has no field for the
+  request's `whole_worker`, so recovery reads every operation back with it false. A queued
+  operation is then an ordinary action. A running one is recovered by booking its request
+  as stored (`recover.rs`: `book` with `worker.booking(request)`, the request's own
+  resources, and a load charge from the recorded grant cost, which is the admission
+  charge of that booking; the worker-wide charge is made only in the scheduler's memory at
+  grant), so it holds the front's small booking and ordinary actions can be placed
+  beside it, and if it is lost or requeued it reruns as an ordinary action, up the memory
+  ladder, without owning the worker. A run that depends on one action per worker must not
+  restart the server. The server logs `exclusive-actions: on` at start when the flag is on. Both
+  scheduler cores take the request unchanged.
 - Each request carries its lease kind (`kbf-lease`: `action` or `whole_machine`). A
   worker is feasible for it only if its node report lists a driver that serves the
   kind (`container`, `native`, `fake` or `local` for `action`, `native-whole-machine` for
@@ -709,6 +730,34 @@ turns it into one of two outcomes, and the scheduler decides on the committed re
   the farm: where no live node has the first rung's memory, an action that names no
   size is unservable, as one that names that size would be, and is refused after the
   unservable wait; a farm of small nodes sets a lower first rung.
+- **With `--exclusive-actions` on**, an action already books the whole worker, so it has
+  no rung above: an own-limit kill finishes the operation `Failed(OutOfMemory)` and raises
+  no floor for its key, the same as a kill of a run that booked the cap.
+- **`--no-memory-climb`: no rung above the first booking.** With the flag, set on the
+  server (default off; off is the behaviour above), an own-limit kill does not queue the
+  operation again. The scheduler records the kill as a memory run, as it does a kill at
+  the cap, and finishes the operation `Failed(OutOfMemory)` at the booking it ran with:
+  the first rung, or the GiB its `kbf-book-mem-gib` names. Its callers are told
+  FAILED_PRECONDITION with reason `ACTION_OUT_OF_MEMORY`, the message saying the ladder is
+  off, not that no node is large enough (it passed its memory limit with 4 GiB booked on
+  node-a; the memory ladder is off (--no-memory-climb), so it is not run again with more
+  memory. Runs: 1 (4 GiB on node-a)). The server tells the two apart by the last run: a
+  kill below its cap can only end an operation when the climb is off, and its attempt in the invocation record carries
+  `memory_kill` `own_limit`. No booking, floor or key floor is raised, so every
+  submission of the action starts where the first did. A kill the node made under memory
+  pressure is not the action's: it runs again with the same booking and counts against
+  the farm-fault reruns, with the flag as without it. The ladder's rungs still matter
+  for the first booking only (the first rung). `--learned-sizes on` is allowed with the
+  flag: the booking floor the estimator adds comes from a kill that climbs, which the
+  flag never lets happen; the estimator still takes the kill in as a sample of the
+  action, as it takes any kill, but the scheduler holds no floor from it. The flag is
+  held by the legacy core's scheduler, which a restart builds again from the flag. The js
+  core builds its scheduler inside `js-server-core`, whose configuration has no setting
+  for it yet, so a server given `--no-memory-climb` with `--scheduler-core js` refuses to
+  start (exit status 2). A start logs `memory climb: on` or `memory climb: off`. With
+  `--exclusive-actions` as well, an action books the whole worker, so its booking is its
+  cap: an own-limit kill reads as a kill at the cap, with the original message, not the
+  ladder-off one.
 - **The memory floor.** Each raised booking is kept as the memory floor of the
   action's key (instance name and action digest), and a later submission of that key
   books at least the floor, so a known-big action starts at the rung that ran it
@@ -802,6 +851,82 @@ hosts later, and the scheduler runs on its leader:
   naming the leader. None of this is built: `/readyz` exists, but its `leader` check
   always passes on the one server, and there is no second readiness path and no
   redirect yet.
+
+## The js scheduler core (`--scheduler-core`)
+
+Every build has two scheduler cores, and `--scheduler-core` (`[scheduler] scheduler-core`)
+picks the one a server runs: `legacy`, the default, is the farm described above; `js` runs
+the farm on the js scheduler core (`kbf-server/src/farm_js` and `src/farm/js`), which
+decides placement, leases and retries itself while the farm carries out what it decides.
+The server logs the core at start (`scheduler core: js`) and exports it as
+`kbf_scheduler_core{core}`.
+
+To switch, change the flag and restart the frontend; to switch back, set `legacy` and
+restart. Both cores keep their state in the same rows of the state store, and each reads
+what the other wrote (the lease record's cost field is additive and the legacy core ignores
+it), so nothing is converted either way.
+
+What an operator sees with `js`:
+
+- **Learned sizes.** `--learned-sizes shadow` and `off` work: the estimator is shown every
+  attempt, the `size estimate:` line, the `kbf_estimator_shadow_total` counts and the
+  size summaries (`est/` rows) are as on `legacy`, and no booking changes. `--learned-sizes on`
+  is refused at start (exit status 2): this core sets no size keys, so `on` would book as
+  `off` does.
+- **Operation names.** Only `operations/<id>` names are answered. A name of the older form,
+  `operations/<term>-<waiter>`, is not found, also on a farm with no state store (see
+  "Results across frontends": `legacy` still answers it for a caller its own process holds). After a rollback to `legacy` a client that holds an
+  `operations/<id>` name from `js` still finds it on a farm over a state store: `legacy`
+  answers that form from the same `op/`, `queue/` and `done/` rows. A farm with no state
+  store (`kbf-server` without `--state-store`, which keeps the scheduler's state in memory and
+  loses it on a restart) answers only the `operations/<id>` names of operations the core
+  holds, and nothing from a store.
+- **Node load.** `--placement-load` is read on this core as on `legacy`. The farm accepts
+  the load a daemon reports on its heartbeat by the same rule, keeps it in memory, shows it in
+  the node's detail, and hands each accepted reading to the scheduler, which was built with
+  the load configuration of `placement_load.rs`. With `off`, the default, the scheduler books
+  by the CPUs a lease asks for and reads no load. With `on`, the js scheduler's placement by
+  load is switched on as a whole, not only the reading. `placement_load.rs` pins these
+  settings as constants, and its tests hold them:
+  - *Load predicate.* A node is admitted by its measured load and the load a lease is
+    predicted to add, not by its booked CPUs.
+  - *Profile charging* (`PROFILE`, `PROFILE_MEMORY`, floor 750 thousandths). A key with a
+    learned time profile is charged its cores per minute, checked over the next half hour, and
+    its remaining maximum memory. This core gives the scheduler no profile, so the setting
+    is idle today.
+  - *Flat-memory guard* (`FLAT_MEMORY_SLACK_PERMILLE` = 0). The flat memory charged to the
+    leases of a node, the new lease's own included, stays within the node's memory. With no
+    prediction a lease is charged no memory, so the guard counts only the leases that carry
+    one (a retry up the memory ladder, a VM) unless `--placement-predictions on` gives leases
+    a memory; in `--placement-load on` alone it admits nearly everything.
+  - *Expected-life delta* (`EXPECTED_LIFE_DELTA_MINUTES` = 2). A new lease is charged until
+    the P90 of its key's wall time plus two minutes, not for the whole horizon. The delta
+    needs a prediction for the operation and a curve source that knows the key's wall time.
+    With `--placement-predictions on` this core gives the scheduler the first, but the farm
+    never gives it a curve source, so the setting is idle today.
+  - *Balance scoring.* Nodes are ranked with the scheduler's own balance term, which
+    `placement_load.rs` leaves at the scheduler library's value.
+
+  A node with no usable reading is admitted on the sum of its leases' predicted costs, never
+  by the booked rule. A node that has never sent an accepted reading (a daemon or runtime
+  that takes none, or an agent that reports none) is charged at least 1000 m for each lease
+  (the node's whole CPU capacity, if that is less), whatever the prediction, so a prediction
+  under one core changes nothing there, and `--placement-predictions on` would do nothing for
+  small actions on such nodes; a node that has measured and gone stale is not floored. On a
+  farm of such nodes `--placement-load on` therefore charges close to the booked rule, and a change
+  in placement is not to be expected from it. `--placement-predictions` is read under
+  `--scheduler-core js` too (see the flag's help): `on` hands the scheduler the prediction at
+  submit; an operation read back from the state store is charged as with `off`.
+- **Node of another frontend.** The detail of a node that another frontend holds is not
+  answered from the store's rows.
+- **Whole-node drain.** A submission's `max_wall` is not given to the scheduler, so a
+  whole-node drain sees no per-operation deadline. Keep whole-node placement off
+  (`--whole-node-max` unset) with `js` until the core takes `max_wall`.
+- **Logs.** The core's "lease finished" line has no `exit_code=` field and comes before
+  the `action usage:` line. The `size estimate:` line of a new operation is written after
+  the submit is queued, not before.
+- **Fenced frontend.** A frontend the store has fenced still writes size summaries (the
+  `est/` rows); on `legacy` it writes none.
 
 ## Where to look
 

@@ -123,6 +123,39 @@ async fn the_pack_counts_of_a_node_are_those_of_its_newest_stream() {
     assert!(kept_reads.is_empty() && kept_writes.is_empty(), "forgotten");
 }
 
+/// Asserts that the input cache counts follow the same rules as the pack counts: kept for the
+/// newest stream, ignored from a replaced one, forgotten by a heartbeat without them, and shown
+/// for the node detail.
+#[tokio::test(start_paused = true)]
+async fn input_cache_counts_follow_the_newest_stream() {
+    use kbf_proto::worker::InputCacheCounts;
+    let rig = rig();
+    let worker = WorkerId::new("node-a");
+    let old = register(&rig, "node-a", 0).stream;
+    let new = register(&rig, "node-a", 0).stream;
+    let counts = InputCacheCounts {
+        fills: 4,
+        ..Default::default()
+    };
+    let drive = |f: &dyn Fn(&mut super::KbfAdapter)| rig.core.with(|_, a| f(a));
+    drive(&|a| a.note_input_cache(&worker, new, Some(counts)));
+    drive(&|a| a.note_input_cache(&worker, old, None));
+    let kept = rig
+        .core
+        .with(|_, a| (a.input_caches(), a.input_cache_of(&worker)));
+    assert_eq!(
+        kept.0,
+        [(worker.clone(), counts)],
+        "the old stream's is ignored"
+    );
+    assert_eq!(kept.1.map(|view| view.fills), Some(4));
+    drive(&|a| a.note_input_cache(&worker, new, None));
+    let kept = rig
+        .core
+        .with(|_, a| (a.input_caches(), a.input_cache_of(&worker)));
+    assert!(kept.0.is_empty() && kept.1.is_none(), "forgotten");
+}
+
 /// Asserts that a node whose newest stream has closed is no longer connected in the
 /// machine's registry once the adapter is told to look, and one whose stream is open still
 /// is.
@@ -179,7 +212,7 @@ async fn an_operation_no_recorded_call_waits_on_is_not_told_to_the_recorder() {
     recorder.caught_up().await;
     assert_eq!(recorder.sent(), 0, "nothing was told");
     rig.core
-        .with(|_, a| a.record_ran(OperationId(0), first, Default::default()));
+        .with(|_, a| a.recording.ran(OperationId(0), first, Default::default()));
     recorder.caught_up().await;
     assert_eq!(
         recorder.sent(),
@@ -284,10 +317,11 @@ async fn a_recorded_call_whose_operation_is_refused_ends_with_the_reason() {
     assert!(matches!(outcome, Some(Answered::Refused(_))), "{outcome:?}");
     rig.core.with(|_, a| {
         assert!(
-            !a.is_recorded(OperationId(0)),
+            !a.recording.is_recorded(OperationId(0)),
             "the operation is not noted any more"
         );
-        a.record_ran(OperationId(0), LeaseId::new(7, 0), Default::default());
+        a.recording
+            .ran(OperationId(0), LeaseId::new(7, 0), Default::default());
     });
 }
 
@@ -380,7 +414,7 @@ async fn report(rig: &super::testing::Rig, result: worker::Result) -> bool {
         &rig.core,
         &rig.backend,
         &wall(),
-        || at(0),
+        &|| at(0),
         &WorkerId::new("node-a"),
         result,
     )

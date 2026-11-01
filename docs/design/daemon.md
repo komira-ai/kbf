@@ -853,8 +853,9 @@ drops a killed run's result and cuts a timeout's to its logs
 | `target`, `target_kind` | the target the action's own `buck-out` paths name (issue #796): `"cell//pkg:name"` from its first output pattern that names one, else from its first program word that does (a test binary buck2 built), and the owner's kind (`target`, `anon` or `bxl`); `-` when they name none (a remotely run test under `buck-out/v2/test/execution/`, run by a program outside `buck-out`). Read from the Command, never from the client |
 | `outcome` | how the scheduler judged the report: `ok`, `oom` (the action's own memory limit), `node-pressure`, `timeout`, `infra`, `invalid`, `missing-input`, `lost-restart`, `lost-fenced` |
 | `lease`, `node` | the lease and the node that ran it: the join to the daemon's `lease phases:` and `transfers:` lines |
+| `booked_millicpus`, `booked_memory_bytes` | what the lease was granted, as its `Start` carried it (thousandths of a CPU, bytes), after the memory ladder and the floors, not the client's request; `-` for a lease the server never started (one taken up from the state store). They end the line, so a reader of the fields above is unaffected; held beside `cpu_usage_us` and `wall_us` they give vCPU-hours held against used |
 
-The fields keep their order; `target_hint` was called `target` before the derived
+The fields keep their order, and a field added is added at the end; `target_hint` was called `target` before the derived
 target took that name. A report the server refuses (its lease is no longer
 current) has no line: that is how a **cancelled** lease ends. Its usage is in the
 daemon's `lease phases:` line, which joins on `lease=` to the server's `lease granted`

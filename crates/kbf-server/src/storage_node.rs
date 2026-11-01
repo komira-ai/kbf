@@ -52,6 +52,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Arg, ArgMatches, Command, FromArgMatches as _};
+use kbf_front::store_metrics::StoreMetrics;
 use kbf_front::{
     Cache, CacheStorage, Hold, MetaLog, MetaLogError, ObjectKeys, RebuildConfig, SegmentsConfig,
     VerifiedBlob,
@@ -60,6 +61,7 @@ use kbf_log::FarmLogId;
 use kbf_mapsync::MapHolder;
 use kbf_meta::{NodeWriter, Retention};
 use kbf_objstore::{KeyPrefix, ObjectStore, StillHeld};
+use kbf_storage::legacy::LegacyReads;
 use kbf_storage::repair::{RepairConfig, Repairs};
 use kbf_storage::service::CatchUp;
 use kbf_store::StdFs;
@@ -69,6 +71,7 @@ use kbf_tls::{TlsFiles, TlsSource};
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
 
 use crate::cold_apply::{ColdPick, Fixed, Registrable};
+use crate::cold_counted::CountedPick;
 use crate::join::{self, Joined, Joiner};
 use crate::listen::Binder;
 use crate::members::LastBoot;
@@ -89,6 +92,7 @@ use crate::{Args, ConfigError, RaftMetaLog, SERVER_VERSION, StartFailure, interr
 /// ([`kbf_threads::PoolArgs`]): where its bytes are and how they are written.
 pub const ALLOWED: &[&str] = &[
     "cold_store",
+    "cold_store_credentials_file",
     "hot_store",
     "hot_store_max_bytes",
     "hot_store_abandon",
@@ -611,6 +615,7 @@ where
 {
     let listener = flags.listener()?;
     let stores = flags.server.stores(&Statvfs)?;
+    flags.server.check_cold_key_file()?;
     for line in stores.describe() {
         tracing::info!("{line}");
     }
@@ -629,7 +634,11 @@ where
             .await
         }
         StoreUri::S3(uri) => {
-            let cold = Registrable::new(uri, flags.env)?;
+            let cold = Registrable::new(
+                uri,
+                flags.server.cold_store_credentials_file.as_deref(),
+                flags.env,
+            )?;
             over(
                 flags,
                 listener,
@@ -697,8 +706,15 @@ where
     // One start, one bind budget for both listeners, spent before the first await (a
     // `Binder` is not `Send`).
     let (socket, metrics) = bind_node_sockets(listener.listen, flags.metrics, &Binder::new())?;
+    let cold_metrics = Arc::new(StoreMetrics::cold());
+    let cold = CountedPick(cold, Arc::clone(&cold_metrics));
     let (cache, registered) = open_cache(flags, socket, (meta, cold, prefix, log)).await?;
+    // The reads this node serves from its own copy: the service counts them, the scrape of
+    // the cache renders them.
+    let legacy_reads = Arc::new(LegacyReads::default());
     let cache = cache
+        .with_legacy_reads(Arc::clone(&legacy_reads))
+        .with_cold_store_metrics(cold_metrics)
         .with_writes(flags.server.write_config())
         .with_write_pool(flags.server.write_pool_config())
         .with_durable_wait(flags.server.durable_wait())
@@ -743,7 +759,15 @@ where
     let holder = holder_of(&cache);
     let storage = Arc::new(CacheStorage::new(cache, flags.segments()));
     let stop = Box::pin(shutdown()?);
-    let node = bind_node(flags, listener, registered, storage, repair_dir, stop)?;
+    let node = bind_node(
+        flags,
+        listener,
+        registered,
+        storage,
+        legacy_reads,
+        repair_dir,
+        stop,
+    )?;
     Ok(StorageHandle {
         addr: node.addr,
         metrics,

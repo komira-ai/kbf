@@ -37,6 +37,12 @@
 //! action-cache write refused for a closure blob not found all answer UNAVAILABLE, never
 //! NOT_FOUND or FAILED_PRECONDITION. Hits and writes are served.
 //!
+//! **Reads served from the node's own copy** are counted ([`crate::legacy`], rendered as
+//! `kbf_storage_legacy_read_total{kind,source}` on the node's `/metrics`): a `Read` that found
+//! its blob, an action-store `Get` that found its entry, a `Segments` `ReadRange` that returned
+//! bytes, and the same reads made through [`InProcess`]. Misses, `FindMissingBlobs` and writes
+//! are not.
+//!
 //! **Who may call** is [`Admission`]: the role in the caller's certificate against the
 //! endpoint's table, the role read by `kbf-peer`, and then the map's deny list against the
 //! certificate; the module docs of [`admission`] say what is checked and what is planned.
@@ -73,14 +79,15 @@ use kbf_proto::worker::segments_server::{Segments, SegmentsServer};
 use tokio::sync::Semaphore;
 use tonic::service::Routes;
 
+use crate::legacy::{LegacyReads, Path};
 use crate::repair::PeerConfirmer;
 use crate::replicate::{self, Chain, MapSource};
 use crate::{Storage, StorageError};
 
 pub use admission::{Admission, Endpoint, PeerNames, PeerRole, ROLE_URI_PREFIX, host_of, role_of};
 pub use catch_up::CatchUp;
-pub use client::RemoteStorage;
 pub(crate) use client::lift;
+pub use client::{RemoteStorage, stale_generation};
 pub use in_process::InProcess;
 pub use open_writes::{OpenWrite, OpenWrites};
 
@@ -145,6 +152,7 @@ pub struct StorageService {
     map: Option<Arc<dyn MapSource>>,
     catch_up: Option<CatchUp>,
     open_writes: OpenWrites,
+    legacy_reads: Arc<LegacyReads>,
     refetch_wait: Duration,
     write_room: Semaphore,
     write_room_bytes: u32,
@@ -163,6 +171,7 @@ impl StorageService {
             map: None,
             catch_up: None,
             open_writes: OpenWrites::new(),
+            legacy_reads: Arc::default(),
             refetch_wait: replicate::REFETCH_WAIT,
             write_room: Semaphore::new(config.write_bytes_in_flight as usize),
             write_room_bytes: config.write_bytes_in_flight,
@@ -222,6 +231,23 @@ impl StorageService {
         self.segments = self.storage.segments_counted(&open_writes);
         self.open_writes = open_writes;
         self
+    }
+
+    /// The service counting the reads it serves from its store in `legacy_reads`
+    /// ([`crate::legacy`] says which), which the node's `/metrics` renders. A service given
+    /// none counts into a handle nobody reads.
+    #[must_use]
+    pub fn with_legacy_reads(mut self, legacy_reads: Arc<LegacyReads>) -> Self {
+        self.legacy_reads = legacy_reads;
+        self
+    }
+
+    /// Counts a read of the blob `digest` that this node served on `path`. The empty blob is
+    /// held by no store, so reading it is not a read of the node's copy.
+    fn count_blob_read(&self, digest: &kbf_types::Digest, path: Path) {
+        if digest.size_bytes != 0 {
+            self.legacy_reads.count(path);
+        }
     }
 
     /// Whether a miss found from now on must be answered UNAVAILABLE: read before the

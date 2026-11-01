@@ -1,0 +1,19 @@
+# kbf's own definition: the service every coordinator manages. A services file whose first
+# entry is named `kbf` replaces it (see services.rs); without one this is what runs.
+#
+# All four roles, limits from the desired state; a frontend is never the last one up and
+# waits for every other role. The `min_up` keys a desired state of kbf must name (storage and
+# frontend) belong to the service and are not set here.
+
+[[service]]
+name = "kbf"
+
+[service.roles.frontend]
+never_last = true
+after = ["storage", "daemon", "mac-daemon"]
+
+[service.roles.storage]
+
+[service.roles.daemon]
+
+[service.roles.mac-daemon]

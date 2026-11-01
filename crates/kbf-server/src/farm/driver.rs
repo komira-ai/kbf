@@ -2,12 +2,11 @@
 //!
 //! A farm's methods reach its engine through [`Driver`], so a second engine is a new
 //! variant and one new arm in the methods that differ, not a change to every method.
-//! The farm's own scheduler, engine and side under one lock is [`Driver::Legacy`]. With the
-//! `farm-core-js` feature there is a second, [`Driver::Js`]: the core of `crate::farm_js`.
+//! The farm's own scheduler, engine and side under one lock is [`Driver::Legacy`]. The
+//! second is [`Driver::Js`]: the core of `crate::farm_js`.
 //!
 //! A method of the farm that differs by engine starts with [`js_arm!`], which returns the
-//! result of the matching function in `farm::js` when the farm runs on the second engine
-//! and expands to nothing without the feature.
+//! result of the matching function in `farm::js` when the farm runs on the second engine.
 
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -18,14 +17,13 @@ use kbf_sched::{MEMORY_FLOORS, MemoryLadder, Scheduler, WholeNodeConfig};
 use super::State;
 use super::durable::ORPHAN_WAIT;
 use super::engine::HELD_CAP;
-#[cfg(feature = "farm-core-js")]
 use super::js::JsFarm;
 use crate::learned::{Learned, LearnedSizes};
 use crate::placement_load::PlacementLoad;
+use crate::placement_predictions::PlacementPredictions;
 
 /// Returns from the enclosing method with `farm::js::<group>::<method>(js, args..)` when
 /// the farm runs on the js core: `js_arm!(self, hot::resize(worker, stream, reported))`.
-#[cfg(feature = "farm-core-js")]
 macro_rules! js_arm {
     ($farm:expr, $group:ident :: $method:ident ( $($arg:expr),* $(,)? )) => {
         if let $crate::farm::driver::Driver::Js(js) = &$farm.driver {
@@ -35,7 +33,6 @@ macro_rules! js_arm {
 }
 
 /// [`js_arm!`] for an `async fn`: awaits the function of the js core.
-#[cfg(feature = "farm-core-js")]
 macro_rules! js_arm_async {
     ($farm:expr, $group:ident :: $method:ident ( $($arg:expr),* $(,)? )) => {
         if let $crate::farm::driver::Driver::Js(js) = &$farm.driver {
@@ -47,31 +44,12 @@ macro_rules! js_arm_async {
 /// Returns from the enclosing [`Driver`] method once the js core is built again from
 /// `settings`, if the driver is the js core: its builders change the core's configuration,
 /// which the core takes at construction.
-#[cfg(feature = "farm-core-js")]
 macro_rules! js_rebuilt {
     ($driver:expr, $settings:expr) => {
         if $driver.rebuilt($settings) {
             return;
         }
     };
-}
-
-/// Without the feature there is one engine: nothing to select.
-#[cfg(not(feature = "farm-core-js"))]
-macro_rules! js_rebuilt {
-    ($($tokens:tt)*) => {};
-}
-
-/// Without the feature there is one engine: nothing to select.
-#[cfg(not(feature = "farm-core-js"))]
-macro_rules! js_arm {
-    ($($tokens:tt)*) => {};
-}
-
-/// Without the feature there is one engine: nothing to select.
-#[cfg(not(feature = "farm-core-js"))]
-macro_rules! js_arm_async {
-    ($($tokens:tt)*) => {};
 }
 
 /// What a farm's `with_*` builders set: the values an engine is configured from, kept
@@ -83,12 +61,18 @@ pub(crate) struct Settings {
     pub orphan_wait: Duration,
     /// The memory ladder an action that passes its limit climbs.
     pub ladder: MemoryLadder,
+    /// Whether an own-limit kill climbs the ladder (`--no-memory-climb` is `false`). Only the
+    /// legacy scheduler is told: the js core builds its own, so a startup check refuses the
+    /// flag with it.
+    pub climb: bool,
     /// How many memory floors are kept.
     pub floors: usize,
     /// How placement uses the load (`--placement-load`).
     pub placement_load: PlacementLoad,
     /// What learned sizes do (`--learned-sizes`).
     pub learned: LearnedSizes,
+    /// Whether the scheduler is given predictions (`--placement-predictions`).
+    pub predictions: PlacementPredictions,
     /// The first rung of the ladder, in bytes, learned sizes start from.
     pub default_memory: u64,
     /// The whole-node drain and caps (`--whole-node-max`), if set.
@@ -97,6 +81,9 @@ pub(crate) struct Settings {
     pub recorder: Recorder,
     /// Held-back committed records kept for a refusing state store at most.
     pub held_cap: usize,
+    /// What the farm learns from the runs it hears of (`--usage-profiles`). Only the js core
+    /// learns; the flag is refused with the legacy core.
+    pub usage: kbf_usage::UsageMode,
 }
 
 impl Default for Settings {
@@ -105,13 +92,16 @@ impl Default for Settings {
         Self {
             orphan_wait: ORPHAN_WAIT,
             ladder: MemoryLadder::default(),
+            climb: true,
             floors: MEMORY_FLOORS,
             placement_load: PlacementLoad::Off,
             learned: LearnedSizes::Off,
+            predictions: PlacementPredictions::Off,
             default_memory: 0,
             whole_node: None,
             recorder: Recorder::default(),
             held_cap: HELD_CAP,
+            usage: kbf_usage::UsageMode::Off,
         }
     }
 }
@@ -119,14 +109,12 @@ impl Default for Settings {
 /// The engine state of a farm.
 // A farm holds one driver for its whole life, so the legacy state, which is the large
 // variant, is not boxed.
-#[cfg_attr(feature = "farm-core-js", allow(clippy::large_enum_variant))]
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub(super) enum Driver {
     /// The farm's scheduler, engine and side, under the one lock every operation takes.
     Legacy(Mutex<State>),
-    /// The core of `crate::farm_js` and the pieces around it (`farm::js`). Only a build with
-    /// the `farm-core-js` feature has it.
-    #[cfg(feature = "farm-core-js")]
+    /// The core of `crate::farm_js` and the pieces around it (`farm::js`).
     Js(Box<JsFarm>),
 }
 
@@ -140,7 +128,6 @@ impl Driver {
     pub(super) const fn core(&self) -> crate::SchedulerCore {
         match self {
             Self::Legacy(_) => crate::SchedulerCore::Legacy,
-            #[cfg(feature = "farm-core-js")]
             Self::Js(_) => crate::SchedulerCore::Js,
         }
     }
@@ -151,7 +138,6 @@ impl Driver {
         match self {
             // Nothing under the lock panics midway through a change.
             Self::Legacy(state) => state.lock().unwrap_or_else(PoisonError::into_inner),
-            #[cfg(feature = "farm-core-js")]
             Self::Js(_) => unreachable!("a farm on the js core has no engine lock"),
         }
     }
@@ -160,13 +146,11 @@ impl Driver {
     pub(super) fn state_mut(&mut self) -> &mut State {
         match self {
             Self::Legacy(state) => state.get_mut().unwrap_or_else(PoisonError::into_inner),
-            #[cfg(feature = "farm-core-js")]
             Self::Js(_) => unreachable!("a farm on the js core has no engine state"),
         }
     }
 
     /// Opens the core again over `settings` if this is the js core, and says whether it is.
-    #[cfg(feature = "farm-core-js")]
     fn rebuilt(&mut self, settings: &Settings) -> bool {
         match self {
             Self::Js(js) => {
@@ -184,6 +168,16 @@ impl Driver {
             .engine
             .sched
             .set_memory_ladder(settings.ladder.clone());
+    }
+
+    /// Applies `settings.climb` to the legacy scheduler.
+    pub(super) fn set_climb(&mut self, settings: &Settings) {
+        if matches!(self, Self::Legacy(_)) {
+            self.state_mut()
+                .engine
+                .sched
+                .set_memory_climb(settings.climb);
+        }
     }
 
     /// Applies `settings.floors` to the scheduler of `term`.
@@ -207,7 +201,17 @@ impl Driver {
     pub(super) fn set_learned(&mut self, epoch_unix_ms: u64, settings: &Settings) {
         js_rebuilt!(self, settings);
         self.state_mut().side.learned =
-            Learned::new(settings.learned, settings.default_memory, epoch_unix_ms);
+            Learned::new(settings.learned, settings.default_memory, epoch_unix_ms)
+                .with_predictions(settings.predictions);
+    }
+
+    /// Applies `settings.predictions`.
+    pub(super) fn set_predictions(&mut self, settings: &Settings) {
+        js_rebuilt!(self, settings);
+        self.state_mut()
+            .side
+            .learned
+            .set_predictions(settings.predictions);
     }
 
     /// Applies `settings.whole_node` to the scheduler of `term`. Called once it is set.
@@ -222,7 +226,10 @@ impl Driver {
     /// Applies `settings.recorder`.
     pub(super) fn set_recorder(&mut self, settings: &Settings) {
         js_rebuilt!(self, settings);
-        self.state_mut().side.recorder = settings.recorder.clone();
+        self.state_mut()
+            .side
+            .recording
+            .tell(settings.recorder.clone());
     }
 
     /// Applies `settings.orphan_wait`.
@@ -231,10 +238,15 @@ impl Driver {
         self.state_mut().engine.intake.orphan_wait = settings.orphan_wait;
     }
 
+    /// Applies `settings.usage`: the js core opens its usage side again over the store it
+    /// has, and the legacy core learns nothing.
+    pub(super) fn set_usage(&mut self, settings: &Settings) {
+        js_rebuilt!(self, settings);
+    }
+
     /// Applies `settings.held_cap`, to the core as it is on either driver: the cap changes
     /// nothing the core was built from.
     pub(super) fn set_held_cap(&mut self, settings: &Settings) {
-        #[cfg(feature = "farm-core-js")]
         if let Self::Js(js) = self {
             js.set_held_cap(settings);
             return;

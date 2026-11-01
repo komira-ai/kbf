@@ -132,6 +132,16 @@ impl Platform {
     }
 }
 
+/// What a lease was granted, as its `Start` carried it: the booking after the
+/// memory ladder and the floors, not the request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Booked {
+    /// Thousandths of a CPU.
+    pub cpu_millis: u64,
+    /// Bytes of memory.
+    pub memory_bytes: u64,
+}
+
 /// A lease whose `Start` was sent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Sent {
@@ -140,6 +150,9 @@ pub struct Sent {
     pub action: Digest,
     /// When the operation was queued and the `Start` sent.
     pub stamp: Stamp,
+    /// What the lease was granted; `None` for a lease taken up from the state store,
+    /// which was never started here.
+    pub booked: Option<Booked>,
 }
 
 /// A node that has registered.
@@ -418,6 +431,7 @@ mod tests {
                 queued: at(u64::from(n)),
                 started: at(u64::from(n) + 1),
             },
+            booked: None,
         }
     }
 

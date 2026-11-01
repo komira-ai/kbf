@@ -1,0 +1,1 @@
+{"class":"kbf-linux","resources":{"cpu_millis":16000,"memory_bytes":68719476736,"gpus":1,"gpu_class":"a100"},"capabilities":{"os":"linux","arch":"x86_64"},"max_wall_seconds":21600,"labels":{"kbf-frontend":"fe-1","kbf-pool":"main"},"validation_run":"vr-7","ttl_seconds":600}

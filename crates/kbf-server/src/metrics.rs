@@ -62,11 +62,21 @@ impl Extras {
 }
 
 /// Appends what a farm reports: the scheduler core its driver is (so the gauge cannot name
-/// another), the pack daemons' counts, and the failed actions. The one call every server's
-/// `/metrics` makes, so the all-in-one and the frontend pages cannot differ.
+/// another), the pack daemons' and input caches' counts, the scheduler's load counters and each
+/// node's load, and the failed actions. The one call every server's `/metrics` makes, so the all-in-one and the
+/// frontend pages cannot differ.
 pub(crate) fn render_farm(out: &mut String, farm: &Farm) {
     crate::scheduler_core::render(out, farm.scheduler_core());
+    crate::usage_profiles::render(out, farm.usage_profiles());
+    if let Some(stats) = farm.usage_stats() {
+        stats.render(out);
+    }
     crate::pack_daemon_metrics::render_farm(out, farm);
+    crate::input_cache_metrics::render_farm(out, farm);
+    crate::load_metrics::render_farm(out, farm);
+    if let Some((ablation, counters)) = farm.ablation() {
+        ablation.render(out, &counters);
+    }
     farm.failed_actions().render(out);
 }
 

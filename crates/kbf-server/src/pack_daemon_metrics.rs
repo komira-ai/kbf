@@ -70,7 +70,7 @@ const FAMILIES: [Family; 6] = [
 ];
 
 /// `value` as a label value of the text format: backslash, double quote and line feed escaped.
-fn label_value(value: &str) -> String {
+pub(crate) fn label_value(value: &str) -> String {
     value
         .replace('\\', "\\\\")
         .replace('"', "\\\"")

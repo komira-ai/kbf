@@ -400,7 +400,7 @@ async fn an_unreadable_done_row_ends_the_caller_with_a_retryable_error_and_does_
         &first.core,
         &first.backend,
         &super::testing::wall(),
-        || FarmTime::from_millis(0),
+        &|| FarmTime::from_millis(0),
         &WorkerId::new("node-a"),
         super::testing::ran(lease, 0),
     )
@@ -441,9 +441,9 @@ async fn an_unreadable_done_row_ends_the_caller_with_a_retryable_error_and_does_
     drop(log);
     let log = capture();
     rig.core.with(|_, adapter| {
-        assert!(adapter.is_recorded(OperationId(0)));
+        assert!(adapter.recording.is_recorded(OperationId(0)));
         adapter.followed(OperationId(0), &garbage);
-        assert!(!adapter.is_recorded(OperationId(0)), "told");
+        assert!(!adapter.recording.is_recorded(OperationId(0)), "told");
         assert_eq!(adapter.unreadable_results(), 0, "followed counts nothing");
     });
     assert_eq!(count_of(&log), 0, "followed does not log the row again");
@@ -532,9 +532,9 @@ async fn the_end_of_an_operation_another_frontend_ran_is_recorded_once() {
     drop(ticket);
 
     rig.core.with(|_, adapter| {
-        assert!(adapter.is_recorded(operation));
+        assert!(adapter.recording.is_recorded(operation));
         adapter.followed(operation, &done_row("ended by the other frontend"));
-        assert!(!adapter.is_recorded(operation), "told");
+        assert!(!adapter.recording.is_recorded(operation), "told");
         adapter.followed(operation, &done_row("again"));
     });
 

@@ -90,6 +90,7 @@ impl Job {
             hermetic: true,
             do_not_cache: false,
             needs: kbf_caps::Request::from_platform(self.platform.iter().copied()).unwrap(),
+            whole_worker: false,
         };
         farm.submit(Submission {
             request,
@@ -1153,6 +1154,7 @@ fn a_stored_operation_is_registered_only_when_it_can_be_named() {
             hermetic: true,
             do_not_cache: false,
             needs,
+            whole_worker: false,
         },
         lease: None,
         losses: 0,

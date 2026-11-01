@@ -101,6 +101,7 @@ impl KbfAdapter {
             platform,
         } = caller;
         let queued = (self.wall)();
+        self.note_action(&key, &platform, &usage);
         let waiter = Waiter {
             key,
             kind,
@@ -112,7 +113,8 @@ impl KbfAdapter {
         self.machine.insert(admitted.waiter, waiter);
         if let Some(call) = call {
             let name = stored_name(admitted.operation);
-            self.record_submit(call, &name, admitted.operation, admitted.joined);
+            self.recording
+                .submit(call, &name, admitted.operation, admitted.joined);
         }
         if matches!(admitted.held, Held::Elsewhere(_)) {
             stage.send_replace(Stage::Executing);
@@ -284,6 +286,36 @@ impl KbfAdapter {
         let writes = self.pack_writes.iter();
         writes
             .map(|(worker, counts)| (worker.clone(), *counts))
+            .collect()
+    }
+
+    /// As [`KbfAdapter::note_pack_reads`], for the input cache counts.
+    pub fn note_input_cache(
+        &mut self,
+        worker: &WorkerId,
+        stream: Stream,
+        counts: Option<worker::InputCacheCounts>,
+    ) {
+        if !self.is_current(worker, stream) {
+            return;
+        }
+        match counts {
+            Some(counts) => self.input_caches.insert(worker.clone(), counts),
+            None => self.input_caches.remove(worker),
+        };
+    }
+
+    /// `worker`'s newest input cache counts, as `GET /v1/nodes/{id}` shows them.
+    #[must_use]
+    pub fn input_cache_of(&self, worker: &WorkerId) -> Option<crate::fleet::InputCacheView> {
+        self.input_caches.get(worker).map(Into::into)
+    }
+
+    /// The newest input cache counts of every node that sent any, in node-id order.
+    #[must_use]
+    pub fn input_caches(&self) -> Vec<(WorkerId, worker::InputCacheCounts)> {
+        let kept = self.input_caches.iter();
+        kept.map(|(worker, counts)| (worker.clone(), *counts))
             .collect()
     }
 }

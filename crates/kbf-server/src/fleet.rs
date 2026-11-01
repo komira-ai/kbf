@@ -104,6 +104,87 @@ pub struct NodeDetail {
     /// none, or a node another frontend holds).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub load: Option<LoadView>,
+    /// What the node's input cache has done since its daemon process started, from the
+    /// newest heartbeat that carried it. Left out when the node sent none (a daemon with its
+    /// cache off or built before the counts, or a node another frontend holds): absent is
+    /// not zero.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_cache: Option<InputCacheView>,
+    /// Who placed the node out of placement, when it is (cordoned, draining or drained).
+    /// Left out when the node is serving. A cordon with no recorded owner, which is every
+    /// cordon today, is the operator's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner: Option<Owner>,
+}
+
+/// Who owns a node's cordon, as the state store keeps it (`cordon-owner/<node>`, see
+/// `farm::cordon_owner`). Shown as `operator` or `updater:<unit>`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Owner {
+    /// An operator placed the node, or nothing records who did.
+    #[default]
+    Operator,
+    /// The host updater placed the node, for the update of the named unit.
+    Updater(String),
+}
+
+impl std::fmt::Display for Owner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Operator => f.write_str("operator"),
+            Self::Updater(unit) => write!(f, "updater:{unit}"),
+        }
+    }
+}
+
+impl Serialize for Owner {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+/// The counts of a node's input cache (`docs/api.md`, "Input cache counts"): cumulative since
+/// its daemon process started, so they start again from 0 when the daemon restarts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct InputCacheView {
+    /// Entries written into the cache from the content store, and their bytes.
+    pub fills: u64,
+    pub fill_bytes: u64,
+    /// Entries a lease found in the cache and used, and their bytes.
+    pub hits: u64,
+    pub hit_bytes: u64,
+    /// Entries evicted for the byte budget or the free-space floor, and their bytes.
+    pub evictions: u64,
+    pub evicted_bytes: u64,
+    /// The shared tree store's counts. Left out when the node has no store.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trees: Option<TreeCountsView>,
+}
+
+/// The counts of a node's shared tree store, cumulative since its daemon process started.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct TreeCountsView {
+    pub builds: u64,
+    pub hits: u64,
+    pub evictions: u64,
+}
+
+impl From<&kbf_proto::worker::InputCacheCounts> for InputCacheView {
+    fn from(counts: &kbf_proto::worker::InputCacheCounts) -> Self {
+        Self {
+            fills: counts.fills,
+            fill_bytes: counts.fill_bytes,
+            hits: counts.hits,
+            hit_bytes: counts.hit_bytes,
+            evictions: counts.evictions,
+            evicted_bytes: counts.evicted_bytes,
+            trees: counts.trees.as_ref().map(|trees| TreeCountsView {
+                builds: trees.builds,
+                hits: trees.hits,
+                evictions: trees.evictions,
+            }),
+        }
+    }
 }
 
 /// The load of a node's `actions/` cgroup, from the readings its heartbeats carried

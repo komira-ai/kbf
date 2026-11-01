@@ -65,13 +65,12 @@ mod driver;
 mod ack;
 mod ambient;
 mod beat;
+mod cordon_owner;
 pub(crate) mod durable;
 mod engine;
 pub(crate) mod failed_actions;
 mod handover;
-// The core's pieces are read as the groups of methods in `js` are written.
-#[cfg(feature = "farm-core-js")]
-#[allow(dead_code)]
+mod input_cache;
 mod js;
 mod learning;
 mod named;
@@ -81,7 +80,6 @@ mod nodes;
 mod pack_reads;
 mod pack_writes;
 mod phase;
-mod record;
 mod report;
 pub mod sched_view;
 mod side;
@@ -177,6 +175,8 @@ pub struct Farm {
     ambient: Ambient,
     /// What the `with_*` builders set.
     settings: Settings,
+    /// The `--usage-profiles` mode, which the start line and the gauge report.
+    usage_profiles: crate::UsageProfiles,
     /// The engine every method reaches the farm's state through.
     driver: Driver,
 }
@@ -228,7 +228,7 @@ impl Farm {
     /// new [`process_term`] for both otherwise (see the module docs).
     ///
     /// It runs on the core [`crate::SchedulerCore::under_test`] names: the farm's own, and
-    /// the js core in a build with the `farm-core-js` feature.
+    /// the js core in a build with the `farm-core-js` feature (the tests of the js core).
     #[must_use]
     pub fn new(
         cache: impl Into<Backend>,
@@ -260,14 +260,12 @@ impl Farm {
     }
 
     /// [`Farm::new`] on `core`.
-    #[cfg_attr(not(feature = "farm-core-js"), allow(unused_variables))]
     pub(crate) fn on_core(
         core: crate::SchedulerCore,
         cache: Backend,
         unservable_wait: Duration,
         finished_retention: Duration,
     ) -> Self {
-        #[cfg(feature = "farm-core-js")]
         if core == crate::SchedulerCore::Js {
             return Self::new_js(cache, unservable_wait, finished_retention);
         }
@@ -327,6 +325,7 @@ impl Farm {
             reports: AtomicUsize::new(0),
             ambient,
             settings: Settings::default(),
+            usage_profiles: crate::UsageProfiles::default(),
             driver: Driver::legacy(State {
                 engine: Engine::new(sched, finished_retention, ambient),
                 side: Side::new(term, ambient),
@@ -372,6 +371,23 @@ impl Farm {
         self.settings.ladder = ladder;
         self.driver.set_ladder(&self.settings);
         self
+    }
+
+    /// This farm, whose scheduler finishes an action that passes its own memory limit with
+    /// `Failed(OutOfMemory)` at its booking if `climb` is `false` (`--no-memory-climb`), instead
+    /// of running it again one rung up. Legacy core only: the js core builds its own scheduler
+    /// and ignores this.
+    #[must_use]
+    pub fn with_memory_climb(mut self, climb: bool) -> Self {
+        self.settings.climb = climb;
+        self.driver.set_climb(&self.settings);
+        self
+    }
+
+    /// Whether an own-limit kill runs the action again one rung up (the default) or finishes it.
+    #[must_use]
+    pub(crate) const fn memory_climb(&self) -> bool {
+        self.settings.climb
     }
 
     /// This farm, keeping at most `bound` memory floors (instead of
@@ -427,6 +443,10 @@ impl Farm {
             .sched_whole
             .set(state.engine.sched.whole_summary().as_ref());
         state.side.learned.publish(&metrics.estimator_shadow);
+        state.side.learned.publish_predictions(&metrics.prediction);
+        metrics
+            .prediction
+            .set_cpu_limited_nodes(self.cpu_limited_nodes(state));
     }
 
     /// Writes the changed size summaries to the state store now, as the tick does once
@@ -812,8 +832,9 @@ impl Dispatch for Farm {
         let name = state
             .side
             .name_of(state.engine.durable.is_some(), waiter, operation);
-        state.learn_submit(
+        let predicted = state.learn_submit(
             waiter,
+            operation,
             &name,
             &submission.request,
             &submission.evidence,
@@ -822,7 +843,7 @@ impl Dispatch for Farm {
         );
         if let Some((call, shape)) = submission.call.take().zip(shape) {
             let call = call.with_shape(shape).with_evidence(submission.evidence);
-            state.side.record_submit(call, &name, operation, joined);
+            state.side.recording.submit(call, &name, operation, joined);
         }
         let (stage, receiver) = watch::channel(Stage::Queued);
         state.side.stages.insert(waiter, stage);
@@ -838,6 +859,11 @@ impl Dispatch for Farm {
         if let Some(key) = size_key.filter(|_| !joined) {
             let next = state.engine.sched.next_operation();
             state.engine.sched.set_size_key(next, key);
+        }
+        // Its predicted cost is given before the submit is fed too (`--placement-predictions
+        // on`; none for a twin joined, which keeps the one it was given).
+        if let Some(prediction) = predicted {
+            state.engine.sched.set_cost(operation, prediction);
         }
         match held {
             Held::Here => state.feed_quiet(
@@ -972,11 +998,16 @@ fn wire_lease(lease: LeaseId) -> worker::LeaseId {
     }
 }
 
+#[cfg(test)]
+mod cordon_owner_tests;
 mod from_listeners;
 #[cfg(test)]
 mod learned_tests;
 #[cfg(test)]
 mod placement_tests;
+mod prediction;
+#[cfg(test)]
+mod prediction_tests;
 #[cfg(test)]
 mod storage_down_tests;
 #[cfg(test)]

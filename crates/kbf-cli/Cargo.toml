@@ -12,9 +12,10 @@ publish.workspace = true
 # server and the node library (the version stamp is kbf-server's), so it is listed in
 # `JOINERS` in crates/kbf-integration-test/tests/layering.rs.
 [features]
-# The `kbf` binary with the farm on the js scheduler core (kbf-server's feature of the same
-# name): `cargo build -p kbf-cli --features farm-core-js`. Test-only; no default feature set
-# turns it on.
+# kbf-server's test-only feature of the same name (`SchedulerCore::under_test()` names the js
+# core), reachable from `-p kbf-cli --features farm-core-js`. It does not change what the `kbf`
+# binary can run: both scheduler cores are in every build (`--scheduler-core`). No default
+# feature set turns it on.
 farm-core-js = ["kbf-server/farm-core-js"]
 
 [[bin]]
@@ -71,6 +72,9 @@ kbf-state = { workspace = true, features = ["postgres"] }
 # `[proxy]` table is `kbf-installer setup`'s to keep (tests/layering.rs in kbf-integration-test
 # checks the tree).
 kbf-setup.workspace = true
+# `kbf update-hook <step>` (src/lib.rs): the hook the generic updater runs for the kbf service,
+# today's update of a host split at the five steps of the hook contract.
+kbf-updater.workspace = true
 # The identity `kbf --version --json` prints (src/version.rs), and the bodies of
 # `kbf cluster` (src/cluster.rs).
 serde_json.workspace = true

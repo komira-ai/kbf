@@ -34,6 +34,7 @@ fn request() -> Request {
         hermetic: true,
         do_not_cache: false,
         needs: kbf_caps::Request::default(),
+        whole_worker: false,
     }
 }
 
@@ -215,4 +216,80 @@ fn a_control_record_that_is_not_a_lease_is_other() {
         KbfRowCodec.read("lease/1", &refusal),
         Ok(Value::Other)
     ));
+}
+
+/// 5 GiB, a disk amount whose varint is five bytes.
+const DISK: u64 = 5 << 30;
+
+/// Asserts that a request and a registration that carry scratch disk read back with it, and
+/// that the lease row of the same operation reads back as what it was.
+///
+/// Catches: a row codec that drops `disk_bytes` (a restart would recover a running lease
+/// booking no disk, and the scheduler could place a second run's disk over it), one that
+/// moves it to another dimension, and a lease row that stops reading back.
+#[test]
+fn rows_of_a_request_a_lease_and_a_registration_with_disk_read_back_with_it() {
+    let mut with_disk = request();
+    with_disk.resources = with_disk.resources.with_disk_bytes(DISK);
+    let row = KbfRowCodec.submit(&with_disk).expect("submit");
+    let Ok(Value::Submit(read)) = KbfRowCodec.read("op/1", &row) else {
+        panic!("not a request");
+    };
+    assert_eq!(read.resources.disk_bytes, DISK);
+    assert_eq!(read, with_disk);
+    assert_ne!(row, KbfRowCodec.submit(&request()).expect("submit"));
+
+    let mut session = up();
+    session.capacity = session.capacity.with_disk_bytes(DISK);
+    let row = KbfRowCodec.session(&session).expect("session");
+    let Ok(Value::Session(read)) = KbfRowCodec.read("session/node-a", &row) else {
+        panic!("not a registration");
+    };
+    assert_eq!(read.capacity.disk_bytes, DISK);
+    assert_eq!(read, session);
+
+    // A lease row holds the grant and its cost, not the request's resources: the disk a
+    // lease books is read from its request's row, above.
+    let granted = grant(charged());
+    let row = KbfRowCodec.lease(&granted).expect("lease");
+    let Ok(Value::Lease(read)) = KbfRowCodec.read("lease/1.2", &row) else {
+        panic!("not a lease");
+    };
+    assert_eq!(read, granted);
+}
+
+/// Asserts that a request and a registration with no disk are the rows the store has always
+/// held: their resources message ends after `memory_bytes` (and `leases`), with no disk field,
+/// and they read back with disk 0.
+///
+/// Catches: an encoder that writes a zero disk (every row already in a store would differ from
+/// the one a new binary writes), and a reader that refuses a row without the field.
+#[test]
+fn a_row_without_disk_is_the_old_row_and_reads_as_disk_0() {
+    // cpu_millis 1000 (`08 e8 07`), memory_bytes 1 GiB (`10 80 80 80 80 04`).
+    let old_resources = "08e8071080808080 04".replace(' ', "");
+    let row = KbfRowCodec.submit(&request()).expect("submit");
+    let text: String = row.iter().map(|b| format!("{b:02x}")).collect();
+    // The request's resources message is its field 4 (`22`), 9 bytes, with nothing after.
+    assert!(text.contains(&format!("2209{old_resources}")), "{text}");
+    let Ok(Value::Submit(read)) = KbfRowCodec.read("op/1", &row) else {
+        panic!("not a request");
+    };
+    assert_eq!(read.resources.disk_bytes, 0);
+
+    let row = KbfRowCodec.session(&up()).expect("session");
+    let text: String = row.iter().map(|b| format!("{b:02x}")).collect();
+    // Capacity is CPU 2000 (`08 d0 0f`), memory 1 GiB, in a 9-byte message (`0a 09 ...`).
+    assert!(
+        text.contains(&format!(
+            "{:02x}{}",
+            9,
+            "08d00f1080808080 04".replace(' ', "")
+        )),
+        "{text}"
+    );
+    let Ok(Value::Session(read)) = KbfRowCodec.read("session/node-a", &row) else {
+        panic!("not a registration");
+    };
+    assert_eq!(read.capacity.disk_bytes, 0);
 }

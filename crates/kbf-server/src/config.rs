@@ -1,6 +1,7 @@
 //! Command-line flags. Every setting is a flag; the only environment variables read are
 //! the standard S3 key pair, `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (a secret
-//! never goes on the command line). Where the server keeps its bytes is two store URIs
+//! never goes on the command line), and only when `--cold-store-credentials-file` names no
+//! file: they are deprecated. Where the server keeps its bytes is two store URIs
 //! and, sometimes, one directory ([`crate::stores`]): `--cold-store`, `--hot-store`,
 //! `--meta-dir`.
 
@@ -76,6 +77,15 @@ pub struct Args {
     /// a `file://` path on a tmpfs is one.
     #[arg(long, value_name = "URI")]
     pub cold_store: Option<StoreUri>,
+    /// The key pair of an `s3://` `--cold-store`, in a file: JSON
+    /// `{"access_key_id": "...", "secret_access_key": "..."}`, a regular file (a symbolic
+    /// link is refused) that the server's user owns and no one else can read (mode 0600 or
+    /// 0400). The secret is never a flag: a command line is world-readable. Without it the
+    /// key pair is read from `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, which is
+    /// deprecated: the start logs one warning and a later release refuses the variables.
+    /// A `file://` cold store has no keys, so the server refuses the flag with one.
+    #[arg(long, value_name = "PATH", requires = "cold_store")]
+    pub cold_store_credentials_file: Option<PathBuf>,
     /// The fast tier in front of the cold store: `file:///absolute/path`, a directory
     /// on an SSD (or a tmpfs). Uploads land there and are flushed to the cold store in
     /// the background; reads are served from it while a blob is still there. Its
@@ -311,6 +321,35 @@ pub struct Args {
         default_values_t = kbf_sched::MemoryLadder::DEFAULT_GIB
     )]
     pub memory_ladder_gib: Vec<u64>,
+    /// Every `action` lease books the whole worker it lands on: all of its CPUs and all of
+    /// its memory, whichever worker that is, so that exactly one action runs per worker
+    /// and a second waits for it. The action digest is the client's and does not change
+    /// (the per-action `kbf-book-cpus` and `kbf-book-mem-gib` properties would split the
+    /// action cache); this is a setting of the server. `kbf-book-cpus` and `kbf-book-mem-gib`
+    /// are still checked, but no longer change what is booked. `kbf-lease=whole_machine` and
+    /// `vm` leases are as they were. An action killed for passing its own memory limit has
+    /// no larger booking to climb to, so `--memory-ladder-gib` has no further rung to give
+    /// it: it finishes out-of-memory, as an action that already books the largest node does,
+    /// and its memory floor is not raised. A worker books by what it reported at
+    /// registration. The setting is not kept in the state store, so a server restart
+    /// ends it for the operations the store holds: one that was queued is read back as
+    /// an ordinary action, and one that was running is recovered holding only the booking
+    /// the front computed for it, not the worker, so ordinary actions can be placed
+    /// beside it and, if it is lost or requeued, it runs again as an ordinary action. A
+    /// run that needs one action per worker must not restart the server. Off by default
+    #[arg(long, default_value_t = false)]
+    pub exclusive_actions: bool,
+    /// Keeps an action's memory booking where it started. An action that passes its own
+    /// memory limit is not run again on the next rung of `--memory-ladder-gib`: the kill
+    /// finishes it, FAILED_PRECONDITION with reason `ACTION_OUT_OF_MEMORY`, as a kill at the
+    /// largest node does, and its attempt is recorded with `memory_kill` `own_limit`. A
+    /// booking is therefore the first rung, or the GiB the action names in
+    /// `kbf-book-mem-gib`. No floor is raised, so with `--learned-sizes on` an own-limit
+    /// kill leaves none either. A kill the node made under memory pressure is not the
+    /// action's: it runs again with the same booking, as it does without this flag. Needs
+    /// `--scheduler-core legacy`; a server given it with `js` refuses to start (exit status 2)
+    #[arg(long)]
+    pub no_memory_climb: bool,
     /// The cores a node that reports VM slots (`vm.slots`) keeps for the host itself:
     /// subtracted from the CPUs placement may book on it, so that guests cannot take the
     /// host's own share. A node that reports none books the whole machine.
@@ -341,9 +380,12 @@ pub struct Args {
     #[arg(long, value_enum, default_value_t = crate::LearnedSizes::Off)]
     pub learned_sizes: crate::LearnedSizes,
     /// Which core drives the farm's scheduling. `legacy`, the default, is the driver the
-    /// server has always had. `js` is not available in this release: a server given it
-    /// refuses to start (exit status 2) and says so. The core a server runs is logged at
-    /// start and exported as `kbf_scheduler_core{core}`, 1 for it and 0 for the other
+    /// server has always had. `js` runs the farm on the js scheduler core: it learns sizes in
+    /// `shadow` at most (`--learned-sizes on` with it is refused at start, exit status 2), and
+    /// it answers an operation by its `operations/<id>` name only. Either core reads the rows
+    /// the other wrote to the state store, so a restart with the other value takes them up.
+    /// The core a server runs is logged at start and exported as `kbf_scheduler_core{core}`,
+    /// 1 for it and 0 for the other
     // The text above states the default; the help golden cannot hold the whitespace-only
     // line clap prints before a `[default: ...]` line.
     #[arg(
@@ -356,7 +398,18 @@ pub struct Args {
     /// Whether placement reads the load the nodes report. `off`, the default, books by
     /// the CPUs a lease asks for, as the server always has, and reads no load. `on` admits
     /// and ranks nodes by the load they report and the load a lease is predicted to add;
-    /// a node that reports none is charged by prediction alone
+    /// a node that reports none is charged by prediction alone, and a node that has never sent
+    /// a reading the server accepted is charged at least 1000 m for each lease (the node's
+    /// whole CPU capacity, if that is less), so a prediction under one core changes nothing for
+    /// such a node. It is read under either `--scheduler-core`. With `js`, `on` is the
+    /// scheduler's placement by load as a whole, with settings the server fixes
+    /// (`placement_load.rs`; none is a flag): besides the reading it applies the guard that
+    /// keeps the flat memory charged to a node within its memory, and scores nodes by balance.
+    /// It also sets a learned time profile charged per minute and an expected-life charge that
+    /// ends a new lease at its key's expected life plus two minutes; both read curves, which the
+    /// scheduler has only under `--usage-profiles on` and is idle without. The memory guard counts
+    /// only leases that carry a memory (a retry up the memory ladder, a VM) unless
+    /// `--placement-predictions on` gives leases one
     // The text above states the default; the help golden cannot hold the whitespace-only
     // line clap prints before a `[default: ...]` line.
     #[arg(
@@ -366,6 +419,57 @@ pub struct Args {
         hide_default_value = true
     )]
     pub placement_load: crate::PlacementLoad,
+    /// Whether the farm gives its scheduler the estimator's prediction of what a new
+    /// operation costs, from the rows `--learned-sizes` keeps, so that placement charges the
+    /// learned cores and memory instead of the cores the request asked for and no memory.
+    /// `off`, the default, computes none. `shadow` computes the prediction at submit, gives
+    /// the scheduler nothing, and compares it with the run when it ends: the cores the run
+    /// used on average, its peak memory and its life in whole minutes, each counted as under
+    /// (the run used more than predicted), fit (at most the prediction and at least half of
+    /// it) or over (less than half of it) in `kbf_prediction_vs_run_total`; the operations
+    /// given a prediction are counted in `kbf_prediction_made_total` and those given none,
+    /// by why, in `kbf_prediction_unset_total`. Placement is exactly what `off` does. `on`
+    /// gives the scheduler the prediction as the cost of the operation's lease, at submit (on
+    /// the legacy core also again for an operation read back from the state store at a
+    /// start), which charges the learned memory as well as the cores: a lease is admitted to
+    /// a node only while the memory charged to the node's leases stays within the node's
+    /// memory. An operation the estimator has no usable row for, or is not asked about (not
+    /// an action, one that asks for a GPU, no OS pinned, no subject), gets none and is
+    /// charged as it is with `off`. `shadow` and `on` need `--learned-sizes shadow` or `on`;
+    /// `on` needs `--placement-load on`; a prediction only changes what the lease is charged:
+    /// the memory limit and the cores it is booked and run with stay the request's and the
+    /// ladder's. A server given a combination that breaks one of these refuses to start
+    // The text above states the default; the help golden cannot hold the whitespace-only
+    // line clap prints before a `[default: ...]` line.
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = crate::PlacementPredictions::Off,
+        hide_default_value = true
+    )]
+    pub placement_predictions: crate::PlacementPredictions,
+    /// Whether the farm learns what its leases use, for the scheduler's admission by load.
+    /// `off`, the default, learns nothing and writes no row. `record` and `on` need
+    /// `--scheduler-core js` and `--state-store`, and learn a profile of each action shape from
+    /// the runs the farm hears of, which they store; `on` also needs `--placement-load on` and
+    /// `--placement-predictions on`, since the scheduler reads a curve only for an action that
+    /// has a prediction. `record` places as `off` does. `on` gives the scheduler the curves, so
+    /// that an action with a prediction and a curve is charged by the curve (its cores per
+    /// minute, its remaining maximum memory, an expected life) instead of flat, which can place
+    /// work where `record` would queue it; an action with no prediction, or whose key has not
+    /// been run for over 60 days, is charged flat. A value other than `off` also changes the start line
+    /// `usage profiles: <mode>` and the gauge `kbf_usage_profiles_mode{mode}`, 1 for the mode
+    /// and 0 for the others. A server given a combination that breaks one of these refuses to
+    /// start
+    // The text above states the default; the help golden cannot hold the whitespace-only
+    // line clap prints before a `[default: ...]` line.
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = crate::UsageProfiles::Off,
+        hide_default_value = true
+    )]
+    pub usage_profiles: crate::UsageProfiles,
     /// Whether whole-machine requests are run with the scheduler's whole-node drain and
     /// caps (`--whole-node-max`), and with which settings: off unless it is given.
     #[command(flatten)]
@@ -605,7 +709,7 @@ pub struct Args {
         long,
         value_name = "URI",
         value_parser = crate::state_store::StateStoreParser,
-        display_order = 5,
+        display_order = 6,
     )]
     pub state_store: Option<crate::state_store::StateStoreUri>,
     /// How long, in seconds, a storage node's membership row lives without a heartbeat
@@ -679,6 +783,20 @@ pub enum ConfigError {
     /// An S3 setting is missing from the environment.
     #[error("{0} must be set for an s3:// store")]
     MissingEnv(&'static str),
+    /// The key file of `--cold-store-credentials-file` is refused. `why` never holds a byte
+    /// of the file.
+    #[error("--cold-store-credentials-file {}: {why}", path.display())]
+    ColdKeyFile {
+        /// The file.
+        path: PathBuf,
+        /// What is wrong with it.
+        why: String,
+    },
+    /// `--cold-store-credentials-file` with a cold store that is not `s3://`.
+    #[error(
+        "--cold-store-credentials-file needs an s3:// --cold-store: a file:// store has no keys"
+    )]
+    ColdKeyFileOnFileStore,
     /// The S3 configuration is refused.
     #[error(transparent)]
     S3(#[from] S3ConfigError),
@@ -741,14 +859,18 @@ pub enum ConfigError {
         #[source]
         source: PolicyError,
     },
-    /// `--scheduler-core` names a core this release does not have.
+    /// `--placement-predictions shadow` or `on` with `--learned-sizes off`.
     #[error(
-        "--scheduler-core {}: that core is not available yet in this release; run with \
-         --scheduler-core {} (the default)",
-        .0.name(),
-        crate::SchedulerCore::RUNNING.name()
+        "--placement-predictions {0} needs --learned-sizes shadow or on: with the estimator off \
+         there are no learned rows to predict from"
     )]
-    SchedulerCoreUnavailable(crate::SchedulerCore),
+    PredictionsNeedLearnedSizes(&'static str),
+    /// `--placement-predictions on` with `--placement-load off`.
+    #[error(
+        "--placement-predictions on needs --placement-load on: with it off the scheduler books \
+         by cores and ignores a prediction"
+    )]
+    PredictionsNeedPlacementLoad,
     /// `--learned-sizes on` was given with `--scheduler-core js`, which learns sizes in `shadow`
     /// only: it would book as `off` does while the flag says otherwise.
     #[error(
@@ -756,22 +878,37 @@ pub enum ConfigError {
          shadow or off, or --scheduler-core legacy"
     )]
     LearnedSizesOnUnderJs,
+    /// `--no-memory-climb` was given with `--scheduler-core js`, whose scheduler is built
+    /// inside the core with no setting for it: the climb would stay on while the flag says
+    /// otherwise.
+    #[error(
+        "--no-memory-climb is not supported with --scheduler-core js yet; use --scheduler-core \
+         legacy, or leave the flag out"
+    )]
+    NoMemoryClimbUnderJs,
+    /// `--usage-profiles` was given a value that would do nothing.
+    #[error(transparent)]
+    UsageProfiles(#[from] crate::usage_profiles::UsageProfilesError),
 }
 
 impl Args {
-    /// Refuses a `--scheduler-core` this release cannot run.
+    /// Refuses a combination of `--scheduler-core` and the flags that the core cannot run.
+    /// Both cores are built into every binary.
     ///
     /// # Errors
-    /// [`ConfigError::SchedulerCoreUnavailable`]: the core is `js`, in a build without it.
     /// [`ConfigError::LearnedSizesOnUnderJs`]: the core is `js` and `--learned-sizes` is `on`.
+    /// [`ConfigError::NoMemoryClimbUnderJs`]: the core is `js` and `--no-memory-climb` is set.
+    /// [`ConfigError::UsageProfiles`]: `--usage-profiles` would do nothing (see
+    /// [`crate::usage_profiles::UsageProfilesError`]).
     pub fn check_scheduler_core(&self) -> Result<(), ConfigError> {
         let js = self.scheduler_core == crate::SchedulerCore::Js;
         if js && self.learned_sizes == crate::LearnedSizes::On {
             return Err(ConfigError::LearnedSizesOnUnderJs);
         }
-        if !self.scheduler_core.available() {
-            return Err(ConfigError::SchedulerCoreUnavailable(self.scheduler_core));
+        if js && self.no_memory_climb {
+            return Err(ConfigError::NoMemoryClimbUnderJs);
         }
+        self.usage_profiles_fit()?;
         Ok(())
     }
 
@@ -846,6 +983,7 @@ impl Args {
     pub fn listeners(&self) -> Result<Listeners, ConfigError> {
         self.segment_upload_fits_write_bound()?;
         self.durable_wait_fits_commit_bound()?;
+        self.placement_predictions_fit()?;
         let reload = Duration::from_secs(self.tls_reload_interval_secs);
         let deny_list = self
             .worker_deny_list
@@ -901,10 +1039,14 @@ impl Args {
             default_platform: self.default_platform,
             qos_allowed: self.qos_allowed,
             memory_ladder: kbf_sched::MemoryLadder::from_gib(&self.memory_ladder_gib)?,
+            memory_climb: !self.no_memory_climb,
             vm_host_floor: HostFloor::new(self.vm_host_floor_cpus, self.vm_host_floor_mem_gib),
             learned_sizes: self.learned_sizes,
+            exclusive_actions: self.exclusive_actions,
             scheduler_core: self.scheduler_core,
             placement_load: self.placement_load,
+            placement_predictions: self.placement_predictions,
+            usage_profiles: self.usage_profiles,
             whole_node: self.whole_node.config(),
             finished_retention: Duration::from_secs(self.finished_retention_secs),
             shutdown_timeout: match self.shutdown_timeout_secs {

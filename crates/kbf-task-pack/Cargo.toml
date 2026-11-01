@@ -1,0 +1,23 @@
+[package]
+name = "kbf-task-pack"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Hex of the MAC in a key.
+hex.workspace = true
+# The segment layout of a task pack: the footer, the writer and the reader of its records.
+kbf-segments.workspace = true
+# `Digest`, the content address of a record.
+kbf-types.workspace = true
+# The manifest of a task pack is JSON.
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

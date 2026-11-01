@@ -41,7 +41,7 @@ fn invalid(spec: &TokenSpec) -> Option<&'static str> {
 /// node never carries a host role, and the role never mixes with a node's.
 #[test]
 fn an_updater_token_is_for_one_named_host_once_and_with_its_host_role() {
-    let good = updater_spec("host-1", HostRole::Daemon);
+    let good = updater_spec("host-1", HostRole::DAEMON);
     assert_eq!(invalid(&good), None);
 
     let mixed = TokenSpec {
@@ -77,7 +77,7 @@ fn an_updater_token_is_for_one_named_host_once_and_with_its_host_role() {
     };
     assert_eq!(invalid(&many), Some("an updater token has one use"));
     let node_with_host_role = TokenSpec {
-        host_role: Some(HostRole::Daemon),
+        host_role: Some(HostRole::DAEMON),
         ..spec(&[Daemon], 1)
     };
     assert_eq!(
@@ -92,17 +92,17 @@ fn an_updater_token_is_for_one_named_host_once_and_with_its_host_role() {
 fn the_host_role_goes_from_the_token_to_the_updaters_row() {
     let env = fake();
     let id = node("host-1");
-    make_token(&env, 1, &updater_spec("host-1", HostRole::MacDaemon));
+    make_token(&env, 1, &updater_spec("host-1", HostRole::MAC_DAEMON));
     make_token(&env, 2, &spec(&[Daemon], 1));
     assert_eq!(
         token_host_role(&*env.store, &tid(1)).unwrap(),
-        Some(HostRole::MacDaemon)
+        Some(HostRole::MAC_DAEMON)
     );
     assert_eq!(token_host_role(&*env.store, &tid(2)).unwrap(), None);
     assert_eq!(token_host_role(&*env.store, &tid(9)).unwrap(), None);
     assert_eq!(
         list_tokens(&*env.store).unwrap()[0].host_role,
-        Some(HostRole::MacDaemon)
+        Some(HostRole::MAC_DAEMON)
     );
     assert_eq!(updater_host_role(&*env.store, &id).unwrap(), None);
 
@@ -111,7 +111,7 @@ fn the_host_role_goes_from_the_token_to_the_updaters_row() {
         .expect("enrolled");
     assert_eq!(
         updater_host_role(&*env.store, &id).unwrap(),
-        Some(HostRole::MacDaemon)
+        Some(HostRole::MAC_DAEMON)
     );
 }
 
@@ -121,7 +121,7 @@ fn the_host_role_goes_from_the_token_to_the_updaters_row() {
 fn an_updater_and_the_node_of_one_id_have_rows_of_their_own() {
     let env = fake();
     make_token(&env, 1, &spec(&[Daemon], 1));
-    make_token(&env, 2, &updater_spec("host-1", HostRole::Daemon));
+    make_token(&env, 2, &updater_spec("host-1", HostRole::DAEMON));
     Req::new(1, "host-1", &[Daemon])
         .enroll(&env, 1)
         .expect("node");
@@ -144,7 +144,7 @@ fn an_updater_and_the_node_of_one_id_have_rows_of_their_own() {
 #[test]
 fn an_updater_token_is_refused_for_another_node_a_second_use_and_other_roles() {
     let env = fake();
-    make_token(&env, 1, &updater_spec("host-1", HostRole::Daemon));
+    make_token(&env, 1, &updater_spec("host-1", HostRole::DAEMON));
     let refuse = |req: Req, why: R| {
         assert_eq!(
             req.run(&*env.store, &mut || panic!("the signer ran")),
@@ -180,8 +180,8 @@ fn a_node_token_cannot_enroll_an_updater() {
 #[test]
 fn an_expired_or_revoked_updater_token_is_refused() {
     let env = fake();
-    make_token(&env, 1, &updater_spec("host-1", HostRole::Daemon));
-    make_token(&env, 2, &updater_spec("host-2", HostRole::Daemon));
+    make_token(&env, 1, &updater_spec("host-1", HostRole::DAEMON));
+    make_token(&env, 2, &updater_spec("host-2", HostRole::DAEMON));
     kbf_enroll_registry::revoke_token(&*env.store, &tid(2)).expect("revoked");
     env.advance(2 * DAY);
     assert_eq!(
@@ -199,7 +199,7 @@ fn an_expired_or_revoked_updater_token_is_refused() {
 #[test]
 fn an_updater_renews_its_own_row() {
     let env = fake();
-    make_token(&env, 1, &updater_spec("host-1", HostRole::Daemon));
+    make_token(&env, 1, &updater_spec("host-1", HostRole::DAEMON));
     Req::new(1, "host-1", &[Updater])
         .enroll(&env, 1)
         .expect("enrolled");
@@ -238,7 +238,7 @@ fn an_updater_renews_its_own_row() {
     assert_eq!(renewed.certs[0].not_after, now + 7 * DAY);
     assert_eq!(
         updater_host_role(&*env.store, &id).unwrap(),
-        Some(HostRole::Daemon),
+        Some(HostRole::DAEMON),
         "the host role stays with the row"
     );
 }
@@ -249,13 +249,13 @@ fn an_updater_renews_its_own_row() {
 #[test]
 fn a_replaced_updater_denies_its_old_certificate_but_not_the_node_id() {
     let env = fake();
-    make_token(&env, 1, &updater_spec("host-1", HostRole::Daemon));
+    make_token(&env, 1, &updater_spec("host-1", HostRole::DAEMON));
     make_token(
         &env,
         2,
         &TokenSpec {
             replace: true,
-            ..updater_spec("host-1", HostRole::Daemon)
+            ..updater_spec("host-1", HostRole::DAEMON)
         },
     );
     Req::new(1, "host-1", &[Updater])
@@ -279,7 +279,7 @@ fn a_replaced_updater_denies_its_old_certificate_but_not_the_node_id() {
 #[test]
 fn a_row_with_a_host_role_that_is_not_one_is_unreadable() {
     let env = fake();
-    make_token(&env, 1, &updater_spec("host-1", HostRole::Daemon));
+    make_token(&env, 1, &updater_spec("host-1", HostRole::DAEMON));
     Req::new(1, "host-1", &[Updater])
         .enroll(&env, 1)
         .expect("enrolled");
@@ -287,7 +287,7 @@ fn a_row_with_a_host_role_that_is_not_one_is_unreadable() {
     // row, 12 of a node row) is set to a name that is no host role.
     let bogus = |tag: u8| {
         let mut bytes = vec![tag, 5];
-        bytes.extend_from_slice(b"bogus");
+        bytes.extend_from_slice(b"cache");
         bytes
     };
     for (key, tag) in [("enroll/token/", 0x72), ("enroll/updater/", 0x62)] {
@@ -326,8 +326,8 @@ fn a_row_with_a_host_role_that_is_not_one_is_unreadable() {
 fn revoking_a_host_ends_its_updater_renewals() {
     let env = fake();
     make_token(&env, 1, &spec(&[Daemon], 1));
-    make_token(&env, 2, &updater_spec("host-1", HostRole::Daemon));
-    make_token(&env, 3, &updater_spec("host-2", HostRole::Daemon));
+    make_token(&env, 2, &updater_spec("host-1", HostRole::DAEMON));
+    make_token(&env, 3, &updater_spec("host-2", HostRole::DAEMON));
     Req::new(1, "host-1", &[Daemon])
         .enroll(&env, 1)
         .expect("node");

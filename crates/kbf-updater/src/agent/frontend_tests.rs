@@ -27,6 +27,8 @@ use crate::version::Version;
 /// A storage host's own view: its member active on the commit `aaaaaaaaaaaa`, nothing owed.
 const OWN: &str = r#"{"node":"n1","half":"member","member":{"id":1,"state":"active","build_commit":"aaaaaaaaaaaa"},"storage":{"members_active":3,"under_replicated_blobs":0}}"#;
 
+const SERVING: &str = r#"{"placement":{"state":"serving"},"leases":[],"connected":true}"#;
+
 const NODE: &str = r#"{"placement":{"state":"draining"},"leases":["a","b"],"connected":true}"#;
 
 struct Rig {
@@ -40,7 +42,7 @@ impl Rig {
     fn new(name: &str) -> Self {
         let pki = Pki::new();
         let dir = TestDir::under(std::env::temp_dir(), name);
-        let updater = pki.updater("n1", HostRole::Daemon);
+        let updater = pki.updater("n1", HostRole::DAEMON);
         let files = write_files(&dir, &pki, &updater);
         Self {
             pki,
@@ -77,6 +79,7 @@ impl Rig {
             frontend: addr.map(|a| Endpoint::parse(&format!("localhost:{}", a.port())).unwrap()),
             enroll_frontend: None,
             state_dir: None,
+            cordon_dir: None,
             node_api: None,
             daemon_node: None,
             timing: Timing::DEFAULT,
@@ -141,7 +144,7 @@ fn the_agent_drains_reads_and_undrains_its_node_with_its_certificate_and_no_toke
         let who = identity_of(one.client.as_deref().expect("a client certificate")).unwrap();
         assert_eq!(
             (who.node_id.to_string(), who.role),
-            ("n1".to_owned(), HostRole::Daemon)
+            ("n1".to_owned(), HostRole::DAEMON)
         );
     }
 }
@@ -157,7 +160,7 @@ fn a_daemon_hosts_health_is_read_from_its_own_node_through_the_frontend() {
         &rig.dir.join("none.sock"),
         Limits::default(),
     ));
-    let (_, health) = node_ports(&config, &rig.identity(), Role::Daemon, &local).unwrap();
+    let (_, health) = node_ports(&config, &rig.identity(), Role::Daemon, "kbf", &local).unwrap();
     let target = Version::parse("0.1.5+gaaaaaaaaaaaa-2").unwrap();
     // The helper is not there, so the commit cannot be read: the check fails there, after it
     // asked the frontend for the node, and not before.
@@ -180,7 +183,7 @@ fn the_ports_follow_the_flags_the_agent_was_given() {
     let h = host(Role::Daemon);
 
     let none = rig.config(None);
-    let (drain, health) = node_ports(&none, &rig.identity(), Role::Daemon, &local).unwrap();
+    let (drain, health) = node_ports(&none, &rig.identity(), Role::Daemon, "kbf", &local).unwrap();
     for text in [
         drain
             .drain(&h, Some(Duration::from_secs(1)))
@@ -191,18 +194,37 @@ fn the_ports_follow_the_flags_the_agent_was_given() {
         assert_eq!(text, NO_CREDENTIAL);
     }
 
-    let (addr, server) = rig.frontend(vec![ok("{}")]);
+    // The drain reads the node first (to tell its own cordon from an operator's), then drains.
+    let (addr, server) = rig.frontend(vec![ok(SERVING), ok("{}")]);
     let with_frontend = rig.config(Some(addr));
-    let (drain, _) = node_ports(&with_frontend, &rig.identity(), Role::Daemon, &local).unwrap();
+    let (drain, _) =
+        node_ports(&with_frontend, &rig.identity(), Role::Daemon, "kbf", &local).unwrap();
     assert_eq!(drain.drain(&h, Some(Duration::from_secs(1))), Ok(()));
-    assert_eq!(server.join().unwrap().len(), 1);
+    let seen = server.join().unwrap();
+    assert_eq!(head_of(&seen[0]).0[0], "GET /v1/nodes/n1 HTTP/1.1");
+    assert_eq!(head_of(&seen[1]).0[0], "POST /v1/nodes/n1:drain HTTP/1.1");
+    assert_eq!(seen.len(), 2);
 
     // A storage host is built the same way: its drain and its health are calls to the frontend
     // too, and it refuses nothing for want of the token.
-    let (addr, server) = rig.frontend(vec![http("404 Not Found", "", "{}"), ok(OWN)]);
-    let with_frontend = rig.config(Some(addr));
-    let (storage_drain, storage_health) =
-        node_ports(&with_frontend, &rig.identity(), Role::Storage, &local).unwrap();
+    let (addr, server) = rig.frontend(vec![
+        http("404 Not Found", "", "{}"),
+        http("404 Not Found", "", "{}"),
+        ok(OWN),
+    ]);
+    // Its own marks: the daemon's drain above left one for the same node.
+    let marks = rig.dir.join("storage-marks");
+    std::fs::create_dir(&marks).unwrap();
+    let mut with_frontend = rig.config(Some(addr));
+    with_frontend.cordon_dir = Some(marks);
+    let (storage_drain, storage_health) = node_ports(
+        &with_frontend,
+        &rig.identity(),
+        Role::Storage,
+        "kbf",
+        &local,
+    )
+    .unwrap();
     let st = host(Role::Storage);
     assert_eq!(storage_health.refusal(&st), None);
     assert_eq!(
@@ -215,9 +237,10 @@ fn the_ports_follow_the_flags_the_agent_was_given() {
         Ok(crate::ports::Health::Healthy)
     );
     let seen = server.join().unwrap();
-    assert_eq!(head_of(&seen[0]).0[0], "POST /v1/nodes/n1:drain HTTP/1.1");
+    assert_eq!(head_of(&seen[0]).0[0], "GET /v1/nodes/n1 HTTP/1.1");
+    assert_eq!(head_of(&seen[1]).0[0], "POST /v1/nodes/n1:drain HTTP/1.1");
     assert_eq!(
-        head_of(&seen[1]).0[0],
+        head_of(&seen[2]).0[0],
         "GET /v1/nodes/n1/storage-health HTTP/1.1"
     );
 
@@ -232,7 +255,7 @@ fn the_ports_follow_the_flags_the_agent_was_given() {
         addr: "127.0.0.1:1".parse().unwrap(),
         token_file: token,
     });
-    let (drain, _) = node_ports(&with_token, &rig.identity(), Role::Daemon, &local).unwrap();
+    let (drain, _) = node_ports(&with_token, &rig.identity(), Role::Daemon, "kbf", &local).unwrap();
     let err = drain.drain(&h, Some(Duration::from_secs(1))).unwrap_err();
     assert_eq!(err.kind(), PortErrorKind::Unreachable);
     assert!(err.to_string().contains("the operator API"), "{err}");
@@ -284,7 +307,7 @@ fn a_swapped_pair_a_bad_file_and_a_dead_frontend_are_refused() {
     let h = host(Role::Daemon);
     let (addr, server) = rig.frontend(vec![ok("{}")]);
     let api = rig.api(addr);
-    let other = rig.pki.updater("n2", HostRole::Daemon);
+    let other = rig.pki.updater("n2", HostRole::DAEMON);
     write_files(&rig.dir, &rig.pki, &other);
     let err = super::build::drain_for(Role::Daemon, &api)
         .drain(&h, Some(Duration::from_secs(1)))

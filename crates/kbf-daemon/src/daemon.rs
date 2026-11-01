@@ -597,6 +597,7 @@ impl<X: SessionExtras> Daemon<X> {
                         pack_reads,
                         pack_writes,
                         node_load,
+                        input_cache: self.core.leases.runtimes.input_cache(),
                     };
                     send(&tx, daemon_message::Message::Heartbeat(heartbeat));
                 }

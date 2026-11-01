@@ -54,8 +54,11 @@ fn flags(dir: &Path, more: &[String]) -> Result<StorageFlags, clap::Error> {
     if !more.iter().any(|m| m.starts_with("--storage-listen")) {
         argv.push("--storage-listen=127.0.0.1:0".to_owned());
     }
+    // An explicit floor: the default is 5% of the disk, and a runner's free space shrinks
+    // while the coverage build fills it, so a write would pass or fail with the disk.
     argv.extend([
         format!("--cold-store=file://{}", dir.join("cold").display()),
+        "--cold-store-floor-bytes=1".to_owned(),
         format!("--meta-dir={}", dir.join("meta").display()),
     ]);
     argv.extend_from_slice(more);
@@ -95,10 +98,14 @@ fn listeners(worker_tls: Option<WorkerTls>) -> Listeners {
         default_platform: kbf_front::DefaultPlatform::NONE,
         qos_allowed: kbf_front::QosAllow::DEFAULT,
         memory_ladder: kbf_server::MemoryLadder::default(),
+        memory_climb: true,
         vm_host_floor: kbf_server::HostFloor::default(),
         learned_sizes: kbf_server::LearnedSizes::Off,
+        exclusive_actions: false,
         scheduler_core: kbf_server::SchedulerCore::under_test(),
         placement_load: kbf_server::PlacementLoad::Off,
+        placement_predictions: kbf_server::PlacementPredictions::Off,
+        usage_profiles: kbf_server::UsageProfiles::Off,
         whole_node: None,
         finished_retention: kbf_sched::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),

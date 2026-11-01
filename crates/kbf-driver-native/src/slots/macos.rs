@@ -15,9 +15,9 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use crate::leader::Leader;
 use kbf_daemon::RuntimeError;
 use kbf_daemon::uid;
-use tokio::process::Child;
 use tokio::sync::OwnedSemaphorePermit;
 
 use super::book::{Backoff, Book, Cleaner, CountHook, Held, Slotted};
@@ -559,7 +559,7 @@ impl UidWatch {
     /// Processes of the uid survived, or the leader could not be reaped.
     pub async fn end(
         &mut self,
-        child: &mut Child,
+        child: &mut Leader,
         wait: Duration,
         grace: Duration,
     ) -> Result<Vec<Survivor>, RuntimeError> {

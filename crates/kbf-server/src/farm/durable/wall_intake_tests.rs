@@ -45,6 +45,7 @@ async fn a_request_another_frontend_queued_comes_in_with_its_wall_time() {
             hermetic: true,
             do_not_cache: false,
             needs: kbf_caps::Request::default(),
+            whole_worker: false,
         };
         let subject = crate::action_usage::Subject::of(Default::default()).0;
         let id = other.reserve_operation(OperationId(id)).expect("an id");

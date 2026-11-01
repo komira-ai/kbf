@@ -28,14 +28,14 @@ use crate::test_log::capture;
 type Inbox = mpsc::UnboundedReceiver<Result<ServerMessage, Status>>;
 
 /// A node's stream as a test holds it: dropping the inbox ends the stream.
-struct Joined {
-    stream: StreamId,
-    inbox: Inbox,
+pub(super) struct Joined {
+    pub(super) stream: StreamId,
+    pub(super) inbox: Inbox,
 }
 
 impl Joined {
     /// The messages sent on the stream since the last call.
-    fn sent(&mut self) -> Vec<Message> {
+    pub(super) fn sent(&mut self) -> Vec<Message> {
         let mut sent = Vec::new();
         while let Ok(Ok(ServerMessage {
             message: Some(message),
@@ -47,7 +47,7 @@ impl Joined {
     }
 
     /// The lease of the `Start` sent since the last call, if one was.
-    fn started(&mut self) -> Option<worker::LeaseId> {
+    pub(super) fn started(&mut self) -> Option<worker::LeaseId> {
         self.sent().into_iter().find_map(|message| match message {
             Message::Start(start) => start.lease_id,
             _ => None,
@@ -55,15 +55,15 @@ impl Joined {
     }
 }
 
-fn farm_on(core: SchedulerCore, cache: &Backend) -> Farm {
+pub(super) fn farm_on(core: SchedulerCore, cache: &Backend) -> Farm {
     Farm::on_core(core, cache.clone(), UNSERVABLE_WAIT, FINISHED_RETENTION)
 }
 
-fn backend() -> Backend {
+pub(super) fn backend() -> Backend {
     Arc::new(Cache::memory()).into()
 }
 
-fn node(name: &str) -> WorkerId {
+pub(super) fn node(name: &str) -> WorkerId {
     WorkerId::new(name)
 }
 
@@ -74,12 +74,12 @@ fn hello(os: &str, arch: &str) -> Reported {
     Reported::serving(Resources::new(4_000, 8 << 30), caps)
 }
 
-fn linux() -> Reported {
+pub(super) fn linux() -> Reported {
     hello("linux", "x86_64")
 }
 
 /// `name` joined to `farm` on a new stream.
-fn join(farm: &Farm, name: &str, reported: Reported) -> Joined {
+pub(super) fn join(farm: &Farm, name: &str, reported: Reported) -> Joined {
     let (outbound, inbox) = mpsc::unbounded_channel();
     let welcome = ServerMessage {
         message: Some(Message::Welcome(Welcome::default())),
@@ -95,7 +95,7 @@ fn join(farm: &Farm, name: &str, reported: Reported) -> Joined {
     Joined { stream, inbox }
 }
 
-fn request(tag: u8) -> kbf_sched::Request {
+pub(super) fn request(tag: u8) -> kbf_sched::Request {
     let key = ActionKey {
         instance: "main".to_owned(),
         action: Digest::new(DigestFunction::Sha256, [tag; 32], u64::from(tag)),
@@ -108,10 +108,11 @@ fn request(tag: u8) -> kbf_sched::Request {
         hermetic: true,
         do_not_cache: false,
         needs: kbf_caps::Request::default(),
+        whole_worker: false,
     }
 }
 
-fn submission(tag: u8, call: Option<ExecuteCall>) -> Submission {
+pub(super) fn submission(tag: u8, call: Option<ExecuteCall>) -> Submission {
     Submission {
         request: request(tag),
         call,
@@ -126,7 +127,7 @@ fn submit(farm: &Farm, tag: u8) -> Ticket {
 }
 
 /// The `Result` of a run that exited 0, carrying `usage` the way a daemon sends it.
-fn ok(lease: &worker::LeaseId, usage: Option<&ResourceUsage>) -> worker::Result {
+pub(super) fn ok(lease: &worker::LeaseId, usage: Option<&ResourceUsage>) -> worker::Result {
     let execution_metadata = usage.map(|usage| ExecutedActionMetadata {
         auxiliary_metadata: vec![usage.to_any()],
         ..ExecutedActionMetadata::default()
@@ -143,7 +144,7 @@ fn ok(lease: &worker::LeaseId, usage: Option<&ResourceUsage>) -> worker::Result 
 }
 
 /// A `Result` for `lease` killed for memory as `kill` says, with the status a driver sends.
-fn killed(lease: &worker::LeaseId, kill: MemoryKill) -> worker::Result {
+pub(super) fn killed(lease: &worker::LeaseId, kill: MemoryKill) -> worker::Result {
     worker::Result {
         lease_id: Some(*lease),
         status: Some(rpc::Status {
@@ -156,7 +157,7 @@ fn killed(lease: &worker::LeaseId, kill: MemoryKill) -> worker::Result {
     }
 }
 
-fn usage() -> ResourceUsage {
+pub(super) fn usage() -> ResourceUsage {
     ResourceUsage {
         wall_micros: 2_000_000,
         cgroup: Some(CgroupUsage {
@@ -456,7 +457,7 @@ async fn an_operation_is_named_by_its_id_and_a_name_that_is_not_one_is_not_found
 
 /// The `Start` of the rerun after a kill: the scheduler places it at the next tick, so the
 /// clock is moved on (paused, so no real time passes) until one is sent.
-async fn rerun_start(farm: &Farm, joined: &mut Joined) -> worker::LeaseId {
+pub(super) async fn rerun_start(farm: &Farm, joined: &mut Joined) -> worker::LeaseId {
     for _ in 0..30 {
         farm.tick().await;
         if let Some(lease) = joined.started() {
@@ -465,4 +466,46 @@ async fn rerun_start(farm: &Farm, joined: &mut Joined) -> worker::LeaseId {
         tokio::time::advance(std::time::Duration::from_secs(1)).await;
     }
     panic!("no rerun was started");
+}
+
+/// Asserts which acknowledgement the js farm's report keeps from the core's: a stale
+/// refusal of a lease the core still calls current is dropped (the daemon keeps that
+/// `Result` and sends it again), and every other answer stands: an acceptance, a refusal
+/// while the farm is fenced (which refuses every `Result` as stale by design), a stale
+/// refusal of a lease that is not current, and a refusal for another reason. Catches a
+/// check that drops the wrong acks, or that asks whether the lease is current when the
+/// ack alone decides.
+#[test]
+fn only_a_stale_refusal_of_the_current_lease_loses_its_ack() {
+    use kbf_proto::worker::{ResultAck, ResultAckReason};
+    use kbf_types::LeaseId;
+
+    use super::super::hot::answered;
+
+    let lease = LeaseId::new(1, 1);
+    let worker = node("n1");
+    let ack = |accepted, reason: ResultAckReason| ResultAck {
+        lease_id: Some(worker::LeaseId { term: 1, seq: 1 }),
+        accepted,
+        reason: reason as i32,
+    };
+    let unasked = || -> bool { panic!("the ack alone decides") };
+    let stale = ack(false, ResultAckReason::Stale);
+
+    assert_eq!(answered(stale, false, &|| true, lease, &worker), None);
+    let accepted = ack(true, ResultAckReason::Accepted);
+    assert_eq!(
+        answered(accepted, false, &unasked, lease, &worker),
+        Some(accepted)
+    );
+    assert_eq!(answered(stale, true, &unasked, lease, &worker), Some(stale));
+    assert_eq!(
+        answered(stale, false, &|| false, lease, &worker),
+        Some(stale)
+    );
+    let unknown = ack(false, ResultAckReason::UnknownLease);
+    assert_eq!(
+        answered(unknown, false, &unasked, lease, &worker),
+        Some(unknown)
+    );
 }

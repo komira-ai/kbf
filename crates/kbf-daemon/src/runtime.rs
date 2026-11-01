@@ -10,7 +10,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use kbf_proto::reapi::{ActionResult, Digest};
-use kbf_proto::worker::{NodeLoad, ResourceUsage};
+use kbf_proto::worker::{InputCacheCounts, NodeLoad, ResourceUsage};
 use kbf_types::{LeaseId, LeaseKind, LostWhy, Resources};
 use tokio::sync::oneshot;
 
@@ -189,6 +189,13 @@ pub trait Runtime: Send + Sync + 'static {
         async { Ok(None) }
     }
 
+    /// What the runtime's input cache has done since the process started, for the
+    /// heartbeat (`Heartbeat.input_cache`). `None` for a runtime with no input cache open
+    /// (the default).
+    fn input_cache(&self) -> Option<InputCacheCounts> {
+        None
+    }
+
     /// Told by each Welcome whether the farm places by the load the nodes measure
     /// (`Welcome.placement_load`, false when absent), on the connect of every stream, before
     /// the first heartbeat of it. A runtime that limits the CPU of its leases applies the
@@ -207,7 +214,8 @@ pub trait Runtime: Send + Sync + 'static {
 
     /// Stops a running lease. Returns once its work has stopped; the lease's `run` then
     /// ends with [`RuntimeError::Killed`]. Killing a lease that is not running does
-    /// nothing.
+    /// nothing. The daemon calls it only after the lease's [`Runtime::run`] has been
+    /// polled once, so `run` must register what `kill` stops before its first `.await`.
     fn kill(&self, lease_id: LeaseId) -> impl Future<Output = ()> + Send;
 }
 

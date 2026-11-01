@@ -1,5 +1,5 @@
-//! `kbf frontend --scheduler-core`: taken by the frontend, refused for `js` in a build
-//! without the `js` core, and logged at start as the core the farm runs. Alone in its test
+//! `kbf frontend --scheduler-core`: taken by the frontend (`legacy` and `js`), and logged at
+//! start as the core the farm runs. Alone in its test
 //! binary: a log event is seen by a subscriber set for one thread only if no other thread
 //! has already made the callsite uninteresting, which other frontend starts in the same
 //! process would do.
@@ -69,11 +69,9 @@ fn flags(more: &[&str]) -> frontend::FrontendFlags {
 }
 
 /// Catches a frontend that refuses `--scheduler-core` as a flag it does not take (a unit
-/// file for the js core could not be written for a frontend), a frontend that starts on
-/// `js` in a build that does not have it (the refusal must be the server's own message,
-/// naming the flag and the value, and come before any line says the core runs), and a
-/// start that does not log the core the farm runs, in the words the all-in-one server
-/// uses (`scheduler core: legacy`, once per start; `js` only in a build that has it).
+/// file for the js core could not be written for a frontend), a frontend that cannot
+/// start on `js`, and a start that does not log the core the farm runs, in the words the
+/// all-in-one server uses (`scheduler core: legacy` or `scheduler core: js`, once per start).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_frontend_takes_the_scheduler_core_flag_and_logs_the_core_it_runs() {
     let log = Log::default();
@@ -104,20 +102,11 @@ async fn a_frontend_takes_the_scheduler_core_flag_and_logs_the_core_it_runs() {
     assert!(!log.text().contains("scheduler core: js"));
 
     let js = flags(&["--scheduler-core=js"]);
-    let started = start(&js);
-    if cfg!(feature = "farm-core-js") {
-        let _js = started.expect("a build with farm-core-js starts on js");
-        assert_eq!(
-            log.text().matches("scheduler core: js").count(),
-            1,
-            "{}",
-            log.text()
-        );
-    } else {
-        let refused = started.err().expect("js is refused in a build without it");
-        let said = refused.to_string();
-        assert!(said.contains("--scheduler-core js"), "{said}");
-        assert!(said.contains("not available yet"), "{said}");
-        assert!(!log.text().contains("scheduler core: js"), "{}", log.text());
-    }
+    let _js = start(&js).expect("js starts");
+    assert_eq!(
+        log.text().matches("scheduler core: js").count(),
+        1,
+        "{}",
+        log.text()
+    );
 }

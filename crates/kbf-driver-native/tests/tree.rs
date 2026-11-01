@@ -422,3 +422,31 @@ async fn processes_that_end_on_sigterm_are_not_reported() {
     assert_eq!(stderr, "done\n");
     assert!(!alive(pid_of(&cas, &result)));
 }
+
+/// Catches: an action's CPU taken from the polls alone. The shell runs ten children one
+/// after another, each burning 0.2 s of CPU and gone before any poll (the poll interval
+/// is an hour, so only the start and the end are read, and the end finds no child), so
+/// the CPU of the lease is the leader's reaped total: the CPU of the children it reaped.
+/// The sampled sum reads about nothing. Half the 2 s burned is asked for, since a
+/// loaded runner may give a burn less than its time. macOS only: the other platforms
+/// report no usage.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn the_usage_cpu_of_children_that_exited_between_polls_is_counted() {
+    let dir = scratch("usage-short-children");
+    let cas = Arc::new(MemoryCas::default());
+    let mut config = config(&dir);
+    config.poll = Duration::from_secs(3600);
+    let rt = runtime(config, &cas);
+    let act = support::act();
+    let script = format!(
+        "i=0; while [ $i -lt 10 ]; do {} burn 0.2; i=$((i+1)); done",
+        act.display()
+    );
+    let result = run(&rt, &cas, 5, &Spec::sh(&script)).await.expect("ran");
+    assert_eq!(result.exit_code, 0, "{}", support::stderr(&cas, &result));
+    let usage = ResourceUsage::in_result(&result).expect("a usage");
+    let f = usage.footprint.expect("a footprint block");
+    let cpu = f.cpu_user_micros.expect("user") + f.cpu_system_micros.expect("system");
+    assert!(cpu >= 1_000_000, "cpu {cpu} us after ten 0.2 s burns");
+}

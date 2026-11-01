@@ -7,8 +7,8 @@
 #
 # 1. It runs the binary the farm ships. A production frontend is `/usr/bin/kbf --mode=frontend`,
 #    so the cell starts `kbf --mode=storage` and `kbf --mode=frontend` from one `kbf` built with
-#    `cargo build -p kbf-cli --bins --locked --features farm-core-js` (`--kbf-bin`; the feature
-#    is kbf-cli's and forwards to kbf-server), and not the `kbf-server` binary, which no
+#    `cargo build -p kbf-cli --bins --locked` (`--kbf-bin`; both scheduler cores are in every
+#    build), and not the `kbf-server` binary, which no
 #    production host runs. The frontend is given the flip's flags, `--scheduler-core=js --learned-sizes=shadow`, and no
 #    `--placement-load` (it defaults to `off`, which is what the farm runs, so the blocking
 #    leg leaves it out).
@@ -144,15 +144,12 @@ jobs:
             target
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
-      # The cell (kbf-cell, kbf-act) and then the shipping binary with the js core compiled in.
-      # Two invocations, `kbf` last: the feature belongs to kbf-cli (it forwards to
-      # kbf-server) and is turned on by a build of that package alone; one invocation naming
-      # all the packages with a `--features` for one of them was tried on the server and built it
-      # WITHOUT the feature. `kbf` is built last so nothing after it can relink its binary.
+      # The cell (kbf-cell, kbf-act) and then the shipping binary, which has both cores. `kbf` is
+      # built last so nothing after it can relink its binary.
       - name: Build the cell
         run: cargo build -p kbf-integration-test -p kbf-testkit --bins --locked
-      - name: Build kbf with the js core
-        run: cargo build -p kbf-cli --bins --locked --features farm-core-js
+      - name: Build kbf
+        run: cargo build -p kbf-cli --bins --locked
       - name: Fetch Bazel (pinned version, checked by SHA-256)
         run: cargo xtask fetch --url "https://github.com/bazelbuild/bazel/releases/download/$BAZEL_VERSION/bazel-$BAZEL_VERSION-linux-x86_64" --sha256 "$BAZEL_SHA256" --out "$RUNNER_TEMP/tools/bazel"
       - name: Fetch buck2 (pinned version, checked by SHA-256)

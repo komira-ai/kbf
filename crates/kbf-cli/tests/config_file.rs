@@ -74,6 +74,29 @@ fn a_mode_takes_every_setting_from_the_file_alone() {
     assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument, "{err}");
 }
 
+/// Catches `no-memory-climb` missing from the file's keys (the file cannot turn the
+/// climb off), or read the wrong way round: absent or `false` leaves the climb on, `true`
+/// turns it off, for the frontend, the mode a server runs as.
+#[test]
+fn the_file_turns_the_memory_climb_off() {
+    let dir = scratch("no_memory_climb");
+    for (line, off) in [
+        ("", false),
+        ("no-memory-climb = false\n", false),
+        ("no-memory-climb = true\n", true),
+    ] {
+        let text = format!("{FRONTEND_FILE}\n[memory]\n{line}");
+        let path = file(&dir, &text, 0o600);
+        let parsed =
+            kbf_cli::parse_with(argv(&["kbf", "frontend"], Some(&path)), None).expect("parses");
+        assert_eq!(
+            frontend(&parsed.invocation).server.no_memory_climb,
+            off,
+            "{line:?}"
+        );
+    }
+}
+
 /// Catches a default config path that is ignored, or one that is required: `parse_with`
 /// reads the default file when it exists and goes on without it when it does not.
 #[test]
@@ -410,6 +433,22 @@ fn each_modes_golden_matches_the_flag_definitions() {
         "differs from its golden file:\n{}",
         stale.join("\n=====\n")
     );
+}
+
+/// Catches `--executor-locate` missing from the frontend's `kbf.toml`, or on in it: the template
+/// generated from the flag definitions (not the golden file) names the key, off, and the golden
+/// file carries the same line.
+#[test]
+fn kbf_toml_golden_names_executor_locate() {
+    let template = kbf_cli::config_template("frontend").expect("a mode");
+    let golden = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/kbf-frontend.toml"),
+    )
+    .expect("golden");
+    for text in [&template, &golden] {
+        let lines = text.lines().filter(|l| l.starts_with("executor-locate"));
+        assert_eq!(lines.collect::<Vec<_>>(), ["executor-locate = false"]);
+    }
 }
 
 /// Catches a golden whose keys the loader would refuse (a template that is not a config):

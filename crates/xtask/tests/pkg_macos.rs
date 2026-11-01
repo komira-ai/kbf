@@ -32,14 +32,14 @@
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use kbf_installer::layout::Platform;
 use xtask::pkg::sha1::cksum;
 
 mod support;
 use kbf_testkit::dir::TestDir;
-use support::{BUSY_WAIT, output_unbusy};
+use support::output_unbusy;
 
 const XTASK: &str = env!("CARGO_BIN_EXE_xtask");
 /// The binary the package ships: the stub, until the real one is built.
@@ -134,7 +134,7 @@ fn signed_installer(dir: &Path) -> PathBuf {
     // that child execs. Run it plainly until it is not busy: once one exec succeeds the
     // descriptor is closed everywhere and no later holder can appear (the file is no
     // longer opened for writing), so `sign-darwin` cannot meet the race.
-    output_unbusy(&mut Command::new(&binary), BUSY_WAIT).expect("the copy runs once it is free");
+    output_unbusy(&mut Command::new(&binary)).expect("the copy runs once it is free");
     success(XTASK, &["sign-darwin", s(&binary), "--minos", MINOS]);
     binary
 }
@@ -220,16 +220,19 @@ fn assert_root() {
     );
 }
 
-/// Polls `f` for up to `secs` seconds.
-fn within(secs: u64, f: impl Fn() -> bool) -> bool {
-    let end = Instant::now() + Duration::from_secs(secs);
-    while Instant::now() < end {
-        if f() {
-            return true;
+/// Polls `f` until it holds. `sudo-test` runs the binary itself, not nextest, so no per-test
+/// hang guard applies: a condition that never comes is ended by the workflow job's own
+/// `timeout-minutes`. `waiting_for` is said on stderr every twenty polls, so that job's log
+/// names what it was waiting for.
+fn until(waiting_for: &str, f: impl Fn() -> bool) {
+    let mut polls = 0u32;
+    while !f() {
+        polls += 1;
+        if polls.is_multiple_of(20) {
+            eprintln!("still waiting: {waiting_for}");
         }
         std::thread::sleep(Duration::from_millis(500));
     }
-    f()
 }
 
 #[test]
@@ -351,7 +354,13 @@ fn installer_places_files_and_loads_nothing() {
     success("launchctl", &["bootstrap", "system", PLIST]);
     let state = success("launchctl", &["print", &format!("system/{LABEL}")]);
     assert!(state.contains("state = not running"), "{state}");
-    std::thread::sleep(Duration::from_secs(3));
+    // No wait stands between bootstrap and these checks: the old three-second sleep raced
+    // a clock, and `launchctl` offers no event for "launchd evaluated the gate and left the
+    // job down" to wait on instead. What this step proves is therefore the state at that
+    // instant (a job that ignored the gate and started late is not seen here). That defect
+    // is closed from the other side: `cargo xtask pkg build` refuses a property list not
+    // gated on the file and kbf-setup's `setup::tests` pins the gate path, and the step
+    // below shows the gate is what starts the job.
     assert!(!is_running());
     assert!(
         !Path::new(JOB_LOG).exists(),
@@ -363,12 +372,9 @@ fn installer_places_files_and_loads_nothing() {
     // `setup` writes (kbf-setup's `setup::tests` pins that the plist's gate is it).
     std::fs::create_dir_all(gate_dir()).unwrap();
     std::fs::write(gate(), b"# configured\n").unwrap();
-    assert!(
-        within(60, || std::fs::read_to_string(JOB_LOG)
-            .is_ok_and(|log| log.contains("kbf-installer-stub run"))),
-        "the job did not run once {} existed",
-        gate()
-    );
+    until(&format!("the job to run once {} exists", gate()), || {
+        std::fs::read_to_string(JOB_LOG).is_ok_and(|log| log.contains("kbf-installer-stub run"))
+    });
     success("launchctl", &["bootout", &format!("system/{LABEL}")]);
     std::fs::remove_file(gate()).unwrap();
 

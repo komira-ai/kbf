@@ -25,7 +25,7 @@ async fn report(rig: &Rig, result: worker::Result) {
         &rig.core,
         &rig.backend,
         &wall(),
-        || at(0),
+        &|| at(0),
         &WorkerId::new("node-a"),
         result,
     )

@@ -21,6 +21,8 @@ use kbf_types::{HostRole, NodeId};
 use kbf_updater::version::Version;
 use kbf_updater::wire::{Health, Heartbeat, Outcome};
 
+use crate::bake::Bake;
+use crate::defer::{DeferBackoff, Defers};
 use crate::desired::KBF;
 
 /// A host with no heartbeat for this long is down.
@@ -45,8 +47,8 @@ struct Order {
 /// A host, as its last heartbeat and certificate left it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Host {
-    /// What the host runs, from its certificate.
-    pub role: HostRole,
+    /// What the host runs, from its certificate, by name. Read it with [`Host::role_name`].
+    role: String,
     /// What it last said.
     pub beat: Heartbeat,
     /// When it said it.
@@ -54,20 +56,30 @@ pub struct Host {
 }
 
 impl Host {
+    /// The host's role, by name: how coordinator logic reads a role.
+    #[must_use]
+    pub fn role_name(&self) -> &str {
+        &self.role
+    }
+
     /// Whether the host has heartbeated within [`DOWN_AFTER`] of `now`.
     #[must_use]
     pub fn is_live(&self, now: Duration) -> bool {
         now.saturating_sub(self.seen) < DOWN_AFTER
     }
 
-    /// Whether the host counts as up: live, healthy, and not in the middle of an update.
+    /// Whether the host counts as up: live, healthy, not in the middle of an update and not
+    /// waiting for its promotion.
     #[must_use]
     pub fn is_up(&self, now: Duration) -> bool {
-        self.is_live(now) && self.beat.health == Health::Healthy && self.beat.updating.is_none()
+        self.is_live(now)
+            && self.beat.health == Health::Healthy
+            && self.beat.updating.is_none()
+            && !self.beat.promotion_pending
     }
 
-    /// Whether the host holds one of its role's update slots: it is updating, or its last
-    /// update failed and it has not yet heartbeated healthy.
+    /// Whether the host holds one of its role's update slots: it is updating, its promotion
+    /// is pending, or its last update failed and it has not yet heartbeated healthy.
     #[must_use]
     pub fn holds_slot(&self) -> bool {
         let failed = self
@@ -75,7 +87,32 @@ impl Host {
             .last_update
             .as_ref()
             .is_some_and(|r| r.outcome == Outcome::Failed);
-        self.beat.updating.is_some() || (failed && self.beat.health != Health::Healthy)
+        self.beat.updating.is_some()
+            || self.beat.promotion_pending
+            || (failed && self.beat.health != Health::Healthy)
+    }
+}
+
+/// A host the coordinator has heard from, whatever it runs: noted for every heartbeat, so a
+/// host is known without a `kbf` beat.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Node {
+    /// What the host runs, from its certificate, by name.
+    pub role: String,
+    /// The features its agent announced.
+    pub features: Vec<String>,
+    /// When it last heartbeated.
+    pub seen: Duration,
+    /// The services its last heartbeat named, with the health it gave each (`kbf`: the top
+    /// level).
+    pub announced: BTreeMap<String, Health>,
+}
+
+impl Node {
+    /// Whether the node has heartbeated within [`DOWN_AFTER`] of `now`.
+    #[must_use]
+    pub fn is_live(&self, now: Duration) -> bool {
+        now.saturating_sub(self.seen) < DOWN_AFTER
     }
 }
 
@@ -83,8 +120,12 @@ impl Host {
 #[derive(Clone, Debug)]
 pub struct Fleet {
     started: Duration,
+    nodes: BTreeMap<NodeId, Node>,
     hosts: BTreeMap<String, BTreeMap<NodeId, Host>>,
     orders: BTreeMap<(NodeId, String), Order>,
+    /// Healthy beats in a row at one version, per service and host ([`Bake`]).
+    bake: BTreeMap<(String, NodeId), Bake>,
+    defers: Defers,
 }
 
 impl Fleet {
@@ -93,8 +134,11 @@ impl Fleet {
     pub fn new(started: Duration) -> Self {
         Self {
             started,
+            nodes: BTreeMap::new(),
             hosts: BTreeMap::new(),
             orders: BTreeMap::new(),
+            bake: BTreeMap::new(),
+            defers: Defers::default(),
         }
     }
 
@@ -110,6 +154,30 @@ impl Fleet {
         self.started
     }
 
+    /// Notes that the host `id` heartbeated, as `node` says.
+    pub fn note_node(&mut self, id: NodeId, node: Node) {
+        self.nodes.insert(id, node);
+    }
+
+    /// The node `id`, if it has heartbeated.
+    #[must_use]
+    pub fn node(&self, id: &NodeId) -> Option<&Node> {
+        self.nodes.get(id)
+    }
+
+    /// Every node that has heartbeated, by node id.
+    pub fn nodes(&self) -> impl Iterator<Item = (&NodeId, &Node)> {
+        self.nodes.iter()
+    }
+
+    /// Forgets what the host `id` said about `service`, and any order for it.
+    pub fn forget_in(&mut self, service: &str, id: &NodeId) {
+        if let Some(hosts) = self.hosts.get_mut(service) {
+            hosts.remove(id);
+        }
+        self.orders.remove(&(id.clone(), service.to_owned()));
+    }
+
     /// Notes a `kbf` heartbeat: [`Self::record_in`] for [`KBF`].
     pub fn record(&mut self, id: NodeId, role: HostRole, beat: Heartbeat, now: Duration) {
         self.record_in(KBF, id, role, beat, now);
@@ -119,7 +187,9 @@ impl Fleet {
     /// one.
     ///
     /// An order for the host and service ends when the beat shows it updating (the beat
-    /// counts from then), runs the ordered version, or reports that update failed.
+    /// counts from then), runs the ordered version, reports that update failed, or reports
+    /// that it declined it ([`crate::defer`]): a deferral holds no slot, so the order must not
+    /// hold it for [`ORDER_AGE`] either.
     pub fn record_in(
         &mut self,
         service: &str,
@@ -128,20 +198,48 @@ impl Fleet {
         beat: Heartbeat,
         now: Duration,
     ) {
+        self.record_named_in(service, id, role.name(), beat, now);
+    }
+
+    /// [`Self::record_in`] for a host whose role is named `role`: the one place a role enters
+    /// the fleet.
+    pub(crate) fn record_named_in(
+        &mut self,
+        service: &str,
+        id: NodeId,
+        role: &str,
+        beat: Heartbeat,
+        now: Duration,
+    ) {
         let key = (id, service.to_owned());
+        let mut deferred_order = false;
         if let Some(order) = self.orders.get(&key) {
             let failed = beat
                 .last_update
                 .as_ref()
                 .is_some_and(|r| r.outcome == Outcome::Failed && r.target == order.target);
-            if beat.updating.is_some() || beat.version == order.target || failed {
+            deferred_order = beat
+                .deferred
+                .as_ref()
+                .is_some_and(|d| d.target == order.target);
+            if beat.updating.is_some() || beat.version == order.target || failed || deferred_order {
                 self.orders.remove(&key);
             }
         }
+        let baking = (key.1.clone(), key.0.clone());
+        match Bake::after(self.bake.get(&baking), &beat, now) {
+            Some(bake) => {
+                self.bake.insert(baking, bake);
+            }
+            None => {
+                self.bake.remove(&baking);
+            }
+        }
+        self.defers.observe(&key, &beat, deferred_order, now);
         self.hosts.entry(key.1).or_default().insert(
             key.0,
             Host {
-                role,
+                role: role.to_owned(),
                 beat,
                 seen: now,
             },
@@ -162,6 +260,19 @@ impl Fleet {
         }
         self.orders
             .insert((id, service.to_owned()), Order { target, at: now });
+    }
+
+    /// When the wait of the host `id` ends, if it declined an update of `service` to `target`.
+    #[must_use]
+    pub fn deferred_until(
+        &self,
+        service: &str,
+        id: &NodeId,
+        target: &Version,
+        backoff: &DeferBackoff,
+    ) -> Option<Duration> {
+        self.defers
+            .until(&(id.clone(), service.to_owned()), target, backoff)
     }
 
     /// Whether `id` has an order outstanding for `service` at `now`.
@@ -193,6 +304,32 @@ impl Fleet {
     #[must_use]
     pub fn holds_slot(&self, service: &str, id: &NodeId, host: &Host, now: Duration) -> bool {
         host.holds_slot() || self.is_ordered(service, id, now)
+    }
+
+    /// How many healthy beats in a row the host `id` has sent `service` at `version`.
+    #[must_use]
+    pub fn bake_beats(&self, service: &str, id: &NodeId, version: &Version) -> u32 {
+        self.bake
+            .get(&(service.to_owned(), id.clone()))
+            .filter(|b| b.target == *version)
+            .map_or(0, |b| b.beats)
+    }
+
+    /// Whether the host `id` is still baking: live, at `version`, and has beaten healthy
+    /// fewer than `need` times in a row.
+    #[must_use]
+    pub fn is_baking(
+        &self,
+        service: &str,
+        id: &NodeId,
+        host: &Host,
+        version: &Version,
+        need: u32,
+        now: Duration,
+    ) -> bool {
+        host.is_live(now)
+            && host.beat.version == *version
+            && self.bake_beats(service, id, version) < need
     }
 
     /// Whether the host `id` counts as up for `service`: [`Host::is_up`] and no order
