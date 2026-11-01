@@ -77,12 +77,32 @@ pub fn capture(name: &str, out: &Output) {
     .unwrap();
 }
 
+/// Like [`run`], and when `cmd` fails while the journal of `units` shows GitHub refused the
+/// helper for its quota, the failure says so ([`rate_limit_note`]).
+pub fn run_explaining(name: &str, cmd: &mut Command, units: &[&str]) -> String {
+    let out = cmd
+        .output()
+        .unwrap_or_else(|e| panic!("{name}: did not start: {e}"));
+    capture(name, &out);
+    if !out.status.success()
+        && let Some(note) = rate_limit_note(&journal(units))
+    {
+        panic!("{name} failed: {note}");
+    }
+    check(name, &out)
+}
+
 /// Runs `cmd`, keeps its output as `name`, and requires it to succeed.
 pub fn run(name: &str, cmd: &mut Command) -> String {
     let out = cmd
         .output()
         .unwrap_or_else(|e| panic!("{name}: did not start: {e}"));
     capture(name, &out);
+    check(name, &out)
+}
+
+/// `out`'s stdout, when the command succeeded; a panic with its output when it did not.
+fn check(name: &str, out: &Output) -> String {
     assert!(
         out.status.success(),
         "{name} failed ({:?}): {}{}",
@@ -162,8 +182,13 @@ pub const RATE_LIMITED: &str = "rate limited by GitHub";
 ///
 /// A helper without the token mark asks GitHub anonymously, and the hosted runners of a
 /// region share a small anonymous quota, so the refusal says nothing of the release.
-pub fn rate_limit_note(_journal: &str) -> Option<String> {
-    None
+pub fn rate_limit_note(journal: &str) -> Option<String> {
+    journal.contains(RATE_LIMITED).then(|| {
+        "GitHub refused the helper's release listing: the helper of release N takes no Actions \
+         token, so it asks GitHub anonymously, and the quota of this hosted runner's address is \
+         over. This says nothing of the release. Re-run the job."
+            .to_owned()
+    })
 }
 
 /// The units' journal so far.
