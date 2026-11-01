@@ -372,3 +372,28 @@ async fn a_blocked_ack_drop_holds_the_order_across_a_restart() {
     assert!(matches!(replies[0], ServiceReply::Update { .. }));
     assert!(persisted(&rig).failure_acked.is_empty());
 }
+
+/// An ops file written before `failure_acked` existed (marks with only `last_good` and `bad`)
+/// loads with no acks, and writing it back does not add the key.
+#[test]
+fn an_ops_file_without_failure_acked_loads_and_is_written_back_without_it() {
+    let dir = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "ov-old-file");
+    let path = dir.path().join("desired.json.ops");
+    let old = r#"{"schema":1,"services":{"kbf":{"halt":null,"halt_acked":[],"last_good":"1.0","bad":["2.0"]}}}"#;
+    std::fs::write(&path, old).expect("written");
+    let store = crate::ops::OpsStore::open(&path).expect("opened");
+    let marks = store.marks("kbf");
+    assert_eq!(marks.last_good, Some(version("1.0")));
+    assert_eq!(marks.bad, vec![version("2.0")]);
+    assert!(marks.failure_acked.is_empty());
+    store
+        .change(
+            crate::ops::Write::BeforeMemory,
+            crate::ops::AuditEntry::new("operator", "seed"),
+            |_| {},
+        )
+        .expect("changed");
+    let text = std::fs::read_to_string(&path).expect("read");
+    assert!(!text.contains("failure_acked"), "{text}");
+    assert!(text.contains("\"last_good\": \"1.0\""), "{text}");
+}

@@ -128,8 +128,9 @@ impl Version {
     /// pre-release (`~rc1`), is no part of the numbers and does not order. A number over
     /// `u64::MAX` saturates to it.
     ///
-    /// This is the one order of versions: the agent and the coordinator both use it, so they
-    /// cannot order two versions differently.
+    /// This is the order of versions for any caller that needs one. Today the coordinator
+    /// uses it (the floor `min_version` sets under a rollback); the agent does not order
+    /// versions, and one that starts to should use this, so that the two cannot disagree.
     #[must_use]
     pub fn release_numbers(&self) -> Vec<u64> {
         let end = self
