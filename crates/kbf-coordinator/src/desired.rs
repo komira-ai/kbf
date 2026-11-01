@@ -384,7 +384,7 @@ pub struct DesiredStore {
     writing: Mutex<()>,
 }
 
-fn io_at(path: &Path) -> impl FnOnce(io::Error) -> StoreError + '_ {
+pub(crate) fn io_at(path: &Path) -> impl FnOnce(io::Error) -> StoreError + '_ {
     move |source| StoreError::Io {
         path: path.to_owned(),
         source,
@@ -451,9 +451,6 @@ impl DesiredStore {
     }
 
     fn write(&self, services: &BTreeMap<String, Desired>) -> Result<(), StoreError> {
-        let mut temp = self.path.clone().into_os_string();
-        temp.push(".new");
-        let temp = PathBuf::from(temp);
         // Only `kbf` is the single state of earlier builds, which refuse the map form.
         let encoded = match services.iter().collect::<Vec<_>>().as_slice() {
             [(name, only)] if name.as_str() == KBF => serde_json::to_vec_pretty(only),
@@ -461,26 +458,37 @@ impl DesiredStore {
                 services: services.clone(),
             }),
         };
-        let mut text = encoded.map_err(io::Error::from).map_err(io_at(&temp))?;
+        let mut text = encoded
+            .map_err(io::Error::from)
+            .map_err(io_at(&self.path))?;
         text.push(b'\n');
-        // A leftover of a crash is replaced, never followed: the temporary file is created
-        // new, owner-only.
-        match fs::remove_file(&temp) {
-            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(io_at(&temp)(e)),
-            _ => {}
-        }
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temp)
-            .map_err(io_at(&temp))?;
-        file.write_all(&text).map_err(io_at(&temp))?;
-        file.sync_all().map_err(io_at(&temp))?;
-        fs::rename(&temp, &self.path).map_err(io_at(&self.path))?;
-        let dir = dir_of(&self.path);
-        File::open(dir)
-            .and_then(|d| d.sync_all())
-            .map_err(io_at(dir))
+        write_whole(&self.path, &text)
     }
+}
+
+/// Replaces the file at `path` with `text`, whole: a temporary file beside it, created new
+/// and owner-only, fsynced, renamed over `path`, and the directory fsynced, so a crash leaves
+/// the old file or the new one. A leftover temporary file of a crash is replaced, never
+/// followed.
+pub(crate) fn write_whole(path: &Path, text: &[u8]) -> Result<(), StoreError> {
+    let mut temp = path.to_path_buf().into_os_string();
+    temp.push(".new");
+    let temp = PathBuf::from(temp);
+    match fs::remove_file(&temp) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(io_at(&temp)(e)),
+        _ => {}
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temp)
+        .map_err(io_at(&temp))?;
+    file.write_all(text).map_err(io_at(&temp))?;
+    file.sync_all().map_err(io_at(&temp))?;
+    fs::rename(&temp, path).map_err(io_at(path))?;
+    let dir = dir_of(path);
+    File::open(dir)
+        .and_then(|d| d.sync_all())
+        .map_err(io_at(dir))
 }

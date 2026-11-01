@@ -9,6 +9,7 @@
 //! - [`converge`]: whether the farm has reached the desired version, for CI to wait on;
 //! - [`decide`]: the decision as a pure function of the desired state, the fleet, the host
 //!   and the time;
+//! - [`ops`]: what operators decide (exclusions, labels, the audit ring), in a file of its own;
 //! - [`services`]: services as data: roles, limits and the order between services;
 //! - [`service`]: the coordinator itself: heartbeats in, the desired state set by CI's OIDC
 //!   token, the status read by the operator token;
@@ -33,6 +34,7 @@ pub mod fleet;
 pub mod http;
 pub mod identity;
 pub mod listen;
+pub mod ops;
 pub mod service;
 pub mod services;
 
@@ -68,6 +70,8 @@ mod http_tests;
 mod kbf_definition_tests;
 #[cfg(test)]
 mod kbf_review_tests;
+#[cfg(test)]
+mod ops_tests;
 #[cfg(test)]
 mod priority_tests;
 #[cfg(test)]
