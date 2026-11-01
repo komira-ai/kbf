@@ -17,14 +17,16 @@
 //! refused); 2 refused: bad arguments or a bad token file (`REFUSED: ...` on stderr).
 
 use std::fmt;
-use std::fs::{self, File};
+use std::fs::OpenOptions;
 use std::io::{Read, Write};
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::Args;
+use rustix::fs::OFlags;
+use rustix::io::Errno;
 use rustls::pki_types::CertificateDer;
 use rustls::pki_types::pem::PemObject;
 use serde_json::Value;
@@ -118,7 +120,7 @@ impl fmt::Debug for Token {
     }
 }
 
-/// The rule for the token file itself: a regular file (a link is not one), owned by `me`,
+/// The rule for the token file itself: a regular file opened without following a link, owned by `me`,
 /// mode exactly `0600` or `0400`.
 pub(crate) fn token_rule(is_file: bool, uid: u32, mode: u32, me: u32) -> Result<(), &'static str> {
     if !is_file {
@@ -139,11 +141,25 @@ pub(crate) fn token_rule(is_file: bool, uid: u32, mode: u32, me: u32) -> Result<
 fn read_token(path: &Path, me: u32) -> Result<Token, String> {
     let fail = |why: &str| format!("{TOKEN_FLAG}: {why}");
     let io = |e: std::io::Error| fail(&e.kind().to_string());
-    let meta = fs::symlink_metadata(path).map_err(io)?;
+    // Open first, without following a link and without blocking on a FIFO, and check the open
+    // file: what is checked is what is read, whatever the path is swapped for meanwhile.
+    let flags = (OFlags::NOFOLLOW | OFlags::NONBLOCK).bits() as i32;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(flags)
+        .open(path)
+        .map_err(|e| {
+            if e.raw_os_error() == Some(Errno::LOOP.raw_os_error()) {
+                fail("it is a symbolic link")
+            } else {
+                io(e)
+            }
+        })?;
+    let meta = file.metadata().map_err(io)?;
     token_rule(meta.is_file(), meta.uid(), meta.mode(), me).map_err(fail)?;
     let mut bytes = Vec::new();
-    File::open(path)
-        .and_then(|f| f.take(TOKEN_MAX + 1).read_to_end(&mut bytes))
+    file.take(TOKEN_MAX + 1)
+        .read_to_end(&mut bytes)
         .map_err(io)?;
     let shape = "it must hold one token of 32 to 4096 visible ASCII characters";
     let text = String::from_utf8(bytes).map_err(|_| fail(shape))?;

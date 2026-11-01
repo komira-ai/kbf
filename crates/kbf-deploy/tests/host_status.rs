@@ -485,7 +485,11 @@ fn a_symlink_at_the_token_path_is_refused() {
     let fake = coordinator();
     let ran = against(&fake, &link, "dm1", &[]);
     assert_eq!(ran.code, Some(2), "{}", ran.stderr);
-    assert!(ran.stderr.contains("--operator-token-file"), "{}", ran.stderr);
+    assert!(
+        ran.stderr.contains("--operator-token-file"),
+        "{}",
+        ran.stderr
+    );
     assert_eq!(ran.stdout, "");
     ran.assert_no_token();
     assert!(fake.heads.lock().expect("lock").is_empty());
