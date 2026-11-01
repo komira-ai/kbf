@@ -99,8 +99,10 @@ pub struct Halt {
     pub check: String,
     /// The version it was updating to.
     pub target: Version,
-    /// The `last_update` it reported, whole: what an acknowledgement of it matches.
-    pub report: UpdateResult,
+    /// The `last_update` it reported, whole: what an acknowledgement of it matches. `None` in
+    /// a file written before reports were kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report: Option<UpdateResult>,
 }
 
 /// A host and the halt report an operator cleared. It matches that report, whole: the same
@@ -112,8 +114,19 @@ pub struct HaltAck {
     pub node_id: String,
     /// The version.
     pub target: Version,
-    /// The `last_update` the host reported.
-    pub report: UpdateResult,
+    /// The `last_update` the host reported. `None` in a file written before reports were kept:
+    /// such an acknowledgement matches no report, and ends on the host's first beat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report: Option<UpdateResult>,
+}
+
+impl HaltAck {
+    /// Whether this acknowledges `report` of the host `node`: the same host and the very same
+    /// `last_update`.
+    #[must_use]
+    pub fn matches(&self, node: &str, report: &UpdateResult) -> bool {
+        self.node_id == node && self.report.as_ref() == Some(report)
+    }
 }
 
 impl From<Halt> for HaltAck {

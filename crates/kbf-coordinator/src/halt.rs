@@ -81,7 +81,7 @@ fn reported(last: Option<&UpdateResult>, id: &NodeId) -> Option<Halt> {
             .map_or(UNSPECIFIED, Token::as_str)
             .to_owned(),
         target: last.target.clone(),
-        report: last.clone(),
+        report: Some(last.clone()),
     })
 }
 
@@ -114,9 +114,11 @@ fn ignored(state: &OpsState, service: &str, halt: &Halt) -> Option<Ignored> {
         return Some(Ignored::Excluded);
     }
     let acked = marks.is_some_and(|m| {
-        m.halt_acked
-            .iter()
-            .any(|a| (&a.node_id, &a.report) == (&halt.node_id, &halt.report))
+        m.halt_acked.iter().any(|a| {
+            halt.report
+                .as_ref()
+                .is_some_and(|r| a.matches(&halt.node_id, r))
+        })
     });
     if acked {
         return Some(Ignored::Acked);
@@ -176,8 +178,10 @@ pub(crate) fn note(
 /// stands, so no order may go out before it is gone.
 fn end_ack(ops: &OpsStore, service: &str, id: &NodeId, report: Option<&Halt>) -> bool {
     let node = id.to_string();
-    let report = report.map(|halt| halt.report.clone());
-    let differs = move |ack: &HaltAck| ack.node_id == node && Some(&ack.report) != report.as_ref();
+    let report = report.and_then(|halt| halt.report.clone());
+    let differs = move |ack: &HaltAck| {
+        ack.node_id == node && !report.as_ref().is_some_and(|r| ack.matches(&node, r))
+    };
     let held = ops.read(|state| {
         state
             .services
