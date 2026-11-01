@@ -50,6 +50,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod builds;
 pub mod cli;
 pub mod export;
 pub mod readonly;

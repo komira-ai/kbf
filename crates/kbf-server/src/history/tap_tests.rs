@@ -69,6 +69,7 @@ fn ended(id: &str, kind: EndedKind, attempt: Option<usize>) -> Ended {
         attempt,
         kind,
         at: at(50_000_000),
+        correlated_invocations_id: None,
     }
 }
 
@@ -94,8 +95,16 @@ fn record_of(
     attempt: usize,
     kind: EndedKind,
 ) -> (kbf_history::records::RunRecord, Option<[u8; 12]>) {
+    record_for(row, &ended("b", kind, Some(attempt)))
+}
+
+/// What `ended` of `row` gives: the run record the tap offered, and the id it returned.
+fn record_for(
+    row: &ActionRow,
+    ended: &Ended,
+) -> (kbf_history::records::RunRecord, Option<[u8; 12]>) {
     let rig = rig(16);
-    let id = rig.tap.ended(&ended("b", kind, Some(attempt)), row);
+    let id = rig.tap.ended(ended, row);
     let mut events = rig.queue.drain();
     assert_eq!(events.len(), 1, "one record for one attempt");
     let Some(Event::Run {
@@ -1079,4 +1088,40 @@ fn an_absent_peak_and_wall_stay_absent_and_the_lease_counters_are_kept() {
         ]
     );
     assert_eq!(c.cpus_effective, Some(16));
+}
+
+/// Catches: the invocation or the build left off the record (the record is found by run
+/// id, so without them a run cannot be put in its build), the build's id written as the
+/// invocation's or the reverse, an absent correlated id written as an empty one (it would
+/// read as a build named ""), and a collision record (`<id>~2`) naming itself instead of
+/// the client's id.
+#[test]
+fn the_record_names_the_invocation_and_the_build_the_end_names() {
+    let r = row(
+        vec![attempt(Some(AttemptEnd::Accepted))],
+        Some(Outcome::Ok { exit_code: 0 }),
+    );
+    let named = Ended {
+        correlated_invocations_id: Some("corr-9".to_owned()),
+        ..ended("inv-7", EndedKind::Finished, Some(0))
+    };
+    let (rec, _) = record_for(&r, &named);
+    assert_eq!(rec.invocation_id.as_deref(), Some("inv-7"));
+    assert_eq!(rec.correlated_invocations_id.as_deref(), Some("corr-9"));
+
+    let tool_only = ended("inv-7", EndedKind::Finished, Some(0));
+    let (rec, _) = record_for(&r, &tool_only);
+    assert_eq!(rec.invocation_id.as_deref(), Some("inv-7"));
+    assert_eq!(rec.correlated_invocations_id, None);
+
+    let second_caller = Ended {
+        key: RecordKey::collision(kbf_invocation::InvocationId::new("inv-7"), 2),
+        ..tool_only
+    };
+    let rig = rig(16);
+    rig.tap.ended(&second_caller, &r);
+    let Some(Event::Run { record, .. }) = rig.queue.drain().pop() else {
+        panic!("a run event");
+    };
+    assert_eq!(record.invocation_id.as_deref(), Some("inv-7"));
 }

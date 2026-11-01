@@ -292,6 +292,8 @@ fn row_of(v: &Value, nodes: &BTreeMap<String, Node>) -> Result<Row, String> {
             .as_u64()
             .or_else(|| usage.and_then(|u| u["booked_millicpus"].as_u64())),
         node_cpu_pressure_centi: usage.and_then(|u| u["node_cpu_pressure_centi"].as_u64()),
+        invocation_id: None,
+        correlated_invocations_id: None,
     })
 }
 

@@ -41,6 +41,9 @@ pub struct Ended {
     pub kind: EndedKind,
     /// When: the event's time.
     pub at: WallTime,
+    /// The record's `correlated_invocations_id` when the event was applied, if a call
+    /// named one: the build the invocation is part of.
+    pub correlated_invocations_id: Option<String>,
 }
 
 /// Whether a lease given up for `reason` is followed by the worker's report of its run.
@@ -63,6 +66,7 @@ impl Records {
             attempt: None,
             kind: EndedKind::Hit,
             at,
+            correlated_invocations_id: None,
         });
     }
 
@@ -87,6 +91,7 @@ impl Records {
                 attempt: Some(attempt),
                 kind,
                 at,
+                correlated_invocations_id: None,
             });
         }
     }

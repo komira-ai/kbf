@@ -392,6 +392,16 @@ pub struct RunRecord {
     /// The number of distinct files of the input tree; absent as `input_bytes` is.
     #[prost(uint64, optional, tag = "47")]
     pub input_files: Option<u64>,
+    /// The invocation the attempt's request belonged to: the client's `tool_invocation_id`
+    /// of the Execute call that queued or joined the operation. Absent: a record written
+    /// before the field. Fields 48 and 49 follow the submit evidence (43 to 47).
+    #[prost(string, optional, tag = "48")]
+    pub invocation_id: Option<String>,
+    /// The build the invocation is part of: its `correlated_invocations_id`, when the
+    /// client sent one. Absent is not empty: no call of the invocation named one, or the
+    /// record predates the field.
+    #[prost(string, optional, tag = "49")]
+    pub correlated_invocations_id: Option<String>,
 }
 
 /// Where one axis of an attempt's booking came from. A record written before the field
