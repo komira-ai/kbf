@@ -1991,6 +1991,7 @@ mod tests {
             limit: 1.0,
             requests: 50,
             window_secs: 10,
+            detail: None,
         });
         r.cold_state.push(PassColdState {
             pass: 2,
