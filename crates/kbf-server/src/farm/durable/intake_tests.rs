@@ -447,7 +447,7 @@ async fn a_result_the_store_refuses_as_stale_is_answered_from_the_store() {
 
     farm.report(&WorkerId::new("node-a"), invalid(lease)).await;
 
-    assert_eq!(farm.dropped_writes(), 1);
+    assert_eq!(farm.lost_races(), 1);
     assert!(!matches!(*ticket.stage.borrow(), Stage::Done(_)));
     assert_eq!(farm.lock().intake.following(), 1);
     remove(&store, &op_key(operation));
@@ -510,7 +510,7 @@ async fn a_refusal_the_store_refuses_as_stale_is_answered_from_the_store() {
 
     farm.tick().await;
 
-    assert_eq!(farm.dropped_writes(), 1, "the refusal was written");
+    assert_eq!(farm.lost_races(), 1, "the refusal was written");
     assert!(!matches!(*ticket.stage.borrow(), Stage::Done(_)));
     let finished = ending("finished elsewhere");
     let result = [Effect::Answer(answer(operation.0, 0))];

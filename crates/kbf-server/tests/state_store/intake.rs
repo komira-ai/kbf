@@ -121,7 +121,7 @@ pub(super) async fn a_lost_grant_race_forgets_the_placement_and_the_operation_ru
     assert!(held(&a).is_empty(), "the lost placement was kept");
     assert_eq!(a.lease_views(Some(&node_a)).leases.len(), 0);
     assert_eq!(a.queued_operations(), 0, "the loser kept the operation");
-    assert_eq!(a.dropped_writes(), 1);
+    assert_eq!(lost_races(&a), 1);
     assert_eq!(disk.rows("lease/"), 1);
 
     assert!(finished_by(&b, &node_b, won).await);

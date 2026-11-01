@@ -461,6 +461,29 @@ pub(crate) mod subject;
 mod sweep;
 mod transitions;
 
+/// The operations the `effects` name, comma separated, for a log line.
+/// Each operation is named once, in the order the effects first name it.
+fn operations_of(effects: &VecDeque<Effect>) -> String {
+    let mut operations: Vec<OperationId> = Vec::new();
+    for effect in effects {
+        let operation = match effect {
+            Effect::Start(start) => start.operation,
+            Effect::Answer(answer) => answer.operation,
+            Effect::Refuse(refusal) => refusal.operation,
+            Effect::Waiting(waiting) => waiting.operation,
+            Effect::Commit(_) => continue,
+        };
+        if !operations.contains(&operation) {
+            operations.push(operation);
+        }
+    }
+    operations
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// The lease an effect starts, if it is a `Start`.
 fn started(effect: &Effect) -> Option<LeaseId> {
     match effect {
@@ -600,6 +623,10 @@ pub(super) struct Durable {
     /// an operation's `opkey/` row whatever the flag says, so rows an `on` run left are
     /// cleaned up as its operations end.
     pub(super) read_size_keys: AtomicBool,
+    /// Test builds only: refusals the store gives in place of a write, each to the next
+    /// attempt that names its `what` ([`Durable::refuse_next`]).
+    #[cfg(test)]
+    refusals: Mutex<Vec<(&'static str, StateError)>>,
 }
 
 impl std::fmt::Debug for Durable {
@@ -710,6 +737,8 @@ impl Durable {
             handovers: Mutex::new(BTreeMap::new()),
             sessions: Mutex::new(BTreeMap::new()),
             read_size_keys: AtomicBool::new(true),
+            #[cfg(test)]
+            refusals: Mutex::new(Vec::new()),
         };
         let epoch = durable.settle_epoch(policy, first)?;
         Ok((durable, epoch))
@@ -1171,6 +1200,22 @@ impl Durable {
         fenced
     }
 
+    /// Test builds only: the next attempt that names `what` ([`Engine::attempt`]) is
+    /// refused with `error` and its write is not made, as if the store had refused it.
+    #[cfg(test)]
+    pub(super) fn refuse_next(&self, what: &'static str, error: StateError) {
+        let mut refusals = self.refusals.lock().unwrap_or_else(PoisonError::into_inner);
+        refusals.push((what, error));
+    }
+
+    /// Test builds only: the refusal [`Durable::refuse_next`] holds for `what`, taken.
+    #[cfg(test)]
+    fn refusal_for(&self, what: &str) -> Option<StateError> {
+        let mut refusals = self.refusals.lock().unwrap_or_else(PoisonError::into_inner);
+        let at = refusals.iter().position(|(named, _)| *named == what)?;
+        Some(refusals.remove(at).1)
+    }
+
     /// Whether a write was refused because a newer writer holds the store: nothing this
     /// handle writes can succeed any more.
     pub(super) fn superseded(&self) -> bool {
@@ -1273,13 +1318,33 @@ impl Engine {
         what: &str,
         write: impl FnOnce(&Durable) -> Result<(), StateError>,
     ) -> Attempt {
+        self.attempt_logging(what, false, write)
+    }
+
+    /// [`Engine::attempt`]; with `race_is_expected`, a refusal as stale is not logged here:
+    /// the caller knows it is the loss of a race with another frontend and says so itself.
+    fn attempt_logging(
+        &self,
+        what: &str,
+        race_is_expected: bool,
+        write: impl FnOnce(&Durable) -> Result<(), StateError>,
+    ) -> Attempt {
         let Some(durable) = &self.durable else {
             return Attempt::Taken;
         };
-        match write(durable) {
+        #[cfg(test)]
+        let written = durable
+            .refusal_for(what)
+            .map_or_else(|| write(durable), Err);
+        #[cfg(not(test))]
+        let written = write(durable);
+        match written {
             Ok(()) => Attempt::Taken,
             Err(error) => {
-                tracing::error!(%error, "the state store did not take {what}");
+                let race = matches!(error, StateError::Missing(_) | StateError::Conflict(_));
+                if !(race && race_is_expected) {
+                    tracing::error!(%error, "the state store did not take {what}");
+                }
                 durable.note_failure(&error);
                 match error {
                     StateError::Store(cause) if !matches!(cause, StoreError::Fenced) => {
@@ -1339,7 +1404,7 @@ impl Engine {
             // A try that the store applied and did not acknowledge is tried again here,
             // and finds its own work in the rows (the write says so: it is `Taken`); a
             // `Stale` is another writer's work in the way, and the effect is dropped.
-            let attempt = self.attempt("a committed record", |d| {
+            let attempt = self.attempt_logging("a committed record", true, |d| {
                 d.persist(std::slice::from_ref(&effect), ending.as_ref())
             });
             match attempt {
@@ -1353,9 +1418,19 @@ impl Engine {
                     return ready;
                 }
                 Attempt::Stale | Attempt::Disowned | Attempt::Dropped => {
-                    self.write_drops += 1;
-                    tracing::error!("a committed record's remaining effects were dropped");
                     let dropped = self.unwritten.pop_front().unwrap_or_default();
+                    if attempt == Attempt::Stale {
+                        // Two frontends took the same queue row and the store kept the
+                        // other's write: nothing is lost, this frontend follows the store.
+                        self.lost_races += 1;
+                        tracing::warn!(
+                            operations = %operations_of(&dropped),
+                            "another frontend won the race for the operation: this frontend's write is dropped and its placement undone"
+                        );
+                    } else {
+                        self.write_drops += 1;
+                        tracing::error!("a committed record's remaining effects were dropped");
+                    }
                     // Another frontend's work stands in its place: this one gives up what
                     // it did for the operation and follows the store. A finish dropped for
                     // another reason (the node moved to another frontend, and its daemon
@@ -1828,6 +1903,8 @@ mod owner_tests;
 mod place_tests;
 #[cfg(test)]
 mod reads_tests;
+#[cfg(test)]
+mod refusal_tests;
 #[cfg(test)]
 mod results_tests;
 #[cfg(test)]

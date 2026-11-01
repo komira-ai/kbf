@@ -546,6 +546,7 @@ async fn the_counters_of_an_idle_farm_are_the_legacy_farms_and_the_gauges_follow
 
     assert_eq!(js.failed_actions(), legacy.failed_actions());
     assert_eq!(js.dropped_writes(), legacy.dropped_writes());
+    assert_eq!(js.lost_races(), legacy.lost_races());
     assert_eq!(js.memory_runs(), legacy.memory_runs());
     assert_eq!(js.avoided(), legacy.avoided());
     assert_eq!(js.open_sessions(), 0);

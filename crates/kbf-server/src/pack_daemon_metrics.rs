@@ -177,6 +177,27 @@ pub(crate) fn render_writes(out: &mut String, nodes: &[(WorkerId, PackWriteCount
 pub(crate) fn render_farm(out: &mut String, farm: &Farm) {
     render(out, &farm.pack_reads());
     render_writes(out, &farm.pack_writes());
+    render_store_writes(out, farm);
+}
+
+/// Appends `kbf_farm_lost_races_total` and `kbf_farm_dropped_writes_total` to `out`.
+fn render_store_writes(out: &mut String, farm: &Farm) {
+    let _ = writeln!(
+        out,
+        "# HELP kbf_farm_lost_races_total Writes to the state store refused because another \
+         frontend took the same operation first (the designed end of a race; the operation \
+         runs once), since the process started\n# TYPE kbf_farm_lost_races_total counter\n\
+         kbf_farm_lost_races_total {}",
+        farm.lost_races()
+    );
+    let _ = writeln!(
+        out,
+        "# HELP kbf_farm_dropped_writes_total Writes to the state store given up on for \
+         good (fenced by a newer writer, for a node another frontend owns, not encodable, or \
+         over the held cap), since the process started\n# TYPE kbf_farm_dropped_writes_total \
+         counter\nkbf_farm_dropped_writes_total {}",
+        farm.dropped_writes()
+    );
 }
 
 #[cfg(test)]

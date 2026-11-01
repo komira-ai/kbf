@@ -217,6 +217,12 @@ pub(crate) fn queued_operations(js: &JsFarm) -> u64 {
     js.core.queued_operations()
 }
 
+/// [`Farm::lost_races`](crate::farm::Farm::lost_races): the js core does not tell a lost
+/// race from a dropped write, and counts it in [`dropped_writes`].
+pub(crate) fn lost_races(_js: &JsFarm) -> u64 {
+    0
+}
+
 /// [`Farm::dropped_writes`](crate::farm::Farm::dropped_writes).
 pub(crate) fn dropped_writes(js: &JsFarm) -> u64 {
     js.core.dropped_writes()

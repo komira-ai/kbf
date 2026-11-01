@@ -61,3 +61,22 @@ async fn a_failing_action_raises_only_the_action_class() {
         assert_eq!(count(api, class).await, 0, "{class}");
     }
 }
+
+/// Asserts that a farm writes `kbf_farm_lost_races_total` and `kbf_farm_dropped_writes_total`
+/// from its start, each as a counter at 0 with a `# HELP` and `# TYPE` line: an absent series
+/// would mean the metric is gone, not that no race was lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fresh_farm_shows_no_lost_races_and_no_dropped_writes() {
+    let cell = Cell::start_with_api().await;
+    let api = cell.api.expect("an operator API");
+    let mut tcp = TcpStream::connect(api).await.expect("connect");
+    let request = "GET /metrics HTTP/1.1\r\nHost: kbf\r\nConnection: close\r\n\r\n";
+    tcp.write_all(request.as_bytes()).await.expect("send");
+    let mut text = String::new();
+    tcp.read_to_string(&mut text).await.expect("read");
+
+    for name in ["kbf_farm_lost_races_total", "kbf_farm_dropped_writes_total"] {
+        assert!(text.contains(&format!("# TYPE {name} counter\n")), "{text}");
+        assert!(text.lines().any(|l| l == format!("{name} 0")), "{text}");
+    }
+}
