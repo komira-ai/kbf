@@ -36,6 +36,8 @@ use std::fmt::Write;
 
 use serde_json::{Value, json};
 
+use crate::build_report;
+use crate::builds::BuildStats;
 use crate::row::Row;
 
 /// What the numbers cannot see. Printed with every report.
@@ -46,6 +48,13 @@ pub const NOT_RECORDED: [&str; 5] = [
     "The queue wait of an attempt that never started is not recorded; it is counted by outcome, never given a wait.",
     "The row does not say which scheduler core or flags ran it: an arm is whatever export was given.",
 ];
+
+/// What the numbers of `a` and `b` cannot see: [`NOT_RECORDED`], less the per-build entry
+/// when both arms name their builds.
+pub fn not_recorded(a: &ArmStats, b: &ArmStats) -> Vec<&'static str> {
+    let _ = (a, b);
+    NOT_RECORDED.to_vec()
+}
 
 /// A median and a 90th percentile, in microseconds; `None` when there is no sample.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -94,6 +103,8 @@ pub struct ArmStats {
     /// plus one when the latest end is before the earliest queue time. Such rows are
     /// excluded from wall and wait but still set the makespan end.
     pub out_of_order: u64,
+    /// The per-build numbers of rows that name their invocation or build.
+    pub builds: BuildStats,
 }
 
 impl ArmStats {
@@ -163,6 +174,7 @@ pub fn analyze(rows: &[Row]) -> ArmStats {
     stats.queue_wait = percentiles(waits);
     stats.wall_samples = walls.len() as u64;
     stats.wall = percentiles(walls);
+    stats.builds = BuildStats::default();
     stats
 }
 
@@ -170,7 +182,7 @@ const LABEL_WIDTH: usize = 34;
 const CELL_WIDTH: usize = 14;
 
 /// One table row: the label, then A, B and B less A, right-aligned.
-fn line(out: &mut String, label: &str, cells: [String; 3]) {
+pub(crate) fn line(out: &mut String, label: &str, cells: [String; 3]) {
     let _ = write!(out, "{label:<LABEL_WIDTH$}");
     for cell in cells {
         let _ = write!(out, "{cell:>CELL_WIDTH$}");
@@ -179,18 +191,18 @@ fn line(out: &mut String, label: &str, cells: [String; 3]) {
 }
 
 /// Seconds with three decimals (half up) of a signed microsecond value.
-fn secs(us: i128) -> String {
+pub(crate) fn secs(us: i128) -> String {
     let ms = (us.abs() + 500) / 1000;
     let sign = if us < 0 && ms > 0 { "-" } else { "" };
     format!("{sign}{}.{:03}", ms / 1000, ms % 1000)
 }
 
-fn count_row(out: &mut String, label: &str, a: u64, b: u64) {
+pub(crate) fn count_row(out: &mut String, label: &str, a: u64, b: u64) {
     let diff = i128::from(b) - i128::from(a);
     line(out, label, [a.to_string(), b.to_string(), diff.to_string()]);
 }
 
-fn duration_row(out: &mut String, label: &str, a: Option<u64>, b: Option<u64>) {
+pub(crate) fn duration_row(out: &mut String, label: &str, a: Option<u64>, b: Option<u64>) {
     let cell = |v: Option<u64>| v.map_or_else(|| "-".to_owned(), |v| secs(i128::from(v)));
     let diff = a
         .zip(b)
@@ -293,8 +305,9 @@ pub fn render_text(a: &ArmStats, b: &ArmStats) -> String {
     out.push_str(
         "B - A is a difference of two single numbers, not a significance test; the paper's rule needs the 95% Welch CI over runs to exclude 0.\n",
     );
+    build_report::rows(&mut out, &a.builds, &b.builds);
     out.push_str("Not recorded (not estimated):\n");
-    for gap in NOT_RECORDED {
+    for gap in not_recorded(a, b) {
         let _ = writeln!(out, "  - {gap}");
     }
     out
@@ -321,6 +334,7 @@ fn arm_json(arm: &ArmStats) -> Value {
         },
         "ok_without_end": arm.ok_without_end,
         "out_of_order": arm.out_of_order,
+        "builds": build_report::arm_json(&arm.builds),
     })
 }
 
@@ -349,6 +363,7 @@ pub fn render_json(a: &ArmStats, b: &ArmStats) -> String {
                 "p90": delta(a.wall.p90, b.wall.p90),
             },
             "makespan_us": delta(a.makespan_us, b.makespan_us),
+            "builds": build_report::difference_json(&a.builds, &b.builds),
             "kills_per_1000": {
                 "own_limit": rate_delta(
                     a.per_thousand(a.kills.own_limit),
@@ -360,7 +375,8 @@ pub fn render_json(a: &ArmStats, b: &ArmStats) -> String {
                 ),
             },
         },
-        "not_recorded": NOT_RECORDED,
+        "runs": {"a": a.builds.run_records("a"), "b": b.builds.run_records("b")},
+        "not_recorded": not_recorded(a, b),
     });
     format!("{doc:#}\n")
 }

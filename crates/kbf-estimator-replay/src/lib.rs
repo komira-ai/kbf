@@ -66,6 +66,7 @@
 
 #![forbid(unsafe_code)]
 
+mod build_report;
 pub mod builds;
 pub mod cli;
 pub mod compare;
