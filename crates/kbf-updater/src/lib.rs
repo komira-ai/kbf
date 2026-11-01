@@ -127,7 +127,7 @@ pub fn version_line() -> String {
 /// with (`None`: it was not).
 pub(crate) fn version_text(version: &str, commit: Option<&str>) -> String {
     let commit = commit.filter(|c| !c.is_empty()).unwrap_or("unknown");
-    format!("kbf-updater {version} ({commit})")
+    format!("kbf-updater {version}+{commit}")
 }
 
 /// The binary, as a function so that it is tested: the argument list in, the exit code and the

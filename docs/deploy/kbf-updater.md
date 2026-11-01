@@ -50,7 +50,7 @@ sit behind a load balancer of the farm's own (anything that stops sending to a b
 `kbf-updater --version` prints the package version and the commit the binary was built from:
 
 ```text
-kbf-updater 0.1.0 (0123456789ab)
+kbf-updater 0.1.0+0123456789ab
 ```
 
 The commit is the first 12 hex digits of the commit in the name of the release asset
