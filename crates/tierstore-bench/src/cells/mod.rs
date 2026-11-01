@@ -15,10 +15,9 @@
 //!   timed, logged and held to the rate cap.
 //! - Pass 0 of each arm is a warm-up: it is run, reported with `discarded: true`, and left out of
 //!   every figure. Arms are interleaved across passes and the order is recorded in `notes`.
-//! - The cell reads a [`crate::gate::LoadSample`] before each pass and every few completions in
-//!   it, and checks it against `ctx.config.gate`; a trip ends the pass (`gate_tripped`), marks its
-//!   samples `Window::Busy` whatever the run's window, and ends the run. The cell `c` reads it
-//!   before a burst only.
+//! - The cell reads a [`crate::gate::LoadSample`] before each pass, over a quiet window, and
+//!   checks it against `ctx.config.gate`; a trip ends the run (`gate_tripped` on the empty pass).
+//!   Inside a pass the load is recorded (`pass_load`) and not judged.
 //! - Bytes written to the cold store are counted against `ctx.config.bytes`; a cell is refused
 //!   before it sends anything when its cost is more than what is left, and a request-rate cap
 //!   (`ctx.config.rates`) holds whatever a cell asks for.

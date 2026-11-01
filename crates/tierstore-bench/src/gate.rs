@@ -2,17 +2,25 @@
 //!
 //! The thresholds are flags ([`crate::config::ConfigArgs`]); this module holds the rule, which
 //! is pure, and the sample it judges. Reading `/proc` for a sample is [`LoadSample::read`], over
-//! [`crate::procload`]. A pass during which the gate trips is aborted, and its
-//! samples are marked busy: a p99 is claimed only from passes that stayed under every limit.
+//! [`crate::procload`].
+//!
+//! Where it is judged: the preflight judges all four limits on the averages the kernel keeps. A
+//! run judges three of them, once, before each pass, over a quiet window of its own (the
+//! one-minute load average is left out, see [`LoadGate::check_run`]); a trip there ends the run
+//! with the passes so far written. Inside a pass the figures are only recorded
+//! ([`crate::result::PassLoad`]): the machine's work and the run's cannot be told apart there.
+//! What the gate does not see: with the load average out, the gap between passes is judged on
+//! disk time and CPU and IO stall time alone, so a co-tenant on idle cores, or contention for
+//! memory bandwidth, shows in neither.
 
 use std::path::Path;
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::BenchError;
-use crate::procload::Reader;
+use crate::procload::{QuietTiming, Reader, wait_for_writeback};
 
 /// The limits. A sample above any one of them trips the gate.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -20,14 +28,14 @@ pub struct LoadGate {
     /// One-minute load average of the machine that sends the load; judged at preflight only
     /// (see [`LoadGate::check_run`]).
     pub max_loadavg_1m: f64,
-    /// Pressure stall information, CPU, "some" share, in percent: over ten seconds at preflight
-    /// and inside a pass, over the quiet window before a pass.
+    /// Pressure stall information, CPU, "some" share, in percent: over ten seconds at preflight,
+    /// over the quiet window before a pass.
     pub max_psi_cpu_avg10: f64,
-    /// Pressure stall information, IO, "some" share, in percent: over ten seconds at preflight
-    /// and inside a pass, over the quiet window before a pass.
+    /// Pressure stall information, IO, "some" share, in percent: over ten seconds at preflight,
+    /// over the quiet window before a pass.
     pub max_psi_io_avg10: f64,
-    /// Utilisation of the busiest disk, in percent: since the previous reading at preflight and
-    /// inside a pass, over the quiet window before a pass.
+    /// Utilisation of the busiest disk, in percent: since the previous reading at preflight, over
+    /// the quiet window before a pass.
     pub max_disk_util_pct: f64,
 }
 
@@ -115,22 +123,40 @@ impl LoadSample {
         READER.read(Path::new("/proc"), Path::new("/sys/block"), now_ms())
     }
 
-    /// Reads the sample for the gate before a pass: the disk and the pressure are measured over
-    /// a quiet window of `settle` that begins now (see [`Reader::read_quiet`]), so the pass that
-    /// just ended is not counted. Blocks for `settle`.
+    /// Reads the sample inside a pass: pressure and disk time over the interval since the
+    /// previous reading of this process (see [`Reader::read_interval`]). Recorded by the run,
+    /// not judged.
     ///
     /// # Errors
     /// [`BenchError`] if the machine has no such files or they are not `/proc` text.
-    pub fn read_quiet(settle: Duration) -> Result<Self, BenchError> {
-        READER.read_quiet(
-            Path::new("/proc"),
-            Path::new("/sys/block"),
+    pub fn read_interval() -> Result<Self, BenchError> {
+        READER.read_interval(Path::new("/proc"), Path::new("/sys/block"), now_ms())
+    }
+
+    /// Reads the sample for the gate before a pass. First waits, up to a cap, until the memory
+    /// not yet written to disk is under a threshold, so that the pass that just ended has landed;
+    /// if the cap comes first the window is read as it is. Then the disk and the pressure are
+    /// measured over a quiet window that begins then (see [`Reader::read_quiet`]). Blocks for
+    /// both waits.
+    ///
+    /// # Errors
+    /// [`BenchError`] if the machine has no such files or they are not `/proc` text.
+    pub fn read_quiet(timing: &QuietTiming) -> Result<Self, BenchError> {
+        let (proc_root, sys_block) = (Path::new("/proc"), Path::new("/sys/block"));
+        wait_for_writeback(
+            proc_root,
+            timing.writeback_below_kib,
+            u64::try_from(timing.writeback_cap.as_millis()).unwrap_or(u64::MAX),
             now_ms(),
             || {
-                std::thread::sleep(settle);
+                std::thread::sleep(timing.poll);
                 now_ms()
             },
-        )
+        )?;
+        READER.read_quiet(proc_root, sys_block, now_ms(), || {
+            std::thread::sleep(timing.settle);
+            now_ms()
+        })
     }
 }
 
@@ -260,7 +286,13 @@ mod tests {
     fn this_machine_can_be_read() {
         let sample = LoadSample::read().unwrap();
         assert!(sample.loadavg_1m >= 0.0);
-        let quiet = LoadSample::read_quiet(Duration::ZERO).unwrap();
-        assert!(quiet.loadavg_1m >= 0.0);
+        let now = QuietTiming {
+            settle: std::time::Duration::ZERO,
+            writeback_cap: std::time::Duration::ZERO,
+            poll: std::time::Duration::ZERO,
+            ..QuietTiming::DEFAULT
+        };
+        assert!(LoadSample::read_quiet(&now).unwrap().loadavg_1m >= 0.0);
+        assert!(LoadSample::read_interval().unwrap().loadavg_1m >= 0.0);
     }
 }

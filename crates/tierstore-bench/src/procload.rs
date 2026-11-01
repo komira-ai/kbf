@@ -6,10 +6,12 @@
 //! zram devices are left out. A machine without these files is an error: a gate that cannot see
 //! is not a gate.
 //!
-//! [`Reader::read`] is the reading inside a pass and at preflight: the averages as the kernel
-//! keeps them. [`Reader::read_quiet`] is the reading before a pass: the disk and the pressure
-//! are measured over a window that begins when it is called, so the pass that just ended (whose
-//! IO and stalls the averages still carry) is not read as other work on the machine.
+//! [`Reader::read`] is the reading at preflight: the averages as the kernel keeps them.
+//! [`Reader::read_quiet`] is the reading before a pass: the disk and the pressure are measured
+//! over a window that begins when it is called (after [`wait_for_writeback`]), so the pass that
+//! just ended, whose IO and stalls the averages still carry, is not read as other work on the
+//! machine. [`Reader::read_interval`] is the reading inside a pass: the same figures over the
+//! interval since the previous reading, for the record.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -126,9 +128,17 @@ fn counted(sys_block: &Path, name: &str) -> bool {
     !virtual_device & sys_block.join(name).exists()
 }
 
-/// What the previous read saw: when (milliseconds on the caller's clock) and the busy time of
-/// every counted device.
-type Previous = Option<(u64, BTreeMap<String, u64>)>;
+/// What the previous read saw: when (milliseconds on the caller's clock), the busy time of every
+/// counted device and the stall totals of CPU and IO pressure (microseconds).
+#[derive(Debug)]
+struct Seen {
+    at_ms: u64,
+    disks: BTreeMap<String, u64>,
+    cpu_us: u64,
+    io_us: u64,
+}
+
+type Previous = Option<Seen>;
 
 /// A reader of the load; it remembers the previous read for the disk figure.
 #[derive(Debug, Default)]
@@ -161,16 +171,23 @@ impl Reader {
         let loadavg_1m = parse_loadavg_1m(&text("loadavg")?).ok_or_else(unreadable)?;
         let psi_cpu_avg10 = parse_psi_some_avg10(&text("pressure/cpu")?).ok_or_else(unreadable)?;
         let psi_io_avg10 = parse_psi_some_avg10(&text("pressure/io")?).ok_or_else(unreadable)?;
+        let (cpu_us, io_us) = pressure_totals(proc_root)?;
         let now: Vec<(String, u64)> = parse_diskstats(&text("diskstats")?)
             .into_iter()
             .filter(|(name, _)| counted(sys_block, name))
             .collect();
         let mut previous = self.previous.lock().unwrap_or_else(PoisonError::into_inner);
-        let (since_ms, before) = previous
-            .take()
-            .unwrap_or_else(|| (now_ms, now.iter().cloned().collect()));
+        let (since_ms, before) = previous.take().map_or_else(
+            || (now_ms, now.iter().cloned().collect()),
+            |seen| (seen.at_ms, seen.disks),
+        );
         let disk_util_pct = busiest_disk_pct(&before, &now, now_ms.saturating_sub(since_ms));
-        *previous = Some((now_ms, now.into_iter().collect()));
+        *previous = Some(Seen {
+            at_ms: now_ms,
+            disks: now.into_iter().collect(),
+            cpu_us,
+            io_us,
+        });
         Ok(LoadSample {
             loadavg_1m,
             psi_cpu_avg10,
@@ -179,7 +196,11 @@ impl Reader {
         })
     }
 
-    /// The load inside a pass (stub of the scaffold: it reads like [`Reader::read`]).
+    /// The load inside a pass: the disk figure and both pressure figures are what the disks and
+    /// the stall totals did since the previous read of this reader (the first read reports 0),
+    /// not the kernel's ten-second averages, which a pass carries into the next. The load average
+    /// is the kernel's, as in [`Reader::read`]. The run records these figures and does not judge
+    /// them: inside a pass the machine's work and the run's cannot be told apart.
     ///
     /// # Errors
     /// As [`Reader::read`].
@@ -189,7 +210,32 @@ impl Reader {
         sys_block: &Path,
         now_ms: u64,
     ) -> Result<LoadSample, BenchError> {
-        self.read(proc_root, sys_block, now_ms)
+        let loadavg_1m =
+            parse_loadavg_1m(&read_text(proc_root, "loadavg")?).ok_or_else(unreadable)?;
+        let (cpu_us, io_us) = pressure_totals(proc_root)?;
+        let disks = disk_busy_snapshot(proc_root, sys_block)?;
+        let mut previous = self.previous.lock().unwrap_or_else(PoisonError::into_inner);
+        let before = previous.take().unwrap_or_else(|| Seen {
+            at_ms: now_ms,
+            disks: disks.clone(),
+            cpu_us,
+            io_us,
+        });
+        let wall_ms = now_ms.saturating_sub(before.at_ms);
+        let now: Vec<(String, u64)> = disks.iter().map(|(n, t)| (n.clone(), *t)).collect();
+        let sample = LoadSample {
+            loadavg_1m,
+            psi_cpu_avg10: stall_pct(before.cpu_us, cpu_us, wall_ms),
+            psi_io_avg10: stall_pct(before.io_us, io_us, wall_ms),
+            disk_util_pct: busiest_disk_pct(&before.disks, &now, wall_ms),
+        };
+        *previous = Some(Seen {
+            at_ms: now_ms,
+            disks,
+            cpu_us,
+            io_us,
+        });
+        Ok(sample)
     }
 
     /// The load before a pass, over a quiet window of its own: the disk figure and both pressure
@@ -223,7 +269,12 @@ impl Reader {
             .map(|(name, ticks)| (name.clone(), *ticks))
             .collect();
         let disk_util_pct = busiest_disk_pct(&disks_before, &disks_now, wall_ms);
-        *self.previous.lock().unwrap_or_else(PoisonError::into_inner) = Some((now_ms, disks_after));
+        *self.previous.lock().unwrap_or_else(PoisonError::into_inner) = Some(Seen {
+            at_ms: now_ms,
+            disks: disks_after,
+            cpu_us: cpu_after,
+            io_us: io_after,
+        });
         Ok(LoadSample {
             loadavg_1m,
             psi_cpu_avg10: stall_pct(cpu_before, cpu_after, wall_ms),
@@ -233,7 +284,8 @@ impl Reader {
     }
 }
 
-/// How long the reading before a pass waits (see [`wait_for_writeback`] and [`Reader::read_quiet`]).
+/// How long the reading before a pass waits: first for the disks to drain, then for the window
+/// (see [`wait_for_writeback`] and [`Reader::read_quiet`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct QuietTiming {
     /// The quiet window itself.
@@ -246,36 +298,67 @@ pub struct QuietTiming {
     pub poll: Duration,
 }
 
+impl QuietTiming {
+    /// Two seconds of window, a wait of up to 45 s (the kernel holds dirty pages for 30) for
+    /// under 4 MiB not yet written, read every half second.
+    pub const DEFAULT: Self = Self {
+        settle: SETTLE,
+        writeback_below_kib: 4096,
+        writeback_cap: Duration::from_secs(45),
+        poll: Duration::from_millis(500),
+    };
+}
+
 impl Default for QuietTiming {
     fn default() -> Self {
-        Self {
-            settle: SETTLE,
-            writeback_below_kib: 4096,
-            writeback_cap: Duration::from_secs(45),
-            poll: Duration::from_millis(500),
-        }
+        Self::DEFAULT
     }
 }
 
-/// `Dirty` plus `Writeback` of the text of `/proc/meminfo`, KiB (stub of the scaffold).
+/// `Dirty` plus `Writeback` of the text of `/proc/meminfo`, KiB: the memory the kernel has not
+/// yet written to its disks, or is writing.
 #[must_use]
-pub fn parse_dirty_writeback_kib(_text: &str) -> Option<u64> {
-    None
+pub fn parse_dirty_writeback_kib(text: &str) -> Option<u64> {
+    let figure = |key: &str| {
+        text.lines()
+            .find_map(|line| line.strip_prefix(key))?
+            .split_whitespace()
+            .next()?
+            .parse::<u64>()
+            .ok()
+    };
+    Some(figure("Dirty:")?.saturating_add(figure("Writeback:")?))
 }
 
-/// Waits until the memory not yet written to disk is under `below_kib`, or until `cap_ms` have
-/// passed since `start_ms` (stub of the scaffold: it does not wait).
+/// Waits until the memory not yet written to disk (`Dirty` plus `Writeback`) is under `below_kib`,
+/// or until `cap_ms` have passed since `start_ms`; `true` if it drained, `false` if the cap came
+/// first, and the caller then reads the window as it is. `poll` lets time pass and gives the
+/// caller's monotonic clock in milliseconds; it is not called when the memory is drained at the
+/// first read.
+///
+/// This is what lets the pass that just ended finish landing on its disks (the kernel holds dirty
+/// pages for up to thirty seconds) before the quiet window opens.
 ///
 /// # Errors
-/// [`BenchError`] as [`Reader::read`].
+/// [`BenchError::Io`] if `meminfo` cannot be read, [`BenchError::Request`] if it has no such
+/// figures.
 pub fn wait_for_writeback(
-    _proc_root: &Path,
-    _below_kib: u64,
-    _cap_ms: u64,
-    _start_ms: u64,
-    _poll: impl FnMut() -> u64,
+    proc_root: &Path,
+    below_kib: u64,
+    cap_ms: u64,
+    start_ms: u64,
+    mut poll: impl FnMut() -> u64,
 ) -> Result<bool, BenchError> {
-    Ok(true)
+    loop {
+        let pending =
+            parse_dirty_writeback_kib(&read_text(proc_root, "meminfo")?).ok_or_else(unreadable)?;
+        if pending < below_kib {
+            return Ok(true);
+        }
+        if poll().saturating_sub(start_ms) >= cap_ms {
+            return Ok(false);
+        }
+    }
 }
 
 /// The text of `relative` under `proc_root`.
