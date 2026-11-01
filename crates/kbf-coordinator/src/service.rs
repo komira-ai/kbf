@@ -173,10 +173,11 @@ pub struct Status {
 
 /// The features this coordinator advertises to an agent that announces `agent_features`.
 ///
-/// Each name is added in the change that implements what it names (`heartbeat-v2`,
-/// `deferred-v1`, `halt-v1`), so a name is never advertised for behaviour that is not there.
-/// Now: `halt-v1`, the clear generations of [`crate::halt`].
-pub const FEATURES: &[&str] = &[halt::FEATURE];
+/// Each name is added in the change that implements what it names (`deferred-v1`, `halt-v1`;
+/// `heartbeat-v2` follows), so a name is never advertised for behaviour that is not there.
+/// `deferred-v1`: a heartbeat's `deferred` report ends the order, holds no slot and backs the
+/// host off ([`crate::defer`]). `halt-v1`: the clear generations of [`crate::halt`].
+pub const FEATURES: &[&str] = &["deferred-v1", halt::FEATURE];
 
 /// The coordinator.
 pub struct Coordinator {

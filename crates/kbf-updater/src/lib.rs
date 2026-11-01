@@ -89,6 +89,8 @@ mod server_tests;
 #[cfg(test)]
 mod testutil;
 #[cfg(test)]
+mod updater_cordon_tests;
+#[cfg(test)]
 mod updater_drain_tests;
 #[cfg(test)]
 mod updater_followup_tests;

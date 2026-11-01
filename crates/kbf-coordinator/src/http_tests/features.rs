@@ -179,11 +179,35 @@ async fn a_heartbeat_with_every_new_fact_is_accepted_and_ordered_as_without_them
     );
 }
 
-/// Catches: the unit test of the advertised set going vacuous: every name the coordinator
-/// advertises must be handled, and a name is added in the change that handles it. `halt-v1`
-/// is handled by `http_tests/halt.rs`.
-#[test]
-fn advertised_features_equal_the_handled_set() {
-    let handled: &[&str] = &["halt-v1"];
-    assert_eq!(FEATURES, handled);
+/// Catches: the advertised set going vacuous: every name the coordinator advertises must be
+/// handled, and a name is added in the change that handles it. For each advertised name the
+/// heartbeat that uses it is answered differently from the same heartbeat without it, and
+/// the table of what uses a name has no entry for a name that is not advertised.
+#[tokio::test]
+async fn advertised_features_equal_the_handled_set() {
+    let uses = std::collections::BTreeMap::from([
+        (
+            "deferred-v1",
+            r#","deferred":{"target":"2.0","reason":"drain_bound","retry_after_secs":300}"#,
+        ),
+        // A halt report: the host that makes it is ordered nothing, where the host without
+        // it is ordered the update. It is the last name, since the halt stands afterwards.
+        (
+            "halt-v1",
+            r#","last_update":{"target":"2.0","outcome":"failed","phase":"halt","reason":"tainted"}"#,
+        ),
+    ]);
+    let announced = FEATURES.join(r#"",""#);
+    let announce = format!(r#","agent_features":["{announced}"]"#);
+    let rig = rig("http-features-handled", FEATURES).await;
+    let mut proven = Vec::new();
+    for name in FEATURES {
+        let without = beat_text(&rig, "d1", "daemon", &beat("1.0", &announce)).await;
+        let with_it = beat("1.0", &format!("{announce}{}", uses[name]));
+        let with = beat_text(&rig, "d2", "daemon", &with_it).await;
+        assert_ne!(with, without, "{name} changes nothing");
+        proven.push(*name);
+    }
+    let handled: Vec<&str> = uses.keys().copied().collect();
+    assert_eq!(proven, handled);
 }
