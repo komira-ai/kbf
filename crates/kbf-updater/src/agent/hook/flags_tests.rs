@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use super::flags::split;
+use super::flags::{FlagsError, split};
 
 fn args(line: &str) -> Vec<String> {
     line.split_whitespace().map(str::to_owned).collect()
@@ -14,6 +14,10 @@ const BASE: &str =
     "--record-dir /var/lib/hook --channel stable --client-cert /c --client-key /k --ca /ca";
 
 fn refusal(line: &str) -> String {
+    split(&args(line)).map(|_| ()).unwrap_err().to_string()
+}
+
+fn kind(line: &str) -> FlagsError {
     split(&args(line)).map(|_| ()).unwrap_err()
 }
 
@@ -148,4 +152,62 @@ fn flags_that_are_wrong_are_refused_by_name() {
     );
     assert!(refusal(&format!("{BASE} --retry-secs")).contains("needs a value"));
     assert!(refusal(&format!("{BASE} --unknown 1 prepare")).contains("unknown argument --unknown"));
+}
+
+/// Each refusal is of its own kind, so a caller can tell them apart without reading the text:
+/// the kind and the flag it names, for one command line of each.
+///
+/// Catches: a refusal reported as the wrong kind (a missing flag as a bad value), or a kind
+/// that names another flag than the one that is wrong.
+#[test]
+fn each_refusal_is_of_its_own_kind() {
+    assert_eq!(
+        kind("--channel stable --client-cert /c --client-key /k --ca /ca prepare"),
+        FlagsError::Required {
+            flag: "--record-dir"
+        }
+    );
+    assert_eq!(
+        kind("--record-dir /r --client-cert /c --client-key /k --ca /ca prepare"),
+        FlagsError::Required { flag: "--channel" }
+    );
+    assert_eq!(
+        kind("--record-dir /r --channel Stable --client-cert /c --client-key /k --ca /ca x"),
+        FlagsError::Channel
+    );
+    assert_eq!(
+        kind("--record-dir /r --channel stable prepare"),
+        FlagsError::Tls
+    );
+    assert!(matches!(
+        kind(&format!("{BASE} --frontend nonsense prepare")),
+        FlagsError::Frontend(_)
+    ));
+    assert_eq!(
+        kind(&format!("{BASE} --token-file /t prepare")),
+        FlagsError::OperatorApiAlone
+    );
+    assert!(matches!(
+        kind(&format!(
+            "{BASE} --operator-api http://example.com:1 --token-file /t prepare"
+        )),
+        FlagsError::OperatorApi(_)
+    ));
+    assert_eq!(
+        kind(&format!("{BASE} --daemon-node Not_A_Label prepare")),
+        FlagsError::DaemonNode
+    );
+    for line in [
+        format!("{BASE} --drain-deadline-secs 0 prepare"),
+        format!("{BASE} --health-poll-secs 0 prepare"),
+    ] {
+        assert!(matches!(kind(&line), FlagsError::Seconds(_)), "{line}");
+    }
+    for line in [
+        format!("{BASE} --unknown 1 prepare"),
+        format!("{BASE} --retry-secs"),
+        format!("{BASE} --retry-secs 5 --retry-secs 6 prepare"),
+    ] {
+        assert!(matches!(kind(&line), FlagsError::Unreadable(_)), "{line}");
+    }
 }

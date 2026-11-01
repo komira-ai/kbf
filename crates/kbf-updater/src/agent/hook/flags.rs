@@ -54,6 +54,40 @@ const FLAGS: [&str; 16] = [
     "--retry-secs",
 ];
 
+/// Why the flags before the step were refused. The text names the flag; it is the `detail`
+/// of the step's last line (`bad_arguments`).
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum FlagsError {
+    /// An argument the agent's own reader refused: one that is no flag of the hook, a flag
+    /// without a value, a flag given twice.
+    #[error("{0}")]
+    Unreadable(String),
+    /// A flag the hook cannot run without.
+    #[error("{flag} is required")]
+    Required { flag: &'static str },
+    /// `--channel` is not a channel name.
+    #[error("--channel must be a channel name: [a-z0-9][a-z0-9-]{{0,31}}")]
+    Channel,
+    /// Neither the enrollment directory nor all three files, or both.
+    #[error("give --enrollment-dir, or all of --client-cert, --client-key and --ca (and not both)")]
+    Tls,
+    /// `--frontend` is not `<dns name>:<port>`.
+    #[error("--frontend: {0}")]
+    Frontend(String),
+    /// `--operator-api` is not a loopback `http://IP:PORT`; the text says how.
+    #[error("{0}")]
+    OperatorApi(String),
+    /// One of `--operator-api` and `--token-file` without the other.
+    #[error("--operator-api and --token-file are given together, or not at all")]
+    OperatorApiAlone,
+    /// `--daemon-node` is not a node id.
+    #[error("--daemon-node must be a node id: a DNS label")]
+    DaemonNode,
+    /// A number of seconds out of its range; the text names the flag and the range.
+    #[error("{0}")]
+    Seconds(String),
+}
+
 /// The settings of one hook run.
 #[derive(Clone, Debug)]
 pub struct Flags {
@@ -75,8 +109,8 @@ pub struct Flags {
 /// an `=`); the first word that does not is the step.
 ///
 /// # Errors
-/// What is wrong with the flags, in a line.
-pub fn split(args: &[String]) -> Result<(Flags, &[String]), String> {
+/// What is wrong with the flags, by kind ([`FlagsError`]).
+pub fn split(args: &[String]) -> Result<(Flags, &[String]), FlagsError> {
     let mut at = 0;
     while let Some(word) = args.get(at).filter(|w| w.starts_with("--")) {
         at += if word.contains('=') { 1 } else { 2 };
@@ -85,17 +119,13 @@ pub fn split(args: &[String]) -> Result<(Flags, &[String]), String> {
     Ok((parse(flags)?, rest))
 }
 
-fn parse(args: &[String]) -> Result<Flags, String> {
-    let mut found = collect(args, &FLAGS)?;
-    let mut take = |flag: &str| {
-        found
-            .remove(flag)
-            .ok_or_else(|| format!("{flag} is required"))
-    };
+fn parse(args: &[String]) -> Result<Flags, FlagsError> {
+    let mut found = collect(args, &FLAGS).map_err(FlagsError::Unreadable)?;
+    let mut take = |flag: &'static str| found.remove(flag).ok_or(FlagsError::Required { flag });
     let record_dir = PathBuf::from(take("--record-dir")?);
     let channel = take("--channel")?;
     if !channel_ok(&channel) {
-        return Err("--channel must be a channel name: [a-z0-9][a-z0-9-]{0,31}".to_owned());
+        return Err(FlagsError::Channel);
     }
     let files = tls_files(
         found
@@ -108,26 +138,22 @@ fn parse(args: &[String]) -> Result<Flags, String> {
             found.remove("--ca"),
         ],
     )
-    .map_err(|why| why.replace("--state-dir", "--enrollment-dir"))?;
+    .map_err(|_| FlagsError::Tls)?;
     let frontend = found
         .remove("--frontend")
-        .map(|text| Endpoint::parse(&text).map_err(|why| format!("--frontend: {why}")))
+        .map(|text| Endpoint::parse(&text).map_err(FlagsError::Frontend))
         .transpose()?;
     let node_api = match (found.remove("--operator-api"), found.remove("--token-file")) {
         (Some(api), Some(token)) => Some(NodeApi {
-            addr: parse_operator_url(&api)?,
+            addr: parse_operator_url(&api).map_err(FlagsError::OperatorApi)?,
             token_file: PathBuf::from(token),
         }),
         (None, None) => None,
-        _ => {
-            return Err(
-                "--operator-api and --token-file are given together, or not at all".to_owned(),
-            );
-        }
+        _ => return Err(FlagsError::OperatorApiAlone),
     };
     let daemon_node = found.remove("--daemon-node");
     if daemon_node.as_deref().is_some_and(|id| !valid_node_id(id)) {
-        return Err("--daemon-node must be a node id: a DNS label".to_owned());
+        return Err(FlagsError::DaemonNode);
     }
     let cordon_dir = found
         .remove("--cordon-dir")
@@ -137,7 +163,8 @@ fn parse(args: &[String]) -> Result<Flags, String> {
         .map_or_else(|| PathBuf::from(DEFAULT_HELPER_SOCKET), PathBuf::from);
     let mut timing = Timing::DEFAULT;
     if let Some(text) = found.remove("--drain-deadline-secs") {
-        timing.drain_deadline = Some(drain_secs("--drain-deadline-secs", &text)?);
+        timing.drain_deadline =
+            Some(drain_secs("--drain-deadline-secs", &text).map_err(FlagsError::Seconds)?);
     }
     for (flag, slot) in [
         ("--health-timeout-secs", &mut timing.health_timeout),
@@ -145,7 +172,7 @@ fn parse(args: &[String]) -> Result<Flags, String> {
         ("--retry-secs", &mut timing.retry),
     ] {
         if let Some(text) = found.remove(flag) {
-            *slot = secs(flag, &text)?;
+            *slot = secs(flag, &text).map_err(FlagsError::Seconds)?;
         }
     }
     Ok(Flags {
