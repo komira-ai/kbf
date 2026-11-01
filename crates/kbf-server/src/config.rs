@@ -1,6 +1,7 @@
 //! Command-line flags. Every setting is a flag; the only environment variables read are
 //! the standard S3 key pair, `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (a secret
-//! never goes on the command line). Where the server keeps its bytes is two store URIs
+//! never goes on the command line), and only when `--cold-store-credentials-file` names no
+//! file: they are deprecated. Where the server keeps its bytes is two store URIs
 //! and, sometimes, one directory ([`crate::stores`]): `--cold-store`, `--hot-store`,
 //! `--meta-dir`.
 
@@ -76,6 +77,15 @@ pub struct Args {
     /// a `file://` path on a tmpfs is one.
     #[arg(long, value_name = "URI")]
     pub cold_store: Option<StoreUri>,
+    /// The key pair of an `s3://` `--cold-store`, in a file: JSON
+    /// `{"access_key_id": "...", "secret_access_key": "..."}`, a regular file (a symbolic
+    /// link is refused) that the server's user owns and no one else can read (mode 0600 or
+    /// 0400). The secret is never a flag: a command line is world-readable. Without it the
+    /// key pair is read from `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, which is
+    /// deprecated: the start logs one warning and a later release refuses the variables.
+    /// A `file://` cold store has no keys, so the server refuses the flag with one.
+    #[arg(long, value_name = "PATH", requires = "cold_store")]
+    pub cold_store_credentials_file: Option<PathBuf>,
     /// The fast tier in front of the cold store: `file:///absolute/path`, a directory
     /// on an SSD (or a tmpfs). Uploads land there and are flushed to the cold store in
     /// the background; reads are served from it while a blob is still there. Its
@@ -694,7 +704,7 @@ pub struct Args {
         long,
         value_name = "URI",
         value_parser = crate::state_store::StateStoreParser,
-        display_order = 5,
+        display_order = 6,
     )]
     pub state_store: Option<crate::state_store::StateStoreUri>,
     /// How long, in seconds, a storage node's membership row lives without a heartbeat
@@ -768,6 +778,20 @@ pub enum ConfigError {
     /// An S3 setting is missing from the environment.
     #[error("{0} must be set for an s3:// store")]
     MissingEnv(&'static str),
+    /// The key file of `--cold-store-credentials-file` is refused. `why` never holds a byte
+    /// of the file.
+    #[error("--cold-store-credentials-file {}: {why}", path.display())]
+    ColdKeyFile {
+        /// The file.
+        path: PathBuf,
+        /// What is wrong with it.
+        why: String,
+    },
+    /// `--cold-store-credentials-file` with a cold store that is not `s3://`.
+    #[error(
+        "--cold-store-credentials-file needs an s3:// --cold-store: a file:// store has no keys"
+    )]
+    ColdKeyFileOnFileStore,
     /// The S3 configuration is refused.
     #[error(transparent)]
     S3(#[from] S3ConfigError),
