@@ -78,6 +78,7 @@ pub(crate) fn render_farm(out: &mut String, farm: &Farm) {
         ablation.render(out, &counters);
     }
     farm.failed_actions().render(out);
+    farm.refusals().render(out);
 }
 
 /// What a scrape reads: the cache, and the extras.

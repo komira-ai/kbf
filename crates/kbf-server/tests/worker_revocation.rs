@@ -15,9 +15,10 @@ use kbf_enroll::config::{Config, Host};
 use kbf_enroll::pin::Anchor;
 use kbf_enroll::store::Store as NodeStore;
 use kbf_proto::kbf::enroll::v1::NodeFacts;
+use kbf_proto::update::UpdateStatus;
 use kbf_proto::worker::{
-    Capability, DaemonMessage, Heartbeat, Hello, ServerMessage, daemon_message, server_message,
-    worker_client::WorkerClient,
+    Capability, DaemonMessage, Heartbeat, Hello, LeaseId, MapRequest, NodeStatus, ServerMessage,
+    daemon_message, server_message, worker_client::WorkerClient,
 };
 use kbf_server::api_client::OperatorClient;
 use kbf_server::enroll::api::TOKENS;
@@ -147,6 +148,7 @@ impl Farm {
         tokio::task::spawn_blocking(move || {
             let reply = match method {
                 "POST" => client.post(&path, body),
+                "GET" => client.get(&path),
                 _ => client.delete(&path),
             }
             .expect("the API answers");
@@ -260,6 +262,10 @@ fn identity_of(cert: &Path, key: &Path) -> Identity {
 }
 
 fn hello(node: &str) -> daemon_message::Message {
+    hello_with_cpus(node, "1")
+}
+
+fn hello_with_cpus(node: &str, cpus: &str) -> daemon_message::Message {
     let entry = |key: &str, value: &str| Capability {
         key: key.to_owned(),
         value: value.to_owned(),
@@ -270,7 +276,7 @@ fn hello(node: &str) -> daemon_message::Message {
         capabilities: vec![
             entry("os", "linux"),
             entry("arch", "x86_64"),
-            entry("cpus", "1"),
+            entry("cpus", cpus),
             entry("mem_gib", "1"),
             entry("drivers", "fake"),
         ],
@@ -303,6 +309,90 @@ impl Session {
         timeout(PROMPT, self.inbound.message())
             .await
             .expect("an answer or an end in time")
+    }
+}
+
+impl Session {
+    /// Sends `message`, then a heartbeat behind it, and reads the server's side until the
+    /// first of: the stream ends (the status), or the heartbeat is acknowledged (`None`). The
+    /// messages in between are returned. The stream is read in order, so when the heartbeat
+    /// has been answered `message` has been handled, and when the stream ended it ended at
+    /// `message` or at the heartbeat: which of the two is told by the refusal counts
+    /// ([`Farm::refused`]), not by this.
+    async fn ended_by(
+        mut self,
+        message: daemon_message::Message,
+    ) -> (Vec<ServerMessage>, Option<Status>) {
+        send(&self.tx, message);
+        // The stream may be closed by now: that is the answer, not an error.
+        let _ = self.tx.unbounded_send(DaemonMessage {
+            message: Some(daemon_message::Message::Heartbeat(Heartbeat {
+                seq: 99,
+                ..Heartbeat::default()
+            })),
+        });
+        let mut seen = Vec::new();
+        loop {
+            match self.inbound.message().await {
+                Ok(Some(ServerMessage {
+                    message: Some(server_message::Message::HeartbeatAck(_)),
+                })) => return (seen, None),
+                Ok(Some(reply)) => seen.push(reply),
+                Ok(None) => panic!("the stream ended cleanly: {seen:?}"),
+                Err(status) => return (seen, Some(status)),
+            }
+        }
+    }
+
+    /// Sends `message`, then a heartbeat, and waits for its acknowledgement: by then the
+    /// server has handled `message`, which the stream reads in order.
+    async fn handled(&mut self, message: daemon_message::Message, seq: u64) {
+        send(&self.tx, message);
+        let acked = self.heartbeat(seq).await;
+        assert!(
+            matches!(
+                acked,
+                Ok(Some(ServerMessage {
+                    message: Some(server_message::Message::HeartbeatAck(_))
+                }))
+            ),
+            "{acked:?}"
+        );
+    }
+}
+
+impl Farm {
+    /// `GET /v1/nodes/{node}`, as JSON.
+    async fn node(&self, node: &str) -> serde_json::Value {
+        let (status, body) = self.call("GET", format!("/v1/nodes/{node}"), "").await;
+        assert_eq!(status, 200, "{body}");
+        serde_json::from_str(&body).expect("JSON")
+    }
+
+    /// The refusal counts on `/metrics`, by message kind.
+    async fn refused(&self) -> std::collections::BTreeMap<String, u64> {
+        let (status, body) = self.call("GET", "/metrics".to_owned(), "").await;
+        assert_eq!(status, 200, "{body}");
+        let prefix = "kbf_worker_admission_refused_total{message=\"";
+        body.lines()
+            .filter_map(|line| line.strip_prefix(prefix))
+            .map(|rest| {
+                let (kind, count) = rest.split_once("\"} ").expect("a sample");
+                (kind.to_owned(), count.parse().expect("a count"))
+            })
+            .collect()
+    }
+
+    /// Enrolls `node`, opens its session, makes sure it is heard, and revokes it.
+    async fn revoked(&self, node: &str) -> Session {
+        let identity = self.enrolled(node).await;
+        let mut open = self.session(&identity, node).await.expect("admitted");
+        assert!(matches!(open.heartbeat(1).await, Ok(Some(_))));
+        let (status, body) = self
+            .call("POST", format!("/v1/enroll/nodes/{node}/revoke"), "")
+            .await;
+        assert_eq!(status, 200, "{body}");
+        open
     }
 }
 
@@ -370,4 +460,122 @@ async fn taking_a_revoked_node_off_the_deny_list_readmits_it() {
     }
     let session = farm.session(&node, "node-07").await;
     assert!(session.is_ok(), "readmitted: {:?}", session.err());
+}
+
+fn assert_denied(ended: Option<Status>) {
+    let status = ended.expect("the stream ended");
+    assert_eq!(status.code(), Code::PermissionDenied, "{status:?}");
+}
+
+/// Asserts that the worker listener refused exactly one message, of kind `message`: the
+/// one the test sent, not the heartbeat behind it.
+async fn assert_refused_once(farm: &Farm, message: &str) {
+    let counts = farm.refused().await;
+    let expected = [
+        "hello",
+        "heartbeat",
+        "result",
+        "node_status",
+        "map_request",
+        "update_status",
+    ]
+    .map(|kind| (kind.to_owned(), u64::from(kind == message)));
+    assert_eq!(counts, expected.into_iter().collect(), "refusals");
+}
+
+/// A revoked node's `Result` is refused before the farm sees it: the stream ends
+/// PERMISSION_DENIED and no `ResultAck` follows. The farm answers a `Result` for a lease it
+/// does not hold with a refusing `ResultAck`, so an acknowledgement here would mean the
+/// result reached it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_revoked_nodes_result_is_refused_and_never_reaches_the_farm() {
+    let farm = Farm::start("result", &[]).await;
+    let open = farm.revoked("node-07").await;
+    let result = kbf_proto::worker::Result {
+        lease_id: Some(LeaseId { term: 1, seq: 1 }),
+        ..kbf_proto::worker::Result::default()
+    };
+    let (seen, ended) = open.ended_by(daemon_message::Message::Result(result)).await;
+    assert_denied(ended);
+    assert_refused_once(&farm, "result").await;
+    assert!(seen.is_empty(), "{seen:?}");
+}
+
+/// A revoked node's `NodeStatus` is refused and leaves the node's view as it was (no
+/// software status), while the same message from a node that is not revoked is kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_revoked_nodes_node_status_does_not_reach_the_node_view() {
+    let farm = Farm::start("node-status", &[]).await;
+    let status = || {
+        daemon_message::Message::NodeStatus(NodeStatus {
+            os_name: "Ubuntu".to_owned(),
+            ..NodeStatus::default()
+        })
+    };
+    let other = farm.enrolled("node-08").await;
+    let mut fine = farm.session(&other, "node-08").await.expect("not revoked");
+    fine.handled(status(), 1).await;
+    assert!(!farm.node("node-08").await["software"].is_null());
+
+    let open = farm.revoked("node-07").await;
+    let (seen, ended) = open.ended_by(status()).await;
+    assert_denied(ended);
+    assert_refused_once(&farm, "node_status").await;
+    assert!(seen.is_empty(), "{seen:?}");
+    assert!(farm.node("node-07").await["software"].is_null());
+}
+
+/// A revoked node's `UpdateStatus` is refused: the stream ends PERMISSION_DENIED at it, which
+/// the refusal count shows (the heartbeat behind it is never read).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_revoked_nodes_update_status_is_refused() {
+    let farm = Farm::start("update-status", &[]).await;
+    let open = farm.revoked("node-07").await;
+    let status = UpdateStatus {
+        running_commit: "abc".to_owned(),
+        ..UpdateStatus::default()
+    };
+    let (seen, ended) = open
+        .ended_by(daemon_message::Message::UpdateStatus(status))
+        .await;
+    assert_denied(ended);
+    assert_refused_once(&farm, "update_status").await;
+    assert!(seen.is_empty(), "{seen:?}");
+}
+
+/// A revoked node's `MapRequest` is refused: the stream ends PERMISSION_DENIED at it, which
+/// the refusal count shows. This frontend holds no map yet, so an admitted request would be
+/// answered with nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_revoked_nodes_map_request_is_refused() {
+    let farm = Farm::start("map-request", &[]).await;
+    let open = farm.revoked("node-07").await;
+    let (seen, ended) = open
+        .ended_by(daemon_message::Message::MapRequest(MapRequest {
+            at_least: 1,
+        }))
+        .await;
+    assert_denied(ended);
+    assert_refused_once(&farm, "map_request").await;
+    assert!(seen.is_empty(), "{seen:?}");
+}
+
+/// A revoked node's resent `Hello` does not resize the node: its capacity stays what its
+/// first `Hello` reported, while the same resent `Hello` from a node that is not revoked
+/// changes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_revoked_nodes_resent_hello_does_not_resize_the_node() {
+    let farm = Farm::start("resent-hello", &[]).await;
+    let other = farm.enrolled("node-08").await;
+    let mut fine = farm.session(&other, "node-08").await.expect("not revoked");
+    assert_eq!(farm.node("node-08").await["capacity"]["cpu_millis"], 1000);
+    fine.handled(hello_with_cpus("node-08", "3"), 1).await;
+    assert_eq!(farm.node("node-08").await["capacity"]["cpu_millis"], 3000);
+
+    let open = farm.revoked("node-07").await;
+    let (seen, ended) = open.ended_by(hello_with_cpus("node-07", "3")).await;
+    assert_denied(ended);
+    assert_refused_once(&farm, "hello").await;
+    assert!(seen.is_empty(), "{seen:?}");
+    assert_eq!(farm.node("node-07").await["capacity"]["cpu_millis"], 1000);
 }

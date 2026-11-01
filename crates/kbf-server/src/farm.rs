@@ -171,6 +171,8 @@ pub struct Farm {
     shapes: Shapes,
     /// `Result`s being taken now ([`Farm::report`]): a handover waits for none to be.
     reports: AtomicUsize,
+    /// The messages the worker listener refused on open streams ([`crate::worker_refusals`]).
+    refusals: crate::worker_refusals::Refusals,
     /// Where the wall clock and the process term come from.
     ambient: Ambient,
     /// What the `with_*` builders set.
@@ -323,6 +325,7 @@ impl Farm {
             epoch_unix_ms,
             shapes: Shapes::default(),
             reports: AtomicUsize::new(0),
+            refusals: crate::worker_refusals::Refusals::default(),
             ambient,
             settings: Settings::default(),
             usage_profiles: crate::UsageProfiles::default(),
@@ -621,6 +624,16 @@ impl Farm {
             debug_assert!(none.is_empty(), "a capacity change has no effect: {none:?}");
             state.phase(now, worker, reported.phase);
         }
+    }
+
+    /// Counts a message the worker listener refused on an open stream.
+    pub(crate) fn note_refused(&self, message: crate::worker_refusals::Message) {
+        self.refusals.note(message);
+    }
+
+    /// The refusals counted so far.
+    pub(crate) const fn refusals(&self) -> &crate::worker_refusals::Refusals {
+        &self.refusals
     }
 
     /// A `NodeStatus` on `stream`: kept as the worker's newest, unless `stream` was
