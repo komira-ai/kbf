@@ -144,11 +144,7 @@ fn buck2_in_a_build_step_is_named() {
 fn a_remote_execution_flag_on_a_build_is_named() {
     // Catches: a remote-execution flag added to the cargo build.
     red(
-        &spoil_artifacts(
-            "linux-x86_64",
-            "cargo build --locked",
-            "cargo build --remote --locked",
-        ),
+        &spoil_artifacts("linux-x86_64", X86_BUILD, &format!("{X86_BUILD} --remote")),
         &["`linux-x86_64`", "--remote"],
     );
 }
@@ -186,16 +182,16 @@ fn a_build_without_locked_or_release_is_named() {
     red(
         &spoil_artifacts(
             "linux-x86_64",
-            "cargo build --locked --release",
-            "cargo build --release",
+            X86_BUILD,
+            &X86_BUILD.replace(" --locked", ""),
         ),
         &["`linux-x86_64`", "--locked"],
     );
     red(
         &spoil_artifacts(
             "darwin-arm64",
-            "cargo build --locked --release",
-            "cargo build --locked",
+            "cargo build --locked --release --target \"$TARGET\" -p kbf-cli --bin kbf",
+            "cargo build --locked --target \"$TARGET\" -p kbf-cli --bin kbf",
         ),
         &["`darwin-arm64`", "--release"],
     );
