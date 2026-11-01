@@ -96,8 +96,8 @@ so run each proxied arm once with `pass` as the control.
 
 One JSON per cell, arm and attempt (`schema_version`, see `result.rs`) and a CSV of raw samples
 with the git SHA, the binary digest, the pass index, a quiet or busy flag and the attempt on every
-row. The newer fields (`cold_state`, `cold_guard`, `provenance.attempt`) are optional on reading:
-a result written without them reads as a first attempt with no cold readings.
+row. The newer fields (`cold_state`, `cold_guard`, `cold_window`, `provenance.attempt`) are optional on
+reading: a result written without them reads as a first attempt with no cold readings.
 
 ## The ops file
 
@@ -337,34 +337,131 @@ warm-up included) and was healing in none; otherwise it prints `not labelled v1`
 that saw it healing, or the passes that have no reading. `v1` here means only that: the figures
 are still those of a test instance on test buckets.
 
-**Guard.** The tool keeps the harness's own requests to the cold role over a sliding window and
-stops the run, as the load gate does (the pass is cut and marked busy, the run ends, the results
-so far are written), when either holds:
+**Guard.** The tool stops the run, as the load gate does (the pass is cut and marked busy, the
+run ends, the results so far are written), when the cold store is used by something other than
+the harness or is not healthy. The harness's own latency is measured, not guarded: for a small
+write on an erasure-coded set of hard disks it is the quantity a cell measures, and a limit on it
+stops a measurement of a store that is quiet and merely slow. The one latency limit left is a
+backstop for a store that has stopped answering.
 
 | flag | default | trips when |
 |---|---|---|
-| `--cold-abort-p99-ms` | 2000 | the p99 latency of the window is above it, milliseconds |
+| `--cold-abort-foreign-requests` | 10 | a pass saw more than this many requests at the cold store that this tool did not send |
+| `--cold-counter-settle-secs` | 11 | (not a limit) the wait, tool silent, before each reading of the store's request counter |
 | `--cold-abort-error-share` | 0.05 | the share of the window's requests that failed or timed out is above it (0 to 1) |
-| `--cold-abort-window-secs` | 60 | the length of the window, seconds |
+| `--cold-abort-p99-ms` | 30000 | the hung-store backstop: the p99 latency of the window is above it, milliseconds |
+| `--cold-abort-window-secs` | 60 | the length of the window of the error share and the backstop, seconds |
 
-Equal to a limit is within it. The window counts one entry per request to the cold role: every
-step of the `cold` role is one, whatever its label (cell B's `.cold-direct` reads of the cold
-bucket are counted), except the `.ttfb` step of a streamed read, which is the time to the first
-byte of a request already counted and is not a second one. A window of fewer than 20 requests is not judged; with 20 to
-99 requests in it the p99 is the slowest request, so one slow request can stop the run. That is
-deliberate: it protects the farm. A failed request counts in the share and, with the time it took
-to fail, in the p99. Only requests the harness sent to the cold role are counted (steps of the
-`cold` role), and not the arms that put the cold store in a fault on purpose (the arms through the
-fault proxy other than `proxy-pass`), whose requests are meant to be slow or to fail.
+It also trips, without a flag, when a drive of the cold store is not `ok` (or none is listed) or
+the store is healing, read at the start of the run and at the end of every pass; when the
+request counter cannot be read; and when it went backwards (the store restarted).
 
-The guard does not watch the instance arms: requests to the instance are not counted, and the
-instance's own copy traffic to the cold store is throttled only by the held `COPY_PARALLEL` site
-key.
+*Requests from elsewhere.* At the start of the run and at the end of every pass (after the
+pass's requests and its hook) the tool reads the store's S3 request counter
+(`minio_s3_requests_total`, summed over its series, with `mc admin prometheus metrics` and the
+cold admin key) and its own count of requests to the cold role (every request of the request
+log, a part of a multipart upload each). The window of a pass runs from the reading before it to
+the reading after it, so setup and cleanup requests of the tool are in its count. Foreign
+requests are the growth of the counter less the tool's count, at least 0, and equal to the limit
+is within it. The counter is cached by the store for 10 s, so each reading waits
+`--cold-counter-settle-secs` with the tool silent first; a pass costs that much more. With 0 a
+reading may show the counter as it was up to 10 s before and charge a pass with its neighbour's
+requests. Default 10: a quiet store showed none in 30 s; a probe or an operator's listing may
+add a few; a job or a person at work adds far more.
 
-The trip is in the
-result, in the pass it cut (`cold_guard`: `metric` `p99_ms` or `error_share`, `value`, `limit`,
-`requests` in the window, `window_secs`), and `report` lists it under the table. The flags are
-accepted by every verb that takes the shared flags, like the load gate's.
+The tool's count can differ from the store's for reasons that are not foreign load, and neither
+can trip a quiet pass on the tool's own traffic. `objstore-s3` resends a ranged read up to
+`READ_RETRIES` (2) times inside one logged call: a failed attempt that reached the store is in
+its counter and not in the tool's count, so such a read adds up to 2 foreign requests (a few in a
+window; the limit of 10 leaves room). Foreign is the counter's growth less the tool's count,
+floored at 0, so a request of the tool that never reached the store (a refused connection) hides
+one foreign request in its window; it can only hide, never make one.
+
+The instance copies to the cold store on its own, for minutes after an instance arm's pass, and
+the tool reads no signal of when the copies end. So from the first pass that sent a request to
+the instance on, no window of the run is judged for foreign requests; the passes of an arm
+through the fault proxy and the window after one are not judged either. Those windows are
+recorded with `judged` false and the reason in `unjudged_reason` (the drives, healing, the
+counter and the error share are still judged). A missed foreign load is accepted; a trip on the
+run's own instance traffic is not. The store's request counter counts every server of the cold MinIO cluster, and the hot store is
+very likely the same cluster at another address (a NodePort answers on every node; the cold
+store is `127.0.0.1` on one node and another node's address elsewhere), so the tool counts its
+own requests per *cluster*, not per role, and decides which roles are on the cold store's
+cluster by its identity, never by comparing addresses: first the run file's `cold_cluster_roles`
+(for example `["hot"]`), which overrides everything; otherwise the deployment id that `mc admin
+info` reports for the hot and for the cold store (the ops file needs the admin key of each);
+equal ids are one cluster, different ids two. The roles counted and how it was decided are in
+`provenance.cold_server`. Requests of the hot role are in the own count when the hot store is on
+the cold store's cluster and not when it is another; either way a pass to the hot store alone is
+the tool's own traffic and is judged. If nothing decides it (no list, no admin key for the hot
+store, an answer without an id) the pass to the hot store and the window after it are not
+judged, and the reason says "the hot store's cluster could not be told apart from the cold
+store's". The instance's requests to MinIO are its copies and are never counted as the tool's.
+A pass to a role the tool cannot attribute (the fault proxy, a test silo, the generator) is
+not judged either, nor is the window after it, and its reason says so.
+
+*Running the direct arms judged.* `cold-put` interleaves its `direct`, `direct-mp` and `instance`
+arms in one run, so after the first instance pass the direct arms are all `judged: false`.
+`run --arms direct,direct-mp` restricts every selected cell to those arm families (an arm label
+is its family, then its size, width and mode: `direct-mp-4kib-c1-healthy` is of family
+`direct-mp`; the families are `direct`, `direct-mp`, `instance` of `cold-put`, `direct`,
+`instance` of `cold-read`, `hot`, `instance` of `a1`; cells B, C and G have none and cannot be
+filtered). A family no selected cell has is refused before anything is sent, and so is a filter
+that leaves a selected cell no arm, naming the cell. So run the direct arms in a run of their
+own, before the instance run, with the same `--attempt`, back to back in one window:
+
+```
+run --cell cold-put --arms direct,direct-mp --run-id w1-direct --attempt 1 ...
+run --cell cold-put --arms instance         --run-id w1-instance --attempt 1 ...
+```
+
+The filter is in `provenance.arms_filter` of every result (absent for a run of every arm) and
+`report` prints it. `report` pairs an `instance` arm with the `direct-mp` arm of the same size,
+width and mode and the same attempt, also when they are in result files of two runs; it then
+says the arms came from two runs, not interleaved, which is a weaker comparison than an
+interleaved one: a drift of the cold store between the runs is not controlled for. Arms of
+different attempts are not paired. A run with no cold admin key (heal status file mode) has no
+counter: the guard then keeps to the error share and the backstop, and the health reading is the
+one before each pass.
+
+*The window.* The error share and the backstop look at the harness's own requests to the cold
+role over a sliding window. Equal to a limit is within it. The window counts one entry per
+request to the cold role: every step of the `cold` role is one, whatever its label (cell B's
+`.cold-direct` reads of the cold bucket are counted), except the `.ttfb` step of a streamed
+read, which is the time to the first byte of a request already counted and is not a second one. A
+window of fewer than 20 requests is not judged; with 20 to 99 requests in it the p99 is the
+slowest request, so one request over the backstop can stop the run. A failed request counts in
+the share and, with the time it took to fail, in the p99. Only requests the harness sent to the
+cold role are counted (steps of the `cold` role), and not the arms that put the cold store in a
+fault on purpose (the arms through the fault proxy other than `proxy-pass`), whose requests are
+meant to be slow or to fail.
+
+The guard does not watch the instance arms' requests to the instance; the instance's own copy
+traffic to the cold store is throttled only by the held `COPY_PARALLEL` site key.
+
+The trip is in the result, in the pass it cut (`cold_guard`: `metric` one of `foreign_requests`,
+`drives`, `healing`, `counter`, `unreadable`, `error_share`, `p99_ms`; `value`, `limit`,
+`requests` in the window, `window_secs`, and `detail`, the numbers in words), and `report` lists
+it under the table. The abort line names the condition and its numbers, for example
+
+```
+cold store guard: foreign_requests is 25, over the limit 10: the store counted 65 S3 requests over the pass and this tool sent 40, so 25 came from elsewhere
+cold store guard: drives is 1, over the limit 0: 1 of 12 drives are not ok: ["offline"]
+cold store guard: p99_ms is 31000, over the limit 30000: the hung-store backstop: the p99 of the 20 requests this tool sent over the last 60 s
+```
+
+Every pass of a run with a counter records what the guard read, so the paper can show the window
+was quiet (`cold_window`):
+
+```json
+"cold_window": {"minio_requests": 40, "own_requests": 40, "foreign_requests": 0, "judged": true,
+                "drives": 12, "drives_not_ok": 0, "healing": false}
+```
+
+`minio_requests` is the growth of the store's counter over the window, `own_requests` the tool's
+count over the same window, `judged` false for a pass that was recorded and not judged (above).
+`report` prints the same under the table. The flags are accepted by every verb that takes the
+shared flags, like the load gate's.
 
 `report --result-dir DIR` prints one table per cell: per arm, attempt and window, requests, failures
 with their time to failure, p50 and p95 with a bootstrap interval, p99 where it may be claimed, the
