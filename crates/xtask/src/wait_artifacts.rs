@@ -73,6 +73,9 @@ pub struct Args {
     /// The most looks at the run (the default is an hour at the default interval).
     #[arg(long, default_value_t = 240)]
     pub polls: u32,
+    /// The further looks after every job has finished, for an artifact that is not listed yet.
+    #[arg(long, default_value_t = 8)]
+    pub grace_polls: u32,
     /// The `gh` program.
     #[arg(long, default_value = "gh")]
     pub gh: PathBuf,
