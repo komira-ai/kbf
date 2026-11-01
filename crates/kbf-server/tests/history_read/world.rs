@@ -23,6 +23,7 @@ use kbf_server::history::{Options, over};
 use kbf_server::{EpochPolicy, StateStore};
 use kbf_state::Store;
 use prost::Message as _;
+use tokio::sync::Notify;
 
 use crate::pages::{
     Server, cached, digest, finished, granted, hit, later, listing, queued, started,
@@ -48,6 +49,8 @@ pub struct ObjectsInner {
     /// Reads that start at the first byte (a whole chunk) fail.
     fail_chunk_reads: AtomicBool,
     puts: AtomicU64,
+    /// Woken whenever a write is asked of the store.
+    attempted: Notify,
     /// Writes asked of the store, whatever they answered.
     put_attempts: AtomicU64,
     gets: AtomicU64,
@@ -64,6 +67,7 @@ impl Objects {
             fail_gets: AtomicBool::new(false),
             fail_chunk_reads: AtomicBool::new(false),
             puts: AtomicU64::new(0),
+            attempted: Notify::new(),
             put_attempts: AtomicU64::new(0),
             gets: AtomicU64::new(0),
         }))
@@ -94,13 +98,7 @@ impl Objects {
     /// Waits until the writer has asked the store for a write: it has cut a chunk and
     /// tried to put it, so what the server does next comes after the cut.
     pub async fn put_attempted(&self) {
-        for _ in 0..500 {
-            if self.put_attempts() > 0 {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        panic!("the writer never tried to write a chunk");
+        until(&self.0.attempted, || self.put_attempts() > 0).await;
     }
 
     /// Reads asked of the store, whatever they answered.
@@ -121,6 +119,7 @@ impl ObjectStore for Objects {
         retain_until: Option<SystemTime>,
     ) -> Result<(), ObjectStoreError> {
         self.0.put_attempts.fetch_add(1, Ordering::SeqCst);
+        self.0.attempted.notify_waiters();
         if self.0.fail_puts.load(Ordering::SeqCst) {
             return Err(ObjectStoreError::Protocol("planted failure".into()));
         }
@@ -155,6 +154,20 @@ impl ObjectStore for Objects {
         max_keys: PageSize,
     ) -> Result<ListPage, ObjectStoreError> {
         self.0.memory.list(prefix, after, max_keys).await
+    }
+}
+
+/// Waits until `done` holds, re-checking it each time `changed` is woken. The wait is
+/// registered before `done` is read, so a wake between the read and the wait is not lost.
+pub async fn until(changed: &Notify, mut done: impl FnMut() -> bool) {
+    loop {
+        let woken = changed.notified();
+        tokio::pin!(woken);
+        woken.as_mut().enable();
+        if done() {
+            return;
+        }
+        woken.await;
     }
 }
 
@@ -230,18 +243,15 @@ impl World {
     /// counted: its chunks and their rows are in the stores.
     pub async fn flushed(&self, inv: &str, records: u64) {
         let prefix = IndexRoot::default().header_rows(&InvKey::from_record_id(inv));
-        for _ in 0..500 {
+        until(&self.state.written, || {
             // Each writer keeps a header row of its own: the records are the sum.
             let counted: u64 = (self.state.fake.scan_prefix(&prefix).expect("a read").iter())
                 .filter_map(|(_, row)| InvocationHeader::decode(row.value.as_slice()).ok())
                 .map(|h| h.runs + h.hits)
                 .sum();
-            if counted >= records {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        panic!("{inv} never reached {records} records in the index");
+            counted >= records
+        })
+        .await;
     }
 
     /// The header row of `inv`.
