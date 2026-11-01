@@ -1189,7 +1189,7 @@ fn stated(class: Class, reversible: bool) -> Report {
 
 /// A `cleanup` that fails and states `reversible: true` has committed nothing: the updater runs
 /// `rollback`, and the host's result is the rollback's outcome. It does not retry first, and it
-/// is not Failed(after_commit).
+/// is not Failed(after_commit): the result is Failed(before_commit) with the cleanup's class.
 #[test]
 fn a_failed_cleanup_that_states_reversible_true_is_rolled_back() {
     assert_eq!(
@@ -1199,7 +1199,7 @@ fn a_failed_cleanup_that_states_reversible_true_is_rolled_back() {
             &stated(RELEASE, true),
             &ctx(false, true, false)
         ),
-        rollback_then(failed(Phase::GateRelease, RELEASE))
+        rollback_then(failed(Phase::BeforeCommit, RELEASE))
     );
     assert_eq!(
         next(
@@ -1208,7 +1208,7 @@ fn a_failed_cleanup_that_states_reversible_true_is_rolled_back() {
             &stated(ENV, true),
             &ctx(false, false, false)
         ),
-        rollback_then(failed(Phase::GateEnvironment, ENV))
+        rollback_then(failed(Phase::BeforeCommit, ENV))
     );
 }
 
