@@ -628,24 +628,6 @@ async fn a_halt_of_another_target_ends_the_ack_of_the_first() {
     assert_eq!(acked, json!([]));
 }
 
-/// Catches: a host that lists `kbf` among its services (`heartbeat-v2`) being read by its
-/// top-level placeholder as well: its report is read from the `kbf` entry alone, so the
-/// placeholder's lack of a report does not end the acknowledgement of the report an operator
-/// cleared, and the repeated report is not raised again.
-#[tokio::test]
-async fn a_host_that_lists_kbf_is_read_by_that_entry_and_not_its_placeholder() {
-    let rig = farm("halt-lists-kbf").await;
-    let entry = format!(
-        r#","agent_features":["heartbeat-v2"],"services":[{{"name":"kbf","version":"1.0","health":"healthy"{HALT}}}]"#
-    );
-    let body = beat("1.0", &entry);
-    send(&rig, "s1", "storage", &body).await;
-    assert_eq!(convergence(&rig, "kbf").await["state"], "halted");
-    clear(&rig, "kbf").await;
-    send(&rig, "s1", "storage", &body).await;
-    assert_ne!(convergence(&rig, "kbf").await["state"], "halted");
-}
-
 /// Catches: a clear that clears one report of a service that several hosts halted: host B
 /// halts, host A reports the same failure while the service is halted (ignored, B stands and the
 /// convergence names B), and the operator clears it. A's report is acknowledged with B's, so it

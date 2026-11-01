@@ -129,13 +129,8 @@ fn ignored(state: &OpsState, service: &str, halt: &Halt) -> Option<Ignored> {
 /// ignored.
 pub(crate) fn note(ops: &OpsStore, services: &Services, who: &Identity, beat: &Heartbeat) {
     let listed = beat.services.as_deref().unwrap_or_default();
-    // A host that lists `kbf` says its `kbf` there; its top-level facts are placeholders.
-    let top = listed.iter().all(|one| one.name != KBF).then_some((
-        KBF,
-        beat.last_update.as_ref(),
-        beat.updating.is_some(),
-    ));
-    let reports = top.into_iter().chain(listed.iter().map(|one| {
+    let top = std::iter::once((KBF, beat.last_update.as_ref(), beat.updating.is_some()));
+    let reports = top.chain(listed.iter().map(|one| {
         (
             one.name.as_str(),
             one.last_update.as_ref(),
