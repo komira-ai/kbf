@@ -62,9 +62,10 @@ pub struct Record {
     pub digest: String,
     /// The host runs the target already: no step has anything to do.
     pub current: bool,
-    /// Whether the node was in placement before this update's own drain. Written before the
-    /// drain, read once, never read again: it is what decides, in `rollback` and `cleanup`,
-    /// whether the node is given back.
+    /// Whether the node was in placement before this update's own drain. Read from the
+    /// frontend and written before the drain; a resumed `prepare` whose record does not say
+    /// `out` reads it again before it drains, and writes it again if it now reads `out`. It is
+    /// what decides, in `rollback` and `cleanup`, whether the node is given back.
     pub placement: Option<Was>,
     /// The drain was begun (written before it). Cleared again when the drain was refused.
     pub drain_begun: bool,

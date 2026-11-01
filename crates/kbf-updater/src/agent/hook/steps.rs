@@ -14,7 +14,9 @@
 //!
 //! Every step decides from the record ([`super::record`]), not from the order it was called in.
 //! The node is given back only when the record says it was in placement before this update's
-//! own drain, and the placement is read once, before the drain, and written before it.
+//! own drain. The placement is read before the drain and written before it; a resumed
+//! `prepare` whose record does not say `out` reads it again before it drains (an operator may
+//! have drained the node since), and a node recorded as `out` stays out.
 
 use std::fmt::Display;
 use std::io::Write;
@@ -324,8 +326,8 @@ impl<'a> Hook<'a> {
 
     /// Reads whether the node is in placement, then drains it and waits until it holds no
     /// lease, however long that takes, or until the drain deadline, if the operator set one, is
-    /// out. At that deadline nothing is switched: the step exits `75` with the node left
-    /// drained (its leases run on).
+    /// out. At that deadline nothing is switched: the hook lifts the cordon it placed itself
+    /// (an operator's cordon stays) and the step exits `75`; the leases run on.
     fn drain(&mut self) -> Result<(), Done> {
         let world = self.world;
         // The placement is read before the drain. A record that has it already is a resume: a

@@ -17,6 +17,7 @@
 //! the cordon this update placed is lifted, `retry_after_secs` is `--retry-secs`) or `76` (never: no check
 //! of this hook is one no version can repair). The log goes to standard error.
 
+pub mod fake;
 pub mod flags;
 pub mod real;
 pub mod record;
@@ -37,6 +38,8 @@ use crate::inventory::Host;
 use crate::ports::{Clock, Drain, HealthCheck};
 use crate::version::Version;
 
+#[cfg(test)]
+mod fake_tests;
 #[cfg(test)]
 mod flags_tests;
 #[cfg(test)]
@@ -67,10 +70,28 @@ pub struct HookWorld {
     pub unix_now: Arc<dyn Fn() -> u64 + Send + Sync>,
 }
 
+/// Why the world of a step could not be built: the environment's fault (exit `1`, the reason
+/// `world`, the class `environment`). The text is what the agent's own wiring says, which names
+/// the file or the flag; it is the `detail` of the step's last line.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum WorldError {
+    /// The certificate cannot be read, holds no certificate, or is no updater's.
+    #[error("{0}")]
+    Certificate(String),
+    /// The certificate names a role the updater has no duties for, or `--daemon-node` was
+    /// given on a host that is not a frontend's.
+    #[error("{0}")]
+    Host(String),
+    /// The ports cannot be made: a cordon directory that cannot be written, an operator token
+    /// that cannot be read.
+    #[error("{0}")]
+    Ports(String),
+}
+
 /// Where a run gets its world, and what it does before each write of the record.
 pub struct Setup<'a> {
     /// Builds the world the flags describe.
-    pub world: &'a dyn Fn(&Flags) -> Result<HookWorld, String>,
+    pub world: &'a dyn Fn(&Flags) -> Result<HookWorld, WorldError>,
     /// Called before every write of the record. A test stops the step here
     /// (`update_hook::conformance::gate::point`); a real run has none.
     pub before_write: Option<Gate>,
