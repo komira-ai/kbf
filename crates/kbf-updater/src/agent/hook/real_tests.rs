@@ -6,6 +6,7 @@ use std::io::{BufRead, BufReader};
 use std::net::{SocketAddr, TcpListener};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -156,16 +157,25 @@ fn a_daemon_host_is_its_certificates_node() {
     assert!(rig.frontend.all_carried(&rig.token));
 }
 
-/// The world's clock and Unix seconds are the ones it is given: a wait on the world's clock
-/// moves the given clock by exactly that much, at once, with no time passing on the system's;
-/// what the given clock reads, the world reads; the Unix seconds are the given ones.
+/// The world's clock and Unix seconds are the sources it is given, read live: a wait on the
+/// world's clock moves the given clock by exactly that much, at once, with no time passing on
+/// the system's; what the given clock reads, the world reads; and Unix seconds moved after the
+/// world was built are what the world reads next.
 ///
 /// Catches: a world that waits on the system clock whatever it is given (a test of it then
-/// sleeps for real, and one that asserts what it reads depends on how fast the host is).
+/// sleeps for real, and one that asserts what it reads depends on how fast the host is), or one
+/// that reads the Unix seconds once when it is built and keeps that value (the helper's
+/// deadline would then be measured from the start of the step, not from now).
 #[test]
 fn the_world_reads_and_waits_on_the_time_it_is_given() {
     let rig = Rig::new("hook-real-time", HostRole::DAEMON);
-    let (clock, time) = manual();
+    let clock = Arc::new(ManualClock::default());
+    let unix = Arc::new(AtomicU64::new(NOW));
+    let source = unix.clone();
+    let time = Time {
+        clock: clock.clone(),
+        unix_now: Arc::new(move || source.load(Ordering::SeqCst)),
+    };
     let world = world_at(&rig.flags, time).unwrap();
     assert_eq!(world.clock.now(), Duration::ZERO);
     clock.advance(Duration::from_secs(7));
@@ -173,6 +183,10 @@ fn the_world_reads_and_waits_on_the_time_it_is_given() {
     world.clock.sleep(Duration::from_secs(3600));
     assert_eq!(clock.now(), Duration::from_secs(3607));
     assert_eq!((world.unix_now)(), NOW);
+    unix.store(NOW + 95, Ordering::SeqCst);
+    assert_eq!((world.unix_now)(), NOW + 95);
+    unix.store(NOW + 600, Ordering::SeqCst);
+    assert_eq!((world.unix_now)(), NOW + 600);
 }
 
 /// The drain dials the frontend the flags name, and no other: with another listener up on the

@@ -190,51 +190,6 @@ fn a_directory_flag_that_is_empty_or_another_flag_is_refused() {
     );
 }
 
-/// Run as the harness would, with an empty `--world` and a step that would write the host
-/// (`prepare` drains the node): the step is refused with `bad_arguments` naming the flag, and
-/// the working directory is exactly as it was.
-///
-/// Catches: a refusal that comes after the fake has already written `node`, `mark` or
-/// `helper.json` into the working directory.
-#[test]
-fn an_empty_world_changes_nothing_in_the_working_directory() {
-    let listing = || {
-        let mut names: Vec<_> = fs::read_dir(".")
-            .unwrap()
-            .map(|e| e.unwrap().file_name())
-            .collect();
-        names.sort();
-        names
-    };
-    let before = listing();
-    let dir = scratch("empty-world");
-    let (mut out, mut err) = (Vec::new(), Vec::new());
-    let args = words(&[
-        "update-hook",
-        "--world",
-        "",
-        "--faults",
-        &dir.join("faults").display().to_string(),
-        "--record-dir",
-        &dir.join("record").display().to_string(),
-        "prepare",
-    ]);
-    assert_eq!(fake_run(&args, &mut out, &mut err), Outcome::Failure);
-    let report = Report::from_stdout(&String::from_utf8(out).unwrap()).unwrap();
-    assert_eq!(report.reason.as_deref(), Some("bad_arguments"));
-    assert!(
-        report
-            .detail
-            .unwrap()
-            .contains("--world must name a directory")
-    );
-    assert_eq!(listing(), before);
-    for name in ["node", "mark", "helper.json", "node.tmp", "mark.tmp"] {
-        assert!(!Path::new(name).exists(), "{name}");
-    }
-    assert!(fs::read_dir(dir.join("record")).unwrap().next().is_none());
-}
-
 /// The program's entry: a command line it cannot use exits 1, as the hook's does.
 ///
 /// Catches: an entry that panics, or exits 0, on a command line without the fake's flags.

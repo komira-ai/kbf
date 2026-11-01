@@ -322,6 +322,38 @@ fn a_verify_that_never_turns_healthy_fails_at_the_bound_and_the_rollback_goes_ba
     assert!(!rig.drain.is_drained());
 }
 
+/// The bound of `verify` is measured from the Unix seconds when `verify` runs, not when the
+/// switch was made: the helper's deadline is 100 s after the switch and the margin 10 s, so
+/// with 50 s gone B is looked at for 40 s (9 looks, every 5 s from 0); at 95 s gone, within
+/// the margin, and at the deadline itself and past it, B is looked at once and the step fails.
+/// No time passes on the system's clock: the Unix seconds and the clock are the rig's.
+///
+/// Catches: a bound computed from a Unix time read at the switch (or once per process), which
+/// waits past the helper's own revert; a wait that never looks when no time is left.
+#[test]
+fn the_wait_for_health_is_bounded_by_the_helpers_deadline_as_of_now() {
+    for (gone, looks) in [(50, 9), (95, 1), (100, 1), (130, 1)] {
+        let rig = Rig::new("hook-deadline-now");
+        rig.local.world().switch = Ok(NOW + 100);
+        rig.health.say(VB, vec![Ok(Health::Waiting(s("not yet")))]);
+        assert_eq!(rig.run(Step::Prepare).outcome, Outcome::Success);
+        assert_eq!(rig.run(Step::Cutover).outcome, Outcome::Success);
+        rig.unix
+            .store(NOW + gone, std::sync::atomic::Ordering::SeqCst);
+        let ran = rig.run(Step::Verify);
+        assert_eq!(
+            (ran.outcome, ran.reason()),
+            (Outcome::Failure, "not_healthy"),
+            "{gone} s gone"
+        );
+        assert_eq!(
+            rig.events.count(&format!("health:held {VB}")),
+            looks,
+            "{gone} s gone"
+        );
+    }
+}
+
 /// The wait ends before the helper's own deadline, less the margin: with 100 s left of the
 /// helper's window and a 10 s margin B is looked at for 90 s (19 looks), not for the 300 s.
 ///
