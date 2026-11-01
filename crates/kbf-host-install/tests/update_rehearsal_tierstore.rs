@@ -10,7 +10,7 @@
 //! issuer is the rehearsal's stand-in (`rehearsal/issuer.rs`); `xtask deploy-farm`; and six
 //! stand-in storage hosts (`rehearsal/fleet.rs`) that heartbeat over mutual TLS with
 //! certificates of the farm CA and announce `tierstore`, as the agent does with `--service`.
-//! Six is the farm the shipped definition is written for (`min_up = 5`).
+//! Six is the farm the shipped definition is written for (`min_up = 4`: one host updating, at least four others up).
 //!
 //! What it proves: with the hosts at version 1.0.0, `deploy-farm` of 1.0.0 ends 0 at once; of
 //! 2.0.0 it ends 0 once the coordinator's convergence for `?service=tierstore` says every
