@@ -535,12 +535,15 @@ pub fn seen() -> Option<Seen> {
 /// The frontend writes these lines itself as it acts, in the order it acts: `operator action`
 /// when a node is cordoned, drained or given back (on the operator API and on the worker
 /// listener the agent uses alike; a drain the frontend answers "no such node" writes none),
-/// and `worker registered` when a daemon's stream registers the node. The `operator action`
+/// `worker registered` when a daemon's stream registers the node, and `worker stream ended`
+/// when a daemon's stream ends (its connection closes as its process stops). The `operator action`
 /// line is the legacy scheduler core's, the default; the js core does not write it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NodeEvent {
     /// A daemon registered as the node.
     Registered,
+    /// A daemon's stream ended.
+    StreamEnded,
     /// The node was cordoned without a drain.
     Cordon,
     /// The node was drained.
@@ -560,6 +563,8 @@ pub fn node_events(log: &str) -> Vec<NodeEvent> {
             let words: Vec<&str> = line.split_whitespace().collect();
             if line.contains("worker registered") {
                 Some(NodeEvent::Registered)
+            } else if line.contains("worker stream ended") {
+                Some(NodeEvent::StreamEnded)
             } else if !line.contains("operator action") {
                 None
             } else if words.iter().any(|w| w.starts_with("action=Drain(")) {
