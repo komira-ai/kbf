@@ -345,6 +345,7 @@ fn arm(label: String, mode: &str, burst: &Arc<Burst>) -> Arm {
         })),
         faulted: burst.fault.is_some(),
         notes,
+        proxy: burst.fault.clone(),
     }
 }
 
