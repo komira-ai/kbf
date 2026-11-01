@@ -577,6 +577,10 @@ impl<'a> Hook<'a> {
 
     /// Gives the node back, if this update drained it and it was in placement before: a node
     /// that was out of placement is left out, and the log says so.
+    ///
+    /// Known limit: if the undrain succeeds and the write of `given_back` then fails, the next
+    /// `rollback` or `cleanup` undrains again. That is harmless unless an operator drained the
+    /// node in between; closed with kbf#2166 step B.
     fn give_back(&mut self) -> Result<(), Done> {
         let world = self.world;
         // With no record nothing was drained: there is nothing to give back.
