@@ -211,6 +211,18 @@ pub async fn fetch_with<'a>(
     }
 }
 
+/// Waits for the store a node started with `--cold-store registered` runs on.
+///
+/// # Errors
+/// A refusal that waiting does not change.
+pub async fn registration_with<'a>(
+    call: &mut dyn FnMut() -> Fetch<'a>,
+    pause: &dyn Fn(u32) -> Duration,
+) -> Result<(u64, StoreConfig), Status> {
+    let _ = (call, pause);
+    Err(Status::unimplemented("not yet"))
+}
+
 /// Whether `config` names the store `flag` does: the same endpoint, bucket and prefix.
 /// Keys, region and the put settings are not identity.
 #[must_use]
@@ -456,3 +468,7 @@ pub fn harden_process() -> Result<(), ColdApplyError> {
 #[cfg(test)]
 #[path = "cold_apply_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "cold_registered_tests.rs"]
+mod registered_tests;

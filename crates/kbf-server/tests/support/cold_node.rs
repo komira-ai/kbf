@@ -98,7 +98,17 @@ pub async fn rig(generation: u64, config: impl FnOnce(&FakeS3) -> StoreConfig) -
 /// The flags of a node of `rig` named `name`, with a cold store `cold` and the key pair
 /// `env` gives.
 pub fn flags(rig: &Rig, name: &str, cold: &str, env: fn(&str) -> Option<String>) -> StorageFlags {
-    let d = dir(name);
+    flags_at(rig, (dir(name), next_port()), cold, env)
+}
+
+/// The flags of a node whose directory is `d` (as it is: not emptied) and whose address is
+/// `localhost:port`: the same node again, for a restart over the metadata log it left.
+pub fn flags_at(
+    rig: &Rig,
+    (d, port): (PathBuf, u16),
+    cold: &str,
+    env: fn(&str) -> Option<String>,
+) -> StorageFlags {
     let write = |file: &str, text: String| {
         let path = d.join(file);
         std::fs::write(&path, text).expect("write");
@@ -109,10 +119,7 @@ pub fn flags(rig: &Rig, name: &str, cold: &str, env: fn(&str) -> Option<String>)
         "storage".to_owned(),
         "--storage-listen=127.0.0.1:0".to_owned(),
         // Its own address per node: the address is the member's identity.
-        format!(
-            "--advertise-addr=localhost:{}",
-            9000 + NODES.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-        ),
+        format!("--advertise-addr=localhost:{port}"),
         format!("--cold-store={cold}"),
         format!("--meta-dir={}", d.join("meta").display()),
         format!("--frontend=https://localhost:{}", rig.farm.addr.port()),
@@ -128,6 +135,11 @@ pub fn flags(rig: &Rig, name: &str, cold: &str, env: fn(&str) -> Option<String>)
     flags
 }
 
+/// The next address port a node of this binary gets.
+pub fn next_port() -> u16 {
+    9000 + NODES.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+}
+
 /// `s3://bkt/kbf/` on the rig's service.
 pub fn bucket(rig: &Rig) -> String {
     format!("s3://bkt/kbf/?endpoint={}", rig.s3.endpoint())
@@ -135,6 +147,17 @@ pub fn bucket(rig: &Rig) -> String {
 
 pub async fn started(flags: &StorageFlags) -> Result<StorageHalf, Box<dyn Error>> {
     start(flags, never).await
+}
+
+/// Yields until `probe` finds something: no sleep and no limit, so a wait that never ends is
+/// the test run's to cut, and a slow machine is never a failure.
+pub async fn spin_until<T>(mut probe: impl FnMut() -> Option<T>) -> T {
+    loop {
+        if let Some(found) = probe() {
+            return found;
+        }
+        tokio::task::yield_now().await;
+    }
 }
 
 pub async fn until<T>(what: &str, mut probe: impl FnMut() -> Option<T>) -> T {
