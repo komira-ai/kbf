@@ -245,6 +245,7 @@ fn the_last_line_is_read_with_all_its_fields() {
             reason: Some("lease_unreachable".to_owned()),
             retry_after_secs: Some(300),
             reversible: false,
+            reversible_stated: false,
             promotion_pending: true,
             detail: Some("no hello".to_owned()),
         }
@@ -268,6 +269,7 @@ fn a_report_prints_as_one_line_and_reads_back() {
         reason: Some("r".to_owned()),
         retry_after_secs: Some(7),
         reversible: false,
+        reversible_stated: false,
         promotion_pending: true,
         detail: Some("two\nlines".to_owned()),
     };
@@ -1164,6 +1166,99 @@ fn a_halt_runs_nothing_and_cleanup_is_never_rolled_back() {
                 }
             }
         }
+    }
+}
+
+/// A report whose line stated `reversible`, as a hook that knows the field writes it.
+fn stated(class: Class, reversible: bool) -> Report {
+    Report {
+        class,
+        reversible,
+        reversible_stated: true,
+        ..Report::default()
+    }
+}
+
+/// A `cleanup` that fails and states `reversible: true` has committed nothing: the updater runs
+/// `rollback`, and the host's result is the rollback's outcome. It does not retry first, and it
+/// is not Failed(after_commit).
+#[test]
+fn a_failed_cleanup_that_states_reversible_true_is_rolled_back() {
+    assert_eq!(
+        next(
+            Step::Cleanup,
+            Outcome::Failure,
+            &stated(RELEASE, true),
+            &ctx(false, true, false)
+        ),
+        rollback_then(failed(Phase::GateRelease, RELEASE))
+    );
+    assert_eq!(
+        next(
+            Step::Cleanup,
+            Outcome::Failure,
+            &stated(ENV, true),
+            &ctx(false, false, false)
+        ),
+        rollback_then(failed(Phase::GateEnvironment, ENV))
+    );
+}
+
+/// A `cleanup` that fails and states `reversible: false` keeps the path of the table: run it
+/// again while retries last, then Failed(after_commit); never a rollback.
+#[test]
+fn a_failed_cleanup_that_states_reversible_false_is_retried_then_failed_after_the_commit() {
+    assert_eq!(
+        next(
+            Step::Cleanup,
+            Outcome::Failure,
+            &stated(RELEASE, false),
+            &ctx(false, true, false)
+        ),
+        Next::Again {
+            step: Step::Cleanup,
+            after_secs: None
+        }
+    );
+    assert_eq!(
+        next(
+            Step::Cleanup,
+            Outcome::Failure,
+            &stated(ENV, false),
+            &ctx(false, false, false)
+        ),
+        Next::Report(failed(Phase::AfterCommit, ENV))
+    );
+}
+
+/// A `cleanup` that fails with no `reversible` field is an old hook: it keeps the path of the
+/// table and never triggers a rollback.
+#[test]
+fn a_failed_cleanup_that_leaves_reversible_out_is_never_rolled_back() {
+    let absent = Report::from_stdout("{\"class\":\"release\"}").unwrap();
+    assert!(absent.reversible && !absent.reversible_stated);
+    for report in [Report::default(), absent] {
+        assert_eq!(
+            next(
+                Step::Cleanup,
+                Outcome::Failure,
+                &report,
+                &ctx(false, true, false)
+            ),
+            Next::Again {
+                step: Step::Cleanup,
+                after_secs: None
+            }
+        );
+        assert_eq!(
+            next(
+                Step::Cleanup,
+                Outcome::Failure,
+                &report,
+                &ctx(false, false, false)
+            ),
+            Next::Report(failed(Phase::AfterCommit, RELEASE))
+        );
     }
 }
 
