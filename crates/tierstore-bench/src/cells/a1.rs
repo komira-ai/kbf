@@ -44,7 +44,7 @@ pub const PATHS: [PutPath; 2] = [
 /// # Errors
 /// As [`crate::cells::cold_put::run`].
 pub async fn run(ctx: &CellContext, plan: &CellPlan) -> Result<Vec<CellResult>, BenchError> {
-    run_with(ctx, plan, Arc::new(ProcLoad), None, None).await
+    run_with(ctx, plan, Arc::new(ProcLoad::new()), None, None).await
 }
 
 /// [`run`] with the machine, the fault proxy and a cap on the requests of a pass given.
