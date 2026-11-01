@@ -70,7 +70,7 @@ The updater reads the line field by field. A missing line, or one that is not a 
 `{}`. In an object, each invalid field (a `reason` that is not a token, a wrongly typed value, an
 unknown `class`) takes its default and is reported as a warning, and the valid fields are kept; a
 `reversible` that is present but not a boolean reads as `false`, because a step that might have
-committed is treated as committed. The strict reader and the harness refuse any invalid field and
+committed is treated as committed (a `null` too, on the strict reader as well). The strict reader and the harness refuse any invalid field and
 a missing line.
 
 **Every step is safe to run twice**, acts on the hook's own durable record rather than on the order it
@@ -78,8 +78,9 @@ was called in, and takes an exclusive `flock` on its record directory for the wh
 copy exits `1` and changes nothing). `cleanup` refuses to run unless the record says `verify` succeeded.
 A `cleanup` that fails is retried and then Failed(after_commit), unless its line states
 `"reversible": true`: then nothing has committed, the updater runs `rollback`, and the host's result
-is the rollback's. A line that states `false`, or leaves `reversible` out (an old hook), is never
-rolled back; `Report::reversible_stated` tells the two apart from a stated `true`.
+is the rollback's: it reports Failed(before_commit) with the cleanup's class, and that is not
+counted toward `rollback_after_failed`. A line that states `false`, or leaves `reversible` out
+(an old hook), is never rolled back; `Report::reversible_stated` tells the two apart from a stated `true`.
 
 **What runs next** is `update_hook::next`, a pure function of the step, how it ended and a small
 `Context`; the tests pin every row of the table in the design document.
