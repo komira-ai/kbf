@@ -97,6 +97,7 @@ pub(super) fn action_code(action: AuditAction) -> i32 {
         AuditAction::PutBinding => 3,
         AuditAction::DeleteBinding => 4,
         AuditAction::Repoint => 5,
+        AuditAction::Unknown(code) => i32::try_from(code).unwrap_or(i32::MAX),
     }
 }
 

@@ -401,3 +401,28 @@ fn the_verify_body_and_the_small_answers_round_trip() {
     let back: Status = serde_json::from_str(&serde_json::to_string(&status).unwrap()).unwrap();
     assert_eq!(back, status);
 }
+
+/// Catches an action this build does not know being unrepresentable on the wire: it is the
+/// text `unknown (N)` with its numeric code, it reads back as the same action, and text that
+/// names neither a known action nor such a code is still refused.
+#[test]
+fn an_unknown_action_is_text_with_its_code_and_reads_back() {
+    let unknown = AuditAction::Unknown(9);
+    assert_eq!(serde_json::to_string(&unknown).unwrap(), r#""unknown (9)""#);
+    assert_eq!(
+        serde_json::from_str::<AuditAction>(r#""unknown (9)""#).unwrap(),
+        unknown
+    );
+    assert_eq!(
+        serde_json::to_string(&AuditAction::Repoint).unwrap(),
+        r#""repoint""#
+    );
+    for bad in [
+        r#""bogus""#,
+        r#""unknown (x)""#,
+        r#""unknown 9""#,
+        r#""unknown (9""#,
+    ] {
+        assert!(serde_json::from_str::<AuditAction>(bad).is_err(), "{bad}");
+    }
+}

@@ -320,6 +320,8 @@ pub enum AuditAction {
     DeleteBinding,
     /// `POST /connections/{name}:repoint`.
     Repoint,
+    /// An action code this build does not know, written by a newer one.
+    Unknown(u32),
 }
 
 /// How a mutation ended.
