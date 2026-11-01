@@ -1091,6 +1091,8 @@ where
         if reapi_done {
             stop_api(api_stop, api_serve).await;
         }
+        // What the usage side learned and has not flushed yet.
+        farm.finish_usage().await;
         crate::history::finish(history).await;
         outcome
     };

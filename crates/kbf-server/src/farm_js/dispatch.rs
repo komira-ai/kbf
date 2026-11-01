@@ -23,7 +23,7 @@ use js_store::{Ext as _, Progress};
 use kbf_front::{Backend, Stage, Submission, Ticket};
 use kbf_proto::worker::{self, ResultAck, ResultAckReason};
 use kbf_sched::DaemonInstance;
-use kbf_types::{ActionKey, FarmTime, LeaseId, OperationId, WorkerId};
+use kbf_types::{ActionKey, FarmTime, LeaseId, OperationId, Outcome, WorkerId};
 use tonic::Status;
 
 use super::adapter::{KbfAdapter, Wall, wire_lease};
@@ -264,6 +264,34 @@ pub async fn report(
     worker: &WorkerId,
     result: worker::Result,
 ) -> Result<Option<ResultAck>, Denied> {
+    report_noting(core, cache, wall, now, worker, result, &mut None).await
+}
+
+/// How a run that reported ended, for what the farm learns from it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Ran {
+    /// The action the lease ran.
+    pub(crate) action: ActionKey,
+    /// Whether the run ended on its own (it completed, with any exit code): not killed, lost,
+    /// timed out or stored badly.
+    pub(crate) clean: bool,
+}
+
+/// [`report`], leaving in `ran` what the lease ran and how it ended, for a `Result` that
+/// names a lease the core holds for `worker`. It is set before the core is asked, so it is
+/// read only when the answer is an accepted one.
+///
+/// # Errors
+/// The core's admission refuses the host.
+pub(crate) async fn report_noting(
+    core: &Core<KbfAdapter>,
+    cache: &Backend,
+    wall: &Wall,
+    now: &(dyn Fn() -> FarmTime + Sync),
+    worker: &WorkerId,
+    result: worker::Result,
+    ran: &mut Option<Ran>,
+) -> Result<Option<ResultAck>, Denied> {
     let Some(wire) = result.lease_id else {
         return Ok(None);
     };
@@ -279,10 +307,13 @@ pub async fn report(
     };
     // The lease id is this process's, so the run it reports was started for this
     // operation; a daemon that says it ran another action is refused all the same.
-    let (sent, recorded) = core.with(|view, adapter| {
+    let (sent, recorded, keyed) = core.with(|view, adapter| {
         (
             adapter.sent(view, operation, lease),
             adapter.recording.is_recorded(operation),
+            adapter
+                .first_waiter(view.sched(), operation)
+                .map(|(_, waiter)| waiter.key.clone()),
         )
     });
     let Some(Sent {
@@ -310,6 +341,8 @@ pub async fn report(
         run_record::of(&result, usage, stamp, read(), booked)
     });
     let (outcome, detail) = answer::outcome(cache, read, lease, ran_on, result).await;
+    let clean = matches!(outcome, Outcome::Completed { .. });
+    *ran = keyed.map(|action| Ran { action, clean });
     let report = Report {
         operation,
         lease,

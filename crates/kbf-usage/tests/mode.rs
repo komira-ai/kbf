@@ -53,17 +53,3 @@ fn modes_say_what_they_learn_and_serve() {
     assert!(UsageMode::Record.learns() && !UsageMode::Record.serves());
     assert!(UsageMode::On.learns() && UsageMode::On.serves());
 }
-
-// Catches the table of what each mode does, one fact per line: off learns and serves
-// nothing, record learns only, on does both.
-#[test]
-fn mode_learns_and_serves_table() {
-    for (mode, learns, serves) in [
-        (UsageMode::Off, false, false),
-        (UsageMode::Record, true, false),
-        (UsageMode::On, true, true),
-    ] {
-        assert_eq!(mode.learns(), learns, "{mode} learns");
-        assert_eq!(mode.serves(), serves, "{mode} serves");
-    }
-}

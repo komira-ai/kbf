@@ -45,6 +45,7 @@ use super::codec::KbfRowCodec;
 use super::facts::WorkerFacts;
 use super::learning::Learning;
 use super::report_hooks::ReportHooks;
+use super::usage::Usage;
 use crate::action_usage::Subject;
 use crate::answer::{Detail, Pending, failed, finished_of, refused_as};
 use crate::farm::NodeLoads;
@@ -116,6 +117,8 @@ pub struct KbfAdapter {
     pub(super) learning: Learning,
     /// The counts that tell the ablation's rows apart ([`super::ablation`]).
     ablation: Ablation,
+    /// Where the profile name of each action is told (`--usage-profiles record`).
+    usage: Option<Arc<Usage>>,
 }
 
 /// The `LeaseId` of the wire.
@@ -179,6 +182,7 @@ impl KbfAdapter {
             hooks: ReportHooks::default(),
             learning: Learning::off(),
             ablation: Ablation::default(),
+            usage: None,
         }
     }
 
@@ -188,6 +192,20 @@ impl KbfAdapter {
     pub fn recording(mut self, recorder: Recorder) -> Self {
         self.recording.tell(recorder);
         self
+    }
+
+    /// This adapter, telling `usage` the profile name of each action it enrols or takes up.
+    #[must_use]
+    pub(crate) fn noting_usage(mut self, usage: Option<Arc<Usage>>) -> Self {
+        self.usage = usage;
+        self
+    }
+
+    /// Tells the usage side, if there is one, which action an operation runs and what it is.
+    pub(super) fn note_action(&self, key: &ActionKey, platform: &Platform, usage: &Subject) {
+        if let Some(sink) = &self.usage {
+            sink.note_action(key, platform, usage);
+        }
     }
 
     /// The farm machine: the callers, the leases whose `Start` was sent and the nodes.
@@ -614,6 +632,8 @@ impl Adapter for KbfAdapter {
         let usage = parcel
             .and_then(|parcel| subject::decode(parcel).ok())
             .unwrap_or_else(|| Subject::of(kbf_front::Described::default()).0);
+        let platform = Platform::of(&request.needs);
+        self.note_action(&key, &platform, &usage);
         self.machine.insert(
             waiter,
             Waiter {
@@ -621,7 +641,7 @@ impl Adapter for KbfAdapter {
                 kind: request.kind,
                 do_not_cache: request.do_not_cache,
                 queued: now,
-                platform: Platform::of(&request.needs),
+                platform,
                 usage,
             },
         );

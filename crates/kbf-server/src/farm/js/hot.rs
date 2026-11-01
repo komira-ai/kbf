@@ -8,6 +8,7 @@
 //! [`crate::farm_js::dispatch`]; what the farm's driver does around a `Result`'s feed is the
 //! adapter's (`crate::farm_js::report_hooks`).
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -19,8 +20,9 @@ use kbf_types::sched::usage::NodeLoad;
 use kbf_types::{LeaseId, WorkerId};
 use tonic::Status;
 
-use super::JsFarm;
+use super::{JsFarm, wall_minute};
 use crate::farm::{Outbound, Reported, StreamId};
+use crate::farm_js::dispatch::Ran;
 use crate::farm_js::host::{Connection, stream_number};
 use crate::farm_js::{Wall, dispatch, write_learned};
 use crate::learned::LearnedSizes;
@@ -105,6 +107,7 @@ pub(crate) async fn heartbeat(
     running: Vec<LeaseId>,
     load: Option<NodeLoad>,
 ) -> bool {
+    let session = stream.0;
     // A heartbeat from a replaced stream is dropped and not acknowledged.
     let Some(stream) = js
         .core
@@ -112,15 +115,47 @@ pub(crate) async fn heartbeat(
     else {
         return false;
     };
+    // Kept for the usage side, which reads it after the core has answered.
+    let kept = js.usage.as_ref().and(load.clone());
     let beat = Beat::new(seq, running);
     let beat = match load {
         Some(load) => beat.with_load(load),
         None => beat,
     };
-    js.core
+    let acknowledged = js
+        .core
         .heartbeat(js.now(), worker, stream, beat)
         .await
-        .unwrap_or(false)
+        .unwrap_or(false);
+    // After the core let go of its lock. A beat is answered whatever usage does with it.
+    if let Some(usage) = js.usage.as_ref().filter(|_| acknowledged) {
+        let held = held_leases(js, worker, kept.as_ref());
+        let minute = wall_minute(js.ambient);
+        usage
+            .beat(worker.clone(), session, kept, held, minute)
+            .await;
+    }
+    acknowledged
+}
+
+/// The leases of `load`'s minutes that the core holds for `worker`, as the usage side names
+/// them. The core's own answer to "who holds this lease" has effects (a refusal is logged,
+/// a held result is owed), so the scheduler is asked what it holds, not what it would say.
+fn held_leases(
+    js: &JsFarm,
+    worker: &WorkerId,
+    load: Option<&NodeLoad>,
+) -> BTreeSet<js_types::LeaseId> {
+    let Some(load) = load else {
+        return BTreeSet::new();
+    };
+    let on = js.core.with(|view, _| view.sched().leases_on(worker));
+    load.minutes
+        .iter()
+        .map(|minute| minute.lease)
+        .filter(|lease| on.contains(lease))
+        .map(|lease| js_types::LeaseId::new(lease.term, lease.seq))
+        .collect()
 }
 
 /// [`Farm::report`](crate::farm::Farm::report).
@@ -134,10 +169,25 @@ pub(crate) async fn report(
     let _taking = Taking::of(&js.reports);
     let ambient = js.ambient;
     let wall: Wall = Arc::new(move || ambient.wall());
-    let acked = dispatch::report(&js.core, &js.cache, &wall, &|| js.now(), worker, result)
-        .await
-        .ok()
-        .flatten();
+    let mut ran = None;
+    let acked = dispatch::report_noting(
+        &js.core,
+        &js.cache,
+        &wall,
+        &|| js.now(),
+        worker,
+        result,
+        &mut ran,
+    )
+    .await
+    .ok()
+    .flatten();
+    // A result the core took is a run the usage side follows to its worker's next beat.
+    if let (Some(usage), Some(Ran { action, clean })) = (&js.usage, ran)
+        && acked.as_ref().is_some_and(|ack| ack.accepted)
+    {
+        usage.accepted(worker, lease, action, clean, wall_minute(js.ambient));
+    }
     // The summaries a kill changed are written now, after the core has let go of its lock.
     if js.settings.learned != LearnedSizes::Off {
         write_learned(&js.core, &js.learning_gate, false).await;
@@ -184,6 +234,17 @@ pub(crate) async fn tick(js: &JsFarm) {
     js.core.tick(js.now()).await;
     write_learned(&js.core, &js.learning_gate, true).await;
     publish(js);
+    if let Some(usage) = &js.usage {
+        usage.tick(wall_minute(js.ambient)).await;
+    }
+}
+
+/// [`Farm::finish_usage`](crate::farm::Farm::finish_usage).
+pub(crate) async fn finish_usage(js: &JsFarm) -> bool {
+    match &js.usage {
+        Some(usage) => usage.finish(wall_minute(js.ambient)).await,
+        None => true,
+    }
 }
 
 /// [`Dispatch::submit`](kbf_front::Dispatch::submit) for the farm.

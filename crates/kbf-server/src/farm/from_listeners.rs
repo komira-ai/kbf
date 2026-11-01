@@ -42,6 +42,8 @@ impl Farm {
     #[must_use]
     pub fn with_usage_profiles(mut self, mode: crate::UsageProfiles) -> Self {
         self.usage_profiles = mode;
+        self.settings.usage = mode.mode();
+        self.driver.set_usage(&self.settings);
         self
     }
 

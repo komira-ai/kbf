@@ -101,6 +101,7 @@ impl KbfAdapter {
             platform,
         } = caller;
         let queued = (self.wall)();
+        self.note_action(&key, &platform, &usage);
         let waiter = Waiter {
             key,
             kind,

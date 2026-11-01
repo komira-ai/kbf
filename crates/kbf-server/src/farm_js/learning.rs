@@ -121,7 +121,11 @@ pub(crate) struct Ask<'a> {
 }
 
 /// The estimator's key for an action to run on `platform`, measured by the basis of its OS.
-fn estimator_key(instance: &str, platform: &Platform, subject: &Subject) -> Result<Key, Skip> {
+pub(super) fn estimator_key(
+    instance: &str,
+    platform: &Platform,
+    subject: &Subject,
+) -> Result<Key, Skip> {
     basis_of_os(platform.os_family)
         .ok_or(Skip::NoOs)
         .and_then(|basis| key_of(instance, platform, basis, subject))
