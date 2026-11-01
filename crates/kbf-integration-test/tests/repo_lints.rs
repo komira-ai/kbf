@@ -61,6 +61,9 @@
 //!   instead of the defect it catches (module `test_wording`, whose docs state the rule);
 //! - a test that opens a `file://` cold store without naming its
 //!   free-space floor (module `store_floor`, whose docs say what it misses);
+//! - a release that is not also built by plain `cargo build --locked --release` on GitHub-hosted
+//!   runners, or whose signed and published files do not come from those jobs (module
+//!   `seed_build`, whose docs state the rules);
 //! - the scans passing vacuously because git listed nothing, no Markdown file was
 //!   scanned or the workflows moved;
 //! - a drift in the rules that pick which files each lint reads (module `selection`).
@@ -76,6 +79,7 @@ mod pipeline_workflow;
 mod release_artifacts;
 mod release_workflow;
 mod scratch_dirs;
+mod seed_build;
 mod store_floor;
 mod test_spawns;
 mod test_wording;

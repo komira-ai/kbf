@@ -16,6 +16,16 @@ A pull request builds none of this unless it carries the label `needs-artifacts`
 the label to an open pull request starts the build. Pushes and the merge queue always
 build.
 
+## The seed path: plain cargo on GitHub-hosted runners
+
+The build jobs of `artifacts.yml` (`darwin-arm64`, `linux-x86_64` and `linux-arm64`) build every
+release binary with `cargo build --locked --release` on GitHub-hosted runners, and what they build is
+what is signed, attested and released. This seed path needs no kbf, no farm and no Buck2, and it must
+stay. A build of kbf by kbf may run beside it, never instead of it, because the seed path is how a
+broken kbf is rebuilt without kbf. A repository lint
+(`crates/kbf-integration-test/tests/seed_build`) holds the jobs to plain cargo on hosted runners, and
+holds signing, the sums, the pipeline and the release to the files they build.
+
 ## Pull request labels
 
 A pull request runs `ci.yml` (the checks `lint` and `test`, which gates the coverage of the fast set
