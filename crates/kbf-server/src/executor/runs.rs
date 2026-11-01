@@ -21,7 +21,9 @@ use tokio::time::Instant;
 use crate::executor::config::Config;
 use crate::executor::host::{Drain, HostWorker, Retire};
 use crate::executor::metrics::{IngestEnd, Metrics, RunEnd};
-use crate::executor::outcome::{Settled, Verdict, judge, ran, refused_for_quota, result_of};
+use crate::executor::outcome::{
+    Settled, Verdict, judge, ran, refused_for_files, refused_for_quota, result_of,
+};
 use crate::executor::task::{Nonce, PackKey, TaskArgs};
 use crate::executor::traits::{Ingested, InputsError, MintError, PresignError, UntrustedLimits};
 use crate::executor::{Ctx, note};
@@ -436,9 +438,10 @@ impl HostWorker {
                 Queued::Settled(Settled::Infra("the host is tainted".to_owned()))
             }
             // The host said it could mount files and now cannot (its files root is gone): it
-            // is taken out of service and the farm runs the action again elsewhere.
+            // is held out like a host with a sick quota, so that it is not leased again at
+            // once, and the farm runs the action again elsewhere.
             Some(ErrorCode::FilesUnsupported) => {
-                self.begin_drain(ctx, Drain::Tainted);
+                self.hold_out(ctx, ctx.clock.now());
                 Queued::Settled(Settled::Infra(
                     "the host cannot deliver the files of a run".to_owned(),
                 ))
@@ -449,7 +452,7 @@ impl HostWorker {
                 "the lease server refused a file of the run".to_owned(),
             )),
             Some(ErrorCode::QuotaUnavailable) => {
-                self.quota_unavailable(ctx, ctx.clock.now());
+                self.hold_out(ctx, ctx.clock.now());
                 Queued::Settled(Settled::Lost(Lost::Fenced))
             }
             Some(ErrorCode::HostLost | ErrorCode::HostNotRegistered) => {
@@ -549,8 +552,8 @@ impl HostWorker {
         if !ended {
             return;
         }
-        if refused_for_quota(run) {
-            self.quota_unavailable(ctx, now);
+        if refused_for_quota(run) || refused_for_files(run) {
+            self.hold_out(ctx, now);
         }
         match judge(run, truncated) {
             Verdict::Settled(settled) => {

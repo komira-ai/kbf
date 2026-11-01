@@ -146,8 +146,9 @@ the paths (`--pack-url-file`, `--grant-token-file`): no argument holds a secret,
 `--executor-insecure-argv-secrets` is refused with it, and the lease asks for hosts that report
 `run-files=true`. There is no fall back to arguments: a pool whose agents do not report
 `run-files` holds no host, and no run is sent. A start the lease server refuses with
-`files-unsupported` drains that host and the action is rerun elsewhere; `invalid-file` ends the
-action as invalid. `files` is refused with `--executor kbf-daemon`, which builds no command
+`files-unsupported`, or an agent that ends a start with that detail, holds that host out for the
+quota hold (the lease stays booked and idle, so it is not leased again at once) and the action is
+rerun elsewhere; `invalid-file`, from either, ends the action as invalid. `files` is refused with `--executor kbf-daemon`, which builds no command
 line. The executor runs on exactly one frontend: it looks for another frontend's leases on
 the lease server before its first pass and every minute after, and a frontend that finds one
 older than its own (or finds one before it has any) stops with an error naming it. Each lease

@@ -349,6 +349,10 @@ impl Config {
                 ConfigError::InsecureArgv,
             ),
             (
+                self.delivery != Delivery::Files || !self.insecure_argv_secrets,
+                ConfigError::InsecureWithFiles,
+            ),
+            (
                 self.max_wall > self.drain_before_end && self.drain_before_end > longest,
                 ConfigError::Drain,
             ),

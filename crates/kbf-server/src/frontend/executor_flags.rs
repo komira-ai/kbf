@@ -425,7 +425,7 @@ pub(super) fn from_matches(m: &ArgMatches) -> Result<ExecutorFlags, String> {
     if !missing.is_empty() {
         return Err(format!("--executor js-agent needs {}", missing.join(", ")));
     }
-    let files = m.get_one::<String>(DELIVERY).is_some_and(|d| d == "files");
+    let files = delivery(m) == Delivery::Files;
     if files && m.get_flag(INSECURE) {
         return Err(
             "--executor-secret-delivery files sends no secret in arguments: drop \

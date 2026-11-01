@@ -54,14 +54,22 @@ const QUOTA_UNAVAILABLE: &str = "quota-unavailable";
 /// Whether `run` never started because the host's scratch quota is out of order: the host's
 /// fault, and no taint.
 pub(super) fn refused_for_quota(run: &Run) -> bool {
-    run.outcome == Some(Outcome::FailedToStart) && run.detail.as_deref() == Some(QUOTA_UNAVAILABLE)
+    refused_start(run, QUOTA_UNAVAILABLE)
+}
+
+/// The details a js-agent gives a start it refuses because of the files of the run
+/// (`js-agent-wire`): it has no files root, or a file is invalid.
+const FILES_UNSUPPORTED: &str = "files-unsupported";
+const INVALID_FILE: &str = "invalid-file";
+
+/// Whether `run` never started and the host says why with exactly `detail`.
+fn refused_start(run: &Run, detail: &str) -> bool {
+    run.outcome == Some(Outcome::FailedToStart) && run.detail.as_deref() == Some(detail)
 }
 
 /// Whether `run` never started because its host cannot deliver the files of a run.
-#[allow(dead_code)]
 pub(super) fn refused_for_files(run: &Run) -> bool {
-    let _ = run;
-    false
+    refused_start(run, FILES_UNSUPPORTED)
 }
 
 /// The verdict on `run`. `truncated` says the lease cut the run's wall time short of what
@@ -91,6 +99,13 @@ pub(super) fn judge(run: &Run, truncated: bool) -> Verdict {
             tracing::warn!(run = %run.run_id, "the host refused the start: its scratch quota is out of order");
             Verdict::Settled(Settled::Lost(Lost::Fenced))
         }
+        (_, Some(Outcome::FailedToStart)) if refused_for_files(run) => {
+            infra("the host cannot deliver the files of a run")
+        }
+        // A file the agent refuses is ours to fix, and no host takes it.
+        (_, Some(Outcome::FailedToStart)) if refused_start(run, INVALID_FILE) => Verdict::Settled(
+            Settled::Invalid("the agent refused a file of the run".to_owned()),
+        ),
         (_, Some(Outcome::FailedToStart)) => infra("the run could not start"),
         (_, Some(Outcome::Unknown)) => infra("the run ended in a way this server does not know"),
         (_, None) => infra("the run ended with no outcome"),
