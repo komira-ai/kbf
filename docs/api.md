@@ -1604,6 +1604,11 @@ caller goes away before the answer counts as an error.
 | `kbf_segment_commit_seconds` | histogram | one segment's `PutBlobs` commit to the metadata log, including any wait behind commits queued ahead of it |
 | `kbf_segment_blobs`, `kbf_segment_bytes` | histogram | blobs, and bytes (footer included), per segment written |
 | `kbf_object_get_seconds` | histogram | one range GET of a blob being read (ByteStream Read, GetActionResult, a BatchReadBlobs run); footer reads are not in it |
+| `kbf_cold_store_requests_total{op}` | counter | requests the cache makes to the cold object store, by `op` (`get` a ranged read, `head` a length lookup, `put`, `delete`, `list` one page), counted when the call starts; every op has a line from the first scrape. The series are the same on every process: no key, bucket or host is a label |
+| `kbf_cold_store_errors_total{op}` | counter | those requests the store answered with an error |
+| `kbf_cold_store_bytes_total{dir}` | counter | bytes the cold store returned (`dir="read"`, the bytes of the answers, not the range asked for) and accepted (`dir="write"`, writes that succeeded) |
+| `kbf_cold_store_request_seconds{op}` | histogram | seconds from a request to the cold store to its answer, by `op`, in fixed buckets from 1 ms to 60 s. For a window of a run, the delta of `kbf_cold_store_requests_total{op="get"}` is the number of cold GETs the window made |
+| `kbf_pack_store_requests_total{op}`, `kbf_pack_store_errors_total{op}`, `kbf_pack_store_bytes_total{dir}`, `kbf_pack_store_request_seconds{op}` | counter, counter, counter, histogram | the same four families for the object store the frontend's packs are written to and read from; present on a frontend that has packs |
 | `kbf_meta_commit_seconds{command}` | histogram | every metadata-log commit the cache makes, by command (`put_blobs`, `touch`, `put_action`, `object_unreachable`, `tick`, `collect`, ...): with the Raft metadata log, the Raft log's commit latency |
 | `kbf_meta_query_seconds` | histogram | every metadata-log query the cache makes |
 | `kbf_execute_presubmit_seconds` | histogram | an Execute from the handler's start to its first stream item (the first `QUEUED` operation cannot be sent sooner): authorization, the action-cache lookup, the action and command reads, the input-tree walk and the scheduler's submit. Failed and abandoned calls are observed too |
@@ -1748,6 +1753,7 @@ under `--job-plain-http`, where the listener has no TLS files.
 |---|---|---|
 | `kbf_job_read_requests_total` | counter | requests answered, labelled `outcome`: `ok` (200), `unauthorized` (401: no grant, a malformed, forged, expired or revoked one), `forbidden` (403: a digest outside the grant's scope, or an Action with no readable inputs), `not_found` (404: a blob that is not held, or a path that is not `/<hex>/<size>`), `too_large` (413: a blob over 64 MiB, not read), `method_not_allowed` (405) and `unavailable` (503: the store could not answer) |
 | `kbf_job_read_bytes_total` | counter | blob bytes served to jobs |
+| `kbf_job_read_seconds{op}` | histogram | seconds from a job's blob read (`op="get"`, `GET /<hex>/<size>`) or batch (`op="batch"`) to its answer, in fixed buckets from 1 ms to 60 s: one observation per answered request, refusals included; `/locate`, a refused method and a path that names no blob are not in it. A blob too large to read whole is answered when its stream starts, not when its last byte is sent |
 
 **Pack reads by daemons.** A daemon started with `--pack-read` ([kbf-modes.md](deploy/kbf-modes.md))
 puts the counts of its pack reads in every heartbeat, and the frontend its worker stream is on

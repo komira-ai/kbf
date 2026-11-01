@@ -12,7 +12,8 @@
 //!   certificate, and a certificate that names another node or role than the one the agent
 //!   started as is not used (the drain it does targets the node it started as).
 //! - **What it takes back.** A 200 whose body is exactly a [`Reply`] (a [`ServiceReply`] for
-//!   an agent that lists services), read strictly and no more than [`REPLY_MAX`] bytes.
+//!   an agent that lists services, an [`Answer`] for one that announces `agent_features`), read
+//!   strictly and no more than [`REPLY_MAX`] bytes.
 //!   Anything else is an error, and the updater does nothing with it but heartbeat again.
 //!
 //! HTTP/1.1 only, `Connection: close`, rustls with the ring provider over a std socket, like
@@ -31,7 +32,7 @@ use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 
 use crate::identity::{Identity, identity_of};
 use crate::secret::read_secret;
-use crate::wire::{HEARTBEAT_PATH, Heartbeat, Reply, ServiceReply};
+use crate::wire::{Answer, HEARTBEAT_PATH, Heartbeat, Reply, ServiceReply};
 
 /// The most bytes of a reply that are read.
 pub const REPLY_MAX: usize = 16 * 1024;
@@ -80,6 +81,14 @@ pub trait Coordinator: Send + Sync {
     /// # Errors
     /// [`CoordinatorError`].
     fn heartbeat_services(&self, beat: &Heartbeat) -> Result<ServiceReply, CoordinatorError>;
+
+    /// [`Coordinator::heartbeat_services`] for a heartbeat that announces `agent_features`:
+    /// the answer is the service reply and, from a coordinator that knows the field, the
+    /// `features` it supports (an old one sends none). Only an agent that announces calls it.
+    ///
+    /// # Errors
+    /// [`CoordinatorError`].
+    fn heartbeat_answer(&self, beat: &Heartbeat) -> Result<Answer, CoordinatorError>;
 }
 
 /// The files of this host's side of the TLS.
@@ -319,6 +328,10 @@ impl Coordinator for HttpsCoordinator {
     }
 
     fn heartbeat_services(&self, beat: &Heartbeat) -> Result<ServiceReply, CoordinatorError> {
+        self.post(beat)
+    }
+
+    fn heartbeat_answer(&self, beat: &Heartbeat) -> Result<Answer, CoordinatorError> {
         self.post(beat)
     }
 }

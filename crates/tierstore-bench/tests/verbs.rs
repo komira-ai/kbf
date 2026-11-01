@@ -587,3 +587,28 @@ async fn plan_refuses_a_name_outside_the_prefix_and_reads_a_good_run_file() {
     assert!(matches!(err, BenchError::Config(_)), "{err}");
     assert!(err.to_string().contains("farm-cold"), "{err}");
 }
+
+/// Catches the `--arms` flag not reaching the run: a comma list is the filter, no flag is no
+/// filter, and a family no selected cell has is refused before anything is read (the result
+/// directory here does not exist, so any other error would be about it).
+#[tokio::test]
+async fn the_arms_flag_is_a_filter_and_a_typo_is_refused_first() {
+    assert_eq!(
+        parsed_run(&["--campaign-ledger", "l"])
+            .unwrap()
+            .arms_filter(),
+        None
+    );
+    let args = parsed_run(&["--campaign-ledger", "l", "--arms", "hot,instance"]).unwrap();
+    assert_eq!(
+        args.arms_filter(),
+        Some(vec!["hot".to_owned(), "instance".to_owned()])
+    );
+    let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "tierstore-bench-arms-typo");
+    let out = dir.path().join("out");
+    let err = run_owned(&run_args(&out, &["--arms", "hot,nope"]))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, BenchError::Setup(_)), "{err}");
+    assert!(err.to_string().contains("nope"), "{err}");
+}

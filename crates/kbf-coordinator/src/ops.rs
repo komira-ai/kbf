@@ -506,7 +506,7 @@ fn reason(text: &str) -> Result<String, OperateError> {
     Ok(text.to_owned())
 }
 
-fn label(text: &str) -> bool {
+pub(crate) fn label(text: &str) -> bool {
     (1..=MAX_LABEL_BYTES).contains(&text.len())
         && text
             .bytes()

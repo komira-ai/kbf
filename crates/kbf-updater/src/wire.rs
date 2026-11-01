@@ -41,6 +41,10 @@ pub enum Health {
     Healthy,
     /// It does not, or the updater cannot tell.
     Unhealthy,
+    /// The service is declared on the host and has never registered. An agent sends it only
+    /// to a coordinator that advertised `heartbeat-v2`: an older coordinator refuses the
+    /// heartbeat.
+    Absent,
 }
 
 /// How an update ended on the host.
