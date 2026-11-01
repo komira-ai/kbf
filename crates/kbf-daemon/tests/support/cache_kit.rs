@@ -254,8 +254,11 @@ impl Gates {
     /// nothing until the cache is stopped. Only on [`Gates::new`]. A test that changes
     /// what the budget leaves the entries, or counts evictions, calls this first (or
     /// opens with [`open_started`]), or the start-up drain may run beside its own
-    /// `evict` and take half of the evictions. No deadline here: a thread that never
-    /// arrives is ended by the nextest guard.
+    /// `evict` and take half of the evictions. These waits (this one,
+    /// [`Gates::wait_reached`] and the hold in `Hooks::at`) have no bound of their own:
+    /// under a plain `cargo test`, without nextest, a failing test that leaves a hold
+    /// held hangs. The bound is the nextest override for the cache binary in
+    /// `.config/nextest.toml`.
     pub fn wait_started(&self) {
         let state = lock(&self.state);
         drop(
@@ -281,7 +284,8 @@ impl Gates {
         HoldId(state.holds.len() - 1)
     }
 
-    /// Waits until the work reached the hold (no deadline; see [`Gates::wait_started`]).
+    /// Waits until the work reached the hold. No bound of its own: see
+    /// [`Gates::wait_started`] (the nextest override is the bound).
     pub fn wait_reached(&self, id: HoldId) {
         let state = lock(&self.state);
         drop(
@@ -320,8 +324,8 @@ impl Hooks for Gates {
         };
         state.holds[at].reached = true;
         self.changed.notify_all();
-        // No deadline: a test that failed with a hold still held waits here until the
-        // nextest guard ends it.
+        // No bound of its own: a test that failed with a hold still held waits here
+        // until the nextest override ends it (under plain `cargo test` it hangs).
         let _held = self
             .changed
             .wait_while(state, |s| !s.holds[at].released)
