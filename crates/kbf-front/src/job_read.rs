@@ -67,8 +67,10 @@ use crate::grants::{Claims, GrantError, Grants, Scope};
 use crate::large_backfill::{LargeBackfill, Tee};
 use crate::metrics::{Counter, Families};
 use crate::proxy::MAX_UNTRUSTED_BLOB_BYTES;
+use crate::store_metrics::Stopwatch;
 
 mod idle;
+mod latency;
 mod locate;
 mod source;
 mod store_grants;
@@ -415,6 +417,7 @@ pub struct JobRead {
     backfill: Option<LargeBackfill>,
     /// What `GET /locate` signs store read grants with; none, and it says nothing of grants.
     store_grants: Option<StoreGrants>,
+    latency: latency::Latency,
 }
 
 impl JobRead {
@@ -436,7 +439,15 @@ impl JobRead {
             ended_early: Arc::default(),
             backfill: None,
             store_grants: None,
+            latency: latency::Latency::new(),
         }
+    }
+
+    /// This read, timing its answers by `clock` (the process's unless told).
+    #[must_use]
+    pub fn with_stopwatch(mut self, clock: Stopwatch) -> Self {
+        self.latency = self.latency.with_clock(clock);
+        self
     }
 
     /// This read, handing out store read grants with the table of `GET /locate` (see the
@@ -477,6 +488,17 @@ impl JobRead {
     /// carries, and is read by the caller, at most [`MAX_BATCH_REQUEST_BYTES`] of it (a body
     /// that is longer or does not arrive is passed as empty, which is a malformed request).
     pub async fn respond_with_body(
+        &self,
+        method: &Method,
+        path: &str,
+        authorization: Option<&str>,
+        body: &[u8],
+    ) -> Reply {
+        let answer = self.route(method, path, authorization, body);
+        self.latency.timed((method, path), answer).await
+    }
+
+    async fn route(
         &self,
         method: &Method,
         path: &str,
@@ -833,6 +855,7 @@ impl JobRead {
                 counter.get()
             );
         }
+        self.latency.render(&mut families);
         self.locate.render_metrics(&mut families);
         *out = families.0;
         if let Some(backfill) = &self.backfill {
