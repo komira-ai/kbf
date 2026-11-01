@@ -17,7 +17,8 @@
 //!   [`workflows::is_hosted_label`]): not `self-hosted`, a custom label, a runner group or an
 //!   expression.
 //! - **Plain cargo.** Each builds every binary its platform ships ([`shipped`]: its tarballs'
-//!   and images', by package, [`SHIPPED_BINARIES`]) in an unconditional step, and every
+//!   and images', by package, [`SHIPPED_BINARIES`]) for one of [`BUILD_TARGETS`] in an
+//!   unconditional step, and every
 //!   `cargo build` line of the job is plain: `cargo build --locked --release`, then only
 //!   [`BUILD_FLAGS`] (a target, packages, binaries), after no variable but
 //!   [`BUILD_VARIABLES`], in a step with no `shell:` of its own and a job with no `defaults:`
@@ -339,18 +340,27 @@ enum Build<'a> {
 }
 
 /// What a plain build line builds: the packages it names, and their binaries it names
-/// (`--bin`) or all of them (`--bins`).
+/// (`--bin`) or all of them (`--bins`), for the target it names (`--target`).
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Built<'a> {
     packages: Vec<&'a str>,
     bins: Vec<&'a str>,
     all_bins: bool,
+    target: Option<&'a str>,
 }
 
+/// The targets a seed job's credited build may name: the job's `TARGET`, or `STATIC_TARGET`
+/// (the static `kbf-task`), the triples whose `target/<triple>/release` the packaging steps
+/// read. A build without `--target` lands in `target/release`, which no package step reads.
+pub const BUILD_TARGETS: &[&str] = &["$TARGET", "$STATIC_TARGET"];
+
 impl Built<'_> {
-    /// Whether the line builds the binary `binary` of the package `package`.
+    /// Whether the line builds the binary `binary` of the package `package`, for one of
+    /// [`BUILD_TARGETS`].
     fn builds(&self, package: &str, binary: &str) -> bool {
-        self.packages.contains(&package) && (self.all_bins || self.bins.contains(&binary))
+        self.packages.contains(&package)
+            && (self.all_bins || self.bins.contains(&binary))
+            && self.target.is_some_and(|t| BUILD_TARGETS.contains(&t))
     }
 }
 
@@ -410,6 +420,7 @@ fn build_line(line: &str) -> Build<'_> {
                 Some(v) if !v.starts_with('-') => match *f {
                     "-p" | "--package" => built.packages.push(*v),
                     "--bin" => built.bins.push(*v),
+                    "--target" => built.target = Some(*v),
                     _ => {}
                 },
                 _ => return Build::NotPlain(format!("`{flag}` has no value")),
