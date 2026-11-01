@@ -607,3 +607,21 @@ async fn an_ack_ends_when_the_host_starts_an_update() {
     send(&rig, "s1", "storage", &beat("1.0", HALT)).await;
     assert_eq!(convergence(&rig, "kbf").await["state"], "halted");
 }
+
+/// Catches: a host that lists `kbf` among its services (`heartbeat-v2`) being read by its
+/// top-level placeholder as well: its report is read from the `kbf` entry alone, so the
+/// placeholder's lack of a report does not end the acknowledgement of the report an operator
+/// cleared, and the repeated report is not raised again.
+#[tokio::test]
+async fn a_host_that_lists_kbf_is_read_by_that_entry_and_not_its_placeholder() {
+    let rig = farm("halt-lists-kbf").await;
+    let entry = format!(
+        r#","agent_features":["heartbeat-v2"],"services":[{{"name":"kbf","version":"1.0","health":"healthy"{HALT}}}]"#
+    );
+    let body = beat("1.0", &entry);
+    send(&rig, "s1", "storage", &body).await;
+    assert_eq!(convergence(&rig, "kbf").await["state"], "halted");
+    clear(&rig, "kbf").await;
+    send(&rig, "s1", "storage", &body).await;
+    assert_ne!(convergence(&rig, "kbf").await["state"], "halted");
+}

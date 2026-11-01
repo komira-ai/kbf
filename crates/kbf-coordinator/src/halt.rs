@@ -101,20 +101,61 @@ fn ignored(state: &OpsState, service: &str, halt: &Halt) -> Option<&'static str>
 /// Raises the halts the heartbeat `beat` of the host `who` reports, for `kbf` (its top-level
 /// facts) and for each service it lists. Before the heartbeat is decided, so the host that
 /// reports a halt is ordered nothing in the same reply.
+///
+/// A report is read only while the host is not updating: a beat that says it is updating, or
+/// carries no halt report, is not that report, and ends the host's acknowledgement of one an
+/// operator cleared ([`forget`]).
 pub(crate) fn note(ops: &OpsStore, services: &Services, who: &Identity, beat: &Heartbeat) {
     let listed = beat.services.as_deref().unwrap_or_default();
-    let reports = std::iter::once((KBF, beat.last_update.as_ref())).chain(
-        listed
-            .iter()
-            .map(|one| (one.name.as_str(), one.last_update.as_ref())),
-    );
-    for (service, last) in reports {
+    // A host that lists `kbf` says its `kbf` there; its top-level facts are placeholders.
+    let top = listed.iter().all(|one| one.name != KBF).then_some((
+        KBF,
+        beat.last_update.as_ref(),
+        beat.updating.is_some(),
+    ));
+    let reports = top.into_iter().chain(listed.iter().map(|one| {
+        (
+            one.name.as_str(),
+            one.last_update.as_ref(),
+            one.updating.is_some(),
+        )
+    }));
+    for (service, last, updating) in reports {
         if !is_member(services, service, who.role.name()) {
             continue;
         }
-        if let Some(halt) = reported(last, &who.node_id) {
-            raise(ops, service, halt);
+        let report = reported(last, &who.node_id).filter(|_| !updating);
+        match report {
+            Some(halt) => raise(ops, service, halt),
+            None => forget(ops, service, &who.node_id),
         }
+    }
+}
+
+/// Ends the acknowledgement the host `id` has for `service`, if it has one: the host no longer
+/// reports the halt an operator cleared, so a halt it reports from now on is a new failure, even
+/// of the same target. Written after it is in memory, like a halt: it removes protection.
+fn forget(ops: &OpsStore, service: &str, id: &NodeId) {
+    let node = id.to_string();
+    let held = ops.read(|state| {
+        state
+            .services
+            .get(service)
+            .is_some_and(|m| m.halt_acked.iter().any(|a| a.node_id == node))
+    });
+    if !held {
+        return;
+    }
+    let mut entry = AuditEntry::new(COORDINATOR, "halt_ack_ended");
+    entry.service = Some(service.to_owned());
+    entry.node_id = Some(node.clone());
+    let name = service.to_owned();
+    let ended = ops.change(Write::AfterMemory, entry, |state| {
+        let marks = state.services.entry(name).or_default();
+        marks.halt_acked.retain(|a| a.node_id != node);
+    });
+    if let Err(why) = ended {
+        tracing::error!(service, %why, "the end of an acknowledgement could not be written");
     }
 }
 
