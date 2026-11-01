@@ -19,7 +19,7 @@ mod root_rig;
 
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, chown, symlink};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use root_rig::{
@@ -27,7 +27,7 @@ use root_rig::{
     said, said_by,
 };
 use update_hook::{Class, Outcome, Step};
-use update_rights::{Accounts, EtcAccounts, Policy, Refusal, load_dir};
+use update_rights::{Accounts, EtcAccounts, Launch, Policy, Refusal, load_dir};
 
 fn caps_text(mask: u64) -> String {
     format!("eff={mask:016x} amb={mask:016x} bnd={mask:016x}")
@@ -1052,17 +1052,17 @@ fn a_write_path_pointed_at_etc_after_the_load_is_refused_by_the_recheck() {
     symlink(&real, &link).unwrap();
     let mut spec = rig.spec();
     spec.write = vec![link.display().to_string()];
-    let declaration = rig.declaration(&spec, &["ok", "--"]);
-    assert_eq!(update_rights::recheck_targets(&declaration, 65534), Ok(()));
+    let declared = rig.declared(&spec, &["ok", "--"]);
+    assert_eq!(declared.recheck(), Ok(()));
     fs::remove_file(&link).unwrap();
     symlink("/etc", &link).unwrap();
-    match update_rights::recheck_targets(&declaration, 65534) {
+    match declared.recheck() {
         Err(Refusal::Reserved { field, .. }) => assert_eq!(field, "hook.write_paths"),
         other => panic!("{other:?}"),
     }
     fs::remove_file(&link).unwrap();
     symlink("/var/log", &link).unwrap();
-    match update_rights::recheck_targets(&declaration, 65534) {
+    match declared.recheck() {
         Err(Refusal::Reserved { field, why, .. }) => {
             assert_eq!(field, "hook.write_paths");
             assert_eq!(why, update_rights::reserved::Violation::NotAllowed);
@@ -1084,12 +1084,8 @@ fn a_root_hook_path_below_a_directory_others_control_is_refused() {
     spec.user = "root".to_owned();
     spec.group = "root".to_owned();
     spec.write = vec![closed.join("work").display().to_string()];
-    let declaration = rig.declaration(&spec, &["ok", "--"]);
-    assert_eq!(
-        update_rights::recheck_targets(&declaration, 0),
-        Ok(()),
-        "below a closed root directory"
-    );
+    let declared = rig.declared(&spec, &["ok", "--"]);
+    assert_eq!(declared.recheck(), Ok(()), "below a closed root directory");
     for (name, mode, owned_by_nobody) in [
         ("everyone", 0o777, false),
         ("group", 0o775, false),
@@ -1101,12 +1097,110 @@ fn a_root_hook_path_below_a_directory_others_control_is_refused() {
             give_to_nobody(&dir);
         }
         spec.write = vec![dir.join("work").display().to_string()];
-        let declaration = rig.declaration(&spec, &["ok", "--"]);
-        match update_rights::recheck_targets(&declaration, 0) {
+        let declared = rig.declared(&spec, &["ok", "--"]);
+        match declared.recheck() {
             Err(Refusal::Ancestor { ancestor, .. }) => {
                 assert_eq!(ancestor, dir.display().to_string(), "{name}")
             }
             other => panic!("{name}: {other:?}"),
         }
+    }
+}
+
+/// Catches a root hook reaching the directory of another declared service through a link: the
+/// service `probe-trespass` may write in `/var/lib/probe-trespass-*`, a link there that points
+/// at `/var/lib/probe-trespass-b`, the directory of the service `probe-trespass-b`, is that
+/// service's. At the load the declaration is refused as a conflict, and a link made or
+/// re-pointed after the load is refused at the recheck, and so at the launch, which spawns
+/// nothing.
+#[test]
+#[ignore = "needs root and systemd; run by cargo xtask sudo-test"]
+fn a_root_hook_cannot_write_in_another_services_directory_through_a_link() {
+    let rig = Rig::new("trespass");
+    let (mine, other, link) = (
+        PathBuf::from("/var/lib/probe-trespass-mine"),
+        PathBuf::from("/var/lib/probe-trespass-b"),
+        PathBuf::from("/var/lib/probe-trespass-x"),
+    );
+    let _planted = Planted(vec![mine.clone(), other.clone(), link.clone()]);
+    for dir in [&mine, &other] {
+        make_dir(dir, 0o755);
+    }
+    symlink(&mine, &link).unwrap();
+
+    // After the load: the link is made to point at the other service's directory.
+    let mut spec = rig.spec();
+    spec.user = "root".to_owned();
+    spec.group = "root".to_owned();
+    spec.write = vec![link.display().to_string()];
+    let mut declared = rig.declared(&spec, &["ok", "--"]);
+    declared.names.insert("probe-trespass-b".to_owned());
+    assert_eq!(
+        declared.recheck(),
+        Ok(()),
+        "the link points into its own directory"
+    );
+    fs::remove_file(&link).unwrap();
+    symlink(&other, &link).unwrap();
+    match declared.recheck() {
+        Err(Refusal::Conflict { what, with }) => {
+            assert_eq!(what, "a write path in the directory of another service");
+            assert_eq!(with, "probe-trespass-b");
+        }
+        other => panic!("{other:?}"),
+    }
+    let release = rig.dir.join("release");
+    let launch = Launch::of(&declared, Step::Verify, 1, &release, None);
+    assert!(matches!(
+        update_rights::run_step(&update_rights::Systemd::system(), &launch),
+        Err(update_rights::RunError::Recheck(Refusal::Conflict { .. }))
+    ));
+
+    // At the load: the same link, already there.
+    let dir = rig.dir.join("updater.d");
+    make_dir(&dir, 0o755);
+    let declarations = [
+        ("probe-trespass", "daemon", link.display().to_string()),
+        ("probe-trespass-b", "bin", other.display().to_string()),
+    ];
+    for (name, account, path) in declarations {
+        let mut spec = rig.spec();
+        spec.user = "root".to_owned();
+        spec.group = "root".to_owned();
+        spec.write = vec![path];
+        let text = rig
+            .toml(name, &spec, &["ok", "--"])
+            .replace("uid = \"daemon\"", &format!("uid = \"{account}\""))
+            .replace(
+                &format!("state_dir = \"{}\"", rig.path("state")),
+                &format!("state_dir = \"{}\"", rig.path(&format!("state-{name}"))),
+            );
+        let file = dir.join(format!("{name}.toml"));
+        fs::write(&file, text).unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    let accounts = EtcAccounts::system().unwrap();
+    let policy = Policy {
+        trusted_uid: 0,
+        accounts: &accounts,
+    };
+    let loaded = load_dir(&dir, &policy).unwrap();
+    let refused: Vec<_> = loaded
+        .refused
+        .iter()
+        .map(|r| (&r.service, &r.reason))
+        .collect();
+    assert_eq!(
+        loaded.services.keys().collect::<Vec<_>>(),
+        ["probe-trespass-b"],
+        "{refused:?}"
+    );
+    match &loaded.refused[..] {
+        [one] => assert!(
+            matches!(&one.reason, Refusal::Conflict { with, .. } if with == "probe-trespass-b"),
+            "{:?}",
+            one.reason
+        ),
+        other => panic!("{other:?}"),
     }
 }

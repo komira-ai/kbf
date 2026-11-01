@@ -12,7 +12,7 @@ use update_hook::Step;
 use update_rights::reserved::Violation;
 use update_rights::{
     Digest, EtcAccounts, Finished, Launch, Loaded, Policy, Refusal, Spawner, SystemdRun, UserIds,
-    check_state_dir, load_dir, recheck_targets, run_step,
+    check_state_dir, load_dir, run_step,
 };
 
 /// One declaration, small enough to vary: the account names, the claims that can collide, the
@@ -732,22 +732,18 @@ fn a_target_pointed_at_a_reserved_place_after_the_load_is_refused_by_the_recheck
     host.put(&spec);
     let loaded = host.load();
     assert!(loaded.refused.is_empty(), "{:?}", loaded.refused);
-    let declaration = &loaded.services["tierstore"].declaration;
-    assert_eq!(recheck_targets(declaration, 65534), Ok(()));
+    let declared = &loaded.services["tierstore"];
+    assert_eq!(declared.recheck(), Ok(()));
     for (link, field) in [(&read, "hook.read_paths"), (&state, "state_dir")] {
         fs::remove_file(link).unwrap();
         symlink("/etc", link).unwrap();
-        match recheck_targets(declaration, 65534) {
+        match declared.recheck() {
             Err(Refusal::Reserved { field: found, .. }) => assert_eq!(found, field),
             other => panic!("{field}: {other:?}"),
         }
         fs::remove_file(link).unwrap();
         symlink(&real, link).unwrap();
-        assert_eq!(
-            recheck_targets(declaration, 65534),
-            Ok(()),
-            "{field} put back"
-        );
+        assert_eq!(declared.recheck(), Ok(()), "{field} put back");
     }
 }
 
@@ -889,23 +885,6 @@ fn a_hook_account_with_uid_zero_under_another_name_is_a_root_hook() {
     }
 }
 
-/// Catches `recheck_targets` ignoring whether the hook is root: told it is, it applies the
-/// ancestor rule to the same declaration it passes when told it is not.
-#[test]
-fn the_recheck_applies_the_ancestor_rule_when_told_the_hook_is_root() {
-    let host = Host::new("recheck-root");
-    let mut spec = Spec::new("tierstore");
-    spec.read = vec![host.scratch.path().join("data").display().to_string()];
-    host.put(&spec);
-    let loaded = host.load();
-    let declaration = &loaded.services["tierstore"].declaration;
-    assert_eq!(recheck_targets(declaration, 65534), Ok(()));
-    assert!(matches!(
-        recheck_targets(declaration, 0),
-        Err(Refusal::Ancestor { .. })
-    ));
-}
-
 /// Catches a root hook being granted a directory of the system that happens to be one component
 /// under a write root (`/var/lib/sudo`, `/run/udev`, `/var/lib/cloud`): it may write at or below a
 /// directory named for its service, and a hook that is not root keeps the one-component rule.
@@ -1003,11 +982,6 @@ fn a_loaded_declaration_whose_hook_has_uid_zero_is_held_to_the_root_rules_howeve
         run_step(&Silent, &root),
         Err(update_rights::RunError::Recheck(Refusal::Ancestor { .. }))
     ));
-    let by_hand = Launch::new(&declared.declaration, 0, Step::Verify, 1, release, None);
-    assert!(matches!(
-        run_step(&Silent, &by_hand),
-        Err(update_rights::RunError::Recheck(Refusal::Ancestor { .. }))
-    ));
 }
 
 /// Catches a root hook writing in another declared service's directory through the `-` rule:
@@ -1076,4 +1050,36 @@ fn a_service_may_not_be_named_for_a_directory_of_the_system() {
         }
         fs::remove_file(host.dir.join(format!("{name}.toml"))).unwrap();
     }
+}
+
+/// Catches the dash rule being checked only when the file is loaded: a root hook's write path in
+/// the directory of another declared service is refused at every recheck and so at every launch,
+/// from the names the load recorded in the declaration, and a hook that is not root, or a host
+/// that does not declare the other service, leaves the path alone.
+#[test]
+fn a_root_hook_in_another_services_directory_is_refused_at_the_recheck_and_the_launch() {
+    let mut spec = Spec::new("tierstore");
+    spec.hook_user = "root".to_owned();
+    spec.write = vec!["/var/lib/tierstore-b/x".to_owned()];
+    let declaration = update_rights::Declaration::parse(&spec.text()).unwrap();
+
+    let both = support::declared(declaration.clone(), 0, &["tierstore", "tierstore-b"]);
+    match both.recheck() {
+        Err(Refusal::Conflict { what, with }) => {
+            assert_eq!(what, "a write path in the directory of another service");
+            assert_eq!(with, "tierstore-b");
+        }
+        other => panic!("{other:?}"),
+    }
+    let release = Path::new("/var/lib/updater/releases/tierstore/abc");
+    let launch = Launch::of(&both, Step::Verify, 1, release, None);
+    assert!(matches!(
+        run_step(&Silent, &launch),
+        Err(update_rights::RunError::Recheck(Refusal::Conflict { .. }))
+    ));
+
+    let alone = support::declared(declaration.clone(), 0, &["tierstore"]);
+    assert_eq!(alone.recheck(), Ok(()));
+    let ordinary = support::declared(declaration, 65534, &["tierstore", "tierstore-b"]);
+    assert_eq!(ordinary.recheck(), Ok(()));
 }

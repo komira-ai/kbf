@@ -17,7 +17,7 @@
 //! and raises an alert; the others load. A conflict has two parties and neither has the better
 //! claim, so both are refused.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -50,13 +50,16 @@ pub struct Declared {
     pub hook: UserIds,
     /// The service account's primary group and the groups that list it.
     pub service_gids: Vec<u32>,
+    /// The names of every declared service of the host at the load, this one included: what a root
+    /// hook's write paths are held apart from, at the load and again at each launch.
+    pub names: BTreeSet<String>,
 }
 
 impl Declared {
     /// [`recheck_targets`] for this declaration, with the uid of the hook account the loader
     /// resolved: the one way to recheck that cannot be told the wrong answer.
     pub fn recheck(&self) -> Result<(), Refusal> {
-        recheck_targets(&self.declaration, self.hook.uid)
+        recheck_targets(&self.declaration, self.hook.uid, &self.names)
     }
 }
 
@@ -179,7 +182,12 @@ fn swappable_above(path: &str) -> Option<String> {
 
 /// The reserved-path rules on what each entry points to now, for the step runner to call before
 /// every launch: a link can be re-pointed after the load.
-pub fn recheck_targets(declaration: &Declaration, hook_uid: u32) -> Result<(), Refusal> {
+pub(crate) fn recheck_targets(
+    declaration: &Declaration,
+    hook_uid: u32,
+    names: &BTreeSet<String>,
+) -> Result<(), Refusal> {
+    let _ = names;
     check_targets(declaration, hook_uid == 0)
 }
 
@@ -232,6 +240,7 @@ fn load_file(path: &Path, stem: &str, policy: &Policy<'_>) -> Result<Declared, R
         service,
         hook: hook_user,
         service_gids,
+        names: BTreeSet::new(),
     })
 }
 
@@ -314,6 +323,10 @@ pub fn load_dir(dir: &Path, policy: &Policy<'_>) -> Result<Loaded, io::Error> {
             }),
         }
     }
+    let names: BTreeSet<String> = good
+        .iter()
+        .map(|declared| declared.declaration.name.clone())
+        .collect();
     for declared in &good {
         let other = good
             .iter()
@@ -327,9 +340,11 @@ pub fn load_dir(dir: &Path, policy: &Policy<'_>) -> Result<Loaded, io::Error> {
                 reason: Refusal::Conflict { what, with },
             }),
             None => {
+                let mut declared = declared.clone();
+                declared.names = names.clone();
                 loaded
                     .services
-                    .insert(declared.declaration.name.clone(), declared.clone());
+                    .insert(declared.declaration.name.clone(), declared);
             }
         }
     }

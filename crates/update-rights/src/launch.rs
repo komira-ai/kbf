@@ -72,13 +72,18 @@ pub struct Launch<'a> {
     // The uid of the hook account. Whether it is root is derived from this, in `root_hook`, the one
     // place, and is never a flag a caller supplies.
     hook_uid: u32,
+    // The declared services of the host, for the check that a root hook stays in its own directory.
+    names: &'a BTreeSet<String>,
 }
 
 impl<'a> Launch<'a> {
-    /// A run of `step` of the hook of `declaration`, whose account has the uid `hook_uid`.
-    pub fn new(
+    /// A run of `step` of the hook of `declaration`, whose account has the uid `hook_uid`. Not
+    /// public: the one way to build a launch from outside is [`Launch::of`], which takes the uid
+    /// and the names from what the loader resolved.
+    pub(crate) fn new(
         declaration: &'a Declaration,
         hook_uid: u32,
+        names: &'a BTreeSet<String>,
         step: Step,
         generation: u64,
         release: &'a Path,
@@ -91,6 +96,7 @@ impl<'a> Launch<'a> {
             release,
             params,
             hook_uid,
+            names,
         }
     }
 
@@ -105,6 +111,7 @@ impl<'a> Launch<'a> {
         Launch::new(
             &declared.declaration,
             declared.hook.uid,
+            &declared.names,
             step,
             generation,
             release,
@@ -286,7 +293,8 @@ pub enum RunError {
 /// contract, a signal and a timeout are failures) and the last line of standard output as a
 /// [`Report`] (a missing or malformed line is `{}`).
 pub fn run_step(spawner: &dyn Spawner, launch: &Launch<'_>) -> Result<StepRun, RunError> {
-    recheck_targets(launch.declaration, launch.hook_uid).map_err(RunError::Recheck)?;
+    recheck_targets(launch.declaration, launch.hook_uid, launch.names)
+        .map_err(RunError::Recheck)?;
     let command = command(launch)?;
     let finished = spawner.run(&command)?;
     Ok(StepRun {

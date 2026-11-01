@@ -267,13 +267,29 @@ impl Rig {
             .unwrap_or_else(|| self.dir.join("release"))
     }
 
+    /// The declaration of `spec` as a loaded one: the uid of the account the hook runs as, and the
+    /// service of the rig as the only declared name.
+    pub fn declared(&self, spec: &Spec, hook_args: &[&str]) -> update_rights::Declared {
+        update_rights::Declared {
+            declaration: self.declaration(spec, hook_args),
+            digest: update_rights::Digest::of(b"by hand"),
+            file: PathBuf::from("by-hand.toml"),
+            service: update_rights::UserIds { uid: 1, gid: 1 },
+            hook: update_rights::UserIds {
+                uid: hook_uid(spec),
+                gid: hook_uid(spec),
+            },
+            service_gids: vec![1],
+            names: [self.service()].into_iter().collect(),
+        }
+    }
+
     /// Runs one step of the hook through the real `systemd-run`.
     pub fn run(&self, spec: &Spec, step: Step, hook_args: &[&str]) -> StepRun {
-        let declaration = self.declaration(spec, hook_args);
+        let declared = self.declared(spec, hook_args);
         let release = self.release(spec);
-        let launch = Launch::new(
-            &declaration,
-            hook_uid(spec),
+        let launch = Launch::of(
+            &declared,
             step,
             GENERATION.fetch_add(1, Ordering::Relaxed),
             &release,
@@ -290,11 +306,10 @@ impl Rig {
         step: Step,
         hook_args: &[&str],
     ) -> update_rights::SystemdRun {
-        let declaration = self.declaration(spec, hook_args);
+        let declared = self.declared(spec, hook_args);
         let release = self.release(spec);
-        let launch = Launch::new(
-            &declaration,
-            hook_uid(spec),
+        let launch = Launch::of(
+            &declared,
             step,
             GENERATION.fetch_add(1, Ordering::Relaxed),
             &release,
@@ -311,11 +326,10 @@ impl Rig {
         hook_args: &[&str],
         params: Option<&Path>,
     ) -> Finished {
-        let declaration = self.declaration(spec, hook_args);
+        let declared = self.declared(spec, hook_args);
         let release = self.release(spec);
-        let launch = Launch::new(
-            &declaration,
-            hook_uid(spec),
+        let launch = Launch::of(
+            &declared,
             step,
             GENERATION.fetch_add(1, Ordering::Relaxed),
             &release,

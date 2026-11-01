@@ -143,3 +143,25 @@ pub fn accounts() -> EtcAccounts {
          shared:x:994:tierstore,other\n",
     )
 }
+
+/// A loaded declaration made by hand, for the tests that need one without a directory: its hook
+/// account has the uid `hook_uid` and the host declares these `names` (the service's own among
+/// them).
+pub fn declared(
+    declaration: Declaration,
+    hook_uid: u32,
+    names: &[&str],
+) -> update_rights::Declared {
+    update_rights::Declared {
+        declaration,
+        digest: update_rights::Digest::of(b"by hand"),
+        file: PathBuf::from("by-hand.toml"),
+        service: update_rights::UserIds { uid: 990, gid: 990 },
+        hook: update_rights::UserIds {
+            uid: hook_uid,
+            gid: hook_uid,
+        },
+        service_gids: vec![990],
+        names: names.iter().map(|name| (*name).to_owned()).collect(),
+    }
+}
