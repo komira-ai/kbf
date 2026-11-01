@@ -18,10 +18,10 @@
 //! - [`UsageMode`]: `off`, `record` or `on`.
 //!
 //! Nothing here reads a clock or a flag: days and wall minutes are arguments. The farm on the
-//! js core calls this crate under `--usage-profiles record` (`kbf-server`, `farm_js::usage`)
-//! and gives the scheduler none of the curves, so it changes no placement. Admission reads a
-//! curve only for an action that also has a prediction; handing the curves over is a separate
-//! change.
+//! js core calls this crate under `--usage-profiles record` and `on` (`kbf-server`,
+//! `farm_js::usage`). `record` gives the scheduler none of the curves, so it changes no
+//! placement; `on` gives it [`ProfileSink::curves`], which steers placement. Admission reads a
+//! curve only for an action that also has a prediction.
 #![forbid(unsafe_code)]
 
 mod hub_sink;

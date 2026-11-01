@@ -47,6 +47,9 @@
 //!
 //! # The local socket
 //!
+//! `kbf-host-install approve <service> <sha256>` records the approval of one declaration of the
+//! generic updater that asks for more rights (`update_rights::cli`).
+//!
 //! `kbf-host-install --serve` ([`local`]) serves the same host over a unix socket (mode 0600,
 //! owned by the account of `kbf-updater`) instead of ssh: stage a release beside the running
 //! one, switch to it on trial, confirm it, query, revert. It owns the revert: a release on
@@ -219,6 +222,16 @@ pub fn main() -> ExitCode {
             .map(|arg| arg.to_str().map(str::to_owned))
             .collect();
         return rest.map_or(ExitCode::from(2), |rest| local::production::main(&rest));
+    }
+    // The operator's act on the generic updater: approve one declaration that asks for more
+    // rights (see `update_rights::cli`). Not a flag and not an sshd request: sshd passes no
+    // arguments.
+    if args.first().is_some_and(|arg| arg == "approve") {
+        let rest: Vec<String> = args[1..]
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        return update_rights::cli::main(&rest);
     }
     // Both sides are compiled everywhere, so the Linux build checks the Mac code.
     if cfg!(target_os = "macos") {

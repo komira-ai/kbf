@@ -30,7 +30,7 @@ use crate::{SchedulerCore, UsageProfiles};
 
 const GIB: u64 = 1 << 30;
 
-fn fake() -> Arc<Fake> {
+pub(super) fn fake() -> Arc<Fake> {
     let store = Arc::new(Fake::with_flaw(
         Arc::new(ManualClock::default()),
         Flaw::None,
@@ -112,7 +112,7 @@ impl Store for Gate {
 
 /// The action `tag` runs `compile`, asking for 4 GiB on Linux: every tag is another action
 /// of the one shape.
-fn submission(tag: u8) -> Submission {
+pub(super) fn submission(tag: u8) -> Submission {
     let key = ActionKey {
         instance: "main".to_owned(),
         action: Digest::new(DigestFunction::Sha256, [tag; 32], u64::from(tag)),
@@ -157,7 +157,7 @@ struct Rig {
     seq: u64,
 }
 
-fn state(store: &Arc<dyn Store>) -> StateStore {
+pub(super) fn state(store: &Arc<dyn Store>) -> StateStore {
     StateStore {
         store: Arc::clone(store),
         epoch: EpochPolicy::Keep,
