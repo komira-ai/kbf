@@ -533,6 +533,30 @@ mod tests {
         );
     }
 
+    /// Catches the flag raising an arm: it is a cap, so with 200 a 4 KiB multipart arm (plan
+    /// 1,000) is cut to 200, and a 16 MiB one (plan 100 narrow, 64 wide) keeps its smaller plan.
+    #[test]
+    fn the_multipart_count_caps_an_arm_and_never_raises_it() {
+        let (_dir, env) = env(&[(Role::Cold, "http://127.0.0.1:9")]);
+        let plan = with_multipart_objects(plan(&[1, 16], &[4096, 16 * MIB]), 200);
+        let arms = arms(&env, CellId::ColdPut, &PATHS, &plan, None, None).unwrap();
+        let mut counts: Vec<(&str, u64)> = arms
+            .iter()
+            .filter(|a| a.label.starts_with("direct-mp") & !a.label.contains("open"))
+            .map(|a| (a.label.as_str(), a.requests))
+            .collect();
+        counts.sort_unstable();
+        assert_eq!(
+            counts,
+            [
+                ("direct-mp-16mib-c1-healthy", 100),
+                ("direct-mp-16mib-c16-healthy", 64),
+                ("direct-mp-4kib-c1-healthy", 200),
+                ("direct-mp-4kib-c16-healthy", 200),
+            ]
+        );
+    }
+
     /// Catches a p99 note that is missing below a thousand objects, or present from a thousand:
     /// the line is the one `P99_MIN_N` draws, and the note names the count.
     #[test]
