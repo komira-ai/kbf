@@ -76,7 +76,7 @@ already has:
 - Packs on the same tierstore, under their own prefixes (`--pack-store-*`).
 - Object Lock in tierstore. Not needed: the segment path passes no retention date (a search result, not a proof).
 - Open questions: (A) what the chain's acknowledgement waits for with no write tier; (B) ingress CPU without a tier;
-  (C) how the frontend treats a mismatched node; (D) callers of `retain_until`; (E) how a collector learns of adoptions;
-  (F) for tierstore: a latency histogram, list cost on a large
-  prefix, GC-key behaviour, drain with an unfinished copy, `start-after` paging, and `_journal/` and `_tiering/` hidden
+  (C) callers of `retain_until`; (D) how a collector learns of adoptions;
+  (E) for tierstore: a latency histogram, list cost on a large
+  prefix, GC-key behaviour, `start-after` paging, and `_journal/` and `_tiering/` hidden
   from listings.
