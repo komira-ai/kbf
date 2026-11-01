@@ -154,6 +154,18 @@ pub fn download(token: &str, tag: &str, dir: &Path, names: &[String]) {
     }
 }
 
+/// What the helper's journal says when GitHub refuses its release listing.
+pub const RATE_LIMITED: &str = "rate limited by GitHub";
+
+/// The plain words for a failure whose cause is GitHub's quota for the runner's address, when
+/// `journal` shows the helper was refused for it; `None` for any other failure.
+///
+/// A helper without the token mark asks GitHub anonymously, and the hosted runners of a
+/// region share a small anonymous quota, so the refusal says nothing of the release.
+pub fn rate_limit_note(_journal: &str) -> Option<String> {
+    None
+}
+
 /// The units' journal so far.
 pub fn journal(units: &[&str]) -> String {
     let mut cmd = Command::new("journalctl");
@@ -490,4 +502,25 @@ fn takes_actions_token(path: &Path) -> bool {
 pub fn start_helper() {
     systemctl("start_helper", &["start", HELPER_UNIT]);
     until(HELPER_UNIT, || Path::new(SOCKET).exists());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Catches a rate-limited helper reported as a bare "deploy_farm failed", and a journal
+    /// that mentions nothing of the quota being blamed on it.
+    #[test]
+    fn a_refused_listing_is_explained_and_other_journals_are_not() {
+        let refused = "kbf-host-install: stage: fetch_failed: rate limited by GitHub, retry after \
+                       2026-11-01T05:45:24Z or set token_file\n";
+        let note = rate_limit_note(refused).expect("a note for a rate-limited helper");
+        assert!(note.contains("anonymous"), "{note}");
+        assert!(note.contains("Re-run the job"), "{note}");
+        assert_eq!(
+            rate_limit_note("kbf-host-install: stage: verify_failed\n"),
+            None
+        );
+        assert_eq!(rate_limit_note(""), None);
+    }
 }
