@@ -394,6 +394,7 @@ mod tests {
             in_flight: in_flight.to_vec(),
             object_bytes: sizes.to_vec(),
             open_loop: true,
+            multipart_objects: None,
         }
     }
 

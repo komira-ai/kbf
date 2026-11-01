@@ -70,6 +70,15 @@ pub fn requests_for(size: u64, in_flight: u32) -> u64 {
     if in_flight >= 16 { wide } else { narrow }
 }
 
+/// The note an arm with `requests` objects per pass carries when no p99 may be claimed from it:
+/// below [`stats::P99_MIN_N`] a p99 is the slowest request or close to it. `None` from that many
+/// requests on.
+#[must_use]
+pub fn p99_note(requests: u64) -> Option<String> {
+    let _ = requests;
+    None
+}
+
 /// The open-loop arms: `(size, requests per second, seconds)`.
 const OPEN_LOOP: [(u64, u32, u64); 2] = [(19 * KIB, 20, 600), (MIB, 10, 300)];
 
@@ -334,7 +343,13 @@ mod tests {
             in_flight: in_flight.to_vec(),
             object_bytes: sizes.to_vec(),
             open_loop: true,
+            multipart_objects: None,
         }
+    }
+
+    fn with_multipart_objects(mut plan: CellPlan, n: u64) -> CellPlan {
+        plan.multipart_objects = Some(n);
+        plan
     }
 
     fn summary(arms: &[Arm]) -> Vec<(String, u64, u32)> {
@@ -453,6 +468,72 @@ mod tests {
         )
         .unwrap();
         assert!(capped.iter().all(|a| a.requests == 5));
+    }
+
+    /// Catches the multipart count leaking into a single-PUT arm, not reaching a multipart one
+    /// (at any width, size or role), reaching the open-loop arms (their count is a rate times a
+    /// time), or the ledger being asked for the plan's bytes and not the arm's own: with 7
+    /// objects, `direct` keeps 1,000 and 100, both multipart paths have 7, and each arm's cold
+    /// bytes are its own count times its size.
+    #[test]
+    fn the_multipart_count_is_the_multipart_arms_own_and_the_ledger_follows_it() {
+        let (_dir, env) = env(&[
+            (Role::Cold, "http://127.0.0.1:9"),
+            (Role::Instance, "http://127.0.0.1:9"),
+        ]);
+        let plan = with_multipart_objects(plan(&[1, 16], &[19 * 1024, 16 * MIB]), 7);
+        let arms = arms(&env, CellId::ColdPut, &PATHS, &plan, None, None).unwrap();
+        let closed: Vec<(&str, u64, u64)> = arms
+            .iter()
+            .filter(|a| !matches!(a.pace, Pace::Open { .. }))
+            .map(|a| (a.label.as_str(), a.requests, a.cold_bytes_per_pass))
+            .collect();
+        let size = |label: &str| {
+            if label.contains("19kib") {
+                19 * 1024
+            } else {
+                16 * MIB
+            }
+        };
+        for (label, requests, cold_bytes) in &closed {
+            let want = if label.starts_with("direct-") && !label.starts_with("direct-mp") {
+                requests_for(size(label), if label.contains("c16") { 16 } else { 1 })
+            } else {
+                7
+            };
+            assert_eq!(*requests, want, "{label}");
+            assert_eq!(*cold_bytes, want * size(label), "{label}");
+        }
+        assert_eq!(closed.len(), 12);
+        let open: Vec<(&str, u64)> = arms
+            .iter()
+            .filter(|a| matches!(a.pace, Pace::Open { .. }))
+            .map(|a| (a.label.as_str(), a.requests))
+            .collect();
+        assert_eq!(
+            open,
+            [
+                ("direct-19kib-open20-healthy", 12_000),
+                ("direct-mp-19kib-open20-healthy", 12_000),
+                ("instance-19kib-open20-healthy", 12_000),
+            ]
+        );
+    }
+
+    /// Catches a p99 note that is missing below a thousand objects, or present from a thousand:
+    /// the line is the one `P99_MIN_N` draws, and the note names the count.
+    #[test]
+    fn the_p99_note_is_there_below_a_thousand_objects_and_only_there() {
+        assert_eq!(
+            p99_note(999).as_deref(),
+            Some("p99 not reported: 999 objects per pass, fewer than the 1,000 a p99 needs")
+        );
+        assert_eq!(
+            p99_note(12).as_deref(),
+            Some("p99 not reported: 12 objects per pass, fewer than the 1,000 a p99 needs")
+        );
+        assert_eq!(p99_note(1000), None);
+        assert_eq!(p99_note(12_000), None);
     }
 
     const GIB: u64 = 1 << 30;

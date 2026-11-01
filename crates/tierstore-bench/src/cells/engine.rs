@@ -837,6 +837,7 @@ pub async fn run_cell(
             notes,
             cold_state: got.cold_state,
             rate_caps: Some(env.config.rates),
+            objects_per_pass: None,
         };
         write_new(&env.result_path(cell, &result.arm), &result.to_json())?;
         results.push(result);

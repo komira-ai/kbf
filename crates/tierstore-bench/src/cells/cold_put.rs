@@ -98,6 +98,7 @@ mod tests {
             in_flight: vec![2],
             object_bytes: sizes.to_vec(),
             open_loop: true,
+            multipart_objects: None,
         }
     }
 
@@ -167,6 +168,114 @@ mod tests {
                 .any(|r| (r.role, r.method.as_str()) == (Role::Instance, "POST"))
         );
         assert!(sent.iter().all(|r| r.bucket == "kbf-fake"));
+    }
+
+    fn with_multipart_objects(mut plan: CellPlan, n: u64) -> CellPlan {
+        plan.multipart_objects = Some(n);
+        plan
+    }
+
+    /// Catches the multipart count not reaching a multipart arm, leaking into the single-PUT arm,
+    /// or the ledger charging the plan's bytes and not the bytes put: with 3 multipart objects
+    /// and the requests capped at 5, `direct` puts 5 a pass and both multipart arms 3, the store
+    /// sees exactly those puts, and the ledger holds their bytes.
+    #[tokio::test]
+    async fn the_multipart_arms_put_their_own_count_and_the_direct_arm_its_own() {
+        let dir = temp("tb-cold-put-mp-count");
+        let (cold, instance) = (FakeS3::start().await, FakeS3::start().await);
+        let stores = [
+            (Role::Cold, cold.endpoint()),
+            (Role::Instance, instance.endpoint()),
+        ];
+        let ctx = testkit::ctx(dir.path(), &stores, Window::Busy);
+        let plan = with_multipart_objects(plan(&[4096]), 3);
+        let results = run_with(&ctx, &plan, Script::calm(), None, Some(5))
+            .await
+            .unwrap();
+        let counted: Vec<(&str, Vec<u64>)> = results
+            .iter()
+            .map(|r| {
+                (
+                    r.arm.as_str(),
+                    r.passes.iter().map(|p| p.requests).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            counted,
+            [
+                ("direct-4kib-c2-healthy", vec![5, 5]),
+                ("direct-mp-4kib-c2-healthy", vec![3, 3]),
+                ("instance-4kib-c2-healthy", vec![3, 3]),
+            ]
+        );
+        let (c, i) = (cold.stats(), instance.stats());
+        assert_eq!((c.single_puts, c.completed), (10, 6));
+        assert_eq!((i.single_puts, i.completed), (0, 6));
+        let ledger = std::fs::read_to_string(dir.path().join("ledger.json")).unwrap();
+        assert_eq!(
+            ledger,
+            format!("{{\"cold_written_bytes\":{}}}", (5 + 3 + 3) * 2 * 4096)
+        );
+    }
+
+    /// Catches a p99 claimed from fewer than a thousand requests, or an arm that drops the p99
+    /// without saying why: in a quiet window with the multipart arms at 3 objects and the direct
+    /// arm capped at 5, no arm has a p99 and every arm's notes give its own count as the reason.
+    #[tokio::test]
+    async fn an_arm_under_a_thousand_objects_records_no_p99_and_says_why() {
+        let dir = temp("tb-cold-put-mp-p99");
+        let (cold, instance) = (FakeS3::start().await, FakeS3::start().await);
+        let stores = [
+            (Role::Cold, cold.endpoint()),
+            (Role::Instance, instance.endpoint()),
+        ];
+        let ctx = testkit::ctx(dir.path(), &stores, Window::Quiet);
+        let plan = with_multipart_objects(plan(&[4096]), 3);
+        let results = run_with(&ctx, &plan, Script::calm(), None, Some(5))
+            .await
+            .unwrap();
+        let why = |n: u64| {
+            format!("p99 not reported: {n} objects per pass, fewer than the 1,000 a p99 needs")
+        };
+        for (result, n) in results.iter().zip([5, 3, 3]) {
+            let p99: Vec<Option<u64>> = result
+                .passes
+                .iter()
+                .map(|p| p.percentiles.unwrap().p99_us)
+                .collect();
+            assert_eq!(p99, [None, None], "{}", result.arm);
+            let reasons = result.notes.iter().filter(|x| x.starts_with("p99 "));
+            assert_eq!(reasons.collect::<Vec<_>>(), [&why(n)], "{}", result.arm);
+        }
+    }
+
+    /// Catches a result that does not say how many objects its arm put per pass, in the value
+    /// returned or in the file written: the JSON of each arm holds the count the arm used.
+    #[tokio::test]
+    async fn the_result_records_the_object_count_used() {
+        let dir = temp("tb-cold-put-mp-record");
+        let (cold, instance) = (FakeS3::start().await, FakeS3::start().await);
+        let stores = [
+            (Role::Cold, cold.endpoint()),
+            (Role::Instance, instance.endpoint()),
+        ];
+        let ctx = testkit::ctx(dir.path(), &stores, Window::Busy);
+        let plan = with_multipart_objects(plan(&[4096]), 3);
+        let results = run_with(&ctx, &plan, Script::calm(), None, Some(5))
+            .await
+            .unwrap();
+        let used: Vec<Option<u64>> = results.iter().map(|r| r.objects_per_pass).collect();
+        assert_eq!(used, [Some(5), Some(3), Some(3)]);
+        let written: Vec<Option<u64>> = results
+            .iter()
+            .map(|r| {
+                let file = dir.path().join(format!("cold-put-{}-a1.json", r.arm));
+                let text = std::fs::read_to_string(file).unwrap();
+                CellResult::from_json(&text).unwrap().objects_per_pass
+            })
+            .collect();
+        assert_eq!(written, used);
     }
 
     /// Catches fault modes not set around each pass, or not put back before the cleanup (a
