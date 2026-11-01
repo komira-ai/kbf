@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use clap::error::ErrorKind;
-use clap::{Parser, ValueEnum};
+use clap::{CommandFactory, Parser, ValueEnum};
 use kbf_front::Cache;
 use kbf_usage::UsageMode;
 
@@ -252,4 +252,25 @@ fn metrics_mode_gauge_is_one_for_the_running_mode() {
         crate::metrics::render_farm(&mut out, &farm(flags));
         assert!(out.contains(&expected), "{flags:?}: {out}");
     }
+}
+
+/// Catches the flag's help naming a staleness bound other than the one the curves use: the
+/// help says how long a key may go unrun before it is charged flat, and that number is
+/// `js_usage::STALE_DAYS`, read from the clap command so the two cannot drift.
+#[test]
+fn the_help_names_the_staleness_bound_the_curves_use() {
+    let command = Args::command();
+    let argument = command
+        .get_arguments()
+        .find(|argument| argument.get_id() == "usage_profiles")
+        .expect("the flag exists");
+    let help = argument
+        .get_long_help()
+        .or_else(|| argument.get_help())
+        .expect("the flag has help")
+        .to_string();
+    assert!(
+        help.contains(&format!("over {} days", js_usage::STALE_DAYS)),
+        "{help}"
+    );
 }
