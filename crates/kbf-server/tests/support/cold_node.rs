@@ -105,7 +105,19 @@ pub fn flags(rig: &Rig, name: &str, cold: &str, env: fn(&str) -> Option<String>)
 /// `localhost:port`: the same node again, for a restart over the metadata log it left.
 pub fn flags_at(
     rig: &Rig,
+    at: (PathBuf, u16),
+    cold: &str,
+    env: fn(&str) -> Option<String>,
+) -> StorageFlags {
+    flags_as(rig, at, "storage", cold, env)
+}
+
+/// [`flags_at`] for a node whose certificate holds `role`: any but `storage` is a node the
+/// frontend's role table denies the cold-store service.
+pub fn flags_as(
+    rig: &Rig,
     (d, port): (PathBuf, u16),
+    role: &str,
     cold: &str,
     env: fn(&str) -> Option<String>,
 ) -> StorageFlags {
@@ -114,7 +126,7 @@ pub fn flags_at(
         std::fs::write(&path, text).expect("write");
         path.display().to_string()
     };
-    let (cert, key) = rig.farm.pki.client_pem(Some("storage"), &["localhost"]);
+    let (cert, key) = rig.farm.pki.client_pem(Some(role), &["localhost"]);
     let argv = [
         "storage".to_owned(),
         "--storage-listen=127.0.0.1:0".to_owned(),

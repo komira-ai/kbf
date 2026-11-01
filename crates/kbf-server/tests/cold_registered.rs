@@ -27,8 +27,8 @@ use kbf_state::ManualClock;
 use kbf_state::Store;
 use kbf_state::fake::{Fake, Flaw};
 use node::{
-    ID, Rig, SECRET, class, dir, flags, flags_at, never, next_port, no_keys, own_keys, promoted,
-    registered, reported_status, rig, round_trip, spin_until, started,
+    ID, Rig, SECRET, class, dir, flags, flags_as, flags_at, never, next_port, no_keys, own_keys,
+    promoted, registered, reported_status, rig, round_trip, spin_until, started,
 };
 
 const REGISTERED: &str = "registered";
@@ -241,6 +241,32 @@ async fn registered_keys_that_fail_the_probe_never_fall_back() {
         .filter(|r| r.contains(".kbf-probe"))
         .collect();
     assert_eq!(probes.len(), 1, "the refused write only: {probes:?}");
+}
+
+/// Catches a registered node that waits for ever for a frontend that denied it (defect: a
+/// refusal is waited out as a frontend that cannot answer), or whose refusal is told as
+/// something a restart clears: a node whose certificate holds no storage role is denied the
+/// cold-store service, so the start ends with that refusal, exit 2, and no store was touched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_registered_node_the_frontend_denies_does_not_start() {
+    let rig = rig(3, |s3| registered(s3, "bkt", ID, SECRET)).await;
+    let at = (dir("denied"), next_port());
+    let node = flags_as(&rig, at, "daemon", REGISTERED, no_keys);
+    let Err(error) = started(&node).await else {
+        panic!("a node the frontend denied started");
+    };
+    let refusal = error
+        .downcast_ref::<ColdApplyError>()
+        .unwrap_or_else(|| panic!("an apply error: {error}"));
+    assert!(
+        matches!(
+            refusal,
+            ColdApplyError::Refused(tonic::Code::PermissionDenied)
+        ),
+        "{refusal:?}"
+    );
+    assert_eq!(class(&*error), StartFailure::Refused);
+    assert!(rig.s3.requests().is_empty());
 }
 
 /// Catches a registered node with nothing to ask (defect: it waits for ever on no
