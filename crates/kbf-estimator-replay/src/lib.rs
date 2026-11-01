@@ -46,11 +46,14 @@
 //!
 //! # Per-build numbers
 //!
-//! A row carries the invocation (`tool_invocation_id`) and, when the client sent one, the
-//! build (`correlated_invocations_id`) of the Execute request its attempt belonged to, as the
-//! server's run record holds them ([`row::Row`]). [`builds`] turns rows into per-build wall
-//! time and queue wait, and into per-run values shaped for `js-analysis`'s `RunRecord`. A row
-//! from a server that predates the ids has none, and no build is made of it.
+//! A row carries the invocation (`tool_invocation_id`, one buck2 command) and, when the
+//! client sent one, the CI job (`correlated_invocations_id`) of the Execute request its
+//! attempt belonged to, as the server's run record holds them ([`row::Row`]). [`builds`]
+//! turns rows into per-build numbers (the server's action span, the queue time total, the
+//! attempt queue wait distribution) and into per-run values shaped for `js-analysis`'s
+//! `RunRecord`. The action span excludes the client's own analysis and local actions: the
+//! paper's build wall comes from the client. A row from a server that predates the ids has
+//! none, and no build is made of it.
 //!
 //! This crate is a workspace member under the coverage gate (99% of lines and branches):
 //! the verbs are library functions over injected I/O, `main` is three lines, and every

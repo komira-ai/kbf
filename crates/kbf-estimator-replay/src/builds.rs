@@ -7,7 +7,10 @@
 //! `RequestMetadata`: the `tool_invocation_id`, which is one buck2 command and what buck2's
 //! Build ID joins to. That is the build ([`GroupBy::Invocation`], the default).
 //! [`GroupBy::Correlated`] groups by `correlated_invocations_id` instead: the CI-job view,
-//! where several commands of one job are one build. A row without the id of the chosen view is
+//! where several commands of one job are one build. The server snapshots the correlated id
+//! when each attempt ends (the first non-empty value seen by then), so an invocation whose
+//! early calls sent none can have rows with it and rows without: under this grouping those
+//! early rows are counted as rows with no id and the invocation's build is split. A row without the id of the chosen view is
 //! in no build and is counted ([`BuildStats::rows_without_id`]); an export from a server that
 //! does not record the ids has no builds, and nothing is estimated for it.
 //!
@@ -124,14 +127,119 @@ impl BuildStats {
     }
 
     /// One `js-analysis` `RunRecord` per build, as JSON values.
-    pub fn run_records(&self, _labels: &RunLabels) -> Vec<Value> {
-        let _ = json!(null);
-        Vec::new()
+    pub fn run_records(&self, labels: &RunLabels) -> Vec<Value> {
+        let number = |v: Option<u64>| v.map_or(Value::Null, |v| json!(v as f64));
+        self.runs
+            .iter()
+            .enumerate()
+            .map(|(i, run)| {
+                json!({
+                    "setting": labels.setting,
+                    "arm": labels.arm,
+                    "run_index": i,
+                    "seed": labels.seed,
+                    "commit": labels.commit,
+                    "label": "",
+                    "metrics": {
+                        "build_action_span_us": number(run.action_span_us),
+                        "build_queue_time_total_us": number(run.queue_time_total_us),
+                        "build_attempt_queue_wait_p50_us": number(run.attempt_queue_wait.p50),
+                        "build_attempt_queue_wait_p90_us": number(run.attempt_queue_wait.p90),
+                        "build_attempts": run.attempts as f64,
+                    },
+                })
+            })
+            .collect()
     }
 }
 
-/// The per-build numbers of `rows`.
-pub fn analyze(_rows: &[Row], _group: GroupBy) -> BuildStats {
-    let _ = BTreeMap::<String, u64>::new();
-    BuildStats::default()
+/// What one build's rows have said so far.
+#[derive(Default)]
+struct Open {
+    attempts: u64,
+    first_queued: u64,
+    last_ended: Option<u64>,
+    unfinished: bool,
+    waits: Vec<u64>,
+}
+
+/// The value at percentile `p` (1 to 100) of `sorted`, by nearest rank.
+fn nearest(sorted: &[u64], p: u64) -> Option<u64> {
+    let rank = (p * sorted.len() as u64).div_ceil(100).max(1);
+    sorted.get((rank - 1) as usize).copied()
+}
+
+fn spread(mut values: Vec<u64>) -> Spread {
+    values.sort_unstable();
+    Spread {
+        p50: nearest(&values, 50),
+        p90: nearest(&values, 90),
+    }
+}
+
+/// The per-build numbers of `rows`, builds being what `group` says.
+pub fn analyze(rows: &[Row], group: GroupBy) -> BuildStats {
+    let mut stats = BuildStats::default();
+    let mut builds: BTreeMap<&str, Open> = BTreeMap::new();
+    for row in rows {
+        let id = match group {
+            GroupBy::Invocation => row.invocation_id.as_deref(),
+            GroupBy::Correlated => row.correlated_invocations_id.as_deref(),
+        };
+        let Some(build) = id else {
+            stats.rows_without_id += 1;
+            continue;
+        };
+        let open = builds.entry(build).or_insert_with(|| Open {
+            first_queued: row.queued_us,
+            ..Open::default()
+        });
+        open.attempts += 1;
+        open.first_queued = open.first_queued.min(row.queued_us);
+        match row.ended_us {
+            None => open.unfinished = true,
+            Some(ended) => open.last_ended = open.last_ended.max(Some(ended)),
+        }
+        if let Some(started) = row.started_us {
+            match started.checked_sub(row.queued_us) {
+                Some(wait) => open.waits.push(wait),
+                None => stats.out_of_order += 1,
+            }
+        }
+    }
+    let mut ordered: Vec<(&str, Open)> = builds.into_iter().collect();
+    ordered.sort_by_key(|(name, open)| (open.first_queued, *name));
+    let (mut spans, mut totals) = (Vec::new(), Vec::new());
+    let (mut p50s, mut p90s) = (Vec::new(), Vec::new());
+    for (name, open) in ordered {
+        stats.unfinished += u64::from(open.unfinished);
+        let span = open
+            .last_ended
+            .filter(|_| !open.unfinished)
+            .and_then(|ended| {
+                let span = ended.checked_sub(open.first_queued);
+                stats.out_of_order += u64::from(span.is_none());
+                span
+            });
+        let total = (!open.waits.is_empty()).then(|| open.waits.iter().sum::<u64>());
+        let wait = spread(open.waits);
+        spans.extend(span);
+        totals.extend(total);
+        p50s.extend(wait.p50);
+        p90s.extend(wait.p90);
+        stats.runs.push(BuildRun {
+            build: name.to_owned(),
+            attempts: open.attempts,
+            action_span_us: span,
+            queue_time_total_us: total,
+            attempt_queue_wait: wait,
+        });
+    }
+    stats.span_samples = spans.len() as u64;
+    stats.action_span = spread(spans);
+    stats.queue_total_samples = totals.len() as u64;
+    stats.queue_time_total = spread(totals);
+    stats.attempt_wait_p50 = spread(p50s);
+    stats.attempt_wait_p90 = spread(p90s);
+    stats
 }

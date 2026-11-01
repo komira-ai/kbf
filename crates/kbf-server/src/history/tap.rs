@@ -426,7 +426,7 @@ pub(crate) fn run_record(row: &ActionRow, attempt: &Attempt) -> RunRecord {
 
 /// Names on `record` the invocation its attempt's request belonged to (the client's id,
 /// without the `~<n>` of a second caller's record) and, if a call of the invocation sent
-/// one, the build it is part of. [`run_record`] cannot: a row does not know its record.
+/// one, the group (a CI job) it is part of. [`run_record`] cannot: a row does not know its record.
 pub(crate) fn name_build(record: &mut RunRecord, key: &RecordKey, correlated: Option<&str>) {
     record.invocation_id = Some(key.id().as_str().to_owned());
     record.correlated_invocations_id = correlated.map(str::to_owned);
