@@ -401,22 +401,18 @@ async fn the_audit_ring_keeps_the_last_64_and_status_shows_it() {
     assert_eq!(seqs, (3..=66).collect::<Vec<u64>>());
 }
 
-/// Catches: an operator change reaching a decision in this build (nothing reads the ops state
-/// yet): the same heartbeats against the same desired state get the same replies, and the same
-/// per-service status, with exclusions and labels set on the hosts as without.
+/// Catches: labels reaching a decision of a service that has no selector: the same heartbeats
+/// against the same desired state get the same replies, and the same per-service status, with
+/// labels set on a host as without. (Exclusions do change what a host is told: they are
+/// tested in `membership_tests`.)
 #[tokio::test]
-async fn operator_changes_do_not_change_what_a_host_is_told() {
+async fn labels_do_not_change_what_a_host_is_told_without_a_selector() {
     async fn run(name: &str, operate: bool) -> (Vec<Value>, Value) {
         let rig = Rig::new(name);
         rig.set(STATE).await;
         if operate {
-            for body in [
-                EXCLUDE,
-                r#"{"action":"exclude","service":"kbf","node_id":"s1","reason":"r"}"#,
-                r#"{"action":"set_labels","node_id":"f1","labels":{"zone":"a"}}"#,
-            ] {
-                assert_eq!(post(&rig, Some(OPERATOR), body).await.0, StatusCode::OK);
-            }
+            let body = r#"{"action":"set_labels","node_id":"f1","labels":{"zone":"a"}}"#;
+            assert_eq!(post(&rig, Some(OPERATOR), body).await.0, StatusCode::OK);
         }
         let mut replies = Vec::new();
         for at in [1_100, 1_200, 1_300] {

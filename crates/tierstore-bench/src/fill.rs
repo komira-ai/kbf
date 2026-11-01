@@ -1519,6 +1519,7 @@ mod tests {
             }),
             gate_tripped: None,
             cold_guard: None,
+            cold_window: None,
             proxy_requests: None,
             disk_busy: BTreeMap::new(),
             peak_in_flight: 0,
@@ -1990,6 +1991,7 @@ mod tests {
             limit: 1.0,
             requests: 50,
             window_secs: 10,
+            detail: None,
         });
         r.cold_state.push(PassColdState {
             pass: 2,
