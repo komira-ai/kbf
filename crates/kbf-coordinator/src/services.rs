@@ -37,7 +37,15 @@
 //! min_up = 0                     # optional; absent: the desired state's number
 //! never_last = false             # default false
 //! after = ["storage"]            # roles of this service this role waits for
+//! pool = "daemons"               # optional: share this role's slots with every service whose
+//!                                # role of the same name names the same pool
 //! ```
+//!
+//! A `pool` is named, not declared: two services whose role of one name gives the same pool
+//! share one count of hosts holding a slot on that role, and each compares the count with its
+//! own `max_updating`. A role without a pool counts the slots of its own service only, and a
+//! pool only one service names decides exactly as no pool. A pool name is 1 to
+//! [`MAX_SERVICE_NAME`] bytes of lowercase letters, digits and `-`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -80,6 +88,9 @@ pub struct RoleDef {
     /// The roles of the same service whose live hosts must all run the desired version, and
     /// not be updating, before a host of this role is ordered.
     pub after: Vec<String>,
+    /// The named pool whose update slots this role shares with every other service's role
+    /// of the same name in the same pool. `None`: the service's slots are its own.
+    pub pool: Option<String>,
 }
 
 impl RoleDef {
@@ -91,6 +102,7 @@ impl RoleDef {
             min_up: None,
             never_last: false,
             after: Vec::new(),
+            pool: None,
         }
     }
 
@@ -269,6 +281,7 @@ struct RawRole {
     never_last: bool,
     #[serde(default)]
     after: Vec<String>,
+    pool: Option<String>,
 }
 
 fn invalid<T>(why: String) -> Result<T, ServicesError> {
@@ -299,6 +312,11 @@ fn role_def(
     {
         return invalid(format!("{service}: a count is over {MAX_COUNT}"));
     }
+    if let Some(pool) = raw.pool.as_deref().filter(|p| !is_service_name(p)) {
+        return invalid(format!(
+            "{service}: pool {pool:?} is not 1 to {MAX_SERVICE_NAME} bytes of lowercase letters, digits and -"
+        ));
+    }
     let after = raw
         .after
         .iter()
@@ -318,6 +336,7 @@ fn role_def(
         min_up: raw.min_up,
         never_last: raw.never_last,
         after,
+        pool: raw.pool,
     })
 }
 
@@ -450,7 +469,7 @@ impl Services {
     /// # Errors
     /// [`ServicesError`]: the text is not TOML of the shape, a name is bad or repeated (`kbf`
     /// only as the first entry, once), a service has no roles, `kbf` has an `after`, there
-    /// are more than [`MAX_SERVICES`] services, a role name or count is unusable, or an
+    /// are more than [`MAX_SERVICES`] services, a role name, count or pool name is unusable, or an
     /// `after` names what does not exist (or is defined later, which also forbids a cycle).
     pub fn parse(text: &str) -> Result<Self, ServicesError> {
         let file: RawFile =

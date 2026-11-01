@@ -20,7 +20,9 @@
 //! 6. the service's canary gate, if it has one, is open to the host ([`crate::canary`]; a
 //!    host that is deferring is not chosen as a canary);
 //! 7. the service runs on the host's role, and the role has room: fewer hosts of the role
-//!    hold a slot than `max_updating` allows (a
+//!    hold a slot than `max_updating` allows (with a named `pool` on the role, a host
+//!    holding a slot for any service whose role of that name is in the same pool counts,
+//!    once however many of them it holds; [`crate::services`]) (a
 //!    host holds a slot while updating, while its promotion is pending, after a failed update
 //!    until it heartbeats healthy, from the order the coordinator gave it until the host
 //!    reports it or the order ages out, [`crate::fleet::ORDER_AGE`], and, at the desired
@@ -48,7 +50,7 @@
 //! The reply carries the desired version and nothing else. [`decide_why`] is the same
 //! decision that also says which rule held ([`Hold`]); [`decide_in`] drops the reason.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use kbf_types::NodeId;
@@ -59,7 +61,7 @@ use serde::Serialize;
 use crate::canary;
 use crate::desired::{Desired, KBF};
 use crate::fleet::{Fleet, Host};
-use crate::services::{ServiceDef, Services};
+use crate::services::{RoleDef, ServiceDef, Services};
 
 /// What to tell the `kbf` host `id` at `now`, when `kbf` is the only service.
 #[must_use]
@@ -176,7 +178,7 @@ pub fn decide_marked(
     let Some(want) = desired.get(service) else {
         return Decision::Hold(Hold::NoDesired);
     };
-    match first_hold(def, want, desired, bad, fleet, id, now) {
+    match first_hold(services, def, want, desired, bad, fleet, id, now) {
         Some(why) => Decision::Hold(why),
         None => Decision::Update {
             version: want.version.clone(),
@@ -185,7 +187,12 @@ pub fn decide_marked(
 }
 
 /// The first rule that fails for the host `id`, or `None` when every rule holds.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the inputs of the one decision, passed down from decide_marked"
+)]
 fn first_hold(
+    services: &Services,
     def: &ServiceDef,
     desired: &Desired,
     all: &BTreeMap<String, Desired>,
@@ -207,16 +214,7 @@ fn first_hold(
         .last_update
         .as_ref()
         .is_some_and(|r| r.outcome == Outcome::Failed && r.target == desired.version);
-    let in_role = || others().filter(|(_, h)| h.role_name() == host.role_name());
-    let slots = in_role()
-        .filter(|(o, h)| fleet.holds_slot(service, o, h, now))
-        .count();
-    let baking = in_role()
-        .filter(|(o, h)| {
-            !fleet.holds_slot(service, o, h, now)
-                && fleet.is_baking(service, o, h, &desired.version, def.bake_beats, now)
-        })
-        .count();
+    let (slots, baking) = slots_in_use(services, def, role, all, fleet, id, host.role_name(), now);
     let rules = [
         (fleet.is_quiet(now), Hold::Quiet),
         (bad.contains(&desired.version), Hold::Bad),
@@ -275,6 +273,68 @@ fn first_hold(
     rules
         .into_iter()
         .find_map(|(holds, why)| holds.then_some(why))
+}
+
+/// The services whose count of slots on `role_name` is `def`'s: `def` alone, or, when its
+/// role names a pool, every service whose role of that name is in the same pool.
+fn sharing<'a>(
+    services: &'a Services,
+    def: &'a ServiceDef,
+    role_name: &str,
+    role: &RoleDef,
+) -> Vec<&'a ServiceDef> {
+    role.pool.as_ref().map_or_else(
+        || vec![def],
+        |pool| {
+            services
+                .defs()
+                .filter(|d| {
+                    d.name == def.name
+                        || d.roles
+                            .get(role_name)
+                            .is_some_and(|r| r.pool.as_ref() == Some(pool))
+                })
+                .collect()
+        },
+    )
+}
+
+/// How many hosts of the role `role_name` other than `id` hold a slot for any service that
+/// shares `def`'s count ([`sharing`]), and how many more hold none and are baking: each host
+/// counted once, whichever and however many services it holds a slot for.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the inputs of the one decision, passed down from first_hold"
+)]
+fn slots_in_use(
+    services: &Services,
+    def: &ServiceDef,
+    role: &RoleDef,
+    all: &BTreeMap<String, Desired>,
+    fleet: &Fleet,
+    id: &NodeId,
+    role_name: &str,
+    now: Duration,
+) -> (usize, usize) {
+    let mut holding = BTreeSet::new();
+    let mut baking = BTreeSet::new();
+    for member in sharing(services, def, role_name, role) {
+        let name = member.name.as_str();
+        let want = all.get(name);
+        for (o, h) in fleet
+            .hosts_of(name)
+            .filter(|(o, h)| *o != id && h.role_name() == role_name)
+        {
+            if fleet.holds_slot(name, o, h, now) {
+                holding.insert(o);
+            } else if want
+                .is_some_and(|w| fleet.is_baking(name, o, h, &w.version, member.bake_beats, now))
+            {
+                baking.insert(o);
+            }
+        }
+    }
+    (holding.len(), baking.difference(&holding).count())
 }
 
 /// Whether `h` is live and not yet at `desired`, or still updating: what a later role or

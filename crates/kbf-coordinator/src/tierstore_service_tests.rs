@@ -49,6 +49,7 @@ fn the_shipped_definition_says_what_the_rollout_rests_on() {
                 min_up: Some(4),
                 never_last: false,
                 after: Vec::new(),
+                pool: Some("storage".to_owned()),
             }
         )]
     );
