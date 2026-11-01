@@ -22,6 +22,9 @@
 //! Every change carries an [`AuditEntry`]: the store numbers it, keeps the last
 //! [`AUDIT_RING`] in the file and logs it on the target `kbf_coordinator::audit`.
 //!
+//! The caps on the counts (`MAX_HOSTS`, `MAX_EXCLUDED`) are checked under the same lock as the
+//! write ([`OpsStore::try_change`]), on the state the change is applied to.
+//!
 //! The operator actions ([`operate`]) are the only writers in this PR; nothing reads the
 //! store when it decides what a host is told.
 
@@ -344,12 +347,32 @@ impl OpsStore {
     pub fn change(
         &self,
         write: Write,
-        mut entry: AuditEntry,
+        entry: AuditEntry,
         edit: impl FnOnce(&mut OpsState),
     ) -> Result<AuditEntry, OpsError> {
+        self.try_change(write, entry, |state| {
+            edit(state);
+            Ok::<(), OpsError>(())
+        })
+    }
+
+    /// [`Self::change`] with an edit that may refuse. The edit runs under the lock that
+    /// serialises writes, on the state the change is applied to, so a limit it checks (a cap
+    /// on a count) holds however many callers there are. When it refuses, its error is
+    /// returned and nothing else happens: the state, the ring and its numbering and the file
+    /// are as they were, and nothing is logged.
+    ///
+    /// # Errors
+    /// The edit's own error, or [`OpsError`] as for [`Self::change`].
+    pub fn try_change<E: From<OpsError>>(
+        &self,
+        write: Write,
+        mut entry: AuditEntry,
+        edit: impl FnOnce(&mut OpsState) -> Result<(), E>,
+    ) -> Result<AuditEntry, E> {
         let _writer = self.writing.lock().unwrap_or_else(PoisonError::into_inner);
         let mut next = self.state();
-        edit(&mut next);
+        edit(&mut next)?;
         entry.seq = next.audit.last().map_or(1, |last| last.seq + 1);
         next.audit.push(entry.clone());
         let surplus = next.audit.len().saturating_sub(AUDIT_RING);
@@ -515,26 +538,25 @@ pub fn operate(
                 node_id: node(&node_id)?,
                 reason: reason(&why)?,
             };
-            let known = store.state().excluded.iter().any(|e| {
-                (e.service.as_str(), e.node_id.as_str())
-                    == (exclusion.service.as_str(), exclusion.node_id.as_str())
-            });
-            if !known && store.state().excluded.len() >= MAX_EXCLUDED {
-                return Err(OperateError::Capped {
-                    what: "exclusions (MAX_EXCLUDED)",
-                    max: MAX_EXCLUDED,
-                });
-            }
             let mut entry = AuditEntry::new(by, "exclude");
             entry.service = Some(exclusion.service.clone());
             entry.node_id = Some(exclusion.node_id.clone());
             entry.reason = Some(exclusion.reason.clone());
-            store.change(Write::BeforeMemory, entry, |state| {
+            store.try_change(Write::BeforeMemory, entry, |state| {
+                let before = state.excluded.len();
                 state.excluded.retain(|e| {
                     (e.service.as_str(), e.node_id.as_str())
                         != (exclusion.service.as_str(), exclusion.node_id.as_str())
                 });
+                let known = state.excluded.len() < before;
+                if !known && before >= MAX_EXCLUDED {
+                    return Err(OperateError::Capped {
+                        what: "exclusions (MAX_EXCLUDED)",
+                        max: MAX_EXCLUDED,
+                    });
+                }
                 state.excluded.push(exclusion);
+                Ok(())
             })?
         }
         Action::Include {
@@ -558,21 +580,22 @@ pub fn operate(
                     "labels are at most 8, each key and value 1 to 32 bytes of [a-z0-9-]",
                 ));
             }
-            let grows = !labels.is_empty() && !store.state().hosts.contains_key(&id);
-            if grows && store.state().hosts.len() >= MAX_HOSTS {
-                return Err(OperateError::Capped {
-                    what: "hosts with labels (MAX_HOSTS)",
-                    max: MAX_HOSTS,
-                });
-            }
             let mut entry = AuditEntry::new(by, "set_labels");
             entry.node_id = Some(id.clone());
-            store.change(Write::BeforeMemory, entry, |state| {
+            store.try_change(Write::BeforeMemory, entry, |state| {
                 if labels.is_empty() {
                     state.hosts.remove(&id);
                 } else {
+                    let grows = !state.hosts.contains_key(&id);
+                    if grows && state.hosts.len() >= MAX_HOSTS {
+                        return Err(OperateError::Capped {
+                            what: "hosts with labels (MAX_HOSTS)",
+                            max: MAX_HOSTS,
+                        });
+                    }
                     state.hosts.insert(id, HostOps { labels });
                 }
+                Ok(())
             })?
         }
     })
