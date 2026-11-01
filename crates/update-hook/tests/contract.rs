@@ -245,7 +245,7 @@ fn the_last_line_is_read_with_all_its_fields() {
             reason: Some("lease_unreachable".to_owned()),
             retry_after_secs: Some(300),
             reversible: false,
-            reversible_stated: false,
+            reversible_stated: true,
             promotion_pending: true,
             detail: Some("no hello".to_owned()),
         }
@@ -269,7 +269,7 @@ fn a_report_prints_as_one_line_and_reads_back() {
         reason: Some("r".to_owned()),
         retry_after_secs: Some(7),
         reversible: false,
-        reversible_stated: false,
+        reversible_stated: true,
         promotion_pending: true,
         detail: Some("two\nlines".to_owned()),
     };
@@ -1129,13 +1129,16 @@ fn the_cleanup_row() {
 }
 
 /// Catches two rules that hold in every context: a `halt` runs nothing further, and `cleanup`
-/// is never followed by `rollback` (the commit has happened).
+/// is followed by `rollback` only when it failed, its line stated `reversible: true` and
+/// nothing had committed.
 #[test]
-fn a_halt_runs_nothing_and_cleanup_is_never_rolled_back() {
+fn a_halt_runs_nothing_and_cleanup_is_rolled_back_only_when_it_states_reversible_true() {
     let reports = [
         Report::default(),
         report(ENV, false, Some(1)),
         report(RELEASE, true, None),
+        stated(RELEASE, true),
+        stated(ENV, false),
     ];
     for step in Step::ALL {
         for outcome in [
@@ -1158,9 +1161,14 @@ fn a_halt_runs_nothing_and_cleanup_is_never_rolled_back() {
                         assert_eq!(got, Next::Report(Verdict::Halt), "{step} {c:?}");
                     }
                     if step == Step::Cleanup {
-                        assert!(
-                            !matches!(got, Next::Rollback { .. }),
-                            "{step} {outcome:?} {c:?}"
+                        let rolls_back = outcome == Outcome::Failure
+                            && report.reversible_stated
+                            && report.reversible
+                            && !c.committed;
+                        assert_eq!(
+                            matches!(got, Next::Rollback { .. }),
+                            rolls_back,
+                            "{step} {outcome:?} {c:?} {report:?}"
                         );
                     }
                 }

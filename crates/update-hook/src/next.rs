@@ -7,7 +7,7 @@
 //! | `cutover` | `verify` | `rollback`, then `Failed` | `rollback`, then `Deferred`; only valid if nothing irreversible happened | stop, `halt` |
 //! | `verify` | `cleanup` | `rollback`, then `Failed` with the hook's class | `verify` again with the backoff until the deadline, then `rollback` | stop, `halt` |
 //! | `rollback` | report the original `Failed` or `Deferred` | before the commit: `halt`; after it: `Failed(after_commit)` if the hook says `reversible: false`, else `halt` | `rollback` again up to its bound, then as for failure | stop, `halt` |
-//! | `cleanup` | `Succeeded` (with `promotion_pending` of the last `verify`) | `cleanup` again, up to `cleanup_retries`, then `Failed(after_commit)`; never `rollback` | `cleanup` again later, within the same retries | stop, `halt` |
+//! | `cleanup` | `Succeeded` (with `promotion_pending` of the last `verify`) | if its line states `reversible: true` (and nothing committed): `rollback`, and the host's result is the rollback's; otherwise (`false`, or the field left out) `cleanup` again, up to `cleanup_retries`, then `Failed(after_commit)` | `cleanup` again later, within the same retries | stop, `halt` |
 //!
 //! The function holds no clock and no counter: the updater says whether the verify deadline has
 //! passed and whether a retry is left ([`Context`]), and does the waiting itself.
@@ -141,6 +141,12 @@ pub fn next(step: Step, outcome: Outcome, report: &Report, ctx: &Context) -> Nex
             Next::Report(failed(Phase::AfterCommit))
         }
         (Step::Rollback, Outcome::Failure | Outcome::Deferred) => Next::Report(Verdict::Halt),
+        // A cleanup that fails and states `reversible: true` committed nothing: roll back, and the
+        // host's result is the rollback's. One that states false, or leaves the field out (an old
+        // hook), keeps the path below.
+        (Step::Cleanup, Outcome::Failure) if report.reversible_stated && !committed => {
+            rollback_then(failed(gate))
+        }
         (Step::Cleanup, Outcome::Failure | Outcome::Deferred) if ctx.retries_left => Next::Again {
             step: Step::Cleanup,
             after_secs,

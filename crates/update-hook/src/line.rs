@@ -162,7 +162,7 @@ impl Report {
             reason: wire.reason,
             retry_after_secs: wire.retry_after_secs,
             reversible: wire.reversible.unwrap_or(true),
-            reversible_stated: false,
+            reversible_stated: wire.reversible.is_some(),
             promotion_pending: wire.promotion_pending.unwrap_or(false),
             detail: wire.detail,
         })
@@ -224,18 +224,28 @@ impl Report {
             reason,
             retry_after_secs,
             reversible: bool_field(&object, "reversible", true, &mut warnings),
-            reversible_stated: false,
+            reversible_stated: object.contains_key("reversible"),
             promotion_pending: bool_field(&object, "promotion_pending", false, &mut warnings),
             detail: text_field(&object, "detail", &mut warnings),
         };
         (report, warnings)
     }
 
-    /// The line to print: one JSON object, no newline.
+    /// This report with `reversible` stated: the line will carry it, true or false.
+    pub fn with_reversible(mut self, reversible: bool) -> Report {
+        self.reversible = reversible;
+        self.reversible_stated = true;
+        self
+    }
+
+    /// The line to print: one JSON object, no newline. `reversible` is printed when it was stated
+    /// or is false; a report that leaves it out prints without it, as an old hook's does.
     pub fn to_line(&self) -> String {
         let mut object = Map::new();
         object.insert("class".to_owned(), Value::from(self.class.as_str()));
-        object.insert("reversible".to_owned(), Value::from(self.reversible));
+        if self.reversible_stated || !self.reversible {
+            object.insert("reversible".to_owned(), Value::from(self.reversible));
+        }
         object.insert(
             "promotion_pending".to_owned(),
             Value::from(self.promotion_pending),
