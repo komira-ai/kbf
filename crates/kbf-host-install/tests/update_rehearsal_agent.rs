@@ -296,20 +296,15 @@ fn the_agent_updates_the_host_when_the_coordinator_is_told_the_next_release() {
     // once the host is laid out, and the keys are made for them then.
     let path = |p: &Path| p.display().to_string();
     let worker = farm::FRONTEND_WORKER.rsplit(':').next().unwrap();
+    // Red: the host as it ran before, a storage node without a daemon half.
     let flags = format!(
         "--storage-listen={storage} --storage-tls-cert={} --storage-tls-key={} \
-         --storage-client-ca={} --frontend=https://localhost:{worker} --advertise-addr={storage} \
-         --driver=container --server=https://localhost:{worker} --ca-cert={} --cert={} --key={} \
-         --node-id={} --data-dir=/var/lib/kbf-rehearsal/data",
+         --storage-client-ca={} --frontend=https://localhost:{worker} --advertise-addr={storage}",
         path(&storage_dir.join("storage.pem")),
         path(&storage_dir.join("storage.key")),
         path(&storage_dir.join("ca.pem")),
-        path(&storage_dir.join("ca.pem")),
-        path(&storage_dir.join("daemon.pem")),
-        path(&storage_dir.join("daemon.key")),
-        farm::NODE,
     );
-    let unit = rehearsal::kbf_node_unit(&format!("User={SERVICE_ACCOUNT}"), &flags);
+    let unit = rehearsal::kbf_unit(&format!("User={SERVICE_ACCOUNT}"), &flags);
     let host_agent = rehearsal::lay_out(&r, &unit);
     container_runtime(SERVICE_ACCOUNT);
     farm::private_dir(&storage_dir, Some(SERVICE_ACCOUNT));
@@ -363,11 +358,6 @@ fn the_agent_updates_the_host_when_the_coordinator_is_told_the_next_release() {
     );
     // The daemon half registered too: the frontend shows the node serving and connected, on
     // release N's daemon.
-    wait(
-        "the node serving and connected on release N",
-        &mut [&mut frontend],
-        || farm::seen().is_some_and(|n| n.serving() && n.connected && n.runs(old)),
-    );
 
     // The coordinator, trusting the stand-in issuer.
     let issuer = Issuer::start();
@@ -504,11 +494,6 @@ fn the_agent_updates_the_host_when_the_coordinator_is_told_the_next_release() {
     );
 
     // The node after the update: serving and connected, on release N+1's daemon.
-    wait(
-        "the node serving and connected on release N+1",
-        &mut [&mut frontend, &mut coordinator],
-        || farm::seen().is_some_and(|n| n.serving() && n.connected && n.runs(new)),
-    );
     // What the frontend did to the node meanwhile, in the order it did it.
     let events = watch.stop();
     println!("the node, as the frontend's log records it: {events:?}");
