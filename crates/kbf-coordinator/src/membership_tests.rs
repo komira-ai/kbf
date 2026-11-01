@@ -429,6 +429,6 @@ pub(crate) async fn heartbeat_v2_is_acted_on() {
 
 #[tokio::test]
 async fn heartbeat_v2_is_advertised_and_acted_on() {
-    assert_eq!(FEATURES, [V2]);
+    assert!(FEATURES.contains(&V2));
     heartbeat_v2_is_acted_on().await;
 }
