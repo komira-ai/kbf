@@ -28,7 +28,9 @@ use std::time::Duration;
 
 use super::coordinator::{Coordinator, CoordinatorError};
 use super::flags::Timing;
-use super::hold::{ANNOUNCED, Deferral, Features, Fit, Halt, Hold, MAX_RETRY_SECS, Marks, fit};
+use super::hold::{
+    ANNOUNCED, Deferral, Features, Fit, Halt, Hold, MAX_RETRY_SECS, Marks, UNREADABLE_HALT, fit,
+};
 use super::local::{HostState, Local};
 use super::renew::Renewer;
 use super::status::{Shared, Status, version_of_commit};
@@ -228,7 +230,17 @@ impl Agent {
             }
             match marks.load_halt(slot.unit()) {
                 Ok(halt) => *held(&slot.halted) = halt,
-                Err(e) => self.log(&slot.say(&format!("a halt on disk is ignored: {e}"))),
+                Err(e) => {
+                    // A halt is a safety stop: a record that cannot be read holds the unit, as
+                    // under generation 0, so the next clear lifts it.
+                    self.log(&slot.say(&format!(
+                        "error: halt record unreadable, the unit stays held: {e}"
+                    )));
+                    *held(&slot.halted) = Token::parse(UNREADABLE_HALT).map(|reason| Halt {
+                        reason,
+                        generation: 0,
+                    });
+                }
             }
         }
         self.announced = ANNOUNCED.iter().map(|name| (*name).to_owned()).collect();
@@ -579,10 +591,16 @@ impl Agent {
         {
             self.log(&slot.say(&format!("the deferral on disk could not be removed: {e}")));
         }
+        // The generation before the result is published: a reply that arrives while the update
+        // runs may carry a clear that came after the halt, and must not be taken as seen.
+        let seen = held(&self.generations)
+            .get(slot.unit())
+            .copied()
+            .unwrap_or(0);
         let done = update.run_for(target, self.features());
         match &done.hold {
             Some(Hold::Deferred { reason }) => self.defer(slot, target, reason),
-            Some(Hold::Halt { reason }) => self.halt(slot, reason),
+            Some(Hold::Halt { reason }) => self.halt(slot, reason, seen),
             None => {}
         }
         let deferred = matches!(done.hold, Some(Hold::Deferred { .. }));
@@ -593,11 +611,7 @@ impl Agent {
 
     /// The unit cannot be repaired by a retry: hold it, under the clear generation of the last
     /// reply, in memory and on disk.
-    fn halt(&self, slot: &Slot, reason: &Token) {
-        let generation = held(&self.generations)
-            .get(slot.unit())
-            .copied()
-            .unwrap_or(0);
+    fn halt(&self, slot: &Slot, reason: &Token, generation: u64) {
         let halt = Halt {
             reason: reason.clone(),
             generation,
@@ -615,10 +629,12 @@ impl Agent {
     /// Take the clear generations a reply carries: a held unit whose generation is newer than
     /// the one it halted under is cleared, and its hold is lifted.
     fn clear_halts(&self, halts: &BTreeMap<String, u64>) {
-        *held(&self.generations) = halts.clone();
         if !self.features().halt {
+            // A reply that does not advertise `halt-v1` carries no generations: they are not
+            // zero, they are not said, so the last ones stay.
             return;
         }
+        *held(&self.generations) = halts.clone();
         for slot in &self.slots {
             let generation = halts.get(slot.unit()).copied().unwrap_or(0);
             let mut halted = held(&slot.halted);

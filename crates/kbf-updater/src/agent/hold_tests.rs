@@ -1010,5 +1010,9 @@ fn state_files_are_not_followed_through_links() {
     symlink(&real, dir.join(".defer-kbf.tmp")).unwrap();
     marks.save("kbf", &deferral).unwrap();
     assert_eq!(std::fs::read_to_string(&real).unwrap(), "keep");
-    assert_eq!(marks.load("kbf"), Ok(Some(deferral)));
+    assert_eq!(marks.load("kbf"), Ok(Some(deferral.clone())));
+
+    // A temp that cannot be removed is an error, not a write through it.
+    std::fs::create_dir_all(dir.join(".defer-db.tmp").join("x")).unwrap();
+    assert!(marks.save("db", &deferral).is_err());
 }

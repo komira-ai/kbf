@@ -49,6 +49,9 @@ pub const ROLLBACK_FAILED: &str = "rollback_failed";
 /// other, so a test pins the value.
 pub const MAX_RETRY_SECS: u64 = 3600;
 
+/// The reason of a halt whose record on disk cannot be read.
+pub const UNREADABLE_HALT: &str = "halt_record_unreadable";
+
 /// The most bytes of a deferral file that are read.
 const MARK_MAX: u64 = 4096;
 
@@ -106,7 +109,8 @@ pub struct Deferral {
 impl Deferral {
     /// This deferral as read at `now`: its retry time no further out than [`MAX_RETRY_SECS`]
     /// from `now`, so a file an older agent wrote with a longer one cannot hold the host longer
-    /// than that.
+    /// than that. The clamp is applied here and when a deferral is made, not while it runs, so a
+    /// clock that jumps back declines for the whole jump: a known limit.
     #[must_use]
     pub fn read_at(mut self, now: u64) -> Self {
         self.retry_after_unix = self
@@ -162,6 +166,10 @@ impl Marks {
 
     /// The deferral of `unit`, if there is one.
     ///
+    /// A file that cannot be used is an error the agent logs and goes on without: a deferral
+    /// only declines an order for a while, so dropping one is safe (a halt is not, and its
+    /// unreadable record keeps the unit held).
+    ///
     /// # Errors
     /// The file is there and cannot be read, is too long, or is no deferral.
     pub fn load(&self, unit: &str) -> Result<Option<Deferral>, String> {
@@ -180,10 +188,15 @@ impl Marks {
         &self,
         path: &std::path::Path,
     ) -> Result<Option<T>, String> {
-        let read = std::fs::File::open(path).and_then(|file| {
-            let mut text = Vec::new();
-            file.take(MARK_MAX + 1).read_to_end(&mut text).map(|_| text)
-        });
+        // O_NOFOLLOW: a link planted in the state directory is no record.
+        let read = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .and_then(|file| {
+                let mut text = Vec::new();
+                file.take(MARK_MAX + 1).read_to_end(&mut text).map(|_| text)
+            });
         let bad = |why: &dyn std::fmt::Display| format!("{}: {why}", path.display());
         let text = match read {
             Ok(text) => text,
@@ -219,13 +232,16 @@ impl Marks {
         value: &T,
     ) -> std::io::Result<()> {
         let temp = self.dir.join(temp);
+        // A stale temp (a crash between write and rename) or a planted link is removed, never
+        // written through: the temp is created new, with mode 0600, and not through a link.
+        Self::remove(&temp)?;
         serde_json::to_vec(value)
             .map_err(std::io::Error::other)
             .and_then(|body| {
                 OpenOptions::new()
                     .write(true)
-                    .create(true)
-                    .truncate(true)
+                    .create_new(true)
+                    .custom_flags(libc::O_NOFOLLOW)
                     .mode(0o600)
                     .open(&temp)
                     .and_then(|mut file| file.write_all(&body).and_then(|()| file.sync_all()))
