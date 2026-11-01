@@ -161,3 +161,107 @@ fn group_by_correlated_gives_the_ci_job_view() {
     let bad = verb(&dir, &["--group-by", "owner"]);
     assert!(matches!(bad, Err(Failure::Usage(_))), "{bad:?}");
 }
+
+/// Catches: equal labels for the two arms (js-analysis would get the same setting, arm and
+/// run index twice), and an empty label (an arm with no name) written into the runs.
+#[test]
+fn equal_or_empty_labels_are_refused() {
+    let dir = with_ids();
+    let given = |a: &str, b: &str, setting: &str, commit: &str| {
+        verb(
+            &dir,
+            &[
+                "--json",
+                "--setting",
+                setting,
+                "--label-a",
+                a,
+                "--label-b",
+                b,
+                "--seed",
+                "1",
+                "--commit",
+                commit,
+            ],
+        )
+    };
+    let Err(Failure::Run(text)) = given("js", "js", "k7", "abc") else {
+        panic!("equal labels are refused");
+    };
+    assert!(
+        text.contains("--label-a") && text.contains("--label-b"),
+        "{text}"
+    );
+    for (a, b, setting, commit, flag) in [
+        ("", "js", "k7", "abc", "--label-a"),
+        ("legacy", "", "k7", "abc", "--label-b"),
+        ("legacy", "js", "", "abc", "--setting"),
+        ("legacy", "js", "k7", "", "--commit"),
+    ] {
+        let Err(Failure::Run(text)) = given(a, b, setting, commit) else {
+            panic!("an empty {flag} is refused");
+        };
+        assert!(text.contains(flag), "{flag}: {text}");
+    }
+    assert!(given("legacy", "js", "k7", "abc").is_ok());
+}
+
+/// Catches: a label demanded for an arm that has no builds to label, and runs written for
+/// it anyway.
+#[test]
+fn an_arm_with_no_builds_needs_no_label() {
+    let dir = dirs(
+        &[row("a1", Some("x"), None, (0, 1, 5))],
+        &[row("b1", None, None, (0, 2, 9))],
+        "compare-builds-cli-one-arm",
+    );
+    let json: Value = serde_json::from_str(
+        &verb(
+            &dir,
+            &[
+                "--json",
+                "--setting",
+                "k7",
+                "--label-a",
+                "legacy",
+                "--seed",
+                "1",
+                "--commit",
+                "c",
+            ],
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(json["runs"]["a"].as_array().unwrap().len(), 1);
+    assert_eq!(json["runs"]["b"].as_array().unwrap().len(), 0);
+    let Err(Failure::Run(text)) = verb(
+        &dir,
+        &["--json", "--setting", "k7", "--seed", "1", "--commit", "c"],
+    ) else {
+        panic!("arm A has builds, so it needs its label");
+    };
+    assert!(
+        text.contains("--label-a") && !text.contains("--label-b"),
+        "{text}"
+    );
+}
+
+/// Catches: the build numbers' limits only in rustdoc: the help of `compare` must say the
+/// action span is the server's and excludes the client's own analysis and local actions.
+#[test]
+fn the_help_says_what_the_build_action_span_leaves_out() {
+    let Err(Failure::Usage(help)) = run(
+        ["kbf-estimator-replay", "compare", "--help"],
+        &mut Vec::new(),
+    ) else {
+        panic!("help is printed as usage");
+    };
+    let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(flat.contains("build action span (server)"), "{flat}");
+    assert!(
+        flat.contains("excludes the client's own analysis and local actions"),
+        "{flat}"
+    );
+    assert!(!flat.contains("build wall"), "{flat}");
+}

@@ -141,6 +141,12 @@ fn grouping_by_correlated_id_gives_the_ci_job_view() {
 fn the_per_build_gap_is_listed_only_for_rows_without_the_ids() {
     let gap = NOT_RECORDED[0];
     assert!(gap.starts_with("Per-build"), "{gap}");
+    assert!(gap.contains("build action span"), "{gap}");
+    assert!(gap.contains("queue time"), "{gap}");
+    assert!(
+        !gap.contains("wall") && !gap.contains("queue wait"),
+        "{gap}"
+    );
     let both = render_text(&analyze(&arm_a()), &analyze(&arm_b()));
     assert!(!both.contains(gap), "{both}");
     for kept in &NOT_RECORDED[1..] {
@@ -272,4 +278,15 @@ fn a_joined_operation_is_counted_once_per_waiter_until_the_export_names_it() {
         Some(4 * S),
         "2 s of queueing, counted twice"
     );
+}
+
+/// Catches: the table printing build numbers without saying what the span leaves out.
+#[test]
+fn the_table_says_the_action_span_is_the_servers() {
+    let text = render_text(&analyze(&arm_a()), &analyze(&arm_b()));
+    let note = "build action span (server): excludes the client's own analysis and local actions";
+    assert!(text.contains(note), "{text}");
+    let plain = without_ids(arm_a());
+    let none = render_text(&analyze(&plain), &analyze(&plain));
+    assert!(!none.contains(note), "no builds, no note: {none}");
 }
