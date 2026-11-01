@@ -60,9 +60,11 @@ slow-timeout = { period = "30s", terminate-after = 4 }
 filter = 'package(kbf-task) & binary(put_back_pressure)'
 slow-timeout = { period = "30s", terminate-after = 4 }
 
-# The kbf-daemon cache tests wait on the cache's own counters (tests/support/cache_kit.rs,
-# wait_for_fill_waits), never on a deadline in the test: a cache that never makes two leases
-# meet would hang, and this guard ends such a test (2 minutes) instead. Applies to every
+# The kbf-daemon cache tests wait on the cache's own counters and gates (tests/support/cache_kit.rs:
+# wait_for_fill_waits, Gates::wait_started, Gates::wait_reached and the holds in Hooks::at),
+# never on a deadline in the test: a cache that never makes two leases meet, a background thread
+# that never reaches its start gate, or a failed test that leaves a hold held would hang, and this
+# guard ends such a test (2 minutes) instead. Applies to every
 # profile, the pull-request one included. Keep it above any catch-all override: the first
 # matching override wins.
 [[profile.default.overrides]]
@@ -75,6 +77,13 @@ slow-timeout = { period = "30s", terminate-after = 4 }
 # this guard (2 minutes) ends it instead. Above the general budget: the first match wins.
 [[profile.default.overrides]]
 filter = 'package(kbf-server) & test(/^frontend::janitor::tests::/)'
+slow-timeout = { period = "30s", terminate-after = 4 }
+
+# The history read tests wait on events (a write asked of the object store, a batch applied to
+# the state store) and hold no timeout of their own: a writer that never writes leaves the test
+# waiting for ever, and it is killed after 120 seconds (30 s x 4) and fails. Above the general budget: the first match wins.
+[[profile.default.overrides]]
+filter = 'binary_id(=kbf-server::history_read)'
 slow-timeout = { period = "30s", terminate-after = 4 }
 
 # The general budget: every other test, of every package, is ended after eight minutes

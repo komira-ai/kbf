@@ -329,10 +329,9 @@ mod tests {
     #[tokio::test]
     async fn a_dead_store_is_a_result_of_failed_puts() {
         let dir = temp("tb-cold-put-dead");
-        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let dead = format!("http://{}", closed.local_addr().unwrap());
-        drop(closed);
-        let ctx = testkit::ctx(dir.path(), &[(Role::Cold, &dead)], Window::Quiet);
+        let dead_store = testkit::DeadStore::start().await;
+        let dead = dead_store.endpoint();
+        let ctx = testkit::ctx(dir.path(), &[(Role::Cold, dead)], Window::Quiet);
         let results = run_with(&ctx, &plan(&[4096]), Script::calm(), None, Some(2))
             .await
             .unwrap();

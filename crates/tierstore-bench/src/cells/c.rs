@@ -629,13 +629,9 @@ mod tests {
     async fn a_cold_store_that_cannot_be_listed_leaves_the_objects_unseen() {
         let dir = temp("tb-c-coldless");
         let instance = FakeS3::start().await;
-        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let dead = format!("http://{}", closed.local_addr().unwrap());
-        drop(closed);
-        let stores = [
-            (Role::Instance, instance.endpoint()),
-            (Role::Cold, dead.as_str()),
-        ];
+        let dead_store = testkit::DeadStore::start().await;
+        let dead = dead_store.endpoint();
+        let stores = [(Role::Instance, instance.endpoint()), (Role::Cold, dead)];
         let ctx = testkit::ctx(dir.path(), &stores, Window::Busy);
         let results = run_with(
             &ctx,
@@ -657,13 +653,9 @@ mod tests {
     async fn puts_that_failed_are_failures_and_not_waited_for() {
         let dir = temp("tb-c-noinstance");
         let cold = FakeS3::start().await;
-        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let dead = format!("http://{}", closed.local_addr().unwrap());
-        drop(closed);
-        let stores = [
-            (Role::Instance, dead.as_str()),
-            (Role::Cold, cold.endpoint()),
-        ];
+        let dead_store = testkit::DeadStore::start().await;
+        let dead = dead_store.endpoint();
+        let stores = [(Role::Instance, dead), (Role::Cold, cold.endpoint())];
         let ctx = testkit::ctx(dir.path(), &stores, Window::Busy);
         let results = run_with(
             &ctx,

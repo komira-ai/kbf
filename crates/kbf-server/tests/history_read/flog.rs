@@ -11,7 +11,7 @@ use kbf_types::{Digest, FarmTime};
 use serde_json::Value;
 
 use crate::pages::{OPEN, Server, finished, granted, later, listing, queued, started};
-use crate::world::{ONLY_A, World, key, measured};
+use crate::world::{ONLY_A, World, key, measured, until};
 
 /// The text of a log long enough for a tail to be shorter than it: 20,000 ASCII bytes that
 /// tell any two places apart (a tail is shown as text, and text must read back as it was).
@@ -59,13 +59,10 @@ pub(crate) fn run_id(server: &Server, inv: &str) -> String {
 
 /// Waits until `n` failure-log rows are in the index.
 pub(crate) async fn copies(world: &World, n: usize) {
-    for _ in 0..500 {
-        if world.rows("ui/obj/flog/").len() >= n {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("{n} failure logs never reached the index");
+    until(&world.state.written, || {
+        world.rows("ui/obj/flog/").len() >= n
+    })
+    .await;
 }
 
 /// The run `id` of a build whose chunk is in the stores, once its failed section is: a

@@ -177,6 +177,7 @@ const GROUPS: &[(&str, &[&str])] = &[
         "stores",
         &[
             "cold-store",
+            "cold-store-credentials-file",
             "cold-store-evict-grace-ms",
             "cold-store-floor-bytes",
             "cold-store-size-bytes",

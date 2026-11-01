@@ -456,10 +456,9 @@ mod tests {
     #[tokio::test]
     async fn an_instance_that_will_not_take_the_objects_stops_the_run() {
         let dir = temp("tb-b-dead");
-        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let dead = format!("http://{}", closed.local_addr().unwrap());
-        drop(closed);
-        let ctx = testkit::ctx(dir.path(), &[(Role::Instance, &dead)], Window::Busy);
+        let dead_store = testkit::DeadStore::start().await;
+        let dead = dead_store.endpoint();
+        let ctx = testkit::ctx(dir.path(), &[(Role::Instance, dead)], Window::Busy);
         let err = run_with(&ctx, &plan(&[1], &[4096]), Script::calm(), Some(2))
             .await
             .unwrap_err();

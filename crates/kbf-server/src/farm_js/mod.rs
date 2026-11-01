@@ -14,7 +14,8 @@
 //! - [`ablation`]: the `kbf_ablation_*` counters that tell the rows of the placement ablation
 //!   apart on `/metrics`.
 //! - [`adapter`]: [`KbfAdapter`], the core's `Adapter`; [`host`]: what a host does around
-//!   the core's calls with it; [`record`]: the events it tells the invocation recorder;
+//!   the core's calls with it; the events it tells the invocation recorder are those of
+//!   [`crate::run_record::Recording`], which the farm's own side tells too;
 //!   [`open`]: the core's configuration, storage, metrics and admission.
 //!
 //! `--scheduler-core js` runs the farm on these ([`crate::farm`] dispatches on the core, and
@@ -35,7 +36,6 @@ pub mod host;
 mod learning;
 pub mod load;
 pub mod open;
-mod record;
 mod report_hooks;
 
 pub use adapter::{KbfAdapter, Outbound, Wall};
