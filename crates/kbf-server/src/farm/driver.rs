@@ -222,7 +222,10 @@ impl Driver {
     /// Applies `settings.recorder`.
     pub(super) fn set_recorder(&mut self, settings: &Settings) {
         js_rebuilt!(self, settings);
-        self.state_mut().side.recorder = settings.recorder.clone();
+        self.state_mut()
+            .side
+            .recording
+            .tell(settings.recorder.clone());
     }
 
     /// Applies `settings.orphan_wait`.

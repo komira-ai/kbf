@@ -23,7 +23,7 @@
 //!   frontend could not write (it lost the race, or the node moved to another frontend)
 //!   follow it the same way. They are kept for the finished retention after, as the callers
 //!   of an operation this frontend finished are. A recorded call among them is ended in the
-//!   invocation record when the result is shown ([`State::record_followed`]), with no lease
+//!   invocation record when the result is shown ([`Recording::followed`](crate::run_record::Recording::followed)), with no lease
 //!   and no listing of the result.
 //! - **Joiners.** The callers of a request that joined an operation leased on a node another
 //!   frontend owns are followed the same way from the start ([`Held::Elsewhere`]): the
@@ -399,14 +399,14 @@ impl Engine {
 
     /// Whether a lease of `operation` the scheduler gave up is not yet written to the store
     /// as a requeue: the operation has no `queue/` row for that reason.
-    fn requeue_pending(&self, operation: OperationId) -> bool {
+    pub(super) fn requeue_pending(&self, operation: OperationId) -> bool {
         self.unsettled
             .iter()
             .any(|(requeue, ..)| requeue.operation == operation)
     }
 
     /// Forgets `operation`, which another frontend took, and keeps its callers.
-    fn hand_off(&mut self, operation: OperationId) {
+    pub(super) fn hand_off(&mut self, operation: OperationId) {
         let callers = self.sched.forget_queued(operation).unwrap_or_default();
         self.keep_following(operation, callers);
     }

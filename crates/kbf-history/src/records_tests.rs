@@ -319,3 +319,29 @@ fn the_peak_and_the_wall_are_optional_on_the_old_tags() {
     let omitted = Cgroup::decode([].as_slice()).unwrap();
     assert_eq!((omitted.memory_peak_bytes, omitted.wall_us), (None, None));
 }
+
+#[test]
+fn the_phase_times_marker_round_trips_and_an_old_record_reads_as_measured() {
+    // Catches: the marker lost on the wire, a record without it read as a claim, and the
+    // marker taking a field number another record uses (field 50; 48 and 49 are #2200's).
+    use prost::Message as _;
+    let mut r = RunRecord::default();
+    assert_eq!(r.phase_times(), PhaseTimes::Unspecified);
+    assert_eq!(r.phase_times().name(), "measured");
+    r.phase_times = PhaseTimes::TaskClaim.into();
+    let back = RunRecord::decode(r.encode_to_vec().as_slice()).expect("decodes");
+    assert_eq!(back.phase_times(), PhaseTimes::TaskClaim);
+    assert_eq!(back.phase_times().name(), "task_claim");
+    r.phase_times = PhaseTimes::Measured.into();
+    let back = RunRecord::decode(r.encode_to_vec().as_slice()).expect("decodes");
+    assert_eq!(back.phase_times().name(), "measured");
+    let only = RunRecord {
+        phase_times: PhaseTimes::TaskClaim.into(),
+        ..RunRecord::default()
+    };
+    assert_eq!(
+        only.encode_to_vec(),
+        [0x90, 0x03, 0x02],
+        "field 50, varint 2"
+    );
+}

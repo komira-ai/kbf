@@ -105,6 +105,7 @@ pub mod http_sched;
 pub mod identity;
 mod input_cache_metrics;
 pub mod join;
+mod key_file;
 pub mod learned;
 mod listen;
 mod load_metrics;
