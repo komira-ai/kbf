@@ -4,6 +4,10 @@
 # All four roles, limits from the desired state; a frontend is never the last one up and
 # waits for every other role. The `min_up` keys a desired state of kbf must name (storage and
 # frontend) belong to the service and are not set here.
+#
+# The storage role is in the pool `storage`, the one tierstore's shipped entry names too: a
+# host holding a slot for either service on storage holds the one count both compare with
+# their own limit. With kbf alone the pool decides exactly as no pool.
 
 [[service]]
 name = "kbf"
@@ -13,6 +17,7 @@ never_last = true
 after = ["storage", "daemon", "mac-daemon"]
 
 [service.roles.storage]
+pool = "storage"
 
 [service.roles.daemon]
 

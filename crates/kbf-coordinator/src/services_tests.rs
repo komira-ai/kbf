@@ -53,16 +53,21 @@ fn refusal(text: &str) -> String {
 
 /// Catches: kbf's rules being code and not data: its definition names all four roles, makes
 /// only the frontend never the last one up, and has the frontend wait for the other three
-/// roles and nothing else wait for anything.
+/// roles and nothing else wait for anything, and storage alone is in the `storage` pool.
 #[test]
 fn kbf_is_built_in_as_data() {
     let kbf = ServiceDef::kbf();
     assert_eq!(kbf.name, KBF);
     assert!(kbf.after.is_empty());
     assert_eq!(kbf.roles.len(), 4);
-    for role in [HostRole::STORAGE, HostRole::DAEMON, HostRole::MAC_DAEMON] {
+    for role in [HostRole::DAEMON, HostRole::MAC_DAEMON] {
         assert_eq!(kbf.roles[role.name()], RoleDef::plain(), "{role:?}");
     }
+    let storage = RoleDef {
+        pool: Some("storage".to_owned()),
+        ..RoleDef::plain()
+    };
+    assert_eq!(kbf.roles["storage"], storage);
     let frontend = &kbf.roles["frontend"];
     assert!(frontend.never_last);
     assert_eq!(frontend.after, ["storage", "daemon", "mac-daemon"]);

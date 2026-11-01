@@ -312,3 +312,71 @@ fn a_pool_name_is_validated_and_kept() {
     let services = Services::parse(none).expect("parsed");
     assert_eq!(services.get("a").expect("a").roles["daemon"].pool, None);
 }
+
+/// Catches: a slot freed by one service not freeing the pool for the other. d1 updating `a`
+/// holds the one shared slot and d2 is held for `b`; once d1 reports `a` at 2.0 and done, the
+/// slot is free and d2 is ordered for `b`.
+#[test]
+fn a_slot_freed_by_one_service_is_free_for_the_other() {
+    let shared = services(
+        &[("daemon", role(1, Some("p")))],
+        &[("daemon", role(1, Some("p")))],
+    );
+    let hosts = daemons(&["d1", "d2"]);
+    let busy = fleet_of(&hosts, &[("d1", "a", updating(beat("1.0"), "2.0"))]);
+    assert_eq!(ask(&shared, &busy, "b", "d2"), Decision::Hold(Hold::NoSlot));
+    let done = fleet_of(&hosts, &[("d1", "a", beat("2.0"))]);
+    assert_eq!(ask(&shared, &done, "b", "d2"), update());
+}
+
+/// Catches: a pool that counts the other services' updating hosts but not their baking ones.
+/// `a` bakes for three beats and d1 has sent `a` one at 2.0: it holds the shared slot for
+/// baking, so d2 is held for `b` (with no pool `b` would order it).
+#[test]
+fn a_host_baking_for_one_service_holds_the_pool_slot_for_the_other() {
+    let mut a = ServiceDef::new("a", &[("daemon", role(1, Some("p")))]);
+    a.bake_beats = 3;
+    let b = ServiceDef::new("b", &[("daemon", role(1, Some("p")))]);
+    let fleet = fleet_of(&daemons(&["d1", "d2"]), &[("d1", "a", beat("2.0"))]);
+    let shared = Services::from_defs(vec![a.clone(), b.clone()]);
+    assert_eq!(
+        ask(&shared, &fleet, "b", "d2"),
+        Decision::Hold(Hold::Baking)
+    );
+    a.roles.get_mut("daemon").expect("daemon").pool = None;
+    let alone = Services::from_defs(vec![a, ServiceDef::new("b", &[("daemon", role(1, None))])]);
+    assert_eq!(ask(&alone, &fleet, "b", "d2"), update());
+}
+
+/// Catches: the shipped definitions not sharing storage. With kbf's shipped definition and
+/// the shipped tierstore entry, a storage host updating tierstore holds the storage slot kbf
+/// counts, so no other storage host is ordered kbf; a daemon, outside the pool, still is.
+#[test]
+fn the_shipped_kbf_and_tierstore_share_storage() {
+    let shipped = Services::parse(crate::services::TIERSTORE_SERVICES).expect("parsed");
+    let want = BTreeMap::from([
+        (KBF.to_owned(), desired("2.0", 1, 1)),
+        ("tierstore".to_owned(), desired("2.0", 0, 0)),
+    ]);
+    let storage = ["s1", "s2", "s3", "s4", "s5", "s6"];
+    let ask = |fleet: &Fleet, host: &str| decide_why(&shipped, &want, KBF, fleet, &id(host), NOW);
+    let fleet_with = |s1: kbf_updater::wire::Heartbeat| {
+        let mut fleet = Fleet::new(Duration::ZERO);
+        for host in storage {
+            let ts = if host == "s1" {
+                s1.clone()
+            } else {
+                beat("1.0")
+            };
+            fleet.record_in("tierstore", id(host), HostRole::STORAGE, ts, NOW);
+            fleet.record_in(KBF, id(host), HostRole::STORAGE, beat("1.0"), NOW);
+        }
+        fleet.record_in(KBF, id("d1"), HostRole::DAEMON, beat("1.0"), NOW);
+        fleet
+    };
+    let busy = fleet_with(updating(beat("1.0"), "2.0"));
+    assert_eq!(ask(&busy, "s2"), Decision::Hold(Hold::NoSlot));
+    assert_eq!(ask(&busy, "d1"), update());
+    let idle = fleet_with(beat("1.0"));
+    assert_eq!(ask(&idle, "s2"), update());
+}
