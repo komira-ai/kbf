@@ -72,6 +72,10 @@ pub struct Report {
     /// Whether the hook can still undo what it has done. A step that says `false` is the commit.
     /// Absent means `true`.
     pub reversible: bool,
+    /// The line stated `reversible` (true or false) rather than leaving it out. A step that
+    /// leaves it out is an old hook, and `next` never rolls back after a failed `cleanup` on
+    /// its account.
+    pub reversible_stated: bool,
     /// Set by `verify`: serving, but not yet fully its own.
     pub promotion_pending: bool,
     /// A short text for the log and the alert.
@@ -86,6 +90,7 @@ impl Default for Report {
             reason: None,
             retry_after_secs: None,
             reversible: true,
+            reversible_stated: false,
             promotion_pending: false,
             detail: None,
         }
@@ -157,6 +162,7 @@ impl Report {
             reason: wire.reason,
             retry_after_secs: wire.retry_after_secs,
             reversible: wire.reversible.unwrap_or(true),
+            reversible_stated: false,
             promotion_pending: wire.promotion_pending.unwrap_or(false),
             detail: wire.detail,
         })
@@ -218,6 +224,7 @@ impl Report {
             reason,
             retry_after_secs,
             reversible: bool_field(&object, "reversible", true, &mut warnings),
+            reversible_stated: false,
             promotion_pending: bool_field(&object, "promotion_pending", false, &mut warnings),
             detail: text_field(&object, "detail", &mut warnings),
         };

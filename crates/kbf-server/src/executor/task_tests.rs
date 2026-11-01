@@ -17,6 +17,7 @@ fn args<'a>(action: &'a Digest, grant: &'a Secret, url: &'a Secret, plain: bool)
         work_dir: None,
         allow_plain_http_put: plain,
         allow_plain_http_grant: false,
+        locate: false,
     }
 }
 
@@ -146,6 +147,56 @@ fn the_plain_http_grant_flag_is_passed_once_and_only_when_allowed() {
         );
         assert_eq!(on.iter().any(|a| a == "--allow-plain-http-put"), put);
     }
+}
+
+/// Catches `--locate` leaking into runs that did not ask for it, or going out twice or under
+/// another spelling: with it off the whole command line is the one a frontend without the flag
+/// has always given, word for word; with it on the line is that one plus a single `--locate`,
+/// after every other optional flag, whatever the others say.
+#[test]
+fn argv_has_locate_only_when_asked() {
+    let (action, grant, url) = (
+        digest(),
+        Secret::new("grant-token"),
+        Secret::new("https://p/key"),
+    );
+    let hash = "ab".repeat(32);
+    let before_the_flag = [
+        "--action",
+        &format!("{hash}/12"),
+        "--lease",
+        "7-3",
+        "--grant-url",
+        "https://grant.test:9400",
+        "--deadline-ms",
+        "90000",
+        "--insecure-argv-secrets",
+        "--pack-url",
+        "https://p/key",
+        "--grant-token",
+        "grant-token",
+    ];
+    let off = args(&action, &grant, &url, false).argv(Delivery::InsecureArgv);
+    assert_eq!(off, before_the_flag, "off is today's line, byte for byte");
+    let on = TaskArgs {
+        locate: true,
+        ..args(&action, &grant, &url, false)
+    }
+    .argv(Delivery::InsecureArgv);
+    assert_eq!(on[..off.len()], off[..]);
+    assert_eq!(&on[off.len()..], ["--locate"]);
+    let everything = TaskArgs {
+        locate: true,
+        work_dir: Some("/work"),
+        allow_plain_http_grant: true,
+        ..args(&action, &grant, &url, true)
+    }
+    .argv(Delivery::InsecureArgv);
+    let at = |flag: &str| everything.iter().position(|a| a == flag);
+    assert_eq!(everything.iter().filter(|a| *a == "--locate").count(), 1);
+    assert_eq!(everything.last().map(String::as_str), Some("--locate"));
+    assert!(at("--allow-plain-http-grant") < at("--locate"));
+    assert!(at("--work-dir") < at("--locate"));
 }
 
 /// Catches a Debug of the task arguments that shows the pack url or the read token.

@@ -180,9 +180,13 @@ where
         Some(HeartbeatRead {
             beat,
             services_dropped,
+            extras_dropped,
         }) => {
             if let Some(why) = services_dropped {
                 coordinator.note_services_dropped(&identity, &why);
+            }
+            if let Some(why) = extras_dropped {
+                coordinator.note_extras_dropped(&identity, &why);
             }
             json(StatusCode::OK, &coordinator.heartbeat(identity, beat))
         }
@@ -199,8 +203,11 @@ where
     let Some(body) = read(request, MAX_DESIRED_BYTES, patience).await else {
         return error(StatusCode::BAD_REQUEST, "bad_request");
     };
-    match coordinator.set_desired(token.as_deref(), &body).await {
-        Ok(desired) => json(StatusCode::OK, &desired),
+    match coordinator
+        .set_desired_noting(token.as_deref(), &body)
+        .await
+    {
+        Ok(set) => json(StatusCode::OK, &set),
         Err(SetError::Unauthorized(_)) => error(StatusCode::UNAUTHORIZED, "unauthorized"),
         Err(SetError::Unavailable) => error(StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
         Err(SetError::Forbidden) => error(StatusCode::FORBIDDEN, "forbidden"),
