@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::cells::CellId;
+use crate::config::RateCaps;
 use crate::error::BenchError;
 use crate::role::Role;
 
@@ -261,6 +262,88 @@ pub struct PassResult {
     /// The cold store guard's trip that aborted the pass, if one did.
     #[serde(default)]
     pub cold_guard: Option<ColdTrip>,
+    /// Requests the fault proxy forwarded, by HTTP method, while the pass was driven and while
+    /// the arm's cleanup hook ran; none when the arm has no proxy in its path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_requests: Option<ProxyRequests>,
+    /// The busy time of each whole disk of the machine that sends the requests over the pass,
+    /// by device name; empty when the machine could not be read for it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub disk_busy: BTreeMap<String, DiskBusy>,
+    /// The most requests that were in flight at the start of one request of the pass: what the
+    /// pass realised of the width it was asked for.
+    #[serde(default)]
+    pub peak_in_flight: u32,
+    /// What the machine that sends the requests looked like while the pass ran: the readings
+    /// taken inside it, and whether the disks had drained when its window opened. Recorded,
+    /// never a reason to stop the pass; absent in results written before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pass_load: Option<PassLoad>,
+}
+
+/// The readings of the load inside one pass. Each is taken over the interval since the previous
+/// reading (the end of the quiet window before the pass for the first), and the pass's own
+/// requests are in all of them: the figures say what the machine did, not whose work it was.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PassLoad {
+    /// How many readings were taken.
+    pub readings: u32,
+    /// The highest share of an interval with some task stalled on CPU, percent.
+    pub peak_psi_cpu_pct: f64,
+    /// The highest share of an interval with some task stalled on IO, percent.
+    pub peak_psi_io_pct: f64,
+    /// The highest utilisation of the busiest disk over an interval, percent.
+    pub peak_disk_util_pct: f64,
+    /// `false` when the wait for the kernel to write out what the pass before left dirty gave up
+    /// at its cap, so the pass was measured on unsettled writeback. Older results say `true`.
+    #[serde(default = "settled")]
+    pub writeback_settled: bool,
+    /// Bytes still dirty or being written (`Dirty` plus `Writeback`) when the wait gave up; none
+    /// when it did not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writeback_pending_bytes: Option<u64>,
+}
+
+impl PassLoad {
+    /// No reading yet, and writeback settled.
+    #[must_use]
+    pub const fn none() -> Self {
+        Self {
+            readings: 0,
+            peak_psi_cpu_pct: 0.0,
+            peak_psi_io_pct: 0.0,
+            peak_disk_util_pct: 0.0,
+            writeback_settled: true,
+            writeback_pending_bytes: None,
+        }
+    }
+}
+
+/// The default of [`PassLoad::writeback_settled`].
+const fn settled() -> bool {
+    true
+}
+
+/// What the fault proxy forwarded to the store around one pass, by HTTP method. A method with no
+/// request is absent. Background traffic (a copy the instance makes later) is not separated.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProxyRequests {
+    /// While the pass sent its requests.
+    pub during: BTreeMap<String, u64>,
+    /// The requests made while the arm's cleanup hook ran: the bench's own cleanup, plus any
+    /// background traffic that happened to land then. Background traffic is not separated. An
+    /// arm with no cleanup hook has about none. Older result files call this field `after`.
+    #[serde(alias = "after")]
+    pub cleanup: BTreeMap<String, u64>,
+}
+
+/// How busy one disk was over a pass.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DiskBusy {
+    /// Milliseconds the disk spent doing IO during the pass (`io_ticks` of `/proc/diskstats`).
+    pub busy_ms: u64,
+    /// `busy_ms` over the wall time of the pass, percent, at most 100.
+    pub util_pct: f64,
 }
 
 /// The result of one arm of one cell: the contents of one result JSON.
@@ -287,6 +370,16 @@ pub struct CellResult {
     /// had no cold store to read (or the result was written before the field existed).
     #[serde(default)]
     pub cold_state: Vec<PassColdState>,
+    /// The request-rate caps the run held every client to. A cell whose requests wait at a cap
+    /// measures the cap, so the caps are in every result. Absent in a result written before the
+    /// field existed.
+    #[serde(default)]
+    pub rate_caps: Option<RateCaps>,
+    /// The counted requests a pass of the arm was set to make: one per object put or read (a
+    /// multipart object is one, its parts are in the request log). What `--multipart-objects`
+    /// changed is read here. Absent in a result written before the field existed.
+    #[serde(default)]
+    pub objects_per_pass: Option<u64>,
 }
 
 impl CellResult {
@@ -451,6 +544,26 @@ mod tests {
                     requests: 40,
                     window_secs: 60,
                 }),
+                proxy_requests: Some(ProxyRequests {
+                    during: BTreeMap::from([("HEAD".to_owned(), 3)]),
+                    cleanup: BTreeMap::from([("DELETE".to_owned(), 10)]),
+                }),
+                disk_busy: BTreeMap::from([(
+                    "sda".to_owned(),
+                    DiskBusy {
+                        busy_ms: 2_500,
+                        util_pct: 50.0,
+                    },
+                )]),
+                peak_in_flight: 7,
+                pass_load: Some(PassLoad {
+                    readings: 3,
+                    peak_psi_cpu_pct: 1.5,
+                    peak_psi_io_pct: 41.0,
+                    peak_disk_util_pct: 100.0,
+                    writeback_settled: true,
+                    writeback_pending_bytes: None,
+                }),
             }],
             notes: vec!["a note".to_owned()],
             cold_state: vec![PassColdState {
@@ -467,6 +580,12 @@ mod tests {
                     source: Some(ColdSource::File),
                 },
             }],
+            rate_caps: Some(RateCaps {
+                cold_rps: 20,
+                hot_rps: 50,
+                list_poll_rps: 2,
+            }),
+            objects_per_pass: Some(1000),
         }
     }
 
@@ -497,20 +616,78 @@ mod tests {
         );
     }
 
-    /// Catches a result written before the cold state, the cold guard and the attempt were added
+    /// Pins the name of the cleanup counts and that a result written under the old name `after`
+    /// still parses into it.
+    #[test]
+    fn the_cleanup_counts_are_named_cleanup_and_the_old_name_still_parses() {
+        let v: serde_json::Value = serde_json::from_str(&result().to_json()).unwrap();
+        let counts = &v["passes"][0]["proxy_requests"];
+        assert_eq!(counts["cleanup"]["DELETE"], 10);
+        assert!(counts.get("after").is_none());
+        let old = v.to_string().replace("\"cleanup\"", "\"after\"");
+        let parsed = CellResult::from_json(&old).unwrap();
+        let counts = parsed.passes[0].proxy_requests.as_ref().unwrap();
+        assert_eq!(counts.cleanup["DELETE"], 10);
+    }
+
+    /// Catches a result written before the cold state, the cold guard, the attempt, the rate caps,
+    /// the proxy counts, the disk busy time and the peak in flight were added
     /// being refused, or read as something other than a first attempt with no readings.
     #[test]
     fn a_result_without_the_newer_fields_reads_with_their_defaults() {
         let mut v: serde_json::Value = serde_json::from_str(&result().to_json()).unwrap();
         v.as_object_mut().unwrap().remove("cold_state");
+        v.as_object_mut().unwrap().remove("rate_caps");
+        v.as_object_mut().unwrap().remove("objects_per_pass");
         v["provenance"].as_object_mut().unwrap().remove("attempt");
         for pass in v["passes"].as_array_mut().unwrap() {
-            pass.as_object_mut().unwrap().remove("cold_guard");
+            for field in [
+                "cold_guard",
+                "proxy_requests",
+                "disk_busy",
+                "peak_in_flight",
+                "pass_load",
+            ] {
+                pass.as_object_mut().unwrap().remove(field);
+            }
         }
         let old = CellResult::from_json(&v.to_string()).unwrap();
         assert!(old.cold_state.is_empty());
+        assert_eq!(old.rate_caps, None);
+        assert_eq!(old.objects_per_pass, None);
+        assert_eq!(
+            (
+                old.passes[0].proxy_requests.is_none(),
+                old.passes[0].disk_busy.is_empty(),
+                old.passes[0].peak_in_flight,
+                old.passes[0].pass_load.is_none()
+            ),
+            (true, true, 0, true)
+        );
         assert_eq!(old.provenance.attempt, 1);
         assert_eq!(old.passes[0].cold_guard, None);
+    }
+
+    /// Catches a pass load written before the writeback fields being refused, or read as unsettled.
+    #[test]
+    fn a_pass_load_without_the_writeback_fields_reads_as_settled() {
+        let mut v: serde_json::Value = serde_json::from_str(&result().to_json()).unwrap();
+        let load = v["passes"][0]["pass_load"].as_object_mut().unwrap();
+        load.remove("writeback_settled");
+        let old = CellResult::from_json(&v.to_string()).unwrap();
+        let load = old.passes[0].pass_load.unwrap();
+        assert_eq!(
+            (load.writeback_settled, load.writeback_pending_bytes),
+            (true, None)
+        );
+        let mut unsettled = result();
+        unsettled.passes[0].pass_load = Some(PassLoad {
+            writeback_settled: false,
+            writeback_pending_bytes: Some(7),
+            ..load
+        });
+        let back = CellResult::from_json(&unsettled.to_json()).unwrap();
+        assert_eq!(back, unsettled);
     }
 
     /// Catches a cold reading whose fields are not flat beside the pass (the shape the report and

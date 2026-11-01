@@ -135,7 +135,7 @@ impl Farm {
             let standing = state.standing(lease, worker);
             let recorded = standing
                 .as_ref()
-                .is_ok_and(|(operation, ..)| state.side.is_recorded(*operation));
+                .is_ok_and(|(operation, ..)| state.side.recording.is_recorded(*operation));
             // A copy of a result the scheduler took whose finish waits for the store is
             // acknowledged with the first, to the node that sent the first: a copy from
             // another node, which never held the lease, is owed nothing.
@@ -330,7 +330,7 @@ impl State {
                 Some(killed) => run_record::killed(run, killed),
                 None => run,
             };
-            self.side.record_ran(operation, lease, run);
+            self.side.recording.ran(operation, lease, run);
         }
         let (operation, node) = (name, worker);
         // `-` when the worker reported no run (a failure before the action executed).
@@ -413,7 +413,9 @@ impl State {
             }
             _ => (None, None),
         };
-        self.side.record_finished(answer, &finished, stored, reason);
+        self.side
+            .recording
+            .finished(answer, &finished, stored, reason);
         self.keep_finished(answer.operation, answer.waiters.clone());
         // A result whose finish waited for the store is acknowledged to its sender's
         // newest stream: the store has taken the row.

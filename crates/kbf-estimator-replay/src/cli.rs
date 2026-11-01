@@ -1,4 +1,4 @@
-//! The command line: `export`, `replay` and `slowdown`.
+//! The command line: `export`, `replay`, `slowdown` and `compare`.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -11,6 +11,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use kbf_server::api_client::OperatorClient;
 
+use crate::compare;
 use crate::export::{Export, Window, export};
 use crate::readonly::{Api, ReadOnly, Transport};
 use crate::replay::{Arm, Params, report, sim, trace};
@@ -37,6 +38,22 @@ enum Command {
     /// For each successful run, how much slower it was than the same key on a quiet host;
     /// prints a table, or JSON with every run.
     Slowdown(SlowdownArgs),
+    /// Prints queue wait, wall, makespan and kills per 1,000 attempts for two exports, and
+    /// the difference. Read-only.
+    Compare(CompareArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct CompareArgs {
+    /// Arm A: a directory of `runs-*.jsonl` files (an export), or one such file.
+    #[arg(long)]
+    arm_a: PathBuf,
+    /// Arm B, the same.
+    #[arg(long)]
+    arm_b: PathBuf,
+    /// Print one JSON document instead of the table.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -146,7 +163,28 @@ where
         }
         Command::Replay(args) => replay(&args, out).map_err(Failure::Run),
         Command::Slowdown(args) => slowdown_to(&args, out).map_err(Failure::Run),
+        Command::Compare(args) => compare_to(&args, out).map_err(Failure::Run),
     }
+}
+
+fn compare_to(args: &CompareArgs, out: &mut impl Write) -> Result<(), String> {
+    let arm = |path: &Path| {
+        trace::read_rows(path)
+            .map(|rows| compare::analyze(&rows))
+            .map_err(|e| format!("{}: {e}", path.display()))
+    };
+    let (a, b) = (arm(&args.arm_a)?, arm(&args.arm_b)?);
+    let text = if args.json {
+        compare::render_json(&a, &b)
+    } else {
+        format!(
+            "A: {}\nB: {}\n{}",
+            args.arm_a.display(),
+            args.arm_b.display(),
+            compare::render_text(&a, &b)
+        )
+    };
+    out.write_all(text.as_bytes()).map_err(|e| e.to_string())
 }
 
 fn slowdown_to(args: &SlowdownArgs, out: &mut impl Write) -> Result<(), String> {

@@ -177,6 +177,7 @@ const GROUPS: &[(&str, &[&str])] = &[
         "stores",
         &[
             "cold-store",
+            "cold-store-credentials-file",
             "cold-store-evict-grace-ms",
             "cold-store-floor-bytes",
             "cold-store-size-bytes",
@@ -308,6 +309,7 @@ const GROUPS: &[(&str, &[&str])] = &[
             "executor-max-run-secs",
             "executor-output-disk-bytes",
             "executor-run-margin-secs",
+            "executor-secret-delivery",
             "executor-work-dir",
         ],
     ),
