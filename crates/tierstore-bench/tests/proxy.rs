@@ -348,6 +348,42 @@ async fn skew_moves_the_dates_of_the_answer_only_when_allowed_and_asked() {
     assert!(matches!(spawn(config).await, Err(BenchError::Proxy(_))));
 }
 
+/// Catches counters that cannot tell a HEAD from a PUT: the requests sent on are counted by their
+/// method, the counts add up to the total, a request refused is in none of them, and the counts
+/// are in the counters file a cell reads: two HEADs, a GET, a PUT and a DELETE, then one refused.
+#[tokio::test]
+async fn requests_are_counted_by_method() {
+    let (proxy, seen) = proxy_for(ok("", ""), |_| {}).await;
+    for line in [
+        "HEAD /b/k HTTP/1.1",
+        "HEAD /b/k2 HTTP/1.1",
+        "GET /b/k HTTP/1.1",
+        "PUT /b/k HTTP/1.1",
+        "DELETE /b/k HTTP/1.1",
+    ] {
+        let request = format!(
+            "{line}\r\nHost: sentinel.example:4242\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let answer = exchange(proxy.local_addr(), &request).await;
+        assert!(answer.starts_with("HTTP/1.1 200 OK"), "{line}: {answer}");
+    }
+    assert_eq!(seen.all().len(), 5);
+    proxy.set_mode(FaultMode::Refuse).unwrap();
+    exchange(proxy.local_addr(), &get("/refused")).await;
+    let counters = proxy.stop().await.unwrap();
+    let expected: std::collections::BTreeMap<String, u64> =
+        [("DELETE", 1), ("GET", 1), ("HEAD", 2), ("PUT", 1)]
+            .into_iter()
+            .map(|(m, n)| (m.to_owned(), n))
+            .collect();
+    assert_eq!(counters.requests_by_method, expected);
+    assert_eq!(
+        counters.requests_by_method.values().sum::<u64>(),
+        counters.requests
+    );
+    assert_eq!(counters.requests, 5);
+}
+
 /// Catches a store that ends an answer early taking the proxy down, or the bytes that did
 /// arrive not being counted: the client gets the part and a closed connection, and the next
 /// request is served.

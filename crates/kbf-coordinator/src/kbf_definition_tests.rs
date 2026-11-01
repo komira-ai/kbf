@@ -46,6 +46,7 @@ fn the_shipped_kbf_definition_equals_the_frozen_built_in() {
         after: Vec::new(),
         require_min_up: vec!["storage".to_owned(), "frontend".to_owned()],
         priority: 0,
+        defer_backoff: crate::defer::DeferBackoff::default(),
     };
     assert_eq!(ServiceDef::kbf(), frozen);
     assert_eq!(Services::default().get(KBF), Some(&frozen));

@@ -580,6 +580,9 @@ async fn the_pass_leaves_a_key_whose_slot_is_held() {
     let gates = Gates::new();
     let cache =
         Cache::open(config(&dir, 100, Arc::clone(&gates), &FakeClock::at(1000))).expect("open");
+    // The start-up drain would otherwise run beside the leases and could be the evictor
+    // held on K, so that the lease finishing would not mean K was unlinked.
+    gates.wait_started();
     let cas = Arc::new(CountingCas::default());
     let k = key(&[b'k'; 100], false);
     lease(

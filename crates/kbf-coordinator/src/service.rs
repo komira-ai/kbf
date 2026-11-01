@@ -2,13 +2,13 @@
 //! or read either. No sockets here; [`crate::http`] maps requests onto these calls.
 
 use std::cmp::Reverse;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use kbf_oidc::{Refusal, Verified, Verifier};
-use kbf_updater::wire::{Heartbeat, Reply, ServiceReply};
+use kbf_updater::wire::{Answer, Heartbeat, Reply, ServiceReply};
 use serde::Serialize;
 use subtle::ConstantTimeEq;
 
@@ -156,6 +156,10 @@ pub struct Status {
     /// Heartbeats since the coordinator started whose `services` list was bad and was
     /// dropped: the host was answered as a `kbf`-only host.
     pub services_dropped: u64,
+    /// Heartbeats since the coordinator started whose optional fact was bad and was dropped,
+    /// by the fact's name (`step`, `commit`, ...): one per beat per fact. Absent while none.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub extras_dropped: BTreeMap<&'static str, u64>,
     /// Every host heard from since the coordinator started, by node id.
     pub hosts: Vec<HostStatus>,
     /// Every service the coordinator manages, `kbf` included, by name: its desired state, the
@@ -163,6 +167,25 @@ pub struct Status {
     pub per_service: BTreeMap<String, ServiceStatus>,
     /// The commit this coordinator was built from ([`crate::BUILD_COMMIT`]).
     pub commit: &'static str,
+}
+
+/// The features this coordinator advertises to an agent that announces `agent_features`.
+///
+/// Each name is added in the change that implements what it names (`deferred-v1` here;
+/// `heartbeat-v2` and `halt-v1` follow), so a name is never advertised for behaviour that is
+/// not there. `deferred-v1`: a heartbeat's `deferred` report ends the order, holds no slot and
+/// backs the host off ([`crate::defer`]).
+pub const FEATURES: &[&str] = &["deferred-v1"];
+
+/// How long a host's warn about one dropped fact is silent after it was logged.
+const EXTRAS_LOG_EVERY: Duration = Duration::from_secs(3600);
+
+/// The dropped optional facts: a count per fact name, and when each host's fact was last
+/// logged.
+#[derive(Default)]
+struct ExtrasDropped {
+    counts: BTreeMap<&'static str, u64>,
+    logged: HashMap<(String, &'static str), Duration>,
 }
 
 /// The coordinator.
@@ -174,6 +197,8 @@ pub struct Coordinator {
     operator_token: String,
     clock: Clock,
     services_dropped: AtomicU64,
+    extras: Mutex<ExtrasDropped>,
+    features: Vec<String>,
 }
 
 impl std::fmt::Debug for Coordinator {
@@ -201,6 +226,8 @@ impl Coordinator {
             operator_token,
             clock,
             services_dropped: AtomicU64::new(0),
+            extras: Mutex::new(ExtrasDropped::default()),
+            features: FEATURES.iter().map(|name| (*name).to_owned()).collect(),
         }
     }
 
@@ -209,6 +236,38 @@ impl Coordinator {
     pub fn with_services(mut self, services: Services) -> Self {
         self.services = services;
         self
+    }
+
+    /// The same coordinator advertising `features` instead of [`FEATURES`].
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_features(mut self, features: &[&str]) -> Self {
+        self.features = features.iter().map(|name| (*name).to_owned()).collect();
+        self
+    }
+
+    /// Counts, by name, the optional `facts` of a heartbeat from `who` that were bad and were
+    /// dropped (`why` is the reader's reason), and logs it unless every one of them was logged
+    /// for this host within the last hour. Returns whether it logged. The heartbeat is still
+    /// answered, without those facts.
+    pub fn note_extras_dropped(&self, who: &Identity, why: &str, facts: &[&'static str]) -> bool {
+        let now = (self.clock)();
+        let node = who.node_id.to_string();
+        let mut extras = self.extras.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut due = false;
+        for fact in facts {
+            *extras.counts.entry(fact).or_default() += 1;
+            let last = extras.logged.get(&(node.clone(), *fact)).copied();
+            if last.is_none_or(|at| now.saturating_sub(at) >= EXTRAS_LOG_EVERY) {
+                extras.logged.insert((node.clone(), *fact), now);
+                due = true;
+            }
+        }
+        drop(extras);
+        if due {
+            tracing::warn!(node_id = %who.node_id, why, "dropped optional fields of a heartbeat");
+        }
+        due
     }
 
     /// Counts and logs a heartbeat from `who` whose `services` list was bad and was dropped
@@ -228,7 +287,22 @@ impl Coordinator {
     /// it); services of one priority go `kbf` first, then in the order the host listed them.
     /// The first order is the reply: one update per reply. A host that sent no `services` is
     /// answered about `kbf` alone, in the shape it has always read.
-    pub fn heartbeat(&self, who: Identity, beat: Heartbeat) -> ServiceReply {
+    pub fn heartbeat(&self, who: Identity, beat: Heartbeat) -> Answer {
+        let asked = beat.agent_features.clone();
+        let reply = self.reply_to(who, beat);
+        // Only an agent that announced features gets `features`: an older agent reads the
+        // reply strictly and refuses a field it does not know.
+        let features = (!asked.is_empty()).then(|| {
+            self.features
+                .iter()
+                .filter(|name| asked.contains(name))
+                .cloned()
+                .collect()
+        });
+        Answer { reply, features }
+    }
+
+    fn reply_to(&self, who: Identity, beat: Heartbeat) -> ServiceReply {
         let now = (self.clock)();
         let mut fleet = self.fleet.lock().unwrap_or_else(PoisonError::into_inner);
         let announced = beat.services.clone().unwrap_or_default();
@@ -383,6 +457,12 @@ impl Coordinator {
             services: self.desired.all(),
             quiet: fleet.is_quiet(now),
             services_dropped: self.services_dropped.load(Ordering::Relaxed),
+            extras_dropped: self
+                .extras
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .counts
+                .clone(),
             hosts,
             commit: crate::BUILD_COMMIT,
         })

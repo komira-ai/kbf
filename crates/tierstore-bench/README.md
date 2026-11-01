@@ -125,6 +125,21 @@ A credentials file (`admin`, `verifier`) is JSON of `access_key_id` and `secret_
 `verifier`, `mc`, `node`, `cold_heal_status_file` and `paper` are optional; `tierstore`, `live`
 (with `dirs`) and `test_instance` are not.
 
+`verify-teardown` reads the store with the `verifier` key. That key needs `s3:ListAllMyBuckets`
+(the bucket list) and read on the test bucket (`s3:GetObject`, `s3:ListBucket`,
+`s3:ListBucketMultipartUploads`, `s3:GetBucketLocation`). `test-bucket-removed` passes only when
+the bucket list, read with that key, does not name the test bucket and does name the role's
+live bucket (`live_buckets`). It fails if the bucket is listed and fails if the list cannot be
+read (`AccessDenied` included). The live-bucket condition closes a blind spot: a store lists a key
+without `s3:ListAllMyBuckets` only the buckets that key may use, so a mis-scoped verifier sees an
+empty list, and an empty list proves nothing. A list that does not name the live bucket fails with
+"the verifier's bucket list does not show the live bucket <name>: the key lacks
+s3:ListAllMyBuckets, so the list cannot prove removal", and a role with no `live_buckets` entry
+fails with a message that says so. An `AccessDenied` on the
+bucket itself is never read as removal; a `NoSuchBucket` on it is noted and does not decide
+alone. `no-multipart-uploads` reads the uploads of the bucket whenever `s3:ListBucketMultipartUploads`
+is granted, whether or not the other listings work.
+
 ### The live directories
 
 `live.dirs` lists the live tierstore's state and data directories on this node. It is required
@@ -185,8 +200,34 @@ their paths in the arm names and the result notes say which they are:
 | `cold-read` | `direct`, `instance`, each with a `.ttfb` arm | a streamed read of objects only the cold tier holds: time to the last byte, and to the first |
 | `g` | `instance`, `direct-cold`, `direct-hot`, `loopback-http`, `local-disk` | a read of the 18,105-file, 344,233,431-byte synthetic tree at each width, with the baselines |
 | `a1` | `instance`, `hot` | put-to-ack of a plain put, acknowledged from the hot tier |
-| `b` | `<size>-c<n>` and `.ttfb`, `.second`, `.cold-direct` | a read of a hot miss with copy-back, the second read, and the direct read |
+| `b` | `<size>-c<n>` and `.ttfb`, `.second`, `.cold-direct` | a read of a hot miss with copy-back, the second read, and the direct read; per object the instance's reads come first and the direct read of the cold bucket last, so the miss is not timed against a store the harness has just read from |
 | `c` | `<N>x<size>-c<n>-<mode>` | copy lag of a burst, found by one prefix LIST of the cold bucket every `1 / --list-poll-rps` seconds (2 a second unless set) |
+
+Besides latencies every result records what a reader needs to tell a measurement from a cap or a
+busy machine:
+
+- `rate_caps`: the cold, hot and LIST-poll request caps of the run (`--cold-rps`, `--hot-rps`,
+  `--list-poll-rps`). A cell whose requests wait at a cap measures the cap; `report` names the caps
+  under the table of every cell.
+- per pass, `peak_in_flight`: the most requests in flight at the start of one request, which is the
+  width the pass realised (at 16 asked and a cap of 20 requests a second it is far below 16).
+- per pass, `disk_busy`: for each whole disk of the machine that sends the requests, the
+  milliseconds it spent doing IO during the pass (`io_ticks` of `/proc/diskstats`) and that over the
+  pass's wall time, over the driven window only (the cleanup hook is not in it). It is this
+  machine's disks; a cold store on another host has to be read there. `dm-*` and `md*` devices
+  (LVM, RAID) are in `/sys/block`, so a stacked volume is listed beside its physical disk; busy time
+  is per device, so nothing is summed.
+- per pass of an arm that has the fault proxy in its path, `proxy_requests`: the requests the proxy
+  forwarded by HTTP method (the proxy's own `requests_by_method` counter) while the pass sent its
+  requests (`during`) and while the arm's cleanup hook ran (`cleanup`: the bench's own cleanup,
+  plus any background traffic that happened to land then; background traffic is not separated, and
+  an arm with no cleanup hook has about none). Old results call the field `after`. The report gives
+  them per request.
+
+`report` also sets each `instance` put arm of `cold-put` beside the `direct-mp` arm of the same
+size, width and mode (both are multipart uploads); the single PUT `direct` is not its partner. The
+number of measured requests of an arm is `(passes - 1) x requests per pass`: 10,000 requests at
+1,000 a pass is `--passes 11`.
 
 The rules (also in `cells/mod.rs`): pass 0 of every arm is a discarded warm-up, arms are
 interleaved across passes, the load gate is read before a pass and every few completions in it
@@ -215,11 +256,50 @@ The load gate sees this machine only. Two things look at the cold store itself.
 carry that reading. Before every pass of every arm `run` reads it again, through what preflight
 uses and read-only: `mc admin info` of the cold role (its drives and whether any reports healing)
 and the status file of the ops file (`cold_heal_status_file`, `percent_done`). It is healing if a
-drive says so or the status file is under 100. A reading that cannot be made (neither source
-answers, or the status file is not one) stops the run, and so does a reading that takes longer
+drive says so or the status file is under 100. A reading that cannot be made (`mc admin info`
+fails, or the status file is not one) stops the run, and so does a reading that takes longer
 than `--cold-state-timeout-secs` (30): the `mc admin info` that has not answered by then is
 killed (that command only) and the run stops with `cold state: unreadable`, the status file
 notwithstanding. A run with no `cold` role reads nothing.
+
+**File mode.** When the ops file has no `admin` entry for `cold` and names a
+`cold_heal_status_file`, `run` and `preflight` never run `mc` for the cold role: a writer on a host
+that holds the admin key keeps the file, and the file is the reading. (With an `admin` entry for
+`cold` nothing of this applies: `mc admin info` is read, and an admin key that fails is an error,
+never a fall back to the file.) The file is JSON:
+
+```json
+{"read_unix_ms": 1790000000000, "healing": true, "percent_done": 12.5,
+ "drives": [{"id": "d-1a2b3c4d", "state": "ok", "healing": true}],
+ "version": "RELEASE.<version>"}
+```
+
+`read_unix_ms` (integer, milliseconds since the Unix epoch), `healing` (bool) and `drives` (array of
+`id`, `state`, `healing`, named as in a result) are required; `percent_done` and `version` are
+optional; other fields are ignored. The reading is healing if `healing`, a drive or a
+`percent_done` under 100 says so. The file is refused (`cold state: unreadable` for `run`, which
+stops; a failed `store-version:cold` and `cold-heal-state` for `preflight`) if it is missing or not
+this JSON, if `read_unix_ms` is older than `--cold-state-max-age-secs` (default 30, at least 1) before
+now, or if it is more than 5 s in the future. The `cold_state` entry carries the file's
+`read_unix_ms`, not the time the tool read the file, and `"source": "file"` (`"mc"` when `mc` was
+asked). Preflight takes the store version from the file's `version`; without one the check
+passes as `version unknown (file mode)` and the report records no cold store version. Only the
+cold role has a file mode; a hot role still needs its `admin` entry.
+
+The writer's contract: stamp `read_unix_ms` with the clock of the host that asked the store, at the
+time of the ask; write the file only after `mc admin info` answered and was parsed; on any failure
+write nothing, so the file ages out and the run stops. The tool compares the writer's stamp with
+its own clock, so the two hosts' clocks must be in sync (NTP on both). A writer more than 5 s
+ahead of the reader is refused as stamped in the future; a writer behind the reader spends that
+difference from `--cold-state-max-age-secs`, so a file is refused sooner than its age alone says.
+
+The file is a trust input: it decides whether the cold store is quiet. It is written by the
+dev-box loop over ssh as the operator account, mode 0644, owned by that account (the user that
+runs the tool), and it is read as a secret file is: the tool refuses it (the reading is
+`cold state: unreadable` and `run` stops) if it is a symbolic link, is not a regular file (a FIFO
+or a directory), is owned by another user, is writable by its group or by others, or is over
+64 KiB. The same rule holds for the status file in `mc` mode.
+
 Each reading is stamped into the `cold_state` array of the result of the arm, one entry per pass:
 
 ```json

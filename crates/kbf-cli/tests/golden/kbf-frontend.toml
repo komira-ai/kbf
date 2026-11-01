@@ -77,6 +77,8 @@ executor-insecure-argv-secrets = false
 executor-lease-ttl-secs = 3600
 # The lease server, as `https://host[:port]`, or `http://` to a loopback host. Used only with `--executor js-agent`
 # executor-lease-url = "URL"
+# Has the task tool ask the read listener where each input is kept (`GET /locate`) and read it straight from that store, with the read grants the answer carries, and from the listener any input whose direct read fails; every byte is still checked against its digest. Off by default: the task reads every input through the listener. With no grants in the answer it reads from the listener as without the flag. An `http://` store needs `--executor-allow-plain-http-grant`. Used only with `--executor js-agent`, and refused with `--executor kbf-daemon`
+executor-locate = false
 # The longest action timeout the executor runs, in seconds; an action that asks for more is refused. Used only with `--executor js-agent`
 executor-max-run-secs = 3000
 # The scratch disk a run books for what it writes, in bytes: its outputs, the pack and the private home, tmp and cache. A run books this, the bytes of its inputs and a fixed 1 GiB margin against the host's scratch, and the lease server refuses a run the host's disk cannot hold. Used only with `--executor js-agent`
@@ -144,6 +146,12 @@ job-read-budget-bytes = 1073741824
 job-read-idle-secs = 60
 # The blob reads this listener has open at once, at least 1: a streamed blob holds its place until its response ends, and a request over the bound waits for one to end. Needs `--job-listen`
 job-reads-in-flight = 32
+# The bucket of the tier store that read grants are made for, the store's `--bucket`. Needs `--job-store-grant-key-file`
+# job-store-bucket = "BUCKET"
+# A file with the grant key of the tier store, `{"access_key_id": "...", "secret_access_key": "..."}` (or the id on the first line and the secret on the second), owned by this user and readable by it alone (mode 0600 or 0400): the key the store's `--grant-key-file` holds. With it, `GET /locate` signs read grants for the packs and large objects its table names, each good for the Action's job and at most ten minutes, and the task reads them from the store directly with `--locate`; the store must know the same key. Without it, `GET /locate` carries no grant and the task reads every blob from this listener. The secret is never a flag. Needs `--job-store-url`, `--job-store-bucket` and `--job-listen`
+# job-store-grant-key-file = "PATH"
+# The base URL of the tier store that a task is told to read from with a grant, `http://host:port` or `https://host:port` with no path (the task dials it from its worker, so give an address the workers reach). Needs `--job-store-grant-key-file`
+# job-store-url = "URL"
 # The certificate chain (PEM) of `--job-listen`, issued by the farm CA that the jobs trust. It must carry an IP subjectAltName for each address a job dials the frontend at: the start is refused if it has none, or if `--job-listen` is on one address and the certificate does not name it, since a client that dials an IP address accepts only a certificate that names it. Read again every `--tls-reload-interval-secs`, as the other listeners' are; the names are checked at start only
 # job-tls-cert = "PATH"
 # The private key (PEM) of `--job-tls-cert`
@@ -250,6 +258,8 @@ scheduler-core = "legacy"
 state-store-wait-secs = 300
 # How long, in seconds, queued work waits while no connected daemon can run it (none satisfies its platform, or none that does is large enough) before it is refused FAILED_PRECONDITION. The wait restarts whenever one can
 unservable-wait-secs = 300
+# Whether the farm learns what its leases use, for the scheduler's admission by load. `off`, the default, learns nothing. `record` and `on` need `--scheduler-core js` and `--state-store`; `on` also needs `--placement-load on` and `--placement-predictions on`, since the scheduler reads a curve only for an action that has a prediction. In this build a value other than `off` changes only the start line `usage profiles: <mode>` and the gauge `kbf_usage_profiles_mode{mode}`, 1 for the mode and 0 for the others: nothing is learned or stored yet. A server given a combination that breaks one of these refuses to start
+usage-profiles = "off"
 # The cores a node that reports VM slots (`vm.slots`) keeps for the host itself: subtracted from the CPUs placement may book on it, so that guests cannot take the host's own share. A node that reports none books the whole machine
 vm-host-floor-cpus = 2
 # The memory, in GiB, a node that reports VM slots (`vm.slots`) keeps for the host itself, subtracted as `--vm-host-floor-cpus` subtracts cores

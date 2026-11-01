@@ -180,9 +180,14 @@ where
         Some(HeartbeatRead {
             beat,
             services_dropped,
+            extras_dropped,
+            extras_dropped_facts,
         }) => {
             if let Some(why) = services_dropped {
                 coordinator.note_services_dropped(&identity, &why);
+            }
+            if let Some(why) = extras_dropped {
+                coordinator.note_extras_dropped(&identity, &why, &extras_dropped_facts);
             }
             json(StatusCode::OK, &coordinator.heartbeat(identity, beat))
         }
