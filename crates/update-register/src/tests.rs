@@ -128,8 +128,11 @@ impl Script {
 /// its clock tick, which is at most 10 ms. This reads the setting, not how long anything took.
 fn assert_timeout_is(got: Option<Duration>, want: Duration) {
     let got = got.expect("a timeout is set");
+    // Two assertions, not one with `&&`: the second operand of a lazy `&&` is a branch of its
+    // own, and the first is never false.
+    assert!(got >= want, "{got:?} for {want:?}");
     assert!(
-        got >= want && got < want + Duration::from_millis(100),
+        got < want + Duration::from_millis(100),
         "{got:?} for {want:?}"
     );
 }
