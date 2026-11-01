@@ -283,22 +283,22 @@ jobs:
           - core: legacy
             part: 1
             parts: 3
-            min_free_gb: 75
+            min_free_gb: 40
             args: --workspace
           - core: legacy
             part: 2
             parts: 3
-            min_free_gb: 75
+            min_free_gb: 40
             args: --workspace
           - core: legacy
             part: 3
             parts: 3
-            min_free_gb: 75
+            min_free_gb: 40
             args: --workspace
           - core: js
             part: 1
             parts: 1
-            min_free_gb: 55
+            min_free_gb: 35
             args: -p kbf-server -p kbf-integration-test -p kbf-daemon -p kbf-node --features kbf-server/farm-core-js
     # A throwaway Postgres server for every test that needs one, the same container as
     # beta.yml's jobs use. KBF_TEST_POSTGRES_URL (below) names it; a test that needs it makes a
@@ -390,12 +390,14 @@ jobs:
       # is for.
       - name: Drop the workspace's coverage artifacts the cache restored
         run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov clean --workspace
-      # The instrumented build (about 59 GB measured for the legacy core), the tests' temporary
-      # files under it and the file store's 5% free-space floor (about 7.5 GB on this disk) need
-      # the room below (`min_free_gb` of the matrix): measured use is about 67 GB for the legacy
-      # core and about 50 GB for the js core, and the values hold a margin over those (75 and
-      # 55; the lint refuses lower ones). Short here means the restored cache or the
-      # image grew: the step says so and stops, instead of about 30 tests failing with "Full".
+      # The instrumented build without debug info and the tests' temporary files and profiles
+      # under it (measured as the fall of the disk's used space: about 26 GB for the legacy
+      # core, about 21 GB for the js core; `target` was 25 and 20 GB), and the file store's 5%
+      # free-space floor (7.25 GB on a 145 GB disk, 3.6 GB on a 72 GB one; 7.5 is taken) need
+      # the room below (`min_free_gb` of the matrix): 33.5 and 28.5 GB, and the values hold a
+      # margin over those (40 and 35; the lint refuses lower ones). Short here means the
+      # restored cache or the image grew: the step says so and stops, instead of about 30 tests
+      # failing with "Full".
       - name: Refuse early when the disk is short for the tests
         run: cargo "+$COVERAGE_TOOLCHAIN" xtask runner-disk --path . --min-free-gb "$MIN_FREE_GB"
       # nextest runs a process per test, so a test's line coverage must not rest on another
@@ -413,11 +415,12 @@ jobs:
       - name: Free disk after the tests (report)
         if: ${{ always() }}
         run: df -h /
+      - name: Size of target after the tests (report)
+        if: ${{ always() }}
+        run: du -sh target
       - name: Disk use under target after the tests (report)
         if: ${{ always() }}
-        run: |
-          du -sh target
-          du -xhd 3 target | sort -rh | head -25
+        run: du -xhd 3 --threshold=1G target
       # The shard's raw profiles become ONE indexed profile (a few MB) here, so that `test`
       # downloads megabytes and not the raw profiles (1.8 GB as artifacts, about 14 GB unpacked),
       # which filled its runner's disk.
@@ -519,9 +522,10 @@ jobs:
       - name: Drop the workspace's coverage artifacts the cache restored
         run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov clean --workspace
       - run: mkdir -p target/coverage
-      # The two builds (about 72 GB together, measured) need the room below.
-      - name: Refuse early when the disk is short for the builds (80 GiB free)
-        run: cargo "+$COVERAGE_TOOLCHAIN" xtask runner-disk --path . --min-free-gb 80
+      # The two builds (about 35 GB together, measured as the fall of the disk's free space) and
+      # the file store's 5% floor (7.5 GB) are 42.5 GB; the figure holds a margin over it.
+      - name: Refuse early when the disk is short for the builds (50 GiB free)
+        run: cargo "+$COVERAGE_TOOLCHAIN" xtask runner-disk --path . --min-free-gb 50
       # The build of each core is the command of its shards (the `args` of the matrix of
       # `test-shard`), with every test filtered out. The legacy build is the workspace's; the js
       # build adds the rebuilt kbf-server and its dependents beside it in the same target
