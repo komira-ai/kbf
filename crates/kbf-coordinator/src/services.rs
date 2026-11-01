@@ -18,6 +18,11 @@
 //! name = "agent"
 //! after = ["server"]             # services defined earlier in the file, or kbf
 //! priority = 0                   # default 0; a host is offered the higher number first
+//! install_when_absent = false    # default false; order a host whose copy never registered
+//!
+//! [service.selector]             # optional; absent: a host belongs if it announces the service
+//! roles = ["daemon"]             # default: every role of the service
+//! labels = { zone = "a" }        # operator-set labels the host must carry
 //! bake_beats = 0                 # default 0, at most 100: healthy beats before a slot frees
 //! canary = { count = 1 }         # optional: only this many hosts go until they have baked
 //! rollback = "manual"            # or "automatic": the coordinator sets the last good version
@@ -47,6 +52,7 @@ use crate::bake::MAX_BAKE_BEATS;
 use crate::canary::Canary;
 use crate::defer::DeferBackoff;
 use crate::desired::{Desired, KBF, KBF_MIN_UP, LEGACY_ROLES, MAX_COUNT, kbf_roles};
+use crate::membership::{RawSelector, Selector};
 use crate::reconcile::{FailThreshold, Rollback};
 
 /// The most bytes of a services file.
@@ -120,6 +126,10 @@ pub struct ServiceDef {
     /// [`crate::service::Coordinator::heartbeat`]. It orders offers only: a service that
     /// must wait (`after`, its slots) yields to the next one whatever its priority.
     pub priority: i32,
+    /// Which hosts should run the service (`None`: the hosts that announce it).
+    pub selector: Option<Selector>,
+    /// Whether a host on which the service is declared and has never registered is ordered.
+    pub install_when_absent: bool,
     /// How many healthy beats a host at the desired version must send before it frees the
     /// slot it held while updating (default 0: it frees it at once).
     pub bake_beats: u32,
@@ -148,6 +158,8 @@ impl ServiceDef {
             after: Vec::new(),
             require_min_up: Vec::new(),
             priority: 0,
+            selector: None,
+            install_when_absent: false,
             bake_beats: 0,
             canary: None,
             rollback: Rollback::Manual,
@@ -219,6 +231,9 @@ struct RawService {
     roles: BTreeMap<String, RawRole>,
     #[serde(default)]
     priority: i32,
+    selector: Option<RawSelector>,
+    #[serde(default)]
+    install_when_absent: bool,
     #[serde(default)]
     bake_beats: u32,
     canary: Option<RawCanary>,
@@ -309,6 +324,8 @@ fn service_def(
         after,
         roles,
         priority,
+        selector,
+        install_when_absent,
         bake_beats,
         canary,
         rollback,
@@ -361,6 +378,10 @@ fn service_def(
         .keys()
         .map(|r| role_of(r))
         .collect::<Result<BTreeSet<_>, _>>()?;
+    let selector = selector
+        .map(|raw| Selector::new(raw, &names))
+        .transpose()
+        .or_else(|why| invalid(format!("{name}: selector {why}")))?;
     let roles = roles
         .into_iter()
         .map(|(r, raw)| Ok((role_of(&r)?, role_def(&name, raw, &names)?)))
@@ -371,6 +392,8 @@ fn service_def(
         after,
         require_min_up: Vec::new(),
         priority,
+        selector,
+        install_when_absent,
         bake_beats,
         canary: canary.map(|c| Canary { count: c.count }),
         rollback,

@@ -10,10 +10,12 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
+use crate::cells::armfilter;
 use crate::cells::budget::{Campaign, lock_path};
 use crate::cells::engine::FaultSwitch;
 use crate::cells::{self, CellContext, CellId, CellPlan};
-use crate::coldstate::{ColdStateSource, NoColdState, OpsColdState};
+use crate::coldserver::{self, ColdServer};
+use crate::coldstate::{ColdMeter, ColdStateSource, NoColdState, OpsColdMeter, OpsColdState};
 use crate::config::{ConfigArgs, RunConfig};
 use crate::error::BenchError;
 use crate::faultfile::FileSwitch;
@@ -122,6 +124,16 @@ pub struct RunArgs {
     /// reads them all and labels them.
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
     pub attempt: u32,
+    /// Restrict every selected cell to these arm families (comma separated), so that the direct
+    /// arms run in a run of their own and the cold store guard judges them: the families are
+    /// `direct`, `direct-mp` and `instance` of `cold-put`, `direct` and `instance` of
+    /// `cold-read`, `hot` and `instance` of `a1` (an arm label is its family, then its size,
+    /// width and mode: `direct-mp-4kib-c1-healthy` is of family `direct-mp`). Cells B, C and G
+    /// have no families and cannot be filtered. A family no selected cell has is refused, and so
+    /// is a filter that leaves a selected cell no arm. Without it every arm runs. Run the
+    /// filtered runs with the same `--attempt`, back to back, and `report` pairs them.
+    #[arg(long, value_delimiter = ',', value_name = "FAMILIES")]
+    pub arms: Vec<String>,
     /// The commit this binary was built from, copied into every result.
     #[arg(long)]
     pub git_sha: String,
@@ -151,6 +163,12 @@ pub struct RunArgs {
 }
 
 impl RunArgs {
+    /// The `--arms` filter, if one was given.
+    #[must_use]
+    pub fn arms_filter(&self) -> Option<Vec<String>> {
+        (!self.arms.is_empty()).then(|| self.arms.clone())
+    }
+
     /// Whether the open-loop arms are in the plan (`--open-loop`).
     #[must_use]
     pub fn open_loop(&self) -> bool {
@@ -232,6 +250,8 @@ fn provenance(
     git_sha: &str,
     attempt: u32,
     open_loop: bool,
+    arms_filter: Option<Vec<String>>,
+    cold_server: Option<ColdServer>,
 ) -> Result<Provenance, BenchError> {
     let path = result_dir.join(preflight::REPORT_FILE);
     let text = std::fs::read(&path).map_err(|source| BenchError::Io { path, source })?;
@@ -241,6 +261,8 @@ fn provenance(
     Ok(Provenance {
         attempt,
         open_loop,
+        arms_filter,
+        cold_server,
         ..report.provenance(run_id, git_sha)
     })
 }
@@ -248,18 +270,34 @@ fn provenance(
 /// Where the run reads the cold store's state from: the preflight's source on this machine, or
 /// nothing if the run has no cold store.
 fn cold_source(config: &RunConfig, ops: &OpsFile) -> Arc<dyn ColdStateSource> {
-    match config.stores.get(&Role::Cold) {
-        Some(spec) => Arc::new(
-            OpsColdState::new(
-                Arc::new(SystemHost),
-                ops.clone(),
-                spec.clone(),
-                config.result_dir.clone(),
-            )
-            .with_max_age(config.cold_state_max_age),
-        ),
+    match cold_state_of(config, ops) {
+        Some(state) => Arc::new(state),
         None => Arc::new(NoColdState),
     }
+}
+
+/// The source of the cold store's state, if the run has a cold store.
+fn cold_state_of(config: &RunConfig, ops: &OpsFile) -> Option<OpsColdState> {
+    let spec = config.stores.get(&Role::Cold)?;
+    Some(
+        OpsColdState::new(
+            Arc::new(SystemHost),
+            ops.clone(),
+            spec.clone(),
+            config.result_dir.clone(),
+        )
+        .with_max_age(config.cold_state_max_age),
+    )
+}
+
+/// The meter of the cold store guard: a run with the cold admin key has one; a run with a heal
+/// status file alone (file mode) has no counter to read, nor does a run with no cold store.
+fn cold_meter(config: &RunConfig, ops: &OpsFile) -> Option<Arc<dyn ColdMeter>> {
+    let state = cold_state_of(config, ops).filter(|_| ops.cold_file_mode().is_none())?;
+    Some(Arc::new(OpsColdMeter::new(
+        state,
+        config.cold_counter_settle,
+    )))
 }
 
 /// Runs the verb.
@@ -292,10 +330,15 @@ pub async fn run(cli: Cli) -> Result<(), BenchError> {
         }
         Command::Run(args) => {
             let args = *args;
+            // Before anything is read or made: a filter that names no arm of the cells is a typo.
+            if let Some(filter) = args.arms_filter() {
+                armfilter::check(&args.cells, &filter)?;
+            }
             let config = RunConfig::load(&args.config)?;
             // Before anything is created: the result directory, the ledger and its lock stay
             // clear of the live tierstore's directories.
             let ops = OpsFile::load(&SystemHost, &config.result_dir)?;
+            let cold_server = coldserver::read(&SystemHost, &ops, &config);
             livedir::check_outside(
                 &[
                     ("result directory", config.result_dir.as_path()),
@@ -315,6 +358,8 @@ pub async fn run(cli: Cli) -> Result<(), BenchError> {
                 &args.git_sha,
                 args.attempt,
                 args.open_loop(),
+                args.arms_filter(),
+                Some(cold_server.clone()),
             )?;
             // Before a request is sent: the ledger is begun or found, or the run stops.
             // The lock is held until the arm ends, the run with it.
@@ -331,6 +376,8 @@ pub async fn run(cli: Cli) -> Result<(), BenchError> {
             let ctx = CellContext {
                 provenance,
                 cold_state: cold_source(&config, &ops),
+                cold_meter: cold_meter(&config, &ops),
+                cold_server,
                 config,
                 log: Arc::new(log),
                 campaign,
@@ -428,8 +475,14 @@ mod tests {
         std::fs::create_dir_all(dir.path()).unwrap();
         let report = serde_json::to_vec(&PreflightReport::default()).unwrap();
         std::fs::write(dir.path().join(preflight::REPORT_FILE), report).unwrap();
-        let of = |open_loop| provenance(dir.path(), "run-1", "abc", 3, open_loop).unwrap();
+        let of =
+            |open_loop| provenance(dir.path(), "run-1", "abc", 3, open_loop, None, None).unwrap();
         let (on, off) = (of(true), of(false));
+        assert_eq!(on.arms_filter, None);
+        let filter = Some(vec!["direct".to_owned()]);
+        let filtered =
+            provenance(dir.path(), "run-1", "abc", 3, true, filter.clone(), None).unwrap();
+        assert_eq!(filtered.arms_filter, filter);
         assert_eq!((on.open_loop, off.open_loop), (true, false));
         assert_eq!(
             (off.run_id.as_str(), off.git_sha.as_str(), off.attempt),

@@ -37,6 +37,8 @@
 //!
 //! A version marked bad ([`crate::reconcile`]) is ordered to nobody, whatever the rules above
 //! say, and is held at [`Hold::Bad`] after the quiet start.
+//! A host that reports the service `absent` (declared, never registered) is held back before
+//! all of these but the first, unless the definition says `install_when_absent` ([`Hold::Absent`]).
 //!
 //! The decision records nothing: the caller notes an `Update` it returns with
 //! [`Fleet::order`], under the same lock, so the next host's decision sees it. A host that
@@ -51,7 +53,7 @@ use std::time::Duration;
 
 use kbf_types::NodeId;
 use kbf_updater::version::Version;
-use kbf_updater::wire::{Outcome, Reply};
+use kbf_updater::wire::{Health, Outcome, Reply};
 use serde::Serialize;
 
 use crate::canary;
@@ -99,6 +101,9 @@ pub enum Hold {
     NotAMember,
     /// The coordinator started less than [`crate::fleet::QUIET_START`] ago.
     Quiet,
+    /// The service is declared on the host and has never registered, and the definition does
+    /// not say `install_when_absent`.
+    Absent,
     /// The host is updating this service.
     Updating,
     /// The host is updating another service or has an order outstanding for one.
@@ -215,6 +220,10 @@ fn first_hold(
     let rules = [
         (fleet.is_quiet(now), Hold::Quiet),
         (bad.contains(&desired.version), Hold::Bad),
+        (
+            host.beat.health == Health::Absent && !def.install_when_absent,
+            Hold::Absent,
+        ),
         (host.beat.updating.is_some(), Hold::Updating),
         (fleet.is_busy_besides(service, id, now), Hold::BusyElsewhere),
         (host.beat.version == desired.version, Hold::UpToDate),

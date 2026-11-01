@@ -91,7 +91,14 @@ pub(crate) fn release() -> (Option<Phase>, Option<Class>) {
 
 /// What the plan says for `def` at 2000 when 2.0 is wanted.
 pub(crate) fn plan_for(def: &ServiceDef, marks: &ServiceOps, fleet: &Fleet) -> Vec<Change> {
-    plan(def, &desired("2.0", 0, 0), marks, fleet, secs(2_000))
+    plan(
+        def,
+        &desired("2.0", 0, 0),
+        marks,
+        fleet,
+        &OpsState::default(),
+        secs(2_000),
+    )
 }
 
 pub(crate) fn rolled_back() -> Vec<Change> {
@@ -322,6 +329,7 @@ fn a_halt_beats_a_rollback() {
             &desired("1.0", 0, 0),
             &converged,
             &farm(6, 0, phase, class),
+            &OpsState::default(),
             secs(2_000)
         ),
         vec![]
@@ -415,7 +423,14 @@ pub(crate) fn all_at_one() -> Vec<(&'static str, Heartbeat)> {
 }
 
 pub(crate) fn plan_one(def: &ServiceDef, marks: &ServiceOps, fleet: &Fleet) -> Vec<Change> {
-    plan(def, &desired("1.0", 0, 0), marks, fleet, secs(2_000))
+    plan(
+        def,
+        &desired("1.0", 0, 0),
+        marks,
+        fleet,
+        &OpsState::default(),
+        secs(2_000),
+    )
 }
 
 /// The desired version is recorded as last good when every live host runs it, healthy and
@@ -485,6 +500,7 @@ fn last_good_waits_for_the_bake() {
                 &desired("1.0", 0, 0),
                 &ServiceOps::default(),
                 &fleet,
+                &OpsState::default(),
                 secs(2_000 + round)
             ),
             expect,
@@ -525,6 +541,7 @@ fn setting_min_version_clears_last_good() {
             &desired("3.0", 0, 0),
             &good(),
             &farm(6, 0, phase, class),
+            &OpsState::default(),
             secs(2_000)
         ),
         vec![]
@@ -946,6 +963,7 @@ async fn a_manual_service_records_nothing_and_creates_no_ops_file() {
             &desired("1.0", 0, 0),
             &ServiceOps::default(),
             &converged(&all_at_one()),
+            &OpsState::default(),
             secs(2_000)
         ),
         vec![]
