@@ -31,7 +31,8 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use crate::cells::stats;
-use crate::result::ColdTrip;
+use crate::coldstate::ColdReading;
+use crate::result::{ColdTrip, ColdWindow};
 
 /// Fewer requests than this in the window and the guard does not judge.
 pub const MIN_REQUESTS: usize = 20;
@@ -45,6 +46,8 @@ pub struct ColdGuardLimits {
     pub max_p99_ms: u64,
     /// Highest share of failed requests in the window, 0 to 1.
     pub max_error_share: f64,
+    /// Most requests from elsewhere that a pass may have seen at the cold store.
+    pub max_foreign_requests: u64,
 }
 
 impl Default for ColdGuardLimits {
@@ -53,6 +56,7 @@ impl Default for ColdGuardLimits {
             window: Duration::from_secs(60),
             max_p99_ms: 2_000,
             max_error_share: 0.05,
+            max_foreign_requests: 10,
         }
     }
 }
@@ -90,6 +94,41 @@ impl ColdGuard {
         });
     }
 
+    /// Whether a first reading has been taken: [`ColdGuard::open`] has been called, or
+    /// [`ColdGuard::close`] took its place.
+    #[must_use]
+    pub fn has_baseline(&self) -> bool {
+        todo!("whether a first reading is held")
+    }
+
+    /// Takes the first reading of the chain of windows (the counters at its start), and refuses a
+    /// store that is not healthy by it.
+    ///
+    /// # Errors
+    /// [`ColdTrip`] if the reading failed or the store's drives are not all `ok`, or it is healing.
+    pub fn open(
+        &mut self,
+        _reading: Result<ColdReading, String>,
+        _own_requests: u64,
+    ) -> Result<(), ColdTrip> {
+        todo!("the first reading")
+    }
+
+    /// Ends the window that began at the last reading and begins the next at this one.
+    /// `own_requests` is the harness's count of requests to the cold role at the reading;
+    /// `judgeable` is whether the traffic of the window was the harness's alone.
+    ///
+    /// Gives what the window read (none if it could not be worked out) and the trip, if the store
+    /// is not healthy or the requests from elsewhere are over the limit.
+    pub fn close(
+        &mut self,
+        _reading: Result<ColdReading, String>,
+        _own_requests: u64,
+        _judgeable: bool,
+    ) -> (Option<ColdWindow>, Option<ColdTrip>) {
+        todo!("the end of a window")
+    }
+
     /// Judges the window as it stands at `now`: the requests older than the window are dropped,
     /// then the error share and the p99 of what is left are held to the limits (the share is
     /// looked at first).
@@ -115,6 +154,7 @@ impl ColdGuard {
             limit,
             requests: requests as u64,
             window_secs: window.as_secs(),
+            detail: None,
         };
         let failed = self.window.iter().filter(|seen| seen.failed).count();
         let share = failed as f64 / requests as f64;
@@ -138,12 +178,56 @@ impl ColdGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::result::{ColdSource, ColdState, DriveState};
 
+    /// The limits of the p99 and error share tests: a 2 s p99 keeps their numbers small. The
+    /// real default is the 30 s backstop, pinned by its own test.
     const LIMITS: ColdGuardLimits = ColdGuardLimits {
         window: Duration::from_secs(60),
         max_p99_ms: 2_000,
         max_error_share: 0.05,
+        max_foreign_requests: 10,
     };
+
+    /// A store whose drives are in the states `drives`, healing or not.
+    fn state(drives: &[&str], healing: bool) -> ColdState {
+        ColdState {
+            healing,
+            percent_done: None,
+            drives: drives
+                .iter()
+                .enumerate()
+                .map(|(i, state)| DriveState {
+                    id: format!("d-{i:08}"),
+                    state: (*state).to_owned(),
+                    healing: false,
+                })
+                .collect(),
+            read_unix_ms: 1,
+            source: Some(ColdSource::Mc),
+        }
+    }
+
+    /// A reading of a healthy store of 12 drives whose counter says `s3_requests`.
+    fn read(s3_requests: u64) -> Result<ColdReading, String> {
+        Ok(ColdReading {
+            s3_requests,
+            state: state(&["ok"; 12], false),
+        })
+    }
+
+    /// A reading of a store in `state`.
+    fn read_in(s3_requests: u64, state: ColdState) -> Result<ColdReading, String> {
+        Ok(ColdReading { s3_requests, state })
+    }
+
+    /// A guard whose chain of windows began with the counter at 1,000 and the harness's own count
+    /// at 500.
+    fn opened(limits: ColdGuardLimits) -> ColdGuard {
+        let mut guard = ColdGuard::new(limits);
+        guard.open(read(1_000), 500).unwrap();
+        guard
+    }
 
     /// The clock of these tests, moved by hand: `at` is `s` seconds after a fixed start, `tick`
     /// is `n` tenths of a second.
@@ -266,10 +350,264 @@ mod tests {
         assert!(guard.check(clock.at(31)).is_err());
     }
 
-    /// Catches limits other than the stated defaults: a window of 60 s, a p99 of 2,000 ms and an
-    /// error share of 0.05.
+    /// Catches limits other than the stated defaults: a window of 60 s, a hung-store backstop of
+    /// 30,000 ms, an error share of 0.05 and 10 requests from elsewhere.
     #[test]
-    fn the_defaults_are_sixty_seconds_two_seconds_and_five_percent() {
-        assert_eq!(ColdGuardLimits::default(), LIMITS);
+    fn the_defaults_are_a_minute_a_thirty_second_backstop_five_percent_and_ten_foreign() {
+        assert_eq!(
+            ColdGuardLimits::default(),
+            ColdGuardLimits {
+                max_p99_ms: 30_000,
+                ..LIMITS
+            }
+        );
+    }
+
+    /// Catches a guard that trips on the bench's own latency: the circular case. A store whose
+    /// small writes take 2.5 s at the p99 (an erasure-coded set of hard disks does) is not in
+    /// trouble when nothing but the bench is sending: the p99 is under the backstop, and the
+    /// window has no request from elsewhere.
+    #[test]
+    fn a_quiet_window_with_a_high_p99_of_its_own_does_not_trip() {
+        let clock = clock();
+        let mut guard = opened(ColdGuardLimits::default());
+        healthy(&mut guard, &clock, 0, 98);
+        guard.record(clock.tick(98), 2_500_000, false);
+        guard.record(clock.tick(99), 2_500_000, false);
+        assert_eq!(guard.check(clock.tick(100)), Ok(()));
+        let (window, trip) = guard.close(read(1_100), 600, true);
+        assert_eq!(trip, None);
+        let window = window.unwrap();
+        assert_eq!((window.minio_requests, window.own_requests), (100, 100));
+        assert_eq!((window.foreign_requests, window.judged), (0, true));
+    }
+
+    /// Catches a backstop that is not looked at, or one that fires early: a p99 of 31 s is a hung
+    /// store, and exactly 30 s is within the limit.
+    #[test]
+    fn a_hung_store_trips_the_backstop_and_the_message_says_so() {
+        let clock = clock();
+        let mut guard = ColdGuard::new(ColdGuardLimits::default());
+        healthy(&mut guard, &clock, 0, 98);
+        guard.record(clock.tick(98), 30_000_000, false);
+        guard.record(clock.tick(99), 30_000_000, false);
+        assert_eq!(guard.check(clock.tick(100)), Ok(()));
+        guard.record(clock.tick(100), 31_000_000, false);
+        guard.record(clock.tick(101), 31_000_000, false);
+        let trip = guard.check(clock.tick(102)).unwrap_err();
+        assert_eq!(trip.metric, "p99_ms");
+        assert!((trip.value - 31_000.0).abs() < 1e-9, "{trip}");
+        assert!((trip.limit - 30_000.0).abs() < 1e-9);
+        let text = trip.to_string();
+        assert!(text.contains("hung-store backstop"), "{text}");
+        assert!(text.contains("31000"), "{text}");
+    }
+
+    /// Catches foreign requests that are not held to the limit, and a message that does not name
+    /// them: 71 requests at the store, 60 of them the bench's, 11 are over the 10 allowed.
+    #[test]
+    fn foreign_requests_over_the_limit_trip_and_the_message_names_them() {
+        let mut guard = opened(ColdGuardLimits::default());
+        let (window, trip) = guard.close(read(1_071), 560, true);
+        let trip = trip.unwrap();
+        assert_eq!(trip.metric, "foreign_requests");
+        assert!((trip.value - 11.0).abs() < 1e-9, "{trip}");
+        assert!((trip.limit - 10.0).abs() < 1e-9);
+        let text = trip.to_string();
+        assert!(text.contains("foreign_requests is 11"), "{text}");
+        assert!(text.contains("limit 10"), "{text}");
+        assert!(text.contains("71") && text.contains("60"), "{text}");
+        // The window it read is given with the trip, for the result.
+        let window = window.unwrap();
+        assert_eq!(
+            (
+                window.minio_requests,
+                window.own_requests,
+                window.foreign_requests
+            ),
+            (71, 60, 11)
+        );
+    }
+
+    /// Pins the boundary: exactly the limit is within it, as everywhere else in the guard.
+    #[test]
+    fn foreign_requests_at_the_limit_do_not_trip() {
+        let mut guard = opened(ColdGuardLimits::default());
+        let (window, trip) = guard.close(read(1_070), 560, true);
+        assert_eq!(trip, None);
+        assert_eq!(window.unwrap().foreign_requests, 10);
+        // A limit of 0 is "no request from elsewhere at all".
+        let strict = ColdGuardLimits {
+            max_foreign_requests: 0,
+            ..ColdGuardLimits::default()
+        };
+        let mut guard = opened(strict);
+        assert_eq!(guard.close(read(1_060), 560, true).1, None);
+        assert_eq!(
+            guard.close(read(1_061 + 60), 620, true).1.unwrap().metric,
+            "foreign_requests"
+        );
+    }
+
+    /// Catches a store that failed the bench's requests before they were counted (a refused
+    /// connection is in the bench's count and not the store's) being read as negative foreign
+    /// load: it is none, and the numbers are in the window.
+    #[test]
+    fn fewer_requests_at_the_store_than_sent_is_no_foreign_load() {
+        let mut guard = opened(ColdGuardLimits::default());
+        let (window, trip) = guard.close(read(1_005), 509, true);
+        assert_eq!(trip, None);
+        let window = window.unwrap();
+        assert_eq!(
+            (
+                window.minio_requests,
+                window.own_requests,
+                window.foreign_requests
+            ),
+            (5, 9, 0)
+        );
+    }
+
+    /// Catches windows that are not chained: the second window starts where the first ended, so
+    /// the requests of the first are not counted again.
+    #[test]
+    fn each_window_begins_where_the_last_ended() {
+        let mut guard = opened(ColdGuardLimits::default());
+        assert!(guard.has_baseline());
+        let (first, _) = guard.close(read(1_050), 550, true);
+        assert_eq!(first.unwrap().minio_requests, 50);
+        let (second, trip) = guard.close(read(1_080), 580, true);
+        assert_eq!(trip, None);
+        assert_eq!(second.unwrap().minio_requests, 30);
+    }
+
+    /// Catches a guard that says it has a reading before it has: only a first reading makes the
+    /// baseline; a window closed with none begins the chain and judges the store's health, not
+    /// the requests (there is nothing to take them from).
+    #[test]
+    fn a_window_closed_before_any_reading_begins_the_chain() {
+        let mut guard = ColdGuard::new(ColdGuardLimits::default());
+        assert!(!guard.has_baseline());
+        assert_eq!(guard.close(read(1_000), 500, true), (None, None));
+        assert!(guard.has_baseline());
+        let (window, _) = guard.close(read(1_020), 520, true);
+        assert_eq!(window.unwrap().minio_requests, 20);
+        let mut sick = ColdGuard::new(ColdGuardLimits::default());
+        let offline = state(&["ok", "offline"], false);
+        let (window, trip) = sick.close(read_in(1_000, offline), 500, true);
+        assert_eq!((window, trip.unwrap().metric.as_str()), (None, "drives"));
+    }
+
+    /// Catches a drive that is not `ok` being let by, in the window and at the start of the
+    /// chain: the numbers are the drives not ok and the drives listed.
+    #[test]
+    fn a_drive_that_is_not_ok_trips() {
+        let mut offline = vec!["ok"; 12];
+        offline[3] = "offline";
+        let mut guard = opened(ColdGuardLimits::default());
+        let (window, trip) = guard.close(read_in(1_000, state(&offline, false)), 500, true);
+        let trip = trip.unwrap();
+        assert_eq!(trip.metric, "drives");
+        assert!((trip.value - 1.0).abs() < 1e-9, "{trip}");
+        assert!(trip.limit.abs() < 1e-9);
+        let text = trip.to_string();
+        assert!(text.contains("1 of 12"), "{text}");
+        assert!(text.contains("offline"), "{text}");
+        let window = window.unwrap();
+        assert_eq!((window.drives, window.drives_not_ok), (12, 1));
+        // Starting on such a store is refused as well.
+        let mut fresh = ColdGuard::new(ColdGuardLimits::default());
+        let refused = fresh.open(read_in(1_000, state(&offline, false)), 500);
+        assert_eq!(refused.unwrap_err().metric, "drives");
+        // And a store that lists no drive at all cannot be shown to have them all ok.
+        let mut none = ColdGuard::new(ColdGuardLimits::default());
+        let trip = none.open(read_in(1_000, state(&[], false)), 500);
+        assert!(trip.unwrap_err().to_string().contains("no drive"));
+    }
+
+    /// Catches a store that is healing being let by.
+    #[test]
+    fn a_store_that_is_healing_trips() {
+        let mut guard = opened(ColdGuardLimits::default());
+        let healing = state(&["ok"; 12], true);
+        let (window, trip) = guard.close(read_in(1_000, healing.clone()), 500, true);
+        let trip = trip.unwrap();
+        assert_eq!(trip.metric, "healing");
+        assert!((trip.value - 1.0).abs() < 1e-9, "{trip}");
+        assert!(trip.to_string().contains("healing"));
+        assert!(window.unwrap().healing);
+        let mut fresh = ColdGuard::new(ColdGuardLimits::default());
+        assert_eq!(
+            fresh.open(read_in(1_000, healing), 500).unwrap_err().metric,
+            "healing"
+        );
+    }
+
+    /// Catches an order that hides the cause: a store with a drive offline AND foreign load
+    /// names the drive (the more specific fault, which also explains the load's effects).
+    #[test]
+    fn a_drive_fault_is_named_before_foreign_load() {
+        let mut guard = opened(ColdGuardLimits::default());
+        let offline = state(&["ok", "offline"], false);
+        let (_, trip) = guard.close(read_in(1_500, offline), 500, true);
+        assert_eq!(trip.unwrap().metric, "drives");
+    }
+
+    /// Decision, pinned: a counter that cannot be read is a trip, not zero foreign load. A window
+    /// that cannot be shown to be quiet is not quiet; and a trip, unlike an error, still writes
+    /// the results of the passes so far.
+    #[test]
+    fn a_counter_that_cannot_be_read_trips_and_is_not_zero_load() {
+        let mut guard = opened(ColdGuardLimits::default());
+        let (window, trip) = guard.close(Err("no series".to_owned()), 600, true);
+        assert_eq!(window, None);
+        let trip = trip.unwrap();
+        assert_eq!(trip.metric, "unreadable");
+        let text = trip.to_string();
+        assert!(
+            text.contains("unreadable") && text.contains("no series"),
+            "{text}"
+        );
+        let mut fresh = ColdGuard::new(ColdGuardLimits::default());
+        let refused = fresh.open(Err("timed out".to_owned()), 500).unwrap_err();
+        assert_eq!(refused.metric, "unreadable");
+        assert!(refused.to_string().contains("timed out"));
+        assert!(!fresh.has_baseline());
+    }
+
+    /// Decision, pinned: a counter that went backwards (the store restarted, its counter reset) is
+    /// a trip naming both readings; the same value is a window with no request.
+    #[test]
+    fn a_counter_that_goes_backwards_trips_and_the_same_value_is_a_quiet_window() {
+        let mut guard = opened(ColdGuardLimits::default());
+        let (window, trip) = guard.close(read(3), 520, true);
+        assert_eq!(window, None);
+        let trip = trip.unwrap();
+        assert_eq!(trip.metric, "counter");
+        let text = trip.to_string();
+        assert!(text.contains("1000") && text.contains('3'), "{text}");
+        let mut same = opened(ColdGuardLimits::default());
+        let (window, trip) = same.close(read(1_000), 500, true);
+        assert_eq!(trip, None);
+        let window = window.unwrap();
+        assert_eq!((window.minio_requests, window.foreign_requests), (0, 0));
+    }
+
+    /// Catches foreign load judged where the harness cannot tell it from the instance's own
+    /// copy traffic: the window is recorded with `judged` false and trips nothing, and so is the
+    /// window after it (the copy goes on); the next one is judged again.
+    #[test]
+    fn a_window_that_is_not_judgeable_is_recorded_and_not_judged() {
+        let mut guard = opened(ColdGuardLimits::default());
+        let (first, trip) = guard.close(read(1_500), 500, false);
+        assert_eq!(trip, None);
+        let first = first.unwrap();
+        assert_eq!((first.foreign_requests, first.judged), (500, false));
+        let (second, trip) = guard.close(read(2_000), 500, true);
+        assert_eq!(trip, None);
+        assert!(!second.unwrap().judged);
+        let (third, trip) = guard.close(read(2_500), 500, true);
+        assert!(third.unwrap().judged);
+        assert_eq!(trip.unwrap().metric, "foreign_requests");
     }
 }

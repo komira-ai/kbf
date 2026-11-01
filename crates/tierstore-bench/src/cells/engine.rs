@@ -42,7 +42,7 @@ use crate::cells::coldguard::ColdGuard;
 use crate::cells::stats;
 use crate::cells::streamget::{StreamGet, Streamed};
 use crate::cells::{CellContext, CellId};
-use crate::coldstate::ColdStateSource;
+use crate::coldstate::{ColdMeter, ColdReading, ColdStateSource};
 use crate::config::RunConfig;
 use crate::error::BenchError;
 use crate::gate::{LoadSample, Trip};
@@ -50,8 +50,8 @@ use crate::procload::{disk_busy_over, disk_busy_snapshot};
 use crate::proxy::FaultMode;
 use crate::requestlog::RequestLog;
 use crate::result::{
-    CellResult, ColdTrip, Op, PassColdState, PassResult, Percentiles, Provenance, ProxyRequests,
-    SCHEMA_VERSION, Sample, Window,
+    CellResult, ColdTrip, ColdWindow, Op, PassColdState, PassResult, Percentiles, Provenance,
+    ProxyRequests, SCHEMA_VERSION, Sample, Window,
 };
 use crate::role::Role;
 use crate::s3::{BenchS3, Outcome, Timeouts, unix_ms};
@@ -394,6 +394,7 @@ pub struct Env {
     pub timeouts: Timeouts,
     load: Arc<dyn LoadSource>,
     cold_state: Arc<dyn ColdStateSource>,
+    meter: Option<Arc<dyn ColdMeter>>,
     guard: Mutex<ColdGuard>,
     cold_cap: Arc<Throttle>,
     hot_cap: Arc<Throttle>,
@@ -421,6 +422,7 @@ impl Env {
             timeouts: Timeouts::default(),
             load,
             cold_state: ctx.cold_state.clone(),
+            meter: ctx.cold_meter.clone(),
             guard: Mutex::new(ColdGuard::new(ctx.config.cold_guard)),
             cold_cap: Arc::new(Throttle::new(ctx.config.rates.cold_rps)),
             hot_cap: Arc::new(Throttle::new(ctx.config.rates.hot_rps)),
@@ -430,6 +432,37 @@ impl Env {
                 ctx.config.bytes,
             )?))),
         })
+    }
+
+    fn guard(&self) -> std::sync::MutexGuard<'_, ColdGuard> {
+        self.guard.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// One reading of the meter and, taken just after it, the bench's count of requests to the
+    /// cold role: `None` if the run has no meter.
+    async fn read_meter(&self) -> Option<(Result<ColdReading, String>, u64)> {
+        let meter = self.meter.as_ref()?;
+        let reading = meter.read(self.config.cold_state_timeout).await;
+        Some((reading, self.log.cold_count()))
+    }
+
+    /// Takes the guard's first reading, once: the trip, if the store is not fit to begin on.
+    async fn open_window(&self) -> Option<ColdTrip> {
+        self.meter.as_ref()?;
+        let begun = self.guard().has_baseline();
+        if begun {
+            return None;
+        }
+        let (reading, own) = self.read_meter().await?;
+        self.guard().open(reading, own).err()
+    }
+
+    /// Ends the window of the pass that just ended: what it read and the trip, if any.
+    async fn close_window(&self, judgeable: bool) -> (Option<ColdWindow>, Option<ColdTrip>) {
+        match self.read_meter().await {
+            None => (None, None),
+            Some((reading, own)) => self.guard().close(reading, own, judgeable),
+        }
     }
 
     fn cap(&self, cap: Cap) -> Arc<Throttle> {
@@ -742,6 +775,7 @@ fn pass_result(
         percentiles,
         gate_tripped: trip.map(|t| t.metric.to_owned()),
         cold_guard: cold_trip.cloned(),
+        cold_window: None,
         proxy_requests: None,
         disk_busy: BTreeMap::new(),
         peak_in_flight: steps.iter().map(|s| s.in_flight).max().unwrap_or(0),
@@ -920,6 +954,13 @@ async fn run_pass(
         .cold_state
         .read_within(env.config.cold_state_timeout)
         .await?;
+    // The guard's first reading, once per run: every later window begins where the pass before it
+    // ended. A store that is not fit to begin on ends the run before anything is sent.
+    if let Some(trip) = env.open_window().await {
+        let empty = pass_result(pass, Window::Busy, Duration::ZERO, None, Some(&trip), &[]);
+        acc.entry(arm.label.clone()).or_default().passes.push(empty);
+        return Ok(Some(Stop::Cold(trip)));
+    }
     // The pass's planned bytes are counted before anything is sent, so a run that dies in the
     // middle of a pass, or a ledger read by another run meanwhile, never sees fewer bytes than
     // may have landed. After the pass the count becomes what was written (a failed put counts).
@@ -945,10 +986,21 @@ async fn run_pass(
         }),
         _ => None,
     };
+    // The window ends here, with the hook that follows the requests: a pass that was cut already
+    // has its trip and the run ends with it. The foreign requests are judged only where every
+    // request of the pass was the bench's to the cold role: an instance's own copies to the cold
+    // store, and the requests of an arm through the fault proxy, are not told apart from others.
+    let judgeable = !arm.faulted && driven.steps.iter().all(|s| s.role == Role::Cold);
+    let (cold_window, window_trip) = if driven.trip.is_none() && driven.cold_trip.is_none() {
+        env.close_window(judgeable).await
+    } else {
+        (None, None)
+    };
+    let cold_trip = driven.cold_trip.clone().or(window_trip);
     let disk_busy = disk_busy_over(&disks_before, &disks_after, micros(driven.elapsed));
     env.ledger
         .settle(planned, driven.steps.iter().map(|s| s.cold_write).sum())?;
-    let window = if driven.trip.is_some() || driven.cold_trip.is_some() {
+    let window = if driven.trip.is_some() || cold_trip.is_some() {
         Window::Busy
     } else {
         env.config.window
@@ -983,10 +1035,11 @@ async fn run_pass(
             window,
             driven.elapsed,
             driven.trip.as_ref(),
-            driven.cold_trip.as_ref(),
+            cold_trip.as_ref(),
             &steps,
         );
         let result = PassResult {
+            cold_window: cold_window.clone(),
             proxy_requests: proxy_requests.clone(),
             disk_busy: disk_busy.clone(),
             ..result
@@ -1007,7 +1060,7 @@ async fn run_pass(
     Ok(driven
         .trip
         .map(Stop::Gate)
-        .or_else(|| driven.cold_trip.map(Stop::Cold)))
+        .or_else(|| cold_trip.map(Stop::Cold)))
 }
 
 #[cfg(test)]

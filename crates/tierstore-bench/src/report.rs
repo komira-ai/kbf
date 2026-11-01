@@ -601,6 +601,7 @@ mod tests {
             }),
             gate_tripped: None,
             cold_guard: None,
+            cold_window: None,
             proxy_requests: None,
             disk_busy: BTreeMap::new(),
             peak_in_flight: 0,
@@ -972,10 +973,33 @@ mod tests {
             limit: 0.05,
             requests: 32,
             window_secs: 60,
+            detail: None,
         });
         let text = format_report(&[result("a", vec![cut], &[])], &Rows::new());
         assert!(
             text.contains("- arm a: pass 1 was cut by the cold store guard (cold store guard: error_share is 0.0625, over the limit 0.05 (over 32 requests of the last 60 s))"),
+            "{text}"
+        );
+    }
+
+    /// Catches a window the guard read going unsaid: the report lists, for every pass that has
+    /// one, the store's counter growth, the bench's own count, what is left, the judging and the
+    /// drives and healing, so the paper can show the window was quiet.
+    #[test]
+    fn the_cold_window_of_a_pass_is_listed() {
+        let mut quiet = pass(1, Window::Quiet, 40, None);
+        quiet.cold_window = Some(crate::result::ColdWindow {
+            minio_requests: 120,
+            own_requests: 118,
+            foreign_requests: 2,
+            judged: true,
+            drives: 12,
+            drives_not_ok: 0,
+            healing: false,
+        });
+        let text = format_report(&[result("a", vec![quiet], &[])], &Rows::new());
+        assert!(
+            text.contains("- arm a: pass 1 cold window: store counted 120 S3 requests, this tool sent 118, 2 from elsewhere (judged: true); drives 12, not ok 0; healing: false"),
             "{text}"
         );
     }

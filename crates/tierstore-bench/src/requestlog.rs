@@ -46,6 +46,7 @@ pub struct RequestRecord {
 pub struct RequestLog {
     sink: Mutex<Box<dyn Write + Send>>,
     count: AtomicU64,
+    cold: AtomicU64,
 }
 
 impl RequestLog {
@@ -71,6 +72,7 @@ impl RequestLog {
         Self {
             sink: Mutex::new(Box::new(writer)),
             count: AtomicU64::new(0),
+            cold: AtomicU64::new(0),
         }
     }
 
@@ -94,6 +96,15 @@ impl RequestLog {
     #[must_use]
     pub fn count(&self) -> u64 {
         self.count.load(Ordering::Relaxed)
+    }
+
+    /// How many of the records written went to the cold role: one per HTTP request this tool
+    /// sent to the cold store, a part of a multipart upload and a retry by the tool's own code
+    /// each counted. The cold store guard subtracts it from the store's own request counter to
+    /// get the requests that came from elsewhere.
+    #[must_use]
+    pub fn cold_count(&self) -> u64 {
+        self.cold.load(Ordering::Relaxed)
     }
 }
 

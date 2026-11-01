@@ -46,7 +46,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cells::budget::Campaign;
 use crate::cells::engine::{FaultSwitch, ProcLoad};
-use crate::coldstate::ColdStateSource;
+use crate::coldstate::{ColdMeter, ColdStateSource};
 use crate::config::RunConfig;
 use crate::error::BenchError;
 use crate::requestlog::RequestLog;
@@ -65,6 +65,8 @@ pub mod engine;
 mod engine_gaps_tests;
 #[cfg(test)]
 mod engine_record_tests;
+#[cfg(test)]
+mod engine_window_tests;
 pub mod fileserver;
 pub mod g;
 pub mod modes;
@@ -141,6 +143,11 @@ pub struct CellContext {
     pub campaign: Campaign,
     /// Where the cold store's state is read from, before every pass.
     pub cold_state: Arc<dyn ColdStateSource>,
+    /// Where the cold store guard reads the store's request counter and state at the ends of
+    /// every pass, to judge the requests that came from elsewhere and the drives. `None` for a
+    /// run without the cold admin key (and for the tests that do not need it): the guard then
+    /// keeps to the bench's own requests.
+    pub cold_meter: Option<Arc<dyn ColdMeter>>,
 }
 
 /// What the `run` verb asks of a cell; a cell reads the parts it has.

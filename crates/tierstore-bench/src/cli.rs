@@ -13,7 +13,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use crate::cells::budget::{Campaign, lock_path};
 use crate::cells::engine::FaultSwitch;
 use crate::cells::{self, CellContext, CellId, CellPlan};
-use crate::coldstate::{ColdStateSource, NoColdState, OpsColdState};
+use crate::coldstate::{ColdMeter, ColdStateSource, NoColdState, OpsColdMeter, OpsColdState};
 use crate::config::{ConfigArgs, RunConfig};
 use crate::error::BenchError;
 use crate::faultfile::FileSwitch;
@@ -227,18 +227,34 @@ fn provenance(
 /// Where the run reads the cold store's state from: the preflight's source on this machine, or
 /// nothing if the run has no cold store.
 fn cold_source(config: &RunConfig, ops: &OpsFile) -> Arc<dyn ColdStateSource> {
-    match config.stores.get(&Role::Cold) {
-        Some(spec) => Arc::new(
-            OpsColdState::new(
-                Arc::new(SystemHost),
-                ops.clone(),
-                spec.clone(),
-                config.result_dir.clone(),
-            )
-            .with_max_age(config.cold_state_max_age),
-        ),
+    match cold_state_of(config, ops) {
+        Some(state) => Arc::new(state),
         None => Arc::new(NoColdState),
     }
+}
+
+/// The source of the cold store's state, if the run has a cold store.
+fn cold_state_of(config: &RunConfig, ops: &OpsFile) -> Option<OpsColdState> {
+    let spec = config.stores.get(&Role::Cold)?;
+    Some(
+        OpsColdState::new(
+            Arc::new(SystemHost),
+            ops.clone(),
+            spec.clone(),
+            config.result_dir.clone(),
+        )
+        .with_max_age(config.cold_state_max_age),
+    )
+}
+
+/// The meter of the cold store guard: a run with the cold admin key has one; a run with a heal
+/// status file alone (file mode) has no counter to read, nor does a run with no cold store.
+fn cold_meter(config: &RunConfig, ops: &OpsFile) -> Option<Arc<dyn ColdMeter>> {
+    let state = cold_state_of(config, ops).filter(|_| ops.cold_file_mode().is_none())?;
+    Some(Arc::new(OpsColdMeter::new(
+        state,
+        config.cold_counter_settle,
+    )))
 }
 
 /// Runs the verb.
@@ -315,6 +331,7 @@ pub async fn run(cli: Cli) -> Result<(), BenchError> {
             let ctx = CellContext {
                 provenance,
                 cold_state: cold_source(&config, &ops),
+                cold_meter: cold_meter(&config, &ops),
                 config,
                 log: Arc::new(log),
                 campaign,

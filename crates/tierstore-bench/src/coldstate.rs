@@ -116,6 +116,34 @@ impl OpsColdState {
         self
     }
 
+    /// The meter's reading: the counter first, then the state, their commands stopped once
+    /// `stop` is set. Needs the cold admin key: file mode has no counter to read.
+    ///
+    /// # Errors
+    /// [`BenchError`] if the key is missing or a command fails, or its answer is not what it
+    /// should be.
+    pub fn meter_until(&self, stop: &AtomicBool) -> Result<ColdReading, BenchError> {
+        let bounded = Stoppable {
+            inner: &*self.host,
+            stop,
+        };
+        let host: &dyn Host = &bounded;
+        let mc = Mc::for_role(host, &self.ops, Role::Cold, &self.spec, &self.result_dir)?;
+        let s3_requests = s3_requests_total(&mc.metrics()?)?;
+        let info = mc.info()?;
+        let percent = heal_percent(host, &self.ops).map_err(BenchError::Ops)?;
+        Ok(ColdReading {
+            s3_requests,
+            state: ColdState {
+                healing: is_healing(Some(&info), percent),
+                percent_done: percent,
+                drives: drives_of(&info),
+                read_unix_ms: unix_ms(),
+                source: Some(ColdSource::Mc),
+            },
+        })
+    }
+
     /// One reading, its commands stopped (and killed) once `stop` is set.
     fn read_until(&self, stop: &AtomicBool) -> Result<Option<ColdState>, BenchError> {
         let bounded = Stoppable {
@@ -159,21 +187,97 @@ impl ColdStateSource for OpsColdState {
     /// error, whatever the status file would have said: a store that does not answer is not a
     /// store that is quiet.
     fn read_within(&self, limit: Duration) -> ReadFuture<'_> {
+        let this = self.clone();
+        Box::pin(bounded(limit, move |stop| this.read_until(stop)))
+    }
+}
+
+/// Runs `job` on a thread of the blocking pool, given the flag that tells its commands to stop;
+/// if `limit` passes first the flag is set, the job ends and the answer is an error.
+async fn bounded<T: Send + 'static>(
+    limit: Duration,
+    job: impl FnOnce(&AtomicBool) -> Result<T, BenchError> + Send + 'static,
+) -> Result<T, BenchError> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = stop.clone();
+    let mut task = tokio::task::spawn_blocking(move || job(&flag));
+    if let Ok(done) = tokio::time::timeout(limit, &mut task).await {
+        return done.unwrap_or(Err(unreadable("the reading did not end")));
+    }
+    stop.store(true, Ordering::SeqCst);
+    task.await.ok();
+    Err(unreadable(&format!(
+        "no answer in {} s, the command was stopped",
+        limit.as_secs()
+    )))
+}
+
+/// One reading of the cold store for the guard: its S3 request counter and its state, taken
+/// together.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ColdReading {
+    /// The store's S3 request counter, summed over its series (`minio_s3_requests_total`).
+    pub s3_requests: u64,
+    /// The drives and whether the store is healing.
+    pub state: ColdState,
+}
+
+/// Where the guard reads the store's request counter and state at the ends of a window.
+pub trait ColdMeter: Send + Sync {
+    /// One reading, given up after `limit`. The reading must reflect every request this tool
+    /// sent before the call: a meter that cannot promise it waits first.
+    ///
+    /// # Errors
+    /// Why the store could not be read (not a [`BenchError`]: the guard turns it into a trip, so
+    /// the results of the passes so far are written).
+    fn read(&self, limit: Duration) -> MeterFuture<'_>;
+}
+
+/// What [`ColdMeter::read`] gives.
+pub type MeterFuture<'a> = Pin<Box<dyn Future<Output = Result<ColdReading, String>> + Send + 'a>>;
+
+/// The meter of a run with the cold admin key: `mc admin prometheus metrics` for the counter and
+/// `mc admin info` for the state, after a wait.
+///
+/// The wait is the point. MinIO caches the group of metrics the counter is in for 10 s, so a
+/// reading made at once can show the counter as it was up to 10 s before and a window would
+/// count requests of its neighbours. The wait (`settle`, 11 s unless set) is spent with this
+/// tool silent: a reading made after it shows every request sent before it.
+#[derive(Clone)]
+pub struct OpsColdMeter {
+    state: OpsColdState,
+    settle: Duration,
+}
+
+impl OpsColdMeter {
+    /// A meter over `state`'s host, ops file and store, waiting `settle` before each reading.
+    #[must_use]
+    pub fn new(state: OpsColdState, settle: Duration) -> Self {
+        Self { state, settle }
+    }
+}
+
+impl ColdMeter for OpsColdMeter {
+    fn read(&self, limit: Duration) -> MeterFuture<'_> {
+        let state = self.state.clone();
         Box::pin(async move {
-            let stop = Arc::new(AtomicBool::new(false));
-            let (this, flag) = (self.clone(), stop.clone());
-            let mut task = tokio::task::spawn_blocking(move || this.read_until(&flag));
-            if let Ok(done) = tokio::time::timeout(limit, &mut task).await {
-                return done.unwrap_or(Err(unreadable("the reading did not end")));
-            }
-            stop.store(true, Ordering::SeqCst);
-            task.await.ok();
-            Err(unreadable(&format!(
-                "no answer in {} s, the command was stopped",
-                limit.as_secs()
-            )))
+            tokio::time::sleep(self.settle).await;
+            bounded(limit, move |stop| state.meter_until(stop))
+                .await
+                .map_err(|e| e.to_string())
         })
     }
+}
+
+/// The sum of the `minio_s3_requests_total` series in a Prometheus text exposition: every S3
+/// request the store has received since it started, over its APIs (and its servers).
+///
+/// # Errors
+/// [`BenchError::Ops`] if the text says nothing of the counter: no such series (an unreadable
+/// counter is not a quiet store), or a value that is not a count.
+pub fn s3_requests_total(text: &str) -> Result<u64, BenchError> {
+    let _ = text;
+    todo!("the sum of the minio_s3_requests_total series")
 }
 
 fn unreadable(why: &str) -> BenchError {
@@ -316,6 +420,43 @@ mod tests {
         };
         let err = stopped.run(&Cmd::new("sleep", &["3600"])).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+    }
+
+    /// Catches a counter that is one series instead of the sum, one that takes in a series of a
+    /// similar name (the errors, which are also in the total), a float spelling of a count read
+    /// as nothing, and a series without labels being missed.
+    #[test]
+    fn the_counter_is_the_sum_of_the_request_series_and_of_nothing_else() {
+        let text = "# HELP minio_s3_requests_total Total number of s3 requests\n\
+            # TYPE minio_s3_requests_total counter\n\
+            minio_s3_requests_total{api=\"getobject\",server=\"a:9000\"} 5\n\
+            minio_s3_requests_total{api=\"putobject\",server=\"a:9000\"} 7\n\
+            minio_s3_requests_total{api=\"listobjectsv2\",server=\"b:9000\"} 1.2e+03\n\
+            minio_s3_requests_errors_total{api=\"putobject\",server=\"a:9000\"} 100\n\
+            minio_s3_requests_total_other 9\n\
+            minio_s3_requests_total 3\n";
+        assert_eq!(s3_requests_total(text).unwrap(), 5 + 7 + 1_200 + 3);
+    }
+
+    /// Catches a text with no request series, or a value that is not a count, being read as a
+    /// store with no requests: each is an error that names the series.
+    #[test]
+    fn a_text_without_the_series_or_with_a_bad_value_is_an_error() {
+        for text in [
+            "",
+            "# TYPE minio_s3_requests_total counter\n",
+            "minio_s3_requests_errors_total 4\n",
+            "minio_s3_requests_total{api=\"x\"} many\n",
+            "minio_s3_requests_total{api=\"x\"} -1\n",
+            "minio_s3_requests_total{api=\"x\"} NaN\n",
+            "minio_s3_requests_total{api=\"x\"}\n",
+        ] {
+            let err = s3_requests_total(text).unwrap_err();
+            assert!(
+                err.to_string().contains("minio_s3_requests_total"),
+                "{text}: {err}"
+            );
+        }
     }
 
     /// Catches a run with no cold store being asked anything.
