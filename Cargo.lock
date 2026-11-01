@@ -2707,6 +2707,8 @@ dependencies = [
  "hyper-util",
  "js-server-core",
  "js-store",
+ "js-types",
+ "js-usage",
  "kbf-auth",
  "kbf-ca",
  "kbf-caps",

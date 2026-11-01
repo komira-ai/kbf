@@ -4,12 +4,13 @@
 use std::collections::BTreeMap;
 use std::fmt::Display;
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use js_types::HostId;
 use js_usage::{
-    KeyProfile, KeySource, Limits, LoadIn, NodeMinute, Observation, ProfileCurves, ProfileKey,
-    RunEnd, SinkCounters, UsageFault, UsageSink,
+    Admitted, KeyProfile, KeySource, Limits, LoadIn, NodeMinute, Observation, ProfileCurves,
+    ProfileKey, RunEnd, SinkCounters, UsageFault, UsageSink,
 };
 use kbf_types::ActionKey;
 
@@ -31,6 +32,7 @@ fn fault(err: impl Display) -> UsageFault {
 /// (counted in [`SinkStats`](crate::SinkStats)) and writes the keys' last-used days.
 pub struct KbfUsageSink {
     sink: Arc<ProfileSink>,
+    declined: AtomicU64,
 }
 
 impl KbfUsageSink {
@@ -38,7 +40,19 @@ impl KbfUsageSink {
     /// carry (`stats`, `forget_host`).
     #[must_use]
     pub fn new(sink: Arc<ProfileSink>) -> Self {
-        Self { sink }
+        Self {
+            sink,
+            declined: AtomicU64::new(0),
+        }
+    }
+
+    /// How many runs the profile declined: the call succeeded, so the hub counts the run as
+    /// learned, but the profile did not take it (no minute at all, or more than a fifth of
+    /// the minutes up to its last missing). `runs_learned` minus this is the runs in
+    /// profiles.
+    #[must_use]
+    pub fn declined(&self) -> u64 {
+        self.declined.load(Ordering::Relaxed)
     }
 }
 
@@ -56,10 +70,14 @@ impl UsageSink for KbfUsageSink {
     }
 
     fn run_ended(&self, end: &RunEnd, now_minute: u64) -> Result<(), UsageFault> {
-        self.sink
+        let admitted = self
+            .sink
             .run_ended(&end.key, &end.series, now_minute / MINUTES_PER_DAY)
-            .map(drop)
-            .map_err(fault)
+            .map_err(fault)?;
+        if admitted != Admitted::Yes {
+            self.declined.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
     }
 
     fn flush(&self, now_minute: u64) -> Result<Vec<(HostId, NodeMinute)>, UsageFault> {
@@ -113,6 +131,7 @@ impl UsageSink for KbfUsageSink {
 pub struct RunKeys {
     shapes: Arc<ShapeIndex>,
     runs: Mutex<BTreeMap<String, ActionKey>>,
+    refused: AtomicU64,
 }
 
 impl RunKeys {
@@ -122,6 +141,7 @@ impl RunKeys {
         Self {
             shapes,
             runs: Mutex::default(),
+            refused: AtomicU64::new(0),
         }
     }
 
@@ -134,6 +154,7 @@ impl RunKeys {
     pub fn bind(&self, run_id: &str, action: ActionKey) -> bool {
         let mut runs = self.lock();
         if runs.len() >= MAX_SHAPES && !runs.contains_key(run_id) {
+            self.refused.fetch_add(1, Ordering::Relaxed);
             return false;
         }
         runs.insert(run_id.to_owned(), action);
@@ -143,6 +164,13 @@ impl RunKeys {
     /// Forgets run `run_id`; whether it was held.
     pub fn forget(&self, run_id: &str) -> bool {
         self.lock().remove(run_id).is_some()
+    }
+
+    /// How many binds a full table refused. Each is a run that cannot be learned, so a
+    /// table that is full shows here and not only as runs without a key.
+    #[must_use]
+    pub fn refused(&self) -> u64 {
+        self.refused.load(Ordering::Relaxed)
     }
 
     /// How many runs are held.
