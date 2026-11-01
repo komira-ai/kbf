@@ -322,6 +322,12 @@ jobs:
       # `cargo llvm-cov nextest` runs the tests with cargo-nextest, one process per test.
       NEXTEST_VERSION: 0.9.146
       NEXTEST_SHA256: 682c21b777c333e96fd532e114d3a5a894e0729ab88d94c0a9f20f8419695428
+      # The instrumented build's debug info is the largest part of its size and coverage does not
+      # read it (the counters and the coverage mapping are not debug info), so the build has none:
+      # no line tables, which the profiles `dev` and `test` of Cargo.toml keep for backtraces.
+      # cargo-llvm-cov builds the `dev` profile and the tests with `test`.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
       PART: ${{ matrix.part }}
       PARTS: ${{ matrix.parts }}
       ARGS: ${{ matrix.args }}
@@ -335,10 +341,9 @@ jobs:
           persist-credentials: false
           # The merge commit and its first parent, the base branch (no-lowering --base-ref).
           fetch-depth: 2
-      # A shard builds one core and holds a third of the legacy profiles, so it fits the free
-      # disk of the image as it is (about 87 GB; the legacy build is about 61 GB), and the removal
-      # of the preinstalled toolchains (1 to 4 minutes) is left to `test`, which holds both builds
-      # and every shard's profiles. The step below refuses early when the room is short.
+      # A shard builds one core and holds a third of the legacy profiles. The steps below make
+      # room (container images, then the preinstalled toolchains, 1 to 4 minutes) and the
+      # disk check after them refuses early when the room is still short.
       - name: Free disk before (report)
         run: df -h /
       # Images the runner preloads and this job never runs; the Postgres service container's
@@ -346,6 +351,13 @@ jobs:
       - name: Remove container images this job does not use
         run: docker image prune --all --force
       - name: Free disk after (report)
+        run: df -h /
+      # Some runners of `ubuntu-latest` have a 72 GB disk with about 19 GB free (the others have
+      # 145 GB with about 90 free): no instrumented build fits there as the image is, so the
+      # preinstalled toolchains this job never uses go here too (the step of `test`).
+      - name: Remove preinstalled toolchains this job does not use
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache /usr/local/share/powershell /usr/share/swift /usr/local/lib/node_modules
+      - name: Free disk after the toolchains are removed (report)
         run: df -h /
       - run: rustup toolchain install "$COVERAGE_TOOLCHAIN" --profile minimal --component llvm-tools-preview
       # xtask builds with the coverage nightly, the one toolchain this job installs.
@@ -403,7 +415,9 @@ jobs:
         run: df -h /
       - name: Disk use under target after the tests (report)
         if: ${{ always() }}
-        run: du -xhd 2 target
+        run: |
+          du -sh target
+          du -xhd 3 target | sort -rh | head -25
       # The shard's raw profiles become ONE indexed profile (a few MB) here, so that `test`
       # downloads megabytes and not the raw profiles (1.8 GB as artifacts, about 14 GB unpacked),
       # which filled its runner's disk.
@@ -468,6 +482,9 @@ jobs:
       LLVM_COV_SHA256: b3f68e625481fed9b16444174f3fa5ebcdbde4a1878803a35eabe2dcefcdc41a
       NEXTEST_VERSION: 0.9.146
       NEXTEST_SHA256: 682c21b777c333e96fd532e114d3a5a894e0729ab88d94c0a9f20f8419695428
+      # As in `test-shard`: the same flags build the same binaries, which the profiles are read with.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
