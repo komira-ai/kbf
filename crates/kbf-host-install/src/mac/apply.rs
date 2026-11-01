@@ -201,8 +201,9 @@ pub fn run(host: &MacHost, runner: &dyn Runner) -> u8 {
     if result.is_ok() {
         // The release is applied: the ones the Mac no longer keeps go, before the status says
         // done, so no install lays out a release meanwhile. A prune that fails removes less;
-        // the apply is done all the same.
-        let _ = super::retain::prune_after_apply(host, kbf_installer::retain::DEFAULT_KEEP);
+        // the apply is done all the same, and the audit log says why.
+        let pruned = super::retain::prune_after_apply(host, kbf_retain::DEFAULT_KEEP);
+        record_prune(host, &pruned);
     }
     // The result stays in the status file; an unwritable file is all there is to tell.
     let written = status::write(host, &state);
@@ -212,6 +213,30 @@ pub fn run(host: &MacHost, runner: &dyn Runner) -> u8 {
 
 /// Append the end of the apply to the audit log; a log that cannot be opened loses the line
 /// (the status file has the result).
+/// Append what the apply's prune did, or why it could not, to the audit log: `pruned` with its
+/// line, or `prune_failed` with the error. A log that cannot be opened loses the line.
+fn record_prune(host: &MacHost, pruned: &Result<String, String>) {
+    let Ok(mut log) = Audit::open(&host.trust, &host.audit) else {
+        return;
+    };
+    let (outcome, result) = match pruned {
+        Ok(done) => ("pruned", done.clone()),
+        Err(why) => ("prune_failed", why.clone()),
+    };
+    let entry = audit::Entry {
+        time: audit::now(),
+        verb: Some("prune"),
+        version: None,
+        channel: None,
+        unit: None,
+        outcome,
+        reason: None,
+        result: Some(result),
+        command: None,
+    };
+    let _ = log.append(&entry);
+}
+
 fn record(host: &MacHost, plan: Option<&Plan>, state: &ApplyState) {
     let Ok(mut log) = Audit::open(&host.trust, &host.audit) else {
         return;

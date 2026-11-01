@@ -8,7 +8,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use kbf_installer::retain::Kept;
+use kbf_retain::Kept;
 use kbf_testkit::dir::TestDir;
 
 use super::answer::{Answer, Code, LastView, PendingView, QueryView};
@@ -48,6 +48,9 @@ pub(super) struct World {
     pub(super) prune_say: String,
     pub(super) prune_fault: Option<Fault>,
     pub(super) prune_removes: Vec<String>,
+    /// A version another writer (a stage) records in the retain file just after the next
+    /// listing is taken: the commit and its text.
+    pub(super) recorded_after_listing: Option<(String, String)>,
     pub(super) calls: Vec<String>,
 }
 
@@ -140,7 +143,19 @@ impl Backend for Fake {
         if world.kept_fault {
             return Err(Fault::failed(Code::StateUnavailable, "listing"));
         }
-        Ok(world.kept.clone())
+        let kept = world.kept.clone();
+        drop(world);
+        let late = self.world.borrow_mut().recorded_after_listing.take();
+        if let (Some((commit, version)), Some(file)) =
+            (late, self.world.borrow().retain_file.clone())
+        {
+            kbf_retain::Retained::update(&file, |r| {
+                r.versions
+                    .insert(kbf_retain::CommitId::new(&commit).unwrap(), version);
+            })
+            .unwrap();
+        }
+        Ok(kept)
     }
 
     fn retain_file(&self) -> Option<PathBuf> {

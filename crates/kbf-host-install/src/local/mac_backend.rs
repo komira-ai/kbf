@@ -28,7 +28,7 @@ use crate::mac::{self, conf, stage};
 use crate::outcome::{FailureCode, Outcome, Refusal};
 use crate::request::{Channel, Version};
 use crate::runner::Runner;
-use kbf_installer::retain::Kept;
+use kbf_retain::Kept;
 
 /// What a switch leaves behind until it is confirmed or reverted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -11,8 +11,8 @@ use std::io;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
-use kbf_installer::CommitId;
-use kbf_installer::retain::{self, Kept, Known, RetainLock, Retained};
+use kbf_retain::CommitId;
+use kbf_retain::{Kept, Known, RetainLock, Retained};
 
 use super::kit;
 use super::layout::MacHost;
@@ -21,7 +21,7 @@ use crate::host::take_lock;
 
 /// Where `retain.json` is on a Mac.
 pub(crate) fn file(host: &MacHost) -> PathBuf {
-    host.work.join(retain::FILE)
+    host.work.join(kbf_retain::FILE)
 }
 
 /// Each directory of `releases/` named by a commit, with the time it was laid out. Anything
@@ -71,7 +71,7 @@ pub(crate) fn kept(host: &MacHost, on_trial: Option<&str>) -> Result<Vec<Kept>, 
         commit(links.previous.as_ref()),
     );
     let trial = on_trial.and_then(|c| CommitId::new(c).ok());
-    let mut kept = retain::listing(
+    let mut kept = kbf_retain::listing(
         &found(host)?,
         &Known {
             current: current.as_ref(),
@@ -124,13 +124,13 @@ pub(crate) fn prune(host: &MacHost, keep: usize) -> Result<String, String> {
     if let Some(commit) = on_trial(host)? {
         return Ok(format!("removing nothing: {commit} is on trial"));
     }
-    let keep = retain::at_least(keep);
+    let keep = kbf_retain::at_least(keep);
     let links = kit::links(host)?;
     let retained = lock.read().map_err(|e| e.to_string())?;
     let mut must: BTreeSet<CommitId> = retained.protected();
     must.extend(commit(links.current.as_ref()));
     must.extend(commit(links.previous.as_ref()));
-    let gone = retain::surplus(&found(host)?, &must, keep);
+    let gone = kbf_retain::surplus(&found(host)?, &must, keep);
     for c in &gone {
         let dir = host.release(c.as_str());
         fs::remove_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;

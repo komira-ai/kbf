@@ -682,7 +682,8 @@ laid out). So going back to any of them needs no download. The rest are removed 
 `confirm`, and only then: never while a release is on trial, and not by `install` or `switch`.
 On a Mac, the ssh path's apply removes them once the new daemon is welcomed, keeping 4 others,
 unless the socket has a swap on trial (its marker is there) or another install or switch holds
-the install lock. A confirm whose `last_good` cannot be recorded (the listing or the file cannot
+the install lock; the audit log gets a `prune` line with what was kept and removed (`pruned`) or
+why nothing could be (`prune_failed`). A confirm whose `last_good` cannot be recorded (the listing or the file cannot
 be read or written, or its 12 digits name two releases) removes nothing, and the log says why.
 
 What must stay besides the links is in `retain.json`, beside the installer's state (Linux,
@@ -699,7 +700,9 @@ release that kept versions only in the helper's own state, the helper copies the
 `previous`, `on_trial`, `pinned`, `last_good`; left out for one of the newest others). At most 64
 are listed: the ones that must stay first (what runs, what is on trial, the one before, the last
 good, then the pinned ones), then the newest others; `releases_omitted` counts any left out, and
-is absent when none is. `kbf-deploy host status` prints the whole list.
+is absent when none is. When the releases cannot be listed (`retain.json` or `releases/` cannot be
+read), `releases` is left out and `releases_unavailable` is `true`; a host with nothing to list
+has neither key. `kbf-deploy host status` prints the whole list.
 
 The agent does not send `last_good` yet: the coordinator does not carry it in its orders. Until it
 does, the coordinator's last good release is kept only as `previous`, a pin, or one of the newest

@@ -101,9 +101,10 @@ fn a_failed_apply_removes_nothing() {
 }
 
 /// A prune that cannot be done (the retain file does not parse, and may hold a pin) removes
-/// nothing and does not fail the apply, which is done.
+/// nothing and does not fail the apply, which is done; the audit log says why.
 ///
-/// Catches: a failed prune failing an apply that is done.
+/// Catches: a failed prune failing an apply that is done; a failed prune that leaves no word of
+/// why, so a host that never prunes again cannot be told from one that has nothing to remove.
 #[test]
 fn a_prune_that_fails_does_not_fail_the_apply() {
     let fx = Fx::new("mac-retain-prunefail");
@@ -118,6 +119,30 @@ fn a_prune_that_fails_does_not_fail_the_apply() {
     expected.push(NEW.to_owned());
     expected.sort();
     assert_eq!(dirs(&fx), expected, "nothing was removed");
+    let audit = fs::read_to_string(&fx.host.audit).unwrap();
+    let line = audit
+        .lines()
+        .find(|l| l.contains("\"verb\":\"prune\""))
+        .unwrap_or_else(|| panic!("no prune line: {audit}"));
+    assert!(line.contains("\"outcome\":\"prune_failed\""), "{line}");
+    assert!(line.contains("cannot be parsed"), "{line}");
+}
+
+/// A good apply's prune is in the audit log too, with what it kept and removed.
+#[test]
+fn a_good_apply_logs_its_prune() {
+    let fx = Fx::new("mac-retain-prunelog");
+    let sim = fx.sim();
+    seed(&fx);
+    launched(&fx, &sim);
+    assert_eq!(run(&fx.host, &sim), 0);
+    let audit = fs::read_to_string(&fx.host.audit).unwrap();
+    let line = audit
+        .lines()
+        .find(|l| l.contains("\"verb\":\"prune\""))
+        .unwrap_or_else(|| panic!("no prune line: {audit}"));
+    assert!(line.contains("\"outcome\":\"pruned\""), "{line}");
+    assert!(line.contains("keeping: "), "{line}");
 }
 
 /// The pinned release and the coordinator's last good stay after an apply, however old.

@@ -7,8 +7,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::rc::Rc;
 use std::time::{Duration, UNIX_EPOCH};
 
-use kbf_installer::CommitId;
-use kbf_installer::retain::Retained;
+use kbf_retain::CommitId;
+use kbf_retain::Retained;
 
 use super::{Ab, Answer, Backend, Code, LocalRequest, MacBackend, Shared, current, previous, rig};
 use crate::fixed_mark::mark;

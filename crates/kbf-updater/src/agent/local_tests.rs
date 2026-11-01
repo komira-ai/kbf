@@ -80,6 +80,7 @@ fn the_requests_are_the_helpers_five_and_carry_a_version_and_a_channel_only() {
                 busy: false,
                 releases: Vec::new(),
                 releases_omitted: 0,
+                releases_unavailable: false,
             })),
             Some("stage") => line(&Answer::Staged {
                 version: VB.into(),
@@ -186,6 +187,7 @@ fn the_helpers_real_answers_are_read() {
         busy: true,
         releases: Vec::new(),
         releases_omitted: 0,
+        releases_unavailable: false,
     };
     let (socket, _) = serve(&d, 1, move |_| line(&Answer::Queried(view.clone())));
     let state = SocketLocal::new(&socket, limits()).query().unwrap();
@@ -225,6 +227,7 @@ fn the_helpers_real_answers_are_read() {
             busy: false,
             releases: Vec::new(),
             releases_omitted: 0,
+            releases_unavailable: false,
         }))
     });
     let state = SocketLocal::new(&socket, limits()).query().unwrap();

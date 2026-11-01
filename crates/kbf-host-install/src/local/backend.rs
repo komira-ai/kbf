@@ -9,7 +9,7 @@
 
 use std::path::PathBuf;
 
-use kbf_installer::retain::Kept;
+use kbf_retain::Kept;
 
 use super::answer::{Answer, Code};
 use crate::request::{Channel, Version};

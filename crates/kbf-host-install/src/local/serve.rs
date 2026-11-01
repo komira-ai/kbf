@@ -53,7 +53,7 @@ use crate::audit::{self, Audit};
 use crate::pace::{Now, Pace};
 use crate::request::{BadCommand, Unit};
 use crate::trust::Trust;
-use kbf_installer::retain::{DEFAULT_KEEP, MIN_KEEP};
+use kbf_retain::{DEFAULT_KEEP, MIN_KEEP};
 
 /// The window a release on trial has to be confirmed, unless a flag says otherwise.
 pub const DEFAULT_WINDOW_SECS: u64 = 600;

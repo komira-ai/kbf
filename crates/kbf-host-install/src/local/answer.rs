@@ -12,7 +12,7 @@
 //! A reason is a code from a closed set ([`Code`]), never text taken from the request or from
 //! a child process; the detail goes to the log, cleaned.
 
-use kbf_installer::retain::Kept;
+use kbf_retain::Kept;
 use serde::Serialize;
 
 use crate::outcome::MAX_DETAIL_LEN;
@@ -160,6 +160,9 @@ pub struct QueryView {
     pub releases: Vec<Kept>,
     /// How many releases the host holds past the ones listed; 0 when it lists them all.
     pub releases_omitted: usize,
+    /// The releases could not be listed (the file that names what must stay, or `releases/`,
+    /// cannot be read): `releases` is empty for that, not because the host holds none.
+    pub releases_unavailable: bool,
 }
 
 /// What a request did.
@@ -229,13 +232,10 @@ struct Queried<'a> {
     busy: bool,
     #[serde(skip_serializing_if = "<[Kept]>::is_empty")]
     releases: &'a [Kept],
-    #[serde(skip_serializing_if = "is_zero")]
-    releases_omitted: usize,
-}
-
-#[allow(clippy::trivially_copy_pass_by_ref)]
-fn is_zero(n: &usize) -> bool {
-    *n == 0
+    #[serde(skip_serializing_if = "Option::is_none")]
+    releases_omitted: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    releases_unavailable: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -285,7 +285,8 @@ impl Answer {
                 last: view.last.as_ref(),
                 busy: view.busy,
                 releases: &view.releases,
-                releases_omitted: view.releases_omitted,
+                releases_omitted: (view.releases_omitted > 0).then_some(view.releases_omitted),
+                releases_unavailable: view.releases_unavailable.then_some(true),
             }),
             Self::Refused(code, _) => to_json(&Reason {
                 result: "refused",

@@ -22,8 +22,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use kbf_installer::CommitId;
-use kbf_installer::retain::{Kept, Retained};
+use kbf_retain::CommitId;
+use kbf_retain::{Kept, Retained};
 
 use super::answer::{Answer, Code, LastView, PendingView, QueryView};
 use super::backend::{Backend, Fault, Pending};
@@ -189,16 +189,16 @@ impl<B: Backend> Ab<B> {
             trust,
             window_secs,
             clock,
-            keep: kbf_installer::retain::DEFAULT_KEEP,
+            keep: kbf_retain::DEFAULT_KEEP,
             note: Box::new(|_| {}),
         }
     }
 
     /// Keep `keep` releases besides the ones that must stay (never fewer than
-    /// [`kbf_installer::retain::MIN_KEEP`]), and tell what a prune did to `note`.
+    /// [`kbf_retain::MIN_KEEP`]), and tell what a prune did to `note`.
     #[must_use]
     pub fn keeping(mut self, keep: usize, note: Box<dyn Fn(&str)>) -> Self {
-        self.keep = kbf_installer::retain::at_least(keep);
+        self.keep = kbf_retain::at_least(keep);
         self.note = note;
         self
     }
@@ -286,7 +286,7 @@ impl<B: Backend> Ab<B> {
     fn query(&self) -> Result<Answer, Fault> {
         let saved = self.load()?;
         let commit = self.backend.current()?;
-        let (releases, releases_omitted) = self.listed(&saved);
+        let (releases, releases_omitted, releases_unavailable) = self.listed(&saved);
         let pending = self.backend.pending()?.map(|p| PendingView {
             version: saved.version_of(&p.commit),
             commit: p.commit,
@@ -308,20 +308,24 @@ impl<B: Backend> Ab<B> {
             busy: locks::flock_held(&self.backend.lock_file()),
             releases,
             releases_omitted,
+            releases_unavailable,
         }))
     }
 
     /// The releases the host keeps, each with its version: what the host recorded when it was
     /// laid out, else the text it was staged as here. A listing that cannot be read is empty:
     /// the rest of the answer stands.
-    fn listed(&self, saved: &Saved) -> (Vec<Kept>, usize) {
-        let (mut kept, omitted) = cut(self.backend.kept().unwrap_or_default(), MAX_LISTED);
+    fn listed(&self, saved: &Saved) -> (Vec<Kept>, usize, bool) {
+        let Ok(kept) = self.backend.kept() else {
+            return (Vec::new(), 0, true);
+        };
+        let (mut kept, omitted) = cut(kept, MAX_LISTED);
         for k in &mut kept {
             if k.version.is_none() {
                 k.version = saved.version_of(k.commit.as_str());
             }
         }
-        (kept, omitted)
+        (kept, omitted, false)
     }
 
     fn stage(&self, version: &Version, channel: &Channel) -> Result<Answer, Fault> {
@@ -447,6 +451,10 @@ impl<B: Backend> Ab<B> {
                 "another release is on trial than that version",
             ));
         }
+        // The last good is recorded while the release is still on trial, when no collection of
+        // any program removes a release: one that runs between the confirm and this record
+        // would not know the release it names.
+        let recorded = self.record(last_good);
         self.backend.confirm(&pending)?;
         saved.last = Some(Last {
             target: version.as_str().to_owned(),
@@ -455,22 +463,30 @@ impl<B: Backend> Ab<B> {
         });
         saved.staged = None;
         self.save(&saved)?;
-        self.retain(last_good, &mut saved);
+        self.retain(recorded, &mut saved);
         Ok(confirmed)
     }
 
-    /// After a confirm: record the coordinator's `last_good`, then remove the releases the host
-    /// no longer keeps, and forget their versions. The confirm stands whatever this does: a
-    /// failure is told to the log, and the next confirm tries again.
-    fn retain(&self, last_good: Option<&Version>, saved: &mut Saved) {
-        let Some(file) = self.backend.retain_file() else {
+    /// Record the last good a confirm names, if it names one, in the host's `retain.json`;
+    /// whether it could be (a host that keeps no release directories records nothing, and that
+    /// is no failure).
+    fn record(&self, last_good: Option<&Version>) -> Result<(), String> {
+        match (self.backend.retain_file(), last_good) {
+            (Some(file), Some(version)) => self.record_last_good(&file, version),
+            _ => Ok(()),
+        }
+    }
+
+    /// After a confirm: remove the releases the host no longer keeps, and forget their
+    /// versions. `recorded` is whether the confirm's last good was recorded. The confirm stands
+    /// whatever this does: a failure is told to the log, and the next confirm tries again.
+    fn retain(&self, recorded: Result<(), String>, saved: &mut Saved) {
+        if self.backend.retain_file().is_none() {
             return;
-        };
+        }
         // A last good that cannot be recorded is not pruned around: the release it names may be
         // the one an automatic rollback needs, so nothing is removed until a confirm records it.
-        if let Some(version) = last_good
-            && let Err(why) = self.record_last_good(&file, version)
-        {
+        if let Err(why) = recorded {
             (self.note)(&format!("retain: {why}; removing nothing"));
             return;
         }
@@ -512,7 +528,7 @@ impl<B: Backend> Ab<B> {
         }
         let seeded = Retained::update(&file, |r| {
             for (commit, version) in known {
-                r.versions.insert(commit, version);
+                r.versions.entry(commit).or_insert(version);
             }
         });
         if let Err(e) = seeded {

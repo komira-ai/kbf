@@ -6,8 +6,8 @@ use std::fs;
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use kbf_installer::CommitId;
-use kbf_installer::retain::{Kept, Retained};
+use kbf_retain::CommitId;
+use kbf_retain::{Kept, Retained};
 
 use super::{A, B, C, Fx, VA, VB, VC, failed, refused};
 use crate::local::answer::{Answer, Code};
@@ -378,18 +378,28 @@ fn a_query_lists_at_most_sixty_four_releases() {
     assert_eq!(view.releases[63].commit.to_string(), format!("{:040x}", 63));
 }
 
-/// A listing that cannot be read leaves the releases out; the rest of the answer stands.
+/// A listing that cannot be read leaves the releases out and says so; the rest of the answer
+/// stands. A host whose listing is empty says nothing of the kind: the two are told apart.
+///
+/// Catches: a listing that cannot be read answered as an empty one.
 #[test]
-fn a_query_whose_listing_fails_still_answers() {
+fn a_query_whose_listing_fails_still_answers_and_says_it_is_unavailable() {
     let (fx, _) = host("ab-listing-fault", 4);
     fx.world.borrow_mut().kept_fault = true;
-    match fx.ask("query") {
-        Answer::Queried(view) => {
-            assert!(view.releases.is_empty());
-            assert_eq!(view.commit.as_deref(), Some(A));
-        }
-        other => panic!("{other:?}"),
-    }
+    let view = fx.query();
+    assert!(view.releases.is_empty());
+    assert!(view.releases_unavailable);
+    assert_eq!(view.commit.as_deref(), Some(A));
+    let json: serde_json::Value = serde_json::from_str(&Answer::Queried(view).json_line()).unwrap();
+    assert_eq!(json["releases_unavailable"], true);
+    assert_eq!(json["commit"], A);
+
+    fx.world.borrow_mut().kept_fault = false;
+    fx.world.borrow_mut().kept = Vec::new();
+    let view = fx.query();
+    assert!(view.releases.is_empty() && !view.releases_unavailable);
+    let line = Answer::Queried(view).json_line();
+    assert!(!line.contains("releases"), "{line}");
 }
 
 /// A backend that keeps no release directories (a package, a container image) and so answers
@@ -562,4 +572,24 @@ fn a_last_good_that_names_two_held_releases_records_neither_and_removes_nothing(
             && told[0].ends_with("; removing nothing"),
         "{told:?}"
     );
+}
+
+/// The versions copied from this program's state never replace one a stage records after the
+/// listing they were chosen from was taken: the stage's is the release's own.
+///
+/// Catches: the copy deciding what is missing before it holds the file's lock, which writes the
+/// older text over the one the stage just recorded.
+#[test]
+fn a_version_recorded_after_the_listing_is_not_replaced_by_the_copy() {
+    let (fx, _) = host("ab-seed-late", 4);
+    fx.install(VB);
+    fx.world.borrow_mut().kept = vec![held(B, None), held(A, None)];
+    fx.world.borrow_mut().recorded_after_listing = Some((B.to_owned(), "the stage's".to_owned()));
+    fx.ab.seed_versions();
+    let file = retained(&fx);
+    assert_eq!(
+        file.versions.get(&commit(B)).map(String::as_str),
+        Some("the stage's")
+    );
+    assert_eq!(file.versions.get(&commit(A)).map(String::as_str), None);
 }

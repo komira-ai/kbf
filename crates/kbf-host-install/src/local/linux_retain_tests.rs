@@ -451,3 +451,119 @@ fn a_last_good_that_cannot_be_written_removes_nothing() {
         "{told:?}"
     );
 }
+
+/// The Linux backend, with an operator's `gc` run by another program the moment the confirm has
+/// cleared the trial: the gap between the confirm and anything this program does after it.
+struct GcInTheGap<'a>(&'a Rig);
+
+impl Backend for GcInTheGap<'_> {
+    fn lock_file(&self) -> PathBuf {
+        self.0.backend.lock_file()
+    }
+    fn node_id(&self) -> Option<String> {
+        self.0.backend.node_id()
+    }
+    fn current(&self) -> Result<Option<String>, crate::local::backend::Fault> {
+        self.0.backend.current()
+    }
+    fn pending(
+        &self,
+    ) -> Result<Option<crate::local::backend::Pending>, crate::local::backend::Fault> {
+        self.0.backend.pending()
+    }
+    fn has(&self, commit: &str) -> bool {
+        self.0.backend.has(commit)
+    }
+    fn stage(
+        &self,
+        version: &crate::request::Version,
+        channel: &crate::request::Channel,
+    ) -> Result<String, crate::local::backend::Fault> {
+        self.0.backend.stage(version, channel)
+    }
+    fn switch(
+        &self,
+        commit: &str,
+        window_secs: u64,
+        now: u64,
+    ) -> Result<u64, crate::local::backend::Fault> {
+        self.0.backend.switch(commit, window_secs, now)
+    }
+    fn confirm(
+        &self,
+        pending: &crate::local::backend::Pending,
+    ) -> Result<(), crate::local::backend::Fault> {
+        self.0.backend.confirm(pending)?;
+        let mut out = Vec::new();
+        kbf_installer::release::gc(
+            &mut *self.0.backend.exec.borrow_mut(),
+            &self.0.layout,
+            2,
+            &std::collections::BTreeSet::new(),
+            kbf_host::plan::Mode::Apply,
+            &mut out,
+        )
+        .expect("the operator's gc");
+        Ok(())
+    }
+    fn revert(
+        &self,
+        pending: &crate::local::backend::Pending,
+    ) -> Result<(), crate::local::backend::Fault> {
+        self.0.backend.revert(pending)
+    }
+    fn kept(&self) -> Result<Vec<kbf_installer::retain::Kept>, crate::local::backend::Fault> {
+        self.0.backend.kept()
+    }
+    fn retain_file(&self) -> Option<PathBuf> {
+        self.0.backend.retain_file()
+    }
+    fn prune(&self, keep: usize) -> Result<String, crate::local::backend::Fault> {
+        self.0.backend.prune(keep)
+    }
+}
+
+/// A `gc` another program runs in the moment after the confirm has cleared the trial keeps the
+/// last good the confirm named, however old: it was recorded while the release was still on
+/// trial, when no collection removes anything.
+///
+/// Catches: the last good recorded after the confirm, which leaves a gap where a collection
+/// removes the release the coordinator would go back to.
+#[test]
+fn a_collection_right_after_the_confirm_keeps_the_last_good_it_named() {
+    let rig = Rig::new("retain-lg-gap");
+    for n in 20..28 {
+        seed(&rig, &commit_n(n), u64::from(n));
+    }
+    seed(&rig, &commit_n(1), 1);
+    let uid = std::os::unix::fs::MetadataExt::uid(&fs::metadata(&*rig.dir).unwrap());
+    let ab = Ab::new(
+        GcInTheGap(&rig),
+        rig.dir.join("state.json"),
+        Trust::owned_by(uid, &rig.dir),
+        600,
+        Box::new(|| 1_000),
+    )
+    .keeping(2, Box::new(|_| {}));
+    let commit = commit_n(30);
+    rig.offer(&commit, &tar_gz(&[file("kbf", &binary("r30"))]));
+    *rig.probe.borrow_mut() = what_kbf_says(&commit);
+    let version = version_n(30);
+    let staged = ask_any(&ab, &format!("install kbf={version} from stable"));
+    assert!(matches!(&staged, Answer::Staged { .. }), "{staged:?}");
+    age(&rig, &commit, 300);
+    let switched = ask_any(&ab, &format!("switch kbf={version}"));
+    assert!(matches!(switched, Answer::Switched { .. }), "{switched:?}");
+    let line = format!("confirm kbf={version} last_good={}", version_n(1));
+    assert_eq!(ask_any(&ab, &line), Answer::Confirmed { version });
+    assert!(dirs(&rig).contains(&commit_n(1)), "{:?}", dirs(&rig));
+    assert!(
+        !dirs(&rig).contains(&commit_n(20)),
+        "the gap's gc ran: {:?}",
+        dirs(&rig)
+    );
+}
+
+fn ask_any<B: Backend>(ab: &Ab<B>, line: &str) -> Answer {
+    ab.handle(&LocalRequest::parse(line).unwrap())
+}

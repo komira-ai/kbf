@@ -2154,6 +2154,7 @@ dependencies = [
  "kbf-host",
  "kbf-installer",
  "kbf-oidc",
+ "kbf-retain",
  "kbf-testkit",
  "kbf-types",
  "kbf-update",
@@ -2212,6 +2213,7 @@ dependencies = [
  "kbf-pack-index",
  "kbf-proto",
  "kbf-proxy",
+ "kbf-retain",
  "kbf-setup",
  "kbf-state",
  "kbf-testkit",
@@ -2651,6 +2653,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-retain"
+version = "0.1.0"
+dependencies = [
+ "kbf-host",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "kbf-route"
 version = "0.1.0"
 dependencies = [
@@ -2785,6 +2797,7 @@ dependencies = [
  "kbf-host",
  "kbf-pack-index",
  "kbf-proxy",
+ "kbf-retain",
  "kbf-state",
  "kbf-testkit",
  "postgres",
