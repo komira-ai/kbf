@@ -191,6 +191,17 @@ the default caps where the same run with the arms does not. The other cells have
 and ignore the flag. The setting is recorded as `open_loop` in the provenance of every result (a
 result that predates the field was run with the arms on) and the report names it in its header.
 
+`run --multipart-objects N` (default: not set, the plan's count) caps the objects per pass (at most
+N, never more than the plan's count for that size) of the multipart arms of `cold-put`, `direct-mp`
+and `instance`, in their closed-loop arms of every size
+and width. A multipart object is three requests to the store (create, part, complete), and a slow
+cold store (about 1.25 s a request on a disk-backed one) cannot do the plan's 1,000 objects a pass
+of an arm in a measurement window. The `direct` arm, the open-loop arms (use `--open-loop off` with
+the flag) and the fault arms' own counts are not changed, and the ledger is asked for the bytes of
+the objects the arms put. A p99 is reported only from 1,000 requests: an arm with fewer reports a
+null `p99_us` in every pass and says why in its notes. Every result records the objects per pass its
+arm used as `objects_per_pass` (absent in a result written before the field existed).
+
 Tierstore at v0.0.37 has no cold-only mode (`--hot` is a required flag). So the cold cells label
 their paths in the arm names and the result notes say which they are:
 
