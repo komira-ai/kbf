@@ -1223,7 +1223,7 @@ mod tests {
             rows("instance-4kib-c1-healthy", 1, &[1000, 2000, 3000], "200"),
             rows("direct-mp-1kib-c1-healthy", 1, &[0, 0, 0], "200"),
             rows("instance-1kib-c1-healthy", 1, &[1000, 1000, 1000], "200"),
-            rows("direct-mp-2kib-c1-healthy", 1, &[1000, 2000, 3000], "200"),
+            rows("direct-mp-2kib-c1-healthy", 1, &[9000, 9000, 9000], "200"),
             on_attempt(
                 rows("instance-2kib-c1-healthy", 1, &[2000, 3000, 4000], "200"),
                 2,
