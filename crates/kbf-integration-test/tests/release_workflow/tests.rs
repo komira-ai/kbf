@@ -1783,3 +1783,56 @@ fn the_buck2_fetch_step_takes_its_pins_from_the_job_env_alone() {
         );
     }
 }
+
+#[test]
+fn the_rehearsal_token_is_the_runs_own_in_a_private_file_and_never_in_a_command() {
+    // Catches: the rehearsal's helper listing releases without the run's token (the shared
+    // address's anonymous quota refuses it), the token taken from a secret, written to a file
+    // others can read, or put in a command line.
+    let token = "printf '%s' \"$GH_TOKEN\" > /var/tmp/kbf-update-rehearsal.token";
+    red(
+        &plant(
+            REHEARSE,
+            token,
+            "printf '%s' \"${{ github.token }}\" > /var/tmp/kbf-update-rehearsal.token",
+        ),
+        "the job `rehearse` puts a `${{ }}` value in a command",
+    );
+    red(
+        &plant(
+            REHEARSE,
+            "GH_TOKEN: ${{ github.token }}",
+            "GH_TOKEN: ${{ secrets.SOME_TOKEN }}",
+        ),
+        "the job `rehearse` writes a token that is not `github.token`",
+    );
+    red(
+        &plant(
+            REHEARSE,
+            "install -m 0600 /dev/null /var/tmp/kbf-update-rehearsal.token",
+            "install -m 0644 /dev/null /var/tmp/kbf-update-rehearsal.token",
+        ),
+        "the job `rehearse` makes its token file with a mode other than 0600",
+    );
+    red(
+        &plant(REHEARSE, token, "echo done"),
+        "the job `rehearse` does not write its token file from `GH_TOKEN`",
+    );
+}
+
+#[test]
+fn the_rehearsal_names_the_token_file_in_the_channel_the_helper_reads() {
+    // Catches: the rehearsal's channel dropping `token_file` again, so the helper's release
+    // listing is anonymous and shares a hosted runner's quota. The test cannot run in a pull
+    // request (it needs root and systemd); this reads its source.
+    let path = "crates/kbf-host-install/tests/rehearsal/mod.rs";
+    let source = std::fs::read_to_string(crate::repo_root().join(path)).expect(path);
+    assert!(
+        source.contains("source = \\\"github\\\"\\ntoken_file = "),
+        "{path}: the channel does not name a `token_file`"
+    );
+    assert!(
+        !source.contains("no token. (The helper"),
+        "{path}: still says the channel names no token"
+    );
+}

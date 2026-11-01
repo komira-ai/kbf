@@ -30,7 +30,7 @@ use serde::Deserialize;
 
 use crate::inventory::{Host, valid_node_id};
 use crate::operator::{CHECK, OperatorApi, WHAT};
-use crate::ports::{Drain, Placed, PortError};
+use crate::ports::{Drain, Placed, PortError, Seen};
 use crate::reply::Reply;
 
 /// Draining over the operator API.
@@ -105,15 +105,32 @@ impl Drain for NodeDrain {
     }
 
     fn placed_if_known(&self, host: &Host) -> Result<Option<Placed>, PortError> {
+        Ok(self.seen_if_known(host)?.map(|seen| match seen {
+            Seen::Serving => Placed::In,
+            Seen::Cordoned | Seen::Draining => Placed::Out,
+        }))
+    }
+
+    fn seen_if_known(&self, host: &Host) -> Result<Option<Seen>, PortError> {
         let node = Self::node(host)?;
         let Some(reply) = self.judged(self.api.get(&format!("/v1/nodes/{node}"))?, node)? else {
             return Ok(None);
         };
         let read: Node = Self::read(&reply, node)?;
-        Ok(Some(if read.placement.state == "serving" {
-            Placed::In
-        } else {
-            Placed::Out
+        Ok(Some(match read.placement.state.as_str() {
+            "serving" => Seen::Serving,
+            "draining" | "drained" | "drain_paused" => Seen::Draining,
+            // "cordoned", and a state this build does not know: not the updater's drain, so
+            // the node is left out rather than lifted at give-back.
+            other => {
+                if other != "cordoned" {
+                    eprintln!(
+                        "kbf-updater: node {node} is in the placement state {other:?}, which this \
+                         build does not know; treating it as an operator's cordon"
+                    );
+                }
+                Seen::Cordoned
+            }
         }))
     }
 

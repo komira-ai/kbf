@@ -382,6 +382,117 @@ fn a_mark_is_dropped_when_the_node_is_read_serving_and_kept_while_it_is_cordoned
     );
 }
 
+/// A node the updater drained, then cordoned by an operator over that drain (or given back
+/// and cordoned again before the agent looked), still has the updater's mark. A plain cordon
+/// is never the updater's own, which is always a drain: the node reads as out, the mark is
+/// dropped, and a roll leaves the node cordoned.
+///
+/// Catches: a roll that uncordons a node an operator cordoned for a measurement because an
+/// earlier drain of the updater's left a mark.
+#[test]
+fn an_operator_cordon_over_a_stale_mark_is_not_the_updaters() {
+    let dir = scratch("cordon-over-mark");
+    let h = host(Role::Daemon);
+    let node = ServingNode::new();
+    let w = cordon(&node, &dir);
+    w.drain(&h, None).unwrap();
+    assert_eq!(marks(&dir), 1);
+
+    node.operator_cordons();
+    assert_eq!(w.placed(&h).unwrap(), Placed::Out);
+    assert_eq!(marks(&dir), 0, "the cordon changed hands: the mark is gone");
+    assert_eq!(cordon(&node, &dir).placed(&h).unwrap(), Placed::Out);
+}
+
+/// The same through a whole roll: the mark of an earlier failed attempt is on disk, an
+/// operator cordons the node, and the next roll drains it and waits, but gives nothing back.
+///
+/// Catches: the incident of a release roll uncordoning nodes an operator had cordoned.
+#[test]
+fn a_roll_leaves_a_node_an_operator_cordoned_over_a_stale_mark() {
+    let rig = Rig::new("cordon-roll-over-mark");
+    *rig.node.leases.lock().unwrap() = 1;
+    assert_eq!(
+        rig.run(VB, Some(Duration::from_secs(10))),
+        result(VB, Outcome::Failed)
+    );
+    assert_eq!(marks(&rig.dir), 1);
+    rig.node.operator_cordons();
+    *rig.node.leases.lock().unwrap() = 0;
+    assert_eq!(rig.run(VB, None), result(VB, Outcome::Succeeded));
+    assert!(!rig.node.is_serving(), "still cordoned");
+    assert_eq!(marks(&rig.dir), 0);
+}
+
+/// `observe` drops the mark of a node an operator cordoned over the updater's drain, as it
+/// does that of a node read serving.
+///
+/// Catches: a mark that waits for the next update to be found stale.
+#[test]
+fn observing_a_node_an_operator_cordoned_drops_the_mark() {
+    let dir = scratch("cordon-observe-cordoned");
+    let h = host(Role::Daemon);
+    let node = ServingNode::new();
+    let w = cordon(&node, &dir);
+    w.drain(&h, None).unwrap();
+    node.operator_cordons();
+    w.observe(&h).unwrap();
+    assert_eq!(marks(&dir), 0);
+}
+
+/// A marked node whose placement cannot be read is not given back unseen: the read fails, the
+/// roll fails with the node left drained, and nothing is uncordoned.
+///
+/// Catches: a failed read taken for "ours", which let an undrain that worked lift a cordon the
+/// agent could not tell was its own.
+#[test]
+fn a_marked_node_that_cannot_be_read_is_not_given_back() {
+    let dir = scratch("cordon-unreadable");
+    let h = host(Role::Daemon);
+    let node = ServingNode::new();
+    let w = cordon(&node, &dir);
+    w.drain(&h, None).unwrap();
+    *node.read_error.lock().unwrap() = Some(PortError::other("503"));
+    assert!(w.placed(&h).is_err());
+    assert_eq!(marks(&dir), 1, "the mark stays");
+
+    let rig = Rig::new("cordon-unreadable-roll");
+    *rig.node.leases.lock().unwrap() = 1;
+    assert_eq!(
+        rig.run(VB, Some(Duration::from_secs(10))),
+        result(VB, Outcome::Failed)
+    );
+    *rig.node.read_error.lock().unwrap() = Some(PortError::other("503"));
+    *rig.node.leases.lock().unwrap() = 0;
+    assert_eq!(rig.run(VB, None), result(VB, Outcome::Failed));
+    assert!(!rig.node.is_serving(), "left drained");
+    assert_eq!(marks(&rig.dir), 1);
+}
+
+/// A restart in the middle of a trial finds the marked node unreadable: the trial still
+/// finishes and B is kept, but the node is not given back, its mark stays, and the log says
+/// to uncordon it by hand.
+///
+/// Catches: a transient read failure at resume taken for "ours" (the node uncordoned unseen),
+/// and a node left drained with no word of how to get it back.
+#[test]
+fn a_resumed_trial_whose_node_cannot_be_read_keeps_b_and_leaves_the_node_drained() {
+    let rig = Rig::new("cordon-resume-unreadable");
+    cordon(&rig.node, &rig.dir)
+        .drain(&host(Role::Daemon), None)
+        .unwrap();
+    rig.pending();
+    *rig.node.read_error.lock().unwrap() = Some(PortError::other("503"));
+    assert_eq!(rig.run(VB, None), result(VB, Outcome::Succeeded));
+    assert!(!rig.node.is_serving(), "not given back");
+    assert_eq!(marks(&rig.dir), 1, "the mark stays");
+    let logs = rig.logs.lock().unwrap();
+    assert!(
+        logs.iter().any(|l| l.contains("uncordon it by hand")),
+        "{logs:?}"
+    );
+}
+
 /// `observe` (what the agent calls when it looks at its node outside an update) drops the mark
 /// of a node read serving, keeps that of one still cordoned, and does nothing with no mark.
 ///
