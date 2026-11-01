@@ -21,6 +21,10 @@ use tierstore_bench::s3::{BenchS3, Timeouts};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+mod dead_store;
+
+use dead_store::DeadStore;
+
 const DATE: &str = "Sun, 06 Nov 1994 08:49:37 GMT";
 const LATER: &str = "Sun, 06 Nov 1994 09:49:37 GMT";
 
@@ -403,10 +407,8 @@ async fn an_answer_cut_short_costs_one_connection() {
 /// the attempt is counted.
 #[tokio::test]
 async fn a_store_that_is_down_closes_the_client_connection() {
-    let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}", closed.local_addr().unwrap());
-    drop(closed);
-    let proxy = proxy_at(&url, |_| {}).await;
+    let dead = DeadStore::start().await;
+    let proxy = proxy_at(dead.endpoint(), |_| {}).await;
     let answer = exchange(proxy.local_addr(), &get("/a")).await;
     assert!(answer.is_empty(), "{answer}");
     assert_eq!(proxy.request_count(), 1);

@@ -112,7 +112,7 @@ pub(super) fn request(tag: u8) -> kbf_sched::Request {
     }
 }
 
-fn submission(tag: u8, call: Option<ExecuteCall>) -> Submission {
+pub(super) fn submission(tag: u8, call: Option<ExecuteCall>) -> Submission {
     Submission {
         request: request(tag),
         call,
@@ -457,7 +457,7 @@ async fn an_operation_is_named_by_its_id_and_a_name_that_is_not_one_is_not_found
 
 /// The `Start` of the rerun after a kill: the scheduler places it at the next tick, so the
 /// clock is moved on (paused, so no real time passes) until one is sent.
-async fn rerun_start(farm: &Farm, joined: &mut Joined) -> worker::LeaseId {
+pub(super) async fn rerun_start(farm: &Farm, joined: &mut Joined) -> worker::LeaseId {
     for _ in 0..30 {
         farm.tick().await;
         if let Some(lease) = joined.started() {
