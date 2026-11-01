@@ -12,6 +12,7 @@
 mod classes;
 mod driver;
 mod keys;
+mod phases;
 mod pool;
 mod quota;
 mod real_prep;

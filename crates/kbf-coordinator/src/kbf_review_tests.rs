@@ -213,6 +213,8 @@ fn the_hold_strings_are_the_ones_the_status_documents() {
             Hold::WaitingForRole => "waiting_for_role",
             Hold::WaitingForService => "waiting_for_service",
             Hold::MinUp => "min_up",
+            Hold::Baking => "baking",
+            Hold::CanaryWait => "canary_wait",
         }
     };
     for hold in [
@@ -230,6 +232,8 @@ fn the_hold_strings_are_the_ones_the_status_documents() {
         Hold::WaitingForRole,
         Hold::WaitingForService,
         Hold::MinUp,
+        Hold::Baking,
+        Hold::CanaryWait,
     ] {
         assert_eq!(json!(hold), json!(spelled(hold)));
     }
