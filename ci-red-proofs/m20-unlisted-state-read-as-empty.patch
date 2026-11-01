@@ -1,0 +1,13 @@
+diff --git a/crates/kbf-updater/src/root/mod.rs b/crates/kbf-updater/src/root/mod.rs
+index 42b63e51c..7b886d3dc 100644
+--- a/crates/kbf-updater/src/root/mod.rs
++++ b/crates/kbf-updater/src/root/mod.rs
+@@ -549,7 +549,7 @@ impl RootPart {
+         // The state directory is made when the root part is (`RootPart::new`).
+         let entries = match fs::read_dir(&self.config.state) {
+             Ok(entries) => entries,
+-            Err(e) => return vec![(String::new(), e.to_string())],
++            Err(_) => return Vec::new(),
+         };
+         let mut unread = Vec::new();
+         for entry in entries {

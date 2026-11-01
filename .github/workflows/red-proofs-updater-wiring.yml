@@ -25,9 +25,12 @@ jobs:
           - id: baseline
             runs: "update-rights:boot update-rights:shipped kbf-updater:root_part kbf-updater:root_units kbf-updater:agent_packaging kbf-integration-test:layering"
             expect: ""
-          - id: m17-boot-entry-skips-record-dir-check
+          - id: m19-boot-id-written-over-an-unread-record
             runs: "kbf-updater:root_part"
-            expect: "a_boot_entry_whose_record_directory_the_service_can_write_runs_nothing"
+            expect: "the_boot_id_is_written_only_once_every_record_was_read"
+          - id: m20-unlisted-state-read-as-empty
+            runs: "kbf-updater:root_part"
+            expect: "a_state_directory_that_cannot_be_listed_is_reported_by_the_read_after_a_boot"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

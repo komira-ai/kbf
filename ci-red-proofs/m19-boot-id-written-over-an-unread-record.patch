@@ -1,0 +1,13 @@
+diff --git a/crates/kbf-updater/src/root/mod.rs b/crates/kbf-updater/src/root/mod.rs
+index 42b63e51c..1e632baea 100644
+--- a/crates/kbf-updater/src/root/mod.rs
++++ b/crates/kbf-updater/src/root/mod.rs
+@@ -774,7 +774,7 @@ fn serve(
+             serde_json::to_string(&started).unwrap_or_default()
+         );
+     }
+-    if unread.is_empty() {
++    if true {
+         boot::commit_boot(&state, &*clock).map_err(text)?;
+     }
+     let listener = socket::bind(&flags.socket, agent.uid, agent.gid).map_err(text)?;
