@@ -2863,6 +2863,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-step-runner"
+version = "0.1.0"
+dependencies = [
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror",
+ "update-hook",
+]
+
+[[package]]
 name = "kbf-storage"
 version = "0.1.0"
 dependencies = [
