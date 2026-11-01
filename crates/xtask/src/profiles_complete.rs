@@ -28,10 +28,14 @@ pub struct Args {
     /// The file-name prefix of one shard's profiles; once for each shard.
     #[arg(long = "prefix", required = true)]
     pub prefixes: Vec<String>,
+    /// The extension of the files to check: `profraw` (a shard's raw profiles) or `profdata`
+    /// (the one file each shard merged them into, which is what `test` downloads).
+    #[arg(long, default_value = "profraw")]
+    pub extension: String,
 }
 
-/// The `.profraw` files of `dir` as `(name, bytes)`, in name order.
-fn profiles(dir: &Path) -> Result<Vec<(String, u64)>, Error> {
+/// The files of `dir` with the extension (`.profraw` by default) as `(name, bytes)`, in name order.
+fn profiles(dir: &Path, extension: &str) -> Result<Vec<(String, u64)>, Error> {
     let what = || format!("read {}", dir.display());
     let spawn = |e: std::io::Error| Error::Spawn {
         what: what(),
@@ -42,7 +46,7 @@ fn profiles(dir: &Path) -> Result<Vec<(String, u64)>, Error> {
         let entry = entry.map_err(spawn)?;
         let name = entry.file_name().to_string_lossy().into_owned();
         let meta = entry.metadata().map_err(spawn)?;
-        if meta.is_file() && name.ends_with(".profraw") {
+        if meta.is_file() && name.ends_with(&format!(".{extension}")) {
             found.push((name, meta.len()));
         }
     }
@@ -52,7 +56,7 @@ fn profiles(dir: &Path) -> Result<Vec<(String, u64)>, Error> {
 
 /// Check the directory: one line for each shard saying how many profiles it has, or why not.
 pub fn run(args: &Args) -> Result<Vec<String>, Error> {
-    let files = profiles(&args.dir)?;
+    let files = profiles(&args.dir, &args.extension)?;
     let mut problems = Vec::new();
     let mut lines = Vec::new();
     for prefix in &args.prefixes {

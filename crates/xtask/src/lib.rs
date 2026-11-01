@@ -14,7 +14,7 @@
 //!   finished without one, or the looks ran out).
 //! - `profiles-complete --dir <dir> --prefix <p>...` ([`profiles_complete`]): exit 1 unless each
 //!   shard's prefix begins a non-empty `.profraw` file of the directory and no `.profraw` file
-//!   begins none of them.
+//!   begins none of them (`--extension profdata` checks the shards' merged `.profdata` files).
 //! - `release farm-version --repo <owner/repo> --tag <tag> --commit <sha> [--output <file>]`
 //!   ([`release::farm_version`]): the version text the farm is told to converge on,
 //!   `<version>+g<12 hex digits of the commit>` as the hosts report it, read from the release's

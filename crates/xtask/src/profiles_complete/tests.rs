@@ -17,6 +17,7 @@ fn args(dir: &TestDir, prefixes: &[&str]) -> Args {
     Args {
         dir: dir.to_path_buf(),
         prefixes: prefixes.iter().map(|p| (*p).to_owned()).collect(),
+        extension: "profraw".to_owned(),
     }
 }
 
@@ -111,7 +112,29 @@ fn a_directory_that_cannot_be_read_is_an_error() {
     let args = Args {
         dir: d.to_path_buf().join("nowhere"),
         prefixes: vec!["kbf-".to_owned()],
+        extension: "profraw".to_owned(),
     };
     let e = run(&args).expect_err("no directory");
     assert!(e.to_string().starts_with("read "), "{e}");
+}
+
+/// Catches: `--extension profdata` still reading `.profraw` files (the merged profiles of a shard
+/// would then never be found), and a shard's raw profile being counted as its merged one.
+#[test]
+fn the_extension_picks_which_files_are_checked() {
+    let d = scratch("extension");
+    put(&d, "kbf-legacy-1-merged.profdata", b"abc");
+    put(&d, "kbf-js-1-merged.profdata", b"de");
+    let mut a = args(&d, &["kbf-legacy-1-", "kbf-js-1-"]);
+    a.extension = "profdata".to_owned();
+    assert_eq!(run(&a).map(|l| l.len()).ok(), Some(2));
+    let raw = args(&d, &["kbf-legacy-1-", "kbf-js-1-"]);
+    let problems = refused(run(&raw));
+    assert!(problems[0].contains("kbf-legacy-1-"), "{problems:?}");
+    put(&d, "kbf-js-2-merged.profdata", b"x");
+    let problems = refused(run(&a));
+    assert!(
+        problems[0].contains("begin with none of the shards' prefixes"),
+        "{problems:?}"
+    );
 }

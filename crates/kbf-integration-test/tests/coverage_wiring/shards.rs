@@ -387,7 +387,9 @@ pub fn gate_wiring(workflow: &str) -> Result<(), String> {
         r.contains("llvm-profdata") && r.contains("merge")
     })
     .ok_or_else(|| {
-        format!("the job `{GATE}` has no step that merges the shards' profiles (`llvm-profdata merge`)")
+        format!(
+            "the job `{GATE}` has no step that merges the shards' profiles (`llvm-profdata merge`)"
+        )
     })?;
     let report = find(&|s| run(s).contains("llvm-cov report"))
         .ok_or_else(|| format!("the job `{GATE}` has no step running `llvm-cov report`"))?;
