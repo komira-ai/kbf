@@ -10,7 +10,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::io::{AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
@@ -23,6 +23,9 @@ const MAX_HEAD: usize = 8192;
 pub struct FileServer {
     addr: SocketAddr,
     connections: Arc<AtomicU64>,
+    /// Accepted connections whose socket had TCP_NODELAY set, for the tests.
+    #[cfg(test)]
+    nodelay: Arc<AtomicU64>,
     task: JoinHandle<()>,
 }
 
@@ -44,11 +47,19 @@ impl FileServer {
         let addr = listener.local_addr().map_err(unavailable)?;
         let connections = Arc::new(AtomicU64::new(0));
         let counted = connections.clone();
+        #[cfg(test)]
+        let nodelay = Arc::new(AtomicU64::new(0));
+        #[cfg(test)]
+        let nodelay_seen = nodelay.clone();
         let task = tokio::spawn(async move {
             loop {
                 // An accept that fails (out of descriptors) is tried again after other tasks ran.
                 listener.accept().await.into_iter().for_each(|(socket, _)| {
                     counted.fetch_add(1, Ordering::SeqCst);
+                    #[cfg(test)]
+                    if socket.nodelay().unwrap_or(false) {
+                        nodelay_seen.fetch_add(1, Ordering::SeqCst);
+                    }
                     tokio::spawn(serve(socket, root.clone()));
                 });
                 tokio::task::yield_now().await;
@@ -57,6 +68,8 @@ impl FileServer {
         Ok(Self {
             addr,
             connections,
+            #[cfg(test)]
+            nodelay,
             task,
         })
     }
@@ -95,7 +108,11 @@ fn requested(head: &str) -> Option<PathBuf> {
     (method == "GET" && version.starts_with("HTTP/1.") && inside).then(|| relative.to_owned())
 }
 
-async fn respond(socket: &mut TcpStream, status: &str, body: &[u8]) -> std::io::Result<()> {
+async fn respond<W: AsyncWrite + Unpin>(
+    socket: &mut W,
+    status: &str,
+    body: &[u8],
+) -> std::io::Result<()> {
     let head = format!(
         "HTTP/1.1 {status}\r\ncontent-length: {}\r\n\r\n",
         body.len()
@@ -139,6 +156,68 @@ async fn serve(mut socket: TcpStream, root: PathBuf) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    /// A writer that keeps what it is given and counts the writes it took it in.
+    #[derive(Default)]
+    struct Counting {
+        writes: usize,
+        bytes: Vec<u8>,
+    }
+
+    impl AsyncWrite for Counting {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.writes += 1;
+            self.bytes.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Catches an answer sent as a head write and then a body write: on a socket without
+    /// TCP_NODELAY the second small write waits for the peer's delayed ACK of the first. A small
+    /// answer is one write, head and body together, and its bytes are the whole response.
+    #[tokio::test]
+    async fn a_small_answer_is_written_in_one_write() {
+        let mut out = Counting::default();
+        respond(&mut out, "200 OK", b"hello").await.unwrap();
+        assert_eq!(out.writes, 1);
+        assert_eq!(
+            out.bytes,
+            b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nhello"
+        );
+    }
+
+    /// Catches a connection served with Nagle on: every connection the server accepts has
+    /// TCP_NODELAY set, however many clients there are.
+    #[tokio::test]
+    async fn every_accepted_connection_has_nodelay_set() {
+        let dir = dir("tb-fileserver-nodelay");
+        let server = FileServer::start(dir.path().to_owned()).await.unwrap();
+        let addr = server.url().trim_start_matches("http://").to_owned();
+        for _ in 0..2 {
+            let mut socket = TcpStream::connect(&addr).await.unwrap();
+            socket
+                .write_all(b"GET /d000/f1 HTTP/1.1\r\n\r\n")
+                .await
+                .unwrap();
+            let mut first = [0u8; 12];
+            socket.read_exact(&mut first).await.unwrap();
+        }
+        assert_eq!(server.connections(), 2);
+        assert_eq!(server.nodelay.load(Ordering::SeqCst), 2);
+        server.stop();
+    }
 
     fn dir(name: &str) -> kbf_testkit::dir::TestDir {
         let dir = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), name);
