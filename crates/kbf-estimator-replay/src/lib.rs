@@ -69,10 +69,12 @@
 
 #![forbid(unsafe_code)]
 
+mod build_report;
 pub mod builds;
 pub mod cli;
 pub mod compare;
 pub mod export;
+pub mod phases;
 pub mod readonly;
 pub mod replay;
 pub mod row;

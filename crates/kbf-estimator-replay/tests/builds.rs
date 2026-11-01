@@ -260,3 +260,31 @@ fn per_run_json_has_the_fields_of_a_run_record_and_the_callers_labels() {
         "no wait is not zero"
     );
 }
+
+/// Catches: runs numbered in the order of their ids or of the input rows (a build's index
+/// would move with its name or with which row came first), a build's first queue taken from
+/// its first row instead of the earliest of its rows, and a tie broken by anything but the
+/// id. Builds: `z` queued 0; `b` has a first row queued 9 and a later one queued 1, so its
+/// earliest queue is 1; `a` and `m` both queued 5, so `a` comes first.
+#[test]
+fn run_index_follows_the_earliest_queue_then_the_id() {
+    let rows = [
+        row("r1", Some("b"), None, (9, Some(10), Some(11))),
+        row("r2", Some("m"), None, (5, Some(6), Some(7))),
+        row("r3", Some("a"), None, (5, Some(6), Some(7))),
+        row("r4", Some("z"), None, (0, Some(1), Some(2))),
+        row("r5", Some("b"), None, (1, Some(2), Some(3))),
+    ];
+    let got = analyze(&rows, GroupBy::Invocation);
+    let order: Vec<&str> = got.runs.iter().map(|r| r.build.as_str()).collect();
+    assert_eq!(order, ["z", "b", "a", "m"]);
+    let records = got.run_records(&labels("x"));
+    let attempts: Vec<&Value> = records
+        .iter()
+        .map(|r| &r["metrics"]["build_attempts"])
+        .collect();
+    assert_eq!(attempts, [1.0, 2.0, 1.0, 1.0]);
+    for (i, r) in records.iter().enumerate() {
+        assert_eq!(r["run_index"], i);
+    }
+}
