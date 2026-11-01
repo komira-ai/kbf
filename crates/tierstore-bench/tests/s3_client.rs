@@ -15,6 +15,10 @@ use tierstore_bench::requestlog::{RequestLog, RequestRecord};
 use tierstore_bench::role::Role;
 use tierstore_bench::s3::{BenchS3, Timeouts};
 
+mod dead_store;
+
+use dead_store::DeadStore;
+
 fn spec(endpoint: &str) -> StoreSpec {
     StoreSpec {
         endpoint: endpoint.to_owned(),
@@ -153,10 +157,8 @@ async fn a_request_that_gets_no_answer_has_no_status_and_a_class_only() {
     let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "tierstore-bench-s3-down");
     let log_path = dir.path().join("requests.jsonl");
     let log = Arc::new(RequestLog::create(&log_path).unwrap());
-    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let endpoint = format!("http://{}", closed.local_addr().unwrap());
-    drop(closed);
-    let s3 = BenchS3::new(Role::Cold, &spec(&endpoint), Timeouts::default(), log).unwrap();
+    let dead = DeadStore::start().await;
+    let s3 = BenchS3::new(Role::Cold, &spec(dead.endpoint()), Timeouts::default(), log).unwrap();
     let out = s3.put("bench/a", Bytes::from_static(b"x")).await.unwrap();
     assert!(!out.is_ok());
     assert_eq!(out.status, None);
@@ -394,10 +396,8 @@ async fn a_sweep_stops_when_its_log_does() {
 /// what it found, nothing.
 #[tokio::test]
 async fn a_sweep_of_a_dead_store_finds_nothing() {
-    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let endpoint = format!("http://{}", closed.local_addr().unwrap());
-    drop(closed);
+    let dead = DeadStore::start().await;
     let log = Arc::new(RequestLog::to_writer(std::io::sink()));
-    let s3 = client(&endpoint, log);
+    let s3 = client(dead.endpoint(), log);
     assert_eq!(s3.abort_uploads("sweep/").await.unwrap(), 0);
 }

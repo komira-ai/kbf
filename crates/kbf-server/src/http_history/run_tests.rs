@@ -1,6 +1,8 @@
 //! The run as `GET /v1/runs/{id}` renders it. Each test names the defect it catches.
 
-use kbf_history::records::{Cgroup, MemoryKill, RunOutcome, RunRecord, Timestamps, WireDigest};
+use kbf_history::records::{
+    Cgroup, MemoryKill, PhaseTimes, RunOutcome, RunRecord, Timestamps, WireDigest,
+};
 use kbf_history::{RunId, StreamId};
 use serde_json::{Value, json};
 
@@ -602,5 +604,21 @@ mod recorder_side {
         let mut value = serde_json::json!({});
         add_logs(&state, &readers, &RunRecord::default(), None, &mut value).await;
         assert!(value.get("logs").is_none(), "{value}");
+    }
+}
+
+/// Catches an export that does not say where the phase times came from: a task's claim is
+/// `task_claim`, a daemon's run is `measured`, and a record written before the marker reads
+/// `measured`, which is what it was.
+#[test]
+fn a_run_says_where_its_phase_times_came_from() {
+    for (marker, name) in [
+        (PhaseTimes::TaskClaim, "task_claim"),
+        (PhaseTimes::Measured, "measured"),
+        (PhaseTimes::Unspecified, "measured"),
+    ] {
+        let mut r = base();
+        r.phase_times = marker.into();
+        assert_eq!(render(&r)["phase_times"], name, "{marker:?}");
     }
 }

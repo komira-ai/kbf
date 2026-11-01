@@ -335,8 +335,12 @@ impl Registrable {
     /// # Errors
     /// The flag's configuration is refused (a missing key pair is not an error yet: the
     /// registration may supply it).
-    pub(crate) fn new(uri: &S3Uri, env: fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
-        let own = match crate::s3_store(uri, env) {
+    pub(crate) fn new(
+        uri: &S3Uri,
+        file: Option<&std::path::Path>,
+        env: fn(&str) -> Option<String>,
+    ) -> Result<Self, ConfigError> {
+        let own = match crate::key_file::cold_s3_store(uri, file, env) {
             Ok(store) => Ok(store),
             Err(ConfigError::MissingEnv(name)) => Err(name),
             Err(other) => return Err(other),

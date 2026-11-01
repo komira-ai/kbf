@@ -399,14 +399,14 @@ impl Engine {
 
     /// Whether a lease of `operation` the scheduler gave up is not yet written to the store
     /// as a requeue: the operation has no `queue/` row for that reason.
-    fn requeue_pending(&self, operation: OperationId) -> bool {
+    pub(super) fn requeue_pending(&self, operation: OperationId) -> bool {
         self.unsettled
             .iter()
             .any(|(requeue, ..)| requeue.operation == operation)
     }
 
     /// Forgets `operation`, which another frontend took, and keeps its callers.
-    fn hand_off(&mut self, operation: OperationId) {
+    pub(super) fn hand_off(&mut self, operation: OperationId) {
         let callers = self.sched.forget_queued(operation).unwrap_or_default();
         self.keep_following(operation, callers);
     }

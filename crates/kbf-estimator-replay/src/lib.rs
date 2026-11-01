@@ -55,6 +55,14 @@
 //! paper's build wall comes from the client. A row from a server that predates the ids has
 //! none, and no build is made of it.
 //!
+//! # The two-arm comparison
+//!
+//! `kbf-estimator-replay compare --arm-a DIR --arm-b DIR [--json]` reads two exports and
+//! prints, for each arm and as the difference, queue wait and wall percentiles, the makespan
+//! and kills per 1,000 attempts split by kind. The definitions (nearest rank, which attempts
+//! count, absent against zero) are in the [`compare`] module documentation, and the report
+//! prints what the export cannot say ([`compare::NOT_RECORDED`]). It reads and prints only.
+//!
 //! This crate is a workspace member under the coverage gate (99% of lines and branches):
 //! the verbs are library functions over injected I/O, `main` is three lines, and every
 //! rule of the replay has a test that asserts it.
@@ -63,6 +71,7 @@
 
 pub mod builds;
 pub mod cli;
+pub mod compare;
 pub mod export;
 pub mod readonly;
 pub mod replay;

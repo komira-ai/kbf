@@ -519,6 +519,7 @@ An attempt, as `actions/{digest}`, `failures` and `runs/{run_id}` return it. The
    "execution_start": "...Z", "execution_completed": "...Z",
    "output_upload_start": "...Z", "output_upload_completed": "...Z",
    "worker_completed": "...Z"},
+ "phase_times": "measured",
  "presubmit_us": 0,
  "inputs": {"root_digest": "...", "files": 0, "bytes": 0, "fetched_bytes": 0,
    "tree_href": "/v1/trees/{digest}?instance=..."},

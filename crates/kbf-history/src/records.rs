@@ -397,13 +397,44 @@ pub struct RunRecord {
     /// before the field. Fields 48 and 49 follow the submit evidence (43 to 47).
     #[prost(string, optional, tag = "48")]
     pub invocation_id: Option<String>,
-    /// The group of invocations (a CI job) this one is part of: its `correlated_invocations_id`, when the
-    /// client sent one. Absent is not empty: no call of the invocation named one, or the
+    /// The group of invocations (a CI job) this one is part of: its
+    /// `correlated_invocations_id`, when the client sent one. Absent is not empty: no call of the invocation named one, or the
     /// record predates the field. It is a snapshot taken when the attempt ended (the first
     /// non-empty value seen by then), while the live read of a run uses the current one: an
     /// invocation whose early calls sent none can have records without it and later ones with.
     #[prost(string, optional, tag = "49")]
     pub correlated_invocations_id: Option<String>,
+    /// Where the three phase durations of `timestamps` came from. `Unspecified` is a record
+    /// written before the field, which reads as measured. Field 50: fields 48 and 49 are taken
+    /// by the invocation ids (#2200).
+    #[prost(enumeration = "PhaseTimes", tag = "50")]
+    pub phase_times: i32,
+}
+
+/// Where a run record's `input_fetch`, `execution` and `output_upload` times came from. For
+/// a `TaskClaim` only the three durations are data: never the instants, or the gaps between
+/// them and the server's `worker_start` and `worker_completed`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, prost::Enumeration)]
+#[repr(i32)]
+pub enum PhaseTimes {
+    /// Not recorded: a record written before the field. Read as measured, which is what
+    /// every such record was (a daemon's run, or an executor run with no phase times).
+    Unspecified = 0,
+    /// A daemon measured them.
+    Measured = 1,
+    /// A task claimed them, laid out ending at the frontend's read of its pack.
+    TaskClaim = 2,
+}
+
+impl PhaseTimes {
+    /// The name the read API writes: an unrecorded record is `measured`.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Unspecified | Self::Measured => "measured",
+            Self::TaskClaim => "task_claim",
+        }
+    }
 }
 
 /// Where one axis of an attempt's booking came from. A record written before the field

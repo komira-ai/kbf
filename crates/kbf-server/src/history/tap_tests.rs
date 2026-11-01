@@ -165,6 +165,7 @@ fn a_finished_attempt_keeps_what_the_row_and_the_attempt_hold() {
         booked_memory_bytes: Some(1 << 30),
         booked_millicpus: None,
         cap_bytes: None,
+        phase_times: Default::default(),
     }));
     let mut r = row(
         vec![
@@ -1125,3 +1126,6 @@ fn the_record_names_the_invocation_and_the_build_the_end_names() {
     };
     assert_eq!(record.invocation_id.as_deref(), Some("b"));
 }
+
+#[path = "tap_phase_tests.rs"]
+mod phase;
