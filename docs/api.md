@@ -1278,6 +1278,7 @@ and a lost race is `409 conflict`, never a lost write.
 | `GET /v1/object-stores/connections/{name}` | one connection, never a secret |
 | `DELETE /v1/object-stores/connections/{name}` | `{generation}`; `409 in_use` while a binding names it |
 | `POST /v1/object-stores/connections/{name}:verify` | probe the store, change nothing |
+| `POST /v1/object-stores/connections/{name}:repoint` | move the bound store (endpoint, bucket, prefix); probed first, always |
 | `PUT /v1/object-stores/bindings/{role}` | bind `cold`; `201` created, `200` changed or unchanged |
 | `DELETE /v1/object-stores/bindings/{role}` | `{generation}`; `409 in_use` once a node has applied it |
 | `GET /v1/object-stores` | the desired state and the nodes' convergence |
@@ -1314,7 +1315,7 @@ secret_access_key, conditional_put?, min_put_rate?, expect_generation?, verify?}
 verify?}`; `verify` (default `true`) probes the bucket with the connection's stored key
 first. `422 unknown_connection`, `invalid_bucket`, `invalid_prefix` and `probe_failed` write
 nothing. The store identity `(endpoint, bucket, prefix)` is immutable once bound
-(`409 identity_change`): moving to another store is a migration this API has no verb for.
+(`409 identity_change`): `:repoint` below is the only call that moves it.
 Answer: `{role, generation, changed, verified}`.
 
 **`POST .../connections/{name}:verify`** takes nothing, or `{bucket?, prefix?}`; without a
@@ -1325,6 +1326,21 @@ probe_failed` with `verified` (`{ok, put, get, delete, conditional_put}`): the s
 the store's words. The probe proves that *this frontend* can reach the store with this key;
 the frontend connects to an endpoint an operator typed, so it is bounded (20 seconds in all)
 and operator-only behind the token.
+
+**`POST .../connections/{name}:repoint`** takes `{endpoint, bucket?, prefix?,
+expect_generation}` and moves the store the role `cold` names: the endpoint of the connection
+and the bucket and prefix of the binding, with the generation bumped, in one write. Bucket and
+prefix default to the binding's. `expect_generation` is required (`400 bad_body` without it;
+`409 generation_mismatch` when stale), and there is no `verify` field: the new store is probed
+with the connection's registered key first, and a failed probe answers `422 probe_failed` and
+changes nothing. The connection must be the bound one (`409 not_bound`; `404
+no_such_connection`); `422 tls_unsupported`, `invalid_endpoint`, `invalid_bucket` and
+`invalid_prefix` are as for a bind. Answer: `{name, generation, changed, from, to, verified}`
+with `from` and `to` being `{endpoint, bucket, prefix}`; a repoint to the current identity is
+`changed: false` and keeps the generation. The audit row names the connection and carries
+`detail` with the old and the new identity. Only nodes started with `--cold-store registered`
+follow a repoint, at their next start; a node that names a store URL keeps its
+`identity_mismatch` behaviour.
 
 **`GET /v1/object-stores`** answers `{generation, connections, bindings, convergence}`;
 `convergence` is `{converged, expected, applied, unsupported, nodes: [{id, state,
@@ -1346,9 +1362,10 @@ applied_generation, status, last_seen_secs}]}`.
   `pending` for every node until heartbeats arrive.
 
 **`GET /v1/object-stores/audit`** answers `{entries: [{seq, at, action, subject, outcome,
-generation}]}`, newest first. A row names what was touched and what happened, never a body
+generation, detail?}]}`, newest first. A row names what was touched and what happened, never a body
 field; the actor is always "the API token", the gate knows no finer identity. Only writes
-leave rows (a refused call, a failed probe and `:verify` leave none), an unchanged repeat leaves
+leave rows (a refused call, a failed probe and `:verify` leave none; `detail` is set on
+`repoint` rows only), an unchanged repeat leaves
 one with `outcome` `unchanged`.
 
 **Errors** are `{"error": "...", "code": "..."}` (a `probe_failed` also has `verified`). The
@@ -1359,7 +1376,7 @@ text names no value of the request: a body that does not parse says where, not w
 | 400 | `bad_name`, `bad_body`, `bad_query` |
 | 401, 403, 415 | `unauthorized`, `forbidden`, `unsupported_media_type` (the gate's) |
 | 404 | `not_enabled`, `no_such_connection`, `no_such_binding`, `unknown_action` |
-| 409 | `identity_change`, `in_use`, `generation_mismatch`, `conflict` |
+| 409 | `identity_change`, `not_bound`, `in_use`, `generation_mismatch`, `conflict` |
 | 413 | `payload_too_large` |
 | 422 | `invalid_field`, `tls_unsupported`, `invalid_endpoint`, `invalid_bucket`, `invalid_prefix`, `role_not_supported`, `unknown_connection`, `no_bucket`, `probe_failed` |
 | 500 | `secret_missing` (the file a row names is missing or not 0600: fail closed, PUT again to repair), `secret_io`, `corrupt_rows`, `internal` |
@@ -1409,6 +1426,7 @@ passes the whole gate; `--api ADDR` names the listener (default `127.0.0.1:8982`
 | `object-store bind --connection NAME --bucket B [--role cold] [--prefix P] [--expect-generation N] [--no-verify]` | `PUT /v1/object-stores/bindings/cold` |
 | `object-store unbind [--role cold]` | `DELETE /v1/object-stores/bindings/cold` |
 | `object-store verify NAME [--bucket B] [--prefix P]` | `POST /v1/object-stores/connections/NAME:verify` |
+| `object-store repoint --connection NAME --endpoint URL [--bucket B] [--prefix P] --expect-generation N` | `POST /v1/object-stores/connections/NAME:repoint` |
 
 The secret key is never a flag or an environment variable: `connection put` reads it from
 standard input (`--secret-stdin`) or from a file (`--secret-file F`) that must be a regular

@@ -32,7 +32,9 @@ use std::path::PathBuf;
 
 use clap::{Args, Subcommand};
 use kbf_server::object_store::api::BASE;
-use kbf_types::object_store_api::{BindingPut, BindingRole, ConnectionName, VerifyRequest};
+use kbf_types::object_store_api::{
+    BindingPut, BindingRole, ConnectionName, RepointRequest, VerifyRequest,
+};
 use serde::Serialize;
 use zeroize::Zeroizing;
 
@@ -255,9 +257,21 @@ impl ObjectStore {
                 }),
             ),
             Self::Unbind { role, .. } => Call::Delete(format!("{BASE}/bindings/{role}")),
-            Self::Repoint { connection, .. } => Call::Post(
+            Self::Repoint {
+                connection,
+                endpoint,
+                bucket,
+                prefix,
+                expect_generation,
+                ..
+            } => Call::Post(
                 format!("{BASE}/connections/{connection}:repoint"),
-                Body::empty(),
+                Body::json(&RepointRequest {
+                    endpoint: endpoint.clone(),
+                    bucket: bucket.clone(),
+                    prefix: prefix.clone(),
+                    expect_generation: *expect_generation,
+                }),
             ),
             Self::Verify {
                 name,

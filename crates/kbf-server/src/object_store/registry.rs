@@ -624,11 +624,60 @@ impl Registry {
     /// [`RegistryError::Store`].
     pub fn repoint(
         &self,
-        _name: &ConnectionName,
-        _to: &StoreIdentity,
-        _expect_generation: u64,
+        name: &ConnectionName,
+        to: &StoreIdentity,
+        expect_generation: u64,
     ) -> Result<(Written, StoreIdentity), RegistryError> {
-        Err(RegistryError::Conflict)
+        let _guard = self.lock();
+        let head = self.read_gen()?;
+        head.expect(Some(expect_generation))?;
+        let mut conn = self
+            .conn_row(name)?
+            .ok_or(RegistryError::NoSuchConnection)?;
+        let (role, mut bind) = self
+            .bind_rows()?
+            .into_iter()
+            .find(|(_, row)| row.connection == name.as_str())
+            .ok_or(RegistryError::NotBound)?;
+        let from = StoreIdentity {
+            endpoint: conn.endpoint.clone(),
+            bucket: bind.bucket.clone(),
+            prefix: bind.prefix.clone(),
+        };
+        let mut audit = Audit {
+            action: AuditAction::Repoint,
+            subject: name.to_string(),
+            outcome: AuditOutcome::Unchanged,
+            detail: format!("{from} -> {to}"),
+        };
+        if from == *to {
+            let generation = self.commit(&head, Txn::new(), audit, false)?;
+            return Ok((
+                Written {
+                    generation,
+                    outcome: AuditOutcome::Unchanged,
+                },
+                from,
+            ));
+        }
+        let generation = head.after(true);
+        to.endpoint.clone_into(&mut conn.endpoint);
+        conn.updated_generation = generation;
+        to.bucket.clone_into(&mut bind.bucket);
+        to.prefix.clone_into(&mut bind.prefix);
+        bind.updated_generation = generation;
+        audit.outcome = AuditOutcome::Changed;
+        let txn = Txn::new()
+            .put(conn_key(name), conn.encode_to_vec(), Cond::Any)
+            .put(bind_key(role), bind.encode_to_vec(), Cond::Any);
+        self.commit(&head, txn, audit, true)?;
+        Ok((
+            Written {
+                generation,
+                outcome: AuditOutcome::Changed,
+            },
+            from,
+        ))
     }
 
     /// Removes a binding. Whether a node still runs on it is the caller's rule.

@@ -6,6 +6,7 @@
 //! | `GET /connections`, `GET /connections/{name}` | read, never a secret |
 //! | `DELETE /connections/{name}` | delete; 409 `in_use` while bound |
 //! | `POST /connections/{name}:verify` | probe the store; change nothing |
+//! | `POST /connections/{name}:repoint` | move the bound store (endpoint, bucket, prefix); always probed |
 //! | `PUT /bindings/{role}` | bind the role `cold` |
 //! | `DELETE /bindings/{role}` | unbind; 409 `in_use` once a node has applied it |
 //! | `GET /v1/object-stores` | the desired state and the nodes' convergence |
@@ -48,7 +49,8 @@ use axum::routing::{get, put};
 use kbf_types::object_store_api::{
     AuditList, AuditOutcome, BindingPut, BindingPutAnswer, BindingRole, ConnectionList,
     ConnectionName, ConnectionPut, ConnectionPutAnswer, Convergence, Deleted, ErrorBody,
-    NodeConvergence, NodeStatus, RoleFault, Status, Verified, VerifyAnswer, VerifyRequest,
+    NodeConvergence, NodeStatus, RepointAnswer, RepointRequest, RoleFault, Status, StoreIdentity,
+    Verified, VerifyAnswer, VerifyRequest,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -79,6 +81,9 @@ const REGION_MAX: usize = 64;
 
 /// The custom method that probes a connection.
 const VERIFY: &str = ":verify";
+
+/// The custom method that moves the bound store of a connection.
+const REPOINT: &str = ":repoint";
 
 /// Where the nodes' acknowledgements of the registration are read.
 pub trait AckSource: Send + Sync {
@@ -305,7 +310,7 @@ pub fn routes(token: Option<ApiToken>, api: Option<Arc<ObjectStoreApi>>) -> Rout
             get(connection)
                 .put(put_connection)
                 .delete(delete_connection)
-                .post(verify),
+                .post(connection_action),
         )
         .route(
             "/v1/object-stores/bindings/{role}",
@@ -513,10 +518,40 @@ async fn delete_connection(
     .await
 }
 
+/// `POST .../connections/{name}:verify` or `:repoint`: the router takes the whole segment, so
+/// the verb is split off here.
+async fn connection_action(
+    state: State<Arc<Routes>>,
+    peer: Caller,
+    Path(target): Path<String>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    match target.strip_suffix(REPOINT) {
+        Some(name) => repoint(state, peer, name.to_owned(), headers, body).await,
+        None => verify(state, peer, target, headers, body).await,
+    }
+}
+
+async fn repoint(
+    State(state): State<Arc<Routes>>,
+    peer: Caller,
+    name: String,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    serve(&state, &peer, &headers, |api| async move {
+        let name = connection_name(&name)?;
+        let request: RepointRequest = parse(body, "repoint request")?;
+        blocking(move || api.repoint(&name, request)).await
+    })
+    .await
+}
+
 async fn verify(
     State(state): State<Arc<Routes>>,
     peer: Caller,
-    Path(target): Path<String>,
+    target: String,
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
@@ -525,7 +560,7 @@ async fn verify(
             return Err(Failure::new(
                 StatusCode::NOT_FOUND,
                 "unknown_action",
-                "a POST to a connection is POST .../connections/{name}:verify",
+                "a POST to a connection is POST .../connections/{name}:verify or :repoint",
             ));
         };
         let name = connection_name(name)?;
@@ -726,6 +761,52 @@ impl ObjectStoreApi {
             StatusCode::OK,
             VerifyAnswer {
                 name: name.clone(),
+                verified,
+            },
+        ))
+    }
+
+    /// Moves the store the role `cold` names to `request`'s endpoint, bucket and prefix
+    /// (the binding's own where the request gives none), once the connection's key has
+    /// passed the probe of the new store. There is no way to skip the probe.
+    fn repoint(
+        &self,
+        name: &ConnectionName,
+        request: RepointRequest,
+    ) -> Result<(StatusCode, RepointAnswer), Failure> {
+        let info = self
+            .registry
+            .connection(name)?
+            .ok_or(RegistryError::NoSuchConnection)?;
+        let (bucket, prefix) = self.cold_target(name)?.ok_or(RegistryError::NotBound)?;
+        let to = StoreIdentity {
+            endpoint: request.endpoint,
+            bucket: request.bucket.unwrap_or(bucket),
+            prefix: request.prefix.unwrap_or(prefix),
+        };
+        check_origin(&to.endpoint, &to.bucket, &to.prefix)?;
+        let secret = self.registry.secret(name)?;
+        let verified = self.probed(&ProbeTarget {
+            endpoint: &to.endpoint,
+            region: &info.region,
+            access_key_id: &info.access_key_id,
+            secret: &secret,
+            bucket: &to.bucket,
+            prefix: &to.prefix,
+            conditional_put: info.conditional_put,
+            min_put_rate: info.min_put_rate,
+        })?;
+        let (written, from) = self
+            .registry
+            .repoint(name, &to, request.expect_generation)?;
+        Ok((
+            StatusCode::OK,
+            RepointAnswer {
+                name: name.clone(),
+                generation: written.generation,
+                changed: written.outcome != AuditOutcome::Unchanged,
+                from,
+                to,
                 verified,
             },
         ))

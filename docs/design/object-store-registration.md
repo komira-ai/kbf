@@ -50,7 +50,8 @@ Related: [operator-verbs.md](operator-verbs.md) (every operator verb and its rou
 7. Keys are held in memory on the node. A node restarted while the frontend is down serves its
    hot tier only and retries.
 8. v1 has no hot credential swap. Rotation reaches a running node at its next start.
-9. The store identity `(endpoint, bucket, prefix)` is immutable once bound.
+9. The store identity `(endpoint, bucket, prefix)` cannot change through a connection or a
+   binding write once bound; only the deliberate `:repoint` call moves it (section 19).
 10. This reads as "the frontend pushes" in effect, though no connection is opened from the
     frontend to a node. A `Watch` stream may be added later as a latency optimisation.
 
@@ -115,7 +116,7 @@ Each is an engineering default pending the owner; the question is in section 14.
 | D4 | The frontend log route is cut from this work. | Q4 |
 | D5 | Out of scope: update policy, image pull (no source verb exists), meta-backup (an installer and root verb), CA rotation (its own unit). | Q5 |
 | D6 | The secret file is host-local, readable by every frontend of the host, with versioned names. No writer baton and no `not_writer`. One token, loopback gate, no operator and admin split. | Q6 |
-| D7 | Store identity is immutable after the first bind; moving stores is a later migration verb. | Q7 |
+| D7 | Store identity is immutable after the first bind, except through `:repoint` (section 19). | Q7 |
 | D8 | A node with a `--cold-store` flag keeps running on it and reports `identity_mismatch` if the registered identity differs. | Q8 |
 
 ## 5. The control API
@@ -390,8 +391,7 @@ proxy. Until answered, the operator documentation says not to forward it.
 - **Q6 Token and proxy.** Default: the secret file is host-local and every frontend of the host reads
   it; the one-token loopback gate stays. May the installer's proxy carry secret-bearing routes
   (section 13)? Multiple hosts need a shared secret store (#966 section 14.8), still open.
-- **Q7 Immutable identity.** Moving to a different store is then a migration with no verb.
-  Acceptable for now?
+- **Q7 Immutable identity.** Moving to a different store is `:repoint` (section 19).
 - **Q8 Flag precedence.** Default: D8. Confirm.
 
 ## 15. Held steps (the owner's, never a change's)
@@ -470,3 +470,45 @@ lives in the handlers.
 - **Schema.** Rows in the existing store only; see the schema rule in section 6.
 - **Identity.** One "who is calling" function, whose source may be the proxy (section 7).
 - **No state migration:** a fresh Postgres. **A second update is rejected while one runs.**
+
+## 19. Re-point
+
+`POST /v1/object-stores/connections/{name}:repoint` (`kbf cluster object-store repoint`)
+moves the store the role `cold` names. It is the only call that does: a connection `PUT` that
+names another endpoint, and a binding `PUT` that names another bucket or prefix, still answer
+409 `identity_change`, and an unbind still answers 409 `in_use` once a node has applied the
+binding.
+
+- **Request.** `{endpoint, bucket?, prefix?, expect_generation}`. Bucket and prefix keep the
+  binding's current values when absent (an empty prefix given is an empty prefix).
+  `expect_generation` is required: a repoint decided on a stale reading is refused with 409
+  `generation_mismatch`. There is no `verify` field and no `--no-verify`: a repoint is always
+  probed.
+- **Which connection.** The one the `cold` binding names. A connection that exists but is not
+  the bound one answers 409 `not_bound`; one that does not exist answers 404
+  `no_such_connection`.
+- **Order.** Check the new endpoint, bucket and prefix as `bind` does; probe the new identity
+  with the connection's registered key and its region, `conditional_put` and `min_put_rate`;
+  only then write. A failed probe answers 422 `probe_failed` with the steps and writes nothing.
+  The key is the connection's: kbf signs with the one registered key whichever endpoint is
+  registered, so a repoint carries no credential.
+- **The write** is one state-store transaction that compare-and-sets `objstore/gen`, replaces
+  the connection row's endpoint and the binding row's bucket and prefix, stamps both with the
+  new generation, and appends the audit row. A lost race is 409 `conflict`, as for every write.
+  The secret file is untouched. A repoint to the identity already registered writes only an
+  `unchanged` audit row and leaves the generation.
+- **Audit.** The row's action is `repoint`, its subject the connection name, and its `detail`
+  is `<old endpoint> <old bucket>/<old prefix> -> <new endpoint> <new bucket>/<new prefix>`,
+  with the generation the repoint made. No credential is in it. (A frontend of the previous
+  version reading that row does not know the action and answers `corrupt_rows` to the audit
+  list until it is replaced; every other read is unaffected.)
+- **Who follows.** Only a node that takes its store from the registration (`--cold-store
+  registered`) moves, at its next start: a running node keeps the store it opened and reports
+  `pending` for the new generation, as it does for any change. A node that names a store URL
+  on its own is unaffected beyond what it does today: it keeps running on its flag and reports
+  `identity_mismatch` against the new registration, and a node with no keys of its own refuses
+  to start on it. A repoint therefore changes nothing for such a node and is not a way to
+  move it.
+- **Unbind afterwards.** The binding's `updated_generation` is the repoint's, so nodes that
+  applied an earlier generation do not count as using it until they restart onto the new
+  store.
