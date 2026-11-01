@@ -206,7 +206,7 @@ it once its leases end: a `WholeMachine` lease, an `owns_worker` action, or a
    (a lease holds the host), so it covers the whole-machine and owner-worker kinds, with
    the demand the whole worker. The partial-capacity start time of a `Blocked::Load` head
    reads the admission charge model, which only `js-sched` has; that part stays in
-   `js-sched` (3.4) and takes the clamp and the overdue floor from the same `tail()` rule.
+   `js-sched` (3.4) and takes the clamp and the unknown-last rule from the same `tail()`.
 2. **Reserve** the worker with the least tail among those that could hold the request.
    The pick is made again every round with no stickiness: ties go to the lower name, so a
    steady state does not flap. A reservation moves when another worker's tail becomes the
@@ -226,21 +226,29 @@ it once its leases end: a `WholeMachine` lease, an `owns_worker` action, or a
 What is common to both choices (and is the first step, 3.6): **the tail rule is written
 once, in `js_whole::cost`**, as pure functions, and both engines' ranking reads it.
 
-- `HostLoad` gains the estimated end of each lease beside its declared end bound. `HostLoad` is
-  a `pub` struct that derives `PartialEq, Eq` and is built by struct literal at
-  `crates/js-registry/src/registry/start.rs:44` and `crates/js-sched/src/scheduler/whole.rs:310`, so
-  step 1 edits both call sites (to set the new field empty), though neither engine reads it yet.
-- `tail()` of a host is the latest remaining time over its leases, each as
-  `max(min(estimated end, enforced end) - now, margin)` (3.3): an estimate is clamped to
-  the lease's max-wall bound, an unknown estimate falls back to the bound, and a lease
-  with no bound is unknown (3.5).
-- `drain_cost` sorts by tail, then fewest leases, then name. `tail()` and `fits_in_tail` take
-  `margin` and `ceiling` as arguments (3.3, 3.5), not as scheduler settings; the callers pass them.
-- `DrainCost` carries the tail's end (`tail_end`, absolute time) **[proposed]**, added in step 1 (3.6), so that a mark can
-  store it when it is made (3.6, the tail-record item).
-- `fits_in_tail(candidate estimated end, host tail, now)` is the backfill test (rule 3 of
-  3.1): true only when the candidate's estimated end is no later than the host's start
-  time.
+The shape below is the first implementation step as built (jobscheduler PR #597, head
+`e01545ff4635f34ee234ebb1d6aa60ab832406ba`; line numbers are `crates/js-whole/src/cost.rs` there).
+
+- **[code]** `HostLoad` gains `est_ends: Vec<Option<u64>>`, in the order of `end_bounds`
+  (`cost.rs:18`); an empty list, `None`, or an entry past the end is a lease with no estimate.
+  `HostLoad` is a `pub` struct that derives `PartialEq, Eq` and is built by struct literal at
+  `crates/js-registry/src/registry/start.rs:44` and `crates/js-sched/src/scheduler/whole.rs:310`
+  (at `e23a2b4c`), so step 1 edits both call sites to pass `Vec::new()`; neither engine reads it yet.
+- **[code]** `tail(load: &HostLoad) -> Option<u64>` (`cost.rs:83`) is the host's tail as an absolute
+  time: the latest over its leases of each lease's end, where a lease's end is its estimate cut to
+  its max-wall bound, else the bound, else unknown (`lease_end`, `cost.rs:67`). A host with no
+  lease has tail zero; `None` when some lease has neither an estimate nor a bound. It takes no
+  `now`, no `margin` and no `ceiling`.
+- **[code]** `DrainCost.tail_end: Option<u64>` (`cost.rs:32`) carries it, and
+  `wait_ms = tail_end.unwrap_or(u64::MAX).saturating_sub(now)` (`cost.rs:48`).
+  `drain_cost` sorts by (tail unknown last, `wait_ms`, leases, id) (`cost.rs:54-57`).
+- **[code]** `fits_in_tail(now, estimated_duration: Option<u64>, tail_end: Option<u64>, margin: u64)`
+  (`cost.rs:95-106`) is `now + duration + margin <= tail_end` with saturating sums, and fails
+  closed when the duration or the tail is unknown. The margin is applied only here;
+  `DEFAULT_BACKFILL_MARGIN_MS` is one minute (`cost.rs:63`).
+- **[proposed]** A reservation takes the tail once, when it sets the mark, and keeps that value
+  (the doc comment at `cost.rs:81-82`): work admitted later cannot extend it. The mark stores
+  `tail_end` (the tail-record item, 3.6).
 
 Who calls it, and who feeds the estimates, is open: the maintainers decide, and this note gives a lean. Neither choice changes the rule.
 
@@ -284,16 +292,17 @@ submission's `max_wall` to the js core). No kbf scheduling code, under either pa
   same-QoS work. A steady higher-QoS stream still starves it; that is decision 4.3. We
   accept both and test both (3.7 e and f). Applying rule 3 to work ahead needs last
   round's reservation as an input to the walk; not built (decision 4.9).
-- **Overdue leases.** `drain_cost` reads a lease past its end as zero remaining
-  (`saturating_sub`, `cost.rs:39`), so a still-busy worker would look empty, become the least-tail pick,
-  and close backfill. A lease's **remaining time** is
-  `max(min(estimated end, enforced end) - now, margin)`: the cap at the enforced end never
-  takes it below `margin`, because a lease past its enforced end still holds the worker
-  until the next lease tick releases it. `margin` is supplied to `tail()` by the caller (js-sched keeps it as a setting, default one minute). Per core: js-lease releases a lease
-  past its wall at its next tick; the embedded core has no tick, and there the floor
-  holds until the kbf action timeout ends the lease. A learned estimate that proves too short
-  therefore keeps the worker from looking free. This rule is part of `tail()` in
-  `js_whole::cost` (3.2), so both engines have it.
+- **Overdue leases.** `wait_ms` saturates at zero (`cost.rs:48`, as `cost.rs:39` did), so a lease
+  past its end reads zero remaining and a host whose only lease is overdue ranks as free. That is
+  how step 1 is built, and it is a weaker rule than the one this note first proposed (a
+  floor of `margin` on each lease's remaining time, so a still-busy worker never looks free). What
+  stays: `fits_in_tail` keeps `margin` between backfilled work and the tail's end (`cost.rs:104`), and
+  the tail is taken at the mark and kept. Whether the pick also needs the floor is **[verify]**: an
+  overdue lease past its enforced end still holds the worker until the next lease tick
+  (js-lease) or, in the embedded core, until the kbf action timeout ends it. If the red run
+  (tests (g), (p)) shows a mark landing on a host that is not in fact free, the floor is added to the
+  pick as its own change, in the engine that has the tick. The kind of the enforced end (per core)
+  is as in 3.5.
 
 ### 3.4 Mapping onto the code that exists
 
@@ -370,8 +379,10 @@ how long the curve is charged is not read; the js-sched step reads it first.
   lease is its declared `max_wall`. A bound above `ceiling` is **refused for backfill**
   (treated as unknown; a clamped bound would not be enforced, and its overrun would run
   to the real timeout), and a lease with no declared bound is unknown. For the pick,
-  unknown counts as `ceiling`; for backfill, unknown is refused. In `js_whole::cost` an
-  estimate is also clamped to its lease's bound (3.2). `ceiling` is supplied to `tail()` by the caller; in js-sched it is **new
+  an unknown tail ranks last (`cost.rs:55`); for backfill, unknown is refused (`fits_in_tail`
+  fails closed, `cost.rs:101-105`). In `js_whole::cost` an estimate is also cut to its lease's
+  bound (`cost.rs:67-73`). The wall `ceiling` above which a bound is refused for backfill is not a
+  parameter of `tail()`; it is applied by the caller, which treats such a bound as no bound. In js-sched it is **new
   configuration**, fed by kbf (js-sched does not depend on js-lease, and
   the embedded farm has no lease table). On the lease server the wall ceiling already
   exists (`server.max_lease_wall`, refused above, `crates/js-lease-server/src/lib.rs:94`) and the
@@ -409,30 +420,30 @@ how long the curve is charged is not read; the js-sched step reads it first.
 
 **The first step is common to both paths and is the first implementation step.**
 
-1. **`js-whole`: the tail rule, alone.** `crates/js-whole/src/cost.rs`: estimated ends on
-   `HostLoad`, `tail()` with the max-wall clamp and the unknown fallback and the overdue
-   floor (3.2, 3.3), `drain_cost` sorted by tail, and `fits_in_tail`. `margin` and `ceiling`
-   are arguments of `tail()`. Pure functions with
-   unit tests, red first: two hosts, A with the longer max wall and the shorter estimated
-   tail, B the reverse, and `drain_cost` must put A first (red today: `cost.rs:38` ranks by
-   the bound). **This step keeps today's values for input with no
-   estimate:** both call sites pass `margin = 0` (an overdue lease reads zero remaining, `cost.rs:39`) and
-   `ceiling = u64::MAX` (an unbounded lease ends at `u64::MAX`, `whole.rs:289`), so every ranking equals
-   today's. Three tests in `cost.rs`: (i) an unbounded case, which the existing tests lack: host A with a `u64::MAX` end
-   bound and host B with a finite one; B ranks first and A's `wait_ms` is `u64::MAX - now`.
-   (ii) An equivalence test, which is a **characterization test**: it runs every existing
-   case through `drain_cost`-by-tail with `(0, u64::MAX)` and requires output identical to the current
-   function, `DrainCost.wait_ms` included. It is green on today's code once it compiles, so its red is the compile
-   failure until `tail()` exists; what it catches afterwards is a default other than `0` / `u64::MAX` (a
-   `margin` of 1 turns the overdue case into a tie broken by lease count). (iii) `DrainCost` gains `tail_end` (the absolute
-   end of the tail, `now + wait_ms`, saturating) in this step, with a test of its value; `DrainCost` is a `pub`
-   struct deriving `PartialEq, Eq` (`cost.rs:19-26`) with one construction site, `cost.rs:33`, so no other
-   crate's literal changes. The deliberate
-   changes, a `margin` floor above zero and an unknown bound counted as the real ceiling, arrive with
-   the step that passes real values (step 2 for the registry, the `js-sched` step for the embedded core),
-   tied to tests (g) and (d). The existing goldens (the hosts-API field and the D55 record rows; D55, W6
-   and W14 are decisions in jobscheduler `docs/design/whole-node.md`) are unchanged: nothing is written
-   or exported by this step. Neither engine reads the new field yet, but both call sites are edited.
+1. **`js-whole`: the tail rule, alone** (as built, 3.2). `crates/js-whole/src/cost.rs`:
+   `HostLoad.est_ends`, `tail()`, `DrainCost.tail_end`, `drain_cost` sorted by tail, and
+   `fits_in_tail`; both `HostLoad` call sites pass `Vec::new()`. Pure functions with unit tests,
+   red first: two hosts, A with the longer max wall and the shorter estimated tail, B the
+   reverse, and `drain_cost` must put A first (red before the change: `cost.rs:38` at
+   `e23a2b4c` ranks by the bound). **This step keeps today's order for input with no
+   estimate**, and the other tests are:
+   - an unbounded case (the existing tests lack one): host A with a `u64::MAX` end bound and host
+     B with a finite one; B ranks first and A's `wait_ms` is `u64::MAX - now`; two unbounded
+     hosts order by leases, then id;
+   - an estimate past the bound is cut to the bound; `tail()` of a host with no lease is zero;
+   - `fits_in_tail` fits up to the tail's end less the margin and not a millisecond more, never
+     fits an unknown duration or an unknown tail, and its sum saturates;
+   - a **characterization test** against the pre-change `drain_cost` as an oracle: the old function
+     is copied into the test module, every existing case (and the no-estimate and all-`None`
+     variants) runs through both, and the output must be identical, `wait_ms` included.
+     It is green on the old logic once it compiles, so its red is the compile failure until the new fields
+     exist; afterwards it catches any change to the order or the wait of input with no estimate.
+   The existing goldens (the hosts-API field and the D55 record rows; D55, W6 and W14 are
+   decisions in jobscheduler `docs/design/whole-node.md`) are unchanged: nothing is written or
+   exported by this step. Neither engine reads the new field yet, but both call sites are
+   edited. The weaker overdue rule (3.3) and the `ceiling` handling arrive with the step that passes real
+   values (step 2 for the registry, the `js-sched` step for the embedded core), tied to tests (g)
+   and (d).
 
 **The steps after this depend on the choice of path (3.2), which the maintainers make.**
 
@@ -440,10 +451,9 @@ how long the curve is charged is not read; the js-sched step reads it first.
 
 2. **The lease server feeds estimates, behind a flag.** From `NodeUsage`'s `ProfileStore`
    (2.4) into `HostFacts.load` in `Registry::host_facts` (`start.rs:24`), the declared
-   bound as the fallback; flag off keeps today's pick, and passes the step-1 values. A lease's estimate is its
+   bound as the fallback; flag off keeps today's pick, and passes no estimates (as step 1). A lease's estimate is its
    start plus the largest `wall_minutes_p90` of its keyed runs (2.4); it is unknown until a keyed
-   run exists, so a host record keeps a started-at beside `bound` [proposed]. With the flag on the real
-   `margin` and `ceiling` are passed. Red first: A has the longer max wall
+   run exists, so a host record keeps a started-at beside `bound` [proposed]. With the flag on the estimates and the backfill `margin` are passed. Red first: A has the longer max wall
    and the shorter estimated tail, and the mark must land on A.
 3. **The backfill gate (optional; only if a pool shape books several leases per host).**
    `reserve::may_start` (`reserve.rs:245`) replaces the arm `(Some(_), _, _) | (None, true, Some(_)) => false`
