@@ -888,6 +888,28 @@ offline against the bundle released beside it
 too). The release's `SHA256SUMS` lists each asset's SHA-256, but is not itself attested:
 the attestation is the check.
 
+## The seed build: plain cargo on GitHub-hosted runners
+
+Every file a release ships is built by the three platform jobs of `artifacts.yml`
+(`darwin-arm64`, `linux-x86_64`, `linux-arm64`) with plain `cargo build --locked --release`
+on GitHub-hosted runners: no Buck2 or Bazel, no kbf farm address, no remote execution or
+remote cache, no rustc wrapper. This is the seed build, and it stays when kbf builds kbf.
+A kbf release built only on a kbf farm could be rebuilt only while that farm works; a kbf
+that broke the farm, or a release that rolls one back, would then need the thing that is
+broken. The seed build needs nothing of kbf's, so a broken kbf is always rebuilt without
+kbf, and the next release that fixes it can always be cut, signed and published. A build
+on kbf may run beside the seed build, never instead of it: the files the release attests
+and publishes are the seed jobs' (their `assets-<platform>` artifacts), the sums the attest
+jobs hold the files to need them, and the pipeline's success, which starts the release,
+needs them too.
+
+The lint `crates/kbf-integration-test/tests/seed_build` holds the workflows to this: it
+fails when a seed job is removed, moved to a runner that is not GitHub-hosted, given Buck2,
+a farm address, a remote-execution flag or a cargo build that is not plain, or no longer
+builds each binary its platform ships with plain cargo in a step that always runs, when another
+job of the pipeline's run uploads an assets artifact, or when the release's verify and
+publish stop needing the seed jobs.
+
 ## How a node's deployment verifies an asset (planned)
 
 No deployment job exists yet. When it does, it is to verify each asset before it

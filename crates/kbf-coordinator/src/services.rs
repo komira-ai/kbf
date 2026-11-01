@@ -61,6 +61,12 @@ const MAX_FILE_BYTES: u64 = 1 << 20;
 /// kbf's shipped definition, in the format of a services file.
 const KBF_SERVICES: &str = include_str!("kbf.services.toml");
 
+/// tierstore's definition, in the format of a services file: the entry an operator appends to
+/// the file named by `--services-file` to have the coordinator roll tierstore
+/// (`docs/deploy/kbf-updater.md`, "tierstore as a service"). It is not in force unless the
+/// file says so.
+pub const TIERSTORE_SERVICES: &str = include_str!("tierstore.services.toml");
+
 /// What one role of a service is allowed and required to do.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RoleDef {

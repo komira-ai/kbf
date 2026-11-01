@@ -353,17 +353,48 @@ impl Update<'_> {
     /// The node's health for `target`, held drained, until it is healthy, abandoned, or
     /// `bound` is out.
     fn wait_healthy(&self, target: &Version, bound: Duration) -> Health {
-        let start = self.ports.clock.now();
-        loop {
-            let seen = match self.ports.health.check_held(self.host, target) {
-                Ok(Health::Waiting(why)) => Health::Waiting(why),
-                Ok(done) => return done,
-                Err(e) => Health::Waiting(e.to_string()),
-            };
-            if self.ports.clock.now().saturating_sub(start) >= bound {
-                return seen;
-            }
-            self.ports.clock.sleep(self.timing.health_poll);
+        wait_healthy(
+            self.ports.health,
+            self.ports.clock,
+            self.host,
+            target,
+            Waits {
+                bound,
+                poll: self.timing.health_poll,
+            },
+        )
+    }
+}
+
+/// How long [`wait_healthy`] looks, and how often.
+#[derive(Clone, Copy)]
+pub struct Waits {
+    /// It gives up (with the last thing it saw) when this much time has gone.
+    pub bound: Duration,
+    /// Between two looks.
+    pub poll: Duration,
+}
+
+/// The node's health for `target`, held drained, until it is healthy, abandoned, or the bound
+/// is out. An error of the check is waited out like a "not yet", and is what comes back if it
+/// is the last thing seen. The update and the update hook both wait this way.
+pub fn wait_healthy(
+    health: &dyn HealthCheck,
+    clock: &dyn Clock,
+    host: &Host,
+    target: &Version,
+    waits: Waits,
+) -> Health {
+    let start = clock.now();
+    loop {
+        let seen = match health.check_held(host, target) {
+            Ok(Health::Waiting(why)) => Health::Waiting(why),
+            Ok(done) => return done,
+            Err(e) => Health::Waiting(e.to_string()),
+        };
+        if clock.now().saturating_sub(start) >= waits.bound {
+            return seen;
         }
+        clock.sleep(waits.poll);
     }
 }

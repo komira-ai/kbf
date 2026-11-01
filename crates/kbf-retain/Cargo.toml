@@ -1,0 +1,24 @@
+[package]
+name = "kbf-retain"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# Which releases a host keeps, and `retain.json`, the file that says what must stay besides the
+# links: the rule and the file, shared by the installer (Linux) and the helper on both
+# platforms. A commit id is here too, so neither side needs the other to name a release. It
+# depends on nothing of the workspace, so the helper's Mac build links nothing more than this.
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+kbf-host = { workspace = true, features = ["testkit"] }
+
+[lints]
+workspace = true

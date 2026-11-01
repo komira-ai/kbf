@@ -41,7 +41,9 @@ A store URI is `file:///absolute/path` or `s3://bucket/prefix?endpoint=http://ho
   overwrite a key, as MinIO and RustFS do) and `min-put-rate=` (the slowest rate in
   bytes a second a PUT body may reach the store at, default 1 MiB/s; a PUT is cut after
   60 s plus its body's length at that rate). The prefix is the path, `kbf/` when there
-  is none. The key pair is in the JSON file `--cold-store-credentials-file` names
+  is none. A storage node may instead be given the word `registered`: it names no store and
+  runs on the one the frontend registers (`kbf cluster object-store`), with the registered
+  keys. Otherwise the key pair is in the JSON file `--cold-store-credentials-file` names
   (`{"access_key_id": ..., "secret_access_key": ...}`, mode 0600 or 0400, not a link), never in
   the URI. `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` in the environment still work when
   there is no file, deprecated: the start logs a warning and a later release refuses them.

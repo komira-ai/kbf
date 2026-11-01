@@ -71,6 +71,12 @@ slow-timeout = { period = "30s", terminate-after = 4 }
 filter = 'package(kbf-daemon) & binary(cache)'
 slow-timeout = { period = "30s", terminate-after = 4 }
 
+# Hang guard for the step runner's tests that wait on a socket peer or a thread: no test asserts
+# how long it takes, and a test that waits for something that never comes is stopped and fails.
+[[profile.default.overrides]]
+filter = 'package(kbf-step-runner)'
+slow-timeout = { period = "60s", terminate-after = 2 }
+
 # The janitor tests wait on the janitor's own counters, never on a deadline in the test: the loop
 # test on its paused clock until the third sweep, the frontend test on `GET /metrics` until the
 # orphans are counted as deleted. A janitor that never sweeps would leave one waiting for ever, and
@@ -159,3 +165,9 @@ not (
 # Kept as an artifact of the full run so the slow list above can be regenerated from it.
 [profile.default.junit]
 path = "junit.xml"
+
+# The registration client waits for the updater's answer with a deadline it is given: a test that
+# waits for ever on a peer that never answers is stopped after a minute and fails.
+[[profile.default.overrides]]
+filter = 'package(update-register)'
+slow-timeout = { period = "30s", terminate-after = 2 }

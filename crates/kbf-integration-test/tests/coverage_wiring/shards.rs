@@ -41,11 +41,12 @@ const SHARD: &str = "test-shard";
 const GATE: &str = "test";
 const LINT: &str = "lint";
 /// The cores, and what a core's `args` must hold.
-/// The least `min_free_gb` of a core: its measured disk use (legacy about 67 GB: the build 59,
-/// the store floor 7.5; js about 50) and a margin.
+/// The least `min_free_gb` of a core: its measured disk use (legacy about 26 GB, js about 21,
+/// of the build without debug info, the tests' files and profiles), the store's floor (7.5) and
+/// a margin.
 const CORES: [(&str, &str, usize); 2] = [
-    ("legacy", "--workspace", 75),
-    ("js", "--features kbf-server/farm-core-js", 55),
+    ("legacy", "--workspace", 40),
+    ("js", "--features kbf-server/farm-core-js", 35),
 ];
 /// The directory a shard merges its raw profiles in, and the `test` job merges the shards'
 /// merged profiles into: the one `llvm-cov report` reads.

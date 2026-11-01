@@ -1702,6 +1702,7 @@ dependencies = [
  "kbf-transfer",
  "kbf-types",
  "kbf-unitfile",
+ "kbf-updater",
  "postgres",
  "prost",
  "rcgen",
@@ -2153,6 +2154,7 @@ dependencies = [
  "kbf-host",
  "kbf-installer",
  "kbf-oidc",
+ "kbf-retain",
  "kbf-testkit",
  "kbf-types",
  "kbf-update",
@@ -2167,6 +2169,7 @@ dependencies = [
  "thiserror",
  "time",
  "toml",
+ "update-rights",
 ]
 
 [[package]]
@@ -2210,6 +2213,7 @@ dependencies = [
  "kbf-pack-index",
  "kbf-proto",
  "kbf-proxy",
+ "kbf-retain",
  "kbf-setup",
  "kbf-state",
  "kbf-testkit",
@@ -2649,6 +2653,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-retain"
+version = "0.1.0"
+dependencies = [
+ "kbf-host",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "kbf-route"
 version = "0.1.0"
 dependencies = [
@@ -2783,6 +2797,7 @@ dependencies = [
  "kbf-host",
  "kbf-pack-index",
  "kbf-proxy",
+ "kbf-retain",
  "kbf-state",
  "kbf-testkit",
  "postgres",
@@ -2858,6 +2873,19 @@ dependencies = [
  "sha2 0.11.0",
  "thiserror",
  "toml",
+]
+
+[[package]]
+name = "kbf-step-runner"
+version = "0.1.0"
+dependencies = [
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror",
+ "update-hook",
+ "update-register",
 ]
 
 [[package]]
@@ -3085,6 +3113,7 @@ dependencies = [
  "kbf-host-install",
  "kbf-peer",
  "kbf-proto",
+ "kbf-retain",
  "kbf-testkit",
  "kbf-types",
  "libc",
@@ -3094,6 +3123,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "update-hook",
 ]
 
 [[package]]
@@ -5257,6 +5287,29 @@ dependencies = [
  "serde_json",
  "thiserror",
  "toml",
+]
+
+[[package]]
+name = "update-register"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "update-rights"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "libc",
+ "rustix",
+ "serde",
+ "sha2 0.11.0",
+ "thiserror",
+ "toml",
+ "update-hook",
+ "update-rights",
 ]
 
 [[package]]

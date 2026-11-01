@@ -90,6 +90,7 @@ All answer 404 when the feature is off.
 | show a connection | `GET /v1/object-stores/connections/{name}` | [N] | full |
 | delete a connection | `DELETE /v1/object-stores/connections/{name}` | [N] | full |
 | probe a connection | `POST /v1/object-stores/connections/{name}:verify` | [N] | full |
+| move the bound store | `POST /v1/object-stores/connections/{name}:repoint` | [N] | full |
 | bind a role | `PUT /v1/object-stores/bindings/{role}` | [N] | full |
 | unbind a role | `DELETE /v1/object-stores/bindings/{role}` | [N] | full |
 | desired state and convergence | `GET /v1/object-stores` | [N] (convergence from unit D) | full |

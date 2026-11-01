@@ -3,8 +3,9 @@
 //! (`docs/deploy/kbf-updater.md`, "Turn on the deploy step").
 //!
 //! `--service NAME` (default `kbf`) names the service the deploy is about. For `kbf` the
-//! requests are exactly those below. For another service the POST body also carries
-//! `"service": NAME`, and every convergence read is `GET /v1/convergence?service=NAME`, so
+//! requests are exactly those below. For another service the POST body is the version and
+//! `"service": NAME` (the `min_up` keys are kbf's; that service's minimums are its definition's),
+//! the coordinator's commit is not compared with the version, and every convergence read is `GET /v1/convergence?service=NAME`, so
 //! the wait is on that service's own hosts and desired state. `--version` is then that
 //! service's own version text, as its hosts report it: the coordinator compares the text, so
 //! only `kbf`'s form (`<semver>+g<commit12>`) is checked here.
@@ -178,10 +179,11 @@ pub struct Args {
     /// Seconds between two reads.
     #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=3600))]
     pub every_secs: u64,
-    /// The storage hosts that must stay up while others update.
+    /// The storage hosts that must stay up while others update. `kbf` only: another service's
+    /// minimums are in its definition, and none is sent.
     #[arg(long, default_value_t = 1)]
     pub min_up_storage: u32,
-    /// The frontends that must stay up while others update.
+    /// The frontends that must stay up while others update. `kbf` only, as above.
     #[arg(long, default_value_t = 1)]
     pub min_up_frontend: u32,
     /// Fail before anything is changed when the coordinator runs another commit than the
@@ -473,16 +475,29 @@ pub fn deploy_on(
     };
     let read_path = plan.convergence_path();
     let first = Read::of(&client.send_retrying(out, READ_BASELINE, &read_path, None, plan)?)?;
-    check_coordinator(plan, first.commit.as_deref(), out)?;
+    if plan.service == KBF {
+        check_coordinator(plan, first.commit.as_deref(), out)?;
+    } else {
+        log(
+            out,
+            &format!(
+                "not checking the coordinator's commit against {}: its version is not a kbf commit",
+                plan.service
+            ),
+        )?;
+    }
     let baseline = first.live();
     log(out, &baseline_line(&baseline))?;
-    let mut body = json!({
-        "version": plan.version,
-        "min_up": {"storage": plan.min_up_storage, "frontend": plan.min_up_frontend},
-    });
-    if plan.service != KBF {
-        body["service"] = json!(plan.service);
-    }
+    // The `min_up` keys are kbf's contract with CI; any other service's minimums are its
+    // definition's, so it is sent none (the coordinator would drop the keys its roles lack).
+    let body = if plan.service == KBF {
+        json!({
+            "version": plan.version,
+            "min_up": {"storage": plan.min_up_storage, "frontend": plan.min_up_frontend},
+        })
+    } else {
+        json!({"version": plan.version, "service": plan.service})
+    };
     client.send_retrying(out, SET_DESIRED, DESIRED_PATH, Some(&body), plan)?;
     log(out, &format!("desired version {} set", plan.version))?;
 

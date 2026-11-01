@@ -108,13 +108,15 @@ pub(crate) fn cold_s3_store(
 
 impl Args {
     /// Refuses `--cold-store-credentials-file` with a cold store that is not `s3://`: a
-    /// directory has no keys, so the flag would do nothing.
+    /// directory has no keys, so the flag would do nothing, and a `registered` store gets its
+    /// keys from the registration, so the file would be a second place they come from.
     ///
     /// # Errors
-    /// [`ConfigError::ColdKeyFileOnFileStore`].
+    /// [`ConfigError::ColdKeyFileOnFileStore`], [`ConfigError::ColdKeyFileOnRegistered`].
     pub(crate) fn check_cold_key_file(&self) -> Result<(), ConfigError> {
         match (&self.cold_store_credentials_file, &self.cold_store) {
             (Some(_), Some(StoreUri::File(_))) => Err(ConfigError::ColdKeyFileOnFileStore),
+            (Some(_), Some(StoreUri::Registered)) => Err(ConfigError::ColdKeyFileOnRegistered),
             _ => Ok(()),
         }
     }

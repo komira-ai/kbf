@@ -9,7 +9,7 @@ const LEGACY_ARGS: &str = "--workspace";
 const JS_ARGS: &str = "-p kbf-server --features kbf-server/farm-core-js";
 
 fn entry(core: &str, part: usize, parts: usize, args: &str) -> String {
-    let gb = if core == "js" { 55 } else { 75 };
+    let gb = if core == "js" { 35 } else { 40 };
     entry_with_disk(core, part, parts, args, &gb.to_string())
 }
 
@@ -417,20 +417,20 @@ fn a_shard_with_too_little_disk_is_refused() {
     let js_gb = |gb: &str| entry_with_disk("js", 1, 1, JS_ARGS, gb);
     let cases = [
         (
-            with(l1("74"), js.clone()),
-            "a `legacy` entry says `min_free_gb: 74`, under the 75",
+            with(l1("39"), js.clone()),
+            "a `legacy` entry says `min_free_gb: 39`, under the 40",
         ),
         (
-            with(l1("60"), js.clone()),
-            "a `legacy` entry says `min_free_gb: 60`, under the 75",
+            with(l1("30"), js.clone()),
+            "a `legacy` entry says `min_free_gb: 30`, under the 40",
         ),
         (
-            with(l1("75"), js_gb("54")),
-            "a `js` entry says `min_free_gb: 54`, under the 55",
+            with(l1("40"), js_gb("34")),
+            "a `js` entry says `min_free_gb: 34`, under the 35",
         ),
         (
-            with(l1("75"), js_gb("40")),
-            "a `js` entry says `min_free_gb: 40`, under the 55",
+            with(l1("40"), js_gb("20")),
+            "a `js` entry says `min_free_gb: 20`, under the 35",
         ),
         (
             with(l1("lots"), js.clone()),
@@ -438,7 +438,7 @@ fn a_shard_with_too_little_disk_is_refused() {
         ),
         (
             with(
-                l1("75").replace("            min_free_gb: 75\n", ""),
+                l1("40").replace("            min_free_gb: 40\n", ""),
                 js.clone(),
             ),
             "a `legacy` entry has no numeric `min_free_gb`",
@@ -452,7 +452,7 @@ fn a_shard_with_too_little_disk_is_refused() {
         );
     }
     // The measured numbers and more pass.
-    assert_eq!(shard_wiring(&with(l1("75"), js_gb("55"))), Ok(()));
+    assert_eq!(shard_wiring(&with(l1("40"), js_gb("35"))), Ok(()));
     assert_eq!(shard_wiring(&with(l1("120"), js_gb("90"))), Ok(()));
 }
 
