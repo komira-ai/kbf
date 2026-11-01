@@ -12,7 +12,7 @@ use kbf_updater::wire::{Answer, Heartbeat, ServiceReply};
 use serde::Serialize;
 use subtle::ConstantTimeEq;
 
-use crate::acks::{clear_bad, ordered};
+use crate::acks::{clear_bad, release_ack};
 use crate::converge::{Convergence, RoleCounts, converge_kbf, converge_service, role_counts};
 use crate::decide::{Decision, Hold, decide_marked};
 use crate::desired::{Desired, DesiredError, DesiredStore, KBF, StoreError};
@@ -365,8 +365,11 @@ impl Coordinator {
                 now,
             );
             if let Decision::Update { version } = decision {
+                // The host's ack goes from the file before the order exists.
+                if !release_ack(&self.ops, name, &who.node_id) {
+                    continue;
+                }
                 fleet.order(name, who.node_id.clone(), version.clone(), now);
-                ordered(&self.ops, name, &who.node_id);
                 return ServiceReply::Update {
                     service: (name != KBF).then(|| name.to_owned()),
                     version,

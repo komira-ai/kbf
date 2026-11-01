@@ -134,30 +134,6 @@ pub fn plan(
     changes
 }
 
-/// The numbers a version starts with (`0.1.10+g0123456789ab-8` is 0, 1, 10), without trailing
-/// zeros: a `Version` has no order of its own, and a floor needs one. A build suffix is
-/// ignored.
-fn release_numbers(version: &Version) -> Vec<u64> {
-    let text = version.as_str();
-    let end = text
-        .find(|c: char| !c.is_ascii_digit() && c != '.')
-        .unwrap_or(text.len());
-    let mut numbers: Vec<u64> = text[..end]
-        .split('.')
-        .filter(|part| !part.is_empty())
-        .map(|part| part.parse().unwrap_or(u64::MAX))
-        .collect();
-    while numbers.last() == Some(&0) {
-        numbers.pop();
-    }
-    numbers
-}
-
-/// Whether `version` is `floor` or later, by [`release_numbers`].
-fn at_least(version: &Version, floor: &Version) -> bool {
-    release_numbers(version) >= release_numbers(floor)
-}
-
 fn decide(
     def: &ServiceDef,
     want: &Desired,
@@ -184,7 +160,10 @@ fn decide(
     if settled && !recorded && !marked {
         return vec![Change::LastGood(wanted.clone())];
     }
-    let floored = def.min_version.as_ref() == Some(wanted);
+    let floored = def
+        .min_version
+        .as_ref()
+        .is_some_and(|floor| floor.same_release(wanted));
     if floored {
         return older.map(|_| Change::ClearLastGood).into_iter().collect();
     }
@@ -193,7 +172,7 @@ fn decide(
     };
     let failed = live()
         .filter(|(_, h)| is_release_failure(h, wanted))
-        .filter(|(id, _)| !is_acked(marks, id, wanted))
+        .filter(|(id, h)| !is_acked(marks, id, h))
         .count();
     if !marked && failed < def.rollback_after_failed.hosts(live().count()) {
         return Vec::new();
@@ -206,7 +185,7 @@ fn decide(
     if def
         .min_version
         .as_ref()
-        .is_none_or(|floor| at_least(back, floor))
+        .is_none_or(|floor| back.at_least(floor))
     {
         changes.push(Change::RollBackTo(back.clone()));
     }
@@ -281,7 +260,7 @@ fn apply(
         }
         Change::DropAck(node) => {
             let why = format!("{node} reports something else now");
-            drop_ack(ops, service, &node, why)?;
+            drop_ack(ops, service, &node, why, Write::AfterMemory)?;
         }
     }
     Ok(())

@@ -122,24 +122,42 @@ impl Version {
 }
 
 impl Version {
-    /// The numbers the version starts with.
+    /// The numbers the version starts with: its leading digits and dots, split at the dots,
+    /// without trailing zeros (`0.1.10+g0123456789ab-8` is 0, 1, 10 and `2.0.0` is 2).
+    /// Whatever follows them, a build suffix (`+g<sha>-<run>`), a Debian revision (`-1`) or a
+    /// pre-release (`~rc1`), is no part of the numbers and does not order. A number over
+    /// `u64::MAX` saturates to it.
+    ///
+    /// This is the one order of versions: the agent and the coordinator both use it, so they
+    /// cannot order two versions differently.
     #[must_use]
     pub fn release_numbers(&self) -> Vec<u64> {
-        Vec::new()
+        let end = self
+            .0
+            .find(|c: char| !c.is_ascii_digit() && c != '.')
+            .unwrap_or(self.0.len());
+        let mut numbers: Vec<u64> = self.0[..end]
+            .split('.')
+            .filter(|part| !part.is_empty())
+            .map(|part| part.parse().unwrap_or(u64::MAX))
+            .collect();
+        while numbers.last() == Some(&0) {
+            numbers.pop();
+        }
+        numbers
     }
 
-    /// Whether the version is `floor` or later.
+    /// Whether the version is `floor` or a later release, by [`Self::release_numbers`].
     #[must_use]
     pub fn at_least(&self, floor: &Version) -> bool {
-        let _ = floor;
-        true
+        self.release_numbers() >= floor.release_numbers()
     }
 
-    /// Whether the two versions are the same release.
+    /// Whether the two versions are the same release, by [`Self::release_numbers`]: the
+    /// numbers are equal, whatever their suffixes.
     #[must_use]
     pub fn same_release(&self, other: &Version) -> bool {
-        let _ = other;
-        true
+        self.release_numbers() == other.release_numbers()
     }
 }
 
