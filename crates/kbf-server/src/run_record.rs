@@ -8,7 +8,6 @@ mod recording;
 #[cfg(test)]
 mod recording_tests;
 
-#[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use recording::Recording;
 
 use std::time::SystemTime;

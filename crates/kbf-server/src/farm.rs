@@ -79,7 +79,6 @@ mod nodes;
 mod pack_reads;
 mod pack_writes;
 mod phase;
-mod record;
 mod report;
 pub mod sched_view;
 mod side;
@@ -840,7 +839,7 @@ impl Dispatch for Farm {
         );
         if let Some((call, shape)) = submission.call.take().zip(shape) {
             let call = call.with_shape(shape).with_evidence(submission.evidence);
-            state.side.record_submit(call, &name, operation, joined);
+            state.side.recording.submit(call, &name, operation, joined);
         }
         let (stage, receiver) = watch::channel(Stage::Queued);
         state.side.stages.insert(waiter, stage);
