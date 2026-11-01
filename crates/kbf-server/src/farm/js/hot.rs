@@ -22,7 +22,7 @@ use tonic::Status;
 
 use super::{JsFarm, wall_minute};
 use crate::farm::{Outbound, Reported, StreamId};
-use crate::farm_js::dispatch::Ran;
+use crate::farm_js::dispatch::{Ran, Took};
 use crate::farm_js::host::{Connection, stream_number};
 use crate::farm_js::{Wall, dispatch, write_learned};
 use crate::learned::LearnedSizes;
@@ -183,8 +183,24 @@ pub(crate) async fn report(
     .ok()
     .flatten();
     // A result the core took is a run the usage side follows to its worker's next beat.
-    if let Some((Ran { action, clean }, usage)) = ran.zip(js.usage.as_ref()) {
-        usage.accepted(worker, lease, action, clean, wall_minute(js.ambient));
+    if let Some((
+        Ran {
+            action,
+            clean,
+            took,
+        },
+        usage,
+    )) = ran.zip(js.usage.as_ref())
+    {
+        match took {
+            Took::Accepted => {
+                usage.accepted(worker, lease, action, clean, wall_minute(js.ambient));
+            }
+            // Its run is not followed: a held result is acknowledged by the core later,
+            // where nothing tells the usage side, so it is counted and not learned.
+            Took::Held => usage.not_taken(false),
+            Took::Dropped => usage.not_taken(true),
+        }
     }
     // The summaries a kill changed are written now, after the core has let go of its lock.
     if js.settings.learned != LearnedSizes::Off {

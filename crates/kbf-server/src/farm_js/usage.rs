@@ -23,16 +23,21 @@
 //! handover ([`Usage::drop_all`]). A run that never had an accepted result (a lease given up,
 //! a refused operation) was never bound.
 //!
-//! **Order.** The profile name of an action is read from the [`ShapeIndex`] when the hub reads
-//! the result, so the entry is removed after the beat that carried the result, never when the
-//! result is accepted. Two operations of one action in flight share the entry: the first to
-//! finish removes it, and the other's result then has no key (counted by the hub as a run
-//! without a key) until the action is submitted again.
+//! **Profile names.** The profile name of an action is read from the [`ShapeIndex`] when the
+//! hub reads the result, one or two beats after the result was accepted. The entry is not
+//! removed when a run ends: the rerun of a killed run, and a second run of the action while
+//! the first's result waits for a beat, need it, and nothing re-inserts it (an operation is
+//! named when it is enrolled or taken up, not when its lease is rerun). The index's own cap
+//! (oldest first) bounds it.
 //!
 //! **Never in the lock.** The hub blocks on the store, so it is called from the farm's own
 //! tasks ([`hot`](crate::farm::js::hot)) after the core's calls returned, on the blocking
-//! pool. A panic in the hub is caught and counted as a fault; a beat or a result is never
-//! refused because of usage.
+//! pool. A panic in the hub is caught and counted as a fault, and usage cannot change the
+//! answer to a beat or a result. The heartbeat's answer is given after the usage work of that
+//! beat is done, not before: beats of a worker must reach the hub in order (its recorder
+//! drops a reading whose sequence is not above the last, and a run's grace is counted in
+//! beats), and the tests have no clock to wait on. The cost is one store write on a beat that
+//! reads a run that ended.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -72,7 +77,6 @@ fn run_id(lease: LeaseId) -> String {
 struct Waiting {
     lease: js_types::LeaseId,
     run_id: String,
-    action: ActionKey,
     finish: Finish,
     /// The wall minute it was accepted at.
     minute: u64,
@@ -123,7 +127,7 @@ impl UsageStats {
             (
                 "kbf_usage_runs_without_key_total",
                 "counter",
-                "Clean runs whose action had no profile name",
+                "Clean runs whose action had no profile name (unclean runs are not counted)",
                 counters.runs_without_key,
             ),
             (
@@ -187,6 +191,12 @@ impl UsageStats {
                 "# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {value}"
             );
         }
+        let name = "kbf_usage_results_not_taken_total";
+        let _ = writeln!(
+            out,
+            "# HELP {name} Results the core took whose record the store had not written (held) or dropped over its cap, whose runs are not learned\n# TYPE {name} counter\n{name}{{reason=\"held\"}} {}\n{name}{{reason=\"dropped\"}} {}",
+            self.results_held, self.results_dropped
+        );
     }
 }
 
@@ -202,6 +212,8 @@ pub(crate) struct Usage {
     /// The wall minute from which [`Usage::tick`] runs again.
     next_tick: AtomicU64,
     ticks: AtomicU64,
+    results_held: AtomicU64,
+    results_dropped: AtomicU64,
 }
 
 impl Usage {
@@ -239,6 +251,8 @@ impl Usage {
             waiting: Mutex::default(),
             next_tick: AtomicU64::new(0),
             ticks: AtomicU64::new(0),
+            results_held: AtomicU64::new(0),
+            results_dropped: AtomicU64::new(0),
         })
     }
 
@@ -279,19 +293,35 @@ impl Usage {
         let waiting = Waiting {
             lease: js_types::LeaseId::new(lease.term, lease.seq),
             run_id,
-            action,
             finish,
             minute: now_minute,
         };
         self.lock().entry(worker.clone()).or_default().push(waiting);
     }
 
-    /// The one place a run is forgotten: its key, and the profile name of its action. Called
-    /// once a beat has read its result, or when no beat will.
+    /// Counts a result the core took but whose record the store has not written (`dropped`
+    /// false: held back, to be acknowledged later) or dropped over its cap. Its run is not
+    /// followed: nothing tells the usage side when a held result is finished.
+    pub(crate) fn not_taken(&self, dropped: bool) {
+        let count = if dropped {
+            &self.results_dropped
+        } else {
+            &self.results_held
+        };
+        count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts a fault of the usage work; `false`, for what answers "did it take".
+    fn fault(&self) -> bool {
+        self.hub.note_fault();
+        false
+    }
+
+    /// The one place a run is forgotten: its key. The profile name of its action stays (see
+    /// the [module](self)). Called once a beat has read its result, or when no beat will.
     fn finish_runs(&self, ended: Vec<Waiting>) {
         for run in ended {
             self.keys.forget(&run.run_id);
-            self.shapes.remove(&run.action);
         }
     }
 
@@ -336,7 +366,7 @@ impl Usage {
         }))
         .is_err()
         {
-            self.hub.note_fault();
+            self.fault();
         }
         // After the hub read the results: it asks for their keys in `on_beat`.
         drop(results);
@@ -353,10 +383,12 @@ impl Usage {
         now_minute: u64,
     ) {
         let usage = Arc::clone(self);
-        let _joined = tokio::task::spawn_blocking(move || {
+        let joined = tokio::task::spawn_blocking(move || {
             usage.beat_blocking(&worker, epoch, load.as_ref(), &held, now_minute);
         })
         .await;
+        // A panic the work did not catch itself.
+        let _ = joined.map_err(|_| self.fault());
     }
 
     /// The tick's work at wall minute `now_minute`: the hub's own (a flush every
@@ -369,7 +401,7 @@ impl Usage {
         }))
         .is_err()
         {
-            self.hub.note_fault();
+            self.fault();
         }
         let gone: Vec<Waiting> = {
             let mut waiting = self.lock();
@@ -396,7 +428,8 @@ impl Usage {
         self.next_tick
             .store(now_minute + FLUSH_EVERY_MINUTES, Ordering::Relaxed);
         let usage = Arc::clone(self);
-        let _joined = tokio::task::spawn_blocking(move || usage.tick_blocking(now_minute)).await;
+        let joined = tokio::task::spawn_blocking(move || usage.tick_blocking(now_minute)).await;
+        let _ = joined.map_err(|_| self.fault());
     }
 
     /// The flush at shutdown, whatever the schedule says; whether the store took it.
@@ -404,17 +437,14 @@ impl Usage {
         catch_unwind(AssertUnwindSafe(|| {
             self.hub.finish(now_minute).closed.is_ok()
         }))
-        .unwrap_or_else(|_| {
-            self.hub.note_fault();
-            false
-        })
+        .unwrap_or_else(|_| self.fault())
     }
 
     /// [`Usage::finish_blocking`] on the blocking pool.
     pub(crate) async fn finish(self: &Arc<Self>, now_minute: u64) -> bool {
         let usage = Arc::clone(self);
         let joined = tokio::task::spawn_blocking(move || usage.finish_blocking(now_minute)).await;
-        joined.unwrap_or(false)
+        joined.unwrap_or_else(|_| self.fault())
     }
 
     /// Lets go of every result no beat has read: the farm hands its work over, and the
@@ -439,8 +469,8 @@ impl Usage {
             held_runs: self.keys.len(),
             waiting: self.lock().values().map(Vec::len).sum(),
             ticks: self.ticks.load(Ordering::Relaxed),
-            results_held: 0,
-            results_dropped: 0,
+            results_held: self.results_held.load(Ordering::Relaxed),
+            results_dropped: self.results_dropped.load(Ordering::Relaxed),
         }
     }
 

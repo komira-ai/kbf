@@ -275,10 +275,23 @@ pub(crate) struct Ran {
     /// Whether the run ended on its own (it completed, with any exit code): not killed, lost,
     /// timed out or stored badly.
     pub(crate) clean: bool,
+    /// How the core took the `Result`.
+    pub(crate) took: Took,
 }
 
-/// [`report`], leaving in `ran` what the lease ran and how it ended when the core accepted the
-/// `Result` now (not for a refused one, nor one whose record the store has not taken yet).
+/// How the core took a `Result` it did not refuse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Took {
+    /// Accepted, and its record written or not needed.
+    Accepted,
+    /// Taken, its record not written yet: acknowledged once it is.
+    Held,
+    /// Taken, and its record dropped unwritten over the cap: never acknowledged.
+    Dropped,
+}
+
+/// [`report`], leaving in `ran` what the lease ran, how it ended and how the core took the
+/// `Result` (not for a refused one).
 ///
 /// # Errors
 /// The core's admission refuses the host.
@@ -356,11 +369,33 @@ pub(crate) async fn report_noting(
     // None: the ack is sent when the store has taken the record, or never.
     let (accepted, reason) = match taken {
         Taken::Accepted => {
-            *ran = keyed.map(|action| Ran { action, clean });
+            let took = Took::Accepted;
+            *ran = keyed.map(|action| Ran {
+                action,
+                clean,
+                took,
+            });
             (true, ResultAckReason::Accepted)
         }
         Taken::Refused(reason) => (false, acked(reason)),
-        Taken::Held | Taken::Dropped => return Ok(None),
+        Taken::Held => {
+            let took = Took::Held;
+            *ran = keyed.map(|action| Ran {
+                action,
+                clean,
+                took,
+            });
+            return Ok(None);
+        }
+        Taken::Dropped => {
+            let took = Took::Dropped;
+            *ran = keyed.map(|action| Ran {
+                action,
+                clean,
+                took,
+            });
+            return Ok(None);
+        }
     };
     Ok(Some(ResultAck {
         lease_id: Some(wire_lease(lease)),

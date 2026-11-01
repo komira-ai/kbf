@@ -633,6 +633,8 @@ impl Adapter for KbfAdapter {
             .and_then(|parcel| subject::decode(parcel).ok())
             .unwrap_or_else(|| Subject::of(kbf_front::Described::default()).0);
         let platform = Platform::of(&request.needs);
+        // A row with no parcel has the empty subject, which has no estimator key: it names
+        // no profile and cannot overwrite the entry of a real action.
         self.note_action(&key, &platform, &usage);
         self.machine.insert(
             waiter,
