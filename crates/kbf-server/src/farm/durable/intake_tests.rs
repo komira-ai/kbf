@@ -364,15 +364,18 @@ async fn a_queued_operation_granted_since_the_poll_read_the_queue_is_not_taken_i
 /// Asserts that a daemon whose `Hello` reaches a frontend before the frontend's next poll
 /// still has its lease taken up there, when the frontend took the operation in while it was
 /// queued and another frontend has granted it since: the lease stands in the store for the
-/// node, the new owner holds it, and the daemon's result is accepted and answers the caller.
+/// node, the new owner holds it, and the daemon's result is accepted and answers the caller
+/// waiting on this frontend, once. (The frontend that granted the lease is not told it is
+/// gone, so its own caller is not asserted.)
 #[tokio::test(start_paused = true)]
 async fn a_hello_before_the_poll_takes_up_the_lease_of_an_operation_held_queued() {
     let store = Racing::new();
     let (a, b) = (farm_over(&store), farm_over(&store));
     let node = WorkerId::new("node-a");
-    let ticket = caller(&a, 1);
+    let _ticket = caller(&a, 1);
     b.intake();
     assert_eq!(unfinished(&b).len(), 1, "the operation was not taken in");
+    let on_b = caller(&b, 1);
     let _first = register(&a, "node-a");
     a.tick().await;
     let views = a.lease_views(None);
@@ -386,8 +389,10 @@ async fn a_hello_before_the_poll_takes_up_the_lease_of_an_operation_held_queued(
 
     assert!(ack.is_some_and(|ack| ack.accepted), "{ack:?}");
     assert_eq!(rows(&store, "done/"), 1);
-    a.intake();
-    assert_eq!(done_with(&ticket), "test");
+    assert_eq!(done_with(&on_b), "test");
+    b.intake();
+    assert_eq!(done_with(&on_b), "test", "answered again");
+    assert_eq!(rows(&store, "done/"), 1);
 }
 
 /// Asserts that a daemon's `Hello` to a frontend that gave the node's lease up, whose requeue
