@@ -863,3 +863,34 @@ fn a_download_selector_is_read_as_the_action_reads_it() {
     );
     assert!(found.is_empty(), "{found:#?}");
 }
+
+#[test]
+fn a_seed_upload_of_another_name_case_or_directory_is_refused() {
+    // Catches: a seed upload renamed only in case (`Assets-<job>`, which the attest and
+    // release selectors, case-sensitive, never read), pointed at a directory other than the
+    // packaged release files, or allowed to upload nothing.
+    for job in SEED_JOBS {
+        let name = format!("name: assets-{job}\n");
+        red(
+            &spoil_artifacts(job, &name, &format!("name: Assets-{job}\n")),
+            &format!("the seed job `{job}` does not upload its files as `assets-{job}` (exactly)"),
+        );
+        for to in [
+            "          path: build/\n",
+            "          path: target/release/\n",
+        ] {
+            red(
+                &spoil_artifacts(job, "          path: dist/\n", to),
+                &format!("the seed job `{job}` uploads `assets-{job}` from Some("),
+            );
+        }
+        red(
+            &spoil_artifacts(
+                job,
+                "          if-no-files-found: error\n",
+                "          if-no-files-found: warn\n",
+            ),
+            "without `if-no-files-found: error`",
+        );
+    }
+}

@@ -28,8 +28,9 @@
 //!   (Buck2 or Bazel, a remote-execution or remote-cache flag, a gRPC farm address, another
 //!   rustc or a wrapper of it). Cargo's own configuration files are not read: a change there
 //!   is a change to every build of the repository, reviewed as such.
-//! - **The published files are theirs.** Each seed job uploads its files as the artifact
-//!   `assets-<job>` in an unconditional step, and no other job of `artifacts.yml`, of
+//! - **The published files are theirs.** Each seed job uploads its packaged files (`dist`,
+//!   with `if-no-files-found: error`) as the artifact `assets-<job>`, spelled exactly (the
+//!   readers' selectors are case-sensitive), in an unconditional step, and no other job of `artifacts.yml`, of
 //!   `pipeline.yml` or of a workflow the pipeline calls, at any depth (whose artifacts share
 //!   the pipeline's run), uploads an artifact whose name starts [`ASSETS_PREFIX`], or might (a
 //!   name an expression starts); nor does such a job run a local action or call a workflow
@@ -156,6 +157,10 @@ pub const NOT_PLAIN: &[&str] = &[
     "rustc",
     "sccache",
 ];
+
+/// The directory a seed job packages its release files into (`cargo xtask package dist ...`,
+/// `release_artifacts`' rules), as its upload may name it.
+pub const UPLOAD_PATHS: &[&str] = &["dist", "dist/"];
 
 /// The prefix of the artifacts that carry a release's files.
 pub const ASSETS_PREFIX: &str = "assets-";
@@ -291,12 +296,25 @@ fn seed_job(text: &str, job: &str, out: &mut Vec<String>) -> Result<(), String> 
     let want = format!("{ASSETS_PREFIX}{job}");
     let uploads: Vec<&Step> = steps
         .iter()
-        .filter(|s| is_upload(s) && upload_name(s).eq_ignore_ascii_case(&want))
+        .filter(|s| is_upload(s) && upload_name(s) == want)
         .collect();
-    if !matches!(uploads.as_slice(), [one] if !one.conditional) {
-        out.push(format!(
-            "the seed job `{job}` does not upload its files as `{want}` in one unconditional step"
-        ));
+    match uploads.as_slice() {
+        [one] if !one.conditional => {
+            let path = input(one, "path").map(str::trim);
+            if !matches!(path, Some(p) if UPLOAD_PATHS.contains(&p)) {
+                out.push(format!(
+                    "the seed job `{job}` uploads `{want}` from {path:?}, not the packaged release files in `dist`"
+                ));
+            }
+            if input(one, "if-no-files-found").map(str::trim) != Some("error") {
+                out.push(format!(
+                    "the seed job `{job}` uploads `{want}` without `if-no-files-found: error`: an empty `dist` would pass"
+                ));
+            }
+        }
+        _ => out.push(format!(
+            "the seed job `{job}` does not upload its files as `{want}` (exactly) in one unconditional step"
+        )),
     }
     Ok(())
 }
