@@ -162,7 +162,10 @@ pub fn run(args: &FillArgs) -> Result<(), FillError> {
             ));
         }
         let table = match &args.result_tsv {
-            Some(path) => Some(ResultTsv::parse(&table_name(path), &read(path)?)?),
+            Some(path) => {
+                check_table_dir(path, args.results_dir.as_deref())?;
+                Some(ResultTsv::parse(&table_name(path), &read(path)?)?)
+            }
             None => None,
         };
         let findings = check(&html, &mappings, &results, table.as_ref())?;
@@ -184,6 +187,7 @@ pub fn run(args: &FillArgs) -> Result<(), FillError> {
             "give --result-tsv FILE, the table of rows behind the numbers",
         ));
     };
+    check_table_dir(table_path, args.results_dir.as_deref())?;
     let name = table_name(table_path);
     let mut table = match std::fs::read_to_string(table_path) {
         Ok(text) => ResultTsv::parse(&name, &text)?,
@@ -196,14 +200,10 @@ pub fn run(args: &FillArgs) -> Result<(), FillError> {
         }
     };
     let (text, report) = fill(&html, &mappings, &results, &mut table)?;
-    std::fs::write(table_path, table.render()).map_err(|source| FillError::Io {
-        path: table_path.clone(),
-        source,
-    })?;
-    std::fs::write(target, text).map_err(|source| FillError::Io {
-        path: target.clone(),
-        source,
-    })?;
+    // The paper first: if it cannot be written the table is as it was, and a table with rows no
+    // cell cites is not left behind.
+    write_atomic(target, text.as_bytes())?;
+    write_atomic(table_path, table.render().as_bytes())?;
     println!(
         "fill-paper: {} filled, {} blocked, {} left with a note, {} without a mapping",
         report.filled, report.blocked, report.noted, report.unmapped
@@ -295,8 +295,8 @@ impl ResultTsv {
         self.lines.iter().map(|l| format!("{l}\n")).collect()
     }
 
-    /// Replaces the row with the id of `row` in place, or appends it.
-    fn upsert(&mut self, row: String) {
+    /// Replaces the row with the id of `row` in place, or appends it; returns the id.
+    fn upsert(&mut self, row: String) -> String {
         let id = row.split('\t').nth(1).unwrap_or_default().to_owned();
         let at = self
             .lines
@@ -306,6 +306,26 @@ impl ResultTsv {
             Some(k) => self.lines[k] = row,
             None => self.lines.push(row),
         }
+        id
+    }
+
+    /// Removes the rows of this tool (id `fill:...`) that are not in `produced`: rows of cells
+    /// or metrics the last run did not use. Comments and other rows stay.
+    fn drop_unproduced(&mut self, produced: &BTreeSet<String>) {
+        self.lines.retain(|l| {
+            let id = l.split('\t').nth(1).unwrap_or_default();
+            l.starts_with('#') || !id.starts_with("fill:") || produced.contains(id)
+        });
+    }
+
+    /// The ids of the rows of this tool (`fill:...`).
+    fn fill_row_ids(&self) -> Vec<&str> {
+        self.lines
+            .iter()
+            .filter(|l| !l.starts_with('#'))
+            .filter_map(|l| l.split('\t').nth(1))
+            .filter(|id| id.starts_with("fill:"))
+            .collect()
     }
 
     /// Whether a row names `cell` in its last column.
@@ -317,6 +337,54 @@ impl ResultTsv {
                     .is_some_and(|cells| cells.split(',').any(|c| c.trim() == cell))
         })
     }
+}
+
+/// Refuses a table that is not in the directory the paper's results live in: `data-result` is a
+/// bare name, so a table of the same name elsewhere is another file.
+fn check_table_dir(table: &Path, results_dir: Option<&Path>) -> Result<(), FillError> {
+    let Some(dir) = results_dir else {
+        return Err(FillError::Usage(
+            "give --results-dir DIR, the directory the paper's results (and the table) live in",
+        ));
+    };
+    let parent = table.parent().filter(|p| !p.as_os_str().is_empty());
+    let resolve = |path: &Path| {
+        std::fs::canonicalize(path).map_err(|source| FillError::Io {
+            path: path.to_owned(),
+            source,
+        })
+    };
+    if resolve(parent.unwrap_or(Path::new(".")))? == resolve(dir)? {
+        Ok(())
+    } else {
+        Err(FillError::TsvElsewhere {
+            table: table.to_owned(),
+            dir: dir.to_owned(),
+        })
+    }
+}
+
+/// Writes `bytes` to `path` through a temporary file in the same directory, synced and renamed
+/// over `path`, so a reader sees the old file or the whole new one.
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), FillError> {
+    use std::io::Write;
+    let mut name = std::ffi::OsString::from(".");
+    name.push(path.file_name().unwrap_or_default());
+    name.push(format!(".tmp{}", std::process::id()));
+    let temp = path.with_file_name(name);
+    let written = std::fs::File::create(&temp).and_then(|mut file| {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&temp, path)
+    });
+    if written.is_err() {
+        // Nothing else to do if the temporary file cannot be removed either.
+        let _ = std::fs::remove_file(&temp);
+    }
+    written.map_err(|source| FillError::Io {
+        path: path.to_owned(),
+        source,
+    })
 }
 
 /// The file name of the table at `path`, as `data-result` writes it.
@@ -582,6 +650,12 @@ impl Mapping {
         let mut seen = BTreeSet::new();
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
+            if row.id.contains(['\t', '\n', '\r', ',']) {
+                return Err(FillError::Mapping(format!(
+                    "id {:?} has a tab, line break or comma, which would break a row of the result table",
+                    row.id
+                )));
+            }
             if !seen.insert(row.id.clone()) {
                 return Err(FillError::Mapping(format!("id {:?} is repeated", row.id)));
             }
@@ -984,13 +1058,6 @@ fn is_space(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0c)
 }
 
-fn unescape(raw: &str) -> String {
-    raw.replace("&quot;", "\"")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&amp;", "&")
-}
-
 fn escape(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -1090,7 +1157,7 @@ fn parse_start_tag(html: &str, start: usize) -> Result<StartTag, FillError> {
                 None => return Err(unterminated()),
                 Some(&q) if q == b'"' || q == b'\'' => {
                     let close = html[k + 1..].find(q as char).ok_or_else(unterminated)?;
-                    value = Some(unescape(&html[k + 1..k + 1 + close]));
+                    value = Some(html[k + 1..k + 1 + close].to_owned());
                     end = k + close + 2;
                 }
                 Some(_) => {
@@ -1098,7 +1165,7 @@ fn parse_start_tag(html: &str, start: usize) -> Result<StartTag, FillError> {
                     while k < bytes.len() && !is_space(bytes[k]) && bytes[k] != b'>' {
                         k += 1;
                     }
-                    value = Some(unescape(&html[v..k]));
+                    value = Some(html[v..k].to_owned());
                     end = k;
                 }
             }
@@ -1273,6 +1340,7 @@ pub fn fill(
     let known = by_id(mappings);
     let mut report = FillReport::default();
     let mut edits = Vec::new();
+    let mut produced = BTreeSet::new();
     for ph in placeholders(&tokens) {
         if is_held(ph.tag) {
             report.blocked += 1;
@@ -1285,6 +1353,18 @@ pub fn fill(
         if mapping.blocked {
             report.blocked += 1;
             continue;
+        }
+        // A table this run did not write belongs to whoever filled the cell, whatever the
+        // results hold for it.
+        if let Some(found) = ph.tag.attr("data-result").and_then(|a| a.value.as_deref())
+            && found.ends_with(".tsv")
+            && found != tsv.name()
+        {
+            return Err(FillError::Foreign {
+                cell: ph.id,
+                found: found.to_owned(),
+                ours: tsv.name().to_owned(),
+            });
         }
         let Some((inner_start, inner_end)) = ph.inner else {
             return Err(FillError::Html(format!(
@@ -1299,18 +1379,7 @@ pub fn fill(
                 label,
                 row,
             }) => {
-                // A table this run did not write belongs to whoever filled the cell.
-                if let Some(found) = ph.tag.attr("data-result").and_then(|a| a.value.as_deref())
-                    && found.ends_with(".tsv")
-                    && found != tsv.name()
-                {
-                    return Err(FillError::Foreign {
-                        cell: ph.id,
-                        found: found.to_owned(),
-                        ours: tsv.name().to_owned(),
-                    });
-                }
-                tsv.upsert(row);
+                produced.insert(tsv.upsert(row));
                 let mut set = vec![
                     ("data-source", source),
                     ("data-label", label),
@@ -1344,6 +1413,7 @@ pub fn fill(
             }
         }
     }
+    tsv.drop_unproduced(&produced);
     Ok((apply(html, edits)?, report))
 }
 
@@ -1392,6 +1462,23 @@ pub fn check(
             && !table.names(cell)
         {
             findings.push(format!("{who:?} has no row naming it in {name}"));
+        }
+    }
+    if let Some(table) = tsv {
+        for id in table.fill_row_ids() {
+            // `fill:<cell>:<metric>`; the cell cites the row by its name, table and metric.
+            let (cell, metric) = id["fill:".len()..].rsplit_once(':').unwrap_or_default();
+            let wanted = format!("#{metric}");
+            let cited = tokens.iter().any(|t| {
+                let Token::Open(tag) = t else { return false };
+                let value = |name| tag.attr(name).and_then(|a| a.value.as_deref());
+                value("data-cell") == Some(cell)
+                    && value("data-result") == Some(table.name())
+                    && value("data-source").is_some_and(|s| s.ends_with(&wanted))
+            });
+            if !cited {
+                findings.push(format!("row {id:?} is cited by no cell"));
+            }
         }
     }
     Ok(findings)
@@ -2159,8 +2246,8 @@ derived\tfill:a:p50\t9.99\tms\tstale\ta\nraw\tlast.row\t8\tms\tby hand\n";
     /// row naming it is a finding; a cell citing another table is not ours to look up.
     #[test]
     fn check_follows_data_result_to_the_table() {
-        let html = "<i data-cell=\"a\" data-result=\"r.tsv\">1</i>\
-<i data-cell=\"b\" data-result=\"r.tsv\">2</i>\
+        let html = "<i data-cell=\"a\" data-source=\"x.json#p50\" data-result=\"r.tsv\">1</i>\
+<i data-cell=\"b\" data-source=\"x.json#p50\" data-result=\"r.tsv\">2</i>\
 <i data-cell=\"c\" data-result=\"phase-b.tsv\">3</i>";
         let m = mappings(&format!(
             "[{},{},{}]",
@@ -2226,11 +2313,15 @@ derived\tfill:a:p99\t80.0\tms\tstale\ta\nderived\tfill:gone:p50\t1.00\tms\tstale
     #[test]
     fn check_lists_rows_no_cell_cites() {
         let html = "<i data-cell=\"a\" data-source=\"cold-put-instance-a1.json#p95\" data-result=\"r.tsv\">20.0 ms</i>\
-<i data-cell=\"o\" data-source=\"x.json#p95\" data-result=\"other.tsv\">1</i>";
+<i data-cell=\"o\" data-source=\"cold-put-direct-a1.json#p95\" data-result=\"other.tsv\">1</i>";
         let table = "derived\tfill:a:p95\t20.0\tms\th\ta\nderived\tfill:a:p99\t80.0\tms\th\ta\n\
 derived\tfill:gone:p50\t1.00\tms\th\tgone\nderived\tfill:o:p95\t1\tms\th\to\nraw\tby.hand\t1\tms\th\ta\n";
         let t = ResultTsv::parse("r.tsv", table).unwrap();
-        let m = one("a", "p95", "ms", "instance");
+        let m = mappings(&format!(
+            "[{},{}]",
+            row("a", "p95", "ms", "instance"),
+            row("o", "p95", "ms", "direct")
+        ));
         let findings = super::check(html, &m, &results(), Some(&t)).unwrap();
         let text = findings.join("\n");
         assert!(
