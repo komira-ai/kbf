@@ -300,15 +300,18 @@ impl<B: Backend> Ab<B> {
     /// laid out, else the text it was staged as here. A listing that cannot be read is empty:
     /// the rest of the answer stands.
     fn listed(&self, saved: &Saved) -> (Vec<Kept>, usize, bool) {
-        let Ok(kept) = self.backend.kept() else {
+        let Ok(mut kept) = self.backend.kept() else {
             return (Vec::new(), 0, true);
         };
-        let (mut kept, omitted) = cut(kept, MAX_LISTED);
+        // The versions this program's state knows are filled in first, so the cut that keeps
+        // the listing in its budget sees every entry as it is sent; one whose text was left out
+        // as too long is not filled in again.
         for k in &mut kept {
-            if k.version.is_none() {
+            if k.version.is_none() && !k.version_left_out {
                 k.version = saved.version_of(k.commit.as_str());
             }
         }
+        let (kept, omitted) = cut(kept, MAX_LISTED);
         (kept, omitted, false)
     }
 

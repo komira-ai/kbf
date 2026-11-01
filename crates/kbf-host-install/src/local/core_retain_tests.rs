@@ -619,3 +619,83 @@ fn a_version_recorded_after_the_listing_is_not_replaced_by_the_copy() {
     );
     assert_eq!(file.versions.get(&commit(A)).map(String::as_str), None);
 }
+
+/// Write this program's own state with the version text `versions` gives each commit.
+fn saved_versions(fx: &Fx, versions: &[(String, String)]) {
+    let map: serde_json::Map<String, serde_json::Value> = versions
+        .iter()
+        .map(|(c, v)| (c.clone(), serde_json::Value::String(v.clone())))
+        .collect();
+    let path = fx.dir.join("state.json");
+    fs::write(&path, serde_json::json!({ "versions": map }).to_string()).unwrap();
+    fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+}
+
+/// A version text this program's state knows, filled into an entry the backend lists without
+/// one, is held to the same limit as any other: too long, it is left out and the entry says so.
+///
+/// Catches: the versions filled in after the cut, past the limit of an entry.
+#[test]
+fn a_long_version_from_this_programs_state_is_left_out_of_its_entry() {
+    let (fx, _) = host("ab-fill-long", 4);
+    let long = format!(
+        "0.1.0+g{}-{}",
+        &B[..12],
+        "9".repeat(kbf_retain::MAX_LISTED_VERSION)
+    );
+    saved_versions(&fx, &[(B.to_owned(), long)]);
+    fx.world.borrow_mut().kept = vec![held(B, None), held(A, None)];
+    let view = fx.query();
+    assert_eq!(view.releases[0].version, None);
+    assert!(view.releases[0].version_left_out);
+}
+
+/// The listing stays within its budget with the versions this program's state fills in: many
+/// releases the backend lists without a version, each filled with a long one that is still
+/// short enough to list, make an array no longer than [`crate::local::core::LISTED_BYTES`], and the
+/// count of what is left out says the rest.
+///
+/// Catches: the budget applied before the versions are filled in, which lets the line grow past
+/// it and past what the agent reads.
+#[test]
+fn the_listing_fits_its_budget_after_the_versions_are_filled_in() {
+    let (fx, _) = host("ab-fill-budget", 4);
+    let commits: Vec<String> = (0..64_u32).map(|n| format!("{n:040x}")).collect();
+    let versions: Vec<(String, String)> = commits
+        .iter()
+        .map(|c| {
+            (
+                c.clone(),
+                format!("0.1.0+g{}-{}", &c[..12], "7".repeat(100)),
+            )
+        })
+        .collect();
+    saved_versions(&fx, &versions);
+    fx.world.borrow_mut().kept = commits.iter().map(|c| held(c, None)).collect();
+    let view = fx.query();
+    let array = serde_json::to_string(&view.releases).unwrap();
+    assert!(
+        array.len() <= crate::local::core::LISTED_BYTES,
+        "{} bytes",
+        array.len()
+    );
+    assert!(view.releases.iter().all(|k| k.version.is_some()));
+    assert_eq!(view.releases.len() + view.releases_omitted, 64);
+    assert!(view.releases_omitted > 0);
+}
+
+/// An entry the backend lists with its version left out as too long is not filled in again
+/// from this program's state.
+///
+/// Catches: a version that was left out put back, past the limit it was left out for.
+#[test]
+fn an_entry_whose_version_was_left_out_is_not_filled_in_again() {
+    let (fx, _) = host("ab-fill-left-out", 4);
+    saved_versions(&fx, &[(B.to_owned(), VB.to_owned())]);
+    let mut left_out = held(B, None);
+    left_out.version_left_out = true;
+    fx.world.borrow_mut().kept = vec![left_out, held(A, None)];
+    let view = fx.query();
+    assert_eq!(view.releases[0].version, None);
+    assert!(view.releases[0].version_left_out);
+}
