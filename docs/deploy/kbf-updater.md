@@ -398,8 +398,8 @@ file once at start:
 # (after kbf's own entry if the file replaces it), it makes tierstore a service the
 # coordinator rolls to the hosts of the storage role.
 #
-# Six storage hosts is the farm this is written for: one updates at a time, and the other
-# five must be up. The first host goes alone, and no other starts until it has beaten
+# Six storage hosts is the farm this is written for: one updates at a time, and four of the
+# other five must stay up. The first host goes alone, and no other starts until it has beaten
 # healthy three times at the new version. A release that fails after its commit on two
 # hosts is rolled back by the coordinator to the last version that converged and baked.
 
@@ -416,7 +416,7 @@ roles = ["storage"]
 
 [service.roles.storage]
 max_updating = 1
-min_up = 5
+min_up = 4
 ```
 
 What each value is for, for a farm of six storage hosts:
@@ -424,9 +424,13 @@ What each value is for, for a farm of six storage hosts:
 - `[service.roles.storage]` and `roles = ["storage"]`: tierstore is ordered to hosts of the storage
   role and to no other. A host of another role that lists tierstore is not counted and is never
   ordered it.
-- `max_updating = 1` and `min_up = 5`: one storage host updates at a time and the other five must be
-  up while it does. A storage host that is down, or excluded, therefore holds the roll until it is back or
-  `min_up` is lowered in the file; a farm of fewer than six storage hosts needs a smaller `min_up`.
+- `max_updating = 1` and `min_up = 4`: one storage host updates at a time and four others must be
+  up while it does, so one storage host that is down, drained or excluded does not hold the roll; a
+  second one does, until one is back or `min_up` is lowered in the file. tierstore keeps serving through
+  its hand-over, and the canary, the bake and the automatic rollback still gate each step. A farm of
+  fewer than six storage hosts needs a smaller `min_up`.
+- One service per host updates at a time, but kbf and tierstore may update different hosts at once:
+  kbf restarting on one host while tierstore hands over on another.
 - `canary = { count = 1 }` and `bake_beats = 3`: one host goes alone, and no other starts until it has
   sent three healthy beats at the new version; each host
   after it holds its slot for the same three beats, so the next host starts only once the last one has
@@ -440,7 +444,10 @@ What each value is for, for a farm of six storage hosts:
   ordered it.
 
 The release workflow's CI token needs an allow-list entry with `services = ["tierstore"]` (the
-default is kbf alone). To roll a version, after it is published:
+default is kbf alone): a `[[remote_operator]]` entry in the `--oidc-config` file beside kbf's, for
+`repository = "komira-ai/tierstore"` and `job_workflow_ref` that repository's release workflow on
+`main`, with `event_names = ["workflow_run"]` (see the allow-list above). A token admitted by kbf's
+entry still sets kbf alone. To roll a version, after it is published:
 
 ```text
 cargo xtask deploy-farm --url <coordinator> --service tierstore --version <tierstore's version text>
