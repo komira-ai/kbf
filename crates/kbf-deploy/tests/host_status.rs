@@ -187,18 +187,20 @@ impl Ran {
     }
 }
 
-/// Run `kbf-deploy host-status` with `args`, in an environment that holds nothing.
+/// Run `kbf-deploy host-status` with `args`, in an environment that holds nothing but where
+/// a coverage build writes its profile (a binary without it writes into its working directory).
 fn run(args: &[&str]) -> Ran {
     let argv: Vec<String> = ["host-status"]
         .into_iter()
         .chain(args.iter().copied())
         .map(str::to_owned)
         .collect();
-    let out = Command::new(env!("CARGO_BIN_EXE_kbf-deploy"))
-        .args(&argv)
-        .env_clear()
-        .output()
-        .expect("the binary runs");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_kbf-deploy"));
+    command.args(&argv).env_clear();
+    if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+        command.env("LLVM_PROFILE_FILE", profile);
+    }
+    let out = command.output().expect("the binary runs");
     Ran {
         code: out.status.code(),
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
