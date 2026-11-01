@@ -11,6 +11,7 @@ use kbf_state::StoreError;
 
 use super::blocks_tests::{Racing, farm_over, submit};
 use super::intake_tests::{caller, invalid, register};
+use super::transition_tests::{answer, start};
 use super::*;
 use crate::test_log::capture;
 
@@ -25,6 +26,8 @@ struct Refused {
     dropped_writes: u64,
     /// The farm's `/metrics` lines after the refusal.
     metrics: String,
+    /// The committed records held back, unwritten, after the refusal.
+    held: usize,
 }
 
 impl Refused {
@@ -64,6 +67,7 @@ async fn refused_with(error: StateError) -> Refused {
         lost_races: farm.lost_races(),
         dropped_writes: farm.dropped_writes(),
         metrics,
+        held: farm.lock().engine.unwritten.len(),
     }
 }
 
@@ -164,6 +168,7 @@ async fn an_unreachable_store_keeps_its_error_and_holds_the_record() {
             "{cause}: {}",
             refused.log
         );
+        assert_eq!(refused.held, 1, "{cause}: the record was not held back");
         assert!(!refused.log.contains(RACE), "{cause}: {}", refused.log);
         assert_eq!(
             (refused.dropped_writes, refused.lost_races),
@@ -259,4 +264,37 @@ async fn a_stale_refusal_of_another_write_is_logged_as_before() {
     assert!(error.contains("the write is stale"), "{error}");
     assert!(!log.contains(RACE), "{log}");
     assert_eq!((farm.lost_races(), farm.dropped_writes()), (0, 0));
+}
+
+/// Asserts that the operations a lost race names are those of every effect that has one
+/// (a start, an answer, a refusal, a wait), each once however often the effects repeat it,
+/// in the order first named, and that a committed record names none. Catches a log line
+/// that names nothing or the same operation twice.
+#[test]
+fn the_operations_a_lost_race_names_are_those_of_its_effects() {
+    let grant = LeaseGrant {
+        lease: LeaseId::new(5, 0),
+        operation: OperationId(9),
+        worker: WorkerId::new("node-a"),
+        cost: Default::default(),
+    };
+    let refusal = kbf_types::Refusal {
+        operation: OperationId(4),
+        waiters: Vec::new(),
+        reason: String::new(),
+    };
+    let effects = VecDeque::from([
+        Effect::Commit(ControlRecord::Lease(grant)),
+        Effect::Start(start(7, 0, "node-a")),
+        Effect::Waiting(kbf_types::Waiting {
+            operation: OperationId(3),
+            reason: None,
+        }),
+        Effect::Answer(answer(3, 1)),
+        Effect::Refuse(refusal),
+        Effect::Start(start(7, 1, "node-a")),
+    ]);
+
+    assert_eq!(operations_of(&effects), "op-7,op-3,op-4");
+    assert_eq!(operations_of(&VecDeque::new()), "");
 }
