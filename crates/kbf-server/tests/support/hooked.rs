@@ -146,8 +146,8 @@ fn writes_map(txn: &Txn) -> bool {
         .any(|op| matches!(op, Op::Put { key, .. } if key == "map"))
 }
 
-impl Store for Hooked {
-    fn apply_batch(&self, batch: Vec<Txn>) -> Result<Vec<Result<Commit, Conflict>>, StoreError> {
+impl Hooked {
+    fn apply(&self, batch: Vec<Txn>) -> Result<Vec<Result<Commit, Conflict>>, StoreError> {
         if self
             .fail_txns
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
@@ -179,8 +179,16 @@ impl Store for Hooked {
             }
             answers.push(answer);
         }
-        self.written.notify_waiters();
         Ok(answers)
+    }
+}
+
+impl Store for Hooked {
+    fn apply_batch(&self, batch: Vec<Txn>) -> Result<Vec<Result<Commit, Conflict>>, StoreError> {
+        let answers = self.apply(batch);
+        // Woken whatever the answer: an error can come after earlier txns of the batch landed.
+        self.written.notify_waiters();
+        answers
     }
 
     fn get(&self, key: &str) -> Result<Option<Versioned>, StoreError> {

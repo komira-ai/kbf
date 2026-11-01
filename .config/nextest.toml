@@ -77,6 +77,13 @@ slow-timeout = { period = "30s", terminate-after = 4 }
 filter = 'package(kbf-server) & test(/^frontend::janitor::tests::/)'
 slow-timeout = { period = "30s", terminate-after = 4 }
 
+# The history read tests wait on events (a write asked of the object store, a batch applied to
+# the state store) and hold no timeout of their own: a writer that never writes leaves the test
+# waiting for ever, and it is killed after 120 seconds (30 s x 4) and fails. Above the general budget: the first match wins.
+[[profile.default.overrides]]
+filter = 'binary_id(=kbf-server::history_read)'
+slow-timeout = { period = "30s", terminate-after = 4 }
+
 # The general budget: every other test, of every package, is ended after eight minutes
 # (120 seconds x 4). The slowest of them in the full run on main takes about 240 seconds
 # (kbf-server::frontend, a_frontend_dialing_a_node_with_another_nodes_certificate_is_refused),
@@ -150,10 +157,3 @@ not (
 # Kept as an artifact of the full run so the slow list above can be regenerated from it.
 [profile.default.junit]
 path = "junit.xml"
-
-# The history read tests wait on events (a write asked of the object store, a batch applied to
-# the state store) and hold no timeout of their own: a writer that never writes leaves the test
-# waiting for ever, and it is killed after two minutes and fails.
-[[profile.default.overrides]]
-filter = 'binary_id(=kbf-server::history_read)'
-slow-timeout = { period = "30s", terminate-after = 4 }
