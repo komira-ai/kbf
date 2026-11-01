@@ -347,15 +347,24 @@ reading may show the counter as it was up to 10 s before and charge a pass with 
 requests. Default 10: a quiet store showed none in 30 s; a probe or an operator's listing may
 add a few; a job or a person at work adds far more.
 
-The tool's count can differ from the store's for reasons that are not foreign load: a request
-that never reached the store (a refused connection) is in the tool's count only, which hides
-that many foreign requests (never makes a negative one); a retry the S3 client makes below the
-tool's own code, if it makes one, is in the store's count and not the tool's, which shows as foreign. The
-passes of an instance arm are not judged (the instance copies to the cold store on its own), nor
-are the passes of an arm through the fault proxy, nor the window after either (the copies go
-on); they are recorded. A run with no cold admin key (heal status file mode) has no counter: the
-guard then keeps to the error share and the backstop, and the health reading is the one before
-each pass.
+The tool's count can differ from the store's for reasons that are not foreign load, and neither
+can trip a quiet pass on the tool's own traffic. `objstore-s3` resends a ranged read up to
+`READ_RETRIES` (2) times inside one logged call: a failed attempt that reached the store is in
+its counter and not in the tool's count, so such a read adds up to 2 foreign requests (a few in a
+window; the limit of 10 leaves room). Foreign is the counter's growth less the tool's count,
+floored at 0, so a request of the tool that never reached the store (a refused connection) hides
+one foreign request in its window; it can only hide, never make one.
+
+The instance copies to the cold store on its own, for minutes after an instance arm's pass, and
+the tool reads no signal of when the copies end. So from the first pass that sent a request to
+the instance on, no window of the run is judged for foreign requests; the passes of an arm
+through the fault proxy and the window after one are not judged either. Those windows are
+recorded with `judged` false and the reason in `unjudged_reason` (the drives, healing, the
+counter and the error share are still judged). A missed foreign load is accepted; a trip on the
+run's own instance traffic is not. A run that wants its direct arms judged keeps them in a run
+of their own, without instance arms. A run with no cold admin key (heal status file mode) has no
+counter: the guard then keeps to the error share and the backstop, and the health reading is the
+one before each pass.
 
 *The window.* The error share and the backstop look at the harness's own requests to the cold
 role over a sliding window. Equal to a limit is within it. The window counts one entry per

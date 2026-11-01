@@ -34,10 +34,19 @@
 //!   for one. Fewer requests at the store than the harness sent (a refused connection never
 //!   reaches it) is no foreign load, not a negative one.
 //! - Requests from elsewhere are judged only where the harness can tell them from the
-//!   instance's own: not for a pass whose requests went to another role than the cold one (an
-//!   instance arm: its copies to the cold store are its own), nor for an arm through the fault
-//!   proxy, nor for the window after such a pass (the copies go on). Those windows are recorded
-//!   with `judged` false.
+//!   instance's own. An instance pass (a request to another role than the cold one) makes the
+//!   instance copy to the cold store, for minutes after the pass, and the bench reads no signal
+//!   of when the copies end; so from the first instance pass of a run on, no window is judged.
+//!   An arm through the fault proxy, and the window after it, are not judged either. Those
+//!   windows are recorded with `judged` false and the reason in `unjudged_reason`. A missed
+//!   foreign load is accepted; a trip on the run's own instance traffic is not.
+//! - The count is exact enough that neither of these can trip a quiet pass on its own traffic:
+//!   `objstore-s3` resends a ranged read up to `READ_RETRIES` (2) times inside one logged call,
+//!   and a failed attempt that reached the store is in its counter and not in the bench's count,
+//!   so such a read adds up to 2 foreign requests; and foreign is the store's growth less the
+//!   bench's count, floored at 0, so a bench request that never reached the store hides one
+//!   foreign request in its window. The first can add a few to a window (the limit of 10 leaves
+//!   room); the second can only hide.
 //! - A window with fewer than [`MIN_REQUESTS`] requests trips nothing on the error share or the
 //!   backstop: one failure in two requests is not a share, and the p99 of a handful is the
 //!   slowest of them.
@@ -96,6 +105,13 @@ struct Seen {
     failed: bool,
 }
 
+/// Why the windows from the first instance pass on are not judged.
+const INSTANCE_REASON: &str = "instance copies may be pending: the bench reads no signal of when an instance's copies to the cold store end, so every window from the first instance pass on is recorded and not judged";
+
+/// Why a fault-proxy pass and the window after it are not judged.
+const FAULT_REASON: &str =
+    "fault proxy pass, or the window after one: its requests are not told apart from others";
+
 /// Whose traffic the requests of a pass were, as far as the harness can tell.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Traffic {
@@ -126,6 +142,8 @@ pub struct ColdGuard {
     /// Whether the window that ended at the last reading could be judged; the one after it
     /// cannot be if it could not (an instance's copies go on after its pass).
     prev_judgeable: bool,
+    /// Whether an instance pass has run: from then on no window is judged (see [`Traffic`]).
+    instance_seen: bool,
 }
 
 impl ColdGuard {
@@ -137,6 +155,7 @@ impl ColdGuard {
             window: VecDeque::new(),
             baseline: None,
             prev_judgeable: true,
+            instance_seen: false,
         }
     }
 
@@ -247,7 +266,15 @@ impl ColdGuard {
         let Some(base) = self.baseline.replace(now) else {
             return (None, self.unhealthy(&reading.state));
         };
-        let judged = judgeable && self.prev_judgeable;
+        self.instance_seen |= traffic == Traffic::Instance;
+        let judged = judgeable && self.prev_judgeable && !self.instance_seen;
+        let unjudged_reason = if self.instance_seen {
+            Some(INSTANCE_REASON)
+        } else if judged {
+            None
+        } else {
+            Some(FAULT_REASON)
+        };
         self.prev_judgeable = judgeable;
         let Some(minio_requests) = now.s3_requests.checked_sub(base.s3_requests) else {
             let detail = format!(
@@ -270,7 +297,7 @@ impl ColdGuard {
             drives_not_ok: u32::try_from(drives.iter().filter(|d| d.state != "ok").count())
                 .unwrap_or(u32::MAX),
             healing: reading.state.healing,
-            unjudged_reason: None,
+            unjudged_reason: unjudged_reason.map(str::to_owned),
         };
         let limit = self.limits.max_foreign_requests;
         let trip = self.unhealthy(&reading.state).or_else(|| {
