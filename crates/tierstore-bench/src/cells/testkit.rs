@@ -29,6 +29,15 @@ pub fn calm() -> LoadSample {
 /// A machine over the load limit.
 pub fn busy() -> LoadSample {
     LoadSample {
+        psi_cpu_avg10: 99.0,
+        ..calm()
+    }
+}
+
+/// A machine whose one-minute load average is over the limit and nothing else is: what a run's
+/// own in-flight requests and fsyncs look like to `/proc/loadavg`.
+pub fn loaded() -> LoadSample {
+    LoadSample {
         loadavg_1m: 99.0,
         ..calm()
     }

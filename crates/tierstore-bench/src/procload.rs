@@ -162,6 +162,20 @@ impl Reader {
             disk_util_pct,
         })
     }
+
+    /// The load after a quiet window (stub of the scaffold: reads like [`Reader::read`]).
+    ///
+    /// # Errors
+    /// As [`Reader::read`].
+    pub fn read_quiet(
+        &self,
+        proc_root: &Path,
+        sys_block: &Path,
+        start_ms: u64,
+        _wait: impl FnOnce() -> u64,
+    ) -> Result<LoadSample, BenchError> {
+        self.read(proc_root, sys_block, start_ms)
+    }
 }
 
 #[cfg(test)]
@@ -269,6 +283,96 @@ mod tests {
         machine(&dir, 9_000);
         let third = reader.read(&proc_root, &sys_block, 12_000).unwrap();
         assert_eq!(third.disk_util_pct, 100.0);
+    }
+
+    /// Catches a quiet sample that counts the pass that just ran: the disk was saturated for the
+    /// whole interval before the window began, and idle inside it, so the figure is 0; and the
+    /// next ordinary read measures from the end of the window, not from before the pass.
+    #[test]
+    fn the_busy_time_before_the_quiet_window_is_not_counted() {
+        let dir = TestDir::under(std::env::temp_dir(), "tb-procload-quiet-idle");
+        let (proc_root, sys_block) = machine(&dir, 1_000);
+        let reader = Reader::new();
+        reader.read(&proc_root, &sys_block, 10_000).unwrap();
+        // The pass: the disk was busy for all of the ten seconds it took.
+        machine(&dir, 11_000);
+        let quiet = reader
+            .read_quiet(&proc_root, &sys_block, 20_000, || 21_000)
+            .unwrap();
+        assert_eq!(quiet.disk_util_pct, 0.0);
+        assert_eq!(quiet.loadavg_1m, 0.52);
+        machine(&dir, 11_100);
+        let next = reader.read(&proc_root, &sys_block, 22_000).unwrap();
+        assert_eq!(next.disk_util_pct, 5.0);
+    }
+
+    /// Catches a quiet sample that does not see other work: the disk gets 900 ms of IO during
+    /// the one-second window (the wait is injected, and changes the fake `diskstats`), so the
+    /// figure is 90 and a gate with a 60 limit names `disk_util_pct`.
+    #[test]
+    fn a_busy_quiet_window_trips_the_gate() {
+        let dir = TestDir::under(std::env::temp_dir(), "tb-procload-quiet-busy");
+        let (proc_root, sys_block) = machine(&dir, 1_000);
+        let reader = Reader::new();
+        reader.read(&proc_root, &sys_block, 10_000).unwrap();
+        let quiet = reader
+            .read_quiet(&proc_root, &sys_block, 20_000, || {
+                machine(&dir, 1_900);
+                21_000
+            })
+            .unwrap();
+        assert_eq!(quiet.disk_util_pct, 90.0);
+        let gate = crate::gate::LoadGate {
+            max_loadavg_1m: 8.0,
+            max_psi_cpu_avg10: 10.0,
+            max_psi_io_avg10: 10.0,
+            max_disk_util_pct: 60.0,
+        };
+        assert_eq!(gate.check(&quiet).unwrap_err().metric, "disk_util_pct");
+    }
+
+    /// Catches a quiet sample as the first reading of a reader being measured against nothing:
+    /// the window itself is the interval, so a disk busy in it is seen on the very first call.
+    #[test]
+    fn the_first_reading_may_be_a_quiet_one() {
+        let dir = TestDir::under(std::env::temp_dir(), "tb-procload-quiet-first");
+        let (proc_root, sys_block) = machine(&dir, 0);
+        let quiet = Reader::new()
+            .read_quiet(&proc_root, &sys_block, 0, || {
+                machine(&dir, 500);
+                1_000
+            })
+            .unwrap();
+        assert_eq!(quiet.disk_util_pct, 50.0);
+    }
+
+    /// Catches a quiet sample that reads pressure from the ten-second average: the files say
+    /// 1.5 throughout, the stall total moves 300 ms (cpu) and 50 ms (io) inside the one-second
+    /// window and 4 s before it, so the figures are 30 and 5.
+    #[test]
+    fn pressure_in_a_quiet_window_is_the_stall_over_the_window() {
+        let dir = TestDir::under(std::env::temp_dir(), "tb-procload-quiet-psi");
+        let (proc_root, sys_block) = machine(&dir, 0);
+        let psi = |cpu_us: u64, io_us: u64| {
+            let text = |us: u64| {
+                format!(
+                    "some avg10=1.50 avg60=0.00 avg300=0.00 total={us}\nfull avg10=9.00 avg60=0.00 avg300=0.00 total=1\n"
+                )
+            };
+            write(&proc_root, "pressure/cpu", &text(cpu_us));
+            write(&proc_root, "pressure/io", &text(io_us));
+        };
+        psi(5_000_000, 5_000_000);
+        let reader = Reader::new();
+        reader.read(&proc_root, &sys_block, 10_000).unwrap();
+        psi(9_000_000, 9_000_000);
+        let quiet = reader
+            .read_quiet(&proc_root, &sys_block, 20_000, || {
+                psi(9_300_000, 9_050_000);
+                21_000
+            })
+            .unwrap();
+        assert_eq!((quiet.psi_cpu_avg10, quiet.psi_io_avg10), (30.0, 5.0));
     }
 
     /// Catches a machine without the files being read as calm, and one whose files are not

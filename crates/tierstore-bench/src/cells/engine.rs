@@ -105,6 +105,14 @@ pub trait LoadSource: Send + Sync {
     /// [`BenchError`] if the machine cannot be read; the run stops, since a gate that cannot see
     /// is not a gate.
     fn sample(&self) -> Result<LoadSample, BenchError>;
+    /// The sample before a pass, over a quiet window of its own, so that the pass that just ran
+    /// is not read as the machine's load. A source with no window says [`LoadSource::sample`].
+    ///
+    /// # Errors
+    /// As [`LoadSource::sample`].
+    fn quiet_sample(&self) -> Result<LoadSample, BenchError> {
+        self.sample()
+    }
     /// Milliseconds each whole disk of the machine has spent doing IO so far, by device name;
     /// empty for a source that cannot say.
     ///
@@ -1015,7 +1023,7 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use super::*;
-    use crate::cells::testkit::{self, Script, busy, calm};
+    use crate::cells::testkit::{self, Script, busy, calm, loaded};
 
     fn temp(name: &str) -> kbf_testkit::dir::TestDir {
         kbf_testkit::dir::TestDir::under(std::env::temp_dir(), name)
@@ -1207,14 +1215,17 @@ mod tests {
         assert!(matches!(err, BenchError::Gate(_)), "{err}");
         assert_eq!(
             err.to_string(),
-            "load gate: loadavg_1m is 99, over the limit 8"
+            "load gate: psi_cpu_avg10 is 99, over the limit 10"
         );
         assert!(seen.lock().unwrap().is_empty());
         assert_eq!(csv_rows(dir.path()).len(), 0);
         let written = std::fs::read_to_string(dir.path().join("cold-put-a-a1.json")).unwrap();
         let result = CellResult::from_json(&written).unwrap();
         assert_eq!(result.passes.len(), 1);
-        assert_eq!(result.passes[0].gate_tripped.as_deref(), Some("loadavg_1m"));
+        assert_eq!(
+            result.passes[0].gate_tripped.as_deref(),
+            Some("psi_cpu_avg10")
+        );
         assert_eq!(result.passes[0].window, Window::Busy);
         assert_eq!(result.passes[0].requests, 0);
     }
@@ -1244,7 +1255,7 @@ mod tests {
         assert!(matches!(err, BenchError::Gate(_)), "{err}");
         assert_eq!(
             err.to_string(),
-            "load gate: loadavg_1m is 99, over the limit 8"
+            "load gate: psi_cpu_avg10 is 99, over the limit 10"
         );
         let written = std::fs::read_to_string(dir.path().join("cold-put-a-a1.json")).unwrap();
         let result = CellResult::from_json(&written).unwrap();
@@ -1255,6 +1266,83 @@ mod tests {
         assert_eq!(pass.window, Window::Busy);
         assert_eq!(after_ran.load(Ordering::SeqCst), 1);
         assert!(csv_rows(dir.path()).iter().all(|r| r[6] == "busy"));
+    }
+
+    /// A machine whose reading during a pass (`sample`) and whose reading in the quiet window
+    /// before one (`quiet_sample`) are scripted apart.
+    struct Split {
+        during: Arc<Script>,
+        quiet: LoadSample,
+    }
+
+    impl LoadSource for Split {
+        fn sample(&self) -> Result<LoadSample, BenchError> {
+            self.during.sample()
+        }
+
+        fn quiet_sample(&self) -> Result<LoadSample, BenchError> {
+            Ok(self.quiet)
+        }
+    }
+
+    fn disk_hot() -> LoadSample {
+        LoadSample {
+            disk_util_pct: 100.0,
+            ..calm()
+        }
+    }
+
+    /// Catches a pass refused for the disk time of the pass before it: the reading over the
+    /// interval since the last one is hot, the quiet window is idle, and the pass runs.
+    #[tokio::test]
+    async fn the_gate_before_a_pass_reads_the_quiet_window_not_the_last_pass() {
+        let dir = temp("tb-engine-gate-quiet-idle");
+        let load = Arc::new(Split {
+            during: Script::of(vec![Some(disk_hot())]),
+            quiet: calm(),
+        });
+        let env = env(dir.path(), Window::Quiet, load);
+        let seen = Arc::new(Mutex::new(vec![]));
+        run_cell(&env, CellId::ColdPut, vec![arm("a", 4, 2, &seen)], 1, None)
+            .await
+            .unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 4);
+    }
+
+    /// Catches a gate before a pass that ignores other work: a hot quiet window sends nothing
+    /// and names the disk.
+    #[tokio::test]
+    async fn a_busy_quiet_window_before_a_pass_sends_nothing_and_names_the_disk() {
+        let dir = temp("tb-engine-gate-quiet-busy");
+        let load = Arc::new(Split {
+            during: Script::calm(),
+            quiet: disk_hot(),
+        });
+        let env = env(dir.path(), Window::Quiet, load);
+        let seen = Arc::new(Mutex::new(vec![]));
+        let err = run_cell(&env, CellId::ColdPut, vec![arm("a", 4, 2, &seen)], 1, None)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "load gate: disk_util_pct is 100, over the limit 60"
+        );
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    /// Catches the one-minute load average stopping a run: it carries the run's own in-flight
+    /// requests and fsyncs for a minute, so a reading of 99 before and during a pass is not a
+    /// reason to refuse or cut it.
+    #[tokio::test]
+    async fn the_load_average_does_not_stop_a_run_between_or_inside_passes() {
+        let dir = temp("tb-engine-gate-loadavg");
+        let load = Script::of(vec![Some(loaded()); 8]);
+        let env = env(dir.path(), Window::Quiet, load);
+        let seen = Arc::new(Mutex::new(vec![]));
+        run_cell(&env, CellId::ColdPut, vec![arm("a", 4, 2, &seen)], 2, None)
+            .await
+            .unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 8);
     }
 
     /// Catches a gate that cannot be read being taken for a calm machine.

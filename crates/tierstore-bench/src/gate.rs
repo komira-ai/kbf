@@ -84,6 +84,17 @@ impl LoadGate {
     }
 }
 
+impl LoadGate {
+    /// As [`LoadGate::check`] for the gate a run holds between and inside passes (stub of the
+    /// scaffold: it checks everything).
+    ///
+    /// # Errors
+    /// [`Trip`], naming the measure.
+    pub fn check_run(&self, sample: &LoadSample) -> Result<(), Trip> {
+        self.check(sample)
+    }
+}
+
 impl LoadSample {
     /// Reads the sample from `/proc/loadavg`, `/proc/pressure/{cpu,io}` and `/proc/diskstats`
     /// (utilisation over the interval since the previous call of this process).
@@ -171,6 +182,43 @@ mod tests {
             assert_eq!(trip.metric, metric);
             assert!(trip.value > trip.limit);
             assert!(trip.to_string().contains(metric));
+        }
+    }
+
+    /// Catches the load average judged by the gate of a run: it alone over its limit passes
+    /// there and trips in [`LoadGate::check`] (the preflight's), and the other three still trip.
+    #[test]
+    fn the_gate_of_a_run_does_not_judge_the_load_average() {
+        let loaded = LoadSample {
+            loadavg_1m: 99.0,
+            ..calm()
+        };
+        assert_eq!(GATE.check(&loaded).unwrap_err().metric, "loadavg_1m");
+        assert_eq!(GATE.check_run(&loaded), Ok(()));
+        for (metric, sample) in [
+            (
+                "psi_cpu_avg10",
+                LoadSample {
+                    psi_cpu_avg10: 11.0,
+                    ..loaded
+                },
+            ),
+            (
+                "psi_io_avg10",
+                LoadSample {
+                    psi_io_avg10: 11.0,
+                    ..loaded
+                },
+            ),
+            (
+                "disk_util_pct",
+                LoadSample {
+                    disk_util_pct: 61.0,
+                    ..loaded
+                },
+            ),
+        ] {
+            assert_eq!(GATE.check_run(&sample).unwrap_err().metric, metric);
         }
     }
 
