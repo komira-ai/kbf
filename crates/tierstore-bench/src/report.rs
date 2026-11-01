@@ -471,6 +471,18 @@ fn recorded_lines(name: &str, result: &CellResult) -> Vec<String> {
             each.join("; ")
         ));
     }
+    for pass in &measured {
+        if let Some(bytes) = pass
+            .pass_load
+            .filter(|load| !load.writeback_settled)
+            .and_then(|load| load.writeback_pending_bytes)
+        {
+            lines.push(format!(
+                "- arm {name}: pass {} was measured on unsettled writeback: {bytes} bytes were still dirty or being written when the wait for the disks gave up",
+                pass.pass
+            ));
+        }
+    }
     let peak = measured.iter().map(|p| p.peak_in_flight).max().unwrap_or(0);
     if peak > 0 {
         lines.push(format!(
@@ -651,6 +663,7 @@ mod tests {
             proxy_requests: None,
             disk_busy: BTreeMap::new(),
             peak_in_flight: 0,
+            pass_load: None,
         }
     }
 
@@ -1307,6 +1320,7 @@ mod tests {
                 },
             )]),
             peak_in_flight: peak,
+            pass_load: None,
             ..pass(index, Window::Quiet, 10, None)
         };
         let r = result(
@@ -1323,6 +1337,40 @@ mod tests {
             text.contains("- arm x: most requests in flight in a measured pass: 3"),
             "{text}"
         );
+    }
+
+    /// Catches a measurement taken on unsettled writeback going unmentioned: each measured pass
+    /// that opened its window with the wait at its cap is named with the bytes pending, a pass
+    /// that drained or has no record is not, and the warm-up is left out.
+    #[test]
+    fn a_pass_measured_on_unsettled_writeback_is_named() {
+        let with = |index: u32, settled: bool, bytes: Option<u64>| PassResult {
+            pass_load: Some(crate::result::PassLoad {
+                readings: 1,
+                peak_psi_cpu_pct: 0.0,
+                peak_psi_io_pct: 0.0,
+                peak_disk_util_pct: 0.0,
+                writeback_settled: settled,
+                writeback_pending_bytes: bytes,
+            }),
+            ..pass(index, Window::Quiet, 10, None)
+        };
+        let r = result(
+            "x",
+            vec![
+                with(0, false, Some(1)),
+                with(1, true, None),
+                with(2, false, Some(5_120_000)),
+                pass(3, Window::Quiet, 10, None),
+            ],
+            &[],
+        );
+        let text = format_report(&[r], &Rows::new());
+        assert!(
+            text.contains("- arm x: pass 2 was measured on unsettled writeback: 5120000 bytes were still dirty or being written when the wait for the disks gave up"),
+            "{text}"
+        );
+        assert_eq!(text.matches("unsettled writeback").count(), 1, "{text}");
     }
 
     /// Catches a table of a cell that hides the rate cap its requests waited at: the caps of the

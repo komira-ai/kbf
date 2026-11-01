@@ -47,14 +47,17 @@ const CORES: [(&str, &str, usize); 2] = [
     ("legacy", "--workspace", 75),
     ("js", "--features kbf-server/farm-core-js", 55),
 ];
-/// The directory `llvm-cov report` merges every `*.profraw` of.
+/// The directory a shard merges its raw profiles in, and the `test` job merges the shards'
+/// merged profiles into: the one `llvm-cov report` reads.
 const PROFILES: &str = "target/llvm-cov-target";
+/// Where `test` downloads the shards' merged profiles (a few MB each, not the raw GB).
+const DOWNLOADS: &str = "target/shard-profdata";
 /// What the shards name their artifacts, and the gate downloads.
-const ARTIFACT: &str = "profraw-${{ matrix.core }}-${{ matrix.part }}";
+const ARTIFACT: &str = "profdata-${{ matrix.core }}-${{ matrix.part }}";
 /// The text of a shard job's name that tells it from the others, and the whole name.
 const JOB_KEY: &str = "(${{ matrix.core }}-${{ matrix.part }}-of-${{ matrix.parts }})";
 const JOB_NAME: &str = "test-shard (${{ matrix.core }}-${{ matrix.part }}-of-${{ matrix.parts }})";
-const PATTERN: &str = "profraw-*";
+const PATTERN: &str = "profdata-*";
 /// What a shard's profile file names begin with.
 const FILE_PREFIX: &str = "kbf-${{ matrix.core }}-${{ matrix.part }}-";
 
@@ -256,6 +259,41 @@ pub fn shard_wiring(workflow: &str) -> Result<(), String> {
             "the test step of `{SHARD}` has an `if:` or `continue-on-error`, so a shard could pass without running its tests"
         ));
     }
+    let merge_at = steps.iter().position(|s| {
+        s.run
+            .as_deref()
+            .is_some_and(|r| r.contains("xtask merge-profiles"))
+    });
+    let Some(merge_at) = merge_at else {
+        return Err(format!(
+            "the job `{SHARD}` has no step `cargo xtask merge-profiles` that merges its raw profiles, so the raw profiles (GB) would be what `test` downloads"
+        ));
+    };
+    let merge = &steps[merge_at];
+    let merge_text = merge.run.as_deref().unwrap_or_default();
+    if merge.conditional {
+        return Err(format!(
+            "the merge step of `{SHARD}` has an `if:` or `continue-on-error`, so a shard could upload without its profiles merged"
+        ));
+    }
+    // Text, not words: the prefix and the name hold `${{ matrix.<key> }}`, which has spaces.
+    let wants = [
+        format!("--dir {PROFILES} "),
+        "--extension profraw ".to_owned(),
+        format!("--prefix {FILE_PREFIX} "),
+        format!("--out {PROFILES}/{FILE_PREFIX}merged.profdata"),
+    ];
+    if wants.iter().any(|w| !merge_text.contains(w.as_str())) {
+        return Err(format!(
+            "the merge step of `{SHARD}` must merge the shard's own `{FILE_PREFIX}*.profraw` files of `{PROFILES}` into `{PROFILES}/{FILE_PREFIX}merged.profdata`"
+        ));
+    }
+    let tests_at = steps.iter().position(|s| std::ptr::eq(s, run));
+    if merge_at + 1 >= steps.len() || tests_at.is_none_or(|t| merge_at < t) {
+        return Err(format!(
+            "the merge step of `{SHARD}` does not come after the tests and before the upload"
+        ));
+    }
     let last = steps.last().ok_or("the shard job has no steps")?;
     let uploads = last
         .uses
@@ -270,10 +308,10 @@ pub fn shard_wiring(workflow: &str) -> Result<(), String> {
         return Err(format!("the upload step's `name` is not `{ARTIFACT}`"));
     }
     if !input(last, "path").is_some_and(|p| {
-        p.starts_with(&format!("{PROFILES}/{FILE_PREFIX}")) && p.ends_with(".profraw")
+        p.starts_with(&format!("{PROFILES}/{FILE_PREFIX}")) && p.ends_with(".profdata")
     }) {
         return Err(format!(
-            "the upload step's `path` is not the shard's own profiles, `{PROFILES}/{FILE_PREFIX}*.profraw`"
+            "the upload step's `path` is not the shard's own merged profile, `{PROFILES}/{FILE_PREFIX}merged.profdata`"
         ));
     }
     if input(last, "overwrite") != Some("true") {
@@ -346,6 +384,9 @@ pub fn gate_wiring(workflow: &str) -> Result<(), String> {
     let complete = find(&|s| run(s).contains("xtask profiles-complete")).ok_or_else(|| {
         format!("the job `{GATE}` has no step running `cargo xtask profiles-complete`")
     })?;
+    let merge = find(&|s| run(s).contains("xtask merge-profiles")).ok_or_else(|| {
+        format!("the job `{GATE}` has no step running `cargo xtask merge-profiles` on the shards' profiles")
+    })?;
     let report = find(&|s| run(s).contains("llvm-cov report"))
         .ok_or_else(|| format!("the job `{GATE}` has no step running `llvm-cov report`"))?;
     let gate = find(&|s| {
@@ -358,10 +399,11 @@ pub fn gate_wiring(workflow: &str) -> Result<(), String> {
         && clean < download
         && wait < download
         && download < complete
-        && complete < report
+        && complete < merge
+        && merge < report
         && report < gate)
     {
-        return Err("the steps of `test` are not in the order build, drop listing profiles (before the download), wait, download, check the profiles, report, gate".to_owned());
+        return Err("the steps of `test` are not in the order build, drop listing profiles (before the download), wait, download, check the profiles, merge them, report, gate".to_owned());
     }
     for (what, i) in [
         ("build", builds[0]),
@@ -370,6 +412,7 @@ pub fn gate_wiring(workflow: &str) -> Result<(), String> {
         ("wait", wait),
         ("download", download),
         ("profiles-complete", complete),
+        ("profile-merging", merge),
         ("report", report),
     ] {
         if steps[i].conditional {
@@ -391,29 +434,39 @@ pub fn gate_wiring(workflow: &str) -> Result<(), String> {
         ));
     }
     if input(&steps[download], "pattern") != Some(PATTERN)
-        || artifacts.iter().any(|a| !a.starts_with("profraw-"))
+        || artifacts.iter().any(|a| !a.starts_with("profdata-"))
     {
         return Err(format!(
             "the download step's `pattern` is not `{PATTERN}`, which the shards' artifact names begin with"
         ));
     }
-    if input(&steps[download], "path") != Some(PROFILES)
+    if input(&steps[download], "path") != Some(DOWNLOADS)
         || input(&steps[download], "merge-multiple") != Some("true")
     {
         return Err(format!(
-            "the download step must put the profiles flat in `{PROFILES}` (`merge-multiple: true`)"
+            "the download step must put the profiles flat in `{DOWNLOADS}` (`merge-multiple: true`)"
         ));
     }
     let complete_text = run(&steps[complete]);
     let w = words(&complete_text);
-    if flag(&w, "--dir") != Some(PROFILES) {
+    if flag(&w, "--dir") != Some(DOWNLOADS) || flag(&w, "--extension") != Some("profdata") {
         return Err(format!(
-            "the profiles-complete step does not check `--dir {PROFILES}`"
+            "the profiles-complete step does not check `--dir {DOWNLOADS} --extension profdata`"
         ));
     }
     if !same(&values(&w, "--prefix"), &prefixes) {
         return Err(format!(
             "the profiles-complete step's `--prefix` values are not the shards' file prefixes {prefixes:?} (one for each matrix entry)"
+        ));
+    }
+    let merge_text = run(&steps[merge]);
+    let w = words(&merge_text);
+    if flag(&w, "--dir") != Some(DOWNLOADS)
+        || flag(&w, "--extension") != Some("profdata")
+        || flag(&w, "--workspace-profile-in") != Some(PROFILES)
+    {
+        return Err(format!(
+            "the merge step of `{GATE}` must merge the `.profdata` files of `{DOWNLOADS}` into the profile `llvm-cov report` reads (`--workspace-profile-in {PROFILES}`)"
         ));
     }
     Ok(())

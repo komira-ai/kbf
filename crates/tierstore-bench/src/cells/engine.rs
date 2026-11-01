@@ -7,8 +7,9 @@
 //!
 //! - passes: `passes` of every arm, pass 0 the discarded warm-up, arms interleaved (the order
 //!   starts one arm later each pass, and is written into `notes`);
-//! - the load gate is read before each pass and every few requests in it; a trip ends the pass,
-//!   marks its samples busy and ends the run (the passes so far are written first);
+//! - the load gate is read before each pass, over a quiet window of its own; a trip ends the run
+//!   (the passes so far are written first). Inside a pass the load is read every few requests and
+//!   recorded in the pass (`pass_load`), never a reason to cut it;
 //! - the byte ledger admits a cell before it sends anything and is charged what each pass
 //!   wrote to the cold store;
 //! - the cold store's state is read again before every pass and stamped into the results, and
@@ -48,17 +49,17 @@ use crate::coldstate::{ColdMeter, ColdReading, ColdStateSource};
 use crate::config::RunConfig;
 use crate::error::BenchError;
 use crate::gate::{LoadSample, Trip};
-use crate::procload::{disk_busy_over, disk_busy_snapshot};
+use crate::procload::{QuietTiming, disk_busy_over, disk_busy_snapshot};
 use crate::proxy::FaultMode;
 use crate::requestlog::RequestLog;
 use crate::result::{
-    CellResult, ColdTrip, ColdWindow, Op, PassColdState, PassResult, Percentiles, Provenance,
-    ProxyRequests, SCHEMA_VERSION, Sample, Window,
+    CellResult, ColdTrip, ColdWindow, Op, PassColdState, PassLoad, PassResult, Percentiles,
+    Provenance, ProxyRequests, SCHEMA_VERSION, Sample, Window,
 };
 use crate::role::Role;
 use crate::s3::{BenchS3, Outcome, Timeouts, unix_ms};
 
-/// Completions between two reads of the load gate, at most.
+/// Completions between two readings of the load inside a pass, at most.
 const GATE_EVERY: u64 = 16;
 
 /// A boxed future of a cell's work.
@@ -98,8 +99,8 @@ where
     Arc::new(move |pass| Box::pin(f(pass)))
 }
 
-/// What the machine looks like, for the load gate. The real source reads `/proc`
-/// ([`ProcLoad`]); a test scripts it.
+/// What the machine looks like, for the load gate and the record of a pass. The real source reads
+/// `/proc` ([`ProcLoad`]); a test scripts it.
 pub trait LoadSource: Send + Sync {
     /// The sample now.
     ///
@@ -107,6 +108,23 @@ pub trait LoadSource: Send + Sync {
     /// [`BenchError`] if the machine cannot be read; the run stops, since a gate that cannot see
     /// is not a gate.
     fn sample(&self) -> Result<LoadSample, BenchError>;
+    /// The sample inside a pass: pressure and disk time over the interval since the previous
+    /// reading, which the run records and does not judge. A source with no such interval says
+    /// [`LoadSource::sample`].
+    ///
+    /// # Errors
+    /// As [`LoadSource::sample`].
+    fn interval_sample(&self) -> Result<LoadSample, BenchError> {
+        self.sample()
+    }
+    /// The sample before a pass, over a quiet window of its own, so that the pass that just ran
+    /// is not read as the machine's load. A source with no window says [`LoadSource::sample`].
+    ///
+    /// # Errors
+    /// As [`LoadSource::sample`].
+    fn quiet_sample(&self) -> Result<QuietSample, BenchError> {
+        self.sample().map(QuietSample::from)
+    }
     /// Milliseconds each whole disk of the machine has spent doing IO so far, by device name;
     /// empty for a source that cannot say.
     ///
@@ -117,12 +135,90 @@ pub trait LoadSource: Send + Sync {
     }
 }
 
-/// The machine this process runs on, through [`LoadSample::read`].
-pub struct ProcLoad;
+/// A reading before a pass, and whether the wait for the disks to drain before it gave up.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct QuietSample {
+    /// The sample over the quiet window.
+    pub load: LoadSample,
+    /// `Dirty` plus `Writeback`, KiB, when the wait gave up at its cap; none when it did not.
+    pub unsettled_kib: Option<u64>,
+}
+
+impl From<LoadSample> for QuietSample {
+    fn from(load: LoadSample) -> Self {
+        Self {
+            load,
+            unsettled_kib: None,
+        }
+    }
+}
+
+/// What the gate before a pass found.
+pub struct QuietGate {
+    /// The first limit the window was over, if one.
+    pub trip: Option<Trip>,
+    /// As [`QuietSample::unsettled_kib`].
+    pub unsettled_kib: Option<u64>,
+}
+
+/// The reading that a blocking thread gave back. A source that panicked panics the run, as it
+/// would had it read in place; a thread that was cancelled (the runtime shutting down) has no
+/// panic to give, and is an error.
+fn read_joined(
+    joined: Result<Result<QuietSample, BenchError>, tokio::task::JoinError>,
+) -> Result<QuietSample, BenchError> {
+    match joined {
+        Ok(quiet) => quiet,
+        Err(gone) => match gone.try_into_panic() {
+            Ok(payload) => std::panic::resume_unwind(payload),
+            Err(_) => Err(BenchError::Request(
+                "the reading of the machine was cancelled",
+            )),
+        },
+    }
+}
+
+/// The machine this process runs on, through [`LoadSample::read_interval`] inside a pass and,
+/// before one, [`LoadSample::read_quiet`] with the waits of its [`QuietTiming`].
+pub struct ProcLoad {
+    timing: QuietTiming,
+}
+
+impl ProcLoad {
+    /// This machine, with the default waits.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self::with_timing(QuietTiming::DEFAULT)
+    }
+
+    /// This machine, with the waits of `timing`.
+    #[must_use]
+    pub const fn with_timing(timing: QuietTiming) -> Self {
+        Self { timing }
+    }
+}
+
+impl Default for ProcLoad {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl LoadSource for ProcLoad {
     fn sample(&self) -> Result<LoadSample, BenchError> {
         LoadSample::read()
+    }
+
+    fn interval_sample(&self) -> Result<LoadSample, BenchError> {
+        LoadSample::read_interval()
+    }
+
+    fn quiet_sample(&self) -> Result<QuietSample, BenchError> {
+        let (load, writeback) = LoadSample::read_quiet(&self.timing)?;
+        Ok(QuietSample {
+            load,
+            unsettled_kib: writeback.unsettled_kib(),
+        })
     }
 
     fn disk_busy_ms(&self) -> Result<BTreeMap<String, u64>, BenchError> {
@@ -505,12 +601,22 @@ impl Env {
         format!("tierstore-bench/{run}")
     }
 
-    /// Reads the load gate: the first limit the machine is over, if one.
+    /// Reads the load gate before a pass, over a quiet window of its own
+    /// ([`LoadSource::quiet_sample`]): the pass that just ended is not read as other work on
+    /// the machine. The disks are first waited for (bounded) and then the window is waited for,
+    /// on a thread that may block, so no worker of the runtime sleeps. The one-minute load
+    /// average is not judged ([`crate::gate::LoadGate::check_run`]).
     ///
     /// # Errors
     /// [`BenchError`] if the machine cannot be read.
-    pub fn gate(&self) -> Result<Option<Trip>, BenchError> {
-        Ok(self.config.gate.check(&self.load.sample()?).err())
+    pub async fn gate_quiet(&self) -> Result<QuietGate, BenchError> {
+        let load = Arc::clone(&self.load);
+        let read = tokio::task::spawn_blocking(move || load.quiet_sample()).await;
+        let quiet = read_joined(read)?;
+        Ok(QuietGate {
+            trip: self.config.gate.check_run(&quiet.load).err(),
+            unsettled_kib: quiet.unsettled_kib,
+        })
     }
 
     /// Shows the cold store guard the cold requests among `steps`, which finished now, and judges
@@ -644,7 +750,7 @@ async fn run_unit(
 struct Driven {
     steps: Vec<Step>,
     elapsed: Duration,
-    trip: Option<Trip>,
+    load: PassLoad,
     cold_trip: Option<ColdTrip>,
 }
 
@@ -663,8 +769,8 @@ impl From<Stop> for BenchError {
     }
 }
 
-/// Sends the requests of one pass of `arm` and collects their steps, reading the gate as they
-/// complete.
+/// Sends the requests of one pass of `arm` and collects their steps, reading the load as they
+/// complete (recorded in the pass, never a reason to cut it).
 async fn drive(env: &Env, arm: &Arm, pass: u32) -> Result<Driven, BenchError> {
     let (tx, mut rx) = mpsc::unbounded_channel::<Result<Vec<Step>, BenchError>>();
     let stop = Arc::new(AtomicBool::new(false));
@@ -718,7 +824,7 @@ async fn drive(env: &Env, arm: &Arm, pass: u32) -> Result<Driven, BenchError> {
     let every = (arm.requests / 4).clamp(1, GATE_EVERY);
     let mut steps = Vec::new();
     let mut done = 0u64;
-    let mut trip = None;
+    let mut load = PassLoad::none();
     let mut cold_trip = None;
     while let Some(result) = rx.recv().await {
         let got = result?;
@@ -731,20 +837,29 @@ async fn drive(env: &Env, arm: &Arm, pass: u32) -> Result<Driven, BenchError> {
         }
         steps.extend(got);
         done += 1;
-        if done.is_multiple_of(every) & trip.is_none() {
-            trip = env.gate()?;
-            if trip.is_some() {
-                stop.store(true, Ordering::SeqCst);
-            }
+        if done.is_multiple_of(every) {
+            let sample = env.load.interval_sample()?;
+            load = peak_of(load, &sample);
         }
     }
     while tasks.join_next().await.is_some() {}
     Ok(Driven {
         steps,
         elapsed: clock.elapsed(),
-        trip,
+        load,
         cold_trip,
     })
+}
+
+/// `sofar` with one more reading in it: the count, and the highest of each figure.
+fn peak_of(sofar: PassLoad, sample: &LoadSample) -> PassLoad {
+    PassLoad {
+        readings: sofar.readings.saturating_add(1),
+        peak_psi_cpu_pct: sofar.peak_psi_cpu_pct.max(sample.psi_cpu_avg10),
+        peak_psi_io_pct: sofar.peak_psi_io_pct.max(sample.psi_io_avg10),
+        peak_disk_util_pct: sofar.peak_disk_util_pct.max(sample.disk_util_pct),
+        ..sofar
+    }
 }
 
 /// The `PassResult` of the steps of one label of one pass.
@@ -783,6 +898,7 @@ fn pass_result(
         proxy_requests: None,
         disk_busy: BTreeMap::new(),
         peak_in_flight: steps.iter().map(|s| s.in_flight).max().unwrap_or(0),
+        pass_load: None,
     }
 }
 
@@ -948,7 +1064,8 @@ async fn run_pass(
     pass: u32,
     acc: &mut BTreeMap<String, Acc>,
 ) -> Result<Option<Stop>, BenchError> {
-    if let Some(trip) = env.gate()? {
+    let quiet = env.gate_quiet().await?;
+    if let Some(trip) = quiet.trip {
         let empty = pass_result(pass, Window::Busy, Duration::ZERO, Some(&trip), None, &[]);
         acc.entry(arm.label.clone()).or_default().passes.push(empty);
         return Ok(Some(Stop::Gate(trip)));
@@ -1000,7 +1117,7 @@ async fn run_pass(
         driven.steps.iter().map(|s| s.role),
         env.cold_server.hot,
     );
-    let (cold_window, window_trip) = if driven.trip.is_none() && driven.cold_trip.is_none() {
+    let (cold_window, window_trip) = if driven.cold_trip.is_none() {
         env.close_window(traffic).await
     } else {
         (None, None)
@@ -1009,10 +1126,19 @@ async fn run_pass(
     let disk_busy = disk_busy_over(&disks_before, &disks_after, micros(driven.elapsed));
     env.ledger
         .settle(planned, driven.steps.iter().map(|s| s.cold_write).sum())?;
-    let window = if driven.trip.is_some() || cold_trip.is_some() {
+    let window = if cold_trip.is_some() {
         Window::Busy
     } else {
         env.config.window
+    };
+    // The pass opened its window with the wait for the disks at its cap: it says so.
+    let load = match quiet.unsettled_kib {
+        None => driven.load,
+        Some(kib) => PassLoad {
+            writeback_settled: false,
+            writeback_pending_bytes: Some(kib.saturating_mul(1024)),
+            ..driven.load
+        },
     };
     let mut by_label: BTreeMap<&str, Vec<&Step>> = BTreeMap::from([("", vec![])]);
     for step in &driven.steps {
@@ -1043,7 +1169,7 @@ async fn run_pass(
             pass,
             window,
             driven.elapsed,
-            driven.trip.as_ref(),
+            None,
             cold_trip.as_ref(),
             &steps,
         );
@@ -1051,6 +1177,7 @@ async fn run_pass(
             cold_window: cold_window.clone(),
             proxy_requests: proxy_requests.clone(),
             disk_busy: disk_busy.clone(),
+            pass_load: Some(load),
             ..result
         };
         let slot = acc.entry(label).or_default();
@@ -1066,10 +1193,7 @@ async fn run_pass(
     if !rows.is_empty() {
         env.recorder.append(&rows)?;
     }
-    Ok(driven
-        .trip
-        .map(Stop::Gate)
-        .or_else(|| cold_trip.map(Stop::Cold)))
+    Ok(cold_trip.map(Stop::Cold))
 }
 
 #[cfg(test)]
@@ -1077,7 +1201,7 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use super::*;
-    use crate::cells::testkit::{self, Script, busy, calm};
+    use crate::cells::testkit::{self, Script, busy, calm, loaded};
 
     fn temp(name: &str) -> kbf_testkit::dir::TestDir {
         kbf_testkit::dir::TestDir::under(std::env::temp_dir(), name)
@@ -1269,23 +1393,26 @@ mod tests {
         assert!(matches!(err, BenchError::Gate(_)), "{err}");
         assert_eq!(
             err.to_string(),
-            "load gate: loadavg_1m is 99, over the limit 8"
+            "load gate: psi_cpu_avg10 is 99, over the limit 10"
         );
         assert!(seen.lock().unwrap().is_empty());
         assert_eq!(csv_rows(dir.path()).len(), 0);
         let written = std::fs::read_to_string(dir.path().join("cold-put-a-a1.json")).unwrap();
         let result = CellResult::from_json(&written).unwrap();
         assert_eq!(result.passes.len(), 1);
-        assert_eq!(result.passes[0].gate_tripped.as_deref(), Some("loadavg_1m"));
+        assert_eq!(
+            result.passes[0].gate_tripped.as_deref(),
+            Some("psi_cpu_avg10")
+        );
         assert_eq!(result.passes[0].window, Window::Busy);
         assert_eq!(result.passes[0].requests, 0);
     }
 
-    /// Catches a gate that is not read during a pass: a machine that turns busy after two
-    /// completions cuts the pass short, marks its samples busy though the run said quiet, ends
-    /// the run, and still runs the arm's after hook.
+    /// Catches a pass cut for what the machine did while it ran: a machine that turns busy after
+    /// two completions neither cuts the pass nor ends the run, its samples stay quiet, the arm's
+    /// after hook runs for every pass, and the pass records the peak it saw.
     #[tokio::test]
-    async fn a_machine_that_turns_busy_in_a_pass_cuts_it_and_ends_the_run() {
+    async fn a_machine_that_turns_busy_in_a_pass_is_recorded_and_not_cut() {
         let dir = temp("tb-engine-gate-during");
         let load = Script::of(vec![Some(calm()), Some(calm()), Some(busy())]);
         let env = env(dir.path(), Window::Quiet, load);
@@ -1300,23 +1427,252 @@ mod tests {
                 Ok(vec![])
             }
         }));
-        let err = run_cell(&env, CellId::ColdPut, vec![a], 3, None)
+        let results = run_cell(&env, CellId::ColdPut, vec![a], 3, None)
+            .await
+            .unwrap();
+        let passes = &results[0].passes;
+        assert_eq!(passes.len(), 3);
+        assert!(
+            passes
+                .iter()
+                .all(|p| p.requests == 8 && p.gate_tripped.is_none())
+        );
+        assert!(passes.iter().all(|p| p.window == Window::Quiet));
+        assert_eq!(after_ran.load(Ordering::SeqCst), 3);
+        let load = passes[0].pass_load.unwrap();
+        assert_eq!((load.readings, load.peak_psi_cpu_pct), (4, 99.0));
+        assert!(csv_rows(dir.path()).iter().all(|r| r[6] == "quiet"));
+    }
+
+    /// Catches a pass stopped for its own disk and IO pressure, and a pass that does not say what
+    /// the machine did: the readings inside it are hot on the disk and on IO, the pass runs, and
+    /// the result holds the count and the peak of each figure.
+    #[tokio::test]
+    async fn the_disk_and_io_pressure_inside_a_pass_are_recorded_not_judged() {
+        let dir = temp("tb-engine-gate-pass-load");
+        let pressed = LoadSample {
+            psi_cpu_avg10: 4.0,
+            psi_io_avg10: 50.0,
+            disk_util_pct: 100.0,
+            ..calm()
+        };
+        let load = Split::new(Script::of(vec![Some(pressed), Some(calm())]), calm());
+        let env = env(dir.path(), Window::Quiet, load);
+        let seen = Arc::new(Mutex::new(vec![]));
+        let results = run_cell(&env, CellId::ColdPut, vec![arm("a", 4, 2, &seen)], 1, None)
+            .await
+            .unwrap();
+        let pass = &results[0].passes[0];
+        assert_eq!((pass.requests, pass.window), (4, Window::Quiet));
+        assert_eq!(
+            pass.pass_load,
+            Some(PassLoad {
+                readings: 4,
+                peak_psi_cpu_pct: 4.0,
+                peak_psi_io_pct: 50.0,
+                peak_disk_util_pct: 100.0,
+                writeback_settled: true,
+                writeback_pending_bytes: None,
+            })
+        );
+    }
+
+    /// A machine whose reading during a pass (`sample`) and whose reading in the quiet window
+    /// before one (`quiet_sample`) are scripted apart; it counts the quiet readings.
+    struct Split {
+        during: Arc<Script>,
+        quiet: LoadSample,
+        quiet_reads: AtomicUsize,
+    }
+
+    impl Split {
+        fn new(during: Arc<Script>, quiet: LoadSample) -> Arc<Self> {
+            Arc::new(Self {
+                during,
+                quiet,
+                quiet_reads: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    impl LoadSource for Split {
+        fn sample(&self) -> Result<LoadSample, BenchError> {
+            self.during.sample()
+        }
+
+        fn interval_sample(&self) -> Result<LoadSample, BenchError> {
+            self.during.sample()
+        }
+
+        fn quiet_sample(&self) -> Result<QuietSample, BenchError> {
+            self.quiet_reads.fetch_add(1, Ordering::SeqCst);
+            Ok(self.quiet.into())
+        }
+    }
+
+    fn disk_hot() -> LoadSample {
+        LoadSample {
+            disk_util_pct: 100.0,
+            ..calm()
+        }
+    }
+
+    /// Catches a gate before a pass that reads the interval since the last reading, which is the
+    /// pass before: the quiet window is read once for each of two passes and both run.
+    #[tokio::test]
+    async fn the_gate_before_a_pass_reads_the_quiet_window_not_the_last_pass() {
+        let dir = temp("tb-engine-gate-quiet-idle");
+        let load = Split::new(Script::calm(), calm());
+        let env = env(dir.path(), Window::Quiet, load.clone());
+        let seen = Arc::new(Mutex::new(vec![]));
+        run_cell(&env, CellId::ColdPut, vec![arm("a", 4, 2, &seen)], 2, None)
+            .await
+            .unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 8);
+        assert_eq!(load.quiet_reads.load(Ordering::SeqCst), 2);
+    }
+
+    /// Catches a gate before a pass that ignores other work: a hot quiet window sends nothing
+    /// and names the disk.
+    #[tokio::test]
+    async fn a_busy_quiet_window_before_a_pass_sends_nothing_and_names_the_disk() {
+        let dir = temp("tb-engine-gate-quiet-busy");
+        let load = Split::new(Script::calm(), disk_hot());
+        let env = env(dir.path(), Window::Quiet, load);
+        let seen = Arc::new(Mutex::new(vec![]));
+        let err = run_cell(&env, CellId::ColdPut, vec![arm("a", 4, 2, &seen)], 1, None)
             .await
             .unwrap_err();
-        assert!(matches!(err, BenchError::Gate(_)), "{err}");
         assert_eq!(
             err.to_string(),
-            "load gate: loadavg_1m is 99, over the limit 8"
+            "load gate: disk_util_pct is 100, over the limit 60"
         );
-        let written = std::fs::read_to_string(dir.path().join("cold-put-a-a1.json")).unwrap();
-        let result = CellResult::from_json(&written).unwrap();
-        assert_eq!(result.passes.len(), 1);
-        let pass = &result.passes[0];
-        assert!(pass.requests < 8, "{}", pass.requests);
-        assert!(pass.requests >= 4, "{}", pass.requests);
-        assert_eq!(pass.window, Window::Busy);
-        assert_eq!(after_ran.load(Ordering::SeqCst), 1);
-        assert!(csv_rows(dir.path()).iter().all(|r| r[6] == "busy"));
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    /// Catches the one-minute load average stopping a run: it carries the run's own in-flight
+    /// requests and fsyncs for a minute, so a reading of 99 before and during a pass is not a
+    /// reason to refuse or cut it.
+    #[tokio::test]
+    async fn the_load_average_does_not_stop_a_run_between_or_inside_passes() {
+        let dir = temp("tb-engine-gate-loadavg");
+        let load = Script::of(vec![Some(loaded()); 8]);
+        let env = env(dir.path(), Window::Quiet, load);
+        let seen = Arc::new(Mutex::new(vec![]));
+        run_cell(&env, CellId::ColdPut, vec![arm("a", 4, 2, &seen)], 2, None)
+            .await
+            .unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 8);
+    }
+
+    /// Catches a source of this machine that does not read it before a pass: with a window of
+    /// no length, `quiet_sample` and `sample` both give figures of `/proc`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn this_machine_is_read_before_a_pass_over_the_window_it_was_given() {
+        let load = ProcLoad::with_timing(QuietTiming {
+            settle: Duration::ZERO,
+            writeback_cap: Duration::ZERO,
+            poll: Duration::ZERO,
+            ..QuietTiming::DEFAULT
+        });
+        assert!(load.quiet_sample().unwrap().load.loadavg_1m >= 0.0);
+        assert!(load.interval_sample().unwrap().loadavg_1m >= 0.0);
+        assert!(load.sample().unwrap().loadavg_1m >= 0.0);
+        let _ = ProcLoad::default();
+    }
+
+    /// A machine that cannot be asked before a pass without a panic.
+    struct Panicking;
+
+    impl LoadSource for Panicking {
+        fn sample(&self) -> Result<LoadSample, BenchError> {
+            Ok(calm())
+        }
+
+        fn quiet_sample(&self) -> Result<QuietSample, BenchError> {
+            panic!("the reader of the machine is broken");
+        }
+    }
+
+    /// Catches a reading on its own thread that loses a panic: the run panics with it, it is not
+    /// taken for a calm machine or for a failed pass.
+    #[tokio::test]
+    #[should_panic(expected = "the reader of the machine is broken")]
+    async fn a_reader_that_panics_before_a_pass_panics_the_run() {
+        let dir = temp("tb-engine-gate-panic");
+        let env = env(dir.path(), Window::Quiet, Arc::new(Panicking));
+        let seen = Arc::new(Mutex::new(vec![]));
+        let _ = run_cell(&env, CellId::ColdPut, vec![arm("a", 4, 2, &seen)], 1, None).await;
+    }
+
+    /// A machine whose wait for the disks always gave up at its cap, 5000 KiB still dirty.
+    struct Unsettled;
+
+    impl LoadSource for Unsettled {
+        fn sample(&self) -> Result<LoadSample, BenchError> {
+            Ok(calm())
+        }
+
+        fn quiet_sample(&self) -> Result<QuietSample, BenchError> {
+            Ok(QuietSample {
+                load: calm(),
+                unsettled_kib: Some(5000),
+            })
+        }
+    }
+
+    /// Catches a measurement on unsettled writeback that does not show in the result: every pass
+    /// that opened its window with the cap reached says so, with the bytes still pending; and a
+    /// machine that drained says it did, with no figure.
+    #[tokio::test]
+    async fn a_pass_measured_on_unsettled_writeback_says_so() {
+        let dir = temp("tb-engine-unsettled");
+        let stuck_env = env(dir.path(), Window::Quiet, Arc::new(Unsettled));
+        let seen = Arc::new(Mutex::new(vec![]));
+        let results = run_cell(
+            &stuck_env,
+            CellId::ColdPut,
+            vec![arm("a", 4, 2, &seen)],
+            2,
+            None,
+        )
+        .await
+        .unwrap();
+        for pass in &results[0].passes {
+            let load = pass.pass_load.unwrap();
+            assert_eq!(
+                (load.writeback_settled, load.writeback_pending_bytes),
+                (false, Some(5000 * 1024))
+            );
+        }
+        let dir = temp("tb-engine-settled");
+        let calm_env = env(dir.path(), Window::Quiet, Script::calm());
+        let results = run_cell(
+            &calm_env,
+            CellId::ColdPut,
+            vec![arm("a", 4, 2, &seen)],
+            1,
+            None,
+        )
+        .await
+        .unwrap();
+        let load = results[0].passes[0].pass_load.unwrap();
+        assert_eq!(
+            (load.writeback_settled, load.writeback_pending_bytes),
+            (true, None)
+        );
+    }
+
+    /// Catches a reading thread that was cancelled (the runtime shutting down) taken for a panic
+    /// of the source, which would panic the run a second time: it is an error that says so.
+    #[tokio::test]
+    async fn a_cancelled_reading_is_an_error_and_not_a_panic() {
+        let handle = tokio::spawn(std::future::pending::<Result<QuietSample, BenchError>>());
+        handle.abort();
+        let err = read_joined(handle.await).unwrap_err();
+        assert!(matches!(err, BenchError::Request(_)), "{err}");
+        assert!(err.to_string().contains("cancelled"), "{err}");
     }
 
     /// Catches a gate that cannot be read being taken for a calm machine.
@@ -1451,10 +1807,10 @@ mod tests {
     }
 
     /// Catches an open loop that waits for answers (it must send on its own clock), loses a
-    /// request, or ignores the gate: all requests of a calm run are sent, and a machine that
-    /// turns busy stops the sending.
+    /// request: all requests of a calm run are sent, and a machine that turns busy inside a pass
+    /// does not stop the sending.
     #[tokio::test(start_paused = true)]
-    async fn an_open_loop_sends_on_its_own_clock_and_stops_at_the_gate() {
+    async fn an_open_loop_sends_on_its_own_clock_and_is_not_stopped_by_the_load() {
         let dir = temp("tb-engine-open");
         let env = env(dir.path(), Window::Quiet, Script::calm());
         let seen = Arc::new(Mutex::new(vec![]));
@@ -1476,11 +1832,8 @@ mod tests {
         let seen = Arc::new(Mutex::new(vec![]));
         let mut a = arm("a", 8, 1, &seen);
         a.pace = Pace::Open { per_sec: 1 };
-        let err = run_cell(&env, CellId::A1, vec![a], 2, None)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, BenchError::Gate(_)));
-        assert_eq!(seen.lock().unwrap().len(), 6);
+        run_cell(&env, CellId::A1, vec![a], 2, None).await.unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 16);
     }
 
     /// Catches a delay that is not added to the latency of an open-loop request that went out
@@ -1665,7 +2018,7 @@ mod tests {
     #[test]
     fn an_unconfigured_role_has_no_client() {
         let dir = temp("tb-engine-roles");
-        let env = env(dir.path(), Window::Busy, Arc::new(ProcLoad));
+        let env = env(dir.path(), Window::Busy, Arc::new(ProcLoad::new()));
         assert!(matches!(
             env.s3(Role::Cold, Cap::Cold),
             Err(BenchError::Config(_))
