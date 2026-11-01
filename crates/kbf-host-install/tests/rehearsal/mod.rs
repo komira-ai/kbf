@@ -13,7 +13,7 @@
 //!
 //! Every command's output and the units' journal go to `target/update-rehearsal` (the
 //! workflow uploads it). The workflow leaves its read-only token in
-//! `/var/tmp/kbf-update-rehearsal.token`.
+//! `/var/tmp/kbf-update-rehearsal.token`; the channel's `token_file` is a root-owned copy.
 
 #![allow(dead_code)]
 
@@ -24,9 +24,11 @@ use std::process::{Command, Output};
 use std::thread::sleep;
 use std::time::Duration;
 
+use kbf_host_install::LONG_TOKEN_MARKER;
 use serde_json::Value;
 
 pub mod farm;
+pub mod fleet;
 pub mod issuer;
 
 pub const REPO: &str = "komira-ai/kbf";
@@ -40,6 +42,8 @@ pub const RELEASES: &str = "/var/lib/kbf-installer/releases";
 pub const HELPER: &str = "/usr/libexec/kbf/kbf-host-install";
 pub const TRUST: &str = "/usr/share/kbf/trust";
 pub const CHANNELS: &str = "/etc/kbf/host-install-releases.toml";
+/// The channel's token file, root's alone.
+pub const CHANNEL_TOKEN: &str = "/etc/kbf/host-install-github.token";
 pub const UNIT_DIR: &str = "/etc/systemd/system";
 pub const HELPER_UNIT: &str = "kbf-host-local.service";
 /// The `kbf` unit the helper restarts.
@@ -74,12 +78,36 @@ pub fn capture(name: &str, out: &Output) {
     .unwrap();
 }
 
+/// Like [`run`], and when `cmd` fails while the journal of `units` shows GitHub refused the
+/// helper for its quota, the failure says so ([`rate_limit_note`]).
+pub fn run_explaining(name: &str, cmd: &mut Command, units: &[&str]) -> String {
+    let out = cmd
+        .output()
+        .unwrap_or_else(|e| panic!("{name}: did not start: {e}"));
+    capture(name, &out);
+    if !out.status.success()
+        && let Some(note) = rate_limit_note(&journal(units))
+    {
+        panic!(
+            "{name} failed ({:?}): {}",
+            out.status.code(),
+            explained(name, &note, &String::from_utf8_lossy(&out.stderr))
+        );
+    }
+    check(name, &out)
+}
+
 /// Runs `cmd`, keeps its output as `name`, and requires it to succeed.
 pub fn run(name: &str, cmd: &mut Command) -> String {
     let out = cmd
         .output()
         .unwrap_or_else(|e| panic!("{name}: did not start: {e}"));
     capture(name, &out);
+    check(name, &out)
+}
+
+/// `out`'s stdout, when the command succeeded; a panic with its output when it did not.
+fn check(name: &str, out: &Output) -> String {
     assert!(
         out.status.success(),
         "{name} failed ({:?}): {}{}",
@@ -151,6 +179,35 @@ pub fn download(token: &str, tag: &str, dir: &Path, names: &[String]) {
     }
 }
 
+/// What the helper's journal says when GitHub refuses its release listing.
+pub const RATE_LIMITED: &str = "rate limited by GitHub";
+
+/// How many of the last lines of a command's stderr go after the note.
+const STDERR_LINES: usize = 40;
+
+/// The plain words for a failure whose journal shows GitHub refused the helper for its quota;
+/// `None` for any other journal.
+///
+/// The wording is of what the journal says, not of whether the channel had a token: GitHub's
+/// API quota for this request, whichever address or token it was counted against.
+pub fn rate_limit_note(journal: &str) -> Option<String> {
+    journal.contains(RATE_LIMITED).then(|| {
+        "GitHub's API quota refused the helper's release listing (counted against the runner's \
+         address when the channel had no token, against the run's token when it had one). \
+         This says nothing of the release. Re-run the job."
+            .to_owned()
+    })
+}
+
+/// The failure message of a command whose journal showed the quota refusal: the note, then
+/// the last [`STDERR_LINES`] lines of the command's `stderr`, so that an earlier refusal in
+/// the journal cannot hide a different cause the command itself reports.
+pub fn explained(name: &str, note: &str, stderr: &str) -> String {
+    let lines: Vec<&str> = stderr.lines().collect();
+    let tail = lines[lines.len().saturating_sub(STDERR_LINES)..].join("\n");
+    format!("{name} failed: {note}\n---- last lines of {name}'s stderr\n{tail}")
+}
+
 /// The units' journal so far.
 pub fn journal(units: &[&str]) -> String {
     let mut cmd = Command::new("journalctl");
@@ -180,6 +237,7 @@ impl Journal {
 
 impl Drop for Journal {
     fn drop(&mut self) {
+        let _ = fs::remove_file(CHANNEL_TOKEN);
         let mut cmd = Command::new("journalctl");
         cmd.arg("--no-pager");
         for unit in &self.units {
@@ -436,13 +494,33 @@ pub fn lay_out(r: &Rehearsal, kbf_unit: &str) -> PathBuf {
             .arg(HELPER),
     );
     fs::create_dir_all("/etc/kbf").unwrap();
-    // The channel as the farm's nodes name theirs: no token. (The helper takes a token of
-    // letters, digits, `_` and `-`, at most 255 bytes; the run's token is longer.)
-    install_file(
-        &format!("[channels.{CHANNEL}]\nsource = \"github\"\n"),
-        CHANNELS,
-        0o644,
-    );
+    // The channel as the farm's nodes name theirs, with a token file when release N's helper
+    // takes GitHub's Actions token: a hosted runner's address shares GitHub's anonymous quota
+    // with other jobs, so the helper lists the releases under the run's own read-only token.
+    // The helper reads a token file that is root's alone, so the workflow's file (the runner
+    // user's) is copied to one root owns, and removed when the rehearsal ends.
+    let _ = fs::remove_file(CHANNEL_TOKEN);
+    let channel = if takes_actions_token(&dir.join("helper/kbf-host-install")) {
+        let token = fs::read_to_string(TOKEN_FILE).unwrap_or_else(|e| panic!("{TOKEN_FILE}: {e}"));
+        {
+            use std::io::Write as _;
+            use std::os::unix::fs::OpenOptionsExt as _;
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(CHANNEL_TOKEN)
+                .unwrap_or_else(|e| panic!("{CHANNEL_TOKEN}: {e}"));
+            file.write_all(token.trim().as_bytes()).unwrap();
+        }
+        format!("[channels.{CHANNEL}]\nsource = \"github\"\ntoken_file = \"{CHANNEL_TOKEN}\"\n")
+    } else {
+        // Only the first release after the helper learned the token can be here: its
+        // predecessor's helper refuses a token of this length (`config_invalid`).
+        eprintln!("release {old}'s helper takes no Actions token: its channel names none");
+        format!("[channels.{CHANNEL}]\nsource = \"github\"\n")
+    };
+    install_file(&channel, CHANNELS, 0o644);
 
     // The units: the kbf unit, and the helper's unit of this checkout restarting it.
     install_file(kbf_unit, &format!("{UNIT_DIR}/{KBF_UNIT}"), 0o644);
@@ -454,8 +532,54 @@ pub fn lay_out(r: &Rehearsal, kbf_unit: &str) -> PathBuf {
     host_agent
 }
 
+/// Whether the helper binary at `path` carries [`LONG_TOKEN_MARKER`].
+fn takes_actions_token(path: &Path) -> bool {
+    let bytes = fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    bytes
+        .windows(LONG_TOKEN_MARKER.len())
+        .any(|w| w == LONG_TOKEN_MARKER)
+}
+
 /// Starts the helper and waits for its socket.
 pub fn start_helper() {
     systemctl("start_helper", &["start", HELPER_UNIT]);
     until(HELPER_UNIT, || Path::new(SOCKET).exists());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Catches a rate-limited helper reported as a bare "deploy_farm failed", and a journal
+    /// that mentions nothing of the quota being blamed on it.
+    #[test]
+    fn a_refused_listing_is_explained_and_other_journals_are_not() {
+        let refused = "kbf-host-install: stage: fetch_failed: rate limited by GitHub, retry after \
+                       2026-11-01T05:45:24Z or set token_file\n";
+        let note = rate_limit_note(refused).expect("a note for a rate-limited helper");
+        assert!(!note.contains("takes no"), "{note}");
+        assert!(note.contains("Re-run the job"), "{note}");
+        assert_eq!(
+            rate_limit_note("kbf-host-install: stage: verify_failed\n"),
+            None
+        );
+        assert_eq!(rate_limit_note(""), None);
+    }
+
+    /// Catches the note replacing the command's own report: a different real cause must stay
+    /// in the message, and a long stderr is cut to its last lines.
+    #[test]
+    fn the_explanation_keeps_the_end_of_the_commands_stderr() {
+        let stderr: String = (0..100).map(|i| format!("line {i}\n")).collect();
+        let text = explained("deploy_farm", "NOTE", &stderr);
+        assert!(text.contains("NOTE"), "{text}");
+        assert!(text.contains("line 99"), "{text}");
+        assert!(text.contains("line 60"), "{text}");
+        assert!(
+            !text.contains("line 59\n") && !text.ends_with("line 59"),
+            "{text}"
+        );
+        assert!(!text.contains("line 0\n"), "{text}");
+        assert!(explained("x", "N", "").contains("N"));
+    }
 }

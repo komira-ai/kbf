@@ -13,18 +13,24 @@
 //! - [`HostNames`]: a worker's id as the host id the recorder keys a node by.
 //! - [`ProfileSink`]: the recorder and the profile store behind one lock, with the flush
 //!   a tick calls and the curves the scheduler reads.
+//! - [`KbfUsageSink`] and [`RunKeys`]: the sink and the key source a `js-usage` `UsageHub`
+//!   is made over, so the scheduler libraries' own recorder runs on kbf's store.
 //! - [`UsageMode`]: `off`, `record` or `on`.
 //!
-//! Nothing here reads a clock or a flag: days and wall minutes are arguments, and no farm
-//! code calls this crate yet, so linking it changes no placement. Admission reads a curve
-//! only for an action that also has a prediction; feeding predictions is a separate change.
+//! Nothing here reads a clock or a flag: days and wall minutes are arguments. The farm on the
+//! js core calls this crate under `--usage-profiles record` and `on` (`kbf-server`,
+//! `farm_js::usage`). `record` gives the scheduler none of the curves, so it changes no
+//! placement; `on` gives it [`ProfileSink::curves`], which steers placement. Admission reads a
+//! curve only for an action that also has a prediction.
 #![forbid(unsafe_code)]
 
+mod hub_sink;
 mod mode;
 mod name;
 mod shapes;
 mod sink;
 
+pub use hub_sink::{KbfUsageSink, RunKeys};
 pub use mode::{BadMode, UsageMode};
 pub use name::{HostNames, profile_name};
 pub use shapes::{MAX_SHAPES, ShapeIndex};

@@ -209,6 +209,7 @@ pub const ALLOWED: &[&str] = &[
     "exclusive_actions",
     "placement_load",
     "placement_predictions",
+    "usage_profiles",
     "whole_node_max",
     "whole_node_max_draining",
     "whole_node_keep_for_ordinary",
@@ -1261,6 +1262,8 @@ impl<'a> Prepared<'a> {
                 api_stop.fire();
                 stop_api(api_stop_when_done, api_serve).await;
             }
+            // What the usage side learned and has not flushed yet.
+            farm.finish_usage().await;
             crate::history::finish(history).await;
             outcome
         };

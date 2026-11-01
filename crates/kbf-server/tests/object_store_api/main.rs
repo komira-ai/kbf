@@ -4,11 +4,13 @@
 //! One binary on purpose: the coverage ratchet counts the best single build of each function,
 //! so the routes' tests live together.
 
+mod audit_unknown;
 mod bindings;
 mod client;
 mod connections;
 mod gate;
 mod harness;
 mod leaks;
+mod repoint;
 mod status;
 mod verify;

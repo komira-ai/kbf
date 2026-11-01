@@ -137,10 +137,19 @@ lease server (`--executor-lease-url`, `https://`, or `http://` to loopback only;
 URL), `--executor-frontend-id` (the `kbf-frontend` label on the frontend's leases, by which a
 restarted frontend finds and releases them; it must be different for each frontend, so a
 `kbf.toml` is not copied to a second frontend with it), the packs (`--pack-store-endpoint`, through which
-the pack a task writes is read, hashed and turned into the action's result) and
-`--executor-insecure-argv-secrets`: the lease server's job has no secret field yet, so the
-presigned write url and the read token travel as arguments of the run, where the action can
-read them. The executor runs on exactly one frontend: it looks for another frontend's leases on
+the pack a task writes is read, hashed and turned into the action's result) and the delivery
+of the secrets, `--executor-secret-delivery`. With `argv`, the default, the presigned write url
+and the read token travel as arguments of the run, where the action can read them, and
+`--executor-insecure-argv-secrets` says the operator accepts it. With `files` each is a file of
+the run, which the lease server mounts read-only at `/run/js-files`, and the task tool is given
+the paths (`--pack-url-file`, `--grant-token-file`): no argument holds a secret,
+`--executor-insecure-argv-secrets` is refused with it, and the lease asks for hosts that report
+`run-files=true`. There is no fall back to arguments: a pool whose agents do not report
+`run-files` holds no host, and no run is sent. A start the lease server refuses with
+`files-unsupported`, or an agent that ends a start with that detail, holds that host out for the
+quota hold (the lease stays booked and idle, so it is not leased again at once) and the action is
+rerun elsewhere; `invalid-file`, from either, ends the action as invalid. `files` is refused with `--executor kbf-daemon`, which builds no command
+line. The executor runs on exactly one frontend: it looks for another frontend's leases on
 the lease server before its first pass and every minute after, and a frontend that finds one
 older than its own (or finds one before it has any) stops with an error naming it. Each lease
 also carries the process that made it: a frontend that starts and finds leases of another
@@ -187,6 +196,36 @@ v0.0.44 or later, the first release that knows `--locate`: an older one refuses 
 run fails). A setting that breaks a rule
 the executor's safety rests on (the fence time against the scheduler's grace, the lease ttl
 against the longest run) is refused at start, exit status 2.
+
+Per-action overhead of the executor, for comparing it with a daemon, is read from two places. The
+executor's own phases are the histogram `kbf_executor_phase_seconds{phase=...}` on `GET /metrics`:
+`prepare` (the `Start` first seen to its run being ready), `start` (ready to the lease server accepting
+the run), `queue` (accepted to first read back as running), `task` (first read back as running to read
+back as exited), `run` (accepted to read back as exited, whether or not it was seen running) and
+`ingest` (read back as exited to the read of the pack done). They are stamped by the executor on its
+own clock, once per pass over the host's runs, and the lease server learns a run's state from the
+agent's heartbeat, which trails the host by one or two beats: `queue`, `task` and `run` are good to a
+pass plus a heartbeat or two, not to the instant the host started or ended the run, and a run that
+starts and ends between two reads has a `run` and no `queue` or `task`. A phase that was not observed
+is absent, never zero. The task's own account of its steps (`fetch_ms`, `run_ms` and `pack_ms` of the manifest) is carried
+in the result's execution metadata as the `input_fetch`, `execution` and `output_upload` start and
+completed times, marked as a task's claim, and the run record and the read API say so with
+`phase_times: "task_claim"` (a daemon's run is `measured`, and so is a record written before the
+field). The manifest holds durations only, so the three are laid back to back and end at the time the
+frontend read the pack. For a `task_claim` run only the three durations are data, each as long as the
+task said and none the frontend's own measurement: the instants, and the gaps between them and the
+server's `worker_start` and `worker_completed`, are not (the delay from the task's end to the
+frontend's read lands before `input_fetch_start`). A claim is fine for a measurement and never for a
+decision: nothing reads it to decide, and the live estimator learns from the lease's usage block, not
+from these times. A step the task reports as 0 ms has no timestamps.
+
+One definition of per-action overhead serves both arms, on the same server-stamped span:
+`overhead = (worker_completed - worker_start) - (execution_completed - execution_start)`. Report the
+fetch (`input_fetch_completed - input_fetch_start`) and the pack (`output_upload_completed -
+output_upload_start`) durations beside it as a breakdown, labelled by `phase_times`: a daemon's are
+measured and a task's are its claim. `queue`, `task` and `run` of `kbf_executor_phase_seconds` are good
+to one executor pass plus one or two agent heartbeats, so for actions shorter than a few heartbeats
+only `run` and `ingest` are usable.
 
 A daemon reads from the packs with `--pack-read` (off by default; the `[packs]` table of
 `kbf.toml`), which needs `--pack-store-endpoint`, `--pack-store-bucket` and
@@ -596,11 +635,22 @@ The cold store is the durable home of every blob: a `file://` directory on one h
   opens its cache on the answer. It holds the key in memory only, with core dumps off. The
   registered store must be the store the node's `--cold-store` names (endpoint, bucket and
   prefix), or the node keeps its own and reports `identity_mismatch`. The keys are probed
-  before the cache opens on them.
+  before the cache opens on them. `kbf node` passes `--cold-store registered` instead of that
+  URI, so the store is whatever the frontend has registered at each start: the node waits for a
+  registration, runs on its endpoint, bucket, prefix and keys, and never falls back. Moving the
+  farm to another endpoint is a new registration and a restart of each node. With `registered`
+  `--cold-store-credentials-file` is refused and the `AWS_*` variables are not read.
 - **A rotation reaches a node at its next start.** There is no hot swap; until then the
   frontend shows the node as `pending`.
-- **A fallback.** A node that has an `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` of its
-  own gives up on the frontend after four tries and starts on those. A node without them
+- **A node's own key pair is a file.** `--cold-store-credentials-file PATH` names a JSON file,
+  `{"access_key_id": "...", "secret_access_key": "..."}`, that the server's user owns with mode
+  0600 or 0400; a symbolic link or any other file is refused, at start, with exit 2, naming the
+  flag and the path and never the content. The same flag and file format serve `storage`,
+  `all-in-one` and `kbf-server` with an `s3://` `--cold-store`; a `file://` cold store refuses
+  it. `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` still work for one more release when no
+  file is named, and the start logs one warning that says they are deprecated (never a value).
+- **A fallback.** A node that has a key pair of its own (the file, or `AWS_ACCESS_KEY_ID` and
+  `AWS_SECRET_ACCESS_KEY`) gives up on the frontend after four tries and starts on those. A node without them
   waits for the frontend, as it waits for the registration.
 - **Who never holds a key.** A daemon holds no store and no credential. A frontend serves no
   blob itself. In `all-in-one` the cold store is a directory in the units, so there is no key.

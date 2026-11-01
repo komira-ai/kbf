@@ -417,6 +417,7 @@ pub struct FakeDrain {
     drains: Arc<Script<Result<(), PortError>>>,
     leases: Arc<Script<Result<usize, PortError>>>,
     undrains: Arc<Script<Result<(), PortError>>>,
+    placed: Arc<Script<Result<Placed, PortError>>>,
 }
 
 impl FakeDrain {
@@ -426,7 +427,24 @@ impl FakeDrain {
             drains: Arc::new(Script::new(Ok(()))),
             leases: Arc::new(Script::new(Ok(0))),
             undrains: Arc::new(Script::new(Ok(()))),
+            placed: Arc::new(Script::new(Ok(Placed::In))),
         }
+    }
+
+    /// What reading the node's placement says, in order, then `then` for ever after. A read is
+    /// not in the [`Log`]. Unscripted, a node is in placement.
+    pub fn script_placed(
+        &self,
+        alias: &str,
+        first: Vec<Result<Placed, PortError>>,
+        then: Result<Placed, PortError>,
+    ) {
+        self.placed.set(alias, first, then);
+    }
+
+    /// An operator drained the node before the roll came: every read says it is out.
+    pub fn operator_drained(&self, alias: &str) {
+        self.script_placed(alias, vec![], Ok(Placed::Out));
     }
 
     pub fn script_drain(
@@ -459,8 +477,8 @@ impl FakeDrain {
 }
 
 impl Drain for FakeDrain {
-    fn placed(&self, _host: &Host) -> Result<Placed, PortError> {
-        Ok(Placed::In)
+    fn placed(&self, host: &Host) -> Result<Placed, PortError> {
+        self.placed.next(&host.alias)
     }
 
     fn drain(&self, host: &Host, deadline: Option<Duration>) -> Result<(), PortError> {

@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 
 const XTASK: &str = env!("CARGO_BIN_EXE_xtask");
 const FAKE: &str = env!("CARGO_BIN_EXE_xtask-fake");
+const RUN: &str = "repos/o/r/actions/runs/7";
 const JOBS: &str = "repos/o/r/actions/runs/7/jobs?filter=latest&per_page=100";
 const ARTIFACTS: &str = "repos/o/r/actions/runs/7/artifacts?per_page=100";
 
@@ -69,7 +70,7 @@ fn made(names: &[&str]) -> Value {
 fn returns_when_the_named_artifacts_have_been_uploaded() {
     let f = fx(
         "ready",
-        &json!({ JOBS: running(), ARTIFACTS: made(&["profraw-legacy-1", "profraw-js-1"]) }),
+        &json!({ RUN: json!({}), JOBS: running(), ARTIFACTS: made(&["profraw-legacy-1", "profraw-js-1"]) }),
     );
     let (code, out, err) = f.run("3");
     assert_eq!(code, Some(0), "{err}");
@@ -85,7 +86,7 @@ fn returns_when_the_named_artifacts_have_been_uploaded() {
 fn gives_up_and_stops_for_a_failed_shard() {
     let f = fx(
         "short",
-        &json!({ JOBS: running(), ARTIFACTS: made(&["profraw-js-1"]) }),
+        &json!({ RUN: json!({}), JOBS: running(), ARTIFACTS: made(&["profraw-js-1"]) }),
     );
     let (code, _, err) = f.run("2");
     assert_eq!(code, Some(1));
@@ -98,7 +99,10 @@ fn gives_up_and_stops_for_a_failed_shard() {
 
     let failed =
         json!({ "jobs": [{ "name": "test-shard (legacy-1-of-3)", "conclusion": "failure" }] });
-    let f = fx("failed", &json!({ JOBS: failed, ARTIFACTS: made(&[]) }));
+    let f = fx(
+        "failed",
+        &json!({ RUN: json!({}), JOBS: failed, ARTIFACTS: made(&[]) }),
+    );
     let (code, _, err) = f.run("2");
     assert_eq!(code, Some(1));
     assert!(
@@ -123,7 +127,10 @@ fn a_missing_run_fails_after_the_failed_looks_in_a_row() {
 /// nothing.
 #[test]
 fn it_needs_an_artifact_to_wait_for() {
-    let f = fx("none", &json!({ JOBS: running(), ARTIFACTS: made(&[]) }));
+    let f = fx(
+        "none",
+        &json!({ RUN: json!({}), JOBS: running(), ARTIFACTS: made(&[]) }),
+    );
     let out = Command::new(XTASK)
         .args(["wait-artifacts", "--repo", "o/r", "--run-id", "7"])
         .args(["--job-prefix", "test-shard", "--gh"])
@@ -167,7 +174,7 @@ fn a_rerun_counts_the_artifacts_of_the_shards_that_ran_in_it() {
     ]});
     let f = fx(
         "rerun-all",
-        &json!({ JOBS: everything, ARTIFACTS: { "artifacts": [
+        &json!({ RUN: json!({ "run_attempt": 2, "run_started_at": start }), JOBS: everything, ARTIFACTS: { "artifacts": [
             dated("profraw-legacy-1", old), dated("profraw-js-1", old)
         ]}}),
     );
@@ -184,7 +191,7 @@ fn a_rerun_counts_the_artifacts_of_the_shards_that_ran_in_it() {
     ]});
     let f = fx(
         "rerun-failed",
-        &json!({ JOBS: failed_only, ARTIFACTS: { "artifacts": [
+        &json!({ RUN: json!({ "run_attempt": 2, "run_started_at": start }), JOBS: failed_only, ARTIFACTS: { "artifacts": [
             dated("profraw-legacy-1", old), dated("profraw-js-1", new)
         ]}}),
     );

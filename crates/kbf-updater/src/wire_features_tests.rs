@@ -300,7 +300,7 @@ fn a_bad_services_list_and_a_bad_new_field_are_both_dropped() {
 fn a_heartbeat_that_is_wrong_beyond_its_new_fields_is_still_refused() {
     let mut wire = full_beat();
     wire["agent_features"] = json!(["Upper"]);
-    wire["health"] = json!("absent");
+    wire["health"] = json!("sick");
     assert!(read_heartbeat(&serde_json::to_vec(&wire).expect("json")).is_err());
 }
 
@@ -397,6 +397,7 @@ fn an_answer_with_features_names_them_after_the_reply_and_reads_back() {
             Answer {
                 reply: ServiceReply::Nothing,
                 features: Some(vec![]),
+                halts: Default::default(),
             },
             r#"{"reply":"nothing","features":[]}"#,
         ),
@@ -407,6 +408,7 @@ fn an_answer_with_features_names_them_after_the_reply_and_reads_back() {
                     version: v("2.0"),
                 },
                 features: Some(vec!["deferred-v1".to_owned()]),
+                halts: Default::default(),
             },
             r#"{"reply":"update","service":"db","version":"2.0","features":["deferred-v1"]}"#,
         ),
@@ -437,6 +439,7 @@ fn an_answer_equals_the_reply_it_carries() {
     let answer = Answer {
         reply: ServiceReply::Nothing,
         features: Some(vec!["x".to_owned()]),
+        halts: Default::default(),
     };
     assert_eq!(answer, ServiceReply::Nothing);
     assert_eq!(answer, Reply::Nothing);
@@ -450,12 +453,7 @@ fn an_answer_equals_the_reply_it_carries() {
 fn the_new_facts_at_their_bounds_stay_inside_the_budget() {
     let token = "r".repeat(64);
     let step_secs: serde_json::Map<String, Value> = (0..8)
-        .map(|i| {
-            (
-                format!("{:_<16}", format!("s{i}")),
-                json!(4_294_967_295_u64),
-            )
-        })
+        .map(|i| (format!("{:_<16}", format!("s{i}")), json!(u64::MAX)))
         .collect();
     let facts = json!({
         "step": {"name": "n".repeat(16), "attempt": 4_294_967_295_u64},

@@ -742,15 +742,21 @@ fn reconcile_moves_links_to_the_state_and_leaves_a_consistent_host_alone() {
 }
 
 /// Catches a retention that loses the rollback target: after two confirmed swaps the
-/// running release, the previous one and one more (the newest of the rest) are kept,
-/// the others removed, and a revert still works.
+/// running release, the previous one and the four newest of the rest (the default) are
+/// kept, the others removed, and a revert still works.
 ///
 /// Catches: `gc` not keeping the state's previous; the newest-first order
-/// reversed.
+/// reversed; a default of fewer than four.
 #[test]
-fn retention_keeps_the_running_the_previous_and_one_more() {
+fn retention_keeps_the_running_the_previous_and_the_four_newest_others() {
+    assert_eq!(crate::retain::DEFAULT_KEEP, 4);
     let (mut exec, layout) = host("retention");
     running(&exec, &layout, A, &[B, C, D, E]);
+    // Three older ones: with A, D and E that makes six others, so two go.
+    let (x, y, z) = ("1".repeat(40), "2".repeat(40), "3".repeat(40));
+    for (release, age) in [(&x, 10), (&y, 20), (&z, 30)] {
+        seed(&exec, release, age);
+    }
     for (n, (release, id)) in [(B, "o1"), (C, "o2")].into_iter().enumerate() {
         assert_eq!(
             go(&mut exec, &layout, &order(release, id, 5 + n as u64), START),
@@ -766,7 +772,7 @@ fn retention_keeps_the_running_the_previous_and_one_more() {
     release::gc(
         &mut exec,
         &layout,
-        1,
+        crate::retain::DEFAULT_KEEP,
         &Default::default(),
         Mode::Apply,
         &mut Vec::new(),
@@ -778,10 +784,11 @@ fn retention_keeps_the_running_the_previous_and_one_more() {
         .filter(|name| name != "current" && name != "previous")
         .collect();
     left.sort();
+    let mut want = [A, B, C, D, E, z.as_str()];
+    want.sort_unstable();
     assert_eq!(
-        left,
-        [B, C, E],
-        "the running, the previous and the newest other"
+        left, want,
+        "the running, the previous and the four newest others"
     );
 
     let done = revert(&mut exec, &layout, &mut Vec::new()).expect("revert");

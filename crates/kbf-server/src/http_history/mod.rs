@@ -51,6 +51,13 @@ use crate::http_invocations::{CALL, InvocationReaders, bad_answer};
 pub(crate) use cross::router as cross_router;
 pub(crate) use run::router as run_router;
 
+/// One run as `GET /v1/runs/{id}` answers it. The replay exporter's tests read their fake
+/// farm's runs through this, so the shape they read is the one the route writes.
+#[must_use]
+pub fn run_json(record: &RunRecord) -> serde_json::Value {
+    run::render(record)
+}
+
 /// Which blobs the cache holds, with the cache's type erased: a run's links to its logs
 /// are to the blob while it is held.
 pub(crate) trait Presence: Send + Sync {

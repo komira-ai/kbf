@@ -23,12 +23,14 @@ use kbf_sched::{LoadCounters, QueueView};
 use kbf_types::{MemoryRun, OperationId, WorkerId};
 
 use super::JsFarm;
+use crate::farm::cordon_owner;
 use crate::farm::failed_actions::FailedActions;
 use crate::farm::nodes::{detail_of, look_of, node_of};
 use crate::farm::sched_view::{LeaseViews, WholeView, whole_of};
 use crate::farm::{NodeLook, NodeUnread, StreamId, node_load};
 use crate::farm_js::KbfAdapter;
 use crate::farm_js::ablation::Ablation;
+use crate::farm_js::usage::UsageStats;
 use crate::fleet::{NodeDetail, NodeView, NodesView};
 
 /// `worker`, which the machine knows, as the node list shows it.
@@ -96,13 +98,14 @@ pub(crate) fn node_detail(
             let capacity = view.sched().capacity(worker).unwrap_or_default();
             let load = node_load::shown(adapter.node_loads(), worker, &capacity, js.now());
             let input_cache = adapter.input_cache_of(worker);
-            detail_of(
+            let detail = detail_of(
                 listed(js, view, adapter, worker),
                 view.sched(),
                 worker,
                 load,
                 input_cache,
-            )
+            );
+            cordon_owner::with_owner(detail, || cordon_owner::shown(js.store.as_deref(), worker))
         };
         Ok(node.map(detail))
     })
@@ -162,6 +165,11 @@ pub(crate) fn queue_view(js: &JsFarm) -> QueueView {
 /// [`Farm::load_counters`](crate::farm::Farm::load_counters).
 pub(crate) fn load_counters(js: &JsFarm) -> LoadCounters {
     js.core.with(|view, _| view.sched().load_counters())
+}
+
+/// [`Farm::usage_stats`](crate::farm::Farm::usage_stats).
+pub(crate) fn usage_stats(js: &JsFarm) -> Option<UsageStats> {
+    js.usage.as_ref().map(|usage| usage.stats())
 }
 
 /// [`Farm::ablation`](crate::farm::Farm::ablation).

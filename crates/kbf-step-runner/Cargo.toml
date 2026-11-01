@@ -1,0 +1,31 @@
+[package]
+name = "kbf-step-runner"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# The step runner of the generic host updater (docs/design/host-updates.md, migration step 4):
+# the persisted step record and its resume, the dead-man that enforces the bounds on a thread of
+# its own, the exit codes read as outcomes through `update-hook`, the check of the staged artifact
+# before any run, the registration socket (liveness and version, `SO_PEERCRED`) and the updater's
+# own update with its fallback. It runs a step through a `StepLauncher` it is given and knows no
+# service and no declaration: the launcher of the transient units and the declaration loader are
+# migration step 3. Synchronous, threads and blocking sockets.
+[dependencies]
+update-hook = { path = "../update-hook" }
+# `SO_PEERCRED` (Linux) and the monotonic clock.
+rustix = { workspace = true, features = ["fs", "net", "process", "time"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+# The client of the registration socket, run against the server of `register` (tests/register_client.rs).
+update-register = { path = "../update-register" }
+
+[lints]
+workspace = true
