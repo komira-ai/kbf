@@ -242,7 +242,10 @@ async fn a_learned_curve_changes_the_placement() {
     assert_eq!(record.started(), (false, false), "charged flat, no node");
     assert_eq!(record.queued(), 1, "the action waits");
     assert_eq!(record.since().admitted, 0);
-    assert!(record.since().blocked > 0, "the load held it back");
+    assert!(
+        record.since().blocked > 0,
+        "both nodes were over the load rule at the flat charge, so the scheduler counted the queued action as blocked by load"
+    );
 }
 
 /// Catches the counters not seeing the curve: under `on` the admission is charged by the
