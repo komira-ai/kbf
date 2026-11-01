@@ -233,16 +233,21 @@ pub struct ConfigArgs {
     /// Seed of the content generator, so a tree or a body is the same bytes on every run.
     #[arg(long, default_value_t = 1)]
     pub seed: u64,
-    /// Load gate: highest one-minute load average.
+    /// Load gate: highest one-minute load average. Judged by the preflight only: it carries the
+    /// run's own requests and fsyncs and takes a minute to clear, so it cannot tell the run from
+    /// other work between or inside passes.
     #[arg(long, default_value_t = 8.0)]
     pub max_loadavg_1m: f64,
-    /// Load gate: highest CPU pressure (some, ten-second average, percent).
+    /// Load gate: highest CPU pressure (some, percent): the ten-second average at preflight and
+    /// inside a pass, the share of the quiet window before a pass.
     #[arg(long, default_value_t = 10.0)]
     pub max_psi_cpu_avg10: f64,
-    /// Load gate: highest IO pressure (some, ten-second average, percent).
+    /// Load gate: highest IO pressure (some, percent): the ten-second average at preflight and
+    /// inside a pass, the share of the quiet window before a pass.
     #[arg(long, default_value_t = 10.0)]
     pub max_psi_io_avg10: f64,
-    /// Load gate: highest utilisation of the busiest disk, percent.
+    /// Load gate: highest utilisation of the busiest disk, percent: since the previous reading
+    /// at preflight and inside a pass, over the quiet window before a pass.
     #[arg(long, default_value_t = 60.0)]
     pub max_disk_util_pct: f64,
     /// Cold store guard: the run stops when the p99 latency of the harness's own requests to the

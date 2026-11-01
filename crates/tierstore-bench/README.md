@@ -231,7 +231,13 @@ number of measured requests of an arm is `(passes - 1) x requests per pass`: 10,
 
 The rules (also in `cells/mod.rs`): pass 0 of every arm is a discarded warm-up, arms are
 interleaved across passes, the load gate is read before a pass and every few completions in it
-(a trip ends the run and marks the pass busy), a cell is refused before it sends anything when
+(a trip ends the run and marks the pass busy). Before a pass it is read over a quiet window of
+its own (two seconds, the disk's busy time and the CPU and IO stall time of the window only), so
+that the pass just ended is not taken for other work on the machine; `--max-loadavg-1m` is judged
+by `preflight` only, as the load average carries the run's own requests and fsyncs, and the
+pressure and disk limits keep their names and are read over the window instead of the ten-second
+average. Inside a pass the pressure and disk figures are the kernel's averages and the interval
+since the last reading, which include the pass's own load. A cell is refused before it sends anything when
 its cold bytes are over the pass, cell or campaign cap, requests are held to the rate caps, and
 a p99 is filled in only from quiet passes with 1,000 requests or more. Fault arms (`latency`,
 `bandwidth`, `refused`, `blackhole`, and `proxy-pass` as the control) need the fault proxy as a

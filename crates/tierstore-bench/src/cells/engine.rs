@@ -123,12 +123,39 @@ pub trait LoadSource: Send + Sync {
     }
 }
 
-/// The machine this process runs on, through [`LoadSample::read`].
-pub struct ProcLoad;
+/// The machine this process runs on, through [`LoadSample::read`] and, before a pass,
+/// [`LoadSample::read_quiet`] over a window of `settle`.
+pub struct ProcLoad {
+    settle: Duration,
+}
+
+impl ProcLoad {
+    /// This machine, with the quiet window of [`crate::procload::SETTLE`].
+    #[must_use]
+    pub const fn new() -> Self {
+        Self::with_settle(crate::procload::SETTLE)
+    }
+
+    /// This machine, with a quiet window of `settle`.
+    #[must_use]
+    pub const fn with_settle(settle: Duration) -> Self {
+        Self { settle }
+    }
+}
+
+impl Default for ProcLoad {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl LoadSource for ProcLoad {
     fn sample(&self) -> Result<LoadSample, BenchError> {
         LoadSample::read()
+    }
+
+    fn quiet_sample(&self) -> Result<LoadSample, BenchError> {
+        LoadSample::read_quiet(self.settle)
     }
 
     fn disk_busy_ms(&self) -> Result<BTreeMap<String, u64>, BenchError> {
@@ -476,12 +503,24 @@ impl Env {
         format!("tierstore-bench/{run}")
     }
 
-    /// Reads the load gate: the first limit the machine is over, if one.
+    /// Reads the load gate inside a pass: the first limit the machine is over, if one. The
+    /// one-minute load average is not judged (see [`crate::gate::LoadGate::check_run`]).
     ///
     /// # Errors
     /// [`BenchError`] if the machine cannot be read.
     pub fn gate(&self) -> Result<Option<Trip>, BenchError> {
-        Ok(self.config.gate.check(&self.load.sample()?).err())
+        Ok(self.config.gate.check_run(&self.load.sample()?).err())
+    }
+
+    /// Reads the load gate before a pass, over a quiet window of its own
+    /// ([`LoadSource::quiet_sample`]): the pass that just ended is not read as other work on
+    /// the machine. The window is waited for in this call, which blocks its thread: between
+    /// passes nothing else of the cell is running.
+    ///
+    /// # Errors
+    /// [`BenchError`] if the machine cannot be read.
+    pub fn gate_quiet(&self) -> Result<Option<Trip>, BenchError> {
+        Ok(self.config.gate.check_run(&self.load.quiet_sample()?).err())
     }
 
     /// Shows the cold store guard the cold requests among `steps`, which finished now, and judges
@@ -917,7 +956,7 @@ async fn run_pass(
     pass: u32,
     acc: &mut BTreeMap<String, Acc>,
 ) -> Result<Option<Stop>, BenchError> {
-    if let Some(trip) = env.gate()? {
+    if let Some(trip) = env.gate_quiet()? {
         let empty = pass_result(pass, Window::Busy, Duration::ZERO, Some(&trip), None, &[]);
         acc.entry(arm.label.clone()).or_default().passes.push(empty);
         return Ok(Some(Stop::Gate(trip)));
@@ -1345,6 +1384,17 @@ mod tests {
         assert_eq!(seen.lock().unwrap().len(), 8);
     }
 
+    /// Catches a source of this machine that does not read it before a pass: with a window of
+    /// no length, `quiet_sample` and `sample` both give figures of `/proc`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn this_machine_is_read_before_a_pass_over_the_window_it_was_given() {
+        let load = ProcLoad::with_settle(Duration::ZERO);
+        assert!(load.quiet_sample().unwrap().loadavg_1m >= 0.0);
+        assert!(load.sample().unwrap().loadavg_1m >= 0.0);
+        assert!(ProcLoad::default().quiet_sample().unwrap().loadavg_1m >= 0.0);
+    }
+
     /// Catches a gate that cannot be read being taken for a calm machine.
     #[tokio::test]
     async fn a_machine_that_cannot_be_read_stops_the_run() {
@@ -1691,7 +1741,7 @@ mod tests {
     #[test]
     fn an_unconfigured_role_has_no_client() {
         let dir = temp("tb-engine-roles");
-        let env = env(dir.path(), Window::Busy, Arc::new(ProcLoad));
+        let env = env(dir.path(), Window::Busy, Arc::new(ProcLoad::new()));
         assert!(matches!(
             env.s3(Role::Cold, Cap::Cold),
             Err(BenchError::Config(_))

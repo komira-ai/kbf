@@ -181,7 +181,7 @@ pub async fn run_with_faults(
     plan: &CellPlan,
     faults: Option<Arc<dyn FaultSwitch>>,
 ) -> Result<Vec<CellResult>, BenchError> {
-    let load = || Arc::new(ProcLoad);
+    let load = || Arc::new(ProcLoad::new());
     match id {
         CellId::ColdPut => cold_put::run_with(ctx, plan, load(), faults, None).await,
         CellId::ColdRead => cold_read::run_with(ctx, plan, load(), faults, None).await,

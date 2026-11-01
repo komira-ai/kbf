@@ -7,7 +7,7 @@
 
 use std::path::Path;
 use std::sync::OnceLock;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -17,13 +17,17 @@ use crate::procload::Reader;
 /// The limits. A sample above any one of them trips the gate.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LoadGate {
-    /// One-minute load average of the machine that sends the load.
+    /// One-minute load average of the machine that sends the load; judged at preflight only
+    /// (see [`LoadGate::check_run`]).
     pub max_loadavg_1m: f64,
-    /// Pressure stall information, CPU, "some" share over ten seconds, in percent.
+    /// Pressure stall information, CPU, "some" share, in percent: over ten seconds at preflight
+    /// and inside a pass, over the quiet window before a pass.
     pub max_psi_cpu_avg10: f64,
-    /// Pressure stall information, IO, "some" share over ten seconds, in percent.
+    /// Pressure stall information, IO, "some" share, in percent: over ten seconds at preflight
+    /// and inside a pass, over the quiet window before a pass.
     pub max_psi_io_avg10: f64,
-    /// Utilisation of the busiest disk the run touches, in percent.
+    /// Utilisation of the busiest disk, in percent: since the previous reading at preflight and
+    /// inside a pass, over the quiet window before a pass.
     pub max_disk_util_pct: f64,
 }
 
@@ -32,9 +36,9 @@ pub struct LoadGate {
 pub struct LoadSample {
     /// One-minute load average.
     pub loadavg_1m: f64,
-    /// CPU pressure, "some", ten-second average, percent.
+    /// CPU pressure, "some", percent: the ten-second average, or the share of a quiet window.
     pub psi_cpu_avg10: f64,
-    /// IO pressure, "some", ten-second average, percent.
+    /// IO pressure, "some", percent: the ten-second average, or the share of a quiet window.
     pub psi_io_avg10: f64,
     /// Utilisation of the busiest disk, percent.
     pub disk_util_pct: f64,
@@ -85,13 +89,19 @@ impl LoadGate {
 }
 
 impl LoadGate {
-    /// As [`LoadGate::check`] for the gate a run holds between and inside passes (stub of the
-    /// scaffold: it checks everything).
+    /// As [`LoadGate::check`], for the gate a run holds before and inside its passes: the
+    /// one-minute load average is not judged. It counts the run's own in-flight requests and
+    /// fsyncs and decays over a minute, so no window short enough to sit between passes can
+    /// tell the run's load from anyone else's; the preflight judges it, on a machine the run
+    /// has not touched yet. The other three measures are as in [`LoadGate::check`].
     ///
     /// # Errors
     /// [`Trip`], naming the measure.
     pub fn check_run(&self, sample: &LoadSample) -> Result<(), Trip> {
-        self.check(sample)
+        self.check(&LoadSample {
+            loadavg_1m: 0.0,
+            ..*sample
+        })
     }
 }
 
@@ -102,12 +112,34 @@ impl LoadSample {
     /// # Errors
     /// [`BenchError`] if the machine has no such files or they are not `/proc` text.
     pub fn read() -> Result<Self, BenchError> {
-        static START: OnceLock<Instant> = OnceLock::new();
-        static READER: Reader = Reader::new();
-        let now_ms = u64::try_from(START.get_or_init(Instant::now).elapsed().as_millis())
-            .unwrap_or(u64::MAX);
-        READER.read(Path::new("/proc"), Path::new("/sys/block"), now_ms)
+        READER.read(Path::new("/proc"), Path::new("/sys/block"), now_ms())
     }
+
+    /// Reads the sample for the gate before a pass: the disk and the pressure are measured over
+    /// a quiet window of `settle` that begins now (see [`Reader::read_quiet`]), so the pass that
+    /// just ended is not counted. Blocks for `settle`.
+    ///
+    /// # Errors
+    /// [`BenchError`] if the machine has no such files or they are not `/proc` text.
+    pub fn read_quiet(settle: Duration) -> Result<Self, BenchError> {
+        READER.read_quiet(
+            Path::new("/proc"),
+            Path::new("/sys/block"),
+            now_ms(),
+            || {
+                std::thread::sleep(settle);
+                now_ms()
+            },
+        )
+    }
+}
+
+static START: OnceLock<Instant> = OnceLock::new();
+static READER: Reader = Reader::new();
+
+/// Milliseconds since the first reading of this process, on a monotonic clock.
+fn now_ms() -> u64 {
+    u64::try_from(START.get_or_init(Instant::now).elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
@@ -228,5 +260,7 @@ mod tests {
     fn this_machine_can_be_read() {
         let sample = LoadSample::read().unwrap();
         assert!(sample.loadavg_1m >= 0.0);
+        let quiet = LoadSample::read_quiet(Duration::ZERO).unwrap();
+        assert!(quiet.loadavg_1m >= 0.0);
     }
 }

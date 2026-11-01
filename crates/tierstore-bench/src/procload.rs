@@ -5,10 +5,16 @@
 //! since the previous read, so the first read of a [`Reader`] reports 0 for it; loop, ram and
 //! zram devices are left out. A machine without these files is an error: a gate that cannot see
 //! is not a gate.
+//!
+//! [`Reader::read`] is the reading inside a pass and at preflight: the averages as the kernel
+//! keeps them. [`Reader::read_quiet`] is the reading before a pass: the disk and the pressure
+//! are measured over a window that begins when it is called, so the pass that just ended (whose
+//! IO and stalls the averages still carry) is not read as other work on the machine.
 
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Mutex, PoisonError};
+use std::time::Duration;
 
 use crate::error::BenchError;
 use crate::gate::LoadSample;
@@ -26,6 +32,20 @@ pub fn parse_psi_some_avg10(text: &str) -> Option<f64> {
     let line = text.lines().find(|l| l.starts_with("some "))?;
     line.split_whitespace()
         .find_map(|field| field.strip_prefix("avg10="))?
+        .parse()
+        .ok()
+}
+
+/// The quiet window before a pass: long enough for the disk's busy counter (milliseconds) and the
+/// pressure totals (microseconds) to move by a figure worth a percentage, short against a pass.
+pub const SETTLE: Duration = Duration::from_secs(2);
+
+/// The `total=` of the `some` line of a `/proc/pressure/*` file: microseconds some task stalled.
+#[must_use]
+pub fn parse_psi_some_total_us(text: &str) -> Option<u64> {
+    let line = text.lines().find(|l| l.starts_with("some "))?;
+    line.split_whitespace()
+        .find_map(|field| field.strip_prefix("total="))?
         .parse()
         .ok()
 }
@@ -137,11 +157,7 @@ impl Reader {
         sys_block: &Path,
         now_ms: u64,
     ) -> Result<LoadSample, BenchError> {
-        let text = |relative: &str| {
-            let path = proc_root.join(relative);
-            std::fs::read_to_string(&path).map_err(|source| BenchError::Io { path, source })
-        };
-        let unreadable = || BenchError::Request("load figures of /proc cannot be parsed");
+        let text = |relative: &str| read_text(proc_root, relative);
         let loadavg_1m = parse_loadavg_1m(&text("loadavg")?).ok_or_else(unreadable)?;
         let psi_cpu_avg10 = parse_psi_some_avg10(&text("pressure/cpu")?).ok_or_else(unreadable)?;
         let psi_io_avg10 = parse_psi_some_avg10(&text("pressure/io")?).ok_or_else(unreadable)?;
@@ -163,7 +179,14 @@ impl Reader {
         })
     }
 
-    /// The load after a quiet window (stub of the scaffold: reads like [`Reader::read`]).
+    /// The load before a pass, over a quiet window of its own: the disk figure and both pressure
+    /// figures are what the disks and the stall totals did between the start of the window and
+    /// its end, not the kernel's ten-second averages and not the time since the previous read.
+    /// The load average is the kernel's, as in [`Reader::read`]. The window becomes the
+    /// interval the next [`Reader::read`] measures from.
+    ///
+    /// `start_ms` is a reading of the caller's monotonic clock; `wait` lets the window pass and
+    /// gives the clock again (a test moves the fake files and returns a number).
     ///
     /// # Errors
     /// As [`Reader::read`].
@@ -172,10 +195,56 @@ impl Reader {
         proc_root: &Path,
         sys_block: &Path,
         start_ms: u64,
-        _wait: impl FnOnce() -> u64,
+        wait: impl FnOnce() -> u64,
     ) -> Result<LoadSample, BenchError> {
-        self.read(proc_root, sys_block, start_ms)
+        let disks_before = disk_busy_snapshot(proc_root, sys_block)?;
+        let (cpu_before, io_before) = pressure_totals(proc_root)?;
+        let now_ms = wait();
+        let wall_ms = now_ms.saturating_sub(start_ms);
+        let loadavg_1m =
+            parse_loadavg_1m(&read_text(proc_root, "loadavg")?).ok_or_else(unreadable)?;
+        let (cpu_after, io_after) = pressure_totals(proc_root)?;
+        let disks_after = disk_busy_snapshot(proc_root, sys_block)?;
+        let disks_now: Vec<(String, u64)> = disks_after
+            .iter()
+            .map(|(name, ticks)| (name.clone(), *ticks))
+            .collect();
+        let disk_util_pct = busiest_disk_pct(&disks_before, &disks_now, wall_ms);
+        *self.previous.lock().unwrap_or_else(PoisonError::into_inner) = Some((now_ms, disks_after));
+        Ok(LoadSample {
+            loadavg_1m,
+            psi_cpu_avg10: stall_pct(cpu_before, cpu_after, wall_ms),
+            psi_io_avg10: stall_pct(io_before, io_after, wall_ms),
+            disk_util_pct,
+        })
     }
+}
+
+/// The text of `relative` under `proc_root`.
+fn read_text(proc_root: &Path, relative: &str) -> Result<String, BenchError> {
+    let path = proc_root.join(relative);
+    std::fs::read_to_string(&path).map_err(|source| BenchError::Io { path, source })
+}
+
+/// The error for a file that is there and is not `/proc` text.
+fn unreadable() -> BenchError {
+    BenchError::Request("load figures of /proc cannot be parsed")
+}
+
+/// The stall totals (microseconds) of CPU and IO pressure now.
+fn pressure_totals(proc_root: &Path) -> Result<(u64, u64), BenchError> {
+    let total = |relative: &str| {
+        parse_psi_some_total_us(&read_text(proc_root, relative)?).ok_or_else(unreadable)
+    };
+    Ok((total("pressure/cpu")?, total("pressure/io")?))
+}
+
+/// The share of `wall_ms` that went to stalls, percent, at most 100, from the totals before and
+/// after in microseconds; a `wall_ms` of 0 is read as 1, a total that went back as no stall.
+fn stall_pct(before_us: u64, after_us: u64, wall_ms: u64) -> f64 {
+    // At most a few days of microseconds: exactly representable.
+    let pct = after_us.saturating_sub(before_us) as f64 / (wall_ms.max(1) as f64 * 10.0);
+    pct.min(100.0)
 }
 
 #[cfg(test)]
@@ -373,6 +442,33 @@ mod tests {
             })
             .unwrap();
         assert_eq!((quiet.psi_cpu_avg10, quiet.psi_io_avg10), (30.0, 5.0));
+    }
+
+    /// Catches a quiet sample that takes a file it cannot read for a calm machine: a pressure
+    /// file without a stall total, and a machine without the files.
+    #[test]
+    fn a_machine_that_cannot_be_read_quietly_is_an_error() {
+        let dir = TestDir::under(std::env::temp_dir(), "tb-procload-quiet-bad");
+        let (proc_root, sys_block) = machine(&dir, 0);
+        assert_eq!(parse_psi_some_total_us(PSI), Some(1));
+        assert_eq!(parse_psi_some_total_us("some avg10=1.0\n"), None);
+        assert_eq!(parse_psi_some_total_us("full total=1\n"), None);
+        write(&proc_root, "pressure/io", "some avg10=1.0\n");
+        let reader = Reader::new();
+        let err = reader
+            .read_quiet(&proc_root, &sys_block, 0, || 1)
+            .unwrap_err();
+        assert!(matches!(err, BenchError::Request(_)), "{err}");
+        let err = reader
+            .read_quiet(&dir.path().join("absent"), &sys_block, 0, || 1)
+            .unwrap_err();
+        assert!(matches!(err, BenchError::Io { .. }), "{err}");
+        let (proc_root, sys_block) = machine(&dir, 0);
+        write(&proc_root, "loadavg", "nonsense");
+        let err = reader
+            .read_quiet(&proc_root, &sys_block, 0, || 1)
+            .unwrap_err();
+        assert!(matches!(err, BenchError::Request(_)), "{err}");
     }
 
     /// Catches a machine without the files being read as calm, and one whose files are not

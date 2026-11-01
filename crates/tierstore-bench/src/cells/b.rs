@@ -226,7 +226,7 @@ fn arm(label: String, in_flight: u32, misses: &Arc<Misses>) -> Arm {
 /// [`BenchError`] if the instance is not configured, the objects cannot be written, the ledger
 /// refuses the cell, the load gate trips or cannot be read, or a file or the request log fails.
 pub async fn run(ctx: &CellContext, plan: &CellPlan) -> Result<Vec<CellResult>, BenchError> {
-    run_with(ctx, plan, Arc::new(ProcLoad), None).await
+    run_with(ctx, plan, Arc::new(ProcLoad::new()), None).await
 }
 
 /// [`run`] with the machine given and the objects of a pass capped at `limit`.
