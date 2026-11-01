@@ -709,6 +709,8 @@ async fn a_fill_waits_for_the_evictor_holding_its_key() {
     let gates = Gates::new();
     let clock = FakeClock::at(1000);
     let cache = Cache::open(config(&dir, 200, Arc::clone(&gates), &clock)).expect("open");
+    // The start-up drain must be done, or it could be the evictor held on K.
+    gates.wait_started();
     let one = |c: u8| cas.tree(&[file("f", &[c; 100], false)]);
     let k = key(&[b'k'; 100], false);
     lease(&cas, &cache, &one(b'k'), &dir, "k").await.expect("k");
