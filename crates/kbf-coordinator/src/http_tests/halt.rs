@@ -676,3 +676,30 @@ async fn the_reports_received_while_halted_survive_a_restart() {
     send(&rig, "s1", "storage", &beat("1.0", HALT)).await;
     assert_ne!(convergence(&rig, "kbf").await["state"], "halted");
 }
+
+/// Catches: a clear that acknowledges fewer reports than the service received: hosts A, B and C
+/// each report a halt (A first, so the convergence names A), the operator clears once, and then
+/// each repeats its report: nothing halts again, and the three are acknowledged. A host of
+/// another service is untouched.
+#[tokio::test]
+async fn three_hosts_halt_one_clear_and_none_re_halts() {
+    let rig = farm("halt-three-hosts").await;
+    for host in ["s1", "s2", "s3"] {
+        send(&rig, host, "storage", &beat("1.0", HALT)).await;
+    }
+    assert_eq!(convergence(&rig, "kbf").await["halt"]["node_id"], "s1");
+    clear(&rig, "kbf").await;
+    for host in ["s1", "s2", "s3"] {
+        send(&rig, host, "storage", &beat("1.0", HALT)).await;
+        assert_ne!(convergence(&rig, "kbf").await["state"], "halted", "{host}");
+    }
+    let acked = status(&rig).await["ops"]["services"]["kbf"]["halt_acked"].clone();
+    assert_eq!(
+        acked,
+        json!([
+            {"node_id": "s1", "target": "2.0"},
+            {"node_id": "s2", "target": "2.0"},
+            {"node_id": "s3", "target": "2.0"}
+        ])
+    );
+}
