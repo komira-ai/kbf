@@ -37,9 +37,10 @@
 //! server had seen when the attempt ended, so the CI-job view can split a build whose early
 //! calls sent none. A joined operation is exported once per waiting invocation, each copy
 //! with its own run id and the same operation and lease. Each invocation's build counts it (it
-//! did wait); the attempt counts, queue wait, kill rates, phases and the CI-job view count the
-//! attempt (operation and lease) once, from its first copy. A row that names no operation or
-//! no lease, as in an export that predates them, is its own attempt: such an export keeps
+//! did wait); the attempt counts, queue wait, kill rates and phases count the attempt
+//! (operation and lease) once per arm, from its first copy, and the CI-job view once per job.
+//! A row that names no operation or no lease (or the zero lease `0.0` of an attempt never
+//! granted one), as in an export that predates them, is its own attempt: such an export keeps
 //! the old counting, one per waiter.
 //!
 //! **Phases**: input fetch, execution and pack (the output upload) of each attempt, from its
@@ -139,16 +140,25 @@ fn percentiles(values: Vec<u64>) -> Percentiles {
     builds::spread(values)
 }
 
-/// `rows` with one row for each attempt: a joined operation is exported once per waiting
-/// invocation, each copy with its own run id and the same operation and lease, and the first
-/// copy stands for the attempt. A row that names no operation or no lease (an export that
-/// predates them) is its own attempt, as it was counted before.
-fn once_per_attempt(rows: &[Row]) -> Cow<'_, [Row]> {
+/// The lease an attempt that was never granted one exports (`<epoch>.<seq>` of the zero
+/// record fields). The record keeps no other marker: it is such an attempt's own, not a
+/// lease that two rows share.
+const NO_LEASE: &str = "0.0";
+
+/// `rows` with one row for each attempt within `scope` (the arm when it gives `None`, else
+/// the CI job): a joined operation is exported once per waiting invocation, each copy with
+/// its own run id and the same operation and lease, and the first copy in the scope stands
+/// for the attempt. A row that names no operation or no lease, or the zero lease of an
+/// attempt never granted one (an export that predates them, or a refusal before a grant), is
+/// its own attempt, as it was counted before.
+fn once_per_attempt<'a>(rows: &'a [Row], scope: fn(&Row) -> Option<&str>) -> Cow<'a, [Row]> {
     let mut seen = BTreeSet::new();
     let keep: Vec<bool> = rows
         .iter()
         .map(|row| match (&row.operation, &row.lease) {
-            (Some(operation), Some(lease)) => seen.insert((operation, lease)),
+            (Some(operation), Some(lease)) if lease != NO_LEASE => {
+                seen.insert((scope(row), operation, lease))
+            }
             _ => true,
         })
         .collect();
@@ -172,7 +182,7 @@ pub fn analyze(rows: &[Row]) -> ArmStats {
 /// The numbers of `rows`, their builds being what `group` says.
 pub fn analyze_grouped(rows: &[Row], group: GroupBy) -> ArmStats {
     let all = rows;
-    let once = once_per_attempt(all);
+    let once = once_per_attempt(all, |_| None);
     let rows: &[Row] = &once;
     let mut stats = ArmStats::default();
     let (mut waits, mut walls) = (Vec::new(), Vec::new());
@@ -219,10 +229,15 @@ pub fn analyze_grouped(rows: &[Row], group: GroupBy) -> ArmStats {
     stats.wall_samples = walls.len() as u64;
     stats.wall = percentiles(walls);
     // Each invocation's build waited on a joined operation, so it keeps its copy; the CI-job
-    // view is one build over several invocations, so it counts the attempt once.
+    // view is one build over several invocations, so it counts the attempt once for each job
+    // that waited on it.
+    let per_job;
     let build_rows = match group {
         GroupBy::Invocation => all,
-        GroupBy::Correlated => rows,
+        GroupBy::Correlated => {
+            per_job = once_per_attempt(all, |r| r.correlated_invocations_id.as_deref());
+            &per_job
+        }
     };
     stats.builds = builds::analyze(build_rows, group);
     stats.phases = phases::analyze(rows);
