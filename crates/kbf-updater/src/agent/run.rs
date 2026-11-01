@@ -28,9 +28,7 @@ use std::time::Duration;
 
 use super::coordinator::{Coordinator, CoordinatorError};
 use super::flags::Timing;
-use super::hold::{
-    ANNOUNCED, Deferral, Features, Fit, Halt, Hold, MAX_RETRY_SECS, Marks, UNREADABLE_HALT, fit,
-};
+use super::hold::{ANNOUNCED, Deferral, Features, Fit, Halt, Hold, MAX_RETRY_SECS, Marks, fit};
 use super::local::{HostState, Local};
 use super::renew::Renewer;
 use super::status::{Shared, Status, version_of_commit};
@@ -236,10 +234,6 @@ impl Agent {
                     self.log(&slot.say(&format!(
                         "error: halt record unreadable, the unit stays held: {e}"
                     )));
-                    *held(&slot.halted) = Token::parse(UNREADABLE_HALT).map(|reason| Halt {
-                        reason,
-                        generation: 0,
-                    });
                 }
             }
         }
