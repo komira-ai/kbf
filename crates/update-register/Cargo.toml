@@ -15,7 +15,8 @@ publish.workspace = true
 # (crates/kbf-integration-test/tests/layering.rs keeps both true). The server is
 # `kbf-step-runner::register`, whose tests run this client against it.
 [dependencies]
-libc.workspace = true
+# rustix: the connect is made on a socket given its send timeout first, so that it is bounded.
+rustix = { workspace = true, features = ["net"] }
 serde_json.workspace = true
 thiserror.workspace = true
 

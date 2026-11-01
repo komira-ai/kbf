@@ -176,10 +176,10 @@ fn register_within(
     now: Clock<'_>,
 ) -> Result<Registration, Error> {
     let end = now() + deadline;
-    let wait = remaining(end, now).ok_or(Error::NoAnswer)?;
-    // A connect that waited out the deadline (a full backlog) is the updater not answering; any
-    // other failure (no socket, nobody listening, no permission) is the path not being reachable.
-    let stream = connect(socket, wait).map_err(|source| {
+    // A connect that waited out the deadline (a full backlog), or had none left, is the updater
+    // not answering; any other failure (no socket, nobody listening, no permission) is the path
+    // not being reachable.
+    let stream = connect(socket, end, now).map_err(|source| {
         if timed_out(&source) {
             Error::NoAnswer
         } else {
@@ -192,59 +192,48 @@ fn register_within(
     register_on(stream, name, version, health, end, now)
 }
 
-/// Connects to `path`, waiting at most `wait` for a listener whose backlog is full.
+/// Connects to `path` before `end` on the clock `now`, waiting only for what is left for a
+/// listener whose backlog is full.
 ///
 /// `std` has no connect timeout, and Linux makes a unix socket's connect to a full backlog wait
 /// for as long as the socket's send timeout says, for ever by default. So the socket is made here
-/// and given `wait` as its send timeout before it connects: the connect then fails with
-/// `WouldBlock` once `wait` has passed. The socket is owned from the moment it exists, so an
-/// error drops it and no descriptor is left; no thread is started.
-#[cfg(target_os = "linux")]
-fn connect(path: &Path, wait: Duration) -> io::Result<UnixStream> {
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    use std::os::unix::ffi::OsStrExt;
+/// and given what is left as its send timeout before each try: the connect then fails with
+/// `WouldBlock` once that has passed. The socket is owned from the moment it exists, so an error
+/// drops it and no descriptor is left; no thread is started. (The BSD-derived kernels refuse a
+/// connection to a full backlog rather than wait, which is `Error::Connect`.)
+fn connect(path: &Path, end: Instant, now: Clock<'_>) -> io::Result<UnixStream> {
+    use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
 
     // The checks of `std`'s own connect: no NUL in the path, and room for the one that ends it.
     std::os::unix::net::SocketAddr::from_pathname(path)?;
-    let bytes = path.as_os_str().as_bytes();
-    // SAFETY: `sockaddr_un` is plain data, for which all zeroes is a valid value.
-    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
-    for (to, from) in addr.sun_path.iter_mut().zip(bytes) {
-        *to = *from as libc::c_char;
-    }
-    let len = std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1;
-    // SAFETY: a plain system call with constant arguments.
-    let fd =
-        cvt(unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) })?;
-    // SAFETY: `fd` was just returned by `socket` and nothing else owns it.
-    let stream = UnixStream::from(unsafe { OwnedFd::from_raw_fd(fd) });
-    stream.set_write_timeout(Some(wait))?;
-    // SAFETY: `addr` is a `sockaddr_un` that lives across the call, and `len` (at most its size,
-    // which `from_pathname` checked) is the length of the address in it, terminating NUL included.
-    cvt(unsafe {
-        libc::connect(
-            stream.as_raw_fd(),
-            (&raw const addr).cast::<libc::sockaddr>(),
-            len as libc::socklen_t,
-        )
+    let addr = SocketAddrUnix::new(path)?;
+    let stream = UnixStream::from(rustix::net::socket_with(
+        AddressFamily::UNIX,
+        SocketType::STREAM,
+        SocketFlags::CLOEXEC,
+        None,
+    )?);
+    with_what_is_left(end, now, |wait| {
+        stream.set_write_timeout(Some(wait))?;
+        rustix::net::connect(&stream, &addr).map_err(io::Error::from)
     })?;
     Ok(stream)
 }
 
-/// Elsewhere `std`'s connect: the BSD-derived kernels refuse a connection to a full backlog
-/// rather than wait for room in it.
-#[cfg(not(target_os = "linux"))]
-fn connect(path: &Path, _wait: Duration) -> io::Result<UnixStream> {
-    UnixStream::connect(path)
-}
-
-/// A system call's result: -1 is the error in `errno`.
-#[cfg(target_os = "linux")]
-fn cvt(result: libc::c_int) -> io::Result<libc::c_int> {
-    match result {
-        -1 => Err(io::Error::last_os_error()),
-        fd => Ok(fd),
+/// Calls `op` with the time left until `end` on the clock `now`, and again, with what is left
+/// then, while a signal interrupts it. With none left `op` is not called and the result is
+/// `TimedOut`; so a peer, or signals, that keep interrupting cannot carry a call past `end`.
+fn with_what_is_left<T>(
+    end: Instant,
+    now: Clock<'_>,
+    mut op: impl FnMut(Duration) -> io::Result<T>,
+) -> io::Result<T> {
+    loop {
+        let wait = remaining(end, now).ok_or(io::ErrorKind::TimedOut)?;
+        match op(wait) {
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            done => return done,
+        }
     }
 }
 
@@ -264,7 +253,10 @@ fn register_on(
     }
     // An updater that is full answers and closes without reading the line, so the write can
     // fail while the answer is waiting: the answer is read first and says why.
-    let sent = send(&stream, &line, end, now);
+    let sent = send(&line, end, now, |wait, bytes| {
+        stream.set_write_timeout(Some(wait))?;
+        (&stream).write(bytes)
+    });
     match (answer(&stream, end, now), sent) {
         (Ok(()), Ok(())) => Ok(Registration {
             _connection: stream,
@@ -277,14 +269,23 @@ fn register_on(
     }
 }
 
-/// Writes `line` before `end`, waiting only for what is left: the timeout is set from the clock
-/// once, and the line, at most `MAX_LINE` bytes, goes in one write unless that wait runs out
-/// (`write_all` retries a write a signal interrupted). A deadline that has passed is `TimedOut`, and
-/// a write that waited out what was left is `WouldBlock`.
-fn send(stream: &UnixStream, line: &[u8], end: Instant, now: Clock<'_>) -> io::Result<()> {
-    let wait = remaining(end, now).ok_or(io::ErrorKind::TimedOut)?;
-    stream.set_write_timeout(Some(wait))?;
-    (&*stream).write_all(line)
+/// Writes `line` before `end` with `write`, which is given the time left and writes what it can
+/// of the bytes in that time. The clock is read before every write, the one after a write that
+/// went in part and the one after a signal included, and each waits only for what is left: a
+/// deadline that has passed is `TimedOut`, and a write that waited out what was left is
+/// `WouldBlock`.
+fn send(
+    line: &[u8],
+    end: Instant,
+    now: Clock<'_>,
+    mut write: impl FnMut(Duration, &[u8]) -> io::Result<usize>,
+) -> io::Result<()> {
+    let mut rest = line;
+    while !rest.is_empty() {
+        let n = with_what_is_left(end, now, |wait| write(wait, rest))?;
+        rest = &rest[n..];
+    }
+    Ok(())
 }
 
 /// The time left until `end` on the clock `now`, or `None` once there is none: a zero timeout
@@ -295,7 +296,7 @@ fn remaining(end: Instant, now: Clock<'_>) -> Option<Duration> {
 }
 
 /// Whether an I/O error is a wait that ran out: a socket timeout reports `WouldBlock` (or
-/// `TimedOut`), and `send` reports a deadline already passed as `TimedOut`.
+/// `TimedOut`), and `with_what_is_left` reports a deadline already passed as `TimedOut`.
 fn timed_out(e: &io::Error) -> bool {
     matches!(
         e.kind(),
@@ -319,14 +320,17 @@ fn encode(name: &str, version: &str, health: Option<&Health>) -> Vec<u8> {
 /// newline included: the updater writes the newline with the rest, so a success that lacks it was
 /// cut by a connection that died, and is not believed. The clock is read before each read, which
 /// waits only for what is left, and a read with nothing left is not made: a peer that sends the
-/// answer a byte at a time cannot hold the client past the deadline.
+/// answer a byte at a time cannot hold the client past the deadline. A read a signal interrupted
+/// is made again, with what is left then.
 fn answer(stream: &UnixStream, end: Instant, now: Clock<'_>) -> Result<(), Error> {
     let mut text = Vec::new();
     let mut chunk = [0u8; 128];
     while !text.contains(&b'\n') && text.len() < MAX_ANSWER {
-        let wait = remaining(end, now).ok_or(Error::NoAnswer)?;
-        stream.set_read_timeout(Some(wait))?;
-        match (&*stream).read(&mut chunk) {
+        let read = with_what_is_left(end, now, |wait| {
+            stream.set_read_timeout(Some(wait))?;
+            (&*stream).read(&mut chunk)
+        });
+        match read {
             Ok(0) => break,
             Ok(n) => text.extend_from_slice(&chunk[..n]),
             Err(e) if timed_out(&e) => return Err(Error::NoAnswer),
