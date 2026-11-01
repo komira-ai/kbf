@@ -216,7 +216,7 @@ it once its leases end: a `WholeMachine` lease, an `owns_worker` action, or a
 3. **Backfill.** An operation *after the large request in queue order* is placed on the
    reserved worker only if its estimated end, plus a `margin` kept spare, is no later than
    that worker's start time (`fits_in_tail`, `cost.rs:97-109`). The spare margin is a change from the
-   rule as first written ("no later than the start time"). Otherwise it goes elsewhere or waits. Operations *ahead* of the large request in queue
+   rule as first written ("no later than the start time"). Otherwise it goes elsewhere or waits. **[code]** (jobscheduler#613, `admission/head.rs` `start_time`) The start time holds the measured load constant at its latest reading, so when the real measured load falls the real start can come earlier than the start time; backfill admitted against the start time can then delay the large request by at most that gap, and never past the start time itself. Operations *ahead* of the large request in queue
    order are not held back (3.3).
 4. **Start.** The large request starts when the start time comes, not when a timer fires.
 5. **No timer.** No `head_hold_after`, no `blocked_since`, no fixed hold, and no give-up
@@ -558,7 +558,7 @@ replace the `js-sched` test of the same letter, which proves the scheduler reads
   shape: the start time is when 24 cores free up, not when the worker empties; the
   pick follows it. (c) Backfill: a job whose estimate ends inside the start time is
   placed on the reserved worker, one ending after it is not, and the large job starts at
-  the original start time. (d) The ceiling: a declared bound over `ceiling` is refused for
+  the original start time (with the measured load constant). (d) The ceiling: a declared bound over `ceiling` is refused for
   backfill, an unknown estimate is refused, and the cases on each side of the ceiling
   behave as stated; with fallback-only estimates a job with a shorter bound than the
   remaining tail backfills and one with an equal or longer bound does not. (e) Older same-QoS
