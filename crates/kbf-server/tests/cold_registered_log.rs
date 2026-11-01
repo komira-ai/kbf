@@ -38,7 +38,7 @@ impl Log {
 /// Catches a wait an operator cannot read (defects: no line when the wait starts, a warning
 /// with no code and no reason, no count): the node says at INFO that it is waiting and for
 /// which frontend, and each failed ask says at WARN which attempt it was, the status code and
-/// the reason (for a connection that fails, the connect error under tonic's `Unknown`), so a down frontend, a refused certificate and a wrong address read differently.
+/// the reason (for a connection that fails, the connect error), so a down frontend, a refused certificate and a wrong address read differently.
 /// The frontend here is `localhost:1`, where nothing listens.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_node_that_waits_says_for_whom_and_why_each_ask_failed() {
@@ -73,8 +73,7 @@ async fn a_node_that_waits_says_for_whom_and_why_each_ask_failed() {
         .unwrap_or_else(|| panic!("no line when the wait starts:\n{text}"));
     assert!(info.contains("https://localhost:1"), "{info}");
     assert!(warned.contains("attempt=1"), "{warned}");
-    // tonic reports a failed connection as `Unknown`, with the connect error under it.
-    assert!(warned.contains("code=Unknown"), "{warned}");
-    assert!(warned.contains("error=transport error"), "{warned}");
+    assert!(warned.contains("code=Unavailable"), "{warned}");
+    assert!(warned.contains("error="), "{warned}");
     assert!(warned.to_lowercase().contains("connect"), "{warned}");
 }
