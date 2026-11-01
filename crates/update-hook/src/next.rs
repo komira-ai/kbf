@@ -17,7 +17,9 @@ use crate::{Class, Outcome, Report, Step};
 /// Where in the life of a failure it happened, assigned by the updater and never by the hook.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
-    /// Nothing irreversible had been reported.
+    /// Nothing irreversible had been reported. Also the phase of a failed `cleanup` that was
+    /// rolled back for stating `reversible: true`. It does not count toward the coordinator's
+    /// `rollback_after_failed` (only `after_commit` and `gate_release` do).
     BeforeCommit,
     /// `verify` failed (or ran out of time) before the commit, the hook's class `release`.
     GateRelease,
