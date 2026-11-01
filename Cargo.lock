@@ -2872,6 +2872,7 @@ dependencies = [
  "sha2 0.11.0",
  "thiserror",
  "update-hook",
+ "update-register",
 ]
 
 [[package]]
@@ -5272,6 +5273,14 @@ dependencies = [
  "serde_json",
  "thiserror",
  "toml",
+]
+
+[[package]]
+name = "update-register"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]
