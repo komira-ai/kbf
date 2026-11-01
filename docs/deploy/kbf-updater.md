@@ -45,6 +45,19 @@ sit behind a load balancer of the farm's own (anything that stops sending to a b
   (`swap_abandoned`) before any ssh call.
 - `instance=` and `base=` are accepted on a `frontend` line only.
 
+## Which build is running
+
+`kbf-updater --version` prints the package version and the commit the binary was built from:
+
+```text
+kbf-updater 0.1.0+0123456789ab
+```
+
+The commit is the first 12 hex digits of the commit in the name of the release asset
+(`kbf-updater-<commit>-<platform>.tar.gz`); compare it with the release you meant to install. The
+package version alone does not tell two builds apart. A binary built outside the artifacts
+workflow prints `unknown` in place of the commit.
+
 ## The flags
 
 All are flags; none is read from the environment.

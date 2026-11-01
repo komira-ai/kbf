@@ -187,7 +187,11 @@ jobs:
       # library once for both, with the installer's `proxy` feature, and `kbf` would link the proxy
       # (crates/kbf-integration-test/tests/layering.rs checks the tree of `-p kbf-cli` alone).
       - run: cargo build --locked --release --target "$TARGET" -p kbf-cli --bin kbf
-      - run: cargo build --locked --release --target "$TARGET" -p kbf-deploy -p kbf-installer -p kbf-host-install -p kbf-updater -p kbf-mac-provision --bin kbf-deploy --bin kbf-installer --bin kbf-host-install --bin kbf-updater --bin kbf-mac-provision
+      - name: Build the host-side binaries, stamping kbf-updater with its commit
+        # `kbf-updater --version` prints this commit (crates/kbf-updater/src/lib.rs).
+        run: KBF_BUILD_COMMIT="${GITHUB_SHA::12}" cargo build --locked --release --target "$TARGET" -p kbf-deploy -p kbf-installer -p kbf-host-install -p kbf-updater -p kbf-mac-provision --bin kbf-deploy --bin kbf-installer --bin kbf-host-install --bin kbf-updater --bin kbf-mac-provision
+      - name: kbf-updater --version names the package version and this commit
+        run: cargo xtask build-commit check "target/$TARGET/release/kbf-updater" "$GITHUB_SHA"
       - name: Sign kbf ad hoc with the hardened runtime, and check it
         run: cargo xtask sign-darwin "target/$TARGET/release/kbf" --minos "$MACOSX_DEPLOYMENT_TARGET" --summary "$GITHUB_STEP_SUMMARY"
       - name: Sign kbf-deploy ad hoc with the hardened runtime, and check it
@@ -233,6 +237,8 @@ jobs:
         run: cargo xtask darwin-asset "dist/kbf-host-install-$GITHUB_SHA-darwin-arm64.tar.gz" kbf-host-install
       - name: Check the packaged kbf-updater's signature, and run it
         run: cargo xtask darwin-asset "dist/kbf-updater-$GITHUB_SHA-darwin-arm64.tar.gz" kbf-updater
+      - name: The packaged kbf-updater names the commit
+        run: cargo xtask build-commit check-asset --plain "dist/kbf-updater-$GITHUB_SHA-darwin-arm64.tar.gz" "$GITHUB_SHA"
       - name: Check the packaged kbf-mac-provision's signature, and run it
         run: cargo xtask darwin-asset "dist/kbf-mac-provision-$GITHUB_SHA-darwin-arm64.tar.gz" kbf-mac-provision
       - name: The packaged kbf names the commit and a release build
@@ -360,7 +366,11 @@ jobs:
       - run: cargo cyclonedx --version
       # `kbf` is built without the installer (see the darwin job): its `kbf setup` links no proxy.
       - run: cargo build --locked --release --target "$TARGET" -p kbf-node -p kbf-server -p kbf-cli --bins
-      - run: cargo build --locked --release --target "$TARGET" -p kbf-deploy -p kbf-host-install -p kbf-updater -p kbf-coordinator -p kbf-signer --bins
+      - name: Build the host-side binaries, stamping kbf-updater with its commit
+        # `kbf-updater --version` prints this commit (crates/kbf-updater/src/lib.rs).
+        run: KBF_BUILD_COMMIT="${GITHUB_SHA::12}" cargo build --locked --release --target "$TARGET" -p kbf-deploy -p kbf-host-install -p kbf-updater -p kbf-coordinator -p kbf-signer --bins
+      - name: kbf-updater --version names the package version and this commit
+        run: cargo xtask build-commit check "target/$TARGET/release/kbf-updater" "$GITHUB_SHA"
       - name: Build kbf-task for the static target
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
@@ -393,6 +403,8 @@ jobs:
         run: cargo xtask package --binary "target/$TARGET/release/kbf-host-install" --sbom crates/kbf-host-install/kbf-host-install_bin.cdx.json --platform linux-x86_64 --commit "$GITHUB_SHA" --out dist
       - name: Package kbf-updater
         run: cargo xtask package --binary "target/$TARGET/release/kbf-updater" --sbom crates/kbf-updater/kbf-updater_bin.cdx.json --platform linux-x86_64 --commit "$GITHUB_SHA" --out dist
+      - name: The packaged kbf-updater names the commit
+        run: cargo xtask build-commit check-asset --plain "dist/kbf-updater-$GITHUB_SHA-linux-x86_64.tar.gz" "$GITHUB_SHA"
       - name: Package kbf-signer
         run: cargo xtask package --binary "target/$TARGET/release/kbf-signer" --sbom crates/kbf-signer/kbf-signer_bin.cdx.json --platform linux-x86_64 --commit "$GITHUB_SHA" --out dist
       # The SBOM of kbf-task is made for the target it is built for. This runs after the others are
@@ -575,7 +587,11 @@ jobs:
       - run: cargo cyclonedx --version
       # `kbf` is built without the installer (see the darwin job): its `kbf setup` links no proxy.
       - run: cargo build --locked --release --target "$TARGET" -p kbf-node -p kbf-server -p kbf-cli --bins
-      - run: cargo build --locked --release --target "$TARGET" -p kbf-deploy -p kbf-host-install -p kbf-updater -p kbf-coordinator -p kbf-signer --bins
+      - name: Build the host-side binaries, stamping kbf-updater with its commit
+        # `kbf-updater --version` prints this commit (crates/kbf-updater/src/lib.rs).
+        run: KBF_BUILD_COMMIT="${GITHUB_SHA::12}" cargo build --locked --release --target "$TARGET" -p kbf-deploy -p kbf-host-install -p kbf-updater -p kbf-coordinator -p kbf-signer --bins
+      # The linux-arm64 job cross-compiles, so its kbf-updater cannot run here; the x86_64 and darwin
+      # jobs check the same stamped build step and the packaged tarball.
       - name: Build kbf-task for the static target
         env:
           CC_aarch64_unknown_linux_musl: musl-gcc
