@@ -607,26 +607,30 @@ async fn two_runs_of_one_action_in_flight_are_both_learned() {
 }
 
 /// Catches a result the core took but did not finish writing (the store refuses the record)
-/// or dropped over the cap going unseen: it is counted by which of the two it was, and its
-/// run is not followed.
+/// or dropped over the cap going unseen: with room for one record, the first result is held
+/// back and the second is dropped; each is counted by which it was, and neither run is
+/// followed.
 #[tokio::test(start_paused = true)]
 async fn a_result_the_store_has_not_taken_is_counted_not_followed() {
-    for (cap, held, dropped) in [(None, 1, 0), (Some(0), 0, 1)] {
-        let gate = Gate::over(fake());
-        let shared: Arc<dyn Store> = gate.clone();
-        let mut rig = rig_capped(&shared, UsageProfiles::Record, cap);
-        let wire = rig.start(1).lease_id.expect("a lease");
-        let lease = lease_of(&wire);
-        assert!(rig.beat(vec![lease], minutes_of(lease, 3)).await);
-        gate.all_fail.store(true, Ordering::SeqCst);
-        let ack = rig.farm.report(&node(rig.name), ok(&wire, None)).await;
-        assert_eq!(ack, None);
-        let stats = rig.stats();
-        assert_eq!(stats.results_held, held, "cap {cap:?}");
-        assert_eq!(stats.results_dropped, dropped, "cap {cap:?}");
-        assert_eq!(stats.held_runs, 0);
-        assert_eq!(stats.waiting, 0);
+    let gate = Gate::over(fake());
+    let shared: Arc<dyn Store> = gate.clone();
+    let mut rig = rig_capped(&shared, UsageProfiles::Record, Some(1));
+    let first = rig.start(1).lease_id.expect("a lease");
+    let second = rig.start(2).lease_id.expect("a lease");
+    let running = vec![lease_of(&first), lease_of(&second)];
+    for lease in running.clone() {
+        assert!(rig.beat(running.clone(), minutes_of(lease, 3)).await);
     }
+    gate.all_fail.store(true, Ordering::SeqCst);
+    for wire in [&first, &second] {
+        let ack = rig.farm.report(&node(rig.name), ok(wire, None)).await;
+        assert_eq!(ack, None);
+    }
+    let stats = rig.stats();
+    assert_eq!(stats.results_held, 1);
+    assert_eq!(stats.results_dropped, 1);
+    assert_eq!(stats.held_runs, 0);
+    assert_eq!(stats.waiting, 0);
 }
 
 /// Catches the usage families missing from a scrape of a farm that records, or present on one
