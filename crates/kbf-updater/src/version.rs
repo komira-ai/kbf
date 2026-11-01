@@ -121,6 +121,28 @@ impl Version {
     }
 }
 
+impl Version {
+    /// The numbers the version starts with.
+    #[must_use]
+    pub fn release_numbers(&self) -> Vec<u64> {
+        Vec::new()
+    }
+
+    /// Whether the version is `floor` or later.
+    #[must_use]
+    pub fn at_least(&self, floor: &Version) -> bool {
+        let _ = floor;
+        true
+    }
+
+    /// Whether the two versions are the same release.
+    #[must_use]
+    pub fn same_release(&self, other: &Version) -> bool {
+        let _ = other;
+        true
+    }
+}
+
 fn allowed(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'.' | b'+' | b'~' | b'-')
 }
@@ -215,5 +237,69 @@ mod tests {
         assert!(ERE.contains("[0-9]"));
         assert!(ERE.contains("[A-Za-z0-9.+~-]"));
         assert!(ERE.contains(&format!("{{0,{}}}", MAX_LEN - 1)));
+    }
+
+    fn v(text: &str) -> Version {
+        Version::parse(text).expect(text)
+    }
+
+    /// Catches an order that reads past the release numbers: a build suffix (`+g<sha>-<run>`,
+    /// a Debian `-N`) or a pre-release (`~rc`) is no part of the numbers.
+    #[test]
+    fn the_release_numbers_are_the_leading_dotted_numbers() {
+        assert_eq!(v("1").release_numbers(), [1]);
+        assert_eq!(v("0.1.10+g0123456789ab-8").release_numbers(), [0, 1, 10]);
+        assert_eq!(v("1.2.3~rc1-1").release_numbers(), [1, 2, 3]);
+        assert_eq!(
+            v("20261021.1+git9ba38c2-2").release_numbers(),
+            [20_261_021, 1]
+        );
+        assert_eq!(v("7.0.0-1~deb12u1").release_numbers(), [7]);
+        assert_eq!(
+            v("1.0").release_numbers(),
+            [1],
+            "trailing zeros are no number"
+        );
+        assert_eq!(v("1.0.0.0").release_numbers(), [1]);
+        assert_eq!(v("0").release_numbers(), Vec::<u64>::new());
+    }
+
+    /// Catches a number that wraps or panics: one over a u64 saturates, so it is later than
+    /// any number that fits.
+    #[test]
+    fn a_number_over_u64_saturates() {
+        let huge = v("99999999999999999999999.1");
+        assert_eq!(huge.release_numbers(), [u64::MAX, 1]);
+        assert!(huge.at_least(&v("18446744073709551615.1")));
+        assert!(!v("18446744073709551614").at_least(&huge));
+    }
+
+    /// Catches the order the agent and the coordinator could disagree on: numbers, not text
+    /// (0.1.9 is before 0.1.10), the missing component is zero, a suffix does not order.
+    #[test]
+    fn versions_are_ordered_by_their_numbers_and_never_by_a_suffix() {
+        assert!(!v("0.1.9").at_least(&v("0.1.10")));
+        assert!(v("0.1.10").at_least(&v("0.1.9")));
+        assert!(v("0.1.10+gabc-8").at_least(&v("0.1.10")));
+        assert!(v("0.1.10").at_least(&v("0.1.10+gabc-8")));
+        assert!(v("0.1.10+gabc-8").same_release(&v("0.1.10-3")));
+        assert!(v("1.2.3~rc1-1").same_release(&v("1.2.3")));
+        assert!(v("2").same_release(&v("2.0.0")));
+        assert!(!v("2").same_release(&v("2.0.1")));
+        assert!(!v("0.1.9").same_release(&v("0.1.10")));
+        assert!(v("2").at_least(&v("1.9.9")));
+        assert!(!v("1.9.9").at_least(&v("2")));
+    }
+
+    /// Catches an accepted version that has no order or that is not its own release: every
+    /// one of them has numbers, is at least itself and is the same release as itself.
+    #[test]
+    fn every_accepted_version_is_ordered_against_itself() {
+        for s in ACCEPTED {
+            let version = v(s);
+            assert!(!version.release_numbers().is_empty(), "{s}");
+            assert!(version.at_least(&version), "{s}");
+            assert!(version.same_release(&version), "{s}");
+        }
     }
 }

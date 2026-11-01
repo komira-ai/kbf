@@ -5,10 +5,10 @@
 use std::time::Duration;
 
 use kbf_types::HostRole;
-use kbf_updater::wire::Phase;
+use kbf_updater::wire::{Class, Outcome, Phase, ServiceReply, Token, UpdateResult};
 
 use crate::fleet::Fleet;
-use crate::ops::{HaltAck, OpsState, ServiceOps};
+use crate::ops::{FailureAck, OpsState, ServiceOps};
 use crate::reconcile::{Change, plan};
 use crate::rollback_tests::{
     AUTO, ONE, THREE, TWO, def, failure, farm, good, marks, persisted, plan_for, release, restart,
@@ -16,11 +16,23 @@ use crate::rollback_tests::{
 };
 use crate::testutil::{beat, desired, id, version};
 
-fn ack(node: &str, target: &str) -> HaltAck {
-    HaltAck {
+/// The ack of the failure `node` reported: the whole report.
+fn ack_of(node: &str, phase: Option<Phase>, class: Option<Class>, target: &str) -> FailureAck {
+    FailureAck {
         node_id: node.to_owned(),
-        target: version(target),
+        report: UpdateResult {
+            target: version(target),
+            outcome: Outcome::Failed,
+            phase,
+            class,
+            reason: None,
+        },
     }
+}
+
+/// The ack of a failure after the commit that the release is blamed for.
+fn ack(node: &str, target: &str) -> FailureAck {
+    ack_of(node, Some(Phase::AfterCommit), Some(Class::Release), target)
 }
 
 /// The marks of a service whose last good version is `last_good`.
@@ -168,7 +180,10 @@ async fn re_setting_a_bad_version_by_hand_is_not_rolled_back_by_the_old_failures
     assert!(marks(&rig).bad.is_empty());
     assert_eq!(
         persisted(&rig).failure_acked,
-        vec![ack("d1", "2.0"), ack("d2", "2.0")]
+        vec![
+            ack("d1", "2.0"),
+            ack_of("d2", Some(Phase::GateRelease), None, "2.0")
+        ]
     );
 
     round(&rig, 2_045, &two_failed());
@@ -237,17 +252,82 @@ async fn an_ack_drops_when_the_host_is_next_ordered() {
 
     let (phase, class) = release();
     let replies = round(&rig, 2_100, &[("d1", failure(phase, class, "2.0"))]);
-    assert!(matches!(
-        replies[0],
-        kbf_updater::wire::ServiceReply::Update { .. }
-    ));
+    assert!(matches!(replies[0], ServiceReply::Update { .. }));
     assert!(persisted(&rig).failure_acked.is_empty());
 }
 
-/// An ack whose drop cannot be written is gone in memory all the same, the failure counts
-/// again, and the order is still given.
+/// An ack matches one report: with the reports of four hosts the same as before, the two whose
+/// acks are for exactly that report stay hidden, and the two whose acks are for a report of
+/// another reason count, and their stale acks are dropped.
+#[test]
+fn an_ack_matches_the_whole_report_and_not_one_of_the_same_target() {
+    let (phase, class) = release();
+    let automatic = def(AUTO);
+    let fleet = farm(6, 4, phase, class);
+    let mut other = ack("d2", "2.0");
+    other.report.reason = Some(Token::parse("disk").expect("a token"));
+    let mut another = ack("d3", "2.0");
+    another.report.reason = Some(Token::parse("net").expect("a token"));
+    let acked = ServiceOps {
+        failure_acked: vec![ack("d0", "2.0"), ack("d1", "2.0"), other, another],
+        ..good()
+    };
+    assert_eq!(
+        plan_for(&automatic, &acked, &fleet),
+        vec![
+            Change::DropAck("d2".to_owned()),
+            Change::DropAck("d3".to_owned()),
+            Change::MarkBad(version("2.0")),
+            Change::RollBackTo(version("1.0"))
+        ]
+    );
+}
+
+/// After the override, a host that fails again at the same target but with another class or
+/// phase has made a different report: it counts at once.
 #[tokio::test]
-async fn an_ack_that_cannot_be_dropped_in_the_file_is_dropped_in_memory() {
+async fn a_new_failure_at_the_same_target_with_another_class_or_phase_counts_again() {
+    let rig = rig("ov-same-target", AUTO, ONE).await;
+    round(&rig, 2_000, &[]);
+    rig.set(TWO).await;
+    round(&rig, 2_030, &two_failed());
+    rig.set(TWO).await;
+
+    let (phase, class) = release();
+    round(&rig, 2_045, &two_failed());
+    assert_eq!(wanted(&rig), version("2.0"), "the same reports stay hidden");
+
+    let again = [
+        ("d1", failure(Some(Phase::AfterCommit), None, "2.0")),
+        ("d2", failure(phase, class, "2.0")),
+    ];
+    round(&rig, 2_060, &again);
+    assert_eq!(wanted(&rig), version("1.0"), "other reports count");
+    assert_eq!(marks(&rig).bad, vec![version("2.0")]);
+}
+
+/// A `min_version` and a desired version that are the same release by number (the desired
+/// one has a build suffix) are the same for the floor: the last good version is forgotten.
+#[test]
+fn a_min_version_that_is_the_same_release_by_number_is_the_floor() {
+    let (phase, class) = release();
+    let floored = def(&format!("{AUTO}\nmin_version = \"0.1.10\""));
+    assert_eq!(
+        plan(
+            &floored,
+            &desired("0.1.10+gabc-8", 0, 0),
+            &last_good("0.1.9"),
+            &farm(6, 0, phase, class),
+            secs(2_000)
+        ),
+        vec![Change::ClearLastGood]
+    );
+}
+
+/// An order is never given while its host's ack is on disk: when the ack cannot be dropped
+/// durably, the host is not ordered and holds no slot, and the ack stands.
+#[tokio::test]
+async fn an_order_is_not_sent_when_its_ack_cannot_be_dropped() {
     let mut state = OpsState::default();
     state.services.insert(
         "kbf".to_owned(),
@@ -259,9 +339,36 @@ async fn an_ack_that_cannot_be_dropped_in_the_file_is_dropped_in_memory() {
     let rig = rig_over("ov-unwritable", AUTO, THREE, unwritable(state)).await;
     let (phase, class) = release();
     let replies = round(&rig, 2_000, &[("d1", failure(phase, class, "2.0"))]);
-    assert!(matches!(
-        replies[0],
-        kbf_updater::wire::ServiceReply::Update { .. }
-    ));
-    assert!(marks(&rig).failure_acked.is_empty());
+    assert_eq!(replies[0], ServiceReply::Nothing);
+    assert_eq!(marks(&rig).failure_acked, vec![ack("d1", "2.0")]);
+    let shown = crate::rollback_tests::status(&rig);
+    let host = shown.hosts.iter().find(|h| h.node_id == "d1").expect("d1");
+    assert!(!host.holds_slot, "no order exists for it");
+}
+
+/// The same, with the file: while the ops file cannot be written the host is not ordered; a
+/// restart and a file that can be written again order it, and the ack is gone from the file by
+/// then.
+#[tokio::test]
+async fn a_blocked_ack_drop_holds_the_order_across_a_restart() {
+    let mut rig = rig("ov-blocked", AUTO, TWO).await;
+    seed(&rig, |m| {
+        m.last_good = Some(version("1.0"));
+        m.failure_acked = vec![ack("d1", "2.0")];
+    });
+    rig.set(THREE).await;
+    restart(&mut rig, AUTO);
+    let blocker = rig.dir.path().join("desired.json.ops.new");
+    std::fs::create_dir(&blocker).expect("blocked");
+
+    let (phase, class) = release();
+    let replies = round(&rig, 2_100, &[("d1", failure(phase, class, "2.0"))]);
+    assert_eq!(replies[0], ServiceReply::Nothing);
+    assert_eq!(persisted(&rig).failure_acked, vec![ack("d1", "2.0")]);
+
+    restart(&mut rig, AUTO);
+    std::fs::remove_dir(&blocker).expect("unblocked");
+    let replies = round(&rig, 2_200, &[("d1", failure(phase, class, "2.0"))]);
+    assert!(matches!(replies[0], ServiceReply::Update { .. }));
+    assert!(persisted(&rig).failure_acked.is_empty());
 }

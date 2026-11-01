@@ -39,6 +39,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use kbf_types::NodeId;
 use kbf_updater::version::Version;
+use kbf_updater::wire::UpdateResult;
 use serde::{Deserialize, Serialize};
 
 use crate::desired::{StoreError, io_at, write_whole};
@@ -112,6 +113,17 @@ pub struct HaltAck {
     pub target: Version,
 }
 
+/// A failure report an operator override acknowledged: the host and the whole report it made,
+/// so that a different report of the same host is not hidden by it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FailureAck {
+    /// The host.
+    pub node_id: String,
+    /// The `last_update` it reported.
+    pub report: UpdateResult,
+}
+
 /// The marks of one service.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -130,9 +142,9 @@ pub struct ServiceOps {
     #[serde(default)]
     pub bad: Vec<Version>,
     /// The failure reports standing when CI set a bad version by hand: one per host. A report
-    /// that is acked does not count towards an automatic rollback.
+    /// that is acked, whole, does not count towards an automatic rollback.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub failure_acked: Vec<HaltAck>,
+    pub failure_acked: Vec<FailureAck>,
 }
 
 /// One change, as the ring and the log say it.

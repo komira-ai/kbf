@@ -15,7 +15,7 @@ use kbf_updater::version::Version;
 use kbf_updater::wire::Outcome;
 
 use crate::fleet::Fleet;
-use crate::ops::{HaltAck, OpsError, OpsStore, ServiceOps, Write};
+use crate::ops::{FailureAck, OpsError, OpsStore, ServiceOps, Write};
 use crate::reconcile::{CI, COORDINATOR, Change, entry, is_release_failure};
 
 /// Whether the failure report of the host `id` for `version` is acked in `marks`.
@@ -24,7 +24,7 @@ pub(crate) fn is_acked(marks: &ServiceOps, id: &NodeId, version: &Version) -> bo
     marks
         .failure_acked
         .iter()
-        .any(|ack| (&ack.target, &ack.node_id) == (version, &name))
+        .any(|ack| (&ack.report.target, &ack.node_id) == (version, &name))
 }
 
 /// The acks in `marks` whose host, as `service` last heard it, no longer reports the failure
@@ -36,7 +36,7 @@ pub(crate) fn stale_acks(service: &str, marks: &ServiceOps, fleet: &Fleet) -> Ve
         .filter(|ack| {
             fleet.hosts_of(service).any(|(id, host)| {
                 let same = host.beat.last_update.as_ref().is_some_and(|last| {
-                    (last.outcome, &last.target) == (Outcome::Failed, &ack.target)
+                    (last.outcome, &last.target) == (Outcome::Failed, &ack.report.target)
                 });
                 id.to_string() == ack.node_id && !same
             })
@@ -95,12 +95,14 @@ pub fn clear_bad(
     if !ops.marks(service).bad.contains(version) {
         return Ok(());
     }
-    let acks: Vec<HaltAck> = fleet
+    let acks: Vec<FailureAck> = fleet
         .hosts_of(service)
         .filter(|(_, host)| is_release_failure(host, version))
-        .map(|(id, _)| HaltAck {
-            node_id: id.to_string(),
-            target: version.clone(),
+        .filter_map(|(id, host)| {
+            host.beat.last_update.clone().map(|report| FailureAck {
+                node_id: id.to_string(),
+                report,
+            })
         })
         .collect();
     let why = format!(
