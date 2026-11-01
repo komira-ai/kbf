@@ -23,6 +23,7 @@
 //! [service.selector]             # optional; absent: a host belongs if it announces the service
 //! roles = ["daemon"]             # default: every role of the service
 //! labels = { zone = "a" }        # operator-set labels the host must carry
+//! defer_backoff = { initial_secs = 300, factor = 2, max_secs = 3600 }   # the defaults
 //!
 //! [service.roles.daemon]
 //! max_updating = 2               # optional; absent: the desired state's number
@@ -39,6 +40,7 @@ use kbf_updater::secret::read_secret;
 use kbf_updater::wire::{MAX_SERVICE_NAME, MAX_SERVICES, is_service_name};
 use serde::Deserialize;
 
+use crate::defer::DeferBackoff;
 use crate::desired::{Desired, KBF, KBF_MIN_UP, LEGACY_ROLES, MAX_COUNT, kbf_roles};
 use crate::membership::{RawSelector, Selector};
 
@@ -117,6 +119,8 @@ pub struct ServiceDef {
     pub selector: Option<Selector>,
     /// Whether a host on which the service is declared and has never registered is ordered.
     pub install_when_absent: bool,
+    /// How long a host that deferred an update is left alone ([`crate::defer`]).
+    pub defer_backoff: DeferBackoff,
 }
 
 impl ServiceDef {
@@ -134,6 +138,7 @@ impl ServiceDef {
             priority: 0,
             selector: None,
             install_when_absent: false,
+            defer_backoff: DeferBackoff::default(),
         }
     }
 
@@ -202,6 +207,8 @@ struct RawService {
     selector: Option<RawSelector>,
     #[serde(default)]
     install_when_absent: bool,
+    #[serde(default)]
+    defer_backoff: DeferBackoff,
 }
 
 #[derive(Deserialize)]
@@ -276,6 +283,7 @@ fn service_def(
         priority,
         selector,
         install_when_absent,
+        defer_backoff,
     } = raw;
     if !is_service_name(&name) {
         return invalid(format!(
@@ -285,6 +293,9 @@ fn service_def(
     if defined.contains_key(&name) {
         return invalid(format!("{name} is defined twice"));
     }
+    defer_backoff
+        .check()
+        .or_else(|why| invalid(format!("{name}: defer_backoff: {why}")))?;
     if roles.is_empty() {
         return invalid(format!("{name} has no roles"));
     }
@@ -316,6 +327,7 @@ fn service_def(
         priority,
         selector,
         install_when_absent,
+        defer_backoff,
     })
 }
 

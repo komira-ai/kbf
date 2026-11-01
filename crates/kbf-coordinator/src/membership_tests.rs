@@ -303,6 +303,24 @@ async fn an_absent_host_is_not_up_and_is_ordered_only_with_install_when_absent()
     assert_eq!(c["state"], "converged");
 }
 
+/// Catches: a deferral not shown in the counts, or shown after its wait: a host that declined
+/// the desired version is counted `deferred` while its backoff lasts and not after, and is not
+/// ordered meanwhile.
+#[tokio::test]
+async fn a_host_that_declined_the_version_is_counted_deferred_until_its_wait_ends() {
+    let rig = rig("mem-deferred", DAEMONS, &["other"]).await;
+    let declined = json!({"name": "other", "version": "1.0", "health": "healthy",
+        "deferred": {"target": "3.0", "reason": "drain_bound", "retry_after_secs": 300}});
+    let mut b = beat_of(true, &[]);
+    b.services = Some(serde_json::from_value(json!([declined])).expect("beats"));
+    let reply = rig.coordinator.heartbeat(who("d1"), b).reply;
+    assert_eq!(reply, ServiceReply::Nothing);
+    let c = convergence(&rig, "other");
+    assert_eq!(c["hosts"]["deferred"], 1);
+    rig.at(2_400);
+    assert_eq!(convergence(&rig, "other")["hosts"]["deferred"], 0);
+}
+
 /// Catches: a selector that names roles selecting every role of the service: a host of a role
 /// the selector leaves out is not counted, not missing and not ordered, even when the service
 /// runs on its role.

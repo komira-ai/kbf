@@ -21,6 +21,7 @@ use kbf_types::{HostRole, NodeId};
 use kbf_updater::version::Version;
 use kbf_updater::wire::{Health, Heartbeat, Outcome};
 
+use crate::defer::{DeferBackoff, Defers};
 use crate::desired::KBF;
 
 /// A host with no heartbeat for this long is down.
@@ -115,6 +116,7 @@ pub struct Fleet {
     nodes: BTreeMap<NodeId, Node>,
     hosts: BTreeMap<String, BTreeMap<NodeId, Host>>,
     orders: BTreeMap<(NodeId, String), Order>,
+    defers: Defers,
 }
 
 impl Fleet {
@@ -126,6 +128,7 @@ impl Fleet {
             nodes: BTreeMap::new(),
             hosts: BTreeMap::new(),
             orders: BTreeMap::new(),
+            defers: Defers::default(),
         }
     }
 
@@ -174,7 +177,9 @@ impl Fleet {
     /// one.
     ///
     /// An order for the host and service ends when the beat shows it updating (the beat
-    /// counts from then), runs the ordered version, or reports that update failed.
+    /// counts from then), runs the ordered version, reports that update failed, or reports
+    /// that it declined it ([`crate::defer`]): a deferral holds no slot, so the order must not
+    /// hold it for [`ORDER_AGE`] either.
     pub fn record_in(
         &mut self,
         service: &str,
@@ -197,15 +202,21 @@ impl Fleet {
         now: Duration,
     ) {
         let key = (id, service.to_owned());
+        let mut deferred_order = false;
         if let Some(order) = self.orders.get(&key) {
             let failed = beat
                 .last_update
                 .as_ref()
                 .is_some_and(|r| r.outcome == Outcome::Failed && r.target == order.target);
-            if beat.updating.is_some() || beat.version == order.target || failed {
+            deferred_order = beat
+                .deferred
+                .as_ref()
+                .is_some_and(|d| d.target == order.target);
+            if beat.updating.is_some() || beat.version == order.target || failed || deferred_order {
                 self.orders.remove(&key);
             }
         }
+        self.defers.observe(&key, &beat, deferred_order, now);
         self.hosts.entry(key.1).or_default().insert(
             key.0,
             Host {
@@ -230,6 +241,19 @@ impl Fleet {
         }
         self.orders
             .insert((id, service.to_owned()), Order { target, at: now });
+    }
+
+    /// When the wait of the host `id` ends, if it declined an update of `service` to `target`.
+    #[must_use]
+    pub fn deferred_until(
+        &self,
+        service: &str,
+        id: &NodeId,
+        target: &Version,
+        backoff: &DeferBackoff,
+    ) -> Option<Duration> {
+        self.defers
+            .until(&(id.clone(), service.to_owned()), target, backoff)
     }
 
     /// Whether `id` has an order outstanding for `service` at `now`.

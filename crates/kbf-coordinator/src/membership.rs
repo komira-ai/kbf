@@ -27,6 +27,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use kbf_types::NodeId;
+use kbf_updater::version::Version;
 use kbf_updater::wire::Health;
 use serde::{Deserialize, Serialize};
 
@@ -242,8 +243,9 @@ pub struct HostCounts {
     pub excluded: usize,
     /// Selected, with an agent that cannot list services.
     pub unmanaged: usize,
-    /// Declined the update for a reason about their moment: counted from the change that
-    /// lets a host defer; 0 until then.
+    /// Declined the update to the desired version, and still within their wait
+    /// ([`Fleet::deferred_until`]). They are counted in `roles` as well: this says why they
+    /// are not being ordered.
     pub deferred: usize,
 }
 
@@ -262,11 +264,42 @@ impl HostCounts {
     }
 }
 
-/// `convergence` with the hosts `def` does not count: they are shown when `def` has a
-/// selector or there is any, and a farm with a missing or an absent host is not converged.
+/// How many hosts of `def` are within the wait that follows a deferral of `version` at `now`.
 #[must_use]
-pub fn account(mut convergence: Convergence, def: &ServiceDef, members: &[Member]) -> Convergence {
-    let counts = HostCounts::of(members);
+pub fn deferred_count(
+    def: &ServiceDef,
+    fleet: &Fleet,
+    version: Option<&Version>,
+    now: Duration,
+) -> usize {
+    let Some(version) = version else {
+        return 0;
+    };
+    fleet
+        .hosts_of(&def.name)
+        .filter(|(_, host)| host.is_live(now))
+        .filter(|(id, _)| {
+            fleet
+                .deferred_until(&def.name, id, version, &def.defer_backoff)
+                .is_some_and(|until| now < until)
+        })
+        .count()
+}
+
+/// `convergence` with the hosts `def` does not count, and the `deferred` hosts it does: they
+/// are shown when `def` has a selector or there is any, and a farm with a missing or an
+/// absent host is not converged.
+#[must_use]
+pub fn account(
+    mut convergence: Convergence,
+    def: &ServiceDef,
+    members: &[Member],
+    deferred: usize,
+) -> Convergence {
+    let counts = HostCounts {
+        deferred,
+        ..HostCounts::of(members)
+    };
     if counts.missing + counts.absent > 0 && convergence.state == State::Converged {
         convergence.state = State::InProgress;
     }

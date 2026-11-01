@@ -428,3 +428,35 @@ fn a_volatile_store_keeps_changes_in_memory_only() {
     assert_eq!(done.seq, 1);
     assert_eq!(store.state().excluded.len(), 1);
 }
+
+/// Pins: a refused edit does nothing. With a file behind the store, an edit that refuses
+/// returns its own error and leaves the state, the ring, the file's bytes and the next
+/// number as they were (the next accepted change is numbered as if the refusal never was),
+/// and the writer is not called. This holds with either order of writing.
+#[test]
+fn a_refused_edit_leaves_the_state_the_ring_and_the_file_untouched() {
+    let dir = dir("ops-refused");
+    let file = dir.path().join("ops.json");
+    let store = OpsStore::open(&file).expect("opened");
+    store
+        .change(Write::BeforeMemory, entry("exclude"), |s| exclude(s, "n1"))
+        .expect("changed");
+    let (state, bytes) = (store.state(), fs::read(&file).expect("read"));
+    for write in [Write::BeforeMemory, Write::AfterMemory] {
+        let refused = store.try_change(write, entry("exclude"), |s| {
+            exclude(s, "n2");
+            Err(OpsError::Invalid {
+                path: "ops.json".into(),
+                why: "refused".to_owned(),
+            })
+        });
+        assert!(matches!(refused, Err(OpsError::Invalid { .. })));
+        assert_eq!(store.state(), state);
+        assert_eq!(fs::read(&file).expect("read"), bytes);
+        assert!(!dir.path().join("ops.json.new").exists());
+    }
+    let next = store
+        .change(Write::BeforeMemory, entry("exclude"), |s| exclude(s, "n3"))
+        .expect("changed");
+    assert_eq!(next.seq, 2);
+}
