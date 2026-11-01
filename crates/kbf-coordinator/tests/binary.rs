@@ -37,6 +37,11 @@ impl Files {
             0o644,
         );
         put("operator.token", OPERATOR, 0o600);
+        put(
+            "services.toml",
+            "[[service]]\nname = \"other\"\n[service.roles.daemon]\n",
+            0o600,
+        );
         Self { dir, pki }
     }
 
@@ -71,9 +76,23 @@ fn spawn(flags: &[String]) -> Child {
         .expect("spawned")
 }
 
-/// Runs the binary to its end: the exit code, stdout and stderr.
+/// How long a run that should end at once may take before it is taken to have started
+/// serving instead: a bound on a hang, not a measure of speed.
+const RUN_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Runs the binary to its end: the exit code, stdout and stderr. A binary still running
+/// after [`RUN_BOUND`] (one that started instead of refusing) is stopped and the test
+/// fails saying so, rather than waiting for ever.
 fn run(flags: &[String]) -> (i32, String, String) {
-    let out = Command::new(BIN).args(flags).output().expect("ran");
+    let child = spawn(flags);
+    let pid = Pid::from_raw(i32::try_from(child.id()).expect("a pid")).expect("not zero");
+    let (sent, ended) = std::sync::mpsc::channel();
+    std::thread::spawn(move || sent.send(child.wait_with_output()));
+    let Ok(out) = ended.recv_timeout(RUN_BOUND) else {
+        kill_process(pid, Signal::KILL).expect("stopped");
+        panic!("the coordinator did not exit with {flags:?}: it started instead of refusing");
+    };
+    let out = out.expect("ran");
     (
         out.status.code().expect("an exit code"),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -94,7 +113,9 @@ fn with(flags: &[String], flag: &str, value: &str) -> Vec<String> {
 #[test]
 fn it_announces_its_addresses_serves_and_stops_on_sigterm() {
     let files = Files::new("bin-serve");
-    let mut child = spawn(&files.flags());
+    let mut flags = files.flags();
+    flags.extend(["--services-file".to_owned(), files.path("services.toml")]);
+    let mut child = spawn(&flags);
     let mut stdout = BufReader::new(child.stdout.take().expect("stdout"));
     let mut line = String::new();
     stdout.read_line(&mut line).expect("a start line");
@@ -176,8 +197,9 @@ fn the_version_names_the_commit_it_was_built_from() {
 }
 
 /// Catches: a start that goes on with a file it cannot use: a missing certificate, an
-/// operator token file others can read, a bad allow-list, a state file that is not a state,
-/// and an address in use each stop it with exit 1 and a reason that names the file or flag.
+/// operator token file others can read, a bad allow-list, an allow-list entry naming a
+/// service that is not defined, a state file that is not a state, and an address in use each
+/// stop it with exit 1 and a reason that names the file or flag.
 #[test]
 fn a_start_with_a_bad_file_or_address_is_refused_with_a_reason() {
     let files = Files::new("bin-refused");
@@ -200,6 +222,25 @@ fn a_start_with_a_bad_file_or_address_is_refused_with_a_reason() {
     assert_eq!(code, 1);
     assert!(err.contains("remote_operator"), "{err}");
 
+    let mut with_services = flags.clone();
+    with_services.extend(["--services-file".to_owned(), files.path("nope.toml")]);
+    let (code, _, err) = run(&with_services);
+    assert_eq!(code, 1);
+    assert!(
+        err.contains("--services-file") && err.contains("nope.toml"),
+        "{err}"
+    );
+
+    let unknown = files.path("unknown.toml");
+    let text = kbf_oidc::testkit::config_text("https://token.example");
+    std::fs::write(&unknown, format!("{text}services = [\"kbf\", \"nope\"]\n")).expect("written");
+    let (code, _, err) = run(&with(&flags, "--oidc-config", &unknown));
+    assert_eq!(code, 1);
+    assert!(
+        err.contains("--oidc-config") && err.contains("nope"),
+        "{err}"
+    );
+
     let state = files.path("state.json");
     std::fs::write(&state, "{}").expect("written");
     let (code, _, err) = run(&with(&flags, "--state-file", &state));
@@ -212,4 +253,36 @@ fn a_start_with_a_bad_file_or_address_is_refused_with_a_reason() {
     assert_eq!(code, 1);
     assert!(err.starts_with("kbf-coordinator: "), "{err}");
     drop(taken);
+}
+
+/// Catches: a start over an ops file this build cannot honour: a file with a key it does not
+/// know, or with a newer schema, at the path `--ops-file` names or, with no flag, at the state
+/// file's name with `.ops` added, stops it with exit 1 and a reason that names the flag and
+/// the file; and the file is left as it was.
+#[test]
+fn an_ops_file_this_build_cannot_read_stops_the_start() {
+    let files = Files::new("bin-ops");
+    let flags = files.flags();
+    let given = files.path("given.ops");
+    std::fs::write(&given, r#"{"schema":1,"future":true}"#).expect("written");
+    let mut explicit = flags.clone();
+    explicit.extend(["--ops-file".to_owned(), given.clone()]);
+    let (code, _, err) = run(&explicit);
+    assert_eq!(code, 1);
+    assert!(
+        err.contains("--ops-file") && err.contains("given.ops"),
+        "{err}"
+    );
+
+    let newer = r#"{"schema":2,"services":{}}"#;
+    let default = files.path("desired.json.ops");
+    std::fs::write(&default, newer).expect("written");
+    let (code, _, err) = run(&flags);
+    assert_eq!(code, 1);
+    assert!(
+        err.contains("--ops-file") && err.contains("desired.json.ops"),
+        "{err}"
+    );
+    assert!(err.contains("newer"), "{err}");
+    assert_eq!(std::fs::read_to_string(&default).expect("read"), newer);
 }

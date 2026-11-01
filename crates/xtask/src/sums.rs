@@ -4,19 +4,23 @@
 //! A sums file is `<64 lowercase hex digits><two spaces><file name>` lines, each ending
 //! in a newline, as `sha256sum` writes them; a name holds no `/` ([`parse`]).
 //!
-//! - `sums assemble <dir> [--expect <file>] [--summary <file>]` ([`assemble`]): merges
+//! - `sums assemble <dir> [--expect <file>] [--summary <file>] [--digest-output <file>]` ([`assemble`]): merges
 //!   the `SHA256SUMS.<platform>` files `package` wrote into `<dir>/SHA256SUMS`, sorted
 //!   by name, and removes them. A name in two of them, or a `SHA256SUMS.<suffix>` that
 //!   names no platform, is refused. `--expect` refuses a result that is not byte for
 //!   byte that file (the published one); `--summary` appends the result to a file (the
-//!   job summary).
+//!   job summary); `--digest-output` appends `sha256=<hex>`, the SHA-256 of the `SHA256SUMS` it
+//!   wrote, to a file (on Actions, `GITHUB_OUTPUT`: the sums job hands the digest on, and the
+//!   attest job of the sign call compares the sums it downloads with it).
 //! - `verify-assets sums <dir>` ([`verify_sums`]): `<dir>/SHA256SUMS` lists every other
 //!   file in `<dir>` (but the provenance bundles, which are made after the sums and so
 //!   cannot be listed: [`crate::bundles`]), each once, and each matches its line, and
 //!   every listed `kbf` tarball has its version facts listed too
-//!   ([`version_facts::facts_of`]; [`verify_sums_with`] waives that for the release made
-//!   before the facts were recorded) and every listed facts file its tarball
-//!   ([`version_facts::tarball_of`]). Control: a copy of the first tarball with its last byte
+//!   ([`version_facts::facts_of`]) and every listed facts file its tarball
+//!   ([`version_facts::tarball_of`]); the same for a listed task image and its facts
+//!   ([`pkg_image_asset::facts_of`], [`pkg_image_asset::image_of`]), and for a listed task image its
+//!   CycloneDX SBOM and the reverse ([`pkg_image_asset::sbom_of`], [`pkg_image_asset::image_of_sbom`]).
+//!   Control: a copy of the first tarball with its last byte
 //!   flipped must not match that line, so a check that accepts anything fails instead of
 //!   passing.
 //! - `verify-assets attestations <dir> --repo <owner/repo> --workflow-ref <ref> --commit
@@ -29,7 +33,10 @@
 //!   A `.deb` or `.pkg` (the `kbf-installer` package, [`crate::pkg_asset`], the `kbf` package,
 //!   [`crate::pkg_kbf_asset`], and [`crate::pkg_macos_asset`]) is listed and verified
 //!   like a tarball except that it has no SBOM attestation: build provenance and its own
-//!   bundle. The version facts of a `kbf` ([`crate::version_facts`]) are verified like an
+//!   bundle, except a task image that has its SBOM listed ([`crate::pkg_image_sbom`]): it also has an SBOM
+//!   attestation, whose subject is the image tarball. The version facts of a `kbf`
+//!   ([`crate::version_facts`]) and the facts of the task
+//!   image ([`crate::pkg_image_asset::facts_text`]) are verified like an
 //!   SBOM: build provenance, and nothing else.
 //!   First, before `gh` is run, `<dir>` holds exactly one bundle per listed tarball and
 //!   no other, each the bundle of that tarball ([`bundles::pairing`]). Every tarball
@@ -56,7 +63,8 @@ use crate::build_commit::full_commit;
 use crate::bundles;
 use crate::fetch::Sha256;
 use crate::package::{Platform, read, write_new};
-use crate::version_facts::{self, Pairing};
+use crate::pkg_image_asset;
+use crate::version_facts;
 
 /// The file name of the merged sums file.
 pub const SUMS: &str = "SHA256SUMS";
@@ -168,6 +176,7 @@ pub fn assemble(
     dir: &Path,
     expect: Option<&Path>,
     summary: Option<&Path>,
+    digest_output: Option<&Path>,
 ) -> Result<Vec<String>, Error> {
     let prefix = format!("{SUMS}.");
     let mut parts = Vec::new();
@@ -221,6 +230,15 @@ pub fn assemble(
             .and_then(|mut f| write!(f, "```text\n{text}```\n"))
             .map_err(Error::spawn(format!("append to {}", summary.display())))?;
     }
+    if let Some(output) = digest_output {
+        let digest = Sha256::of(text.as_bytes());
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(output)
+            .and_then(|mut f| writeln!(f, "sha256={digest}"))
+            .map_err(Error::spawn(format!("append to {}", output.display())))?;
+    }
     Ok(text.lines().map(str::to_owned).collect())
 }
 
@@ -239,17 +257,9 @@ fn flipped_tarball<'a>(dir: &Path, lines: &'a [Line]) -> Result<(&'a Line, Vec<u
 
 /// The `verify-assets sums` verb, with the digest `digest` (the real one is
 /// [`Sha256::of`]; tests pass a broken one to see the control refuse it): the line to
-/// print. Every `kbf` tarball must have its version facts listed.
+/// print. Every `kbf` tarball must have its version facts listed, and every task image its
+/// facts and its SBOM.
 pub fn verify_sums(dir: &Path, digest: fn(&[u8]) -> Sha256) -> Result<String, Error> {
-    verify_sums_with(dir, digest, Pairing::Required)
-}
-
-/// [`verify_sums`], holding a `kbf` tarball to its version facts as `pairing` says.
-pub fn verify_sums_with(
-    dir: &Path,
-    digest: fn(&[u8]) -> Sha256,
-    pairing: Pairing,
-) -> Result<String, Error> {
     let lines = read_sums(&dir.join(SUMS))?;
     let mut problems: Vec<String> = duplicates(&lines)
         .iter()
@@ -274,12 +284,10 @@ pub fn verify_sums_with(
         }
     }
     // The facts a `kbf` states of itself are part of its release: the tarball of `kbf`
-    // does not go without them (unless the release is one made before they were recorded),
-    // and they do not go without the tarball they state the facts of.
+    // does not go without them, and they do not go without the tarball they state the facts of.
     let listed = |name: &str| lines.iter().any(|m| m.name == name);
     for l in &lines {
         if let Some(facts) = version_facts::facts_of(&l.name)
-            && pairing == Pairing::Required
             && !listed(&facts)
         {
             problems.push(format!(
@@ -292,6 +300,43 @@ pub fn verify_sums_with(
         {
             problems.push(format!(
                 "{}: the tarball it states the facts of, {tarball}, is not listed in {SUMS}",
+                l.name
+            ));
+        }
+        // The same for the image that has a base: its facts carry the digest of its manifest
+        // and of its base, which the attestation of these sums is to cover.
+        if let Some(facts) = pkg_image_asset::facts_of(&l.name)
+            && !listed(&facts)
+        {
+            problems.push(format!(
+                "{}: its image facts {facts} are not listed in {SUMS}",
+                l.name
+            ));
+        }
+        if let Some(image) = pkg_image_asset::image_of(&l.name)
+            && !listed(&image)
+        {
+            problems.push(format!(
+                "{}: the image it states the facts of, {image}, is not listed in {SUMS}",
+                l.name
+            ));
+        }
+        // And its CycloneDX SBOM, which names the packages of the base the image carries: the
+        // attest job signs an SBOM attestation with the image as its subject, so the SBOM is part
+        // of the set.
+        if let Some(sbom) = pkg_image_asset::sbom_of(&l.name)
+            && !listed(&sbom)
+        {
+            problems.push(format!(
+                "{}: its image SBOM {sbom} is not listed in {SUMS}",
+                l.name
+            ));
+        }
+        if let Some(image) = pkg_image_asset::image_of_sbom(&l.name)
+            && !listed(&image)
+        {
+            problems.push(format!(
+                "{}: the image it describes, {image}, is not listed in {SUMS}",
                 l.name
             ));
         }
@@ -568,17 +613,35 @@ pub fn verify_attestations(dir: &Path, a: &Attestations) -> Result<Vec<String>, 
             printed.push(format!("verified: {} (provenance, SBOM, bundle)", l.name));
         } else if bundles::is_package(&l.name) {
             // A package has build provenance and its own bundle, and no SBOM attestation
-            // (docs/artifacts.md): what it holds is the tarball's binary, which has one.
+            // (docs/artifacts.md): what it holds is the tarball's binary, which has one. The
+            // exception is an image the release lists an SBOM of (the task image): the attest
+            // job signs an SBOM attestation with the image as its subject, so one is required
+            // exactly when the sums list that SBOM (`verify-assets sums` holds the listing to
+            // the image: the previous release, which has none, is read as it was made).
             a.require(&file, workflow, None)?;
+            let sbom = pkg_image_asset::sbom_of(&l.name)
+                .is_some_and(|sbom| lines.iter().any(|m| m.name == sbom));
+            if sbom {
+                a.require(&file, workflow, Some(SBOM_PREDICATE))?;
+            }
             a.require_bundle(dir, &l.name, workflow)?;
-            printed.push(format!("verified: {} (provenance, bundle)", l.name));
-        } else if l.name.ends_with(".cdx.json") || l.name.ends_with(version_facts::SUFFIX) {
-            // An SBOM and the version facts of a `kbf` have build provenance only.
+            let kinds = if sbom {
+                "provenance, SBOM, bundle"
+            } else {
+                "provenance, bundle"
+            };
+            printed.push(format!("verified: {} ({kinds})", l.name));
+        } else if l.name.ends_with(".cdx.json")
+            || l.name.ends_with(version_facts::SUFFIX)
+            || l.name.ends_with(pkg_image_asset::FACTS_SUFFIX)
+        {
+            // An SBOM, the version facts of a `kbf` and the facts of an image have build
+            // provenance only.
             a.require(&file, workflow, None)?;
             printed.push(format!("verified: {} (provenance)", l.name));
         } else {
             return Err(Error::Failed(format!(
-                "{SUMS} lists {}, neither a tarball, a package, an SBOM nor version facts",
+                "{SUMS} lists {}, neither a tarball, a package, an SBOM nor facts",
                 l.name
             )));
         }

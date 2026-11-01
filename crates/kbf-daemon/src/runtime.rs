@@ -4,13 +4,13 @@
 //! actions as plain processes; the container driver (`kbf-driver-container`)
 //! implements the trait for farm nodes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use kbf_proto::reapi::{ActionResult, Digest};
-use kbf_proto::worker::ResourceUsage;
+use kbf_proto::worker::{InputCacheCounts, NodeLoad, ResourceUsage};
 use kbf_types::{LeaseId, LeaseKind, LostWhy, Resources};
 use tokio::sync::oneshot;
 
@@ -98,6 +98,67 @@ pub async fn upload_within<T>(
         })
 }
 
+/// A runtime could not read the node's load. `kind` names what failed in a few fixed
+/// words (a file name), so the daemon can log one kind once instead of on every heartbeat.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{kind}: {why}")]
+pub struct NodeLoadError {
+    pub kind: &'static str,
+    pub why: String,
+}
+
+/// One reading of the node's actions cgroup and of each lease that runs in it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct NodeReading {
+    /// What a heartbeat carries of the node. The runtime leaves `lease_clocks` and
+    /// `minutes` empty; the daemon's collector fills them from `leases` (and orders and
+    /// cuts `covered`). (`NodeReading` is `PartialEq` and not `Eq` because the generated
+    /// `NodeLoad` is not `Eq`.)
+    pub load: NodeLoad,
+    /// Each running lease of the runtime at the reading, in lease order.
+    pub leases: Vec<LeaseReading>,
+}
+
+impl From<NodeLoad> for NodeReading {
+    /// A reading that names no leases.
+    fn from(load: NodeLoad) -> Self {
+        Self {
+            load,
+            leases: Vec::new(),
+        }
+    }
+}
+
+/// One running lease at a [`NodeReading`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LeaseReading {
+    pub lease: LeaseId,
+    /// When the lease's container started (after its inputs and image), on the clock of
+    /// the reading's `load.mono_usec`.
+    pub started_usec: u64,
+    /// What its cgroup holds now; `None` when a file of it could not be read or parsed.
+    /// The lease keeps its start then, and is never given a zero.
+    pub usage: Option<LeaseUsage>,
+}
+
+/// What one lease's cgroup holds at a reading.
+///
+/// A lease's CPU peak is computed in two places, from different clock reads, so the two
+/// can differ in the last digits and nothing asserts them equal. The container driver
+/// takes the busiest window between a lease's own successive `cpu.stat` reads, each
+/// stamped by a clock read right after that file ([`Runtime::take_peak_window_millicores`]).
+/// A figure taken between whole readings uses the reading's `load.mono_usec`, one stamp for
+/// every lease; the leases are read one after another, so a lease's own stamp is later than
+/// the reading's by the time spent reading the files before it (tens of milliseconds with
+/// many leases).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LeaseUsage {
+    /// `usage_usec` of the lease's `cpu.stat`: cumulative.
+    pub cpu_usage_usec: u64,
+    /// `memory.current` less `inactive_file` of `memory.stat`, floored at 0.
+    pub working_set_bytes: u64,
+}
+
 /// Runs leases. The lease manager never names a driver: it asks the runtime whether it
 /// serves a lease kind, and runs the lease through it.
 pub trait Runtime: Send + Sync + 'static {
@@ -118,9 +179,43 @@ pub trait Runtime: Send + Sync + 'static {
         None
     }
 
+    /// One reading of what the node's actions are doing and of each of this runtime's
+    /// running leases, for the heartbeat. `Ok(None)` for a runtime that takes no readings
+    /// (the default). The reading is made off the async workers.
+    ///
+    /// # Errors
+    /// The reading could not be made.
+    fn node_load(&self) -> impl Future<Output = Result<Option<NodeReading>, NodeLoadError>> + Send {
+        async { Ok(None) }
+    }
+
+    /// What the runtime's input cache has done since the process started, for the
+    /// heartbeat (`Heartbeat.input_cache`). `None` for a runtime with no input cache open
+    /// (the default).
+    fn input_cache(&self) -> Option<InputCacheCounts> {
+        None
+    }
+
+    /// Told by each Welcome whether the farm places by the load the nodes measure
+    /// (`Welcome.placement_load`, false when absent), on the connect of every stream, before
+    /// the first heartbeat of it. A runtime that limits the CPU of its leases applies the
+    /// mode here, off the async workers; one that does not (the default) ignores it. A failure
+    /// is the runtime's to log: the stream goes on, and the next Welcome tells it again.
+    fn welcomed_placement_load(&self, _on: bool) -> impl Future<Output = ()> + Send {
+        async {}
+    }
+
+    /// The most CPU any one window between two readings used by lease `lease_id`, in
+    /// millicores, once, after its [`Runtime::run`] ended. `None` for a runtime that takes
+    /// no readings (the default), and for a lease that ended before it had a full window.
+    fn take_peak_window_millicores(&self, _lease_id: LeaseId) -> Option<u64> {
+        None
+    }
+
     /// Stops a running lease. Returns once its work has stopped; the lease's `run` then
     /// ends with [`RuntimeError::Killed`]. Killing a lease that is not running does
-    /// nothing.
+    /// nothing. The daemon calls it only after the lease's [`Runtime::run`] has been
+    /// polled once, so `run` must register what `kill` stops before its first `.await`.
     fn kill(&self, lease_id: LeaseId) -> impl Future<Output = ()> + Send;
 }
 
@@ -140,6 +235,8 @@ struct FakeState {
     started: Vec<LeaseId>,
     killed: Vec<LeaseId>,
     stop: BTreeMap<LeaseId, oneshot::Sender<()>>,
+    readings: VecDeque<Result<Option<NodeReading>, NodeLoadError>>,
+    hangs: bool,
 }
 
 impl FakeRuntime {
@@ -163,6 +260,21 @@ impl FakeRuntime {
             driver,
             ..self
         }
+    }
+
+    /// This runtime answering its next [`Runtime::node_load`] with `reading`, after the
+    /// readings already given (then `Ok(None)`, as a runtime that takes none does).
+    #[must_use]
+    pub fn with_node_load(self, reading: Result<Option<NodeReading>, NodeLoadError>) -> Self {
+        self.lock().readings.push_back(reading);
+        self
+    }
+
+    /// This runtime never answering [`Runtime::node_load`]: a read that hangs.
+    #[must_use]
+    pub fn with_hanging_node_load(self) -> Self {
+        self.lock().hangs = true;
+        self
     }
 
     /// Leases started, in order.
@@ -215,6 +327,13 @@ impl Runtime for FakeRuntime {
             // The receiver is gone only if the run already ended.
             let _ = stop.send(());
         }
+    }
+
+    async fn node_load(&self) -> Result<Option<NodeReading>, NodeLoadError> {
+        if self.lock().hangs {
+            std::future::pending::<()>().await;
+        }
+        self.lock().readings.pop_front().unwrap_or(Ok(None))
     }
 }
 

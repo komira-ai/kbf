@@ -4,8 +4,9 @@
 //!
 //! The scheduler decides whether a killed run runs again (`kbf_types::MemoryRun`); the
 //! server only translates. An operation finished by an own-limit kill was killed at the
-//! largest node that could run it: its callers get FAILED_PRECONDITION, the
-//! `status.message` saying the action needs more memory than any node offers, and a
+//! largest node that could run it (or, with `--no-memory-climb`, at its first booking): its callers get FAILED_PRECONDITION, the
+//! `status.message` saying the action needs more memory than any node offers (or, for a
+//! kill below the cap, that the ladder is off), and a
 //! `google.rpc.ErrorInfo` of reason [`OUT_OF_MEMORY_REASON`]. One finished by a busy
 //! node's kill has used its farm reruns: `crate::fault` answers it, as every farm fault.
 
@@ -59,11 +60,25 @@ pub(crate) fn finished(runs: &[MemoryRun]) -> Finished {
     let booked = Gib(last.map_or(0, |r| r.booked));
     let list: Vec<String> = runs.iter().map(run).collect();
     let runs_text = format!("Runs: {} ({})", runs.len(), list.join(", "));
-    let message = format!(
-        "kbf: the action needs more memory than any node offers: it passed its memory \
-         limit with {booked} booked on {node}, the largest node for its platform. \
-         {runs_text}."
-    );
+    // With the climb on, the kill that ends an operation is one at the cap. A last kill
+    // below its cap ended it because the climb is off (`--no-memory-climb`), so no larger
+    // node is known to be too small. The runs say which, as they are what the stored row
+    // keeps too.
+    let cut_short =
+        last.is_some_and(|r| matches!(r.kill, Kill::OwnLimit { cap } if r.booked < cap));
+    let message = if cut_short {
+        format!(
+            "kbf: the action passed its memory limit with {booked} booked on {node}; the \
+             memory ladder is off (--no-memory-climb), so it is not run again with more \
+             memory. {runs_text}."
+        )
+    } else {
+        format!(
+            "kbf: the action needs more memory than any node offers: it passed its memory \
+             limit with {booked} booked on {node}, the largest node for its platform. \
+             {runs_text}."
+        )
+    };
     let info = ErrorInfo {
         reason: OUT_OF_MEMORY_REASON.to_owned(),
         domain: ERROR_DOMAIN.to_owned(),

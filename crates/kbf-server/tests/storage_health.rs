@@ -39,6 +39,7 @@ fn reported(id: u64, state: MemberState, debts: Debts, seconds: u64) -> MemberRe
     MemberReport {
         id: MemberId(id),
         state,
+        boot: 1,
         planned: kbf_server::storage_health::Planned::No,
         report: Some(Report {
             said: Reported::debts(debts),
@@ -84,6 +85,7 @@ fn a_member_that_is_down_makes_the_number_unknown_however_little_the_others_owe(
         planned: kbf_server::storage_health::Planned::No,
         id: MemberId(2),
         state: MemberState::Down,
+        boot: 1,
         report: None,
     };
     let health = judge(&[active(1, 0), down, active(3, 0)]);
@@ -603,4 +605,137 @@ fn a_nodes_vitals_are_shown_only_while_its_report_is_fresh() {
         Vitals::NONE,
         "a node that sends none"
     );
+}
+
+// ---- the member families ----
+
+/// The line `kbf_member_state{member="<id>",state="<state>"} <v>`.
+fn state_line(id: u64, state: &str, v: u8) -> String {
+    format!("\nkbf_member_state{{member=\"{id}\",state=\"{state}\"}} {v}\n")
+}
+
+/// Asserts that a member's state is one sample per state name, 1 for its own state and 0
+/// for the rest, and that `kbf_members_not_active` counts the members that are not
+/// `Active`. Catches: a state gauge that is absent for a down member (the gate would read
+/// "no series" as healthy), two states set at once, a count that leaves out a member in a
+/// state the build does not name.
+#[test]
+fn the_state_is_one_hot_and_the_not_active_count_follows_it() {
+    let draining = MemberReport {
+        state: MemberState::Draining,
+        ..active(2, 0)
+    };
+    let unnamed = MemberReport {
+        state: MemberState::Unknown(7),
+        ..active(3, 0)
+    };
+    let text = scrape_of(Some(&judge(&[
+        active(1, 0),
+        draining,
+        unnamed,
+        active(4, 0).down(),
+    ])));
+    for (id, state) in [(1, "active"), (2, "draining"), (3, "unknown"), (4, "down")] {
+        for name in [
+            "joining",
+            "catching_up",
+            "active",
+            "draining",
+            "down",
+            "unknown",
+        ] {
+            let want = u8::from(name == state);
+            let line = state_line(id, name, want);
+            assert!(text.contains(&line), "{line:?} missing from {text}");
+        }
+    }
+    assert!(text.contains("\nkbf_members_not_active 3\n"), "{text}");
+    assert!(text.contains("# TYPE kbf_member_state gauge"), "{text}");
+    assert!(
+        text.contains("# TYPE kbf_members_not_active gauge"),
+        "{text}"
+    );
+
+    let whole = scrape_of(Some(&judge(&[active(1, 0), active(2, 0)])));
+    assert!(whole.contains("\nkbf_members_not_active 0\n"), "{whole}");
+    assert!(whole.contains(&state_line(2, "down", 0)), "{whole}");
+}
+
+/// Asserts that the count and the states are absent, not zero, when the membership cannot
+/// be read, and that with no member there is a count of 0 and no state family. Catches:
+/// a count of 0 exported for an unreadable store (a gate would read it as a whole farm).
+#[test]
+fn the_member_families_are_absent_when_the_membership_is_unknown() {
+    let unreadable = scrape_of(None);
+    for family in [
+        "kbf_members_not_active",
+        "kbf_member_state",
+        "kbf_member_boot",
+    ] {
+        assert!(!unreadable.contains(family), "{family} in {unreadable}");
+    }
+    let empty = scrape_of(Some(&judge(&[])));
+    assert!(empty.contains("\nkbf_members_not_active 0\n"), "{empty}");
+    assert!(!empty.contains("kbf_member_state"), "{empty}");
+    assert!(!empty.contains("kbf_member_boot"), "{empty}");
+}
+
+/// Asserts that the boot counter is exported per member as the registration's, so a
+/// restart (a larger boot) moves the sample and a heartbeat does not. Catches: a boot
+/// that is exported as the member id or a constant, which no restart gate could see.
+#[test]
+fn a_restart_moves_the_boot_sample() {
+    let first = scrape_of(Some(&judge(&[active(1, 0), active(2, 0)])));
+    assert!(
+        first.contains("\nkbf_member_boot{member=\"1\"} 1\n"),
+        "{first}"
+    );
+    assert!(first.contains("# TYPE kbf_member_boot gauge"), "{first}");
+    let restarted = MemberReport {
+        boot: 2,
+        ..active(1, 0)
+    };
+    let second = scrape_of(Some(&judge(&[restarted, active(2, 0)])));
+    assert!(
+        second.contains("\nkbf_member_boot{member=\"1\"} 2\n"),
+        "{second}"
+    );
+    assert!(
+        second.contains("\nkbf_member_boot{member=\"2\"} 1\n"),
+        "{second}"
+    );
+}
+
+/// Asserts that `storage_health` reads each member's boot from its live row: a member
+/// that registered again reports the larger boot and the other keeps its own. Catches: a
+/// boot read as a constant, as the member id or as zero in the live-row branch of
+/// `member_reports`, which the hand-built reports above cannot reach.
+#[test]
+fn the_health_nodes_carry_the_boot_of_the_live_row() {
+    let pair = Pair::new(Debts::Known(0), Debts::Known(0));
+    let again = pair.members.register(&node(1)).expect("registers again");
+    assert_eq!(again.boot, 2);
+    let health = pair.health();
+    let boots: Vec<(MemberId, u64)> = health.nodes.iter().map(|n| (n.id, n.boot)).collect();
+    assert_eq!(boots, [(pair.a.0, 2), (pair.b.0, 1)]);
+}
+
+/// Asserts that a member in the map whose row has expired reports the boot the map
+/// entry stands for. Catches: a boot read as zero or as the member id in the map-entry
+/// branch of `member_reports`, so a node that restarted and then went quiet would export
+/// a boot that never moves.
+#[test]
+fn the_health_nodes_carry_the_boot_of_the_map_entry_without_a_row() {
+    let pair = Pair::new(Debts::Known(0), Debts::Known(0));
+    let again = pair.members.register(&node(1)).expect("registers again");
+    pair.members.refresh().expect("map published");
+    pair.advance(31);
+    let health = pair.health();
+    let a = health
+        .nodes
+        .iter()
+        .find(|n| n.id == pair.a.0)
+        .expect("a is in the map");
+    assert_eq!(a.boot, again.boot);
+    assert_eq!(a.boot, 2);
 }

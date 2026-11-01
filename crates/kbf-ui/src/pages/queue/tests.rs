@@ -2,7 +2,9 @@
 
 use serde_json::{Value, json};
 
-use super::super::sched::fixtures::{HOSTILE, queue_doc, sched_farm};
+use super::super::sched::fixtures::{
+    HOSTILE, queue_doc, sched_farm, whole_queue_doc, whole_request,
+};
 use crate::tests::{Fake, body, render};
 
 fn page(fake: &Fake, path: &str) -> (u16, String) {
@@ -210,4 +212,202 @@ fn the_page_is_routed_and_on_the_navigation() {
         "{html}"
     );
     assert!(html.contains("<a href=\"/ui/leases\">Leases</a>"), "{html}");
+}
+
+/// Catches a whole-machine section shown without the option (a document with no
+/// `whole_node` key is the page as it was), and one hidden with it: the heading and the
+/// numbers show only with the section.
+#[test]
+fn the_whole_machine_section_shows_only_with_the_option() {
+    let (_, html) = page(&with(&queue_doc()), "/ui/queue");
+    assert!(!html.contains("Whole-machine"), "{html}");
+    let (status, html) = page(&with(&whole_queue_doc()), "/ui/queue");
+    assert_eq!(status, 200, "{html}");
+    assert!(html.contains("<h2>Whole-machine requests</h2>"), "{html}");
+    assert!(
+        html.contains("<dt>Workers held by a whole-machine lease</dt><dd>1</dd>"),
+        "{html}"
+    );
+    assert!(
+        html.contains("<dt>Workers held by a queued request</dt><dd>2</dd>"),
+        "{html}"
+    );
+    assert!(
+        html.contains("<dt>Of those, still draining</dt><dd>1 (at most 2)</dd>"),
+        "{html}"
+    );
+    assert!(
+        html.contains(
+            "<dt>Workers that may be whole</dt>\
+             <dd>4 (at most 6; 5 capable, 1 kept for ordinary work)</dd>"
+        ),
+        "{html}"
+    );
+    assert!(html.contains("Queued by reason: barred: 1,"), "{html}");
+    assert!(
+        !html.contains("cap_max_draining: "),
+        "zero counts are left out: {html}"
+    );
+}
+
+/// Catches a state shown as another or with the field of another: each of the requests
+/// of the fixture has its own words and numbers (each its own value), a request that
+/// only waits is called Waiting, and a barred worker is a link with its back-off.
+#[test]
+fn each_whole_machine_state_is_told_in_its_own_words() {
+    let (_, html) = page(&with(&whole_queue_doc()), "/ui/queue");
+    for (operation, state, detail) in [
+        ("op-20", "Early", "may hold a worker in 12.3 s"),
+        (
+            "op-21",
+            "Holding",
+            "holds node-a for 1 min 1 s, waiting for its leases to end; gives it up in 1 min 40 s; holds given up: 1",
+        ),
+        (
+            "op-22",
+            "Barred",
+            "barred from every worker it could hold; holds given up: 2",
+        ),
+        (
+            "op-23",
+            "Stopped",
+            "stopped: workers whole are at the ceiling",
+        ),
+        (
+            "op-24",
+            "Stopped",
+            "stopped: the last worker an older ordinary request could run on",
+        ),
+        ("op-25", "Waiting", "waiting for a worker"),
+        (
+            "op-26",
+            "Unservable",
+            "no worker has 2 GPUs; the closest is node-a with 1",
+        ),
+    ] {
+        assert!(
+            html.contains(&format!(
+                "<code>{operation}</code></td><td>main</td><td>{state}</td><td>{detail}</td>"
+            )),
+            "{operation}: {html}"
+        );
+    }
+    assert!(
+        html.contains("<a href=\"/ui/leases?node=node-b\">node-b</a> for 5 min 0 s"),
+        "{html}"
+    );
+    assert!(!html.contains("Showing 7 of 7"), "{html}");
+}
+
+/// Catches a hold with no deadline shown as a time, a request list cut by the API without
+/// saying so, a section with no request shown as empty tables, and the scheduler's reason
+/// text or a worker id written as markup.
+#[test]
+fn a_whole_machine_section_says_what_it_cannot_show_and_escapes() {
+    let mut doc = whole_queue_doc();
+    doc["whole_node"]["requests"] = json!([whole_request(
+        "op-30",
+        "holding",
+        "holding",
+        json!({"worker": "node-a", "held_for_ms": 0, "deadline_in_ms": null,
+            "give_ups": 2, "draining": false})
+    )]);
+    doc["whole_node"]["requests_total"] = json!(101);
+    let (_, html) = page(&with(&doc), "/ui/queue");
+    assert!(
+        html.contains(
+            "holds node-a for 0 ms, no leases left; gives it up never; holds given up: 2"
+        ),
+        "{html}"
+    );
+    assert!(html.contains("Showing 1 of 101"), "{html}");
+
+    doc["whole_node"]["waiting"] = json!({"queued": 0});
+    doc["whole_node"]["requests"] = json!([]);
+    let (_, html) = page(&with(&doc), "/ui/queue");
+    assert!(
+        html.contains("No whole-machine request is queued."),
+        "{html}"
+    );
+
+    doc["whole_node"]["waiting"] = json!({"unservable": 1});
+    doc["whole_node"]["requests"] = json!([whole_request(
+        HOSTILE,
+        "unservable",
+        "unservable",
+        json!({"unservable": HOSTILE})
+    )]);
+    let (_, html) = page(&with(&doc), "/ui/queue");
+    assert!(!html.contains("<script"), "{html}");
+    let escaped = "&lt;script&gt;alert(1)&lt;/script&gt;&quot;&#39;&amp;";
+    assert!(html.matches(escaped).count() >= 2, "{html}");
+}
+
+/// Catches a cap shown in another cap's words, a state or reason the page does not know
+/// hidden or shown as another (it is written as the API spells it), a field a state
+/// should carry missing without a stand-in, and two barred workers not both listed.
+#[test]
+fn every_cap_has_words_and_an_unknown_state_is_shown_as_sent() {
+    let mut doc = whole_queue_doc();
+    let reasons = [
+        (
+            "cap_keep_for_ordinary",
+            "stopped: the rest of the pool is kept for ordinary work",
+        ),
+        (
+            "cap_max_draining",
+            "stopped: the most workers are already draining",
+        ),
+        ("cap_per_consumer", "stopped: the consumer is at its limit"),
+        ("cap_new_in_a_later_build", "cap_new_in_a_later_build"),
+    ];
+    let mut requests: Vec<Value> = reasons
+        .iter()
+        .enumerate()
+        .map(|(i, (reason, _))| whole_request(&format!("op-4{i}"), "stopped", reason, json!({})))
+        .collect();
+    requests.push(whole_request("op-50", "paused", "paused", json!({})));
+    requests.push(whole_request("op-51", "early", "early", json!({})));
+    requests.push(whole_request("op-52", "holding", "holding", json!({})));
+    requests.push(whole_request(
+        "op-53",
+        "unservable",
+        "unservable",
+        json!({}),
+    ));
+    requests.push(whole_request(
+        "op-54",
+        "barred",
+        "barred",
+        json!({"give_ups": 1, "barred": [
+            {"worker": "node-a", "until_in_ms": 1_000},
+            {"worker": "node-b", "until_in_ms": null}]}),
+    ));
+    doc["whole_node"]["requests"] = json!(requests);
+    let (_, html) = page(&with(&doc), "/ui/queue");
+    for (i, (_, words)) in reasons.iter().enumerate() {
+        assert!(
+            html.contains(&format!(
+                "<code>op-4{i}</code></td><td>main</td><td>Stopped</td><td>{words}</td>"
+            )),
+            "{words}: {html}"
+        );
+    }
+    assert!(html.contains("<td>paused</td><td>paused</td>"), "{html}");
+    assert!(html.contains("may hold a worker in -"), "{html}");
+    assert!(
+        html.contains("holds - for -, no leases left; gives it up never; holds given up: 0"),
+        "{html}"
+    );
+    assert!(
+        html.contains("<code>op-53</code></td><td>main</td><td>Unservable</td><td></td>"),
+        "{html}"
+    );
+    assert!(
+        html.contains(
+            "<a href=\"/ui/leases?node=node-a\">node-a</a> for 1.0 s, \
+             <a href=\"/ui/leases?node=node-b\">node-b</a> with no end"
+        ),
+        "{html}"
+    );
 }

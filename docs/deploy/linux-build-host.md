@@ -128,6 +128,34 @@ fewer than 16) is what the farm's own processes keep:
 - `N` of 0 is allowed; `N` at the CPUs the daemon may use or more is refused at start
   (the leases would get nothing).
 
+#### The limit under placement by measured load: `--actions-cpu-max`
+
+A cgroup throttled at its `cpu.max` never measures more CPU than the limit, so a farm that
+places by the load its nodes measure (the daemon's `Heartbeat.node_load`) cannot see an
+overload through the limit above. The server says which kind of farm it is in every
+`Welcome` (`Welcome.placement_load`, [worker-protocol.md](../design/worker-protocol.md)),
+from its `--placement-load off|on` flag (a frontend and the all-in-one take it;
+default `off`). It applies to every node that connects to that server, so give a pool of
+nodes the mode by pointing the pool at a server started with it. `on` sends the field as
+true; `off` leaves it out (absent, never false), and the bytes of the `Welcome` are those of a
+server that predates it. A node that reconnects to such a server, or to an old one, gets the
+limit of its reserve back.
+
+The daemon's `--actions-cpu-max auto|on|off` (container driver; default `auto`) decides what
+it does with the Welcome, at every connect and reconnect:
+
+| `--actions-cpu-max` | `Welcome.placement_load` true | absent or false |
+|---|---|---|
+| `auto` | `actions/cpu.max` is `max 100000`: no limit | the limit of `--reserve-cpus`, as above |
+| `on` | no limit | no limit |
+| `off` | the limit of `--reserve-cpus` | the limit of `--reserve-cpus` |
+
+Until the first Welcome the limit written at start stays. A reconnect to a server in another
+mode writes the other limit. A write that fails is logged as an error and leaves `cpu.max` as it
+was. The heartbeat's `actions_cpu_limited` is read from `cpu.max`, so it reports what was
+written. The daemon refuses `on` and `off` with a driver other than `container`, and the
+value is parsed strictly (anything but the three is a usage error).
+
 `--reserve-cpus` and `--reserve-share` are the daemon's flags; `kbf-server` has neither
 and refuses them at start (an old unit that passes one fails at once, status 2, instead
 of the flag being ignored). The server runs no actions, so it uses every CPU it may: one

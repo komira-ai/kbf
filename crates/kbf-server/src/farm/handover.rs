@@ -16,6 +16,7 @@ use tokio::sync::watch;
 use tonic::Status;
 
 use super::durable::{Durable, Held, Progress, StateError, StoredCordon};
+use super::engine::{Adapter, Engine};
 use super::{Farm, NodeAction, State};
 
 /// How many looks in a row at the state store may find an operation neither unfinished
@@ -75,6 +76,7 @@ impl Farm {
     /// taken and no Execute is between its request and its queueing (the input check).
     #[must_use]
     pub fn quiet(&self) -> bool {
+        js_arm!(self, hot::quiet());
         let presubmit = self.cache.metrics().execute_presubmit_in_flight.get();
         let taking = u64::try_from(self.reports.load(Ordering::SeqCst)).unwrap_or(u64::MAX);
         presubmit + taking == 0
@@ -86,7 +88,8 @@ impl Farm {
     /// successor's work could depend on. What it already holds stays as it was, for
     /// [`Farm::follow`] to answer.
     pub fn fence(&self) {
-        self.lock().fenced = true;
+        js_arm!(self, lifecycle::fence());
+        self.lock().engine.fenced = true;
     }
 
     /// Lets a farm that [`Farm::fence`] stopped for a takeover that did not happen feed the
@@ -94,7 +97,8 @@ impl Farm {
     /// state store's as of the fence; the caller checks first that the store is still at
     /// the generation this process holds.
     pub fn resume(&self) {
-        self.lock().fenced = false;
+        js_arm!(self, lifecycle::resume());
+        self.lock().engine.fenced = false;
     }
 
     /// Closes this farm's intake, the step of a drain (`crate::sequence`) before the fence:
@@ -106,14 +110,17 @@ impl Farm {
     /// other frontends write ([`Farm::intake`]). Unlike [`Farm::fence`] it refuses nothing a
     /// node reports, so the executions that are running finish here. Nothing undoes it.
     pub fn close_intake(&self) {
-        self.lock().closed = true;
+        js_arm!(self, lifecycle::close_intake());
+        self.lock().engine.closed = true;
     }
 
     /// Whether the state store has refused a write of this farm because a newer writer
     /// holds it.
     #[must_use]
     pub fn superseded(&self) -> bool {
+        js_arm!(self, lifecycle::superseded());
         self.lock()
+            .engine
             .durable
             .as_ref()
             .is_some_and(Durable::superseded)
@@ -122,7 +129,8 @@ impl Farm {
     /// Worker streams open now.
     #[must_use]
     pub fn open_sessions(&self) -> usize {
-        self.lock().links.len()
+        js_arm!(self, views::open_sessions());
+        self.lock().side.links.len()
     }
 
     /// Writes, to the state store, the requeues it refused (a lease the scheduler gave
@@ -134,6 +142,7 @@ impl Farm {
     /// `deadline`; whatever is left is logged at ERROR, naming the operations. Returns
     /// the operations whose requeues were not written.
     pub async fn flush_unsettled(&self, deadline: Duration) -> Vec<OperationId> {
+        js_arm_async!(self, lifecycle::flush_unsettled(deadline));
         let until = tokio::time::Instant::now() + deadline;
         let (left, why) = loop {
             // The lock is not held across the sleep.
@@ -167,8 +176,10 @@ impl Farm {
     /// successor, once this process no longer accepts). Returns how many streams were
     /// still open.
     pub fn end_worker_streams(&self, status: &Status) -> usize {
+        js_arm!(self, hot::end_worker_streams(status));
         let state = self.lock();
         state
+            .side
             .links
             .values()
             .filter(|link| link.outbound.send(Err(status.clone())).is_ok())
@@ -176,7 +187,7 @@ impl Farm {
     }
 
     /// Answers, from the state store, the callers this fenced farm still holds, and the
-    /// clients that asked it for an operation by name ([`State::follow_watched`]): an
+    /// clients that asked it for an operation by name ([`Engine::follow_watched`]): an
     /// operation the successor finished gets its result from the `done/` row, one it has
     /// leased is shown executing. A caller waits until its operation finishes, it cancels
     /// (its stream is dropped), or this process is killed: no look count or timer ends
@@ -188,6 +199,7 @@ impl Farm {
     /// # Errors
     /// The state store cannot be read.
     pub fn follow(&self) -> Result<usize, StateError> {
+        js_arm!(self, lifecycle::follow());
         self.lock().follow()
     }
 
@@ -225,18 +237,33 @@ pub(super) enum Flushed {
 }
 
 impl State {
+    /// [`Engine::flush_step`] with the farm's own side.
+    pub(super) fn flush_step(&mut self) -> Flushed {
+        self.engine.flush_step(&mut self.side)
+    }
+
+    /// [`Engine::follow`] with the farm's own side.
+    fn follow(&mut self) -> Result<usize, StateError> {
+        self.engine.follow(&mut self.side)
+    }
+}
+
+impl Engine {
     /// Cordons, in the scheduler alone, every node this farm has heard from once its intake
     /// is closed ([`Farm::close_intake`]), so that placement gives none of them work. Before
     /// every input: a node that registers after the intake closed is cordoned before the
     /// placement round that follows its registration. A farm whose intake is open does
     /// nothing. A node that is cordoned already (by this or by an operator) is left as it
     /// is.
-    pub(super) fn hold_placements(&mut self, now: FarmTime) {
+    pub(super) fn hold_placements(&mut self, a: &dyn Adapter, now: FarmTime) {
         if !self.closed {
             return;
         }
-        let open = |worker: &&WorkerId| self.sched.cordon(worker).is_none();
-        let nodes: Vec<WorkerId> = self.machine.nodes().filter(open).cloned().collect();
+        let nodes: Vec<WorkerId> = a
+            .registered()
+            .into_iter()
+            .filter(|worker| self.sched.cordon(worker).is_none())
+            .collect();
         for worker in nodes {
             self.drain_held.insert(worker.clone());
             let none = self.sched.apply(Input::new(now, Event::Cordon { worker }));
@@ -259,10 +286,10 @@ impl State {
     /// given up since the last feed, once. Works on a fenced farm: this is the one thing
     /// a fenced farm writes, because the successor's recovery depends on it (see
     /// [`Farm::flush_unsettled`]).
-    pub(super) fn flush_step(&mut self) -> Flushed {
+    pub(super) fn flush_step(&mut self, a: &mut dyn Adapter) -> Flushed {
         let superseded = |state: &Self| state.durable.as_ref().is_some_and(Durable::superseded);
         if !superseded(self) {
-            self.log_requeues();
+            self.log_requeues(a);
         }
         let left: Vec<OperationId> = self
             .unsettled
@@ -276,60 +303,51 @@ impl State {
         }
     }
 
-    /// Feeds `event` to the scheduler (see [`State::carry_out`]), unless the farm is
+    /// Feeds `event` to the scheduler (see [`Engine::carry_out`]), unless the farm is
     /// fenced: then nothing is fed and there are no answers.
-    pub(super) fn feed(&mut self, now: FarmTime, event: Event) -> Vec<Answer> {
+    pub(super) fn feed(&mut self, a: &mut dyn Adapter, now: FarmTime, event: Event) -> Vec<Answer> {
         if self.fenced {
             return Vec::new();
         }
-        self.carry_out(now, event)
+        self.carry_out(a, now, event)
     }
 
     /// Writes `request`, about to be queued, to the state store (see
-    /// [`State::queue`]), unless the farm is fenced, and says where it is held. `now` is
+    /// [`Engine::queue`]), unless the farm is fenced, and says where it is held. `now` is
     /// farm time.
     ///
     /// # Errors
     /// UNAVAILABLE if the farm is fenced or the store did not take it.
     pub(super) fn admit(
         &mut self,
+        a: &mut dyn Adapter,
         request: &kbf_sched::Request,
         subject: &crate::action_usage::Subject,
         size_key: Option<u64>,
+        max_wall: Option<Duration>,
         now: FarmTime,
     ) -> Result<Held, Status> {
         if self.fenced {
             return Err(Status::unavailable(HANDING_OVER));
         }
-        self.queue(request, subject, size_key, now)
+        self.queue(a, request, subject, size_key, max_wall, now)
     }
 
     /// The callers of `operation` still waiting: not answered, and with a stream open
     /// (a caller that cancelled has dropped its end of the channel).
-    fn callers_waiting(&self, operation: OperationId) -> Vec<WaiterId> {
+    fn callers_waiting(&self, a: &dyn Adapter, operation: OperationId) -> Vec<WaiterId> {
         let callers = self.sched.waiters(operation).unwrap_or_default();
-        self.waiting_among(callers)
-    }
-
-    /// The callers among `callers` still waiting: not answered, and with a stream open.
-    pub(super) fn waiting_among(&self, callers: &[WaiterId]) -> Vec<WaiterId> {
-        let waiting = |caller: &WaiterId| {
-            let stage = self.stages.get(caller);
-            stage.is_some_and(|stage| {
-                !stage.is_closed() && !matches!(*stage.borrow(), Stage::Done(_))
-            })
-        };
-        callers.iter().copied().filter(waiting).collect()
+        a.waiting_among(callers)
     }
 
     /// [`Farm::follow`] under the lock: how many callers still wait.
-    pub(super) fn follow(&mut self) -> Result<usize, StateError> {
+    pub(super) fn follow(&mut self, a: &mut dyn Adapter) -> Result<usize, StateError> {
         let Some(durable) = &self.durable else {
             return Ok(0);
         };
         let mut looked = Vec::new();
         for operation in self.sched.unfinished() {
-            let callers = self.callers_waiting(operation);
+            let callers = self.callers_waiting(&*a, operation);
             if !callers.is_empty() {
                 looked.push((operation, callers, durable.progress(operation)?));
             }
@@ -344,14 +362,12 @@ impl State {
             let ended = matches!(stage, Some(Stage::Done(_)));
             waiting += callers.len() * usize::from(!ended);
             if let Some(stage) = stage {
-                for channel in callers.iter().filter_map(|caller| self.stages.get(caller)) {
-                    show(channel, stage.clone());
-                }
+                a.show_callers(&callers, &stage);
             }
         }
         // The operations clients ask for by name that this farm does not hold are looked at
         // too: a fenced farm takes no intake poll, and answers them from here.
-        self.follow_watched();
+        self.follow_watched(a);
         Ok(waiting)
     }
 

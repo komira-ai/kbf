@@ -369,6 +369,81 @@ async fn a_kill_or_a_timeout_ends_the_users_processes() {
     assert_eq!(cas.blob(&digest), b"partial\n");
 }
 
+/// Catches a whole-machine lease that reports nothing of what it used: the server writes
+/// an `action usage:` line only for a result that carries a `ResourceUsage`, so a Mac
+/// lease of this runtime had no line. A finished action's result carries one (its wall
+/// time, nothing else measured: CPU, memory and both instrument blocks absent, the basis
+/// unspecified so no reader takes it for a memory sample), and so does the lease that
+/// ends without a result, a timeout or a kill, through `failed_usage`, once.
+#[tokio::test]
+async fn every_lease_reports_its_usage_even_when_it_has_no_result() {
+    use kbf_proto::worker::{ResourceUsage, UsageBasis};
+
+    let dir = scratch("whole-usage");
+    let cas = Arc::new(MemoryCas::default());
+    let fake = FakeSession::default();
+    let runtime = start(&config(&dir), &fake, &cas);
+
+    let result = run(&runtime, &the_action(&cas)).await.expect("ran");
+    let usage = ResourceUsage::in_result(&result).expect("the result carries its usage");
+    assert_eq!(
+        ResourceUsage {
+            wall_micros: 0,
+            ..usage.clone()
+        },
+        ResourceUsage::default(),
+        "only the wall time is measured: {usage:?}"
+    );
+    assert_eq!(usage.basis(), UsageBasis::Unspecified);
+    assert_eq!(runtime.failed_usage(lease()), None, "a result has its own");
+
+    let timed = Spec::act("echo partial ; sleep 60")
+        .timeout(Duration::from_millis(300))
+        .store(&cas);
+    run(&runtime, &timed)
+        .await
+        .expect_err("ran past its timeout");
+    let told = runtime
+        .failed_usage(lease())
+        .expect("a timed out lease's usage");
+    assert!(
+        told.wall_micros >= 300_000,
+        "ran until the timeout: {told:?}"
+    );
+    assert_eq!(runtime.failed_usage(lease()), None, "told once");
+
+    let slow = Spec::act("sleep 60").store(&cas);
+    fake.verbs();
+    let running = {
+        let runtime = Arc::clone(&runtime);
+        tokio::spawn(async move { runtime.run(work(slow)).await })
+    };
+    until_logged(&fake, "run").await;
+    runtime.kill(lease()).await;
+    let outcome = running.await.expect("the run ended");
+    assert!(matches!(outcome, Err(RuntimeError::Killed)), "{outcome:?}");
+    assert_eq!(runtime.failed_usage(LeaseId::new(9, 9)), None, "another's");
+    assert!(runtime.failed_usage(lease()).is_some(), "a killed lease's");
+
+    fake.state().fail.insert("wait");
+    run(&runtime, &the_action(&cas)).await.expect_err("no exit");
+    assert_eq!(
+        runtime.failed_usage(lease()),
+        None,
+        "a run whose end was not seen measured nothing"
+    );
+
+    // An action that ran, whose outputs could not be stored: no result, but it ran.
+    let dir = scratch("whole-usage-down");
+    let down = Arc::new(MemoryCas {
+        refuse_puts: true,
+        ..MemoryCas::default()
+    });
+    let runtime = start(&config(&dir), &FakeSession::default(), &down);
+    run(&runtime, &the_action(&down)).await.expect_err("stored");
+    assert!(runtime.failed_usage(lease()).is_some(), "it ran");
+}
+
 /// Catches a lease the server gave up while the daemon restarted that is never
 /// cleaned (no `Start` comes for it again, so only the server's `Cancel`, a kill of a
 /// lease not running, can end it), one cleaned for a kill naming another lease, and a

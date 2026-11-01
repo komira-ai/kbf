@@ -1,0 +1,554 @@
+{
+  "Resources": {
+    "Bucket83908E77": {
+      "Type": "AWS::S3::Bucket",
+      "Properties": {
+        "BucketEncryption": {
+          "ServerSideEncryptionConfiguration": [
+            {
+              "ServerSideEncryptionByDefault": {
+                "SSEAlgorithm": "AES256"
+              }
+            }
+          ]
+        },
+        "BucketName": "kbf-prod-site-123456789012",
+        "LifecycleConfiguration": {
+          "Rules": [
+            {
+              "AbortIncompleteMultipartUpload": {
+                "DaysAfterInitiation": 7
+              },
+              "Id": "expire-noncurrent-versions",
+              "NoncurrentVersionExpiration": {
+                "NoncurrentDays": 365
+              },
+              "Status": "Enabled"
+            }
+          ]
+        },
+        "OwnershipControls": {
+          "Rules": [
+            {
+              "ObjectOwnership": "BucketOwnerEnforced"
+            }
+          ]
+        },
+        "PublicAccessBlockConfiguration": {
+          "BlockPublicAcls": true,
+          "BlockPublicPolicy": true,
+          "IgnorePublicAcls": true,
+          "RestrictPublicBuckets": true
+        },
+        "VersioningConfiguration": {
+          "Status": "Enabled"
+        }
+      },
+      "UpdateReplacePolicy": "Retain",
+      "DeletionPolicy": "Retain"
+    },
+    "BucketPolicyE9A3008A": {
+      "Type": "AWS::S3::BucketPolicy",
+      "Properties": {
+        "Bucket": {
+          "Ref": "Bucket83908E77"
+        },
+        "PolicyDocument": {
+          "Statement": [
+            {
+              "Action": "s3:*",
+              "Condition": {
+                "Bool": {
+                  "aws:SecureTransport": "false"
+                }
+              },
+              "Effect": "Deny",
+              "Principal": {
+                "AWS": "*"
+              },
+              "Resource": [
+                {
+                  "Fn::GetAtt": [
+                    "Bucket83908E77",
+                    "Arn"
+                  ]
+                },
+                {
+                  "Fn::Join": [
+                    "",
+                    [
+                      {
+                        "Fn::GetAtt": [
+                          "Bucket83908E77",
+                          "Arn"
+                        ]
+                      },
+                      "/*"
+                    ]
+                  ]
+                }
+              ]
+            },
+            {
+              "Action": "s3:GetObject",
+              "Condition": {
+                "StringEquals": {
+                  "AWS:SourceArn": {
+                    "Fn::Join": [
+                      "",
+                      [
+                        "arn:",
+                        {
+                          "Ref": "AWS::Partition"
+                        },
+                        ":cloudfront::",
+                        {
+                          "Ref": "AWS::AccountId"
+                        },
+                        ":distribution/",
+                        {
+                          "Ref": "Distribution830FAC52"
+                        }
+                      ]
+                    ]
+                  }
+                }
+              },
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "cloudfront.amazonaws.com"
+              },
+              "Resource": {
+                "Fn::Join": [
+                  "",
+                  [
+                    {
+                      "Fn::GetAtt": [
+                        "Bucket83908E77",
+                        "Arn"
+                      ]
+                    },
+                    "/*"
+                  ]
+                ]
+              }
+            }
+          ],
+          "Version": "2012-10-17"
+        }
+      }
+    },
+    "Cert5C9FAEC1": {
+      "Type": "AWS::CertificateManager::Certificate",
+      "Properties": {
+        "DomainName": "kbf.dev",
+        "DomainValidationOptions": [
+          {
+            "DomainName": "kbf.dev",
+            "HostedZoneId": "Z0TESTZONE"
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": "kbf-prod-site/Cert"
+          }
+        ],
+        "ValidationMethod": "DNS"
+      }
+    },
+    "HeadersECA0794E": {
+      "Type": "AWS::CloudFront::ResponseHeadersPolicy",
+      "Properties": {
+        "ResponseHeadersPolicyConfig": {
+          "CustomHeadersConfig": {
+            "Items": [
+              {
+                "Header": "Cross-Origin-Opener-Policy",
+                "Override": true,
+                "Value": "same-origin"
+              },
+              {
+                "Header": "Cross-Origin-Resource-Policy",
+                "Override": true,
+                "Value": "same-origin"
+              },
+              {
+                "Header": "Permissions-Policy",
+                "Override": true,
+                "Value": "camera=(), microphone=(), geolocation=(), payment=(), usb=()"
+              }
+            ]
+          },
+          "Name": "kbf-prod-site-headers",
+          "SecurityHeadersConfig": {
+            "ContentSecurityPolicy": {
+              "ContentSecurityPolicy": "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'",
+              "Override": true
+            },
+            "ContentTypeOptions": {
+              "Override": true
+            },
+            "FrameOptions": {
+              "FrameOption": "DENY",
+              "Override": true
+            },
+            "ReferrerPolicy": {
+              "Override": true,
+              "ReferrerPolicy": "no-referrer"
+            },
+            "StrictTransportSecurity": {
+              "AccessControlMaxAgeSec": 63072000,
+              "IncludeSubdomains": true,
+              "Override": true
+            }
+          }
+        }
+      }
+    },
+    "Router16807C72": {
+      "Type": "AWS::CloudFront::Function",
+      "Properties": {
+        "AutoPublish": true,
+        "FunctionCode": "function handler(event) {\n  var r = event.request;\n  var uri = r.uri;\n  if (uri.indexOf('/releases/') === 0) return r;\n  if (uri.charAt(uri.length - 1) === '/') r.uri = uri + 'index.html';\n  return r;\n}\n",
+        "FunctionConfig": {
+          "Comment": "kbf site: /x/ -> /x/index.html; /releases/* untouched",
+          "Runtime": "cloudfront-js-2.0"
+        },
+        "Name": "kbf-prod-site-router"
+      }
+    },
+    "DistributionOrigin1S3OriginAccessControlEB606076": {
+      "Type": "AWS::CloudFront::OriginAccessControl",
+      "Properties": {
+        "OriginAccessControlConfig": {
+          "Name": "kbfprodsiteDistributionOrigin1S3OriginAccessControl19B3CDE6",
+          "OriginAccessControlOriginType": "s3",
+          "SigningBehavior": "always",
+          "SigningProtocol": "sigv4"
+        }
+      }
+    },
+    "Distribution830FAC52": {
+      "Type": "AWS::CloudFront::Distribution",
+      "Properties": {
+        "DistributionConfig": {
+          "Aliases": [
+            "kbf.dev"
+          ],
+          "Comment": "kbf.dev site and releases",
+          "CustomErrorResponses": [
+            {
+              "ErrorCachingMinTTL": 10,
+              "ErrorCode": 403,
+              "ResponseCode": 404,
+              "ResponsePagePath": "/404.html"
+            },
+            {
+              "ErrorCachingMinTTL": 10,
+              "ErrorCode": 404,
+              "ResponseCode": 404,
+              "ResponsePagePath": "/404.html"
+            }
+          ],
+          "DefaultCacheBehavior": {
+            "AllowedMethods": [
+              "GET",
+              "HEAD"
+            ],
+            "CachePolicyId": "658327ea-f89d-4fab-a63d-7e88639e58f6",
+            "Compress": true,
+            "FunctionAssociations": [
+              {
+                "EventType": "viewer-request",
+                "FunctionARN": {
+                  "Fn::GetAtt": [
+                    "Router16807C72",
+                    "FunctionARN"
+                  ]
+                }
+              }
+            ],
+            "ResponseHeadersPolicyId": {
+              "Ref": "HeadersECA0794E"
+            },
+            "TargetOriginId": "kbfprodsiteDistributionOrigin195A1CA31",
+            "ViewerProtocolPolicy": "redirect-to-https"
+          },
+          "DefaultRootObject": "index.html",
+          "Enabled": true,
+          "HttpVersion": "http2and3",
+          "IPV6Enabled": true,
+          "Origins": [
+            {
+              "DomainName": {
+                "Fn::GetAtt": [
+                  "Bucket83908E77",
+                  "RegionalDomainName"
+                ]
+              },
+              "Id": "kbfprodsiteDistributionOrigin195A1CA31",
+              "OriginAccessControlId": {
+                "Fn::GetAtt": [
+                  "DistributionOrigin1S3OriginAccessControlEB606076",
+                  "Id"
+                ]
+              },
+              "S3OriginConfig": {
+                "OriginAccessIdentity": ""
+              }
+            }
+          ],
+          "ViewerCertificate": {
+            "AcmCertificateArn": {
+              "Ref": "Cert5C9FAEC1"
+            },
+            "MinimumProtocolVersion": "TLSv1.2_2021",
+            "SslSupportMethod": "sni-only"
+          }
+        }
+      }
+    },
+    "ARecordE7B57761": {
+      "Type": "AWS::Route53::RecordSet",
+      "Properties": {
+        "AliasTarget": {
+          "DNSName": {
+            "Fn::GetAtt": [
+              "Distribution830FAC52",
+              "DomainName"
+            ]
+          },
+          "HostedZoneId": {
+            "Fn::FindInMap": [
+              "AWSCloudFrontPartitionHostedZoneIdMap",
+              {
+                "Ref": "AWS::Partition"
+              },
+              "zoneId"
+            ]
+          }
+        },
+        "HostedZoneId": "Z0TESTZONE",
+        "Name": "kbf.dev.",
+        "Type": "A"
+      }
+    },
+    "AaaaRecord61D2056E": {
+      "Type": "AWS::Route53::RecordSet",
+      "Properties": {
+        "AliasTarget": {
+          "DNSName": {
+            "Fn::GetAtt": [
+              "Distribution830FAC52",
+              "DomainName"
+            ]
+          },
+          "HostedZoneId": {
+            "Fn::FindInMap": [
+              "AWSCloudFrontPartitionHostedZoneIdMap",
+              {
+                "Ref": "AWS::Partition"
+              },
+              "zoneId"
+            ]
+          }
+        },
+        "HostedZoneId": "Z0TESTZONE",
+        "Name": "kbf.dev.",
+        "Type": "AAAA"
+      }
+    },
+    "PublishRoleF42F66B6": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Statement": [
+            {
+              "Action": "sts:AssumeRoleWithWebIdentity",
+              "Condition": {
+                "StringEquals": {
+                  "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+                  "token.actions.githubusercontent.com:sub": "repo:example-org@111/example-repo@222:environment:prod-site:job_workflow_ref:example-org/example-repo/.github/workflows/site-publish.yml@refs/heads/main"
+                }
+              },
+              "Effect": "Allow",
+              "Principal": {
+                "Federated": "arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com"
+              }
+            }
+          ],
+          "Version": "2012-10-17"
+        },
+        "Description": "kbf site-publish workflow: uploads to the kbf.dev bucket and invalidates its distribution",
+        "MaxSessionDuration": 3600,
+        "RoleName": "kbf-prod-publish"
+      }
+    },
+    "PublishRoleDefaultPolicy9257B12D": {
+      "Type": "AWS::IAM::Policy",
+      "Properties": {
+        "PolicyDocument": {
+          "Statement": [
+            {
+              "Action": "s3:ListBucket",
+              "Effect": "Allow",
+              "Resource": {
+                "Fn::GetAtt": [
+                  "Bucket83908E77",
+                  "Arn"
+                ]
+              },
+              "Sid": "ListBucket"
+            },
+            {
+              "Action": "s3:PutObject",
+              "Effect": "Allow",
+              "Resource": {
+                "Fn::Join": [
+                  "",
+                  [
+                    {
+                      "Fn::GetAtt": [
+                        "Bucket83908E77",
+                        "Arn"
+                      ]
+                    },
+                    "/*"
+                  ]
+                ]
+              },
+              "Sid": "PutObjects"
+            },
+            {
+              "Action": "s3:DeleteObject",
+              "Effect": "Allow",
+              "Resource": {
+                "Fn::Join": [
+                  "",
+                  [
+                    {
+                      "Fn::GetAtt": [
+                        "Bucket83908E77",
+                        "Arn"
+                      ]
+                    },
+                    "/*"
+                  ]
+                ]
+              },
+              "Sid": "DeleteOutsideReleases"
+            },
+            {
+              "Action": [
+                "s3:DeleteObject",
+                "s3:DeleteObjectVersion"
+              ],
+              "Effect": "Deny",
+              "Resource": {
+                "Fn::Join": [
+                  "",
+                  [
+                    {
+                      "Fn::GetAtt": [
+                        "Bucket83908E77",
+                        "Arn"
+                      ]
+                    },
+                    "/releases/*"
+                  ]
+                ]
+              },
+              "Sid": "NeverDeleteReleases"
+            },
+            {
+              "Action": "s3:PutObject",
+              "Condition": {
+                "StringNotEquals": {
+                  "s3:if-none-match": "*"
+                }
+              },
+              "Effect": "Deny",
+              "Resource": {
+                "Fn::Join": [
+                  "",
+                  [
+                    {
+                      "Fn::GetAtt": [
+                        "Bucket83908E77",
+                        "Arn"
+                      ]
+                    },
+                    "/releases/*/*"
+                  ]
+                ]
+              },
+              "Sid": "ReleasesWriteOnce"
+            },
+            {
+              "Action": "cloudfront:CreateInvalidation",
+              "Effect": "Allow",
+              "Resource": {
+                "Fn::Join": [
+                  "",
+                  [
+                    "arn:aws:cloudfront::123456789012:distribution/",
+                    {
+                      "Ref": "Distribution830FAC52"
+                    }
+                  ]
+                ]
+              },
+              "Sid": "Invalidate"
+            }
+          ],
+          "Version": "2012-10-17"
+        },
+        "PolicyName": "PublishRoleDefaultPolicy9257B12D",
+        "Roles": [
+          {
+            "Ref": "PublishRoleF42F66B6"
+          }
+        ]
+      }
+    }
+  },
+  "Mappings": {
+    "AWSCloudFrontPartitionHostedZoneIdMap": {
+      "aws": {
+        "zoneId": "Z2FDTNDATAQYW2"
+      },
+      "aws-cn": {
+        "zoneId": "Z3RFFRIM2A3IF5"
+      }
+    }
+  },
+  "Outputs": {
+    "BucketName": {
+      "Value": {
+        "Ref": "Bucket83908E77"
+      }
+    },
+    "DistributionId": {
+      "Value": {
+        "Ref": "Distribution830FAC52"
+      }
+    },
+    "DistributionDomainName": {
+      "Value": {
+        "Fn::GetAtt": [
+          "Distribution830FAC52",
+          "DomainName"
+        ]
+      }
+    },
+    "PublishRoleArn": {
+      "Value": {
+        "Fn::GetAtt": [
+          "PublishRoleF42F66B6",
+          "Arn"
+        ]
+      }
+    }
+  }
+}

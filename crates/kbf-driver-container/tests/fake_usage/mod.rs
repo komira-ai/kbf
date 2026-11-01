@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use kbf_daemon::phases::LeasePhases;
 use kbf_daemon::{Runtime, RuntimeError};
+use kbf_driver_container::{ActionsCpu, ActionsCpuMax};
 use kbf_proto::worker::{NumaNodeBytes, ResourceUsage};
 use kbf_types::LeaseId;
 
@@ -358,4 +359,138 @@ async fn a_lease_reports_its_booked_cpu_and_the_node_cpu_pressure_at_its_start()
     let usage = ResourceUsage::in_result(&result).expect("usage");
     assert_eq!(usage.booked_millicpus, Some(2000));
     assert_eq!(usage.node_cpu_pressure_centi, None);
+}
+
+/// Catches the runtime reading the node load from a path other than the configured
+/// `actions/` cgroup (the parent's leading `/` joined as an absolute path), the clock
+/// given to the runtime being ignored, and a lease nobody ran having a peak.
+#[tokio::test]
+async fn the_runtime_reads_the_actions_cgroup_with_its_clock() {
+    let fake = Fake::new("node-load");
+    let actions = fake.cgroup.join("actions");
+    for (file, text) in [
+        ("cpu.stat", "usage_usec 42\nthrottled_usec 7\n"),
+        ("memory.current", "1000\n"),
+        ("memory.stat", "inactive_file 400\nactive_file 150\n"),
+        ("cpu.max", "max 100000\n"),
+    ] {
+        std::fs::write(actions.join(file), text).expect("file");
+    }
+    let runtime = kbf_driver_container::ContainerRuntime::new(
+        fake.config.clone(),
+        std::sync::Arc::clone(&fake.cas),
+    )
+    .expect("runtime")
+    .with_clock(std::sync::Arc::new(|| 9_000));
+    let load = runtime.node_load().await.expect("reading");
+    assert_eq!(
+        (
+            load.seq,
+            load.mono_usec,
+            load.cpu_usage_usec,
+            load.working_set_bytes
+        ),
+        (1, 9_000, 42, 600)
+    );
+    assert_eq!(load.active_file_bytes, 150);
+    assert_eq!(load.throttled_usec, Some(7));
+    assert_eq!(load.pressure_some_total_usec, None);
+    assert!(!load.actions_cpu_limited && load.covered.is_empty());
+    assert_eq!(
+        runtime.take_peak_window_millicores(LeaseId { term: 1, seq: 1 }),
+        None
+    );
+}
+
+/// What the node's load reading says of the actions cgroup's limit, and the text of its
+/// `cpu.max`, after the runtime was told what a Welcome said.
+async fn told(fake: &Fake, placement_load: bool) -> (bool, String) {
+    Runtime::welcomed_placement_load(&*fake.runtime, placement_load).await;
+    let load = Runtime::node_load(&*fake.runtime)
+        .await
+        .expect("reading")
+        .expect("a container runtime takes readings");
+    let written = std::fs::read_to_string(fake.cgroup.join("actions/cpu.max")).expect("cpu.max");
+    (load.load.actions_cpu_limited, written)
+}
+
+/// A fake node whose actions cgroup holds the limit the start wrote (4 CPUs), with the
+/// runtime following `mode` over 4 CPUs; `None` is a runtime given no mode.
+fn limited_node(name: &str, mode: Option<ActionsCpuMax>) -> Fake {
+    let fake = Fake::with(name, |config| {
+        config.actions_cpu = mode.map(|mode| ActionsCpu {
+            mode,
+            lease_cpus: 4,
+        });
+    });
+    let actions = fake.cgroup.join("actions");
+    for (file, text) in [
+        ("cpu.stat", "usage_usec 42\n"),
+        ("memory.current", "1000\n"),
+        ("memory.stat", "inactive_file 400\nactive_file 150\n"),
+        ("cpu.max", "400000 100000"),
+    ] {
+        std::fs::write(actions.join(file), text).expect("file");
+    }
+    fake
+}
+
+const RESERVE: &str = "400000 100000";
+const LIFTED: &str = "max 100000";
+
+/// Catches `--actions-cpu-max=auto` not following the Welcome, and a heartbeat that does not
+/// report what was written: until the first Welcome the limit of the start stays; a Welcome
+/// that says true lifts it; one that says false (a reconnect to a server in another mode)
+/// writes the reserve's limit again; and the reading (`actions_cpu_limited`) is the opposite
+/// of what is lifted each time.
+#[tokio::test]
+async fn auto_follows_each_welcome_and_the_reading_reports_it() {
+    let fake = limited_node("cpu-max-auto", Some(ActionsCpuMax::Auto));
+    let before = Runtime::node_load(&*fake.runtime).await.expect("reading");
+    assert!(before.expect("reading").load.actions_cpu_limited);
+    for (placement_load, limited, written) in [
+        (true, false, LIFTED),
+        (false, true, RESERVE),
+        (true, false, LIFTED),
+    ] {
+        assert_eq!(
+            told(&fake, placement_load).await,
+            (limited, written.to_owned()),
+            "Welcome {placement_load}"
+        );
+    }
+}
+
+/// Catches `on` and `off` yielding to the Welcome: each writes the same whatever it says.
+#[tokio::test]
+async fn on_and_off_override_each_welcome() {
+    for (mode, limited, written) in [
+        (ActionsCpuMax::On, false, LIFTED),
+        (ActionsCpuMax::Off, true, RESERVE),
+    ] {
+        let fake = limited_node(&format!("cpu-max-{mode:?}"), Some(mode));
+        for placement_load in [true, false, true] {
+            assert_eq!(
+                told(&fake, placement_load).await,
+                (limited, written.to_owned()),
+                "{mode:?} with Welcome {placement_load}"
+            );
+        }
+    }
+}
+
+/// Catches a runtime given no mode writing to `cpu.max` (a runtime built without the
+/// node's setting leaves the limit of the start), and a failed write ending the stream or
+/// changing the limit: a `cpu.max` that cannot be written is logged and stays as it was.
+#[tokio::test]
+async fn without_a_mode_or_when_the_write_fails_the_limit_stays() {
+    let none = limited_node("cpu-max-none", None);
+    assert_eq!(told(&none, true).await, (true, RESERVE.to_owned()));
+
+    let fake = limited_node("cpu-max-unwritable", Some(ActionsCpuMax::On));
+    let cpu_max = fake.cgroup.join("actions/cpu.max");
+    std::fs::remove_file(&cpu_max).expect("rm");
+    std::fs::create_dir(&cpu_max).expect("a directory cannot be written as a file");
+    Runtime::welcomed_placement_load(&*fake.runtime, true).await;
+    assert!(cpu_max.is_dir(), "nothing was written over it");
 }

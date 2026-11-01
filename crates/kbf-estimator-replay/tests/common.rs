@@ -141,7 +141,12 @@ pub fn farm() -> Routes {
             "memory_anon_swap_peak_bytes": 8, "cpu_pressure_some_us": 9,
         }),
     );
-    mac["operation"] = "op-9".into();
+    // The operation, as the run route writes it (a number under `operation_id`).
+    let served = kbf_server::run_json(&kbf_history::records::RunRecord {
+        operation_id: Some(9),
+        ..Default::default()
+    });
+    mac["operation_id"] = served["operation_id"].clone();
     put(&mut r, "/v1/runs/r3", &mac);
     // r4: a node the list does not know, no shape, no usage, never started.
     let mut lost = run("r4", "gone", OCT_1 + DAY + 1, "lost", Value::Null);
@@ -291,6 +296,13 @@ pub fn attempt(digest: &str, queued_s: u64, run_s: u64, outcome: &str, peak: Opt
         operation: None,
         booked_millicpus: None,
         node_cpu_pressure_centi: None,
+        invocation_id: None,
+        correlated_invocations_id: None,
+        phase_times: None,
+        fetch_us: None,
+        execution_us: None,
+        pack_us: None,
+        lease: None,
     }
 }
 

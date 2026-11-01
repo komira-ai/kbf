@@ -40,9 +40,17 @@ fn start_with(local: Option<Arc<LocalCache>>) -> (SocketAddr, SocketAddr) {
         tick: Duration::from_millis(50),
         unservable_wait: kbf_sched::UNSERVABLE_WAIT,
         default_platform: kbf_front::DefaultPlatform::NONE,
+        qos_allowed: kbf_front::QosAllow::DEFAULT,
         memory_ladder: kbf_server::MemoryLadder::default(),
+        memory_climb: true,
         vm_host_floor: kbf_server::HostFloor::default(),
         learned_sizes: kbf_server::LearnedSizes::Off,
+        exclusive_actions: false,
+        scheduler_core: kbf_server::SchedulerCore::under_test(),
+        placement_load: kbf_server::PlacementLoad::Off,
+        placement_predictions: kbf_server::PlacementPredictions::Off,
+        usage_profiles: kbf_server::UsageProfiles::Off,
+        whole_node: None,
         finished_retention: kbf_sched::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
         streams: kbf_server::StreamTiming::default(),
@@ -123,6 +131,18 @@ async fn metrics_count_what_the_reapi_listener_serves() {
     );
     assert_eq!(sample(&body, "kbf_bytestream_write_requests_total"), 0);
     assert!(!body.contains("kbf_local_cache"), "{body}");
+    // The scheduler core the farm runs: one series per core, 1 for the running one.
+    assert!(body.contains("# TYPE kbf_scheduler_core gauge"), "{body}");
+    // The farm of this server is built on the core the tests name, and the gauge follows its
+    // driver: a farm on the js core must not report legacy.
+    let running = kbf_server::SchedulerCore::under_test();
+    for core in [
+        kbf_server::SchedulerCore::Legacy,
+        kbf_server::SchedulerCore::Js,
+    ] {
+        let series = format!("kbf_scheduler_core{{core=\"{}\"}}", core.name());
+        assert_eq!(sample(&body, &series), u64::from(core == running), "{body}");
+    }
     // The loss-mark families, read from the metadata state at the scrape.
     assert!(body.contains("# TYPE kbf_cache_lost_blobs gauge"), "{body}");
     assert!(

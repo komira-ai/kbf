@@ -13,6 +13,16 @@ pub enum DigestFunction {
     Sha256,
 }
 
+impl DigestFunction {
+    /// The function's name in lower case, as trace and text forms write it (`sha256`).
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Sha256 => "sha256",
+        }
+    }
+}
+
 /// A content digest: the hash function, the hash, and the size of the content in bytes.
 ///
 /// Equality, ordering and hashing use all three fields. Two digests with the same hash
@@ -139,6 +149,12 @@ mod tests {
         assert_eq!(digest(0), digest(0));
         assert_ne!(digest(0), digest(1));
         assert!(digest(0) < digest(1));
+    }
+
+    /// Catches: a function name that is not the lower-case name trace text writes.
+    #[test]
+    fn a_function_is_named_in_lower_case() {
+        assert_eq!(DigestFunction::Sha256.name(), "sha256");
     }
 
     /// Catches: a hex encoder or decoder that swaps nibbles, drops a byte, or emits

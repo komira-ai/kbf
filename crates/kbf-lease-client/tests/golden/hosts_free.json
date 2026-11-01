@@ -1,0 +1,1 @@
+{"hosts":[{"id":"node1","source":"registered","state":"live","lost":false,"phase":"serving","shape":{"cpu_millis":16000,"memory_bytes":68719476736,"gpus":0},"capabilities":{"os":"linux"},"labels":{},"agent_version":"fake","releasing":false}]}

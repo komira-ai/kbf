@@ -62,11 +62,11 @@ pub fn needs_in(invocation: &Invocation, config: &Path) -> Needs {
         Invocation::AllInOne(flags) => {
             let mut n = Needs::new("all-in-one");
             server_files(&mut n, &flags.server);
-            n.s3 = s3(&flags.server);
+            cold_keys(&mut n, &flags.server, true);
             n.hot_store = hot_dir(&flags.server);
             daemon(&mut n, &flags.daemon);
             // An all-in-one with an S3 cold store holds the key on purpose.
-            if !n.s3 {
+            if !s3(&flags.server) {
                 n.key = KeyRule::Absent;
             }
             n
@@ -143,6 +143,19 @@ fn s3(args: &Args) -> bool {
     matches!(args.cold_store, Some(StoreUri::S3(_)))
 }
 
+/// What the cold store's key pair asks of the host: the key file, as a secret, when
+/// `--cold-store-credentials-file` names one (the environment is not read then); else, for an
+/// S3 store and when `env_pair` (no registration may supply it), the two variables.
+fn cold_keys(n: &mut Needs, args: &Args, env_pair: bool) {
+    match &args.cold_store_credentials_file {
+        // A `registered` store takes its keys from the registration only: the start refuses
+        // the file with a message of its own, so the host is not asked to have it.
+        Some(_) if matches!(args.cold_store, Some(StoreUri::Registered)) => {}
+        Some(file) => n.secret("--cold-store-credentials-file", file),
+        None => n.s3 = s3(args) && env_pair,
+    }
+}
+
 /// The files the frontend half of `kbf-server` reads: the REAPI listener's pair, the auth
 /// policy, the operator API's token, the proxy's secret, the worker listener's certificate, key, client CA
 /// and deny list.
@@ -200,7 +213,7 @@ fn storage(n: &mut Needs, flags: &kbf_server::storage_node::StorageFlags) {
     // A node that registers with a frontend may be given the key pair by it
     // (`kbf_server::cold_apply`); the start says which variable is missing if the
     // frontend has no store registered either.
-    n.s3 = s3(&flags.server) && flags.frontend.is_none();
+    cold_keys(n, &flags.server, flags.frontend.is_none());
     if let Some([cert, key, ca]) = &flags.tls {
         n.cert(
             ("--storage-tls-cert", cert),

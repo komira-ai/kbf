@@ -3,6 +3,8 @@
 # overrides its key. A secret is the path of the file that holds it.
 
 [containers]
+# Whether the actions cgroup's `cpu.max` is lifted (container). At start it holds the leases' CPUs, the node's minus `--reserve-cpus`; the server's Welcome then says, on every connect and reconnect, whether the farm places by the load the nodes measure (`Welcome.placement_load`), which a CPU limit would hide (a cgroup throttled at its limit never measures more than it). `auto` follows the Welcome: `cpu.max` is `max` when it says so, and the leases' CPUs when it says otherwise or nothing; `on` lifts the limit and `off` keeps it, whatever the Welcome says. Until the first Welcome the limit of the start stays. The heartbeat reports what was written (`NodeLoad.actions_cpu_limited`). Refused with a driver other than `container`
+actions-cpu-max = "auto"
 # Written to the actions cgroup's `memory.max` at start (container): the most memory all leases together may use, in GiB, so the rest stays for what else runs on the node. The node reports the lowest `memory.max` above its leases, or its memory when that is less, and the CPUs of their cpuset
 # actions-memory-max-gib = "ACTIONS_MEMORY_MAX_GIB"
 # The cgroup lease cgroups are made under, from the cgroup root (container). Left out, the daemon sets up its own cgroup, which its systemd unit must delegate (`Delegate=yes`): it moves itself into a `supervisor` leaf there and makes `actions` beside it, with cpu, memory and pids enabled. Given, it must already enable cpu, memory and pids for its children
@@ -52,18 +54,20 @@ supervisor-memory-min-mib = 256
 # cpu-threads = "N"
 # This daemon's own user, which keeps read and remove access to what a whole-machine lease's user writes in its lease directory (native-whole-machine)
 daemon-user = "_kbf"
-# The directory the daemon keeps everything in, on a local disk: `leases/` (lease directories, the container and native drivers), and under the container driver (and the native driver on macOS) `cache/` (the input cache, `docs/design/worker-cache.md`) and `trees/` (shared read-only input trees, `docs/design/fast-sandbox.md#4-shared-trees`). Made if missing; absolute. The cache and trees are on, sized from the filesystem: half and a quarter of its size less what it keeps free (5%, at least 1 GiB), and the cache evicts entries no running lease links to keep that much free. A directory another daemon owns, or that cannot be used, is left alone: the daemon warns and runs uncached
+# The directory the daemon keeps everything in, on a local disk: `leases/` (lease directories, the container and native drivers), and under the container driver (and the native driver on macOS) `cache/` (the input cache, `docs/design/worker-cache.md`) and `trees/` (shared read-only input trees, `docs/design/fast-sandbox.md#4-shared-trees`). Made if missing; absolute. The cache and trees are on (unless `--no-input-cache`), sized from the filesystem: half and a quarter of its size less what it keeps free (5%, at least 1 GiB), and the cache evicts entries no running lease links to keep that much free. A directory another daemon owns, or that cannot be used, is left alone: the daemon warns and runs uncached
 # data-dir = "DIR"
 # Lowers the size the cache and the trees are budgeted from (half and a quarter of it), under the filesystem's automatic one
 # data-max-bytes = "BYTES"
-# On the first SIGTERM or SIGINT the daemon drains: it takes no new lease, lets the running ones finish and report, waits for their acknowledgements, then exits 0. A second signal, or this many seconds after the first, stops it at once and abandons the leases still running. Used by `kbf daemon` and `kbf storage-and-daemon`; `kbf all-in-one` stops its daemon half with the server half
-drain-deadline-secs = 600
+# On the first SIGTERM or SIGINT the daemon drains: it takes no new lease, lets the running ones finish and report, waits for their acknowledgements, then exits 0, however long that takes. A second signal stops it at once and abandons the leases still running. Left out, the drain has no deadline. Given, this many seconds after the first signal the daemon logs a warning with the number of leases still running and keeps waiting; the value has no upper bound, and 0 warns at once. It never abandons a lease. Used by `kbf daemon`, `kbf storage-and-daemon` and `kbf all-in-one`, whose daemon half drains once its server half has no execution open, while the server half goes on serving it; a second signal stops both
+# drain-deadline-secs = "SECONDS"
 # How leases run; once per runtime. The daemon runs each lease on the driver that serves its kind and refuses to start when two serve the same kind. The node's own driver (native or container) is set up first, whatever the order given
 # driver = []
 # A container image this node is pinned to, as an action names it: `docker://<repo>@sha256:<digest>`, one architecture's manifest digest (container; repeatable). At start the daemon makes sure each is in the node's image store, as the prepare step of every lease does: it fetches the image from its registry by that digest, checks every byte against a digest, and unpacks it once. It exits with status 2 if one cannot be fetched, fails a check, or names an image index. The node's status lists them (`GET /v1/nodes`, `software.container_images`). No work is placed by image yet: an action may still name another image
 # image = []
 # How long a lease's processes are given to end after SIGTERM before they are killed, in milliseconds; 0 kills them at once (native). A workload that cleans up when asked to end, such as Python's multiprocessing resource tracker with the shared memory it made, does so in this time; one that ignores SIGTERM is named in the lease's stderr. A slot's clean uses the same value (at most its own time limit). More than 60000 is taken as 60000. The wait comes after the action's timeout and its memory watch have ended it (neither runs during it), and on top of the time given to the kill that follows. A lease past its memory limit is killed at once. Applies on every platform
 native-term-grace-ms = 2000
+# Switches the host input cache off: no `cache/` and no `trees/`, so every action fetches its inputs from the CAS into its own input root and no later action reuses them (no hard link or clone from either). Leaves what an earlier start put in `<data-dir>/cache` and `<data-dir>/trees` alone. Without a cache a lease reports no input statistics (`cache_hits` and the rest exist only with a cache). For measuring what the cache saves
+no-input-cache = false
 # Retired: no longer read, the node's update client was removed. Accepted and ignored for one release
 # (not in --help)
 # orders-dir = "DIR"
@@ -71,7 +75,7 @@ native-term-grace-ms = 2000
 reconnect-max-ms = 30000
 # The wait, in milliseconds, after a session ends and after the first round of connection attempts that all failed. It doubles with each further failed round
 reconnect-ms = 1000
-# Logical CPUs the farm's own processes keep, in CPUs (hyperthreads count one each). The daemon gives its leases every CPU it may use but these, with no pinning, and sizes its own pools from them. Default: 8 (half the CPUs on a machine of fewer than 16). 0 is allowed; a value that leaves no CPU for leases, or is more than the machine has, is refused. On a host that also runs the server, this covers both; the server has no reserve flag
+# Logical CPUs the farm's own processes keep, in CPUs (hyperthreads count one each). The daemon gives its leases every CPU it may use but these, with no pinning, and sizes its own pools from them. Default: 4 physical cores with their hyperthreads, so 8 where two threads share a core and 4 where each core has one (half the CPUs on a smaller machine). 0 is allowed; a value that leaves no CPU for leases, or is more than the machine has, is refused. On a host that also runs the server, this covers both; the server has no reserve flag
 # reserve-cpus = "N"
 # How many of the farm's processes on this host share the reserve: the daemon sizes its pools from `reserve / share` CPUs. Default 1
 # reserve-share = "N"

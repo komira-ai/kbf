@@ -72,6 +72,7 @@ fn stdin_is_closed() {
 fn exec_text_replaces_invalid_bytes() {
     let exec = Exec {
         code: Some(0),
+        signal: None,
         stdout: vec![b'a', 0xff],
         stderr: vec![0xfe, b'b'],
     };
@@ -247,59 +248,6 @@ fn a_privilege_drop_needs_a_real_uid_of_root() {
     assert!(refuse_setuid_drop(None, 1000, 0).is_ok());
 }
 
-/// A command with no `run_as` is started as it is. One with `run_as` is started by `chroot`
-/// on macOS, which sets the user, the group and the one supplementary group (the program
-/// and its arguments follow the root `/`); elsewhere this process sets the user and group.
-#[test]
-fn a_drop_goes_through_chroot_on_a_mac() {
-    use super::{Identity, Launch, launch};
-    let mut c = cmd("/usr/bin/gh", &["attestation", "verify"]);
-    for through_chroot in [false, true] {
-        assert_eq!(
-            launch(&c, through_chroot).unwrap(),
-            Launch {
-                program: "/usr/bin/gh".into(),
-                args: vec!["attestation".into(), "verify".into()],
-                set_ids: None
-            }
-        );
-    }
-    let id = Identity {
-        uid: 4_294_967_294,
-        gid: 4_294_967_293,
-    };
-    c.run_as = Some(id);
-    assert_eq!(
-        launch(&c, false).unwrap(),
-        Launch {
-            program: "/usr/bin/gh".into(),
-            args: vec!["attestation".into(), "verify".into()],
-            set_ids: Some(id)
-        }
-    );
-    assert_eq!(
-        launch(&c, true).unwrap(),
-        Launch {
-            program: "/usr/sbin/chroot".into(),
-            args: [
-                "-u",
-                "4294967294",
-                "-g",
-                "4294967293",
-                "-G",
-                "4294967293",
-                "/",
-                "/usr/bin/gh",
-                "attestation",
-                "verify"
-            ]
-            .map(str::to_owned)
-            .to_vec(),
-            set_ids: None
-        }
-    );
-}
-
 /// A command that writes `blocks` MiB to `file` with `dd`, held to `max` bytes in `dir`.
 fn writes(dir: &std::path::Path, file: &str, blocks: u32, max: u64) -> Cmd {
     Cmd {
@@ -418,25 +366,74 @@ fn a_cap_works_without_a_time_limit_and_over_a_missing_directory() {
     assert!(SystemRunner.run(&missing).unwrap().success());
 }
 
-/// A drop through `chroot` to uid 0 is refused, so `chroot` never runs a command as root.
+/// A drop with exact groups to uid 0 or gid 0 is refused, so the program never runs as root or
+/// in group 0 (`wheel`) through it; the drop by `Command::uid` and `gid` is not covered by this
+/// check, and no drop at all is not refused.
 #[test]
-fn a_chroot_drop_to_uid_zero_is_refused() {
-    use super::{Identity, launch};
-    let mut c = cmd("/usr/bin/gh", &[]);
-    c.run_as = Some(Identity { uid: 0, gid: 20 });
-    let kind = launch(&c, true).map_err(|e| e.kind());
-    assert_eq!(kind, Err(std::io::ErrorKind::PermissionDenied));
-    // This process's own drop is not covered by this check.
-    assert!(launch(&c, false).is_ok());
+fn an_exact_groups_drop_to_uid_or_gid_zero_is_refused() {
+    use super::{Identity, drop_ids};
+    use std::process::Command;
+    for (uid, gid) in [(0, 20), (501, 0), (0, 0)] {
+        let mut command = Command::new("/usr/bin/true");
+        let kind = drop_ids(&mut command, Some(Identity { uid, gid }), true).map_err(|e| e.kind());
+        assert_eq!(
+            kind,
+            Err(std::io::ErrorKind::PermissionDenied),
+            "{uid} {gid}"
+        );
+        assert!(drop_ids(&mut command, Some(Identity { uid, gid }), false).is_ok());
+    }
+    let mut command = Command::new("/usr/bin/true");
+    assert!(drop_ids(&mut command, None, true).is_ok());
+    assert!(drop_ids(&mut command, Some(Identity { uid: 501, gid: 20 }), true).is_ok());
 }
 
-/// A drop through `chroot` to gid 0 is refused, so the child never keeps group 0 (`wheel`).
+/// The words for how a command ended, from a fixed exit.
 #[test]
-fn a_chroot_drop_to_gid_zero_is_refused() {
-    use super::{Identity, launch};
-    let mut c = cmd("/usr/bin/gh", &[]);
-    c.run_as = Some(Identity { uid: 501, gid: 0 });
-    let kind = launch(&c, true).map_err(|e| e.kind());
-    assert_eq!(kind, Err(std::io::ErrorKind::PermissionDenied));
-    assert!(launch(&c, false).is_ok());
+fn ended_says_the_status_or_the_signal() {
+    let exec = |code, signal| Exec {
+        code,
+        signal,
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+    };
+    assert_eq!(exec(Some(0), None).ended(), "exit status 0");
+    assert_eq!(exec(None, Some(9)).ended(), "signal 9 (SIGKILL)");
+    assert_eq!(exec(None, Some(13)).ended(), "signal 13 (SIGPIPE)");
+    assert_eq!(exec(None, Some(11)).ended(), "signal 11 (SIGSEGV)");
+    assert_eq!(exec(None, Some(63)).ended(), "signal 63 (unnamed)");
+    assert_eq!(exec(None, None).ended(), "no exit status");
+}
+
+/// The variable that makes `helper_raise_sigterm_when_asked` end this test binary with SIGTERM.
+const RAISE: &str = "KBF_RUNNER_TEST_RAISE_SIGTERM";
+
+/// Not a test of its own: the program the next test runs. Without the variable it does
+/// nothing; with it, the test binary sends itself SIGTERM and so ends by that signal.
+#[test]
+fn helper_raise_sigterm_when_asked() {
+    if std::env::var_os(RAISE).is_some() {
+        rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::TERM)
+            .expect("send SIGTERM to self");
+        // The default action ends the process before this; a stop here would be a hang.
+        std::process::abort();
+    }
+}
+
+/// Catches a runner that does not record the signal that ended a real child (`signal` always
+/// none): the test binary is run again, filtered to the helper above, with the variable set.
+/// It ends itself by SIGTERM, and the result has that signal, no exit code, and the words
+/// `fetch` uses in its reasons.
+#[test]
+fn a_real_child_that_kills_itself_reports_signal_15() {
+    let mut c = cmd(
+        std::env::current_exe().unwrap().to_str().unwrap(),
+        &["helper_raise_sigterm_when_asked", "--test-threads=1"],
+    );
+    c.env = vec![(RAISE.into(), "1".into())];
+    let exec = SystemRunner.run(&c).unwrap();
+    assert_eq!(exec.signal, Some(15), "{}", exec.stderr_text());
+    assert_eq!(exec.code, None);
+    assert!(!exec.success());
+    assert_eq!(exec.ended(), "signal 15 (SIGTERM)");
 }

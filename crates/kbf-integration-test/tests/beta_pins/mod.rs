@@ -1,5 +1,5 @@
-//! The beta smoke job (`smoke` in `.github/workflows/beta.yml`) fetches the same Buck2
-//! as the other jobs of that workflow (the M1 and M2 cells) and runs the same actions, and
+//! The beta smoke job (`smoke` in `.github/workflows/smoke.yml`) fetches the same Buck2
+//! as the jobs of `beta.yml` (the M1 and M2 cells) and runs the same actions, and
 //! its text says so by copying their pins: `BUCK2_VERSION`, `BUCK2_SHA256` and each
 //! action's commit.
 //! A bump in one job that leaves a copy behind would have the smoke test other bytes than
@@ -11,7 +11,9 @@ use std::collections::BTreeMap;
 
 use super::workflows;
 
-/// The workflow that holds the smoke job and the jobs it copies from.
+/// The workflow that holds the smoke job.
+const SMOKE: &str = ".github/workflows/smoke.yml";
+/// The workflow that holds the jobs the smoke job copies from, and the cross-version cell.
 const BETA: &str = ".github/workflows/beta.yml";
 /// What a message calls the jobs the smoke job copies from.
 const CI: &str = ".github/workflows/beta.yml (another job)";
@@ -63,15 +65,15 @@ fn mismatches(beta: &str, ci: &str, also: &[&str]) -> Result<Vec<String>, String
     }
     for pin in PINS {
         let Some((_, mine)) = beta_env.iter().find(|(k, _)| k == pin) else {
-            problems.push(format!("{BETA}: the {JOB} job does not set {pin}"));
+            problems.push(format!("{SMOKE}: the {JOB} job does not set {pin}"));
             continue;
         };
         match ci_env.get(pin) {
-            None => problems.push(format!("{CI}: no job sets {pin}, which {BETA} copies")),
+            None => problems.push(format!("{CI}: no job sets {pin}, which {SMOKE} copies")),
             Some(theirs) => {
                 for (job, value) in theirs.iter().filter(|(_, v)| v != mine) {
                     problems.push(format!(
-                        "{BETA}: {pin} is {mine}, but {CI} job {job} has {value}"
+                        "{SMOKE}: {pin} is {mine}, but {CI} job {job} has {value}"
                     ));
                 }
             }
@@ -82,9 +84,9 @@ fn mismatches(beta: &str, ci: &str, also: &[&str]) -> Result<Vec<String>, String
             continue;
         };
         match ci_uses.get(name) {
-            None => problems.push(format!("{BETA}: {name} is used, and {CI} does not use it")),
+            None => problems.push(format!("{SMOKE}: {name} is used, and {CI} does not use it")),
             Some(commits) if commits.iter().any(|c| c != commit) => problems.push(format!(
-                "{BETA}: {name} is at {commit}, but {CI} uses it at {}",
+                "{SMOKE}: {name} is at {commit}, but {CI} uses it at {}",
                 commits
                     .iter()
                     .filter(|c| *c != commit)
@@ -115,10 +117,10 @@ fn gamma_mismatches(release: &str, beta: &str) -> Result<Vec<String>, String> {
         match (want, have) {
             (Some(w), Some(h)) if w == h => {}
             (Some(w), Some(h)) => problems.push(format!(
-                "{RELEASE}: {pin} is {h} in the {GAMMA} job, but {BETA} job {JOB} has {w}"
+                "{RELEASE}: {pin} is {h} in the {GAMMA} job, but {SMOKE} job {JOB} has {w}"
             )),
             (_, None) => problems.push(format!("{RELEASE}: the {GAMMA} job does not set {pin}")),
-            (None, Some(_)) => problems.push(format!("{BETA}: the {JOB} job does not set {pin}")),
+            (None, Some(_)) => problems.push(format!("{SMOKE}: the {JOB} job does not set {pin}")),
         }
     }
     Ok(problems)
@@ -150,7 +152,7 @@ fn no_buck2_fetch_step_overrides_the_pins_with_an_env_of_its_own() {
     // Catches: a step-level `env:` on a Buck2 fetch step in beta.yml or release.yml that
     // changes the checksum or the version after the job-level pins were compared.
     let root = super::repo_root();
-    for path in [BETA, RELEASE] {
+    for path in [BETA, SMOKE, RELEASE] {
         let text = std::fs::read_to_string(root.join(path)).expect(path);
         assert_eq!(fetch_step_overrides(&text), Ok(Vec::new()), "{path}");
     }
@@ -167,7 +169,7 @@ fn the_gamma_job_fetches_the_buck2_of_the_beta_smoke() {
     let root = super::repo_root();
     let read = |path: &str| std::fs::read_to_string(root.join(path)).expect(path);
     assert_eq!(
-        gamma_mismatches(&read(RELEASE), &read(BETA)),
+        gamma_mismatches(&read(RELEASE), &read(SMOKE)),
         Ok(Vec::new())
     );
 }
@@ -217,7 +219,7 @@ fn the_beta_workflow_copies_the_pins_of_ci() {
     let read = |path: &str| std::fs::read_to_string(root.join(path)).expect(path);
     let artifacts = read(".github/workflows/artifacts.yml");
     assert_eq!(
-        mismatches(&read(BETA), &read(BETA), &[&artifacts]),
+        mismatches(&read(SMOKE), &read(BETA), &[&artifacts]),
         Ok(Vec::new())
     );
 }

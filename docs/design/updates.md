@@ -25,6 +25,10 @@ Node id and role come from the certificate (section 5), not the heartbeat. The u
 
 CI sets one desired state with one OIDC-authenticated call (`kbf-oidc`): version X and per-role limits, including the minimum number of storage hosts and of frontends that must be up. The coordinator stores only that, in a small file.
 
+The coordinator keeps that desired state per service name; `kbf` is the only service it accepts. `POST /v1/desired` takes an optional `service` field (absent means `kbf`), and any other name is refused with 400. `GET /v1/status` and `GET /v1/convergence` keep their fields for `kbf`; the status adds `services`, the desired state of every service by name. `GET /v1/convergence?service=S` answers the same shape for service S from the hosts that heartbeated it and its own desired state (no query means `kbf`, unchanged), and the status adds `per_service`, each managed service's desired state and role counts. The decision and the heartbeat and reply wire are unchanged. The state file is, while `kbf` is the only service, the single state itself (the format earlier builds wrote); a file of the form `{"services": {name: state}}` is read as the map, and a file of the old form is read as `kbf`'s.
+
+A service is data (`crates/kbf-coordinator/src/services.rs`): a name; the roles it runs on, each with `max_updating`, `min_up`, `never_last` and the roles of the same service it waits for; and `after`, the services whose live hosts must all run their desired version and not be updating before any host of this service is ordered. `kbf` is shipped as data in the same format (`crates/kbf-coordinator/src/kbf.services.toml`) and reproduces the rules above: its frontend role is `never_last` (at least one other frontend up, whatever `min_up` says) and waits for the storage, daemon and Mac roles, and its limits come from the desired state. `--services-file` (optional; without it `kbf` is the only service) defines further services in TOML, and may begin with an entry named `kbf` to replace the shipped definition (it must be the first entry, wait for no service and have a role; a desired state of `kbf` still names `min_up` for storage and frontend; a later `kbf` entry is refused). **Trust boundary:** a replaced `kbf` can drop every gate of kbf's rollout (`max_updating` up to 10000, `min_up = 0`, no `never_last`, no `after`), and a role's own limits replace the desired state's, so whoever controls the services file controls kbf's rollout safety. `--services-file` is a startup flag only, and the file is read under the rule of the operator token file: a regular file, not a symlink, owned by the coordinator's user, mode `0600` or `0400`, at most 1 MiB; anything else stops the start. Which services a CI token may set comes from the allow-list entry that admitted it (`services = [...]`, default `kbf` only), not from the services file; a service the entry does not name is refused with 403, so a token meant for another service can never set `kbf`, and a services file that still has a `ci_services` key is refused. A defined role's own `max_updating` and `min_up` replace the desired state's; `min_up = 0` allows ordering a lone host of the role. The decision runs per host and service, orders are kept per (host, service), and a host with any service updating, or with an order outstanding for another, is ordered nothing for a second: one update per host at a time. The wire carries services in a way an updater of today still reads. A heartbeat may add `services`, a list of `{name, version, health, last_update, updating}`, one per service besides `kbf`; the top-level fields stay `kbf` in every heartbeat, so `kbf` is never listed inside `services` (a heartbeat whose list names `kbf`, names a service twice, uses a bad name or lists more than 16 services is not refused, because that would also stop the host's `kbf` updates: the coordinator drops the list, answers the host as a `kbf`-only host, logs a warning with the node id and the reason, and counts it in `services_dropped` in `GET /v1/status`; a heartbeat that is wrong in any other way is still a 400. A services file defines at most 16 services, and a name is at most 64 bytes). An updater of today sends no `services` and, as the readers ignore unknown fields, a coordinator of today reads a heartbeat that has it. The coordinator notes each entry as that service's state of the host, if it manages the service and runs it on the host's role, and ignores any other. A reply keeps its exact old shape, `{"reply":"update","version":V}`, for `kbf`. A reply for another service, `{"reply":"update","service":S,"version":V}`, is sent only to an updater whose last heartbeat carried `services`, because the reader of today refuses a field it does not know (`Reply` is read with `deny_unknown_fields`); `ServiceReply` is the reader that accepts both shapes. The coordinator decides `kbf` first and then the host's services in the order it listed them, and the first order is the whole reply: one update per reply, as per host.
+
 On each heartbeat it answers `update to X` only if all hold:
 
 - the host is behind X;
@@ -45,7 +49,7 @@ Host state is rebuilt from heartbeats. No heartbeat for 45 s means down. After a
 ## 4. One host's A/B
 
 1. Fetch B and verify it (section 5).
-2. Drain the node (`NodeDrain`, durable cordon).
+2. Drain the node (`NodeDrain`, durable cordon) and wait until it holds no lease, however long that takes. An operator-set drain deadline that passes stops the update with the node left drained; it never installs over running leases.
 3. Install B beside A, then switch (a Mac uses the kit layout and a detached launchd apply).
 4. Health check (`node_health`).
 5. `kbf-host-install` (on a Mac, the detached apply) owns the revert: if B has not confirmed healthy within a timeout, it switches back to A. Rollback does not need B to run. Stay drained if A is not healthy.
@@ -93,6 +97,25 @@ job_workflow_ref = ["komira-ai/kbf/.github/workflows/<workflow>.yml@refs/heads/m
 environments = ["<a protected environment>"]
 # event_names: push and workflow_dispatch by default
 # runner_environment: the default, github-hosted
+```
+
+**Several entries.** The file may instead hold several `[[remote_operator]]` entries, each with the keys above (a file never has both `[remote_operator]` and `[[remote_operator]]`). A token is admitted by the first entry whose every check passes, and only that entry's `services` apply: `services` is a list of service names the token may set the desired version of, `["kbf"]` when the entry names none. `Verified` carries the matching entry's place in the file and its services, so the caller authorizes per service. A token no entry admits is refused with the first entry's reason. The file is refused at load if entries name different issuers (the keys are one issuer's), or if two entries have the same `repository_id` and share a `job_workflow_ref`. A file with a single `[remote_operator]` table means what it always meant (one entry, services `["kbf"]`). The list form is read by `kbf_oidc::AllowList`; `OidcConfig` reads the single table only.
+
+```toml
+[[remote_operator]]
+issuer = "https://token.actions.githubusercontent.com"
+audience = "<audience>"
+repository_id = "<id of komira-ai/kbf>"
+job_workflow_ref = ["komira-ai/kbf/.github/workflows/release.yml@refs/heads/main"]
+environments = ["release"]
+
+[[remote_operator]]
+issuer = "https://token.actions.githubusercontent.com"
+audience = "<audience>"
+repository_id = "<id of the other repository>"
+job_workflow_ref = ["<owner>/<repo>/.github/workflows/release.yml@refs/heads/main"]
+environments = ["release"]
+services = ["<that repository's services>"]
 ```
 
 A CI job asks for the token with its audience (`ACTIONS_ID_TOKEN_REQUEST_URL` with `&audience=`) and sends it as `Authorization: Bearer`. For a workflow that GitHub starts from a `workflow_run`, `job_workflow_ref` names the copy of the workflow on the default branch, and `event_names` must list `workflow_run`; the token does not say which event started the upstream run, so the workflow's own `if:` is what keeps a run started any other way from calling.

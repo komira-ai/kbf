@@ -1,7 +1,5 @@
 //! A retire that stands down with requeues the state store has not taken yet.
 
-use std::io;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use futures::future::AbortRegistration;
@@ -19,6 +17,7 @@ use super::*;
 use crate::farm::{EpochPolicy, Outbound, Reported, StreamId};
 use crate::health::Readiness;
 use crate::state_store::StateStore;
+use crate::test_log::capture;
 
 /// A state store over the fake that can refuse writes, as a store with a failing disk
 /// does, and counts the batches of writes it is asked to apply.
@@ -101,13 +100,15 @@ fn request(tag: u8) -> Request {
         key: ActionKey {
             instance: "main".to_owned(),
             action: Digest::new(DigestFunction::Sha256, [tag; 32], u64::from(tag)),
-        },
+        }
+        .into(),
         qos: Qos::Ci,
         kind: LeaseKind::Action,
         resources: Resources::new(1_000, 1 << 30),
         hermetic: true,
         do_not_cache: false,
         needs: kbf_caps::Request::default(),
+        whole_worker: false,
     }
 }
 
@@ -118,6 +119,7 @@ fn submit(farm: &Farm, request: Request) -> Result<kbf_front::Ticket, Status> {
         call: None,
         described: Described::default(),
         evidence: Default::default(),
+        max_wall: None,
     })
 }
 
@@ -178,37 +180,6 @@ impl Rig {
             sweeper: self.sweeper.clone(),
             wait,
         }
-    }
-}
-
-/// Log lines written by the test's subscriber on this thread.
-#[derive(Clone, Default)]
-struct Lines(Arc<Mutex<Vec<u8>>>);
-
-impl Lines {
-    fn subscribe(&self) -> tracing::subscriber::DefaultGuard {
-        let writer = self.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(move || writer.clone())
-            .with_ansi(false)
-            .finish();
-        tracing::subscriber::set_default(subscriber)
-    }
-
-    fn text(&self) -> String {
-        let bytes = self.0.lock().expect("lock").clone();
-        String::from_utf8(bytes).expect("UTF-8 logs")
-    }
-}
-
-impl io::Write for Lines {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0.lock().expect("lock").extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
     }
 }
 
@@ -308,8 +279,7 @@ async fn a_requeue_the_store_refuses_past_the_deadline_is_logged_and_the_stand_d
     let rig = Rig::new();
     let operation = with_an_unsettled_requeue(&rig).await;
     rig.store.refuse_next.store(usize::MAX, Ordering::SeqCst);
-    let lines = Lines::default();
-    let _logging = lines.subscribe();
+    let lines = capture();
     let before = rig.store.writes_tried.load(Ordering::SeqCst);
 
     rig.stand(Duration::from_millis(100)).release().await;
@@ -331,8 +301,7 @@ async fn a_newer_writer_stops_the_flush_at_once() {
     let operation = with_an_unsettled_requeue(&rig).await;
     assert!(!rig.farm.superseded(), "not fenced yet");
     rig.store.newer_writer.store(true, Ordering::SeqCst);
-    let lines = Lines::default();
-    let _logging = lines.subscribe();
+    let lines = capture();
     let before = rig.store.writes_tried.load(Ordering::SeqCst);
 
     let run = tokio::time::timeout(Duration::from_secs(20), rig.stand(LONG).release()).await;

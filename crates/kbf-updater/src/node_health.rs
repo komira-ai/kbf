@@ -62,6 +62,16 @@
 //! `serving`, which it cannot be until the roll undrains it. The roll then undrains it and
 //! asks [`NodeHealth::check`], so `serving` is shown too before the host is done.
 //!
+//! A node is connected to exactly one frontend, and a host's updater reaches the frontends
+//! through the farm's load balancer, which picks one per connection and which the updater
+//! cannot steer. A frontend that does not hold the node answers from the shared store: the
+//! node, `connected: false`, or a 404. So one answer of "not connected" proves nothing, and
+//! reading one answer made the check flap with the balancer's choice. [`NodeHealth::for_updater`]
+//! therefore asks again, each time on a new connection, up to [`FRONTEND_SAMPLES`] times, and
+//! takes the first answer that says connected: the node is as healthy as the frontend that
+//! holds it says. Only when no answer says so does the check wait ("is not connected", or
+//! "has not registered"), and it fails as before when no sample could be read at all.
+//!
 //! The roll waits while the node has not registered with this frontend since it started
 //! (404), is not connected, is not serving (unless held), or the host has not reported a
 //! commit or reports another. It fails at once for a version that names no commit.
@@ -76,6 +86,12 @@ use crate::inventory::{Host, Role, valid_node_id};
 use crate::operator::{CHECK, OperatorApi, WHAT};
 use crate::ports::{Health, HealthCheck, Installer, PortError};
 use crate::version::Version;
+
+/// How many times a host's updater asks the frontends (through the load balancer, one new
+/// connection each) whether its node is connected, before it believes that none holds it. With
+/// the balancer sharing connections out in turn, two frontends are both reached by the second
+/// ask; the rest covers a balancer that picks at random (one miss in 2^8 for two frontends).
+pub const FRONTEND_SAMPLES: usize = 8;
 
 /// What the check says of a frontend host that is listed without `instance=` and `base=`.
 pub const NO_MEMBER_REFUSAL: &str =
@@ -166,6 +182,9 @@ pub struct NodeHealth {
     /// Asked what commit a daemon host runs.
     installer: Arc<dyn Installer>,
     storage_view: StorageView,
+    /// How many answers about a daemon's node are read, at most, to find the one that says it
+    /// is connected (see the module docs); 1 for a client that reaches one frontend.
+    samples: usize,
 }
 
 impl NodeHealth {
@@ -176,6 +195,7 @@ impl NodeHealth {
             api,
             installer,
             storage_view: StorageView::Lists,
+            samples: 1,
         }
     }
 
@@ -185,6 +205,7 @@ impl NodeHealth {
     pub fn for_updater(api: OperatorApi, installer: Arc<dyn Installer>) -> NodeHealth {
         NodeHealth {
             storage_view: StorageView::Own,
+            samples: FRONTEND_SAMPLES,
             ..NodeHealth::with_api(api, installer)
         }
     }
@@ -200,6 +221,31 @@ impl NodeHealth {
             }),
             404 => Ok(None),
             _ => Err(reply.failure(WHAT, CHECK)),
+        }
+    }
+
+    /// A daemon's node as the frontends say it, asking up to `samples` times for an answer
+    /// that says it is connected (the first is returned at once). Without one: the last
+    /// answer that named the node, else a 404 if every answer was one, else the last error
+    /// if no answer could be read.
+    fn daemon_node(&self, path: &str) -> Result<Option<DaemonNode>, PortError> {
+        let mut named = None;
+        let mut answered = false;
+        let mut failed = None;
+        for _ in 0..self.samples.max(1) {
+            match self.read::<DaemonNode>(path) {
+                Ok(Some(node)) if node.connected => return Ok(Some(node)),
+                Ok(Some(node)) => {
+                    named = Some(node);
+                    answered = true;
+                }
+                Ok(None) => answered = true,
+                Err(e) => failed = Some(e),
+            }
+        }
+        match failed {
+            Some(e) if !answered => Err(e),
+            _ => Ok(named),
         }
     }
 
@@ -290,7 +336,7 @@ impl NodeHealth {
         let alias = &host.alias;
         let waiting = |why: &str| Ok(Health::Waiting(format!("{alias} {why}")));
         let node_id = host.node_id.as_deref().unwrap_or(alias);
-        let Some(node) = self.read::<DaemonNode>(&format!("/v1/nodes/{node_id}"))? else {
+        let Some(node) = self.daemon_node(&format!("/v1/nodes/{node_id}"))? else {
             return waiting("has not registered with the frontend since it started");
         };
         if !node.connected {

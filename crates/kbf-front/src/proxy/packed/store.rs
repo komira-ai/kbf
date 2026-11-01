@@ -6,21 +6,23 @@
 
 use std::fmt;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
-use kbf_objstore::{ByteRange, ObjectKey, ObjectStore, ObjectStoreError};
+use kbf_objstore::{BodyStream, ByteRange, ObjectKey, ObjectStore, ObjectStoreError};
 use kbf_pack::{
     Blob, FRONTEND_PACK_BYTES, Fetch, PackError, PackKeys, Packed, Packer, PackerConfig, ReadCache,
     ReadError, Reader, ReaderConfig, check_create_only,
 };
-use kbf_pack_index::{BlobDigest, MAX_BATCH, PackIndex, PackIndexError};
+use kbf_pack_index::{BlobDigest, Location, MAX_BATCH, PackIndex, PackIndexError};
 use kbf_types::{Digest, DigestFunction};
 use tonic::Status;
 
 use super::metrics::PackMetrics;
 use super::room::{Budget, DEFAULT_INFLIGHT_BYTES, Room};
+use super::verifying::VerifyingKeys;
+use crate::large_backfill::LargeStore;
 
 /// The largest blob a frontend puts in a pack or serves from one by default: 64 MiB, the
 /// most it holds in memory to hash a blob before the first byte of it is sent.
@@ -87,6 +89,22 @@ pub trait PackStore: Send + Sync {
         key: &'a ObjectKey,
         range: ByteRange,
     ) -> BoxFuture<'a, Result<Bytes, ObjectStoreError>>;
+
+    /// The length of the object `key`, or `None` if the store has none ([`ObjectStore::len`]).
+    fn len<'a>(
+        &'a self,
+        key: &'a ObjectKey,
+    ) -> BoxFuture<'a, Result<Option<u64>, ObjectStoreError>>;
+
+    /// Writes the object `key` of exactly `len` bytes from `body` as it is sent
+    /// ([`ObjectStore::put_stream`]): create-only, and an `Err` piece or a body of another length
+    /// leaves nothing under `key`.
+    fn put_stream<'a>(
+        &'a self,
+        key: &'a ObjectKey,
+        len: u64,
+        body: BodyStream,
+    ) -> BoxFuture<'a, Result<(), ObjectStoreError>>;
 }
 
 /// A packer and a reader over one store.
@@ -120,7 +138,26 @@ impl<S: ObjectStore> PackStore for Over<S> {
     ) -> BoxFuture<'a, Result<Bytes, ObjectStoreError>> {
         Box::pin(self.store.get_range(key, range))
     }
+
+    fn len<'a>(
+        &'a self,
+        key: &'a ObjectKey,
+    ) -> BoxFuture<'a, Result<Option<u64>, ObjectStoreError>> {
+        Box::pin(self.store.len(key))
+    }
+
+    fn put_stream<'a>(
+        &'a self,
+        key: &'a ObjectKey,
+        len: u64,
+        body: BodyStream,
+    ) -> BoxFuture<'a, Result<(), ObjectStoreError>> {
+        Box::pin(self.store.put_stream(key, len, body))
+    }
 }
+
+/// The clock that dates a task key's age.
+pub type Clock = Arc<dyn Fn() -> SystemTime + Send + Sync>;
 
 /// The frontend's packs. Cheap to clone; every clone is the same packs.
 #[derive(Clone)]
@@ -131,6 +168,10 @@ pub struct Packs {
     upload_idle_timeout: Duration,
     budget: Budget,
     pub(super) metrics: Arc<PackMetrics>,
+    /// What the packs' object store has been asked ([`Packs::with_store_metrics`]).
+    store_metrics: Arc<crate::store_metrics::StoreMetrics>,
+    pub(super) verifying: Arc<VerifyingKeys>,
+    clock: Clock,
 }
 
 impl fmt::Debug for Packs {
@@ -178,7 +219,40 @@ impl Packs {
             upload_idle_timeout: settings.upload_idle_timeout.min(MAX_UPLOAD_IDLE_TIMEOUT),
             budget: Budget::new(settings.inflight_bytes, Arc::clone(&metrics)),
             metrics,
+            store_metrics: Arc::new(crate::store_metrics::StoreMetrics::packs()),
+            verifying: Arc::default(),
+            clock: Arc::new(SystemTime::now),
         })
+    }
+
+    /// These packs rendering `metrics` as the packs' store's families (`kbf_pack_store_*`).
+    /// Give the store the packs are made over the same handle through
+    /// [`Counted`](crate::store_metrics::Counted); packs whose store is not counted render
+    /// the families with zeros.
+    #[must_use]
+    pub fn with_store_metrics(mut self, metrics: Arc<crate::store_metrics::StoreMetrics>) -> Self {
+        self.store_metrics = metrics;
+        self
+    }
+
+    /// These packs judging the age of a task key by `clock` (the wall clock unless told).
+    #[must_use]
+    pub fn with_clock(mut self, clock: Clock) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// The time these packs judge the age of a task key by.
+    #[must_use]
+    pub fn now(&self) -> SystemTime {
+        (self.clock)()
+    }
+
+    /// The task pack keys an ingest through these packs is verifying now: the janitor of
+    /// `cas/b/` never deletes one. Shared by every clone.
+    #[must_use]
+    pub fn verifying_keys(&self) -> Arc<VerifyingKeys> {
+        Arc::clone(&self.verifying)
     }
 
     /// The largest blob, in bytes, that is packed or served from a pack. A larger one is
@@ -220,6 +294,7 @@ impl Packs {
     /// Appends the pack families to `out` in the Prometheus text format.
     pub fn render_metrics(&self, out: &mut String) {
         self.metrics.render(out);
+        self.store_metrics.render(out);
     }
 
     /// Appends the pack families of `packs`, if a frontend has them, to `out`; without packs
@@ -257,6 +332,48 @@ impl Packs {
         self.metrics.asked.add(asked.len() as u64);
         self.metrics.found.add((asked.len() - absent.len()) as u64);
         Ok(absent)
+    }
+
+    /// Where the blob of each of `asked` lies, in the order asked: `None` for one with no row in
+    /// the index, or over [`Packs::max_blob_bytes`] (never packed). The index is asked in calls
+    /// of at most [`MAX_BATCH`]; nothing is read from a pack and nothing is written.
+    ///
+    /// # Errors
+    /// UNAVAILABLE when the index fails.
+    pub async fn locate(&self, asked: &[Digest]) -> Result<Vec<Option<Location>>, Status> {
+        let inside: Vec<BlobDigest> = asked
+            .iter()
+            .filter(|d| self.fits(d))
+            .map(to_index)
+            .collect();
+        let mut found = Vec::with_capacity(inside.len());
+        for chunk in inside.chunks(MAX_BATCH) {
+            let wanted = chunk.to_vec();
+            let index = Arc::clone(&self.index);
+            let located = offload(move || index.locate(&wanted)).await;
+            found.extend(located.map_err(index_failed)?);
+        }
+        let mut found = found.into_iter();
+        Ok(asked
+            .iter()
+            .map(|digest| {
+                if self.fits(digest) {
+                    found.next().flatten()
+                } else {
+                    None
+                }
+            })
+            .collect())
+    }
+
+    /// The length of the object `key` in the pack store (a HEAD), `None` if there is none.
+    ///
+    /// # Errors
+    /// UNAVAILABLE when the store fails or `key` is not an object key.
+    pub async fn object_len(&self, key: &str) -> Result<Option<u64>, Status> {
+        let failed = |e: &dyn fmt::Display| Status::unavailable(format!("object store: {e}"));
+        let key = ObjectKey::new(key).map_err(|e| failed(&e))?;
+        self.store.len(&key).await.map_err(|e| failed(&e))
     }
 
     /// Writes `blobs` into packs and records them. They are in the pack index, and the packs
@@ -464,4 +581,22 @@ where
 {
     let joined = tokio::task::spawn_blocking(work).await;
     joined.expect("a blocking pack index call panicked")
+}
+
+impl LargeStore for Packs {
+    fn len<'a>(
+        &'a self,
+        key: &'a ObjectKey,
+    ) -> BoxFuture<'a, Result<Option<u64>, ObjectStoreError>> {
+        self.store.len(key)
+    }
+
+    fn put<'a>(
+        &'a self,
+        key: &'a ObjectKey,
+        len: u64,
+        body: BodyStream,
+    ) -> BoxFuture<'a, Result<(), ObjectStoreError>> {
+        self.store.put_stream(key, len, body)
+    }
 }

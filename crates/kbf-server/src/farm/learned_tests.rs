@@ -30,7 +30,7 @@ fn over(store: Arc<dyn Store>, mode: LearnedSizes) -> Farm {
 
 /// [`over`], keeping at most `floors` memory floors.
 fn over_with(store: Arc<dyn Store>, mode: LearnedSizes, floors: Option<usize>) -> Farm {
-    let farm = Farm::new(
+    let farm = Farm::new_legacy(
         Arc::new(kbf_front::Cache::memory()),
         kbf_sched::UNSERVABLE_WAIT,
         kbf_sched::FINISHED_RETENTION,
@@ -82,13 +82,15 @@ impl Job {
             key: ActionKey {
                 instance: self.instance.to_owned(),
                 action: Digest::new(DigestFunction::Sha256, [self.tag; 32], 1),
-            },
+            }
+            .into(),
             qos: Qos::Ci,
             kind: self.kind,
             resources: Resources::new(1_000, 4 << 30).with_gpus(self.gpus),
             hermetic: true,
             do_not_cache: false,
             needs: kbf_caps::Request::from_platform(self.platform.iter().copied()).unwrap(),
+            whole_worker: false,
         };
         farm.submit(Submission {
             request,
@@ -105,6 +107,7 @@ impl Job {
                 memory_source: self.memory,
                 ..Evidence::default()
             },
+            max_wall: None,
         })
         .expect("submitted");
     }
@@ -276,7 +279,7 @@ fn a_bad_size_key_row_stops_a_start_only_when_on() {
     for mode in [LearnedSizes::Off, LearnedSizes::Shadow] {
         drop(farm_over(&store, mode));
     }
-    let on = Farm::new(
+    let on = Farm::new_legacy(
         Arc::new(kbf_front::Cache::memory()),
         kbf_sched::UNSERVABLE_WAIT,
         kbf_sched::FINISHED_RETENTION,
@@ -334,7 +337,7 @@ fn a_kill_through_the_farm_leaves_a_floor_the_next_start_books() {
         let operation = state.sched.unfinished().next().expect("queued");
         (operation, state.sched.leases_on(&node)[0])
     };
-    let report = super::Report {
+    let report = super::report::Report {
         lease,
         outcome: Outcome::Failed(Failure::OutOfMemory),
         measured: None,
@@ -388,7 +391,7 @@ fn estimator_key_and_run() -> (kbf_estimator::Key, kbf_estimator::Run) {
     };
     let key = key_of("main", &platform, Basis::Cgroup, &subject).expect("a key");
     let ok = Outcome::Completed {
-        action_result: Digest::new(DigestFunction::Sha256, [1; 32], 1),
+        action_result: Digest::new(DigestFunction::Sha256, [1; 32], 1).into(),
     };
     let usage = kbf_invocation::RunUsage {
         wall_micros: 2_000_000,
@@ -440,7 +443,7 @@ fn killed_farm_on(
         let operation = state.sched.unfinished().next().expect("queued");
         (operation, state.sched.leases_on(&node)[0])
     };
-    let report = super::Report {
+    let report = super::report::Report {
         lease,
         outcome: kbf_types::Outcome::Failed(kbf_types::Failure::OutOfMemory),
         measured: None,
@@ -474,6 +477,7 @@ impl Killed {
         use kbf_types::{FarmTime, LeaseId};
         let mut state = self.farm.lock();
         state
+            .side
             .learned
             .clock(FarmTime::from_millis(days * 86_400_000));
         for _ in 0..runs {
@@ -483,7 +487,7 @@ impl Killed {
                 key: self.key.clone(),
                 run: self.run,
             };
-            state.learned.stage(lease, Some(attempt));
+            state.side.learned.stage(lease, Some(attempt));
             state.finish_learning(kbf_types::OperationId(u64::MAX), lease, &self.node, true);
         }
     }
@@ -710,7 +714,7 @@ fn a_fenced_farm_lowers_the_floor_and_writes_no_row() {
 fn a_decay_for_a_key_without_a_floor_writes_nothing() {
     let rows = store();
     let mut killed = killed_farm(rows.clone(), &rows);
-    killed.farm.lock().learned.register(&killed.key, 999);
+    killed.farm.lock().side.learned.register(&killed.key, 999);
     killed.quiet(8);
     assert_eq!(killed.farm.lock().sched.key_floor(999), None);
     let names: Vec<String> = rows
@@ -783,10 +787,10 @@ fn succeed(
     lease: kbf_types::LeaseId,
     peak: u64,
 ) {
-    let report = super::Report {
+    let report = super::report::Report {
         lease,
         outcome: kbf_types::Outcome::Completed {
-            action_result: Digest::new(DigestFunction::Sha256, [1; 32], 1),
+            action_result: Digest::new(DigestFunction::Sha256, [1; 32], 1).into(),
         },
         measured: Some(measured(peak)),
         exit_code: Some(0),
@@ -834,12 +838,14 @@ fn a_floor_killed_on_a_smaller_worker_decays_like_any_other() {
     let summary = killed
         .farm
         .lock()
+        .side
         .learned
         .summary_key(size_key)
         .expect("named");
     let estimator_floor = |killed: &Killed| {
         let state = killed.farm.lock();
         state
+            .side
             .learned
             .summaries()
             .get(&summary)
@@ -875,7 +881,7 @@ fn a_pending_lowered_row_does_not_overwrite_a_floor_raised_since() {
     // the floor rises to 16 GiB, and the requeue's row waits for the store too.
     Job::new(2).submit(&killed.farm);
     let (operation, lease) = newest(&killed.farm, &killed.node);
-    let report = super::Report {
+    let report = super::report::Report {
         lease,
         outcome: kbf_types::Outcome::Failed(kbf_types::Failure::OutOfMemory),
         measured: None,
@@ -919,7 +925,7 @@ fn a_floor_whose_operations_have_all_finished_still_decays_after_a_restart() {
     assert!(rows.scan_prefix("opkey/").expect("scan").is_empty());
 
     let restarted = farm_over(&rows, LearnedSizes::On);
-    assert_eq!(restarted.lock().learned.named(&key), vec![size_key]);
+    assert_eq!(restarted.lock().side.learned.named(&key), vec![size_key]);
     let mut again = Killed {
         farm: restarted,
         node,
@@ -945,11 +951,11 @@ fn a_restart_registers_the_keys_of_the_operations_it_restores() {
     assert!(rows.scan_prefix("keyfloor/").expect("scan").is_empty());
     let restarted = farm_over(&rows, LearnedSizes::On);
     let (key, _) = estimator_key_and_run();
-    assert_eq!(restarted.lock().learned.named(&key), vec![size_key]);
+    assert_eq!(restarted.lock().side.learned.named(&key), vec![size_key]);
     // Without `on` nothing is registered.
     drop(restarted);
     let off = farm_over(&rows, LearnedSizes::Shadow);
-    assert!(off.lock().learned.named(&key).is_empty());
+    assert!(off.lock().side.learned.named(&key).is_empty());
 }
 
 /// An attempt the client sized (never keyed) is the one that crosses the threshold, as the
@@ -977,7 +983,7 @@ fn a_client_sized_attempt_that_crosses_the_threshold_lowers_the_keyed_floor() {
 /// The farm kills the newest operation the node holds at its own memory limit.
 fn kill_newest(farm: &Farm, node: &kbf_types::WorkerId) {
     let (operation, lease) = newest(farm, node);
-    let report = super::Report {
+    let report = super::report::Report {
         lease,
         outcome: kbf_types::Outcome::Failed(kbf_types::Failure::OutOfMemory),
         measured: None,
@@ -1133,25 +1139,29 @@ fn a_stored_operation_is_registered_only_when_it_can_be_named() {
     });
     let (empty, _) = Subject::of(Described::default());
     let linux = kbf_caps::Request::from_platform([("OSFamily", "linux")]).unwrap();
+    let action = ActionKey {
+        instance: "main".to_owned(),
+        action: Digest::new(DigestFunction::Sha256, [1; 32], 1),
+    };
     let stored = |needs: kbf_caps::Request, subject: Option<Subject>| StoredOperation {
         operation: kbf_types::OperationId(1),
+        action: action.clone(),
         request: kbf_sched::Request {
-            key: ActionKey {
-                instance: "main".to_owned(),
-                action: Digest::new(DigestFunction::Sha256, [1; 32], 1),
-            },
+            key: (&action).into(),
             qos: Qos::Ci,
             kind: LeaseKind::Action,
             resources: Resources::new(1_000, 4 << 30),
             hermetic: true,
             do_not_cache: false,
             needs,
+            whole_worker: false,
         },
         lease: None,
         losses: 0,
         fate: None,
         subject,
         size_key: Some(5),
+        max_wall: None,
     };
     let (key, _) = estimator_key_and_run();
     {
@@ -1162,10 +1172,13 @@ fn a_stored_operation_is_registered_only_when_it_can_be_named() {
             5,
         );
         state.register_stored(&stored(linux.clone(), Some(empty)), 5);
-        assert!(state.learned.named(&key).is_empty(), "none can be named");
+        assert!(
+            state.side.learned.named(&key).is_empty(),
+            "none can be named"
+        );
         state.register_stored(&stored(linux, Some(subject)), 5);
     }
-    assert_eq!(farm.lock().learned.named(&key), vec![5]);
+    assert_eq!(farm.lock().side.learned.named(&key), vec![5]);
 }
 
 /// A report the farm never saw start, and a success that carries no usage, teach the
@@ -1177,10 +1190,10 @@ fn a_report_without_a_booking_or_usage_is_counted_not_shown() {
     let killed = killed_farm(rows.clone(), &rows);
     // A lease the farm never saw start.
     let stranger = kbf_types::LeaseId::new(9, 4_242);
-    let report = super::Report {
+    let report = super::report::Report {
         lease: stranger,
         outcome: kbf_types::Outcome::Completed {
-            action_result: Digest::new(DigestFunction::Sha256, [1; 32], 1),
+            action_result: Digest::new(DigestFunction::Sha256, [1; 32], 1).into(),
         },
         measured: None,
         exit_code: Some(0),
@@ -1191,14 +1204,14 @@ fn a_report_without_a_booking_or_usage_is_counted_not_shown() {
         .farm
         .lock()
         .take_report(now, &killed.node, kbf_types::OperationId(0), report);
-    assert_eq!(killed.farm.lock().learned.skipped(Skip::NoBooking), 1);
+    assert_eq!(killed.farm.lock().side.learned.skipped(Skip::NoBooking), 1);
 
     // A success of the retry that measured nothing.
     let (operation, lease) = newest(&killed.farm, &killed.node);
-    let report = super::Report {
+    let report = super::report::Report {
         lease,
         outcome: kbf_types::Outcome::Completed {
-            action_result: Digest::new(DigestFunction::Sha256, [1; 32], 1),
+            action_result: Digest::new(DigestFunction::Sha256, [1; 32], 1).into(),
         },
         measured: None,
         exit_code: Some(0),
@@ -1208,5 +1221,5 @@ fn a_report_without_a_booking_or_usage_is_counted_not_shown() {
         .farm
         .lock()
         .take_report(now, &killed.node, operation, report);
-    assert_eq!(killed.farm.lock().learned.skipped(Skip::NoBasis), 1);
+    assert_eq!(killed.farm.lock().side.learned.skipped(Skip::NoBasis), 1);
 }

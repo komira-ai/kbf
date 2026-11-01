@@ -536,6 +536,33 @@ impl Storage for Node {
         })
     }
 
+    /// Gathers the pieces (a test blob is small), and stores them if they are the claimed
+    /// digest, as a node's streamed put does.
+    fn put_streamed(
+        &self,
+        size: u64,
+        mut bytes: stream::BoxStream<'static, std::io::Result<Bytes>>,
+        claim: BoxFuture<'static, Option<Digest>>,
+    ) -> Answer<'_, Option<Digest>> {
+        Box::pin(async move {
+            self.check()?;
+            self.take_put_failure()?;
+            let mut whole = Vec::new();
+            while let Some(piece) = bytes.next().await {
+                let piece = piece.map_err(|e| StorageError::Unavailable(Arc::new(e)))?;
+                whole.extend_from_slice(&piece);
+            }
+            let Some(claimed) = claim.await else {
+                return Ok(None);
+            };
+            let actual = sha(&whole);
+            if actual != claimed || whole.len() as u64 != size {
+                return Err(StorageError::DigestMismatch { claimed, actual });
+            }
+            Ok(Some(self.store(Bytes::from(whole))))
+        })
+    }
+
     fn stream(&self, _size: u64) -> Option<Box<dyn PutStream>> {
         None
     }

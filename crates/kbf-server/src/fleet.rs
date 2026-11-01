@@ -28,8 +28,10 @@
 
 use kbf_proto::worker::{NodeStatus, XcodeState, XcodeStatus};
 use kbf_sched::NodePhase;
-use kbf_types::Resources;
+use kbf_types::{Resources, WorkerId};
 use serde::Serialize;
+
+use crate::machine::FarmMachine;
 
 /// One node, as `GET /v1/nodes` lists it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -97,6 +99,151 @@ pub struct NodeDetail {
     pub free: ResourcesView,
     /// The leases it holds, as `term.seq`, in lease order.
     pub leases: Vec<String>,
+    /// What its daemon reports of the CPU and memory its actions use. Left out when the
+    /// node has sent no reading this frontend accepted (a daemon or runtime that takes
+    /// none, or a node another frontend holds).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load: Option<LoadView>,
+    /// What the node's input cache has done since its daemon process started, from the
+    /// newest heartbeat that carried it. Left out when the node sent none (a daemon with its
+    /// cache off or built before the counts, or a node another frontend holds): absent is
+    /// not zero.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_cache: Option<InputCacheView>,
+    /// Who placed the node out of placement, when it is (cordoned, draining or drained).
+    /// Left out when the node is serving. A cordon with no recorded owner, which is every
+    /// cordon today, is the operator's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner: Option<Owner>,
+}
+
+/// Who owns a node's cordon, as the state store keeps it (`cordon-owner/<node>`, see
+/// `farm::cordon_owner`). Shown as `operator` or `updater:<unit>`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Owner {
+    /// An operator placed the node, or nothing records who did.
+    #[default]
+    Operator,
+    /// The host updater placed the node, for the update of the named unit.
+    Updater(String),
+}
+
+impl std::fmt::Display for Owner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Operator => f.write_str("operator"),
+            Self::Updater(unit) => write!(f, "updater:{unit}"),
+        }
+    }
+}
+
+impl Serialize for Owner {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+/// The counts of a node's input cache (`docs/api.md`, "Input cache counts"): cumulative since
+/// its daemon process started, so they start again from 0 when the daemon restarts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct InputCacheView {
+    /// Entries written into the cache from the content store, and their bytes.
+    pub fills: u64,
+    pub fill_bytes: u64,
+    /// Entries a lease found in the cache and used, and their bytes.
+    pub hits: u64,
+    pub hit_bytes: u64,
+    /// Entries evicted for the byte budget or the free-space floor, and their bytes.
+    pub evictions: u64,
+    pub evicted_bytes: u64,
+    /// The shared tree store's counts. Left out when the node has no store.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trees: Option<TreeCountsView>,
+}
+
+/// The counts of a node's shared tree store, cumulative since its daemon process started.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct TreeCountsView {
+    pub builds: u64,
+    pub hits: u64,
+    pub evictions: u64,
+}
+
+impl From<&kbf_proto::worker::InputCacheCounts> for InputCacheView {
+    fn from(counts: &kbf_proto::worker::InputCacheCounts) -> Self {
+        Self {
+            fills: counts.fills,
+            fill_bytes: counts.fill_bytes,
+            hits: counts.hits,
+            hit_bytes: counts.hit_bytes,
+            evictions: counts.evictions,
+            evicted_bytes: counts.evicted_bytes,
+            trees: counts.trees.as_ref().map(|trees| TreeCountsView {
+                builds: trees.builds,
+                hits: trees.hits,
+                evictions: trees.evictions,
+            }),
+        }
+    }
+}
+
+/// The load of a node's `actions/` cgroup, from the readings its heartbeats carried
+/// (`docs/api.md`, "Node load"). The scheduler is handed each accepted reading as well;
+/// whether it places by them is `--placement-load`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct LoadView {
+    /// The CPU the actions used, in thousandths of a CPU: the larger of the last two
+    /// windows between accepted readings. `null` with fewer than two windows, and when
+    /// `stale`.
+    pub measured_cpu_millicores: Option<u64>,
+    /// `memory.current` less the inactive file pages, in bytes, at the last reading.
+    pub memory_working_set_bytes: u64,
+    /// The active file pages of the cgroup, in bytes, at the last reading.
+    pub memory_active_file_bytes: u64,
+    /// The working set less the active file pages beyond a quarter of the node's memory:
+    /// what an admission would count. Never above the working set.
+    pub admission_working_set_bytes: u64,
+    /// The leases that ran for the whole window before the last reading, as `term.seq`.
+    pub covered: Vec<String>,
+    /// Whether the cgroup has a CPU quota.
+    pub actions_cpu_limited: bool,
+    /// Cumulative CPU throttled time, in microseconds, when the daemon read it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_throttled_usec: Option<u64>,
+    /// Cumulative CPU pressure (`some` total), in microseconds, when the daemon read it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_pressure_some_total_usec: Option<u64>,
+    /// What the lists of the readings carried, and what was not taken.
+    pub lists: ListsView,
+    /// Whether no reading was accepted for three windows.
+    pub stale: bool,
+}
+
+/// What the `lease_clocks` and `minutes` lists of a node's readings have come to since its
+/// daemon process began (`docs/api.md`, "Node load"), so that a dropped record, or a feed
+/// that is empty, can be seen.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ListsView {
+    /// Clock records kept, summed over the accepted readings.
+    pub clocks: u64,
+    /// Minute records kept, summed over the accepted readings.
+    pub minutes: u64,
+    /// Records dropped, from the three lists (`covered` included), by reason.
+    pub dropped: DroppedView,
+    /// Minute records carried by readings that were not accepted.
+    pub refused_minutes: u64,
+}
+
+/// Why records of a reading's lists were dropped.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct DroppedView {
+    /// A rule was broken: no lease, a minute above 63, a working set above 2^45 bytes, a mean
+    /// above its peak, a start after the reading.
+    pub invalid: u64,
+    /// The record repeated an earlier kept one.
+    pub duplicate: u64,
+    /// The record was past the cap of its list.
+    pub over_cap: u64,
 }
 
 /// A node's phase (`kbf_sched::NodePhase`). Serialized with its `state` as a tag.
@@ -180,6 +327,16 @@ pub fn quarantine_change(
     }
 }
 
+/// The deadline a drain is shown with: `unix_ms` as it is, or `None` for a drain with no
+/// deadline. A deadline of half the range of a `u64` of milliseconds (about 292 million years)
+/// or more counts as none: it is what [`NO_DRAIN_DEADLINE`](crate::api::NO_DRAIN_DEADLINE)
+/// becomes (saturated, or less the store's clock when another frontend applies the stored
+/// row), and no operator's deadline comes near it.
+#[must_use]
+pub(crate) fn shown_deadline(unix_ms: u64) -> Option<u64> {
+    (unix_ms < u64::MAX / 2).then_some(unix_ms)
+}
+
 /// Where a node is in placement. Serialized with its `state` as a tag.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -191,8 +348,9 @@ pub enum PlacementView {
     /// Cordoned, and its leases are waited for until the deadline.
     Draining {
         /// When the drain pauses if leases still run: milliseconds since the Unix
-        /// epoch, server clock.
-        deadline_unix_ms: u64,
+        /// epoch, server clock. Left out for a drain with no deadline.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        deadline_unix_ms: Option<u64>,
         /// The leases it still holds, as `term.seq`.
         leases: Vec<String>,
     },
@@ -201,8 +359,10 @@ pub enum PlacementView {
     /// The deadline passed while leases still ran. They run on; nothing proceeds
     /// until an operator drains it again or uncordons it.
     DrainPaused {
-        /// The deadline that passed (milliseconds since the Unix epoch).
-        deadline_unix_ms: u64,
+        /// The deadline that passed (milliseconds since the Unix epoch). Left out for a
+        /// drain that had none.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        deadline_unix_ms: Option<u64>,
         /// The leases it still holds, as `term.seq`.
         leases: Vec<String>,
     },
@@ -388,6 +548,37 @@ pub fn attention_changes(
         .filter(|(key, _)| !has(&after, key))
         .map(|(_, item)| (false, format!("node {node}: resolved: {item}")));
     raised.chain(cleared).collect()
+}
+
+/// Keeps `status`, a `NodeStatus` of `worker` received at `received` (milliseconds since the
+/// Unix epoch), as the machine's newest of the node, and returns the attention items it
+/// raises or clears against the node's previous status, `true` for each raised; each is
+/// logged once, at `WARN` for a raise and `INFO` for a clear, under the target
+/// `kbf_server::attention`. An Xcode the status lists not surveyed yet keeps its previous
+/// item (neither cleared now nor raised again by the survey). Both drivers of the farm take
+/// a node's status through this.
+pub fn take_node_status(
+    machine: &mut FarmMachine,
+    worker: &WorkerId,
+    status: NodeStatus,
+    received: u64,
+) -> Vec<(bool, String)> {
+    let mut view = SoftwareView::new(status, received);
+    let before = machine
+        .node(worker)
+        .and_then(|n| n.status.as_ref())
+        .map_or(&[][..], |s| &s.xcodes);
+    view.hold_unsurveyed(before);
+    let changes = attention_changes(worker.as_str(), before, &view.xcodes);
+    for (raise, line) in &changes {
+        if *raise {
+            tracing::warn!(target: "kbf_server::attention", "{line}");
+        } else {
+            tracing::info!(target: "kbf_server::attention", "{line}");
+        }
+    }
+    machine.report_status(worker, view);
+    changes
 }
 
 /// The body of `GET /v1/nodes`: the server that answers, and every node registered

@@ -50,7 +50,8 @@ Related: [operator-verbs.md](operator-verbs.md) (every operator verb and its rou
 7. Keys are held in memory on the node. A node restarted while the frontend is down serves its
    hot tier only and retries.
 8. v1 has no hot credential swap. Rotation reaches a running node at its next start.
-9. The store identity `(endpoint, bucket, prefix)` is immutable once bound.
+9. The store identity `(endpoint, bucket, prefix)` cannot change through a connection or a
+   binding write once bound; only the deliberate `:repoint` call moves it (section 19).
 10. This reads as "the frontend pushes" in effect, though no connection is opened from the
     frontend to a node. A `Watch` stream may be added later as a latency optimisation.
 
@@ -75,7 +76,7 @@ Related: [operator-verbs.md](operator-verbs.md) (every operator verb and its rou
   `crates/kbf-cli/src/node.rs`]**. Section 8 says what becomes of them.
 - **The store flag today.** A storage node is given `--cold-store`; `S3Store` refuses an
   `https` endpoint (`TLS is not built yet; use http`) **[F:
-  `crates/kbf-objstore/src/s3/mod.rs`]**.
+  `komira-ai/tierstore:crates/objstore-s3/src/s3/mod.rs`]**.
 - **Registration precedes the cache open.** With `--frontend`, the node binds its listener and
   registers before the cache opens, so the cache writes as the registration's member and boot
   **[F: `crates/kbf-server/src/storage_node.rs`, `start_storage`]**. The cold store is opened
@@ -115,8 +116,9 @@ Each is an engineering default pending the owner; the question is in section 14.
 | D4 | The frontend log route is cut from this work. | Q4 |
 | D5 | Out of scope: update policy, image pull (no source verb exists), meta-backup (an installer and root verb), CA rotation (its own unit). | Q5 |
 | D6 | The secret file is host-local, readable by every frontend of the host, with versioned names. No writer baton and no `not_writer`. One token, loopback gate, no operator and admin split. | Q6 |
-| D7 | Store identity is immutable after the first bind; moving stores is a later migration verb. | Q7 |
+| D7 | Store identity is immutable after the first bind, except through `:repoint` (section 19). | Q7 |
 | D8 | A node with a `--cold-store` flag keeps running on it and reports `identity_mismatch` if the registered identity differs. | Q8 |
+| D9 | `--cold-store registered` names no store: the node waits for the registration, runs on its endpoint, bucket, prefix and keys, and never falls back. Moving a farm to another store is a registration change and a restart of each node. | (the one-store plan) |
 
 ## 5. The control API
 
@@ -256,6 +258,36 @@ so `converged` is false until the node beats again: never a false converged.
 - **Flag precedence.** A node started with `--cold-store` whose identity differs from the
   registered one keeps running on its flag and reports `identity_mismatch`. If the flag
   matches, the registration supplies the keys only.
+- **`--cold-store registered` (D9).** The word is the whole flag: the node holds no URL and no
+  key, and the registration is the one place its store comes from. There is no flag store to
+  compare with, so there is no `identity_mismatch`, and no fallback, so a node with no
+  registration waits and a node whose keys fail the probe stops (`probe_failed` is what the
+  frontend sees of a node that has a store of its own; a registered node has none, so it exits 75
+  and the restart reads what the operator registered next). The node asks before it opens its
+  metadata log, because the log keeps the objects under the registered prefix and refuses to
+  open under another one, so it is no member of the farm while it waits. Nothing else names
+  the store: `--cold-store-credentials-file` is refused at the start, and `AWS_ACCESS_KEY_ID`,
+  `AWS_SECRET_ACCESS_KEY` and `AWS_ENDPOINT_URL` are not read. It reports
+  the generation it fetched as `ok`; a new generation while it runs is `pending`, and the node
+  takes it at its next start. A changed endpoint is therefore a registration change and a
+  restart of each node, **and it is safe only when the new store already holds every object
+  the node's index names**: the same bucket and prefix, the old endpoint being write-through
+  (for example a write-through cache in front of the same bucket). A node does not check
+  that: an index entry for an object the new store lacks is a read that fails. A changed
+  **bucket is not checked at the start** (the log's `Bootstrap` holds only the prefix), so
+  moving to another bucket, with its objects copied, is the operator's duty. A changed
+  prefix is refused at the start with a message that says so (`PrefixChanged`) and needs an
+  empty `--meta-dir`. While it waits the node says so (`waiting for the registered cold
+  store`, with the frontend) and each failed ask says its attempt, status code and reason;
+  a frontend too old to serve `ColdStore` (`Unimplemented`) is waited for, as is one that is
+  down, while a denied node (`PermissionDenied`, `Unauthenticated`) and a request the
+  frontend calls malformed (`InvalidArgument`, `FailedPrecondition`, `NotFound`) end the start
+  at once, since waiting does not change them. The cold-store HTTP client reads `HTTP_PROXY`,
+  `HTTPS_PROXY` and `ALL_PROXY` from the environment (reqwest's default, for the URL path as
+  for `registered`), and kbf cannot turn that off for one store: the client is built inside
+  the `objstore-s3` crate, which has no such setting. Put the endpoint's host in `NO_PROXY`
+  on a host that sets a proxy. Only a storage node
+  takes the word: the frontend, `all-in-one` and `--history-objects` refuse it.
 - **A bad credential** reaching a node reports `probe_failed`; a node that already had a store
   keeps it.
 - **No fence.** The proxy forwards each stream to one frontend of the pool, so registration
@@ -271,8 +303,8 @@ so `converged` is false until the node beats again: never a false converged.
 - **A newer frontend.** The frontend updates first, so a node meets an N+1 frontend. The node
   ignores unknown fields in `GetStoreConfig` and heartbeat answers, and a generation or
   status it does not understand is reported (`unsupported`), never a crash.
-- **No hot swap.** Rotation reaches a running node at its next start; until then `GET` shows
-  that node `pending`. kbf never restarts itself. A hot swap needs a lock-free load of the
+- **No hot swap.** Rotation reaches a running node at its next start, and so does a new store
+  for a node on `--cold-store registered`; until then `GET` shows that node `pending`. kbf never restarts itself. A hot swap needs a lock-free load of the
   credentials on every request of the S3 path and a performance review, and is not scheduled.
 - **Readiness.** `/readyz` of a node with no store says so by a check name, so an operator
   can tell "no store registered" from "store down" **[V]** in PR E.
@@ -289,13 +321,17 @@ line to touch and moves only `keys.rs`; if the wire unit lands first, #1049 drop
 `cold_store` reader along with `kbf node`. `GetKeys` is replaced, not kept: the client in
 `keys.rs` moves to `GetStoreConfig`, keeping memory-only storage and zeroize.
 
-**[D] Until the deferred open exists, the frontend does write `cold_store`.** A storage node
-cannot open its metadata log without the store's prefix before it registers, so `kbf node`
-still passes `--cold-store`, and `Enroll` and `Renew` answer it from the registration: the URI
+**[D] `kbf node` passes `--cold-store registered`.** The frontend still writes `cold_store`
+into `Enroll` and `Renew` answers, but `kbf node` no longer reads it: a stored URI went stale
+when the farm re-pointed its store, and a node enrolled before the registration had none. The
+node starts with the word `registered` and fetches the registration itself, before it opens its
+metadata log, so it needs no URI from enrolment, and the old refresh of an empty `cold_store`
+at start is gone. The text below says what `cold_store` holds for the nodes that still read it
+(older builds): the URI
 holds the bucket, prefix, endpoint, region and put settings of the `cold` binding and no key
 (`docs/api.md`, enroll section). A node uses the `cold_store` it is sent with its own process credentials, so
 the frontend picks the endpoint that receives the node's signed requests: the same trust as the worker and CAS endpoints it already sends. The node's registration fetch then finds the same identity
-and applies the keys. When the open is deferred, `cold_store` and the node's refresh of it go.
+and applies the keys. `cold_store` goes from `Enroll` and `Renew` once no build reads it.
 
 ## 9. Secrets: where they can leak, and what stops it
 
@@ -390,8 +426,7 @@ proxy. Until answered, the operator documentation says not to forward it.
 - **Q6 Token and proxy.** Default: the secret file is host-local and every frontend of the host reads
   it; the one-token loopback gate stays. May the installer's proxy carry secret-bearing routes
   (section 13)? Multiple hosts need a shared secret store (#966 section 14.8), still open.
-- **Q7 Immutable identity.** Moving to a different store is then a migration with no verb.
-  Acceptable for now?
+- **Q7 Immutable identity.** Moving to a different store is `:repoint` (section 19).
 - **Q8 Flag precedence.** Default: D8. Confirm.
 
 ## 15. Held steps (the owner's, never a change's)
@@ -470,3 +505,49 @@ lives in the handlers.
 - **Schema.** Rows in the existing store only; see the schema rule in section 6.
 - **Identity.** One "who is calling" function, whose source may be the proxy (section 7).
 - **No state migration:** a fresh Postgres. **A second update is rejected while one runs.**
+
+## 19. Re-point
+
+`POST /v1/object-stores/connections/{name}:repoint` (`kbf cluster object-store repoint`)
+moves the store the role `cold` names. It is the only call that does: a connection `PUT` that
+names another endpoint, and a binding `PUT` that names another bucket or prefix, still answer
+409 `identity_change`, and an unbind still answers 409 `in_use` once a node has applied the
+binding.
+
+- **Request.** `{endpoint, bucket?, prefix?, expect_generation}`. Bucket and prefix keep the
+  binding's current values when absent (an empty prefix given is an empty prefix).
+  `expect_generation` is required: a repoint decided on a stale reading is refused with 409
+  `generation_mismatch`. There is no `verify` field and no `--no-verify`: a repoint is always
+  probed.
+- **Which connection.** The one the `cold` binding names. A connection that exists but is not
+  the bound one answers 409 `not_bound`; one that does not exist answers 404
+  `no_such_connection`.
+- **Order.** Check the new endpoint, bucket and prefix as `bind` does; probe the new identity
+  with the connection's registered key and its region, `conditional_put` and `min_put_rate`;
+  only then write. A failed probe answers 422 `probe_failed` with the steps and writes nothing.
+  The key is the connection's: kbf signs with the one registered key whichever endpoint is
+  registered, so a repoint carries no credential.
+- **The write** is one state-store transaction that compare-and-sets `objstore/gen`, replaces
+  the connection row's endpoint and the binding row's bucket and prefix, stamps both with the
+  new generation, and appends the audit row. A lost race is 409 `conflict`, as for every write.
+  The secret file is untouched. A repoint to the identity already registered writes only an
+  `unchanged` audit row and leaves the generation.
+- **Audit.** The row's action is `repoint`, its subject the connection name, and its `detail`
+  is `<old endpoint> <old bucket>/<old prefix> -> <new endpoint> <new bucket>/<new prefix>`,
+  with the generation the repoint made. No credential is in it. (A frontend of the previous
+  version reading that row does not know the action and answers `corrupt_rows` to the audit
+  list until it is replaced; every other read is unaffected. Frontends therefore update
+  first. From this version on the reader tolerates an action code it does not know: the row
+  lists with action `unknown (N)`, N being the code, and its subject and detail, so a later
+  action cannot break the listing of readers of this release. Known actions keep their
+  snake_case names in the answer.)
+- **Who follows.** Only a node that takes its store from the registration (`--cold-store
+  registered`) moves, at its next start: a running node keeps the store it opened and reports
+  `pending` for the new generation, as it does for any change. A node that names a store URL
+  on its own is unaffected beyond what it does today: it keeps running on its flag and reports
+  `identity_mismatch` against the new registration, and a node with no keys of its own refuses
+  to start on it. A repoint therefore changes nothing for such a node and is not a way to
+  move it.
+- **Unbind afterwards.** The binding's `updated_generation` is the repoint's, so nodes that
+  applied an earlier generation do not count as using it until they restart onto the new
+  store.

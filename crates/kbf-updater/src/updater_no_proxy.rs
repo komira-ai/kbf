@@ -13,12 +13,13 @@
 //!    `Timing::healthy_frontend` more; else the roll fails with `unsafe_to_stop` and nothing has
 //!    been changed. A member that is alone in the inventory is refused the same way;
 //! 2. `draining`: the member is told to drain, and the roll waits until its operator API
-//!    refuses the connection (it has exited) or reports the drain phase `closing`, for at most
-//!    `Timing::frontend_drain`. A frontend that reports no `closing` phase is waited for
-//!    until it exits. A member that answers but is not draining fails the
+//!    refuses the connection (it has exited) or reports the drain phase `closing`, however long
+//!    that takes unless `Timing::frontend_drain` is set. A frontend that reports no `closing`
+//!    phase is waited for until it exits. A member that answers but is not draining fails the
 //!    roll at once. The frontend in this tree puts no bound on a drain that the endpoint began
-//!    (`--shutdown-timeout-secs` bounds only one that a signal began), so an execution that
-//!    runs past `Timing::frontend_drain` fails the roll with the member left draining;
+//!    (`--shutdown-timeout-secs` bounds only one that a signal began), so with a
+//!    `Timing::frontend_drain` set, an execution that runs past it fails the roll with the
+//!    member left draining;
 //! 3. `installing`: the package is installed on the host, unless the host already has the
 //!    target, which is the case for every member of the host after the first;
 //! 4. `restarting`: the host restarts the member's unit, which starts the new version;
@@ -208,8 +209,8 @@ impl Updater {
 
     /// Wait until the draining member `name` has exited: its operator API refuses the
     /// connection, or says that it is closing. A member that answers otherwise, or not at all
-    /// (a timeout, a 5xx), is waited for, at most `Timing::frontend_drain`; the failure at the
-    /// bound names the member as left draining. A member that answers that it is not draining
+    /// (a timeout, a 5xx), is waited for, however long that takes unless `Timing::frontend_drain`
+    /// is set; the failure at that bound names the member as left draining. A member that answers that it is not draining
     /// fails the wait at once, without that note.
     fn wait_exit(&self, host: &Host, name: &str) -> Result<(), Halt> {
         let start = self.now();
@@ -227,7 +228,7 @@ impl Updater {
                 Ok(status) => format!("{} executions were still open", status.open_executions),
                 Err(e) => e.to_string(),
             };
-            if self.since(start) >= bound {
+            if let Some(bound) = bound.filter(|b| self.since(start) >= *b) {
                 let secs = bound.as_secs();
                 let note = format!("frontend member {name} ({}) is left draining", host.alias);
                 return Err(Halt::Fail(

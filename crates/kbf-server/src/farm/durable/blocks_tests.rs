@@ -182,23 +182,30 @@ fn bump(previous: u64, epoch: u64) -> EpochBump {
     EpochBump { previous, epoch }
 }
 
+/// The action `request(tag)` runs.
+pub(super) fn action_key(tag: u8) -> ActionKey {
+    ActionKey::try_from(&request(tag).key).expect("an action's key")
+}
+
 pub(super) fn request(tag: u8) -> Request {
     Request {
         key: ActionKey {
             instance: "main".to_owned(),
             action: Digest::new(DigestFunction::Sha256, [tag; 32], u64::from(tag)),
-        },
+        }
+        .into(),
         qos: Qos::Ci,
         kind: LeaseKind::Action,
         resources: Resources::new(1_000, 1 << 30),
         hermetic: true,
         do_not_cache: false,
         needs: kbf_caps::Request::default(),
+        whole_worker: false,
     }
 }
 
 fn try_farm_over(store: &Arc<Racing>) -> Result<Farm, StateError> {
-    Farm::new(
+    Farm::new_legacy(
         Arc::new(Cache::memory()),
         kbf_sched::UNSERVABLE_WAIT,
         kbf_sched::FINISHED_RETENTION,
@@ -221,6 +228,7 @@ pub(super) fn submit(farm: &Farm, tag: u8) -> Result<(), Status> {
         call: None,
         described: Described::default(),
         evidence: Default::default(),
+        max_wall: None,
     })
     .map(drop)
 }
@@ -644,7 +652,7 @@ fn a_bump_through_a_farm_is_served_by_the_next_start() {
     assert_eq!(farm.lease_epoch(), epoch);
     assert_eq!(counter(&store, EPOCH), epoch + 1);
     assert_eq!(farm_over(&store).lease_epoch(), epoch + 1);
-    let bare = Farm::new(
+    let bare = Farm::new_legacy(
         Arc::new(Cache::memory()),
         kbf_sched::UNSERVABLE_WAIT,
         kbf_sched::FINISHED_RETENTION,

@@ -25,8 +25,11 @@
 //! holds while the heartbeats go on; a Start that still arrives is refused with a Result
 //! the server runs again (`UNAVAILABLE`); the runs go on, report and are acknowledged as
 //! always. It returns, so the process exits 0, once no lease runs and no Result is
-//! unacknowledged, connected or not. A second signal, or the drain deadline, returns at
-//! once, and the runs still going are abandoned as [`Daemon::run`] abandons them.
+//! unacknowledged, connected or not, however long that takes: a drain never ends
+//! because time ran out. A deadline, if the operator sets one, only logs a warning with
+//! the number of leases still running, once, and the wait goes on. A second signal is
+//! the operator's hard stop: it returns at once, and the runs still going are abandoned
+//! as [`Daemon::run`] abandons them.
 //!
 //! A runtime that switches a Mac's GUI session for a whole-machine lease hands the
 //! daemon its phase ([`Daemon::with_phase`]; `docs/design/worker-protocol.md#node-phases`):
@@ -76,92 +79,40 @@
 //! on every stream and listed in every Heartbeat for the daemon's lifetime. No server
 //! without ResultAck has been released, which is why the version was not raised for it.
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::hash::{BuildHasher, RandomState};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use futures::channel::mpsc::{UnboundedSender, unbounded};
-use kbf_proto::google::rpc::Code;
-use kbf_proto::kbf::map::v1 as wire;
-use kbf_proto::reapi::Digest;
 use kbf_proto::worker::{
-    self, DaemonMessage, Heartbeat, Hello, PackWriteCounts, Phase, ServerMessage, daemon_message,
+    self, DaemonMessage, Heartbeat, Hello, Phase, ServerMessage, Welcome, daemon_message,
     server_message, worker_client::WorkerClient,
 };
-use kbf_types::{LeaseId, NodePhase};
+use kbf_types::NodePhase;
 use tokio::sync::{Notify, mpsc, watch};
 use tokio::time::{sleep, timeout};
 use tonic::transport::Endpoint;
 
-use crate::acks;
 use crate::clock::{Clock, SystemClock};
 use crate::config::{ConfigError, DaemonConfig};
 use crate::connect::{
     Backoff, Resolve, Server, SystemResolver, Target, WARN_EVERY, WarnLimit, resolve_all,
     rotate_after, unit_random,
 };
-use crate::contact::Contact;
-use crate::lease::{Done, Leases, failure, lease_id, proto_lease_id};
-use crate::map::{MapLink, map_asked};
-use crate::packed::{PackCommit, PackCounter};
-use crate::phases::LeasePhases;
-use crate::pressure;
+use crate::core::{Event, LeaseCore, send};
+use crate::drain::wait_for_drain;
+use crate::extras::{ExtraWake, SessionExtras};
+use crate::kbf_extras::KbfExtras;
+use crate::lease::{Done, Leases, lease_id, proto_lease_id};
+use crate::lease_minutes::usage_window;
 use crate::report::NodeReport;
 use crate::runtimes::Runtimes;
-use crate::status::{DriverReport, Software};
 use crate::welcome;
-use crate::window::StartWindow;
 
 /// The `kbf.worker.v1` protocol version this daemon speaks.
 pub const PROTOCOL_VERSION: u32 = 1;
-
-/// Something the daemon did that an observer (a test, later the meter) may want.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Event {
-    /// A stream connected and its Hello went out; Welcome is awaited.
-    HelloSent,
-    /// A session began: the server answered Hello.
-    Welcomed { heartbeat_interval: Duration },
-    /// The server placed a lease here; nothing runs until its Start.
-    Offered(LeaseId),
-    /// A Start arrived after the window it names, or names a heartbeat this stream
-    /// did not send: the lease was not run, and no Result is sent (issue #23).
-    StartExpired(LeaseId),
-    /// The server cancelled a running lease; its kill has begun.
-    Cancelled(LeaseId),
-    /// The server decided a Result: `accepted` says whether it became the operation's
-    /// result, `reason` why (unspecified from a server that predates it). Either way the
-    /// daemon forgets the Result: it is neither resent nor listed in heartbeats any more.
-    ResultAcknowledged {
-        lease: LeaseId,
-        accepted: bool,
-        reason: worker::ResultAckReason,
-    },
-    /// No heartbeat sent in the last two intervals has been acknowledged.
-    HeartbeatGap { silent_for: Duration },
-    /// An acknowledgement arrived after a gap.
-    ContactRestored,
-    /// Contact was lost for the fence time; these leases are being killed. Each
-    /// reports, fenced (lost), once its run has stopped.
-    Fenced(Vec<LeaseId>),
-    /// A Welcome named another lease epoch: these leases, granted under an earlier
-    /// one, are dropped. Their runs are being killed, and no Result of them is sent.
-    Superseded(Vec<LeaseId>),
-    /// A welcomed session ended, with the reason.
-    Disconnected(String),
-    /// A lease's run ended (its Result is being sent): where its time went, as the
-    /// `lease phases:` line logs it.
-    LeaseEnded(LeasePhases),
-    /// An attempt to connect ended before the server's Welcome (a refused connection, a
-    /// TLS failure, a server answering `UNAVAILABLE`, ...), or a server's name resolved
-    /// to no address. `server` names the URL, and the address when there was one.
-    ConnectFailed { server: String, reason: String },
-    /// Every address of a round of attempts failed: the daemon waits `wait` and starts
-    /// the next round. `failed_rounds` counts the rounds since the last session.
-    Retrying { failed_rounds: u32, wait: Duration },
-}
 
 /// Why a session ended.
 #[derive(Debug, thiserror::Error)]
@@ -205,7 +156,9 @@ impl SessionError {
 }
 
 /// A daemon: configuration, runtimes, node report and the state that outlives streams.
-pub struct Daemon {
+/// `X` answers the hooks of its session that name more than leases ([`SessionExtras`]);
+/// the default is a kbf node's.
+pub struct Daemon<X = KbfExtras> {
     config: DaemonConfig,
     /// The `--server` URLs, parsed.
     servers: Vec<Server>,
@@ -218,54 +171,20 @@ pub struct Daemon {
     base: NodeReport,
     /// What Hello carries and heartbeats hash: `base` plus the driver's newest entries.
     report: NodeReport,
-    /// What `NodeStatus` says about the operating system.
-    software: Software,
-    /// The driver's newest report, if it sends any; see [`Self::with_driver_report`].
-    driver: Option<watch::Receiver<DriverReport>>,
-    /// Every Xcode the driver's newest report names, ready or not.
-    xcodes: Vec<worker::XcodeStatus>,
-    /// The container images `NodeStatus` lists; see [`Self::with_container_images`].
-    container_images: Vec<String>,
-    /// The runtime's phase, if one reports it; see [`Self::with_phase`].
-    phase: Option<watch::Receiver<NodePhase>>,
-    /// The newest phase taken from it.
-    phase_now: NodePhase,
-    /// The memory backstop, if one is set; see [`Self::with_memory_backstop`]. Every
-    /// Hello carries `phase_now`, or [`NodePhase::MemoryPressure`] in its place while
-    /// the node is serving and the backstop has paused it.
-    pressure: Option<Backstop>,
-    /// Where the storage map of `Welcome` and `MapUpdate` goes, if the daemon routes by
-    /// one; see [`Self::with_map`].
-    map: Option<MapLink>,
     /// Whether the drain has begun, as [`Self::run_draining`] sets it; `None` for a
     /// daemon run by [`Self::run`], which never drains.
     drain: Option<watch::Receiver<bool>>,
-    /// The drain's state as the loops last took it: set once the first signal came.
-    draining: bool,
     /// Notified when the daemon is draining and has nothing left to wait for.
     drained: Arc<Notify>,
-    events: Option<mpsc::UnboundedSender<Event>>,
-    leases: Leases,
+    /// How many leases ran when the session loop last looked, for the drain's warning
+    /// past its deadline (the stop future cannot reach `core`).
+    running: Arc<AtomicUsize>,
+    /// The lease state: leases, contact, Start window, unacknowledged Results, epoch.
+    core: LeaseCore,
+    /// Where the runs of `core`'s leases report their end.
     done: mpsc::UnboundedReceiver<Done>,
-    contact: Contact,
-    /// Send times of this stream's Hello and heartbeats, which Starts name.
-    window: StartWindow,
-    /// Results the server has not acknowledged yet, by lease.
-    unacked: BTreeMap<LeaseId, worker::Result>,
-    /// The lease epoch the newest Welcome named; `None` before the first, or when it
-    /// named none (0).
-    epoch: Option<u64>,
-    /// Each lease acted on and not yet forgotten: the epoch of its Start and the action
-    /// it named.
-    granted: BTreeMap<LeaseId, Granted>,
-    /// The counts of the pack reads of the data plane, if it reads packs; see
-    /// [`Self::with_pack_reads`].
-    pack_reads: Option<PackCounter>,
-    /// The handle the frontend's Welcome turns pack writes on and off with, if the data plane
-    /// writes packs; see [`Self::with_pack_writes`].
-    pack_commit: Option<PackCommit>,
-    /// The suspend-counting clock that contact and the Start window read.
-    clock: Arc<dyn Clock>,
+    /// What the node adds to the lease protocol.
+    pub(crate) extras: X,
     /// This daemon process's `Hello.instance_id`, the same on every stream it opens.
     instance: String,
     /// `Hello.predecessor_instance_id`: the daemon process whose runs this one's drivers
@@ -273,39 +192,20 @@ pub struct Daemon {
     predecessor: String,
 }
 
-/// The memory backstop: the sampled pressure, the percentage above which a node that
-/// runs leases takes no more, and whether it is paused now.
-struct Backstop {
-    stall: watch::Receiver<Option<f64>>,
-    above: f64,
-    paused: bool,
-}
-
-/// What the daemon remembers of a lease's Start until it forgets the lease.
-struct Granted {
-    /// The lease epoch in force when the Start arrived.
-    epoch: Option<u64>,
-    /// The action the Start named, which the lease's Result echoes.
-    action: Option<Digest>,
-}
-
 /// What woke the session loop.
 enum Wake {
-    Message(ServerMessage),
+    Message(Box<ServerMessage>),
     Beat,
     Done(Box<Done>),
     Recheck,
-    Driver,
-    Phase,
-    Pressure,
-    MapAsked,
+    Extra(ExtraWake),
     Drain,
 }
 
-impl Daemon {
+impl Daemon<KbfExtras> {
     /// A daemon that will connect as `config` says. Reads the TLS files now, so a
     /// missing or unreadable file fails here rather than on the first connection, and
-    /// detects the node's software ([`Software::detect`]).
+    /// detects the node's software ([`crate::status::Software::detect`]).
     ///
     /// A Start runs on the runtime of `runtimes` that serves its kind (one runtime, an
     /// `Arc<R>`, converts). The node report is `report` with a `drivers` entry for every
@@ -314,6 +214,18 @@ impl Daemon {
         config: DaemonConfig,
         runtimes: impl Into<Runtimes>,
         report: NodeReport,
+    ) -> Result<Self, ConfigError> {
+        Self::with_extras(config, runtimes, report, KbfExtras::detect())
+    }
+}
+
+impl<X: SessionExtras> Daemon<X> {
+    /// [`Daemon::new`] for a node whose session hooks are `extras`.
+    pub fn with_extras(
+        config: DaemonConfig,
+        runtimes: impl Into<Runtimes>,
+        report: NodeReport,
+        extras: X,
     ) -> Result<Self, ConfigError> {
         let runtimes = runtimes.into();
         let drivers = runtimes.drivers().into_iter().map(|d| ("drivers", d));
@@ -331,7 +243,12 @@ impl Daemon {
         // one the next connection presents.
         config.tls.load()?;
         let (done_tx, done) = mpsc::unbounded_channel();
-        let contact = Contact::new(config.fence_after);
+        let core = LeaseCore::new(
+            Leases::new(runtimes, done_tx),
+            config.fence_after,
+            config.max_unacked,
+            Arc::new(SystemClock),
+        );
         Ok(Self {
             config,
             servers,
@@ -339,85 +256,15 @@ impl Daemon {
             welcomed: false,
             base: report.clone(),
             report,
-            software: Software::detect(),
-            driver: None,
-            xcodes: Vec::new(),
-            container_images: Vec::new(),
-            phase: None,
-            phase_now: NodePhase::Serving,
-            pressure: None,
-            map: None,
             drain: None,
-            draining: false,
             drained: Arc::new(Notify::new()),
-            events: None,
-            leases: Leases::new(runtimes, done_tx),
+            running: Arc::new(AtomicUsize::new(0)),
+            core,
             done,
-            contact,
-            window: StartWindow::default(),
-            unacked: BTreeMap::new(),
-            epoch: None,
-            granted: BTreeMap::new(),
-            pack_reads: None,
-            pack_commit: None,
-            clock: Arc::new(SystemClock),
+            extras,
             instance: instance_id(),
             predecessor: String::new(),
         })
-    }
-
-    /// Puts the storage map the server sends (in `Welcome`, and in each `MapUpdate`) in
-    /// `holder`, which keeps the newest and never goes back, and asks the server for a
-    /// map when the holder is waiting for a generation it does not have
-    /// ([`kbf_mapsync::MapHolder::reach`]). Without one the daemon ignores the map.
-    #[must_use]
-    pub fn with_map(mut self, holder: Arc<kbf_mapsync::MapHolder>) -> Self {
-        self.map = Some(MapLink::new(holder));
-        self
-    }
-
-    /// Puts the counts of the pack reads `counter` holds in every Heartbeat
-    /// (`Heartbeat.pack_reads`), as they stand when it is sent: the totals since this
-    /// process started, which the server shows per node. Without it a Heartbeat carries
-    /// none, as before the field existed.
-    #[must_use]
-    pub fn with_pack_reads(mut self, counter: PackCounter) -> Self {
-        self.pack_reads = Some(counter);
-        self
-    }
-
-    /// Sets `commit` from every Welcome (`Welcome.pack_commit`): the data plane that writes packs
-    /// ([`crate::PackedCas::with_writes`], given the same handle) writes them only while the
-    /// frontend says it takes commits. Given the counter of [`Self::with_pack_reads`] too, the
-    /// daemon also puts the counts of its pack writes in every Heartbeat
-    /// (`Heartbeat.pack_writes`). Without it a Welcome sets nothing and a Heartbeat carries no
-    /// write counts.
-    #[must_use]
-    pub fn with_pack_writes(mut self, commit: PackCommit) -> Self {
-        self.pack_commit = Some(commit);
-        self
-    }
-
-    /// The counter [`Self::with_pack_reads`] was given; `None` for a daemon whose
-    /// Heartbeats carry no counts.
-    #[must_use]
-    pub const fn pack_reads(&self) -> Option<&PackCounter> {
-        self.pack_reads.as_ref()
-    }
-
-    /// The counts of the pack writes for a Heartbeat: those of the counter
-    /// [`Self::with_pack_reads`] was given, and only for a daemon that also writes packs
-    /// ([`Self::with_pack_writes`]).
-    fn pack_writes_counted(&self) -> Option<PackWriteCounts> {
-        self.pack_commit.as_ref()?;
-        self.pack_reads.as_ref().map(|c| c.stats().writes.into())
-    }
-
-    /// The handle [`Self::with_pack_writes`] was given; `None` for a daemon that sets none from
-    /// its Welcomes.
-    #[must_use]
-    pub const fn pack_writes(&self) -> Option<&PackCommit> {
-        self.pack_commit.as_ref()
     }
 
     /// This daemon process's instance id (`Hello.instance_id`), drawn when it was built.
@@ -439,101 +286,31 @@ impl Daemon {
     /// Sends every [`Event`] to `events` as well as to the log.
     #[must_use]
     pub fn with_events(mut self, events: mpsc::UnboundedSender<Event>) -> Self {
-        self.events = Some(events);
-        self
-    }
-
-    /// Adds `driver`'s entries to the report and its Xcodes to `NodeStatus`, now and
-    /// each time it changes (see the module documentation).
-    #[must_use]
-    pub fn with_driver_report(mut self, driver: watch::Receiver<DriverReport>) -> Self {
-        self.driver = Some(driver);
-        self.take_driver_report();
+        self.core.observe(events);
         self
     }
 
     /// Takes the driver's newest report, if it sends any; returns whether the node
     /// report changed.
-    fn take_driver_report(&mut self) -> bool {
-        let Some(driver) = &mut self.driver else {
-            return false;
-        };
-        let newest = driver.borrow_and_update().clone();
-        let report = self.base.clone().with_entries(newest.entries);
-        self.xcodes = newest.xcodes;
-        let changed = report != self.report;
-        self.report = report;
-        changed
-    }
-
-    /// Sends `phase`'s value in every Hello, and resends the Hello on the stream each
-    /// time it changes (see the module documentation).
-    #[must_use]
-    pub fn with_phase(mut self, phase: watch::Receiver<NodePhase>) -> Self {
-        self.phase = Some(phase);
-        self.take_phase();
-        self
+    pub(crate) fn take_driver(&mut self) -> bool {
+        self.extras.take_driver(&self.base, &mut self.report)
     }
 
     /// Takes the runtime's newest phase, if it reports one; returns whether it changed.
-    fn take_phase(&mut self) -> bool {
-        let Some(phase) = &mut self.phase else {
-            return false;
-        };
-        let newest = phase.borrow_and_update().clone();
-        let changed = newest != self.phase_now;
-        self.phase_now = newest;
-        changed
+    pub(crate) fn take_phase(&mut self) -> bool {
+        self.extras.take_phase()
     }
 
-    /// Stops taking new leases while `stall`, the node's memory stall time as a
-    /// percentage ([`crate::pressure::watch`]), is above `above` and a lease runs: the
-    /// Hello says [`NodePhase::MemoryPressure`] then, and resends when it changes (see
-    /// [`crate::pressure`]). Leases already running are not touched. A runtime's own
-    /// phase (a session switch, a quarantine) takes the place of this one.
-    #[must_use]
-    pub fn with_memory_backstop(mut self, stall: watch::Receiver<Option<f64>>, above: f64) -> Self {
-        self.pressure = Some(Backstop {
-            stall,
-            above,
-            paused: false,
-        });
-        self.take_pressure();
-        self
-    }
-
-    /// The percentage of memory stall time above which the backstop pauses this node
-    /// while it runs a lease; `None` without one ([`Self::with_memory_backstop`]).
-    #[must_use]
-    pub fn memory_backstop(&self) -> Option<f64> {
-        self.pressure.as_ref().map(|backstop| backstop.above)
-    }
-
-    /// The phase every Hello carries: the runtime's, or memory pressure in place of
-    /// serving while the backstop has the node paused.
+    /// The phase every Hello carries.
     fn phase(&self) -> NodePhase {
-        if self.draining && self.phase_now == NodePhase::Serving {
-            return NodePhase::Draining;
-        }
-        match &self.pressure {
-            Some(backstop) if backstop.paused && self.phase_now == NodePhase::Serving => {
-                NodePhase::MemoryPressure
-            }
-            _ => self.phase_now.clone(),
-        }
+        self.extras.hello_phase(self.core.draining)
     }
 
     /// Takes the newest pressure reading and the number of leases running; returns
     /// whether the phase a Hello carries changed.
-    fn take_pressure(&mut self) -> bool {
-        let leases = self.leases.running().len();
-        let before = self.phase();
-        let Some(backstop) = &mut self.pressure else {
-            return false;
-        };
-        let stall = *backstop.stall.borrow_and_update();
-        backstop.paused = pressure::paused(stall, backstop.above, leases);
-        self.phase() != before
+    pub(crate) fn take_pressure(&mut self) -> bool {
+        let leases = self.core.leases.running().len();
+        self.extras.take_pressure(leases, self.core.draining)
     }
 
     /// Takes the drain's newest state; returns whether the phase a Hello carries
@@ -544,14 +321,16 @@ impl Daemon {
         };
         let began = *drain.borrow_and_update();
         let before = self.phase();
-        self.draining = began;
+        self.core.draining = began;
         self.phase() != before
     }
 
     /// Wakes [`Self::run_draining`] when the daemon is draining and nothing is left to
     /// wait for: no lease runs and every Result is acknowledged.
     fn check_drained(&self) {
-        if self.draining && self.leases.running().is_empty() && self.unacked.is_empty() {
+        self.running
+            .store(self.core.leases.running().len(), Ordering::Relaxed);
+        if self.core.drained() {
             self.drained.notify_one();
         }
     }
@@ -567,24 +346,10 @@ impl Daemon {
         self.check_drained();
     }
 
-    /// Lists `images` in every `NodeStatus`, sorted and each once: the container
-    /// images the driver checked present at start. Status only; they route no work.
-    #[must_use]
-    pub fn with_container_images(mut self, images: impl IntoIterator<Item = String>) -> Self {
-        let images: std::collections::BTreeSet<String> = images.into_iter().collect();
-        self.container_images = images.into_iter().collect();
-        self
-    }
-
-    /// The `NodeStatus` this node sends now: its software, every Xcode the driver's
-    /// newest report names, ready or not, and the container images it was given.
+    /// The `NodeStatus` this node sends now.
     #[must_use]
     pub fn node_status(&self) -> worker::NodeStatus {
-        worker::NodeStatus {
-            xcodes: self.xcodes.clone(),
-            container_images: self.container_images.clone(),
-            ..self.software.status(&self.report)
-        }
+        self.extras.node_status(&self.report)
     }
 
     /// Resolves server names with `resolver` instead of the operating system's. A test
@@ -599,7 +364,7 @@ impl Daemon {
     /// test passes one it can jump forward, as a resume does.
     #[must_use]
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
-        self.clock = clock;
+        self.core.clock = clock;
         self
     }
 
@@ -618,18 +383,21 @@ impl Daemon {
 
     /// Runs the daemon like [`Self::run`], but drains on the first of `signals` (a
     /// `()` for each SIGTERM or SIGINT): see the module documentation. Returns when
-    /// the drain is complete (no lease runs, no Result is unacknowledged), at the
-    /// second signal, or `deadline` after the first; `signals` closing does not stop it.
+    /// the drain is complete (no lease runs, no Result is unacknowledged) or at the
+    /// second signal; `signals` closing does not stop it. `deadline`, if set, is when
+    /// the drain warns that leases still run; it never ends the drain, so no lease is
+    /// abandoned for it.
     pub async fn run_draining(
         mut self,
         mut signals: mpsc::UnboundedReceiver<()>,
-        deadline: Duration,
+        deadline: Option<Duration>,
     ) {
         #[cfg(target_os = "linux")]
         crate::numa::log_layout();
         let (begin, began) = watch::channel(false);
         self.drain = Some(began);
         let drained = Arc::clone(&self.drained);
+        let running = Arc::clone(&self.running);
         let stop = async {
             // A closed channel is no signal.
             if signals.recv().await.is_none() {
@@ -637,11 +405,7 @@ impl Daemon {
             }
             tracing::info!(?deadline, "draining: no new leases; running ones finish");
             begin.send_replace(true);
-            tokio::select! {
-                _ = signals.recv() => tracing::warn!("second signal: stopping at once"),
-                () = sleep(deadline) => tracing::warn!(?deadline, "drain deadline: stopping"),
-                () = drained.notified() => tracing::info!("drained: stopping"),
-            }
+            wait_for_drain(&mut signals, &drained, deadline, &running).await;
         };
         tokio::select! {
             () = self.reconnect_forever() => {}
@@ -673,7 +437,7 @@ impl Daemon {
                 };
                 if self.welcomed {
                     tracing::warn!(server = %target, %reason, "session ended");
-                    self.emit(Event::Disconnected(reason));
+                    self.core.emit(Event::Disconnected(reason));
                     warn.welcomed();
                     welcomed = true;
                     break;
@@ -686,7 +450,7 @@ impl Daemon {
                 let wait = backoff.failed(unit_random());
                 let failed_rounds = backoff.failed_rounds();
                 tracing::debug!(failed_rounds, ?wait, "no server reached; waiting");
-                self.emit(Event::Retrying {
+                self.core.emit(Event::Retrying {
                     failed_rounds,
                     wait,
                 });
@@ -705,7 +469,7 @@ impl Daemon {
         } else {
             tracing::debug!(%server, %reason, attempts, "cannot reach a server; retrying");
         }
-        self.emit(Event::ConnectFailed {
+        self.core.emit(Event::ConnectFailed {
             server,
             reason: reason.to_owned(),
         });
@@ -741,13 +505,13 @@ impl Daemon {
         let mut client = WorkerClient::new(channel);
         let (tx, rx) = unbounded();
         // A change that arrived while no stream was up.
-        self.take_driver_report();
+        self.take_driver();
         self.take_phase();
         self.take_pressure();
         self.take_drain();
-        let hello_sent = self.clock.now();
+        let hello_sent = self.core.clock.now();
         send(&tx, daemon_message::Message::Hello(self.hello()));
-        self.emit(Event::HelloSent);
+        self.core.emit(Event::HelloSent);
 
         let wait = self.config.welcome_timeout;
         let response = self
@@ -759,26 +523,32 @@ impl Daemon {
             .offline(timeout(wait, inbound.message()))
             .await
             .map_err(|_| SessionError::WelcomeTimeout(wait))??;
-        let (interval, epoch, map) = self.welcome(first)?;
+        let (interval, epoch, welcome) = self.welcome(first)?;
         self.welcomed = true;
-        self.contact.new_stream(interval);
-        self.window.new_stream(hello_sent);
+        let usage_window = usage_window(interval, self.config.usage_window);
+        self.core.new_stream(interval, usage_window, hello_sent);
         // Before the Welcome renews contact: a lease whose fence passed while this
         // stream was set up must not outlive it (`offline` checked already; this keeps
         // the order true by construction here too).
-        self.recheck();
+        self.core.recheck();
         // Before any Result is resent or any Start of this stream is read.
         self.new_epoch(epoch);
-        self.new_map_stream(map);
-        if self.contact.confirm(hello_sent) {
-            self.emit(Event::ContactRestored);
+        let placement_load = welcome.placement_load == Some(true);
+        self.extras.on_welcome(welcome);
+        if self.core.contact.confirm(hello_sent) {
+            self.core.emit(Event::ContactRestored);
         }
         tracing::info!(server = %target, ?interval, "welcomed");
-        self.emit(Event::Welcomed {
+        self.core.emit(Event::Welcomed {
             heartbeat_interval: interval,
         });
+        // On every stream, so a reconnect to a server with another mode changes the limit
+        // (absent is false); after contact is renewed, so a slow write cannot cost the
+        // fence, and before the first Heartbeat of the stream, which reports what was
+        // written.
+        self.core.welcomed_placement_load(placement_load).await;
         // Before the first Heartbeat, which lists these leases (issue #26).
-        for result in self.unacked.values() {
+        for result in self.core.unacked.values() {
             send(&tx, daemon_message::Message::Result(result.clone()));
         }
         send(&tx, daemon_message::Message::NodeStatus(self.node_status()));
@@ -791,63 +561,65 @@ impl Daemon {
         let mut beat = tokio::time::interval(interval);
         beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            let wait = self.until_recheck();
+            let wait = self.core.until_recheck(self.config.recheck_every);
             let wake = tokio::select! {
                 msg = inbound.message() => match msg? {
-                    Some(msg) => Wake::Message(msg),
+                    Some(msg) => Wake::Message(Box::new(msg)),
                     None => return Ok(()),
                 },
                 _ = beat.tick() => Wake::Beat,
                 Some(done) = self.done.recv() => Wake::Done(Box::new(done)),
                 () = sleep(wait) => Wake::Recheck,
-                Some(()) = driver_changed(self.driver.as_mut()) => Wake::Driver,
-                Some(()) = phase_changed(self.phase.as_mut()) => Wake::Phase,
-                Some(()) = pressure_changed(self.pressure.as_mut()) => Wake::Pressure,
-                () = map_asked(self.map.as_mut()) => Wake::MapAsked,
+                extra = self.extras.wake() => Wake::Extra(extra),
                 Some(()) = drain_changed(self.drain.as_mut()) => Wake::Drain,
             };
             // First, whatever woke the loop: the clock may have jumped over a suspend.
-            self.recheck();
+            self.core.recheck();
             self.check_silence(heard)?;
             match wake {
                 Wake::Message(msg) => {
                     if let Some(server_message::Message::HeartbeatAck(_)) = msg.message {
                         heard = tokio::time::Instant::now();
                     }
-                    self.on_message(msg, &tx);
+                    self.on_message(*msg, &tx);
                 }
                 Wake::Beat => {
                     seq += 1;
-                    let now = self.clock.now();
-                    self.contact.sent(seq, now);
-                    self.window.sent(seq, now);
+                    let now = self.core.clock.now();
+                    self.core.contact.sent(seq, now);
+                    self.core.window.sent(seq, now);
+                    let (pack_reads, pack_writes) = self.extras.pack_counts();
+                    let node_load = self.core.node_load(seq).await;
                     let heartbeat = Heartbeat {
                         seq,
                         report_hash: self.report.hash().to_vec(),
-                        running: self.listed().into_iter().map(proto_lease_id).collect(),
-                        pack_reads: self.pack_reads.as_ref().map(|c| c.stats().into()),
-                        pack_writes: self.pack_writes_counted(),
+                        running: self.core.listed().into_iter().map(proto_lease_id).collect(),
+                        pack_reads,
+                        pack_writes,
+                        node_load,
+                        input_cache: self.core.leases.runtimes.input_cache(),
                     };
                     send(&tx, daemon_message::Message::Heartbeat(heartbeat));
                 }
-                Wake::Done(done) => self.finished(Some(&tx), *done),
+                Wake::Done(done) => self.core.finished(Some(&tx), *done),
                 Wake::Recheck => {}
-                Wake::Driver => {
-                    if self.take_driver_report() {
+                Wake::Extra(ExtraWake::Driver) => {
+                    if self.take_driver() {
                         send(&tx, daemon_message::Message::Hello(self.hello()));
                     }
                     send(&tx, daemon_message::Message::NodeStatus(self.node_status()));
                 }
-                Wake::Phase => {
+                Wake::Extra(ExtraWake::Phase) => {
                     if self.take_phase() {
                         tracing::info!(phase = self.phase().name(), "node phase changed");
                         send(&tx, daemon_message::Message::Hello(self.hello()));
                     }
                 }
-                // The request for a map is sent below, whatever woke the loop.
-                Wake::Pressure | Wake::MapAsked | Wake::Drain => {}
+                // The pressure is taken below, and the request for a map is sent by
+                // `after_wake`, whatever woke the loop.
+                Wake::Extra(ExtraWake::Pressure | ExtraWake::MapAsked) | Wake::Drain => {}
             }
-            self.ask_map(&tx);
+            self.extras.after_wake(&tx);
             self.settle_drain(&tx);
             // Whatever woke the loop, leases may have started or ended.
             if self.take_pressure() {
@@ -857,43 +629,24 @@ impl Daemon {
         }
     }
 
-    /// Takes the map a `Welcome` carried, the first of a new stream: the generation the
-    /// holder waits for is asked for again on this stream, by [`Self::ask_map`]. These are
-    /// methods rather than code in [`Self::session`] so that none of it is conditional
-    /// there (the session is compiled once for each test binary, and the coverage tool
-    /// counts the lines of the copy that covers most).
-    fn new_map_stream(&mut self, map: Option<wire::Map>) {
-        if let Some(link) = self.map.as_mut() {
-            link.new_stream();
-            link.take(map);
-        }
-    }
-
-    /// Sends the `MapRequest` for a generation the holder waits for, once on a stream.
-    fn ask_map(&mut self, tx: &UnboundedSender<DaemonMessage>) {
-        if let Some(request) = self.map.as_mut().and_then(MapLink::request) {
-            send(tx, daemon_message::Message::MapRequest(request));
-        }
-    }
-
     /// Ends the session when contact is lost and this stream has acknowledged no
     /// heartbeat since `heard` for 1.5 T of time awake: it is stuck, or the server
     /// gave this node up, and a new stream says Hello again. Half T past the fence, so
     /// the Results of runs that stop at once go out on this stream first.
     fn check_silence(&self, heard: tokio::time::Instant) -> Result<(), SessionError> {
-        let silent_for = self.contact.fence_after().saturating_mul(3) / 2;
-        if self.contact.lost(self.clock.now()) && heard.elapsed() >= silent_for {
+        let silent_for = self.core.contact.fence_after().saturating_mul(3) / 2;
+        if self.core.contact.lost(self.core.clock.now()) && heard.elapsed() >= silent_for {
             return Err(SessionError::Silent(silent_for));
         }
         Ok(())
     }
 
     /// Checks the first server message is an acceptable Welcome; returns its interval,
-    /// the lease epoch it names (`None` for 0) and the storage map it carries.
+    /// the lease epoch it names (`None` for 0) and the Welcome itself.
     fn welcome(
-        &self,
+        &mut self,
         first: Option<ServerMessage>,
-    ) -> Result<(Duration, Option<u64>, Option<wire::Map>), SessionError> {
+    ) -> Result<(Duration, Option<u64>, Welcome), SessionError> {
         let Some(server_message::Message::Welcome(w)) = first.and_then(|m| m.message) else {
             return Err(SessionError::Protocol(
                 "the first server message is not Welcome".into(),
@@ -913,222 +666,52 @@ impl Daemon {
         }
         let interval = Duration::from_millis(w.heartbeat_interval_ms);
         // A gap is two intervals; it must be noticed well before the fence.
-        if interval.is_zero() || interval.saturating_mul(2) >= self.contact.fence_after() {
+        if interval.is_zero() || interval.saturating_mul(2) >= self.core.contact.fence_after() {
             return Err(SessionError::Protocol(format!(
                 "heartbeat interval {interval:?} does not fit the fence time {:?}",
-                self.contact.fence_after()
+                self.core.contact.fence_after()
             )));
         }
-        if let Some(commit) = &self.pack_commit {
-            commit.welcomed(w.pack_commit);
-        }
-        Ok((interval, (w.epoch != 0).then_some(w.epoch), w.map))
+        self.extras.welcome_checked(&w);
+        Ok((interval, (w.epoch != 0).then_some(w.epoch), w))
     }
 
-    /// Takes the lease epoch a Welcome named. When it names one, every lease granted
-    /// under another is dropped: its run is killed and its Result forgotten, unsent
-    /// (issue #137). A Welcome that names none drops nothing, and a lease granted while
-    /// none was named is kept.
+    /// Takes the lease epoch a Welcome named: the node's hook first, then the core's
+    /// (see [`LeaseCore::new_epoch`]).
     fn new_epoch(&mut self, epoch: Option<u64>) {
-        self.epoch = epoch;
-        if let Some(lease) = self.phase_now.switching()
-            && epoch.is_some_and(|epoch| epoch != lease.term)
-        {
-            // The server that granted it is gone: no Start for it will come again.
-            tracing::warn!(%lease, ?epoch, "the switching lease is of an earlier epoch");
-            self.leases.forget(lease);
-        }
-        let stale: Vec<LeaseId> = self
-            .granted
-            .keys()
-            .copied()
-            .filter(|id| self.superseded(*id))
-            .collect();
-        if stale.is_empty() {
-            return;
-        }
-        let running = self.leases.running();
-        for id in &stale {
-            self.unacked.remove(id);
-            if running.contains(id) {
-                // Its Result is dropped when the run ends (`report`).
-                self.leases.cancel(*id);
-            } else {
-                self.granted.remove(id);
-            }
-        }
-        tracing::warn!(?stale, ?epoch, "leases of an earlier epoch dropped");
-        self.emit(Event::Superseded(stale));
-    }
-
-    /// Whether lease `id` was granted under a lease epoch other than the newest
-    /// Welcome's, when that Welcome named one.
-    fn superseded(&self, id: LeaseId) -> bool {
-        superseded(self.granted.get(&id).and_then(|g| g.epoch), self.epoch)
+        change_epoch(&mut self.extras, &mut self.core, epoch);
     }
 
     fn on_message(&mut self, msg: ServerMessage, tx: &UnboundedSender<DaemonMessage>) {
+        if let Some(message) = &msg.message
+            && self.extras.on_server_message(message)
+        {
+            return;
+        }
         match msg.message {
-            Some(server_message::Message::HeartbeatAck(ack)) => {
-                self.window.acknowledged(ack.seq);
-                if self.contact.acknowledged(ack.seq).restored {
-                    tracing::info!("contact restored");
-                    self.emit(Event::ContactRestored);
-                }
-            }
+            Some(server_message::Message::HeartbeatAck(ack)) => self.core.on_heartbeat_ack(ack.seq),
             Some(server_message::Message::LeaseOffer(offer)) => {
                 if let Some(id) = offer.lease_id.map(lease_id) {
                     tracing::info!(lease = %id, kind = %offer.kind, "lease offered");
-                    self.emit(Event::Offered(id));
+                    self.core.emit(Event::Offered(id));
                 }
             }
-            Some(server_message::Message::Start(start)) => self.on_start(start, tx),
-            Some(server_message::Message::ResultAck(ack)) => {
-                if let Some(id) = ack.lease_id.map(lease_id) {
-                    self.unacked.remove(&id);
-                    self.granted.remove(&id);
-                    let reason = acks::reason(&ack);
-                    acks::log(id, ack.accepted, reason);
-                    self.emit(Event::ResultAcknowledged {
-                        lease: id,
-                        accepted: ack.accepted,
-                        reason,
-                    });
-                }
-            }
-            Some(server_message::Message::Cancel(cancel)) => {
-                if let Some(id) = cancel.lease_id.map(lease_id) {
-                    if self.leases.cancel(id) {
-                        self.emit(Event::Cancelled(id));
-                    } else {
-                        self.leases.forget(id);
-                    }
-                }
-            }
+            Some(server_message::Message::Start(start)) => self.core.on_start(start, tx),
+            Some(server_message::Message::ResultAck(ack)) => self.core.on_result_ack(&ack),
+            Some(server_message::Message::Cancel(cancel)) => self.core.on_cancel(&cancel),
             Some(server_message::Message::Welcome(_)) => {
                 tracing::warn!("a second Welcome on one stream ignored");
             }
-            Some(server_message::Message::MapUpdate(update)) => {
-                if let Some(link) = &self.map {
-                    link.take(update.map);
-                }
-            }
+            // A map is the node's (`on_server_message`); a node that takes none ignores it.
             // A frontend that still offers or orders an update is answered with nothing:
             // updates are installed from packages, not over this session.
             Some(
-                server_message::Message::UpdateOffer(_) | server_message::Message::UpdateOrder(_),
+                server_message::Message::MapUpdate(_)
+                | server_message::Message::UpdateOffer(_)
+                | server_message::Message::UpdateOrder(_),
             ) => {}
             None => tracing::warn!("an empty server message ignored"),
         }
-    }
-
-    /// Runs the lease a Start names, unless its Result is still unacknowledged, it
-    /// arrived after its window, or contact is lost (then it is refused with a Result).
-    /// A lease it acts on is remembered ([`Self::remember`]).
-    fn on_start(&mut self, start: worker::Start, tx: &UnboundedSender<DaemonMessage>) {
-        let done = start.lease_id.map(lease_id);
-        if let Some(id) = done.filter(|id| self.unacked.contains_key(id)) {
-            // Its Result stands until acknowledged; running it again could
-            // produce a second one.
-            tracing::warn!(lease = %id, "a Start for a lease already reported ignored");
-            return;
-        }
-        let valid_for = Duration::from_millis(start.valid_for_ms);
-        if !self
-            .window
-            .allows(start.heartbeat_seq, valid_for, self.clock.now())
-        {
-            // The scheduler may have given the lease up and granted it again; it
-            // gives it up here too, as a Start that never arrived.
-            if let Some(id) = done {
-                tracing::warn!(lease = %id, "a Start that arrived after its window not run");
-                self.emit(Event::StartExpired(id));
-            }
-            return;
-        }
-        self.remember(done, &start);
-        let refused = if self.contact.lost(self.clock.now()) {
-            start.lease_id.map(|id| {
-                failure(
-                    lease_id(id),
-                    Code::Unavailable,
-                    "contact with the server is lost; not starting",
-                )
-            })
-        } else if self.draining {
-            start.lease_id.map(|id| {
-                failure(
-                    lease_id(id),
-                    Code::Unavailable,
-                    "the node is draining; not starting",
-                )
-            })
-        } else {
-            self.leases.start(start)
-        };
-        if let Some(result) = refused {
-            self.report(Some(tx), result);
-        }
-    }
-
-    /// Remembers lease `id` of `start`, if the Start names one and it is not remembered
-    /// already: the lease epoch in force and the action the Start named.
-    fn remember(&mut self, id: Option<LeaseId>, start: &worker::Start) {
-        if let Some(id) = id {
-            let granted = Granted {
-                epoch: self.epoch,
-                action: start.action_digest.clone(),
-            };
-            self.granted.entry(id).or_insert(granted);
-        }
-    }
-
-    /// Declares a heartbeat gap, and fences, when their deadlines have passed. A fence
-    /// returns at once: each fenced lease reports through `done` once its run stops.
-    fn recheck(&mut self) {
-        let now = self.clock.now();
-        if let Some(silent_for) = self.contact.check_gap(now) {
-            tracing::warn!(?silent_for, "heartbeat gap: no acknowledgement");
-            self.emit(Event::HeartbeatGap { silent_for });
-        }
-        if !self.contact.lost(now) {
-            return;
-        }
-        let fenced = self.leases.fence();
-        if !fenced.is_empty() {
-            self.emit(Event::Fenced(fenced));
-        }
-    }
-
-    /// Reports a finished run.
-    fn finished(
-        &mut self,
-        tx: Option<&UnboundedSender<DaemonMessage>>,
-        (id, outcome, usage, phases): Done,
-    ) {
-        let result = self.leases.finished(id, outcome, usage, &phases);
-        self.emit(Event::LeaseEnded(phases));
-        self.report(tx, result);
-    }
-
-    /// How long to sleep before [`Self::check`] may have something to do: until its
-    /// next deadline, but never longer than `recheck_every`, since the sleep runs on a
-    /// clock that stops during suspend and the deadline on one that does not.
-    fn until_recheck(&self) -> Duration {
-        let fence = if !self.leases.unfenced() {
-            None
-        } else {
-            self.contact.fence_deadline()
-        };
-        [fence, self.contact.gap_deadline()]
-            .into_iter()
-            .flatten()
-            .min()
-            .map_or(Duration::from_secs(3600), |deadline| {
-                deadline
-                    .saturating_duration_since(self.clock.now())
-                    .min(self.config.recheck_every)
-            })
     }
 
     /// Runs `fut` while no stream is up, still finishing leases and fencing on time.
@@ -1137,7 +720,7 @@ impl Daemon {
     async fn offline<F: Future>(&mut self, fut: F) -> F::Output {
         let mut fut = std::pin::pin!(fut);
         loop {
-            let wait = self.until_recheck();
+            let wait = self.core.until_recheck(self.config.recheck_every);
             let (out, done) = tokio::select! {
                 out = &mut fut => (Some(out), None),
                 Some(done) = self.done.recv() => (None, Some(done)),
@@ -1145,12 +728,12 @@ impl Daemon {
                 Some(()) = drain_changed(self.drain.as_mut()) => (None, None),
             };
             // First: the clock may have jumped over a suspend.
-            self.recheck();
+            self.core.recheck();
             if let Some(out) = out {
                 return out;
             }
             if let Some(done) = done {
-                self.finished(None, done);
+                self.core.finished(None, done);
             }
             self.take_drain();
             self.check_drained();
@@ -1169,46 +752,6 @@ impl Daemon {
             predecessor_instance_id: self.predecessor.clone(),
         }
     }
-
-    /// Keeps `result` until its lease's ResultAck, and sends it on `tx` if a stream is
-    /// up. Without one it goes out after the next Welcome. It echoes the action its
-    /// lease's Start named. The Result of a lease of an earlier epoch is dropped.
-    fn report(&mut self, tx: Option<&UnboundedSender<DaemonMessage>>, mut result: worker::Result) {
-        // Every Result here names its lease: the lease manager builds them all.
-        let id = result.lease_id.map_or(LeaseId::new(0, 0), lease_id);
-        if self.superseded(id) {
-            tracing::warn!(lease = %id, "the Result of a lease of an earlier epoch dropped");
-            self.granted.remove(&id);
-            return;
-        }
-        result.action_digest = self.granted.get(&id).and_then(|g| g.action.clone());
-        if let Some(tx) = tx {
-            send(tx, daemon_message::Message::Result(result.clone()));
-        }
-        if self.unacked.len() >= self.config.max_unacked {
-            tracing::error!(lease = %id, kept = self.unacked.len(), "too many unacknowledged results: this one is sent once and not kept");
-            self.granted.remove(&id);
-            return;
-        }
-        self.unacked.insert(id, result);
-    }
-
-    /// What a Heartbeat lists as running: the leases running now, and those whose
-    /// Result the server has not acknowledged (issue #26).
-    fn listed(&self) -> BTreeSet<LeaseId> {
-        self.leases
-            .running()
-            .into_iter()
-            .chain(self.unacked.keys().copied())
-            .collect()
-    }
-
-    fn emit(&self, event: Event) {
-        if let Some(events) = &self.events {
-            // An observer that went away does not stop the daemon.
-            let _ = events.send(event);
-        }
-    }
 }
 
 /// A new daemon process's instance id: 128 random bits as 32 hex digits, from two
@@ -1222,27 +765,10 @@ fn instance_id() -> String {
     format!("{:016x}{:016x}", half(), half())
 }
 
-/// Completes when `driver` has a report the daemon has not taken; never when there is
-/// no driver channel, or its sender is gone (`None` then disables the select arm).
-async fn driver_changed(driver: Option<&mut watch::Receiver<DriverReport>>) -> Option<()> {
-    driver?.changed().await.ok()
-}
-
 /// Completes when the drain has a state the daemon has not taken; never for a daemon
 /// that does not drain, or once its sender is gone.
 async fn drain_changed(drain: Option<&mut watch::Receiver<bool>>) -> Option<()> {
     drain?.changed().await.ok()
-}
-
-/// Completes when `phase` has a value the daemon has not taken; never without one.
-async fn phase_changed(phase: Option<&mut watch::Receiver<NodePhase>>) -> Option<()> {
-    phase?.changed().await.ok()
-}
-
-/// Completes when the memory backstop has a reading the daemon has not taken; never
-/// without one.
-async fn pressure_changed(backstop: Option<&mut Backstop>) -> Option<()> {
-    backstop?.stall.changed().await.ok()
 }
 
 /// `phase` as Hello carries it: absent for serving, as a daemon that predates the
@@ -1263,26 +789,86 @@ fn wire_phase(phase: &NodePhase) -> Option<worker::NodePhase> {
     })
 }
 
-/// Queues a message on the stream. A message for a stream that is gone is dropped: a
-/// Result stays in the daemon's unacknowledged set and is resent on the next stream.
-pub(crate) fn send(tx: &UnboundedSender<DaemonMessage>, message: daemon_message::Message) {
-    let _ = tx.unbounded_send(DaemonMessage {
-        message: Some(message),
-    });
-}
-
-/// Whether a lease granted under the lease epoch `granted` is dropped once the newest
-/// `Welcome` named `newest` (issue #137): only when both name one and they differ. A
-/// Welcome that names none drops nothing, and a lease granted while none was named is
-/// kept. The daemon's rule, public so a simulated daemon follows the same one.
-#[must_use]
-pub fn superseded(granted: Option<u64>, newest: Option<u64>) -> bool {
-    newest.is_some() && granted.is_some() && granted != newest
+/// A Welcome named lease epoch `epoch`: the node's hook first, then the core's change.
+/// The hook goes first because it forgets leases the node holds outside the core (a
+/// session switch's lease) by the epoch the core is about to replace; the core's change
+/// then drops what it granted under the old one. Both kill by lease id and a kill of a
+/// lease already killed does nothing, so what is dropped and what is reported does not
+/// depend on which comes first, but the hook is written to see the core as the Welcome
+/// found it.
+fn change_epoch<X: SessionExtras>(extras: &mut X, core: &mut LeaseCore, epoch: Option<u64>) {
+    extras.epoch_changed(epoch, core);
+    core.new_epoch(epoch);
 }
 
 #[cfg(test)]
 mod tests {
+    use kbf_proto::reapi::Digest;
+    use kbf_types::LeaseId;
+
+    use crate::clock::SystemClock;
+    use crate::runtime::FakeRuntime;
+
     use super::*;
+
+    /// Catches a new epoch that leaves a lease which is the Mac session's switching lease
+    /// and is also granted and running alive, or reports its Result: the run is killed
+    /// (once, though the hook and the core both kill it), the Result of the run is
+    /// dropped when it ends, nothing is kept for resending, and the observer is told the
+    /// lease was superseded. Driven through [`change_epoch`], without a stream.
+    #[tokio::test]
+    async fn a_new_epoch_drops_a_switching_lease_that_runs_and_its_result() {
+        let lease = LeaseId::new(1, 1);
+        let runtime = Arc::new(FakeRuntime::new(Duration::from_secs(3600)));
+        let (done_tx, mut done) = mpsc::unbounded_channel();
+        let mut core = LeaseCore::new(
+            Leases::new(Runtimes::new(Arc::clone(&runtime)), done_tx),
+            Duration::from_secs(40),
+            8,
+            Arc::new(SystemClock),
+        );
+        let (events_tx, mut events) = mpsc::unbounded_channel();
+        core.observe(events_tx);
+        core.new_stream(
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            core.clock.now(),
+        );
+        core.new_epoch(Some(1));
+        let (tx, mut sent) = unbounded();
+        let start = worker::Start {
+            lease_id: Some(worker::LeaseId { term: 1, seq: 1 }),
+            kind: "action".to_owned(),
+            action_digest: Some(Digest::default()),
+            ..worker::Start::default()
+        };
+        core.on_start(start, &tx);
+        let mut extras = KbfExtras::detect();
+        extras.phase_now = NodePhase::Preparing(lease);
+        while runtime.started().is_empty() {
+            tokio::task::yield_now().await;
+        }
+
+        change_epoch(&mut extras, &mut core, Some(2));
+        let finished = done.recv().await.expect("the killed run ends");
+        core.finished(Some(&tx), finished);
+
+        assert_eq!(runtime.killed(), [lease]);
+        assert_eq!(core.epoch, Some(2));
+        assert!(core.unacked.is_empty(), "no Result kept");
+        assert!(core.granted.is_empty(), "the grant is forgotten");
+        assert!(sent.try_recv().is_err(), "no Result sent");
+        assert_eq!(
+            events.recv().await,
+            Some(Event::Superseded(vec![lease])),
+            "superseded first"
+        );
+        let ended = events
+            .recv()
+            .await
+            .map(|e| matches!(e, Event::LeaseEnded(_)));
+        assert_eq!(ended, Some(true), "then the run's end");
+    }
 
     /// Catches (issue #170): a session error logged as `connect: transport error`
     /// alone, without the cause under it (here, the refused connection), and a chain

@@ -37,9 +37,14 @@ fn enrolled(name: &str, host: &str, host_role: HostRole) -> (Farm, Vec<KeyPair>)
 /// the CA bundle and the clock come with it, and the node listing does not show the updater.
 #[test]
 fn an_updater_token_makes_an_updater_certificate_for_its_node_and_host_role() {
-    for host_role in HostRole::ALL {
+    for host_role in [
+        HostRole::FRONTEND,
+        HostRole::STORAGE,
+        HostRole::DAEMON,
+        HostRole::MAC_DAEMON,
+    ] {
         let farm = farm("updater-cert");
-        let tok = token(&farm, 1, &updater_spec("host-1", host_role));
+        let tok = token(&farm, 1, &updater_spec("host-1", host_role.clone()));
         let (request, keys) = enroll_request(&tok, "host-1", &UPDATER, "");
         let answer = farm.service.enroll_now(&request).expect("enrolled");
 
@@ -72,7 +77,7 @@ fn an_updater_token_makes_an_updater_certificate_for_its_node_and_host_role() {
 fn only_an_updater_token_for_this_node_enrolls_an_updater() {
     let farm = farm("updater-refused");
     let node_token = token(&farm, 1, &spec(&[Role::Storage, Role::Daemon]));
-    let updater_token = token(&farm, 2, &updater_spec("host-1", HostRole::Daemon));
+    let updater_token = token(&farm, 2, &updater_spec("host-1", HostRole::DAEMON));
     let cases = [
         (
             &node_token,
@@ -129,7 +134,7 @@ fn only_an_updater_token_for_this_node_enrolls_an_updater() {
 #[test]
 fn an_expired_updater_token_is_refused() {
     let farm = farm("updater-expired");
-    let tok = token(&farm, 1, &updater_spec("host-1", HostRole::Storage));
+    let tok = token(&farm, 1, &updater_spec("host-1", HostRole::STORAGE));
     farm.advance(2 * 86_400);
     let (request, _) = enroll_request(&tok, "host-1", &UPDATER, "");
     assert_eq!(
@@ -142,7 +147,7 @@ fn an_expired_updater_token_is_refused() {
 /// node, signed by the key the registry holds; the frontend asks nothing else of the request.
 #[test]
 fn an_updater_renews_with_its_own_key_and_keeps_its_host_role() {
-    let (farm, keys) = enrolled("updater-renew", "host-1", HostRole::MacDaemon);
+    let (farm, keys) = enrolled("updater-renew", "host-1", HostRole::MAC_DAEMON);
     farm.advance(3_600);
     let request = renew_request("host-1", &UPDATER, &keys, farm.now());
     let answer = farm.service.renew_now(&request).expect("renewed");
@@ -163,7 +168,7 @@ fn an_updater_renews_with_its_own_key_and_keeps_its_host_role() {
 /// (a node of the same id is not one), and for the roles of a node on an updater's id.
 #[test]
 fn an_updater_renewal_needs_the_updaters_row_and_its_key() {
-    let (farm, keys) = enrolled("updater-renew-refused", "host-1", HostRole::Daemon);
+    let (farm, keys) = enrolled("updater-renew-refused", "host-1", HostRole::DAEMON);
     farm.advance(3_600);
     let other = [key()];
     let wrong_key = renew_request("host-1", &UPDATER, &other, farm.now());
@@ -211,7 +216,7 @@ fn an_updater_renewal_needs_the_updaters_row_and_its_key() {
 #[test]
 fn a_ca_that_cannot_sign_makes_no_updater() {
     let farm = farm_at("updater-clock", 1_000_000);
-    let tok = token(&farm, 1, &updater_spec("host-1", HostRole::Daemon));
+    let tok = token(&farm, 1, &updater_spec("host-1", HostRole::DAEMON));
     let (request, _) = enroll_request(&tok, "host-1", &UPDATER, "");
     assert_eq!(
         farm.service.enroll_now(&request).err(),
@@ -229,7 +234,7 @@ fn a_ca_that_cannot_sign_makes_no_updater() {
 /// no certificate is issued for a host role nobody could read.
 #[test]
 fn an_updater_renewal_while_its_row_is_unreadable_is_store_unavailable() {
-    let (farm, keys) = enrolled("updater-unreadable", "host-1", HostRole::Daemon);
+    let (farm, keys) = enrolled("updater-unreadable", "host-1", HostRole::DAEMON);
     farm.advance(3_600);
     farm.store
         .txn(Txn::new().put("enroll/updater/host-1", [0xffu8, 0xff], Cond::Any))

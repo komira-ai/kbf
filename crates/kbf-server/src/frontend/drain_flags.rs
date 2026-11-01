@@ -15,9 +15,8 @@ use crate::sequence::DrainTiming;
 const LB_WAIT: &str = "drain_lb_wait";
 const DEADLINE: &str = "drain_deadline";
 
-/// The defaults, in seconds: [`DrainTiming::default`]'s.
+/// The default, in seconds: [`DrainTiming::default`]'s. The deadline has none.
 const DEFAULT_LB_WAIT: &str = "10";
-const DEFAULT_DEADLINE: &str = "900";
 
 /// The two flags.
 pub(super) fn args() -> [Arg; 2] {
@@ -34,26 +33,26 @@ pub(super) fn args() -> [Arg; 2] {
                  least its check interval times its unhealthy threshold, and the time its \
                  routes take to change. Then new Execute calls are refused UNAVAILABLE and \
                  every listener is sent GOAWAY. 0 goes on at once. The container's stop \
-                 timeout must exceed this and --drain-deadline.",
+                 timeout must exceed this and the longest action to be waited for.",
             ),
         Arg::new(DEADLINE)
             .long("drain-deadline")
             .value_name("SECONDS")
             .value_parser(clap::value_parser!(u64).range(1..))
-            .default_value(DEFAULT_DEADLINE)
             .help(
-                "The longest, in seconds, a drain (a stop signal or `POST /v1/frontend/drain`) \
-                 waits for the open executions to finish after it has refused new ones; a \
-                 stop always ends by then, unless `--shutdown-timeout-secs` ends it earlier. \
-                 The one stream that does not wait is that of an operation that was never \
-                 started, that no worker on this frontend can run and that no other \
-                 frontend can take: it ends UNAVAILABLE as the drain begins, since that action would fail at the deadline anyway (Buck2 retries \
-                 only the opening of a call), and the operation stays queued for the other \
-                 frontends. Executions still open at the deadline are ended UNAVAILABLE, \
-                 the daemons' worker streams end and the process exits. Buck2 does not \
-                 recover a stream that breaks mid-action, so an action that runs longer than \
-                 this fails: update in a quiet window, or set it above the longest action. \
-                 At least 1.",
+                "When set, how long, in seconds, after a drain (a stop signal or `POST \
+                 /v1/frontend/drain`) has refused new executions it reports the ones still \
+                 open: a WARN with their count, and `deadline_passed` in `GET \
+                 /v1/frontend/drain`. It never ends a stream or stops the drain: absent, \
+                 the default, and set alike, the drain waits for the open executions for \
+                 as long as they run, and the process stays up serving them. Only a second \
+                 stop signal, or `--shutdown-timeout-secs` on a stop signal (default none), \
+                 forces a stop and ends the streams that are left UNAVAILABLE. The one \
+                 stream that does not wait is that of an operation that was never started, \
+                 that no worker on this frontend can run and that no other frontend can \
+                 take: it ends UNAVAILABLE as the drain begins (Buck2 retries only the \
+                 opening of a call), and the operation stays queued for the other \
+                 frontends. No upper bound; at least 1.",
             ),
     ]
 }
@@ -66,6 +65,6 @@ pub(super) fn from_matches(m: &ArgMatches) -> DrainTiming {
     };
     DrainTiming {
         lb_wait: seconds(LB_WAIT),
-        deadline: seconds(DEADLINE),
+        deadline: m.get_one::<u64>(DEADLINE).copied().map(Duration::from_secs),
     }
 }

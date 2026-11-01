@@ -132,6 +132,16 @@ impl Platform {
     }
 }
 
+/// What a lease was granted, as its `Start` carried it: the booking after the
+/// memory ladder and the floors, not the request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Booked {
+    /// Thousandths of a CPU.
+    pub cpu_millis: u64,
+    /// Bytes of memory.
+    pub memory_bytes: u64,
+}
+
 /// A lease whose `Start` was sent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Sent {
@@ -140,6 +150,9 @@ pub struct Sent {
     pub action: Digest,
     /// When the operation was queued and the `Start` sent.
     pub stamp: Stamp,
+    /// What the lease was granted; `None` for a lease taken up from the state store,
+    /// which was never started here.
+    pub booked: Option<Booked>,
 }
 
 /// A node that has registered.
@@ -196,6 +209,13 @@ impl FarmMachine {
         self.next_waiter += 1;
         self.waiters.insert(id, waiter);
         id
+    }
+
+    /// Records a caller that the scheduler core numbered (`id`), where
+    /// [`FarmMachine::submit`] numbers its own. A machine takes its callers from one or the
+    /// other, never both: `submit` does not skip the ids inserted here.
+    pub fn insert(&mut self, id: WaiterId, waiter: Waiter) {
+        self.waiters.insert(id, waiter);
     }
 
     /// The caller `id`, while it is kept.
@@ -411,6 +431,7 @@ mod tests {
                 queued: at(u64::from(n)),
                 started: at(u64::from(n) + 1),
             },
+            booked: None,
         }
     }
 
@@ -727,5 +748,17 @@ mod tests {
         let id = m.submit(waiter(1));
         assert_eq!(parse_stored_name(&m.name(id)), None);
         assert_eq!(m.named(&stored_name(OperationId(0))), None);
+    }
+
+    /// Asserts that a caller inserted under an id someone else chose is kept under that id
+    /// and forgotten with its finished operation like any other.
+    #[test]
+    fn a_caller_inserted_under_a_chosen_id_is_kept_and_forgotten_like_any_other() {
+        let mut m = FarmMachine::new(TERM);
+        m.insert(WaiterId(41), waiter(2));
+        assert_eq!(m.waiter(WaiterId(41)), Some(&waiter(2)));
+        m.keep_finished(OperationId(9), vec![WaiterId(41)]);
+        assert_eq!(m.forget_dropped(|_| false), vec![WaiterId(41)]);
+        assert_eq!(m.waiter(WaiterId(41)), None);
     }
 }

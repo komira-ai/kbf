@@ -13,7 +13,7 @@ use kbf_objstore::MemoryStore;
 use kbf_proto::update::UpdateStatus;
 use kbf_proto::update::update_status::State;
 use kbf_proto::worker::{NodeStatus, ServerMessage, XcodeState, XcodeStatus, daemon_message};
-use kbf_server::api::{DRAIN_DEADLINE, Write, write_request};
+use kbf_server::api::{NO_DRAIN_DEADLINE, Write, write_request};
 use kbf_server::farm::NodeAction;
 use kbf_server::fleet::SoftwareView;
 use kbf_server::proxy_auth::Caller;
@@ -88,9 +88,17 @@ fn listeners() -> Listeners {
         tick: Duration::from_millis(50),
         unservable_wait: kbf_sched::UNSERVABLE_WAIT,
         default_platform: kbf_front::DefaultPlatform::NONE,
+        qos_allowed: kbf_front::QosAllow::DEFAULT,
         memory_ladder: kbf_server::MemoryLadder::default(),
+        memory_climb: true,
         vm_host_floor: kbf_server::HostFloor::default(),
         learned_sizes: kbf_server::LearnedSizes::Off,
+        exclusive_actions: false,
+        scheduler_core: kbf_server::SchedulerCore::under_test(),
+        placement_load: kbf_server::PlacementLoad::Off,
+        placement_predictions: kbf_server::PlacementPredictions::Off,
+        usage_profiles: kbf_server::UsageProfiles::Off,
+        whole_node: None,
         finished_retention: kbf_sched::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
         streams: kbf_server::StreamTiming::default(),
@@ -367,9 +375,17 @@ async fn an_api_address_in_use_is_refused() {
         tick: Duration::from_millis(50),
         unservable_wait: kbf_sched::UNSERVABLE_WAIT,
         default_platform: kbf_front::DefaultPlatform::NONE,
+        qos_allowed: kbf_front::QosAllow::DEFAULT,
         memory_ladder: kbf_server::MemoryLadder::default(),
+        memory_climb: true,
         vm_host_floor: kbf_server::HostFloor::default(),
         learned_sizes: kbf_server::LearnedSizes::Off,
+        exclusive_actions: false,
+        scheduler_core: kbf_server::SchedulerCore::under_test(),
+        placement_load: kbf_server::PlacementLoad::Off,
+        placement_predictions: kbf_server::PlacementPredictions::Off,
+        usage_profiles: kbf_server::UsageProfiles::Off,
+        whole_node: None,
         finished_retention: kbf_sched::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
         streams: kbf_server::StreamTiming::default(),
@@ -722,6 +738,55 @@ async fn cordon_drain_and_uncordon_over_http() {
     server.stop().await;
 }
 
+/// Catches a drain with an empty body that is given a deadline (it was 30 minutes, after
+/// which the node paused), and one shown with a far-future timestamp: a node holds a lease
+/// and is drained with no body. The answer, `GET /v1/nodes` and `GET /v1/nodes/{id}` say
+/// `draining` with the lease and leave `deadline_unix_ms` out, `GET /v1/health` counts the
+/// node as draining, and the lease is not cut. Draining again with a deadline shows that
+/// deadline, and again with no body shows none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_drain_with_an_empty_body_has_no_deadline() {
+    let server = start();
+    let api = server.api;
+    let cell = Client::connect(server.reapi, server.worker).await;
+    let mut node = FakeDaemon::connect(server.worker, hello("linux-1", 8, 16))
+        .await
+        .expect("registered");
+    let job = Job::new("first", &[]);
+    cell.upload(&job.blobs()).await;
+    let _ops = cell.execute(&job.action).await;
+    let lease = node.start().await.lease_id.expect("a lease");
+    let lease_name = format!("{}.{}", lease.term, lease.seq);
+
+    let (code, view) = post(api, "linux-1:drain", "").await;
+    assert_eq!(code, 200, "{view}");
+    assert_eq!(
+        view["placement"],
+        json!({ "state": "draining", "leases": [lease_name] }),
+        "{view}"
+    );
+    let listed = nodes(api).await;
+    assert_eq!(listed["nodes"][0]["placement"], view["placement"]);
+    let (code, one) = http(api, "GET", "/v1/nodes/linux-1", "").await;
+    assert_eq!(code, 200, "{one}");
+    let one: Value = serde_json::from_str(&one).expect("JSON");
+    assert_eq!(one["placement"], view["placement"], "{one}");
+    let (code, health) = http(api, "GET", "/v1/health", "").await;
+    assert_eq!(code, 200, "{health}");
+    let health: Value = serde_json::from_str(&health).expect("JSON");
+    assert_eq!(health["nodes"]["draining"], 1, "{health}");
+    assert_eq!(node.cancelled().await, None, "a drain never cancels");
+
+    let (_, timed) = post(api, "linux-1:drain", "{\"deadline_secs\": 3600}").await;
+    assert!(
+        timed["placement"]["deadline_unix_ms"].is_u64(),
+        "a given deadline is shown: {timed}"
+    );
+    let (_, again) = post(api, "linux-1:drain", "").await;
+    assert_eq!(again["placement"], view["placement"], "{again}");
+    server.stop().await;
+}
+
 /// Catches: the loopback check removed or inverted (a remote caller could send the
 /// token in clear, or act without the proxy), and an IPv4 loopback peer seen through
 /// an IPv6 socket refused.
@@ -754,11 +819,26 @@ fn writes_are_accepted_only_from_loopback() {
     let local = "127.0.0.1:1";
     assert_eq!(
         write(local, "mac-1:drain", b"").map(|(_, a)| a),
-        Ok(NodeAction::Drain(DRAIN_DEADLINE))
+        Ok(NodeAction::Drain(NO_DRAIN_DEADLINE))
     );
     assert_eq!(
         write(local, "mac-1:drain", b"{\"deadline_secs\": 90}").map(|(_, a)| a),
         Ok(NodeAction::Drain(Duration::from_secs(90)))
+    );
+    // Any number of seconds is a deadline, none and a huge one included; only an empty
+    // body is no deadline.
+    assert_eq!(
+        write(local, "mac-1:drain", b"{\"deadline_secs\": 0}").map(|(_, a)| a),
+        Ok(NodeAction::Drain(Duration::ZERO))
+    );
+    assert_eq!(
+        write(
+            local,
+            "mac-1:drain",
+            b"{\"deadline_secs\": 18446744073709551615}"
+        )
+        .map(|(_, a)| a),
+        Ok(NodeAction::Drain(Duration::from_secs(u64::MAX)))
     );
     assert_eq!(
         write(local, "a:b:uncordon", b"").map(|(n, a)| (n.as_str().to_owned(), a)),

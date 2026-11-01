@@ -11,7 +11,7 @@ use kbf_state::{Cond, Txn};
 use kbf_types::OperationId;
 
 use super::{Durable, EPOCH, EpochBump, EpochPolicy, NEXT_OP, NEXT_SEQ, StateError, number};
-use crate::farm::State;
+use crate::farm::engine::Engine;
 
 /// How many operation ids, or lease sequences, one reservation takes from `meta/next_op`
 /// or `meta/next_seq`. A frontend writes the counter once for this many ids, so a block
@@ -137,11 +137,11 @@ impl Durable {
     }
 }
 
-impl State {
+impl Engine {
     /// Reserves the next block of lease sequences once the scheduler has fewer than
     /// [`SEQS_LOW`] left in its block, and gives it to the scheduler, which places no lease
     /// past the end of its block. Called at the start of every feed, after
-    /// [`State::watch_store`]: while the store is down nothing is placed, and the
+    /// [`Engine::watch_store`]: while the store is down nothing is placed, and the
     /// reservation waits for it. A reservation the store refuses is tried again at the
     /// next feed, and the scheduler places what is left of its block meanwhile.
     pub(in crate::farm) fn reserve_seqs(&mut self) {

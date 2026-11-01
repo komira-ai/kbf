@@ -1,0 +1,709 @@
+// kbf.worker.v1: the protocol between a kbf-daemon and kbf-server.
+//
+// Each daemon opens one outbound stream to any server front; no daemon listens on an
+// inbound port. The front relays the stream to the scheduler. Blob bytes never travel on
+// this stream: the daemon reads and writes the CAS over separate ByteStream connections.
+//
+// This is the first cut. Hello and Heartbeat carry what the scheduler needs to see a node
+// and to time its fence; Offer, LeaseOffer, Start and Result are placeholders whose
+// fields will grow with the scheduler and the daemon. A server accepts protocol versions
+// N-1 and N.
+//
+// Additions within version 1 (a daemon that ignores them keeps working):
+// - ResultAck: the server's answer to a Result.
+// - ResourceUsage: what an action used, carried inside its ActionResult.
+// - Start.heartbeat_seq and Start.valid_for_ms: how late a Start may still be acted on.
+// - Cancel: the server stops a lease it no longer holds on the daemon.
+// - NodeStatus: what software the node runs, for operators; it routes no work.
+// - Welcome.epoch and Result.action_digest: a lease id never names leases of two server
+//   processes, and a Result answers only the action its Start named (issue #137).
+// - Hello.instance_id: which daemon process registered the node (issue #140).
+// - NodeStatus.xcodes: every installed Xcode with its readiness (issue #164); a daemon
+//   resends Hello and NodeStatus mid-stream when an Xcode becomes ready or stops being so.
+// - Result.memory_kill: which memory ran out when a lease was killed for memory
+//   (docs/design/failure-classes.md, 6.1). The native and container drivers set it; a
+//   Result without it is read as before.
+// - Hello.phase: what the node is doing besides running leases: switching a Mac's GUI
+//   session for a whole-machine lease, or quarantined (docs/design/worker-protocol.md,
+//   "Node phases"). A Hello without it is a serving node, as before.
+// - DaemonMessage.update_status, ServerMessage.update_offer and update_order: pull-based
+//   self-update (kbf.update.v1, docs/design/pull-updates.md). A server that predates
+//   them ignores update_status; a daemon that predates them ignores the others.
+// - ResourceUsage.footprint, .basis, .node_cpu_pressure_centi and .booked_millicpus: the
+//   macOS footprint block, which instrument measured, and the CPU evidence the size
+//   estimator reads. Each is absent from a peer that predates it, and absent means no
+//   report (a reader never reads absent as zero); a peer that predates them skips the
+//   unknown fields.
+// - ResultAck.reason: why a Result was or was not accepted. A daemon that predates it
+//   reads `accepted`; a server that predates it leaves the reason unspecified, which a
+//   daemon takes as "acknowledged: forget the Result".
+//
+// A Result carries no attempt number: the lease id is the attempt. A lease id is unique
+// per grant and a re-grant of the same operation gets a new one, so a Result of an
+// earlier attempt names a lease the server no longer holds (ResultAck STALE).
+//
+// A server acknowledges a Result only after the state store holds the row that records
+// it; a daemon that keeps the Result until its ack resends it on the next stream.
+//
+// Welcome.protocol_version is the lesser of the Hello's version and the newest the server
+// speaks, when the Hello's is not below the oldest the server accepts (a Hello below it is
+// refused FAILED_PRECONDITION). A Hello in the server's range is answered with its own
+// version, which a daemon of that version requires. A daemon accepts a Welcome from the
+// oldest version it speaks up to the version its Hello named, never above.
+syntax = "proto3";
+
+package kbf.worker.v1;
+
+import "build/bazel/remote/execution/v2/remote_execution.proto";
+import "google/rpc/status.proto";
+import "kbf/map/v1/map.proto";
+import "kbf/update/v1/update.proto";
+
+// The service a kbf-server front exposes to daemons.
+service Worker {
+  // The daemon's session. The daemon's first message is Hello; the server answers
+  // Welcome or ends the stream with an error status. While the stream is open the
+  // daemon sends a Heartbeat at the interval Welcome names.
+  rpc Session(stream DaemonMessage) returns (stream ServerMessage);
+}
+
+// Everything a daemon sends.
+message DaemonMessage {
+  oneof message {
+    Hello hello = 1;
+    Heartbeat heartbeat = 2;
+    Offer offer = 3;
+    Result result = 4;
+    NodeStatus node_status = 5;
+    MapRequest map_request = 6;
+    // What the host's update is doing (docs/design/pull-updates.md); sent on every change.
+    kbf.update.v1.UpdateStatus update_status = 7;
+  }
+}
+
+// Everything the server sends.
+message ServerMessage {
+  oneof message {
+    Welcome welcome = 1;
+    HeartbeatAck heartbeat_ack = 2;
+    Start start = 3;
+    LeaseOffer lease_offer = 4;
+    ResultAck result_ack = 5;
+    Cancel cancel = 6;
+    MapUpdate map_update = 7;
+    // Reserved for a release offer. The frontend no longer sends it, and a daemon ignores it.
+    kbf.update.v1.UpdateOffer update_offer = 8;
+    // The frontend's order of the rollout to this host.
+    kbf.update.v1.UpdateOrder update_order = 9;
+  }
+}
+
+// One entry of a node report, for example `arch` = `x86_64` or `drivers` = `container`.
+// A list-valued capability (`isa_level`, `cpu.features`, `drivers`) repeats its key, one
+// entry per value.
+message Capability {
+  string key = 1;
+  string value = 2;
+}
+
+// The first message of a session, and resent whenever the node report changes.
+//
+// Only the first Hello of a stream registers the node: it opens a new session, and the
+// server sends Start messages for this node on this stream from then on. A Hello resent
+// on the same stream changes the node report, and with it the capacity placement sees,
+// and nothing else (issue #25). The server reads the capacity from the `cpus` and
+// `mem_gib` entries, which a Hello must carry, and the GPU count from its `gpu` entry
+// (0 when absent).
+message Hello {
+  // The protocol version the daemon speaks. This file defines version 1.
+  uint32 protocol_version = 1;
+  // A stable name for the node, unique within the cell. Under mutual TLS it must
+  // equal the one DNS subjectAltName of the daemon's client certificate, in this and
+  // every later Hello on the stream (docs/design/worker-protocol.md).
+  string node_id = 2;
+  // The daemon's own version string, for logs and the UI.
+  string daemon_version = 3;
+  // The node report: what the daemon detected about this machine. Sorted by key,
+  // then value, so equal reports encode to equal bytes.
+  repeated Capability capabilities = 4;
+  // SHA-256 of the encoded `capabilities` entries, in order. Heartbeats repeat it so
+  // the server notices a changed report without receiving the report again.
+  bytes report_hash = 5;
+  // Names the daemon process: drawn at random when the daemon starts, the same in
+  // every Hello it sends on every stream, and kept across a restart only for the next
+  // daemon to name as its predecessor (predecessor_instance_id). The server
+  // gives up at once a lease the daemon's new stream leaves out only if that lease's
+  // Start went to the same process; one that went to another process (a restarted
+  // daemon, or a second one holding this node's certificate) is given up once that
+  // process has fenced (docs/design/worker-protocol.md, issue #140). Empty (a daemon
+  // that predates this field): every registration is taken as another process's.
+  string instance_id = 6;
+  // What the node is doing besides running leases. The daemon resends Hello when it
+  // changes. Unset is serving.
+  NodePhase phase = 7;
+  // The instance_id of the daemon process that ran on this node before this one, read
+  // from the file it left in the lease scratch directory. Sent only once this
+  // process's drivers have swept that directory, killing every run the predecessor
+  // left, so it says the predecessor's runs are dead. The server then gives up at
+  // once, not after the handover grace, the leases whose Start went to that process,
+  // if it is the process the node's previous stream came from and that stream has
+  // closed (docs/design/worker-protocol.md). Empty: no predecessor known (the first
+  // start, or a daemon without a scratch directory).
+  string predecessor_instance_id = 8;
+}
+
+// The phases of a node (docs/design/fleet-updates.md, 3.3).
+enum Phase {
+  // It takes leases.
+  PHASE_SERVING = 0;
+  // It switches the Mac's GUI session to the user of the whole-machine lease
+  // `lease_id`, which it holds, then runs its action there. The switch is a userspace
+  // restart, which ends the daemon too. The server keeps the lease while the node is
+  // silent, for longer than the lease grace, and sends its Start again on the stream
+  // of the Hello that names it after the restart. A daemon restarted after the action
+  // started never runs it again: it says PHASE_RESTORING.
+  PHASE_PREPARING = 1;
+  // It switches the session back after the whole-machine lease `lease_id` ended (or
+  // after the daemon restarted while its action ran: the action's processes are
+  // killed and the lease's Result says LOST_DAEMON_RESTARTED, which the server runs
+  // again) and cleans up; the lease's Result is sent when that is done. Kept the same
+  // way.
+  PHASE_RESTORING = 2;
+  // A cleanup failed (`reason` says which): the node takes no lease until an
+  // operator repairs it. The server lists it for attention.
+  PHASE_QUARANTINED = 3;
+  // The node's memory is under pressure (the kernel's memory stall time is above the
+  // daemon's `--memory-pressure-pause-percent`) and it holds leases: it takes no new
+  // lease until the pressure falls, and keeps the ones it runs. The daemon says it
+  // only while it holds a lease, and resends Hello with PHASE_SERVING when the pressure
+  // falls or its last lease ends. A server that does not know this value reads it as a
+  // quarantine, which also takes no lease.
+  PHASE_MEMORY_PRESSURE = 4;
+  // The daemon was told to stop (SIGTERM or SIGINT) and is draining: it takes no new
+  // lease, runs the ones it holds to their end, reports their Results and waits for
+  // their ResultAcks, then exits. The server keeps its leases, and its heartbeats keep
+  // the node in contact as usual; it is not lost and nothing is requeued. A server that
+  // does not know this value reads it as a quarantine, which also takes no lease.
+  PHASE_DRAINING = 5;
+}
+
+message NodePhase {
+  Phase phase = 1;
+  // The whole-machine lease of PHASE_PREPARING and PHASE_RESTORING.
+  LeaseId lease_id = 2;
+  // Why the node is quarantined.
+  string reason = 3;
+}
+
+// What software the node runs: status for operators and the fleet API, never matched
+// against an action's platform, so it is kept out of the node report and its hash.
+// The daemon sends it right after each Welcome, and again when its Xcodes change. The
+// server keeps the newest one per node; a server that predates this message ignores
+// it, and a node that never sends one is listed without software. An empty string, or
+// an empty list, means not known on this node.
+message NodeStatus {
+  // The operating system's name: `macOS` (`sw_vers -productName`), or the
+  // `os-release` NAME on Linux (`Ubuntu`).
+  string os_name = 1;
+  // Its version: `sw_vers -productVersion` (`15.1`), or the `os-release` VERSION_ID.
+  string os_version = 2;
+  // Its build: `sw_vers -buildVersion` (`24B83`), or the `os-release` BUILD_ID where
+  // the distribution sets one.
+  string os_build = 3;
+  // The running kernel's release (`uname -r`). Linux only.
+  string kernel = 4;
+  // The kbf-daemon version.
+  string daemon_version = 5;
+  // The Xcode builds actions can use here (Mac): the node report's `xcode` entries,
+  // sorted. Only these route work; an Xcode that is installed but not ready is in
+  // `xcodes` only.
+  repeated string xcode_builds = 6;
+  // Every installed Xcode (Mac), ready or not, in app-name order, with why one is not
+  // ready and how to make it so (issue #164). Empty from a daemon that predates this
+  // field, and on Linux. The daemon sends NodeStatus again when this changes.
+  repeated XcodeStatus xcodes = 7;
+  // The container images the daemon was pinned to (`--image`, container driver), as
+  // `docker://<repo>@sha256:<digest>`, sorted, each checked present in the node's
+  // image store, as one architecture's manifest, when the daemon started. A daemon that
+  // finds one missing does not start. Status only: no work is placed by image. Empty
+  // when none is pinned, and from a daemon that predates this field.
+  repeated string container_images = 8;
+}
+
+// One Xcode installed on a Mac, as the daemon last found it.
+message XcodeStatus {
+  // The app as found in the directory the daemon searches
+  // (`/Applications/Xcode_16.2.app`).
+  string app = 1;
+  // Its build (`16C5032a`); empty when `xcodebuild -version` did not say.
+  string build = 2;
+  // Whether actions can use it, and if not, why.
+  XcodeState state = 3;
+  // Why it is not ready, in the words of the check that failed (for example
+  // `xcodebuild -license check` exited 69: "You have not agreed to the Xcode license
+  // agreements."). Empty when ready.
+  string reason = 4;
+  // The command that makes it ready, when one is known (for example `sudo
+  // /Applications/Xcode_16.2.app/Contents/Developer/usr/bin/xcodebuild -license
+  // accept`). Empty when ready or when no single command is known.
+  string fix = 5;
+}
+
+// Whether an installed Xcode can run actions. Only READY is advertised for placement.
+enum XcodeState {
+  // Not set (a daemon that sent a state this server does not know).
+  XCODE_STATE_UNSPECIFIED = 0;
+  // It answered every check; its build is in `xcode_builds`.
+  XCODE_STATE_READY = 1;
+  // `xcodebuild -license check` failed: an administrator must accept the licence.
+  XCODE_STATE_LICENSE_NOT_ACCEPTED = 2;
+  // `xcodebuild -checkFirstLaunchStatus` failed: its first launch was not run.
+  XCODE_STATE_FIRST_LAUNCH_NOT_RUN = 3;
+  // The node requires the Metal toolchain and this Xcode has none installed.
+  XCODE_STATE_METAL_TOOLCHAIN_MISSING = 4;
+  // Another check failed (no build, no compiler, no answer in time).
+  XCODE_STATE_FAILED = 5;
+  // Found, not asked yet: the daemon says Hello before its first survey of the Xcodes
+  // ends, and sends Hello and NodeStatus again when it does. Not advertised; nothing
+  // for an administrator to do.
+  XCODE_STATE_NOT_SURVEYED = 6;
+}
+
+// The server's answer to Hello.
+message Welcome {
+  // The protocol version the server will speak on this stream.
+  uint32 protocol_version = 1;
+  // How often the daemon sends a Heartbeat, in milliseconds.
+  uint64 heartbeat_interval_ms = 2;
+  // The lease epoch: names the record of leases this server answers for. A lease the
+  // daemon was granted under another epoch is one this server never granted and will
+  // never accept a Result for, so the daemon stops its run and forgets its Result
+  // without sending it. A single-node server keeps its leases in its own process, so
+  // each process has its own epoch, equal to the term of every lease it grants
+  // (docs/design/worker-protocol.md, "Server restarts"). 0 means not named (a server
+  // that predates this field): the daemon then forgets nothing.
+  uint64 epoch = 3;
+  // The storage map the frontend holds now (docs/design/architecture-v2.md, section 6).
+  // Absent from a server that holds none (a farm of one member): the daemon then routes
+  // by no map. A daemon keeps the newest map it was sent, whichever message brought it,
+  // and ignores one that is not newer than the one it holds.
+  kbf.map.v1.Map map = 4;
+  // True when this frontend takes `kbf.worker.v1.PackIndex/CommitPack`: it has the pack index
+  // and the pack store, and checks a sample of the blobs of a pack before it records the pack.
+  // A daemon should send CommitPack only to a frontend that says so; false (also from a
+  // frontend that predates the field) leaves the daemon on the member path.
+  bool pack_commit = 5;
+}
+
+// The storage map changed. Sent on the session each time the frontend's map changes,
+// whole (never a difference), with the newest map at the time it is sent: a map change
+// that follows another quickly may be sent as the later one alone. A receiver that
+// misses one is not harmed: it learns the map from the next Welcome, from the answer to
+// a MapRequest, or from the next MapUpdate.
+message MapUpdate {
+  kbf.map.v1.Map map = 1;
+}
+
+// A daemon asks for the map. Sent when a storage node answered STALE_MAP naming a map
+// newer than the daemon's. The server answers with a MapUpdate of the map it holds now,
+// which may be older than at_least when this frontend has not seen that map yet: the
+// daemon then goes on waiting, and a later MapUpdate reaches it. A server that holds no
+// map does not answer.
+message MapRequest {
+  // The generation a storage node named. Informational: the server answers with its
+  // current map whatever the value.
+  uint64 at_least = 1;
+}
+
+// A lease: a numbered permission to run, ordered by (term, seq).
+message LeaseId {
+  // The scheduler term that granted the lease. No two server processes grant leases
+  // of one term: a single-node server picks a new term at every start.
+  uint64 term = 1;
+  // The lease's sequence number within that term.
+  uint64 seq = 2;
+}
+
+// Sent by the daemon at the interval Welcome names.
+message Heartbeat {
+  // Increases by one with each heartbeat on a stream; the server echoes it in
+  // HeartbeatAck. A daemon that fences counts from its newest acknowledged heartbeat.
+  uint64 seq = 1;
+  // Equal to the report_hash of the newest Hello.
+  bytes report_hash = 2;
+  // The leases this daemon is running now.
+  //
+  // Contract: the server requeues a lease granted to an earlier stream as soon as
+  // a heartbeat on the new stream leaves it out. A restarted daemon must therefore
+  // finish re-adopting its lease units before it sends its first Heartbeat on the
+  // new stream, and list every unit it re-adopted; otherwise a unit still running
+  // within its self-fence window is requeued at once and runs twice. Issue #26:
+  // this set must also include leases whose result is not yet acknowledged.
+  // Issue #25: only the first Hello of a stream registers the worker again.
+  repeated LeaseId running = 3;
+  // What this daemon's pack reads did since the daemon process started. Present only
+  // when the daemon reads packs (`--pack-read`): a daemon that does not, or one built
+  // before the field, sends none, and a server built before it skips the field.
+  PackReadCounts pack_reads = 4;
+  // What this daemon's pack writes did since the daemon process started. Present only
+  // when the daemon writes packs (`--pack-write`): a daemon that does not, or one built
+  // before the field, sends none, and a server built before it skips the field.
+  PackWriteCounts pack_writes = 5;
+}
+
+// The counts of a daemon's pack reads, cumulative since the daemon process started (they
+// start again from 0 when it restarts). Each read of a blob by digest (for a lease's
+// action, input tree or input files) adds 1 to exactly one of served, elsewhere, unasked,
+// lost and damaged; served_bytes adds the bytes of a served blob.
+message PackReadCounts {
+  // Reads answered from a pack.
+  uint64 served = 1;
+  // The bytes of the blobs those reads returned.
+  uint64 served_bytes = 2;
+  // Reads of a blob no pack holds (or that is not asked of the packs), or from a
+  // frontend that serves no locations: the read went to the storage nodes, as it did
+  // before packs.
+  uint64 elsewhere = 3;
+  // Reads that went to the storage nodes because the packs could not be asked (the
+  // index or the object store failed).
+  uint64 unasked = 4;
+  // Reads that failed because the pack the index points at is gone or too short.
+  uint64 lost = 5;
+  // Reads that failed because the bytes in the pack are not the digest.
+  uint64 damaged = 6;
+}
+
+// The counts of a daemon's pack writes, cumulative since the daemon process started (they
+// start again from 0 when it restarts). The unit is the blob, not the call: each blob of a
+// put of outputs is either in a committed pack (packs, packed, packed_bytes) or written to the
+// storage nodes instead, and adds 1 to exactly one of the fallback counts.
+message PackWriteCounts {
+  // Packs committed: stored, and recorded by the frontend.
+  uint64 packs = 1;
+  // Blobs in those packs.
+  uint64 packed = 2;
+  // The bytes of those packs, footers included.
+  uint64 packed_bytes = 3;
+  // Blobs written to the storage nodes because packing was off: the frontend did not say it
+  // takes pack commits, or a commit was answered UNIMPLEMENTED earlier.
+  uint64 fallback_off = 4;
+  // Blobs written to the storage nodes because they do not fit a pack: over the largest blob a
+  // pack holds, not a SHA-256 digest, or over the in-flight budget.
+  uint64 fallback_unfit = 5;
+  // Blobs written to the storage nodes because the commit was answered UNIMPLEMENTED.
+  uint64 fallback_unsupported = 6;
+  // Blobs written to the storage nodes because the commit was refused for a reason a repeat
+  // does not change.
+  uint64 fallback_refused = 7;
+  // Blobs written to the storage nodes because the object store failed the put of the pack.
+  uint64 fallback_store = 8;
+  // Blobs written to the storage nodes because the commit failed for a reason a repeat may pass.
+  uint64 fallback_record = 9;
+  // Blobs written to the storage nodes because the pack index failed before the pack was
+  // written.
+  uint64 fallback_index = 10;
+  // Digests of a find-missing question that the pack index answered for.
+  uint64 missing_indexed = 11;
+  // Digests of a find-missing question that went to the storage nodes whole because the pack
+  // index could not be asked.
+  uint64 missing_unasked = 12;
+}
+
+// The server's acknowledgement of a Heartbeat.
+message HeartbeatAck {
+  // The seq of the acknowledged Heartbeat.
+  uint64 seq = 1;
+}
+
+// Placeholder, not read by the server yet. The capacity the daemon offers for actions
+// now, after its protected floors. Resources are not capabilities: there are no slots.
+message Offer {
+  // Free CPU, in thousandths of a CPU.
+  uint64 millicpus = 1;
+  // Free memory, in bytes.
+  uint64 memory_bytes = 2;
+}
+
+// Placeholder. The scheduler has placed a lease on this daemon but not yet committed
+// it. The daemon may prepare for it (fetch inputs) and must not run anything: work
+// starts only on Start, which the scheduler sends after the lease commits. An offer
+// that is never followed by a Start lapses; a Start needs no earlier offer.
+message LeaseOffer {
+  LeaseId lease_id = 1;
+  // The lease kind, as in Start.
+  string kind = 2;
+  // The action the lease would run.
+  build.bazel.remote.execution.v2.Digest action_digest = 3;
+}
+
+// Placeholder. The server tells the daemon to run one lease. The scheduler commits the
+// lease before it sends Start.
+message Start {
+  LeaseId lease_id = 1;
+  // The lease kind, the value of the reserved platform key `kbf-lease`: `action` or
+  // `whole_machine` (planned: `vm`). The server places a kind only on a daemon whose
+  // Hello lists a `drivers` entry serving it; the daemon still refuses a kind it has no
+  // driver for. A `whole_machine` lease books the daemon's whole capacity, which
+  // millicpus and memory_bytes then carry.
+  string kind = 2;
+  // The action to run. Its inputs are fetched from the CAS.
+  build.bazel.remote.execution.v2.Digest action_digest = 3;
+  // What the scheduler booked for the lease on this daemon: CPU in thousandths of a
+  // CPU. The container driver turns it into the lease's cpu.weight. 0 means not booked.
+  uint64 millicpus = 4;
+  // Memory booked for the lease, in bytes. The container driver sets the lease's soft
+  // limit (memory.high) from it; there is no hard per-lease cap. 0 means not booked.
+  uint64 memory_bytes = 5;
+  // The newest Heartbeat of this stream the server had taken when it sent this Start,
+  // by its seq; 0 when it had taken none, which names the stream's Hello instead.
+  uint64 heartbeat_seq = 6;
+  // How long after the daemon sent that Heartbeat (or Hello) it may still act on this
+  // Start, in milliseconds. The server sent the Start after it took the Heartbeat, so
+  // a Start the daemon receives within this window was in flight for less than it,
+  // measured on the daemon's clock alone. A daemon refuses a Start that arrives later,
+  // or that names a seq it did not send on this stream: it does not run it, sends no
+  // Result and does not list it, so the scheduler gives the lease up as a Start that
+  // never arrived. The bound keeps a late Start from running beside the retry of its
+  // lease. 0 means no bound (a server that predates this field).
+  uint64 valid_for_ms = 7;
+  // The iOS device the scheduler booked for the lease, by its id (the UDID) as the
+  // daemon's `ios.device` Hello entry names it; empty when the action asked for none
+  // (`ios.device=1`). The server books a device only on a daemon whose Hello lists one,
+  // so a daemon that predates this field, and would drop it, is never sent one. A
+  // booked device is the lease's alone until the lease ends.
+  string device_id = 8;
+}
+
+// The server no longer holds this lease on the daemon (it gave the lease up and the
+// operation may already run elsewhere), yet the daemon's Heartbeat lists it. The daemon
+// stops the lease if it is running; its run ends like any killed run, with a Result
+// the server refuses. A lease the daemon is not running is ignored. The server sends a
+// Cancel for every Heartbeat that lists such a lease, so a lost Cancel is sent again.
+message Cancel {
+  LeaseId lease_id = 1;
+}
+
+// Placeholder. The outcome of one lease. The server accepts at most one Result for an
+// operation, only from the node that holds the operation's current lease, and only
+// for the action that lease runs (action_digest, when set); it
+// answers each Result with a ResultAck. An OK result's outputs (every output file,
+// stdout and stderr, every output tree and the files it names) must already be in the
+// CAS, or the result is taken as an infrastructure failure. The server writes an
+// accepted OK result with exit code 0 to the action cache, unless the action is
+// `do_not_cache`, before it answers the operation's callers.
+message Result {
+  LeaseId lease_id = 1;
+  // OK when the action ran, whatever its exit code; otherwise why it could not run.
+  google.rpc.Status status = 2;
+  // The action's result when status is OK. Its outputs are already in the CAS. With
+  // DEADLINE_EXCEEDED, the partial result REAPI allows: the stdout and stderr the
+  // action wrote before it was stopped, already in the CAS; the server keeps only those
+  // two digests and never caches it. Unset with any other status.
+  build.bazel.remote.execution.v2.ActionResult action_result = 3;
+  // The action_digest of the Start this Result answers, as the Start carried it. The
+  // server refuses a Result whose action_digest is set and is not the action of the
+  // operation it granted the lease for. Unset: not checked (a daemon that predates
+  // this field, or a lease whose Start the daemon never saw).
+  build.bazel.remote.execution.v2.Digest action_digest = 4;
+  // Why the lease was killed, when it was killed for memory. Read only on a Result
+  // whose status is not OK, and then in place of the status code: the server runs the
+  // action again (docs/design/failure-classes.md, 6.1). Unspecified: not killed for
+  // memory, or not known, and the status code alone decides.
+  MemoryKill memory_kill = 5;
+  // How the farm lost the run, when it did: the daemon restarted while the action ran,
+  // or the node fenced it. Read only on a Result whose status is not OK, and then in
+  // place of the status code: the server runs the action again, preferring another
+  // node, while the operation's farm reruns last (docs/design/failure-classes.md,
+  // 6.5). The daemon sends it with UNAVAILABLE, which a server that predates this
+  // field takes as the farm's failure. Unspecified: not lost.
+  Lost lost = 6;
+}
+
+// How the farm lost a lease's run.
+enum Lost {
+  // Not lost, or not known.
+  LOST_UNSPECIFIED = 0;
+  // The daemon restarted while the action ran: the restarted daemon killed what was
+  // left of it before its Hello, and its result is gone (a whole-machine lease, whose
+  // record outlives the daemon).
+  LOST_DAEMON_RESTARTED = 1;
+  // The node lost contact with the server and fenced (killed) the run: no heartbeat
+  // was acknowledged within the self-fence time T.
+  LOST_FENCED = 2;
+}
+
+// Which memory ran out when a lease was killed for it.
+enum MemoryKill {
+  // Not killed for memory, or not known.
+  MEMORY_KILL_UNSPECIFIED = 0;
+  // The action passed its own memory limit, and was killed for it: the native
+  // driver's memory watch, the kernel's OOM killer at the container lease's cap, or
+  // the container driver's swap watch at that cap. The booking was too small: the
+  // server runs it again with its memory booking doubled, up to the largest node, and
+  // remembers the raised booking for its action key; at the largest node it answers
+  // the client that the action needs more memory than any node offers.
+  MEMORY_KILL_OWN_LIMIT = 1;
+  // The node killed it for memory while it was under its own limit: a node-wide
+  // out-of-memory kill, or the node's backstop for all actions. The busy node's fault,
+  // not the booking's: the server runs it again with the same booking and counts the
+  // kill against the node. It never raises the booking.
+  MEMORY_KILL_NODE_PRESSURE = 2;
+}
+
+// The server's answer to a Result. The daemon may forget the Result on any ResultAck for
+// its lease. Until a daemon receives one, it resends the Result on its next stream and
+// lists the lease in Heartbeat.running (issue #26). The server sends it only once the
+// state store holds the record of the result.
+message ResultAck {
+  LeaseId lease_id = 1;
+  // Whether this Result became the operation's result, or was a memory kill the server
+  // took (memory_kill set: the operation runs again, or is answered). False when the lease is
+  // unknown, held by another node, or no longer the operation's current lease (it was
+  // given up and granted again), and for a copy of a Result that was already accepted
+  // (its operation is finished). A refused result is never written to the action
+  // cache. Either way the daemon may forget the Result.
+  bool accepted = 2;
+  // Why. Unspecified from a server that predates the field: read `accepted`.
+  ResultAckReason reason = 3;
+}
+
+// Why the server answered a Result as it did.
+enum ResultAckReason {
+  // Not said.
+  RESULT_ACK_REASON_UNSPECIFIED = 0;
+  // The Result became the operation's result (or a memory kill or lost run it took).
+  RESULT_ACK_REASON_ACCEPTED = 1;
+  // The operation is already answered: the first valid Result won, and this is a copy.
+  RESULT_ACK_REASON_DUPLICATE = 2;
+  // The lease was given up or granted again, or this node does not hold it: the Result
+  // is of an earlier attempt. It never reaches the action cache.
+  RESULT_ACK_REASON_STALE = 3;
+  // The server knows no such lease: an unknown one, or one of another lease epoch.
+  RESULT_ACK_REASON_UNKNOWN_LEASE = 4;
+  // The Result names an action other than the one its lease runs.
+  RESULT_ACK_REASON_MISMATCH = 5;
+}
+
+// What one action used, as the runtime that ran it measured it: an input to
+// accounting (docs/design/scheduler.md#accounting). The daemon carries it in the action's
+// `ActionResult.execution_metadata.auxiliary_metadata`, as an `Any` whose type URL is
+// `type.googleapis.com/kbf.worker.v1.ResourceUsage`, so it travels with the result to
+// the server and into the action cache. Zero in a field means not measured.
+message ResourceUsage {
+  // CPU time in user mode, in microseconds, of the action and of every process it
+  // waited for.
+  uint64 cpu_user_micros = 1;
+  // CPU time the kernel spent on the action's behalf, in microseconds.
+  uint64 cpu_system_micros = 2;
+  // The largest resident memory of any one process of the action, in bytes (for a
+  // runtime that gives the action a cgroup, the cgroup's `memory.peak`; for the macOS
+  // native driver, the sum over the action's processes of each one's lifetime peak
+  // physical footprint, the same number as `footprint.peak_footprint_bytes`).
+  uint64 peak_memory_bytes = 3;
+  // Wall time from the action's start to its exit, in microseconds.
+  uint64 wall_micros = 4;
+  // What the lease's own cgroup (v2) counted, for a runtime that gives each action
+  // one. Absent for a runtime that does not, so a reader that predates this field
+  // sees the four above unchanged.
+  CgroupUsage cgroup = 5;
+  // What the macOS native driver measured: a phys_footprint high-water mark and the
+  // CPU time of the lease's uid. Absent for a runtime that does not report it (every
+  // Linux runtime), so a reader that predates this field sees the fields above
+  // unchanged. Set together with `basis = USAGE_BASIS_MAC_FOOTPRINT`, never beside a
+  // `cgroup` block.
+  FootprintUsage footprint = 6;
+  // Which instrument produced the memory numbers above, so a footprint peak and a cgroup
+  // `memory.peak` are never pooled: they count different memory. A runtime that measures
+  // memory sets it; it is never inferred from which block is present. Unspecified from a
+  // runtime that predates the field, or one whose numbers are not a memory sample (the
+  // daemon's own `wait4` figures): a reader makes no memory sample of such a report.
+  UsageBasis basis = 7;
+  // The node's CPU pressure when the lease started: the `some avg10` of
+  // `/proc/pressure/cpu`, in hundredths of a percent (1234 is 12.34%). Absent when the
+  // runtime did not read it (no pressure stall information, or a runtime that does not
+  // try); absent is not zero. A sample of CPU use taken on a busy node understates what
+  // the action needs, and this says how busy it was.
+  optional uint32 node_cpu_pressure_centi = 8;
+  // The CPU the scheduler booked for the lease, in thousandths of a CPU (the Start's
+  // `millicpus`). Absent when the runtime did not report it.
+  optional uint64 booked_millicpus = 9;
+}
+
+// The instrument that produced a ResourceUsage. Closed: a new instrument is a new value,
+// and a reader that does not know it reads it as unspecified.
+enum UsageBasis {
+  // Not said: a runtime that predates the field, or one with no memory sample.
+  USAGE_BASIS_UNSPECIFIED = 0;
+  // The lease's cgroup v2 counters (`CgroupUsage`).
+  USAGE_BASIS_CGROUP = 1;
+  // macOS physical footprint and per-uid CPU time (`FootprintUsage`).
+  USAGE_BASIS_MAC_FOOTPRINT = 2;
+}
+
+// What the macOS native driver measured for a lease. A field that is absent was not
+// readable: absent is not zero. Measurement only: nothing in scheduling reads these.
+// The peak is `phys_footprint`, which counts compressed and dirty pages; it is not
+// comparable with a cgroup's `memory.peak` and must not be pooled with it.
+message FootprintUsage {
+  // The highest physical footprint the lease's process tree reached, in bytes.
+  optional uint64 peak_footprint_bytes = 1;
+  // CPU time in user mode of every process the lease's uid ran, in microseconds.
+  optional uint64 cpu_user_micros = 2;
+  // CPU time in system mode of every process the lease's uid ran, in microseconds.
+  optional uint64 cpu_system_micros = 3;
+  // Wall time from the action's start to its exit, in microseconds.
+  optional uint64 wall_micros = 4;
+}
+
+// The counters of a lease's cgroup v2, read when the action ended. A field that is
+// absent was not readable (no cgroup v2, or a controller not enabled): absent is not
+// zero. Measurement only: nothing in scheduling reads these.
+message CgroupUsage {
+  // `cpu.stat` usage_usec, user_usec and system_usec: CPU time of every process in
+  // the cgroup, in microseconds.
+  optional uint64 cpu_usage_micros = 1;
+  optional uint64 cpu_user_micros = 2;
+  optional uint64 cpu_system_micros = 3;
+  // `cpu.stat` nr_periods, nr_throttled and throttled_usec: the CFS bandwidth
+  // periods the cgroup ran in, those it was throttled in, and the time it spent
+  // throttled. Zero without a `cpu.max` quota, which kbf does not set.
+  optional uint64 cpu_periods = 4;
+  optional uint64 cpu_throttled_periods = 5;
+  optional uint64 cpu_throttled_micros = 6;
+  // `memory.peak`: the most memory the cgroup held at once, in bytes.
+  optional uint64 memory_peak_bytes = 7;
+  // `memory.numa_stat` anon + file per NUMA node, in bytes, of the sample with the
+  // most memory (the action's end, or an earlier sample while it ran: anon memory is
+  // gone once the processes have exited). Empty when not readable.
+  repeated NumaNodeBytes numa = 8;
+  // `memory.events` `max`: how many times usage reached the lease's `memory.max`. Above
+  // zero, `memory_peak_bytes` is a floor on what the action needed, not the need (the
+  // lease was reclaimed or swapped at its limit): the sample is censored.
+  optional uint64 memory_events_max = 9;
+  // `memory.events` `oom_kill`: processes of the lease the kernel OOM killer killed.
+  optional uint64 memory_events_oom_kill = 10;
+  // `memory.swap.peak`, in bytes: the most swap the lease held at once. Absent on a
+  // kernel before 6.5, which has no such file.
+  optional uint64 memory_swap_peak_bytes = 11;
+  // The largest anon + swap (`memory.stat` anon plus `memory.swap.current`) of any sample
+  // taken while the action ran, in bytes: what the action touched without the page
+  // cache `memory_peak_bytes` counts. A sample every second, so a floor on the true peak.
+  // Absent when either file was unreadable at every sample.
+  optional uint64 memory_anon_swap_peak_bytes = 12;
+  // `cpu.pressure` `some` total, in microseconds: how long some task of the lease waited
+  // for a CPU while it ran. Absent without pressure stall information.
+  optional uint64 cpu_pressure_some_micros = 13;
+  // `memory.pressure` `some` and `full` totals, in microseconds: how long some task, and
+  // every task, of the lease stalled on memory.
+  optional uint64 memory_pressure_some_micros = 14;
+  optional uint64 memory_pressure_full_micros = 15;
+  // How many CPUs the lease's cgroup could run on (`cpuset.cpus.effective`): fewer than
+  // the node's for a lease placed on one NUMA node. Absent when not readable.
+  optional uint32 cpus_effective = 16;
+}
+
+// Bytes of one NUMA node.
+message NumaNodeBytes {
+  uint32 node = 1;
+  uint64 bytes = 2;
+}

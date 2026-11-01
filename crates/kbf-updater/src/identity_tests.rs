@@ -32,7 +32,12 @@ fn strings(items: &[&str]) -> Vec<String> {
 /// subjectAltNames.
 #[test]
 fn an_updater_certificate_names_its_host_and_its_host_role() {
-    for role in HostRole::ALL {
+    for role in [
+        HostRole::FRONTEND,
+        HostRole::STORAGE,
+        HostRole::DAEMON,
+        HostRole::MAC_DAEMON,
+    ] {
         let host_role = format!("urn:kbf:host-role:{role}");
         let sans = vec![dns("host-7"), uri(&host_role), uri("urn:kbf:role:updater")];
         assert_eq!(
@@ -50,7 +55,7 @@ fn an_updater_certificate_names_its_host_and_its_host_role() {
     ];
     assert_eq!(
         identity_of(&cert(reversed)).expect("read").role,
-        HostRole::Storage
+        HostRole::STORAGE
     );
 }
 
@@ -114,6 +119,7 @@ fn an_updater_must_name_exactly_one_host_role_the_farm_has() {
         &["storage", "daemon"],
         &["storage", "storage"],
         &["gateway"],
+        &["cache"],
         &["Storage"],
         &["mac_daemon"],
         &[""],

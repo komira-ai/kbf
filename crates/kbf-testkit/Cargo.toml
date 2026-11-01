@@ -7,34 +7,20 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
-# `kbf-act`, the program this crate's own tests run (see the library docs). Each
-# crate whose tests need the act verbs adds a bin like it under its own name, since
-# `CARGO_BIN_EXE_<name>` is set only for the bins of the package under test.
+# `kbf-act`, the program the samples' `shout` action runs (`cargo build -p kbf-testkit
+# --bins`): a thin main over `js_testkit::act`, kept so the binary keeps its name and path.
 [[bin]]
 name = "kbf-act"
 path = "src/bin/kbf-act.rs"
 test = false
 
 [features]
-# `database`: a Postgres database a test owns. Off by default, so the crates that take this one
-# as a normal dependency (the test-only bins) carry no database client.
-postgres = ["dep:postgres"]
+# `database`: a Postgres database a test owns (the feature of `js-testkit` of that name).
+postgres = ["js-testkit/postgres"]
 
-# No kbf dependency: every crate may take this one as a dev-dependency (or a
-# dependency of a test-only bin) without a cycle. rustix makes its system calls
-# directly on Linux; libc is for the two calls rustix has no portable form of
-# (mkfifo, and signal to ignore one). `kbf-m2-act` still links statically.
 [dependencies]
-libc.workspace = true
-postgres = { workspace = true, optional = true }
-rustix = { workspace = true, features = ["process", "net"] }
-# `switch`: the forwarder tokio runs on the caller's runtime.
-tokio = { workspace = true, features = ["io-util", "net", "rt"] }
-
-[dev-dependencies]
-# This crate's own tests of `database` (the files in tests/ see only the features that are on).
-kbf-testkit = { workspace = true, features = ["postgres"] }
-tokio = { workspace = true, features = ["io-util", "macros", "net", "rt"] }
+# The code lives in the jobscheduler repository, at the revision the workspace pins.
+js-testkit.workspace = true
 
 [lints]
 workspace = true

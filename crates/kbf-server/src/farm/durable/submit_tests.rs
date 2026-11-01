@@ -13,7 +13,9 @@ use kbf_state::{
     Changes, Commit, CommitStats, Conflict, ManualClock, Revision, ScanPage, ScanRange, Store,
     StoreError, StoreTime, Txn, Versioned,
 };
-use kbf_types::{ActionKey, Digest, DigestFunction, LeaseKind, OperationId, Qos, Resources};
+use kbf_types::{
+    ActionKey, Digest, DigestFunction, LeaseKind, OperationId, Qos, Resources, WorkKey,
+};
 
 use tonic::Code;
 
@@ -105,18 +107,20 @@ fn request(tag: u8) -> Request {
         key: ActionKey {
             instance: "main".to_owned(),
             action: Digest::new(DigestFunction::Sha256, [tag; 32], u64::from(tag)),
-        },
+        }
+        .into(),
         qos: Qos::Ci,
         kind: LeaseKind::Action,
         resources: Resources::new(1_000, 1 << 30),
         hermetic: true,
         do_not_cache: false,
         needs: kbf_caps::Request::default(),
+        whole_worker: false,
     }
 }
 
 fn farm_over(store: &Arc<LostAck>) -> Farm {
-    Farm::new(
+    Farm::new_legacy(
         Arc::new(Cache::memory()),
         kbf_sched::UNSERVABLE_WAIT,
         kbf_sched::FINISHED_RETENTION,
@@ -136,6 +140,7 @@ fn submit(farm: &Farm, tag: u8) -> Result<Ticket, Status> {
         call: None,
         described: Described::default(),
         evidence: Default::default(),
+        max_wall: None,
     })
 }
 
@@ -255,10 +260,10 @@ fn refuse(durable: &Durable, operation: u64) {
         .expect("refuse");
 }
 
-fn pin_row(store: &LostAck, key: &ActionKey) -> Option<Vec<u8>> {
+fn pin_row(store: &LostAck, key: &WorkKey) -> Option<Vec<u8>> {
     let prefix = "inflight/";
     let rows = store.scan_prefix(prefix).expect("scan");
-    let named = key.action.to_string();
+    let named = key.dedup.clone();
     rows.into_iter()
         .find(|(row, _)| row.ends_with(&named))
         .map(|(_, row)| row.value)
@@ -289,7 +294,7 @@ fn the_finish_removes_the_pin_of_its_own_operation_only() {
     let unpinned = durable.unpin(Txn::new(), OperationId(1)).expect("unpin");
     assert_eq!(unpinned.ops().len(), 1, "the owner's finish keeps its pin");
     let other = Txn::new().put(
-        format!("inflight/6d61696e/{}", key.action),
+        format!("inflight/6d61696e/{}", key.dedup),
         9_u64.to_be_bytes(),
         Cond::Any,
     );
@@ -310,7 +315,7 @@ fn a_pin_of_a_finished_operation_is_replaced() {
     let store = LostAck::new();
     let durable = durable_over(&store);
     let stale = Txn::new().put(
-        format!("inflight/{}/{}", "6d61696e", request(1).key.action),
+        format!("inflight/{}/{}", "6d61696e", request(1).key.dedup),
         7_u64.to_be_bytes(),
         Cond::Absent,
     );
@@ -419,8 +424,20 @@ fn a_joined_operation_leased_on_a_node_the_farm_does_not_own_is_followed_not_tak
     assert!(submit(&farm, 1).is_ok());
 
     let state = farm.lock();
-    assert!(state.machine.sent(kbf_types::LeaseId::new(5, 0)).is_none());
-    assert!(state.machine.sent(kbf_types::LeaseId::new(5, 1)).is_none());
+    assert!(
+        state
+            .side
+            .machine
+            .sent(kbf_types::LeaseId::new(5, 0))
+            .is_none()
+    );
+    assert!(
+        state
+            .side
+            .machine
+            .sent(kbf_types::LeaseId::new(5, 1))
+            .is_none()
+    );
     let held = state.sched.state(OperationId(0));
     assert!(held.is_none(), "the farm holds it");
     assert_eq!(state.intake.following(), 1);
@@ -438,10 +455,10 @@ fn a_pin_that_lands_after_the_look_is_not_written_over() {
     let farm = farm_over(&store);
     let other = durable_over(&store);
     let landing = other
-        .submission(OperationId(5), &request(1), &subject(), None)
+        .submission(OperationId(5), &request(1), &subject(), None, None)
         .expect("encode")
         .put(
-            format!("inflight/6d61696e/{}", request(1).key.action),
+            format!("inflight/6d61696e/{}", request(1).key.dedup),
             5_u64.to_be_bytes(),
             Cond::Absent,
         );
@@ -467,7 +484,7 @@ fn a_pin_or_row_that_cannot_be_trusted_is_refused() {
             .is_ok()
     );
     let pin = Txn::new().put(
-        format!("inflight/6d61696e/{}", request(1).key.action),
+        format!("inflight/6d61696e/{}", request(1).key.dedup),
         0_u64.to_be_bytes(),
         Cond::Absent,
     );
@@ -587,7 +604,7 @@ fn a_store_that_is_down_refuses_the_submit_and_a_farm_without_one_queues() {
     assert!(submit(&farm, 1).is_ok());
     assert_eq!(rows(&store, "op/"), 1);
 
-    let bare = Farm::new(
+    let bare = Farm::new_legacy(
         Arc::new(Cache::memory()),
         kbf_sched::UNSERVABLE_WAIT,
         kbf_sched::FINISHED_RETENTION,
@@ -658,7 +675,7 @@ fn a_submit_takes_three_conflicts_and_is_refused_at_the_fourth() {
         for id in 0..landed {
             let tag = 10 + u8::try_from(id).expect("a small id");
             let landing = other
-                .submission(OperationId(id), &request(tag), &subject(), None)
+                .submission(OperationId(id), &request(tag), &subject(), None, None)
                 .expect("encode");
             store.before_submit.lock().expect("lock").push_back(landing);
         }

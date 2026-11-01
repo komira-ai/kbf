@@ -28,6 +28,7 @@ use kbf_daemon::RuntimeError;
 use kbf_types::Resources;
 
 use crate::numa::Pin;
+use crate::off_worker::off_worker;
 
 /// Controllers the lease hands to the container's cgroup.
 const SUBTREE: &str = "+cpu +memory +pids";
@@ -225,7 +226,9 @@ pub(crate) async fn presses_into_swap(
     let mut watch = SwapWatch::new(threshold, cap.unwrap_or(0));
     loop {
         tokio::time::sleep(every).await;
-        let Ok(now) = cgroup.pressure() else {
+        // Three file reads that can wait on the kernel: not on an async worker.
+        let reading = cgroup.clone();
+        let Ok(now) = off_worker(move || reading.pressure()).await else {
             continue;
         };
         if watch.kills(now) {
@@ -235,7 +238,7 @@ pub(crate) async fn presses_into_swap(
 }
 
 /// One lease's cgroup.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct LeaseCgroup {
     /// The directory, under the cgroup filesystem's mount.
     dir: PathBuf,
@@ -594,6 +597,27 @@ mod tests {
         };
         let err = retry_busy(&dir, 4, Duration::ZERO, &mut remove).expect_err("denied");
         assert_eq!((calls, err.kind()), (1, io::ErrorKind::PermissionDenied));
+    }
+
+    /// Catches a busy-cgroup report that names only the processes of the cgroup itself: a
+    /// process in a child cgroup keeps the parent busy, so the report must reach it, and
+    /// must name the child it sits in.
+    #[test]
+    fn the_members_of_a_busy_cgroup_include_those_of_its_children() {
+        let dir = scratch("members-below");
+        std::fs::create_dir_all(dir.join("child/grandchild")).expect("mkdir");
+        let pid = std::process::id();
+        std::fs::write(
+            dir.join("child/grandchild/cgroup.procs"),
+            format!("{pid}\n"),
+        )
+        .expect("plant a member");
+        let report = members(&dir);
+        let place = dir.join("child/grandchild");
+        assert!(
+            report.contains(&format!("in {}: pid {pid} (", place.display())),
+            "{report}"
+        );
     }
 
     /// Catches child cgroups left behind (removal must go deepest first), a cgroup

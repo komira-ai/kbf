@@ -1,45 +1,20 @@
-//! Worker capabilities: parsers over the text a node's OS publishes about its CPU
-//! (Linux `/proc/cpuinfo`, macOS `sysctl hw.optional`) and GPUs (Linux PCI functions
-//! in sysfs), the ISA levels that text
-//! implies, and matching of an action's capability request against a node.
+//! Worker capabilities: parsers over the text a node's OS publishes about its CPU and
+//! GPUs, the ISA levels that text implies, and matching of an action's capability
+//! request against a node.
 //!
-//! - [`CpuCaps`] holds a node's architecture, every feature it reports (kernel names)
-//!   and its highest ISA level: an x86-64 psABI level ([`X86Level`]) or an Armv8
-//!   version ([`ArmVersion`]).
-//! - [`gpus_from_linux_pci`] and [`gpus_from_macos_sysctl`] count a node's GPUs, the
-//!   `gpu` capacity a request books whole and exclusively; [`gpu_cores_from_macos_ioreg`]
-//!   and [`metal_family_of_apple_chip`] describe a Mac's.
-//! - [`Request`] and [`NodeCaps`] match with typed comparisons: exact, at least for
-//!   ordered levels, subset for feature sets, membership for sets a node reports
-//!   (`xcode`, and `vm.image` on its digest), minimums for countable resources, and one
-//!   iOS device that satisfies every device attribute (`ios.device=1`).
-//! - [`Request::from_platform`] reads an action's REAPI platform (`OSFamily`, `ISA`
-//!   and kbf's own keys, the names in any case: [`property_name`]) as a request;
-//!   [`NodeCaps::from_report`] reads a daemon's node report as the capabilities
-//!   requests are matched against.
+//! The code now lives in the `js-caps` crate of the `komira-ai/jobscheduler`
+//! repository (`crates/js-caps`), at the revision pinned in the workspace
+//! `Cargo.toml`; this crate re-exports it under its old name so that every path
+//! (`kbf_caps::NodeCaps`, `kbf_caps::Request`, ...) stays as it was. It is still a pure
+//! crate (no async runtime, network, clock, randomness or hashed collections): the
+//! layering test in `kbf-integration-test` and the lists in `clippy.toml` enforce it,
+//! and `js-caps` depends only on `thiserror`.
 //!
-//! This is a pure crate: no async runtime, network, clock, randomness or hashed
-//! collections. The layering test in `kbf-integration-test` and the lists in `clippy.toml` enforce it.
+//! `tests/fixtures` stays here because `kbf-daemon` reads some of its files with
+//! `include_str!`. `tests/wire_keys.rs` pins the platform property names a kbf client
+//! and daemon exchange, so a revision that renames one fails here.
 
 #![deny(clippy::disallowed_methods, clippy::disallowed_types)]
+#![forbid(unsafe_code)]
 
-mod cpu;
-mod gpu;
-mod level;
-mod macos;
-mod matching;
-mod platform;
-mod report;
-
-pub use cpu::{Arch, CpuCaps, ParseError, UnknownArch};
-pub use gpu::{
-    GPU_KIND_NATIVE, PciFunction, gpu_cores_from_macos_ioreg, gpus_from_linux_pci,
-    gpus_from_macos_sysctl, metal_family_of_apple_chip,
-};
-pub use level::{ArmVersion, IsaLevel, UnknownIsaLevel, X86Level};
-pub use matching::{
-    Consumable, DEVICE_ATTRIBUTES, NodeCaps, REPORT_ONLY_KEYS, RESERVED_KEYS, Request,
-    RequestError, Unmet,
-};
-pub use platform::{DAEMON_OSES, FromPlatformError, REAPI_KEYS, property_name};
-pub use report::ReportError;
+pub use js_caps::*;

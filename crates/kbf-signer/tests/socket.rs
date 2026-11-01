@@ -115,13 +115,21 @@ fn an_updater_certificate_for_each_host_role_is_signed_through_the_socket() {
     let client = Arc::new(SocketSigner::connect(&socket, Route::Node).expect("connect"));
     let authority = Authority::import(client, Policy::default(), &ca.root).expect("authority");
     let id = "host-a".parse().expect("id");
-    for (n, host_role) in kbf_types::HostRole::ALL.into_iter().enumerate() {
+    for (n, host_role) in [
+        kbf_types::HostRole::FRONTEND,
+        kbf_types::HostRole::STORAGE,
+        kbf_types::HostRole::DAEMON,
+        kbf_types::HostRole::MAC_DAEMON,
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let key = support::fresh_key();
         let issued = authority
             .issue_updater(
                 &kbf_ca::UpdaterCert {
                     node_id: &id,
-                    host_role,
+                    host_role: &host_role,
                     key: &key,
                 },
                 NOW,

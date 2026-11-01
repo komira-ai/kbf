@@ -8,7 +8,8 @@ repository.workspace = true
 publish.workspace = true
 
 # The VM driver (docs/design/macos-vms.md section 6): one VM per lease behind the
-# `VmHost` trait, and a fake host that runs the real kbf-guest agent.
+# `VmHost` trait, a fake host that runs the real kbf-guest agent, and the macOS host that
+# runs `kbf-vmm vm-run` through the root helper.
 [dependencies]
 hex.workspace = true
 kbf-daemon.workspace = true
@@ -17,11 +18,18 @@ kbf-guest.workspace = true
 kbf-outputs.workspace = true
 kbf-proto.workspace = true
 kbf-types.workspace = true
+kbf-vmm.workspace = true
+libc.workspace = true
 prost-types.workspace = true
 rustix = { workspace = true, features = ["fs"] }
+serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "macros", "rt", "sync", "time"] }
 tracing.workspace = true
+
+# The root helper's socket, for the macOS host's real session.
+[target.'cfg(target_os = "macos")'.dependencies]
+kbf-mac-session.workspace = true
 
 [dev-dependencies]
 kbf-testkit.workspace = true

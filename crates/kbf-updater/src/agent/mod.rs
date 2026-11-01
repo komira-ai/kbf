@@ -9,6 +9,10 @@
 //!   container included: [`container_health`]);
 //! - [`enroll`] and [`renew`]: the host's certificate, made once with a token and renewed by the
 //!   agent at half its life;
+//! - [`service_health`]: a service's readiness URL;
+//! - [`cordon`]: which cordons on the node are the updater's own, kept on disk;
+//! - [`hold`]: `Deferred` and `halt`: the features announced, the deferral kept on disk, the
+//!   heartbeat's size;
 //! - [`status`]: what the heartbeat says;
 //! - [`update`]: one host's A/B, step by step;
 //! - [`run`]: the two threads, and the wiring of the real ports ([`build`]).
@@ -17,16 +21,20 @@ pub mod container_health;
 pub mod coordinator;
 pub mod enroll;
 pub mod flags;
+pub mod hold;
+pub mod hook;
 pub mod local;
 pub mod renew;
 pub mod run;
+pub mod service_health;
 pub mod status;
 pub mod update;
 
 mod build;
+pub mod cordon;
 
-pub use build::{NO_CREDENTIAL, NoCredential, run_agent, run_config};
-pub use run::{Agent, Stop, World};
+pub use build::{Access, NO_CREDENTIAL, NoCredential, run_agent, run_config};
+pub use run::{Agent, ServicePorts, Stop, World};
 
 #[cfg(test)]
 mod build_tests;
@@ -34,6 +42,8 @@ mod build_tests;
 mod container_health_tests;
 #[cfg(test)]
 mod coordinator_tests;
+#[cfg(test)]
+mod cordon_tests;
 #[cfg(test)]
 mod enroll_tests;
 #[cfg(test)]
@@ -43,6 +53,8 @@ mod flags_tests;
 #[cfg(test)]
 mod frontend_tests;
 #[cfg(test)]
+mod hold_tests;
+#[cfg(test)]
 mod local_tests;
 #[cfg(test)]
 mod pki;
@@ -51,6 +63,8 @@ mod renew_tests;
 #[cfg(test)]
 mod run_tests;
 #[cfg(test)]
-mod testing;
+mod service_tests;
+#[cfg(test)]
+pub(crate) mod testing;
 #[cfg(test)]
 mod update_tests;

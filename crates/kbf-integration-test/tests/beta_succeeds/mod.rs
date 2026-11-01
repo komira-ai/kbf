@@ -18,6 +18,9 @@ use super::workflows;
 /// The workflow whose conclusion `release gates` reads.
 const BETA: &str = ".github/workflows/beta.yml";
 
+/// The other workflow whose jobs the release gate reads: the beta smoke, which tests the run's artifacts.
+const SMOKE: &str = ".github/workflows/smoke.yml";
+
 /// The only `if:` a step of `beta.yml` may carry.
 const STEP_CONDITIONS: [&str; 2] = [
     "${{ !cancelled() }}",
@@ -26,12 +29,12 @@ const STEP_CONDITIONS: [&str; 2] = [
 
 /// Every way `text` could let a run conclude `success` with a job or step not passed, one
 /// sentence each; an error when the text does not parse.
-fn problems(text: &str) -> Result<Vec<String>, String> {
+fn problems(file: &str, text: &str) -> Result<Vec<String>, String> {
     let mut found = Vec::new();
     for (n, line) in text.lines().enumerate() {
         if line.trim_start().starts_with("continue-on-error") {
             found.push(format!(
-                "{BETA}:{}: continue-on-error lets a failing job or step pass",
+                "{file}:{}: continue-on-error lets a failing job or step pass",
                 n + 1
             ));
         }
@@ -39,7 +42,7 @@ fn problems(text: &str) -> Result<Vec<String>, String> {
     for job in workflows::job_names(text)? {
         if let Some(c) = workflows::job_condition(text, &job)? {
             found.push(format!(
-                "{BETA}: job {job} has the condition {c:?}; a skipped job counts as passed"
+                "{file}: job {job} has the condition {c:?}; a skipped job counts as passed"
             ));
         }
         for step in workflows::job_steps(text, &job)? {
@@ -47,7 +50,7 @@ fn problems(text: &str) -> Result<Vec<String>, String> {
                 && !STEP_CONDITIONS.contains(&c)
             {
                 found.push(format!(
-                    "{BETA}: a step of job {job} has the condition {c:?}, not one of the two allowed"
+                    "{file}: a step of job {job} has the condition {c:?}, not one of the two allowed"
                 ));
             }
         }
@@ -60,22 +63,28 @@ fn a_green_beta_run_is_a_passed_beta() {
     // Catches: a `continue-on-error` or a skippable job added to beta.yml, which would let
     // `release gates` judge a beta green that did not pass.
     let root = super::repo_root();
-    let text = std::fs::read_to_string(root.join(BETA)).expect(BETA);
-    assert_eq!(problems(&text), Ok(Vec::new()));
+    for file in [BETA, SMOKE] {
+        let text = std::fs::read_to_string(root.join(file)).expect(file);
+        assert_eq!(problems(file, &text), Ok(Vec::new()), "{file}");
+    }
 }
 
-/// [`problems`] on beta.yml with a defect planted, to see each rule go red.
+/// [`problems`] on smoke.yml and beta.yml with one defect added, to see each rule go red.
 mod rules {
     use super::*;
 
-    fn beta() -> String {
-        std::fs::read_to_string(super::super::repo_root().join(BETA)).expect(BETA)
+    fn read(file: &str) -> String {
+        std::fs::read_to_string(super::super::repo_root().join(file)).expect(file)
     }
 
-    /// `beta()` with the first `from` replaced by `to`; the plant must change the text.
+    /// smoke.yml with the first `from` replaced by `to`; the plant must change the text.
     fn planted(from: &str, to: &str) -> String {
-        let text = beta();
-        assert!(text.contains(from), "{from:?} not in {BETA}");
+        edited_in(SMOKE, from, to)
+    }
+
+    fn edited_in(file: &str, from: &str, to: &str) -> String {
+        let text = read(file);
+        assert!(text.contains(from), "{from:?} not in {file}");
         text.replacen(from, to, 1)
     }
 
@@ -85,7 +94,7 @@ mod rules {
             "  smoke:\n    runs-on: ubuntu-24.04\n",
             "  smoke:\n    continue-on-error: true\n    runs-on: ubuntu-24.04\n",
         );
-        let found = problems(&text).unwrap();
+        let found = problems(SMOKE, &text).unwrap();
         assert!(
             found.len() == 1 && found[0].contains("continue-on-error"),
             "{found:?}"
@@ -98,7 +107,7 @@ mod rules {
             "      - name: B0, the farm under build load\n",
             "      - name: B0, the farm under build load\n        continue-on-error: true\n",
         );
-        let found = problems(&text).unwrap();
+        let found = problems(SMOKE, &text).unwrap();
         assert!(
             found.len() == 1 && found[0].contains("continue-on-error"),
             "{found:?}"
@@ -111,7 +120,7 @@ mod rules {
             "  smoke:\n    runs-on: ubuntu-24.04\n",
             "  smoke:\n    if: ${{ github.event_name == 'push' }}\n    runs-on: ubuntu-24.04\n",
         );
-        let found = problems(&text).unwrap();
+        let found = problems(SMOKE, &text).unwrap();
         assert!(
             found.len() == 1 && found[0].contains("job smoke has the condition"),
             "{found:?}"
@@ -124,9 +133,27 @@ mod rules {
             "      - name: B0, the farm under build load\n",
             "      - name: B0, the farm under build load\n        if: ${{ always() }}\n",
         );
-        let found = problems(&text).unwrap();
+        let found = problems(SMOKE, &text).unwrap();
         assert!(
             found.len() == 1 && found[0].contains("not one of the two allowed"),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn the_same_rules_hold_for_the_jobs_of_beta_yml() {
+        // Catches: a job of beta.yml that can fail without failing the run, once the suite no
+        // longer shares a file with the smoke.
+        let text = edited_in(
+            BETA,
+            "  test-x86:\n    runs-on: ubuntu-latest\n",
+            "  test-x86:\n    continue-on-error: true\n    runs-on: ubuntu-latest\n",
+        );
+        let found = problems(BETA, &text).unwrap();
+        assert!(
+            found.len() == 1
+                && found[0].starts_with(BETA)
+                && found[0].contains("continue-on-error"),
             "{found:?}"
         );
     }

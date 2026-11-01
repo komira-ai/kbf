@@ -762,3 +762,77 @@ async fn a_failed_streamed_write_leaves_no_file() {
     assert_eq!(left, 0, "files left in tmp/");
     drop(store);
 }
+
+/// Catches a `len` that is not the object's size: the file's size with the header in it,
+/// a size off by one, or `None` for an empty object.
+#[tokio::test]
+async fn len_of_an_object_is_its_size() {
+    let dir = scratch("len");
+    let store = FsStore::open(&dir, FLOOR).expect("open");
+    store
+        .put_new(&key("a"), Bytes::from_static(b"abcde"), None)
+        .await
+        .expect("put a");
+    store
+        .put_new(&key("e"), Bytes::new(), None)
+        .await
+        .expect("put e");
+    use futures::StreamExt;
+    let streamed = Bytes::from(vec![7u8; 1000]);
+    let body = futures::stream::iter([Ok(streamed)]).boxed();
+    store
+        .put_stream(&key("s"), 1000, body)
+        .await
+        .expect("put s");
+    assert_eq!(store.len(&key("a")).await.expect("len a"), Some(5));
+    assert_eq!(store.len(&key("e")).await.expect("len e"), Some(0));
+    assert_eq!(store.len(&key("s")).await.expect("len s"), Some(1000));
+    drop(store);
+}
+
+/// Catches a `len` that fails, or invents a length, for a key with no object, and one
+/// that still answers after the object was deleted.
+#[tokio::test]
+async fn len_of_an_absent_key_is_none() {
+    let dir = scratch("len-absent");
+    let store = FsStore::open(&dir, FLOOR).expect("open");
+    assert_eq!(store.len(&key("a")).await.expect("len"), None);
+    store
+        .put_new(&key("a"), Bytes::from_static(b"x"), None)
+        .await
+        .expect("put");
+    store.delete(&key("a")).await.expect("delete");
+    assert_eq!(store.len(&key("a")).await.expect("len"), None);
+    drop(store);
+}
+
+/// Catches a `len` that counts a write in flight: a file in `tmp/` (even with a whole
+/// header and the key's bytes), a file at the key's name too short for its header, or
+/// one of zero bytes is not an object, so the answer is `None`. A file holding another
+/// key's object is a protocol break, as for a read.
+#[tokio::test]
+async fn len_of_a_partial_upload_is_none() {
+    let dir = scratch("len-partial");
+    let store = FsStore::open(&dir, FLOOR).expect("open");
+    let (a, b, c, z) = (key("a"), key("b"), key("c"), key("z"));
+    let in_flight = [b"kbf-obj1\0\x01a".as_slice(), b"half"].concat();
+    std::fs::write(dir.join("tmp").join("3"), in_flight).expect("plant tmp");
+    assert_eq!(store.len(&a).await.expect("len a, in tmp/"), None);
+
+    store
+        .put_new(&a, Bytes::from_static(b"object a"), None)
+        .await
+        .expect("put a");
+    std::fs::copy(file_of(&dir, &a), file_of(&dir, &b)).expect("copy a's file to b's name");
+    let Err(ObjectStoreError::Protocol(why)) = store.len(&b).await else {
+        panic!("a's length answered for b");
+    };
+    assert!(why.contains("holds object a, not b"), "{why}");
+
+    std::fs::write(file_of(&dir, &c), b"kbf-obj1").expect("a header cut short");
+    std::fs::write(file_of(&dir, &z), b"").expect("a file of zero bytes");
+    for k in [&c, &z] {
+        assert_eq!(store.len(k).await.expect("len"), None, "{k}");
+    }
+    drop(store);
+}

@@ -12,7 +12,7 @@ name = "kbf-estimator-replay"
 path = "src/main.rs"
 
 # The exporter reads the operator API with kbf-server's own client (`OperatorClient`), through a
-# wrapper that can send a GET only. The replay drives `kbf-sched` and `kbf-estimator`
+# wrapper that can send a GET only. The replay drives `kbf-sched` (`js-sched`) and `kbf-estimator`
 # (both pure) in process.
 [dependencies]
 clap.workspace = true
@@ -27,6 +27,7 @@ thiserror.workspace = true
 time.workspace = true
 
 [dev-dependencies]
+kbf-history.workspace = true
 kbf-invocation.workspace = true
 kbf-testkit.workspace = true
 

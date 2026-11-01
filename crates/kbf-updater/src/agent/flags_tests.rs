@@ -4,7 +4,9 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use super::flags::{DEFAULT_HELPER_SOCKET, NodeApi, Timing, parse_flags};
+use super::flags::{
+    DEFAULT_HELPER_SOCKET, NodeApi, ServiceConfig, ServiceDrain, ServiceHealth, Timing, parse_flags,
+};
 
 fn args(words: &[&str]) -> Vec<String> {
     words.iter().map(|w| (*w).to_owned()).collect()
@@ -69,6 +71,18 @@ fn the_required_flags_make_a_config_with_the_defaults() {
     assert_eq!(parse_flags(&inline).unwrap(), config);
 }
 
+/// `--cordon-dir` is read as a path and is absent unless given.
+#[test]
+fn the_cordon_directory_is_read() {
+    assert_eq!(parse_flags(&with(&NODE_API)).unwrap().cordon_dir, None);
+    let mut words = with(&NODE_API);
+    words.extend(args(&["--cordon-dir", "/var/lib/kbf-updater/cordons"]));
+    assert_eq!(
+        parse_flags(&words).unwrap().cordon_dir,
+        Some(PathBuf::from("/var/lib/kbf-updater/cordons"))
+    );
+}
+
 /// Every optional flag is read: the helper's socket and each of the times.
 #[test]
 fn the_optional_flags_are_read() {
@@ -97,12 +111,36 @@ fn the_optional_flags_are_read() {
     assert_eq!(config.daemon_node.as_deref(), Some("d1"));
     let secs = Duration::from_secs;
     assert_eq!(config.timing.heartbeat, secs(20));
-    assert_eq!(config.timing.drain_deadline, secs(30));
+    assert_eq!(config.timing.drain_deadline, Some(secs(30)));
     assert_eq!(config.timing.health_timeout, secs(40));
     assert_eq!(config.timing.health_poll, secs(2));
     assert_eq!(config.timing.retry, secs(60));
     assert_eq!(config.timing.drain_poll, Timing::DEFAULT.drain_poll);
     assert_eq!(config.timing.margin, Timing::DEFAULT.margin);
+}
+
+/// The drain deadline has no default (absent waits however long the leases take), takes any
+/// number of seconds from 1 up with no upper bound (the other times stop at a day), and refuses
+/// 0 and non-numbers with the flag named.
+#[test]
+fn the_drain_deadline_is_absent_by_default_has_no_cap_and_refuses_zero() {
+    let base = with(&NODE_API);
+    assert_eq!(parse_flags(&base).unwrap().timing.drain_deadline, None);
+    for (text, want) in [("1", 1), ("86401", 86_401), ("31536000", 31_536_000)] {
+        let mut args = base.clone();
+        args.extend(["--drain-deadline-secs".to_owned(), text.to_owned()]);
+        let got = parse_flags(&args).unwrap().timing.drain_deadline;
+        assert_eq!(got, Some(Duration::from_secs(want)), "{text}");
+    }
+    for bad in ["0", "-1", "soon", "1.5", ""] {
+        let mut args = base.clone();
+        args.extend(["--drain-deadline-secs".to_owned(), bad.to_owned()]);
+        let err = parse_flags(&args).unwrap_err();
+        assert!(
+            err.contains("--drain-deadline-secs must be"),
+            "{bad}: {err}"
+        );
+    }
 }
 
 /// Whatever is missing, repeated, unknown or malformed is refused with the flag in the message:
@@ -276,4 +314,181 @@ fn the_daemon_node_is_a_node_id_or_not_given() {
         let err = parse_flags(&with(&["--daemon-node", bad])).unwrap_err();
         assert!(err.contains("--daemon-node"), "{bad}: {err}");
     }
+}
+
+/// No `--service` is no services; each is read, in the order given, as `--service V` or
+/// `--service=V`: the channel is the service's name unless one is given, the drain is the node's
+/// unless `none`, the health is the node's unless there is a readiness URL (a loopback address,
+/// with a path or without), and the helper is the socket given.
+#[test]
+fn services_are_read_in_order_with_their_settings() {
+    assert!(parse_flags(&with(&NODE_API)).unwrap().services.is_empty());
+    let mut words = with(&NODE_API);
+    words.extend(args(&[
+        "--service",
+        "db,helper-socket=/run/db.sock",
+        "--service=cache,channel=cache-stable,helper-socket=/run/cache.sock,drain=none,ready-url=http://127.0.0.1:8080/readyz",
+        "--service=plain,helper-socket=/run/plain.sock,drain=node,ready-url=http://[::1]:9",
+    ]));
+    let config = parse_flags(&words).unwrap();
+    assert_eq!(
+        config.services,
+        [
+            ServiceConfig {
+                name: "db".to_owned(),
+                channel: "db".to_owned(),
+                helper_socket: PathBuf::from("/run/db.sock"),
+                drain: ServiceDrain::Node,
+                health: ServiceHealth::Node,
+            },
+            ServiceConfig {
+                name: "cache".to_owned(),
+                channel: "cache-stable".to_owned(),
+                helper_socket: PathBuf::from("/run/cache.sock"),
+                drain: ServiceDrain::None,
+                health: ServiceHealth::Ready {
+                    addr: "127.0.0.1:8080".parse().unwrap(),
+                    path: "/readyz".to_owned(),
+                },
+            },
+            ServiceConfig {
+                name: "plain".to_owned(),
+                channel: "plain".to_owned(),
+                helper_socket: PathBuf::from("/run/plain.sock"),
+                drain: ServiceDrain::Node,
+                health: ServiceHealth::Ready {
+                    addr: "[::1]:9".parse().unwrap(),
+                    path: "/".to_owned(),
+                },
+            },
+        ]
+    );
+    // The other flags are read as before around them.
+    assert_eq!(config.channel, "stable");
+}
+
+/// A `--service` that is not a service name (or is `kbf`, or is missing its value), is given
+/// twice, has a setting that is not `key=value`, unknown, repeated or out of range, or a
+/// readiness URL that is not plain http to a loopback address, is refused with the service in
+/// the text.
+#[test]
+fn a_service_flag_that_is_wrong_is_refused() {
+    let cases: [(&str, &str); 17] = [
+        ("", "service name"),
+        ("kbf", "other than kbf"),
+        ("Db", "service name"),
+        ("db,channel", "not key=value"),
+        ("db,channel=a,channel=b", "channel is given twice"),
+        ("db,speed=fast", "unknown setting speed"),
+        ("db,channel=UP", "the channel must be a channel name"),
+        (
+            "a-very-long-service-name-that-is-not-a-channel-name-at-all",
+            "give one with channel=",
+        ),
+        (
+            "db,helper-socket=run/x.sock",
+            "helper-socket must be an absolute path",
+        ),
+        ("db,drain=sometimes", "drain is node or none"),
+        (
+            "db,ready-url=https://127.0.0.1:1/",
+            "must start with http://",
+        ),
+        ("db,ready-url=http://example.com:1/", "with an IP address"),
+        (
+            "db,ready-url=http://203.0.113.5:1/",
+            "must be a loopback address",
+        ),
+        ("db,ready-url=http://127.0.0.1:1/a b", "space or a control"),
+        ("db,ready-url=http://127.0.0.1/", "with an IP address"),
+        ("db,ready-url=http://127.0.0.1:1", "ok"),
+        (
+            "db,ready-url=http://127.0.0.1:1/x\u{7}",
+            "space or a control",
+        ),
+    ];
+    for (value, expect) in cases {
+        // Each case but the socket's own is given a socket, so it reaches the check it is about.
+        let value = if value.starts_with("db") && !value.contains("helper-socket") {
+            format!("{value},helper-socket=/run/db.sock")
+        } else {
+            value.to_owned()
+        };
+        let result = parse_flags(&with(&["--service", &value]));
+        if expect == "ok" {
+            assert!(result.is_ok(), "{value}");
+            continue;
+        }
+        let err = result.unwrap_err();
+        assert!(err.contains(expect), "{value}: {err}");
+    }
+    let err = parse_flags(&with(&[
+        "--service",
+        "db,helper-socket=/run/db.sock",
+        "--service=db,channel=x,helper-socket=/run/x.sock",
+    ]))
+    .unwrap_err();
+    assert_eq!(err, "--service db is given twice");
+    let err = parse_flags(&with(&["--service"])).unwrap_err();
+    assert!(err.contains("service name"), "{err}");
+}
+
+/// Catches: a service updated through a helper that is not its own: the agent's, which installs
+/// `kbf` (an install request names no service, so kbf would be installed at the service's
+/// version), or another service's. A service without `helper-socket=` is refused, and so is one
+/// whose socket is the agent's `--helper-socket` (the default one or one given), one that
+/// shares another service's socket, or one whose path holds a `..` component; a socket of
+/// its own is read.
+#[test]
+fn a_service_needs_a_helper_of_its_own() {
+    let err = parse_flags(&with(&["--service", "db"])).unwrap_err();
+    assert!(
+        err.contains("--service db: helper-socket= is required"),
+        "{err}"
+    );
+    let err = parse_flags(&with(&[
+        "--service",
+        "db,helper-socket=/run/kbf-host-install/local.sock",
+    ]))
+    .unwrap_err();
+    assert!(
+        err.contains("--service db: helper-socket is the agent's"),
+        "{err}"
+    );
+    let err = parse_flags(&with(&[
+        "--helper-socket",
+        "/run/h.sock",
+        "--service",
+        "db,helper-socket=/run/h.sock",
+    ]))
+    .unwrap_err();
+    assert!(err.contains("helper-socket is the agent's"), "{err}");
+    let err = parse_flags(&with(&[
+        "--service",
+        "db,helper-socket=/run/one.sock",
+        "--service",
+        "cache,helper-socket=/run/one.sock",
+    ]))
+    .unwrap_err();
+    assert!(
+        err.contains("--service cache: helper-socket is also db's"),
+        "{err}"
+    );
+    let err = parse_flags(&with(&[
+        "--service",
+        "db,helper-socket=/run/x/../kbf-host-install/local.sock",
+    ]))
+    .unwrap_err();
+    assert!(err.contains("may not hold a .. component"), "{err}");
+    let config = parse_flags(&with(&[
+        "--helper-socket",
+        "/run/h.sock",
+        "--service",
+        "db,helper-socket=/run/kbf-host-install/local.sock",
+    ]))
+    .unwrap();
+    assert_eq!(
+        config.services[0].helper_socket,
+        PathBuf::from("/run/kbf-host-install/local.sock")
+    );
 }

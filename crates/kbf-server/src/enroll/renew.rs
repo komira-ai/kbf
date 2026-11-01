@@ -101,7 +101,13 @@ impl EnrollService {
             }
             keys.iter()
                 .map(|(role, key)| {
-                    core.issue_for(&node_id, *role, key, host_role, advertise.as_deref())
+                    core.issue_for(
+                        &node_id,
+                        *role,
+                        key,
+                        host_role.as_ref(),
+                        advertise.as_deref(),
+                    )
                 })
                 .collect()
         };

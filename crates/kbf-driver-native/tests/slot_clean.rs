@@ -924,7 +924,20 @@ fn a_job_labelled_like_launchds_own_is_still_the_leases() {
             std::thread::sleep(Duration::from_millis(50));
         }
     }
-    let left = kbf_driver_native::slots::macos::host::leftover_processes(user.uid).expect("list");
+    // launchd reports the pid when it spawns the job; the kernel's process table lists
+    // the process by its uid only once the spawn has applied the credentials, a moment
+    // later (measured: a listing right after the first `pid =` line misses it in about
+    // one run in ten, and lists it within a few milliseconds). So list again until the
+    // pid is there; a listing that never has it still fails the test below.
+    let give_up = Instant::now() + PROMPT;
+    let left = loop {
+        let left =
+            kbf_driver_native::slots::macos::host::leftover_processes(user.uid).expect("list");
+        if pid.is_none_or(|pid| left.contains(&pid)) || Instant::now() >= give_up {
+            break left;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
     let (_, booted) = root("/bin/launchctl", &["bootout", &service]);
     assert!(text.contains("planted label"), "{text}");
     let pid = pid.unwrap_or_else(|| panic!("the agent never ran: {text}"));

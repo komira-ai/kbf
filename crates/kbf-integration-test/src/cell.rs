@@ -280,13 +280,18 @@ impl<T, E: Display> OrBroken<T> for Result<T, E> {
 /// Prints the last `n` lines of the server's and the daemon's error logs in `logs`.
 pub(crate) fn print_tails(logs: &Path, n: usize) {
     for name in ["server.err", "daemon.err"] {
-        println!("--- last lines of {name}");
-        if let Ok(bytes) = std::fs::read(logs.join(name)) {
-            let text = String::from_utf8_lossy(&bytes);
-            let lines: Vec<&str> = text.lines().collect();
-            for line in &lines[lines.len().saturating_sub(n)..] {
-                println!("{line}");
-            }
+        print_tail(logs, name, n);
+    }
+}
+
+/// Prints the last `n` lines of the log `name` in `logs` under a heading of its own.
+pub(crate) fn print_tail(logs: &Path, name: &str, n: usize) {
+    println!("--- last lines of {name}");
+    if let Ok(bytes) = std::fs::read(logs.join(name)) {
+        let text = String::from_utf8_lossy(&bytes);
+        let lines: Vec<&str> = text.lines().collect();
+        for line in &lines[lines.len().saturating_sub(n)..] {
+            println!("{line}");
         }
     }
 }

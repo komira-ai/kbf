@@ -136,8 +136,8 @@ pub struct Limits {
 }
 
 /// The system `curl` that lists and the pinned `gh` that downloads, run as `who` with `home`
-/// as the home of `gh`. `token`, when there is one, is one line of letters, digits, `_` and
-/// `-`.
+/// as the home of `gh`. `token`, when there is one, is one line of letters, digits, `_`, `-`
+/// and `.`, at most 1024 bytes.
 pub struct Fetcher<'a> {
     /// The platform of the release files to take: `darwin-arm64`, `linux-x86_64`, ...
     pub platform: &'a str,
@@ -357,8 +357,8 @@ impl Fetcher<'_> {
         match self.runner.run(&download) {
             Err(e) => failed(format!("gh release download: {e}")),
             Ok(exec) if !exec.success() => failed(format!(
-                "gh release download: exit status {:?}: {}",
-                exec.code,
+                "gh release download: {}: {}",
+                exec.ended(),
                 exec.stderr_text()
             )),
             Ok(_) => Ok(commit),
@@ -371,11 +371,7 @@ impl Fetcher<'_> {
             Err(e) => return failed(format!("curl: {e}")),
         };
         if !exec.success() {
-            return failed(format!(
-                "curl: exit status {:?}: {}",
-                exec.code,
-                exec.stderr_text()
-            ));
+            return failed(format!("curl: {}: {}", exec.ended(), exec.stderr_text()));
         }
         serde_json::from_slice(page_body(&exec.stdout)?)
             .or_else(|_| failed("the answer is not a listing of releases"))

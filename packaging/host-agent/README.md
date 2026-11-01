@@ -48,7 +48,12 @@ command, which `crates/kbf-updater/tests/agent_packaging.rs` checks against the 
 - **Its certificate**: from the enrollment above, in the state directory. The certificate says
   which node this is and what the host runs; the agent's flags say neither. (Placed files still
   work, with `--client-cert`, `--client-key` and `--ca` in place of `--state-dir`; nothing
-  renews them.)
+  renews them. The agent records the cordons it makes in `--cordon-dir`, which defaults to the
+  state directory, else the directory of `--client-key`; with placed files in a root-owned
+  directory (`/etc/kbf`) under the unit's `ProtectSystem=strict`, that default is not writable,
+  so give `--cordon-dir /var/lib/kbf-updater` (the unit's `StateDirectory`) or a directory named
+  in `ReadWritePaths=`. The agent checks it at start and refuses to start with one it cannot
+  write.)
 - **A configuration for the helper's channels**: on Linux `/etc/kbf/host-install-releases.toml`,
   on a Mac the existing `host-install.toml`. See `docs/deploy/host-install.md`, "The local socket".
 - **No operator token, as shipped.** The drain of the node, its undrain and its status (a storage

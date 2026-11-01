@@ -25,7 +25,15 @@ type Inbox = mpsc::UnboundedReceiver<Result<ServerMessage, Status>>;
 fn timing(lb_wait: u64, deadline: u64) -> DrainTiming {
     DrainTiming {
         lb_wait: Duration::from_secs(lb_wait),
-        deadline: Duration::from_secs(deadline),
+        deadline: Some(Duration::from_secs(deadline)),
+    }
+}
+
+/// The load balancer wait in seconds, and no deadline: the default.
+fn no_deadline(lb_wait: u64) -> DrainTiming {
+    DrainTiming {
+        lb_wait: Duration::from_secs(lb_wait),
+        deadline: None,
     }
 }
 
@@ -115,13 +123,15 @@ fn request(tag: u8) -> Request {
         key: ActionKey {
             instance: "main".to_owned(),
             action: Digest::new(DigestFunction::Sha256, [tag; 32], u64::from(tag)),
-        },
+        }
+        .into(),
         qos: Qos::Ci,
         kind: LeaseKind::Action,
         resources: Resources::new(1_000, 1 << 30),
         hermetic: true,
         do_not_cache: false,
         needs: kbf_caps::Request::default(),
+        whole_worker: false,
     }
 }
 
@@ -132,16 +142,22 @@ fn submit(farm: &Farm, request: Request) -> Result<kbf_front::Ticket, Status> {
         call: None,
         described: Described::default(),
         evidence: Default::default(),
+        max_wall: None,
     })
 }
 
 /// Registers the node `node-a` on the rig's farm, as a daemon's first stream does.
 fn register(rig: &Rig) -> Inbox {
+    register_stream(rig).1
+}
+
+/// [`register`], and the id of the stream the node is registered on.
+fn register_stream(rig: &Rig) -> (crate::farm::StreamId, Inbox) {
     let caps = kbf_caps::NodeCaps::from_report([("arch", "x86_64"), ("os", "linux")])
         .expect("caps")
         .with_drivers(["container"]);
     let (outbound, inbox) = mpsc::unbounded_channel();
-    rig.farm.register(
+    let stream = rig.farm.register(
         &WorkerId::new("node-a"),
         DaemonInstance::new("daemon"),
         DaemonInstance::new(""),
@@ -149,7 +165,7 @@ fn register(rig: &Rig) -> Inbox {
         outbound,
         Default::default(),
     );
-    inbox
+    (stream, inbox)
 }
 
 /// How many `Start`s are waiting in `inbox`.
@@ -207,32 +223,6 @@ async fn the_wait_serves_everything_and_the_end_of_it_refuses_and_sends_goaway()
         .await
         .expect("the drain ends once the execution is gone");
     assert_eq!(rig.drain.phase(), Phase::Closing);
-}
-
-/// Asserts that with an execution that never ends, the drain waits the whole deadline and
-/// the clients' grace and no more; that the worker's stream is then ended UNAVAILABLE, so
-/// its daemon dials another frontend; and that the farm is fenced and takes no work.
-#[tokio::test(start_paused = true)]
-async fn at_the_deadline_the_streams_that_are_left_are_ended() {
-    let rig = Rig::new(timing(0, 30));
-    let mut inbox = register(&rig);
-    let _open = rig.backend.metrics().execute.open_executions.raise();
-    let began = Instant::now();
-
-    assert!(rig.sequence.begin());
-    rig.drain.sequence_finished().await;
-
-    let waited = began.elapsed();
-    let least = Duration::from_secs(30) + CLOSE_GRACE;
-    assert!(waited >= least, "ended early: {waited:?}");
-    assert!(waited < Duration::from_secs(40), "ended late: {waited:?}");
-    assert_eq!(rig.drain.phase(), Phase::Closing);
-    let ended: Vec<Code> = std::iter::from_fn(|| inbox.try_recv().ok())
-        .filter_map(|message| message.err())
-        .map(|status| status.code())
-        .collect();
-    assert_eq!(ended, [Code::Unavailable]);
-    assert!(submit(&rig.farm, request(1)).is_err(), "still takes work");
 }
 
 /// Asserts that a second stop signal (`Drain::close`) skips the waits: with a wait of ten
@@ -309,11 +299,11 @@ async fn a_stop_over_a_state_store_runs_the_sequence() {
 }
 
 /// Asserts that the stop timeout (`--shutdown-timeout-secs`) bounds a sequence that a stop
-/// signal began: an execution that never ends is closed when it runs out, long before the
-/// deadline.
+/// signal began, with no drain deadline: an execution that never ends is closed when it
+/// runs out.
 #[tokio::test(start_paused = true)]
 async fn the_stop_timeout_closes_the_streams_of_a_sequence() {
-    let rig = Rig::new(timing(0, 900));
+    let rig = Rig::new(no_deadline(0));
     let retire = rig.retire();
     let _open = rig.backend.metrics().execute.open_executions.raise();
     let began = Instant::now();
@@ -343,13 +333,13 @@ async fn a_sequence_task_that_panics_still_ends_the_sequence() {
     rig.drain.sequence_finished().await;
 }
 
-/// Asserts that the defaults are the ones the flags document: ten seconds of wait and
-/// fifteen minutes of deadline.
+/// Asserts that the defaults are the ones the flags document: ten seconds of wait and no
+/// deadline.
 #[test]
-fn the_defaults_are_ten_seconds_and_fifteen_minutes() {
+fn the_defaults_are_ten_seconds_and_no_deadline() {
     let timing = DrainTiming::default();
     assert_eq!(timing.lb_wait, Duration::from_secs(10));
-    assert_eq!(timing.deadline, Duration::from_secs(900));
+    assert_eq!(timing.deadline, None);
 }
 
 /// What begins the drain in the tests below: a stop signal, or `POST /v1/frontend/drain`.
@@ -410,6 +400,18 @@ fn begin(rig: &Rig, how: Begin, timeout: Duration) -> tokio::task::JoinHandle<()
     })
 }
 
+/// Asserts that a stop whose streams are all kept is still going on, whatever deadline it
+/// has passed, then ends it as a second signal does and waits for it.
+async fn force_stop(rig: &Rig, stop: tokio::task::JoinHandle<()>) {
+    pass_feeding(rig, 5).await;
+    assert!(!stop.is_finished(), "a deadline ended the stop");
+    rig.drain.close();
+    tokio::time::timeout(Duration::from_secs(60), stop)
+        .await
+        .expect("the second signal ends the stop")
+        .expect("task");
+}
+
 /// Lets the tasks that are ready run, and `by` of paused time pass.
 async fn pass(by: Duration) {
     tokio::time::sleep(by).await;
@@ -426,6 +428,32 @@ async fn pass_feeding(rig: &Rig, secs: u64) {
     }
     // Let the tasks the last input woke run.
     pass(Duration::from_millis(1)).await;
+}
+
+/// Lets `secs` seconds of paused time pass as [`pass_feeding`] does, with the node's daemon
+/// heartbeating on `stream` every second and listing `lease` as running, so that the lease
+/// is not given up as a silent node's would be.
+async fn pass_beating(
+    rig: &Rig,
+    stream: crate::farm::StreamId,
+    lease: kbf_types::LeaseId,
+    secs: u64,
+) {
+    for beat in 1..=secs {
+        pass(Duration::from_secs(1)).await;
+        let worker = WorkerId::new("node-a");
+        assert!(rig.farm.heartbeat(&worker, stream, beat, vec![lease]).await);
+        rig.farm.tick().await;
+    }
+    pass(Duration::from_millis(1)).await;
+}
+
+/// The errors in `inbox`: the streams a drain ended.
+fn errors(inbox: &mut Inbox) -> Vec<Code> {
+    std::iter::from_fn(|| inbox.try_recv().ok())
+        .filter_map(|message| message.err())
+        .map(|status| status.code())
+        .collect()
 }
 
 /// A result for `lease`, which the farm accepts without a cache write: the operation
@@ -445,6 +473,7 @@ fn finished(lease: kbf_types::LeaseId) -> kbf_proto::worker::Result {
         action_digest: None,
         memory_kill: 0,
         lost: 0,
+        job_outcome: None,
     }
 }
 
@@ -580,50 +609,11 @@ async fn the_endpoints_drain_with_only_a_queued_operation_ends_within_the_lb_wai
     only_a_queued_operation_does_not_hold_the_stop(Begin::Endpoint).await;
 }
 
-/// Asserts that a stop whose running action outlasts `--drain-deadline`, with no stop
-/// timeout, ends at the deadline (and the clients' grace) and no earlier: the running
-/// stream is then ended UNAVAILABLE.
-async fn a_running_action_is_cut_at_the_drain_deadline(how: Begin) {
-    let rig = Rig::new(timing(0, 30));
-    let mut inbox = register(&rig);
-    let running = submit(&rig.farm, request(1)).expect("queued");
-    rig.farm.tick().await;
-    assert_eq!(starts(&mut inbox), 1, "the operation did not start");
-    let running = follow(&rig, &running).await;
-    let began = Instant::now();
-    let stop = begin(&rig, how, Duration::MAX);
-
-    pass(Duration::from_secs(29)).await;
-    assert!(!running.is_finished());
-    assert!(!stop.is_finished(), "{how:?}: ended before the deadline");
-
-    let waited = tokio::time::timeout(Duration::from_secs(60), stop).await;
-    waited
-        .expect("the stop ends at the deadline")
-        .expect("task");
-    let took = began.elapsed();
-    assert!(took >= Duration::from_secs(30), "{how:?}: {took:?}");
-    let latest = Duration::from_secs(30) + CLOSE_GRACE + Duration::from_secs(2);
-    assert!(took < latest, "{how:?}: {took:?}");
-    let ended = running.await.expect("task").expect_err("ended");
-    assert_eq!(ended.code(), Code::Unavailable, "{how:?}: {ended:?}");
-}
-
-#[tokio::test(start_paused = true)]
-async fn a_stop_ends_at_the_drain_deadline_when_a_running_action_outlasts_it() {
-    a_running_action_is_cut_at_the_drain_deadline(Begin::Signal).await;
-}
-
-#[tokio::test(start_paused = true)]
-async fn the_endpoints_drain_ends_at_the_deadline_when_a_running_action_outlasts_it() {
-    a_running_action_is_cut_at_the_drain_deadline(Begin::Endpoint).await;
-}
-
 /// Asserts that an operation a worker can take but that is only queued (the node is full)
 /// keeps its stream through the drain, which no longer ends it: the stream is open past the
-/// load balancer wait and until the deadline, which ends it with the stop. Buck2 does not
-/// recover a stream that ends after the call opened, so a queued operation is not ended
-/// early.
+/// load balancer wait and the deadline, until a second signal ends it with the stop. Buck2
+/// does not recover a stream that ends after the call opened, so a queued operation is not
+/// ended early.
 async fn a_queued_operation_a_worker_can_take_keeps_its_stream(how: Begin) {
     let rig = Rig::new(timing(0, 30));
     let mut inbox = register(&rig);
@@ -636,23 +626,14 @@ async fn a_queued_operation_a_worker_can_take_keeps_its_stream(how: Begin) {
     rig.farm.tick().await;
     assert!(matches!(*queued.stage.borrow(), kbf_front::Stage::Queued));
     let stream = follow(&rig, &queued).await;
-    let began = Instant::now();
     let stop = begin(&rig, how, Duration::MAX);
 
-    pass_feeding(&rig, 29).await;
+    pass_feeding(&rig, 40).await;
     assert!(
         !stream.is_finished(),
         "{how:?}: a queued stream was ended early"
     );
-    assert!(
-        !stop.is_finished(),
-        "{how:?}: the stop ended before the deadline"
-    );
-    tokio::time::timeout(Duration::from_secs(60), stop)
-        .await
-        .expect("the stop ends at the deadline")
-        .expect("task");
-    assert!(began.elapsed() >= Duration::from_secs(30), "{how:?}");
+    force_stop(&rig, stop).await;
     let ended = stream.await.expect("task").expect_err("ended");
     assert_eq!(ended.code(), Code::Unavailable, "{how:?}: {ended:?}");
 }
@@ -669,7 +650,7 @@ async fn the_endpoints_drain_keeps_the_stream_of_a_queued_operation_a_worker_can
 
 /// Asserts that an operation that had a lease, lost it to a silent node and now waits
 /// behind a cordoned worker keeps its stream: it reads `WaitingKept`, not `Waiting`,
-/// and the stream lasts until the deadline, as that of any operation that has run.
+/// and the stream lasts past the deadline, as that of any operation that has run.
 async fn a_requeued_operation_keeps_its_stream(how: Begin) {
     let rig = Rig::new(timing(0, 30));
     let mut inbox = register(&rig);
@@ -688,20 +669,14 @@ async fn a_requeued_operation_keeps_its_stream(how: Begin) {
         *ticket.stage.borrow()
     );
     let stream = follow(&rig, &ticket).await;
-    let began = Instant::now();
     let stop = begin(&rig, how, Duration::MAX);
 
-    pass_feeding(&rig, 29).await;
+    pass_feeding(&rig, 40).await;
     assert!(
         !stream.is_finished(),
         "{how:?}: an operation that ran was ended early"
     );
-    assert!(!stop.is_finished(), "{how:?}");
-    tokio::time::timeout(Duration::from_secs(60), stop)
-        .await
-        .expect("the stop ends at the deadline")
-        .expect("task");
-    assert!(began.elapsed() >= Duration::from_secs(30), "{how:?}");
+    force_stop(&rig, stop).await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -875,8 +850,8 @@ fn other_frontend(rig: &Rig) -> (Farm, Inbox) {
 
 /// Asserts what the ruling says for an operation no worker of this frontend could run: with
 /// another frontend that has a worker that could, its stream is kept through the load
-/// balancer wait (that frontend takes the operation), until the deadline ends it with the
-/// stop; with no other frontend it ends at the end of the wait.
+/// balancer wait (that frontend takes the operation), past the deadline, until a second
+/// signal ends it with the stop; with no other frontend it ends at the end of the wait.
 async fn a_waiting_stream_follows_whether_another_frontend_could_take_it(how: Begin, other: bool) {
     let rig = Rig::new(timing(10, 30));
     let _other = other.then(|| other_frontend(&rig));
@@ -888,17 +863,14 @@ async fn a_waiting_stream_follows_whether_another_frontend_could_take_it(how: Be
     let stream = follow(&rig, &ticket).await;
     let stop = begin(&rig, how, Duration::MAX);
 
-    pass_feeding(&rig, 20).await;
+    pass_feeding(&rig, 40).await;
     assert_eq!(
         stream.is_finished(),
         !other,
         "{how:?}: another frontend {other}"
     );
     if other {
-        tokio::time::timeout(Duration::from_secs(60), stop)
-            .await
-            .expect("the stop ends at the deadline")
-            .expect("task");
+        force_stop(&rig, stop).await;
     }
 }
 
@@ -948,12 +920,9 @@ async fn an_operation_that_stopped_waiting_keeps_its_stream(how: Begin) {
     let stream = follow(&rig, last).await;
     let stop = begin(&rig, how, Duration::MAX);
 
-    pass_feeding(&rig, 20).await;
+    pass_feeding(&rig, 40).await;
     assert!(!stream.is_finished(), "{how:?}: ended");
-    tokio::time::timeout(Duration::from_secs(60), stop)
-        .await
-        .expect("the stop ends at the deadline")
-        .expect("task");
+    force_stop(&rig, stop).await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -1019,4 +988,5 @@ async fn another_frontends_node_of_another_platform_does_not_keep_the_stream() {
     }
 }
 
+mod deadline;
 mod skips;

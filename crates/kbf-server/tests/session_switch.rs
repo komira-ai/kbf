@@ -218,6 +218,25 @@ async fn an_unknown_phase_is_offered_nothing() {
     daemon.no_work().await;
 }
 
+/// Catches a tainted phase (it is on the wire, this server does not act on it yet) that
+/// is read as serving: it is held back like a quarantine.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tainted_phase_is_offered_nothing() {
+    let cell = Cell::start().await;
+    let tainted = Some(NodePhase {
+        phase: Phase::Tainted.into(),
+        reason: "a container could not be removed".to_owned(),
+        ..NodePhase::default()
+    });
+    let mut daemon = FakeDaemon::connect(cell.worker_addr, mac("one", tainted))
+        .await
+        .expect("registered");
+    let job = Job::new("waits", WHOLE);
+    cell.upload(&job.blobs()).await;
+    let _ops = cell.execute(&job.action).await;
+    daemon.no_work().await;
+}
+
 /// Catches a draining daemon (it was told to stop and finishes its runs first) that is
 /// still offered work (the phase read as serving: the restart drill's 18 s of
 /// re-placing), or one whose running lease is lost for it: with the node heartbeating

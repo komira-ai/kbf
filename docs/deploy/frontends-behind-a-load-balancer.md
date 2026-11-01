@@ -89,7 +89,7 @@ Several frontends over one store are supported on `main` today:
 
 - A frontend that opens a Postgres store takes no writer generation. It makes sure the
   store's `meta/generation` row holds the marker `shared-writers`
-  (`crates/kbf-state/src/shared.rs`, `share`; called from `StateStore::open` in
+  (`crates/js-state/src/shared.rs` in the jobscheduler repository, `share`; called from `StateStore::open` in
   `crates/kbf-server/src/state_store.rs`), and any number of frontends can then open the
   database and serve at once; none fences another. Writes are conditional on the rows
   read.

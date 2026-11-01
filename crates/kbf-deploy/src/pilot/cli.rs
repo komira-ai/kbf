@@ -4,7 +4,7 @@ use std::ffi::OsString;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use clap::{Args, Subcommand};
 
@@ -74,12 +74,13 @@ pub fn run<E: Exec>(
     p: Pilot,
     exec: &mut E,
     env: &dyn Fn(&str) -> Option<OsString>,
+    now: SystemTime,
     out: &mut dyn Write,
     err: &mut dyn Write,
     pause: &dyn Fn(),
 ) -> ExitCode {
     let done = match p {
-        Pilot::ServerInstall(a) => server_install(a, exec, env, out, pause),
+        Pilot::ServerInstall(a) => server_install(a, exec, env, now, out, pause),
         Pilot::Buckconfig(a) => Config::load(&a.config, KEYS)
             .map_err(PilotError::from)
             .and_then(|c| {
@@ -120,6 +121,7 @@ fn server_install<E: Exec>(
     a: ServerInstallArgs,
     exec: &mut E,
     env: &dyn Fn(&str) -> Option<OsString>,
+    now: SystemTime,
     out: &mut dyn Write,
     pause: &dyn Fn(),
 ) -> Result<(), PilotError> {
@@ -137,7 +139,7 @@ fn server_install<E: Exec>(
             exec,
             &u,
             Platform::HOST,
-            &crate::cli::stamp(),
+            &crate::cli::stamp(now),
             mode(a.apply),
             out,
         );

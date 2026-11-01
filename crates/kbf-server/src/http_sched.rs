@@ -20,7 +20,10 @@
 //!   "avoided", "avoided_total"}`. `by_platform` has one entry per platform and QoS
 //!   level; `waiting` one per reason no live worker can run the work, with its count
 //!   and an example; `avoided` the queued operations placement keeps off some nodes,
-//!   at most [`kbf_sched::MAX_AVOIDED`], of which there are `avoided_total`. It takes no query.
+//!   at most [`kbf_sched::MAX_AVOIDED`], of which there are `avoided_total`. With
+//!   `--whole-node-max` it has a `whole_node` section too: the caps' numbers and the
+//!   queued whole-machine requests with why each waits; without the option the document
+//!   is as it was. It takes no query.
 //!
 //! Every answer is `Cache-Control: no-store`. Durations carry the unit in the key. The
 //! routes are written up in `docs/api-scheduler.md`.
@@ -34,12 +37,13 @@ use axum::http::StatusCode;
 use axum::http::header::CACHE_CONTROL;
 use axum::response::Response;
 use axum::routing::get;
-use kbf_sched::{LeaseView, QueueView};
+use kbf_sched::{LeaseView, QueueView, WHOLE_REASONS, WholeState, whole_reason_name};
 use kbf_types::{LeaseId, WorkerId};
 use serde_json::{Value, json};
 
 use crate::api::{error, json};
 use crate::farm::Farm;
+use crate::farm::sched_view::WholeView;
 
 /// The path of `GET /v1/leases`.
 pub const LEASES: &str = "/v1/leases";
@@ -182,8 +186,8 @@ fn lease_item(lease: &LeaseView, epoch_unix_ms: u64) -> Value {
         "granted_unix_ms": wall(lease.granted_at),
         "started_unix_ms": lease.started_at.map(wall),
         "operation": lease.operation.to_string(),
-        "instance": lease.instance,
-        "digest": lease.action.to_string(),
+        "instance": lease.key.class,
+        "digest": lease.key.dedup,
         "platform": lease.platform,
         "qos": lease.qos.name(),
     })
@@ -226,8 +230,114 @@ async fn leases(State(farm): State<Arc<Farm>>, RawQuery(raw): RawQuery) -> Respo
     )
 }
 
-/// The queue as the API shows it.
-fn queue_body(queue: &QueueView) -> Value {
+/// A farm time `at` as the milliseconds from `now` until it: 0 for a time already past,
+/// `null` for the end of time (a hold with no wall time to give it up at).
+fn until(at: kbf_types::FarmTime, now: kbf_types::FarmTime) -> Value {
+    if at.as_millis() == u64::MAX {
+        return Value::Null;
+    }
+    json!(at.as_millis().saturating_sub(now.as_millis()))
+}
+
+/// The `whole_node` section of the queue: the caps' numbers and each queued
+/// whole-machine request with why it waits.
+fn whole_body(view: &WholeView) -> Value {
+    let now = view.now;
+    let waiting: serde_json::Map<String, Value> = WHOLE_REASONS
+        .iter()
+        .map(|r| {
+            let count = view.summary.waiting.get(r).copied().unwrap_or(0);
+            (whole_reason_name(*r).to_owned(), json!(count))
+        })
+        .collect();
+    let requests: Vec<Value> = view
+        .requests
+        .iter()
+        .map(|r| {
+            let mut item = json!({
+                "operation": r.operation.to_string(),
+                "instance": r.key.class,
+                "digest": r.key.dedup,
+                "state": "queued",
+                "reason": whole_reason_name(r.state.reason()),
+                "may_hold_in_ms": null,
+                "worker": null,
+                "held_for_ms": null,
+                "deadline_in_ms": null,
+                "give_ups": null,
+                "draining": null,
+                "barred": [],
+                "unservable": null,
+            });
+            let fields = item.as_object_mut().expect("an object");
+            match &r.state {
+                WholeState::Early { may_hold_at } => {
+                    fields.insert("state".into(), json!("early"));
+                    fields.insert("may_hold_in_ms".into(), until(*may_hold_at, now));
+                }
+                WholeState::Holding {
+                    worker,
+                    made,
+                    deadline,
+                    give_ups,
+                    draining,
+                } => {
+                    fields.insert("state".into(), json!("holding"));
+                    fields.insert("worker".into(), json!(worker.as_str()));
+                    fields.insert(
+                        "held_for_ms".into(),
+                        json!(now.as_millis().saturating_sub(made.as_millis())),
+                    );
+                    fields.insert(
+                        "deadline_in_ms".into(),
+                        deadline.map_or(Value::Null, |at| until(at, now)),
+                    );
+                    fields.insert("give_ups".into(), json!(give_ups));
+                    fields.insert("draining".into(), json!(draining));
+                }
+                WholeState::Barred { workers, give_ups } => {
+                    fields.insert("state".into(), json!("barred"));
+                    fields.insert("give_ups".into(), json!(give_ups));
+                    let barred: Vec<Value> = workers
+                        .iter()
+                        .map(|(worker, end)| {
+                            json!({"worker": worker.as_str(), "until_in_ms": until(*end, now)})
+                        })
+                        .collect();
+                    fields.insert("barred".into(), json!(barred));
+                }
+                WholeState::Stopped(_) => {
+                    fields.insert("state".into(), json!("stopped"));
+                }
+                WholeState::Queued => {}
+                WholeState::Unservable { reason, .. } => {
+                    fields.insert("state".into(), json!("unservable"));
+                    fields.insert("unservable".into(), json!(reason));
+                }
+            }
+            item
+        })
+        .collect();
+    let s = &view.summary;
+    json!({
+        "held": s.held,
+        "marks": s.marks,
+        "whole": s.whole,
+        "draining": s.draining,
+        "ceiling": s.ceiling,
+        "max_whole_node": s.max_whole_node,
+        "capable_hosts": s.capable_hosts,
+        "keep_for_ordinary": s.keep_for_ordinary,
+        "max_draining": s.max_draining,
+        "waiting": waiting,
+        "requests": requests,
+        "requests_total": view.total,
+    })
+}
+
+/// The queue as the API shows it; `whole` is its `whole_node` section, present only with
+/// the whole-node option on.
+fn queue_body(queue: &QueueView, whole: Option<&WholeView>) -> Value {
     let by_platform: Vec<Value> = queue
         .groups
         .iter()
@@ -248,8 +358,8 @@ fn queue_body(queue: &QueueView) -> Value {
                 "reason": g.reason,
                 "count": g.count,
                 "example_operation": g.example.to_string(),
-                "example_instance": g.example_instance,
-                "example_digest": g.example_action.to_string(),
+                "example_instance": g.example_key.class,
+                "example_digest": g.example_key.dedup,
             })
         })
         .collect();
@@ -259,20 +369,31 @@ fn queue_body(queue: &QueueView) -> Value {
         .map(|a| {
             json!({
                 "operation": a.operation.to_string(),
-                "instance": a.instance,
-                "digest": a.action.to_string(),
+                "instance": a.key.class,
+                "digest": a.key.dedup,
                 "nodes": a.nodes.iter().map(WorkerId::as_str).collect::<Vec<_>>(),
             })
         })
         .collect();
-    json!({
+    let mut body = json!({
         "depth": queue.depth,
         "oldest_age_ms": queue.oldest_age.map(millis),
         "by_platform": by_platform,
         "waiting": waiting,
         "avoided": avoided,
         "avoided_total": queue.avoided_total,
-    })
+    });
+    if let Some(whole) = whole {
+        body["whole_node"] = whole_body(whole);
+    }
+    body
+}
+
+/// The body of `GET /v1/queue` now: the queue and, with the whole-node option on, its
+/// `whole_node` section, read together.
+pub(crate) fn queue_document(farm: &Farm) -> Value {
+    let (queue, whole) = farm.queue_views();
+    queue_body(&queue, whole.as_ref())
 }
 
 async fn queue(State(farm): State<Arc<Farm>>, RawQuery(raw): RawQuery) -> Response {
@@ -283,7 +404,7 @@ async fn queue(State(farm): State<Arc<Farm>>, RawQuery(raw): RawQuery) -> Respon
             .unwrap_or_default();
         return bad(&format!("this route takes no query key {key:?}"));
     }
-    fresh(StatusCode::OK, &queue_body(&farm.queue_view()))
+    fresh(StatusCode::OK, &queue_document(&farm))
 }
 
 #[cfg(test)]

@@ -97,13 +97,31 @@ impl Rig {
         self.open_with(self.store())
     }
 
+    /// An updater over the standard inventory with `timing` in place of the defaults.
+    pub fn open_timed(&self, timing: Timing) -> Updater {
+        match Updater::open(inventory(), self.store(), self.ports(), timing) {
+            Ok(u) => u,
+            Err(e) => panic!("open: {e}"),
+        }
+    }
+
     pub fn open_with(&self, store: RollStore) -> Updater {
         self.open_inventory(inventory(), store)
     }
 
     /// An updater over `inventory` in place of the standard one.
     pub fn open_inventory(&self, inventory: Inventory, store: RollStore) -> Updater {
-        match Updater::open(inventory, store, self.ports(), Timing::default()) {
+        self.open_inventory_timed(inventory, store, Timing::default())
+    }
+
+    /// [`Rig::open_inventory`] with `timing` in place of the defaults.
+    pub fn open_inventory_timed(
+        &self,
+        inventory: Inventory,
+        store: RollStore,
+        timing: Timing,
+    ) -> Updater {
+        match Updater::open(inventory, store, self.ports(), timing) {
             Ok(u) => u,
             Err(e) => panic!("open: {e}"),
         }
@@ -132,7 +150,7 @@ fn failure_code(roll: &Roll) -> ErrorCode {
 }
 
 fn e(s: &str) -> Event {
-    // `ck:` check, `in:` install, `hl:` health, `qy:` query, `dr:` drain (600 s), `ls:` read the
+    // `ck:` check, `in:` install, `hl:` health, `qy:` query, `dr:` drain (no deadline), `ls:` read the
     // node's leases, `ud:` undrain.
     let (kind, alias) = s.split_once(':').expect("kind:alias");
     let a = alias.to_owned();
@@ -140,7 +158,7 @@ fn e(s: &str) -> Event {
         "ck" => Event::Check(a),
         "in" => Event::Install(a, "2.0".to_owned()),
         "hl" => Event::Health(a),
-        "dr" => Event::Drain(a, 600),
+        "dr" => Event::Drain(a, None),
         "ls" => Event::Leases(a),
         "ud" => Event::Undrain(a),
         _ => Event::Query(a),

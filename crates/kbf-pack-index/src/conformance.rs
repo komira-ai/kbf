@@ -317,7 +317,10 @@ pub fn p3_conflicting_record_is_refused<B: PackBackend>(backend: &B) {
             size: first.size + 1,
             ..first.clone()
         },
-        with_blobs(&first, |b| b[1].offset += 1),
+        with_blobs(&first, |b| {
+            b[0].offset = 20;
+            b[1].offset = 0;
+        }),
         with_blobs(&first, |b| b.truncate(2)),
         with_blobs(&first, |b| b.push(blob(4, 5, 60))),
         with_blobs(&first, |b| b[2] = blob(4, 40, 30)),
@@ -606,7 +609,8 @@ pub fn p8_concurrent_records_all_succeed<B: PackBackend>(backend: &B) {
 
 /// P9: a pack that cannot exist is refused and leaves nothing behind: one with no key, one
 /// longer than a `bigint` holds, one that lists a digest twice, one with a blob past its end,
-/// and one whose blob would end past the largest offset.
+/// one whose blob would end past the largest offset and one whose blobs
+/// overlap.
 pub fn p9_a_pack_that_cannot_exist_is_refused<B: PackBackend>(backend: &B) {
     let index = backend.open_index(Arc::new(ManualClock::default()));
     let base = packed(KEY, "n1", &[(1, 10)]);
@@ -621,12 +625,14 @@ pub fn p9_a_pack_that_cannot_exist_is_refused<B: PackBackend>(backend: &B) {
         ..base.clone()
     };
     let wrapped = with_blobs(&base, |b| b[0].offset = u64::MAX);
+    let shared = with_blobs(&packed(KEY, "n1", &[(1, 10), (2, 20)]), |b| b[1].offset = 5);
     let cases = [
         (no_key, "the pack key is empty"),
         (huge, "the pack is longer than the index can hold"),
         (twice, "a digest appears twice in the pack"),
         (past, "a blob reaches past the end of the pack"),
         (wrapped, "a blob reaches past the end of the pack"),
+        (shared, "two blobs of the pack overlap"),
     ];
     for (pack, why) in cases {
         same(

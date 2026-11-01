@@ -3,8 +3,6 @@
 //! with one warning, when a handle on the store is leaked.
 
 use std::future::ready;
-use std::io;
-use std::sync::{Arc, Mutex, PoisonError};
 
 use kbf_meta::Retention;
 use kbf_objstore::{Capabilities, Floor, FsStore, MemoryStore, Released};
@@ -13,44 +11,7 @@ use super::{COLD_RELEASE_DEADLINE, StorageHandle, assemble, command, parse};
 use crate::RaftMetaLog;
 use crate::cold_apply::Fixed;
 use crate::replication::REPAIR_DIR;
-
-/// What the subscriber wrote.
-#[derive(Clone, Default)]
-struct Log(Arc<Mutex<Vec<u8>>>);
-
-impl io::Write for Log {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Log {
-    type Writer = Log;
-
-    fn make_writer(&'a self) -> Log {
-        self.clone()
-    }
-}
-
-impl Log {
-    fn text(&self) -> String {
-        String::from_utf8(
-            self.0
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .clone(),
-        )
-        .expect("UTF-8")
-    }
-}
+use crate::test_log::capture;
 
 /// A new, empty directory for one test, removed when it drops.
 fn scratch(name: &str) -> kbf_testkit::dir::TestDir {
@@ -89,19 +50,10 @@ async fn node(dir: &std::path::Path, cold: Option<Released>) -> StorageHandle {
     .expect("the node assembles")
 }
 
-/// The log of this thread, until the guard drops. Other tests of the binary reach the
-/// same callsites with no subscriber and can leave their interest cached as never, so
-/// the cache is rebuilt once ours is installed.
-fn capture(log: &Log) -> tracing::subscriber::DefaultGuard {
-    let guard = tracing::subscriber::set_default(
-        tracing_subscriber::fmt()
-            .with_writer(log.clone())
-            .with_ansi(false)
-            .finish(),
-    );
-    tracing_core::callsite::rebuild_interest_cache();
-    guard
-}
+/// What a stop writes once the node's calls have ended and nothing is staged on the hot
+/// store (`RamDrain::after`): in every capture below, so an absent line is absent from a
+/// capture that holds the lines the serve wrote.
+const STOP_LINE: &str = "no block is left staged";
 
 /// Catches a `serve` that warns, or waits, when the cold store is released in time: the
 /// only handle on the store is the node's, dropped by `serve`, so it returns with no
@@ -113,8 +65,7 @@ async fn serve_returns_at_once_and_quietly_when_the_store_is_released() {
     let handle = node(&dir, Some(cold.released())).await;
     let released = cold.released();
     drop(cold);
-    let log = Log::default();
-    let _guard = capture(&log);
+    let log = capture();
     let start = tokio::time::Instant::now();
     handle.serve().await.expect("serves");
     assert_eq!(start.elapsed(), std::time::Duration::ZERO);
@@ -122,6 +73,7 @@ async fn serve_returns_at_once_and_quietly_when_the_store_is_released() {
         .wait_within(std::time::Duration::ZERO)
         .await
         .expect("released");
+    assert!(log.text().contains(STOP_LINE), "{}", log.text());
     assert!(!log.text().contains("still open"), "{}", log.text());
 }
 
@@ -136,8 +88,7 @@ async fn serve_gives_up_at_the_deadline_with_one_warning_naming_the_handles() {
     let cold_dir = dir.join("cold");
     let cold = FsStore::open(&cold_dir, Floor::Bytes(1)).expect("open");
     let handle = node(&dir, Some(cold.released())).await;
-    let log = Log::default();
-    let _guard = capture(&log);
+    let log = capture();
     let start = tokio::time::Instant::now();
     handle.serve().await.expect("serves");
     assert_eq!(start.elapsed(), COLD_RELEASE_DEADLINE);
@@ -158,8 +109,7 @@ async fn serve_checked_reports_a_leaked_handle_at_its_own_limit() {
     let dir = scratch("checked");
     let cold = FsStore::open(&dir.join("cold"), Floor::Bytes(1)).expect("open");
     let handle = node(&dir, Some(cold.released())).await;
-    let log = Log::default();
-    let _guard = capture(&log);
+    let log = capture();
     let limit = std::time::Duration::from_secs(3);
     let start = tokio::time::Instant::now();
     let (served, released) = handle.serve_checked(limit).await;
@@ -167,6 +117,7 @@ async fn serve_checked_reports_a_leaked_handle_at_its_own_limit() {
     let held = released.expect_err("a clone is alive");
     assert_eq!((held.clones, held.limit), (1, limit));
     assert_eq!(start.elapsed(), limit);
+    assert!(log.text().contains(STOP_LINE), "{}", log.text());
     assert!(!log.text().contains("still open"), "{}", log.text());
     drop(cold);
 }
@@ -182,8 +133,7 @@ async fn serve_waits_for_a_held_clone_and_returns_when_it_is_dropped() {
     let dir = scratch("held");
     let cold = FsStore::open(&dir.join("cold"), Floor::Bytes(1)).expect("open");
     let handle = node(&dir, Some(cold.released())).await;
-    let log = Log::default();
-    let _guard = capture(&log);
+    let log = capture();
     let limit = std::time::Duration::from_secs(10);
     let serving = handle.serve_checked(limit);
     tokio::pin!(serving);
@@ -196,6 +146,7 @@ async fn serve_waits_for_a_held_clone_and_returns_when_it_is_dropped() {
     let (served, released) = serving.await;
     served.expect("serves");
     released.expect("released once the clone is dropped");
+    assert!(log.text().contains(STOP_LINE), "{}", log.text());
     assert!(!log.text().contains("still open"), "{}", log.text());
 }
 
@@ -206,12 +157,12 @@ async fn serve_waits_for_a_held_clone_and_returns_when_it_is_dropped() {
 async fn serve_with_no_cold_lock_to_wait_for_returns_at_once() {
     let dir = scratch("none");
     let handle = node(&dir, None).await;
-    let log = Log::default();
-    let _guard = capture(&log);
+    let log = capture();
     let start = tokio::time::Instant::now();
     let (served, released) = handle.serve_checked(COLD_RELEASE_DEADLINE).await;
     served.expect("serves");
     released.expect("nothing to release");
     assert_eq!(start.elapsed(), std::time::Duration::ZERO);
+    assert!(log.text().contains(STOP_LINE), "{}", log.text());
     assert!(!log.text().contains("still open"), "{}", log.text());
 }

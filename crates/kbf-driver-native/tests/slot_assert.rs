@@ -234,7 +234,9 @@ fn agent(label: &str) -> String {
 
 /// Bootstraps the agent `label` into `user/<uid>` from the user's home, as the user
 /// through `launchctl asuser` and the `as-user` drop of `drop_to`, and waits until
-/// `launchctl print` lists it.
+/// `launchctl print` lists it and its program (`/bin/sleep`) is running as the user.
+/// Being listed is not being started: launchd spawns a RunAtLoad agent after it lists
+/// it, so a probe run between the two would see no process.
 fn bootstrap(user: &SlotUser, drop_to: &str, label: &str) {
     let agents = home_of(user).join("Library").join("LaunchAgents");
     let (made, said) = as_user(user, "/bin/mkdir", &["-p", &agents.to_string_lossy()]);
@@ -265,6 +267,9 @@ fn bootstrap(user: &SlotUser, drop_to: &str, label: &str) {
     );
     wait_until(&format!("{label} is listed ({booted}: {said})"), || {
         root("/bin/launchctl", &["print", &service]).0
+    });
+    wait_until(&format!("{label}'s /bin/sleep runs as uid {uid}"), || {
+        root("/usr/bin/pgrep", &["-U", &uid, "-x", "sleep"]).0
     });
 }
 

@@ -202,16 +202,66 @@ impl<T: Installer + ?Sized> Installer for std::sync::Arc<T> {
     }
 }
 
+/// Whether a node was in placement (taking new leases) when a roll came to it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Placed {
+    /// It was serving, or there is no node to ask about: the roll's drain is the only
+    /// thing keeping it out, so the roll gives it back.
+    In,
+    /// It was out already (cordoned, draining or drained by somebody else): the roll still
+    /// drains it, so that a restart cuts no lease off, but does not give it back.
+    Out,
+}
+
+/// How the frontend holds a node out of placement, as far as telling the updater's own cordon
+/// from an operator's needs: the updater's cordon is always a drain, never a plain cordon.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Seen {
+    /// In placement.
+    Serving,
+    /// Out of placement as a plain cordon (no drain): an operator's, never the updater's.
+    Cordoned,
+    /// Out of placement in a drain (draining, drained or paused at its deadline).
+    Draining,
+}
+
 /// Taking a daemon host's node out of placement at the frontend, and giving it back.
 pub trait Drain: Send + Sync {
-    /// Cordon the node of `host` and ask the frontend to wait for its leases for `deadline`.
-    fn drain(&self, host: &Host, deadline: Duration) -> Result<(), PortError>;
+    /// Whether the node of `host` is in placement now, or was put out by this caller. A caller
+    /// reads this before [`Drain::drain`] and calls [`Drain::undrain`] only for a node that was
+    /// [`Placed::In`]. A drain that can remember its own cordon (the agent's) reads a node it
+    /// cordoned earlier as [`Placed::In`]; one that cannot reads it as out.
+    fn placed(&self, host: &Host) -> Result<Placed, PortError>;
+    /// Cordon the node of `host` and ask the frontend to wait for its leases for `deadline`,
+    /// or with no deadline (`None`) when the caller waits however long it takes.
+    fn drain(&self, host: &Host, deadline: Option<Duration>) -> Result<(), PortError>;
     /// How many leases the node of `host` holds now.
     fn leases(&self, host: &Host) -> Result<usize, PortError>;
-    /// Return the node of `host` to placement. This is unconditional: a node an operator
-    /// cordoned before the roll is uncordoned after it, so cordon it again if it must stay out.
+    /// Return the node of `host` to placement. This is unconditional: it is the caller's job
+    /// not to call it for a node that [`Drain::placed`] said was [`Placed::Out`], because an
+    /// uncordon cannot tell the roll's cordon from an operator's.
     /// A storage host is never drained, even one that also runs a daemon, and needs no node id.
     fn undrain(&self, host: &Host) -> Result<(), PortError>;
+    /// As [`Drain::placed`], but `None` when the frontend knows no node for `host` (a storage
+    /// host that runs no daemon): [`Drain::placed`] reads such a host as in placement, and a
+    /// caller that records a cordon must tell that from a node that is there. The default
+    /// has no such case.
+    fn placed_if_known(&self, host: &Host) -> Result<Option<Placed>, PortError> {
+        self.placed(host).map(Some)
+    }
+    /// As [`Drain::placed_if_known`], but telling a plain cordon from a drain. The default
+    /// reads a node that is out as draining.
+    fn seen_if_known(&self, host: &Host) -> Result<Option<Seen>, PortError> {
+        Ok(self.placed_if_known(host)?.map(|placed| match placed {
+            Placed::In => Seen::Serving,
+            Placed::Out => Seen::Draining,
+        }))
+    }
+    /// Look at the node the caller cordoned earlier, outside any update, so that a drain that
+    /// remembers its own cordon can forget one that is gone. The default does nothing.
+    fn observe(&self, _host: &Host) -> Result<(), PortError> {
+        Ok(())
+    }
 }
 
 /// What a frontend says of its own drain: `GET /v1/frontend/drain`.

@@ -9,15 +9,18 @@
 //!   `SHA256SUMS` and its attestation, and only then loaded ([`ImageSource`], and
 //!   [`Runtime::load`]). Nothing runs differently, and a file that is not the release's is
 //!   refused before the runtime sees it.
-//! - **switch**: refuses when it can see that another frontend is not ready, writes the marker
-//!   (the configuration the containers are made from, the images of both releases, the
-//!   deadline), and then, in this order: asks the frontend to drain through its own operator
-//!   API (`kbf cluster drain --frontend` inside the container, where the API is on loopback),
-//!   waits until the container has ended or the drain deadline is out, stops it, removes it,
-//!   makes a new one from the new image with the same configuration, and waits for `/readyz`
-//!   to answer 200 and `/healthz` to name the release's commit. When any of it fails, the
-//!   container is made again from the old image and waited for the same way, and the switch
-//!   fails.
+//! - **switch**: refuses when it can see that another frontend is not ready; asks the
+//!   frontend to drain through its own operator API (`kbf cluster drain --frontend` inside
+//!   the container, where the API is on loopback); and waits until the container has ended,
+//!   as long as that takes. A configured `drain_secs` only stops the waiting: the switch
+//!   then fails with the old container still running and draining, its restart policy put
+//!   back, nothing stopped, removed or recorded. Only once the container has ended it writes
+//!   the marker (the configuration the containers are made from, the images of both
+//!   releases), stops it, removes it, makes a new one from the new image with the same
+//!   configuration, and waits for `/readyz` to answer 200 and `/healthz` to name the
+//!   release's commit. The trial window counts from the new container's start. When any of
+//!   it fails after the marker, the container is made again from the old image and waited
+//!   for the same way, and the switch fails.
 //! - **confirm**: the marker is cleared and the old image is forgotten.
 //! - **revert**: the container is made again from the old image, as after a failed switch.
 //!   The core calls it when a release on trial is not confirmed by its deadline, whether or
@@ -205,9 +208,11 @@ impl<S: ImageSource, R: Runtime, P: Probe> Frontend<S, R, P> {
         record.save(&self.record_file).map_err(state_fault)
     }
 
-    /// Wait until the container has ended, or the drain deadline is out: a drained frontend
-    /// ends by itself when the work it had is done.
-    fn wait_ended(&self, config: &FrontendConfig) -> Result<(), String> {
+    /// Wait until the container has ended: a drained frontend ends by itself when the work it
+    /// had is done. With no `drain_secs` that takes as long as it takes. With one, a container
+    /// that still runs when it is out is reported as `Ok(false)`: the caller stops waiting,
+    /// and nothing here ends anything.
+    fn wait_ended(&self, config: &FrontendConfig) -> Result<bool, String> {
         let start = (self.pace.now)();
         loop {
             let running = self
@@ -215,9 +220,15 @@ impl<S: ImageSource, R: Runtime, P: Probe> Frontend<S, R, P> {
                 .container(&config.run.name)
                 .map_err(|e| e.to_string())?
                 .is_some_and(|c| c.running);
+            if !running {
+                return Ok(true);
+            }
             let waited = (self.pace.now)().saturating_sub(start);
-            if !running || waited >= Duration::from_secs(config.drain_secs) {
-                return Ok(());
+            if config
+                .drain_secs
+                .is_some_and(|secs| waited >= Duration::from_secs(secs))
+            {
+                return Ok(false);
             }
             (self.pace.sleep)(self.pace.poll);
         }
@@ -248,27 +259,100 @@ impl<S: ImageSource, R: Runtime, P: Probe> Frontend<S, R, P> {
         }
     }
 
-    /// The container is the new release's: drained, stopped, made again from its image, and
-    /// ready.
-    fn replace(&self, trial: &Trial) -> Result<(), String> {
-        let (config, name) = (&trial.config, &trial.config.run.name);
-        let say = |e: RuntimeError| e.to_string();
+    /// The old container is drained and has ended on its own. Nothing is stopped or removed
+    /// here: when the drain is not finished (a configured `drain_secs` is out), or any step
+    /// fails, the container keeps running what it has and only its restart policy is put back
+    /// to the configured one, so the switch can be asked for again.
+    fn drain(&self, config: &FrontendConfig) -> Result<(), Fault> {
+        let name = &config.run.name;
+        let say = |e: RuntimeError| Fault::failed(Code::SwitchFailed, e.to_string());
         let running = self
             .runtime
             .container(name)
             .map_err(say)?
             .is_some_and(|c| c.running);
+        if !running {
+            return Ok(());
+        }
         // The container ends by itself once drained; a policy that restarts it would bring
         // the old release back before the new one is made.
         self.runtime.set_restart(name, "no").map_err(say)?;
-        if running {
-            self.runtime.exec(name, &drain_argv(config)).map_err(say)?;
-            self.wait_ended(config)?;
-        }
+        let waited = self
+            .runtime
+            .exec(name, &drain_argv(config))
+            .map_err(|e| e.to_string())
+            .and_then(|()| self.wait_ended(config));
+        let why = match waited {
+            Ok(true) => return Ok(()),
+            Ok(false) => format!(
+                "the frontend {name} is still draining after {} s (drain_secs); nothing was \
+                 stopped, and it keeps its work",
+                config.drain_secs.unwrap_or_default()
+            ),
+            Err(why) => why,
+        };
+        // Best effort: a container that cannot be told its policy again is still running.
+        let _ = self.runtime.set_restart(name, &config.run.restart);
+        Err(Fault::failed(Code::SwitchFailed, why))
+    }
+
+    /// The container is the new release's: stopped (it has ended after its drain), removed,
+    /// made again from its image, and ready. The trial window counts from the new container's
+    /// start, never from the drain: the deadline goes onto the marker as soon as `run`
+    /// returns, and is the one answered.
+    fn replace(
+        &self,
+        record: &mut Record,
+        trial: &Trial,
+        window_secs: u64,
+        unix_now: &dyn Fn() -> u64,
+    ) -> Result<u64, String> {
+        let (config, name) = (&trial.config, &trial.config.run.name);
+        let say = |e: RuntimeError| e.to_string();
         self.runtime.stop(name, STOP_SECS).map_err(say)?;
         self.runtime.remove(name).map_err(say)?;
         self.runtime.run(&config.run, &trial.image).map_err(say)?;
-        self.wait_ready(config, &trial.commit)
+        let deadline = unix_now() + window_secs;
+        record.pending = Some(Trial {
+            deadline_unix: Some(deadline),
+            ..trial.clone()
+        });
+        record.save(&self.record_file)?;
+        self.wait_ready(config, &trial.commit)?;
+        Ok(deadline)
+    }
+
+    /// At the start of the program: a drain that was cut short by a crash of the program (after
+    /// the restart policy was switched off, before the marker) leaves the old container with no
+    /// policy, and with nothing to say so; if it later exits, no frontend runs. With no release
+    /// on trial and the container's policy off, the configured policy is put back.
+    ///
+    /// Chosen over a "draining" marker because the state is already in the container (nothing
+    /// else turns its policy off outside a switch, and a switch in progress holds a marker
+    /// from the moment the container has ended), so it needs no new record field and cannot go
+    /// stale.
+    ///
+    /// # Errors
+    /// The file, the record or the runtime could not be read, or the policy not set.
+    pub fn recover_restart_policy(&self) -> Result<Option<String>, String> {
+        if self.record().map_err(|f| f.detail)?.pending.is_some() {
+            return Ok(None);
+        }
+        let config = FrontendConfig::load_for_start(&self.host.trust, &self.config_file)?;
+        let name = &config.run.name;
+        let Some(container) = self.runtime.container(name).map_err(|e| e.to_string())? else {
+            return Ok(None);
+        };
+        if !matches!(container.restart.as_str(), "" | "no") {
+            return Ok(None);
+        }
+        self.runtime
+            .set_restart(name, &config.run.restart)
+            .map_err(|e| e.to_string())?;
+        Ok(Some(format!(
+            "the restart policy of {name} was off with no switch under way (a drain cut short); set back to {}",
+            config.run.restart
+        )))
     }
 
     /// The container is the old release's again, from its image and the configuration of the
@@ -366,12 +450,14 @@ impl<S: ImageSource, R: Runtime, P: Probe> Backend for Frontend<S, R, P> {
 
     fn switch(&self, commit: &str, window_secs: u64, now: u64) -> Result<u64, Fault> {
         let config = self.config()?;
-        if config.switch_secs() > window_secs {
+        // The window starts when the new container does, so it holds the wait for readiness
+        // and nothing of the drain.
+        if config.ready_secs > window_secs {
             return Err(Fault::refused(
                 Code::ConfigInvalid,
                 format!(
-                    "a switch can take {} s (drain, stop, ready) and the window is {window_secs} s",
-                    config.switch_secs()
+                    "a new container can take {} s to be ready and the window is {window_secs} s",
+                    config.ready_secs
                 ),
             ));
         }
@@ -406,26 +492,36 @@ impl<S: ImageSource, R: Runtime, P: Probe> Backend for Frontend<S, R, P> {
                 format!("the frontend at {peer} is not ready"),
             ));
         }
+        let begun = (self.pace.now)();
+        let unix_now = || now + (self.pace.now)().saturating_sub(begun).as_secs();
+        // The drain first, with nothing recorded: until the old container has ended it is
+        // untouched and there is nothing to put back. It may take any time; one that is not
+        // done by a configured `drain_secs` stops the switch here.
+        self.drain(&config)?;
         let trial = Trial {
             commit: commit.to_owned(),
             image: image.clone(),
             from,
             from_image: container.image_id,
-            deadline_unix: Some(now + window_secs),
+            deadline_unix: Some(unix_now() + window_secs),
             config,
         };
-        // The marker first: whatever happens from here, the old release is put back from it.
+        // The marker before the old container is stopped: whatever happens from here, the
+        // old release is put back from it.
         record.pending = Some(trial.clone());
         self.save(&record)?;
-        let moved = self.replace(&trial).and_then(|()| {
-            record.current = Some(Slot {
-                commit: commit.to_owned(),
-                image,
+        let moved = self
+            .replace(&mut record, &trial, window_secs, &unix_now)
+            .and_then(|deadline| {
+                record.current = Some(Slot {
+                    commit: commit.to_owned(),
+                    image,
+                });
+                record.save(&self.record_file).map(|()| deadline)
             });
-            record.save(&self.record_file)
-        });
-        let Err(why) = moved else {
-            return Ok(now + window_secs);
+        let why = match moved {
+            Ok(deadline) => return Ok(deadline),
+            Err(why) => why,
         };
         match self.restore(&trial) {
             Ok(()) => {
@@ -518,6 +614,8 @@ pub fn production(
 
 #[cfg(test)]
 mod config_tests;
+#[cfg(test)]
+mod drain_tests;
 #[cfg(test)]
 mod fake;
 #[cfg(test)]

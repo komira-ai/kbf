@@ -130,6 +130,8 @@ impl Farm {
                 kbf_front::Defaults {
                     memory: kbf_front::DEFAULT_RESOURCES.memory_bytes,
                     platform: kbf_front::DefaultPlatform::NONE,
+                    qos: kbf_front::QosAllow::DEFAULT,
+                    exclusive_actions: false,
                 },
             )
         };
@@ -151,6 +153,31 @@ impl Farm {
                 kbf_front::Defaults {
                     memory: default_memory,
                     platform: kbf_front::DefaultPlatform::NONE,
+                    qos: kbf_front::QosAllow::DEFAULT,
+                    exclusive_actions: false,
+                },
+            )
+        };
+        Self::serve(routes).await
+    }
+
+    /// The cache services and `Execution` over `dispatch` (streams never closed), where
+    /// every `action` lease asks to own its whole worker.
+    pub async fn with_exclusive_actions<D: Dispatch>(dispatch: Arc<D>) -> Self {
+        let (_, closing) = kbf_front::closing();
+        let routes = |cache| {
+            kbf_front::routes_recorded(
+                cache,
+                dispatch,
+                closing,
+                kbf_front::Progress::off(),
+                Arc::new(Authorizers::allow_all()),
+                &kbf_front::Recorder::off(),
+                kbf_front::Defaults {
+                    memory: kbf_front::DEFAULT_RESOURCES.memory_bytes,
+                    platform: kbf_front::DefaultPlatform::NONE,
+                    qos: kbf_front::QosAllow::DEFAULT,
+                    exclusive_actions: true,
                 },
             )
         };
@@ -175,6 +202,31 @@ impl Farm {
                 kbf_front::Defaults {
                     memory: kbf_front::DEFAULT_RESOURCES.memory_bytes,
                     platform,
+                    qos: kbf_front::QosAllow::DEFAULT,
+                    exclusive_actions: false,
+                },
+            )
+        };
+        Self::serve(routes).await
+    }
+
+    /// The cache services and `Execution` over `dispatch` (streams never closed),
+    /// where the `x-kbf-qos` header may name the levels in `qos`.
+    pub async fn with_qos_allow<D: Dispatch>(dispatch: Arc<D>, qos: kbf_front::QosAllow) -> Self {
+        let (_, closing) = kbf_front::closing();
+        let routes = |cache| {
+            kbf_front::routes_recorded(
+                cache,
+                dispatch,
+                closing,
+                kbf_front::Progress::off(),
+                Arc::new(Authorizers::allow_all()),
+                &kbf_front::Recorder::off(),
+                kbf_front::Defaults {
+                    memory: kbf_front::DEFAULT_RESOURCES.memory_bytes,
+                    platform: kbf_front::DefaultPlatform::NONE,
+                    qos,
+                    exclusive_actions: false,
                 },
             )
         };

@@ -5,11 +5,13 @@ use std::fs::File;
 use std::os::fd::OwnedFd;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 use kbf_daemon::cas::Cas;
 use kbf_daemon::tree::{check_relative, fetch_message, materialize, output_paths, real_dirs};
 use kbf_daemon::{RuntimeError, Work, upload_within};
-use kbf_proto::reapi::{Action, ActionResult, Command};
+use kbf_proto::reapi::{Action, ActionResult, Command, ExecutedActionMetadata};
+use kbf_proto::worker::ResourceUsage;
 use tokio::sync::oneshot;
 
 use super::state::{Record, Step};
@@ -105,6 +107,7 @@ impl<S: Session, C: Cas> WholeMachineRuntime<S, C> {
         // Kept first: a daemon that restarts from here on must not run it again.
         record.step = Step::Started;
         self.keep(record).map_err(RuntimeError::Failed)?;
+        let started = Instant::now();
         let running = self
             .helper(move |s| s.run(id, &argv, &env, fds))
             .await
@@ -116,14 +119,20 @@ impl<S: Session, C: Cas> WholeMachineRuntime<S, C> {
             () = tokio::time::sleep(timeout) => Ended::TimedOut,
             Ok(by) = &mut *stop => Ended::Killed(by),
         };
+        let usage = ResourceUsage {
+            wall_micros: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            ..ResourceUsage::default()
+        };
         let exit = match ended {
             Ended::Exited(exit) => exit.map_err(failed_at("waiting for the action"))?,
             Ended::TimedOut => {
+                self.keep_failed(id, usage);
                 self.end(id, exited).await?;
                 return Err(self.timed_out(cas, &dir).await);
             }
             Ended::Killed(by) => {
                 *killer = Some(by);
+                self.keep_failed(id, usage);
                 self.end(id, exited).await?;
                 return Err(RuntimeError::Killed);
             }
@@ -155,7 +164,15 @@ impl<S: Session, C: Cas> WholeMachineRuntime<S, C> {
             }
             Ok(())
         };
-        upload_within(self.config.upload_deadline, upload).await?;
+        if let Err(error) = upload_within(self.config.upload_deadline, upload).await {
+            // The action ran, but the lease has no result to carry what it used.
+            self.keep_failed(id, usage);
+            return Err(error);
+        }
+        result.execution_metadata = Some(ExecutedActionMetadata {
+            auxiliary_metadata: vec![usage.to_any()],
+            ..ExecutedActionMetadata::default()
+        });
         Ok(result)
     }
 

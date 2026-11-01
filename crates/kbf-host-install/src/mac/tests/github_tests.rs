@@ -559,6 +559,25 @@ fn a_network_failure_refuses_before_any_root_state_changes() {
     assert_untouched(&fx);
 }
 
+/// Catches a listing that a signal ended being reported as "exit status None": the refusal
+/// is `fetch_failed`, and its reason names the program and the signal, so the operator can tell
+/// a kill (SIGKILL), a crash (SIGSEGV, SIGABRT) and a broken pipe (SIGPIPE) apart.
+#[test]
+fn a_listing_ended_by_a_signal_names_the_signal() {
+    let fx = Fx::new("mac-gh-signal");
+    let sim = github(&fx);
+    sim.break_("list-signal");
+    let result = run(&fx, &sim, &channel(&fx, false), NEW_VERSION);
+    match result {
+        Err(Outcome::RefusedBecause(Refusal::FetchFailed, why)) => {
+            assert!(why.starts_with("curl: signal 13 (SIGPIPE): "), "{why}");
+            assert!(!why.contains("None"), "{why}");
+        }
+        other => panic!("not a fetch failure with a reason: {other:?}"),
+    }
+    assert_untouched(&fx);
+}
+
 fn write_channel(fx: &Fx, body: &str) {
     write(
         &fx.host.allowlist,
@@ -993,6 +1012,44 @@ fn the_token_goes_to_the_listing_by_stdin_and_the_download_only() {
             refusal(run(&fx, &sim, &channel, NEW_VERSION)),
             Refusal::ConfigInvalid,
             "{bad:?}"
+        );
+        assert!(sim.calls.borrow().is_empty());
+    }
+}
+
+/// GitHub's workflow tokens are a prefix, an app id and a signed token of about 520 bytes in
+/// base64url with dots. A channel's token file takes one, so a hosted runner's rehearsal can
+/// list releases under the run's own quota; a token that is not one line of those bytes, or
+/// is past 1024 bytes, is still refused.
+#[test]
+fn a_workflow_token_of_the_new_long_format_is_taken() {
+    let long = format!(
+        "ghs_123456_{}.{}.{}",
+        "aB3-_".repeat(30),
+        "xY9".repeat(60),
+        "z_".repeat(60)
+    );
+    assert!(long.len() > 255 && long.len() <= 1024, "{}", long.len());
+    let fx = Fx::new("mac-gh-token-long");
+    let sim = github(&fx);
+    let (channel, _) = token_channel(&fx, &format!("{long}\n"));
+    run(&fx, &sim, &channel, NEW_VERSION).unwrap();
+    for list in curl_calls(&fx, &sim) {
+        assert_eq!(
+            String::from_utf8(list.stdin.clone()).unwrap(),
+            format!("header = \"Authorization: Bearer {long}\"\n")
+        );
+    }
+
+    for bad in ["a".repeat(1025), "ghs_a/b".to_owned(), "ghs_a=b".to_owned()] {
+        let fx = Fx::new("mac-gh-token-long-bad");
+        let sim = github(&fx);
+        let (channel, _) = token_channel(&fx, &bad);
+        assert_eq!(
+            refusal(run(&fx, &sim, &channel, NEW_VERSION)),
+            Refusal::ConfigInvalid,
+            "{} bytes",
+            bad.len()
         );
         assert!(sim.calls.borrow().is_empty());
     }

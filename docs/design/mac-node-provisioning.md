@@ -609,7 +609,7 @@ daemon starts at boot with nobody logged in
 <key>RunAtLoad</key>         <true/>
 <key>KeepAlive</key>         <true/>
 <key>ThrottleInterval</key>  <integer>10</integer>
-<key>ExitTimeOut</key>       <integer>30</integer>
+<key>ExitTimeOut</key>       <integer>2147483647</integer>
 <key>ProcessType</key>       <string>Interactive</string>
 <key>StandardErrorPath</key> <string>/Library/Logs/kbf/kbf-daemon.err.log</string>
 <key>SoftResourceLimits</key><dict><key>NumberOfFiles</key><integer>65536</integer></dict>
@@ -631,8 +631,9 @@ daemon starts at boot with nobody logged in
   limitations ... throttling its CPU usage and I/O bandwidth". `Interactive` jobs "run
   with the same resource limitations as apps, that is to say, none". A build node's
   daemon and the actions it starts must not be throttled.
-- `ExitTimeOut` gives the daemon time to kill its leases on SIGTERM before launchd
-  sends SIGKILL.
+- `ExitTimeOut` is the largest 32-bit value (launchd has no "infinity"): on SIGTERM the
+  daemon drains until every lease has ended, however long that takes, and launchd must
+  not send SIGKILL meanwhile. A second SIGTERM is the operator's hard stop.
 - The server's address, the node id and the certificate paths are flags in
   `ProgramArguments`, written from the profile. No environment variables.
 

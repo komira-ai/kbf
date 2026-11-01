@@ -48,7 +48,8 @@ fn serve(
 fn limits() -> Limits {
     Limits {
         install: Duration::from_secs(5),
-        switch: Duration::from_secs(5),
+        switch: None,
+        revert: Duration::from_secs(5),
         other: Duration::from_secs(5),
     }
 }
@@ -77,6 +78,9 @@ fn the_requests_are_the_helpers_five_and_carry_a_version_and_a_channel_only() {
                 pending: None,
                 last: None,
                 busy: false,
+                releases: Vec::new(),
+                releases_omitted: 0,
+                releases_unavailable: false,
             })),
             Some("stage") => line(&Answer::Staged {
                 version: VB.into(),
@@ -181,6 +185,9 @@ fn the_helpers_real_answers_are_read() {
             reason: Some("timeout"),
         }),
         busy: true,
+        releases: Vec::new(),
+        releases_omitted: 0,
+        releases_unavailable: false,
     };
     let (socket, _) = serve(&d, 1, move |_| line(&Answer::Queried(view.clone())));
     let state = SocketLocal::new(&socket, limits()).query().unwrap();
@@ -218,6 +225,9 @@ fn the_helpers_real_answers_are_read() {
                 reason: None,
             }),
             busy: false,
+            releases: Vec::new(),
+            releases_omitted: 0,
+            releases_unavailable: false,
         }))
     });
     let state = SocketLocal::new(&socket, limits()).query().unwrap();
@@ -400,6 +410,48 @@ fn a_helper_that_is_gone_or_silent_is_unreachable() {
     assert_eq!(Limits::default().install, Duration::from_secs(1200));
 }
 
+/// A switch is not limited by default (the helper waits for the frontend's drain as long as it
+/// takes, and answers when the switch is done), so a helper that answers late is still heard:
+/// this one holds its answer for a moment, a limit of the old 10 minutes' kind would have
+/// given up, and the switch is read as made. The other requests keep their limits.
+#[test]
+fn a_switch_is_waited_for_as_long_as_the_helper_takes() {
+    assert_eq!(Limits::default().switch, None);
+    assert_eq!(Limits::default().revert, Duration::from_secs(600));
+    let d = dir("lc-long-switch");
+    let (socket, asked) = serve(&d, 1, |_| {
+        std::thread::sleep(Duration::from_millis(600));
+        line(&Answer::Switched {
+            version: VB.into(),
+            commit: COMMIT_B.into(),
+            deadline_unix: 77,
+        })
+    });
+    let quick = Limits {
+        other: Duration::from_millis(100),
+        revert: Duration::from_millis(100),
+        ..limits()
+    };
+    assert_eq!(
+        SocketLocal::new(&socket, quick).switch(&version(VB)),
+        Ok(77)
+    );
+    assert_eq!(asked.join().unwrap(), [format!("switch kbf={VB}")]);
+}
+
+/// A switch with no limit still notices a helper that is gone: one that takes the request and
+/// closes the socket (it died) ends the wait at once as unreachable, which the update reports.
+#[test]
+fn a_switch_with_no_limit_still_notices_a_helper_that_dies() {
+    let d = dir("lc-dead-switch");
+    let (socket, _) = serve(&d, 1, |_| None);
+    assert_eq!(Limits::default().switch, None);
+    assert!(matches!(
+        SocketLocal::new(&socket, Limits::default()).switch(&version(VB)),
+        Err(LocalError::Unreachable(_))
+    ));
+}
+
 /// The health check asks the helper what the host runs through the installer port: the commit
 /// the host reports is the helper's, a host whose helper is busy has an install in progress, a
 /// host with no version text has none installed, and the install the roll mode asks for is not
@@ -432,4 +484,66 @@ fn the_helper_is_the_installer_port_of_the_health_check() {
     local.world().query = Err(LocalError::Failed("state_unavailable".into()));
     assert!(!installer.report(&host).unwrap_err().is_unreachable());
     assert!(installer.install(&host, &version(VB)).is_err());
+}
+
+/// Catches this agent failing to read a newer helper's query, which lists the releases it keeps
+/// (and how many it left out of the list): the agent reads the host as it did before, the list
+/// is passed over, and the line of a full list is read whole.
+#[test]
+fn a_query_that_lists_the_kept_releases_reads_as_before() {
+    let d = dir("lc-kept");
+    let kept: Vec<String> = (0..64)
+        .map(|n| {
+            format!(
+                "{{\"commit\":\"{n:040x}\",\"version\":\"0.1.{n}+g{n:012x}-1\",\"why\":[\"pinned\"]}}"
+            )
+        })
+        .collect();
+    let text = format!(
+        "{{\"result\":\"query\",\"commit\":\"{COMMIT_A}\",\"version\":\"{VA}\",\"node_id\":\"n1\",\
+         \"pending\":null,\"last\":null,\"busy\":false,\"releases\":[{}],\"releases_omitted\":3}}\n",
+        kept.join(",")
+    );
+    let (socket, _) = serve(&d, 1, move |_| Some(text.clone()));
+    let state = SocketLocal::new(&socket, limits()).query().unwrap();
+    assert_eq!(state.commit.as_deref(), Some(COMMIT_A));
+    assert_eq!(state.version, Some(version(VA)));
+    assert_eq!(state.node_id.as_deref(), Some("n1"));
+    assert!(!state.busy);
+}
+
+/// Catches a helper's query that this agent cannot read whole: 70 releases that must stay, each
+/// with a version text as long as a binary may declare, cut as the helper cuts them and answered
+/// on the socket, are read by the agent's reader within its limit, the host as before.
+#[test]
+fn a_full_listing_of_long_versions_is_read_within_the_answer_limit() {
+    use kbf_host_install::contract::local::{LISTED_BYTES, MAX_LISTED};
+    let d = dir("lc-long");
+    let kept: Vec<kbf_retain::Kept> = (0..70_u32)
+        .map(|n| kbf_retain::Kept {
+            commit: kbf_retain::CommitId::new(&format!("{n:040x}")).unwrap(),
+            version: Some(format!("0.1.{n}+g{n:012x}-1{}", "x".repeat(4000))),
+            why: vec!["pinned", "last_good"],
+            version_left_out: false,
+        })
+        .collect();
+    let (releases, releases_omitted) = kbf_retain::cut(kept, MAX_LISTED, LISTED_BYTES);
+    assert!(releases_omitted > 0 && releases.iter().all(|k| k.version_left_out));
+    let view = QueryView {
+        commit: Some(COMMIT_A.into()),
+        version: Some(VA.into()),
+        node_id: Some("n1".into()),
+        pending: None,
+        last: None,
+        busy: false,
+        releases,
+        releases_omitted,
+        releases_unavailable: false,
+    };
+    let text = line(&Answer::Queried(view)).unwrap();
+    assert!(text.len() < 16 * 1024, "{} bytes", text.len());
+    let (socket, _) = serve(&d, 1, move |_| Some(text.clone()));
+    let state = SocketLocal::new(&socket, limits()).query().unwrap();
+    assert_eq!(state.commit.as_deref(), Some(COMMIT_A));
+    assert_eq!(state.version, Some(version(VA)));
 }

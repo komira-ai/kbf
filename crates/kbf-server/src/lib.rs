@@ -71,6 +71,9 @@
 //! capability matching, and the daemon-side `ResultAck` handling (issue #26).
 
 pub mod action_usage;
+pub mod answer;
+#[cfg(test)]
+pub(crate) mod answer_tests;
 pub mod api;
 pub mod api_client;
 pub mod blobs;
@@ -79,10 +82,13 @@ mod build_commit;
 #[doc(hidden)]
 pub mod build_seq;
 pub mod cold_apply;
+mod cold_counted;
 pub mod config;
 pub mod drain;
 pub mod enroll;
+pub mod executor;
 pub mod farm;
+pub mod farm_js;
 mod fault;
 pub mod fill;
 mod flag_set;
@@ -98,9 +104,12 @@ mod http_history;
 pub mod http_invocations;
 pub mod http_sched;
 pub mod identity;
+mod input_cache_metrics;
 pub mod join;
+mod key_file;
 pub mod learned;
 mod listen;
+mod load_metrics;
 mod local;
 pub mod log_file;
 pub mod machine;
@@ -117,6 +126,8 @@ mod notify;
 pub mod object_store;
 mod pack_daemon_metrics;
 pub mod pack_locate;
+pub mod placement_load;
+pub mod placement_predictions;
 pub mod proxy_auth;
 pub mod raft_log;
 mod ram_drain;
@@ -128,6 +139,7 @@ pub mod replication;
 pub mod retire;
 pub mod retired;
 mod run_record;
+pub mod scheduler_core;
 pub mod sequence;
 pub mod serve;
 #[cfg(test)]
@@ -153,30 +165,38 @@ pub mod stores;
 pub mod streams;
 #[cfg(test)]
 mod test_dir;
+#[cfg(test)]
+mod test_log;
 mod timeout;
 pub mod token;
 pub mod ui_mount;
 pub mod update_status;
+pub mod usage_profiles;
 pub mod verbs;
 pub mod vitals;
+pub mod whole_node;
 pub mod worker;
 pub mod worker_roles;
 pub mod write_tier;
 
 pub use config::{Args, ConfigError, Role, SERVER, s3_store};
-pub use drain::{Drain, DrainStatus};
+pub use drain::{Drain, DrainStatus, Hold};
 pub use farm::{
     ACK_WINDOW, DONE_FLOOR, EpochBump, EpochPolicy, Farm, ID_BLOCK, INTAKE_POLL, ORPHAN_WAIT,
     OWNER_CACHE_TTL, SESSION_RENEWAL, StateError,
 };
 pub use health::Readiness;
+pub use http_history::run_json;
 pub use identity::{DenyList, DenyListError, Peers};
 pub use kbf_sched::MemoryLadder;
 pub use kbf_tls::{TlsError, TlsFiles, TlsSource};
 pub use learned::LearnedSizes;
 pub use local::LocalStore;
 pub use node_map::NodeMap;
+pub use placement_load::PlacementLoad;
+pub use placement_predictions::PlacementPredictions;
 pub use raft_log::{RaftLogError, RaftMetaLog};
+pub use scheduler_core::SchedulerCore;
 pub use serve::{
     Api, Behind, Bound, BoundStorage, Listeners, ServeError, StorageListener, StreamTiming,
     WorkerTls, bind_server, bind_server_with_api, bind_server_with_map, bind_server_with_policy,
@@ -192,6 +212,8 @@ pub use state_store::{
 };
 pub use streams::{StreamArgs, StreamLimits};
 pub use ui_mount::bind_server_with_options;
+pub use usage_profiles::UsageProfiles;
+pub use whole_node::WholeNodeFlags;
 pub use worker::HostFloor;
 pub use worker::WorkerService;
 

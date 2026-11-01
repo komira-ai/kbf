@@ -1,4 +1,5 @@
 # Size summary `own-limit-kill-sets-a-floor`: the stored record of one summary, version 1.
+# Synthetic: made-up runs fed to the estimator's update path, not farm data.
 # Pins: this build encodes the summary to these bytes, decodes them to it, and
 # refuses a record with any byte changed.
 # A change to this file needs a reason in the pull request that makes it, and the

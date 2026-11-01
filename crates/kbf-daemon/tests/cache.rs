@@ -12,6 +12,8 @@
 mod crash;
 #[path = "cache/edges.rs"]
 mod edges;
+#[path = "cache/input_counts.rs"]
+mod input_counts;
 #[path = "cache/measure.rs"]
 mod measure;
 #[path = "cache/one_cache.rs"]
@@ -33,7 +35,7 @@ use kbf_daemon::tree::{
 };
 use support::cache_kit::{
     CountingCas, FakeClock, Gates, config, digest, entries, entry_path, file, key, lease,
-    lease_dir, on_disk_sum, stop, tmp_files, toolchain,
+    lease_dir, on_disk_sum, open_started, stop, tmp_files, toolchain, wait_for_fill_waits,
 };
 use support::scratch;
 
@@ -44,9 +46,12 @@ fn meta(path: &Path) -> std::fs::Metadata {
 }
 
 /// C-4. Catches fills not merged per key (defect "remove the fill map": every miss
-/// fetches): 32 leases at once over one tree, through a CAS that yields on every read
-/// so their misses overlap, read each file blob exactly once, and each lease's files
-/// are right.
+/// fetches): 32 leases at once over one tree, through a CAS that holds every file read
+/// until a lease has waited on another's fill, read each file blob exactly once, and
+/// each lease's files are right. The overlap is made, not hoped for: with the first
+/// read held, nothing can finish until some lease has reached a held slot and
+/// waited, and the test lets the reads go only then. Without the fill map no lease
+/// waits and the test fails at that wait.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_leases_fetch_each_blob_once() {
     let dir = scratch("cache-c4");
@@ -64,6 +69,7 @@ async fn concurrent_leases_fetch_each_blob_once() {
         })
         .collect();
     let root = cas.tree(&tree);
+    cas.stall();
     let leases: Vec<_> = (0..32)
         .map(|n| {
             let (cas, cache, root, dir) = (
@@ -75,6 +81,8 @@ async fn concurrent_leases_fetch_each_blob_once() {
             tokio::spawn(async move { lease(&cas, &cache, &root, &dir, &format!("l{n}")).await })
         })
         .collect();
+    wait_for_fill_waits(&cache, 1).await;
+    cas.unstall();
     let mut waits = 0;
     for done in leases {
         let (at, stats) = done.await.expect("joined").expect("written");
@@ -89,10 +97,8 @@ async fn concurrent_leases_fetch_each_blob_once() {
     }
     assert_eq!(cas.most_reads_of_one_file(), 1, "a blob was fetched twice");
     assert_eq!(cas.file_reads(), 48);
-    assert!(
-        waits > 0,
-        "no lease waited on another's fill: the leases did not overlap"
-    );
+    assert!(waits > 0, "no lease waited on another's fill");
+    assert_eq!(waits, cache.stats().fill_waits, "waits counted two ways");
     stop(cache, &gates);
 }
 
@@ -141,7 +147,7 @@ async fn the_budget_evicts_least_recently_used_but_never_a_pinned_key() {
     let clock = FakeClock::at(1000);
     let mut serial = config(&dir, 300, Arc::clone(&gates), &clock);
     serial.link_concurrency = 1;
-    let cache = Cache::open(serial).expect("open");
+    let cache = open_started(serial, &gates);
     let cas = CountingCas::default();
     let blob = |c: u8| vec![c; 100];
     let one = |name: &str, c: u8| cas.tree(&[file(name, &blob(c), false)]);
@@ -203,7 +209,7 @@ async fn a_key_two_leases_pin_stays_until_both_release_it() {
     let dir = scratch("cache-c8-two");
     let gates = Gates::new();
     let clock = FakeClock::at(1000);
-    let cache = Cache::open(config(&dir, 100, Arc::clone(&gates), &clock)).expect("open");
+    let cache = open_started(config(&dir, 100, Arc::clone(&gates), &clock), &gates);
     let cas = CountingCas::default();
     let one = |c: u8| cas.tree(&[file("f", &[c; 100], false)]);
     let old = key(&[b'o'; 100], false);
@@ -599,11 +605,8 @@ async fn a_failed_fill_fails_every_waiter_with_its_error() {
             tokio::spawn(async move { lease(&cas, &cache, &root, &dir, &format!("l{n}")).await })
         })
         .collect();
-    // The first fill is stalled in its read; the others reach its slot meanwhile.
-    while cas.reads_of(&digest(b"not stored")) == 0 {
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    // The first fill is stalled in its read; the other seven reach its slot and wait.
+    wait_for_fill_waits(&cache, 7).await;
     cas.unstall();
     let mut waits = 0;
     for done in leases {
@@ -615,6 +618,11 @@ async fn a_failed_fill_fails_every_waiter_with_its_error() {
         waits += 1;
     }
     assert_eq!(waits, 8);
+    assert_eq!(
+        cache.stats().fill_waits,
+        7,
+        "the seven other leases waited on the first one's fill"
+    );
     assert_eq!(
         cas.reads_of(&digest(b"not stored")),
         1,
@@ -700,7 +708,8 @@ async fn a_fill_waits_for_the_evictor_holding_its_key() {
     let cas = Arc::new(CountingCas::default());
     let gates = Gates::new();
     let clock = FakeClock::at(1000);
-    let cache = Cache::open(config(&dir, 200, Arc::clone(&gates), &clock)).expect("open");
+    // The start-up drain must be done, or it could be the evictor held on K.
+    let cache = open_started(config(&dir, 200, Arc::clone(&gates), &clock), &gates);
     let one = |c: u8| cas.tree(&[file("f", &[c; 100], false)]);
     let k = key(&[b'k'; 100], false);
     lease(&cas, &cache, &one(b'k'), &dir, "k").await.expect("k");
@@ -721,7 +730,8 @@ async fn a_fill_waits_for_the_evictor_holding_its_key() {
             (Arc::clone(&cas), Arc::clone(&cache), one(b'k'), dir.clone());
         tokio::spawn(async move { lease(&cas, &cache, &root, &dir, "k-again").await })
     };
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // k-again waits on the slot the evictor holds for key k.
+    wait_for_fill_waits(&cache, 1).await;
     assert_eq!(
         cas.reads_of(&digest(&[b'k'; 100])),
         1,

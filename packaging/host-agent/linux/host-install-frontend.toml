@@ -28,5 +28,12 @@ drain_token_file = "/etc/kbf/operator.token"
 # does not answer /readyz with 200 keeps this frontend up. Without peers nothing here guards the
 # last ready frontend; only the coordinator's order does (docs/deploy/host-install.md).
 peers = ["203.0.113.11:8982"]
-drain_secs = 180
+# Optional. Left out, a switch waits for the old container to end however long its builds take; it
+# never stops, removes or replaces a container that still runs. Set, it is how long the switch waits
+# before it gives up: it then fails with the old container still running and draining, and asking
+# again resumes. No upper limit; at least 1. It cuts no work either way. Keep it below about 9
+# minutes: the updater gives a switch call 10 minutes, so during a longer drain it reports the host
+# Unreachable while the helper goes on and finishes the switch.
+# drain_secs = 3600
+# The most a new container has to be ready; counted inside the trial window (--window-secs).
 ready_secs = 90

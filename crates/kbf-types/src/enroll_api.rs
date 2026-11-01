@@ -181,6 +181,19 @@ mod tests {
         }
     }
 
+    /// Catches: the host role in a token's JSON spelled or placed differently: the exact
+    /// bytes a client reads, `mac-daemon` with its hyphen, and an absent role as `null`.
+    #[test]
+    fn the_host_role_is_the_bare_name_in_the_json() {
+        let mut one = info();
+        one.host_role = Some("mac-daemon".to_owned());
+        let json = serde_json::to_string(&one).expect("json");
+        assert!(json.contains(r#""host_role":"mac-daemon","#), "{json}");
+        one.host_role = None;
+        let json = serde_json::to_string(&one).expect("json");
+        assert!(json.contains(r#""host_role":null,"#), "{json}");
+    }
+
     fn round<T: Serialize + for<'de> Deserialize<'de> + PartialEq + fmt::Debug>(value: &T) {
         let text = serde_json::to_string(value).expect("serialise");
         let back: T = serde_json::from_str(&text).expect("deserialise");

@@ -353,6 +353,16 @@ fn recv_frame(
             "too many descriptors",
         ));
     }
+    // The clock is looked at before a read, so a frame whose last bytes came in one
+    // read, after the deadline, would pass: look once more, before it is parsed.
+    if let Some(deadline) = deadline
+        && (deadline.now)() >= deadline.by
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "the deadline passed",
+        ));
+    }
     Ok(Some((body, fds)))
 }
 

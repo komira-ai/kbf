@@ -1,0 +1,47 @@
+[package]
+name = "update-rights"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# What the host updater lets a hook do (docs/design/host-updates.md, sections 2.4, 3.3 and 3.4):
+# the declaration file a package installs, the rules it is loaded under, the comparison that
+# says a new declaration asks for more than the approved one, the record of approvals, and the
+# transient systemd unit that runs one step of a hook with exactly the declared rights. The crate
+# names no product and depends on no crate of this workspace but the hook contract
+# (a layering test of the workspace keeps both true).
+[dependencies]
+# `Step`, `Invocation`, `Outcome`, `Report` and the `updater.*` reserved params keys.
+update-hook.workspace = true
+# `O_NOFOLLOW`, to open a declaration without following a link.
+libc.workspace = true
+# The effective uid of the process that approves, and the lock it holds while it does.
+rustix = { workspace = true, features = ["process", "fs"] }
+serde.workspace = true
+# The digest of a declaration file.
+sha2.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+
+# The program the root tests run as a hook, with the operations that probe the rights it was
+# given. A program of the tests, not shipped.
+[[bin]]
+name = "update-rights-probe"
+path = "tests/bin/probe_hook.rs"
+test = false
+
+[features]
+# `Declared::by_hand`, for the tests of this crate: a loaded declaration made without a directory.
+# Off for everything else, so a `Declared` comes only from `load_dir`.
+test-support = []
+
+[dev-dependencies]
+# Its own tests turn on `test-support`.
+update-rights = { path = ".", features = ["test-support"] }
+
+[lints]
+workspace = true

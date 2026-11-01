@@ -15,7 +15,12 @@
 //! not a metadata command, and each input a batch of the farm carries (the worker's
 //! registration and capacity, the heartbeat, a submission, a started lease, the committed
 //! lease, result and refusal, and the placement of a node). The test of the kinds fails when
-//! one is added without a row. The metadata commands are pinned in part (the rows named
+//! one is added without a row. The values the entries carry are held the same way: a
+//! submission for each QoS level and each kind of lease, and a report for each `Failure`
+//! (and so each `LostWhy`), each listed by a chain written as an exhaustive match that does
+//! not compile when a variant is added to the type. Not entries of the log, so not here: the
+//! reason a lease is given up (`RequeueReason`), the fence policy and the device of a start
+//! (the grant the log holds names the lease, the operation and the worker, and nothing else). The metadata commands are pinned in part (the rows named
 //! `meta-`) and in part by the inline bytes of `meta_codec.rs`, which are tests and not
 //! files. That the corpus is append-only is held by review: the test of the directory fails
 //! on a file added or deleted without its row, and not on a file and its row edited together.
@@ -40,8 +45,8 @@ use kbf_meta::{
 };
 use kbf_sched::{DaemonInstance, Request};
 use kbf_types::{
-    ActionKey, ControlRecord, Failure, FarmTime, LeaseGrant, LeaseId, LeaseKind, OperationId,
-    Outcome, Qos, RefusalRecord, Resources, ResultRecord,
+    ActionKey, ControlRecord, Failure, FarmTime, LeaseGrant, LeaseId, LeaseKind, LostWhy,
+    OperationId, Outcome, Qos, RefusalRecord, Resources, ResultRecord,
 };
 
 fn nz(n: u64) -> NonZeroU64 {
@@ -68,13 +73,15 @@ fn request<const N: usize>(qos: Qos, kind: LeaseKind, needs: [(&str, &str); N]) 
         key: ActionKey {
             instance: "i".to_owned(),
             action: d(3),
-        },
+        }
+        .into(),
         qos,
         kind,
         resources: Resources::new(1, 2),
         needs: kbf_caps::Request::parse(needs).expect("a request"),
         hermetic: true,
         do_not_cache: true,
+        whole_worker: false,
     }
 }
 
@@ -120,6 +127,7 @@ fn input_rows() -> Vec<(&'static str, LogCommand)> {
         lease: lease(1, 2),
         operation: OperationId(3),
         worker: w("w"),
+        cost: Default::default(),
     };
     let result = ResultRecord {
         lease: lease(1, 2),
@@ -203,8 +211,83 @@ fn input_rows() -> Vec<(&'static str, LogCommand)> {
         ),
         ("farm-disconnected", FarmInput::Disconnected(w("w"))),
     ];
-    rows.into_iter()
+    let mut rows: Vec<_> = rows
+        .into_iter()
         .map(|(name, input)| (name, batch(input)))
+        .collect();
+    rows.extend(qos_rows());
+    rows
+}
+
+/// The values of an enum: `first`, then what `next` makes of the last one, until it makes
+/// none. `next` is a `match` with an arm for every variant, so a variant added to the enum
+/// does not compile until it has a place in the chain, and then it needs a row.
+fn chain<T>(first: T, next: impl Fn(&T) -> Option<T>) -> Vec<T> {
+    let mut all = vec![first];
+    while let Some(after) = next(&all[all.len() - 1]) {
+        all.push(after);
+    }
+    all
+}
+
+/// A submission for each QoS level the rows above do not hold (`Batch` is in `farm-submit`
+/// and `farm-submit-device`), with the kinds of lease they leave out (`Vm`).
+fn qos_rows() -> Vec<(&'static str, LogCommand)> {
+    let levels = chain(Qos::Interactive, |qos| match qos {
+        Qos::Interactive => Some(Qos::Ci),
+        Qos::Ci => Some(Qos::Batch),
+        Qos::Batch => Some(Qos::custom("tenant-a", 150).expect("a level")),
+        Qos::Custom(_) => None,
+    });
+    levels
+        .into_iter()
+        .filter_map(|qos| {
+            let (name, kind) = match &qos {
+                Qos::Interactive => ("farm-submit-interactive", LeaseKind::Action),
+                Qos::Ci => ("farm-submit-ci", LeaseKind::Vm),
+                Qos::Batch => return None,
+                Qos::Custom(_) => ("farm-submit-custom", LeaseKind::Action),
+            };
+            let submit = FarmInput::Submit(request(qos, kind, []));
+            Some((name, batch(submit)))
+        })
+        .collect()
+}
+
+/// A report for each `Failure`: the outcome of a lease that ended without a result.
+fn report_rows() -> Vec<(&'static str, LogCommand)> {
+    let failures = chain(Failure::Timeout, |failure| match failure {
+        Failure::Timeout => Some(Failure::Infra),
+        Failure::Infra => Some(Failure::Invalid),
+        Failure::Invalid => Some(Failure::OutOfMemory),
+        Failure::OutOfMemory => Some(Failure::NodeMemoryPressure),
+        Failure::NodeMemoryPressure => Some(Failure::MissingInput),
+        Failure::MissingInput => Some(Failure::Lost(LostWhy::DaemonRestarted)),
+        Failure::Lost(LostWhy::DaemonRestarted) => Some(Failure::Lost(LostWhy::Fenced)),
+        Failure::Lost(LostWhy::Fenced) => None,
+    });
+    failures
+        .into_iter()
+        .map(|failure| {
+            let name = match failure {
+                Failure::Timeout => "report-failed",
+                Failure::Infra => "report-failed-infra",
+                Failure::Invalid => "report-failed-invalid",
+                Failure::OutOfMemory => "report-failed-out-of-memory",
+                Failure::NodeMemoryPressure => "report-failed-node-memory-pressure",
+                Failure::MissingInput => "report-failed-missing-input",
+                Failure::Lost(LostWhy::DaemonRestarted) => "report-failed-lost-daemon-restarted",
+                Failure::Lost(LostWhy::Fenced) => "report-failed-lost-fenced",
+            };
+            let report = LogCommand::Report(Report {
+                now: FarmTime::from_millis(1),
+                operation: OperationId(3),
+                lease: LeaseId::new(1, 2),
+                outcome: Outcome::Failed(failure),
+                action_entry: None,
+            });
+            (name, report)
+        })
         .collect()
 }
 
@@ -225,19 +308,12 @@ fn corpus() -> Vec<(&'static str, LogCommand)> {
         wall: UNIX_EPOCH + Duration::from_nanos(2),
         inputs: vec![FarmInput::Tick],
     });
-    let report = LogCommand::Report(Report {
-        now: FarmTime::from_millis(1),
-        operation: OperationId(3),
-        lease: LeaseId::new(1, 2),
-        outcome: Outcome::Failed(Failure::Timeout),
-        action_entry: None,
-    });
     let completed = LogCommand::Report(Report {
         now: FarmTime::from_millis(1),
         operation: OperationId(3),
         lease: LeaseId::new(1, 2),
         outcome: Outcome::Completed {
-            action_result: d(3),
+            action_result: d(3).into(),
         },
         action_entry: Some(ActionEntry {
             action: d(4),
@@ -257,10 +333,10 @@ fn corpus() -> Vec<(&'static str, LogCommand)> {
         ("machine-version", version),
         ("takeover", takeover),
         ("farm-tick", farm),
-        ("report-failed", report),
         ("report-completed", completed),
         ("checkpoint", checkpoint),
     ]);
+    rows.extend(report_rows());
     rows.extend(input_rows());
     rows
 }

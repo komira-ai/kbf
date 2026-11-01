@@ -7,7 +7,7 @@ use serde_json::json;
 use crate::inventory::{Host, Role};
 use crate::node_drain::NodeDrain;
 use crate::operator::OperatorApi;
-use crate::ports::{Drain, PortErrorKind};
+use crate::ports::{Drain, Placed, PortErrorKind, Seen};
 use crate::testutil::{FakeApi, KEY, TOKEN, closed_port, fake_api_by, file, http, scratch};
 
 fn dm(node_id: Option<&str>) -> Host {
@@ -52,7 +52,7 @@ fn a_drain_posts_the_deadline_to_the_nodes_drain_route() {
     let server = answering(200, &node("draining", &["1.1"]));
     let drain = adapter(&server, "nd-drain");
     drain
-        .drain(&dm(Some("dm-node")), Duration::from_secs(600))
+        .drain(&dm(Some("dm-node")), Some(Duration::from_secs(600)))
         .expect("drained");
     let sent = server.requests();
     assert_eq!(sent.len(), 1);
@@ -68,6 +68,25 @@ fn a_drain_posts_the_deadline_to_the_nodes_drain_route() {
         "{}",
         sent[0]
     );
+}
+
+/// Catches a drain without a deadline that still sends one: the frontend takes a drain with
+/// no body as having no deadline, and any number in the body as a deadline it ends at.
+#[test]
+fn a_drain_without_a_deadline_sends_no_body() {
+    let server = answering(200, &node("draining", &["1.1"]));
+    adapter(&server, "nd-drain-unbounded")
+        .drain(&dm(Some("dm-node")), None)
+        .expect("drained");
+    let sent = server.requests();
+    assert_eq!(sent.len(), 1);
+    assert!(
+        sent[0].starts_with("POST /v1/nodes/dm-node:drain HTTP/1.1\r\n"),
+        "{}",
+        sent[0]
+    );
+    assert!(sent[0].contains("Content-Length: 0\r\n"), "{}", sent[0]);
+    assert!(sent[0].ends_with("\r\n\r\n"), "{}", sent[0]);
 }
 
 /// Catches an undrain that is not the uncordon route, or that sends a body: it is
@@ -143,7 +162,7 @@ fn errors_are_of_the_right_kind_and_leak_nothing() {
         let host = dm(Some("dm-node"));
         let errors = [
             drain
-                .drain(&host, Duration::from_secs(5))
+                .drain(&host, Some(Duration::from_secs(5)))
                 .expect_err("drain"),
             drain.leases(&host).expect_err("leases"),
             drain.undrain(&host).expect_err("undrain"),
@@ -189,7 +208,7 @@ fn a_host_without_a_usable_node_id_is_refused_without_a_call() {
         let host = dm(id);
         for e in [
             drain
-                .drain(&host, Duration::from_secs(5))
+                .drain(&host, Some(Duration::from_secs(5)))
                 .expect_err("drain"),
             drain.leases(&host).expect_err("leases"),
             drain.undrain(&host).expect_err("undrain"),
@@ -219,7 +238,9 @@ fn a_daemon_the_frontend_knows_is_drained_counted_and_given_back() {
     let server = answering(200, &node("draining", &["1.1", "1.2"]));
     let drain = adapter_if_present(&server, "nd-present");
     let host = dm(Some("dm-node"));
-    drain.drain(&host, Duration::from_secs(60)).expect("drain");
+    drain
+        .drain(&host, Some(Duration::from_secs(60)))
+        .expect("drain");
     assert_eq!(drain.leases(&host), Ok(2));
     drain.undrain(&host).expect("undrain");
     let sent = server.requests();
@@ -245,7 +266,7 @@ fn a_storage_host_with_no_daemon_has_nothing_to_drain() {
     let server = answering(404, "{\"error\":\"no_node\"}");
     let drain = adapter_if_present(&server, "nd-absent");
     let host = dm(Some("dm-node"));
-    assert_eq!(drain.drain(&host, Duration::from_secs(60)), Ok(()));
+    assert_eq!(drain.drain(&host, Some(Duration::from_secs(60))), Ok(()));
     assert_eq!(drain.leases(&host), Ok(0));
     assert_eq!(drain.undrain(&host), Ok(()));
     assert_eq!(server.requests().len(), 3);
@@ -254,10 +275,131 @@ fn a_storage_host_with_no_daemon_has_nothing_to_drain() {
         let server = answering(status, "{}");
         let drain = adapter_if_present(&server, "nd-absent-errors");
         assert!(
-            drain.drain(&host, Duration::from_secs(1)).is_err(),
+            drain.drain(&host, Some(Duration::from_secs(1))).is_err(),
             "{status}"
         );
         assert!(drain.leases(&host).is_err(), "{status}");
         assert!(drain.undrain(&host).is_err(), "{status}");
     }
+}
+
+/// Catches a roll that cannot tell a node an operator took out of placement from one it
+/// serves: `placed` reads `GET /v1/nodes/<id>` and only `serving` is in placement; a cordoned,
+/// draining, drained or drain-paused node is out. It is one read and writes nothing.
+#[test]
+fn placed_reads_the_nodes_state_and_only_serving_is_in_placement() {
+    for (state, want) in [
+        ("serving", Placed::In),
+        ("cordoned", Placed::Out),
+        ("draining", Placed::Out),
+        ("drained", Placed::Out),
+        ("drain_paused", Placed::Out),
+    ] {
+        let server = answering(200, &node(state, &["1.1"]));
+        let got = adapter(&server, "nd-placed").placed(&dm(Some("dm-node")));
+        assert_eq!(got, Ok(want), "{state}");
+        let sent = server.requests();
+        assert_eq!(sent.len(), 1, "{state}: {sent:?}");
+        assert!(
+            sent[0].starts_with("GET /v1/nodes/dm-node HTTP/1.1\r\n"),
+            "{}",
+            sent[0]
+        );
+        assert!(sent[0].contains(&format!("Authorization: Bearer {TOKEN}\r\n")));
+    }
+}
+
+/// Catches a plain operator cordon being read as a drain: only `cordoned` is a plain cordon,
+/// and every drain state is a drain, so that the agent's marks can tell whose cordon it is.
+#[test]
+fn seen_tells_a_plain_cordon_from_a_drain() {
+    for (state, want) in [
+        ("serving", Seen::Serving),
+        ("cordoned", Seen::Cordoned),
+        ("draining", Seen::Draining),
+        ("drained", Seen::Draining),
+        ("drain_paused", Seen::Draining),
+        // A state this build does not know is not the updater's drain.
+        ("quarantined", Seen::Cordoned),
+    ] {
+        let server = answering(200, &node(state, &[]));
+        let got = adapter(&server, "nd-seen").seen_if_known(&dm(Some("dm-node")));
+        assert_eq!(got, Ok(Some(want)), "{state}");
+    }
+}
+
+/// Catches a storage host with no daemon being failed, or its absent node being taken for one
+/// an operator drained: the frontend not knowing the node (404) is `In` for a host that may run
+/// no daemon, and the failure it is for any other.
+#[test]
+fn placed_takes_an_unknown_node_as_nothing_to_leave_out_only_if_present() {
+    let server = answering(404, "{\"error\":\"no_node\"}");
+    let host = dm(Some("dm-node"));
+    assert_eq!(
+        adapter_if_present(&server, "nd-placed-absent").placed(&host),
+        Ok(Placed::In)
+    );
+    let server = answering(404, "{\"error\":\"no_node\"}");
+    let e = adapter(&server, "nd-placed-unknown")
+        .placed(&host)
+        .expect_err("unknown");
+    assert!(e.to_string().contains("does not know node dm-node"), "{e}");
+}
+
+/// Catches `placed` guessing when it could not look: an answer that is no, a server error or a
+/// body that is not a node is an error (the roll must not assume the node was serving), a node
+/// id that is not a label is refused without a call, and no error holds the token or an
+/// address.
+#[test]
+fn placed_fails_when_it_cannot_read_the_node() {
+    for (status, body) in [(401, "{}"), (403, "{}"), (503, "{}"), (200, "<html>")] {
+        let server = answering(status, body);
+        let e = adapter(&server, "nd-placed-errors")
+            .placed(&dm(Some("dm-node")))
+            .expect_err("unreadable");
+        for secret in [TOKEN, "secret-host", &server.addr.to_string()] {
+            assert!(!e.to_string().contains(secret), "{status}: {secret} in {e}");
+        }
+    }
+    let server = answering(200, &node("serving", &[]));
+    let drain = adapter(&server, "nd-placed-noid");
+    for id in [None, Some("../x"), Some("a b")] {
+        let e = drain.placed(&dm(id)).expect_err("no id");
+        assert!(e.to_string().contains("dm has no usable node id"), "{e}");
+    }
+    assert!(server.requests().is_empty());
+}
+
+/// `placed_if_known` tells a node that is there from one the frontend does not know: the
+/// state of the first, `None` for a 404 of a host that may run no daemon, and the failure
+/// it is for any other host. One call each.
+///
+/// Catches: an absent node read as one in placement by a caller that records a cordon for
+/// every node in placement.
+#[test]
+fn placed_if_known_is_none_for_an_unknown_node_of_a_host_that_may_have_none() {
+    let host = dm(Some("dm-node"));
+    let server = answering(404, "{\"error\":\"no_node\"}");
+    assert_eq!(
+        adapter_if_present(&server, "nd-known-absent").placed_if_known(&host),
+        Ok(None)
+    );
+    assert_eq!(server.requests().len(), 1);
+
+    let server = answering(200, &node("serving", &[]));
+    assert_eq!(
+        adapter_if_present(&server, "nd-known-in").placed_if_known(&host),
+        Ok(Some(Placed::In))
+    );
+    let server = answering(200, &node("cordoned", &[]));
+    assert_eq!(
+        adapter(&server, "nd-known-out").placed_if_known(&host),
+        Ok(Some(Placed::Out))
+    );
+    let server = answering(404, "{\"error\":\"no_node\"}");
+    assert!(
+        adapter(&server, "nd-known-unknown")
+            .placed_if_known(&host)
+            .is_err()
+    );
 }
