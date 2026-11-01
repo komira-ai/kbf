@@ -500,6 +500,7 @@ fn measured(a: &Attempt, keys: &mut Map<String, Value>) {
     }
     if let Some(run) = run {
         put("reapi_times", reapi_times(run));
+        put("phase_times", run.phase_times.name().into());
         if let Some(u) = &run.usage {
             put("usage", run_usage(u));
         }
