@@ -66,7 +66,10 @@ impl Records {
             attempt: None,
             kind: EndedKind::Hit,
             at,
-            correlated_invocations_id: None,
+            // The row is in the record, so the record is.
+            correlated_invocations_id: self.invocations[key]
+                .correlated_invocations_id()
+                .map(str::to_owned),
         });
     }
 
@@ -80,18 +83,22 @@ impl Records {
         kind: EndedKind,
         at: WallTime,
     ) {
-        let attempt = self
-            .invocations
-            .get(key)
-            .and_then(|inv| inv.rows[row].attempts.iter().position(|a| a.lease == lease));
-        if let Some(attempt) = attempt {
+        let found = self.invocations.get(key).and_then(|inv| {
+            let attempts = &inv.rows[row].attempts;
+            let correlated = inv.correlated_invocations_id().map(str::to_owned);
+            attempts
+                .iter()
+                .position(|a| a.lease == lease)
+                .map(|attempt| (attempt, correlated))
+        });
+        if let Some((attempt, correlated_invocations_id)) = found {
             self.ended.push(Ended {
                 key: key.clone(),
                 row,
                 attempt: Some(attempt),
                 kind,
                 at,
-                correlated_invocations_id: None,
+                correlated_invocations_id,
             });
         }
     }

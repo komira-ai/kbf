@@ -44,6 +44,14 @@
 //! carries no concurrent-lease count, and a run with no pressure reading is counted apart and
 //! never imputed.
 //!
+//! # Per-build numbers
+//!
+//! A row carries the invocation (`tool_invocation_id`) and, when the client sent one, the
+//! build (`correlated_invocations_id`) of the Execute request its attempt belonged to, as the
+//! server's run record holds them ([`row::Row`]). [`builds`] turns rows into per-build wall
+//! time and queue wait, and into per-run values shaped for `js-analysis`'s `RunRecord`. A row
+//! from a server that predates the ids has none, and no build is made of it.
+//!
 //! This crate is a workspace member under the coverage gate (99% of lines and branches):
 //! the verbs are library functions over injected I/O, `main` is three lines, and every
 //! rule of the replay has a test that asserts it.
