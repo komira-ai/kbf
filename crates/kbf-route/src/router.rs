@@ -279,7 +279,7 @@ impl Router {
             let used = view.map.generation();
             match op(view).await {
                 Err(StorageError::StaleMap { current }) => {
-                    view = self.newer(used, current, &mut fetches).await?;
+                    view = self.newer_map(used, current, &mut fetches).await?;
                 }
                 done => return Ok(done),
             }
@@ -287,8 +287,14 @@ impl Router {
     }
 
     /// The map to run a call again against after a node holding generation `current`
-    /// refused the one of generation `used`: fetched, and newer than `used`.
-    async fn newer(
+    /// refused the one of generation `used`: fetched, and newer than `used`. `fetches`
+    /// counts the fetches the call has made; it fails UNAVAILABLE, rather than loop, when
+    /// the fetch brings no newer map or [`MAX_MAP_REFETCHES`] have been made. For a caller
+    /// that dials the nodes itself and so runs the retry itself, by the same rule.
+    ///
+    /// # Errors
+    /// UNAVAILABLE, as above.
+    pub async fn newer_map(
         &self,
         used: u64,
         current: u64,
