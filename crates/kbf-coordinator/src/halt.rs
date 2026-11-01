@@ -18,8 +18,14 @@
 //! stood (`halt_seen`, kept with the halt) is acknowledged with it, so the coordinator and the
 //! agents, which lift on the generation, agree. A `last_update` has no attempt number or
 //! finish stamp, so a report's identity is its `(node, target)` for as long as the host keeps
-//! reporting it and is not updating: a beat without it, or one that says the host is updating,
-//! ends the host's acknowledgement ([`forget`]), and a halt reported after that is new. Each clear raises the service's generation by one. A reply to an agent that
+//! reporting it: a different `last_update` (another target, or no halt at all) ends the host's
+//! acknowledgement ([`end_ack`]), and a halt reported after that is new. The design also ends it
+//! when the host is next ordered to update the service; that cannot happen first here, since a
+//! host whose `last_update` is the failed target is not ordered it (`failed_here`), and the
+//! order of another target is not a new attempt of this one. A service the host is updating is
+//! not read: its `last_update` is the one before.
+//!
+//! Each clear raises the service's generation by one. A reply to an agent that
 //! announced [`FEATURE`] carries the generation of every service that has one (`halts`): the
 //! agent lifts its hold when it sees a number newer than the one it halted under, so a lost
 //! heartbeat cannot make it miss a clear, and a restart of the coordinator, which reads the
@@ -117,9 +123,10 @@ fn ignored(state: &OpsState, service: &str, halt: &Halt) -> Option<Ignored> {
 /// facts) and for each service it lists. Before the heartbeat is decided, so the host that
 /// reports a halt is ordered nothing in the same reply.
 ///
-/// A report is read only while the host is not updating: a beat that says it is updating, or
-/// carries no halt report, is not that report, and ends the host's acknowledgement of one an
-/// operator cleared ([`forget`]).
+/// A service whose update the host is running is skipped: its `last_update` is the one before,
+/// not a report. Otherwise a `last_update` that is not the halt an operator cleared for the
+/// host ends that acknowledgement ([`end_ack`]), and one that is a halt is raised unless it is
+/// ignored.
 pub(crate) fn note(ops: &OpsStore, services: &Services, who: &Identity, beat: &Heartbeat) {
     let listed = beat.services.as_deref().unwrap_or_default();
     // A host that lists `kbf` says its `kbf` there; its top-level facts are placeholders.
@@ -136,38 +143,42 @@ pub(crate) fn note(ops: &OpsStore, services: &Services, who: &Identity, beat: &H
         )
     }));
     for (service, last, updating) in reports {
-        if !is_member(services, service, who.role.name()) {
+        if updating || !is_member(services, service, who.role.name()) {
             continue;
         }
-        let report = reported(last, &who.node_id).filter(|_| !updating);
-        match report {
-            Some(halt) => raise(ops, service, halt),
-            None => forget(ops, service, &who.node_id),
+        let report = reported(last, &who.node_id);
+        end_ack(ops, service, &who.node_id, report.as_ref());
+        if let Some(halt) = report {
+            raise(ops, service, halt);
         }
     }
 }
 
-/// Ends the acknowledgement the host `id` has for `service`, if it has one: the host no longer
-/// reports the halt an operator cleared, so a halt it reports from now on is a new failure, even
-/// of the same target. Written after it is in memory, like a halt: it removes protection.
-fn forget(ops: &OpsStore, service: &str, id: &NodeId) {
+/// Ends the acknowledgement the host `id` has for `service`, unless `report`, the halt the
+/// host reports now, is the very one acknowledged: a different `last_update` (another target,
+/// or no halt at all) is a different report, so a halt the host reports from then on is a new
+/// failure, even of the same target. Written after it is in memory, like a halt: it removes
+/// protection.
+fn end_ack(ops: &OpsStore, service: &str, id: &NodeId, report: Option<&Halt>) {
     let node = id.to_string();
+    let target = report.map(|halt| halt.target.clone());
+    let differs = move |ack: &HaltAck| ack.node_id == node && Some(&ack.target) != target.as_ref();
     let held = ops.read(|state| {
         state
             .services
             .get(service)
-            .is_some_and(|m| m.halt_acked.iter().any(|a| a.node_id == node))
+            .is_some_and(|m| m.halt_acked.iter().any(&differs))
     });
     if !held {
         return;
     }
     let mut entry = AuditEntry::new(COORDINATOR, "halt_ack_ended");
     entry.service = Some(service.to_owned());
-    entry.node_id = Some(node.clone());
+    entry.node_id = Some(id.to_string());
     let name = service.to_owned();
     let ended = ops.change(Write::AfterMemory, entry, |state| {
         let marks = state.services.entry(name).or_default();
-        marks.halt_acked.retain(|a| a.node_id != node);
+        marks.halt_acked.retain(|ack| !differs(ack));
     });
     if let Err(why) = ended {
         tracing::error!(service, %why, "the end of an acknowledgement could not be written");

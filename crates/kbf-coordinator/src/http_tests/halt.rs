@@ -592,20 +592,40 @@ async fn the_same_host_failing_the_same_target_again_after_a_clear_halts_again()
     );
 }
 
-/// Catches: an acknowledgement that survives the host starting a new update: a beat that says
-/// the host is updating ends the acknowledgement, even if it still carries the old report, and
-/// the report that comes after a failed attempt halts again. While the host updates, the old
-/// report is not read as a new failure.
+/// Catches: the report of the update before being read while the host runs another: a beat that
+/// says the host is updating, and still carries the old halt, is not read at all, so it neither
+/// raises the cleared halt nor ends its acknowledgement; the same report after the update is
+/// still acknowledged.
 #[tokio::test]
-async fn an_ack_ends_when_the_host_starts_an_update() {
-    let rig = farm("halt-ack-updating").await;
+async fn a_report_of_the_update_before_is_not_read_while_the_host_updates() {
+    let rig = farm("halt-stale-updating").await;
     send(&rig, "s1", "storage", &beat("1.0", HALT)).await;
     clear(&rig, "kbf").await;
-    let updating = beat("1.0", &format!(r#","updating":"2.0"{HALT}"#));
+    let updating = beat("1.0", &format!(r#","updating":"3.0"{HALT}"#));
     send(&rig, "s1", "storage", &updating).await;
     assert_ne!(convergence(&rig, "kbf").await["state"], "halted");
     send(&rig, "s1", "storage", &beat("1.0", HALT)).await;
-    assert_eq!(convergence(&rig, "kbf").await["state"], "halted");
+    assert_ne!(convergence(&rig, "kbf").await["state"], "halted");
+}
+
+/// Catches: an acknowledgement kept when the host reports another halt: after the clear the host
+/// halts the update to 3.0 (a different `last_update`), the service halts, and the
+/// acknowledgement of 2.0 has ended.
+#[tokio::test]
+async fn a_halt_of_another_target_ends_the_ack_of_the_first() {
+    let rig = farm("halt-other-target-ends-ack").await;
+    send(&rig, "s1", "storage", &beat("1.0", HALT)).await;
+    clear(&rig, "kbf").await;
+    send(
+        &rig,
+        "s1",
+        "storage",
+        &beat("1.0", &HALT.replace("2.0", "3.0")),
+    )
+    .await;
+    assert_eq!(convergence(&rig, "kbf").await["halt"]["target"], "3.0");
+    let acked = status(&rig).await["ops"]["services"]["kbf"]["halt_acked"].clone();
+    assert_eq!(acked, json!([]));
 }
 
 /// Catches: a host that lists `kbf` among its services (`heartbeat-v2`) being read by its
