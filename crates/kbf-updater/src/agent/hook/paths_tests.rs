@@ -409,9 +409,10 @@ fn a_node_in_placement_is_given_back_once() {
     assert!(!rig.drain.is_drained());
 }
 
-/// The placement is read once, before the drain, and is on disk by then: the record is not
-/// empty when the drain call arrives, the node is never read again by `prepare` run a second
-/// time, and nothing later reads it.
+/// The placement is read before the drain and is on disk by then: the record is not empty
+/// when the drain call arrives, a `prepare` run again after it finished does not read the node
+/// again, and nothing later reads it. (A `prepare` resumed before it finished reads it again:
+/// `window_tests::a_crash_between_the_placement_and_the_drain_does_not_hand_the_node_to_the_update`.)
 ///
 /// Catches: a placement read after the drain, which reads the update's own cordon as an
 /// operator's (or the reverse), or a record written after the drain.
