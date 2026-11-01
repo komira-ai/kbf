@@ -79,6 +79,9 @@
 //!   deadline on the store's clock), kept until it is returned to placement, so a
 //!   successor process serves the node as the operator left it, and the other frontends
 //!   of the store apply it at their next intake poll;
+//! - `cordon-owner/<worker>`: who owns that cordon (`operator`, or `updater:<unit>`), read
+//!   for the node detail and written by nothing yet (`farm::cordon_owner`). A row of its
+//!   own, outside the `cordon/` scan, so a frontend that does not know it never reads it;
 //! - `est/<instance>/<platform>/<basis>/<shape>/<cfg>`: one size summary of the learned-sizes
 //!   shadow ([`crate::learned`]): a version byte and the estimator's own checksummed row.
 //!   Never in the transaction of a requeue or a finish: a summary an own-limit kill changed

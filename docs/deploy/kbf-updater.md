@@ -77,6 +77,17 @@ the node back without installing, uncordon it (`POST /v1/nodes/{id}:uncordon`, o
 given back by hand is noticed by the agent, see `--cordon-dir`.)
 The node drain at the frontend is the frontend's cordon and is not changed by this.
 
+The SSH roll gives back only a node whose cordon carries the roll's mark, and the frontend's cordon
+has no owner, so two limits follow; kbf#2166 (the cordon-owner issue) tracks the fix:
+
+- An operator who drains a node during the roll, after the roll's mark is written, has that drain
+  lifted at the give-back: the mark says the cordon is the roll's, and the frontend cannot tell two
+  drains apart.
+- When the frontend does not know the node yet at the drain, the roll drains it with no mark, and
+  the node is left out after the roll. The roll logs one warn line for it (`<node>: left out after
+  the roll: its cordon is not marked as this roll's ...; uncordon it by hand if it should serve`),
+  as it does for a node an operator drained before the roll; there is no other alert.
+
 ## What a roll does with a frontend pool member
 
 A farm whose frontends sit behind a load balancer of its own (Envoy, a cloud balancer, anything
