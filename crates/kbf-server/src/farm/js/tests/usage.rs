@@ -22,7 +22,7 @@ use kbf_state::{
 use kbf_types::sched::usage::{CurveSource, LeaseMinute, NodeLoad};
 use kbf_types::{ActionKey, Digest, DigestFunction, LeaseId, LeaseKind, Qos, Resources, work_key};
 
-use super::hot::{Joined, backend, farm_on, join, killed, linux, node, ok};
+use super::hot::{Joined, backend, farm_on, join, killed, linux, node, ok, rerun_start};
 use crate::farm::{EpochPolicy, Farm, Reported};
 use crate::farm_js::usage::UsageStats;
 use crate::state_store::StateStore;
@@ -44,6 +44,8 @@ struct Gate {
     inner: Arc<Fake>,
     writes_fail: AtomicBool,
     reads_fail: AtomicBool,
+    /// Every write fails, the farm's own rows too.
+    all_fail: AtomicBool,
 }
 
 impl Gate {
@@ -52,6 +54,7 @@ impl Gate {
             inner,
             writes_fail: AtomicBool::new(false),
             reads_fail: AtomicBool::new(false),
+            all_fail: AtomicBool::new(false),
         })
     }
 
@@ -66,6 +69,9 @@ impl Store for Gate {
             op.key_cond()
                 .is_some_and(|(key, _)| key.starts_with("usage/"))
         });
+        if self.all_fail.load(Ordering::SeqCst) {
+            return Err(Self::refused());
+        }
         if usage && self.writes_fail.load(Ordering::SeqCst) {
             return Err(Self::refused());
         }
@@ -117,7 +123,8 @@ fn submission(tag: u8) -> Submission {
         kind: LeaseKind::Action,
         resources: Resources::new(1_000, 4 * GIB),
         hermetic: true,
-        do_not_cache: false,
+        // So that an action asked for again runs again, not from the cache.
+        do_not_cache: true,
         needs: kbf_caps::Request::from_platform([("OSFamily", "linux")]).expect("a platform"),
         whole_worker: false,
     };
@@ -160,8 +167,18 @@ fn state(store: &Arc<dyn Store>) -> StateStore {
 }
 
 fn rig_over(store: &Arc<dyn Store>, mode: UsageProfiles) -> Rig {
+    rig_capped(store, mode, None)
+}
+
+/// [`rig_over`], keeping at most `cap` records a refusing store has not taken, if given.
+fn rig_capped(store: &Arc<dyn Store>, mode: UsageProfiles, cap: Option<usize>) -> Rig {
     let farm = farm_on(SchedulerCore::Js, &backend())
-        .with_memory_ladder(MemoryLadder::from_gib(&[4, 16, 32]).expect("a ladder"))
+        .with_memory_ladder(MemoryLadder::from_gib(&[4, 16, 32]).expect("a ladder"));
+    let farm = match cap {
+        Some(cap) => farm.with_held_cap(cap),
+        None => farm,
+    };
+    let farm = farm
         .with_usage_profiles(mode)
         .with_state(Some(state(store)))
         .expect("a farm over the store");
@@ -534,12 +551,11 @@ async fn every_end_of_a_run_forgets_its_key() {
     nothing_held(&handed);
 }
 
-/// Catches the profile name of an action being removed when its result is accepted, before the
-/// hub reads it (the hub asks for the key then): after the third result is accepted the
-/// action's entry is still there, and it goes once the beats have read the result, which
-/// learned the run.
+/// Catches the profile name of an action being removed while a later run of the action still
+/// needs it: it is there when the third result is accepted, and still there after the beats
+/// that read it, which learned the run. (It is bounded by the index's own cap, not removed.)
 #[tokio::test(start_paused = true)]
-async fn the_shape_entry_goes_after_the_result_is_read() {
+async fn the_shape_entry_stays_after_the_result_is_read() {
     let (mut rig, _store) = rig(UsageProfiles::Record);
     rig.clean(1).await;
     rig.clean(2).await;
@@ -548,8 +564,69 @@ async fn the_shape_entry_goes_after_the_result_is_read() {
     assert!(usage.shapes().get(&action_of(3)).is_some());
     assert_eq!(rig.stats().counters.runs_learned, 2);
     rig.grace().await;
-    assert!(usage.shapes().get(&action_of(3)).is_none());
+    assert!(usage.shapes().get(&action_of(3)).is_some());
     assert_eq!(rig.stats().counters.runs_learned, 3);
+}
+
+/// Catches the rerun of a killed run going unlearned: the kill is read by a beat, which let go
+/// of the action's profile name, and the rerun's clean result (the size after the ladder) had
+/// no key. The rerun is learned, and the kill is not.
+#[tokio::test(start_paused = true)]
+async fn a_killed_run_and_its_clean_rerun_teach_the_rerun() {
+    let (mut rig, _store) = rig(UsageProfiles::Record);
+    rig.run_with(1, |wire| killed(wire, MemoryKill::OwnLimit))
+        .await;
+    let wire = rerun_start(&rig.farm, &mut rig.joined).await;
+    let lease = lease_of(&wire);
+    assert!(rig.beat(vec![lease], minutes_of(lease, 3)).await);
+    let ack = rig
+        .farm
+        .report(&node(rig.name), ok(&wire, None))
+        .await
+        .expect("an ack");
+    assert!(ack.accepted, "{ack:?}");
+    rig.grace().await;
+    let stats = rig.stats();
+    assert_eq!(stats.counters.runs_without_key, 0);
+    assert_eq!(stats.counters.runs_learned, 1);
+    assert_eq!(stats.held_runs, 0);
+}
+
+/// Catches two runs of one action in flight sharing one profile name that the first to be read
+/// removes: the action runs, its result is accepted and not yet read, the action is asked for
+/// again and runs; both are learned.
+#[tokio::test(start_paused = true)]
+async fn two_runs_of_one_action_in_flight_are_both_learned() {
+    let (mut rig, _store) = rig(UsageProfiles::Record);
+    rig.run_with(1, |wire| ok(wire, None)).await;
+    rig.run_with(1, |wire| ok(wire, None)).await;
+    rig.grace().await;
+    let stats = rig.stats();
+    assert_eq!(stats.counters.runs_without_key, 0);
+    assert_eq!(stats.counters.runs_learned, 2);
+}
+
+/// Catches a result the core took but did not finish writing (the store refuses the record)
+/// or dropped over the cap going unseen: it is counted by which of the two it was, and its
+/// run is not followed.
+#[tokio::test(start_paused = true)]
+async fn a_result_the_store_has_not_taken_is_counted_not_followed() {
+    for (cap, held, dropped) in [(None, 1, 0), (Some(0), 0, 1)] {
+        let gate = Gate::over(fake());
+        let shared: Arc<dyn Store> = gate.clone();
+        let mut rig = rig_capped(&shared, UsageProfiles::Record, cap);
+        let wire = rig.start(1).lease_id.expect("a lease");
+        let lease = lease_of(&wire);
+        assert!(rig.beat(vec![lease], minutes_of(lease, 3)).await);
+        gate.all_fail.store(true, Ordering::SeqCst);
+        let ack = rig.farm.report(&node(rig.name), ok(&wire, None)).await;
+        assert_eq!(ack, None);
+        let stats = rig.stats();
+        assert_eq!(stats.results_held, held, "cap {cap:?}");
+        assert_eq!(stats.results_dropped, dropped, "cap {cap:?}");
+        assert_eq!(stats.held_runs, 0);
+        assert_eq!(stats.waiting, 0);
+    }
 }
 
 /// Catches the usage families missing from a scrape of a farm that records, or present on one

@@ -97,6 +97,10 @@ pub(crate) struct UsageStats {
     pub(crate) waiting: usize,
     /// How many ticks ran.
     pub(crate) ticks: u64,
+    /// Results the core took whose record the store had not written yet.
+    pub(crate) results_held: u64,
+    /// Results the core took and dropped unwritten, over its cap.
+    pub(crate) results_dropped: u64,
 }
 
 impl UsageStats {
@@ -435,6 +439,8 @@ impl Usage {
             held_runs: self.keys.len(),
             waiting: self.lock().values().map(Vec::len).sum(),
             ticks: self.ticks.load(Ordering::Relaxed),
+            results_held: 0,
+            results_dropped: 0,
         }
     }
 

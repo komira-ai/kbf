@@ -16,7 +16,7 @@ use kbf_front::Described;
 use kbf_state::fake::{Fake, Flaw};
 use kbf_state::{ManualClock, Store};
 use kbf_types::sched::usage::{LeaseMinute, NodeLoad};
-use kbf_types::{ActionKey, Digest, DigestFunction, LeaseId, WorkerId};
+use kbf_types::{ActionKey, Digest, DigestFunction, LeaseId, OperationId, WaiterId, WorkerId};
 use kbf_usage::{KbfUsageSink, MAX_SHAPES, profile_name};
 
 use super::usage::{Usage, UsageStats};
@@ -236,6 +236,8 @@ fn the_usage_families_render_the_counts() {
         held_runs: 11,
         waiting: 12,
         ticks: 13,
+        results_held: 14,
+        results_dropped: 15,
     };
     let mut out = String::new();
     stats.render(&mut out);
@@ -256,5 +258,41 @@ fn the_usage_families_render_the_counts() {
         let expected = format!("# TYPE {name} {kind}\n{name} {value}\n");
         assert!(out.contains(&expected), "{expected} not in {out}");
     }
-    assert_eq!(out.matches("# HELP").count(), 12);
+    for (reason, value) in [("held", 14), ("dropped", 15)] {
+        let expected =
+            format!("kbf_usage_results_not_taken_total{{reason=\"{reason}\"}} {value}\n");
+        assert!(out.contains(&expected), "{expected} not in {out}");
+    }
+    assert!(out.contains("# TYPE kbf_usage_results_not_taken_total counter\n"));
+    assert_eq!(out.matches("# HELP").count(), 13);
+}
+
+/// Pins what the adapter does with a row that kept no subject (it arrives green): an
+/// operation read back with no parcel is not named, because the empty subject has no
+/// estimator key, so it cannot overwrite the entry of a real action; one with a parcel is.
+#[test]
+fn a_row_with_no_parcel_is_not_noted() {
+    use js_server_core::Adapter as _;
+    let usage = Arc::new(Usage::open(store(), 0).expect("a usage side"));
+    let mut adapter = super::testing::adapter().noting_usage(Some(Arc::clone(&usage)));
+    let request = kbf_sched::Request {
+        needs: kbf_caps::Request::from_platform([("OSFamily", "linux")]).expect("a platform"),
+        ..super::testing::request(1)
+    };
+    adapter.adopted(OperationId(1), WaiterId(1), None, &request, None, None);
+    assert_eq!(usage.shapes().len(), 0);
+    let described = Described {
+        arguments: vec!["compile".to_owned()],
+        ..Described::default()
+    };
+    let parcel = crate::farm::durable::subject::encode(&Subject::of(described).0);
+    adapter.adopted(
+        OperationId(2),
+        WaiterId(2),
+        Some(&parcel),
+        &request,
+        None,
+        None,
+    );
+    assert_eq!(usage.shapes().len(), 1);
 }
