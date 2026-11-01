@@ -157,12 +157,18 @@ impl Report {
             .map_or(Ok(()), |reason| {
                 Err(LineError::BadReason(reason.to_owned()))
             })?;
+        // `"reversible": null` is a stated value that is not a boolean: false, as on the lenient
+        // path, and not the same as leaving the field out.
+        let null = matches!(
+            serde_json::from_str::<Value>(line),
+            Ok(Value::Object(object)) if object.get("reversible").is_some_and(Value::is_null)
+        );
         Ok(Report {
             class: wire.class.unwrap_or_default(),
             reason: wire.reason,
             retry_after_secs: wire.retry_after_secs,
-            reversible: wire.reversible.unwrap_or(true),
-            reversible_stated: wire.reversible.is_some(),
+            reversible: !null && wire.reversible.unwrap_or(true),
+            reversible_stated: null || wire.reversible.is_some(),
             promotion_pending: wire.promotion_pending.unwrap_or(false),
             detail: wire.detail,
         })
