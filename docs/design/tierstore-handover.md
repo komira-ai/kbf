@@ -110,7 +110,7 @@ ending the watch as `Failed(after_commit)` for a storage node and a build node a
 receives the value as `updater.promotion_ceiling_secs` in the params file and must not exit `1` for it. After the commit
 `verify` exits `1` only for a fault of its own observation (v-next crashed, answers wrongly), class `release`, which the
 updater also reports as `Failed(after_commit)` and never rolls back. **Exit `75` is not used**: nothing here is "not
-ready, try later with nothing done". *Idempotent*: it only observes, and sets the `verified` marker.
+ready, try later with nothing done". *Idempotent*: it only observes, and sets the `verified` marker, which records the boot id read at that moment.
 
 **`rollback`** (before the stop of v-current only). Apply the swap file for the other port (the one `previous` names once
 `swapped`, else the one `serving` names), then stop the instance the restored rule does not name, and clear `previous` and
@@ -120,9 +120,12 @@ to a closed port, so `rollback` exits `1` with `"reversible":false`, which the u
 not `halt` (`host-updates.md` 3.2).
 
 **`cleanup`** (the commit point of tierstore). The updater calls it only after a successful `verify`, and the hook
-refuses anyway: **unless the record says `verified`, `cleanup` does nothing and exits `1`** (`host-updates.md` 3.2: a
-`cleanup` must not commit on its own authority). If `verified` is set: write `stopping` and from here print
-`"reversible":false` on every exit, so the updater records the commit; then `systemctl stop tierstore@<previous>`. The
+refuses anyway: **unless the record says `verified`, `cleanup` does nothing and exits `1` with `"reversible":true`** (`host-updates.md` 3.2: a
+`cleanup` must not commit on its own authority, and a step that commits re-observes first). If `verified` is set, and
+`stopping` is not yet written, `cleanup` first re-observes in its own run: v-next serves through 9300 (the build gauge
+names the slot and version) and the boot id equals the one the marker holds. A failed check, or a stale marker (another
+boot id), commits nothing and exits `1` with `"reversible":true`; the updater runs `rollback`. Then write `stopping` and from here print
+`"reversible":false` on every exit, so the updater records the commit (a re-run after `stopping` does not re-observe); then `systemctl stop tierstore@<previous>`. The
 process sees SIGTERM, keeps accepting for the settle (`--drain-lb-wait`, 70 s, the last SYN retransmit of a default
 client, `host-updates.md` 4.1.3 and Question 13), applies P1 and P2 (section 7, Question 14), waits for requests in flight
 at most `--drain-deadline`, gives up the lease, and exits; the unit's stop timeout kills a hung one and the kernel frees
@@ -250,6 +253,7 @@ scrapes the two private ports from the node (the guard blocks off-host); one is 
 | `cutover` | `nft -f` fails | one transaction: the old rule stays; `1` | v-current serves |
 | `cutover` | probe never answered by v-next | swap back inside the step; `1` | v-current serves |
 | `verify` (before cleanup) | v-next crashes or answers wrongly | `1`; the updater runs `rollback`: swap back, stop v-next; v-current still accepts | v-current serves |
+| `cleanup` | no `verified`, a boot id that changed since it, or v-next not serving through 9300 | commits nothing; `1`, `reversible:true`; the updater runs `rollback` | v-current serves |
 | `cleanup` | killed after `stopping`, or fails after it | re-run forward by the updater up to `cleanup_retries` (3): stop, retire; no swap back; then `Failed(after_commit)` | v-next serves |
 | `cleanup` | v-next crashes after `stopping` | no swap back (v-current has stopped accepting); systemd restarts v-next, read-only while v-current exits, read-write at once if gone; the coordinator rolls back by a new hand-over | a gap until v-next is up; failed |
 | `cleanup` | v-current hangs past the drain deadline | `Drained.abandoned` counts what was cut; the unit is killed at its stop timeout; the kernel frees the lock | v-next takes it |
@@ -269,12 +273,13 @@ real hook binary against a fake service and a fake `nft` and `systemctl`):
   reaches the same state; no `handover-v1` yields `mode=restart`; a bad conntrack bound is `75`.
 - **C2 `cutover`**: twice leaves one rule naming the idle port; killed between apply and `swapped` converges; a failing
   probe swaps back and exits `1`; the swap is one `nft -f` (a recording fake sees one call).
-- **C3 `verify`**: twice changes nothing; with the lock held it exits `0` with `promotion_pending`; with `read-write` it
+- **C3 `verify`**: twice changes nothing; the marker holds the boot id; with the lock held it exits `0` with `promotion_pending`; with `read-write` it
   clears the flag; a wrong version or slot through 9300 is `1`; with `updater.promotion_ceiling_secs` in the params file
   and the lock never taken it still exits `0` (red: a hook that exits `1` at the ceiling).
 - **C4 `rollback`**: after `cutover` it returns the fake to its earlier state; after `cleanup`'s `stopping` marker it
   exits `1` with `reversible:false` and changes nothing.
-- **C5 `cleanup`**: without `verified` it exits `1` and stops nothing (red: a hook that stops v-current); with it, twice and
+- **C5 `cleanup`**: without `verified`, with a `verified` marker holding another boot id, or with v-next not serving
+  through 9300, it exits `1` with `reversible:true` and stops nothing (red: a hook that stops v-current); with a fresh one, twice and
   killed at each boundary, it ends with the unit stopped, link absent, mask present, `previous` cleared, and every exit
   after `stopping` carries `reversible:false`.
 - **C6 `restore`** (boot): before `stopping` it starts only the previous slot and names it in the rule; with `stopping`
