@@ -23,7 +23,7 @@ use kbf_harness::reapi::{connect, upload_action};
 use kbf_harness::stand_in::sibling_bin;
 use kbf_proto::google::longrunning::operation;
 use kbf_proto::reapi::execution_client::ExecutionClient;
-use kbf_proto::reapi::{ExecuteRequest, ExecuteResponse};
+use kbf_proto::reapi::{Digest, ExecuteRequest, ExecuteResponse};
 use kbf_testkit::dir::TestDir;
 use kbf_testkit::tree::{Job, Tree};
 use kbf_transfer::{TransferConfig, Transfers, digest_of};
@@ -80,14 +80,9 @@ fn plant_slow_action(farm: &Farm, dir: &std::path::Path) {
     }
 }
 
-/// Executes the action of `input` to the end of its operation: its response, or why there
-/// is none (a failed call, an operation that ended with no response, a hang).
-async fn run_one(
-    reapi: Channel,
-    cas: Arc<Transfers>,
-    image: String,
-    input: usize,
-) -> Result<ExecuteResponse, String> {
+/// Uploads the action of `input` (its command, its input tree and the action itself) and
+/// returns the action's digest.
+async fn upload_one(cas: Arc<Transfers>, image: String, input: usize) -> Digest {
     let bytes = format!("planned restart input {input:04} {}", "x".repeat(80)).into_bytes();
     let job = Job {
         input: Tree::with_input("input.bin", &bytes),
@@ -95,7 +90,12 @@ async fn run_one(
         cacheable: true,
         ..Job::default()
     };
-    let action = upload_action(&cas, &image, &job).await;
+    upload_action(&cas, &image, &job).await
+}
+
+/// Executes the uploaded `action` to the end of its operation: its response, or why there
+/// is none (a failed call, an operation that ended with no response, a hang).
+async fn execute_one(reapi: Channel, action: Digest) -> Result<ExecuteResponse, String> {
     let call = async {
         let mut ops = ExecutionClient::new(reapi)
             .execute(ExecuteRequest {
@@ -139,6 +139,14 @@ fn node_with_a_lease(farm: &Farm) -> Option<usize> {
 /// running leases it is the victim: its storage member is marked `planned_down` through the
 /// operator API, the frontend lists it down, the node gets SIGTERM and is started again.
 ///
+/// The twelve actions are uploaded, and the uploads joined, before the victim is chosen and
+/// its member marked `planned_down`: the restart moves the storage map's generation (the
+/// node re-enters it catching up, then active), and an upload that spans those moves can be
+/// refused `STALE_MAP`: the frontend's ByteStream `Write` passes that answer through
+/// without a map refetch (#2157). A real planned restart can cause it, so uploads during a
+/// restart are deliberately not exercised here until #2157 lands; its own tests cover the
+/// retry. Only the Execute streams are in flight during the restart.
+///
 /// What it proves is the contract of a planned restart as an operator lives it: every
 /// `Execute` still completes with exit code 0 (none cached, each output the action wrote),
 /// no run is dropped and no lease fails or is fenced in any process's log in any
@@ -164,7 +172,6 @@ fn a_loaded_node_restarts_planned_down_and_loses_no_action() {
     farm.wait_ready().unwrap_or_else(|e| panic!("{e}"));
     plant_slow_action(&farm, &dir);
 
-    // The load: every action is submitted at once and awaited at the end.
     let tokio = tokio::runtime::Runtime::new().expect("runtime");
     let (channel, cas) = tokio.block_on(async {
         let channel = connect(farm.ca_pem(), farm.reapi()).await;
@@ -172,8 +179,19 @@ fn a_loaded_node_restarts_planned_down_and_loses_no_action() {
         (channel, cas)
     });
     let image = farm.image().to_owned();
-    let running: Vec<_> = (0..LOAD_ACTIONS)
-        .map(|i| tokio.spawn(run_one(channel.clone(), cas.clone(), image.clone(), i)))
+    // The uploads are joined first: only the Execute streams are in flight once the victim
+    // is chosen.
+    let uploads: Vec<_> = (0..LOAD_ACTIONS)
+        .map(|i| tokio.spawn(upload_one(cas.clone(), image.clone(), i)))
+        .collect();
+    let mut actions = Vec::with_capacity(LOAD_ACTIONS);
+    for upload in uploads {
+        actions.push(tokio.block_on(upload).expect("the upload task ran"));
+    }
+    // The load: every action is executed at once and awaited at the end.
+    let running: Vec<_> = actions
+        .into_iter()
+        .map(|action| tokio.spawn(execute_one(channel.clone(), action)))
         .collect();
 
     // The victim is a node that runs leases now (its own log says so).

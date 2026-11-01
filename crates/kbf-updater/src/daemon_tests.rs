@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use crate::api::{ErrorCode, Roll, RollState};
 use crate::daemon::{
     Config, Daemon, build_ports, build_ports_with_exec, drive_loop, parse_flags,
-    parse_operator_url, run_config, start, start_with, stderr_sink,
+    parse_operator_url, run_config, start, start_with, stderr_log, stderr_sink,
 };
 use crate::fakes::{Event, FakeClock, FakeHealth, FakeInstaller, FakeSafeToStop, Log};
 use crate::inventory::{Host, Member, Role};
@@ -932,4 +932,5 @@ fn the_process_entry_points() {
     assert_eq!((code, out.as_str()), (0, ""));
     assert!(!sock(&cfg).exists(), "the socket is removed on exit");
     stderr_sink()("{\"event\":\"test\"}");
+    stderr_log()("warn: test");
 }

@@ -65,6 +65,7 @@ mod driver;
 mod ack;
 mod ambient;
 mod beat;
+mod cordon_owner;
 pub(crate) mod durable;
 mod engine;
 pub(crate) mod failed_actions;
@@ -175,6 +176,8 @@ pub struct Farm {
     ambient: Ambient,
     /// What the `with_*` builders set.
     settings: Settings,
+    /// The `--usage-profiles` mode, which the start line and the gauge report.
+    usage_profiles: crate::UsageProfiles,
     /// The engine every method reaches the farm's state through.
     driver: Driver,
 }
@@ -323,6 +326,7 @@ impl Farm {
             reports: AtomicUsize::new(0),
             ambient,
             settings: Settings::default(),
+            usage_profiles: crate::UsageProfiles::default(),
             driver: Driver::legacy(State {
                 engine: Engine::new(sched, finished_retention, ambient),
                 side: Side::new(term, ambient),
@@ -995,6 +999,8 @@ fn wire_lease(lease: LeaseId) -> worker::LeaseId {
     }
 }
 
+#[cfg(test)]
+mod cordon_owner_tests;
 mod from_listeners;
 #[cfg(test)]
 mod learned_tests;
