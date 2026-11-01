@@ -10,7 +10,7 @@ use std::time::Duration;
 use super::coordinator::{Coordinator, CoordinatorError};
 use super::local::{Ended, HostState, Local, LocalError, Staged, Trial};
 use crate::inventory::{Host, Role};
-use crate::ports::{Clock, Drain, Health, HealthCheck, Placed, PortError};
+use crate::ports::{Clock, Drain, Health, HealthCheck, Placed, PortError, Seen};
 use crate::version::Version;
 use crate::wire::{self, Answer, Heartbeat, Reply, ServiceReply};
 
@@ -324,6 +324,11 @@ pub struct ServingNode {
     pub seen_at_drain: Arc<Mutex<Option<bool>>>,
     /// The frontend knows no node here: reads say in placement, drain and undrain do nothing.
     pub absent: Arc<Mutex<bool>>,
+    /// Out of placement as a plain cordon (no drain), which only an operator makes: the
+    /// updater's own cordon is always a drain.
+    pub cordoned: Arc<Mutex<bool>>,
+    /// Reads of the node fail with this.
+    pub read_error: Arc<Mutex<Option<PortError>>>,
 }
 
 impl ServingNode {
@@ -337,6 +342,8 @@ impl ServingNode {
             watch: Arc::default(),
             seen_at_drain: Arc::default(),
             absent: Arc::default(),
+            cordoned: Arc::default(),
+            read_error: Arc::default(),
         }
     }
 
@@ -353,6 +360,14 @@ impl ServingNode {
     /// An operator cordons and drains it.
     pub fn operator_drains(&self) {
         *lock(&self.serving) = false;
+        *lock(&self.cordoned) = false;
+    }
+
+    /// An operator cordons it, with no drain: over the updater's drain or over a node
+    /// serving.
+    pub fn operator_cordons(&self) {
+        *lock(&self.serving) = false;
+        *lock(&self.cordoned) = true;
     }
 
     pub fn is_serving(&self) -> bool {
@@ -362,6 +377,9 @@ impl ServingNode {
 
 impl Drain for ServingNode {
     fn placed(&self, _host: &Host) -> Result<Placed, PortError> {
+        if let Some(e) = lock(&self.read_error).clone() {
+            return Err(e);
+        }
         Ok(if self.is_serving() {
             Placed::In
         } else {
@@ -374,6 +392,14 @@ impl Drain for ServingNode {
             return Ok(None);
         }
         self.placed(host).map(Some)
+    }
+
+    fn seen_if_known(&self, host: &Host) -> Result<Option<Seen>, PortError> {
+        Ok(self.placed_if_known(host)?.map(|placed| match placed {
+            Placed::In => Seen::Serving,
+            Placed::Out if *lock(&self.cordoned) => Seen::Cordoned,
+            Placed::Out => Seen::Draining,
+        }))
     }
 
     fn drain(&self, _host: &Host, _deadline: Option<Duration>) -> Result<(), PortError> {
@@ -389,6 +415,7 @@ impl Drain for ServingNode {
             return Err(e);
         }
         *lock(&self.serving) = false;
+        *lock(&self.cordoned) = false;
         Ok(())
     }
 
@@ -404,6 +431,7 @@ impl Drain for ServingNode {
             return Err(e);
         }
         *lock(&self.serving) = true;
+        *lock(&self.cordoned) = false;
         Ok(())
     }
 }
