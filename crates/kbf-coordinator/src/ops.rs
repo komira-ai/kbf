@@ -124,6 +124,10 @@ pub struct ServiceOps {
     /// The halt reports an operator cleared: one per host, the latest.
     #[serde(default)]
     pub halt_acked: Vec<HaltAck>,
+    /// The other halt reports received while the standing halt stood: one per host, the
+    /// latest. A clear acknowledges them with the halt's own. Empty unless a halt stands.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub halt_seen: Vec<HaltAck>,
     /// How many halts an operator has cleared. Agents that announced `halt-v1` are told it
     /// and lift their hold when it is newer than the one they halted under. Written only
     /// once it is not zero, so a file of a service never cleared reads as it always did.
@@ -636,16 +640,22 @@ pub fn operate(
             entry.node_id = Some(halt.node_id.clone());
             entry.reason = Some(why);
             // Written first: a clear that cannot be written leaves the halt standing. The
-            // report is acknowledged (one per host, the latest) so that the host, which keeps
-            // reporting it until it updates again, does not raise the halt again.
+            // reports of the halt and of every other host that reported while it stood are
+            // acknowledged (one per host, the latest) so that a host, which keeps reporting
+            // until it updates again, does not raise the halt again: a clear clears the service.
             store.change(Write::BeforeMemory, entry, |state| {
                 let marks = state.services.entry(name).or_default();
                 marks.halt = None;
-                marks.halt_acked.retain(|ack| ack.node_id != halt.node_id);
-                marks.halt_acked.push(HaltAck {
+                let seen = std::mem::take(&mut marks.halt_seen);
+                let reports = std::iter::once(HaltAck {
                     node_id: halt.node_id,
                     target: halt.target,
-                });
+                })
+                .chain(seen);
+                for report in reports {
+                    marks.halt_acked.retain(|ack| ack.node_id != report.node_id);
+                    marks.halt_acked.push(report);
+                }
                 marks.halt_generation = marks.halt_generation.saturating_add(1);
             })?
         }

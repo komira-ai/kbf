@@ -14,7 +14,12 @@
 //!
 //! The halted host keeps reporting the same `last_update` until it updates again, so a clear
 //! also records `(node, target)` as acknowledged, and a report for an acknowledged pair is
-//! not raised. Each clear raises the service's generation by one. A reply to an agent that
+//! not raised. A clear clears the service: every other halt report received while the halt
+//! stood (`halt_seen`, kept with the halt) is acknowledged with it, so the coordinator and the
+//! agents, which lift on the generation, agree. A `last_update` has no attempt number or
+//! finish stamp, so a report's identity is its `(node, target)` for as long as the host keeps
+//! reporting it and is not updating: a beat without it, or one that says the host is updating,
+//! ends the host's acknowledgement ([`forget`]), and a halt reported after that is new. Each clear raises the service's generation by one. A reply to an agent that
 //! announced [`FEATURE`] carries the generation of every service that has one (`halts`): the
 //! agent lifts its hold when it sees a number newer than the one it halted under, so a lost
 //! heartbeat cannot make it miss a clear, and a restart of the coordinator, which reads the
@@ -23,7 +28,7 @@
 //! A report is ignored when its host is not a member of the service (the service is not
 //! defined, or does not run on the host's role), when an operator excluded the host from it,
 //! when an operator cleared exactly that report, and when the service is halted already: the
-//! first halt stands until it is cleared.
+//! first halt stands until it is cleared (the convergence names it).
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -35,7 +40,7 @@ use crate::decide::{Decision, Hold, decide_why};
 use crate::desired::{Desired, KBF};
 use crate::fleet::Fleet;
 use crate::identity::Identity;
-use crate::ops::{AuditEntry, Halt, OpsState, OpsStore, Write};
+use crate::ops::{AuditEntry, Halt, HaltAck, OpsState, OpsStore, Write};
 use crate::services::Services;
 
 /// The feature an agent announces to be told the clear generations.
@@ -73,16 +78,26 @@ pub(crate) fn is_member(services: &Services, service: &str, role: &str) -> bool 
         .is_some_and(|def| def.roles.contains_key(role))
 }
 
+/// Why `halt`, reported for `service`, is not raised.
+enum Ignored {
+    /// An operator excluded the host from the service.
+    Excluded,
+    /// An operator cleared this report.
+    Acked,
+    /// The service is halted already: the report is kept for the clear ([`record`]).
+    Standing,
+}
+
 /// Why `halt`, reported for `service`, is not raised: the first of the reasons in the module
 /// documentation that holds, or `None` when it is.
-fn ignored(state: &OpsState, service: &str, halt: &Halt) -> Option<&'static str> {
+fn ignored(state: &OpsState, service: &str, halt: &Halt) -> Option<Ignored> {
     let marks = state.services.get(service);
     let excluded = state
         .excluded
         .iter()
         .any(|e| (e.service.as_str(), e.node_id.as_str()) == (service, halt.node_id.as_str()));
     if excluded {
-        return Some("the host is excluded from the service");
+        return Some(Ignored::Excluded);
     }
     let acked = marks.is_some_and(|m| {
         m.halt_acked
@@ -90,10 +105,10 @@ fn ignored(state: &OpsState, service: &str, halt: &Halt) -> Option<&'static str>
             .any(|a| (&a.node_id, &a.target) == (&halt.node_id, &halt.target))
     });
     if acked {
-        return Some("an operator cleared this report");
+        return Some(Ignored::Acked);
     }
     if marks.is_some_and(|m| m.halt.is_some()) {
-        return Some("the service is halted already");
+        return Some(Ignored::Standing);
     }
     None
 }
@@ -163,9 +178,17 @@ fn forget(ops: &OpsStore, service: &str, id: &NodeId) {
 /// write is logged and the halt stands in memory (a restart before the next write forgets it,
 /// and the host's next report raises it again).
 fn raise(ops: &OpsStore, service: &str, halt: Halt) {
-    if let Some(why) = ops.read(|state| ignored(state, service, &halt)) {
-        tracing::debug!(service, node_id = %halt.node_id, why, "ignored a halt report");
-        return;
+    match ops.read(|state| ignored(state, service, &halt)) {
+        None => {}
+        Some(Ignored::Standing) => return record(ops, service, halt),
+        Some(Ignored::Excluded) => {
+            tracing::debug!(service, node_id = %halt.node_id, "ignored a halt report: excluded");
+            return;
+        }
+        Some(Ignored::Acked) => {
+            tracing::debug!(service, node_id = %halt.node_id, "ignored a halt report: cleared");
+            return;
+        }
     }
     tracing::error!(
         alert = "halt",
@@ -191,6 +214,40 @@ fn raise(ops: &OpsStore, service: &str, halt: Halt) {
             %why,
             "the halt could not be written to the ops file: it stands in memory"
         );
+    }
+}
+
+/// Keeps `report`, made while the halt of `service` stands, for the clear to acknowledge. Kept
+/// once per host and target, with the halt: a report the halt itself holds, or one kept
+/// already, is not kept again.
+fn record(ops: &OpsStore, service: &str, report: Halt) {
+    let ack = HaltAck {
+        node_id: report.node_id,
+        target: report.target,
+    };
+    let known = ops.read(|state| {
+        state.services.get(service).is_some_and(|m| {
+            m.halt
+                .iter()
+                .any(|h| (&h.node_id, &h.target) == (&ack.node_id, &ack.target))
+                || m.halt_seen.contains(&ack)
+        })
+    });
+    if known {
+        return;
+    }
+    let mut entry = AuditEntry::new(COORDINATOR, "halt_report");
+    entry.service = Some(service.to_owned());
+    entry.node_id = Some(ack.node_id.clone());
+    entry.reason = Some(report.check);
+    let name = service.to_owned();
+    let kept = ops.change(Write::AfterMemory, entry, |state| {
+        let seen = &mut state.services.entry(name).or_default().halt_seen;
+        seen.retain(|s| s.node_id != ack.node_id);
+        seen.push(ack);
+    });
+    if let Err(why) = kept {
+        tracing::error!(service, %why, "a halt report could not be written to the ops file");
     }
 }
 

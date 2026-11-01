@@ -59,6 +59,12 @@ const FULL: &str = r#"{
           "target": "1.5"
         }
       ],
+      "halt_seen": [
+        {
+          "node_id": "n5",
+          "target": "2.0"
+        }
+      ],
       "halt_generation": 3,
       "last_good": "1.0",
       "bad": [
@@ -107,6 +113,10 @@ fn the_file_reads_and_writes_every_field_of_the_schema() {
             halt_acked: vec![HaltAck {
                 node_id: "n4".to_owned(),
                 target: version("1.5"),
+            }],
+            halt_seen: vec![HaltAck {
+                node_id: "n5".to_owned(),
+                target: version("2.0"),
             }],
             halt_generation: 3,
             last_good: Some(version("1.0")),
