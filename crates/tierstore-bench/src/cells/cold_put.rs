@@ -64,7 +64,7 @@ pub const PATHS: [PutPath; 3] = [
 /// [`BenchError`] if no store of the cell is configured, the ledger refuses the cell, the load
 /// gate trips or cannot be read, or a file or the request log fails.
 pub async fn run(ctx: &CellContext, plan: &CellPlan) -> Result<Vec<CellResult>, BenchError> {
-    run_with(ctx, plan, Arc::new(ProcLoad), None, None).await
+    run_with(ctx, plan, Arc::new(ProcLoad::new()), None, None).await
 }
 
 /// [`run`] with the machine, the fault proxy and a cap on the requests of a pass given.
@@ -209,10 +209,9 @@ mod tests {
     #[tokio::test]
     async fn a_dead_store_is_a_result_of_failed_puts() {
         let dir = temp("tb-cold-put-dead");
-        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let dead = format!("http://{}", closed.local_addr().unwrap());
-        drop(closed);
-        let ctx = testkit::ctx(dir.path(), &[(Role::Cold, &dead)], Window::Quiet);
+        let dead_store = testkit::DeadStore::start().await;
+        let dead = dead_store.endpoint();
+        let ctx = testkit::ctx(dir.path(), &[(Role::Cold, dead)], Window::Quiet);
         let results = run_with(&ctx, &plan(&[4096]), Script::calm(), None, Some(2))
             .await
             .unwrap();

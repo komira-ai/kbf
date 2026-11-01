@@ -285,7 +285,10 @@ fn row_of(v: &Value, nodes: &BTreeMap<String, Node>) -> Result<Row, String> {
         ended_us: time("ended")?,
         node_capacity: known.and_then(|n| n.capacity),
         basis: usage.and_then(|u| str_of(u, "basis")).map(str::to_owned),
-        operation: str_of(v, "operation").map(str::to_owned),
+        // The run route writes the operation id as a number (`operation_id`), left out for a
+        // run with none. The text is its decimal form. No server wrote another key: the
+        // exporter never read the run's operation, so no export file holds one to keep.
+        operation: v["operation_id"].as_u64().map(|id| id.to_string()),
         // The run's own key is the lease's grant, written for every attempt; the usage block's
         // is what the daemon reported, which an older server wrote for a Mac only.
         booked_millicpus: v["booked_millicpus"]

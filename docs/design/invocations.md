@@ -81,7 +81,7 @@ Read on `main`:
   another machine can read only a server open to everyone who reaches it (4.9).
 - **A timed-out action's logs are not listed.** The farm answers a timeout with the
   partial ActionResult the daemon sent, but the recorder keeps a listing only for an
-  action that ran to an exit (`kbf-server/src/farm/record.rs`), so a timed-out row
+  action that ran to an exit (`kbf-server/src/run_record/recording.rs`), so a timed-out row
   has no stdout or stderr digest (PR 12 lists it).
 - **The client text channel is unused.** `ExecuteResponse` is built with `result`,
   `cached_result` and `status` only; `message` and `server_logs` are empty.

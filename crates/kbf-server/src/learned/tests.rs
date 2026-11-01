@@ -937,3 +937,12 @@ fn the_registry_of_size_keys_is_bounded_and_forgets_the_oldest() {
     assert_eq!(learned.summary_key(newest), Some(shaped(newest)));
     assert_eq!(learned.named(&shaped(1)), vec![1]);
 }
+
+/// Pins that the live estimator learns from the lease's `ResourceUsage` block and from no
+/// timestamp of the execution metadata: a run that carries no usage (an executor run, whose
+/// phase times are a task's claim) is never a sample, whatever its outcome.
+#[test]
+fn a_run_without_a_usage_block_is_never_a_sample() {
+    assert!(run_of(ok(), None, GIB).is_none());
+    assert!(run_of(Outcome::Failed(Failure::OutOfMemory), None, GIB).is_none());
+}
