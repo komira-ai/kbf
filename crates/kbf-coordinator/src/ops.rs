@@ -129,6 +129,10 @@ pub struct ServiceOps {
     /// The versions never to order again, until CI sets one by hand.
     #[serde(default)]
     pub bad: Vec<Version>,
+    /// The failure reports standing when CI set a bad version by hand: one per host. A report
+    /// that is acked does not count towards an automatic rollback.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failure_acked: Vec<HaltAck>,
 }
 
 /// One change, as the ring and the log say it.

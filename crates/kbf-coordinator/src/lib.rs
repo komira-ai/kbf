@@ -79,6 +79,8 @@ mod priority_tests;
 #[cfg(test)]
 mod rollback_definition_tests;
 #[cfg(test)]
+mod rollback_override_tests;
+#[cfg(test)]
 mod rollback_tests;
 #[cfg(test)]
 mod service_tests;

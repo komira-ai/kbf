@@ -24,25 +24,25 @@ use crate::service::SetError;
 use crate::services::{ServiceDef, Services};
 use crate::testutil::{OPERATOR, Rig, beat, ci_token, desired, id, ops_of, version};
 
-const AUTO: &str = "rollback = \"automatic\"";
-const ONE: &str = r#"{"version":"1.0","min_up":{"storage":0,"frontend":0}}"#;
-const TWO: &str = r#"{"version":"2.0","min_up":{"storage":0,"frontend":0}}"#;
-const THREE: &str = r#"{"version":"3.0","min_up":{"storage":0,"frontend":0}}"#;
-const HOSTS: [&str; 6] = ["d1", "d2", "d3", "d4", "d5", "d6"];
+pub(crate) const AUTO: &str = "rollback = \"automatic\"";
+pub(crate) const ONE: &str = r#"{"version":"1.0","min_up":{"storage":0,"frontend":0}}"#;
+pub(crate) const TWO: &str = r#"{"version":"2.0","min_up":{"storage":0,"frontend":0}}"#;
+pub(crate) const THREE: &str = r#"{"version":"3.0","min_up":{"storage":0,"frontend":0}}"#;
+pub(crate) const HOSTS: [&str; 6] = ["d1", "d2", "d3", "d4", "d5", "d6"];
 
-fn secs(n: u64) -> Duration {
+pub(crate) fn secs(n: u64) -> Duration {
     Duration::from_secs(n)
 }
 
 /// `kbf` replaced by a service of daemons that all may update at once, with the definition
 /// lines `extra` in its table.
-fn definition(extra: &str) -> String {
+pub(crate) fn definition(extra: &str) -> String {
     format!(
         "[[service]]\nname = \"kbf\"\n{extra}\n[service.roles.daemon]\nmax_updating = 6\nmin_up = 0\n"
     )
 }
 
-fn def(extra: &str) -> ServiceDef {
+pub(crate) fn def(extra: &str) -> ServiceDef {
     Services::parse(&definition(extra))
         .expect("services")
         .get(KBF)
@@ -50,7 +50,7 @@ fn def(extra: &str) -> ServiceDef {
         .clone()
 }
 
-fn failure(phase: Option<Phase>, class: Option<Class>, target: &str) -> Heartbeat {
+pub(crate) fn failure(phase: Option<Phase>, class: Option<Class>, target: &str) -> Heartbeat {
     let mut b = beat("1.0");
     b.last_update = Some(UpdateResult {
         target: version(target),
@@ -63,7 +63,7 @@ fn failure(phase: Option<Phase>, class: Option<Class>, target: &str) -> Heartbea
 }
 
 /// The marks of a service whose last good version is 1.0.
-fn good() -> ServiceOps {
+pub(crate) fn good() -> ServiceOps {
     ServiceOps {
         last_good: Some(version("1.0")),
         ..ServiceOps::default()
@@ -72,7 +72,7 @@ fn good() -> ServiceOps {
 
 /// `n` daemons at 1.0 that heartbeated at 2000, the first `failed` of which failed an
 /// update to 2.0 as `phase` and `class` say.
-fn farm(n: usize, failed: usize, phase: Option<Phase>, class: Option<Class>) -> Fleet {
+pub(crate) fn farm(n: usize, failed: usize, phase: Option<Phase>, class: Option<Class>) -> Fleet {
     let mut fleet = Fleet::new(Duration::ZERO);
     for i in 0..n {
         let b = if i < failed {
@@ -85,16 +85,16 @@ fn farm(n: usize, failed: usize, phase: Option<Phase>, class: Option<Class>) -> 
     fleet
 }
 
-fn release() -> (Option<Phase>, Option<Class>) {
+pub(crate) fn release() -> (Option<Phase>, Option<Class>) {
     (Some(Phase::AfterCommit), Some(Class::Release))
 }
 
 /// What the plan says for `def` at 2000 when 2.0 is wanted.
-fn plan_for(def: &ServiceDef, marks: &ServiceOps, fleet: &Fleet) -> Vec<Change> {
+pub(crate) fn plan_for(def: &ServiceDef, marks: &ServiceOps, fleet: &Fleet) -> Vec<Change> {
     plan(def, &desired("2.0", 0, 0), marks, fleet, secs(2_000))
 }
 
-fn rolled_back() -> Vec<Change> {
+pub(crate) fn rolled_back() -> Vec<Change> {
     vec![
         Change::MarkBad(version("2.0")),
         Change::RollBackTo(version("1.0")),
@@ -402,7 +402,7 @@ fn a_plan_over_a_marked_desired_version_only_sets_the_desired_state() {
 
 // ---- last_good -------------------------------------------------------------------------
 
-fn converged(beats: &[(&str, Heartbeat)]) -> Fleet {
+pub(crate) fn converged(beats: &[(&str, Heartbeat)]) -> Fleet {
     let mut fleet = Fleet::new(Duration::ZERO);
     for (name, b) in beats {
         fleet.record(id(name), HostRole::DAEMON, b.clone(), secs(2_000));
@@ -410,11 +410,11 @@ fn converged(beats: &[(&str, Heartbeat)]) -> Fleet {
     fleet
 }
 
-fn all_at_one() -> Vec<(&'static str, Heartbeat)> {
+pub(crate) fn all_at_one() -> Vec<(&'static str, Heartbeat)> {
     HOSTS.iter().map(|h| (*h, beat("1.0"))).collect()
 }
 
-fn plan_one(def: &ServiceDef, marks: &ServiceOps, fleet: &Fleet) -> Vec<Change> {
+pub(crate) fn plan_one(def: &ServiceDef, marks: &ServiceOps, fleet: &Fleet) -> Vec<Change> {
     plan(def, &desired("1.0", 0, 0), marks, fleet, secs(2_000))
 }
 
@@ -542,13 +542,13 @@ fn setting_min_version_clears_last_good() {
 
 // ---- the coordinator -------------------------------------------------------------------
 
-fn services_of(extra: &str) -> Services {
+pub(crate) fn services_of(extra: &str) -> Services {
     Services::parse(&definition(extra)).expect("services")
 }
 
 /// A rig whose coordinator runs `extra`'s definition, with `body` desired, past the quiet
 /// start.
-async fn rig(test: &str, extra: &str, body: &str) -> Rig {
+pub(crate) async fn rig(test: &str, extra: &str, body: &str) -> Rig {
     let mut rig = Rig::new(test);
     rig.coordinator = Rig::start(&rig.dir, &rig.clock).with_services(services_of(extra));
     rig.set(body).await;
@@ -557,11 +557,11 @@ async fn rig(test: &str, extra: &str, body: &str) -> Rig {
 }
 
 /// The same files, a coordinator that starts now.
-fn restart(rig: &mut Rig, extra: &str) {
+pub(crate) fn restart(rig: &mut Rig, extra: &str) {
     rig.coordinator = Rig::start(&rig.dir, &rig.clock).with_services(services_of(extra));
 }
 
-fn who(host: &str) -> Identity {
+pub(crate) fn who(host: &str) -> Identity {
     Identity {
         node_id: id(host),
         role: HostRole::DAEMON,
@@ -570,7 +570,7 @@ fn who(host: &str) -> Identity {
 
 /// One heartbeat of every host at `at`, each as `overrides` say or healthy at 1.0, in node
 /// order; the answers are those of the last host.
-fn round(rig: &Rig, at: u64, overrides: &[(&str, Heartbeat)]) -> Vec<ServiceReply> {
+pub(crate) fn round(rig: &Rig, at: u64, overrides: &[(&str, Heartbeat)]) -> Vec<ServiceReply> {
     rig.at(at);
     HOSTS
         .iter()
@@ -584,7 +584,7 @@ fn round(rig: &Rig, at: u64, overrides: &[(&str, Heartbeat)]) -> Vec<ServiceRepl
         .collect()
 }
 
-fn two_failed() -> Vec<(&'static str, Heartbeat)> {
+pub(crate) fn two_failed() -> Vec<(&'static str, Heartbeat)> {
     let (phase, class) = release();
     vec![
         ("d1", failure(phase, class, "2.0")),
@@ -592,15 +592,15 @@ fn two_failed() -> Vec<(&'static str, Heartbeat)> {
     ]
 }
 
-fn status(rig: &Rig) -> crate::service::Status {
+pub(crate) fn status(rig: &Rig) -> crate::service::Status {
     rig.coordinator.status(Some(OPERATOR)).expect("status")
 }
 
-fn wanted(rig: &Rig) -> Version {
+pub(crate) fn wanted(rig: &Rig) -> Version {
     status(rig).services[KBF].version.clone()
 }
 
-fn marks(rig: &Rig) -> ServiceOps {
+pub(crate) fn marks(rig: &Rig) -> ServiceOps {
     status(rig)
         .ops
         .services
@@ -609,7 +609,7 @@ fn marks(rig: &Rig) -> ServiceOps {
         .unwrap_or_default()
 }
 
-fn persisted(rig: &Rig) -> ServiceOps {
+pub(crate) fn persisted(rig: &Rig) -> ServiceOps {
     ops_of(&rig.dir)
         .state()
         .services
@@ -619,7 +619,7 @@ fn persisted(rig: &Rig) -> ServiceOps {
 }
 
 /// The ops file as a crash would leave it: `edit` made to the marks of `kbf`.
-fn seed(rig: &Rig, edit: impl FnOnce(&mut ServiceOps)) {
+pub(crate) fn seed(rig: &Rig, edit: impl FnOnce(&mut ServiceOps)) {
     ops_of(&rig.dir)
         .change(
             Write::BeforeMemory,
@@ -880,7 +880,7 @@ async fn min_version_clears_last_good_on_the_coordinator() {
 }
 
 /// An ops store whose file cannot be written, holding `state`.
-fn unwritable(state: OpsState) -> OpsStore {
+pub(crate) fn unwritable(state: OpsState) -> OpsStore {
     OpsStore::with_writer(
         state,
         Box::new(|_| {
@@ -893,7 +893,7 @@ fn unwritable(state: OpsState) -> OpsStore {
 }
 
 /// A rig over `ops` instead of the files of its directory.
-async fn rig_over(test: &str, extra: &str, body: &str, ops: OpsStore) -> Rig {
+pub(crate) async fn rig_over(test: &str, extra: &str, body: &str, ops: OpsStore) -> Rig {
     let mut rig = Rig::new(test);
     rig.coordinator = Rig::start(&rig.dir, &rig.clock)
         .with_services(services_of(extra))

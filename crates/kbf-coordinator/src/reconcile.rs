@@ -80,6 +80,8 @@ pub enum Change {
     MarkBad(Version),
     /// Sets the desired version to `version`, the other desired fields as they are.
     RollBackTo(Version),
+    /// Drops the failure ack of the host with this node id.
+    DropAck(String),
 }
 
 /// Whether `host`'s last update was a failure of `version` that is the release's fault: it
@@ -228,6 +230,7 @@ fn apply(
             back.version = version;
             store.set(service, back)?;
         }
+        Change::DropAck(_) => {}
     }
     Ok(())
 }
