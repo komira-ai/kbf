@@ -110,7 +110,7 @@ pub(crate) fn action_bytes(do_not_cache: bool) -> Bytes {
 }
 
 /// The frontend with packs, a mint, the Action of the lease and the key issued for it.
-struct Farm {
+pub(crate) struct Farm {
     rig: Rig,
     backend: Backend,
     mint: PackKeyMint,
@@ -119,7 +119,7 @@ struct Farm {
 }
 
 impl Farm {
-    async fn new() -> Self {
+    pub(crate) async fn new() -> Self {
         Self::of(false).await
     }
 
@@ -169,7 +169,7 @@ impl Farm {
 
     /// The manifest of an honest task that exited with `exit_code`: the files are listed out of
     /// order, one is empty (no record), and there is a directory and a symlink.
-    fn manifest(&self, exit_code: i32) -> TaskManifest {
+    pub(crate) fn manifest(&self, exit_code: i32) -> TaskManifest {
         let file = |path: &str, digest: Digest, is_executable: bool| OutputFile {
             path: path.to_owned(),
             digest,
@@ -211,17 +211,19 @@ impl Farm {
 
     /// The pack of an honest task that exited with `exit_code`.
     fn pack(&self, exit_code: i32) -> Vec<u8> {
+        self.pack_of(&self.manifest(exit_code))
+    }
+
+    /// The pack of the honest task's blobs under `manifest`, which may differ from the honest
+    /// one in what the pack's records do not depend on (the timing, the usage).
+    pub(crate) fn pack_of(&self, manifest: &TaskManifest) -> Vec<u8> {
         let (object, stdout, in_dir) = (blob(OBJECT).1, blob(STDOUT).1, blob(IN_DIR).1);
         let tree = self.tree().1;
-        write_pack(
-            &self.manifest(exit_code),
-            &[&object, &stdout, &tree, &in_dir],
-        )
-        .expect("a pack")
+        write_pack(manifest, &[&object, &stdout, &tree, &in_dir]).expect("a pack")
     }
 
     /// The result the frontend must rebuild from the honest pack: sorted by path.
-    fn result(&self, exit_code: i32) -> ActionResult {
+    pub(crate) fn result(&self, exit_code: i32) -> ActionResult {
         let file = |path: &str, digest: &Digest, is_executable: bool| reapi::OutputFile {
             path: path.to_owned(),
             digest: Some(wire(digest)),
@@ -264,7 +266,7 @@ impl Farm {
     }
 
     /// Stores `bytes` under the issued key, as the task's presigned write would.
-    async fn put(&self, bytes: &[u8]) {
+    pub(crate) async fn put(&self, bytes: &[u8]) {
         self.rig.store.seed(self.key.key(), bytes).await;
     }
 
@@ -274,7 +276,7 @@ impl Farm {
         ingest(packs, &self.backend, mint, LEASE, key, &self.action, limits).await
     }
 
-    async fn ingest(&self) -> Ingested {
+    pub(crate) async fn ingest(&self) -> Ingested {
         self.ingest_with(&UntrustedLimits::default()).await
     }
 
@@ -286,7 +288,7 @@ impl Farm {
     }
 
     /// What the frontend's GetActionResult answers for the action.
-    async fn cached(&self) -> Result<ActionResult, tonic::Status> {
+    pub(crate) async fn cached(&self) -> Result<ActionResult, tonic::Status> {
         let request = GetActionResultRequest {
             action_digest: Some(wire(&self.action)),
             ..GetActionResultRequest::default()

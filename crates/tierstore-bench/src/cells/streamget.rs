@@ -312,6 +312,7 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::*;
+    use crate::cells::testkit::DeadStore;
     use crate::config::Secret;
     use crate::s3::BenchS3;
 
@@ -423,14 +424,17 @@ mod tests {
         assert!(missing.ttfb.is_none());
         assert!(!missing.is_ok());
 
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let dead = format!("http://{}", listener.local_addr().unwrap());
-        drop(listener);
-        let refused = StreamGet::new(Role::Cold, &spec(&dead), Timeouts::default(), log())
-            .unwrap()
-            .get("k/a", None)
-            .await
-            .unwrap();
+        let dead = DeadStore::start().await;
+        let refused = StreamGet::new(
+            Role::Cold,
+            &spec(dead.endpoint()),
+            Timeouts::default(),
+            log(),
+        )
+        .unwrap()
+        .get("k/a", None)
+        .await
+        .unwrap();
         assert_eq!((refused.error, refused.status), (Some("transport"), None));
     }
 

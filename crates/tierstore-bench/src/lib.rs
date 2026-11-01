@@ -21,6 +21,7 @@ pub mod coldstate;
 pub mod config;
 pub mod error;
 pub mod faultfile;
+pub mod fill;
 pub mod gate;
 pub mod livedir;
 pub mod preflight;
