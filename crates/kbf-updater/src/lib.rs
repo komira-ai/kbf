@@ -107,6 +107,8 @@ mod updater_tests;
 #[cfg(test)]
 mod version_line_tests;
 #[cfg(test)]
+mod wire_absent_tests;
+#[cfg(test)]
 mod wire_dropped_facts_tests;
 #[cfg(test)]
 mod wire_features_tests;

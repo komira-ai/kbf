@@ -179,6 +179,11 @@ pub struct RunFile {
     /// One entry per store role.
     #[serde(default)]
     pub stores: BTreeMap<Role, StoreFile>,
+    /// The roles whose stores are on the cold store's MinIO cluster (`["hot"]` when the hot store
+    /// is the same cluster at another address). Decides the question for the cold store guard
+    /// without asking either store for its deployment id; see [`crate::coldserver`].
+    #[serde(default)]
+    pub cold_cluster_roles: Option<Vec<Role>>,
 }
 
 /// Caps on the bytes the campaign may write to the cold store, in bytes.
@@ -251,10 +256,24 @@ pub struct ConfigArgs {
     /// what the last pass left dirty, or after a cap). Inside a pass it is recorded, not judged.
     #[arg(long, default_value_t = 60.0)]
     pub max_disk_util_pct: f64,
-    /// Cold store guard: the run stops when the p99 latency of the harness's own requests to the
-    /// cold store over the window is above this, milliseconds.
-    #[arg(long, default_value_t = 2000, value_parser = clap::value_parser!(u64).range(1..))]
+    /// Cold store guard, hung-store backstop only: the run stops when the p99 latency of the
+    /// harness's own requests to the cold store over the window is above this, milliseconds. The
+    /// bench's own latency is what a cell measures, so this is not a health limit: 30 s is a
+    /// store that has stopped answering. What the guard judges is the load from elsewhere
+    /// (`--cold-abort-foreign-requests`) and the drives.
+    #[arg(long, default_value_t = 30_000, value_parser = clap::value_parser!(u64).range(1..))]
     pub cold_abort_p99_ms: u64,
+    /// Cold store guard: the run stops when a pass saw more than this many requests at the cold
+    /// store that this tool did not send (the store's S3 request counter less the tool's own
+    /// count over the pass). A quiet store showed none in 30 s; a few strays (a probe, an
+    /// operator's listing) are allowed, a job or a person at work is not. Needs the cold admin key.
+    #[arg(long, default_value_t = 10)]
+    pub cold_abort_foreign_requests: u64,
+    /// How long to wait, with the tool silent, before each reading of the cold store's request
+    /// counter, seconds: MinIO serves that counter from a 10 s cache. 0 reads at once and may
+    /// count a pass's requests in its neighbour's window.
+    #[arg(long, default_value_t = 11)]
+    pub cold_counter_settle_secs: u64,
     /// Cold store guard: the run stops when the share of the harness's own requests to the cold
     /// store over the window that failed or timed out is above this (0 to 1).
     #[arg(long, default_value_t = 0.05, value_parser = parse_share)]
@@ -327,6 +346,10 @@ pub struct RunConfig {
     pub gate: LoadGate,
     /// The cold store guard's limits.
     pub cold_guard: ColdGuardLimits,
+    /// The run file's `cold_cluster_roles`, if it names them.
+    pub cold_cluster_roles: Option<Vec<Role>>,
+    /// The wait before each reading of the cold store's request counter.
+    pub cold_counter_settle: Duration,
     /// The longest one reading of the cold store's state may take.
     pub cold_state_timeout: Duration,
     /// See [`ConfigArgs::cold_state_max_age_secs`].
@@ -427,7 +450,10 @@ impl RunConfig {
                 window: Duration::from_secs(args.cold_abort_window_secs),
                 max_p99_ms: args.cold_abort_p99_ms,
                 max_error_share: args.cold_abort_error_share,
+                max_foreign_requests: args.cold_abort_foreign_requests,
             },
+            cold_counter_settle: Duration::from_secs(args.cold_counter_settle_secs),
+            cold_cluster_roles: file.cold_cluster_roles.clone(),
             cold_state_timeout: Duration::from_secs(args.cold_state_timeout_secs),
             cold_state_max_age: Duration::from_secs(args.cold_state_max_age_secs),
             rates: RateCaps {
@@ -559,6 +585,17 @@ mod tests {
         "cold": {"access_key_id": "t-cold-id", "secret_access_key": "cold-secret",
                  "region": "eu-test-1"}}}"#;
 
+    /// Catches the run file's list of roles on the cold cluster being lost, or defaulted to a
+    /// list: without the key there is none.
+    #[test]
+    fn the_run_file_may_name_the_roles_on_the_cold_cluster() {
+        let cfg = RunConfig::resolve(&args(&[]), None).unwrap();
+        assert_eq!(cfg.cold_cluster_roles, None);
+        let named = file(r#"{"cold_cluster_roles": ["hot"]}"#);
+        let cfg = RunConfig::resolve(&args(&[]), Some(named)).unwrap();
+        assert_eq!(cfg.cold_cluster_roles, Some(vec![Role::Hot]));
+    }
+
     /// Catches a default that drifted from the approved caps and gate (200 GiB campaign, 8 GiB
     /// pass, 20 GiB cell, 100 and 2000 requests per second).
     #[test]
@@ -581,6 +618,9 @@ mod tests {
         let cfg = RunConfig::resolve(&args(&[]), None).unwrap();
         assert_eq!(cfg.cold_guard, ColdGuardLimits::default());
         assert_eq!(cfg.cold_guard.window, Duration::from_secs(60));
+        assert_eq!(cfg.cold_guard.max_p99_ms, 30_000);
+        assert_eq!(cfg.cold_guard.max_foreign_requests, 10);
+        assert_eq!(cfg.cold_counter_settle, Duration::from_secs(11));
         let set = args(&[
             "--cold-abort-p99-ms",
             "750",
@@ -588,8 +628,14 @@ mod tests {
             "0.2",
             "--cold-abort-window-secs",
             "15",
+            "--cold-abort-foreign-requests",
+            "0",
+            "--cold-counter-settle-secs",
+            "0",
         ]);
         let cfg = RunConfig::resolve(&set, None).unwrap();
+        assert_eq!(cfg.cold_guard.max_foreign_requests, 0);
+        assert_eq!(cfg.cold_counter_settle, Duration::ZERO);
         assert_eq!(cfg.cold_guard.max_p99_ms, 750);
         assert!((cfg.cold_guard.max_error_share - 0.2).abs() < f64::EPSILON);
         assert_eq!(cfg.cold_guard.window, Duration::from_secs(15));
