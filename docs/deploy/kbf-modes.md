@@ -599,8 +599,15 @@ The cold store is the durable home of every blob: a `file://` directory on one h
   before the cache opens on them.
 - **A rotation reaches a node at its next start.** There is no hot swap; until then the
   frontend shows the node as `pending`.
-- **A fallback.** A node that has an `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` of its
-  own gives up on the frontend after four tries and starts on those. A node without them
+- **A node's own key pair is a file.** `--cold-store-credentials-file PATH` names a JSON file,
+  `{"access_key_id": "...", "secret_access_key": "..."}`, that the server's user owns with mode
+  0600 or 0400; a symbolic link or any other file is refused, at start, with exit 2, naming the
+  flag and the path and never the content. The same flag and file format serve `storage`,
+  `all-in-one` and `kbf-server` with an `s3://` `--cold-store`; a `file://` cold store refuses
+  it. `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` still work for one more release when no
+  file is named, and the start logs one warning that says they are deprecated (never a value).
+- **A fallback.** A node that has a key pair of its own (the file, or `AWS_ACCESS_KEY_ID` and
+  `AWS_SECRET_ACCESS_KEY`) gives up on the frontend after four tries and starts on those. A node without them
   waits for the frontend, as it waits for the registration.
 - **Who never holds a key.** A daemon holds no store and no credential. A frontend serves no
   blob itself. In `all-in-one` the cold store is a directory in the units, so there is no key.
