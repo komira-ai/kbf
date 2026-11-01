@@ -90,6 +90,16 @@ pub enum FillError {
         "result table name {0:?}: lower-case letters, digits, `.`, `-` and `_`, ending in .tsv"
     )]
     TsvName(String),
+    /// The table is not in the directory the paper's results live in.
+    #[error(
+        "the result table {table:?} is not in the results directory {dir:?}: the paper's data-result names a file there"
+    )]
+    TsvElsewhere {
+        /// The table.
+        table: PathBuf,
+        /// The directory.
+        dir: PathBuf,
+    },
     /// A cell names a result table this run did not write.
     #[error(
         "cell {cell:?} names the result table {found:?}, which this run did not write (it writes {ours:?}); a hand-filled cell is not rewritten"
@@ -123,6 +133,10 @@ pub struct FillArgs {
     /// created or updated, and named in each filled cell's `data-result`.
     #[arg(long, value_name = "FILE")]
     pub result_tsv: Option<PathBuf>,
+    /// The directory the paper's results live in: the paper's `data-result` is a name in it, so
+    /// the table must be in it.
+    #[arg(long, value_name = "DIR")]
+    pub results_dir: Option<PathBuf>,
     /// Write over the paper instead of to `--out`.
     #[arg(long)]
     pub in_place: bool,
@@ -2134,11 +2148,11 @@ derived\tfill:a:p50\t9.99\tms\tstale\ta\nraw\tlast.row\t8\tms\tby hand\n";
         assert!(out.ends_with(">2.00 ms</i>"), "{out}");
         let (out, report) = super::fill(hand, &[], &results(), &mut tsv()).unwrap();
         assert_eq!((out.as_str(), report.unmapped), (hand, 1));
-        // A mapped hand-filled cell with no figure is left as it is, not refused.
+        // A mapped hand-filled cell is refused also when the results have no figure for it:
+        // it is not given a note either.
         let none = one("a", "p50", "ms", "no-such-arm");
-        let (out, report) = super::fill(hand, &none, &results(), &mut tsv()).unwrap();
-        assert_eq!(report.noted, 1);
-        assert!(out.contains("data-result=\"hand.tsv\""), "{out}");
+        let err = super::fill(hand, &none, &results(), &mut tsv()).unwrap_err();
+        assert!(matches!(err, FillError::Foreign { .. }), "{err}");
     }
 
     /// Catches a check that does not look in the table: a cell that cites this table but has no
@@ -2174,5 +2188,94 @@ derived\tfill:a:p50\t9.99\tms\tstale\ta\nraw\tlast.row\t8\tms\tby hand\n";
             out.starts_with("<b class='how  now' data-cell=\"a\" "),
             "{out}"
         );
+    }
+
+    /// Catches rows of earlier runs that no cell uses any more staying in the table: a cell
+    /// whose p99 fell back to p95 keeps no p99 row, a cell that is gone keeps no row, and
+    /// comments and rows of other ids stay.
+    #[test]
+    fn rows_no_cell_uses_any_more_are_removed() {
+        let old = "# kept\nraw\thand.row\t7\tms\tby hand\ta\n\
+derived\tfill:a:p99\t80.0\tms\tstale\ta\nderived\tfill:gone:p50\t1.00\tms\tstale\tgone\n";
+        let mut t = ResultTsv::parse("r.tsv", old).unwrap();
+        let few = Results::from_results([result(CellId::ColdPut, "direct", 100, Some(5_000))]);
+        let (_, report) = super::fill(
+            "<i data-cell=\"a\">?</i>",
+            &one("a", "p99|p95", "ms", "direct"),
+            &few,
+            &mut t,
+        )
+        .unwrap();
+        assert_eq!(report.filled, 1);
+        let text = t.render();
+        assert!(text.contains("# kept\n"), "{text}");
+        assert!(text.contains("raw\thand.row\t7"), "{text}");
+        assert!(text.contains("\tfill:a:p95\t20.0\t"), "{text}");
+        assert!(!text.contains("fill:a:p99"), "{text}");
+        assert!(!text.contains("fill:gone"), "{text}");
+        // A run that fills nothing leaves no row of its own.
+        let (_, report) = super::fill("<p>none</p>", &[], &results(), &mut t).unwrap();
+        assert_eq!(report.filled, 0);
+        assert!(!t.render().contains("fill:"), "{}", t.render());
+        assert!(t.render().contains("raw\thand.row"));
+    }
+
+    /// Catches a check that lets a fill row stay when no cell cites it: a row of a metric the
+    /// cell no longer uses, or of a cell that is gone, would let a wrong printed number that
+    /// equals the stale value pass the trace.
+    #[test]
+    fn check_lists_rows_no_cell_cites() {
+        let html = "<i data-cell=\"a\" data-source=\"cold-put-instance-a1.json#p95\" data-result=\"r.tsv\">20.0 ms</i>\
+<i data-cell=\"o\" data-source=\"x.json#p95\" data-result=\"other.tsv\">1</i>";
+        let table = "derived\tfill:a:p95\t20.0\tms\th\ta\nderived\tfill:a:p99\t80.0\tms\th\ta\n\
+derived\tfill:gone:p50\t1.00\tms\th\tgone\nderived\tfill:o:p95\t1\tms\th\to\nraw\tby.hand\t1\tms\th\ta\n";
+        let t = ResultTsv::parse("r.tsv", table).unwrap();
+        let m = one("a", "p95", "ms", "instance");
+        let findings = super::check(html, &m, &results(), Some(&t)).unwrap();
+        let text = findings.join("\n");
+        assert!(
+            text.contains("row \"fill:a:p99\" is cited by no cell"),
+            "{text}"
+        );
+        assert!(
+            text.contains("row \"fill:gone:p50\" is cited by no cell"),
+            "{text}"
+        );
+        assert!(
+            text.contains("row \"fill:o:p95\" is cited by no cell"),
+            "{text}"
+        );
+        assert!(!text.contains("fill:a:p95"), "{text}");
+        assert!(!text.contains("by.hand"), "{text}");
+        assert_eq!(findings.len(), 3, "{text}");
+    }
+
+    /// Catches a mapping id that would break the table: a tab or a line break splits a row, a
+    /// comma splits the cells column.
+    #[test]
+    fn a_mapping_id_cannot_break_a_row() {
+        for bad in ["a,b", "a\\tb", "a\\nb", "a\\rb"] {
+            let json = format!(
+                r#"[{{"id":"{bad}","cell":"cold-put","metric":"p50","unit":"ms","condition":"x"}}]"#
+            );
+            let err = Mapping::parse_all(&json).unwrap_err().to_string();
+            assert!(err.contains("tab, line break or comma"), "{bad}: {err}");
+        }
+    }
+
+    /// Catches attribute values read with their entities resolved: the paper's check reads them
+    /// as written, so a cell id with `&amp;` is the cell `a&amp;b`, in the mapping and in the
+    /// table.
+    #[test]
+    fn attribute_values_are_read_as_written() {
+        let html = "<i data-cell=\"a&amp;b\">?</i>";
+        let m = one("a&amp;b", "p50", "ms", "instance");
+        let mut t = tsv();
+        let (out, report) = super::fill(html, &m, &results(), &mut t).unwrap();
+        assert_eq!(report.filled, 1, "{out}");
+        assert!(t.render().contains("\ta&amp;b\n"), "{}", t.render());
+        let foreign = "<i data-cell=\"a&amp;b\" data-result=\"x&amp;y.tsv\">?</i>";
+        let err = super::fill(foreign, &m, &results(), &mut tsv()).unwrap_err();
+        assert!(err.to_string().contains("x&amp;y.tsv"), "{err}");
     }
 }

@@ -30,7 +30,12 @@ fn setup(name: &str) -> TestDir {
 /// `fill-paper` with the result table beside the paper.
 fn fill_paper(dir: &Path, extra: &[&str]) -> Output {
     let tsv = dir.join("paper-results.tsv");
-    let mut args = vec!["--result-tsv", tsv.to_str().unwrap()];
+    let mut args = vec![
+        "--result-tsv",
+        tsv.to_str().unwrap(),
+        "--results-dir",
+        dir.to_str().unwrap(),
+    ];
     args.extend_from_slice(extra);
     fill_paper_raw(dir, &args)
 }
@@ -90,13 +95,20 @@ fn fill_writes_out_and_leaves_the_paper_alone() {
 #[test]
 fn a_fill_needs_a_result_table_with_a_plain_name() {
     let dir = setup("fill-paper-tsv-flag");
-    let run = fill_paper_raw(dir.path(), &["--in-place"]);
+    let d = dir.path().to_str().unwrap();
+    let run = fill_paper_raw(dir.path(), &["--in-place", "--results-dir", d]);
     assert_eq!(run.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&run.stderr).contains("--result-tsv"));
     let bad = dir.path().join("Bad Name.tsv");
     let run = fill_paper_raw(
         dir.path(),
-        &["--in-place", "--result-tsv", bad.to_str().unwrap()],
+        &[
+            "--in-place",
+            "--results-dir",
+            d,
+            "--result-tsv",
+            bad.to_str().unwrap(),
+        ],
     );
     assert_eq!(run.status.code(), Some(2));
     assert!(!bad.exists());
@@ -105,7 +117,13 @@ fn a_fill_needs_a_result_table_with_a_plain_name() {
     std::fs::create_dir(&as_dir).unwrap();
     let run = fill_paper_raw(
         dir.path(),
-        &["--in-place", "--result-tsv", as_dir.to_str().unwrap()],
+        &[
+            "--in-place",
+            "--results-dir",
+            d,
+            "--result-tsv",
+            as_dir.to_str().unwrap(),
+        ],
     );
     assert_eq!(run.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&run.stderr).contains("dir.tsv"));
@@ -279,4 +297,83 @@ fn files_that_cannot_be_read_or_written_stop_the_verb() {
     let run = fill_paper(dir.path(), &["--check"]);
     assert_eq!(run.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&run.stderr).contains("paper.html"));
+}
+
+/// Catches a table written before the paper: a paper that cannot be written (here an `--out` into a
+/// directory that is not there) must leave the table as it was, and a good run leaves no
+/// temporary file beside its outputs.
+#[test]
+fn a_failed_paper_write_leaves_the_table_alone() {
+    let dir = setup("fill-paper-atomic");
+    let table = dir.path().join("paper-results.tsv");
+    std::fs::write(&table, "# old\nraw\tkept\t1\tms\tby hand\n").unwrap();
+    let nowhere = dir.path().join("no-such-dir/out.html");
+    let run = fill_paper(dir.path(), &["--out", nowhere.to_str().unwrap()]);
+    assert_eq!(run.status.code(), Some(2));
+    assert_eq!(
+        std::fs::read_to_string(&table).unwrap(),
+        "# old\nraw\tkept\t1\tms\tby hand\n"
+    );
+    let out = dir.path().join("filled.html");
+    assert!(
+        fill_paper(dir.path(), &["--out", out.to_str().unwrap()])
+            .status
+            .success()
+    );
+    let mut names: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        [
+            "cells.json",
+            "filled.html",
+            "paper-results.tsv",
+            "paper.html",
+            "results"
+        ]
+    );
+}
+
+/// Catches `data-result` read as a basename only: a paper citing a hand-filled `x.tsv` in its
+/// own results directory must not be rewritten by a run whose table `x.tsv` is somewhere else.
+/// The run exits 2 naming the directory, and writes neither the paper nor the table.
+#[test]
+fn a_table_outside_the_results_directory_is_refused() {
+    let dir = setup("fill-paper-dir");
+    let hand = PAPER.replace(
+        "data-cell=\"put\"",
+        "data-cell=\"put\" data-result=\"x.tsv\"",
+    );
+    std::fs::write(dir.path().join("paper.html"), &hand).unwrap();
+    std::fs::create_dir(dir.path().join("elsewhere")).unwrap();
+    std::fs::create_dir(dir.path().join("paper-results")).unwrap();
+    let elsewhere = dir.path().join("elsewhere/x.tsv");
+    let run = fill_paper_raw(
+        dir.path(),
+        &[
+            "--in-place",
+            "--result-tsv",
+            elsewhere.to_str().unwrap(),
+            "--results-dir",
+            dir.path().join("paper-results").to_str().unwrap(),
+        ],
+    );
+    assert_eq!(run.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(stderr.contains("results directory"), "{stderr}");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("paper.html")).unwrap(),
+        hand
+    );
+    assert!(!elsewhere.exists());
+    // The directory is required, not guessed.
+    let run = fill_paper_raw(
+        dir.path(),
+        &["--in-place", "--result-tsv", elsewhere.to_str().unwrap()],
+    );
+    assert_eq!(run.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&run.stderr).contains("--results-dir"));
 }
