@@ -10,7 +10,7 @@
 //!
 //! The counts and sizes are the plan's; an operator narrows them with `--object-bytes` and
 //! `--in-flight`, leaves out the open-loop arms with `--open-loop off`, and sets the count of a
-//! multipart path's closed-loop arms with `--multipart-objects`. The ledger refuses
+//! multipart path's closed-loop arms with `--multipart-objects` (at most that many). The ledger refuses
 //! what does not fit the caps, and is asked about the arms built, so a plan without the open-loop
 //! arms costs without them.
 
@@ -202,12 +202,13 @@ pub fn arms(
                     .in_flight
                     .map_or_else(|| plan.in_flight.clone(), |n| vec![n]);
                 for &in_flight in flights.iter().filter(|&&n| width_ok(n, size)) {
-                    // `--multipart-objects` replaces the plan's count of a multipart path; the
-                    // fault modes' own counts are small already and stay.
+                    // `--multipart-objects` caps the plan's count of a multipart path, it never
+                    // raises it; the fault modes' own counts are small already and stay.
                     let planned = |size, in_flight| {
+                        let count = requests_for(size, in_flight);
                         plan.multipart_objects
                             .filter(|_| path.multipart)
-                            .unwrap_or_else(|| requests_for(size, in_flight))
+                            .map_or(count, |n| n.min(count))
                     };
                     let requests = mode
                         .requests(size, in_flight, planned)

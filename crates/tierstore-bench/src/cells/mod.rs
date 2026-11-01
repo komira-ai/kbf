@@ -155,8 +155,8 @@ pub struct CellPlan {
     /// Whether the put cells add their open-loop arms (`run --open-loop`). The other cells have
     /// none and ignore it.
     pub open_loop: bool,
-    /// Objects per pass of the multipart arms of `cold-put` (`run --multipart-objects`), in place
-    /// of the plan's count; `None` keeps the plan's. The other arms and cells ignore it.
+    /// At most this many objects per pass of the multipart arms of `cold-put` (`run
+    /// --multipart-objects`), a cap on the plan's count; `None` keeps the plan's. The other arms and cells ignore it.
     pub multipart_objects: Option<u64>,
 }
 

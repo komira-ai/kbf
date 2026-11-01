@@ -104,8 +104,8 @@ pub struct RunArgs {
     /// and the report and the provenance of every result say so.
     #[arg(long, value_enum, default_value_t = Switch::On, value_name = "on|off")]
     pub open_loop: Switch,
-    /// Objects per pass for the multipart arms of `cold-put` (`direct-mp`, `instance`), in place
-    /// of the plan's count (1,000 up to 1 MiB). Each multipart object is three requests to the
+    /// At most this many objects per pass for the multipart arms of `cold-put` (`direct-mp`,
+    /// `instance`): a cap on the plan's count (1,000 up to 1 MiB), never a raise. Each multipart object is three requests to the
     /// store, so a slow cold store may not fit the plan's count in a window. The other arms
     /// (`direct`, the open-loop arms, the other cells) keep theirs. An arm with fewer than 1,000
     /// objects per pass reports no p99, and its result says so.

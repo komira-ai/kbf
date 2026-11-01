@@ -23,8 +23,9 @@
 //!
 //! Objects per pass: 1,000 up to 1 MiB (see [`putcell::requests_for`]). A multipart object is three
 //! requests to the store (create, part, complete), so on a slow cold store the plan's count of the
-//! two multipart arms may not fit a window; `--multipart-objects N` sets their count per pass
-//! (`direct-mp` and `instance`, in the closed-loop arms of every size and width) and leaves the
+//! two multipart arms may not fit a window; `--multipart-objects N` caps their count per pass at
+//! N (`direct-mp` and `instance`, in the closed-loop arms of every size and width; an arm whose
+//! plan is smaller keeps it) and leaves the
 //! `direct` arm, the open-loop arms and the fault arms' own counts as they are. Without the flag
 //! nothing changes. The ledger is asked for, and charged, the bytes of the objects the arm puts. A
 //! p99 needs 1,000 requests, so an arm with fewer reports none (`p99_us` is null in each of its
