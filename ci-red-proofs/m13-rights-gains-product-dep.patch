@@ -1,0 +1,12 @@
+diff --git a/crates/update-rights/Cargo.toml b/crates/update-rights/Cargo.toml
+index ed9182685..3ff547c13 100644
+--- a/crates/update-rights/Cargo.toml
++++ b/crates/update-rights/Cargo.toml
+@@ -26,6 +26,7 @@ sha2.workspace = true
+ hex.workspace = true
+ thiserror.workspace = true
+ toml.workspace = true
++kbf-caps = { path = "../kbf-caps" }
+ 
+ # The program the root tests run as a hook, with the operations that probe the rights it was
+ # given. A program of the tests, not shipped.

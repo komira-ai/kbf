@@ -1,0 +1,15 @@
+diff --git a/crates/kbf-updater/src/root/mod.rs b/crates/kbf-updater/src/root/mod.rs
+index f9b542c7a..74b6bf0a8 100644
+--- a/crates/kbf-updater/src/root/mod.rs
++++ b/crates/kbf-updater/src/root/mod.rs
+@@ -302,6 +302,10 @@ impl RootPart {
+         };
+         let fresh = load_dir(&self.config.declarations, &policy)
+             .map_err(|e| format!("{}: {e}", self.config.declarations.display()))?;
++        let mut fresh = fresh;
++        if !fresh.refused.is_empty() {
++            fresh.services.clear();
++        }
+         *self.loaded.write().unwrap_or_else(PoisonError::into_inner) = fresh;
+         Ok(())
+     }

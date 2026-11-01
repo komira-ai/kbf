@@ -1,0 +1,8 @@
+diff --git a/packaging/host-agent/linux/install-declaration.txt b/packaging/host-agent/linux/install-declaration.txt
+index 2ae98bc1c..06cee97a8 100644
+--- a/packaging/host-agent/linux/install-declaration.txt
++++ b/packaging/host-agent/linux/install-declaration.txt
+@@ -1,2 +1,2 @@
+ install -d -o root -g root -m 0755 /etc/updater.d
+-install -o root -g root -m 0644 updater.d/kbf.toml /etc/updater.d/kbf.toml
++install -o root -g root -m 0664 updater.d/kbf.toml /etc/updater.d/kbf.toml

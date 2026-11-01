@@ -1,0 +1,13 @@
+diff --git a/crates/kbf-updater/src/root/mod.rs b/crates/kbf-updater/src/root/mod.rs
+index f9b542c7a..98db7294a 100644
+--- a/crates/kbf-updater/src/root/mod.rs
++++ b/crates/kbf-updater/src/root/mod.rs
+@@ -562,7 +562,7 @@ impl RootPart {
+             };
+             let name = entry.file_name().to_string_lossy().into_owned();
+             let is_dir = entry.file_type().is_ok_and(|kind| kind.is_dir());
+-            if !is_dir || !update_rights::names::is_service_name(&name) {
++            if !is_dir || !update_rights::names::is_service_name(&name) || !self.services().contains(&name) {
+                 continue;
+             }
+             if let Err(e) = boot::read_as_killed(&RecordStore::new(&entry.path())) {

@@ -1,0 +1,13 @@
+diff --git a/crates/update-rights/src/launch.rs b/crates/update-rights/src/launch.rs
+index 92bf2456d..e3dfbc529 100644
+--- a/crates/update-rights/src/launch.rs
++++ b/crates/update-rights/src/launch.rs
+@@ -170,7 +170,7 @@ pub fn properties(declaration: &Declaration, step: Step) -> Vec<String> {
+     let hook = &declaration.hook;
+     properties_with(
+         declaration,
+-        hook.capabilities_for(step),
++        &hook.capabilities,
+         hook.timeout_secs.get(step),
+     )
+ }

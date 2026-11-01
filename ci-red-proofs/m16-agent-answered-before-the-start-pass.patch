@@ -1,0 +1,30 @@
+diff --git a/crates/kbf-updater/src/root/mod.rs b/crates/kbf-updater/src/root/mod.rs
+index f9b542c7a..abb6a9c04 100644
+--- a/crates/kbf-updater/src/root/mod.rs
++++ b/crates/kbf-updater/src/root/mod.rs
+@@ -752,6 +752,12 @@ fn serve(
+         })?;
+         root.serve_registrations(&register.socket, gid)?;
+     }
++    let listener = socket::bind(&flags.socket, agent.uid, agent.gid).map_err(text)?;
++    let stop = Stop {
++        flag: Arc::new(AtomicBool::new(false)),
++        socket: flags.socket.clone(),
++    };
++    ready(stop.clone());
+     // After a boot every record is read first, the services refused at the load included: a
+     // record the boot cut off is read as killed before any update is resumed. The boot id is
+     // written only once every record was read, so a start that could not read one reads it after
+@@ -777,12 +783,6 @@ fn serve(
+     if unread.is_empty() {
+         boot::commit_boot(&state, &*clock).map_err(text)?;
+     }
+-    let listener = socket::bind(&flags.socket, agent.uid, agent.gid).map_err(text)?;
+-    let stop = Stop {
+-        flag: Arc::new(AtomicBool::new(false)),
+-        socket: flags.socket.clone(),
+-    };
+-    ready(stop.clone());
+     for stream in listener.incoming() {
+         if stop.flag.load(Ordering::Acquire) {
+             break;

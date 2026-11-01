@@ -1,0 +1,14 @@
+diff --git a/crates/kbf-updater/src/root/launch.rs b/crates/kbf-updater/src/root/launch.rs
+index cd041550a..5d92b5e54 100644
+--- a/crates/kbf-updater/src/root/launch.rs
++++ b/crates/kbf-updater/src/root/launch.rs
+@@ -118,6 +118,9 @@ impl StepLauncher for HookLauncher {
+             &release,
+             call.invocation.params.as_deref(),
+         );
++        if step == Step::Verify {
++            return Ok(StepExit { code: Some(0), last_line: None });
++        }
+         let command = command(&launch).map_err(failed)?;
+         let finished = self.systemd_run.run(&command)?;
+         if finished.code == Some(EXIT_EXEC) {

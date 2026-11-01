@@ -1,0 +1,15 @@
+diff --git a/packaging/host-agent/linux/updater.d/kbf.toml b/packaging/host-agent/linux/updater.d/kbf.toml
+index 0217d432a..2cc43ede4 100644
+--- a/packaging/host-agent/linux/updater.d/kbf.toml
++++ b/packaging/host-agent/linux/updater.d/kbf.toml
+@@ -18,9 +18,9 @@ uid    = "kbf"
+ # verify (the health wait, --health-timeout-secs 300, and a margin) and rollback together.
+ verify_deadline_secs = 960
+ cleanup_retries      = 3
+-state_dir            = "/var/lib/updater/hooks/kbf"
+ 
+ [hook]
++state_dir = "/var/lib/updater/hooks/kbf"
+ # Root, as the helper is today (kbf-host-local.service, 4.3): approved once per host (3.3).
+ user  = "root"
+ group = "root"

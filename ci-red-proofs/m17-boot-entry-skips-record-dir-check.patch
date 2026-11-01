@@ -1,0 +1,19 @@
+diff --git a/crates/kbf-updater/src/root/mod.rs b/crates/kbf-updater/src/root/mod.rs
+index f9b542c7a..6e7e33d68 100644
+--- a/crates/kbf-updater/src/root/mod.rs
++++ b/crates/kbf-updater/src/root/mod.rs
+@@ -642,14 +642,6 @@ impl RootPart {
+             .check(Path::new(binary))
+             .map_err(|e| ("artifact", e.to_string()))?;
+         make_record_dir(&declared).map_err(|e| ("internal", text(e)))?;
+-        // As before every step (`launch::HookLauncher`): the record directory is checked again,
+-        // on what it is now; one the service's account can write runs nothing.
+-        check_state_dir(
+-            &declared.declaration().state_dir,
+-            declared.service().uid,
+-            declared.service_gids(),
+-        )
+-        .map_err(|e| ("boot", e.to_string()))?;
+         self.launcher
+             .stop(&boot_unit_name(service, generation))
+             .map_err(|e| ("boot", e.to_string()))?;

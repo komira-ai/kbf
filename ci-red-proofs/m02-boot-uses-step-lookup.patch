@@ -1,0 +1,13 @@
+diff --git a/crates/update-rights/src/launch.rs b/crates/update-rights/src/launch.rs
+index 92bf2456d..bc9f7b408 100644
+--- a/crates/update-rights/src/launch.rs
++++ b/crates/update-rights/src/launch.rs
+@@ -179,7 +179,7 @@ pub fn properties(declaration: &Declaration, step: Step) -> Vec<String> {
+ /// `capabilities` (never a step's) and the `rollback` bound.
+ pub fn boot_properties(declaration: &Declaration) -> Vec<String> {
+     let hook = &declaration.hook;
+-    properties_with(declaration, &hook.capabilities, hook.timeout_secs.rollback)
++    properties_with(declaration, hook.capabilities_for(Step::Rollback), hook.timeout_secs.rollback)
+ }
+ 
+ /// The properties of one run that holds `capabilities` and is bounded by `timeout_secs`.

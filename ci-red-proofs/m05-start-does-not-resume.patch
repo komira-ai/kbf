@@ -1,0 +1,12 @@
+diff --git a/crates/kbf-updater/src/root/mod.rs b/crates/kbf-updater/src/root/mod.rs
+index f9b542c7a..eabfa3804 100644
+--- a/crates/kbf-updater/src/root/mod.rs
++++ b/crates/kbf-updater/src/root/mod.rs
+@@ -604,6 +604,7 @@ impl RootPart {
+             let finished = match rec.state.clone() {
+                 State::Finished { verdict, reason } => Finished { verdict, reason },
+                 _ => {
++                    if true { return Err(("record", "unfinished".to_owned())); }
+                     make_record_dir(&declared).map_err(|e| ("internal", text(e)))?;
+                     let finished = unit
+                         .runner

@@ -1,0 +1,12 @@
+diff --git a/crates/kbf-step-runner/Cargo.toml b/crates/kbf-step-runner/Cargo.toml
+index 0ff96fd73..30ed898fc 100644
+--- a/crates/kbf-step-runner/Cargo.toml
++++ b/crates/kbf-step-runner/Cargo.toml
+@@ -20,6 +20,7 @@ update-hook = { path = "../update-hook" }
+ rustix = { workspace = true, features = ["fs", "net", "process", "time"] }
+ serde.workspace = true
+ serde_json.workspace = true
++kbf-caps = { path = "../kbf-caps" }
+ sha2.workspace = true
+ thiserror.workspace = true
+ 

@@ -1,0 +1,13 @@
+diff --git a/crates/kbf-updater/src/root/mod.rs b/crates/kbf-updater/src/root/mod.rs
+index f9b542c7a..7a29b4ddc 100644
+--- a/crates/kbf-updater/src/root/mod.rs
++++ b/crates/kbf-updater/src/root/mod.rs
+@@ -756,7 +756,7 @@ fn serve(
+     // record the boot cut off is read as killed before any update is resumed. The boot id is
+     // written only once every record was read, so a start that could not read one reads it after
+     // a boot again; a service whose record was not read is not started in this pass.
+-    let unread = if boot::boot_changed(&state, &*clock) {
++    let unread = if false && boot::boot_changed(&state, &*clock) {
+         root.read_after_boot()
+     } else {
+         Vec::new()

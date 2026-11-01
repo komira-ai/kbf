@@ -1,0 +1,13 @@
+diff --git a/crates/kbf-updater/src/root/mod.rs b/crates/kbf-updater/src/root/mod.rs
+index f9b542c7a..dd68e118e 100644
+--- a/crates/kbf-updater/src/root/mod.rs
++++ b/crates/kbf-updater/src/root/mod.rs
+@@ -436,7 +436,7 @@ impl RootPart {
+         }
+         let before = record_generation(&unit.dir);
+         let ran = self.run_order(service, version, &releases, release, &unit);
+-        if ran.is_err() & installed && record_generation(&unit.dir) == before {
++        if ran.is_err() & installed {
+             // The runner began nothing under the declaration this order installed (it fails a rule
+             // of the load, or the runner refused the order): the one that was active goes back.
+             // Once the runner has begun the update's record, the declaration stays: the start pass

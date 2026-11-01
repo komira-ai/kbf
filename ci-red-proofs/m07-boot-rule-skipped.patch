@@ -1,0 +1,13 @@
+diff --git a/crates/kbf-updater/src/root/mod.rs b/crates/kbf-updater/src/root/mod.rs
+index f9b542c7a..1fe9ba207 100644
+--- a/crates/kbf-updater/src/root/mod.rs
++++ b/crates/kbf-updater/src/root/mod.rs
+@@ -588,7 +588,7 @@ impl RootPart {
+         let _busy = unit.busy.lock().unwrap_or_else(PoisonError::into_inner);
+         let store = RecordStore::new(&unit.dir);
+         let record = |e: kbf_step_runner::RecordError| ("record", e.to_string());
+-        if first_since_boot {
++        if first_since_boot && false {
+             boot::read_as_killed(&store).map_err(record)?;
+         }
+         let rec = match store.load().map_err(record)? {

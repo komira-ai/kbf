@@ -1,0 +1,13 @@
+diff --git a/crates/kbf-updater/src/root/mod.rs b/crates/kbf-updater/src/root/mod.rs
+index f9b542c7a..e2fdf6579 100644
+--- a/crates/kbf-updater/src/root/mod.rs
++++ b/crates/kbf-updater/src/root/mod.rs
+@@ -348,7 +348,7 @@ impl RootPart {
+             });
+         let launcher: Arc<dyn StepLauncher> = self.launcher.clone();
+         let runner = StepRunner::new(Arc::clone(&launcher), Arc::clone(&self.parts.clock), store);
+-        if let Some(poll_secs) = self.parts.deadman_poll_secs {
++        if let Some(poll_secs) = self.parts.deadman_poll_secs.filter(|_| false) {
+             let deadman = DeadMan::new(
+                 runner.watch(),
+                 Arc::clone(&launcher),

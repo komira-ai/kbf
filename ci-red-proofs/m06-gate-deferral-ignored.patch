@@ -1,0 +1,15 @@
+diff --git a/crates/kbf-updater/src/root/declare.rs b/crates/kbf-updater/src/root/declare.rs
+index ebdcda735..f8c26b4b6 100644
+--- a/crates/kbf-updater/src/root/declare.rs
++++ b/crates/kbf-updater/src/root/declare.rs
+@@ -97,9 +97,7 @@ pub fn decide(
+         &digest,
+         &approvals,
+     );
+-    if let Gate::Deferred(deferral) = verdict {
+-        return Ok(Decision::Deferred(deferral));
+-    }
++    let _ = verdict;
+     let kept = match active {
+         Some(declared) => (
+             PREVIOUS,
