@@ -426,3 +426,20 @@ fn an_unknown_action_is_text_with_its_code_and_reads_back() {
         assert!(serde_json::from_str::<AuditAction>(bad).is_err(), "{bad}");
     }
 }
+
+/// Pins what exists: every known action keeps its snake_case name on the wire and reads
+/// back (this arrived green; the answer shape of known actions does not change).
+#[test]
+fn every_known_action_keeps_its_wire_name() {
+    for (action, name) in [
+        (AuditAction::PutConnection, "put_connection"),
+        (AuditAction::DeleteConnection, "delete_connection"),
+        (AuditAction::PutBinding, "put_binding"),
+        (AuditAction::DeleteBinding, "delete_binding"),
+        (AuditAction::Repoint, "repoint"),
+    ] {
+        let text = format!("\"{name}\"");
+        assert_eq!(serde_json::to_string(&action).unwrap(), text);
+        assert_eq!(serde_json::from_str::<AuditAction>(&text).unwrap(), action);
+    }
+}

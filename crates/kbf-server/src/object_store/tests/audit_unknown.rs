@@ -58,3 +58,15 @@ fn a_row_with_an_unknown_action_lists_and_the_others_still_do() {
         ]
     );
 }
+
+// Pins the codes of the row codec (arrived green): an unknown action keeps its code through
+// the codec, a code too large for the row field saturates, and a negative code is no action.
+#[test]
+fn the_row_codec_keeps_an_unknown_code_and_refuses_a_negative_one() {
+    use crate::object_store::rows::{action_code, action_of};
+    assert_eq!(action_code(AuditAction::Unknown(9)), 9);
+    assert_eq!(action_code(AuditAction::Unknown(u32::MAX)), i32::MAX);
+    assert_eq!(action_of(9).unwrap(), AuditAction::Unknown(9));
+    assert_eq!(action_of(5).unwrap(), AuditAction::Repoint);
+    assert!(action_of(-1).is_err());
+}

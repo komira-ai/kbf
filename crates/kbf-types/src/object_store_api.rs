@@ -306,9 +306,9 @@ pub struct BindingInfo {
     pub updated_generation: u64,
 }
 
-/// What a mutation did, as the audit log names it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// What a mutation did, as the audit log names it. On the wire a known action is its
+/// snake_case name; an unknown one is `unknown (N)` with its numeric code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AuditAction {
     /// `PUT /connections/{name}`.
     PutConnection,
@@ -322,6 +322,44 @@ pub enum AuditAction {
     Repoint,
     /// An action code this build does not know, written by a newer one.
     Unknown(u32),
+}
+
+impl fmt::Display for AuditAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::PutConnection => "put_connection",
+            Self::DeleteConnection => "delete_connection",
+            Self::PutBinding => "put_binding",
+            Self::DeleteBinding => "delete_binding",
+            Self::Repoint => "repoint",
+            Self::Unknown(code) => return write!(f, "unknown ({code})"),
+        })
+    }
+}
+
+impl Serialize for AuditAction {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for AuditAction {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        Ok(match text.as_str() {
+            "put_connection" => Self::PutConnection,
+            "delete_connection" => Self::DeleteConnection,
+            "put_binding" => Self::PutBinding,
+            "delete_binding" => Self::DeleteBinding,
+            "repoint" => Self::Repoint,
+            other => other
+                .strip_prefix("unknown (")
+                .and_then(|rest| rest.strip_suffix(')'))
+                .and_then(|code| code.parse().ok())
+                .map(Self::Unknown)
+                .ok_or_else(|| serde::de::Error::custom("not an audit action"))?,
+        })
+    }
 }
 
 /// How a mutation ended.

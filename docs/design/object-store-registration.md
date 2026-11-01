@@ -501,7 +501,11 @@ binding.
   is `<old endpoint> <old bucket>/<old prefix> -> <new endpoint> <new bucket>/<new prefix>`,
   with the generation the repoint made. No credential is in it. (A frontend of the previous
   version reading that row does not know the action and answers `corrupt_rows` to the audit
-  list until it is replaced; every other read is unaffected.)
+  list until it is replaced; every other read is unaffected. Frontends therefore update
+  first. From this version on the reader tolerates an action code it does not know: the row
+  lists with action `unknown (N)`, N being the code, and its subject and detail, so a later
+  action cannot break the listing of readers of this release. Known actions keep their
+  snake_case names in the answer.)
 - **Who follows.** Only a node that takes its store from the registration (`--cold-store
   registered`) moves, at its next start: a running node keeps the store it opened and reports
   `pending` for the new generation, as it does for any change. A node that names a store URL

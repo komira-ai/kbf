@@ -108,7 +108,10 @@ pub(super) fn action_of(code: i32) -> Result<AuditAction, RegistryError> {
         3 => AuditAction::PutBinding,
         4 => AuditAction::DeleteBinding,
         5 => AuditAction::Repoint,
-        _ => return Err(RegistryError::Corrupt("audit")),
+        // A code a newer build wrote: listed, never refused. A negative one is no code.
+        other => {
+            AuditAction::Unknown(u32::try_from(other).map_err(|_| RegistryError::Corrupt("audit"))?)
+        }
     })
 }
 
