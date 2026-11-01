@@ -40,6 +40,8 @@ mod ack_reasons;
 mod budgets;
 #[path = "state_store/conditional.rs"]
 mod conditional;
+#[path = "state_store/cordon_owner.rs"]
+mod cordon_owner;
 #[path = "state_store/fate.rs"]
 mod fate;
 #[path = "state_store/floors.rs"]
