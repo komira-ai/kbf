@@ -27,6 +27,7 @@ impl Farm {
         .with_learned_sizes(listeners.learned_sizes, listeners.memory_ladder.first())
         .with_placement_load(listeners.placement_load)
         .with_placement_predictions(listeners.placement_predictions)
+        .with_usage_profiles(listeners.usage_profiles)
         .with_whole_node(listeners.whole_node.clone())
     }
 
@@ -34,6 +35,20 @@ impl Farm {
     #[must_use]
     pub const fn scheduler_core(&self) -> crate::SchedulerCore {
         self.driver.core()
+    }
+
+    /// This farm, reporting `mode` as its `--usage-profiles`. The mode changes nothing the
+    /// farm does yet: it is read by the start line and the gauge.
+    #[must_use]
+    pub fn with_usage_profiles(mut self, mode: crate::UsageProfiles) -> Self {
+        self.usage_profiles = mode;
+        self
+    }
+
+    /// The `--usage-profiles` mode this farm was given.
+    #[must_use]
+    pub const fn usage_profiles(&self) -> crate::UsageProfiles {
+        self.usage_profiles
     }
 
     /// This farm, running whole-machine requests with `config`'s whole-node drain and caps

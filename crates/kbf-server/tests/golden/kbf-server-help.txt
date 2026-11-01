@@ -174,6 +174,14 @@ Options:
           - shadow: The prediction is computed and counted at submit and compared with the run when it ends; the scheduler is given nothing, so placement is what `off` does
           - on:     The prediction is computed at submit (on the legacy core, and again for an operation read back from the state store) and given to the scheduler as the cost of the operation's lease
 
+      --usage-profiles <USAGE_PROFILES>
+          Whether the farm learns what its leases use, for the scheduler's admission by load. `off`, the default, learns nothing. `record` and `on` need `--scheduler-core js` and `--state-store`; `on` also needs `--placement-load on` and `--placement-predictions on`, since the scheduler reads a curve only for an action that has a prediction. In this build a value other than `off` changes only the start line `usage profiles: <mode>` and the gauge `kbf_usage_profiles_mode{mode}`, 1 for the mode and 0 for the others: nothing is learned or stored yet. A server given a combination that breaks one of these refuses to start
+
+          Possible values:
+          - off:    Nothing is learned or stored
+          - record: Runs are learned and stored; the scheduler does not read the curves
+          - on:     Runs are learned and stored, and the scheduler reads the curves
+
       --whole-node-max <WORKERS>
           Turns on the whole-node drain and caps for whole-machine requests (`kbf-lease` `whole_machine`), and names the most workers that may be whole at once: held by a whole-machine lease or reserved for a queued request (a request that fits nowhere reserves the worker that will empty soonest, and nothing newer is placed there). The ceiling is also at most the workers that serve whole-machine leases less `--whole-node-keep-for-ordinary`, and falls as workers leave. Left out, the scheduler books whole-machine requests as it always has, and the other `--whole-node-*` flags are refused. A request's reservation is given up at its action's timeout, and a client may send none: without `--whole-node-drain-deadline-secs` the reservation of such a request is never given up (it ends when its worker is empty), so set that flag when clients may send no timeout
 

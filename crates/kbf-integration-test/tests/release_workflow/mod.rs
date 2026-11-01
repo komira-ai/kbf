@@ -382,6 +382,7 @@ pub fn problems(release: &str) -> Result<Vec<String>, String> {
     notes_job(release, &mut out)?;
     publish_job(release, &mut out)?;
     bump_job(release, &mut out)?;
+    rehearse_job(release, &mut out)?;
     gamma_job(release, &mut out)?;
     // The shared rules, as the workflow lint reads them (pins, runners, permissions).
     out.extend(
@@ -992,6 +993,48 @@ fn tag_job(release: &str, out: &mut Vec<String>) -> Result<(), String> {
         bot.id.as_deref().unwrap_or("")
     );
     env_is(job, ts, "GH_TOKEN", &want, out);
+    Ok(())
+}
+
+/// The token file the rehearsal's helper reads its channel's token from (the test copies it to a
+/// file root owns): the run's own token, in a file its owner alone can read, written from the
+/// environment so the token is never in a command line.
+fn rehearse_job(release: &str, out: &mut Vec<String>) -> Result<(), String> {
+    let job = REHEARSE;
+    let file = "/var/tmp/kbf-update-rehearsal.token";
+    let steps = workflows::job_steps(release, job)?;
+    for step in &steps {
+        if step.run.as_deref().is_some_and(|r| r.contains("${{")) {
+            out.push(format!(
+                "the job `{job}` puts a `${{{{ }}}}` value in a command: the token and the tag reach a step by `env:` and are read as variables"
+            ));
+        }
+    }
+    let makes = steps.iter().any(|s| {
+        s.run.as_deref().map(str::trim_end) == Some(&format!("install -m 0600 /dev/null {file}"))
+    });
+    if !makes {
+        out.push(format!(
+            "the job `{job}` makes its token file with a mode other than 0600: `install -m 0600 /dev/null {file}`, before the token is written"
+        ));
+    }
+    let writes = steps.iter().find(|s| {
+        s.run
+            .as_deref()
+            .is_some_and(|r| r.trim_end() == format!("printf '%s' \"$GH_TOKEN\" > {file}"))
+    });
+    match writes {
+        None => out.push(format!(
+            "the job `{job}` does not write its token file from `GH_TOKEN`: the helper lists releases under the run's token, not anonymously"
+        )),
+        Some(step) => {
+            if step.env != [("GH_TOKEN".to_owned(), "${{ github.token }}".to_owned())] {
+                out.push(format!(
+                    "the job `{job}` writes a token that is not `github.token`: the run's own read-only token, no secret"
+                ));
+            }
+        }
+    }
     Ok(())
 }
 

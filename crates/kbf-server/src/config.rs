@@ -448,6 +448,23 @@ pub struct Args {
         hide_default_value = true
     )]
     pub placement_predictions: crate::PlacementPredictions,
+    /// Whether the farm learns what its leases use, for the scheduler's admission by load.
+    /// `off`, the default, learns nothing. `record` and `on` need `--scheduler-core js` and
+    /// `--state-store`; `on` also needs `--placement-load on` and `--placement-predictions on`,
+    /// since the scheduler reads a curve only for an action that has a prediction. In this
+    /// build a value other than `off` changes only the start line `usage profiles: <mode>` and
+    /// the gauge `kbf_usage_profiles_mode{mode}`, 1 for the mode and 0 for the others: nothing
+    /// is learned or stored yet. A server given a combination that breaks one of these refuses
+    /// to start
+    // The text above states the default; the help golden cannot hold the whitespace-only
+    // line clap prints before a `[default: ...]` line.
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = crate::UsageProfiles::Off,
+        hide_default_value = true
+    )]
+    pub usage_profiles: crate::UsageProfiles,
     /// Whether whole-machine requests are run with the scheduler's whole-node drain and
     /// caps (`--whole-node-max`), and with which settings: off unless it is given.
     #[command(flatten)]
@@ -864,6 +881,9 @@ pub enum ConfigError {
          legacy, or leave the flag out"
     )]
     NoMemoryClimbUnderJs,
+    /// `--usage-profiles` was given a value that would do nothing.
+    #[error(transparent)]
+    UsageProfiles(#[from] crate::usage_profiles::UsageProfilesError),
 }
 
 impl Args {
@@ -873,6 +893,8 @@ impl Args {
     /// # Errors
     /// [`ConfigError::LearnedSizesOnUnderJs`]: the core is `js` and `--learned-sizes` is `on`.
     /// [`ConfigError::NoMemoryClimbUnderJs`]: the core is `js` and `--no-memory-climb` is set.
+    /// [`ConfigError::UsageProfiles`]: `--usage-profiles` would do nothing (see
+    /// [`crate::usage_profiles::UsageProfilesError`]).
     pub fn check_scheduler_core(&self) -> Result<(), ConfigError> {
         let js = self.scheduler_core == crate::SchedulerCore::Js;
         if js && self.learned_sizes == crate::LearnedSizes::On {
@@ -881,6 +903,7 @@ impl Args {
         if js && self.no_memory_climb {
             return Err(ConfigError::NoMemoryClimbUnderJs);
         }
+        self.usage_profiles_fit()?;
         Ok(())
     }
 
@@ -1018,6 +1041,7 @@ impl Args {
             scheduler_core: self.scheduler_core,
             placement_load: self.placement_load,
             placement_predictions: self.placement_predictions,
+            usage_profiles: self.usage_profiles,
             whole_node: self.whole_node.config(),
             finished_retention: Duration::from_secs(self.finished_retention_secs),
             shutdown_timeout: match self.shutdown_timeout_secs {
