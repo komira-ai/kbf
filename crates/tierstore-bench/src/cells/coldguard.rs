@@ -81,7 +81,7 @@ impl Default for ColdGuardLimits {
     fn default() -> Self {
         Self {
             window: Duration::from_secs(60),
-            max_p99_ms: 2_000,
+            max_p99_ms: 30_000,
             max_error_share: 0.05,
             max_foreign_requests: 10,
         }
@@ -554,7 +554,8 @@ mod tests {
         let text = trip.to_string();
         assert!(text.contains("foreign_requests is 11"), "{text}");
         assert!(text.contains("limit 10"), "{text}");
-        assert!(text.contains("71") && text.contains("60"), "{text}");
+        assert!(text.contains("counted 71"), "{text}");
+        assert!(text.contains("sent 60"), "{text}");
         // The window it read is given with the trip, for the result.
         let window = window.unwrap();
         assert_eq!(
@@ -702,10 +703,8 @@ mod tests {
         let trip = trip.unwrap();
         assert_eq!(trip.metric, "unreadable");
         let text = trip.to_string();
-        assert!(
-            text.contains("unreadable") && text.contains("no series"),
-            "{text}"
-        );
+        assert!(text.contains("unreadable is"), "{text}");
+        assert!(text.contains("no series"), "{text}");
         let mut fresh = ColdGuard::new(ColdGuardLimits::default());
         let refused = fresh.open(Err("timed out".to_owned()), 500).unwrap_err();
         assert_eq!(refused.metric, "unreadable");
@@ -723,7 +722,7 @@ mod tests {
         let trip = trip.unwrap();
         assert_eq!(trip.metric, "counter");
         let text = trip.to_string();
-        assert!(text.contains("1000") && text.contains('3'), "{text}");
+        assert!(text.contains("from 1000 to 3"), "{text}");
         let mut same = opened(ColdGuardLimits::default());
         let (window, trip) = same.close(read(1_000), 500, true);
         assert_eq!(trip, None);

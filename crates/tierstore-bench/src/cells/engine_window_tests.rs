@@ -205,10 +205,8 @@ async fn a_store_that_cannot_be_read_at_the_start_ends_the_run_before_a_request(
     .await
     .unwrap_err();
     let text = err.to_string();
-    assert!(
-        text.contains("unreadable") && text.contains("no answer in 30 s"),
-        "{text}"
-    );
+    assert!(text.contains("unreadable is"), "{text}");
+    assert!(text.contains("no answer in 30 s"), "{text}");
     let result = written(dir.path());
     assert_eq!(result.passes.len(), 1);
     assert_eq!(result.passes[0].requests, 0);
