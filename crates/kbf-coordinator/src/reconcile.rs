@@ -127,11 +127,11 @@ pub fn plan(
     want: &Desired,
     marks: &ServiceOps,
     fleet: &Fleet,
-    ops: &OpsState,
+    state: &OpsState,
     now: Duration,
 ) -> Vec<Change> {
     let mut changes = stale_acks(&def.name, marks, fleet);
-    changes.extend(decide(def, want, marks, fleet, ops, now));
+    changes.extend(decide(def, want, marks, fleet, state, now));
     changes
 }
 
@@ -140,7 +140,7 @@ fn decide(
     want: &Desired,
     marks: &ServiceOps,
     fleet: &Fleet,
-    ops: &OpsState,
+    state: &OpsState,
     now: Duration,
 ) -> Vec<Change> {
     if def.rollback != Rollback::Automatic || fleet.is_quiet(now) || marks.halt.is_some() {
@@ -156,7 +156,7 @@ fn decide(
     };
     let older = marks.last_good.as_ref().filter(|good| *good != wanted);
     let marked = marks.bad.contains(wanted);
-    let settled = convergence_of(def, Some(want), fleet, ops, now).state == State::Converged
+    let settled = convergence_of(def, Some(want), fleet, state, now).state == State::Converged
         && !live().any(|(id, h)| fleet.holds_slot(service, id, h, now));
     let recorded = marks.last_good.as_ref() == Some(wanted);
     if settled && !recorded && !marked {
@@ -281,7 +281,8 @@ pub fn reconcile(
     let Some(want) = store.get(&def.name) else {
         return;
     };
-    for change in plan(def, &want, &ops.marks(&def.name), fleet, &ops.state(), now) {
+    let state = ops.state();
+    for change in plan(def, &want, &ops.marks(&def.name), fleet, &state, now) {
         if let Err(why) = apply(&def.name, &want, change, ops, store) {
             tracing::error!(service = %def.name, %why, "a rollback change was not made");
             return;

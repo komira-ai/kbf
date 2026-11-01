@@ -37,8 +37,8 @@
 //!
 //! A version marked bad ([`crate::reconcile`]) is ordered to nobody, whatever the rules above
 //! say, and is held at [`Hold::Bad`] after the quiet start.
-//! A host that reports the service `absent` (declared, never registered) is held back after those two
-//! and before the rest, unless the definition says `install_when_absent` ([`Hold::Absent`]).
+//! A host that reports the service `absent` (declared, never registered) is held back before
+//! all of these but the first, unless the definition says `install_when_absent` ([`Hold::Absent`]).
 //!
 //! The decision records nothing: the caller notes an `Update` it returns with
 //! [`Fleet::order`], under the same lock, so the next host's decision sees it. A host that
