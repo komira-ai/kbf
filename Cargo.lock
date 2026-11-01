@@ -1702,6 +1702,7 @@ dependencies = [
  "kbf-transfer",
  "kbf-types",
  "kbf-unitfile",
+ "kbf-updater",
  "postgres",
  "prost",
  "rcgen",
@@ -3107,6 +3108,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "update-hook",
 ]
 
 [[package]]

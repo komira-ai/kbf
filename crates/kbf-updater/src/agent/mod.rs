@@ -22,6 +22,7 @@ pub mod coordinator;
 pub mod enroll;
 pub mod flags;
 pub mod hold;
+pub mod hook;
 pub mod local;
 pub mod renew;
 pub mod run;
@@ -32,7 +33,7 @@ pub mod update;
 mod build;
 pub mod cordon;
 
-pub use build::{NO_CREDENTIAL, NoCredential, run_agent, run_config};
+pub use build::{Access, NO_CREDENTIAL, NoCredential, run_agent, run_config};
 pub use run::{Agent, ServicePorts, Stop, World};
 
 #[cfg(test)]
