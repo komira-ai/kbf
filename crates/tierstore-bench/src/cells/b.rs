@@ -2,8 +2,11 @@
 //!
 //! Quantity: the time of a read through the instance of an object that is on the cold store only
 //! (the first read, which the instance copies back to its hot tier), the second read of the same
-//! object, and a read of the cold store directly. Per object, in this order: the direct read of
-//! the cold bucket (if the run configures the cold role), the first read, the second.
+//! object, and a read of the cold store directly. Per object, in this order: the first read, the
+//! second, and last the direct read of the cold bucket (if the run configures the cold role). The
+//! direct read is last because a read of the cold bucket before the first read would leave the
+//! object in the page cache of the store's disks, and the miss would be timed against a warm
+//! store; the direct read after them is the warm one, which the label says.
 //!
 //! Arms (`<size>-c<in flight>`): the first read's time to the last byte; the arm with the suffix
 //! `.ttfb` its time to the first byte (the first byte of a miss of a 128 MiB object is the
@@ -105,17 +108,11 @@ impl Misses {
         ))
     }
 
-    /// The reads of one object: direct from the cold bucket, then the first and the second
-    /// through the instance.
+    /// The reads of one object: the first and the second through the instance, then, last,
+    /// direct from the cold bucket (see the header for why last).
     async fn read(&self, pass: u32, index: u64) -> Result<Vec<Step>, BenchError> {
         let key = self.key(pass, index);
         let mut steps = Vec::new();
-        if let Some(cold) = &self.read_cold {
-            let direct = cold.get(&key, None).await?;
-            steps.push(
-                Step::streamed(Role::Cold, Op::Get, self.size, &direct).labelled(".cold-direct"),
-            );
-        }
         let first = self.read_instance.get(&key, None).await?;
         let full = Step::streamed(Role::Instance, Op::Get, self.size, &first);
         steps.extend(first.ttfb.map(|t| {
@@ -128,6 +125,12 @@ impl Misses {
         steps.push(full);
         let second = self.read_instance.get(&key, None).await?;
         steps.push(Step::streamed(Role::Instance, Op::Get, self.size, &second).labelled(".second"));
+        if let Some(cold) = &self.read_cold {
+            let direct = cold.get(&key, None).await?;
+            steps.push(
+                Step::streamed(Role::Cold, Op::Get, self.size, &direct).labelled(".cold-direct"),
+            );
+        }
         Ok(steps)
     }
 }
@@ -184,6 +187,7 @@ fn arm(label: String, in_flight: u32, misses: &Arc<Misses>) -> Arm {
             size_label(misses.size)
         ),
         "recently written, likely cache-warm on the store; a lower bound on a real miss".to_owned(),
+        "per object the instance's reads come first and the direct read of the cold bucket last, so the first read is not timed against a store the harness has just read from".to_owned(),
         "test instance and test buckets; two-tier instance (no cold-only mode at the pinned tag)"
             .to_owned(),
     ];
@@ -211,6 +215,7 @@ fn arm(label: String, in_flight: u32, misses: &Arc<Misses>) -> Arm {
         })),
         faulted: false,
         notes,
+        proxy: None,
     }
 }
 
@@ -221,7 +226,7 @@ fn arm(label: String, in_flight: u32, misses: &Arc<Misses>) -> Arm {
 /// [`BenchError`] if the instance is not configured, the objects cannot be written, the ledger
 /// refuses the cell, the load gate trips or cannot be read, or a file or the request log fails.
 pub async fn run(ctx: &CellContext, plan: &CellPlan) -> Result<Vec<CellResult>, BenchError> {
-    run_with(ctx, plan, Arc::new(ProcLoad), None).await
+    run_with(ctx, plan, Arc::new(ProcLoad::new()), None).await
 }
 
 /// [`run`] with the machine given and the objects of a pass capped at `limit`.
@@ -241,6 +246,8 @@ pub async fn run_with(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use bytes::Bytes;
     use objstore_s3::s3::fake::FakeS3;
 
@@ -288,7 +295,7 @@ mod tests {
     /// written as parts through the instance, charged to the ledger, and gone from both stores
     /// after each pass, the cold bucket's copy included.
     #[tokio::test]
-    async fn each_object_is_read_directly_then_twice_through_the_instance_and_removed() {
+    async fn each_object_is_read_twice_through_the_instance_then_directly_and_removed() {
         let dir = temp("tb-b");
         let (instance, cold) = (FakeS3::start().await, FakeS3::start().await);
         let stores = [
@@ -341,6 +348,39 @@ mod tests {
                 .iter()
                 .any(|n| n.contains("a lower bound on a real miss"))
         );
+    }
+
+    /// Catches the store being warmed by the harness before the read the paper calls a miss: for
+    /// every object the first read of the key is the instance's, then its second read, and the
+    /// direct read of the cold bucket comes last. A direct read first would leave the object in
+    /// the page cache of the cold store's disks, and the miss would be timed against a warm store.
+    #[tokio::test]
+    async fn the_first_read_of_an_object_is_the_instances_and_the_direct_read_is_last() {
+        let dir = temp("tb-b-order");
+        let (instance, cold) = (FakeS3::start().await, FakeS3::start().await);
+        let stores = [
+            (Role::Instance, instance.endpoint()),
+            (Role::Cold, cold.endpoint()),
+        ];
+        let ctx = testkit::ctx(dir.path(), &stores, Window::Busy);
+        mirror(&ctx, 4096, 2, 3).await;
+        run_with(&ctx, &plan(&[2], &[4096]), Script::calm(), Some(3))
+            .await
+            .unwrap();
+        let mut reads: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for record in testkit::requests(dir.path())
+            .into_iter()
+            .filter(|r| r.method == "GET" && !r.key.ends_with('/'))
+        {
+            reads
+                .entry(record.key.clone())
+                .or_default()
+                .push(record.role.to_string());
+        }
+        assert_eq!(reads.len(), 6, "{reads:?}");
+        for (key, roles) in &reads {
+            assert_eq!(roles, &["instance", "instance", "cold"], "{key}");
+        }
     }
 
     /// Catches a direct read that is not a failure when the instance keeps its cold objects
@@ -415,10 +455,9 @@ mod tests {
     #[tokio::test]
     async fn an_instance_that_will_not_take_the_objects_stops_the_run() {
         let dir = temp("tb-b-dead");
-        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let dead = format!("http://{}", closed.local_addr().unwrap());
-        drop(closed);
-        let ctx = testkit::ctx(dir.path(), &[(Role::Instance, &dead)], Window::Busy);
+        let dead_store = testkit::DeadStore::start().await;
+        let dead = dead_store.endpoint();
+        let ctx = testkit::ctx(dir.path(), &[(Role::Instance, dead)], Window::Busy);
         let err = run_with(&ctx, &plan(&[1], &[4096]), Script::calm(), Some(2))
             .await
             .unwrap_err();

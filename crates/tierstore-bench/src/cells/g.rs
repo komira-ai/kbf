@@ -435,6 +435,7 @@ fn arm(
             )]))
         })),
         faulted: false,
+        proxy: None,
         notes,
     }
 }
@@ -467,7 +468,7 @@ fn cleanup(stored: Vec<Arc<Stored>>, server: FileServer, root: PathBuf) -> Hook 
 /// [`BenchError`] if the tree cannot be set up, the objects cannot be written, the ledger
 /// refuses the cell, the load gate trips or cannot be read, or a file or the request log fails.
 pub async fn run(ctx: &CellContext, plan: &CellPlan) -> Result<Vec<CellResult>, BenchError> {
-    run_with(ctx, plan, Arc::new(ProcLoad), None).await
+    run_with(ctx, plan, Arc::new(ProcLoad::new()), None).await
 }
 
 /// [`run`] with the machine given and the tree cut to `limit` files (of the paper's mean size).
@@ -598,12 +599,10 @@ mod tests {
         let got = disk.fetch(&missing).await.unwrap();
         assert_eq!((got.body.is_none(), got.status), (true, None));
 
-        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let base = format!("http://{}", closed.local_addr().unwrap());
-        drop(closed);
+        let dead = testkit::DeadStore::start().await;
         let http = Source::Http {
             client: reqwest::Client::new(),
-            base,
+            base: dead.endpoint().to_owned(),
         };
         let got = http.fetch(&missing).await.unwrap();
         assert_eq!((got.body.is_none(), got.status), (true, None));
@@ -732,10 +731,9 @@ mod tests {
     #[tokio::test]
     async fn a_store_that_will_not_take_the_tree_stops_the_run() {
         let dir = temp("tb-g-dead");
-        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let dead = format!("http://{}", closed.local_addr().unwrap());
-        drop(closed);
-        let ctx = testkit::ctx(dir.path(), &[(Role::Cold, &dead)], Window::Busy);
+        let dead_store = testkit::DeadStore::start().await;
+        let dead = dead_store.endpoint();
+        let ctx = testkit::ctx(dir.path(), &[(Role::Cold, dead)], Window::Busy);
         let err = run_with(&ctx, &plan(&[1]), Script::calm(), Some(2))
             .await
             .unwrap_err();

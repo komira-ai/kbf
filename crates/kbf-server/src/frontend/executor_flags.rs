@@ -30,7 +30,7 @@ use kbf_types::ImageRef;
 
 use crate::Farm;
 use crate::executor::{
-    Clock, Config, Deps, Executor, ExecutorKind, Front, FrontParts, Metrics, RunSource,
+    Clock, Config, Delivery, Deps, Executor, ExecutorKind, Front, FrontParts, Metrics, RunSource,
 };
 
 const KIND: &str = "executor";
@@ -49,6 +49,7 @@ const PLAIN_PUT: &str = "executor_allow_plain_http_put";
 const PLAIN_GRANT: &str = "executor_allow_plain_http_grant";
 const LOCATE: &str = "executor_locate";
 const INSECURE: &str = "executor_insecure_argv_secrets";
+const DELIVERY: &str = "executor_secret_delivery";
 const BASE_IMAGE: &str = "executor_base_image";
 const KBF_IMAGE: &str = "executor_kbf_image";
 const MARGIN: &str = "executor_run_margin_secs";
@@ -121,8 +122,9 @@ pub(super) fn args() -> Vec<Arg> {
                  server's flags (`--executor-lease-url`, `--executor-lease-token-file`, and \
                  `--executor-lease-ca-file` for https), the pool's (`--executor-class`, \
                  `--executor-hosts`, `--executor-host-cpus`, `--executor-host-memory-gib`), \
-                 `--executor-frontend-id`, the packs (`--pack-store-endpoint`) and \
-                 `--executor-insecure-argv-secrets`. The executor runs on exactly one \
+                 `--executor-frontend-id`, the packs (`--pack-store-endpoint`) and the secret \
+                 delivery (`--executor-secret-delivery`, with \
+                 `--executor-insecure-argv-secrets` for its default `argv`). The executor runs on exactly one \
                  frontend: a second frontend that holds hosts on the same lease server stops. \
                  A restart of the frontend fails the builds in flight. Switching back to \
                  `kbf-daemon` releases the leases when the frontend is stopped, not when it is \
@@ -251,10 +253,23 @@ pub(super) fn args() -> Vec<Arg> {
             "executor-insecure-argv-secrets",
             "Says the secrets of a task (the presigned write url, the read token) may travel as \
              arguments of the run, where the action can read them from `/proc` and the engine's \
-             inspect shows them. The lease server's job has no secret field yet, so `--executor \
-             js-agent` cannot run without it; it is refused with `--executor kbf-daemon`. Off \
-             by default",
+             inspect shows them. It is what the default `--executor-secret-delivery argv` needs, \
+             and `--executor-secret-delivery files` refuses it. Off by default",
         ),
+        Arg::new(DELIVERY)
+            .long("executor-secret-delivery")
+            .value_name("MODE")
+            .value_parser(["argv", "files"])
+            .default_value("argv")
+            .help(
+                "How the secrets of a task (the presigned write url, the read token) reach it. \
+                 `argv`, the default, passes them as arguments of the run and needs \
+                 `--executor-insecure-argv-secrets`. `files` passes each as a file of the run, \
+                 which the lease server mounts read-only at `/run/js-files`: no argument holds \
+                 a secret, `--executor-insecure-argv-secrets` is refused with it, and only hosts \
+                 that report `run-files` are leased; a pool of none holds no host and no run is \
+                 sent. `files` is refused with `--executor kbf-daemon`, which builds no command line",
+            ),
         text(
             BASE_IMAGE,
             "executor-base-image",
@@ -386,6 +401,13 @@ pub(super) fn from_matches(m: &ArgMatches) -> Result<ExecutorFlags, String> {
                 "--executor-insecure-argv-secrets is ignored: it is for --executor js-agent, and this frontend runs placed actions on daemons"
             );
         }
+        if delivery(m) == Delivery::Files {
+            return Err(
+                "--executor-secret-delivery files is for --executor js-agent: daemons build no \
+                 task command line, so with --executor kbf-daemon it would do nothing"
+                    .to_owned(),
+            );
+        }
         if m.get_flag(LOCATE) {
             return Err(
                 "--executor-locate is for --executor js-agent: daemons build no task command \
@@ -403,11 +425,19 @@ pub(super) fn from_matches(m: &ArgMatches) -> Result<ExecutorFlags, String> {
     if !missing.is_empty() {
         return Err(format!("--executor js-agent needs {}", missing.join(", ")));
     }
-    if !m.get_flag(INSECURE) {
+    let files = delivery(m) == Delivery::Files;
+    if files && m.get_flag(INSECURE) {
         return Err(
-            "--executor js-agent needs --executor-insecure-argv-secrets: the lease \
-                    server's job has no secret field yet, so the secrets of a task travel as \
-                    arguments, where the action can read them"
+            "--executor-secret-delivery files sends no secret in arguments: drop \
+             --executor-insecure-argv-secrets"
+                .to_owned(),
+        );
+    }
+    if !files && !m.get_flag(INSECURE) {
+        return Err(
+            "--executor js-agent needs --executor-insecure-argv-secrets, which \
+                    lets the secrets of a task travel as arguments where the action can read \
+                    them, or --executor-secret-delivery files"
                 .to_owned(),
         );
     }
@@ -467,6 +497,7 @@ fn js_agent_flags(m: &ArgMatches) -> Result<JsAgentFlags, String> {
     config.allow_plain_http_grant = m.get_flag(PLAIN_GRANT);
     config.locate = m.get_flag(LOCATE);
     config.insecure_argv_secrets = m.get_flag(INSECURE);
+    config.delivery = delivery(m);
     config.run_margin = secs(MARGIN);
     config.lease_ttl = secs(TTL);
     config.max_run = secs(MAX_RUN);
@@ -484,6 +515,14 @@ fn js_agent_flags(m: &ArgMatches) -> Result<JsAgentFlags, String> {
         base_image,
         kbf_image,
     })
+}
+
+/// The delivery `--executor-secret-delivery` names.
+fn delivery(m: &ArgMatches) -> Delivery {
+    match m.get_one::<String>(DELIVERY).map(String::as_str) {
+        Some("files") => Delivery::Files,
+        _ => Delivery::InsecureArgv,
+    }
 }
 
 /// The image the flag `long` (argument `id`) names: by digest, with or without the `docker://`
