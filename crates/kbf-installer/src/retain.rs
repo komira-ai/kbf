@@ -76,6 +76,69 @@ pub enum RetainError {
     },
     #[error("cannot write {path}: {source}")]
     Write { path: PathBuf, source: io::Error },
+    #[error("cannot lock {path}: {source}")]
+    Lock { path: PathBuf, source: io::Error },
+}
+
+/// The lock of `retain.json`: an exclusive `flock(2)` on `retain.lock` beside it. Every change
+/// of the file is made holding it, and a prune holds it from reading the file to the last
+/// removal, so a pin or a `last_good` written meanwhile is neither lost nor pruned. It is the
+/// last lock taken: nothing takes another lock while it holds this one.
+#[derive(Debug)]
+pub struct RetainLock {
+    /// None when the directory of the file is not there: then neither is the file, and no
+    /// writer can make it there.
+    _lock: Option<fs::File>,
+    path: PathBuf,
+}
+
+impl RetainLock {
+    /// Wait for the lock of the file at `path`.
+    ///
+    /// # Errors
+    /// The lock file cannot be opened or locked.
+    pub fn acquire(path: &Path) -> Result<Self, RetainError> {
+        let lock_path = path.with_extension("lock");
+        let fail = |source| RetainError::Lock {
+            path: lock_path.clone(),
+            source,
+        };
+        let opened = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&lock_path);
+        let lock = match opened {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            opened => {
+                let lock = opened.map_err(fail)?;
+                lock.lock().map_err(fail)?;
+                Some(lock)
+            }
+        };
+        Ok(Self {
+            _lock: lock,
+            path: path.to_owned(),
+        })
+    }
+
+    /// The file, as it is now.
+    ///
+    /// # Errors
+    /// The file cannot be read, or parsed.
+    pub fn read(&self) -> Result<Retained, RetainError> {
+        Retained::read(&self.path)
+    }
+
+    /// Replace the file by `retained`.
+    ///
+    /// # Errors
+    /// The file cannot be written.
+    pub fn write(&self, retained: &Retained) -> Result<(), RetainError> {
+        retained.write(&self.path)
+    }
 }
 
 /// What `retain.json` holds.
@@ -124,7 +187,9 @@ impl Retained {
         })
     }
 
-    /// Replace the file at `path` by this, whole: written beside it and renamed over it.
+    /// Replace the file at `path` by this, whole: written beside it and renamed over it. Two
+    /// writers share the file beside it, so a writer holds the [`RetainLock`] (as
+    /// [`Retained::update`] and [`RetainLock::write`] do) unless it is the only one.
     ///
     /// # Errors
     /// The file cannot be written.
@@ -150,16 +215,18 @@ impl Retained {
             .map_err(failed)
     }
 
-    /// Read the file at `path`, change it with `change`, and write it back when it changed.
+    /// Read the file at `path`, change it with `change`, and write it back when it changed, all
+    /// holding its [`RetainLock`].
     ///
     /// # Errors
-    /// The file cannot be read, parsed or written.
+    /// The file cannot be locked, read, parsed or written.
     pub fn update(path: &Path, change: impl FnOnce(&mut Self)) -> Result<Self, RetainError> {
-        let was = Self::read(path)?;
+        let lock = RetainLock::acquire(path)?;
+        let was = lock.read()?;
         let mut now = was.clone();
         change(&mut now);
         if now != was {
-            now.write(path)?;
+            lock.write(&now)?;
         }
         Ok(now)
     }

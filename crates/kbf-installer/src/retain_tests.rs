@@ -485,3 +485,48 @@ fn a_kept_release_serializes_without_an_empty_reason_list() {
         serde_json::json!({"commit": B, "version": "v", "why": ["current"]})
     );
 }
+
+/// Catches two writers of `retain.json` losing each other's change: while one holds the lock
+/// with what it read (a stage recording a version, a prune about to remove), another's pin waits
+/// for it, and then reads the file again, so the version and the pin are both there in the end.
+#[test]
+fn a_change_made_while_another_holds_the_file_waits_and_both_changes_stay() {
+    let path = scratch_file("interleave");
+    Retained::default().write(&path).expect("write");
+    let held = RetainLock::acquire(&path).expect("lock");
+    let mut stale = held.read().expect("read");
+    let (pin_path, pinned) = (
+        path.clone(),
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    );
+    let done = std::sync::Arc::clone(&pinned);
+    let pinner = std::thread::spawn(move || {
+        Retained::update(&pin_path, |r| {
+            r.pinned.insert(c(A));
+        })
+        .expect("pin");
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        !pinned.load(std::sync::atomic::Ordering::SeqCst),
+        "the pin waits for the lock"
+    );
+    stale.versions.insert(c(B), "v-b".to_owned());
+    held.write(&stale).expect("write the version");
+    drop(held);
+    pinner.join().expect("pinner");
+    let now = Retained::read(&path).expect("read");
+    assert!(now.pinned.contains(&c(A)), "{now:?}");
+    assert_eq!(now.versions.get(&c(B)).map(String::as_str), Some("v-b"));
+}
+
+/// Catches a lock that cannot be had for a file whose directory is not there: there is no file,
+/// and nothing to keep from another writer, so a collection on such a host goes on.
+#[test]
+fn the_lock_of_a_file_whose_directory_is_not_there_is_had_at_once() {
+    let path = scratch_file("no-dir").join("nowhere").join(FILE);
+    let held = RetainLock::acquire(&path).expect("lock");
+    assert_eq!(held.read().expect("read"), Retained::default());
+    assert!(!path.with_extension("lock").exists());
+}

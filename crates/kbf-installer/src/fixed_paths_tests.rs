@@ -32,8 +32,33 @@ fn lay_down_the_fixed_files(exec: &ScratchHost) {
     }
 }
 
-/// Every fixed file is as it was laid down: there, with its bytes and mode.
-fn assert_the_fixed_files_are_untouched(exec: &ScratchHost, what: &str) {
+/// What changes when a file is written at all, even with the same bytes, or has its mode or
+/// owner changed, or is replaced: its inode and its times of change and modification.
+fn marks(exec: &ScratchHost) -> Vec<(u64, i64, i64, i64, i64)> {
+    use std::os::unix::fs::MetadataExt;
+    FIXED
+        .iter()
+        .map(|path| {
+            let meta = fs::symlink_metadata(exec.at(path)).expect("stat");
+            (
+                meta.ino(),
+                meta.ctime(),
+                meta.ctime_nsec(),
+                meta.mtime(),
+                meta.mtime_nsec(),
+            )
+        })
+        .collect()
+}
+
+/// Every fixed file is as it was laid down: there, with its bytes and mode, and its inode and
+/// times as `laid` saw them (nothing wrote it, not even its own bytes again).
+fn assert_the_fixed_files_are_untouched(
+    exec: &ScratchHost,
+    laid: &[(u64, i64, i64, i64, i64)],
+    what: &str,
+) {
+    assert_eq!(marks(exec), laid, "{what}: a fixed file was written");
     for path in FIXED {
         let at = exec.at(path);
         assert_eq!(
@@ -92,6 +117,7 @@ fn installing_switching_and_collecting_releases_never_touch_the_helper_or_the_ag
     for (mut exec, root) in [host("fixed"), mac("fixed")] {
         let on = format!("{:?}", root.platform());
         lay_down_the_fixed_files(&exec);
+        let laid = marks(&exec);
         let src = |name: &str| source(&format!("fixed-{on}-{name}"), &format!("kbf {name}"), None);
         let id = |n: u64| format!("{n:040x}");
 
@@ -104,7 +130,7 @@ fn installing_switching_and_collecting_releases_never_touch_the_helper_or_the_ag
                 .set_modified(UNIX_EPOCH + Duration::from_secs(1_000 + n))
                 .expect("mtime");
         }
-        assert_the_fixed_files_are_untouched(&exec, "after the installs");
+        assert_the_fixed_files_are_untouched(&exec, &laid, "after the installs");
 
         // A staged release swapped in on trial, then confirmed.
         for (n, order_id) in [(4, "o4"), (5, "o5")] {
@@ -134,7 +160,7 @@ fn installing_switching_and_collecting_releases_never_touch_the_helper_or_the_ag
             if n == 4 {
                 // This one goes back on trial.
                 activate::revert(&mut exec, &root, &mut Vec::new()).expect("revert");
-                assert_the_fixed_files_are_untouched(&exec, "after the revert");
+                assert_the_fixed_files_are_untouched(&exec, &laid, "after the revert");
                 let install = Install {
                     commit: c(&id(n)),
                     from: src(&id(n)),
@@ -162,7 +188,7 @@ fn installing_switching_and_collecting_releases_never_touch_the_helper_or_the_ag
                 activate::confirm(&root, order_id, &c(&id(n))).expect("confirm");
             }
         }
-        assert_the_fixed_files_are_untouched(&exec, "after the swaps");
+        assert_the_fixed_files_are_untouched(&exec, &laid, "after the swaps");
 
         // Back one release, then collect what the floor lets go.
         rollback_on(&mut exec, &root, Mode::Apply).expect("rollback");
@@ -173,7 +199,7 @@ fn installing_switching_and_collecting_releases_never_touch_the_helper_or_the_ag
             !releases_dir_has(&root, &id(1)),
             "{out}: something was collected"
         );
-        assert_the_fixed_files_are_untouched(&exec, "after the collection");
+        assert_the_fixed_files_are_untouched(&exec, &laid, "after the collection");
 
         assert_no_step_names_a_fixed_path(&exec, &on);
     }

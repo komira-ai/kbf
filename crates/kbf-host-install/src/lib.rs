@@ -293,3 +293,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "fixed_mark_tests.rs"]
+pub(crate) mod fixed_mark;

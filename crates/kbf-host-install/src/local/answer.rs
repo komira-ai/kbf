@@ -155,8 +155,11 @@ pub struct QueryView {
     pub last: Option<LastView>,
     /// An install, a switch or a restart holds the install lock.
     pub busy: bool,
-    /// The releases the host holds, newest first, each with its commit and version.
+    /// The releases the host holds, newest first, each with its commit and version: at most
+    /// [`super::core::MAX_LISTED`], the ones that must stay first.
     pub releases: Vec<Kept>,
+    /// How many releases the host holds past the ones listed; 0 when it lists them all.
+    pub releases_omitted: usize,
 }
 
 /// What a request did.
@@ -226,6 +229,13 @@ struct Queried<'a> {
     busy: bool,
     #[serde(skip_serializing_if = "<[Kept]>::is_empty")]
     releases: &'a [Kept],
+    #[serde(skip_serializing_if = "is_zero")]
+    releases_omitted: usize,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 #[derive(Serialize)]
@@ -275,6 +285,7 @@ impl Answer {
                 last: view.last.as_ref(),
                 busy: view.busy,
                 releases: &view.releases,
+                releases_omitted: view.releases_omitted,
             }),
             Self::Refused(code, _) => to_json(&Reason {
                 result: "refused",

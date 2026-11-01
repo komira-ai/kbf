@@ -107,6 +107,7 @@ pub(super) fn serve_with<B: Backend>(
         Box::new(unix_now),
     )
     .keeping(config.keep_releases, Box::new(log));
+    ab.seed_versions();
     let listener = serve::bind(place.trust, &config.socket, place.ids)
         .map_err(|e| format!("{}: {e}", config.socket.display()))?;
     let pace = Pace::real();

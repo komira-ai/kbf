@@ -5,6 +5,7 @@ use std::fs;
 use std::time::{Duration, UNIX_EPOCH};
 
 use super::fx::{Fx, INSTALL, NEW, OLD, Sim, binary, mkdir, write};
+use crate::fixed_mark::mark;
 use crate::mac::apply::run;
 use crate::mac::kit;
 
@@ -162,13 +163,64 @@ fn an_apply_never_writes_the_helper_or_the_agent() {
     let agent = libexec.join("kbf-updater");
     write(&helper, 0o755, b"the helper as it was");
     write(&agent, 0o755, b"the agent as it was");
+    let marks = [mark(&helper), mark(&agent)];
     fx.host.self_exe = helper.clone();
     let sim = fx.sim();
     seed(&fx);
     launched(&fx, &sim);
     assert_eq!(run(&fx.host, &sim), 0);
-    assert_eq!(fs::read(&helper).unwrap(), b"the helper as it was");
-    assert_eq!(fs::read(&agent).unwrap(), b"the agent as it was");
+    assert_eq!([mark(&helper), mark(&agent)], marks, "neither is written");
     assert_eq!(fs::read_dir(&libexec).unwrap().count(), 2);
     assert!(dirs(&fx).len() < 10, "the prune ran");
+}
+
+/// An ssh apply that succeeds while the socket has a swap on trial (its marker is there, whole or
+/// damaged) removes nothing: the trial may go back to a release only it names. The apply is done
+/// all the same.
+///
+/// Catches: the apply's prune reading no trial, which removes releases while one is on trial.
+#[test]
+fn an_apply_while_the_socket_has_a_swap_on_trial_removes_nothing() {
+    for (name, marker) in [
+        (
+            "mac-retain-trial",
+            format!("{{\"commit\":\"{}\"}}", commit_n(27)),
+        ),
+        ("mac-retain-trial-bad", "{ not json".to_owned()),
+    ] {
+        let fx = Fx::new(name);
+        let sim = fx.sim();
+        seed(&fx);
+        launched(&fx, &sim);
+        let before = dirs(&fx);
+        write(&fx.host.pending_marker(), 0o600, marker.as_bytes());
+        assert_eq!(run(&fx.host, &sim), 0, "{name}");
+        assert_eq!(fx.status(), "done\n", "{name}");
+        let mut want = before.clone();
+        want.push(NEW.to_owned());
+        want.sort();
+        want.dedup();
+        assert_eq!(dirs(&fx), want, "{name}: nothing removed");
+    }
+}
+
+/// An ssh apply that succeeds while another install or switch holds the host's install lock
+/// removes nothing; the apply is done all the same.
+///
+/// Catches: the apply's prune going ahead beside an install or a switch of the socket.
+#[test]
+fn an_apply_while_the_install_lock_is_held_removes_nothing() {
+    let fx = Fx::new("mac-retain-locked");
+    let sim = fx.sim();
+    seed(&fx);
+    launched(&fx, &sim);
+    let before = dirs(&fx);
+    let held = crate::host::take_lock(&fx.host.lock_file()).unwrap();
+    assert_eq!(run(&fx.host, &sim), 0);
+    drop(held);
+    let mut want = before;
+    want.push(NEW.to_owned());
+    want.sort();
+    want.dedup();
+    assert_eq!(dirs(&fx), want);
 }

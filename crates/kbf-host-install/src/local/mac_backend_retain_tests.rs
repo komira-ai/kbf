@@ -11,6 +11,7 @@ use kbf_installer::CommitId;
 use kbf_installer::retain::Retained;
 
 use super::{Ab, Answer, Backend, Code, LocalRequest, MacBackend, Shared, current, previous, rig};
+use crate::fixed_mark::mark;
 use crate::mac::tests::fx::{Fx, OLD, OLD_VERSION, Sim, binary, mkdir, write};
 
 /// Seconds after which a release was laid out: every release gets its own time.
@@ -344,7 +345,12 @@ fn what_cannot_be_read_or_removed_is_a_fault_and_removes_nothing() {
     let marker = fx.host.work.join("pending.json");
     write(&marker, 0o600, b"{\"commit\": 7");
     assert_eq!(backend.kept().unwrap_err().code, Code::StateUnavailable);
-    assert_eq!(backend.prune(2).unwrap_err().code, Code::StateUnavailable);
+    // A damaged marker is still a swap on trial: the prune removes nothing.
+    assert_eq!(
+        backend.prune(2).unwrap(),
+        "removing nothing: a release is on trial"
+    );
+    assert_eq!(dirs(&fx), before);
     fs::remove_file(&marker).unwrap();
 
     // The entry cannot be removed from a directory that cannot be written to.
@@ -386,6 +392,7 @@ fn an_update_never_writes_the_helper_or_the_agent() {
     mkdir(&libexec, 0o755);
     write(&helper, 0o755, b"the helper as it was");
     write(&agent, 0o755, b"the agent as it was");
+    let marks = [mark(&helper), mark(&agent)];
     let mut host = fx.host.clone();
     host.self_exe = helper.clone();
     let ab = Ab::new(
@@ -403,8 +410,7 @@ fn an_update_never_writes_the_helper_or_the_agent() {
         stage_and_switch(&fx, &ab, n);
         confirm(&ab, n, Some(1));
     }
-    assert_eq!(fs::read(&helper).unwrap(), b"the helper as it was");
-    assert_eq!(fs::read(&agent).unwrap(), b"the agent as it was");
+    assert_eq!([mark(&helper), mark(&agent)], marks, "neither is written");
     assert_eq!(fs::read_dir(&libexec).unwrap().count(), 2);
     assert!(dirs(&fx).len() < 3 + 4 + 1, "the prune ran");
 }

@@ -680,19 +680,26 @@ the release that runs (`current`), the one before it (`previous`), every pinned 
 coordinator's last good release, and the `--keep-releases` newest others (by the time each was
 laid out). So going back to any of them needs no download. The rest are removed after a
 `confirm`, and only then: never while a release is on trial, and not by `install` or `switch`.
-On a Mac, the ssh path's apply removes them once the new daemon is welcomed, keeping 4 others.
+On a Mac, the ssh path's apply removes them once the new daemon is welcomed, keeping 4 others,
+unless the socket has a swap on trial (its marker is there) or another install or switch holds
+the install lock. A confirm whose `last_good` cannot be recorded (the listing or the file cannot
+be read or written, or its 12 digits name two releases) removes nothing, and the log says why.
 
 What must stay besides the links is in `retain.json`, beside the installer's state (Linux,
 `/var/lib/kbf-installer/retain.json`) or in the work directory (Mac): `pinned` (a list of
 commits), `last_good` (a commit) and `versions` (the version text of each release, for the
 listing). Every key is optional and an unknown one is ignored. A file that cannot be parsed
-removes nothing, since it may hold a pin.
+removes nothing, since it may hold a pin. Each change of it holds `retain.lock` beside it, and a
+prune holds that lock from reading what must stay to the last removal. On a host upgraded from a
+release that kept versions only in the helper's own state, the helper copies them into
+`retain.json` when it starts.
 
 `query` lists the kept releases, newest first, as `releases`: one object per release with its
 `commit`, its `version` (null when the host does not know it) and `why` it must stay (`current`,
 `previous`, `on_trial`, `pinned`, `last_good`; left out for one of the newest others). At most 64
-are listed, and a release that must stay is always among them. `kbf-deploy host status` prints the
-same list.
+are listed: the ones that must stay first (what runs, what is on trial, the one before, the last
+good, then the pinned ones), then the newest others; `releases_omitted` counts any left out, and
+is absent when none is. `kbf-deploy host status` prints the whole list.
 
 The agent does not send `last_good` yet: the coordinator does not carry it in its orders. Until it
 does, the coordinator's last good release is kept only as `previous`, a pin, or one of the newest

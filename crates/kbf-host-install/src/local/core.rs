@@ -18,10 +18,11 @@ use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use kbf_installer::CommitId;
 use kbf_installer::retain::{Kept, Retained};
 
 use super::answer::{Answer, Code, LastView, PendingView, QueryView};
@@ -130,6 +131,33 @@ impl Saved {
     fn version_of(&self, commit: &str) -> Option<String> {
         self.versions.get(commit).cloned()
     }
+}
+
+/// At most `max` of the releases `kept` (newest first), and how many are left out. Past the
+/// limit the ones that must stay come first: what runs, what is on trial, the one before and
+/// the last good, then the pinned ones, then the newest others; the listing stays newest first.
+fn cut(kept: Vec<Kept>, max: usize) -> (Vec<Kept>, usize) {
+    let rank = |k: &Kept| {
+        if k.why.iter().any(|w| *w != "pinned") {
+            0
+        } else if k.why.is_empty() {
+            2
+        } else {
+            1
+        }
+    };
+    let mut order: Vec<usize> = (0..kept.len()).collect();
+    order.sort_by_key(|&i| (rank(&kept[i]), i));
+    let mut chosen: Vec<usize> = order.into_iter().take(max).collect();
+    chosen.sort_unstable();
+    let omitted = kept.len() - chosen.len();
+    let mut chosen = chosen.into_iter().peekable();
+    let listed = kept
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, k)| chosen.next_if_eq(&i).map(|_| k))
+        .collect();
+    (listed, omitted)
 }
 
 /// The update, over a backend.
@@ -258,7 +286,7 @@ impl<B: Backend> Ab<B> {
     fn query(&self) -> Result<Answer, Fault> {
         let saved = self.load()?;
         let commit = self.backend.current()?;
-        let releases = self.listed(&saved);
+        let (releases, releases_omitted) = self.listed(&saved);
         let pending = self.backend.pending()?.map(|p| PendingView {
             version: saved.version_of(&p.commit),
             commit: p.commit,
@@ -279,29 +307,21 @@ impl<B: Backend> Ab<B> {
             }),
             busy: locks::flock_held(&self.backend.lock_file()),
             releases,
+            releases_omitted,
         }))
     }
 
     /// The releases the host keeps, each with its version: what the host recorded when it was
     /// laid out, else the text it was staged as here. A listing that cannot be read is empty:
     /// the rest of the answer stands.
-    fn listed(&self, saved: &Saved) -> Vec<Kept> {
-        let mut kept = self.backend.kept().unwrap_or_default();
-        // Past the limit, the releases that must stay are still listed; only the oldest others
-        // are left out.
-        let must = kept.iter().filter(|k| !k.why.is_empty()).count();
-        let mut others = 0;
-        kept.retain(|k| {
-            others += usize::from(k.why.is_empty());
-            !k.why.is_empty() || others + must <= MAX_LISTED
-        });
-        kept.truncate(MAX_LISTED);
+    fn listed(&self, saved: &Saved) -> (Vec<Kept>, usize) {
+        let (mut kept, omitted) = cut(self.backend.kept().unwrap_or_default(), MAX_LISTED);
         for k in &mut kept {
             if k.version.is_none() {
                 k.version = saved.version_of(k.commit.as_str());
             }
         }
-        kept
+        (kept, omitted)
     }
 
     fn stage(&self, version: &Version, channel: &Channel) -> Result<Answer, Fault> {
@@ -446,28 +466,20 @@ impl<B: Backend> Ab<B> {
         let Some(file) = self.backend.retain_file() else {
             return;
         };
-        // The release `last_good` names, if the host holds it; one it does not hold has
-        // nothing to keep, and the one named before is no longer the coordinator's. A listing
-        // that cannot be read leaves the one recorded as it is.
-        let listed = last_good.map(|version| (version, self.backend.kept()));
-        match listed {
-            Some((version, Ok(kept))) => {
-                let held = commit_prefix(version.as_str()).and_then(|prefix| {
-                    kept.into_iter()
-                        .find_map(|k| k.commit.as_str().starts_with(prefix).then_some(k.commit))
-                });
-                if let Err(e) = Retained::update(&file, |r| r.last_good = held) {
-                    (self.note)(&format!("retain: {e}"));
-                }
-            }
-            Some((_, Err(fault))) => (self.note)(&format!("retain: {}", fault.detail)),
-            None => {}
+        // A last good that cannot be recorded is not pruned around: the release it names may be
+        // the one an automatic rollback needs, so nothing is removed until a confirm records it.
+        if let Some(version) = last_good
+            && let Err(why) = self.record_last_good(&file, version)
+        {
+            (self.note)(&format!("retain: {why}; removing nothing"));
+            return;
         }
         match self.backend.prune(self.keep) {
             Ok(done) if !done.is_empty() => (self.note)(&format!("prune: {done}")),
             Ok(_) => {}
             Err(fault) => (self.note)(&format!("prune: {}", fault.detail)),
         }
+        self.seed_versions();
         if let Ok(kept) = self.backend.kept() {
             let before = saved.versions.len();
             saved
@@ -477,6 +489,70 @@ impl<B: Backend> Ab<B> {
                 let _ = self.save(saved);
             }
         }
+    }
+
+    /// Copy into `retain.json` the version text this program's own state knows of each release
+    /// the host holds and that file does not, so `host status` names the version `query` does:
+    /// a host whose releases were staged before the versions were recorded there. Run when the
+    /// socket starts to serve and after each confirm; a failure is told and changes nothing.
+    pub fn seed_versions(&self) {
+        let Some(file) = self.backend.retain_file() else {
+            return;
+        };
+        let (Ok(saved), Ok(kept)) = (self.load(), self.backend.kept()) else {
+            return;
+        };
+        let known: Vec<(CommitId, String)> = kept
+            .into_iter()
+            .filter(|k| k.version.is_none())
+            .filter_map(|k| saved.version_of(k.commit.as_str()).map(|v| (k.commit, v)))
+            .collect();
+        if known.is_empty() {
+            return;
+        }
+        let seeded = Retained::update(&file, |r| {
+            for (commit, version) in known {
+                r.versions.insert(commit, version);
+            }
+        });
+        if let Err(e) = seeded {
+            (self.note)(&format!("retain: {e}"));
+        }
+    }
+
+    /// Record `version` as the coordinator's last good release: the one release the host holds
+    /// whose commit the version names. One it does not hold has nothing to keep, and the one
+    /// recorded before is no longer the coordinator's, so none is recorded.
+    ///
+    /// # Errors
+    /// The listing cannot be read, the version names more than one held release (two commits
+    /// with its 12 digits), or the file cannot be written: then what is recorded stays.
+    fn record_last_good(&self, file: &Path, version: &Version) -> Result<(), String> {
+        let kept = self.backend.kept().map_err(|fault| fault.detail)?;
+        let held: Vec<CommitId> = match commit_prefix(version.as_str()) {
+            Some(prefix) => kept
+                .into_iter()
+                .filter(|k| k.commit.as_str().starts_with(prefix))
+                .map(|k| k.commit)
+                .collect(),
+            None => Vec::new(),
+        };
+        let held = match held.as_slice() {
+            [] => None,
+            [one] => Some(one.clone()),
+            many => {
+                let names: Vec<String> = many.iter().map(ToString::to_string).collect();
+                return Err(format!(
+                    "last_good {} names {} releases: {}",
+                    version.as_str(),
+                    many.len(),
+                    names.join(" ")
+                ));
+            }
+        };
+        Retained::update(file, |r| r.last_good = held)
+            .map(drop)
+            .map_err(|e| e.to_string())
     }
 
     /// Put the host back on the release that ran before the one on trial, and remember

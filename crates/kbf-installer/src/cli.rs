@@ -156,7 +156,7 @@ impl ServiceArgs {
 #[derive(Args)]
 pub struct GcArgs {
     /// The releases to keep besides the ones that must stay (2 or more).
-    #[arg(long, default_value_t = crate::helper::cycle::GC_KEEP, value_parser = crate::retain::parse_keep)]
+    #[arg(long, default_value_t = crate::retain::DEFAULT_KEEP, value_parser = crate::retain::parse_keep)]
     pub keep: usize,
 }
 

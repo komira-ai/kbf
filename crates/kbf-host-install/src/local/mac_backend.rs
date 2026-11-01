@@ -54,7 +54,7 @@ impl MacBackend {
     }
 
     fn marker_file(&self) -> PathBuf {
-        self.host.work.join("pending.json")
+        self.host.pending_marker()
     }
 
     fn read_marker(&self) -> Result<Option<Marker>, Fault> {
@@ -244,8 +244,6 @@ impl Backend for MacBackend {
     }
 
     fn prune(&self, keep: usize) -> Result<String, Fault> {
-        let on_trial = self.read_marker()?.map(|m| m.commit);
-        retain::prune(&self.host, keep, on_trial.as_deref())
-            .map_err(|why| Fault::failed(Code::StateUnavailable, why))
+        retain::prune(&self.host, keep).map_err(|why| Fault::failed(Code::StateUnavailable, why))
     }
 }

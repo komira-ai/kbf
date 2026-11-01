@@ -208,9 +208,10 @@ fn a_confirm_without_a_last_good_leaves_the_recorded_one() {
 }
 
 /// A retain file that cannot be parsed is told to the log, and the confirm still answers
-/// confirmed; the prune is still asked for (it refuses by itself, on the same file).
+/// confirmed; the last good it names cannot be recorded, so no prune is asked for.
 ///
-/// Catches: a retain file that cannot be parsed passed over in silence.
+/// Catches: a retain file that cannot be parsed passed over in silence; a prune after a last
+/// good that was not recorded.
 #[test]
 fn an_unparseable_retain_file_is_told_and_the_confirm_stands() {
     let (fx, notes) = host("ab-retain-bad", 4);
@@ -222,7 +223,8 @@ fn an_unparseable_retain_file_is_told_and_the_confirm_stands() {
     assert_eq!(told.len(), 1, "{told:?}");
     assert!(told[0].starts_with("retain: "), "{told:?}");
     assert!(told[0].contains("cannot be parsed"), "{told:?}");
-    assert_eq!(prunes(&fx).len(), 1);
+    assert!(told[0].ends_with("; removing nothing"), "{told:?}");
+    assert!(prunes(&fx).is_empty());
     assert_eq!(
         fs::read_to_string(fx.dir.join("retain.json")).unwrap(),
         "{ not json",
@@ -457,9 +459,10 @@ fn a_last_good_is_left_as_recorded_when_the_listing_cannot_be_read() {
         }
     );
     assert_eq!(retained(&fx).last_good, Some(commit(C)));
+    assert_eq!(*notes.borrow(), ["retain: listing; removing nothing"]);
     assert!(
-        notes.borrow().contains(&"retain: listing".to_owned()),
-        "{notes:?}"
+        prunes(&fx).is_empty(),
+        "a last good not recorded is not pruned around"
     );
 }
 
@@ -491,5 +494,72 @@ fn a_cut_listing_still_names_every_release_that_must_stay() {
     assert_eq!(
         listed[62..],
         [format!("{:040x}", 68), format!("{:040x}", 69)]
+    );
+}
+
+/// A host with more releases that must stay than a query lists names the release that runs, and
+/// then the pinned ones, newest first, and says how many it left out; the line carries the
+/// count, which is absent when nothing is left out.
+///
+/// Catches: the listing cut by age alone, which drops an old `current`; pinned releases ranked
+/// with the others; releases left out without a count.
+#[test]
+fn a_listing_past_the_limit_names_what_runs_first_and_counts_what_it_leaves_out() {
+    let (fx, _) = host("ab-listing-pins", 4);
+    let mut many: Vec<Kept> = (0..70_u32)
+        .map(|n| {
+            let mut k = held(&format!("{n:040x}"), None);
+            k.why = vec!["pinned"];
+            k
+        })
+        .collect();
+    let mut old = held(&format!("{:040x}", 99), None);
+    old.why = vec!["current"];
+    many.push(old);
+    // An other newer than every pinned release.
+    many.insert(0, held(&format!("{:040x}", 98), None));
+    fx.world.borrow_mut().kept = many;
+    let view = fx.query();
+    let listed: Vec<String> = view.releases.iter().map(|k| k.commit.to_string()).collect();
+    let mut want: Vec<String> = (0..63_u32).map(|n| format!("{n:040x}")).collect();
+    want.push(format!("{:040x}", 99));
+    assert_eq!(listed, want);
+    assert_eq!(view.releases_omitted, 8);
+    let line = Answer::Queried(view).json_line();
+    let json: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(json["releases"].as_array().unwrap().len(), 64);
+    assert_eq!(json["releases_omitted"], 8);
+    assert!(line.len() < 16 * 1024, "{} bytes", line.len());
+
+    fx.world.borrow_mut().kept = vec![held(B, None), held(A, None)];
+    let line = Answer::Queried(fx.query()).json_line();
+    assert!(!line.contains("releases_omitted"), "{line}");
+}
+
+/// A last good whose 12 digits name two releases the host holds records neither: the one recorded
+/// before stays, nothing is pruned, and the log names both.
+///
+/// Catches: the first of two matching releases taken for the last good, by the order of age.
+#[test]
+fn a_last_good_that_names_two_held_releases_records_neither_and_removes_nothing() {
+    let (fx, notes) = host("ab-lg-ambiguous", 4);
+    let twin = format!("{}{}", &A[..12], "b".repeat(28));
+    fx.world.borrow_mut().kept = vec![held(B, None), held(A, None), held(&twin, None)];
+    let file = Retained {
+        last_good: Some(commit(C)),
+        ..Retained::default()
+    };
+    file.write(&fx.dir.join("retain.json")).unwrap();
+    on_trial(&fx);
+    let answer = fx.ask(&format!("confirm kbf={VB} last_good={VA}"));
+    assert_eq!(answer, Answer::Confirmed { version: VB.into() });
+    assert_eq!(retained(&fx).last_good, Some(commit(C)));
+    assert!(prunes(&fx).is_empty());
+    let told = notes.borrow();
+    assert_eq!(told.len(), 1, "{told:?}");
+    assert!(
+        told[0].contains(&format!("names 2 releases: {A} {twin}"))
+            && told[0].ends_with("; removing nothing"),
+        "{told:?}"
     );
 }

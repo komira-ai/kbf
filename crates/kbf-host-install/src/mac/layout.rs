@@ -197,6 +197,11 @@ impl MacHost {
         self.work.join("lock")
     }
 
+    /// The marker of a swap on trial, which the socket's switch writes (root's, 0600).
+    pub(crate) fn pending_marker(&self) -> PathBuf {
+        self.work.join("pending.json")
+    }
+
     pub(crate) fn stage(&self) -> PathBuf {
         self.work.join("stage")
     }

@@ -14,6 +14,7 @@ use kbf_installer::helper::service::Procs;
 use kbf_installer::retain::Retained;
 
 use super::{A, Ab, Answer, Borrowed, LocalRequest, Rig, Trust, binary, what_kbf_says};
+use crate::fixed_mark::mark;
 use crate::local::answer::Code;
 use crate::local::backend::Backend;
 
@@ -345,6 +346,7 @@ fn an_update_never_writes_the_helper_or_the_agent() {
     fs::create_dir_all(helper.parent().unwrap()).unwrap();
     fs::write(&helper, b"the helper as it was").unwrap();
     fs::write(&agent, b"the agent as it was").unwrap();
+    let marks = [mark(&helper), mark(&agent)];
     let (ab, _) = update_core(&rig, 2);
     for n in 20..24 {
         seed(&rig, &commit_n(n), u64::from(n));
@@ -353,8 +355,7 @@ fn an_update_never_writes_the_helper_or_the_agent() {
         stage_and_switch(&rig, &ab, n);
         confirm(&ab, n, Some(1));
     }
-    assert_eq!(fs::read(&helper).unwrap(), b"the helper as it was");
-    assert_eq!(fs::read(&agent).unwrap(), b"the agent as it was");
+    assert_eq!([mark(&helper), mark(&agent)], marks, "neither is written");
     let log = format!("{:?}", rig.backend.exec.borrow().log);
     assert!(
         log.contains("/var/lib/kbf-installer"),
@@ -362,4 +363,91 @@ fn an_update_never_writes_the_helper_or_the_agent() {
     );
     assert!(!log.contains("/usr/libexec/kbf"), "{log}");
     assert!(dirs(&rig).len() < 3 + 4 + 1, "the prune ran");
+}
+
+/// A host upgraded from a release that did not record versions in `retain.json` (its releases on
+/// disk, their version text only in this program's own state) gets that text copied there when
+/// the socket starts: `host status` and `query` then name each release with the same version.
+///
+/// Catches: a status that says unknown where the query knows the version; a copy that overwrites
+/// a version already recorded.
+#[test]
+fn an_upgraded_host_has_the_versions_of_its_releases_in_the_status_and_the_query() {
+    let rig = Rig::new("retain-upgrade");
+    seed(&rig, &commit_n(1), 10);
+    seed(&rig, &commit_n(2), 20);
+    let (ab, _) = update_core(&rig, 4);
+    let state = serde_json::json!({"versions": {
+        commit_n(1): version_n(1),
+        commit_n(2): version_n(2),
+    }});
+    let saved = rig.dir.join("state.json");
+    fs::write(&saved, state.to_string()).unwrap();
+    fs::set_permissions(&saved, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+    let file = rig.backend.retain_file().unwrap();
+    Retained::update(&file, |r| {
+        r.versions.insert(id(&commit_n(2)), "recorded".to_owned());
+    })
+    .unwrap();
+
+    ab.seed_versions();
+    let status: Vec<(String, Option<String>)> = kbf_installer::release::kept(&rig.layout)
+        .unwrap()
+        .into_iter()
+        .map(|k| (k.commit.to_string(), k.version))
+        .collect();
+    let Answer::Queried(view) = ask(&ab, "query") else {
+        panic!("a query answers")
+    };
+    let query: Vec<(String, Option<String>)> = view
+        .releases
+        .into_iter()
+        .map(|k| (k.commit.to_string(), k.version))
+        .collect();
+    assert_eq!(status, query);
+    assert!(
+        status.contains(&(commit_n(1), Some(version_n(1)))),
+        "{status:?}"
+    );
+    assert!(
+        status.contains(&(commit_n(2), Some("recorded".to_owned()))),
+        "{status:?}"
+    );
+}
+
+/// A confirm whose last good cannot be recorded (the retain file reads, but nothing can be
+/// written beside it) removes nothing: the release it names is older than every kept one, and it
+/// and every surplus release are still there after the confirm, which stands.
+///
+/// Catches: a prune that goes on with the last good recorded before, which removes the release
+/// the coordinator now names as the one to go back to.
+#[test]
+fn a_last_good_that_cannot_be_written_removes_nothing() {
+    let rig = Rig::new("retain-lg-unwritable");
+    for n in 20..28 {
+        seed(&rig, &commit_n(n), u64::from(n));
+    }
+    seed(&rig, &commit_n(1), 1);
+    let (ab, notes) = update_core(&rig, 2);
+    let file = rig.backend.retain_file().unwrap();
+    fs::write(&file, "{}\n").unwrap();
+    stage_and_switch(&rig, &ab, 30);
+    // What is written beside the file cannot be made: the file reads, and cannot be replaced.
+    fs::create_dir(file.with_extension("json.new")).unwrap();
+    let before = dirs(&rig);
+    let line = format!("confirm kbf={} last_good={}", version_n(30), version_n(1));
+    assert_eq!(
+        ask(&ab, &line),
+        Answer::Confirmed {
+            version: version_n(30)
+        }
+    );
+    assert_eq!(dirs(&rig), before, "notes: {:?}", notes.borrow());
+    assert!(dirs(&rig).contains(&commit_n(1)));
+    let told = notes.borrow();
+    assert!(
+        told.iter()
+            .any(|t| t.starts_with("retain: cannot write") && t.ends_with("; removing nothing")),
+        "{told:?}"
+    );
 }

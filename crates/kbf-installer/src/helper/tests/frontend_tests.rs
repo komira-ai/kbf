@@ -349,13 +349,13 @@ fn a_revert_drops_only_the_staged_release_and_never_touches_current() {
     assert_eq!(rig.restarts(), 0);
 }
 
-/// Catches the release a confirm or revert leaves behind never being collected: both owe a
-/// `gc` (the confirm because `previous` moved on, the revert because a staging was dropped),
-/// which removes the releases nothing needs beyond the four newest.
+/// A confirm collects the releases nothing needs beyond the four newest (`previous` moved on);
+/// a revert, which drops a staging and confirms nothing, removes no release.
 ///
-/// Catches: `kept` false after a flip; `kept` false after a drop; a keep above or below four.
+/// Catches: `kept` false after a flip; a keep above or below four; a collection after a drop,
+/// which is no confirm.
 #[test]
-fn a_confirm_and_a_drop_each_collect_the_releases_nothing_needs() {
+fn a_confirm_collects_the_releases_nothing_needs_and_a_drop_collects_none() {
     let releases = |rig: &Rig, name: &str| {
         rig.root
             .join("var/lib/kbf-installer/releases")
@@ -392,9 +392,9 @@ fn a_confirm_and_a_drop_each_collect_the_releases_nothing_needs() {
     }
     rig.order(2, Verb::Revert, B);
     rig.cycle(T0 + 3);
-    // The dropped B is an other now, and the newest: it and the three newest of the rest stay.
-    assert!(!releases(&rig, D) && !releases(&rig, E) && !releases(&rig, &newer[0].0));
-    assert!(newer[1..].iter().all(|(commit, _)| releases(&rig, commit)));
+    // A dropped stage is no confirm: every release stays.
+    assert!(releases(&rig, D) && releases(&rig, E));
+    assert!(newer.iter().all(|(commit, _)| releases(&rig, commit)));
     assert!(releases(&rig, A) && releases(&rig, B));
 }
 

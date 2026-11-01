@@ -79,6 +79,7 @@ fn the_requests_are_the_helpers_five_and_carry_a_version_and_a_channel_only() {
                 last: None,
                 busy: false,
                 releases: Vec::new(),
+                releases_omitted: 0,
             })),
             Some("stage") => line(&Answer::Staged {
                 version: VB.into(),
@@ -184,6 +185,7 @@ fn the_helpers_real_answers_are_read() {
         }),
         busy: true,
         releases: Vec::new(),
+        releases_omitted: 0,
     };
     let (socket, _) = serve(&d, 1, move |_| line(&Answer::Queried(view.clone())));
     let state = SocketLocal::new(&socket, limits()).query().unwrap();
@@ -222,6 +224,7 @@ fn the_helpers_real_answers_are_read() {
             }),
             busy: false,
             releases: Vec::new(),
+            releases_omitted: 0,
         }))
     });
     let state = SocketLocal::new(&socket, limits()).query().unwrap();
@@ -478,4 +481,30 @@ fn the_helper_is_the_installer_port_of_the_health_check() {
     local.world().query = Err(LocalError::Failed("state_unavailable".into()));
     assert!(!installer.report(&host).unwrap_err().is_unreachable());
     assert!(installer.install(&host, &version(VB)).is_err());
+}
+
+/// Catches this agent failing to read a newer helper's query, which lists the releases it keeps
+/// (and how many it left out of the list): the agent reads the host as it did before, the list
+/// is passed over, and the line of a full list is read whole.
+#[test]
+fn a_query_that_lists_the_kept_releases_reads_as_before() {
+    let d = dir("lc-kept");
+    let kept: Vec<String> = (0..64)
+        .map(|n| {
+            format!(
+                "{{\"commit\":\"{n:040x}\",\"version\":\"0.1.{n}+g{n:012x}-1\",\"why\":[\"pinned\"]}}"
+            )
+        })
+        .collect();
+    let text = format!(
+        "{{\"result\":\"query\",\"commit\":\"{COMMIT_A}\",\"version\":\"{VA}\",\"node_id\":\"n1\",\
+         \"pending\":null,\"last\":null,\"busy\":false,\"releases\":[{}],\"releases_omitted\":3}}\n",
+        kept.join(",")
+    );
+    let (socket, _) = serve(&d, 1, move |_| Some(text.clone()));
+    let state = SocketLocal::new(&socket, limits()).query().unwrap();
+    assert_eq!(state.commit.as_deref(), Some(COMMIT_A));
+    assert_eq!(state.version, Some(version(VA)));
+    assert_eq!(state.node_id.as_deref(), Some("n1"));
+    assert!(!state.busy);
 }

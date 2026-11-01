@@ -732,3 +732,6 @@ fn a_repeated_confirm_is_for_the_release_that_was_confirmed() {
 
 #[path = "core_retain_tests.rs"]
 mod retain;
+
+#[path = "compat_tests.rs"]
+mod compat;

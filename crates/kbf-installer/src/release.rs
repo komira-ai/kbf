@@ -48,7 +48,7 @@ use sha2::{Digest, Sha256};
 
 use super::CommitId;
 use super::layout::{self, Layout, Platform};
-use super::retain::{self, RetainError, Retained};
+use super::retain::{self, RetainError, RetainLock, Retained};
 use super::state::{self, Locked, State, StateError};
 
 /// Who owns a release: root, so only root can replace what a service runs.
@@ -677,7 +677,16 @@ pub fn gc<E: Exec>(
         return Ok(());
     }
     let retain_file = retain::path(host);
-    let retained = Retained::read(&retain_file)?;
+    // Held from the read of what must stay to the last removal (an apply), so a pin or a
+    // `last_good` written meanwhile waits for it and is not pruned.
+    let retain_lock = match &lock {
+        Some(_) => Some(RetainLock::acquire(&retain_file)?),
+        None => None,
+    };
+    let retained = match &retain_lock {
+        Some(held) => held.read()?,
+        None => Retained::read(&retain_file)?,
+    };
     if lock.is_some() {
         sweep_stages(host)?;
     }
@@ -712,13 +721,12 @@ pub fn gc<E: Exec>(
         list(&gone.iter().map(ToString::to_string).collect::<Vec<_>>())
     );
     execute(&planner.finish(), RunAs::Root, mode, exec, &mut &mut *out)?;
-    if mode == Mode::Apply && !gone.is_empty() {
-        // Read again: a stage may have recorded a version since.
-        Retained::update(&retain_file, |r| {
-            for commit in &gone {
-                r.versions.remove(commit);
-            }
-        })?;
+    if let Some(held) = retain_lock.filter(|_| !gone.is_empty()) {
+        let mut now = retained;
+        for commit in &gone {
+            now.versions.remove(commit);
+        }
+        held.write(&now)?;
     }
     Ok(())
 }

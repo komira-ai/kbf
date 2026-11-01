@@ -12,11 +12,12 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 
 use kbf_installer::CommitId;
-use kbf_installer::retain::{self, Kept, Known, Retained};
+use kbf_installer::retain::{self, Kept, Known, RetainLock, Retained};
 
 use super::kit;
 use super::layout::MacHost;
 use super::release::is_commit;
+use crate::host::take_lock;
 
 /// Where `retain.json` is on a Mac.
 pub(crate) fn file(host: &MacHost) -> PathBuf {
@@ -87,15 +88,45 @@ pub(crate) fn kept(host: &MacHost, on_trial: Option<&str>) -> Result<Vec<Kept>, 
     Ok(kept)
 }
 
-/// Remove the releases the Mac no longer keeps; what it did, in a line. `on_trial` names the
-/// release on trial, if one is: then nothing is removed.
-pub(crate) fn prune(host: &MacHost, keep: usize, on_trial: Option<&str>) -> Result<String, String> {
-    if let Some(commit) = on_trial {
+/// The release on trial, if the socket's switch left its marker: its commit, or `a release` when
+/// the marker cannot be parsed. A marker that cannot be looked at is an error: then whether a
+/// release is on trial cannot be told.
+fn on_trial(host: &MacHost) -> Result<Option<String>, String> {
+    let marker = host.pending_marker();
+    let say = |e: io::Error| format!("{}: {e}", marker.display());
+    match fs::symlink_metadata(&marker) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(say(e)),
+        Ok(_) => {}
+    }
+    let text = fs::read_to_string(&marker).map_err(say)?;
+    let commit = serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|v| v["commit"].as_str().map(str::to_owned));
+    Ok(Some(commit.unwrap_or_else(|| "a release".to_owned())))
+}
+
+/// [`prune`] after an apply of the ssh path, which runs without the host's install lock: it is
+/// taken here, without waiting. One held means an install or a switch of the socket is under
+/// way, and nothing is removed.
+pub(crate) fn prune_after_apply(host: &MacHost, keep: usize) -> Result<String, String> {
+    let Ok(_lock) = take_lock(&host.lock_file()) else {
+        return Ok("removing nothing: the install lock is held".to_owned());
+    };
+    prune(host, keep)
+}
+
+/// Remove the releases the Mac no longer keeps; what it did, in a line. Nothing is removed while
+/// a release is on trial (the socket's marker is there), nor when that cannot be told. The caller
+/// holds the host's install lock; `retain.json`'s lock is held from its read to the last removal.
+pub(crate) fn prune(host: &MacHost, keep: usize) -> Result<String, String> {
+    let lock = RetainLock::acquire(&file(host)).map_err(|e| e.to_string())?;
+    if let Some(commit) = on_trial(host)? {
         return Ok(format!("removing nothing: {commit} is on trial"));
     }
     let keep = retain::at_least(keep);
     let links = kit::links(host)?;
-    let retained = Retained::read(&file(host)).map_err(|e| e.to_string())?;
+    let retained = lock.read().map_err(|e| e.to_string())?;
     let mut must: BTreeSet<CommitId> = retained.protected();
     must.extend(commit(links.current.as_ref()));
     must.extend(commit(links.previous.as_ref()));

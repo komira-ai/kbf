@@ -202,7 +202,7 @@ pub fn run(host: &MacHost, runner: &dyn Runner) -> u8 {
         // The release is applied: the ones the Mac no longer keeps go, before the status says
         // done, so no install lays out a release meanwhile. A prune that fails removes less;
         // the apply is done all the same.
-        let _ = super::retain::prune(host, kbf_installer::retain::DEFAULT_KEEP, None);
+        let _ = super::retain::prune_after_apply(host, kbf_installer::retain::DEFAULT_KEEP);
     }
     // The result stays in the status file; an unwritable file is all there is to tell.
     let written = status::write(host, &state);
