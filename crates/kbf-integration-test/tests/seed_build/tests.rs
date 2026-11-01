@@ -224,10 +224,8 @@ fn a_farm_or_remote_execution_flag_in_a_seed_job_is_refused() {
             format!("- run: RUSTC_WRAPPER=sccache {line}\n"),
             format!("- run: CARGO_BUILD_RUSTC=/opt/kbf/rustc {line}\n"),
             format!("- run: {line} -Z remote-executor\n"),
-            format!("- run: {line} --remote_executor=grpc://farm.example.com:8980\n"),
-            format!(
-                "- env:\n          KBF_FRONTEND: grpcs://farm.example.com:443\n        run: {line}\n"
-            ),
+            format!("- run: {line} --remote_executor=grpc://\n"),
+            format!("- env:\n          KBF_FRONTEND: grpcs://\n        run: {line}\n"),
             format!("- env:\n          SCCACHE_BUCKET: kbf-cache\n        run: {line}\n"),
         ] {
             let found = spoil_artifacts(job, build, &to);
@@ -312,7 +310,11 @@ fn a_build_line_is_read_word_by_word() {
         build_line(
             r#"KBF_BUILD_COMMIT="${GITHUB_SHA::12}" cargo build --locked --release --target "$TARGET" -p kbf-deploy --bins"#
         ),
-        Build::Plain(vec!["kbf-deploy"])
+        Build::Plain(Built {
+            packages: vec!["kbf-deploy"],
+            bins: vec![],
+            all_bins: true
+        })
     );
     assert_eq!(build_line("cargo xtask package dist kbf"), Build::None);
     assert_eq!(build_line("cargo cyclonedx --format json"), Build::None);
@@ -527,7 +529,8 @@ fn artifact_patterns_match_as_the_download_action_does() {
     // Catches: the pattern match taking a name a download would not read for one it does,
     // or the reverse, so a rule about who reads the seed files passes on a wrong reader.
     assert!(matches("assets-*", "assets-linux-x86_64"));
-    assert!(matches("assets-linux-*", "ASSETS-linux-arm64"));
+    assert!(!matches("assets-linux-*", "ASSETS-linux-arm64"));
+    assert!(!matches("Assets-*", "assets-linux-arm64"));
     assert!(matches("assets-darwin-arm64", "assets-darwin-arm64"));
     assert!(matches("*-arm64", "assets-darwin-arm64"));
     assert!(matches("a*s*4", "assets-linux-arm64"));
@@ -707,4 +710,156 @@ fn uploads_and_downloads_in_every_spelling_are_read() {
         &w.problems(),
         "the job `passed` of pipeline.yml runs the local action `./.github/actions/upload`",
     );
+}
+
+#[test]
+fn every_shipped_binary_needs_its_own_unconditional_plain_build() {
+    // Catches: a binary a platform ships (a tarball's, or the coordinator image's) whose plain
+    // cargo build was removed from its seed job, or made skippable, while another plain build
+    // (kbf's) stays, so the shipped file need not come from the seed build.
+    for job in SEED_JOBS {
+        let binaries = shipped(job);
+        assert!(binaries.contains(&"kbf"), "{job} ships kbf: {binaries:?}");
+        assert!(
+            binaries.contains(&"kbf-host-install"),
+            "{job}: {binaries:?}"
+        );
+        if job.starts_with("linux-") {
+            assert!(
+                binaries.contains(&"kbf-coordinator"),
+                "{job} ships the coordinator image's binary: {binaries:?}"
+            );
+        }
+        for binary in binaries {
+            let (_, package) = SHIPPED_BINARIES
+                .iter()
+                .find(|(b, _)| *b == binary)
+                .expect("every shipped binary has a package");
+            red(
+                &spoil_artifacts(job, &format!(" -p {package} "), " "),
+                &format!(
+                    "the seed job `{job}` has no unconditional plain `cargo build --locked --release` of `{binary}`"
+                ),
+            );
+        }
+        let host = "        run: KBF_BUILD_COMMIT=";
+        let found = spoil_artifacts(job, host, &format!("        if: ${{{{ false }}}}\n{host}"));
+        for binary in ["kbf-host-install", "kbf-updater", "kbf-deploy"] {
+            red(&found, &format!("of `{binary}` (package `{binary}`)"));
+        }
+    }
+    // A package built, but not the binary it ships.
+    red(
+        &spoil_artifacts(
+            "darwin-arm64",
+            "-p kbf-cli --bin kbf\n",
+            "-p kbf-cli --bin kbf-cli-fake-exits\n",
+        ),
+        "the seed job `darwin-arm64` has no unconditional plain `cargo build --locked --release` of `kbf` (package `kbf-cli`)",
+    );
+    let task = "        run: cargo build --locked --release --target \"$STATIC_TARGET\" -p kbf-task --bin kbf-task\n";
+    for job in ["linux-x86_64", "linux-arm64"] {
+        red(
+            &spoil_artifacts(job, task, &format!("        if: ${{{{ false }}}}\n{task}")),
+            &format!(
+                "the seed job `{job}` has no unconditional plain `cargo build --locked --release` of `kbf-task`"
+            ),
+        );
+    }
+}
+
+#[test]
+fn the_shipped_binaries_are_the_packages_targets() {
+    // Catches: a row of `SHIPPED_BINARIES` naming a package that has no such binary (so a
+    // build of the wrong package would satisfy it), or a shipped binary with no row.
+    let root = crate::repo_root();
+    for (binary, package) in SHIPPED_BINARIES {
+        let manifest = std::fs::read_to_string(root.join(format!("crates/{package}/Cargo.toml")))
+            .unwrap_or_else(|e| panic!("crates/{package}/Cargo.toml: {e}"));
+        assert!(
+            manifest.contains(&format!("[package]\nname = \"{package}\"\n")),
+            "crates/{package}/Cargo.toml is not the package `{package}`"
+        );
+        let declared = manifest.contains(&format!("[[bin]]\nname = \"{binary}\"\n"));
+        let default =
+            binary == package && root.join(format!("crates/{package}/src/main.rs")).is_file();
+        assert!(
+            declared || default,
+            "the package `{package}` has no binary `{binary}`"
+        );
+    }
+    for job in SEED_JOBS {
+        for binary in shipped(job) {
+            assert!(
+                SHIPPED_BINARIES.iter().any(|(b, _)| *b == binary),
+                "`{binary}`, shipped for {job}, has no row in `SHIPPED_BINARIES`"
+            );
+        }
+    }
+}
+
+#[test]
+fn cargo_run_through_another_program_is_refused() {
+    // Catches: a second, non-plain build added beside the valid one by running cargo through
+    // `env`, `time` or a path to another cargo, which a reader of lines that start with
+    // `cargo` would pass over.
+    for (job, build) in KBF_BUILDS {
+        for wrapped in [
+            "env cargo build --release -p kbf-cli",
+            "env -i PATH=/opt/kbf cargo build --locked --release -p kbf-cli",
+            "time cargo build --release -p kbf-cli",
+            "/opt/kbf/bin/cargo build --locked --release -p kbf-cli",
+        ] {
+            let first = wrapped.split_whitespace().next().expect("a word");
+            red(
+                &around_kbf_build(job, build, &format!("{{build}}      - run: {wrapped}\n")),
+                &format!("cargo is run through `{first}`"),
+            );
+        }
+    }
+    assert_eq!(build_line("echo cargo xtask fetch"), Build::None);
+}
+
+#[test]
+fn a_download_selector_is_read_as_the_action_reads_it() {
+    // Catches: an attest or release download whose `name:` holds a wildcard (the action looks
+    // one name up, so `name: assets-linux-*` reads nothing), or whose selector differs in case
+    // (the action's pattern match is case-sensitive), taken for a reader of the seed files.
+    for (from, to, want) in [
+        (
+            "pattern: assets-linux-*\n",
+            "name: assets-linux-*\n",
+            "the attest job `attest-linux` does not download `assets-linux-x86_64`",
+        ),
+        (
+            "pattern: assets-linux-*\n",
+            "pattern: ASSETS-linux-*\n",
+            "the attest job `attest-linux` does not download `assets-linux-x86_64`",
+        ),
+    ] {
+        red(&spoil_artifacts("attest-linux", from, to), want);
+    }
+    red(
+        &spoil_artifacts(
+            "attest-darwin-arm64",
+            "pattern: assets-darwin-arm64\n",
+            "name: Assets-darwin-arm64\n",
+        ),
+        "the attest job `attest-darwin-arm64` does not download `assets-darwin-arm64`",
+    );
+    for to in ["name: assets-*\n", "pattern: Assets-*\n"] {
+        let mut w = real();
+        w.release = in_job(&w.release, RELEASE_VERIFY, "pattern: assets-*\n", to);
+        red(
+            &w.problems(),
+            "the release's `verify` does not download `assets-linux-x86_64`",
+        );
+    }
+    // An exact `name:` is a reader.
+    let found = spoil_artifacts(
+        "attest-darwin-arm64",
+        "pattern: assets-darwin-arm64\n",
+        "name: assets-darwin-arm64\n",
+    );
+    assert!(found.is_empty(), "{found:#?}");
 }

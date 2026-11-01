@@ -16,13 +16,14 @@
 //!   runner table, written out literally ([`workflows::job_runs_on`],
 //!   [`workflows::is_hosted_label`]): not `self-hosted`, a custom label, a runner group or an
 //!   expression.
-//! - **Plain cargo.** Each builds the `kbf-cli` package (`kbf`) in an unconditional step, and
-//!   every `cargo build` line of the job is plain: `cargo build --locked --release`, then only
+//! - **Plain cargo.** Each builds every binary its platform ships ([`shipped`]: its tarballs'
+//!   and images', by package, [`SHIPPED_BINARIES`]) in an unconditional step, and every
+//!   `cargo build` line of the job is plain: `cargo build --locked --release`, then only
 //!   [`BUILD_FLAGS`] (a target, packages, binaries), after no variable but
 //!   [`BUILD_VARIABLES`], in a step with no `shell:` of its own and a job with no `defaults:`
 //!   of its own (the workflow's shell is held to bash by `attested_bundles`). A line that compiles with another cargo verb
-//!   ([`OTHER_BUILD_VERBS`]), or puts a cargo option before its verb (`cargo --config ...
-//!   build`), is refused, and no scalar of the job (a key or value: its runner, `env`, steps,
+//!   ([`OTHER_BUILD_VERBS`]), puts a cargo option before its verb (`cargo --config ...
+//!   build`) or runs cargo through anything (`env cargo build`, a path to cargo), is refused, and no scalar of the job (a key or value: its runner, `env`, steps,
 //!   scripts and action inputs) nor of the workflow's own `env:` names any of [`NOT_PLAIN`]
 //!   (Buck2 or Bazel, a remote-execution or remote-cache flag, a gRPC farm address, another
 //!   rustc or a wrapper of it). Cargo's own configuration files are not read: a change there
@@ -69,8 +70,53 @@ pub const SEED_GROUPS: &[(&str, &str, &str, &str)] = &[
 /// The job that sums every platform's files, the set a release carries.
 const ALL_SUMS: &str = "sums";
 
-/// The package whose binary is `kbf`, which every seed job builds.
-const KBF_PACKAGE: &str = "kbf-cli";
+/// The package each shipped binary is built from, as `(binary, package)`: every binary of a
+/// platform's release set (`release_artifacts::ASSETS`; the `kbf-task-bundle` is the signed
+/// `kbf-task`) and of its images ([`IMAGE_BINARIES`]) must be built by an unconditional plain
+/// build in that platform's seed job. `the_shipped_binaries_are_the_packages_targets` holds the
+/// table to each package's `Cargo.toml`.
+pub const SHIPPED_BINARIES: &[(&str, &str)] = &[
+    ("kbf", "kbf-cli"),
+    ("kbf-daemon", "kbf-node"),
+    ("kbf-server", "kbf-server"),
+    ("kbf-deploy", "kbf-deploy"),
+    ("kbf-installer", "kbf-installer"),
+    ("kbf-host-install", "kbf-host-install"),
+    ("kbf-updater", "kbf-updater"),
+    ("kbf-mac-provision", "kbf-mac-provision"),
+    ("kbf-signer", "kbf-signer"),
+    ("kbf-task", "kbf-task"),
+    ("kbf-coordinator", "kbf-coordinator"),
+];
+
+/// The binaries a platform's images are built from that are not its tarballs: the update
+/// coordinator's image, on Linux (`release_artifacts`' images).
+pub const IMAGE_BINARIES: &[(&str, &str)] = &[
+    ("kbf-coordinator", "linux-x86_64"),
+    ("kbf-coordinator", "linux-arm64"),
+];
+
+/// The binaries the seed job `job` ships, in the order the release set lists them.
+pub fn shipped(job: &str) -> Vec<&'static str> {
+    let out: Vec<&str> = super::release_artifacts::ASSETS
+        .iter()
+        .chain(IMAGE_BINARIES)
+        .filter(|(_, platform)| *platform == job)
+        .map(|(name, _)| {
+            if *name == "kbf-task-bundle" {
+                "kbf-task"
+            } else {
+                *name
+            }
+        })
+        .fold(Vec::new(), |mut out, name| {
+            if !out.contains(&name) {
+                out.push(name);
+            }
+            out
+        });
+    out
+}
 
 /// The flags a plain build line may pass after `cargo build --locked --release`, and whether
 /// each takes a value.
@@ -197,7 +243,7 @@ fn seed_job(text: &str, job: &str, out: &mut Vec<String>) -> Result<(), String> 
         }
     }
     let steps = workflows::job_steps(text, job)?;
-    let mut builds_kbf = false;
+    let mut built: Vec<Built<'_>> = Vec::new();
     for step in &steps {
         if is_download(step) {
             out.push(format!(
@@ -212,14 +258,14 @@ fn seed_job(text: &str, job: &str, out: &mut Vec<String>) -> Result<(), String> 
         for line in step.run.as_deref().unwrap_or_default().lines() {
             match build_line(line) {
                 Build::None => {}
-                Build::Plain(packages) => {
+                Build::Plain(b) => {
                     if step.shell.is_some() {
                         out.push(format!(
                             "the seed job `{job}` runs `{}` under a `shell:` of its own",
                             line.trim()
                         ));
-                    } else if !step.conditional && packages.contains(&KBF_PACKAGE) {
-                        builds_kbf = true;
+                    } else if !step.conditional {
+                        built.push(b);
                     }
                 }
                 Build::NotPlain(why) => out.push(format!(
@@ -229,10 +275,18 @@ fn seed_job(text: &str, job: &str, out: &mut Vec<String>) -> Result<(), String> 
             }
         }
     }
-    if !builds_kbf {
-        out.push(format!(
-            "the seed job `{job}` has no unconditional plain `cargo build --locked --release` of `{KBF_PACKAGE}`"
-        ));
+    for binary in shipped(job) {
+        let Some((_, package)) = SHIPPED_BINARIES.iter().find(|(b, _)| *b == binary) else {
+            out.push(format!(
+                "the seed job `{job}` ships `{binary}`, which `SHIPPED_BINARIES` does not name a package for"
+            ));
+            continue;
+        };
+        if !built.iter().any(|b| b.builds(package, binary)) {
+            out.push(format!(
+                "the seed job `{job}` has no unconditional plain `cargo build --locked --release` of `{binary}` (package `{package}`)"
+            ));
+        }
     }
     let want = format!("{ASSETS_PREFIX}{job}");
     let uploads: Vec<&Step> = steps
@@ -252,10 +306,26 @@ fn seed_job(text: &str, job: &str, out: &mut Vec<String>) -> Result<(), String> 
 enum Build<'a> {
     /// The line does not compile with cargo.
     None,
-    /// A plain `cargo build --locked --release`, with the packages it names.
-    Plain(Vec<&'a str>),
+    /// A plain `cargo build --locked --release`, with what it builds.
+    Plain(Built<'a>),
     /// A build that is not plain, and why.
     NotPlain(String),
+}
+
+/// What a plain build line builds: the packages it names, and their binaries it names
+/// (`--bin`) or all of them (`--bins`).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Built<'a> {
+    packages: Vec<&'a str>,
+    bins: Vec<&'a str>,
+    all_bins: bool,
+}
+
+impl Built<'_> {
+    /// Whether the line builds the binary `binary` of the package `package`.
+    fn builds(&self, package: &str, binary: &str) -> bool {
+        self.packages.contains(&package) && (self.all_bins || self.bins.contains(&binary))
+    }
 }
 
 /// What the script line `line` builds with (its words split at blanks, double quotes dropped).
@@ -274,11 +344,20 @@ fn build_line(line: &str) -> Build<'_> {
         words.next();
     }
     let words: Vec<&str> = words.collect();
+    let compiles = |w: &&str| *w == "build" || OTHER_BUILD_VERBS.contains(w);
+    let is_cargo = |w: &&str| *w == "cargo" || w.ends_with("/cargo");
     let verb = match words.as_slice() {
         ["cargo", verb, ..] => *verb,
+        [first, ..] if words.iter().any(is_cargo) => {
+            let after = words.iter().skip_while(|w| !is_cargo(w)).skip(1);
+            return if after.clone().any(compiles) {
+                Build::NotPlain(format!("cargo is run through `{first}`"))
+            } else {
+                Build::None
+            };
+        }
         _ => return Build::None,
     };
-    let compiles = |w: &&str| *w == "build" || OTHER_BUILD_VERBS.contains(w);
     if verb.starts_with('-') && words.iter().any(compiles) {
         return Build::NotPlain(format!("`{verb}` comes before the verb"));
     }
@@ -295,23 +374,23 @@ fn build_line(line: &str) -> Build<'_> {
     if words.get(2..4) != Some(&["--locked", "--release"]) {
         return Build::NotPlain("`--locked --release` do not follow `cargo build`".to_owned());
     }
-    let mut packages = Vec::new();
+    let mut built = Built::default();
     let mut rest = words[4..].iter();
     while let Some(flag) = rest.next() {
         match BUILD_FLAGS.iter().find(|(f, _)| f == flag) {
             None => return Build::NotPlain(format!("it passes `{flag}`")),
-            Some((_, false)) => {}
+            Some((_, false)) => built.all_bins = true,
             Some((f, true)) => match rest.next() {
-                Some(v) if !v.starts_with('-') => {
-                    if matches!(*f, "-p" | "--package") {
-                        packages.push(*v);
-                    }
-                }
+                Some(v) if !v.starts_with('-') => match *f {
+                    "-p" | "--package" => built.packages.push(*v),
+                    "--bin" => built.bins.push(*v),
+                    _ => {}
+                },
                 _ => return Build::NotPlain(format!("`{flag}` has no value")),
             },
         }
     }
-    Build::Plain(packages)
+    Build::Plain(built)
 }
 
 /// Whether `step` runs the action `action` or one of its sub-actions (`actions/upload-artifact/merge`).
@@ -362,9 +441,8 @@ fn may_be_assets(name: &str) -> bool {
 }
 
 /// Whether the artifact name `name` matches the download pattern `pattern`, whose only
-/// wildcard is `*` (ignoring ASCII case, as artifact names are).
+/// wildcard is `*`, case-sensitively, as the download action's pattern is.
 fn matches(pattern: &str, name: &str) -> bool {
-    let (pattern, name) = (pattern.to_ascii_lowercase(), name.to_ascii_lowercase());
     let mut parts = pattern.split('*');
     let first = parts.next().unwrap_or_default();
     let Some(mut rest) = name.strip_prefix(first) else {
@@ -384,19 +462,20 @@ fn matches(pattern: &str, name: &str) -> bool {
 }
 
 /// Whether an unconditional download step of `steps` reads the artifact `name`, with `run-id`
-/// `run_id` (none: this run's), by a `pattern:` or a `name:` (not both, and no `artifact-ids:`,
-/// which the action reads first).
+/// `run_id` (none: this run's), by a `pattern:` that matches it or a `name:` that is exactly it
+/// (one lookup, no wildcard), not both, and no `artifact-ids:`, which the action reads first.
 fn downloads(steps: &[Step], name: &str, run_id: Option<&str>) -> bool {
     steps.iter().any(|s| {
-        let by = match (input(s, "pattern"), input(s, "name")) {
-            (Some(p), None) | (None, Some(p)) => Some(p.trim()),
-            _ => None,
+        let reads = match (input(s, "pattern"), input(s, "name")) {
+            (Some(p), None) => matches(p.trim(), name),
+            (None, Some(n)) => n.trim() == name,
+            _ => false,
         };
         is_download(s)
             && !s.conditional
             && input(s, "artifact-ids").is_none()
             && input(s, "run-id") == run_id
-            && by.is_some_and(|p| matches(p, name))
+            && reads
     })
 }
 

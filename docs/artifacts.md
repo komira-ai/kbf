@@ -905,7 +905,8 @@ needs them too.
 
 The lint `crates/kbf-integration-test/tests/seed_build` holds the workflows to this: it
 fails when a seed job is removed, moved to a runner that is not GitHub-hosted, given Buck2,
-a farm address, a remote-execution flag or a cargo build that is not plain, when another
+a farm address, a remote-execution flag or a cargo build that is not plain, or no longer
+builds each binary its platform ships with plain cargo in a step that always runs, when another
 job of the pipeline's run uploads an assets artifact, or when the release's verify and
 publish stop needing the seed jobs.
 
