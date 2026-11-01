@@ -8,7 +8,12 @@ use std::time::Duration;
 use kbf_proto::kbf::enroll::v1::{GetStoreConfigResponse, StoreConfig};
 use tonic::{Code, Status};
 
+use kbf_objstore::s3::fake::FakeS3;
+use kbf_objstore::{ByteRange, ObjectKey, ObjectStore as _};
+use tonic::transport::Endpoint;
+
 use super::{ColdApplyError, ColdPick, Fetch, RegisteredOnly, registration_with};
+use crate::join::{Identity, Joined, Joiner, RETRY_BASE};
 
 fn named(generation: u64) -> GetStoreConfigResponse {
     GetStoreConfigResponse {
@@ -140,4 +145,107 @@ fn the_log_of_a_registered_node_keeps_its_objects_under_the_registered_prefix() 
     assert_eq!(only("farm-a/").prefix_root(), "farm-a/");
     assert_eq!(only("farm-a").prefix_root(), "farm-a/");
     assert_eq!(only("").prefix_root(), "kbf/");
+}
+
+/// Catches a node that exits on a frontend too old to serve the cold store (defect:
+/// `Unimplemented` is fatal as it is for a node that has a store of its own): during a
+/// rolling upgrade the frontend is updated first, so a node can meet one that does not know
+/// `ColdStore` yet, and waiting is what `registered` means. The node waits through two such
+/// answers and takes the store the third names.
+#[tokio::test(start_paused = true)]
+async fn a_frontend_too_old_for_the_cold_store_is_waited_for() {
+    let old = || -> Result<GetStoreConfigResponse, Code> { Err(Code::Unimplemented) };
+    let (counted, mut call) = frontend(vec![old(), old(), Ok(named(5))]);
+    let (generation, config) = registration_with(&mut call, &wait)
+        .await
+        .expect("a store is named once the frontend can say");
+    assert_eq!(generation, 5);
+    assert_eq!(config.bucket, "bkt");
+    assert_eq!(calls(&counted), 3);
+}
+
+/// Pins the refusals that waiting does not change, each ending the wait at the first call:
+/// `PermissionDenied` and `Unauthenticated` (the node's certificate or standing: a later ask
+/// is refused the same way and the operator must act), `InvalidArgument` and
+/// `FailedPrecondition` (a request this build makes wrongly, the same on every try) and
+/// `NotFound` (no such service on a frontend that answers). Only a frontend that is down or
+/// busy, and one too old to know the service, is worth asking again.
+#[tokio::test(start_paused = true)]
+async fn the_refusals_that_waiting_does_not_change_still_end_the_wait() {
+    for code in [
+        Code::PermissionDenied,
+        Code::Unauthenticated,
+        Code::InvalidArgument,
+        Code::FailedPrecondition,
+        Code::NotFound,
+    ] {
+        let (counted, mut call) = frontend(vec![Err(code)]);
+        let refused = registration_with(&mut call, &wait)
+            .await
+            .expect_err("refused");
+        assert_eq!(refused.code(), code);
+        assert_eq!(calls(&counted), 1, "{code:?}");
+    }
+}
+
+const ID: &str = "AKIAOK";
+const SECRET: &str = "right-secret";
+
+/// A registration naming the store of `s3`, with the pair the service takes.
+fn on(s3: &FakeS3) -> GetStoreConfigResponse {
+    let mut answer = named(5);
+    let Some(config) = answer.config.as_mut() else {
+        panic!("named holds a store");
+    };
+    config.endpoint = s3.endpoint().to_owned();
+    ID.clone_into(&mut config.access_key_id);
+    SECRET.clone_into(&mut config.secret_access_key);
+    answer
+}
+
+/// Catches a node that, after waiting out a frontend too old for the cold store, does not
+/// run on the store it was then told (defect: the answer taken but the store not opened on
+/// it): the node asks twice (`Unimplemented`, then a store), probes the registered keys, and
+/// the store it holds takes writes signed with the registered pair, which the service
+/// refuses any other.
+#[tokio::test]
+async fn after_an_old_frontend_the_node_runs_on_the_registered_store() {
+    let s3 = FakeS3::start().await;
+    s3.require_credentials(ID, SECRET);
+    let old = || -> Result<GetStoreConfigResponse, Code> { Err(Code::Unimplemented) };
+    let (_, mut call) = frontend(vec![old(), Ok(on(&s3))]);
+    let (generation, config) = registration_with(&mut call, &|_| Duration::ZERO)
+        .await
+        .expect("a store is named");
+    let only = RegisteredOnly { generation, config };
+    let channel = Endpoint::from_static("http://frontend.invalid:8981").connect_lazy();
+    let who = Identity {
+        instance_id: "node".to_owned(),
+        addr: "192.0.2.1:8982".to_owned(),
+        zone: String::new(),
+        weight: 1,
+    };
+    let joiner = Joiner::new(channel, who, RETRY_BASE);
+    let joined = Joined {
+        member_id: 1,
+        boot: 1,
+        interval: Duration::from_secs(1),
+        generation: 1,
+        objstore_generation: 0,
+    };
+    let (store, applied) = only
+        .registered(&joiner, &joined)
+        .await
+        .expect("opens on the registration");
+    assert_eq!(
+        applied.for_beat(5),
+        (5, kbf_proto::kbf::map::v1::ApplyStatus::Ok)
+    );
+    let key = ObjectKey::new("kbf/cas/after-old".to_owned()).expect("a key");
+    let range = ByteRange::new(0, 1).expect("a range");
+    store
+        .put_new(&key, bytes::Bytes::from_static(b"x"), None)
+        .await
+        .expect("a write signed with the registered pair");
+    store.get_range(&key, range).await.expect("read back");
 }

@@ -44,6 +44,8 @@
 mod certs;
 #[cfg(test)]
 mod cold_key_file_tests;
+#[cfg(test)]
+mod cold_registered_tests;
 mod cpuset;
 mod credential;
 mod env;

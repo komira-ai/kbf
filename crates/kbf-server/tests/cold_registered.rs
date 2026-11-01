@@ -255,15 +255,13 @@ async fn a_registered_node_the_frontend_denies_does_not_start() {
     let Err(error) = started(&node).await else {
         panic!("a node the frontend denied started");
     };
-    let refusal = error
-        .downcast_ref::<ColdApplyError>()
-        .unwrap_or_else(|| panic!("an apply error: {error}"));
+    assert!(error.is::<ColdApplyError>(), "an apply error: {error}");
+    let said = error.to_string();
+    assert!(said.contains("PermissionDenied"), "{said}");
+    assert!(said.contains("registered"), "{said}");
     assert!(
-        matches!(
-            refusal,
-            ColdApplyError::Refused(tonic::Code::PermissionDenied)
-        ),
-        "{refusal:?}"
+        !said.contains("key pair of its own"),
+        "a registered node has no key pair to be told it lacks: {said}"
     );
     assert_eq!(class(&*error), StartFailure::Refused);
     assert!(rig.s3.requests().is_empty());
@@ -362,4 +360,92 @@ fn registered_is_not_a_history_store() {
     assert!(said.contains("--history-objects"), "{said}");
     assert!(said.contains("registered"), "{said}");
     assert!(!matches!(refused, HistoryError::NeedsStateStore), "{said}");
+}
+
+/// A registration naming `prefix` on `s3`.
+fn with_prefix(s3: &FakeS3, prefix: &str) -> kbf_proto::kbf::enroll::v1::StoreConfig {
+    let mut config = registered(s3, "bkt", ID, SECRET);
+    prefix.clone_into(&mut config.prefix);
+    config
+}
+
+/// Pins the registered prefix as the one the node runs under (defect: the default `kbf/` used
+/// for the log or the probe): the registration names `farm-a/`, the probe and every object
+/// the node writes are under it, and nothing is under `kbf/`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_registered_prefix_is_the_prefix_the_node_runs_under() {
+    let rig = rig(3, |s3| with_prefix(s3, "farm-a/")).await;
+    let half = started(&flags(&rig, "own-prefix", REGISTERED, no_keys))
+        .await
+        .expect("starts on the registration");
+    round_trip(&half, "written under the registered prefix").await;
+    let _serving = tokio::spawn(half.serve());
+    let written = spin_until(|| {
+        let keys = rig.s3.keys();
+        keys.iter()
+            .any(|k| k.starts_with("farm-a/"))
+            .then_some(keys)
+    })
+    .await;
+    assert!(
+        written.iter().all(|k| k.starts_with("farm-a/")),
+        "{written:?}"
+    );
+    let probes: Vec<String> = rig
+        .s3
+        .requests()
+        .into_iter()
+        .filter(|r| r.contains(".kbf-probe"))
+        .collect();
+    assert_eq!(probes.len(), 3, "{probes:?}");
+    assert!(probes.iter().all(|r| r.contains("/bkt/farm-a/.kbf-probe/")));
+}
+
+/// Catches a restart under another prefix than the log was made with taking effect (defect:
+/// the log opened under whatever the registration names now), which would write objects
+/// where the index does not look: the node ran under `farm-a/`; the registration then names
+/// `farm-b/`; the next start is refused (exit 2) with a message that says the prefix changed
+/// and what to do about it, and nothing was written under `farm-b/`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_registration_that_changes_the_prefix_is_refused_at_the_next_start() {
+    let rig = rig(3, |s3| with_prefix(s3, "farm-a/")).await;
+    let (d, port) = (dir("prefix-change"), next_port());
+    let first = started(&flags_at(&rig, (d.clone(), port), REGISTERED, no_keys))
+        .await
+        .expect("starts under farm-a/");
+    round_trip(&first, "written under farm-a/").await;
+    let serving = tokio::spawn(first.serve());
+    reported_at(&rig, 3).await;
+    serving.abort();
+    let _ = serving.await;
+
+    rig.source.serve(with_prefix(&rig.s3, "farm-b/"));
+    rig.source.set(4);
+    let Err(error) = started(&flags_at(&rig, (d, port), REGISTERED, no_keys)).await else {
+        panic!("a node started under a prefix its log was not made with");
+    };
+    let said = error.to_string();
+    assert!(said.contains("prefix"), "{said}");
+    assert!(said.contains("farm-a/"), "{said}");
+    assert!(said.contains("farm-b/"), "{said}");
+    assert!(said.contains("--meta-dir"), "{said}");
+    assert_eq!(class(&*error), StartFailure::Refused, "{said}");
+    let keys = rig.s3.keys();
+    assert!(keys.iter().all(|k| !k.starts_with("farm-b/")), "{keys:?}");
+}
+
+/// Pins `registered` refused as a hot store (the hot tier is a local directory; the word names
+/// the cold store only): the start is refused, exit 2, naming the flag.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn registered_is_not_a_hot_store() {
+    let rig = rig(3, |s3| registered(s3, "bkt", ID, SECRET)).await;
+    let mut node = flags(&rig, "hot-registered", REGISTERED, no_keys);
+    node.server.hot_store = Some(kbf_server::stores::StoreUri::Registered);
+    let Err(error) = started(&node).await else {
+        panic!("a node started with registered as its hot store");
+    };
+    let said = error.to_string();
+    assert!(said.contains("--hot-store"), "{said}");
+    assert_eq!(class(&*error), StartFailure::Refused, "{said}");
+    assert_eq!(rig.source.asked(), 0);
 }

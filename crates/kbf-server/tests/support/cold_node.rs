@@ -161,15 +161,22 @@ pub async fn started(flags: &StorageFlags) -> Result<StorageHalf, Box<dyn Error>
     start(flags, never).await
 }
 
-/// Yields until `probe` finds something: no sleep and no limit, so a wait that never ends is
-/// the test run's to cut, and a slow machine is never a failure.
+/// The most turns [`spin_until`] takes. A turn is one yield, microseconds, so this is far
+/// more than any wait here needs (the longest is a retry pause of about a second), and a wait
+/// that never ends fails the test in a bounded number of turns instead of hanging to the
+/// job's limit. It is a count, not a time.
+pub const SPIN_TURNS: u64 = 200_000_000;
+
+/// Yields until `probe` finds something, at most [`SPIN_TURNS`] times: no sleep, and no
+/// clock.
 pub async fn spin_until<T>(mut probe: impl FnMut() -> Option<T>) -> T {
-    loop {
+    for _ in 0..SPIN_TURNS {
         if let Some(found) = probe() {
             return found;
         }
         tokio::task::yield_now().await;
     }
+    panic!("what the test waits for did not happen in {SPIN_TURNS} turns");
 }
 
 pub async fn until<T>(what: &str, mut probe: impl FnMut() -> Option<T>) -> T {
