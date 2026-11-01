@@ -1,6 +1,6 @@
 # Starvation of a large booking by small actions: who owns the rule
 
-Status: DESIGN, for review. Nothing here is built. Issue: komira-ai/kbf#169. Revised to the whole-node ruling: reserve the host with the least tail. Amended: the lease server's live reservation engine is `js-registry`, not `js-sched` (2.4); where the rule is placed is an open choice (3.2).
+Status: DESIGN, for review. Nothing here is built. Issue: komira-ai/kbf#169. Revised to the whole-node ruling: reserve the host with the least tail. Amended: the lease server's live reservation engine is `js-registry`, not `js-sched` (2.4); where the rule is placed is decided: Path S, approved 2026-11-01 (3.2).
 
 Each claim is marked **[code]** (read from the named file and function, at the kbf
 `main` and at the jobscheduler commit pinned below), **[doc]** (stated by a comment or
@@ -222,10 +222,10 @@ it once its leases end: a `WholeMachine` lease, an `owns_worker` action, or a
 5. **No timer.** No `head_hold_after`, no `blocked_since`, no fixed hold, and no give-up
    deadline for this hold.
 
-### 3.2 Owner: where the rule lives is an open choice
+### 3.2 Owner: Decision: Path S (approved 2026-11-01)
 
-What is common to both choices (and is the first step, 3.6): **the tail rule is written
-once, in `js_whole::cost`**, as pure functions, and both engines' ranking reads it.
+What is common to every path (and is the first step, 3.6): **the tail rule is written
+once, in `js_whole::cost`**, as pure functions, and the engines' ranking reads it.
 
 The shape below is the first implementation step as built (jobscheduler PR #597, head
 `6b7ba4641c65ff4ebd20d26aa922066b2317045b`; line numbers are `crates/js-whole/src/cost.rs` there).
@@ -251,38 +251,35 @@ The shape below is the first implementation step as built (jobscheduler PR #597,
   (the doc comment at `cost.rs:81-82`): work admitted later cannot extend it. The mark stores
   `tail_end` (the tail-record item, 3.6).
 
-Who calls it, and who feeds the estimates, is open: the maintainers decide; this note takes no side. Neither choice changes the rule.
+**Decision: Path S (approved 2026-11-01).** `js-sched` becomes the lease server's
+placement engine; `js-registry` stays the registry of hosts. Concretely:
 
-- **Path R (rule in `js-whole`, the registry is the live engine).** The tail is read
-  by `js-registry`'s `reserve.rs` (the pick at `:403`) and `reserve::may_start`
-  (`:245`), whose refuse-every-start arm for a marked host is replaced by
-  `fits_in_tail`. The lease server feeds estimates from its `ProfileStore` (2.4) into
-  `HostFacts`, behind a flag. `js-sched` is the second user of the same function
-  (`drain_order`, `whole.rs:286`). One implementation of the rule, no second shell,
-  no mirrored state. **What R gives the farm is the ranking only** (steps 1 and 2): the backfill gate is
-  optional and does nothing on the current pool shape (4.14). **Under R, kbf#169 is not fixed until the
-  `js-sched` step (step 5)**, because the 24-of-32-core action places through the embedded core. The flag defaults off, so
-  the lease server's behaviour does not change until it is flipped. The cost: the registry keeps its sticky mark, deadline and give-up
-  (`reserve.rs`) until its own change; one lease per host means a draining registry host has
-  no room to backfill into (4.14); and `js-sched` keeps three picks (3.4) for the
-  ordinary large request, which `js-whole` does not cover (3.1).
-- **Path S (`js-sched` becomes the lease server's placement engine).** Wire up
-  `crates/js-lease-server/src/sched/map.rs` so the server builds a `Scheduler` and places
-  runs through it, which makes `js-sched` place ordinary runs too, and the whole rule
-  of 3.1 to 3.4 (start time for a partial request, backfill in `fit`, one hold per
-  pool) applies to the farm as written. The cost: a placement shell, a rewrite of the
-  registry's start and wait path onto `Scheduler`, a change of booking model (the registry books
-  each host as one whole shape with at most one lease, `start.rs:44-47`; `Scheduler` workers hold
-  many), and two persistence and hosts-API contracts (D55, `drain_deadline_ms`) moving at once. It is a larger,
-  separate decision than starvation.
-- **What weighs on the choice.** R reaches the reservation the lease server runs today with one
-  new function and no new deployment shape. S puts one placement engine behind both the lease
-  server and the embedded core, so the rule (and ordinary-run placement) has one home, at the
-  cost of the booking-model change above. This note takes no side.
+- The lease server drives `js-sched` for placement. It wires up
+  `crates/js-lease-server/src/sched/map.rs`, which is unused today (2.4): the server builds a
+  `Scheduler` and places runs through it, so `js-sched` places ordinary runs and the whole
+  rule of 3.1 to 3.4 (start time for a partial request, backfill in `fit`, one hold per pool)
+  applies to the farm as written.
+- `js-registry` stays the host registry (hosts, their facts, claim and regain handling,
+  the D55 record and the hosts API). Its whole-node reservation (`whole/reserve.rs`) and
+  its start and wait path are replaced by the `Scheduler` (3.6, steps 5 to 11).
+- The booking model changes: the registry books each host as one whole shape with at most one
+  lease (`start.rs:44-47`); `Scheduler` workers hold many leases.
+- The costs, each a step in 3.6: the booking-model change (step 5), the placement shell that
+  consumes `map.rs` (step 6), the flag (steps 6 and 12), and moving the registry's start and wait
+  path onto `Scheduler` while the D55 and `drain_deadline_ms` contracts hold (step 11).
+
+**Path R, the considered alternative, not chosen.** Path R kept the rule in `js-whole` with
+`js-registry` as the live engine: the registry's pick (`reserve.rs:403`) and start gate
+(`reserve::may_start`, `:245`) would read the tail, with estimates fed from the `ProfileStore`
+behind a flag, and `js-sched` as a second user. It was not chosen for three reasons from this
+note: R gives the farm the ranking only (the backfill gate is vacuous on the registry's
+one-lease-per-host booking, 4.14); kbf#169 is not fixed under R until the `js-sched` change
+anyway, because the 24-of-32-core action places through the embedded core (2.1); and the
+embedded core's #169 case needs `js-sched` under either path, so R leaves two placement
+engines with two reservation rules, where S leaves one.
 
 kbf owns only the flag default, the both-core test, and the wiring of kbf step 0 (passing the
-submission's `max_wall` to the js core). No kbf scheduling code, under either path.
-
+submission's `max_wall` to the js core). No kbf scheduling code.
 ### 3.3 Limits, accepted and tested
 
 - **Work ahead in queue order.** `reserved` is built during the queue walk and is empty at
@@ -307,8 +304,8 @@ submission's `max_wall` to the js core). No kbf scheduling code, under either pa
 
 ### 3.4 Mapping onto the code that exists
 
-The bullets below describe `js-sched` (the embedded scheduler; under Path R its second
-user, under Path S the farm's engine). The `js-whole` and `js-registry` parts are in 3.2
+The bullets below describe `js-sched` (the embedded scheduler, and under Path S the farm's
+placement engine). The `js-whole` and `js-registry` parts are in 3.2
 and 3.6.
 
 - **Which worker.** One pick for the three kinds, from `drain_cost`'s order generalised
@@ -448,76 +445,107 @@ how long the curve is charged is not read; the js-sched step reads it first.
    decisions in jobscheduler `docs/design/whole-node.md`) are unchanged: nothing is written or
    exported by this step. Neither engine reads the new field yet, but both call sites are
    edited. The weaker overdue rule (3.3) and the `ceiling` handling arrive with the step that passes real
-   values (step 2 for the registry, the `js-sched` step for the embedded core), tied to tests (g)
+   values (step 7 for the lease server's feed, step 9 for the embedded core), tied to tests (g)
    and (d); `ceiling` handling is the caller's.
 
-**The steps after this depend on the choice of path (3.2), which the maintainers make.**
+**Steps after the first are Path S (3.2).** Every step is **[proposed]**. Each names its
+repo, what it changes, the test that proves it (written first, red before the change), and
+what it depends on. Test letters are those of 3.7.
 
-*If Path R:*
-
-2. **The lease server feeds estimates, behind a flag.** From `NodeUsage`'s `ProfileStore`
-   (2.4) into `HostFacts.load` in `Registry::host_facts` (`start.rs:24`), the declared
-   bound as the fallback; flag off keeps today's pick, and passes no estimates (as step 1). A lease's estimate is its
-   start plus the largest `wall_minutes_p90` of its keyed runs (2.4); it is unknown until a keyed
-   run exists, so a host record keeps a started-at beside `bound` [proposed]. With the flag on the estimates and the backfill `margin` are passed. Red first: A has the longer max wall
-   and the shorter estimated tail, and the mark must land on A.
-3. **The backfill gate (optional; only if a pool shape books several leases per host).**
-   `reserve::may_start` (`reserve.rs:245`) replaces the arm `(Some(_), _, _) | (None, true, Some(_)) => false`
-   (`reserve.rs:253`), which also refuses an unmarked whole-node start that names a request, so the
-   replacement keeps that case refused and changes only the marked-host case, with `fits_in_tail`, behind the
-   same flag. On today's one-lease-per-host pool it does nothing (4.14), so it is not built until a
-   multi-lease pool shape exists.
-4. **Flip the flag.**
-5. **`js-sched`, the second user** (jobscheduler#582): `drain_order` reads the same
-   `tail()`, with kbf steps 0 and 1 below as its prerequisites. Its three picks, `Blocked::Load` start
-   time and the rest of 3.4 are this step.
-
-*If Path S:* the placement shell (`sched/map.rs`) comes next, then 5 as the farm's rule and
-the registry's start and wait path moves onto it; 2 to 4 are not built.
-
-*kbf, either path:*
-
-- **kbf step 0: carry and enforce `max_wall` on the js core.** kbf passes the
-  submission's `max_wall` in `SubmitOptions` (js-server-core already applies it), fixes the
-  stale `hot.rs` comment, and a lease past its wall is ended by the action timeout. Test
-  (red today): a js-core job whose `max_wall` passes is ended and its worker's tail ends
-  with it. Backfill on the js core is not enabled before this. The lease-server path already enforces its bound in
-  js-lease (3.5) and needs no kbf step 0.
-- **kbf step 1: make load placement the only mode, then observe.**
-  - flip `--placement-load` to `on` (`crates/kbf-server/src/config.rs`);
-  - add the both-core #169 test through `Farm` (`SchedulerCore::Legacy` and `Js`, default
-    flags): 60 small actions, then two booking 24 CPUs / 24 GiB, then 200 small and six
-    booking 4 CPUs / 40 GiB on 32- and 28-core workers; assert every large action starts
-    before the small queue is empty. Red today under the `off` default;
-  - then remove `off`; this is plumbing through about thirty files, not a literal swap:
-    `crates/kbf-server/src/farm.rs:272`, `farm.rs:358`,
-    `farm/driver.rs:192` and `:94`, `crates/kbf-estimator-replay/src/replay/sim.rs:186`,
-    `crates/kbf-server/src/farm/js/tests.rs:95,128`, and the daemon, integration and
-    placement fixtures that pass `PlacementLoad::Off`.
-- **kbf: bump the js revision** after the js-sched step. The both-core test stays green.
-- **Remove the give-up** in an engine (the hold deadline, back-off and attempt count, and
-  `drain_after_ms` as a wait), only after the enforced bound (M1), the re-pick (M2) and
-  the overdue case (4.4) are green in that engine: the give-up was also the escape from a
-  wrong pick. Compatibility in 4.11. The registry's give-up stays in this work (4.12).
-- **Record the tail at mark time** (small, any path, after step 1): the mark stores `DrainCost.tail_end` (added in step 1)
-   with the estimated end that produced it, and the request's later start, so the wait versus the
-   tail estimate, the backfill share and the estimate error (section 5) can be computed. Nothing records these
-   today (2.4).
-- **Follow-on, not in this note:** persisting the registry's marks as an additive lease-file record.
+2. **[proposed] kbf: carry and enforce `max_wall` on the js core (kbf step 0).** kbf passes
+   the submission's `max_wall` in `SubmitOptions` (js-server-core already applies it), fixes
+   the stale `hot.rs` comment, and a lease past its wall is ended by the action timeout.
+   Test (red today): a js-core job whose `max_wall` passes is ended and its worker's tail ends
+   with it. Depends on: nothing. Backfill on the js core is not enabled before this. The
+   lease-server path already enforces its bound in js-lease (3.5) and needs no such step.
+3. **[proposed] kbf: make load placement the only mode (kbf step 1).** Flip `--placement-load`
+   to `on` (`crates/kbf-server/src/config.rs`), add the both-core #169 test through `Farm`
+   (`SchedulerCore::Legacy` and `Js`, default flags): 60 small actions, then two booking 24 CPUs /
+   24 GiB, then 200 small and six booking 4 CPUs / 40 GiB on 32- and 28-core workers; assert
+   every large action starts before the small queue is empty. Red under the `off` default
+   **[verify]** whether it is already green under `on` (nobody has run it, 2.2); then remove
+   `off`, which is plumbing through about thirty files (`farm.rs:272`, `farm.rs:358`,
+   `farm/driver.rs:192` and `:94`, `crates/kbf-estimator-replay/src/replay/sim.rs:186`,
+   `crates/kbf-server/src/farm/js/tests.rs:95,128`, and the fixtures that pass
+   `PlacementLoad::Off`). Depends on: nothing.
+4. **[proposed] jobscheduler: `js-sched` takes the tail rule and one pick** (jobscheduler#582).
+   `drain_order` reads `tail()`; the three picks (`hold_whole`, `Servable::reserve`,
+   `hold_for_head`) become one, by least tail, with the start time of a partial request
+   read against `Servable::admitted` (3.1, 3.4); `drain_order` stops requiring whole-node
+   settings; the pick is non-sticky and keeps `made`; ordinary large actions stay in
+   `head_holds`, one per pool. Tests, red first: (a) two workers, short and long tail, the
+   request reserves the short one; (b) the #169 start time is when 24 cores free up; (h), (m),
+   (i), (n), (o), (q), (r). Depends on: step 1.
+5. **[proposed] jobscheduler: the booking model, one shape with at most one lease becomes many
+   leases per host.** The registry's booked table (`state.book.booked()`, `start.rs:25`) and
+   `host_facts` (`start.rs:44-47`) stop assuming one lease per host, so a host maps to a
+   `Scheduler` worker with many leases through `sched/map.rs`. Tests, red first: a host with
+   room starts a second lease (refused today); the hosts-API and D55 goldens are unchanged;
+   **[verify]** by reading `book.start_where` what else assumes one lease. Depends on: step 4.
+6. **[proposed] jobscheduler: the placement wiring.** The lease server drives `js-sched` for
+   placement through `crates/js-lease-server/src/sched/map.rs`: it builds a `Scheduler` from
+   the registry's hosts and places runs through it, behind a flag that defaults off; flag off
+   keeps the registry's path. Tests, red first: with the flag on a run is placed by
+   `Scheduler` (today nothing in the server calls `sched/map.rs`); the #169 shape (a
+   24-of-32-core request among small ones) holds a worker and starts through the lease
+   server; flag off is byte-identical to today. Depends on: steps 4, 5.
+7. **[proposed] jobscheduler: the estimate feed, behind a flag; runs in parallel with step 6.**
+   A lease record gets a started-at beside `bound`; a lease's estimate is its start plus the
+   largest `wall_minutes_p90` of its keyed runs from `NodeUsage`'s `ProfileStore` (2.4), unknown
+   until a keyed run exists, the declared bound as the fallback. Flag off passes no estimates,
+   as step 1. Tests, red first: the record round-trips started-at; A has the longer max wall
+   and the shorter estimated tail, and with the flag on the mark lands on A; a lease with no
+   keyed run is unknown. Depends on: steps 1, 5.
+8. **[proposed] jobscheduler: the evaluation counters; runs in parallel with step 6.** The mark
+   stores `DrainCost.tail_end` with the estimated end that produced it and the request's later
+   start; the scheduler counts backfill share and estimate error (3.8, section 5). Test, red
+   first: (l) a request that starts and one that is cancelled each emit one record with the
+   estimated start and backfilled core-seconds (a move only increments its counter). Depends
+   on: steps 1, 4.
+9. **[proposed] jobscheduler: the `fits_in_tail` backfill gate where `js-sched` places work on
+   a marked host.** A later operation is placed on the reserved worker only if `fits_in_tail`;
+   the start time is carried from the pick into `Servable::fit`; `bounds_enforced` is one
+   per-core setting and `ceiling` is new configuration (3.5). With multi-lease hosts (step 5)
+   behind the lease server (step 6) the gate bites, which it does not on the registry's
+   one-lease booking (4.14). Tests, red first: (c) a job ending inside the tail backfills, one
+   ending after does not, and the large job starts at the original time; (d), (e), (f), (g),
+   (p) overdue, (s) `bounds_enforced` unset means no backfill. **[verify]** first that
+   `Profile::timed`'s `life` is the P90 (3.5). Depends on: steps 2, 4, 6; and step 7 for learned
+   estimates (the declared bound alone works without it).
+10. **[proposed] kbf: bump the js revision** to the step 9 commit. Test: the both-core test of
+    step 3 stays green, and the js-core `max_wall` test of step 2 enables backfill there.
+    Depends on: steps 2, 3, 9.
+11. **[proposed] jobscheduler: move the registry's start and wait path onto `Scheduler`.**
+    `whole/reserve.rs`, `whole/queue.rs`, `whole/requests.rs` and `reserve::may_start` are
+    replaced by the `Scheduler`'s holds; `js-registry` keeps the host table, claim/regain
+    and the D55 record. Tests: the registry's whole-node tests are ported to the `Scheduler`
+    and must still pass; the D55 and `drain_deadline_ms` goldens are unchanged (4.11).
+    **[verify]** what `drain_deadline_ms` reports once the registry has no timer (4.12).
+    Depends on: steps 6, 9, and a canary on the flag.
+12. **[proposed] jobscheduler: flip the flag** to on, once the canary shows (section 5) wait
+    versus tail estimate and no regression. Test: the step 6 tests with the default flipped.
+    Depends on: steps 8, 11.
+13. **[proposed] jobscheduler: remove the give-up** (the hold deadline, back-off, attempt
+    count, and `drain_after_ms` as a wait) from the one engine, after the enforced bound (step 2),
+    the re-pick (step 4) and the overdue case (4.4) are green. Tests: (j) a presented request is
+    never given up, (k) the old flags are accepted and inert, (t) the hosts view and `whole_mark`
+    metric still read `deadline` (4.11). Depends on: steps 2, 4, 9, 11.
+- **Follow-on, not in this note:** persisting the scheduler's marks as an additive lease-file
+  record.
 
 ### 3.7 Tests, written first [proposed]
 
 The lettered tests are the 22-item plan of jobscheduler#582 (the 20 below plus kbf steps 0 and 1);
-the letters and the numbering are unchanged. Under Path R some of them live below
-`js-sched` instead, and the list says so in this table; the rest stay in `js-sched`
-(`crates/js-sched/tests`).
+the letters and the numbering are unchanged. Some of them are unit tests below
+`js-sched`, in `js-whole`, and the table says so; the rest live in `js-sched`
+(`crates/js-sched/tests`), and a few once more through the lease server.
 
 | tests | live in |
 |---|---|
-| (a) pick by least tail, (d) the unknown half (`a_host_with_an_unknown_lease_ranks_after_every_known_tail`, `cost.rs:341`), (g) and (p) the fits-in-tail half, (c) the backfill predicate | unit tests in `crates/js-whole/src/cost.rs`, on `tail()`, `drain_cost`, `fits_in_tail`; (a) and (g) also once through `js-registry` `reserve.rs` (the A/B red test of step 2) |
+| (a) pick by least tail, (d) the unknown half (`a_host_with_an_unknown_lease_ranks_after_every_known_tail`, `cost.rs:341`), (g) and (p) the fits-in-tail half, (c) the backfill predicate | unit tests in `crates/js-whole/src/cost.rs`, on `tail()`, `drain_cost`, `fits_in_tail`; (a) and (g) also once through the lease server (the A/B red test of step 7) |
 | (d) the ceiling half: a bound over `ceiling` is treated as no bound | the caller's tests (lease server, `js-sched`); `tail()` takes no ceiling (3.5) |
-| (c) a started backfill, (s) `bounds_enforced` | `js-registry` for the gate (step 3, 4.14); `js-sched` for the embedded core |
-| (h) moves keep `made`, (m) cap at `max_draining = 1`, (j)-(k) give-up and compatibility | `js-sched` (`Drain`, `hold_whole`). The registry is sticky and keeps its own tests (4.12) |
+| (c) a started backfill, (s) `bounds_enforced` | `js-sched` (step 9); once more through the lease server after the wiring (step 6) |
+| (h) moves keep `made`, (m) cap at `max_draining = 1`, (j)-(k) give-up and compatibility | `js-sched` (`Drain`, `hold_whole`). The registry's whole-node tests are ported with step 11 (4.12) |
 | (b), (e), (f), (i), (l), (n), (o), (q), (r), (t) | `js-sched` only: partial request, queue order, QoS, whole-node caps, ordinary large actions, recording |
 | kbf step 0 and step 1 | kbf |
 
@@ -578,14 +606,14 @@ unchanged beyond 4.11); both engines keep their marks in memory only (2.4).
 
 1. **Load placement is the only mode (decided).** kbf's `--placement-load` defaults to
    `on` and the `off` path is removed; the CPU slack stays a setting (default 1.1x).
-2. **One pick rule: the least tail (decided for js-sched; for the registry, per 4.12).** It is written once in `js_whole::cost`
-   (3.2) and replaces the upper-bound rank of `drain_cost` in both engines, the
+2. **One pick rule: the least tail (decided).** It is written once in `js_whole::cost`
+   (3.2) and replaces the upper-bound rank of `drain_cost`, the
    binding-ratio pick of `hold_for_head` and the fewest-leases pick of `Servable::reserve`. The earlier
    recommendation to hold by load ratio is withdrawn.
 3. **No aging across QoS (recommended, accepted limit).** A lower-QoS large request can
    wait as long as a higher-QoS stream lasts; aging would turn QoS from a priority into a
    weight. Tested by 3.7(f).
-4. **No hold timer (decided for js-sched, conditional on M1, M2 and M4; for the registry, per 4.12: it keeps `keep_or_move`, its deadline and its give-up).** `head_hold_after`,
+4. **No hold timer (decided, conditional on M1, M2 and M4).** `head_hold_after`,
    `blocked_since` and the wait before a hold are not built. The give-up of a presented
    request (`deadline`, the back-off, `max_reserve_attempts`, `drain_after_ms`) is
    removed in the give-up removal step (3.6), after the enforced `max_wall` (kbf step 0), the non-sticky re-pick
@@ -624,7 +652,7 @@ unchanged beyond 4.11); both engines keep their marks in memory only (2.4).
       `claim_by` in the registry, which exists today and is independent of `deadline`;
       nothing else expires by `deadline`.
     - The registry keeps its `deadline` field in the D55 record, the hosts API
-      `drain_deadline_ms` (with its golden) and its own timer (4.12), so D55, the wire
+      `drain_deadline_ms` (with its golden) and its own timer until step 11 (4.12), so D55, the wire
       and the golden do not change in this work.
     - `WholeMark.deadline` is a public field and a view column (`whole_view.rs`, read by
       kbf's `whole_mark` metric and `docs/api.md`). It is kept, always absent after the give-up
@@ -632,29 +660,22 @@ unchanged beyond 4.11); both engines keep their marks in memory only (2.4).
       change.
     - Docs amended with the give-up removal: `whole-node.md` and `configuration.md` where they describe
       the embedded scheduler's give-up; W6/W14 are about the registry and stay.
-12. **The registry keeps its sticky mark, deadline and give-up in this work (recommended).**
-    `crates/js-registry/src/whole/reserve.rs` has its own marks, `keep_or_move`
-    (`:351`), caps and give-up, and the D55 record, the hosts API field and the
-    claim/regain handling live there. Under Path R it takes the *tail rule* (the ranking
-    and the backfill test) by calling `js_whole::cost`; it does not take the removal of
-    its timer, which carries the persistence and wire changes this work should not.
-    This replaces the earlier plan of a separate registry issue after `js-sched`, and the earlier
-    "deployment split" reading: the farm's lease server runs `js-registry` and not `js-sched`
-    (2.4), so a rule that lives only in `js-sched` reaches the embedded kbf core alone. **[proposed]**
-    Whether the registry's timer then conflicts with "no hold timer" (rule 5) is a question for
-    the maintainers: the rule applies to the pick and the backfill now, and to the timer when
-    the registry's own change removes it.
+12. **The registry stays the host registry; its whole-node reservation moves into `js-sched` (decided with Path S).**
+    `crates/js-registry/src/whole/reserve.rs` has its own marks, `keep_or_move` (`:351`),
+    caps and give-up. Under Path S step 11 replaces them with the `Scheduler`'s holds, so
+    the tail rule, the backfill test and the removal of the give-up (step 13) apply in one engine.
+    The registry keeps the host table, claim/regain handling, the D55 record and the hosts
+    API field (4.11). **Open [verify]:** what `drain_deadline_ms` and the D55 `deadline` carry once
+    the registry has no timer; the answer must leave the goldens unchanged (step 11 reads the
+    code first). Persisting the scheduler's marks stays follow-on work.
 13. **Metrics are recorded, not inferred (recommended).** 3.8.
-14. **Backfill on the registry is nearly vacuous today (verify before the backfill gate, step 3).** A registry
+14. **Backfill on the registry is vacuous today; under Path S it bites (decided; verify the booking first).** A registry
     host holds one booked lease (2.4), so a marked host that is draining has no room for
     another start, and a marked host that is quiet has tail zero, where `fits_in_tail` is
-    false for any candidate of positive length. Step 3 therefore changes the registry's
-    behaviour only where a pool books several leases per host, or where the arm is reached
-    with a zero-length candidate. **[verify]** by reading the booking in `book.start_where`
-    and by a test; if it holds, step 3 is the gate for a future shape and the value of
-    Path R on the registry is the ranking (steps 1 and 2 of 3.6), and the backfill share (section 5) is measured on
-    `js-sched`. Say so in the PR rather than count a number the gate cannot move.
-15. **Where the rule is placed: Path R or Path S (open; the maintainers decide).** 3.2.
+    false for any candidate of positive length. With the booking model changed to many leases per
+    host (step 5) and `js-sched` placing (step 6), the gate of step 9 bites. **[verify]** by
+    reading the booking in `book.start_where` and by the step 5 test.
+15. **Where the rule is placed: Path S (decided, approved 2026-11-01).** 3.2.
 
 ## 5. What it measures (for the evaluation)
 
