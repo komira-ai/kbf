@@ -734,6 +734,11 @@ fn an_answer_with_halts_is_read() {
         (0..18).map(|n| (format!("s{n}"), 1)).collect();
     let over = serde_json::json!({"reply": "nothing", "halts": many}).to_string();
     assert!(serde_json::from_str::<crate::wire::Answer>(&over).is_err());
+    let at: std::collections::BTreeMap<String, u64> =
+        (0..17).map(|n| (format!("s{n}"), 1)).collect();
+    let at = serde_json::json!({"reply": "nothing", "halts": at}).to_string();
+    let read: crate::wire::Answer = serde_json::from_str(&at).expect("17 entries are read");
+    assert_eq!(read.halts.len(), 17);
 }
 
 /// Catches: a hold lifted by a reply that carries `halts` and no newer generation: the
@@ -861,7 +866,7 @@ fn halts_on_disk_round_trip_and_bad_files_are_errors() {
     let rig = Rig::new("hold-halt-bad-file");
     std::fs::write(rig.dir.join("halt-kbf"), "not json").unwrap();
     let _agent = rig.announcing();
-    assert!(rig.logged("a halt on disk is ignored"));
+    assert!(rig.logged("halt record unreadable"));
 }
 
 /// Catches: a halt whose file the directory does not take being lost silently, or taken as not
@@ -916,4 +921,94 @@ fn a_corrupt_halt_file_keeps_the_hold_until_a_newer_generation() {
     agent.beat_once();
     rig.take_order(&agent);
     assert_eq!(rig.installs(), 1, "a clear lifts it");
+}
+
+/// An agent that halts on a rollback it cannot do, with `during` run in the middle of the
+/// update (the helper's switch), the way a heartbeat on the other thread would run.
+fn halting_with(rig: &Rig, during: impl Fn(&Agent) + Send + Sync + 'static) -> Arc<Agent> {
+    use std::sync::OnceLock;
+    rig.coordinator.advertise(&["halt-v1"]);
+    rig.coordinator.set_halts(&[("kbf", 3)]);
+    rig.cannot_go_back();
+    let cell: Arc<OnceLock<Arc<Agent>>> = Arc::default();
+    let hook_cell = Arc::clone(&cell);
+    rig.local.world().on_switch = Some(Arc::new(move || {
+        if let Some(agent) = hook_cell.get() {
+            during(agent);
+        }
+    }));
+    let agent = Arc::new(rig.announcing());
+    cell.set(Arc::clone(&agent)).ok().unwrap();
+    rig.take_order(&agent);
+    assert_eq!(rig.installs(), 1);
+    agent
+}
+
+/// Catches: a halt recorded under a generation that a reply brought while the update ran. The
+/// operator cleared (generation 4) after the halt report went out and before the agent
+/// recorded the halt; the hold must be under 3, the generation of the last reply before the
+/// update, so that reply (4) lifts it and the agent is not stuck until another clear.
+#[test]
+fn a_halt_is_held_under_the_generation_from_before_the_update() {
+    let rig = Rig::new("hold-halts-race");
+    let c = rig.coordinator.clone();
+    let agent = halting_with(&rig, move |agent| {
+        c.set_halts(&[("kbf", 4)]);
+        agent.beat_once();
+    });
+    agent.beat_once();
+    rig.clock.advance(Duration::from_secs(RETRY));
+    rig.take_order(&agent);
+    assert_eq!(rig.installs(), 2, "the clear lifted the hold");
+}
+
+/// Catches: the generations overwritten by a reply that does not advertise `halt-v1` (its
+/// `halts` is empty, so every generation reads 0). With `halt-v1` withdrawn during the update
+/// and the halt recorded then, the hold must stay when `halt-v1` returns with the old
+/// generation, and a newer one lifts it.
+#[test]
+fn halt_v1_withdrawn_does_not_reset_the_generations() {
+    let rig = Rig::new("hold-halts-withdrawn");
+    let c = rig.coordinator.clone();
+    let agent = halting_with(&rig, move |agent| {
+        c.advertise(&["deferred-v1"]);
+        c.set_halts(&[]);
+        agent.beat_once();
+    });
+    rig.coordinator.advertise(&["halt-v1"]);
+    rig.coordinator.set_halts(&[("kbf", 3)]);
+    agent.beat_once();
+    rig.clock.advance(Duration::from_secs(RETRY));
+    rig.take_order(&agent);
+    assert_eq!(rig.installs(), 1, "the old generation does not lift");
+    rig.coordinator.set_halts(&[("kbf", 4)]);
+    agent.beat_once();
+    rig.take_order(&agent);
+    assert_eq!(rig.installs(), 2);
+}
+
+/// Catches: a state file followed through a link: a link planted at `defer-<unit>` is no
+/// deferral, and a link planted at the temp name is not written through (a stale temp is
+/// replaced, never trusted).
+#[test]
+fn state_files_are_not_followed_through_links() {
+    use std::os::unix::fs::symlink;
+    let dir = scratch("hold-links");
+    let marks = Marks::new(&dir);
+    let real = dir.join("real");
+    let deferral = Deferral {
+        target: version(VB),
+        reason: token("drain_bound"),
+        retry_after_unix: 5,
+    };
+    std::fs::write(&real, serde_json::to_vec(&deferral).unwrap()).unwrap();
+    symlink(&real, dir.join("defer-kbf")).unwrap();
+    assert!(marks.load("kbf").is_err(), "a link is no deferral");
+    std::fs::remove_file(dir.join("defer-kbf")).unwrap();
+
+    std::fs::write(&real, "keep").unwrap();
+    symlink(&real, dir.join(".defer-kbf.tmp")).unwrap();
+    marks.save("kbf", &deferral).unwrap();
+    assert_eq!(std::fs::read_to_string(&real).unwrap(), "keep");
+    assert_eq!(marks.load("kbf"), Ok(Some(deferral)));
 }
