@@ -38,10 +38,11 @@
 //! heartbeat cannot make it miss a clear, and a restart of the coordinator, which reads the
 //! number from the ops file, does not forget it.
 //!
-//! A report is ignored when its host is not a member of the service (the service is not
-//! defined, or does not run on the host's role), when an operator excluded the host from it,
-//! when an operator cleared exactly that report, and when the service is halted already: the
-//! first halt stands until it is cleared (the convergence names it).
+//! A report is ignored when its host is not counted by the service (the service is not
+//! defined, the host's role or selector leaves it out, it is unmanaged, or an operator excluded
+//! it: [`crate::membership::standing`], the test recording uses), when an operator cleared
+//! exactly that report, and when the service is halted already: the first halt stands until it
+//! is cleared (the convergence names it).
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -88,8 +89,6 @@ fn reported(last: Option<&UpdateResult>, id: &NodeId) -> Option<Halt> {
 
 /// Why `halt`, reported for `service`, is not raised.
 enum Ignored {
-    /// An operator excluded the host from the service.
-    Excluded,
     /// An operator cleared this report.
     Acked,
     /// The service is halted already: the report is kept for the clear ([`record`]).
@@ -100,13 +99,6 @@ enum Ignored {
 /// documentation that holds, or `None` when it is.
 fn ignored(state: &OpsState, service: &str, halt: &Halt) -> Option<Ignored> {
     let marks = state.services.get(service);
-    let excluded = state
-        .excluded
-        .iter()
-        .any(|e| (e.service.as_str(), e.node_id.as_str()) == (service, halt.node_id.as_str()));
-    if excluded {
-        return Some(Ignored::Excluded);
-    }
     let acked = marks.is_some_and(|m| {
         m.halt_acked.iter().any(|a| {
             halt.report
@@ -212,10 +204,6 @@ fn raise(ops: &OpsStore, service: &str, halt: Halt) {
     match ops.read(|state| ignored(state, service, &halt)) {
         None => {}
         Some(Ignored::Standing) => return record(ops, service, halt),
-        Some(Ignored::Excluded) => {
-            tracing::debug!(service, node_id = %halt.node_id, "ignored a halt report: excluded");
-            return;
-        }
         Some(Ignored::Acked) => {
             tracing::debug!(service, node_id = %halt.node_id, "ignored a halt report: cleared");
             return;
