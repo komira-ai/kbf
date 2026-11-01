@@ -215,9 +215,12 @@ async fn scenario(core: SchedulerCore) -> Seen {
                         *field = set(*field);
                     }
                 }
-                // The stored result carries the times the server stamped on it.
+                // The stored result carries the times the server stamped on it, so both its hash
+                // and its size vary with the wall clock (a varint's length follows its value):
+                // only whether a result was stored is compared.
                 if let Some(result) = run.result.as_mut() {
                     result.hash.clear();
+                    result.size = 0;
                 }
                 run
             })
