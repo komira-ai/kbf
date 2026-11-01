@@ -90,7 +90,7 @@ pub struct ArmStats {
 impl ArmStats {
     /// `kills` per 1,000 attempts of this arm; `None` for an arm with no attempt.
     pub fn per_thousand(&self, kills: u64) -> Option<f64> {
-        (self.started > 0).then(|| kills as f64 * 1000.0 / self.started as f64)
+        (self.attempts > 0).then(|| kills as f64 * 1000.0 / self.attempts as f64)
     }
 }
 
