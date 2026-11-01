@@ -77,6 +77,23 @@ pub enum FillError {
     /// `--check` found problems; the text lists them.
     #[error("check failed:\n{0}")]
     Check(String),
+    /// The name of the result table cannot be a `data-result`.
+    #[error(
+        "result table name {0:?}: lower-case letters, digits, `.`, `-` and `_`, ending in .tsv"
+    )]
+    TsvName(String),
+    /// A cell names a result table this run did not write.
+    #[error(
+        "cell {cell:?} names the result table {found:?}, which this run did not write (it writes {ours:?}); a hand-filled cell is not rewritten"
+    )]
+    Foreign {
+        /// The cell.
+        cell: String,
+        /// Its `data-result`.
+        found: String,
+        /// The table this run writes.
+        ours: String,
+    },
 }
 
 /// Flags of `fill-paper`.
@@ -94,6 +111,10 @@ pub struct FillArgs {
     /// Where to write the filled paper.
     #[arg(long, value_name = "FILE")]
     pub out: Option<PathBuf>,
+    /// The table of rows (kind, id, value, unit, how, cells) that backs every filled value;
+    /// created or updated, and named in each filled cell's `data-result`.
+    #[arg(long, value_name = "FILE")]
+    pub result_tsv: Option<PathBuf>,
     /// Write over the paper instead of to `--out`.
     #[arg(long)]
     pub in_place: bool,
@@ -118,7 +139,7 @@ pub fn run(args: &FillArgs) -> Result<(), FillError> {
                 "--check writes nothing: no --out or --in-place",
             ));
         }
-        let findings = check(&html, &mappings, &results)?;
+        let findings = check(&html, &mappings, &results, None)?;
         return if findings.is_empty() {
             println!("fill-paper: check passed");
             Ok(())
@@ -132,7 +153,7 @@ pub fn run(args: &FillArgs) -> Result<(), FillError> {
         (Some(out), false) => out,
         (None, true) => &args.paper,
     };
-    let (text, report) = fill(&html, &mappings, &results)?;
+    let (text, report) = fill(&html, &mappings, &results, &mut ResultTsv::new("x.tsv")?)?;
     std::fs::write(target, text).map_err(|source| FillError::Io {
         path: target.clone(),
         source,
@@ -142,6 +163,47 @@ pub fn run(args: &FillArgs) -> Result<(), FillError> {
         report.filled, report.blocked, report.noted, report.unmapped
     );
     Ok(())
+}
+
+/// The result table: the rows that back the numbers `fill-paper` prints.
+#[derive(Clone, Debug)]
+pub struct ResultTsv {
+    name: String,
+    lines: Vec<String>,
+}
+
+impl ResultTsv {
+    /// An empty table called `name`.
+    ///
+    /// # Errors
+    /// [`FillError::TsvName`] if `name` cannot be a `data-result`.
+    pub fn new(name: &str) -> Result<ResultTsv, FillError> {
+        Ok(ResultTsv {
+            name: name.to_owned(),
+            lines: Vec::new(),
+        })
+    }
+
+    /// The table `name` as it is on disk.
+    ///
+    /// # Errors
+    /// [`FillError::TsvName`] if `name` cannot be a `data-result`.
+    pub fn parse(name: &str, text: &str) -> Result<ResultTsv, FillError> {
+        let _ = text;
+        ResultTsv::new(name)
+    }
+
+    /// The file name, as `data-result` writes it.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The file text.
+    #[must_use]
+    pub fn render(&self) -> String {
+        self.lines.concat()
+    }
 }
 
 fn read(path: &Path) -> Result<String, FillError> {
@@ -995,6 +1057,7 @@ pub fn fill(
     html: &str,
     mappings: &[Mapping],
     results: &Results,
+    _tsv: &mut ResultTsv,
 ) -> Result<(String, FillReport), FillError> {
     let tokens = tokenize(html)?;
     let known = by_id(mappings);
@@ -1070,6 +1133,7 @@ pub fn check(
     html: &str,
     mappings: &[Mapping],
     results: &Results,
+    _tsv: Option<&ResultTsv>,
 ) -> Result<Vec<String>, FillError> {
     let tokens = tokenize(html)?;
     let known = by_id(mappings);
@@ -1168,6 +1232,18 @@ mod tests {
         }
     }
 
+    fn tsv() -> ResultTsv {
+        ResultTsv::new("r.tsv").unwrap()
+    }
+
+    fn fill(html: &str, m: &[Mapping], r: &Results) -> Result<(String, FillReport), FillError> {
+        super::fill(html, m, r, &mut tsv())
+    }
+
+    fn check(html: &str, m: &[Mapping], r: &Results) -> Result<Vec<String>, FillError> {
+        super::check(html, m, r, None)
+    }
+
     fn mappings(json: &str) -> Vec<Mapping> {
         Mapping::parse_all(json).unwrap()
     }
@@ -1198,7 +1274,7 @@ mod tests {
 <p  class='a'>Naïve put <span  data-cell='x'   id=\"k\" >TBD</span>, then <b>bold</b>.</p>\n<p>tail</p>";
         let (out, report) = fill(html, &one("x", "p50", "ms", "instance"), &results()).unwrap();
         let expected = "<!DOCTYPE html>\r\n<!-- <b data-cell=\"x\">keep</b> -->\n<script>var s = '<i data-cell=\"x\">';</script>\n\
-<p  class='a'>Naïve put <span  data-cell='x'   id=\"k\" data-source=\"cold-put-instance-a1.json#p50\" data-label=\"test instance\" data-result=\"cold-put-instance-a1.json\" >2.00 ms</span>, then <b>bold</b>.</p>\n<p>tail</p>";
+<p  class='a'>Naïve put <span  data-cell='x'   id=\"k\" data-source=\"cold-put-instance-a1.json#p50\" data-label=\"test instance\" data-result=\"r.tsv\" >2.00 ms</span>, then <b>bold</b>.</p>\n<p>tail</p>";
         assert_eq!(out, expected);
         assert_eq!(
             report,
@@ -1227,7 +1303,7 @@ mod tests {
         assert_eq!(report.filled, 2);
         assert_eq!(report.noted, 1);
         assert!(once.contains("data-source=\"cold-put-direct-a1.json#p95\""));
-        assert!(once.contains("data-result=\"cold-put-direct-a1.json\""));
+        assert!(once.contains("data-result=\"r.tsv\""));
         assert_eq!(once.matches("data-result").count(), 2, "{once}");
         assert!(!once.contains("old.json"));
     }
@@ -1459,7 +1535,7 @@ mod tests {
 <?php x ?><![CDATA[ <b data-cell=\"a\"> ]]><textarea><b data-cell=\"a\"></textarea>";
         let (out, report) = fill(html, &one("a", "max", "ms", "instance"), &results()).unwrap();
         assert_eq!(report.filled, 1);
-        assert!(out.contains("<SPAN DATA-CELL=a hidden data-source=\"cold-put-instance-a1.json#max\" data-label=\"test instance\" data-result=\"cold-put-instance-a1.json\">90.0 ms</SPAN>"), "{out}");
+        assert!(out.contains("<SPAN DATA-CELL=a hidden data-source=\"cold-put-instance-a1.json#max\" data-label=\"test instance\" data-result=\"r.tsv\">90.0 ms</SPAN>"), "{out}");
         assert!(out.ends_with(
             "<P>two</DIV><?php x ?><![CDATA[ <b data-cell=\"a\"> ]]><textarea><b data-cell=\"a\"></textarea>"
         ));
@@ -1649,8 +1725,8 @@ mod tests {
             row("b", "p95", "ms", "direct")
         ));
         let (out, report) = fill(html, &m, &results()).unwrap();
-        let expected = "<p><span data-cell=\"a\" data-source=\"cold-put-instance-a1.json#p50\" data-label=\"test instance\" data-result=\"cold-put-instance-a1.json\">2.00 ms</span> \
-<span class=\"x y\" data-cell=\"b\" data-source=\"cold-put-direct-a1.json#p95\" data-label=\"farm\" data-result=\"cold-put-direct-a1.json\">20.0 ms</span> \
+        let expected = "<p><span data-cell=\"a\" data-source=\"cold-put-instance-a1.json#p50\" data-label=\"test instance\" data-result=\"r.tsv\">2.00 ms</span> \
+<span class=\"x y\" data-cell=\"b\" data-source=\"cold-put-direct-a1.json#p95\" data-label=\"farm\" data-result=\"r.tsv\">20.0 ms</span> \
 <span class=\"tbd\">[no cell]</span> <span class=\"tbd\" data-cell=\"z\">[no map]</span></p>";
         assert_eq!(out, expected);
         assert_eq!((report.filled, report.unmapped), (2, 1));
@@ -1672,7 +1748,7 @@ mod tests {
     #[test]
     fn a_cell_with_a_basis_or_a_block_is_never_written() {
         let html = "<i data-cell=\"a\" data-basis=\"code-reading\">text</i>\
-<i class=\"tbd\" data-cell=\"b\" data-blocked=\"not run\" data-result=\"cold-put-direct-a1.json\">old</i>";
+<i class=\"tbd\" data-cell=\"b\" data-blocked=\"not run\" data-result=\"r.tsv\">old</i>";
         let m = mappings(&format!(
             "[{},{}]",
             row("a", "p50", "ms", "instance"),
@@ -1691,13 +1767,178 @@ mod tests {
         assert!(findings.is_empty(), "{findings:?}");
     }
 
-    /// Catches a check that ignores `data-result`: a result file that is gone is a finding; a
-    /// result named by someone else's file type (the paper's hand-filled cells name a table) is
-    /// not ours to look up.
+    /// The rows of `tsv` that are not comments, as columns.
+    fn rows(tsv: &ResultTsv) -> Vec<Vec<String>> {
+        tsv.render()
+            .lines()
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(|l| l.split('\t').map(str::to_owned).collect())
+            .collect()
+    }
+
+    /// The numbers a text prints: runs of digits and points, a thousands comma removed.
+    fn printed(text: &str) -> Vec<String> {
+        text.split(|c: char| !(c.is_ascii_digit() || c == '.' || c == ','))
+            .filter(|t| t.starts_with(|c: char| c.is_ascii_digit()))
+            .map(|t| t.replace(',', ""))
+            .collect()
+    }
+
+    /// Catches a filled cell with no row behind its number, a row whose value is not the number
+    /// printed (the check of the paper compares the printed number, as rounded), a row that does
+    /// not name the cell, the source file, the passes and the arithmetic, and a noted cell that
+    /// gets a row.
     #[test]
-    fn check_follows_data_result_to_the_result_file() {
-        let html = "<i data-cell=\"a\" data-result=\"cold-put-instance-a1.json\">1</i>\
-<i data-cell=\"b\" data-result=\"cold-put-gone-a1.json\">2</i>\
+    fn every_filled_cell_has_a_row_with_the_number_it_prints() {
+        let html = "<i data-cell=\"a\">?</i><i data-cell=\"b\">?</i><i data-cell=\"n\">?</i>";
+        let m = mappings(&format!(
+            "[{},{},{}]",
+            row("a", "p50", "ms", "instance"),
+            row("b", "throughput", "MB/s", "direct"),
+            row("n", "p99", "ms", "direct"),
+        ));
+        let few = Results::from_results([
+            result(CellId::ColdPut, "instance", 1_200, Some(80_000)),
+            result(CellId::ColdPut, "direct", 100, None),
+        ]);
+        let mut t = tsv();
+        let (out, report) = super::fill(html, &m, &few, &mut t).unwrap();
+        assert_eq!((report.filled, report.noted), (2, 1));
+        let rows = rows(&t);
+        assert_eq!(rows.len(), 2, "{}", t.render());
+        let a = &rows[0];
+        assert_eq!(a[..4], ["derived", "fill:a:p50", "2.00", "ms"]);
+        assert_eq!(a[5], "a");
+        assert!(a[4].contains("cold-put-instance-a1.json#p50"), "{a:?}");
+        assert!(a[4].contains("passes 1,2,3"), "{a:?}");
+        assert!(a[4].contains("median"), "{a:?}");
+        assert!(a[4].contains("2000"), "{a:?}");
+        let b = &rows[1];
+        assert_eq!(b[..4], ["derived", "fill:b:throughput", "2.00", "MB/s"]);
+        assert_eq!(b[5], "b");
+        assert!(b[4].contains("sum"), "{b:?}");
+        // The number each cell prints is the value of its row.
+        assert!(
+            out.contains(">2.00 ms</i>") && out.contains(">2.00 MB/s</i>"),
+            "{out}"
+        );
+        assert_eq!(printed("1,235 ms"), ["1235"]);
+    }
+
+    /// Catches a row value that differs from the printed text when the printed number is
+    /// grouped or rounded.
+    #[test]
+    fn the_row_holds_the_number_as_printed() {
+        let html = "<i data-cell=\"a\">?</i>";
+        let mut t = tsv();
+        let big = Results::from_results([result(CellId::ColdPut, "direct", 1_234_567, None)]);
+        let (out, _) =
+            super::fill(html, &one("a", "requests", "count", "direct"), &big, &mut t).unwrap();
+        assert!(out.ends_with(">3,703,701</i>"), "{out}");
+        let r = rows(&t);
+        assert_eq!(r[0][2], "3703701");
+        assert_eq!(r[0][3], "count");
+        assert_eq!(printed("3,703,701"), [r[0][2].clone()]);
+    }
+
+    /// Catches a second run that changes the paper or the table, and a table that grows a row per
+    /// run.
+    #[test]
+    fn a_second_run_gives_the_same_paper_and_table() {
+        let html = "<p><b class=\"tbd\" data-cell=\"a\">[x]</b> <b data-cell=\"b\">?</b></p>";
+        let m = mappings(&format!(
+            "[{},{}]",
+            row("a", "p50", "ms", "instance"),
+            row("b", "p95", "ms", "direct")
+        ));
+        let mut t = tsv();
+        let (once, _) = super::fill(html, &m, &results(), &mut t).unwrap();
+        let first = t.render();
+        let mut again = ResultTsv::parse("r.tsv", &first).unwrap();
+        let (twice, _) = super::fill(&once, &m, &results(), &mut again).unwrap();
+        assert_eq!(once, twice);
+        assert_eq!(first, again.render());
+        assert_eq!(rows(&again).len(), 2);
+    }
+
+    /// Catches a table rewritten whole: comments and rows of other owners stay where they are, and
+    /// a changed number updates its row in place instead of adding one.
+    #[test]
+    fn the_table_keeps_other_rows_and_updates_its_own_in_place() {
+        let old = "# kept comment\nraw\thand.row\t7\tms\tmeasured by hand\tz\n\
+derived\tfill:a:p50\t9.99\tms\tstale\ta\nraw\tlast.row\t8\tms\tby hand\n";
+        let mut t = ResultTsv::parse("r.tsv", old).unwrap();
+        let html = "<i data-cell=\"a\">?</i>";
+        super::fill(html, &one("a", "p50", "ms", "instance"), &results(), &mut t).unwrap();
+        let text = t.render();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 4, "{text}");
+        assert_eq!(lines[0], "# kept comment");
+        assert_eq!(lines[1], "raw\thand.row\t7\tms\tmeasured by hand\tz");
+        assert!(
+            lines[2].starts_with("derived\tfill:a:p50\t2.00\tms\t"),
+            "{text}"
+        );
+        assert_eq!(lines[3], "raw\tlast.row\t8\tms\tby hand");
+        assert!(text.ends_with('\n'));
+    }
+
+    /// Catches a new table with no header and a table name that the paper's check would refuse.
+    #[test]
+    fn a_table_has_a_header_and_a_plain_name() {
+        let t = ResultTsv::new("ok-1_a.tsv").unwrap();
+        assert!(t.render().starts_with("# "), "{}", t.render());
+        for bad in [
+            "../x.tsv", "X.tsv", "a.txt", "a b.tsv", "", ".tsv.", "a/b.tsv",
+        ] {
+            let err = ResultTsv::new(bad).unwrap_err();
+            assert!(matches!(err, FillError::TsvName(_)), "{bad}: {err}");
+            assert!(ResultTsv::parse(bad, "").is_err(), "{bad}");
+        }
+        let err = ResultTsv::parse("r.tsv", "raw\tonly\n").unwrap_err();
+        assert!(err.to_string().contains("line 1"), "{err}");
+    }
+
+    /// Catches a hand-filled cell (a result table this run did not write) being rewritten, and
+    /// the refusal not naming the cell and the table; a cell naming the table being written, or
+    /// an old `.json` name, is ours to rewrite; an unmapped hand-filled cell is left alone
+    /// without a complaint.
+    #[test]
+    fn a_hand_filled_cell_is_refused_unless_the_table_is_ours() {
+        let m = one("a", "p50", "ms", "instance");
+        let hand = "<i data-cell=\"a\" data-result=\"hand.tsv\">by hand</i>";
+        let err = super::fill(hand, &m, &results(), &mut tsv()).unwrap_err();
+        let text = err.to_string();
+        assert!(matches!(err, FillError::Foreign { .. }), "{text}");
+        assert!(
+            text.contains("\"a\"") && text.contains("hand.tsv") && text.contains("r.tsv"),
+            "{text}"
+        );
+        let mut t = tsv();
+        let ours = "<i data-cell=\"a\" data-result=\"r.tsv\">old</i>";
+        let (out, _) = super::fill(ours, &m, &results(), &mut t).unwrap();
+        assert!(out.ends_with(">2.00 ms</i>"), "{out}");
+        let json = "<i data-cell=\"a\" data-result=\"cold-put-x-a1.json\">old</i>";
+        let (out, _) = super::fill(json, &m, &results(), &mut tsv()).unwrap();
+        assert!(
+            out.contains("data-result=\"r.tsv\"") && out.ends_with(">2.00 ms</i>"),
+            "{out}"
+        );
+        let (out, report) = super::fill(hand, &[], &results(), &mut tsv()).unwrap();
+        assert_eq!((out.as_str(), report.unmapped), (hand, 1));
+        // A mapped hand-filled cell with no figure is left as it is, not refused.
+        let none = one("a", "p50", "ms", "no-such-arm");
+        let (out, report) = super::fill(hand, &none, &results(), &mut tsv()).unwrap();
+        assert_eq!(report.noted, 1);
+        assert!(out.contains("data-result=\"hand.tsv\""), "{out}");
+    }
+
+    /// Catches a check that does not look in the table: a cell that cites this table but has no
+    /// row naming it is a finding; a cell citing another table is not ours to look up.
+    #[test]
+    fn check_follows_data_result_to_the_table() {
+        let html = "<i data-cell=\"a\" data-result=\"r.tsv\">1</i>\
+<i data-cell=\"b\" data-result=\"r.tsv\">2</i>\
 <i data-cell=\"c\" data-result=\"phase-b.tsv\">3</i>";
         let m = mappings(&format!(
             "[{},{},{}]",
@@ -1705,12 +1946,14 @@ mod tests {
             row("b", "p50", "ms", "instance"),
             row("c", "p50", "ms", "instance")
         ));
-        let findings = check(html, &m, &results()).unwrap();
+        let t = ResultTsv::parse("r.tsv", "derived\tfill:a:p50\t2.00\tms\thow\ta\n").unwrap();
+        let findings = super::check(html, &m, &results(), Some(&t)).unwrap();
         assert_eq!(findings.len(), 1, "{findings:?}");
         assert!(
-            findings[0].contains("\"b\" names the result file \"cold-put-gone-a1.json\""),
+            findings[0].contains("\"b\" has no row naming it in r.tsv"),
             "{findings:?}"
         );
+        assert!(super::check(html, &m, &results(), None).unwrap().is_empty());
     }
 
     /// Catches a class list rewritten when it holds no `tbd`: a filled cell keeps the classes it

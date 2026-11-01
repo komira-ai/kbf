@@ -27,7 +27,15 @@ fn setup(name: &str) -> TestDir {
     dir
 }
 
+/// `fill-paper` with the result table beside the paper.
 fn fill_paper(dir: &Path, extra: &[&str]) -> Output {
+    let tsv = dir.join("paper-results.tsv");
+    let mut args = vec!["--result-tsv", tsv.to_str().unwrap()];
+    args.extend_from_slice(extra);
+    fill_paper_raw(dir, &args)
+}
+
+fn fill_paper_raw(dir: &Path, extra: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_tierstore-bench"))
         .arg("fill-paper")
         .arg("--paper")
@@ -59,9 +67,67 @@ fn fill_writes_out_and_leaves_the_paper_alone() {
     );
     let filled = std::fs::read_to_string(&out).unwrap();
     assert!(filled.contains(
-        "<b data-cell=\"put\" data-source=\"cold-put-direct-a1.json#p50\" data-label=\"farm\" data-result=\"cold-put-direct-a1.json\">2.50 ms</b>"
+        "<b data-cell=\"put\" data-source=\"cold-put-direct-a1.json#p50\" data-label=\"farm\" data-result=\"paper-results.tsv\">2.50 ms</b>"
     ), "{filled}");
     assert!(filled.contains("<i data-cell=\"gone\">TBD</i>"), "{filled}");
+    let table = std::fs::read_to_string(dir.path().join("paper-results.tsv")).unwrap();
+    let rows: Vec<Vec<&str>> = table
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .map(|l| l.split('\t').collect())
+        .collect();
+    assert_eq!(rows.len(), 1, "{table}");
+    assert_eq!(rows[0][..4], ["derived", "fill:put:p50", "2.50", "ms"]);
+    assert_eq!(rows[0][5], "put");
+    assert!(
+        rows[0][4].contains("cold-put-direct-a1.json#p50"),
+        "{table}"
+    );
+}
+
+/// Catches a fill that needs no table (the numbers would have nothing behind them), and a name
+/// the paper's check would refuse; each exits 2 and writes nothing.
+#[test]
+fn a_fill_needs_a_result_table_with_a_plain_name() {
+    let dir = setup("fill-paper-tsv-flag");
+    let run = fill_paper_raw(dir.path(), &["--in-place"]);
+    assert_eq!(run.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&run.stderr).contains("--result-tsv"));
+    let bad = dir.path().join("Bad Name.tsv");
+    let run = fill_paper_raw(
+        dir.path(),
+        &["--in-place", "--result-tsv", bad.to_str().unwrap()],
+    );
+    assert_eq!(run.status.code(), Some(2));
+    assert!(!bad.exists());
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("paper.html")).unwrap(),
+        PAPER
+    );
+}
+
+/// Catches a hand-filled cell being rewritten by the process: exit 2 naming the cell and its
+/// table, the paper unchanged, no table created.
+#[test]
+fn a_hand_filled_cell_stops_the_verb() {
+    let dir = setup("fill-paper-hand");
+    let hand = PAPER.replace(
+        "data-cell=\"put\"",
+        "data-cell=\"put\" data-result=\"hand.tsv\"",
+    );
+    std::fs::write(dir.path().join("paper.html"), &hand).unwrap();
+    let run = fill_paper(dir.path(), &["--in-place"]);
+    assert_eq!(run.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        stderr.contains("\"put\"") && stderr.contains("hand.tsv"),
+        "{stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("paper.html")).unwrap(),
+        hand
+    );
+    assert!(!dir.path().join("paper-results.tsv").exists());
 }
 
 /// Catches `--in-place` that does nothing, and a re-run that changes the file again.
@@ -73,6 +139,12 @@ fn in_place_rewrites_the_paper_and_a_second_run_changes_nothing() {
     assert_ne!(first, PAPER.as_bytes());
     assert!(fill_paper(dir.path(), &["--in-place"]).status.success());
     assert_eq!(std::fs::read(dir.path().join("paper.html")).unwrap(), first);
+    let table = std::fs::read(dir.path().join("paper-results.tsv")).unwrap();
+    assert!(fill_paper(dir.path(), &["--in-place"]).status.success());
+    assert_eq!(
+        std::fs::read(dir.path().join("paper-results.tsv")).unwrap(),
+        table
+    );
     let check = fill_paper(dir.path(), &["--check"]);
     assert!(
         check.status.success(),
@@ -117,6 +189,18 @@ fn check_exits_2_and_lists_when_a_source_is_gone() {
     assert!(stderr.contains("no longer exists"), "{stderr}");
 }
 
+/// Catches a check that passes when the table lost the row behind a filled cell.
+#[test]
+fn check_exits_2_when_the_table_lost_a_row() {
+    let dir = setup("fill-paper-check-row");
+    assert!(fill_paper(dir.path(), &["--in-place"]).status.success());
+    std::fs::write(dir.path().join("paper-results.tsv"), "# emptied\n").unwrap();
+    let run = fill_paper(dir.path(), &["--check"]);
+    assert_eq!(run.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(stderr.contains("\"put\" has no row naming it"), "{stderr}");
+}
+
 /// Catches a result directory read wrongly: other files skipped, a result-shaped file that is not
 /// a result refused, a directory that does not exist refused, and the lookup by cell and arm
 /// (a mapping for an arm that is not there has no result).
@@ -136,18 +220,20 @@ fn results_load_from_a_directory() {
         .unwrap()
     };
     assert!(
-        check("", &map("direct", "cold-put"), &loaded)
+        check("", &map("direct", "cold-put"), &loaded, None)
             .unwrap()
             .is_empty()
     );
     assert_eq!(
-        check("", &map("direct", "cold-read"), &loaded)
+        check("", &map("direct", "cold-read"), &loaded, None)
             .unwrap()
             .len(),
         1
     );
     assert_eq!(
-        check("", &map("other", "cold-put"), &loaded).unwrap().len(),
+        check("", &map("other", "cold-put"), &loaded, None)
+            .unwrap()
+            .len(),
         1
     );
 
