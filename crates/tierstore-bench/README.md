@@ -191,6 +191,17 @@ the default caps where the same run with the arms does not. The other cells have
 and ignore the flag. The setting is recorded as `open_loop` in the provenance of every result (a
 result that predates the field was run with the arms on) and the report names it in its header.
 
+`run --multipart-objects N` (default: not set, the plan's count) caps the objects per pass (at most
+N, never more than the plan's count for that size) of the multipart arms of `cold-put`, `direct-mp`
+and `instance`, in their closed-loop arms of every size
+and width. A multipart object is three requests to the store (create, part, complete), and a slow
+cold store (about 1.25 s a request on a disk-backed one) cannot do the plan's 1,000 objects a pass
+of an arm in a measurement window. The `direct` arm, the open-loop arms (use `--open-loop off` with
+the flag) and the fault arms' own counts are not changed, and the ledger is asked for the bytes of
+the objects the arms put. A p99 is reported only from 1,000 requests: an arm with fewer reports a
+null `p99_us` in every pass and says why in its notes. Every result records the objects per pass its
+arm used as `objects_per_pass` (absent in a result written before the field existed).
+
 Tierstore at v0.0.37 has no cold-only mode (`--hot` is a required flag). So the cold cells label
 their paths in the arm names and the result notes say which they are:
 
@@ -230,8 +241,19 @@ number of measured requests of an arm is `(passes - 1) x requests per pass`: 10,
 1,000 a pass is `--passes 11`.
 
 The rules (also in `cells/mod.rs`): pass 0 of every arm is a discarded warm-up, arms are
-interleaved across passes, the load gate is read before a pass and every few completions in it
-(a trip ends the run and marks the pass busy), a cell is refused before it sends anything when
+interleaved across passes, the load gate is read before a pass, over a quiet window of its own, and a trip ends the run
+(the passes so far are written, and the refused pass is recorded empty and busy). The window is
+the disk's busy time and the CPU and IO stall time of two seconds, opened once the kernel has
+written out what the last pass left dirty (`Dirty` plus `Writeback` of `/proc/meminfo` under 4 MiB,
+for 45 seconds at most; if the cap comes first the window is read as it is), so that the pass just
+ended is not taken for other work on the machine. `--max-loadavg-1m` is judged by `preflight`
+only, as the load average carries the run's own requests and fsyncs; the pressure and disk limits
+keep their names and are the ten-second averages at preflight and the window before a pass.
+Inside a pass nothing is judged: every few completions the stall and disk time since the previous
+reading are read and the result of the pass holds the count and the peak of each (`pass_load`),
+which include the pass's own load; a pass whose window opened with the writeback wait at its cap says so there (`writeback_settled: false`, with the bytes still pending) and in the report. With the load average out, the gap between passes sees disk
+time and CPU and IO stall time only: a co-tenant on idle cores, or contention for memory
+bandwidth, is not seen. A cell is refused before it sends anything when
 its cold bytes are over the pass, cell or campaign cap, requests are held to the rate caps, and
 a p99 is filled in only from quiet passes with 1,000 requests or more. Fault arms (`latency`,
 `bandwidth`, `refused`, `blackhole`, and `proxy-pass` as the control) need the fault proxy as a
