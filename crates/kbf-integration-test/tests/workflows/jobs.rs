@@ -210,6 +210,15 @@ pub fn job_matrix(text: &str, job: &str) -> Result<Vec<Vec<(String, String)>>, S
         .collect()
 }
 
+/// The job `job`'s `runs-on:` when it is a string; `None` without one or for any other shape (a
+/// list or a mapping), which no seed build job may use.
+pub fn job_runs_on(text: &str, job: &str) -> Result<Option<String>, String> {
+    let root = yaml::load(text)?;
+    Ok(get(job_of(&root, job)?, "runs-on")
+        .and_then(Node::as_str)
+        .map(str::to_owned))
+}
+
 /// The reusable workflow the job `job` calls (`uses:`), `None` for a job with steps. An error
 /// when it is not a string.
 pub fn job_uses(text: &str, job: &str) -> Result<Option<String>, String> {

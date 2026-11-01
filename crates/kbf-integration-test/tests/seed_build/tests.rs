@@ -160,7 +160,7 @@ fn a_farm_variable_in_front_of_a_build_is_named() {
         &spoil_artifacts(
             "linux-x86_64",
             "- run: cargo build --locked",
-            "- run: KBF_FARM_ADDR=10.0.0.1:1 cargo build --locked",
+            "- run: KBF_FARM_ADDR=somewhere cargo build --locked",
         ),
         &["`linux-x86_64`", "KBF_FARM_ADDR"],
     );
