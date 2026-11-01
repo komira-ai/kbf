@@ -74,7 +74,15 @@ pub struct Args {
     /// checked against the index by a start-up pass in the background; a lost or
     /// damaged object is also found when it is read, or before an action-cache hit
     /// that needs it is served (a miss). There is no `memory:` store:
-    /// a `file://` path on a tmpfs is one.
+    /// a `file://` path on a tmpfs is one. A storage node (not `all-in-one`) may instead be
+    /// given the word `registered`: it holds no store of its own and, at each start, waits
+    /// for the frontend's registration (`kbf cluster object-store`), then runs on the
+    /// registered endpoint, bucket, prefix and keys, fetched over its storage certificate and
+    /// held in memory only, after the probe of the keys; it never falls back to another
+    /// store, and a registration that changes reaches it at its next start (until then the
+    /// frontend shows it `pending`). With `registered`, `--cold-store-credentials-file` is
+    /// refused and `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `AWS_ENDPOINT_URL` are
+    /// not read.
     #[arg(long, value_name = "URI")]
     pub cold_store: Option<StoreUri>,
     /// The key pair of an `s3://` `--cold-store`, in a file: JSON
@@ -83,7 +91,9 @@ pub struct Args {
     /// 0400). The secret is never a flag: a command line is world-readable. Without it the
     /// key pair is read from `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, which is
     /// deprecated: the start logs one warning and a later release refuses the variables.
-    /// A `file://` cold store has no keys, so the server refuses the flag with one.
+    /// A `file://` cold store has no keys, so the server refuses the flag with one; a
+    /// `registered` one takes its keys from the registration, so the server refuses the flag
+    /// with that too.
     #[arg(long, value_name = "PATH", requires = "cold_store")]
     pub cold_store_credentials_file: Option<PathBuf>,
     /// The fast tier in front of the cold store: `file:///absolute/path`, a directory
@@ -797,6 +807,19 @@ pub enum ConfigError {
         "--cold-store-credentials-file needs an s3:// --cold-store: a file:// store has no keys"
     )]
     ColdKeyFileOnFileStore,
+    /// `--cold-store-credentials-file` with `--cold-store registered`.
+    #[error(
+        "--cold-store-credentials-file cannot be used with --cold-store registered: the \
+         registered store's keys come from the frontend's registration, and nowhere else"
+    )]
+    ColdKeyFileOnRegistered,
+    /// `--cold-store registered` on a server that is not a storage node.
+    #[error(
+        "--cold-store registered is for a storage node (kbf storage, kbf storage-and-daemon, \
+         kbf node): it takes its store from the frontend's registration, and this server \
+         has no frontend to ask"
+    )]
+    ColdRegisteredNotHere,
     /// The S3 configuration is refused.
     #[error(transparent)]
     S3(#[from] S3ConfigError),

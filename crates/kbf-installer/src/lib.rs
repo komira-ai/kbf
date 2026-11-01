@@ -76,6 +76,7 @@ pub mod record;
 pub mod record_release;
 pub mod refusal;
 pub mod release;
+pub mod retain;
 pub mod run;
 pub mod seed;
 #[cfg(test)]

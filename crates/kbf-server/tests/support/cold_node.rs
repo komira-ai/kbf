@@ -98,21 +98,40 @@ pub async fn rig(generation: u64, config: impl FnOnce(&FakeS3) -> StoreConfig) -
 /// The flags of a node of `rig` named `name`, with a cold store `cold` and the key pair
 /// `env` gives.
 pub fn flags(rig: &Rig, name: &str, cold: &str, env: fn(&str) -> Option<String>) -> StorageFlags {
-    let d = dir(name);
+    flags_at(rig, (dir(name), next_port()), cold, env)
+}
+
+/// The flags of a node whose directory is `d` (as it is: not emptied) and whose address is
+/// `localhost:port`: the same node again, for a restart over the metadata log it left.
+pub fn flags_at(
+    rig: &Rig,
+    at: (PathBuf, u16),
+    cold: &str,
+    env: fn(&str) -> Option<String>,
+) -> StorageFlags {
+    flags_as(rig, at, "storage", cold, env)
+}
+
+/// [`flags_at`] for a node whose certificate holds `role`: any but `storage` is a node the
+/// frontend's role table denies the cold-store service.
+pub fn flags_as(
+    rig: &Rig,
+    (d, port): (PathBuf, u16),
+    role: &str,
+    cold: &str,
+    env: fn(&str) -> Option<String>,
+) -> StorageFlags {
     let write = |file: &str, text: String| {
         let path = d.join(file);
         std::fs::write(&path, text).expect("write");
         path.display().to_string()
     };
-    let (cert, key) = rig.farm.pki.client_pem(Some("storage"), &["localhost"]);
+    let (cert, key) = rig.farm.pki.client_pem(Some(role), &["localhost"]);
     let argv = [
         "storage".to_owned(),
         "--storage-listen=127.0.0.1:0".to_owned(),
         // Its own address per node: the address is the member's identity.
-        format!(
-            "--advertise-addr=localhost:{}",
-            9000 + NODES.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-        ),
+        format!("--advertise-addr=localhost:{port}"),
         format!("--cold-store={cold}"),
         format!("--meta-dir={}", d.join("meta").display()),
         format!("--frontend=https://localhost:{}", rig.farm.addr.port()),
@@ -128,6 +147,11 @@ pub fn flags(rig: &Rig, name: &str, cold: &str, env: fn(&str) -> Option<String>)
     flags
 }
 
+/// The next address port a node of this binary gets.
+pub fn next_port() -> u16 {
+    9000 + NODES.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+}
+
 /// `s3://bkt/kbf/` on the rig's service.
 pub fn bucket(rig: &Rig) -> String {
     format!("s3://bkt/kbf/?endpoint={}", rig.s3.endpoint())
@@ -135,6 +159,24 @@ pub fn bucket(rig: &Rig) -> String {
 
 pub async fn started(flags: &StorageFlags) -> Result<StorageHalf, Box<dyn Error>> {
     start(flags, never).await
+}
+
+/// The most turns [`spin_until`] takes. A turn is one yield, microseconds, so this is far
+/// more than any wait here needs (the longest is a retry pause of about a second), and a wait
+/// that never ends fails the test in a bounded number of turns instead of hanging to the
+/// job's limit. It is a count, not a time.
+pub const SPIN_TURNS: u64 = 200_000_000;
+
+/// Yields until `probe` finds something, at most [`SPIN_TURNS`] times: no sleep, and no
+/// clock.
+pub async fn spin_until<T>(mut probe: impl FnMut() -> Option<T>) -> T {
+    for _ in 0..SPIN_TURNS {
+        if let Some(found) = probe() {
+            return found;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("what the test waits for did not happen in {SPIN_TURNS} turns");
 }
 
 pub async fn until<T>(what: &str, mut probe: impl FnMut() -> Option<T>) -> T {

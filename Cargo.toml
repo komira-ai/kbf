@@ -260,6 +260,7 @@ kbf-sched = { path = "crates/kbf-sched" }
 kbf-seatbelt = { path = "crates/kbf-seatbelt" }
 kbf-segments = { path = "crates/kbf-segments" }
 kbf-server = { path = "crates/kbf-server" }
+kbf-retain = { path = "crates/kbf-retain" }
 kbf-setup = { path = "crates/kbf-setup" }
 kbf-signer = { path = "crates/kbf-signer" }
 kbf-sim = { path = "crates/kbf-sim" }

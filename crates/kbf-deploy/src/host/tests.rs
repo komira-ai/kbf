@@ -38,14 +38,15 @@ fn status_prints_the_state_and_the_link_verdict() {
          staged: none\n\
          pending confirm: none\n\
          floor: epoch 0, order 0, generation 0\n\
-         current link: missing (matches the state)\n"
+         current link: missing (matches the state)\n\
+         releases kept: 0\n"
     );
     let (code, out, _) = status_cli(&dir, &["--json"]);
     assert_eq!(code, ExitCode::SUCCESS);
     assert_eq!(
         out,
         "{\"current_link\":{\"kind\":\"missing\",\"matches_state\":true,\"target\":null},\
-         \"exists\":false,\"schema\":2,\"state\":{\"current\":null,\
+         \"exists\":false,\"releases\":[],\"schema\":2,\"state\":{\"current\":null,\
                   \"floor\":{\"epoch\":0,\"generation\":0,\"order_id\":0},\
          \"last_acked_order_id\":0,\"pending_confirm\":null,\"previous\":null,\
          \"serving_instance\":null,\"staged\":null,\"unacked\":[]},\
@@ -70,7 +71,8 @@ fn status_prints_the_state_and_the_link_verdict() {
              staged: {C}\n\
              pending confirm: {A} by 1800000000 (unix seconds), else back to {B}\n\
              floor: epoch 3, order 9, generation 7\n\
-             current link: {A} (matches the state)\n"
+             current link: {A} (matches the state)\n\
+             releases kept: 0\n"
         )
     );
     let (code, out, _) = status_cli(&dir, &["--json"]);
@@ -79,7 +81,7 @@ fn status_prints_the_state_and_the_link_verdict() {
         out,
         format!(
             "{{\"current_link\":{{\"kind\":\"link\",\"matches_state\":true,\
-             \"target\":\"{A}\"}},\"exists\":true,\"schema\":2,\"state\":{{\
+             \"target\":\"{A}\"}},\"exists\":true,\"releases\":[],\"schema\":2,\"state\":{{\
              \"current\":\"{A}\",\"floor\":{{\"epoch\":3,\"generation\":7,\"order_id\":9}},\
              \"last_acked_order_id\":9,\"pending_confirm\":{{\"activation\":\"3-9\",\
              \"commit\":\"{A}\",\"deadline_mono_s\":86400,\"deadline_wall\":1800000000,\
@@ -94,7 +96,9 @@ fn status_prints_the_state_and_the_link_verdict() {
     let (code, out, _) = status_cli(&dir, &[]);
     assert_eq!(code, ExitCode::FAILURE);
     assert!(
-        out.ends_with(&format!("current link: {B} (the state says {A})\n")),
+        out.ends_with(&format!(
+            "current link: {B} (the state says {A})\nreleases kept: 0\n"
+        )),
         "{out}"
     );
 
@@ -116,7 +120,7 @@ fn status_prints_the_state_and_the_link_verdict() {
         "{out}"
     );
     assert!(
-        out.ends_with("current link: not a symbolic link (the state has no current release)\n"),
+        out.ends_with("current link: not a symbolic link (the state has no current release)\nreleases kept: 0\n"),
         "{out}"
     );
     let (_, out, _) = status_cli(&dir, &["--json"]);
@@ -260,7 +264,7 @@ fn rollback_and_gc_run_from_the_command_line() {
         (code, out.as_str()),
         (
             ExitCode::SUCCESS,
-            "keeping: none; removing: none\nnothing to do\n"
+            "keeping: none and the 2 newest others; removing: none\nnothing to do\n"
         )
     );
 
@@ -316,3 +320,6 @@ fn gc_removes_nothing_where_it_cannot_tell_what_runs() {
     );
     assert!(stray.exists());
 }
+
+#[path = "kept_tests.rs"]
+mod kept;

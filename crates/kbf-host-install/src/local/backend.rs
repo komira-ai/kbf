@@ -9,6 +9,8 @@
 
 use std::path::PathBuf;
 
+use kbf_retain::Kept;
+
 use super::answer::{Answer, Code};
 use crate::request::{Channel, Version};
 
@@ -119,4 +121,25 @@ pub trait Backend {
     /// # Errors
     /// The host could not be put back; the marker stays, so the next try finds it.
     fn revert(&self, pending: &Pending) -> Result<(), Fault>;
+
+    /// The releases the host holds, newest first, each with what the host knows of its
+    /// version and why it must stay. None for a host that keeps no release directories (a
+    /// package or a container image is the release there).
+    fn kept(&self) -> Result<Vec<Kept>, Fault> {
+        Ok(Vec::new())
+    }
+
+    /// The file that names the releases kept whatever their age (`retain.json`): the pinned
+    /// ones and the coordinator's `last_good`. None for a host that keeps no release
+    /// directories.
+    fn retain_file(&self) -> Option<PathBuf> {
+        None
+    }
+
+    /// Remove every release directory but the ones that must stay (current, previous, the
+    /// pinned ones, `last_good`, what runs) and the `keep` newest others; what it did, in a
+    /// line. Only after a confirm, and never while a release is on trial.
+    fn prune(&self, _keep: usize) -> Result<String, Fault> {
+        Ok(String::new())
+    }
 }

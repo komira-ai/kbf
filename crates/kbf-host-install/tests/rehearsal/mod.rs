@@ -28,6 +28,7 @@ use kbf_host_install::LONG_TOKEN_MARKER;
 use serde_json::Value;
 
 pub mod farm;
+pub mod fleet;
 pub mod issuer;
 
 pub const REPO: &str = "komira-ai/kbf";

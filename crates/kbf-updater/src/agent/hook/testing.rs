@@ -3,6 +3,7 @@
 //! order the updater's table says (`update_hook::next`).
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use kbf_types::ReleasePlatform;
@@ -61,6 +62,8 @@ pub struct Rig {
     pub drain: FakeDrain,
     pub health: FakeHealth,
     pub clock: Arc<ManualClock>,
+    /// Unix seconds now, as the world reads them at each call: [`NOW`] unless a test moves it.
+    pub unix: Arc<AtomicU64>,
     /// The drain port the world is given: [`Rig::drain`] unless a test replaces it.
     pub drain_port: Arc<dyn Drain>,
     /// The flags before the step.
@@ -90,26 +93,28 @@ impl Rig {
         ] {
             params.insert(key, Scalar::Text(value));
         }
-        let flags = [
-            "--record-dir",
-            dir.join("record").to_str().expect("a path"),
-            "--channel",
-            "stable",
-            "--client-cert",
-            "/etc/kbf/cert.pem",
-            "--client-key",
-            "/etc/kbf/key.pem",
-            "--ca",
-            "/etc/kbf/ca.pem",
-        ]
-        .map(str::to_owned)
-        .to_vec();
+        // The certificate flags name files that are not there, in the rig's own directory: the
+        // fake world never reads them, and the real wiring finds them missing on every host.
+        let absent = |name: &str| dir.join("absent").join(name).display().to_string();
+        let flags = vec![
+            "--record-dir".to_owned(),
+            dir.join("record").display().to_string(),
+            "--channel".to_owned(),
+            "stable".to_owned(),
+            "--client-cert".to_owned(),
+            absent("cert.pem"),
+            "--client-key".to_owned(),
+            absent("key.pem"),
+            "--ca".to_owned(),
+            absent("ca.pem"),
+        ];
         Rig {
             drain_port: Arc::new(drain.clone()),
             local: FakeLocal::new(&events),
             health,
             drain,
             clock: Arc::new(ManualClock::default()),
+            unix: Arc::new(AtomicU64::new(NOW)),
             flags,
             params,
             events,
@@ -136,7 +141,10 @@ impl Rig {
             drain: self.drain_port.clone(),
             health: Arc::new(self.health.clone()),
             clock: self.clock.clone(),
-            unix_now: Arc::new(|| NOW),
+            unix_now: {
+                let unix = self.unix.clone();
+                Arc::new(move || unix.load(Ordering::SeqCst))
+            },
         }
     }
 
