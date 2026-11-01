@@ -34,6 +34,7 @@ pub mod decide;
 pub mod defer;
 pub mod desired;
 pub mod fleet;
+pub mod halt;
 pub mod http;
 pub mod identity;
 pub mod listen;
@@ -69,6 +70,8 @@ mod desired_role_tests;
 mod desired_tests;
 #[cfg(test)]
 mod extras_dropped_tests;
+#[cfg(test)]
+mod halt_membership_tests;
 #[cfg(test)]
 mod http_tests;
 #[cfg(test)]

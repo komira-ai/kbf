@@ -92,6 +92,9 @@ pub fn decide_in(
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Hold {
+    /// The service is halted: a host reported a failure no version can repair and an operator
+    /// has not cleared it. Checked before every other rule ([`crate::halt::decide`]).
+    Halted,
     /// The service has no definition.
     NoDefinition,
     /// The service has no desired state.

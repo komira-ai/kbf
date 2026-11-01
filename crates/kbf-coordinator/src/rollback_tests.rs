@@ -311,6 +311,7 @@ fn a_halt_beats_a_rollback() {
             node_id: "d1".to_owned(),
             check: "tainted".to_owned(),
             target: version("2.0"),
+            report: None,
         }),
         ..good()
     };
@@ -850,6 +851,7 @@ async fn a_standing_halt_stops_the_rollback() {
             node_id: "d1".to_owned(),
             check: "tainted".to_owned(),
             target: version("2.0"),
+            report: None,
         });
     });
     restart(&mut rig, AUTO);

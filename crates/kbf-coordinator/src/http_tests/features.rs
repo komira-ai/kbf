@@ -187,10 +187,18 @@ async fn a_heartbeat_with_every_new_fact_is_accepted_and_ordered_as_without_them
 /// advertised.
 #[tokio::test]
 async fn advertised_features_equal_the_handled_set() {
-    let uses = std::collections::BTreeMap::from([(
-        "deferred-v1",
-        r#","deferred":{"target":"2.0","reason":"drain_bound","retry_after_secs":300}"#,
-    )]);
+    let uses = std::collections::BTreeMap::from([
+        (
+            "deferred-v1",
+            r#","deferred":{"target":"2.0","reason":"drain_bound","retry_after_secs":300}"#,
+        ),
+        // A halt report: the host that makes it is ordered nothing, where the host without
+        // it is ordered the update. It is the last name, since the halt stands afterwards.
+        (
+            "halt-v1",
+            r#","last_update":{"target":"2.0","outcome":"failed","phase":"halt","reason":"tainted"}"#,
+        ),
+    ]);
     let announced = FEATURES.join(r#"",""#);
     let announce = format!(r#","agent_features":["{announced}"]"#);
     let rig = rig("http-features-handled", FEATURES).await;

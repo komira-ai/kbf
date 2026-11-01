@@ -14,9 +14,10 @@ use subtle::ConstantTimeEq;
 
 use crate::acks::{clear_bad, release_ack};
 use crate::converge::{Convergence, RoleCounts, converge_kbf, converge_service, role_counts};
-use crate::decide::{Decision, Hold, decide_marked};
+use crate::decide::{Decision, Hold};
 use crate::desired::{Desired, DesiredError, DesiredStore, KBF, StoreError};
 use crate::fleet::{Fleet, Host, Node};
+use crate::halt;
 use crate::identity::Identity;
 use crate::membership::{Member, Standing, account, deferred_count, members, standing};
 use crate::ops::{self, AuditEntry, OPERATOR, OperateError, OpsError, OpsState, OpsStore};
@@ -186,12 +187,17 @@ pub struct Status {
 
 /// The features this coordinator advertises to an agent that announces `agent_features`.
 ///
-/// Each name is added in the change that implements what it names (`halt-v1` follows), so a
-/// name is never advertised for behaviour that is not there. `deferred-v1`: a heartbeat's
-/// `deferred` report ends the order, holds no slot and backs the host off ([`crate::defer`]).
-/// `heartbeat-v2`: selector membership, hosts that are `missing`, `absent` or `unmanaged`
+/// Each name is added in the change that implements what it names (`halt-v1`; the others
+/// follow), so a name is never advertised for behaviour that is not there. `deferred-v1`: a
+/// heartbeat's `deferred` report ends the order, holds no slot and backs the host off
+/// ([`crate::defer`]). `halt-v1`: the clear generations of [`crate::halt`]. `heartbeat-v2`:
+/// selector membership, hosts that are `missing`, `absent` or `unmanaged`
 /// ([`crate::membership`]).
-pub const FEATURES: &[&str] = &["deferred-v1", crate::membership::HEARTBEAT_V2];
+pub const FEATURES: &[&str] = &[
+    "deferred-v1",
+    halt::FEATURE,
+    crate::membership::HEARTBEAT_V2,
+];
 
 /// How long a host's warn about one dropped fact is silent after it was logged.
 const EXTRAS_LOG_EVERY: Duration = Duration::from_secs(3600);
@@ -317,25 +323,29 @@ impl Coordinator {
         let reply = self.reply_to(who, beat);
         // Only an agent that announced features gets `features`: an older agent reads the
         // reply strictly and refuses a field it does not know.
-        let features = (!asked.is_empty()).then(|| {
+        let features: Option<Vec<String>> = (!asked.is_empty()).then(|| {
             self.features
                 .iter()
                 .filter(|name| asked.contains(name))
                 .cloned()
                 .collect()
         });
+        // The generations only to an agent that announced `halt-v1` and a coordinator that
+        // advertises it: an older agent's strict reader refuses the field.
+        let halts = features
+            .as_ref()
+            .filter(|names| names.iter().any(|name| name == halt::FEATURE))
+            .map_or_else(BTreeMap::new, |_| halt::generations(&self.ops));
         Answer {
             reply,
             features,
-            halts: Default::default(),
+            halts,
         }
     }
 
     fn reply_to(&self, who: Identity, beat: Heartbeat) -> ServiceReply {
         let now = (self.clock)();
-        let mut fleet = self.fleet.lock().unwrap_or_else(PoisonError::into_inner);
         let announced = beat.services.clone().unwrap_or_default();
-        let platform = beat.platform;
         let node = Node {
             role: who.role.name().to_owned(),
             features: beat.agent_features.clone(),
@@ -344,6 +354,9 @@ impl Coordinator {
                 .chain(announced.iter().map(|one| (one.name.clone(), one.health)))
                 .collect(),
         };
+        let held = halt::note(&self.ops, &self.services, &who, &beat, &node, now);
+        let mut fleet = self.fleet.lock().unwrap_or_else(PoisonError::into_inner);
+        let platform = beat.platform;
         let ops = self.ops.state();
         let counted =
             |def: &ServiceDef| standing(def, &who.node_id, &node, &ops, now) == Standing::Counted;
@@ -379,11 +392,13 @@ impl Coordinator {
         }
         let desired = self.desired.all();
         for name in names {
-            let marks = self.ops.marks(name);
-            let decision = decide_marked(
+            if held.iter().any(|service| service == name) {
+                continue;
+            }
+            let decision = halt::decide(
+                &self.ops,
                 &self.services,
                 &desired,
-                &marks.bad,
                 name,
                 &fleet,
                 &who.node_id,
@@ -540,19 +555,15 @@ impl Coordinator {
             .defs()
             .map(|def| {
                 let desired = self.desired.get(&def.name);
-                let bad = ops
-                    .services
-                    .get(&def.name)
-                    .map_or(&[][..], |marks| marks.bad.as_slice());
                 let roles = role_counts(def, desired.as_ref(), &fleet, now);
                 let hosts: Vec<ServiceHostStatus> = fleet
                     .hosts_of(&def.name)
                     .map(|(id, host)| ServiceHostStatus {
                         host: host_status(&fleet, &def.name, id, host, now),
-                        hold: match decide_marked(
+                        hold: match halt::decide(
+                            &self.ops,
                             &self.services,
                             &all,
-                            bad,
                             &def.name,
                             &fleet,
                             id,
@@ -644,7 +655,8 @@ fn host_status(
 
 /// Where the hosts of `def` stand: the one answer both `GET /v1/convergence` and the status
 /// give. `kbf` is counted with the minimums of its desired state, as it always has been; any
-/// other service with what its definition requires of each role.
+/// other service with what its definition requires of each role. A halted service is
+/// `halted` whatever its hosts say.
 pub(crate) fn convergence_of(
     def: &ServiceDef,
     desired: Option<&Desired>,
@@ -658,5 +670,9 @@ pub(crate) fn convergence_of(
         converge_service(def, desired, fleet, now)
     };
     let deferred = deferred_count(def, fleet, convergence.desired.as_ref(), now);
-    account(convergence, def, &members(def, fleet, ops, now), deferred)
+    let convergence = account(convergence, def, &members(def, fleet, ops, now), deferred);
+    match halt::standing(ops, &def.name) {
+        Some(halt) => convergence.halted(halt),
+        None => convergence,
+    }
 }

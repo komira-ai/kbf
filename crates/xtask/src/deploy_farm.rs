@@ -238,6 +238,14 @@ pub enum Error {
     #[error("blocked: a host failed its update to {0}; the table above says which role")]
     Blocked(String),
     #[error(
+        "halted: {host} reported a failure no version can repair ({check}) while updating to {version}; an operator must clear the halt (`clear_halt` on /v1/operator) before anything is ordered again"
+    )]
+    Halted {
+        version: String,
+        host: String,
+        check: String,
+    },
+    #[error(
         "the coordinator's desired version is {0:?}, not this release's: another writer replaced it"
     )]
     Superseded(String),
@@ -507,6 +515,7 @@ pub fn deploy_on(
                 match read.state.as_str() {
                     "converged" => return read.holds(&baseline, &plan.version),
                     "blocked" => return Err(Error::Blocked(plan.version.clone())),
+                    "halted" => return Err(read.halted(&plan.version)),
                     _ => {}
                 }
                 let now = (read.state, answer["roles"].clone());
@@ -736,6 +745,8 @@ struct Read {
     roles: Vec<(String, [u64; 4])>,
     /// The commit the coordinator says it was built from; none from an older build.
     commit: Option<String>,
+    /// The host and the check of the halt the coordinator names, when the state is `halted`.
+    halt: Option<(String, String)>,
 }
 
 impl Read {
@@ -763,7 +774,25 @@ impl Read {
             quiet: answer["quiet"].as_bool().unwrap_or(false),
             roles,
             commit: text("commit").map(|t| plain(&t)),
+            halt: answer["halt"]["node_id"]
+                .as_str()
+                .zip(answer["halt"]["check"].as_str())
+                .map(|(host, check)| (plain(host), plain(check))),
         })
+    }
+
+    /// The failure of a deploy whose coordinator says `halted`, naming the host and the check
+    /// when it names them.
+    fn halted(&self, version: &str) -> Error {
+        let (host, check) = self
+            .halt
+            .clone()
+            .unwrap_or_else(|| ("unknown".to_owned(), "unknown".to_owned()));
+        Error::Halted {
+            version: version.to_owned(),
+            host,
+            check,
+        }
     }
 
     /// The hosts live now (not `down`) per role.

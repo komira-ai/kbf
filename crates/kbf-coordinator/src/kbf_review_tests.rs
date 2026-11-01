@@ -199,6 +199,7 @@ fn a_services_file_must_be_text_and_small() {
 fn the_hold_strings_are_the_ones_the_status_documents() {
     let spelled = |hold: Hold| -> &'static str {
         match hold {
+            Hold::Halted => "halted",
             Hold::NoDefinition => "no_definition",
             Hold::NoDesired => "no_desired",
             Hold::NotAMember => "not_a_member",
@@ -219,6 +220,7 @@ fn the_hold_strings_are_the_ones_the_status_documents() {
         }
     };
     for hold in [
+        Hold::Halted,
         Hold::NoDefinition,
         Hold::NoDesired,
         Hold::NotAMember,

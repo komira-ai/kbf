@@ -219,6 +219,18 @@ fn check_features(names: &[String]) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// The clear generations of an answer: at most [`MAX_SERVICES`] and `kbf`, each named as a
+/// service: the services of a full services file, and the one the coordinator ships.
+fn check_halts(halts: &BTreeMap<String, u64>) -> Result<(), &'static str> {
+    if halts.len() > MAX_SERVICES + 1 {
+        return Err("too many services in halts");
+    }
+    if !halts.keys().all(|name| is_service_name(name)) {
+        return Err("a halts key is not a service name");
+    }
+    Ok(())
+}
+
 /// The step durations of a beat: at most [`MAX_STEP_SECS`] steps.
 pub(crate) fn step_secs_text<'de, D: Deserializer<'de>>(
     d: D,
@@ -239,10 +251,11 @@ pub(crate) fn is_false(flag: &bool) -> bool {
 /// The coordinator's answer to a heartbeat: the reply, and, to an agent that announced
 /// `agent_features`, the features the coordinator supports.
 ///
-/// Written flat: the reply's keys, then `features` when there is one. An agent that never
-/// announced features reads only [`Reply`](crate::wire::Reply) or [`ServiceReply`], both of
-/// which refuse an unknown field, so `features` is `None` for it and the bytes are those of
-/// the reply alone. Equality with a reply compares the reply and ignores `features`.
+/// Written flat: the reply's keys, then `features` when there is one, then `halts` when
+/// there are any. An agent that never announced features reads only
+/// [`Reply`](crate::wire::Reply) or [`ServiceReply`], both of which refuse an unknown field,
+/// so `features` is `None` and `halts` empty for it and the bytes are those of the reply
+/// alone. Equality with a reply compares the reply and ignores `features`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Answer {
     /// What to do.
@@ -251,8 +264,10 @@ pub struct Answer {
     /// The supported features, only for an agent that announced `agent_features`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub features: Option<Vec<String>>,
-    /// The clear generation of each service cleared at least once (absent: 0), only for an
-    /// agent that announced `halt-v1` while the coordinator advertises it.
+    /// How many times an operator has cleared a halt of each service, by service name; a
+    /// service never cleared is not listed. Only for an agent that announced `halt-v1`: it
+    /// lifts its hold on a service when the number is newer than the one it halted under, so
+    /// a clear is not lost with a heartbeat and a coordinator restart does not forget it.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub halts: BTreeMap<String, u64>,
 }
@@ -293,9 +308,6 @@ struct RawAnswer {
     halts: BTreeMap<String, u64>,
 }
 
-/// The most entries of `halts`: a service per entry, the services of a host and `kbf`.
-const MAX_HALTS: usize = MAX_SERVICES + 1;
-
 impl<'de> Deserialize<'de> for Answer {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         use serde::de::Error;
@@ -303,12 +315,7 @@ impl<'de> Deserialize<'de> for Answer {
         if let Some(names) = &raw.features {
             check_features(names).map_err(D::Error::custom)?;
         }
-        if raw.halts.len() > MAX_HALTS {
-            return Err(D::Error::custom("too many halts"));
-        }
-        if raw.halts.keys().any(|name| !is_service_name(name)) {
-            return Err(D::Error::custom("a halt names no service"));
-        }
+        check_halts(&raw.halts).map_err(D::Error::custom)?;
         let reply = ServiceReply::from_parts(raw.reply, raw.service, raw.version)
             .map_err(D::Error::custom)?;
         Ok(Self {
