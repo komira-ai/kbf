@@ -1,6 +1,7 @@
 //! The hook's steps over the agent's fake ports: the calls they make, step by step, are the
 //! calls today's update makes (`agent::update`, pinned by the goldens of `update_tests`), in the
-//! same order, and a drain deadline ends `prepare` with exit 75 and the node left drained.
+//! same order, and a drain deadline ends `prepare` with exit 75 after the hook has lifted the
+//! cordon it placed itself (a cordon an operator placed before the update stays).
 
 use std::time::Duration;
 
