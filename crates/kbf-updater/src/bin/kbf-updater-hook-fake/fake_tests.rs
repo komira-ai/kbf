@@ -391,26 +391,26 @@ fn a_host_that_cannot_be_written_fails_each_change() {
     };
     failed(local.switch(&v("2.0.0")).unwrap_err(), "switch:");
     failed(local.confirm(&v("2.0.0")).unwrap_err(), "confirm:");
-    // A revert needs a trial to read: a world that can be read and not written.
+    // A world that reads but cannot take a write: each file is written to `<name>.tmp` first,
+    // and a directory there refuses the write, whoever runs the test (root included, which
+    // permission bits would not stop).
     let p_ok = paths(&dir);
-    let revert = FakeLocal(p_ok.clone());
-    fs::set_permissions(
-        dir.join("world"),
-        std::os::unix::fs::PermissionsExt::from_mode(0o555),
-    )
-    .unwrap();
-    let reverted = revert.revert();
+    for tmp in ["helper.json.tmp", "mark.tmp", "node.tmp"] {
+        fs::create_dir_all(dir.join("world").join(tmp).join("x")).unwrap();
+    }
+    failed(FakeLocal(p_ok.clone()).revert().unwrap_err(), "revert:");
     let drain = FakeDrain(p_ok.clone());
-    let drained = drain.drain(&host(), None);
-    let given_back = drain.undrain(&host());
-    fs::set_permissions(
-        dir.join("world"),
-        std::os::unix::fs::PermissionsExt::from_mode(0o755),
-    )
-    .unwrap();
-    failed(reverted.unwrap_err(), "revert:");
-    assert!(drained.is_err());
-    assert!(given_back.is_err());
+    assert!(
+        drain.drain(&host(), None).is_err(),
+        "the mark cannot be written"
+    );
+    assert!(
+        drain.undrain(&host()).is_err(),
+        "the node cannot be written"
+    );
+    assert_eq!(read(&dir, "node"), "serving");
+    assert!(!dir.join("world/mark").exists());
+    fs::remove_dir_all(dir.join("world/node.tmp")).unwrap();
     // A mark that cannot be removed is an error too.
     fs::create_dir(dir.join("world/mark")).unwrap();
     fs::write(dir.join("world/mark/x"), "").unwrap();
