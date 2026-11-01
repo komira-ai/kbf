@@ -14,7 +14,7 @@ struct Script {
     run: Value,
     /// Always fail.
     fail: bool,
-    /// Whether each call, in order, fails; the calls after the list succeed.
+    /// Whether each call at the jobs or artifacts, in order, fails; the calls after the list succeed.
     flaky: Vec<bool>,
 }
 
@@ -34,7 +34,9 @@ impl Script {
 
 impl Github for Script {
     fn get(&mut self, path: &str) -> Result<Value, Error> {
-        if self.fail || (!self.flaky.is_empty() && self.flaky.remove(0)) {
+        // The run itself is asked once; the list of failing calls is about the two of each look.
+        let is_run = !path.contains("/jobs?") && !path.contains("/artifacts?");
+        if self.fail || (!is_run && !self.flaky.is_empty() && self.flaky.remove(0)) {
             return Err(Error::Failed("gh api: down".to_owned()));
         }
         self.asked.push(path.to_owned());
