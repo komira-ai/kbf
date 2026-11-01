@@ -35,6 +35,11 @@
 //!    updating, not waiting for its promotion and not under an outstanding order, so a host that has not heartbeated since
 //!    a restart counts as missing.
 //!
+//! A version marked bad ([`crate::reconcile`]) is ordered to nobody, whatever the rules above
+//! say, and is held at [`Hold::Bad`] after the quiet start.
+//! A host that reports the service `absent` (declared, never registered) is held back before
+//! all of these but the first, unless the definition says `install_when_absent` ([`Hold::Absent`]).
+//!
 //! The decision records nothing: the caller notes an `Update` it returns with
 //! [`Fleet::order`], under the same lock, so the next host's decision sees it. A host that
 //! asks again while its own order is outstanding is told the same again: its own order never
@@ -48,7 +53,7 @@ use std::time::Duration;
 
 use kbf_types::NodeId;
 use kbf_updater::version::Version;
-use kbf_updater::wire::{Outcome, Reply};
+use kbf_updater::wire::{Health, Outcome, Reply};
 use serde::Serialize;
 
 use crate::canary;
@@ -96,6 +101,9 @@ pub enum Hold {
     NotAMember,
     /// The coordinator started less than [`crate::fleet::QUIET_START`] ago.
     Quiet,
+    /// The service is declared on the host and has never registered, and the definition does
+    /// not say `install_when_absent`.
+    Absent,
     /// The host is updating this service.
     Updating,
     /// The host is updating another service or has an order outstanding for one.
@@ -119,6 +127,8 @@ pub enum Hold {
     Baking,
     /// The service's canary gate is closed and the host is not one of the canaries.
     CanaryWait,
+    /// The desired version is marked bad ([`crate::reconcile`]).
+    Bad,
 }
 
 /// What [`decide_why`] found for one host and service.
@@ -134,11 +144,27 @@ pub enum Decision {
 }
 
 /// The decision for the host `id` about `service` at `now`, with the rule that held when it
-/// is not an order. The only implementation of the rules; [`decide_in`] drops the reason.
+/// is not an order, for a service none of whose versions is marked bad. [`decide_in`] drops
+/// the reason.
 #[must_use]
 pub fn decide_why(
     services: &Services,
     desired: &BTreeMap<String, Desired>,
+    service: &str,
+    fleet: &Fleet,
+    id: &NodeId,
+    now: Duration,
+) -> Decision {
+    decide_marked(services, desired, &[], service, fleet, id, now)
+}
+
+/// [`decide_why`] for a service whose versions `bad` are marked bad: the only implementation
+/// of the rules.
+#[must_use]
+pub fn decide_marked(
+    services: &Services,
+    desired: &BTreeMap<String, Desired>,
+    bad: &[Version],
     service: &str,
     fleet: &Fleet,
     id: &NodeId,
@@ -150,7 +176,7 @@ pub fn decide_why(
     let Some(want) = desired.get(service) else {
         return Decision::Hold(Hold::NoDesired);
     };
-    match first_hold(def, want, desired, fleet, id, now) {
+    match first_hold(def, want, desired, bad, fleet, id, now) {
         Some(why) => Decision::Hold(why),
         None => Decision::Update {
             version: want.version.clone(),
@@ -163,6 +189,7 @@ fn first_hold(
     def: &ServiceDef,
     desired: &Desired,
     all: &BTreeMap<String, Desired>,
+    bad: &[Version],
     fleet: &Fleet,
     id: &NodeId,
     now: Duration,
@@ -192,6 +219,11 @@ fn first_hold(
         .count();
     let rules = [
         (fleet.is_quiet(now), Hold::Quiet),
+        (bad.contains(&desired.version), Hold::Bad),
+        (
+            host.beat.health == Health::Absent && !def.install_when_absent,
+            Hold::Absent,
+        ),
         (host.beat.updating.is_some(), Hold::Updating),
         (fleet.is_busy_besides(service, id, now), Hold::BusyElsewhere),
         (host.beat.version == desired.version, Hold::UpToDate),

@@ -81,6 +81,9 @@ pub(crate) struct Settings {
     pub recorder: Recorder,
     /// Held-back committed records kept for a refusing state store at most.
     pub held_cap: usize,
+    /// What the farm learns from the runs it hears of (`--usage-profiles`). Only the js core
+    /// learns; the flag is refused with the legacy core.
+    pub usage: kbf_usage::UsageMode,
 }
 
 impl Default for Settings {
@@ -98,6 +101,7 @@ impl Default for Settings {
             whole_node: None,
             recorder: Recorder::default(),
             held_cap: HELD_CAP,
+            usage: kbf_usage::UsageMode::Off,
         }
     }
 }
@@ -232,6 +236,12 @@ impl Driver {
     pub(super) fn set_orphan_wait(&mut self, settings: &Settings) {
         js_rebuilt!(self, settings);
         self.state_mut().engine.intake.orphan_wait = settings.orphan_wait;
+    }
+
+    /// Applies `settings.usage`: the js core opens its usage side again over the store it
+    /// has, and the legacy core learns nothing.
+    pub(super) fn set_usage(&mut self, settings: &Settings) {
+        js_rebuilt!(self, settings);
     }
 
     /// Applies `settings.held_cap`, to the core as it is on either driver: the cap changes
