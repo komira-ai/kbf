@@ -1016,3 +1016,43 @@ fn state_files_are_not_followed_through_links() {
     std::fs::create_dir_all(dir.join(".defer-db.tmp").join("x")).unwrap();
     assert!(marks.save("db", &deferral).is_err());
 }
+
+/// Catches: a corrupt halt record lifted by the first reply of a service that was cleared
+/// before. The record has no generation, so the first `halt-v1` reply after start only records
+/// its generation (3), without lifting; the same generation again does not lift; a later 4
+/// does.
+#[test]
+fn a_corrupt_halt_file_is_not_lifted_by_the_generation_already_standing() {
+    let rig = Rig::new("hold-halt-corrupt-standing");
+    rig.coordinator.advertise(&["halt-v1"]);
+    rig.coordinator.set_halts(&[("kbf", 3)]);
+    std::fs::write(rig.dir.join("halt-kbf"), "not json").unwrap();
+    *rig.drain.leases.lock().unwrap() = [0].into();
+    let agent = rig.announcing();
+    rig.take_order(&agent);
+    assert_eq!(rig.installs(), 0, "the first reply (3) is only recorded");
+    rig.take_order(&agent);
+    assert_eq!(rig.installs(), 0, "3 again is not newer");
+    rig.coordinator.set_halts(&[("kbf", 4)]);
+    agent.beat_once();
+    rig.take_order(&agent);
+    assert_eq!(rig.installs(), 1, "4 is a clear after the record");
+}
+
+/// Catches: the same for a service the first reply does not list (generation 0): it records 0
+/// and does not lift, and 1 lifts.
+#[test]
+fn a_corrupt_halt_file_and_a_first_reply_without_the_service() {
+    let rig = Rig::new("hold-halt-corrupt-unlisted");
+    rig.coordinator.advertise(&["halt-v1"]);
+    rig.coordinator.set_halts(&[("other", 7)]);
+    std::fs::write(rig.dir.join("halt-kbf"), "not json").unwrap();
+    *rig.drain.leases.lock().unwrap() = [0].into();
+    let agent = rig.announcing();
+    rig.take_order(&agent);
+    assert_eq!(rig.installs(), 0);
+    rig.coordinator.set_halts(&[("kbf", 1)]);
+    agent.beat_once();
+    rig.take_order(&agent);
+    assert_eq!(rig.installs(), 1);
+}
