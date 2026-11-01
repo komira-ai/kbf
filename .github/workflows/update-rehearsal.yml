@@ -108,6 +108,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: printf '%s' "$GH_TOKEN" > /var/tmp/kbf-update-rehearsal.token
+      # The node's daemon half runs its containers with the runner's own `crun`, rootless.
+      - name: The container runtime of the daemon half
+        run: sudo apt-get install -y --no-install-recommends crun uidmap
       # The coordinator of this checkout; the test finds it beside the test binaries.
       - name: The coordinator of this checkout
         run: cargo build --locked -p kbf-coordinator

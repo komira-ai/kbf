@@ -389,15 +389,28 @@ pub fn plan() -> Rehearsal {
 /// The `kbf` unit: a storage node on a `file://` cold store that runs `releases/current/kbf`,
 /// as `account` (a `User=` or `DynamicUser=` line), with `flags` on its command line.
 pub fn kbf_unit(account: &str, flags: &str) -> String {
+    unit_of("storage", account, "", flags)
+}
+
+/// The `kbf` unit of a farm node, as `storage-and-daemon` runs there
+/// (`packaging/linux/units/kbf-storage-and-daemon.service`): the storage node and the daemon in
+/// one process, with the cgroup subtree delegated to it that its container driver sets itself
+/// up in.
+pub fn kbf_node_unit(account: &str, flags: &str) -> String {
+    unit_of("storage-and-daemon", account, "Delegate=yes\n", flags)
+}
+
+fn unit_of(mode: &str, account: &str, extra: &str, flags: &str) -> String {
     format!(
         "[Unit]\n\
-         Description=kbf storage node of the update rehearsal, run from the current release\n\
+         Description=kbf {mode} node of the update rehearsal, run from the current release\n\
          \n\
          [Service]\n\
          {account}\n\
+         {extra}\
          StateDirectory=kbf-rehearsal\n\
          WorkingDirectory=/var/lib/kbf-rehearsal\n\
-         ExecStart={RELEASES}/current/kbf --mode=storage \
+         ExecStart={RELEASES}/current/kbf --mode={mode} \
          --hot-store=file:///var/lib/kbf-rehearsal/hot \
          --cold-store=file:///var/lib/kbf-rehearsal/cold {flags}\n\
          Restart=on-failure\n\

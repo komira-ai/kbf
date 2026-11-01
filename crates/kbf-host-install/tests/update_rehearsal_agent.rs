@@ -20,15 +20,24 @@
 //!   unit `packaging/host-agent/linux/kbf-updater-agent.service` runs it, as `kbf-updater`, with
 //!   its certificate placed (`--client-cert`, `--client-key`, `--ca`; `--cordon-dir` is the unit's
 //!   state directory, as the packaged unit's comment says for placed certificates), the
-//!   simplest of the supported ways: enrolling needs a token and the frontend's enroll listener for a result that
-//!   is the same files;
+//!   simplest of the supported ways: enrolling needs a token and the frontend's enroll listener
+//!   for a result that is the same files;
 //! - release N's helper and `kbf` on the host, as in the first rehearsal;
+//! - release N's `kbf --mode=storage-and-daemon`, as the farm's nodes run it: the storage node and
+//!   the node daemon in one process, under a unit with `Delegate=yes`, as the account the
+//!   storage rehearsal uses. The daemon half runs the container driver over the runner's own
+//!   `crun` (rootless, the account's subordinate ids, its cgroup subtree delegated by the unit),
+//!   which is the one runtime the daemon of `storage-and-daemon` supports; no action is sent to
+//!   it, so no image is fetched;
 //! - a real frontend of release N (`kbf --mode=frontend`, a SQLite state store, the farm CA, the
 //!   operator API and the enroll listener) that the host's storage node registers with, as the
 //!   storage member whose state and build the agent reads from the frontend's worker listener
-//!   (`GET /v1/nodes/{id}/storage-health`) with its certificate alone, no token. The host was
-//!   provisioned by hand, so the operator adopts it (`POST /v1/enroll/nodes/{id}:adopt`), the
-//!   registry row that joins the node to its member.
+//!   (`GET /v1/nodes/{id}/storage-health`) with its certificate alone, no token, and that the
+//!   daemon half registers with as a node, whose placement the agent drains and gives back on
+//!   the same listener (`GET /v1/nodes/{id}`, `:drain`, `:uncordon`) and the operator reads on
+//!   `GET /v1/nodes/{id}` of the operator API. The host was provisioned by hand, so the
+//!   operator adopts it (`POST /v1/enroll/nodes/{id}:adopt`), the registry row that joins the
+//!   node to its member.
 //!
 //! What proves what: the coordinator only knows the host by its heartbeats, so the host
 //! appearing in its status at release N proves the agent dialled it over mutual TLS with the
@@ -37,17 +46,31 @@
 //! health, confirm, undrain) through the helper; `deploy-farm` ending 0 proves the coordinator
 //! reported the farm converged on the version `farm-version` printed.
 //!
-//! What is not covered: the host is a storage node without a daemon half, so the frontend does
-//! not know it as a worker and the drain and the undrain are answered "no such node", which the
-//! agent takes as nothing to drain; a drain of a node with leases is not rehearsed (a daemon
-//! half needs a container runtime). The minimum of storage hosts that must stay up is 0 (the
-//! farm has the one host; with the default 1 the coordinator never orders the last storage
-//! host). The issuer is a stand-in for GitHub's, and the coordinator's address is loopback.
+//! The drain is read from the frontend's side, after the fact: the frontend logs each action on
+//! a node (`operator action`, on the operator API and on the worker listener the agent uses
+//! alike), each registration of a daemon (`worker registered`) and the end of each daemon
+//! stream (`worker stream ended`) as they happen, so the part of its log written while
+//! `deploy-farm` runs is the order of events, with no sampling and no timing. Before the update
+//! the node is `serving`, connected, on release N's daemon. During it the frontend records one
+//! drain, before the daemon's stream ends; then N's stream ends (the switch stopped its
+//! process) while the node is drained; then one undrain, and a daemon registers again. After
+//! the confirm the node is `serving` and connected on N+1's daemon. So the agent drained the
+//! node before the switch and gave it back after it. A drain the frontend answers "no such
+//! node" (a host without a daemon half) records nothing and fails the rehearsal.
 //!
-//! It needs Linux, systemd, root and the network, so it is `#[ignore]`d and runs through
-//! `cargo xtask sudo-test -p kbf-host-install --test update_rehearsal_agent` on a GitHub-hosted
-//! runner, after the job built `kbf-coordinator`. The setup it shares with the first rehearsal
-//! is in `rehearsal/mod.rs`; the farm is in `rehearsal/farm.rs`.
+//! What is not covered: no action runs on the node, so a drain that has to wait for a lease
+//! (and an action cut by the switch, or rerun) is not rehearsed; the node holds no lease when
+//! the agent asks. The agent's health check of a storage host reads its storage member, not
+//! its daemon half, so N+1's daemon may register before or after the undrain; neither order is
+//! asserted. The minimum of storage hosts that must stay up is 0 (the farm has the one
+//! host; with the default 1 the coordinator never orders the last storage host). The issuer is
+//! a stand-in for GitHub's, and the coordinator's address is loopback.
+//!
+//! It needs Linux, systemd, root, `crun` (and `uidmap`) and the network, so it is `#[ignore]`d
+//! and runs through `cargo xtask sudo-test -p kbf-host-install --test update_rehearsal_agent` on
+//! a GitHub-hosted runner, after the job built `kbf-coordinator` and installed `crun`. The setup
+//! it shares with the first rehearsal is in `rehearsal/mod.rs`; the farm is in
+//! `rehearsal/farm.rs`.
 
 #![cfg(target_os = "linux")]
 
@@ -103,6 +126,20 @@ fn agent_unit(host_agent: &Path, exec: &str) -> String {
     out.join("\n") + "\n"
 }
 
+/// The runner's `crun`, and the subordinate ids the daemon's account needs for rootless
+/// containers (`kbf --mode=storage-and-daemon` refuses to start without a range of each).
+fn container_runtime(account: &str) {
+    assert!(
+        Path::new("/usr/bin/crun").is_file(),
+        "no /usr/bin/crun: the job installs `crun` and `uidmap` before the test"
+    );
+    for file in ["/etc/subuid", "/etc/subgid"] {
+        let mut text = fs::read_to_string(file).unwrap_or_default();
+        text.push_str(&format!("{account}:200000:65536\n"));
+        fs::write(file, text).unwrap();
+    }
+}
+
 /// The agent's `StateDirectory` in the packaged unit: the one place it may write under
 /// `ProtectSystem=strict`, where it keeps the marks of its cordons.
 const AGENT_STATE_DIR: &str = "/var/lib/kbf-updater";
@@ -131,6 +168,63 @@ fn members_active_on(commit: &str) -> bool {
         && list
             .iter()
             .all(|m| m["state"] == "active" && m["build_commit"] == commit)
+}
+
+/// Whether the frontend's record of the node through the update, from just before
+/// `deploy-farm` until the node serves on release N+1, shows the agent's drain and undrain
+/// around the switch:
+///
+/// - one drain, before any daemon stream ended or registered: the daemon connected at the
+///   drain is the one seen serving on release N before `deploy-farm`;
+/// - that daemon's stream ended after the drain and before the undrain: its process stopped
+///   for the switch (the frontend sees the connection close as the process exits) while the
+///   node was out of placement, so the drain came before the switch and the undrain after it;
+/// - a daemon registered after that: the restarted node's, release N+1's (the caller waits
+///   for the node to serve on N+1);
+/// - one undrain, and no cordon besides the drain.
+///
+/// N+1's daemon may register after the undrain: the agent's health check of a storage host
+/// reads the storage member, not the daemon half, so the order of those two is not the
+/// agent's and is not asserted.
+///
+/// Before the host ran a daemon, the frontend answered the agent's drain "no such node" and
+/// recorded no drain at all, which fails here.
+fn drained_around_the_restart(events: &[farm::NodeEvent]) -> Result<(), String> {
+    use farm::NodeEvent::{Cordon, Drain, Registered, StreamEnded, Uncordon};
+    let count = |e: &farm::NodeEvent| events.iter().filter(|x| *x == e).count();
+    if count(&Cordon) != 0 {
+        return Err("the node was cordoned besides the agent's drain".into());
+    }
+    let drain = match (count(&Drain), events.iter().position(|e| *e == Drain)) {
+        (1, Some(at)) => at,
+        (0, _) => return Err("the frontend recorded no drain of the node".into()),
+        (n, _) => return Err(format!("the node was drained {n} times, not once")),
+    };
+    let undrain = match (count(&Uncordon), events.iter().position(|e| *e == Uncordon)) {
+        (1, Some(at)) => at,
+        (0, _) => return Err("the frontend recorded no undrain of the node".into()),
+        (n, _) => return Err(format!("the node was given back {n} times, not once")),
+    };
+    if events[..drain]
+        .iter()
+        .any(|e| matches!(e, Registered | StreamEnded))
+    {
+        return Err("the daemon's stream ended or a daemon registered before the drain".into());
+    }
+    if undrain < drain {
+        return Err("the node was given back before it was drained".into());
+    }
+    let Some(ended) = events[drain..undrain]
+        .iter()
+        .position(|e| *e == StreamEnded)
+        .map(|at| drain + at)
+    else {
+        return Err("the daemon's stream did not end while the node was drained".into());
+    };
+    if !events[ended..].contains(&Registered) {
+        return Err("no daemon registered after the daemon's stream ended".into());
+    }
+    Ok(())
 }
 
 /// Waits until `ready` holds, as long as [`PATIENCE`] allows, and stops early when one of the
@@ -197,22 +291,30 @@ fn the_agent_updates_the_host_when_the_coordinator_is_told_the_next_release() {
     let storage_dir = farm_dir.join("storage");
     let updater_files = farm_dir.join("updater");
 
-    // The host: release N's kbf as a storage node that registers with the frontend. Its
-    // accounts (the service's and the updater's) exist once the host is laid out, and the keys
-    // are made for them then.
+    // The host: release N's kbf as a farm node (a storage node and a daemon in one process)
+    // that registers with the frontend. Its accounts (the service's and the updater's) exist
+    // once the host is laid out, and the keys are made for them then.
     let path = |p: &Path| p.display().to_string();
+    let worker = farm::FRONTEND_WORKER.rsplit(':').next().unwrap();
     let flags = format!(
         "--storage-listen={storage} --storage-tls-cert={} --storage-tls-key={} \
-         --storage-client-ca={} --frontend=https://localhost:{} --advertise-addr={storage}",
+         --storage-client-ca={} --frontend=https://localhost:{worker} --advertise-addr={storage} \
+         --driver=container --server=https://localhost:{worker} --ca-cert={} --cert={} --key={} \
+         --node-id={} --data-dir=/var/lib/kbf-rehearsal/data",
         path(&storage_dir.join("storage.pem")),
         path(&storage_dir.join("storage.key")),
         path(&storage_dir.join("ca.pem")),
-        farm::FRONTEND_WORKER.rsplit(':').next().unwrap(),
+        path(&storage_dir.join("ca.pem")),
+        path(&storage_dir.join("daemon.pem")),
+        path(&storage_dir.join("daemon.key")),
+        farm::NODE,
     );
-    let unit = rehearsal::kbf_unit(&format!("User={SERVICE_ACCOUNT}"), &flags);
+    let unit = rehearsal::kbf_node_unit(&format!("User={SERVICE_ACCOUNT}"), &flags);
     let host_agent = rehearsal::lay_out(&r, &unit);
+    container_runtime(SERVICE_ACCOUNT);
     farm::private_dir(&storage_dir, Some(SERVICE_ACCOUNT));
     pki.storage(&storage_dir, &ip, SERVICE_ACCOUNT);
+    pki.daemon(&storage_dir, SERVICE_ACCOUNT);
     farm::put(
         &storage_dir.join("ca.pem"),
         &ca_pem,
@@ -258,6 +360,13 @@ fn the_agent_updates_the_host_when_the_coordinator_is_told_the_next_release() {
         "the storage member active on release N",
         &mut [&mut frontend],
         || members_active_on(old),
+    );
+    // The daemon half registered too: the frontend shows the node serving and connected, on
+    // release N's daemon.
+    wait(
+        "the node serving and connected on release N",
+        &mut [&mut frontend],
+        || farm::seen().is_some_and(|n| n.serving() && n.connected && n.runs(old)),
     );
 
     // The coordinator, trusting the stand-in issuer.
@@ -375,6 +484,15 @@ fn the_agent_updates_the_host_when_the_coordinator_is_told_the_next_release() {
         desired, r.version,
         "farm-version and the version facts agree"
     );
+    // The record is the legacy scheduler core's (the frontend's default): the js core places
+    // a node without the `operator action` line.
+    let started = fs::read_to_string(&frontend.log).unwrap();
+    assert!(
+        !started.contains("scheduler core: js"),
+        "the frontend runs the js scheduler core, which does not log the node's drain and \
+         undrain the rehearsal reads"
+    );
+    let watch = farm::Watch::start(&frontend.log);
     let deployed = deploy("deploy_farm", &desired);
     assert!(
         deployed.contains("baseline: hosts live before the deploy: storage 1"),
@@ -384,6 +502,19 @@ fn the_agent_updates_the_host_when_the_coordinator_is_told_the_next_release() {
         deployed.contains(&format!("ok: every live host runs {desired}")),
         "{deployed}"
     );
+
+    // The node after the update: serving and connected, on release N+1's daemon.
+    wait(
+        "the node serving and connected on release N+1",
+        &mut [&mut frontend, &mut coordinator],
+        || farm::seen().is_some_and(|n| n.serving() && n.connected && n.runs(new)),
+    );
+    // What the frontend did to the node meanwhile, in the order it did it.
+    let events = watch.stop();
+    println!("the node, as the frontend's log records it: {events:?}");
+    if let Err(why) = drained_around_the_restart(&events) {
+        panic!("{why}: {events:?}");
+    }
 
     // The host runs N+1, and the coordinator's word for it is the agent's.
     let done = farm::host_status(&ca_file).unwrap();
@@ -473,5 +604,165 @@ fn the_rehearsals_agent_can_write_the_directory_of_its_cordons() {
         writable.iter().any(|w| cordons.starts_with(w)),
         "{} is not inside the unit's StateDirectory or ReadWritePaths ({writable:?})",
         cordons.display()
+    );
+}
+
+/// The lines `kbf --mode=frontend` writes for the node, as its terminal log has them (with
+/// colour), around other lines and another node's.
+fn frontend_line(message: &str, fields: &str) -> String {
+    format!(
+        "\u{1b}[2m2026-01-01T00:00:00.000000Z\u{1b}[0m \u{1b}[32m INFO\u{1b}[0m \
+         \u{1b}[2mkbf_server::farm\u{1b}[0m\u{1b}[2m:\u{1b}[0m {message} {fields}"
+    )
+}
+
+fn colour_field(name: &str, value: &str) -> String {
+    format!("\u{1b}[3m{name}\u{1b}[0m\u{1b}[2m=\u{1b}[0m{value}")
+}
+
+fn registered(node: &str) -> String {
+    frontend_line(
+        "worker registered",
+        &format!(
+            "{} {}",
+            colour_field("worker", node),
+            colour_field("capacity", "Capacity { cpu_millis: 4000 }")
+        ),
+    )
+}
+
+fn action(node: &str, action: &str) -> String {
+    frontend_line(
+        "operator action",
+        &format!(
+            "{} {}",
+            colour_field("worker", node),
+            colour_field("action", action)
+        ),
+    )
+}
+
+/// The frontend's log of an update the agent drained and gave back: the events of the node
+/// alone, in order, whatever the colour codes and the other lines.
+#[test]
+fn the_watch_reads_the_nodes_drain_and_undrain_from_the_frontends_log() {
+    use farm::NodeEvent::{Drain, Registered, StreamEnded, Uncordon};
+    let log = [
+        registered(farm::NODE),
+        frontend_line("storage member active", "member=1"),
+        action(farm::NODE, "Drain(1800s)"),
+        action("host-10", "Drain(1800s)"),
+        frontend_line("worker stream ended", &colour_field("worker", farm::NODE)),
+        registered(farm::NODE),
+        registered("host-10"),
+        action(farm::NODE, "Uncordon"),
+        registered(farm::NODE),
+        // A line cut off mid-write.
+        "\u{1b}[2m2026-01-01T00:0".to_owned(),
+    ]
+    .join("\n");
+    let events = farm::node_events(&log);
+    assert_eq!(
+        events,
+        [
+            Registered,
+            Drain,
+            StreamEnded,
+            Registered,
+            Uncordon,
+            Registered
+        ]
+    );
+    assert_eq!(
+        drained_around_the_restart(&events[1..]),
+        Ok(()),
+        "{events:?}"
+    );
+}
+
+/// The lines a rehearsal's frontend (release N, `scheduler core: legacy`) wrote through a
+/// green update, colour removed: the node's events are read in order, and the record passes.
+#[test]
+fn the_watch_reads_a_rehearsals_frontend_log() {
+    let log = "\
+2026-11-01T23:20:01.871367Z  INFO kbf_server::serve: scheduler core: legacy
+2026-11-01T23:20:02.069714Z  INFO kbf_server::worker: worker registered worker=host-1 capacity=Resources { cpu_millis: 2000, memory_bytes: 16106127360, gpus: 0, vms: 0, disk_bytes: 0, leases: None }
+2026-11-01T23:20:49.329833Z  INFO kbf_server::farm: operator action worker=host-1 action=Drain(18446744073709551615.999999999s)
+2026-11-01T23:20:49.330933Z  INFO kbf_server::farm::durable::intake: another frontend placed the node worker=host-1 cordon=Draining { deadline_unix_ms: 18446744073709551615 }
+2026-11-01T23:20:49.534092Z  INFO kbf_server::worker: worker stream ended worker=host-1
+2026-11-01T23:20:49.965951Z  INFO kbf_server::farm: the daemon restarted and names its predecessor stopped worker=host-1 predecessor=\"fa02025f8e64f96b7b83f57f69b15c34\"
+2026-11-01T23:20:49.977334Z  INFO kbf_server::worker: worker registered worker=host-1 capacity=Resources { cpu_millis: 2000, memory_bytes: 16106127360, gpus: 0, vms: 0, disk_bytes: 0, leases: None }
+2026-11-01T23:20:51.771438Z  INFO kbf_server::farm: operator action worker=host-1 action=Uncordon
+2026-11-01T23:20:51.890218Z  INFO kbf_server::farm::durable::intake: another frontend returned the node to placement worker=host-1
+2026-11-01T23:20:52.000000Z  INFO kbf_server::farm: operator action worker=host-1 action=Cordon
+";
+    assert_eq!(farm::NODE, "host-1");
+    use farm::NodeEvent::{Cordon, Drain, Registered, StreamEnded, Uncordon};
+    let events = farm::node_events(log);
+    assert_eq!(
+        events,
+        [Registered, Drain, StreamEnded, Registered, Uncordon, Cordon]
+    );
+    assert_eq!(drained_around_the_restart(&events[1..5]), Ok(()));
+}
+
+/// The record of each way the update can fail to drain the node around the switch is refused,
+/// with the reason; N+1's daemon registering before or after the undrain is accepted alike.
+#[test]
+fn a_record_without_the_drain_around_the_switch_is_refused() {
+    use farm::NodeEvent::{Cordon, Drain, Registered, StreamEnded, Uncordon};
+    for events in [
+        [Drain, StreamEnded, Registered, Uncordon],
+        [Drain, StreamEnded, Uncordon, Registered],
+    ] {
+        assert_eq!(drained_around_the_restart(&events), Ok(()), "{events:?}");
+    }
+    let cases: [(&[farm::NodeEvent], &str); 11] = [
+        // The host before it ran a daemon: the drain was answered "no such node", so the
+        // frontend recorded nothing, and the restart ends and registers no daemon stream.
+        (&[], "no drain"),
+        (&[Registered], "no drain"),
+        (&[Drain, StreamEnded, Registered], "no undrain"),
+        (
+            &[StreamEnded, Registered, Drain, Uncordon],
+            "before the drain",
+        ),
+        (
+            &[Registered, Drain, StreamEnded, Registered, Uncordon],
+            "before the drain",
+        ),
+        (
+            &[Drain, Uncordon, StreamEnded, Registered],
+            "did not end while the node was drained",
+        ),
+        (
+            &[Drain, Registered, Uncordon],
+            "did not end while the node was drained",
+        ),
+        (
+            &[Drain, StreamEnded, Uncordon],
+            "no daemon registered after",
+        ),
+        (
+            &[Uncordon, Drain, StreamEnded, Registered],
+            "given back before it was drained",
+        ),
+        (
+            &[Drain, StreamEnded, Registered, Drain, Uncordon],
+            "drained 2 times",
+        ),
+        (
+            &[Drain, StreamEnded, Registered, Uncordon, Cordon],
+            "cordoned besides",
+        ),
+    ];
+    for (events, why) in cases {
+        let refused = drained_around_the_restart(events).expect_err(&format!("{events:?}"));
+        assert!(refused.contains(why), "{events:?}: {refused}");
+    }
+    assert!(
+        drained_around_the_restart(&[Uncordon, Drain, StreamEnded, Registered, Uncordon])
+            .unwrap_err()
+            .contains("given back 2 times")
     );
 }

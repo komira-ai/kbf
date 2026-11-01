@@ -174,6 +174,23 @@ impl Pki {
         })
     }
 
+    /// The daemon half's certificate (role `daemon`) for the host `NODE`, owned by `account`.
+    pub fn daemon(&self, dir: &Path, account: &str) -> (PathBuf, PathBuf) {
+        Self::write(dir, "daemon", Some(account), |key| {
+            let node_id = NODE.parse().unwrap();
+            let cert = NodeCert {
+                node_id: &node_id,
+                role: Role::Daemon,
+                key,
+                advertise: None,
+            };
+            self.ca
+                .issue_node(&cert, unix_now(), &mut SystemEntropy)
+                .unwrap()
+                .der
+        })
+    }
+
     /// The updater's certificate of the storage host `node`, as `<node>.pem` and `<node>.key`
     /// in `dir`, for a stand-in host that is no account's.
     pub fn storage_host(&self, dir: &Path, node: &str) -> (PathBuf, PathBuf) {
@@ -331,11 +348,12 @@ pub fn call(name: &str, method: &str, url: &str, ca: Option<&Path>, body: Option
     run(name, cmd.arg(url))
 }
 
-/// Records the host as the frontend's node, with the storage address it advertises: the node
-/// was provisioned by hand, with certificates the operator issued, so it never enrolled.
+/// Records the host as the frontend's node, a storage node and a daemon, with the storage
+/// address it advertises: the node was provisioned by hand, with certificates the operator
+/// issued, so it never enrolled.
 pub fn adopt(advertise: &str) {
     let url = format!("http://{FRONTEND_API}/v1/enroll/nodes/{NODE}:adopt");
-    let body = format!(r#"{{"roles":["storage"],"advertise":"{advertise}"}}"#);
+    let body = format!(r#"{{"roles":["storage","daemon"],"advertise":"{advertise}"}}"#);
     call("adopt", "POST", &url, None, Some(&body));
 }
 
@@ -458,4 +476,149 @@ pub fn storage_health(ca: &Path, cert: &Path, key: &Path) -> Value {
             .arg(url),
     );
     serde_json::from_str(&text).unwrap()
+}
+
+/// The frontend's operator API view of the host's node (`GET /v1/nodes/{id}`): `None` while the
+/// frontend does not know it as a daemon (404) or does not answer.
+pub fn node() -> Option<Value> {
+    let out = Command::new("curl")
+        .args(["--silent", "--max-time", "5"])
+        .args(["-H", &format!("Authorization: Bearer {OPERATOR_TOKEN}")])
+        .arg(format!("http://{FRONTEND_API}/v1/nodes/{NODE}"))
+        .output()
+        .ok()?;
+    let node: Value = serde_json::from_slice(&out.stdout).ok()?;
+    (node["node_id"] == NODE).then_some(node)
+}
+
+/// What the frontend said of the node at one look.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Seen {
+    /// `placement.state`: `serving`, `cordoned`, `draining`, `drained` or `drain_paused`.
+    pub placement: String,
+    /// Whether the daemon's newest stream is open.
+    pub connected: bool,
+    /// The daemon's version as it last reported it: `<semver>+<12 hex digits of the commit>`.
+    pub version: String,
+}
+
+impl Seen {
+    fn of(node: &Value) -> Self {
+        Self {
+            placement: node["placement"]["state"].as_str().unwrap_or("").to_owned(),
+            connected: node["connected"] == true,
+            version: node["software"]["daemon_version"]
+                .as_str()
+                .unwrap_or("")
+                .to_owned(),
+        }
+    }
+
+    /// Whether placement may offer the node leases.
+    pub fn serving(&self) -> bool {
+        self.placement == "serving"
+    }
+
+    /// Whether the daemon runs the build of `commit`.
+    pub fn runs(&self, commit: &str) -> bool {
+        self.version.ends_with(&format!("+{}", &commit[..12]))
+    }
+}
+
+/// The node as the frontend shows it now.
+pub fn seen() -> Option<Seen> {
+    node().map(|n| Seen::of(&n))
+}
+
+/// What the frontend's log records of the node `NODE`, one entry per line that names it.
+///
+/// The frontend writes these lines itself as it acts, in the order it acts: `operator action`
+/// when a node is cordoned, drained or given back (on the operator API and on the worker
+/// listener the agent uses alike; a drain the frontend answers "no such node" writes none),
+/// `worker registered` when a daemon's stream registers the node, and `worker stream ended`
+/// when a daemon's stream ends (its connection closes as its process stops). The `operator action`
+/// line is the legacy scheduler core's, the default; the js core does not write it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NodeEvent {
+    /// A daemon registered as the node.
+    Registered,
+    /// A daemon's stream ended.
+    StreamEnded,
+    /// The node was cordoned without a drain.
+    Cordon,
+    /// The node was drained.
+    Drain,
+    /// The node was given back to placement.
+    Uncordon,
+}
+
+/// The events of `NODE` in `log`, the frontend's standard output and error, in order. The
+/// colour codes of a terminal log are dropped first.
+pub fn node_events(log: &str) -> Vec<NodeEvent> {
+    let node = format!("worker={NODE}");
+    log.lines()
+        .map(without_colour)
+        .filter(|line| line.split_whitespace().any(|w| w == node))
+        .filter_map(|line| {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            if line.contains("worker registered") {
+                Some(NodeEvent::Registered)
+            } else if line.contains("worker stream ended") {
+                Some(NodeEvent::StreamEnded)
+            } else if !line.contains("operator action") {
+                None
+            } else if words.iter().any(|w| w.starts_with("action=Drain(")) {
+                Some(NodeEvent::Drain)
+            } else if words.contains(&"action=Uncordon") {
+                Some(NodeEvent::Uncordon)
+            } else if words.contains(&"action=Cordon") {
+                Some(NodeEvent::Cordon)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// `line` without its ANSI escape sequences (`ESC [ ... <letter>`).
+fn without_colour(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The frontend's own record of the node from [`Watch::start`] on: the part of its log written
+/// since then, read when the watch stops. Nothing is sampled, so no event is missed however
+/// briefly the node was in a state.
+pub struct Watch {
+    log: PathBuf,
+    from: usize,
+}
+
+impl Watch {
+    /// Starts at the end of `log` as it is now.
+    pub fn start(log: &Path) -> Self {
+        let from = fs::read(log).unwrap().len();
+        Self {
+            log: log.to_owned(),
+            from,
+        }
+    }
+
+    /// The node's events the log gained since [`Watch::start`], in order.
+    pub fn stop(self) -> Vec<NodeEvent> {
+        let log = fs::read(&self.log).unwrap();
+        node_events(&String::from_utf8_lossy(&log[self.from..]))
+    }
 }

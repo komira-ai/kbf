@@ -481,6 +481,9 @@ jobs:
         env:
           TAG: ${{ needs.plan.outputs.tag }}
         run: printf '%s\n' "$TAG" > /var/tmp/kbf-update-rehearsal.to
+      # The node's daemon half runs its containers with the runner's own `crun`, rootless.
+      - name: The container runtime of the daemon half
+        run: sudo apt-get install -y --no-install-recommends crun uidmap
       - name: The coordinator of this commit
         run: cargo build --locked -p kbf-coordinator
       - run: cargo xtask sudo-test -p kbf-host-install --test update_rehearsal_agent -- --exact the_agent_updates_the_host_when_the_coordinator_is_told_the_next_release --nocapture
