@@ -17,13 +17,20 @@
 //! not raised. A clear clears the service: every other halt report received while the halt
 //! stood (`halt_seen`, kept with the halt) is acknowledged with it, so the coordinator and the
 //! agents, which lift on the generation, agree. A `last_update` has no attempt number or
-//! finish stamp, so a report's identity is its `(node, target)` for as long as the host keeps
-//! reporting it: a different `last_update` (another target, or no halt at all) ends the host's
-//! acknowledgement ([`end_ack`]), and a halt reported after that is new. The design also ends it
-//! when the host is next ordered to update the service; that cannot happen first here, since a
-//! host whose `last_update` is the failed target is not ordered it (`failed_here`), and the
-//! order of another target is not a new attempt of this one. A service the host is updating is
-//! not read: its `last_update` is the one before.
+//! finish stamp, so a report is identified by the host and its whole `last_update` for as long as
+//! the host keeps reporting it: a different `last_update` (another target, reason or class, or no
+//! halt at all) ends the host's acknowledgement ([`end_ack`]), and a halt reported after that is
+//! new. Design kbf#2197 section 3.8 also ends it when the host is ordered the acknowledged
+//! target, and leaves it standing for an order of another target. That order cannot be given
+//! while the acknowledgement stands: the only place an order is produced is
+//! `Coordinator::reply_to` (`service.rs`, the call of `Fleet::order`), after [`decide`], and
+//! `decide_why` holds a host whose beat's `last_update` is a failure of the desired version
+//! (`Hold::FailedHere`, `decide.rs`) and one that is updating (`Hold::Updating`). The
+//! acknowledgement stands only while the host's beat carries the acknowledged report, a failed
+//! update of its target, and any other beat ends it in [`note`], before [`decide`] and
+//! durably, with no order for the service if the write fails. No operator verb lifts
+//! `FailedHere`, and a change of the desired state does not change what the host reports.
+//! A service the host is updating is not read: its `last_update` is the one before.
 //!
 //! Each clear raises the service's generation by one. A reply to an agent that
 //! announced [`FEATURE`] carries the generation of every service that has one (`halts`): the

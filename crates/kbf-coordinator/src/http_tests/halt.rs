@@ -771,3 +771,42 @@ async fn an_ack_matches_the_whole_report_not_the_host_and_target() {
     send(&rig, "s1", "storage", &beat("1.0", &classed)).await;
     assert_eq!(convergence(&rig, "kbf").await["state"], "halted");
 }
+
+/// Pins: design kbf#2197 section 3.8 ends an acknowledgement when the host is ordered the
+/// acknowledged target, and no path orders it while the acknowledgement stands. After a clear the
+/// host, still reporting the cleared halt, is ordered nothing of the acknowledged target whatever
+/// the desired state does: it is ordered another target (the acknowledgement stands), and nothing
+/// again when the desired state returns to the acknowledged one. It is ordered the target only
+/// in the reply to the beat whose report changed, and the acknowledgement has ended by then.
+#[tokio::test]
+async fn after_a_clear_the_host_is_not_ordered_the_acked_target_until_its_report_changes() {
+    let rig = farm("halt-no-order-of-acked-target").await;
+    let nothing = json!({"reply": "nothing"});
+    send(&rig, "s1", "storage", &beat("1.0", HALT)).await;
+    clear(&rig, "kbf").await;
+    assert_eq!(
+        send(&rig, "s1", "storage", &beat("1.0", HALT)).await,
+        nothing
+    );
+
+    rig.set(r#"{"version":"3.0","min_up":{"storage":0,"frontend":0}}"#)
+        .await;
+    let other = send(&rig, "s1", "storage", &beat("1.0", HALT)).await;
+    assert_eq!(other, json!({"reply": "update", "version": "3.0"}));
+    let acked = brief(&status(&rig).await["ops"]["services"]["kbf"]["halt_acked"]);
+    assert_eq!(acked, json!([{"node_id": "s1", "target": "2.0"}]));
+
+    rig.set(r#"{"version":"2.0","min_up":{"storage":0,"frontend":0}}"#)
+        .await;
+    assert_eq!(
+        send(&rig, "s1", "storage", &beat("1.0", HALT)).await,
+        nothing
+    );
+    let acked = brief(&status(&rig).await["ops"]["services"]["kbf"]["halt_acked"]);
+    assert_eq!(acked, json!([{"node_id": "s1", "target": "2.0"}]));
+
+    let changed = send(&rig, "s1", "storage", &beat("1.0", "")).await;
+    assert_eq!(changed, json!({"reply": "update", "version": "2.0"}));
+    let acked = status(&rig).await["ops"]["services"]["kbf"]["halt_acked"].clone();
+    assert_eq!(acked, json!([]));
+}
