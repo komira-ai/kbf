@@ -60,12 +60,13 @@ The crate names no product and depends on no crate of this workspace but the hoo
   (`/var/lib/svc`, `/var/lib/svc-state`), so the one-component rule cannot hand it `/var/lib/sudo` or
   `/run/udev`.
 - **The dash rule stops at another service.** A root hook's directory `<root>/<service>-…` is
-  refused when it begins with a longer declared name (`tierstore` may not write `/var/lib/tierstore-b/x`
-  if `tierstore-b` is a service of the host), across declarations like the conflicts. A service
+  refused when it begins with a longer declared name, as written or once its links are followed, at the load
+  and at every launch (`Declared::names` records the services; `tierstore` may not write `/var/lib/tierstore-b/x`,
+  nor a link `/var/lib/tierstore-x` that points there, if `tierstore-b` is a service of the host), across declarations like the conflicts. A service
   may not be named for a directory of the system (`names::SYSTEM_NAMES`), and the reserved list is the
   last word on `/var/lib/sudo`, `/run/udev`, `/run/tmpfiles.d`, `/run/systemd/network`,
   `/var/lib/apt` and `/var/lib/cloud`.
-- **Root is derived once.** `Launch::new` takes the hook's uid and `Launch::of` a loaded declaration;
+- **Root is derived once.** `Launch::of` builds a launch from a loaded declaration (`Launch::new` is crate-private);
   the flag is private, `Declared::recheck` supplies the uid to `recheck_targets`, and nothing a
   caller passes can turn the root rules off.
 - **Environment names.** `LD_*`, `MALLOC_*`, `PYTHON*`, `DYLD_*`, `GIT_*` and a list of loader, resolver, shell

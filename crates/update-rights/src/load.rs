@@ -187,8 +187,11 @@ pub(crate) fn recheck_targets(
     hook_uid: u32,
     names: &BTreeSet<String>,
 ) -> Result<(), Refusal> {
-    let _ = names;
-    check_targets(declaration, hook_uid == 0)
+    check_targets(declaration, hook_uid == 0)?;
+    match trespass_among(declaration, hook_uid == 0, names) {
+        Some((what, with)) => Err(Refusal::Conflict { what, with }),
+        None => Ok(()),
+    }
 }
 
 fn account_error(what: &str, name: &str) -> Refusal {
@@ -332,7 +335,7 @@ pub fn load_dir(dir: &Path, policy: &Policy<'_>) -> Result<Loaded, io::Error> {
             .iter()
             .filter(|b| b.declaration.name != declared.declaration.name)
             .find_map(|b| conflict(declared, b).map(|what| (what, b.declaration.name.clone())))
-            .or_else(|| trespass(declared, &good));
+            .or_else(|| trespass_among(&declared.declaration, declared.hook.uid == 0, &names));
         match other {
             Some((what, with)) => loaded.refused.push(Refused {
                 file: declared.file.clone(),
@@ -352,32 +355,38 @@ pub fn load_dir(dir: &Path, policy: &Policy<'_>) -> Result<Loaded, io::Error> {
     Ok(loaded)
 }
 
-/// A write path of a hook that runs as root in the directory of another declared service: the
-/// first component under the write root belongs to the declared name it begins with, the longest
-/// one, so `tierstore` may write `/var/lib/tierstore-state` and not `/var/lib/tierstore-b/x` when
-/// `tierstore-b` is a service of this host. Returns what the two fight over and the owner.
-fn trespass(declared: &Declared, good: &[Declared]) -> Option<(&'static str, String)> {
-    if declared.hook.uid != 0 {
+/// What a root hook and the owner of a directory it writes in fight over.
+const TRESPASS: &str = "a write path in the directory of another service";
+
+/// A write path of a hook that runs as root in the directory of another declared service, as
+/// written or once its links are followed: the first component under the write root belongs to
+/// the declared name among `names` it begins with, the longest one, so `tierstore` may write
+/// `/var/lib/tierstore-state` and not `/var/lib/tierstore-b/x`, nor a link `/var/lib/tierstore-x`
+/// that points there, when `tierstore-b` is a service of the host. Returns what the two fight over
+/// and the owner.
+fn trespass_among(
+    declaration: &Declaration,
+    root_hook: bool,
+    names: &BTreeSet<String>,
+) -> Option<(&'static str, String)> {
+    if !root_hook {
         return None;
     }
-    let own = &declared.declaration.name;
-    declared
-        .declaration
-        .hook
-        .write_paths
-        .iter()
-        .find_map(|path| {
-            let first = reserved::first_below_a_write_root(path)?;
-            let owner = good
-                .iter()
-                .map(|g| g.declaration.name.as_str())
-                .filter(|name| reserved::belongs_to(first, name))
-                .max_by_key(|name| name.len())?;
-            (owner != own).then(|| {
-                (
-                    "a write path in the directory of another service",
-                    owner.to_owned(),
-                )
+    declaration.hook.write_paths.iter().find_map(|path| {
+        let target = std::fs::canonicalize(path)
+            .ok()
+            .map(|target| target.to_string_lossy().into_owned());
+        [Some(path.clone()), target]
+            .into_iter()
+            .flatten()
+            .find_map(|candidate| {
+                let first = reserved::first_below_a_write_root(&candidate)?;
+                let owner = names
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|name| reserved::belongs_to(first, name))
+                    .max_by_key(|name| name.len())?;
+                (owner != declaration.name).then(|| (TRESPASS, owner.to_owned()))
             })
-        })
+    })
 }
