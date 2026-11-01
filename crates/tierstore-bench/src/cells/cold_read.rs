@@ -328,6 +328,7 @@ fn arm(
         .is_some_and(|(mode, _)| *mode != FaultMode::Pass);
     let (before_fault, after_fault) = (fault.clone(), fault.map(|(_, switch)| switch));
     let (before_seen, after_seen) = (seen.clone(), seen);
+    let proxy = after_fault.clone();
     Arm {
         label,
         pace: Pace::Closed,
@@ -376,6 +377,7 @@ fn arm(
         })),
         faulted,
         notes,
+        proxy,
     }
 }
 
@@ -408,7 +410,7 @@ fn cleanup(sets: Vec<Arc<ObjectSet>>, faults: Option<Arc<dyn FaultSwitch>>) -> H
 /// ledger refuses the cell, the load gate trips or cannot be read, or a file or the request log
 /// fails.
 pub async fn run(ctx: &CellContext, plan: &CellPlan) -> Result<Vec<CellResult>, BenchError> {
-    run_with(ctx, plan, Arc::new(ProcLoad), None, None).await
+    run_with(ctx, plan, Arc::new(ProcLoad::new()), None, None).await
 }
 
 /// [`run`] with the machine, the fault proxy and a cap on the requests of a pass (and the
@@ -669,10 +671,9 @@ mod tests {
     #[tokio::test]
     async fn a_store_that_will_not_take_the_objects_stops_the_run() {
         let dir = temp("tb-cold-read-dead");
-        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let dead = format!("http://{}", closed.local_addr().unwrap());
-        drop(closed);
-        let ctx = testkit::ctx(dir.path(), &[(Role::Cold, &dead)], Window::Busy);
+        let dead_store = testkit::DeadStore::start().await;
+        let dead = dead_store.endpoint();
+        let ctx = testkit::ctx(dir.path(), &[(Role::Cold, dead)], Window::Busy);
         let err = run_with(&ctx, &plan(&[1], &[4096]), Script::calm(), None, Some(2))
             .await
             .unwrap_err();

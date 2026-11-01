@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use kbf_front::Tap;
 use kbf_history::records::{
-    BookSource, Cgroup, Footprint, HitHow, HitRecord, MemoryKill, Output, RunOutcome, RunRecord,
-    Timestamps, UsageBasis, WireDigest,
+    BookSource, Cgroup, Footprint, HitHow, HitRecord, MemoryKill, Output, PhaseTimes, RunOutcome,
+    RunRecord, Timestamps, UsageBasis, WireDigest,
 };
 use kbf_history::{Event, EventQueue, InvRef, Minter};
 use kbf_invocation::{
@@ -335,6 +335,12 @@ pub(crate) fn run_record(row: &ActionRow, attempt: &Attempt) -> RunRecord {
         booked_memory_bytes: booked,
         raised_memory_bytes: raised,
         cap_bytes: run.and_then(|r| r.cap_bytes).unwrap_or(0),
+        phase_times: run
+            .map_or(PhaseTimes::Unspecified, |r| match r.phase_times {
+                kbf_invocation::PhaseTimes::Measured => PhaseTimes::Measured,
+                kbf_invocation::PhaseTimes::TaskClaim => PhaseTimes::TaskClaim,
+            })
+            .into(),
         timestamps: Some(Timestamps {
             queued_us: micros(times.queued.or(Some(first_queued))),
             granted_us: micros(Some(attempt.granted)),
