@@ -84,6 +84,8 @@ mod priority_tests;
 #[cfg(test)]
 mod rollback_definition_tests;
 #[cfg(test)]
+mod rollback_membership_tests;
+#[cfg(test)]
 mod rollback_override_tests;
 #[cfg(test)]
 mod rollback_tests;

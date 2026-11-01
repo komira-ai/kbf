@@ -17,6 +17,7 @@ use crate::acks::{drop_ack, is_acked, stale_acks};
 use crate::converge::State;
 use crate::desired::{Desired, DesiredStore, StoreError};
 use crate::fleet::{Fleet, Host};
+use crate::membership::{Standing, standing};
 use crate::ops::{AuditEntry, OpsError, OpsState, OpsStore, ServiceOps, Write};
 use crate::service::convergence_of;
 use crate::services::ServiceDef;
@@ -153,6 +154,12 @@ fn decide(
             .hosts_of(service)
             .filter(|(_, h)| def.roles.contains_key(h.role_name()))
             .filter(|(_, h)| h.is_live(now))
+            // The hosts the service counts: not an excluded one, nor one its selector leaves out.
+            .filter(|(id, _)| {
+                fleet
+                    .node(id)
+                    .is_none_or(|node| standing(def, id, node, state, now) != Standing::Dropped)
+            })
     };
     let older = marks.last_good.as_ref().filter(|good| *good != wanted);
     let marked = marks.bad.contains(wanted);
