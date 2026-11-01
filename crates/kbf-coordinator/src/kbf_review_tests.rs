@@ -29,6 +29,11 @@ fn announcing_other(mut top: Heartbeat, service: &str, running: &str) -> Heartbe
         health: Health::Healthy,
         last_update: None,
         updating: None,
+        step: None,
+        commit: None,
+        step_secs: Default::default(),
+        promotion_pending: false,
+        deferred: None,
     }]);
     top
 }
@@ -202,6 +207,7 @@ fn the_hold_strings_are_the_ones_the_status_documents() {
             Hold::BusyElsewhere => "busy_elsewhere",
             Hold::UpToDate => "up_to_date",
             Hold::FailedHere => "failed_here",
+            Hold::Deferred => "deferred",
             Hold::NoSlot => "no_slot",
             Hold::WaitingForRole => "waiting_for_role",
             Hold::WaitingForService => "waiting_for_service",
@@ -217,6 +223,7 @@ fn the_hold_strings_are_the_ones_the_status_documents() {
         Hold::BusyElsewhere,
         Hold::UpToDate,
         Hold::FailedHere,
+        Hold::Deferred,
         Hold::NoSlot,
         Hold::WaitingForRole,
         Hold::WaitingForService,
