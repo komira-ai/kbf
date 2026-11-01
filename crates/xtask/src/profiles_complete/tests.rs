@@ -74,10 +74,10 @@ fn a_missing_or_empty_shard_is_refused() {
         problems,
         [
             format!(
-                "no raw profile in {} begins `kbf-legacy-2-`: that shard's profiles did not arrive",
+                "no `.profraw` file in {} begins `kbf-legacy-2-`: that shard's profiles did not arrive",
                 d.to_path_buf().display()
             ),
-            "every raw profile that begins `kbf-js-1-` is empty (2 file(s))".to_owned(),
+            "every `.profraw` file that begins `kbf-js-1-` is empty (2 file(s))".to_owned(),
         ]
     );
 }
@@ -97,7 +97,7 @@ fn a_profile_no_shard_owns_is_refused() {
     assert_eq!(
         problems,
         [
-            "7 raw profile(s) begin with none of the shards' prefixes, e.g. kbf-other-0.profraw, kbf-other-1.profraw, kbf-other-2.profraw, kbf-other-3.profraw, kbf-other-4.profraw"
+            "7 `.profraw` file(s) begin with none of the shards' prefixes, e.g. kbf-other-0.profraw, kbf-other-1.profraw, kbf-other-2.profraw, kbf-other-3.profraw, kbf-other-4.profraw"
         ]
     );
     let problems = refused(run(&args(&d, &["kbf-renamed-"])));
@@ -134,7 +134,7 @@ fn the_extension_picks_which_files_are_checked() {
     put(&d, "kbf-js-2-merged.profdata", b"x");
     let problems = refused(run(&a));
     assert!(
-        problems[0].contains("begin with none of the shards' prefixes"),
+        problems[0].contains("1 `.profdata` file(s) begin with none of the shards' prefixes"),
         "{problems:?}"
     );
 }

@@ -259,8 +259,9 @@ jobs:
   # for each function it is in), so raw profiles are what is added up: each shard names its
   # profiles for its core and part (the process id alone repeats between machines), merges them
   # into one indexed profile (`llvm-profdata merge`: counts add, so it is the same profile a
-  # merge of all the raw ones makes; megabytes where the raw files are 1.8 GB for all shards,
-  # which filled the gate's runner) and uploads that; the `test` job below makes the one report of them all. The upload is the LAST step: a
+  # merge of all the raw ones makes; megabytes where the raw profiles are about 14 GB unpacked
+  # for all shards, 1.8 GB as compressed artifacts, which filled the gate's runner) and uploads
+  # that; the `test` job below makes the one report of them all. The upload is the LAST step: a
   # shard that passes has uploaded, and one that fails has not, which is how `test` sees it.
   # The fast set includes the Postgres tests (a throwaway server per shard, below): no S3,
   # crun, root or Mac test is in it.
@@ -404,7 +405,8 @@ jobs:
         if: ${{ always() }}
         run: du -xhd 2 target
       # The shard's raw profiles become ONE indexed profile (a few MB) here, so that `test`
-      # downloads megabytes and not the 1.8 GB of raw profiles, which filled its runner's disk.
+      # downloads megabytes and not the raw profiles (1.8 GB as artifacts, about 14 GB unpacked),
+      # which filled its runner's disk.
       # `xtask merge-profiles` runs the coverage toolchain's own `llvm-profdata merge -sparse` (what
       # cargo-llvm-cov's own merge passes) with no `-failure-mode`: the default (`any`) fails on
       # a corrupt raw profile, and so fails the shard, whose re-run is the remedy.

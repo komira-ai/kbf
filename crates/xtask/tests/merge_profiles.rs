@@ -136,7 +136,8 @@ fn an_empty_profile_and_no_input_fail() {
 }
 
 /// Catches: the default tool (the running toolchain's) never being looked for: with no
-/// `--llvm-profdata` the verb must still try to merge, and fail on a file that is no profile.
+/// `--llvm-profdata` the verb must still try to merge, and fail on a file that is no profile
+/// (or, where the toolchain has no llvm-tools, because the tool is not there).
 #[test]
 fn without_a_tool_flag_the_toolchains_llvm_profdata_is_run() {
     let d = scratch("toolchain");
@@ -149,10 +150,61 @@ fn without_a_tool_flag_the_toolchains_llvm_profdata_is_run() {
         .arg(&out)
         .output()
         .expect("run xtask");
-    assert_eq!(
-        o.status.code(),
-        Some(1),
-        "{}",
-        String::from_utf8_lossy(&o.stderr)
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert_eq!(o.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("lib/rustlib/") && stderr.contains("llvm-profdata"),
+        "the error names the toolchain's own tool path: {stderr}"
     );
+}
+
+/// Catches: a tool path that does not exist reported as something vague: the error must say it
+/// could not run that path.
+#[test]
+fn a_tool_that_is_not_there_is_named() {
+    let d = scratch("missing-tool");
+    put(&d, "kbf-js-1-1-0.profraw", b"x");
+    let out = d.to_path_buf().join("o.profdata");
+    let o = Command::new(XTASK)
+        .args(["merge-profiles", "--dir"])
+        .arg(d.to_path_buf().join("in"))
+        .args([
+            "--extension",
+            "profraw",
+            "--llvm-profdata",
+            "/nonexistent/llvm-profdata",
+            "--out",
+        ])
+        .arg(&out)
+        .output()
+        .expect("run xtask");
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert_eq!(o.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("run /nonexistent/llvm-profdata"),
+        "{stderr}"
+    );
+}
+
+/// Catches: a `rustc` that fails turning into a path like `/lib/rustlib//bin/llvm-profdata`
+/// and a vague spawn error: the verb must say that rustc failed.
+#[test]
+fn a_failing_rustc_is_reported_as_such() {
+    let d = scratch("no-rustc");
+    put(&d, "kbf-js-1-1-0.profraw", b"x");
+    let bin = d.to_path_buf().join("bin");
+    std::fs::create_dir_all(&bin).expect("bin");
+    std::os::unix::fs::symlink(FAKE, bin.join("rustc")).expect("link the fake as rustc");
+    let out = d.to_path_buf().join("o.profdata");
+    let o = Command::new(XTASK)
+        .env("PATH", &bin)
+        .args(["merge-profiles", "--dir"])
+        .arg(d.to_path_buf().join("in"))
+        .args(["--extension", "profraw", "--out"])
+        .arg(&out)
+        .output()
+        .expect("run xtask");
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert_eq!(o.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("rustc --print sysroot failed"), "{stderr}");
 }

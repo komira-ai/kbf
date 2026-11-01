@@ -1,7 +1,7 @@
 //! `merge-profiles`: merges the coverage profiles of a directory into one indexed profile.
 //!
 //! The coverage run of `ci.yml` splits its tests into shards, and the raw profiles
-//! (`*.profraw`) of all of them are 1.8 GB: the `test` job's runner ran out of disk
+//! (`*.profraw`) of all of them are about 14 GB unpacked (1.8 GB as artifacts): the `test` job's runner ran out of disk
 //! downloading them. A shard runs this on its own raw profiles and uploads the one `.profdata`
 //! (megabytes); the `test` job runs it again on the shards' `.profdata` files, into the profile
 //! `llvm-cov report` reads. `llvm-profdata merge` adds the counts of its inputs whatever their
@@ -65,13 +65,19 @@ fn inputs(dir: &Path, extension: &str, prefix: &str) -> Result<Vec<(PathBuf, u64
     Ok(found)
 }
 
-/// What the running toolchain's `rustc` prints for `args`. A `rustc` that fails prints nothing,
-/// and the path built from that names no tool, which the merge then fails to start.
+/// What the running toolchain's `rustc` prints for `args`.
 fn rustc(args: &[&str]) -> Result<String, Error> {
     let out = Command::new("rustc")
         .args(args)
         .output()
         .map_err(Error::spawn(format!("rustc {}", args.join(" "))))?;
+    if !out.status.success() {
+        return Err(Error::Failed(format!(
+            "rustc {} failed ({})",
+            args.join(" "),
+            out.status
+        )));
+    }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 

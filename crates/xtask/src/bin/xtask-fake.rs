@@ -41,6 +41,7 @@
 //!   signing check and a job that runs it leaves its arguments in its log.
 //!   With `XTASK_FAKE_INSTALLER_VERSION=<stamp>` and the one argument `--version` it
 //!   prints `kbf-installer 0.1.0+<stamp>` instead.
+//! - Run as `rustc`, it fails (a toolchain that is not there).
 //! - Run as `llvm-profdata merge -sparse -f <list> -o <out>`, it writes the files the list names, joined,
 //!   to `<out>`, and fails when one begins `corrupt`.
 //! - Run as `gh attestation verify <file> <flags>`, it appends its arguments as one line
@@ -861,6 +862,9 @@ fn main() -> ExitCode {
         syft(&argv0)
     } else if matches!(base, "systemd-sysusers" | "systemd-tmpfiles") {
         systemd(base, &rest)
+    } else if argv0.ends_with("/rustc") {
+        eprintln!("rustc: the toolchain is not installed");
+        ExitCode::FAILURE
     } else if argv0.ends_with("/llvm-profdata") {
         llvm_profdata(&rest)
     } else if argv0 == "uname" || argv0.ends_with("/uname") {

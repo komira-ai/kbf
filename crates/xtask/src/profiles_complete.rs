@@ -1,4 +1,5 @@
-//! `profiles-complete`: refuses a directory of raw coverage profiles in which a shard's
+//! `profiles-complete`: refuses a directory of coverage profiles (`.profraw`, or with
+//! `--extension profdata` the shards' merged `.profdata`) in which a shard's
 //! profiles are missing.
 //!
 //! The coverage run of `ci.yml` runs its tests in shards; each shard names its raw profiles
@@ -67,12 +68,14 @@ pub fn run(args: &Args) -> Result<Vec<String>, Error> {
         let bytes: u64 = own.iter().map(|(_, len)| len).sum();
         if own.is_empty() {
             problems.push(format!(
-                "no raw profile in {} begins `{prefix}`: that shard's profiles did not arrive",
+                "no `.{}` file in {} begins `{prefix}`: that shard's profiles did not arrive",
+                args.extension,
                 args.dir.display()
             ));
         } else if bytes == 0 {
             problems.push(format!(
-                "every raw profile that begins `{prefix}` is empty ({} file(s))",
+                "every `.{}` file that begins `{prefix}` is empty ({} file(s))",
+                args.extension,
                 own.len()
             ));
         } else {
@@ -90,8 +93,9 @@ pub fn run(args: &Args) -> Result<Vec<String>, Error> {
     if !stray.is_empty() {
         let shown: Vec<&str> = stray.iter().copied().take(SHOWN).collect();
         problems.push(format!(
-            "{} raw profile(s) begin with none of the shards' prefixes, e.g. {}",
+            "{} `.{}` file(s) begin with none of the shards' prefixes, e.g. {}",
             stray.len(),
+            args.extension,
             shown.join(", ")
         ));
     }
