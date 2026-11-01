@@ -67,19 +67,6 @@
 //! - the pack adoption tool (`kbf-pack-adopt`) depending, directly or through another crate, on
 //!   a crate of `PACK_MUST_NOT_REACH`, so that the operator binary never links the frontend, the
 //!   server or the daemon; and a walk that cannot see `kbf-pack` beneath it;
-//! - the hot/cold object store library (`tierstore`) depending, directly or through another
-//!   crate, on any other crate of this workspace, which would stop it from moving to a
-//!   repository of its own (its `s3` feature, off by default, adds the S3 client of
-//!   `objstore-s3`, and so does its `server` feature, which the `tierstore` binary needs;
-//!   the check reads the tree of the crate built alone, so the features that its own tests
-//!   turn on do not count); and a walk that cannot see its dependencies, which would make
-//!   that check pass vacuously; and, with every feature and its dev-dependencies, `tierstore`
-//!   reaching a `kbf-*` crate other than `kbf-testkit`, or a walk that does not reach `objstore-s3`;
-//! - the S3 client and object store trait (`objstore-s3`, which `kbf-objstore` re-exports)
-//!   depending, directly or through another crate, on any other crate of this workspace, which
-//!   would stop it from leaving with `tierstore`; a walk that cannot see its dependencies; and
-//!   `kbf-objstore` not being built on it; and its workspace dev-dependencies being more than
-//!   `kbf-testkit`;
 //! - the state store (`kbf-state`, a re-export of `js-state`) depending on any other crate of
 //!   this workspace (with its test-database feature too, which brings `js-testkit` and not
 //!   `kbf-testkit`), which would stop it from being extracted, and the pack index (`kbf-pack-index`) depending on any but the state store;
@@ -89,7 +76,11 @@
 //!   contract and not on kbf, and tierstore will leave this repository; and a walk that cannot see
 //!   its dependencies, which would make that check pass vacuously;
 //! - the registration client (`update-register`) likewise: no other crate of this workspace in its
-//!   tree or among its dev-dependencies, and no `kbf` in its name.
+//!   tree or among its dev-dependencies, and no `kbf` in its name;
+//! - the declaration and rights crate (`update-rights`) linking, in its normal tree or among its
+//!   dev-dependencies, any other crate of this workspace but the hook contract, or having `kbf` in
+//!   its name; and a walk that cannot see its dependencies, which would make that check pass
+//!   vacuously.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::process::Command;
@@ -172,6 +163,134 @@ const PURE_GIT_CRATES: &[(&str, &str)] = &[
     ),
 ];
 
+/// Edges `cargo metadata` reports only because it unifies features across the whole
+/// workspace, not because the pure crates compile them: `ssh-key` (kbf-mdm, kbf-deploy)
+/// turns on `crypto-common/rand_core`, so every `sha2` user would otherwise appear to
+/// reach `rand_core`. `cargo tree -p kbf-segments -e features` shows no such edge.
+///
+/// The edges are dropped only when `unified_edges_are_spurious` finds that nothing the
+/// pure and leaf crates reach asks for the feature itself.
+const FEATURE_UNIFIED_EDGES: &[(&str, &str)] = &[("crypto-common", "rand_core")];
+
+/// The `(package, feature)` that `FEATURE_UNIFIED_EDGES` stands for.
+const UNIFIED_FEATURE: (&str, &str) = ("crypto-common", "rand_core");
+
+/// The packages for which a manifest requests the feature behind `FEATURE_UNIFIED_EDGES`
+/// on a dependency, directly or by naming a feature that forwards to it (a `dep/feature`
+/// entry of a `[features]` table, or another feature of the same package that does).
+/// Only packages reachable from `roots` through normal edges are examined, so the
+/// workspace's other crates (`ssh-key`'s users) are not. Each entry names the requesting
+/// package, the dependency and the feature, sorted. Empty means no root asks for it.
+fn rand_core_requests(meta: &Value, roots: &[&str]) -> Vec<String> {
+    let packages = meta["packages"].as_array().expect("packages");
+
+    // Fixpoint: (package name, feature) pairs that lead to the unified feature.
+    let mut tainted: BTreeSet<(String, String)> =
+        BTreeSet::from([(UNIFIED_FEATURE.0.to_owned(), UNIFIED_FEATURE.1.to_owned())]);
+    loop {
+        let before = tainted.len();
+        for pkg in packages {
+            let name = pkg["name"].as_str().expect("package name");
+            let Some(features) = pkg["features"].as_object() else {
+                continue;
+            };
+            for (feature, items) in features {
+                for item in items.as_array().into_iter().flatten() {
+                    let item = item.as_str().expect("feature item");
+                    let hit = match item.split_once('/') {
+                        Some((dep, f)) => {
+                            let dep = dep.trim_end_matches('?');
+                            pkg["dependencies"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .filter(|d| {
+                                    d["rename"].as_str().or(d["name"].as_str()) == Some(dep)
+                                })
+                                .any(|d| {
+                                    let dn = d["name"].as_str().expect("dep name");
+                                    tainted.contains(&(dn.to_owned(), f.to_owned()))
+                                })
+                        }
+                        None => {
+                            !item.starts_with("dep:")
+                                && tainted.contains(&(name.to_owned(), item.to_owned()))
+                        }
+                    };
+                    if hit {
+                        tainted.insert((name.to_owned(), feature.clone()));
+                    }
+                }
+            }
+        }
+        if tainted.len() == before {
+            break;
+        }
+    }
+
+    // Packages reachable from the roots through normal edges.
+    let by_id: BTreeMap<&str, &Value> = packages
+        .iter()
+        .map(|p| (p["id"].as_str().expect("package id"), p))
+        .collect();
+    let nodes: BTreeMap<&str, &Value> = meta["resolve"]["nodes"]
+        .as_array()
+        .expect("resolve.nodes")
+        .iter()
+        .map(|n| (n["id"].as_str().expect("node id"), n))
+        .collect();
+    let mut reach: BTreeSet<&str> = by_id
+        .iter()
+        .filter(|(_, p)| roots.contains(&p["name"].as_str().expect("package name")))
+        .map(|(id, _)| *id)
+        .collect();
+    let mut queue: VecDeque<&str> = reach.iter().copied().collect();
+    while let Some(id) = queue.pop_front() {
+        for d in nodes[id]["deps"].as_array().expect("deps") {
+            let normal = d["dep_kinds"]
+                .as_array()
+                .expect("dep_kinds")
+                .iter()
+                .any(|k| k["kind"].is_null());
+            let to = d["pkg"].as_str().expect("dep pkg");
+            if normal && reach.insert(to) {
+                queue.push_back(to);
+            }
+        }
+    }
+
+    let mut out = BTreeSet::new();
+    for id in reach {
+        let pkg = by_id[id];
+        for d in pkg["dependencies"].as_array().expect("dependencies") {
+            if !d["kind"].is_null() {
+                continue;
+            }
+            let dn = d["name"].as_str().expect("dep name");
+            let mut asked: Vec<&str> = d["features"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|f| f.as_str().expect("feature"))
+                .collect();
+            if d["uses_default_features"].as_bool().unwrap_or(true) {
+                asked.push("default");
+            }
+            for f in asked {
+                if tainted.contains(&(dn.to_owned(), f.to_owned())) {
+                    out.insert(format!(
+                        "{} requests {dn}/{f}, which enables {}/{}",
+                        pkg["name"].as_str().expect("package name"),
+                        UNIFIED_FEATURE.0,
+                        UNIFIED_FEATURE.1
+                    ));
+                }
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
 struct Graph {
     /// Package id to package name.
     names: BTreeMap<String, String>,
@@ -231,12 +350,20 @@ fn load_graph() -> Graph {
         members.insert(name, (id.to_owned(), lib));
     }
 
+    // The unified edges are dropped only if no pure or leaf crate asks for the feature.
+    let drop_unified = rand_core_requests(&meta, &[PURE, LEAF].concat()).is_empty();
+
     let mut normal = BTreeMap::new();
     for node in meta["resolve"]["nodes"].as_array().expect("resolve.nodes") {
+        let from = names[node["id"].as_str().expect("node id")].as_str();
         let deps = node["deps"]
             .as_array()
             .expect("deps")
             .iter()
+            .filter(|d| {
+                let to = names[d["pkg"].as_str().expect("dep pkg")].as_str();
+                !(drop_unified && FEATURE_UNIFIED_EDGES.contains(&(from, to)))
+            })
             .filter(|d| {
                 // A null kind is a normal dependency; "dev" and "build" are not linked
                 // into the crate's library.
@@ -730,39 +857,6 @@ fn pack_adopt_reaches_neither_the_frontend_nor_the_daemon() {
     );
 }
 
-/// Asserts that the normal dependencies of the object store library (`tierstore`), direct
-/// and through other crates, include no other crate of this workspace, and that the walk
-/// sees its dependencies (it reaches `tokio`), so the check does not pass on an empty walk.
-/// The tree is that of `cargo build -p tierstore`, with the features the crate has by default:
-/// its `s3` feature, which adds `objstore-s3`, is off in it, and so is `server`, which turns
-/// `s3` on for the `tierstore` binary. It is not the graph of `cargo metadata`, which has the
-/// features of the whole workspace, where the tests of `tierstore` turn `server` on.
-#[test]
-fn tierstore_reaches_no_other_workspace_crate() {
-    let g = load_graph();
-    let (_, root) = g
-        .members
-        .get("tierstore")
-        .expect("tierstore is a workspace member");
-    assert!(root.is_some(), "tierstore must have a library target");
-    let linked = linked_by("tierstore");
-    assert!(
-        linked.contains("tokio"),
-        "tierstore's tree must hold tokio, or this walk proves nothing: {linked:?}"
-    );
-    let violations: Vec<&str> = g
-        .members
-        .keys()
-        .map(String::as_str)
-        .filter(|name| *name != "tierstore")
-        .filter(|name| linked.contains(*name))
-        .collect();
-    assert!(
-        violations.is_empty(),
-        "tierstore links another crate of this workspace: {violations:?}"
-    );
-}
-
 /// Asserts that the hook contract crate links no other crate of this workspace (normal tree,
 /// and no workspace crate among its dev-dependencies either, since the harness is a
 /// dev-dependency of services outside this repository), and that its name does not say `kbf`.
@@ -875,146 +969,41 @@ fn the_registration_client_reaches_no_other_workspace_crate() {
     );
 }
 
-/// Asserts that the tree of `cargo build -p tierstore --features s3` holds `objstore-s3` (the
-/// S3 client that `S3Backend` adapts) and that of `--features server` holds it too, so that the
-/// check above sees the edge it guards, and that `server` turns `s3` on.
+/// Asserts that the declaration and rights crate (`update-rights`) links no crate of this workspace
+/// but the hook contract (`update-hook`), in its normal tree or among its dev-dependencies, that its
+/// name does not say `kbf`, and that the walk sees its dependencies (it reaches `update-hook` and
+/// `toml`), so the check does not pass on an empty walk: the host updater is generic code and a
+/// service outside this repository can use what it loads.
 #[test]
-fn tierstore_links_the_s3_client_only_with_its_s3_or_server_feature() {
-    let bare = linked_by("tierstore");
-    assert!(!bare.contains("objstore-s3"), "without a feature: {bare:?}");
-    for features in ["s3", "server"] {
-        let linked = linked_with("tierstore", features);
-        assert!(linked.contains("objstore-s3"), "{features}: {linked:?}");
-    }
-}
-
-/// Asserts that `tierstore`, with every feature on and with its dev-dependencies, reaches no
-/// `kbf-*` crate of this workspace but `kbf-testkit`, a dev-dependency (the scratch directories
-/// and the child-process helper of its tests) that a later change removes, and that the walk
-/// sees `objstore-s3`, the S3 client it is built on, so the check does not pass on an empty
-/// walk. The walk follows every kind of edge of the resolved `cargo metadata` graph, which has
-/// the features of the whole workspace (the `server` and `s3` features are on through the
-/// crate's dev-dependency on itself), so it covers what the two tests above leave out: the
-/// dev-dependencies and the `s3` feature's tree together.
-#[test]
-fn tierstore_with_its_tests_reaches_no_kbf_crate_but_the_test_helpers() {
-    let cargo = std::env::var("CARGO").expect("CARGO is set when cargo runs a test");
-    let out = Command::new(cargo)
-        .args(["metadata", "--format-version", "1", "--locked"])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .output()
-        .expect("run cargo metadata");
-    assert!(
-        out.status.success(),
-        "cargo metadata failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let meta: Value = serde_json::from_slice(&out.stdout).expect("cargo metadata emits JSON");
-    let nodes = meta["resolve"]["nodes"].as_array().expect("resolve.nodes");
-    let edges: BTreeMap<&str, Vec<&str>> = nodes
-        .iter()
-        .map(|node| {
-            let id = node["id"].as_str().expect("node id");
-            let deps = node["deps"]
-                .as_array()
-                .expect("deps")
-                .iter()
-                .map(|d| d["pkg"].as_str().expect("dep pkg"))
-                .collect();
-            (id, deps)
-        })
-        .collect();
-    let name_of: BTreeMap<&str, &str> = meta["packages"]
-        .as_array()
-        .expect("packages")
-        .iter()
-        .map(|p| {
-            (
-                p["id"].as_str().expect("package id"),
-                p["name"].as_str().expect("package name"),
-            )
-        })
-        .collect();
-    let root = name_of
-        .iter()
-        .find(|(_, name)| **name == "tierstore")
-        .map(|(id, _)| *id)
-        .expect("tierstore is a workspace member");
-    let mut seen = BTreeSet::from([root]);
-    let mut queue = VecDeque::from([root]);
-    while let Some(id) = queue.pop_front() {
-        for dep in edges.get(id).into_iter().flatten() {
-            if seen.insert(dep) {
-                queue.push_back(dep);
-            }
-        }
-    }
-    let reached: BTreeSet<&str> = seen.iter().map(|id| name_of[id]).collect();
-    assert!(
-        reached.contains("objstore-s3"),
-        "tierstore's walk must reach objstore-s3, or this check proves nothing: {reached:?}"
-    );
-    let kbf: BTreeSet<&str> = reached
-        .iter()
-        .copied()
-        .filter(|name| name.starts_with("kbf-"))
-        .collect();
-    assert_eq!(
-        kbf,
-        BTreeSet::from(["kbf-testkit"]),
-        "the kbf crates tierstore reaches, with its features and dev-dependencies"
-    );
-}
-
-/// Asserts that the S3 client and the object store trait (`objstore-s3`) link no other crate of
-/// this workspace, with its loopback S3 service (feature `testkit`) on, so that it can move to
-/// a repository of its own with `tierstore`; that the walk sees its dependencies (it reaches
-/// `reqwest`), so the check does not pass on an empty walk; and that `kbf-objstore` is built on
-/// it, so there is one S3 client and not two.
-#[test]
-fn the_s3_client_links_no_other_workspace_crate() {
+fn the_update_rights_crate_reaches_only_the_hook_contract() {
     let g = load_graph();
     let (_, root) = g
         .members
-        .get("objstore-s3")
-        .expect("objstore-s3 is a workspace member");
-    assert!(root.is_some(), "objstore-s3 must have a library target");
-    let linked = linked_with("objstore-s3", "testkit");
+        .get("update-rights")
+        .expect("update-rights is a workspace member");
+    assert!(root.is_some(), "update-rights must have a library target");
     assert!(
-        linked.contains("reqwest"),
-        "objstore-s3's tree must hold reqwest, or this walk proves nothing: {linked:?}"
+        !"update-rights".contains("kbf"),
+        "the rights crate is named without kbf"
     );
-    let violations = workspace_crates_beyond(&g, &linked, &["objstore-s3"]);
+    let linked = linked_by("update-rights");
+    assert!(
+        linked.contains("update-hook") && linked.contains("toml"),
+        "update-rights's tree must hold update-hook and toml, or this walk proves nothing: {linked:?}"
+    );
+    let violations = workspace_crates_beyond(&g, &linked, &["update-rights", "update-hook"]);
     assert!(
         violations.is_empty(),
-        "objstore-s3 links another crate of this workspace: {violations:?}"
+        "update-rights links another crate of this workspace: {violations:?}"
     );
-    let objstore = linked_by("kbf-objstore");
-    assert!(
-        objstore.contains("objstore-s3"),
-        "kbf-objstore must re-export the client of objstore-s3: {objstore:?}"
-    );
-}
 
-/// Asserts that the workspace crates among the dev-dependencies of `objstore-s3` (read from
-/// `cargo metadata`, which the tree walk above does not see) are exactly `kbf-testkit`, which
-/// supplies the loopback port helpers of `tests/s3_wire.rs`. Wave 1 of the plan to move
-/// `tierstore` to a repository of its own removes it (PR 3, which then makes this set empty);
-/// until then a new dev-dependency on another crate of this workspace trips this test. The
-/// crate's dev-dependency on itself (the `testkit` feature) is not another crate.
-#[test]
-fn the_s3_client_has_one_workspace_dev_dependency() {
     let cargo = std::env::var("CARGO").expect("CARGO is set when cargo runs a test");
     let out = Command::new(cargo)
         .args(["metadata", "--format-version", "1", "--no-deps", "--locked"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
         .expect("run cargo metadata");
-    assert!(
-        out.status.success(),
-        "cargo metadata failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    assert!(out.status.success(), "cargo metadata failed");
     let meta: Value = serde_json::from_slice(&out.stdout).expect("cargo metadata emits JSON");
     let packages = meta["packages"].as_array().expect("packages");
     let members: BTreeSet<&str> = packages
@@ -1023,20 +1012,18 @@ fn the_s3_client_has_one_workspace_dev_dependency() {
         .collect();
     let pkg = packages
         .iter()
-        .find(|p| p["name"] == "objstore-s3")
-        .expect("objstore-s3 is a workspace member");
-    let dev: BTreeSet<&str> = pkg["dependencies"]
+        .find(|p| p["name"] == "update-rights")
+        .expect("update-rights is a workspace member");
+    let deps: BTreeSet<&str> = pkg["dependencies"]
         .as_array()
         .expect("dependencies")
         .iter()
-        .filter(|d| d["kind"] == "dev")
         .filter_map(|d| d["name"].as_str())
-        .filter(|name| members.contains(name) && *name != "objstore-s3")
+        .filter(|name| members.contains(name) && !["update-rights", "update-hook"].contains(name))
         .collect();
-    assert_eq!(
-        dev,
-        BTreeSet::from(["kbf-testkit"]),
-        "objstore-s3's workspace dev-dependencies"
+    assert!(
+        deps.is_empty(),
+        "update-rights depends (even as a dev-dependency) on {deps:?}"
     );
 }
 
@@ -1059,8 +1046,7 @@ fn workspace_crates_beyond<'a>(
 /// and that the walk sees its dependencies (it reaches `postgres`), so the check does not
 /// pass on an empty walk. The store is generic: what is specific to a kbf
 /// build (the pack index, `kbf-pack-index`) depends on it and never the other way, which is
-/// what lets the store be extracted. Like the `tierstore` check, it reads the tree of the
-/// crate built alone.
+/// what lets the store be extracted. It reads the tree of the crate built alone.
 #[test]
 fn the_state_store_links_no_build_specific_crate() {
     let g = load_graph();
@@ -1485,4 +1471,52 @@ fn the_lease_client_is_a_leaf_over_hyper_and_tokio_rustls() {
         "the lease client reaches another HTTP stack or a jobscheduler agent crate:\n{}",
         violations.join("\n")
     );
+}
+
+fn synthetic(pure_requests_rand_core: bool) -> Value {
+    // pure-a -> sha2 -> crypto-common; sha2 forwards its `rand_core` feature to
+    // crypto-common. `other` (outside the roots) always asks for it.
+    let pure_features: Vec<&str> = if pure_requests_rand_core {
+        vec!["rand_core"]
+    } else {
+        vec![]
+    };
+    let dep = |name: &str, features: Vec<&str>| {
+        serde_json::json!({"name": name, "kind": null, "features": features,
+            "uses_default_features": false})
+    };
+    let edge = |pkg: &str| serde_json::json!({"pkg": pkg, "dep_kinds": [{"kind": null}]});
+    serde_json::json!({
+        "packages": [
+            {"id": "pure-a", "name": "pure-a", "features": {},
+             "dependencies": [dep("sha2", pure_features)]},
+            {"id": "sha2", "name": "sha2",
+             "features": {"rand_core": ["crypto-common/rand_core"]},
+             "dependencies": [dep("crypto-common", vec![])]},
+            {"id": "crypto-common", "name": "crypto-common",
+             "features": {"rand_core": ["dep:rand_core"]}, "dependencies": []},
+            {"id": "other", "name": "other", "features": {},
+             "dependencies": [dep("crypto-common", vec!["rand_core"])]},
+        ],
+        "resolve": {"nodes": [
+            {"id": "pure-a", "deps": [edge("sha2")]},
+            {"id": "sha2", "deps": [edge("crypto-common")]},
+            {"id": "crypto-common", "deps": []},
+            {"id": "other", "deps": [edge("crypto-common")]},
+        ]},
+    })
+}
+
+#[test]
+fn rand_core_request_by_a_pure_crate_is_found_through_a_forwarding_feature() {
+    let found = rand_core_requests(&synthetic(true), &["pure-a"]);
+    assert_eq!(
+        found,
+        ["pure-a requests sha2/rand_core, which enables crypto-common/rand_core"]
+    );
+}
+
+#[test]
+fn rand_core_request_by_a_crate_outside_the_roots_is_not_found() {
+    assert!(rand_core_requests(&synthetic(false), &["pure-a"]).is_empty());
 }

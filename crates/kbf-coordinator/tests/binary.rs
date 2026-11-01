@@ -40,7 +40,7 @@ impl Files {
         put(
             "services.toml",
             "[[service]]\nname = \"other\"\n[service.roles.daemon]\n",
-            0o644,
+            0o600,
         );
         Self { dir, pki }
     }
@@ -253,4 +253,36 @@ fn a_start_with_a_bad_file_or_address_is_refused_with_a_reason() {
     assert_eq!(code, 1);
     assert!(err.starts_with("kbf-coordinator: "), "{err}");
     drop(taken);
+}
+
+/// Catches: a start over an ops file this build cannot honour: a file with a key it does not
+/// know, or with a newer schema, at the path `--ops-file` names or, with no flag, at the state
+/// file's name with `.ops` added, stops it with exit 1 and a reason that names the flag and
+/// the file; and the file is left as it was.
+#[test]
+fn an_ops_file_this_build_cannot_read_stops_the_start() {
+    let files = Files::new("bin-ops");
+    let flags = files.flags();
+    let given = files.path("given.ops");
+    std::fs::write(&given, r#"{"schema":1,"future":true}"#).expect("written");
+    let mut explicit = flags.clone();
+    explicit.extend(["--ops-file".to_owned(), given.clone()]);
+    let (code, _, err) = run(&explicit);
+    assert_eq!(code, 1);
+    assert!(
+        err.contains("--ops-file") && err.contains("given.ops"),
+        "{err}"
+    );
+
+    let newer = r#"{"schema":2,"services":{}}"#;
+    let default = files.path("desired.json.ops");
+    std::fs::write(&default, newer).expect("written");
+    let (code, _, err) = run(&flags);
+    assert_eq!(code, 1);
+    assert!(
+        err.contains("--ops-file") && err.contains("desired.json.ops"),
+        "{err}"
+    );
+    assert!(err.contains("newer"), "{err}");
+    assert_eq!(std::fs::read_to_string(&default).expect("read"), newer);
 }

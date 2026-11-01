@@ -18,14 +18,6 @@ publish = false
 # `Io` and `Spawner` of the `runc` client (below) are async traits; the container driver
 # implements both. Already in the tree through runc.
 async-trait = "0.1.92"
-# A stock S3 SDK, to prove it works against the tierstore S3 front (tierstore's tests only).
-# Pinned exactly, so that the test is of one SDK version. No default features: the default
-# HTTP client brings a TLS provider (aws-lc), which the front, plain HTTP, does not need; the
-# HTTP client below has no TLS either. Apache-2.0.
-aws-sdk-s3 = { version = "=1.96.0", default-features = false, features = ["behavior-version-latest", "rt-tokio"] }
-# The SDK's own hyper-based HTTP client, built without TLS (`build_http`) for a plain-HTTP
-# endpoint. Apache-2.0.
-aws-smithy-http-client = { version = "1.1.4", default-features = false, features = ["default-client"] }
 # The operator API's HTTP server (kbf-server). Already in the tree through tonic; no
 # default features: no form, query or json extractors, whose parsers are not needed.
 axum = { version = "0.8.9", default-features = false }
@@ -42,8 +34,8 @@ crc32fast = "1.5.2"
 core-foundation = "0.10.1"
 # The MDM gate's grant key (kbf-mdm) and the Mac's check of the grants it signs
 # (kbf-mac-session: pure Rust, so the helper is checked for the macOS target on any
-# host, which ring's C build does not allow). One major for both, already in the tree
-# through ssh-key.
+# host, which ring's C build does not allow). Major 2 here; ssh-key 0.7 brings its own
+# major 3 (the key types it parses), which nothing here shares a type with.
 ed25519-dalek = { version = "2.2.0", default-features = false, features = ["std"] }
 # gzip for the tar.gz archives kbf-deploy installs (`mdm install`) and `cargo xtask
 # fetch` unpacks, and the deflate behind zip (below); the pure-Rust backend, no C zlib.
@@ -100,6 +92,11 @@ js-testkit = { git = "https://github.com/komira-ai/jobscheduler", rev = "f8fc114
 js-types = { git = "https://github.com/komira-ai/jobscheduler", rev = "f8fc1148c58879b055e44341de722b112c77f694" }
 js-usage = { git = "https://github.com/komira-ai/jobscheduler", rev = "f8fc1148c58879b055e44341de722b112c77f694" }
 js-whole = { git = "https://github.com/komira-ai/jobscheduler", rev = "f8fc1148c58879b055e44341de722b112c77f694" }
+# tierstore and objstore-s3 moved to the tierstore repository (https://github.com/komira-ai/tierstore).
+# Both are taken from it at this one revision. The revision is raised by a pull request of
+# its own that runs the whole CI, never along with other changes.
+objstore-s3 = { git = "https://github.com/komira-ai/tierstore", rev = "eb6cfae075b720f2203cd957cffd1ba3b586c999" } # v0.3.0
+tierstore = { git = "https://github.com/komira-ai/tierstore", rev = "eb6cfae075b720f2203cd957cffd1ba3b586c999" } # v0.3.0
 md-5 = "0.11.0"
 # macOS only (kbf-mac-session): OpenDirectory, for the per-lease users.
 objc2 = "0.6.5"
@@ -171,8 +168,9 @@ serde_json = "1.0.151"
 siphasher = "1.0.4"
 sha2 = "0.11.0"
 # OpenSSH signatures (`ssh-keygen -Y sign`) on operator erase requests (kbf-mdm): the
-# SSHSIG envelope and security-key (`sk-`) signature verification.
-ssh-key = { version = "0.6.7", default-features = false, features = ["alloc", "ed25519", "p256", "std"] }
+# SSHSIG envelope and security-key (`sk-`) signature verification. Pinned exactly while
+# 0.7 has only release candidates, so no other candidate slides in.
+ssh-key = { version = "=0.7.0-rc.11", default-features = false, features = ["alloc", "ed25519", "p256", "std"] }
 # Constant-time comparison of the operator API token (kbf-server). Already in the tree
 # through rustls.
 subtle = "2.6.1"
@@ -188,7 +186,7 @@ toml = { version = "1.1.8", default-features = false, features = ["display", "pa
 # RFC 3339 times in the MDM gate's signed messages. Already in the tree through
 # x509-parser.
 time = { version = "0.3.55", default-features = false, features = ["formatting", "macros", "parsing", "std"] }
-tokio = "1.53.2"
+tokio = "1.53.3"
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring"] }
 tonic = "0.14.6"
 tonic-prost = "0.14.6"
@@ -283,12 +281,12 @@ kbf-unitfile = { path = "crates/kbf-unitfile" }
 kbf-update = { path = "crates/kbf-update" }
 kbf-updater = { path = "crates/kbf-updater" }
 kbf-usage = { path = "crates/kbf-usage" }
-# The object store trait and the S3 client, with no dependency on another workspace crate
-# (kbf-integration-test keeps it so); kbf-objstore re-exports it.
-objstore-s3 = { path = "crates/objstore-s3" }
-# The hot/cold object store library; it depends on no kbf crate unless its `s3` feature is on
-# (kbf-integration-test keeps it so).
-tierstore = { path = "crates/tierstore" }
+# The hook contract (steps, exit codes, report line, params), with no dependency on another workspace
+# crate (kbf-integration-test keeps it so).
+update-hook = { path = "crates/update-hook" }
+# The declaration loader, the widening comparer, the approval record and the transient-unit launcher
+# of the host updater; depends on update-hook alone (kbf-integration-test keeps it so).
+update-rights = { path = "crates/update-rights" }
 # The CI verbs (`cargo xtask`); kbf-integration-test reads the interpreter budget with its parser.
 xtask = { path = "crates/xtask" }
 

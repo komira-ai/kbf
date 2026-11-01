@@ -47,6 +47,9 @@
 //!
 //! # The local socket
 //!
+//! `kbf-host-install approve <service> <sha256>` records the approval of one declaration of the
+//! generic updater that asks for more rights (`update_rights::cli`).
+//!
 //! `kbf-host-install --serve` ([`local`]) serves the same host over a unix socket (mode 0600,
 //! owned by the account of `kbf-updater`) instead of ssh: stage a release beside the running
 //! one, switch to it on trial, confirm it, query, revert. It owns the revert: a release on
@@ -81,6 +84,12 @@ mod runner;
 mod trust;
 
 use std::process::ExitCode;
+
+/// The mark the binary carries when its channel token file takes GitHub's Actions token (about
+/// 520 bytes, with dots). The update rehearsal, which runs the helper of the release before
+/// this one, looks for these bytes in that binary to know whether to give it the run's token;
+/// `tests/token_marker.rs` checks the built binary carries them.
+pub const LONG_TOKEN_MARKER: &[u8] = b"kbf-host-install:token-file-takes-actions-tokens";
 
 /// What a client of the forced command may rely on: the answers it prints and the requests
 /// it accepts. The client (`kbf-updater`) dev-depends on this to test its reading of the
@@ -213,6 +222,16 @@ pub fn main() -> ExitCode {
             .map(|arg| arg.to_str().map(str::to_owned))
             .collect();
         return rest.map_or(ExitCode::from(2), |rest| local::production::main(&rest));
+    }
+    // The operator's act on the generic updater: approve one declaration that asks for more
+    // rights (see `update_rights::cli`). Not a flag and not an sshd request: sshd passes no
+    // arguments.
+    if args.first().is_some_and(|arg| arg == "approve") {
+        let rest: Vec<String> = args[1..]
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        return update_rights::cli::main(&rest);
     }
     // Both sides are compiled everywhere, so the Linux build checks the Mac code.
     if cfg!(target_os = "macos") {

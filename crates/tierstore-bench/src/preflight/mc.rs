@@ -27,6 +27,9 @@ const ALIAS: &str = "tbops";
 /// The quota on a test bucket: 30 GiB, in the unit `mc` takes.
 pub const QUOTA_SIZE: &str = "30GiB";
 
+/// [`QUOTA_SIZE`] in bytes.
+pub const QUOTA_BYTES: u64 = 30 * 1024 * 1024 * 1024;
+
 /// `text` with every byte outside `A-Z a-z 0-9 - . _ ~` as `%XX`.
 #[must_use]
 pub fn percent_encode(text: &str) -> String {
@@ -117,13 +120,26 @@ impl<'a> Mc<'a> {
         args: &[&str],
         input: Option<String>,
     ) -> Result<String, BenchError> {
+        run_ok(self.host, what, &self.command(args, input))
+    }
+
+    /// The command line of `mc` with `args` after the global flags.
+    fn command(&self, args: &[&str], input: Option<String>) -> Cmd {
+        self.command_with(true, args, input)
+    }
+
+    /// [`Self::command`], with `--json` only if `json`.
+    fn command_with(&self, json: bool, args: &[&str], input: Option<String>) -> Cmd {
         let config_dir = self.config_dir.display().to_string();
-        let mut all = vec!["--config-dir", config_dir.as_str(), "--json"];
+        let mut all = vec!["--config-dir", config_dir.as_str()];
+        if json {
+            all.push("--json");
+        }
         all.extend_from_slice(args);
         let mut cmd = Cmd::new(&self.program, &all)
             .with_env(&format!("MC_HOST_{ALIAS}"), self.alias_url.clone());
         cmd.stdin = input;
-        run_ok(self.host, what, &cmd)
+        cmd
     }
 
     /// `alias/bucket`.
@@ -141,6 +157,22 @@ impl<'a> Mc<'a> {
             .map_err(|e| BenchError::Ops(format!("mc admin info: not JSON: {e}")))
     }
 
+    /// `mc admin prometheus metrics` of the cluster group: the server's metrics in the Prometheus
+    /// text format, which `mc` fetches with a token of its own from the admin key. Read-only.
+    /// Plain text, not `--json`: the answer is read for one series by
+    /// [`crate::coldstate::s3_requests_total`].
+    ///
+    /// # Errors
+    /// [`BenchError::Ops`] if the command fails.
+    pub fn metrics(&self) -> Result<String, BenchError> {
+        let cmd = self.command_with(
+            false,
+            &["admin", "prometheus", "metrics", ALIAS, "cluster"],
+            None,
+        );
+        run_ok(self.host, "mc admin prometheus metrics", &cmd)
+    }
+
     /// Whether the store has a bucket called `bucket` (`mc ls` of the alias, read-only).
     ///
     /// # Errors
@@ -152,6 +184,44 @@ impl<'a> Mc<'a> {
         Ok(json_lines("mc ls", &out)?
             .iter()
             .any(|line| line.get("key").and_then(Value::as_str) == Some(wanted.as_str())))
+    }
+
+    /// Whether the store has the bucket `bucket`, asked of the bucket alone (`mc ls` of
+    /// `alias/bucket`), which needs only the right to list that bucket. A bucket that is not
+    /// there and one that may not be listed both exit 1 and read the same: the caller needs the
+    /// bucket and may list it, or stops.
+    ///
+    /// # Errors
+    /// [`BenchError::Ops`] if the command cannot be started.
+    pub fn bucket_present(&self, bucket: &str) -> Result<bool, BenchError> {
+        let cmd = self.command(&["ls", &Self::target(bucket)], None);
+        let out = self
+            .host
+            .run(&cmd)
+            .map_err(|e| BenchError::Ops(format!("mc ls: cannot start: {:?}", e.kind())))?;
+        Ok(out.success)
+    }
+
+    /// The hard quota of `bucket` in bytes (`mc quota info`, which needs `admin:GetBucketQuota`
+    /// and nothing that changes anything), or `None` if the answer carries no quota, a quota
+    /// of 0, or a quota that is not of type `hard`.
+    ///
+    /// # Errors
+    /// [`BenchError::Ops`] if the command fails or a line of its answer is not JSON.
+    pub fn quota_info(&self, bucket: &str) -> Result<Option<u64>, BenchError> {
+        let out = self.run("mc quota info", &["quota", "info", &Self::target(bucket)])?;
+        Ok(json_lines("mc quota info", &out)?
+            .iter()
+            .find_map(|line| {
+                // `mc quota info --json` prints `status`, `bucket`, `quota` (bytes, omitted
+                // when 0) and `type` (`hard`, omitted when empty): mc `cmd/quota-set.go:74-80`,
+                // filled at `cmd/quota-info.go:78-83`. A quota whose type is not `hard`, or
+                // whose type is not printed, is not the limit the run needs, so it fails closed.
+                let hard = line.get("type").and_then(Value::as_str) == Some("hard");
+                hard.then(|| line.get("quota").and_then(Value::as_u64))
+                    .flatten()
+            })
+            .filter(|bytes| *bytes > 0))
     }
 
     /// Whether the store has an account whose access key id is `access_key_id` (`mc admin user
@@ -267,15 +337,14 @@ impl<'a> Mc<'a> {
     }
 }
 
-/// The lines of an `mc --json` answer, each parsed: `mc` prints one JSON object per line.
+/// The objects of an `mc --json` answer, each parsed. Most commands print one object per line;
+/// `mc quota info` prints an indented, multi-line object (`json.MarshalIndent`, mc
+/// `cmd/quota-set.go:96-97`), so the answer is read as a stream of objects, not line by line.
 fn json_lines(what: &str, out: &str) -> Result<Vec<Value>, BenchError> {
-    out.lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| {
-            serde_json::from_str(line)
-                .map_err(|_| BenchError::Ops(format!("{what}: a line of the answer is not JSON")))
-        })
-        .collect()
+    serde_json::Deserializer::from_str(out)
+        .into_iter::<Value>()
+        .collect::<Result<_, _>>()
+        .map_err(|_| BenchError::Ops(format!("{what}: the answer is not JSON")))
 }
 
 /// The server version in an `mc admin info` answer: the first server's `version`.

@@ -124,14 +124,18 @@ impl RoleLimits {
         first.chain(rest).collect()
     }
 
-    fn retain(&mut self, legacy: &[&str], keep: impl Fn(&str) -> bool) {
+    /// Drops the limits for roles that are neither in `legacy` nor accepted by `keep`, and
+    /// returns their names.
+    fn retain(&mut self, legacy: &[&str], keep: impl Fn(&str) -> bool) -> Vec<String> {
+        let mut dropped = Vec::new();
         self.0.retain(|role, _| {
             let kept = legacy.contains(&role.as_str()) || keep(role);
             if !kept {
-                tracing::debug!(role = %role, "dropped a limit for a role the service does not have");
+                dropped.push(role.clone());
             }
             kept
         });
+        dropped
     }
 }
 
@@ -237,6 +241,19 @@ impl Desired {
         bytes: &[u8],
         services: &Services,
     ) -> Result<(String, Self), DesiredError> {
+        Self::parse_request_noting(bytes, services).map(|(service, desired, _)| (service, desired))
+    }
+
+    /// [`Self::parse_request_for`], also returning the names of the roles whose limits were
+    /// dropped because the service does not have them (sorted, each once), which it logs as a
+    /// warning.
+    ///
+    /// # Errors
+    /// [`DesiredError`], as [`Self::parse_request_for`].
+    pub fn parse_request_noting(
+        bytes: &[u8],
+        services: &Services,
+    ) -> Result<(String, Self, Vec<String>), DesiredError> {
         let malformed = |e: serde_json::Error| DesiredError::Malformed(e.to_string());
         let mut fields: serde_json::Map<String, serde_json::Value> =
             serde_json::from_slice(bytes).map_err(malformed)?;
@@ -253,9 +270,14 @@ impl Desired {
         desired.checked(&def.require_min_up)?;
         desired.refuse_unnamed(services)?;
         let has = |role: &str| def.roles.contains_key(role);
-        desired.max_updating.retain(&LEGACY_ROLES, has);
-        desired.min_up.retain(&KBF_MIN_UP, has);
-        Ok((service, desired))
+        let mut dropped = desired.max_updating.retain(&LEGACY_ROLES, has);
+        dropped.extend(desired.min_up.retain(&KBF_MIN_UP, has));
+        dropped.sort();
+        dropped.dedup();
+        if !dropped.is_empty() {
+            tracing::warn!(%service, roles = ?dropped, "dropped limits for roles the service does not have");
+        }
+        Ok((service, desired, dropped))
     }
 
     /// Refuses a limits key that is neither a legacy name nor a role of any service, so that a
@@ -362,7 +384,7 @@ pub struct DesiredStore {
     writing: Mutex<()>,
 }
 
-fn io_at(path: &Path) -> impl FnOnce(io::Error) -> StoreError + '_ {
+pub(crate) fn io_at(path: &Path) -> impl FnOnce(io::Error) -> StoreError + '_ {
     move |source| StoreError::Io {
         path: path.to_owned(),
         source,
@@ -429,9 +451,6 @@ impl DesiredStore {
     }
 
     fn write(&self, services: &BTreeMap<String, Desired>) -> Result<(), StoreError> {
-        let mut temp = self.path.clone().into_os_string();
-        temp.push(".new");
-        let temp = PathBuf::from(temp);
         // Only `kbf` is the single state of earlier builds, which refuse the map form.
         let encoded = match services.iter().collect::<Vec<_>>().as_slice() {
             [(name, only)] if name.as_str() == KBF => serde_json::to_vec_pretty(only),
@@ -439,26 +458,37 @@ impl DesiredStore {
                 services: services.clone(),
             }),
         };
-        let mut text = encoded.map_err(io::Error::from).map_err(io_at(&temp))?;
+        let mut text = encoded
+            .map_err(io::Error::from)
+            .map_err(io_at(&self.path))?;
         text.push(b'\n');
-        // A leftover of a crash is replaced, never followed: the temporary file is created
-        // new, owner-only.
-        match fs::remove_file(&temp) {
-            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(io_at(&temp)(e)),
-            _ => {}
-        }
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temp)
-            .map_err(io_at(&temp))?;
-        file.write_all(&text).map_err(io_at(&temp))?;
-        file.sync_all().map_err(io_at(&temp))?;
-        fs::rename(&temp, &self.path).map_err(io_at(&self.path))?;
-        let dir = dir_of(&self.path);
-        File::open(dir)
-            .and_then(|d| d.sync_all())
-            .map_err(io_at(dir))
+        write_whole(&self.path, &text)
     }
+}
+
+/// Replaces the file at `path` with `text`, whole: a temporary file beside it, created new
+/// and owner-only, fsynced, renamed over `path`, and the directory fsynced, so a crash leaves
+/// the old file or the new one. A leftover temporary file of a crash is replaced, never
+/// followed.
+pub(crate) fn write_whole(path: &Path, text: &[u8]) -> Result<(), StoreError> {
+    let mut temp = path.to_path_buf().into_os_string();
+    temp.push(".new");
+    let temp = PathBuf::from(temp);
+    match fs::remove_file(&temp) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(io_at(&temp)(e)),
+        _ => {}
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temp)
+        .map_err(io_at(&temp))?;
+    file.write_all(text).map_err(io_at(&temp))?;
+    file.sync_all().map_err(io_at(&temp))?;
+    fs::rename(&temp, path).map_err(io_at(path))?;
+    let dir = dir_of(path);
+    File::open(dir)
+        .and_then(|d| d.sync_all())
+        .map_err(io_at(dir))
 }

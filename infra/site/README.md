@@ -49,7 +49,7 @@ starting with a letter, at most 16.
 | publish role | `kbf-prod-publish` | `tierstore-prod-publish` |
 | approval environment | `prod` | `prod-tierstore` |
 | site environment (the role trusts it) | `prod-site` | `prod-site-tierstore` |
-| publish workflow the role trusts | `.github/workflows/site-publish.yml` | `.github/workflows/tierstore-site-publish.yml` |
+| publish workflow the role trusts | `.github/workflows/site-publish.yml` | `.github/workflows/tierstore-site-publish.yml` (komira-ai/tierstore; the role's trust in `lib/config.ts` still names this repository until it is moved, below) |
 | GitHub variables | `KBF_SITE_BUCKET`, `KBF_SITE_DISTRIBUTION_ID`, `KBF_SITE_PUBLISH_ROLE_ARN` | `TIERSTORE_SITE_BUCKET`, `TIERSTORE_SITE_DISTRIBUTION_ID`, `TIERSTORE_SITE_PUBLISH_ROLE_ARN` |
 
 **kbf.dev's names are the ones it was first deployed with and must never change**: CloudFormation replaces a resource whose
@@ -64,7 +64,7 @@ cache and error behavior, the role's permissions, the OIDC provider (one per acc
 `prod`-style policies (approval: `main` branch and `v*` tag; site: `v*` tag only). A site that needs a different policy
 changes `lib/site-stack.ts` for that site deliberately. `site/test/csp.test.ts` reads the CSP from `lib/site-stack.ts`.
 
-`.github/workflows/tierstore-site-publish.yml` is the workflow tierstore's publish role trusts. It publishes on a push to `main`
+`.github/workflows/tierstore-site-publish.yml` (now in komira-ai/tierstore, no longer in this repository) is the workflow tierstore's publish role is to trust. The role's trust is not moved yet: `lib/config.ts` still builds it for this repository's workflow path, so a publish from komira-ai/tierstore is refused at `AssumeRoleWithWebIdentity` until a maintainer redeploys the stack with the trust set to komira-ai/tierstore (its repository id and workflow path), the one-time setup of that repository's step 6. It publishes on a push to `main`
 that changes the site (and on a manual run of `main`), so its job runs in the environment `prod-site-tierstore` from the `main`
 branch: that environment's deployment rule is the branch `main`, where kbf.dev's `prod-site` admits `v*` tags only. The held
 `github` step creates the tag rule for every site, so for tierstore.dev the rule is changed by hand once, and a later `github`

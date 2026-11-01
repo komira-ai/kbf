@@ -65,6 +65,7 @@ mod driver;
 mod ack;
 mod ambient;
 mod beat;
+mod cordon_owner;
 pub(crate) mod durable;
 mod engine;
 pub(crate) mod failed_actions;
@@ -79,7 +80,6 @@ mod nodes;
 mod pack_reads;
 mod pack_writes;
 mod phase;
-mod record;
 mod report;
 pub mod sched_view;
 mod side;
@@ -175,6 +175,8 @@ pub struct Farm {
     ambient: Ambient,
     /// What the `with_*` builders set.
     settings: Settings,
+    /// The `--usage-profiles` mode, which the start line and the gauge report.
+    usage_profiles: crate::UsageProfiles,
     /// The engine every method reaches the farm's state through.
     driver: Driver,
 }
@@ -323,6 +325,7 @@ impl Farm {
             reports: AtomicUsize::new(0),
             ambient,
             settings: Settings::default(),
+            usage_profiles: crate::UsageProfiles::default(),
             driver: Driver::legacy(State {
                 engine: Engine::new(sched, finished_retention, ambient),
                 side: Side::new(term, ambient),
@@ -840,7 +843,7 @@ impl Dispatch for Farm {
         );
         if let Some((call, shape)) = submission.call.take().zip(shape) {
             let call = call.with_shape(shape).with_evidence(submission.evidence);
-            state.side.record_submit(call, &name, operation, joined);
+            state.side.recording.submit(call, &name, operation, joined);
         }
         let (stage, receiver) = watch::channel(Stage::Queued);
         state.side.stages.insert(waiter, stage);
@@ -995,6 +998,8 @@ fn wire_lease(lease: LeaseId) -> worker::LeaseId {
     }
 }
 
+#[cfg(test)]
+mod cordon_owner_tests;
 mod from_listeners;
 #[cfg(test)]
 mod learned_tests;

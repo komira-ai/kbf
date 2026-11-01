@@ -14,7 +14,9 @@
 //!   finished without one, or the looks ran out).
 //! - `profiles-complete --dir <dir> --prefix <p>...` ([`profiles_complete`]): exit 1 unless each
 //!   shard's prefix begins a non-empty `.profraw` file of the directory and no `.profraw` file
-//!   begins none of them.
+//!   begins none of them (`--extension profdata` checks the shards' merged `.profdata` files).
+//! - `merge-profiles --dir <dir> --extension <e> [--prefix <p>] --out <file>` ([`merge_profiles`]): the
+//!   toolchain's `llvm-profdata merge -sparse` of the directory's `.profraw` or `.profdata` files.
 //! - `release farm-version --repo <owner/repo> --tag <tag> --commit <sha> [--output <file>]`
 //!   ([`release::farm_version`]): the version text the farm is told to converge on,
 //!   `<version>+g<12 hex digits of the commit>` as the hosts report it, read from the release's
@@ -27,9 +29,6 @@
 //!   --project <dir> --nonce <text>` ([`prove_farm`]): after the deploy, build a small Buck2 project against the
 //!   farm, remote only, and exit 1 unless some action ran remotely and none locally. An empty `--address` prints a
 //!   notice and exits 0.
-//! - `frozen-paths --base <rev> --head <rev>` ([`frozen_paths`]): refused when the change touches a
-//!   path tierstore is moving to its own repository with (a rename out of one counts). Deleted with
-//!   its workflow, `tierstore-move-freeze.yml`, once the import has landed.
 //! - `budget-diff --base <rev>` ([`budget`]): the interpreter budget may only shrink; a
 //!   row the working tree's budget file has and `<rev>`'s does not is refused, unless
 //!   git sees the row's path renamed from a path `<rev>` has a row for. CI runs
@@ -150,8 +149,8 @@ pub mod deploy_farm;
 pub mod entitlements;
 pub mod fetch;
 pub mod fetch_attested;
-pub mod frozen_paths;
 pub mod installer_tarball;
+pub mod merge_profiles;
 pub mod package;
 pub mod pipeline_rerun;
 pub mod pipeline_watch;
@@ -236,6 +235,8 @@ enum Verb {
     WaitArtifacts(wait_artifacts::Args),
     /// Refuse a directory of raw coverage profiles in which a shard's profiles are missing.
     ProfilesComplete(profiles_complete::Args),
+    /// Merge a directory's coverage profiles into one indexed profile.
+    MergeProfiles(merge_profiles::Args),
     /// Set a published release as the farm's desired version on the update coordinator and
     /// wait for the farm to converge.
     DeployFarm(deploy_farm::Args),
@@ -256,9 +257,6 @@ enum Verb {
         #[arg(long)]
         base: String,
     },
-    /// Refuse a change between `--base` and `--head` that touches a path tierstore is moving out
-    /// with (a rename out of one counts).
-    FrozenPaths(frozen_paths::Args),
     /// Append `SOURCE_DATE_EPOCH=<seconds>`, the committer time of `--commit`, to `--output`
     /// (on Actions, `GITHUB_ENV`), so a later step builds an image that carries the commit's
     /// time and no clock of the build's.
@@ -995,8 +993,14 @@ enum BuildCommit {
     },
     /// The `kbf` in the release tarball `<tarball>` (`<name>-<commit>-<platform>.tar.gz`)
     /// names `<commit>` and a release build, as `check --json` finds, run on the bytes
-    /// that ship.
-    CheckAsset { tarball: PathBuf, commit: String },
+    /// that ship. With `--plain`, only the `--version` line is checked, for a binary that has no
+    /// `--version --json` (kbf-updater).
+    CheckAsset {
+        tarball: PathBuf,
+        commit: String,
+        #[arg(long)]
+        plain: bool,
+    },
     /// A plain build, two override stamps and a malformed override, from the checkout.
     Stamps { commit: String },
 }
@@ -1128,12 +1132,17 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             commit,
             json,
         }) => Ok(vec![build_commit::check(&binary, &commit, json)?]),
-        Verb::BuildCommit(BuildCommit::CheckAsset { tarball, commit }) => {
+        Verb::BuildCommit(BuildCommit::CheckAsset {
+            tarball,
+            commit,
+            plain,
+        }) => {
             let scratch_in = root.join("target");
             Ok(vec![build_commit::check_asset(
                 &scratch_in,
                 &tarball,
                 &commit,
+                !plain,
             )?])
         }
         Verb::BuildCommit(BuildCommit::Stamps { commit }) => {
@@ -1160,6 +1169,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
         Verb::Advisories(args) => advisories::run(&args, &root, &cargo_program()),
         Verb::WaitArtifacts(args) => wait_artifacts::run(&args, &root, &cargo_program()),
         Verb::ProfilesComplete(args) => profiles_complete::run(&args),
+        Verb::MergeProfiles(args) => merge_profiles::run(&args, &root),
         Verb::DeployFarm(args) => deploy_farm::run(&args),
         Verb::ProveFarm(args) => prove_farm::run(&args),
         Verb::RunnerDisk(args) => runner_disk::run(&args),
@@ -1167,7 +1177,6 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
         Verb::PipelineWatch(args) => pipeline_watch::run(&args),
         Verb::PipelineRerun(args) => pipeline_rerun::run(&args),
         Verb::BudgetDiff { base } => Ok(vec![budget_diff(&root, &base)?]),
-        Verb::FrozenPaths(args) => Ok(vec![frozen_paths::run(&args, &root)?]),
         Verb::SourceDateEpoch { commit, output } => {
             source_date_epoch(&root, &commit, &output).map(|line| vec![line])
         }

@@ -12,9 +12,10 @@
 //!   it. It stays so until the host is fixed or another version is set (the coordinator
 //!   does not tell it again, `decide`).
 //! - `converged`: past the quiet start, at least one live host, every live host at the
-//!   desired version and none updating or failed, and at least `min_up` hosts of the
-//!   storage and of the frontend role up. The last two keep a coordinator that has just
-//!   restarted, and has heard from few hosts, from reporting a farm converged.
+//!   desired version, none updating or failed or still baking or waiting for a promotion,
+//!   and at least `min_up` hosts of the storage and of the frontend role up. The last two
+//!   keep a coordinator that has just restarted, and has heard from few hosts, from
+//!   reporting a farm converged.
 //! - `in_progress`: everything else.
 //!
 //! How long a farm has gone without progress is the caller's to judge: it needs the time of
@@ -28,6 +29,7 @@ use serde::Serialize;
 
 use crate::desired::Desired;
 use crate::fleet::{Fleet, Host};
+use crate::membership::HostCounts;
 use crate::services::ServiceDef;
 
 /// Where the farm stands.
@@ -69,6 +71,10 @@ pub struct Convergence {
     pub state: State,
     /// The counts of every role that has a host, in role order.
     pub roles: Vec<RoleCounts>,
+    /// The hosts that are not counted in `roles`, by why. Left out for a service with no
+    /// selector until there is one to count.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hosts: Option<HostCounts>,
     /// The commit this coordinator was built from ([`crate::BUILD_COMMIT`]): what a client
     /// compares with a release before it orders one.
     pub commit: &'static str,
@@ -131,17 +137,32 @@ pub fn role_counts(
         .collect()
 }
 
-/// Where the farm stands at `now` against `desired`.
+/// Where the farm stands at `now` against `desired`, for `kbf` as shipped.
 #[must_use]
 pub fn converge(desired: Option<&Desired>, fleet: &Fleet, now: Duration) -> Convergence {
-    converge_with(&ServiceDef::kbf(), desired, fleet, now, |d, role| {
+    converge_kbf(&ServiceDef::kbf(), desired, fleet, now)
+}
+
+/// Where the hosts of `kbf`, as `def` defines it (the shipped definition or a replacement),
+/// stand at `now` against `desired`: the answer clients of `kbf` have always read, so the
+/// minimum of hosts up per role is the desired state's `min_up` alone, without the floor of
+/// a `never_last` role that [`converge_service`] applies.
+#[must_use]
+pub fn converge_kbf(
+    def: &ServiceDef,
+    desired: Option<&Desired>,
+    fleet: &Fleet,
+    now: Duration,
+) -> Convergence {
+    converge_with(def, desired, fleet, now, |d, role| {
         d.min_up.min_up_of(role) as usize
     })
 }
 
 /// Where the hosts of the service `def` stand at `now` against its `desired`: like
 /// [`converge`] over the hosts that heartbeated the service, with the minimum of hosts up
-/// per role being what the service requires of the role ([`crate::services::RoleDef::required_up`]).
+/// per role being what the service requires of the role
+/// ([`crate::services::RoleDef::required_up`]).
 #[must_use]
 pub fn converge_service(
     def: &ServiceDef,
@@ -168,6 +189,7 @@ fn converge_with(
             quiet,
             state: State::InProgress,
             roles: Vec::new(),
+            hosts: None,
             commit: crate::BUILD_COMMIT,
         };
     };
@@ -179,6 +201,13 @@ fn converge_with(
         .count();
     let at_desired: usize = roles.iter().map(|c| c.at_desired).sum();
     let clear = roles.iter().all(|c| c.updating == 0 && c.failed == 0);
+    // A host still baking, or waiting for its promotion, is not yet a host that took the
+    // version.
+    let settled = fleet.hosts_of(service).all(|(id, h)| {
+        !h.is_live(now)
+            || !(h.beat.promotion_pending
+                || fleet.is_baking(service, id, h, &desired.version, def.bake_beats, now))
+    });
     let up = |role: &str| {
         fleet
             .hosts_of(service)
@@ -191,6 +220,7 @@ fn converge_with(
         && live > 0
         && at_desired == live
         && clear
+        && settled
         && def
             .role_names()
             .into_iter()
@@ -205,6 +235,7 @@ fn converge_with(
         quiet,
         state,
         roles,
+        hosts: None,
         commit: crate::BUILD_COMMIT,
     }
 }

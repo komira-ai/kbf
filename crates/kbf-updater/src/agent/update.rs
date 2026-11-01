@@ -12,7 +12,9 @@
 //! 2. **Drain** the node at the frontend and wait until it holds no lease, however long that
 //!    takes (`NodeDrain`: cordon, drain, uncordon over the operator API; a cordon is durable).
 //!    A `--drain-deadline-secs` that passes first fails the update with the node left drained
-//!    and nothing switched; the order is tried again after `--retry-secs`.
+//!    and nothing switched; the order is tried again after `--retry-secs`. To a coordinator
+//!    that advertises `deferred-v1` that is a [`Hold::Deferred`] (reason `drain_bound`), not a
+//!    failure, and the order is declined until `--retry-secs` have passed.
 //! 3. **Switch**: the helper puts B in place on trial, with a pending marker and a deadline on
 //!    its disk, and restarts the service on it.
 //! 4. **Health**: the node's health check (`node_health`) until B shows healthy, for no longer
@@ -28,7 +30,9 @@
 //!    retry or a resume gives it back (`cordon`: the drain leaves a mark on disk).
 //!
 //! The result is [`UpdateResult`]: the target and whether it succeeded. It goes into the next
-//! heartbeat.
+//! heartbeat. Two endings are more than that, for a coordinator that advertises them
+//! (`super::hold`): a drain bound is a deferral, and a revert the helper could not do, with
+//! the previous release not healthy, is a halt (phase `halt`, reason `rollback_failed`).
 //!
 //! A restart of the updater in the middle finds the helper's pending marker and finishes the
 //! trial from the health step: it does not fetch, drain or switch a second time.
@@ -36,12 +40,13 @@
 use std::time::Duration;
 
 use super::flags::Timing;
+use super::hold::{DRAIN_BOUND, Features, Hold, ROLLBACK_FAILED, deferred, halt};
 use super::local::{Local, LocalError, Trial};
 use super::status::{Shared, version_of_commit};
 use crate::inventory::Host;
 use crate::ports::{Clock, Drain, Health, HealthCheck, Placed, PortError};
 use crate::version::Version;
-use crate::wire::{Outcome, UpdateResult};
+use crate::wire::{Outcome, Phase, UpdateResult};
 
 /// What an update needs of the outside, as ports.
 pub struct Ports<'a> {
@@ -64,10 +69,33 @@ pub struct Update<'a> {
 }
 
 fn result(target: &Version, outcome: Outcome) -> UpdateResult {
-    UpdateResult {
-        target: target.clone(),
-        outcome,
+    UpdateResult::new(target.clone(), outcome)
+}
+
+/// How an update ended: the result it has always had, and, for the two endings that are not a
+/// verdict on the release, why. The hold is what the updater found; [`Update::run_for`] keeps
+/// it only for a behaviour the coordinator advertised.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Done {
+    pub result: UpdateResult,
+    pub hold: Option<Hold>,
+}
+
+impl From<UpdateResult> for Done {
+    fn from(result: UpdateResult) -> Self {
+        Self { result, hold: None }
     }
+}
+
+/// Why the drain did not finish.
+#[derive(Debug, thiserror::Error)]
+enum DrainError {
+    /// The node could not be read, drained or counted.
+    #[error("{0}")]
+    Port(PortError),
+    /// The operator's drain deadline passed with leases still held.
+    #[error("{0}")]
+    Bound(String),
 }
 
 impl Update<'_> {
@@ -75,21 +103,40 @@ impl Update<'_> {
         (self.ports.log)(line);
     }
 
-    /// Run the update to `target`, or finish the one the helper is in the middle of.
+    /// Run the update to `target`, or finish the one the helper is in the middle of, as an
+    /// agent does against a coordinator that advertises nothing: it ends in a result.
     pub fn run(&self, target: &Version) -> UpdateResult {
+        self.run_for(target, Features::default()).result
+    }
+
+    /// [`Update::run`], where the endings `features` names are reported as what they are. A
+    /// deferred update is not a result: the status keeps the last result it had, and the
+    /// caller gets the [`Hold`]. A halt is a failed result of phase `halt`.
+    pub fn run_for(&self, target: &Version, features: Features) -> Done {
         self.status.update(|s| s.updating = Some(target.clone()));
-        let done = self.run_inner(target);
+        let mut done = self.run_inner(target);
+        done.hold = done.hold.filter(|hold| match hold {
+            Hold::Deferred { .. } => features.deferred,
+            Hold::Halt { .. } => features.halt,
+        });
+        if let Some(Hold::Halt { reason }) = &done.hold {
+            done.result.phase = Some(Phase::Halt);
+            done.result.reason = Some(reason.clone());
+        }
+        let is_result = !matches!(done.hold, Some(Hold::Deferred { .. }));
         self.status.update(|s| {
             s.updating = None;
-            s.last_update = Some(done.clone());
+            if is_result {
+                s.last_update = Some(done.result.clone());
+            }
         });
         done
     }
 
-    fn run_inner(&self, target: &Version) -> UpdateResult {
+    fn run_inner(&self, target: &Version) -> Done {
         let failed = |why: &dyn std::fmt::Display| {
             self.log(&format!("update to {target}: {why}"));
-            result(target, Outcome::Failed)
+            Done::from(result(target, Outcome::Failed))
         };
         if let Some(why) = self.ports.health.refusal(self.host) {
             return failed(&why);
@@ -103,7 +150,7 @@ impl Update<'_> {
             return self.resume(target, &trial);
         }
         if state.version.as_ref() == Some(target) {
-            return result(target, Outcome::Succeeded);
+            return result(target, Outcome::Succeeded).into();
         }
         // 1. Fetch and verify. Nothing of the node has changed if this fails.
         let staged = match self.ports.local.install(target, self.channel) {
@@ -112,12 +159,20 @@ impl Update<'_> {
         };
         if staged.current {
             // The host runs this release already (the helper now knows its version's text).
-            return result(target, Outcome::Succeeded);
+            return result(target, Outcome::Succeeded).into();
         }
         // 2. Drain.
         let placed = match self.drain() {
             Ok(placed) => placed,
-            Err(e) => return failed(&format!("the node could not be drained: {e}")),
+            Err(e) => {
+                let mut done = failed(&format!("the node could not be drained: {e}"));
+                // Leases that run past the operator's bound are the host's moment, not the
+                // release: nothing was switched.
+                done.hold = matches!(e, DrainError::Bound(_))
+                    .then(|| deferred(DRAIN_BOUND))
+                    .flatten();
+                return done;
+            }
         };
         // 3. Switch.
         let deadline = match self.ports.local.switch(target) {
@@ -132,7 +187,7 @@ impl Update<'_> {
     }
 
     /// The helper has `trial` on trial: finish it from the health step.
-    fn resume(&self, asked: &Version, trial: &Trial) -> UpdateResult {
+    fn resume(&self, asked: &Version, trial: &Trial) -> Done {
         let Some(target) = trial.version.clone() else {
             // A release on trial whose version this host never named: not one to keep.
             self.log(&format!(
@@ -151,7 +206,8 @@ impl Update<'_> {
         // disk), and as out if an operator did. If it cannot be read, nothing says it is ours.
         let placed = self.ports.drain.placed(self.host).unwrap_or_else(|e| {
             self.log(&format!(
-                "update to {target}: the node could not be read, so it is not given back: {e}"
+                "update to {target}: the node could not be read, so it is not given back; uncordon it \
+                 by hand if it should serve: {e}"
             ));
             Placed::Out
         });
@@ -159,7 +215,7 @@ impl Update<'_> {
     }
 
     /// Steps 4 to 6 for `target` on trial until `deadline` (Unix seconds).
-    fn trial(&self, target: &Version, deadline: u64, placed: Placed) -> UpdateResult {
+    fn trial(&self, target: &Version, deadline: u64, placed: Placed) -> Done {
         let left = Duration::from_secs(deadline.saturating_sub((self.ports.unix_now)()));
         let bound = self
             .timing
@@ -193,28 +249,31 @@ impl Update<'_> {
     }
 
     /// B is confirmed: the node goes back into placement, if it was in it.
-    fn keep(&self, target: &Version, placed: Placed) -> UpdateResult {
+    fn keep(&self, target: &Version, placed: Placed) -> Done {
         match self.give_back(placed) {
-            Ok(()) => result(target, Outcome::Succeeded),
+            Ok(()) => result(target, Outcome::Succeeded).into(),
             Err(e) => {
                 // On B and healthy, and not given back: the update is not done.
                 self.log(&format!(
                     "update to {target}: confirmed, and the node stays drained: {e}"
                 ));
-                result(target, Outcome::Failed)
+                result(target, Outcome::Failed).into()
             }
         }
     }
 
     /// B did not work: the helper puts A back, and the node is given back only if A is
     /// healthy.
-    fn back_on_a(&self, target: &Version, placed: Placed) -> UpdateResult {
-        match self.ports.local.revert() {
-            Ok(()) => {}
+    fn back_on_a(&self, target: &Version, placed: Placed) -> Done {
+        let revert_failed = match self.ports.local.revert() {
+            Ok(()) => false,
             // Nothing on trial: the helper went back by itself, or the switch never held.
-            Err(LocalError::Refused(code)) if code == "nothing_pending" => {}
-            Err(e) => self.log(&format!("update to {target}: the revert failed: {e}")),
-        }
+            Err(LocalError::Refused(code)) if code == "nothing_pending" => false,
+            Err(e) => {
+                self.log(&format!("update to {target}: the revert failed: {e}"));
+                true
+            }
+        };
         let running = match self.ports.local.query() {
             Ok(state) => state
                 .version
@@ -241,7 +300,13 @@ impl Update<'_> {
                 "update to {target}: A is not healthy: the node stays drained"
             ));
         }
-        result(target, Outcome::Failed)
+        let mut done = Done::from(result(target, Outcome::Failed));
+        // The helper could not put A back and A does not run healthy: no version and no retry
+        // repairs that, and a retry would drain the node again.
+        done.hold = (revert_failed && !healthy)
+            .then(|| halt(ROLLBACK_FAILED))
+            .flatten();
+        done
     }
 
     /// Read whether the node is in placement, then drain it and wait until it holds no lease,
@@ -250,11 +315,16 @@ impl Update<'_> {
     /// (its leases run on), and the same order is tried again after the retry time, which
     /// drains the node again and waits again. What comes back is whether the node was in
     /// placement before this drain: a node the updater drained on an earlier attempt is.
-    fn drain(&self) -> Result<Placed, PortError> {
-        let placed = self.ports.drain.placed(self.host)?;
+    fn drain(&self) -> Result<Placed, DrainError> {
+        let placed = self
+            .ports
+            .drain
+            .placed(self.host)
+            .map_err(DrainError::Port)?;
         self.ports
             .drain
-            .drain(self.host, self.timing.drain_deadline)?;
+            .drain(self.host, self.timing.drain_deadline)
+            .map_err(DrainError::Port)?;
         let start = self.ports.clock.now();
         loop {
             let leases = match self.ports.drain.leases(self.host) {
@@ -262,7 +332,7 @@ impl Update<'_> {
                 Err(e) => {
                     // The node is drained by us and is not going to be switched.
                     let _ = self.give_back(placed);
-                    return Err(e);
+                    return Err(DrainError::Port(e));
                 }
             };
             let waited = self.ports.clock.now().saturating_sub(start);
@@ -270,7 +340,7 @@ impl Update<'_> {
                 return Ok(placed);
             }
             if let Some(deadline) = self.timing.drain_deadline.filter(|d| waited >= *d) {
-                return Err(PortError::other(format!(
+                return Err(DrainError::Bound(format!(
                     "the node still holds {leases} leases after the drain deadline of {} s; \
                      nothing was switched, the leases run on and the node is left drained",
                     deadline.as_secs()

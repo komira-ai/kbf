@@ -19,6 +19,19 @@ pub const WORKFLOW: &str = "komira-ai/kbf/.github/workflows/artifacts.yml";
 pub const FORMER_REPO: &str = "komira-ai/komira-build-farm";
 pub const FORMER_WORKFLOW: &str = "komira-ai/komira-build-farm/.github/workflows/artifacts.yml";
 
+/// The asset whose releases komira-ai/tierstore's own workflow signs now that the crate lives
+/// there: the start of its file names (`tierstore-<commit>-<platform>.tar.gz`).
+pub const TIERSTORE_PREFIX: &str = "tierstore";
+
+/// The repository that builds and signs the `tierstore` asset from now on. Its attestation is
+/// accepted for [`TIERSTORE_PREFIX`] files only, beside kbf's own, so that a rollback to the last
+/// tierstore kbf shipped still verifies. Its source ref is `refs/heads/main`, the channel's
+/// branch, as for kbf.
+pub const TIERSTORE_REPO: &str = "komira-ai/tierstore";
+
+/// The workflow of [`TIERSTORE_REPO`] that builds and attests its release files.
+pub const TIERSTORE_WORKFLOW: &str = "komira-ai/tierstore/.github/workflows/artifacts.yml";
+
 /// The start of every release file's name unless the channel names another.
 pub const ARTIFACT_PREFIX: &str = "kbf";
 
@@ -141,11 +154,26 @@ impl Origin {
     }
 
     /// The (repository, workflow) pairs an attestation of this origin's releases may name:
-    /// for kbf's own pair also its former name (the transition), else only the pair.
+    /// for kbf's own pair also its former name (the transition), else only the pair. The
+    /// `tierstore` asset (by its prefix, nothing else) also accepts kbf's pairs and
+    /// [`TIERSTORE_REPO`]'s, when the channel names kbf's, its former name's or tierstore's
+    /// repository; a channel for any other repository gets only its own pair, and no other
+    /// asset gets more.
+    /// The pairs are compared whole and exactly.
     pub fn signers(&self) -> Vec<(&str, &str)> {
         let mut signers = vec![(self.repository(), self.workflow())];
-        if self.repository == REPO && self.workflow == WORKFLOW {
-            signers.push((FORMER_REPO, FORMER_WORKFLOW));
+        let mut add = |pair: (&'static str, &'static str)| {
+            if !signers.contains(&pair) {
+                signers.push(pair);
+            }
+        };
+        let pinned = [REPO, FORMER_REPO, TIERSTORE_REPO].contains(&self.repository.as_str());
+        if self.prefix == TIERSTORE_PREFIX && pinned {
+            add((REPO, WORKFLOW));
+            add((FORMER_REPO, FORMER_WORKFLOW));
+            add((TIERSTORE_REPO, TIERSTORE_WORKFLOW));
+        } else if self.is_kbf_signer() {
+            add((FORMER_REPO, FORMER_WORKFLOW));
         }
         signers
     }

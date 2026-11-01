@@ -105,6 +105,8 @@ fn a_window_becomes_its_attempts_in_queue_order() {
             operation: None,
             booked_millicpus: None,
             node_cpu_pressure_centi: None,
+            invocation_id: None,
+            correlated_invocations_id: None,
         }
     );
 
@@ -136,7 +138,7 @@ fn a_window_becomes_its_attempts_in_queue_order() {
     let r3 = &done.rows[3];
     assert_eq!(r3.platform, "macos");
     assert_eq!(r3.basis.as_deref(), Some("mac_footprint"));
-    assert_eq!(r3.operation.as_deref(), Some("op-9"));
+    assert_eq!(r3.operation.as_deref(), Some("9"));
     assert_eq!(r3.booked_millicpus, Some(1000));
     assert_eq!(r3.node_cpu_pressure_centi, Some(1234));
     let u = r3.cgroup.as_ref().unwrap();

@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use kbf_front::Tap;
 use kbf_history::records::{
-    BookSource, Cgroup, Footprint, HitHow, HitRecord, MemoryKill, Output, RunOutcome, RunRecord,
-    Timestamps, UsageBasis, WireDigest,
+    BookSource, Cgroup, Footprint, HitHow, HitRecord, MemoryKill, Output, PhaseTimes, RunOutcome,
+    RunRecord, Timestamps, UsageBasis, WireDigest,
 };
 use kbf_history::{Event, EventQueue, InvRef, Minter};
 use kbf_invocation::{
@@ -179,6 +179,11 @@ impl HistoryTap {
         let inv = InvRef::named(name);
         let minted = self.minter.mint(&inv.key, at.unix_micros() / 1000);
         let mut record = run_record(row, attempt);
+        name_build(
+            &mut record,
+            &ended.key,
+            ended.correlated_invocations_id.as_deref(),
+        );
         record.set_run_id(minted.id);
         let mut job = Job {
             inv,
@@ -335,6 +340,12 @@ pub(crate) fn run_record(row: &ActionRow, attempt: &Attempt) -> RunRecord {
         booked_memory_bytes: booked,
         raised_memory_bytes: raised,
         cap_bytes: run.and_then(|r| r.cap_bytes).unwrap_or(0),
+        phase_times: run
+            .map_or(PhaseTimes::Unspecified, |r| match r.phase_times {
+                kbf_invocation::PhaseTimes::Measured => PhaseTimes::Measured,
+                kbf_invocation::PhaseTimes::TaskClaim => PhaseTimes::TaskClaim,
+            })
+            .into(),
         timestamps: Some(Timestamps {
             queued_us: micros(times.queued.or(Some(first_queued))),
             granted_us: micros(Some(attempt.granted)),
@@ -417,6 +428,14 @@ pub(crate) fn run_record(row: &ActionRow, attempt: &Attempt) -> RunRecord {
         input_files: row.evidence.and_then(|e| e.input_files),
         ..RunRecord::default()
     }
+}
+
+/// Names on `record` the invocation its attempt's request belonged to (the client's id,
+/// without the `~<n>` of a second caller's record) and, if a call of the invocation sent
+/// one, the group (a CI job) it is part of. [`run_record`] cannot: a row does not know its record.
+pub(crate) fn name_build(record: &mut RunRecord, key: &RecordKey, correlated: Option<&str>) {
+    record.invocation_id = Some(key.id().as_str().to_owned());
+    record.correlated_invocations_id = correlated.map(str::to_owned);
 }
 
 /// What a run record says of an axis' booking source: `Unspecified` when the row was
