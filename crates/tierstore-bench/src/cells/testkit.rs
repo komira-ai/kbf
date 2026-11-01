@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use crate::cells::CellContext;
 use crate::cells::budget::{Campaign, Ledger};
 use crate::cells::engine::LoadSource;
-use crate::coldstate::{ColdStateSource, NoColdState};
+use crate::coldstate::{ColdMeter, ColdReading, ColdStateSource, MeterFuture, NoColdState};
 use crate::config::{ByteCaps, RateCaps, RunConfig, Secret, StoreSpec};
 use crate::error::BenchError;
 use crate::gate::{LoadGate, LoadSample};
@@ -121,6 +121,49 @@ impl ColdStateSource for ColdScript {
         }
         Ok(last.clone())
     }
+}
+
+/// A cold meter that answers what it was told, in order: the reading of a store whose request
+/// counter says so, or the reason a reading failed. Asked more often than it was told, it fails
+/// the test.
+pub struct MeterScript {
+    answers: Mutex<VecDeque<Result<ColdReading, String>>>,
+    reads: std::sync::atomic::AtomicU32,
+}
+
+impl MeterScript {
+    /// A meter that answers `answers` in turn.
+    pub fn of(answers: Vec<Result<ColdReading, String>>) -> Arc<Self> {
+        Arc::new(Self {
+            answers: Mutex::new(answers.into()),
+            reads: 0.into(),
+        })
+    }
+
+    /// How many times it was asked.
+    pub fn reads(&self) -> u32 {
+        self.reads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl ColdMeter for MeterScript {
+    fn read(&self, _limit: std::time::Duration) -> MeterFuture<'_> {
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let next = self
+            .answers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop_front();
+        Box::pin(async move { next.expect("the meter was asked more often than it was told") })
+    }
+}
+
+/// A reading of a healthy store (one drive, `ok`) whose request counter says `s3_requests`.
+pub fn counter(s3_requests: u64) -> Result<ColdReading, String> {
+    Ok(ColdReading {
+        s3_requests,
+        state: cold_state(false, 1),
+    })
 }
 
 /// Twin of `tests/dead_store/mod.rs`: keep the two identical.
@@ -253,7 +296,14 @@ pub fn ctx_with_log(
             max_psi_io_avg10: 10.0,
             max_disk_util_pct: 60.0,
         },
-        cold_guard: crate::cells::coldguard::ColdGuardLimits::default(),
+        // The p99 limit of the engine tests is 2 s, so that their slow stores are a few seconds
+        // of the paused clock; the default of the real run is the 30 s backstop.
+        cold_guard: crate::cells::coldguard::ColdGuardLimits {
+            max_p99_ms: 2_000,
+            ..crate::cells::coldguard::ColdGuardLimits::default()
+        },
+        cold_counter_settle: std::time::Duration::ZERO,
+        cold_cluster_roles: None,
         cold_state_timeout: std::time::Duration::from_secs(30),
         cold_state_max_age: std::time::Duration::from_secs(30),
         rates: RateCaps {
@@ -274,6 +324,8 @@ pub fn ctx_with_log(
         log,
         campaign: Campaign { ledger },
         cold_state: Arc::new(NoColdState),
+        cold_meter: None,
+        cold_server: crate::coldserver::ColdServer::alone(),
         provenance: Provenance {
             run_id: "test-run".to_owned(),
             ..Provenance::unrecorded()

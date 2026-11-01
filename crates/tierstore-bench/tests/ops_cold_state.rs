@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use tierstore_bench::coldstate::{ColdStateSource, OpsColdState};
+use tierstore_bench::coldstate::{ColdMeter, ColdStateSource, OpsColdMeter, OpsColdState};
 use tierstore_bench::error::BenchError;
 use tierstore_bench::result::ColdSource;
 use tierstore_bench::role::Role;
@@ -318,4 +318,107 @@ async fn a_reading_that_answers_in_time_is_the_plain_reading() {
     assert_eq!(read.percent_done, Some(6.4));
     assert_eq!(read.drives.len(), 2);
     assert_eq!(host.ran().len(), 1);
+}
+
+/// The Prometheus text of a store that has served 5 gets and 7 puts, with a series of another
+/// name beside them.
+const METRICS: &str = "# HELP minio_s3_requests_total Total number of s3 requests\n\
+# TYPE minio_s3_requests_total counter\n\
+minio_s3_requests_total{api=\"getobject\",server=\"s:9000\"} 5\n\
+minio_s3_requests_total{api=\"putobject\",server=\"s:9000\"} 7\n\
+minio_s3_requests_errors_total{api=\"putobject\",server=\"s:9000\"} 100\n";
+
+/// A meter over a host that answers the metrics command with `metrics` and the rest with the
+/// admin info of a store that is not healing.
+fn meter_over(name: &str, metrics: &'static str) -> (Arc<FakeHost>, OpsColdMeter) {
+    let (dir, host, config, ops) = base(name);
+    host.answer(move |cmd| {
+        if cmd.args.iter().any(|a| a == "prometheus") {
+            ok(metrics)
+        } else {
+            ok(&info_json("RELEASE.mark", false))
+        }
+    });
+    host.file("/private-mark/heal.json", r#"{"percent_done": 100.0}"#);
+    let host = Arc::new(host);
+    let spec = config.store(Role::Cold).unwrap().clone();
+    let state = OpsColdState::new(host.clone(), ops, spec, dir.path().to_owned());
+    (host, OpsColdMeter::new(state, Duration::ZERO))
+}
+
+/// Catches a meter that reads the state but not the counter (or the other way round), that asks
+/// for the counter in JSON (the answer is Prometheus text) or with a write, and one whose
+/// reading names the store: the counter is the sum of the request series, the state is the
+/// admin info's, and the two commands are the read-only ones.
+#[tokio::test]
+async fn the_meter_reads_the_request_counter_and_the_state_with_read_only_commands() {
+    let (host, meter) = meter_over("tb-cold-meter", METRICS);
+    let reading = meter.read(Duration::from_secs(600)).await.unwrap();
+    assert_eq!(reading.s3_requests, 12);
+    assert!(!reading.state.healing);
+    assert_eq!(reading.state.drives.len(), 2);
+    assert_eq!(reading.state.source, Some(ColdSource::Mc));
+    let asked: Vec<String> = host.ran().iter().map(|c| c.args.join(" ")).collect();
+    assert_eq!(asked.len(), 2, "{asked:?}");
+    assert!(
+        asked[0].ends_with("admin prometheus metrics tbops cluster"),
+        "{asked:?}"
+    );
+    assert!(!asked[0].contains("--json"), "{asked:?}");
+    assert!(asked[1].ends_with("admin info tbops"), "{asked:?}");
+    let text = format!("{reading:?}");
+    for private in PRIVATE {
+        assert!(!text.contains(private), "{private} in {text}");
+    }
+}
+
+/// Catches a counter that cannot be read being taken for a quiet store: a metrics command that
+/// fails, and an answer with no request series, are errors with a reason, not zero.
+#[tokio::test]
+async fn a_counter_that_cannot_be_read_is_an_error_with_a_reason() {
+    let (host, meter) = meter_over("tb-cold-meter-fails", METRICS);
+    host.answer(|_| failed(1, "no route"));
+    let err = meter.read(Duration::from_secs(600)).await.unwrap_err();
+    assert!(err.contains("mc admin prometheus metrics"), "{err}");
+    assert!(err.contains("exited"), "{err}");
+    let (_host, meter) = meter_without_series();
+    let err = meter.read(Duration::from_secs(600)).await.unwrap_err();
+    assert!(err.contains("minio_s3_requests_total"), "{err}");
+}
+
+fn meter_without_series() -> (Arc<FakeHost>, OpsColdMeter) {
+    meter_over("tb-cold-meter-no-series", "# nothing here\nminio_up 1\n")
+}
+
+/// Catches a reading whose second half is skipped when it fails: the state read after the
+/// counter (the admin info, the heal status file) and the admin key each have their own error,
+/// and none gives a half reading.
+#[tokio::test]
+async fn a_failing_state_or_key_is_an_error_not_a_half_reading() {
+    let (host, meter) = meter_over("tb-cold-meter-info-fails", METRICS);
+    host.answer(|cmd| {
+        if cmd.args.iter().any(|a| a == "prometheus") {
+            ok(METRICS)
+        } else {
+            failed(1, "no route")
+        }
+    });
+    let err = meter.read(Duration::from_secs(600)).await.unwrap_err();
+    assert!(err.contains("mc admin info"), "{err}");
+
+    let (host, meter) = meter_over("tb-cold-meter-heal-file", METRICS);
+    host.file("/private-mark/heal.json", "not json");
+    let err = meter.read(Duration::from_secs(600)).await.unwrap_err();
+    assert!(err.contains("heal status file"), "{err}");
+
+    let (dir, host, config, ops) = base("tb-cold-meter-no-key");
+    let host = Arc::new(host);
+    let spec = config.store(Role::Cold).unwrap().clone();
+    let state = OpsColdState::new(host.clone(), file_mode(&ops), spec, dir.path().to_owned());
+    let err = OpsColdMeter::new(state, Duration::ZERO)
+        .read(Duration::from_secs(600))
+        .await
+        .unwrap_err();
+    assert!(err.contains("no admin key file"), "{err}");
+    assert!(host.ran().is_empty(), "nothing ran without a key");
 }
