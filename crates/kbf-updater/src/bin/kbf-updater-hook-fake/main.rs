@@ -1,19 +1,26 @@
 //! `kbf-updater-hook-fake`: `kbf update-hook` over a fake host, the program the conformance
-//! harness runs (tests/hook_conformance.rs).
+//! harness runs (tests/hook_conformance.rs). Not shipped.
+//!
+//! ```text
+//! kbf-updater-hook-fake [update-hook] --world DIR --faults DIR <the flags of kbf update-hook>
+//!                       <step> [<artifact>] [--params FILE]
+//! ```
 //!
 //! It is the hook's own code (`kbf_updater::agent::hook::run`: the flags, the params, the
 //! record, the five steps) with its ports played by a host kept in a directory instead of the
 //! helper's socket and the frontend's API: the same traits the agent's fakes implement, but
 //! with their state in files, so that a step can be killed and run again by another process.
-//! The flags before the step come from the environment of this test program (the harness
-//! gives a hook only the arguments of its declaration and an environment), and every change to
-//! the host or to the record passes a kill point first.
+//! Every setting is a flag, given by the conformance test as the declaration's `hook_args`;
+//! none is read from the environment (the harness's own kill-point variables aside, which
+//! [`gate::point`] reads). `--world` and `--faults` are this program's and come first; the
+//! rest is handed to the hook as it is. Every change to the host or to the record passes a
+//! kill point first.
 //!
-//! The host (`HOOKFAKE_WORLD`): `helper.json`, what the helper runs and has on trial, and
-//! `node`, `serving` or `drained`. The leases are `leases`, if the file is there. Faults come
-//! from `HOOKFAKE_FAULTS/<step>` (`fail`, `defer`) and take effect where the step makes the
-//! call that can fail: the install, the switch, the health, the revert, the confirm; a
-//! deferral is a lease that never goes.
+//! The host (`--world`): `helper.json`, what the helper runs and has on trial, `node`,
+//! `serving` or `drained`, and `mark`, the cordon mark of this update's drain. Faults come from
+//! `--faults/<step>` (`fail`, `defer`) and take effect where the step makes the call that can
+//! fail: the install, the switch, the health, the revert, the confirm; a deferral is a lease
+//! that never goes.
 
 use std::ffi::OsString;
 use std::fs;
@@ -23,6 +30,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
+use kbf_updater::agent::hook::steps::Done;
 use kbf_updater::agent::hook::{HookWorld, Setup, run};
 use kbf_updater::agent::local::{HostState, Local, LocalError, Staged, Trial};
 use kbf_updater::inventory::{Host, Role};
@@ -31,6 +39,10 @@ use kbf_updater::version::Version;
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 use update_hook::conformance::gate;
+use update_hook::{Class, Outcome};
+
+#[cfg(test)]
+mod fake_tests;
 
 /// The commit the helper reports for a release.
 const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -256,49 +268,80 @@ impl Clock for FakeClock {
     }
 }
 
-fn var(name: &str) -> PathBuf {
-    PathBuf::from(std::env::var_os(name).unwrap_or_default())
+/// Why this program's own flags were refused.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+enum OwnError {
+    #[error("{flag} is required")]
+    Required { flag: &'static str },
+    #[error("{flag} needs a value")]
+    NoValue { flag: &'static str },
+    #[error("{flag} is given twice")]
+    Twice { flag: &'static str },
 }
 
-fn main() -> ExitCode {
-    let paths = Arc::new(Paths {
-        world: var("HOOKFAKE_WORLD"),
-        faults: var("HOOKFAKE_FAULTS"),
-    });
-    // The harness runs `<this program> update-hook <step> ...`; the flags go between.
-    let mut rest: Vec<OsString> = std::env::args_os().skip(1).collect();
-    if rest.first().is_some_and(|word| word == "update-hook") {
-        rest.remove(0);
+/// This program's own flags, the first words of its command line.
+#[derive(Debug, PartialEq, Eq)]
+struct Own {
+    /// The fake host's directory.
+    world: PathBuf,
+    /// The directory of the faults, one file per step.
+    faults: PathBuf,
+}
+
+/// `--world` and `--faults`, each once, from the front of `args`; the rest is the hook's.
+fn own_flags(args: &[String]) -> Result<(Own, &[String]), OwnError> {
+    let (mut world, mut faults) = (None, None);
+    let mut at = 0;
+    while let Some(word) = args.get(at) {
+        let (flag, slot) = match word.as_str() {
+            "--world" => ("--world", &mut world),
+            "--faults" => ("--faults", &mut faults),
+            _ => break,
+        };
+        let value = args.get(at + 1).ok_or(OwnError::NoValue { flag })?;
+        if slot.replace(PathBuf::from(value)).is_some() {
+            return Err(OwnError::Twice { flag });
+        }
+        at += 2;
     }
-    let mut args: Vec<String> = [
-        "--record-dir",
-        &var("HOOKFAKE_RECORD").to_string_lossy(),
-        "--channel",
-        "stable",
-        "--client-cert",
-        "/unused/cert.pem",
-        "--client-key",
-        "/unused/key.pem",
-        "--ca",
-        "/unused/ca.pem",
-        "--drain-deadline-secs",
-        "30",
-        "--retry-secs",
-        "60",
-    ]
-    .map(str::to_owned)
-    .to_vec();
-    args.extend(rest.into_iter().map(|a| a.to_string_lossy().into_owned()));
+    let world = world.ok_or(OwnError::Required { flag: "--world" })?;
+    let faults = faults.ok_or(OwnError::Required { flag: "--faults" })?;
+    Ok((Own { world, faults }, &args[at..]))
+}
+
+/// The host this program plays: node `n1`, a daemon's.
+fn host() -> Host {
+    Host {
+        alias: "n1".to_owned(),
+        address: "localhost".to_owned(),
+        role: Role::Daemon,
+        host_key: String::new(),
+        node_id: Some("n1".to_owned()),
+        member: None,
+    }
+}
+
+/// One run: `args` are the words after the program's name.
+fn fake_run(args: &[String], out: &mut dyn io::Write, err: &mut dyn io::Write) -> Outcome {
+    // The harness runs `<this program> update-hook <flags> <step> ...`.
+    let args = args
+        .strip_prefix(&["update-hook".to_owned()])
+        .unwrap_or(args);
+    let (own, rest) = match own_flags(args) {
+        Ok(split) => split,
+        Err(why) => {
+            let done = Done::failed("bad_arguments", Class::Release, why);
+            let _ = done.report.write_to(out);
+            return done.outcome;
+        }
+    };
+    let paths = Arc::new(Paths {
+        world: own.world,
+        faults: own.faults,
+    });
     let world = |_: &kbf_updater::agent::hook::flags::Flags| {
         Ok(HookWorld {
-            host: Host {
-                alias: "n1".to_owned(),
-                address: "localhost".to_owned(),
-                role: Role::Daemon,
-                host_key: String::new(),
-                node_id: Some("n1".to_owned()),
-                member: None,
-            },
+            host: host(),
             local: Arc::new(FakeLocal(paths.clone())),
             drain: Arc::new(FakeDrain(paths.clone())),
             health: Arc::new(FakeHealth(paths.clone())),
@@ -310,12 +353,16 @@ fn main() -> ExitCode {
         world: &world,
         before_write: Some(Arc::new(gate::point)),
     };
-    let outcome = run(
-        &args,
-        &setup,
-        &mut io::stdout().lock(),
-        &mut io::stderr().lock(),
-    );
-    let _ = io::stdout().flush();
+    run(rest, &setup, out, err)
+}
+
+fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args_os()
+        .skip(1)
+        .map(|word: OsString| word.to_string_lossy().into_owned())
+        .collect();
+    let mut out = io::stdout().lock();
+    let outcome = fake_run(&args, &mut out, &mut io::stderr().lock());
+    let _ = out.flush();
     outcome.into()
 }

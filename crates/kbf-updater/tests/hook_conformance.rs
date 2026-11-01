@@ -5,6 +5,9 @@
 //! The harness runs every step twice, kills the hook at every write it makes and runs it
 //! again, drives the updater's table through a failure, a deferral and a halt at each step,
 //! and runs the update as a first install; it refuses a hook that breaks the contract by name.
+//!
+//! The fake host is configured by flags only, given as the declaration's `hook_args` (see
+//! [`hook`]); the hook's environment is empty but for the harness's own kill-point variables.
 
 use std::ffi::OsString;
 use std::fs;
@@ -54,15 +57,9 @@ impl FakeService for FakeHost {
         fs::create_dir_all(sandbox.root().join("faults"))
     }
 
-    fn env(&self, sandbox: &Sandbox) -> Vec<(OsString, OsString)> {
-        vec![
-            ("HOOKFAKE_WORLD".into(), sandbox.world().into()),
-            ("HOOKFAKE_RECORD".into(), sandbox.record().into()),
-            (
-                "HOOKFAKE_FAULTS".into(),
-                sandbox.root().join("faults").into(),
-            ),
-        ]
+    /// Nothing: every setting of the fake host is a flag ([`hook`]).
+    fn env(&self, _sandbox: &Sandbox) -> Vec<(OsString, OsString)> {
+        Vec::new()
     }
 
     fn params(&self) -> Params {
@@ -97,8 +94,57 @@ impl FakeService for FakeHost {
     }
 }
 
+/// The fake host's program and its `hook_args`: the fake's own flags (where the host and the
+/// faults are) and the flags of `kbf update-hook` (where the record is, the channel, the
+/// certificate files, which the fake world never reads, and the waits). The harness starts
+/// every step in the root of its sandbox, so the paths are relative to it: `world/` and
+/// `record/` are the sandbox's own, `faults/` is the one `init` makes.
 fn hook() -> HookCommand {
-    HookCommand::new(Path::new(env!("CARGO_BIN_EXE_kbf-updater-hook-fake")))
+    HookCommand::new(Path::new(env!("CARGO_BIN_EXE_kbf-updater-hook-fake"))).with_hook_args(&[
+        "update-hook",
+        "--world",
+        "world",
+        "--faults",
+        "faults",
+        "--record-dir",
+        "record",
+        "--channel",
+        "stable",
+        "--client-cert",
+        "absent/cert.pem",
+        "--client-key",
+        "absent/key.pem",
+        "--ca",
+        "absent/ca.pem",
+        "--drain-deadline-secs",
+        "30",
+        "--retry-secs",
+        "60",
+    ])
+}
+
+/// The environment of the hook is empty: the fake host is found by the flags of [`hook`]
+/// alone, and they name the sandbox's own directories.
+///
+/// Catches: configuration slipped back into the environment, which a declaration's
+/// `hook_args` would not show.
+#[test]
+fn the_fake_host_is_configured_by_flags_alone() {
+    let scratch = Scratch::new("flags");
+    let sandbox = Sandbox::create(scratch.0.join("run")).expect("a sandbox");
+    assert!(FakeHost::default().env(&sandbox).is_empty());
+    let args: Vec<String> = hook()
+        .hook_args
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    let value = |flag: &str| {
+        let at = args.iter().position(|a| a == flag).expect(flag);
+        sandbox.root().join(&args[at + 1])
+    };
+    assert_eq!(value("--world"), sandbox.world());
+    assert_eq!(value("--record-dir"), sandbox.record());
+    assert_eq!(value("--faults"), sandbox.root().join("faults"));
 }
 
 /// `kbf update-hook` keeps the contract on a host whose node serves: every step is safe to run
