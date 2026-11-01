@@ -1,3 +1,5 @@
+//! Twin of `DeadStore` in `src/cells/testkit.rs`: keep the two identical.
+//!
 //! A store address that gives no answer, for the integration tests that need "a store that is
 //! not there". The same as `DeadStore` of the unit tests (`src/cells/testkit.rs`), which an
 //! integration binary cannot see.
@@ -6,6 +8,8 @@
 //! any other test binary binds on this machine, and that test's fake store then answers the
 //! requests meant for the dead one. Here the address stays bound for as long as the value lives,
 //! and every connection made to it is closed at once, so a request to it ends without an answer.
+//!
+//! The tests below re-run in each test binary that includes this module, on purpose.
 
 pub struct DeadStore {
     url: String,
@@ -19,7 +23,12 @@ impl DeadStore {
         let url = format!("http://{}", listener.local_addr().unwrap());
         let accepting = tokio::spawn(async move {
             loop {
-                drop(listener.accept().await.unwrap());
+                // An accept error (no free descriptor under parallel tests) is skipped, so
+                // the store keeps its address and keeps closing connections.
+                let Ok(_conn) = listener.accept().await else {
+                    tokio::task::yield_now().await;
+                    continue;
+                };
             }
         });
         Self { url, accepting }

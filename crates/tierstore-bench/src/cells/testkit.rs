@@ -114,6 +114,8 @@ impl ColdStateSource for ColdScript {
     }
 }
 
+/// Twin of `tests/dead_store/mod.rs`: keep the two identical.
+///
 /// A store address that gives no answer. Tests that need "a store that is not there" use this and
 /// not a port bound and then closed: a closed port is handed to the next listener any other test
 /// binds on this machine, and that test's fake store then answers the requests meant for the
@@ -131,7 +133,12 @@ impl DeadStore {
         let url = format!("http://{}", listener.local_addr().unwrap());
         let accepting = tokio::spawn(async move {
             loop {
-                drop(listener.accept().await.unwrap());
+                // An accept error (no free descriptor under parallel tests) is skipped, so
+                // the store keeps its address and keeps closing connections.
+                let Ok(_conn) = listener.accept().await else {
+                    tokio::task::yield_now().await;
+                    continue;
+                };
             }
         });
         Self { url, accepting }
