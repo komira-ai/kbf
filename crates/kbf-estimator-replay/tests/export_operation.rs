@@ -49,7 +49,11 @@ fn killed(mut r: RunRecord) -> RunRecord {
 /// A farm of one build whose attempts are `records`, each answered as the run route does.
 fn served(records: &[RunRecord]) -> Fake {
     let mut r = Routes::new();
-    put(&mut r, "/v1/nodes", &json!({"nodes": [{"node_id": "n1"}]}));
+    put(
+        &mut r,
+        "/v1/nodes",
+        &json!({"nodes": [{"node_id": "n1", "software": {"os_name": "Ubuntu"}}]}),
+    );
     put(
         &mut r,
         "/v1/nodes/n1",
