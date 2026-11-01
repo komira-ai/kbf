@@ -11,6 +11,7 @@
 
 mod classes;
 mod driver;
+mod files;
 mod keys;
 mod phases;
 mod pool;
