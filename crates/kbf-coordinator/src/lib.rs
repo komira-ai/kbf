@@ -4,6 +4,7 @@
 //! - [`identity`]: who is calling, from the client certificate's subjectAltNames alone;
 //! - [`desired`]: the one thing stored, the desired state, in a file replaced atomically;
 //! - [`fleet`]: the last heartbeat of every host, the live and down rule, the quiet start;
+//! - [`acks`]: the failure reports a by-hand set of a bad version acknowledged;
 //! - [`bake`] and [`canary`]: how long an updated host holds its slot, and the hosts that go
 //!   alone first;
 //! - [`converge`]: whether the farm has reached the desired version, for CI to wait on;
@@ -24,6 +25,7 @@
 /// `GET /v1/convergence` say it as `commit`.
 pub const BUILD_COMMIT: &str = env!("KBF_BUILD_COMMIT");
 
+pub mod acks;
 pub mod bake;
 pub mod canary;
 pub mod config;

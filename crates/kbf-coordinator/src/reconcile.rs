@@ -13,6 +13,7 @@ use kbf_updater::version::Version;
 use kbf_updater::wire::{Class, Outcome, Phase};
 use serde::Deserialize;
 
+use crate::acks::{drop_ack, is_acked, stale_acks};
 use crate::converge::State;
 use crate::desired::{Desired, DesiredStore, StoreError};
 use crate::fleet::{Fleet, Host};
@@ -88,7 +89,7 @@ pub enum Change {
 /// failed after the commit or at the release gate, and the hook did not blame the
 /// environment. A failure that says nothing about where it happened (an updater without
 /// phases) is not counted, nor is one before the commit, at the environment gate, or a halt.
-fn is_release_failure(host: &Host, version: &Version) -> bool {
+pub(crate) fn is_release_failure(host: &Host, version: &Version) -> bool {
     let Some(last) = host.beat.last_update.as_ref() else {
         return false;
     };
@@ -114,10 +115,50 @@ fn is_release_failure(host: &Host, version: &Version) -> bool {
 /// 3. an older last good version is recorded, and the
 ///    desired version is marked bad or failed its release on [`FailThreshold::hosts`] live
 ///    hosts: mark it bad (unless it already is), then set the desired version to the last
-///    good one. The mark comes first, so a stop between the two leaves a marked desired
-///    version, which this finishes on the next beat.
+///    good one (only if that is `min_version` or later, else it is only marked). The mark
+///    comes first, so a stop between the two leaves a marked desired version, which this
+///    finishes on the next beat. Failure reports acked by an override do not count
+///    ([`crate::acks`]).
+///
+/// Acks that no longer match their host's report are dropped whatever else is planned.
 #[must_use]
 pub fn plan(
+    def: &ServiceDef,
+    want: &Desired,
+    marks: &ServiceOps,
+    fleet: &Fleet,
+    now: Duration,
+) -> Vec<Change> {
+    let mut changes = stale_acks(&def.name, marks, fleet);
+    changes.extend(decide(def, want, marks, fleet, now));
+    changes
+}
+
+/// The numbers a version starts with (`0.1.10+g0123456789ab-8` is 0, 1, 10), without trailing
+/// zeros: a `Version` has no order of its own, and a floor needs one. A build suffix is
+/// ignored.
+fn release_numbers(version: &Version) -> Vec<u64> {
+    let text = version.as_str();
+    let end = text
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(text.len());
+    let mut numbers: Vec<u64> = text[..end]
+        .split('.')
+        .filter(|part| !part.is_empty())
+        .map(|part| part.parse().unwrap_or(u64::MAX))
+        .collect();
+    while numbers.last() == Some(&0) {
+        numbers.pop();
+    }
+    numbers
+}
+
+/// Whether `version` is `floor` or later, by [`release_numbers`].
+fn at_least(version: &Version, floor: &Version) -> bool {
+    release_numbers(version) >= release_numbers(floor)
+}
+
+fn decide(
     def: &ServiceDef,
     want: &Desired,
     marks: &ServiceOps,
@@ -152,6 +193,7 @@ pub fn plan(
     };
     let failed = live()
         .filter(|(_, h)| is_release_failure(h, wanted))
+        .filter(|(id, _)| !is_acked(marks, id, wanted))
         .count();
     if !marked && failed < def.rollback_after_failed.hosts(live().count()) {
         return Vec::new();
@@ -160,7 +202,14 @@ pub fn plan(
     if !marked {
         changes.push(Change::MarkBad(wanted.clone()));
     }
-    changes.push(Change::RollBackTo(back.clone()));
+    // The last good version is a target only at or above the floor.
+    if def
+        .min_version
+        .as_ref()
+        .is_none_or(|floor| at_least(back, floor))
+    {
+        changes.push(Change::RollBackTo(back.clone()));
+    }
     changes
 }
 
@@ -175,7 +224,7 @@ enum Failed {
     Desired(#[from] StoreError),
 }
 
-fn entry(by: &str, action: &str, service: &str, reason: String) -> AuditEntry {
+pub(crate) fn entry(by: &str, action: &str, service: &str, reason: String) -> AuditEntry {
     let mut entry = AuditEntry::new(by, action);
     entry.service = Some(service.to_owned());
     entry.reason = Some(reason);
@@ -230,7 +279,10 @@ fn apply(
             back.version = version;
             store.set(service, back)?;
         }
-        Change::DropAck(_) => {}
+        Change::DropAck(node) => {
+            let why = format!("{node} reports something else now");
+            drop_ack(ops, service, &node, why)?;
+        }
     }
     Ok(())
 }
@@ -254,31 +306,4 @@ pub fn reconcile(
             return;
         }
     }
-}
-
-/// Removes the mark that `version` is bad, if it has one: CI set it by hand. Written to the
-/// file before it leaves memory (it clears protection), and before CI's desired state is
-/// stored, so that a failed write leaves both as they were.
-///
-/// # Errors
-/// [`OpsError`]: the ops file could not be written.
-pub fn clear_bad(ops: &OpsStore, service: &str, version: &Version) -> Result<(), OpsError> {
-    if !ops.marks(service).bad.contains(version) {
-        return Ok(());
-    }
-    let audit = entry(
-        CI,
-        "unmark_bad",
-        service,
-        format!("{version} was set by CI"),
-    );
-    ops.change(Write::BeforeMemory, audit, |state| {
-        state
-            .services
-            .entry(service.to_owned())
-            .or_default()
-            .bad
-            .retain(|bad| bad != version);
-    })
-    .map(drop)
 }

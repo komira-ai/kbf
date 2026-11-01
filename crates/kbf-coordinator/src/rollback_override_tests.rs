@@ -8,11 +8,11 @@ use kbf_types::HostRole;
 use kbf_updater::wire::Phase;
 
 use crate::fleet::Fleet;
-use crate::ops::{HaltAck, ServiceOps};
+use crate::ops::{HaltAck, OpsState, ServiceOps};
 use crate::reconcile::{Change, plan};
 use crate::rollback_tests::{
     AUTO, ONE, THREE, TWO, def, failure, farm, good, marks, persisted, plan_for, release, restart,
-    rig, round, secs, seed, two_failed, wanted,
+    rig, rig_over, round, secs, seed, two_failed, unwritable, wanted,
 };
 use crate::testutil::{beat, desired, id, version};
 
@@ -242,4 +242,26 @@ async fn an_ack_drops_when_the_host_is_next_ordered() {
         kbf_updater::wire::ServiceReply::Update { .. }
     ));
     assert!(persisted(&rig).failure_acked.is_empty());
+}
+
+/// An ack whose drop cannot be written is gone in memory all the same, the failure counts
+/// again, and the order is still given.
+#[tokio::test]
+async fn an_ack_that_cannot_be_dropped_in_the_file_is_dropped_in_memory() {
+    let mut state = OpsState::default();
+    state.services.insert(
+        "kbf".to_owned(),
+        ServiceOps {
+            failure_acked: vec![ack("d1", "2.0")],
+            ..good()
+        },
+    );
+    let rig = rig_over("ov-unwritable", AUTO, THREE, unwritable(state)).await;
+    let (phase, class) = release();
+    let replies = round(&rig, 2_000, &[("d1", failure(phase, class, "2.0"))]);
+    assert!(matches!(
+        replies[0],
+        kbf_updater::wire::ServiceReply::Update { .. }
+    ));
+    assert!(marks(&rig).failure_acked.is_empty());
 }

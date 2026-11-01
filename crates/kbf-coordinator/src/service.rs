@@ -12,13 +12,14 @@ use kbf_updater::wire::{Answer, Heartbeat, ServiceReply};
 use serde::Serialize;
 use subtle::ConstantTimeEq;
 
+use crate::acks::{clear_bad, ordered};
 use crate::converge::{Convergence, RoleCounts, converge_kbf, converge_service, role_counts};
 use crate::decide::{Decision, Hold, decide_marked};
 use crate::desired::{Desired, DesiredError, DesiredStore, KBF, StoreError};
 use crate::fleet::{Fleet, Host};
 use crate::identity::Identity;
 use crate::ops::{self, AuditEntry, OPERATOR, OperateError, OpsError, OpsState, OpsStore};
-use crate::reconcile::{clear_bad, reconcile};
+use crate::reconcile::reconcile;
 use crate::services::{ServiceDef, Services};
 
 /// The time since the coordinator started.
@@ -353,11 +354,11 @@ impl Coordinator {
         }
         let desired = self.desired.all();
         for name in names {
-            let bad = self.ops.marks(name).bad;
+            let marks = self.ops.marks(name);
             let decision = decide_marked(
                 &self.services,
                 &desired,
-                &bad,
+                &marks.bad,
                 name,
                 &fleet,
                 &who.node_id,
@@ -365,6 +366,7 @@ impl Coordinator {
             );
             if let Decision::Update { version } = decision {
                 fleet.order(name, who.node_id.clone(), version.clone(), now);
+                ordered(&self.ops, name, &who.node_id);
                 return ServiceReply::Update {
                     service: (name != KBF).then(|| name.to_owned()),
                     version,
@@ -427,7 +429,10 @@ impl Coordinator {
         // CI naming a version by hand lifts its mark. The mark goes first: a set that fails
         // after it leaves nothing blocked, and the reverse would leave a wanted version that
         // the next beat rolls back.
-        clear_bad(&self.ops, &service, &desired.version)?;
+        {
+            let fleet = self.fleet.lock().unwrap_or_else(PoisonError::into_inner);
+            clear_bad(&self.ops, &fleet, &service, &desired.version)?;
+        }
         self.desired.set(&service, desired.clone())?;
         tracing::info!(
             workflow = %verified.job_workflow_ref,
