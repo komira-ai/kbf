@@ -352,7 +352,7 @@ by the load gate or the cold store guard, and the notes of the passes.
 
 ## fill-paper
 
-`tierstore-bench fill-paper --paper P.html --cells cells.json --result-dir DIR --result-tsv R.tsv --out OUT.html`
+`tierstore-bench fill-paper --paper P.html --cells cells.json --result-dir DIR --result-tsv R.tsv --results-dir RDIR --out OUT.html`
 writes the measured numbers into the paper: each element carrying `data-cell="<id>"` gets the
 formatted value of the mapped result, `data-source="<file>#<metric>"`, `data-label`
 (`test instance` or `farm`) and `data-result="R.tsv"`, and loses `tbd` from its class list; a cell
@@ -365,5 +365,8 @@ paper and the table. A cell whose `data-result` is another `.tsv` was filled by 
 refused, not rewritten. A result file is `<cell>-<arm>-a<N>.json`; of several attempts of an arm
 the latest that gives a figure is used. `--in-place` replaces `--out`; `--check` writes nothing and exits 2 listing
 placeholders without a mapping, mappings without a result, filled values whose source is gone
-and (with `--result-tsv`) cells that cite the table but have no row in it.
+and (with `--result-tsv`) cells that cite the table but have no row in it and `fill:` rows no cell cites.
+`--results-dir` is the directory the paper's `data-result` names live in; the table must be in it (a
+bare name in another directory is another file). A run drops the `fill:` rows it did not produce, and
+writes the paper and then the table, each through a temporary file renamed over the target.
 The mapping schema and the rules for each figure are in the header of `src/fill.rs`.
