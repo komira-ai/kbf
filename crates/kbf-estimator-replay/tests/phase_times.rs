@@ -69,3 +69,32 @@ fn rows_with_and_without_the_phase_columns_round_trip() {
     assert!(line.contains(r#""phase_times":"task_claim""#), "{line}");
     assert_eq!(Row::parse(&line).unwrap(), full);
 }
+
+/// Catches: a phase whose end is before its start given a wrapped (huge) duration, and a
+/// time that does not parse passed over (the walk would invent a row from half a page): a
+/// bad start and a bad end each fail the export, and name the page.
+#[test]
+fn phase_times_out_of_order_have_no_duration_and_unreadable_ones_fail_the_walk() {
+    let window = || Window::parse(SINCE, UNTIL).unwrap();
+    let with = |times: serde_json::Value| {
+        let mut routes = farm();
+        let mut r = run("r1", "n1", OCT_1 + 5_000_000, "ok", usage(GIB, 60_000_000));
+        r["reapi_times"] = times;
+        put(&mut routes, "/v1/runs/r1", &r);
+        Fake::new(routes)
+    };
+    let backwards = with(json!({
+        "execution_start": at(OCT_1 + 9_000_000),
+        "execution_completed": at(OCT_1 + 8_000_000),
+    }));
+    let done = export(&ReadOnly::new(&backwards), window()).unwrap();
+    let r1 = done.rows.iter().find(|r| r.run_id == "r1").unwrap();
+    assert_eq!(r1.execution_us, None);
+    for bad in [
+        json!({"execution_start": "soon", "execution_completed": at(OCT_1)}),
+        json!({"execution_start": at(OCT_1), "execution_completed": "later"}),
+    ] {
+        let fake = with(bad);
+        assert!(export(&ReadOnly::new(&fake), window()).is_err());
+    }
+}

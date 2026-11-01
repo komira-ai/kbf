@@ -40,6 +40,12 @@
 //! CI-job view count it once per waiter until the export carries the operation
 //! (komira-ai/kbf#2207).
 //!
+//! **Phases**: input fetch, execution and pack (the output upload) of each attempt, from its
+//! run record. A run record says whether a daemon measured them (`measured`, which a row with
+//! no marker is read as) or a task claimed them (`task_claim`). The two are never pooled: each
+//! phase's p50 and p90 is printed once per provenance, a row with a marker this tool does not
+//! know is counted apart and in no number, and a provenance with no sample prints `-`.
+//!
 //! B - A is a difference of two single numbers, not a significance test; the paper's rule
 //! needs the 95% Welch CI over runs to exclude 0.
 //! What the export
@@ -198,7 +204,7 @@ pub fn analyze_grouped(rows: &[Row], group: GroupBy) -> ArmStats {
     stats.wall_samples = walls.len() as u64;
     stats.wall = percentiles(walls);
     stats.builds = builds::analyze(rows, group);
-    stats.phases = PhaseStats::default();
+    stats.phases = phases::analyze(rows);
     stats
 }
 

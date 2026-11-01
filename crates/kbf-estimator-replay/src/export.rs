@@ -268,6 +268,15 @@ fn row_of(v: &Value, nodes: &BTreeMap<String, Node>) -> Result<Row, String> {
     let queued_us = micros(need("queued")?)?;
     let usage = v.get("usage").filter(|u| u.is_object());
     let shape_key = |key: &str| v["shape"][key].as_str().unwrap_or("-").to_owned();
+    let times = &v["reapi_times"];
+    let spans = [
+        ("input_fetch_start", "input_fetch_completed"),
+        ("execution_start", "execution_completed"),
+        ("output_upload_start", "output_upload_completed"),
+    ]
+    .map(|(from, to)| phase_us(times, from, to))
+    .into_iter()
+    .collect::<Result<Vec<_>, String>>()?;
     Ok(Row {
         run_id: need("run_id")?.to_owned(),
         instance: need("instance")?.to_owned(),
@@ -296,11 +305,17 @@ fn row_of(v: &Value, nodes: &BTreeMap<String, Node>) -> Result<Row, String> {
         node_cpu_pressure_centi: usage.and_then(|u| u["node_cpu_pressure_centi"].as_u64()),
         invocation_id: str_of(v, "invocation_id").map(str::to_owned),
         correlated_invocations_id: str_of(v, "correlated_invocations_id").map(str::to_owned),
-        phase_times: None,
-        fetch_us: None,
-        execution_us: None,
-        pack_us: None,
+        phase_times: str_of(v, "phase_times").map(str::to_owned),
+        fetch_us: spans[0],
+        execution_us: spans[1],
+        pack_us: spans[2],
     })
+}
+
+/// The time between two of a run's REAPI times, when it has both and they are in order.
+fn phase_us(times: &Value, from: &str, to: &str) -> Result<Option<u64>, String> {
+    let at = |key: &str| str_of(times, key).map(micros).transpose();
+    Ok(at(from)?.zip(at(to)?).and_then(|(a, b)| b.checked_sub(a)))
 }
 
 /// The cgroup block. The read API writes 0 for a wall or peak that was not measured, so
