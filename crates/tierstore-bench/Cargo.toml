@@ -9,8 +9,7 @@ publish.workspace = true
 
 # A measurement tool for tierstore, an S3 client of its front and of the two stores behind it.
 # It depends on no tierstore code (it talks to the binary over HTTP, as any client does) and on
-# `objstore-s3` only for the SigV4 client; crates/kbf-integration-test/tests/layering.rs does not
-# constrain it.
+# `objstore-s3` only for the SigV4 client.
 
 [dependencies]
 bytes.workspace = true
@@ -24,6 +23,9 @@ hyper = { workspace = true, features = ["client", "http1", "server"] }
 hyper-util = { workspace = true, features = ["tokio"] }
 # The S3 client (`s3`): SigV4, multipart, ranged reads, listings.
 objstore-s3.workspace = true
+# The status file is opened without following a link and its owner is compared with the running
+# user (`preflight::trusted`), and the tests make a FIFO.
+rustix = { workspace = true, features = ["fs", "process"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -47,6 +49,8 @@ kbf-testkit.workspace = true
 # (`tests/ops_support`): requests as text, upstreams that answer by hand. A paused clock for the
 # throttle and the open-loop pacing tests.
 tokio = { workspace = true, features = ["io-util", "net", "test-util"] }
+# A socket bound and not listening, for the port probe test (`tests/ops_parts.rs`).
+rustix = { workspace = true, features = ["net"] }
 
 [lints]
 workspace = true

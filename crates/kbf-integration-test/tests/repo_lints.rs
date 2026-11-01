@@ -38,6 +38,11 @@
 //!   built, and again on the packaged tarball with `build-commit check-asset`), signing and
 //!   `darwin-asset`-checking every macOS binary, or docs/artifacts.md describing
 //!   another set (module `release_artifacts`);
+//! - a release file not built by the seed build: a platform job of `.github/workflows/artifacts.yml`
+//!   removed, off GitHub-hosted runners, given Buck2, a farm address, a remote-execution flag or a
+//!   cargo build that is not plain `cargo build --locked --release`; an assets artifact uploaded
+//!   by another job of the pipeline's run; the release no longer needing the seed jobs (module
+//!   `seed_build`, whose docs say why: a broken kbf is rebuilt without kbf);
 //! - a workflow, release asset list or docs/artifacts.md that ships a darwin `kbf-task` asset, package or image,
 //!   or a workflow that enables the test-only feature `unconfined-for-tests` of `kbf-task` (`no_darwin_task.rs`);
 //! - the push-to-main pipeline drifting from its shape (`ci` and `beta` together, `artifacts` after `ci`,
@@ -76,7 +81,7 @@ mod pipeline_workflow;
 mod release_artifacts;
 mod release_workflow;
 mod scratch_dirs;
-mod site_deploy_workflow;
+mod seed_build;
 mod store_floor;
 mod test_spawns;
 mod test_wording;

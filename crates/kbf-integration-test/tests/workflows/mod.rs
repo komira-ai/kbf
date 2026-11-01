@@ -21,9 +21,7 @@
 //!   [`SIGNING_STAGE_ONLY`] (the same push to main, and the called artifacts workflow's `sign`
 //!   stage; a caller job has no `inputs`, so it keeps [`SIGNING_PUSH_ONLY`]) (`id-token`
 //!   also in a job whose `if:` is exactly [`RELEASE_PUSH_ONLY`], for the release's deploy step,
-//!   [`DEPLOY_SCOPE`]; and in a job whose `if:` is exactly [`SITE_DEPLOY_IF`] and whose `environment:` is exactly
-//!   [`SITE_DEPLOY_ENVIRONMENT`], tierstore.dev's deploy: a push to `main` or a manual run of `main`, in the one environment
-//!   its AWS role trusts), and
+//!   [`DEPLOY_SCOPE`]), and
 //!   `contents` ([`RELEASE_SCOPES`]), which may be `write` only in a job whose `if:` is
 //!   exactly [`RELEASE_PUSH_ONLY`]. So no pull request or merge-queue run holds a
 //!   token that can sign an attestation, every attestation this repository signs names
@@ -92,8 +90,8 @@ mod yaml;
 mod jobs;
 pub use jobs::{
     concurrency, job_env, job_environment, job_has_key, job_matrix, job_name, job_needs,
-    job_outputs, job_permission_levels, job_uses, job_with, push_filters, top_defaults_shell,
-    top_env, trigger_filters,
+    job_outputs, job_permission_levels, job_runs_on, job_strings, job_uses, job_with, push_filters,
+    top_defaults_shell, top_env, trigger_filters,
 };
 
 use yaml::{Node, Value};
@@ -174,16 +172,6 @@ const SIGNING_STAGE_ONLY: &str = "${{ github.event_name == 'push' && github.ref 
 /// It signs nothing (`attestations` stays under [`SIGNING_PUSH_ONLY`]), and the workflow lint of
 /// `release.yml` holds the one job that has it to `contents: read` beside it.
 const DEPLOY_SCOPE: &str = "id-token";
-
-/// The one `if:` spelling under which the site deploy job may hold [`DEPLOY_SCOPE`] for writing, together with
-/// [`SITE_DEPLOY_ENVIRONMENT`] (both must hold): a push to `main` or a manual run, on the ref `main`.
-/// A pull request run satisfies neither event.
-const SITE_DEPLOY_IF: &str = "${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' }}";
-
-/// The GitHub environment the site deploy job runs in: the one AWS role of tierstore.dev trusts (its `sub` names it), whose
-/// settings are the bucket and the role. `id-token: write` under [`SITE_DEPLOY_IF`] is allowed in a job of this environment
-/// and no other. `site_deploy_workflow` holds the rest of the deploy's shape.
-const SITE_DEPLOY_ENVIRONMENT: &str = "prod-site-tierstore";
 
 /// Token scopes a job may set to `write` when it runs only for a push to `main` that releases:
 /// the repository's contents, which creating a release and uploading its assets need.
@@ -621,8 +609,7 @@ impl Lint<'_> {
             }
         }
         if let Some(p) = get(job_map, "permissions") {
-            let environment = get(job_map, "environment").and_then(Node::as_str);
-            self.job_permissions(p, get(job_map, "if").and_then(Node::as_str), environment);
+            self.job_permissions(p, get(job_map, "if").and_then(Node::as_str));
         }
         match get(job_map, "runs-on") {
             Some(r) => self.runs_on(r),
@@ -685,10 +672,9 @@ impl Lint<'_> {
     /// for [`SIGNING_SCOPES`] set to `write` in a job whose `if:` (`condition`) is
     /// exactly [`SIGNING_PUSH_ONLY`], [`RELEASE_SCOPES`] set to `write` in one whose
     /// `if:` is exactly [`RELEASE_PUSH_ONLY`], [`ISSUE_SCOPES`] in one whose `if:`
-    /// is exactly [`ISSUES_MAIN_ONLY`], and `id-token` alone in a job whose `if:` is exactly
-    /// [`SITE_DEPLOY_IF`] and whose `environment:` is exactly [`SITE_DEPLOY_ENVIRONMENT`]. Scope names and levels are compared
+    /// is exactly [`ISSUES_MAIN_ONLY`]. Scope names and levels are compared
     /// exactly, so another spelling is refused (the safe side).
-    fn job_permissions(&mut self, p: &Node, condition: Option<&str>, environment: Option<&str>) {
+    fn job_permissions(&mut self, p: &Node, condition: Option<&str>) {
         let Value::Map(scopes) = &p.value else {
             self.refuse(
                 p,
@@ -703,14 +689,6 @@ impl Lint<'_> {
                 continue;
             }
             if name == DEPLOY_SCOPE && granted == "write" && condition == Some(RELEASE_PUSH_ONLY) {
-                continue;
-            }
-            // The site deploy: the OIDC token alone (no attestation), for main only, in the site's own environment.
-            if name == DEPLOY_SCOPE
-                && granted == "write"
-                && condition == Some(SITE_DEPLOY_IF)
-                && environment == Some(SITE_DEPLOY_ENVIRONMENT)
-            {
                 continue;
             }
             let gate: &[&str] = if SIGNING_SCOPES.contains(&name) {
@@ -881,7 +859,7 @@ fn is_lower_hex(s: &str, len: usize) -> bool {
             .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
 }
 
-fn is_hosted_label(v: &str) -> bool {
+pub fn is_hosted_label(v: &str) -> bool {
     HOSTED_LABELS.contains(&v)
 }
 

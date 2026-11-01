@@ -1,0 +1,24 @@
+# tierstore as a service of the coordinator (docs/deploy/kbf-updater.md, "tierstore as a
+# service"). An entry of a services file: appended to the file named by --services-file
+# (after kbf's own entry if the file replaces it), it makes tierstore a service the
+# coordinator rolls to the hosts of the storage role.
+#
+# Six storage hosts is the farm this is written for: one updates at a time, and four of the
+# other five must stay up. The first host goes alone, and no other starts until it has beaten
+# healthy three times at the new version. A release that fails after its commit on two
+# hosts is rolled back by the coordinator to the last version that converged and baked.
+
+[[service]]
+name = "tierstore"
+bake_beats = 3
+canary = { count = 1 }
+rollback = "automatic"
+rollback_after_failed = { percent = 25, min_hosts = 2 }
+install_when_absent = false
+
+[service.selector]
+roles = ["storage"]
+
+[service.roles.storage]
+max_updating = 1
+min_up = 4

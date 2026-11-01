@@ -54,15 +54,18 @@ sudo kbf-deploy host status
   `kbf` package run `/usr/bin/kbf`, which `host install` does not change).
 - `host status` prints the state and whether the `current` link matches it. It exits 0 when it does
   (or when there is neither), 1 when it does not, and 2 when the state cannot be read
-  (`REFUSED: ...`). `--json` prints one object.
+  (`REFUSED: ...`). `--json` prints one object. Both list the releases the host keeps, each with
+  its commit, its version and why it stays.
 - `host rollback [--apply]` points `current` at the previous release and removes `previous`. It
   refuses when there is no previous release or its binary is gone. Restart the units again.
 - `host gc [--keep N] [--apply]` removes release directories. It never removes the current, previous
-  or staged release, or one that a running process executes from; `--keep N` also keeps the N newest
-  others (default 0). If it cannot tell which releases run, it removes nothing and fails.
+  or staged release, one that a running process executes from, or one that `retain.json` pins or
+  names as the coordinator's last good; `--keep N` also keeps the N newest others (2 or more, default
+  4). It removes nothing while a swap is on trial. If it cannot tell which releases run, it removes
+  nothing and fails.
 
 `kbf-installer` has the same verbs for a host it manages: `kbf-installer rollback --unit <unit>`,
-`kbf-installer gc [--keep N]` (it keeps the newest other release by default) and `kbf-installer
+`kbf-installer gc [--keep N]` (the same rule: 2 or more, default 4) and `kbf-installer
 status`. Like `host`, they change nothing without `--apply`. `rollback` takes `--unit` (or
 `--launchd-label` on a Mac), because the installer restarts that service itself.
 

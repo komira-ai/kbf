@@ -401,22 +401,32 @@ fn a_revert_or_rollback_drops_a_staged_release_it_puts_back_and_keeps_another() 
     }
 }
 
-/// Catches `gc` removing what must stay and a dry run that removes: current, previous, the
-/// pending swap and a release a process runs stay; the others go only with `apply`; and a
-/// host whose processes cannot be listed removes nothing (exit 1).
+/// Catches `gc` removing what must stay and a dry run that removes: current, previous, a
+/// release a process runs and the two newest others (the floor of `--keep 0`) stay; the
+/// oldest goes only with `apply`; and a host whose processes cannot be listed removes
+/// nothing (exit 1).
 ///
-/// Catches: in-use ignored; the dry run applying; the blind host treated as empty.
+/// Catches: in-use ignored; the dry run applying; the blind host treated as empty; the floor
+/// of two not applied (the newest others would go too).
 #[test]
 fn gc_keeps_what_runs_and_removes_nothing_when_it_cannot_tell() {
-    let mut rig = Rig::new("gc", true);
+    let mut rig = Rig::new("gc", false);
     let releases = rig.exec.root.join("var/lib/kbf-installer/releases");
     let running = release(&rig.exec.root, C);
     let stray = release(&rig.exec.root, "dddddddddddddddddddddddddddddddddddddddd");
-    let epoch = std::time::UNIX_EPOCH + Duration::from_secs(1000);
-    for d in [&running, &stray] {
+    let newer = [
+        release(&rig.exec.root, "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"),
+        release(&rig.exec.root, "ffffffffffffffffffffffffffffffffffffffff"),
+    ];
+    for (d, secs) in [
+        (&running, 1000),
+        (&stray, 1000),
+        (&newer[0], 2000),
+        (&newer[1], 3000),
+    ] {
         fs::File::open(d)
             .expect("dir")
-            .set_modified(epoch)
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(secs))
             .expect("mtime");
     }
     rig.service
@@ -432,6 +442,10 @@ fn gc_keeps_what_runs_and_removes_nothing_when_it_cannot_tell() {
     operator::gc(&mut rig.exec, &rig.layout, &rig.service, 0, true, &mut out).expect("gc");
     assert!(!stray.exists());
     assert!(running.exists() && releases.join(A).exists() && releases.join(B).exists());
+    assert!(
+        newer.iter().all(|d| d.exists()),
+        "the floor keeps two others"
+    );
 
     rig.service.0.borrow_mut().blind = true;
     let again = release(&rig.exec.root, "dddddddddddddddddddddddddddddddddddddddd");

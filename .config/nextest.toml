@@ -12,27 +12,7 @@ install-sh-fixture = { max-threads = 1 }
 # name share a directory (crates/kbf-mac-provision/tests/support/mod.rs).
 mac-provision-scratch = { max-threads = 1 }
 
-# Hang guards for the tests of the tierstore local cache that wait for a task: no test asserts how
-# long it takes, and a test that waits for something that never comes is stopped after a minute
-# and fails. Named overrides go before any override that matches more.
-[[profile.default.overrides]]
-filter = 'package(tierstore) & (test(~local_cache::) | test(~cache_cli_tests::) | test(~cache_node::))'
-slow-timeout = { period = "60s", terminate-after = 2 }
-
-# The tierstore drain tests over a real socket (tests/s3_front/drain.rs) wait for the client to
-# read the end of the stream and for the drain to end, with no timeout of their own: one that
-# waits for ever is stopped after a minute and fails.
-[[profile.default.overrides]]
-filter = 'package(tierstore) & binary(s3_front) & test(~drain::)'
-slow-timeout = { period = "30s", terminate-after = 2 }
-
-# The same for the tierstore tests that bind sockets and serve over them (the unit tests of
-# `server::listen`, and `tests/s3_front/listeners.rs`, which starts the binary too): a drain that
-# never ends or a listener that is never served fails the test after two minutes at most.
-[[profile.default.overrides]]
-filter = 'package(tierstore) & (test(~listen::tests::) | (binary(s3_front) & test(~listeners::)))'
-slow-timeout = { period = "60s", terminate-after = 2 }
-
+# Named overrides go before any override that matches more.
 [[profile.default.overrides]]
 filter = 'package(xtask) & binary(install_sh)'
 test-group = 'install-sh-fixture'
@@ -80,14 +60,22 @@ slow-timeout = { period = "30s", terminate-after = 4 }
 filter = 'package(kbf-task) & binary(put_back_pressure)'
 slow-timeout = { period = "30s", terminate-after = 4 }
 
-# The kbf-daemon cache tests wait on the cache's own counters (tests/support/cache_kit.rs,
-# wait_for_fill_waits), never on a deadline in the test: a cache that never makes two leases
-# meet would hang, and this guard ends such a test (2 minutes) instead. Applies to every
+# The kbf-daemon cache tests wait on the cache's own counters and gates (tests/support/cache_kit.rs:
+# wait_for_fill_waits, Gates::wait_started, Gates::wait_reached and the holds in Hooks::at),
+# never on a deadline in the test: a cache that never makes two leases meet, a background thread
+# that never reaches its start gate, or a failed test that leaves a hold held would hang, and this
+# guard ends such a test (2 minutes) instead. Applies to every
 # profile, the pull-request one included. Keep it above any catch-all override: the first
 # matching override wins.
 [[profile.default.overrides]]
 filter = 'package(kbf-daemon) & binary(cache)'
 slow-timeout = { period = "30s", terminate-after = 4 }
+
+# Hang guard for the step runner's tests that wait on a socket peer or a thread: no test asserts
+# how long it takes, and a test that waits for something that never comes is stopped and fails.
+[[profile.default.overrides]]
+filter = 'package(kbf-step-runner)'
+slow-timeout = { period = "60s", terminate-after = 2 }
 
 # The janitor tests wait on the janitor's own counters, never on a deadline in the test: the loop
 # test on its paused clock until the third sweep, the frontend test on `GET /metrics` until the
@@ -95,6 +83,13 @@ slow-timeout = { period = "30s", terminate-after = 4 }
 # this guard (2 minutes) ends it instead. Above the general budget: the first match wins.
 [[profile.default.overrides]]
 filter = 'package(kbf-server) & test(/^frontend::janitor::tests::/)'
+slow-timeout = { period = "30s", terminate-after = 4 }
+
+# The history read tests wait on events (a write asked of the object store, a batch applied to
+# the state store) and hold no timeout of their own: a writer that never writes leaves the test
+# waiting for ever, and it is killed after 120 seconds (30 s x 4) and fails. Above the general budget: the first match wins.
+[[profile.default.overrides]]
+filter = 'binary_id(=kbf-server::history_read)'
 slow-timeout = { period = "30s", terminate-after = 4 }
 
 # The general budget: every other test, of every package, is ended after eight minutes
@@ -170,3 +165,9 @@ not (
 # Kept as an artifact of the full run so the slow list above can be regenerated from it.
 [profile.default.junit]
 path = "junit.xml"
+
+# The registration client waits for the updater's answer with a deadline it is given: a test that
+# waits for ever on a peer that never answers is stopped after a minute and fails.
+[[profile.default.overrides]]
+filter = 'package(update-register)'
+slow-timeout = { period = "30s", terminate-after = 2 }

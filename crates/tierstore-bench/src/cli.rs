@@ -10,10 +10,12 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
+use crate::cells::armfilter;
 use crate::cells::budget::{Campaign, lock_path};
 use crate::cells::engine::FaultSwitch;
 use crate::cells::{self, CellContext, CellId, CellPlan};
-use crate::coldstate::{ColdStateSource, NoColdState, OpsColdState};
+use crate::coldserver::{self, ColdServer};
+use crate::coldstate::{ColdMeter, ColdStateSource, NoColdState, OpsColdMeter, OpsColdState};
 use crate::config::{ConfigArgs, RunConfig};
 use crate::error::BenchError;
 use crate::faultfile::FileSwitch;
@@ -46,7 +48,7 @@ pub enum Command {
     /// Create the test buckets, scoped accounts and quotas (a dry run unless `--apply`).
     Provision(ProvisionArgs),
     /// Run cells.
-    Run(RunArgs),
+    Run(Box<RunArgs>),
     /// Serve the fault proxy in front of a store.
     FaultProxy(ProxyArgs),
     /// Check, against the before-snapshot, that nothing the run made is left and nothing live
@@ -54,6 +56,8 @@ pub enum Command {
     VerifyTeardown(TeardownArgs),
     /// Print one table from the results of a result directory.
     Report(ReportArgs),
+    /// Write the measured numbers into the paper's HTML, or check that they are all there.
+    FillPaper(crate::fill::FillArgs),
 }
 
 /// Flags of `provision`.
@@ -104,6 +108,13 @@ pub struct RunArgs {
     /// and the report and the provenance of every result say so.
     #[arg(long, value_enum, default_value_t = Switch::On, value_name = "on|off")]
     pub open_loop: Switch,
+    /// At most this many objects per pass for the multipart arms of `cold-put` (`direct-mp`,
+    /// `instance`): a cap on the plan's count (1,000 up to 1 MiB), never a raise. Each multipart object is three requests to the
+    /// store, so a slow cold store may not fit the plan's count in a window. The other arms
+    /// (`direct`, the open-loop arms, the other cells) keep theirs. An arm with fewer than 1,000
+    /// objects per pass reports no p99, and its result says so.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
+    pub multipart_objects: Option<u64>,
     /// Names the run in every result and in the keys it writes (role names and digits; no host).
     #[arg(long)]
     pub run_id: String,
@@ -113,6 +124,16 @@ pub struct RunArgs {
     /// reads them all and labels them.
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
     pub attempt: u32,
+    /// Restrict every selected cell to these arm families (comma separated), so that the direct
+    /// arms run in a run of their own and the cold store guard judges them: the families are
+    /// `direct`, `direct-mp` and `instance` of `cold-put`, `direct` and `instance` of
+    /// `cold-read`, `hot` and `instance` of `a1` (an arm label is its family, then its size,
+    /// width and mode: `direct-mp-4kib-c1-healthy` is of family `direct-mp`). Cells B, C and G
+    /// have no families and cannot be filtered. A family no selected cell has is refused, and so
+    /// is a filter that leaves a selected cell no arm. Without it every arm runs. Run the
+    /// filtered runs with the same `--attempt`, back to back, and `report` pairs them.
+    #[arg(long, value_delimiter = ',', value_name = "FAMILIES")]
+    pub arms: Vec<String>,
     /// The commit this binary was built from, copied into every result.
     #[arg(long)]
     pub git_sha: String,
@@ -142,10 +163,28 @@ pub struct RunArgs {
 }
 
 impl RunArgs {
+    /// The `--arms` filter, if one was given.
+    #[must_use]
+    pub fn arms_filter(&self) -> Option<Vec<String>> {
+        (!self.arms.is_empty()).then(|| self.arms.clone())
+    }
+
     /// Whether the open-loop arms are in the plan (`--open-loop`).
     #[must_use]
     pub fn open_loop(&self) -> bool {
         self.open_loop == Switch::On
+    }
+
+    /// What the flags ask of a cell.
+    #[must_use]
+    pub fn plan(&self) -> CellPlan {
+        CellPlan {
+            passes: self.passes,
+            in_flight: self.in_flight.clone(),
+            object_bytes: self.object_bytes.clone(),
+            open_loop: self.open_loop(),
+            multipart_objects: self.multipart_objects,
+        }
     }
 
     /// The switch of the fault proxy `--fault-control` names, with `--fault-ttl-secs`.
@@ -211,6 +250,8 @@ fn provenance(
     git_sha: &str,
     attempt: u32,
     open_loop: bool,
+    arms_filter: Option<Vec<String>>,
+    cold_server: Option<ColdServer>,
 ) -> Result<Provenance, BenchError> {
     let path = result_dir.join(preflight::REPORT_FILE);
     let text = std::fs::read(&path).map_err(|source| BenchError::Io { path, source })?;
@@ -220,6 +261,8 @@ fn provenance(
     Ok(Provenance {
         attempt,
         open_loop,
+        arms_filter,
+        cold_server,
         ..report.provenance(run_id, git_sha)
     })
 }
@@ -227,15 +270,34 @@ fn provenance(
 /// Where the run reads the cold store's state from: the preflight's source on this machine, or
 /// nothing if the run has no cold store.
 fn cold_source(config: &RunConfig, ops: &OpsFile) -> Arc<dyn ColdStateSource> {
-    match config.stores.get(&Role::Cold) {
-        Some(spec) => Arc::new(OpsColdState::new(
+    match cold_state_of(config, ops) {
+        Some(state) => Arc::new(state),
+        None => Arc::new(NoColdState),
+    }
+}
+
+/// The source of the cold store's state, if the run has a cold store.
+fn cold_state_of(config: &RunConfig, ops: &OpsFile) -> Option<OpsColdState> {
+    let spec = config.stores.get(&Role::Cold)?;
+    Some(
+        OpsColdState::new(
             Arc::new(SystemHost),
             ops.clone(),
             spec.clone(),
             config.result_dir.clone(),
-        )),
-        None => Arc::new(NoColdState),
-    }
+        )
+        .with_max_age(config.cold_state_max_age),
+    )
+}
+
+/// The meter of the cold store guard: a run with the cold admin key has one; a run with a heal
+/// status file alone (file mode) has no counter to read, nor does a run with no cold store.
+fn cold_meter(config: &RunConfig, ops: &OpsFile) -> Option<Arc<dyn ColdMeter>> {
+    let state = cold_state_of(config, ops).filter(|_| ops.cold_file_mode().is_none())?;
+    Some(Arc::new(OpsColdMeter::new(
+        state,
+        config.cold_counter_settle,
+    )))
 }
 
 /// Runs the verb.
@@ -267,10 +329,16 @@ pub async fn run(cli: Cli) -> Result<(), BenchError> {
                 .map(|_| ())
         }
         Command::Run(args) => {
+            let args = *args;
+            // Before anything is read or made: a filter that names no arm of the cells is a typo.
+            if let Some(filter) = args.arms_filter() {
+                armfilter::check(&args.cells, &filter)?;
+            }
             let config = RunConfig::load(&args.config)?;
             // Before anything is created: the result directory, the ledger and its lock stay
             // clear of the live tierstore's directories.
             let ops = OpsFile::load(&SystemHost, &config.result_dir)?;
+            let cold_server = coldserver::read(&SystemHost, &ops, &config);
             livedir::check_outside(
                 &[
                     ("result directory", config.result_dir.as_path()),
@@ -290,6 +358,8 @@ pub async fn run(cli: Cli) -> Result<(), BenchError> {
                 &args.git_sha,
                 args.attempt,
                 args.open_loop(),
+                args.arms_filter(),
+                Some(cold_server.clone()),
             )?;
             // Before a request is sent: the ledger is begun or found, or the run stops.
             // The lock is held until the arm ends, the run with it.
@@ -302,16 +372,12 @@ pub async fn run(cli: Cli) -> Result<(), BenchError> {
             let faults = args
                 .fault_switch()
                 .map(|switch| Arc::new(switch) as Arc<dyn FaultSwitch>);
-            let open_loop = args.open_loop();
-            let plan = CellPlan {
-                passes: args.passes,
-                in_flight: args.in_flight,
-                object_bytes: args.object_bytes,
-                open_loop,
-            };
+            let plan = args.plan();
             let ctx = CellContext {
                 provenance,
                 cold_state: cold_source(&config, &ops),
+                cold_meter: cold_meter(&config, &ops),
+                cold_server,
                 config,
                 log: Arc::new(log),
                 campaign,
@@ -343,6 +409,7 @@ pub async fn run(cli: Cli) -> Result<(), BenchError> {
             print!("{table}");
             Ok(())
         }
+        Command::FillPaper(args) => Ok(crate::fill::run(&args)?),
     }
 }
 
@@ -369,7 +436,7 @@ mod tests {
         ];
         argv.extend_from_slice(extra);
         match Cli::try_parse_from(argv)?.command {
-            Command::Run(args) => Ok(args),
+            Command::Run(args) => Ok(*args),
             other => panic!("not the run verb: {other:?}"),
         }
     }
@@ -388,6 +455,18 @@ mod tests {
         assert!(run_args(&["--open-loop"]).is_err());
     }
 
+    /// Catches `--multipart-objects` that changes the plan of a run without it, that does not
+    /// reach the plan of a run with it, or that takes zero or a word.
+    #[test]
+    fn multipart_objects_is_absent_by_default_and_reaches_the_plan() {
+        assert_eq!(run_args(&[]).unwrap().plan().multipart_objects, None);
+        let args = run_args(&["--multipart-objects", "50"]).unwrap();
+        assert_eq!(args.plan().multipart_objects, Some(50));
+        for bad in ["0", "-1", "many", ""] {
+            assert!(run_args(&["--multipart-objects", bad]).is_err(), "{bad:?}");
+        }
+    }
+
     /// Catches the provenance of a run not carrying the setting the run was given: it is what the
     /// report and every result file say about the arms.
     #[test]
@@ -396,8 +475,14 @@ mod tests {
         std::fs::create_dir_all(dir.path()).unwrap();
         let report = serde_json::to_vec(&PreflightReport::default()).unwrap();
         std::fs::write(dir.path().join(preflight::REPORT_FILE), report).unwrap();
-        let of = |open_loop| provenance(dir.path(), "run-1", "abc", 3, open_loop).unwrap();
+        let of =
+            |open_loop| provenance(dir.path(), "run-1", "abc", 3, open_loop, None, None).unwrap();
         let (on, off) = (of(true), of(false));
+        assert_eq!(on.arms_filter, None);
+        let filter = Some(vec!["direct".to_owned()]);
+        let filtered =
+            provenance(dir.path(), "run-1", "abc", 3, true, filter.clone(), None).unwrap();
+        assert_eq!(filtered.arms_filter, filter);
         assert_eq!((on.open_loop, off.open_loop), (true, false));
         assert_eq!(
             (off.run_id.as_str(), off.git_sha.as_str(), off.attempt),
@@ -407,7 +492,7 @@ mod tests {
 
     /// Catches the source of the cold state being chosen by the wrong test: a run with no cold
     /// role reads nothing, and a run with one reads through the preflight's source, which here,
-    /// with no `mc` to run and no status file, says it cannot tell (so the run would stop).
+    /// with no admin key to read, says it cannot tell (so the run would stop).
     #[test]
     fn a_cold_role_is_read_through_the_ops_file_and_no_cold_role_is_not_read() {
         let dir = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "tb-cli-cold-source");
@@ -427,10 +512,43 @@ mod tests {
             Window::Busy,
         );
         let err = cold_source(&cold.config, &ops).read().unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("neither the admin info nor a status file"),
-            "{err}"
+        assert_eq!(
+            err.to_string(),
+            "cold state: a file cannot be read: NotFound"
         );
+    }
+
+    /// Catches `--cold-state-max-age-secs` not reaching the source: a status file 20 s old is
+    /// unreadable under a limit of 10 s and read under a limit of 60 s, through `cold_source`.
+    #[test]
+    fn the_cold_state_max_age_reaches_the_source() {
+        let dir = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "tb-cli-cold-age");
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let file = dir.path().join("heal.json");
+        let stamp = crate::s3::unix_ms().saturating_sub(20_000);
+        std::fs::write(
+            &file,
+            format!(r#"{{"read_unix_ms": {stamp}, "healing": false, "drives": []}}"#),
+        )
+        .unwrap();
+        let ops: OpsFile = serde_json::from_value(serde_json::json!({
+            "tierstore": {"binary": "/x/t", "sha256": "00", "version": "0.0.37", "plan_flags": []},
+            "live": {"unit": "l.service", "binary": "/x/l", "port": 9300, "dirs": ["/x/live"]},
+            "test_instance": {"unit": "t.service", "port": 9411, "dirs": ["/x/state"]},
+            "cold_heal_status_file": file,
+            "mc": "/x/absent-mc"
+        }))
+        .unwrap();
+        let mut cold = testkit::ctx(
+            dir.path(),
+            &[(Role::Cold, "http://127.0.0.1:9")],
+            Window::Busy,
+        )
+        .config;
+        cold.cold_state_max_age = Duration::from_secs(10);
+        let err = cold_source(&cold, &ops).read().unwrap_err().to_string();
+        assert!(err.contains("over the limit of 10 s"), "{err}");
+        cold.cold_state_max_age = Duration::from_secs(60);
+        assert!(cold_source(&cold, &ops).read().unwrap().is_some());
     }
 }
