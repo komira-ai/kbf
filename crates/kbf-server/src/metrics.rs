@@ -68,6 +68,9 @@ impl Extras {
 pub(crate) fn render_farm(out: &mut String, farm: &Farm) {
     crate::scheduler_core::render(out, farm.scheduler_core());
     crate::usage_profiles::render(out, farm.usage_profiles());
+    if let Some(stats) = farm.usage_stats() {
+        stats.render(out);
+    }
     crate::pack_daemon_metrics::render_farm(out, farm);
     crate::input_cache_metrics::render_farm(out, farm);
     crate::load_metrics::render_farm(out, farm);

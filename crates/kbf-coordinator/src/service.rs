@@ -12,13 +12,16 @@ use kbf_updater::wire::{Answer, Heartbeat, ServiceReply};
 use serde::Serialize;
 use subtle::ConstantTimeEq;
 
+use crate::acks::{clear_bad, release_ack};
 use crate::converge::{Convergence, RoleCounts, converge_kbf, converge_service, role_counts};
 use crate::decide::{Decision, Hold};
 use crate::desired::{Desired, DesiredError, DesiredStore, KBF, StoreError};
-use crate::fleet::{Fleet, Host};
+use crate::fleet::{Fleet, Host, Node};
 use crate::halt;
 use crate::identity::Identity;
-use crate::ops::{self, AuditEntry, OPERATOR, OperateError, OpsState, OpsStore};
+use crate::membership::{Member, Standing, account, deferred_count, members, standing};
+use crate::ops::{self, AuditEntry, OPERATOR, OperateError, OpsError, OpsState, OpsStore};
+use crate::reconcile::reconcile;
 use crate::services::{ServiceDef, Services};
 
 /// The time since the coordinator started.
@@ -43,6 +46,9 @@ pub enum SetError {
     /// The state file could not be written.
     #[error(transparent)]
     Store(#[from] StoreError),
+    /// The ops file could not be written (the bad mark of the version could not be cleared).
+    #[error(transparent)]
+    Ops(#[from] OpsError),
     /// The allow-list entry that admitted the token does not name this service.
     #[error("the token may not set this service")]
     Forbidden,
@@ -115,6 +121,10 @@ pub struct ServiceStatus {
     pub roles: Vec<RoleCounts>,
     /// Every host that heartbeated the service, by node id.
     pub hosts: Vec<ServiceHostStatus>,
+    /// The nodes the service does not count, by why: excluded (with the operator's reason),
+    /// absent, missing or unmanaged. Left out when there are none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<Member>,
     /// How many of `hosts` are up for the service.
     pub up: usize,
     /// How many of `hosts` hold one of the service's update slots.
@@ -177,11 +187,17 @@ pub struct Status {
 
 /// The features this coordinator advertises to an agent that announces `agent_features`.
 ///
-/// Each name is added in the change that implements what it names (`deferred-v1`, `halt-v1`;
-/// `heartbeat-v2` follows), so a name is never advertised for behaviour that is not there.
-/// `deferred-v1`: a heartbeat's `deferred` report ends the order, holds no slot and backs the
-/// host off ([`crate::defer`]). `halt-v1`: the clear generations of [`crate::halt`].
-pub const FEATURES: &[&str] = &["deferred-v1", halt::FEATURE];
+/// Each name is added in the change that implements what it names (`halt-v1`; the others
+/// follow), so a name is never advertised for behaviour that is not there. `deferred-v1`: a
+/// heartbeat's `deferred` report ends the order, holds no slot and backs the host off
+/// ([`crate::defer`]). `halt-v1`: the clear generations of [`crate::halt`]. `heartbeat-v2`:
+/// selector membership, hosts that are `missing`, `absent` or `unmanaged`
+/// ([`crate::membership`]).
+pub const FEATURES: &[&str] = &[
+    "deferred-v1",
+    halt::FEATURE,
+    crate::membership::HEARTBEAT_V2,
+];
 
 /// How long a host's warn about one dropped fact is silent after it was logged.
 const EXTRAS_LOG_EVERY: Duration = Duration::from_secs(3600);
@@ -333,9 +349,27 @@ impl Coordinator {
         let mut fleet = self.fleet.lock().unwrap_or_else(PoisonError::into_inner);
         let announced = beat.services.clone().unwrap_or_default();
         let platform = beat.platform;
-        fleet.record(who.node_id.clone(), who.role.clone(), beat, now);
+        let node = Node {
+            role: who.role.name().to_owned(),
+            features: beat.agent_features.clone(),
+            seen: now,
+            announced: std::iter::once((KBF.to_owned(), beat.health))
+                .chain(announced.iter().map(|one| (one.name.clone(), one.health)))
+                .collect(),
+        };
+        let ops = self.ops.state();
+        let counted =
+            |def: &ServiceDef| standing(def, &who.node_id, &node, &ops, now) == Standing::Counted;
+        for def in self.services.defs() {
+            if standing(def, &who.node_id, &node, &ops, now) == Standing::Dropped {
+                fleet.forget_in(&def.name, &who.node_id);
+            }
+        }
+        if self.services.get(KBF).is_none_or(counted) {
+            fleet.record(who.node_id.clone(), who.role.clone(), beat, now);
+        }
         for one in &announced {
-            if halt::is_member(&self.services, &one.name, who.role.name()) {
+            if self.services.get(&one.name).is_some_and(counted) {
                 fleet.record_in(
                     &one.name,
                     who.node_id.clone(),
@@ -345,12 +379,18 @@ impl Coordinator {
                 );
             }
         }
-        let desired = self.desired.all();
+        fleet.note_node(who.node_id.clone(), node);
         let mut names: Vec<&str> = std::iter::once(KBF)
             .chain(announced.iter().map(|one| one.name.as_str()))
             .collect();
         // Stable: services of one priority keep the order above.
         names.sort_by_key(|name| Reverse(self.services.get(name).map_or(0, |def| def.priority)));
+        // The hosts' words are in: record the last good versions and roll back what failed,
+        // before the orders below read the desired states.
+        for def in names.iter().filter_map(|name| self.services.get(name)) {
+            reconcile(def, &self.ops, &self.desired, &fleet, now);
+        }
+        let desired = self.desired.all();
         for name in names {
             if held.iter().any(|service| service == name) {
                 continue;
@@ -365,6 +405,10 @@ impl Coordinator {
                 now,
             );
             if let Decision::Update { version } = decision {
+                // The host's ack goes from the file before the order exists.
+                if !release_ack(&self.ops, name, &who.node_id) {
+                    continue;
+                }
                 fleet.order(name, who.node_id.clone(), version.clone(), now);
                 return ServiceReply::Update {
                     service: (name != KBF).then(|| name.to_owned()),
@@ -425,6 +469,13 @@ impl Coordinator {
             );
             return Err(SetError::Forbidden);
         }
+        // CI naming a version by hand lifts its mark. The mark goes first: a set that fails
+        // after it leaves nothing blocked, and the reverse would leave a wanted version that
+        // the next beat rolls back.
+        {
+            let fleet = self.fleet.lock().unwrap_or_else(PoisonError::into_inner);
+            clear_bad(&self.ops, &fleet, &service, &desired.version)?;
+        }
         self.desired.set(&service, desired.clone())?;
         tracing::info!(
             workflow = %verified.job_workflow_ref,
@@ -458,7 +509,31 @@ impl Coordinator {
     /// [`OperateError`].
     pub fn operate(&self, bearer: Option<&str>, body: &[u8]) -> Result<AuditEntry, OperateError> {
         self.operator(bearer)?;
-        ops::operate(&self.ops, &self.services, OPERATOR, body)
+        let entry = ops::operate(&self.ops, &self.services, OPERATOR, body)?;
+        self.reconcile();
+        Ok(entry)
+    }
+
+    /// Forgets what the hosts said about a service they no longer belong to, after an
+    /// operator changed exclusions or labels ([`standing`]).
+    fn reconcile(&self) {
+        let now = (self.clock)();
+        let ops = self.ops.state();
+        let mut fleet = self.fleet.lock().unwrap_or_else(PoisonError::into_inner);
+        let dropped: Vec<(String, kbf_types::NodeId)> = self
+            .services
+            .defs()
+            .flat_map(|def| {
+                fleet
+                    .nodes()
+                    .filter(|(id, node)| standing(def, id, node, &ops, now) == Standing::Dropped)
+                    .map(|(id, _)| (def.name.clone(), id.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        for (service, id) in dropped {
+            fleet.forget_in(&service, &id);
+        }
     }
 
     /// The status, if `bearer` is the operator token.
@@ -474,6 +549,7 @@ impl Coordinator {
             .map(|(id, host)| host_status(&fleet, KBF, id, host, now))
             .collect();
         let all = self.desired.all();
+        let ops = self.ops.state();
         let per_service = self
             .services
             .defs()
@@ -500,11 +576,13 @@ impl Coordinator {
                     .collect();
                 let up = hosts.iter().filter(|h| h.host.up).count();
                 let slots_held = hosts.iter().filter(|h| h.host.holds_slot).count();
-                let convergence = convergence_of(&self.ops, def, desired.as_ref(), &fleet, now);
+                let members = members(def, &fleet, &ops, now);
+                let convergence = convergence_of(def, desired.as_ref(), &fleet, &ops, now);
                 let status = ServiceStatus {
                     desired,
                     roles,
                     hosts,
+                    members,
                     up,
                     slots_held,
                     convergence,
@@ -514,7 +592,7 @@ impl Coordinator {
             .collect();
         Ok(Status {
             per_service,
-            ops: self.ops.state(),
+            ops,
             desired: self.desired.get(KBF),
             services: self.desired.all(),
             quiet: fleet.is_quiet(now),
@@ -550,13 +628,8 @@ impl Coordinator {
         let now = (self.clock)();
         let fleet = self.fleet.lock().unwrap_or_else(PoisonError::into_inner);
         let desired = self.desired.get(service);
-        Ok(convergence_of(
-            &self.ops,
-            def,
-            desired.as_ref(),
-            &fleet,
-            now,
-        ))
+        let ops = self.ops.state();
+        Ok(convergence_of(def, desired.as_ref(), &fleet, &ops, now))
     }
 }
 
@@ -584,11 +657,11 @@ fn host_status(
 /// give. `kbf` is counted with the minimums of its desired state, as it always has been; any
 /// other service with what its definition requires of each role. A halted service is
 /// `halted` whatever its hosts say.
-fn convergence_of(
-    ops: &OpsStore,
+pub(crate) fn convergence_of(
     def: &ServiceDef,
     desired: Option<&Desired>,
     fleet: &Fleet,
+    ops: &OpsState,
     now: Duration,
 ) -> Convergence {
     let convergence = if def.name == KBF {
@@ -596,6 +669,8 @@ fn convergence_of(
     } else {
         converge_service(def, desired, fleet, now)
     };
+    let deferred = deferred_count(def, fleet, convergence.desired.as_ref(), now);
+    let convergence = account(convergence, def, &members(def, fleet, ops, now), deferred);
     match halt::standing(ops, &def.name) {
         Some(halt) => convergence.halted(halt),
         None => convergence,

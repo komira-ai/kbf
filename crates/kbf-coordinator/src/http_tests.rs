@@ -20,6 +20,7 @@ mod extras;
 mod features;
 mod halt;
 mod operator;
+mod rollback;
 mod services;
 mod status;
 

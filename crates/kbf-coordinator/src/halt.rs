@@ -24,7 +24,7 @@
 //! target, and leaves it standing for an order of another target. That order cannot be given
 //! while the acknowledgement stands: the only place an order is produced is
 //! `Coordinator::reply_to` (`service.rs`, the call of `Fleet::order`), after [`decide`], and
-//! `decide_why` holds a host whose beat's `last_update` is a failure of the desired version
+//! `decide_marked` holds a host whose beat's `last_update` is a failure of the desired version
 //! (`Hold::FailedHere`, `decide.rs`) and one that is updating (`Hold::Updating`). The
 //! acknowledgement stands only while the host's beat carries the acknowledged report, a failed
 //! update of its target, and any other beat ends it in [`note`], before [`decide`] and
@@ -49,7 +49,7 @@ use std::time::Duration;
 use kbf_types::NodeId;
 use kbf_updater::wire::{Heartbeat, Outcome, Phase, Token, UpdateResult};
 
-use crate::decide::{Decision, Hold, decide_why};
+use crate::decide::{Decision, Hold, decide_marked};
 use crate::desired::{Desired, KBF};
 use crate::fleet::Fleet;
 use crate::identity::Identity;
@@ -280,12 +280,16 @@ fn record(ops: &OpsStore, service: &str, report: Halt) {
     }
 }
 
-/// The standing halt of `service`, if any.
-pub(crate) fn standing(ops: &OpsStore, service: &str) -> Option<Halt> {
-    ops.read(|state| state.services.get(service).and_then(|m| m.halt.clone()))
+/// The standing halt of `service` in `state`, if any.
+pub(crate) fn standing(state: &OpsState, service: &str) -> Option<Halt> {
+    state.services.get(service).and_then(|m| m.halt.clone())
 }
 
-/// [`decide_why`] for a service that is not halted, and [`Hold::Halted`] for one that is.
+/// [`Hold::Halted`] for a service that is halted, and [`decide_marked`] (which holds the
+/// versions marked bad) for one that is not.
+///
+/// A halt is checked first, so that a halted service is told nothing: not an order, and not
+/// the reason a version is bad. The halt and the bad versions are read under one lock.
 pub(crate) fn decide(
     ops: &OpsStore,
     services: &Services,
@@ -295,10 +299,20 @@ pub(crate) fn decide(
     id: &NodeId,
     now: Duration,
 ) -> Decision {
-    if standing(ops, service).is_some() {
+    let (halted, bad) = ops.read(|state| {
+        (
+            standing(state, service).is_some(),
+            state
+                .services
+                .get(service)
+                .map(|marks| marks.bad.clone())
+                .unwrap_or_default(),
+        )
+    });
+    if halted {
         return Decision::Hold(Hold::Halted);
     }
-    decide_why(services, desired, service, fleet, id, now)
+    decide_marked(services, desired, &bad, service, fleet, id, now)
 }
 
 /// The generation of every service an operator has cleared a halt of, by name.

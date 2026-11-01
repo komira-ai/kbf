@@ -26,8 +26,11 @@
 //! write ([`OpsStore::try_change`]), on the state the change is applied to.
 //!
 //! The operator actions ([`operate`]) write exclusions, labels and the clear of a halt; the
-//! coordinator itself writes the raising of a halt ([`crate::halt`]). Nothing but a halt reads
-//! the store when it decides what a host is told.
+//! coordinator itself writes the raising of a halt ([`crate::halt`]) and, in
+//! [`crate::reconcile`], the last good version and the marking of a version bad (a raise, so in
+//! memory first); CI's override clears that mark when it sets that version by hand. The
+//! decision reads a halt and the bad versions ([`crate::halt::decide`]); nothing reads the rest
+//! when it decides what a host is told.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -143,6 +146,17 @@ fn is_zero(n: &u64) -> bool {
     *n == 0
 }
 
+/// A failure report an operator override acknowledged: the host and the whole report it made,
+/// so that a different report of the same host is not hidden by it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FailureAck {
+    /// The host.
+    pub node_id: String,
+    /// The `last_update` it reported.
+    pub report: UpdateResult,
+}
+
 /// The marks of one service.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -162,12 +176,17 @@ pub struct ServiceOps {
     /// once it is not zero, so a file of a service never cleared reads as it always did.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub halt_generation: u64,
-    /// The newest version that converged and baked.
+    /// The newest version that converged and baked, as the coordinator recorded it; the
+    /// version an automatic rollback goes back to.
     #[serde(default)]
     pub last_good: Option<Version>,
-    /// The versions never to order again.
+    /// The versions never to order again, until CI sets one by hand.
     #[serde(default)]
     pub bad: Vec<Version>,
+    /// The failure reports standing when CI set a bad version by hand: one per host. A report
+    /// that is acked, whole, does not count towards an automatic rollback.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failure_acked: Vec<FailureAck>,
 }
 
 /// One change, as the ring and the log say it.
@@ -178,7 +197,8 @@ pub struct AuditEntry {
     pub seq: u64,
     /// Who made it.
     pub by: String,
-    /// What it was (`exclude`, `include`, `set_labels`, `clear_halt`, `halt`).
+    /// What it was (`exclude`, `include`, `set_labels`, `clear_halt`, `halt`; the
+    /// coordinator's own: `last_good`, `clear_last_good`, `mark_bad`; CI's: `unmark_bad`).
     pub action: String,
     /// The service it concerned, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -383,6 +403,16 @@ impl OpsStore {
         read(&self.lock())
     }
 
+    /// The marks of `service` now: none if it has none.
+    #[must_use]
+    pub fn marks(&self, service: &str) -> ServiceOps {
+        self.lock()
+            .services
+            .get(service)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     fn lock(&self) -> MutexGuard<'_, OpsState> {
         self.current.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -558,7 +588,7 @@ fn reason(text: &str) -> Result<String, OperateError> {
     Ok(text.to_owned())
 }
 
-fn label(text: &str) -> bool {
+pub(crate) fn label(text: &str) -> bool {
     (1..=MAX_LABEL_BYTES).contains(&text.len())
         && text
             .bytes()

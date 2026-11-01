@@ -32,6 +32,7 @@ use serde::Serialize;
 
 use crate::desired::Desired;
 use crate::fleet::{Fleet, Host};
+use crate::membership::HostCounts;
 use crate::ops::Halt;
 use crate::services::ServiceDef;
 
@@ -101,6 +102,10 @@ pub struct Convergence {
     /// The halt that stands, when the state is `halted`: the host, the check and the version.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub halt: Option<HaltNote>,
+    /// The hosts that are not counted in `roles`, by why. Left out for a service with no
+    /// selector until there is one to count.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hosts: Option<HostCounts>,
     /// The commit this coordinator was built from ([`crate::BUILD_COMMIT`]): what a client
     /// compares with a release before it orders one.
     pub commit: &'static str,
@@ -228,6 +233,7 @@ fn converge_with(
             state: State::InProgress,
             roles: Vec::new(),
             halt: None,
+            hosts: None,
             commit: crate::BUILD_COMMIT,
         };
     };
@@ -274,6 +280,7 @@ fn converge_with(
         state,
         roles,
         halt: None,
+        hosts: None,
         commit: crate::BUILD_COMMIT,
     }
 }

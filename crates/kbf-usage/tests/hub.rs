@@ -276,3 +276,49 @@ fn a_store_failure_is_a_fault_and_the_hub_goes_on() {
     let err = rig.seam.flush(NOW).unwrap_err();
     assert!(err.0.starts_with("state store"), "{}", err.0);
 }
+
+// Catches a run the profile declines being counted as a run in a profile: the hub counts it
+// as learned (the call succeeded), and the seam counts it apart, so the two numbers say how
+// many runs are in profiles. The run has minutes 0 and 9 only, more than a fifth missing.
+#[test]
+fn a_run_the_profile_declines_is_counted_apart() {
+    let rig = rig(fake());
+    let id = run_id(1);
+    assert!(rig.keys.bind(&id, action("main", 1)));
+    let minutes = [0, 9].map(|m| minute_of(lease(1), m, 1_000)).to_vec();
+    let load = BeatLoad::Read {
+        load: beat(1, minutes),
+        records_dropped: 0,
+    };
+    let result = js_usage::AcceptedResult {
+        lease: lease(1),
+        run_id: &id,
+        finish: Finish::Clean,
+    };
+    send(&rig, load, &[result]);
+    for _ in 0..GRACE_BEATS {
+        send(&rig, BeatLoad::Absent, &[]);
+    }
+    assert_eq!(rig.hub.counters().runs_learned, 1);
+    assert_eq!(rig.seam.declined(), 1);
+    assert_eq!(rig.sink.stats().keys, 0);
+    run(&rig, 2, Finish::Clean, true, true);
+    assert_eq!(rig.hub.counters().runs_learned, 2);
+    assert_eq!(rig.seam.declined(), 1);
+    assert_eq!(rig.sink.stats().keys, 1);
+}
+
+// Catches a full table of runs that refuses without a trace: each refused bind is counted,
+// a rebind of a held run is not a refusal, and a bind that fits is not counted.
+#[test]
+fn a_refused_bind_is_counted() {
+    let keys = RunKeys::new(Arc::new(ShapeIndex::new()));
+    for n in 0..MAX_SHAPES {
+        assert!(keys.bind(&format!("r{n}"), action("main", 1)));
+    }
+    assert_eq!(keys.refused(), 0);
+    assert!(!keys.bind("extra", action("main", 1)));
+    assert!(!keys.bind("extra2", action("main", 1)));
+    assert!(keys.bind("r0", action("main", 2)));
+    assert_eq!(keys.refused(), 2);
+}

@@ -151,6 +151,7 @@ fn the_file_reads_and_writes_every_field_of_the_schema() {
             halt_generation: 3,
             last_good: Some(version("1.0")),
             bad: vec![version("1.9")],
+            failure_acked: Vec::new(),
         },
     );
     let mut seven = entry("exclude");

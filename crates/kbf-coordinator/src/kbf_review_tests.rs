@@ -204,6 +204,7 @@ fn the_hold_strings_are_the_ones_the_status_documents() {
             Hold::NoDesired => "no_desired",
             Hold::NotAMember => "not_a_member",
             Hold::Quiet => "quiet",
+            Hold::Absent => "absent",
             Hold::Updating => "updating",
             Hold::BusyElsewhere => "busy_elsewhere",
             Hold::UpToDate => "up_to_date",
@@ -215,6 +216,7 @@ fn the_hold_strings_are_the_ones_the_status_documents() {
             Hold::MinUp => "min_up",
             Hold::Baking => "baking",
             Hold::CanaryWait => "canary_wait",
+            Hold::Bad => "bad",
         }
     };
     for hold in [
@@ -223,6 +225,7 @@ fn the_hold_strings_are_the_ones_the_status_documents() {
         Hold::NoDesired,
         Hold::NotAMember,
         Hold::Quiet,
+        Hold::Absent,
         Hold::Updating,
         Hold::BusyElsewhere,
         Hold::UpToDate,
@@ -234,6 +237,7 @@ fn the_hold_strings_are_the_ones_the_status_documents() {
         Hold::MinUp,
         Hold::Baking,
         Hold::CanaryWait,
+        Hold::Bad,
     ] {
         assert_eq!(json!(hold), json!(spelled(hold)));
     }
