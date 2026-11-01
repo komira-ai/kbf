@@ -48,6 +48,7 @@ use sha2::{Digest, Sha256};
 
 use super::CommitId;
 use super::layout::{self, Layout, Platform};
+use super::retain::{self, RetainError, Retained};
 use super::state::{self, Locked, State, StateError};
 
 /// Who owns a release: root, so only root can replace what a service runs.
@@ -66,6 +67,8 @@ pub enum ReleaseError {
     State(#[from] StateError),
     #[error(transparent)]
     Host(#[from] HostError),
+    #[error(transparent)]
+    Retain(#[from] RetainError),
     #[error("the metadata log: {0}")]
     MetaLog(#[from] crate::meta_log::MetaLogError),
     #[error("cannot read {path}: {source}")]
@@ -640,10 +643,12 @@ pub(crate) fn has_binary<E: Exec>(exec: &E, host: &Layout, commit: &CommitId) ->
 }
 
 /// `host gc --keep N`: remove each release directory but the kept ones: the state's
-/// current, previous and staged, what the `current` and `previous` links point to, and
-/// the release a pending swap names and the one it came from, every release in `in_use` (a
-/// process executes from it), and the `keep` newest others (by the directory's modification
-/// time). An entry of `releases/` that is not a directory named by a commit id is left alone.
+/// current, previous and staged, what the `current` and `previous` links point to, every
+/// release in `in_use` (a process executes from it), the pinned releases and `last_good` of
+/// `retain.json`, and the `keep` newest others (by the directory's modification time; never
+/// fewer than [`retain::MIN_KEEP`]). Nothing is removed while a swap is on trial: the swap
+/// is not over, and the release it would go back to is not the only one a revert may want.
+/// An entry of `releases/` that is not a directory named by a commit id is left alone.
 pub fn gc<E: Exec>(
     exec: &mut E,
     host: &Layout,
@@ -652,9 +657,8 @@ pub fn gc<E: Exec>(
     mode: Mode,
     out: &mut dyn Write,
 ) -> Result<(), ReleaseError> {
+    let keep = retain::at_least(keep);
     // Held through the removals, so an install cannot make a release current meanwhile.
-    // Unlike an install, `gc` is not refused while a swap is on trial: it keeps both of the
-    // swap's releases (S22).
     let lock = match mode {
         Mode::Apply => Some(Locked::acquire(host)?),
         Mode::DryRun => None,
@@ -664,6 +668,16 @@ pub fn gc<E: Exec>(
         None => state::read_unlocked(host)?,
     };
     let state = state.unwrap_or_default();
+    if let Some(p) = &state.pending_confirm {
+        let _ = writeln!(
+            out,
+            "removing nothing: {} is on trial (confirm it or let it go back first)",
+            p.commit
+        );
+        return Ok(());
+    }
+    let retain_file = retain::path(host);
+    let retained = Retained::read(&retain_file)?;
     if lock.is_some() {
         sweep_stages(host)?;
     }
@@ -671,25 +685,15 @@ pub fn gc<E: Exec>(
         .into_iter()
         .flatten()
         .collect();
-    if let Some(p) = &state.pending_confirm {
-        kept.insert(p.commit.clone());
-        kept.extend(p.previous.clone());
-    }
+    kept.extend(retained.protected());
     kept.extend(in_use.iter().cloned());
     for link in [host.current(), host.previous()] {
         if let Some(Entry::Link { target }) = inspect(exec, &link)? {
             kept.extend(linked(&target));
         }
     }
-    let mut old = Vec::new();
-    for (commit, modified) in releases(host, out)? {
-        if !kept.contains(&commit) {
-            old.push((modified, commit));
-        }
-    }
-    // Newest first; the first `keep` stay.
-    old.sort_by(|a, b| b.cmp(a));
-    let gone: Vec<CommitId> = old.into_iter().skip(keep).map(|(_, c)| c).collect();
+    let found = releases(host, out)?;
+    let gone = retain::surplus(&found, &kept, keep);
     let mut paths = Vec::new();
     for commit in &gone {
         let dir = host.release_dir(commit);
@@ -703,12 +707,40 @@ pub fn gc<E: Exec>(
     let kept: Vec<String> = kept.iter().map(ToString::to_string).collect();
     let _ = writeln!(
         out,
-        "keeping: {}; removing: {}",
+        "keeping: {} and the {keep} newest others; removing: {}",
         list(&kept),
         list(&gone.iter().map(ToString::to_string).collect::<Vec<_>>())
     );
     execute(&planner.finish(), RunAs::Root, mode, exec, &mut &mut *out)?;
+    if mode == Mode::Apply && !gone.is_empty() {
+        // Read again: a stage may have recorded a version since.
+        Retained::update(&retain_file, |r| {
+            for commit in &gone {
+                r.versions.remove(commit);
+            }
+        })?;
+    }
     Ok(())
+}
+
+/// The releases `host` holds, newest first, each with its version and why it must stay, for
+/// `host status`. Read without the lock, like the status.
+///
+/// # Errors
+/// The state, `retain.json` or `releases/` cannot be read.
+pub fn kept(host: &Layout) -> Result<Vec<retain::Kept>, ReleaseError> {
+    let state = state::read_unlocked(host)?.unwrap_or_default();
+    let retained = Retained::read(&retain::path(host))?;
+    let found = releases(host, &mut io::sink())?;
+    Ok(retain::listing(
+        &found,
+        &retain::Known {
+            current: state.current.as_ref(),
+            previous: state.previous.as_ref(),
+            on_trial: state.pending_confirm.as_ref().map(|p| &p.commit),
+            retained: Some(&retained),
+        },
+    ))
 }
 
 fn list(items: &[String]) -> String {
@@ -725,7 +757,7 @@ fn linked(target: &Path) -> Option<CommitId> {
 }
 
 /// Each directory in `releases/` named by a commit id, with its modification time.
-fn releases(
+pub(crate) fn releases(
     host: &Layout,
     out: &mut dyn Write,
 ) -> Result<Vec<(CommitId, SystemTime)>, ReleaseError> {
@@ -744,10 +776,17 @@ fn releases(
             .file_name()
             .to_str()
             .and_then(|n| CommitId::new(n).ok());
+        // The `current` and `previous` links live here too: they are the layout's, not
+        // strays, and are not told.
+        let link = meta.file_type().is_symlink()
+            && [layout::CURRENT, layout::PREVIOUS]
+                .iter()
+                .any(|name| item.file_name() == OsStr::new(name));
         match commit {
             Some(c) if meta.is_dir() => {
                 found.push((c, meta.modified().map_err(read_failed(&full))?));
             }
+            _ if link => {}
             _ => {
                 let _ = writeln!(out, "left alone (not a release): {}", full.display());
             }

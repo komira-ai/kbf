@@ -1458,3 +1458,6 @@ fn the_retired_flags_on_the_command_line_reach_the_values_setup_runs_with() {
     let raw = raw_from(&all.setup);
     assert_eq!(raw.retired.given(), ["--release-url", "--commit"]);
 }
+
+#[path = "app_gc_tests.rs"]
+mod gc_keep;

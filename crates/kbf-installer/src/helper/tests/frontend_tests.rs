@@ -351,9 +351,9 @@ fn a_revert_drops_only_the_staged_release_and_never_touches_current() {
 
 /// Catches the release a confirm or revert leaves behind never being collected: both owe a
 /// `gc` (the confirm because `previous` moved on, the revert because a staging was dropped),
-/// which removes the releases nothing needs beyond the newest one.
+/// which removes the releases nothing needs beyond the four newest.
 ///
-/// Catches: `kept` false after a flip; `kept` false after a drop.
+/// Catches: `kept` false after a flip; `kept` false after a drop; a keep above or below four.
 #[test]
 fn a_confirm_and_a_drop_each_collect_the_releases_nothing_needs() {
     let releases = |rig: &Rig, name: &str| {
@@ -362,22 +362,40 @@ fn a_confirm_and_a_drop_each_collect_the_releases_nothing_needs() {
             .join(name)
             .exists()
     };
+    // Six others: the two oldest (D, E) are beyond the four newest.
+    let newer = [
+        ("1".repeat(40), 3_000),
+        ("2".repeat(40), 4_000),
+        ("3".repeat(40), 5_000),
+        ("4".repeat(40), 6_000),
+    ];
     let mut rig = staged("gc-confirm", B, 1);
     old_release(&rig, D, 1_000);
     old_release(&rig, E, 2_000);
+    for (commit, age) in &newer {
+        old_release(&rig, commit, *age);
+    }
     rig.order(2, Verb::Confirm, B);
     rig.cycle(T0 + 3);
-    assert!(!releases(&rig, D), "the oldest unneeded release is gone");
-    assert!(releases(&rig, E));
+    assert!(
+        !releases(&rig, D) && !releases(&rig, E),
+        "the oldest two are gone"
+    );
+    assert!(newer.iter().all(|(commit, _)| releases(&rig, commit)));
     assert!(releases(&rig, A) & releases(&rig, B));
 
     let mut rig = staged("gc-revert", B, 1);
     old_release(&rig, D, 1_000);
     old_release(&rig, E, 2_000);
+    for (commit, age) in &newer {
+        old_release(&rig, commit, *age);
+    }
     rig.order(2, Verb::Revert, B);
     rig.cycle(T0 + 3);
-    assert!(!releases(&rig, D));
-    assert!(releases(&rig, A));
+    // The dropped B is an other now, and the newest: it and the three newest of the rest stay.
+    assert!(!releases(&rig, D) && !releases(&rig, E) && !releases(&rig, &newer[0].0));
+    assert!(newer[1..].iter().all(|(commit, _)| releases(&rig, commit)));
+    assert!(releases(&rig, A) && releases(&rig, B));
 }
 
 /// Catches the proxy's three orders sharing the node's floor, and the floor not being theirs:

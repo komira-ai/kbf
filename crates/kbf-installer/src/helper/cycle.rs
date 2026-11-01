@@ -64,8 +64,8 @@ pub struct Config {
     pub min_activation_interval_secs: u64,
 }
 
-/// How many releases `gc` keeps besides current, previous, staged and pending.
-pub const GC_KEEP: usize = 1;
+/// How many releases `gc` keeps besides the ones that must stay (`retain`).
+pub const GC_KEEP: usize = crate::retain::DEFAULT_KEEP;
 
 /// Something the helper cannot go on from: the host's own files are wrong. A refused
 /// offer or order is not one; it is recorded and reported.

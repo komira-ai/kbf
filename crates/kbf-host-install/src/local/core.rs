@@ -22,6 +22,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use kbf_installer::retain::{Kept, Retained};
+
 use super::answer::{Answer, Code, LastView, PendingView, QueryView};
 use super::backend::{Backend, Fault, Pending};
 use super::request::LocalRequest;
@@ -31,8 +33,13 @@ use crate::mac::release::commit_prefix;
 use crate::request::{Channel, Version};
 use crate::trust::Trust;
 
-/// How many versions the state file remembers.
+/// How many versions the state file remembers, at the least: it never forgets a release the
+/// host keeps (see [`Ab::versions_kept`]).
 const KEEP_VERSIONS: usize = 16;
+
+/// The most releases a `query` lists, so its line stays well inside what a client reads (the
+/// agent reads 16 KiB).
+pub const MAX_LISTED: usize = 64;
 
 /// How an update ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,11 +102,11 @@ struct Saved {
 }
 
 impl Saved {
-    /// Remember that `commit` is `version`, forgetting the oldest names past the limit (the
-    /// commit just named is never the one forgotten).
-    fn note(&mut self, commit: &str, version: &str) {
+    /// Remember that `commit` is `version`, forgetting names past `limit` (the commit just
+    /// named is never the one forgotten).
+    fn note(&mut self, commit: &str, version: &str, limit: usize) {
         self.versions.insert(commit.to_owned(), version.to_owned());
-        let surplus = self.versions.len().saturating_sub(KEEP_VERSIONS);
+        let surplus = self.versions.len().saturating_sub(limit);
         let forget: Vec<String> = self
             .versions
             .keys()
@@ -134,6 +141,10 @@ pub struct Ab<B: Backend> {
     window_secs: u64,
     /// Unix seconds now.
     clock: Box<dyn Fn() -> u64>,
+    /// How many releases the host keeps besides the ones that must stay.
+    keep: usize,
+    /// Where what this program did besides answering is told (a prune after a confirm).
+    note: Box<dyn Fn(&str)>,
 }
 
 impl<B: Backend> Ab<B> {
@@ -150,7 +161,23 @@ impl<B: Backend> Ab<B> {
             trust,
             window_secs,
             clock,
+            keep: kbf_installer::retain::DEFAULT_KEEP,
+            note: Box::new(|_| {}),
         }
+    }
+
+    /// Keep `keep` releases besides the ones that must stay (never fewer than
+    /// [`kbf_installer::retain::MIN_KEEP`]), and tell what a prune did to `note`.
+    #[must_use]
+    pub fn keeping(mut self, keep: usize, note: Box<dyn Fn(&str)>) -> Self {
+        self.keep = kbf_installer::retain::at_least(keep);
+        self.note = note;
+        self
+    }
+
+    /// How many versions the state file remembers: every release kept, and more.
+    fn versions_kept(&self) -> usize {
+        KEEP_VERSIONS.max(self.keep + KEEP_VERSIONS / 2)
     }
 
     /// Answer a request.
@@ -161,7 +188,9 @@ impl<B: Backend> Ab<B> {
                 self.locked(|| self.stage(version, channel))
             }
             LocalRequest::Switch { version } => self.locked(|| self.switch(version)),
-            LocalRequest::Confirm { version } => self.locked(|| self.confirm(version)),
+            LocalRequest::Confirm { version, last_good } => {
+                self.locked(|| self.confirm(version, last_good.as_ref()))
+            }
             LocalRequest::Revert => self.locked(|| self.go_back(Why::Reverted)),
         };
         done.unwrap_or_else(Fault::answer)
@@ -229,6 +258,7 @@ impl<B: Backend> Ab<B> {
     fn query(&self) -> Result<Answer, Fault> {
         let saved = self.load()?;
         let commit = self.backend.current()?;
+        let releases = self.listed(&saved);
         let pending = self.backend.pending()?.map(|p| PendingView {
             version: saved.version_of(&p.commit),
             commit: p.commit,
@@ -248,7 +278,30 @@ impl<B: Backend> Ab<B> {
                 reason: last.why.map(Why::word),
             }),
             busy: locks::flock_held(&self.backend.lock_file()),
+            releases,
         }))
+    }
+
+    /// The releases the host keeps, each with its version: what the host recorded when it was
+    /// laid out, else the text it was staged as here. A listing that cannot be read is empty:
+    /// the rest of the answer stands.
+    fn listed(&self, saved: &Saved) -> Vec<Kept> {
+        let mut kept = self.backend.kept().unwrap_or_default();
+        // Past the limit, the releases that must stay are still listed; only the oldest others
+        // are left out.
+        let must = kept.iter().filter(|k| !k.why.is_empty()).count();
+        let mut others = 0;
+        kept.retain(|k| {
+            others += usize::from(k.why.is_empty());
+            !k.why.is_empty() || others + must <= MAX_LISTED
+        });
+        kept.truncate(MAX_LISTED);
+        for k in &mut kept {
+            if k.version.is_none() {
+                k.version = saved.version_of(k.commit.as_str());
+            }
+        }
+        kept
     }
 
     fn stage(&self, version: &Version, channel: &Channel) -> Result<Answer, Fault> {
@@ -275,7 +328,7 @@ impl<B: Backend> Ab<B> {
         };
         if current.starts_with(prefix) {
             // The host runs this release already: all it lacks is the version's text.
-            saved.note(&current, version.as_str());
+            saved.note(&current, version.as_str(), self.versions_kept());
             saved.staged = None;
             self.save(&saved)?;
             return Ok(answer(&current, true));
@@ -288,7 +341,7 @@ impl<B: Backend> Ab<B> {
             return Ok(answer(&staged.commit, false));
         }
         let commit = self.backend.stage(version, channel)?;
-        saved.note(&commit, version.as_str());
+        saved.note(&commit, version.as_str(), self.versions_kept());
         saved.staged = Some(Staged {
             version: version.as_str().to_owned(),
             commit: commit.clone(),
@@ -345,7 +398,7 @@ impl<B: Backend> Ab<B> {
         }
     }
 
-    fn confirm(&self, version: &Version) -> Result<Answer, Fault> {
+    fn confirm(&self, version: &Version, last_good: Option<&Version>) -> Result<Answer, Fault> {
         let mut saved = self.load()?;
         let confirmed = Answer::Confirmed {
             version: version.as_str().to_owned(),
@@ -382,7 +435,48 @@ impl<B: Backend> Ab<B> {
         });
         saved.staged = None;
         self.save(&saved)?;
+        self.retain(last_good, &mut saved);
         Ok(confirmed)
+    }
+
+    /// After a confirm: record the coordinator's `last_good`, then remove the releases the host
+    /// no longer keeps, and forget their versions. The confirm stands whatever this does: a
+    /// failure is told to the log, and the next confirm tries again.
+    fn retain(&self, last_good: Option<&Version>, saved: &mut Saved) {
+        let Some(file) = self.backend.retain_file() else {
+            return;
+        };
+        // The release `last_good` names, if the host holds it; one it does not hold has
+        // nothing to keep, and the one named before is no longer the coordinator's. A listing
+        // that cannot be read leaves the one recorded as it is.
+        let listed = last_good.map(|version| (version, self.backend.kept()));
+        match listed {
+            Some((version, Ok(kept))) => {
+                let held = commit_prefix(version.as_str()).and_then(|prefix| {
+                    kept.into_iter()
+                        .find_map(|k| k.commit.as_str().starts_with(prefix).then_some(k.commit))
+                });
+                if let Err(e) = Retained::update(&file, |r| r.last_good = held) {
+                    (self.note)(&format!("retain: {e}"));
+                }
+            }
+            Some((_, Err(fault))) => (self.note)(&format!("retain: {}", fault.detail)),
+            None => {}
+        }
+        match self.backend.prune(self.keep) {
+            Ok(done) if !done.is_empty() => (self.note)(&format!("prune: {done}")),
+            Ok(_) => {}
+            Err(fault) => (self.note)(&format!("prune: {}", fault.detail)),
+        }
+        if let Ok(kept) = self.backend.kept() {
+            let before = saved.versions.len();
+            saved
+                .versions
+                .retain(|commit, _| kept.iter().any(|k| k.commit.as_str() == commit));
+            if saved.versions.len() != before {
+                let _ = self.save(saved);
+            }
+        }
     }
 
     /// Put the host back on the release that ran before the one on trial, and remember

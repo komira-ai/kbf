@@ -67,6 +67,7 @@ fn a_query_line_carries_the_release_the_trial_and_the_last_end() {
             reason: Some("timeout"),
         }),
         busy: true,
+        releases: Vec::new(),
     };
     assert_eq!(
         line(&Answer::Queried(view)),
@@ -84,6 +85,7 @@ fn a_query_line_carries_the_release_the_trial_and_the_last_end() {
         pending: None,
         last: None,
         busy: false,
+        releases: Vec::new(),
     };
     assert_eq!(
         line(&Answer::Queried(empty)),
@@ -149,6 +151,7 @@ fn the_audit_fields_of_good_answers_name_the_outcome() {
         pending: None,
         last: None,
         busy: false,
+        releases: Vec::new(),
     });
     assert_eq!(query.audit_fields(), ("query", None));
 }

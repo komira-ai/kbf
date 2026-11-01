@@ -67,6 +67,15 @@ impl Backend for Borrowed<'_> {
     fn revert(&self, pending: &super::backend::Pending) -> Result<(), Fault> {
         self.0.revert(pending)
     }
+    fn kept(&self) -> Result<Vec<kbf_installer::retain::Kept>, Fault> {
+        self.0.kept()
+    }
+    fn retain_file(&self) -> Option<PathBuf> {
+        self.0.retain_file()
+    }
+    fn prune(&self, keep: usize) -> Result<String, Fault> {
+        self.0.prune(keep)
+    }
 }
 
 /// A file of the host's configuration: written, and readable by all but writable by its owner.
@@ -259,6 +268,21 @@ struct Rig {
     /// The installer's runner: how `gh attestation verify` ends, and what the binary says.
     gh_exit: Rc<RefCell<i32>>,
     probe: Rc<RefCell<String>>,
+    /// The executables of the host's processes, for a prune.
+    running: Rc<RefCell<Vec<PathBuf>>>,
+}
+
+/// The host's processes, as a test sets them.
+struct Running(Rc<RefCell<Vec<PathBuf>>>);
+
+impl kbf_installer::helper::service::Procs for Running {
+    fn exe_of(&self, _pid: u32) -> io::Result<PathBuf> {
+        Err(io::ErrorKind::NotFound.into())
+    }
+
+    fn executables(&self) -> io::Result<Vec<PathBuf>> {
+        Ok(self.0.borrow().clone())
+    }
 }
 
 impl Rig {
@@ -321,6 +345,7 @@ impl Rig {
             })
         };
         let installer = installer_runner.log();
+        let running = Rc::new(RefCell::new(Vec::new()));
         let backend = Linux {
             layout: layout.clone(),
             exec: RefCell::new(exec),
@@ -353,6 +378,7 @@ impl Rig {
                 gid: who.gid,
             },
             scratch_tag: None,
+            procs: Box::new(Running(Rc::clone(&running))),
         };
         let rig = Self {
             dir,
@@ -363,6 +389,7 @@ impl Rig {
             installer,
             gh_exit,
             probe,
+            running,
         };
         rig.offer(COMMIT, &tar_gz(&[file("kbf", &binary("b"))]));
         rig
@@ -1463,3 +1490,6 @@ fn the_production_host_is_the_installers_layout_and_the_programs_of_a_stage() {
 
 #[path = "linux_image_tests.rs"]
 mod image;
+
+#[path = "linux_retain_tests.rs"]
+mod retain;

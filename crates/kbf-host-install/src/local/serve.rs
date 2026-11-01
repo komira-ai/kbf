@@ -53,9 +53,15 @@ use crate::audit::{self, Audit};
 use crate::pace::{Now, Pace};
 use crate::request::{BadCommand, Unit};
 use crate::trust::Trust;
+use kbf_installer::retain::{DEFAULT_KEEP, MIN_KEEP};
 
 /// The window a release on trial has to be confirmed, unless a flag says otherwise.
 pub const DEFAULT_WINDOW_SECS: u64 = 600;
+
+/// The most releases `--keep-releases` keeps: the `query` that lists them stays small.
+pub const MAX_KEEP_RELEASES: usize = 32;
+
+const KEEP_RANGE: &str = "--keep-releases must be a number from 2 to 32";
 
 /// How long the loop sleeps when no connection waits.
 const IDLE: Duration = Duration::from_millis(200);
@@ -67,7 +73,7 @@ const IO_TIMEOUT: Duration = Duration::from_secs(10);
 pub(super) const REVERT_RETRY: Duration = Duration::from_secs(30);
 
 pub const USAGE: &str = "usage: kbf-host-install --serve --socket PATH --socket-user NAME \
-[--window-secs N] [--layout installer|deb|rpm] \
+[--window-secs N] [--keep-releases N] [--layout installer|deb|rpm] \
 (--restart-unit UNIT... | --frontend-container [--frontend-config PATH])\n";
 
 /// How a host keeps the releases it runs.
@@ -99,6 +105,9 @@ pub struct ServeConfig {
     pub socket: PathBuf,
     pub user: String,
     pub window_secs: u64,
+    /// How many releases the host keeps besides current, previous, the pinned ones and
+    /// `last_good`.
+    pub keep_releases: usize,
     pub layout: Layout,
     pub units: Vec<Unit>,
     /// The host runs the frontend as a container, not as units.
@@ -117,6 +126,7 @@ impl ServeConfig {
         let mut socket = None;
         let mut user = None;
         let mut window = None;
+        let mut keep = None;
         let mut layout = None;
         let mut units = Vec::new();
         let mut frontend_container = false;
@@ -151,6 +161,7 @@ impl ServeConfig {
                 "--socket" => once(&mut socket)?,
                 "--socket-user" => once(&mut user)?,
                 "--window-secs" => once(&mut window)?,
+                "--keep-releases" => once(&mut keep)?,
                 "--layout" => once(&mut layout)?,
                 "--frontend-config" => once(&mut frontend_config)?,
                 "--restart-unit" => {
@@ -173,6 +184,14 @@ impl ServeConfig {
                 .filter(|secs| (120..=1800).contains(secs))
                 .ok_or("--window-secs must be a number from 120 to 1800")?,
             None => DEFAULT_WINDOW_SECS,
+        };
+        let keep_releases = match keep {
+            Some(text) => text
+                .parse::<usize>()
+                .ok()
+                .filter(|n| (MIN_KEEP..=MAX_KEEP_RELEASES).contains(n))
+                .ok_or(KEEP_RANGE)?,
+            None => DEFAULT_KEEP,
         };
         if frontend_container && !units.is_empty() {
             return Err(
@@ -202,6 +221,7 @@ impl ServeConfig {
             socket,
             user,
             window_secs,
+            keep_releases,
             layout,
             units,
             frontend_container,
@@ -370,7 +390,7 @@ impl<B: Backend> Serving<'_, B> {
                 Some(version.as_str().to_owned()),
                 Some(channel.as_str().to_owned()),
             ),
-            Some(LocalRequest::Switch { version } | LocalRequest::Confirm { version }) => {
+            Some(LocalRequest::Switch { version } | LocalRequest::Confirm { version, .. }) => {
                 (Some(version.as_str().to_owned()), None)
             }
             _ => (None, None),

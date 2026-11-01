@@ -1071,3 +1071,6 @@ fn the_supported_numbers_are_protocol_one_and_the_embedded_schema() {
     assert_eq!(s.state_schema, u64::from(kbf_pack_index::schema::latest()));
     assert!(s.state_schema > 0, "this build embeds a migration");
 }
+
+#[path = "stage_version_tests.rs"]
+mod version;

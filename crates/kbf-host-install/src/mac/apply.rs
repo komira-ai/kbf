@@ -198,6 +198,12 @@ pub fn run(host: &MacHost, runner: &dyn Runner) -> u8 {
         Err(why) => ApplyState::Failed(why.clone()),
     };
     let _ = fs::remove_dir_all(host.stage());
+    if result.is_ok() {
+        // The release is applied: the ones the Mac no longer keeps go, before the status says
+        // done, so no install lays out a release meanwhile. A prune that fails removes less;
+        // the apply is done all the same.
+        let _ = super::retain::prune(host, kbf_installer::retain::DEFAULT_KEEP, None);
+    }
     // The result stays in the status file; an unwritable file is all there is to tell.
     let written = status::write(host, &state);
     record(host, plan.as_ref(), &state);

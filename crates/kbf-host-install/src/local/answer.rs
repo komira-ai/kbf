@@ -12,6 +12,7 @@
 //! A reason is a code from a closed set ([`Code`]), never text taken from the request or from
 //! a child process; the detail goes to the log, cleaned.
 
+use kbf_installer::retain::Kept;
 use serde::Serialize;
 
 use crate::outcome::MAX_DETAIL_LEN;
@@ -154,6 +155,8 @@ pub struct QueryView {
     pub last: Option<LastView>,
     /// An install, a switch or a restart holds the install lock.
     pub busy: bool,
+    /// The releases the host holds, newest first, each with its commit and version.
+    pub releases: Vec<Kept>,
 }
 
 /// What a request did.
@@ -221,6 +224,8 @@ struct Queried<'a> {
     pending: Option<&'a PendingView>,
     last: Option<&'a LastView>,
     busy: bool,
+    #[serde(skip_serializing_if = "<[Kept]>::is_empty")]
+    releases: &'a [Kept],
 }
 
 #[derive(Serialize)]
@@ -269,6 +274,7 @@ impl Answer {
                 pending: view.pending.as_ref(),
                 last: view.last.as_ref(),
                 busy: view.busy,
+                releases: &view.releases,
             }),
             Self::Refused(code, _) => to_json(&Reason {
                 result: "refused",

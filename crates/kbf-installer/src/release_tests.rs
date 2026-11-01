@@ -423,7 +423,7 @@ fn a_dry_run_writes_nothing() {
     .expect("dry gc");
     assert_eq!(
         String::from_utf8(out).expect("utf-8"),
-        "keeping: none; removing: none\nnothing to do\n"
+        "keeping: none and the 2 newest others; removing: none\nnothing to do\n"
     );
     assert_eq!(tree(&exec.root), before);
     assert!(!exec.at("/run/kbf-installer/lock").exists());
@@ -437,7 +437,11 @@ fn a_dry_run_writes_nothing() {
         Mode::Apply,
     )
     .expect("B");
-    fs::create_dir(exec.at(&format!("/var/lib/kbf-installer/releases/{C}"))).expect("seed");
+    // Three others besides current and previous: the two newest stay (the floor of `keep`),
+    // so the dry gc below has C, the oldest, to name.
+    seed_release(&exec, C, 1);
+    seed_release(&exec, E, 2_000);
+    seed_release(&exec, S, 3_000);
     let before = tree(&exec.root);
     let out = install_on(
         &mut exec,
@@ -540,14 +544,17 @@ fn gc_keeps_current_previous_staged_and_the_newest() {
         .expect("lock")
         .write(&state)
         .expect("write");
-    // No links: only the state names what is in use.
+    // No links: only the state names what is in use. One other is asked for; a host keeps
+    // two (the floor), so only the oldest of C, D, E goes.
     let out = gc_on(&mut exec, &root, 1).expect("gc");
     assert!(
-        out.contains(&format!("keeping: {B} {A} {S}; removing: {D} {C}\n")),
+        out.contains(&format!(
+            "keeping: {B} {A} {S} and the 2 newest others; removing: {C}\n"
+        )),
         "{out}"
     );
     assert!(out.contains("left alone (not a release): "), "{out}");
-    let mut want = vec![A, B, E, S, "notes.txt", "tmp"]
+    let mut want = vec![A, B, D, E, S, "notes.txt", "tmp"]
         .into_iter()
         .map(String::from)
         .collect::<Vec<_>>();
@@ -564,10 +571,11 @@ fn gc_keeps_current_previous_staged_and_the_newest() {
         .expect("lock")
         .write(&State::default())
         .expect("write");
-    symlink(E, exec.at("/var/lib/kbf-installer/releases/current")).expect("link");
-    symlink(S, exec.at("/var/lib/kbf-installer/releases/previous")).expect("link");
+    // The links point at the two oldest, which the newest-two rule would remove.
+    symlink(A, exec.at("/var/lib/kbf-installer/releases/current")).expect("link");
+    symlink(B, exec.at("/var/lib/kbf-installer/releases/previous")).expect("link");
     gc_on(&mut exec, &root, 0).expect("gc");
-    let mut want = vec![E, S, "current", "previous", "notes.txt", "tmp"]
+    let mut want = vec![A, B, E, S, "current", "previous", "notes.txt", "tmp"]
         .into_iter()
         .map(String::from)
         .collect::<Vec<_>>();
@@ -609,14 +617,14 @@ fn every_verb_refuses_while_a_deploy_is_pending() {
     }
 }
 
-/// Catches a `gc` that removes the release on trial or the one it came from (S22), and a
-/// `gc` that is refused for the trial: with a swap pending the releases it names stay, a
-/// release a process runs stays, and the rest go.
+/// Catches a `gc` that removes anything while a swap is on trial: the release on trial, the
+/// one it came from (S22), a release a process runs, and every other release stay, and the
+/// output says why nothing was removed.
 ///
-/// Catches: the pending commit not kept; the pending `previous` not kept; `in_use`
-/// not kept.
+/// Catches: the check for `pending_confirm` removed from `gc` (the surplus is pruned and
+/// `releases/` shrinks).
 #[test]
-fn gc_keeps_the_swap_on_trial_and_what_runs() {
+fn gc_removes_nothing_while_the_swap_is_on_trial() {
     let (mut exec, root) = host("gc-pending");
     let (p, q) = ("1".repeat(40), "2".repeat(40));
     for r in [A, B, C, &p, &q] {
@@ -640,8 +648,12 @@ fn gc_keeps_the_swap_on_trial_and_what_runs() {
         .expect("write");
     let running: BTreeSet<_> = [c(&q)].into();
     let mut out = Vec::new();
-    gc(&mut exec, &root, 0, &running, Mode::Apply, &mut out).expect("gc");
-    let mut want = vec![C.to_owned(), p, q];
+    gc(&mut exec, &root, 2, &running, Mode::Apply, &mut out).expect("gc");
+    assert_eq!(
+        String::from_utf8(out).expect("utf-8"),
+        format!("removing nothing: {C} is on trial (confirm it or let it go back first)\n")
+    );
+    let mut want = vec![A.to_owned(), B.to_owned(), C.to_owned(), p, q];
     want.sort();
     assert_eq!(releases_left(&exec), want);
 }
@@ -1708,3 +1720,9 @@ fn gc_on_an_unreadable_releases_directory_is_an_error_not_an_empty_one() {
     let err = result.expect_err("denied");
     assert!(matches!(err, ReleaseError::Read { .. }), "{err}");
 }
+
+#[path = "gc_retain_tests.rs"]
+mod retention;
+
+#[path = "fixed_paths_tests.rs"]
+mod fixed_paths;

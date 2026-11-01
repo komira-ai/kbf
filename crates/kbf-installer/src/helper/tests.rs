@@ -1501,11 +1501,11 @@ fn a_confirm_order_is_kept_only_when_the_new_release_runs() {
 }
 
 /// Catches `gc` removing what must stay: after a confirm the releases nothing needs go,
-/// and current, previous, the newest other and every release a process executes from stay.
-/// A confirm that is refused collects nothing.
+/// and current, previous, the four newest others and every release a process executes from
+/// stay. A confirm that is refused collects nothing.
 ///
 /// Catches: the in-use set ignored (the oldest release, run by a process, is
-/// removed); `gc_due` set by a refused confirm; previous not kept.
+/// removed); `gc_due` set by a refused confirm; previous not kept; a keep below four.
 #[test]
 fn a_confirm_collects_old_releases_but_not_one_a_process_runs() {
     let mut rig = Rig::new("gc-after-confirm");
@@ -1514,25 +1514,27 @@ fn a_confirm_collects_old_releases_but_not_one_a_process_runs() {
         "2222222222222222222222222222222222222222",
         "3333333333333333333333333333333333333333",
         "4444444444444444444444444444444444444444",
+        "5555555555555555555555555555555555555555",
+        "6666666666666666666666666666666666666666",
+        "7777777777777777777777777777777777777777",
     ];
-    for o in others {
+    let releases = rig.root.join("var/lib/kbf-installer/releases");
+    for (i, o) in others.into_iter().enumerate() {
         rig.install(o);
+        // The first is the oldest by far, and the rest follow in order.
+        fs::File::open(releases.join(o))
+            .expect("dir")
+            .set_modified(
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(1000 + 10 * i as u64),
+            )
+            .expect("mtime");
     }
-    // The first is the oldest by far, and a stray process runs it.
-    let old = rig
-        .root
-        .join("var/lib/kbf-installer/releases")
-        .join(others[0]);
-    let epoch = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1000);
-    fs::File::open(&old)
-        .expect("dir")
-        .set_modified(epoch)
-        .expect("mtime");
+    // A stray process runs the oldest.
+    let old = releases.join(others[0]);
     rig.service.0.borrow_mut().exes.push((77, old.join("kbf")));
 
     rig.order(5, Verb::Activate, B);
     rig.cycle(T0);
-    let releases = rig.root.join("var/lib/kbf-installer/releases");
     let there = |c: &str| releases.join(c).exists();
     assert!(there(others[1]), "nothing is collected before the confirm");
 
@@ -1542,8 +1544,11 @@ fn a_confirm_collects_old_releases_but_not_one_a_process_runs() {
     rig.cycle(T0 + 3);
     assert!(there(A) && there(B), "previous and current stay");
     assert!(there(others[0]), "a release a process runs stays");
-    let left = others[1..].iter().filter(|o| there(o)).count();
-    assert_eq!(left, 1, "only the newest other stays");
+    assert!(
+        !there(others[1]) && !there(others[2]),
+        "the two oldest others go"
+    );
+    assert!(others[3..].iter().all(|o| there(o)), "the four newest stay");
 }
 
 /// Catches a collection that cannot run ending the pass or refusing the confirm: when the

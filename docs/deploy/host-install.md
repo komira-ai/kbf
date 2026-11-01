@@ -611,7 +611,7 @@ is not changed. It does one host's A/B: put the next release beside the one that
 it on trial, keep it or go back.
 
 ```text
-kbf-host-install --serve --socket PATH --socket-user NAME [--window-secs N]
+kbf-host-install --serve --socket PATH --socket-user NAME [--window-secs N] [--keep-releases N]
                  [--layout installer|deb|rpm] (--restart-unit UNIT... | --frontend-container)
 ```
 
@@ -621,6 +621,8 @@ kbf-host-install --serve --socket PATH --socket-user NAME [--window-secs N]
 - `--socket-user`: the one account that may connect. On Linux it is looked up in `/etc/passwd`,
   on a Mac with `dscl`; root is refused.
 - `--window-secs`: how long a release on trial has to be confirmed, 120 to 1800 (default 600).
+- `--keep-releases`: how many releases the host keeps besides the ones that must stay, 2 to 32
+  (default 4). See [The releases a host keeps](#the-releases-a-host-keeps).
 - `--layout`: how a Linux host keeps its releases. `installer` (the default) is the hand-placed
   layout of `kbf-installer`, described under "On Linux". `deb` and `rpm` are a host whose units
   are the `kbf` package's and run `/usr/bin/kbf`, updated by installing that package ("On a Linux
@@ -648,7 +650,7 @@ the channel as the forced command's (single spaces, no control byte; no path or 
 query
 install kbf=<version> from <channel>
 switch kbf=<version>
-confirm kbf=<version>
+confirm kbf=<version>[ last_good=<version>]
 revert
 ```
 
@@ -656,19 +658,45 @@ revert
 |---|---|
 | `install` | looks `<version>` up in the channel, fetches the release **on the host**, verifies it, and lays it out beside the one that runs. No link moves and nothing restarts. The same version asked again is answered from what is laid out; the version the host runs already is answered at once (`current: true`) and teaches the host its version text |
 | `switch` | puts the laid-out release in place **on trial**: the pending marker, with its deadline, is written before the first link moves; then the links move and the units restart on it. A unit that does not come up puts the host back at once |
-| `confirm` | keeps the release on trial. Asked again after it was answered, the answer is the same |
+| `confirm` | keeps the release on trial, then removes the releases the host no longer keeps. `last_good` names the coordinator's last good release, which the host then keeps whatever its age. Asked again after it was answered, the answer is the same |
 | `revert` | goes back to the release that ran, now |
-| `query` | what runs, what is on trial and until when, how the last update ended, and whether another install, switch or restart is running |
+| `query` | what runs, what is on trial and until when, how the last update ended, whether another install, switch or restart is running, and the releases the host keeps |
 
 Answers: `staged` (`version`, `commit`, `current`), `switched` (`version`, `commit`,
 `deadline_unix`), `confirmed`, `reverted` (`version`, the release the host is back on, when it
-knows its text), `query` (`commit`, `version`, `node_id`, `pending`, `last`, `busy`), and
+knows its text), `query` (`commit`, `version`, `node_id`, `pending`, `last`, `busy`, and
+`releases` when the host keeps release directories), and
 `{"result":"refused","reason":CODE}` (nothing ran) or `{"result":"failed","reason":CODE}` with a
 code from a closed set: `bad_command`, `channel_not_allowed`, `config_invalid`, `config_unsafe`,
 `unknown_release`, `ambiguous_release`, `fetch_failed`, `verify_failed`, `pending`, `not_staged`,
 `nothing_pending`, `no_current`, `busy`, `stage_failed`, `switch_failed`, `revert_failed`,
 `state_unavailable`, `audit_unavailable`, `peer_not_ready`, `runtime_failed`. The detail of a refusal goes to the journal, cleaned,
 never to the line.
+
+### The releases a host keeps
+
+A host with release directories (the `installer` layout, and a Mac's kit) keeps, in `releases/`:
+the release that runs (`current`), the one before it (`previous`), every pinned release, the
+coordinator's last good release, and the `--keep-releases` newest others (by the time each was
+laid out). So going back to any of them needs no download. The rest are removed after a
+`confirm`, and only then: never while a release is on trial, and not by `install` or `switch`.
+On a Mac, the ssh path's apply removes them once the new daemon is welcomed, keeping 4 others.
+
+What must stay besides the links is in `retain.json`, beside the installer's state (Linux,
+`/var/lib/kbf-installer/retain.json`) or in the work directory (Mac): `pinned` (a list of
+commits), `last_good` (a commit) and `versions` (the version text of each release, for the
+listing). Every key is optional and an unknown one is ignored. A file that cannot be parsed
+removes nothing, since it may hold a pin.
+
+`query` lists the kept releases, newest first, as `releases`: one object per release with its
+`commit`, its `version` (null when the host does not know it) and `why` it must stay (`current`,
+`previous`, `on_trial`, `pinned`, `last_good`; left out for one of the newest others). At most 64
+are listed, and a release that must stay is always among them. `kbf-deploy host status` prints the
+same list.
+
+The agent does not send `last_good` yet: the coordinator does not carry it in its orders. Until it
+does, the coordinator's last good release is kept only as `previous`, a pin, or one of the newest
+others.
 
 ### The revert is this program's
 
