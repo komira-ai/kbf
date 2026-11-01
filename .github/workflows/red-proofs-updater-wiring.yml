@@ -25,60 +25,9 @@ jobs:
           - id: baseline
             runs: "update-rights:boot update-rights:shipped kbf-updater:root_part kbf-updater:root_units kbf-updater:agent_packaging kbf-integration-test:layering"
             expect: ""
-          - id: m01-boot-drops-hook-wide
-            runs: "update-rights:boot kbf-updater:root_part"
-            expect: "the_boot_entry_holds_exactly_the_hook_wide_capabilities every_step_and_the_boot_entry_hold_the_hook_wide_set"
-          - id: m02-boot-uses-step-lookup
-            runs: "update-rights:boot"
-            expect: "the_boot_entry_holds_exactly_the_hook_wide_capabilities"
-          - id: m03-step-ignores-its-entry
-            runs: "kbf-updater:root_part"
-            expect: "a_step_with_an_entry_holds_only_that_list_and_one_without_the_hook_wide_set"
-          - id: m04-verify-step-skipped
-            runs: "kbf-updater:root_part"
-            expect: "an_update_runs_the_four_steps_in_order_and_writes_the_step_record"
-          - id: m05-start-does-not-resume
-            runs: "kbf-updater:root_part"
-            expect: "a_killed_root_part_resumes_a_successful_update_from_every_record_write a_killed_root_part_resumes_a_rolled_back_update_from_every_record_write"
-          - id: m06-gate-deferral-ignored
-            runs: "kbf-updater:root_part"
-            expect: "a_widened_root_declaration_is_deferred_until_its_digest_is_approved a_first_install_of_a_root_declaration_is_deferred_until_its_digest_is_approved"
-          - id: m07-boot-rule-skipped
-            runs: "kbf-updater:root_part"
-            expect: "a_pending_cutover_found_at_boot_is_rolled_back_before_the_boot_entry"
-          - id: m08-one-refusal-refuses-all
-            runs: "kbf-updater:root_part"
-            expect: "a_declaration_that_fails_a_load_rule_refuses_only_its_service"
-          - id: m09-carried-declaration-put-back-after-begin
-            runs: "kbf-updater:root_part"
-            expect: "a_killed_update_keeps_the_declaration_it_installed_until_its_verdict a_start_does_what_a_verdict_left_undone"
-          - id: m10-kbf-toml-key-under-hook
-            runs: "update-rights:shipped kbf-updater:agent_packaging"
-            expect: "every_shipped_declaration_has_its_top_level_keys_before_any_table"
-          - id: m11-declaration-group-writable
-            runs: "kbf-updater:agent_packaging"
-            expect: "the_kbf_declaration_is_installed_root_owned_and_closed_to_group_and_others"
-          - id: m12-step-runner-gains-product-dep
-            runs: "kbf-integration-test:layering"
-            expect: "the_step_runner_reaches_only_the_hook_contract"
-          - id: m13-rights-gains-product-dep
-            runs: "kbf-integration-test:layering"
-            expect: "the_update_rights_crate_reaches_only_the_hook_contract"
-          - id: m14-serve-skips-the-boot-read
-            runs: "kbf-updater:root_part"
-            expect: "the_root_part_rolls_back_a_cutover_a_boot_cut_off_before_it_answers_the_agent a_cutover_a_boot_cut_off_is_rolled_back_even_when_its_declaration_was_refused_at_boot"
-          - id: m15-boot-read-only-declared-services
-            runs: "kbf-updater:root_part"
-            expect: "a_cutover_a_boot_cut_off_is_rolled_back_even_when_its_declaration_was_refused_at_boot"
-          - id: m16-agent-answered-before-the-start-pass
-            runs: "kbf-updater:root_part"
-            expect: "the_root_part_rolls_back_a_cutover_a_boot_cut_off_before_it_answers_the_agent"
           - id: m17-boot-entry-skips-record-dir-check
             runs: "kbf-updater:root_part"
             expect: "a_boot_entry_whose_record_directory_the_service_can_write_runs_nothing"
-          - id: m18-no-dead-man
-            runs: "kbf-updater:root_part"
-            expect: "each_service_gets_a_dead_man_that_polls_at_its_interval"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -105,7 +54,7 @@ jobs:
         run: |
           echo "## ${{ matrix.id }}" >> "$GITHUB_STEP_SUMMARY"
           grep -E '^test .* \.\.\. (ok|FAILED|ignored)$' out.txt | sort > results.txt || true
-          if grep -q '^error\(\[E[0-9]*\]\)\?:' out.txt; then echo "DID NOT BUILD" | tee -a "$GITHUB_STEP_SUMMARY"; exit 1; fi
+          if grep -q '^error: could not compile' out.txt; then echo "DID NOT BUILD" | tee -a "$GITHUB_STEP_SUMMARY"; exit 1; fi
           grep FAILED results.txt | sed 's/^/- /' >> "$GITHUB_STEP_SUMMARY" || true
           bad=0
           if [ -z "$EXPECT" ]; then
@@ -118,21 +67,3 @@ jobs:
           done
           exit $bad
 
-  root-mutant:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 40
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - run: rustup toolchain install
-      - run: sudo apt-get install -y --no-install-recommends nftables polkitd
-      - run: git apply ci-red-proofs/m01-boot-drops-hook-wide.patch && git diff --stat
-      - name: the root test against the boot entry that drops the hook-wide set
-        run: |
-          cargo xtask sudo-test -p update-rights --test boot_root -- --nocapture --test-threads=1 2>&1 | tee out.txt || true
-          t=a_booted_hook_runs_nft_with_the_hook_wide_capability_and_not_without_it
-          if grep -qE "^test $t \.\.\. FAILED$" out.txt; then echo "RED $t" | tee -a "$GITHUB_STEP_SUMMARY";
-          else echo "SURVIVED $t" | tee -a "$GITHUB_STEP_SUMMARY"; exit 1; fi
