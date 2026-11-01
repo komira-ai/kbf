@@ -52,8 +52,6 @@ const STORAGE: &str = "127.0.0.1:8983";
 const REQUEST_ENV: &str = "KBF_REHEARSAL_REQUEST";
 /// How long one request may take: an install downloads and verifies a release.
 const REQUEST_LIMIT: Duration = Duration::from_secs(900);
-/// What the helper logs when GitHub refuses its listing for the address's quota.
-const RATE_LIMITED: &str = "rate limited by GitHub";
 
 /// The helper's answer line, which [`speak_to_the_helper`] prints, parsed.
 fn answer(text: &str) -> Value {
@@ -128,12 +126,10 @@ fn the_helper_updates_a_hand_laid_host_from_the_last_release_to_the_next() {
         "install",
         &format!("install kbf={version} from {CHANNEL}"),
     );
-    if staged["result"] != "staged" && journal(&[HELPER_UNIT, KBF_UNIT]).contains(RATE_LIMITED) {
-        panic!(
-            "GitHub refused the helper's release listing: the quota of this hosted runner's \
-             address (or of the run's token) is over, which says nothing of the release. \
-             Re-run the job. {staged}"
-        );
+    if staged["result"] != "staged"
+        && let Some(note) = rehearsal::rate_limit_note(&journal(&[HELPER_UNIT, KBF_UNIT]))
+    {
+        panic!("{note} {staged}");
     }
     assert_eq!(staged["result"], "staged", "{staged}");
     assert_eq!(staged["commit"], new.as_str(), "{staged}");

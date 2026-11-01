@@ -27,6 +27,7 @@ thiserror.workspace = true
 time.workspace = true
 
 [dev-dependencies]
+kbf-history.workspace = true
 kbf-invocation.workspace = true
 kbf-testkit.workspace = true
 

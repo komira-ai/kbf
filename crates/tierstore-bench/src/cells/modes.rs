@@ -65,7 +65,7 @@ impl Mode {
     /// Requests per pass at `size` with `in_flight` workers; `plan` is the cell's count for the
     /// modes that follow the plan.
     #[must_use]
-    pub fn requests(&self, size: u64, in_flight: u32, plan: fn(u64, u32) -> u64) -> u64 {
+    pub fn requests(&self, size: u64, in_flight: u32, plan: impl Fn(u64, u32) -> u64) -> u64 {
         match &self.counts {
             Counts::Plan => plan(size, in_flight),
             Counts::Fixed(n) => *n,
