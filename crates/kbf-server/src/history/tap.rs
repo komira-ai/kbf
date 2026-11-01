@@ -336,7 +336,10 @@ pub(crate) fn run_record(row: &ActionRow, attempt: &Attempt) -> RunRecord {
         raised_memory_bytes: raised,
         cap_bytes: run.and_then(|r| r.cap_bytes).unwrap_or(0),
         phase_times: run
-            .map_or(PhaseTimes::Unspecified, |_| PhaseTimes::Measured)
+            .map_or(PhaseTimes::Unspecified, |r| match r.phase_times {
+                kbf_invocation::PhaseTimes::Measured => PhaseTimes::Measured,
+                kbf_invocation::PhaseTimes::TaskClaim => PhaseTimes::TaskClaim,
+            })
             .into(),
         timestamps: Some(Timestamps {
             queued_us: micros(times.queued.or(Some(first_queued))),

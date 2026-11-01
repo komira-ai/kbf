@@ -54,7 +54,11 @@ pub(crate) fn of(
         booked_memory_bytes: booked.map(|b| b.memory_bytes),
         booked_millicpus: booked.map(|b| b.cpu_millis),
         cap_bytes: None,
-        phase_times: kbf_invocation::PhaseTimes::Measured,
+        phase_times: if kbf_proto::task_claim::is_marked(m) {
+            kbf_invocation::PhaseTimes::TaskClaim
+        } else {
+            kbf_invocation::PhaseTimes::Measured
+        },
     }
 }
 

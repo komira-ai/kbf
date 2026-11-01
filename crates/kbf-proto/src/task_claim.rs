@@ -16,14 +16,21 @@ pub const TYPE_URL: &str = "type.googleapis.com/kbf.worker.v1.TaskClaimedPhases"
 
 /// Marks `metadata` as carrying a task's claim, once.
 pub fn mark(metadata: &mut ExecutedActionMetadata) {
-    let _ = (metadata, Any::default());
+    if !is_marked(metadata) {
+        metadata.auxiliary_metadata.push(Any {
+            type_url: TYPE_URL.to_owned(),
+            value: Vec::new(),
+        });
+    }
 }
 
 /// Whether `metadata` is marked as a task's claim.
 #[must_use]
 pub fn is_marked(metadata: &ExecutedActionMetadata) -> bool {
-    let _ = metadata;
-    false
+    metadata
+        .auxiliary_metadata
+        .iter()
+        .any(|any| any.type_url == TYPE_URL)
 }
 
 #[cfg(test)]

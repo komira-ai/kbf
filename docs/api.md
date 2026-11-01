@@ -2147,7 +2147,13 @@ own route; then the keys added since (none of the keys above changed):
   read: `cpu_usage_us`, `cpu_user_us`, `cpu_system_us`, `cpu_periods`,
   `cpu_throttled`, `throttled_us`, `memory_peak_bytes`; `parallelism`, CPU time over
   wall time; `numa_bytes`, `[{"node", "bytes"}]`). A key not measured is left out,
-  never zero.
+  never zero. `phase_times` says where `input_fetch`, `execution` and `output_upload` of
+  `reapi_times` came from: `measured` (a daemon's own stamps; also what a record written
+  before the field reads as) or `task_claim` (an executor run: the task claimed three
+  durations in its manifest and the frontend laid them out back to back, ending when it read
+  the task's pack). For a `task_claim` only the three durations are data; the instants, and
+  the gaps between them and the server's `worker_start` and `worker_completed`, say nothing
+  about the run. The same key is on an attempt of `/v1/runs/{id}` and of the build pages.
 
 A timed-out run's stdout and stderr (those the CAS holds) are its row's `stdout` and
 `stderr`; its `result` stays `null`, since a partial result is never stored. `/actions/{digest}` adds `outputs` (each `path`, `digest`, `executable`,

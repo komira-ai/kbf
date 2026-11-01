@@ -10,9 +10,12 @@ use std::time::{Duration, SystemTime};
 
 use kbf_pack::Timing;
 use kbf_proto::reapi::ExecutedActionMetadata;
+use kbf_proto::task_claim;
 use prost_types::Timestamp;
 
-/// The metadata the task's claim makes, or `None` when it claims nothing.
+/// The metadata the task's claim makes, or `None` when it claims nothing. It carries the mark
+/// of [`task_claim`], so a reader knows the three durations are a claim, and that the instants,
+/// and the gaps between them and the server's own times, are not data.
 ///
 /// The manifest holds durations and no instants, so the three phases are laid back to back and
 /// anchored at `end`, the time the frontend read the task's pack: the task wrote the pack
@@ -33,7 +36,7 @@ pub(super) fn claimed(timing: &Timing, end: SystemTime) -> Option<ExecutedAction
         let (input_fetch_start, input_fetch_completed) = split(fetch);
         let (execution_start, execution_completed) = split(execution);
         let (output_upload_start, output_upload_completed) = split(upload);
-        ExecutedActionMetadata {
+        let mut metadata = ExecutedActionMetadata {
             input_fetch_start_timestamp: input_fetch_start,
             input_fetch_completed_timestamp: input_fetch_completed,
             execution_start_timestamp: execution_start,
@@ -41,7 +44,9 @@ pub(super) fn claimed(timing: &Timing, end: SystemTime) -> Option<ExecutedAction
             output_upload_start_timestamp: output_upload_start,
             output_upload_completed_timestamp: output_upload_completed,
             ..ExecutedActionMetadata::default()
-        }
+        };
+        task_claim::mark(&mut metadata);
+        metadata
     })
 }
 

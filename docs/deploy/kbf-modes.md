@@ -198,15 +198,25 @@ own clock, once per pass over the host's runs, and the lease server learns a run
 agent's heartbeat, which trails the host by one or two beats: `queue`, `task` and `run` are good to a
 pass plus a heartbeat or two, not to the instant the host started or ended the run, and a run that
 starts and ends between two reads has a `run` and no `queue` or `task`. A phase that was not observed
-is absent, never zero. The task's own account of its steps (`fetch_ms`, `run_ms` and `pack_ms` of the
-manifest) is carried in the result's execution metadata as the `input_fetch`, `execution` and
-`output_upload` start and completed times, in the run history and the estimator's replay as a daemon's
-are. The manifest holds durations only, so the three are laid back to back and end at the time the
-frontend read the pack; each is as long as the task said, and none is the frontend's own measurement:
-it is a claim of the task, fine for a measurement and never for a decision. A step the task reports as
-0 ms has no timestamps. The overhead of an action is its `worker_completed - worker_start` less the
-three claimed durations, and a daemon's is its `lease_ms` less its `inputs_ms`, `run_ms` and
-`outputs_ms`.
+is absent, never zero. The task's own account of its steps (`fetch_ms`, `run_ms` and `pack_ms` of the manifest) is carried
+in the result's execution metadata as the `input_fetch`, `execution` and `output_upload` start and
+completed times, marked as a task's claim, and the run record and the read API say so with
+`phase_times: "task_claim"` (a daemon's run is `measured`, and so is a record written before the
+field). The manifest holds durations only, so the three are laid back to back and end at the time the
+frontend read the pack. For a `task_claim` run only the three durations are data, each as long as the
+task said and none the frontend's own measurement: the instants, and the gaps between them and the
+server's `worker_start` and `worker_completed`, are not (the delay from the task's end to the
+frontend's read lands before `input_fetch_start`). A claim is fine for a measurement and never for a
+decision: nothing reads it to decide, and the live estimator learns from the lease's usage block, not
+from these times. A step the task reports as 0 ms has no timestamps.
+
+One definition of per-action overhead serves both arms, on the same server-stamped span:
+`overhead = (worker_completed - worker_start) - (execution_completed - execution_start)`. Report the
+fetch (`input_fetch_completed - input_fetch_start`) and the pack (`output_upload_completed -
+output_upload_start`) durations beside it as a breakdown, labelled by `phase_times`: a daemon's are
+measured and a task's are its claim. `queue`, `task` and `run` of `kbf_executor_phase_seconds` are good
+to one executor pass plus one or two agent heartbeats, so for actions shorter than a few heartbeats
+only `run` and `ingest` are usable.
 
 A daemon reads from the packs with `--pack-read` (off by default; the `[packs]` table of
 `kbf.toml`), which needs `--pack-store-endpoint`, `--pack-store-bucket` and
