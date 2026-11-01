@@ -16,7 +16,6 @@ use crate::http::{
 };
 use crate::testutil::{OPERATOR, Rig, ci_token};
 
-/// How long a body has in the tests that are not about patience.
 mod extras;
 mod features;
 mod operator;
