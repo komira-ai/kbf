@@ -1,0 +1,1 @@
+{"image":"reg.example/kbf-task@sha256:0000000000000000000000000000000000000000000000000000000000000000","args":["--build","b1"],"limits":{"cpu_millis":4000,"memory_bytes":8589934592},"files":[{"name":"put-url","contents":"https://store.example/put?sig=abc"},{"name":"grant-token","contents":"tok-123"}]}

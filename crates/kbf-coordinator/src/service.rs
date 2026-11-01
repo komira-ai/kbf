@@ -1,22 +1,23 @@
 //! The coordinator: the fleet the heartbeats build, the desired state, and who may change
 //! or read either. No sockets here; [`crate::http`] maps requests onto these calls.
 
+use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use kbf_oidc::{Refusal, Verified, Verifier};
-use kbf_updater::wire::{Heartbeat, Reply, ServiceReply};
+use kbf_updater::wire::{Answer, Heartbeat, Reply, ServiceReply};
 use serde::Serialize;
 use subtle::ConstantTimeEq;
 
-use crate::converge::{Convergence, RoleCounts, converge, converge_service, role_counts};
-use crate::decide::decide_in;
+use crate::converge::{Convergence, RoleCounts, converge_kbf, converge_service, role_counts};
+use crate::decide::{Decision, Hold, decide_in, decide_why};
 use crate::desired::{Desired, DesiredError, DesiredStore, KBF, StoreError};
-use crate::fleet::Fleet;
+use crate::fleet::{Fleet, Host};
 use crate::identity::Identity;
-use crate::services::Services;
+use crate::services::{ServiceDef, Services};
 
 /// The time since the coordinator started.
 pub type Clock = Arc<dyn Fn() -> Duration + Send + Sync>;
@@ -91,6 +92,18 @@ pub struct HostStatus {
     pub beat: Heartbeat,
 }
 
+/// One host in the status of a service: the host as that service sees it, and why it is
+/// not ordered.
+#[derive(Debug, Serialize)]
+pub struct ServiceHostStatus {
+    /// The host, with `up` and `holds_slot` counted for the service.
+    #[serde(flatten)]
+    pub host: HostStatus,
+    /// The rule that holds an order for the service back at this moment, or `None` when the
+    /// host would be ordered at its next heartbeat.
+    pub hold: Option<Hold>,
+}
+
 /// One service in the status.
 #[derive(Debug, Serialize)]
 pub struct ServiceStatus {
@@ -98,6 +111,14 @@ pub struct ServiceStatus {
     pub desired: Option<Desired>,
     /// The counts of every role that has a host heartbeating the service, in role order.
     pub roles: Vec<RoleCounts>,
+    /// Every host that heartbeated the service, by node id.
+    pub hosts: Vec<ServiceHostStatus>,
+    /// How many of `hosts` are up for the service.
+    pub up: usize,
+    /// How many of `hosts` hold one of the service's update slots.
+    pub slots_held: usize,
+    /// What `GET /v1/convergence` answers for the service.
+    pub convergence: Convergence,
 }
 
 /// Why the convergence was not read.
@@ -109,6 +130,18 @@ pub enum ConvergenceError {
     /// The coordinator manages no such service.
     #[error("no such service")]
     UnknownService,
+}
+
+/// What `POST /v1/desired` answers: the state as stored, and, only when there are any, the
+/// roles whose limits were dropped because the service does not have them.
+#[derive(Debug, Serialize)]
+pub struct Set {
+    /// The state as stored.
+    #[serde(flatten)]
+    pub desired: Desired,
+    /// The dropped roles, sorted.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub dropped_roles: Vec<String>,
 }
 
 /// What an operator reads.
@@ -125,12 +158,20 @@ pub struct Status {
     pub services_dropped: u64,
     /// Every host heard from since the coordinator started, by node id.
     pub hosts: Vec<HostStatus>,
-    /// Every service the coordinator manages, `kbf` included, by name: its desired state and
-    /// the counts of its hosts per role.
+    /// Every service the coordinator manages, `kbf` included, by name: its desired state, the
+    /// counts of its hosts per role, its hosts, and its convergence.
     pub per_service: BTreeMap<String, ServiceStatus>,
     /// The commit this coordinator was built from ([`crate::BUILD_COMMIT`]).
     pub commit: &'static str,
 }
+
+/// The features this coordinator advertises to an agent that announces `agent_features`.
+///
+/// Each name is added in the change that implements what it names (`deferred-v1` here;
+/// `heartbeat-v2` and `halt-v1` follow), so a name is never advertised for behaviour that is
+/// not there. `deferred-v1`: a heartbeat's `deferred` report ends the order, holds no slot and
+/// backs the host off ([`crate::defer`]).
+pub const FEATURES: &[&str] = &["deferred-v1"];
 
 /// The coordinator.
 pub struct Coordinator {
@@ -141,6 +182,7 @@ pub struct Coordinator {
     operator_token: String,
     clock: Clock,
     services_dropped: AtomicU64,
+    features: Vec<String>,
 }
 
 impl std::fmt::Debug for Coordinator {
@@ -168,6 +210,7 @@ impl Coordinator {
             operator_token,
             clock,
             services_dropped: AtomicU64::new(0),
+            features: FEATURES.iter().map(|name| (*name).to_owned()).collect(),
         }
     }
 
@@ -176,6 +219,20 @@ impl Coordinator {
     pub fn with_services(mut self, services: Services) -> Self {
         self.services = services;
         self
+    }
+
+    /// The same coordinator advertising `features` instead of [`FEATURES`].
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_features(mut self, features: &[&str]) -> Self {
+        self.features = features.iter().map(|name| (*name).to_owned()).collect();
+        self
+    }
+
+    /// Logs a heartbeat from `who` of which an optional fact was bad and was dropped (`why`
+    /// is the reader's reason): the heartbeat is still answered, without that fact.
+    pub fn note_extras_dropped(&self, who: &Identity, why: &str) {
+        tracing::warn!(node_id = %who.node_id, why, "dropped optional fields of a heartbeat");
     }
 
     /// Counts and logs a heartbeat from `who` whose `services` list was bad and was dropped
@@ -190,11 +247,27 @@ impl Coordinator {
     ///
     /// The top-level fields are `kbf`. Each entry of `services` is noted as that service's
     /// heartbeat of the host, if the coordinator manages the service and runs it on the
-    /// host's role (any other entry is ignored). `kbf` is decided first, then the host's
-    /// services in the order it listed them, and the first order is the reply: one update
-    /// per reply. A host that sent no `services` is answered about `kbf` alone, in the
-    /// shape it has always read.
-    pub fn heartbeat(&self, who: Identity, beat: Heartbeat) -> ServiceReply {
+    /// host's role (any other entry is ignored). The services are decided by priority, the
+    /// highest first ([`crate::services::ServiceDef::priority`], 0 unless a definition sets
+    /// it); services of one priority go `kbf` first, then in the order the host listed them.
+    /// The first order is the reply: one update per reply. A host that sent no `services` is
+    /// answered about `kbf` alone, in the shape it has always read.
+    pub fn heartbeat(&self, who: Identity, beat: Heartbeat) -> Answer {
+        let asked = beat.agent_features.clone();
+        let reply = self.reply_to(who, beat);
+        // Only an agent that announced features gets `features`: an older agent reads the
+        // reply strictly and refuses a field it does not know.
+        let features = (!asked.is_empty()).then(|| {
+            self.features
+                .iter()
+                .filter(|name| asked.contains(name))
+                .cloned()
+                .collect()
+        });
+        Answer { reply, features }
+    }
+
+    fn reply_to(&self, who: Identity, beat: Heartbeat) -> ServiceReply {
         let now = (self.clock)();
         let mut fleet = self.fleet.lock().unwrap_or_else(PoisonError::into_inner);
         let announced = beat.services.clone().unwrap_or_default();
@@ -216,7 +289,11 @@ impl Coordinator {
             }
         }
         let desired = self.desired.all();
-        let names = std::iter::once(KBF).chain(announced.iter().map(|one| one.name.as_str()));
+        let mut names: Vec<&str> = std::iter::once(KBF)
+            .chain(announced.iter().map(|one| one.name.as_str()))
+            .collect();
+        // Stable: services of one priority keep the order above.
+        names.sort_by_key(|name| Reverse(self.services.get(name).map_or(0, |def| def.priority)));
         for name in names {
             let reply = decide_in(&self.services, &desired, name, &fleet, &who.node_id, now);
             if let Reply::Update { version } = reply {
@@ -253,8 +330,25 @@ impl Coordinator {
         bearer: Option<&str>,
         body: &[u8],
     ) -> Result<Desired, SetError> {
+        self.set_desired_noting(bearer, body)
+            .await
+            .map(|set| set.desired)
+    }
+
+    /// [`Self::set_desired`], also naming the roles whose limits the body carried and the
+    /// service does not have: they are dropped, not refused, since one body serves every
+    /// service.
+    ///
+    /// # Errors
+    /// [`SetError`].
+    pub async fn set_desired_noting(
+        &self,
+        bearer: Option<&str>,
+        body: &[u8],
+    ) -> Result<Set, SetError> {
         let verified = self.ci(bearer).await?;
-        let (service, desired) = Desired::parse_request_for(body, &self.services)?;
+        let (service, desired, dropped_roles) =
+            Desired::parse_request_noting(body, &self.services)?;
         if !verified.services.contains(&service) {
             tracing::warn!(
                 workflow = %verified.job_workflow_ref,
@@ -270,7 +364,10 @@ impl Coordinator {
             %service,
             "desired state set by CI"
         );
-        Ok(desired)
+        Ok(Set {
+            desired,
+            dropped_roles,
+        })
     }
 
     /// The status, if `bearer` is the operator token.
@@ -286,23 +383,37 @@ impl Coordinator {
         let fleet = self.fleet.lock().unwrap_or_else(PoisonError::into_inner);
         let hosts = fleet
             .hosts()
-            .map(|(id, host)| HostStatus {
-                node_id: id.to_string(),
-                role: host.role_name().to_owned(),
-                live: host.is_live(now),
-                up: fleet.is_up(KBF, id, host, now),
-                holds_slot: fleet.holds_slot(KBF, id, host, now),
-                silent_secs: now.saturating_sub(host.seen).as_secs(),
-                beat: host.beat.clone(),
-            })
+            .map(|(id, host)| host_status(&fleet, KBF, id, host, now))
             .collect();
+        let all = self.desired.all();
         let per_service = self
             .services
             .defs()
             .map(|def| {
                 let desired = self.desired.get(&def.name);
                 let roles = role_counts(def, desired.as_ref(), &fleet, now);
-                (def.name.clone(), ServiceStatus { desired, roles })
+                let hosts: Vec<ServiceHostStatus> = fleet
+                    .hosts_of(&def.name)
+                    .map(|(id, host)| ServiceHostStatus {
+                        host: host_status(&fleet, &def.name, id, host, now),
+                        hold: match decide_why(&self.services, &all, &def.name, &fleet, id, now) {
+                            Decision::Update { .. } => None,
+                            Decision::Hold(why) => Some(why),
+                        },
+                    })
+                    .collect();
+                let up = hosts.iter().filter(|h| h.host.up).count();
+                let slots_held = hosts.iter().filter(|h| h.host.holds_slot).count();
+                let convergence = convergence_of(def, desired.as_ref(), &fleet, now);
+                let status = ServiceStatus {
+                    desired,
+                    roles,
+                    hosts,
+                    up,
+                    slots_held,
+                    convergence,
+                };
+                (def.name.clone(), status)
             })
             .collect();
         Ok(Status {
@@ -336,10 +447,42 @@ impl Coordinator {
         let now = (self.clock)();
         let fleet = self.fleet.lock().unwrap_or_else(PoisonError::into_inner);
         let desired = self.desired.get(service);
-        Ok(if service == KBF {
-            converge(desired.as_ref(), &fleet, now)
-        } else {
-            converge_service(def, desired.as_ref(), &fleet, now)
-        })
+        Ok(convergence_of(def, desired.as_ref(), &fleet, now))
+    }
+}
+
+/// The host `id` as the status shows it for `service`: whether it is up and holds a slot
+/// counted for that service.
+fn host_status(
+    fleet: &Fleet,
+    service: &str,
+    id: &kbf_types::NodeId,
+    host: &Host,
+    now: Duration,
+) -> HostStatus {
+    HostStatus {
+        node_id: id.to_string(),
+        role: host.role_name().to_owned(),
+        live: host.is_live(now),
+        up: fleet.is_up(service, id, host, now),
+        holds_slot: fleet.holds_slot(service, id, host, now),
+        silent_secs: now.saturating_sub(host.seen).as_secs(),
+        beat: host.beat.clone(),
+    }
+}
+
+/// Where the hosts of `def` stand: the one answer both `GET /v1/convergence` and the status
+/// give. `kbf` is counted with the minimums of its desired state, as it always has been; any
+/// other service with what its definition requires of each role.
+fn convergence_of(
+    def: &ServiceDef,
+    desired: Option<&Desired>,
+    fleet: &Fleet,
+    now: Duration,
+) -> Convergence {
+    if def.name == KBF {
+        converge_kbf(def, desired, fleet, now)
+    } else {
+        converge_service(def, desired, fleet, now)
     }
 }

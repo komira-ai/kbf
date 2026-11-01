@@ -5,7 +5,7 @@ use super::*;
 
 const LINT_JOB: &str = "  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo\n";
 
-const LEGACY_ARGS: &str = "--workspace --features tierstore/s3";
+const LEGACY_ARGS: &str = "--workspace";
 const JS_ARGS: &str = "-p kbf-server --features kbf-server/farm-core-js";
 
 fn entry(core: &str, part: usize, parts: usize, args: &str) -> String {
@@ -42,7 +42,7 @@ fn shard_job(matrix: &str) -> String {
 }
 
 const GATE_HEAD: &str = "  test:\n    runs-on: ubuntu-latest\n    permissions:\n      contents: read\n      actions: read\n    steps:\n";
-const BUILD_LEGACY: &str = "      - run: cargo llvm-cov nextest --workspace --features tierstore/s3 --locked --branch --no-report --profile pr -E 'none()' --no-tests=pass\n";
+const BUILD_LEGACY: &str = "      - run: cargo llvm-cov nextest --workspace --locked --branch --no-report --profile pr -E 'none()' --no-tests=pass\n";
 const BUILD_JS: &str = "      - run: cargo llvm-cov nextest -p kbf-server --features kbf-server/farm-core-js --locked --branch --no-report --profile pr -E 'none()' --no-tests=pass\n";
 const CLEAN: &str = "      - run: cargo llvm-cov clean --profraw-only\n";
 const WAIT: &str = "      - run: cargo xtask wait-artifacts --repo r --run-id 1 --job-prefix test-shard --artifact \"profraw-legacy-1=(legacy-1-of-2)\" --artifact \"profraw-legacy-2=(legacy-2-of-2)\" --artifact \"profraw-js-1=(js-1-of-1)\"\n";
@@ -125,7 +125,10 @@ fn each_drift_of_the_partition_is_refused() {
             "the `legacy` entries do not all say `parts: 2`, so their parts are of different splits",
         ),
         (
-            legacy_only(&format!("{l1}{}{js}", entry("legacy", 2, 2, "--workspace"))),
+            legacy_only(&format!(
+                "{l1}{}{js}",
+                entry("legacy", 2, 2, "--workspace --exclude kbf-front")
+            )),
             "the `legacy` entries do not run the same packages (`args`), so the parts are not parts of one set of tests",
         ),
         (
@@ -448,7 +451,7 @@ fn each_drift_of_the_gate_is_refused() {
     let cases = [
         (
             without(0),
-            "the job `test` has no step that builds the instrumented tests of the `legacy` core (`llvm-cov nextest --workspace --features tierstore/s3 ... --no-tests=pass`)",
+            "the job `test` has no step that builds the instrumented tests of the `legacy` core (`llvm-cov nextest --workspace ... --no-tests=pass`)",
         ),
         (
             without(1),

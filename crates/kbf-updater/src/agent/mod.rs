@@ -59,6 +59,6 @@ mod run_tests;
 #[cfg(test)]
 mod service_tests;
 #[cfg(test)]
-mod testing;
+pub(crate) mod testing;
 #[cfg(test)]
 mod update_tests;
