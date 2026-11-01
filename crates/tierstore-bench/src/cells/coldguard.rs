@@ -1,29 +1,56 @@
-//! The cold store guard: a run stops when the cold store itself is in trouble.
+//! The cold store guard: a run stops when the cold store is in trouble or something other than
+//! the harness is using it.
 //!
-//! The load gate ([`crate::gate`]) sees this machine only. The guard sees the store: it keeps the
-//! harness's own requests to the cold role over a sliding window (60 s unless set) and trips when
+//! The load gate ([`crate::gate`]) sees this machine only. The guard sees the store. It stops the
+//! run on
 //!
-//! - the p99 latency of the window is over `--cold-abort-p99-ms` (2,000 ms), or
-//! - the share of the window's requests that failed or timed out is over
-//!   `--cold-abort-error-share` (0.05).
+//! - **requests from elsewhere**: over each pass the store's S3 request counter grows by the
+//!   requests it received; the harness knows how many it sent (the request log counts every
+//!   request to the cold role); the difference is the requests that came from elsewhere, and a
+//!   pass with more of them than `--cold-abort-foreign-requests` (10) trips;
+//! - **the store's health**: a drive that is not `ok`, a store with no drive listed, or a store
+//!   that is healing, at the start of the run and at the end of every pass;
+//! - **the error share**: the share of the sliding window's requests (60 s unless set) that failed
+//!   or timed out is over `--cold-abort-error-share` (0.05);
+//! - **a hung store**, as a backstop: the p99 latency of the window is over `--cold-abort-p99-ms`
+//!   (30,000 ms).
+//!
+//! The harness's own latency is not guarded. For a small write on an erasure-coded set of hard
+//! disks it is the quantity a cell measures, and a limit on it stops a measurement when the store
+//! is quiet and merely slow. The backstop is for a store that has stopped answering.
 //!
 //! A trip ends the pass and the run, the way a trip of the load gate does (the passes so far are
-//! written first), and is recorded in the result ([`crate::result::PassResult::cold_guard`]).
+//! written first), and is recorded in the result ([`crate::result::PassResult::cold_guard`]); the
+//! readings of every window are recorded as well ([`crate::result::PassResult::cold_window`]).
 //!
 //! Rules:
 //! - Equal to a limit is within it, as in the load gate.
-//! - A window with fewer than [`MIN_REQUESTS`] requests trips nothing: one failure in two
-//!   requests is not a share, and the p99 of a handful is the slowest of them.
+//! - Windows are chained: the window of a pass runs from the reading that ended the pass before
+//!   (or the first reading of the run) to the reading after its requests and its hook, so every
+//!   request of the harness to the cold role between the two readings, setup and cleanup
+//!   included, is in the harness's count.
+//! - A counter that cannot be read trips (`unreadable`) and a counter that went backwards (the
+//!   store restarted) trips (`counter`): a window that cannot be shown to be quiet is not taken
+//!   for one. Fewer requests at the store than the harness sent (a refused connection never
+//!   reaches it) is no foreign load, not a negative one.
+//! - Requests from elsewhere are judged only where the harness can tell them from the
+//!   instance's own: not for a pass whose requests went to another role than the cold one (an
+//!   instance arm: its copies to the cold store are its own), nor for an arm through the fault
+//!   proxy, nor for the window after such a pass (the copies go on). Those windows are recorded
+//!   with `judged` false.
+//! - A window with fewer than [`MIN_REQUESTS`] requests trips nothing on the error share or the
+//!   backstop: one failure in two requests is not a share, and the p99 of a handful is the
+//!   slowest of them.
 //! - A request that failed counts in the share and, with the time it took to fail, in the p99: a
 //!   store that hangs until the timeout is slow as well as failing.
 //! - The window counts one entry per request: the step of the whole request. The step that
 //!   carries a second quantity of a request (the `.ttfb` of a streamed read, which only a request
 //!   that succeeded has) is not an entry, or a read that succeeded would count twice and one that
 //!   failed once.
-//! - Only requests the harness sent to the cold role count; the arms that put the cold store in a
-//!   fault on purpose (through the fault proxy) are not shown to the guard.
-//! - The guard is pure: it is given the instant of every request and of every check, so a test
-//!   moves time by hand.
+//! - Only requests the harness sent to the cold role count in the sliding window; the arms that
+//!   put the cold store in a fault on purpose (through the fault proxy) are not shown to it.
+//! - The guard is pure: it is given the instant of every request and of every check and the
+//!   readings of the store, so a test moves time and the counter by hand.
 
 use std::collections::VecDeque;
 use std::time::Duration;
@@ -32,7 +59,7 @@ use tokio::time::Instant;
 
 use crate::cells::stats;
 use crate::coldstate::ColdReading;
-use crate::result::{ColdTrip, ColdWindow};
+use crate::result::{ColdState, ColdTrip, ColdWindow};
 
 /// Fewer requests than this in the window and the guard does not judge.
 pub const MIN_REQUESTS: usize = 20;
@@ -69,19 +96,35 @@ struct Seen {
     failed: bool,
 }
 
-/// The window of cold requests.
+/// What was read at one end of a window.
+#[derive(Clone, Copy)]
+struct Mark {
+    /// The store's S3 request counter.
+    s3_requests: u64,
+    /// The harness's own count of requests to the cold role.
+    own_requests: u64,
+}
+
+/// The guard: the window of the harness's own cold requests, and the chain of windows between
+/// readings of the store.
 pub struct ColdGuard {
     limits: ColdGuardLimits,
     window: VecDeque<Seen>,
+    baseline: Option<Mark>,
+    /// Whether the window that ended at the last reading could be judged; the one after it
+    /// cannot be if it could not (an instance's copies go on after its pass).
+    prev_judgeable: bool,
 }
 
 impl ColdGuard {
-    /// A guard with an empty window.
+    /// A guard with an empty window and no reading.
     #[must_use]
     pub fn new(limits: ColdGuardLimits) -> Self {
         Self {
             limits,
             window: VecDeque::new(),
+            baseline: None,
+            prev_judgeable: true,
         }
     }
 
@@ -98,7 +141,53 @@ impl ColdGuard {
     /// [`ColdGuard::close`] took its place.
     #[must_use]
     pub fn has_baseline(&self) -> bool {
-        todo!("whether a first reading is held")
+        self.baseline.is_some()
+    }
+
+    /// A trip of `metric` with the guard's own window numbers.
+    fn trip(&self, metric: &str, value: f64, limit: f64, detail: Option<String>) -> ColdTrip {
+        ColdTrip {
+            metric: metric.to_owned(),
+            value,
+            limit,
+            requests: self.window.len() as u64,
+            window_secs: self.limits.window.as_secs(),
+            detail,
+        }
+    }
+
+    /// The trip of a store that could not be read.
+    fn unreadable(&self, why: &str) -> ColdTrip {
+        let detail =
+            format!("the store could not be read, so the pass cannot be shown quiet: {why}");
+        self.trip("unreadable", 0.0, 0.0, Some(detail))
+    }
+
+    /// The trip of a store whose drives are not all `ok`, or that is healing, if it is one.
+    fn unhealthy(&self, state: &ColdState) -> Option<ColdTrip> {
+        let listed = state.drives.len();
+        let bad: Vec<&str> = state
+            .drives
+            .iter()
+            .filter(|drive| drive.state != "ok")
+            .map(|drive| drive.state.as_str())
+            .collect();
+        if listed == 0 {
+            let detail = "the store lists no drive, so they cannot be shown to be ok";
+            return Some(self.trip("drives", 0.0, 0.0, Some(detail.to_owned())));
+        }
+        if !bad.is_empty() {
+            let detail = format!("{} of {listed} drives are not ok: {bad:?}", bad.len());
+            return Some(self.trip("drives", bad.len() as f64, 0.0, Some(detail)));
+        }
+        let healing = state.drives.iter().filter(|drive| drive.healing).count();
+        state.healing.then(|| {
+            let detail = format!(
+                "the store is healing ({healing} drives report it; percent done {:?})",
+                state.percent_done
+            );
+            self.trip("healing", healing.max(1) as f64, 0.0, Some(detail))
+        })
     }
 
     /// Takes the first reading of the chain of windows (the counters at its start), and refuses a
@@ -108,10 +197,18 @@ impl ColdGuard {
     /// [`ColdTrip`] if the reading failed or the store's drives are not all `ok`, or it is healing.
     pub fn open(
         &mut self,
-        _reading: Result<ColdReading, String>,
-        _own_requests: u64,
+        reading: Result<ColdReading, String>,
+        own_requests: u64,
     ) -> Result<(), ColdTrip> {
-        todo!("the first reading")
+        let reading = reading.map_err(|why| self.unreadable(&why))?;
+        if let Some(trip) = self.unhealthy(&reading.state) {
+            return Err(trip);
+        }
+        self.baseline = Some(Mark {
+            s3_requests: reading.s3_requests,
+            own_requests,
+        });
+        Ok(())
     }
 
     /// Ends the window that began at the last reading and begins the next at this one.
@@ -122,11 +219,55 @@ impl ColdGuard {
     /// is not healthy or the requests from elsewhere are over the limit.
     pub fn close(
         &mut self,
-        _reading: Result<ColdReading, String>,
-        _own_requests: u64,
-        _judgeable: bool,
+        reading: Result<ColdReading, String>,
+        own_requests: u64,
+        judgeable: bool,
     ) -> (Option<ColdWindow>, Option<ColdTrip>) {
-        todo!("the end of a window")
+        let reading = match reading {
+            Ok(reading) => reading,
+            Err(why) => return (None, Some(self.unreadable(&why))),
+        };
+        let now = Mark {
+            s3_requests: reading.s3_requests,
+            own_requests,
+        };
+        let Some(base) = self.baseline.replace(now) else {
+            return (None, self.unhealthy(&reading.state));
+        };
+        let judged = judgeable && self.prev_judgeable;
+        self.prev_judgeable = judgeable;
+        let Some(minio_requests) = now.s3_requests.checked_sub(base.s3_requests) else {
+            let detail = format!(
+                "the store's S3 request counter went from {} to {} (a restart?), so the pass cannot be shown quiet",
+                base.s3_requests, now.s3_requests
+            );
+            return (None, Some(self.trip("counter", 0.0, 0.0, Some(detail))));
+        };
+        // A request that never reached the store (a refused connection) is in the harness's count
+        // and not the store's: foreign load is never negative.
+        let sent = now.own_requests.saturating_sub(base.own_requests);
+        let foreign = minio_requests.saturating_sub(sent);
+        let drives = &reading.state.drives;
+        let window = ColdWindow {
+            minio_requests,
+            own_requests: sent,
+            foreign_requests: foreign,
+            judged,
+            drives: u32::try_from(drives.len()).unwrap_or(u32::MAX),
+            drives_not_ok: u32::try_from(drives.iter().filter(|d| d.state != "ok").count())
+                .unwrap_or(u32::MAX),
+            healing: reading.state.healing,
+        };
+        let limit = self.limits.max_foreign_requests;
+        let trip = self.unhealthy(&reading.state).or_else(|| {
+            (judged && foreign > limit).then(|| {
+                let detail = format!(
+                    "the store counted {minio_requests} S3 requests over the pass and this tool sent {sent}, so {foreign} came from elsewhere"
+                );
+                self.trip("foreign_requests", foreign as f64, limit as f64, Some(detail))
+            })
+        });
+        (Some(window), trip)
     }
 
     /// Judges the window as it stands at `now`: the requests older than the window are dropped,
@@ -148,27 +289,24 @@ impl ColdGuard {
         if requests < MIN_REQUESTS {
             return Ok(());
         }
-        let trip = |metric: &str, value: f64, limit: f64| ColdTrip {
-            metric: metric.to_owned(),
-            value,
-            limit,
-            requests: requests as u64,
-            window_secs: window.as_secs(),
-            detail: None,
-        };
         let failed = self.window.iter().filter(|seen| seen.failed).count();
         let share = failed as f64 / requests as f64;
         if share > self.limits.max_error_share {
-            return Err(trip("error_share", share, self.limits.max_error_share));
+            return Err(self.trip("error_share", share, self.limits.max_error_share, None));
         }
         let mut latencies: Vec<u64> = self.window.iter().map(|seen| seen.latency_us).collect();
         let p99_us = stats::summarise(&mut latencies).map_or(0, |s| s.p99);
         let limit_us = self.limits.max_p99_ms.saturating_mul(1_000);
         if p99_us > limit_us {
-            return Err(trip(
+            let detail = format!(
+                "the hung-store backstop: the p99 of the {requests} requests this tool sent over the last {} s",
+                window.as_secs()
+            );
+            return Err(self.trip(
                 "p99_ms",
                 p99_us as f64 / 1_000.0,
                 self.limits.max_p99_ms as f64,
+                Some(detail),
             ));
         }
         Ok(())

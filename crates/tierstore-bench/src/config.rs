@@ -250,7 +250,7 @@ pub struct ConfigArgs {
     /// bench's own latency is what a cell measures, so this is not a health limit: 30 s is a
     /// store that has stopped answering. What the guard judges is the load from elsewhere
     /// (`--cold-abort-foreign-requests`) and the drives.
-    #[arg(long, default_value_t = 2000, value_parser = clap::value_parser!(u64).range(1..))]
+    #[arg(long, default_value_t = 30_000, value_parser = clap::value_parser!(u64).range(1..))]
     pub cold_abort_p99_ms: u64,
     /// Cold store guard: the run stops when a pass saw more than this many requests at the cold
     /// store that this tool did not send (the store's S3 request counter less the tool's own

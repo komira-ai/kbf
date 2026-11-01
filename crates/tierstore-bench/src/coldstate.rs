@@ -276,8 +276,32 @@ impl ColdMeter for OpsColdMeter {
 /// [`BenchError::Ops`] if the text says nothing of the counter: no such series (an unreadable
 /// counter is not a quiet store), or a value that is not a count.
 pub fn s3_requests_total(text: &str) -> Result<u64, BenchError> {
-    let _ = text;
-    todo!("the sum of the minio_s3_requests_total series")
+    const SERIES: &str = "minio_s3_requests_total";
+    let bad = |what: &str| BenchError::Ops(format!("the metrics have no usable {SERIES}: {what}"));
+    let mut total = 0u64;
+    let mut found = false;
+    for line in text.lines() {
+        // The name, then labels or a space: `minio_s3_requests_total_other` is another series.
+        let Some(rest) = line.strip_prefix(SERIES) else {
+            continue;
+        };
+        if !rest.starts_with(['{', ' ']) {
+            continue;
+        }
+        let value = rest.rsplit(' ').next().unwrap_or_default();
+        let count: f64 = value.parse().map_err(|_| bad("a value is not a number"))?;
+        if !count.is_finite() || count < 0.0 {
+            return Err(bad("a value is not a count"));
+        }
+        // A counter is far below 2^53, where f64 holds every integer.
+        total = total.saturating_add(count as u64);
+        found = true;
+    }
+    if found {
+        Ok(total)
+    } else {
+        Err(bad("no such series"))
+    }
 }
 
 fn unreadable(why: &str) -> BenchError {

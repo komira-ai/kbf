@@ -231,9 +231,17 @@ impl std::fmt::Display for ColdTrip {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "cold store guard: {} is {}, over the limit {} (over {} requests of the last {} s)",
-            self.metric, self.value, self.limit, self.requests, self.window_secs
-        )
+            "cold store guard: {} is {}, over the limit {}",
+            self.metric, self.value, self.limit
+        )?;
+        match &self.detail {
+            Some(detail) => write!(f, ": {detail}"),
+            None => write!(
+                f,
+                " (over {} requests of the last {} s)",
+                self.requests, self.window_secs
+            ),
+        }
     }
 }
 

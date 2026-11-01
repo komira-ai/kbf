@@ -89,6 +89,9 @@ impl RequestLog {
             .and_then(|()| sink.flush())
             .map_err(BenchError::Log)?;
         self.count.fetch_add(1, Ordering::Relaxed);
+        if record.role == Role::Cold {
+            self.cold.fetch_add(1, Ordering::Relaxed);
+        }
         Ok(())
     }
 

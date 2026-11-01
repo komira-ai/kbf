@@ -554,6 +554,23 @@ fn format_report(results: &[CellResult], rows: &Rows) -> String {
                     .expect("a string takes text");
                 }
             }
+            for pass in result.passes.iter() {
+                if let Some(w) = &pass.cold_window {
+                    writeln!(
+                        out,
+                        "- arm {name}: pass {} cold window: store counted {} S3 requests, this tool sent {}, {} from elsewhere (judged: {}); drives {}, not ok {}; healing: {}",
+                        pass.pass,
+                        w.minio_requests,
+                        w.own_requests,
+                        w.foreign_requests,
+                        w.judged,
+                        w.drives,
+                        w.drives_not_ok,
+                        w.healing
+                    )
+                    .expect("a string takes text");
+                }
+            }
             for note in result.notes.iter().filter(|n| n.starts_with("pass ")) {
                 writeln!(out, "- arm {name}: {note}").expect("a string takes text");
             }
