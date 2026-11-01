@@ -342,6 +342,17 @@ pub enum Writeback {
     },
 }
 
+impl Writeback {
+    /// The KiB still pending when the cap came first, none when the memory drained.
+    #[must_use]
+    pub const fn unsettled_kib(self) -> Option<u64> {
+        match self {
+            Self::Drained => None,
+            Self::Unsettled { kib } => Some(kib),
+        }
+    }
+}
+
 /// Waits until the memory not yet written to disk (`Dirty` plus `Writeback`) is under `below_kib`,
 /// or until `cap_ms` have passed since `start_ms`; [`Writeback::Drained`] if it drained,
 /// [`Writeback::Unsettled`] with the figure at the last read if the cap came first, and the
@@ -369,8 +380,7 @@ pub fn wait_for_writeback(
             return Ok(Writeback::Drained);
         }
         if poll().saturating_sub(start_ms) >= cap_ms {
-            // Stub of the scaffold: the figure is not carried yet.
-            return Ok(Writeback::Unsettled { kib: 0 });
+            return Ok(Writeback::Unsettled { kib: pending });
         }
     }
 }
@@ -757,6 +767,8 @@ mod tests {
         })
         .unwrap();
         assert_eq!(drained, Writeback::Unsettled { kib: 90_000 });
+        assert_eq!(drained.unsettled_kib(), Some(90_000));
+        assert_eq!(Writeback::Drained.unsettled_kib(), None);
         assert_eq!(polls, 5);
         meminfo(&proc_root, 0, 0);
         let drained = wait_for_writeback(&proc_root, 4_096, 45_000, 0, || unreachable!()).unwrap();

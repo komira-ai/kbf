@@ -240,7 +240,7 @@ only, as the load average carries the run's own requests and fsyncs; the pressur
 keep their names and are the ten-second averages at preflight and the window before a pass.
 Inside a pass nothing is judged: every few completions the stall and disk time since the previous
 reading are read and the result of the pass holds the count and the peak of each (`pass_load`),
-which include the pass's own load. With the load average out, the gap between passes sees disk
+which include the pass's own load; a pass whose window opened with the writeback wait at its cap says so there (`writeback_settled: false`, with the bytes still pending) and in the report. With the load average out, the gap between passes sees disk
 time and CPU and IO stall time only: a co-tenant on idle cores, or contention for memory
 bandwidth, is not seen. A cell is refused before it sends anything when
 its cold bytes are over the pass, cell or campaign cap, requests are held to the rate caps, and

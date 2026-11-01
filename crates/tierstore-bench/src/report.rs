@@ -452,6 +452,18 @@ fn recorded_lines(name: &str, result: &CellResult) -> Vec<String> {
             each.join("; ")
         ));
     }
+    for pass in &measured {
+        if let Some(bytes) = pass
+            .pass_load
+            .filter(|load| !load.writeback_settled)
+            .and_then(|load| load.writeback_pending_bytes)
+        {
+            lines.push(format!(
+                "- arm {name}: pass {} was measured on unsettled writeback: {bytes} bytes were still dirty or being written when the wait for the disks gave up",
+                pass.pass
+            ));
+        }
+    }
     let peak = measured.iter().map(|p| p.peak_in_flight).max().unwrap_or(0);
     if peak > 0 {
         lines.push(format!(

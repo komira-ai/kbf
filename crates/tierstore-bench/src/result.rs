@@ -275,7 +275,8 @@ pub struct PassResult {
     #[serde(default)]
     pub peak_in_flight: u32,
     /// What the machine that sends the requests looked like while the pass ran: the readings
-    /// taken inside it. Recorded, never a reason to stop the pass; `None` when none was taken.
+    /// taken inside it, and whether the disks had drained when its window opened. Recorded,
+    /// never a reason to stop the pass; absent in results written before it existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pass_load: Option<PassLoad>,
 }
@@ -301,6 +302,21 @@ pub struct PassLoad {
     /// when it did not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub writeback_pending_bytes: Option<u64>,
+}
+
+impl PassLoad {
+    /// No reading yet, and writeback settled.
+    #[must_use]
+    pub const fn none() -> Self {
+        Self {
+            readings: 0,
+            peak_psi_cpu_pct: 0.0,
+            peak_psi_io_pct: 0.0,
+            peak_disk_util_pct: 0.0,
+            writeback_settled: true,
+            writeback_pending_bytes: None,
+        }
+    }
 }
 
 /// The default of [`PassLoad::writeback_settled`].

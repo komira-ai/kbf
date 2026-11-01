@@ -160,13 +160,19 @@ pub struct QuietGate {
 }
 
 /// The reading that a blocking thread gave back. A source that panicked panics the run, as it
-/// would had it read in place (stub of the scaffold: a cancelled thread panics here too).
+/// would had it read in place; a thread that was cancelled (the runtime shutting down) has no
+/// panic to give, and is an error.
 fn read_joined(
     joined: Result<Result<QuietSample, BenchError>, tokio::task::JoinError>,
 ) -> Result<QuietSample, BenchError> {
     match joined {
         Ok(quiet) => quiet,
-        Err(gone) => std::panic::resume_unwind(gone.into_panic()),
+        Err(gone) => match gone.try_into_panic() {
+            Ok(payload) => std::panic::resume_unwind(payload),
+            Err(_) => Err(BenchError::Request(
+                "the reading of the machine was cancelled",
+            )),
+        },
     }
 }
 
@@ -206,8 +212,11 @@ impl LoadSource for ProcLoad {
     }
 
     fn quiet_sample(&self) -> Result<QuietSample, BenchError> {
-        // Stub of the scaffold: the wait's finding is not carried yet.
-        LoadSample::read_quiet(&self.timing).map(|(load, _)| QuietSample::from(load))
+        let (load, writeback) = LoadSample::read_quiet(&self.timing)?;
+        Ok(QuietSample {
+            load,
+            unsettled_kib: writeback.unsettled_kib(),
+        })
     }
 
     fn disk_busy_ms(&self) -> Result<BTreeMap<String, u64>, BenchError> {
@@ -704,7 +713,7 @@ async fn run_unit(
 struct Driven {
     steps: Vec<Step>,
     elapsed: Duration,
-    load: Option<PassLoad>,
+    load: PassLoad,
     cold_trip: Option<ColdTrip>,
 }
 
@@ -778,7 +787,7 @@ async fn drive(env: &Env, arm: &Arm, pass: u32) -> Result<Driven, BenchError> {
     let every = (arm.requests / 4).clamp(1, GATE_EVERY);
     let mut steps = Vec::new();
     let mut done = 0u64;
-    let mut load: Option<PassLoad> = None;
+    let mut load = PassLoad::none();
     let mut cold_trip = None;
     while let Some(result) = rx.recv().await {
         let got = result?;
@@ -793,7 +802,7 @@ async fn drive(env: &Env, arm: &Arm, pass: u32) -> Result<Driven, BenchError> {
         done += 1;
         if done.is_multiple_of(every) {
             let sample = env.load.interval_sample()?;
-            load = Some(peak_of(load, &sample));
+            load = peak_of(load, &sample);
         }
     }
     while tasks.join_next().await.is_some() {}
@@ -806,22 +815,13 @@ async fn drive(env: &Env, arm: &Arm, pass: u32) -> Result<Driven, BenchError> {
 }
 
 /// `sofar` with one more reading in it: the count, and the highest of each figure.
-fn peak_of(sofar: Option<PassLoad>, sample: &LoadSample) -> PassLoad {
-    let before = sofar.unwrap_or(PassLoad {
-        readings: 0,
-        peak_psi_cpu_pct: 0.0,
-        peak_psi_io_pct: 0.0,
-        peak_disk_util_pct: 0.0,
-        writeback_settled: true,
-        writeback_pending_bytes: None,
-    });
+fn peak_of(sofar: PassLoad, sample: &LoadSample) -> PassLoad {
     PassLoad {
-        readings: before.readings.saturating_add(1),
-        peak_psi_cpu_pct: before.peak_psi_cpu_pct.max(sample.psi_cpu_avg10),
-        peak_psi_io_pct: before.peak_psi_io_pct.max(sample.psi_io_avg10),
-        peak_disk_util_pct: before.peak_disk_util_pct.max(sample.disk_util_pct),
-        writeback_settled: before.writeback_settled,
-        writeback_pending_bytes: before.writeback_pending_bytes,
+        readings: sofar.readings.saturating_add(1),
+        peak_psi_cpu_pct: sofar.peak_psi_cpu_pct.max(sample.psi_cpu_avg10),
+        peak_psi_io_pct: sofar.peak_psi_io_pct.max(sample.psi_io_avg10),
+        peak_disk_util_pct: sofar.peak_disk_util_pct.max(sample.disk_util_pct),
+        ..sofar
     }
 }
 
@@ -1070,6 +1070,15 @@ async fn run_pass(
     } else {
         env.config.window
     };
+    // The pass opened its window with the wait for the disks at its cap: it says so.
+    let load = match quiet.unsettled_kib {
+        None => driven.load,
+        Some(kib) => PassLoad {
+            writeback_settled: false,
+            writeback_pending_bytes: Some(kib.saturating_mul(1024)),
+            ..driven.load
+        },
+    };
     let mut by_label: BTreeMap<&str, Vec<&Step>> = BTreeMap::from([("", vec![])]);
     for step in &driven.steps {
         by_label.entry(step.label).or_default().push(step);
@@ -1106,7 +1115,7 @@ async fn run_pass(
         let result = PassResult {
             proxy_requests: proxy_requests.clone(),
             disk_busy: disk_busy.clone(),
-            pass_load: driven.load,
+            pass_load: Some(load),
             ..result
         };
         let slot = acc.entry(label).or_default();
