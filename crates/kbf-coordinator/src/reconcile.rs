@@ -100,14 +100,16 @@ fn is_release_failure(host: &Host, version: &Version) -> bool {
 /// What to change for `def` given its desired state `want`, the marks `marks` the ops store
 /// holds for it, and the fleet at `now`.
 ///
-/// Nothing in the quiet start (the coordinator has not heard the hosts that would outvote a
-/// few failures) and nothing while the service is halted. Otherwise, the first that applies:
+/// Nothing for a `manual` service (a farm that never asks for a rollback keeps its files as
+/// they were), nothing in the quiet start (the coordinator has not heard the hosts that would
+/// outvote a few failures) and nothing while the service is halted. Otherwise, the first that
+/// applies:
 ///
 /// 1. the desired version has converged and baked and nothing holds a slot: record it as
 ///    the last good version (unless it is, or is marked bad);
 /// 2. the desired version is `min_version` and an older last good version is recorded: forget
 ///    it, since the version before the first release with hooks is no rollback target;
-/// 3. the service rolls back by itself, an older last good version is recorded, and the
+/// 3. an older last good version is recorded, and the
 ///    desired version is marked bad or failed its release on [`FailThreshold::hosts`] live
 ///    hosts: mark it bad (unless it already is), then set the desired version to the last
 ///    good one. The mark comes first, so a stop between the two leaves a marked desired
@@ -120,7 +122,7 @@ pub fn plan(
     fleet: &Fleet,
     now: Duration,
 ) -> Vec<Change> {
-    if fleet.is_quiet(now) || marks.halt.is_some() {
+    if def.rollback != Rollback::Automatic || fleet.is_quiet(now) || marks.halt.is_some() {
         return Vec::new();
     }
     let wanted = &want.version;
@@ -143,7 +145,7 @@ pub fn plan(
     if floored {
         return older.map(|_| Change::ClearLastGood).into_iter().collect();
     }
-    let Some(back) = older.filter(|_| def.rollback == Rollback::Automatic) else {
+    let Some(back) = older else {
         return Vec::new();
     };
     let failed = live()
