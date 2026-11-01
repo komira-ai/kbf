@@ -1,10 +1,13 @@
-//! The client against a peer it controls: a socket pair for the bytes. The path to a real
-//! socket is tried against the real server, in the tests of `kbf-step-runner`.
+//! The client against a peer it controls: a socket pair for the bytes, and a clock the test moves
+//! for the deadline. The path to a real socket is tried against the real server, in the tests of
+//! `kbf-step-runner`, and here against a listener that never accepts.
 
+use std::cell::Cell;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::net::UnixStream;
-use std::path::Path;
-use std::time::Duration;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -30,7 +33,7 @@ fn sent_line(peer: &UnixStream) -> String {
     line
 }
 
-/// `register_on` with the deadline of `register`, which no test waits for.
+/// `register_on` with the deadline of `register` on the real clock, which no test waits for.
 fn on(
     client: UnixStream,
     name: &str,
@@ -42,8 +45,104 @@ fn on(
         name,
         version,
         health,
-        Duration::from_secs(ANSWER_DEADLINE_SECS),
+        Instant::now() + Duration::from_secs(ANSWER_DEADLINE_SECS),
+        &Instant::now,
     )
+}
+
+/// What the client's thread tells the test: it is reading the clock, or it is done.
+enum Event {
+    ReadsTheClock,
+    Done(Result<Registration, Error>),
+}
+
+/// Runs `register_on` over `client` until `end` in a thread of its own, on a clock the test
+/// moves (see `run_on_a_moved_clock`).
+fn on_a_moved_clock(
+    client: UnixStream,
+    end: Instant,
+    at: impl FnMut(usize) -> Instant,
+) -> (Result<Registration, Error>, Vec<Instant>) {
+    run_on_a_moved_clock(
+        move |clock| register_on(client, "svc", "1.0.0", None, end, clock),
+        at,
+    )
+}
+
+/// Runs `call` in a thread of its own, on a clock the test moves. The call's reading `k` of the
+/// clock (from 0) waits on a channel until the test has run `at(k)`, and reads the time `at`
+/// returns; `at` may feed the peer first. So the bytes go one per reading, the clock moves between
+/// them, and nothing waits on time. Returns the outcome and the times the call read, in order.
+fn run_on_a_moved_clock(
+    call: impl FnOnce(Clock<'_>) -> Result<Registration, Error> + Send + 'static,
+    mut at: impl FnMut(usize) -> Instant,
+) -> (Result<Registration, Error>, Vec<Instant>) {
+    let (events, event) = mpsc::channel();
+    let (times, time) = mpsc::channel();
+    let done = events.clone();
+    let client = std::thread::spawn(move || {
+        let clock = move || {
+            events.send(Event::ReadsTheClock).unwrap();
+            time.recv().unwrap()
+        };
+        let got = call(&clock);
+        done.send(Event::Done(got)).unwrap();
+    });
+    let mut read = Vec::new();
+    let got = loop {
+        match event.recv().unwrap() {
+            Event::ReadsTheClock => {
+                let now = at(read.len());
+                read.push(now);
+                times.send(now).unwrap();
+            }
+            Event::Done(got) => break got,
+        }
+    };
+    client.join().unwrap();
+    (got, read)
+}
+
+/// A clock that reads `times` in turn, the last of them for ever after, and counts its readings.
+struct Script {
+    times: Vec<Instant>,
+    read: Cell<usize>,
+}
+
+impl Script {
+    fn new(times: &[Instant]) -> Script {
+        Script {
+            times: times.to_vec(),
+            read: Cell::new(0),
+        }
+    }
+
+    fn now(&self) -> Instant {
+        let k = self.read.get();
+        self.read.set(k + 1);
+        self.times[k.min(self.times.len() - 1)]
+    }
+}
+
+/// Asserts that a socket timeout the client set is `want`, as the kernel keeps it: rounded up to
+/// its clock tick, which is at most 10 ms. This reads the setting, not how long anything took.
+fn assert_timeout_is(got: Option<Duration>, want: Duration) {
+    let got = got.expect("a timeout is set");
+    // Two assertions, not one with `&&`: the second operand of a lazy `&&` is a branch of its
+    // own, and the first is never false.
+    assert!(got >= want, "{got:?} for {want:?}");
+    assert!(
+        got < want + Duration::from_millis(100),
+        "{got:?} for {want:?}"
+    );
+}
+
+/// Asserts that the client went on while time was left and stopped at the first reading of the
+/// clock that had none: the last time read is past `end`, and every one before it short of it.
+fn assert_stopped_at_the_deadline(read: &[Instant], end: Instant) {
+    let (last, before) = read.split_last().expect("the clock was read");
+    assert!(*last >= end, "{read:?}");
+    assert!(before.iter().all(|t| *t < end), "{read:?}");
 }
 
 fn refused(said: &str) -> Refusal {
@@ -205,21 +304,179 @@ fn an_answer_cut_short_is_not_success() {
     }
 }
 
-/// An updater that never answers is given up on when the deadline passes, whatever the
-/// deadline: a zero deadline is the smallest the socket takes (a zero timeout would mean
-/// waiting for ever), and the peer here stays open and says nothing, so the outcome does not
-/// depend on how long anything takes.
+/// An updater that never answers is given up on when the deadline passes: with the deadline
+/// already reached nothing waits (a zero timeout would mean waiting for ever), and the peer here
+/// stays open and says nothing, so the outcome does not depend on how long anything takes.
 #[test]
 fn an_updater_that_never_answers_is_given_up_on() {
     let (client, _peer) = UnixStream::pair().unwrap();
-    let got = register_on(client, "svc", "1.0.0", None, Duration::ZERO);
+    let now = Instant::now();
+    let got = register_on(client, "svc", "1.0.0", None, now, &|| now);
     assert!(matches!(got, Err(Error::NoAnswer)), "{got:?}");
 }
 
-/// The deadline of `register` is ten seconds, the updater's own limit on a line.
+/// The deadline is for the whole answer, not for each read. The peer sends the answer a byte at a
+/// time, each before the client's next reading of the clock, and the clock moves a quarter of the
+/// deadline per reading: the call ends with `NoAnswer` at the first reading past the deadline,
+/// with most of the answer unsent, and not with the success the whole line would be. A client that
+/// set its read timeout once, or gave each read a timeout of its own, would read on to the whole
+/// line, or give up (after a real wait) before the clock had passed the deadline. And each read
+/// waits only for what the clock left it: before each reading the test looks at the socket's read
+/// timeout, which the read before it set to the deadline less the time it read. A client that set
+/// it once, or to a fixed length, keeps the first.
 #[test]
-fn the_answer_deadline_is_ten_seconds() {
-    assert_eq!(ANSWER_DEADLINE_SECS, 10);
+fn an_answer_sent_a_byte_at_a_time_is_given_up_on_at_the_deadline() {
+    let (client, mut peer) = UnixStream::pair().unwrap();
+    let watch = client.try_clone().unwrap();
+    let start = Instant::now();
+    let deadline = Duration::from_secs(ANSWER_DEADLINE_SECS);
+    let end = start + deadline;
+    let time = |k: usize| start + deadline / 4 * k as u32;
+    let (got, read) = on_a_moved_clock(client, end, |k| {
+        // Reading 0 is the write's and reading 1 the first read's; the read after reading `k - 1`
+        // waited for what that left.
+        if k >= 2 {
+            assert_timeout_is(watch.read_timeout().unwrap(), end - time(k - 1));
+        }
+        peer.write_all(OK.as_bytes().get(k..=k).unwrap_or_default())
+            .unwrap();
+        time(k)
+    });
+    assert!(matches!(got, Err(Error::NoAnswer)), "{got:?}");
+    assert_stopped_at_the_deadline(&read, end);
+    assert!(read.len() < OK.len(), "{read:?}");
+}
+
+/// A read waits only for what the clock leaves it: with the peer silent and a microsecond left,
+/// the read's own timeout runs out and the call is `NoAnswer`, without the clock having to pass
+/// the deadline first.
+#[test]
+fn a_read_that_waits_out_what_is_left_is_no_answer() {
+    let (client, _peer) = UnixStream::pair().unwrap();
+    let end = Instant::now() + Duration::from_secs(ANSWER_DEADLINE_SECS);
+    // The write reads the clock first, then the answer before its read.
+    let times = [end - Duration::from_secs(1), end - Duration::from_micros(1)];
+    let (got, read) = on_a_moved_clock(client, end, |k| times[k.min(1)]);
+    assert!(matches!(got, Err(Error::NoAnswer)), "{got:?}");
+    assert_eq!(read, times);
+}
+
+/// A peer that sends part of the answer and then nothing holds the client only for what is left:
+/// the first read takes what was sent with the whole deadline left, the clock then leaves a
+/// microsecond, and the second read's own timeout is that, so the call is `NoAnswer`. A client
+/// that kept the first read's timeout would wait the whole deadline for the second read.
+#[test]
+fn a_peer_that_stops_part_way_is_waited_for_only_what_is_left() {
+    let (client, mut peer) = UnixStream::pair().unwrap();
+    let watch = client.try_clone().unwrap();
+    let start = Instant::now();
+    let end = start + Duration::from_secs(ANSWER_DEADLINE_SECS);
+    // The write's reading, the first read's (with part of the answer waiting), the second's.
+    let times = [start, start, end - Duration::from_micros(1)];
+    let (got, read) = on_a_moved_clock(client, end, |k| {
+        if k == 1 {
+            peer.write_all(&OK.as_bytes()[..5]).unwrap();
+        }
+        times[k.min(2)]
+    });
+    assert!(matches!(got, Err(Error::NoAnswer)), "{got:?}");
+    assert_eq!(read, times);
+    assert_timeout_is(watch.read_timeout().unwrap(), Duration::from_micros(1));
+}
+
+/// A call a signal interrupts is made again, and with what is left then, not with what was left
+/// before: the clock moves between the tries, and with none left there is no other try and the
+/// result is `TimedOut`. So signals that keep coming cannot carry a connect, a write or a read
+/// past the deadline.
+#[test]
+fn an_interrupted_call_is_made_again_with_what_is_left() {
+    let end = Instant::now() + Duration::from_secs(ANSWER_DEADLINE_SECS);
+    let secs = Duration::from_secs;
+    let clock = Script::new(&[end - secs(4), end - secs(3), end - secs(1), end]);
+    let mut waits = Vec::new();
+    let got: std::io::Result<()> = with_what_is_left(end, &|| clock.now(), |wait| {
+        waits.push(wait);
+        Err(std::io::ErrorKind::Interrupted.into())
+    });
+    assert_eq!(got.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+    assert_eq!(waits, [secs(4), secs(3), secs(1)]);
+    assert_eq!(clock.read.get(), 4);
+
+    // Interrupted twice, then done: the result is the third try's.
+    let clock = Script::new(&[end - secs(4), end - secs(3), end - secs(2)]);
+    let mut waits = Vec::new();
+    let got = with_what_is_left(end, &|| clock.now(), |wait| {
+        waits.push(wait);
+        match waits.len() {
+            3 => Ok(7),
+            _ => Err(std::io::ErrorKind::Interrupted.into()),
+        }
+    });
+    assert_eq!(got.unwrap(), 7);
+    assert_eq!(waits, [secs(4), secs(3), secs(2)]);
+}
+
+/// A line that goes in part is carried on with what is left, and not past the deadline: each
+/// write here takes three bytes, one is interrupted, and the clock moves a quarter of the
+/// deadline per reading. The writes are given less each time, and when the clock reaches the
+/// deadline the rest of the line is not written and the result is `TimedOut`. A `write_all` on a
+/// timeout set once would give every write the first wait, and go on to the end of the line.
+#[test]
+fn a_write_that_goes_in_part_is_carried_on_with_what_is_left() {
+    let deadline = Duration::from_secs(ANSWER_DEADLINE_SECS);
+    let end = Instant::now() + deadline;
+    let quarter = deadline / 4;
+    let clock = Script::new(&[
+        end - deadline,
+        end - 3 * quarter,
+        end - 2 * quarter,
+        end - quarter,
+        end,
+    ]);
+    let line = b"twenty bytes of line";
+    let mut written = Vec::new();
+    let mut waits = Vec::new();
+    let got = send(line, end, &|| clock.now(), |wait, bytes| {
+        waits.push(wait);
+        if waits.len() == 2 {
+            return Err(std::io::ErrorKind::Interrupted.into());
+        }
+        let n = bytes.len().min(3);
+        written.extend_from_slice(&bytes[..n]);
+        Ok(n)
+    });
+    assert_eq!(got.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+    assert_eq!(waits, [deadline, 3 * quarter, 2 * quarter, quarter]);
+    assert_eq!(written, line[..9]);
+}
+
+/// The deadline holds for the write too. With the socket's buffer full and the peer reading
+/// nothing, the line cannot go: the write waits only for what the clock leaves it (a microsecond,
+/// so the socket's write timeout is that and not the whole deadline), and the call ends with
+/// `NoAnswer`, as when the deadline passes waiting for the answer, not with the write's
+/// `WouldBlock`. None of the line reached the peer.
+#[test]
+fn a_write_that_waits_out_the_deadline_is_no_answer() {
+    let (client, peer) = UnixStream::pair().unwrap();
+    // Fill what the socket holds, to the byte.
+    client.set_nonblocking(true).unwrap();
+    let filler = [b'x'; 4096];
+    for size in [filler.len(), 1] {
+        while (&client).write(&filler[..size]).is_ok() {}
+    }
+    client.set_nonblocking(false).unwrap();
+    let watch = client.try_clone().unwrap();
+    let end = Instant::now() + Duration::from_secs(ANSWER_DEADLINE_SECS);
+    let times = [end - Duration::from_micros(1), end];
+    let (got, read) = on_a_moved_clock(client, end, |k| times[k.min(1)]);
+    assert!(matches!(got, Err(Error::NoAnswer)), "{got:?}");
+    assert_stopped_at_the_deadline(&read, end);
+    let timeout = watch.write_timeout().unwrap().expect("a write timeout");
+    assert!(timeout < Duration::from_secs(1), "{timeout:?}");
+    drop(watch);
+    let mut rest = Vec::new();
+    (&peer).read_to_end(&mut rest).unwrap();
+    assert!(rest.iter().all(|b| *b == b'x'), "the line went");
 }
 
 /// A read that fails for another reason than the deadline is an I/O error: here the peer
@@ -316,6 +573,133 @@ fn a_missing_socket_names_its_path() {
             assert!(shown.contains("nonexistent-update-register"), "{shown}");
         }
         other => panic!("{other:?}"),
+    }
+}
+
+/// A path too long for a unix socket address is a connect error that names it, as `std` says.
+#[test]
+fn a_socket_path_too_long_is_a_connect_error() {
+    let long = PathBuf::from(format!("/{}", "x".repeat(200)));
+    match register(&long, "svc", "1.0.0", None) {
+        Err(Error::Connect { path, source }) => {
+            assert_eq!(path, long);
+            assert_eq!(source.kind(), std::io::ErrorKind::InvalidInput);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The deadline runs from before the connect: with none of it left nothing is connected, and the
+/// call is `NoAnswer` even for a path that does not exist.
+#[test]
+fn a_deadline_already_passed_does_not_connect() {
+    let sock = Path::new("/nonexistent-update-register/none");
+    let got = register_within(sock, "svc", "1.0.0", None, Duration::ZERO, &Instant::now);
+    assert!(matches!(got, Err(Error::NoAnswer)), "{got:?}");
+}
+
+/// A listener that is there but never accepts, its backlog full, does not hold the caller: the
+/// connect waits only for the deadline and the call is `NoAnswer`, not a wait for ever. The
+/// connect cannot run on a moved clock (the kernel waits on its own), so the deadline is a short
+/// real one and only the outcome is asserted. The listener's backlog is set to zero, which one
+/// connection waiting to be accepted fills; afterwards that one is all the listener holds, so the
+/// client gave up while connecting, not after.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_listener_whose_backlog_is_full_is_given_up_on() {
+    let dir = SocketDir::new();
+    let sock = dir.0.join("register.sock");
+    let listener = UnixListener::bind(&sock).unwrap();
+    rustix::net::listen(&listener, 0).unwrap();
+    let _waiting = UnixStream::connect(&sock).unwrap();
+
+    let got = register_within(
+        &sock,
+        "svc",
+        "1.0.0",
+        None,
+        Duration::from_millis(100),
+        &Instant::now,
+    );
+    assert!(matches!(got, Err(Error::NoAnswer)), "{got:?}");
+
+    listener.set_nonblocking(true).unwrap();
+    let _accepted = listener.accept().unwrap();
+    let more = listener.accept().unwrap_err();
+    assert_eq!(more.kind(), std::io::ErrorKind::WouldBlock);
+}
+
+/// What `connect` takes of the deadline is not given again to what follows: the clock leaves
+/// time for the connect, which the listener takes (its backlog has room, so no accept is needed),
+/// and then reads the deadline. The write is not made and the call is `NoAnswer`; the peer the
+/// listener accepts afterwards got no byte. A client that started the deadline after the connect
+/// would have sent the line.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_deadline_left_after_the_connect_is_all_that_follows_gets() {
+    let dir = SocketDir::new();
+    let sock = dir.0.join("register.sock");
+    let listener = UnixListener::bind(&sock).unwrap();
+    let start = Instant::now();
+    let deadline = Duration::from_secs(ANSWER_DEADLINE_SECS);
+    let to = sock.clone();
+    let (got, read) = run_on_a_moved_clock(
+        move |clock| register_within(&to, "svc", "1.0.0", None, deadline, clock),
+        // The deadline's start, the connect's reading, then the write's and the answer's.
+        |k| if k < 2 { start } else { start + deadline },
+    );
+    assert!(matches!(got, Err(Error::NoAnswer)), "{got:?}");
+    assert_eq!(read.len(), 4, "{read:?}");
+    listener.set_nonblocking(true).unwrap();
+    let (accepted, _) = listener.accept().unwrap();
+    accepted.set_nonblocking(false).unwrap();
+    let mut sent = Vec::new();
+    (&accepted).read_to_end(&mut sent).unwrap();
+    assert!(sent.is_empty(), "{:?}", String::from_utf8_lossy(&sent));
+}
+
+/// A socket file that no one listens on any more (the updater stopped and left it) is a connect
+/// error naming the path, with the kernel's refusal, as `std`'s connect gave: not `NoAnswer`.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_socket_left_by_a_listener_that_is_gone_is_refused() {
+    let dir = SocketDir::new();
+    let sock = dir.0.join("register.sock");
+    drop(UnixListener::bind(&sock).unwrap());
+    assert!(sock.exists());
+    match register(&sock, "svc", "1.0.0", None) {
+        Err(Error::Connect { path, source }) => {
+            assert_eq!(path, sock);
+            assert_eq!(source.kind(), std::io::ErrorKind::ConnectionRefused);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A directory of its own for a test's socket, removed when it is dropped, whether the test
+/// passes or panics. It is what `kbf_testkit::dir::TestDir` gives, which this crate cannot use
+/// (it may depend on no other crate of this workspace). The name holds the process id and a
+/// count, so no live process holds it; one a dead process with the same id left is removed first.
+#[cfg(target_os = "linux")]
+struct SocketDir(PathBuf);
+
+#[cfg(target_os = "linux")]
+impl SocketDir {
+    fn new() -> Self {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("update-register-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        SocketDir(dir)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for SocketDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 

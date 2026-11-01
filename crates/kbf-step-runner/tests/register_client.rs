@@ -146,7 +146,9 @@ fn a_service_without_a_health_address_is_not_absent() {
 #[test]
 fn the_health_address_arrives_as_sent() {
     for (addr, port) in [("127.0.0.1:9301", 9301), ("[::1]:9302", 9302)] {
-        let live = Live::start("regc-health", me(), |s| s);
+        // A directory of its own per address: the previous server's connection thread, which
+        // is not joined, may still be writing the close into its state directory.
+        let live = Live::start(&format!("regc-health-{port}"), me(), |s| s);
         let held = live
             .register("1.0.0", Some(&health(addr, "/readyz")))
             .unwrap();
