@@ -258,6 +258,8 @@ scheduler-core = "legacy"
 state-store-wait-secs = 300
 # How long, in seconds, queued work waits while no connected daemon can run it (none satisfies its platform, or none that does is large enough) before it is refused FAILED_PRECONDITION. The wait restarts whenever one can
 unservable-wait-secs = 300
+# Whether the farm learns what its leases use, for the scheduler's admission by load. `off`, the default, learns nothing. `record` and `on` need `--scheduler-core js` and `--state-store`; `on` also needs `--placement-load on` and `--placement-predictions on`, since the scheduler reads a curve only for an action that has a prediction. In this build a value other than `off` changes only the start line `usage profiles: <mode>` and the gauge `kbf_usage_profiles_mode{mode}`, 1 for the mode and 0 for the others: nothing is learned or stored yet. A server given a combination that breaks one of these refuses to start
+usage-profiles = "off"
 # The cores a node that reports VM slots (`vm.slots`) keeps for the host itself: subtracted from the CPUs placement may book on it, so that guests cannot take the host's own share. A node that reports none books the whole machine
 vm-host-floor-cpus = 2
 # The memory, in GiB, a node that reports VM slots (`vm.slots`) keeps for the host itself, subtracted as `--vm-host-floor-cpus` subtracts cores

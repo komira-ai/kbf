@@ -23,6 +23,7 @@ use kbf_sched::{LoadCounters, QueueView};
 use kbf_types::{MemoryRun, OperationId, WorkerId};
 
 use super::JsFarm;
+use crate::farm::cordon_owner;
 use crate::farm::failed_actions::FailedActions;
 use crate::farm::nodes::{detail_of, look_of, node_of};
 use crate::farm::sched_view::{LeaseViews, WholeView, whole_of};
@@ -96,13 +97,14 @@ pub(crate) fn node_detail(
             let capacity = view.sched().capacity(worker).unwrap_or_default();
             let load = node_load::shown(adapter.node_loads(), worker, &capacity, js.now());
             let input_cache = adapter.input_cache_of(worker);
-            detail_of(
+            let detail = detail_of(
                 listed(js, view, adapter, worker),
                 view.sched(),
                 worker,
                 load,
                 input_cache,
-            )
+            );
+            cordon_owner::with_owner(detail, || cordon_owner::shown(js.store.as_deref(), worker))
         };
         Ok(node.map(detail))
     })
