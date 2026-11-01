@@ -810,3 +810,30 @@ async fn after_a_clear_the_host_is_not_ordered_the_acked_target_until_its_report
     let acked = status(&rig).await["ops"]["services"]["kbf"]["halt_acked"].clone();
     assert_eq!(acked, json!([]));
 }
+
+/// Catches: an ops file written before a halt and an acknowledgement carried the report, which
+/// the reader refuses (the coordinator would not start): the file loads, its halt stands, and
+/// its acknowledgement, which names no report, matches nothing: the host's first beat ends it,
+/// and a clear still works on the halt that has no report.
+#[tokio::test]
+async fn an_ops_file_from_before_reports_loads_and_its_acks_drop_on_the_first_beat() {
+    let mut rig = farm("halt-old-ops-file").await;
+    let old = r#"{"schema":1,"services":{"kbf":{
+        "halt":{"node_id":"s2","check":"disk_tainted","target":"2.0"},
+        "halt_acked":[{"node_id":"s1","target":"2.0"}]}}}"#;
+    std::fs::write(rig.dir.path().join("desired.json.ops"), old).expect("written");
+    rig.restart();
+    rig.at(1_200);
+    let state = convergence(&rig, "kbf").await;
+    assert_eq!(state["state"], "halted");
+    assert_eq!(state["halt"]["node_id"], "s2");
+    let acked = brief(&status(&rig).await["ops"]["services"]["kbf"]["halt_acked"]);
+    assert_eq!(acked, json!([{"node_id": "s1", "target": "2.0"}]));
+
+    send(&rig, "s1", "storage", &beat("1.0", HALT)).await;
+    let marks = status(&rig).await["ops"]["services"]["kbf"].clone();
+    assert_eq!(marks["halt_acked"], json!([]));
+    assert_eq!(marks["halt"]["node_id"], "s2");
+    clear(&rig, "kbf").await;
+    assert_ne!(convergence(&rig, "kbf").await["state"], "halted");
+}
