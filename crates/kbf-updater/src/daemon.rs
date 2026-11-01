@@ -66,6 +66,7 @@ use std::time::Duration;
 
 use serde_json::json;
 
+use crate::agent::cordon::OwnCordon;
 use crate::api::RollState;
 use crate::frontend_http::HttpFrontend;
 use crate::inventory::Inventory;
@@ -343,6 +344,11 @@ pub fn stderr_sink() -> AuditSink {
     Arc::new(|line| eprintln!("{line}"))
 }
 
+/// A log that writes each line to stderr, where the journal takes it.
+pub fn stderr_log() -> AuditSink {
+    Arc::new(|line| eprintln!("kbf-updater: {line}"))
+}
+
 /// The ports of this build: the real safe-to-stop, health check, clock and ssh installer.
 pub fn build_ports(cfg: &Config) -> Result<Ports, String> {
     build_ports_with_exec(cfg, Arc::new(SystemExec))
@@ -375,7 +381,13 @@ pub fn build_ports_with_exec(cfg: &Config, exec: Arc<dyn Exec>) -> Result<Ports,
     Ok(Ports {
         safe: Box::new(HttpSafeToStop::from_api(api.clone())),
         installer: Box::new(Arc::clone(&installer)),
-        drain: Box::new(NodeDrain::with_api(api.clone())),
+        // The roll's own cordons are marked in the state directory, beside `roll.json`, so that
+        // a node an operator drained is left out when the roll ends (see `OwnCordon`).
+        drain: Box::new(OwnCordon::new(
+            Arc::new(NodeDrain::with_api(api.clone())),
+            &cfg.state_dir,
+            "roll",
+        )),
         health: Box::new(NodeHealth::with_api(api.clone(), installer)),
         clock: Box::new(SystemClock::new()),
         frontend: Box::new(HttpFrontend::with_api(api)),
@@ -432,6 +444,7 @@ pub fn start_with(
     let store = RollStore::open(&cfg.state_dir)
         .map_err(|e| format!("state dir {}: {e}", cfg.state_dir.display()))?;
     let updater = Updater::open(inventory, store, ports, timing)
+        .map(|u| u.with_log(stderr_log()))
         .map_err(|e| format!("roll record in {}: {e}", cfg.state_dir.display()))?;
     let updater = Arc::new(updater);
     let opened = open(&cfg.listen)?;

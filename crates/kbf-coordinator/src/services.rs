@@ -25,6 +25,7 @@
 //! rollback_after_failed = { percent = 25, min_hosts = 2 }  # the larger of the two (default)
 //! min_version = "0.0.18"         # optional: the first version with update hooks; setting the
 //!                                # desired state to it forgets the last good version
+//! defer_backoff = { initial_secs = 300, factor = 2, max_secs = 3600 }   # the defaults
 //!
 //! [service.roles.daemon]
 //! max_updating = 2               # optional; absent: the desired state's number
@@ -44,6 +45,7 @@ use serde::Deserialize;
 
 use crate::bake::MAX_BAKE_BEATS;
 use crate::canary::Canary;
+use crate::defer::DeferBackoff;
 use crate::desired::{Desired, KBF, KBF_MIN_UP, LEGACY_ROLES, MAX_COUNT, kbf_roles};
 use crate::reconcile::{FailThreshold, Rollback};
 
@@ -129,6 +131,8 @@ pub struct ServiceDef {
     pub rollback_after_failed: FailThreshold,
     /// The first version that has update hooks: no rollback goes below it.
     pub min_version: Option<Version>,
+    /// How long a host that deferred an update is left alone ([`crate::defer`]).
+    pub defer_backoff: DeferBackoff,
 }
 
 impl ServiceDef {
@@ -149,6 +153,7 @@ impl ServiceDef {
             rollback: Rollback::Manual,
             rollback_after_failed: FailThreshold::default(),
             min_version: None,
+            defer_backoff: DeferBackoff::default(),
         }
     }
 
@@ -222,6 +227,8 @@ struct RawService {
     #[serde(default)]
     rollback_after_failed: FailThreshold,
     min_version: Option<Version>,
+    #[serde(default)]
+    defer_backoff: DeferBackoff,
 }
 
 /// The count form of the canary. The roles and labels form is refused as an unknown field
@@ -307,6 +314,7 @@ fn service_def(
         rollback,
         rollback_after_failed,
         min_version,
+        defer_backoff,
     } = raw;
     if !is_service_name(&name) {
         return invalid(format!(
@@ -316,6 +324,9 @@ fn service_def(
     if defined.contains_key(&name) {
         return invalid(format!("{name} is defined twice"));
     }
+    defer_backoff
+        .check()
+        .or_else(|why| invalid(format!("{name}: defer_backoff: {why}")))?;
     if roles.is_empty() {
         return invalid(format!("{name} has no roles"));
     }
@@ -365,6 +376,7 @@ fn service_def(
         rollback,
         rollback_after_failed,
         min_version,
+        defer_backoff,
     })
 }
 

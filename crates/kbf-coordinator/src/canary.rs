@@ -8,8 +8,9 @@
 //! The hosts that have *started* are those updating, under an order, failed at the desired
 //! version, or at it: silent ones too, so a canary that went down after it began is not
 //! replaced. The next hosts are chosen among the live ones that have not started, the roles
-//! that wait for no other role first and then by node id: the smallest id alone could pick a
-//! host of a role that cannot go until another has, and the gate would never open.
+//! that wait for no other role first and then by node id, leaving out the hosts that are
+//! deferring: the smallest id alone could pick a host of a role that cannot go until another
+//! has, and the gate would never open.
 
 use std::time::Duration;
 
@@ -68,6 +69,12 @@ pub(crate) fn closed_to(
     if baked >= canary.count as usize {
         return false;
     }
+    // A host that declined the update is left alone: it is not chosen, and the next host is.
+    let deferring = |o: &NodeId| {
+        fleet
+            .deferred_until(service, o, &want.version, &def.defer_backoff)
+            .is_some_and(|until| now < until)
+    };
     // The key a host is chosen by: the roles that wait for no role first, then the id.
     let key = |o: &NodeId, h: &Host| {
         let waits = def
@@ -81,7 +88,7 @@ pub(crate) fn closed_to(
     }
     let mine = key(id, me);
     let before = members()
-        .filter(|(o, h)| h.is_live(now) && !started(o, h) && key(o, h) < mine)
+        .filter(|(o, h)| h.is_live(now) && !started(o, h) && !deferring(o) && key(o, h) < mine)
         .count();
     let free =
         (canary.count as usize).saturating_sub(members().filter(|(o, h)| started(o, h)).count());

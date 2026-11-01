@@ -176,9 +176,11 @@ pub struct Status {
 
 /// The features this coordinator advertises to an agent that announces `agent_features`.
 ///
-/// Empty: each name is added in the change that implements what it names (`heartbeat-v2`,
-/// `deferred-v1`, `halt-v1`), so a name is never advertised for behaviour that is not there.
-pub const FEATURES: &[&str] = &[];
+/// Each name is added in the change that implements what it names (`deferred-v1` here;
+/// `heartbeat-v2` and `halt-v1` follow), so a name is never advertised for behaviour that is
+/// not there. `deferred-v1`: a heartbeat's `deferred` report ends the order, holds no slot and
+/// backs the host off ([`crate::defer`]).
+pub const FEATURES: &[&str] = &["deferred-v1"];
 
 /// The coordinator.
 pub struct Coordinator {
