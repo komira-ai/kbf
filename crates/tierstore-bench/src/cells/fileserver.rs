@@ -19,6 +19,10 @@ use crate::error::BenchError;
 /// Longest request head the server reads.
 const MAX_HEAD: usize = 8192;
 
+/// Largest body copied behind its head to go out in one write; a larger one is its own write,
+/// which TCP_NODELAY keeps from waiting.
+const ONE_WRITE_MAX: usize = 64 * 1024;
+
 /// A running server.
 pub struct FileServer {
     addr: SocketAddr,
@@ -56,6 +60,9 @@ impl FileServer {
                 // An accept that fails (out of descriptors) is tried again after other tasks ran.
                 listener.accept().await.into_iter().for_each(|(socket, _)| {
                     counted.fetch_add(1, Ordering::SeqCst);
+                    // Best effort: a socket that refuses the option is still served, and a small
+                    // answer is one write either way.
+                    socket.set_nodelay(true).ok();
                     #[cfg(test)]
                     if socket.nodelay().unwrap_or(false) {
                         nodelay_seen.fetch_add(1, Ordering::SeqCst);
@@ -117,8 +124,16 @@ async fn respond<W: AsyncWrite + Unpin>(
         "HTTP/1.1 {status}\r\ncontent-length: {}\r\n\r\n",
         body.len()
     );
-    socket.write_all(head.as_bytes()).await?;
-    socket.write_all(body).await
+    if body.len() <= ONE_WRITE_MAX {
+        // One write, so the answer never waits on the peer's ACK of its own head (Nagle against
+        // a delayed ACK is ~40 ms a request).
+        let mut answer = head.into_bytes();
+        answer.extend_from_slice(body);
+        socket.write_all(&answer).await
+    } else {
+        socket.write_all(head.as_bytes()).await?;
+        socket.write_all(body).await
+    }
 }
 
 /// Serves one connection until the client closes it or sends what is not a request.
