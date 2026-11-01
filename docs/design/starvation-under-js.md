@@ -105,7 +105,7 @@ operation it calls `Servable::fit` (`crates/js-sched/src/servable.rs`).
   `Scheduler::drain_order` (`crates/js-sched/src/scheduler/whole.rs:286`) that could run
   it. `drain_order` builds one `HostLoad` per worker whose `end_bounds` are each held
   lease's `started_at` (else `granted_at`) plus the lease's `max_wall` (`whole.rs:287-310`),
-  and `js_whole::cost::drain_cost` (`crates/js-whole/src/cost.rs:30-45`) sorts hosts by
+  and `js_whole::cost::drain_cost` (`crates/js-whole/src/cost.rs:30-45`) sorts hosts at `e23a2b4c` by
   `wait_ms = max(end_bounds) - now`, then fewest leases, then name. A lease with no
   `max_wall` counts as ending at `u64::MAX` (`whole.rs:289`; `set_max_wall`, `whole.rs:280`,
   says so). That is the host with the least **upper bound** on its remaining time, not
@@ -214,8 +214,9 @@ it once its leases end: a `WholeMachine` lease, an `owns_worker` action, or a
    original `made` time across moves, so the queue-age order of the caps does not reset
    (`Drain::mark` drops `made` on a worker change today; it must carry it).
 3. **Backfill.** An operation *after the large request in queue order* is placed on the
-   reserved worker only if its estimated end is no later than that worker's start time.
-   Otherwise it goes elsewhere or waits. Operations *ahead* of the large request in queue
+   reserved worker only if its estimated end, plus a `margin` kept spare, is no later than
+   that worker's start time (`fits_in_tail`, `cost.rs:97-109`). The spare margin is a change from the
+   rule as first written ("no later than the start time"). Otherwise it goes elsewhere or waits. Operations *ahead* of the large request in queue
    order are not held back (3.3).
 4. **Start.** The large request starts when the start time comes, not when a timer fires.
 5. **No timer.** No `head_hold_after`, no `blocked_since`, no fixed hold, and no give-up
@@ -227,7 +228,7 @@ What is common to both choices (and is the first step, 3.6): **the tail rule is 
 once, in `js_whole::cost`**, as pure functions, and both engines' ranking reads it.
 
 The shape below is the first implementation step as built (jobscheduler PR #597, head
-`e01545ff4635f34ee234ebb1d6aa60ab832406ba`; line numbers are `crates/js-whole/src/cost.rs` there).
+`6b7ba4641c65ff4ebd20d26aa922066b2317045b`; line numbers are `crates/js-whole/src/cost.rs` there).
 
 - **[code]** `HostLoad` gains `est_ends: Vec<Option<u64>>`, in the order of `end_bounds`
   (`cost.rs:18`); an empty list, `None`, or an entry past the end is a lease with no estimate.
@@ -243,7 +244,7 @@ The shape below is the first implementation step as built (jobscheduler PR #597,
   `wait_ms = tail_end.unwrap_or(u64::MAX).saturating_sub(now)` (`cost.rs:48`).
   `drain_cost` sorts by (tail unknown last, `wait_ms`, leases, id) (`cost.rs:54-57`).
 - **[code]** `fits_in_tail(now, estimated_duration: Option<u64>, tail_end: Option<u64>, margin: u64)`
-  (`cost.rs:95-106`) is `now + duration + margin <= tail_end` with saturating sums, and fails
+  (`cost.rs:97-109`) is `now + duration + margin <= tail_end` with saturating sums, and fails
   closed when the duration or the tail is unknown. The margin is applied only here;
   `DEFAULT_BACKFILL_MARGIN_MS` is one minute (`cost.rs:63`).
 - **[proposed]** A reservation takes the tail once, when it sets the mark, and keeps that value
@@ -296,7 +297,7 @@ submission's `max_wall` to the js core). No kbf scheduling code, under either pa
   past its end reads zero remaining and a host whose only lease is overdue ranks as free. That is
   how step 1 is built, and it is a weaker rule than the one this note first proposed (a
   floor of `margin` on each lease's remaining time, so a still-busy worker never looks free). What
-  stays: `fits_in_tail` keeps `margin` between backfilled work and the tail's end (`cost.rs:104`), and
+  stays: `fits_in_tail` keeps `margin` between backfilled work and the tail's end (`cost.rs:106`), and
   the tail is taken at the mark and kept. Whether the pick also needs the floor is **[verify]**: an
   overdue lease past its enforced end still holds the worker until the next lease tick
   (js-lease) or, in the embedded core, until the kbf action timeout ends it. If the red run
@@ -380,7 +381,7 @@ how long the curve is charged is not read; the js-sched step reads it first.
   (treated as unknown; a clamped bound would not be enforced, and its overrun would run
   to the real timeout), and a lease with no declared bound is unknown. For the pick,
   an unknown tail ranks last (`cost.rs:55`); for backfill, unknown is refused (`fits_in_tail`
-  fails closed, `cost.rs:101-105`). In `js_whole::cost` an estimate is also cut to its lease's
+  fails closed, `cost.rs:103-106`). In `js_whole::cost` an estimate is also cut to its lease's
   bound (`cost.rs:67-73`). The wall `ceiling` above which a bound is refused for backfill is not a
   parameter of `tail()`; it is applied by the caller, which treats such a bound as no bound. In js-sched it is **new
   configuration**, fed by kbf (js-sched does not depend on js-lease, and
@@ -430,20 +431,25 @@ how long the curve is charged is not read; the js-sched step reads it first.
    - an unbounded case (the existing tests lack one): host A with a `u64::MAX` end bound and host
      B with a finite one; B ranks first and A's `wait_ms` is `u64::MAX - now`; two unbounded
      hosts order by leases, then id;
-   - an estimate past the bound is cut to the bound; `tail()` of a host with no lease is zero;
+   - an estimate past the bound is cut to the bound (`an_estimate_past_the_max_wall_is_cut_to_it`);
+     `tail()` of an empty host is zero (`once_the_running_leases_are_gone_the_tail_is_over`,
+     `cost.rs:411`);
    - `fits_in_tail` fits up to the tail's end less the margin and not a millisecond more, never
-     fits an unknown duration or an unknown tail, and its sum saturates;
-   - a **characterization test** against the pre-change `drain_cost` as an oracle: the old function
-     is copied into the test module, every existing case (and the no-estimate and all-`None`
-     variants) runs through both, and the output must be identical, `wait_ms` included.
-     It is green on the old logic once it compiles, so its red is the compile failure until the new fields
-     exist; afterwards it catches any change to the order or the wait of input with no estimate.
+     fits an unknown duration or an unknown tail, and its sum saturates
+     (`cost.rs:424-442`);
+   - a **characterization test** against the pre-change `drain_cost` as an oracle **[code]**:
+     `with_no_estimates_every_old_case_gives_the_old_order_and_waits` (`cost.rs:238`) runs the pre-tail
+     cases at several clocks through `drain_cost_before_tail` (`cost.rs:213`, the old function kept
+     verbatim, returning `(id, wait_ms, leases)`) and through the new `drain_cost`, and requires the same
+     id, `wait_ms`, leases and order; `tail_end` is checked on its own. It is green on the old logic once it
+     compiles, so its red is the compile failure until the new fields exist; afterwards it catches any
+     change to the order or the wait of input with no estimate.
    The existing goldens (the hosts-API field and the D55 record rows; D55, W6 and W14 are
    decisions in jobscheduler `docs/design/whole-node.md`) are unchanged: nothing is written or
    exported by this step. Neither engine reads the new field yet, but both call sites are
    edited. The weaker overdue rule (3.3) and the `ceiling` handling arrive with the step that passes real
    values (step 2 for the registry, the `js-sched` step for the embedded core), tied to tests (g)
-   and (d).
+   and (d); `ceiling` handling is the caller's.
 
 **The steps after this depend on the choice of path (3.2), which the maintainers make.**
 
@@ -491,7 +497,7 @@ the registry's start and wait path moves onto it; 2 to 4 are not built.
 - **kbf: bump the js revision** after the js-sched step. The both-core test stays green.
 - **Remove the give-up** in an engine (the hold deadline, back-off and attempt count, and
   `drain_after_ms` as a wait), only after the enforced bound (M1), the re-pick (M2) and
-  the overdue rule (M4) are green in that engine: the give-up was also the escape from a
+  the overdue case (4.4) are green in that engine: the give-up was also the escape from a
   wrong pick. Compatibility in 4.11. The registry's give-up stays in this work (4.12).
 - **Record the tail at mark time** (small, any path, after step 1): the mark stores `DrainCost.tail_end` (added in step 1)
    with the estimated end that produced it, and the request's later start, so the wait versus the
@@ -508,7 +514,8 @@ the letters and the numbering are unchanged. Under Path R some of them live belo
 
 | tests | live in |
 |---|---|
-| (a) pick by least tail, (d) ceiling and unknown, (g) overdue, (p) past the enforced end, (c) the backfill predicate | unit tests in `crates/js-whole/src/cost.rs`, on `tail()`, `drain_cost`, `fits_in_tail`; (a) and (g) also once through `js-registry` `reserve.rs` (the A/B red test of step 2) |
+| (a) pick by least tail, (d) the unknown half (`a_host_with_an_unknown_lease_ranks_after_every_known_tail`, `cost.rs:341`), (g) and (p) the fits-in-tail half, (c) the backfill predicate | unit tests in `crates/js-whole/src/cost.rs`, on `tail()`, `drain_cost`, `fits_in_tail`; (a) and (g) also once through `js-registry` `reserve.rs` (the A/B red test of step 2) |
+| (d) the ceiling half: a bound over `ceiling` is treated as no bound | the caller's tests (lease server, `js-sched`); `tail()` takes no ceiling (3.5) |
 | (c) a started backfill, (s) `bounds_enforced` | `js-registry` for the gate (step 3, 4.14); `js-sched` for the embedded core |
 | (h) moves keep `made`, (m) cap at `max_draining = 1`, (j)-(k) give-up and compatibility | `js-sched` (`Drain`, `hold_whole`). The registry is sticky and keeps its own tests (4.12) |
 | (b), (e), (f), (i), (l), (n), (o), (q), (r), (t) | `js-sched` only: partial request, queue order, QoS, whole-node caps, ordinary large actions, recording |
@@ -529,9 +536,10 @@ replace the `js-sched` test of the same letter, which proves the scheduler reads
   remaining tail backfills and one with an equal or longer bound does not. (e) Older same-QoS
   work ahead of the large request lands on the reserved worker, and the large job starts
   after it but before any later arrival. (f) A lower-QoS large request waits out a
-  higher-QoS stream and starts when it stops. (g) Overdue: a worker whose lease is past
-  its estimate is not preferred over a worker with a real shorter tail, and admits no
-  backfill beyond `margin`. (h) The reservation moves when the reserved worker's tail
+  higher-QoS stream and starts when it stops. (g) Overdue: `fits_in_tail` admits no backfill
+  on a tail that is past (`now + duration + margin <= past end` is false, `cost.rs:106`), which holds
+  today; and, if the pick-side floor is built (3.3), a worker whose lease is past its estimate is not
+  preferred over a worker with a real shorter tail. (h) The reservation moves when the reserved worker's tail
   grows past another's, keeps its `made` time, and does not move on a tie. (i) An
   ordinary large action is not counted by `max_whole_node` and is not dropped by
   `ceiling_excess`. (j) At the give-up removal the deadline and give-up tests are removed with the code, and a
@@ -581,7 +589,10 @@ unchanged beyond 4.11); both engines keep their marks in memory only (2.4).
    `blocked_since` and the wait before a hold are not built. The give-up of a presented
    request (`deadline`, the back-off, `max_reserve_attempts`, `drain_after_ms`) is
    removed in the give-up removal step (3.6), after the enforced `max_wall` (kbf step 0), the non-sticky re-pick
-   (4.9) and the overdue rule (3.3) are tested: they replace what the give-up did, which
+   (4.9) are tested and the overdue case is closed: either the pick-side floor of 3.3 is built, or the
+   red run of tests (g) and (p) shows that no mark lands on a host that is not free.
+   `fits_in_tail` already refuses backfill on an overdue tail (`cost.rs:106`), and that part holds
+   today. These replace what the give-up did, which
    was to bound a delay and to move a request off a wrong pick. Keep the caps.
 5. **One hold per pool, first (recommended).** Several large requests take their tails in
    turn: slower, never stuck by each other. Allow more only if the #169 run shows the
