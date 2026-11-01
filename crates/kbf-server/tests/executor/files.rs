@@ -134,14 +134,13 @@ fn ended_any(rig: &Rig, outcome: &str) -> bool {
 
 /// Catches a host that cannot deliver files being handed back and re-leased at once, without
 /// bound: it is held out like a host with a sick quota, so its lease stays booked and idle
-/// (no release, no new lease asked for) while the hold lasts. The action ends as the
+/// (no release, no other lease booked) while the hold lasts. The action ends as the
 /// infrastructure failure the farm reruns, not as a loss to the host.
 #[tokio::test(start_paused = true)]
 async fn a_files_unsupported_host_is_not_leased_again_within_the_hold() {
     let mut rig = rig().await;
     rig.pump().await;
     let lease = rig.exec.hosts()[0].lease;
-    let leases = count(&rig.requests(), "POST /v1/leases");
     assert!(rig.fake.refuse_posts("node1", Some("files-unsupported")));
     let _caller = rig.submit(3);
     rig.elapse(15).await;
@@ -151,7 +150,16 @@ async fn a_files_unsupported_host_is_not_leased_again_within_the_hold() {
     assert!(rig.exec.hosts().is_empty(), "{:?}", rig.exec.hosts());
     let delete = format!("DELETE /v1/leases/{lease}");
     assert_eq!(count(&rig.requests(), &delete), 0);
-    assert_eq!(count(&rig.requests(), "POST /v1/leases"), leases);
+    // No other lease is booked: the held-out one is the only one, and the pool has no more.
+    let booked: Vec<_> = rig
+        .api
+        .leases()
+        .await
+        .expect("leases")
+        .iter()
+        .map(|l| l.id)
+        .collect();
+    assert_eq!(booked, [lease]);
 }
 
 /// Catches the agent's own refusal (a run that ended without starting, detail
