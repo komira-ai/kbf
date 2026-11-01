@@ -265,3 +265,34 @@ fn the_help_says_what_the_build_action_span_leaves_out() {
     );
     assert!(!flat.contains("build wall"), "{flat}");
 }
+
+/// Catches: the label of arm A demanded or used when only arm B has builds (the relaxed rule
+/// must hold in both directions).
+#[test]
+fn only_arm_b_having_builds_needs_only_its_label() {
+    let dir = dirs(
+        &[row("a1", None, None, (0, 1, 5))],
+        &[row("b1", Some("x"), None, (0, 2, 9))],
+        "compare-builds-cli-b-only",
+    );
+    let json: Value = serde_json::from_str(
+        &verb(
+            &dir,
+            &[
+                "--json",
+                "--setting",
+                "k7",
+                "--label-b",
+                "js",
+                "--seed",
+                "1",
+                "--commit",
+                "c",
+            ],
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(json["runs"]["a"].as_array().unwrap().len(), 0);
+    assert_eq!(json["runs"]["b"][0]["arm"], "js");
+}

@@ -6,6 +6,10 @@ use serde_json::{Value, json};
 use crate::builds::{BuildStats, Spread};
 use crate::compare::{count_row, delta, duration_row};
 
+/// What the span is, printed with the per-build rows.
+pub(crate) const SPAN_NOTE: &str =
+    "build action span (server): excludes the client's own analysis and local actions";
+
 /// Appends the per-build rows of the table: counts, the server's build action span and the
 /// queue time total (attempt-seconds) at p50 and p90 over builds, and the median over builds
 /// of each build's own attempt queue wait p50 and p90. An arm that names no build prints `-`
@@ -24,6 +28,10 @@ pub(crate) fn rows(out: &mut String, a: &BuildStats, b: &BuildStats) {
         a.unfinished,
         b.unfinished,
     );
+    if [a, b].iter().any(|arm| arm.recorded()) {
+        out.push_str(SPAN_NOTE);
+        out.push('\n');
+    }
     type Get = fn(&BuildStats) -> Spread;
     let spreads: [(&str, &str, Get); 2] = [
         ("build action span", "(s)", |s| s.action_span),

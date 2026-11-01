@@ -57,13 +57,13 @@ use std::fmt::Write;
 use serde_json::{Value, json};
 
 use crate::build_report;
-use crate::builds::{self, BuildStats, GroupBy, RunLabels};
+use crate::builds::{self, BuildStats, GroupBy, RunLabels, Spread};
 use crate::phases::{self, PhaseStats};
 use crate::row::Row;
 
 /// What the numbers cannot see. Printed with every report.
 pub const NOT_RECORDED: [&str; 5] = [
-    "Per-build wall and queue wait: a row carries no invocation id, so only per-attempt numbers exist.",
+    "Per-build action span and queue time: a row carries no invocation id, so only per-attempt numbers exist.",
     "Attempts the history does not hold (no invocation id, aged out of retention) are in no number.",
     "An attempt with no end (lost, or in flight at the export) has no wall and cannot move the makespan's end; the makespan is the export's window of recorded times, not a build's.",
     "The queue wait of an attempt that never started is not recorded; it is counted by outcome, never given a wait.",
@@ -79,13 +79,7 @@ pub fn not_recorded(a: &ArmStats, b: &ArmStats) -> Vec<&'static str> {
 }
 
 /// A median and a 90th percentile, in microseconds; `None` when there is no sample.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Percentiles {
-    /// Median (nearest rank).
-    pub p50: Option<u64>,
-    /// 90th percentile (nearest rank).
-    pub p90: Option<u64>,
-}
+pub type Percentiles = Spread;
 
 /// Attempts killed for memory, by kind.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -138,18 +132,8 @@ impl ArmStats {
     }
 }
 
-/// The value at percentile `p` (1 to 100) of `sorted`, by nearest rank.
-fn nearest(sorted: &[u64], p: u64) -> Option<u64> {
-    let rank = (p * sorted.len() as u64).div_ceil(100).max(1);
-    sorted.get((rank - 1) as usize).copied()
-}
-
-fn percentiles(mut values: Vec<u64>) -> Percentiles {
-    values.sort_unstable();
-    Percentiles {
-        p50: nearest(&values, 50),
-        p90: nearest(&values, 90),
-    }
+fn percentiles(values: Vec<u64>) -> Percentiles {
+    builds::spread(values)
 }
 
 /// The numbers of `rows`.

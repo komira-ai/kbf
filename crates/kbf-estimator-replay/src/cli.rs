@@ -39,8 +39,9 @@ enum Command {
     /// For each successful run, how much slower it was than the same key on a quiet host;
     /// prints a table, or JSON with every run.
     Slowdown(SlowdownArgs),
-    /// Prints queue wait, wall, makespan and kills per 1,000 attempts for two exports, and
-    /// the difference. Read-only.
+    /// Prints queue wait, wall, makespan and kills per 1,000 attempts for two exports, with
+    /// per-build numbers (build action span (server): excludes the client's own analysis and
+    /// local actions; queue time total; attempt queue wait) and the difference. Read-only.
     Compare(CompareArgs),
 }
 
@@ -236,45 +237,61 @@ fn compare_to(args: &CompareArgs, out: &mut impl Write) -> Result<(), String> {
 }
 
 /// The labels of the two arms' per-run records, when either arm has builds to write; an
-/// error naming the flags that are missing when they are not all given.
+/// error when a label an arm with builds needs is missing, when one is empty, or when the
+/// two arm labels are equal (js-analysis would get one run twice).
 fn run_labels(
     args: &CompareArgs,
     a: &compare::ArmStats,
     b: &compare::ArmStats,
 ) -> Result<Option<(RunLabels, RunLabels)>, String> {
-    if ![a, b].iter().any(|arm| arm.builds.recorded()) {
+    let (need_a, need_b) = (a.builds.recorded(), b.builds.recorded());
+    if ![need_a, need_b].contains(&true) {
         return Ok(None);
     }
     let missing: Vec<&str> = [
-        ("--setting", args.setting.is_none()),
-        ("--label-a", args.label_a.is_none()),
-        ("--label-b", args.label_b.is_none()),
-        ("--seed", args.seed.is_none()),
-        ("--commit", args.commit.is_none()),
+        ("--setting", true, args.setting.is_some()),
+        ("--label-a", need_a, args.label_a.is_some()),
+        ("--label-b", need_b, args.label_b.is_some()),
+        ("--seed", true, args.seed.is_some()),
+        ("--commit", true, args.commit.is_some()),
     ]
     .into_iter()
-    .filter_map(|(flag, absent)| absent.then_some(flag))
+    .filter_map(|(flag, needed, given)| (needed && !given).then_some(flag))
     .collect();
-    let (Some(setting), Some(la), Some(lb), Some(seed), Some(commit)) = (
-        &args.setting,
-        &args.label_a,
-        &args.label_b,
-        args.seed,
-        &args.commit,
-    ) else {
+    if !missing.is_empty() {
         return Err(format!(
             "--json writes one run record per build, and an export does not know their \
              labels: give {}",
             missing.join(", ")
         ));
+    }
+    let empty: Vec<&str> = [
+        ("--setting", &args.setting),
+        ("--label-a", &args.label_a),
+        ("--label-b", &args.label_b),
+        ("--commit", &args.commit),
+    ]
+    .into_iter()
+    .filter_map(|(flag, value)| (value.as_deref() == Some("")).then_some(flag))
+    .collect();
+    if !empty.is_empty() {
+        return Err(format!("{} must not be empty", empty.join(", ")));
+    }
+    if args.label_a.is_some() && args.label_a == args.label_b {
+        return Err(
+            "--label-a and --label-b are equal: two arms with one name would put the same \
+             run twice into js-analysis"
+                .to_owned(),
+        );
+    }
+    let text = |v: &Option<String>| v.clone().unwrap_or_default();
+    let labels = |arm: &Option<String>| RunLabels {
+        setting: text(&args.setting),
+        arm: text(arm),
+        seed: args.seed.unwrap_or_default(),
+        commit: text(&args.commit),
     };
-    let labels = |arm: &String| RunLabels {
-        setting: setting.clone(),
-        arm: arm.clone(),
-        seed,
-        commit: commit.clone(),
-    };
-    Ok(Some((labels(la), labels(lb))))
+    Ok(Some((labels(&args.label_a), labels(&args.label_b))))
 }
 
 fn slowdown_to(args: &SlowdownArgs, out: &mut impl Write) -> Result<(), String> {
