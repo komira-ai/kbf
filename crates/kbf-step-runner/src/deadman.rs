@@ -12,6 +12,13 @@
 //! For `verify` the runner arms the earlier of the step's bound and the end of the verify
 //! window, so a `verify` that is still running at `verify_deadline_secs` is stopped here and the
 //! update rolls back.
+//!
+//! A stop that fails is tried again at every tick, and kept on the arming: when the step ends
+//! before a stop has worked, [`Watch::disarm`] gives the runner the error, and the runner stops
+//! with [`crate::RunError::Unstopped`] rather than read a step that ran past its bound. The
+//! dead-man waits in [`StepLauncher::stop`] for as long as it takes, so the launcher bounds its
+//! stop; and if the root part itself is killed, the dead-man dies with it, so the launcher also
+//! bounds the unit itself (see [`StepLauncher`]).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -26,6 +33,8 @@ struct Active {
     unit: String,
     deadline_secs: u64,
     stopped: bool,
+    /// The error of the last try to stop this arming, `None` once a stop worked.
+    stop_error: Option<String>,
 }
 
 #[derive(Default)]
@@ -60,17 +69,18 @@ impl Watch {
             unit: unit.to_owned(),
             deadline_secs,
             stopped: false,
+            stop_error: None,
         });
     }
 
     /// The step ended. `Some` with the error of the dead-man's stop when the step passed its
     /// bound and the dead-man could not stop it.
     pub fn disarm(&self) -> Option<String> {
-        self.state().active = None;
-        None
+        self.state().active.take().and_then(|a| a.stop_error)
     }
 
-    /// The last error of stopping a unit, `None` when the last stop worked.
+    /// The last error of stopping a unit, `None` when the last stop worked. A tick that has
+    /// nothing to stop leaves it as it is.
     pub fn last_error(&self) -> Option<String> {
         self.state().last_error.clone()
     }
@@ -106,20 +116,27 @@ impl DeadMan {
         let Some((unit, arm)) = due else {
             return Ok(false);
         };
-        self.launcher.stop(&unit)?;
+        let stopped = self.launcher.stop(&unit);
+        let error = stopped.as_ref().err().map(ToString::to_string);
         // Only the arming that was stopped: the next try of the step may be armed meanwhile.
         let mut state = self.watch.state();
         let armed = state.active.iter_mut().filter(|a| a.arm == arm);
-        armed.for_each(|a| a.stopped = true);
-        Ok(true)
+        armed.for_each(|a| {
+            a.stopped = error.is_none();
+            a.stop_error.clone_from(&error);
+        });
+        stopped.map(|()| true)
     }
 
     /// Ticks every `poll_secs` until `stop` is set. An error of stopping a unit is kept in the
-    /// watch ([`Watch::last_error`]) and the next tick tries again.
+    /// watch ([`Watch::last_error`]) until a stop works, and the next tick tries again.
     pub fn run(&self, stop: &AtomicBool, poll_secs: u64) {
         while !stop.load(Ordering::Acquire) {
-            let error = self.tick().err().map(|e| e.to_string());
-            self.watch.state().last_error = error;
+            match self.tick() {
+                Ok(false) => {}
+                Ok(true) => self.watch.state().last_error = None,
+                Err(e) => self.watch.state().last_error = Some(e.to_string()),
+            }
             self.clock.sleep_secs(poll_secs);
         }
     }

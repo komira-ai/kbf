@@ -56,6 +56,24 @@ pub enum LaunchError {
 
 /// Runs steps. One launcher is shared by the runner and the dead-man, which stops a step from
 /// its own thread.
+///
+/// What a launcher must do that the runner cannot check (the launcher of migration step 3 is
+/// held to it):
+///
+/// - **A unit name is used again.** The runner starts a step again under the same
+///   [`StepCall::unit`] when the hook asks for another try (`Next::Again`: a deferred
+///   `rollback` or `cleanup`, a deferred `verify`, the post-success watcher) and after a resume.
+///   It does not stop or reset the unit in between (it does stop a unit found `running` on
+///   resume). systemd keeps a transient unit that failed loaded under its name, and refuses to
+///   start another unit of that name, so the launcher clears it before every start
+///   (`systemctl reset-failed <unit>`, a unit that is not loaded being no error) or starts the
+///   unit with `CollectMode=inactive-or-failed`, so that systemd drops it once it has ended,
+///   failed or not.
+/// - **The unit is bounded by itself.** The runner arms the dead-man with the step's bound, but
+///   the dead-man is a thread of the root part: if the root part is killed (`SIGKILL`, the OOM
+///   killer, a crash), the unit it started runs without a bound until the updater is back and
+///   resumes. The launcher sets `RuntimeMaxSec=` to [`StepCall::timeout_secs`] on the unit, so
+///   that systemd ends the step at its bound whatever becomes of the updater.
 pub trait StepLauncher: Send + Sync {
     /// Runs the step and waits for it to end. A step killed by its bound is a [`StepExit`] with
     /// no code.
@@ -63,5 +81,12 @@ pub trait StepLauncher: Send + Sync {
 
     /// Stops the unit of that name and waits until it has ended; a unit that is not running is
     /// not an error.
+    ///
+    /// The dead-man calls it from its thread and waits in it, enforcing nothing else meanwhile,
+    /// so it must end within a bound of its own and escalate: systemd's stop sends `SIGTERM`, then
+    /// `SIGKILL` to the whole unit after `TimeoutStopSec=` (with the default `KillMode=` of the
+    /// control group), and the launcher sets that bound on the unit. An error is kept by the
+    /// dead-man, the stop is tried again at its next tick, and a step that ends before any stop
+    /// worked stops the runner with [`crate::RunError::Unstopped`].
     fn stop(&self, unit: &str) -> Result<(), LaunchError>;
 }

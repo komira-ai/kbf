@@ -89,8 +89,19 @@ impl Layout {
     }
 
     /// Puts `binary` beside the others as version `version`, mode 0755, durably. Changes no link.
+    ///
+    /// The version `current` or `previous` points at is refused
+    /// ([`io::ErrorKind::AlreadyExists`]) and left as it is: a crash between staging over it and
+    /// the switch would leave the unit, or its fallback, running a binary that was never the one
+    /// it switched to.
     pub fn stage(&self, version: &str, binary: &Path) -> io::Result<()> {
         check_version(version)?;
+        if self.in_place(version)? {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "the version `current` or `previous` points at is not staged over",
+            ));
+        }
         let versions = self.dir.join("versions");
         fs::create_dir_all(&versions)?;
         let tmp = versions.join(format!("{version}.tmp"));
@@ -117,7 +128,8 @@ impl Layout {
     }
 
     /// Points `current` at `previous` again. `false` when there is no `previous` or `current`
-    /// already points at it.
+    /// already points at it; an error, with `current` unchanged, when the binary `previous`
+    /// names is not there.
     pub fn flip_back(&self) -> io::Result<bool> {
         let Some(previous) = self.previous()? else {
             return Ok(false);
@@ -125,8 +137,15 @@ impl Layout {
         if self.current()?.as_deref() == Some(previous.as_str()) {
             return Ok(false);
         }
+        fs::symlink_metadata(self.version_path(&previous))?;
         self.set_link("current", &previous)?;
         Ok(true)
+    }
+
+    /// Whether `current` or `previous` points at `version`.
+    fn in_place(&self, version: &str) -> io::Result<bool> {
+        let named = [self.current()?, self.previous()?];
+        Ok(named.iter().any(|v| v.as_deref() == Some(version)))
     }
 
     fn set_link(&self, name: &str, version: &str) -> io::Result<()> {
@@ -166,13 +185,22 @@ fn check_version(version: &str) -> io::Result<()> {
 }
 
 /// The follow-on step of an update that finished: when it succeeded and this updater (version
-/// `running`) is not `version`, stages the updater binary `binary` of the verified release
-/// `release` as `version` and switches to it.
+/// `running`) is not `version`, stages the updater binary of the verified release `release` as
+/// `version` and switches to it.
+///
+/// `binary` is the binary's path inside the release, relative and of plain names; it is taken
+/// only through [`Staged::check`], so a release that changed since it was sealed, or a path that
+/// leaves it, stages nothing and moves no link. There is no way to give this a file of no
+/// verified release.
+///
+/// A version `current` or `previous` already names (a repeat after a crash between the switch
+/// and the restart, or a return to the binary before) is not staged again: it is switched to
+/// when its file holds the bytes of the verified binary, and refused, with nothing changed,
+/// when it does not.
 ///
 /// The record of the update is finished before this is called ([`crate::StepRunner::run`]
-/// returned), so the restart interrupts nothing. It is safe to call again after a crash: the
-/// staging and the switch are idempotent, and the new binary, started, finds `running ==
-/// version` and does nothing.
+/// returned), so the restart interrupts nothing. It is safe to call again after a crash, and
+/// the new binary, started, finds `running == version` and does nothing.
 pub fn follow_on(
     finished: &Finished,
     layout: &Layout,
@@ -184,8 +212,19 @@ pub fn follow_on(
     if !matches!(finished.verdict, Verdict::Succeeded { .. }) || running == version {
         return Ok(FollowOn::NotNeeded);
     }
-    let new_binary = release.dir().join(binary);
-    layout.stage(version, &new_binary)?;
+    let new_binary = release.check(binary)?;
+    if layout.in_place(version)? {
+        let same = fs::read(layout.version_path(version))? == fs::read(&new_binary)?;
+        if !same {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "the version in place holds another binary than the verified release",
+            )
+            .into());
+        }
+    } else {
+        layout.stage(version, &new_binary)?;
+    }
     layout.switch(version)?;
     Ok(FollowOn::Restart)
 }

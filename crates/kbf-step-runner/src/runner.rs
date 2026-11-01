@@ -379,8 +379,16 @@ impl StepRunner {
             // The hook cannot be started: a failed step, and for `rollback` the one case to go
             // to the previous release's hook (3.3).
             Err(ArtifactError::BadHookPath(_) | ArtifactError::HookMissing(_)) => Ran::NoStart,
+            // The tree could not be read (out of descriptors, an I/O error): that passes, and it
+            // says nothing about the tree. Nothing runs, nothing is written: the step is still
+            // pending, and the next run checks again.
+            Err(error @ ArtifactError::Io(_)) => return Err(RunError::Unreadable(error)),
             // The tree is not what was verified: nothing from it runs.
-            Err(_) => {
+            Err(
+                ArtifactError::Changed { .. }
+                | ArtifactError::Untrusted(_)
+                | ArtifactError::Unsupported(_),
+            ) => {
                 rec.state = State::Finished {
                     verdict: Verdict::Halt,
                     reason: Some(REASON_ARTIFACT_CHANGED.to_owned()),
@@ -447,7 +455,11 @@ impl StepRunner {
             unit: &unit,
             timeout_secs: timeout,
         });
-        self.watch.disarm();
+        // A step the dead-man could not stop at its bound ran past it: what it reports is not
+        // read. It stays `running` in the record, and the next run stops its unit by name first.
+        if let Some(error) = self.watch.disarm() {
+            return Err(RunError::Unstopped { unit, error });
+        }
         match result {
             Ok(exit) => Ok(Ran::Exit(exit)),
             Err(LaunchError::NoStart(_)) => Ok(Ran::NoStart),
