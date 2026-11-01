@@ -24,6 +24,7 @@ use crate::executor::metrics::{IngestEnd, Metrics, RunEnd};
 use crate::executor::outcome::{
     Settled, Verdict, judge, ran, refused_for_files, refused_for_quota, result_of,
 };
+use crate::executor::phases::{Mark, Timeline};
 use crate::executor::task::{Nonce, PackKey, TaskArgs};
 use crate::executor::traits::{Ingested, InputsError, MintError, PresignError, UntrustedLimits};
 use crate::executor::{Ctx, note};
@@ -36,6 +37,8 @@ pub(super) const RUN_LABEL: &str = "kbf-run";
 pub(super) struct Task {
     pub(super) action: Digest,
     pub(super) stage: Stage,
+    /// When the run passed each of its moments, on the executor's clock.
+    pub(super) timeline: Timeline,
 }
 
 pub(super) enum Stage {
@@ -166,6 +169,7 @@ impl HostWorker {
             .or_insert(Task {
                 action,
                 stage: Stage::Waiting(waiting),
+                timeline: Timeline::default(),
             });
     }
 
@@ -221,6 +225,7 @@ impl HostWorker {
                 self.drop_task(lease);
                 continue;
             };
+            self.stamp(lease, Mark::Seen, at, ctx);
             match self.queue(ctx, lease, &action, &w, deadline).await {
                 Queued::Wait(prepared) => {
                     let w = Waiting {
@@ -229,7 +234,10 @@ impl HostWorker {
                     };
                     self.set_stage(lease, Stage::Waiting(w));
                 }
-                Queued::Posted(running) => self.set_stage(lease, Stage::Running(running)),
+                Queued::Posted(running) => {
+                    self.stamp(lease, Mark::Posted, ctx.clock.now(), ctx);
+                    self.set_stage(lease, Stage::Running(running));
+                }
                 Queued::Settled(settled) => {
                     self.settle_with(lease, &settled, now, &ctx.deps.metrics);
                 }
@@ -242,6 +250,14 @@ impl HostWorker {
             }
         }
         ControlFlow::Continue(())
+    }
+
+    /// Stamps `mark` of `lease`'s run at `at`: the first stamp of each is kept.
+    fn stamp(&mut self, lease: kbf_types::LeaseId, mark: Mark, at: Instant, ctx: &Ctx<'_>) {
+        let metrics = &ctx.deps.metrics;
+        self.tasks
+            .entry(lease)
+            .and_modify(|task| task.timeline.stamp(mark, at, metrics));
     }
 
     fn set_stage(&mut self, lease: kbf_types::LeaseId, stage: Stage) {
@@ -281,7 +297,10 @@ impl HostWorker {
                 let preparing =
                     tokio::time::timeout_at(deadline, self.prepare(ctx, lease, action, w));
                 match preparing.await {
-                    Ok(Ok(prepared)) => Arc::new(prepared),
+                    Ok(Ok(prepared)) => {
+                        self.stamp(lease, Mark::Prepared, ctx.clock.now(), ctx);
+                        Arc::new(prepared)
+                    }
                     Ok(Err(settled)) => return Queued::Settled(settled),
                     Err(_) => return Queued::Late,
                 }
@@ -545,10 +564,14 @@ impl HostWorker {
         truncated: bool,
         key: PackKey,
     ) {
-        let ended = matches!(
-            run.state,
-            RunState::Exited | RunState::Ended | RunState::NeverStarted
-        );
+        if run.state == RunState::Running {
+            self.stamp(lease, Mark::Running, now, ctx);
+        }
+        let exited = matches!(run.state, RunState::Exited | RunState::Ended);
+        if exited {
+            self.stamp(lease, Mark::Ended, now, ctx);
+        }
+        let ended = exited || run.state == RunState::NeverStarted;
         if !ended {
             return;
         }
@@ -582,6 +605,7 @@ impl HostWorker {
             match &mut task.stage {
                 Stage::Ingesting(handle) => {
                     let next = handle.now_or_never().map(|done| {
+                        task.timeline.stamp(Mark::Done, now, &ctx.deps.metrics);
                         let (result, end) = ingested(*lease, &task.action, done);
                         ctx.deps.metrics.ingested(end);
                         ctx.deps.metrics.run_ended(RunEnd::of(&result));
