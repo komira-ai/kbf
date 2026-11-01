@@ -92,7 +92,8 @@ async fn a_files_unsupported_refusal_drains_the_host_and_reruns_the_action() {
     assert!(rig.fake.refuse_posts("node1", Some("files-unsupported")));
     let caller = rig.submit(3);
     rig.pump().await;
-    assert!(rig.exec.hosts()[0].draining);
+    // The worker is retired and its lease is kept, held out (see the test of the hold).
+    assert!(rig.exec.hosts().is_empty(), "{:?}", rig.exec.hosts());
     assert!(rig.runs().await.is_empty());
     assert!(caller.finished().is_none(), "{:?}", caller.finished());
     assert!(ended_any(&rig, "infra"), "{}", rig.counted());
@@ -146,9 +147,8 @@ async fn a_files_unsupported_host_is_not_leased_again_within_the_hold() {
     rig.elapse(15).await;
     assert!(ended_any(&rig, "infra"), "{}", rig.counted());
     assert!(!ended_any(&rig, "lost"), "{}", rig.counted());
-    let held = rig.exec.hosts();
-    assert_eq!(held.len(), 1, "{held:?}");
-    assert!(held[0].draining);
+    // The worker is retired, and its lease stays booked, idle.
+    assert!(rig.exec.hosts().is_empty(), "{:?}", rig.exec.hosts());
     let delete = format!("DELETE /v1/leases/{lease}");
     assert_eq!(count(&rig.requests(), &delete), 0);
     assert_eq!(count(&rig.requests(), "POST /v1/leases"), leases);
@@ -173,9 +173,8 @@ async fn an_agent_that_refused_the_files_is_held_out() {
     );
     rig.elapse(15).await;
     assert!(ended_any(&rig, "infra"), "{}", rig.counted());
-    let held = rig.exec.hosts();
-    assert_eq!(held.len(), 1, "{held:?}");
-    assert!(held[0].draining);
+    // The worker is retired, and its lease stays booked, idle.
+    assert!(rig.exec.hosts().is_empty(), "{:?}", rig.exec.hosts());
     let delete = format!("DELETE /v1/leases/{lease}");
     assert_eq!(count(&rig.requests(), &delete), 0);
 }
