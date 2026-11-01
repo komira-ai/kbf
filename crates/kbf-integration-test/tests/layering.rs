@@ -70,7 +70,11 @@
 //! - the state store (`kbf-state`, a re-export of `js-state`) depending on any other crate of
 //!   this workspace (with its test-database feature too, which brings `js-testkit` and not
 //!   `kbf-testkit`), which would stop it from being extracted, and the pack index (`kbf-pack-index`) depending on any but the state store;
-//!   each with a walk that cannot see what it should, which would make the check vacuous.
+//!   each with a walk that cannot see what it should, which would make the check vacuous;
+//! - the hook contract crate (`update-hook`) linking, in its normal tree or among its dev-dependencies,
+//!   any other crate of this workspace, or having `kbf` in its name: services depend on the
+//!   contract and not on kbf, and tierstore will leave this repository; and a walk that cannot see
+//!   its dependencies, which would make that check pass vacuously.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::process::Command;
@@ -844,6 +848,62 @@ fn pack_adopt_reaches_neither_the_frontend_nor_the_daemon() {
         violations.is_empty(),
         "kbf-pack-adopt reaches a frontend or daemon crate:\n{}",
         violations.join("\n")
+    );
+}
+
+/// Asserts that the hook contract crate links no other crate of this workspace (normal tree,
+/// and no workspace crate among its dev-dependencies either, since the harness is a
+/// dev-dependency of services outside this repository), and that its name does not say `kbf`.
+#[test]
+fn the_update_hook_contract_reaches_no_other_workspace_crate() {
+    let g = load_graph();
+    let (_, root) = g
+        .members
+        .get("update-hook")
+        .expect("update-hook is a workspace member");
+    assert!(root.is_some(), "update-hook must have a library target");
+    assert!(
+        !"update-hook".contains("kbf"),
+        "the contract crate is named without kbf"
+    );
+    let linked = linked_by("update-hook");
+    assert!(
+        linked.contains("serde_json"),
+        "update-hook's tree must hold serde_json, or this walk proves nothing: {linked:?}"
+    );
+    let violations = workspace_crates_beyond(&g, &linked, &["update-hook"]);
+    assert!(
+        violations.is_empty(),
+        "update-hook links another crate of this workspace: {violations:?}"
+    );
+
+    let cargo = std::env::var("CARGO").expect("CARGO is set when cargo runs a test");
+    let out = Command::new(cargo)
+        .args(["metadata", "--format-version", "1", "--no-deps", "--locked"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("run cargo metadata");
+    assert!(out.status.success(), "cargo metadata failed");
+    let meta: Value = serde_json::from_slice(&out.stdout).expect("cargo metadata emits JSON");
+    let packages = meta["packages"].as_array().expect("packages");
+    let members: BTreeSet<&str> = packages
+        .iter()
+        .map(|p| p["name"].as_str().expect("package name"))
+        .collect();
+    let pkg = packages
+        .iter()
+        .find(|p| p["name"] == "update-hook")
+        .expect("update-hook is a workspace member");
+    let deps: BTreeSet<&str> = pkg["dependencies"]
+        .as_array()
+        .expect("dependencies")
+        .iter()
+        .filter_map(|d| d["name"].as_str())
+        .filter(|name| members.contains(name) && *name != "update-hook")
+        .collect();
+    assert!(
+        deps.is_empty(),
+        "update-hook depends (even as a dev-dependency) on {deps:?}"
     );
 }
 
