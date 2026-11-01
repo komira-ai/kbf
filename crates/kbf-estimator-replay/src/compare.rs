@@ -21,7 +21,14 @@
 //!   does the difference when either arm lacks it. The difference is arm B less arm A.
 //!
 //! A timestamp pair that is out of order, and an `ok` attempt with no end, are counted
-//! ([`ArmStats::out_of_order`], [`ArmStats::ok_without_end`]) and not used. What the export
+//! ([`ArmStats::out_of_order`], [`ArmStats::ok_without_end`]) and not used. An
+//! out-of-order row is left out of wall and wait but its end still sets the makespan's end;
+//! a latest end before the earliest queue time gives no makespan (absent, counted once as
+//! out of order).
+//!
+//! B - A is a difference of two single numbers, not a significance test; the paper's rule
+//! needs the 95% Welch CI over runs to exclude 0.
+//! What the export
 //! cannot say is printed with every report ([`NOT_RECORDED`]); nothing is estimated.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -83,7 +90,9 @@ pub struct ArmStats {
     pub kills: Kills,
     /// `ok` attempts with a start and no end.
     pub ok_without_end: u64,
-    /// Timestamp pairs (queue/start, start/end) where the later is before the earlier.
+    /// Timestamp pairs (queue/start, start/end) where the later is before the earlier,
+    /// plus one when the latest end is before the earliest queue time. Such rows are
+    /// excluded from wall and wait but still set the makespan end.
     pub out_of_order: u64,
 }
 
@@ -146,7 +155,10 @@ pub fn analyze(rows: &[Row]) -> ArmStats {
     }
     stats.makespan_us = last_ended
         .zip(first_queued)
-        .map(|(e, q)| e.saturating_sub(q));
+        .and_then(|(e, q)| e.checked_sub(q));
+    if last_ended.is_some() && stats.makespan_us.is_none() {
+        stats.out_of_order += 1;
+    }
     stats.queue_wait_samples = waits.len() as u64;
     stats.queue_wait = percentiles(waits);
     stats.wall_samples = walls.len() as u64;
@@ -169,7 +181,7 @@ fn line(out: &mut String, label: &str, cells: [String; 3]) {
 /// Seconds with three decimals (half up) of a signed microsecond value.
 fn secs(us: i128) -> String {
     let ms = (us.abs() + 500) / 1000;
-    let sign = if us < 0 { "-" } else { "" };
+    let sign = if us < 0 && ms > 0 { "-" } else { "" };
     format!("{sign}{}.{:03}", ms / 1000, ms % 1000)
 }
 
@@ -277,6 +289,9 @@ pub fn render_text(a: &ArmStats, b: &ArmStats) -> String {
         "times out of order",
         a.out_of_order,
         b.out_of_order,
+    );
+    out.push_str(
+        "B - A is a difference of two single numbers, not a significance test; the paper's rule needs the 95% Welch CI over runs to exclude 0.\n",
     );
     out.push_str("Not recorded (not estimated):\n");
     for gap in NOT_RECORDED {
