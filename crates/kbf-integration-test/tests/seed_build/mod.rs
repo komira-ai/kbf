@@ -10,7 +10,8 @@
 //! reports every way they differ from these rules:
 //!
 //! - **The seed jobs exist.** `artifacts.yml` has each of [`SEED_JOBS`], a job with steps (not
-//!   a call of another workflow).
+//!   a call of another workflow) that needs no other job, downloads no artifact and runs no
+//!   local action: it builds from the checkout alone.
 //! - **On a GitHub-hosted runner.** Each one's `runs-on` is one label of GitHub's hosted
 //!   runner table, written out literally ([`workflows::job_runs_on`],
 //!   [`workflows::is_hosted_label`]): not `self-hosted`, a custom label, a runner group or an
@@ -18,18 +19,22 @@
 //! - **Plain cargo.** Each builds the `kbf-cli` package (`kbf`) in an unconditional step, and
 //!   every `cargo build` line of the job is plain: `cargo build --locked --release`, then only
 //!   [`BUILD_FLAGS`] (a target, packages, binaries), after no variable but
-//!   [`BUILD_VARIABLES`], in a step with no `shell:` of its own. A line that compiles with
-//!   another cargo verb ([`OTHER_BUILD_VERBS`]) is refused, and no scalar of the job (a key or
-//!   value: its runner, `env`, steps, scripts and action inputs) nor of the workflow's own
-//!   `env:` names any of [`NOT_PLAIN`] (Buck or Bazel, a remote-execution or remote-cache
-//!   flag, a gRPC farm address, a rustc wrapper).
+//!   [`BUILD_VARIABLES`], in a step with no `shell:` of its own and a job with no `defaults:`
+//!   of its own (the workflow's shell is held to bash by `attested_bundles`). A line that compiles with another cargo verb
+//!   ([`OTHER_BUILD_VERBS`]), or puts a cargo option before its verb (`cargo --config ...
+//!   build`), is refused, and no scalar of the job (a key or value: its runner, `env`, steps,
+//!   scripts and action inputs) nor of the workflow's own `env:` names any of [`NOT_PLAIN`]
+//!   (Buck2 or Bazel, a remote-execution or remote-cache flag, a gRPC farm address, another
+//!   rustc or a wrapper of it). Cargo's own configuration files are not read: a change there
+//!   is a change to every build of the repository, reviewed as such.
 //! - **The published files are theirs.** Each seed job uploads its files as the artifact
 //!   `assets-<job>` in an unconditional step, and no other job of `artifacts.yml`, of
-//!   `pipeline.yml` or of a workflow the pipeline calls (whose artifacts share the
-//!   pipeline's run) uploads an artifact whose name starts [`ASSETS_PREFIX`], or might (a
-//!   name an expression starts). An attest job downloads each seed job's artifact, and the
+//!   `pipeline.yml` or of a workflow the pipeline calls, at any depth (whose artifacts share
+//!   the pipeline's run), uploads an artifact whose name starts [`ASSETS_PREFIX`], or might (a
+//!   name an expression starts); nor does such a job run a local action or call a workflow
+//!   this lint did not read. An attest job downloads each seed job's artifact, and the
 //!   release's `verify` job downloads every seed job's artifact from the pipeline run that
-//!   started it.
+//!   started it, each in an unconditional step that names it by one `pattern:` or `name:`.
 //! - **The release needs them.** In `artifacts.yml` each seed job is needed by the sums job
 //!   of its platform group and by `sums` ([`SEED_GROUPS`]: the sums the attest job holds its
 //!   files to, by the digest the pipeline passes, which `pipeline_workflow` pins), and each
@@ -85,9 +90,12 @@ pub const OTHER_BUILD_VERBS: &[&str] = &["b", "rustc", "install", "zigbuild", "a
 
 /// What no scalar of a seed job, nor the workflow's `env:`, may name, compared ignoring ASCII
 /// case: another build system, a remote-execution or remote-cache setting, a farm's gRPC
-/// address, or a wrapper that hands rustc's work to something else.
+/// address, or another rustc (`RUSTC`, `CARGO_BUILD_RUSTC`, a wrapper, a line that writes one
+/// to `$GITHUB_ENV`: no seed job names rustc at all) or a cache that hands its work elsewhere.
 pub const NOT_PLAIN: &[&str] = &[
-    "buck",
+    "buck2",
+    "buck-out",
+    "buckconfig",
     "bazel",
     "remote_executor",
     "remote-executor",
@@ -99,10 +107,7 @@ pub const NOT_PLAIN: &[&str] = &[
     "action_cache_address",
     "grpc://",
     "grpcs://",
-    "rustc_wrapper",
-    "rustc-wrapper",
-    "rustc_workspace_wrapper",
-    "rustc-workspace-wrapper",
+    "rustc",
     "sccache",
 ];
 
@@ -158,6 +163,16 @@ fn seed_job(text: &str, job: &str, out: &mut Vec<String>) -> Result<(), String> 
         ));
         return Ok(());
     }
+    if workflows::job_has_key(text, job, "defaults")? {
+        out.push(format!(
+            "the seed job `{job}` has `defaults:` of its own, which can run its build under another shell"
+        ));
+    }
+    if !workflows::job_needs(text, job)?.is_empty() {
+        out.push(format!(
+            "the seed job `{job}` needs another job: it builds from the checkout alone"
+        ));
+    }
     match workflows::job_runs_on(text, job) {
         Ok(label) if workflows::is_hosted_label(&label) => {}
         Ok(label) => out.push(format!(
@@ -184,6 +199,16 @@ fn seed_job(text: &str, job: &str, out: &mut Vec<String>) -> Result<(), String> 
     let steps = workflows::job_steps(text, job)?;
     let mut builds_kbf = false;
     for step in &steps {
+        if is_download(step) {
+            out.push(format!(
+                "the seed job `{job}` downloads an artifact: its files are built by its own cargo, not taken from another job"
+            ));
+        }
+        if let Some(local) = step.uses.as_deref().filter(|u| u.starts_with("./")) {
+            out.push(format!(
+                "the seed job `{job}` runs the local action `{local}`, which this lint does not read"
+            ));
+        }
         for line in step.run.as_deref().unwrap_or_default().lines() {
             match build_line(line) {
                 Build::None => {}
@@ -253,6 +278,10 @@ fn build_line(line: &str) -> Build<'_> {
         ["cargo", verb, ..] => *verb,
         _ => return Build::None,
     };
+    let compiles = |w: &&str| *w == "build" || OTHER_BUILD_VERBS.contains(w);
+    if verb.starts_with('-') && words.iter().any(compiles) {
+        return Build::NotPlain(format!("`{verb}` comes before the verb"));
+    }
     if verb != "build" {
         return if verb.starts_with('+') || OTHER_BUILD_VERBS.contains(&verb) {
             Build::NotPlain(format!("it compiles with `cargo {verb}`"))
@@ -285,18 +314,25 @@ fn build_line(line: &str) -> Build<'_> {
     Build::Plain(packages)
 }
 
+/// Whether `step` runs the action `action` or one of its sub-actions (`actions/upload-artifact/merge`).
+fn runs_action(step: &Step, action: &str) -> bool {
+    step.uses.as_deref().is_some_and(|u| {
+        let name = u
+            .split_once('@')
+            .map_or(u, |(name, _)| name)
+            .to_ascii_lowercase();
+        name == action || name.starts_with(&format!("{action}/"))
+    })
+}
+
 /// Whether `step` uploads a workflow artifact.
 fn is_upload(step: &Step) -> bool {
-    step.uses
-        .as_deref()
-        .is_some_and(|u| u.starts_with("actions/upload-artifact@"))
+    runs_action(step, "actions/upload-artifact")
 }
 
 /// Whether `step` downloads workflow artifacts.
 fn is_download(step: &Step) -> bool {
-    step.uses
-        .as_deref()
-        .is_some_and(|u| u.starts_with("actions/download-artifact@"))
+    runs_action(step, "actions/download-artifact")
 }
 
 /// The value of `step`'s input `key`, if it passes one.
@@ -309,7 +345,10 @@ fn input<'a>(step: &'a Step, key: &str) -> Option<&'a str> {
 
 /// The artifact name an upload step gives (`artifact` without a `name:`, as the action does).
 fn upload_name(step: &Step) -> &str {
-    input(step, "name").unwrap_or("artifact")
+    match input(step, "name").map(str::trim) {
+        Some(name) if !name.is_empty() => name,
+        _ => "artifact",
+    }
 }
 
 /// Whether an upload named `name` could be read as a release file's artifact: its name
@@ -344,15 +383,20 @@ fn matches(pattern: &str, name: &str) -> bool {
     rest.len() >= last.len() && rest.ends_with(last)
 }
 
-/// Whether a download step of `steps` reads the artifact `name`, with `run-id` `run_id` (none:
-/// this run's).
+/// Whether an unconditional download step of `steps` reads the artifact `name`, with `run-id`
+/// `run_id` (none: this run's), by a `pattern:` or a `name:` (not both, and no `artifact-ids:`,
+/// which the action reads first).
 fn downloads(steps: &[Step], name: &str, run_id: Option<&str>) -> bool {
     steps.iter().any(|s| {
+        let by = match (input(s, "pattern"), input(s, "name")) {
+            (Some(p), None) | (None, Some(p)) => Some(p.trim()),
+            _ => None,
+        };
         is_download(s)
+            && !s.conditional
+            && input(s, "artifact-ids").is_none()
             && input(s, "run-id") == run_id
-            && input(s, "pattern")
-                .or_else(|| input(s, "name"))
-                .is_some_and(|p| matches(p, name))
+            && by.is_some_and(|p| matches(p, name))
     })
 }
 
@@ -364,10 +408,27 @@ fn published(w: &Workflows<'_>, out: &mut Vec<String>) -> Result<(), String> {
     for (path, text) in texts {
         for job in workflows::job_names(text)? {
             let seed = path == "artifacts.yml" && SEED_JOBS.contains(&job.as_str());
-            if seed || workflows::job_uses(text, &job)?.is_some() {
+            if seed {
+                continue;
+            }
+            if let Some(uses) = workflows::job_uses(text, &job)? {
+                let read = uses == ARTIFACTS_USES
+                    || w.called
+                        .iter()
+                        .any(|(p, _)| uses.strip_prefix("./") == Some(p.as_str()));
+                if !read {
+                    out.push(format!(
+                        "the job `{job}` of {path} calls `{uses}`, which this lint does not read for uploads"
+                    ));
+                }
                 continue;
             }
             for step in workflows::job_steps(text, &job)? {
+                if let Some(local) = step.uses.as_deref().filter(|u| u.starts_with("./")) {
+                    out.push(format!(
+                        "the job `{job}` of {path} runs the local action `{local}`, which this lint does not read for uploads"
+                    ));
+                }
                 if is_upload(&step) && may_be_assets(upload_name(&step)) {
                     out.push(format!(
                         "the job `{job}` of {path} uploads `{}`, which the release would take for a seed job's files",
@@ -442,20 +503,29 @@ fn needed(w: &Workflows<'_>, out: &mut Vec<String>) -> Result<(), String> {
     Ok(())
 }
 
-/// The workflows the pipeline calls, as `(uses path, text)`, read from the repository.
+/// The workflows the pipeline calls, and those they call in turn, as `(uses path, text)`, read
+/// from the repository.
 fn called(root: &std::path::Path, pipeline: &str) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    for job in workflows::job_names(pipeline).expect("pipeline.yml is read") {
-        let uses = workflows::job_uses(pipeline, &job).expect("a `uses` is read");
-        if let Some(path) = uses.as_deref().and_then(|u| u.strip_prefix("./"))
-            && path != ARTIFACTS_USES.trim_start_matches("./")
-            && !out.iter().any(|(p, _): &(String, String)| p == path)
-        {
-            let text = std::fs::read_to_string(root.join(path)).expect(path);
-            out.push((path.to_owned(), text));
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut next = 0;
+    let mut text = pipeline.to_owned();
+    loop {
+        for job in workflows::job_names(&text).expect("a called workflow is read") {
+            let uses = workflows::job_uses(&text, &job).expect("a `uses` is read");
+            if let Some(path) = uses.as_deref().and_then(|u| u.strip_prefix("./"))
+                && path != ARTIFACTS_USES.trim_start_matches("./")
+                && !out.iter().any(|(p, _)| p == path)
+            {
+                let found = std::fs::read_to_string(root.join(path)).expect(path);
+                out.push((path.to_owned(), found));
+            }
         }
+        let Some((_, t)) = out.get(next) else {
+            return out;
+        };
+        text = t.clone();
+        next += 1;
     }
-    out
 }
 
 #[test]

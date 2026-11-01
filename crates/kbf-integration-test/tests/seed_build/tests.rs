@@ -244,7 +244,7 @@ fn a_farm_or_remote_execution_flag_in_a_seed_job_is_refused() {
     for job in SEED_JOBS {
         red(
             &w.problems(),
-            &format!("the seed job `{job}` names `rustc_wrapper`"),
+            &format!("the seed job `{job}` names `rustc`"),
         );
     }
     let mut w = real();
@@ -254,10 +254,7 @@ fn a_farm_or_remote_execution_flag_in_a_seed_job_is_refused() {
         "    runs-on: ubuntu-24.04\n",
         "    runs-on: ubuntu-24.04\n    env:\n      RUSTC_WRAPPER: /opt/kbf/rustc-remote\n",
     );
-    red(
-        &w.problems(),
-        "the seed job `linux-x86_64` names `rustc_wrapper`",
-    );
+    red(&w.problems(), "the seed job `linux-x86_64` names `rustc`");
 }
 
 #[test]
@@ -544,4 +541,170 @@ fn artifact_patterns_match_as_the_download_action_does() {
     assert!(may_be_assets("assets-${{ env.NAME }}"));
     assert!(!may_be_assets("profdata-${{ matrix.core }}"));
     assert!(!may_be_assets("sha256sums-linux"));
+}
+
+/// The problems of the real workflows with `to` in place of each seed job's kbf build, `{build}`
+/// in `to` standing for that build's step.
+fn around_kbf_build(job: &str, build: &str, to: &str) -> Vec<String> {
+    spoil_artifacts(job, build, &to.replace("{build}", build))
+}
+
+#[test]
+fn another_rustc_in_a_seed_job_is_refused() {
+    // Catches: a seed job's cargo given another compiler, a shim that can hand its work to a
+    // farm, by `RUSTC` or `CARGO_BUILD_RUSTC` in a step's `env:`, or written to `$GITHUB_ENV`
+    // by an earlier step.
+    for (job, build) in KBF_BUILDS {
+        for to in [
+            "- env:\n          RUSTC: /opt/kbf/remote\n        run: {line}\n",
+            "- env:\n          CARGO_BUILD_RUSTC: /opt/kbf/remote\n        run: {line}\n",
+            "- run: echo \"RUSTC=/opt/kbf/remote\" >> \"$GITHUB_ENV\"\n      {build}",
+        ] {
+            let line = build.trim_start_matches("- run: ").trim_end();
+            let found = around_kbf_build(job, build, &to.replace("{line}", line));
+            red(&found, &format!("the seed job `{job}` names `rustc`"));
+        }
+    }
+}
+
+#[test]
+fn every_word_a_seed_job_may_not_name_is_refused_alone() {
+    // Catches: an entry of `NOT_PLAIN` that no longer refuses the scalar holding it (each
+    // other spoil may be caught by another rule first).
+    for word in NOT_PLAIN {
+        let to = format!("- env:\n          SEED_SPOIL: \"x-{word}-y\"\n        {{build}}");
+        let (job, build) = KBF_BUILDS[1];
+        let to = to.replace("{build}", &build.replacen("- run:", "run:", 1));
+        red(
+            &spoil_artifacts(job, build, &to),
+            &format!("the seed job `{job}` names `{word}`"),
+        );
+    }
+}
+
+#[test]
+fn a_step_named_after_a_bucket_is_not_refused() {
+    // Catches: a refused word matching inside an ordinary one (`buck` in `bucket`), which
+    // would refuse an innocent edit of a seed job.
+    for (job, build) in KBF_BUILDS {
+        let found = spoil_artifacts(
+            job,
+            build,
+            &format!("- name: Copy to the bucket\n        {}", &build[2..]),
+        );
+        assert!(found.is_empty(), "{job}: {found:#?}");
+    }
+}
+
+#[test]
+fn a_cargo_option_before_the_verb_is_refused() {
+    // Catches: `cargo --config ... build` or `cargo -Z ... build`, whose first word after
+    // `cargo` is not the verb, read as a line that builds nothing.
+    for (job, build) in KBF_BUILDS {
+        for to in [
+            build.replace("cargo build", "cargo --config build.jobs=1 build"),
+            build.replace("cargo build", "cargo -Zunstable-options build"),
+        ] {
+            red(&spoil_artifacts(job, build, &to), "comes before the verb");
+        }
+    }
+    assert_eq!(build_line("cargo --version"), Build::None);
+}
+
+#[test]
+fn a_seed_job_that_takes_anything_but_the_checkout_is_refused() {
+    // Catches: a seed job given `needs:` (another job's outputs), an artifact download (files
+    // built elsewhere swapped in before the upload), a local action this lint never reads
+    // or `defaults:` of its own (a shell that runs the build somewhere else).
+    for (job, line) in RUNNERS {
+        for (to, want) in [
+            (format!("{line}    needs: [sums]\n"), "needs another job"),
+            (
+                format!("{line}    defaults:\n      run:\n        shell: farm-shell {{0}}\n"),
+                "has `defaults:` of its own",
+            ),
+        ] {
+            red(&spoil_artifacts(job, line, &to), want);
+        }
+    }
+    for (job, build) in KBF_BUILDS {
+        red(
+            &around_kbf_build(
+                job,
+                build,
+                "- uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1\n        with:\n          name: farm-kbf\n      {build}",
+            ),
+            &format!("the seed job `{job}` downloads an artifact"),
+        );
+        red(
+            &around_kbf_build(
+                job,
+                build,
+                "- uses: ./.github/actions/farm-build\n      {build}",
+            ),
+            &format!("the seed job `{job}` runs the local action"),
+        );
+    }
+}
+
+#[test]
+fn uploads_and_downloads_in_every_spelling_are_read() {
+    // Catches: an assets artifact uploaded by a sub-action (`upload-artifact/merge`) or under
+    // a name with blanks around it; an attest download made skippable, or given
+    // `artifact-ids:` or both `name:` and `pattern:` (which the action reads before the
+    // pattern); a job of a called workflow calling one this lint never read, or running a
+    // local action.
+    let from = "      - name: Assemble SHA256SUMS\n        run: cargo xtask sums assemble dist --summary \"$GITHUB_STEP_SUMMARY\"\n";
+    for (uses, name) in [
+        (
+            "actions/upload-artifact/merge@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+            "assets-merged",
+        ),
+        (
+            "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+            "\" assets-padded\"",
+        ),
+    ] {
+        let to = format!(
+            "      - uses: {uses} # v7.0.1\n        with:\n          name: {name}\n          path: dist/\n"
+        );
+        red(
+            &spoil_artifacts(ALL_SUMS, from, &to),
+            "the job `sums` of artifacts.yml uploads `assets-",
+        );
+    }
+    let pattern = "        with:\n          pattern: assets-linux-*\n";
+    for to in [
+        format!("        if: ${{{{ false }}}}\n{pattern}"),
+        format!("{pattern}          artifact-ids: 1\n"),
+        format!("{pattern}          name: sha256sums-linux\n"),
+    ] {
+        red(
+            &spoil_artifacts("attest-linux", pattern, &to),
+            "the attest job `attest-linux` does not download `assets-linux-x86_64`",
+        );
+    }
+    let mut w = real();
+    let (path, text) = w
+        .called
+        .iter_mut()
+        .find(|(p, _)| p.ends_with("smoke.yml"))
+        .expect("the pipeline calls smoke.yml");
+    text.push_str("  farm:\n    uses: ./.github/workflows/farm-upload.yml\n");
+    let path = path.clone();
+    red(
+        &w.problems(),
+        &format!("the job `farm` of {path} calls `./.github/workflows/farm-upload.yml`"),
+    );
+    let mut w = real();
+    w.pipeline = in_job(
+        &w.pipeline,
+        PASSED,
+        "    steps:\n",
+        "    steps:\n      - uses: ./.github/actions/upload\n",
+    );
+    red(
+        &w.problems(),
+        "the job `passed` of pipeline.yml runs the local action `./.github/actions/upload`",
+    );
 }
