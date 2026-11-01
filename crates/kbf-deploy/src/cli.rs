@@ -434,7 +434,7 @@ pub fn run_at<E: Exec>(
         Kit::Linux(l) => return linux_kit(l, exec, out, err),
         Kit::Mdm(m) => return mdm_kit(m, exec, now, out, err),
         Kit::Log(a) => return log::run(&a, out, err),
-        Kit::HostStatus(a) => return crate::host_status::run(&a, out, err),
+        Kit::HostStatus(a) => return crate::host_status::run(&a, exec.euid(), out, err),
         Kit::Pilot(p) => {
             return pilot::cli::run(p, exec, env, now, out, err, &pilot::cli::sleep_a_second);
         }

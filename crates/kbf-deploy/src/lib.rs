@@ -31,6 +31,8 @@
 //!   request for one Mac signed with their security key (`mdm erase-request`).
 //! - [`log`]: the last lines of a kbf-server's durable log across its rotated files
 //!   (`log`; read-only).
+//! - [`host_status`]: one host's row from the coordinator's `GET /v1/status` (`host-status`;
+//!   read-only), for an operator rolling agents node by node.
 //! - [`pilot`]: a pilot kbf-server run as a systemd user service by the operator's own
 //!   user (`pilot server-install`), and the buck2 overlay that points one linked
 //!   worktree at it, which never replaces a file it did not write (`pilot buckconfig`).

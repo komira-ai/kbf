@@ -471,6 +471,48 @@ coordinator is older than this field keeps working. The rule is equality, not or
 coordinator newer than the release (a rollback of the hosts) also fails; leave the variable unset
 for such a deploy. The variable is the operator's to set for the releases that need it.
 
+## Reading one host's row
+
+While rolling agents node by node, `kbf-deploy host-status` prints one host's row from the
+coordinator's `GET /v1/status`, so the whole status need not be read for one node. It only reads.
+
+```sh
+kbf-deploy host-status --coordinator https://coordinator.example:8443 \
+    --operator-token-file ~/.kbf/operator.token --node daemon-04 --ca-pem "$(cat farm-ca.pem)"
+```
+
+```text
+node_id: daemon-04
+service: kbf
+role: daemon
+platform: linux-x86_64
+version: 2.0
+health: healthy
+live: true
+up: false
+updating: 2.1
+last_update: none
+last_seen: 3s ago
+holds_slot: true
+hold: updating
+```
+
+- `--coordinator` is an `https://` URL with no path, or `host:port`; `--ca-pem` is the farm CA
+  (PEM text) the coordinator's certificate must chain to, as for `deploy-farm`, and without it
+  the system roots are used.
+- `--operator-token-file` names a file of yours with mode `0600` or `0400` that holds the operator
+  token; a file others can read is refused. The token is sent only as the `Authorization` header:
+  it is not an argument and is in no output.
+- `--service NAME` (default `kbf`) picks the service whose view of the host is printed; it is the
+  one with the `hold`. Under the row the text adds the host's exclusion (`excluded:`) and the
+  service's standing halt (`halt:`), when the status has them. `--json` prints the host's row,
+  as the status has it, as one JSON object on one line.
+- Exit 0: found. 1: the node (or the service) is not in the status, or the coordinator could not
+  be asked: `cannot connect`, `TLS error`, or an HTTP status (a 401 says the operator token was
+  refused). 2: bad arguments or a bad token file.
+
+(`kbf-deploy host status`, with a space, is the other verb: the deploy state of the host it runs on.)
+
 ## Turn on the gamma stage
 
 The last job of `release.yml`, `gamma`, tells the update coordinator "desired = this release" once
