@@ -403,25 +403,21 @@ jobs:
       - name: Disk use under target after the tests (report)
         if: ${{ always() }}
         run: du -xhd 2 target
-      # The shard's raw profiles become ONE indexed profile (a few MB) here, so
-      # that `test` downloads megabytes and not the 1.8 GB of raw profiles, which filled its
-      # runner's disk. llvm-profdata is the coverage toolchain's own (the one cargo-llvm-cov
-      # runs), `-sparse` is what cargo-llvm-cov's own merge passes, and no `-failure-mode` is
-      # given: the default (`any`) fails on a corrupt raw profile, and so fails the shard, whose
-      # re-run is the remedy. `-failure-mode=all` would drop the corrupt file, merge the rest
-      # and pass, and the tests that file recorded would count as never run, a number under
-      # the floor with nothing in the log to say why. `merge` is also the check that the
-      # profiles are readable at all. This step has no `if:`: a shard that cannot merge fails.
-      - name: Merge this shard's raw profiles into one (sizes reported)
-        run: |
-          set -eu
-          llvm_profdata="$(rustc "+$COVERAGE_TOOLCHAIN" --print sysroot)/lib/rustlib/$(rustc "+$COVERAGE_TOOLCHAIN" -vV | sed -n 's/^host: //p')/bin/llvm-profdata"
-          profiles=target/llvm-cov-target
-          merged="$profiles/kbf-${{ matrix.core }}-${{ matrix.part }}-merged.profdata"
-          echo "raw profiles:"; du -ch "$profiles"/kbf-${{ matrix.core }}-${{ matrix.part }}-*.profraw | tail -1
-          "$llvm_profdata" merge -sparse "$profiles"/kbf-${{ matrix.core }}-${{ matrix.part }}-*.profraw -o "$merged"
-          echo "merged profile:"; du -h "$merged"
-          df -h /
+      # The shard's raw profiles become ONE indexed profile (a few MB) here, so that `test`
+      # downloads megabytes and not the 1.8 GB of raw profiles, which filled its runner's disk.
+      # `xtask merge-profiles` runs the coverage toolchain's own `llvm-profdata merge -sparse` (what
+      # cargo-llvm-cov's own merge passes) with no `-failure-mode`: the default (`any`) fails on
+      # a corrupt raw profile, and so fails the shard, whose re-run is the remedy.
+      # `-failure-mode=all` would drop the corrupt file, merge the rest and pass, and the tests
+      # that file recorded would count as never run, a number under the floor with nothing in
+      # the log to say why. The step says what went in and what came out. It has no `if:`: a
+      # shard that cannot merge fails.
+      - name: Merge this shard's raw profiles into one
+        run: cargo "+$COVERAGE_TOOLCHAIN" xtask merge-profiles --dir target/llvm-cov-target --extension profraw --prefix kbf-${{ matrix.core }}-${{ matrix.part }}- --out target/llvm-cov-target/kbf-${{ matrix.core }}-${{ matrix.part }}-merged.profdata
+      - name: Size of the merged profile (report)
+        run: du -h target/llvm-cov-target/kbf-${{ matrix.core }}-${{ matrix.part }}-merged.profdata
+      - name: Free disk after the merge (report)
+        run: df -h /
       # No step runs Postgres tests on their own: they are in the run above, which fails any of
       # them when KBF_TEST_POSTGRES_URL (set for the job) names no server.
       # The last step, with no `if:`, so that this job has succeeded exactly when its profiles
@@ -532,28 +528,25 @@ jobs:
           pattern: profdata-*
           path: target/shard-profdata
           merge-multiple: true
-      - name: Size of the download and free disk (report)
-        run: |
-          du -sh target/shard-profdata
-          df -h /
+      - name: Size of the download (report)
+        run: du -sh target/shard-profdata
+      - name: Free disk after the download (report)
+        run: df -h /
       - name: Every shard's profiles are there
         run: cargo "+$COVERAGE_TOOLCHAIN" xtask profiles-complete --dir target/shard-profdata --extension profdata --prefix kbf-legacy-1- --prefix kbf-legacy-2- --prefix kbf-legacy-3- --prefix kbf-js-1-
-      # `llvm-cov report` (cargo-llvm-cov's report, which has no raw profile to merge) reads
-      # the one indexed profile cargo-llvm-cov names for the workspace, `<workspace
-      # directory>.profdata` in target/llvm-cov-target: when no `*.profraw` is there and that file
-      # is, it uses it as it is. The shards' profiles are added into it (llvm-profdata merges
-      # indexed profiles as it merges raw ones, so the counts are the sums a merge of all the raw
-      # profiles makes), then the downloads go. A name cargo-llvm-cov does not look for fails
-      # the report ("not found *.profraw files"), it does not pass over less. No `-failure-mode`:
-      # an unreadable profile fails the job.
+      # `cargo llvm-cov report` merges the `*.profraw` of target/llvm-cov-target into
+      # `<workspace directory>.profdata` there and reports from it; when no `*.profraw` is there and
+      # that file is, it uses it as it is. So the shards' profiles are merged into that file
+      # (`llvm-profdata` adds the counts of indexed profiles as it adds raw ones, so it is the
+      # profile a merge of all the raw files makes), and the downloads go. A name
+      # cargo-llvm-cov does not look for fails the report ("not found *.profraw files"), it
+      # does not pass over less. No `-failure-mode`: an unreadable profile fails the job.
       - name: Merge the shards' profiles into the one the report reads
-        run: |
-          set -eu
-          llvm_profdata="$(rustc "+$COVERAGE_TOOLCHAIN" --print sysroot)/lib/rustlib/$(rustc "+$COVERAGE_TOOLCHAIN" -vV | sed -n 's/^host: //p')/bin/llvm-profdata"
-          "$llvm_profdata" merge -sparse target/shard-profdata/*.profdata -o "target/llvm-cov-target/$(basename "$GITHUB_WORKSPACE").profdata"
-          ls -l target/llvm-cov-target/*.profdata
-          rm -r target/shard-profdata
-          df -h /
+        run: cargo "+$COVERAGE_TOOLCHAIN" xtask merge-profiles --dir target/shard-profdata --extension profdata --workspace-profile-in target/llvm-cov-target
+      - name: Delete the downloaded profiles
+        run: rm -r target/shard-profdata
+      - name: Free disk after the merge (report)
+        run: df -h /
       # `-skip-functions` leaves the per-function records (FN, FNDA) out of the lcov
       # export. With branch coverage on, llvm-cov's lcov exporter segfaults while
       # writing them for kbf-front's async service methods (LLVM 23.1 in this nightly;

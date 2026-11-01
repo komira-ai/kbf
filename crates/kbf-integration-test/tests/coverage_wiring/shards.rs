@@ -262,11 +262,11 @@ pub fn shard_wiring(workflow: &str) -> Result<(), String> {
     let merge_at = steps.iter().position(|s| {
         s.run
             .as_deref()
-            .is_some_and(|r| r.contains("llvm-profdata") && r.contains("merge"))
+            .is_some_and(|r| r.contains("xtask merge-profiles"))
     });
     let Some(merge_at) = merge_at else {
         return Err(format!(
-            "the job `{SHARD}` has no step that merges its raw profiles with `llvm-profdata merge`, so the raw profiles (GB) would be what `test` downloads"
+            "the job `{SHARD}` has no step `cargo xtask merge-profiles` that merges its raw profiles, so the raw profiles (GB) would be what `test` downloads"
         ));
     };
     let merge = &steps[merge_at];
@@ -276,14 +276,14 @@ pub fn shard_wiring(workflow: &str) -> Result<(), String> {
             "the merge step of `{SHARD}` has an `if:` or `continue-on-error`, so a shard could upload without its profiles merged"
         ));
     }
-    if merge_text.contains("failure-mode=all") || merge_text.contains("failure-mode all") {
+    let mw = words(merge_text);
+    if flag(&mw, "--dir") != Some(PROFILES)
+        || flag(&mw, "--extension") != Some("profraw")
+        || flag(&mw, "--prefix") != Some(FILE_PREFIX)
+        || flag(&mw, "--out") != Some(&format!("{PROFILES}/{FILE_PREFIX}merged.profdata"))
+    {
         return Err(format!(
-            "the merge step of `{SHARD}` uses `-failure-mode=all`, which drops a corrupt raw profile silently and would count its tests as never run"
-        ));
-    }
-    if !merge_text.contains("-sparse") {
-        return Err(format!(
-            "the merge step of `{SHARD}` lacks `-sparse`, so the merged profile would differ from the one `llvm-cov report` makes itself"
+            "the merge step of `{SHARD}` must merge the shard's own `{FILE_PREFIX}*.profraw` files of `{PROFILES}` into `{PROFILES}/{FILE_PREFIX}merged.profdata`"
         ));
     }
     let tests_at = steps.iter().position(|s| std::ptr::eq(s, run));
@@ -382,14 +382,8 @@ pub fn gate_wiring(workflow: &str) -> Result<(), String> {
     let complete = find(&|s| run(s).contains("xtask profiles-complete")).ok_or_else(|| {
         format!("the job `{GATE}` has no step running `cargo xtask profiles-complete`")
     })?;
-    let merge = find(&|s| {
-        let r = run(s);
-        r.contains("llvm-profdata") && r.contains("merge")
-    })
-    .ok_or_else(|| {
-        format!(
-            "the job `{GATE}` has no step that merges the shards' profiles (`llvm-profdata merge`)"
-        )
+    let merge = find(&|s| run(s).contains("xtask merge-profiles")).ok_or_else(|| {
+        format!("the job `{GATE}` has no step running `cargo xtask merge-profiles` on the shards' profiles")
     })?;
     let report = find(&|s| run(s).contains("llvm-cov report"))
         .ok_or_else(|| format!("the job `{GATE}` has no step running `llvm-cov report`"))?;
@@ -458,19 +452,19 @@ pub fn gate_wiring(workflow: &str) -> Result<(), String> {
             "the profiles-complete step does not check `--dir {DOWNLOADS} --extension profdata`"
         ));
     }
-    let merge_text = run(&steps[merge]);
-    if !merge_text.contains(DOWNLOADS)
-        || !merge_text.contains(PROFILES)
-        || merge_text.contains("failure-mode=all")
-        || !merge_text.contains("-sparse")
-    {
-        return Err(format!(
-            "the merge step of `{GATE}` must `-sparse` merge the profiles of `{DOWNLOADS}` into `{PROFILES}` (the directory `llvm-cov report` reads) without `-failure-mode=all`"
-        ));
-    }
     if !same(&values(&w, "--prefix"), &prefixes) {
         return Err(format!(
             "the profiles-complete step's `--prefix` values are not the shards' file prefixes {prefixes:?} (one for each matrix entry)"
+        ));
+    }
+    let merge_text = run(&steps[merge]);
+    let w = words(&merge_text);
+    if flag(&w, "--dir") != Some(DOWNLOADS)
+        || flag(&w, "--extension") != Some("profdata")
+        || flag(&w, "--workspace-profile-in") != Some(PROFILES)
+    {
+        return Err(format!(
+            "the merge step of `{GATE}` must merge the `.profdata` files of `{DOWNLOADS}` into the profile `llvm-cov report` reads (`--workspace-profile-in {PROFILES}`)"
         ));
     }
     Ok(())

@@ -15,6 +15,8 @@
 //! - `profiles-complete --dir <dir> --prefix <p>...` ([`profiles_complete`]): exit 1 unless each
 //!   shard's prefix begins a non-empty `.profraw` file of the directory and no `.profraw` file
 //!   begins none of them (`--extension profdata` checks the shards' merged `.profdata` files).
+//! - `merge-profiles --dir <dir> --extension <e> [--prefix <p>] --out <file>` ([`merge_profiles`]): the
+//!   toolchain's `llvm-profdata merge -sparse` of the directory's `.profraw` or `.profdata` files.
 //! - `release farm-version --repo <owner/repo> --tag <tag> --commit <sha> [--output <file>]`
 //!   ([`release::farm_version`]): the version text the farm is told to converge on,
 //!   `<version>+g<12 hex digits of the commit>` as the hosts report it, read from the release's
@@ -148,6 +150,7 @@ pub mod entitlements;
 pub mod fetch;
 pub mod fetch_attested;
 pub mod installer_tarball;
+pub mod merge_profiles;
 pub mod package;
 pub mod pipeline_rerun;
 pub mod pipeline_watch;
@@ -232,6 +235,8 @@ enum Verb {
     WaitArtifacts(wait_artifacts::Args),
     /// Refuse a directory of raw coverage profiles in which a shard's profiles are missing.
     ProfilesComplete(profiles_complete::Args),
+    /// Merge a directory's coverage profiles into one indexed profile.
+    MergeProfiles(merge_profiles::Args),
     /// Set a published release as the farm's desired version on the update coordinator and
     /// wait for the farm to converge.
     DeployFarm(deploy_farm::Args),
@@ -1153,6 +1158,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
         Verb::Advisories(args) => advisories::run(&args, &root, &cargo_program()),
         Verb::WaitArtifacts(args) => wait_artifacts::run(&args, &root, &cargo_program()),
         Verb::ProfilesComplete(args) => profiles_complete::run(&args),
+        Verb::MergeProfiles(args) => merge_profiles::run(&args, &root),
         Verb::DeployFarm(args) => deploy_farm::run(&args),
         Verb::ProveFarm(args) => prove_farm::run(&args),
         Verb::RunnerDisk(args) => runner_disk::run(&args),
