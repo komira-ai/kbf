@@ -1522,6 +1522,7 @@ mod tests {
             proxy_requests: None,
             disk_busy: BTreeMap::new(),
             peak_in_flight: 0,
+            pass_load: None,
         }
     }
 
@@ -1540,6 +1541,7 @@ mod tests {
             notes: Vec::new(),
             cold_state: Vec::new(),
             rate_caps: None,
+            objects_per_pass: None,
         }
     }
 
