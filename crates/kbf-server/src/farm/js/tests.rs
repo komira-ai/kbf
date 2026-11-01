@@ -26,6 +26,8 @@ mod one_recorder;
 
 mod placement;
 
+mod usage;
+
 mod views;
 
 fn farm() -> Farm {

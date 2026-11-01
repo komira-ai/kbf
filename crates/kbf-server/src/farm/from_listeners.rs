@@ -37,11 +37,14 @@ impl Farm {
         self.driver.core()
     }
 
-    /// This farm, reporting `mode` as its `--usage-profiles`. The mode changes nothing the
-    /// farm does yet: it is read by the start line and the gauge.
+    /// This farm, learning as `mode` says (`--usage-profiles`): `record` and `on` learn a
+    /// profile from the runs the js core's farm hears of, once the farm has a state store,
+    /// and hand the scheduler no curve. Set before the farm takes a state store over.
     #[must_use]
     pub fn with_usage_profiles(mut self, mode: crate::UsageProfiles) -> Self {
         self.usage_profiles = mode;
+        self.settings.usage = mode.mode();
+        self.driver.set_usage(&self.settings);
         self
     }
 
