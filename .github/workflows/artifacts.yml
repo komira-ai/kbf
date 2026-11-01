@@ -237,6 +237,8 @@ jobs:
         run: cargo xtask darwin-asset "dist/kbf-host-install-$GITHUB_SHA-darwin-arm64.tar.gz" kbf-host-install
       - name: Check the packaged kbf-updater's signature, and run it
         run: cargo xtask darwin-asset "dist/kbf-updater-$GITHUB_SHA-darwin-arm64.tar.gz" kbf-updater
+      - name: The packaged kbf-updater names the commit
+        run: cargo xtask build-commit check-asset --plain "dist/kbf-updater-$GITHUB_SHA-darwin-arm64.tar.gz" "$GITHUB_SHA"
       - name: Check the packaged kbf-mac-provision's signature, and run it
         run: cargo xtask darwin-asset "dist/kbf-mac-provision-$GITHUB_SHA-darwin-arm64.tar.gz" kbf-mac-provision
       - name: The packaged kbf names the commit and a release build
@@ -401,6 +403,8 @@ jobs:
         run: cargo xtask package --binary "target/$TARGET/release/kbf-host-install" --sbom crates/kbf-host-install/kbf-host-install_bin.cdx.json --platform linux-x86_64 --commit "$GITHUB_SHA" --out dist
       - name: Package kbf-updater
         run: cargo xtask package --binary "target/$TARGET/release/kbf-updater" --sbom crates/kbf-updater/kbf-updater_bin.cdx.json --platform linux-x86_64 --commit "$GITHUB_SHA" --out dist
+      - name: The packaged kbf-updater names the commit
+        run: cargo xtask build-commit check-asset --plain "dist/kbf-updater-$GITHUB_SHA-linux-x86_64.tar.gz" "$GITHUB_SHA"
       - name: Package kbf-signer
         run: cargo xtask package --binary "target/$TARGET/release/kbf-signer" --sbom crates/kbf-signer/kbf-signer_bin.cdx.json --platform linux-x86_64 --commit "$GITHUB_SHA" --out dist
       # The SBOM of kbf-task is made for the target it is built for. This runs after the others are
@@ -587,7 +591,7 @@ jobs:
         # `kbf-updater --version` prints this commit (crates/kbf-updater/src/lib.rs).
         run: KBF_BUILD_COMMIT="${GITHUB_SHA::12}" cargo build --locked --release --target "$TARGET" -p kbf-deploy -p kbf-host-install -p kbf-updater -p kbf-coordinator -p kbf-signer --bins
       # The linux-arm64 job cross-compiles, so its kbf-updater cannot run here; the x86_64 and darwin
-      # jobs check the same stamped build step.
+      # jobs check the same stamped build step and the packaged tarball.
       - name: Build kbf-task for the static target
         env:
           CC_aarch64_unknown_linux_musl: musl-gcc

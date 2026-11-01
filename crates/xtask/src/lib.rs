@@ -988,8 +988,14 @@ enum BuildCommit {
     },
     /// The `kbf` in the release tarball `<tarball>` (`<name>-<commit>-<platform>.tar.gz`)
     /// names `<commit>` and a release build, as `check --json` finds, run on the bytes
-    /// that ship.
-    CheckAsset { tarball: PathBuf, commit: String },
+    /// that ship. With `--plain`, only the `--version` line is checked, for a binary that has no
+    /// `--version --json` (kbf-updater).
+    CheckAsset {
+        tarball: PathBuf,
+        commit: String,
+        #[arg(long)]
+        plain: bool,
+    },
     /// A plain build, two override stamps and a malformed override, from the checkout.
     Stamps { commit: String },
 }
@@ -1121,12 +1127,17 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             commit,
             json,
         }) => Ok(vec![build_commit::check(&binary, &commit, json)?]),
-        Verb::BuildCommit(BuildCommit::CheckAsset { tarball, commit }) => {
+        Verb::BuildCommit(BuildCommit::CheckAsset {
+            tarball,
+            commit,
+            plain,
+        }) => {
             let scratch_in = root.join("target");
             Ok(vec![build_commit::check_asset(
                 &scratch_in,
                 &tarball,
                 &commit,
+                !plain,
             )?])
         }
         Verb::BuildCommit(BuildCommit::Stamps { commit }) => {

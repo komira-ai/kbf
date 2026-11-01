@@ -13,7 +13,8 @@
 //!   before it is packaged). The tarball is `<name>-<commit>-<platform>.tar.gz` for
 //!   this `<commit>`, exactly the one entry `package` writes; the binary `<name>` is
 //!   taken out into a directory under `<root>/target` (the job's workspace, which the
-//!   verb removes again) and checked there, as `check --json <name> <commit>`.
+//!   verb removes again) and checked there, as `check --json <name> <commit>`; with `--plain`,
+//!   as `check <name> <commit>`, for a binary that has no `--version --json` (kbf-updater).
 //! - `stamps <commit>`: from the checkout, a plain build of kbf-server passes `check`
 //!   for `<commit>`; builds with `KBF_BUILD_COMMIT_OVERRIDE` set to two stamps each pass
 //!   `check` for their own stamp (so they name no other commit; a `<commit>` that begins
@@ -262,13 +263,19 @@ pub(crate) fn write_executable(path: &Path, bytes: &[u8]) -> Result<(), Error> {
 /// `check-asset <tarball> <commit>`: the line it prints on success. The tarball is
 /// `<name>-<commit>-<platform>.tar.gz` ([`asset_name`]) and must be the one entry
 /// `package` writes. The binary in it is taken out into a directory under `scratch_in`,
-/// removed afterwards, and passes `check --json` for `commit`: the bytes that ship are
+/// removed afterwards, and passes `check` for `commit` (with `--json` unless `json` is false, for
+/// a binary with no identity): the bytes that ship are
 /// the bytes whose identity is checked.
 ///
 /// # Errors
 /// `commit` is not a commit, the file name is not that of a tarball of `commit`, the
 /// tarball cannot be read or is not exactly the one binary, or as [`check`] with `json`.
-pub fn check_asset(scratch_in: &Path, tarball: &Path, commit: &str) -> Result<String, Error> {
+pub fn check_asset(
+    scratch_in: &Path,
+    tarball: &Path,
+    commit: &str,
+    json: bool,
+) -> Result<String, Error> {
     if !is_commit(commit) {
         return Err(Error::NotACommit(commit.to_owned()));
     }
@@ -277,7 +284,7 @@ pub fn check_asset(scratch_in: &Path, tarball: &Path, commit: &str) -> Result<St
     let scratch = Scratch::new(scratch_in)?;
     let binary = scratch.0.join(&name);
     write_executable(&binary, &bytes)?;
-    let checked = check(&binary, commit, true)?;
+    let checked = check(&binary, commit, json)?;
     let shown = tarball.file_name().unwrap_or(tarball.as_os_str());
     Ok(format!("{}: {checked}", shown.to_string_lossy()))
 }
