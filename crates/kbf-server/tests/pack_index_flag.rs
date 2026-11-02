@@ -1,18 +1,26 @@
-//! `--pack-index` on a started frontend, against a real Postgres server: a frontend given the
-//! flag carries the pack index and one without it carries none, and a start on a schema
-//! without the pack tables is refused with the line that says what to run.
+//! `--pack-index` on a started frontend and a started cache server, against a real Postgres
+//! server: either given the flag carries the pack index and one without it carries none, and a
+//! frontend start on a schema without the pack tables is refused with the line that says what
+//! to run. The flag's refusals that need no server (no state store, a SQLite one) are the cache
+//! server's unit tests (`src/start.rs`).
 //!
 //! The tests need a server and fail without one: `KBF_TEST_POSTGRES_URL` names a server they
 //! may create and drop databases on. Each test makes a database of its own.
 
 use std::error::Error;
 use std::future::pending;
+use std::path::Path;
 use std::sync::Arc;
 
+use clap::Parser as _;
+use kbf_meta::Retention;
+use kbf_objstore::{Floor, FsStore};
 use kbf_pack_index::schema::test_database;
 use kbf_pack_index::{BlobDigest, NewPack, PackBlob, PackIndex};
 use kbf_server::frontend::{self, FrontendFlags, FrontendHandle, start_frontend};
+use kbf_server::{Args, RaftMetaLog, ServerHandle, interrupted, serve_with};
 use kbf_state::postgres::{PostgresConfig, TestDatabase, schema};
+use kbf_testkit::dir::TestDir;
 
 /// The flags of a frontend on loopback ports over the state store at `url`, with
 /// `--pack-index` as `pack_index` says.
@@ -122,4 +130,38 @@ async fn a_frontend_on_a_schema_without_the_pack_tables_is_refused_at_start() {
     assert!(said.starts_with("--pack-index: "), "{said}");
     assert!(said.contains("kbf-installer setup"), "{said}");
     started(&flags(&db.url(), false)).expect("starts without the flag");
+}
+
+/// Starts a cache server over `args` on a metadata log and a cold store of its own, in the
+/// directory `dir` under `root`.
+async fn boot(args: &Args, root: &Path, dir: &str) -> Result<ServerHandle, Box<dyn Error>> {
+    let log = RaftMetaLog::open_dir(&root.join(dir), Retention::default(), "kbf/")
+        .await
+        .expect("open the log");
+    let (prefix, id) = (log.store_prefix(), log.log_id());
+    let store =
+        FsStore::open(&root.join(format!("{dir}-blobs")), Floor::Bytes(1)).expect("open the store");
+    serve_with(args, None, log, store, prefix, id, interrupted).await
+}
+
+/// Asserts that `--pack-index` reaches the cache server [`serve_with`] starts: over a Postgres
+/// state store a server given the flag carries the index and one without it carries none.
+#[tokio::test(flavor = "current_thread")]
+async fn a_started_server_carries_the_pack_index_the_flag_names() {
+    let db = Database::new(test_database);
+    let root = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "pack-index-server");
+    let mut args = Args::parse_from([
+        "kbf-server",
+        "--listen=127.0.0.1:0",
+        "--worker-listen=127.0.0.1:0",
+    ]);
+    args.state_store = Some(db.url().parse().expect("a postgres URL"));
+    let off = boot(&args, root.path(), "off").await;
+    let off = off.expect("starts without the flag");
+    assert!(off.pack_index().is_none());
+    drop(off);
+    args.pack_index = true;
+    let on = boot(&args, root.path(), "on").await;
+    let on = on.expect("starts with the flag");
+    assert!(on.pack_index().is_some());
 }
