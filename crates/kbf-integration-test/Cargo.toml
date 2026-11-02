@@ -79,6 +79,8 @@ kbf-objstore = { workspace = true, features = ["testkit"] }
 kbf-state = { workspace = true, features = ["test-support", "test-database"] }
 kbf-storage.workspace = true
 kbf-types.workspace = true
+# `tests/mdm_layering.rs` reads the root layers.toml.
+toml.workspace = true
 kbf-proxy.workspace = true
 kbf-sched.workspace = true
 kbf-server.workspace = true

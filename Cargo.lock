@@ -2290,6 +2290,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-rustls",
+ "toml",
  "tonic",
  "tracing-subscriber",
  "xtask",
