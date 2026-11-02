@@ -161,14 +161,17 @@ fn a_failed_clear_whose_staged_file_stays_is_removed_at_the_next_start() {
     assert!(!staged_path(&path).exists());
 }
 
-/// Catches: a committed clear whose halts file could not be renamed in read at the next start
-/// with the halts file before it (the acknowledgement without its report, the old
-/// generation): the start renames the staged file in.
+/// Catches: a clear whose halts file could not be renamed in answered as made, so that its
+/// generation reaches memory and agents while only the staged file holds it (which the release
+/// before rewriting the ops file would throw away); and such a clear read at the next start
+/// with the halts file before it: the clear fails and is not in memory, and the start renames
+/// the staged file in, reading the clear whole.
 #[test]
 fn a_committed_clear_whose_halts_file_was_not_renamed_in_is_renamed_in_at_the_next_start() {
     let (_dir, path, store, faults) = halted_store("ops-commit-publish");
     faults.publish.store(true, Ordering::SeqCst);
-    clear(&store).expect("committed");
+    assert!(matches!(clear(&store), Err(OpsError::Io(_))));
+    assert_eq!(store.marks("kbf"), halted(), "no generation reaches memory");
     assert!(staged_path(&path).exists());
     assert_eq!(restarted(&path), cleared());
     assert!(!staged_path(&path).exists());
@@ -181,7 +184,7 @@ fn a_committed_clear_whose_halts_file_was_not_renamed_in_is_renamed_in_at_the_ne
 fn a_committed_clears_staged_file_is_renamed_in_before_the_next_change() {
     let (_dir, path, store, faults) = halted_store("ops-commit-settle-first");
     faults.publish.store(true, Ordering::SeqCst);
-    clear(&store).expect("committed");
+    assert!(clear(&store).is_err());
     faults.publish.store(false, Ordering::SeqCst);
     block_ops(&path);
     let next = store.change(
@@ -213,7 +216,7 @@ fn a_clear_whose_ops_file_cannot_be_read_back_is_settled_by_the_next_start() {
 fn a_start_that_cannot_rename_a_committed_staged_file_in_is_refused() {
     let (_dir, path, store, faults) = halted_store("ops-commit-refused");
     faults.publish.store(true, Ordering::SeqCst);
-    clear(&store).expect("committed");
+    assert!(clear(&store).is_err());
     let halts = halts_path(&path);
     fs::remove_file(&halts).expect("removed");
     fs::create_dir(&halts).expect("a directory");
@@ -366,5 +369,32 @@ fn a_kept_report_of_the_same_host_and_another_version_joins_nothing() {
     let marks = OpsStore::open(&path).expect("read").marks("kbf");
     assert_eq!(marks.halt.map(|h| h.report), Some(None));
     assert_eq!(marks.halt_acked[0].report, None);
+    assert_eq!(marks.halt_seen, []);
+}
+
+/// Catches: a standing halt record whose version this release cannot parse refusing the start,
+/// or joined to the ops file's halt anyway: it is passed over and counted, the halt reads with
+/// no report, and the reports kept while a halt it cannot name stood join to nothing.
+#[test]
+fn a_halt_record_whose_version_cannot_be_read_is_passed_over_and_counted() {
+    let dir = TestDir::under(std::env::temp_dir(), "ops-commit-unknown-halt-version");
+    let path = dir.path().join("ops.json");
+    fs::write(
+        &path,
+        r#"{"schema":1,"services":{"kbf":{
+            "halt":{"node_id":"s1","check":"tainted","target":"2.0"}}}}"#,
+    )
+    .expect("written");
+    let report = serde_json::json!({"target": "2.0", "outcome": "failed", "phase": "halt"});
+    let halts = serde_json::json!({"services": {"kbf": {
+        "halt": {"node_id": "s1", "target": "not a version", "report": report},
+        "halt_seen": [{"node_id": "s2", "target": "2.0", "report": report}],
+    }}});
+    fs::write(halts_path(&path), halts.to_string()).expect("written");
+    let (state, skipped) =
+        ops_file::joined(&path, OpsStore::open(&path).expect("read").state()).expect("joined");
+    assert_eq!(skipped, 1);
+    let marks = &state.services["kbf"];
+    assert_eq!(marks.halt.as_ref().map(|h| h.report.clone()), Some(None));
     assert_eq!(marks.halt_seen, []);
 }

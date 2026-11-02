@@ -31,7 +31,11 @@
 //! file is removed, or found stale later). Once the ops file holds the change, the change
 //! stands: replacing the ops file can answer an error after its rename (the directory's fsync),
 //! so on an error the ops file is read back, and when it holds the change's text the change
-//! goes on; a failure to rename the staged file after that is logged and settled later.
+//! goes on. The change is answered as made only once the halts file is renamed in and its
+//! directory synced: until then what it adds (a clear's generation above all) would not
+//! survive the release before rewriting the ops file, so a failure to rename it fails the
+//! change, which does not reach memory (no agent is told its generation), and the staged file
+//! is left for the next start or change to rename in.
 //!
 //! A start, and each change before it writes, settles a staged file left behind: one that names
 //! the digest of the ops file there is renamed over the halts file (the change it staged was
@@ -42,8 +46,9 @@
 //! The one exception needs a crash after the commit and then the release before writing the
 //! ops file before this one starts again: the staged file no longer names the ops file and is
 //! removed, so a clear in the ops file loses its acknowledgements' reports and its generation.
-//! No agent was told that generation (the crash came before the clear reached memory), and the
-//! loss only halts the service again.
+//! No agent was told that generation (a change reaches memory only once its halts file is
+//! renamed in), and the loss only halts the service again: the next clear counts on from the
+//! generation agents were told.
 //!
 //! A farm that never halted has no halts file: one is written once there is something to keep
 //! in it, and after that on every change.
@@ -112,23 +117,23 @@ fn is_zero(n: &u64) -> bool {
     *n == 0
 }
 
-/// The host and the version a kept report is about, read on their own.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
-struct About {
+/// The standing halt: its host and version, which the reports kept while it stood join by,
+/// and its report when there is one this release can read. The host and version are kept
+/// even when there is no report, so that those reports still join after any later write.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct Standing {
     node_id: String,
     target: Version,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    report: Option<UpdateResult>,
 }
 
 /// What the halts file keeps of one service.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 struct ServiceHalts {
-    /// Whom the standing halt's record is about, even when its report was passed over: the
-    /// reports kept while it stood still join to it. Read only.
-    #[serde(skip)]
-    halt_about: Option<About>,
-    /// The report of the standing halt.
+    /// The standing halt.
     #[serde(skip_serializing_if = "Option::is_none")]
-    halt: Option<Kept>,
+    halt: Option<Standing>,
     /// The reports of the acknowledgements.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     halt_acked: Vec<Kept>,
@@ -180,17 +185,29 @@ fn kept(value: Value, skipped: &mut usize) -> Option<Kept> {
     read
 }
 
+/// The standing halt `value` holds: none, counted in `skipped`, when this release cannot read
+/// its host or version; with no report, counted, when it cannot read the report.
+fn standing(mut value: Value, skipped: &mut usize) -> Option<Standing> {
+    let report = value.get_mut("report").map(Value::take);
+    let Ok(mut halt) = serde_json::from_value::<Standing>(value) else {
+        *skipped += 1;
+        return None;
+    };
+    halt.report = report.and_then(|r| {
+        let read = serde_json::from_value(r).ok();
+        *skipped += usize::from(read.is_none());
+        read
+    });
+    Some(halt)
+}
+
 impl ReadHalts {
     /// What this release reads of the file, and how many records it passed over.
     fn known(self) -> (HaltsFile, usize) {
         let mut skipped = 0;
         let mut services = BTreeMap::new();
         for (name, read) in self.services {
-            let about = read
-                .halt
-                .clone()
-                .and_then(|v| serde_json::from_value::<About>(v).ok());
-            let halt = read.halt.and_then(|v| kept(v, &mut skipped));
+            let halt = read.halt.and_then(|v| standing(v, &mut skipped));
             let mut each = |values: Vec<Value>| -> Vec<Kept> {
                 values
                     .into_iter()
@@ -198,7 +215,6 @@ impl ReadHalts {
                     .collect()
             };
             let service = ServiceHalts {
-                halt_about: about,
                 halt,
                 halt_acked: each(read.halt_acked),
                 halt_seen: each(read.halt_seen),
@@ -222,10 +238,11 @@ fn split(state: &OpsState) -> (OpsState, HaltsFile) {
     for (name, marks) in &mut ops.services {
         let mut kept = ServiceHalts::default();
         if let Some(halt) = &mut marks.halt {
-            kept.halt = halt
-                .report
-                .take()
-                .map(|report| Kept::of(&halt.node_id, &halt.target, report));
+            kept.halt = Some(Standing {
+                node_id: halt.node_id.clone(),
+                target: halt.target.clone(),
+                report: halt.report.take(),
+            });
         }
         for ack in &mut marks.halt_acked {
             if let Some(report) = ack.report.take() {
@@ -256,11 +273,11 @@ fn join(mut ops: OpsState, halts: HaltsFile) -> OpsState {
         }
         let marks = ops.services.entry(name).or_default();
         let mut standing = false;
-        if let (Some(halt), Some(about)) = (&mut marks.halt, &kept.halt_about)
-            && about.node_id == halt.node_id
-            && about.target == halt.target
+        if let (Some(halt), Some(kept)) = (&mut marks.halt, kept.halt)
+            && kept.node_id == halt.node_id
+            && kept.target == halt.target
         {
-            halt.report = kept.halt.map(|k| k.report);
+            halt.report = kept.report;
             standing = true;
         }
         for ack in &mut marks.halt_acked {
@@ -402,7 +419,8 @@ pub(crate) enum Step {
 /// docs say how).
 ///
 /// # Errors
-/// [`OpsError`]: a file could not be read or replaced before the ops file held the change.
+/// [`OpsError`]: a file could not be read or replaced, or the halts file could not be renamed
+/// in after the ops file held the change.
 pub(crate) fn write(path: &Path, state: &OpsState) -> Result<(), OpsError> {
     write_with(path, state, &|_| Ok(()))
 }
@@ -459,11 +477,12 @@ pub(crate) fn write_with(
         .map_err(io_at(&halts_path))
         .and_then(|()| publish(&staged, &halts_path));
     if let Err(why) = published {
-        tracing::warn!(
+        tracing::error!(
             path = %staged.display(),
             %why,
-            "the change is committed, and its halts file is left to be renamed in later"
+            "the ops file holds the change but its halts file could not be renamed in: the change fails, and the next start or change renames it in"
         );
+        return Err(why.into());
     }
     Ok(())
 }

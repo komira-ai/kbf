@@ -5,18 +5,21 @@
 //! change included; and the first heartbeat after the restart is answered as that state says.
 
 use std::fs;
+use std::io;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use kbf_types::HostRole;
 use kbf_updater::wire::{Heartbeat, UpdateResult};
 use serde_json::json;
 
-use crate::desired::KBF;
+use crate::desired::{DesiredStore, KBF};
 use crate::identity::Identity;
-use crate::ops::{HaltAck, ServiceOps};
-use crate::ops_file::{halts_path, staged_path};
-use crate::service::FEATURES;
-use crate::testutil::{OPERATOR, Rig, beat, id};
+use crate::ops::{HaltAck, OpsStore, ServiceOps};
+use crate::ops_file::{self, Step, halts_path, staged_path};
+use crate::service::{Coordinator, FEATURES};
+use crate::testutil::{OPERATOR, Rig, beat, clock_of, id};
 
 fn halted_update() -> UpdateResult {
     serde_json::from_value(json!({
@@ -232,4 +235,121 @@ fn a_crash_around_the_end_of_an_acknowledgement_restarts_on_one_side_of_it() {
             "committed: {committed}"
         );
     }
+}
+
+/// The heartbeat of [`halting`] with the reason `reason` instead.
+fn halting_for(reason: &str) -> Heartbeat {
+    let mut b = calm();
+    let mut report = halted_update();
+    report.reason = kbf_updater::wire::Token::parse(reason);
+    b.last_update = Some(report);
+    b
+}
+
+/// The rig's coordinator restarted over a store whose halts file cannot be renamed in while
+/// `fails` is set.
+fn start_failing_rename(rig: &mut Rig, fails: &Arc<AtomicBool>) {
+    let path = ops_path(rig);
+    let state = OpsStore::open(&path).expect("read").state();
+    let fails = Arc::clone(fails);
+    let store = OpsStore::with_writer(
+        state,
+        Box::new(move |state| {
+            ops_file::write_with(&path, state, &|step| {
+                if step == Step::Publish && fails.load(Ordering::SeqCst) {
+                    Err(io::Error::other("the rename fails"))
+                } else {
+                    Ok(())
+                }
+            })
+        }),
+    );
+    let desired = DesiredStore::open(&rig.dir.path().join("desired.json")).expect("a store");
+    let (verifier, _) = kbf_oidc::testkit::static_verifier();
+    rig.coordinator =
+        Coordinator::new(desired, verifier, OPERATOR.to_owned(), clock_of(&rig.clock))
+            .with_ops(store);
+}
+
+/// The ops file as the release before rewrites it: whole, with a change of its own (it reads
+/// and writes only the ops file).
+fn rewritten_by_the_release_before(rig: &Rig) {
+    let path = ops_path(rig);
+    let mut ops: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).expect("the ops file")).expect("JSON");
+    ops["excluded"] = json!([{"service": "kbf", "node_id": "s9", "reason": "gone"}]);
+    fs::write(&path, ops.to_string()).expect("rewritten");
+}
+
+/// Catches: a clear answered as made, its generation told to agents, while only its staged
+/// halts file holds that generation: a crash and the release before rewriting the ops file
+/// throw the staged file away, and the next clear tells the same number again, which an agent
+/// that halted under it does not lift on. Here the clear whose halts file cannot be renamed in
+/// fails and tells nothing, so after the crash, the rewrite and the restart, the next clear
+/// tells a generation greater than any an agent was told.
+#[test]
+fn a_generation_told_to_an_agent_survives_the_release_before_rewriting_the_ops_file() {
+    let mut rig = halted_rig("ops-crash-told");
+    let fails = Arc::new(AtomicBool::new(false));
+    start_failing_rename(&mut rig, &fails);
+    clear(&rig);
+    let mut told_most = told(&rig, "s1", halting()).expect("a generation");
+    assert_eq!(told_most, 1);
+    rig.coordinator
+        .heartbeat(storage("s1"), halting_for("disk_tainted_again"));
+    assert!(kbf(&rig).halt.is_some(), "a new failure halts again");
+    fails.store(true, Ordering::SeqCst);
+    let failed = rig.coordinator.operate(
+        Some(OPERATOR),
+        br#"{"action":"clear_halt","service":"kbf","reason":"disk replaced"}"#,
+    );
+    assert!(failed.is_err(), "{failed:?}");
+    told_most = told_most.max(told(&rig, "s1", halting_for("disk_tainted_again")).unwrap_or(0));
+    rewritten_by_the_release_before(&rig);
+    rig.restart();
+    for _ in 0..3 {
+        rig.coordinator
+            .heartbeat(storage("s1"), halting_for("disk_tainted_again"));
+    }
+    assert!(
+        kbf(&rig).halt.is_some(),
+        "the host's report halts the service again"
+    );
+    clear(&rig);
+    let next = told(&rig, "s1", calm()).expect("a generation");
+    assert!(next > told_most, "told {next} after {told_most}");
+}
+
+/// Catches: the host and version of a standing halt kept only with its report: when the report
+/// cannot be read, the reports kept while the halt stood join at the first start, but the next
+/// write leaves the halt out of the halts file, so after another restart they no longer join
+/// and the clear does not acknowledge them. They join after the write and the restart, and the
+/// clear acknowledges them: those hosts' repeated reports do not halt the service again.
+#[test]
+fn reports_kept_while_a_halt_with_an_unreadable_report_stood_survive_a_write_and_a_restart() {
+    let mut rig = Rig::new("ops-crash-unreadable-halt");
+    rig.at(1_100);
+    let path = ops_path(&rig);
+    fs::write(
+        &path,
+        r#"{"schema":1,"services":{"kbf":{
+            "halt":{"node_id":"s1","check":"disk_tainted","target":"2.0"}}}}"#,
+    )
+    .expect("written");
+    let mut unknown = serde_json::to_value(halted_update()).expect("JSON");
+    unknown["outcome"] = "rolled_forward".into();
+    let halts = json!({"services": {"kbf": {
+        "halt": {"node_id": "s1", "target": "2.0", "report": unknown},
+        "halt_seen": [{"node_id": "s2", "target": "2.0", "report": halted_update()}],
+    }}});
+    fs::write(halts_path(&path), halts.to_string()).expect("written");
+    rig.restart();
+    rig.coordinator.heartbeat(storage("s3"), halting());
+    rig.restart();
+    let seen: Vec<String> = kbf(&rig).halt_seen.into_iter().map(|a| a.node_id).collect();
+    assert_eq!(seen, ["s2", "s3"]);
+    clear(&rig);
+    rig.coordinator.heartbeat(storage("s2"), halting());
+    rig.coordinator.heartbeat(storage("s3"), halting());
+    assert_eq!(kbf(&rig).halt, None, "a cleared report halted again");
 }
