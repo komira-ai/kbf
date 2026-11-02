@@ -1,0 +1,33 @@
+{
+  "profile_name": "Example MDM",
+  "url": "https://mdm.example.com/enroll",
+  "is_supervised": true,
+  "is_mandatory": true,
+  "is_mdm_removable": false,
+  "await_device_configured": false,
+  "auto_advance_setup": false,
+  "org_magic": "js-mdm",
+  "language": "en",
+  "region": "US",
+  "anchor_certs": [],
+  "skip_setup_items": [
+    "Accessibility",
+    "Appearance",
+    "AppleID",
+    "AppStore",
+    "Biometric",
+    "Diagnostics",
+    "DisplayTone",
+    "FileVault",
+    "iCloudDiagnostics",
+    "iCloudStorage",
+    "Intelligence",
+    "Privacy",
+    "ScreenTime",
+    "Siri",
+    "TermsOfAddress",
+    "TOS",
+    "UnlockWithWatch",
+    "Wallpaper"
+  ]
+}

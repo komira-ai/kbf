@@ -1,0 +1,8 @@
+# kbf-mdm-proxy-reload.service: started by kbf-mdm-proxy-reload.path. Rendered by
+# `kbf-deploy mdm tls`.
+[Unit]
+Description=kbf-mdm: restart the proxy for a new certificate
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl try-restart kbf-mdm-proxy.service

@@ -1,6 +1,6 @@
 //! Test code says what each test proves and which defect it catches.
 //!
-//! That is the maintainers' rule: a comment or a name states the defect a test guards
+//! That is rules T8 and T9 of `AGENTS.md`: a comment or a name states the defect a test guards
 //! against ("Catches: the check dropped"), and does not narrate how the test was checked.
 //! So no `.rs` file under `crates/` may hold any form in `FORBIDDEN` below, in any letter
 //! case: the word for a changed copy of the code, the phrase for a failure seen when

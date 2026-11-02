@@ -135,6 +135,10 @@ scripts!(
     epoch_change,
     handover,
     cordon_and_drain,
+    unreadable_op_row,
+    unreadable_done_row,
+    unreadable_leased_op_row,
+    unreadable_done_row_elsewhere,
 );
 
 /// Catches a script that is not run: a golden file with no test would never be compared,
@@ -182,4 +186,111 @@ fn the_comparison_finds_a_changed_line() {
     assert!(changed.contains("first difference at line 2"), "{changed}");
     let shorter = first_difference("a\nb\nc\n", "a\nb\n").expect("a difference");
     assert!(shorter.contains("first difference at line 3"), "{shorter}");
+}
+
+/// Catches a read fault of the tape that does not fail what the scripts rely on, or fails more:
+/// a row made unreadable fails a `get` of it and every scan whose answer holds it, by prefix or
+/// by range in either direction, and no page of a range scan that does not hold it (the pages
+/// before it, a bound that leaves it out); a key with no row still reads as absent; writes go
+/// on; the fault outlives a restart; `readable` ends it; and each refused row is written down
+/// once in the lines a call takes.
+#[test]
+fn an_unreadable_row_fails_every_read_that_meets_it_and_nothing_else() {
+    use std::num::NonZeroUsize;
+    use std::ops::Bound;
+
+    use kbf_state::{Cond, ScanRange, Store as _, StoreError, Txn};
+
+    let failed = |key: &str| StoreError::Failed(format!("the row {key} cannot be read"));
+    let value = |tape: &tape::Tape, key| tape.get(key).expect("readable").map(|row| row.value);
+    let keys = |rows: &[(String, kbf_state::Versioned)]| -> Vec<String> {
+        rows.iter().map(|(key, _)| key.clone()).collect()
+    };
+    let tape = tape::Tape::new(tape::as_written);
+    let rows = Txn::new()
+        .put("op/1", b"one".to_vec(), Cond::Any)
+        .put("op/2", b"two".to_vec(), Cond::Any)
+        .put("op/3", b"three".to_vec(), Cond::Any)
+        .put("queue/1", b"".to_vec(), Cond::Any);
+    tape.apply_batch(vec![rows]).expect("written");
+    tape.take();
+    let one = NonZeroUsize::new(1).expect("non-zero");
+    let two = NonZeroUsize::new(2).expect("non-zero");
+
+    tape.unreadable("op/3");
+    tape.unreadable("op/9");
+
+    assert_eq!(tape.get("op/3").expect_err("unreadable"), failed("op/3"));
+    assert_eq!(tape.get("op/9").expect("absent").map(|row| row.value), None);
+    assert_eq!(value(&tape, "op/2"), Some(b"two".to_vec()));
+    assert_eq!(
+        tape.scan_prefix("op/").expect_err("meets op/3"),
+        failed("op/3")
+    );
+    assert_eq!(
+        tape.scan_prefix("queue/").expect("does not meet it").len(),
+        1
+    );
+
+    // Forward, two rows a page: the first page is before the row, the next holds it.
+    let forward = ScanRange::new("op/", two);
+    let first = tape.scan_range(forward).expect("before the row");
+    assert_eq!(keys(&first.rows), ["op/1", "op/2"]);
+    let token = first.resume.expect("more rows");
+    let next = tape.scan_range(forward.resume(&token));
+    assert_eq!(next.expect_err("meets op/3"), failed("op/3"));
+    // A bound that leaves the row out.
+    let below = ScanRange {
+        upper: Bound::Excluded("op/3"),
+        ..forward
+    };
+    assert_eq!(
+        keys(&tape.scan_range(below).expect("left out").rows),
+        ["op/1", "op/2"]
+    );
+
+    // Reverse, one row a page: the first page from the top holds it; one from below it does
+    // not, and neither does the page it resumes to.
+    let reverse = ScanRange::new("op/", one).reverse();
+    assert_eq!(
+        tape.scan_range(reverse).expect_err("meets op/3"),
+        failed("op/3")
+    );
+    let under = ScanRange {
+        upper: Bound::Included("op/2"),
+        ..reverse
+    };
+    let first = tape.scan_range(under).expect("below the row");
+    assert_eq!(keys(&first.rows), ["op/2"]);
+    let token = first.resume.expect("more rows");
+    let next = tape
+        .scan_range(under.resume(&token))
+        .expect("below the row");
+    assert_eq!(keys(&next.rows), ["op/1"]);
+
+    // Every read above that met op/3 was refused; it is written down once, and again after the
+    // lines are taken.
+    assert_eq!(tape.take(), ["  read refused op/3"]);
+    assert!(tape.get("op/3").is_err());
+    assert_eq!(tape.take(), ["  read refused op/3"]);
+
+    let rewrite = Txn::new().put("op/3", b"again".to_vec(), Cond::Any);
+    assert!(tape.apply_batch(vec![rewrite]).expect("written")[0].is_ok());
+    let tape = tape.restart();
+    assert_eq!(
+        tape.get("op/3").expect_err("still unreadable"),
+        failed("op/3")
+    );
+
+    tape.readable();
+    tape.take();
+    assert_eq!(value(&tape, "op/3"), Some(b"again".to_vec()));
+    assert_eq!(tape.scan_prefix("op/").expect("readable").len(), 3);
+    let all = ScanRange::new("op/", NonZeroUsize::new(10).expect("non-zero"));
+    assert_eq!(tape.scan_range(all).expect("readable").rows.len(), 3);
+    assert_eq!(
+        tape.scan_range(all.reverse()).expect("readable").rows.len(),
+        3
+    );
+    assert_eq!(tape.take(), Vec::<String>::new(), "no read was refused");
 }

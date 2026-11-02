@@ -128,6 +128,12 @@ impl<S: Copy> Transcript<S> {
         });
     }
 
+    /// The caller `label` goes away: its stage is no longer watched, and the server finds its
+    /// channel closed.
+    pub fn cancel(&mut self, label: &str) {
+        self.watched.retain(|caller| caller.label != label);
+    }
+
     /// The process dies: its nodes and callers die with it, and the store, on the same tape,
     /// restarts. The cache stays.
     pub fn restart(&mut self) {

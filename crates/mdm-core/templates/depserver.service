@@ -1,0 +1,36 @@
+# @PREFIX@-depserver.service: NanoDEP's depserver (the Apple Business Manager
+# token, the ADE profile, Apple's device API behind /proxy/), rendered by
+# `js-mdm install`. Loopback only and never proxied. The API key
+# comes from EnvironmentFile as NANODEP_API, never argv.
+[Unit]
+Description=@PREFIX@ NanoDEP depserver (loopback only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+Group=@USER@
+Slice=@SLICE@
+EnvironmentFile=@ETC@/nanodep.env
+ExecStart=@BIN@/depserver -listen 127.0.0.1:@DEP_PORT@ -storage filekv -storage-dsn @STATE@/dep
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ReadWritePaths=@STATE@/dep
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

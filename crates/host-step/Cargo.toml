@@ -1,0 +1,19 @@
+[package]
+name = "host-step"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# The host-step layer: a planner of file, directory, user, unit and command steps, each with a
+# dry-run description and an apply, over a `Host` that is the machine (`RealHost`) or a fake
+# (`fake::FakeHost`). The programs that configure a host (mdm-host first) are built on it.
+
+[dependencies]
+rustix = { workspace = true, features = ["fs", "process"] }
+thiserror.workspace = true
+
+[lints]
+workspace = true
