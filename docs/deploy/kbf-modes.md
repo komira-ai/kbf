@@ -256,6 +256,31 @@ the whole farm, with no frontend to ask and no pack index, and refuse the flag. 
 what was read from packs, elsewhere, lost and damaged are logged when the daemon stops
 (`pack reads: ...`), and a lost or damaged blob is logged when it is found.
 
+`kbf daemon` can read the same packs through a tierstore on its own host instead, with
+`--tierstore-endpoint` (off by default; the `[packs]` table of `kbf.toml`), for a node whose
+tierstore keeps the objects read through it on local disk in front of the farm's object store.
+It needs `--tierstore-bucket` (the tierstore's `server.bucket`) and
+`--tierstore-credentials-file` (a JSON key pair in the form of `--pack-store-credentials-file`,
+mode 0600 or 0400, of a read-only key of the tierstore); requests are signed for `us-east-1`,
+the tierstore's default `server.region`. The endpoint must be `http://` to a loopback IP
+address (`http://127.0.0.1:<port>` or `http://[::1]:<port>`; a name, `localhost` included, a
+path, a query and user info are refused), and anything else stops the start with
+`--tierstore-endpoint "<endpoint>" is not a tierstore on loopback: <why>`. A read asks the
+frontend where the blob lies over the connection to `--cas`, as `--pack-read` does, and reads
+that range of the pack through the tierstore; the frontend's CAS is not read for a blob the
+tierstore serves. The frontend stays the source of truth: every read the tierstore does not
+serve is read where it was before (through `--cas`, or from the storage nodes of the map the
+frontend sends), and succeeds if it would have: a blob the frontend does not locate (or a
+frontend without `--pack-index`), a pack the tierstore answers 404 for (`lost`), bytes that are
+not the digest (`damaged`, never served), a tierstore that is down or answers an error
+(`unasked`), and a blob over 64 MiB. Where `--pack-read` fails a lost or damaged read, this
+falls back, because the tierstore is a cache and not the store. Nothing checks the tierstore at
+start, so a daemon whose tierstore is down starts, reads every blob as it did without the flag,
+and uses the tierstore once it answers. The counts are the ones of `--pack-read`, logged and sent
+in every heartbeat the same way. The flags are refused with `--pack-read`, and by
+`kbf storage-and-daemon` and `kbf all-in-one`. Left out, no tierstore is contacted and the
+daemon starts as before.
+
 **Task runs** (off by default; the `[task-runs]` table of `kbf.toml`). With `--task-secret-file`
 the frontend prepares the runs of a host executor: for each lease and Action it makes the three
 values a task needs and the executor delivers, `RunInputs` of `kbf_front::prepare_run`. They are
@@ -706,7 +731,8 @@ disks and CPUs, and `daemon` on hosts that only build.
   taking it `down`; it is read first. The state of every member is in `GET /v1/members`.
 - **Macs.** A Mac is a node only: `daemon` with the `native` driver, enrolled like any other
   node. Macs build what Linux cannot (Xcode, iOS), and hold no blobs; `all-in-one` and
-  `storage-and-daemon` refuse any driver but `container`, so a Mac is never one of those. Its
+  `storage-and-daemon` refuse any driver but `container`, so a Mac is never one of those. A Mac
+  may read the packs through a tierstore on its own loopback (`--tierstore-endpoint`, above). Its
   `kbf.toml` is rendered by `kbf-mac-provision`. See
   [kbf-installer-setup.md](kbf-installer-setup.md) for the verbs.
 - **A frontend is one process; several may share a store.** Frontends over one Postgres

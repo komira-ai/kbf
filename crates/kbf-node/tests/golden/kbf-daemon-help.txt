@@ -181,6 +181,15 @@ Options:
       --pack-store-write-credentials-file <PATH>
           A file with the key pair `--pack-write` writes with, in the form of `--pack-store-credentials-file`: a key that may create objects under `cas/` (it also deletes the one it creates to check the store at start, and if it may not, that object is left for garbage collection). The secret is never a flag. Needs `--pack-write`
 
+      --tierstore-endpoint <URL>
+          A tierstore on this host, as `http://<loopback IP>:<port>` (any `127.*` address or `[::1]`; a name such as `localhost` is refused), that `kbf daemon` reads the blobs of its leases through first: the daemon asks the frontend where a blob lies (over the connection to `--cas`), reads that range of that pack through the tierstore and checks it against the digest. Every blob the tierstore does not serve (not in a pack, a 404, bytes that are not the digest, a tierstore that is down or answers an error, a blob over 64 MiB) is read from the frontend as without this flag, so a dead tierstore never fails a build. Outputs are stored where they were. An endpoint that is not on loopback is refused at start. Needs `--tierstore-bucket` and `--tierstore-credentials-file`; refused with `--pack-read`, and by `kbf storage-and-daemon` and `kbf all-in-one`. Left out, no tierstore is contacted
+
+      --tierstore-bucket <BUCKET>
+          The bucket the tierstore of `--tierstore-endpoint` serves (its `server.bucket`), under whose keys `cas/` the packs are. Needs `--tierstore-endpoint`
+
+      --tierstore-credentials-file <PATH>
+          A file with a key pair the tierstore of `--tierstore-endpoint` takes, as JSON `{"access_key_id": "...", "secret_access_key": "..."}`, readable by its owner alone (mode 0600 or 0400): a read-only key of the tierstore. The secret is never a flag. Needs `--tierstore-endpoint`
+
       --cgroup-parent <CGROUP_PARENT>
           The cgroup lease cgroups are made under, from the cgroup root (container). Left out, the daemon sets up its own cgroup, which its systemd unit must delegate (`Delegate=yes`): it moves itself into a `supervisor` leaf there and makes `actions` beside it, with cpu, memory and pids enabled. Given, it must already enable cpu, memory and pids for its children
 

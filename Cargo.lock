@@ -2456,6 +2456,7 @@ dependencies = [
 name = "kbf-node"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "clap",
  "futures",
  "kbf-daemon",
@@ -2467,8 +2468,10 @@ dependencies = [
  "kbf-objstore",
  "kbf-outputs",
  "kbf-pack",
+ "kbf-pack-index",
  "kbf-proto",
  "kbf-server",
+ "kbf-state",
  "kbf-testkit",
  "kbf-threads",
  "kbf-transfer",

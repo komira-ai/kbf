@@ -65,17 +65,17 @@ use zeroize::Zeroizing;
 use super::{Cli, Error, NodeHandle, farm, member, start_over, transfer};
 
 /// What makes the endpoint of the connection that asks the frontend where blobs lie.
-type Locate = fn(&Cli) -> Result<Endpoint, Error>;
+pub(crate) type Locate = fn(&Cli) -> Result<Endpoint, Error>;
 
 /// The signing region when `--pack-store-region` is left out: the one S3-compatible stores
 /// accept unless they are configured to another.
-const DEFAULT_REGION: &str = "us-east-1";
+pub(crate) const DEFAULT_REGION: &str = "us-east-1";
 
 /// How long opening a connection to the object store may take.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long a request to the object store may go without an answer or a byte of one.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// What a credentials file that is not JSON of the key pair is told.
 const NOT_KEYS: &str = "not JSON with access_key_id and secret_access_key";
@@ -335,7 +335,7 @@ fn over_store<C: Cas, S: ObjectStore>(
 
 /// The frontend's pack index over the connection `locate` makes (lazily, on the current
 /// runtime).
-fn index(cli: &Cli, locate: Locate) -> Result<Arc<RemoteIndex>, Error> {
+pub(crate) fn index(cli: &Cli, locate: Locate) -> Result<Arc<RemoteIndex>, Error> {
     let channel = locate(cli)?.connect_lazy();
     Ok(Arc::new(RemoteIndex::new(
         channel,
@@ -463,7 +463,7 @@ fn said(flag: &str, error: impl std::fmt::Display) -> String {
 
 /// The key pair in the file at `path`, which only its owner may be able to read. No message
 /// carries the secret.
-fn read_credentials(path: &Path, flag: &str) -> Result<Credentials, Error> {
+pub(crate) fn read_credentials(path: &Path, flag: &str) -> Result<Credentials, Error> {
     let bad = |why: &str| format!("{flag} {}: {why}", path.display());
     let read = std::fs::File::open(path).and_then(|mut file| {
         file.metadata().and_then(|meta| {

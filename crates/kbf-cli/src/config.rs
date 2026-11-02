@@ -216,7 +216,9 @@ const GROUPS: &[(&str, &[&str])] = &[
     (
         // Blobs in packs: the frontend's (`kbf_server::frontend`'s `pack_flags`; `pack-index`,
         // which they need, stays with the scheduler's state store) and the daemon's reads of
-        // them (`kbf_node`'s `pack_read`). The `pack-store-*` keys name the object store in both.
+        // them (`kbf_node`'s `pack_read`), from the object store or through a tierstore on
+        // loopback (`kbf_node`'s `tierstore`). The `pack-store-*` keys name the object store in
+        // both.
         "packs",
         &[
             "pack-bytes",
@@ -235,6 +237,9 @@ const GROUPS: &[(&str, &[&str])] = &[
             "pack-upload-idle-timeout",
             "pack-write",
             "pack-writer",
+            "tierstore-bucket",
+            "tierstore-credentials-file",
+            "tierstore-endpoint",
         ],
     ),
     (

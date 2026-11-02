@@ -23,6 +23,8 @@ kbf-objstore.workspace = true
 kbf-outputs.workspace = true
 # The packing client's reader and read cache (`pack_read`).
 kbf-pack.workspace = true
+# The pack index trait the reader finds blobs through (`tierstore`).
+kbf-pack-index.workspace = true
 kbf-threads.workspace = true
 kbf-transfer.workspace = true
 kbf-types.workspace = true
@@ -42,9 +44,14 @@ zeroize.workspace = true
 kbf-driver-container.workspace = true
 
 [dev-dependencies]
+# The bodies the in-process tierstore of src/tierstore/tests.rs holds.
+bytes.workspace = true
 futures.workspace = true
 kbf-integration-test.workspace = true
 kbf-map.workspace = true
+# The in-memory pack index the tierstore read tests place blobs in (src/tierstore/tests.rs).
+kbf-pack-index = { workspace = true, features = ["test-support"] }
+kbf-state = { workspace = true, features = ["test-support"] }
 kbf-types.workspace = true
 # The CAS the restart test's daemon reads its action from (tests/binary.rs).
 kbf-front.workspace = true

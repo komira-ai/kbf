@@ -1775,8 +1775,8 @@ under `--job-plain-http`, where the listener has no TLS files.
 | `kbf_job_read_bytes_total` | counter | blob bytes served to jobs |
 | `kbf_job_read_seconds{op}` | histogram | seconds from a job's blob read (`op="get"`, `GET /<hex>/<size>`) or batch (`op="batch"`) to its answer, in fixed buckets from 1 ms to 60 s: one observation per answered request, refusals included; `/locate`, a refused method and a path that names no blob are not in it. A blob too large to read whole is answered when its stream starts, not when its last byte is sent |
 
-**Pack reads by daemons.** A daemon started with `--pack-read` ([kbf-modes.md](deploy/kbf-modes.md))
-puts the counts of its pack reads in every heartbeat, and the frontend its worker stream is on
+**Pack reads by daemons.** A daemon started with `--pack-read` or `--tierstore-endpoint`
+([kbf-modes.md](deploy/kbf-modes.md)) puts the counts of its pack reads in every heartbeat, and the frontend its worker stream is on
 keeps the newest of each node and exports them, one sample per node, labelled `node`. They
 are the counts of the daemon's process: they start again from 0 when it restarts, as any counter
 may. A node that sent none (a daemon without `--pack-read`, or one built before the field) has
@@ -1791,8 +1791,8 @@ unasked, lost and damaged.
 | `kbf_pack_daemon_served_total{node}`, `kbf_pack_daemon_served_bytes_total{node}` | counter | blobs the node's daemon read from a pack, and their bytes |
 | `kbf_pack_daemon_elsewhere_total{node}` | counter | reads of a blob no pack holds (or that is not asked of the packs, or whose frontend serves no locations): answered by the storage nodes, as before packs |
 | `kbf_pack_daemon_unasked_total{node}` | counter | reads answered by the storage nodes because the packs could not be asked (the pack index or the pack store failed): the daemon is reading around the packs |
-| `kbf_pack_daemon_lost_total{node}` | counter | reads that failed because the pack the index names is gone or too short (UNAVAILABLE to the lease; alert on any) |
-| `kbf_pack_daemon_damaged_total{node}` | counter | reads that failed because the bytes in the pack are not the digest (never served; alert on any) |
+| `kbf_pack_daemon_lost_total{node}` | counter | reads of a blob whose pack the index names is gone or too short: failed (UNAVAILABLE to the lease; alert on any), or with `--tierstore-endpoint` answered by the frontend (a pack the tierstore does not have) |
+| `kbf_pack_daemon_damaged_total{node}` | counter | reads of a blob whose bytes in the pack are not the digest (never served): failed (alert on any), or with `--tierstore-endpoint` answered by the frontend |
 
 **Pack writes by daemons.** A daemon started with `--pack-write` (which needs `--pack-read`;
 [kbf-modes.md](deploy/kbf-modes.md)) also puts the counts of its pack writes in every heartbeat,

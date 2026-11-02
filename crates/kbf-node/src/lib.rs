@@ -44,6 +44,10 @@
 //! With `--pack-write` as well (off by default; `pack_read`) it writes its outputs into packs
 //! while the frontend takes pack commits.
 //!
+//! With `--tierstore-endpoint` (off by default; `tierstore`) the data plane of `kbf daemon` reads
+//! the same packs through a tierstore on loopback first, and reads every blob it does not serve
+//! where it always was, so a tierstore that misses, fails or is down never fails a build.
+//!
 //! The log goes to stderr, in color only when stderr is a terminal: under launchd or
 //! systemd it is a file or a journal, where escape codes are noise (issue #170). The
 //! daemon does not rotate it; the service manager that owns stderr does. systemd's
@@ -164,6 +168,8 @@ pub struct Cli {
     transfer: transfer::TransferArgs,
     #[command(flatten)]
     pack_read: pack_read::PackReadArgs,
+    #[command(flatten)]
+    tierstore: tierstore::TierstoreArgs,
     /// The cgroup lease cgroups are made under, from the cgroup root (container). Left
     /// out, the daemon sets up its own cgroup, which its systemd unit must delegate
     /// (`Delegate=yes`): it moves itself into a `supervisor` leaf there and makes
@@ -612,6 +618,10 @@ impl NodeHandle {
 /// checks fail ([`ImageUnusable`] among them, for which [`exit_code`] answers 2), or
 /// the node cannot be detected.
 pub fn start(cli: &Cli) -> Result<NodeHandle, Error> {
+    // With `--tierstore-endpoint`, the same plane with its reads going through it first.
+    if let Some(settings) = cli.tierstore.settings()? {
+        return tierstore::start(cli, settings);
+    }
     // With `--pack-read`, the same plane with its reads going to the packs first.
     if let Some(settings) = cli.pack_read.settings() {
         return pack_read::start(cli, settings);
@@ -636,6 +646,7 @@ pub fn start(cli: &Cli) -> Result<NodeHandle, Error> {
 /// # Errors
 /// As [`start`].
 pub fn start_member(cli: &Cli, local: LocalMember) -> Result<NodeHandle, Error> {
+    cli.tierstore.refuse("`kbf storage-and-daemon`")?;
     if let Some(settings) = cli.pack_read.settings() {
         return pack_read::start_member(cli, local, settings);
     }
@@ -661,6 +672,8 @@ pub fn start_with<C: Cas>(
     plane: impl Fn(&Cli) -> Result<Arc<C>, Error> + 'static,
 ) -> Result<NodeHandle, Error> {
     cli.pack_read.refuse_in_process()?;
+    cli.tierstore
+        .refuse("a daemon that reads blobs in-process")?;
     start_over(cli, None, move |cli, _| plane(cli))
 }
 
@@ -1330,6 +1343,7 @@ mod instance;
 mod pack_read;
 mod retired;
 mod run;
+mod tierstore;
 mod transfer;
 mod whole_machine;
 
