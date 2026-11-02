@@ -38,7 +38,13 @@ fn unpack_into(
             required: false,
         },
     ];
-    unpack_members(tarball, &members, within)
+    let mut told = Vec::new();
+    let result = unpack_members(tarball, &members, within, &mut |m| told.push(m.to_owned()));
+    // Every member passed over is told once, in order: the list is what was told.
+    if let Ok(unpacked) = &result {
+        assert_eq!(unpacked.ignored, told);
+    }
+    result
 }
 
 /// Unpack `tarball` as the stage does into a fresh directory `<dir>/out`; that directory and
@@ -276,7 +282,7 @@ fn every_member_is_checked_and_an_unsafe_one_is_refused_by_name() {
 
 /// Catches an archive that lacks a member the unpack requires being accepted, or refused
 /// without saying which: a tarball of the declaration alone, of another name, of a name with
-/// a path (`bin/kbf`, `./kbf`) and of nothing at all.
+/// a path (`bin/kbf`, `./kbf`) and of no entries at all (still named by the member).
 #[test]
 fn a_missing_required_member_is_refused_by_name() {
     for (why, tarball) in [
@@ -291,8 +297,11 @@ fn a_missing_required_member_is_refused_by_name() {
         assert_eq!(err.to_string(), "it holds no member named \"kbf\"", "{why}");
         let _ = fs::remove_dir_all(out.join("updater.d"));
     }
+    // An archive of no entries at all lacks the binary too, and says so by name.
     let (_, result) = unpack("archive-missing-none", &tar_gz(&[]), CAP);
-    assert_eq!(result.expect_err("none").code(), "archive-entries");
+    let err = result.expect_err("none");
+    assert_eq!(err.code(), "archive-name");
+    assert_eq!(err.to_string(), "it holds no member named \"kbf\"");
 }
 
 /// Catches a wanted member that is not a plain file of its size once being taken: a
@@ -468,7 +477,7 @@ fn a_declaration_is_never_written_through_a_link_or_into_a_missing_directory() {
         cap: CAP,
         required: true,
     }];
-    let err = unpack_members(&source, &members, WITHIN).expect_err("no parent");
+    let err = unpack_members(&source, &members, WITHIN, &mut |_| {}).expect_err("no parent");
     assert_eq!(err.code(), "archive-malformed");
     assert!(!dir.join("missing").exists());
 }
@@ -573,3 +582,6 @@ fn the_decompressed_size_and_the_time_are_bounded() {
     assert_eq!(err.code(), "archive-timeout");
     assert!(!dir.join("kbf").exists());
 }
+
+#[path = "archive_more_tests.rs"]
+mod more;

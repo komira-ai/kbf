@@ -144,6 +144,10 @@ fn every_case() -> Vec<(&'static str, Refusal)> {
             archive(ArchiveFault::Duplicate("kbf".into())),
         ),
         (
+            "archive-request",
+            archive(ArchiveFault::Request("kbf".into())),
+        ),
+        (
             "archive-oversize",
             archive(ArchiveFault::Oversize { cap: 10 }),
         ),

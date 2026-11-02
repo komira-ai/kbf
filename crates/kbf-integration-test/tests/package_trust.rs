@@ -262,7 +262,7 @@ fn unpack_binary(
         cap: 1 << 20,
         required: true,
     };
-    kbf_installer::archive::unpack_members(tarball, &[binary], Duration::from_secs(30))
+    kbf_installer::archive::unpack_members(tarball, &[binary], Duration::from_secs(30), &mut |_| {})
 }
 
 #[test]

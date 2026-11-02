@@ -7,10 +7,11 @@ use std::path::Path;
 
 use tar::EntryType::{self, Block, Char, Continuous, Directory, Fifo, Link, Regular, Symlink};
 
-use super::fx::{Fx, NEW, NEW_VERSION, Sim, mkdir, mode, raw_tarball, sha256, tarball, write};
+use super::fx::{Fx, NEW, NEW_VERSION, Sim, gzip, mkdir, mode, raw_tarball, sha256, tarball};
 use crate::mac::channel::{MacChannel, Source};
 use crate::mac::release::Origin;
-use crate::mac::stage::{DECLARATION_CAP, Staged, Wanted, declaration_member, stage, unpack};
+use crate::mac::stage::{Staged, stage};
+use crate::mac::unpack::{DECLARATION_CAP, FRAMING, declaration_member};
 use crate::outcome::{FailureCode, Outcome};
 use crate::request::Version;
 
@@ -28,9 +29,18 @@ fn run(fx: &Fx, sim: &Sim) -> Result<Staged, Outcome> {
     stage(&fx.host, sim, &channel, &Version::new(NEW_VERSION).unwrap())
 }
 
-/// The detail of a stage that failed its checks; the stage is gone.
+/// The detail of a stage that failed at the unpack; the stage is gone, and nothing that runs
+/// after the unpack (`xattr`, `codesign`, the new binary's check) was run.
 fn verify_failure(fx: &Fx, sim: &Sim) -> String {
-    match run(fx, sim) {
+    let before = sim.calls.borrow().len();
+    let result = run(fx, sim);
+    let after: Vec<String> = sim.calls.borrow()[before..]
+        .iter()
+        .map(|c| c.program.clone())
+        .filter(|p| p.ends_with("/kbf") || p.ends_with("xattr") || p.ends_with("codesign"))
+        .collect();
+    assert!(after.is_empty(), "run after a refused unpack: {after:?}");
+    match result {
         Err(Outcome::Failed(f)) => {
             assert_eq!(f.code, FailureCode::VerifyFailed, "{}", f.detail);
             assert!(!fx.host.stage().exists(), "a failed check leaves no stage");
@@ -138,8 +148,8 @@ fn a_member_no_one_asked_for_is_ignored() {
 
 /// Catches an unsafe member let through because it is or is not one the stage wants: an
 /// absolute name, one with a `..` component, an empty one, a symbolic link, a hard link, a
-/// device, a FIFO and a member of another kind each refuse the release whether alone or
-/// beside a good binary, and the refusal names the member.
+/// device, a FIFO and a member of another kind each refuse the release whether alone, before
+/// or after a good binary, and the refusal names the member.
 #[test]
 fn an_unsafe_member_is_refused_by_name() {
     let fx = Fx::new("mac-members-unsafe");
@@ -181,6 +191,7 @@ fn an_unsafe_member_is_refused_by_name() {
         let bad = (name, entry, &b""[..]);
         for (place, members) in [
             ("alone", vec![bad]),
+            ("before", vec![bad, (&b"kbf"[..], Regular, &bin[..])]),
             ("after", vec![(&b"kbf"[..], Regular, &bin[..]), bad]),
         ] {
             fx.offer(&raw_tarball(&members));
@@ -190,7 +201,7 @@ fn an_unsafe_member_is_refused_by_name() {
 }
 
 /// Catches a release that lacks the binary being staged, or refused without its name: the
-/// declaration alone, another name, a name with a path.
+/// declaration alone, another name, a name with a path, `./kbf`, and no entries at all.
 #[test]
 fn a_missing_binary_is_refused_by_name() {
     let fx = Fx::new("mac-members-missing");
@@ -199,6 +210,7 @@ fn a_missing_binary_is_refused_by_name() {
         vec![(DECLARATION, Regular, TOML)],
         vec![("kbf2", Regular, &fx.new_binary[..])],
         vec![("bin/kbf", Regular, &fx.new_binary[..])],
+        vec![],
     ] {
         fx.offer(&tarball(&members));
         assert_eq!(
@@ -206,10 +218,99 @@ fn a_missing_binary_is_refused_by_name() {
             "tarball: holds no member named kbf"
         );
     }
+    fx.offer(&raw_tarball(&[(b"./kbf", Regular, &fx.new_binary)]));
+    assert_eq!(
+        verify_failure(&fx, &sim),
+        "tarball: holds no member named kbf"
+    );
+}
+
+/// Catches a name that only looks like a wanted one being taken: `./updater.d/kbf.toml` and
+/// `updater.d//kbf.toml` beside the binary are passed over, the binary is staged, and no
+/// declaration is.
+#[test]
+fn a_name_that_only_looks_like_the_declaration_is_passed_over() {
+    let fx = Fx::new("mac-members-alias");
+    let bin = fx.new_binary.clone();
+    fx.offer(&raw_tarball(&[
+        (b"kbf", Regular, &bin),
+        (b"./updater.d/kbf.toml", Regular, TOML),
+        (b"updater.d//kbf.toml", Regular, TOML),
+    ]));
+    run(&fx, &fx.sim()).unwrap();
+    assert_eq!(unpacked(&fx), ["kbf"]);
+}
+
+/// Catches a tarball whose stream does not end where its tar does being staged: a header or
+/// a member cut short, a damaged gzip checksum or length, bytes after the gzip member, a
+/// second gzip member, a non-zero byte after the tar's end, and zero padding past the bound.
+/// Each refuses the release, with the stage gone and nothing run.
+#[test]
+fn the_stream_ends_where_the_tar_does() {
+    let fx = Fx::new("mac-members-stream");
+    let sim = fx.sim();
+    let tar = raw_tar_of(&fx.new_binary);
+    let clean = gzip(&tar);
+    let cut = |at: usize| gzip(&tar[..at]);
+    let mut crc = clean.clone();
+    let n = crc.len();
+    crc[n - 8] ^= 0xff;
+    let mut length = clean.clone();
+    length[n - 2] ^= 0xff;
+    let mut trailing = clean.clone();
+    trailing.extend_from_slice(b"\0\0\0\0");
+    let mut second = clean.clone();
+    second.extend_from_slice(&clean);
+    let mut tail = tar.clone();
+    tail.extend_from_slice(b"hidden");
+    let bound = fx.host.tuning.binary_max + DECLARATION_CAP + FRAMING;
+    let mut padded = tar.clone();
+    padded.resize(usize::try_from(bound).unwrap() + 1, 0);
+    let follows = "tarball: data follows the end of the archive".to_owned();
+    for (why, bytes, want) in [
+        ("cut-header", cut(300), None),
+        ("cut-member", cut(700), None),
+        ("crc", crc, None),
+        ("length", length, None),
+        ("trailing", trailing, Some(follows.clone())),
+        ("second-member", second, Some(follows.clone())),
+        ("tail", gzip(&tail), Some(follows.clone())),
+        (
+            "padding",
+            gzip(&padded),
+            Some(format!(
+                "tarball: it decompresses to more than {bound} bytes"
+            )),
+        ),
+    ] {
+        fx.offer(&bytes);
+        let detail = verify_failure(&fx, &sim);
+        match want {
+            Some(want) => assert_eq!(detail, want, "{why}"),
+            None => assert!(detail.starts_with("tarball: "), "{why}: {detail}"),
+        }
+    }
+    // Padded with zeros up to the bound exactly, it is a release.
+    let mut at_bound = tar;
+    at_bound.resize(usize::try_from(bound).unwrap(), 0);
+    fx.offer(&gzip(&at_bound));
+    run(&fx, &sim).unwrap();
+}
+
+/// The uncompressed tar of the one member `kbf`.
+fn raw_tar_of(binary: &[u8]) -> Vec<u8> {
+    let mut builder = tar::Builder::new(Vec::new());
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(Regular);
+    header.set_size(binary.len() as u64);
+    header.set_mode(0o755);
+    header.set_cksum();
+    builder.append_data(&mut header, "kbf", binary).unwrap();
+    builder.into_inner().unwrap()
 }
 
 /// Catches a wanted member that is not one plain file within its cap being staged: the
-/// declaration as a directory, twice, or over its cap.
+/// declaration as a directory, either member twice, or the declaration over its cap.
 #[test]
 fn a_wanted_member_must_be_one_regular_file_within_its_cap() {
     let fx = Fx::new("mac-members-wanted");
@@ -233,6 +334,10 @@ fn a_wanted_member_must_be_one_regular_file_within_its_cap() {
             format!("tarball: the member {DECLARATION:?} is in it twice"),
         ),
         (
+            vec![("kbf", Regular, &bin[..]), ("kbf", Regular, &bin[..])],
+            "tarball: the member \"kbf\" is in it twice".to_owned(),
+        ),
+        (
             vec![("kbf", Regular, &bin[..]), (DECLARATION, Regular, &big[..])],
             format!("tarball: the member {DECLARATION:?} is larger than {DECLARATION_CAP} bytes"),
         ),
@@ -242,121 +347,12 @@ fn a_wanted_member_must_be_one_regular_file_within_its_cap() {
     }
 }
 
-/// The stage's ask, `kbf` (at most `cap`) and its declaration, of the tarball `bytes`
-/// unpacked into `dir`.
-fn unpack_into(dir: &Path, bytes: &[u8], cap: u64) -> Result<Vec<String>, String> {
-    let source = dir.join("kbf.tar.gz");
-    write(&source, 0o644, bytes);
-    let declaration = declaration_member("kbf");
-    let wanted = [
-        Wanted {
-            name: "kbf",
-            dest: &dir.join("kbf"),
-            mode: 0o755,
-            cap,
-            required: true,
-        },
-        Wanted {
-            name: &declaration,
-            dest: &dir.join(&declaration),
-            mode: 0o644,
-            cap: DECLARATION_CAP,
-            required: false,
-        },
-    ];
-    unpack(&source, &wanted)
-}
-
-/// Catches the members passed over not being the ones told, and a gzip bomb in a member no
-/// one asked for being read to its end: the names are given in the archive's order, and a
-/// member that decompresses past the caps and framing stops the unpack.
-#[test]
-fn the_members_passed_over_are_named_and_bounded() {
-    let fx = Fx::new("mac-members-bound");
-    let dir = fx.dir.join("out");
-    mkdir(&dir, 0o755);
-    let ignored = unpack_into(
-        &dir,
-        &tarball(&[
-            ("a", Regular, b"1"),
-            ("kbf", Regular, b"bin"),
-            ("b/", Directory, b""),
-        ]),
-        1024,
-    )
-    .unwrap();
-    assert_eq!(ignored, ["a", "b/"]);
-    assert_eq!(listing(&dir), ["kbf", "kbf.tar.gz"]);
-
-    let dir = fx.dir.join("bomb");
-    mkdir(&dir, 0o755);
-    let bomb = tarball(&[
-        ("kbf", Regular, b"x"),
-        ("big", Regular, &vec![0u8; 8 << 20]),
-    ]);
-    assert_eq!(
-        unpack_into(&dir, &bomb, 1024),
-        Err(format!(
-            "it decompresses to more than {} bytes",
-            1024 + DECLARATION_CAP
-        ))
-    );
-}
-
-/// Catches the declaration's directory not being made, or a file or a link in its place
-/// being replaced or followed, a missing parent being made, and a file already at a
-/// member's destination being replaced.
-#[test]
-fn a_destination_that_cannot_be_made_is_refused() {
-    let fx = Fx::new("mac-members-dest");
-    let dir = fx.dir.join("blocked");
-    mkdir(&dir, 0o755);
-    write(&dir.join("updater.d"), 0o644, b"a file");
-    let both = tarball(&[(DECLARATION, Regular, TOML), ("kbf", Regular, b"bin")]);
-    assert!(unpack_into(&dir, &both, 1024).is_err());
-    assert_eq!(fs::read(dir.join("updater.d")).unwrap(), b"a file");
-
-    let dir = fx.dir.join("exists");
-    mkdir(&dir, 0o755);
-    write(&dir.join("kbf"), 0o755, b"old");
-    assert!(unpack_into(&dir, &both, 1024).is_err());
-    assert_eq!(fs::read(dir.join("kbf")).unwrap(), b"old");
-
-    // A link in the place of `updater.d` is not followed, and a missing parent is not made.
-    let dir = fx.dir.join("linked");
-    mkdir(&dir, 0o755);
-    let elsewhere = fx.dir.join("elsewhere");
-    mkdir(&elsewhere, 0o755);
-    std::os::unix::fs::symlink(&elsewhere, dir.join("updater.d")).unwrap();
-    assert!(unpack_into(&dir, &both, 1024).is_err());
-    assert!(listing(&elsewhere).is_empty(), "written through the link");
-    let deep = [Wanted {
-        name: "kbf",
-        dest: &fx.dir.join("missing/deeper/kbf"),
-        mode: 0o755,
-        cap: 1024,
-        required: true,
-    }];
-    assert!(unpack(&dir.join("kbf.tar.gz"), &deep).is_err());
-    assert!(!fx.dir.join("missing").exists());
-
-    // And a tarball that is not there.
-    let wanted = [Wanted {
-        name: "kbf",
-        dest: &dir.join("new"),
-        mode: 0o755,
-        cap: 1,
-        required: true,
-    }];
-    assert!(unpack(&dir.join("none.tar.gz"), &wanted).is_err());
-}
-
 /// Catches the Mac and the Linux unpack naming a release's declaration differently, or
 /// either naming its directory other than the host's declaration directory
 /// (`/etc/updater.d`, where the updater reads declarations).
 #[test]
 fn the_declaration_member_is_the_same_on_both_platforms_and_named_for_updater_d() {
-    use crate::mac::stage::DECLARATIONS;
+    use crate::mac::unpack::DECLARATIONS;
     assert_eq!(declaration_member("tierstore"), "updater.d/tierstore.toml");
     assert_eq!(
         Path::new(update_rights::load::DECLARATION_DIR)

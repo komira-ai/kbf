@@ -326,6 +326,10 @@ pub enum ArchiveFault {
     /// A wanted member that is in the archive twice.
     #[error("its member {0:?} is in it twice")]
     Duplicate(String),
+    /// The unpack asked for a member name, or a destination, twice: the caller's mistake,
+    /// found before the tarball is opened.
+    #[error("the unpack asks for {0:?} by a name or a destination it already asks for")]
+    Request(String),
     #[error("it is larger than {cap} bytes (its entry, or what it decompresses to)")]
     Oversize { cap: u64 },
     #[error("data follows the end of the archive")]
@@ -343,6 +347,7 @@ impl ArchiveFault {
             ArchiveFault::NotRegular { .. } => "archive-not-regular",
             ArchiveFault::UnsafePath(_) => "archive-unsafe-path",
             ArchiveFault::Duplicate(_) => "archive-duplicate",
+            ArchiveFault::Request(_) => "archive-request",
             ArchiveFault::Oversize { .. } => "archive-oversize",
             ArchiveFault::TrailingData => "archive-trailing",
             ArchiveFault::TimedOut => "archive-timeout",

@@ -43,6 +43,28 @@ pub fn declaration_member(name: &str) -> String {
     format!("{DECLARATIONS}/{name}.toml")
 }
 
+/// A test of a file's kind, on its metadata.
+type IsKind = fn(&fs::Metadata) -> bool;
+
+/// The updater declaration of the component `name` that the release directory `release` holds:
+/// `Ok(None)` for none (no `updater.d/`, or no file of that name in it), the sha256 of a plain
+/// file in a plain `updater.d/`, and `Err` for anything else: a link at either, another kind
+/// of file, or a file that cannot be read or looked at.
+pub(crate) fn declaration_in(release: &Path, name: &str) -> Result<Option<String>, ()> {
+    let dir = release.join(DECLARATIONS);
+    let file = release.join(declaration_member(name));
+    let plain: [(&Path, IsKind); 2] =
+        [(&dir, fs::Metadata::is_dir), (&file, fs::Metadata::is_file)];
+    for (path, kind) in plain {
+        match fs::symlink_metadata(path) {
+            Ok(meta) if kind(&meta) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            _ => return Err(()),
+        }
+    }
+    crate::stage::file_sha256(&file).map(Some).map_err(drop)
+}
+
 /// One member the caller wants: its exact name in the tarball, the new file it is written
 /// to (with its mode), the most it may be, and whether the archive must hold it.
 #[derive(Clone, Copy, Debug)]
@@ -111,17 +133,20 @@ fn check_name(name: &[u8]) -> Result<(), ArchiveFault> {
     Ok(())
 }
 
-/// Make the directory `dir` (0755) in its parent, which must be there, unless it is there
-/// already as a directory. Never through a link: a link (or anything but a directory) in
-/// its place is refused, so nothing is written outside the directory unpacked into.
+/// Make the directory `dir` in its parent, which must be there, mode 0755 whatever the umask,
+/// unless it is there already as a directory, which is the caller's and is left as it is (the
+/// directory unpacked into, or the declarations' directory an earlier component made). Never
+/// through a link: a link (or anything but a directory) in its place is refused, so nothing is
+/// written outside the directory unpacked into.
 fn make_dir(dir: &Path) -> io::Result<()> {
     match fs::DirBuilder::new().mode(0o755).create(dir) {
+        Ok(()) => fs::set_permissions(dir, fs::Permissions::from_mode(0o755)),
         Err(e)
             if e.kind() == io::ErrorKind::AlreadyExists && fs::symlink_metadata(dir)?.is_dir() =>
         {
             Ok(())
         }
-        made => made,
+        Err(e) => Err(e),
     }
 }
 
@@ -139,18 +164,34 @@ fn refused_kind(kind: EntryType) -> Option<&'static str> {
 }
 
 /// Write each of `members` that `tarball` holds to its `dest` (a new file; its directory is
-/// made, 0755, when it is not there, in a parent that is: [`make_dir`]). Every member is
-/// checked ([`check_name`], [`refused_kind`]); a wanted one must be a regular file, at most its `cap`, and there once.
+/// made, 0755, when it is not there, in a parent that is: [`make_dir`]). The request names
+/// each member and each destination once ([`ArchiveFault::Request`] otherwise, before the
+/// tarball is opened); any number of members may be required, and none need be. Every member
+/// of the tarball is checked ([`check_name`], [`refused_kind`]) by the name the tar reader
+/// resolves (a GNU long name, a PAX `path`, a ustar prefix), and a wanted one must be a
+/// regular file, at most its `cap`, and there once. A required member the tarball does not
+/// hold is refused by name, before an archive with no entries at all is.
 /// The whole stream decompresses to at most the members' caps and some framing, and is
 /// done within `within`. What follows the tar's end is only zero bytes, and nothing follows
 /// the gzip member: a second member or any trailing byte refuses the archive, since a
-/// reader that stops early would not see it. A member no one asked for is logged and
-/// listed in [`Unpacked::ignored`].
+/// reader that stops early would not see it. A member no one asked for is handed to
+/// `ignored` as it is passed over (the caller logs it, once), and listed in
+/// [`Unpacked::ignored`].
 pub fn unpack_members(
     tarball: &Path,
     members: &[Member<'_>],
     within: Duration,
+    ignored: &mut dyn FnMut(&str),
 ) -> Result<Unpacked, ArchiveFault> {
+    for (i, member) in members.iter().enumerate() {
+        let seen = &members[..i];
+        if seen
+            .iter()
+            .any(|m| m.name == member.name || m.dest == member.dest)
+        {
+            return Err(ArchiveFault::Request(member.name.to_owned()));
+        }
+    }
     let caps = members
         .iter()
         .fold(0u64, |sum, m| sum.saturating_add(m.cap));
@@ -182,7 +223,7 @@ pub fn unpack_members(
         }
         let Some(member) = members.iter().find(|m| m.name.as_bytes() == name_bytes) else {
             // Not asked for: read past (its bytes count against the bound), never written.
-            tracing::info!(member = ?name, "a member of the tarball not taken here: ignored");
+            ignored(&name);
             unpacked.ignored.push(name);
             continue;
         };
@@ -213,14 +254,14 @@ pub fn unpack_members(
             .map_err(bad)?;
         unpacked.taken.push(name);
     }
-    if seen == 0 {
-        return Err(ArchiveFault::Entries(0));
-    }
     if let Some(missing) = members
         .iter()
         .find(|m| m.required && !unpacked.taken.iter().any(|t| t == m.name))
     {
         return Err(ArchiveFault::WrongName(missing.name.to_owned()));
+    }
+    if seen == 0 {
+        return Err(ArchiveFault::Entries(0));
     }
     // The rest of the decompressed stream must be the tar's zero padding, read to the end
     // so that the gzip trailer (its length and checksum) is checked too.

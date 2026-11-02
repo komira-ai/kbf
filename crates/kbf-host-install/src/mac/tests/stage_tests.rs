@@ -443,7 +443,7 @@ fn the_tarball_holds_the_binary() {
     fx.offer(b"plain text, not a tarball");
     assert!(verify_failure(&fx, &sim).starts_with("tarball:"));
     fx.offer(&gzip(b""));
-    assert!(verify_failure(&fx, &sim).contains("holds no file"));
+    assert!(verify_failure(&fx, &sim).contains("holds no member named kbf"));
     // Attestation had passed each time: the checks after it are the ones that spoke.
     assert!(tags(&fx, &sim).contains(&"gh"));
 }

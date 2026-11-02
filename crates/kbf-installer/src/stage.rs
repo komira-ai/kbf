@@ -658,7 +658,10 @@ impl Pipeline<'_> {
                 required: false,
             },
         ];
-        archive::unpack_members(tarball, &members, self.policy.timeouts.extract).map_err(
+        let log = &mut |member: &str| {
+            tracing::info!(component = name, ?member, "member of the tarball ignored");
+        };
+        archive::unpack_members(tarball, &members, self.policy.timeouts.extract, log).map_err(
             |fault: ArchiveFault| Refusal::Archive {
                 component: name.to_owned(),
                 fault,
@@ -821,7 +824,8 @@ impl Pipeline<'_> {
         let carried: Vec<String> = declarations
             .filter(|d| fs::symlink_metadata(dir.join(d)).is_ok())
             .collect();
-        if !carried.is_empty() {
+        let declares = !carried.is_empty();
+        if declares {
             entries.push(archive::DECLARATIONS.to_owned());
             entries.extend(carried);
         }
@@ -830,6 +834,10 @@ impl Pipeline<'_> {
             // Never through a link: the entry itself is the release's.
             std::os::unix::fs::lchown(&path, Some(owner.uid), Some(owner.gid))
                 .map_err(work_err(&path))?;
+        }
+        // The names in `updater.d/` are on disk before the release that holds it is.
+        if declares {
+            sync_dir(&dir.join(archive::DECLARATIONS))?;
         }
         sync_dir(&dir)?;
 
@@ -884,14 +892,9 @@ impl Pipeline<'_> {
             if !same {
                 return Err(differs(&old));
             }
-            let declaration = archive::declaration_member(name);
-            let (old, fresh) = (target.join(&declaration), new.join(&declaration));
-            // Nothing, or a plain file, in both; and then the same bytes.
-            let kind = |path: &Path| fs::symlink_metadata(path).ok().map(|m| m.is_file());
-            let same =
-                kind(&old) == kind(&fresh) && file_sha256(&old).ok() == file_sha256(&fresh).ok();
-            if !same {
-                return Err(differs(&old));
+            let old = archive::declaration_in(target, name);
+            if old.is_err() || old != archive::declaration_in(new, name) {
+                return Err(differs(&target.join(archive::declaration_member(name))));
             }
         }
         Ok(())
@@ -950,7 +953,7 @@ fn sha256_of(mut file: File) -> io::Result<String> {
     }
 }
 
-fn file_sha256(path: &Path) -> io::Result<String> {
+pub(crate) fn file_sha256(path: &Path) -> io::Result<String> {
     sha256_of(File::open(path)?)
 }
 
