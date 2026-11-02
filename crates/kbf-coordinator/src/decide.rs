@@ -28,7 +28,9 @@
 //!    host reports it or the order ages out, [`crate::fleet::ORDER_AGE`], and, at its
 //!    service's desired version, until it has beaten healthy that service's `bake_beats`
 //!    times, [`crate::bake`]. The asking host's own slot for the asked service is not
-//!    counted, so a host asking again under its own order is told the same again;
+//!    counted, so a host asking again under its own order is told the same again. A host the
+//!    service no longer counts (excluded, out of its selector, not announcing it) still holds
+//!    its slot until its beats or its order's age free it ([`Fleet::occupants_of`]);
 //! 8. the role waits for the roles its definition names (`kbf`: a frontend waits for every
 //!    live storage, daemon and Mac host) and the service for the services in its `after`: each
 //!    live host of those runs that service's desired version and is done updating;
@@ -304,7 +306,7 @@ fn live(
         let name = def.name.as_str();
         let want = all.get(name);
         for (o, h) in fleet
-            .hosts_of(name)
+            .occupants_of(name)
             .filter(|(o, _)| !(name == service && *o == id))
         {
             if fleet.holds_slot(name, o, h, now) {

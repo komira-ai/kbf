@@ -385,18 +385,36 @@ impl Coordinator {
                 fleet.forget_in(&def.name, &who.node_id);
             }
         }
-        if self.services.get(KBF).is_none_or(counted) {
-            fleet.record(who.node_id.clone(), who.role.clone(), beat, now);
+        // A host a service does not count still says what it runs of it: kept as what it
+        // occupies, so an update it was ordered before it left holds its slot until it ends.
+        let dropped =
+            |def: &ServiceDef| standing(def, &who.node_id, &node, &ops, now) == Standing::Dropped;
+        match self.services.get(KBF) {
+            Some(def) if dropped(def) => {
+                fleet.record_outside_in(KBF, who.node_id.clone(), &who.role, beat, now);
+            }
+            kbf if kbf.is_none_or(counted) => {
+                fleet.record(who.node_id.clone(), who.role.clone(), beat, now);
+            }
+            _ => {}
         }
         for one in &announced {
-            if self.services.get(&one.name).is_some_and(counted) {
-                fleet.record_in(
+            match self.services.get(&one.name) {
+                Some(def) if counted(def) => fleet.record_in(
                     &one.name,
                     who.node_id.clone(),
                     who.role.clone(),
                     one.as_heartbeat(platform),
                     now,
-                );
+                ),
+                Some(def) if dropped(def) => fleet.record_outside_in(
+                    &one.name,
+                    who.node_id.clone(),
+                    &who.role,
+                    one.as_heartbeat(platform),
+                    now,
+                ),
+                _ => {}
             }
         }
         fleet.note_node(who.node_id.clone(), node);
@@ -534,7 +552,8 @@ impl Coordinator {
         Ok(entry)
     }
 
-    /// Forgets what the hosts said about a service they no longer belong to, after an
+    /// Stops counting the hosts of a service they no longer belong to (what they said is kept
+    /// only as what they occupy, [`Fleet::forget_in`]), after an
     /// operator changed exclusions or labels ([`standing`]).
     fn reconcile(&self) {
         let now = (self.clock)();
