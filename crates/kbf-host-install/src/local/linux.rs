@@ -19,7 +19,10 @@
 //!   are restarted and waited for. A unit that does not come up puts the host back at once;
 //! - **confirm**: [`kbf_installer::activate::confirm`] clears the marker;
 //! - **revert**: [`kbf_installer::activate::revert`] writes the state first, then moves the
-//!   links back, and the units are restarted on the release that ran.
+//!   links back, and the units are restarted on the release that ran;
+//! - **activate**: [`kbf_installer::activate::select`] writes the state with the release named
+//!   current, the one that ran `previous` and nothing on trial, then moves the links; the units
+//!   are restarted on it, and nothing goes back if they do not come up.
 //!
 //! The channels are named in `/etc/kbf/host-install-releases.toml`, in the format of a Mac's
 //! allowlist ([`crate::mac::channel`]); the ssh forced command's `host-install.toml` is the
@@ -590,6 +593,31 @@ impl<E: Exec> Backend for Linux<E> {
 
     fn revert(&self, _pending: &Pending) -> Result<(), Fault> {
         self.put_back()
+    }
+
+    /// The installer's [`activate::select`] (the state, then the links; no trial), then the
+    /// units restarted. A unit that does not come up leaves the host on the release named: there
+    /// is no going back to the release left.
+    fn activate(&self, commit: &str) -> Result<(), Fault> {
+        let id = commit_id(commit)?;
+        let mut out = Vec::new();
+        activate::select(&mut *self.exec.borrow_mut(), &self.layout, &id, &mut out).map_err(
+            |e| match e {
+                kbf_installer::release::ReleaseError::NotInstalled(_) => {
+                    Fault::refused(Code::NotKept, e.to_string())
+                }
+                other => Fault::failed(Code::StateUnavailable, other.to_string()),
+            },
+        )?;
+        self.restart_units().map_err(|why| {
+            Fault::failed(
+                Code::RestartFailed,
+                format!(
+                    "the host runs {} now, but: {why}",
+                    commit.get(..12).unwrap_or(commit)
+                ),
+            )
+        })
     }
 
     fn kept(&self) -> Result<Vec<Kept>, Fault> {

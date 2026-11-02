@@ -565,7 +565,33 @@ pub(crate) fn take_lock(path: &std::path::Path) -> Result<Lock, Outcome> {
     // held): either way nothing may start.
     file.try_lock()
         .map_err(|_| fail(FailureCode::Busy, BUSY_DETAIL))?;
+    // Who holds it, for `activate` to name ([`locks::holder`]): this process's id, in place of
+    // the last holder's. The lock is the `flock`; a record that cannot be written only names
+    // no one.
+    let _ = file
+        .set_len(0)
+        .and_then(|()| writeln!(&file, "{}", std::process::id()));
     Ok(Lock(file))
+}
+
+/// The install lock for `activate --force-lock`: taken as [`take_lock`] does, and when another
+/// process holds it, taken from that holder. A `flock` cannot be broken: the holder keeps its
+/// lock on the file it opened, so that file is removed from its name and a new one is made and
+/// locked there, which every later taker opens. The holder it was taken from, if it was taken.
+pub(crate) fn take_lock_over(
+    path: &std::path::Path,
+) -> Result<(Lock, Option<locks::Holder>), Outcome> {
+    match take_lock(path) {
+        Ok(lock) => Ok((lock, None)),
+        Err(Outcome::Failed(failure)) if failure.code == FailureCode::Busy => {
+            let holder = locks::holder(path);
+            // A file that cannot be removed is still the holder's: the take below is then
+            // refused as busy, which names it.
+            let _ = std::fs::remove_file(path);
+            take_lock(path).map(|lock| (lock, Some(holder)))
+        }
+        Err(other) => Err(other),
+    }
 }
 
 /// What a command printed to explain itself: its stderr, else its stdout.

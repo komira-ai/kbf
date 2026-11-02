@@ -315,6 +315,23 @@ pub(crate) fn switch(
     Err(format!("{why}:{tail}"))
 }
 
+/// Move the links to the laid-out release `commit` for good and restart the daemon on it:
+/// `activate`'s swap. A flip that stops halfway puts the links back as `before` had them; a
+/// daemon that does not come up is not answered by going back (the release left is the one the
+/// operator is leaving), and the error is the reason.
+pub(crate) fn select(
+    host: &MacHost,
+    runner: &dyn Runner,
+    commit: &str,
+    before: &Links,
+) -> Result<(), String> {
+    if flip(host, before, commit).is_err() {
+        let _ = restore(host, before);
+        return Err("links_failed".to_owned());
+    }
+    restart(host, runner, commit).map_err(str::to_owned)
+}
+
 /// Put both links back as `before` had them and start the release `before.current` names.
 ///
 /// # Errors

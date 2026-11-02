@@ -34,6 +34,9 @@ use crate::mac::release::commit_prefix;
 use crate::request::{Channel, Version};
 use crate::trust::Trust;
 
+#[path = "core_activate.rs"]
+pub mod activate;
+
 /// How many versions the state file remembers, at the least: it never forgets a release the
 /// host keeps (see [`Ab::versions_kept`]).
 const KEEP_VERSIONS: usize = 16;
@@ -157,6 +160,8 @@ pub struct Ab<B: Backend> {
     keep: usize,
     /// Where what this program did besides answering is told (a prune after a confirm).
     note: Box<dyn Fn(&str)>,
+    /// The root-owned file an `activate --pin` writes for the agent ([`activate`]).
+    hold_file: Option<PathBuf>,
 }
 
 impl<B: Backend> Ab<B> {
@@ -175,7 +180,15 @@ impl<B: Backend> Ab<B> {
             clock,
             keep: kbf_retain::DEFAULT_KEEP,
             note: Box::new(|_| {}),
+            hold_file: None,
         }
+    }
+
+    /// Write the hold of an `activate --pin` to `hold_file`.
+    #[must_use]
+    pub fn holding(mut self, hold_file: PathBuf) -> Self {
+        self.hold_file = Some(hold_file);
+        self
     }
 
     /// Keep `keep` releases besides the ones that must stay (never fewer than
@@ -204,6 +217,9 @@ impl<B: Backend> Ab<B> {
                 self.locked(|| self.confirm(version, last_good.as_ref()))
             }
             LocalRequest::Revert => self.locked(|| self.go_back(Why::Reverted)),
+            LocalRequest::Activate { target } => {
+                return self.activate(target, activate::How::default());
+            }
         };
         done.unwrap_or_else(Fault::answer)
     }

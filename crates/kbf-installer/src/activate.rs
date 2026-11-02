@@ -245,6 +245,46 @@ pub fn first<E: Exec>(
     Ok(())
 }
 
+/// What [`select`] did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Selected {
+    /// The release that was current before, now `previous` (when it is not `commit`).
+    pub from: Option<CommitId>,
+}
+
+/// Make the installed release `commit` current for good, with no trial: the operator's
+/// emergency swap to a release the host keeps. The state gets `current` = `commit`,
+/// `previous` = the release that was current (unless that is `commit`, when `previous` stays),
+/// no `pending_confirm` (a swap on trial ends here, kept or left), and a `staged` that names
+/// `commit` is cleared; the state is written first and the links follow, as for every verb.
+/// Nothing is fetched and nothing is run: the caller restarts the service.
+pub fn select<E: Exec>(
+    exec: &mut E,
+    host: &Layout,
+    commit: &CommitId,
+    out: &mut dyn Write,
+) -> Result<Selected, ReleaseError> {
+    let (lock, state) = open(host)?;
+    if !has_binary(exec, host, commit) {
+        return Err(ReleaseError::NotInstalled(commit.clone()));
+    }
+    let from = state.current.clone();
+    let previous = match &from {
+        Some(ran) if ran != commit => Some(ran.clone()),
+        _ => state.previous.clone(),
+    };
+    let next = State {
+        current: Some(commit.clone()),
+        previous,
+        pending_confirm: None,
+        staged: state.staged.clone().filter(|c| c != commit),
+        ..state
+    };
+    lock.write(&next)?;
+    converge(exec, host, &next, out)?;
+    Ok(Selected { from })
+}
+
 /// Keep the swap that `order_id` made. `commit` is the release the order named, so that
 /// a confirm after the swap was reverted is not taken for a repeat.
 pub fn confirm(

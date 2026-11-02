@@ -9,6 +9,9 @@
 //! daemon. The marker names the release that ran and the links as they were, so a revert,
 //! by the deadline or by request, puts both links back and starts the old release without
 //! the new one running. The marker is on disk: the first tick after a reboot reads it.
+//!
+//! `activate` clears the marker, moves the links to a release the kit keeps and restarts the
+//! daemon's job on it, with no marker and no going back.
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -231,6 +234,39 @@ impl Backend for MacBackend {
         apply::switch_back(&self.host, &*self.runner, &before)
             .map_err(|tail| Fault::failed(Code::RevertFailed, tail))?;
         self.clear_marker()
+    }
+
+    /// Refused while the ssh path's apply job runs (it holds no install lock). The marker of
+    /// a release on trial is cleared first, so no deadline puts back what this chose; then the
+    /// links move ([`apply::select`]) and the daemon's job restarts on the release.
+    fn activate(&self, commit: &str) -> Result<(), Fault> {
+        if mac::status::effective(&self.host, &*self.runner)
+            == Some(mac::status::ApplyState::Running)
+        {
+            return Err(Fault::refused(
+                Code::Busy,
+                format!(
+                    "the ssh path's apply job ({}) is running",
+                    mac::layout::APPLY_LABEL
+                ),
+            ));
+        }
+        let before =
+            kit::links(&self.host).map_err(|why| Fault::failed(Code::StateUnavailable, why))?;
+        self.clear_marker()?;
+        apply::select(&self.host, &*self.runner, commit, &before).map_err(|why| {
+            if why == "links_failed" {
+                Fault::failed(Code::SwitchFailed, why)
+            } else {
+                Fault::failed(
+                    Code::RestartFailed,
+                    format!(
+                        "the kit runs {} now, but: {why}",
+                        commit.get(..12).unwrap_or(commit)
+                    ),
+                )
+            }
+        })
     }
 
     fn kept(&self) -> Result<Vec<Kept>, Fault> {
