@@ -145,3 +145,87 @@ fn a_select_whose_links_cannot_follow_leaves_the_state_as_it_was() {
     assert_eq!((state.current, state.previous), (Some(c(C)), Some(c(A))));
     assert_eq!(link(&exec, "previous"), at(A));
 }
+
+/// A host whose state directory turns read-only at the first link step: the select's state is
+/// written, its links fail, and the state cannot be put back.
+struct Sealing<'a> {
+    host: &'a mut ScratchHost,
+    dir: std::path::PathBuf,
+}
+
+impl Exec for Sealing<'_> {
+    fn euid(&self) -> u32 {
+        self.host.euid()
+    }
+    fn inspect(&self, path: &HostPath) -> io::Result<Option<Entry>> {
+        self.host.inspect(path)
+    }
+    fn stat(&self, path: &HostPath) -> io::Result<Option<Meta>> {
+        self.host.stat(path)
+    }
+    fn query(&self, cmd: &Cmd) -> io::Result<Output> {
+        self.host.query(cmd)
+    }
+    fn http_status(&self, url: &HttpUrl) -> io::Result<u16> {
+        self.host.http_status(url)
+    }
+    fn apply(&mut self, _step: &Step) -> io::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&self.dir, fs::Permissions::from_mode(0o555))?;
+        Err(io::Error::other("the link step failed"))
+    }
+    fn check_binary(&self) -> Result<(), Untrusted> {
+        self.host.check_binary()
+    }
+}
+
+/// Links that cannot follow and a state that cannot be put back: the failure says both and what
+/// `current` names; the state still names the release that never ran, and the next select (to
+/// another release) takes the release it leaves from the links, so `previous` is the release that
+/// ran.
+///
+/// Catches: a recovery failure swallowed, and the history of the next select taken from a state
+/// that names a release that never ran.
+#[test]
+fn a_select_that_cannot_put_the_state_back_says_so_and_the_next_one_follows_the_links() {
+    use std::os::unix::fs::PermissionsExt;
+    let (mut exec, layout) = host("select-sealed");
+    running(&exec, &layout, A, &[B, C]);
+    let dir = exec.at("/var/lib/kbf-installer");
+    let err = select(
+        &mut Sealing {
+            host: &mut exec,
+            dir: dir.clone(),
+        },
+        &layout,
+        &c(B),
+        &mut Vec::new(),
+    )
+    .expect_err("cannot link");
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).expect("open again");
+    assert!(
+        matches!(&err, ReleaseError::NotPutBack { linked: Some(l), .. } if *l == c(A)),
+        "{err}"
+    );
+    let text = err.to_string();
+    assert!(
+        text.contains("the link step failed; and the state could not be put back ("),
+        "{text}"
+    );
+    assert!(
+        text.ends_with(&format!(
+            "`current` names {A}, run `reconcile` or select again"
+        )),
+        "{text}"
+    );
+    assert_eq!(
+        state_of(&layout).current,
+        Some(c(B)),
+        "the state was not put back"
+    );
+    assert_eq!(link(&exec, "current"), at(A));
+    let selected = select(&mut exec, &layout, &c(C), &mut Vec::new()).expect("to C");
+    assert_eq!(selected.from, Some(c(A)));
+    let state = state_of(&layout);
+    assert_eq!((state.current, state.previous), (Some(c(C)), Some(c(A))));
+}

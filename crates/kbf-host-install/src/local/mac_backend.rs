@@ -279,16 +279,16 @@ impl Backend for MacBackend {
         self.clear_marker()
     }
 
-    /// Refused while the ssh path's apply job runs (it holds no install lock): its status file
-    /// says `running`, or launchd has the job and it has not ended (a job launchd cannot be
-    /// asked about counts as running). The links move ([`apply::select`]), then the marker of a
+    /// Refused while the ssh path's apply job may run (it holds no install lock): its status
+    /// file says `running`, or launchd does not say it has no such job or that it ended
+    /// ([`mac::status::apply_may_run`]: another failure of the query counts as running). The links move ([`apply::select`]), then the marker of a
     /// release on trial is cleared, so no deadline puts back what this chose (a marker that
     /// cannot be cleared puts the links back), then the daemon's job restarts on the release.
     /// Links that cannot be put back are `revert_failed`, with what they name.
     fn activate(&self, commit: &str) -> Result<(), Fault> {
         let status = mac::status::effective(&self.host, &*self.runner);
         if status == Some(mac::status::ApplyState::Running)
-            || mac::status::job_running(&self.host, &*self.runner)
+            || mac::status::apply_may_run(&self.host, &*self.runner)
         {
             return Err(Fault::refused(
                 Code::Busy,

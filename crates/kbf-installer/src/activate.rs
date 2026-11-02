@@ -272,7 +272,9 @@ pub fn select<E: Exec>(
     if !has_binary(exec, host, commit) {
         return Err(ReleaseError::NotInstalled(commit.clone()));
     }
-    let from = state.current.clone();
+    // The release left is the one `current` names: the state can name another when a verb
+    // was cut short (or a select could not put it back), and the links are what runs.
+    let from = linked(exec, host).or_else(|| state.current.clone());
     let previous = match &from {
         Some(ran) if ran != commit => Some(ran.clone()),
         _ => state.previous.clone(),
@@ -286,14 +288,31 @@ pub fn select<E: Exec>(
     };
     lock.write(&next)?;
     if let Err(e) = converge(exec, host, &next, out) {
-        // The links did not follow: the state goes back to the release they still name, so the
-        // next select leaves the release that runs, and the links are put back as they were.
-        // What cannot be put back is for `reconcile`, which makes the links follow the state.
-        let _ = lock.write(&state);
+        // The links did not follow: the state goes back as it was, and the links too, as far as
+        // they can be. A state that could not be put back is told; the next select takes the
+        // release it leaves from the links, not from a state that names a release that never ran.
+        let restored = lock.write(&state);
         let _ = converge(exec, host, &state, out);
-        return Err(e);
+        return Err(match restored {
+            Ok(()) => e,
+            Err(restore) => ReleaseError::NotPutBack {
+                cause: e.to_string(),
+                restore: restore.to_string(),
+                linked: linked(exec, host),
+            },
+        });
     }
     Ok(Selected { from })
+}
+
+/// The release the `current` link names, when it names one.
+fn linked<E: Exec>(exec: &E, host: &Layout) -> Option<CommitId> {
+    match exec.inspect(&host.current()) {
+        Ok(Some(kbf_host::exec::Entry::Link { target })) => {
+            target.to_str().and_then(|t| CommitId::new(t).ok())
+        }
+        _ => None,
+    }
 }
 
 /// Keep the swap that `order_id` made. `commit` is the release the order named, so that

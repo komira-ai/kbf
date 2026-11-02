@@ -65,17 +65,27 @@ fn a_kept_release_that_cannot_run_is_refused_before_anything_moves() {
 
 /// The ssh path's apply job holds no install lock, so launchd is asked about it whatever the
 /// status file says: a job that runs with no status, with a status that is not one, or with a
-/// stale `done`, and a launchd that cannot be asked, all refuse the activate (busy), and nothing
-/// changes.
+/// stale `done`; a `launchctl` that cannot be run; a query that fails with another status than
+/// "no such service", or is killed by a signal: all refuse the activate (busy), and nothing
+/// changes. The fixture's "no such service" status is the one the check trusts.
 ///
 /// Catches: an activate beside a running apply because its status was missing or stale.
 #[test]
 fn a_running_apply_job_is_found_by_launchd_whatever_its_status_says() {
-    for case in ["no-status", "not-a-status", "stale-done", "no-launchd"] {
+    for case in [
+        "no-status",
+        "not-a-status",
+        "stale-done",
+        "no-launchd",
+        "print-apply-fails",
+        "print-apply-killed",
+    ] {
         let (fx, sim, _) = rig(&format!("mbam-{case}"));
         keep(&fx, NEW, NEW_VERSION, 2);
         match case {
             "no-launchd" => sim.break_("launchctl"),
+            "print-apply-fails" => sim.break_("print-apply-fails"),
+            "print-apply-killed" => sim.break_("print-apply-killed"),
             _ => {
                 sim.loaded.borrow_mut().insert(APPLY_LABEL.to_owned());
                 sim.apply_running.set(true);
@@ -93,6 +103,10 @@ fn a_running_apply_job_is_found_by_launchd_whatever_its_status_says() {
         );
         unchanged(&fx, &sim);
     }
+    assert_eq!(
+        include_str!("../../tests/fixtures/mac/print_missing.code").trim(),
+        status::PRINT_NO_SERVICE.to_string()
+    );
 }
 
 /// When what follows the move of the links fails and the links cannot be put back either, the
@@ -366,4 +380,20 @@ fn an_interrupted_mac_activate_is_put_back_or_finished_by_asking_again() {
     assert_eq!(sim.daemon_bootstraps.get(), 1, "restarted on NEW");
     assert_eq!(previous(&fx).as_deref(), Some(OLD));
     mkdir(&fx.dir.join("unused"), 0o755);
+}
+
+/// An apply job launchd still has but lists as ended (it exited) runs no more: the activate goes
+/// ahead.
+///
+/// Catches: a check so closed that a finished job blocks every activate until it is unloaded.
+#[test]
+fn an_apply_job_listed_as_ended_does_not_hold_the_activate() {
+    let (fx, sim, _) = rig("mbam-ended");
+    keep(&fx, NEW, NEW_VERSION, 2);
+    sim.loaded.borrow_mut().insert(APPLY_LABEL.to_owned());
+    status::write(&fx.host, &ApplyState::Done).unwrap();
+    assert!(matches!(
+        core(&fx, &sim).activate(&target(NEW), How::default()),
+        Answer::Activated { .. }
+    ));
 }

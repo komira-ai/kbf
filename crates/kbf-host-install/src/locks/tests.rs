@@ -243,8 +243,11 @@ fn a_taker_writes_its_id_and_a_take_over_names_the_holder() {
     drop(lock);
     wait_lockable(&file);
 
-    let (lock, taken) = take_lock_over(&file).unwrap();
+    let (over, taken) = take_lock_over(&file).unwrap();
     assert_eq!(taken, None, "no one held it");
+    drop(over);
+    wait_lockable(&file);
+    let lock = take_lock(&file).unwrap();
     let first = fs::metadata(&file).unwrap().ino();
     let (_second, taken) = take_lock_over(&file).unwrap();
     let taken = taken.unwrap();
@@ -277,13 +280,14 @@ fn a_taker_holding_the_replaced_lock_file_is_busy() {
         "the lock was taken from the displaced holder"
     );
     drop(displaced);
+    assert!(flock_held(&path), "the taker over holds the lock");
+    drop(over);
+    wait_lockable(&path);
+    // The displaced holder and the taker over are gone: the old file locks, and is no lock.
     assert!(
         lock_opened(&path, late).is_err(),
         "the replaced file is no lock"
     );
-    assert!(flock_held(&path), "the taker over still holds the lock");
-    drop(over);
-    wait_lockable(&path);
 
     let gone = open_lock(&path).unwrap();
     fs::remove_file(&path).unwrap();
@@ -298,7 +302,7 @@ fn a_taker_holding_the_replaced_lock_file_is_busy() {
 /// Catches: a second forced taker that removes the first one's new lock file, so both run.
 #[test]
 fn two_forced_takers_never_both_hold_the_lock() {
-    use crate::host::{open_lock, take_lock, take_lock_over, take_over_opened};
+    use crate::host::{open_lock, take_lock, take_lock_over, take_over_from};
     use std::os::unix::fs::MetadataExt;
     let dir = TestDir::under(std::env::temp_dir(), "locks-two");
     let path = dir.join("lock");
@@ -306,10 +310,11 @@ fn two_forced_takers_never_both_hold_the_lock() {
     stuck.try_lock().unwrap();
     // B opens the file the stuck holder holds, then A takes the lock over first.
     let b_first = open_lock(&path).unwrap();
+    let b_decided = super::holder(&path);
     let (a, a_took) = take_lock_over(&path).unwrap();
     assert!(a_took.is_some());
     let a_file = fs::metadata(&path).unwrap().ino();
-    let b = take_over_opened(&path, b_first);
+    let b = take_over_from(&path, b_first, b_decided);
     assert!(b.is_err(), "B is busy: A holds the lock");
     assert_eq!(
         fs::metadata(&path).unwrap().ino(),
@@ -332,4 +337,98 @@ fn two_forced_takers_never_both_hold_the_lock() {
         "the holder's file is untouched"
     );
     drop((held, replacing, stuck));
+}
+
+/// The holder a forced taker read let go, and a normal taker took the same file before the
+/// forced taker held the guard: the forced taker finds another holder than the one it meant to
+/// take from, and is busy; the normal taker keeps its lock and its file.
+///
+/// Catches: a forced taker that removes the lock file a normal taker has just taken, so both run.
+#[test]
+fn a_forced_taker_does_not_take_from_a_holder_that_came_since() {
+    use crate::host::{open_lock, take_lock, take_over_from};
+    use std::io::Write as _;
+    use std::os::unix::fs::MetadataExt;
+    let dir = TestDir::under(std::env::temp_dir(), "locks-came");
+    let path = dir.join("lock");
+    let mut stuck = open_lock(&path).unwrap();
+    stuck.try_lock().unwrap();
+    stuck.write_all(b"2147483647\n").unwrap();
+    // The forced taker opens the file and reads the holder it means to take the lock from.
+    let first = open_lock(&path).unwrap();
+    let decided = super::holder(&path);
+    assert_eq!(decided.pid, Some(2_147_483_647));
+    // That holder lets go, and a normal taker takes the same file.
+    drop(stuck);
+    wait_lockable(&path);
+    let normal = take_lock(&path).unwrap();
+    let file = fs::metadata(&path).unwrap().ino();
+    assert!(take_over_from(&path, first, decided).is_err(), "busy");
+    assert_eq!(
+        fs::metadata(&path).unwrap().ino(),
+        file,
+        "the normal taker's file stays"
+    );
+    assert!(flock_held(&path));
+    drop(normal);
+}
+
+/// A forced taker keeps the guard for as long as it holds the lock it took: a second forced
+/// request, and a normal one, are busy until it lets go; then the lock is taken as usual.
+///
+/// Catches: a second forced request that removes the lock file of an activate still running.
+#[test]
+fn a_forced_take_holds_off_every_other_taker_until_it_lets_go() {
+    use crate::host::{open_lock, take_lock, take_lock_over};
+    use std::os::unix::fs::MetadataExt;
+    let dir = TestDir::under(std::env::temp_dir(), "locks-held-off");
+    let path = dir.join("lock");
+    let stuck = open_lock(&path).unwrap();
+    stuck.try_lock().unwrap();
+    let (first, taken) = take_lock_over(&path).unwrap();
+    assert!(taken.is_some());
+    let file = fs::metadata(&path).unwrap().ino();
+    assert!(
+        take_lock_over(&path).is_err(),
+        "a second forced request is busy"
+    );
+    assert!(take_lock(&path).is_err(), "a normal request is busy");
+    assert_eq!(
+        fs::metadata(&path).unwrap().ino(),
+        file,
+        "the first one's file stays"
+    );
+    drop(first);
+    wait_lockable(&path);
+    let (lock, taken) = take_lock_over(&path).unwrap();
+    assert_eq!(taken, None, "free: taken as usual");
+    drop((lock, stuck));
+}
+
+/// A forced taker whose file was replaced (and let go) by another forced taker since it opened
+/// it takes the new file as a normal taker would, from no one, when it is free.
+///
+/// Catches: a forced taker that removes the new file because the old one is still held.
+#[test]
+fn a_forced_taker_whose_file_was_replaced_takes_the_new_one_when_free() {
+    use crate::host::{open_lock, take_lock_over, take_over_from};
+    use std::os::unix::fs::MetadataExt;
+    let dir = TestDir::under(std::env::temp_dir(), "locks-replaced");
+    let path = dir.join("lock");
+    let stuck = open_lock(&path).unwrap();
+    stuck.try_lock().unwrap();
+    let b_first = open_lock(&path).unwrap();
+    let b_decided = super::holder(&path);
+    let (a, _) = take_lock_over(&path).unwrap();
+    let replaced = fs::metadata(&path).unwrap().ino();
+    drop(a);
+    wait_lockable(&path);
+    let (b, taken) = take_over_from(&path, b_first, b_decided).unwrap();
+    assert_eq!(taken, None, "taken from no one");
+    assert_eq!(
+        fs::metadata(&path).unwrap().ino(),
+        replaced,
+        "the new file stays"
+    );
+    drop((b, stuck));
 }

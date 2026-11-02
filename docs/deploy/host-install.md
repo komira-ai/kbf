@@ -781,14 +781,17 @@ kbf-host-install activate kbf=<commit|version> [--pin] [--force-lock] [--restart
   stderr: `pid N, which is alive` (let it end or stop it), `pid N, which is gone` (a process it
   started keeps the lock), or `a process that wrote no id` (a helper from before this one). On a
   Mac an apply job of the ssh path that is running is refused the same way (`busy`), since it runs
-  without the lock: launchd is asked about the job whatever its status file says, and a launchd
-  that cannot be asked counts as running. The locks taken inside it (the installer's state lock,
+  without the lock: launchd is asked about the job whatever its status file says, and anything but
+  "no such service" or a listing that says it ended (another status, a signal, a `launchctl` that
+  cannot run) counts as running. The locks taken inside it (the installer's state lock,
   `retain.json`'s) are taken without waiting too: a holder is refused (`busy`), not waited for.
 - **`--force-lock`** takes the lock from a holder that is gone or stuck: the lock file is made
   anew under its name and locked (a `flock` cannot be taken from its holder; the holder keeps the
   old file, and every later taker opens the new one; a taker that had the old one open finds it is
-  no longer the lock and is busy). One forced taker at a time replaces it, and only the file it
-  found held (`<lock>.take` is locked meanwhile). A stuck holder is not stopped: stop it first if
+  no longer the lock and is busy). Every taker takes the lock under `<lock>.take`; a forced taker
+  keeps that guard until the activate ends, so a second forced request, or any other, is busy
+  meanwhile, and it replaces only the file and the holder it found (a holder that came since is
+  not taken from). A stuck holder is not stopped: stop it first if
   it may still move the links. Each take is appended at once (before the release is even
   looked up) to `lock-takes.jsonl`
   beside the helper's `state.json` (`/var/lib/kbf-host-install` on Linux, the work directory on a

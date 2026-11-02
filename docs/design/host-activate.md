@@ -28,7 +28,9 @@ no `pending_confirm`) and the links follow; on a Mac the links move first and th
 `pending.json` is removed after (one that cannot be removed puts the links back, and links that
 cannot be put back are `revert_failed`, saying what they name). If the links cannot follow the
 state on Linux, the state is put back as it was, so the next activate leaves the release that
-still runs.
+still runs. If the state cannot be put back either, the failure says so and names what `current`
+links to; the next select takes the release it leaves from the `current` link, not from the state,
+so `previous` is never a release that did not run.
 
 A unit that does not come up on the release named is `restart_failed`. The host stays on that
 release: going back would start the release being left. Every configured unit is restarted, each
@@ -42,12 +44,16 @@ does. The lock is a `flock`, which nothing can take from a live holder. So:
 - Every taker writes its process id into the lock file after it locks it; a refusal names the
   holder (`pid N, which is alive`, `which is gone`, or a helper from before this one that wrote
   none).
+- Every taker takes the lock while it holds a guard, `<lock>.take` (taken without waiting), and
+  checks, once it holds the lock, that its file is still the one at the name. A taker that opened
+  the old file before a replacement, and locks it once its holder lets go, is busy.
 - `--force-lock` replaces the lock file: the holder keeps the old file, the name gets a new one
-  that the forced taker locks. One forced taker at a time does this (a lock on `<lock>.take`,
-  without waiting), and only for the very file it found held: a file another taker made meanwhile
-  is that taker's, and the second forced taker is busy.
-- Every taker checks, once it holds its lock, that its file is still the one at the name. A taker
-  that opened the old file before a replacement, and locks it once its holder lets go, is busy.
+  that the forced taker locks. The forced taker takes the guard first and keeps it for as long as
+  it holds the lock, so no other take completes meanwhile: a second forced request, and a normal
+  one, are busy until the activate ends. Under the guard it replaces the file only if it is still
+  the file it found held and the holder is still the one it read before it decided; a holder that
+  came since (the first let go and another took the lock) is not taken from, and the forced taker
+  is busy.
 - The take is appended at once, before anything else is read, to `lock-takes.jsonl` beside the
   helper's `state.json` (one JSON line per take; a line cut short by a crash is ended before the
   next). It is a file of its own because helpers before this one read `state.json` strictly.
@@ -55,7 +61,9 @@ does. The lock is a `flock`, which nothing can take from a live holder. So:
 The locks taken inside the install lock (the installer's state, `retain.json`) are taken without
 waiting too: an emergency command is refused, never left hanging, behind a writer that does not
 let go. On a Mac the ssh path's apply job runs without the install lock; launchd is asked about
-that job whatever its status file says, and a launchd that cannot be asked counts as running.
+that job whatever its status file says. Only launchd's "no such service" (exit 113) or a listing
+that says the job ended counts as not running: another status, a signal, or a `launchctl` that
+cannot be run counts as running.
 
 ### The pin
 
