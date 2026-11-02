@@ -28,8 +28,8 @@
 //!   changes later. `cordon-unowned-noted`: as `cordon-unowned`, and it also notes the foreign
 //!   cordon in the world. `cordon-recorded-first`: it records the cordon before placing it, but
 //!   a run that finds a cordon and no `prepared` takes it for an operator's anyway and drops its
-//!   record. `cordon-rooted`, with one of these: the cordon holds the world's path, which
-//!   differs from sandbox to sandbox.
+//!   record. `cordon-sandboxed`, with one of these: the cordon holds its sandbox's directory name
+//!   and the world's path, which differ from sandbox to sandbox.
 //! - `first-install-no-rollback`: with no previous release in the params, `rollback` after
 //!   `cutover` fails with `no_previous_release`, says `reversible: false` and changes nothing.
 //!   `no-rollback-after-cutover`: it does so with a previous release too. Variants of the first
@@ -332,13 +332,16 @@ impl Hook {
                         self.take(&self.record, "cordon_mine")?;
                     }
                 } else {
-                    let world = self.world.to_string_lossy().into_owned();
-                    let cordon = if self.behaves("cordon-rooted") {
-                        world.as_str()
+                    let cordon = if self.behaves("cordon-sandboxed") {
+                        // The sandbox's own name, and the world's path: bytes no two sandboxes
+                        // share.
+                        let sandbox = self.world.parent().and_then(Path::file_name);
+                        let name = sandbox.map(|n| n.to_string_lossy()).unwrap_or_default();
+                        format!("lease of {name} at {}", self.world.display())
                     } else {
-                        "1"
+                        "1".to_owned()
                     };
-                    self.world_set("cordon", cordon)?;
+                    self.world_set("cordon", &cordon)?;
                 }
                 if foreign && self.behaves("cordon-unowned-noted") {
                     self.world_set("foreign-cordon", "1")?;

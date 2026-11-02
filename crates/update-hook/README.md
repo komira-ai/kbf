@@ -116,13 +116,13 @@ off unless declared, so a hook that declares none (the kbf hook) is checked stri
   ignores `reversible` on a `rollback` that succeeded). The rerun must still end as the first did
   and change nothing; a flag that falls, or a flip on another step, is still refused.
 - `lapsing_cordon`: a `LapsingCordon`, the state paths of a cordon and the paths whose presence
-  means the hook has recorded it as its own. After a crash right after placing (or renewing) the
-  cordon and before recording it, a run again cannot tell it from an operator's and may leave it to
-  lapse by its lease. Only the kill point right after the change that placed or renewed the cordon is
-  excused, only while no ownership path is there (an empty ownership list excuses nothing), and only
-  for the cordon paths, added or changed; a cordon left by a crash at any other point is still
-  refused. The window is judged on states from different sandboxes, each with its sandbox's root
-  written as `<sandbox>`.
+  means the hook has recorded it as its own. After a crash right after placing the cordon and before
+  recording it, a run again cannot tell it from an operator's and may leave it to lapse by its lease.
+  Only the kill point right after the change that made a cordon path appear is excused, only while no
+  ownership path is there (an empty ownership list excuses nothing), and only for the cordon paths,
+  added or changed; a cordon left by a crash at any other point, a renewal included, is still
+  refused. The kill point before a kill ran in another sandbox, so the window reads only which paths
+  exist, never their bytes, which may name the sandbox.
 - `first_install_rollback_may_fail`: on a first install, a `rollback` after `cutover` may fail
   (exit `1`; not a deferral or a halt) with the reason `no_previous_release` rather than stop what
   it started, changing nothing, and the same way, with the same reason and the same `reversible`,

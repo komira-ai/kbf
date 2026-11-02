@@ -212,12 +212,13 @@ fn a_cordon_left_by_a_crash_outside_the_window_is_refused_even_when_declared() {
 }
 
 /// Catches a window judged on bytes that differ from sandbox to sandbox: with a cordon that
-/// holds the world's path (a new path in each sandbox), the late-recording hook is still refused
-/// at the fourth point, and a hook that records its cordon right after placing it still passes.
+/// holds its sandbox's directory name (`run-7`, `run-8`) and the world's path, the
+/// late-recording hook is still refused at the first kill outside the window (the fourth), and
+/// a hook that records its cordon right after placing it still passes.
 #[test]
 fn a_cordon_that_names_its_sandbox_opens_no_window_of_its_own() {
-    let hook = behaving(false, &["cordon-recorded-late", "cordon-rooted"]);
-    match check_all("c2-late-rooted", &hook, lapsing("cordon")) {
+    let hook = behaving(false, &["cordon-recorded-late", "cordon-sandboxed"]);
+    match check_all("c2-late-sandboxed", &hook, lapsing("cordon")) {
         Err(Violation::CrashResumeDiverges {
             step: Step::Prepare,
             kill_at: 4,
@@ -225,8 +226,8 @@ fn a_cordon_that_names_its_sandbox_opens_no_window_of_its_own() {
         }) => assert_eq!(changes, ["added cordon"]),
         other => panic!("{other:?}"),
     }
-    let hook = behaving(false, &["cordon-unowned", "cordon-rooted"]);
-    check_all("c2-rooted", &hook, lapsing("cordon")).expect("declared: accepted");
+    let hook = behaving(false, &["cordon-unowned", "cordon-sandboxed"]);
+    check_all("c2-sandboxed", &hook, lapsing("cordon")).expect("declared: accepted");
 }
 
 /// Catches a window that opens although the hook had recorded the cordon as its own: a hook

@@ -2,17 +2,14 @@
 //! safety, each refused unless the hook's test opts in ([`super::Conformance::with_allowances`]).
 //! docs/design/host-updates.md (section 9, "Allowances") says why each is safe.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use super::sandbox::{Entry, Tree};
+use super::sandbox::Tree;
 use crate::Report;
 
 /// The `reason` of a first-install `rollback` that refuses to stop what `cutover` started
 /// because there is no previous release to go back to.
 pub const NO_PREVIOUS_RELEASE: &str = "no_previous_release";
-
-/// What stands for the sandbox's root in a state compared across sandboxes.
-const ROOT_MARK: &[u8] = b"<sandbox>";
 
 /// The behaviours a hook declares; the default declares none, and the harness then checks
 /// strictly.
@@ -44,13 +41,18 @@ pub struct Allowances {
 /// A cordon the hook places and records as its own, in the state the harness compares: a world
 /// path as it is, a record path under `record/`.
 ///
-/// After a crash right after the change that placed (or renewed) the cordon, and before the
-/// hook recorded it, a run again cannot tell that cordon from one an operator placed, and
-/// leaves it. A divergence of [`paths`](Self::paths), added or changed, is accepted only for a
-/// crash at the kill point right after that change and only while no path of
+/// After a crash right after the change that placed the cordon, and before the hook recorded
+/// it, a run again cannot tell that cordon from one an operator placed, and leaves it. A
+/// divergence of [`paths`](Self::paths), added or changed, is accepted only for a crash at the
+/// kill point right after the change that made a cordon path appear, and only while no path of
 /// [`ownership`](Self::ownership) is there; a cordon removed, a divergence of any other path,
-/// a cordon left by a crash at any other point, and a cordon left although its ownership was
-/// recorded, are still refused.
+/// a cordon left by a crash at any other point (a renewal of a cordon already there included),
+/// and a cordon left although its ownership was recorded, are still refused.
+///
+/// The kill point before a kill ran in another sandbox, so the window is judged on which paths
+/// exist, never on what they hold: a cordon's bytes may name its sandbox (its path, its
+/// directory's name, a process id), and are compared only within one sandbox, against the run
+/// the harness is checking.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LapsingCordon {
     /// The paths that hold the cordon.
@@ -67,23 +69,23 @@ impl Allowances {
     }
 
     /// Whether a crash that left the state `at_kill`, where the kill point before it (or the
-    /// step's start) had left `before`, is the crash window of the lapsing cordon: the change
-    /// between the two placed or changed a path of the cordon, that path is there, and the hook
-    /// has recorded no ownership. Both states are [`portable`].
+    /// step's start) had left `before`, is the crash window of the lapsing cordon: a path of the
+    /// cordon is there and was not before, and the hook has recorded no ownership. Only which
+    /// paths exist is read, since `before` may come from another sandbox.
     pub(crate) fn in_cordon_window(&self, before: &Tree, at_kill: &Tree) -> bool {
         let Some(cordon) = &self.lapsing_cordon else {
             return false;
         };
-        let changed = cordon
+        let placed = cordon
             .paths
             .iter()
-            .any(|path| at_kill.contains_key(path) && before.get(path) != at_kill.get(path));
+            .any(|path| at_kill.contains_key(path) && !before.contains_key(path));
         let unrecorded = !cordon.ownership.is_empty()
             && !cordon
                 .ownership
                 .iter()
                 .any(|path| at_kill.contains_key(path));
-        changed && unrecorded
+        placed && unrecorded
     }
 
     /// `want` and `got` without the cordon paths that `got` holds: what is left to compare
@@ -114,46 +116,11 @@ impl Allowances {
     }
 }
 
-/// `tree` with every occurrence of `root` (the sandbox's root) in a file or a link written as
-/// `<sandbox>`, so that two states of different sandboxes compare by what the hook did and not
-/// by where it ran.
-pub(crate) fn portable(root: &Path, tree: Tree) -> Tree {
-    let root = root.as_os_str().as_encoded_bytes();
-    tree.into_iter()
-        .map(|(path, entry)| {
-            let entry = match entry {
-                Entry::File(bytes) => Entry::File(unrooted(&bytes, root)),
-                Entry::Link(target) => {
-                    let bytes = unrooted(target.as_os_str().as_encoded_bytes(), root);
-                    Entry::Link(PathBuf::from(String::from_utf8_lossy(&bytes).into_owned()))
-                }
-                Entry::Dir => Entry::Dir,
-            };
-            (path, entry)
-        })
-        .collect()
-}
-
-/// `bytes` with each `root` replaced by [`ROOT_MARK`].
-fn unrooted(bytes: &[u8], root: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut rest = bytes;
-    while !rest.is_empty() {
-        if !root.is_empty() && rest.starts_with(root) {
-            out.extend_from_slice(ROOT_MARK);
-            rest = &rest[root.len()..];
-        } else {
-            out.push(rest[0]);
-            rest = &rest[1..];
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::Outcome;
+    use crate::conformance::Entry;
 
     fn tree(entries: &[(&str, &str)]) -> Tree {
         entries
@@ -184,16 +151,17 @@ mod tests {
         assert!(!Allowances::default().rollback_reversible_rise(false, true));
     }
 
-    /// Catches a window that opens on a cordon that was already there, that went away, whose
-    /// ownership is recorded, or whose ownership the declaration cannot see.
+    /// Catches a window that opens on a cordon that was already there (renewed or not, its
+    /// bytes from another sandbox or not), that went away, whose ownership is recorded, or whose
+    /// ownership the declaration cannot see.
     #[test]
-    fn the_window_is_the_kill_right_after_an_unrecorded_cordon_was_placed_or_changed() {
+    fn the_window_is_the_kill_right_after_an_unrecorded_cordon_appeared() {
         let none = tree(&[]);
         let placed = tree(&[("cordon", "1")]);
         let renewed = tree(&[("cordon", "2")]);
         let owned = tree(&[("cordon", "1"), ("record/cordon_mine", "1")]);
         assert!(cordon().in_cordon_window(&none, &placed));
-        assert!(cordon().in_cordon_window(&placed, &renewed));
+        assert!(!cordon().in_cordon_window(&placed, &renewed));
         assert!(!cordon().in_cordon_window(&placed, &placed));
         assert!(!cordon().in_cordon_window(&placed, &none));
         assert!(!cordon().in_cordon_window(&none, &owned));
@@ -249,42 +217,5 @@ mod tests {
         assert!(!on.rollback_may_fail(true, Outcome::Failure, &said(Some("agent_busy"))));
         assert!(!on.rollback_may_fail(true, Outcome::Failure, &said(None)));
         assert!(!Allowances::default().rollback_may_fail(true, Outcome::Failure, &reason));
-    }
-
-    /// Catches a state compared across sandboxes by where it ran: the root in a file or a link
-    /// is written as `<sandbox>`, and nothing else changes.
-    #[test]
-    fn the_sandbox_root_is_written_as_a_mark() {
-        let root = Path::new("/s/run-3");
-        let tree: Tree = [
-            (
-                PathBuf::from("cordon"),
-                Entry::File(b"/s/run-3/world:/s/run-3".to_vec()),
-            ),
-            (
-                PathBuf::from("link"),
-                Entry::Link(PathBuf::from("/s/run-3/v2")),
-            ),
-            (PathBuf::from("plain"), Entry::File(b"v2".to_vec())),
-            (PathBuf::from("dir"), Entry::Dir),
-        ]
-        .into_iter()
-        .collect();
-        let want: Tree = [
-            (
-                PathBuf::from("cordon"),
-                Entry::File(b"<sandbox>/world:<sandbox>".to_vec()),
-            ),
-            (
-                PathBuf::from("link"),
-                Entry::Link(PathBuf::from("<sandbox>/v2")),
-            ),
-            (PathBuf::from("plain"), Entry::File(b"v2".to_vec())),
-            (PathBuf::from("dir"), Entry::Dir),
-        ]
-        .into_iter()
-        .collect();
-        assert_eq!(portable(root, tree.clone()), want);
-        assert_eq!(unrooted(b"abc", b""), b"abc");
     }
 }
