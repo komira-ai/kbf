@@ -171,9 +171,8 @@ clears the mark.
 version, `min_up` per role, and an optional `max_updating`). Nothing is sent to a host. On
 each heartbeat (every 15 s) the coordinator decides for that host, in a fixed order of
 rules: the quiet start after a restart, a bad mark, the host updating or busy, the host up
-to date, the host failed at this version, a deferral, the canary, a free slot within
-`max_updating` for the role (1 for frontend and storage, 2 for daemon and mac-daemon), the
-bake, the role order (a frontend waits for every other role), and `min_up` (a frontend is
+to date, the host failed at this version, a deferral, the canary, no update live anywhere (no host of any role holds an update slot for any
+service; a `max_updating` of 0 holds the role, a larger number has no effect), the bake, the role order (a frontend waits for every other role), and `min_up` (a frontend is
 never the last one up). The first rule that holds back the order wins. Otherwise the reply
 is `Update { version }`.
 
@@ -440,7 +439,7 @@ It bypasses:
 It keeps:
 
 - the role order;
-- `max_updating`, which the request may raise;
+- `max_updating`, which the request may raise (a raise has no effect while the coordinator allows one live update at a time across every service);
 - `min_version`. A force below the service's `min_version` (the first release that has the
   host-updates hook) is refused with that reason, and names the manual path.
 

@@ -78,8 +78,9 @@ impl Host {
             && !self.beat.promotion_pending
     }
 
-    /// Whether the host holds one of its role's update slots: it is updating, its promotion
-    /// is pending, or its last update failed and it has not yet heartbeated healthy.
+    /// Whether the host holds an update slot (one is live at a time across every service,
+    /// [`crate::decide`]): it is updating, its promotion is pending, or its last update failed
+    /// and it has not yet heartbeated healthy.
     #[must_use]
     pub fn holds_slot(&self) -> bool {
         let failed = self

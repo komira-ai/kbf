@@ -424,13 +424,15 @@ What each value is for, for a farm of six storage hosts:
 - `[service.roles.storage]` and `roles = ["storage"]`: tierstore is ordered to hosts of the storage
   role and to no other. A host of another role that lists tierstore is not counted and is never
   ordered it.
-- `max_updating = 1` and `min_up = 4`: one storage host updates at a time and four others must be
-  up while it does, so one storage host that is down, drained or excluded does not hold the roll; a
+- `max_updating = 1` and `min_up = 4`: one storage host updates at a time (the coordinator allows
+  one live update at a time whatever the number says, see "One live update at a time" below) and
+  four others must be up while it does, so one storage host that is down, drained or excluded does not hold the roll; a
   second one does, until one is back or `min_up` is lowered in the file. tierstore keeps serving through
   its hand-over, and the canary, the bake and the automatic rollback still gate each step. A farm of
   fewer than six storage hosts needs a smaller `min_up`.
-- One service per host updates at a time, but kbf and tierstore may update different hosts at once:
-  kbf restarting on one host while tierstore hands over on another.
+- kbf and tierstore never update two hosts at once: while tierstore hands over on one storage host,
+  no host is ordered kbf, and while kbf restarts on one host, no host is ordered tierstore. The
+  bake below counts too: no other order goes out until the last tierstore host has baked.
 - `canary = { count = 1 }` and `bake_beats = 3`: one host goes alone, and no other starts until it has
   sent three healthy beats at the new version; each host
   after it holds its slot for the same three beats, so the next host starts only once the last one has
@@ -697,6 +699,21 @@ will converge on it.
 
 `--services-file` is read once at start, under the rule of `--operator-token-file`: a regular file (not a symlink) owned by the coordinator's user with mode `0600` or `0400`, at most 1 MiB; a file that fails it stops the start. Treat it as secret-grade: a file whose first entry is named `kbf` replaces the shipped kbf definition, and can set `max_updating` up to 10000, `min_up = 0`, drop `never_last` and every `after`, so whoever controls the file controls kbf's rollout safety. A replaced kbf must be the first entry, wait for no service and have a role, and its desired state still names `min_up` for storage and frontend.
 
+**One live update at a time.** The coordinator orders a new update only when no host, of any role,
+holds an update slot for any service. A host holds a slot from the order the coordinator gave it
+(until the host reports it, or for 120 s), while it is updating, while its promotion is pending,
+while it bakes (`bake_beats` below, at its service's desired version) and, after a failed update,
+until it heartbeats healthy. So two services with updates pending take turns: the second is
+ordered only once the first host is healthy and released. A failed host that is unhealthy holds
+the next order of every service until it is healthy again or the operator fixes it; only that
+host itself may be ordered a new desired version of the service it failed, as before. This holds
+for every service and role, with no setting. `max_updating`, in a services file entry and in a
+desired state, is still read and accepted as before, so files and states written for earlier
+releases load unchanged, but a number above 1 no longer lets more hosts update at once; 0 still
+holds the role (no host of it is ordered). `min_up` is unchanged. The one-update-per-host rule
+(`busy_elsewhere`) also still holds. After a restart the coordinator knows of a live update from
+the hosts' own beats in the quiet start, so the rule resumes as it was.
+
 A service may carry `install_when_absent = true` and a `[service.selector]` with `roles` (default: every role of the service) and `labels` (at most 8, key and value 1 to 32 bytes of `[a-z0-9-]`); a selector naming a role the service lacks is refused. Without a selector a host belongs to the service if it lists it, as always. With one, the coordinator decides who should run the service from the host's certificate role and the labels an operator set for it with `POST /v1/operator` (`set_labels`; a heartbeat can never set them). A selected, live host whose agent announced `heartbeat-v2` and that did not list the service is `missing`; one that reports it `absent` is `absent` and is ordered only with `install_when_absent`; one whose agent did not announce `heartbeat-v2` is `unmanaged` (not counted, not ordered); one an operator excluded is `excluded`. A silent host is `down` first of all. `GET /v1/convergence` shows `hosts: {missing, absent, excluded, unmanaged, deferred}` for a service with a selector, or any such host, and a service with a missing or absent host is `in_progress`; the status lists them with their reason. Exclusions apply to a service without a selector too. `deferred` counts the live hosts within the wait that follows their deferral of the desired version. This holds for `kbf` as for any service whose definition has a selector or an exclusion: a host that is not counted for `kbf` (excluded, or outside a `kbf` selector) has its beat not recorded, so it gets no `kbf` orders, is left out of the `kbf` convergence and appears only in `members`. Excluding a node from `kbf` therefore stops its `kbf` updates.
 
 A service entry may also set two rollout fields, both off by default (a coordinator before the change refuses a file that names them, so set them only after every coordinator runs the new build):
@@ -776,7 +793,7 @@ ordering the host now (`quiet`, `updating`, `busy_elsewhere`, `up_to_date`, `fai
 `deferred`, `no_slot`, `baking`, `canary_wait`, `waiting_for_role`, `waiting_for_service`, `min_up`, `not_a_member`, `no_desired`, `no_definition`; these spellings are public), or
 `null` when it would be ordered at its next heartbeat. `up` and `slots_held` count those hosts,
 and `convergence` is the answer of `GET /v1/convergence?service=NAME`. The top-level keys, and the
-top-level `hosts`, which are `kbf`'s, are unchanged. Two holds are for the rollout fields above: `baking` means every slot of the host's role is held and at least one holder is a host at the desired version that has not finished baking, and `canary_wait` means the service's canary gate is closed and the host is not one of the canaries. `deferred` means the host declined the update to the desired version and its wait (`defer_backoff`, never shorter than the host's own `retry_after`) has not ended.
+top-level `hosts`, which are `kbf`'s, are unchanged. `no_slot` means some host, of any role, holds an update slot for some service (one live update at a time). Two holds are for the rollout fields above: `baking` means no host holds a slot, but some host, of any role and service, is at its service's desired version and has not finished baking, and `canary_wait` means the service's canary gate is closed and the host is not one of the canaries. `deferred` means the host declined the update to the desired version and its wait (`defer_backoff`, never shorter than the host's own `retry_after`) has not ended.
 
 `cargo xtask deploy-farm --service NAME` (default `kbf`) deploys another service the same way.
 For `kbf` the requests are the ones listed above. For another service the POST body also has

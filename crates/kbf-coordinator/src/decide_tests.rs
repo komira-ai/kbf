@@ -54,65 +54,68 @@ fn a_host_that_has_not_heartbeated_is_told_nothing() {
     assert_eq!(ask(&desired("2.0", 1, 1), &f, "d2"), Reply::Nothing);
 }
 
-/// Catches: a role's limit not counting the hosts that are updating, so a third daemon
-/// starts while two are updating; and a slot not freeing when an update ends.
+/// Catches: the hosts that are updating not being counted, so a second daemon starts while
+/// one is updating under the default daemon limit of two; and the slot not freeing when the
+/// update ends.
 #[test]
-fn a_role_at_its_limit_waits_for_a_slot() {
-    let busy = |d2: kbf_updater::wire::Heartbeat| {
+fn a_host_updating_holds_the_one_slot_until_it_is_done() {
+    let with = |d1: kbf_updater::wire::Heartbeat| {
         fleet(
             NOW,
             &[
-                ("d1", HostRole::DAEMON, updating(beat("1.0"), "2.0")),
-                ("d2", HostRole::DAEMON, d2),
-                ("d3", HostRole::DAEMON, beat("1.0")),
+                ("d1", HostRole::DAEMON, d1),
+                ("d2", HostRole::DAEMON, beat("1.0")),
             ],
         )
     };
     let d = desired("2.0", 1, 1);
     assert_eq!(
-        ask(&d, &busy(updating(beat("1.0"), "2.0")), "d3"),
+        ask(&d, &with(updating(beat("1.0"), "2.0")), "d2"),
         Reply::Nothing,
-        "two daemons updating is the default limit"
+        "one update at a time, though the daemon limit is two"
     );
-    assert_eq!(ask(&d, &busy(beat("2.0")), "d3"), update("2.0"));
+    assert_eq!(ask(&d, &with(beat("2.0")), "d2"), update("2.0"));
 }
 
-/// Catches: the limits taken from the wrong role (a storage host updating holding a
-/// daemon's slot), the defaults changed (1, 1, 2, 2), and the limit not following the
-/// desired state.
+/// Catches: the slot counted per role (a storage host updating leaving a daemon free to
+/// start), a limit above one letting a second host go, and a limit of zero no longer holding
+/// its role.
 #[test]
-fn the_limit_is_per_role_and_follows_the_desired_state() {
-    let f = fleet(
+fn a_limit_above_one_orders_one_host_and_zero_holds_the_role() {
+    let busy = fleet(
         NOW,
         &[
             ("s1", HostRole::STORAGE, updating(beat("1.0"), "2.0")),
             ("s2", HostRole::STORAGE, beat("1.0")),
             ("s3", HostRole::STORAGE, beat("1.0")),
             ("d1", HostRole::DAEMON, beat("1.0")),
-            ("m1", HostRole::MAC_DAEMON, updating(beat("1.0"), "2.0")),
-            ("m2", HostRole::MAC_DAEMON, beat("1.0")),
-            ("m3", HostRole::MAC_DAEMON, updating(beat("1.0"), "2.0")),
+            ("m1", HostRole::MAC_DAEMON, beat("1.0")),
         ],
     );
     let mut d = desired("2.0", 1, 1);
     assert_eq!(
-        ask(&d, &f, "d1"),
-        update("2.0"),
-        "storage's slot is not a daemon's"
-    );
-    assert_eq!(
-        ask(&d, &f, "s2"),
+        ask(&d, &busy, "d1"),
         Reply::Nothing,
-        "one storage host at a time"
+        "a storage host updating holds the daemons' slot too"
     );
-    assert_eq!(ask(&d, &f, "m2"), Reply::Nothing, "two Macs at a time");
     d.max_updating.set("storage", 2);
+    d.max_updating.set("daemon", 3);
     d.max_updating.set("mac-daemon", 3);
-    assert_eq!(ask(&d, &f, "s2"), update("2.0"));
-    assert_eq!(ask(&d, &f, "m2"), update("2.0"));
+    for host in ["s2", "d1", "m1"] {
+        assert_eq!(ask(&d, &busy, host), Reply::Nothing, "{host}");
+    }
+    let idle = fleet(
+        NOW,
+        &[
+            ("d1", HostRole::DAEMON, beat("2.0")),
+            ("m1", HostRole::MAC_DAEMON, beat("1.0")),
+            ("m2", HostRole::MAC_DAEMON, beat("1.0")),
+        ],
+    );
+    assert_eq!(ask(&d, &idle, "m2"), update("2.0"));
     d.max_updating.set("mac-daemon", 0);
     assert_eq!(
-        ask(&d, &f, "m2"),
+        ask(&d, &idle, "m2"),
         Reply::Nothing,
         "a limit of zero holds the role"
     );

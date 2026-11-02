@@ -84,6 +84,8 @@ mod kbf_review_tests;
 #[cfg(test)]
 mod membership_tests;
 #[cfg(test)]
+mod one_live_update_tests;
+#[cfg(test)]
 mod ops_commit_tests;
 #[cfg(test)]
 mod ops_crash_tests;
