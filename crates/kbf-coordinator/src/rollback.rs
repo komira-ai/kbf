@@ -14,16 +14,16 @@ use crate::services::{Services, ServicesError};
 
 /// The first coordinator release that reads `pool` in a services file. The release that
 /// carries this check is that release.
-pub const FIRST_POOL_VERSION: &str = "0.0.61";
+pub const FIRST_POOL_VERSION: &str = "0.0.62";
 
 /// [`FIRST_POOL_VERSION`]'s [`Version::release_numbers`] (a test holds the two together).
-const FIRST_POOL: [u64; 3] = [0, 0, 61];
+const FIRST_POOL: [u64; 3] = [0, 0, 62];
 
 /// `text` as a release version: one [`Version`] that starts with at least two numbers joined
 /// by single dots, each of one or more digits, and has nothing after them or a suffix that
 /// starts with `+`, `-` or `~` (`0.0.57`, `0.0.57+g0123456789ab-8`). A bare commit id, a
-/// word, an empty number (`0..60`, `.0.60`, `0.0.60.`) or digits run into letters
-/// (`0.0.61abc`) is none: [`Version::release_numbers`] would order each of them as some
+/// word, an empty number (`0..62`, `.0.62`, `0.0.62.`) or digits run into letters
+/// (`0.0.62abc`) is none: [`Version::release_numbers`] would order each of them as some
 /// release, and a wrong order here would let a release that refuses `pool` through.
 fn release(text: &str) -> Option<Version> {
     let version = Version::parse(text).ok()?;

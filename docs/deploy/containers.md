@@ -168,7 +168,7 @@ are configuration (the unit below, the certificate, and each agent's `--coordina
 `<commit>` in the unit, `systemctl daemon-reload`, `systemctl restart kbf-coordinator`. The
 desired state is in the state directory and survives; a restarted coordinator waits 30 s before
 it says a farm has converged ([kbf-updater.md](kbf-updater.md#turn-on-the-gamma-stage)). To go
-back, name the old tag again; going back to a release before 0.0.61, also drop every
+back, name the old tag again; going back to a release before 0.0.62, also drop every
 `--rollback-target` flag from the command and any `pool` from the services file, which that
 release does not know ([kbf-updater.md](kbf-updater.md#updating-the-coordinator)).
 

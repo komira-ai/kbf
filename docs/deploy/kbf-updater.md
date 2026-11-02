@@ -545,7 +545,7 @@ agent heartbeats and refuses every update order before it fetches anything, for 
 The coordinator is not one of the hosts it orders: it does not update itself. It is updated the
 way it was deployed ([containers.md](containers.md#run-the-coordinator-on-one-host): a new image,
 the tag changed in the unit, a restart; to go back, name the old tag). Going back to a release
-before 0.0.61 (the first with `--rollback-target`), also drop every `--rollback-target` flag from
+before 0.0.62 (the first with `--rollback-target`), also drop every `--rollback-target` flag from
 the unit, since that release does not know the flag and stops at start with a usage error, and
 take any `pool` out of the services file, which it refuses. Hosts that were updating
 finish or revert on their own while it is down, and the restarted coordinator orders nothing for
@@ -746,9 +746,9 @@ not add a pool to the file before that.
 The coordinator checks the second step for the releases it is told about. Pass
 `--rollback-target=<version>` once for each coordinator release whose image is kept to go back to
 (`--rollback-target=0.0.57`). A services file that names a pool then stops the start while any of
-them is a release before 0.0.61 (the first that reads pools) or is not a release version (a bare
+them is a release before 0.0.62 (the first that reads pools) or is not a release version (a bare
 commit id, a tag word): `--services-file: services: tierstore: pool "storage" on storage: the
-rollback target 0.0.57 (--rollback-target) is a release before 0.0.61 and refuses the field
+rollback target 0.0.57 (--rollback-target) is a release before 0.0.62 and refuses the field
 `pool`; ...`. Remove the pool, or drop the target once its image is no longer kept. A file with no
 pool, and kbf's built-in storage pool, are never refused. Without the flag nothing is checked: the
 list is what the operator declares, not what the host holds.
