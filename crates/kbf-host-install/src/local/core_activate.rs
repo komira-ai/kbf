@@ -112,17 +112,18 @@ impl<B: Backend> Ab<B> {
 
     /// Undo the pin of an `activate --pin` (see the module docs).
     pub fn unpin(&self) -> Answer {
-        self.unpin_with(&|| {})
+        self.unpin_with(&|| Ok(()))
     }
 
     /// [`Self::unpin`] that runs `after_retain` once `retain.json` is changed and before the
-    /// hold file is removed: a test's way in to the moment between the two.
+    /// hold file is removed: a test's way in to the moment between the two. An error from it
+    /// stops the unpin there, as a crash would.
     #[cfg(test)]
-    pub(crate) fn unpin_interrupted(&self, after_retain: &dyn Fn()) -> Answer {
+    pub(crate) fn unpin_interrupted(&self, after_retain: &dyn Fn() -> io::Result<()>) -> Answer {
         self.unpin_with(after_retain)
     }
 
-    fn unpin_with(&self, after_retain: &dyn Fn()) -> Answer {
+    fn unpin_with(&self, after_retain: &dyn Fn() -> io::Result<()>) -> Answer {
         Activation {
             backend: &self.backend,
             state_file: &self.state_file,
@@ -422,7 +423,7 @@ impl Activation<'_> {
 
 impl Activation<'_> {
     /// Undo the pin, holding the install lock (see the module docs).
-    fn unpin(&self, after_retain: &dyn Fn()) -> Answer {
+    fn unpin(&self, after_retain: &dyn Fn() -> io::Result<()>) -> Answer {
         let Some(hold) = self.hold_file else {
             return Answer::Refused(Code::ConfigInvalid, "this host has no hold file".to_owned());
         };
@@ -440,7 +441,11 @@ impl Activation<'_> {
     /// a commit already gone changes nothing). The commit comes from root's file alone; what is
     /// at the name when it is removed is removed whatever it is, which the directory's owner
     /// could have done itself.
-    fn unpin_held(&self, hold: &Path, after_retain: &dyn Fn()) -> Result<Answer, Fault> {
+    fn unpin_held(
+        &self,
+        hold: &Path,
+        after_retain: &dyn Fn() -> io::Result<()>,
+    ) -> Result<Answer, Fault> {
         let commit = match read_hold(hold, self.trust) {
             Read::Absent => return Ok(Answer::Unpinned { commit: None }),
             Read::Commit(commit) => Some(commit),
@@ -458,10 +463,11 @@ impl Activation<'_> {
                 other => Fault::failed(Code::StateUnavailable, format!("the pin: {other}")),
             })?;
         }
-        after_retain();
-        remove_hold(hold).map_err(|e| {
-            Fault::failed(Code::StateUnavailable, format!("{}: {e}", hold.display()))
-        })?;
+        after_retain()
+            .and_then(|()| remove_hold(hold))
+            .map_err(|e| {
+                Fault::failed(Code::StateUnavailable, format!("{}: {e}", hold.display()))
+            })?;
         Ok(Answer::Unpinned { commit })
     }
 }

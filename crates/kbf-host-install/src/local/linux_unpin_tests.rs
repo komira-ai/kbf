@@ -418,10 +418,12 @@ fn the_hold_file_is_read_whole_and_only_when_no_one_else_may_write_it() {
     );
 }
 
-/// An unpin cut short after `retain.json` changed and before the hold file went (here the hold
-/// file cannot be removed) fails and leaves the hold file, so the agent stays pinned; run again
-/// once the name can be removed, it finishes. A file the agent's account puts at the name in
-/// that moment is removed with it, and the commit unpinned is still the one root's file named.
+/// An unpin cut short after `retain.json` changed and before the hold file went fails and
+/// leaves root's hold file exactly as it was: a regular file of the trusted owner that no one
+/// else may write, naming the commit, which the agent still reads as a pin. Run again on that
+/// same file, the unpin finishes. A name that cannot be removed in that moment fails the same
+/// way. A file the agent's account puts at the name in that moment is removed with it, and the
+/// commit unpinned is still the one root's file named.
 ///
 /// Catches: an unpin that removes the hold file first (a cut leaves the release unprotected
 /// and unpinned in retain but the agent free); one whose retain change follows what is at the
@@ -436,10 +438,40 @@ fn an_unpin_cut_short_leaves_the_hold_and_is_finished_by_running_it_again() {
         Answer::Activated { .. }
     ));
     let hold = agent_dir(&rig).join("pin.json");
+    let uid = fs::metadata(&*rig.dir).unwrap().uid();
+    let written = fs::read(&hold).unwrap();
+    let cut = || Err(std::io::Error::other("cut short"));
+    let answer = ab.unpin_interrupted(&cut);
+    assert_eq!(
+        answer,
+        Answer::Failed(
+            Code::StateUnavailable,
+            format!("{}: cut short", hold.display())
+        )
+    );
+    assert!(pinned(&rig).is_empty(), "retain.json changed first");
+    // The hold file is root's pin as the agent reads one: the same regular file, the owner's,
+    // that its group and others may not write, naming B.
+    let meta = fs::symlink_metadata(&hold).unwrap();
+    assert!(meta.file_type().is_file());
+    assert_eq!((meta.uid(), meta.mode() & 0o7777), (uid, 0o644));
+    assert_eq!(fs::read(&hold).unwrap(), written);
+    let named: serde_json::Value = serde_json::from_slice(&written).unwrap();
+    assert_eq!(named["commit"], B);
+
+    assert_eq!(ab.unpin(), unpinned(Some(B)), "run again, it finishes");
+    assert!(!hold.exists());
+    assert!(pinned(&rig).is_empty());
+
+    // A name that cannot be removed in that moment fails the same way, and leaves it.
+    assert!(matches!(
+        ab.activate(&target(B), PIN),
+        Answer::Activated { .. }
+    ));
     let in_the_way = || {
-        fs::remove_file(&hold).unwrap();
-        fs::create_dir(&hold).unwrap();
-        fs::write(hold.join("x"), "in the way").unwrap();
+        fs::remove_file(&hold)?;
+        fs::create_dir(&hold)?;
+        fs::write(hold.join("x"), "in the way")
     };
     let answer = ab.unpin_interrupted(&in_the_way);
     assert!(
@@ -447,18 +479,8 @@ fn an_unpin_cut_short_leaves_the_hold_and_is_finished_by_running_it_again() {
             if d.starts_with(&hold.display().to_string())),
         "{answer:?}"
     );
-    assert!(pinned(&rig).is_empty(), "retain.json changed first");
-    assert!(hold.exists(), "the hold stays: the agent is still pinned");
-
+    assert!(hold.is_dir());
     fs::remove_dir_all(&hold).unwrap();
-    super::super::super::core::activate::write_hold_for_test(
-        &hold,
-        &format!("{{\"commit\":\"{B}\"}}"),
-        &|_| {},
-    )
-    .unwrap();
-    assert_eq!(ab.unpin(), unpinned(Some(B)), "run again, it finishes");
-    assert!(!hold.exists());
 
     // Root's pin of B; in the moment, the agent's account swaps in a file naming C.
     assert!(matches!(
@@ -470,8 +492,9 @@ fn an_unpin_cut_short_leaves_the_hold_and_is_finished_by_running_it_again() {
     })
     .unwrap();
     let swap = || {
-        fs::remove_file(&hold).unwrap();
+        fs::remove_file(&hold)?;
         put(&hold, &format!("{{\"commit\":\"{C}\"}}"));
+        Ok(())
     };
     assert_eq!(ab.unpin_interrupted(&swap), unpinned(Some(B)));
     assert!(!hold.exists());
