@@ -15,6 +15,9 @@
 //! (`transcript.rs`), not something the public API shows; the order within each is the
 //! farm's. The text is built by hand from the fields, never from `Debug`, so a field that
 //! is added to a message is added to the text on purpose (`text.rs` writes the words).
+//!
+//! Besides the calls of the farm, a script can make rows of the store unreadable and readable
+//! again (`unreadable`, `readable`: the tape's read faults), and run an intake poll (`intake`).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -54,7 +57,11 @@ impl Session {
             farm: None,
             t: Transcript::new(title, as_written),
         };
-        session.farm = Some(session.build(EpochPolicy::Keep));
+        session.farm = Some(
+            session
+                .build(EpochPolicy::Keep)
+                .expect("a farm over the store"),
+        );
         let farm = session.farm();
         let note = format!(
             "farm term={} lease_epoch={}",
@@ -72,7 +79,9 @@ impl Session {
         self.t.text()
     }
 
-    fn build(&self, policy: EpochPolicy) -> Farm {
+    /// A farm over the session's store, or why the store refused it, in the words of the
+    /// error.
+    fn build(&self, policy: EpochPolicy) -> Result<Farm, String> {
         let core = TestCore::new(
             TERM,
             WALL_MS,
@@ -87,7 +96,7 @@ impl Session {
                 members: Default::default(),
                 history: None,
             }))
-            .expect("a farm over the store")
+            .map_err(|e| e.to_string())
     }
 
     fn farm(&self) -> &Farm {
@@ -344,7 +353,9 @@ impl Session {
     }
 
     /// The process dies and another starts over the same store, with `policy`. The
-    /// streams and the callers die with it; the store and the cache stay.
+    /// streams and the callers die with it; the store and the cache stay. A start the store
+    /// refuses is written down (`not started:` and the error), and leaves no process running
+    /// until the next restart: a script makes no other call before it.
     pub async fn restart(&mut self, policy: EpochPolicy) {
         let how = match policy {
             EpochPolicy::Keep => "keep",
@@ -353,13 +364,40 @@ impl Session {
         self.t.say(&format!("restart epoch={how}"));
         drop(self.farm.take());
         self.t.restart();
-        self.farm = Some(self.build(policy));
-        let note = format!(
-            "farm term={} lease_epoch={}",
-            self.farm().term(),
-            self.farm().lease_epoch()
-        );
-        self.t.note(note);
+        match self.build(policy) {
+            Ok(farm) => {
+                let note = format!(
+                    "farm term={} lease_epoch={}",
+                    farm.term(),
+                    farm.lease_epoch()
+                );
+                self.farm = Some(farm);
+                self.t.note(note);
+            }
+            Err(e) => self.t.note(format!("not started: {e}")),
+        }
+        self.t.sync().await;
+    }
+
+    /// An intake poll: what the other frontends of the store did is taken in, and the
+    /// callers that asked for an operation by name are shown what the store says of it.
+    pub async fn intake(&mut self) {
+        self.t.say("intake");
+        self.farm().intake();
+        self.t.sync().await;
+    }
+
+    /// From now on a read of the row at `key` fails, as the backend's failures do.
+    pub async fn unreadable(&mut self, key: &str) {
+        self.t.say(&format!("unreadable {key}"));
+        self.t.tape.unreadable(key);
+        self.t.sync().await;
+    }
+
+    /// Every row can be read again.
+    pub async fn readable(&mut self) {
+        self.t.say("readable");
+        self.t.tape.readable();
         self.t.sync().await;
     }
 

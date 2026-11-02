@@ -301,3 +301,65 @@ pub async fn cordon_and_drain() -> String {
     }
     s.text()
 }
+
+/// The `op/` row of an operation the store holds cannot be read, and the operation is neither
+/// lost nor left with a caller that waits for nothing.
+///
+/// A start that would take the queued operation up is refused, naming the row; the next start
+/// over the readable store takes it up and runs it for a caller that asks by name.
+///
+/// A leased operation's row cannot be read after a restart: a caller that asks by name is told
+/// there is no such operation (it submits again), the node's `Hello` is taken but its claim
+/// cannot read the lease's operation, so its heartbeat is not acknowledged and the lease is
+/// cancelled. Once the row can be read, the next heartbeat claims the node and is acknowledged,
+/// a caller that asks by name follows the operation taken up (queued, the stage of the caller
+/// kept for an operation taken up from the store) and the node's result is taken and answers
+/// it.
+pub async fn unreadable_op_row() -> String {
+    let mut s = Session::start("an operation row that cannot be read is never lost").await;
+    s.submit(&Job::new("queued", 1)).await;
+    s.unreadable("op/0000000000000000").await;
+    s.restart(EpochPolicy::Keep).await;
+    s.readable().await;
+    s.restart(EpochPolicy::Keep).await;
+    s.wait("queued-again", "queued#1").await;
+    s.register("node-a", 2, 8, &["container"]).await;
+    s.report("node-a", "queued", Ended::Ran(0)).await;
+    s.submit(&Job::new("leased", 2)).await;
+    let leased = s.lease_of("leased");
+    s.restart(EpochPolicy::Keep).await;
+    s.unreadable("op/0000000000000400").await;
+    s.wait("leased-unread", "leased#1").await;
+    s.register("node-a", 2, 8, &["container"]).await;
+    s.heartbeat("node-a", &[leased]).await;
+    s.readable().await;
+    s.heartbeat("node-a", &[leased]).await;
+    s.wait("leased-again", "leased#1").await;
+    s.report_lease("node-a", "leased", leased, Ended::Ran(0))
+        .await;
+    s.intake().await;
+    s.text()
+}
+
+/// The `done/` row of an operation a caller asked for by name cannot be read when the
+/// operation finishes: the intake polls show the caller nothing while the read fails, and
+/// the first poll after the row can be read shows it the result.
+pub async fn unreadable_done_row() -> String {
+    let mut s =
+        Session::start("a result row that cannot be read is read again at the next poll").await;
+    s.register("node-a", 2, 8, &["container"]).await;
+    s.submit(&Job::new("build", 1)).await;
+    let build = s.lease_of("build");
+    s.restart(EpochPolicy::Keep).await;
+    s.wait("build-again", "build#1").await;
+    s.register("node-a", 2, 8, &["container"]).await;
+    s.heartbeat("node-a", &[build]).await;
+    s.unreadable("done/0000000000000000").await;
+    s.report_lease("node-a", "build", build, Ended::Ran(0))
+        .await;
+    s.intake().await;
+    s.intake().await;
+    s.readable().await;
+    s.intake().await;
+    s.text()
+}

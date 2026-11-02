@@ -2,7 +2,8 @@
 //! kbf's adapter instead of over [`kbf_server::Farm`]: the same calls, in the same words, and
 //! the text they write. Each method does what the method of the same name of `Farm` does with
 //! the call, through the functions of `kbf_server::farm_js::dispatch` where the farm's own
-//! work is in them and through the core where the scheduler's is.
+//! work is in them and through the core where the scheduler's is. The read faults of the store
+//! (`unreadable`, `readable`) are the tape's, as in the farm's session.
 
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
@@ -118,7 +119,11 @@ impl Session {
             wall: wall_from(started),
             started,
         };
-        session.core = Some(session.build(EpochPolicy::Keep));
+        session.core = Some(
+            session
+                .build(EpochPolicy::Keep)
+                .expect("a core over the store"),
+        );
         let epoch = session.epoch();
         session.t.say("start");
         session
@@ -133,8 +138,9 @@ impl Session {
         self.t.text()
     }
 
-    /// A core over the session's store, that starts now.
-    fn build(&mut self, policy: EpochPolicy) -> Core<KbfAdapter> {
+    /// A core over the session's store, that starts now, or why the store refused it, in the
+    /// words of the error.
+    fn build(&mut self, policy: EpochPolicy) -> Result<Core<KbfAdapter>, String> {
         self.started = tokio::time::Instant::now();
         self.wall = wall_from(self.started);
         let store: Arc<dyn Store> = self.t.tape.clone();
@@ -147,7 +153,7 @@ impl Session {
         let unservable = kbf_sched::UNSERVABLE_WAIT;
         let retention = kbf_sched::FINISHED_RETENTION;
         let config = open::config(TERM, unservable, retention, PlacementLoad::Off);
-        open::open(&config, adapter, store, policy, self.now()).expect("a core over the store")
+        open::open(&config, adapter, store, policy, self.now()).map_err(|e| e.to_string())
     }
 
     fn core(&self) -> &Core<KbfAdapter> {
@@ -438,7 +444,9 @@ impl Session {
     }
 
     /// The process dies and another starts over the same store, with `policy`. The
-    /// streams and the callers die with it; the store and the cache stay.
+    /// streams and the callers die with it; the store and the cache stay. A start the store
+    /// refuses is written down (`not started:` and the error), and leaves no process running
+    /// until the next restart: a script makes no other call before it.
     pub async fn restart(&mut self, policy: EpochPolicy) {
         let how = match policy {
             EpochPolicy::Keep => "keep",
@@ -447,10 +455,37 @@ impl Session {
         self.t.say(&format!("restart epoch={how}"));
         drop(self.core.take());
         self.t.restart();
-        self.core = Some(self.build(policy));
-        let epoch = self.epoch();
-        self.t
-            .note(format!("farm term={epoch} lease_epoch={epoch}"));
+        match self.build(policy) {
+            Ok(core) => {
+                self.core = Some(core);
+                let epoch = self.epoch();
+                self.t
+                    .note(format!("farm term={epoch} lease_epoch={epoch}"));
+            }
+            Err(e) => self.t.note(format!("not started: {e}")),
+        }
+        self.t.sync().await;
+    }
+
+    /// An intake poll: what the other frontends of the store did is taken in, and the
+    /// callers that asked for an operation by name are shown what the store says of it.
+    pub async fn intake(&mut self) {
+        self.t.say("intake");
+        self.core().intake(self.now());
+        self.t.sync().await;
+    }
+
+    /// From now on a read of the row at `key` fails, as the backend's failures do.
+    pub async fn unreadable(&mut self, key: &str) {
+        self.t.say(&format!("unreadable {key}"));
+        self.t.tape.unreadable(key);
+        self.t.sync().await;
+    }
+
+    /// Every row can be read again.
+    pub async fn readable(&mut self) {
+        self.t.say("readable");
+        self.t.tape.readable();
         self.t.sync().await;
     }
 

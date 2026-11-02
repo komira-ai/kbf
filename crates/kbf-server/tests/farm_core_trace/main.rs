@@ -135,6 +135,8 @@ scripts!(
     epoch_change,
     handover,
     cordon_and_drain,
+    unreadable_op_row,
+    unreadable_done_row,
 );
 
 /// Catches a script that is not run: a golden file with no test would never be compared,
@@ -182,4 +184,65 @@ fn the_comparison_finds_a_changed_line() {
     assert!(changed.contains("first difference at line 2"), "{changed}");
     let shorter = first_difference("a\nb\nc\n", "a\nb\n").expect("a difference");
     assert!(shorter.contains("first difference at line 3"), "{shorter}");
+}
+
+/// Catches a read fault of the tape that does not fail what the scripts rely on, or fails more:
+/// a row made unreadable fails a `get` of it and every scan whose answer holds it, by prefix or
+/// by range; a key with no row still reads as absent; a scan that does not meet the row and the
+/// other rows read as before; writes go on; the fault outlives a restart; and `readable` ends
+/// it.
+#[test]
+fn an_unreadable_row_fails_every_read_that_meets_it_and_nothing_else() {
+    use std::num::NonZeroUsize;
+
+    use kbf_state::{Cond, ScanRange, Store as _, StoreError, Txn};
+
+    let failed = |key: &str| StoreError::Failed(format!("the row {key} cannot be read"));
+    let tape = tape::Tape::new(tape::as_written);
+    let rows = Txn::new()
+        .put("op/1", b"one".to_vec(), Cond::Any)
+        .put("op/2", b"two".to_vec(), Cond::Any)
+        .put("queue/1", b"".to_vec(), Cond::Any);
+    tape.apply_batch(vec![rows]).expect("written");
+    let page = NonZeroUsize::new(10).expect("non-zero");
+
+    tape.unreadable("op/1");
+    tape.unreadable("op/9");
+
+    assert_eq!(tape.get("op/1").expect_err("unreadable"), failed("op/1"));
+    assert_eq!(tape.get("op/9").expect("absent").map(|row| row.value), None);
+    assert_eq!(
+        tape.get("op/2").expect("readable").map(|row| row.value),
+        Some(b"two".to_vec())
+    );
+    assert_eq!(
+        tape.scan_prefix("op/").expect_err("meets op/1"),
+        failed("op/1")
+    );
+    let range = ScanRange::new("op/", page);
+    assert_eq!(
+        tape.scan_range(range).expect_err("meets op/1"),
+        failed("op/1")
+    );
+    assert_eq!(
+        tape.scan_prefix("queue/").expect("does not meet it").len(),
+        1
+    );
+    let rewrite = Txn::new().put("op/1", b"again".to_vec(), Cond::Any);
+    assert!(tape.apply_batch(vec![rewrite]).expect("written")[0].is_ok());
+
+    let tape = tape.restart();
+    assert_eq!(
+        tape.get("op/1").expect_err("still unreadable"),
+        failed("op/1")
+    );
+
+    tape.readable();
+    assert_eq!(
+        tape.get("op/1").expect("readable").map(|row| row.value),
+        Some(b"again".to_vec())
+    );
+    assert_eq!(tape.scan_prefix("op/").expect("readable").len(), 2);
+    let range = ScanRange::new("op/", page);
+    assert_eq!(tape.scan_range(range).expect("readable").rows.len(), 2);
 }
