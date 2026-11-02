@@ -213,9 +213,10 @@ fn connect(path: &Path, end: Instant, now: Clock<'_>) -> io::Result<UnixStream> 
         SocketFlags::CLOEXEC,
         None,
     )?);
-    with_what_is_left(end, now, |wait| {
+    with_what_is_left(end, now, &mut |wait| {
         stream.set_write_timeout(Some(wait))?;
-        rustix::net::connect(&stream, &addr).map_err(io::Error::from)
+        rustix::net::connect(&stream, &addr)?;
+        Ok(0)
     })?;
     Ok(stream)
 }
@@ -223,11 +224,13 @@ fn connect(path: &Path, end: Instant, now: Clock<'_>) -> io::Result<UnixStream> 
 /// Calls `op` with the time left until `end` on the clock `now`, and again, with what is left
 /// then, while a signal interrupts it. With none left `op` is not called and the result is
 /// `TimedOut`; so a peer, or signals, that keep interrupting cannot carry a call past `end`.
-fn with_what_is_left<T>(
+/// The result is `op`'s, a count of bytes (0 for the connect). `op` is a trait object, not a
+/// generic, so the function is compiled once and its coverage is that of every caller.
+fn with_what_is_left(
     end: Instant,
     now: Clock<'_>,
-    mut op: impl FnMut(Duration) -> io::Result<T>,
-) -> io::Result<T> {
+    op: &mut dyn FnMut(Duration) -> io::Result<usize>,
+) -> io::Result<usize> {
     loop {
         let wait = remaining(end, now).ok_or(io::ErrorKind::TimedOut)?;
         match op(wait) {
@@ -253,7 +256,7 @@ fn register_on(
     }
     // An updater that is full answers and closes without reading the line, so the write can
     // fail while the answer is waiting: the answer is read first and says why.
-    let sent = send(&line, end, now, |wait, bytes| {
+    let sent = send(&line, end, now, &mut |wait, bytes| {
         stream.set_write_timeout(Some(wait))?;
         (&stream).write(bytes)
     });
@@ -278,11 +281,11 @@ fn send(
     line: &[u8],
     end: Instant,
     now: Clock<'_>,
-    mut write: impl FnMut(Duration, &[u8]) -> io::Result<usize>,
+    write: &mut dyn FnMut(Duration, &[u8]) -> io::Result<usize>,
 ) -> io::Result<()> {
     let mut rest = line;
     while !rest.is_empty() {
-        let n = with_what_is_left(end, now, |wait| write(wait, rest))?;
+        let n = with_what_is_left(end, now, &mut |wait| write(wait, rest))?;
         rest = &rest[n..];
     }
     Ok(())
@@ -326,7 +329,7 @@ fn answer(stream: &UnixStream, end: Instant, now: Clock<'_>) -> Result<(), Error
     let mut text = Vec::new();
     let mut chunk = [0u8; 128];
     while !text.contains(&b'\n') && text.len() < MAX_ANSWER {
-        let read = with_what_is_left(end, now, |wait| {
+        let read = with_what_is_left(end, now, &mut |wait| {
             stream.set_read_timeout(Some(wait))?;
             (&*stream).read(&mut chunk)
         });

@@ -394,7 +394,7 @@ fn an_interrupted_call_is_made_again_with_what_is_left() {
     let secs = Duration::from_secs;
     let clock = Script::new(&[end - secs(4), end - secs(3), end - secs(1), end]);
     let mut waits = Vec::new();
-    let got: std::io::Result<()> = with_what_is_left(end, &|| clock.now(), |wait| {
+    let got = with_what_is_left(end, &|| clock.now(), &mut |wait| {
         waits.push(wait);
         Err(std::io::ErrorKind::Interrupted.into())
     });
@@ -405,7 +405,7 @@ fn an_interrupted_call_is_made_again_with_what_is_left() {
     // Interrupted twice, then done: the result is the third try's.
     let clock = Script::new(&[end - secs(4), end - secs(3), end - secs(2)]);
     let mut waits = Vec::new();
-    let got = with_what_is_left(end, &|| clock.now(), |wait| {
+    let got = with_what_is_left(end, &|| clock.now(), &mut |wait| {
         waits.push(wait);
         match waits.len() {
             3 => Ok(7),
@@ -436,7 +436,7 @@ fn a_write_that_goes_in_part_is_carried_on_with_what_is_left() {
     let line = b"twenty bytes of line";
     let mut written = Vec::new();
     let mut waits = Vec::new();
-    let got = send(line, end, &|| clock.now(), |wait, bytes| {
+    let got = send(line, end, &|| clock.now(), &mut |wait, bytes| {
         waits.push(wait);
         if waits.len() == 2 {
             return Err(std::io::ErrorKind::Interrupted.into());
