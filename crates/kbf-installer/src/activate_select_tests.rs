@@ -131,13 +131,33 @@ fn a_select_whose_links_cannot_follow_leaves_the_state_as_it_was() {
     let (mut exec, layout) = host("select-stuck");
     running(&exec, &layout, A, &[B, C]);
     let before = state_of(&layout);
-    // A directory where `previous` goes: the link step refuses it.
+    // The links' directory takes no new link (its links can still be read): the state written
+    // for B is put back.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let releases = exec.at("/var/lib/kbf-installer/releases");
+        fs::set_permissions(&releases, fs::Permissions::from_mode(0o555)).expect("close");
+        let err = select(&mut exec, &layout, &c(B), &mut Vec::new());
+        fs::set_permissions(&releases, fs::Permissions::from_mode(0o755)).expect("open");
+        err.expect_err("cannot link");
+    }
+    assert_eq!(state_of(&layout), before, "the state is as it was");
+    assert_eq!(link(&exec, "current"), at(A));
+    // A host where every link step fails puts the state back the same way.
+    let mut killed = Killed {
+        host: &mut exec,
+        left: 0,
+    };
+    select(&mut killed, &layout, &c(B), &mut Vec::new()).expect_err("cannot link");
+    assert_eq!(state_of(&layout), before, "the state is as it was");
+    // A directory where `previous` goes is no history to read: refused before anything is
+    // written.
     let previous = exec.at("/var/lib/kbf-installer/releases/previous");
     fs::create_dir(&previous).expect("dir");
     fs::write(previous.join("x"), "in the way").expect("file");
-    select(&mut exec, &layout, &c(B), &mut Vec::new()).expect_err("cannot link");
+    let err = select(&mut exec, &layout, &c(B), &mut Vec::new()).expect_err("unreadable");
+    assert!(err.to_string().ends_with(": not a link"), "{err}");
     assert_eq!(state_of(&layout), before, "the state is as it was");
-    assert_eq!(link(&exec, "current"), at(A));
     fs::remove_dir_all(&previous).expect("clear");
     let selected = select(&mut exec, &layout, &c(C), &mut Vec::new()).expect("to C");
     assert_eq!(selected.from, Some(c(A)));
@@ -151,6 +171,8 @@ fn a_select_whose_links_cannot_follow_leaves_the_state_as_it_was() {
 struct Sealing<'a> {
     host: &'a mut ScratchHost,
     dir: std::path::PathBuf,
+    /// What else happens to the host at that step.
+    also: &'a dyn Fn(),
 }
 
 impl Exec for Sealing<'_> {
@@ -171,6 +193,7 @@ impl Exec for Sealing<'_> {
     }
     fn apply(&mut self, _step: &Step) -> io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
+        (self.also)();
         fs::set_permissions(&self.dir, fs::Permissions::from_mode(0o555))?;
         Err(io::Error::other("the link step failed"))
     }
@@ -190,12 +213,21 @@ impl Exec for Sealing<'_> {
 fn a_select_that_cannot_put_the_state_back_says_so_and_the_next_one_follows_the_links() {
     use std::os::unix::fs::PermissionsExt;
     let (mut exec, layout) = host("select-sealed");
-    running(&exec, &layout, A, &[B, C]);
+    running(&exec, &layout, A, &[B, C, D]);
+    // A runs and C is `previous`, in the state and the links.
+    let mut state = state_of(&layout);
+    state.previous = Some(c(C));
+    Locked::acquire(&layout)
+        .expect("lock")
+        .write(&state)
+        .expect("state");
+    symlink(C, exec.at("/var/lib/kbf-installer/releases/previous")).expect("link");
     let dir = exec.at("/var/lib/kbf-installer");
     let err = select(
         &mut Sealing {
             host: &mut exec,
             dir: dir.clone(),
+            also: &|| {},
         },
         &layout,
         &c(B),
@@ -204,7 +236,7 @@ fn a_select_that_cannot_put_the_state_back_says_so_and_the_next_one_follows_the_
     .expect_err("cannot link");
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).expect("open again");
     assert!(
-        matches!(&err, ReleaseError::NotPutBack { linked: Some(l), .. } if *l == c(A)),
+        matches!(&err, ReleaseError::NotPutBack { current, .. } if *current == format!("names {A}")),
         "{err}"
     );
     let text = err.to_string();
@@ -224,8 +256,138 @@ fn a_select_that_cannot_put_the_state_back_says_so_and_the_next_one_follows_the_
         "the state was not put back"
     );
     assert_eq!(link(&exec, "current"), at(A));
-    let selected = select(&mut exec, &layout, &c(C), &mut Vec::new()).expect("to C");
+    // Selecting the release that stayed current keeps the `previous` the links name (C), not the
+    // release the state says was left.
+    let selected = select(&mut exec, &layout, &c(A), &mut Vec::new()).expect("to A");
     assert_eq!(selected.from, Some(c(A)));
     let state = state_of(&layout);
-    assert_eq!((state.current, state.previous), (Some(c(C)), Some(c(A))));
+    assert_eq!((state.current, state.previous), (Some(c(A)), Some(c(C))));
+    assert_eq!(link(&exec, "previous"), at(C));
+    let selected = select(&mut exec, &layout, &c(D), &mut Vec::new()).expect("to D");
+    assert_eq!(selected.from, Some(c(A)));
+    let state = state_of(&layout);
+    assert_eq!((state.current, state.previous), (Some(c(D)), Some(c(A))));
+}
+
+/// A host whose first look at `current` fails, and every later one works.
+struct Flaky<'a> {
+    host: &'a mut ScratchHost,
+    current: HostPath,
+    failed: std::cell::Cell<bool>,
+}
+
+impl Exec for Flaky<'_> {
+    fn euid(&self) -> u32 {
+        self.host.euid()
+    }
+    fn inspect(&self, path: &HostPath) -> io::Result<Option<Entry>> {
+        if *path == self.current && !self.failed.replace(true) {
+            return Err(io::Error::other("cannot look"));
+        }
+        self.host.inspect(path)
+    }
+    fn stat(&self, path: &HostPath) -> io::Result<Option<Meta>> {
+        self.host.stat(path)
+    }
+    fn query(&self, cmd: &Cmd) -> io::Result<Output> {
+        self.host.query(cmd)
+    }
+    fn http_status(&self, url: &HttpUrl) -> io::Result<u16> {
+        self.host.http_status(url)
+    }
+    fn apply(&mut self, step: &Step) -> io::Result<()> {
+        self.host.apply(step)
+    }
+    fn check_binary(&self) -> Result<(), Untrusted> {
+        self.host.check_binary()
+    }
+}
+
+/// With the state naming a release that never ran (B) and `current` linking to A, a look at
+/// `current` that fails refuses the select before anything is written, so the state's B is never
+/// taken for the release left; asked again, the select leaves A. A `current` that links to no
+/// release is refused the same way.
+///
+/// Catches: a failed look at the links read as "no link", so the history comes from the state.
+#[test]
+fn a_select_that_cannot_read_current_refuses_before_writing() {
+    let (mut exec, layout) = host("select-flaky");
+    running(&exec, &layout, A, &[B, C]);
+    let mut state = state_of(&layout);
+    state.current = Some(c(B));
+    Locked::acquire(&layout)
+        .expect("lock")
+        .write(&state)
+        .expect("state");
+    let current = layout.current();
+    let err = select(
+        &mut Flaky {
+            host: &mut exec,
+            current,
+            failed: std::cell::Cell::new(false),
+        },
+        &layout,
+        &c(C),
+        &mut Vec::new(),
+    )
+    .expect_err("cannot look");
+    assert!(err.to_string().ends_with("cannot look"), "{err}");
+    assert_eq!(state_of(&layout), state, "nothing written");
+    let selected = select(&mut exec, &layout, &c(C), &mut Vec::new()).expect("to C");
+    assert_eq!(selected.from, Some(c(A)));
+    assert_eq!(state_of(&layout).previous, Some(c(A)));
+
+    let link_path = exec.at("/var/lib/kbf-installer/releases/current");
+    fs::remove_file(&link_path).expect("unlink");
+    symlink("not-a-release", &link_path).expect("link");
+    let before = state_of(&layout);
+    let err = select(&mut exec, &layout, &c(A), &mut Vec::new()).expect_err("no release");
+    assert!(
+        err.to_string()
+            .ends_with("a link to not-a-release, which is no release"),
+        "{err}"
+    );
+    assert_eq!(state_of(&layout), before);
+}
+
+/// When the state cannot be put back, the failure says what `current` is even when it is no
+/// link (removed meanwhile) or cannot be looked at.
+///
+/// Catches: a `current` that cannot be read reported as "no release".
+#[test]
+fn a_select_that_cannot_put_the_state_back_tells_a_current_it_cannot_read() {
+    use std::os::unix::fs::PermissionsExt;
+    for case in ["gone", "unreadable"] {
+        let (mut exec, layout) = host(&format!("select-sealed-{case}"));
+        running(&exec, &layout, A, &[B]);
+        let dir = exec.at("/var/lib/kbf-installer");
+        let releases = exec.at("/var/lib/kbf-installer/releases");
+        let current = releases.join("current");
+        let also = || match case {
+            // Run at each link step: the swap's and the putting back's.
+            "gone" => drop(fs::remove_file(&current)),
+            _ => fs::set_permissions(&releases, fs::Permissions::from_mode(0o000)).expect("close"),
+        };
+        let err = select(
+            &mut Sealing {
+                host: &mut exec,
+                dir: dir.clone(),
+                also: &also,
+            },
+            &layout,
+            &c(B),
+            &mut Vec::new(),
+        )
+        .expect_err("cannot link");
+        fs::set_permissions(&releases, fs::Permissions::from_mode(0o755)).expect("open");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).expect("open");
+        let ReleaseError::NotPutBack { current, .. } = &err else {
+            panic!("{err}");
+        };
+        if case == "gone" {
+            assert_eq!(current, "is no link");
+        } else {
+            assert!(current.starts_with("cannot be read ("), "{current}");
+        }
+    }
 }

@@ -272,12 +272,17 @@ pub fn select<E: Exec>(
     if !has_binary(exec, host, commit) {
         return Err(ReleaseError::NotInstalled(commit.clone()));
     }
-    // The release left is the one `current` names: the state can name another when a verb
-    // was cut short (or a select could not put it back), and the links are what runs.
-    let from = linked(exec, host).or_else(|| state.current.clone());
+    // The history is the links': the release left is the one `current` names, and the one
+    // before it the one `previous` names. The state can name others when a verb was cut short
+    // (or a select could not put it back); it is read only on a host with no `current` link. A
+    // link that cannot be read is refused before anything is written.
+    let (from, before) = match linked(exec, host, &host.current())? {
+        Some(ran) => (Some(ran), linked(exec, host, &host.previous())?),
+        None => (state.current.clone(), state.previous.clone()),
+    };
     let previous = match &from {
         Some(ran) if ran != commit => Some(ran.clone()),
-        _ => state.previous.clone(),
+        _ => before,
     };
     let next = State {
         current: Some(commit.clone()),
@@ -298,20 +303,41 @@ pub fn select<E: Exec>(
             Err(restore) => ReleaseError::NotPutBack {
                 cause: e.to_string(),
                 restore: restore.to_string(),
-                linked: linked(exec, host),
+                current: match linked(exec, host, &host.current()) {
+                    Ok(Some(ran)) => format!("names {ran}"),
+                    Ok(None) => "is no link".to_owned(),
+                    Err(e) => format!("cannot be read ({e})"),
+                },
             },
         });
     }
     Ok(Selected { from })
 }
 
-/// The release the `current` link names, when it names one.
-fn linked<E: Exec>(exec: &E, host: &Layout) -> Option<CommitId> {
-    match exec.inspect(&host.current()) {
-        Ok(Some(kbf_host::exec::Entry::Link { target })) => {
-            target.to_str().and_then(|t| CommitId::new(t).ok())
-        }
-        _ => None,
+/// The release the link `link` names: none when there is no link there; an error when it cannot
+/// be read, or is not a link to a release.
+fn linked<E: Exec>(
+    exec: &E,
+    host: &Layout,
+    link: &kbf_host::path::HostPath,
+) -> Result<Option<CommitId>, ReleaseError> {
+    let unreadable = |source: std::io::Error| ReleaseError::Read {
+        path: host.join(link),
+        source,
+    };
+    match exec.inspect(link).map_err(unreadable)? {
+        None => Ok(None),
+        Some(kbf_host::exec::Entry::Link { target }) => target
+            .to_str()
+            .and_then(|t| CommitId::new(t).ok())
+            .map(Some)
+            .ok_or_else(|| {
+                unreadable(std::io::Error::other(format!(
+                    "a link to {}, which is no release",
+                    target.display()
+                )))
+            }),
+        Some(_) => Err(unreadable(std::io::Error::other("not a link"))),
     }
 }
 

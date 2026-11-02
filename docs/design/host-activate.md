@@ -28,9 +28,12 @@ no `pending_confirm`) and the links follow; on a Mac the links move first and th
 `pending.json` is removed after (one that cannot be removed puts the links back, and links that
 cannot be put back are `revert_failed`, saying what they name). If the links cannot follow the
 state on Linux, the state is put back as it was, so the next activate leaves the release that
-still runs. If the state cannot be put back either, the failure says so and names what `current`
-links to; the next select takes the release it leaves from the `current` link, not from the state,
-so `previous` is never a release that did not run.
+still runs. If the state cannot be put back either, the failure says so and says what `current`
+is (the release it names, no link, or that it cannot be read). Every select takes its history
+from the links, not the state: the release it leaves is the one `current` names and, when that is
+the release named, `previous` stays the one the `previous` link names; the state is read only on a
+host with no `current` link. A link that cannot be read, or that names no release, is refused
+before anything is written. So `previous` is never a release that did not run.
 
 A unit that does not come up on the release named is `restart_failed`. The host stays on that
 release: going back would start the release being left. Every configured unit is restarted, each

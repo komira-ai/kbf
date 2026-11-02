@@ -106,14 +106,15 @@ pub enum ReleaseError {
     #[error("no swap is pending, and {0} is not the current release")]
     NotPending(CommitId),
     #[error(
-        "{cause}; and the state could not be put back ({restore}): `current` names {}, run \
-         `reconcile` or select again",
-        linked.as_ref().map_or("no release", CommitId::as_str)
+        "{cause}; and the state could not be put back ({restore}): `current` {current}, run \
+         `reconcile` or select again"
     )]
     NotPutBack {
         cause: String,
         restore: String,
-        linked: Option<CommitId>,
+        /// What the `current` link is now: `names <commit>`, `is no link`, or `cannot be read
+        /// (<why>)`.
+        current: String,
     },
     #[error("{0} is staged and has not been confirmed or dropped: one frontend update at a time")]
     FrontendBusy(CommitId),
