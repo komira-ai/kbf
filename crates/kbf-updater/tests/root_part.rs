@@ -8,27 +8,13 @@
 mod root_support;
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, mpsc};
 
 use kbf_step_runner::{Clock, CrashPoint};
-use kbf_updater::root::socket::{self, Answer, Request};
-use kbf_updater::root::{RootPart, boot};
-use root_support::{FakeClock, World, my_uid, property, word};
+use kbf_updater::root::RootPart;
+use root_support::{FakeClock, SUCCEEDED, World, my_uid, property, verdict, word};
 use update_hook::{Class, Phase, Step, Verdict};
-
-const SUCCEEDED: Verdict = Verdict::Succeeded {
-    promotion_pending: false,
-};
-
-fn verdict(answer: &Answer) -> Verdict {
-    answer
-        .verdict
-        .clone()
-        .unwrap_or_else(|| panic!("no verdict: {answer:?}"))
-}
 
 /// Catches the root part not running a declared hook through the step runner: an update of the
 /// fake service runs `prepare`, `cutover`, `verify` and `cleanup` in that order, each in the unit
@@ -289,98 +275,6 @@ fn a_killed_root_part_resumes_a_successful_update_from_every_record_write() {
 #[test]
 fn a_killed_root_part_resumes_a_rolled_back_update_from_every_record_write() {
     sweep(Scenario::VerifyFails);
-}
-
-/// The record says `cutover` is about to start: the gate kills the root part once that is durable.
-fn killed_before_cutover(world: &World) {
-    let record = world.path("state/svc/step-record.json");
-    let gate = move |point: CrashPoint| {
-        let pending_cutover = fs::read(&record)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-            .is_some_and(|rec| rec["step"] == "cutover" && rec["state"]["state"] == "pending");
-        matches!(point, CrashPoint::AfterWrite(_)) && pending_cutover
-    };
-    let killed = world.root_part_gated(Arc::new(gate)).update("svc", "2.0.0");
-    assert_eq!(killed.token(), Some("runner"), "{killed:?}");
-    assert_eq!(world.record("svc")["step"], "cutover");
-    assert_eq!(world.record("svc")["state"]["state"], "pending");
-}
-
-fn pending_cutover_world(name: &str) -> World {
-    let world = World::new(name);
-    world.declare("svc", &world.tierstore_shaped());
-    world.stage("svc", "1.0.0", None);
-    world.stage("svc", "2.0.0", None);
-    assert_eq!(
-        verdict(&world.root_part().update("svc", "1.0.0")),
-        SUCCEEDED
-    );
-    killed_before_cutover(&world);
-    world
-}
-
-/// Catches a boot that runs a `cutover` it found pending, or that starts the units before the
-/// rollback: after a boot the pending `cutover` of the update to 2.0.0 is rolled back (the table
-/// of 3.2 for a killed `cutover`), the update ends `Failed`, and only then does the boot entry
-/// run, from the release that was running, 1.0.0.
-#[test]
-fn a_pending_cutover_found_at_boot_is_rolled_back_before_the_boot_entry() {
-    let world = pending_cutover_world("boot-cutover");
-    let before = world.steps("svc").len();
-    world.clock.reboot("boot-b");
-    let root = world.root_part();
-    let first =
-        kbf_updater::root::boot::first_start_since_boot(&world.path("state"), &*world.clock)
-            .unwrap();
-    assert!(first, "the boot id changed");
-    let started = root.start("svc", first);
-    assert_eq!(
-        started.verdict,
-        Some(Verdict::Failed {
-            phase: Phase::BeforeCommit,
-            class: Class::Release
-        }),
-        "{started:?}"
-    );
-    assert_eq!(started.boot.as_deref(), Some("success"));
-    assert_eq!(&world.steps("svc")[before..], ["rollback", "restore"]);
-    let boot = world.launched().pop().unwrap();
-    assert!(
-        root_support::words(&boot)
-            .iter()
-            .any(|a| a.ends_with("/releases/svc/1.0.0/hook")),
-        "{boot:?}"
-    );
-    assert_eq!(
-        fs::read_link(world.path("releases/svc/current")).unwrap(),
-        std::path::Path::new("1.0.0")
-    );
-}
-
-/// Catches the boot rule applied to a restart that is not a boot: the root part restarted in
-/// the same boot resumes the update it found with `cutover` pending, as after any crash, and it
-/// succeeds.
-#[test]
-fn a_pending_cutover_found_after_a_restart_in_the_same_boot_is_run() {
-    let world = pending_cutover_world("restart-cutover");
-    let before = world.steps("svc").len();
-    let root = world.root_part();
-    let first =
-        kbf_updater::root::boot::first_start_since_boot(&world.path("state"), &*world.clock)
-            .unwrap();
-    // The first start of this world's root part wrote no boot id: it is read as a boot.
-    assert!(first);
-    let first =
-        kbf_updater::root::boot::first_start_since_boot(&world.path("state"), &*world.clock)
-            .unwrap();
-    assert!(!first, "the same boot");
-    let started = root.start("svc", first);
-    assert_eq!(started.verdict, Some(SUCCEEDED), "{started:?}");
-    assert_eq!(
-        &world.steps("svc")[before..],
-        ["cutover", "verify", "cleanup", "restore"]
-    );
 }
 
 /// Catches a declaration installed past the gate: a release whose declaration widens the active
@@ -731,13 +625,13 @@ fn a_killed_update_keeps_the_declaration_it_installed_until_its_verdict() {
     assert!(!world.path("state/svc/declaration.previous").exists());
 }
 
-/// A clock whose dead-man polls are counted: a sleep of the dead-man's interval is a poll, and
-/// waits a little on the real clock so the dead-man's loop does not spin; any other sleep moves
-/// the fake clock.
+/// A clock that tells when the dead-man polls: a sleep of the dead-man's interval is a poll, sent
+/// on `polled`, after which the dead-man's thread is parked (it is not woken: the test is over by
+/// then); any other sleep moves the fake clock.
 struct PollClock {
     fake: Arc<FakeClock>,
     poll_secs: u64,
-    polls: AtomicU64,
+    polled: Mutex<mpsc::Sender<()>>,
 }
 
 impl Clock for PollClock {
@@ -751,8 +645,8 @@ impl Clock for PollClock {
 
     fn sleep_secs(&self, secs: u64) {
         if secs == self.poll_secs {
-            self.polls.fetch_add(1, Ordering::SeqCst);
-            std::thread::sleep(Duration::from_millis(10));
+            let _ = self.polled.lock().unwrap().send(());
+            std::thread::park();
         } else {
             self.fake.sleep_secs(secs);
         }
@@ -761,175 +655,23 @@ impl Clock for PollClock {
 
 /// Catches a service run with no dead-man: the root part gives each service's runner a dead-man
 /// thread that polls at the interval it was given, and an update runs to its verdict beside it.
+/// The test waits for the poll itself (nextest's hang guard ends it if none comes).
 #[test]
 fn each_service_gets_a_dead_man_that_polls_at_its_interval() {
     let world = World::new("deadman");
     world.declare("svc", &world.tierstore_shaped());
     world.stage("svc", "1.0.0", None);
-    let clock = Arc::new(PollClock {
+    let (polled, poll) = mpsc::channel();
+    let mut parts = world.parts(None);
+    parts.clock = Arc::new(PollClock {
         fake: FakeClock::new(),
         poll_secs: 3600,
-        polls: AtomicU64::new(0),
+        polled: Mutex::new(polled),
     });
-    let mut parts = world.parts(None);
-    parts.clock = clock.clone();
     parts.deadman_poll_secs = Some(3600);
     let root = RootPart::new(world.config(), parts).unwrap();
     assert_eq!(verdict(&root.update("svc", "1.0.0")), SUCCEEDED);
-    // Waits for the dead-man's first poll; a bound on the number of looks, not on time.
-    let polled = (0..3000).any(|_| {
-        let seen = clock.polls.load(Ordering::SeqCst) > 0;
-        if !seen {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        seen
-    });
-    assert!(polled, "no dead-man polled for svc");
-}
-
-/// Catches a boot entry run with a record directory the service's account can write: the check
-/// every step gets before its launch is made before the boot entry too, and nothing is launched.
-#[test]
-fn a_boot_entry_whose_record_directory_the_service_can_write_runs_nothing() {
-    let world = World::new("boot-state");
-    world.declare("svc", &world.tierstore_shaped());
-    world.stage("svc", "1.0.0", None);
-    assert_eq!(
-        verdict(&world.root_part().update("svc", "1.0.0")),
-        SUCCEEDED
-    );
-    let launched = world.launched().len();
-    // Opened to the service's account once the declarations are loaded, before the boot entry: a
-    // load after this refuses the declaration itself.
-    let root = world.root_part();
-    root_support::dir(&world.hook_dir("svc"), 0o777);
-    let started = root.start("svc", false);
-    assert_eq!(started.token(), Some("boot"), "{started:?}");
-    assert!(
-        started
-            .error
-            .as_deref()
-            .unwrap_or_default()
-            .contains("can be written"),
-        "{started:?}"
-    );
-    assert_eq!(world.launched().len(), launched);
-}
-
-/// `kbf-updater root` as a host starts it (`run_config`), over `world`, with the agent's socket in
-/// it: `at_ready` runs when the root part is about to answer the agent, then the agent asks for
-/// the status of `svc` and the root part is stopped. The answer.
-fn serve_once(world: &World, at_ready: impl FnOnce()) -> Answer {
-    let socket = world.path("root.sock");
-    let flags = kbf_updater::root::flags::parse(&[
-        "--socket".to_owned(),
-        socket.display().to_string(),
-        "--socket-user".to_owned(),
-        "me".to_owned(),
-    ])
-    .unwrap();
-    let (sent, answered) = std::sync::mpsc::channel();
-    let (code, text) =
-        kbf_updater::root::run_config(&flags, world.config(), world.parts(None), move |stop| {
-            at_ready();
-            std::thread::spawn(move || {
-                let answer = socket::request(
-                    &socket,
-                    &Request::Status {
-                        service: "svc".to_owned(),
-                    },
-                );
-                stop.stop();
-                sent.send(answer.map_err(|e| e.to_string())).unwrap();
-            });
-        });
-    assert_eq!((code, text.as_str()), (0, ""));
-    answered.recv().unwrap().unwrap()
-}
-
-/// The boot id of the last start pass, as the root part wrote it.
-fn committed_boot_id(world: &World) -> String {
-    fs::read_to_string(world.path("state").join(boot::BOOT_ID_FILE)).unwrap_or_default()
-}
-
-/// Catches a root part that answers the agent before its start pass, or that does not read the
-/// boot the way a host starts it: `kbf-updater root` started after a boot finds the update to
-/// 2.0.0 cut off before its `cutover`, rolls it back and runs the boot entry from 1.0.0, all
-/// before it answers the agent, and only then writes the new boot id.
-#[test]
-fn the_root_part_rolls_back_a_cutover_a_boot_cut_off_before_it_answers_the_agent() {
-    let world = pending_cutover_world("serve-boot");
-    boot::commit_boot(&world.path("state"), &*world.clock).unwrap();
-    let before = world.steps("svc").len();
-    world.clock.reboot("boot-b");
-    let mut at_ready = None;
-    let answer = serve_once(&world, || {
-        at_ready = Some((
-            world.steps("svc")[before..].to_vec(),
-            world.record("svc")["state"].clone(),
-        ));
-    });
-    let (steps, state) = at_ready.unwrap();
-    assert_eq!(steps, ["rollback", "restore"]);
-    assert_eq!(state["state"], "finished", "{state}");
-    assert_eq!(
-        serde_json::from_value::<Verdict>(state["verdict"].clone()).unwrap(),
-        Verdict::Failed {
-            phase: Phase::BeforeCommit,
-            class: Class::Release
-        },
-        "{state}"
-    );
-    assert!(answer.ok, "{answer:?}");
-    assert_eq!(committed_boot_id(&world), "boot-b");
-}
-
-/// Catches a boot id written over a record the start pass could not read, or a service started
-/// from such a record: after a boot, a record that does not parse holds the boot id back and its
-/// service is not started; once it is put right the next start reads it after the boot and
-/// writes the boot id, and a start in the same boot after that leaves the boot id as it is.
-#[test]
-fn the_boot_id_is_written_only_once_every_record_was_read() {
-    let world = World::new("boot-unread");
-    world.declare("svc", &world.tierstore_shaped());
-    let state = world.path("state");
-    root_support::dir(&state, 0o700);
-    boot::commit_boot(&state, &*world.clock).unwrap();
-    root_support::dir(&state.join("svc"), 0o700);
-    let record = state.join("svc/step-record.json");
-    root_support::put(&record, b"{", 0o600);
-    // Neither a directory nor a service's name: not a record of anyone.
-    root_support::dir(&state.join(".scratch"), 0o700);
-    world.clock.reboot("boot-b");
-    serve_once(&world, || {});
-    assert_eq!(committed_boot_id(&world), "boot-a");
-    assert_eq!(
-        fs::read(&record).unwrap(),
-        b"{",
-        "the record is left as it was"
-    );
-    fs::remove_file(&record).unwrap();
-    serve_once(&world, || {});
-    assert_eq!(committed_boot_id(&world), "boot-b");
-    // A start in the same boot reads nothing as cut off and leaves the boot id as it is.
-    let after = serve_once(&world, || {});
-    assert!(after.ok, "{after:?}");
-    assert_eq!(committed_boot_id(&world), "boot-b");
-}
-
-/// Catches a state directory the root part cannot list read as one with no record in it: the
-/// read after a boot reports it, so the boot id is not written.
-#[test]
-fn a_state_directory_that_cannot_be_listed_is_reported_by_the_read_after_a_boot() {
-    let world = World::new("boot-unlisted");
-    world.declare("svc", &world.tierstore_shaped());
-    let root = world.root_part();
-    let state = world.path("state");
-    fs::set_permissions(&state, fs::Permissions::from_mode(0o000)).unwrap();
-    let unread = root.read_after_boot();
-    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
-    assert_eq!(unread.len(), 1, "{unread:?}");
-    assert_eq!(unread[0].0, "", "{unread:?}");
+    poll.recv().expect("the dead-man of svc polls");
 }
 
 /// Catches a verdict whose leavings fail quietly: after a successful update the declaration kept
@@ -958,40 +700,4 @@ fn a_release_that_cannot_be_made_current_after_a_success_is_an_error() {
     let answer = world.root_part().update("svc", "1.0.0");
     assert_eq!(answer.token(), Some("internal"), "{answer:?}");
     assert!(fs::read_link(world.path("releases/svc/current")).is_err());
-}
-
-/// Catches a boot rule kept only for the services whose declaration loaded: after a boot the
-/// root part reads the record of a service whose declaration is refused as well, so the
-/// `cutover` the boot cut off is rolled back once the declaration is put right, in the same boot,
-/// and not run forward.
-#[test]
-fn a_cutover_a_boot_cut_off_is_rolled_back_even_when_its_declaration_was_refused_at_boot() {
-    let world = pending_cutover_world("boot-refused");
-    boot::commit_boot(&world.path("state"), &*world.clock).unwrap();
-    let file = world.path("updater.d/svc.toml");
-    let mode = |m: u32| fs::set_permissions(&file, fs::Permissions::from_mode(m)).unwrap();
-    // Open to everyone: the load refuses it.
-    mode(0o666);
-    world.clock.reboot("boot-b");
-    let before = world.steps("svc").len();
-    serve_once(&world, || {});
-    assert_eq!(
-        world.steps("svc").len(),
-        before,
-        "a refused service runs nothing"
-    );
-    assert_eq!(world.record("svc")["state"]["state"], "done");
-    assert_eq!(committed_boot_id(&world), "boot-b");
-    // Put right in the same boot; the root part restarted.
-    mode(0o644);
-    let started = world.root_part().start("svc", false);
-    assert_eq!(
-        started.verdict,
-        Some(Verdict::Failed {
-            phase: Phase::BeforeCommit,
-            class: Class::Release
-        }),
-        "{started:?}"
-    );
-    assert_eq!(&world.steps("svc")[before..], ["rollback", "restore"]);
 }

@@ -5,26 +5,29 @@
 //!
 //! Needs Linux, systemd and root, so it is `#[ignore]`d and runs in the `update-rights-linux`
 //! workflow through `cargo xtask sudo-test -p kbf-updater --test root_part_root`. No test here
-//! decides anything by how long it takes: it waits for the socket to answer and for the hook's
-//! log, and each wait is ended by nextest's guard if what it waits for never comes.
+//! decides anything by how long it takes: it waits for the root part to say it serves the agent,
+//! and each wait is ended by nextest's guard if what it waits for never comes.
 
 #![cfg(target_os = "linux")]
 
 mod root_support;
 
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
-use std::time::Duration;
+use std::process::{Child, Command, Stdio};
 
 use kbf_updater::root::socket::{self, Request};
+use kbf_updater::root::test_hook::RECORD_DIR_FILE;
 use root_support::{HOOK, dir, put};
 use update_hook::Verdict;
 use update_rights::{Accounts, EtcAccounts};
 
 const SERVICE: &str = "kbfue2e";
+
+/// What the root part writes when it starts answering the agent.
+const SERVING: &str = "kbf-updater root: serving the agent at ";
 
 /// The directory of the test under `/var/lib` (the hook's units have a private `/tmp` and no
 /// home), removed with everything in it when the test ends.
@@ -64,16 +67,25 @@ fn start(base: &Path) -> Running {
             "--releases-dir",
             &path("releases"),
         ])
+        .stderr(Stdio::piped())
         .spawn()
         .expect("the root part starts");
-    // The socket is bound once the start pass is over.
-    let socket = base.join("run/root.sock");
-    while UnixStream::connect(&socket).is_err() {
-        if let Some(status) = child.try_wait().unwrap() {
-            panic!("the root part exited before it served: {status}");
-        }
-        std::thread::sleep(Duration::from_millis(50));
+    // It says when it serves the agent, once the start pass is over and the socket is bound; the
+    // rest of what it writes is passed on.
+    let mut lines = BufReader::new(child.stderr.take().expect("its standard error")).lines();
+    let serving = lines.by_ref().map_while(Result::ok).find(|line| {
+        eprintln!("{line}");
+        line.starts_with(SERVING)
+    });
+    if serving.is_none() {
+        let status = child.wait().unwrap();
+        panic!("the root part exited before it served: {status}");
     }
+    std::thread::spawn(move || {
+        lines
+            .map_while(Result::ok)
+            .for_each(|line| eprintln!("{line}"));
+    });
     Running(child)
 }
 
@@ -115,7 +127,6 @@ fn the_root_part_binary_runs_a_declared_hook_through_systemd_and_writes_the_step
          user = \"nobody\"\n\
          group = \"nogroup\"\n\
          address_families = [\"AF_UNIX\"]\n\
-         environment = {{ HOOK_RECORD_DIR = \"{state}\" }}\n\
          [hook.timeout_secs]\n\
          prepare = 60\ncutover = 60\nverify = 60\nrollback = 60\ncleanup = 60\n",
         state = state_dir.display(),
@@ -128,6 +139,12 @@ fn the_root_part_binary_runs_a_declared_hook_through_systemd_and_writes_the_step
     let tree = base.join("releases").join(SERVICE).join("1.0.0");
     dir(&tree, 0o755);
     fs::copy(HOOK, tree.join("hook")).unwrap();
+    // The hook's record directory, which it reads beside itself.
+    put(
+        &tree.join(RECORD_DIR_FILE),
+        state_dir.display().to_string().as_bytes(),
+        0o644,
+    );
     fs::set_permissions(tree.join("hook"), fs::Permissions::from_mode(0o755)).unwrap();
     let digest = kbf_step_runner::tree_digest(&tree).unwrap();
     put(

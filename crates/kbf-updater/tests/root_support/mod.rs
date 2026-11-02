@@ -2,7 +2,7 @@
 //! staged releases with their seals, the hooks' record directories), fake accounts, a clock that
 //! moves only when told to, and a `systemd-run` that runs the hook directly as this user with the
 //! unit's environment, keeping every command it was given.
-#![allow(dead_code)]
+#![allow(dead_code)] // Each test binary of the root part uses its own part of this module.
 
 use std::fs;
 use std::io;
@@ -12,9 +12,12 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use kbf_step_runner::Clock;
 use kbf_step_runner::record::CrashGate;
+use kbf_step_runner::{Clock, CrashPoint};
+use kbf_updater::root::socket::Answer;
+use kbf_updater::root::test_hook::RECORD_DIR_FILE;
 use kbf_updater::root::{Config, Parts, RootPart};
+use update_hook::Verdict;
 use update_rights::{EtcAccounts, Finished, Spawner, SystemdRun};
 
 /// The hook of the fake service.
@@ -272,7 +275,6 @@ impl World {
              [hook]\n\
              {hook}\
              address_families = [\"AF_UNIX\", \"AF_NETLINK\"]\n\
-             environment = {{ HOOK_RECORD_DIR = \"{state}\" }}\n\
              [hook.timeout_secs]\n\
              prepare = 600\ncutover = 300\nverify = 1000\nrollback = 600\ncleanup = 1300\n",
             state = self.hook_dir(service).display(),
@@ -313,6 +315,12 @@ impl World {
         dir(&tree, 0o755);
         fs::copy(HOOK, tree.join("hook")).unwrap();
         fs::set_permissions(tree.join("hook"), fs::Permissions::from_mode(0o755)).unwrap();
+        // The hook's record directory, which it reads beside itself.
+        put(
+            &tree.join(RECORD_DIR_FILE),
+            self.hook_dir(service).display().to_string().as_bytes(),
+            0o644,
+        );
         if let Some(text) = declaration {
             dir(&tree.join("updater.d"), 0o755);
             put(
@@ -382,4 +390,47 @@ impl Drop for World {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
     }
+}
+
+/// The verdict of an update that succeeded with no promotion pending.
+pub const SUCCEEDED: Verdict = Verdict::Succeeded {
+    promotion_pending: false,
+};
+
+/// The verdict an answer carries; a test fails when it carries none.
+pub fn verdict(answer: &Answer) -> Verdict {
+    answer
+        .verdict
+        .clone()
+        .unwrap_or_else(|| panic!("no verdict: {answer:?}"))
+}
+
+/// The record says `cutover` is about to start: the gate kills the root part once that is durable.
+pub fn killed_before_cutover(world: &World) {
+    let record = world.path("state/svc/step-record.json");
+    let gate = move |point: CrashPoint| {
+        let pending_cutover = fs::read(&record)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .is_some_and(|rec| rec["step"] == "cutover" && rec["state"]["state"] == "pending");
+        matches!(point, CrashPoint::AfterWrite(_)) && pending_cutover
+    };
+    let killed = world.root_part_gated(Arc::new(gate)).update("svc", "2.0.0");
+    assert_eq!(killed.token(), Some("runner"), "{killed:?}");
+    assert_eq!(world.record("svc")["step"], "cutover");
+    assert_eq!(world.record("svc")["state"]["state"], "pending");
+}
+
+/// A world whose update of `svc` from 1.0.0 to 2.0.0 was cut off with its `cutover` pending.
+pub fn pending_cutover_world(name: &str) -> World {
+    let world = World::new(name);
+    world.declare("svc", &world.tierstore_shaped());
+    world.stage("svc", "1.0.0", None);
+    world.stage("svc", "2.0.0", None);
+    assert_eq!(
+        verdict(&world.root_part().update("svc", "1.0.0")),
+        SUCCEEDED
+    );
+    killed_before_cutover(&world);
+    world
 }

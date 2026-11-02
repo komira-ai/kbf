@@ -31,6 +31,10 @@ pub mod flags;
 pub mod launch;
 pub mod releases;
 pub mod socket;
+pub mod test_hook;
+
+#[cfg(test)]
+mod test_hook_tests;
 
 use std::collections::BTreeMap;
 use std::fs::{self, DirBuilder};
@@ -41,8 +45,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
-use kbf_step_runner::record::{CrashGate, Loaded as Stored, Record, RecordStore, State};
+use kbf_step_runner::record::{
+    CrashGate, Loaded as Stored, Record, RecordError, RecordStore, State,
+};
 use kbf_step_runner::register::{Registry, Server};
+use kbf_step_runner::runner::REASON_ARTIFACT_CHANGED;
 use kbf_step_runner::{
     Bounds, Clock, DeadMan, Finished, RunError, Staged, StepLauncher, StepRunner, SystemClock,
     UpdateOrder,
@@ -56,7 +63,7 @@ use update_rights::{
 
 use self::declare::{Decision, Place};
 use self::launch::{Grants, HookLauncher, SYSTEMCTL, Shared, declared};
-use self::releases::Releases;
+use self::releases::{Releases, SealError};
 use self::socket::{Answer, Request};
 
 /// Where the root part keeps and finds things.
@@ -198,21 +205,40 @@ fn order(
     })
 }
 
-/// The update an unfinished record holds, as it was begun: the releases are those its params
-/// file names and the digests those the record holds, so a tree changed since is found by the
-/// runner's check and halts.
-fn resumed(declared: &Declared, rec: &Record) -> Result<UpdateOrder, Refusal> {
+/// What an unfinished record resumes as.
+enum Resumed {
+    /// The update as it was begun.
+    Order(Box<UpdateOrder>),
+    /// A release it runs from is not the one that was verified, and why: nothing from it runs.
+    Changed(String),
+}
+
+/// The update an unfinished record holds, as it was begun: the releases its params file names,
+/// each sealed again and compared with the digest the record holds. A tree that changed since is
+/// [`Resumed::Changed`]; one that cannot be read now is refused, and the next start looks again.
+fn resumed(declared: &Declared, rec: &Record) -> Result<Resumed, Refusal> {
     let params = Params::read(&rec.params).map_err(|e| ("record", e.to_string()))?;
-    let staged = Staged {
-        dir: params.staged_release().unwrap_or_default(),
-        digest: rec.artifact_digest.clone(),
+    let seal = |tree: &Path, digest: &str| match releases::sealed_as(tree, digest) {
+        Ok(staged) => Ok(Ok(staged)),
+        Err(SealError::Changed(why)) => Ok(Err(why)),
+        Err(e @ SealError::Unreadable(_)) => Err(("artifact", e.to_string())),
     };
-    let previous = params
-        .previous_version()
-        .map(str::to_owned)
-        .zip(params.previous_release())
-        .zip(rec.previous_digest.clone())
-        .map(|((version, dir), digest)| (version, Staged { dir, digest }));
+    let staged_dir = params.staged_release().unwrap_or_default();
+    let staged = match seal(staged_dir.as_path(), rec.artifact_digest.as_str())? {
+        Ok(staged) => staged,
+        Err(why) => return Ok(Resumed::Changed(why)),
+    };
+    let previous = match (
+        params.previous_version(),
+        params.previous_release(),
+        rec.previous_digest.as_deref(),
+    ) {
+        (Some(version), Some(dir), Some(digest)) => match seal(dir.as_path(), digest)? {
+            Ok(staged) => Some((version.to_owned(), staged)),
+            Err(why) => return Ok(Resumed::Changed(why)),
+        },
+        _ => None,
+    };
     order(
         declared,
         &rec.target_version,
@@ -220,6 +246,27 @@ fn resumed(declared: &Declared, rec: &Record) -> Result<UpdateOrder, Refusal> {
         staged,
         previous,
     )
+    .map(|order| Resumed::Order(Box::new(order)))
+}
+
+/// Ends the update `rec` holds as the step runner ends one whose release changed after it was
+/// verified: a `Halt` with the reason `artifact_changed`, kept until an operator clears it.
+fn halt_changed(store: &RecordStore, rec: &Record, why: &str) -> Result<Finished, RecordError> {
+    eprintln!(
+        "kbf-updater root: {}: {why}; the update is halted",
+        rec.service
+    );
+    let finished = Finished {
+        verdict: Verdict::Halt,
+        reason: Some(REASON_ARTIFACT_CHANGED.to_owned()),
+    };
+    let mut halted = rec.clone();
+    halted.state = State::Finished {
+        verdict: finished.verdict.clone(),
+        reason: finished.reason.clone(),
+    };
+    store.save(&halted)?;
+    Ok(finished)
 }
 
 /// The generation of the step record in `dir`, `None` when there is none or it cannot be read:
@@ -605,10 +652,12 @@ impl RootPart {
                 State::Finished { verdict, reason } => Finished { verdict, reason },
                 _ => {
                     make_record_dir(&declared).map_err(|e| ("internal", text(e)))?;
-                    let finished = unit
-                        .runner
-                        .run(&resumed(&declared, &rec)?)
-                        .map_err(run_refusal)?;
+                    let finished = match resumed(&declared, &rec)? {
+                        Resumed::Order(order) => unit.runner.run(&order).map_err(run_refusal)?,
+                        Resumed::Changed(why) => {
+                            halt_changed(&store, &rec, &why).map_err(record)?
+                        }
+                    };
                     answer = Answer::finished(finished.clone());
                     finished
                 }
@@ -657,7 +706,7 @@ impl RootPart {
             &*self.parts.systemd_run,
             &declared,
             generation,
-            &current.staged.dir,
+            current.staged.dir(),
         )
         .map_err(|e| ("boot", e.to_string()))?;
         Ok(ran.map(|run| format!("{:?}", run.outcome).to_lowercase()))
@@ -670,14 +719,15 @@ impl RootPart {
     /// The socket's directory is not the trusted account's and closed to others, or the
     /// registrations kept on disk cannot be read.
     pub fn serve_registrations(&self, socket: &Path, gid: u32) -> Result<(), String> {
-        let registry =
-            Registry::load(&self.config.state, Arc::clone(&self.parts.clock)).map_err(text)?;
+        let grants = Arc::new(Grants(Arc::clone(&self.loaded)));
+        let registry = Registry::load(&self.config.state, Arc::clone(&self.parts.clock), &*grants)
+            .map_err(text)?;
         let server = Server::bind(
             socket,
             self.config.trusted_uid,
-            Some(gid),
+            gid,
             Arc::new(registry),
-            Arc::new(Grants(Arc::clone(&self.loaded))),
+            grants,
         )
         .map_err(text)?;
         let server = Arc::new(server);
@@ -792,6 +842,10 @@ fn serve(
         flag: Arc::new(AtomicBool::new(false)),
         socket: flags.socket.clone(),
     };
+    eprintln!(
+        "kbf-updater root: serving the agent at {}",
+        flags.socket.display()
+    );
     ready(stop.clone());
     for stream in listener.incoming() {
         if stop.flag.load(Ordering::Acquire) {

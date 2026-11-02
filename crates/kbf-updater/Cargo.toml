@@ -7,13 +7,6 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
-# A hook for the tests of the root part (tests/root_part.rs): it logs the step it is run for in
-# its record directory and exits as a file there says. Not shipped.
-[[bin]]
-name = "kbf-updater-test-hook"
-path = "tests/bin/test_hook.rs"
-test = false
-
 # The optional package that rolls a new kbf version over the hosts of a farm, one host at a
 # time, behind a local socket. This crate is the core: the API model, the host
 # inventory, the roll state machine over ports (safe-to-stop, install, health, clock) and
@@ -67,6 +60,12 @@ kbf-testkit.workspace = true
 [[bin]]
 name = "kbf-updater-hook-fake"
 path = "src/bin/kbf-updater-hook-fake.rs"
+
+# The hook of a fake service the tests of the root part declare (`root::test_hook`): it logs the
+# step it is run for in its record directory and exits as a file there says. Not shipped.
+[[bin]]
+name = "kbf-updater-test-hook"
+path = "src/bin/kbf-updater-test-hook.rs"
 
 [lints]
 workspace = true

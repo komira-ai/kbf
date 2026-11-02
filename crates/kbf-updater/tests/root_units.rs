@@ -257,7 +257,18 @@ fn a_release_is_found_only_by_a_version_and_a_trusted_seal() {
     let releases = Releases::new(&world.path("releases"), my_uid());
     let found = releases.staged("svc", "1.0.0").unwrap();
     assert_eq!(found.version, "1.0.0");
-    assert_eq!(found.staged.dir, world.path("releases/svc/1.0.0"));
+    assert_eq!(
+        found.staged.dir(),
+        world.path("releases/svc/1.0.0").as_path()
+    );
+    // A tree changed after its seal is not the release that was verified.
+    put(&world.path("releases/svc/1.0.0/extra"), b"x", 0o644);
+    let changed = releases.staged("svc", "1.0.0").unwrap_err();
+    assert!(
+        changed.contains("changed after it was verified"),
+        "{changed}"
+    );
+    fs::remove_file(world.path("releases/svc/1.0.0/extra")).unwrap();
     assert_eq!(found.artifact_digest, "ab".repeat(32));
     assert!(releases.staged("svc", "../svc/1.0.0").is_err());
     assert!(releases.staged("svc", "9.9.9").is_err());
