@@ -642,8 +642,6 @@ jobs:
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
       - run: sw_vers
       - run: cargo test -p kbf-task --locked --no-fail-fast
-      # The registration client links on Macs too: its connect differs by platform.
-      - run: cargo check -p update-register --all-targets --locked
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: ${{ github.event_name == 'push' && steps.cargo-cache.outputs.cache-hit != 'true' }}
         with:

@@ -4,9 +4,7 @@
 
 use std::cell::Cell;
 use std::io::{BufRead, BufReader, Read, Write};
-#[cfg(target_os = "linux")]
-use std::os::unix::net::UnixListener;
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -631,12 +629,46 @@ fn a_listener_whose_backlog_is_full_is_given_up_on() {
     assert_eq!(more.kind(), std::io::ErrorKind::WouldBlock);
 }
 
+/// Elsewhere (macOS) the kernel refuses a connection to a full backlog rather than wait for room
+/// in it, so the connect, which is `std`'s there, does not wait: the call is `Error::Connect`
+/// naming the path, with the refusal, at once and not after the deadline. The backlog is filled by
+/// connecting until the kernel refuses (`std` asks for a backlog of 128, which the kernel may
+/// stretch).
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn a_listener_whose_backlog_is_full_is_refused_at_once() {
+    let dir = SocketDir::new();
+    let sock = dir.0.join("register.sock");
+    let _listener = UnixListener::bind(&sock).unwrap();
+    let mut waiting = Vec::new();
+    let refused = loop {
+        match UnixStream::connect(&sock) {
+            Ok(stream) => waiting.push(stream),
+            Err(e) => break e,
+        }
+        assert!(waiting.len() < 1024, "the backlog never filled");
+    };
+    assert_eq!(
+        refused.kind(),
+        std::io::ErrorKind::ConnectionRefused,
+        "{refused}"
+    );
+
+    let deadline = Duration::from_secs(ANSWER_DEADLINE_SECS);
+    match register_within(&sock, "svc", "1.0.0", None, deadline, &Instant::now) {
+        Err(Error::Connect { path, source }) => {
+            assert_eq!(path, sock);
+            assert_eq!(source.kind(), std::io::ErrorKind::ConnectionRefused);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
 /// What `connect` takes of the deadline is not given again to what follows: the clock leaves
 /// time for the connect, which the listener takes (its backlog has room, so no accept is needed),
 /// and then reads the deadline. The write is not made and the call is `NoAnswer`; the peer the
 /// listener accepts afterwards got no byte. A client that started the deadline after the connect
 /// would have sent the line.
-#[cfg(target_os = "linux")]
 #[test]
 fn the_deadline_left_after_the_connect_is_all_that_follows_gets() {
     let dir = SocketDir::new();
@@ -662,7 +694,6 @@ fn the_deadline_left_after_the_connect_is_all_that_follows_gets() {
 
 /// A socket file that no one listens on any more (the updater stopped and left it) is a connect
 /// error naming the path, with the kernel's refusal, as `std`'s connect gave: not `NoAnswer`.
-#[cfg(target_os = "linux")]
 #[test]
 fn a_socket_left_by_a_listener_that_is_gone_is_refused() {
     let dir = SocketDir::new();
@@ -682,10 +713,8 @@ fn a_socket_left_by_a_listener_that_is_gone_is_refused() {
 /// passes or panics. It is what `kbf_testkit::dir::TestDir` gives, which this crate cannot use
 /// (it may depend on no other crate of this workspace). The name holds the process id and a
 /// count, so no live process holds it; one a dead process with the same id left is removed first.
-#[cfg(target_os = "linux")]
 struct SocketDir(PathBuf);
 
-#[cfg(target_os = "linux")]
 impl SocketDir {
     fn new() -> Self {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -698,7 +727,6 @@ impl SocketDir {
     }
 }
 
-#[cfg(target_os = "linux")]
 impl Drop for SocketDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
