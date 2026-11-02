@@ -1,0 +1,32 @@
+# kbf-mdm-cert.service: obtain or renew the MDM's ACME certificate with lego over
+# DNS-01, rendered by `kbf-deploy mdm tls`. Edit the template. Run twice a day by
+# kbf-mdm-cert.timer, and once by `mdm tls --apply` when no certificate is there
+# yet. The DNS provider's API key comes from EnvironmentFile (a 0600 root file),
+# never argv.
+[Unit]
+Description=kbf-mdm TLS certificate (ACME, DNS-01)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=@USER@
+Group=@USER@
+Slice=kbf-mdm.slice
+EnvironmentFile=@ETC@/dns.env
+ExecStart=@BIN@/lego run --accept-tos --email @ACME_EMAIL@ --server @ACME_SERVER@ --path @STATE@/lego --key-type ec256 --dns @DNS_PROVIDER@ --domains @DNS_NAME@ --dns.resolvers @DNS_RESOLVERS@ --dns.propagation.wait @PROPAGATION_WAIT@
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ReadWritePaths=@STATE@/lego
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX

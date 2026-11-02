@@ -62,6 +62,9 @@ http-body-util = "0.1.5"
 # HTTP-date text of `Date` and `Last-Modified` (tierstore-bench's fault proxy). Already in the
 # tree through hyper.
 httpdate = "1.0.3"
+# The kernel's random source behind the MDM host layer's secrets (mdm-host); already in the
+# tree through ring.
+getrandom = "0.2.17"
 # `wait4` and `kill` for a measured child process (kbf-daemon's `usage` module); the
 # standard library reaps children without returning their resource usage.
 libc = "0.2.190"
@@ -141,7 +144,7 @@ roxmltree = "0.21.1"
 # The MDM gate's mutual-TLS listener, on the ring provider tonic's `tls-ring` uses too.
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
 # The host's trusted roots for kbf-deploy's HTTPS downloads and checks (`mdm fetch`,
-# `mdm verify`) and `cargo xtask fetch`'s.
+# `mdm verify`), mdm-host's `fetch` and `cargo xtask fetch`'s.
 rustls-native-certs = "0.8.4"
 # zstd for the .zst downloads `cargo xtask fetch` unpacks; pure Rust, no C zstd.
 ruzstd = "0.9.1"
@@ -288,6 +291,10 @@ update-hook = { path = "crates/update-hook" }
 # The declaration loader, the widening comparer, the approval record and the transient-unit launcher
 # of the host updater; depends on update-hook alone (kbf-integration-test keeps it so).
 update-rights = { path = "crates/update-rights" }
+# The MDM host layer: the pure renderer, the host-step planner and the `mdm-host` binary. They link
+# no other workspace crate, and the farm links none of them (kbf-integration-test's `mdm_layering`).
+host-step = { path = "crates/host-step" }
+mdm-core = { path = "crates/mdm-core" }
 # The CI verbs (`cargo xtask`); kbf-integration-test reads the interpreter budget with its parser.
 xtask = { path = "crates/xtask" }
 

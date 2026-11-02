@@ -1,0 +1,42 @@
+# js-mdm-nanohub.service: NanoHUB (NanoMDM + KMFDDM + NanoCMD in one process),
+# rendered by `js-mdm install`. Edit the template.
+#
+# Listens on loopback only; the Macs reach /mdm through js-mdm-proxy (TLS on
+# the LAN address). Its API (/api/v1/, one all-powerful key) is NOT proxied:
+# only processes on this box reach it. The key comes from EnvironmentFile (a
+# 0600 root file systemd reads before dropping to the service user), as
+# NANOHUB_API_KEY, never from argv. -ca is the SCEP CA: NanoHUB accepts a
+# device whose identity certificate (Mdm-Signature, SignMessage=true in the
+# enrollment profile) chains to it.
+[Unit]
+Description=js-mdm NanoHUB (loopback only)
+After=network-online.target js-mdm-scep.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=js-mdm
+Group=js-mdm
+Slice=js-mdm.slice
+EnvironmentFile=/etc/js-mdm/nanohub.env
+ExecStart=/opt/js-mdm/bin/nanohub -listen 127.0.0.1:9004 -storage file -storage-dsn /var/lib/js-mdm/nanohub -ca /var/lib/js-mdm/scep/depot/ca.pem
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ReadWritePaths=/var/lib/js-mdm/nanohub
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target
