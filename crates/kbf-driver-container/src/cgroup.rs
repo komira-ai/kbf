@@ -117,6 +117,14 @@ impl SwapKill {
             .unwrap_or(u64::MAX);
         share.max(self.floor_bytes)
     }
+
+    /// The watch of a new lease that booked `memory_bytes`: capped at the `memory.max`
+    /// that booking gets ([`memory_max`]) and killed past [`SwapKill::threshold`] of
+    /// its own swap. `None` for a lease that booked no memory: it has no cap, and is
+    /// never watched.
+    pub(crate) fn watch(&self, memory_bytes: u64) -> Option<SwapWatch> {
+        memory_max(memory_bytes).map(|cap| SwapWatch::new(self.threshold(memory_bytes), cap))
+    }
 }
 
 /// A lease holds "about its cap" in RAM when `memory.current` is within this fraction
@@ -213,6 +221,16 @@ impl SwapWatch {
         self.last.swap - self.not_own
     }
 
+    /// The lease's `memory.max`, in bytes.
+    pub(crate) fn cap(&self) -> u64 {
+        self.cap
+    }
+
+    /// The swap of its own the lease may hold at its cap, in bytes.
+    pub(crate) fn threshold(&self) -> u64 {
+        self.threshold
+    }
+
     /// Takes one read of the lease and returns the sample that kills it, with its own
     /// share of swap then ([`SwapWatch::kills`]). A read that failed is skipped and
     /// changes nothing: the next sample is compared with the last one read, and a
@@ -224,22 +242,21 @@ impl SwapWatch {
     }
 }
 
-/// Returns the sample at which the lease in `cgroup`, capped at `cap`, pressed its cap
-/// into swap past `threshold` ([`SwapKill`]), with what of its swap it pushed there
-/// itself ([`SwapWatch::own`]); sampled every `every`. Never returns for a lease with
-/// no cap. A sample that cannot be read is skipped: the kernel's own OOM kill at the
-/// cap still ends such a lease once swap is full.
+/// Returns the sample at which the lease in `cgroup` pressed its cap into swap past its
+/// threshold ([`SwapKill`]), as `watch` ([`SwapKill::watch`], a new lease's) judges it,
+/// with what of its swap it pushed there itself ([`SwapWatch::own`]); sampled every
+/// `every`. Never returns for a lease with no watch (no cap). A sample that cannot be
+/// read is skipped: the kernel's own OOM kill at the cap still ends such a lease once
+/// swap is full.
 pub(crate) async fn presses_into_swap(
     cgroup: &LeaseCgroup,
-    cap: Option<u64>,
-    threshold: u64,
+    watch: Option<SwapWatch>,
     every: Duration,
 ) -> (Pressure, u64) {
-    let Some(cap) = cap else {
+    // The lease cgroup is new, so its `max` events and its swap count from 0.
+    let Some(mut watch) = watch else {
         return std::future::pending().await;
     };
-    // The lease cgroup is new, so its `max` events and its swap count from 0.
-    let mut watch = SwapWatch::new(threshold, cap);
     loop {
         tokio::time::sleep(every).await;
         // Three file reads that can wait on the kernel: not on an async worker.

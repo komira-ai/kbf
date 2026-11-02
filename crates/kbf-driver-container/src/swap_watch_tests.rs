@@ -172,7 +172,7 @@ fn a_reclaim_at_the_cap_that_outlasts_its_max_event_is_the_leases_own() {
     const EDGE: u64 = CAP - CAP / 8;
     const LOW: u64 = CAP / 4;
     type Sample = (u64, u64, u64);
-    let rows: [(&str, &[Sample], Option<usize>, u64); 10] = [
+    let rows: [(&str, &[Sample], Option<usize>, u64); 16] = [
         (
             "timed-out run: max 1 while swap climbs across two samples, at the cap",
             &[
@@ -271,6 +271,65 @@ fn a_reclaim_at_the_cap_that_outlasts_its_max_event_is_the_leases_own() {
             None,
             MIB,
         ),
+        (
+            "an event, swap flat, then a rise at the cap: the credit is spent",
+            &[(0, AT, 0), (1, AT, MIB), (1, AT, MIB), (1, AT, 439 * MIB)],
+            None,
+            MIB,
+        ),
+        (
+            "an event, swap falling, then a rise at the cap: the credit is spent",
+            &[
+                (0, AT, 0),
+                (1, AT, 10 * MIB),
+                (1, AT, 5 * MIB),
+                (1, AT, 439 * MIB),
+            ],
+            None,
+            5 * MIB,
+        ),
+        (
+            "an event, a flat sample below the cap, then back at the cap and a rise",
+            &[(0, AT, 0), (1, AT, MIB), (1, LOW, MIB), (1, AT, 439 * MIB)],
+            None,
+            MIB,
+        ),
+        (
+            "an event, a host rise below the cap, then back at the cap and a rise",
+            &[
+                (0, AT, 0),
+                (1, AT, MIB),
+                (1, LOW, 100 * MIB),
+                (1, AT, 439 * MIB),
+            ],
+            None,
+            MIB,
+        ),
+        (
+            "events with swap flat renew the credit for the rise after them",
+            &[
+                (0, AT, 0),
+                (5, AT, 10 * MIB),
+                (9, AT, 10 * MIB),
+                (14, AT, 10 * MIB),
+                (14, AT, 439 * MIB),
+            ],
+            Some(4),
+            439 * MIB,
+        ),
+        (
+            "a new event renews the credit after an earlier one was spent",
+            &[
+                (0, AT, 0),
+                (1, AT, MIB),
+                (1, AT, MIB),
+                (1, AT, 2 * MIB),
+                (2, AT, 2 * MIB),
+                (2, AT, 439 * MIB),
+            ],
+            Some(5),
+            438 * MIB,
+        ),
     ];
     for (row, samples, killed, own) in rows {
         let mut watch = SwapWatch::new(128 * MIB, CAP);
@@ -309,4 +368,62 @@ fn a_failed_read_between_the_max_event_and_the_rise_keeps_the_event_credit() {
         );
         assert_eq!(watch.own(), own, "RAM {current}");
     }
+}
+
+/// Catches "about its cap" judged against a cap other than the lease's own, or its
+/// edge rounded wrong for a cap not divisible by eight (`cap * 7 / 8` puts it a byte
+/// low). For leases of three bookings, a rise after an event with RAM at the least
+/// within an eighth of that lease's cap is its own; a byte less, it is the host's.
+#[test]
+fn about_its_cap_is_within_an_eighth_of_each_leases_own_cap() {
+    // (booking, the cap it gets, the least RAM within an eighth of that cap)
+    for (booking, cap, edge) in [
+        (16 * MIB, 562_036_736, 491_782_144),
+        (1_000_000_001, 2_036_870_913, 1_782_262_049),
+        (64 << 30, 103_616_086_016, 90_664_075_264),
+    ] {
+        assert_eq!(memory_max(booking), Some(cap));
+        for (current, own) in [(edge, 439 * MIB), (edge - 1, MIB)] {
+            let mut watch = SwapWatch::new(128 * MIB, cap);
+            let event = Pressure {
+                max: 1,
+                current: cap,
+                swap: MIB,
+            };
+            assert!(!watch.kills(event));
+            let rise = Pressure {
+                max: 1,
+                current,
+                swap: 439 * MIB,
+            };
+            let killed = watch.kills(rise);
+            assert_eq!(
+                (killed, watch.own()),
+                (own > MIB, own),
+                "booking {booking}, RAM {current}"
+            );
+        }
+    }
+}
+
+/// Catches the watch the runtime builds for a lease ([`SwapKill::watch`]) capped at
+/// anything but the `memory.max` its booking gets, or killed past another threshold.
+/// The same samples (an event with 1000 MiB in RAM, then a 590 MiB rise in swap) are
+/// the lease's own for a 400 MiB booking (cap 1112 MiB: within an eighth of it) and
+/// the host's for a 600 MiB booking (cap 1412 MiB). A lease that booked no memory has
+/// no watch.
+#[test]
+fn a_leases_watch_is_capped_at_the_memory_max_its_booking_gets() {
+    let ram = 1000 * MIB;
+    let samples = [(0, ram, 0), (1, ram, 10 * MIB), (1, ram, 600 * MIB)];
+    for (booking, killed, own) in [(400 * MIB, Some(2), 600 * MIB), (600 * MIB, None, 10 * MIB)] {
+        let mut watch = SwapKill::DEFAULT.watch(booking).expect("booked memory");
+        assert_eq!(Some(watch.cap()), memory_max(booking));
+        assert_eq!(watch.threshold(), SwapKill::DEFAULT.threshold(booking));
+        let at = samples
+            .iter()
+            .position(|&(max, current, swap)| watch.kills(Pressure { max, current, swap }));
+        assert_eq!((at, watch.own()), (killed, own), "booking {booking}");
+    }
+    assert_eq!(SwapKill::DEFAULT.watch(0), None);
 }
