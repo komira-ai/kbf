@@ -100,6 +100,10 @@ fn the_words_after_a_redirection_stay_in_the_command() {
         ["kbf", "cluster", "drain", "n", "--bad"]
     );
     assert_eq!(
+        words("kbf >out cluster drain n --bad"),
+        ["kbf", "cluster", "drain", "n", "--bad"]
+    );
+    assert_eq!(
         words("kbf cluster drain n >&out --bad"),
         ["kbf", "cluster", "drain", "n", "--bad"]
     );
@@ -212,6 +216,8 @@ fn what_cannot_be_read_is_an_error_naming_its_line() {
         "kbf cluster object-store status --token-file f >\"$(printf out)\" --misspelled",
         "kbf cluster drain \"$(echo n)\" --bad",
         "kbf cluster drain n --x \"a$(echo b)\"",
+        "kbf >out cluster object-store status --token-file f $(printf '') --misspelled",
+        "y; kbf cluster drain \"$(echo n)\" --bad",
     ] {
         assert_eq!(
             err(&format!("```\n{line}\n```\n")),

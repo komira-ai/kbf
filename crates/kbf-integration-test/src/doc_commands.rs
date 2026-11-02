@@ -380,45 +380,49 @@ fn is_kbf_cluster(program: &str, verb: &str) -> bool {
     program.rsplit('/').next() == Some("kbf") && verb == "cluster"
 }
 
-/// Whether the command `out` ends in (the words since its last control operator,
-/// redirection targets among them) is a `kbf cluster` command.
-fn in_cluster_command(out: &[Token]) -> bool {
-    let words: Vec<&str> = out
-        .iter()
-        .rev()
-        .take_while(|t| **t != Token::Control)
-        .filter_map(|t| match t {
-            Token::Word(w) => Some(w.as_str()),
-            _ => None,
-        })
-        .collect();
-    words.windows(2).any(|w| is_kbf_cluster(w[1], w[0]))
-}
-
-/// The `kbf cluster` commands among `tokens`: each simple command (the words between two
-/// control operators, redirections and their targets taken out) from its `kbf` word on.
-fn commands(tokens: &[Token]) -> Vec<Vec<String>> {
-    let mut out = Vec::new();
-    let mut words: Vec<String> = Vec::new();
+/// The words of one simple command (`tokens` holds no control operator), with each
+/// redirection and its target taken out, as the shell runs it.
+fn simple_words(tokens: &[Token]) -> Vec<String> {
+    let mut words = Vec::new();
     let mut target = false;
-    for token in tokens.iter().chain([&Token::Control]) {
+    for token in tokens {
         match token {
-            Token::Redirect => target = true,
-            Token::Word(_) if target => target = false,
-            Token::Word(w) => words.push(w.clone()),
-            Token::Control => {
-                target = false;
-                let at = words.windows(2).position(|w| is_kbf_cluster(&w[0], &w[1]));
-                if let Some(at) = at {
-                    let mut argv = words.split_off(at);
-                    argv[0] = "kbf".to_owned();
-                    out.push(argv);
-                }
-                words.clear();
-            }
+            Token::Word(w) if !target => words.push(w.clone()),
+            Token::Word(_) => target = false,
+            // A redirection (a segment holds no control operator).
+            _ => target = true,
         }
     }
-    out
+    words
+}
+
+/// The `kbf cluster` command in one simple command's words, from its `kbf` word on.
+fn cluster_argv(mut words: Vec<String>) -> Option<Vec<String>> {
+    let at = words
+        .windows(2)
+        .position(|w| is_kbf_cluster(&w[0], &w[1]))?;
+    let mut argv = words.split_off(at);
+    argv[0] = "kbf".to_owned();
+    Some(argv)
+}
+
+/// Whether the command `out` ends in (the tokens since its last control operator, read
+/// as [`commands`] reads them) is a `kbf cluster` command.
+fn in_cluster_command(out: &[Token]) -> bool {
+    let from = out
+        .iter()
+        .rposition(|t| *t == Token::Control)
+        .map_or(0, |p| p + 1);
+    cluster_argv(simple_words(&out[from..])).is_some()
+}
+
+/// The `kbf cluster` commands among `tokens`: each simple command (the tokens between two
+/// control operators, read by [`simple_words`]) from its `kbf` word on.
+fn commands(tokens: &[Token]) -> Vec<Vec<String>> {
+    tokens
+        .split(|t| *t == Token::Control)
+        .filter_map(|segment| cluster_argv(simple_words(segment)))
+        .collect()
 }
 
 #[cfg(test)]

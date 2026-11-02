@@ -142,8 +142,8 @@ with the same walk as above: between steps 3 and 4,
   have `--frontend`: `registered` without it does not start;
 - look at **every** drop-in that applies to the unit, loaded or not: for each of its names
   (`systemctl show -P Names <unit>`, aliases included), `<name>.d/`, the template's
-  `<template>@.service.d/` for an instance, the prefix forms (`kbf-.service.d/`, ...) and
-  `service.d/`, under `/etc/systemd/system`, `/run/systemd/system`,
+  `<template>@.service.d/` for an instance, the prefix forms (`kbf-.service.d/`, ...; for an
+  instance also `kbf-@<instance>.service.d/` and `kbf-@.service.d/`) and `service.d/`, under `/etc/systemd/system`, `/run/systemd/system`,
   `/usr/local/lib/systemd/system`, `/usr/lib/systemd/system` and `/lib/systemd/system`, a
   directory reached through a symbolic link included; and every file `systemctl show -P
   DropInPaths <unit>` lists as loaded. A drop-in that names a store
@@ -396,16 +396,22 @@ remote_test() { # host, test args...
 }
 
 # The drop-in directory names systemd reads for one unit name: <name>.d, the template's
-# <template>@.service.d for an instance, each dash-prefix form (kbf-.service.d, ...) and
-# service.d.
+# <template>@.service.d for an instance, each dash-prefix form (kbf-.service.d, ...) and,
+# for an instance, its instance and template forms too (kbf-@<instance>.service.d,
+# kbf-@.service.d), and service.d. A name too many is only one more directory looked at.
 dropin_names() { # unit name
-  local base=${1%.service} prefix= part
+  local base=${1%.service} prefix= part instance=
+  [[ $base != *@* ]] || instance=${base#*@}
   echo "$1.d"
   [[ $base != *@?* ]] || echo "${base%%@*}@.service.d"
   IFS=- read -ra parts <<<"${base%%@*}"
   for part in "${parts[@]:0:${#parts[@]}-1}"; do
     prefix+="$part-"
     echo "$prefix.service.d"
+    if [[ $base == *@* ]]; then
+      echo "$prefix@.service.d"
+      [ -z "$instance" ] || echo "$prefix@$instance.service.d"
+    fi
   done
   echo service.d
 }
