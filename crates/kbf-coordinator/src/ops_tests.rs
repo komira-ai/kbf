@@ -5,6 +5,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use kbf_testkit::dir::TestDir;
+use kbf_updater::wire::{Outcome, Phase, Token, UpdateResult};
+use sha2::Digest as _;
 
 use crate::desired::StoreError;
 use crate::ops::{
@@ -21,6 +23,14 @@ fn entry(action: &str) -> AuditEntry {
     AuditEntry::new("operator", action)
 }
 
+/// The `last_update` of a halt of `target`.
+fn halt_report(target: &str) -> UpdateResult {
+    let mut report = UpdateResult::new(version(target), Outcome::Failed);
+    report.phase = Some(Phase::Halt);
+    report.reason = Token::parse("tainted");
+    report
+}
+
 fn exclude(state: &mut OpsState, node: &str) {
     state.excluded.push(Exclusion {
         service: "kbf".to_owned(),
@@ -29,7 +39,8 @@ fn exclude(state: &mut OpsState, node: &str) {
     });
 }
 
-/// A file holding one of everything the schema has.
+/// An ops file holding one of everything its schema has: the shape the release before the
+/// halt release reads.
 const FULL: &str = r#"{
   "schema": 1,
   "hosts": {
@@ -78,14 +89,60 @@ const FULL: &str = r#"{
 }
 "#;
 
-/// Pins: the schema of the file. Every field of every table reads back and writes out as
+/// The halts file beside [`FULL`]: one of everything its schema has.
+const FULL_HALTS: &str = r#"{
+  "services": {
+    "kbf": {
+      "halt": {
+        "node_id": "n3",
+        "target": "2.0",
+        "report": {
+          "target": "2.0",
+          "outcome": "failed",
+          "phase": "halt",
+          "reason": "tainted"
+        }
+      },
+      "halt_acked": [
+        {
+          "node_id": "n4",
+          "target": "1.5",
+          "report": {
+            "target": "1.5",
+            "outcome": "failed",
+            "phase": "halt",
+            "reason": "tainted"
+          }
+        }
+      ],
+      "halt_seen": [
+        {
+          "node_id": "n5",
+          "target": "2.0",
+          "report": {
+            "target": "2.0",
+            "outcome": "failed",
+            "phase": "halt",
+            "reason": "tainted"
+          }
+        }
+      ],
+      "halt_generation": 3
+    }
+  }
+}
+"#;
+
+/// Pins: the schema of the two files. Every field of every table reads back and writes out as
 /// shown here (the text a later change reads is this one), and the state the reader makes is
 /// the state a test builds by hand.
 #[test]
 fn the_file_reads_and_writes_every_field_of_the_schema() {
     let dir = dir("ops-full");
     let file = dir.path().join("ops.json");
+    let halts = dir.path().join("ops.json.halts");
     fs::write(&file, FULL).expect("written");
+    fs::write(&halts, FULL_HALTS).expect("written");
     let store = OpsStore::open(&file).expect("read");
     let mut want = OpsState::default();
     want.hosts.insert(
@@ -102,11 +159,19 @@ fn the_file_reads_and_writes_every_field_of_the_schema() {
                 node_id: "n3".to_owned(),
                 check: "tainted".to_owned(),
                 target: version("2.0"),
+                report: Some(halt_report("2.0")),
             }),
             halt_acked: vec![HaltAck {
                 node_id: "n4".to_owned(),
                 target: version("1.5"),
+                report: Some(halt_report("1.5")),
             }],
+            halt_seen: vec![HaltAck {
+                node_id: "n5".to_owned(),
+                target: version("2.0"),
+                report: Some(halt_report("2.0")),
+            }],
+            halt_generation: 3,
             last_good: Some(version("1.0")),
             bad: vec![version("1.9")],
             failure_acked: Vec::new(),
@@ -132,6 +197,16 @@ fn the_file_reads_and_writes_every_field_of_the_schema() {
     }
     assert_eq!(wrote["audit"][1]["seq"], 8);
     assert!(text.ends_with("}\n"), "{text:?}");
+    // The halts file names the ops file text it was written with.
+    let digest: String = sha2::Sha256::digest(text.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let want_halts = FULL_HALTS.replace(
+        "\n  }\n}\n",
+        &format!("\n  }},\n  \"ops\": \"{digest}\"\n}}\n"),
+    );
+    assert_eq!(fs::read_to_string(&halts).expect("read"), want_halts);
     assert_eq!(
         OpsStore::open(&file).expect("reread").state(),
         store.state()

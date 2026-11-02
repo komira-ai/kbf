@@ -45,7 +45,8 @@
 //! `ACTIONS_ID_TOKEN_REQUEST_TOKEN`, which the platform sets for a job with `id-token:
 //! write`) and never printed: it is masked in the log as soon as it is read.
 
-use std::io::Write;
+use std::fmt;
+use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
 use clap::Args as ClapArgs;
@@ -237,6 +238,15 @@ pub enum Error {
     Answer(String),
     #[error("blocked: a host failed its update to {0}; the table above says which role")]
     Blocked(String),
+    #[error(
+        "halted: {host} reported a failure no version can repair ({check}) while updating to {target}; this deploy of {version} cannot proceed, and an operator must clear the halt (`clear_halt` on /v1/operator) before anything is ordered again"
+    )]
+    Halted {
+        version: String,
+        target: String,
+        host: String,
+        check: String,
+    },
     #[error(
         "the coordinator's desired version is {0:?}, not this release's: another writer replaced it"
     )]
@@ -458,9 +468,26 @@ pub fn deploy_on(
             .build()
             .into()
     };
-    let client = Client {
+    let transport = UreqTransport {
         runner: agent(roots.runner),
         coordinator: agent(roots.coordinator),
+    };
+    deploy_with(plan, service, &transport, clock, out)
+}
+
+/// [`deploy_on`] over a transport it is given (the URL is not checked here).
+///
+/// # Errors
+/// [`Error`]: anything but `converged`.
+pub fn deploy_with(
+    plan: &Plan,
+    service: &TokenService,
+    transport: &dyn Transport,
+    clock: &Clock<'_>,
+    out: &mut impl Write,
+) -> Result<(), Error> {
+    let client = Client {
+        transport,
         plan,
         service,
         clock,
@@ -507,6 +534,7 @@ pub fn deploy_on(
                 match read.state.as_str() {
                     "converged" => return read.holds(&baseline, &plan.version),
                     "blocked" => return Err(Error::Blocked(plan.version.clone())),
+                    "halted" => return Err(read.halted(&plan.version)),
                     _ => {}
                 }
                 let now = (read.state, answer["roles"].clone());
@@ -581,9 +609,114 @@ fn log(out: &mut dyn Write, text: &str) -> Result<(), Error> {
         .map_err(|e| Error::Output(e.to_string()))
 }
 
-struct Client<'a> {
+/// Who a call goes to: each has its own trust roots.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Peer {
+    /// The runner's OIDC token service.
+    Runner,
+    /// The farm's update coordinator.
+    Coordinator,
+}
+
+impl fmt::Display for Peer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Runner => "the runner's token service",
+            Self::Coordinator => "the coordinator",
+        })
+    }
+}
+
+/// Why a call got no answer: no connection, the TLS handshake refused, a timeout.
+#[derive(Debug, thiserror::Error)]
+#[error("no answer from {peer}: {source}")]
+pub struct CallError {
+    /// Whom the call went to.
+    pub peer: Peer,
+    /// What failed.
+    #[source]
+    pub source: io::Error,
+}
+
+/// Why the body of an answer could not be read: cut off, too long, not text.
+#[derive(Debug, thiserror::Error)]
+#[error("the answer from {peer} could not be read: {source}")]
+pub struct BodyError {
+    /// Whom the call went to.
+    pub peer: Peer,
+    /// What failed.
+    #[source]
+    pub source: io::Error,
+}
+
+/// One HTTP call.
+#[derive(Clone, Copy, Debug)]
+pub struct Call<'a> {
+    pub peer: Peer,
+    /// `GET` or `POST`.
+    pub method: &'static str,
+    pub url: &'a str,
+    /// The whole `Authorization` header value.
+    pub authorization: &'a str,
+    /// The JSON text of a POST.
+    pub body: Option<&'a str>,
+}
+
+/// What a call got back.
+#[derive(Debug)]
+pub struct Answer {
+    pub status: u16,
+    /// The body text, or why it could not be read.
+    pub body: Result<String, BodyError>,
+}
+
+/// How calls reach the peers: HTTPS in production, memory in tests.
+pub trait Transport {
+    /// # Errors
+    /// Why the call did not get an answer.
+    fn call(&self, call: Call<'_>) -> Result<Answer, CallError>;
+}
+
+/// The production transport: one `ureq` agent per peer.
+struct UreqTransport {
     runner: ureq::Agent,
     coordinator: ureq::Agent,
+}
+
+impl Transport for UreqTransport {
+    fn call(&self, call: Call<'_>) -> Result<Answer, CallError> {
+        let peer = call.peer;
+        let agent = match call.peer {
+            Peer::Runner => &self.runner,
+            Peer::Coordinator => &self.coordinator,
+        };
+        let mut response = match call.body {
+            Some(body) => agent
+                .post(call.url)
+                .header("Authorization", call.authorization)
+                .content_type("application/json")
+                .send(body),
+            None => agent
+                .get(call.url)
+                .header("Authorization", call.authorization)
+                .call(),
+        }
+        .map_err(|e| CallError {
+            peer,
+            source: io::Error::other(e),
+        })?;
+        Ok(Answer {
+            status: response.status().as_u16(),
+            body: answer_text(&mut response).map_err(|e| BodyError {
+                peer,
+                source: io::Error::other(e),
+            }),
+        })
+    }
+}
+
+struct Client<'a> {
+    transport: &'a dyn Transport,
     plan: &'a Plan,
     service: &'a TokenService,
     clock: &'a Clock<'a>,
@@ -628,16 +761,20 @@ impl Client<'_> {
         url.push(if url.contains('?') { '&' } else { '?' });
         url.push_str("audience=");
         url.push_str(&percent_encode(&self.plan.audience));
-        let mut response = self
-            .runner
-            .get(&url)
-            .header("Authorization", format!("Bearer {}", self.service.key))
-            .call()
+        let authorization = format!("Bearer {}", self.service.key);
+        let answer = self
+            .transport
+            .call(Call {
+                peer: Peer::Runner,
+                method: "GET",
+                url: &url,
+                authorization: &authorization,
+                body: None,
+            })
             .map_err(|e| call(e.to_string()))?;
-        let status = response.status().as_u16();
-        let text = answer_text(&mut response).map_err(call)?;
-        if status != 200 {
-            return Err(call(format!("status {status}")));
+        let text = answer.body.map_err(|e| call(e.to_string()))?;
+        if answer.status != 200 {
+            return Err(call(format!("status {}", answer.status)));
         }
         let value: Value = serde_json::from_str(&text).map_err(|e| call(e.to_string()))?;
         let token = value["value"]
@@ -660,25 +797,22 @@ impl Client<'_> {
         let call = |why: String| Error::Call { what, why };
         let bearer = format!("Bearer {}", self.token(out)?);
         let url = format!("{}{path}", self.plan.url);
-        let mut response = match body {
-            Some(body) => self
-                .coordinator
-                .post(&url)
-                .header("Authorization", bearer)
-                .content_type("application/json")
-                .send(body.to_string().as_str()),
-            None => self
-                .coordinator
-                .get(&url)
-                .header("Authorization", bearer)
-                .call(),
-        }
-        .map_err(|e| call(e.to_string()))?;
-        let status = response.status().as_u16();
+        let body = body.map(Value::to_string);
+        let answer = self
+            .transport
+            .call(Call {
+                peer: Peer::Coordinator,
+                method: if body.is_some() { "POST" } else { "GET" },
+                url: &url,
+                authorization: &bearer,
+                body: body.as_deref(),
+            })
+            .map_err(|e| call(e.to_string()))?;
+        let status = answer.status;
         if matches!(status, 401 | 403) {
             return Err(Error::Refused { what, status });
         }
-        let text = answer_text(&mut response).map_err(call)?;
+        let text = answer.body.map_err(|e| call(e.to_string()))?;
         if status != 200 {
             return Err(call(format!("status {status}")));
         }
@@ -686,13 +820,12 @@ impl Client<'_> {
     }
 }
 
-fn answer_text(response: &mut ureq::http::Response<ureq::Body>) -> Result<String, String> {
+fn answer_text(response: &mut ureq::http::Response<ureq::Body>) -> Result<String, ureq::Error> {
     response
         .body_mut()
         .with_config()
         .limit(MAX_ANSWER)
         .read_to_string()
-        .map_err(|e| e.to_string())
 }
 
 /// `text` with everything but unreserved characters as `%XX`.
@@ -728,6 +861,14 @@ fn baseline_line(baseline: &[(String, u64)]) -> String {
     )
 }
 
+/// The host, the check and the target version of a halt; the target is `unknown` when the
+/// coordinator gives none.
+struct Halt {
+    host: String,
+    check: String,
+    target: String,
+}
+
 /// What the coordinator said, as far as the table needs it.
 struct Read {
     state: String,
@@ -736,6 +877,10 @@ struct Read {
     roles: Vec<(String, [u64; 4])>,
     /// The commit the coordinator says it was built from; none from an older build.
     commit: Option<String>,
+    /// The host, the check and the target version of the halt the coordinator names, when the
+    /// state is `halted`; a halt outlives changes of the desired version, so the target is the
+    /// halt's own.
+    halt: Option<Halt>,
 }
 
 impl Read {
@@ -763,7 +908,34 @@ impl Read {
             quiet: answer["quiet"].as_bool().unwrap_or(false),
             roles,
             commit: text("commit").map(|t| plain(&t)),
+            halt: answer["halt"]["node_id"]
+                .as_str()
+                .zip(answer["halt"]["check"].as_str())
+                .map(|(host, check)| Halt {
+                    host: plain(host),
+                    check: plain(check),
+                    target: answer["halt"]["target"]
+                        .as_str()
+                        .map_or_else(|| "unknown".to_owned(), plain),
+                }),
         })
+    }
+
+    /// The failure of a deploy whose coordinator says `halted`, naming the host, the check and
+    /// the version the host failed on (the halt's own target, not the deploy's) when it names
+    /// them.
+    fn halted(&self, version: &str) -> Error {
+        let unknown = || "unknown".to_owned();
+        let (host, check, target) = self.halt.as_ref().map_or_else(
+            || (unknown(), unknown(), unknown()),
+            |h| (h.host.clone(), h.check.clone(), h.target.clone()),
+        );
+        Error::Halted {
+            version: version.to_owned(),
+            target,
+            host,
+            check,
+        }
     }
 
     /// The hosts live now (not `down`) per role.
