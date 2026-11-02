@@ -499,10 +499,11 @@ jobs:
     needs: [plan, publish, rehearse, rehearse-agent]
     if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}
     runs-on: ubuntu-24.04
-    # The deploy's --deadline-min (60) and 30 minutes more: the build and the reads before the
-    # deadline starts, the proof and the restore after it. The release workflow lint holds the
-    # sum, so a job cut by this timeout still had time to set the farm back.
-    timeout-minutes: 90
+    # Every step has a timeout of its own, the deploy's at least its --deadline-min (60) and 15
+    # minutes more, and the job's is at least their sum: a step that hangs is cut by its own
+    # timeout, fails, and the restore still runs within its own. The release workflow lint
+    # holds all of it.
+    timeout-minutes: 170
     environment: release
     permissions:
       contents: read
@@ -512,15 +513,18 @@ jobs:
       BUCK2_SHA256: 828aba01bf80e8ba50ed27d89be86efe0246b3807c3d040e1ea7b4810a55fb78
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
           persist-credentials: false
       - run: rustup toolchain install
+        timeout-minutes: 10
       # The token service's address and key are in the environment of every step of this job, the
       # build's scripts included: the build runs from the locked dependency set, and the
       # coordinator's allow-list (this workflow, on main, for `release`) and the hosts' own
       # signature and hash checks bound what a token can do.
       - run: cargo build -p xtask --locked
+        timeout-minutes: 30
       # The version the farm is told to converge on is the one its hosts report in their
       # heartbeats, `<version>+g<12 hex digits of the commit>` (0.1.0+g0123456789ab), which the
       # coordinator compares with the desired version and a host's installer finds the commit in.
@@ -529,6 +533,7 @@ jobs:
       # release's SHA256SUMS lists and the release build of this commit; the job fails here if
       # the facts are missing or are not.
       - name: The version the hosts will report, from this release's version facts
+        timeout-minutes: 5
         id: farm-version
         env:
           GH_TOKEN: ${{ github.token }}
@@ -544,6 +549,7 @@ jobs:
       # the build still needs the network. With TS_CLIENT_ID unset, or neither address set (a fork,
       # a repository with no farm or no network), the step is skipped and the verbs run as before.
       - name: Join the farm's Tailscale network
+        timeout-minutes: 5
         if: ${{ vars.TS_CLIENT_ID != '' && (vars.KBF_COORDINATOR_URL != '' || vars.FARM_ADDRESS != '') }}
         uses: tailscale/github-action@d1b6cd204f8dceda5b3eaad7f1f767be390056cd # v4.2.0
         with:
@@ -554,6 +560,7 @@ jobs:
       # deadline is given here, not left to the verb's default, because the job's timeout must
       # leave room after it for the proof and the restore.
       - name: Set this release as the farm's desired version, and wait for the farm to converge
+        timeout-minutes: 75
         env:
           COORDINATOR_URL: ${{ vars.KBF_COORDINATOR_URL }}
           # The farm CA's certificate (public), which the coordinator's certificate chains to.
@@ -572,8 +579,10 @@ jobs:
       # address, instance, TLS and platform properties are the organisation variables FARM_*;
       # with FARM_ADDRESS unset the verb prints a notice and passes, as deploy-farm does.
       - name: Fetch buck2 (pinned version, checked by SHA-256)
+        timeout-minutes: 5
         run: cargo xtask fetch --url "https://github.com/facebook/buck2/releases/download/$BUCK2_VERSION/buck2-x86_64-unknown-linux-gnu.zst" --sha256 "$BUCK2_SHA256" --out "$RUNNER_TEMP/tools/buck2" --extract zst
       - name: Prove the farm with a remote-only Buck2 build
+        timeout-minutes: 20
         env:
           FARM_ADDRESS: ${{ vars.FARM_ADDRESS }}
           FARM_INSTANCE: ${{ vars.FARM_INSTANCE }}
@@ -589,6 +598,7 @@ jobs:
       # restores nothing, and the operator re-runs the failed jobs (docs/design/gamma-cicd.md,
       # G1). It must stay the job's last step.
       - name: Set the farm back to the version this release replaced, after a failed step
+        timeout-minutes: 10
         if: ${{ failure() }}
         env:
           URL: ${{ vars.KBF_COORDINATOR_URL }}

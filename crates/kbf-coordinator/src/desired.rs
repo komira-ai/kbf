@@ -210,7 +210,7 @@ pub enum DesiredError {
 
 /// A `POST /v1/desired` body, read ([`Desired::parse_write`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DesiredWrite {
+pub(crate) struct DesiredWrite {
     /// The service it sets.
     pub service: String,
     /// The state it sets.
@@ -286,7 +286,10 @@ impl Desired {
     /// # Errors
     /// [`DesiredError`], as [`Self::parse_request_for`], and [`DesiredError::Malformed`] for
     /// an `if_generation` that is not a number or a `write_id` that is not such a text.
-    pub fn parse_write(bytes: &[u8], services: &Services) -> Result<DesiredWrite, DesiredError> {
+    pub(crate) fn parse_write(
+        bytes: &[u8],
+        services: &Services,
+    ) -> Result<DesiredWrite, DesiredError> {
         let malformed = |e: serde_json::Error| DesiredError::Malformed(e.to_string());
         let mut fields: serde_json::Map<String, serde_json::Value> =
             serde_json::from_slice(bytes).map_err(malformed)?;
@@ -426,6 +429,15 @@ pub enum StoreError {
         /// What is wrong with it.
         source: DesiredError,
     },
+    /// The generation of a service's writes is at its largest and cannot be raised: no write
+    /// of it is accepted, so a write conditional on that generation can never pass twice.
+    #[error(
+        "the generation of the writes of {service} is at its largest: no further write of it is accepted"
+    )]
+    GenerationExhausted {
+        /// The service.
+        service: String,
+    },
 }
 
 /// The desired state of every service and the record of its writes ([`crate::writes`]).
@@ -449,7 +461,7 @@ pub struct DesiredStore {
 
 /// The one writer of a [`DesiredStore`]: while it is held no other write is accepted, so what
 /// it reads ([`Self::record`]) is what the write it makes ([`Self::set`]) replaces.
-pub struct Writer<'a> {
+pub(crate) struct Writer<'a> {
     store: &'a DesiredStore,
     _held: MutexGuard<'a, ()>,
 }
@@ -462,12 +474,15 @@ impl Writer<'_> {
     }
 
     /// Replaces the desired state of `service` (the others stay), made by the write
-    /// `write_id` (empty for none), and answers its record. The record file is written
-    /// first and the state file then, and memory only if both hold it: a stop between the
-    /// two leaves a record of another state, which the next start drops ([`crate::writes`]).
+    /// `write_id` (empty for none), and answers its record. The state is written whole to its
+    /// temporary file, the record file is written naming that file ([`writes::FileId`]), and the temporary
+    /// file is then renamed over the state file; memory changes only when all three are done.
+    /// A stop or a failure between them leaves a record file that names another state file
+    /// than the one in place, which the next start drops ([`crate::writes`]).
     ///
     /// # Errors
-    /// [`StoreError::Io`]: a file could not be replaced; the old state stands.
+    /// [`StoreError::Io`]: a file could not be replaced; the old state stands in memory.
+    /// [`StoreError::GenerationExhausted`]: nothing is written.
     pub fn set(
         &self,
         service: &str,
@@ -478,15 +493,19 @@ impl Writer<'_> {
             let current = self.store.lock();
             (current.desired.clone(), current.records.clone())
         };
-        let record = records.get(service).cloned().unwrap_or_default().after(
-            next.get(service),
-            &desired,
-            write_id,
-        );
+        let record = records
+            .get(service)
+            .cloned()
+            .unwrap_or_default()
+            .after(next.get(service), &desired, write_id)
+            .ok_or_else(|| StoreError::GenerationExhausted {
+                service: service.to_owned(),
+            })?;
         next.insert(service.to_owned(), desired);
         records.insert(service.to_owned(), record.clone());
-        writes::save(&self.store.records_path, &next, &records)?;
-        self.store.write(&next)?;
+        let staged = self.store.stage(&next)?;
+        writes::save(&self.store.records_path, staged.id, &next, &records)?;
+        staged.commit()?;
         *self.store.lock() = Current {
             desired: next,
             records,
@@ -526,7 +545,7 @@ impl DesiredStore {
             Err(e) => return Err(io_at(path)(e)),
         };
         let records_path = writes::path_of(path);
-        let records = writes::load(&records_path, &desired)?;
+        let records = writes::load(&records_path, path, &desired)?;
         Ok(Self {
             path: path.to_owned(),
             records_path,
@@ -560,7 +579,7 @@ impl DesiredStore {
 
     /// The writer, once every earlier writer is done.
     #[must_use]
-    pub fn writer(&self) -> Writer<'_> {
+    pub(crate) fn writer(&self) -> Writer<'_> {
         Writer {
             store: self,
             _held: self.writing.lock().unwrap_or_else(PoisonError::into_inner),
@@ -580,7 +599,8 @@ impl DesiredStore {
         self.current.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn write(&self, services: &BTreeMap<String, Desired>) -> Result<(), StoreError> {
+    /// The state file of `services`, written whole to its temporary file and not yet in place.
+    fn stage(&self, services: &BTreeMap<String, Desired>) -> Result<Staged, StoreError> {
         // Only `kbf` is the single state of earlier builds, which refuse the map form.
         let encoded = match services.iter().collect::<Vec<_>>().as_slice() {
             [(name, only)] if name.as_str() == KBF => serde_json::to_vec_pretty(only),
@@ -592,15 +612,33 @@ impl DesiredStore {
             .map_err(io::Error::from)
             .map_err(io_at(&self.path))?;
         text.push(b'\n');
-        write_whole(&self.path, &text)
+        stage(&self.path, &text)
     }
 }
 
-/// Replaces the file at `path` with `text`, whole: a temporary file beside it, created new
-/// and owner-only, fsynced, renamed over `path`, and the directory fsynced, so a crash leaves
-/// the old file or the new one. A leftover temporary file of a crash is replaced, never
-/// followed.
-pub(crate) fn write_whole(path: &Path, text: &[u8]) -> Result<(), StoreError> {
+/// A file written whole beside the file it replaces, fsynced, and not yet renamed over it.
+pub(crate) struct Staged {
+    temp: PathBuf,
+    path: PathBuf,
+    /// The id of the temporary file, which the file at `path` has once the rename is done.
+    pub(crate) id: writes::FileId,
+}
+
+impl Staged {
+    /// Renames the temporary file over the file it replaces and fsyncs the directory.
+    pub(crate) fn commit(self) -> Result<(), StoreError> {
+        fs::rename(&self.temp, &self.path).map_err(io_at(&self.path))?;
+        let dir = dir_of(&self.path);
+        File::open(dir)
+            .and_then(|d| d.sync_all())
+            .map_err(io_at(dir))
+    }
+}
+
+/// `text` written whole to a temporary file beside `path` (its name with `.new` added),
+/// created new and owner-only, and fsynced. A leftover temporary file of a crash is replaced,
+/// never followed.
+pub(crate) fn stage(path: &Path, text: &[u8]) -> Result<Staged, StoreError> {
     let mut temp = path.to_path_buf().into_os_string();
     temp.push(".new");
     let temp = PathBuf::from(temp);
@@ -616,9 +654,16 @@ pub(crate) fn write_whole(path: &Path, text: &[u8]) -> Result<(), StoreError> {
         .map_err(io_at(&temp))?;
     file.write_all(text).map_err(io_at(&temp))?;
     file.sync_all().map_err(io_at(&temp))?;
-    fs::rename(&temp, path).map_err(io_at(path))?;
-    let dir = dir_of(path);
-    File::open(dir)
-        .and_then(|d| d.sync_all())
-        .map_err(io_at(dir))
+    let id = writes::FileId::of(&file.metadata().map_err(io_at(&temp))?);
+    Ok(Staged {
+        temp,
+        path: path.to_owned(),
+        id,
+    })
+}
+
+/// Replaces the file at `path` with `text`, whole: [`stage`], then [`Staged::commit`], so a
+/// crash leaves the old file or the new one.
+pub(crate) fn write_whole(path: &Path, text: &[u8]) -> Result<(), StoreError> {
+    stage(path, text)?.commit()
 }

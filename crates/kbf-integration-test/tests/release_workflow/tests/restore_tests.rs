@@ -112,36 +112,80 @@ fn the_restore_is_given_the_deploys_address_version_and_the_run() {
 }
 
 #[test]
-fn the_job_timeout_leaves_room_for_the_proof_and_the_restore() {
-    // Catches: a deadline left to the verb's default (the timeout cannot be checked against
-    // it), and a job timeout that leaves less than the room the proof and the restore need
-    // after the deadline: a timeout one minute short, a deadline one minute long, and no
-    // timeout at all. A longer timeout is fine.
+fn every_step_is_bounded_and_the_job_timeout_covers_them_all() {
+    // Catches: a step that can hang until the job's timeout cuts the restore, and a budget
+    // that does not add up: a step with no timeout of its own (the proof, the build), a
+    // deadline left to the verb's default, a deploy step cut before its deadline ends it, a
+    // restore with less than its tries need, and a job timeout one minute below the sum of
+    // its steps'. A longer job timeout is fine.
+    let proof = "      - name: Prove the farm with a remote-only Buck2 build\n        timeout-minutes: 20\n";
+    red(
+        &plant(
+            "gamma",
+            proof,
+            "      - name: Prove the farm with a remote-only Buck2 build\n",
+        ),
+        "the step \"Prove the farm with a remote-only Buck2 build\" of `gamma` has no `timeout-minutes`",
+    );
+    red(
+        &plant(
+            "gamma",
+            "      - run: cargo build -p xtask --locked\n        timeout-minutes: 30\n",
+            "      - run: cargo build -p xtask --locked\n",
+        ),
+        "the step \"cargo build -p xtask --locked\" of `gamma` has no `timeout-minutes`",
+    );
     red(
         &plant("gamma", "--deadline-min 60 ", ""),
         "is not given `--deadline-min <minutes>`",
     );
-    let short = "is not at least the deploy's deadline (60) and 30 minutes more";
+    red(
+        &plant("gamma", "--deadline-min 60 ", "--deadline-min 61 "),
+        "less than its deadline (61) and 15 minutes more",
+    );
     red(
         &plant(
             "gamma",
-            "    timeout-minutes: 90\n",
-            "    timeout-minutes: 89\n",
+            "        timeout-minutes: 10\n        if: ${{ failure() }}\n",
+            "        timeout-minutes: 9\n        if: ${{ failure() }}\n",
         ),
-        short,
+        "the restore step's `timeout-minutes` is less than 10",
     );
     red(
-        &plant("gamma", "    timeout-minutes: 90\n", ""),
-        "(none) is not at least",
+        &plant(
+            "gamma",
+            "    timeout-minutes: 170\n",
+            "    timeout-minutes: 164\n",
+        ),
+        "the `timeout-minutes` of `gamma` (164) is less than the sum of its steps' (165)",
     );
     red(
-        &plant("gamma", "--deadline-min 60 ", "--deadline-min 61 "),
-        "is not at least the deploy's deadline (61) and 30 minutes more",
+        &plant("gamma", "    timeout-minutes: 170\n", ""),
+        "the `timeout-minutes` of `gamma` (none)",
     );
     let longer = plant(
         "gamma",
-        "    timeout-minutes: 90\n",
-        "    timeout-minutes: 120\n",
+        "    timeout-minutes: 170\n",
+        "    timeout-minutes: 240\n",
     );
     assert!(longer.is_empty(), "{longer:#?}");
+}
+
+#[test]
+fn the_restore_is_given_its_four_flags_and_nothing_else() {
+    // Catches: a restore that keeps every flag the lint looks for and adds one that sends it
+    // elsewhere or stops it: a `--service` of another service (it would set that service
+    // back), a flag given twice (a usage error, so nothing is restored), and a stray word.
+    let run = "--run \"$RUN\"";
+    for extra in [
+        "--service tierstore",
+        "--run \"$RUN\"",
+        "--url \"$URL\"",
+        "now",
+    ] {
+        red(
+            &plant("gamma", run, &format!("{run} {extra}")),
+            "`cargo xtask deploy-farm restore` is given [",
+        );
+    }
 }

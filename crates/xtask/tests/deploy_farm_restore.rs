@@ -7,133 +7,17 @@
 mod coordinator_fake;
 #[path = "support/deploy_fake.rs"]
 mod deploy_fake;
+#[path = "support/restore_steps.rs"]
+mod restore_steps;
 
 use std::time::Duration;
 
-use coordinator_fake::{BEFORE, Competing, Fake, Fate, RELEASE, Script, State, serve};
-use deploy_fake::{RUNNER_KEY, Time};
-use serde_json::{Value, json};
-use xtask::deploy_farm::restore::{self, Error, FORCED_ROLLBACK, restore_on};
-use xtask::deploy_farm::{
-    Command, Error as Deploy, Plan, Roots, Then, TokenService, deploy_on, run_command,
-};
-
-const RUN: &str = "4711-2";
-const WRITE_ID: &str = "restore-4711-2";
-
-fn token_service(base: &str) -> TokenService {
-    TokenService {
-        url: format!("{base}/token?api-version=2.0"),
-        key: RUNNER_KEY.to_owned(),
-    }
-}
-
-fn plan(fake: &Fake) -> Plan {
-    Plan {
-        url: fake.base.clone(),
-        service: "kbf".to_owned(),
-        audience: fake.base.clone(),
-        version: RELEASE.to_owned(),
-        min_up_storage: 1,
-        min_up_frontend: 1,
-        require_coordinator_current: false,
-        deadline: Duration::from_secs(30),
-        stall: Duration::from_secs(30),
-        every: Duration::from_secs(1),
-    }
-}
-
-/// The deploy step of the job, by `plan`.
-fn deploy_with(fake: &Fake, plan: &Plan) -> Result<(), Deploy> {
-    let ca = [fake.ca.clone()];
-    let roots = Roots {
-        runner: &ca,
-        coordinator: &ca,
-    };
-    let mut out = Vec::new();
-    deploy_on(
-        plan,
-        &token_service(&fake.base),
-        &roots,
-        &Time::default().clock(),
-        &mut out,
-    )
-}
-
-fn deploy(fake: &Fake) -> Result<(), Deploy> {
-    deploy_with(fake, &plan(fake))
-}
-
-fn args(base: &str) -> restore::Args {
-    restore::Args {
-        url: base.to_owned(),
-        version: RELEASE.to_owned(),
-        service: "kbf".to_owned(),
-        ca_pem: String::new(),
-        audience: None,
-        run: RUN.to_owned(),
-        every_secs: 1,
-    }
-}
-
-/// The restore step of the job: its result, its log, and what it slept.
-fn restore_timed(fake: &Fake, args: &restore::Args) -> (Result<String, Error>, String, Time) {
-    let ca = [fake.ca.clone()];
-    let roots = Roots {
-        runner: &ca,
-        coordinator: &ca,
-    };
-    let time = Time::default();
-    let mut out = Vec::new();
-    let result = restore_on(
-        args,
-        &token_service(&fake.base),
-        &roots,
-        &time.clock(),
-        &mut out,
-    );
-    (result, String::from_utf8(out).expect("utf8"), time)
-}
-
-fn restore(fake: &Fake) -> (Result<String, Error>, String) {
-    let (result, out, _) = restore_timed(fake, &args(&fake.base));
-    (result, out)
-}
-
-fn restored() -> Result<String, Error> {
-    Err(Error::Restored {
-        version: BEFORE.to_owned(),
-        release: RELEASE.to_owned(),
-    })
-}
-
-/// The body of the restore's POST of `BEFORE` and its minimums, on `generation`.
-fn restore_body(generation: u64) -> Value {
-    json!({
-        "version": BEFORE,
-        "min_up": {"storage": 2, "frontend": 1},
-        "if_generation": generation,
-        "write_id": WRITE_ID,
-    })
-}
-
-/// The farm set back to `BEFORE` by the restore, on top of `generation`.
-fn set_back(generation: u64) -> State {
-    State {
-        version: BEFORE.to_owned(),
-        min_up: json!({"storage": 2, "frontend": 1}),
-        generation: generation + 1,
-        replaced: Some((RELEASE.to_owned(), json!({"storage": 1, "frontend": 1}))),
-        write_id: WRITE_ID.to_owned(),
-    }
-}
-
-fn versions(fake: &Fake) -> Vec<String> {
-    fake.posts()
-        .iter()
-        .map(|p| p.body["version"].as_str().expect("version").to_owned())
-        .collect()
-}
+use coordinator_fake::{BEFORE, Competing, Fate, RELEASE, Script, State, serve};
+use deploy_fake::RUNNER_KEY;
+use restore_steps::*;
+use serde_json::json;
+use xtask::deploy_farm::restore::{self, BY_HAND, Error};
+use xtask::deploy_farm::{Command, Error as Deploy, Then, run_command};
 
 /// Catches: a red proof (the farm converged on the release, then `prove-farm` failed) that
 /// leaves the release desired. The restore makes exactly one POST after the release's own:
@@ -395,7 +279,7 @@ fn every_call_presents_a_fresh_token_and_a_replayed_one_is_refused() {
 
 /// Catches: a restore that sets something it should not. With another version desired (the
 /// release was superseded) it sets nothing and exits 0 saying why; with nothing replaced (a
-/// first deploy) it sets nothing and exits 1 naming the forced rollback.
+/// first deploy) it sets nothing and exits 1 naming the hand step.
 #[test]
 fn a_superseded_release_and_an_empty_replaced_make_no_post() {
     let newer = "3.0.0+g000000000003";
@@ -424,15 +308,15 @@ fn a_superseded_release_and_an_empty_replaced_make_no_post() {
     let (result, _) = restore(&first);
     let error = result.expect_err("nothing replaced");
     assert_eq!(error, Error::NothingReplaced(RELEASE.to_owned()));
-    assert!(error.to_string().contains(FORCED_ROLLBACK), "{error}");
+    assert!(error.to_string().contains(BY_HAND), "{error}");
     assert_eq!(versions(&first), [RELEASE]);
 }
 
 /// Catches: a restore against a coordinator older than the generation, which would post
 /// without a condition and could overwrite another writer. It makes no POST and exits 1
-/// naming the forced rollback.
+/// naming the hand step.
 #[test]
-fn a_coordinator_without_generation_makes_no_post_and_names_the_forced_rollback() {
+fn a_coordinator_without_generation_makes_no_post_and_names_the_hand_step() {
     let fake = serve(Script {
         state: Some(State::released()),
         generation_shown: false,
@@ -444,7 +328,7 @@ fn a_coordinator_without_generation_makes_no_post_and_names_the_forced_rollback(
     assert_eq!(
         error.to_string(),
         format!(
-            "the coordinator shows no generation (it is older than the restore): nothing was set back; to go back, use {FORCED_ROLLBACK}"
+            "the coordinator shows no generation (it is older than the restore): nothing was set back; to go back, use {BY_HAND}"
         )
     );
     assert!(fake.posts().is_empty());
@@ -452,10 +336,10 @@ fn a_coordinator_without_generation_makes_no_post_and_names_the_forced_rollback(
 
 /// Catches: a restore that could not be made reported as anything but a failure that names
 /// what to do. A 503 on every try (four tries, the pause between them on the virtual clock)
-/// and a 403 each exit 1 naming the version it could not set and the forced rollback, and the
+/// and a 403 each exit 1 naming the version it could not set and the hand step, and the
 /// release stays desired.
 #[test]
-fn a_503_on_every_try_and_a_403_each_exit_1_naming_replaced_and_the_forced_rollback() {
+fn a_503_on_every_try_and_a_403_each_exit_1_naming_replaced_and_the_hand_step() {
     for (fates, tries, why) in [
         (vec![Fate::Status(503); 4], 4, "status 503".to_owned()),
         (
@@ -480,7 +364,7 @@ fn a_503_on_every_try_and_a_403_each_exit_1_naming_replaced_and_the_forced_rollb
             text.starts_with(&format!("could not set the farm back to {BEFORE}: ")),
             "{text}"
         );
-        assert!(text.ends_with(FORCED_ROLLBACK), "{text}");
+        assert!(text.ends_with(BY_HAND), "{text}");
         assert_eq!(fake.posts().len(), tries);
         assert_eq!(time.slept.borrow().len(), tries - 1);
         assert_eq!(fake.state(), Some(State::released()));
@@ -520,61 +404,6 @@ fn the_restore_of_another_service_names_it() {
             .filter(|r| r.method == "GET")
             .all(|r| r.path == "/v1/convergence?service=tierstore")
     );
-}
-
-/// Catches: a restore that cannot tell what it read, or a refused POST whose read after it
-/// fails, taken for a restore done or for another writer: both exit 1 with the reason.
-#[test]
-fn an_unreadable_answer_and_a_failed_read_after_a_409_are_failures() {
-    let reads = |replaced: Value| {
-        let mut read = deploy_fake::farm("converged", 0, 0);
-        read["generation"] = json!(2);
-        read["replaced"] = replaced;
-        read["write_id"] = json!("");
-        read
-    };
-    let unreadable = deploy_fake::serve(deploy_fake::Script::after(
-        Ok(reads(json!({"min_up": {}}))),
-        vec![],
-    ));
-    let (result, _) = restore_scripted(&unreadable);
-    assert_eq!(
-        result,
-        Err(Error::Deploy(Deploy::Answer(
-            "no version in replaced".to_owned()
-        )))
-    );
-    assert!(unreadable.requests("/v1/desired").is_empty());
-
-    let mut script = deploy_fake::Script::after(
-        Ok(reads(json!({"version": BEFORE, "min_up": {"storage": 2}}))),
-        vec![Err(403)],
-    );
-    script.post = 409;
-    let refused = deploy_fake::serve(script);
-    let (result, _) = restore_scripted(&refused);
-    let error = result.expect_err("not set");
-    assert!(
-        matches!(&error, Error::Failed { version, why } if version == BEFORE && why.contains("403")),
-        "{error}"
-    );
-}
-
-fn restore_scripted(fake: &deploy_fake::Fake) -> (Result<String, Error>, String) {
-    let ca = [fake.ca.clone()];
-    let roots = Roots {
-        runner: &ca,
-        coordinator: &ca,
-    };
-    let mut out = Vec::new();
-    let result = restore_on(
-        &args(&fake.base),
-        &fake.service(),
-        &roots,
-        &Time::default().clock(),
-        &mut out,
-    );
-    (result, String::from_utf8(out).expect("utf8"))
 }
 
 /// Catches: the verb's entry points. `run_with` trusts the farm CA given as PEM (or the host

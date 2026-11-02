@@ -5,10 +5,14 @@
 //!   under exactly [`RESTORE_IF`] (it runs when an earlier step failed, and a green job skips
 //!   it). It is given the coordinator's address and CA from the same variables as the deploy,
 //!   the version the deploy was given, and the run id and attempt as its run ([`RESTORE_ENV`]),
-//!   through `env:` and nothing else.
-//! - **Time.** The deploy is given `--deadline-min` explicitly, and the job's `timeout-minutes`
-//!   is at least that deadline and [`ROOM_MIN`] more, so the timeout does not cut the job
-//!   before the proof and the restore.
+//!   through `env:` and nothing else, and its words are exactly those four flags, each once
+//!   ([`RESTORE_FLAGS`]): no `--service` that would restore another service, and no repeated
+//!   flag.
+//! - **Time.** Every step of the job has a `timeout-minutes` of its own; the deploy is given
+//!   `--deadline-min` explicitly and its step's timeout is at least that and
+//!   [`DEPLOY_ROOM_MIN`] more; the restore's is at least [`RESTORE_MIN`]; and the job's
+//!   `timeout-minutes` is at least the sum of the steps'. A step that hangs is then cut by its
+//!   own timeout and fails, the restore runs, and the job's timeout cannot cut the restore.
 
 use super::{GAMMA, NONCE, command, flag_is, lines, value, workflows};
 
@@ -18,10 +22,21 @@ pub const RESTORE_IF: &str = "${{ failure() }}";
 /// The verb of the restore step.
 const RESTORE: &str = "cargo xtask deploy-farm restore ";
 
-/// The minutes `gamma` needs beyond the deploy's deadline: the build of xtask, the fetch of
-/// the version and the reads before the deadline starts, and the proof and the restore after
-/// it.
-pub const ROOM_MIN: u64 = 30;
+/// The minutes the deploy step needs beyond its deadline: the reads and the POST before the
+/// deadline starts, each tried again on a 503, and the last read.
+pub const DEPLOY_ROOM_MIN: u64 = 15;
+
+/// The fewest minutes the restore step may have: two reads and a POST, each tried four times
+/// with a pause of 30 seconds, and a call bounded at 60 seconds.
+pub const RESTORE_MIN: u64 = 10;
+
+/// The words of the restore, exactly: each flag once, with its variable.
+pub const RESTORE_FLAGS: [(&str, &str); 4] = [
+    ("--url", "$URL"),
+    ("--ca-pem", "$CA_PEM"),
+    ("--version", "$RELEASE"),
+    ("--run", "$RUN"),
+];
 
 /// The `env:` of the restore step, exactly: the deploy's address and CA variables, the version
 /// the deploy was given, and the run.
@@ -82,18 +97,7 @@ pub fn rules(
     deploy: &[&str],
     out: &mut Vec<String>,
 ) -> Result<(), String> {
-    let deadline = value(deploy, "--deadline-min").and_then(|m| m.parse::<u64>().ok());
-    let timeout = workflows::job_scalar(release, GAMMA, "timeout-minutes")?;
-    match (deadline, timeout.as_deref().map(str::parse::<u64>)) {
-        (None, _) => out.push(
-            "`cargo xtask deploy-farm` is not given `--deadline-min <minutes>`: the job's timeout must leave room after the deadline for the proof and the restore".to_owned(),
-        ),
-        (Some(deadline), Some(Ok(timeout))) if timeout >= deadline + ROOM_MIN => {}
-        (Some(deadline), _) => out.push(format!(
-            "the `timeout-minutes` of `{GAMMA}` ({}) is not at least the deploy's deadline ({deadline}) and {ROOM_MIN} minutes more: the timeout would cut the proof or the restore",
-            timeout.as_deref().unwrap_or("none")
-        )),
-    }
+    time(release, steps, deploy, out)?;
     let at: Vec<usize> = (0..steps.len())
         .filter(|&i| runs_restore(&steps[i]))
         .collect();
@@ -131,10 +135,15 @@ pub fn rules(
         .map(|w| w.trim_matches('"'))
         .collect();
     let verb = RESTORE.trim_end();
-    flag_is(&words, verb, "--url", "$URL", out);
-    flag_is(&words, verb, "--ca-pem", "$CA_PEM", out);
-    flag_is(&words, verb, "--version", "$RELEASE", out);
-    flag_is(&words, verb, "--run", "$RUN", out);
+    for (flag, want) in RESTORE_FLAGS {
+        flag_is(&words, verb, flag, want, out);
+    }
+    let want: Vec<&str> = RESTORE_FLAGS.iter().flat_map(|(f, v)| [*f, *v]).collect();
+    if words != want {
+        out.push(format!(
+            "`{verb}` is given {words:?}, not exactly {want:?}: another flag (a `--service`, a repeated flag) would restore something else or nothing"
+        ));
+    }
     let mut given: Vec<(&str, &str)> = step
         .env
         .iter()
@@ -146,6 +155,66 @@ pub fn rules(
     if given != want {
         out.push(format!(
             "the step of `{GAMMA}` that runs `{verb}` is given {given:?}, not exactly {want:?}: the deploy's address, CA and version, and the run"
+        ));
+    }
+    Ok(())
+}
+
+/// The minutes of a step's or the job's `timeout-minutes`, if it is a whole number.
+fn minutes(text: Option<&str>) -> Option<u64> {
+    text.and_then(|t| t.parse().ok())
+}
+
+/// The time rules of the job (see the module's documentation).
+fn time(
+    release: &str,
+    steps: &[workflows::Step],
+    deploy: &[&str],
+    out: &mut Vec<String>,
+) -> Result<(), String> {
+    let mut sum = 0;
+    for step in steps {
+        let name = step
+            .name
+            .as_deref()
+            .or(step.uses.as_deref())
+            .or(step.run.as_deref());
+        match minutes(step.timeout_minutes.as_deref()) {
+            Some(n) if n > 0 => sum += n,
+            _ => out.push(format!(
+                "the step {:?} of `{GAMMA}` has no `timeout-minutes` of its own: if it hangs, the job's timeout would cut the restore",
+                name.unwrap_or("?")
+            )),
+        }
+    }
+    let step_of = |prefix: &str| {
+        steps
+            .iter()
+            .find(|s| lines(s).any(|l| l.starts_with(prefix)))
+            .and_then(|s| minutes(s.timeout_minutes.as_deref()))
+    };
+    match value(deploy, "--deadline-min").and_then(|m| m.parse::<u64>().ok()) {
+        None => out.push(
+            "`cargo xtask deploy-farm` is not given `--deadline-min <minutes>`: its step's timeout must leave room after the deadline".to_owned(),
+        ),
+        Some(deadline) => {
+            if step_of("cargo xtask deploy-farm --url ").is_some_and(|n| n < deadline + DEPLOY_ROOM_MIN) {
+                out.push(format!(
+                    "the deploy step's `timeout-minutes` is less than its deadline ({deadline}) and {DEPLOY_ROOM_MIN} minutes more: it would be cut before it ends by itself"
+                ));
+            }
+        }
+    }
+    if step_of(RESTORE).is_some_and(|n| n < RESTORE_MIN) {
+        out.push(format!(
+            "the restore step's `timeout-minutes` is less than {RESTORE_MIN}: it could be cut before its tries end"
+        ));
+    }
+    let job = workflows::job_scalar(release, GAMMA, "timeout-minutes")?;
+    if minutes(job.as_deref()).is_none_or(|n| n < sum) {
+        out.push(format!(
+            "the `timeout-minutes` of `{GAMMA}` ({}) is less than the sum of its steps' ({sum}): the job's timeout could cut the restore",
+            job.as_deref().unwrap_or("none")
         ));
     }
     Ok(())

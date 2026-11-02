@@ -720,15 +720,19 @@ number, makes the write conditional: when it is not the service's generation now
 visible ASCII characters. A malformed one is a 400. The answer of the POST is the state as stored
 followed by `generation`, `replaced` and `write_id`, and `GET /v1/convergence` (and so the status's
 `per_service.*.convergence`) shows them too. The record is kept in a file of its own beside the
-`--state-file`, its name with `.writes` added, written whole before the state file at each write,
-so the state file keeps the form earlier coordinators read and a downgrade still starts (the
-earlier build ignores the `.writes` file). Each entry names the state it describes: when the state
-file holds another state at a start (a stop between the two writes, or a write by an earlier
-build), the entry's `replaced` and `write_id` are dropped and its generation is raised by one. A
-`.writes` file that is not JSON of its shape stops the start; a key it does not know is skipped.
-An earlier build that changed the state and changed it back to the very state an entry names is
-not seen: after running an earlier coordinator, set the desired version once before relying on
-`replaced`.
+`--state-file`, its name with `.writes` added, so the state file keeps the form earlier
+coordinators read and a downgrade still starts (the earlier build ignores the `.writes` file). At
+each write the state is written whole to its temporary file, the `.writes` file is written naming
+that file (its inode and modification time) and the state each entry describes, and the temporary
+file is then renamed over the state file, which keeps both. Every replacement of the state file is
+another file (another inode, or a reused inode with the later time of its own write), so at a start
+the `.writes` file is trusted only when it names the state file in place and the state in it: after a
+stop between the two writes, or any write of the state file by an earlier coordinator (even one
+that changed the state and changed it back), the entries' `replaced` and `write_id` are dropped and
+their generations raised by one. A restore then finds nothing replaced and names the hand step. A
+generation that cannot be raised (it is at 2^64 - 1) refuses every write of that service, as a 500,
+and stops a start that would have to raise it. A `.writes` file that is not JSON of its shape stops
+the start; a key it does not know is skipped.
 
 `--ops-file` (default: the `--state-file` name with `.ops` added) holds what an operator decides, apart from CI's desired state: the hosts excluded from a service, the labels on a host, and a ring of the last 64 operator changes (it also holds the per-service marks: `halt`, `halt_acked`, `last_good`, `bad` and `failure_acked`; a coordinator from before the rollback release knows all of them but `failure_acked`, which is written only after CI sets by hand a version marked bad, and refuses a file that holds it as an unknown key, so that rolling back across that release means moving the file aside). The coordinator creates the file at the first change and replaces it whole (a temporary file beside it, fsync, rename, directory fsync), owner-only; with no file nothing is excluded or labelled and the coordinator behaves as before. The reader is strict: a key it does not know, or a `schema` newer than the build's, stops the start with the flag and the path in the message, so a coordinator rolled back below the build that wrote the file does not ignore what it holds. To start without the file anyway, move it aside on purpose. The directory must be writable by the coordinator. `GET /v1/status` shows the file's content as `ops` once anything has been changed (before that the key is absent).
 
@@ -769,9 +773,10 @@ Each accepted action is written to the file before it takes effect (a failed wri
    convergence fails the job; the release stays published whatever it says. Another failed read
    is reported and tried again, and counts as no change.
 
-The job gives `--deadline-min 60` explicitly, and its `timeout-minutes` (90) leaves 30 minutes
-beyond it for the build before the deploy and the proof and the restore after it; the release
-workflow lint holds that sum.
+The job gives `--deadline-min 60` explicitly. Every step of the job has a `timeout-minutes` of its
+own (the deploy's 75, the restore's 10), and the job's (170) is at least their sum: a step that
+hangs, the proof included, is cut by its own timeout and fails, and the restore still runs within
+its own. The release workflow lint holds each of these.
 
 When any earlier step of the `gamma` job failed (the deploy, or the proof after it), the job's
 last step, `cargo xtask deploy-farm restore --url ... --ca-pem ... --version <this release> --run
@@ -780,8 +785,9 @@ last step, `cargo xtask deploy-farm restore --url ... --ca-pem ... --version <th
 1. it reads `GET /v1/convergence`. When the desired version is not this release (another writer,
    a newer release or the coordinator's own rollback has it), it sets nothing, says so and exits
    0. When the coordinator shows no `generation` (a coordinator older than this), or no
-   `replaced` (the release was the farm's first), it sets nothing and exits 1 naming the forced
-   rollback;
+   `replaced` (the release was the farm's first), it sets nothing and exits 1 naming the hand
+   step (below). An answer whose fields are not of their types (no `desired`, a `generation` that
+   is no count, and so on) is an error, never read as "another version";
 2. it posts `replaced` (its version and minimums) to `/v1/desired` with `if_generation` set to
    the generation it read and `write_id` set to `restore-<run id>-<attempt>`, with a fresh token
    (a 503 is tried again, as for the deploy), prints what it set, and exits 1, so the run stays
@@ -790,10 +796,14 @@ last step, `cargo xtask deploy-farm restore --url ... --ca-pem ... --version <th
    POST that landed behind a lost answer, and the restore is done; any other write stands,
    nothing is restored, and it exits 1 naming the desired version and that write.
 
-Any other failure of the POST (a 503 on every try, a lost connection, a timeout) is followed by
-the same read, so a restore that landed with its answer lost is reported done. A POST that did
-not land, and a 401 or a 403, exit 1 naming the version it could not set and the forced
-rollback. The restore is an ordinary desired write, so it goes through every ordinary rule. A run
+Any other failure of the POST (a 503 on every try, a lost connection, a timeout, an answer it
+cannot read) is followed by the same read, so a restore that landed with its answer lost is
+reported done. A POST that did not land, and a 401 or a 403, exit 1 naming the version it could
+not set and the hand step; when the read after an unseen POST fails too, it exits 1 saying the
+outcome is not known and which `write_id` to look for. Versions and write ids are compared and
+posted exactly as the coordinator sent them; only the log shortens them. The hand step, until the
+forced rollback of the design is built, is re-running, from its run's page, the `gamma` job of the
+release the farm should run, which sets that release as desired. The restore is an ordinary desired write, so it goes through every ordinary rule. A run
 that is cancelled, or whose runner is lost, restores nothing; `GET /v1/convergence` still shows
 `replaced`, and re-running the failed jobs sets this release again (which keeps `replaced`) and
 then runs the restore.

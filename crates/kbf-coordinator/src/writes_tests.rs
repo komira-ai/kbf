@@ -178,3 +178,184 @@ fn a_write_without_an_id_raises_the_generation_and_clears_the_id() {
     );
     assert_eq!(store.read("other"), (None, Record::default()));
 }
+
+/// The state file at `path` replaced whole with `text` the way any build writes it: a new
+/// file renamed over it. A later write has a later time; the file's modification time is set
+/// to `at` seconds, which no write of this test's own has, so that the file is another file
+/// whether or not its inode is one freed and reused.
+fn rewrite(path: &std::path::Path, text: &str, at: u64) {
+    let temp = path.with_extension("other");
+    fs::write(&temp, text).expect("written");
+    fs::File::options()
+        .write(true)
+        .open(&temp)
+        .and_then(|f| f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(at)))
+        .expect("its time set");
+    fs::rename(&temp, path).expect("renamed");
+}
+
+/// Catches: a record trusted after an earlier build changed the state file and changed it
+/// back. The record says the farm went from 1.0 to 2.0; an earlier build sets 3.0 and then
+/// 2.0 again, so the state file holds the state the record names. The record is dropped all
+/// the same (its `replaced` would name 1.0, not 3.0) and its generation is raised, and the
+/// next write records what it replaced from the state in place.
+#[test]
+fn an_earlier_build_that_rewrites_the_state_back_drops_the_record() {
+    let dir = dir("writes-aba");
+    let path = dir.path().join("desired.json");
+    let store = DesiredStore::open(&path).expect("a store");
+    store.set(KBF, state("1.0", 1)).expect("set");
+    store
+        .writer()
+        .set(KBF, state("2.0", 1), "w".to_owned())
+        .expect("set");
+    drop(store);
+    let two = fs::read_to_string(&path).expect("the state file");
+    rewrite(&path, &two.replace("2.0", "3.0"), 1);
+    rewrite(&path, &two, 2);
+    let reopened = DesiredStore::open(&path).expect("reopened");
+    assert_eq!(
+        reopened.read(KBF),
+        (
+            Some(state("2.0", 1)),
+            Record {
+                generation: 3,
+                ..Record::default()
+            }
+        )
+    );
+    reopened.set(KBF, state("4.0", 1)).expect("set");
+    assert_eq!(reopened.read(KBF).1.replaced, replaced("2.0", 1));
+    let again = DesiredStore::open(&path).expect("reopened");
+    assert_eq!(
+        again.read(KBF).1.generation,
+        4,
+        "the record is trusted again"
+    );
+}
+
+/// Catches: a record trusted for a state file that never took its place. The record of a
+/// write is saved and the state file then cannot be renamed into place (a directory stands
+/// where it goes): the write fails and memory keeps the state and record before it. At the
+/// next start, on the state file as it was, the record of the failed write is dropped: its
+/// id is not shown and its generation is raised past every generation shown before, so a
+/// write conditional on one of them is refused. A write that completes both files is trusted
+/// after the next start.
+#[test]
+fn a_state_file_that_never_takes_its_place_leaves_no_record_trusted() {
+    let dir = dir("writes-uncommitted");
+    let path = dir.path().join("desired.json");
+    let store = DesiredStore::open(&path).expect("a store");
+    store.set(KBF, state("1.0", 1)).expect("set");
+    store
+        .writer()
+        .set(KBF, state("2.0", 1), "release".to_owned())
+        .expect("set");
+    let before = store.read(KBF);
+    let kept = dir.path().join("desired.json.kept");
+    fs::rename(&path, &kept).expect("the state file aside, its inode kept");
+    fs::create_dir_all(path.join("occupied")).expect("a directory in its place");
+    let failed = store
+        .writer()
+        .set(KBF, state("1.0", 1), "restore".to_owned());
+    assert!(matches!(failed, Err(StoreError::Io { .. })), "{failed:?}");
+    assert_eq!(store.read(KBF), before);
+    drop(store);
+
+    fs::remove_dir_all(&path).expect("the directory gone");
+    fs::rename(&kept, &path).expect("the state file back, as a crash leaves it");
+    let reopened = DesiredStore::open(&path).expect("reopened");
+    let (desired, record) = reopened.read(KBF);
+    assert_eq!(desired, Some(state("2.0", 1)));
+    assert_eq!(record.write_id, "", "the failed write's id is not shown");
+    assert_eq!(record.replaced, None);
+    assert!(record.generation > before.1.generation, "{record:?}");
+    assert_ne!(
+        reopened.writer().record(KBF).generation,
+        before.1.generation
+    );
+
+    let done = reopened
+        .writer()
+        .set(KBF, state("1.0", 1), "restore".to_owned())
+        .expect("set");
+    drop(reopened);
+    let trusted = DesiredStore::open(&path).expect("reopened");
+    assert_eq!(trusted.read(KBF), (Some(state("1.0", 1)), done));
+    assert_eq!(trusted.read(KBF).1.replaced, replaced("2.0", 1));
+}
+
+/// Catches: a generation that stops rising at its largest value, so that a write conditional
+/// on it would pass after another write. A record at `u64::MAX` refuses every write, the
+/// state and the files unchanged; and a record at `u64::MAX` that would have to be raised at
+/// the start, because the state file changed under it, stops the start.
+#[test]
+fn a_generation_at_its_largest_refuses_writes_and_a_raise_at_the_start() {
+    let dir = dir("writes-exhausted");
+    let path = dir.path().join("desired.json");
+    let store = DesiredStore::open(&path).expect("a store");
+    store.set(KBF, state("1.0", 1)).expect("set");
+    drop(store);
+    let records = path_of(&path);
+    let mut file: Value =
+        serde_json::from_slice(&fs::read(&records).expect("the record file")).expect("JSON");
+    file["services"][KBF]["generation"] = json!(u64::MAX);
+    fs::write(&records, file.to_string()).expect("written");
+
+    let store = DesiredStore::open(&path).expect("reopened");
+    assert_eq!(store.read(KBF).1.generation, u64::MAX);
+    let refused = store.writer().set(KBF, state("2.0", 1), "w".to_owned());
+    assert!(
+        matches!(&refused, Err(StoreError::GenerationExhausted { service }) if service == KBF),
+        "{refused:?}"
+    );
+    assert_eq!(store.read(KBF).0, Some(state("1.0", 1)));
+    assert_eq!(
+        Desired::parse(&fs::read(&path).expect("the state file")),
+        Ok(state("1.0", 1))
+    );
+    drop(store);
+
+    rewrite(
+        &path,
+        &fs::read_to_string(&path).expect("the state file"),
+        3,
+    );
+    let refused = DesiredStore::open(&path).expect_err("the start stops");
+    assert!(
+        matches!(&refused, StoreError::GenerationExhausted { service } if service == KBF),
+        "{refused}"
+    );
+}
+
+/// Catches: an entry trusted for the state file it names although it describes another state
+/// (a record file edited, or written by a build that described states otherwise): the entry
+/// is dropped and its generation raised, while the entry of the same file that does describe
+/// its state is kept.
+#[test]
+fn an_entry_of_the_same_file_that_describes_another_state_is_dropped() {
+    let dir = dir("writes-other-entry");
+    let path = dir.path().join("desired.json");
+    let store = DesiredStore::open(&path).expect("a store");
+    store.set(KBF, state("1.0", 1)).expect("set");
+    store
+        .writer()
+        .set(KBF, state("2.0", 1), "w".to_owned())
+        .expect("set");
+    drop(store);
+    let records = path_of(&path);
+    let mut file: Value =
+        serde_json::from_slice(&fs::read(&records).expect("the record file")).expect("JSON");
+    let kept = DesiredStore::open(&path).expect("reopened").read(KBF);
+    assert_eq!(kept.1.write_id, "w", "the file and its state match");
+    file["services"][KBF]["of"]["version"] = json!("9.0");
+    fs::write(&records, file.to_string()).expect("written");
+    let reopened = DesiredStore::open(&path).expect("reopened");
+    assert_eq!(
+        reopened.read(KBF).1,
+        Record {
+            generation: 3,
+            ..Record::default()
+        }
+    );
+}

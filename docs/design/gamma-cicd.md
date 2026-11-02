@@ -268,9 +268,14 @@ is the largest.
 restore is `crates/xtask/src/deploy_farm/restore.rs`, and the workflow rules are
 `crates/kbf-integration-test/tests/release_workflow/restore.rs`. The record of the writes is kept
 in a file beside the state file (its name with `.writes` added), so the state file keeps the form
-earlier builds read; the coordinator's own rollback is a write too, and raises the generation.
-"A green run makes no restore" is held by the workflow: the step runs under `if: ${{ failure() }}`
-only, which the release workflow lint pins.
+earlier builds read; it names the state file by its inode and modification time, so any rewrite of the state file it did
+not see (a stop between the two writes, an earlier build) drops it. The coordinator's own rollback
+is a write too, and raises the generation. "A green run makes no restore" is held by the
+workflow: the step runs under `if: ${{ failure() }}` only, which the release workflow lint pins.
+Where this section says the restore names the forced rollback, it names the hand step of M6 (a
+re-run of the `gamma` job of the release to go back to) until C1 is built. For "Time",
+every step of the job has its own `timeout-minutes` and the job's is at least their sum, so a
+hanging proof is cut and the restore still runs.
 
 **Change.** The PR has two parts. The baseline the job goes back to is kept by the
 coordinator, not by the job, so it is there whatever happened to the job.

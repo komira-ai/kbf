@@ -10,8 +10,9 @@
 //! 2. `GET /v1/convergence`. When the desired version is not this release (another writer, a
 //!    newer release or the coordinator's own rollback has it now), it sets nothing, says so
 //!    and exits 0. When the coordinator shows no `generation` (it is older than the restore)
-//!    or no `replaced` (a first deploy), it sets nothing and exits 1 naming the forced
-//!    rollback.
+//!    or no `replaced` (a first deploy), it sets nothing and exits 1 naming the hand step
+//!    ([`BY_HAND`]). An answer whose fields are not of their types is an error, never a
+//!    default: a missing `desired` is not taken for "another version".
 //! 3. `POST /v1/desired` of `replaced` (its version and its minimums), with `if_generation`
 //!    the generation read and `write_id` `restore-<run>`. It prints what it set and exits 1:
 //!    the run stays red.
@@ -20,10 +21,13 @@
 //!    lost, so the restore is done (exit 1, as in 3). Any other `write_id`, or none: that
 //!    write stands, nothing is restored, and it exits 1 naming the state now and its write.
 //!
-//! Any other failure of the POST (a 503 on every try, a lost connection, a timeout) is
-//! followed by the same read: a state showing `restore-<run>` is the restore done, whose
-//! answer was lost. Otherwise, and on a 401 or 403 (which set nothing), it exits 1 naming the
-//! version it could not set and the forced rollback.
+//! Any other failure of the POST (a 503 on every try, a lost connection, a timeout, an
+//! answer it cannot read) is followed by the same read: a state showing `restore-<run>` is the
+//! restore done, whose answer was lost. Otherwise, and on a 401 or 403 (which set nothing), it
+//! exits 1 naming the version it could not set and the hand step.
+//!
+//! Versions and write ids are compared and posted exactly as the coordinator sent them; only
+//! the log and the errors show them shortened and stripped of control characters.
 
 use std::io::Write;
 use std::time::Duration;
@@ -41,8 +45,10 @@ pub(super) const READ_BEFORE: &str = "read the farm before the restore";
 pub(super) const SET_BACK: &str = "set the farm back";
 pub(super) const READ_AFTER: &str = "read the farm after the restore was refused";
 
-/// Where the operator goes when the restore cannot set the farm back.
-pub const FORCED_ROLLBACK: &str = "the forced rollback (docs/design/gamma-cicd.md, section 4: the coordinator's `force`, C1, or `kbf-host-install activate` on each host, H1)";
+/// What the operator does when the restore cannot set the farm back: the hand step this
+/// checkout supports for the whole farm (docs/design/gamma-cicd.md, section 3, M6). The
+/// coordinator's `force` (C1) is planned and not named here until it is built.
+pub const BY_HAND: &str = "the hand step: re-run, from its run's page, the `gamma` job of the release the farm should run, which sets that release as desired (docs/design/gamma-cicd.md, section 3, M6)";
 
 /// The prefix of the restore's `write_id`.
 pub const WRITE_ID_PREFIX: &str = "restore-";
@@ -89,12 +95,12 @@ pub enum Error {
     Restored { version: String, release: String },
     /// The coordinator keeps no version this release replaced.
     #[error(
-        "the coordinator keeps no version that {0} replaced (a first deploy): nothing was set back; to go back, use {FORCED_ROLLBACK}"
+        "the coordinator keeps no version that {0} replaced (a first deploy): nothing was set back; to go back, use {BY_HAND}"
     )]
     NothingReplaced(String),
     /// The coordinator is older than the restore.
     #[error(
-        "the coordinator shows no generation (it is older than the restore): nothing was set back; to go back, use {FORCED_ROLLBACK}"
+        "the coordinator shows no generation (it is older than the restore): nothing was set back; to go back, use {BY_HAND}"
     )]
     NoGeneration,
     /// Another write was accepted between the read and the restore, and stands.
@@ -103,8 +109,18 @@ pub enum Error {
     )]
     OtherWriter { desired: String, write: String },
     /// The POST, or the read after its 409, failed.
-    #[error("could not set the farm back to {version}: {why}; to go back, use {FORCED_ROLLBACK}")]
+    #[error("could not set the farm back to {version}: {why}; to go back, use {BY_HAND}")]
     Failed { version: String, why: String },
+    /// The POST's outcome is not known (it was refused with a 409 or its answer was lost) and
+    /// the read that would tell failed too.
+    #[error(
+        "whether the farm is set back to {version} is not known: {why}; read GET /v1/convergence for the write `{write_id}`, and if it is not there, use {BY_HAND}"
+    )]
+    Unknown {
+        version: String,
+        write_id: String,
+        why: String,
+    },
     /// `--run` makes no `write_id` the coordinator keeps.
     #[error(
         "--run {0:?} is not <run id>-<attempt>: the restore's write id must be 1 to {MAX_WRITE_ID} visible characters"
@@ -217,44 +233,90 @@ fn plan_of(args: &Args) -> Plan {
     }
 }
 
-/// What the restore reads of the convergence answer.
+/// What the restore reads of the convergence answer: the values exactly as the coordinator sent
+/// them, since they are compared and posted back; [`plain`] is applied only where one is
+/// printed.
 struct Read {
-    desired: String,
-    generation: Option<u64>,
+    /// The desired version; none when the coordinator holds no desired state.
+    desired: Option<String>,
+    /// The record of the writes; none from a coordinator older than the record.
+    record: Option<Record>,
+}
+
+/// The record of the writes, as the answer shows it.
+struct Record {
+    generation: u64,
     /// The version and minimums the last change of version replaced.
     replaced: Option<(String, Value)>,
     write_id: String,
 }
 
 impl Read {
+    /// The answer read, every field the restore uses checked: an answer that is not an object,
+    /// a `desired` that is neither text nor `null`, and, once `generation` is there, a
+    /// `generation` that is no count, a `write_id` that is not text, or a `replaced` that is
+    /// neither `null` nor a version with its minimums, are each an error, never a default.
     fn of(answer: &Value) -> Result<Self, Deploy> {
-        let replaced = match &answer["replaced"] {
-            Value::Null => None,
-            r => Some((
-                r["version"]
-                    .as_str()
-                    .map(plain)
-                    .ok_or_else(|| Deploy::Answer("no version in replaced".to_owned()))?,
-                r["min_up"].clone(),
-            )),
+        let bad = |why: &str| Deploy::Answer(why.to_owned());
+        let fields = answer
+            .as_object()
+            .ok_or_else(|| bad("the convergence answer is not an object"))?;
+        let desired = match fields.get("desired") {
+            Some(Value::Null) => None,
+            Some(Value::String(version)) => Some(version.clone()),
+            _ => return Err(bad("`desired` is neither a version nor null")),
+        };
+        let Some(generation) = fields.get("generation") else {
+            return Ok(Self {
+                desired,
+                record: None,
+            });
+        };
+        let generation = generation
+            .as_u64()
+            .ok_or_else(|| bad("`generation` is not a count"))?;
+        let write_id = match fields.get("write_id") {
+            Some(Value::String(id)) => id.clone(),
+            _ => return Err(bad("`write_id` is not text")),
+        };
+        let replaced = match fields.get("replaced") {
+            Some(Value::Null) => None,
+            Some(Value::Object(r)) => match (r.get("version"), r.get("min_up")) {
+                (Some(Value::String(version)), Some(min_up @ Value::Object(_))) => {
+                    Some((version.clone(), min_up.clone()))
+                }
+                _ => return Err(bad("`replaced` is not a version with its minimums")),
+            },
+            _ => {
+                return Err(bad(
+                    "`replaced` is neither null nor a version with its minimums",
+                ));
+            }
         };
         Ok(Self {
-            desired: answer["desired"]
-                .as_str()
-                .map_or_else(|| "(none)".to_owned(), plain),
-            generation: answer["generation"].as_u64(),
-            replaced,
-            write_id: answer["write_id"].as_str().map(plain).unwrap_or_default(),
+            desired,
+            record: Some(Record {
+                generation,
+                replaced,
+                write_id,
+            }),
         })
     }
 
-    /// The write that made the state, as the error names it.
-    fn write(&self) -> String {
-        if self.write_id.is_empty() {
-            "a write without an id".to_owned()
-        } else {
-            format!("the write {}", self.write_id)
-        }
+    /// The desired version as the log shows it.
+    fn shown(&self) -> String {
+        self.desired
+            .as_deref()
+            .map_or_else(|| "(none)".to_owned(), plain)
+    }
+}
+
+/// The write that made a state, as an error names it.
+fn named(write_id: &str) -> String {
+    if write_id.is_empty() {
+        "a write without an id".to_owned()
+    } else {
+        format!("the write {}", plain(write_id))
     }
 }
 
@@ -274,18 +336,20 @@ pub fn restore_on(
     let client = Client::new(&plan, service, roots, clock)?;
     let path = plan.convergence_path();
     let read = Read::of(&client.send_retrying(out, READ_BEFORE, &path, None, &plan)?)?;
-    if read.desired != plan.version {
+    if read.desired.as_deref() != Some(plan.version.as_str()) {
         return Ok(format!(
             "nothing to set back: the desired version is {}, not {} (another writer, a newer release or the coordinator's own rollback has it now)",
-            read.desired, plan.version
+            read.shown(),
+            plain(&plan.version)
         ));
     }
-    let Some(generation) = read.generation else {
+    let Some(record) = read.record else {
         return Err(Error::NoGeneration);
     };
-    let Some((version, min_up)) = read.replaced else {
-        return Err(Error::NothingReplaced(plan.version));
+    let Some((version, min_up)) = record.replaced else {
+        return Err(Error::NothingReplaced(plain(&plan.version)));
     };
+    let generation = record.generation;
     let id = write_id(&args.run);
     let mut body = json!({
         "version": version,
@@ -297,11 +361,11 @@ pub fn restore_on(
         body["service"] = json!(plan.service);
     }
     let restored = || Error::Restored {
-        version: version.clone(),
-        release: plan.version.clone(),
+        version: plain(&version),
+        release: plain(&plan.version),
     };
     let not_set = |e: Deploy| Error::Failed {
-        version: version.clone(),
+        version: plain(&version),
         why: e.to_string(),
     };
     match client.send_retrying(out, SET_BACK, DESIRED_PATH, Some(&body), &plan) {
@@ -309,7 +373,9 @@ pub fn restore_on(
             log(
                 out,
                 &format!(
-                    "set back: desired version {version}, min_up {min_up}, on generation {generation}, as {id}"
+                    "set back: desired version {}, min_up {min_up}, on generation {generation}, as {}",
+                    plain(&version),
+                    plain(&id)
                 ),
             )?;
             Err(restored())
@@ -317,26 +383,38 @@ pub fn restore_on(
         // A refusal of the token set nothing: no read can change that.
         Err(e @ Deploy::Refused { .. }) => Err(not_set(e)),
         // Some write was accepted, or the POST may have landed with its answer lost (a 503 on
-        // every try, a dropped connection, a timeout): the state's `write_id` tells.
+        // every try, a dropped connection, a timeout, an answer that cannot be read): the
+        // state's `write_id` tells.
         Err(e) => {
             let conflict = matches!(e, Deploy::Conflict { .. });
+            let unknown = |why: Deploy| Error::Unknown {
+                version: plain(&version),
+                write_id: plain(&id),
+                why: format!("{e}, then {why}"),
+            };
             let now = client
                 .send_retrying(out, READ_AFTER, &path, None, &plan)
                 .and_then(|answer| Read::of(&answer))
-                .map_err(not_set)?;
-            if now.write_id == id {
+                .map_err(unknown)?;
+            let Some(record) = now.record.as_ref() else {
+                return Err(unknown(Deploy::Answer(
+                    "the read after the restore shows no generation".to_owned(),
+                )));
+            };
+            if record.write_id == id {
                 log(
                     out,
                     &format!(
-                        "set back: desired version {}, by this restore ({id}), whose answer was lost before",
-                        now.desired
+                        "set back: desired version {}, by this restore ({}), whose answer was lost before",
+                        now.shown(),
+                        plain(&id)
                     ),
                 )?;
                 Err(restored())
             } else if conflict {
                 Err(Error::OtherWriter {
-                    write: now.write(),
-                    desired: now.desired,
+                    write: named(&record.write_id),
+                    desired: now.shown(),
                 })
             } else {
                 Err(not_set(e))

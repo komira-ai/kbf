@@ -238,6 +238,8 @@ pub struct Step {
     pub working_directory: Option<String>,
     /// The step's own `shell:`, if it has one.
     pub shell: Option<String>,
+    /// The step's own `timeout-minutes:`, if it has one.
+    pub timeout_minutes: Option<String>,
 }
 
 /// The steps of the job `job` (its key matched ignoring ASCII case) in a workflow
@@ -282,6 +284,7 @@ pub fn job_steps(text: &str, job: &str) -> Result<Vec<Step>, String> {
                 condition: text_of(get(m, "if")),
                 working_directory: text_of(get(m, "working-directory")),
                 shell: text_of(get(m, "shell")),
+                timeout_minutes: text_of(get(m, "timeout-minutes")),
             },
             _ => Step::default(),
         })

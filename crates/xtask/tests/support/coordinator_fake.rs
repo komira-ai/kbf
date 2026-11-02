@@ -9,6 +9,7 @@
 //! token whose `jti` it has seen.
 //!
 //! A test file includes it after `deploy_fake`, whose TLS listener and request reader it uses.
+#![allow(dead_code)] // Each test binary uses its own part of this module.
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
@@ -62,10 +63,25 @@ pub enum Fate {
     Answer,
     /// Applies it and closes the connection without an answer.
     Drop,
+    /// Closes the connection without an answer and applies nothing.
+    DropUnstored,
+    /// Applies it and answers 200 with a body that is not JSON.
+    Garbled,
     /// Applies it and answers 503.
     Lands503,
     /// Answers this status and applies nothing.
     Status(u16),
+}
+
+/// What the fake does with a convergence read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadFate {
+    /// Answers the farm and the state.
+    Answer,
+    /// Answers this status.
+    Status(u16),
+    /// Answers 200 with these bytes as the body.
+    Raw(&'static str),
 }
 
 /// A write of another writer, accepted right after the read with this number (from 0) is
@@ -88,6 +104,8 @@ pub struct Script {
     pub farm: Vec<(&'static str, u64)>,
     /// What happens to each POST, by number; a POST past the end is answered.
     pub fates: Vec<Fate>,
+    /// What happens to each convergence read, by number; a read past the end is answered.
+    pub read_fates: Vec<ReadFate>,
     /// Writes of other writers.
     pub competing: Vec<Competing>,
     /// Whether the reads show `generation`, `replaced` and `write_id` (a coordinator older
@@ -102,6 +120,7 @@ impl Script {
             state: Some(State::before()),
             farm: vec![("converged", 2)],
             fates: Vec::new(),
+            read_fates: Vec::new(),
             competing: Vec::new(),
             generation_shown: true,
         }
@@ -274,10 +293,15 @@ fn answer(script: &Script, inner: &mut Inner, request: Seen) -> Option<Vec<u8>> 
             .unwrap_or(Fate::Answer);
         let status = match fate {
             Fate::Status(status) => status,
+            Fate::DropUnstored => 0,
             _ => apply(&mut inner.state, &body),
         };
         let answered = match (fate, status) {
             (Fate::Drop, 200) => 0,
+            (Fate::Garbled, 200) => {
+                inner.posts.push(Post { body, status: 200 });
+                return Some(response(200, "not JSON"));
+            }
             (Fate::Lands503, 200) => 503,
             _ => status,
         };
@@ -294,6 +318,16 @@ fn answer(script: &Script, inner: &mut Inner, request: Seen) -> Option<Vec<u8>> 
     }
     let read = inner.reads;
     inner.reads += 1;
+    match script
+        .read_fates
+        .get(read)
+        .copied()
+        .unwrap_or(ReadFate::Answer)
+    {
+        ReadFate::Answer => {}
+        ReadFate::Status(status) => return Some(response(status, "{}")),
+        ReadFate::Raw(body) => return Some(response(200, body)),
+    }
     let answer = read_answer(script, inner.state.as_ref(), read);
     for write in script.competing.iter().filter(|w| w.at_read == read) {
         let body =
