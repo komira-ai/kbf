@@ -464,29 +464,6 @@ async fn a_member_daemon_starts_with_the_packs_in_front_of_its_plane_or_is_refus
     kbf_outputs::remove_tree(&dir).expect("clean");
 }
 
-/// Asserts that the daemon half of a storage-and-daemon (`start_member`) refuses
-/// `--tierstore-endpoint` at its start, naming the flag and the start, where without it the
-/// same daemon starts.
-#[tokio::test]
-async fn a_member_daemon_refuses_the_tierstore() {
-    let dir = scratch("tierstore-member");
-    tls_files(&dir);
-    let path = keys(&dir, "keys.json", &pair(), 0o600);
-    let (_half, local) = storage_member(&dir).await;
-    let https = ["https://127.0.0.1:1"];
-    let tierstore = [
-        "--tierstore-endpoint=http://127.0.0.1:9".to_owned(),
-        "--tierstore-bucket=tierstore".to_owned(),
-        format!("--tierstore-credentials-file={}", path.display()),
-    ];
-    let started = started_member(&dir, &tierstore, &https, &local).await;
-    let refused = "--tierstore-endpoint: only `kbf daemon` reads through a local tierstore, not \
-                   `kbf storage-and-daemon`";
-    assert_eq!(started, Err(refused.to_owned()));
-    assert_eq!(started_member(&dir, &[], &https, &local).await, Ok(()));
-    kbf_outputs::remove_tree(&dir).expect("clean");
-}
-
 /// Asserts that a daemon with no `--cas` asks the frontend over its first `--server` (the
 /// listener its session is made to, with its own TLS files), and that a first `--server` that
 /// is not an https URL, or none, is refused with the flag named.

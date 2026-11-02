@@ -1,29 +1,16 @@
-//! The `--tierstore-*` flags, the loopback rule, the start, and the plane they make: reads
-//! through an in-process stand-in for the tierstore, with the frontend's plane underneath.
+//! The `--tierstore-*` flags, the loopback rule and the starts. The plane they make is
+//! `plane.rs`'s.
 
-use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
 
-use bytes::Bytes;
 use clap::Parser as _;
-use kbf_objstore::{
-    ByteRange, Capabilities, KeyPrefix, ListPage, ListToken, MemoryStore, ObjectKey,
-    ObjectStoreError, PageSize,
-};
-use kbf_pack::{PackKeys, Packer, PackerConfig, WriterKind, blob_digest};
-use kbf_pack_index::memory::MemoryPackIndex;
-use kbf_pack_index::{NewPack, PackBlob};
-use kbf_proto::reapi::Digest;
-use kbf_state::ManualClock;
-use kbf_transfer::CasError;
-use kbf_transfer::cas::{digest_of, label};
-use tokio::io::AsyncWriteExt as _;
 
 use super::*;
 use crate::tests::{scratch, tls_files};
+
+mod plane;
 
 /// The secret of the credentials files of these tests, which no message may carry.
 const SECRET: &str = "s3cr3t-tier-key";
@@ -87,7 +74,7 @@ fn the_tierstore_is_off_by_default() {
     assert_eq!(args.tierstore_endpoint, None);
     assert_eq!(args.tierstore_bucket, None);
     assert_eq!(args.tierstore_credentials_file, None);
-    assert_eq!(args.settings(), Ok(None));
+    assert_eq!(args.settings().expect("no settings"), None);
     assert!(args.refuse("a test").is_ok());
 }
 
@@ -98,11 +85,15 @@ fn the_flags_reach_the_settings() {
     let flags: Vec<&str> = flags.iter().map(String::as_str).collect();
     let args = parse(&flags).expect("flags").tierstore;
     let want = Tierstore {
-        endpoint: "http://127.0.0.1:9300".to_owned(),
+        endpoint: Endpoint {
+            given: "http://127.0.0.1:9300".to_owned(),
+            addr: SocketAddr::from(([127, 0, 0, 1], 9300)),
+            authority: "127.0.0.1:9300".to_owned(),
+        },
         bucket: "tierstore".to_owned(),
         credentials: PathBuf::from("/keys.json"),
     };
-    assert_eq!(args.settings(), Ok(Some(want)));
+    assert_eq!(args.settings().expect("settings"), Some(want));
 }
 
 /// Asserts that the endpoint is refused without the bucket or the credentials file, that each
@@ -132,22 +123,53 @@ fn the_flags_come_together_and_never_with_pack_read() {
     assert!(both.contains("--tierstore-endpoint"), "{both}");
 }
 
-/// Asserts the endpoints that are a tierstore on loopback: any `127.*` address, `::1`
-/// and the IPv4-mapped form of a loopback address, with or without a port or a last `/`.
+/// Asserts the endpoints that are a tierstore on loopback, and the address and authority each
+/// is reached at: any `127.*` address, `::1` and the IPv4-mapped form of a loopback address, with
+/// or without a port (80 when there is none), with or without a last `/`, ports 1 and 65535.
 #[test]
 fn loopback_endpoints_are_taken() {
     // The last loopback address of IPv4, spelled from its parts.
-    let last = format!("http://{}:1", std::net::Ipv4Addr::new(127, 255, 255, 254));
-    for endpoint in [
-        "http://127.0.0.1:9300",
-        "http://127.0.0.1:9300/",
-        "http://127.0.0.1",
-        &last,
-        "http://[::1]:9300",
-        "http://[::1]",
-        "http://[::ffff:127.0.0.1]:9300",
-    ] {
-        assert_eq!(loopback(endpoint), Ok(()), "{endpoint}");
+    let last_ip = std::net::Ipv4Addr::new(127, 255, 255, 254);
+    let last = format!("http://{last_ip}:1");
+    let v6 = |port: u16| SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port));
+    let mapped: IpAddr = "::ffff:127.0.0.1".parse().expect("an address");
+    let cases = [
+        (
+            "http://127.0.0.1:9300",
+            SocketAddr::from(([127, 0, 0, 1], 9300)),
+            "127.0.0.1:9300",
+        ),
+        (
+            "http://127.0.0.1:9300/",
+            SocketAddr::from(([127, 0, 0, 1], 9300)),
+            "127.0.0.1:9300",
+        ),
+        (
+            "http://127.0.0.1",
+            SocketAddr::from(([127, 0, 0, 1], 80)),
+            "127.0.0.1",
+        ),
+        (
+            "http://127.0.0.1:65535",
+            SocketAddr::from(([127, 0, 0, 1], 65535)),
+            "127.0.0.1:65535",
+        ),
+        (&last, SocketAddr::from((last_ip, 1)), &last[7..]),
+        ("http://[::1]:9300", v6(9300), "[::1]:9300"),
+        ("http://[::1]", v6(80), "[::1]"),
+        (
+            "http://[::ffff:127.0.0.1]:9300",
+            SocketAddr::new(mapped, 9300),
+            "[::ffff:127.0.0.1]:9300",
+        ),
+    ];
+    for (endpoint, addr, authority) in cases {
+        let want = Endpoint {
+            given: endpoint.to_owned(),
+            addr,
+            authority: authority.to_owned(),
+        };
+        assert_eq!(loopback(endpoint), Ok(want), "{endpoint}");
     }
 }
 
@@ -205,6 +227,23 @@ fn other_endpoints_are_refused_with_what_is_wrong() {
         ("http://127.0.0.1.:9300", "the host is not an IP address"),
         ("http://[::1%25lo]:9300", "the host is not an IP address"),
         (" http://127.0.0.1:9300", "not http://"),
+        (
+            "http://127.0.0.1:port",
+            "the port is not a number from 1 to 65535",
+        ),
+        (
+            "http://127.0.0.1:0",
+            "the port is not a number from 1 to 65535",
+        ),
+        (
+            "http://127.0.0.1:65536",
+            "the port is not a number from 1 to 65535",
+        ),
+        (
+            "http://127.0.0.1:",
+            "the port is not a number from 1 to 65535",
+        ),
+        ("http://[::1]:", "the port is not a number from 1 to 65535"),
     ];
     for (endpoint, why) in cases {
         let want = NotLoopback {
@@ -233,13 +272,20 @@ fn a_non_loopback_endpoint_is_refused_at_start_with_a_named_error() {
     let path = keys(&dir, "keys.json", 0o600);
     let cli = daemon(&dir, &on("http://192.0.2.1:9300", &path));
     let refused = crate::start(&cli).err().expect("refused");
-    let named = refused.downcast_ref::<NotLoopback>().expect("NotLoopback");
+    let named = refused.downcast_ref::<TierstoreError>();
+    let Some(TierstoreError::NotLoopback(named)) = named else {
+        panic!("not NotLoopback: {refused:?}");
+    };
     let want = NotLoopback {
         endpoint: "http://192.0.2.1:9300".to_owned(),
         why: "the address is not a loopback address",
     };
     assert_eq!(named, &want);
-    assert_eq!(refused.to_string(), want.to_string());
+    assert_eq!(
+        refused.to_string(),
+        "--tierstore-endpoint \"http://192.0.2.1:9300\" is not a tierstore on loopback: the \
+         address is not a loopback address; give http://127.0.0.1:<port> or http://[::1]:<port>"
+    );
     kbf_outputs::remove_tree(&dir).expect("clean");
 }
 
@@ -334,40 +380,57 @@ fn a_daemon_starts_reading_through_the_tierstore_and_carries_the_counts() {
     kbf_outputs::remove_tree(&dir).expect("clean");
 }
 
-/// Asserts that what the S3 client cannot be built from stops the start, naming the flag and
-/// never the secret: a credentials file others may read (named by its file), one that is not
-/// there, a bucket the client refuses, and a loopback endpoint with a port that is not one.
+/// Asserts that what the client cannot be made from stops the start, each refusal whole and
+/// exactly, so that it names the flag and the file and never the secret: a credentials file
+/// others may read, one that is not there, one that is not the key pair, and a bucket no
+/// tierstore serves.
+/// Catches a refusal that drops the flag or the path, or that carries the key file's contents.
 #[test]
 fn what_the_client_cannot_use_stops_the_start_with_the_flag_named() {
     let dir = scratch("tierstore-refused");
     tls_files(&dir);
     let good = keys(&dir, "keys.json", 0o600);
     let open = keys(&dir, "open.json", 0o644);
+    let none = dir.join("none.json");
+    let array = dir.join("array.json");
+    std::fs::write(&array, format!("[\"{SECRET}\"]")).expect("write");
+    std::fs::set_permissions(&array, std::fs::Permissions::from_mode(0o600)).expect("chmod");
     let refused = |flags: Vec<String>| started(&daemon(&dir, &flags)).expect_err("refused");
-
     let mut upper = on("http://127.0.0.1:9", &good);
     upper[1] = "--tierstore-bucket=UPPER".to_owned();
+    let flag = "--tierstore-credentials-file";
     let cases = [
         (
             on("http://127.0.0.1:9", &open),
-            "--tierstore-credentials-file ",
+            format!(
+                "{flag} {}: mode 0644 lets others read a secret: use 0600",
+                open.display()
+            ),
         ),
         (
-            on("http://127.0.0.1:9", &dir.join("none.json")),
-            "--tierstore-credentials-file ",
+            on("http://127.0.0.1:9", &none),
+            format!(
+                "{flag} {}: No such file or directory (os error 2)",
+                none.display()
+            ),
         ),
-        (upper, "--tierstore-bucket: "),
-        (on("http://127.0.0.1:port", &good), "--tierstore-endpoint: "),
+        (
+            on("http://127.0.0.1:9", &array),
+            format!(
+                "{flag} {}: not JSON with access_key_id and secret_access_key",
+                array.display()
+            ),
+        ),
+        (
+            upper,
+            "--tierstore-bucket \"UPPER\": a bucket is 3 to 63 of a-z 0-9 . - and starts and ends \
+             with a letter or digit"
+                .to_owned(),
+        ),
     ];
-    let mut said = Vec::new();
-    for (flags, flag) in cases {
-        let refusal = refused(flags);
-        assert!(refusal.starts_with(flag), "{refusal}");
-        assert!(!refusal.contains(SECRET), "{refusal}");
-        said.push(refusal);
+    for (flags, want) in cases {
+        assert_eq!(refused(flags), want);
     }
-    assert!(said[0].contains("open.json"), "{}", said[0]);
-    assert!(said[1].contains("none.json"), "{}", said[1]);
     kbf_outputs::remove_tree(&dir).expect("clean");
 }
 
@@ -390,361 +453,81 @@ fn the_in_process_start_refuses_the_tierstore() {
     kbf_outputs::remove_tree(&dir).expect("clean");
 }
 
-/// The frontend's plane, as the daemon reads it without the flag: blobs in memory, and the calls
-/// made on it.
-#[derive(Clone, Default)]
-struct Front {
-    blobs: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
-    calls: Arc<Mutex<Vec<&'static str>>>,
-}
-
-impl Front {
-    fn note(&self, call: &'static str) {
-        let mut calls = self.calls.lock().unwrap_or_else(PoisonError::into_inner);
-        calls.push(call);
-    }
-
-    fn calls(&self) -> Vec<&'static str> {
-        let calls = self.calls.lock().unwrap_or_else(PoisonError::into_inner);
-        calls.clone()
-    }
-
-    fn insert(&self, bytes: &[u8]) -> Digest {
-        let digest = digest_of(bytes);
-        let mut blobs = self.blobs.lock().unwrap_or_else(PoisonError::into_inner);
-        blobs.insert(label(&digest), bytes.to_vec());
-        digest
-    }
-
-    fn blob(&self, digest: &Digest) -> Result<Vec<u8>, CasError> {
-        let blobs = self.blobs.lock().unwrap_or_else(PoisonError::into_inner);
-        let held = blobs.get(&label(digest)).cloned();
-        held.ok_or_else(|| CasError::Missing(label(digest)))
-    }
-}
-
-impl Cas for Front {
-    type Lease = Front;
-
-    fn lease(self: &Arc<Self>, _: &kbf_types::LeaseId) -> Front {
-        self.note("lease");
-        Front::clone(self)
-    }
-
-    async fn get(&self, digest: &Digest) -> Result<Vec<u8>, CasError> {
-        self.note("get");
-        self.blob(digest)
-    }
-
-    async fn read_to(&self, digest: &Digest, file: &mut tokio::fs::File) -> Result<(), CasError> {
-        self.note("read_to");
-        let bytes = self.blob(digest)?;
-        file.write_all(&bytes).await.expect("write");
-        file.flush().await.expect("flush");
-        Ok(())
-    }
-
-    async fn put(&self, bytes: Vec<u8>) -> Result<Digest, CasError> {
-        self.note("put");
-        Ok(self.insert(&bytes))
-    }
-}
-
-/// The tierstore, in process: a memory object store that counts the ranged reads made of it
-/// and, while `down`, fails each one as a connection that was refused.
-struct Tier {
-    store: MemoryStore,
-    reads: AtomicUsize,
-    down: AtomicBool,
-}
-
-impl Tier {
-    fn new() -> Self {
-        Self {
-            // Create-only, so that the test's packer, the farm's writer of packs here, takes it.
-            store: MemoryStore::new(Capabilities {
-                conditional_put: true,
-                object_lock: false,
-            }),
-            reads: AtomicUsize::new(0),
-            down: AtomicBool::new(false),
-        }
-    }
-
-    fn store(&self) -> &MemoryStore {
-        &self.store
-    }
-}
-
-impl ObjectStore for Tier {
-    fn capabilities(&self) -> Capabilities {
-        self.store().capabilities()
-    }
-
-    async fn put_new(
-        &self,
-        key: &ObjectKey,
-        body: Bytes,
-        retain_until: Option<std::time::SystemTime>,
-    ) -> Result<(), ObjectStoreError> {
-        self.store().put_new(key, body, retain_until).await
-    }
-
-    async fn get_range(
-        &self,
-        key: &ObjectKey,
-        range: ByteRange,
-    ) -> Result<Bytes, ObjectStoreError> {
-        self.reads.fetch_add(1, Ordering::SeqCst);
-        if self.down.load(Ordering::SeqCst) {
-            let refused = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
-            return Err(ObjectStoreError::Transport(Arc::new(refused)));
-        }
-        self.store().get_range(key, range).await
-    }
-
-    async fn delete(&self, key: &ObjectKey) -> Result<(), ObjectStoreError> {
-        self.store().delete(key).await
-    }
-
-    async fn list(
-        &self,
-        prefix: &KeyPrefix,
-        after: Option<&ListToken>,
-        max_keys: PageSize,
-    ) -> Result<ListPage, ObjectStoreError> {
-        self.store().list(prefix, after, max_keys).await
-    }
-}
-
-/// Where the pack of a blob that is recorded in the index without being stored is.
-const FORGED: &str = "cas/d/node1/boot1/00000000000000ff";
-
-/// The frontend's plane, the tierstore, the frontend's pack index, a packer over the last two,
-/// and the plane [`over`] makes of them.
-struct Rig {
-    front: Front,
-    tier: Arc<Tier>,
-    index: Arc<MemoryPackIndex>,
-    packer: Packer<Tier>,
-    counter: PackCounter,
-    cas: Arc<PackedCas<Front>>,
-}
-
-impl Rig {
-    fn new() -> Self {
-        let tier = Arc::new(Tier::new());
-        let index = Arc::new(MemoryPackIndex::new(Arc::new(ManualClock::default())));
-        let shared: Arc<dyn PackIndex> = index.clone();
-        let keys = PackKeys::new(WriterKind::Daemon, "node1", "boot1").expect("keys");
-        let packer = Packer::new(
-            Arc::clone(&tier),
-            Arc::clone(&shared),
-            keys,
-            PackerConfig::default(),
-        );
-        let front = Front::default();
-        let counter = PackCounter::default();
-        let cas = over(Arc::new(front.clone()), Arc::clone(&tier), shared, &counter);
-        Self {
-            front,
-            tier,
-            index,
-            packer: packer.expect("packer"),
-            counter,
-            cas,
-        }
-    }
-
-    /// Packs `bytes` into the tierstore, as a writer of the farm's packs would, and records the
-    /// pack in the index; their digest.
-    async fn pack(&self, bytes: &'static [u8]) -> Digest {
-        let blob = kbf_pack::Blob {
-            digest: blob_digest(bytes),
-            bytes: Bytes::from_static(bytes),
-        };
-        self.packer.pack(vec![blob]).await.expect("packed");
-        digest_of(bytes)
-    }
-
-    /// Records in the index a pack that holds `true_bytes` at its start, and stores `stored` as
-    /// that pack's bytes in the tierstore if given (`None`: the tierstore answers 404 for it).
-    /// The digest of `true_bytes`.
-    async fn forge(&self, true_bytes: &'static [u8], stored: Option<&'static [u8]>) -> Digest {
-        let pack = NewPack {
-            key: FORGED.to_owned(),
-            writer: "node1".to_owned(),
-            size: true_bytes.len() as u64,
-            blobs: vec![PackBlob {
-                digest: blob_digest(true_bytes),
-                offset: 0,
-            }],
-        };
-        self.index.record_pack(&pack).expect("recorded");
-        if let Some(stored) = stored {
-            let key = ObjectKey::new(FORGED).expect("a key");
-            let put = self
-                .tier
-                .put_new(&key, Bytes::from_static(stored), None)
-                .await;
-            put.expect("stored");
-        }
-        digest_of(true_bytes)
-    }
-
-    fn reads(&self) -> usize {
-        self.tier.reads.load(Ordering::SeqCst)
-    }
-}
-
-/// `digest` read with `get`, and with `read_to` into a fresh file of `dir`: the two answers,
-/// the second as the bytes the file holds after it.
-async fn both(cas: &PackedCas<Front>, dir: &Path, digest: &Digest) -> (Vec<u8>, Vec<u8>) {
-    let got = cas.get(digest).await.expect("get");
-    let path = dir.join(label(digest).replace('/', "-"));
-    let mut file = tokio::fs::File::create(&path).await.expect("create");
-    cas.read_to(digest, &mut file).await.expect("read_to");
-    (got, std::fs::read(&path).expect("read back"))
-}
-
-/// Asserts that a blob the tierstore holds is served from it to `get` and to `read_to`, whole,
-/// and that the frontend's CAS plane is never called: the bytes come from the tierstore only
-/// (the blob's place comes from the frontend's pack index, here in memory).
-/// Catches a read that fetches the bytes from the frontend though the tierstore has the blob.
-#[tokio::test]
-async fn a_hit_is_served_from_the_tierstore_and_never_read_from_the_frontends_cas() {
-    let dir = scratch("tierstore-hit");
-    let rig = Rig::new();
-    let digest = rig.pack(b"in the tierstore").await;
-    let (got, written) = both(&rig.cas, &dir, &digest).await;
-    assert_eq!(got, b"in the tierstore");
-    assert_eq!(written, b"in the tierstore");
-    assert_eq!(rig.front.calls(), Vec::<&str>::new());
-    assert_eq!(rig.reads(), 2);
-    let stats = rig.counter.stats();
-    assert_eq!((stats.served, stats.served_bytes), (2, 32));
-    assert_eq!(
-        stats.elsewhere + stats.unasked + stats.lost + stats.damaged,
-        0
-    );
-    kbf_outputs::remove_tree(&dir).expect("clean");
-}
-
-/// Asserts that a blob the frontend's index places in no pack is read from the frontend, with
-/// the frontend's bytes, the tierstore not asked for it, and counted as read elsewhere.
-#[tokio::test]
-async fn a_blob_in_no_pack_is_read_from_the_frontend() {
-    let dir = scratch("tierstore-unplaced");
-    let rig = Rig::new();
-    let digest = rig.front.insert(b"only at the frontend");
-    let (got, written) = both(&rig.cas, &dir, &digest).await;
-    assert_eq!(
-        (got.as_slice(), written.as_slice()),
-        (&b"only at the frontend"[..], &b"only at the frontend"[..])
-    );
-    assert_eq!(rig.front.calls(), ["get", "read_to"]);
-    assert_eq!(rig.reads(), 0);
-    assert_eq!(rig.counter.stats().elsewhere, 2);
-    kbf_outputs::remove_tree(&dir).expect("clean");
-}
-
-/// Asserts that a pack the tierstore answers 404 for (a miss its upstream does not hold either)
-/// costs a read from the frontend and never a failed one: both reads answer the frontend's
-/// bytes, and are counted as lost.
-/// Catches a tierstore miss that fails a lease's input fetch.
-#[tokio::test]
-async fn a_miss_in_the_tierstore_falls_back_to_the_frontend_and_the_read_succeeds() {
-    let dir = scratch("tierstore-miss");
-    let rig = Rig::new();
-    let digest = rig.forge(b"not in the tierstore", None).await;
-    rig.front.insert(b"not in the tierstore");
-    let (got, written) = both(&rig.cas, &dir, &digest).await;
-    assert_eq!(got, b"not in the tierstore");
-    assert_eq!(written, b"not in the tierstore");
-    assert_eq!(rig.front.calls(), ["get", "read_to"]);
-    assert_eq!(rig.reads(), 2);
-    let stats = rig.counter.stats();
-    assert_eq!((stats.lost, stats.served), (2, 0));
-    kbf_outputs::remove_tree(&dir).expect("clean");
-}
-
-/// Asserts that bytes from the tierstore that are not the digest are never served: both reads
-/// answer the frontend's true bytes, and are counted as damaged.
-/// Catches a damaged cached copy that reaches a lease, or that fails its read.
-#[tokio::test]
-async fn damaged_bytes_from_the_tierstore_fall_back_to_the_frontend() {
-    let dir = scratch("tierstore-damaged");
-    let rig = Rig::new();
-    let digest = rig.forge(b"true bytes", Some(b"xxxx bytes")).await;
-    rig.front.insert(b"true bytes");
-    let (got, written) = both(&rig.cas, &dir, &digest).await;
-    assert_eq!(got, b"true bytes");
-    assert_eq!(written, b"true bytes");
-    assert_eq!(rig.front.calls(), ["get", "read_to"]);
-    assert_eq!(rig.counter.stats().damaged, 2);
-    kbf_outputs::remove_tree(&dir).expect("clean");
-}
-
-/// Asserts that a tierstore that is down (each read refused) costs reads from the frontend and
-/// never a failed one, counted as unasked; and that once it is up again, with no restart, the
-/// same blob is served from it again and the frontend is not asked.
-/// Catches a dead tierstore that fails builds, or a daemon that stops using one that came back.
-#[tokio::test]
-async fn a_tierstore_that_is_down_is_read_around_and_used_again_once_up() {
-    let dir = scratch("tierstore-down");
-    let rig = Rig::new();
-    let digest = rig.pack(b"packed and at the frontend").await;
-    rig.front.insert(b"packed and at the frontend");
-    rig.tier.down.store(true, Ordering::SeqCst);
-    let (got, written) = both(&rig.cas, &dir, &digest).await;
-    assert_eq!(got, b"packed and at the frontend");
-    assert_eq!(written, b"packed and at the frontend");
-    assert_eq!(rig.front.calls(), ["get", "read_to"]);
-    assert_eq!(rig.counter.stats().unasked, 2);
-
-    rig.tier.down.store(false, Ordering::SeqCst);
-    assert_eq!(
-        rig.cas.get(&digest).await,
-        Ok(b"packed and at the frontend".to_vec())
-    );
-    assert_eq!(rig.front.calls(), ["get", "read_to"]);
-    assert_eq!(rig.counter.stats().served, 1);
-    kbf_outputs::remove_tree(&dir).expect("clean");
-}
-
-/// Asserts that a blob over 64 MiB, which a read from a pack would hold whole, is read from the
-/// frontend without asking the tierstore, and that a blob in neither is the frontend's
-/// `Missing`, as without the flag.
-#[tokio::test]
-async fn a_large_blob_and_a_blob_nowhere_are_the_frontends() {
-    let rig = Rig::new();
-    let large = Digest {
-        hash: "ab".repeat(32),
-        size_bytes: (64 << 20) + 1,
+/// The storage member of a `kbf storage-and-daemon`, served in this process from memory: no
+/// listener is bound, as `start_member` refuses the flags before it reaches the member.
+fn member() -> kbf_daemon::LocalMember {
+    use kbf_storage::service::{Admission, Config, StorageService};
+    let cache = Arc::new(kbf_front::Cache::memory());
+    let storage = kbf_front::CacheStorage::new(cache, kbf_front::SegmentsConfig::DEFAULT);
+    let config = Config {
+        write_bytes_in_flight: 1 << 20,
     };
-    assert_eq!(
-        rig.cas.get(&large).await,
-        Err(CasError::Missing(label(&large)))
-    );
-    let nowhere = digest_of(b"nowhere");
-    assert_eq!(
-        rig.cas.get(&nowhere).await,
-        Err(CasError::Missing(label(&nowhere)))
-    );
-    assert_eq!(rig.front.calls(), ["get", "get"]);
-    assert_eq!(rig.reads(), 0);
+    let service = StorageService::new(Arc::new(storage), Admission::Open, config);
+    kbf_daemon::LocalMember::new("127.0.0.1:1".to_owned(), Arc::new(service).in_process())
 }
 
-/// Asserts that a lease's plane reads through the tierstore as its plane does, and falls back
-/// as it does: a hit is not read from the frontend, a miss is.
+/// Asserts that the daemon half of a `kbf storage-and-daemon` with a frontend (`start_member`)
+/// refuses `--tierstore-endpoint` at its start, the refusal exactly, where without it the same
+/// daemon over the same member starts.
 #[tokio::test]
-async fn a_lease_reads_through_the_tierstore_and_falls_back() {
-    let rig = Rig::new();
-    let hit = rig.pack(b"leased hit").await;
-    let miss = rig.forge(b"leased miss", None).await;
-    rig.front.insert(b"leased miss");
-    let lease = rig.cas.lease(&kbf_types::LeaseId::new(1, 2));
-    assert_eq!(lease.get(&hit).await, Ok(b"leased hit".to_vec()));
-    assert_eq!(lease.get(&miss).await, Ok(b"leased miss".to_vec()));
-    assert_eq!(rig.front.calls(), ["lease", "get"]);
+async fn a_member_daemon_refuses_the_tierstore() {
+    let dir = scratch("tierstore-member");
+    tls_files(&dir);
+    let path = keys(&dir, "keys.json", 0o600);
+    let started = |more: Vec<String>| {
+        let mut cli = daemon(&dir, &more);
+        cli.cas = None;
+        let local = member();
+        // `start_member` builds a runtime of its own, which tokio refuses on a thread of tasks.
+        tokio::task::spawn_blocking(move || {
+            crate::start_member(&cli, local)
+                .map(drop)
+                .map_err(|e| e.to_string())
+        })
+    };
+    let refused = started(on("http://127.0.0.1:9", &path))
+        .await
+        .expect("joined");
+    let want = "--tierstore-endpoint: only `kbf daemon` reads through a local tierstore, not \
+                `kbf storage-and-daemon`";
+    assert_eq!(refused, Err(want.to_owned()));
+    assert_eq!(started(Vec::new()).await.expect("joined"), Ok(()));
+    kbf_outputs::remove_tree(&dir).expect("clean");
+}
+
+/// Asserts the bucket names a tierstore serves: 3 to 63 of `a-z 0-9 . -`, starting and ending
+/// with a letter or a digit; and that the rest are refused.
+#[test]
+fn bucket_names_are_the_ones_s3_takes() {
+    let longest = "b".repeat(63);
+    for good in ["abc", "a1.b-2", "1ab", "ab9", longest.as_str()] {
+        assert!(bucket_name(good), "{good}");
+    }
+    let too_long = "b".repeat(64);
+    for bad in [
+        "ab",
+        too_long.as_str(),
+        "-ab",
+        "ab.",
+        "aBc",
+        "a_b",
+        ".ab",
+        "ab-",
+    ] {
+        assert!(!bucket_name(bad), "{bad}");
+    }
+}
+
+/// Asserts that a key pair read from its file shows its id and never its secret.
+#[test]
+fn a_key_pair_never_shows_its_secret() {
+    let dir = scratch("tierstore-key-pair");
+    let path = keys(&dir, "keys.json", 0o600);
+    let pair = pack_read::read_key_pair(&path, CREDENTIALS_FLAG).expect("a key pair");
+    assert_eq!(
+        format!("{pair:?}"),
+        "KeyPair { id: \"AKIATIER\", secret: \"<redacted>\" }"
+    );
+    assert_eq!(pair.secret.as_str(), SECRET);
+    kbf_outputs::remove_tree(&dir).expect("clean");
 }

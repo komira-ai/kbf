@@ -25,6 +25,14 @@ kbf-outputs.workspace = true
 kbf-pack.workspace = true
 # The pack index trait the reader finds blobs through (`tierstore`).
 kbf-pack-index.workspace = true
+# The tierstore client's bodies, its HTTP client (no proxy, no redirect) and its request
+# signature (`tierstore::client`).
+bytes.workspace = true
+# The future the pack reader's wrapper answers (`tierstore::placed`).
+futures.workspace = true
+hex.workspace = true
+reqwest.workspace = true
+sha2.workspace = true
 kbf-threads.workspace = true
 kbf-transfer.workspace = true
 kbf-types.workspace = true
@@ -44,14 +52,16 @@ zeroize.workspace = true
 kbf-driver-container.workspace = true
 
 [dev-dependencies]
-# The bodies the in-process tierstore of src/tierstore/tests.rs holds.
-bytes.workspace = true
-futures.workspace = true
 kbf-integration-test.workspace = true
 kbf-map.workspace = true
 # The in-memory pack index the tierstore read tests place blobs in (src/tierstore/tests.rs).
 kbf-pack-index = { workspace = true, features = ["test-support"] }
+# The S3 service on a loopback port of the test that the tierstore client is read against
+# (src/tierstore/client/tests.rs).
+kbf-objstore = { workspace = true, features = ["testkit"] }
 kbf-state = { workspace = true, features = ["test-support"] }
+# The in-process storage service of the member the tierstore refusal test starts over.
+kbf-storage.workspace = true
 kbf-types.workspace = true
 # The CAS the restart test's daemon reads its action from (tests/binary.rs).
 kbf-front.workspace = true
