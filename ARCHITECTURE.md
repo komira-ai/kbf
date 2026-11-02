@@ -518,8 +518,8 @@ To report a vulnerability, see [SECURITY.md](SECURITY.md).
 
 ## Testing
 
-The project's testing rules are in [CONTRIBUTING.md](CONTRIBUTING.md): every test has
-been seen failing on a planted defect (a mutant), and the coverage gate checks every crate for 99% of lines and branches, or its floor in
+The project's testing rules are T1 to T19 of [AGENTS.md](AGENTS.md): tests assert
+behaviour, a bug fix ships a test that failed before the fix, and the coverage gate checks every crate for 99% of lines and branches, or its floor in
 [coverage-floors](coverage-floors), which may only rise. How the code is tested:
 
 - **Pure cores, unit-tested.** The scheduler, metadata, segment, capability and Raft

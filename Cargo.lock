@@ -2271,6 +2271,7 @@ dependencies = [
  "libc",
  "proc-macro2",
  "prost",
+ "pulldown-cmark",
  "rcgen",
  "reqwest",
  "rustix",

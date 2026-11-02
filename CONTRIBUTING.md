@@ -1,7 +1,9 @@
 # Contributing to kbf
 
-Thank you for helping. This file says what a pull request needs before it can
-be merged.
+Thank you for helping. The rules every change is written and reviewed against
+are in [AGENTS.md](AGENTS.md), cited by id (T1, B8, ...); this file says how to
+meet them here: signing commits, building and testing, and how CI checks a pull
+request.
 
 ## Developer Certificate of Origin (DCO)
 
@@ -24,66 +26,27 @@ server: reject digests with a negative size
 Signed-off-by: Your Name <you@example.com>
 ```
 
-The name and email must match the commit author. Maintainers do not merge a
-pull request with an unsigned commit. An automated DCO check will enforce this
-once it is set up; until then, reviewers check the trailer by hand.
+The name and email must match the commit author (rule P4 of
+[AGENTS.md](AGENTS.md)). An automated DCO check will enforce this once it is
+set up; until then, reviewers check the trailer by hand.
 
-## The mutant rule
+## Tests
 
-A test that cannot fail is not a test. Every test in kbf must have been seen
-failing on a planted defect (a mutant) before it is merged:
-
-1. Write the test and see it pass.
-2. Plant a mutant: a small, deliberate bug in the code the test is meant to
-   guard (flip a comparison, drop a check, return early).
-3. Run the test and see it fail at the assertion you expect. A failure caused
-   by a compile error proves nothing.
-4. Remove the mutant.
-
-Each test says, in a comment or its name, which defect it catches. The pull
-request description lists every mutant you planted and the test that went red
-on it.
-
-A bug fix ships with a test that failed before the fix.
+Tests assert behaviour, cover failure and boundary cases, and are hermetic; a
+bug fix ships with a test that failed before the fix. The rules are T1 to T19
+in [AGENTS.md](AGENTS.md).
 
 ## Small pull requests
 
-Keep pull requests small and about one thing. A reviewer should be able to
-read the whole diff in one sitting. Split refactors from behavior changes, and
-land interfaces before the code that uses them. Keep source files under 1000
-lines.
+Keep pull requests small and about one thing, so a reviewer can read the
+whole diff in one sitting (rules P7 and R12 of [AGENTS.md](AGENTS.md)).
 
 ## Formats change additively
 
-Every format kbf writes and another kbf reads changes additively only: the
-metadata log, state-store rows, files a node keeps on disk, and the protobuf and
-JSON messages between processes. A farm runs two releases side by side during an
-update, and a node may go back to the release before; each release must start on
-data the other wrote.
-
-Allowed:
-
-- a new optional field, whose absence (or zero value) means what the code did
-  before the field existed;
-- a new record type, log command, oneof case or table;
-- a new column with a default.
-
-Not allowed:
-
-- renumbering, renaming on the wire, or removing a field, case or table that a
-  release has shipped;
-- giving an existing field or value a new meaning;
-- a required field, or a check that refuses data because it carries something
-  this release does not know;
-- a version or floor raise that an older release cannot open.
-
-A reader skips what it does not know: an unknown field is ignored, and an
-unknown record, command or enum value is passed over as a whole and counted.
-Data that cannot be parsed at all is still refused. When you add a record type,
-the pull request says what an older release loses by skipping it, and that loss
-must be safe. Every pull request that changes a format names the test that
-starts the previous release on data the new one wrote, and the new one on data
-the previous release wrote.
+Every format kbf writes and another kbf reads changes additively only: rule B8
+of [AGENTS.md](AGENTS.md), with what it covers in this repository. The reason:
+a farm runs two releases side by side during an update, and a node may go back
+to the release before, so each release must start on data the other wrote.
 
 ## Building and testing
 
@@ -108,34 +71,30 @@ and drops it when the test ends, so tests run in parallel and never share rows.
 
 ## No new shell or Python
 
-kbf's tooling is Rust. The repository lints (`cargo test -p kbf-integration-test --test
-repo_lints`) refuse a workflow `run:` step with shell logic (more than one line, a
-pipe, `&&`, `;`, `$(`, a backtick, `if`, `for` or `while`) outright: a step is one
-command, and anything more is a `cargo xtask` verb or a flag of the program the
-step runs. They refuse a shell, Python, awk, sed, Perl or Ruby file, and production
-code under `crates/*/src/` that names a shell and a `-c` flag, unless
+The rule is B4 of [AGENTS.md](AGENTS.md). The repository lints
+(`cargo test -p kbf-integration-test --test repo_lints`) hold it: a workflow `run:`
+step with shell logic is refused outright, and a shell, Python, awk, sed, Perl or
+Ruby file, or production code that runs a shell with `-c`, is refused unless
 [tools/interpreter_budget.tsv](tools/interpreter_budget.tsv) lists it by path
 (a `<key><TAB><reason>` row). The rows there are what is left to port. The list
 records what exists, not how big it is: editing a listed file or keeper leaves
-the list alone. The list only shrinks: on a pull request,
+the list alone. On a pull request,
 `cargo xtask budget-diff --base HEAD^1` refuses any row the base branch's list
 does not have, so a listed file is not moved or renamed either (that would be a
 new row); it is ported. A pull request that deletes one removes its row in the
 same commit; the lint refuses a row whose file or keeper is gone.
 
-Test code is held to the same list. A test file (under `crates/*/tests/`, or
-`#[cfg(test)]` code under `crates/*/src/`) that names an interpreter, as a
-program (`Command::new("perl")`, an argv starting `/bin/sh`) or as the `#!` line
-of a script it writes, needs a `[test-interpreters]` row for its path saying why
-the test needs it. That list only shrinks too: a new test drives Rust (a
-`kbf-testkit` fake or the program under test), not a shell.
+Test code is held to the same list: a test file (under `crates/*/tests/`, or
+`#[cfg(test)]` code under `crates/*/src/`) names an interpreter as a program
+(`Command::new("perl")`, an argv starting `/bin/sh`) or as the `#!` line of a
+script it writes, and its `[test-interpreters]` row says why the test needs it.
 
 ## Continuous integration
 
 CI is defined in [.github/workflows/ci.yml](.github/workflows/ci.yml) and runs
-only on GitHub-hosted runners: formatting, clippy, the repository lints,
-`cargo deny` (licences, bans and sources), and the workspace tests on x86-64 and
-arm64. A pull request is merged only when CI is green on its head commit.
+only on GitHub-hosted runners (rules B9 and B10 of [AGENTS.md](AGENTS.md)):
+formatting, clippy, the repository lints, `cargo deny` (licences, bans and
+sources), and the workspace tests on x86-64 and arm64. A pull request is merged only when CI is green on its head commit.
 
 Security advisories against our dependencies do not block a pull request: a new
 advisory against a crate we already use would fail every open pull request for
@@ -151,9 +110,9 @@ cargo-cyclonedx, Bazel, buck2) is pinned in the workflow by URL and SHA-256 and
 installed by `cargo xtask fetch`, which refuses a download whose SHA-256 differs
 before it unpacks or writes anything.
 
-The pull-request gate is 99.00% of lines and 99.00% of branches in every crate,
-measured on the fast tests (the `pr` profile of `.config/nextest.toml`) by the
-`test` job. The target is 100%, and reviewers hold the rest: a pull request
+The pull-request gate (rules T1 and T3 of [AGENTS.md](AGENTS.md)) is 99.00% of
+lines and 99.00% of branches in every crate, measured on the fast tests (the
+`pr` profile of `.config/nextest.toml`) by the `test` job. The target is 100%, and reviewers hold the rest: a pull request
 covers the code it adds or changes.
 
 The fast tests run in shards, in the matrix job `test-shard`: the scheduler's

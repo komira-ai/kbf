@@ -124,6 +124,9 @@ prost-types = "0.14.4"
 # Message-only code for a proto with no gRPC service (kbf-invocation). Already in the
 # tree through tonic-prost-build.
 prost-build = "0.14.4"
+# The CommonMark parser that reads CLAUDE.md in kbf-integration-test's `agents_md` lint. Already
+# in the tree through prost-build; no default features: no HTML rendering, no getopts.
+pulldown-cmark = { version = "0.13.5", default-features = false }
 # The RFC 8187 `filename*` of the blob route's Content-Disposition (kbf-server). Already in
 # the tree through axum.
 percent-encoding = "2.3.2"

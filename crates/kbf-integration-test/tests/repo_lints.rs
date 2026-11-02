@@ -66,10 +66,13 @@
 //!   instead of the defect it catches (module `test_wording`, whose docs state the rule);
 //! - a test that opens a `file://` cold store without naming its
 //!   free-space floor (module `store_floor`, whose docs say what it misses);
+//! - `AGENTS.md`'s shared core drifting from its hashed copy in `tools/agents/`, and
+//!   `CLAUDE.md` no longer importing `AGENTS.md` (module `agents_md`);
 //! - the scans passing vacuously because git listed nothing, no Markdown file was
 //!   scanned or the workflows moved;
 //! - a drift in the rules that pick which files each lint reads (module `selection`).
 
+mod agents_md;
 mod attested_assets;
 mod attested_bundles;
 mod beta_pins;
