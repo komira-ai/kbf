@@ -146,12 +146,12 @@ fn join(mut ops: OpsState, halts: HaltsFile) -> OpsState {
             standing = true;
         }
         for ack in &mut marks.halt_acked {
-            if ack.report.is_none() {
-                ack.report = kept
-                    .halt_acked
-                    .iter()
-                    .find(|k| k.is_about(&ack.node_id, &ack.target))
-                    .map(|k| k.report.clone());
+            if let Some(k) = kept
+                .halt_acked
+                .iter()
+                .find(|k| k.is_about(&ack.node_id, &ack.target))
+            {
+                ack.report = Some(k.report.clone());
             }
         }
         if standing {

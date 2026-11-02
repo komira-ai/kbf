@@ -245,3 +245,28 @@ fn only_the_defined_services_generations_are_told_and_the_answer_reads() {
         .read(|state| state.services["gone-0"].halt_generation);
     assert_eq!(kept, 5);
 }
+
+/// Catches: the end of an acknowledgement decided on a read made before another writer ended
+/// it: the host reports something else, and while its change waits the acknowledgement is gone
+/// already. Nothing is ended twice: no `halt_ack_ended` is audited for it.
+#[test]
+fn an_acknowledgement_another_writer_ended_first_is_not_ended_again() {
+    let rig = rig("halt-race-ack-gone");
+    rig.coordinator.heartbeat(storage("s1"), halting());
+    clear(&rig).expect("cleared");
+    assert_eq!(kbf(&rig).halt_acked, [HaltAck::from(halt_of("s1"))]);
+    rig.coordinator.ops().interleave(|state| {
+        let marks = state.services.entry(KBF.to_owned()).or_default();
+        marks.halt_acked.clear();
+    });
+    rig.coordinator.heartbeat(storage("s1"), beat("1.0"));
+    assert_eq!(kbf(&rig).halt_acked, []);
+    let ended = rig.coordinator.ops().read(|state| {
+        state
+            .audit
+            .iter()
+            .filter(|entry| entry.action == "halt_ack_ended")
+            .count()
+    });
+    assert_eq!(ended, 0);
+}
