@@ -2,7 +2,9 @@
 //! section 3).
 //!
 //! CI sets it with one call: the version every host should run, how many hosts of a kind
-//! may update at once, and how many storage hosts and frontends must stay up. The store
+//! may update at once (only 0, which holds the role, matters: one update is live at a time
+//! across every service, [`crate::decide`]), and how many storage hosts and frontends must
+//! stay up. The store
 //! keeps one such state per service name; a service must be `kbf` or one the services file
 //! defines (`crate::services`). Hosts are ordered only for `kbf` until their heartbeats
 //! name other services. It is one small JSON file, replaced whole by a temporary file,
@@ -176,7 +178,9 @@ fn read_max_updating<'de, D: serde::Deserializer<'de>>(d: D) -> Result<RoleLimit
 pub struct Desired {
     /// The version every host should run. An older one than the hosts run is a rollback.
     pub version: Version,
-    /// The per-role limit on hosts updating at once.
+    /// The per-role limit on hosts updating at once. Kept, read and written as before so
+    /// older states load and older coordinators read this one's, but only 0 (the role is held)
+    /// matters: one update is live at a time across every service ([`crate::decide`]).
     #[serde(
         default = "RoleLimits::max_updating_default",
         deserialize_with = "read_max_updating",

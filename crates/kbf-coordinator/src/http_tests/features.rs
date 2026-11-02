@@ -87,6 +87,9 @@ async fn an_agent_that_announced_nothing_gets_the_reply_alone() {
     assert_eq!(nothing, r#"{"reply":"nothing"}"#);
     let kbf_order = beat_text(&rig, "d2", "daemon", &beat("1.0", "")).await;
     assert_eq!(kbf_order, r#"{"reply":"update","version":"2.0"}"#);
+    // d2 reports its update done, so the one live update is over and d3 may be ordered.
+    let done = beat_text(&rig, "d2", "daemon", &beat("2.0", "")).await;
+    assert_eq!(done, r#"{"reply":"nothing"}"#);
     let service_order = beat_text(&rig, "d3", "daemon", &beat("2.0", OTHER)).await;
     assert_eq!(
         service_order,

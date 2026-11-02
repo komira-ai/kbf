@@ -89,12 +89,13 @@ fn a_host_whose_role_no_definition_names_is_never_ordered() {
     assert_eq!(ask("d1"), update());
 }
 
-/// Catches: the slots and the minimum of a role that is not one of the four being read from
-/// another role's numbers, or ignored. With two slots and one host that must stay up, of
-/// three builders the first two are ordered and the third waits; with a minimum of three
-/// nobody is ordered, there being only two others.
+/// Catches: the limit and the minimum of a role that is not one of the four being read from
+/// another role's numbers, or ignored, and a limit of two letting a second host go. With two
+/// slots and one host that must stay up, of three builders the first is ordered and the other
+/// two wait for it; with a limit of zero nobody is ordered; with a minimum of three nobody is
+/// ordered, there being only two others.
 #[test]
-fn a_non_legacy_role_is_ordered_by_its_own_min_up_and_slots() {
+fn a_non_legacy_role_is_ordered_by_its_own_min_up_and_limit() {
     let role = RoleDef {
         max_updating: Some(2),
         min_up: Some(1),
@@ -103,35 +104,51 @@ fn a_non_legacy_role_is_ordered_by_its_own_min_up_and_slots() {
     let services = pool(role);
     let all = want("");
     let mut fleet = builders(&["b1", "b2", "b3"]);
-    for host in ["b1", "b2"] {
-        assert_eq!(ask(&services, &all, &fleet, host), update(), "{host}");
-        fleet.order("pool", id(host), version("2.0"), NOW);
+    assert_eq!(ask(&services, &all, &fleet, "b1"), update());
+    fleet.order("pool", id("b1"), version("2.0"), NOW);
+    for host in ["b2", "b3"] {
+        assert_eq!(ask(&services, &all, &fleet, host), Reply::Nothing, "{host}");
     }
-    assert_eq!(ask(&services, &all, &fleet, "b3"), Reply::Nothing);
+
+    let held = pool(RoleDef {
+        max_updating: Some(0),
+        ..RoleDef::plain()
+    });
+    let fleet = builders(&["b1", "b2", "b3"]);
+    assert_eq!(ask(&held, &all, &fleet, "b1"), Reply::Nothing);
 
     let strict = pool(RoleDef {
         min_up: Some(3),
         ..RoleDef::plain()
     });
-    let fleet = builders(&["b1", "b2", "b3"]);
     assert_eq!(ask(&strict, &all, &fleet, "b1"), Reply::Nothing);
 }
 
 /// Catches: the order of precedence for a role's limit changed: the definition's number
-/// beats the desired state's, which beats the default. With a definition limit of one, a
-/// desired limit of three changes nothing; without one, the desired limit of two lets a
-/// second host go.
+/// beats the desired state's, which beats the default. A limit counts only as zero (the role
+/// is held) or not: a definition limit of one orders a builder whatever the desired state
+/// says, a definition limit of zero holds it whatever the desired state says, and without a
+/// definition limit the desired state's zero holds it and its two orders one host.
 #[test]
 fn the_definitions_limit_beats_the_desired_state_which_beats_the_default() {
+    let zero = want(r#","max_updating":{"builder":0}"#);
     let two = want(r#","max_updating":{"builder":2}"#);
+    let fleet = builders(&["b1", "b2"]);
     let bound = pool(RoleDef {
         max_updating: Some(1),
         ..RoleDef::plain()
     });
-    let mut fleet = builders(&["b1", "b2"]);
-    fleet.order("pool", id("b1"), version("2.0"), NOW);
-    assert_eq!(ask(&bound, &two, &fleet, "b2"), Reply::Nothing);
+    assert_eq!(ask(&bound, &zero, &fleet, "b2"), update());
+    let shut = pool(RoleDef {
+        max_updating: Some(0),
+        ..RoleDef::plain()
+    });
+    assert_eq!(ask(&shut, &two, &fleet, "b2"), Reply::Nothing);
     let open = pool(RoleDef::plain());
+    assert_eq!(ask(&open, &zero, &fleet, "b2"), Reply::Nothing);
     assert_eq!(ask(&open, &two, &fleet, "b2"), update());
-    assert_eq!(ask(&open, &want(""), &fleet, "b2"), Reply::Nothing);
+    assert_eq!(ask(&open, &want(""), &fleet, "b2"), update());
+    let mut ordered = builders(&["b1", "b2"]);
+    ordered.order("pool", id("b1"), version("2.0"), NOW);
+    assert_eq!(ask(&open, &two, &ordered, "b2"), Reply::Nothing);
 }
