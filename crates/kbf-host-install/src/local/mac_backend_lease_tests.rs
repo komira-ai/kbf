@@ -20,6 +20,7 @@ use crate::runner::{Cmd, Exec, Runner};
 #[derive(Clone)]
 pub(crate) struct Leases {
     answer: Rc<RefCell<Result<usize, String>>>,
+    note: Rc<RefCell<Option<String>>>,
     asked: Rc<Cell<usize>>,
 }
 
@@ -28,6 +29,7 @@ impl Leases {
     pub(crate) fn idle() -> Self {
         Self {
             answer: Rc::new(RefCell::new(Ok(0))),
+            note: Rc::default(),
             asked: Rc::default(),
         }
     }
@@ -39,8 +41,13 @@ impl Leases {
 
 impl LeaseSource for Leases {
     fn live(&self) -> Result<usize, String> {
+        self.live_noted().map(|(n, _)| n)
+    }
+
+    fn live_noted(&self) -> Result<(usize, Option<String>), String> {
         self.asked.set(self.asked.get() + 1);
-        self.answer.borrow().clone()
+        let note = self.note.borrow().clone();
+        self.answer.borrow().clone().map(|n| (n, note))
     }
 }
 
@@ -57,6 +64,7 @@ struct Rig {
     fx: Fx,
     sim: Rc<Sim>,
     leases: Leases,
+    logged: Rc<RefCell<Vec<String>>>,
     ab: Ab<MacBackend>,
 }
 
@@ -67,11 +75,16 @@ impl Rig {
         mkdir(&fx.host.work, 0o711);
         let sim = Rc::new(fx.sim());
         let leases = Leases::idle();
+        let logged = Rc::new(RefCell::new(Vec::new()));
         let backend = MacBackend::new(
             fx.host.clone(),
             Box::new(Shared(Rc::clone(&sim))),
             Box::new(leases.clone()),
-        );
+        )
+        .logging_to({
+            let logged = Rc::clone(&logged);
+            Box::new(move |line| logged.borrow_mut().push(line.to_owned()))
+        });
         let ab = Ab::new(
             backend,
             fx.host.work.join("state.json"),
@@ -83,6 +96,7 @@ impl Rig {
             fx,
             sim,
             leases,
+            logged,
             ab,
         };
         assert!(matches!(
@@ -189,4 +203,22 @@ fn a_lease_record_that_cannot_be_read_refuses_the_switch_with_the_reason() {
         )
     );
     rig.untouched();
+}
+
+/// Catches lease directories that a stopped daemon left being let through silently: when the
+/// count lets the switch through on that judgment, the switch is made and the count's note is
+/// in the log, whole; a count with no note logs nothing.
+#[test]
+fn a_judged_lease_count_switches_and_logs_its_note() {
+    let rig = Rig::staged("mbl-noted");
+    let note = "/Volumes/kbf/data/leases/lease-3-7 remains and no kbf daemon is running; the \
+                daemon's start-up sweep removes it";
+    *rig.leases.note.borrow_mut() = Some(note.to_owned());
+    assert!(matches!(rig.switch(), Answer::Switched { .. }));
+    assert_eq!(rig.current().as_deref(), Some(NEW));
+    assert_eq!(*rig.logged.borrow(), [format!("leases: {note}")]);
+
+    let rig = Rig::staged("mbl-plain");
+    assert!(matches!(rig.switch(), Answer::Switched { .. }));
+    assert!(rig.logged.borrow().is_empty());
 }

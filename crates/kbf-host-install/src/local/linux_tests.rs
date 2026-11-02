@@ -37,7 +37,7 @@ use crate::runner::{Cmd, Exec, Runner};
 use crate::trust::Trust;
 
 /// The backend of a rig, lent to the core, which owns the one it is given.
-struct Borrowed<'a>(&'a Linux<ScratchHost>);
+pub(super) struct Borrowed<'a>(pub(super) &'a Linux<ScratchHost>);
 
 impl Backend for Borrowed<'_> {
     fn lock_file(&self) -> PathBuf {
@@ -82,14 +82,14 @@ impl Backend for Borrowed<'_> {
 }
 
 /// A file of the host's configuration: written, and readable by all but writable by its owner.
-fn put(path: &Path, text: impl AsRef<str>) {
+pub(super) fn put(path: &Path, text: impl AsRef<str>) {
     fs::write(path, text.as_ref()).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o644)).unwrap();
 }
 
 /// What a build of `commit` prints for `--version --json`, with the protocol numbers this
 /// installer understands.
-fn what_kbf_says(commit: &str) -> String {
+pub(super) fn what_kbf_says(commit: &str) -> String {
     version_json(commit, "release")
         .replace("\"protocol\":4", "\"protocol\":1")
         .replace("\"min_protocol\":3", "\"min_protocol\":1")
@@ -97,9 +97,9 @@ fn what_kbf_says(commit: &str) -> String {
 }
 
 /// The release that runs.
-const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+pub(super) const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
-fn arch_name() -> &'static str {
+pub(super) fn arch_name() -> &'static str {
     if std::env::consts::ARCH == "aarch64" {
         "arm64"
     } else {
@@ -107,11 +107,11 @@ fn arch_name() -> &'static str {
     }
 }
 
-fn version() -> Version {
+pub(super) fn version() -> Version {
     Version::new(&format!("0.1.7+g{}-3", &COMMIT[..12])).unwrap()
 }
 
-fn stable() -> Channel {
+pub(super) fn stable() -> Channel {
     Channel::new("stable").unwrap()
 }
 
@@ -134,27 +134,27 @@ fn binary(tail: &str) -> Vec<u8> {
 
 /// What the network and the service manager do.
 #[derive(Default)]
-struct Net {
+pub(super) struct Net {
     /// The listing of the releases, one text per page.
-    pages: Vec<String>,
+    pub(super) pages: Vec<String>,
     /// The files of each release, by tag and then by asset name.
-    assets: BTreeMap<String, BTreeMap<String, Vec<u8>>>,
+    pub(super) assets: BTreeMap<String, BTreeMap<String, Vec<u8>>>,
     /// Things that go wrong, by name.
-    broken: BTreeSet<&'static str>,
+    pub(super) broken: BTreeSet<&'static str>,
     /// Units that do not restart, units that do not restart the first time, and units that
     /// never become active.
-    restart_fails: BTreeSet<String>,
-    restart_fails_once: BTreeSet<String>,
-    inactive: BTreeSet<String>,
+    pub(super) restart_fails: BTreeSet<String>,
+    pub(super) restart_fails_once: BTreeSet<String>,
+    pub(super) inactive: BTreeSet<String>,
 }
 
 /// The programs of the host-install side: `curl`, `gh release download`, `systemctl`.
-struct Sim {
-    net: Rc<RefCell<Net>>,
-    calls: Rc<RefCell<Vec<Cmd>>>,
+pub(super) struct Sim {
+    pub(super) net: Rc<RefCell<Net>>,
+    pub(super) calls: Rc<RefCell<Vec<Cmd>>>,
 }
 
-fn exec(code: i32, stdout: &str, stderr: &str) -> io::Result<Exec> {
+pub(super) fn exec(code: i32, stdout: &str, stderr: &str) -> io::Result<Exec> {
     Ok(Exec {
         code: Some(code),
         signal: None,
@@ -276,7 +276,7 @@ struct Rig {
 }
 
 /// The host's processes, as a test sets them.
-struct Running(Rc<RefCell<Vec<PathBuf>>>);
+pub(super) struct Running(pub(super) Rc<RefCell<Vec<PathBuf>>>);
 
 impl kbf_installer::helper::service::Procs for Running {
     fn exe_of(&self, _pid: u32) -> io::Result<PathBuf> {
@@ -359,6 +359,9 @@ impl Rig {
                 Unit::service("kbf-daemon.service").unwrap(),
                 Unit::service("kbf-frontend@a.service").unwrap(),
             ],
+            launchd: None,
+            leases: Box::new(super::linux::NoLeases),
+            log: Box::new(|_| {}),
             restart_wait: Wait {
                 timeout: Duration::from_millis(40),
                 interval: Duration::from_millis(1),

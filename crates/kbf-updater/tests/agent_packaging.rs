@@ -206,6 +206,11 @@ fn the_macos_jobs_agree_with_the_programs_and_with_each_other() {
         serve.units.is_empty(),
         "a Mac restarts the daemon's job, not a unit"
     );
+    assert_eq!(
+        serve.launchd_label.as_deref(),
+        Some("com.komira.kbf-daemon"),
+        "the job kbf-mac-provision installs, on the installer layout"
+    );
     assert_eq!(plist_value(&helper, "UserName"), "root");
     for plist in [&agent, &helper] {
         assert!(plist.contains("<key>KeepAlive</key>\n\t<true/>"));

@@ -38,7 +38,8 @@ pub mod units;
 // Compiled and tested everywhere, used by the program on Linux only.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub mod frontend;
-#[cfg(target_os = "linux")]
+// The installer layout: a Linux host's, and a Mac's that the `kbf-installer` package laid out.
+pub mod launchd;
 pub mod linux;
 #[cfg(target_os = "linux")]
 mod linux_image;
@@ -60,6 +61,8 @@ mod answer_tests;
 #[cfg(test)]
 mod core_activate_tests;
 #[cfg(test)]
+mod core_lease_tests;
+#[cfg(test)]
 mod core_tests;
 #[cfg(all(test, target_os = "linux"))]
 mod linux_tests;
@@ -67,6 +70,10 @@ mod linux_tests;
 mod mac_backend_lease_tests;
 #[cfg(test)]
 mod mac_backend_tests;
+#[cfg(test)]
+mod mac_installer_serve_tests;
+#[cfg(all(test, target_os = "linux"))]
+mod mac_installer_tests;
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) mod package_tests;
 #[cfg(test)]

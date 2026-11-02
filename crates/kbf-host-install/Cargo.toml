@@ -37,15 +37,14 @@ flate2.workspace = true
 sha2.workspace = true
 tar.workspace = true
 
-# The lease count a Mac's switch makes before it moves a link: the installer's Mac lease
-# source (`kbf_installer::helper::mac_leases`) over the host root (`kbf-host`). The Linux side
-# also uses both for the layout, the state and the verify pipeline of `kbf-installer`.
+# The installer layout, its state and its verify pipeline (`kbf-installer`, over the host
+# root of `kbf-host`), on a Linux host and on a Mac the `kbf-installer` package laid out; and
+# the lease count a Mac's switch makes before it moves a link
+# (`kbf_installer::helper::mac_leases`).
 kbf-host.workspace = true
 kbf-installer.workspace = true
-
-# The Linux side of the local socket moves releases in the layout, with the state and the
-# verify pipeline of `kbf-installer`, so a host has one of each.
-[target.'cfg(target_os = "linux")'.dependencies]
+# The locator of a release the installer's verify pipeline takes, on the installer layout of
+# both platforms.
 kbf-update.workspace = true
 
 [dev-dependencies]

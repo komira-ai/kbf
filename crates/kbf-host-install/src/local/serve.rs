@@ -74,7 +74,7 @@ pub(super) const REVERT_RETRY: Duration = Duration::from_secs(30);
 
 pub const USAGE: &str = "usage: kbf-host-install --serve --socket PATH --socket-user NAME \
 [--window-secs N] [--keep-releases N] [--layout installer|deb|rpm] \
-(--restart-unit UNIT... | --frontend-container [--frontend-config PATH])\n";
+(--restart-unit UNIT... | --frontend-container [--frontend-config PATH] | --launchd-label LABEL)\n";
 
 /// How a host keeps the releases it runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -114,6 +114,9 @@ pub struct ServeConfig {
     pub frontend_container: bool,
     /// The frontend container's configuration file.
     pub frontend_config: PathBuf,
+    /// On a Mac, the daemon's launchd job on the installer layout. Without it a Mac serves
+    /// the kit.
+    pub launchd_label: Option<String>,
 }
 
 impl ServeConfig {
@@ -131,6 +134,7 @@ impl ServeConfig {
         let mut units = Vec::new();
         let mut frontend_container = false;
         let mut frontend_config = None;
+        let mut launchd_label = None;
         let mut rest = args.iter();
         while let Some(arg) = rest.next() {
             let (name, inline) = match arg.split_once('=') {
@@ -164,6 +168,7 @@ impl ServeConfig {
                 "--keep-releases" => once(&mut keep)?,
                 "--layout" => once(&mut layout)?,
                 "--frontend-config" => once(&mut frontend_config)?,
+                "--launchd-label" => once(&mut launchd_label)?,
                 "--restart-unit" => {
                     units.push(Unit::service(&value).map_err(|BadCommand| {
                         format!("--restart-unit {value:?} is not a kbf unit")
@@ -207,6 +212,21 @@ impl ServeConfig {
                 "--frontend-container and --layout deb or rpm are not given together".to_owned(),
             );
         }
+        if let Some(label) = &launchd_label {
+            if !is_launchd_label(label) {
+                return Err(format!(
+                    "--launchd-label {label:?} is not a launchd label (letters, digits, '.', \
+                     '-' and '_', at most 128)"
+                ));
+            }
+            if !units.is_empty() || frontend_container || layout != Layout::Installer {
+                return Err(
+                    "--launchd-label is for a Mac on the installer layout: it is not \
+                     given with --restart-unit, --frontend-container or --layout deb or rpm"
+                        .to_owned(),
+                );
+            }
+        }
         let frontend_config = match frontend_config {
             Some(_) if !frontend_container => {
                 return Err("--frontend-config needs --frontend-container".to_owned());
@@ -226,8 +246,19 @@ impl ServeConfig {
             units,
             frontend_container,
             frontend_config,
+            launchd_label,
         })
     }
+}
+
+/// Whether `label` is a launchd job label this program takes: letters, digits, `.`, `-` and
+/// `_`, at most 128 of them (`com.komira.kbf-daemon`).
+fn is_launchd_label(label: &str) -> bool {
+    !label.is_empty()
+        && label.len() <= 128
+        && label
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b".-_".contains(&c))
 }
 
 /// The ids of the account `name` in the text of a passwd file.

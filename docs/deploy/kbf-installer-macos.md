@@ -130,17 +130,24 @@ kbf-proxy packages (package-update design, `design.md` section 12), then run `se
 ## Updating
 
 A Mac takes update orders from the farm's coordinator through its host agent (`kbf-updater
-agent`, as `_kbf-updater`) and the root helper's local socket (`kbf-host-install --serve`), as a
-Linux daemon host does ([the updater guide](kbf-updater.md)). The agent drains the node at the
+agent`, as `_kbf-updater`) and the root helper's local socket (`kbf-host-install --serve
+--launchd-label com.komira.kbf-daemon`, the job `packaging/host-agent/macos` ships), as a
+Linux daemon host does ([the updater guide](kbf-updater.md)). The helper works on this page's
+layout: it stages the release into `/usr/local/kbf-installer/releases`, verified as the
+installer verifies one, moves the links in the installer's state, and kickstarts the daemon's
+job ([the host-install guide](host-install.md), "A Mac on the installer layout"). The stage
+runs nothing against `kbf.toml` and does not read the node's key. The agent drains the node at the
 frontend and waits until it holds no lease. Then the helper counts the leases again, as root,
 from what the native driver leaves on the host: the daemon's keepers (`kbf-keeper __keeper ...`)
 and its lease directories (`<data-dir>/leases/lease-*`, `data-dir` from the root-owned
 `kbf.toml`). It counts them the same way whether the daemon runs as its own account or as root
 with a pool of lease users (`[macos] pool-users`).
 
-- With a lease live, the switch is refused (`leases_live`) and nothing moves. The agent
-  reports the update as deferred (reason `leases_live`), and the coordinator orders it again
-  after the wait.
+- With a lease live, the switch is refused (`leases_live`) and nothing moves. When the
+  coordinator advertises `deferred-v1`, the agent reports the update as deferred (reason
+  `leases_live`), and the coordinator orders it again after the wait. With a coordinator that
+  does not advertise it, the update is reported as a plain `Failed`, and the agent takes the
+  order again after its `--retry-secs`.
 - With none, the release is switched to on trial, checked and confirmed.
 - When the count cannot be made (a `kbf.toml` the helper cannot rely on, a `leases/` that is a
   link, a process listing that failed, no `sandbox-exec`), the switch is refused

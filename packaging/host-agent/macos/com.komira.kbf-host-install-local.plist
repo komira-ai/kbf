@@ -3,9 +3,12 @@
 <!--
   kbf-host-install's local socket on a Mac: the root half of this host's update agent
   (docs/design/updates.md, section 4; docs/deploy/host-install.md). A system launchd job, as
-  root. It binds a socket only the account _kbf-updater can connect to (mode 0600), in its
-  work directory, stages the release beside the one that runs in the kit tree, switches to it on
-  trial, and goes back to the one that ran when nobody confirms the new one by its deadline.
+  root. It binds a socket only the account _kbf-updater can connect to (mode 0600), stages the
+  release beside the one that runs in the installer layout (/usr/local/kbf-installer, laid out
+  by the kbf-installer package and kbf-mac-provision), counts the Mac's leases before it
+  switches, switches to it on trial by kickstarting the daemon's job named by --launchd-label,
+  and goes back to the one that ran when nobody confirms the new one by its deadline. On a Mac
+  the older kit laid out (/usr/local/kbf), leave out the two --launchd-label lines.
   The ssh forced command (and its sudo rule) is not this job and is unchanged.
 -->
 <plist version="1.0">
@@ -22,6 +25,8 @@
 		<string>_kbf-updater</string>
 		<string>--window-secs</string>
 		<string>600</string>
+		<string>--launchd-label</string>
+		<string>com.komira.kbf-daemon</string>
 	</array>
 	<key>UserName</key>
 	<string>root</string>

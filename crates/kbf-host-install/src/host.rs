@@ -157,6 +157,21 @@ impl Host {
         }
     }
 
+    /// A Mac's paths, for the local socket on the installer layout: the lock under
+    /// `/var/run`, the node's `kbf.toml` where `kbf-mac-provision` writes it. A Mac has no
+    /// host name file, so the node's id is the one `kbf.toml` names (`[identity] node-id`).
+    /// The paths only the ssh path or a package host reads (its configuration, `/proc/locks`,
+    /// the dpkg lock) are left where nothing is found.
+    pub fn production_mac() -> Self {
+        Self {
+            config: PathBuf::from("/usr/local/etc/kbf/host-install.toml"),
+            install_lock: PathBuf::from("/var/run/kbf-host-install.lock"),
+            node_config: PathBuf::from("/usr/local/etc/kbf/kbf.toml"),
+            hostname: PathBuf::from("/var/empty/hostname"),
+            ..Self::production()
+        }
+    }
+
     /// Paths under `dir`, trusting `trust`, for tests.
     #[cfg(test)]
     pub fn for_test(dir: &std::path::Path, trust: Trust) -> Self {

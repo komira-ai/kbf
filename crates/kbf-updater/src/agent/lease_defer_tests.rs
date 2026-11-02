@@ -177,3 +177,54 @@ fn without_deferred_v1_a_live_lease_on_a_mac_is_a_plain_failure() {
     );
     assert_eq!(rig.events.count("local:revert"), 0);
 }
+
+/// Every code the previous release's helper (v0.0.63) refuses a switch with: it has no
+/// `leases_live`.
+const PREVIOUS_HELPER_CODES: [&str; 22] = [
+    "bad_command",
+    "channel_not_allowed",
+    "config_invalid",
+    "config_unsafe",
+    "unknown_release",
+    "ambiguous_release",
+    "fetch_failed",
+    "verify_failed",
+    "pending",
+    "not_staged",
+    "nothing_pending",
+    "no_current",
+    "busy",
+    "stage_failed",
+    "switch_failed",
+    "revert_failed",
+    "state_unavailable",
+    "audit_unavailable",
+    "peer_not_ready",
+    "runtime_failed",
+    "not_kept",
+    "restart_failed",
+];
+
+/// Catches this agent taking a previous helper's refusal for a deferral: against a helper of
+/// the previous release, which never sends `leases_live`, a switch refused with any code that
+/// helper has ends as it did, even with `deferred-v1` advertised: no deferral, a `Failed` of
+/// the target, and the agent goes back (it asks the helper to revert).
+#[test]
+fn with_a_previous_helper_a_refused_switch_still_goes_back_as_before() {
+    for code in PREVIOUS_HELPER_CODES {
+        let rig = Rig::new(&format!("lease-prev-{code}"));
+        rig.local.world().switch = Err(LocalError::Refused(code.to_owned()));
+        rig.coordinator.advertise(&["deferred-v1"]);
+        let agent = rig.agent();
+        rig.take_order(&agent);
+        agent.beat_once();
+        let beat = rig.last_beat();
+        assert_eq!(beat.deferred, None, "{code}");
+        assert_eq!(
+            beat.last_update,
+            Some(UpdateResult::new(version(VB), Outcome::Failed)),
+            "{code}"
+        );
+        assert_eq!(rig.events.count("local:revert"), 1, "{code}");
+    }
+}

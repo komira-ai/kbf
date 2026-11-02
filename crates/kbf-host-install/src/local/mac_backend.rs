@@ -61,6 +61,8 @@ pub struct MacBackend {
     runner: Box<dyn Runner>,
     /// The leases that run on the host, counted before a switch.
     leases: Box<dyn LeaseSource>,
+    /// Where a note the lease count gives goes (the program's log).
+    log: Box<dyn Fn(&str)>,
 }
 
 impl MacBackend {
@@ -69,14 +71,29 @@ impl MacBackend {
             host,
             runner,
             leases,
+            log: Box::new(super::production::log),
         }
     }
 
-    /// `Ok` when no lease runs on the host; the refusal that changes nothing otherwise.
+    /// This backend, telling the lease count's notes to `log`.
+    #[cfg(test)]
+    pub(super) fn logging_to(mut self, log: Box<dyn Fn(&str)>) -> Self {
+        self.log = log;
+        self
+    }
+
+    /// `Ok` when no lease runs on the host; the refusal that changes nothing otherwise. A
+    /// note the count gives (lease directories left by a daemon that is not running) goes to
+    /// the log.
     fn idle(&self) -> Result<(), Fault> {
-        match self.leases.live() {
-            Ok(0) => Ok(()),
-            Ok(n) => Err(Fault::refused(
+        match self.leases.live_noted() {
+            Ok((0, note)) => {
+                if let Some(note) = note {
+                    (self.log)(&format!("leases: {note}"));
+                }
+                Ok(())
+            }
+            Ok((n, _)) => Err(Fault::refused(
                 Code::LeasesLive,
                 format!("{n} leases are live; not switching"),
             )),

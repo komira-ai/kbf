@@ -12,7 +12,7 @@ here is in a package yet: the binaries are release assets (`docs/deploy/host-ins
 | `linux/kbf-updater-agent.service` | `kbf-updater agent`, as `kbf-updater`: the heartbeat to the coordinator and the host's A/B through that socket |
 | `linux/kbf-updater.conf` | the sysusers.d entry of the `kbf-updater` account (no login, no home) |
 | `enroll-example.txt` | the enrollment command, as the tests read it |
-| `macos/com.komira.kbf-host-install-local.plist` | the same socket on a Mac, as root, in `/var/db/kbf-host-install` |
+| `macos/com.komira.kbf-host-install-local.plist` | the same socket on a Mac, as root, its state in `/var/db/kbf-host-install`: on the installer layout of the `kbf-installer` package, restarting the daemon's job `com.komira.kbf-daemon` (`--launchd-label`); on a Mac the older kit laid out, without `--launchd-label` |
 | `macos/com.komira.kbf-updater-agent.plist` | the agent on a Mac, as `_kbf-updater` |
 
 The values in the files are examples (`coordinator.farm.example`, `frontend.farm.example`, the

@@ -246,9 +246,55 @@ is not started when the log cannot be opened.
 
 A Mac takes the same `install kbf=<version> from <channel>` and `query` requests (a `restart`
 is refused as `bad_command`) and answers in the same shape, but it installs the attested release tarball
-`kbf-<commit>-darwin-arm64.tar.gz` (not a package), into the kit layout, and restarts the
-daemon's launchd job on it. The program is the same binary; the platform picks the Mac side.
-Nothing here is a Homebrew formula or a `kbf-installer` order.
+`kbf-<commit>-darwin-arm64.tar.gz` (not a package) and restarts the daemon's launchd job on it.
+The program is the same binary; the platform picks the Mac side. Nothing here is a Homebrew
+formula or a `kbf-installer` order.
+
+A Mac is served in one of two layouts:
+
+- **The installer layout**, with `--serve ... --launchd-label <label>`. This is the layout the
+  `kbf-installer` package and `kbf-mac-provision` lay out
+  ([installing kbf on a macOS host](kbf-installer-macos.md)), and the one the shipped
+  `packaging/host-agent/macos/com.komira.kbf-host-install-local.plist` serves with the label
+  `com.komira.kbf-daemon`. See "A Mac on the installer layout" below.
+- **The kit layout**, without `--launchd-label`, for a Mac that the older Mac kit laid out. The
+  rest of this section describes it.
+
+### A Mac on the installer layout
+
+The releases are `/usr/local/kbf-installer/releases/<commit>/kbf`, with the links `current` and
+`previous` beside them, and the state is `kbf-installer`'s, in `/var/db/kbf-installer`. The
+daemon's job runs `releases/current/kbf --mode=daemon --config /usr/local/etc/kbf/kbf.toml`, as
+root. The helper is the Linux helper of the installer layout with three changes:
+
+- **Stage.** It fetches the `darwin-<arch>` release and verifies it as the installer does:
+  - size and digest;
+  - `gh attestation verify` offline;
+  - a Mach-O of this CPU, with no quarantine and the signature CI makes;
+  - the binary's own word on its commit (`--version --json`), asked as the installer's
+    unprivileged user with an empty environment.
+
+  It runs no `--check` against `kbf.toml`, and nothing reads the node's key, which is root's
+  alone on a root daemon.
+- **Switch.**
+  1. It first counts the leases that run on the Mac as root sees them: the daemon's keepers and
+     its lease directories, in daemon-user mode and in pool mode
+     ([installing kbf on a macOS host](kbf-installer-macos.md), "Updating").
+     - With one live, it refuses `leases_live` and nothing moves.
+     - When the count cannot be made, it refuses `state_unavailable`.
+     - When the count let the switch through on a judgment (lease directories left with no
+       daemon running), its note goes to the log as `leases: ...`.
+  2. It then writes the trial marker into the state, moves the links, and runs
+     `launchctl kickstart -k system/<label>`.
+  3. It waits until the job's process runs `releases/<commit>/kbf` (`launchctl print` for its
+     pid, `lsof` for its program).
+  4. If the process does not run that release within the wait, the host goes back at once.
+- **The node's id** is `[identity] node-id` of `/usr/local/etc/kbf/kbf.toml`.
+
+Its channels are in `/usr/local/etc/kbf/host-install.toml`, in the same format as on the kit.
+The socket's own state is `/var/db/kbf-host-install/installer-state.json`. `--restart-unit`,
+`--frontend-container` and `--layout deb|rpm` are refused beside `--launchd-label`, and a
+Linux host refuses `--launchd-label`.
 
 ### The layout it works in
 
@@ -681,8 +727,11 @@ code from a closed set: `bad_command`, `channel_not_allowed`, `config_invalid`, 
 `releases`, the kept releases in the listing's format below (and `releases_omitted` when some are
 left out). The detail of a refusal goes to the journal, cleaned, never to the line. On a Mac, `switch`
 first counts the leases that run on the host as root sees them (the daemon's keepers and its lease
-directories, in daemon-user mode and in pool mode): with one live it is refused `leases_live` and
-nothing moves, and the agent takes that as a deferral; a count that cannot be made is refused
+directories, in daemon-user mode and in pool mode), on both layouts. With one live it is refused
+`leases_live` and nothing moves. An agent whose coordinator advertises `deferred-v1` reports
+that as a deferral (reason `leases_live`), and the coordinator orders the host again after the
+wait. With a coordinator that does not advertise it, the update ends as a plain `Failed`, and
+the agent tries the order again after its `--retry-secs`. A count that cannot be made is refused
 `state_unavailable`.
 
 ### The releases a host keeps

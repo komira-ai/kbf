@@ -547,3 +547,24 @@ fn a_full_listing_of_long_versions_is_read_within_the_answer_limit() {
     assert_eq!(state.commit.as_deref(), Some(COMMIT_A));
     assert_eq!(state.version, Some(version(VA)));
 }
+
+/// Catches a `leases_live` refusal that an agent of the previous release cannot read: the
+/// socket's reader (`SocketLocal`, the same code as in v0.0.63) takes the helper's real
+/// `leases_live` line as a refusal with that code, like any other refusal, and not as a broken
+/// answer; the detail stays in the helper's log.
+#[test]
+fn the_socket_reader_takes_a_leases_live_line_as_a_refusal() {
+    let d = dir("lc-leases-live");
+    let (socket, server) = serve(&d, 1, |_| {
+        line(&Answer::Refused(
+            Code::LeasesLive,
+            "1 leases are live; not switching".to_owned(),
+        ))
+    });
+    let helper = SocketLocal::new(&socket, limits());
+    assert_eq!(
+        helper.switch(&version(VB)),
+        Err(LocalError::Refused("leases_live".to_owned()))
+    );
+    assert_eq!(server.join().unwrap(), [format!("switch kbf={VB}")]);
+}

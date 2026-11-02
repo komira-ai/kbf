@@ -66,7 +66,7 @@ fn scratch(name: &str) -> (TestDir, std::path::PathBuf) {
 }
 
 /// Query through `socket` once it is there, then stop the serving.
-fn ask_then_stop(
+pub(super) fn ask_then_stop(
     socket: std::path::PathBuf,
     stop: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<String> {
