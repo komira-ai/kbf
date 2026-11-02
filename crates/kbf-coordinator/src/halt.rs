@@ -55,7 +55,7 @@ use crate::desired::{Desired, KBF};
 use crate::fleet::{Fleet, Node};
 use crate::identity::Identity;
 use crate::membership::{self, Standing};
-use crate::ops::{AuditEntry, Halt, HaltAck, OpsState, OpsStore, Write};
+use crate::ops::{AuditEntry, Halt, HaltAck, OpsError, OpsState, OpsStore, Write};
 use crate::services::Services;
 
 /// The feature an agent announces to be told the clear generations.
@@ -87,37 +87,29 @@ fn reported(last: Option<&UpdateResult>, id: &NodeId) -> Option<Halt> {
     })
 }
 
-/// Why `halt`, reported for `service`, is not raised.
-enum Ignored {
+/// Why a halt report changed nothing.
+enum Unchanged {
     /// An operator cleared this report.
     Acked,
-    /// The service is halted already: the report is kept for the clear ([`record`]).
-    Standing,
+    /// The service is halted already and the report is the halt's own or kept already.
+    Known,
+    /// The host has no acknowledgement that the report ends.
+    NoAck,
+    /// The ops file could not be written.
+    Store(OpsError),
 }
 
-/// Why `halt`, reported for `service`, is not raised: the first of the reasons in the module
-/// documentation that holds, or `None` when it is.
-fn ignored(state: &OpsState, service: &str, halt: &Halt) -> Option<Ignored> {
-    let marks = state.services.get(service);
-    let acked = marks.is_some_and(|m| {
-        m.halt_acked.iter().any(|a| {
-            halt.report
-                .as_ref()
-                .is_some_and(|r| a.matches(&halt.node_id, r))
-        })
-    });
-    if acked {
-        return Some(Ignored::Acked);
+impl From<OpsError> for Unchanged {
+    fn from(why: OpsError) -> Self {
+        Self::Store(why)
     }
-    if marks.is_some_and(|m| m.halt.is_some()) {
-        return Some(Ignored::Standing);
-    }
-    None
 }
 
 /// Raises the halts the heartbeat `beat` of the host `who` reports, for `kbf` (its top-level
 /// facts) and for each service it lists. Before the heartbeat is decided, so the host that
-/// reports a halt is ordered nothing in the same reply.
+/// reports a halt is ordered nothing in the same reply, and under the fleet's lock, which every
+/// decision and order is made under (`Coordinator::reply_to`): a halt is never raised between
+/// another heartbeat's decision to order and its order.
 ///
 /// A service whose update the host is running is skipped: its `last_update` is the one before,
 /// not a report. Otherwise a `last_update` that is not the halt an operator cleared for the
@@ -166,105 +158,107 @@ pub(crate) fn note(
 /// reason or class, or no halt at all) is a different report, so a halt the host reports from
 /// then on is a new failure, even of the same target. Written before it is in memory: it
 /// removes protection, and one that stays on disk would swallow the new failure after a
-/// restart. Answers whether it holds: `false` when the write failed and the acknowledgement
-/// stands, so no order may go out before it is gone.
+/// restart. Decided under the writers' lock, on the state it changes. Answers whether it
+/// holds: `false` when the write failed and the acknowledgement stands, so no order may go out
+/// before it is gone.
 fn end_ack(ops: &OpsStore, service: &str, id: &NodeId, report: Option<&Halt>) -> bool {
     let node = id.to_string();
     let report = report.and_then(|halt| halt.report.clone());
-    let differs = move |ack: &HaltAck| {
+    let differs = |ack: &HaltAck| {
         ack.node_id == node && !report.as_ref().is_some_and(|r| ack.matches(&node, r))
     };
     let held = ops.read(|state| {
         state
             .services
             .get(service)
-            .is_some_and(|m| m.halt_acked.iter().any(&differs))
+            .is_some_and(|m| m.halt_acked.iter().any(differs))
     });
     if !held {
         return true;
     }
-    let mut entry = AuditEntry::new(COORDINATOR, "halt_ack_ended");
-    entry.service = Some(service.to_owned());
-    entry.node_id = Some(id.to_string());
-    let name = service.to_owned();
-    let ended = ops.change(Write::BeforeMemory, entry, |state| {
-        let marks = state.services.entry(name).or_default();
+    let ended = ops.decide_change(Write::BeforeMemory, |state| {
+        let marks = state.services.entry(service.to_owned()).or_default();
+        let before = marks.halt_acked.len();
         marks.halt_acked.retain(|ack| !differs(ack));
+        if marks.halt_acked.len() == before {
+            return Err(Unchanged::NoAck);
+        }
+        let mut entry = AuditEntry::new(COORDINATOR, "halt_ack_ended");
+        entry.service = Some(service.to_owned());
+        entry.node_id = Some(node.clone());
+        Ok(entry)
     });
-    if let Err(why) = &ended {
-        tracing::error!(service, %why, "the end of an acknowledgement could not be written: no order for the host");
+    match ended {
+        Ok(_) | Err(Unchanged::NoAck) => true,
+        Err(Unchanged::Store(why)) => {
+            tracing::error!(service, %why, "the end of an acknowledgement could not be written: no order for the host");
+            false
+        }
+        Err(Unchanged::Acked | Unchanged::Known) => unreachable!("not answered by this change"),
     }
-    ended.is_ok()
 }
 
-/// Raises `halt` for `service` unless it is ignored: in memory first, then written. A failed
-/// write is logged and the halt stands in memory (a restart before the next write forgets it,
-/// and the host's next report raises it again).
+/// Raises `halt` for `service`, or keeps it for the clear when the service is halted already,
+/// unless an operator cleared exactly this report: in memory first, then written. Which of
+/// these it is is decided under the writers' lock, on the state the change is applied to, so a
+/// clear or another host's halt that got there first is seen. A failed write is logged and the
+/// change stands in memory (a restart before the next write forgets it, and the host's next
+/// report makes it again).
+///
+/// A report made while the halt stands is kept once per host, with the halt (`halt_seen`), for
+/// the clear to acknowledge: a report the halt itself holds, or one kept already, is not kept
+/// again.
 fn raise(ops: &OpsStore, service: &str, halt: Halt) {
-    match ops.read(|state| ignored(state, service, &halt)) {
-        None => {}
-        Some(Ignored::Standing) => return record(ops, service, halt),
-        Some(Ignored::Acked) => {
-            tracing::debug!(service, node_id = %halt.node_id, "ignored a halt report: cleared");
-            return;
+    let node_id = halt.node_id.clone();
+    let changed = ops.decide_change(Write::AfterMemory, |state| {
+        let marks = state.services.entry(service.to_owned()).or_default();
+        let acked = halt.report.as_ref().is_some_and(|report| {
+            marks
+                .halt_acked
+                .iter()
+                .any(|ack| ack.matches(&halt.node_id, report))
+        });
+        if acked {
+            return Err(Unchanged::Acked);
         }
-    }
-    tracing::error!(
-        alert = "halt",
-        service,
-        node_id = %halt.node_id,
-        check = %halt.check,
-        target = %halt.target,
-        "a host halted the service: nothing is ordered for it until an operator clears the halt"
-    );
-    let mut entry = AuditEntry::new(COORDINATOR, "halt");
-    entry.service = Some(service.to_owned());
-    entry.node_id = Some(halt.node_id.clone());
-    entry.reason = Some(halt.check.clone());
-    let name = service.to_owned();
-    let raised = ops.change(Write::AfterMemory, entry, |state| {
-        let marks = state.services.entry(name).or_default();
-        marks.halt.get_or_insert(halt);
+        let mut entry = AuditEntry::new(COORDINATOR, "halt");
+        entry.service = Some(service.to_owned());
+        entry.node_id = Some(halt.node_id.clone());
+        entry.reason = Some(halt.check.clone());
+        let Some(standing) = &marks.halt else {
+            tracing::error!(
+                alert = "halt",
+                service,
+                node_id = %halt.node_id,
+                check = %halt.check,
+                target = %halt.target,
+                "a host halted the service: nothing is ordered for it until an operator clears the halt"
+            );
+            marks.halt = Some(halt);
+            return Ok(entry);
+        };
+        let ack = HaltAck::from(halt);
+        let own = (&standing.node_id, &standing.report) == (&ack.node_id, &ack.report);
+        if own || marks.halt_seen.contains(&ack) {
+            return Err(Unchanged::Known);
+        }
+        marks.halt_seen.retain(|seen| seen.node_id != ack.node_id);
+        marks.halt_seen.push(ack);
+        entry.action = "halt_report".to_owned();
+        Ok(entry)
     });
-    if let Err(why) = raised {
-        tracing::error!(
+    match changed {
+        Ok(_) | Err(Unchanged::Known | Unchanged::NoAck) => {}
+        Err(Unchanged::Acked) => {
+            tracing::debug!(service, %node_id, "ignored a halt report: cleared");
+        }
+        Err(Unchanged::Store(why)) => tracing::error!(
             alert = "halt",
             service,
+            %node_id,
             %why,
-            "the halt could not be written to the ops file: it stands in memory"
-        );
-    }
-}
-
-/// Keeps `report`, made while the halt of `service` stands, for the clear to acknowledge. Kept
-/// once per host, with the halt: a report the halt itself holds, or one kept
-/// already, is not kept again.
-fn record(ops: &OpsStore, service: &str, report: Halt) {
-    let check = report.check.clone();
-    let ack = HaltAck::from(report);
-    let known = ops.read(|state| {
-        state.services.get(service).is_some_and(|m| {
-            m.halt
-                .iter()
-                .any(|h| (&h.node_id, &h.report) == (&ack.node_id, &ack.report))
-                || m.halt_seen.contains(&ack)
-        })
-    });
-    if known {
-        return;
-    }
-    let mut entry = AuditEntry::new(COORDINATOR, "halt_report");
-    entry.service = Some(service.to_owned());
-    entry.node_id = Some(ack.node_id.clone());
-    entry.reason = Some(check);
-    let name = service.to_owned();
-    let kept = ops.change(Write::AfterMemory, entry, |state| {
-        let seen = &mut state.services.entry(name).or_default().halt_seen;
-        seen.retain(|s| s.node_id != ack.node_id);
-        seen.push(ack);
-    });
-    if let Err(why) = kept {
-        tracing::error!(service, %why, "a halt report could not be written to the ops file");
+            "a halt or a halt report could not be written to the ops file: it stands in memory"
+        ),
     }
 }
 
@@ -303,13 +297,16 @@ pub(crate) fn decide(
     decide_marked(services, desired, &bad, service, fleet, id, now)
 }
 
-/// The generation of every service an operator has cleared a halt of, by name.
-pub(crate) fn generations(ops: &OpsStore) -> BTreeMap<String, u64> {
+/// The generation of every service an operator has cleared a halt of, by name, of the
+/// services `services` defines. The ops file keeps the generation of a service that is no longer
+/// defined (it counts on if the service comes back), but an agent reads at most a services
+/// file's worth of them and refuses an answer with more, so only the defined ones are told.
+pub(crate) fn generations(ops: &OpsStore, services: &Services) -> BTreeMap<String, u64> {
     ops.read(|state| {
         state
             .services
             .iter()
-            .filter(|(_, marks)| marks.halt_generation > 0)
+            .filter(|(name, marks)| marks.halt_generation > 0 && services.get(name).is_some())
             .map(|(name, marks)| (name.clone(), marks.halt_generation))
             .collect()
     })

@@ -277,6 +277,21 @@ impl Coordinator {
         self
     }
 
+    /// Whether the fleet's lock, which every decision and order is made under, is held now.
+    #[cfg(test)]
+    pub(crate) fn fleet_held(&self) -> bool {
+        matches!(
+            self.fleet.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        )
+    }
+
+    /// The ops store.
+    #[cfg(test)]
+    pub(crate) fn ops(&self) -> &OpsStore {
+        &self.ops
+    }
+
     /// Counts, by name, the optional `facts` of a heartbeat from `who` that were bad and were
     /// dropped (`why` is the reader's reason), and logs it unless every one of them was logged
     /// for this host within the last hour. Returns whether it logged. The heartbeat is still
@@ -335,7 +350,9 @@ impl Coordinator {
         let halts = features
             .as_ref()
             .filter(|names| names.iter().any(|name| name == halt::FEATURE))
-            .map_or_else(BTreeMap::new, |_| halt::generations(&self.ops));
+            .map_or_else(BTreeMap::new, |_| {
+                halt::generations(&self.ops, &self.services)
+            });
         Answer {
             reply,
             features,
@@ -354,8 +371,11 @@ impl Coordinator {
                 .chain(announced.iter().map(|one| (one.name.clone(), one.health)))
                 .collect(),
         };
-        let held = halt::note(&self.ops, &self.services, &who, &beat, &node, now);
+        // The halts are noted under the fleet's lock, which every decision and order below is
+        // made under: a halt is never raised between another heartbeat's decision to order and
+        // its order. The lock order is the fleet's, then the ops store's, as everywhere.
         let mut fleet = self.fleet.lock().unwrap_or_else(PoisonError::into_inner);
+        let held = halt::note(&self.ops, &self.services, &who, &beat, &node, now);
         let platform = beat.platform;
         let ops = self.ops.state();
         let counted =

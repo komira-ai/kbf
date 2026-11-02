@@ -303,6 +303,10 @@ pub enum Write {
     BeforeMemory,
 }
 
+/// A change [`OpsStore::interleave`] makes at the start of the next change.
+#[cfg(test)]
+type Interleaved = Box<dyn FnOnce(&mut OpsState) + Send>;
+
 /// What puts a state into the file.
 pub type Writer = Box<dyn Fn(&OpsState) -> Result<(), OpsError> + Send + Sync>;
 
@@ -313,6 +317,10 @@ pub struct OpsStore {
     /// `current` is only locked to read or to swap, never across the file's fsyncs.
     writing: Mutex<()>,
     write: Writer,
+    /// A change another writer makes between a caller's read and its change, applied once at
+    /// the start of the next change, under the writers' lock: what a race would do there.
+    #[cfg(test)]
+    interleave: Mutex<Option<Interleaved>>,
 }
 
 fn parse(path: &Path, bytes: &[u8]) -> Result<OpsState, OpsError> {
@@ -381,6 +389,8 @@ impl OpsStore {
             current: Mutex::new(state),
             writing: Mutex::new(()),
             write,
+            #[cfg(test)]
+            interleave: Mutex::new(None),
         }
     }
 
@@ -446,12 +456,30 @@ impl OpsStore {
     pub fn try_change<E: From<OpsError>>(
         &self,
         write: Write,
-        mut entry: AuditEntry,
+        entry: AuditEntry,
         edit: impl FnOnce(&mut OpsState) -> Result<(), E>,
     ) -> Result<AuditEntry, E> {
+        self.decide_change(write, |state| edit(state).map(|()| entry))
+    }
+
+    /// [`Self::try_change`] with an edit that also says what the change is: it reads the state
+    /// under the lock that serialises writes and answers the entry to audit, so that a change
+    /// whose kind or subject depends on the state (raising a halt or keeping a report of one,
+    /// clearing the halt that stands) is decided on the state it is applied to, not on one
+    /// read before another writer changed it.
+    ///
+    /// # Errors
+    /// The edit's own error, or [`OpsError`] as for [`Self::change`].
+    pub fn decide_change<E: From<OpsError>>(
+        &self,
+        write: Write,
+        edit: impl FnOnce(&mut OpsState) -> Result<AuditEntry, E>,
+    ) -> Result<AuditEntry, E> {
         let _writer = self.writing.lock().unwrap_or_else(PoisonError::into_inner);
+        #[cfg(test)]
+        self.interleaved();
         let mut next = self.state();
-        edit(&mut next)?;
+        let mut entry = edit(&mut next)?;
         entry.seq = next.audit.last().map_or(1, |last| last.seq + 1);
         next.audit.push(entry.clone());
         let surplus = next.audit.len().saturating_sub(AUDIT_RING);
@@ -469,6 +497,29 @@ impl OpsStore {
             }
         }
         Ok(entry)
+    }
+}
+
+#[cfg(test)]
+impl OpsStore {
+    /// Makes `change` at the start of the next change, under the writers' lock, as another
+    /// writer that got there between that caller's read and its change would.
+    pub(crate) fn interleave(&self, change: impl FnOnce(&mut OpsState) + Send + 'static) {
+        *self
+            .interleave
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Box::new(change));
+    }
+
+    fn interleaved(&self) {
+        let change = self
+            .interleave
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(change) = change {
+            change(&mut self.lock());
+        }
     }
 }
 
@@ -686,25 +737,23 @@ pub fn operate(
         } => {
             let name = service(services, &name)?.to_owned();
             let why = reason(&why)?;
-            let halt = store
-                .read(|state| {
-                    state
-                        .services
-                        .get(&name)
-                        .and_then(|marks| marks.halt.clone())
-                })
-                .ok_or(OperateError::Invalid("the service is not halted"))?;
-            let mut entry = AuditEntry::new(by, "clear_halt");
-            entry.service = Some(name.clone());
-            entry.node_id = Some(halt.node_id.clone());
-            entry.reason = Some(why);
             // Written first: a clear that cannot be written leaves the halt standing. The
             // reports of the halt and of every other host that reported while it stood are
             // acknowledged (one per host, the latest) so that a host, which keeps reporting
             // until it updates again, does not raise the halt again: a clear clears the service.
-            store.change(Write::BeforeMemory, entry, |state| {
-                let marks = state.services.entry(name).or_default();
-                marks.halt = None;
+            // The halt is the one standing when the change is made, under the writers' lock:
+            // one read before could have been cleared by another clear since, and a halt raised
+            // after that one would be cleared with the old report's acknowledgement.
+            store.decide_change::<OperateError>(Write::BeforeMemory, |state| {
+                let marks = state.services.entry(name.clone()).or_default();
+                let halt = marks
+                    .halt
+                    .take()
+                    .ok_or(OperateError::Invalid("the service is not halted"))?;
+                let mut entry = AuditEntry::new(by, "clear_halt");
+                entry.service = Some(name);
+                entry.node_id = Some(halt.node_id.clone());
+                entry.reason = Some(why);
                 let seen = std::mem::take(&mut marks.halt_seen);
                 let reports = std::iter::once(HaltAck::from(halt)).chain(seen);
                 for report in reports {
@@ -712,6 +761,7 @@ pub fn operate(
                     marks.halt_acked.push(report);
                 }
                 marks.halt_generation = marks.halt_generation.saturating_add(1);
+                Ok(entry)
             })?
         }
     })

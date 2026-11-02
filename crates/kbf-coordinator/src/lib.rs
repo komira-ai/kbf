@@ -73,6 +73,8 @@ mod extras_dropped_tests;
 #[cfg(test)]
 mod halt_membership_tests;
 #[cfg(test)]
+mod halt_race_tests;
+#[cfg(test)]
 mod http_tests;
 #[cfg(test)]
 mod kbf_definition_tests;
@@ -80,6 +82,8 @@ mod kbf_definition_tests;
 mod kbf_review_tests;
 #[cfg(test)]
 mod membership_tests;
+#[cfg(test)]
+mod ops_downgrade_tests;
 #[cfg(test)]
 mod ops_tests;
 #[cfg(test)]
