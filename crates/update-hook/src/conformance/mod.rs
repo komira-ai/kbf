@@ -55,7 +55,7 @@ use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
 
-pub use allow::{Allowances, NO_PREVIOUS_RELEASE};
+pub use allow::{Allowances, LapsingCordon, NO_PREVIOUS_RELEASE};
 pub use sandbox::{Entry, Sandbox, Tree, changes, snapshot};
 
 use crate::{
@@ -312,7 +312,10 @@ impl<'a> Conformance<'a> {
         }
     }
 
-    /// Accepts the behaviours `allow` declares (see [`Allowances`]); without it, none.
+    /// Accepts the behaviours `allow` declares (see [`Allowances`]); without it, none. The
+    /// first-install allowance covers the first-install `rollback` of [`Self::idempotence`]
+    /// only: combined with [`Self::with_first_install`], [`Self::check_all`] still refuses a
+    /// declined rollback in crash-resume and in the sequences.
     pub fn with_allowances(mut self, allow: Allowances) -> Conformance<'a> {
         self.allow = allow;
         self
@@ -561,14 +564,14 @@ impl<'a> Conformance<'a> {
     /// Whether a `rollback` that ended as `done` declined to roll back a first install
     /// ([`Allowances::first_install_rollback_may_fail`]).
     fn declined(&self, done: &Done) -> bool {
-        done.outcome == Outcome::Failure
-            && self
-                .allow
-                .rollback_may_fail(self.first_install, &done.report)
+        self.allow
+            .rollback_may_fail(self.first_install, done.outcome, &done.report)
     }
 
     /// After a `rollback` that declined (`first`): it changed nothing since `cut_over`, and run
-    /// again it fails the same way, with the same reason, and changes nothing.
+    /// again it fails the same way, with the same reason and the same `reversible` (which
+    /// decides between `Failed(after_commit)` and `halt` after a failed rollback), and changes
+    /// nothing.
     fn declined_twice(
         &self,
         sandbox: &Sandbox,
@@ -592,6 +595,13 @@ impl<'a> Conformance<'a> {
                 step: Step::Rollback,
                 first: first.report.reason.clone(),
                 second: second.report.reason,
+            });
+        }
+        if second.report.reversible != first.report.reversible {
+            return Err(Violation::RerunReversibleChanged {
+                step: Step::Rollback,
+                first: first.report.reversible,
+                second: second.report.reversible,
             });
         }
         let moved = changes(cut_over, &Self::state(sandbox)?);
@@ -677,7 +687,8 @@ impl<'a> Conformance<'a> {
     /// its end), then all of `rest`; the state must be `want`, but for a cordon left to lapse
     /// when the kill is in its window ([`Allowances::lapsing_cordon`]), judged against
     /// `previous`, the state the kill point before this one left (`None`: the step's start).
-    /// Returns the state at the kill.
+    /// Returns the state at the kill. The states the window is judged on come from different
+    /// sandboxes, so each is [`allow::portable`]: its sandbox's root written as a mark.
     fn resume(
         &mut self,
         before: &[Step],
@@ -690,14 +701,14 @@ impl<'a> Conformance<'a> {
         for step in before {
             self.exec_ok(&sandbox, *step)?;
         }
-        let start = Self::state(&sandbox)?;
+        let start = allow::portable(sandbox.root(), Self::state(&sandbox)?);
         let step = rest[0];
         if kill_at == 0 {
             self.exec_ok(&sandbox, step)?;
         } else if !self.exec_at(&sandbox, step, kill_at)?.parked {
             return Err(Violation::KillPointVanished { step, kill_at });
         }
-        let at_kill = Self::state(&sandbox)?;
+        let at_kill = allow::portable(sandbox.root(), Self::state(&sandbox)?);
         for step in rest {
             self.exec_ok(&sandbox, *step)?;
         }

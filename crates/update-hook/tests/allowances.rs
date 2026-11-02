@@ -5,7 +5,9 @@
 
 use std::path::PathBuf;
 
-use update_hook::conformance::{Allowances, Conformance, HookCommand, Summary, Violation};
+use update_hook::conformance::{
+    Allowances, Conformance, HookCommand, LapsingCordon, Summary, Violation,
+};
 use update_hook::{Outcome, Step};
 
 mod support;
@@ -38,9 +40,18 @@ fn rerun_reversible() -> Allowances {
     }
 }
 
+/// The example's cordon declaration, with the cordon at `path`: its ownership is the record's
+/// `cordon_mine`.
+fn cordon_at(path: &str) -> LapsingCordon {
+    LapsingCordon {
+        paths: vec![PathBuf::from(path)],
+        ownership: vec![PathBuf::from("record/cordon_mine")],
+    }
+}
+
 fn lapsing(path: &str) -> Allowances {
     Allowances {
-        lapsing_cordon: vec![PathBuf::from(path)],
+        lapsing_cordon: Some(cordon_at(path)),
         ..Allowances::default()
     }
 }
@@ -56,7 +67,7 @@ fn first_install_rollback() -> Allowances {
 fn all_three() -> Allowances {
     Allowances {
         rollback_rerun_may_say_reversible: true,
-        lapsing_cordon: vec![PathBuf::from("cordon")],
+        lapsing_cordon: Some(cordon_at("cordon")),
         first_install_rollback_may_fail: true,
     }
 }
@@ -71,7 +82,7 @@ fn the_default_declares_nothing_and_a_strict_hook_passes_either_way() {
         Allowances::default(),
         Allowances {
             rollback_rerun_may_say_reversible: false,
-            lapsing_cordon: Vec::new(),
+            lapsing_cordon: None,
             first_install_rollback_may_fail: false,
         }
     );
@@ -117,6 +128,36 @@ fn a_rollback_rerun_with_another_outcome_is_refused_even_when_declared() {
             second: Outcome::Failure,
         }) => {}
         other => panic!("{other:?}"),
+    }
+}
+
+/// Catches an allowance for the flag that also lets the rerun change things: a rollback rerun
+/// that makes the allowed rise and writes the world, or its record, is refused with it declared.
+#[test]
+fn a_rollback_rerun_that_says_reversible_and_changes_things_is_refused_even_when_declared() {
+    let rerun = |name: &str, behaviour: &str| {
+        let scratch = Scratch::new(name);
+        let hook = behaving(true, &["forgets-commit", behaviour]);
+        let mut fake = ExampleFake::default();
+        Conformance::new(&hook, &mut fake, scratch.path())
+            .with_allowances(rerun_reversible())
+            .idempotence()
+    };
+    for (name, behaviour, changed) in [
+        ("c1-world", "rollback-rerun-touches-world", "added rerun"),
+        (
+            "c1-record",
+            "rollback-rerun-touches-record",
+            "added record/rerun",
+        ),
+    ] {
+        match rerun(name, behaviour) {
+            Err(Violation::NotIdempotent {
+                step: Step::Rollback,
+                changes,
+            }) => assert_eq!(changes, [changed], "{name}"),
+            other => panic!("{name}: {other:?}"),
+        }
     }
 }
 
@@ -168,6 +209,68 @@ fn a_cordon_left_by_a_crash_outside_the_window_is_refused_even_when_declared() {
         }) => assert_eq!(changes, ["added cordon"]),
         other => panic!("{other:?}"),
     }
+}
+
+/// Catches a window judged on bytes that differ from sandbox to sandbox: with a cordon that
+/// holds the world's path (a new path in each sandbox), the late-recording hook is still refused
+/// at the fourth point, and a hook that records its cordon right after placing it still passes.
+#[test]
+fn a_cordon_that_names_its_sandbox_opens_no_window_of_its_own() {
+    let hook = behaving(false, &["cordon-recorded-late", "cordon-rooted"]);
+    match check_all("c2-late-rooted", &hook, lapsing("cordon")) {
+        Err(Violation::CrashResumeDiverges {
+            step: Step::Prepare,
+            kill_at: 4,
+            changes,
+        }) => assert_eq!(changes, ["added cordon"]),
+        other => panic!("{other:?}"),
+    }
+    let hook = behaving(false, &["cordon-unowned", "cordon-rooted"]);
+    check_all("c2-rooted", &hook, lapsing("cordon")).expect("declared: accepted");
+}
+
+/// Catches a window that opens although the hook had recorded the cordon as its own: a hook
+/// that records it before placing it, and then leaves it after a crash right after placing it
+/// (the fourth point), is refused with the allowance declared.
+#[test]
+fn a_cordon_left_although_its_ownership_was_recorded_is_refused_even_when_declared() {
+    let hook = behaving(false, &["cordon-recorded-first"]);
+    match check_all("c2-recorded-first", &hook, lapsing("cordon")) {
+        Err(Violation::CrashResumeDiverges {
+            step: Step::Prepare,
+            kill_at: 4,
+            changes,
+        }) => assert_eq!(changes, ["added cordon"]),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Catches a hook, under the allowance, that rewrites or lifts an operator's cordon: with one
+/// in the world from the start, every check passes and every sandbox ends with the operator's
+/// lease state as it was, through reruns, crash-resume and the sequences.
+#[test]
+fn an_operators_cordon_keeps_its_lease_state_under_the_allowance() {
+    const LEASE: &str = "operator lease 7, expires at 4100";
+    let scratch = Scratch::new("c2-operator");
+    let hook = behaving(false, &["cordon-unowned"]);
+    let mut fake = ExampleFake {
+        operator_cordon: Some(LEASE),
+        ..ExampleFake::default()
+    };
+    Conformance::new(&hook, &mut fake, scratch.path())
+        .with_allowances(lapsing("cordon"))
+        .check_all()
+        .expect("declared: accepted");
+    let mut runs = 0;
+    for entry in std::fs::read_dir(scratch.path()).unwrap() {
+        let run = entry.unwrap().path();
+        if run.join("world").is_dir() {
+            runs += 1;
+            let held = std::fs::read_to_string(run.join("world/cordon")).unwrap();
+            assert_eq!(held, LEASE, "{}", run.display());
+        }
+    }
+    assert!(runs > 10, "{runs}");
 }
 
 /// Catches an allowance that sets aside more than the declared cordon: in the window, another
@@ -255,10 +358,97 @@ fn a_first_install_rollback_failure_for_another_reason_is_refused_even_when_decl
     }
 }
 
+/// Catches an allowance for a rollback that defers or halts with the reason: only a failure
+/// (exit `1`) may decline, so a deferral (with its `retry_after_secs`) or a halt saying
+/// `no_previous_release` is refused, declared or not.
+#[test]
+fn a_first_install_rollback_that_defers_or_halts_with_the_reason_is_refused() {
+    for (name, behaviour, got) in [
+        (
+            "c3-defers",
+            "first-install-defers-rollback",
+            Outcome::Deferred,
+        ),
+        ("c3-halts", "first-install-halts-rollback", Outcome::Halt),
+    ] {
+        let scratch = Scratch::new(name);
+        let hook = behaving(false, &[behaviour]);
+        let mut fake = ExampleFake::default();
+        match Conformance::new(&hook, &mut fake, scratch.path())
+            .with_first_install()
+            .with_allowances(first_install_rollback())
+            .idempotence()
+        {
+            Err(Violation::UnexpectedOutcome {
+                step: Step::Rollback,
+                wanted: Outcome::Success,
+                got: ended,
+            }) => assert_eq!(ended, got, "{name}"),
+            other => panic!("{name}: {other:?}"),
+        }
+    }
+}
+
+/// Catches a declined rollback whose `reversible` changes on the rerun (it decides between
+/// `Failed(after_commit)` and `halt`): refused with the first-install allowance, and with the
+/// rollback-rerun allowance as well, which covers only a rollback that succeeded.
+#[test]
+fn a_declined_rollback_whose_reversible_flips_is_refused_even_with_both_allowances() {
+    for (name, allow) in [
+        ("c3-flips", first_install_rollback()),
+        (
+            "c3-flips-c1",
+            Allowances {
+                rollback_rerun_may_say_reversible: true,
+                first_install_rollback_may_fail: true,
+                ..Allowances::default()
+            },
+        ),
+    ] {
+        let scratch = Scratch::new(name);
+        let hook = behaving(false, &["first-install-no-rollback-rerun-flips"]);
+        let mut fake = ExampleFake::default();
+        match Conformance::new(&hook, &mut fake, scratch.path())
+            .with_first_install()
+            .with_allowances(allow)
+            .idempotence()
+        {
+            Err(Violation::RerunReversibleChanged {
+                step: Step::Rollback,
+                first: false,
+                second: true,
+            }) => {}
+            other => panic!("{name}: {other:?}"),
+        }
+    }
+}
+
+/// Catches the first-install allowance read as covering every check: with
+/// `with_first_install`, `check_all` still refuses the declined rollback where crash-resume
+/// measures the rollback, as the builder's documentation says.
+#[test]
+fn with_first_install_check_all_still_requires_a_rollback_in_crash_resume() {
+    let scratch = Scratch::new("c3-first-install-all");
+    let hook = behaving(false, &["first-install-no-rollback"]);
+    let mut fake = ExampleFake::default();
+    match Conformance::new(&hook, &mut fake, scratch.path())
+        .with_first_install()
+        .with_allowances(first_install_rollback())
+        .check_all()
+    {
+        Err(Violation::UnexpectedOutcome {
+            step: Step::Rollback,
+            wanted: Outcome::Success,
+            got: Outcome::Failure,
+        }) => {}
+        other => panic!("{other:?}"),
+    }
+}
+
 /// Catches a declined first-install rollback held to less than "fails the same way and changes
-/// nothing": one that took something away before it declined, one whose rerun fails with
-/// another reason, one whose rerun rolls back, and one whose rerun takes something away, are
-/// refused with the allowance declared.
+/// nothing": one that took something away from the world or its record before it declined, one
+/// whose rerun fails with another reason, one whose rerun rolls back, and one whose rerun takes
+/// something away from the world or the record, are refused with the allowance declared.
 #[test]
 fn a_declined_first_install_rollback_that_changes_things_or_its_reason_is_refused() {
     let declined = |name: &str, behaviour: &str| {
@@ -273,6 +463,15 @@ fn a_declined_first_install_rollback_that_changes_things_or_its_reason_is_refuse
     match declined("c3-undoes", "first-install-no-rollback-undoes") {
         Err(Violation::DeclinedRollbackChanged { changes }) => {
             assert_eq!(changes, ["removed next"]);
+        }
+        other => panic!("{other:?}"),
+    }
+    match declined(
+        "c3-undoes-record",
+        "first-install-no-rollback-undoes-record",
+    ) {
+        Err(Violation::DeclinedRollbackChanged { changes }) => {
+            assert_eq!(changes, ["removed record/target"]);
         }
         other => panic!("{other:?}"),
     }
@@ -300,6 +499,16 @@ fn a_declined_first_install_rollback_that_changes_things_or_its_reason_is_refuse
             step: Step::Rollback,
             changes,
         }) => assert_eq!(changes, ["removed next"]),
+        other => panic!("{other:?}"),
+    }
+    match declined(
+        "c3-rerun-undoes-record",
+        "first-install-no-rollback-rerun-undoes-record",
+    ) {
+        Err(Violation::NotIdempotent {
+            step: Step::Rollback,
+            changes,
+        }) => assert_eq!(changes, ["removed record/target"]),
         other => panic!("{other:?}"),
     }
 }
