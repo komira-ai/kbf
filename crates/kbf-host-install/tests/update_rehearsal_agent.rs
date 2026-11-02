@@ -77,6 +77,7 @@
 #![cfg(target_os = "linux")]
 
 mod rehearsal;
+mod subordinate_ids;
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -89,6 +90,7 @@ use rehearsal::{
     CHANNEL, HELPER_UNIT, KBF_UNIT, RELEASES, UPDATER, answers, install_file, journal, run,
     systemctl, until,
 };
+use subordinate_ids::SubIds;
 
 /// The unit of the agent, as the packaged one is named.
 const AGENT_UNIT: &str = "kbf-updater-agent.service";
@@ -141,55 +143,11 @@ fn container_runtime(account: &str) -> SubIds {
              `crun` and `uidmap`"
         );
     }
-    let mut kept = Vec::new();
-    for file in ["/etc/subuid", "/etc/subgid"] {
-        let before = fs::read_to_string(file).unwrap_or_default();
-        if let Some(line) = sub_id_line(&before, account) {
-            fs::write(file, format!("{before}{line}\n")).unwrap();
-        }
-        kept.push((file, before));
-    }
-    SubIds { kept }
-}
-
-/// The subordinate-id files as they were before the rehearsal, written back on drop.
-struct SubIds {
-    kept: Vec<(&'static str, String)>,
-}
-
-impl Drop for SubIds {
-    fn drop(&mut self) {
-        for (file, before) in &self.kept {
-            let _ = fs::write(file, before);
-        }
-    }
-}
-
-/// The ids one account gets: a container's whole 16-bit range.
-const SUB_ID_COUNT: u64 = 65536;
-
-/// The line that gives `account` a range of subordinate ids in a file holding `existing`
-/// (`/etc/subuid` or `/etc/subgid`: `<name>:<first>:<count>` per line), or `None` when the
-/// account has a range already. The range starts at 100000 or above every range the file
-/// gives, on a multiple of [`SUB_ID_COUNT`], so it overlaps none.
-fn sub_id_line(existing: &str, account: &str) -> Option<String> {
-    let ranges: Vec<(&str, u64, u64)> = existing
-        .lines()
-        .filter_map(|line| {
-            let mut parts = line.trim().splitn(3, ':');
-            let (name, first, count) = (parts.next()?, parts.next()?, parts.next()?);
-            Some((name, first.parse().ok()?, count.parse().ok()?))
-        })
-        .collect();
-    if ranges.iter().any(|(name, _, _)| *name == account) {
-        return None;
-    }
-    let above = ranges
-        .iter()
-        .map(|(_, first, count)| first.saturating_add(*count))
-        .fold(100_000, u64::max);
-    let first = above.div_ceil(SUB_ID_COUNT) * SUB_ID_COUNT;
-    Some(format!("{account}:{first}:{SUB_ID_COUNT}"))
+    SubIds::add(
+        &[Path::new("/etc/subuid"), Path::new("/etc/subgid")],
+        account,
+    )
+    .unwrap_or_else(|e| panic!("the subordinate ids of {account}: {e}"))
 }
 
 /// The agent's `StateDirectory` in the packaged unit: the one place it may write under
@@ -908,34 +866,4 @@ fn a_watch_started_on_an_empty_log_reads_from_the_first_line() {
     let watch = farm::Watch::start(&log);
     append(&log, &plain("worker registered", "capacity=x"));
     assert_eq!(watch.stop(), [Registered]);
-}
-
-/// The service account's subordinate ids: a range above every range the file gives, on a
-/// boundary of 65536 and at 100000 or above, so it overlaps none; nothing when the account has
-/// one; lines that are not ranges are passed over.
-#[test]
-fn the_subordinate_ids_overlap_no_range_the_file_gives() {
-    assert_eq!(
-        sub_id_line("", "kbf-rehearsal").as_deref(),
-        Some("kbf-rehearsal:131072:65536")
-    );
-    assert_eq!(
-        sub_id_line("runner:100000:65536\n", "kbf-rehearsal").as_deref(),
-        Some("kbf-rehearsal:196608:65536")
-    );
-    assert_eq!(
-        sub_id_line(
-            "# a comment\nrunner:100000:65536\nbuilder:231072:65536\nbroken:x:1\n",
-            "kbf-rehearsal"
-        )
-        .as_deref(),
-        Some("kbf-rehearsal:327680:65536")
-    );
-    assert_eq!(
-        sub_id_line(
-            "runner:100000:65536\nkbf-rehearsal:500000:1000\n",
-            "kbf-rehearsal"
-        ),
-        None
-    );
 }
