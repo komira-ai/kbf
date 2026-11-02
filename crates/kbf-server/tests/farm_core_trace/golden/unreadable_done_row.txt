@@ -62,7 +62,9 @@
     put done/0000000000000000 cond=any len=56 sha=5bbebcd2c09db909 ttl=600000ms
   cache build exit=0
 > [t=0ms] intake
+  read refused done/0000000000000000
 > [t=0ms] intake
+  read refused done/0000000000000000
 > [t=0ms] readable
 > [t=0ms] intake
   stage build-again done ran exit=0 stdout="output of build" worker="node-a" queued_ms=1900000000000 started_ms=1900000000000 completed_ms=1900000000000

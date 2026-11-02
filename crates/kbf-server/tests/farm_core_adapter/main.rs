@@ -119,6 +119,8 @@ scripts!(
     cordon_and_drain,
     unreadable_op_row,
     unreadable_done_row,
+    unreadable_leased_op_row,
+    unreadable_done_row_elsewhere,
 );
 
 /// Catches a normalisation that takes out more than the cost: a lease row with a cost is

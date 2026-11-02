@@ -7,7 +7,8 @@
 //! live is written out.
 //!
 //! A script can make rows unreadable ([`Tape::unreadable`]): a read that would return one fails
-//! as a backend failure does, and the rows stay as they are. Reads are not written down. The
+//! as a backend failure does, and the rows stay as they are. A read that succeeds is not written
+//! down; one refused is, as `read refused <key>`, once per row in the lines a call takes. The
 //! rows stay unreadable across a restart of the store, until [`Tape::readable`]; the change feed
 //! and the expiry of rows do not look at them.
 
@@ -29,6 +30,8 @@ pub struct Tape {
     lines: Mutex<Vec<String>>,
     /// The keys whose rows cannot be read.
     unreadable: Mutex<BTreeSet<String>>,
+    /// The unreadable keys a read was refused at since the lines were last taken.
+    refused: Mutex<BTreeSet<String>>,
     /// How a value is written down, given its key.
     normalise: Normalise,
 }
@@ -51,6 +54,7 @@ impl Tape {
             clock,
             lines: Mutex::new(Vec::new()),
             unreadable: Mutex::new(BTreeSet::new()),
+            refused: Mutex::new(BTreeSet::new()),
             normalise,
         }
     }
@@ -62,6 +66,7 @@ impl Tape {
 
     /// The lines written since the last call, oldest first.
     pub fn take(&self) -> Vec<String> {
+        lock(&self.refused).clear();
         std::mem::take(&mut *self.lines())
     }
 
@@ -72,6 +77,7 @@ impl Tape {
             clock: self.clock,
             lines: self.lines,
             unreadable: self.unreadable,
+            refused: self.refused,
             normalise: self.normalise,
         }
     }
@@ -92,23 +98,29 @@ impl Tape {
     }
 
     fn unreadable_keys(&self) -> MutexGuard<'_, BTreeSet<String>> {
-        self.unreadable
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+        lock(&self.unreadable)
     }
 
-    /// The failure of a read that met the row at `key`, if it cannot be read.
+    /// The failure of a read that met the row at `key`, if it cannot be read; the first refusal
+    /// at `key` since the lines were last taken is written down.
     fn check(&self, key: &str) -> Result<(), StoreError> {
-        if self.unreadable_keys().contains(key) {
-            return Err(StoreError::Failed(format!("the row {key} cannot be read")));
+        if !self.unreadable_keys().contains(key) {
+            return Ok(());
         }
-        Ok(())
+        if lock(&self.refused).insert(key.to_owned()) {
+            self.lines().push(format!("  read refused {key}"));
+        }
+        Err(StoreError::Failed(format!("the row {key} cannot be read")))
     }
 
     /// Fails if the row at any of `keys` cannot be read.
     fn check_all<'a>(&self, mut keys: impl Iterator<Item = &'a str>) -> Result<(), StoreError> {
         keys.try_for_each(|key| self.check(key))
     }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 fn cond(cond: Cond) -> String {
