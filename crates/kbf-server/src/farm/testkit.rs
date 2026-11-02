@@ -54,8 +54,8 @@ impl TestCore {
 
 impl Farm {
     /// [`Farm::new`] on `core`, whatever core [`crate::SchedulerCore::under_test`] names: for
-    /// a test that runs the two cores over one state store. In a build without the
-    /// `farm-core-js` feature the js core does not exist, and `Js` builds the legacy farm.
+    /// a test that runs the two cores over one state store. Both cores are in every build:
+    /// `Js` builds the js core's farm with or without the `farm-core-js` feature.
     #[must_use]
     pub fn new_on_core(
         core: crate::SchedulerCore,
