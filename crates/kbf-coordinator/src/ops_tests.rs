@@ -38,7 +38,8 @@ fn exclude(state: &mut OpsState, node: &str) {
     });
 }
 
-/// A file holding one of everything the schema has.
+/// An ops file holding one of everything its schema has: the shape the release before the
+/// halt release reads.
 const FULL: &str = r#"{
   "schema": 1,
   "hosts": {
@@ -60,6 +61,39 @@ const FULL: &str = r#"{
       "halt": {
         "node_id": "n3",
         "check": "tainted",
+        "target": "2.0"
+      },
+      "halt_acked": [
+        {
+          "node_id": "n4",
+          "target": "1.5"
+        }
+      ],
+      "last_good": "1.0",
+      "bad": [
+        "1.9"
+      ]
+    }
+  },
+  "audit": [
+    {
+      "seq": 7,
+      "by": "operator",
+      "action": "exclude",
+      "service": "kbf",
+      "node_id": "n2",
+      "reason": "disk replaced"
+    }
+  ]
+}
+"#;
+
+/// The halts file beside [`FULL`]: one of everything its schema has.
+const FULL_HALTS: &str = r#"{
+  "services": {
+    "kbf": {
+      "halt": {
+        "node_id": "n3",
         "target": "2.0",
         "report": {
           "target": "2.0",
@@ -92,34 +126,22 @@ const FULL: &str = r#"{
           }
         }
       ],
-      "halt_generation": 3,
-      "last_good": "1.0",
-      "bad": [
-        "1.9"
-      ]
+      "halt_generation": 3
     }
-  },
-  "audit": [
-    {
-      "seq": 7,
-      "by": "operator",
-      "action": "exclude",
-      "service": "kbf",
-      "node_id": "n2",
-      "reason": "disk replaced"
-    }
-  ]
+  }
 }
 "#;
 
-/// Pins: the schema of the file. Every field of every table reads back and writes out as
+/// Pins: the schema of the two files. Every field of every table reads back and writes out as
 /// shown here (the text a later change reads is this one), and the state the reader makes is
 /// the state a test builds by hand.
 #[test]
 fn the_file_reads_and_writes_every_field_of_the_schema() {
     let dir = dir("ops-full");
     let file = dir.path().join("ops.json");
+    let halts = dir.path().join("ops.json.halts");
     fs::write(&file, FULL).expect("written");
+    fs::write(&halts, FULL_HALTS).expect("written");
     let store = OpsStore::open(&file).expect("read");
     let mut want = OpsState::default();
     want.hosts.insert(
@@ -174,6 +196,7 @@ fn the_file_reads_and_writes_every_field_of_the_schema() {
     }
     assert_eq!(wrote["audit"][1]["seq"], 8);
     assert!(text.ends_with("}\n"), "{text:?}");
+    assert_eq!(fs::read_to_string(&halts).expect("read"), FULL_HALTS);
     assert_eq!(
         OpsStore::open(&file).expect("reread").state(),
         store.state()

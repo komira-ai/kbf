@@ -680,8 +680,8 @@ async fn a_clear_acks_every_halt_report_received_while_halted() {
 }
 
 /// Catches: the reports received while halted being held in memory only: after a restart the
-/// clear still acknowledges the report of the host that was ignored, and the file holds it with
-/// the halt.
+/// clear still acknowledges the report of the host that was ignored, and the halts file beside
+/// the ops file holds it with the halt.
 #[tokio::test]
 async fn the_reports_received_while_halted_survive_a_restart() {
     let mut rig = farm("halt-seen-restart").await;
@@ -689,7 +689,8 @@ async fn the_reports_received_while_halted_survive_a_restart() {
     send(&rig, "s1", "storage", &beat("1.0", HALT)).await;
     rig.restart();
     rig.at(1_200);
-    let file = std::fs::read_to_string(rig.dir.path().join("desired.json.ops")).expect("file");
+    let file =
+        std::fs::read_to_string(rig.dir.path().join("desired.json.ops.halts")).expect("file");
     let file: Value = serde_json::from_str(&file).expect("json");
     assert_eq!(
         brief(&file["services"]["kbf"]["halt_seen"]),

@@ -7,7 +7,9 @@
 //! apart from `desired.json` so that an earlier coordinator, which refuses a key it does not
 //! know there, still reads the desired state. The file is created by the first change (a
 //! farm that never uses it keeps its files as they are) and replaced whole after that, like
-//! the desired state: a temporary file, fsync, rename and a directory fsync.
+//! the desired state: a temporary file, fsync, rename and a directory fsync. What the halt
+//! release added to a halt and its acknowledgements is kept in a second file beside it, so that
+//! the release before still reads this one ([`crate::ops_file`]).
 //!
 //! The reader is strict. A key it does not know is a refusal to start, and so is a `schema`
 //! newer than this build: a coordinator rolled back below the build that wrote a halt would
@@ -43,7 +45,8 @@ use kbf_updater::version::Version;
 use kbf_updater::wire::UpdateResult;
 use serde::{Deserialize, Serialize};
 
-use crate::desired::{StoreError, io_at, write_whole};
+use crate::desired::StoreError;
+use crate::ops_file;
 use crate::service::Unauthorized;
 use crate::services::Services;
 
@@ -354,9 +357,12 @@ impl OpsStore {
     /// The store of the file at `path`: its state if it exists, empty if not. Nothing is
     /// created until the first change.
     ///
+    /// The halts file beside it ([`crate::ops_file`]) is read and joined to it, and every
+    /// change writes both.
+    ///
     /// # Errors
     /// [`OpsError`]: the file exists and cannot be read, holds a key this build does not
-    /// know, or has another schema.
+    /// know, or has another schema; or its halts file exists and cannot be read or parsed.
     pub fn open(path: &Path) -> Result<Self, OpsError> {
         let state = match fs::read(path) {
             Ok(bytes) => parse(path, &bytes)?,
@@ -369,16 +375,11 @@ impl OpsStore {
                 .into());
             }
         };
+        let state = ops_file::joined(path, state)?;
         let path = path.to_owned();
         Ok(Self::with_writer(
             state,
-            Box::new(move |state| {
-                let mut text = serde_json::to_vec_pretty(state)
-                    .map_err(io::Error::from)
-                    .map_err(io_at(&path))?;
-                text.push(b'\n');
-                Ok(write_whole(&path, &text)?)
-            }),
+            Box::new(move |state| ops_file::write(&path, state)),
         ))
     }
 

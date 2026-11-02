@@ -40,6 +40,7 @@ pub mod identity;
 pub mod listen;
 pub mod membership;
 pub mod ops;
+pub mod ops_file;
 pub mod reconcile;
 pub mod service;
 pub mod services;
