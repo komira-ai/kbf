@@ -228,3 +228,63 @@ async fn the_status_lists_a_pinned_host_as_pinned() {
     assert_eq!(kbf["convergence"]["state"], json!("in_progress"));
     assert_eq!(kbf["slots_held"], json!(1));
 }
+
+/// The pin is `kbf`'s: a pinned host that also runs `other` is still ordered `other`'s
+/// desired version, and is held `pinned` under `kbf` only.
+///
+/// Catches: a `kbf` pin that stalls the rollout of every service on the host.
+#[tokio::test]
+async fn a_pinned_host_is_still_ordered_another_service() {
+    let mut rig = Rig::new("pin-other-service");
+    let list = kbf_oidc::testkit::config_text(kbf_oidc::testkit::STATIC_ISSUER)
+        + "services = [\"kbf\", \"other\"]\n";
+    rig.coordinator = Rig::start_with_allow_list(&rig.dir, &rig.clock, &list).with_services(
+        crate::services::Services::parse(
+            "[[service]]\nname = \"other\"\n[service.roles.daemon]\nmin_up = 0\n",
+        )
+        .expect("services"),
+    );
+    for body in [
+        r#"{"version":"2.0","min_up":{"storage":0,"frontend":0}}"#,
+        r#"{"service":"other","version":"3.0","min_up":{"storage":0,"frontend":0}}"#,
+    ] {
+        rig.coordinator
+            .set_desired(Some(&crate::testutil::ci_token()), body.as_bytes())
+            .await
+            .expect("set");
+    }
+    rig.at(2_000);
+    let mut b = pinned(beat("1.0"));
+    b.services = Some(vec![kbf_updater::wire::ServiceBeat {
+        name: "other".to_owned(),
+        version: version("1.0"),
+        health: kbf_updater::wire::Health::Healthy,
+        last_update: None,
+        updating: None,
+        step: None,
+        commit: None,
+        step_secs: Default::default(),
+        promotion_pending: false,
+        deferred: None,
+    }]);
+    let who = Identity {
+        node_id: id("d1"),
+        role: HostRole::DAEMON,
+    };
+    assert_eq!(
+        rig.coordinator.heartbeat(who, b),
+        ServiceReply::Update {
+            service: Some("other".to_owned()),
+            version: version("3.0"),
+        }
+    );
+    let status = status_of(&rig);
+    assert_eq!(
+        host(&status["per_service"]["kbf"]["hosts"], "d1")["hold"],
+        json!("pinned")
+    );
+    assert_eq!(
+        host(&status["per_service"]["other"]["hosts"], "d1").get("pinned"),
+        None
+    );
+}

@@ -329,8 +329,9 @@ helper writes it. An agent given another directory reads no pin there.
   known); the field is never dropped when a heartbeat is trimmed to fit. A coordinator from before
   the pin ignores the field (and orders the host, which does not run the order); this one reads a
   `pinned` it cannot parse as absent and counts it among the dropped facts.
-- The coordinator **orders a pinned host nothing** (`hold` `pinned`), and an order it gave before
-  ends when the host says it is pinned. The host **keeps a slot of its role** however healthy it
+- The coordinator **orders a pinned host nothing for `kbf`** (`hold` `pinned` under `kbf`; its
+  other services are ordered as before), and a `kbf` order it gave before ends when the host says
+  it is pinned. The host **keeps a slot of its role** however healthy it
   is, so pinning a host never lets the rollout go on to the next one. It is counted **neither
   failed nor at another version**: the role's `pinned` count has it (and `at_desired` when it runs
   the desired version), `failed` does not, so it does not make the farm `blocked`, and a host
