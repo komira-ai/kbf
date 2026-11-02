@@ -10,15 +10,19 @@
 //!
 //! The reader of the halts file skips a key it does not know. A record whose report it cannot
 //! read (an outcome a later release added, say) is passed over as a whole and counted, and the
-//! rest of the file is read; only a file it cannot parse at all is refused. What a passed-over
-//! record loses only halts the service again: a halt with no report, an acknowledgement with
-//! none, are what a file from before reports reads as ([`crate::halt`]), and a report seen
-//! while halted that is not kept halts the service again after the clear.
+//! rest of the file is read; only a file it cannot parse at all is refused. A passed-over
+//! record loses its report and nothing else (the reports kept while a halt stood still join to
+//! it by its host and version), and that loss only halts the service again: a halt with no
+//! report, an acknowledgement with none, are what a file from before reports reads as
+//! ([`crate::halt`]), and a report seen while halted that is not kept halts the service again
+//! after the clear.
 //!
 //! On reading, the halts file's records are joined to the ops file's by host and target. A
 //! record that matches nothing (the release before rewrote the ops file and cleared or replaced
 //! what it was about) is dropped, with the same loss. Reports kept while a halt stood join only
-//! to that halt. A generation is kept whatever the ops file says.
+//! to that halt. A generation is kept whatever the ops file says. Records join by host and
+//! version alone: when the release before cleared a halt and the same host halted on the same
+//! version again, the old halt's reports join to the new one, about the same host and version.
 //!
 //! A change is committed by replacing the ops file. First the halts file it goes with is
 //! written whole to `<ops-file>.halts.next`, naming the SHA-256 of the ops file text it goes
@@ -35,6 +39,11 @@
 //! file since). A staged file that cannot be settled refuses the start and fails the change.
 //! So the two files are read as they were before a change or as they were after it, never one
 //! of each: a clear's generation and acknowledgements are on disk with the clear or not at all.
+//! The one exception needs a crash after the commit and then the release before writing the
+//! ops file before this one starts again: the staged file no longer names the ops file and is
+//! removed, so a clear in the ops file loses its acknowledgements' reports and its generation.
+//! No agent was told that generation (the crash came before the clear reached memory), and the
+//! loss only halts the service again.
 //!
 //! A farm that never halted has no halts file: one is written once there is something to keep
 //! in it, and after that on every change.
@@ -103,9 +112,20 @@ fn is_zero(n: &u64) -> bool {
     *n == 0
 }
 
+/// The host and the version a kept report is about, read on their own.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+struct About {
+    node_id: String,
+    target: Version,
+}
+
 /// What the halts file keeps of one service.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 struct ServiceHalts {
+    /// Whom the standing halt's record is about, even when its report was passed over: the
+    /// reports kept while it stood still join to it. Read only.
+    #[serde(skip)]
+    halt_about: Option<About>,
     /// The report of the standing halt.
     #[serde(skip_serializing_if = "Option::is_none")]
     halt: Option<Kept>,
@@ -166,6 +186,10 @@ impl ReadHalts {
         let mut skipped = 0;
         let mut services = BTreeMap::new();
         for (name, read) in self.services {
+            let about = read
+                .halt
+                .clone()
+                .and_then(|v| serde_json::from_value::<About>(v).ok());
             let halt = read.halt.and_then(|v| kept(v, &mut skipped));
             let mut each = |values: Vec<Value>| -> Vec<Kept> {
                 values
@@ -174,6 +198,7 @@ impl ReadHalts {
                     .collect()
             };
             let service = ServiceHalts {
+                halt_about: about,
                 halt,
                 halt_acked: each(read.halt_acked),
                 halt_seen: each(read.halt_seen),
@@ -231,10 +256,11 @@ fn join(mut ops: OpsState, halts: HaltsFile) -> OpsState {
         }
         let marks = ops.services.entry(name).or_default();
         let mut standing = false;
-        if let (Some(halt), Some(report)) = (&mut marks.halt, kept.halt)
-            && report.is_about(&halt.node_id, &halt.target)
+        if let (Some(halt), Some(about)) = (&mut marks.halt, &kept.halt_about)
+            && about.node_id == halt.node_id
+            && about.target == halt.target
         {
-            halt.report = Some(report.report);
+            halt.report = kept.halt.map(|k| k.report);
             standing = true;
         }
         for ack in &mut marks.halt_acked {

@@ -85,6 +85,16 @@ fn crash(rig: &mut Rig, before: &Files, after: &Files, committed: bool) {
         !staged_path(&path).exists(),
         "the start settles the staged file"
     );
+    let halts = if committed {
+        &after.halts
+    } else {
+        &before.halts
+    };
+    assert_eq!(
+        &fs::read(halts_path(&path)).ok(),
+        halts,
+        "the halts file is the one of the side of the change the ops file is on"
+    );
 }
 
 fn kbf(rig: &Rig) -> ServiceOps {

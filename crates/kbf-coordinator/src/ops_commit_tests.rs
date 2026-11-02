@@ -306,3 +306,32 @@ fn a_first_change_whose_ops_file_cannot_be_written_leaves_nothing() {
     assert!(!staged_path(&path).exists());
     assert!(!halts_path(&path).exists());
 }
+
+/// Catches: the reports kept while a halt stood dropped with the halt's own report when only
+/// that report cannot be read (they joined to the halt through it): the halt reads with no
+/// report, one record passed over, and the reports kept while it stood are kept for the clear.
+#[test]
+fn reports_kept_while_halted_join_to_a_halt_whose_report_cannot_be_read() {
+    let dir = TestDir::under(std::env::temp_dir(), "ops-commit-unknown-halt");
+    let path = dir.path().join("ops.json");
+    fs::write(
+        &path,
+        r#"{"schema":1,"services":{"kbf":{
+            "halt":{"node_id":"s1","check":"tainted","target":"2.0"}}}}"#,
+    )
+    .expect("written");
+    let report =
+        |outcome: &str| serde_json::json!({"target": "2.0", "outcome": outcome, "phase": "halt"});
+    let halts = serde_json::json!({"services": {"kbf": {
+        "halt": {"node_id": "s1", "target": "2.0", "report": report("rolled_forward")},
+        "halt_seen": [{"node_id": "s2", "target": "2.0", "report": report("failed")}],
+    }}});
+    fs::write(halts_path(&path), halts.to_string()).expect("written");
+    let read = OpsStore::open(&path).expect("read").state();
+    let (_, skipped) = ops_file::joined(&path, OpsState::default()).expect("joined");
+    assert_eq!(skipped, 1);
+    let marks = &read.services["kbf"];
+    assert_eq!(marks.halt.as_ref().map(|h| h.report.clone()), Some(None));
+    let seen: Vec<&str> = marks.halt_seen.iter().map(|a| a.node_id.as_str()).collect();
+    assert_eq!(seen, ["s2"]);
+}

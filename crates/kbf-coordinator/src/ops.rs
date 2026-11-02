@@ -472,7 +472,7 @@ impl OpsStore {
     ///
     /// # Errors
     /// The edit's own error, or [`OpsError`] as for [`Self::change`].
-    pub fn decide_change<E: From<OpsError>>(
+    pub(crate) fn decide_change<E: From<OpsError>>(
         &self,
         write: Write,
         edit: impl FnOnce(&mut OpsState) -> Result<AuditEntry, E>,
