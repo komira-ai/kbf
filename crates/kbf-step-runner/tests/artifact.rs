@@ -89,7 +89,7 @@ fn a_tree_altered_after_sealing_is_refused() {
     let ArtifactError::Changed { expected, found } = &err else {
         panic!("{err:?}")
     };
-    assert_eq!(expected, &staged.digest);
+    assert_eq!(expected, staged.digest());
     assert_ne!(found, expected);
     assert!(err.to_string().contains("changed after it was verified"));
 }
@@ -180,10 +180,8 @@ fn the_tree_and_its_parents_must_be_closed_and_unlinked() {
 
     let link = s.path().join("link");
     symlink(&outer, &link).unwrap();
-    let through = Staged {
-        dir: link.join("inner"),
-        digest: staged.digest.clone(),
-    };
+    let through = Staged::seal(&link.join("inner")).unwrap();
+    assert_eq!(through.digest(), staged.digest());
     assert!(matches!(
         through.check(hook).unwrap_err(),
         ArtifactError::Untrusted(p) if p == link
@@ -251,10 +249,11 @@ fn only_the_trusted_owners_may_own_the_tree_and_what_is_in_it() {
         let (uid, gid) = host_owner(meta);
         (if meta.is_file() { 4242 } else { uid }, gid)
     };
-    let sealed = Staged {
-        dir: s.path().to_path_buf(),
-        digest: tree_digest_with(s.path(), &files_of_another).unwrap(),
-    };
+    let sealed = Staged::seal_with(s.path(), &files_of_another).unwrap();
+    assert_eq!(
+        sealed.digest(),
+        tree_digest_with(s.path(), &files_of_another).unwrap()
+    );
     let err = sealed
         .check_as(hook, &[me(), 0], &files_of_another)
         .unwrap_err();
@@ -293,15 +292,11 @@ fn a_tree_with_setuid_or_writable_entries_is_refused() {
 }
 
 /// Catches a staged directory that is relative or has `..`: the checks of its ancestors would
-/// then be made on something else than the tree that is run.
+/// then be made on something else than the tree that is run, so it is not even sealed.
 #[test]
 fn the_staged_directory_must_be_absolute_and_plain() {
     for dir in ["relative/tree", "/a/../b", ""] {
-        let staged = Staged {
-            dir: dir.into(),
-            digest: "0".repeat(64),
-        };
-        let err = staged.check(Path::new("hook")).unwrap_err();
+        let err = Staged::seal(Path::new(dir)).unwrap_err();
         assert!(
             matches!(err, ArtifactError::Untrusted(_)),
             "{dir:?}: {err:?}"
