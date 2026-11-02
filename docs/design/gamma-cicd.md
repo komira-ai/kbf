@@ -242,15 +242,16 @@ never by elapsed time.
 |---|---|---|---|---|
 | 1 | G1 a red gamma sets the farm back | M6 (ordinary case) | none | komira-ai/kbf#2239 |
 | 2 | G2 kbf ships automatic rollback | M6 (CI gone) | none (komira-ai/kbf#2181 merged) | komira-ai/kbf#2240 |
-| 3 | C1 coordinator `force` | M6 (farm held by its rules) | komira-ai/kbf#2187 | komira-ai/kbf#2241 |
-| 4 | H1 local `activate` | M7 | none (komira-ai/kbf#2233 merged) | komira-ai/kbf#2242 |
-| 5 | H2 the agent's pin | M7 | H1 (and C1 for its force case) | komira-ai/kbf#2243 |
+| 3 | H1 local `activate` | M7 | none (komira-ai/kbf#2233 merged) | komira-ai/kbf#2242 |
+| 4 | C1 coordinator `force` | M6 (farm held by its rules) | komira-ai/kbf#2187, H1 | komira-ai/kbf#2241 |
+| 5 | H2 the agent's pin | M7 | H1, C1 | komira-ai/kbf#2243 |
 | 6 | G6 agent and helper units in the package | M3 | komira-ai/kbf#2236 | komira-ai/kbf#2244 |
 | 7 | G7 the coordinator updated by the updater | M2 | G6, [host-updates.md](host-updates.md) step 6a | komira-ai/kbf#2245 |
 | 8 | G8 a Mac takes update orders | M8 | the Mac lease users ([macos-end-state.md](macos-end-state.md), steps 3 and 4) | komira-ai/kbf#2246 |
 
-G1 and G2 come first because they close the gap of section 2.5. C1, H1 and H2 are the
-forced rollback. G1 relies on them for the cases it cannot handle. G6 and G7 take the
+G1 and G2 come first because they close the gap of section 2.5. H1, C1 and H2 are the
+forced rollback, in that order: a forced order on a host ends in H1's `activate`, and the
+pin's force case needs C1. G1 relies on them for the cases it cannot handle. G6 and G7 take the
 remaining hand steps out of the release-to-release path. G8 is last because its dependency
 is the largest.
 
@@ -262,10 +263,11 @@ coordinator, not by the job, so it is there whatever happened to the job.
 1. **The coordinator records what a write replaced.** These additions are additive, and
    they are on the control API only.
    - A service's desired state gains `generation` and `replaced`.
-   - `generation` is raised by every write that changes the state.
-   - `replaced` holds the version and the minimums that the write replaced. Setting the
-     same version again changes neither field, so `replaced` still names the version the
-     farm ran before this release.
+   - `generation` is raised by every accepted write, including one that sets the version
+     already desired.
+   - `replaced` holds the version and the minimums that the last change of version
+     replaced. Setting the same version again keeps it, so `replaced` still names the
+     version the farm ran before this release.
    - `POST /v1/desired` answers with both fields, and `GET /v1/convergence` shows them.
    - `POST /v1/desired` takes an optional `if_generation`. When it does not name the current
      generation, the write is refused with 409 `conflict` and changes nothing.
@@ -288,8 +290,16 @@ It sets nothing, and says why, in each of these cases:
   the forced rollback instead;
 - `KBF_COORDINATOR_URL` is unset.
 
-A 409 means a write came in between the read and the restore, even one that set the same
-version again. That write stands, and the restore exits 1 naming the desired version now.
+A 409 means some write was accepted between the read and the restore. That includes one
+that set this release again, such as a re-run's forward write, because every accepted
+write raises `generation`.
+
+On a 409 the restore reads once more, to tell its own retry from another writer:
+
+- **Its own retry.** A 503 answered a restore that had in fact landed. The desired version
+  is now `replaced`, so it reports the restore as done.
+- **Another writer.** Otherwise another write won. That write stands, nothing is restored,
+  and the restore exits 1 naming the desired version now.
 
 The baseline is the coordinator's record, so two cases restore the right version:
 
@@ -320,7 +330,7 @@ job's timeout.
 Coordinator:
 
 - a write records `replaced` and raises `generation`;
-- setting the same version again keeps both;
+- setting the same version again raises `generation` and keeps `replaced`;
 - a stale `if_generation` is refused with 409 and changes nothing, including after writes
   that went from A to B and back to A in between;
 - a request without `if_generation` behaves as today.
@@ -335,7 +345,10 @@ Coordinator:
 - a re-run, with the desired version already this release, restores `replaced` and not
   this release;
 - a competing write, applied by the fake when the restore's read arrives, gets the
-  restore a 409. The competing write survives, and the run exits 1 naming it;
+  restore a 409. The competing write survives, and the run exits 1 naming it. This holds
+  when the competing write sets this same release again;
+- a restore that lands but whose answer is a 503 is retried, gets a 409, reads the
+  desired version as `replaced`, and reports the restore done;
 - the restore presents a token no earlier call used. The fake refuses a replayed `jti`
   with 401, and the restore still lands;
 - `Superseded` and an empty `replaced` make no post;
@@ -366,6 +379,37 @@ file that replaces the `kbf` entry still decides for its farm.
 - a first version, which has no `last_good`, is never rolled back;
 - `before_commit` and `environment` failures never count;
 - `deploy-farm` waiting on N then ends `Superseded`, and G1's restore makes no second post.
+
+### H1. Local `activate`
+
+**Change.** `kbf-host-install activate kbf=<commit|version> [--pin]`, run by root with the
+fixed-path helper, also on the `--serve` socket. It swaps to a release the host keeps
+(komira-ai/kbf#2233), or one that `install` has staged, with no fetch and no trial clock.
+
+It refuses a release the host does not keep, and lists the ones it keeps. It takes the
+install lock and refuses a live holder. `--force-lock` takes a dead holder's lock and
+audits it. It runs nothing from the release being left. It works on Linux and on a Mac.
+
+With `--pin`, the order is fixed so that a crash leaves the host held:
+
+1. it writes the hold file (H2) and syncs it, under the install lock;
+2. it switches;
+3. it records the switch.
+
+A crash after step 1 leaves a host that is held but not yet on the pinned release.
+Running `activate` again finishes the swap, and the heartbeat shows the pin and the
+release that runs, so the gap is visible.
+
+**Tests:**
+
+- `activate` swaps to a kept release with the network cut;
+- it refuses a release not kept and lists the kept ones;
+- the swap runs nothing from the release being left;
+- it refuses a live lock holder;
+- `--force-lock` takes a dead holder's lock and audits it;
+- for `--pin`, a crash injected at each step boundary, followed by a restart, leaves the
+  host held, and the next `activate` completes the swap;
+- the same on a Mac (type-checked in CI, run in the Mac job of `beta.yml`).
 
 ### C1. Coordinator `force`
 
@@ -401,13 +445,16 @@ Its effects, each one audited:
 - `last_good` moves only after the forced version has converged.
 
 **On the host.** A host's forced slot is freed when it reports running the forced version,
-whether or not it is healthy. The agent that takes a forced order activates the target
-without a trial, so the helper's trial deadline never reverts it:
+whether or not it is healthy. The agent that takes a forced order never puts the target on
+trial, so no helper trial deadline exists that could revert it:
 
-- on a host that keeps the release, it uses H1 `activate`;
-- otherwise it runs `install`, `switch` and `confirm` at once, without waiting for health.
+1. When the host does not keep the release, `install` stages it. That fetches and lays it
+   out, and switches nothing.
+2. H1 `activate` makes the staged or kept release the one that runs. This is one durable
+   step with no trial, and no `switch` or `confirm` is sent.
 
-It still reports health.
+If the agent stops between the two steps, the host still runs the release it ran. The
+order ages out, and the coordinator sends it again. The agent still reports health.
 
 **On the wire.** The agent parses the coordinator's reply with unknown fields refused
 (`RawReply`, `RawServiceReply`), so `forced` is sent only to an agent that announced
@@ -431,43 +478,17 @@ The next ordinary desired write ends the forced state.
 - a force exactly at `min_version` is accepted, and one release below it is refused with
   its reason;
 - hosts that report unhealthy after the swap still all receive the force;
+- with the agent stopped after `install` and before `activate`, the host runs its old
+  release, and the force is sent again once the order ages out;
+- with the agent stopped right after `activate`, the helper's injected clock moved far
+  ahead and the helper restarted, the host still runs the target, and the helper holds
+  no trial;
 - an unhealthy forced target stays. The helper's injected clock is moved past the trial
   deadline it would have had, the helper is restarted, and the host still runs the
   target;
 - the reply sent to an agent that did not announce `forced-v1` parses with the previous
   release's reply parser (a golden of its shape). That agent goes back when the target is
   healthy, and reverts by its own rule when it is not.
-
-### H1. Local `activate`
-
-**Change.** `kbf-host-install activate kbf=<commit|version> [--pin]`, run by root with the
-fixed-path helper, also on the `--serve` socket. It swaps to a release the host keeps
-(komira-ai/kbf#2233), with no fetch and no trial clock.
-
-It refuses a release the host does not keep, and lists the ones it keeps. It takes the
-install lock and refuses a live holder. `--force-lock` takes a dead holder's lock and
-audits it. It runs nothing from the release being left. It works on Linux and on a Mac.
-
-With `--pin`, the order is fixed so that a crash leaves the host held:
-
-1. it writes the hold file (H2) and syncs it, under the install lock;
-2. it switches;
-3. it records the switch.
-
-A crash after step 1 leaves a host that is held but not yet on the pinned release.
-Running `activate` again finishes the swap, and the heartbeat shows the pin and the
-release that runs, so the gap is visible.
-
-**Tests:**
-
-- `activate` swaps to a kept release with the network cut;
-- it refuses a release not kept and lists the kept ones;
-- the swap runs nothing from the release being left;
-- it refuses a live lock holder;
-- `--force-lock` takes a dead holder's lock and audits it;
-- for `--pin`, a crash injected at each step boundary, followed by a restart, leaves the
-  host held, and the next `activate` completes the swap;
-- the same on a Mac (type-checked in CI, run in the Mac job of `beta.yml`).
 
 ### H2. The agent's pin
 
@@ -482,9 +503,15 @@ The coordinator shows the host as pinned, and counts it neither failed nor conve
 `kbf-host-install unpin` clears the pin.
 
 A C1 force can also clear it. The coordinator sends a pinned host an order only when a
-force names exactly the pinned commit: `Update { version, forced, unpin }`. This is the one
-order a pinned host takes, even though the host already runs that version. The agent
-removes the hold, through the helper, and switches nothing. An ordinary order, or a force
+force names exactly the pinned commit: `Update { version, forced, unpin }`. It sends it
+whether or not the host already runs that commit, because a crash in H1 can leave a pin
+persisted before its release was activated. This is the one order a pinned host takes:
+
+1. When the host does not run the pinned commit, the agent runs H1 `activate` on it
+   first, with no trial.
+2. It then removes the hold through the helper.
+
+When the host already runs the commit, it switches nothing. An ordinary order, or a force
 of another commit, leaves the pin.
 
 **Tests:**
@@ -493,7 +520,11 @@ of another commit, leaves the pin.
 - the coordinator shows it pinned, and counts it neither failed nor converged;
 - an update accepted before the pin cannot finish: the fake agent sends `switch` after the
   hold file appears, and the helper refuses it;
-- a force naming the pinned commit clears the pin and switches nothing;
+- a force naming the pinned commit clears the pin and switches nothing, on a host that
+  runs it;
+- after a crash that left the pin persisted and the release not yet activated, and a
+  restart, a force naming the pinned commit activates it, clears the pin, and the host
+  reports the commit and converges;
 - an ordinary order, and a force of another commit, leave the pin;
 - `unpin` restores following the desired version;
 - an older coordinator that does not know the field ignores it, and the host still holds.

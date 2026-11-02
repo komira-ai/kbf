@@ -56,19 +56,90 @@ fn remove_row(doc: &str, job: &str) -> String {
     })
 }
 
-/// `workflow` with the job `from` renamed `to`; its header is there exactly once.
-fn rename_job(workflow: &str, from: &str, to: &str) -> String {
-    let header = format!("\n  {from}:\n");
-    assert_eq!(workflow.matches(&header).count(), 1, "one job `{from}`");
-    workflow.replacen(&header, &format!("\n  {to}:\n"), 1)
+/// The 1-based line the key of job `job` of `workflow` starts on, from the YAML parser, so
+/// the helpers below do not depend on how the key or the `jobs:` line are spelt.
+fn job_line(workflow: &str, job: &str) -> usize {
+    let lines = workflows::job_lines(workflow).expect("the workflow parses");
+    let at: Vec<usize> = lines
+        .iter()
+        .filter(|(n, _)| n == job)
+        .map(|(_, l)| *l)
+        .collect();
+    assert_eq!(at.len(), 1, "one job `{job}`");
+    at[0]
 }
 
-/// `workflow` without its last job `job`, which nothing after it needs.
+/// `workflow` with `edit` applied to its 1-based line `line` (without its line end).
+fn edit_line(workflow: &str, line: usize, edit: impl FnOnce(&str) -> String) -> String {
+    let mut edit = Some(edit);
+    let out: String = workflow
+        .split_inclusive('\n')
+        .enumerate()
+        .map(|(n, l)| match edit.take_if(|_| n + 1 == line) {
+            Some(edit) => {
+                let body = l.strip_suffix('\n').unwrap_or(l);
+                format!("{}{}", edit(body), &l[body.len()..])
+            }
+            None => l.to_owned(),
+        })
+        .collect();
+    assert!(edit.is_none(), "the workflow has a line {line}");
+    out
+}
+
+/// `workflow` with the job `from` renamed `to`, its key spelt as before (plain or quoted).
+fn rename_job(workflow: &str, from: &str, to: &str) -> String {
+    edit_line(workflow, job_line(workflow, from), |l| {
+        assert_eq!(
+            l.matches(from).count(),
+            1,
+            "the key line names `{from}` once: {l}"
+        );
+        l.replacen(from, to, 1)
+    })
+}
+
+/// `workflow` without its last job `job`: everything from the line of its key on.
 fn remove_last_job(workflow: &str, job: &str) -> String {
-    let header = format!("\n  {job}:\n");
-    assert_eq!(workflow.matches(&header).count(), 1, "one job `{job}`");
-    let at = workflow.find(&header).expect("the header is there");
-    workflow[..=at].to_owned()
+    let jobs = workflows::job_lines(workflow).expect("the workflow parses");
+    assert_eq!(
+        jobs.last().map(|(n, _)| n.as_str()),
+        Some(job),
+        "`{job}` is the last job"
+    );
+    let line = job_line(workflow, job);
+    workflow.split_inclusive('\n').take(line - 1).collect()
+}
+
+/// `workflow` with a job `job` added before its first job, at that job's indentation.
+fn add_job(workflow: &str, job: &str) -> String {
+    let jobs = workflows::job_lines(workflow).expect("the workflow parses");
+    let first = jobs.first().expect("the workflow has a job").1;
+    edit_line(workflow, first, |l| {
+        let indent = &l[..l.len() - l.trim_start().len()];
+        format!(
+            "{indent}{job}:\n{indent}  runs-on: ubuntu-24.04\n{indent}  steps:\n{indent}    - run: true\n{l}"
+        )
+    })
+}
+
+/// `workflow` spelt another way with the same jobs: a comment on its own line before the first
+/// job, every job key quoted, and a comment after each key.
+fn respelt(workflow: &str) -> String {
+    let jobs = workflows::job_lines(workflow).expect("the workflow parses");
+    let mut out = workflow.to_owned();
+    for (name, line) in &jobs {
+        out = edit_line(&out, *line, |l| {
+            let indent = &l[..l.len() - l.trim_start().len()];
+            let rest = l
+                .trim_start()
+                .strip_prefix(&format!("{name}:"))
+                .expect("a plain key");
+            format!("{indent}\"{name}\":{rest} # a job of the release")
+        });
+    }
+    let first = jobs.first().expect("the workflow has a job").1;
+    edit_line(&out, first, |l| format!("  # the jobs of the release\n{l}"))
 }
 
 /// A small workflow with three jobs, for the shape tests.
@@ -167,20 +238,42 @@ fn a_workflow_job_the_doc_omits_fails() {
 
 #[test]
 fn a_job_added_to_the_real_workflow_fails() {
-    let (real, jobs) = (read(RELEASE), real_jobs());
+    let jobs = real_jobs();
     let added = fresh(&jobs, "prod");
     assert_eq!(
-        real.matches("\njobs:\n").count(),
-        1,
-        "release.yml has one `jobs:` line"
+        problems(&read(DOC), &add_job(&read(RELEASE), &added)),
+        vec![format!(
+            "{DOC}: {RELEASE} has job `{added}`, which the job table omits"
+        )]
     );
-    let spoiled = real.replacen(
-        "\njobs:\n",
-        &format!("\njobs:\n  {added}:\n    runs-on: ubuntu-24.04\n    steps:\n      - run: true\n"),
-        1,
+}
+
+#[test]
+fn the_workflow_spelt_another_way_gives_the_same_answers() {
+    let (real, jobs) = (read(RELEASE), real_jobs());
+    let other = respelt(&real);
+    assert_ne!(other, real);
+    assert_eq!(real_jobs_of(&other), jobs);
+    assert_eq!(problems(&read(DOC), &other), Vec::<String>::new());
+    let last = jobs.last().expect("release.yml has jobs");
+    let renamed = fresh(&jobs, &format!("{last}-renamed"));
+    assert_eq!(
+        problems(
+            &rename_row(&read(DOC), last, &renamed),
+            &rename_job(&other, last, &renamed)
+        ),
+        Vec::<String>::new()
     );
     assert_eq!(
-        problems(&read(DOC), &spoiled),
+        problems(
+            &remove_row(&read(DOC), last),
+            &remove_last_job(&other, last)
+        ),
+        Vec::<String>::new()
+    );
+    let added = fresh(&jobs, "prod");
+    assert_eq!(
+        problems(&read(DOC), &add_job(&other, &added)),
         vec![format!(
             "{DOC}: {RELEASE} has job `{added}`, which the job table omits"
         )]

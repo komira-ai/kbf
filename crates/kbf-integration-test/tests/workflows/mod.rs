@@ -348,6 +348,20 @@ pub fn job_names(text: &str) -> Result<Vec<String>, String> {
         .collect())
 }
 
+/// The names of the jobs of a workflow text with the 1-based line each key starts on, in file
+/// order, however the keys are spelt (quoted or plain) and whatever comments surround them. An
+/// error when [`job_names`] would give one.
+pub fn job_lines(text: &str) -> Result<Vec<(String, usize)>, String> {
+    let root = yaml::load(text)?;
+    let Some(Value::Map(jobs)) = get(top_of(&root)?, "jobs").map(|j| &j.value) else {
+        return Err("the workflow has no `jobs` mapping".to_owned());
+    };
+    Ok(jobs
+        .iter()
+        .filter_map(|(k, _)| k.as_str().map(|n| (n.to_owned(), k.line())))
+        .collect())
+}
+
 /// One step with a `run:` script, in a workflow job or an action file's composite
 /// steps, as the interpreter budget reads it.
 #[derive(Debug, PartialEq, Eq)]
