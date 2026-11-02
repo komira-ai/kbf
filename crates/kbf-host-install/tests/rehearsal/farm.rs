@@ -598,9 +598,13 @@ fn without_colour(line: &str) -> String {
     out
 }
 
-/// The frontend's own record of the node from [`Watch::start`] on: the part of its log written
-/// since then, read when the watch stops. Nothing is sampled, so no event is missed however
-/// briefly the node was in a state.
+/// The frontend's own record of the node from [`Watch::start`] on: the lines of its log
+/// completed since then, read when the watch stops. Nothing is sampled, so no event is missed
+/// however briefly the node was in a state.
+///
+/// The boundaries are whole lines: a line the frontend was still writing when the watch started
+/// belongs before it, and is left out; a line still being written when the watch stops (no
+/// newline yet) is left out too.
 pub struct Watch {
     log: PathBuf,
     from: usize,
@@ -616,9 +620,29 @@ impl Watch {
         }
     }
 
-    /// The node's events the log gained since [`Watch::start`], in order.
+    /// The node's events in the lines the log completed since [`Watch::start`], in order.
     pub fn stop(self) -> Vec<NodeEvent> {
         let log = fs::read(&self.log).unwrap();
-        node_events(&String::from_utf8_lossy(&log[self.from..]))
+        node_events(&String::from_utf8_lossy(lines_since(&log, self.from)))
     }
+}
+
+/// The whole lines of `log` that begin at or after byte `from`: the rest of a line `from` cuts
+/// is skipped, and so is a last line without its newline.
+fn lines_since(log: &[u8], from: usize) -> &[u8] {
+    let from = from.min(log.len());
+    let start = if from == 0 || log[from - 1] == b'\n' {
+        from
+    } else {
+        log[from..]
+            .iter()
+            .position(|b| *b == b'\n')
+            .map_or(log.len(), |at| from + at + 1)
+    };
+    let end = log
+        .iter()
+        .rposition(|b| *b == b'\n')
+        .map_or(0, |at| at + 1)
+        .max(start);
+    &log[start..end]
 }

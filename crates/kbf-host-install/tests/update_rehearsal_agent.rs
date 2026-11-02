@@ -66,9 +66,11 @@
 //! host; with the default 1 the coordinator never orders the last storage host). The issuer is
 //! a stand-in for GitHub's, and the coordinator's address is loopback.
 //!
-//! It needs Linux, systemd, root, `crun` (and `uidmap`) and the network, so it is `#[ignore]`d
-//! and runs through `cargo xtask sudo-test -p kbf-host-install --test update_rehearsal_agent` on
-//! a GitHub-hosted runner, after the job built `kbf-coordinator` and installed `crun`. The setup
+//! It needs Linux, systemd, root, `crun` and `uidmap` (the hosted runner's image has both) and
+//! the network, so it is `#[ignore]`d and runs through `cargo xtask sudo-test -p
+//! kbf-host-install --test update_rehearsal_agent` on a GitHub-hosted runner, after the job
+//! built `kbf-coordinator`. It adds the service account's subordinate ids and puts the files
+//! back when it ends. The setup
 //! it shares with the first rehearsal is in `rehearsal/mod.rs`; the farm is in
 //! `rehearsal/farm.rs`.
 
@@ -126,18 +128,68 @@ fn agent_unit(host_agent: &Path, exec: &str) -> String {
     out.join("\n") + "\n"
 }
 
-/// The runner's `crun`, and the subordinate ids the daemon's account needs for rootless
-/// containers (`kbf --mode=storage-and-daemon` refuses to start without a range of each).
-fn container_runtime(account: &str) {
-    assert!(
-        Path::new("/usr/bin/crun").is_file(),
-        "no /usr/bin/crun: the job installs `crun` and `uidmap` before the test"
-    );
-    for file in ["/etc/subuid", "/etc/subgid"] {
-        let mut text = fs::read_to_string(file).unwrap_or_default();
-        text.push_str(&format!("{account}:200000:65536\n"));
-        fs::write(file, text).unwrap();
+/// The runner's container runtime, and the subordinate ids the daemon's account needs for
+/// rootless containers (`kbf --mode=storage-and-daemon` refuses to start without a range of
+/// each). The hosted runner's image ships `crun` and `uidmap` (`newuidmap`, `newgidmap`); the
+/// rehearsal installs nothing. The returned guard puts `/etc/subuid` and `/etc/subgid` back as
+/// they were when it is dropped.
+fn container_runtime(account: &str) -> SubIds {
+    for tool in ["/usr/bin/crun", "/usr/bin/newuidmap", "/usr/bin/newgidmap"] {
+        assert!(
+            Path::new(tool).is_file(),
+            "no {tool}: the rootless container runtime of the daemon half is the runner image's \
+             `crun` and `uidmap`"
+        );
     }
+    let mut kept = Vec::new();
+    for file in ["/etc/subuid", "/etc/subgid"] {
+        let before = fs::read_to_string(file).unwrap_or_default();
+        if let Some(line) = sub_id_line(&before, account) {
+            fs::write(file, format!("{before}{line}\n")).unwrap();
+        }
+        kept.push((file, before));
+    }
+    SubIds { kept }
+}
+
+/// The subordinate-id files as they were before the rehearsal, written back on drop.
+struct SubIds {
+    kept: Vec<(&'static str, String)>,
+}
+
+impl Drop for SubIds {
+    fn drop(&mut self) {
+        for (file, before) in &self.kept {
+            let _ = fs::write(file, before);
+        }
+    }
+}
+
+/// The ids one account gets: a container's whole 16-bit range.
+const SUB_ID_COUNT: u64 = 65536;
+
+/// The line that gives `account` a range of subordinate ids in a file holding `existing`
+/// (`/etc/subuid` or `/etc/subgid`: `<name>:<first>:<count>` per line), or `None` when the
+/// account has a range already. The range starts at 100000 or above every range the file
+/// gives, on a multiple of [`SUB_ID_COUNT`], so it overlaps none.
+fn sub_id_line(existing: &str, account: &str) -> Option<String> {
+    let ranges: Vec<(&str, u64, u64)> = existing
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.trim().splitn(3, ':');
+            let (name, first, count) = (parts.next()?, parts.next()?, parts.next()?);
+            Some((name, first.parse().ok()?, count.parse().ok()?))
+        })
+        .collect();
+    if ranges.iter().any(|(name, _, _)| *name == account) {
+        return None;
+    }
+    let above = ranges
+        .iter()
+        .map(|(_, first, count)| first.saturating_add(*count))
+        .fold(100_000, u64::max);
+    let first = above.div_ceil(SUB_ID_COUNT) * SUB_ID_COUNT;
+    Some(format!("{account}:{first}:{SUB_ID_COUNT}"))
 }
 
 /// The agent's `StateDirectory` in the packaged unit: the one place it may write under
@@ -182,6 +234,13 @@ fn members_active_on(commit: &str) -> bool {
 /// - a daemon registered after that: the restarted node's, release N+1's (the caller waits
 ///   for the node to serve on N+1);
 /// - one undrain, and no cordon besides the drain.
+///
+/// The drain line is written once the frontend has stored the node's cordon, and the drain is
+/// then applied by the scheduler. The applied state is checked by the agent itself: before it
+/// switches, it waits for the node's leases by reading `GET /v1/nodes/{id}`, the scheduler's
+/// placement, and fails the update, with nothing switched, if the node is serving there. So a
+/// stream end after the drain in a rehearsal whose update succeeded (which the caller checks)
+/// means the switch came after the scheduler had the node out of placement.
 ///
 /// N+1's daemon may register after the undrain: the agent's health check of a storage host
 /// reads the storage member, not the daemon half, so the order of those two is not the
@@ -311,7 +370,7 @@ fn the_agent_updates_the_host_when_the_coordinator_is_told_the_next_release() {
     );
     let unit = rehearsal::kbf_node_unit(&format!("User={SERVICE_ACCOUNT}"), &flags);
     let host_agent = rehearsal::lay_out(&r, &unit);
-    container_runtime(SERVICE_ACCOUNT);
+    let _sub_ids = container_runtime(SERVICE_ACCOUNT);
     farm::private_dir(&storage_dir, Some(SERVICE_ACCOUNT));
     pki.storage(&storage_dir, &ip, SERVICE_ACCOUNT);
     pki.daemon(&storage_dir, SERVICE_ACCOUNT);
@@ -611,7 +670,7 @@ fn the_rehearsals_agent_can_write_the_directory_of_its_cordons() {
 /// colour), around other lines and another node's.
 fn frontend_line(message: &str, fields: &str) -> String {
     format!(
-        "\u{1b}[2m2026-01-01T00:00:00.000000Z\u{1b}[0m \u{1b}[32m INFO\u{1b}[0m \
+        "\u{1b}[2m2026-11-01T00:00:00.000000Z\u{1b}[0m \u{1b}[32m INFO\u{1b}[0m \
          \u{1b}[2mkbf_server::farm\u{1b}[0m\u{1b}[2m:\u{1b}[0m {message} {fields}"
     )
 }
@@ -658,7 +717,7 @@ fn the_watch_reads_the_nodes_drain_and_undrain_from_the_frontends_log() {
         action(farm::NODE, "Uncordon"),
         registered(farm::NODE),
         // A line cut off mid-write.
-        "\u{1b}[2m2026-01-01T00:0".to_owned(),
+        "\u{1b}[2m2026-11-01T00:0".to_owned(),
     ]
     .join("\n");
     let events = farm::node_events(&log);
@@ -764,5 +823,119 @@ fn a_record_without_the_drain_around_the_switch_is_refused() {
         drained_around_the_restart(&[Uncordon, Drain, StreamEnded, Registered, Uncordon])
             .unwrap_err()
             .contains("given back 2 times")
+    );
+}
+
+/// A scratch log the frontend's lines are appended to by hand, as the frontend writes them.
+fn append(log: &Path, text: &str) {
+    use std::io::Write as _;
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(log)
+        .unwrap();
+    file.write_all(text.as_bytes()).unwrap();
+}
+
+fn plain(message: &str, fields: &str) -> String {
+    format!(
+        "2026-11-01T00:00:00Z  INFO kbf_server::farm: {message} worker={} {fields}\n",
+        farm::NODE
+    )
+}
+
+/// The watch keeps the events of the lines written between its start and its stop, and none
+/// written before: the drain logged before `Watch::start` is history.
+#[test]
+fn the_watch_keeps_only_the_lines_written_after_it_started() {
+    use farm::NodeEvent::{Drain, Registered, StreamEnded, Uncordon};
+    let dir = kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), "watch-history");
+    let log = dir.path().join("frontend.log");
+    append(&log, &plain("worker registered", "capacity=x"));
+    append(&log, &plain("operator action", "action=Drain(30s)"));
+    let watch = farm::Watch::start(&log);
+    append(&log, &plain("operator action", "action=Drain(30s)"));
+    append(&log, &plain("worker stream ended", ""));
+    append(&log, &plain("worker registered", "capacity=x"));
+    append(&log, &plain("operator action", "action=Uncordon"));
+    assert_eq!(watch.stop(), [Drain, StreamEnded, Registered, Uncordon]);
+}
+
+/// A line the frontend was writing when the watch started is history, though it ends after the
+/// start; a line it is writing when the watch stops is left out until its newline; lines split
+/// over several writes in between are read whole.
+#[test]
+fn the_watch_reads_whole_lines_across_split_writes() {
+    use farm::NodeEvent::{Drain, Registered, Uncordon};
+    let dir = kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), "watch-split");
+    let log = dir.path().join("frontend.log");
+    let before = plain("operator action", "action=Uncordon");
+    let (head, tail) = before.split_at(10);
+    append(&log, head);
+    let watch = farm::Watch::start(&log);
+    append(&log, tail);
+    let drain = plain("operator action", "action=Drain(30s)");
+    let (head, tail) = drain.split_at(drain.find("worker=").unwrap() + 3);
+    append(&log, head);
+    append(&log, tail);
+    append(&log, &plain("worker registered", "capacity=x"));
+    let last = plain("operator action", "action=Uncordon");
+    append(&log, &last[..last.len() - 1]);
+    let log_now = fs::read_to_string(&log).unwrap();
+    assert!(!log_now.ends_with('\n'), "{log_now}");
+    assert_eq!(watch.stop(), [Drain, Registered]);
+
+    // The same watch, stopped once the last line has its newline, reads it.
+    let dir = kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), "watch-split-end");
+    let log = dir.path().join("frontend.log");
+    append(
+        &log,
+        "2026-11-01T00:00:00Z  INFO kbf_server::serve: scheduler core: legacy\n",
+    );
+    let watch = farm::Watch::start(&log);
+    append(&log, &last[..20]);
+    append(&log, &last[20..]);
+    assert_eq!(watch.stop(), [Uncordon]);
+}
+
+/// A watch that starts on an empty log reads every line from the first.
+#[test]
+fn a_watch_started_on_an_empty_log_reads_from_the_first_line() {
+    use farm::NodeEvent::Registered;
+    let dir = kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), "watch-empty");
+    let log = dir.path().join("frontend.log");
+    append(&log, "");
+    let watch = farm::Watch::start(&log);
+    append(&log, &plain("worker registered", "capacity=x"));
+    assert_eq!(watch.stop(), [Registered]);
+}
+
+/// The service account's subordinate ids: a range above every range the file gives, on a
+/// boundary of 65536 and at 100000 or above, so it overlaps none; nothing when the account has
+/// one; lines that are not ranges are passed over.
+#[test]
+fn the_subordinate_ids_overlap_no_range_the_file_gives() {
+    assert_eq!(
+        sub_id_line("", "kbf-rehearsal").as_deref(),
+        Some("kbf-rehearsal:131072:65536")
+    );
+    assert_eq!(
+        sub_id_line("runner:100000:65536\n", "kbf-rehearsal").as_deref(),
+        Some("kbf-rehearsal:196608:65536")
+    );
+    assert_eq!(
+        sub_id_line(
+            "# a comment\nrunner:100000:65536\nbuilder:231072:65536\nbroken:x:1\n",
+            "kbf-rehearsal"
+        )
+        .as_deref(),
+        Some("kbf-rehearsal:327680:65536")
+    );
+    assert_eq!(
+        sub_id_line(
+            "runner:100000:65536\nkbf-rehearsal:500000:1000\n",
+            "kbf-rehearsal"
+        ),
+        None
     );
 }
