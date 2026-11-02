@@ -9,7 +9,7 @@
 //! version, or at it: silent ones too, so a canary that went down after it began is not
 //! replaced. The next hosts are chosen among the live ones that have not started, the roles
 //! that wait for no other role first and then by node id, leaving out the hosts that are
-//! deferring: the smallest id alone could pick a host of a role that cannot go until another
+//! deferring or pinned (neither would take the order): the smallest id alone could pick a host of a role that cannot go until another
 //! has, and the gate would never open.
 
 use std::time::Duration;
@@ -88,7 +88,9 @@ pub(crate) fn closed_to(
     }
     let mine = key(id, me);
     let before = members()
-        .filter(|(o, h)| h.is_live(now) && !started(o, h) && !deferring(o) && key(o, h) < mine)
+        .filter(|(o, h)| {
+            h.is_live(now) && !h.is_pinned() && !started(o, h) && !deferring(o) && key(o, h) < mine
+        })
         .count();
     let free =
         (canary.count as usize).saturating_sub(members().filter(|(o, h)| started(o, h)).count());

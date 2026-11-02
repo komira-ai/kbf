@@ -59,7 +59,8 @@
 //! `kbf-host-install activate kbf=<commit|version> [--pin] [--force-lock] [--restart-unit UNIT]...`
 //! is the operator's emergency command, run by root on the host
 //! ([`local::activate_cli`]): it makes a release the host keeps the one that runs, for good, with
-//! no fetch and no trial, and runs nothing of the release it leaves.
+//! no fetch and no trial, and runs nothing of the release it leaves. `kbf-host-install unpin`
+//! ([`local::unpin_cli`]) undoes its `--pin`: the agent follows the coordinator again.
 //!
 //! The paths this program reads as root are constants of [`host::Host::production`]. The
 //! only way to point them elsewhere is a `cfg(test)` constructor: no environment variable
@@ -242,6 +243,14 @@ fn main_with(args: Vec<std::ffi::OsString>) -> ExitCode {
             .collect();
         return rest.map_or(ExitCode::from(2), |rest| local::activate_cli::main(&rest));
     }
+    // Its undoing: remove the pin `activate --pin` wrote (see `local::unpin_cli`). Root's too.
+    if args.first().is_some_and(|arg| arg == "unpin") {
+        let rest: Option<Vec<String>> = args[1..]
+            .iter()
+            .map(|arg| arg.to_str().map(str::to_owned))
+            .collect();
+        return rest.map_or(ExitCode::from(2), |rest| local::unpin_cli::main(&rest));
+    }
     // The operator's act on the generic updater: approve one declaration that asks for more
     // rights (see `update_rights::cli`). Not a flag and not an sshd request: sshd passes no
     // arguments.
@@ -318,6 +327,22 @@ mod tests {
             ExitCode::from(2)
         );
         assert_eq!(main_with(args(&["activate", "--pin"])), ExitCode::from(2));
+    }
+
+    /// `unpin` reaches its command, whose arguments must be text: a word that is not refuses
+    /// the command, and so does any argument at all, both before anything is read from the
+    /// host.
+    ///
+    /// Catches: `unpin` taken for an ssh request; an unpin that takes an argument.
+    #[test]
+    fn unpin_reaches_its_command() {
+        use std::os::unix::ffi::OsStringExt;
+        let not_text = OsString::from_vec(vec![b'k', 0xff]);
+        assert_eq!(
+            main_with(vec![OsString::from("unpin"), not_text]),
+            ExitCode::from(2)
+        );
+        assert_eq!(main_with(args(&["unpin", "--pin"])), ExitCode::from(2));
     }
 
     #[test]

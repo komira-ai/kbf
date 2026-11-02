@@ -211,6 +211,11 @@ pub enum Answer {
         /// The install lock was taken from another holder (`--force-lock`).
         lock_taken: bool,
     },
+    /// An `unpin` ended: the pin of `commit` is undone, or there was none (`None`: no hold
+    /// file, or one that named no commit root wrote).
+    Unpinned {
+        commit: Option<CommitId>,
+    },
     /// An `activate` named no release the host keeps (`not_kept`), or more than one
     /// (`ambiguous_release`): refused, nothing ran, and the releases the host keeps are told.
     Unresolved {
@@ -279,6 +284,12 @@ struct Activated<'a> {
     from: Option<&'a CommitId>,
     pinned: bool,
     lock_taken: bool,
+}
+
+#[derive(Serialize)]
+struct Unpinned<'a> {
+    result: &'static str,
+    commit: Option<&'a CommitId>,
 }
 
 #[derive(Serialize)]
@@ -354,6 +365,10 @@ impl Answer {
                 pinned: *pinned,
                 lock_taken: *lock_taken,
             }),
+            Self::Unpinned { commit } => to_json(&Unpinned {
+                result: "unpinned",
+                commit: commit.as_ref(),
+            }),
             Self::Unresolved {
                 code,
                 releases,
@@ -385,6 +400,7 @@ impl Answer {
             Self::Reverted { .. } => ("reverted", None),
             Self::Queried(_) => ("query", None),
             Self::Activated { .. } => ("activated", None),
+            Self::Unpinned { .. } => ("unpinned", None),
             Self::Refused(code, _) | Self::Unresolved { code, .. } => {
                 ("refused", Some(code.code()))
             }

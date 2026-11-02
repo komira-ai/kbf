@@ -41,7 +41,8 @@ fn a_farm_all_at_the_desired_version_has_converged() {
             at_desired: 2,
             updating: 0,
             failed: 0,
-            down: 0
+            down: 0,
+            pinned: 0
         }
     );
 }
@@ -179,7 +180,8 @@ fn a_silent_host_is_down_and_nothing_else() {
             at_desired: 2,
             updating: 0,
             failed: 0,
-            down: 2
+            down: 2,
+            pinned: 0
         }
     );
     assert_eq!(c.state, State::Converged);

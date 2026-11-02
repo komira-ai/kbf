@@ -27,6 +27,12 @@
 //!   before anything changes. The hold file is written first, then `retain.json`: a pin that
 //!   fails between them leaves the hold and is told; asked again, both are written. The agent's
 //!   reading of the hold file is the agent's.
+//! - **The unpin** ([`Ab::unpin`], `kbf-host-install unpin`) undoes a pin under the same
+//!   install lock, taken without waiting: the commit root's hold file names is taken out of
+//!   `retain.json`'s `pinned` first, then the hold file is removed, so a run cut short between
+//!   the two leaves the hold file and is finished by asking again. A host with no hold file is
+//!   not pinned, and the unpin says so and changes nothing. A hold file that is not root's, or
+//!   names no commit, is removed and unpins nothing in `retain.json`.
 //!
 //! The work is one code path over `&dyn Backend` ([`Activation`]), whatever the backend.
 
@@ -102,6 +108,20 @@ impl<B: Backend> Ab<B> {
         }
         .run(target, how)
     }
+
+    /// Undo the pin of an `activate --pin` (see the module docs).
+    pub fn unpin(&self) -> Answer {
+        Activation {
+            backend: &self.backend,
+            state_file: &self.state_file,
+            trust: &self.trust,
+            clock: &*self.clock,
+            note: &*self.note,
+            hold_file: self.hold_file.as_deref(),
+            versions_kept: self.versions_kept(),
+        }
+        .unpin()
+    }
 }
 
 /// What an activate needs of the core, borrowed: one code path for every backend.
@@ -128,7 +148,7 @@ impl Activation<'_> {
             (true, Some(hold)) => Some(hold),
             (false, _) => None,
         };
-        let (lock, holder) = match self.lock(how.force_lock) {
+        let (lock, holder) = match self.lock(how.force_lock, true) {
             Ok(taken) => taken,
             Err(answer) => return *answer,
         };
@@ -138,9 +158,10 @@ impl Activation<'_> {
     }
 
     /// The install lock, taken without waiting, or from its holder when `force`; the holder it
-    /// was taken from. A holder that keeps it is named in the refusal. (With `force`, a lock
-    /// still busy is one another taker made anew at the same moment.)
-    fn lock(&self, force: bool) -> Result<(Lock, Option<Holder>), Box<Answer>> {
+    /// was taken from. A holder that keeps it is named in the refusal, which offers
+    /// `--force-lock` when the verb takes it (`forcible`). (With `force`, a lock still busy is
+    /// one another taker made anew at the same moment.)
+    fn lock(&self, force: bool, forcible: bool) -> Result<(Lock, Option<Holder>), Box<Answer>> {
         let path = self.backend.lock_file();
         let taken = if force {
             take_lock_over(&path)
@@ -151,10 +172,13 @@ impl Activation<'_> {
             Box::new(match outcome {
                 Outcome::Failed(failure) if failure.code == FailureCode::Busy => {
                     let holder = locks::holder(&path);
-                    let what_now = if holder.alive {
-                        "let it end or stop it, or take it from a stuck holder with --force-lock"
-                    } else {
-                        "take it with --force-lock"
+                    let what_now = match (holder.alive, forcible) {
+                        (true, true) => {
+                            "let it end or stop it, or take it from a stuck holder with --force-lock"
+                        }
+                        (false, true) => "take it with --force-lock",
+                        (true, false) => "let it end or stop it",
+                        (false, false) => "take it with activate --force-lock",
                     };
                     Answer::Refused(
                         Code::Busy,
@@ -382,6 +406,115 @@ impl Activation<'_> {
         }
         Ok(())
     }
+}
+
+impl Activation<'_> {
+    /// Undo the pin, holding the install lock (see the module docs).
+    fn unpin(&self) -> Answer {
+        let Some(hold) = self.hold_file else {
+            return Answer::Refused(Code::ConfigInvalid, "this host has no hold file".to_owned());
+        };
+        let lock = match self.lock(false, false) {
+            Ok((lock, _)) => lock,
+            Err(answer) => return *answer,
+        };
+        let done = self.unpin_held(hold);
+        drop(lock);
+        done.unwrap_or_else(Fault::answer)
+    }
+
+    fn unpin_held(&self, hold: &Path) -> Result<Answer, Fault> {
+        let commit = match read_hold(hold, self.trust) {
+            Read::Absent => return Ok(Answer::Unpinned { commit: None }),
+            Read::Commit(commit) => Some(commit),
+            Read::NoCommit(why) => {
+                (self.note)(&format!("unpin: {why}: nothing is unpinned in retain.json"));
+                None
+            }
+        };
+        if let (Some(commit), Some(file)) = (&commit, self.backend.retain_file()) {
+            Retained::try_update(&file, |r| {
+                r.pinned.remove(commit);
+            })
+            .map_err(|e| match e {
+                kbf_retain::RetainError::Busy { .. } => Fault::refused(Code::Busy, e.to_string()),
+                other => Fault::failed(Code::StateUnavailable, format!("the pin: {other}")),
+            })?;
+        }
+        remove_hold(hold).map_err(|e| {
+            Fault::failed(Code::StateUnavailable, format!("{}: {e}", hold.display()))
+        })?;
+        Ok(Answer::Unpinned { commit })
+    }
+}
+
+/// What a hold file holds, for an unpin.
+enum Read {
+    /// There is none.
+    Absent,
+    /// Root's, naming this commit.
+    Commit(CommitId),
+    /// Something is at the name, but it is not root's or names no commit, for this reason.
+    NoCommit(String),
+}
+
+/// The keys of a hold file an unpin reads.
+#[derive(serde::Deserialize)]
+struct HoldRead {
+    commit: String,
+}
+
+/// Read the hold file `path`, never through a link, trusting only a regular file `trust` owns.
+fn read_hold(path: &Path, trust: &Trust) -> Read {
+    let opened = OpenOptions::new()
+        .read(true)
+        .custom_flags(nofollow() | libc::O_NONBLOCK)
+        .open(path);
+    let file = match opened {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Read::Absent,
+        Err(e) => return Read::NoCommit(format!("{}: {e}", path.display())),
+    };
+    let text = file
+        .metadata()
+        .and_then(|meta| {
+            if meta.is_file() && trust.owns(&meta) {
+                let mut text = String::new();
+                io::Read::read_to_string(&mut io::Read::take(file, 4096), &mut text)?;
+                Ok(text)
+            } else {
+                Err(io::Error::other("not a regular file root owns"))
+            }
+        })
+        .map_err(|e| format!("{}: {e}", path.display()));
+    match text.and_then(|text| {
+        serde_json::from_str::<HoldRead>(&text)
+            .map_err(|e| e.to_string())
+            .and_then(|hold| CommitId::new(&hold.commit).map_err(|e| e.to_string()))
+    }) {
+        Ok(commit) => Read::Commit(commit),
+        Err(why) => Read::NoCommit(why),
+    }
+}
+
+/// Remove the name `path` (never following a link) and sync its directory; no file is fine.
+fn remove_hold(path: &Path) -> io::Result<()> {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(io::Error::other(
+            "the hold file has no directory or no name",
+        ));
+    };
+    let dir = rustix::fs::open(
+        dir,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    match rustix::fs::unlinkat(&dir, name, AtFlags::empty()) {
+        Ok(()) | Err(rustix::io::Errno::NOENT) => {}
+        Err(e) => return Err(e.into()),
+    }
+    rustix::fs::fsync(&dir)?;
+    Ok(())
 }
 
 /// A refusal of `code` that tells `detail` and lists the releases the host keeps.

@@ -294,7 +294,8 @@ fn size(beat: &Heartbeat) -> usize {
 /// `beat` if it is at most `max` bytes as JSON; else `beat` without the facts the coordinator
 /// can do without (`agent_features`, the step, commit, durations, `promotion_pending`,
 /// `deferred`, and the phase, class and reason of a result, of `kbf` and of every service);
-/// else nothing.
+/// else nothing. The pin (`pinned`) is never dropped: without it the coordinator would count a
+/// pinned host as one that can be ordered.
 #[must_use]
 pub fn fit(beat: Heartbeat, max: usize) -> Fit {
     if size(&beat) <= max {

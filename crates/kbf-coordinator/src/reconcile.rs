@@ -89,8 +89,13 @@ pub enum Change {
 /// Whether `host`'s last update was a failure of `version` that is the release's fault: it
 /// failed after the commit or at the release gate, and the hook did not blame the
 /// environment. A failure that says nothing about where it happened (an updater without
-/// phases) is not counted, nor is one before the commit, at the environment gate, or a halt.
+/// phases) is not counted, nor is one before the commit, at the environment gate, or a halt,
+/// nor one of a pinned host: root holds it on a release, and its report is no vote on the
+/// desired version.
 pub(crate) fn is_release_failure(host: &Host, version: &Version) -> bool {
+    if host.is_pinned() {
+        return false;
+    }
     let Some(last) = host.beat.last_update.as_ref() else {
         return false;
     };

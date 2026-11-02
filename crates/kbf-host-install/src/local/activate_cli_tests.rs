@@ -269,3 +269,25 @@ fn the_program_refuses_before_it_reads_the_host() {
         ExitCode::from(2)
     );
 }
+
+/// `unpin` takes no argument and is root's: an argument, or another account, is refused (exit
+/// 2) before anything runs; root with none runs it and exits with its status.
+///
+/// Catches: an unpin run by the agent's account; an argument taken for something it is not.
+#[test]
+fn only_root_with_no_argument_reaches_the_unpin() {
+    use super::unpin_cli;
+    let ran = std::cell::Cell::new(0);
+    let go = || {
+        ran.set(ran.get() + 1);
+        0
+    };
+    assert_eq!(
+        unpin_cli::main_with(&args("kbf=bbbbbbbbbbbb"), 0, &go),
+        ExitCode::from(2)
+    );
+    assert_eq!(unpin_cli::main_with(&[], 1000, &go), ExitCode::from(2));
+    assert_eq!(ran.get(), 0);
+    assert_eq!(unpin_cli::main_with(&[], 0, &go), ExitCode::from(0));
+    assert_eq!(ran.get(), 1);
+}

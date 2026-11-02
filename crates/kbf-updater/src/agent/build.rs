@@ -15,6 +15,7 @@ use super::cordon::OwnCordon;
 use super::enroll::frontend_url;
 use super::flags::{Config, NodeApi, ServiceConfig, ServiceDrain, ServiceHealth};
 use super::local::{Limits, LocalInstaller, SocketLocal};
+use super::pin::PinFile;
 use super::renew::{FrontendRenewer, Renewer};
 use super::run::{Agent, ServicePorts, Stop, World};
 use super::service_health::ReadyUrl;
@@ -365,7 +366,8 @@ pub fn build(cfg: &Config) -> Result<Agent, String> {
         Status::unknown(platform, unknown),
     )
     .with_services(services)
-    .with_host_updates(cordon_dir(cfg)))
+    .with_host_updates(cordon_dir(cfg))
+    .with_pin(PinFile::in_dir(&cordon_dir(cfg))))
 }
 
 /// The ports of `service`: its own helper socket, the node's drain

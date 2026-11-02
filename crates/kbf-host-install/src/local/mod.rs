@@ -15,7 +15,7 @@
 //! - `query` says what runs, what is on trial, and how the last update ended;
 //! - `activate` makes a release the host keeps the one that runs, for good: no fetch and no
 //!   trial ([`core::activate`]). Root runs it on the host too, with a pin and a forced lock
-//!   ([`activate_cli`]).
+//!   ([`activate_cli`]), and undoes the pin with `unpin` ([`unpin_cli`]).
 //!
 //! This program owns the revert. A release on trial that is not confirmed by its deadline is
 //! put back by this program ([`core::Ab::tick`]), whether or not the release, the updater
@@ -34,6 +34,7 @@ pub mod request;
 pub mod serve;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub mod units;
+pub mod unpin_cli;
 
 // Compiled and tested everywhere, used by the program on Linux only.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]

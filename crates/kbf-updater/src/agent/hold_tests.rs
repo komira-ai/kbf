@@ -534,6 +534,7 @@ fn rich() -> Heartbeat {
         step_secs: [(StepName::parse("fetch").unwrap(), 1)].into(),
         promotion_pending: true,
         deferred: None,
+        pinned: None,
     }
 }
 

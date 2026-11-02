@@ -166,6 +166,52 @@ pub struct DeferredReport {
     pub retry_after_secs: u64,
 }
 
+/// The full commit of a release: 40 lowercase hex digits.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct Commit(String);
+
+impl Commit {
+    /// `text` as a commit, if it is 40 lowercase hex digits.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        (text.len() == 40 && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+            .then(|| Self(text.to_owned()))
+    }
+}
+
+impl TryFrom<String> for Commit {
+    type Error = &'static str;
+
+    fn try_from(text: String) -> Result<Self, Self::Error> {
+        Self::parse(&text).ok_or("not a commit: 40 lowercase hex digits")
+    }
+}
+
+impl From<Commit> for String {
+    fn from(commit: Commit) -> Self {
+        commit.0
+    }
+}
+
+impl std::fmt::Display for Commit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// The host is pinned: root's hold file (`kbf-host-install activate --pin`) is there, and the
+/// agent acts on no order for `kbf` until it is gone (`kbf-host-install unpin`).
+///
+/// A field this reader does not know is ignored, so a later agent can say more of the pin.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PinReport {
+    /// The release the hold file names; none when root's hold file could not be read, which
+    /// pins the host all the same.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<Commit>,
+}
+
 /// A field that is read as `None` when its value is not one of `T`: for a fact a newer agent
 /// may spell in a way this reader does not know.
 pub(crate) fn lenient<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
