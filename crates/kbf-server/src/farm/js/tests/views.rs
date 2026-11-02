@@ -546,7 +546,12 @@ async fn the_counters_of_an_idle_farm_are_the_legacy_farms_and_the_gauges_follow
 
     assert_eq!(js.failed_actions(), legacy.failed_actions());
     assert_eq!(js.dropped_writes(), legacy.dropped_writes());
-    assert_eq!(js.lost_races(), legacy.lost_races());
+    assert_eq!(legacy.lost_races(), Some(0));
+    assert_eq!(
+        js.lost_races(),
+        None,
+        "the js core counts no lost race apart"
+    );
     assert_eq!(js.memory_runs(), legacy.memory_runs());
     assert_eq!(js.avoided(), legacy.avoided());
     assert_eq!(js.open_sessions(), 0);
@@ -606,4 +611,41 @@ async fn the_pack_counts_are_kept_from_the_newest_stream_only() {
     assert_eq!(js.pack_reads(), legacy.pack_reads());
     assert_eq!(js.pack_reads().len(), 1);
     assert_eq!(js.pack_writes().len(), 1);
+}
+
+/// Asserts what a scrape (`crate::metrics::render_farm`, the one call of `GET /metrics`) of a
+/// fresh farm says of the state store's refused writes: on the legacy core both
+/// `kbf_farm_lost_races_total` and `kbf_farm_dropped_writes_total` are counters at 0 with a
+/// `# HELP` and a `# TYPE` line; on the js core, which counts a lost race among its dropped
+/// writes, only `kbf_farm_dropped_writes_total` is written. Catches: a family missing from
+/// the scrape (an absent series reads as a metric that is gone), one not typed a counter,
+/// and a lost-race count of 0 shown for a core that cannot count lost races.
+#[tokio::test(start_paused = true)]
+async fn a_fresh_farm_scrapes_its_refused_writes_as_counters_at_zero() {
+    let (legacy, js) = pair();
+    let scrape = |farm: &Farm| {
+        let mut text = String::new();
+        crate::metrics::render_farm(&mut text, farm);
+        text
+    };
+    let (legacy, js) = (scrape(&legacy), scrape(&js));
+    let family = |text: &str, name: &str| {
+        let help = text
+            .lines()
+            .any(|l| l.starts_with(&format!("# HELP {name} ")));
+        let typed = text.lines().any(|l| l == format!("# TYPE {name} counter"));
+        let zero = text.lines().any(|l| l == format!("{name} 0"));
+        (help, typed, zero)
+    };
+
+    for name in ["kbf_farm_lost_races_total", "kbf_farm_dropped_writes_total"] {
+        assert_eq!(
+            family(&legacy, name),
+            (true, true, true),
+            "{name}: {legacy}"
+        );
+    }
+    let dropped = family(&js, "kbf_farm_dropped_writes_total");
+    assert_eq!(dropped, (true, true, true), "{js}");
+    assert!(!js.contains("kbf_farm_lost_races_total"), "{js}");
 }

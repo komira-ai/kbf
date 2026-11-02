@@ -5,27 +5,77 @@
 //! (unavailable, timed out, an I/O error) holds the record back and counts nothing; a
 //! fence, a node another frontend owns, an unencodable write and the held cap each drop
 //! the write and count it in `dropped_writes`. A refusal as stale of another write than a
-//! committed record's is logged as before.
+//! committed record's is logged as before. A record held back by an unreachable store that
+//! loses the race before it is written again is one lost race, once, on the retry.
 
 use kbf_state::StoreError;
 
-use super::blocks_tests::{Racing, farm_over, submit};
+use super::blocks_tests::{Racing, durable_over, farm_over, submit, unfinished};
 use super::intake_tests::{caller, invalid, register};
+use super::owner_tests::grant;
 use super::transition_tests::{answer, start};
 use super::*;
 use crate::test_log::capture;
 
-/// The line of a lost race.
+/// The start of the line of a lost race.
 const RACE: &str = "another frontend won the race for the operation";
+
+/// The whole message of a lost race.
+const LOST_RACE: &str = "another frontend won the race for the operation: this frontend's \
+                         write is dropped and its placement undone";
+
+/// The lost races `farm` counted: the legacy core, which every test here runs, counts them.
+fn races(farm: &Farm) -> u64 {
+    farm.lost_races()
+        .expect("the legacy core counts lost races")
+}
+
+/// The farm's `/metrics` page, as `GET /metrics` writes it.
+fn scrape(farm: &Farm) -> String {
+    let mut text = String::new();
+    crate::metrics::render_farm(&mut text, farm);
+    text
+}
+
+/// Lets `farm` notice that its state store is down and still refuses the held records, so
+/// the log of the next tick holds what that tick writes and not the outage's notice: one
+/// tick with the store down (it says the store is unavailable, and the held records are
+/// refused again), and the store comes back.
+async fn notice_the_outage(store: &Racing, farm: &Farm) {
+    store.set_down(true);
+    farm.tick().await;
+    store.set_down(false);
+}
+
+/// Refuses the next write named `what` on `farm`'s state store with `error`.
+fn refuse_next(farm: &Farm, what: &'static str, error: StateError) {
+    let state = farm.lock();
+    let durable = state.engine.durable.as_ref().expect("a state store");
+    durable.refuse_next(what, error);
+}
+
+/// Asserts that `log` holds exactly one WARN line, the whole message of a lost race with
+/// `operations` set to exactly `named` and nothing after it, and no ERROR line.
+fn assert_one_race_warning(log: &str, named: &str, why: &str) {
+    let warnings: Vec<_> = log.lines().filter(|l| l.contains(" WARN ")).collect();
+    let [warning] = &warnings[..] else {
+        panic!("{why}: one WARN line expected: {log}");
+    };
+    let wanted = format!(": {LOST_RACE} operations={named}");
+    assert!(warning.ends_with(&wanted), "{why}: {warning}");
+    assert!(!log.contains(" ERROR "), "{why}: {log}");
+}
 
 /// What one refusal of a committed record left behind.
 struct Refused {
+    /// The store under the farm.
+    store: Arc<Racing>,
+    /// The farm the record was refused on.
+    farm: Farm,
     log: String,
     operation: OperationId,
     lost_races: u64,
     dropped_writes: u64,
-    /// The farm's `/metrics` lines after the refusal.
-    metrics: String,
     /// The committed records held back, unwritten, after the refusal.
     held: usize,
 }
@@ -49,25 +99,20 @@ async fn refused_with(error: StateError) -> Refused {
         panic!("one lease expected");
     };
     let (lease, operation) = (view.lease, view.operation);
-    let durable = |farm: &Farm| {
-        let state = farm.lock();
-        let durable = state.engine.durable.as_ref().expect("a state store");
-        durable.refuse_next("a committed record", error);
-    };
-    durable(&farm);
+    refuse_next(&farm, "a committed record", error);
 
     let log = capture();
     farm.report(&node, invalid(lease)).await;
 
-    let mut metrics = String::new();
-    crate::pack_daemon_metrics::render_farm(&mut metrics, &farm);
+    let held = farm.lock().engine.unwritten.len();
     Refused {
         log: log.text(),
         operation,
-        lost_races: farm.lost_races(),
+        lost_races: races(&farm),
         dropped_writes: farm.dropped_writes(),
-        metrics,
-        held: farm.lock().engine.unwritten.len(),
+        held,
+        farm,
+        store,
     }
 }
 
@@ -96,10 +141,13 @@ fn assert_dropped(refused: &Refused, why: &str) {
 }
 
 /// Asserts that a committed record the store refuses as stale (a row the write depends on
-/// is gone, or changed under it) is one WARN line naming the operation and one lost race,
-/// with no ERROR line and no dropped write, and that `/metrics` shows the race in
-/// `kbf_farm_lost_races_total`. Catches: the race logged at ERROR, logged twice, named
-/// without its operation, counted as a dropped write, or missing from the exposition.
+/// is gone, or changed under it) is exactly one WARN line, the whole race message with
+/// `operations` naming the operation, and one lost race, with no ERROR line and no dropped
+/// write, and that `/metrics` shows the race in `kbf_farm_lost_races_total`. The result is
+/// held back by an unreachable store first, whose outage the farm notices, so the log of
+/// the retry (a tick) holds only the store's return (INFO) and what the refusal wrote. Catches: the race logged at ERROR, logged twice or beside another
+/// WARN, its message cut short, its operation missing or wrong, counted as a dropped write,
+/// or missing from the exposition.
 #[tokio::test(start_paused = true)]
 async fn a_stale_refusal_is_one_warning_and_a_lost_race() {
     let stale = [
@@ -111,33 +159,93 @@ async fn a_stale_refusal_is_one_warning_and_a_lost_race() {
     ];
     for error in stale {
         let why = error.to_string();
-        let refused = refused_with(error).await;
+        let held = StateError::Store(StoreError::Failed("unavailable".to_owned()));
+        let refused = refused_with(held).await;
+        assert_eq!(refused.held, 1, "{why}: the result was not held back");
+        let farm = refused.farm;
+        notice_the_outage(&refused.store, &farm).await;
+        assert_eq!(farm.lock().engine.unwritten.len(), 1, "{why}: not held");
+        refuse_next(&farm, "a committed record", error);
 
-        assert!(refused.lines("ERROR").is_empty(), "{why}: {}", refused.log);
-        let races = refused.lines(RACE);
-        let [warning] = &races[..] else {
-            panic!("{why}: one race line expected: {}", refused.log);
-        };
-        assert!(warning.contains(" WARN "), "{why}: {warning}");
-        let named = format!("operations={}", refused.operation);
-        assert!(warning.contains(&named), "{why}: {warning}");
-        assert_eq!(
-            (refused.lost_races, refused.dropped_writes),
-            (1, 0),
-            "{why}"
-        );
-        let exposed = |line: &str| refused.metrics.lines().any(|l| l == line);
-        assert!(
-            exposed("kbf_farm_lost_races_total 1"),
-            "{}",
-            refused.metrics
-        );
-        assert!(
-            exposed("kbf_farm_dropped_writes_total 0"),
-            "{}",
-            refused.metrics
-        );
+        let log = capture();
+        farm.tick().await;
+        let log = log.text();
+
+        assert_one_race_warning(&log, &refused.operation.to_string(), &why);
+        assert_eq!((races(&farm), farm.dropped_writes()), (1, 0), "{why}");
+        let metrics = scrape(&farm);
+        let exposed = |line: &str| metrics.lines().any(|l| l == line);
+        assert!(exposed("kbf_farm_lost_races_total 1"), "{metrics}");
+        assert!(exposed("kbf_farm_dropped_writes_total 0"), "{metrics}");
     }
+}
+
+/// Asserts that a grant held back by an unreachable store, whose operation another frontend
+/// takes before the grant is written again, is one lost race on the retry: exactly one WARN
+/// line naming the operation, no ERROR, `(lost_races, dropped_writes) == (1, 0)`, and the
+/// placement undone (this frontend holds no lease); and that the ticks and reports after it
+/// neither warn nor count the race again. Catches: a race counted at the outage instead of
+/// at the refusal, counted or warned again on a later retry, or its placement kept.
+#[tokio::test(start_paused = true)]
+async fn a_held_grant_that_loses_the_race_on_its_retry_is_one_lost_race() {
+    let store = Racing::new();
+    let farm = farm_over(&store);
+    let _ticket = caller(&farm, 1);
+    let [operation] = unfinished(&farm)[..] else {
+        panic!("one operation expected");
+    };
+    let unavailable = StateError::Store(StoreError::Failed("unavailable".to_owned()));
+    refuse_next(&farm, "a committed record", unavailable);
+    let _inbox = register(&farm, "node-a");
+    assert_eq!(
+        farm.lock().engine.unwritten.len(),
+        1,
+        "the grant was not held"
+    );
+    let views = farm.lease_views(None);
+    let [view] = &views.leases[..] else {
+        panic!("one placement expected");
+    };
+    let lease = view.lease;
+    assert_eq!(
+        (races(&farm), farm.dropped_writes()),
+        (0, 0),
+        "at the outage"
+    );
+    notice_the_outage(&store, &farm).await;
+    let other = durable_over(&store);
+    grant(&other, operation.0, 0, "node-b").expect("granted by another frontend");
+
+    let log = capture();
+    farm.tick().await;
+    let log = log.text();
+
+    assert_one_race_warning(&log, &operation.to_string(), "the retry");
+    assert_eq!((races(&farm), farm.dropped_writes()), (1, 0));
+    assert!(
+        farm.lease_views(None).leases.is_empty(),
+        "the placement was kept"
+    );
+    assert!(
+        farm.lock().engine.unwritten.is_empty(),
+        "the grant is still held"
+    );
+
+    let later = capture();
+    for _ in 0..3 {
+        tokio::time::advance(Duration::from_secs(5)).await;
+        farm.tick().await;
+    }
+    farm.report(&WorkerId::new("node-a"), invalid(lease)).await;
+    let later = later.text();
+
+    assert!(!later.contains(RACE), "the race was logged again: {later}");
+    assert!(!later.contains(" ERROR "), "{later}");
+    assert_eq!(
+        (races(&farm), farm.dropped_writes()),
+        (1, 0),
+        "after the retry"
+    );
 }
 
 /// Asserts that a store that cannot be reached (it is unavailable, a call timed out, an I/O
@@ -231,7 +339,7 @@ async fn a_record_over_the_held_cap_keeps_its_error_and_counts_a_drop() {
     assert!(log.contains("ERROR"), "{log}");
     assert!(log.contains("records over the cap: one dropped"), "{log}");
     assert!(!log.contains(RACE), "{log}");
-    assert_eq!((farm.dropped_writes(), farm.lost_races()), (1, 0));
+    assert_eq!((farm.dropped_writes(), races(&farm)), (1, 0));
 }
 
 /// Asserts that a refusal as stale of a write that is not a committed record's (here, the
@@ -241,12 +349,8 @@ async fn a_record_over_the_held_cap_keeps_its_error_and_counts_a_drop() {
 async fn a_stale_refusal_of_another_write_is_logged_as_before() {
     let store = Racing::new();
     let farm = farm_over(&store);
-    {
-        let state = farm.lock();
-        let durable = state.engine.durable.as_ref().expect("a state store");
-        let stale = StateError::Missing("queue row".to_owned());
-        durable.refuse_next("a submission", stale);
-    }
+    let stale = StateError::Missing("queue row".to_owned());
+    refuse_next(&farm, "a submission", stale);
 
     let log = capture();
     let submitted = submit(&farm, 1);
@@ -263,7 +367,7 @@ async fn a_stale_refusal_of_another_write_is_logged_as_before() {
     );
     assert!(error.contains("the write is stale"), "{error}");
     assert!(!log.contains(RACE), "{log}");
-    assert_eq!((farm.lost_races(), farm.dropped_writes()), (0, 0));
+    assert_eq!((races(&farm), farm.dropped_writes()), (0, 0));
 }
 
 /// Asserts that the operations a lost race names are those of every effect that has one

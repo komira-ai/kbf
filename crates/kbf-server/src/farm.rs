@@ -466,15 +466,17 @@ impl Farm {
         self.lock().engine.sched.queued_len() as u64
     }
 
-    /// Races with another frontend this one lost: committed records the state store
-    /// refused as stale because the other frontend's write stood
-    /// (`kbf_farm_lost_races_total`). The operation runs once, under the winner; not
-    /// counted in [`Farm::dropped_writes`]. Always 0 on the js core, which counts these
-    /// among its dropped writes.
+    /// Races with another frontend this one lost since it started, from 0: committed records
+    /// the state store refused as stale because the other frontend's write stood
+    /// (`kbf_farm_lost_races_total`). The operation runs once, under the winner; a lost
+    /// race is not counted in [`Farm::dropped_writes`]. `None` on the js core
+    /// (`--scheduler-core js`), which does not tell a lost race from a dropped write and
+    /// counts it in [`Farm::dropped_writes`]: no count of its races is known, and none is
+    /// shown as 0.
     #[must_use]
-    pub fn lost_races(&self) -> u64 {
+    pub fn lost_races(&self) -> Option<u64> {
         js_arm!(self, views::lost_races());
-        self.lock().engine.lost_races
+        Some(self.lock().engine.lost_races)
     }
 
     /// Writes to the state store the farm gave up on for good: held effects dropped on a

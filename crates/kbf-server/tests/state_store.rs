@@ -467,15 +467,11 @@ fn submit(farm: &TestFarm, request: Request) -> Result<(), Status> {
     .map(drop)
 }
 
-/// The races with another frontend `farm` lost: [`Farm::lost_races`] on the legacy core.
-/// The js core does not tell a lost race from a dropped write and counts it among its
-/// dropped writes.
+/// The races with another frontend `farm` lost: [`Farm::lost_races`], on a core that counts
+/// them. The js core has no such count (`None`): it counts a lost race among its dropped
+/// writes, which are read instead.
 fn lost_races(farm: &TestFarm) -> u64 {
-    if cfg!(feature = "farm-core-js") {
-        farm.dropped_writes()
-    } else {
-        farm.lost_races()
-    }
+    farm.lost_races().unwrap_or_else(|| farm.dropped_writes())
 }
 
 fn node() -> WorkerId {
