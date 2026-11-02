@@ -150,7 +150,8 @@ async fn a_server_shows_the_pack_writes_its_daemons_report() {
     }
     let node_b = text.lines().filter(|l| l.contains("node=\"node-b\""));
     let node_b: Vec<&str> = node_b.collect();
-    assert_eq!(node_b.len(), 6, "{text}");
+    // The eight read families, and none of the writes.
+    assert_eq!(node_b.len(), 8, "{text}");
     assert!(
         node_b.iter().all(|l| l.starts_with("kbf_pack_daemon_")),
         "{text}"
