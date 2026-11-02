@@ -592,7 +592,9 @@ async fn a_revoked_nodes_resent_hello_does_not_resize_the_node() {
 
 /// A deny list that cannot be read refuses a node's message UNAVAILABLE before the farm sees
 /// it: the stream ends at the `NodeStatus`, not at the `Hello` behind it, and the node's view
-/// keeps no software status. The node is not revoked: the refusal is the unreadable list's.
+/// keeps no software status. The node is not revoked: the refusal is the list's. Here the
+/// list cannot be read because a line is not an entry (`DenyListError::Parse`); a file that
+/// cannot be opened takes the same path out of `DenyList::current`.
 ///
 /// Catches: an admission check that lets a message through when the list cannot be read, or
 /// that turns that failure into another code, so that a list broken by an operator's bad edit
