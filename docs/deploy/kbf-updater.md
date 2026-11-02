@@ -734,8 +734,11 @@ and -`); a value that is not a string (`pool = 3`) is refused by the TOML parse
 (`services: invalid type: ...`). Either stops the start.
 
 A coordinator before slot pools refuses a file that names `pool` (an unknown field) and does not
-start. Add a pool to the file only once every coordinator that may read it, and any release it may
-be rolled back to, reads pools.
+start. Pools therefore go out in two steps. First, the release that reads pools ships with no pool in
+any shipped entry, so it and the release before it both read every shipped file. Second, once that
+release is the oldest one any coordinator runs or may be rolled back to, a pool is added to the file
+(the tierstore entry's `pool = "storage"`): every release that may then read the file reads it. Do
+not add a pool to the file before that.
 
 A service entry may also set two rollout fields, both off by default (a coordinator before the change refuses a file that names them, so set them only after every coordinator runs the new build):
 

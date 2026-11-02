@@ -213,10 +213,11 @@ fn the_release_before_pools_reads_the_shipped_tierstore_entry() {
     before_pools::read(TIERSTORE_BEFORE_POOLS).expect("its own entry");
 }
 
-/// Catches: the version floor of a pool going unstated. A file that names a pool, the shipped
+/// Catches: the second step of the deploy document's two (a pool in the file) being safe
+/// before the first has reached every coordinator. A file that names a pool, the shipped
 /// tierstore entry with the documented line added, is refused by the release before pools
-/// for the unknown field `pool`, which is why the deploy document says to add it only once
-/// every coordinator that may read the file reads pools; this release reads it with the pool.
+/// for the unknown field `pool`, so the pool waits until that release is no longer run or
+/// rolled back to; this release, the one the second step waits for, reads it with the pool.
 #[test]
 fn the_release_before_pools_refuses_a_file_that_names_a_pool() {
     let pooled = TIERSTORE_SERVICES.replace("min_up = 4\n", "min_up = 4\npool = \"storage\"\n");
