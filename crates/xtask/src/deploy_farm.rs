@@ -45,7 +45,8 @@
 //! `ACTIONS_ID_TOKEN_REQUEST_TOKEN`, which the platform sets for a job with `id-token:
 //! write`) and never printed: it is masked in the log as soon as it is read.
 
-use std::io::Write;
+use std::fmt;
+use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
 use clap::Args as ClapArgs;
@@ -617,6 +618,37 @@ pub enum Peer {
     Coordinator,
 }
 
+impl fmt::Display for Peer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Runner => "the runner's token service",
+            Self::Coordinator => "the coordinator",
+        })
+    }
+}
+
+/// Why a call got no answer: no connection, the TLS handshake refused, a timeout.
+#[derive(Debug, thiserror::Error)]
+#[error("no answer from {peer}: {source}")]
+pub struct CallError {
+    /// Whom the call went to.
+    pub peer: Peer,
+    /// What failed.
+    #[source]
+    pub source: io::Error,
+}
+
+/// Why the body of an answer could not be read: cut off, too long, not text.
+#[derive(Debug, thiserror::Error)]
+#[error("the answer from {peer} could not be read: {source}")]
+pub struct BodyError {
+    /// Whom the call went to.
+    pub peer: Peer,
+    /// What failed.
+    #[source]
+    pub source: io::Error,
+}
+
 /// One HTTP call.
 #[derive(Clone, Copy, Debug)]
 pub struct Call<'a> {
@@ -631,18 +663,18 @@ pub struct Call<'a> {
 }
 
 /// What a call got back.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Answer {
     pub status: u16,
     /// The body text, or why it could not be read.
-    pub body: Result<String, String>,
+    pub body: Result<String, BodyError>,
 }
 
 /// How calls reach the peers: HTTPS in production, memory in tests.
 pub trait Transport {
     /// # Errors
     /// Why the call did not get an answer.
-    fn call(&self, call: Call<'_>) -> Result<Answer, String>;
+    fn call(&self, call: Call<'_>) -> Result<Answer, CallError>;
 }
 
 /// The production transport: one `ureq` agent per peer.
@@ -652,7 +684,8 @@ struct UreqTransport {
 }
 
 impl Transport for UreqTransport {
-    fn call(&self, call: Call<'_>) -> Result<Answer, String> {
+    fn call(&self, call: Call<'_>) -> Result<Answer, CallError> {
+        let peer = call.peer;
         let agent = match call.peer {
             Peer::Runner => &self.runner,
             Peer::Coordinator => &self.coordinator,
@@ -668,10 +701,16 @@ impl Transport for UreqTransport {
                 .header("Authorization", call.authorization)
                 .call(),
         }
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| CallError {
+            peer,
+            source: io::Error::other(e),
+        })?;
         Ok(Answer {
             status: response.status().as_u16(),
-            body: answer_text(&mut response),
+            body: answer_text(&mut response).map_err(|e| BodyError {
+                peer,
+                source: io::Error::other(e),
+            }),
         })
     }
 }
@@ -732,8 +771,8 @@ impl Client<'_> {
                 authorization: &authorization,
                 body: None,
             })
-            .map_err(call)?;
-        let text = answer.body.map_err(call)?;
+            .map_err(|e| call(e.to_string()))?;
+        let text = answer.body.map_err(|e| call(e.to_string()))?;
         if answer.status != 200 {
             return Err(call(format!("status {}", answer.status)));
         }
@@ -768,12 +807,12 @@ impl Client<'_> {
                 authorization: &bearer,
                 body: body.as_deref(),
             })
-            .map_err(call)?;
+            .map_err(|e| call(e.to_string()))?;
         let status = answer.status;
         if matches!(status, 401 | 403) {
             return Err(Error::Refused { what, status });
         }
-        let text = answer.body.map_err(call)?;
+        let text = answer.body.map_err(|e| call(e.to_string()))?;
         if status != 200 {
             return Err(call(format!("status {status}")));
         }
@@ -781,13 +820,12 @@ impl Client<'_> {
     }
 }
 
-fn answer_text(response: &mut ureq::http::Response<ureq::Body>) -> Result<String, String> {
+fn answer_text(response: &mut ureq::http::Response<ureq::Body>) -> Result<String, ureq::Error> {
     response
         .body_mut()
         .with_config()
         .limit(MAX_ANSWER)
         .read_to_string()
-        .map_err(|e| e.to_string())
 }
 
 /// `text` with everything but unreserved characters as `%XX`.

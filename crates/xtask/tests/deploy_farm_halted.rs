@@ -6,7 +6,9 @@
 use std::cell::RefCell;
 
 use serde_json::{Value, json};
-use xtask::deploy_farm::{Answer, Call, Error, TokenService, Transport, deploy_with};
+use xtask::deploy_farm::{
+    Answer, BodyError, Call, CallError, Error, TokenService, Transport, deploy_with,
+};
 
 #[path = "support/deploy_data.rs"]
 mod deploy_data;
@@ -22,6 +24,8 @@ struct Memory {
     reads: Vec<Value>,
     /// The coordinator's answers have a status but a body that cannot be read.
     unreadable: bool,
+    /// The coordinator does not answer at all.
+    silent: bool,
     seen: RefCell<Vec<(String, String)>>,
 }
 
@@ -30,6 +34,7 @@ impl Memory {
         Self {
             reads,
             unreadable: false,
+            silent: false,
             seen: RefCell::new(Vec::new()),
         }
     }
@@ -40,7 +45,7 @@ impl Memory {
 }
 
 impl Transport for Memory {
-    fn call(&self, call: Call<'_>) -> Result<Answer, String> {
+    fn call(&self, call: Call<'_>) -> Result<Answer, CallError> {
         let path = call.url.strip_prefix(BASE).unwrap_or(call.url).to_owned();
         let reads_so_far = self
             .seen
@@ -58,10 +63,19 @@ impl Transport for Memory {
         } else {
             self.reads[reads_so_far.min(self.reads.len() - 1)].clone()
         };
+        if self.silent && !path.starts_with(TOKENS) {
+            return Err(CallError {
+                peer: call.peer,
+                source: std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused"),
+            });
+        }
         if self.unreadable && !path.starts_with(TOKENS) {
             return Ok(Answer {
                 status: 200,
-                body: Err("the answer is too long".to_owned()),
+                body: Err(BodyError {
+                    peer: call.peer,
+                    source: std::io::Error::other("the answer is too long"),
+                }),
             });
         }
         Ok(Answer {
@@ -206,6 +220,34 @@ fn an_unreadable_answer_body_is_a_call_error() {
     fake.unreadable = true;
     let (result, _) = run(&fake);
     let failure = result.expect_err("an unreadable body").to_string();
-    assert!(failure.contains("the answer is too long"), "{failure}");
+    assert_eq!(
+        failure,
+        "read the farm before the deploy: the answer from the coordinator could not be read: the answer is too long"
+    );
     assert_eq!(fake.requests("/v1/desired"), 0);
+}
+
+/// Proves: a call that gets no answer is a call error that names the peer and the cause, and
+/// the transport's error keeps that cause as its source. Catches: a transport failure turned
+/// into bare text at the boundary, losing whom the call went to.
+#[test]
+fn a_call_with_no_answer_is_a_call_error_naming_the_peer() {
+    let mut fake = Memory::new(vec![farm("converged", 0, 0)]);
+    fake.silent = true;
+    let (result, _) = run(&fake);
+    assert_eq!(
+        result.expect_err("no answer").to_string(),
+        "read the farm before the deploy: no answer from the coordinator: refused"
+    );
+    assert_eq!(fake.requests("/v1/desired"), 0);
+    let error = CallError {
+        peer: xtask::deploy_farm::Peer::Runner,
+        source: std::io::Error::other("timed out"),
+    };
+    let source = std::error::Error::source(&error).expect("a source");
+    assert_eq!(source.to_string(), "timed out");
+    assert_eq!(
+        error.to_string(),
+        "no answer from the runner's token service: timed out"
+    );
 }
