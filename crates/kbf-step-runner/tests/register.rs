@@ -205,9 +205,42 @@ fn a_peer_that_is_not_the_declared_user_is_refused() {
     assert_eq!(refused(&rig, &format!("{line}\n")), "unknown_service");
 }
 
+/// Catches a reader that refuses a field it does not know, which makes every field added to the
+/// message later break a client that sends it to an updater of an earlier release: a line with
+/// fields this updater does not have (an optional one of a later release, and one that names a
+/// command) registers as the same line without them would, and the fields act on nothing.
+#[test]
+fn an_unknown_optional_field_is_passed_over() {
+    let rig = Rig::new("reg-unknown-field", me());
+    let line = concat!(
+        r#"{"name":"svc","version":"2.0.0","#,
+        r#""health":{"addr":"127.0.0.1:9301","path":"/ready"},"#,
+        r#""region":{"zone":"a","weight":3},"exec":"reboot"}"#,
+        "\n",
+    );
+    let (client, served) = rig.connect();
+    assert_eq!(say(&client, line)["ok"], true);
+    assert_eq!(rig.registry.report("svc", Some("2.0.0")), Reported::Healthy);
+    assert_eq!(
+        rig.registry.health_addr("svc"),
+        Some(HealthAddr {
+            addr: "127.0.0.1:9301".to_owned(),
+            path: "/ready".to_owned(),
+        })
+    );
+    let parsed: Registration = serde_json::from_str(line.trim()).unwrap();
+    assert_eq!(parsed, reg("2.0.0", Some(("127.0.0.1:9301", "/ready"))));
+    drop(client);
+    served.join().unwrap().unwrap();
+    assert_eq!(
+        rig.registry.report("svc", Some("2.0.0")),
+        Reported::Unhealthy(Why::Stopped)
+    );
+}
+
 /// Catches a registration that is accepted although it is not one JSON object within the limit:
-/// garbage, an object missing a field, a command in a field the message does not have, an
-/// empty message, bytes that are not text, and a line over the limit are all `malformed`.
+/// garbage, an object missing a field, an empty message, bytes that are not text, and a line
+/// over the limit are all `malformed`.
 #[test]
 fn what_is_not_a_registration_is_malformed() {
     let rig = Rig::new("reg-malformed", me());
@@ -230,16 +263,6 @@ fn what_is_not_a_registration_is_malformed() {
     client.shutdown(Shutdown::Write).unwrap();
     assert_eq!(answer(&client)["error"], "malformed");
     served.join().unwrap().unwrap();
-    // A field the message does not have (a command, say) is not passed over.
-    let (client, served) = rig.connect();
-    let reply = say(
-        &client,
-        "{\"name\":\"svc\",\"version\":\"2.0.0\",\"exec\":\"reboot\"}\n",
-    );
-    drop(client);
-    served.join().unwrap().unwrap();
-    assert_eq!(reply["error"], "malformed", "{reply}");
-    assert_eq!(rig.registry.report("svc", None), Reported::Absent);
     for refusal in [
         Refused::Malformed,
         Refused::UnknownService,

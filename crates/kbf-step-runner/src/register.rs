@@ -64,10 +64,11 @@ pub struct HealthAddr {
     pub path: String,
 }
 
-/// The message of a service: liveness and version. Nothing else: a field it does not have (a
-/// command, a path) makes the line `malformed` rather than being passed over.
+/// The message of a service: liveness and version. Nothing else is read from it: a field it does
+/// not have is passed over and acts on nothing (there is no command, path or right to act on),
+/// so that a field added to the message later is additive, and a client that sends one still
+/// registers with an updater that does not know it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Registration {
     pub name: String,
     pub version: String,
