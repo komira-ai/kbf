@@ -3,7 +3,9 @@
 //! half (its container driver over a stand-in `crun`, `kbf-cli-fake-crun`, which runs the
 //! action as a plain process, and a cgroup tree of plain directories), its outputs, stdout
 //! and stderr stored in the node's storage in-process and read back through the frontend;
-//! and the node's one cache across a crash.
+//! the node's one cache across a crash; and a frontend started with `--scheduler-core=js`
+//! as a production host starts it (`kbf --mode=frontend`), which runs that core and serves a
+//! lease on it, and refuses it beside a flag that core cannot run.
 //!
 //! The node has no `--frontend`, so it is the whole farm's storage, a map of itself: the
 //! frontend reaches it through `--storage`, and the node's daemon half dials the frontend's
@@ -129,10 +131,24 @@ fn start_node(bin: &Path, flags: &[String]) -> Running {
 /// listener plain text on a free loopback port, its worker listener on `addrs.worker`
 /// under mutual TLS; the frontend and its REAPI address, from its start line.
 fn start_frontend(dir: &Path, addrs: &Addrs) -> (Running, SocketAddr) {
+    let (running, line) = start_frontend_with(dir, addrs, "frontend", &[], Stdio::inherit());
+    (running, field(&line, "reapi=").parse().expect("an address"))
+}
+
+/// [`start_frontend`] with `mode` as the binary's first argument (the word `frontend`, or
+/// the flag `--mode=frontend` a production host's unit gives), `extra` flags after the
+/// others and its log (stderr) sent to `stderr`; the frontend and its start line.
+fn start_frontend_with(
+    dir: &Path,
+    addrs: &Addrs,
+    mode: &str,
+    extra: &[String],
+    stderr: Stdio,
+) -> (Running, String) {
     let at = |name: &str| dir.join(name).display().to_string();
     let mut child = Command::new(BIN)
         .args([
-            "frontend".to_owned(),
+            mode.to_owned(),
             "--listen=127.0.0.1:0".to_owned(),
             // The node is this host, whatever its architecture: the default
             // (`linux/x86_64`) would leave an action on an aarch64 host with no worker.
@@ -146,20 +162,23 @@ fn start_frontend(dir: &Path, addrs: &Addrs) -> (Running, SocketAddr) {
             format!("--state-store=sqlite://{}", at("state.db")),
             kbf_testkit::config::flag(dir),
         ])
+        .args(extra)
         .stdout(Stdio::piped())
+        .stderr(stderr)
         .spawn()
         .expect("spawn");
     let stdout = BufReader::new(child.stdout.take().expect("stdout"));
     let running = Running(child);
     let line = stdout.lines().next().expect("a start line").expect("read");
     assert!(line.starts_with("kbf-frontend "), "{line}");
-    let reapi = line
-        .split(' ')
-        .find_map(|field| field.strip_prefix("reapi="))
-        .unwrap_or_else(|| panic!("no reapi= in {line:?}"))
-        .parse()
-        .expect("an address");
-    (running, reapi)
+    (running, line)
+}
+
+/// The value of the `key` field (`key` ends in `=`) of a start line.
+fn field<'a>(line: &'a str, key: &str) -> &'a str {
+    line.split(' ')
+        .find_map(|field| field.strip_prefix(key))
+        .unwrap_or_else(|| panic!("no {key} in {line:?}"))
 }
 
 /// A client of the plain-text gRPC listener at `addr`.
@@ -299,6 +318,187 @@ fn an_actions_outputs_are_stored_by_the_node_and_read_back_through_the_frontend(
 
     let status = terminate(node);
     assert!(status.success(), "{status}");
+}
+
+/// The `kbf_scheduler_core` gauge of `samples`, one `(core, value)` for each core it names.
+fn core_gauge(samples: &std::collections::BTreeMap<String, u64>) -> Vec<(String, u64)> {
+    samples
+        .iter()
+        .filter_map(|(name, value)| {
+            let core = name.strip_prefix("kbf_scheduler_core{core=\"")?;
+            Some((core.strip_suffix("\"}")?.to_owned(), *value))
+        })
+        .collect()
+}
+
+/// Catches a `kbf frontend` given `--scheduler-core=js` whose farm runs the legacy core all
+/// the same (the flag not carried from the parsed flags to the farm the frontend builds), and
+/// a js core that cannot serve a lease in the shipped binary built with its default features
+/// (the suites reach the js core through the test-only `farm-core-js` feature; this binary
+/// has none). The frontend is started as a production host starts it, `kbf
+/// --mode=frontend`, with the flag and an operator listener; before the
+/// action and after it, its `/metrics` says `kbf_scheduler_core{core="js"} 1` and
+/// `{core="legacy"} 0`; one action is executed through its REAPI listener, leased to the
+/// node's daemon half over the worker listener, run, and its result and stdout read back;
+/// and its log holds the start line `scheduler core: js` once and no `scheduler core:
+/// legacy`.
+#[test]
+fn a_frontend_given_the_js_core_runs_it_and_serves_a_lease_end_to_end() {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let dir = scratch("js-core");
+    pki(&dir);
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).expect("mkdir");
+    let image = crun(
+        &bin,
+        &dir.join("data"),
+        FAKE_CRUN,
+        &["echo", "on the js core"],
+    );
+    let token = dir.join("api-token");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&token)
+        .and_then(|mut f| f.write_all(&[b'7'; 64]))
+        .expect("write the token");
+    let log = dir.join("frontend.err");
+    let addrs = Addrs::new();
+    let node = start_node(&bin, &node_flags(&dir, &addrs, &[]));
+    let extra = [
+        "--scheduler-core=js".to_owned(),
+        "--api-listen=127.0.0.1:0".to_owned(),
+        format!("--api-token-file={}", token.display()),
+    ];
+    let stderr = std::fs::File::create(&log).expect("the log file");
+    let (_frontend, line) =
+        start_frontend_with(&dir, &addrs, "--mode=frontend", &extra, stderr.into());
+    let reapi: SocketAddr = field(&line, "reapi=").parse().expect("an address");
+    let api: SocketAddr = field(&line, "api=").parse().expect("an address");
+    let js_running = vec![("js".to_owned(), 1), ("legacy".to_owned(), 0)];
+    assert_eq!(core_gauge(&metrics(api)), js_running, "before the action");
+
+    let tokio = tokio::runtime::Runtime::new().expect("runtime");
+    tokio.block_on(async {
+        let channel = connect(reapi).await;
+        let cas = Transfers::over(channel.clone(), TransferConfig::default());
+        let command = ReapiCommand {
+            arguments: vec!["true".to_owned()],
+            ..ReapiCommand::default()
+        };
+        let action = Action {
+            command_digest: Some(put(&cas, command.encode_to_vec()).await),
+            input_root_digest: Some(put(&cas, Directory::default().encode_to_vec()).await),
+            platform: Some(Platform {
+                properties: vec![Property {
+                    name: "container-image".to_owned(),
+                    value: image,
+                }],
+            }),
+            ..Action::default()
+        };
+        let action = put(&cas, action.encode_to_vec()).await;
+        // No bound of its own: a lease that never ends is a hung test, which nextest's
+        // slow-timeout ends.
+        let result = execute(channel, action).await;
+        assert_eq!(result.exit_code, 0, "{result:?}");
+        let stdout = fetch(&cas, &result.stdout_digest.expect("a stdout digest"))
+            .await
+            .expect("read back");
+        assert_eq!(stdout, b"on the js core\n");
+    });
+    drop(tokio);
+
+    assert_eq!(core_gauge(&metrics(api)), js_running, "after the action");
+    let said = std::fs::read_to_string(&log).expect("the log");
+    assert_eq!(said.matches("scheduler core: js").count(), 1, "{said}");
+    assert!(!said.contains("scheduler core: legacy"), "{said}");
+    let status = terminate(node);
+    assert!(status.success(), "{status}");
+}
+
+/// Catches `kbf --mode=frontend` starting the js core with a flag that core cannot honour
+/// (it would run while the flag says otherwise), a refusal with a status other than 2, and
+/// one whose message does not name both flags. Each of `--learned-sizes=on` and
+/// `--no-memory-climb` beside `--scheduler-core=js` ends the start, before a start line, with
+/// status 2 and the error naming the flag and `--scheduler-core js`, logs no core, and leaves
+/// its state store uncreated (the refusal comes before anything opens). Control: the same
+/// start with `--learned-sizes=shadow`, which the js core runs, prints its start line and has
+/// created its state store by then.
+#[test]
+fn a_frontend_refuses_the_js_core_with_a_flag_it_cannot_run() {
+    let dir = scratch("js-core-refused");
+    let addrs = Addrs::new();
+    // Each start has a state store of its own, so a refused start that opened (and so
+    // created) it is seen.
+    let start = |state: &Path, extra: &[&str], stderr: Stdio| {
+        Command::new(BIN)
+            .args([
+                "--mode=frontend".to_owned(),
+                "--listen=127.0.0.1:0".to_owned(),
+                format!("--worker-listen={}", addrs.worker),
+                format!("--storage=http://{}", addrs.storage),
+                format!("--state-store=sqlite://{}", state.display()),
+                kbf_testkit::config::flag(&dir),
+            ])
+            .args(extra)
+            .stdout(Stdio::piped())
+            .stderr(stderr)
+            .spawn()
+            .expect("spawn")
+    };
+    for (flag, named, state) in [
+        (
+            "--learned-sizes=on",
+            "--learned-sizes on",
+            "state-learned.db",
+        ),
+        ("--no-memory-climb", "--no-memory-climb", "state-climb.db"),
+    ] {
+        let state = dir.join(state);
+        let mut child = start(&state, &["--scheduler-core=js", flag], Stdio::piped());
+        let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
+        // A refused start ends its stdout with no line; a frontend that started prints its
+        // start line, and is killed when `running` drops.
+        let running = Running(child);
+        let mut line = String::new();
+        BufReader::new(stdout.expect("stdout"))
+            .read_line(&mut line)
+            .expect("read");
+        assert_eq!(line, "", "{flag}: the frontend started");
+        let mut said = String::new();
+        std::io::Read::read_to_string(&mut stderr.expect("stderr"), &mut said).expect("read");
+        // Its stderr has ended, so the process has: no bound is needed to reap it.
+        let mut running = running;
+        let status = running.0.wait().expect("wait");
+        assert_eq!(status.code(), Some(2), "{flag}: {status} {said}");
+        assert!(said.contains(named), "{flag}: {said}");
+        assert!(said.contains("--scheduler-core js"), "{flag}: {said}");
+        assert!(
+            !said.contains("scheduler core:"),
+            "{flag}: a core ran: {said}"
+        );
+        assert!(!state.exists(), "{flag}: {} was created", state.display());
+    }
+
+    let shadow = ["--scheduler-core=js", "--learned-sizes=shadow"];
+    let state = dir.join("state-shadow.db");
+    let mut shadow = start(&state, &shadow, Stdio::null());
+    let stdout = BufReader::new(shadow.stdout.take().expect("stdout"));
+    let running = Running(shadow);
+    let line = stdout.lines().next().expect("a start line").expect("read");
+    assert!(line.starts_with("kbf-frontend "), "{line}");
+    // The control opens its store before it prints the start line, so the check of the
+    // refused starts' stores above can fail.
+    assert!(
+        state.exists(),
+        "the started frontend made no {}",
+        state.display()
+    );
+    drop(running);
 }
 
 /// Runs one action whose input root holds `input` as `in/input.bin`; the action
