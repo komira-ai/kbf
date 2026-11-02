@@ -26,8 +26,9 @@ fn role(
 /// Pins: the shipped kbf definition is exactly the rules kbf ran with when its definition
 /// was built into the code: four roles, no limits of their own, only the frontend never the
 /// last one up and waiting for storage, daemon and Mac daemon, no `after`, priority 0, and
-/// a desired state that must name `min_up` for storage and frontend. The literal is a copy
-/// of those rules, so a change to the shipped data shows here.
+/// a desired state that must name `min_up` for storage and frontend; and, added since, the
+/// coordinator's automatic rollback at the default threshold. The literal is a copy of those
+/// rules, so a change to the shipped data shows here.
 #[test]
 fn the_shipped_kbf_definition_equals_the_frozen_built_in() {
     let frozen = ServiceDef {
@@ -51,7 +52,7 @@ fn the_shipped_kbf_definition_equals_the_frozen_built_in() {
         install_when_absent: false,
         bake_beats: 0,
         canary: None,
-        rollback: Rollback::Manual,
+        rollback: Rollback::Automatic,
         rollback_after_failed: FailThreshold::default(),
         min_version: None,
         defer_backoff: crate::defer::DeferBackoff::default(),

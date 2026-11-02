@@ -3,6 +3,7 @@
 //! read per service with a query.
 
 use super::*;
+use crate::status_service_tests::OPS_LAST_GOOD_TWO;
 
 const SERVICES_TEXT: &str = "[[service]]\nname = \"other\"\n[service.roles.daemon]\nmin_up = 0\n";
 
@@ -181,7 +182,8 @@ const GOLDEN_STATUS: &str = concat!(
 /// managed, the convergence is byte for byte the old answer followed by the build `commit`,
 /// whether or not `?service=kbf` is given, and the status is the old answer followed by the
 /// new `per_service` key (kbf's `desired` and `roles` as they were, then `hosts`, `up`,
-/// `slots_held` and `convergence`) and then `commit`.
+/// `slots_held` and `convergence`), then `ops` (kbf's automatic rollback records the version
+/// the farm converged on as the last good one) and then `commit`.
 #[tokio::test]
 async fn the_kbf_status_and_convergence_bytes_are_unchanged() {
     let rig = Rig::new("http-golden-status");
@@ -234,7 +236,7 @@ async fn the_kbf_status_and_convergence_bytes_are_unchanged() {
     // The convergence in the status is the answer of `GET /v1/convergence`, with its commit.
     assert_eq!(
         status,
-        format!("{GOLDEN_STATUS}{tail}{converged}}}}}{commit}")
+        format!("{GOLDEN_STATUS}{tail}{converged}}}}}{OPS_LAST_GOOD_TWO}{commit}")
     );
 }
 

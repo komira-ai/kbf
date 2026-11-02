@@ -227,6 +227,15 @@ async fn the_convergence_in_the_status_is_the_convergence_read() {
     }
 }
 
+/// The `ops` key of a status whose kbf farm converged on 2.0: kbf ships automatic rollback,
+/// so the coordinator records the converged version as the last good one, and the status shows
+/// that record, after `per_service` and before `commit`, where `ops` has always gone.
+pub(crate) const OPS_LAST_GOOD_TWO: &str = concat!(
+    r#","ops":{"schema":1,"hosts":{},"excluded":[],"#,
+    r#""services":{"kbf":{"halt":null,"halt_acked":[],"last_good":"2.0","bad":[]}},"#,
+    r#""audit":[{"seq":1,"by":"coordinator","action":"last_good","service":"kbf","reason":"2.0"}]}"#
+);
+
 const OLD_HEAD: &str = concat!(
     r#"{"desired":{"version":"2.0","max_updating":{"frontend":1,"storage":1,"daemon":2,"mac-daemon":2},"min_up":{"storage":1,"frontend":0}},"#,
     r#""services":{"kbf":{"version":"2.0","max_updating":{"frontend":1,"storage":1,"daemon":2,"mac-daemon":2},"min_up":{"storage":1,"frontend":0}}},"#,
@@ -238,8 +247,9 @@ const OLD_HEAD: &str = concat!(
 
 /// Pins: with only kbf defined, the status keeps every byte it had, up to and including
 /// kbf's `roles`, and the new keys follow in the same order as they come for any service:
-/// `hosts`, `up`, `slots_held`, `convergence`; `commit` stays last. Catches a renamed,
-/// removed or moved old key, and a new key inserted among the old ones.
+/// `hosts`, `up`, `slots_held`, `convergence`; then `ops`, the coordinator's record of the
+/// version the farm converged on, and `commit` last. Catches a renamed, removed or moved old
+/// key, and a new key inserted among the old ones.
 #[tokio::test]
 async fn the_kbf_status_keeps_its_bytes_and_only_gains_keys() {
     let rig = Rig::new("status-service-bytes");
@@ -259,14 +269,16 @@ async fn the_kbf_status_keeps_its_bytes_and_only_gains_keys() {
         r#"{{"desired":"2.0","quiet":false,"state":"converged","roles":[{{"role":"storage","at_desired":1,"updating":0,"failed":0,"down":0}}],"commit":"{commit}","generation":1,"replaced":null,"write_id":""}}"#
     );
     let want = format!(
-        r#"{OLD_HEAD},"hosts":[{host}],"up":1,"slots_held":0,"convergence":{convergence}}}}},"commit":"{commit}"}}"#
+        r#"{OLD_HEAD},"hosts":[{host}],"up":1,"slots_held":0,"convergence":{convergence}}}}}{OPS_LAST_GOOD_TWO},"commit":"{commit}"}}"#
     );
     assert_eq!(text, want);
 }
 
 /// Pins: the top-level keys of the status, which old clients read, are exactly those they
-/// were, and `per_service` entries only add to `desired` and `roles`. Catches a key renamed
-/// or dropped, whatever else is added.
+/// were, and `per_service` entries only add to `desired` and `roles`. `ops` is there because
+/// the farm converged on kbf's desired version at its first beat, which kbf's automatic
+/// rollback records as the last good version. Catches a key renamed or dropped, whatever
+/// else is added.
 #[tokio::test]
 async fn the_status_keys_are_the_old_keys_plus_additions() {
     let rig = farm("status-service-keys").await;
@@ -284,6 +296,7 @@ async fn the_status_keys_are_the_old_keys_plus_additions() {
             "commit",
             "desired",
             "hosts",
+            "ops",
             "per_service",
             "quiet",
             "services",

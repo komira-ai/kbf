@@ -87,6 +87,8 @@ mod kbf_definition_tests;
 #[cfg(test)]
 mod kbf_review_tests;
 #[cfg(test)]
+mod kbf_rollback_tests;
+#[cfg(test)]
 mod membership_tests;
 #[cfg(test)]
 mod one_live_update_coordinator_tests;

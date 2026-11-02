@@ -48,6 +48,9 @@ kbf-testkit.workspace = true
 rcgen.workspace = true
 rustix = { workspace = true, features = ["process"] }
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "test-util", "time"] }
+# The release's gamma steps (`cargo xtask deploy-farm` and its restore) run against this
+# coordinator as it ships, in tests/gamma_rollback.rs.
+xtask.workspace = true
 
 [lints]
 workspace = true
