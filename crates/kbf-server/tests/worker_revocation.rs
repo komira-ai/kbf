@@ -20,6 +20,7 @@ use kbf_proto::worker::{
     Capability, DaemonMessage, Heartbeat, Hello, LeaseId, MapRequest, NodeStatus, ServerMessage,
     daemon_message, server_message, worker_client::WorkerClient,
 };
+use kbf_server::SchedulerCore;
 use kbf_server::api_client::OperatorClient;
 use kbf_server::enroll::api::TOKENS;
 use kbf_server::enroll::ca::{Ca, SignerChoice};
@@ -125,6 +126,11 @@ impl Farm {
             format!("--worker-tls-key={}", dir.join("server.key").display()),
             format!("--worker-client-ca={}", ca_dir.join("ca.pem").display()),
         ]);
+        // The core the suite runs on: js in a build with `farm-core-js`, legacy otherwise.
+        argv.push(format!(
+            "--scheduler-core={}",
+            SchedulerCore::under_test().name()
+        ));
         argv.extend(extra.iter().map(|a| (*a).to_owned()));
         if deny_list {
             let list = dir.join("deny.list");
@@ -153,7 +159,22 @@ impl Farm {
             _stop: stop,
         };
         tokio::spawn(handle.serve());
+        farm.assert_core().await;
         farm
+    }
+
+    /// Asserts that the frontend runs the core under test, as `kbf_scheduler_core` says.
+    async fn assert_core(&self) {
+        let (status, body) = self.call("GET", "/metrics".to_owned(), "").await;
+        assert_eq!(status, 200, "{body}");
+        let running = format!(
+            "kbf_scheduler_core{{core=\"{}\"}} 1",
+            SchedulerCore::under_test().name()
+        );
+        assert!(
+            body.lines().any(|line| line == running),
+            "{running}: {body}"
+        );
     }
 
     /// One operator API call, off the async threads (the client blocks).
