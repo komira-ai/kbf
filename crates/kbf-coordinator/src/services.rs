@@ -551,7 +551,7 @@ impl Services {
     /// other service's role of that name names (a pool of one member decides as no pool, so a
     /// misspelt pool shows here). The coordinator logs each at start.
     #[must_use]
-    pub fn notes(&self) -> &[String] {
+    pub(crate) fn notes(&self) -> &[String] {
         &self.notes
     }
 

@@ -140,48 +140,92 @@ fn a_file_of_the_release_before_pools_loads_with_no_pool() {
     assert_eq!(services.get("tierstore"), shipped.get("tierstore"));
 }
 
-/// The keys the release before pools reads in a service entry and in a role (its readers
-/// refuse any other).
-const SERVICE_KEYS_BEFORE_POOLS: [&str; 12] = [
-    "name",
-    "after",
-    "roles",
-    "priority",
-    "selector",
-    "install_when_absent",
-    "bake_beats",
-    "canary",
-    "rollback",
-    "rollback_after_failed",
-    "min_version",
-    "defer_backoff",
-];
-const ROLE_KEYS_BEFORE_POOLS: [&str; 4] = ["max_updating", "min_up", "never_last", "after"];
+/// The services-file reader of the release before pools (v0.0.57), frozen: the same tables,
+/// each refusing a field it does not know, as that release's `RawFile`, `RawService` and
+/// `RawRole` do. The values of the tables pools did not touch are kept as TOML values.
+mod before_pools {
+    use std::collections::BTreeMap;
 
-/// Catches: the shipped tierstore entry gaining a key the release before pools refuses, which
-/// would stop that coordinator's start on a file holding the entry (one rolled back to, or
-/// not yet updated). Every key of the entry and of its roles is one that release reads.
-#[test]
-fn the_shipped_tierstore_entry_is_readable_by_the_release_before_pools() {
-    let file: toml::Table = toml::from_str(TIERSTORE_SERVICES).expect("TOML");
-    assert_eq!(file.keys().collect::<Vec<_>>(), ["service"]);
-    let entries = file["service"].as_array().expect("entries");
-    assert!(!entries.is_empty());
-    for entry in entries {
-        let entry = entry.as_table().expect("a table");
-        for key in entry.keys() {
-            assert!(
-                SERVICE_KEYS_BEFORE_POOLS.contains(&key.as_str()),
-                "service key {key}"
-            );
-        }
-        for (role, keys) in entry["roles"].as_table().expect("roles") {
-            for key in keys.as_table().expect("a role table").keys() {
-                assert!(
-                    ROLE_KEYS_BEFORE_POOLS.contains(&key.as_str()),
-                    "{role}: {key}"
-                );
-            }
-        }
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    #[expect(
+        dead_code,
+        reason = "read only to be refused or accepted, as that release did"
+    )]
+    pub struct File {
+        #[serde(default)]
+        service: Vec<Service>,
     }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    #[expect(
+        dead_code,
+        reason = "read only to be refused or accepted, as that release did"
+    )]
+    struct Service {
+        name: String,
+        after: Option<Vec<String>>,
+        roles: Option<BTreeMap<String, Role>>,
+        priority: Option<i32>,
+        selector: Option<toml::Value>,
+        install_when_absent: Option<bool>,
+        bake_beats: Option<u32>,
+        canary: Option<toml::Value>,
+        rollback: Option<String>,
+        rollback_after_failed: Option<toml::Value>,
+        min_version: Option<String>,
+        defer_backoff: Option<toml::Value>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    #[expect(
+        dead_code,
+        reason = "read only to be refused or accepted, as that release did"
+    )]
+    struct Role {
+        max_updating: Option<u32>,
+        min_up: Option<u32>,
+        never_last: Option<bool>,
+        after: Option<Vec<String>>,
+    }
+
+    /// Whether that release starts on the file text `text`, or why it refuses it.
+    pub fn read(text: &str) -> Result<(), String> {
+        toml::from_str::<File>(text)
+            .map(drop)
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// Catches: the shipped tierstore entry gaining a field the release before pools refuses,
+/// which would stop that coordinator's start on a file holding the entry (one rolled back to,
+/// or not yet updated). That release's reader takes the shipped entry, alone and after a kbf
+/// entry of its own, and takes this release's own copy of that release's file.
+#[test]
+fn the_release_before_pools_reads_the_shipped_tierstore_entry() {
+    before_pools::read(TIERSTORE_SERVICES).expect("the shipped entry");
+    let kbf_before = "[[service]]\nname = \"kbf\"\n[service.roles.storage]\n\n";
+    before_pools::read(&format!("{kbf_before}{TIERSTORE_SERVICES}")).expect("after kbf");
+    before_pools::read(TIERSTORE_BEFORE_POOLS).expect("its own entry");
+}
+
+/// Catches: the version floor of a pool going unstated. A file that names a pool, the shipped
+/// tierstore entry with the documented line added, is refused by the release before pools
+/// for the unknown field `pool`, which is why the deploy document says to add it only once
+/// every coordinator that may read the file reads pools; this release reads it with the pool.
+#[test]
+fn the_release_before_pools_refuses_a_file_that_names_a_pool() {
+    let pooled = TIERSTORE_SERVICES.replace("min_up = 4\n", "min_up = 4\npool = \"storage\"\n");
+    assert_ne!(pooled, TIERSTORE_SERVICES);
+    let why = before_pools::read(&pooled).expect_err("refused");
+    assert!(why.contains("unknown field `pool`"), "{why}");
+    let services = Services::parse(&pooled).expect("read here");
+    assert_eq!(
+        pool_of(&services, "tierstore", "storage").as_deref(),
+        Some("storage")
+    );
 }

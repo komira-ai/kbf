@@ -286,3 +286,50 @@ fn an_ops_file_this_build_cannot_read_stops_the_start() {
     assert!(err.contains("newer"), "{err}");
     assert_eq!(std::fs::read_to_string(&default).expect("read"), newer);
 }
+
+/// Runs the binary with `services` as its services file until its start line, stops it, and
+/// returns what it wrote to stderr.
+fn stderr_of_a_start_with(name: &str, services: &str) -> String {
+    let files = Files::new(name);
+    let path = files.path("services.toml");
+    std::fs::write(&path, services).expect("written");
+    let mut flags = files.flags();
+    flags.extend(["--services-file".to_owned(), path]);
+    let mut child = spawn(&flags);
+    let mut stdout = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut line = String::new();
+    stdout.read_line(&mut line).expect("a start line");
+    assert!(line.starts_with("kbf-coordinator "), "it started: {line}");
+    let pid = Pid::from_raw(i32::try_from(child.id()).expect("a pid")).expect("not zero");
+    // The warning is written before the start line; how the run ends is not what is tested.
+    kill_process(pid, Signal::KILL).expect("stopped");
+    let out = child.wait_with_output().expect("exited");
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+/// Catches: a misspelt slot pool starting silently. A services file whose `tierstore` names
+/// the pool `storag` on storage (kbf's built-in storage role names `storage`) starts, and
+/// the start logs one warning naming the service, the pool and the role; the same file with
+/// `storage` logs no pool warning.
+#[test]
+fn a_pool_no_other_service_names_is_warned_of_at_start() {
+    let file = |pool: &str| {
+        format!("[[service]]\nname = \"tierstore\"\n[service.roles.storage]\npool = \"{pool}\"\n")
+    };
+    let note = "tierstore: pool \"storag\" on storage is named by no other service's storage role, so it shares no slots";
+    let stderr = stderr_of_a_start_with("bin-pool-typo", &file("storag"));
+    let warnings: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.contains("is named by no other service's"))
+        .collect();
+    assert_eq!(warnings.len(), 1, "{stderr}");
+    assert!(warnings[0].contains("WARN"), "{stderr}");
+    assert!(warnings[0].contains(note), "{stderr}");
+    assert!(warnings[0].contains("--services-file"), "{stderr}");
+
+    let stderr = stderr_of_a_start_with("bin-pool-shared", &file("storage"));
+    assert!(
+        !stderr.contains("is named by no other service's"),
+        "{stderr}"
+    );
+}
