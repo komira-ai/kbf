@@ -39,6 +39,11 @@ pub const ANNOUNCED: [&str; 2] = [DEFERRED_V1, HALT_V1];
 /// The reason of a deferral whose drain bound passed.
 pub const DRAIN_BOUND: &str = "drain_bound";
 
+/// The reason of a deferral whose switch the helper refused because leases still run on the
+/// host as root counts them (the helper's code `leases_live`): a Mac's helper counts them
+/// itself before it switches.
+pub const LEASES_LIVE: &str = "leases_live";
+
 /// The reason of a halt: the helper could not put the previous release back and it does not run
 /// healthy.
 pub const ROLLBACK_FAILED: &str = "rollback_failed";

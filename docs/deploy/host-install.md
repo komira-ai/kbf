@@ -670,8 +670,11 @@ knows its text), `query` (`commit`, `version`, `node_id`, `pending`, `last`, `bu
 code from a closed set: `bad_command`, `channel_not_allowed`, `config_invalid`, `config_unsafe`,
 `unknown_release`, `ambiguous_release`, `fetch_failed`, `verify_failed`, `pending`, `not_staged`,
 `nothing_pending`, `no_current`, `busy`, `stage_failed`, `switch_failed`, `revert_failed`,
-`state_unavailable`, `audit_unavailable`, `peer_not_ready`, `runtime_failed`. The detail of a refusal goes to the journal, cleaned,
-never to the line.
+`state_unavailable`, `audit_unavailable`, `peer_not_ready`, `runtime_failed`, `leases_live`. The detail of a refusal goes to the
+journal, cleaned, never to the line. On a Mac, `switch` first counts the leases that run on the host as root sees
+them (the daemon's keepers and its lease directories, in daemon-user mode and in pool mode): with one live it is
+refused `leases_live` and nothing moves, and the agent takes that as a deferral; a count that cannot be made is
+refused `state_unavailable`.
 
 ### The releases a host keeps
 

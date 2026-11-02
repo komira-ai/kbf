@@ -55,6 +55,8 @@ mod frontend_tests;
 #[cfg(test)]
 mod hold_tests;
 #[cfg(test)]
+mod lease_defer_tests;
+#[cfg(test)]
 mod local_tests;
 #[cfg(test)]
 mod pki;

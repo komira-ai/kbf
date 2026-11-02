@@ -16,7 +16,12 @@
 //!    that advertises `deferred-v1` that is a [`Hold::Deferred`] (reason `drain_bound`), not a
 //!    failure, and the order is declined until `--retry-secs` have passed.
 //! 3. **Switch**: the helper puts B in place on trial, with a pending marker and a deadline on
-//!    its disk, and restarts the service on it.
+//!    its disk, and restarts the service on it. A helper that counts the host's leases itself
+//!    (a Mac's) refuses the switch with `leases_live` while one still runs, the frontend's
+//!    count notwithstanding: nothing was switched, and that ends the update as a drain bound
+//!    does, the node left drained and the order tried again after `--retry-secs`; to a
+//!    coordinator that advertises `deferred-v1` it is a [`Hold::Deferred`] (reason
+//!    `leases_live`).
 //! 4. **Health**: the node's health check (`node_health`) until B shows healthy, for no longer
 //!    than the health timeout and never past the helper's deadline.
 //! 5. **Confirm** B if it is healthy. If it is not, **revert**: the helper owns that, and does
@@ -31,7 +36,7 @@
 //!
 //! The result is [`UpdateResult`]: the target and whether it succeeded. It goes into the next
 //! heartbeat. Two endings are more than that, for a coordinator that advertises them
-//! (`super::hold`): a drain bound is a deferral, and a revert the helper could not do, with
+//! (`super::hold`): a drain bound or leases the helper still counts are a deferral, and a revert the helper could not do, with
 //! the previous release not healthy, is a halt (phase `halt`, reason `rollback_failed`).
 //!
 //! A restart of the updater in the middle finds the helper's pending marker and finishes the
@@ -40,7 +45,7 @@
 use std::time::Duration;
 
 use super::flags::Timing;
-use super::hold::{DRAIN_BOUND, Features, Hold, ROLLBACK_FAILED, deferred, halt};
+use super::hold::{DRAIN_BOUND, Features, Hold, LEASES_LIVE, ROLLBACK_FAILED, deferred, halt};
 use super::local::{Local, LocalError, Trial};
 use super::status::{Shared, version_of_commit};
 use crate::inventory::Host;
@@ -177,6 +182,14 @@ impl Update<'_> {
         // 3. Switch.
         let deadline = match self.ports.local.switch(target) {
             Ok(deadline) => deadline,
+            Err(LocalError::Refused(code)) if code == LEASES_LIVE => {
+                let mut done = failed(
+                    &"the host helper counts leases that still run; nothing was switched, the \
+                      leases run on and the node is left drained",
+                );
+                done.hold = deferred(LEASES_LIVE);
+                return done;
+            }
             Err(e) => {
                 self.log(&format!("update to {target}: the switch failed: {e}"));
                 return self.back_on_a(target, placed);

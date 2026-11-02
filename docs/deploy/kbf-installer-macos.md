@@ -55,7 +55,9 @@ user.
 
 `/Library/LaunchDaemons/com.komira.kbf-installer.plist` has the label `com.komira.kbf-installer`
 and runs `/usr/local/kbf-installer/bin/kbf-installer run --launchd-label com.komira.kbf-daemon`.
-`run` acts on the orders the node wrote and kickstarts `com.komira.kbf-daemon` after a swap. The
+`run` acts on the orders in its spool and kickstarts `com.komira.kbf-daemon` after a swap. The
+node no longer writes those orders: a Mac takes its update orders through the host agent and the
+root helper's local socket (see "Updating" below). The
 job holds itself back: `RunAtLoad` is false and `KeepAlive` is `PathState` on
 `/usr/local/etc/kbf/installer.toml`, so it does not run until that file exists. It throttles
 restarts to ten seconds and writes to `/Library/Logs/kbf-installer/kbf-installer.log` and
@@ -125,6 +127,25 @@ settings file `etc/av2_mac.conf` and the LaunchDaemon `com.komira.kbf-daemon`. T
 not adopt that layout: there is no `kbf-installer migrate` verb. Adoption = install the kbf and
 kbf-proxy packages (package-update design, `design.md` section 12), then run `setup`.
 
+## Updating
+
+A Mac takes update orders from the farm's coordinator through its host agent (`kbf-updater
+agent`, as `_kbf-updater`) and the root helper's local socket (`kbf-host-install --serve`), as a
+Linux daemon host does ([the updater guide](kbf-updater.md)). The agent drains the node at the
+frontend and waits until it holds no lease. Then the helper counts the leases again, as root,
+from what the native driver leaves on the host: the daemon's keepers (`kbf-keeper __keeper ...`)
+and its lease directories (`<data-dir>/leases/lease-*`, `data-dir` from the root-owned
+`kbf.toml`). It counts them the same way whether the daemon runs as its own account or as root
+with a pool of lease users (`[macos] pool-users`).
+
+- With a lease live, the switch is refused (`leases_live`) and nothing moves. The agent
+  reports the update as deferred (reason `leases_live`), and the coordinator orders it again
+  after the wait.
+- With none, the release is switched to on trial, checked and confirmed.
+- When the count cannot be made (a `kbf.toml` the helper cannot rely on, a `leases/` that is a
+  link, a process listing that failed, no `sandbox-exec`), the switch is refused
+  (`state_unavailable`). The reason goes to the helper's log.
+
 ## What is still by hand
 
 - Installing the package, and verifying its checksum and attestation first.
@@ -132,7 +153,6 @@ kbf-proxy packages (package-update design, `design.md` section 12), then run `se
   administrator account, FileVault, macOS and Xcode installs, the APFS volume for the lease users.
 - Creating the enrollment token on the frontend and putting the token file on the Mac.
 - Placing and recording the first release (above).
-- Updating: a Mac takes no update order yet. `kbf-installer run` activates a release only after it
-  has counted the live leases, and for a launchd job it has no lease source, so it refuses the
-  order (`cannot tell whether leases are live`). Update by hand, see [updating a host](update-a-host.md).
+- Enrolling the host agent and placing its two jobs (`packaging/host-agent/macos`, and
+  [the host-install guide](host-install.md), "On a Mac").
 - A signature: nothing in the package is signed with a Developer ID.

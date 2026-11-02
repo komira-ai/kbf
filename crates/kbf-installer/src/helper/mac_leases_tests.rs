@@ -19,14 +19,14 @@ use super::*;
 use crate::fixtures::{ran, scratch_dir};
 use crate::layout::Platform;
 
-const TOML: &str = "mode = \"daemon\"\n[identity]\nnode-id = \"n\"\n[daemon]\ndriver = [\"native\"]\ndata-dir = \"/Volumes/kbf/data\"\n";
+pub(crate) const TOML: &str = "mode = \"daemon\"\n[identity]\nnode-id = \"n\"\n[daemon]\ndriver = [\"native\"]\ndata-dir = \"/Volumes/kbf/data\"\n";
 const DAEMON: &str = "/usr/local/kbf-installer/releases/current/kbf --mode=daemon --config /usr/local/etc/kbf/kbf.toml";
-const KBF_TOML: &str = "/usr/local/etc/kbf/kbf.toml";
+pub(crate) const KBF_TOML: &str = "/usr/local/etc/kbf/kbf.toml";
 
 /// What a fake program answers: `None` is a program that could not be started.
 pub(crate) type Reply = Option<Ran>;
 
-fn said(code: i32, text: &str) -> Reply {
+pub(crate) fn said(code: i32, text: &str) -> Reply {
     Some(ran(code, text, ""))
 }
 
@@ -77,14 +77,14 @@ impl Runner for ScriptRunner {
 pub(crate) struct MacHost {
     pub root: PathBuf,
     pub layout: Layout,
-    exec: FakeExec,
+    pub exec: FakeExec,
     script: Rc<RefCell<Script>>,
     calls: Rc<RefCell<Vec<Spawn>>>,
     /// The clock the source reads: 1000 s after `kbf.toml` last changed.
     pub now: i64,
 }
 
-fn root_owned() -> Owner {
+pub(crate) fn root_owned() -> Owner {
     Owner { uid: 0, gid: 0 }
 }
 
@@ -217,7 +217,7 @@ pub(crate) fn reply_pids(pids: &str) -> Reply {
 
 /// An error that holds `needle`, or a failure showing what came instead.
 #[track_caller]
-fn refused(answer: Result<usize, String>, needle: &str) {
+pub(crate) fn refused(answer: Result<usize, String>, needle: &str) {
     match answer {
         Err(why) => assert!(why.contains(needle), "{why:?} lacks {needle:?}"),
         Ok(n) => panic!("answered {n}, not an error naming {needle:?}"),
@@ -730,171 +730,6 @@ fn a_mac_without_sandbox_exec_cannot_tell() {
     fs::rename(at(&rig), rig.root.join("usr/bin/real")).expect("move");
     symlink("real", at(&rig)).expect("link");
     assert_eq!(rig.count(), Ok(0));
-}
-
-/// Catches an unreliable `kbf.toml` passing. Each of these cannot tell, naming the file or
-/// the key: absent, a link or a directory where the file should be, not root's, group
-/// writable, in a directory others can write, over 1 MiB, not text, not TOML, a mode that is
-/// not `daemon`, no mode, a `driver` that is absent, not `["native"]` or holds more, no
-/// `data-dir` or a relative one, a pool key (not read by this source), and a file that is
-/// there for the trust check but gone for the timestamp read.
-///
-/// Catches: the trust check dropped; the driver check dropped; the pool-key check dropped; the mode check dropped.
-#[test]
-fn a_kbf_toml_that_is_not_a_native_daemons_or_not_trusted_cannot_tell() {
-    let toml_cases: Vec<(&str, String, &str)> = vec![
-        (
-            "mode",
-            TOML.replace("mode = \"daemon\"", "mode = \"frontend\""),
-            "mode is \"frontend\"",
-        ),
-        (
-            "no mode",
-            TOML.replace("mode = \"daemon\"\n", ""),
-            "has no mode",
-        ),
-        (
-            "no driver",
-            TOML.replace("driver = [\"native\"]\n", ""),
-            "driver is None",
-        ),
-        (
-            "two drivers",
-            TOML.replace("[\"native\"]", "[\"native\", \"native-whole-machine\"]"),
-            "not [\"native\"]",
-        ),
-        (
-            "other driver",
-            TOML.replace("native", "container"),
-            "not [\"native\"]",
-        ),
-        (
-            "no data-dir",
-            TOML.replace("data-dir = \"/Volumes/kbf/data\"\n", ""),
-            "no absolute data-dir",
-        ),
-        (
-            "relative",
-            TOML.replace("/Volumes/kbf/data", "data"),
-            "no absolute data-dir",
-        ),
-        (
-            "not a string",
-            TOML.replace("\"/Volumes/kbf/data\"", "7"),
-            "no absolute data-dir",
-        ),
-        (
-            "pool users",
-            format!("{TOML}[macos]\npool-users = 4\n"),
-            "sets a pool key",
-        ),
-        (
-            "pool uid",
-            format!("{TOML}[macos]\npool-first-uid = 600\n"),
-            "sets a pool key",
-        ),
-        ("not toml", "mode = = \n".to_owned(), "is not TOML"),
-        (
-            "big",
-            format!("{TOML}#{}\n", "x".repeat(1 << 20)),
-            "is over",
-        ),
-    ];
-    for (name, text, why) in toml_cases {
-        let mut rig = MacHost::new("toml");
-        rig.toml(&text);
-        match rig.count() {
-            Err(e) => assert!(e.contains(why), "{name}: {e}"),
-            Ok(n) => panic!("{name}: answered {n}"),
-        }
-    }
-
-    let file = |perms, uid, bytes: &[u8]| Entry::File {
-        perms: Perms::new(perms),
-        owner: Owner { uid, gid: 0 },
-        bytes: bytes.to_vec(),
-    };
-    let entry_cases: Vec<(&str, Option<Entry>, &str)> = vec![
-        ("absent", None, "is not there"),
-        (
-            "not utf-8",
-            Some(file(0o644, 0, &[0xff, 0xfe])),
-            "not UTF-8",
-        ),
-        (
-            "a link",
-            Some(Entry::Link { target: "x".into() }),
-            "not a plain file",
-        ),
-        (
-            "a directory",
-            Some(Entry::Dir {
-                perms: Perms::new(0o755),
-                owner: root_owned(),
-            }),
-            "not a plain file",
-        ),
-        (
-            "not root's",
-            Some(file(0o644, 501, TOML.as_bytes())),
-            "not trusted",
-        ),
-        (
-            "group writable",
-            Some(file(0o664, 0, TOML.as_bytes())),
-            "not trusted",
-        ),
-    ];
-    for (name, entry, why) in entry_cases {
-        let mut rig = MacHost::new("entry");
-        match entry {
-            Some(entry) => {
-                rig.exec
-                    .entries
-                    .insert(HostPath::new(KBF_TOML).expect("path"), entry);
-            }
-            None => {
-                rig.exec
-                    .entries
-                    .remove(&HostPath::new(KBF_TOML).expect("path"));
-            }
-        }
-        match rig.count() {
-            Err(e) => assert!(e.contains(why), "{name}: {e}"),
-            Ok(n) => panic!("{name}: answered {n}"),
-        }
-    }
-
-    let mut rig = MacHost::new("entry-dir-writable");
-    rig.exec.entries.insert(
-        HostPath::new("/usr/local/etc").expect("path"),
-        Entry::Dir {
-            perms: Perms::new(0o775),
-            owner: root_owned(),
-        },
-    );
-    refused(rig.count(), "not trusted");
-
-    let mut rig = MacHost::new("unreadable");
-    rig.exec.entries.insert(
-        HostPath::new("/usr/local/etc/kbf/kbf.toml").expect("path"),
-        file(0o644, 0, TOML.as_bytes()),
-    );
-    fs::remove_file(rig.root.join("usr/local/etc/kbf/kbf.toml")).expect("remove");
-    refused(rig.count(), "kbf.toml");
-}
-
-/// Asserts that a `[macos]` table without a pool key is read like a file without the table (an
-/// idle daemon host counts no lease), and that a pool key given beside other keys of the table
-/// is still refused as a pool key.
-#[test]
-fn a_macos_table_without_a_pool_key_does_not_make_the_file_unreadable() {
-    let mut rig = MacHost::new("macos-table");
-    rig.toml(&format!("{TOML}[macos]\nsandbox = true\n"));
-    assert_eq!(rig.live(), Ok((0, None)));
-    let mut rig = MacHost::new("macos-table-pool");
-    rig.toml(&format!("{TOML}[macos]\nsandbox = true\npool-users = 4\n"));
-    refused(rig.count(), "sets a pool key");
 }
 
 /// Catches a `leases/` that cannot be listed read as empty: missing, a file, or a link

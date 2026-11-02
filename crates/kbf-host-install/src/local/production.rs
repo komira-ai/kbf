@@ -12,6 +12,11 @@ use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use kbf_host::path::Root;
+use kbf_installer::helper::leases::LeaseSource;
+use kbf_installer::helper::mac_leases::MacLeases;
+use kbf_installer::layout::{Layout as HostLayout, Platform};
+
 use super::backend::Backend;
 use super::core::Ab;
 use super::serve::{self, Layout, ServeConfig, Serving};
@@ -253,13 +258,15 @@ fn serve_linux_for(_config: &ServeConfig) -> Result<(), String> {
 }
 
 /// A Mac: the account of the socket from `dscl` (through `runner`, never root), the work
-/// directory made, then the serving of the kit by `backend_runner`'s tools.
+/// directory made, then the serving of the kit by `backend_runner`'s tools, with the leases
+/// counted by `leases` before a switch.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(super) fn serve_mac_with(
     config: &ServeConfig,
     host: MacHost,
     runner: &dyn Runner,
     backend_runner: Box<dyn Runner>,
+    leases: Box<dyn LeaseSource>,
     stop: &AtomicBool,
 ) -> Result<(), String> {
     use crate::mac::tools;
@@ -281,7 +288,7 @@ pub(super) fn serve_mac_with(
         .ok_or_else(|| format!("the account {} has no usable ids", config.user))?;
     crate::mac::ensure_work(&host).map_err(|_| "the work directory is not usable".to_owned())?;
     let (trust, work, audit) = (host.trust.clone(), host.work.clone(), host.audit.clone());
-    let backend = super::mac_backend::MacBackend::new(host, backend_runner);
+    let backend = super::mac_backend::MacBackend::new(host, backend_runner, leases);
     let place = Place {
         state_dir: &work,
         state_name: "state.json",
@@ -300,6 +307,10 @@ pub(super) fn serve_mac(config: &ServeConfig) -> Result<(), String> {
         MacHost::production(),
         &SystemRunner,
         Box::new(SystemRunner),
+        Box::new(MacLeases::on_host(HostLayout::new(
+            Root::host(),
+            Platform::MacOs,
+        ))),
         &AtomicBool::new(false),
     )
 }

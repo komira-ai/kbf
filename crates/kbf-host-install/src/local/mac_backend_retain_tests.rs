@@ -12,6 +12,7 @@ use kbf_retain::Retained;
 
 use super::{Ab, Answer, Backend, Code, LocalRequest, MacBackend, Shared, current, previous, rig};
 use crate::fixed_mark::mark;
+use crate::local::mac_backend_lease_tests::Leases;
 use crate::mac::tests::fx::{Fx, OLD, OLD_VERSION, Sim, binary, mkdir, write};
 
 /// Seconds after which a release was laid out: every release gets its own time.
@@ -70,7 +71,11 @@ fn core(fx: &Fx, sim: &Rc<Sim>, keep: usize) -> (Ab<MacBackend>, Notes) {
     let notes: Notes = Rc::default();
     let told = Rc::clone(&notes);
     let ab = Ab::new(
-        MacBackend::new(fx.host.clone(), Box::new(Shared(Rc::clone(sim)))),
+        MacBackend::new(
+            fx.host.clone(),
+            Box::new(Shared(Rc::clone(sim))),
+            Box::new(Leases::idle()),
+        ),
         fx.host.work.join("state.json"),
         fx.host.trust.clone(),
         600,
@@ -396,7 +401,11 @@ fn an_update_never_writes_the_helper_or_the_agent() {
     let mut host = fx.host.clone();
     host.self_exe = helper.clone();
     let ab = Ab::new(
-        MacBackend::new(host, Box::new(Shared(Rc::clone(&sim)))),
+        MacBackend::new(
+            host,
+            Box::new(Shared(Rc::clone(&sim))),
+            Box::new(Leases::idle()),
+        ),
         fx.host.work.join("state.json"),
         fx.host.trust.clone(),
         600,

@@ -9,6 +9,15 @@
 //! daemon. The marker names the release that ran and the links as they were, so a revert,
 //! by the deadline or by request, puts both links back and starts the old release without
 //! the new one running. The marker is on disk: the first tick after a reboot reads it.
+//!
+//! Before it writes the marker, `switch` counts the leases that run on the Mac as root sees
+//! them, from the native driver's own signs of a lease (its keepers and its lease
+//! directories, [`kbf_installer::helper::mac_leases`]), in daemon-user mode and in pool mode
+//! alike. The agent drains the node at the frontend first, so this count is 0 unless the
+//! frontend's view and the host's disagree. With a live lease the switch is refused
+//! (`leases_live`) and nothing changes; the agent takes that as a deferral. A count that
+//! cannot be made is refused too (`state_unavailable`), with the reason in the log: an
+//! activation is never made blind.
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -28,6 +37,7 @@ use crate::mac::{self, conf, stage};
 use crate::outcome::{FailureCode, Outcome, Refusal};
 use crate::request::{Channel, Version};
 use crate::runner::Runner;
+use kbf_installer::helper::leases::LeaseSource;
 use kbf_retain::Kept;
 
 /// What a switch leaves behind until it is confirmed or reverted.
@@ -46,11 +56,32 @@ struct Marker {
 pub struct MacBackend {
     host: MacHost,
     runner: Box<dyn Runner>,
+    /// The leases that run on the host, counted before a switch.
+    leases: Box<dyn LeaseSource>,
 }
 
 impl MacBackend {
-    pub fn new(host: MacHost, runner: Box<dyn Runner>) -> Self {
-        Self { host, runner }
+    pub fn new(host: MacHost, runner: Box<dyn Runner>, leases: Box<dyn LeaseSource>) -> Self {
+        Self {
+            host,
+            runner,
+            leases,
+        }
+    }
+
+    /// `Ok` when no lease runs on the host; the refusal that changes nothing otherwise.
+    fn idle(&self) -> Result<(), Fault> {
+        match self.leases.live() {
+            Ok(0) => Ok(()),
+            Ok(n) => Err(Fault::refused(
+                Code::LeasesLive,
+                format!("{n} leases are live; not switching"),
+            )),
+            Err(why) => Err(Fault::refused(
+                Code::StateUnavailable,
+                format!("cannot tell whether leases are live: {why}"),
+            )),
+        }
     }
 
     fn marker_file(&self) -> PathBuf {
@@ -186,6 +217,8 @@ impl Backend for MacBackend {
     }
 
     fn switch(&self, commit: &str, window_secs: u64, now: u64) -> Result<u64, Fault> {
+        // The leases first: a refusal here leaves no marker, moves no link and restarts nothing.
+        self.idle()?;
         let before =
             kit::links(&self.host).map_err(|why| Fault::failed(Code::StateUnavailable, why))?;
         let Some(from) = before.current.clone() else {

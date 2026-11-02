@@ -61,11 +61,14 @@ pub enum Code {
     PeerNotReady,
     /// The container runtime could not be asked, or did not do what it was asked.
     RuntimeFailed,
+    /// Leases still run on the host, as root counts them: nothing was switched. The host's
+    /// moment is wrong, not the release, and the same switch can be asked again later.
+    LeasesLive,
 }
 
 impl Code {
     /// Every code.
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 21] = [
         Self::BadCommand,
         Self::ChannelNotAllowed,
         Self::ConfigInvalid,
@@ -86,6 +89,7 @@ impl Code {
         Self::AuditUnavailable,
         Self::PeerNotReady,
         Self::RuntimeFailed,
+        Self::LeasesLive,
     ];
 
     /// The code whose closed spelling this is.
@@ -116,6 +120,7 @@ impl Code {
             Self::AuditUnavailable => "audit_unavailable",
             Self::PeerNotReady => "peer_not_ready",
             Self::RuntimeFailed => "runtime_failed",
+            Self::LeasesLive => "leases_live",
         }
     }
 }

@@ -56,6 +56,8 @@ mod core_tests;
 #[cfg(all(test, target_os = "linux"))]
 mod linux_tests;
 #[cfg(test)]
+mod mac_backend_lease_tests;
+#[cfg(test)]
 mod mac_backend_tests;
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) mod package_tests;

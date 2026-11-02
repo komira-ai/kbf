@@ -14,6 +14,7 @@ use kbf_testkit::dir::TestDir;
 use serde_json::Value;
 
 use super::core_tests::{A, Fake, Fx};
+use super::mac_backend_lease_tests::Leases;
 use super::production::{
     LinuxEnv, Place, bound_container, log, main_with, private_dir, run, serve_linux,
     serve_linux_with, serve_mac, serve_mac_with, serve_with, unix_now,
@@ -373,6 +374,7 @@ fn a_mac_asks_the_directory_service_and_makes_its_work_directory() {
         mac.host.clone(),
         &*sim,
         Box::new(Shared(Rc::clone(&sim))),
+        Box::new(Leases::idle()),
         &stop,
     )
     .unwrap();
@@ -385,6 +387,7 @@ fn a_mac_asks_the_directory_service_and_makes_its_work_directory() {
         mac.host.clone(),
         &Broken,
         Box::new(Broken),
+        Box::new(Leases::idle()),
         &stopped,
     )
     .unwrap_err();
@@ -395,6 +398,7 @@ fn a_mac_asks_the_directory_service_and_makes_its_work_directory() {
         mac.host.clone(),
         &*sim,
         Box::new(Shared(Rc::clone(&sim))),
+        Box::new(Leases::idle()),
         &stopped,
     )
     .unwrap_err();
@@ -408,6 +412,7 @@ fn a_mac_asks_the_directory_service_and_makes_its_work_directory() {
         blocked,
         &*sim,
         Box::new(Shared(Rc::clone(&sim))),
+        Box::new(Leases::idle()),
         &stopped,
     )
     .unwrap_err();
