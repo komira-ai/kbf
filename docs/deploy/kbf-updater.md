@@ -711,8 +711,21 @@ for every service and role, with no setting. `max_updating`, in a services file 
 desired state, is still read and accepted as before, so files and states written for earlier
 releases load unchanged, but a number above 1 no longer lets more hosts update at once; 0 still
 holds the role (no host of it is ordered). `min_up` is unchanged. The one-update-per-host rule
-(`busy_elsewhere`) also still holds. After a restart the coordinator knows of a live update from
-the hosts' own beats in the quiet start, so the rule resumes as it was.
+(`busy_elsewhere`) also still holds.
+
+A host that leaves a service while it holds a slot (the operator excludes it, its labels move it
+out of the selector, or its agent stops announcing the service) still holds the slot: the
+coordinator keeps the host's last word and any order it gave it, reads the host's further beats
+about the service, and frees the slot under the same rule (done, healthy, baked, or the order's
+120 s). A host that holds a slot and is never heard from again holds it until it is back, or
+until the coordinator restarts.
+
+After a restart the coordinator knows of a live update from the hosts' own beats in the 30 s
+quiet start, so the rule resumes as it was for a host updating, waiting for its promotion, failed
+and unhealthy, or baking (a bake counts again from the restart). Orders are not stored: a host
+ordered just before the restart that stays silent through the whole quiet start (it reports an
+order within one 15 s heartbeat) is not known to hold the slot, and another host may be ordered
+before its first report.
 
 A service may carry `install_when_absent = true` and a `[service.selector]` with `roles` (default: every role of the service) and `labels` (at most 8, key and value 1 to 32 bytes of `[a-z0-9-]`); a selector naming a role the service lacks is refused. Without a selector a host belongs to the service if it lists it, as always. With one, the coordinator decides who should run the service from the host's certificate role and the labels an operator set for it with `POST /v1/operator` (`set_labels`; a heartbeat can never set them). A selected, live host whose agent announced `heartbeat-v2` and that did not list the service is `missing`; one that reports it `absent` is `absent` and is ordered only with `install_when_absent`; one whose agent did not announce `heartbeat-v2` is `unmanaged` (not counted, not ordered); one an operator excluded is `excluded`. A silent host is `down` first of all. `GET /v1/convergence` shows `hosts: {missing, absent, excluded, unmanaged, deferred}` for a service with a selector, or any such host, and a service with a missing or absent host is `in_progress`; the status lists them with their reason. Exclusions apply to a service without a selector too. `deferred` counts the live hosts within the wait that follows their deferral of the desired version. This holds for `kbf` as for any service whose definition has a selector or an exclusion: a host that is not counted for `kbf` (excluded, or outside a `kbf` selector) has its beat not recorded, so it gets no `kbf` orders, is left out of the `kbf` convergence and appears only in `members`. Excluding a node from `kbf` therefore stops its `kbf` updates.
 
@@ -793,7 +806,7 @@ ordering the host now (`quiet`, `updating`, `busy_elsewhere`, `up_to_date`, `fai
 `deferred`, `no_slot`, `baking`, `canary_wait`, `waiting_for_role`, `waiting_for_service`, `min_up`, `not_a_member`, `no_desired`, `no_definition`; these spellings are public), or
 `null` when it would be ordered at its next heartbeat. `up` and `slots_held` count those hosts,
 and `convergence` is the answer of `GET /v1/convergence?service=NAME`. The top-level keys, and the
-top-level `hosts`, which are `kbf`'s, are unchanged. `no_slot` means some host, of any role, holds an update slot for some service (one live update at a time). Two holds are for the rollout fields above: `baking` means no host holds a slot, but some host, of any role and service, is at its service's desired version and has not finished baking, and `canary_wait` means the service's canary gate is closed and the host is not one of the canaries. `deferred` means the host declined the update to the desired version and its wait (`defer_backoff`, never shorter than the host's own `retry_after`) has not ended.
+top-level `hosts`, which are `kbf`'s, are unchanged. `no_slot` means some host, of any role, holds an update slot for some service (one live update at a time), or the host's role has `max_updating = 0` (the role is held). Two holds are for the rollout fields above: `baking` means no host holds a slot, but some host, of any role and service, is at its service's desired version and has not finished baking, and `canary_wait` means the service's canary gate is closed and the host is not one of the canaries. `deferred` means the host declined the update to the desired version and its wait (`defer_backoff`, never shorter than the host's own `retry_after`) has not ended.
 
 `cargo xtask deploy-farm --service NAME` (default `kbf`) deploys another service the same way.
 For `kbf` the requests are the ones listed above. For another service the POST body also has
