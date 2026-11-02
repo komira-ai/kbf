@@ -19,12 +19,18 @@
 //!    version lifts it);
 //! 6. the service's canary gate, if it has one, is open to the host ([`crate::canary`]; a
 //!    host that is deferring is not chosen as a canary);
-//! 7. the service runs on the host's role, and the role has room: fewer hosts of the role
-//!    hold a slot than `max_updating` allows (a
-//!    host holds a slot while updating, while its promotion is pending, after a failed update
-//!    until it heartbeats healthy, from the order the coordinator gave it until the host
-//!    reports it or the order ages out, [`crate::fleet::ORDER_AGE`], and, at the desired
-//!    version, until it has beaten healthy `bake_beats` times, [`crate::bake`]);
+//! 7. the service runs on the host's role, and no update is live anywhere: no host, of any
+//!    role, holds an update slot for any service, and the role's `max_updating` is not 0.
+//!    One update is live at a time across every service and role, whatever `max_updating`
+//!    says; a number above 1 is read and has no effect, and 0 still holds the role ([`live`]).
+//!    A host holds a slot while updating, while its promotion is pending, after a failed
+//!    update until it heartbeats healthy, from the order the coordinator gave it until the
+//!    host reports it or the order ages out, [`crate::fleet::ORDER_AGE`], and, at its
+//!    service's desired version, until it has beaten healthy that service's `bake_beats`
+//!    times, [`crate::bake`]. The asking host's own slot for the asked service is not
+//!    counted, so a host asking again under its own order is told the same again. A host the
+//!    service no longer counts (excluded, out of its selector, not announcing it) still holds
+//!    its slot until its beats or its order's age free it ([`Fleet::occupants_of`]);
 //! 8. the role waits for the roles its definition names (`kbf`: a frontend waits for every
 //!    live storage, daemon and Mac host) and the service for the services in its `after`: each
 //!    live host of those runs that service's desired version and is done updating;
@@ -48,7 +54,7 @@
 //! The reply carries the desired version and nothing else. [`decide_why`] is the same
 //! decision that also says which rule held ([`Hold`]); [`decide_in`] drops the reason.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use kbf_types::NodeId;
@@ -117,7 +123,8 @@ pub enum Hold {
     FailedHere,
     /// The host declined an update to the desired version and its wait is not over.
     Deferred,
-    /// Every slot of the host's role is held.
+    /// A host, of any role, holds an update slot for some service (one live update at a time),
+    /// or the role's `max_updating` is 0.
     NoSlot,
     /// A role of the service that this one waits for has hosts behind or updating.
     WaitingForRole,
@@ -125,8 +132,8 @@ pub enum Hold {
     WaitingForService,
     /// Fewer hosts of the role would stay up than the role requires.
     MinUp,
-    /// Every slot of the host's role is held, at least one of them by a host that runs the
-    /// desired version and has not yet baked.
+    /// No host holds an update slot, but a host, of any role, runs its service's desired
+    /// version and has not yet baked.
     Baking,
     /// The service's canary gate is closed and the host is not one of the canaries.
     CanaryWait,
@@ -179,7 +186,7 @@ pub fn decide_marked(
     let Some(want) = desired.get(service) else {
         return Decision::Hold(Hold::NoDesired);
     };
-    match first_hold(def, want, desired, bad, fleet, id, now) {
+    match first_hold(services, def, want, desired, bad, fleet, id, now) {
         Some(why) => Decision::Hold(why),
         None => Decision::Update {
             version: want.version.clone(),
@@ -188,7 +195,12 @@ pub fn decide_marked(
 }
 
 /// The first rule that fails for the host `id`, or `None` when every rule holds.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the inputs of the one decision, passed down from decide_marked"
+)]
 fn first_hold(
+    services: &Services,
     def: &ServiceDef,
     desired: &Desired,
     all: &BTreeMap<String, Desired>,
@@ -210,16 +222,8 @@ fn first_hold(
         .last_update
         .as_ref()
         .is_some_and(|r| r.outcome == Outcome::Failed && r.target == desired.version);
-    let in_role = || others().filter(|(_, h)| h.role_name() == host.role_name());
-    let slots = in_role()
-        .filter(|(o, h)| fleet.holds_slot(service, o, h, now))
-        .count();
-    let baking = in_role()
-        .filter(|(o, h)| {
-            !fleet.holds_slot(service, o, h, now)
-                && fleet.is_baking(service, o, h, &desired.version, def.bake_beats, now)
-        })
-        .count();
+    let live = live(services, all, fleet, service, id, now);
+    let room = role.max_updating(host.role_name(), desired).min(1);
     let rules = [
         (fleet.is_quiet(now), Hold::Quiet),
         (bad.contains(&desired.version), Hold::Bad),
@@ -241,14 +245,8 @@ fn first_hold(
             canary::closed_to(def, desired, fleet, id, host, now),
             Hold::CanaryWait,
         ),
-        (
-            slots >= role.max_updating(host.role_name(), desired),
-            Hold::NoSlot,
-        ),
-        (
-            slots + baking >= role.max_updating(host.role_name(), desired),
-            Hold::Baking,
-        ),
+        (live.slots >= room, Hold::NoSlot),
+        (live.slots + live.baking >= room, Hold::Baking),
         (
             others().any(|(_, h)| {
                 role.after.iter().any(|r| r == h.role_name()) && is_pending(h, desired, now)
@@ -278,6 +276,52 @@ fn first_hold(
     rules
         .into_iter()
         .find_map(|(holds, why)| holds.then_some(why))
+}
+
+/// The updates live across the fleet, as rule 7 counts them: each host once, however many
+/// services it is busy with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Live {
+    /// Hosts that hold an update slot for some service ([`Fleet::holds_slot`]).
+    slots: usize,
+    /// Hosts that hold none and are still baking some service's desired version
+    /// ([`Fleet::is_baking`]).
+    baking: usize,
+}
+
+/// The updates live across every service the coordinator manages and every role, leaving out
+/// only the asking host `id`'s own slot for the asked `service`. A service with no desired
+/// state has nothing to bake, so only its slots count.
+fn live(
+    services: &Services,
+    all: &BTreeMap<String, Desired>,
+    fleet: &Fleet,
+    service: &str,
+    id: &NodeId,
+    now: Duration,
+) -> Live {
+    let mut holding = BTreeSet::new();
+    let mut baking = BTreeSet::new();
+    for def in services.defs() {
+        let name = def.name.as_str();
+        let want = all.get(name);
+        for (o, h) in fleet
+            .occupants_of(name)
+            .filter(|(o, _)| !(name == service && *o == id))
+        {
+            if fleet.holds_slot(name, o, h, now) {
+                holding.insert(o);
+            } else if want
+                .is_some_and(|w| fleet.is_baking(name, o, h, &w.version, def.bake_beats, now))
+            {
+                baking.insert(o);
+            }
+        }
+    }
+    Live {
+        slots: holding.len(),
+        baking: baking.difference(&holding).count(),
+    }
 }
 
 /// Whether `h` is live and not yet at `desired`, or still updating: what a later role or

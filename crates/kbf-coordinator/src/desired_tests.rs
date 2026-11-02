@@ -113,7 +113,8 @@ fn the_desired_state_survives_a_restart() {
 }
 
 /// Catches: a state file written in place (a crash mid-write would leave half a state): the
-/// file is replaced whole, and no temporary file is left beside it.
+/// file is replaced whole, and no temporary file is left beside it or beside the record of
+/// the writes (`crate::writes`), the one other file.
 #[test]
 fn the_state_file_is_replaced_whole_and_leaves_nothing_behind() {
     let dir = dir("desired-atomic");
@@ -122,11 +123,12 @@ fn the_state_file_is_replaced_whole_and_leaves_nothing_behind() {
     store
         .set(KBF, Desired::parse(FULL.as_bytes()).expect("parsed"))
         .expect("stored");
-    let names: Vec<_> = fs::read_dir(dir.path())
+    let mut names: Vec<_> = fs::read_dir(dir.path())
         .expect("listed")
         .map(|e| e.expect("entry").file_name())
         .collect();
-    assert_eq!(names, ["desired.json"]);
+    names.sort();
+    assert_eq!(names, ["desired.json", "desired.json.writes"]);
     let text = fs::read_to_string(&file).expect("read");
     assert!(text.ends_with("}\n"), "{text:?}");
     assert_eq!(

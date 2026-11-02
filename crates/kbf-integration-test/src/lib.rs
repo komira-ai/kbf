@@ -40,6 +40,7 @@ pub mod cross_version;
 #[cfg(target_os = "linux")]
 pub mod daemon;
 pub mod deploy_units;
+pub mod doc_commands;
 pub mod hygiene;
 #[cfg(target_os = "linux")]
 pub mod m1;

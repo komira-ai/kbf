@@ -29,13 +29,15 @@ version is this release". Its token is the run's own GitHub OIDC token, and it s
 heartbeats to the coordinator, is told the version, and updates itself through the root
 helper `kbf-host-install`, which fetches the release's package and checks its attestation.
 The job waits until the coordinator reports the farm converged. It then proves the farm
-with a remote-only Buck2 build.
+with a remote-only Buck2 build. When any of its steps fails, its last step sets the farm back to
+the version the release replaced (G1, done).
 
 What is still by hand (section 3):
 
 - the coordinator's own update;
 - a host's first install of the agent and helper;
-- going back after a red gamma;
+- going back after a red gamma when the job cannot (CI is gone, or the coordinator's rules hold
+  the farm);
 - updating a Mac (removed by G8, which is done);
 - one-time setup (the coordinator, its allow-list, the repository variables, enrolling
   each host).
@@ -137,7 +139,7 @@ The job table below lists the jobs in the order they run. The repository lint `g
 | `bump` | `plan`, `tag`, `publish` | `contents: read`, plus a release-bot App token scoped to the downstream repository that pins kbf as a submodule, in environment `release` | opens a pull request there that moves the pin to the released commit | nothing: no job needs it, and the farm path does not depend on it |
 | `rehearse` | `plan`, `publish` | `contents: read`, the run token passed as a file | a host laid out from the previous release is updated to this one by the real helper under real systemd (`update_rehearsal`) | `gamma` |
 | `rehearse-agent` | `plan`, `publish` | `contents: read`, the run token passed as a file | the same host is updated through the whole control loop: this commit's coordinator, `cargo xtask deploy-farm`, and the previous release's agent and frontend (`update_rehearsal_agent`) | `gamma` |
-| `gamma` | `plan`, `publish`, `rehearse`, `rehearse-agent` | `contents: read`, `id-token: write` (the only job with OIDC), in environment `release`, no secret | `release farm-version` (the version the hosts report, `<semver>+g<12 hex>`). Then it joins the farm's Tailscale network when `TS_CLIENT_ID` is set, through workload identity federation. Then `cargo xtask deploy-farm`: it records a baseline, sends `POST /v1/desired`, and polls `GET /v1/convergence` until the farm converges. Then `cargo xtask prove-farm`: a remote-only Buck2 build, every action new. | nothing after it. The release stays published whatever it says. Its result is the run's colour. |
+| `gamma` | `plan`, `publish`, `rehearse`, `rehearse-agent` | `contents: read`, `id-token: write` (the only job with OIDC), in environment `release`, no secret | `release farm-version` (the version the hosts report, `<semver>+g<12 hex>`). Then it joins the farm's Tailscale network when `TS_CLIENT_ID` is set, through workload identity federation. Then `cargo xtask deploy-farm --deadline-min 60`: it records a baseline, sends `POST /v1/desired`, and polls `GET /v1/convergence` until the farm converges. Then `cargo xtask prove-farm`: a remote-only Buck2 build, every action new. Last, only when an earlier step failed, `cargo xtask deploy-farm restore`: the version this release replaced is set back as desired (G1). | nothing after it. The release stays published whatever it says. Its result is the run's colour. |
 <!-- release-jobs: end -->
 
 ### 2.4 The desired version, from the CI token to the hosts
@@ -171,9 +173,8 @@ clears the mark.
 version, `min_up` per role, and an optional `max_updating`). Nothing is sent to a host. On
 each heartbeat (every 15 s) the coordinator decides for that host, in a fixed order of
 rules: the quiet start after a restart, a bad mark, the host updating or busy, the host up
-to date, the host failed at this version, a deferral, the canary, a free slot within
-`max_updating` for the role (1 for frontend and storage, 2 for daemon and mac-daemon), the
-bake, the role order (a frontend waits for every other role), and `min_up` (a frontend is
+to date, the host failed at this version, a deferral, the canary, no update live anywhere (no host of any role holds an update slot for any
+service; a `max_updating` of 0 holds the role, a larger number has no effect), the bake, the role order (a frontend waits for every other role), and `min_up` (a frontend is
 never the last one up). The first rule that holds back the order wins. Otherwise the reply
 is `Update { version }`.
 
@@ -204,14 +205,19 @@ configuration, not code, and it is not committed.
 
 ### 2.5 What a red gamma does to the farm today
 
-Nothing stops the roll. The desired version stays at the new release. A host whose update
-failed its health check is put back by its helper, and it keeps its slot only until it
-heartbeats healthy again
-(rule 7 of `crates/kbf-coordinator/src/decide.rs`). Then the next host of that role is
-ordered to the same version. Automatic rollback (`rollback = "automatic"`,
-komira-ai/kbf#2181) exists in the coordinator, but kbf's shipped definition does not turn
-it on. A red proof (`prove-farm`) is not seen by the coordinator at all. The next code push
-releases again, and its `gamma` sets a newer version. Only `RELEASE_FREEZE` stops that.
+The job's last step, run only when an earlier one failed, sets the farm back (G1): while this
+release is still the desired version, it sets the version and minimums the release replaced,
+which the coordinator keeps as `replaced`, conditional on the generation it read, and the run
+stays red. That covers a red deploy (`blocked`, a stall, the deadline, a lost host) and a red
+proof (`prove-farm`), which the coordinator does not see at all. Until the restore runs, nothing
+stops the roll: a host whose update failed its health check is put back by its helper, and it
+keeps its slot only until it heartbeats healthy again (rule 7 of
+`crates/kbf-coordinator/src/decide.rs`). Then the next host of that role is ordered to the same
+version. Automatic rollback (`rollback = "automatic"`, komira-ai/kbf#2181) exists in the
+coordinator, but kbf's shipped definition does not turn it on (G2). A run that is cancelled, or
+whose runner is lost, restores nothing; the operator re-runs the failed jobs, or uses C1. The
+next code push releases again, and its `gamma` sets a newer version. Only `RELEASE_FREEZE` stops
+that.
 
 ## 3. Steps still done by hand
 
@@ -222,7 +228,7 @@ releases again, and its `gamma` sets a newer version. Only `RELEASE_FREEZE` stop
 | M3 | Install the agent and helper units on a new host (`packaging/host-agent`: "nothing here is in a package yet"), and add `--layout deb` to the helper's line | once per host | by hand | G6 |
 | M4 | Issue a host's enrollment token (`POST /v1/enroll/tokens`) and run `kbf-updater enroll` | once per host | by hand | stays by hand: issuing an identity is the operator's act |
 | M5 | Set the repository and organisation variables (`KBF_COORDINATOR_URL`, `KBF_COORDINATOR_CA`, `KBF_MIN_UP_*`, `TS_CLIENT_ID`, `TS_AUDIENCE`, `FARM_*`), the Tailscale trust credential and its policy for `tag:ci`, and the `release` environment | once per farm | by hand | stays by hand: it is configuration of the farm, not of kbf |
-| M6 | After a red gamma, set the farm back: choose the version, and set it as desired. Only a CI token can, so that means re-running an earlier release's `gamma` job. | every red gamma | by hand | G1 (the ordinary case), G2 (when CI is gone), C1 (when the ordinary rules hold the farm) |
+| M6 | After a red gamma, set the farm back: choose the version, and set it as desired. Only a CI token can, so that means re-running an earlier release's `gamma` job. | every red gamma | the ordinary case is done by the job (G1, done); by hand when CI is gone or the ordinary rules hold the farm | G1 (the ordinary case, done), G2 (when CI is gone), C1 (when the ordinary rules hold the farm) |
 | M7 | Go back on a host when the coordinator is down or cannot order it | rare | by hand. `kbf-deploy host rollback` serves hand-laid hosts only. On a package host, the helper's `revert` goes back only from a release on trial, and `switch` needs a release staged by `install`, on a trial clock. Nothing switches to any other kept release. | H1, H2 |
 | M8 | Update a Mac. Before G8, the Mac side of the root helper served only the older kit layout, not the installer layout of the `kbf-installer` package, and switched with no lease count of its own; the installer's Mac lease source refused a Mac in pool mode, the root daemon with lease users that farm Macs run | every release | by hand before G8 | G8 (done) |
 | M9 | Update a farm's only frontend, or its only storage host. A frontend is never the last one up, and a lone storage host with the default storage minimum (`KBF_MIN_UP_STORAGE` unset, so 1) would leave none up, so the coordinator orders neither, and `gamma` fails at its stall or deadline. The operator sends `install`, `switch` and `confirm` to the helper's socket in a window. | every release, on such a farm | by hand ([kbf-updater.md](../deploy/kbf-updater.md), "A frontend host") | stays by hand: it is the operator's choice between an outage and more hosts. Either run two frontends behind a load balancer ([frontends-behind-a-load-balancer.md](../deploy/frontends-behind-a-load-balancer.md)) and two storage hosts, or set `KBF_MIN_UP_STORAGE` to 0 and accept that the storage host is down while it updates. |
@@ -240,7 +246,7 @@ never by elapsed time.
 
 | order | task | removes | needs | issue |
 |---|---|---|---|---|
-| 1 | G1 a red gamma sets the farm back | M6 (ordinary case) | none | komira-ai/kbf#2239 |
+| 1 | G1 a red gamma sets the farm back (done) | M6 (ordinary case) | none | komira-ai/kbf#2239 |
 | 2 | G2 kbf ships automatic rollback | M6 (CI gone) | none (komira-ai/kbf#2181 merged) | komira-ai/kbf#2240 |
 | 3 | H1 local `activate` | M7 | none (komira-ai/kbf#2233 merged) | komira-ai/kbf#2242 |
 | 4 | C1 coordinator `force` | M6 (farm held by its rules) | komira-ai/kbf#2187, H1 | komira-ai/kbf#2241 |
@@ -256,6 +262,19 @@ remaining hand steps out of the release-to-release path. G8 is last because its 
 is the largest.
 
 ### G1. A red gamma sets the farm back
+
+**Status: done.** The coordinator's record is `crates/kbf-coordinator/src/writes.rs`, the
+restore is `crates/xtask/src/deploy_farm/restore.rs`, and the workflow rules are
+`crates/kbf-integration-test/tests/release_workflow/restore.rs`. The record of the writes is kept
+in a file beside the state file (its name with `.writes` added), so the state file keeps the form
+earlier builds read; it names the state file by its inode and modification time, so any rewrite of the state file it did
+not see (a stop between the two writes, an earlier build) drops it. The coordinator's own rollback
+is a write too, and raises the generation. "A green run makes no restore" is held by the
+workflow: the step runs under `if: ${{ failure() }}` only, which the release workflow lint pins.
+Where this section says the restore names the forced rollback, it names the hand step of M6 (a
+re-run of the `gamma` job of the release to go back to) until C1 is built. For "Time",
+every step of the job has its own `timeout-minutes` and the job's is at least their sum, so a
+hanging proof is cut and the restore still runs.
 
 **Change.** The PR has two parts. The baseline the job goes back to is kept by the
 coordinator, not by the job, so it is there whatever happened to the job.
@@ -440,7 +459,7 @@ It bypasses:
 It keeps:
 
 - the role order;
-- `max_updating`, which the request may raise;
+- `max_updating`, which the request may raise (a raise has no effect while the coordinator allows one live update at a time across every service);
 - `min_version`. A force below the service's `min_version` (the first release that has the
   host-updates hook) is refused with that reason, and names the manual path.
 
