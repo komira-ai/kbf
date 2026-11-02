@@ -33,8 +33,9 @@ let _registration = update_register::register(
   A line over `MAX_LINE` bytes is refused
   before anything is sent (`Error::TooLong`).
 
-The crate depends on `rustix` (to give the socket its timeout before it connects), `serde_json`
-and `thiserror`, and on no crate of this workspace, and its name
+The crate depends on `serde_json` and `thiserror`, and on Linux on `rustix` (to give the socket its
+timeout before it connects; macOS refuses a connection to a full backlog at once, so there `std`'s
+connect is used), and on no crate of this workspace, and its name
 does not say `kbf`; `crates/kbf-integration-test/tests/layering.rs` keeps both true. The server
 is `kbf-step-runner::register`, whose tests (`tests/register_client.rs`) run this client against
 it over a unix socket.

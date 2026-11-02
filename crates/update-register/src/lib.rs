@@ -199,8 +199,8 @@ fn register_within(
 /// for as long as the socket's send timeout says, for ever by default. So the socket is made here
 /// and given what is left as its send timeout before each try: the connect then fails with
 /// `WouldBlock` once that has passed. The socket is owned from the moment it exists, so an error
-/// drops it and no descriptor is left; no thread is started. (The BSD-derived kernels refuse a
-/// connection to a full backlog rather than wait, which is `Error::Connect`.)
+/// drops it and no descriptor is left; no thread is started.
+#[cfg(target_os = "linux")]
 fn connect(path: &Path, end: Instant, now: Clock<'_>) -> io::Result<UnixStream> {
     use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
 
@@ -219,6 +219,16 @@ fn connect(path: &Path, end: Instant, now: Clock<'_>) -> io::Result<UnixStream> 
         Ok(0)
     })?;
     Ok(stream)
+}
+
+/// Elsewhere `std`'s connect, once the deadline is checked: the BSD-derived kernels (macOS among
+/// them) refuse a connection to a full backlog rather than wait for room in it, which is
+/// `Error::Connect`, so the connect does not wait. (rustix has no `SOCK_CLOEXEC` there, and `std`
+/// sets close-on-exec itself.)
+#[cfg(not(target_os = "linux"))]
+fn connect(path: &Path, end: Instant, now: Clock<'_>) -> io::Result<UnixStream> {
+    remaining(end, now).ok_or(io::ErrorKind::TimedOut)?;
+    UnixStream::connect(path)
 }
 
 /// Calls `op` with the time left until `end` on the clock `now`, and again, with what is left
