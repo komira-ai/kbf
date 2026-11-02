@@ -187,7 +187,7 @@ async fn a_recorded_call_that_joined_an_operation_elsewhere_ends_with_the_operat
     let (a, b) = (farm_over(&store), farm_over(&store));
     let (recorder, recording) = kbf_front::Recorder::new(1 << 20, 64);
     tokio::spawn(recording.run());
-    b.lock().side.recorder = recorder.clone();
+    b.lock().side.recording.tell(recorder.clone());
     let node = WorkerId::new("node-a");
     let _inbox = register(&a, "node-a");
     let _leased = caller(&a, 1);
@@ -230,7 +230,7 @@ async fn a_recorded_call_that_joined_an_operation_elsewhere_ends_with_the_operat
     };
     let ended = outcome_of(&recorder, &key, &action);
     assert_eq!(ended, Some(failed));
-    assert!(b.lock().side.recorded.is_empty(), "the operation is noted");
+    assert!(b.lock().side.recording.is_empty(), "the operation is noted");
 }
 
 /// Asserts that a request that joins an operation leased on a node this frontend owns takes

@@ -116,6 +116,36 @@ pub struct Run {
     /// For a run killed at its own limit: the memory of the largest node that could
     /// run it when the kill was committed, in bytes.
     pub cap_bytes: Option<u64>,
+    /// Where the three phase durations of `times` came from.
+    pub phase_times: PhaseTimes,
+}
+
+/// Where a run's `input_fetch`, `execution` and `output_upload` times came from.
+///
+/// For a run of the executor only the three durations of a [`TaskClaim`](Self::TaskClaim)
+/// are data: the task claimed them in its manifest and the frontend laid them out back to
+/// back, ending when it read the task's pack. The instants, and the gaps between them and
+/// the server's own times (`worker_start`, `worker_completed`), say nothing about the run.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PhaseTimes {
+    /// A daemon measured them. Also what a run reads as when nothing else is known: a
+    /// record written before the marker is a daemon's, or an executor run with no phase
+    /// times at all.
+    #[default]
+    Measured,
+    /// A task claimed them, laid out ending at the frontend's read of its pack.
+    TaskClaim,
+}
+
+impl PhaseTimes {
+    /// The name the read API writes: `measured` or `task_claim`.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Measured => "measured",
+            Self::TaskClaim => "task_claim",
+        }
+    }
 }
 
 impl Run {

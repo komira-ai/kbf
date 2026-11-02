@@ -38,6 +38,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use kbf_front::store_metrics::StoreMetrics;
 use kbf_front::{CacheStorage, Hold, RebuildConfig, SegmentsConfig, VerifiedBlob};
 use kbf_mapsync::MapHolder;
 use kbf_meta::Retention;
@@ -48,7 +49,8 @@ use kbf_storage::repair::Repairs;
 use kbf_storage::service::InProcess;
 use kbf_threads::disk::Statvfs;
 
-use crate::cold_apply::{ColdPick, Fixed, Registrable};
+use crate::cold_apply::{ColdPick, Fixed, RegisteredOnly, Registrable, explain_prefix};
+use crate::cold_counted::CountedPick;
 use crate::listen::Binder;
 use crate::metrics::bind_node_sockets;
 use crate::ram_drain::RamDrain;
@@ -169,6 +171,7 @@ where
 {
     let listener = flags.listener()?;
     let stores = flags.server.stores(&Statvfs)?;
+    flags.server.check_cold_key_file()?;
     for line in stores.describe() {
         tracing::info!("{line}");
     }
@@ -180,7 +183,11 @@ where
             over(flags, listener, &stores, opened, FILE_PREFIX_ROOT, shutdown).await
         }
         StoreUri::S3(uri) => {
-            let cold = Registrable::new(uri, flags.env)?;
+            let cold = Registrable::new(
+                uri,
+                flags.server.cold_store_credentials_file.as_deref(),
+                flags.env,
+            )?;
             over(
                 flags,
                 listener,
@@ -190,6 +197,15 @@ where
                 shutdown,
             )
             .await
+        }
+        StoreUri::Registered => {
+            // The registration names the prefix the metadata log keeps its objects under,
+            // so it is fetched before the log opens.
+            let cold = RegisteredOnly::wait(flags).await?;
+            let prefix = cold.prefix_root();
+            over(flags, listener, &stores, (cold, None), &prefix, shutdown)
+                .await
+                .map_err(|error| explain_prefix(error, &prefix))
         }
     }
 }
@@ -220,6 +236,8 @@ where
     // One start, one bind budget for both listeners, spent before the first await (a
     // `Binder` is not `Send`).
     let (socket, metrics) = bind_node_sockets(listener.listen, flags.metrics, &Binder::new())?;
+    let cold_metrics = Arc::new(StoreMetrics::cold());
+    let cold = CountedPick(cold, Arc::clone(&cold_metrics));
     let (cache, registered) = open_cache(flags, socket, (meta, cold, prefix, log)).await?;
     // The reads this node serves from its own copy: the service counts the calls it serves
     // and the daemon half's calls through `in_process()`, `StorageHalf::storage` counts the
@@ -228,6 +246,7 @@ where
     let legacy_reads = Arc::new(LegacyReads::default());
     let cache = cache
         .with_legacy_reads(Arc::clone(&legacy_reads))
+        .with_cold_store_metrics(cold_metrics)
         .with_writes(args.write_config())
         .with_write_pool(args.write_pool_config())
         .with_durable_wait(args.durable_wait())

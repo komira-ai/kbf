@@ -237,6 +237,30 @@ fn a_plain_read_url_needs_the_plain_http_grant_opt_in() {
     );
 }
 
+/// Catches `--executor-locate` opening the plain-http read grant: the task asks `/locate` over
+/// the same grant, so an `http://` read url is as refused with it as without it, naming the
+/// flag that allows it, and accepted with that flag.
+#[test]
+fn locate_does_not_loosen_the_plain_read_url_rule() {
+    let http = "--task-read-url=http://192.0.2.6:9400";
+    let why = refused(
+        &["--job-tls-cert", "--job-tls-key"],
+        &[http, "--job-plain-http", "--executor-locate"],
+    );
+    assert!(why.contains("--executor-allow-plain-http-grant"), "{why}");
+    let flags = parsed(argv(
+        &["--job-tls-cert", "--job-tls-key"],
+        &[
+            http,
+            "--job-plain-http",
+            "--executor-locate",
+            "--executor-allow-plain-http-grant",
+        ],
+    ))
+    .expect("accepted with the opt-in");
+    assert!(flags.executor.js.expect("js-agent").config.locate);
+}
+
 /// Catches a read url or a tier store given by name: the job network has no DNS, so the task
 /// could not connect. An IPv6 address in brackets is an address.
 #[test]

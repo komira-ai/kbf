@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use js_types::HostId;
 use js_usage::{
-    Admitted, Counters, Limits, LoadIn, MinuteIn, Observed, ProfileCurves, ProfileError,
-    ProfileKey, ProfileStore, Recorder, RunSeries,
+    Admitted, Counters, KeyProfile, Limits, LoadIn, MinuteIn, Observed, ProfileCurves,
+    ProfileError, ProfileKey, ProfileStore, Recorder, RunSeries,
 };
 use kbf_state::Store;
 
@@ -150,6 +150,15 @@ impl ProfileSink {
             node_minutes_discarded: dropped,
             touches_persisted,
         })
+    }
+
+    /// What is stored for `key`: its run count, its fit once it has enough runs, and the
+    /// day it was last used; `None` for a key with no row.
+    ///
+    /// # Errors
+    /// The store failed, or the row is not a profile row.
+    pub fn profile(&self, key: &ProfileKey) -> Result<Option<KeyProfile>, ProfileError> {
+        self.lock().profiles.profile(key)
     }
 
     /// Forgets a node that left the pool, with its open readings.

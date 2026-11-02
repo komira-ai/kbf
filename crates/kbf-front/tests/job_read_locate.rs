@@ -359,3 +359,18 @@ async fn a_span_that_does_not_fit_its_digest_is_absent() {
         "{longest_line}"
     );
 }
+
+/// Catches: a span that compares equal to one that differs in its key, offset or length (the
+/// grants and the table's tests compare spans), or whose copy or `Debug` leaves a field out.
+#[test]
+fn a_span_is_equal_to_its_copy_and_to_nothing_that_differs_in_a_field() {
+    let at = span("cas/f/w/1", 3, 5);
+    assert_eq!(at, at.clone());
+    assert_ne!(at, span("cas/f/w/2", 3, 5));
+    assert_ne!(at, span("cas/f/w/1", 4, 5));
+    assert_ne!(at, span("cas/f/w/1", 3, 6));
+    let shown = format!("{at:?}");
+    for part in ["cas/f/w/1", "offset: 3", "length: 5"] {
+        assert!(shown.contains(part), "{shown}");
+    }
+}

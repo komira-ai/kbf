@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use kbf_sched::fence::{LEADER_LEASE_MARGIN, LEASE_GRACE, START_GRACE, START_VALIDITY};
 
-use super::{Config, ConfigError, HARD_CAP_PAD, PRESIGN_LIMIT};
+use super::{Config, ConfigError, Delivery, HARD_CAP_PAD, PRESIGN_LIMIT};
 use crate::config::MAX_HEARTBEAT_INTERVAL_MS;
 
 const GIB: u64 = 1 << 30;
@@ -402,4 +402,58 @@ fn the_quota_hold_is_above_zero_and_cut_to_a_third_of_the_ttl() {
         with(Duration::from_secs(10), ttl).held_out_for(),
         Duration::from_secs(10)
     );
+}
+
+/// Catches a files run asked of a host that cannot mount files, and a plain run asking for
+/// more than it did: under `files` the acquire asks for `run-files=true` besides the system and
+/// the architecture; under `argv` it asks for those two alone.
+#[test]
+fn files_delivery_asks_acquire_for_run_files() {
+    let argv = base().host_capabilities();
+    assert_eq!(
+        argv.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["arch", "os"]
+    );
+    let files = Config {
+        delivery: Delivery::Files,
+        ..base()
+    }
+    .host_capabilities();
+    assert_eq!(
+        files.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["arch", "os", "run-files"]
+    );
+    assert_eq!(files.get("run-files").map(String::as_str), Some("true"));
+    assert_eq!(files.get("os"), argv.get("os"));
+    assert_eq!(files.get("arch"), argv.get("arch"));
+}
+
+/// Catches the insecure flag demanded of a delivery that sends no secret in arguments, and
+/// dropped from the one that does: `argv` is refused without it, `files` is valid without it.
+#[test]
+fn files_mode_needs_no_insecure_flag_and_argv_mode_still_does() {
+    let files = Config {
+        delivery: Delivery::Files,
+        insecure_argv_secrets: false,
+        ..base()
+    };
+    assert_eq!(files.validate(), Ok(()));
+    let argv = Config {
+        delivery: Delivery::InsecureArgv,
+        insecure_argv_secrets: false,
+        ..base()
+    };
+    assert_eq!(argv.validate(), Err(ConfigError::InsecureArgv));
+}
+
+/// Catches the parser being the only guard against the contradiction: a config that says the
+/// secrets travel as files and also that they may travel as arguments is refused by name.
+#[test]
+fn files_delivery_refuses_the_insecure_opt_in() {
+    let both = Config {
+        delivery: Delivery::Files,
+        insecure_argv_secrets: true,
+        ..base()
+    };
+    assert_eq!(both.validate(), Err(ConfigError::InsecureWithFiles));
 }

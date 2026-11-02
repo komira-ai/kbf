@@ -541,3 +541,70 @@ fn frontend_stays_a_mode_and_handover_is_not_a_command() {
     );
     assert!(!err.contains("handover"), "{err}");
 }
+
+/// `kbf update-hook` is the update hook of the kbf service, not a mode: a command line the
+/// updater would never give ends with exit 1 and the contract's last line, and a step on a
+/// record directory that is not there ends the same way and says which. Neither starts a mode
+/// or touches the host.
+///
+/// Catches: the word falling through to the mode parser (exit 2, no last line), which the
+/// generic updater reads as a hook that died.
+#[test]
+fn update_hook_answers_with_the_contracts_last_line() {
+    let (code, out, _) = run(&[kbf_cli::UPDATE_HOOK]);
+    assert_eq!(code, Some(1));
+    let last = out.lines().last().expect("a last line");
+    assert!(last.contains("\"reason\":\"bad_arguments\""), "{out}");
+    assert!(last.starts_with('{') && last.ends_with('}'), "{out}");
+
+    let dir = scratch("update-hook");
+    let params = dir.join("params.toml");
+    std::fs::write(
+        &params,
+        "\"updater.target_version\" = \"2.0.0\"\n\"updater.artifact_digest\" = \
+         \"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"\n",
+    )
+    .expect("params");
+    let missing = dir.join("no-record-directory");
+    let (code, out, _) = run(&[
+        kbf_cli::UPDATE_HOOK,
+        "--record-dir",
+        &missing.display().to_string(),
+        "--channel",
+        "stable",
+        "--client-cert",
+        "/unused/cert.pem",
+        "--client-key",
+        "/unused/key.pem",
+        "--ca",
+        "/unused/ca.pem",
+        "verify",
+        "--params",
+        &params.display().to_string(),
+    ]);
+    assert_eq!(code, Some(1));
+    assert!(out.contains("\"reason\":\"record_unusable\""), "{out}");
+    assert!(!missing.exists());
+
+    // A record directory that is there: the real ports are wired next, and a host with no
+    // certificate files ends the step as the environment's fault, naming the file.
+    let (code, out, _) = run(&[
+        kbf_cli::UPDATE_HOOK,
+        "--record-dir",
+        &dir.display().to_string(),
+        "--channel",
+        "stable",
+        "--client-cert",
+        "/unused/cert.pem",
+        "--client-key",
+        "/unused/key.pem",
+        "--ca",
+        "/unused/ca.pem",
+        "verify",
+        "--params",
+        &params.display().to_string(),
+    ]);
+    assert_eq!(code, Some(1));
+    assert!(out.contains("\"reason\":\"world\""), "{out}");
+    assert!(out.contains("/unused/cert.pem"), "{out}");
+}

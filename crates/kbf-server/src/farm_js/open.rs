@@ -49,12 +49,19 @@ pub fn config(
 /// with the memory ladder and floors, the loss requeues, the whole-node drain and caps
 /// (`--whole-node-max`) if they are set, and the wait of the orphan sweep, as
 /// [`Farm::new`](crate::farm::Farm::new) and its builders give the farm's own scheduler.
+///
+/// Under `--usage-profiles on` the configuration also carries the curves of `usage`, the farm's
+/// usage side, which the scheduler reads for an action that has a prediction; `record` and `off`
+/// carry none, and a farm with no usage side (no state store) has none to give. Every
+/// configuration built from one usage side carries the one source, so the core and what feeds it
+/// agree.
 #[must_use]
 pub(crate) fn farm_config(
     term: u64,
     unservable_wait: Duration,
     finished_retention: Duration,
     settings: &crate::farm::Settings,
+    usage: Option<&super::usage::Usage>,
 ) -> Config {
     let config = self::config(
         term,
@@ -66,6 +73,10 @@ pub(crate) fn farm_config(
     .with_memory_floors(settings.floors)
     .with_loss_requeues(kbf_sched::LOSS_REQUEUES)
     .with_orphan_wait(settings.orphan_wait);
+    let config = match usage {
+        Some(usage) if settings.usage.serves() => config.with_curves(usage.curves()),
+        _ => config,
+    };
     match &settings.whole_node {
         Some(whole) => config.with_whole_node(whole.clone()),
         None => config,

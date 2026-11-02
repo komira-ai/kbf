@@ -101,6 +101,7 @@ impl KbfAdapter {
             platform,
         } = caller;
         let queued = (self.wall)();
+        self.note_action(&key, &platform, &usage);
         let waiter = Waiter {
             key,
             kind,
@@ -112,7 +113,8 @@ impl KbfAdapter {
         self.machine.insert(admitted.waiter, waiter);
         if let Some(call) = call {
             let name = stored_name(admitted.operation);
-            self.record_submit(call, &name, admitted.operation, admitted.joined);
+            self.recording
+                .submit(call, &name, admitted.operation, admitted.joined);
         }
         if matches!(admitted.held, Held::Elsewhere(_)) {
             stage.send_replace(Stage::Executing);

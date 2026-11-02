@@ -309,6 +309,189 @@ fn arm_name(result: &CellResult, of_cell: &[&CellResult]) -> String {
     }
 }
 
+/// `+2.00 ms` or `-850 us`: `value` against `base`.
+fn fmt_diff(value: u64, base: u64) -> String {
+    let sign = if value >= base { '+' } else { '-' };
+    format!("{sign}{}", fmt_us(value.abs_diff(base)))
+}
+
+/// `+2.00 ms (2.00x)`: the difference of `value` from `base` and the ratio.
+fn fmt_against(value: u64, base: u64) -> String {
+    if base == 0 {
+        return format!("{} (n/a)", fmt_diff(value, base));
+    }
+    format!(
+        "{} ({:.2}x)",
+        fmt_diff(value, base),
+        value as f64 / base as f64
+    )
+}
+
+/// The table that sets each `instance` put arm beside the `direct-mp` arm of the same size,
+/// width and mode: both are multipart uploads, so only these two are alike but for the
+/// instance. The single PUT (`direct`) is not a partner. `None` if no arm has a partner.
+fn put_comparison(of_cell: &[&CellResult], rows: &Rows) -> Option<String> {
+    let mut table = String::new();
+    // The pairs whose two arms are of different runs: the names, and the runs of each side.
+    let (mut crossed, mut floor_runs, mut instance_runs) =
+        (Vec::new(), BTreeSet::new(), BTreeSet::new());
+    for instance in of_cell {
+        let Some(rest) = instance.arm.strip_prefix("instance-") else {
+            continue;
+        };
+        let floor_arm = format!("direct-mp-{rest}");
+        let Some(floor) = of_cell
+            .iter()
+            .find(|r| r.arm == floor_arm && r.provenance.attempt == instance.provenance.attempt)
+        else {
+            continue;
+        };
+        if floor.provenance.run_id != instance.provenance.run_id {
+            crossed.push(rest.to_owned());
+            floor_runs.insert(floor.provenance.run_id.as_str());
+            instance_runs.insert(instance.provenance.run_id.as_str());
+        }
+        let name = if instance.provenance.attempt == 1 {
+            rest.to_owned()
+        } else {
+            format!("{rest} (attempt {})", instance.provenance.attempt)
+        };
+        for window in [Window::Quiet, Window::Busy] {
+            let (Some(mut via), Some(mut base)) =
+                (gather(instance, rows, window), gather(floor, rows, window))
+            else {
+                continue;
+            };
+            let (Some(via), Some(base)) = (
+                stats::summarise(&mut via.ok),
+                stats::summarise(&mut base.ok),
+            ) else {
+                continue;
+            };
+            writeln!(
+                table,
+                "| {name} | {} | {} | {} | {} | {} | {} | {} |",
+                window.as_str(),
+                fmt_us(base.p50),
+                fmt_us(via.p50),
+                fmt_against(via.p50, base.p50),
+                fmt_us(base.p95),
+                fmt_us(via.p95),
+                fmt_against(via.p95, base.p95),
+            )
+            .expect("a string takes text");
+        }
+    }
+    let note = if crossed.is_empty() {
+        String::new()
+    } else {
+        let runs = |set: &BTreeSet<&str>| set.iter().copied().collect::<Vec<_>>().join(", ");
+        format!(
+            "- the arms of {} came from two runs ({} and {}), not interleaved pass by pass: the direct-mp arm of one run is set beside the instance arm of another of the same attempt, so a drift of the cold store between the runs is not controlled for\n\n",
+            crossed.join(", "),
+            runs(&floor_runs),
+            runs(&instance_runs)
+        )
+    };
+    (!table.is_empty()).then(|| {
+        format!(
+            "### cold-put: instance against direct-mp\n\n| arm | window | direct-mp p50 | instance p50 | instance against direct-mp | direct-mp p95 | instance p95 | instance against direct-mp |\n|---|---|---|---|---|---|---|---|\n{table}\n{note}"
+        )
+    })
+}
+
+/// The caps line of a cell: the request-rate caps the run held its clients to.
+fn caps_line(of_cell: &[&CellResult]) -> String {
+    match of_cell.iter().find_map(|r| r.rate_caps) {
+        Some(caps) => format!(
+            "- request caps of the run: cold {}/s, hot {}/s, LIST poll {}/s",
+            caps.cold_rps, caps.hot_rps, caps.list_poll_rps
+        ),
+        None => "- request caps of the run: not recorded".to_owned(),
+    }
+}
+
+/// `HEAD 2.00, PUT 1.00` or `none`: `counts` per request.
+fn per_request(counts: &BTreeMap<String, u64>, requests: u64) -> String {
+    if counts.is_empty() {
+        return "none".to_owned();
+    }
+    counts
+        .iter()
+        .map(|(method, n)| format!("{method} {:.2}", *n as f64 / requests as f64))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The lines about what an arm's measured passes recorded beside the latencies: the proxy's
+/// requests by method per request, the busy time of the disks, and the width reached.
+fn recorded_lines(name: &str, result: &CellResult) -> Vec<String> {
+    let measured: Vec<_> = result.passes.iter().filter(|p| !p.discarded).collect();
+    let mut lines = Vec::new();
+    let counted: Vec<_> = measured
+        .iter()
+        .filter_map(|p| p.proxy_requests.as_ref().map(|c| (p.requests, c)))
+        .collect();
+    let requests: u64 = counted.iter().map(|(n, _)| n).sum();
+    if requests > 0 {
+        let (mut during, mut cleanup) = (BTreeMap::new(), BTreeMap::new());
+        for (_, counts) in &counted {
+            for (total, part) in [
+                (&mut during, &counts.during),
+                (&mut cleanup, &counts.cleanup),
+            ] {
+                for (method, n) in part {
+                    *total.entry(method.clone()).or_insert(0) += n;
+                }
+            }
+        }
+        lines.push(format!(
+            "- arm {name}: proxy requests per request, measured passes: during {}; cleanup {}",
+            per_request(&during, requests),
+            per_request(&cleanup, requests)
+        ));
+    }
+    let mut disks: BTreeMap<&str, Vec<f64>> = BTreeMap::new();
+    for pass in &measured {
+        for (disk, busy) in &pass.disk_busy {
+            disks.entry(disk).or_default().push(busy.util_pct);
+        }
+    }
+    if !disks.is_empty() {
+        let each: Vec<String> = disks
+            .iter()
+            .map(|(disk, utils)| {
+                let mean = utils.iter().sum::<f64>() / utils.len() as f64;
+                let max = utils.iter().copied().fold(0.0, f64::max);
+                format!("{disk} mean {mean:.1}%, max {max:.1}%")
+            })
+            .collect();
+        lines.push(format!(
+            "- arm {name}: disk busy, measured passes: {}",
+            each.join("; ")
+        ));
+    }
+    for pass in &measured {
+        if let Some(bytes) = pass
+            .pass_load
+            .filter(|load| !load.writeback_settled)
+            .and_then(|load| load.writeback_pending_bytes)
+        {
+            lines.push(format!(
+                "- arm {name}: pass {} was measured on unsettled writeback: {bytes} bytes were still dirty or being written when the wait for the disks gave up",
+                pass.pass
+            ));
+        }
+    }
+    let peak = measured.iter().map(|p| p.peak_in_flight).max().unwrap_or(0);
+    if peak > 0 {
+        lines.push(format!(
+            "- arm {name}: most requests in flight in a measured pass: {peak}"
+        ));
+    }
+    lines
+}
+
 /// The report for `results` with their `rows`.
 fn format_report(results: &[CellResult], rows: &Rows) -> String {
     let mut out = String::new();
@@ -353,6 +536,22 @@ fn format_report(results: &[CellResult], rows: &Rows) -> String {
             }
         }
         out.push('\n');
+        if cell == CellId::ColdPut
+            && let Some(table) = put_comparison(&of_cell, rows)
+        {
+            out.push_str(&table);
+        }
+        writeln!(out, "{}", caps_line(&of_cell)).expect("a string takes text");
+        let filters: BTreeSet<(&str, String)> = of_cell
+            .iter()
+            .filter_map(|r| {
+                let filter = r.provenance.arms_filter.as_ref()?;
+                Some((r.provenance.run_id.as_str(), filter.join(", ")))
+            })
+            .collect();
+        for (run, filter) in filters {
+            writeln!(out, "- run {run} ran only the arms: {filter}").expect("a string takes text");
+        }
         let mut said = BTreeSet::new();
         for result in &of_cell {
             for note in &result.notes {
@@ -374,6 +573,9 @@ fn format_report(results: &[CellResult], rows: &Rows) -> String {
                 Some(why) => format!("not labelled v1: {why}"),
             };
             writeln!(out, "- arm {name}: {label}").expect("a string takes text");
+            for line in recorded_lines(&name, result) {
+                writeln!(out, "{line}").expect("a string takes text");
+            }
             for pass in result.passes.iter().filter(|p| p.gate_tripped.is_some()) {
                 writeln!(
                     out,
@@ -389,6 +591,23 @@ fn format_report(results: &[CellResult], rows: &Rows) -> String {
                         out,
                         "- arm {name}: pass {} was cut by the cold store guard ({trip})",
                         pass.pass
+                    )
+                    .expect("a string takes text");
+                }
+            }
+            for pass in result.passes.iter() {
+                if let Some(w) = &pass.cold_window {
+                    writeln!(
+                        out,
+                        "- arm {name}: pass {} cold window: store counted {} S3 requests, this tool sent {}, {} from elsewhere (judged: {}); drives {}, not ok {}; healing: {}",
+                        pass.pass,
+                        w.minio_requests,
+                        w.own_requests,
+                        w.foreign_requests,
+                        w.judged,
+                        w.drives,
+                        w.drives_not_ok,
+                        w.healing
                     )
                     .expect("a string takes text");
                 }
@@ -440,6 +659,11 @@ mod tests {
             }),
             gate_tripped: None,
             cold_guard: None,
+            cold_window: None,
+            proxy_requests: None,
+            disk_busy: BTreeMap::new(),
+            peak_in_flight: 0,
+            pass_load: None,
         }
     }
 
@@ -459,6 +683,8 @@ mod tests {
             passes,
             notes: notes.iter().map(|n| (*n).to_owned()).collect(),
             cold_state: vec![],
+            rate_caps: None,
+            objects_per_pass: None,
         }
     }
 
@@ -688,6 +914,7 @@ mod tests {
                     percent_done: None,
                     drives: vec![],
                     read_unix_ms: 7,
+                    source: None,
                 },
             })
             .collect();
@@ -806,10 +1033,34 @@ mod tests {
             limit: 0.05,
             requests: 32,
             window_secs: 60,
+            detail: None,
         });
         let text = format_report(&[result("a", vec![cut], &[])], &Rows::new());
         assert!(
             text.contains("- arm a: pass 1 was cut by the cold store guard (cold store guard: error_share is 0.0625, over the limit 0.05 (over 32 requests of the last 60 s))"),
+            "{text}"
+        );
+    }
+
+    /// Catches a window the guard read going unsaid: the report lists, for every pass that has
+    /// one, the store's counter growth, the bench's own count, what is left, the judging and the
+    /// drives and healing, so the paper can show the window was quiet.
+    #[test]
+    fn the_cold_window_of_a_pass_is_listed() {
+        let mut quiet = pass(1, Window::Quiet, 40, None);
+        quiet.cold_window = Some(crate::result::ColdWindow {
+            minio_requests: 120,
+            own_requests: 118,
+            foreign_requests: 2,
+            judged: true,
+            drives: 12,
+            drives_not_ok: 0,
+            healing: false,
+            unjudged_reason: None,
+        });
+        let text = format_report(&[result("a", vec![quiet], &[])], &Rows::new());
+        assert!(
+            text.contains("- arm a: pass 1 cold window: store counted 120 S3 requests, this tool sent 118, 2 from elsewhere (judged: true); drives 12, not ok 0; healing: false"),
             "{text}"
         );
     }
@@ -876,5 +1127,373 @@ mod tests {
         let other = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "tb-report-io2");
         std::fs::create_dir(other.path().join("x.json")).unwrap();
         assert!(matches!(render(other.path()), Err(BenchError::Io { .. })));
+    }
+
+    /// A pass of `arm` with the counts, disk figures and width given.
+    fn recorded(
+        index: u32,
+        requests: u64,
+        during: &[(&str, u64)],
+        cleanup: &[(&str, u64)],
+    ) -> PassResult {
+        let counts = |pairs: &[(&str, u64)]| -> BTreeMap<String, u64> {
+            pairs.iter().map(|(m, n)| ((*m).to_owned(), *n)).collect()
+        };
+        PassResult {
+            proxy_requests: Some(crate::result::ProxyRequests {
+                during: counts(during),
+                cleanup: counts(cleanup),
+            }),
+            ..pass(index, Window::Quiet, requests, None)
+        }
+    }
+
+    /// Catches the instance's multipart put reported on its own, with nothing to read it
+    /// against: the report pairs `instance-<rest>` with `direct-mp-<rest>` (same size, width and
+    /// mode) and gives each path's p50 and p95 and the difference and ratio; the single PUT
+    /// (`direct-`) is not a partner, and an arm with no partner gets no comparison.
+    #[test]
+    fn an_instance_put_is_compared_with_the_multipart_put_to_the_store() {
+        let quiet = |arm: &str| {
+            result(
+                arm,
+                vec![
+                    pass(0, Window::Quiet, 3, None),
+                    pass(1, Window::Quiet, 3, None),
+                ],
+                &[],
+            )
+        };
+        let data = merged(vec![
+            rows("direct-mp-4kib-c1-healthy", 1, &[1000, 2000, 3000], "200"),
+            rows("instance-4kib-c1-healthy", 1, &[3000, 4000, 5000], "200"),
+            rows("direct-4kib-c1-healthy", 1, &[100, 200, 300], "200"),
+            rows("instance-1mib-c1-healthy", 1, &[9000], "200"),
+        ]);
+        let results = [
+            quiet("direct-mp-4kib-c1-healthy"),
+            quiet("instance-4kib-c1-healthy"),
+            quiet("direct-4kib-c1-healthy"),
+            quiet("instance-1mib-c1-healthy"),
+        ];
+        let text = format_report(&results, &data);
+        let (_, section) = text
+            .split_once("### cold-put: instance against direct-mp")
+            .expect("a comparison section");
+        let section = section.split("\n\n").nth(1).unwrap();
+        assert!(
+            section.contains("| 4kib-c1-healthy | quiet | 2.00 ms | 4.00 ms | +2.00 ms (2.00x) | 3.00 ms | 5.00 ms | +2.00 ms (1.67x) |"),
+            "{section}"
+        );
+        assert!(!section.contains("direct-4kib"), "{section}");
+        assert!(!section.contains("1mib"), "{section}");
+
+        let alone = format_report(&results[1..2], &data);
+        assert!(!alone.contains("instance against direct-mp"), "{alone}");
+    }
+
+    /// The cold-put results of `instance-4kib-c1-healthy` and `direct-mp-4kib-c1-healthy`, each
+    /// of the run and attempt given, with samples.
+    fn two_arms(instance: (&str, u32), floor: (&str, u32)) -> String {
+        let quiet = |arm: &str, (run, attempt): (&str, u32)| {
+            let mut r = result(
+                arm,
+                vec![
+                    pass(0, Window::Quiet, 3, None),
+                    pass(1, Window::Quiet, 3, None),
+                ],
+                &[],
+            );
+            r.provenance.run_id = run.to_owned();
+            r.provenance.attempt = attempt;
+            r
+        };
+        let on = |rows: Rows, attempt: u32| -> Rows {
+            rows.into_iter()
+                .map(|((c, a, _, p), v)| ((c, a, attempt, p), v))
+                .collect()
+        };
+        let data = merged(vec![
+            on(
+                rows("direct-mp-4kib-c1-healthy", 1, &[1000, 2000, 3000], "200"),
+                floor.1,
+            ),
+            on(
+                rows("instance-4kib-c1-healthy", 1, &[3000, 4000, 5000], "200"),
+                instance.1,
+            ),
+        ]);
+        let results = [
+            quiet("direct-mp-4kib-c1-healthy", floor),
+            quiet("instance-4kib-c1-healthy", instance),
+        ];
+        format_report(&results, &data)
+    }
+
+    /// Catches an instance arm and a direct-mp arm of two runs (the direct arms run alone with
+    /// `--arms`) going unpaired, or paired without saying so: the same attempt pairs them across
+    /// result files and the report says the arms came from two runs, not interleaved; arms of
+    /// one run carry no such note.
+    #[test]
+    fn arms_of_two_runs_with_one_attempt_are_paired_and_the_report_says_so() {
+        let text = two_arms(("run-I", 1), ("run-D", 1));
+        assert!(
+            text.contains("### cold-put: instance against direct-mp"),
+            "{text}"
+        );
+        assert!(
+            text.contains("came from two runs (run-D and run-I), not interleaved"),
+            "{text}"
+        );
+        let one = two_arms(("run-I", 1), ("run-I", 1));
+        assert!(
+            one.contains("### cold-put: instance against direct-mp"),
+            "{one}"
+        );
+        assert!(!one.contains("two runs"), "{one}");
+    }
+
+    /// Catches arms of two attempts being paired: a different attempt is not a partner, and no
+    /// comparison and no note are made.
+    #[test]
+    fn arms_of_two_attempts_are_not_paired() {
+        let text = two_arms(("run-I", 2), ("run-D", 1));
+        assert!(!text.contains("instance against direct-mp"), "{text}");
+        assert!(!text.contains("two runs"), "{text}");
+    }
+
+    /// Catches a filtered run going unsaid: the report names the families a run was restricted
+    /// to, once per run.
+    #[test]
+    fn the_arms_filter_of_a_run_is_printed() {
+        let mut r = result(
+            "direct-4kib-c1-healthy",
+            vec![pass(1, Window::Quiet, 3, None)],
+            &[],
+        );
+        r.provenance.arms_filter = Some(vec!["direct".to_owned(), "direct-mp".to_owned()]);
+        let text = format_report(&[r], &Rows::new());
+        assert!(
+            text.contains("- run run-7 ran only the arms: direct, direct-mp"),
+            "{text}"
+        );
+        let all = format_report(
+            &[result("a", vec![pass(1, Window::Quiet, 3, None)], &[])],
+            &Rows::new(),
+        );
+        assert!(!all.contains("ran only"), "{all}");
+    }
+
+    /// Catches the requests the proxy forwarded being left out of the report, summed over the
+    /// warm-up pass, or not divided by the requests of the arm: the measured passes' counts by
+    /// method, per request, those during the pass and those during its cleanup hook apart.
+    #[test]
+    fn the_proxy_requests_are_reported_per_request_by_method() {
+        let r = result(
+            "a",
+            vec![
+                recorded(0, 10, &[("PUT", 1000)], &[("DELETE", 1000)]),
+                recorded(1, 10, &[("HEAD", 20), ("PUT", 10)], &[("DELETE", 10)]),
+                recorded(2, 10, &[("HEAD", 20), ("PUT", 10)], &[("DELETE", 10)]),
+            ],
+            &[],
+        );
+        let none = result("b", vec![pass(1, Window::Quiet, 10, None)], &[]);
+        let text = format_report(&[r, none], &Rows::new());
+        assert!(
+            text.contains("- arm a: proxy requests per request, measured passes: during HEAD 2.00, PUT 1.00; cleanup DELETE 1.00"),
+            "{text}"
+        );
+        assert!(!text.contains("- arm b: proxy requests"), "{text}");
+    }
+
+    /// Catches the disk figures and the width a pass reached being recorded and never shown, the
+    /// warm-up pass among them: the mean and the largest utilisation of each disk over the
+    /// measured passes and the most requests in flight in one.
+    #[test]
+    fn the_disk_and_the_width_of_the_measured_passes_are_reported() {
+        let with = |index: u32, util: f64, peak: u32| PassResult {
+            disk_busy: BTreeMap::from([(
+                "sda".to_owned(),
+                crate::result::DiskBusy {
+                    busy_ms: 1,
+                    util_pct: util,
+                },
+            )]),
+            peak_in_flight: peak,
+            pass_load: None,
+            ..pass(index, Window::Quiet, 10, None)
+        };
+        let r = result(
+            "x",
+            vec![with(0, 99.0, 9), with(1, 40.0, 3), with(2, 60.0, 2)],
+            &[],
+        );
+        let text = format_report(&[r], &Rows::new());
+        assert!(
+            text.contains("- arm x: disk busy, measured passes: sda mean 50.0%, max 60.0%"),
+            "{text}"
+        );
+        assert!(
+            text.contains("- arm x: most requests in flight in a measured pass: 3"),
+            "{text}"
+        );
+    }
+
+    /// Catches a measurement taken on unsettled writeback going unmentioned: each measured pass
+    /// that opened its window with the wait at its cap is named with the bytes pending, a pass
+    /// that drained or has no record is not, and the warm-up is left out.
+    #[test]
+    fn a_pass_measured_on_unsettled_writeback_is_named() {
+        let with = |index: u32, settled: bool, bytes: Option<u64>| PassResult {
+            pass_load: Some(crate::result::PassLoad {
+                readings: 1,
+                peak_psi_cpu_pct: 0.0,
+                peak_psi_io_pct: 0.0,
+                peak_disk_util_pct: 0.0,
+                writeback_settled: settled,
+                writeback_pending_bytes: bytes,
+            }),
+            ..pass(index, Window::Quiet, 10, None)
+        };
+        let r = result(
+            "x",
+            vec![
+                with(0, false, Some(1)),
+                with(1, true, None),
+                with(2, false, Some(5_120_000)),
+                pass(3, Window::Quiet, 10, None),
+            ],
+            &[],
+        );
+        let text = format_report(&[r], &Rows::new());
+        assert!(
+            text.contains("- arm x: pass 2 was measured on unsettled writeback: 5120000 bytes were still dirty or being written when the wait for the disks gave up"),
+            "{text}"
+        );
+        assert_eq!(text.matches("unsettled writeback").count(), 1, "{text}");
+    }
+
+    /// Catches a table of a cell that hides the rate cap its requests waited at: the caps of the
+    /// run are named under the table of every cell, and a result that predates them says so.
+    #[test]
+    fn the_rate_caps_of_the_run_are_named_under_each_table() {
+        let mut capped = result("a", vec![pass(1, Window::Quiet, 1, None)], &[]);
+        capped.rate_caps = Some(crate::config::RateCaps {
+            cold_rps: 20,
+            hot_rps: 50,
+            list_poll_rps: 2,
+        });
+        let text = format_report(&[capped], &Rows::new());
+        assert!(
+            text.contains("- request caps of the run: cold 20/s, hot 50/s, LIST poll 2/s"),
+            "{text}"
+        );
+        let old = result("a", vec![pass(1, Window::Quiet, 1, None)], &[]);
+        let text = format_report(&[old], &Rows::new());
+        assert!(
+            text.contains("- request caps of the run: not recorded"),
+            "{text}"
+        );
+    }
+
+    /// Pins how the paper's 10,000 requests are reached: the warm-up pass is left out, so eleven
+    /// passes of 1,000 give a row of ten passes and 10,000 requests, and six give 5,000.
+    #[test]
+    fn eleven_passes_of_a_thousand_give_ten_thousand_measured_requests() {
+        let passes = |n: u32| (0..n).map(|i| pass(i, Window::Quiet, 1000, None)).collect();
+        let row = |n: u32, needle: &str| {
+            let text = format_report(&[result("big", passes(n), &[])], &Rows::new());
+            text.lines().any(|l| l.contains(needle))
+        };
+        assert!(row(11, "| big | quiet | 10 | 10000 |"));
+        assert!(row(6, "| big | quiet | 5 | 5000 |"));
+    }
+
+    /// Catches a comparison that only handles the common case: an instance faster than its floor
+    /// (a minus sign, a ratio under 1), a floor of zero (no ratio), busy passes (their own row),
+    /// a second attempt (named as one, paired with its own attempt's floor), and an instance arm
+    /// with no success (no row, and no panic).
+    #[test]
+    fn the_comparison_handles_a_faster_instance_a_zero_floor_busy_passes_and_attempts() {
+        let both = |arm: &str, window: Window, attempt: u32| {
+            let mut r = result(
+                arm,
+                vec![pass(0, window, 3, None), pass(1, window, 3, None)],
+                &[],
+            );
+            r.provenance.attempt = attempt;
+            r
+        };
+        let on_attempt = |rows: Rows, attempt: u32| -> Rows {
+            rows.into_iter()
+                .map(|((c, a, _, p), v)| ((c, a, attempt, p), v))
+                .collect()
+        };
+        let data = merged(vec![
+            rows("direct-mp-4kib-c1-healthy", 1, &[4000, 5000, 6000], "200"),
+            rows("instance-4kib-c1-healthy", 1, &[1000, 2000, 3000], "200"),
+            rows("direct-mp-1kib-c1-healthy", 1, &[0, 0, 0], "200"),
+            rows("instance-1kib-c1-healthy", 1, &[1000, 1000, 1000], "200"),
+            rows("direct-mp-2kib-c1-healthy", 1, &[9000, 9000, 9000], "200"),
+            on_attempt(
+                rows("instance-2kib-c1-healthy", 1, &[2000, 3000, 4000], "200"),
+                2,
+            ),
+            on_attempt(
+                rows("direct-mp-2kib-c1-healthy", 1, &[1000, 2000, 3000], "200"),
+                2,
+            ),
+            rows("direct-mp-8kib-c1-healthy", 1, &[1000], "200"),
+        ]);
+        let results = [
+            both("direct-mp-4kib-c1-healthy", Window::Busy, 1),
+            both("instance-4kib-c1-healthy", Window::Busy, 1),
+            both("direct-mp-1kib-c1-healthy", Window::Quiet, 1),
+            both("instance-1kib-c1-healthy", Window::Quiet, 1),
+            both("direct-mp-2kib-c1-healthy", Window::Quiet, 1),
+            both("direct-mp-2kib-c1-healthy", Window::Quiet, 2),
+            both("instance-2kib-c1-healthy", Window::Quiet, 2),
+            both("direct-mp-8kib-c1-healthy", Window::Quiet, 1),
+            both("instance-8kib-c1-healthy", Window::Quiet, 1),
+        ];
+        let text = format_report(&results, &data);
+        let (_, section) = text
+            .split_once("### cold-put: instance against direct-mp")
+            .expect("a comparison section");
+        let table = section.split("\n\n").nth(1).unwrap();
+        let has = |needle: &str| table.lines().any(|l| l.starts_with(needle));
+        assert!(
+            has("| 4kib-c1-healthy | busy | 5.00 ms | 2.00 ms | -3.00 ms (0.40x) |"),
+            "{table}"
+        );
+        assert!(
+            has("| 1kib-c1-healthy | quiet | 0 us | 1.00 ms | +1.00 ms (n/a) |"),
+            "{table}"
+        );
+        assert!(
+            has("| 2kib-c1-healthy (attempt 2) | quiet | 2.00 ms | 3.00 ms | +1.00 ms (1.50x) |"),
+            "{table}"
+        );
+        assert!(!table.contains("8kib"), "{table}");
+    }
+
+    /// Catches a method that no request used being left out of the line as if the line were
+    /// missing, rather than named `none`: all the requests of the arm were in its cleanup.
+    #[test]
+    fn a_phase_with_no_proxy_request_is_reported_as_none() {
+        let r = result(
+            "a",
+            vec![
+                recorded(1, 10, &[], &[("DELETE", 10)]),
+                recorded(2, 10, &[], &[("DELETE", 10)]),
+            ],
+            &[],
+        );
+        let text = format_report(&[r], &Rows::new());
+        assert!(
+            text.contains("measured passes: during none; cleanup DELETE 1.00"),
+            "{text}"
+        );
     }
 }

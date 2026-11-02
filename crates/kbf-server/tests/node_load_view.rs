@@ -46,10 +46,6 @@ fn reading(seq: u64, mono_usec: u64, cpu_usage_usec: u64) -> NodeLoad {
 /// heartbeats after, keeps showing them across a heartbeat without one, and drops a reading whose
 /// seq is not above the last.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg_attr(
-    feature = "farm-core-js",
-    ignore = "known-different-on-js: the js core keeps no node load"
-)]
 async fn a_server_shows_the_node_load_its_daemons_report() {
     let cell = Cell::start_with_api().await;
     let api = cell.api.expect("an operator API");

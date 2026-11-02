@@ -20,7 +20,7 @@
 //!
 //! What a host does around the core (a `Hello`, a submit) is in [`crate::farm_js::host`].
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -45,6 +45,7 @@ use super::codec::KbfRowCodec;
 use super::facts::WorkerFacts;
 use super::learning::Learning;
 use super::report_hooks::ReportHooks;
+use super::usage::Usage;
 use crate::action_usage::Subject;
 use crate::answer::{Detail, Pending, failed, finished_of, refused_as};
 use crate::farm::NodeLoads;
@@ -52,6 +53,7 @@ use crate::farm::durable::{named, subject};
 use crate::farm::failed_actions::{Class, FailedActions, class_of};
 use crate::fleet::quarantine_change;
 use crate::machine::{Booked, FarmMachine, Platform, Sent, Waiter, stored_name};
+use crate::run_record::Recording;
 use crate::stamp::Stamp;
 
 /// Where the farm sends a worker's messages: the outbound half of its stream.
@@ -93,9 +95,9 @@ pub struct KbfAdapter {
     /// The channel of each operation clients ask for by name that the scheduler does not
     /// hold, shown what the store says of it at each intake poll while a ticket holds it.
     pub(super) watched: BTreeMap<OperationId, watch::Sender<Stage>>,
-    pub(super) recorder: Recorder,
-    /// The operations a recorded call waits on: the only ones the recorder is told of.
-    pub(super) recorded: BTreeSet<OperationId>,
+    /// Where the invocation record's lease and finish events go, and the operations it is
+    /// told of.
+    pub(super) recording: Recording,
     pub(super) pack_reads: BTreeMap<WorkerId, worker::PackReadCounts>,
     pub(super) pack_writes: BTreeMap<WorkerId, worker::PackWriteCounts>,
     pub(super) input_caches: BTreeMap<WorkerId, worker::InputCacheCounts>,
@@ -115,6 +117,8 @@ pub struct KbfAdapter {
     pub(super) learning: Learning,
     /// The counts that tell the ablation's rows apart ([`super::ablation`]).
     ablation: Ablation,
+    /// Where the profile name of each action is told (`--usage-profiles record`).
+    usage: Option<Arc<Usage>>,
 }
 
 /// The `LeaseId` of the wire.
@@ -167,8 +171,7 @@ impl KbfAdapter {
             nodes: BTreeMap::new(),
             parked: BTreeMap::new(),
             watched: BTreeMap::new(),
-            recorder: Recorder::off(),
-            recorded: BTreeSet::new(),
+            recording: Recording::new(),
             pack_reads: BTreeMap::new(),
             pack_writes: BTreeMap::new(),
             input_caches: BTreeMap::new(),
@@ -179,6 +182,7 @@ impl KbfAdapter {
             hooks: ReportHooks::default(),
             learning: Learning::off(),
             ablation: Ablation::default(),
+            usage: None,
         }
     }
 
@@ -186,8 +190,22 @@ impl KbfAdapter {
     /// started and given up, and each operation's end.
     #[must_use]
     pub fn recording(mut self, recorder: Recorder) -> Self {
-        self.recorder = recorder;
+        self.recording.tell(recorder);
         self
+    }
+
+    /// This adapter, telling `usage` the profile name of each action it enrols or takes up.
+    #[must_use]
+    pub(crate) fn noting_usage(mut self, usage: Option<Arc<Usage>>) -> Self {
+        self.usage = usage;
+        self
+    }
+
+    /// Tells the usage side, if there is one, which action an operation runs and what it is.
+    pub(super) fn note_action(&self, key: &ActionKey, platform: &Platform, usage: &Subject) {
+        if let Some(sink) = &self.usage {
+            sink.note_action(key, platform, usage);
+        }
     }
 
     /// The farm machine: the callers, the leases whose `Start` was sent and the nodes.
@@ -369,7 +387,7 @@ impl Adapter for KbfAdapter {
         let os_family = platform.map_or("-", |p| p.os_family);
         let isa = platform.map_or("-", |p| p.isa.as_str());
         tracing::info!(%operation, %lease, %node, key, %os_family, %isa, "lease granted");
-        self.record_granted(grant);
+        self.recording.granted(grant);
         self.send_for(view.sched(), &grant.worker, grant.operation, |w| {
             server_message::Message::LeaseOffer(LeaseOffer {
                 lease_id: Some(wire_lease(grant.lease)),
@@ -433,7 +451,7 @@ impl Adapter for KbfAdapter {
             });
         sent.into_iter()
             .for_each(|sent| self.machine.start(start.lease, sent));
-        self.record_started(start);
+        self.recording.started(start);
         self.learning_started(start);
         let cost = view.sched().lease_cost(start.lease);
         self.ablation.booked(Booking::of(start.kind, cost));
@@ -461,7 +479,7 @@ impl Adapter for KbfAdapter {
 
     fn refuse(&mut self, _view: &View<'_>, refusal: &Refusal) {
         tracing::warn!(operation = %refusal.operation, reason = %refusal.reason, "operation refused");
-        self.record_refused(refusal);
+        self.recording.refused(refusal);
         let finished = refused_as(refusal);
         self.failed.count(Class::Farm);
         // A lease given up before the operation was refused may still be listed.
@@ -474,7 +492,7 @@ impl Adapter for KbfAdapter {
     }
 
     fn requeued(&mut self, requeue: &Requeue) {
-        self.record_requeue(requeue);
+        self.recording.requeued(requeue);
         self.learning_requeued(requeue);
         self.ablation.requeued(requeue.reason);
     }
@@ -515,7 +533,7 @@ impl Adapter for KbfAdapter {
             }
             _ => (None, None),
         };
-        self.record_finished(answer, &finished, stored, reason);
+        self.recording.finished(answer, &finished, stored, reason);
         self.machine
             .keep_finished(answer.operation, answer.waiters.clone());
         // A result whose finish waited for the store is acknowledged to its sender's
@@ -614,6 +632,10 @@ impl Adapter for KbfAdapter {
         let usage = parcel
             .and_then(|parcel| subject::decode(parcel).ok())
             .unwrap_or_else(|| Subject::of(kbf_front::Described::default()).0);
+        let platform = Platform::of(&request.needs);
+        // A row with no parcel has the empty subject, which has no estimator key: it names
+        // no profile and cannot overwrite the entry of a real action.
+        self.note_action(&key, &platform, &usage);
         self.machine.insert(
             waiter,
             Waiter {
@@ -621,7 +643,7 @@ impl Adapter for KbfAdapter {
                 kind: request.kind,
                 do_not_cache: request.do_not_cache,
                 queued: now,
-                platform: Platform::of(&request.needs),
+                platform,
                 usage,
             },
         );
@@ -654,7 +676,7 @@ impl Adapter for KbfAdapter {
     fn followed(&mut self, operation: OperationId, ended: &[u8]) {
         // The callers were shown this row just before (`show_callers`), which logged and
         // counted it if it cannot be read; the recording ends as they were told.
-        self.record_followed(operation, &ended_as(ended));
+        self.recording.followed(operation, &ended_as(ended));
     }
 
     fn watched(&mut self) -> Vec<OperationId> {

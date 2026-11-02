@@ -68,6 +68,27 @@ pub enum TokenFileError {
     Content { path: PathBuf },
 }
 
+impl TokenFileError {
+    /// What is wrong with the file, without its path (the caller names the flag and the path)
+    /// and without a byte of its content.
+    pub(crate) fn reason(&self) -> String {
+        match self {
+            Self::Read { source, .. }
+                if source.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()) =>
+            {
+                "is a symbolic link".to_owned()
+            }
+            Self::Read { source, .. } => source.to_string(),
+            Self::NotAFile { .. } => "not a regular file".to_owned(),
+            Self::Owner { owner, server, .. } => {
+                format!("owned by uid {owner}, not by this server's uid {server}")
+            }
+            Self::Mode { mode, .. } => format!("mode {mode:04o}: it must be 0600 or 0400"),
+            Self::Content { .. } => "its content is not usable".to_owned(),
+        }
+    }
+}
+
 impl ApiToken {
     /// The token in the file at `path`: its content without leading or trailing
     /// whitespace (a trailing newline is usual).
@@ -147,6 +168,30 @@ fn bearer_digest(authorization: &[u8]) -> Option<[u8; 32]> {
 /// mode.
 #[cfg(unix)]
 pub(crate) fn read_owner_only(path: &Path, limit: usize) -> Result<Vec<u8>, TokenFileError> {
+    read_owner_only_with(path, limit, rustix::fs::OFlags::empty())
+}
+
+/// [`read_owner_only`] for a file that must not be a symbolic link: the file is opened with
+/// `O_NOFOLLOW`, so a link is refused at the open (as [`TokenFileError::Read`]) and what is
+/// checked is what is read.
+///
+/// # Errors
+/// As [`read_owner_only`], and the path is a symbolic link.
+#[cfg(unix)]
+pub(crate) fn read_owner_only_nofollow(
+    path: &Path,
+    limit: usize,
+) -> Result<Vec<u8>, TokenFileError> {
+    read_owner_only_with(path, limit, rustix::fs::OFlags::NOFOLLOW)
+}
+
+/// [`read_owner_only`] with `extra` open flags besides the non-blocking one.
+#[cfg(unix)]
+fn read_owner_only_with(
+    path: &Path,
+    limit: usize,
+    extra: rustix::fs::OFlags,
+) -> Result<Vec<u8>, TokenFileError> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
     let read = |source| TokenFileError::Read {
@@ -154,10 +199,10 @@ pub(crate) fn read_owner_only(path: &Path, limit: usize) -> Result<Vec<u8>, Toke
         source,
     };
     // Non-blocking: opening a FIFO for reading would otherwise wait for a writer.
-    let nonblocking = rustix::fs::OFlags::NONBLOCK.bits().cast_signed();
+    let flags = (rustix::fs::OFlags::NONBLOCK | extra).bits().cast_signed();
     let file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(nonblocking)
+        .custom_flags(flags)
         .open(path)
         .map_err(read)?;
     let meta = file.metadata().map_err(read)?;

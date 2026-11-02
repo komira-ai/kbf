@@ -249,23 +249,22 @@ impl Gates {
         gates
     }
 
-    /// Waits, at most 30 seconds, until the background thread finished its start-up
-    /// (the snapshot and the drain to the budget) and stands at [`Point::PassStarts`]:
-    /// from then on it does nothing until the cache is stopped. Only on [`Gates::new`].
-    /// A test that changes what the budget leaves the entries calls this first, or the
-    /// start-up drain may run beside its own `evict` and take half of the evictions.
+    /// Waits until the background thread finished its start-up (the snapshot and the
+    /// drain to the budget) and stands at [`Point::PassStarts`]: from then on it does
+    /// nothing until the cache is stopped. Only on [`Gates::new`]. A test that changes
+    /// what the budget leaves the entries, or counts evictions, calls this first (or
+    /// opens with [`open_started`]), or the start-up drain may run beside its own
+    /// `evict` and take half of the evictions. These waits (this one,
+    /// [`Gates::wait_reached`] and the hold in `Hooks::at`) have no bound of their own:
+    /// under a plain `cargo test`, without nextest, a failing test that leaves a hold
+    /// held hangs. The bound is the nextest override for the cache binary in
+    /// `.config/nextest.toml`.
     pub fn wait_started(&self) {
         let state = lock(&self.state);
-        let (state, timeout) = self
-            .changed
-            .wait_timeout_while(state, Duration::from_secs(30), |s| {
-                !s.reached.iter().any(|p| p == "PassStarts")
-            })
-            .unwrap_or_else(PoisonError::into_inner);
-        assert!(
-            !timeout.timed_out(),
-            "the background thread never started; points: {:?}",
-            state.reached
+        drop(
+            self.changed
+                .wait_while(state, |s| !s.reached.iter().any(|p| p == "PassStarts"))
+                .unwrap_or_else(PoisonError::into_inner),
         );
     }
 
@@ -285,17 +284,14 @@ impl Gates {
         HoldId(state.holds.len() - 1)
     }
 
-    /// Waits, at most 30 seconds, until the work reached the hold.
+    /// Waits until the work reached the hold. No bound of its own: see
+    /// [`Gates::wait_started`] (the nextest override is the bound).
     pub fn wait_reached(&self, id: HoldId) {
         let state = lock(&self.state);
-        let (state, timeout) = self
-            .changed
-            .wait_timeout_while(state, Duration::from_secs(30), |s| !s.holds[id.0].reached)
-            .unwrap_or_else(PoisonError::into_inner);
-        assert!(
-            !timeout.timed_out(),
-            "hold {id:?} not reached; points: {:?}",
-            state.reached
+        drop(
+            self.changed
+                .wait_while(state, |s| !s.holds[id.0].reached)
+                .unwrap_or_else(PoisonError::into_inner),
         );
     }
 
@@ -328,13 +324,23 @@ impl Hooks for Gates {
         };
         state.holds[at].reached = true;
         self.changed.notify_all();
-        // At most a minute: a test that failed with a hold still held must not hang
-        // (its runtime waits for the blocking thread the hold is on).
+        // No bound of its own: a test that failed with a hold still held waits here
+        // until the nextest override ends it (under plain `cargo test` it hangs).
         let _held = self
             .changed
-            .wait_timeout_while(state, Duration::from_secs(60), |s| !s.holds[at].released)
+            .wait_while(state, |s| !s.holds[at].released)
             .unwrap_or_else(PoisonError::into_inner);
     }
+}
+
+/// Opens the cache and returns once its background thread has finished the start-up
+/// drain and stands at [`Point::PassStarts`] ([`Gates::wait_started`]), so the test's own
+/// leases, `evict` calls and counts are the only evictions. `gates` are the ones in
+/// `config`, made by [`Gates::new`].
+pub fn open_started(config: CacheConfig, gates: &Gates) -> Arc<Cache> {
+    let cache = Cache::open(config).expect("open");
+    gates.wait_started();
+    cache
 }
 
 /// A test's cache configuration: the cache in `dir/cache`, leases under `dir/leases`,

@@ -12,6 +12,7 @@
 //! A reason is a code from a closed set ([`Code`]), never text taken from the request or from
 //! a child process; the detail goes to the log, cleaned.
 
+use kbf_retain::Kept;
 use serde::Serialize;
 
 use crate::outcome::MAX_DETAIL_LEN;
@@ -154,6 +155,14 @@ pub struct QueryView {
     pub last: Option<LastView>,
     /// An install, a switch or a restart holds the install lock.
     pub busy: bool,
+    /// The releases the host holds, newest first, each with its commit and version: at most
+    /// [`super::core::MAX_LISTED`], the ones that must stay first.
+    pub releases: Vec<Kept>,
+    /// How many releases the host holds past the ones listed; 0 when it lists them all.
+    pub releases_omitted: usize,
+    /// The releases could not be listed (the file that names what must stay, or `releases/`,
+    /// cannot be read): `releases` is empty for that, not because the host holds none.
+    pub releases_unavailable: bool,
 }
 
 /// What a request did.
@@ -221,6 +230,12 @@ struct Queried<'a> {
     pending: Option<&'a PendingView>,
     last: Option<&'a LastView>,
     busy: bool,
+    #[serde(skip_serializing_if = "<[Kept]>::is_empty")]
+    releases: &'a [Kept],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    releases_omitted: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    releases_unavailable: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -269,6 +284,9 @@ impl Answer {
                 pending: view.pending.as_ref(),
                 last: view.last.as_ref(),
                 busy: view.busy,
+                releases: &view.releases,
+                releases_omitted: (view.releases_omitted > 0).then_some(view.releases_omitted),
+                releases_unavailable: view.releases_unavailable.then_some(true),
             }),
             Self::Refused(code, _) => to_json(&Reason {
                 result: "refused",

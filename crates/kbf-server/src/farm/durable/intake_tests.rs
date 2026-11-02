@@ -361,6 +361,74 @@ async fn a_queued_operation_granted_since_the_poll_read_the_queue_is_not_taken_i
     assert_eq!(rows(&store, "lease/"), 1);
 }
 
+/// Asserts that a daemon whose `Hello` reaches a frontend before the frontend's next poll
+/// still has its lease taken up there, when the frontend took the operation in while it was
+/// queued and another frontend has granted it since: the lease stands in the store for the
+/// node, the new owner holds it, and the daemon's result is accepted and answers the caller
+/// waiting on this frontend, once. (The frontend that granted the lease is not told it is
+/// gone, so its own caller is not asserted.)
+#[tokio::test(start_paused = true)]
+async fn a_hello_before_the_poll_takes_up_the_lease_of_an_operation_held_queued() {
+    let store = Racing::new();
+    let (a, b) = (farm_over(&store), farm_over(&store));
+    let node = WorkerId::new("node-a");
+    let _ticket = caller(&a, 1);
+    b.intake();
+    assert_eq!(unfinished(&b).len(), 1, "the operation was not taken in");
+    let on_b = caller(&b, 1);
+    let _first = register(&a, "node-a");
+    a.tick().await;
+    let views = a.lease_views(None);
+    let [view] = &views.leases[..] else {
+        panic!("one lease expected");
+    };
+    let lease = view.lease;
+
+    let _second = register(&b, "node-a");
+    let ack = b.report(&node, invalid(lease)).await;
+
+    assert!(ack.is_some_and(|ack| ack.accepted), "{ack:?}");
+    assert_eq!(rows(&store, "done/"), 1);
+    b.intake();
+    assert_eq!(done_with(&on_b), "test");
+    b.intake();
+    assert_eq!(done_with(&on_b), "test", "answered again");
+    assert_eq!(rows(&store, "done/"), 1);
+}
+
+/// Asserts that a daemon's `Hello` to a frontend that gave the node's lease up, whose requeue
+/// the store has not taken, keeps the operation on this frontend with its callers, not handed
+/// off to be followed in the store: the lease row still names the node, but the operation is
+/// this frontend's own, requeued. (The node, which has room, is then placed the operation as
+/// any registered node is.)
+#[tokio::test(start_paused = true)]
+async fn a_hello_does_not_take_up_the_lease_of_an_operation_whose_requeue_is_unsettled() {
+    let store = Racing::new();
+    let farm = farm_over(&store);
+    let _first = register(&farm, "node-a");
+    let ticket = caller(&farm, 1);
+    assert_eq!((rows(&store, "lease/"), rows(&store, "queue/")), (1, 0));
+    store.set_down(true);
+    tokio::time::advance(kbf_sched::fence::LEASE_GRACE + Duration::from_secs(1)).await;
+    farm.tick().await;
+    store.set_down(false);
+    assert_eq!(farm.queued_operations(), 1, "the lease was not given up");
+
+    let _second = register(&farm, "node-a");
+
+    assert_eq!(
+        farm.lock().intake.following(),
+        0,
+        "the callers were handed off"
+    );
+    assert_eq!(unfinished(&farm).len(), 1);
+    assert_eq!(rows(&store, "done/"), 0);
+    assert!(
+        !matches!(*ticket.stage.borrow(), Stage::Done(_)),
+        "the caller was answered from a handoff"
+    );
+}
+
 /// Asserts that a result the store refuses as stale (the lease row is gone) does not leave
 /// its callers waiting on this frontend: they are answered with the result another frontend
 /// recorded.

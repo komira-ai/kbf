@@ -116,7 +116,7 @@ impl KbfAdapter {
                 Some(killed) => run_record::killed(run, killed),
                 None => run,
             };
-            self.record_ran(operation, lease, run);
+            self.recording.ran(operation, lease, run);
         }
         if outcome == Outcome::Failed(Failure::NodeMemoryPressure) {
             memory::pressure(worker, view.sched().memory_pressure(worker));

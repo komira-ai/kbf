@@ -85,6 +85,9 @@ pub(super) struct AuditRow {
     pub outcome: i32,
     #[prost(uint64, tag = "5")]
     pub generation: u64,
+    /// What the action changed, when its subject does not say (a repoint); empty if not.
+    #[prost(string, tag = "6")]
+    pub detail: String,
 }
 
 pub(super) fn action_code(action: AuditAction) -> i32 {
@@ -93,6 +96,8 @@ pub(super) fn action_code(action: AuditAction) -> i32 {
         AuditAction::DeleteConnection => 2,
         AuditAction::PutBinding => 3,
         AuditAction::DeleteBinding => 4,
+        AuditAction::Repoint => 5,
+        AuditAction::Unknown(code) => i32::try_from(code).unwrap_or(i32::MAX),
     }
 }
 
@@ -102,7 +107,11 @@ pub(super) fn action_of(code: i32) -> Result<AuditAction, RegistryError> {
         2 => AuditAction::DeleteConnection,
         3 => AuditAction::PutBinding,
         4 => AuditAction::DeleteBinding,
-        _ => return Err(RegistryError::Corrupt("audit")),
+        5 => AuditAction::Repoint,
+        // A code a newer build wrote: listed, never refused. A negative one is no code.
+        other => {
+            AuditAction::Unknown(u32::try_from(other).map_err(|_| RegistryError::Corrupt("audit"))?)
+        }
     })
 }
 

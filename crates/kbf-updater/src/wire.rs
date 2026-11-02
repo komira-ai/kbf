@@ -12,15 +12,25 @@
 //! validated string, never a URL or a path: the updater resolves the release itself and
 //! checks its attestation.
 
+use std::collections::BTreeMap;
+
 use kbf_types::ReleasePlatform;
 use serde::{Deserialize, Serialize};
 
 use crate::version::Version;
+pub use crate::wire_report::{
+    Answer, Class, CommitState, DeferredReport, MAX_FEATURES, MAX_STEP_NAME, MAX_STEP_SECS,
+    MAX_TOKEN, Phase, StepName, StepRun, Token,
+};
+use crate::wire_report::{features_text, is_false, lenient, or_default, step_secs_text};
 
 /// The path an updater posts its heartbeat to.
 pub const HEARTBEAT_PATH: &str = "/v1/heartbeat";
 
 /// The most bytes of a heartbeat the coordinator reads.
+///
+/// A beat with every optional fact at its bounds, for `kbf` and sixteen services, can exceed
+/// it (`wire_size_tests`); the agent trims optional facts first to keep a beat under it.
 pub const MAX_HEARTBEAT_BYTES: usize = 16 * 1024;
 
 /// Whether the host serves what it should.
@@ -31,6 +41,10 @@ pub enum Health {
     Healthy,
     /// It does not, or the updater cannot tell.
     Unhealthy,
+    /// The service is declared on the host and has never registered. An agent sends it only
+    /// to a coordinator that advertised `heartbeat-v2`: an older coordinator refuses the
+    /// heartbeat.
+    Absent,
 }
 
 /// How an update ended on the host.
@@ -50,6 +64,41 @@ pub struct UpdateResult {
     pub target: Version,
     /// How it ended.
     pub outcome: Outcome,
+    /// Where a failure happened. A value this reader does not know reads as `None`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient"
+    )]
+    pub phase: Option<Phase>,
+    /// Whom a failure is blamed on. A value this reader does not know reads as `None`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient"
+    )]
+    pub class: Option<Class>,
+    /// The check or cause of a failure, as a token. A value that is no token reads as `None`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient"
+    )]
+    pub reason: Option<Token>,
+}
+
+impl UpdateResult {
+    /// A result with no phase, class or reason: what an updater without them reports.
+    #[must_use]
+    pub fn new(target: Version, outcome: Outcome) -> Self {
+        Self {
+            target,
+            outcome,
+            phase: None,
+            class: None,
+            reason: None,
+        }
+    }
 }
 
 /// One heartbeat.
@@ -81,6 +130,39 @@ pub struct Heartbeat {
         deserialize_with = "services_text"
     )]
     pub services: Option<Vec<ServiceBeat>>,
+    /// What this updater can use of the coordinator's side, by feature name: at most
+    /// [`MAX_FEATURES`], each a lowercase name of letters, digits and `-`, none twice. Absent
+    /// from an updater that announces nothing; the coordinator then sends no `features`.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "features_text"
+    )]
+    pub agent_features: Vec<String>,
+    /// The step the update running now is in, and the try.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step: Option<StepRun>,
+    /// Whether the update running now is past the hook's commit point.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<CommitState>,
+    /// How many seconds each step of the last update took, by step name; at most
+    /// [`MAX_STEP_SECS`] steps.
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "step_secs_text"
+    )]
+    pub step_secs: BTreeMap<StepName, u64>,
+    /// Serving, but not yet fully its own: the coordinator holds the host's slot.
+    #[serde(
+        default,
+        skip_serializing_if = "is_false",
+        deserialize_with = "or_default"
+    )]
+    pub promotion_pending: bool,
+    /// An update the host declined for a reason about its moment, not the release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred: Option<DeferredReport>,
 }
 
 /// What a host says of one service besides `kbf`: the same four facts as the top level.
@@ -98,6 +180,30 @@ pub struct ServiceBeat {
     /// The target of the update of it running now.
     #[serde(default)]
     pub updating: Option<Version>,
+    /// The step the update running now is in, and the try.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step: Option<StepRun>,
+    /// Whether the update running now is past the hook's commit point.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<CommitState>,
+    /// How many seconds each step of the last update took, by step name; at most
+    /// [`MAX_STEP_SECS`] steps.
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "step_secs_text"
+    )]
+    pub step_secs: BTreeMap<StepName, u64>,
+    /// Serving, but not yet fully its own: the coordinator holds the host's slot.
+    #[serde(
+        default,
+        skip_serializing_if = "is_false",
+        deserialize_with = "or_default"
+    )]
+    pub promotion_pending: bool,
+    /// An update the host declined for a reason about its moment, not the release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred: Option<DeferredReport>,
 }
 
 impl ServiceBeat {
@@ -111,6 +217,12 @@ impl ServiceBeat {
             last_update: self.last_update.clone(),
             updating: self.updating.clone(),
             services: None,
+            agent_features: Vec::new(),
+            step: self.step.clone(),
+            commit: self.commit,
+            step_secs: self.step_secs.clone(),
+            promotion_pending: self.promotion_pending,
+            deferred: self.deferred.clone(),
         }
     }
 }
@@ -166,39 +278,55 @@ fn services_text<'de, D: serde::Deserializer<'de>>(
 /// A heartbeat as the coordinator reads it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HeartbeatRead {
-    /// The heartbeat. When its `services` list was dropped, `services` is `None`.
+    /// The heartbeat. A field that was dropped is `None` (or empty, for a list).
     pub beat: Heartbeat,
     /// Why the `services` list was dropped, if it was.
     pub services_dropped: Option<String>,
+    /// Why one of the optional facts (`agent_features`, `step`, `commit`, `step_secs`,
+    /// `promotion_pending`, `deferred`) was dropped, if one was.
+    pub extras_dropped: Option<String>,
+    /// The names of the facts `extras_dropped` is about, sorted, each once: `step`, `commit`,
+    /// `step_secs`, `promotion_pending`, `deferred` or `agent_features`, whether the bad one
+    /// was at the top level or in a service entry.
+    pub extras_dropped_facts: Vec<&'static str>,
 }
 
-/// Reads a heartbeat, keeping a host whose `services` list is bad.
+/// Reads a heartbeat, keeping a host whose `services` list, or one of its optional facts, is
+/// bad.
 ///
 /// A bad list (see [`Heartbeat::services`]) is dropped and the rest is read, so the host is
-/// answered as a `kbf`-only host and its `kbf` updates go on. Anything else that is wrong
-/// with the heartbeat is an error, as for [`Heartbeat`].
+/// answered as a `kbf`-only host and its `kbf` updates go on. A bad optional fact is dropped
+/// the same way, on its own: a host never loses its `kbf` updates to a field the coordinator
+/// could do without. Anything else that is wrong with the heartbeat is an error, as for
+/// [`Heartbeat`].
 ///
 /// # Errors
-/// The strict read's error: the bytes are no heartbeat, with or without their `services`.
+/// The strict read's error: the bytes are no heartbeat, with or without the dropped fields.
 pub fn read_heartbeat(bytes: &[u8]) -> Result<HeartbeatRead, serde_json::Error> {
     match serde_json::from_slice::<Heartbeat>(bytes) {
         Ok(beat) => Ok(HeartbeatRead {
             beat,
             services_dropped: None,
+            extras_dropped: None,
+            extras_dropped_facts: Vec::new(),
         }),
-        Err(why) => without_services(bytes)
-            .map(|beat| HeartbeatRead {
-                beat,
-                services_dropped: Some(why.to_string()),
-            })
-            .ok_or(why),
+        Err(why) => {
+            let Some(read) = without_droppable(bytes) else {
+                return Err(why);
+            };
+            if read.services_dropped.is_none() && read.extras_dropped.is_none() {
+                // Nothing the loose read dropped explains the refusal.
+                return Err(why);
+            }
+            Ok(read)
+        }
     }
 }
 
-/// A [`Heartbeat`] whose `services` value is not read: it reads every other field as
+/// A [`Heartbeat`] whose droppable values are not read yet: it reads every other field as
 /// [`Heartbeat`] does, duplicate keys included.
 #[derive(Deserialize)]
-struct HeartbeatWithoutServices {
+struct HeartbeatLoose {
     #[serde(with = "platform_text")]
     platform: ReleasePlatform,
     version: Version,
@@ -208,21 +336,118 @@ struct HeartbeatWithoutServices {
     #[serde(default)]
     updating: Option<Version>,
     #[serde(default)]
-    #[allow(dead_code)]
-    services: Option<serde::de::IgnoredAny>,
+    services: Option<serde_json::Value>,
+    #[serde(default)]
+    agent_features: Option<serde_json::Value>,
+    #[serde(default)]
+    step: Option<serde_json::Value>,
+    #[serde(default)]
+    commit: Option<serde_json::Value>,
+    #[serde(default)]
+    step_secs: Option<serde_json::Value>,
+    #[serde(default)]
+    promotion_pending: Option<serde_json::Value>,
+    #[serde(default)]
+    deferred: Option<serde_json::Value>,
 }
 
-/// The heartbeat in `bytes` with its `services` value ignored, if what is left is a
+/// One droppable value read as `T`: its default, and the reason, when it is bad.
+fn loose<T: Default + serde::de::DeserializeOwned>(
+    name: &'static str,
+    value: Option<serde_json::Value>,
+    why: &mut Vec<(&'static str, String)>,
+) -> T {
+    let Some(value) = value else {
+        return T::default();
+    };
+    serde_json::from_value(value).unwrap_or_else(|e| {
+        why.push((name, format!("{name}: {e}")));
+        T::default()
+    })
+}
+
+/// Removes from each entry of the `services` list in `value` every new fact that does not
+/// read, and records it in `why` as `services[<name>].<fact>: <error>`. The structural rules
+/// of the list (names, duplicates, `kbf`, the count) are left to [`services_text`], so a bad
+/// fact costs that fact and never the host's services.
+fn scrub_service_facts(value: &mut serde_json::Value, why: &mut Vec<(&'static str, String)>) {
+    let Some(entries) = value.as_array_mut() else {
+        return;
+    };
+    for entry in entries {
+        let name = entry
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let Some(object) = entry.as_object_mut() else {
+            continue;
+        };
+        for fact in [
+            "step",
+            "commit",
+            "step_secs",
+            "promotion_pending",
+            "deferred",
+        ] {
+            let Some(fact_value) = object.get(fact).cloned() else {
+                continue;
+            };
+            let read = match fact {
+                "step" => serde_json::from_value::<Option<StepRun>>(fact_value).err(),
+                "commit" => serde_json::from_value::<Option<CommitState>>(fact_value).err(),
+                "step_secs" => step_secs_text(fact_value).err(),
+                "promotion_pending" => or_default::<_, bool>(fact_value).err(),
+                _ => serde_json::from_value::<Option<DeferredReport>>(fact_value).err(),
+            };
+            if let Some(error) = read {
+                object.remove(fact);
+                why.push((fact, format!("services[{name}].{fact}: {error}")));
+            }
+        }
+    }
+}
+
+/// The heartbeat in `bytes` with each bad droppable value dropped, if what is left is a
 /// heartbeat.
-fn without_services(bytes: &[u8]) -> Option<Heartbeat> {
-    let rest: HeartbeatWithoutServices = serde_json::from_slice(bytes).ok()?;
-    Some(Heartbeat {
+fn without_droppable(bytes: &[u8]) -> Option<HeartbeatRead> {
+    let rest: HeartbeatLoose = serde_json::from_slice(bytes).ok()?;
+    let mut extras = Vec::new();
+    let mut services_why = Vec::new();
+    let services = rest.services.and_then(|mut value| {
+        scrub_service_facts(&mut value, &mut extras);
+        services_text(value)
+            .map_err(|e| services_why.push(e.to_string()))
+            .ok()
+            .flatten()
+    });
+    let beat = Heartbeat {
         platform: rest.platform,
         version: rest.version,
         health: rest.health,
         last_update: rest.last_update,
         updating: rest.updating,
-        services: None,
+        services,
+        agent_features: features_text(rest.agent_features.unwrap_or_default())
+            .map_err(|e| extras.push(("agent_features", format!("agent_features: {e}"))))
+            .unwrap_or_default(),
+        step: loose("step", rest.step, &mut extras),
+        commit: loose("commit", rest.commit, &mut extras),
+        step_secs: step_secs_text(rest.step_secs.unwrap_or_default())
+            .map_err(|e| extras.push(("step_secs", format!("step_secs: {e}"))))
+            .unwrap_or_default(),
+        promotion_pending: loose("promotion_pending", rest.promotion_pending, &mut extras),
+        deferred: loose("deferred", rest.deferred, &mut extras),
+    };
+    let mut facts: Vec<&'static str> = extras.iter().map(|(fact, _)| *fact).collect();
+    facts.sort_unstable();
+    facts.dedup();
+    let why: Vec<&str> = extras.iter().map(|(_, why)| why.as_str()).collect();
+    Some(HeartbeatRead {
+        beat,
+        services_dropped: (!services_why.is_empty()).then(|| services_why.join("; ")),
+        extras_dropped: (!why.is_empty()).then(|| why.join("; ")),
+        extras_dropped_facts: facts,
     })
 }
 
@@ -302,20 +527,31 @@ struct RawServiceReply {
     version: Option<Version>,
 }
 
-impl TryFrom<RawServiceReply> for ServiceReply {
-    type Error = &'static str;
-
-    fn try_from(raw: RawServiceReply) -> Result<Self, Self::Error> {
-        if raw.service.as_deref().is_some_and(|s| !is_service_name(s)) {
+impl ServiceReply {
+    /// The reply the three fields of a service reply say, if they say one.
+    pub(crate) fn from_parts(
+        reply: String,
+        service: Option<String>,
+        version: Option<Version>,
+    ) -> Result<Self, &'static str> {
+        if service.as_deref().is_some_and(|s| !is_service_name(s)) {
             return Err("not a service name");
         }
-        match (raw.reply.as_str(), raw.service, raw.version) {
+        match (reply.as_str(), service, version) {
             ("nothing", None, None) => Ok(Self::Nothing),
             ("update", service, Some(version)) => Ok(Self::Update { service, version }),
             ("nothing", _, _) => Err("a reply of nothing carries no service or version"),
             ("update", _, None) => Err("an update reply carries a version"),
             _ => Err("not a reply: nothing or update"),
         }
+    }
+}
+
+impl TryFrom<RawServiceReply> for ServiceReply {
+    type Error = &'static str;
+
+    fn try_from(raw: RawServiceReply) -> Result<Self, Self::Error> {
+        Self::from_parts(raw.reply, raw.service, raw.version)
     }
 }
 

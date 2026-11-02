@@ -4,7 +4,7 @@
 #![allow(dead_code)]
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -62,6 +62,8 @@ pub struct Source {
     held: (Mutex<bool>, Condvar),
     /// The registration is gone from the snapshots, though the generation still names it.
     taken_back: AtomicBool,
+    /// How many snapshots have been asked for.
+    asked: AtomicU64,
 }
 
 impl Source {
@@ -73,7 +75,13 @@ impl Source {
             custom: Mutex::new(None),
             held: (Mutex::new(false), Condvar::new()),
             taken_back: AtomicBool::new(false),
+            asked: AtomicU64::new(0),
         })
+    }
+
+    /// How many times a node has asked for the registration.
+    pub fn asked(&self) -> u64 {
+        self.asked.load(Ordering::SeqCst)
     }
 
     /// Serves `config` (its `secret_version` and generation follow the source's) from now on.
@@ -131,6 +139,7 @@ impl StoreConfigSource for Source {
     }
 
     fn snapshot(&self) -> Result<Snapshot, SourceError> {
+        self.asked.fetch_add(1, Ordering::SeqCst);
         let mut held = self.held.0.lock().unwrap_or_else(PoisonError::into_inner);
         while *held {
             held = self

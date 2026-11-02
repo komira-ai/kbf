@@ -66,6 +66,7 @@ fn listeners() -> Listeners {
         scheduler_core: kbf_server::SchedulerCore::under_test(),
         placement_load: kbf_server::PlacementLoad::Off,
         placement_predictions: kbf_server::PlacementPredictions::Off,
+        usage_profiles: kbf_server::UsageProfiles::Off,
         whole_node: None,
         finished_retention: kbf_sched::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),

@@ -251,12 +251,15 @@ fn expand_verbs(routes: Vec<Route>, verbs: &[String]) -> Vec<Route> {
         .collect()
 }
 
-/// The one `POST` of `/v1/object-stores/connections/{target}` is the probe `{name}:verify`: the
-/// router captures the whole segment and the handler splits the verb off, so the documents name
-/// it with the `:verify`.
+/// The one `POST` of `/v1/object-stores/connections/{target}` is the probe `{name}:verify` and
+/// the move `{name}:repoint`: the router captures the whole segment and the handler splits the
+/// verb off, so the documents name each with its verb.
 const VERIFY_ROUTE: &str = "/v1/object-stores/connections/{}";
 
-/// Renames the `POST` of `VERIFY_ROUTE` to `POST VERIFY_ROUTE:verify`.
+/// The verbs the handler of `VERIFY_ROUTE` splits off.
+const CONNECTION_VERBS: [&str; 2] = ["verify", "repoint"];
+
+/// Replaces the `POST` of `VERIFY_ROUTE` by one `POST VERIFY_ROUTE:verb` per verb.
 fn name_verify(routes: Vec<Route>) -> Vec<Route> {
     let post = ("POST".to_string(), VERIFY_ROUTE.to_string());
     assert!(
@@ -265,11 +268,13 @@ fn name_verify(routes: Vec<Route>) -> Vec<Route> {
     );
     routes
         .into_iter()
-        .map(|r| {
+        .flat_map(|r| {
             if r == post {
-                ("POST".to_string(), format!("{VERIFY_ROUTE}:verify"))
+                CONNECTION_VERBS
+                    .map(|verb| ("POST".to_string(), format!("{VERIFY_ROUTE}:{verb}")))
+                    .to_vec()
             } else {
-                r
+                vec![r]
             }
         })
         .collect()
@@ -299,7 +304,7 @@ fn name_adopt(routes: Vec<Route>) -> Vec<Route> {
 }
 
 /// The exact number of `(method, path)` routes, verbs expanded. A new route moves it.
-const ROUTES: usize = 56;
+const ROUTES: usize = 57;
 
 fn server_routes() -> Vec<Route> {
     let mut files = Vec::new();
@@ -473,6 +478,10 @@ fn the_probe_route_needs_its_verify_row() {
                 "POST".to_string(),
                 "/v1/object-stores/connections/{}:verify".to_string()
             ),
+            (
+                "POST".to_string(),
+                "/v1/object-stores/connections/{}:repoint".to_string()
+            ),
         ]
     );
     let doc = doc_routes(
@@ -480,10 +489,16 @@ fn the_probe_route_needs_its_verify_row() {
     );
     assert_eq!(
         missing(&code, &doc),
-        [(
-            "POST".to_string(),
-            "/v1/object-stores/connections/{}:verify".to_string()
-        )]
+        [
+            (
+                "POST".to_string(),
+                "/v1/object-stores/connections/{}:verify".to_string()
+            ),
+            (
+                "POST".to_string(),
+                "/v1/object-stores/connections/{}:repoint".to_string()
+            ),
+        ]
     );
 }
 

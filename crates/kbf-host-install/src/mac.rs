@@ -43,6 +43,7 @@ pub mod fetch;
 pub mod kit;
 pub mod layout;
 pub mod release;
+pub(crate) mod retain;
 pub mod stage;
 pub mod status;
 pub mod tools;

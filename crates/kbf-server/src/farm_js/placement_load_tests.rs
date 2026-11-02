@@ -30,7 +30,7 @@ const STALE_AFTER_MS: u64 = 15_000;
 const LIMIT_MILLIS: u32 = 4_400;
 const ONE_CORE: u32 = 1_000;
 
-fn at(millis: u64) -> FarmTime {
+pub(super) fn at(millis: u64) -> FarmTime {
     FarmTime::from_millis(millis)
 }
 
@@ -87,15 +87,15 @@ impl Dial {
 }
 
 /// A node of the rig, registered and heard from.
-struct Node {
-    name: &'static str,
-    wire: Wire,
+pub(super) struct Node {
+    pub(super) name: &'static str,
+    pub(super) wire: Wire,
     dial: Dial,
     beats: u64,
 }
 
 impl Node {
-    fn register(rig: &Rig, name: &'static str) -> Self {
+    pub(super) fn register(rig: &Rig, name: &'static str) -> Self {
         Self {
             name,
             wire: register(rig, name, 0),
@@ -122,7 +122,7 @@ impl Node {
 
     /// The two readings that give a window, the first at 1 s and the second at 6 s of farm
     /// time, in which `millis` millicores were busy.
-    async fn measured(&mut self, rig: &Rig, millis: u32, limited: bool) {
+    pub(super) async fn measured(&mut self, rig: &Rig, millis: u32, limited: bool) {
         let baseline = self.dial.read(0, limited);
         self.beat(rig, 1_000, Some(baseline)).await;
         let window = self.dial.read(millis, limited);
@@ -130,12 +130,12 @@ impl Node {
     }
 
     /// Whether the core told the node to start an action since the last call.
-    fn was_started(&mut self) -> bool {
+    pub(super) fn was_started(&mut self) -> bool {
         started(&self.wire.sent()).is_some()
     }
 }
 
-fn counters(rig: &Rig) -> LoadCounters {
+pub(super) fn counters(rig: &Rig) -> LoadCounters {
     rig.core.with(|view, _| view.sched().load_counters())
 }
 
@@ -330,7 +330,7 @@ fn the_default_under_js_is_off_whatever_the_library_defaults_to() {
     let settings = Settings::default();
     assert_eq!(settings.placement_load, PlacementLoad::Off);
     let config = |settings: &Settings| {
-        open::farm_config(7, Duration::ZERO, Duration::ZERO, settings)
+        open::farm_config(7, Duration::ZERO, Duration::ZERO, settings, None)
             .load
             .expect("the placement mode is given explicitly")
     };

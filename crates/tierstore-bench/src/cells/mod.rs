@@ -15,10 +15,9 @@
 //!   timed, logged and held to the rate cap.
 //! - Pass 0 of each arm is a warm-up: it is run, reported with `discarded: true`, and left out of
 //!   every figure. Arms are interleaved across passes and the order is recorded in `notes`.
-//! - The cell reads a [`crate::gate::LoadSample`] before each pass and every few completions in
-//!   it, and checks it against `ctx.config.gate`; a trip ends the pass (`gate_tripped`), marks its
-//!   samples `Window::Busy` whatever the run's window, and ends the run. The cell `c` reads it
-//!   before a burst only.
+//! - The cell reads a [`crate::gate::LoadSample`] before each pass, over a quiet window, and
+//!   checks it against `ctx.config.gate`; a trip ends the run (`gate_tripped` on the empty pass).
+//!   Inside a pass the load is recorded (`pass_load`) and not judged.
 //! - Bytes written to the cold store are counted against `ctx.config.bytes`; a cell is refused
 //!   before it sends anything when its cost is more than what is left, and a request-rate cap
 //!   (`ctx.config.rates`) holds whatever a cell asks for.
@@ -46,13 +45,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::cells::budget::Campaign;
 use crate::cells::engine::{FaultSwitch, ProcLoad};
-use crate::coldstate::ColdStateSource;
+use crate::coldstate::{ColdMeter, ColdStateSource};
 use crate::config::RunConfig;
 use crate::error::BenchError;
 use crate::requestlog::RequestLog;
 use crate::result::{CellResult, Provenance};
 
 pub mod a1;
+pub mod armfilter;
 pub mod b;
 pub mod budget;
 pub mod c;
@@ -63,6 +63,10 @@ pub mod content;
 pub mod engine;
 #[cfg(test)]
 mod engine_gaps_tests;
+#[cfg(test)]
+mod engine_record_tests;
+#[cfg(test)]
+mod engine_window_tests;
 pub mod fileserver;
 pub mod g;
 pub mod modes;
@@ -139,6 +143,14 @@ pub struct CellContext {
     pub campaign: Campaign,
     /// Where the cold store's state is read from, before every pass.
     pub cold_state: Arc<dyn ColdStateSource>,
+    /// Where the cold store guard reads the store's request counter and state at the ends of
+    /// every pass, to judge the requests that came from elsewhere and the drives. `None` for a
+    /// run without the cold admin key (and for the tests that do not need it): the guard then
+    /// keeps to the bench's own requests.
+    pub cold_meter: Option<Arc<dyn ColdMeter>>,
+    /// The roles whose requests the cold store's request counter counts (see
+    /// [`crate::coldserver`]): their requests are the harness's own count.
+    pub cold_server: crate::coldserver::ColdServer,
 }
 
 /// What the `run` verb asks of a cell; a cell reads the parts it has.
@@ -153,6 +165,9 @@ pub struct CellPlan {
     /// Whether the put cells add their open-loop arms (`run --open-loop`). The other cells have
     /// none and ignore it.
     pub open_loop: bool,
+    /// At most this many objects per pass of the multipart arms of `cold-put` (`run
+    /// --multipart-objects`), a cap on the plan's count; `None` keeps the plan's. The other arms and cells ignore it.
+    pub multipart_objects: Option<u64>,
 }
 
 /// Runs one cell.
@@ -179,7 +194,7 @@ pub async fn run_with_faults(
     plan: &CellPlan,
     faults: Option<Arc<dyn FaultSwitch>>,
 ) -> Result<Vec<CellResult>, BenchError> {
-    let load = || Arc::new(ProcLoad);
+    let load = || Arc::new(ProcLoad::new());
     match id {
         CellId::ColdPut => cold_put::run_with(ctx, plan, load(), faults, None).await,
         CellId::ColdRead => cold_read::run_with(ctx, plan, load(), faults, None).await,
@@ -235,6 +250,7 @@ mod tests {
             in_flight: vec![1],
             object_bytes: vec![],
             open_loop: true,
+            multipart_objects: None,
         };
         let bare = testkit::ctx(dir.path(), &[], Window::Busy);
         for (id, name) in [

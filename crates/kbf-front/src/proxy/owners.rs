@@ -17,7 +17,7 @@ use std::sync::{Arc, RwLock};
 
 use bytes::Bytes;
 use kbf_proto::reapi::ActionResult;
-use kbf_route::{Hold, Waiting};
+use kbf_route::{Hold, Router, Waiting};
 use kbf_storage::Storage as _;
 use kbf_storage::service::RemoteStorage;
 use kbf_types::Digest;
@@ -140,6 +140,13 @@ impl Owners {
             .nodes
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = nodes.into();
+    }
+
+    /// The router over the map, if there is one to fetch a newer one of: the retry rule of
+    /// a call that dials the nodes itself is [`Router::newer_map`]. The placement
+    /// ([`Owners::writer`]) is the newer map's once it has returned.
+    pub(super) fn map_router(&self) -> Option<&Router> {
+        self.routed.as_deref().map(Routed::router)
     }
 
     /// The router, when there is a map with two members or more to route by.

@@ -26,5 +26,6 @@ mod untrusted;
 mod untrusted_mint;
 mod untrusted_multi;
 mod untrusted_task;
+mod untrusted_timing;
 mod untrusted_verifying;
 mod untrusted_writethrough;

@@ -34,12 +34,16 @@ use std::time::Duration;
 
 use kbf_host::exec::Exec;
 use kbf_host::path::Root;
+use kbf_host::plan::Mode;
 use kbf_host::step::Owner;
 use kbf_installer::activate::{self, Activated, Arm};
 use kbf_installer::attest::{GhCheck, Signer};
 use kbf_installer::helper::leases::LeaseSource;
+use kbf_installer::helper::service::{self, HostProcs, Procs};
 use kbf_installer::layout::{Layout, Platform};
 use kbf_installer::refusal::Refusal as InstallerRefusal;
+use kbf_installer::release;
+use kbf_installer::retain::{self, Kept};
 use kbf_installer::run::Runner as InstallerRunner;
 use kbf_installer::settings::Settings;
 use kbf_installer::stage::{
@@ -136,6 +140,8 @@ pub struct Linux<E: Exec> {
     /// file of its own: it is part of the names of the scratch and check directories, so that
     /// two helpers staging at once never remove each other's download.
     pub(crate) scratch_tag: Option<String>,
+    /// Which releases a process executes from, so a prune never removes one.
+    pub(crate) procs: Box<dyn Procs>,
 }
 
 pub(super) fn commit_id(commit: &str) -> Result<CommitId, Fault> {
@@ -585,6 +591,32 @@ impl<E: Exec> Backend for Linux<E> {
     fn revert(&self, _pending: &Pending) -> Result<(), Fault> {
         self.put_back()
     }
+
+    fn kept(&self) -> Result<Vec<Kept>, Fault> {
+        release::kept(&self.layout).map_err(state_fault)
+    }
+
+    fn retain_file(&self) -> Option<PathBuf> {
+        Some(retain::path(&self.layout))
+    }
+
+    /// The installer's own `gc`, which keeps what `retain.json` names and removes nothing while
+    /// a swap is on trial.
+    fn prune(&self, keep: usize) -> Result<String, Fault> {
+        let in_use = service::in_use(&*self.procs, &self.layout)
+            .map_err(|e| state_fault(format!("cannot tell which releases run: {e}")))?;
+        let mut out = Vec::new();
+        release::gc(
+            &mut *self.exec.borrow_mut(),
+            &self.layout,
+            keep,
+            &in_use,
+            Mode::Apply,
+            &mut out,
+        )
+        .map_err(state_fault)?;
+        Ok(String::from_utf8_lossy(&out).trim_end().replace('\n', "; "))
+    }
 }
 
 /// The host as it is: the real `exec` and runners, this program's own paths.
@@ -605,5 +637,6 @@ pub fn production(units: Vec<Unit>) -> Linux<kbf_host::HostExec> {
         tools: Tools::production(),
         owner: Owner { uid: 0, gid: 0 },
         scratch_tag: None,
+        procs: Box::new(HostProcs::new(Platform::current())),
     }
 }

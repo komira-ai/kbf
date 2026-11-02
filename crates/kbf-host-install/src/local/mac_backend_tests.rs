@@ -485,3 +485,6 @@ fn a_work_directory_that_is_not_one_and_an_absent_marker() {
     write(&fx.host.work, 0o644, b"a file, not a directory");
     assert_eq!(backend.pending().unwrap_err().code, Code::StateUnavailable);
 }
+
+#[path = "mac_backend_retain_tests.rs"]
+mod retain;

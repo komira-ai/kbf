@@ -1,11 +1,9 @@
 //! A limit for a role the service does not have is dropped (one body serves every service),
 //! and the drop is reported: a warning in the log and the role names in the answer.
 
-use std::sync::{Arc, Mutex};
-
 use crate::desired::Desired;
 use crate::services::{RoleDef, ServiceDef, Services};
-use crate::testutil::{Rig, ci_token};
+use crate::testutil::{Log, Rig, ci_token};
 
 fn services() -> Services {
     Services::default().with(ServiceDef::new("pool", &[("builder", RoleDef::plain())]))
@@ -17,35 +15,6 @@ const WITH_BUILDER: &str = r#"{"version":"1.0","max_updating":{"builder":3,"daem
 
 const WITHOUT_BUILDER: &str = r#"{"version":"1.0","max_updating":{"daemon":1},
     "min_up":{"storage":1,"frontend":1}}"#;
-
-/// What a subscriber wrote.
-#[derive(Clone, Default)]
-struct Log(Arc<Mutex<Vec<u8>>>);
-
-impl Log {
-    fn text(&self) -> String {
-        String::from_utf8(self.0.lock().expect("lock").clone()).expect("UTF-8")
-    }
-}
-
-impl std::io::Write for Log {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().expect("lock").extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Log {
-    type Writer = Self;
-
-    fn make_writer(&'a self) -> Self {
-        self.clone()
-    }
-}
 
 /// The names come back sorted and once each, for roles dropped from both maps, and none for
 /// a body that keeps every limit.
@@ -66,12 +35,7 @@ fn the_dropped_roles_are_named_sorted_and_once() {
 #[test]
 fn a_dropped_limit_is_a_warning_naming_the_roles() {
     let log = Log::default();
-    let _installed = tracing::subscriber::set_default(
-        tracing_subscriber::fmt()
-            .with_writer(log.clone())
-            .with_ansi(false)
-            .finish(),
-    );
+    let _installed = log.install();
     Desired::parse_request_noting(WITHOUT_BUILDER.as_bytes(), &services()).expect("accepted");
     assert_eq!(log.text(), "");
     Desired::parse_request_noting(WITH_BUILDER.as_bytes(), &services()).expect("accepted");

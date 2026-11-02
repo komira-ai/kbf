@@ -220,7 +220,7 @@ Usage: kbf-installer gc [OPTIONS]
 
 Options:
       --json         Print the result as one JSON object on standard output
-      --keep <KEEP>  The releases to keep besides the ones that must stay [default: 1]
+      --keep <KEEP>  The releases to keep besides the ones that must stay (2 or more) [default: 4]
       --apply        Do what the verb says. Without it a mutating verb is a dry run
   -h, --help         Print help
 

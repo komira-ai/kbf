@@ -41,6 +41,9 @@ pub struct Ended {
     pub kind: EndedKind,
     /// When: the event's time.
     pub at: WallTime,
+    /// The record's `correlated_invocations_id` when the event was applied, if a call
+    /// named one: the group (a CI job) the invocation is part of.
+    pub correlated_invocations_id: Option<String>,
 }
 
 /// Whether a lease given up for `reason` is followed by the worker's report of its run.
@@ -63,6 +66,10 @@ impl Records {
             attempt: None,
             kind: EndedKind::Hit,
             at,
+            // The row is in the record, so the record is.
+            correlated_invocations_id: self.invocations[key]
+                .correlated_invocations_id()
+                .map(str::to_owned),
         });
     }
 
@@ -76,17 +83,22 @@ impl Records {
         kind: EndedKind,
         at: WallTime,
     ) {
-        let attempt = self
-            .invocations
-            .get(key)
-            .and_then(|inv| inv.rows[row].attempts.iter().position(|a| a.lease == lease));
-        if let Some(attempt) = attempt {
+        let found = self.invocations.get(key).and_then(|inv| {
+            let attempts = &inv.rows[row].attempts;
+            let correlated = inv.correlated_invocations_id().map(str::to_owned);
+            attempts
+                .iter()
+                .position(|a| a.lease == lease)
+                .map(|attempt| (attempt, correlated))
+        });
+        if let Some((attempt, correlated_invocations_id)) = found {
             self.ended.push(Ended {
                 key: key.clone(),
                 row,
                 attempt: Some(attempt),
                 kind,
                 at,
+                correlated_invocations_id,
             });
         }
     }

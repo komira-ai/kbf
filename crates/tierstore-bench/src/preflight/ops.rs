@@ -129,7 +129,9 @@ pub struct OpsFile {
     /// This machine's roles.
     #[serde(default)]
     pub node: NodeOps,
-    /// A file the operator keeps of the cold store's heal progress: JSON of `percent_done`.
+    /// A file the operator keeps of the cold store's heal progress: JSON of `percent_done`, or,
+    /// for a cold role with no `admin` entry (file mode), the writer's full record, see the
+    /// README (`read_unix_ms`, `healing`, `percent_done`, `drives`, `version`).
     pub cold_heal_status_file: Option<PathBuf>,
     /// The paper and its map, for `paper-scan`.
     pub paper: Option<PaperFiles>,
@@ -155,6 +157,16 @@ impl OpsFile {
         let text = read_text(host, &path)?;
         serde_json::from_str(&text)
             .map_err(|e| BenchError::Ops(format!("{FILE_NAME} is not an ops file: {e}")))
+    }
+
+    /// The heal status file the cold role is read from alone (file mode): the ops file has no
+    /// admin key for `cold` and names a status file. `mc` is then never run for the cold role.
+    #[must_use]
+    pub fn cold_file_mode(&self) -> Option<&Path> {
+        if self.admin.contains_key(&Role::Cold) {
+            return None;
+        }
+        self.cold_heal_status_file.as_deref()
     }
 
     /// What is wrong with the test instance's isolation from the live one, one text per

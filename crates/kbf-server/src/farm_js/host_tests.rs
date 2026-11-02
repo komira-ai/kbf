@@ -212,7 +212,7 @@ async fn an_operation_no_recorded_call_waits_on_is_not_told_to_the_recorder() {
     recorder.caught_up().await;
     assert_eq!(recorder.sent(), 0, "nothing was told");
     rig.core
-        .with(|_, a| a.record_ran(OperationId(0), first, Default::default()));
+        .with(|_, a| a.recording.ran(OperationId(0), first, Default::default()));
     recorder.caught_up().await;
     assert_eq!(
         recorder.sent(),
@@ -317,10 +317,11 @@ async fn a_recorded_call_whose_operation_is_refused_ends_with_the_reason() {
     assert!(matches!(outcome, Some(Answered::Refused(_))), "{outcome:?}");
     rig.core.with(|_, a| {
         assert!(
-            !a.is_recorded(OperationId(0)),
+            !a.recording.is_recorded(OperationId(0)),
             "the operation is not noted any more"
         );
-        a.record_ran(OperationId(0), LeaseId::new(7, 0), Default::default());
+        a.recording
+            .ran(OperationId(0), LeaseId::new(7, 0), Default::default());
     });
 }
 

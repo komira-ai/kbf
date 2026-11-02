@@ -40,3 +40,14 @@ fn only_a_node_that_may_hold_keys_turns_off_core_dumps() {
     let limit = rustix::process::getrlimit(rustix::process::Resource::Core);
     assert_eq!((limit.current, limit.maximum), (Some(0), Some(0)));
 }
+
+/// Pins `registered` among the stores whose node may hold keys (defect: `Registered` dropped
+/// from `may_hold_keys`, which would leave core dumps on for the one node that holds nothing
+/// but registered keys): with a frontend it may, without one it cannot (it would not start).
+#[test]
+fn a_registered_node_may_hold_keys_only_with_a_frontend() {
+    let registered = "--cold-store=registered";
+    let frontend = "--frontend=http://127.0.0.1:8981";
+    assert!(flags(&[registered, frontend]).may_hold_keys());
+    assert!(!flags(&[registered]).may_hold_keys());
+}

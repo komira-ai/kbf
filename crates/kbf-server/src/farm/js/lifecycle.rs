@@ -28,6 +28,10 @@ use crate::fleet::NodeView;
 pub(crate) fn fence(js: &JsFarm) {
     js.core.fence();
     js.fenced.store(true, Ordering::SeqCst);
+    // The beats of the workers go to the successor: no result here will be read.
+    if let Some(usage) = &js.usage {
+        usage.drop_all();
+    }
 }
 
 /// [`Farm::resume`](crate::farm::Farm::resume): [`Core::resume`](js_server_core::Core::resume).

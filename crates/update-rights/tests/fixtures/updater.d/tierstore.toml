@@ -1,0 +1,42 @@
+# A declaration shaped like the design's example for tierstore: the hook runs as an account of its
+# own, holds CAP_NET_ADMIN only in the steps that change the firewall, and writes nothing but
+# its record directory.
+name = "tierstore"
+binary = "tierstore"
+signer = { repository = "komira-ai/kbf", workflow = "artifacts.yml" }
+uid = "tierstore"
+registration_ttl_secs = 300
+health_ports = [9301, 9302]
+verify_deadline_secs = 1600
+promotion_ceiling_secs = 3600
+cleanup_retries = 3
+state_dir = "/var/lib/updater/hooks/tierstore"
+boot = "restore"
+min_version = "0.1.0"
+
+[hook]
+user = "tierstore-update"
+group = "tierstore-update"
+capabilities = []
+read_paths = ["/usr/libexec/kbf", "/usr/sbin/nft", "/etc/tierstore", "/etc/updater.d/tierstore.toml"]
+write_paths = []
+units = ["tierstore@9301.service", "tierstore@9302.service"]
+address_families = ["AF_UNIX", "AF_INET", "AF_INET6", "AF_NETLINK"]
+environment = { }
+
+[hook.step_capabilities]
+prepare = ["CAP_NET_ADMIN"]
+cutover = ["CAP_NET_ADMIN"]
+verify = []
+rollback = ["CAP_NET_ADMIN"]
+cleanup = []
+
+[hook.timeout_secs]
+prepare = 600
+cutover = 300
+verify = 1000
+rollback = 600
+cleanup = 1300
+
+[hook.params]
+promotion_bound_secs = 900

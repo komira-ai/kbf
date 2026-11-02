@@ -4,7 +4,8 @@
 use std::sync::Arc;
 
 use crate::support::cache_kit::{
-    CountingCas, FakeClock, Gates, config, file, key, lease, stop, wait_for_fill_waits,
+    CountingCas, FakeClock, Gates, config, file, key, lease, open_started, stop,
+    wait_for_fill_waits,
 };
 use crate::support::scratch;
 use kbf_daemon::cache::{Cache, Point};
@@ -20,7 +21,7 @@ async fn fills_hits_and_evictions_are_counted_per_entry_with_their_bytes() {
     let dir = scratch("cache-input-counts");
     let gates = Gates::new();
     let clock = FakeClock::at(1000);
-    let cache = Cache::open(config(&dir, 300, Arc::clone(&gates), &clock)).expect("open");
+    let cache = open_started(config(&dir, 300, Arc::clone(&gates), &clock), &gates);
     let cas = CountingCas::default();
     let blob = |c: u8| vec![c; 100];
     let three = cas.tree(&[

@@ -18,12 +18,18 @@ fn a_heartbeat_is_written_and_read_in_one_spelling() {
         platform: ReleasePlatform::DarwinArm64,
         version: v("0.1.7+g0123456789ab-3"),
         health: Health::Unhealthy,
-        last_update: Some(UpdateResult {
-            target: v("0.1.8+gabcdefabcdef-1"),
-            outcome: Outcome::Failed,
-        }),
+        last_update: Some(UpdateResult::new(
+            v("0.1.8+gabcdefabcdef-1"),
+            Outcome::Failed,
+        )),
         updating: Some(v("0.1.9")),
         services: None,
+        agent_features: Vec::new(),
+        step: None,
+        commit: None,
+        step_secs: Default::default(),
+        promotion_pending: false,
+        deferred: None,
     };
     assert_eq!(
         serde_json::to_value(&busy).expect("json"),

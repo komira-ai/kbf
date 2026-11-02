@@ -9,6 +9,8 @@
 //! - `bind --connection NAME --bucket B [--prefix P]` and `unbind`: `PUT` and `DELETE`
 //!   of `/bindings/cold`.
 //! - `verify NAME [--bucket B] [--prefix P]`: `POST /connections/NAME:verify`.
+//! - `repoint --connection NAME --endpoint URL [--bucket B] [--prefix P] --expect-generation N`:
+//!   `POST /connections/NAME:repoint`.
 //!
 //! Every route passes the whole write gate, a `GET` included, so every verb needs
 //! `--token-file`.
@@ -30,7 +32,9 @@ use std::path::PathBuf;
 
 use clap::{Args, Subcommand};
 use kbf_server::object_store::api::BASE;
-use kbf_types::object_store_api::{BindingPut, BindingRole, ConnectionName, VerifyRequest};
+use kbf_types::object_store_api::{
+    BindingPut, BindingRole, ConnectionName, RepointRequest, VerifyRequest,
+};
 use serde::Serialize;
 use zeroize::Zeroizing;
 
@@ -115,6 +119,29 @@ pub enum ObjectStore {
         #[command(flatten)]
         token: Token,
     },
+    /// Move the store the `cold` binding names to another endpoint (and bucket and prefix),
+    /// on purpose: the new store is probed with the connection's key first, and a failed
+    /// probe changes nothing. Only nodes started with `--cold-store registered` follow.
+    Repoint {
+        /// The bound connection.
+        #[arg(long)]
+        connection: ConnectionName,
+        /// The new store's address, `http://host[:port]`.
+        #[arg(long)]
+        endpoint: String,
+        /// The new bucket (the binding's current one if not given).
+        #[arg(long)]
+        bucket: Option<String>,
+        /// The new key prefix (the binding's current one if not given).
+        #[arg(long)]
+        prefix: Option<String>,
+        /// Refuse the change if the registry is not at this generation (read it with
+        /// `status`).
+        #[arg(long, value_name = "N")]
+        expect_generation: u64,
+        #[command(flatten)]
+        token: Token,
+    },
     /// Probe a connection from the frontend: write, read and delete one small object.
     Verify {
         /// The connection.
@@ -193,6 +220,7 @@ impl ObjectStore {
             | Self::Audit { token, .. }
             | Self::Bind { token, .. }
             | Self::Unbind { token, .. }
+            | Self::Repoint { token, .. }
             | Self::Verify { token, .. } => &token.token_file,
             Self::Connection { verb } => verb.token_file(),
         }
@@ -229,6 +257,22 @@ impl ObjectStore {
                 }),
             ),
             Self::Unbind { role, .. } => Call::Delete(format!("{BASE}/bindings/{role}")),
+            Self::Repoint {
+                connection,
+                endpoint,
+                bucket,
+                prefix,
+                expect_generation,
+                ..
+            } => Call::Post(
+                format!("{BASE}/connections/{connection}:repoint"),
+                Body::json(&RepointRequest {
+                    endpoint: endpoint.clone(),
+                    bucket: bucket.clone(),
+                    prefix: prefix.clone(),
+                    expect_generation: *expect_generation,
+                }),
+            ),
             Self::Verify {
                 name,
                 bucket,

@@ -38,12 +38,17 @@
 //! held.
 //!
 //! **STALE_MAP.** A node that holds a newer map answers FAILED_PRECONDITION with its
-//! generation; on this raw path that answer goes to the client as it is, with no refetch
-//! of the map and no second try (the whole-blob calls, which go through the router, do
-//! both). The frontend's map is refreshed by its own timer, so the client's next call is
-//! routed by the newer map. A storage node does not judge a call's generation yet; when
-//! it does, a Read or QueryWriteStatus here (whose request is held) can be run again once
-//! the map is fetched, and a Write (whose body is not) cannot.
+//! generation. A Write that can still be sent whole (below) fetches the map and goes to
+//! the writer of the newer one, by the router's rule ([`kbf_route::Router::newer_map`]): it
+//! stops, UNAVAILABLE, when a fetch brings no newer map or after
+//! [`kbf_route::MAX_MAP_REFETCHES`]. A Write past its first frames cannot be sent again, so
+//! it ends UNAVAILABLE and the client starts it again, routed by the newer map; a large blob
+//! past the held frames therefore costs the client a full resend, which is why only a held
+//! body is retried here. A Read and a
+//! QueryWriteStatus pass the answer to the client as it is, with no refetch and no second
+//! try (the whole-blob calls, which go through the router, do both); the frontend's map is
+//! refreshed by its own timer, so the client's next call is routed by the newer map. Only
+//! STALE_MAP is treated so: no other answer of a node is sent again here.
 //!
 //! **Write** goes to the writer: the first owner of the blob that the map does not say is
 //! down (not always the owner a read asks first). If the blob's writer changes during the
@@ -61,8 +66,8 @@
 //! client's bytes past the first frames have been read by an attempt, they are gone (the
 //! proxy holds no blob), so an attempt that fails after that ends the call with the
 //! node's own answer and the client starts again. Only UNAVAILABLE moves on, never an
-//! answer from a node that was reached (INVALID_ARGUMENT, a map generation that is stale,
-//! a digest that does not match), and nothing is remembered of the node that failed: the
+//! answer from a node that was reached (INVALID_ARGUMENT, a digest that does not match;
+//! STALE_MAP has its own rule, above), and nothing is remembered of the node that failed: the
 //! next upload of a blob it owns tries it first again. If every owner fails, the first
 //! one's failure is the client's, once the hold has ended (also if the map has no writer
 //! left by then). Without a map there is one writer, and no next one.
@@ -91,7 +96,7 @@ use std::task::{Context, Poll};
 use bytes::Bytes;
 use kbf_auth::{Authorizers, authorize};
 use kbf_route::Waiting;
-use kbf_storage::service::MAP_GENERATION_HEADER;
+use kbf_storage::service::{MAP_GENERATION_HEADER, stale_generation};
 use kbf_types::Digest;
 use tonic::body::Body;
 use tonic::codegen::{Service, http};
@@ -238,6 +243,8 @@ impl RawByteStream {
         // The nodes this upload could not reach, and the first failure.
         let mut skipped: Vec<Arc<str>> = Vec::new();
         let mut first_failure: Option<Status> = None;
+        // The map fetches this upload has made after STALE_MAP.
+        let mut fetches = 0;
         loop {
             let failed = Arc::new(Mutex::new(None));
             let guarded = up.guarded(Guard {
@@ -256,6 +263,38 @@ impl RawByteStream {
                 .take();
             if let Some(refusal) = refusal {
                 return Err(refusal);
+            }
+            // A node that holds a newer map refused it.
+            let stale = match (&answer, self.owners.map_router()) {
+                (Ok(response), Some(router)) => Status::from_header_map(response.headers())
+                    .as_ref()
+                    .and_then(stale_generation)
+                    .map(|current| (current, router)),
+                _ => None,
+            };
+            if let Some((current, router)) = stale {
+                // Fetch the newer map and send the upload to its writer, if the upload
+                // can be sent whole; the answer of an upload that cannot is UNAVAILABLE
+                // (it starts again, routed by the newer map).
+                let Some(body) = upload.again() else {
+                    return Err(Status::unavailable(format!(
+                        "storage node {} holds map generation {current}, and the upload \
+                         is past the part the frontend keeps; start it again",
+                        owner.id()
+                    )));
+                };
+                router
+                    .newer_map(owner.generation, current, &mut fetches)
+                    .await?;
+                tracing::warn!(
+                    node = owner.id(),
+                    current,
+                    "storage node holds a newer map; sending the upload by it"
+                );
+                skipped.clear();
+                owner = self.writer_held(&resource.digest, &mut waiting).await?;
+                up = Pass::new(body, &self.meter, Method::Write, Direction::ToStorage);
+                continue;
             }
             let unreached = match &answer {
                 Ok(response) => Status::from_header_map(response.headers())

@@ -90,6 +90,7 @@ mod request_metadata;
 mod routed;
 mod segments;
 mod storage;
+pub mod store_metrics;
 mod wire;
 
 use std::sync::Arc;

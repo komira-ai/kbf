@@ -35,7 +35,7 @@ use kbf_daemon::tree::{
 };
 use support::cache_kit::{
     CountingCas, FakeClock, Gates, config, digest, entries, entry_path, file, key, lease,
-    lease_dir, on_disk_sum, stop, tmp_files, toolchain, wait_for_fill_waits,
+    lease_dir, on_disk_sum, open_started, stop, tmp_files, toolchain, wait_for_fill_waits,
 };
 use support::scratch;
 
@@ -147,7 +147,7 @@ async fn the_budget_evicts_least_recently_used_but_never_a_pinned_key() {
     let clock = FakeClock::at(1000);
     let mut serial = config(&dir, 300, Arc::clone(&gates), &clock);
     serial.link_concurrency = 1;
-    let cache = Cache::open(serial).expect("open");
+    let cache = open_started(serial, &gates);
     let cas = CountingCas::default();
     let blob = |c: u8| vec![c; 100];
     let one = |name: &str, c: u8| cas.tree(&[file(name, &blob(c), false)]);
@@ -209,7 +209,7 @@ async fn a_key_two_leases_pin_stays_until_both_release_it() {
     let dir = scratch("cache-c8-two");
     let gates = Gates::new();
     let clock = FakeClock::at(1000);
-    let cache = Cache::open(config(&dir, 100, Arc::clone(&gates), &clock)).expect("open");
+    let cache = open_started(config(&dir, 100, Arc::clone(&gates), &clock), &gates);
     let cas = CountingCas::default();
     let one = |c: u8| cas.tree(&[file("f", &[c; 100], false)]);
     let old = key(&[b'o'; 100], false);
@@ -708,7 +708,8 @@ async fn a_fill_waits_for_the_evictor_holding_its_key() {
     let cas = Arc::new(CountingCas::default());
     let gates = Gates::new();
     let clock = FakeClock::at(1000);
-    let cache = Cache::open(config(&dir, 200, Arc::clone(&gates), &clock)).expect("open");
+    // The start-up drain must be done, or it could be the evictor held on K.
+    let cache = open_started(config(&dir, 200, Arc::clone(&gates), &clock), &gates);
     let one = |c: u8| cas.tree(&[file("f", &[c; 100], false)]);
     let k = key(&[b'k'; 100], false);
     lease(&cas, &cache, &one(b'k'), &dir, "k").await.expect("k");

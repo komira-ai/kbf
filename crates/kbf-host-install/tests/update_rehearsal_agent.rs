@@ -338,7 +338,7 @@ fn the_agent_updates_the_host_when_the_coordinator_is_told_the_next_release() {
             .to_owned()
     };
     let deploy = |name: &str, version: &str| -> String {
-        run(
+        rehearsal::run_explaining(
             name,
             Command::new(&xtask)
                 .args(["deploy-farm", "--url", &control_url, "--ca-pem", &ca_pem])
@@ -355,6 +355,7 @@ fn the_agent_updates_the_host_when_the_coordinator_is_told_the_next_release() {
                 .env("ACTIONS_ID_TOKEN_REQUEST_URL", issuer.token_url())
                 .env("ACTIONS_ID_TOKEN_REQUEST_TOKEN", REQUEST_TOKEN)
                 .env("SSL_CERT_FILE", &trust),
+            &[HELPER_UNIT, AGENT_UNIT, KBF_UNIT],
         )
     };
 

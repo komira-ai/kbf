@@ -1,0 +1,56 @@
+# What a hook may do, under the real systemd, as root (crates/update-rights/tests/rights_root.rs):
+# a hook declared with a narrow set of rights tries to exceed it and must fail, and the six
+# assumptions of docs/design/host-updates.md section 11 that the design rests on are each run
+# as a test that can fail. A GitHub-hosted Ubuntu runner has systemd and passwordless sudo; nothing
+# here runs on any other machine. nft and polkit are installed first: a probe that finds one
+# missing fails by name instead of passing.
+#
+# Every raw result is uploaded as an artifact (`gh run download`).
+# It runs on a pull request that touches the crate, by hand, and on a push to main.
+name: update-rights-linux
+
+on:
+  pull_request:
+    paths:
+      - crates/update-rights/**
+      - crates/update-hook/**
+      - .github/workflows/update-rights-linux.yml
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - crates/update-rights/**
+      - crates/update-hook/**
+
+permissions: {}
+
+concurrency:
+  group: update-rights-linux-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  root:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - run: systemctl --version
+      - run: sudo apt-get install -y --no-install-recommends nftables polkitd
+      # The tests, as root: systemd-run of system units, accounts, nft and polkit.
+      - run: cargo xtask sudo-test -p update-rights --test rights_root -- --nocapture --test-threads=1
+        timeout-minutes: 15
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
+        with:
+          name: update-rights-linux-raw-output
+          path: target/update-rights
+          if-no-files-found: error

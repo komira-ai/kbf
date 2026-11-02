@@ -69,7 +69,7 @@ mod worker {
     use kbf_types::LeaseId;
     use tokio::time::Instant;
 
-    use super::super::{Queued, Running, Stage, Task, reporting};
+    use super::super::{Queued, Running, Stage, Task, Timeline, reporting};
     use crate::executor::outcome::{Settled, result_of};
     use crate::executor::task::PackKey;
     use crate::executor::test_support::{GIB, Harness, start};
@@ -184,6 +184,7 @@ mod worker {
             Task {
                 action,
                 stage: reporting(result, now),
+                timeline: Timeline::default(),
             },
         );
         worker.report_lost(&ctx).await;

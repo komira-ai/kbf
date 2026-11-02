@@ -522,94 +522,26 @@ async fn the_first_start_of_each_mode_enrolls_for_exactly_its_roles() {
     }
 }
 
-/// Catches a node granted both roles being started as one when the frontend sent the
-/// storage half no cold store: the start is refused after enrollment (the node is
-/// enrolled, and keeps the enrollment), saying what is missing, and a second start
-/// enrolls nothing.
+/// Catches a node granted both roles refused after enrolling because the frontend sent the
+/// storage half no cold store (defect: the missing store is a plan error again): the store
+/// is the registration's, which the node waits for, so every start goes on, the node is
+/// enrolled once, and it sends no `Renew` to ask the frontend for a store.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_configuration_missing_the_cold_store_is_refused_after_enrolling() {
+async fn a_node_the_frontend_sent_no_cold_store_still_starts_registered() {
     let h = Harness::new("node-no-cold-store");
     h.ready("");
     let launches = Arc::new(Launches::default());
     for _ in 0..2 {
-        let failure = start_mode(&h, names::STORAGE_AND_DAEMON, &launches)
+        start_mode(&h, names::STORAGE_AND_DAEMON, &launches)
             .await
-            .expect_err("no cold store");
-        assert!(
-            matches!(&failure, Failure::Plan(m) if m.contains("cold store")),
-            "{failure:?}"
-        );
-        assert_eq!(failure.exit_code(), 2);
+            .expect("a node with no cold store sent starts");
     }
-    assert!(launches.seen().is_empty());
-    assert_eq!(h.fake().enrolls().len(), 1);
-    assert!(h.node_json().contains("storage"));
-}
-
-/// Catches a node enrolled before the farm registered a cold store staying unable to
-/// start its storage half: the first start is refused (no store), then the store is
-/// registered, and the next start asks the frontend for the configuration (one `Renew`)
-/// and runs the storage mode on the store it was sent. A node that holds one asks nothing.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_node_enrolled_before_the_store_was_registered_asks_for_it_at_its_next_start() {
-    let h = Harness::new("node-cold-store-late");
-    h.ready("");
-    let launches = Arc::new(Launches::default());
-    start_mode(&h, names::STORAGE, &launches)
-        .await
-        .expect_err("no cold store yet");
-    assert!(launches.seen().is_empty());
-    assert_eq!(h.fake().enrolls().len(), 1);
-
-    h.fake().set_cold_store(COLD);
-    h.fake().set_generation(2);
-    start_mode(&h, names::STORAGE, &launches)
-        .await
-        .expect("the store was sent");
-    assert_eq!(launches.seen(), [names::STORAGE]);
-    assert_eq!(h.fake().enrolls().len(), 1, "no second enrollment");
-    assert!(
-        h.node_json().contains("objects.example"),
-        "kept in node.json"
-    );
-    let asked = h.fake().renews().len();
     assert_eq!(
-        asked, 1,
-        "one Renew, to ask; the renewer's first look is not due"
+        launches.seen(),
+        [names::STORAGE_AND_DAEMON, names::STORAGE_AND_DAEMON]
     );
-
-    start_mode(&h, names::STORAGE, &launches)
-        .await
-        .expect("a node with a store");
-    assert_eq!(
-        h.fake().renews().len(),
-        asked,
-        "a node that holds a cold store asks for nothing"
-    );
-}
-
-/// Catches a start that dies with the frontend's refusal instead of saying what is missing:
-/// a storage node holding no cold store whose frontend refuses the one `Renew` it sends at
-/// start still gets the plan error naming the cold store, exit 2, and starts nothing.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_refused_cold_store_ask_leaves_the_plan_error() {
-    let h = Harness::new("node-cold-ask-refused");
-    h.ready("");
-    let launches = Arc::new(Launches::default());
-    start_mode(&h, names::STORAGE, &launches)
-        .await
-        .expect_err("no cold store yet");
-    h.fake().refuse_with(Some(RefusalReason::StoreUnavailable));
-    let failure = start_mode(&h, names::STORAGE, &launches)
-        .await
-        .expect_err("the frontend refused");
-    assert!(
-        matches!(&failure, Failure::Plan(m) if m.contains("cold store")),
-        "{failure:?}"
-    );
-    assert_eq!(failure.exit_code(), 2);
-    assert_eq!(h.fake().renews().len(), 1, "the second start asked once");
-    assert!(launches.seen().is_empty());
+    assert_eq!(h.fake().enrolls().len(), 1);
+    assert_eq!(h.fake().renews().len(), 0, "no Renew to ask for a store");
 }
 
 /// Catches a node with no storage role asking the frontend for a cold store at start: a

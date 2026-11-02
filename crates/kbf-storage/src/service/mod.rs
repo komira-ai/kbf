@@ -86,8 +86,8 @@ use crate::{Storage, StorageError};
 
 pub use admission::{Admission, Endpoint, PeerNames, PeerRole, ROLE_URI_PREFIX, host_of, role_of};
 pub use catch_up::CatchUp;
-pub use client::RemoteStorage;
 pub(crate) use client::lift;
+pub use client::{RemoteStorage, stale_generation};
 pub use in_process::InProcess;
 pub use open_writes::{OpenWrite, OpenWrites};
 

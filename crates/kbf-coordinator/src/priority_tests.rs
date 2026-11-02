@@ -73,11 +73,16 @@ fn offered(rig: &Rig, announced: &[&str]) -> Vec<String> {
                         health: b.health,
                         last_update: None,
                         updating: None,
+                        step: None,
+                        commit: None,
+                        step_secs: Default::default(),
+                        promotion_pending: false,
+                        deferred: None,
                     }
                 })
                 .collect(),
         );
-        match rig.coordinator.heartbeat(who.clone(), heartbeat) {
+        match rig.coordinator.heartbeat(who.clone(), heartbeat).reply {
             ServiceReply::Nothing => return told,
             ServiceReply::Update { service, version } => {
                 let name = service.unwrap_or_else(|| "kbf".to_owned());
@@ -160,7 +165,7 @@ fn a_priority_that_is_not_a_number_is_refused() {
 /// A definition field nothing implements yet is still refused, with its name.
 #[test]
 fn an_unknown_definition_field_is_refused() {
-    for field in ["bake_beats = 2", "colour = 1", "urgent = true"] {
+    for field in ["colour = 1", "urgent = true"] {
         let err = parse(&service("a", field)).expect_err(field);
         let name = field.split(' ').next().expect("a name");
         assert!(err.contains(name), "{field}: {err}");

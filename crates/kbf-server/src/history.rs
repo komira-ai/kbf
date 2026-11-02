@@ -49,7 +49,7 @@ pub use tails::{
 pub use tap::HistoryTap;
 #[cfg(test)]
 pub(crate) use tap::RunIndex;
-pub(crate) use tap::run_record;
+pub(crate) use tap::{name_build, run_record};
 
 use kbf_front::Recording;
 

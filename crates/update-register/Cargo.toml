@@ -1,0 +1,22 @@
+[package]
+name = "update-register"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# The client of the registration socket of a host updater (docs/design/host-updates.md, 2.1 and
+# migration step 4a): a service tells the updater its name, the version it runs and, if it has
+# a listener, a loopback health address, and holds the connection open for as long as it runs.
+# The crate depends on no crate of this workspace and its name does not say `kbf`: services link
+# the client, not kbf, and tierstore will leave this repository
+# (crates/kbf-integration-test/tests/layering.rs keeps both true). The server is
+# `kbf-step-runner::register`, whose tests run this client against it.
+[dependencies]
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

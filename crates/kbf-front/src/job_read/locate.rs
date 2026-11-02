@@ -39,13 +39,22 @@
 //! [`super::Limits::stream_over`] must equal the pack store's `max_blob_bytes`: a blob between
 //! them is asked of the index, which does not hold it, and is `absent`.
 //!
-//! **Contract for the consumer (not implemented yet: the kbf-task client is the next step).**
-//! kbf-task is to check the SHA-256 of every blob it takes through a table and to fall back to
-//! the listener's GET or batch for one that does not verify or is gone, which is what makes a
-//! stale entry safe. A `large` key is readable only by a holder of a tierstore read credential (a
-//! per-job grant or a presigned GET); until a task has one it is to treat `large` as `absent`.
+//! **Store grants.** With a grant key configured ([`super::StoreGrants`], the frontend's
+//! `--job-store-*` flags) the first line is a header,
+//! `{"store":"<base url>","bucket":"<bucket>","grants":["<token>",...]}`, and every `pack` and
+//! `large` line carries `"g":<n>`, the index in `grants` of the tierstore read grant that lists
+//! its key (the spans of one pack share it). The grants are made over the keys of the lines of
+//! this answer, which come from the scope's digests, and no others; a line whose key tierstore
+//! would refuse to list is `absent`. See [`super::StoreGrants`] for the bounds and the end of a
+//! grant. A grant is a bearer secret that exists only in the body of the answer. Without a key
+//! the answer is as it was: no header line and no `g`, which the task reads as listener-only.
+//!
+//! **Contract for the consumer.** kbf-task checks the SHA-256 of every blob it takes through a
+//! table and falls back to the listener's GET or batch for one that does not verify or is gone,
+//! which is what makes a stale entry safe. A `pack` or `large` line with no `g` is one it cannot
+//! read from the store, and it asks the listener.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -57,8 +66,9 @@ use serde_json::json;
 use tokio::sync::Semaphore;
 use tokio::time::Instant;
 
+use super::store_grants::{GRANT_LIFETIME, Minted};
 use super::walk::ScopeError;
-use super::{Hold, JobRead, LOCATE_OUTCOMES, Limits, Outcome, Reply, Tally};
+use super::{Hold, JobRead, LOCATE_OUTCOMES, Limits, Outcome, Reply, StoreGrants, Tally};
 use crate::cache::is_empty_blob;
 use crate::metrics::{Counter, Families};
 
@@ -91,6 +101,11 @@ pub const MAX_LOCATE_LINE_BYTES: u64 = 1208;
 /// longest line ([`MAX_LOCATE_LINE_BYTES`]) and 256 bytes for what a digest costs while the
 /// table is made (its place in the three vectors and the map of entries, at most 248 bytes).
 const LOCATE_CHARGE_BYTES: u64 = MAX_LOCATE_LINE_BYTES + 256;
+
+/// What each digest is charged besides that when store grants are handed out: its key can be in
+/// a grant (the token is four thirds of the names it lists, so 1370 bytes for a key of 1024) and
+/// its line carries a `g` (at most 10 bytes).
+const GRANT_CHARGE_BYTES: u64 = 1380;
 
 /// The lines of a table built between two yields to the runtime.
 const LINES_PER_YIELD: usize = 1024;
@@ -207,6 +222,15 @@ enum Entry {
     Absent,
 }
 
+/// The key of the store object a line for `digest` points at, if it points at one.
+fn key_of(digest: &Digest, entry: &Entry) -> Option<String> {
+    match entry {
+        Entry::Pack(at) => Some(at.key.clone()),
+        Entry::Large(_) => Some(large_key(digest)),
+        Entry::Absent => None,
+    }
+}
+
 impl JobRead {
     /// The answer to a `GET /locate`: see the module's account of the table.
     pub(super) async fn locate(&self, authorization: Option<&str>) -> Reply {
@@ -224,22 +248,46 @@ impl JobRead {
         // The table is held until it is sent: the most it can be is charged before any of it is
         // built (a place first, as a GET takes them, so that the two never wait on each other).
         let place = Arc::clone(&self.reads).acquire_owned().await;
-        let room = self
-            .budget
-            .take(scope.most_digests() as u64 * LOCATE_CHARGE_BYTES)
-            .await;
+        let mut charge = LOCATE_CHARGE_BYTES;
+        if self.store_grants.is_some() {
+            charge += GRANT_CHARGE_BYTES;
+        }
+        let room = self.budget.take(scope.most_digests() as u64 * charge).await;
         let digests = scope.digests();
         let entries = self.entries_of(&digests).await;
         drop(place);
         let Ok(entries) = entries else {
             return self.refuse_locate(Outcome::Unavailable, "store_unavailable");
         };
+        // The grants cover the keys of the lines to be sent, and those only.
+        let mut keys = Vec::new();
+        if self.store_grants.is_some() {
+            for (digest, entry) in digests.iter().zip(&entries) {
+                keys.push(key_of(digest, entry));
+            }
+        }
+        let granted = self.grants_for(claims.not_after, &keys);
         let mut body = String::new();
+        if let Some((store, minted)) = &granted {
+            body.push_str(&store.header(minted).to_string());
+            body.push('\n');
+        }
         for (at, (digest, entry)) in digests.iter().zip(&entries).enumerate() {
             if at % LINES_PER_YIELD == LINES_PER_YIELD - 1 {
                 tokio::task::yield_now().await;
             }
-            let (kind, line) = match entry {
+            // With grants a line is located only if a grant lists its key.
+            let mut grant = None;
+            let mut entry = entry;
+            if let Some((_, minted)) = &granted {
+                if let Some(key) = &keys[at] {
+                    grant = minted.grant_of(key);
+                }
+                if grant.is_none() {
+                    entry = &Entry::Absent;
+                }
+            }
+            let (kind, mut line) = match entry {
                 Entry::Pack(at) => (
                     0,
                     json!({"digest": digest.to_string(), "pack":
@@ -252,6 +300,9 @@ impl JobRead {
                 ),
                 Entry::Absent => (2, json!({"digest": digest.to_string(), "absent": true})),
             };
+            if let Some(grant) = grant {
+                line["g"] = json!(grant);
+            }
             self.locate.entries[kind].add(1);
             body.push_str(&line.to_string());
             body.push('\n');
@@ -262,6 +313,24 @@ impl JobRead {
             idle: self.limits.held_idle,
         });
         reply
+    }
+
+    /// The store grants for `keys`, the store key of each line (if it has one), ending at the
+    /// earlier of `not_after` (the job's read grant) and [`GRANT_LIFETIME`] from now; none
+    /// without a grant key.
+    fn grants_for(
+        &self,
+        not_after: u64,
+        keys: &[Option<String>],
+    ) -> Option<(&StoreGrants, Minted)> {
+        let store = self.store_grants.as_ref()?;
+        let mut distinct = BTreeSet::new();
+        for key in keys.iter().flatten() {
+            distinct.insert(key.clone());
+        }
+        let end = GRANT_LIFETIME.as_secs();
+        let expires = not_after.min(self.grants.now().saturating_add(end));
+        Some((store, store.mint(&distinct, expires)))
     }
 
     fn refuse_locate(&self, outcome: Outcome, reason: &'static str) -> Reply {

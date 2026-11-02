@@ -26,7 +26,8 @@ use crate::role::Role;
 use crate::s3::{Timeouts, unix_ms};
 
 /// The hash of an empty body, as SigV4 spells it.
-const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+pub(crate) const EMPTY_SHA256: &str =
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 /// What one streamed read did.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -211,15 +212,15 @@ impl StreamGet {
 }
 
 /// The signing identity and scope.
-struct Credentials<'a> {
-    access_key_id: &'a str,
-    secret_access_key: &'a str,
-    region: &'a str,
+pub(crate) struct Credentials<'a> {
+    pub(crate) access_key_id: &'a str,
+    pub(crate) secret_access_key: &'a str,
+    pub(crate) region: &'a str,
 }
 
 /// The `Authorization` header of a GET with no query, signing `host` and `headers` (lowercase
 /// names, as they are sent) with the empty-body hash.
-fn authorization(
+pub(crate) fn authorization(
     credentials: &Credentials<'_>,
     host: &str,
     path: &str,
@@ -274,7 +275,7 @@ fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
 }
 
 /// `YYYYMMDDTHHMMSSZ` of `time`.
-fn amz_date(time: SystemTime) -> String {
+pub(crate) fn amz_date(time: SystemTime) -> String {
     let seconds = time
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -311,6 +312,7 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::*;
+    use crate::cells::testkit::DeadStore;
     use crate::config::Secret;
     use crate::s3::BenchS3;
 
@@ -422,14 +424,17 @@ mod tests {
         assert!(missing.ttfb.is_none());
         assert!(!missing.is_ok());
 
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let dead = format!("http://{}", listener.local_addr().unwrap());
-        drop(listener);
-        let refused = StreamGet::new(Role::Cold, &spec(&dead), Timeouts::default(), log())
-            .unwrap()
-            .get("k/a", None)
-            .await
-            .unwrap();
+        let dead = DeadStore::start().await;
+        let refused = StreamGet::new(
+            Role::Cold,
+            &spec(dead.endpoint()),
+            Timeouts::default(),
+            log(),
+        )
+        .unwrap()
+        .get("k/a", None)
+        .await
+        .unwrap();
         assert_eq!((refused.error, refused.status), (Some("transport"), None));
     }
 

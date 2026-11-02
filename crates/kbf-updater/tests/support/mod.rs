@@ -473,6 +473,9 @@ pub fn helper(
                     }),
                     last: last.clone(),
                     busy: false,
+                    releases: Vec::new(),
+                    releases_omitted: 0,
+                    releases_unavailable: false,
                 }),
                 Some("stage") => {
                     events.push(format!("helper:install {line}"));

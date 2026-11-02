@@ -224,9 +224,22 @@ fn an_update_by(way: Way) {
     for beat in beats.iter() {
         let mut keys: Vec<_> = beat.as_object().unwrap().keys().cloned().collect();
         keys.sort();
+        // `agent_features` is the one new key a kbf-only host sends: it announces what it can
+        // do with a coordinator's answer, and an old coordinator ignores it.
         assert_eq!(
             keys,
-            ["health", "last_update", "platform", "updating", "version"]
+            [
+                "agent_features",
+                "health",
+                "last_update",
+                "platform",
+                "updating",
+                "version"
+            ]
+        );
+        assert_eq!(
+            beat["agent_features"],
+            serde_json::json!(["deferred-v1", "halt-v1"])
         );
         for forbidden in ["n1", "daemon", "node", "role"] {
             assert!(!beat.to_string().contains(forbidden), "{forbidden}: {beat}");

@@ -9,7 +9,7 @@ use std::time::Duration;
 use kbf_lease_client::{
     AcquireRequest, Granted, Host, HostSource, HostState, Isolation, Lease, LeaseId, LeaseState,
     Mount, Outcome, PendingLease, ReleaseState, Released, Renewed, Resources, Run, RunAccepted,
-    RunId, RunLimits, RunSpec, RunState,
+    RunFile, RunId, RunLimits, RunSpec, RunState,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -365,4 +365,52 @@ async fn the_fake_refuses_in_the_shape_of_the_golden_errors() {
     assert_eq!((status, nothing), (405, Value::Null));
     let (status, missing) = raw_json(&server, "GET", "/v2/leases", "").await;
     assert_eq!((status, missing), (404, json!({ "error": "not-found" })));
+}
+
+/// Asserts that a run without files is written as the bytes it always was: the minimal and
+/// the full golden read, and write back byte for byte, with no `files` key. It catches a
+/// field that is always serialised (an older lease server would answer 400 for it, and one
+/// that knows it would see an empty list on every start).
+#[test]
+fn a_start_without_files_has_the_bytes_it_had_before() {
+    for name in ["run_request_minimal", "run_request_full"] {
+        let spec: RunSpec = round_trip(name);
+        assert!(spec.files.is_empty(), "{name}");
+        let path = format!("{}/tests/golden/{name}.json", env!("CARGO_MANIFEST_DIR"));
+        let on_disk = std::fs::read_to_string(path).unwrap();
+        assert_eq!(serde_json::to_string(&spec).unwrap(), on_disk.trim_end());
+    }
+}
+
+/// Asserts that a run's files are sent as a list of `{name, contents}` in the order given and
+/// read back the same, and that the typed body is exactly the golden one. It catches a
+/// renamed field, a lost order, and a client that sends contents under another key.
+#[test]
+fn files_serialize_as_name_and_contents_and_round_trip() {
+    let spec: RunSpec = round_trip("run_request_files");
+    let names: Vec<&str> = spec.files.iter().map(|file| file.name.as_str()).collect();
+    assert_eq!(names, ["put-url", "grant-token"]);
+    assert_eq!(spec.files[1].contents, "tok-123");
+    let mut built = RunSpec::new(
+        support::IMAGE,
+        RunLimits {
+            cpu_millis: 4000,
+            memory_bytes: 8 << 30,
+            pids: None,
+            wall_ms: None,
+            disk_bytes: None,
+        },
+    );
+    built.args = vec!["--build".to_owned(), "b1".to_owned()];
+    built.files = vec![
+        RunFile {
+            name: "put-url".to_owned(),
+            contents: "https://store.example/put?sig=abc".to_owned(),
+        },
+        RunFile {
+            name: "grant-token".to_owned(),
+            contents: "tok-123".to_owned(),
+        },
+    ];
+    assert_eq!(built, spec);
 }

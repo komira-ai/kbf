@@ -79,6 +79,20 @@ impl Farm {
         None
     }
 
+    /// What the farm's usage side holds and has counted; `None` when it records nothing
+    /// (`--usage-profiles off`, the legacy core, or no state store).
+    pub(crate) fn usage_stats(&self) -> Option<crate::farm_js::usage::UsageStats> {
+        js_arm!(self, views::usage_stats());
+        None
+    }
+
+    /// Flushes what the usage side learned, whatever its schedule says: the last thing a
+    /// server does. Whether the store took it; `true` for a farm that records nothing.
+    pub async fn finish_usage(&self) -> bool {
+        js_arm_async!(self, hot::finish_usage());
+        true
+    }
+
     /// The whole-node view of the queue now; `None` unless the farm runs with whole-node
     /// settings.
     pub fn whole_view(&self) -> Option<WholeView> {

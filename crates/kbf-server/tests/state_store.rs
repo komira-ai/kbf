@@ -40,6 +40,8 @@ mod ack_reasons;
 mod budgets;
 #[path = "state_store/conditional.rs"]
 mod conditional;
+#[path = "state_store/cordon_owner.rs"]
+mod cordon_owner;
 #[path = "state_store/fate.rs"]
 mod fate;
 #[path = "state_store/floors.rs"]
@@ -1287,6 +1289,7 @@ fn listeners() -> Listeners {
         scheduler_core: kbf_server::SchedulerCore::under_test(),
         placement_load: kbf_server::PlacementLoad::Off,
         placement_predictions: kbf_server::PlacementPredictions::Off,
+        usage_profiles: kbf_server::UsageProfiles::Off,
         whole_node: None,
         finished_retention: kbf_sched::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),

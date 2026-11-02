@@ -43,6 +43,11 @@ pub enum HistoryError {
     /// `--history-objects` without a state store: the index rows have nowhere to go.
     #[error("--history-objects needs --state-store: history's index rows are kept there")]
     NeedsStateStore,
+    /// `--history-objects registered`: only a storage node's `--cold-store` takes the word.
+    #[error(
+        "--history-objects registered: history is an object store of its own; `registered` is for a storage node's --cold-store"
+    )]
+    Registered,
     /// The `file://` directory could not be opened.
     #[error("--history-objects: {0}")]
     Open(#[from] FsStoreError),
@@ -97,6 +102,7 @@ impl HistoryFlags {
                 let root = HistoryRoot::under(&KeyPrefix::new(FILE_PREFIX_ROOT)?)?;
                 Ok(Some(over(objects, root, store, index_root, options)))
             }
+            StoreUri::Registered => Err(HistoryError::Registered),
             StoreUri::S3(s3) => {
                 let objects = s3_store(s3, env)?;
                 let root = HistoryRoot::under(&KeyPrefix::new(s3.prefix.clone())?)?;
@@ -116,6 +122,7 @@ fn describe(uri: &StoreUri) -> String {
     match uri {
         StoreUri::File(dir) => format!("file://{}", dir.display()),
         StoreUri::S3(s3) => format!("s3://{}/{}", s3.bucket, s3.prefix),
+        StoreUri::Registered => uri.to_string(),
     }
 }
 

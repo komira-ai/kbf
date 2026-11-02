@@ -23,7 +23,8 @@ pub enum PlacementLoad {
 /// thousandths (`f` of the scheduler: a constant-duty lease is charged all of them).
 pub const CPU_FLOOR_PERMILLE: u32 = 1000;
 /// Whether a key with a learned profile is charged its cores per minute and checked over the
-/// next half hour. Moot until the farm gives the scheduler profiles to read.
+/// next half hour. Read only under `--usage-profiles on`, which gives the scheduler the curves
+/// to read; under `off` and `record` it has none, and the switch charges nothing.
 pub const PROFILE: bool = true;
 /// Whether a key with a learned profile is charged the profile's remaining maximum memory.
 pub const PROFILE_MEMORY: bool = true;

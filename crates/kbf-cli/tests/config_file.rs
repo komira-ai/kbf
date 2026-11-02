@@ -435,6 +435,22 @@ fn each_modes_golden_matches_the_flag_definitions() {
     );
 }
 
+/// Catches `--executor-locate` missing from the frontend's `kbf.toml`, or on in it: the template
+/// generated from the flag definitions (not the golden file) names the key, off, and the golden
+/// file carries the same line.
+#[test]
+fn kbf_toml_golden_names_executor_locate() {
+    let template = kbf_cli::config_template("frontend").expect("a mode");
+    let golden = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/kbf-frontend.toml"),
+    )
+    .expect("golden");
+    for text in [&template, &golden] {
+        let lines = text.lines().filter(|l| l.starts_with("executor-locate"));
+        assert_eq!(lines.collect::<Vec<_>>(), ["executor-locate = false"]);
+    }
+}
+
 /// Catches a golden whose keys the loader would refuse (a template that is not a config):
 /// every mode's golden, as a file, is accepted by the loader up to what the flags
 /// themselves refuse (a required flag still commented), never for a key. Every setting of

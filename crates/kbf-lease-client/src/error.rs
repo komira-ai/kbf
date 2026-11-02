@@ -74,6 +74,10 @@ pub enum ErrorCode {
     HostJobsNotAllowed,
     /// 422: the image is not pinned by digest.
     ImageDigestRequired,
+    /// 409: the host does not deliver run files.
+    FilesUnsupported,
+    /// 400: a run file is not valid.
+    InvalidFile,
     /// The answer had no `{"error": ...}` body (a 401 has none).
     Unspecified,
     /// A code this version does not know.
@@ -114,6 +118,8 @@ const CODES: &[(&str, ErrorCode)] = &[
     ("limits-exceed-shape", ErrorCode::LimitsExceedShape),
     ("host-jobs-not-allowed", ErrorCode::HostJobsNotAllowed),
     ("image-digest-required", ErrorCode::ImageDigestRequired),
+    ("files-unsupported", ErrorCode::FilesUnsupported),
+    ("invalid-file", ErrorCode::InvalidFile),
 ];
 
 impl ErrorCode {

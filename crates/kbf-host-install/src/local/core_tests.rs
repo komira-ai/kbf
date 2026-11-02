@@ -8,6 +8,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 use std::rc::Rc;
 
+use kbf_retain::Kept;
 use kbf_testkit::dir::TestDir;
 
 use super::answer::{Answer, Code, LastView, PendingView, QueryView};
@@ -38,6 +39,18 @@ pub(super) struct World {
     /// Whether a revert that fails has cleared the marker anyway.
     pub(super) revert_clears: bool,
     pub(super) confirm_fault: Option<Fault>,
+    /// The releases the host lists as kept; a prune removes the commits in `prune_removes`.
+    pub(super) kept: Vec<Kept>,
+    pub(super) kept_fault: bool,
+    /// The file that names the releases kept whatever their age; none is a host with no
+    /// release directories, where no prune is asked for.
+    pub(super) retain_file: Option<PathBuf>,
+    pub(super) prune_say: String,
+    pub(super) prune_fault: Option<Fault>,
+    pub(super) prune_removes: Vec<String>,
+    /// A version another writer (a stage) records in the retain file just after the next
+    /// listing is taken: the commit and its text.
+    pub(super) recorded_after_listing: Option<(String, String)>,
     pub(super) calls: Vec<String>,
 }
 
@@ -123,6 +136,43 @@ impl Backend for Fake {
         world.pending = None;
         world.current = Some(pending.from.clone());
         Ok(())
+    }
+
+    fn kept(&self) -> Result<Vec<Kept>, Fault> {
+        let world = self.world.borrow();
+        if world.kept_fault {
+            return Err(Fault::failed(Code::StateUnavailable, "listing"));
+        }
+        let kept = world.kept.clone();
+        drop(world);
+        let late = self.world.borrow_mut().recorded_after_listing.take();
+        if let (Some((commit, version)), Some(file)) =
+            (late, self.world.borrow().retain_file.clone())
+        {
+            kbf_retain::Retained::update(&file, |r| {
+                r.versions
+                    .insert(kbf_retain::CommitId::new(&commit).unwrap(), version);
+            })
+            .unwrap();
+        }
+        Ok(kept)
+    }
+
+    fn retain_file(&self) -> Option<PathBuf> {
+        self.world.borrow().retain_file.clone()
+    }
+
+    fn prune(&self, keep: usize) -> Result<String, Fault> {
+        let mut world = self.world.borrow_mut();
+        world.calls.push(format!("prune {keep}"));
+        if let Some(fault) = world.prune_fault.clone() {
+            return Err(fault);
+        }
+        let gone = world.prune_removes.clone();
+        world
+            .kept
+            .retain(|k| !gone.iter().any(|g| g == k.commit.as_str()));
+        Ok(world.prune_say.clone())
     }
 }
 
@@ -694,3 +744,9 @@ fn a_repeated_confirm_is_for_the_release_that_was_confirmed() {
         &fx.ask(&format!("confirm kbf={VB}"))
     ));
 }
+
+#[path = "core_retain_tests.rs"]
+mod retain;
+
+#[path = "compat_tests.rs"]
+mod compat;

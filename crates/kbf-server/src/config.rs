@@ -1,6 +1,7 @@
 //! Command-line flags. Every setting is a flag; the only environment variables read are
 //! the standard S3 key pair, `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (a secret
-//! never goes on the command line). Where the server keeps its bytes is two store URIs
+//! never goes on the command line), and only when `--cold-store-credentials-file` names no
+//! file: they are deprecated. Where the server keeps its bytes is two store URIs
 //! and, sometimes, one directory ([`crate::stores`]): `--cold-store`, `--hot-store`,
 //! `--meta-dir`.
 
@@ -73,9 +74,28 @@ pub struct Args {
     /// checked against the index by a start-up pass in the background; a lost or
     /// damaged object is also found when it is read, or before an action-cache hit
     /// that needs it is served (a miss). There is no `memory:` store:
-    /// a `file://` path on a tmpfs is one.
+    /// a `file://` path on a tmpfs is one. A storage node (not `all-in-one`) may instead be
+    /// given the word `registered`: it holds no store of its own and, at each start, waits
+    /// for the frontend's registration (`kbf cluster object-store`), then runs on the
+    /// registered endpoint, bucket, prefix and keys, fetched over its storage certificate and
+    /// held in memory only, after the probe of the keys; it never falls back to another
+    /// store, and a registration that changes reaches it at its next start (until then the
+    /// frontend shows it `pending`). With `registered`, `--cold-store-credentials-file` is
+    /// refused and `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `AWS_ENDPOINT_URL` are
+    /// not read.
     #[arg(long, value_name = "URI")]
     pub cold_store: Option<StoreUri>,
+    /// The key pair of an `s3://` `--cold-store`, in a file: JSON
+    /// `{"access_key_id": "...", "secret_access_key": "..."}`, a regular file (a symbolic
+    /// link is refused) that the server's user owns and no one else can read (mode 0600 or
+    /// 0400). The secret is never a flag: a command line is world-readable. Without it the
+    /// key pair is read from `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, which is
+    /// deprecated: the start logs one warning and a later release refuses the variables.
+    /// A `file://` cold store has no keys, so the server refuses the flag with one; a
+    /// `registered` one takes its keys from the registration, so the server refuses the flag
+    /// with that too.
+    #[arg(long, value_name = "PATH", requires = "cold_store")]
+    pub cold_store_credentials_file: Option<PathBuf>,
     /// The fast tier in front of the cold store: `file:///absolute/path`, a directory
     /// on an SSD (or a tmpfs). Uploads land there and are flushed to the cold store in
     /// the background; reads are served from it while a blob is still there. Its
@@ -396,8 +416,8 @@ pub struct Args {
     /// (`placement_load.rs`; none is a flag): besides the reading it applies the guard that
     /// keeps the flat memory charged to a node within its memory, and scores nodes by balance.
     /// It also sets a learned time profile charged per minute and an expected-life charge that
-    /// ends a new lease at its key's expected life plus two minutes; both are idle, since the
-    /// farm gives the scheduler no learned profile and no curve source. The memory guard counts
+    /// ends a new lease at its key's expected life plus two minutes; both read curves, which the
+    /// scheduler has only under `--usage-profiles on` and is idle without. The memory guard counts
     /// only leases that carry a memory (a retry up the memory ladder, a VM) unless
     /// `--placement-predictions on` gives leases one
     // The text above states the default; the help golden cannot hold the whitespace-only
@@ -438,6 +458,28 @@ pub struct Args {
         hide_default_value = true
     )]
     pub placement_predictions: crate::PlacementPredictions,
+    /// Whether the farm learns what its leases use, for the scheduler's admission by load.
+    /// `off`, the default, learns nothing and writes no row. `record` and `on` need
+    /// `--scheduler-core js` and `--state-store`, and learn a profile of each action shape from
+    /// the runs the farm hears of, which they store; `on` also needs `--placement-load on` and
+    /// `--placement-predictions on`, since the scheduler reads a curve only for an action that
+    /// has a prediction. `record` places as `off` does. `on` gives the scheduler the curves, so
+    /// that an action with a prediction and a curve is charged by the curve (its cores per
+    /// minute, its remaining maximum memory, an expected life) instead of flat, which can place
+    /// work where `record` would queue it; an action with no prediction, or whose key has not
+    /// been run for over 60 days, is charged flat. A value other than `off` also changes the start line
+    /// `usage profiles: <mode>` and the gauge `kbf_usage_profiles_mode{mode}`, 1 for the mode
+    /// and 0 for the others. A server given a combination that breaks one of these refuses to
+    /// start
+    // The text above states the default; the help golden cannot hold the whitespace-only
+    // line clap prints before a `[default: ...]` line.
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = crate::UsageProfiles::Off,
+        hide_default_value = true
+    )]
+    pub usage_profiles: crate::UsageProfiles,
     /// Whether whole-machine requests are run with the scheduler's whole-node drain and
     /// caps (`--whole-node-max`), and with which settings: off unless it is given.
     #[command(flatten)]
@@ -677,7 +719,7 @@ pub struct Args {
         long,
         value_name = "URI",
         value_parser = crate::state_store::StateStoreParser,
-        display_order = 5,
+        display_order = 6,
     )]
     pub state_store: Option<crate::state_store::StateStoreUri>,
     /// How long, in seconds, a storage node's membership row lives without a heartbeat
@@ -751,6 +793,33 @@ pub enum ConfigError {
     /// An S3 setting is missing from the environment.
     #[error("{0} must be set for an s3:// store")]
     MissingEnv(&'static str),
+    /// The key file of `--cold-store-credentials-file` is refused. `why` never holds a byte
+    /// of the file.
+    #[error("--cold-store-credentials-file {}: {why}", path.display())]
+    ColdKeyFile {
+        /// The file.
+        path: PathBuf,
+        /// What is wrong with it.
+        why: String,
+    },
+    /// `--cold-store-credentials-file` with a cold store that is not `s3://`.
+    #[error(
+        "--cold-store-credentials-file needs an s3:// --cold-store: a file:// store has no keys"
+    )]
+    ColdKeyFileOnFileStore,
+    /// `--cold-store-credentials-file` with `--cold-store registered`.
+    #[error(
+        "--cold-store-credentials-file cannot be used with --cold-store registered: the \
+         registered store's keys come from the frontend's registration, and nowhere else"
+    )]
+    ColdKeyFileOnRegistered,
+    /// `--cold-store registered` on a server that is not a storage node.
+    #[error(
+        "--cold-store registered is for a storage node (kbf storage, kbf storage-and-daemon, \
+         kbf node): it takes its store from the frontend's registration, and this server \
+         has no frontend to ask"
+    )]
+    ColdRegisteredNotHere,
     /// The S3 configuration is refused.
     #[error(transparent)]
     S3(#[from] S3ConfigError),
@@ -840,6 +909,9 @@ pub enum ConfigError {
          legacy, or leave the flag out"
     )]
     NoMemoryClimbUnderJs,
+    /// `--usage-profiles` was given a value that would do nothing.
+    #[error(transparent)]
+    UsageProfiles(#[from] crate::usage_profiles::UsageProfilesError),
 }
 
 impl Args {
@@ -849,6 +921,8 @@ impl Args {
     /// # Errors
     /// [`ConfigError::LearnedSizesOnUnderJs`]: the core is `js` and `--learned-sizes` is `on`.
     /// [`ConfigError::NoMemoryClimbUnderJs`]: the core is `js` and `--no-memory-climb` is set.
+    /// [`ConfigError::UsageProfiles`]: `--usage-profiles` would do nothing (see
+    /// [`crate::usage_profiles::UsageProfilesError`]).
     pub fn check_scheduler_core(&self) -> Result<(), ConfigError> {
         let js = self.scheduler_core == crate::SchedulerCore::Js;
         if js && self.learned_sizes == crate::LearnedSizes::On {
@@ -857,6 +931,7 @@ impl Args {
         if js && self.no_memory_climb {
             return Err(ConfigError::NoMemoryClimbUnderJs);
         }
+        self.usage_profiles_fit()?;
         Ok(())
     }
 
@@ -994,6 +1069,7 @@ impl Args {
             scheduler_core: self.scheduler_core,
             placement_load: self.placement_load,
             placement_predictions: self.placement_predictions,
+            usage_profiles: self.usage_profiles,
             whole_node: self.whole_node.config(),
             finished_retention: Duration::from_secs(self.finished_retention_secs),
             shutdown_timeout: match self.shutdown_timeout_secs {

@@ -75,6 +75,41 @@ fn the_submit_evidence_fields_are_43_to_47_and_older_records_read_absent() {
 }
 
 #[test]
+fn the_invocation_fields_are_48_and_49_and_older_records_read_absent() {
+    // Catches: a field renumbered onto another (the wire would read one id as another), a
+    // record written before the fields failing to decode or reading an id, `optional` lost
+    // (an absent id written as an empty string, so a build named "" appears), and an
+    // empty id lost on the way (a present empty value is not an absent one).
+    use prost::Message as _;
+    let r = RunRecord {
+        invocation_id: Some("a".to_owned()),
+        correlated_invocations_id: Some("b".to_owned()),
+        ..RunRecord::default()
+    };
+    // Tag 48, length-delimited: key 386 (0x82 0x03); 49: key 394 (0x8a 0x03).
+    assert_eq!(
+        r.encode_to_vec(),
+        [0x82, 0x03, 0x01, b'a', 0x8a, 0x03, 0x01, b'b']
+    );
+    assert_eq!(RunRecord::decode(r.encode_to_vec().as_slice()).unwrap(), r);
+    let empty = RunRecord {
+        invocation_id: Some(String::new()),
+        ..RunRecord::default()
+    };
+    assert_eq!(empty.encode_to_vec(), [0x82, 0x03, 0x00]);
+    let older = RunRecord {
+        seq: 3,
+        ..RunRecord::default()
+    };
+    assert_eq!(older.encode_to_vec(), [0x18, 0x03]);
+    let read = RunRecord::decode(older.encode_to_vec().as_slice()).unwrap();
+    assert_eq!(
+        (read.invocation_id, read.correlated_invocations_id),
+        (None, None)
+    );
+}
+
+#[test]
 fn a_digest_prefix_is_its_first_eight_bytes() {
     // Catches: a little-endian prefix, which would not match the 16 hex digits the
     // digest is shown with.
@@ -318,4 +353,30 @@ fn the_peak_and_the_wall_are_optional_on_the_old_tags() {
     assert_eq!((old.memory_peak_bytes, old.wall_us), (Some(5), Some(300)));
     let omitted = Cgroup::decode([].as_slice()).unwrap();
     assert_eq!((omitted.memory_peak_bytes, omitted.wall_us), (None, None));
+}
+
+#[test]
+fn the_phase_times_marker_round_trips_and_an_old_record_reads_as_measured() {
+    // Catches: the marker lost on the wire, a record without it read as a claim, and the
+    // marker taking a field number another record uses (field 50; 48 and 49 are #2200's).
+    use prost::Message as _;
+    let mut r = RunRecord::default();
+    assert_eq!(r.phase_times(), PhaseTimes::Unspecified);
+    assert_eq!(r.phase_times().name(), "measured");
+    r.phase_times = PhaseTimes::TaskClaim.into();
+    let back = RunRecord::decode(r.encode_to_vec().as_slice()).expect("decodes");
+    assert_eq!(back.phase_times(), PhaseTimes::TaskClaim);
+    assert_eq!(back.phase_times().name(), "task_claim");
+    r.phase_times = PhaseTimes::Measured.into();
+    let back = RunRecord::decode(r.encode_to_vec().as_slice()).expect("decodes");
+    assert_eq!(back.phase_times().name(), "measured");
+    let only = RunRecord {
+        phase_times: PhaseTimes::TaskClaim.into(),
+        ..RunRecord::default()
+    };
+    assert_eq!(
+        only.encode_to_vec(),
+        [0x90, 0x03, 0x02],
+        "field 50, varint 2"
+    );
 }

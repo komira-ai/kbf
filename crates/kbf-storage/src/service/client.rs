@@ -178,7 +178,7 @@ pub(crate) fn lift(status: &Status, at: Option<(Digest, u64)>) -> StorageError {
 /// The generation a node named when it answered `STALE_MAP`: FAILED_PRECONDITION with the
 /// generation in the [`MAP_GENERATION_HEADER`] entry. FAILED_PRECONDITION alone is also a
 /// refused action-cache write, so the entry is what says it.
-fn stale_generation(status: &Status) -> Option<u64> {
+pub fn stale_generation(status: &Status) -> Option<u64> {
     if status.code() != Code::FailedPrecondition {
         return None;
     }

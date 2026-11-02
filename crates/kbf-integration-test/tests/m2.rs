@@ -243,12 +243,16 @@ mod fake {
             1
         };
         // Real crun makes `.cache` in its root beside the container's state: not a
-        // container.
-        std::fs::create_dir_all(lease.join("crun").join(".cache")).expect("crun's cache");
+        // container. The whole root appears at once, by a rename from a name the harness
+        // does not read: a harness polling between two `create_dir_all` calls would see
+        // the first of two containers alone, count one, and pass the defect.
+        let staged = lease.join("crun-staged");
+        std::fs::create_dir_all(staged.join(".cache")).expect("crun's cache");
         for i in 0..containers {
-            std::fs::create_dir_all(lease.join("crun").join(format!("{name}-{i}")))
+            std::fs::create_dir_all(staged.join(format!("{name}-{i}")))
                 .expect("a container's state");
         }
+        std::fs::rename(&staged, lease.join("crun")).expect("crun's root");
         let secs = args
             .iter()
             .find_map(|a| a.strip_prefix("kbf_m2.sleep_secs="));
@@ -263,7 +267,12 @@ mod fake {
         std::thread::sleep(sleep);
         // The container ends and the lease is cleaned, unless a defect leaves them.
         if !defect("container-left") {
-            let _ = std::fs::remove_dir_all(lease.join("crun"));
+            // Out of the harness's sight whole, then removed: unlinking the containers
+            // one by one would show a poll one of two for a moment.
+            let gone = lease.join("crun-gone");
+            if std::fs::rename(lease.join("crun"), &gone).is_ok() {
+                let _ = std::fs::remove_dir_all(&gone);
+            }
         }
         if !defect("container-left") & !defect("lease-left") {
             let _ = std::fs::remove_dir_all(&lease);

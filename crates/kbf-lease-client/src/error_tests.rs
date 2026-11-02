@@ -85,3 +85,20 @@ fn quota_unavailable_is_a_code_of_its_own() {
     assert_eq!(code, ErrorCode::QuotaUnavailable);
     assert_eq!(code.as_str(), "quota-unavailable");
 }
+
+/// Asserts that the two codes a lease server answers a start with files are typed: both
+/// directions of the table, so a caller can tell a host that cannot deliver files from a
+/// file that is wrong. It catches the codes falling into `Other`, where the executor would
+/// treat both as an infrastructure failure of the action.
+#[test]
+fn error_codes_files_unsupported_and_invalid_file_parse_both_ways() {
+    for (text, code) in [
+        ("files-unsupported", ErrorCode::FilesUnsupported),
+        ("invalid-file", ErrorCode::InvalidFile),
+    ] {
+        assert_eq!(ErrorCode::from_text(text), code);
+        assert_eq!(code.as_str(), text);
+        assert_eq!(code.to_string(), text);
+        assert!(CODES.contains(&(text, code)), "{text} is in the table");
+    }
+}

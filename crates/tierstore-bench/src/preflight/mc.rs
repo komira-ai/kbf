@@ -125,8 +125,16 @@ impl<'a> Mc<'a> {
 
     /// The command line of `mc` with `args` after the global flags.
     fn command(&self, args: &[&str], input: Option<String>) -> Cmd {
+        self.command_with(true, args, input)
+    }
+
+    /// [`Self::command`], with `--json` only if `json`.
+    fn command_with(&self, json: bool, args: &[&str], input: Option<String>) -> Cmd {
         let config_dir = self.config_dir.display().to_string();
-        let mut all = vec!["--config-dir", config_dir.as_str(), "--json"];
+        let mut all = vec!["--config-dir", config_dir.as_str()];
+        if json {
+            all.push("--json");
+        }
         all.extend_from_slice(args);
         let mut cmd = Cmd::new(&self.program, &all)
             .with_env(&format!("MC_HOST_{ALIAS}"), self.alias_url.clone());
@@ -147,6 +155,22 @@ impl<'a> Mc<'a> {
         let out = self.run("mc admin info", &["admin", "info", ALIAS])?;
         serde_json::from_str(&out)
             .map_err(|e| BenchError::Ops(format!("mc admin info: not JSON: {e}")))
+    }
+
+    /// `mc admin prometheus metrics` of the cluster group: the server's metrics in the Prometheus
+    /// text format, which `mc` fetches with a token of its own from the admin key. Read-only.
+    /// Plain text, not `--json`: the answer is read for one series by
+    /// [`crate::coldstate::s3_requests_total`].
+    ///
+    /// # Errors
+    /// [`BenchError::Ops`] if the command fails.
+    pub fn metrics(&self) -> Result<String, BenchError> {
+        let cmd = self.command_with(
+            false,
+            &["admin", "prometheus", "metrics", ALIAS, "cluster"],
+            None,
+        );
+        run_ok(self.host, "mc admin prometheus metrics", &cmd)
     }
 
     /// Whether the store has a bucket called `bucket` (`mc ls` of the alias, read-only).

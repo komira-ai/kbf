@@ -4,7 +4,7 @@
 //! query
 //! install kbf=<version> from <channel>
 //! switch kbf=<version>
-//! confirm kbf=<version>
+//! confirm kbf=<version>[ last_good=<version>]
 //! revert
 //! ```
 //!
@@ -29,8 +29,12 @@ pub enum LocalRequest {
     Install { version: Version, channel: Channel },
     /// Put the staged `version` in place on trial, and start the clock of the revert.
     Switch { version: Version },
-    /// Keep the release on trial: it came up healthy.
-    Confirm { version: Version },
+    /// Keep the release on trial: it came up healthy. `last_good` is the coordinator's last
+    /// good release, as the order carries it: the host keeps it whatever its age.
+    Confirm {
+        version: Version,
+        last_good: Option<Version>,
+    },
     /// Go back now to the release that ran before the one on trial.
     Revert,
 }
@@ -59,9 +63,14 @@ impl LocalRequest {
                 version: version_of(version)?,
             });
         }
-        let version = text.strip_prefix("confirm kbf=").ok_or(BadCommand)?;
+        let rest = text.strip_prefix("confirm kbf=").ok_or(BadCommand)?;
+        let (version, last_good) = match rest.split_once(" last_good=") {
+            Some((version, last_good)) => (version, Some(version_of(last_good)?)),
+            None => (rest, None),
+        };
         Ok(Self::Confirm {
             version: version_of(version)?,
+            last_good,
         })
     }
 

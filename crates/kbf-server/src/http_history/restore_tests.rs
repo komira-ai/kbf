@@ -1,8 +1,8 @@
 //! History records back into rows. Each test names the defect it catches.
 
 use kbf_history::records::{
-    Cgroup, HitHow, HitRecord, MemoryKill, Output as WireOutput, RunOutcome, RunRecord, Timestamps,
-    WireDigest,
+    Cgroup, HitHow, HitRecord, MemoryKill, Output as WireOutput, PhaseTimes, RunOutcome, RunRecord,
+    Timestamps, WireDigest,
 };
 use kbf_invocation::{AttemptEnd, How, Outcome, RunUsage, TargetKind, WallTime};
 use kbf_sched::RequeueReason;
@@ -614,6 +614,7 @@ fn measured_row(usage: RunUsage) -> kbf_invocation::ActionRow {
                 booked_memory_bytes: None,
                 booked_millicpus: None,
                 cap_bytes: None,
+                phase_times: Default::default(),
             })),
             run_id: None,
         }],
@@ -825,4 +826,39 @@ fn a_record_that_kept_one_evidence_field_comes_back_with_evidence() {
     assert_eq!((bytes.input_bytes, bytes.input_files), (Some(9), None));
     let files = rows[2].evidence.expect("input files alone");
     assert_eq!((files.input_bytes, files.input_files), (None, Some(4)));
+}
+
+/// Catches the marker lost on a restore: a record of a task's claim restores to a run that
+/// says so, a record of a daemon's run to a measured one, and a record written before the
+/// marker (unspecified) to a measured one, which is what such a record was.
+#[test]
+fn an_attempt_keeps_where_its_phase_times_came_from() {
+    let read = |marker: PhaseTimes| {
+        let mut r = run(1, 1_000, 4, RunOutcome::Ok);
+        r.phase_times = marker.into();
+        r.timestamps = Some(Timestamps {
+            queued_us: 100,
+            granted_us: 200,
+            worker_start_us: 300,
+            ..Timestamps::default()
+        });
+        let (rows, _) = to_rows(&[r], &[]);
+        rows[0].attempts[0]
+            .run
+            .as_deref()
+            .expect("a run")
+            .phase_times
+    };
+    assert_eq!(
+        read(PhaseTimes::TaskClaim),
+        kbf_invocation::PhaseTimes::TaskClaim
+    );
+    assert_eq!(
+        read(PhaseTimes::Measured),
+        kbf_invocation::PhaseTimes::Measured
+    );
+    assert_eq!(
+        read(PhaseTimes::Unspecified),
+        kbf_invocation::PhaseTimes::Measured
+    );
 }

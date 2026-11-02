@@ -14,25 +14,30 @@
 //! in which GitHub answers an error is tried again, and the wait fails with that error only when
 //! [`FAILED_LOOKS`] looks in a row have failed: one bad reply is not the end of an hour's wait.
 //!
+//! **Grace after the last job.** The artifact list can lag behind the job list: the last shard
+//! may be seen finished while the artifact it uploaded a second earlier is not listed yet. When
+//! every such job has finished and a named artifact is still missing, the wait therefore goes on
+//! for `--grace-polls` further looks (at the same interval) before it fails naming what is
+//! missing; when the artifacts come in the grace, the line printed says after how many looks.
+//!
 //! **Artifacts of an earlier attempt.** A re-run of the run keeps the run id and the artifacts
 //! of its earlier attempts, so a name that is there is not proof that this attempt's shard made
 //! it. An `--artifact` may therefore say which job makes it, `NAME=JOBTEXT`: the job whose name
-//! contains `JOBTEXT`, as the jobs reply of `filter=latest` lists it (one job of each name).
-//! Such an artifact counts only when it was created at or after that job's `started_at`; with
-//! no job of that text listed it does not count. The rule rests on timestamps alone, because of
-//! the shape GitHub gives a re-run:
+//! contains `JOBTEXT` (of the jobs reply of `filter=latest`; if a name is listed for more than one
+//! attempt, the newest attempt's record is the one). With no job of that text listed it does not
+//! count. Whether the job ran in this attempt of the run decides:
 //!
-//! - "Re-run all jobs": every job is new and starts after the artifacts of the first attempt were
-//!   made, so none of those counts, and the wait goes on until each shard has uploaded again.
-//! - "Re-run failed jobs": the shards that passed come back as new job records of the newest
-//!   attempt but with their original `started_at`, so the artifact they made then is not older
-//!   than their start and counts. The shard that runs again has a new `started_at` (a queued job
-//!   has its creation time), after any artifact an earlier attempt left, so it is waited for.
-//! - Only this job re-run: the shards keep their `started_at` and their artifacts count at once.
+//! - A job that did **not** run in this attempt (carried over by "Re-run failed jobs" or "Re-run
+//!   this job"; its `run_attempt` is older than the run's, or its `started_at` precedes the
+//!   attempt's `run_started_at`) made its artifact in an earlier attempt, which is the artifact to
+//!   use: it counts whatever its time is.
+//! - A job that **did** run in this attempt counts only when its artifact was created at or after
+//!   the job's `started_at` (a queued job has its creation time). Attempt 1's artifacts, which
+//!   "Re-run all jobs" and "Re-run failed jobs" leave in place for the shards that run again, are
+//!   older than that, so the wait goes on until each such shard has uploaded again.
 //!
-//! The attempt number of a job is not used: carried-over jobs carry the newest one. A time is an
-//! RFC 3339 string in UTC, which orders as text. An `--artifact` with no `=` counts by its name
-//! alone.
+//! A time is an RFC 3339 string in UTC, which orders as text. An `--artifact` with no `=` counts
+//! by its name alone.
 //!
 //! GitHub is spoken to with `gh api` ([`crate::advisories::Process`]); the job's token needs
 //! the `actions: read` permission.
@@ -73,6 +78,9 @@ pub struct Args {
     /// The most looks at the run (the default is an hour at the default interval).
     #[arg(long, default_value_t = 240)]
     pub polls: u32,
+    /// The further looks after every job has finished, for an artifact that is not listed yet.
+    #[arg(long, default_value_t = 8)]
+    pub grace_polls: u32,
     /// The `gh` program.
     #[arg(long, default_value = "gh")]
     pub gh: PathBuf,
@@ -124,20 +132,62 @@ struct Shard<'a> {
     conclusion: Option<&'a str>,
     /// When the job started (an RFC 3339 time in UTC, which orders as text).
     started: Option<&'a str>,
+    /// The attempt of the run the record is of; `None` when the reply does not say.
+    attempt: Option<u64>,
+}
+
+/// The attempt of the run that is being waited in.
+#[derive(Default)]
+struct Attempt {
+    number: Option<u64>,
+    /// When the attempt began.
+    started: Option<String>,
+}
+
+impl Attempt {
+    fn of(run: &Value) -> Self {
+        Attempt {
+            number: run.get("run_attempt").and_then(Value::as_u64),
+            started: run
+                .get("run_started_at")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        }
+    }
+
+    /// Whether the job did not run in this attempt: its record is of an earlier one, or it
+    /// started before this one began.
+    fn carried_over(&self, shard: &Shard) -> bool {
+        let earlier = matches!((shard.attempt, self.number), (Some(a), Some(n)) if a < n);
+        let before = matches!((shard.started, &self.started), (Some(s), Some(b)) if s < b.as_str());
+        earlier || before
+    }
 }
 
 /// The jobs whose name contains `prefix`.
+/// A name listed for more than one attempt is the record of the newest.
 fn shards<'a>(jobs: &'a Value, prefix: &str) -> Vec<Shard<'a>> {
-    items(jobs, "jobs")
-        .filter_map(|job| {
-            let name = job.get("name")?.as_str()?;
-            name.contains(prefix).then(|| Shard {
-                name,
-                conclusion: job.get("conclusion").and_then(Value::as_str),
-                started: job.get("started_at").and_then(Value::as_str),
-            })
-        })
-        .collect()
+    let mut found: Vec<Shard<'a>> = Vec::new();
+    for job in items(jobs, "jobs") {
+        let Some(name) = job.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        if !name.contains(prefix) {
+            continue;
+        }
+        let shard = Shard {
+            name,
+            conclusion: job.get("conclusion").and_then(Value::as_str),
+            started: job.get("started_at").and_then(Value::as_str),
+            attempt: job.get("run_attempt").and_then(Value::as_u64),
+        };
+        match found.iter_mut().find(|s| s.name == name) {
+            Some(old) if old.attempt <= shard.attempt => *old = shard,
+            Some(_) => {}
+            None => found.push(shard),
+        }
+    }
+    found
 }
 
 /// The first of the jobs that did not succeed, as `name (conclusion)`.
@@ -157,18 +207,20 @@ fn split(want: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// Whether `artifact` was made by the job named by `job`: created at or after its start.
-fn made_by(artifact: &Value, job: &str, shards: &[Shard]) -> bool {
+/// Whether `artifact` is the one of the job named by `job`: the job did not run in this attempt,
+/// or the artifact was created at or after its start.
+fn made_by(artifact: &Value, job: &str, shards: &[Shard], attempt: &Attempt) -> bool {
     let mine: Vec<&Shard> = shards.iter().filter(|s| s.name.contains(job)).collect();
     let created = artifact.get("created_at").and_then(Value::as_str);
     !mine.is_empty()
-        && mine
-            .iter()
-            .all(|s| matches!((s.started, created), (Some(start), Some(made)) if made >= start))
+        && mine.iter().all(|s| {
+            attempt.carried_over(s)
+                || matches!((s.started, created), (Some(start), Some(made)) if made >= start)
+        })
 }
 
 /// The names of `wanted` that no live (not expired) artifact of the reply counts for.
-fn missing(reply: &Value, wanted: &[String], shards: &[Shard]) -> Vec<String> {
+fn missing(reply: &Value, wanted: &[String], shards: &[Shard], attempt: &Attempt) -> Vec<String> {
     let live: Vec<&Value> = items(reply, "artifacts")
         .filter(|a| !a.get("expired").and_then(Value::as_bool).unwrap_or(false))
         .collect();
@@ -178,7 +230,7 @@ fn missing(reply: &Value, wanted: &[String], shards: &[Shard]) -> Vec<String> {
         .filter(|(name, job)| {
             !live.iter().any(|a| {
                 a.get("name").and_then(Value::as_str) == Some(name)
-                    && job.is_none_or(|j| made_by(a, j, shards))
+                    && job.is_none_or(|j| made_by(a, j, shards, attempt))
             })
         })
         .map(|(name, _)| name.to_owned())
@@ -210,10 +262,19 @@ pub fn wait(github: &mut dyn Github, args: &Args) -> Result<String, Error> {
         .map(|a| split(a).0.to_owned())
         .collect();
     let mut failed_looks = 0;
+    let mut attempt: Option<Attempt> = None;
+    let mut grace = 0;
     for look in 0..args.polls {
         if look > 0 {
             github.pause();
         }
+        if attempt.is_none() {
+            let Some(reply) = tolerate(github.get(&run), &mut failed_looks)? else {
+                continue;
+            };
+            attempt = Some(Attempt::of(&reply));
+        }
+        let attempt_now = attempt.as_ref().expect("fetched above");
         let Some(jobs) = tolerate(
             github.get(&format!("{run}/jobs?filter=latest&per_page=100")),
             &mut failed_looks,
@@ -235,10 +296,15 @@ pub fn wait(github: &mut dyn Github, args: &Args) -> Result<String, Error> {
             continue;
         };
         failed_looks = 0;
-        absent = missing(&reply, &args.artifacts, &shards);
+        absent = missing(&reply, &args.artifacts, &shards, attempt_now);
         if absent.is_empty() {
+            let late = if grace > 0 {
+                format!(" (listed {grace} look(s) after the last job finished)")
+            } else {
+                String::new()
+            };
             return Ok(format!(
-                "wait-artifacts: the {} artifact(s) are there: {}",
+                "wait-artifacts: the {} artifact(s) are there: {}{late}",
                 args.artifacts.len(),
                 args.artifacts
                     .iter()
@@ -248,11 +314,15 @@ pub fn wait(github: &mut dyn Github, args: &Args) -> Result<String, Error> {
             ));
         }
         if !shards.is_empty() && shards.iter().all(|s| s.conclusion.is_some()) {
-            return Err(Error::Failed(format!(
-                "every job named {}* has finished and these artifacts did not come: {}",
-                args.job_prefix,
-                absent.join(", ")
-            )));
+            if grace >= args.grace_polls {
+                return Err(Error::Failed(format!(
+                    "every job named {}* has finished and these artifacts did not come, even {} look(s) later: {}",
+                    args.job_prefix,
+                    grace,
+                    absent.join(", ")
+                )));
+            }
+            grace += 1;
         }
     }
     Err(Error::Failed(format!(

@@ -18,6 +18,9 @@ type Hook = Box<dyn FnOnce() + Send>;
 pub struct Hooked {
     pub fake: Arc<Fake>,
     pub clock: Arc<ManualClock>,
+    /// Woken after every batch the store applied, so a test waits for a write instead of
+    /// polling for it.
+    pub written: tokio::sync::Notify,
     after_get: Mutex<Option<(String, Hook)>>,
     counts: Mutex<Vec<(String, Arc<AtomicUsize>)>>,
     conflict_on: Mutex<Option<String>>,
@@ -43,6 +46,7 @@ impl Hooked {
         Arc::new(Hooked {
             fake: Arc::new(Fake::with_flaw(Arc::clone(&clock), Flaw::None)),
             clock,
+            written: tokio::sync::Notify::new(),
             after_get: Mutex::new(None),
             counts: Mutex::new(Vec::new()),
             conflict_on: Mutex::new(None),
@@ -142,8 +146,8 @@ fn writes_map(txn: &Txn) -> bool {
         .any(|op| matches!(op, Op::Put { key, .. } if key == "map"))
 }
 
-impl Store for Hooked {
-    fn apply_batch(&self, batch: Vec<Txn>) -> Result<Vec<Result<Commit, Conflict>>, StoreError> {
+impl Hooked {
+    fn apply(&self, batch: Vec<Txn>) -> Result<Vec<Result<Commit, Conflict>>, StoreError> {
         if self
             .fail_txns
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
@@ -176,6 +180,15 @@ impl Store for Hooked {
             answers.push(answer);
         }
         Ok(answers)
+    }
+}
+
+impl Store for Hooked {
+    fn apply_batch(&self, batch: Vec<Txn>) -> Result<Vec<Result<Commit, Conflict>>, StoreError> {
+        let answers = self.apply(batch);
+        // Woken whatever the answer: an error can come after earlier txns of the batch landed.
+        self.written.notify_waiters();
+        answers
     }
 
     fn get(&self, key: &str) -> Result<Option<Versioned>, StoreError> {

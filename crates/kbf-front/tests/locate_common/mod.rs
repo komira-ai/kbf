@@ -15,7 +15,7 @@ use bytes::Bytes;
 use futures::future::BoxFuture;
 use kbf_front::digest_to_proto;
 use kbf_front::grants::{GrantKey, Grants, MIN_SECRET_LEN};
-use kbf_front::job_read::{BlobSource, JobRead, LOCATE_PATH, Limits, Reply, Span};
+use kbf_front::job_read::{BlobSource, JobRead, LOCATE_PATH, Limits, Reply, Span, StoreGrants};
 use kbf_proto::reapi::{Action, Directory, DirectoryNode, FileNode};
 use kbf_storage::{ReadStream, StorageError};
 use kbf_types::Digest;
@@ -248,28 +248,42 @@ pub struct Rig {
     pub source: Arc<Source>,
     pub read: JobRead,
     pub grants: Arc<Grants>,
+    /// The time the grants are checked at, in unix seconds.
+    pub clock: Arc<AtomicU64>,
 }
 
 pub fn rig(source: Source, limits: Limits) -> Rig {
+    rig_granting(source, limits, None)
+}
+
+/// A rig whose locate hands out store grants made by `store`, if there is one.
+pub fn rig_granting(source: Source, limits: Limits, store: Option<StoreGrants>) -> Rig {
     let key = GrantKey::from_secret(&[1; MIN_SECRET_LEN]).expect("a long enough secret");
     let clock = Arc::new(AtomicU64::new(100));
+    let ticks = Arc::clone(&clock);
     let grants = Arc::new(Grants::new(
         key,
-        Arc::new(move || clock.load(Ordering::SeqCst)),
+        Arc::new(move || ticks.load(Ordering::SeqCst)),
     ));
     let source = Arc::new(source);
-    let read = JobRead::new(source.clone(), Arc::clone(&grants), limits);
+    let read = JobRead::new(source.clone(), Arc::clone(&grants), limits).with_store_grants(store);
     Rig {
         source,
         read,
         grants,
+        clock,
     }
 }
 
 impl Rig {
     pub fn token(&self, action: Digest) -> String {
+        self.token_until(action, NOT_AFTER)
+    }
+
+    /// The read grant of `action` that ends at the unix time `not_after`.
+    pub fn token_until(&self, action: Digest, not_after: u64) -> String {
         self.grants
-            .issue(BUILD, action, NOT_AFTER)
+            .issue(BUILD, action, not_after)
             .expect("a valid build id")
             .expose()
             .to_owned()

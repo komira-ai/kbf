@@ -9,7 +9,8 @@
 //! the last one is answered (the sum of the requests' times, for a multipart put).
 //!
 //! The counts and sizes are the plan's; an operator narrows them with `--object-bytes` and
-//! `--in-flight`, and leaves out the open-loop arms with `--open-loop off`. The ledger refuses
+//! `--in-flight`, leaves out the open-loop arms with `--open-loop off`, and sets the count of a
+//! multipart path's closed-loop arms with `--multipart-objects` (at most that many). The ledger refuses
 //! what does not fit the caps, and is asked about the arms built, so a plan without the open-loop
 //! arms costs without them.
 
@@ -18,6 +19,7 @@ use std::sync::Arc;
 use crate::cells::content;
 use crate::cells::engine::{Arm, Cap, Env, FaultSwitch, Pace, Step, hook, slug, work};
 use crate::cells::modes::{Mode, put_modes, width_ok};
+use crate::cells::stats;
 use crate::cells::{CellId, CellPlan};
 use crate::error::BenchError;
 use crate::proxy::FaultMode;
@@ -70,6 +72,17 @@ pub fn requests_for(size: u64, in_flight: u32) -> u64 {
     if in_flight >= 16 { wide } else { narrow }
 }
 
+/// The note an arm with `requests` objects per pass carries when no p99 may be claimed from it:
+/// below [`stats::P99_MIN_N`] a p99 is the slowest request or close to it. `None` from that many
+/// requests on.
+#[must_use]
+pub fn p99_note(requests: u64) -> Option<String> {
+    let least = u64::try_from(stats::P99_MIN_N).unwrap_or(u64::MAX);
+    (requests < least).then(|| {
+        format!("p99 not reported: {requests} objects per pass, fewer than the 1,000 a p99 needs")
+    })
+}
+
 /// The open-loop arms: `(size, requests per second, seconds)`.
 const OPEN_LOOP: [(u64, u32, u64); 2] = [(19 * KIB, 20, 600), (MIB, 10, 300)];
 
@@ -119,7 +132,7 @@ impl Putter {
 }
 
 /// The notes every arm of a put cell carries, for the path and the mode.
-fn notes(cell: CellId, path: &PutPath, mode: &Mode, size: u64) -> Vec<String> {
+fn notes(cell: CellId, path: &PutPath, mode: &Mode, size: u64, requests: u64) -> Vec<String> {
     let how = match (path.multipart, path.role) {
         (true, Role::Instance) => {
             "a multipart upload through the instance: its parts go straight to the cold tier and do not touch the hot tier. The instance has no cold-only mode at the pinned tag, so it runs with a hot tier of its own on the same host (two-tier mode); this arm measures the cold path of it"
@@ -136,14 +149,16 @@ fn notes(cell: CellId, path: &PutPath, mode: &Mode, size: u64) -> Vec<String> {
         || "none: the cold store as it is".to_owned(),
         |f| format!("{f:?} through the fault proxy (the arm of mode proxy-pass is its control)"),
     );
-    vec![
+    let mut notes = vec![
         format!("{}: put-to-ack by {}, {how}", cell.as_str(), path.name),
         format!("test instance and test buckets; fault: {fault}"),
         format!(
             "every object of the arm has the same {} seeded bytes; keys are unique per pass",
             size_label(size)
         ),
-    ]
+    ];
+    notes.extend(p99_note(requests));
+    notes
 }
 
 /// The arms of a put cell: every path the run configures, at every size, in flight and mode.
@@ -187,8 +202,16 @@ pub fn arms(
                     .in_flight
                     .map_or_else(|| plan.in_flight.clone(), |n| vec![n]);
                 for &in_flight in flights.iter().filter(|&&n| width_ok(n, size)) {
+                    // `--multipart-objects` caps the plan's count of a multipart path, it never
+                    // raises it; the fault modes' own counts are small already and stay.
+                    let planned = |size, in_flight| {
+                        let count = requests_for(size, in_flight);
+                        plan.multipart_objects
+                            .filter(|_| path.multipart)
+                            .map_or(count, |n| n.min(count))
+                    };
                     let requests = mode
-                        .requests(size, in_flight, requests_for)
+                        .requests(size, in_flight, planned)
                         .min(limit.unwrap_or(u64::MAX));
                     let label = slug(&format!(
                         "{}-{}-c{in_flight}-{}",
@@ -208,7 +231,7 @@ pub fn arms(
                         Pace::Closed,
                         in_flight,
                         requests,
-                        notes(cell, path, &mode, size),
+                        notes(cell, path, &mode, size, requests),
                         putter,
                         mode.fault.zip(faults.clone()),
                     ));
@@ -231,7 +254,7 @@ pub fn arms(
                         body: body.clone(),
                         prefix: format!("{}/{}", env.prefix(), label),
                     };
-                    let mut notes = notes(cell, path, &mode, size);
+                    let mut notes = notes(cell, path, &mode, size, requests);
                     notes.push(format!(
                         "open loop: {per_sec} puts per second for {secs} s; a put that goes out late has its delay in its latency"
                     ));
@@ -285,6 +308,7 @@ fn arm(
         .as_ref()
         .is_some_and(|(mode, _)| *mode != FaultMode::Pass);
     let switch = fault.map(|(_, switch)| switch);
+    let proxy = switch.clone();
     Arm {
         label,
         pace,
@@ -309,6 +333,7 @@ fn arm(
         })),
         faulted,
         notes,
+        proxy,
     }
 }
 
@@ -332,7 +357,13 @@ mod tests {
             in_flight: in_flight.to_vec(),
             object_bytes: sizes.to_vec(),
             open_loop: true,
+            multipart_objects: None,
         }
+    }
+
+    fn with_multipart_objects(mut plan: CellPlan, n: u64) -> CellPlan {
+        plan.multipart_objects = Some(n);
+        plan
     }
 
     fn summary(arms: &[Arm]) -> Vec<(String, u64, u32)> {
@@ -451,6 +482,96 @@ mod tests {
         )
         .unwrap();
         assert!(capped.iter().all(|a| a.requests == 5));
+    }
+
+    /// Catches the multipart count leaking into a single-PUT arm, not reaching a multipart one
+    /// (at any width, size or role), reaching the open-loop arms (their count is a rate times a
+    /// time), or the ledger being asked for the plan's bytes and not the arm's own: with 7
+    /// objects, `direct` keeps 1,000 and 100, both multipart paths have 7, and each arm's cold
+    /// bytes are its own count times its size.
+    #[test]
+    fn the_multipart_count_is_the_multipart_arms_own_and_the_ledger_follows_it() {
+        let (_dir, env) = env(&[
+            (Role::Cold, "http://127.0.0.1:9"),
+            (Role::Instance, "http://127.0.0.1:9"),
+        ]);
+        let plan = with_multipart_objects(plan(&[1, 16], &[19 * 1024, 16 * MIB]), 7);
+        let arms = arms(&env, CellId::ColdPut, &PATHS, &plan, None, None).unwrap();
+        let closed: Vec<(&str, u64, u64)> = arms
+            .iter()
+            .filter(|a| !matches!(a.pace, Pace::Open { .. }))
+            .map(|a| (a.label.as_str(), a.requests, a.cold_bytes_per_pass))
+            .collect();
+        let size = |label: &str| {
+            if label.contains("19kib") {
+                19 * 1024
+            } else {
+                16 * MIB
+            }
+        };
+        for (label, requests, cold_bytes) in &closed {
+            let want = if label.starts_with("direct-") && !label.starts_with("direct-mp") {
+                requests_for(size(label), if label.contains("c16") { 16 } else { 1 })
+            } else {
+                7
+            };
+            assert_eq!(*requests, want, "{label}");
+            assert_eq!(*cold_bytes, want * size(label), "{label}");
+        }
+        assert_eq!(closed.len(), 12);
+        let open: Vec<(&str, u64)> = arms
+            .iter()
+            .filter(|a| matches!(a.pace, Pace::Open { .. }))
+            .map(|a| (a.label.as_str(), a.requests))
+            .collect();
+        assert_eq!(
+            open,
+            [
+                ("direct-19kib-open20-healthy", 12_000),
+                ("direct-mp-19kib-open20-healthy", 12_000),
+                ("instance-19kib-open20-healthy", 12_000),
+            ]
+        );
+    }
+
+    /// Catches the flag raising an arm: it is a cap, so with 200 a 4 KiB multipart arm (plan
+    /// 1,000) is cut to 200, and a 16 MiB one (plan 100 narrow, 64 wide) keeps its smaller plan.
+    #[test]
+    fn the_multipart_count_caps_an_arm_and_never_raises_it() {
+        let (_dir, env) = env(&[(Role::Cold, "http://127.0.0.1:9")]);
+        let plan = with_multipart_objects(plan(&[1, 16], &[4096, 16 * MIB]), 200);
+        let arms = arms(&env, CellId::ColdPut, &PATHS, &plan, None, None).unwrap();
+        let mut counts: Vec<(&str, u64)> = arms
+            .iter()
+            .filter(|a| a.label.starts_with("direct-mp") & !a.label.contains("open"))
+            .map(|a| (a.label.as_str(), a.requests))
+            .collect();
+        counts.sort_unstable();
+        assert_eq!(
+            counts,
+            [
+                ("direct-mp-16mib-c1-healthy", 100),
+                ("direct-mp-16mib-c16-healthy", 64),
+                ("direct-mp-4kib-c1-healthy", 200),
+                ("direct-mp-4kib-c16-healthy", 200),
+            ]
+        );
+    }
+
+    /// Catches a p99 note that is missing below a thousand objects, or present from a thousand:
+    /// the line is the one `P99_MIN_N` draws, and the note names the count.
+    #[test]
+    fn the_p99_note_is_there_below_a_thousand_objects_and_only_there() {
+        assert_eq!(
+            p99_note(999).as_deref(),
+            Some("p99 not reported: 999 objects per pass, fewer than the 1,000 a p99 needs")
+        );
+        assert_eq!(
+            p99_note(12).as_deref(),
+            Some("p99 not reported: 12 objects per pass, fewer than the 1,000 a p99 needs")
+        );
+        assert_eq!(p99_note(1000), None);
+        assert_eq!(p99_note(12_000), None);
     }
 
     const GIB: u64 = 1 << 30;

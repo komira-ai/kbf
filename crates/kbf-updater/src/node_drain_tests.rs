@@ -7,7 +7,7 @@ use serde_json::json;
 use crate::inventory::{Host, Role};
 use crate::node_drain::NodeDrain;
 use crate::operator::OperatorApi;
-use crate::ports::{Drain, Placed, PortErrorKind};
+use crate::ports::{Drain, Placed, PortErrorKind, Seen};
 use crate::testutil::{FakeApi, KEY, TOKEN, closed_port, fake_api_by, file, http, scratch};
 
 fn dm(node_id: Option<&str>) -> Host {
@@ -306,6 +306,25 @@ fn placed_reads_the_nodes_state_and_only_serving_is_in_placement() {
             sent[0]
         );
         assert!(sent[0].contains(&format!("Authorization: Bearer {TOKEN}\r\n")));
+    }
+}
+
+/// Catches a plain operator cordon being read as a drain: only `cordoned` is a plain cordon,
+/// and every drain state is a drain, so that the agent's marks can tell whose cordon it is.
+#[test]
+fn seen_tells_a_plain_cordon_from_a_drain() {
+    for (state, want) in [
+        ("serving", Seen::Serving),
+        ("cordoned", Seen::Cordoned),
+        ("draining", Seen::Draining),
+        ("drained", Seen::Draining),
+        ("drain_paused", Seen::Draining),
+        // A state this build does not know is not the updater's drain.
+        ("quarantined", Seen::Cordoned),
+    ] {
+        let server = answering(200, &node(state, &[]));
+        let got = adapter(&server, "nd-seen").seen_if_known(&dm(Some("dm-node")));
+        assert_eq!(got, Ok(Some(want)), "{state}");
     }
 }
 

@@ -109,9 +109,9 @@ pub struct InstallArgs {
 
 #[derive(Args)]
 pub struct GcArgs {
-    /// Keep this many release directories besides the current, previous and staged ones,
-    /// the newest first.
-    #[arg(long, default_value_t = 0)]
+    /// Keep this many release directories besides the ones that must stay (current, previous,
+    /// staged, in use, pinned and the coordinator's last good), the newest first: 2 or more.
+    #[arg(long, default_value_t = kbf_installer::retain::DEFAULT_KEEP, value_parser = kbf_installer::retain::parse_keep)]
     keep: usize,
     #[command(flatten)]
     apply: ApplyArgs,
@@ -307,6 +307,10 @@ pub fn status_lines(host: &Layout, status: &Status) -> String {
         }
     };
     text.push_str(&format!("current link: {link} ({verdict})\n"));
+    match release::kept(host) {
+        Ok(kept) => text.push_str(&kbf_installer::retain::lines(&kept)),
+        Err(e) => text.push_str(&format!("releases kept: cannot tell: {e}\n")),
+    }
     text
 }
 
@@ -327,6 +331,10 @@ pub fn status_json(host: &Layout, status: &Status) -> serde_json::Value {
             "target": target,
             "matches_state": status.link_matches(),
         },
+        "releases": release::kept(host).map_err(|e| e.to_string()).map_or_else(
+            |e| serde_json::json!({"error": e}),
+            |kept| serde_json::json!(kept),
+        ),
     })
 }
 

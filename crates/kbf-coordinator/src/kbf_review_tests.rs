@@ -29,6 +29,11 @@ fn announcing_other(mut top: Heartbeat, service: &str, running: &str) -> Heartbe
         health: Health::Healthy,
         last_update: None,
         updating: None,
+        step: None,
+        commit: None,
+        step_secs: Default::default(),
+        promotion_pending: false,
+        deferred: None,
     }]);
     top
 }
@@ -198,14 +203,19 @@ fn the_hold_strings_are_the_ones_the_status_documents() {
             Hold::NoDesired => "no_desired",
             Hold::NotAMember => "not_a_member",
             Hold::Quiet => "quiet",
+            Hold::Absent => "absent",
             Hold::Updating => "updating",
             Hold::BusyElsewhere => "busy_elsewhere",
             Hold::UpToDate => "up_to_date",
             Hold::FailedHere => "failed_here",
+            Hold::Deferred => "deferred",
             Hold::NoSlot => "no_slot",
             Hold::WaitingForRole => "waiting_for_role",
             Hold::WaitingForService => "waiting_for_service",
             Hold::MinUp => "min_up",
+            Hold::Baking => "baking",
+            Hold::CanaryWait => "canary_wait",
+            Hold::Bad => "bad",
         }
     };
     for hold in [
@@ -213,14 +223,19 @@ fn the_hold_strings_are_the_ones_the_status_documents() {
         Hold::NoDesired,
         Hold::NotAMember,
         Hold::Quiet,
+        Hold::Absent,
         Hold::Updating,
         Hold::BusyElsewhere,
         Hold::UpToDate,
         Hold::FailedHere,
+        Hold::Deferred,
         Hold::NoSlot,
         Hold::WaitingForRole,
         Hold::WaitingForService,
         Hold::MinUp,
+        Hold::Baking,
+        Hold::CanaryWait,
+        Hold::Bad,
     ] {
         assert_eq!(json!(hold), json!(spelled(hold)));
     }

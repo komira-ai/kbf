@@ -44,6 +44,8 @@ kbf-mdm.workspace = true
 kbf-state.workspace = true
 kbf-unitfile.workspace = true
 plist.workspace = true
+# rustix: the token file of `host-status` is opened with O_NOFOLLOW.
+rustix = { workspace = true, features = ["fs", "process"] }
 rustls.workspace = true
 rustls-native-certs.workspace = true
 serde.workspace = true
@@ -67,7 +69,6 @@ kbf-mdm = { workspace = true, features = ["testkit"] }
 # The certificates of the HTTPS servers the `mdm` tests run, and the ones
 # `linux verify-cert` is tested against.
 rcgen.workspace = true
-rustix = { workspace = true, features = ["process"] }
 # Databases a state restore must refuse: another application's, a damaged one.
 rusqlite.workspace = true
 

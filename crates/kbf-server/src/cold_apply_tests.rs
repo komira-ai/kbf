@@ -301,7 +301,7 @@ fn flag() -> S3Uri {
 #[tokio::test(start_paused = true)]
 async fn a_node_with_its_own_keys_starts_on_them_when_the_frontend_is_down() {
     let (joiner, dials) = unreachable_frontend();
-    let cold = Registrable::new(&flag(), keys).expect("a store");
+    let cold = Registrable::new(&flag(), None, keys).expect("a store");
     let before = Instant::now();
     // A bound that is lost would ask for ever: the paused clock would run on, so the
     // test says so after ten virtual minutes instead of hanging.
@@ -332,7 +332,7 @@ async fn a_node_with_its_own_keys_starts_on_them_when_the_frontend_is_down() {
 #[tokio::test(start_paused = true)]
 async fn a_node_with_no_keys_asks_until_the_frontend_answers() {
     let (joiner, dials) = unreachable_frontend();
-    let cold = Registrable::new(&flag(), no_keys).expect("a store");
+    let cold = Registrable::new(&flag(), None, no_keys).expect("a store");
     let joined = joined(3);
     let mut asking = std::pin::pin!(cold.registered(&joiner, &joined));
     for second in 0..600 {
@@ -353,7 +353,7 @@ async fn a_node_with_no_keys_asks_until_the_frontend_answers() {
 #[tokio::test(start_paused = true)]
 async fn with_nothing_registered_the_node_runs_on_its_flags_or_says_what_is_missing() {
     let (joiner, dials) = unreachable_frontend();
-    let cold = Registrable::new(&flag(), keys).expect("a store");
+    let cold = Registrable::new(&flag(), None, keys).expect("a store");
     let (_store, applied) = cold
         .registered(&joiner, &joined(0))
         .await
@@ -367,7 +367,7 @@ async fn with_nothing_registered_the_node_runs_on_its_flags_or_says_what_is_miss
             .is_empty()
     );
 
-    let cold = Registrable::new(&flag(), no_keys).expect("a store");
+    let cold = Registrable::new(&flag(), None, no_keys).expect("a store");
     let Err(error) = cold.registered(&joiner, &joined(0)).await else {
         panic!("a node with no keys and no registration starts");
     };
@@ -391,18 +391,21 @@ async fn with_nothing_registered_the_node_runs_on_its_flags_or_says_what_is_miss
 #[test]
 fn a_node_with_no_frontend_needs_its_own_keys() {
     assert!(
-        Registrable::new(&flag(), keys)
+        Registrable::new(&flag(), None, keys)
             .expect("a store")
             .alone()
             .is_ok()
     );
-    let Err(error) = Registrable::new(&flag(), no_keys).expect("a store").alone() else {
+    let Err(error) = Registrable::new(&flag(), None, no_keys)
+        .expect("a store")
+        .alone()
+    else {
         panic!("a store with no keys opens");
     };
     assert!(error.to_string().contains("AWS_ACCESS_KEY_ID"));
     // A refused configuration is not a missing key.
     let bad = uri("bkt", "kbf/", "https://s3.example");
-    assert!(Registrable::new(&bad, keys).is_err());
+    assert!(Registrable::new(&bad, None, keys).is_err());
 }
 
 /// Catches a `file://` node that reports a registration as its own (defect: `running`) or
@@ -528,7 +531,7 @@ fn registered(s3: &FakeS3, generation: u64, secret: &str) -> GetStoreConfigRespo
 /// The node's flag: the store of the fake, and `keys` of its own or none.
 fn flagged(s3: &FakeS3, keys: bool) -> Registrable {
     let flag = uri("bkt", "kbf/", s3.endpoint());
-    Registrable::new(&flag, if keys { own } else { no_keys }).expect("a store")
+    Registrable::new(&flag, None, if keys { own } else { no_keys }).expect("a store")
 }
 
 fn own(name: &str) -> Option<String> {
@@ -619,7 +622,7 @@ async fn the_registered_store_puts_as_the_registration_says() {
         let joiner = answering(Ok(answer)).await;
         let mut flag = uri("bkt", "kbf/", s3.endpoint());
         flag.conditional_put = !conditional;
-        let node = Registrable::new(&flag, no_keys).expect("a store");
+        let node = Registrable::new(&flag, None, no_keys).expect("a store");
         let (store, _) = within(node.registered(&joiner, &joined(7)))
             .await
             .expect("opens on the registration");

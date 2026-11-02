@@ -6,7 +6,7 @@ use kbf_proto::worker::{Lost, MemoryKill};
 use kbf_types::LeaseId;
 use tonic::Code;
 
-use super::{Settled, Verdict, judge, ran, result_of};
+use super::{Settled, Verdict, judge, ran, refused_for_files, result_of};
 
 fn run(state: RunState, outcome: Option<Outcome>, exit_code: Option<i32>) -> Run {
     Run {
@@ -192,6 +192,51 @@ fn a_start_refused_for_the_quota_is_lost_to_the_host() {
     bare.detail = None;
     assert!(matches!(
         judge(&bare, false),
+        Verdict::Settled(Settled::Infra(_))
+    ));
+}
+
+/// Catches the agent's own refusal of files (the detail of a run that failed to start) being a
+/// plain infrastructure failure that leaves the host in use: `files-unsupported` on a start
+/// that failed is recognised, and still the action's infrastructure failure to rerun, with a
+/// fixed phrase; any other detail, or the same words on a run that did start, is not.
+#[test]
+fn a_start_the_agent_refused_for_files_is_recognised() {
+    let refused = |outcome, detail: &str| Run {
+        detail: Some(detail.to_owned()),
+        ..run(RunState::Exited, Some(outcome), None)
+    };
+    let files = refused(Outcome::FailedToStart, "files-unsupported");
+    assert!(refused_for_files(&files));
+    let said = infra(judge(&files, false));
+    assert!(said.contains("files"), "{said}");
+    for (outcome, detail) in [
+        (Outcome::FailedToStart, "files-unsupported-ish"),
+        (Outcome::FailedToStart, "quota-unavailable"),
+        (Outcome::Failed, "files-unsupported"),
+    ] {
+        assert!(!refused_for_files(&refused(outcome, detail)), "{detail}");
+    }
+}
+
+/// Catches the agent's `invalid-file` being rerun for ever: a file the agent refuses is ours
+/// to fix, so the run ends invalid, with a fixed phrase that repeats nothing of the detail.
+#[test]
+fn a_start_the_agent_refused_for_a_file_is_invalid() {
+    let refused = Run {
+        detail: Some("invalid-file".to_owned()),
+        ..run(RunState::Exited, Some(Outcome::FailedToStart), None)
+    };
+    let Verdict::Settled(Settled::Invalid(said)) = judge(&refused, false) else {
+        panic!("not invalid");
+    };
+    assert!(said.contains("file"), "{said}");
+    let other = Run {
+        outcome: Some(Outcome::Failed),
+        ..refused
+    };
+    assert!(matches!(
+        judge(&other, false),
         Verdict::Settled(Settled::Infra(_))
     ));
 }

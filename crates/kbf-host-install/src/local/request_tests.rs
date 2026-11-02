@@ -17,7 +17,9 @@ fn the_five_requests_parse_and_name_their_verbs() {
     let switch = LocalRequest::parse(&format!("switch kbf={VERSION}")).unwrap();
     assert!(matches!(&switch, LocalRequest::Switch { version } if version.as_str() == VERSION));
     let confirm = LocalRequest::parse(&format!("confirm kbf={VERSION}")).unwrap();
-    assert!(matches!(&confirm, LocalRequest::Confirm { version } if version.as_str() == VERSION));
+    assert!(
+        matches!(&confirm, LocalRequest::Confirm { version, last_good: None } if version.as_str() == VERSION)
+    );
     assert!(matches!(
         LocalRequest::parse("revert").unwrap(),
         LocalRequest::Revert

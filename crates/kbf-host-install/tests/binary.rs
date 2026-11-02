@@ -167,6 +167,29 @@ fn serve_takes_its_own_flags_and_nothing_else() {
     assert_eq!(out.status.code(), Some(2), "needs a value");
 }
 
+/// `approve <service> <sha256>` is the operator's act on the generic updater and takes exactly
+/// those two arguments: any other command line exits 2 with its usage and records nothing.
+#[test]
+fn approve_takes_a_service_and_a_digest_and_nothing_else() {
+    for args in [
+        &["approve"][..],
+        &["approve", "tierstore"],
+        &["approve", "tierstore", "not-a-digest"],
+        &[
+            "approve",
+            "tierstore",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "x",
+        ],
+    ] {
+        let out = run(None, args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert!(out.stdout.is_empty(), "{args:?}");
+        let err = String::from_utf8(out.stderr).unwrap();
+        assert!(err.contains("usage: approve <service>"), "{err}");
+    }
+}
+
 /// `--migrate-to-package` is the held step that moves a hand-placed Linux host to the package
 /// and takes only its own flags: with none, or with a flag it does not know, it exits 2 with its
 /// usage and touches nothing; a unit that is not a daemon mode's is refused before the host is

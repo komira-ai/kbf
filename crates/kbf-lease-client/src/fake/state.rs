@@ -11,7 +11,7 @@ use crate::ids::{LeaseId, RunId};
 use crate::wire::{
     AcquireRequest, Granted, Host, HostList, HostLoad, HostSource, HostState, Lease, LeaseList,
     LeaseState, Mount, Outcome, PendingLease, ReleaseState, Released, RenewRequest, Renewed, Run,
-    RunAccepted, RunList, RunSpec, RunState, Shape, Taint,
+    RunAccepted, RunFile, RunList, RunSpec, RunState, Shape, Taint,
 };
 
 /// The ttl of a lease that asks for none (the server's `--default-ttl`).
@@ -42,6 +42,17 @@ pub struct Pool {
 }
 
 impl Pool {
+    /// The same pool with its hosts reporting `run-files=true`, as an agent with a usable
+    /// files root does. The fake models it per pool; the real server takes the capability
+    /// from each host's own hello. Without it a start with files is `409 files-unsupported`. Pools are
+    /// built without it so that a host list has the capabilities it always had.
+    #[must_use]
+    pub fn with_run_files(mut self) -> Self {
+        self.capabilities
+            .insert("run-files".to_owned(), "true".to_owned());
+        self
+    }
+
     /// A pool of `hosts`, each of `cpu_millis` and `memory_bytes`, under `class`.
     #[must_use]
     pub fn new(class: &str, hosts: &[&str], cpu_millis: u64, memory_bytes: u64) -> Self {
@@ -170,6 +181,8 @@ struct RunRow {
     args: Vec<String>,
     image: String,
     mounts: Vec<Mount>,
+    /// Secret: kept for the test that plays the host, never in a body.
+    files: Vec<RunFile>,
     labels: BTreeMap<String, String>,
 }
 
@@ -402,6 +415,11 @@ impl State {
     }
 
     pub(super) fn queue_run(&mut self, id: LeaseId, spec: RunSpec) -> Answer {
+        // A bad file is the body's fault, whatever the lease or the host: the server answers
+        // it before it reads any state, and the answer repeats no name or content.
+        if !files_valid(&spec.files) {
+            return Err(Refusal::new(400, "invalid-file"));
+        }
         let lease = self.leases.get(&id).ok_or_else(Refusal::unknown_lease)?;
         let left = lease
             .expires_at_ms
@@ -442,6 +460,12 @@ impl State {
         {
             return Err(Refusal::new(422, "limits-exceed-shape"));
         }
+        // After the vetting, as the registry has it, and before the host's state: a host that
+        // cannot deliver the files is refused for that, lost or tainted or not.
+        let delivers = self.pool.capabilities.get("run-files").map(String::as_str) == Some("true");
+        if !spec.files.is_empty() && !delivers {
+            return Err(Refusal::new(409, "files-unsupported"));
+        }
         if host.lost {
             return Err(Refusal::new(409, "host-lost"));
         }
@@ -478,6 +502,7 @@ impl State {
             args: spec.args.clone(),
             image: spec.image.clone(),
             mounts: spec.mounts.clone(),
+            files: spec.files.clone(),
             labels: spec.labels.clone(),
         };
         let accepted = RunAccepted {
@@ -686,6 +711,13 @@ impl State {
             .map(|row| row.mounts.clone())
     }
 
+    pub(super) fn run_files(&self, run: &RunId) -> Option<Vec<RunFile>> {
+        self.runs
+            .iter()
+            .find(|row| row.id == *run)
+            .map(|row| row.files.clone())
+    }
+
     pub(super) fn run_state(&self, run: &RunId) -> Option<RunState> {
         self.runs
             .iter()
@@ -762,6 +794,35 @@ impl State {
             .into_iter()
             .for_each(|row| self.hosts.entry(row.host).or_default().lease = None);
     }
+}
+
+/// The lease server's rules for the files of a start: at most 8; a name of `[A-Za-z0-9._-]`,
+/// leading alphanumeric, 1 to 64 bytes, none twice ignoring case; 16 KiB of contents a file
+/// and 64 KiB in all; no NUL.
+fn files_valid(files: &[RunFile]) -> bool {
+    const MAX_FILES: usize = 8;
+    const MAX_NAME: usize = 64;
+    const MAX_FILE: usize = 16 * 1024;
+    const MAX_TOTAL: usize = 64 * 1024;
+    let name_ok = |name: &str| {
+        let leading = name
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphanumeric());
+        let grammar = name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+        leading && grammar && name.len() <= MAX_NAME
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    let each = files.iter().all(|file| {
+        name_ok(&file.name)
+            && file.contents.len() <= MAX_FILE
+            && !file.contents.contains('\0')
+            && seen.insert(file.name.to_ascii_lowercase())
+    });
+    let total: usize = files.iter().map(|file| file.contents.len()).sum();
+    files.len() <= MAX_FILES && each && total <= MAX_TOTAL
 }
 
 /// Whether an image reference is pinned by digest, `name@sha256:<64 hex>` (a tag before the

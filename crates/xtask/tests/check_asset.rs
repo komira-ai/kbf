@@ -105,6 +105,21 @@ fn check_asset(root: &Path, tarball: &Path, commit: &str) -> (Option<i32>, Strin
     (out.status.code(), text(&out.stdout), text(&out.stderr))
 }
 
+/// As [`check_asset`], with `--plain`: only the `--version` line is checked, for a binary that
+/// has no `--version --json` (kbf-updater).
+fn check_asset_plain(root: &Path, tarball: &Path, commit: &str) -> (Option<i32>, String, String) {
+    let out = Command::new(XTASK)
+        .arg("--root")
+        .arg(root)
+        .args(["build-commit", "check-asset", "--plain"])
+        .arg(tarball)
+        .arg(commit)
+        .output()
+        .expect("run xtask");
+    let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+    (out.status.code(), text(&out.stdout), text(&out.stderr))
+}
+
 /// The names in the workspace's `target/` after a run: the check's scratch directory
 /// must not stay there (the job uploads and caches what it finds).
 fn left_in_target(root: &Path) -> Vec<String> {
@@ -344,4 +359,34 @@ fn check_asset_with_a_missing_argument_exits_2() {
             "{args:?}"
         );
     }
+}
+
+#[test]
+fn check_asset_plain_checks_the_version_line_and_leaves_the_json_alone() {
+    // Catches: a plain check that still asks for `--version --json` (so kbf-updater's tarball
+    // can never pass), and one that skips the `--version` line too (a binary stamped with
+    // another commit would pass).
+    let ours = &COMMIT[..12];
+    let root = scratch("plain-ok");
+    let tarball = packaged(&root, "kbf", &kbf_bytes(ours, "not json\n"), COMMIT);
+    assert_eq!(
+        check_asset_plain(&root, &tarball, COMMIT),
+        (
+            Some(0),
+            format!("kbf-{COMMIT}-{PLATFORM}.tar.gz: ok: kbf 0.1.0+{ours}\n"),
+            String::new()
+        )
+    );
+    assert_eq!(left_in_target(&root), Vec::<String>::new());
+    let other = &OTHER[..12];
+    let root = scratch("plain-refused");
+    let tarball = packaged(&root, "kbf", &kbf_bytes(other, "not json\n"), COMMIT);
+    assert_eq!(
+        check_asset_plain(&root, &tarball, COMMIT),
+        (
+            Some(1),
+            String::new(),
+            format!("xtask: --version is \"kbf 0.1.0+{other}\"; expected it to end +{ours}\n")
+        )
+    );
 }

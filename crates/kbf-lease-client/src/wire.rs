@@ -433,10 +433,43 @@ pub struct RunLimits {
     pub disk_bytes: Option<u64>,
 }
 
+/// One file the agent writes for the run before it starts: a per-run secret such as a
+/// presigned URL or a token, which the run reads at `/run/js-files/<name>` and which no
+/// argument or label should carry.
+///
+/// The lease server refuses a bad file with `400 invalid-file` and a host that did not report
+/// the `run-files` capability with `409 files-unsupported`. The limits are the server's: at
+/// most 8 files; a name of `[A-Za-z0-9._-]`, leading alphanumeric, at most 64 bytes and
+/// unique ignoring case; 16 KiB of contents a file and 64 KiB in all; no NUL.
+///
+/// The contents are secret: `Debug` prints the name and the length of the contents and
+/// nothing else, so no log line that prints a spec can leak them.
+///
+/// Who owns the secret's lifetime: the contents are a plain `String`, copied into the encoded
+/// body, and none of it is zeroized. This crate writes them nowhere (no file, no log) and
+/// keeps them only as long as the caller keeps the spec. The caller decides when they are
+/// dropped.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunFile {
+    /// The file name.
+    pub name: String,
+    /// The contents, UTF-8 text.
+    pub contents: String,
+}
+
+impl fmt::Debug for RunFile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RunFile")
+            .field("name", &self.name)
+            .field("contents_len", &self.contents.len())
+            .finish_non_exhaustive()
+    }
+}
+
 /// The body of `POST /v1/leases/{id}/runs`.
 ///
-/// `Debug` prints the number of arguments and never the arguments: they may carry a
-/// credential (a presigned URL), and this type is what a log line would print.
+/// `Debug` prints the number of arguments and of files and never their contents: they may
+/// carry a credential (a presigned URL), and this type is what a log line would print.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunSpec {
@@ -453,6 +486,10 @@ pub struct RunSpec {
     /// The mounts.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mounts: Vec<Mount>,
+    /// Secret files the run reads at `/run/js-files/<name>`. Absent from the body when
+    /// empty, so a start without files is the bytes it has always been.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<RunFile>,
     /// Whether the run may change the machine.
     #[serde(default, skip_serializing_if = "is_default")]
     pub isolation: Isolation,
@@ -462,7 +499,7 @@ pub struct RunSpec {
 }
 
 impl RunSpec {
-    /// A run of `image` under `limits`, with no arguments, mounts or labels.
+    /// A run of `image` under `limits`, with no arguments, mounts, files or labels.
     #[must_use]
     pub fn new(image: impl Into<String>, limits: RunLimits) -> Self {
         Self {
@@ -471,6 +508,7 @@ impl RunSpec {
             limits,
             gpu_indices: Vec::new(),
             mounts: Vec::new(),
+            files: Vec::new(),
             isolation: Isolation::default(),
             labels: BTreeMap::new(),
         }
@@ -485,6 +523,7 @@ impl fmt::Debug for RunSpec {
             .field("limits", &self.limits)
             .field("gpu_indices", &self.gpu_indices)
             .field("mounts", &self.mounts)
+            .field("files", &format_args!("<{} redacted>", self.files.len()))
             .field("isolation", &self.isolation)
             .field("labels", &self.labels)
             .finish()

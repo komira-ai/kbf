@@ -88,11 +88,14 @@ sudo kbf-deploy host gc [--keep N] [--apply]
   records no release before it). It refuses when there is no previous release or its
   binary is gone.
 - `gc` removes release directories. It never removes the current, previous or staged
-  release, nor one the `current` or `previous` link points to; `--keep N` also keeps the
-  N newest others (by the directory's modification time). Anything in `releases/` that
-  is not a directory named by a commit id is left alone.
+  release, one the `current` or `previous` link points to, nor one `retain.json` pins or
+  names as the coordinator's last good; `--keep N` also keeps the N newest others (by the
+  directory's modification time; 2 or more, default 4). It removes nothing while a swap is
+  on trial. Anything in `releases/` that is not a directory named by a commit id is left
+  alone.
 
-Each refuses while a commit-confirm deploy is pending in the state.
+`install` and `rollback` refuse while a commit-confirm deploy is pending in the state; `gc` then
+removes nothing.
 
 **No verb restarts a service.** After `install --apply` or `rollback --apply`, restart
 the units that run `/var/lib/kbf-installer/releases/current/kbf` by hand (`sudo systemctl restart
@@ -192,4 +195,5 @@ written once, so the process running the old release keeps its file, and only th
 | `reconcile` | after an interrupted verb, make the links agree with the state. |
 
 The window is bounded by the host (120 to 1800 seconds), not by the order. Retention is
-`gc --keep 1`: the running release, the previous one and the newest other.
+`gc --keep 4` after each confirm: the running release, the previous one, any pinned
+release, the coordinator's last good one and the four newest others.

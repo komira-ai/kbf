@@ -22,6 +22,7 @@ use tokio::net::TcpListener;
 use crate::desired::DesiredStore;
 use crate::http::Surface;
 use crate::listen::{CLIENT_PATIENCE, Listener, MAX_CONNECTIONS, reload_every, serve};
+use crate::ops::OpsStore;
 use crate::service::{Clock, Coordinator};
 use crate::services::Services;
 
@@ -67,6 +68,12 @@ pub struct Cli {
     /// A file holding the operator token, mode 0600, owned by the coordinator's user.
     #[arg(long)]
     pub operator_token_file: PathBuf,
+    /// The ops file: what operators changed (exclusions, labels) and the audit ring, written
+    /// by the coordinator and read back at start; created by the first change. Default: the
+    /// state file's name with `.ops` added. Its directory must be writable by the
+    /// coordinator.
+    #[arg(long)]
+    pub ops_file: Option<PathBuf>,
     /// A TOML file that defines further services (`docs/design/updates.md`, section 3).
     /// Without it `kbf` is the only service. Which of them a CI token may set is said by
     /// the allow-list entry that admits it (`--oidc-config`).
@@ -106,8 +113,9 @@ pub struct Parts {
 /// are fetched on the first token.
 ///
 /// # Errors
-/// A file is missing, unreadable or refused (the text names the flag or the file), or an
-/// allow-list entry names a service that is neither `kbf` nor defined by the services file.
+/// A file is missing, unreadable or refused (the text names the flag or the file; the ops file
+/// must be one this build reads), or an allow-list entry names a service that is neither `kbf`
+/// nor defined by the services file.
 pub fn build(cli: &Cli) -> Result<Parts, Error> {
     let operator_token = kbf_updater::secret::read_token(&cli.operator_token_file)
         .map_err(|why| format!("--operator-token-file: {why}"))?;
@@ -129,6 +137,12 @@ pub fn build(cli: &Cli) -> Result<Parts, Error> {
     let keys = HttpsKeys::new(&oidc.entries()[0].issuer, Roots::System, KEY_FETCH_TIMEOUT)?;
     let verifier = Verifier::new(oidc, Arc::new(keys), KEY_REFETCH, kbf_oidc::system_clock());
     let desired = DesiredStore::open(&cli.state_file)?;
+    let ops_path = cli.ops_file.clone().unwrap_or_else(|| {
+        let mut name = cli.state_file.clone().into_os_string();
+        name.push(".ops");
+        PathBuf::from(name)
+    });
+    let ops = OpsStore::open(&ops_path).map_err(|why| format!("--ops-file: {why}"))?;
     let interval = Duration::from_secs(cli.tls_reload_secs);
     let files = |client_ca| TlsFiles {
         cert: cli.tls_cert.clone(),
@@ -140,7 +154,8 @@ pub fn build(cli: &Cli) -> Result<Parts, Error> {
     Ok(Parts {
         coordinator: Arc::new(
             Coordinator::new(desired, Arc::new(verifier), operator_token, clock)
-                .with_services(services),
+                .with_services(services)
+                .with_ops(ops),
         ),
         heartbeat_tls: TlsSource::files("heartbeat", files(Some(cli.client_ca.clone())), interval)?,
         control_tls: TlsSource::files("control", files(None), interval)?,

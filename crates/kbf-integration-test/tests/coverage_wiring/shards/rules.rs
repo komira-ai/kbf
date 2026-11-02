@@ -9,7 +9,7 @@ const LEGACY_ARGS: &str = "--workspace";
 const JS_ARGS: &str = "-p kbf-server --features kbf-server/farm-core-js";
 
 fn entry(core: &str, part: usize, parts: usize, args: &str) -> String {
-    let gb = if core == "js" { 55 } else { 75 };
+    let gb = if core == "js" { 35 } else { 40 };
     entry_with_disk(core, part, parts, args, &gb.to_string())
 }
 
@@ -33,7 +33,7 @@ fn good_matrix() -> String {
 }
 
 const SHARD_ENV: &str = "    env:\n      PART: ${{ matrix.part }}\n      PARTS: ${{ matrix.parts }}\n      ARGS: ${{ matrix.args }}\n      MIN_FREE_GB: ${{ matrix.min_free_gb }}\n      LLVM_PROFILE_FILE_NAME: kbf-${{ matrix.core }}-${{ matrix.part }}-%p-%4m.profraw\n";
-const SHARD_STEPS: &str = "    steps:\n      - run: cargo xtask runner-disk --path . --min-free-gb \"$MIN_FREE_GB\"\n      - run: cargo llvm-cov nextest $ARGS --locked --branch --no-report --no-fail-fast --profile pr \"--partition=count:$PART/$PARTS\"\n      - if: ${{ always() }}\n        run: df -h /\n      - uses: actions/upload-artifact@abc # v7\n        with:\n          name: profraw-${{ matrix.core }}-${{ matrix.part }}\n          path: target/llvm-cov-target/kbf-${{ matrix.core }}-${{ matrix.part }}-*.profraw\n          if-no-files-found: error\n          overwrite: true\n";
+const SHARD_STEPS: &str = "    steps:\n      - run: cargo xtask runner-disk --path . --min-free-gb \"$MIN_FREE_GB\"\n      - run: cargo llvm-cov nextest $ARGS --locked --branch --no-report --no-fail-fast --profile pr \"--partition=count:$PART/$PARTS\"\n      - if: ${{ always() }}\n        run: df -h /\n      - run: cargo xtask merge-profiles --dir target/llvm-cov-target --extension profraw --prefix kbf-${{ matrix.core }}-${{ matrix.part }}- --out target/llvm-cov-target/kbf-${{ matrix.core }}-${{ matrix.part }}-merged.profdata\n      - uses: actions/upload-artifact@abc # v7\n        with:\n          name: profdata-${{ matrix.core }}-${{ matrix.part }}\n          path: target/llvm-cov-target/kbf-${{ matrix.core }}-${{ matrix.part }}-merged.profdata\n          if-no-files-found: error\n          overwrite: true\n";
 
 fn shard_job(matrix: &str) -> String {
     format!(
@@ -45,9 +45,10 @@ const GATE_HEAD: &str = "  test:\n    runs-on: ubuntu-latest\n    permissions:\n
 const BUILD_LEGACY: &str = "      - run: cargo llvm-cov nextest --workspace --locked --branch --no-report --profile pr -E 'none()' --no-tests=pass\n";
 const BUILD_JS: &str = "      - run: cargo llvm-cov nextest -p kbf-server --features kbf-server/farm-core-js --locked --branch --no-report --profile pr -E 'none()' --no-tests=pass\n";
 const CLEAN: &str = "      - run: cargo llvm-cov clean --profraw-only\n";
-const WAIT: &str = "      - run: cargo xtask wait-artifacts --repo r --run-id 1 --job-prefix test-shard --artifact \"profraw-legacy-1=(legacy-1-of-2)\" --artifact \"profraw-legacy-2=(legacy-2-of-2)\" --artifact \"profraw-js-1=(js-1-of-1)\"\n";
-const DOWNLOAD: &str = "      - uses: actions/download-artifact@abc # v8\n        with:\n          pattern: profraw-*\n          path: target/llvm-cov-target\n          merge-multiple: true\n";
-const COMPLETE: &str = "      - run: cargo xtask profiles-complete --dir target/llvm-cov-target --prefix kbf-legacy-1- --prefix kbf-legacy-2- --prefix kbf-js-1-\n";
+const WAIT: &str = "      - run: cargo xtask wait-artifacts --repo r --run-id 1 --job-prefix test-shard --artifact \"profdata-legacy-1=(legacy-1-of-2)\" --artifact \"profdata-legacy-2=(legacy-2-of-2)\" --artifact \"profdata-js-1=(js-1-of-1)\"\n";
+const DOWNLOAD: &str = "      - uses: actions/download-artifact@abc # v8\n        with:\n          pattern: profdata-*\n          path: target/shard-profdata\n          merge-multiple: true\n";
+const COMPLETE: &str = "      - run: cargo xtask profiles-complete --dir target/shard-profdata --extension profdata --prefix kbf-legacy-1- --prefix kbf-legacy-2- --prefix kbf-js-1-\n";
+const MERGE: &str = "      - run: cargo xtask merge-profiles --dir target/shard-profdata --extension profdata --workspace-profile-in target/llvm-cov-target\n";
 const REPORT: &str = "      - run: cargo llvm-cov report --branch --lcov\n";
 const GATE_STEP: &str = "      - run: cargo run -p kbf-coverage --locked -- --lcov l\n";
 
@@ -63,6 +64,7 @@ fn good_steps() -> Vec<&'static str> {
         WAIT,
         DOWNLOAD,
         COMPLETE,
+        MERGE,
         REPORT,
         GATE_STEP,
     ]
@@ -271,17 +273,52 @@ fn each_drift_of_a_shard_is_refused() {
         ),
         (
             changed(
-                "name: profraw-${{ matrix.core }}-${{ matrix.part }}",
-                "name: profraw-${{ matrix.core }}",
+                "xtask merge-profiles --dir target/llvm-cov-target",
+                "xtask other --dir target/llvm-cov-target",
             ),
-            "the upload step's `name` is not `profraw-${{ matrix.core }}-${{ matrix.part }}`",
+            "the job `test-shard` has no step `cargo xtask merge-profiles`",
         ),
         (
             changed(
-                "path: target/llvm-cov-target/kbf-${{ matrix.core }}-${{ matrix.part }}-*.profraw",
-                "path: target/llvm-cov-target/*.profraw",
+                "--extension profraw --prefix",
+                "--extension profdata --prefix",
             ),
-            "the upload step's `path` is not the shard's own profiles, `target/llvm-cov-target/kbf-${{ matrix.core }}-${{ matrix.part }}-*.profraw`",
+            "the merge step of `test-shard` must merge the shard's own",
+        ),
+        (
+            changed(
+                "--prefix kbf-${{ matrix.core }}-${{ matrix.part }}- --out",
+                "--prefix kbf- --out",
+            ),
+            "the merge step of `test-shard` must merge the shard's own",
+        ),
+        (
+            changed(
+                "-merged.profdata\n      - uses",
+                "-other.profdata\n      - uses",
+            ),
+            "the merge step of `test-shard` must merge the shard's own",
+        ),
+        (
+            changed(
+                "      - run: cargo xtask merge-profiles",
+                "      - if: ${{ always() }}\n        run: cargo xtask merge-profiles",
+            ),
+            "the merge step of `test-shard` has an `if:` or `continue-on-error`",
+        ),
+        (
+            changed(
+                "name: profdata-${{ matrix.core }}-${{ matrix.part }}",
+                "name: profdata-${{ matrix.core }}",
+            ),
+            "the upload step's `name` is not `profdata-${{ matrix.core }}-${{ matrix.part }}`",
+        ),
+        (
+            changed(
+                "path: target/llvm-cov-target/kbf-${{ matrix.core }}-${{ matrix.part }}-merged.profdata",
+                "path: target/llvm-cov-target/*.profdata",
+            ),
+            "the upload step's `path` is not the shard's own merged profile, `target/llvm-cov-target/kbf-${{ matrix.core }}-${{ matrix.part }}-merged.profdata`",
         ),
         (
             changed("          overwrite: true\n", ""),
@@ -380,20 +417,20 @@ fn a_shard_with_too_little_disk_is_refused() {
     let js_gb = |gb: &str| entry_with_disk("js", 1, 1, JS_ARGS, gb);
     let cases = [
         (
-            with(l1("74"), js.clone()),
-            "a `legacy` entry says `min_free_gb: 74`, under the 75",
+            with(l1("39"), js.clone()),
+            "a `legacy` entry says `min_free_gb: 39`, under the 40",
         ),
         (
-            with(l1("60"), js.clone()),
-            "a `legacy` entry says `min_free_gb: 60`, under the 75",
+            with(l1("30"), js.clone()),
+            "a `legacy` entry says `min_free_gb: 30`, under the 40",
         ),
         (
-            with(l1("75"), js_gb("54")),
-            "a `js` entry says `min_free_gb: 54`, under the 55",
+            with(l1("40"), js_gb("34")),
+            "a `js` entry says `min_free_gb: 34`, under the 35",
         ),
         (
-            with(l1("75"), js_gb("40")),
-            "a `js` entry says `min_free_gb: 40`, under the 55",
+            with(l1("40"), js_gb("20")),
+            "a `js` entry says `min_free_gb: 20`, under the 35",
         ),
         (
             with(l1("lots"), js.clone()),
@@ -401,7 +438,7 @@ fn a_shard_with_too_little_disk_is_refused() {
         ),
         (
             with(
-                l1("75").replace("            min_free_gb: 75\n", ""),
+                l1("40").replace("            min_free_gb: 40\n", ""),
                 js.clone(),
             ),
             "a `legacy` entry has no numeric `min_free_gb`",
@@ -415,7 +452,7 @@ fn a_shard_with_too_little_disk_is_refused() {
         );
     }
     // The measured numbers and more pass.
-    assert_eq!(shard_wiring(&with(l1("75"), js_gb("55"))), Ok(()));
+    assert_eq!(shard_wiring(&with(l1("40"), js_gb("35"))), Ok(()));
     assert_eq!(shard_wiring(&with(l1("120"), js_gb("90"))), Ok(()));
 }
 
@@ -482,20 +519,25 @@ fn each_drift_of_the_gate_is_refused() {
         ),
         (
             without(6),
-            "the job `test` has no step running `llvm-cov report`",
+            "the job `test` has no step running `cargo xtask merge-profiles` on the shards' profiles",
         ),
         (
             without(7),
+            "the job `test` has no step running `llvm-cov report`",
+        ),
+        (
+            without(8),
             "the job `test` has no step running the gate (`-p kbf-coverage`)",
         ),
         (
             order(2, 4),
-            "the steps of `test` are not in the order build, drop listing profiles (before the download), wait, download, check the profiles, report, gate",
+            "the steps of `test` are not in the order build, drop listing profiles (before the download), wait, download, check the profiles, merge them, report, gate",
         ),
         (order(3, 4), "the steps of `test` are not in the order"),
         (order(4, 5), "the steps of `test` are not in the order"),
         (order(5, 6), "the steps of `test` are not in the order"),
         (order(6, 7), "the steps of `test` are not in the order"),
+        (order(7, 8), "the steps of `test` are not in the order"),
         (order(1, 2), "the steps of `test` are not in the order"),
         (
             conditioned(BUILD_JS),
@@ -518,6 +560,10 @@ fn each_drift_of_the_gate_is_refused() {
             "the profiles-complete step of `test` has an `if:` or `continue-on-error`, so the gate could pass without it",
         ),
         (
+            conditioned(MERGE),
+            "the profile-merging step of `test` has an `if:` or `continue-on-error`, so the gate could pass without it",
+        ),
+        (
             conditioned(REPORT),
             "the report step of `test` has an `if:` or `continue-on-error`, so the gate could pass without it",
         ),
@@ -526,57 +572,71 @@ fn each_drift_of_the_gate_is_refused() {
             "the wait step does not pass `--job-prefix test-shard`, so a failed shard would not end it",
         ),
         (
-            changed(" --artifact \"profraw-js-1=(js-1-of-1)\"", ""),
+            changed(" --artifact \"profdata-js-1=(js-1-of-1)\"", ""),
             "the wait step's `--artifact` names are not the shards' artifacts",
         ),
         (
             changed(
-                " --artifact \"profraw-js-1=(js-1-of-1)\"",
-                " --artifact \"profraw-js-1=(js-1-of-1)\" --artifact \"profraw-js-2=(js-2-of-1)\"",
+                " --artifact \"profdata-js-1=(js-1-of-1)\"",
+                " --artifact \"profdata-js-1=(js-1-of-1)\" --artifact \"profdata-js-2=(js-2-of-1)\"",
             ),
             "the wait step's `--artifact` names are not the shards' artifacts",
         ),
         (
             changed(
-                " --artifact \"profraw-js-1=(js-1-of-1)\"",
-                " --artifact \"profraw-js-1=(js-1-of-1)\" --artifact \"profraw-js-1=(js-1-of-1)\"",
+                " --artifact \"profdata-js-1=(js-1-of-1)\"",
+                " --artifact \"profdata-js-1=(js-1-of-1)\" --artifact \"profdata-js-1=(js-1-of-1)\"",
             ),
             "the wait step's `--artifact` names are not the shards' artifacts",
         ),
         // An artifact asked for by its name alone would count whatever attempt made it.
         (
-            changed("\"profraw-js-1=(js-1-of-1)\"", "profraw-js-1"),
+            changed("\"profdata-js-1=(js-1-of-1)\"", "profdata-js-1"),
             "the wait step's `--artifact` names are not the shards' artifacts",
         ),
         // Or for the wrong shard's job: the key must be that of the artifact's own shard.
         (
             changed(
-                "\"profraw-js-1=(js-1-of-1)\"",
-                "\"profraw-js-1=(legacy-1-of-2)\"",
+                "\"profdata-js-1=(js-1-of-1)\"",
+                "\"profdata-js-1=(legacy-1-of-2)\"",
             ),
             "the wait step's `--artifact` names are not the shards' artifacts",
         ),
         (
-            changed("pattern: profraw-*", "pattern: other-*"),
-            "the download step's `pattern` is not `profraw-*`",
+            changed("pattern: profdata-*", "pattern: other-*"),
+            "the download step's `pattern` is not `profdata-*`",
         ),
         (
             changed(
-                "path: target/llvm-cov-target\n          merge",
+                "path: target/shard-profdata\n          merge",
                 "path: elsewhere\n          merge",
             ),
-            "the download step must put the profiles flat in `target/llvm-cov-target` (`merge-multiple: true`)",
+            "the download step must put the profiles flat in `target/shard-profdata` (`merge-multiple: true`)",
         ),
         (
             changed("merge-multiple: true", "merge-multiple: false"),
-            "the download step must put the profiles flat in `target/llvm-cov-target` (`merge-multiple: true`)",
+            "the download step must put the profiles flat in `target/shard-profdata` (`merge-multiple: true`)",
         ),
         (
             changed(
-                "profiles-complete --dir target/llvm-cov-target",
+                "profiles-complete --dir target/shard-profdata",
                 "profiles-complete --dir elsewhere",
             ),
-            "the profiles-complete step does not check `--dir target/llvm-cov-target`",
+            "the profiles-complete step does not check `--dir target/shard-profdata --extension profdata`",
+        ),
+        (
+            changed(
+                "--workspace-profile-in target/llvm-cov-target",
+                "--workspace-profile-in elsewhere",
+            ),
+            "the merge step of `test` must merge the `.profdata` files of `target/shard-profdata` into the profile `llvm-cov report` reads",
+        ),
+        (
+            changed(
+                "merge-profiles --dir target/shard-profdata",
+                "merge-profiles --dir elsewhere",
+            ),
+            "the merge step of `test` must merge the `.profdata` files of `target/shard-profdata` into the profile `llvm-cov report` reads",
         ),
         (
             changed(" --prefix kbf-js-1-", ""),

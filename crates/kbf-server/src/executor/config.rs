@@ -113,9 +113,9 @@ pub struct Config {
     /// How the secrets reach the task.
     pub delivery: Delivery,
     /// Whether the operator has said the secrets may travel as arguments, where the action
-    /// can read them (`/proc/1/cmdline`) and the engine's inspect shows them: the only
-    /// delivery there is until the lease server's job takes a secret field. False by
-    /// default, and [`Config::validate`] refuses a config that leaves it so.
+    /// can read them (`/proc/1/cmdline`) and the engine's inspect shows them. False by
+    /// default, and [`Config::validate`] refuses a config that leaves it so unless the
+    /// delivery is [`Delivery::Files`].
     pub insecure_argv_secrets: bool,
     /// Where the task tool works in the container, if not in the tool's own default: the
     /// kbf image must have a writable directory there.
@@ -126,6 +126,9 @@ pub struct Config {
     /// the executor may post a run whose grant url is `http://` (the bearer token then crosses
     /// the job network in clear).
     pub allow_plain_http_grant: bool,
+    /// Whether the task is told to read its inputs where `GET /locate` says they are kept
+    /// (`--locate`), and from the listener when that read fails.
+    pub locate: bool,
     /// The most bytes of a pack the frontend takes.
     pub max_pack_bytes: u64,
     /// The most bytes of one blob in a pack.
@@ -195,6 +198,9 @@ pub enum ConfigError {
     /// Secrets as arguments, which the operator has not allowed.
     #[error("the secrets travel as arguments: set insecure_argv_secrets to say so")]
     InsecureArgv,
+    /// Secrets as files, and the opt-in for secrets as arguments: a contradiction.
+    #[error("the secrets travel as files: insecure_argv_secrets must not be set")]
+    InsecureWithFiles,
     /// A presign ceiling or a run longer than a url may be good for.
     #[error("the presign ceiling and the longest run's wall time must be at most 4 hours")]
     PresignLimit,
@@ -241,6 +247,7 @@ impl Config {
             work_dir: None,
             allow_plain_http_put: false,
             allow_plain_http_grant: false,
+            locate: false,
             max_pack_bytes: 128 << 20,
             max_blob_bytes: 64 << 20,
             presign_ceiling: PRESIGN_LIMIT,
@@ -337,7 +344,14 @@ impl Config {
                     && !self.pass_budget.is_zero(),
                 ConfigError::Bounds,
             ),
-            (self.insecure_argv_secrets, ConfigError::InsecureArgv),
+            (
+                self.delivery == Delivery::Files || self.insecure_argv_secrets,
+                ConfigError::InsecureArgv,
+            ),
+            (
+                self.delivery != Delivery::Files || !self.insecure_argv_secrets,
+                ConfigError::InsecureWithFiles,
+            ),
             (
                 self.max_wall > self.drain_before_end && self.drain_before_end > longest,
                 ConfigError::Drain,
@@ -351,11 +365,14 @@ impl Config {
     }
 
     /// What a lease must ask of its host: the system and the architecture, the same as the
-    /// worker's node report says.
+    /// worker's node report says, and under [`Delivery::Files`] `run-files`, so that a host
+    /// that cannot mount files is never leased.
     #[must_use]
     pub fn host_capabilities(&self) -> std::collections::BTreeMap<String, String> {
+        let files = (self.delivery == Delivery::Files).then_some(("run-files", "true"));
         [("os", "linux"), ("arch", self.arch.as_str())]
             .into_iter()
+            .chain(files)
             .map(|(key, value)| (key.to_owned(), value.to_owned()))
             .collect()
     }

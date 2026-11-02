@@ -33,7 +33,9 @@ struct Inner {
 ///
 /// Bounded to a number of actions chosen at construction ([`MAX_SHAPES`] by default):
 /// putting a new action into a full index forgets the one put in longest ago (and counts
-/// it, [`ShapeIndex::evicted`]). The farm removes an action when its operation ends.
+/// it, [`ShapeIndex::evicted`]). The farm does not remove an action when its operation ends: an
+/// entry stays until the oldest-first cap evicts it, because a rerun of a killed run and a
+/// second run of the action still need it.
 pub struct ShapeIndex {
     cap: usize,
     inner: Mutex<Inner>,

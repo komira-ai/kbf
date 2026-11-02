@@ -4,7 +4,9 @@ mod ops_support;
 
 use tierstore_bench::config::{Secret, StoreSpec};
 use tierstore_bench::error::BenchError;
-use tierstore_bench::provision::probe::{Access, BucketState, bucket_state, can_list, can_read};
+use tierstore_bench::provision::probe::{
+    Access, BucketState, Reading, bucket_state, can_list, can_read,
+};
 
 use ops_support::*;
 
@@ -108,57 +110,152 @@ async fn a_store_the_client_refuses_is_an_error_before_any_request() {
     ));
 }
 
-/// Catches a bucket state read from the wrong listing: gone from NoSuchBucket, counts from both
-/// listings, and unreadable (with the status, or the class when there is no status) from a refusal
-/// in either listing and from a listing that is no listing.
+/// The answer to `ListBuckets` naming these buckets.
+fn buckets(names: &[&str]) -> (u16, String) {
+    let items: String = names
+        .iter()
+        .map(|n| format!("<Bucket><Name>{n}</Name></Bucket>"))
+        .collect();
+    (
+        200,
+        format!("<ListAllMyBucketsResult><Buckets>{items}</Buckets></ListAllMyBucketsResult>"),
+    )
+}
+
+/// A store whose account listing is `list` and whose bucket answers `bucket` (listings by kind).
+fn world(
+    list: (u16, String),
+    objects: (u16, String),
+    uploads: (u16, String),
+) -> impl Fn(&Seen) -> (u16, String) + Send + Sync + 'static {
+    move |seen| {
+        if seen.path == "/" {
+            list.clone()
+        } else if is_uploads(seen) {
+            uploads.clone()
+        } else {
+            objects.clone()
+        }
+    }
+}
+
+/// Catches a bucket state read from the wrong place: whether the bucket exists is the account
+/// listing's answer alone (named, not named, refused, or no listing at all), and the two
+/// listings of the bucket are read on their own, each as a count, `NoSuchBucket` or a failure
+/// (the status, or the class when there is no status).
 #[tokio::test]
-async fn the_state_of_a_bucket_is_read_from_both_listings() {
-    let gone = Stub::start(|_| s3_error(404, "NoSuchBucket")).await;
+async fn the_state_of_a_bucket_is_the_account_listing_and_both_bucket_listings() {
+    let gone = Stub::start(world(
+        buckets(&["other-bucket-mark"]),
+        s3_error(404, "NoSuchBucket"),
+        s3_error(404, "NoSuchBucket"),
+    ))
+    .await;
     assert_eq!(
         bucket_state(&spec(&gone.endpoint)).await.unwrap(),
-        BucketState::Gone
-    );
-
-    let there = Stub::start(|seen| {
-        if is_uploads(seen) {
-            uploads_of(2)
-        } else {
-            listing_of(3)
+        BucketState {
+            listed: Ok(false),
+            objects: Reading::NoSuchBucket,
+            uploads: Reading::NoSuchBucket,
         }
-    })
+    );
+    let signed = gone.requests();
+    assert_eq!(signed[0].path, "/");
+    assert_eq!(signed[0].query, "");
+    assert_eq!(signed[0].key_id(), "KEYID-MARK-probe");
+
+    let there = Stub::start(world(
+        buckets(&["other-bucket-mark", "probe-bucket-mark"]),
+        listing_of(3),
+        uploads_of(2),
+    ))
     .await;
     assert_eq!(
         bucket_state(&spec(&there.endpoint)).await.unwrap(),
-        BucketState::Present {
-            objects: 3,
-            uploads: 2
+        BucketState {
+            listed: Ok(true),
+            objects: Reading::Count(3),
+            uploads: Reading::Count(2),
         }
     );
 
     let refused = Stub::start(|_| s3_error(403, "AccessDenied")).await;
+    let denied = || Reading::Failed("status 403 AccessDenied".to_owned());
     assert_eq!(
         bucket_state(&spec(&refused.endpoint)).await.unwrap(),
-        BucketState::Unreadable("status 403 AccessDenied".to_owned())
+        BucketState {
+            listed: Err("status 403 AccessDenied".to_owned()),
+            objects: denied(),
+            uploads: denied(),
+        }
     );
 
     let garbage = Stub::start(|_| (200, "garbage".to_owned())).await;
     assert_eq!(
         bucket_state(&spec(&garbage.endpoint)).await.unwrap(),
-        BucketState::Unreadable("protocol".to_owned())
+        BucketState {
+            listed: Err("the answer is not a bucket list".to_owned()),
+            objects: Reading::Failed("protocol".to_owned()),
+            uploads: Reading::Failed("protocol".to_owned()),
+        }
     );
 
-    let uploads_garbage = Stub::start(|seen| {
-        if is_uploads(seen) {
-            (200, "garbage".to_owned())
-        } else {
-            empty_listing()
+    // The objects listing refused and the uploads listing served: the uploads are still read.
+    let split = Stub::start(world(
+        buckets(&["probe-bucket-mark"]),
+        s3_error(403, "AccessDenied"),
+        uploads_of(0),
+    ))
+    .await;
+    assert_eq!(
+        bucket_state(&spec(&split.endpoint)).await.unwrap(),
+        BucketState {
+            listed: Ok(true),
+            objects: denied(),
+            uploads: Reading::Count(0),
         }
+    );
+
+    // A list cut off before its end names nothing: it is no list, not a list without the bucket.
+    let cut = Stub::start(|_| {
+        (
+            200,
+            "<ListAllMyBucketsResult><Buckets><Bucket><Name>other-bucket-mark</Name>".to_owned(),
+        )
     })
     .await;
     assert_eq!(
-        bucket_state(&spec(&uploads_garbage.endpoint))
-            .await
-            .unwrap(),
-        BucketState::Unreadable("protocol".to_owned())
+        bucket_state(&spec(&cut.endpoint)).await.unwrap().listed,
+        Err("the answer is not a bucket list".to_owned())
+    );
+
+    // A refusal that carries no code, and a store that is not there.
+    let bare = Stub::start(|_| (503, String::new())).await;
+    assert_eq!(
+        bucket_state(&spec(&bare.endpoint)).await.unwrap().listed,
+        Err("status 503".to_owned())
+    );
+    let dead = {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        format!("http://{}", listener.local_addr().unwrap())
+    };
+    assert_eq!(
+        bucket_state(&spec(&dead)).await.unwrap().listed,
+        Err("transport".to_owned())
+    );
+
+    // An empty account has no `Buckets` entries at all.
+    let empty = Stub::start(world(
+        (
+            200,
+            "<ListAllMyBucketsResult><Buckets/></ListAllMyBucketsResult>".to_owned(),
+        ),
+        s3_error(404, "NoSuchBucket"),
+        s3_error(404, "NoSuchBucket"),
+    ))
+    .await;
+    assert_eq!(
+        bucket_state(&spec(&empty.endpoint)).await.unwrap().listed,
+        Ok(false)
     );
 }

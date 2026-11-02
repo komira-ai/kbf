@@ -37,6 +37,9 @@ js-server-core.workspace = true
 # The scheduler's rows in the state store (src/farm_js): the farm's row codec and its
 # build-only rows are written against this crate's `RowCodec` and `Ext`.
 js-store.workspace = true
+# The ids a recorded run is told by, and the recorder the farm's usage side runs (src/farm_js/usage.rs).
+js-types.workspace = true
+js-usage.workspace = true
 kbf-auth.workspace = true
 kbf-ca.workspace = true
 kbf-front.workspace = true
@@ -74,6 +77,8 @@ kbf-tls.workspace = true
 kbf-types.workspace = true
 # The pages mounted under /ui (src/ui_mount.rs).
 kbf-ui.workspace = true
+# The `--usage-profiles` mode (src/usage_profiles.rs).
+kbf-usage.workspace = true
 percent-encoding.workspace = true
 prost.workspace = true
 prost-types.workspace = true

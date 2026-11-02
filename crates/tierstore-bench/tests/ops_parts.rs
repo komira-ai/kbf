@@ -307,6 +307,17 @@ fn a_command_never_prints_its_arguments_and_its_error_never_holds_output() {
     );
 }
 
+/// A TCP socket bound to a loopback port that nothing listens on, and the port.
+fn bound_not_listening() -> (rustix::fd::OwnedFd, u16) {
+    use rustix::net::{AddressFamily, SocketAddrV4, SocketType, bind, getsockname, socket};
+    let fd = socket(AddressFamily::INET, SocketType::STREAM, None).unwrap();
+    bind(&fd, &SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = SocketAddrV4::try_from(getsockname(&fd).unwrap())
+        .unwrap()
+        .port();
+    (fd, port)
+}
+
 /// Catches the real machine seam answering differently from what its callers read: a file read and
 /// a file that is not UTF-8, a path that exists or not, a command that exits 0, one that exits
 /// non-zero, one that sees its variable, one that is not there, a port with a listener and one
@@ -366,8 +377,11 @@ fn the_system_host_reads_files_runs_commands_and_tries_ports() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     assert!(host.port_open(port));
-    drop(listener);
-    assert!(!host.port_open(port));
+    // A port bound and not listening is held (no other test can be given it) and refuses
+    // connections; a port that was freed could be handed to another test binary's listener.
+    let held = bound_not_listening();
+    assert!(!host.port_open(held.1));
+    drop((held, listener));
 
     let _reading = host.load_sample();
     assert_eq!(

@@ -9,7 +9,7 @@ use std::time::Duration;
 use kbf_state::{Cond, Store, StoreError, Txn, Versioned};
 use kbf_types::object_store_api::{
     AuditAction, AuditEntry, AuditOutcome, BindingInfo, BindingPut, BindingRole, ConnectionInfo,
-    ConnectionName, ConnectionPut, Secret,
+    ConnectionName, ConnectionPut, Secret, StoreIdentity,
 };
 use prost::Message as _;
 use subtle::ConstantTimeEq as _;
@@ -48,6 +48,10 @@ pub enum RegistryError {
     /// A binding still uses the connection.
     #[error("a binding uses this connection")]
     InUse,
+    /// The connection exists, but the role `cold` does not name it: only the bound
+    /// connection can be re-pointed.
+    #[error("the role cold is not bound to this connection")]
+    NotBound,
     /// The change would move a bound store: its endpoint, bucket or prefix. Credentials
     /// may change; the store may not.
     #[error("the store identity (endpoint, bucket, prefix) of a bound role cannot change")]
@@ -120,6 +124,8 @@ struct Audit {
     action: AuditAction,
     subject: String,
     outcome: AuditOutcome,
+    /// See [`AuditRow::detail`]; empty for the actions whose subject says it all.
+    detail: String,
 }
 
 /// The precondition that a row is as it was read, or still absent.
@@ -367,6 +373,7 @@ impl Registry {
                     subject: row.subject,
                     outcome: outcome_of(row.outcome)?,
                     generation: row.generation,
+                    detail: Some(row.detail).filter(|detail| !detail.is_empty()),
                 })
             })
             .collect()
@@ -574,6 +581,7 @@ impl Registry {
                     action: AuditAction::PutBinding,
                     subject,
                     outcome: AuditOutcome::Unchanged,
+                    detail: String::new(),
                 };
                 let generation = self.commit(&head, Txn::new(), audit, false)?;
                 return Ok(Written {
@@ -594,12 +602,82 @@ impl Registry {
             action: AuditAction::PutBinding,
             subject,
             outcome,
+            detail: String::new(),
         };
         self.commit(&head, txn, audit, true)?;
         Ok(Written {
             generation,
             outcome,
         })
+    }
+
+    /// Moves the store the role `cold` names, on purpose: replaces the endpoint of
+    /// connection `name` and the bucket and prefix of the binding that names it, bumps
+    /// the generation and appends an audit row with the old and the new identity, all in
+    /// one transaction. The identity it is already at is `Unchanged`. Returns what was
+    /// written and the identity before. The caller has probed `to`.
+    ///
+    /// # Errors
+    /// [`RegistryError::GenerationMismatch`] if `expect_generation` is stale,
+    /// [`RegistryError::NoSuchConnection`], [`RegistryError::NotBound`] if the role
+    /// `cold` does not name the connection, [`RegistryError::Conflict`],
+    /// [`RegistryError::Store`].
+    pub fn repoint(
+        &self,
+        name: &ConnectionName,
+        to: &StoreIdentity,
+        expect_generation: u64,
+    ) -> Result<(Written, StoreIdentity), RegistryError> {
+        let _guard = self.lock();
+        let head = self.read_gen()?;
+        head.expect(Some(expect_generation))?;
+        let mut conn = self
+            .conn_row(name)?
+            .ok_or(RegistryError::NoSuchConnection)?;
+        let (role, mut bind) = self
+            .bind_rows()?
+            .into_iter()
+            .find(|(_, row)| row.connection == name.as_str())
+            .ok_or(RegistryError::NotBound)?;
+        let from = StoreIdentity {
+            endpoint: conn.endpoint.clone(),
+            bucket: bind.bucket.clone(),
+            prefix: bind.prefix.clone(),
+        };
+        let mut audit = Audit {
+            action: AuditAction::Repoint,
+            subject: name.to_string(),
+            outcome: AuditOutcome::Unchanged,
+            detail: format!("{from} -> {to}"),
+        };
+        if from == *to {
+            let generation = self.commit(&head, Txn::new(), audit, false)?;
+            return Ok((
+                Written {
+                    generation,
+                    outcome: AuditOutcome::Unchanged,
+                },
+                from,
+            ));
+        }
+        let generation = head.after(true);
+        to.endpoint.clone_into(&mut conn.endpoint);
+        conn.updated_generation = generation;
+        to.bucket.clone_into(&mut bind.bucket);
+        to.prefix.clone_into(&mut bind.prefix);
+        bind.updated_generation = generation;
+        audit.outcome = AuditOutcome::Changed;
+        let txn = Txn::new()
+            .put(conn_key(name), conn.encode_to_vec(), Cond::Any)
+            .put(bind_key(role), bind.encode_to_vec(), Cond::Any);
+        self.commit(&head, txn, audit, true)?;
+        Ok((
+            Written {
+                generation,
+                outcome: AuditOutcome::Changed,
+            },
+            from,
+        ))
     }
 
     /// Removes a binding. Whether a node still runs on it is the caller's rule.
@@ -617,6 +695,7 @@ impl Registry {
             action: AuditAction::DeleteBinding,
             subject: role.to_string(),
             outcome: AuditOutcome::Deleted,
+            detail: String::new(),
         };
         let generation = self.commit(&head, txn, audit, true)?;
         Ok(Written {
@@ -666,6 +745,7 @@ impl Registry {
             subject: audit.subject,
             outcome: outcome_code(audit.outcome),
             generation,
+            detail: audit.detail,
         };
         let txn = txn.put(GEN_KEY, gen_row.encode_to_vec(), head.cond).put(
             audit_key(seq),
@@ -685,6 +765,7 @@ fn audit_of(action: AuditAction, name: &ConnectionName, outcome: AuditOutcome) -
         action,
         subject: name.to_string(),
         outcome,
+        detail: String::new(),
     }
 }
 
