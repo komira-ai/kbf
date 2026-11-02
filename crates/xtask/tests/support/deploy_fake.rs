@@ -132,8 +132,18 @@ pub fn read_request(stream: impl Read) -> Option<Seen> {
     })
 }
 
-/// A TLS server on loopback that answers by `script`.
-pub fn serve(script: Script) -> Fake {
+/// A loopback listener, the TLS configuration of its server certificate, and the CA that
+/// signed it.
+pub struct Listening {
+    pub listener: TcpListener,
+    pub config: Arc<rustls::ServerConfig>,
+    pub base: String,
+    pub ca: CertificateDer<'static>,
+    pub ca_pem: String,
+}
+
+/// A listener on loopback with a server certificate for `127.0.0.1` from a CA of its own.
+pub fn listen() -> Listening {
     let mut params = CertificateParams::new(Vec::<String>::new()).expect("CA params");
     params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     let ca = CertifiedIssuer::self_signed(params, KeyPair::generate().expect("key")).expect("CA");
@@ -159,6 +169,24 @@ pub fn serve(script: Script) -> Fake {
         "https://127.0.0.1:{}",
         listener.local_addr().expect("addr").port()
     );
+    Listening {
+        listener,
+        config,
+        base,
+        ca: ca.der().clone(),
+        ca_pem: ca.pem(),
+    }
+}
+
+/// A TLS server on loopback that answers by `script`.
+pub fn serve(script: Script) -> Fake {
+    let Listening {
+        listener,
+        config,
+        base,
+        ca,
+        ca_pem,
+    } = listen();
     let seen = Arc::new(Mutex::new(Vec::new()));
     let log = Arc::clone(&seen);
     let tokens = AtomicUsize::new(0);
@@ -214,8 +242,8 @@ pub fn serve(script: Script) -> Fake {
     });
     Fake {
         base,
-        ca: ca.der().clone(),
-        ca_pem: ca.pem(),
+        ca,
+        ca_pem,
         seen,
     }
 }

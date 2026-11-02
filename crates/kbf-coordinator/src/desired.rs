@@ -13,13 +13,18 @@
 //! builds read and wrote, so a downgrade keeps working); a file with
 //! `{"services": {name: state}}` is the map. A file that cannot be read back is a refusal
 //! to start: the coordinator does not guess what an operator meant.
+//!
+//! What is kept of the writes themselves (a generation, what the last change of version
+//! replaced, the caller's id of the write) is in a file beside it, [`crate::writes`], so this
+//! file keeps the form earlier builds read. A write may be conditional on the generation
+//! ([`Writer`]): the check and the write are made under one lock.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use kbf_types::HostRole;
 use kbf_updater::version::Version;
@@ -27,6 +32,7 @@ use kbf_updater::version::Version;
 use serde::{Deserialize, Serialize};
 
 use crate::services::Services;
+use crate::writes::{self, MAX_WRITE_ID, Record, is_write_id};
 
 /// The service every host runs today, and the only one a desired state may name unless a
 /// services file defines more.
@@ -66,7 +72,7 @@ pub fn is_role_name(name: &str) -> bool {
 /// A role the map does not name has the default of the question asked ([`Self::max_updating_of`],
 /// [`Self::min_up_of`]). The defaults are for a role a service definition names: whether a role
 /// is run at all is the definition's to say, never this map's.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct RoleLimits(BTreeMap<String, u32>);
 
@@ -206,6 +212,22 @@ pub enum DesiredError {
     UnknownService,
 }
 
+/// A `POST /v1/desired` body, read ([`Desired::parse_write`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DesiredWrite {
+    /// The service it sets.
+    pub service: String,
+    /// The state it sets.
+    pub desired: Desired,
+    /// The roles whose limits were dropped because the service does not have them, sorted.
+    pub dropped_roles: Vec<String>,
+    /// The generation the write is made on, if it is conditional: it is refused unless the
+    /// service's record is still at that generation.
+    pub if_generation: Option<u64>,
+    /// The caller's id of the write; empty for none.
+    pub write_id: String,
+}
+
 /// The minimums `kbf` requires a state to name.
 fn kbf_required() -> Vec<String> {
     KBF_MIN_UP.map(str::to_owned).into()
@@ -258,9 +280,38 @@ impl Desired {
         bytes: &[u8],
         services: &Services,
     ) -> Result<(String, Self, Vec<String>), DesiredError> {
+        Self::parse_write(bytes, services)
+            .map(|write| (write.service, write.desired, write.dropped_roles))
+    }
+
+    /// [`Self::parse_request_noting`], with the two optional fields of the write itself:
+    /// `if_generation`, a number, and `write_id`, a text [`is_write_id`] accepts.
+    ///
+    /// # Errors
+    /// [`DesiredError`], as [`Self::parse_request_for`], and [`DesiredError::Malformed`] for
+    /// an `if_generation` that is not a number or a `write_id` that is not such a text.
+    pub(crate) fn parse_write(
+        bytes: &[u8],
+        services: &Services,
+    ) -> Result<DesiredWrite, DesiredError> {
         let malformed = |e: serde_json::Error| DesiredError::Malformed(e.to_string());
         let mut fields: serde_json::Map<String, serde_json::Value> =
             serde_json::from_slice(bytes).map_err(malformed)?;
+        let if_generation = match fields.remove("if_generation") {
+            None => None,
+            Some(n) => Some(n.as_u64().ok_or_else(|| {
+                DesiredError::Malformed("if_generation is not a generation".to_owned())
+            })?),
+        };
+        let write_id = match fields.remove("write_id") {
+            None => String::new(),
+            Some(serde_json::Value::String(id)) if is_write_id(&id) => id,
+            Some(_) => {
+                return Err(DesiredError::Malformed(format!(
+                    "write_id is not 1 to {MAX_WRITE_ID} visible characters"
+                )));
+            }
+        };
         let service = match fields.remove("service") {
             None => KBF.to_owned(),
             Some(serde_json::Value::String(name)) => name,
@@ -281,7 +332,13 @@ impl Desired {
         if !dropped.is_empty() {
             tracing::warn!(%service, roles = ?dropped, "dropped limits for roles the service does not have");
         }
-        Ok((service, desired, dropped))
+        Ok(DesiredWrite {
+            service,
+            desired,
+            dropped_roles: dropped,
+            if_generation,
+            write_id,
+        })
     }
 
     /// Refuses a limits key that is neither a legacy name nor a role of any service, so that a
@@ -376,16 +433,89 @@ pub enum StoreError {
         /// What is wrong with it.
         source: DesiredError,
     },
+    /// The generation of a service's writes is at its largest and cannot be raised: no write
+    /// of it is accepted, so a write conditional on that generation can never pass twice.
+    #[error(
+        "the generation of the writes of {service} is at its largest: no further write of it is accepted"
+    )]
+    GenerationExhausted {
+        /// The service.
+        service: String,
+    },
 }
 
-/// The desired state, in memory and in its file.
+/// The desired state of every service and the record of its writes ([`crate::writes`]).
+#[derive(Debug, Default)]
+struct Current {
+    desired: BTreeMap<String, Desired>,
+    records: BTreeMap<String, Record>,
+}
+
+/// The desired state, in memory and in its file, with the record of its writes in a file
+/// beside it ([`crate::writes`]).
 #[derive(Debug)]
 pub struct DesiredStore {
     path: PathBuf,
-    current: Mutex<BTreeMap<String, Desired>>,
+    records_path: PathBuf,
+    current: Mutex<Current>,
     /// Held across a whole replacement, so that writers wait for each other and not readers:
     /// `current` is only locked to read or to swap, never across the file's fsyncs.
     writing: Mutex<()>,
+}
+
+/// The one writer of a [`DesiredStore`]: while it is held no other write is accepted, so what
+/// it reads ([`Self::record`]) is what the write it makes ([`Self::set`]) replaces.
+pub(crate) struct Writer<'a> {
+    store: &'a DesiredStore,
+    _held: MutexGuard<'a, ()>,
+}
+
+impl Writer<'_> {
+    /// The record of `service` now.
+    #[must_use]
+    pub fn record(&self, service: &str) -> Record {
+        self.store.read(service).1
+    }
+
+    /// Replaces the desired state of `service` (the others stay), made by the write
+    /// `write_id` (empty for none), and answers its record. The state is written whole to its
+    /// temporary file, the record file is written naming that file ([`writes::FileId`]), and the temporary
+    /// file is then renamed over the state file; memory changes only when all three are done.
+    /// A stop or a failure between them leaves a record file that names another state file
+    /// than the one in place, which the next start drops ([`crate::writes`]).
+    ///
+    /// # Errors
+    /// [`StoreError::Io`]: a file could not be replaced; the old state stands in memory.
+    /// [`StoreError::GenerationExhausted`]: nothing is written.
+    pub fn set(
+        &self,
+        service: &str,
+        desired: Desired,
+        write_id: String,
+    ) -> Result<Record, StoreError> {
+        let (mut next, mut records) = {
+            let current = self.store.lock();
+            (current.desired.clone(), current.records.clone())
+        };
+        let record = records
+            .get(service)
+            .cloned()
+            .unwrap_or_default()
+            .after(next.get(service), &desired, write_id)
+            .ok_or_else(|| StoreError::GenerationExhausted {
+                service: service.to_owned(),
+            })?;
+        next.insert(service.to_owned(), desired);
+        records.insert(service.to_owned(), record.clone());
+        let staged = self.store.stage(&next)?;
+        writes::save(&self.store.records_path, staged.id, &next, &records)?;
+        staged.commit()?;
+        *self.store.lock() = Current {
+            desired: next,
+            records,
+        };
+        Ok(record)
+    }
 }
 
 pub(crate) fn io_at(path: &Path) -> impl FnOnce(io::Error) -> StoreError + '_ {
@@ -404,12 +534,13 @@ pub(crate) fn dir_of(path: &Path) -> &Path {
 }
 
 impl DesiredStore {
-    /// The store of the file at `path`: its state if it exists, none if not.
+    /// The store of the file at `path`: its state if it exists, none if not, and the record
+    /// of its writes from the file beside it ([`writes::path_of`]).
     ///
     /// # Errors
-    /// [`StoreError`]: the file exists and cannot be read, or holds no desired state.
+    /// [`StoreError`]: a file exists and cannot be read, or holds no desired state or record.
     pub fn open(path: &Path) -> Result<Self, StoreError> {
-        let current = match fs::read(path) {
+        let desired = match fs::read(path) {
             Ok(bytes) => parse_file(&bytes).map_err(|source| StoreError::Invalid {
                 path: path.to_owned(),
                 source,
@@ -417,9 +548,12 @@ impl DesiredStore {
             Err(e) if e.kind() == io::ErrorKind::NotFound => BTreeMap::new(),
             Err(e) => return Err(io_at(path)(e)),
         };
+        let records_path = writes::path_of(path);
+        let records = writes::load(&records_path, path, &desired)?;
         Ok(Self {
             path: path.to_owned(),
-            current: Mutex::new(current),
+            records_path,
+            current: Mutex::new(Current { desired, records }),
             writing: Mutex::new(()),
         })
     }
@@ -427,34 +561,50 @@ impl DesiredStore {
     /// The desired state of `service` now, if one was ever set.
     #[must_use]
     pub fn get(&self, service: &str) -> Option<Desired> {
-        self.lock().get(service).cloned()
+        self.lock().desired.get(service).cloned()
+    }
+
+    /// The desired state of `service` now, if one was ever set, and the record of its writes,
+    /// read together.
+    #[must_use]
+    pub fn read(&self, service: &str) -> (Option<Desired>, Record) {
+        let current = self.lock();
+        (
+            current.desired.get(service).cloned(),
+            current.records.get(service).cloned().unwrap_or_default(),
+        )
     }
 
     /// The desired state of every service, by name.
     #[must_use]
     pub fn all(&self) -> BTreeMap<String, Desired> {
-        self.lock().clone()
+        self.lock().desired.clone()
     }
 
-    /// Replaces the desired state of `service` (the others stay), in the file first and in
-    /// memory only if the file holds it.
+    /// The writer, once every earlier writer is done.
+    #[must_use]
+    pub(crate) fn writer(&self) -> Writer<'_> {
+        Writer {
+            store: self,
+            _held: self.writing.lock().unwrap_or_else(PoisonError::into_inner),
+        }
+    }
+
+    /// Replaces the desired state of `service` (the others stay) by a write without an id:
+    /// [`Writer::set`].
     ///
     /// # Errors
-    /// [`StoreError::Io`]: the file could not be replaced; the old state stands.
+    /// [`StoreError::Io`]: a file could not be replaced; the old state stands.
     pub fn set(&self, service: &str, desired: Desired) -> Result<(), StoreError> {
-        let _writer = self.writing.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut next = self.all();
-        next.insert(service.to_owned(), desired);
-        self.write(&next)?;
-        *self.lock() = next;
-        Ok(())
+        self.writer().set(service, desired, String::new()).map(drop)
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Desired>> {
+    fn lock(&self) -> MutexGuard<'_, Current> {
         self.current.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn write(&self, services: &BTreeMap<String, Desired>) -> Result<(), StoreError> {
+    /// The state file of `services`, written whole to its temporary file and not yet in place.
+    fn stage(&self, services: &BTreeMap<String, Desired>) -> Result<Staged, StoreError> {
         // Only `kbf` is the single state of earlier builds, which refuse the map form.
         let encoded = match services.iter().collect::<Vec<_>>().as_slice() {
             [(name, only)] if name.as_str() == KBF => serde_json::to_vec_pretty(only),
@@ -466,15 +616,33 @@ impl DesiredStore {
             .map_err(io::Error::from)
             .map_err(io_at(&self.path))?;
         text.push(b'\n');
-        write_whole(&self.path, &text)
+        stage(&self.path, &text)
     }
 }
 
-/// Replaces the file at `path` with `text`, whole: a temporary file beside it, created new
-/// and owner-only, fsynced, renamed over `path`, and the directory fsynced, so a crash leaves
-/// the old file or the new one. A leftover temporary file of a crash is replaced, never
-/// followed.
-pub(crate) fn write_whole(path: &Path, text: &[u8]) -> Result<(), StoreError> {
+/// A file written whole beside the file it replaces, fsynced, and not yet renamed over it.
+pub(crate) struct Staged {
+    temp: PathBuf,
+    path: PathBuf,
+    /// The id of the temporary file, which the file at `path` has once the rename is done.
+    pub(crate) id: writes::FileId,
+}
+
+impl Staged {
+    /// Renames the temporary file over the file it replaces and fsyncs the directory.
+    pub(crate) fn commit(self) -> Result<(), StoreError> {
+        fs::rename(&self.temp, &self.path).map_err(io_at(&self.path))?;
+        let dir = dir_of(&self.path);
+        File::open(dir)
+            .and_then(|d| d.sync_all())
+            .map_err(io_at(dir))
+    }
+}
+
+/// `text` written whole to a temporary file beside `path` (its name with `.new` added),
+/// created new and owner-only, and fsynced. A leftover temporary file of a crash is replaced,
+/// never followed.
+pub(crate) fn stage(path: &Path, text: &[u8]) -> Result<Staged, StoreError> {
     let mut temp = path.to_path_buf().into_os_string();
     temp.push(".new");
     let temp = PathBuf::from(temp);
@@ -490,9 +658,16 @@ pub(crate) fn write_whole(path: &Path, text: &[u8]) -> Result<(), StoreError> {
         .map_err(io_at(&temp))?;
     file.write_all(text).map_err(io_at(&temp))?;
     file.sync_all().map_err(io_at(&temp))?;
-    fs::rename(&temp, path).map_err(io_at(path))?;
-    let dir = dir_of(path);
-    File::open(dir)
-        .and_then(|d| d.sync_all())
-        .map_err(io_at(dir))
+    let id = writes::FileId::of(&file.metadata().map_err(io_at(&temp))?);
+    Ok(Staged {
+        temp,
+        path: path.to_owned(),
+        id,
+    })
+}
+
+/// Replaces the file at `path` with `text`, whole: [`stage`], then [`Staged::commit`], so a
+/// crash leaves the old file or the new one.
+pub(crate) fn write_whole(path: &Path, text: &[u8]) -> Result<(), StoreError> {
+    stage(path, text)?.commit()
 }

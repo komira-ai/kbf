@@ -94,6 +94,19 @@ pub fn job_has_key(text: &str, job: &str, key: &str) -> Result<bool, String> {
     Ok(get(job_of(&root, job)?, key).is_some())
 }
 
+/// The job `job`'s value of `key` when it is one scalar (`timeout-minutes: 90` is `90`);
+/// `None` without the key. An error when it is a list or a mapping.
+pub fn job_scalar(text: &str, job: &str, key: &str) -> Result<Option<String>, String> {
+    let root = yaml::load(text)?;
+    match get(job_of(&root, job)?, key) {
+        None => Ok(None),
+        Some(n) => n
+            .as_str()
+            .map(|v| Some(v.to_owned()))
+            .ok_or_else(|| format!("the `{key}` of job `{job}` is not one value")),
+    }
+}
+
 /// The names of the keys under the job `job`'s `outputs:`; empty without any.
 pub fn job_outputs(text: &str, job: &str) -> Result<Vec<(String, String)>, String> {
     let root = yaml::load(text)?;

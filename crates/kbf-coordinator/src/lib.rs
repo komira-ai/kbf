@@ -3,6 +3,8 @@
 //!
 //! - [`identity`]: who is calling, from the client certificate's subjectAltNames alone;
 //! - [`desired`]: the one thing stored, the desired state, in a file replaced atomically;
+//! - [`writes`]: what is kept of the writes of the desired state: a generation, what the last
+//!   change of version replaced, and the caller's id of the write;
 //! - [`fleet`]: the last heartbeat of every host, the live and down rule, the quiet start;
 //! - [`acks`]: the failure reports a by-hand set of a bad version acknowledged;
 //! - [`bake`] and [`canary`]: how long an updated host holds its slot, and the hosts that go
@@ -44,6 +46,7 @@ pub(crate) mod ops_file;
 pub mod reconcile;
 pub mod service;
 pub mod services;
+pub mod writes;
 
 #[cfg(test)]
 mod bake_canary_tests;
@@ -71,6 +74,8 @@ mod desired_role_tests;
 mod desired_tests;
 #[cfg(test)]
 mod extras_dropped_tests;
+#[cfg(test)]
+mod generation_tests;
 #[cfg(test)]
 mod halt_membership_tests;
 #[cfg(test)]
@@ -117,3 +122,5 @@ mod status_service_tests;
 mod testutil;
 #[cfg(test)]
 mod tierstore_service_tests;
+#[cfg(test)]
+mod writes_tests;

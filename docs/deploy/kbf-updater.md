@@ -738,6 +738,32 @@ A host whose heartbeat carries `promotion_pending` holds its update slot and doe
 
 The coordinator keeps its desired state per service name, and `kbf` is the only service it accepts unless `--services-file` defines more ([the design](../design/updates.md)): `POST /v1/desired` takes an optional `service` (absent means `kbf`; a name no file defines is a 400), and `GET /v1/status` adds `services` beside the unchanged `desired`, `services_dropped`, the number of heartbeats whose `services` list was bad and was dropped (the host is answered as a `kbf`-only host), and `per_service` (below). While `kbf` is the only service, the `--state-file` holds the single state in the form earlier coordinators wrote, so a downgrade to one of them starts on the same file; a file in the map form (`{"services": {...}}`), which a coordinator with a second service writes, is refused by an earlier build, and the operator then restores the file from before or writes `kbf`'s state alone in it.
 
+The coordinator keeps a record of the writes of each service's desired state. `generation` is
+raised by every accepted write, a `POST /v1/desired` or the coordinator's own rollback, including
+one that sets the version already desired (0 before the first). `replaced` is `{"version",
+"min_up"}`, the version and minimums that the last change of version replaced (`null` until a
+second version was set); a write of the version already desired keeps it. `write_id` is the
+caller's text for the write that made the state (empty for a write without one, and for the
+coordinator's own). `POST /v1/desired` takes two optional fields for these: `if_generation`, a
+number, makes the write conditional: when it is not the service's generation now the answer is 409
+`conflict` and nothing changes, the bad mark of the version included; `write_id` is 1 to 128
+visible ASCII characters. A malformed one is a 400. The answer of the POST is the state as stored
+followed by `generation`, `replaced` and `write_id`, and `GET /v1/convergence` (and so the status's
+`per_service.*.convergence`) shows them too. The record is kept in a file of its own beside the
+`--state-file`, its name with `.writes` added, so the state file keeps the form earlier
+coordinators read and a downgrade still starts (the earlier build ignores the `.writes` file). At
+each write the state is written whole to its temporary file, the `.writes` file is written naming
+that file (its inode and modification time) and the state each entry describes, and the temporary
+file is then renamed over the state file, which keeps both. Every replacement of the state file is
+another file (another inode, or a reused inode with the later time of its own write), so at a start
+the `.writes` file is trusted only when it names the state file in place and the state in it: after a
+stop between the two writes, or any write of the state file by an earlier coordinator (even one
+that changed the state and changed it back), the entries' `replaced` and `write_id` are dropped and
+their generations raised by one. A restore then finds nothing replaced and names the hand step. A
+generation that cannot be raised (it is at 2^64 - 1) refuses every write of that service, as a 500,
+and stops a start that would have to raise it. A `.writes` file that is not JSON of its shape stops
+the start; a key it does not know is skipped.
+
 `--ops-file` (default: the `--state-file` name with `.ops` added) holds what an operator decides, apart from CI's desired state: the hosts excluded from a service, the labels on a host, and a ring of the last 64 operator changes (it also holds the per-service marks: `halt`, `halt_acked`, `last_good`, `bad` and `failure_acked`; a coordinator from before the rollback release knows all of them but `failure_acked`, which is written only after CI sets by hand a version marked bad, and refuses a file that holds it as an unknown key, so that rolling back across that release means moving the file aside). What the halt release adds is kept beside the ops file, in `<ops-file>.halts`: the whole report each halt and each acknowledgement was made from, the reports received while a halt stood and each service's clear generation. The ops file keeps the shape a coordinator from before that release reads, so one rolled back starts on it, ignores the halts file and keeps the halt as it always did (it does not stop orders for a halt); rolled forward again, the coordinator joins the halts file back by host and target and drops what no longer matches. The halts file's reader skips a key it does not know, and passes over (and counts, in a warning at start) a record whose report it cannot read, such as an outcome a later release added; it refuses only a file it cannot parse. A change is committed by replacing the ops file: the halts file that goes with it is first written to `<ops-file>.halts.next`, naming the SHA-256 of the new ops file, then the ops file is replaced, then the staged file is renamed over the halts file. A start, and every change, first settles a staged file left behind: renamed in when the ops file is the one it names, removed otherwise. A change takes effect (and a clear's generation is told to agents) only once the halts file is renamed in; when that rename fails, the change fails and the next start or change renames the staged file in. A crash or a failed write therefore leaves the two files as they were before the change or as they are after it, never one of each: a clear's generation is on disk with the clear or not at all. A staged file that cannot be settled stops the start with its path in the message. The coordinator creates the file at the first change and replaces it whole (a temporary file beside it, fsync, rename, directory fsync), owner-only; with no file nothing is excluded or labelled and the coordinator behaves as before. The reader is strict: a key it does not know, or a `schema` newer than the build's, stops the start with the flag and the path in the message, so a coordinator rolled back below the build that wrote the file does not ignore what it holds. To start without the file anyway, move it aside on purpose. The directory must be writable by the coordinator. `GET /v1/status` shows the store's content (the two files joined) as `ops` once anything has been changed (before that the key is absent).
 
 `POST /v1/operator` on the control listener takes the operator token as the bearer (CI's OIDC token is refused with 401, as is no token) and one action as JSON, at most 4096 bytes:
@@ -778,8 +804,50 @@ Each accepted action is written to the file before it takes effect (a failed wri
    convergence fails the job; the release stays published whatever it says. Another failed read
    is reported and tried again, and counts as no change.
 
+The job gives `--deadline-min 60` explicitly. Every step of the job has a `timeout-minutes` of its
+own, and the job's (200) is at least their sum: a step that hangs, the proof included, is cut by its
+own timeout and fails, and the restore still runs within its own. The deploy's (85) and the
+restore's (30) cover the longest their verbs can run, and a minute to start: every call is a token
+call and a coordinator call of at most 60 seconds each, a call tried again on a 503 is four such
+calls and three pauses of `--every-secs` (30), the restore makes three of those (28.5 minutes), and
+the deploy two, its deadline, a last read and a pause (81.5 minutes). The release workflow lint
+computes these from the verbs' own limits (`deploy_bound` and `restore::bound` of
+`crates/xtask/src/deploy_farm.rs`) and holds each of them.
+
+When any earlier step of the `gamma` job failed (the deploy, or the proof after it), the job's
+last step, `cargo xtask deploy-farm restore --url ... --ca-pem ... --version <this release> --run
+<run id>-<attempt>`, sets the farm back:
+
+1. it reads `GET /v1/convergence`. When the desired version is not this release (another writer,
+   a newer release or the coordinator's own rollback has it), it sets nothing, says so and exits
+   0. When the coordinator shows no `generation` (a coordinator older than this), or no
+   `replaced` (the release was the farm's first), it sets nothing and exits 1 naming the hand
+   step (below). An answer whose fields are not of their types (no `desired`, a `generation` that
+   is no count, and so on) is an error, never read as "another version";
+2. it posts `replaced` (its version and minimums) to `/v1/desired` with `if_generation` set to
+   the generation it read and `write_id` set to `restore-<run id>-<attempt>`, with a fresh token
+   (a 503 is tried again, as for the deploy), prints what it set, and exits 1, so the run stays
+   red;
+3. on a 409 it reads once more: a state whose `write_id` is its own is an earlier try of the same
+   POST that landed behind a lost answer, and the restore is done; any other write stands,
+   nothing is restored, and it exits 1 naming the desired version and that write.
+
+Any other failure of the POST (a 503 on every try, a lost connection, a timeout, an answer it
+cannot read) is followed by the same read, so a restore that landed with its answer lost is
+reported done. A POST that did not land, and a 401 or a 403, exit 1 naming the version it could
+not set and the hand step; when the read after an unseen POST fails too, it exits 1 saying the
+outcome is not known and which `write_id` to look for. Versions and write ids are compared and
+posted exactly as the coordinator sent them; only the log shortens them. The hand step, until the
+forced rollback of the design is built, is re-running, from its run's page, the `gamma` job of the
+release the farm should run, which sets that release as desired. The restore is an ordinary desired write, so it goes through every ordinary rule. A run
+that is cancelled, or whose runner is lost, restores nothing; `GET /v1/convergence` still shows
+`replaced`, and re-running the failed jobs sets this release again (which keeps `replaced`) and
+then runs the restore.
+
 `GET /v1/convergence` answers `{"desired", "quiet", "state", "roles": [{"role", "at_desired",
-"updating", "failed", "down"}]}`, where `state` is `converged`, `blocked`, `halted` or `in_progress` (`halted` adds `halt`: `{"node_id","check","target"}`). It
+"updating", "failed", "down"}], "commit", "generation", "replaced", "write_id"}`, where `state` is
+`converged`, `blocked`, `halted` or `in_progress` (`halted` adds `halt`: `{"node_id","check","target"}`),
+and `generation`, `replaced` and `write_id` are the record of the writes of the desired state, below. It
 takes CI's OIDC token and refuses the operator token (the operator's read is `GET /v1/status`).
 It is computed from the heartbeats and the desired state, and stores nothing. `converged` needs
 the coordinator to be past its 30 second quiet start, at least one live host, every live host at

@@ -15,7 +15,7 @@ use subtle::ConstantTimeEq;
 use crate::acks::{clear_bad, release_ack};
 use crate::converge::{Convergence, RoleCounts, converge_kbf, converge_service, role_counts};
 use crate::decide::{Decision, Hold};
-use crate::desired::{Desired, DesiredError, DesiredStore, KBF, StoreError};
+use crate::desired::{Desired, DesiredError, DesiredStore, DesiredWrite, KBF, StoreError};
 use crate::fleet::{Fleet, Host, Node};
 use crate::halt;
 use crate::identity::Identity;
@@ -23,6 +23,7 @@ use crate::membership::{Member, Standing, account, deferred_count, members, stan
 use crate::ops::{self, AuditEntry, OPERATOR, OperateError, OpsError, OpsState, OpsStore};
 use crate::reconcile::reconcile;
 use crate::services::{ServiceDef, Services};
+use crate::writes::Record;
 
 /// The time since the coordinator started.
 pub type Clock = Arc<dyn Fn() -> Duration + Send + Sync>;
@@ -52,6 +53,15 @@ pub enum SetError {
     /// The allow-list entry that admitted the token does not name this service.
     #[error("the token may not set this service")]
     Forbidden,
+    /// The write named an `if_generation` that is not the service's generation now: another
+    /// write was accepted since the caller read it. Nothing was changed.
+    #[error("the write was made on generation {asked}, the service is at {now}")]
+    Conflict {
+        /// The generation the write named.
+        asked: u64,
+        /// The service's generation.
+        now: u64,
+    },
 }
 
 /// Why a CI token was not accepted.
@@ -144,13 +154,17 @@ pub enum ConvergenceError {
     UnknownService,
 }
 
-/// What `POST /v1/desired` answers: the state as stored, and, only when there are any, the
-/// roles whose limits were dropped because the service does not have them.
+/// What `POST /v1/desired` answers: the state as stored, the record of the write
+/// ([`Record`]), and, only when there are any, the roles whose limits were dropped because the
+/// service does not have them.
 #[derive(Debug, Serialize)]
 pub struct Set {
     /// The state as stored.
     #[serde(flatten)]
     pub desired: Desired,
+    /// The record after this write: its generation, what it replaced, and its id.
+    #[serde(flatten)]
+    pub record: Record,
     /// The dropped roles, sorted.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub dropped_roles: Vec<String>,
@@ -497,8 +511,13 @@ impl Coordinator {
         body: &[u8],
     ) -> Result<Set, SetError> {
         let verified = self.ci(bearer).await?;
-        let (service, desired, dropped_roles) =
-            Desired::parse_request_noting(body, &self.services)?;
+        let DesiredWrite {
+            service,
+            desired,
+            dropped_roles,
+            if_generation,
+            write_id,
+        } = Desired::parse_write(body, &self.services)?;
         if !verified.services.contains(&service) {
             tracing::warn!(
                 workflow = %verified.job_workflow_ref,
@@ -507,22 +526,41 @@ impl Coordinator {
             );
             return Err(SetError::Forbidden);
         }
+        // The fleet before the writer, the order a heartbeat's rollback takes them in
+        // (`crate::reconcile`). The writer is held from the generation's check to the write,
+        // so no other write is accepted between them. Holding the fleet across the write also
+        // keeps a heartbeat's rollback, which decides on the state it read under the fleet,
+        // from overwriting this write; heartbeats wait for the files' fsyncs, which CI's rare
+        // writes can afford.
+        let fleet = self.fleet.lock().unwrap_or_else(PoisonError::into_inner);
+        let writer = self.desired.writer();
+        let now = writer.record(&service).generation;
+        if let Some(asked) = if_generation.filter(|asked| *asked != now) {
+            tracing::warn!(
+                workflow = %verified.job_workflow_ref,
+                %service,
+                asked,
+                now,
+                "refused a desired state: another write was accepted since the caller read it"
+            );
+            return Err(SetError::Conflict { asked, now });
+        }
         // CI naming a version by hand lifts its mark. The mark goes first: a set that fails
         // after it leaves nothing blocked, and the reverse would leave a wanted version that
         // the next beat rolls back.
-        {
-            let fleet = self.fleet.lock().unwrap_or_else(PoisonError::into_inner);
-            clear_bad(&self.ops, &fleet, &service, &desired.version)?;
-        }
-        self.desired.set(&service, desired.clone())?;
+        clear_bad(&self.ops, &fleet, &service, &desired.version)?;
+        let record = writer.set(&service, desired.clone(), write_id)?;
         tracing::info!(
             workflow = %verified.job_workflow_ref,
             sha = ?verified.sha,
             %service,
+            generation = record.generation,
+            write_id = %record.write_id,
             "desired state set by CI"
         );
         Ok(Set {
             desired,
+            record,
             dropped_roles,
         })
     }
@@ -593,7 +631,7 @@ impl Coordinator {
             .services
             .defs()
             .map(|def| {
-                let desired = self.desired.get(&def.name);
+                let (desired, record) = self.desired.read(&def.name);
                 let roles = role_counts(def, desired.as_ref(), &fleet, now);
                 let hosts: Vec<ServiceHostStatus> = fleet
                     .hosts_of(&def.name)
@@ -616,7 +654,8 @@ impl Coordinator {
                 let up = hosts.iter().filter(|h| h.host.up).count();
                 let slots_held = hosts.iter().filter(|h| h.host.holds_slot).count();
                 let members = members(def, &fleet, &ops, now);
-                let convergence = convergence_of(def, desired.as_ref(), &fleet, &ops, now);
+                let mut convergence = convergence_of(def, desired.as_ref(), &fleet, &ops, now);
+                convergence.record = record;
                 let status = ServiceStatus {
                     desired,
                     roles,
@@ -666,9 +705,11 @@ impl Coordinator {
             .ok_or(ConvergenceError::UnknownService)?;
         let now = (self.clock)();
         let fleet = self.fleet.lock().unwrap_or_else(PoisonError::into_inner);
-        let desired = self.desired.get(service);
+        let (desired, record) = self.desired.read(service);
         let ops = self.ops.state();
-        Ok(convergence_of(def, desired.as_ref(), &fleet, &ops, now))
+        let mut convergence = convergence_of(def, desired.as_ref(), &fleet, &ops, now);
+        convergence.record = record;
+        Ok(convergence)
     }
 }
 

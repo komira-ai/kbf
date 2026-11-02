@@ -90,8 +90,8 @@ mod yaml;
 mod jobs;
 pub use jobs::{
     concurrency, job_env, job_environment, job_has_key, job_matrix, job_name, job_needs,
-    job_outputs, job_permission_levels, job_runs_on, job_strings, job_uses, job_with, push_filters,
-    top_defaults_shell, top_env, trigger_filters,
+    job_outputs, job_permission_levels, job_runs_on, job_scalar, job_strings, job_uses, job_with,
+    push_filters, top_defaults_shell, top_env, trigger_filters,
 };
 
 use yaml::{Node, Value};
@@ -238,6 +238,8 @@ pub struct Step {
     pub working_directory: Option<String>,
     /// The step's own `shell:`, if it has one.
     pub shell: Option<String>,
+    /// The step's own `timeout-minutes:`, if it has one.
+    pub timeout_minutes: Option<String>,
 }
 
 /// The steps of the job `job` (its key matched ignoring ASCII case) in a workflow
@@ -282,6 +284,7 @@ pub fn job_steps(text: &str, job: &str) -> Result<Vec<Step>, String> {
                 condition: text_of(get(m, "if")),
                 working_directory: text_of(get(m, "working-directory")),
                 shell: text_of(get(m, "shell")),
+                timeout_minutes: text_of(get(m, "timeout-minutes")),
             },
             _ => Step::default(),
         })
