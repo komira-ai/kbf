@@ -2,7 +2,7 @@
 //!
 //! xtask and the installer are written apart: `pkg-trust` writes the `installer.conf` of
 //! the package's trust directory and `package` writes the tarball a host stages, and the
-//! installer parses the first (`Settings`) and unpacks the second (`archive::unpack_one`)
+//! installer parses the first (`Settings`) and unpacks the second (`archive::unpack_members`)
 //! on a host. Nothing joins them but this test. Catches:
 //!
 //! - the generator and the parser drifting: a key added to the conf the installer refuses
@@ -15,8 +15,8 @@
 //! - `xtask`'s and the installer's rule for a ref disagreeing: xtask refusing a ref the
 //!   installer takes (a branch that could never be released) or accepting one the installer
 //!   would refuse (a package no host loads);
-//! - the tarball `cargo xtask package` writes not being one `unpack_one` takes (one entry
-//!   named for the binary, mode, no trailing data), which nothing but a host would find.
+//! - the tarball `cargo xtask package` writes not being one `unpack_members` takes (a
+//!   member named for the binary, no unsafe member, no trailing data), which nothing but a host would find.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -249,36 +249,38 @@ fn xtask_and_the_installer_agree_on_which_refs_are_branches() {
     }
 }
 
+/// The stage's ask of a component's tarball: the binary `name`, required, into `dest`.
+fn unpack_binary(
+    tarball: &Path,
+    name: &str,
+    dest: &Path,
+) -> Result<kbf_installer::archive::Unpacked, kbf_installer::refusal::ArchiveFault> {
+    let binary = kbf_installer::archive::Member {
+        name,
+        dest,
+        mode: 0o755,
+        cap: 1 << 20,
+        required: true,
+    };
+    kbf_installer::archive::unpack_members(tarball, &[binary], Duration::from_secs(30))
+}
+
 #[test]
 fn the_tarball_xtask_packages_is_one_the_installer_unpacks() {
-    // Catches: `cargo xtask package` writing a tarball the installer's `unpack_one`
-    // refuses (another entry name, a directory entry, a second entry, trailing bytes):
-    // a release no host could stage.
+    // Catches: `cargo xtask package` writing a tarball the installer's `unpack_members`
+    // refuses (another member name, an unsafe member, trailing bytes): a release no host
+    // could stage.
     let dir = scratch("tarball");
     let bytes = b"\x7fELF the binary";
     let tgz = xtask::package::tarball("kbf-installer", bytes).expect("tarball");
     let tarball = dir.join("kbf-installer.tar.gz");
     std::fs::write(&tarball, &tgz).expect("write");
     let out = dir.join("kbf-installer");
-    kbf_installer::archive::unpack_one(
-        &tarball,
-        "kbf-installer",
-        &out,
-        1 << 20,
-        Duration::from_secs(30),
-    )
-    .expect("the installer unpacks xtask's tarball");
+    let unpacked = unpack_binary(&tarball, "kbf-installer", &out)
+        .expect("the installer unpacks xtask's tarball");
+    assert!(unpacked.ignored.is_empty(), "{unpacked:?}");
     assert_eq!(std::fs::read(&out).expect("unpacked"), bytes);
     // And not under another name: the check is of the name, not of the shape alone.
-    let other = dir.join("other");
-    assert!(
-        kbf_installer::archive::unpack_one(
-            &tarball,
-            "kbf",
-            &other,
-            1 << 20,
-            Duration::from_secs(30)
-        )
-        .is_err()
-    );
+    let err = unpack_binary(&tarball, "kbf", &dir.join("other")).expect_err("another name");
+    assert_eq!(err.code(), "archive-name");
 }

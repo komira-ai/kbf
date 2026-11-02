@@ -390,10 +390,10 @@ fn the_attestation_must_verify() {
     ));
 }
 
-/// The tarball must hold exactly one regular file named `kbf`, and it must be an arm64
-/// Mach-O file.
+/// The tarball must hold a regular file named `kbf`, and it must be an arm64 Mach-O file. (A
+/// second member, and the rules for every member, are `stage_members_tests`.)
 #[test]
-fn the_tarball_holds_exactly_the_binary() {
+fn the_tarball_holds_the_binary() {
     use tar::EntryType::{Directory, Regular};
     let fx = Fx::new("mac-stage-tar");
     let sim = fx.sim();
@@ -402,22 +402,17 @@ fn the_tarball_holds_exactly_the_binary() {
         (
             "another name",
             vec![("kbf2", Regular, &bin[..])],
-            "not named kbf",
+            "holds no member named kbf",
         ),
         (
             "a path",
             vec![("bin/kbf", Regular, &bin[..])],
-            "not named kbf",
+            "holds no member named kbf",
         ),
         (
             "a directory",
             vec![("kbf", Directory, &b""[..])],
-            "not a regular file",
-        ),
-        (
-            "two members",
-            vec![("kbf", Regular, &bin[..]), ("x", Regular, &b"x"[..])],
-            "more than one",
+            "the member \"kbf\" is a directory, not a regular file",
         ),
         (
             "too large",

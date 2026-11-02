@@ -149,6 +149,8 @@ rules the field comments cannot. Numbers in `kbf.worker.v1`: `DaemonMessage.upda
 `NodeStatus` is sent once per `Welcome` and an update changes more often.
 
 **Component.** One tarball, `<name>-<commit>-<platform>.tar.gz`, holding exactly one regular file named `<name>`.
+That is the shape kbf's own components have. A host's installer also takes a release that carries the component's updater
+declaration `updater.d/<name>.toml` beside it, and ignores other members (installer step 4).
 `name` is `kbf` or `kbf-daemon`. `sha256` is 64 lowercase hex digits of the tarball and is also its name in
 `ReleaseService.Fetch`. `attestation` is the build-provenance bundle (JSON lines, at most 256 KiB) of the tarball.
 
@@ -537,9 +539,10 @@ parsed strictly (anything else is a failure), `gh` run with an empty environment
    signer workflow, issuer, `refs/heads/main`, predicate type, and `--source-digest` equal to the **commit of the order**. The
    bundle is the record's; if it fails, nothing from the child is read further. The pinned `trusted_root.jsonl` expires: the
    installer reports the days left in `status.json`, and the frontend raises an alert when fewer than 30 remain.
-4. **Shape**: gzip and tar with exactly one regular file named `<name>` (no link, device, directory, absolute path or `..`),
-   decompressed output at most 1 GiB, extracted by the parent into `work/<commit>.partial/` (not into `dl/`) with mode 0755 and
-   owner root. The tarball stays in `dl/` (0700, root), which the probe never needs to traverse.
+4. **Shape**: gzip and tar with a regular file named `<name>` and, when the release carries one, its updater declaration
+   `updater.d/<name>.toml`; no member a link, device, FIFO, absolute path or `..` (a member of another name is ignored and
+   logged), decompressed output at most 1 GiB, extracted by the parent into `work/<commit>.partial/` (not into `dl/`), the
+   binary with mode 0755 and the declaration 0644 at its member path, owner root. The tarball stays in `dl/` (0700, root), which the probe never needs to traverse.
 5. **The binary names itself, and must match the order, before the flip**: `<name> --version --json`, run as `kbf-fetch` with an
    empty environment, reports the order's commit (12 hex prefix) and a `protocol`, `min_protocol`, `state_schema`, `profile` and
    `platform` that must **equal the expected facts in the order record**, and must satisfy the operator floor. A mismatch refuses

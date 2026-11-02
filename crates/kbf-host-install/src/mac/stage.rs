@@ -12,7 +12,10 @@
 //!    tarball's sha256 is a subject, the signer is this repository's `artifacts.yml` on a
 //!    GitHub-hosted runner, and the build was of the full 40-digit commit on the channel's
 //!    branch. It runs as `nobody` and never as root. This is the trust anchor;
-//! 3. the tarball holds exactly one regular file, `kbf`, a Mach-O file for arm64;
+//! 3. the tarball holds a regular file `kbf`, a Mach-O file for arm64, and it may hold the
+//!    updater declaration `updater.d/kbf.toml`, unpacked at that path in the stage; no
+//!    member is a link, a device or a FIFO or has an absolute name or a `..` in it, and a
+//!    member of another name is ignored and told on stderr;
 //! 4. no `com.apple.quarantine` attribute is left on it;
 //! 5. `codesign --verify --strict` accepts it and its signature has the hardened runtime;
 //! 6. the new binary, run as the daemon's user, accepts the daemon's live configuration
@@ -22,10 +25,12 @@
 //! another user (2 and 6) and sealed (0700) again after each. Any failure removes the stage and
 //! changes nothing else.
 
+use std::cell::Cell;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt, chown};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt, chown};
 use std::path::Path;
+use std::rc::Rc;
 
 use flate2::read::GzDecoder;
 use sha2::{Digest, Sha256};
@@ -184,9 +189,9 @@ fn stage_inner(
     )?;
     set_mode(&stage, 0o700)?;
 
-    // 3. The binary.
+    // 3. The binary, and its updater declaration when the release carries one.
     let binary = stage.join(BINARY);
-    unpack(&tarball, &binary, tuning.binary_max)
+    unpack_release(&tarball, &stage, tuning.binary_max)
         .map_err(|e| verify_failed(format!("tarball: {e}")))?;
     is_macho_arm64(&binary).map_err(|e| verify_failed(format!("{BINARY}: {e}")))?;
     let binary_sha256 = sha256_of(&binary).map_err(|e| verify_failed(format!("{BINARY}: {e}")))?;
@@ -498,40 +503,193 @@ fn attest(
     Err(verify_failed(format!("not attested: {why}")))
 }
 
-/// Unpack the one member of the gzipped tar at `tarball` to the new file `dst`.
-fn unpack(tarball: &Path, dst: &Path, cap: u64) -> Result<(), String> {
-    unpack_member(tarball, dst, cap).map_err(|e| e.to_string())
+/// The directory a release tarball carries its updater declarations in, and the one they
+/// are unpacked into in the stage: the name of the host's declaration directory,
+/// `/etc/updater.d` (`update_rights::load::DECLARATION_DIR`).
+pub(crate) const DECLARATIONS: &str = "updater.d";
+
+/// The most an updater declaration may be.
+pub(crate) const DECLARATION_CAP: u64 = 64 * 1024;
+
+/// What the tar framing may add to the decompressed stream (the headers, the padding and
+/// the zero blocks at the end), beyond the members' own caps.
+const FRAMING: u64 = 64 * 1024;
+
+/// The member name of the updater declaration of the binary `name`, which a release may
+/// carry beside it: `updater.d/<name>.toml`.
+pub(crate) fn declaration_member(name: &str) -> String {
+    format!("{DECLARATIONS}/{name}.toml")
 }
 
-fn unpack_member(tarball: &Path, dst: &Path, cap: u64) -> io::Result<()> {
-    let bad = |why: String| Err(io::Error::other(why));
-    let mut archive = tar::Archive::new(GzDecoder::new(File::open(tarball)?));
-    let mut entries = archive.entries()?;
-    let Some(entry) = entries.next() else {
-        return bad("holds no file".to_owned());
-    };
-    let mut entry = entry?;
-    if entry.header().entry_type() != tar::EntryType::Regular {
-        return bad("the member is not a regular file".to_owned());
+/// One member the stage wants from the tarball: its exact name, the new file it is written
+/// to (with its mode), the most it may be, and whether the tarball must hold it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Wanted<'a> {
+    pub name: &'a str,
+    pub dest: &'a Path,
+    pub mode: u32,
+    pub cap: u64,
+    pub required: bool,
+}
+
+/// The decompressed stream, ended with an error past `left` bytes: a member no one asked
+/// for is read past, and a gzip bomb in it costs a bounded amount of work.
+struct Bounded<R> {
+    inner: R,
+    left: u64,
+    tripped: Rc<Cell<bool>>,
+}
+
+impl<R: Read> Read for Bounded<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        match self.left.checked_sub(n as u64) {
+            Some(left) => self.left = left,
+            None => {
+                self.tripped.set(true);
+                return Err(io::Error::other("the unpacking was stopped"));
+            }
+        }
+        Ok(n)
     }
-    if entry.path_bytes().as_ref() != BINARY.as_bytes() {
-        return bad(format!("the member is not named {BINARY}"));
-    }
-    let size = entry.size();
-    if size > cap {
-        return bad(format!("the member is larger than {cap} bytes"));
-    }
-    let mut out = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o755)
-        .open(dst)?;
-    io::copy(&mut (&mut entry).take(size), &mut out)?;
-    drop(entry);
-    if entries.next().is_some() {
-        return bad("holds more than one member".to_owned());
+}
+
+/// The binary, and its declaration when the release carries one, unpacked into `stage`; the
+/// members passed over are each told on stderr.
+fn unpack_release(tarball: &Path, stage: &Path, binary_max: u64) -> Result<(), String> {
+    let declaration = declaration_member(BINARY);
+    let wanted = [
+        Wanted {
+            name: BINARY,
+            dest: &stage.join(BINARY),
+            mode: 0o755,
+            cap: binary_max,
+            required: true,
+        },
+        Wanted {
+            name: &declaration,
+            dest: &stage.join(&declaration),
+            mode: 0o644,
+            cap: DECLARATION_CAP,
+            required: false,
+        },
+    ];
+    let ignored = unpack(tarball, &wanted)?;
+    for name in &ignored {
+        eprintln!("kbf-host-install: the release tarball's member {name:?} is not taken: ignored");
     }
     Ok(())
+}
+
+/// Make the directory `dir` (0755) in its parent, which must be there, unless it is there
+/// already as a directory. Never through a link: a link (or anything but a directory) in
+/// its place is refused, so nothing is written outside the directory unpacked into.
+fn make_dir(dir: &Path) -> io::Result<()> {
+    match fs::DirBuilder::new().mode(0o755).create(dir) {
+        Err(e)
+            if e.kind() == io::ErrorKind::AlreadyExists && fs::symlink_metadata(dir)?.is_dir() =>
+        {
+            Ok(())
+        }
+        made => made,
+    }
+}
+
+/// Write each of `wanted` that the gzipped tar at `tarball` holds to its `dest` (a new file;
+/// its directory is made, 0755, when it is not there), and return the names of the members
+/// no one asked for, which are read past and never written. Every member is checked: a
+/// name that is empty, absolute or has a `..` component, and a link, a device or a FIFO,
+/// refuse the archive, naming the member. A wanted member must be a regular file, at most
+/// its cap, and there once; a required one that is not there refuses it. The whole stream
+/// decompresses to at most the caps and some framing.
+pub(crate) fn unpack(tarball: &Path, wanted: &[Wanted<'_>]) -> Result<Vec<String>, String> {
+    let caps = wanted.iter().fold(0u64, |sum, w| sum.saturating_add(w.cap));
+    let tripped = Rc::new(Cell::new(false));
+    let decoded = Bounded {
+        inner: GzDecoder::new(File::open(tarball).map_err(|e| e.to_string())?),
+        left: caps.saturating_add(FRAMING),
+        tripped: Rc::clone(&tripped),
+    };
+    let bad = |e: io::Error| {
+        if tripped.get() {
+            format!("it decompresses to more than {caps} bytes")
+        } else {
+            e.to_string()
+        }
+    };
+    let mut archive = tar::Archive::new(decoded);
+    let mut taken: Vec<String> = Vec::new();
+    let mut ignored = Vec::new();
+    let mut seen = 0usize;
+    for entry in archive.entries().map_err(bad)? {
+        let mut entry = entry.map_err(bad)?;
+        seen += 1;
+        let raw = entry.path_bytes().into_owned();
+        let name = String::from_utf8_lossy(&raw).into_owned();
+        let escapes = raw.is_empty()
+            || raw.starts_with(b"/")
+            || raw.split(|b| *b == b'/').any(|part| part == b"..");
+        if escapes {
+            return Err(format!(
+                "the member {name:?} leaves the directory it is unpacked into"
+            ));
+        }
+        let kind = entry.header().entry_type();
+        let refused = match kind {
+            tar::EntryType::Regular | tar::EntryType::Directory => None,
+            tar::EntryType::Symlink => Some("symbolic link"),
+            tar::EntryType::Link => Some("hard link"),
+            tar::EntryType::Char | tar::EntryType::Block => Some("device"),
+            tar::EntryType::Fifo => Some("FIFO"),
+            _ => Some("member of another kind"),
+        };
+        if let Some(what) = refused {
+            return Err(format!(
+                "the member {name:?} is a {what}, not a regular file"
+            ));
+        }
+        let Some(want) = wanted.iter().find(|w| w.name.as_bytes() == raw) else {
+            ignored.push(name);
+            continue;
+        };
+        if kind != tar::EntryType::Regular {
+            return Err(format!(
+                "the member {name:?} is a directory, not a regular file"
+            ));
+        }
+        if taken.contains(&name) {
+            return Err(format!("the member {name:?} is in it twice"));
+        }
+        let size = entry.size();
+        if size > want.cap {
+            return Err(format!(
+                "the member {name:?} is larger than {} bytes",
+                want.cap
+            ));
+        }
+        make_dir(want.dest.parent().unwrap_or(Path::new(""))).map_err(|e| e.to_string())?;
+        let mut out = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(want.mode)
+            .open(want.dest)
+            .map_err(|e| e.to_string())?;
+        // Whatever the umask said, the file has the member's mode.
+        out.set_permissions(fs::Permissions::from_mode(want.mode))
+            .and_then(|()| io::copy(&mut (&mut entry).take(size), &mut out))
+            .map_err(bad)?;
+        taken.push(name);
+    }
+    if seen == 0 {
+        return Err("holds no file".to_owned());
+    }
+    match wanted
+        .iter()
+        .find(|w| w.required && !taken.iter().any(|t| t == w.name))
+    {
+        Some(missing) => Err(format!("holds no member named {}", missing.name)),
+        None => Ok(ignored),
+    }
 }
 
 /// Whether the file at `path` starts as a 64-bit arm64 Mach-O executable.
