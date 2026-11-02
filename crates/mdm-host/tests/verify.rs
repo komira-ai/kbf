@@ -7,7 +7,7 @@ use host_step::Account;
 use host_step::fake::FakeHost;
 use host_step::{Host, SYSTEMCTL};
 use mdm_core::render::{render, render_tls, strip_comments};
-use mdm_host::verify::{Compared, Verify, Want, compare, run};
+use mdm_host::verify::{Compared, Verdict, Verify, Want, compare, run};
 use sha2::{Digest, Sha256};
 
 const UNITS: &str = "/etc/systemd/system";
@@ -457,10 +457,8 @@ fn a_bare_host_fails_every_check_and_reports_every_file_missing() {
         .find(|r| r.name.starts_with("the certificate"))
         .unwrap();
     assert!(
-        cert.result
-            .as_ref()
-            .unwrap_err()
-            .contains("unexpected command")
+        matches!(&cert.verdict, Verdict::Failed(why) if why.contains("unexpected command")),
+        "{cert}"
     );
 }
 
@@ -508,9 +506,10 @@ fn compare_handles_odd_bytes_and_the_check_display_covers_each_form() {
     );
     let c = mdm_host::verify::Check {
         name: "n".to_owned(),
-        result: Ok("seen".to_owned()),
+        verdict: Verdict::Passed("seen".to_owned()),
     };
     assert_eq!(c.to_string(), "ok    n: seen");
+    assert!(!c.verdict.failed());
 }
 
 /// Catches a masked unit read as fine: an admin masks a unit by making it a link to

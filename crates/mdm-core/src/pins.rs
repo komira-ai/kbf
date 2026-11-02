@@ -56,11 +56,14 @@ impl Tool {
     }
 
     /// The tool named `name`, for `--only`.
-    pub fn named(name: &str) -> Result<Tool, String> {
+    ///
+    /// # Errors
+    /// [`UnknownTool`] when no pinned tool has that name.
+    pub fn named(name: &str) -> Result<Tool, UnknownTool> {
         Tool::ALL
             .into_iter()
             .find(|t| t.name() == name)
-            .ok_or(format!("{name:?} is not a pinned tool"))
+            .ok_or_else(|| UnknownTool(name.to_owned()))
     }
 
     /// The `(archive member, installed name)` pairs of the tool's archive at `version`.
@@ -140,6 +143,11 @@ impl Pin {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Pins(Vec<Pin>);
 
+/// A name that is not one of the pinned tools.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{0:?} is not a pinned tool")]
+pub struct UnknownTool(pub String);
+
 /// Why a pins file was refused. Line numbers count from 1.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum PinsError {
@@ -210,7 +218,7 @@ fn pin(raw: &str) -> Result<Pin, String> {
             fields.len()
         ));
     };
-    let tool = Tool::named(name)?;
+    let tool = Tool::named(name).map_err(|e| e.to_string())?;
     let dotted = version
         .split('.')
         .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()));

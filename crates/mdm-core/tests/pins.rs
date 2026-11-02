@@ -1,6 +1,6 @@
 //! The pinned upstream tools and the pins file parser.
 
-use mdm_core::pins::{BUILT_IN, Packing, Pins, PinsError, Tool};
+use mdm_core::pins::{BUILT_IN, Packing, Pins, PinsError, Tool, UnknownTool};
 
 const SUM: &str = "286f2d7ed5fe6297ef48010ac6d7d921b90fe16e62367caaf18154ad649329cf";
 
@@ -128,7 +128,9 @@ fn tools_are_named_and_their_members_carry_the_version() {
         assert_eq!(tool.to_string(), tool.name());
         assert!(!tool.members("1.2.3").is_empty());
     }
-    assert!(Tool::named("nanohubs").is_err());
+    let unknown = Tool::named("nanohubs").unwrap_err();
+    assert_eq!(unknown, UnknownTool("nanohubs".to_owned()));
+    assert_eq!(unknown.to_string(), "\"nanohubs\" is not a pinned tool");
     let members = Tool::Nanodep.members("0.7.0");
     let installed: Vec<&str> = members.iter().map(|(_, i)| *i).collect();
     assert_eq!(installed, ["depserver", "depsyncer"]);

@@ -54,25 +54,51 @@ pub struct Verify<'a> {
     pub ignore: &'a [String],
 }
 
+/// How one check went: a line of the report, not an error.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Verdict {
+    /// It passed; what it saw (empty when there is nothing to add).
+    Passed(String),
+    /// It failed; why, in the report's words.
+    Failed(String),
+}
+
+impl Verdict {
+    /// True when the check failed.
+    pub fn failed(&self) -> bool {
+        matches!(self, Verdict::Failed(_))
+    }
+}
+
+impl From<Outcome> for Verdict {
+    fn from(outcome: Outcome) -> Verdict {
+        match outcome {
+            Ok(seen) => Verdict::Passed(seen),
+            Err(why) => Verdict::Failed(why),
+        }
+    }
+}
+
 /// One check and how it went.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Check {
     /// What was checked.
     pub name: String,
-    /// What it saw when it passed, or why it failed.
-    pub result: Result<String, String>,
+    /// How it went.
+    pub verdict: Verdict,
 }
 
 impl fmt::Display for Check {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.result {
-            Ok(seen) if seen.is_empty() => write!(f, "ok    {}", self.name),
-            Ok(seen) => write!(f, "ok    {}: {seen}", self.name),
-            Err(why) => write!(f, "FAIL  {}: {why}", self.name),
+        match &self.verdict {
+            Verdict::Passed(seen) if seen.is_empty() => write!(f, "ok    {}", self.name),
+            Verdict::Passed(seen) => write!(f, "ok    {}: {seen}", self.name),
+            Verdict::Failed(why) => write!(f, "FAIL  {}: {why}", self.name),
         }
     }
 }
 
+/// What a check function returns before it becomes a [`Verdict`].
 type Outcome = Result<String, String>;
 
 fn text(e: impl fmt::Display) -> String {
@@ -84,7 +110,12 @@ pub fn checks(host: &dyn Host, v: &Verify<'_>) -> Vec<Check> {
     let c = v.config;
     let n = UnitNames::new(c);
     let mut rows = Vec::new();
-    let mut row = |name: String, result: Outcome| rows.push(Check { name, result });
+    let mut row = |name: String, result: Outcome| {
+        rows.push(Check {
+            name,
+            verdict: result.into(),
+        });
+    };
     for unit in [
         &n.scep,
         &n.nanohub,
@@ -371,7 +402,7 @@ pub fn run(env: &Env<'_>, v: &Verify<'_>, out: &mut dyn Write) -> Result<bool, M
     }
     let mut fails = 0;
     for row in checks(host, v) {
-        fails += usize::from(row.result.is_err());
+        fails += usize::from(row.verdict.failed());
         writeln!(out, "{row}")?;
     }
     if v.acme.is_none() {
