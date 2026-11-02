@@ -40,7 +40,7 @@ pub mod identity;
 pub mod listen;
 pub mod membership;
 pub mod ops;
-pub mod ops_file;
+pub(crate) mod ops_file;
 pub mod reconcile;
 pub mod service;
 pub mod services;
@@ -83,6 +83,10 @@ mod kbf_definition_tests;
 mod kbf_review_tests;
 #[cfg(test)]
 mod membership_tests;
+#[cfg(test)]
+mod ops_commit_tests;
+#[cfg(test)]
+mod ops_crash_tests;
 #[cfg(test)]
 mod ops_downgrade_tests;
 #[cfg(test)]

@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use kbf_testkit::dir::TestDir;
 use kbf_updater::wire::{Outcome, Phase, Token, UpdateResult};
+use sha2::Digest as _;
 
 use crate::desired::StoreError;
 use crate::ops::{
@@ -196,7 +197,16 @@ fn the_file_reads_and_writes_every_field_of_the_schema() {
     }
     assert_eq!(wrote["audit"][1]["seq"], 8);
     assert!(text.ends_with("}\n"), "{text:?}");
-    assert_eq!(fs::read_to_string(&halts).expect("read"), FULL_HALTS);
+    // The halts file names the ops file text it was written with.
+    let digest: String = sha2::Sha256::digest(text.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let want_halts = FULL_HALTS.replace(
+        "\n  }\n}\n",
+        &format!("\n  }},\n  \"ops\": \"{digest}\"\n}}\n"),
+    );
+    assert_eq!(fs::read_to_string(&halts).expect("read"), want_halts);
     assert_eq!(
         OpsStore::open(&file).expect("reread").state(),
         store.state()

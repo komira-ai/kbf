@@ -362,7 +362,8 @@ impl OpsStore {
     ///
     /// # Errors
     /// [`OpsError`]: the file exists and cannot be read, holds a key this build does not
-    /// know, or has another schema; or its halts file exists and cannot be read or parsed.
+    /// know, or has another schema; or a halts file a change staged cannot be settled, or the
+    /// halts file exists and cannot be read or parsed.
     pub fn open(path: &Path) -> Result<Self, OpsError> {
         let state = match fs::read(path) {
             Ok(bytes) => parse(path, &bytes)?,
@@ -375,7 +376,7 @@ impl OpsStore {
                 .into());
             }
         };
-        let state = ops_file::joined(path, state)?;
+        let (state, _skipped) = ops_file::joined(path, state)?;
         let path = path.to_owned();
         Ok(Self::with_writer(
             state,

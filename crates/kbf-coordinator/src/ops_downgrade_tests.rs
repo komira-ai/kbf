@@ -2,8 +2,8 @@
 //! one writes, whatever halts, clears and generations it holds, and this one reads the
 //! release before's file. What the halt release adds is in the halts file beside it
 //! ([`crate::ops_file`]), which the release before never opens, and which is joined back on
-//! reading by host and target. Its reader skips what it does not know; a write that reaches the
-//! ops file and not the halts file loses reports, never a halt.
+//! reading by host and target. Its reader skips what it does not know. How a change commits
+//! both files is tested in `ops_commit_tests`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -14,7 +14,7 @@ use kbf_updater::wire::{Outcome, Phase, Token, UpdateResult};
 use crate::ops::{
     AuditEntry, Exclusion, Halt, HaltAck, HostOps, OpsError, OpsState, OpsStore, ServiceOps, Write,
 };
-use crate::ops_file::halts_path;
+use crate::ops_file::{halts_path, staged_path};
 use crate::testutil::version;
 
 /// The reader of the build before this one: its schema types as they were, strict as they
@@ -321,9 +321,9 @@ fn a_halts_file_that_cannot_be_parsed_refuses_to_start() {
     }
 }
 
-/// Catches: a clear whose halts file cannot be written lifting the halt on disk all the same
-/// (the ops file, written first, no longer holds it): the clear fails, it is not in memory,
-/// and what a restart reads is the halt standing, its reports and the old generation.
+/// Catches: a clear whose halts file cannot be staged lifting the halt on disk all the same:
+/// the clear fails, it is not in memory, the ops file is untouched, and what a restart reads is
+/// the halt standing, its reports and the old generation.
 #[test]
 fn a_clear_whose_halts_file_cannot_be_written_leaves_the_halt_on_disk() {
     let (_dir, path, _) = written("ops-prev-torn", |state| {
@@ -331,7 +331,7 @@ fn a_clear_whose_halts_file_cannot_be_written_leaves_the_halt_on_disk() {
     });
     let ops_before = text(&path);
     let store = OpsStore::open(&path).expect("read");
-    let mut blocked = halts_path(&path).into_os_string();
+    let mut blocked = staged_path(&path).into_os_string();
     blocked.push(".new");
     fs::create_dir(&blocked).expect("blocked");
     let cleared = store.change(
@@ -346,17 +346,17 @@ fn a_clear_whose_halts_file_cannot_be_written_leaves_the_halt_on_disk() {
     );
     assert!(matches!(cleared, Err(OpsError::Io(_))), "{cleared:?}");
     assert_eq!(store.marks("kbf"), halted(), "the clear is not in memory");
-    assert_eq!(text(&path), ops_before, "the ops file is put back");
+    assert_eq!(text(&path), ops_before, "the ops file is untouched");
     assert_eq!(OpsStore::open(&path).expect("read").marks("kbf"), halted());
 }
 
-/// Catches: the first write of a store whose halts file cannot be written leaving an ops file
-/// behind (the change failed, so there was none): it is removed again.
+/// Catches: the first write of a store whose halts file cannot be staged leaving an ops file
+/// behind (the change failed, so there was none): none is written.
 #[test]
 fn a_first_write_whose_halts_file_cannot_be_written_leaves_no_ops_file() {
     let dir = TestDir::under(std::env::temp_dir(), "ops-file-first");
     let path = dir.path().join("ops.json");
-    let mut blocked = halts_path(&path).into_os_string();
+    let mut blocked = staged_path(&path).into_os_string();
     blocked.push(".new");
     fs::create_dir(&blocked).expect("blocked");
     let store = OpsStore::open(&path).expect("opened");
@@ -371,10 +371,11 @@ fn a_first_write_whose_halts_file_cannot_be_written_leaves_no_ops_file() {
     assert!(!path.exists());
 }
 
-/// Catches: an ops file that cannot be read before it is replaced (here a directory at its
-/// name) replaced without what it held being kept to put back: the change fails first.
+/// Catches: a change answered as made, or its halts file renamed in, when the ops file cannot
+/// be replaced or read back (here a directory at its name): the change fails, no halts file is
+/// published, and the staged one is left for a start to settle by what the ops file holds.
 #[test]
-fn a_change_whose_ops_file_cannot_be_read_fails_before_writing() {
+fn a_change_whose_ops_file_cannot_be_replaced_publishes_no_halts_file() {
     let dir = TestDir::under(std::env::temp_dir(), "ops-file-dir");
     let path = dir.path().join("ops.json");
     let store = OpsStore::open(&path).expect("opened");
@@ -391,6 +392,7 @@ fn a_change_whose_ops_file_cannot_be_read_fails_before_writing() {
         other => panic!("expected an I/O error, got {other:?}"),
     }
     assert!(!halts_path(&path).exists());
+    assert!(staged_path(&path).exists());
 }
 
 /// Catches: the generation of a service the ops file no longer lists dropped with the
@@ -444,5 +446,7 @@ fn a_halts_file_once_written_is_written_on_every_change() {
             },
         )
         .expect("changed");
-    assert_eq!(text(&halts_path(&path)), "{\n  \"services\": {}\n}\n");
+    let halts: serde_json::Value =
+        serde_json::from_str(&text(&halts_path(&path))).expect("the halts file");
+    assert_eq!(halts["services"], serde_json::json!({}));
 }

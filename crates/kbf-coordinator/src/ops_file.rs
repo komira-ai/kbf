@@ -6,44 +6,75 @@
 //! acknowledgement its host and target. What the halt release adds to them lives beside it in
 //! the halts file (`<ops-file>.halts`): the whole report a halt and each acknowledgement were
 //! made from, the reports received while a halt stood (`halt_seen`) and the clear generation of
-//! each service (`halt_generation`). The reader of the halts file skips a key it does not
-//! know, and refuses only a file it cannot parse.
+//! each service (`halt_generation`).
+//!
+//! The reader of the halts file skips a key it does not know. A record whose report it cannot
+//! read (an outcome a later release added, say) is passed over as a whole and counted, and the
+//! rest of the file is read; only a file it cannot parse at all is refused. What a passed-over
+//! record loses only halts the service again: a halt with no report, an acknowledgement with
+//! none, are what a file from before reports reads as ([`crate::halt`]), and a report seen
+//! while halted that is not kept halts the service again after the clear.
 //!
 //! On reading, the halts file's records are joined to the ops file's by host and target. A
 //! record that matches nothing (the release before rewrote the ops file and cleared or replaced
-//! what it was about) is dropped: a halt with no report, an acknowledgement with none, are what
-//! a file from before reports reads as ([`crate::halt`]), and a cleared report with no
-//! acknowledgement only halts the service again. Reports kept while a halt stood join only to
-//! that halt. A generation is kept whatever the ops file says.
+//! what it was about) is dropped, with the same loss. Reports kept while a halt stood join only
+//! to that halt. A generation is kept whatever the ops file says.
 //!
-//! A change writes the ops file first, then the halts file, each replaced whole. When the
-//! halts file cannot be written, the ops file is put back as it was and the change fails, so
-//! a failed change leaves both files as they were. A crash between the two writes leaves the
-//! halts file behind the ops file, which loses reports and generations, never a halt for long:
-//! a clear whose halts file was not written leaves acknowledgements that match nothing, so the
-//! halted host's next report halts the service again, and the clear's generation is not
-//! counted (no agent lifts on it). A
-//! farm that never halted has no halts file: one is written once there is something to keep in
-//! it, and after that on every change.
+//! A change is committed by replacing the ops file. First the halts file it goes with is
+//! written whole to `<ops-file>.halts.next`, naming the SHA-256 of the ops file text it goes
+//! with; then the ops file is replaced; then the staged file is renamed over the halts file.
+//! A change that fails before the ops file holds it leaves both files as they were (its staged
+//! file is removed, or found stale later). Once the ops file holds the change, the change
+//! stands: replacing the ops file can answer an error after its rename (the directory's fsync),
+//! so on an error the ops file is read back, and when it holds the change's text the change
+//! goes on; a failure to rename the staged file after that is logged and settled later.
+//!
+//! A start, and each change before it writes, settles a staged file left behind: one that names
+//! the digest of the ops file there is renamed over the halts file (the change it staged was
+//! committed), any other is removed (it was not, or the release before has rewritten the ops
+//! file since). A staged file that cannot be settled refuses the start and fails the change.
+//! So the two files are read as they were before a change or as they were after it, never one
+//! of each: a clear's generation and acknowledgements are on disk with the clear or not at all.
+//!
+//! A farm that never halted has no halts file: one is written once there is something to keep
+//! in it, and after that on every change.
 
 use std::collections::BTreeMap;
-use std::fs;
+use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
 
 use kbf_updater::version::Version;
 use kbf_updater::wire::UpdateResult;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha2::{Digest as _, Sha256};
 
-use crate::desired::{StoreError, io_at, write_whole};
+use crate::desired::{StoreError, dir_of, io_at, write_whole};
 use crate::ops::{HaltAck, OpsError, OpsState};
 
 /// The halts file of the ops file at `ops`: its name with `.halts` added.
 #[must_use]
-pub fn halts_path(ops: &Path) -> PathBuf {
+pub(crate) fn halts_path(ops: &Path) -> PathBuf {
     let mut path = ops.as_os_str().to_owned();
     path.push(".halts");
     PathBuf::from(path)
+}
+
+/// Where a change stages the halts file of the ops file at `ops` before it commits.
+#[must_use]
+pub(crate) fn staged_path(ops: &Path) -> PathBuf {
+    let mut path = halts_path(ops).into_os_string();
+    path.push(".next");
+    PathBuf::from(path)
+}
+
+/// The SHA-256 of `text`, in lowercase hex.
+fn digest(text: &[u8]) -> String {
+    Sha256::digest(text)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// A report, with the host that made it and the version it was about.
@@ -73,28 +104,89 @@ fn is_zero(n: &u64) -> bool {
 }
 
 /// What the halts file keeps of one service.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 struct ServiceHalts {
     /// The report of the standing halt.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     halt: Option<Kept>,
     /// The reports of the acknowledgements.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     halt_acked: Vec<Kept>,
     /// The reports received while the standing halt stood.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     halt_seen: Vec<Kept>,
     /// How many halts an operator has cleared.
-    #[serde(default, skip_serializing_if = "is_zero")]
+    #[serde(skip_serializing_if = "is_zero")]
     halt_generation: u64,
 }
 
 /// Everything the halts file holds.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 struct HaltsFile {
     /// Per service name; a service with nothing to keep is not listed.
-    #[serde(default)]
     services: BTreeMap<String, ServiceHalts>,
+    /// The SHA-256 of the ops file text this file was written with.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ops: Option<String>,
+}
+
+/// [`ServiceHalts`] as read: each record is read on its own, so that one this release cannot
+/// read is passed over and not the file.
+#[derive(Deserialize)]
+struct ReadService {
+    #[serde(default)]
+    halt: Option<Value>,
+    #[serde(default)]
+    halt_acked: Vec<Value>,
+    #[serde(default)]
+    halt_seen: Vec<Value>,
+    #[serde(default)]
+    halt_generation: u64,
+}
+
+/// [`HaltsFile`] as read.
+#[derive(Deserialize)]
+struct ReadHalts {
+    #[serde(default)]
+    services: BTreeMap<String, ReadService>,
+    #[serde(default)]
+    ops: Option<String>,
+}
+
+/// The record `value` holds; none, counted in `skipped`, when this release cannot read it.
+fn kept(value: Value, skipped: &mut usize) -> Option<Kept> {
+    let read = serde_json::from_value(value).ok();
+    *skipped += usize::from(read.is_none());
+    read
+}
+
+impl ReadHalts {
+    /// What this release reads of the file, and how many records it passed over.
+    fn known(self) -> (HaltsFile, usize) {
+        let mut skipped = 0;
+        let mut services = BTreeMap::new();
+        for (name, read) in self.services {
+            let halt = read.halt.and_then(|v| kept(v, &mut skipped));
+            let mut each = |values: Vec<Value>| -> Vec<Kept> {
+                values
+                    .into_iter()
+                    .filter_map(|v| kept(v, &mut skipped))
+                    .collect()
+            };
+            let service = ServiceHalts {
+                halt,
+                halt_acked: each(read.halt_acked),
+                halt_seen: each(read.halt_seen),
+                halt_generation: read.halt_generation,
+            };
+            services.insert(name, service);
+        }
+        let file = HaltsFile {
+            services,
+            ops: self.ops,
+        };
+        (file, skipped)
+    }
 }
 
 /// `state` as the two files hold it: the ops file's part, in the shape of the release before,
@@ -170,14 +262,11 @@ fn join(mut ops: OpsState, halts: HaltsFile) -> OpsState {
     ops
 }
 
-/// The halts file at `path`: nothing if there is none.
-fn read_halts(path: &Path) -> Result<HaltsFile, OpsError> {
+/// The file at `path`: none if there is none.
+fn read_if_any(path: &Path) -> Result<Option<Vec<u8>>, OpsError> {
     match fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| OpsError::Invalid {
-            path: path.to_owned(),
-            why: e.to_string(),
-        }),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(HaltsFile::default()),
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(source) => Err(StoreError::Io {
             path: path.to_owned(),
             source,
@@ -186,12 +275,80 @@ fn read_halts(path: &Path) -> Result<HaltsFile, OpsError> {
     }
 }
 
-/// `ops`, read from the ops file at `path`, joined with its halts file.
+/// The halts file at `path` (nothing if there is none), and how many records of it this
+/// release passed over.
+fn read_halts(path: &Path) -> Result<(HaltsFile, usize), OpsError> {
+    let Some(bytes) = read_if_any(path)? else {
+        return Ok((HaltsFile::default(), 0));
+    };
+    let read: ReadHalts = serde_json::from_slice(&bytes).map_err(|e| OpsError::Invalid {
+        path: path.to_owned(),
+        why: e.to_string(),
+    })?;
+    Ok(read.known())
+}
+
+/// Renames the staged halts file `staged` over the halts file `halts`, durably.
+fn publish(staged: &Path, halts: &Path) -> Result<(), StoreError> {
+    fs::rename(staged, halts).map_err(io_at(halts))?;
+    let dir = dir_of(halts);
+    File::open(dir)
+        .and_then(|d| d.sync_all())
+        .map_err(io_at(dir))
+}
+
+/// The digest a staged halts file names; none if it names none or cannot be parsed.
+fn names(staged: &[u8]) -> Option<String> {
+    #[derive(Deserialize)]
+    struct Staged {
+        ops: Option<String>,
+    }
+    serde_json::from_slice::<Staged>(staged).ok()?.ops
+}
+
+/// Settles the staged halts file of the ops file at `path`, if a change left one: renamed over
+/// the halts file when it names the digest of the ops file there (the change was committed),
+/// removed otherwise.
+fn settle(path: &Path) -> Result<(), OpsError> {
+    let staged = staged_path(path);
+    let Some(bytes) = read_if_any(&staged)? else {
+        return Ok(());
+    };
+    let ops = read_if_any(path)?.map(|text| digest(&text));
+    if ops.is_some() && names(&bytes) == ops {
+        tracing::warn!(
+            path = %staged.display(),
+            "a change was committed to the ops file before its halts file was renamed in: renaming it now"
+        );
+        publish(&staged, &halts_path(path))?;
+    } else {
+        tracing::warn!(
+            path = %staged.display(),
+            "removing the halts file of a change that was not committed"
+        );
+        fs::remove_file(&staged).map_err(io_at(&staged))?;
+    }
+    Ok(())
+}
+
+/// `ops`, read from the ops file at `path`, joined with its halts file once a staged halts file
+/// left behind is settled; and how many records of the halts file this release passed over.
 ///
 /// # Errors
-/// [`OpsError`]: the halts file exists and cannot be read or parsed.
-pub fn joined(path: &Path, ops: OpsState) -> Result<OpsState, OpsError> {
-    Ok(join(ops, read_halts(&halts_path(path))?))
+/// [`OpsError`]: a staged halts file cannot be settled, or the halts file exists and cannot be
+/// read or parsed.
+pub(crate) fn joined(path: &Path, ops: OpsState) -> Result<(OpsState, usize), OpsError> {
+    settle(path)?;
+    let halts = halts_path(path);
+    let (file, skipped) = read_halts(&halts)?;
+    if skipped > 0 {
+        tracing::warn!(
+            path = %halts.display(),
+            skipped,
+            "records of the halts file this release cannot read were passed over"
+        );
+    }
+    Ok((join(ops, file), skipped))
 }
 
 fn pretty<T: Serialize>(path: &Path, value: &T) -> Result<Vec<u8>, OpsError> {
@@ -202,41 +359,85 @@ fn pretty<T: Serialize>(path: &Path, value: &T) -> Result<Vec<u8>, OpsError> {
     Ok(text)
 }
 
-/// Writes `state` to the ops file at `path` and its halts file, in that order. When the halts
-/// file cannot be written, the ops file is put back as it was (removed, if there was none) and
-/// the error is answered: a change that fails leaves both files as they were, so a clear that
-/// cannot be written leaves the halt standing on disk too.
+/// A point of [`write_with`] where a test makes the file system fail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Step {
+    /// Just after the ops file was replaced: an error replacing it answers after its rename.
+    OpsReplaced,
+    /// Reading the ops file back after an error replacing it.
+    ReadBack,
+    /// Removing the staged halts file of a change that failed.
+    Discard,
+    /// Renaming the staged halts file over the halts file.
+    Publish,
+}
+
+/// Writes `state` to the ops file at `path` and its halts file, as one commit (the module
+/// docs say how).
 ///
 /// # Errors
-/// [`OpsError::Io`]: a file could not be read or replaced.
-pub fn write(path: &Path, state: &OpsState) -> Result<(), OpsError> {
-    let (ops, halts) = split(state);
+/// [`OpsError`]: a file could not be read or replaced before the ops file held the change.
+pub(crate) fn write(path: &Path, state: &OpsState) -> Result<(), OpsError> {
+    write_with(path, state, &|_| Ok(()))
+}
+
+/// [`write`], with `fail` asked at each [`Step`] whether the file system fails there.
+pub(crate) fn write_with(
+    path: &Path,
+    state: &OpsState,
+    fail: &dyn Fn(Step) -> io::Result<()>,
+) -> Result<(), OpsError> {
+    settle(path)?;
+    let (ops, mut halts) = split(state);
+    let text = pretty(path, &ops)?;
     let halts_path = halts_path(path);
-    let halts_text = pretty(&halts_path, &halts)?;
-    let keep = !halts.services.is_empty() || halts_path.exists();
-    let before = match fs::read(path) {
-        Ok(bytes) => Some(bytes),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-        Err(e) => return Err(io_at(path)(e).into()),
-    };
-    write_whole(path, &pretty(path, &ops)?)?;
-    if !keep {
-        return Ok(());
+    if halts.services.is_empty() && !halts_path.exists() {
+        return Ok(write_whole(path, &text)?);
     }
-    let Err(why) = write_whole(&halts_path, &halts_text) else {
-        return Ok(());
-    };
-    let restored = match &before {
-        Some(bytes) => write_whole(path, bytes).map_err(|e| e.to_string()),
-        None => fs::remove_file(path).map_err(|e| e.to_string()),
-    };
-    if let Err(also) = restored {
-        tracing::error!(
-            path = %path.display(),
+    halts.ops = Some(digest(&text));
+    let staged = staged_path(path);
+    write_whole(&staged, &pretty(&staged, &halts)?)?;
+    let replaced =
+        write_whole(path, &text).and_then(|()| fail(Step::OpsReplaced).map_err(io_at(path)));
+    if let Err(why) = replaced {
+        match fail(Step::ReadBack).and_then(|()| fs::read(path)) {
+            Ok(now) if now == text => tracing::warn!(
+                path = %path.display(),
+                %why,
+                "replacing the ops file answered an error, but it holds the change: the change stands"
+            ),
+            Err(unknown) if unknown.kind() != io::ErrorKind::NotFound => {
+                // Whether the ops file holds the change is not known: the staged file is
+                // left for the next start or change to settle by what the ops file holds.
+                tracing::error!(
+                    path = %path.display(),
+                    %why,
+                    %unknown,
+                    "the ops file could not be replaced or read back"
+                );
+                return Err(why.into());
+            }
+            _ => {
+                if let Err(left) = fail(Step::Discard).and_then(|()| fs::remove_file(&staged)) {
+                    tracing::warn!(
+                        path = %staged.display(),
+                        %left,
+                        "the halts file of a failed change is left to be removed later"
+                    );
+                }
+                return Err(why.into());
+            }
+        }
+    }
+    let published = fail(Step::Publish)
+        .map_err(io_at(&halts_path))
+        .and_then(|()| publish(&staged, &halts_path));
+    if let Err(why) = published {
+        tracing::warn!(
+            path = %staged.display(),
             %why,
-            %also,
-            "the halts file could not be written and the ops file could not be put back"
+            "the change is committed, and its halts file is left to be renamed in later"
         );
     }
-    Err(why.into())
+    Ok(())
 }
