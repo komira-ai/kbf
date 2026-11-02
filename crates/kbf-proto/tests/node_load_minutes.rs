@@ -237,6 +237,8 @@ fn a_load_at_every_cap_is_9001_bytes_and_its_beat_under_12_kib() {
             unasked: u64::MAX,
             lost: u64::MAX,
             damaged: u64::MAX,
+            fallback_lost: u64::MAX,
+            fallback_damaged: u64::MAX,
         }),
         pack_writes: Some(worker::PackWriteCounts {
             packs: u64::MAX,

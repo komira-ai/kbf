@@ -498,6 +498,14 @@ message PackReadCounts {
   uint64 lost = 5;
   // Reads that failed because the bytes in the pack are not the digest.
   uint64 damaged = 6;
+  // Reads of a daemon that reads packs through a local cache (`--tierstore-endpoint`) whose
+  // pack the cache did not have (or had too short): the read went to the frontend or the
+  // storage nodes instead and did not fail. Never counted in `lost`.
+  uint64 fallback_lost = 7;
+  // Reads of such a daemon whose bytes from the cache were not the digest: never served, the
+  // read went to the frontend or the storage nodes instead and did not fail. Never counted in
+  // `damaged`.
+  uint64 fallback_damaged = 8;
 }
 
 // The counts of a daemon's pack writes, cumulative since the daemon process started (they

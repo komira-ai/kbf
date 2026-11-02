@@ -7,16 +7,18 @@ use super::{label_value, render, render_writes};
 
 /// The families in the order they are written, each with the count of
 /// [`counts`] it samples.
-const NAMES: [&str; 6] = [
+const NAMES: [&str; 8] = [
     "kbf_pack_daemon_served_total",
     "kbf_pack_daemon_served_bytes_total",
     "kbf_pack_daemon_elsewhere_total",
     "kbf_pack_daemon_unasked_total",
     "kbf_pack_daemon_lost_total",
     "kbf_pack_daemon_damaged_total",
+    "kbf_pack_daemon_fallback_lost_total",
+    "kbf_pack_daemon_fallback_damaged_total",
 ];
 
-/// Counts that are `base + 1` to `base + 6`, in the order of [`NAMES`].
+/// Counts that are `base + 1` to `base + 8`, in the order of [`NAMES`].
 fn counts(base: u64) -> PackReadCounts {
     PackReadCounts {
         served: base + 1,
@@ -25,6 +27,8 @@ fn counts(base: u64) -> PackReadCounts {
         unasked: base + 4,
         lost: base + 5,
         damaged: base + 6,
+        fallback_lost: base + 7,
+        fallback_damaged: base + 8,
     }
 }
 
@@ -33,14 +37,14 @@ fn node(name: &str) -> WorkerId {
 }
 
 /// Asserts that each family is a header (`# HELP`, `# TYPE ... counter`) followed by one sample
-/// of the node, and that each is fed by its own count: the six counts of a node are told apart
+/// of the node, and that each is fed by its own count: the eight counts of a node are told apart
 /// by their values.
 #[test]
 fn each_family_is_a_counter_sampling_its_own_count() {
     let mut out = String::new();
     render(&mut out, &[(node("node-1"), counts(0))]);
     let lines: Vec<&str> = out.lines().collect();
-    assert_eq!(lines.len(), 18, "{out}");
+    assert_eq!(lines.len(), 24, "{out}");
     for (i, name) in NAMES.iter().enumerate() {
         let help = format!("# HELP {name} ");
         assert!(lines[3 * i].starts_with(&help), "{out}");
@@ -58,11 +62,19 @@ fn every_node_has_a_sample_in_every_family() {
     let nodes = [(node("a"), counts(0)), (node("b"), counts(10))];
     render(&mut out, &nodes);
     let samples: Vec<&str> = out.lines().filter(|l| !l.starts_with('#')).collect();
-    assert_eq!(samples.len(), 12, "{out}");
+    assert_eq!(samples.len(), 16, "{out}");
     assert_eq!(samples[0], "kbf_pack_daemon_served_total{node=\"a\"} 1");
     assert_eq!(samples[1], "kbf_pack_daemon_served_total{node=\"b\"} 11");
     assert_eq!(samples[10], "kbf_pack_daemon_damaged_total{node=\"a\"} 6");
     assert_eq!(samples[11], "kbf_pack_daemon_damaged_total{node=\"b\"} 16");
+    assert_eq!(
+        samples[14],
+        "kbf_pack_daemon_fallback_damaged_total{node=\"a\"} 8"
+    );
+    assert_eq!(
+        samples[15],
+        "kbf_pack_daemon_fallback_damaged_total{node=\"b\"} 18"
+    );
 }
 
 /// Asserts that with no node having sent counts nothing is written, not even a header, and what

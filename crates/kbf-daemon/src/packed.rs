@@ -18,8 +18,8 @@
 //!   [`CasError::Corrupt`], and is logged and counted. Nothing falls back to `C` for these: the
 //!   index says the blob is in a pack, and a bad pack is for the operator to know. A plane made
 //!   with [`PackedCas::falling_back`] reads the packs through a cache that is not the source of
-//!   truth (a tierstore on loopback): there a lost or damaged blob is still logged and counted,
-//!   and the read goes to `C`.
+//!   truth (a tierstore on loopback): there a lost or damaged blob is still logged, counted apart
+//!   ([`PackStats::fallback_lost`], [`PackStats::fallback_damaged`]), and the read goes to `C`.
 //!
 //! **Writes** are `C`'s, unchanged, unless the plane was built to write packs
 //! ([`PackedCas::with_writes`]): then [`Cas::put`], [`Cas::put_chunks`], [`Cas::put_records`] and
@@ -117,12 +117,16 @@ pub struct PackStats {
     /// Reads that went to the plane underneath because the packs could not be asked: the index
     /// or the object store failed, other than by a frontend that serves no locations.
     pub unasked: u64,
-    /// Reads of a blob whose pack the index points at is gone or too short: failed, or read by
-    /// the plane underneath for a plane made with [`PackedCas::falling_back`].
+    /// Reads that failed because the pack the index points at is gone or too short.
     pub lost: u64,
-    /// Reads of a blob whose bytes in the pack are not the digest: failed, or read by the plane
-    /// underneath for a plane made with [`PackedCas::falling_back`].
+    /// Reads that failed because the bytes in the pack are not the digest.
     pub damaged: u64,
+    /// Reads of a plane made with [`PackedCas::falling_back`] whose pack is gone or too short,
+    /// which the plane underneath answered instead; never counted in `lost`.
+    pub fallback_lost: u64,
+    /// Reads of a plane made with [`PackedCas::falling_back`] whose bytes in the pack are not the
+    /// digest, which the plane underneath answered instead; never counted in `damaged`.
+    pub fallback_damaged: u64,
     /// What the plane wrote into packs, and what it wrote elsewhere instead.
     pub writes: WriteStats,
 }
@@ -133,6 +137,16 @@ impl fmt::Display for PackStats {
             f,
             "served={} served_bytes={} elsewhere={} unasked={} lost={} damaged={}",
             self.served, self.served_bytes, self.elsewhere, self.unasked, self.lost, self.damaged
+        )?;
+        // Only a plane that falls back counts these, so the line of one that does not is the
+        // line it always was.
+        if self.fallback_lost + self.fallback_damaged == 0 {
+            return Ok(());
+        }
+        write!(
+            f,
+            " fallback_lost={} fallback_damaged={}",
+            self.fallback_lost, self.fallback_damaged
         )
     }
 }
@@ -146,6 +160,8 @@ impl From<PackStats> for PackReadCounts {
             unasked: stats.unasked,
             lost: stats.lost,
             damaged: stats.damaged,
+            fallback_lost: stats.fallback_lost,
+            fallback_damaged: stats.fallback_damaged,
         }
     }
 }
@@ -193,6 +209,8 @@ struct Counts {
     unasked: AtomicU64,
     lost: AtomicU64,
     damaged: AtomicU64,
+    fallback_lost: AtomicU64,
+    fallback_damaged: AtomicU64,
     /// Whether the last read that asked the packs could not (and it was logged as a warning).
     failing: AtomicBool,
     writes: WriteCounts,
@@ -208,6 +226,8 @@ impl Counts {
             unasked: get(&self.unasked),
             lost: get(&self.lost),
             damaged: get(&self.damaged),
+            fallback_lost: get(&self.fallback_lost),
+            fallback_damaged: get(&self.fallback_damaged),
             writes: self.writes.stats(),
         }
     }
@@ -283,8 +303,9 @@ impl<C: Cas> PackedCas<C> {
     /// from the plane underneath instead of failing the read: for packs read through a cache
     /// that is not the source of truth, such as a tierstore on loopback in front of the object
     /// store, where a miss, a stale or damaged copy, or a cache that is down must cost a read
-    /// from the plane underneath and never a failed one. The blob is still counted (lost,
-    /// damaged) and logged.
+    /// from the plane underneath and never a failed one. The blob is still logged, and counted in
+    /// [`PackStats::fallback_lost`] or [`PackStats::fallback_damaged`], never in `lost` or
+    /// `damaged`, which stay the reads that failed.
     #[must_use]
     pub fn falling_back(mut self) -> Self {
         self.bad = BadPack::ReadElsewhere;
@@ -419,11 +440,13 @@ impl<C: Cas> PackedCas<C> {
                 Found::Elsewhere
             }
             Fetch::Lost => {
-                add(&self.counts.lost, 1);
-                let said = match self.bad {
-                    BadPack::Fail => "",
-                    BadPack::ReadElsewhere => "; reading the blob as before",
+                let (count, said) = match self.bad {
+                    BadPack::Fail => (&self.counts.lost, ""),
+                    BadPack::ReadElsewhere => {
+                        (&self.counts.fallback_lost, "; reading the blob as before")
+                    }
                 };
+                add(count, 1);
                 tracing::warn!(
                     blob = %label(digest),
                     "pack reads: the pack that holds the blob is gone or too short{said}"
@@ -435,11 +458,14 @@ impl<C: Cas> PackedCas<C> {
                 Found::Refused(CasError::Unavailable(label(digest), why.to_owned()))
             }
             Fetch::Damaged => {
-                add(&self.counts.damaged, 1);
-                let said = match self.bad {
-                    BadPack::Fail => "",
-                    BadPack::ReadElsewhere => "; reading the blob as before",
+                let (count, said) = match self.bad {
+                    BadPack::Fail => (&self.counts.damaged, ""),
+                    BadPack::ReadElsewhere => (
+                        &self.counts.fallback_damaged,
+                        "; reading the blob as before",
+                    ),
                 };
+                add(count, 1);
                 tracing::error!(
                     blob = %label(digest),
                     "pack reads: the bytes of the blob in its pack are not its digest{said}"

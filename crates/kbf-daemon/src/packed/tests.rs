@@ -335,7 +335,11 @@ async fn falling_back_a_lost_pack_is_read_from_the_plane_underneath() {
     assert_eq!(std::fs::read(dir.join("blob")).expect("read back"), b"gone");
     assert_eq!(rig.held.calls(), ["get", "read_to"]);
     let stats = rig.cas.stats();
-    assert_eq!((stats.lost, stats.served, stats.elsewhere), (2, 0, 0));
+    assert_eq!((stats.fallback_lost, stats.lost), (2, 0));
+    assert_eq!(
+        (stats.served, stats.elsewhere, stats.fallback_damaged),
+        (0, 0, 0)
+    );
 }
 
 /// Asserts that a plane made with `falling_back` never serves bytes of a pack that are not the
@@ -354,7 +358,11 @@ async fn falling_back_damaged_bytes_are_read_from_the_plane_underneath() {
     assert_eq!(std::fs::read(dir.join("blob")).expect("read back"), b"true");
     assert_eq!(rig.held.calls(), ["get", "read_to"]);
     let stats = rig.cas.stats();
-    assert_eq!((stats.damaged, stats.served, stats.elsewhere), (2, 0, 0));
+    assert_eq!((stats.fallback_damaged, stats.damaged), (2, 0));
+    assert_eq!(
+        (stats.served, stats.elsewhere, stats.fallback_lost),
+        (0, 0, 0)
+    );
 }
 
 /// Asserts that a lease of a plane made with `falling_back` falls back as its plane does: a lost
@@ -367,7 +375,10 @@ async fn falling_back_holds_for_the_leases_of_the_plane() {
     let lease = rig.cas.lease(&LeaseId::new(1, 2));
     assert_eq!(lease.get(&digest).await, Ok(b"leased".to_vec()));
     assert_eq!(rig.held.calls(), ["lease", "get"]);
-    assert_eq!(rig.cas.stats().lost, 1);
+    assert_eq!(
+        (rig.cas.stats().fallback_lost, rig.cas.stats().lost),
+        (1, 0)
+    );
 }
 
 /// Asserts that a digest that is not SHA-256 (a hash that is not hex, one of another length, a
@@ -548,6 +559,8 @@ fn the_wire_counts_are_the_planes_counts() {
         unasked: 1,
         lost: 3,
         damaged: 4,
+        fallback_lost: 6,
+        fallback_damaged: 7,
         writes: WriteStats::default(),
     };
     let want = PackReadCounts {
@@ -557,6 +570,8 @@ fn the_wire_counts_are_the_planes_counts() {
         unasked: 1,
         lost: 3,
         damaged: 4,
+        fallback_lost: 6,
+        fallback_damaged: 7,
     };
     assert_eq!(PackReadCounts::from(stats), want);
 }
@@ -608,11 +623,23 @@ fn the_counts_are_spelled_for_the_log() {
         unasked: 1,
         lost: 3,
         damaged: 4,
+        fallback_lost: 0,
+        fallback_damaged: 0,
         writes: WriteStats::default(),
     };
     assert_eq!(
         stats.to_string(),
         "served=5 served_bytes=4096 elsewhere=2 unasked=1 lost=3 damaged=4"
+    );
+    // The fallback counts are spelled only by a plane that has counted one.
+    let fell_back = PackStats {
+        fallback_damaged: 1,
+        ..stats
+    };
+    assert_eq!(
+        fell_back.to_string(),
+        "served=5 served_bytes=4096 elsewhere=2 unasked=1 lost=3 damaged=4 fallback_lost=0 \
+         fallback_damaged=1"
     );
     assert_eq!(PackStats::default().served, 0);
 }
