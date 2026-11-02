@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand};
 use host_step::Mode;
 use mdm_core::acme::Acme;
 use mdm_core::config::MdmConfig;
-use mdm_core::pins::{Pins, Tool};
+use mdm_core::pins::{BUILT_IN, Pins, Tool};
 
 use crate::fetch::{self, Fetch};
 use crate::install::{self, Install};
@@ -98,7 +98,25 @@ fn read_config(env: &Env<'_>, path: &str) -> Result<String, MdmError> {
 /// Runs the verb `args` (the program's name first) names, with the built-in pins. The exit
 /// code.
 pub fn run(args: &[String], env: &Env<'_>, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
-    run_with(args, env, &Pins::built_in(), out, err)
+    run_with_pin_text(args, env, BUILT_IN, out, err)
+}
+
+/// [`run_with`] the pins `text` holds; a pin table that does not parse fails the run (exit 1,
+/// `FAILED: ...` on `err`) before the arguments are read.
+fn run_with_pin_text(
+    args: &[String],
+    env: &Env<'_>,
+    text: &str,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> u8 {
+    match Pins::parse(text) {
+        Ok(pins) => run_with(args, env, &pins, out, err),
+        Err(e) => {
+            let _ = writeln!(err, "FAILED: the built-in pins: {e}");
+            1
+        }
+    }
 }
 
 /// [`run`] with other pins.
@@ -175,4 +193,35 @@ fn dispatch(verb: Verb, env: &Env<'_>, pins: &Pins, out: &mut dyn Write) -> Resu
         }
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use host_step::fake::FakeHost;
+
+    use super::run_with_pin_text;
+    use crate::{Env, Net, system_random};
+
+    /// Catches a pin table that does not parse being run with anyway, or failing silently: the
+    /// run fails with exit 1 and says why, before it reads the arguments or the host.
+    #[test]
+    fn a_pin_table_that_does_not_parse_fails_the_run() {
+        let host = FakeHost::new(0);
+        let net = Net::new(true);
+        let env = Env {
+            host: &host,
+            net: &net,
+            random: &system_random,
+            now: 0,
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let args = ["mdm-host".to_owned(), "--help".to_owned()];
+        let code = run_with_pin_text(&args, &env, "caddy\n", &mut out, &mut err);
+        assert_eq!(code, 1);
+        assert!(out.is_empty());
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            "FAILED: the built-in pins: pins line 1: 1 fields, not 4 (tool version url sha256)\n"
+        );
+    }
 }

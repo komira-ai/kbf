@@ -352,9 +352,14 @@ impl AdeProfile {
     }
 
     /// The bytes sent to Apple: pretty JSON in field order, ending in a newline.
-    pub fn to_json(&self) -> Vec<u8> {
-        let mut out = serde_json::to_vec_pretty(self).expect("a profile serializes");
+    ///
+    /// # Errors
+    /// [`ProfileError::Json`] if serde cannot write the profile (its fields are text and
+    /// flags, so it always can).
+    pub fn to_json(&self) -> Result<Vec<u8>, ProfileError> {
+        let mut out =
+            serde_json::to_vec_pretty(self).map_err(|e| ProfileError::Json(e.to_string()))?;
         out.push(b'\n');
-        out
+        Ok(out)
     }
 }

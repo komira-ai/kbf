@@ -249,7 +249,12 @@ fn the_ade_profile_is_kbfs_profile() {
     let template = kbf("templates/dep_profile.json")
         .replace("@ORG@", "Example")
         .replace("@DNS_NAME@", "mdm.example.com");
-    let ours = String::from_utf8(AdeProfile::from_config(&c).to_json()).expect("utf-8");
+    let ours = String::from_utf8(
+        AdeProfile::from_config(&c)
+            .to_json()
+            .expect("the profile serializes"),
+    )
+    .expect("utf-8");
     let a: serde_json::Value = serde_json::from_str(&ours).expect("ours parses");
     let b: serde_json::Value = serde_json::from_str(&template).expect("theirs parses");
     assert_eq!(a, b);
@@ -274,7 +279,10 @@ fn the_pins_are_kbfs_pins() {
             .collect()
     };
     assert_eq!(live(BUILT_IN), live(&theirs));
-    assert_eq!(Pins::built_in(), Pins::parse(&theirs).expect("valid"));
+    assert_eq!(
+        Pins::built_in().expect("pins.txt is valid"),
+        Pins::parse(&theirs).expect("valid")
+    );
 }
 
 /// Catches the SCEP CA or the DEP certificate request differing from kbf's, where they

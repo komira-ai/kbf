@@ -157,9 +157,12 @@ pub enum PinsError {
 }
 
 impl Pins {
-    /// The pins compiled into this crate.
-    pub fn built_in() -> Pins {
-        Pins::parse(BUILT_IN).expect("pins.txt is valid (a test checks it)")
+    /// The pins compiled into this crate ([`BUILT_IN`] parsed).
+    ///
+    /// # Errors
+    /// Why `pins.txt` is refused (a test checks that it is not).
+    pub fn built_in() -> Result<Pins, PinsError> {
+        Pins::parse(BUILT_IN)
     }
 
     /// The pins in `text`, one per tool, or why the text is refused.

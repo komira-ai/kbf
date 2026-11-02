@@ -310,9 +310,14 @@ fn an_ade_profile_a_device_could_leave_is_refused() {
 fn the_ade_profile_is_built_from_the_settings_and_passes_its_own_checks() {
     let c = config();
     let p = AdeProfile::from_config(&c);
-    let json = p.to_json();
+    let json = p.to_json().expect("the profile serializes");
     assert_eq!(json, read_bytes("golden/example/ade_profile.json"));
-    assert_eq!(json, AdeProfile::from_config(&c).to_json());
+    assert_eq!(
+        json,
+        AdeProfile::from_config(&c)
+            .to_json()
+            .expect("the profile serializes")
+    );
     let text = String::from_utf8(json.clone()).expect("utf-8");
     assert_eq!(AdeProfile::parse(&text, &c.dns_name), Ok(p.clone()));
     let back: AdeProfile = serde_json::from_slice(&json).expect("round trip");
@@ -331,7 +336,7 @@ fn the_ade_profile_is_built_from_the_settings_and_passes_its_own_checks() {
         ("site.a", "fr", "CA")
     );
     assert!(p.is_supervised && p.is_mandatory && !p.is_mdm_removable);
-    let text = String::from_utf8(p.to_json()).expect("utf-8");
+    let text = String::from_utf8(p.to_json().expect("the profile serializes")).expect("utf-8");
     assert!(
         text.contains("\"profile_name\": \"Site \\\"A\\\"\""),
         "{text}"

@@ -28,7 +28,7 @@ fn refusal(text: &str) -> String {
 /// URLs are GitHub release assets, and the file is the one the crate ships.
 #[test]
 fn the_built_in_pins_parse_and_name_every_tool() {
-    let pins = Pins::built_in();
+    let pins = Pins::built_in().expect("pins.txt is valid");
     assert_eq!(pins, Pins::parse(BUILT_IN).expect("valid"));
     let tools: Vec<Tool> = pins.all().iter().map(|p| p.tool).collect();
     assert_eq!(tools, Tool::ALL);
