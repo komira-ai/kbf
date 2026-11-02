@@ -641,7 +641,7 @@ Nothing else is configured by a flag or the environment: the files this program 
 constants, as above. The units and jobs that start it are in
 [`packaging/host-agent`](../../packaging/host-agent/README.md).
 
-### The five requests
+### The six requests
 
 One line in, one JSON line out, one connection at a time. The same grammar for the version and
 the channel as the forced command's (single spaces, no control byte; no path or URL anywhere).
@@ -652,6 +652,7 @@ install kbf=<version> from <channel>
 switch kbf=<version>
 confirm kbf=<version>[ last_good=<version>]
 revert
+activate kbf=<commit|version>
 ```
 
 | request | does |
@@ -660,17 +661,22 @@ revert
 | `switch` | puts the laid-out release in place **on trial**: the pending marker, with its deadline, is written before the first link moves; then the links move and the units restart on it. A unit that does not come up puts the host back at once |
 | `confirm` | keeps the release on trial, then removes the releases the host no longer keeps. `last_good` names the coordinator's last good release, which the host then keeps whatever its age. Asked again after it was answered, the answer is the same |
 | `revert` | goes back to the release that ran, now |
+| `activate` | makes a release the host keeps the one that runs, for good: no fetch, no trial (see [The emergency command](#the-emergency-command-activate)). The socket's form takes no pin and no forced lock |
 | `query` | what runs, what is on trial and until when, how the last update ended, whether another install, switch or restart is running, and the releases the host keeps |
 
 Answers: `staged` (`version`, `commit`, `current`), `switched` (`version`, `commit`,
 `deadline_unix`), `confirmed`, `reverted` (`version`, the release the host is back on, when it
 knows its text), `query` (`commit`, `version`, `node_id`, `pending`, `last`, `busy`, and
-`releases` when the host keeps release directories), and
+`releases` when the host keeps release directories), `activated` (`commit`, `version`, `from`,
+`pinned`, `lock_taken`), and
 `{"result":"refused","reason":CODE}` (nothing ran) or `{"result":"failed","reason":CODE}` with a
 code from a closed set: `bad_command`, `channel_not_allowed`, `config_invalid`, `config_unsafe`,
 `unknown_release`, `ambiguous_release`, `fetch_failed`, `verify_failed`, `pending`, `not_staged`,
 `nothing_pending`, `no_current`, `busy`, `stage_failed`, `switch_failed`, `revert_failed`,
-`state_unavailable`, `audit_unavailable`, `peer_not_ready`, `runtime_failed`. The detail of a refusal goes to the journal, cleaned,
+`state_unavailable`, `audit_unavailable`, `peer_not_ready`, `runtime_failed`, `not_kept`,
+`restart_failed`. An `activate` refused as `not_kept` or `ambiguous_release` also carries
+`releases`, the kept releases in the listing's format below (and `releases_omitted` when some are
+left out). The detail of a refusal goes to the journal, cleaned,
 never to the line.
 
 ### The releases a host keeps
@@ -728,6 +734,98 @@ Every request but `query` is audited like a forced-command request (verb `stage`
 cannot be opened. A revert is never held back by it. The install lock is the same file as the
 forced command's, so the two never overlap.
 
+### The emergency command: `activate`
+
+The decisions behind it are in [../design/host-activate.md](../design/host-activate.md).
+
+When a release misbehaves and the way back must not wait for the coordinator (it is down, or it
+still desires the bad release), root on the host makes a release the host keeps the one that
+runs, with the helper at its fixed path:
+
+```text
+systemctl stop kbf-updater-agent        # a Mac: launchctl bootout system/com.komira.kbf-updater-agent
+/usr/libexec/kbf/kbf-host-install activate kbf=<commit|version> --pin --restart-unit kbf-daemon.service
+                                         # a Mac: /usr/local/libexec/kbf/kbf-host-install activate kbf=<commit|version> --pin
+```
+
+```text
+kbf-host-install activate kbf=<commit|version> [--pin] [--force-lock] [--restart-unit UNIT]...
+```
+
+- **Root only** (ssh as root, or `sudo`); any other account is refused (exit 2). It is not an ssh
+  forced-command request (sshd passes the forced command no arguments).
+- **The release** is named by its commit (12 to 40 lower-case hex digits, the start of the full
+  one), by its version (whose `+g<12 hex>` names the commit), or by the version text the host
+  recorded for it. It must be one the host keeps (`releases/` of the layout or the kit): nothing is
+  fetched, so the release source and the network may be gone. A release the host does not keep,
+  or a name that fits two, is refused (`not_kept`, `ambiguous_release`) with the kept releases, and
+  so is a kept release whose binary is not a regular file root may run (`not_kept`):
+  in the JSON line as `releases`, and on stderr one line each (`kept: <commit> <version> (why)`).
+- **No trial.** The swap is final: there is no deadline and no revert. `previous` becomes the
+  release that ran (the one left); a release that was on trial is on trial no more, so no deadline
+  puts it back. On Linux the installer's `state.json` is written first, then the links; on a Mac
+  the links move, then the socket's `pending.json` is removed (one that cannot be removed puts the
+  links back and fails with `state_unavailable`).
+- **The restart.** On Linux `--restart-unit` names the units that run the release, as `--serve`
+  takes them (at least one; the packaged unit is `kbf-daemon.service`); a Mac restarts the
+  daemon's launchd job and takes none. Every unit is restarted, each whatever became of the others.
+  A unit that does not come up on the release named is `restart_failed` (exit 3), and the host
+  stays on that release: it is not put back on the one it left. Name another kept release to go
+  elsewhere.
+- **Nothing of the release left runs.** The helper is not part of any kbf release (it is at its
+  fixed path, which no release install writes), it moves the links itself, and the service manager
+  starts the release named: no program under `releases/<the release left>` is executed.
+- **The install lock** (`/run/kbf-host-install.lock` on Linux, `lock` in the work directory on a
+  Mac) is taken without waiting, as every install, switch and restart takes it. Each taker writes
+  its process id into the lock file. A held lock is refused (`busy`, exit 2) and its holder named on
+  stderr: `pid N, which is alive` (let it end or stop it), `pid N, which is gone` (a process it
+  started keeps the lock), or `a process that wrote no id` (a helper from before this one). On a
+  Mac an apply job of the ssh path that is running is refused the same way (`busy`), since it runs
+  without the lock: launchd is asked about the job whatever its status file says, and anything but
+  "no such service" or a listing that says it ended (another status, a signal, a `launchctl` that
+  cannot run) counts as running. The locks taken inside it (the installer's state lock,
+  `retain.json`'s) are taken without waiting too: a holder is refused (`busy`), not waited for.
+- **`--force-lock`** takes the lock from a holder that is gone or stuck: the lock file is made
+  anew under its name and locked (a `flock` cannot be taken from its holder; the holder keeps the
+  old file, and every later taker opens the new one; a taker that had the old one open finds it is
+  no longer the lock and is busy). Every taker takes the lock under `<lock>.take`; a forced taker
+  keeps that guard until the activate ends, so a second forced request, or any other, is busy
+  meanwhile, and it replaces only the file and the holder it found (a holder that came since is
+  not taken from). A stuck holder is not stopped: stop it first if
+  it may still move the links. Each take is appended at once (before the release is even
+  looked up) to `lock-takes.jsonl`
+  beside the helper's `state.json` (`/var/lib/kbf-host-install` on Linux, the work directory on a
+  Mac; root's, 0600), one line per take:
+  `{"at_unix":N,"by":"activate","target":T,"holder_pid":N|null,"holder_alive":bool}`. It is a file
+  of its own because helpers before this one read `state.json` strictly and would refuse a new
+  key. A line cut short by a crash is ended before the next one is appended. A take that cannot be recorded stops the activate (`state_unavailable`). The audit line says
+  `install lock taken` too.
+- **`--pin`** holds the host on the release: it writes the hold file
+  `/var/lib/kbf-updater/pin.json` (a Mac: `/var/db/kbf-updater/pin.json`), in the packaged
+  agent's state directory, root's and 0644,
+  `{"commit":C,"version":V|null,"at_unix":N,"by":"activate"}`, and adds the commit to `pinned` in
+  `retain.json`, so no prune removes it. Both are written once the links name the release (also
+  when its units then do not come up); a refused or failed swap pins nothing, and a pin that
+  cannot be written after the swap fails the command (`state_unavailable`, the release running).
+  The file is written through the directory's descriptor, made aside and renamed over the name,
+  never through a link the agent's account put there; a file swapped in aside before the rename is
+  found and fails the pin, and the directory is synced. Another writer that holds `retain.json`
+  refuses the pin (`busy`) before anything changes. A directory that is not there is refused
+  before anything changes (`config_invalid`): without an agent, leave out `--pin`. Reading the hold file is the agent's; until it reads it, an
+  agent that runs re-drives the coordinator's desired release, which is why the agent is stopped
+  first. The pin stays in `retain.json` until it is removed there.
+- **The answer** is the socket's JSON line on stdout (`activated`, with `from` the release left,
+  `pinned` and `lock_taken`); the exit status is 0 (done), 2 (refused: nothing changed) or 3
+  (failed). It is audited (verb `activate`, `version` the name as given, and on success a `result`
+  of `<commit> from <commit>[; pinned][; install lock taken]`), and not run when the audit log
+  cannot be opened (`audit_unavailable`).
+- The socket takes `activate kbf=<commit|version>` too (no pin, no forced lock), audited like an
+  install. A host whose release is a package or a container image keeps no release directories,
+  and `activate` is refused there (`not_kept`, with nothing to list).
+
+If the session is cut during the restart, run the same command again: activating the release that
+runs restarts its units and moves no link.
+
 ### On Linux
 
 (A host whose frontend is a container is [below](#a-frontend-container).)
@@ -761,7 +859,7 @@ say it is that commit. Nothing is fetched when the trust files are not root's. A
 With `--layout deb` (or `rpm`) the host's units are the packaged ones
 ([packaging/linux](../../packaging/linux/README.md)), which run `/usr/bin/kbf`. No release is laid
 out beside the running one and no link moves: the update is two installations of a package file,
-with the trial recorded first. The same five requests apply, with the same answers and codes, and
+with the trial recorded first. The same requests apply, with the same answers and codes, and
 the same channels file as above. The package and a record of it live in the program's state
 directory (`/var/lib/kbf-host-install`: `package.json` and `packages/`, root's, 0600 and 0700).
 
@@ -790,7 +888,7 @@ A node that was set up by hand moves to this layout once, with
 
 With `--frontend-container` the release is the frontend's image
 (`kbf-frontend-image-<commit>-linux-<arch>.oci.tar`, [artifacts.md](../artifacts.md#the-frontend-image-oci))
-and the runtime is Docker. The five requests are the same, so the pending marker, its deadline and
+and the runtime is Docker. The requests are the same, so the pending marker, its deadline and
 the revert at the deadline are the same. The host needs `docker` at `/usr/bin/docker`, the channels
 file above (the image is fetched from the same releases), the installer's trust files (the pinned
 `gh` and trusted root), and a root-owned `/etc/kbf/host-install-frontend.toml`, which describes the

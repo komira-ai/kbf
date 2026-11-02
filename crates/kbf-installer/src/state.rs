@@ -291,6 +291,14 @@ impl Locked {
         })
     }
 
+    /// Like [`Locked::acquire`], but gives up at once with [`StateError::Busy`] when another
+    /// run holds the lock: for the operator's emergency swap, which must not hang behind a run
+    /// that does not let go. The directory is made as [`Locked::acquire`] makes it.
+    pub fn try_acquire(host: &Layout) -> Result<Locked, StateError> {
+        make_lock_dir(host)?;
+        Locked::acquire_within(host, Duration::ZERO)
+    }
+
     /// Like [`Locked::acquire`], but gives up with [`StateError::Busy`] if another run still
     /// holds the lock after `wait`: for the operator's verbs, which report "busy" (exit 4)
     /// rather than queue behind a pass.

@@ -488,3 +488,6 @@ fn a_work_directory_that_is_not_one_and_an_absent_marker() {
 
 #[path = "mac_backend_retain_tests.rs"]
 mod retain;
+
+#[path = "mac_backend_activate_tests.rs"]
+mod activate_verb;

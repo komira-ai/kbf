@@ -907,3 +907,6 @@ fn a_first_release_that_was_staged_is_current_and_no_longer_staged() {
         assert_eq!(state.staged, want, "{staged}");
     }
 }
+
+#[path = "activate_select_tests.rs"]
+mod select_tests;
