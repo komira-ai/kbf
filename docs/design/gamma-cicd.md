@@ -271,11 +271,14 @@ coordinator, not by the job, so it is there whatever happened to the job.
    - `POST /v1/desired` answers with both fields, and `GET /v1/convergence` shows them.
    - `POST /v1/desired` takes an optional `if_generation`. When it does not name the current
      generation, the write is refused with 409 `conflict` and changes nothing.
+   - `POST /v1/desired` takes an optional `write_id`, a text of the caller's. The desired
+     state shows the `write_id` of the write that made it (empty for a write without one).
+     This is the receipt a caller checks to know that a state is its own write.
 2. **`cargo xtask deploy-farm restore --version <this release>`** is the last step of the
    `gamma` job, run when an earlier step of the job failed. It reads `GET /v1/convergence`.
    When the desired version is this release, it does three things:
    - It sets `replaced` (version and minimums) as desired, with `if_generation` set to the
-     generation it read. It uses the same CI identity with a fresh OIDC token: the
+     generation it read and `write_id` set to `restore-<run id>-<attempt>`. It uses the same CI identity with a fresh OIDC token: the
      coordinator accepts each token once, so no call reuses one. A 503 is retried as on
      every other call.
    - It prints what it set.
@@ -296,10 +299,13 @@ write raises `generation`.
 
 On a 409 the restore reads once more, to tell its own retry from another writer:
 
-- **Its own retry.** A 503 answered a restore that had in fact landed. The desired version
-  is now `replaced`, so it reports the restore as done.
-- **Another writer.** Otherwise another write won. That write stands, nothing is restored,
-  and the restore exits 1 naming the desired version now.
+- **Its own retry.** A 503 answered a restore that had in fact landed. The desired state
+  now shows the restore's own `write_id`, so it reports the restore as done. The version
+  alone proves nothing: another writer may have chosen the same version, or the same
+  version with other minimums.
+- **Another writer.** The state shows another `write_id`, or none. That write stands,
+  even when its version and minimums equal `replaced`. Nothing is restored, and the restore
+  exits 1 naming the state now and its `write_id`.
 
 The baseline is the coordinator's record, so two cases restore the right version:
 
@@ -347,8 +353,12 @@ Coordinator:
 - a competing write, applied by the fake when the restore's read arrives, gets the
   restore a 409. The competing write survives, and the run exits 1 naming it. This holds
   when the competing write sets this same release again;
-- a restore that lands but whose answer is a 503 is retried, gets a 409, reads the
-  desired version as `replaced`, and reports the restore done;
+- a restore that lands but whose answer is a 503 is retried, gets a 409, reads its own
+  `write_id`, and reports the restore done;
+- another writer sets the `replaced` version between the restore's read and its write,
+  once with other minimums and once with the same ones. The restore gets a 409, reads
+  another `write_id`, and reports another writer's result in both cases, never a restore
+  done;
 - the restore presents a token no earlier call used. The fake refuses a replayed `jti`
   with 401, and the restore still lands;
 - `Superseded` and an empty `replaced` make no post;
@@ -496,8 +506,13 @@ The next ordinary desired write ends the forced state.
 
 - the agent takes no order, and reports `pinned <commit>` in every heartbeat (an additive
   field);
-- the helper refuses `install` and `switch` from the agent (`pinned`), so an update the
-  agent accepted before the pin cannot complete after it.
+- the helper refuses `install`, `switch` and `activate` from the agent (`pinned`), so an
+  update the agent accepted before the pin cannot complete after it. That includes a
+  forced update whose release was staged before the pin and is activated after it. The
+  helper checks the hold under the install lock, which `activate` also takes, so no
+  activation slips between the check and the swap. The one `activate` from the agent the
+  helper runs while a hold exists is the recovery that a force naming exactly the pinned
+  commit asks for (below).
 
 The coordinator shows the host as pinned, and counts it neither failed nor converged.
 `kbf-host-install unpin` clears the pin.
@@ -520,6 +535,9 @@ of another commit, leaves the pin.
 - the coordinator shows it pinned, and counts it neither failed nor converged;
 - an update accepted before the pin cannot finish: the fake agent sends `switch` after the
   hold file appears, and the helper refuses it;
+- a forced update staged before the pin cannot finish. Its release is staged, the operator
+  pins another release, and then the agent's `activate` is refused with `pinned`. The host
+  keeps running the pinned release;
 - a force naming the pinned commit clears the pin and switches nothing, on a host that
   runs it;
 - after a crash that left the pin persisted and the release not yet activated, and a

@@ -87,15 +87,28 @@ fn edit_line(workflow: &str, line: usize, edit: impl FnOnce(&str) -> String) -> 
     out
 }
 
-/// `workflow` with the job `from` renamed `to`, its key spelt as before (plain or quoted).
+/// The key of job `name` on its key line `line`: the indentation before it, the key as
+/// written (plain, or in double or single quotes) and the rest of the line from the colon on.
+fn split_key<'l>(line: &'l str, name: &str) -> (&'l str, &'l str, &'l str) {
+    let text = line.trim_start();
+    let indent = &line[..line.len() - text.len()];
+    let key_len = [format!("\"{name}\""), format!("'{name}'"), name.to_owned()]
+        .iter()
+        .find(|k| {
+            text.strip_prefix(k.as_str())
+                .is_some_and(|r| r.trim_start().starts_with(':'))
+        })
+        .map(String::len)
+        .unwrap_or_else(|| panic!("no key `{name}` at the start of: {line}"));
+    (indent, &text[..key_len], &text[key_len..])
+}
+
+/// `workflow` with the job `from` renamed `to`: only its key token changes, spelt as before
+/// (plain or quoted), so a comment on the line that names the job is left as it is.
 fn rename_job(workflow: &str, from: &str, to: &str) -> String {
     edit_line(workflow, job_line(workflow, from), |l| {
-        assert_eq!(
-            l.matches(from).count(),
-            1,
-            "the key line names `{from}` once: {l}"
-        );
-        l.replacen(from, to, 1)
+        let (indent, key, rest) = split_key(l, from);
+        format!("{indent}{}{rest}", key.replacen(from, to, 1))
     })
 }
 
@@ -124,18 +137,15 @@ fn add_job(workflow: &str, job: &str) -> String {
 }
 
 /// `workflow` spelt another way with the same jobs: a comment on its own line before the first
-/// job, every job key quoted, and a comment after each key.
+/// job, every job key in double quotes (a key already quoted stays so), and a comment after each
+/// key that names the job again.
 fn respelt(workflow: &str) -> String {
     let jobs = workflows::job_lines(workflow).expect("the workflow parses");
     let mut out = workflow.to_owned();
     for (name, line) in &jobs {
         out = edit_line(&out, *line, |l| {
-            let indent = &l[..l.len() - l.trim_start().len()];
-            let rest = l
-                .trim_start()
-                .strip_prefix(&format!("{name}:"))
-                .expect("a plain key");
-            format!("{indent}\"{name}\":{rest} # a job of the release")
+            let (indent, _, rest) = split_key(l, name);
+            format!("{indent}\"{name}\"{rest} # {name} is a job of the release")
         });
     }
     let first = jobs.first().expect("the workflow has a job").1;
@@ -250,34 +260,72 @@ fn a_job_added_to_the_real_workflow_fails() {
 
 #[test]
 fn the_workflow_spelt_another_way_gives_the_same_answers() {
-    let (real, jobs) = (read(RELEASE), real_jobs());
-    let other = respelt(&real);
-    assert_ne!(other, real);
-    assert_eq!(real_jobs_of(&other), jobs);
-    assert_eq!(problems(&read(DOC), &other), Vec::<String>::new());
+    let real = read(RELEASE);
+    let once = respelt(&real);
+    // Respelling a workflow whose keys are already quoted, and whose key lines already carry a
+    // comment naming the job, must work too.
+    let twice = respelt(&once);
+    let single = {
+        let jobs = workflows::job_lines(&real).expect("release.yml parses");
+        let (name, line) = jobs.last().expect("release.yml has jobs").clone();
+        edit_line(&real, line, |l| {
+            let (indent, _, rest) = split_key(l, &name);
+            format!("{indent}'{name}'{rest} # '{name}' runs last")
+        })
+    };
+    for other in [&once, &twice, &single] {
+        assert_ne!(other, &real);
+        same_answers_as_the_real_workflow(other);
+    }
+}
+
+/// The lint answers on `other` as on the real `release.yml`: the same jobs, no problem with the
+/// real doc, and the same answers for a rename and a removal made to both files and for an
+/// added job.
+fn same_answers_as_the_real_workflow(other: &str) {
+    let jobs = real_jobs();
+    assert_eq!(real_jobs_of(other), jobs);
+    assert_eq!(problems(&read(DOC), other), Vec::<String>::new());
     let last = jobs.last().expect("release.yml has jobs");
     let renamed = fresh(&jobs, &format!("{last}-renamed"));
+    let workflow = rename_job(other, last, &renamed);
     assert_eq!(
-        problems(
-            &rename_row(&read(DOC), last, &renamed),
-            &rename_job(&other, last, &renamed)
-        ),
+        real_jobs_of(&workflow).last(),
+        Some(&renamed),
+        "only the key is renamed"
+    );
+    assert_eq!(
+        problems(&rename_row(&read(DOC), last, &renamed), &workflow),
         Vec::<String>::new()
     );
     assert_eq!(
-        problems(
-            &remove_row(&read(DOC), last),
-            &remove_last_job(&other, last)
-        ),
+        problems(&remove_row(&read(DOC), last), &remove_last_job(other, last)),
         Vec::<String>::new()
     );
     let added = fresh(&jobs, "prod");
     assert_eq!(
-        problems(&read(DOC), &add_job(&other, &added)),
+        problems(&read(DOC), &add_job(other, &added)),
         vec![format!(
             "{DOC}: {RELEASE} has job `{added}`, which the job table omits"
         )]
     );
+}
+
+#[test]
+fn a_comment_naming_the_job_is_left_by_a_rename() {
+    let jobs = real_jobs();
+    let last = jobs.last().expect("release.yml has jobs");
+    let line = job_line(&read(RELEASE), last);
+    let commented = edit_line(&read(RELEASE), line, |l| {
+        format!("{l} # {last} handles deployment")
+    });
+    let renamed = rename_job(&commented, last, "renamed");
+    let kept: Vec<&str> = renamed
+        .lines()
+        .filter(|l| l.contains(&format!("# {last} handles deployment")))
+        .collect();
+    assert_eq!(kept.len(), 1, "the comment is kept");
+    assert!(kept[0].trim_start().starts_with("renamed:"), "{}", kept[0]);
 }
 
 #[test]
