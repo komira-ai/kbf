@@ -517,6 +517,24 @@ impl Authority {
         self.issue_named("coordinator", names, ekus, key, now, entropy)
     }
 
+    /// The job scheduler's own certificate (role `scheduler`, serverAuth only: its agents
+    /// and frontends dial it and it calls nobody by certificate) for `names`, DNS names or
+    /// addresses. Not reachable from a token. The signer allows one to eight names, and
+    /// no unspecified or multicast address.
+    ///
+    /// # Errors
+    /// [`CaError`].
+    pub fn issue_scheduler(
+        &self,
+        names: &[&str],
+        key: &PublicKey,
+        now: i64,
+        entropy: &mut dyn Entropy,
+    ) -> Result<Issued, CaError> {
+        let ekus = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        self.issue_named("scheduler", names, ekus, key, now, entropy)
+    }
+
     /// A host's updater certificate (role `updater`, clientAuth only: it dials the
     /// coordinator and nobody dials it).
     ///
