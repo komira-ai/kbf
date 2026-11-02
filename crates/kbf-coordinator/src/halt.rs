@@ -51,9 +51,10 @@ use std::time::Duration;
 use kbf_types::NodeId;
 use kbf_updater::wire::{Heartbeat, Outcome, Phase, Token, UpdateResult};
 
-use crate::decide::{Decision, Hold, decide_marked};
+use crate::decide::{Decision, Hold, decide_forced, decide_marked};
 use crate::desired::{Desired, KBF};
 use crate::fleet::{Fleet, Node};
+use crate::force;
 use crate::identity::Identity;
 use crate::membership::{self, Standing};
 use crate::ops::{AuditEntry, Halt, HaltAck, OpsError, OpsState, OpsStore, Write};
@@ -268,11 +269,13 @@ pub(crate) fn standing(state: &OpsState, service: &str) -> Option<Halt> {
     state.services.get(service).and_then(|m| m.halt.clone())
 }
 
-/// [`Hold::Halted`] for a service that is halted, and [`decide_marked`] (which holds the
-/// versions marked bad) for one that is not.
+/// [`decide_forced`] while an operator's force of the service stands ([`crate::force`]: a
+/// halt holds nothing back then), else [`Hold::Halted`] for a service that is halted, and
+/// [`decide_marked`] (which holds the versions marked bad) for one that is not.
 ///
-/// A halt is checked first, so that a halted service is told nothing: not an order, and not
-/// the reason a version is bad. The halt and the bad versions are read under one lock.
+/// A halt is checked before the rules, so that a halted service is told nothing: not an order,
+/// and not the reason a version is bad. The force, the halt and the bad versions are read under
+/// one lock.
 pub(crate) fn decide(
     ops: &OpsStore,
     services: &Services,
@@ -282,16 +285,11 @@ pub(crate) fn decide(
     id: &NodeId,
     now: Duration,
 ) -> Decision {
-    let (halted, bad) = ops.read(|state| {
-        (
-            standing(state, service).is_some(),
-            state
-                .services
-                .get(service)
-                .map(|marks| marks.bad.clone())
-                .unwrap_or_default(),
-        )
-    });
+    let marks = ops.read(|state| state.services.get(service).cloned().unwrap_or_default());
+    if force::standing(&marks, desired.get(service)).is_some() {
+        return decide_forced(services, desired, &marks, service, fleet, id, now);
+    }
+    let (halted, bad) = (marks.halt.is_some(), marks.bad);
     if halted {
         return Decision::Hold(Hold::Halted);
     }

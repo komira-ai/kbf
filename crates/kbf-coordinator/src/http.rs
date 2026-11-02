@@ -8,7 +8,8 @@
 //!   the bearer and the desired state as JSON; `GET /v1/status` with the operator token as
 //!   the bearer; `GET /v1/convergence[?service=<name>]` with CI's OIDC token as the bearer
 //!   (the operator token is refused there; no query means `kbf`); `POST /v1/operator` with the
-//!   operator token as the bearer and an action as JSON (`crate::ops`; CI's token is refused).
+//!   operator token as the bearer and an action as JSON (`crate::ops`, `crate::force`; CI's
+//!   token is refused with 403, any other bearer with 401).
 //!
 //! An answer is JSON, and an error is `{"error":"<code>"}` with a code from a closed set:
 //! never a claim value, a path or the text of an internal error.
@@ -224,6 +225,7 @@ where
         Err(SetError::Unavailable) => error(StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
         Err(SetError::Forbidden) => error(StatusCode::FORBIDDEN, "forbidden"),
         Err(SetError::Invalid(_)) => error(StatusCode::BAD_REQUEST, "bad_request"),
+        Err(SetError::HeldBad(_)) => error(StatusCode::CONFLICT, "held_bad"),
         Err(why @ (SetError::Store(_) | SetError::Ops(_))) => {
             tracing::error!(%why, "the desired state could not be stored");
             error(StatusCode::INTERNAL_SERVER_ERROR, "internal")
@@ -237,9 +239,13 @@ where
     B::Error: Into<BoxError>,
 {
     // The token first: a caller without it costs no read of the body and learns nothing from
-    // its size or its stalling.
+    // its size or its stalling. CI's token is known, and may not.
     let token = bearer(&request).map(str::to_owned);
     if coordinator.operator(token.as_deref()).is_err() {
+        if coordinator.is_ci(token.as_deref()).await {
+            tracing::warn!("refused an operator action: CI's token is no operator token");
+            return error(StatusCode::FORBIDDEN, "forbidden");
+        }
         return error(StatusCode::UNAUTHORIZED, "unauthorized");
     }
     let Some(body) = read(request, MAX_OPERATOR_BYTES, patience).await else {
@@ -252,8 +258,16 @@ where
             tracing::warn!(%why, "refused an operator action");
             error(StatusCode::BAD_REQUEST, "bad_request")
         }
+        Err(why @ OperateError::BelowMinVersion { .. }) => {
+            tracing::warn!(%why, "refused an operator action");
+            error(StatusCode::BAD_REQUEST, "below_min_version")
+        }
         Err(OperateError::Store(why)) => {
             tracing::error!(%why, "the ops file could not be written");
+            error(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+        }
+        Err(why @ OperateError::Desired(_)) => {
+            tracing::error!(%why, "a force's desired state could not be written");
             error(StatusCode::INTERNAL_SERVER_ERROR, "internal")
         }
     }

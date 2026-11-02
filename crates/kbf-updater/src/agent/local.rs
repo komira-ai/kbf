@@ -109,6 +109,41 @@ pub struct HostState {
     pub last: Option<Ended>,
     /// An install, a switch or a restart is running.
     pub busy: bool,
+    /// The releases the host keeps, as far as the helper lists them: none when it sends no
+    /// list (an older helper) or says it could not read one.
+    pub releases: Option<Vec<Kept>>,
+}
+
+impl HostState {
+    /// Whether the helper's list of kept releases names `target`: by its version text, or by
+    /// the commit the version carries. False when there is no list.
+    #[must_use]
+    pub fn keeps(&self, target: &Version) -> bool {
+        self.releases.as_deref().is_some_and(|releases| {
+            releases.iter().any(|kept| {
+                kept.version.as_ref() == Some(target)
+                    || target.commit().is_some_and(|c| kept.commit.starts_with(c))
+            })
+        })
+    }
+}
+
+/// A release the host keeps.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Kept {
+    /// All 40 digits.
+    pub commit: String,
+    /// The version text it was installed as, when the helper knows it.
+    pub version: Option<Version>,
+}
+
+/// What an activate did: the release the host now keeps as the one that runs, for good.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Activated {
+    pub commit: String,
+    pub version: Option<Version>,
+    /// The release that ran before.
+    pub from: Option<String>,
 }
 
 /// What an install did.
@@ -130,6 +165,9 @@ pub trait Local: Send + Sync {
     fn confirm(&self, version: &Version) -> Result<(), LocalError>;
     /// Go back to the release that ran before the one on trial.
     fn revert(&self) -> Result<(), LocalError>;
+    /// Make `version`, a release the host keeps, the one that runs for good: no trial, no
+    /// deadline, no revert. A helper that predates the request refuses it as `bad_command`.
+    fn activate(&self, version: &Version) -> Result<Activated, LocalError>;
 }
 
 /// The real helper, over its unix socket.
@@ -151,6 +189,15 @@ struct Line {
     pending: Option<RawTrial>,
     last: Option<RawEnded>,
     busy: Option<bool>,
+    from: Option<String>,
+    releases: Option<Vec<RawKept>>,
+    releases_unavailable: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct RawKept {
+    commit: String,
+    version: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -250,6 +297,20 @@ impl Local for SocketLocal {
                 })
             })
             .transpose()?;
+        // A list the helper could not read says nothing of what it keeps; a version in it
+        // that is not one leaves that release known by its commit alone.
+        let releases = match (line.releases, line.releases_unavailable) {
+            (Some(releases), None | Some(false)) => Some(
+                releases
+                    .into_iter()
+                    .map(|kept| Kept {
+                        commit: kept.commit,
+                        version: kept.version.and_then(|v| Version::parse(&v).ok()),
+                    })
+                    .collect(),
+            ),
+            _ => None,
+        };
         Ok(HostState {
             version: version_of(line.version.as_deref())?,
             commit: line.commit,
@@ -257,6 +318,7 @@ impl Local for SocketLocal {
             pending,
             last,
             busy: line.busy.ok_or_else(|| protocol("a query without busy"))?,
+            releases,
         })
     }
 
@@ -297,6 +359,23 @@ impl Local for SocketLocal {
     fn revert(&self) -> Result<(), LocalError> {
         self.call("revert", Some(self.limits.revert), "reverted")
             .map(drop)
+    }
+
+    fn activate(&self, version: &Version) -> Result<Activated, LocalError> {
+        let request = format!("activate kbf={}", version.as_str());
+        let line = self.call(&request, Some(self.limits.revert), "activated")?;
+        let named = version_of(line.version.as_deref())?;
+        match (line.commit, named) {
+            (_, Some(named)) if named != *version => Err(protocol(
+                "an activation of a release that is not the one asked for",
+            )),
+            (Some(commit), named) => Ok(Activated {
+                commit,
+                version: named,
+                from: line.from,
+            }),
+            (None, _) => Err(protocol("an activation without a commit")),
+        }
     }
 }
 

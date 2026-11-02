@@ -17,11 +17,14 @@ use crate::converge::{Convergence, RoleCounts, converge_kbf, converge_service, r
 use crate::decide::{Decision, Hold};
 use crate::desired::{Desired, DesiredError, DesiredStore, KBF, StoreError};
 use crate::fleet::{Fleet, Host, Node};
+use crate::force;
 use crate::halt;
 use crate::identity::Identity;
 use crate::membership::{Member, Standing, account, deferred_count, members, standing};
-use crate::ops::{self, AuditEntry, OPERATOR, OperateError, OpsError, OpsState, OpsStore};
-use crate::reconcile::reconcile;
+use crate::ops::{
+    self, Action, AuditEntry, Force, OPERATOR, OperateError, OpsError, OpsState, OpsStore,
+};
+use crate::reconcile::{CI, reconcile};
 use crate::services::{ServiceDef, Services};
 
 /// The time since the coordinator started.
@@ -52,6 +55,10 @@ pub enum SetError {
     /// The allow-list entry that admitted the token does not name this service.
     #[error("the token may not set this service")]
     Forbidden,
+    /// A force left the version, and its bad mark stands until an operator lifts it
+    /// (`unmark_bad` on `/v1/operator`).
+    #[error("{0} was left by a force and is marked bad: an operator's unmark_bad lifts it")]
+    HeldBad(kbf_updater::version::Version),
 }
 
 /// Why a CI token was not accepted.
@@ -125,6 +132,9 @@ pub struct ServiceStatus {
     /// absent, missing or unmanaged. Left out when there are none.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub members: Vec<Member>,
+    /// The operator's force that stands ([`crate::force`]). Left out when none does.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub forced: Option<Force>,
     /// How many of `hosts` are up for the service.
     pub up: usize,
     /// How many of `hosts` hold one of the service's update slots.
@@ -192,11 +202,12 @@ pub struct Status {
 /// heartbeat's `deferred` report ends the order, holds no slot and backs the host off
 /// ([`crate::defer`]). `halt-v1`: the clear generations of [`crate::halt`]. `heartbeat-v2`:
 /// selector membership, hosts that are `missing`, `absent` or `unmanaged`
-/// ([`crate::membership`]).
+/// ([`crate::membership`]). `forced-v1`: an order of a force says so ([`crate::force`]).
 pub const FEATURES: &[&str] = &[
     "deferred-v1",
     halt::FEATURE,
     crate::membership::HEARTBEAT_V2,
+    force::FEATURE,
 ];
 
 /// How long a host's warn about one dropped fact is silent after it was logged.
@@ -335,7 +346,7 @@ impl Coordinator {
     /// answered about `kbf` alone, in the shape it has always read.
     pub fn heartbeat(&self, who: Identity, beat: Heartbeat) -> Answer {
         let asked = beat.agent_features.clone();
-        let reply = self.reply_to(who, beat);
+        let (reply, forced) = self.reply_to(who, beat);
         // Only an agent that announced features gets `features`: an older agent reads the
         // reply strictly and refuses a field it does not know.
         let features: Option<Vec<String>> = (!asked.is_empty()).then(|| {
@@ -353,14 +364,22 @@ impl Coordinator {
             .map_or_else(BTreeMap::new, |_| {
                 halt::generations(&self.ops, &self.services)
             });
+        // `forced` only to an agent that announced `forced-v1` and a coordinator that advertises
+        // it, for the same reason.
+        let forced = forced
+            && features
+                .as_ref()
+                .is_some_and(|names| names.iter().any(|name| name == force::FEATURE));
         Answer {
             reply,
             features,
             halts,
+            forced,
         }
     }
 
-    fn reply_to(&self, who: Identity, beat: Heartbeat) -> ServiceReply {
+    /// The reply to `beat` of `who`, and whether its order is a force's.
+    fn reply_to(&self, who: Identity, beat: Heartbeat) -> (ServiceReply, bool) {
         let now = (self.clock)();
         let announced = beat.services.clone().unwrap_or_default();
         let node = Node {
@@ -430,13 +449,17 @@ impl Coordinator {
                     continue;
                 }
                 fleet.order(name, who.node_id.clone(), version.clone(), now);
-                return ServiceReply::Update {
+                let forced = self
+                    .ops
+                    .read(|state| force::stands(state, name, desired.get(name)));
+                let reply = ServiceReply::Update {
                     service: (name != KBF).then(|| name.to_owned()),
                     version,
                 };
+                return (reply, forced);
             }
         }
-        ServiceReply::Nothing
+        (ServiceReply::Nothing, false)
     }
 
     /// The CI token in `bearer`, checked by the verifier.
@@ -489,12 +512,20 @@ impl Coordinator {
             );
             return Err(SetError::Forbidden);
         }
+        // A version a force left is not CI's to set again: an operator lifts its mark first.
+        if force::held_bad(&self.ops, &service, &desired.version) {
+            tracing::warn!(%service, version = %desired.version, "refused a desired state: a force left the version");
+            return Err(SetError::HeldBad(desired.version));
+        }
         // CI naming a version by hand lifts its mark. The mark goes first: a set that fails
         // after it leaves nothing blocked, and the reverse would leave a wanted version that
-        // the next beat rolls back.
+        // the next beat rolls back. A force that stands ends before the state is set, so a set
+        // that fails after it leaves the forced version under the ordinary rules.
         {
             let fleet = self.fleet.lock().unwrap_or_else(PoisonError::into_inner);
-            clear_bad(&self.ops, &fleet, &service, &desired.version)?;
+            let why = format!("{} was set by CI", desired.version);
+            clear_bad(&self.ops, &fleet, CI, &service, &desired.version, &why)?;
+            force::end(&self.ops, &service, CI, &desired.version)?;
         }
         self.desired.set(&service, desired.clone())?;
         tracing::info!(
@@ -529,9 +560,57 @@ impl Coordinator {
     /// [`OperateError`].
     pub fn operate(&self, bearer: Option<&str>, body: &[u8]) -> Result<AuditEntry, OperateError> {
         self.operator(bearer)?;
-        let entry = ops::operate(&self.ops, &self.services, OPERATOR, body)?;
+        let entry = match ops::parse_action(body)? {
+            Action::Force {
+                service,
+                version,
+                reason,
+                max_updating,
+            } => {
+                // Under the fleet's lock, which every decision and order is made under: no
+                // heartbeat is decided between the force's marks and its desired state.
+                let fleet = self.fleet.lock().unwrap_or_else(PoisonError::into_inner);
+                let request = force::Request {
+                    service,
+                    version,
+                    reason,
+                    max_updating,
+                };
+                force::force(
+                    &self.ops,
+                    &self.services,
+                    &self.desired,
+                    &fleet,
+                    OPERATOR,
+                    request,
+                )?
+            }
+            Action::UnmarkBad {
+                service,
+                version,
+                reason,
+            } => {
+                let fleet = self.fleet.lock().unwrap_or_else(PoisonError::into_inner);
+                force::unmark_bad(
+                    &self.ops,
+                    &self.services,
+                    &fleet,
+                    OPERATOR,
+                    &service,
+                    &version,
+                    &reason,
+                )?
+            }
+            action => ops::apply(&self.ops, &self.services, OPERATOR, action)?,
+        };
         self.reconcile();
         Ok(entry)
+    }
+
+    /// Whether `bearer` is a CI token the verifier accepts: the operator route answers such a
+    /// caller that it may not, rather than that it is unknown.
+    pub async fn is_ci(&self, bearer: Option<&str>) -> bool {
+        self.ci(bearer).await.is_ok()
     }
 
     /// Forgets what the hosts said about a service they no longer belong to, after an
@@ -598,11 +677,17 @@ impl Coordinator {
                 let slots_held = hosts.iter().filter(|h| h.host.holds_slot).count();
                 let members = members(def, &fleet, &ops, now);
                 let convergence = convergence_of(def, desired.as_ref(), &fleet, &ops, now);
+                let forced = ops
+                    .services
+                    .get(&def.name)
+                    .and_then(|marks| force::standing(marks, desired.as_ref()))
+                    .cloned();
                 let status = ServiceStatus {
                     desired,
                     roles,
                     hosts,
                     members,
+                    forced,
                     up,
                     slots_held,
                     convergence,

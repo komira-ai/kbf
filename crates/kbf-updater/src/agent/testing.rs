@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use super::coordinator::{Coordinator, CoordinatorError};
-use super::local::{Ended, HostState, Local, LocalError, Staged, Trial};
+use super::local::{Activated, Ended, HostState, Local, LocalError, Staged, Trial};
 use crate::inventory::{Host, Role};
 use crate::ports::{Clock, Drain, Health, HealthCheck, Placed, PortError, Seen};
 use crate::version::Version;
@@ -93,6 +93,9 @@ pub struct LocalWorld {
     pub switch: Result<u64, LocalError>,
     pub confirm: Result<(), LocalError>,
     pub revert: Result<(), LocalError>,
+    /// What `activate` answers; on `Ok` the release is the one that runs, with nothing on
+    /// trial.
+    pub activate: Result<(), LocalError>,
     pub query: Result<(), LocalError>,
     /// The helper stops answering `query` once it has been asked to go back.
     pub mute_after_revert: bool,
@@ -105,6 +108,8 @@ pub struct LocalWorld {
     pub on_switch: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Called at the start of a confirm, without the lock held.
     pub on_confirm: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Called at the start of an activate, without the lock held.
+    pub on_activate: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 /// A helper that behaves like the real one.
@@ -125,6 +130,7 @@ impl FakeLocal {
                 pending: None,
                 last: None,
                 busy: false,
+                releases: None,
             },
             install: Ok(Staged {
                 commit: COMMIT_B.to_owned(),
@@ -133,12 +139,14 @@ impl FakeLocal {
             switch: Ok(10_600),
             confirm: Ok(()),
             revert: Ok(()),
+            activate: Ok(()),
             query: Ok(()),
             mute_after_revert: false,
             before: None,
             on_install: None,
             on_switch: None,
             on_confirm: None,
+            on_activate: None,
         };
         Self {
             events: events.clone(),
@@ -221,6 +229,24 @@ impl Local for FakeLocal {
             reason: Some("reverted".to_owned()),
         });
         Ok(())
+    }
+
+    fn activate(&self, version: &Version) -> Result<Activated, LocalError> {
+        self.events.push(format!("local:activate {version}"));
+        let hook = self.world().on_activate.clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+        let mut world = self.world();
+        world.activate.clone()?;
+        let from = world.state.commit.replace(COMMIT_B.to_owned());
+        world.state.pending = None;
+        world.state.version = Some(version.clone());
+        Ok(Activated {
+            commit: COMMIT_B.to_owned(),
+            version: Some(version.clone()),
+            from,
+        })
     }
 }
 
@@ -508,6 +534,8 @@ pub struct FakeCoordinator {
     pub features: Arc<Mutex<Option<Vec<String>>>>,
     /// The `halts` of every answer: the clear generation of each service cleared at least once.
     pub halts: Arc<Mutex<std::collections::BTreeMap<String, u64>>>,
+    /// The `forced` of every answer.
+    pub forced: Arc<Mutex<bool>>,
 }
 
 impl FakeCoordinator {
@@ -542,6 +570,11 @@ impl FakeCoordinator {
             .collect();
     }
 
+    /// The coordinator marks the update of every answer from now on as an operator's force.
+    pub fn set_forced(&self, forced: bool) {
+        *lock(&self.forced) = forced;
+    }
+
     /// The coordinator predates features: its replies carry none.
     pub fn advertise_nothing_at_all(&self) {
         *lock(&self.features) = None;
@@ -569,6 +602,7 @@ impl Coordinator for FakeCoordinator {
             reply,
             features: lock(&self.features).clone(),
             halts: lock(&self.halts).clone(),
+            forced: *lock(&self.forced),
         })
     }
 }

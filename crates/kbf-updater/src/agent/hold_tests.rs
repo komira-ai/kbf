@@ -138,7 +138,7 @@ impl Rig {
     fn take_order(&self, agent: &Agent) {
         self.order_is(VB);
         let order = agent.beat_once().expect("an order");
-        agent.order(order.0.as_deref(), &order.1);
+        agent.order(order.0.as_deref(), &order.1, order.2);
     }
 
     fn installs(&self) -> usize {
@@ -215,7 +215,7 @@ fn an_agent_that_sees_no_features_never_defers_or_declines() {
         rig.take_order(&agent);
         agent.beat_once();
         let beat = rig.last_beat();
-        assert_eq!(beat.agent_features, ["deferred-v1", "halt-v1"]);
+        assert_eq!(beat.agent_features, ["deferred-v1", "halt-v1", "forced-v1"]);
         assert_eq!(beat.last_update, failed(VB));
         assert_eq!(beat.deferred, None);
         assert!(!rig.dir.join("defer-kbf").exists());
@@ -295,7 +295,7 @@ fn a_deferral_leaves_the_last_result_as_it_was() {
     *rig.drain.leases.lock().unwrap() = [2].into();
     rig.order_is(OTHER);
     let order = agent.beat_once().unwrap();
-    agent.order(None, &order.1);
+    agent.order(None, &order.1, order.2);
     agent.beat_once();
     let beat = rig.last_beat();
     assert_eq!(beat.deferred.unwrap().target, version(OTHER));
@@ -368,7 +368,7 @@ fn a_reorder_before_retry_after_is_declined_and_one_after_it_runs() {
     // Another target is not the one that was deferred.
     rig.order_is(OTHER);
     let order = agent.beat_once().unwrap();
-    agent.order(None, &order.1);
+    agent.order(None, &order.1, order.2);
     assert_eq!(rig.installs(), 3);
     let kept = Marks::new(&rig.dir).load("kbf").unwrap().unwrap();
     assert_eq!(kept.target, version(OTHER));
@@ -402,7 +402,7 @@ fn a_failed_heartbeat_keeps_what_was_advertised() {
     assert!(rig.logged("heartbeat: the coordinator is unreachable"));
     rig.advance_unix(10);
     rig.order_is(VB);
-    agent.order(None, &version(VB));
+    agent.order(None, &version(VB), false);
     assert_eq!(rig.installs(), 1);
 }
 
@@ -458,7 +458,7 @@ fn with_halt_v1_a_failed_rollback_halts_and_holds_the_service() {
     rig.take_order(&agent);
     rig.order_is(OTHER);
     let order = agent.beat_once().unwrap();
-    agent.order(None, &order.1);
+    agent.order(None, &order.1, order.2);
     assert_eq!(rig.installs(), 1);
     assert!(rig.logged("held after a halt (rollback_failed)"));
 
@@ -619,20 +619,13 @@ fn a_deferral_is_over_at_its_retry_time() {
 fn features_are_the_known_names_advertised() {
     let names = |list: &[&str]| list.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
     assert_eq!(Features::of(&names(&[])), Features::default());
+    let only_halt = Features::of(&names(&["halt-v1", "future-v9"]));
     assert_eq!(
-        Features::of(&names(&["halt-v1", "future-v9"])),
-        Features {
-            deferred: false,
-            halt: true
-        }
+        (only_halt.deferred, only_halt.halt, only_halt.forced),
+        (false, true, false)
     );
-    assert_eq!(
-        Features::of(&names(&["deferred-v1", "halt-v1"])),
-        Features {
-            deferred: true,
-            halt: true
-        }
-    );
+    let both = Features::of(&names(&["deferred-v1", "halt-v1"]));
+    assert_eq!((both.deferred, both.halt, both.forced), (true, true, false));
 }
 
 /// Catches: a clamp that drifts from the step runner's 3600 s bound.

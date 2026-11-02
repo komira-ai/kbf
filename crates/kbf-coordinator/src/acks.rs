@@ -15,8 +15,8 @@ use kbf_types::NodeId;
 use kbf_updater::version::Version;
 
 use crate::fleet::{Fleet, Host};
-use crate::ops::{FailureAck, OpsError, OpsStore, ServiceOps, Write};
-use crate::reconcile::{CI, COORDINATOR, Change, entry, is_release_failure};
+use crate::ops::{AuditEntry, FailureAck, OpsError, OpsStore, ServiceOps, Write};
+use crate::reconcile::{COORDINATOR, Change, entry, is_release_failure};
 
 /// Whether the failure report the host `id` makes now is acked in `marks`: the same host and
 /// the whole report.
@@ -86,21 +86,25 @@ pub fn release_ack(ops: &OpsStore, service: &str, node: &NodeId) -> bool {
     }
 }
 
-/// Removes the mark that `version` is bad, if it has one: CI set it by hand. The failure
-/// reports of `service` standing in `fleet` for `version` are acked in the same write. Written
-/// to the file before it leaves memory (it clears protection), and before CI's desired state
-/// is stored, so that a failed write leaves both as they were.
+/// Removes the mark that `version` is bad, if it has one, as `by`, for `why`: CI set it by
+/// hand, or an operator lifted it. A force's hold on the mark goes with it. The failure reports
+/// of `service` standing in `fleet` for `version` are acked in the same write. Written to the
+/// file before it leaves memory (it clears protection), and before CI's desired state is
+/// stored, so that a failed write leaves both as they were. Answers the audit entry, or none
+/// when the version was not marked.
 ///
 /// # Errors
 /// [`OpsError`]: the ops file could not be written.
 pub fn clear_bad(
     ops: &OpsStore,
     fleet: &Fleet,
+    by: &str,
     service: &str,
     version: &Version,
-) -> Result<(), OpsError> {
+    why: &str,
+) -> Result<Option<AuditEntry>, OpsError> {
     if !ops.marks(service).bad.contains(version) {
-        return Ok(());
+        return Ok(None);
     }
     let acks: Vec<FailureAck> = fleet
         .hosts_of(service)
@@ -112,18 +116,16 @@ pub fn clear_bad(
             })
         })
         .collect();
-    let why = format!(
-        "{version} was set by CI; {} failure reports acked",
-        acks.len()
-    );
-    let audit = entry(CI, "unmark_bad", service, why);
+    let why = format!("{why}; {} failure reports acked", acks.len());
+    let audit = entry(by, "unmark_bad", service, why);
     ops.change(Write::BeforeMemory, audit, |state| {
         let marks = state.services.entry(service.to_owned()).or_default();
         marks.bad.retain(|bad| bad != version);
+        marks.bad_by_force.retain(|bad| bad != version);
         for ack in acks {
             marks.failure_acked.retain(|old| old.node_id != ack.node_id);
             marks.failure_acked.push(ack);
         }
     })
-    .map(drop)
+    .map(Some)
 }

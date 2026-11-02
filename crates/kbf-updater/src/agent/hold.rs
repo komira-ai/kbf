@@ -33,8 +33,12 @@ pub const DEFERRED_V1: &str = "deferred-v1";
 /// The reply may carry a halt and the agent holds the service for it.
 pub const HALT_V1: &str = "halt-v1";
 
+/// The reply may mark an update order as an operator's force, and the agent makes the target
+/// the release that runs, with no trial and no going back (`update_forced`).
+pub const FORCED_V1: &str = "forced-v1";
+
 /// The features this agent announces in every heartbeat.
-pub const ANNOUNCED: [&str; 2] = [DEFERRED_V1, HALT_V1];
+pub const ANNOUNCED: [&str; 3] = [DEFERRED_V1, HALT_V1, FORCED_V1];
 
 /// The reason of a deferral whose drain bound passed.
 pub const DRAIN_BOUND: &str = "drain_bound";
@@ -62,6 +66,8 @@ pub struct Features {
     pub deferred: bool,
     /// Report a [`Hold::Halt`] and hold the service.
     pub halt: bool,
+    /// Run an order the reply marks `forced` as a force, not as an ordinary A/B.
+    pub forced: bool,
 }
 
 impl Features {
@@ -73,6 +79,7 @@ impl Features {
         Self {
             deferred: has(DEFERRED_V1),
             halt: has(HALT_V1),
+            forced: has(FORCED_V1),
         }
     }
 }

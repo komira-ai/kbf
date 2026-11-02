@@ -243,15 +243,17 @@ async fn a_halt_survives_a_restart() {
     );
 }
 
-/// Catches: the halt being cleared by anyone but the operator: no bearer, CI's token, a wrong
-/// token and a token of another scheme are each 401 and leave the halt and its generation as
-/// they were; the operator token clears it, and the answer is the audit entry.
+/// Catches: the halt being cleared by anyone but the operator: CI's token is 403, no bearer, a
+/// wrong token and a token of another scheme are each 401, and each leaves the halt and its
+/// generation as they were; the operator token clears it, and the answer is the audit entry.
 #[tokio::test]
 async fn only_the_operator_token_clears_a_halt() {
     let rig = farm("halt-token").await;
     send(&rig, "s1", "storage", &beat("1.0", HALT)).await;
-    let ci = ci_token();
-    for bearer in [None, Some(ci.as_str()), Some("nope")] {
+    let (code, body) = operate(&rig, Some(&ci_token()), &clear_body("kbf")).await;
+    assert_eq!(code, StatusCode::FORBIDDEN);
+    assert_eq!(body, json!({"error": "forbidden"}));
+    for bearer in [None, Some("nope")] {
         let (code, body) = operate(&rig, bearer, &clear_body("kbf")).await;
         assert_eq!(code, StatusCode::UNAUTHORIZED, "{bearer:?}");
         assert_eq!(body, json!({"error": "unauthorized"}));

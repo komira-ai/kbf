@@ -464,3 +464,21 @@ fn the_fake_clock_moves_only_when_waited_on() {
     assert_eq!((host.alias.as_str(), host.role), ("n1", Role::Daemon));
     assert_eq!(host.node_id.as_deref(), Some("n1"));
 }
+
+/// Catches: a fake helper that does more than the helper of a host whose hook runs the steps:
+/// it has no `activate` (the hook's A/B never forces), so it refuses it as `bad_command` and
+/// leaves the host's files as they were.
+#[test]
+fn the_fake_helper_does_not_know_activate() {
+    let dir = scratch("no-activate");
+    let local = FakeLocal(paths(&dir));
+    let before = fs::read_to_string(dir.join("world/helper.json")).unwrap();
+    assert_eq!(
+        local.activate(&Version::parse("1.1.0").unwrap()),
+        Err(LocalError::Refused("bad_command".to_owned()))
+    );
+    assert_eq!(
+        fs::read_to_string(dir.join("world/helper.json")).unwrap(),
+        before
+    );
+}

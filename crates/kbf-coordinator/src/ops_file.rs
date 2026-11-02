@@ -6,7 +6,12 @@
 //! acknowledgement its host and target. What the halt release adds to them lives beside it in
 //! the halts file (`<ops-file>.halts`): the whole report a halt and each acknowledgement were
 //! made from, the reports received while a halt stood (`halt_seen`) and the clear generation of
-//! each service (`halt_generation`).
+//! each service (`halt_generation`). So does what the force release adds ([`crate::force`]):
+//! the force that is recorded (`force`), the count of forces (`force_generation`) and the bad
+//! marks a force holds (`bad_by_force`). A release before the force release skips those keys:
+//! it loses the force (the forced version is then rolled under the ordinary rules, which a halt
+//! or a bad mark can hold) and the hold on a mark (CI's desired state lifts it, as it did before),
+//! and nothing else; a mark a force made is in the ops file, and stays.
 //!
 //! The reader of the halts file skips a key it does not know. A record whose report it cannot
 //! read (an outcome a later release added, say) is passed over as a whole and counted, and the
@@ -19,8 +24,10 @@
 //!
 //! On reading, the halts file's records are joined to the ops file's by host and target. A
 //! record that matches nothing (the release before rewrote the ops file and cleared or replaced
-//! what it was about) is dropped, with the same loss. Reports kept while a halt stood join only
-//! to that halt. A generation is kept whatever the ops file says. Records join by host and
+//! what it was about) is dropped, with the same loss. A hold on a bad mark joins only to a mark
+//! the ops file still has. A force whose record cannot be read is passed over and counted, as
+//! is a held mark that is no version: that loss ends the force or the hold, as above. Reports
+//! kept while a halt stood join only to that halt. A generation is kept whatever the ops file says. Records join by host and
 //! version alone: when the release before cleared a halt and the same host halted on the same
 //! version again, the old halt's reports join to the new one, about the same host and version.
 //!
@@ -65,7 +72,7 @@ use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
 use crate::desired::{StoreError, dir_of, io_at, write_whole};
-use crate::ops::{HaltAck, OpsError, OpsState};
+use crate::ops::{Force, HaltAck, OpsError, OpsState};
 
 /// The halts file of the ops file at `ops`: its name with `.halts` added.
 #[must_use]
@@ -143,6 +150,15 @@ struct ServiceHalts {
     /// How many halts an operator has cleared.
     #[serde(skip_serializing_if = "is_zero")]
     halt_generation: u64,
+    /// The force recorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    force: Option<Force>,
+    /// How many forces an operator has made.
+    #[serde(skip_serializing_if = "is_zero")]
+    force_generation: u64,
+    /// The bad marks a force holds.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    bad_by_force: Vec<Version>,
 }
 
 /// Everything the halts file holds.
@@ -167,6 +183,12 @@ struct ReadService {
     halt_seen: Vec<Value>,
     #[serde(default)]
     halt_generation: u64,
+    #[serde(default)]
+    force: Option<Value>,
+    #[serde(default)]
+    force_generation: u64,
+    #[serde(default)]
+    bad_by_force: Vec<Value>,
 }
 
 /// [`HaltsFile`] as read.
@@ -179,7 +201,7 @@ struct ReadHalts {
 }
 
 /// The record `value` holds; none, counted in `skipped`, when this release cannot read it.
-fn kept(value: Value, skipped: &mut usize) -> Option<Kept> {
+fn kept<T: serde::de::DeserializeOwned>(value: Value, skipped: &mut usize) -> Option<T> {
     let read = serde_json::from_value(value).ok();
     *skipped += usize::from(read.is_none());
     read
@@ -214,11 +236,19 @@ impl ReadHalts {
                     .filter_map(|v| kept(v, &mut skipped))
                     .collect()
             };
+            let (halt_acked, halt_seen) = (each(read.halt_acked), each(read.halt_seen));
             let service = ServiceHalts {
                 halt,
-                halt_acked: each(read.halt_acked),
-                halt_seen: each(read.halt_seen),
+                halt_acked,
+                halt_seen,
                 halt_generation: read.halt_generation,
+                force: read.force.and_then(|v| kept(v, &mut skipped)),
+                force_generation: read.force_generation,
+                bad_by_force: read
+                    .bad_by_force
+                    .into_iter()
+                    .filter_map(|v| kept(v, &mut skipped))
+                    .collect(),
             };
             services.insert(name, service);
         }
@@ -258,6 +288,9 @@ fn split(state: &OpsState) -> (OpsState, HaltsFile) {
             })
             .collect();
         kept.halt_generation = std::mem::take(&mut marks.halt_generation);
+        kept.force = marks.force.take();
+        kept.force_generation = std::mem::take(&mut marks.force_generation);
+        kept.bad_by_force = std::mem::take(&mut marks.bad_by_force);
         if kept != ServiceHalts::default() {
             halts.services.insert(name.clone(), kept);
         }
@@ -268,7 +301,8 @@ fn split(state: &OpsState) -> (OpsState, HaltsFile) {
 /// `ops`, read from the ops file, with what `halts` keeps for it joined to it.
 fn join(mut ops: OpsState, halts: HaltsFile) -> OpsState {
     for (name, kept) in halts.services {
-        if kept.halt_generation == 0 && !ops.services.contains_key(&name) {
+        let counts = kept.halt_generation > 0 || kept.force_generation > 0;
+        if !counts && !ops.services.contains_key(&name) {
             continue;
         }
         let marks = ops.services.entry(name).or_default();
@@ -301,6 +335,13 @@ fn join(mut ops: OpsState, halts: HaltsFile) -> OpsState {
                 .collect();
         }
         marks.halt_generation = marks.halt_generation.max(kept.halt_generation);
+        marks.force = kept.force;
+        marks.force_generation = marks.force_generation.max(kept.force_generation);
+        marks.bad_by_force = kept
+            .bad_by_force
+            .into_iter()
+            .filter(|held| marks.bad.contains(held))
+            .collect();
     }
     ops
 }

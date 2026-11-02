@@ -398,6 +398,7 @@ fn an_answer_with_features_names_them_after_the_reply_and_reads_back() {
                 reply: ServiceReply::Nothing,
                 features: Some(vec![]),
                 halts: Default::default(),
+                forced: false,
             },
             r#"{"reply":"nothing","features":[]}"#,
         ),
@@ -409,6 +410,7 @@ fn an_answer_with_features_names_them_after_the_reply_and_reads_back() {
                 },
                 features: Some(vec!["deferred-v1".to_owned()]),
                 halts: Default::default(),
+                forced: false,
             },
             r#"{"reply":"update","service":"db","version":"2.0","features":["deferred-v1"]}"#,
         ),
@@ -440,6 +442,7 @@ fn an_answer_equals_the_reply_it_carries() {
         reply: ServiceReply::Nothing,
         features: Some(vec!["x".to_owned()]),
         halts: Default::default(),
+        forced: false,
     };
     assert_eq!(answer, ServiceReply::Nothing);
     assert_eq!(answer, Reply::Nothing);

@@ -94,8 +94,9 @@ pub struct ServicePorts {
     pub health: Arc<dyn HealthCheck>,
 }
 
-/// An order: the service it names (`None`: `kbf`) and the version.
-type Order = (Option<String>, Version);
+/// An order: the service it names (`None`: `kbf`), the version, and whether it is an
+/// operator's force (the answer says so and the coordinator advertised `forced-v1`).
+type Order = (Option<String>, Version, bool);
 
 /// What the agent keeps for one service: its ports and its state.
 struct Slot {
@@ -325,7 +326,7 @@ impl Agent {
                 scope.spawn(|| self.renewals(renewer.as_ref(), stop));
             }
             for (i, target) in &resumed {
-                self.update(&self.slots[*i], target);
+                self.update(&self.slots[*i], target, false);
             }
             self.updates(stop, &inbox);
         });
@@ -420,10 +421,10 @@ impl Agent {
             }
         };
         match self.send(&beat) {
-            Ok(ServiceReply::Update { service, version }) => {
-                Some((service.filter(|name| name != KBF_SERVICE), version))
+            Ok((ServiceReply::Update { service, version }, forced)) => {
+                Some((service.filter(|name| name != KBF_SERVICE), version, forced))
             }
-            Ok(ServiceReply::Nothing) => None,
+            Ok((ServiceReply::Nothing, _)) => None,
             Err(e) => {
                 self.log(&format!("heartbeat: {e}"));
                 None
@@ -454,17 +455,20 @@ impl Agent {
         beat
     }
 
-    fn send(&self, beat: &Heartbeat) -> Result<ServiceReply, CoordinatorError> {
+    /// The reply, and whether its update is an operator's force: the answer says so and the
+    /// coordinator's last reply advertised `forced-v1`.
+    fn send(&self, beat: &Heartbeat) -> Result<(ServiceReply, bool), CoordinatorError> {
         let coordinator = &self.world.coordinator;
         if !self.announced.is_empty() {
             let answer = coordinator.heartbeat_answer(beat)?;
             self.learn(answer.features.as_deref().unwrap_or_default());
             self.clear_halts(&answer.halts);
-            Ok(answer.reply)
+            Ok((answer.reply, answer.forced && self.features().forced))
         } else if self.slots.len() == 1 {
-            coordinator.heartbeat(beat).map(ServiceReply::from)
+            let reply = coordinator.heartbeat(beat)?;
+            Ok((ServiceReply::from(reply), false))
         } else {
-            coordinator.heartbeat_services(beat)
+            Ok((coordinator.heartbeat_services(beat)?, false))
         }
     }
 
@@ -479,8 +483,8 @@ impl Agent {
         let before = std::mem::replace(&mut *held(&self.advertised), now);
         if before != now {
             self.log(&format!(
-                "the coordinator advertises deferred-v1: {}, halt-v1: {}",
-                now.deferred, now.halt
+                "the coordinator advertises deferred-v1: {}, halt-v1: {}, forced-v1: {}",
+                now.deferred, now.halt, now.forced
             ));
         }
     }
@@ -500,14 +504,14 @@ impl Agent {
                 // The newest order for each service wins; the ones queued behind it were the
                 // same. They run one after the other: the host updates one service at a time.
                 let mut orders = vec![first];
-                for (service, target) in inbox.try_iter() {
-                    match orders.iter_mut().find(|(s, _)| *s == service) {
-                        Some(order) => order.1 = target,
-                        None => orders.push((service, target)),
+                for order in inbox.try_iter() {
+                    match orders.iter_mut().find(|(s, ..)| *s == order.0) {
+                        Some(queued) => *queued = order,
+                        None => orders.push(order),
                     }
                 }
-                for (service, target) in &orders {
-                    self.order(service.as_deref(), target);
+                for (service, target, forced) in &orders {
+                    self.order(service.as_deref(), target, *forced);
                 }
                 idle = Duration::ZERO;
                 continue;
@@ -523,7 +527,10 @@ impl Agent {
     /// An order for `target` of `service` (`None`: `kbf`): run it, unless the service is held
     /// after a halt, or the same target was deferred and its retry time has not come (both only
     /// while the coordinator advertises the feature), or the same target failed a moment ago.
-    pub(super) fn order(&self, service: Option<&str>, target: &Version) {
+    /// A `forced` order is not declined for a deferral (the coordinator bypasses it under force);
+    /// a halt it lifted itself, in the answer that carried the order, and the backoff after a
+    /// failure still holds, so a failing force does not loop hot.
+    pub(super) fn order(&self, service: Option<&str>, target: &Version, forced: bool) {
         let Some(slot) = self.slots.iter().find(|s| s.service.as_deref() == service) else {
             self.log(&format!(
                 "an order for {}, which this agent does not run",
@@ -543,6 +550,7 @@ impl Agent {
             return;
         }
         if features.deferred
+            && !forced
             && let Some(left) = held(&slot.deferral)
                 .as_ref()
                 .filter(|d| d.declines(target, unix))
@@ -568,10 +576,10 @@ impl Agent {
             )));
             return;
         }
-        self.update(slot, target);
+        self.update(slot, target, forced);
     }
 
-    fn update(&self, slot: &Slot, target: &Version) {
+    fn update(&self, slot: &Slot, target: &Version, forced: bool) {
         let log = |line: &str| (self.world.log)(&slot.say(line));
         let update = Update {
             ports: Ports {
@@ -599,7 +607,11 @@ impl Agent {
             .get(slot.unit())
             .copied()
             .unwrap_or(0);
-        let done = update.run_for(target, self.features());
+        let done = if forced {
+            update.run_forced_for(target, self.features())
+        } else {
+            update.run_for(target, self.features())
+        };
         match &done.hold {
             Some(Hold::Deferred { reason }) => self.defer(slot, target, reason),
             Some(Hold::Halt { reason }) => self.halt(slot, reason, seen),

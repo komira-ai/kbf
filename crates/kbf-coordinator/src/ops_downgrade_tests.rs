@@ -20,7 +20,7 @@ use crate::testutil::version;
 /// The reader of the build before this one: its schema types as they were, strict as they
 /// were (`deny_unknown_fields`). Only reading matters, so only `Deserialize` is kept.
 #[allow(dead_code)] // Fields are read by serde only.
-mod previous {
+pub(crate) mod previous {
     use std::collections::BTreeMap;
 
     use kbf_updater::version::Version;
@@ -108,7 +108,7 @@ mod previous {
     }
 
     /// Whether the previous build starts on `text`, its ops file.
-    pub(super) fn reads(text: &str) -> Result<(), String> {
+    pub(crate) fn reads(text: &str) -> Result<(), String> {
         serde_json::from_str::<OpsState>(text)
             .map(|_| ())
             .map_err(|e| e.to_string())
