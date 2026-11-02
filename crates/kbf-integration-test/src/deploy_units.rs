@@ -35,20 +35,6 @@ pub const PLACEHOLDERS: &[(&str, &str)] = &[
     ("<generation>", "7"),
 ];
 
-/// Sample values for the shell variables the held script in a deploy doc passes to
-/// `kbf cluster` (`"$NAME"` or `$NAME`); a variable missing from this table is an
-/// error, as a placeholder is.
-pub const SHELL_VARIABLES: &[(&str, &str)] = &[
-    ("API", "127.0.0.1:8982"),
-    ("TOKEN_FILE", "/etc/kbf/api-token"),
-    ("CONNECTION", "cold"),
-    ("ENDPOINT", "http://store-b.example"),
-    ("EXPECT_GENERATION", "7"),
-    ("FOR_SECS", "900"),
-    ("node_id", "node-1"),
-    ("member_id", "1"),
-];
-
 /// One example unit file.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Unit {
@@ -83,8 +69,6 @@ pub enum UnitError {
     Unclosed(usize),
     /// A placeholder [`PLACEHOLDERS`] does not have.
     Placeholder(String),
-    /// A shell variable [`SHELL_VARIABLES`] does not have, in a `kbf cluster` command.
-    Variable(String),
     /// A unit body (its `ini` block at this line) that is not a unit file.
     Body(usize, kbf_unitfile::UnitError),
 }
@@ -99,12 +83,6 @@ impl fmt::Display for UnitError {
             UnitError::Unclosed(line) => write!(f, "line {line}: the ini block never closes"),
             UnitError::Placeholder(p) => {
                 write!(f, "placeholder {p} has no sample value in PLACEHOLDERS")
-            }
-            UnitError::Variable(v) => {
-                write!(
-                    f,
-                    "shell variable ${v} has no sample value in SHELL_VARIABLES"
-                )
             }
             UnitError::Body(line, e) => write!(f, "the ini block at line {line}: {e}"),
         }
@@ -178,105 +156,6 @@ fn substitute(text: &str) -> Result<String, UnitError> {
     }
     out.push_str(rest);
     Ok(out)
-}
-
-/// One `kbf cluster ...` command line of a doc.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ClusterCommand {
-    /// The 1-based line of the doc it starts on.
-    pub line: usize,
-    /// Its words, the first `kbf` and the second `cluster`, with placeholders and shell
-    /// variables replaced.
-    pub argv: Vec<String>,
-}
-
-/// Every `kbf cluster ...` command in the fenced blocks of `markdown`, in order: the text
-/// from `kbf cluster` (at the start of a word or after a `/`, as in `/usr/bin/kbf`) to the
-/// end of its line, a line ending in `\` joined with the next. Its `<placeholder>`s are
-/// replaced from [`PLACEHOLDERS`] first; then it is cut at the first `)`, `|`, `;`, `&`,
-/// `>` or backtick, so a command inside `$(...)` or before a pipe or an output redirection
-/// is read alone (a `<` after a command is read as a placeholder, and refused unless it is
-/// one); then `$NAME` is replaced from [`SHELL_VARIABLES`] and double quotes are
-/// dropped. A comment line (`#` first) is skipped.
-pub fn cluster_commands(markdown: &str) -> Result<Vec<ClusterCommand>, UnitError> {
-    let mut out = Vec::new();
-    let mut fenced = false;
-    let mut joined = String::new();
-    let mut start = 0;
-    for (i, line) in markdown.lines().enumerate() {
-        if line.trim_start().starts_with("```") {
-            fenced = !fenced;
-            joined.clear();
-            continue;
-        }
-        if !fenced || line.trim_start().starts_with('#') {
-            continue;
-        }
-        if joined.is_empty() {
-            start = i + 1;
-        }
-        match line.trim_end().strip_suffix('\\') {
-            Some(head) => {
-                joined.push_str(head);
-                joined.push(' ');
-                continue;
-            }
-            None => joined.push_str(line),
-        }
-        let logical = std::mem::take(&mut joined);
-        for (at, _) in logical.match_indices("kbf cluster") {
-            let before = logical[..at].chars().next_back();
-            let after = logical[at + "kbf cluster".len()..].chars().next();
-            if before.is_some_and(|c| !c.is_whitespace() && c != '/' && c != '(')
-                || after.is_some_and(|c| !c.is_whitespace())
-            {
-                continue;
-            }
-            // Placeholders first: their own `<` and `>` are not a redirection.
-            let rest = substitute(&logical[at..])?;
-            let end = rest
-                .find([')', '|', ';', '&', '>', '`'])
-                .unwrap_or(rest.len());
-            // The descriptor a redirection starts with (the `2` of `2>&1`: a word of digits
-            // only, right before the `>`) is not a word of the command.
-            let mut cmd = &rest[..end];
-            let digits = cmd.trim_end_matches(|c: char| c.is_ascii_digit());
-            if rest[end..].starts_with('>')
-                && digits.len() < cmd.len()
-                && digits.ends_with(char::is_whitespace)
-            {
-                cmd = digits;
-            }
-            let text = variables(cmd)?;
-            out.push(ClusterCommand {
-                line: start,
-                argv: text.split_whitespace().map(str::to_owned).collect(),
-            });
-        }
-    }
-    Ok(out)
-}
-
-/// `text` with each `$NAME` replaced from [`SHELL_VARIABLES`] and double quotes dropped.
-fn variables(text: &str) -> Result<String, UnitError> {
-    let mut out = String::new();
-    let mut rest = text;
-    while let Some(dollar) = rest.find('$') {
-        let name_len = rest[dollar + 1..]
-            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-            .unwrap_or(rest.len() - dollar - 1);
-        let name = &rest[dollar + 1..dollar + 1 + name_len];
-        let value = SHELL_VARIABLES
-            .iter()
-            .find(|(v, _)| *v == name)
-            .ok_or_else(|| UnitError::Variable(name.to_owned()))?
-            .1;
-        out.push_str(&rest[..dollar]);
-        out.push_str(value);
-        rest = &rest[dollar + 1 + name_len..];
-    }
-    out.push_str(rest);
-    Ok(out.replace('"', ""))
 }
 
 /// The lines of every fenced block whose info string is `info` exactly.
@@ -411,110 +290,6 @@ ExecStart=/usr/local/bin/b \\
         assert_eq!(
             e.as_deref(),
             Some("the ini block at line 2: line 2: not [Section], a comment or Key=value")
-        );
-    }
-
-    fn argvs(doc: &str) -> Vec<(usize, String)> {
-        cluster_commands(doc)
-            .expect("commands")
-            .into_iter()
-            .map(|c| (c.line, c.argv.join(" ")))
-            .collect()
-    }
-
-    #[test]
-    fn cluster_commands_are_read_from_fenced_blocks_only_with_values_replaced() {
-        // Catches: a command in prose read as a command line, a placeholder or a shell
-        // variable passed through, a continued line read as two commands, a command
-        // after a path prefix missed, a comment line read, a block's state carried past
-        // its closing fence.
-        let doc = "\
-Run `kbf cluster status` first.
-
-```text
-kbf cluster drain <node> --token-file /etc/kbf/api-token
-sudo /usr/bin/kbf cluster object-store repoint --connection <connection> \\
-    --endpoint <new endpoint URL> --expect-generation <generation>
-# kbf cluster not-a-command
-```
-
-```bash
-run kbf cluster --api \"$API\" undrain \"$node_id\" --token-file \"$TOKEN_FILE\"
-x=\"$(kbf cluster status | jq .nodes)\"; kbf cluster member $member_id --state active 2>&1
-mykbf cluster status
-kbf clusters
-kbf cluster
-```
-";
-        assert_eq!(
-            argvs(doc),
-            [
-                (
-                    4,
-                    "kbf cluster drain node-1 --token-file /etc/kbf/api-token".to_owned()
-                ),
-                (
-                    5,
-                    "kbf cluster object-store repoint --connection cold --endpoint \
-                     http://store-b.example --expect-generation 7"
-                        .to_owned()
-                ),
-                (
-                    11,
-                    "kbf cluster --api 127.0.0.1:8982 undrain node-1 --token-file \
-                     /etc/kbf/api-token"
-                        .to_owned()
-                ),
-                (12, "kbf cluster status".to_owned()),
-                (12, "kbf cluster member 1 --state active".to_owned()),
-                (15, "kbf cluster".to_owned()),
-            ]
-        );
-    }
-
-    #[test]
-    fn only_a_whole_word_of_digits_before_a_redirection_is_its_descriptor() {
-        // Catches: the `2` of `2>&1` passed to the parser as a word, and the digits that
-        // end a real word (`node9>out`) or a plain `>out` cut from the command.
-        let doc = "```\nkbf cluster drain n 2>&1\nkbf cluster drain node9>out\n\
-                   kbf cluster drain n >out\n```\n";
-        assert_eq!(
-            argvs(doc),
-            [
-                (2, "kbf cluster drain n".to_owned()),
-                (3, "kbf cluster drain node9".to_owned()),
-                (4, "kbf cluster drain n".to_owned()),
-            ]
-        );
-    }
-
-    #[test]
-    fn a_continued_line_left_open_by_its_fence_is_dropped() {
-        // Catches: the half line before a closing fence glued to the next block's first
-        // command.
-        let doc = "```\nkbf cluster drain \\\n```\n```\nkbf cluster undrain n\n```\n";
-        assert_eq!(argvs(doc), [(5, "kbf cluster undrain n".to_owned())]);
-    }
-
-    #[test]
-    fn an_unknown_placeholder_or_shell_variable_in_a_command_is_an_error() {
-        // Catches: a value with no sample reaching the parser as text, where it might
-        // parse by luck and hide a wrong flag after it.
-        assert_eq!(
-            cluster_commands("```\nkbf cluster drain <who>\n```\n"),
-            Err(UnitError::Placeholder("<who>".into()))
-        );
-        assert_eq!(
-            cluster_commands("```\nkbf cluster drain \"$WHO\"\n```\n"),
-            Err(UnitError::Variable("WHO".into()))
-        );
-        assert_eq!(
-            cluster_commands("```\nkbf cluster drain $\n```\n"),
-            Err(UnitError::Variable(String::new()))
-        );
-        assert_eq!(
-            UnitError::Variable("WHO".into()).to_string(),
-            "shell variable $WHO has no sample value in SHELL_VARIABLES"
         );
     }
 
