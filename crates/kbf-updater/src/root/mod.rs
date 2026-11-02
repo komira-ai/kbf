@@ -707,11 +707,11 @@ impl Stop {
 /// declarations, serves the registrations, runs the start pass of every service, then binds the
 /// agent's socket, calls `ready` and answers the agent until stopped. Exit 1 with the reason when
 /// it cannot start.
-pub fn run_config(
+pub fn run_config<'a>(
     flags: &flags::Flags,
     config: Config,
     parts: Parts,
-    ready: impl FnOnce(Stop) + '_,
+    ready: impl FnOnce(Stop) + 'a,
 ) -> (u8, String) {
     run_ready(flags, config, parts, Box::new(ready))
 }
