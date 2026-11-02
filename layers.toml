@@ -1,0 +1,21 @@
+# Groups of crates kept apart from the rest of the workspace by declaration, checked by
+# crates/kbf-integration-test/tests/mdm_layering.rs. The farm's own layering (the pure crates,
+# the server and daemon split, the storage and proxy rules) is in tests/layering.rs.
+#
+# A group's crates may depend (normal, optional, dev or build) on no crate of this workspace
+# but the ones their `may_link` row names, which must be crates of the group; no crate outside
+# the group may depend on one of them; a crate listed in `pure` reaches no async runtime,
+# network or random-source crate and denies the clippy.toml lists in its lib.rs; and the
+# crates listed in `farm` are refused by name, in either direction. A crate added to a group is
+# added here in the same change.
+
+# The MDM host layer: one binary (`mdm-host`) beside the update coordinator, never part of
+# the `kbf` binary, kept ready to leave this repository with the coordinator.
+[mdm]
+farm = ["kbf-server", "kbf-cli"]
+pure = ["mdm-core"]
+
+[mdm.may_link]
+mdm-core = []
+host-step = []
+mdm-host = ["mdm-core", "host-step"]

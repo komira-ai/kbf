@@ -22,6 +22,13 @@ allow = [
 ]
 confidence-threshold = 0.93
 
+# The Mozilla root set bundled by webpki-roots, which mdm-host's downloads trust (the roots it
+# trusted before it moved here; no host store or environment variable can change them). A
+# permissive data licence, allowed for this one crate.
+[[licenses.exceptions]]
+crate = "webpki-roots"
+allow = ["CDLA-Permissive-2.0"]
+
 [licenses.private]
 # Workspace crates are not published; their licence is the workspace's Apache-2.0.
 ignore = true
