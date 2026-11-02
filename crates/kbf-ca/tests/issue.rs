@@ -642,6 +642,37 @@ fn a_signed_scheduler_certificate_verifies_against_the_pin_with_ip_and_dns() {
     as_client(&[ca.root_der()], &[&issued.der]).expect_err("it dials nobody");
 }
 
+// Catches: a scheduler certificate that does not serve under an ordinary unicast IPv6
+// address: the name is carried as an IPv6 address, and webpki accepts the certificate as a
+// TLS server under that address (alone, and beside an IPv4 address and a DNS name).
+#[test]
+fn a_signed_scheduler_certificate_serves_under_an_ipv6_address() {
+    let ca = authority();
+    let alone = ca
+        .issue_scheduler(&["2001:db8::7"], &key(), NOW, &mut Stream(8))
+        .expect("issued");
+    let v = view(&alone.der);
+    assert_eq!(
+        v.ips.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        ["2001:db8::7"]
+    );
+    assert!(v.dns.is_empty());
+    assert!(v.server_auth && !v.client_auth);
+    as_server(&[ca.root_der()], &[&alone.der], "2001:db8::7").expect("serves its address");
+    as_server(&[ca.root_der()], &[&alone.der], "2001:db8::8").expect_err("no other address");
+    let mixed = ca
+        .issue_scheduler(
+            &["192.0.2.7", "2001:db8::7", "sched.example.com"],
+            &key(),
+            NOW,
+            &mut Stream(9),
+        )
+        .expect("issued");
+    for name in ["192.0.2.7", "2001:db8::7", "sched.example.com"] {
+        as_server(&[ca.root_der()], &[&mixed.der], name).expect(name);
+    }
+}
+
 // Catches: a scheduler certificate a node would admit as a role it serves (the storage
 // service reads the role from the certificate), or that passes as the frontend's.
 #[test]

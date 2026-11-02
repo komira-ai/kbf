@@ -5,6 +5,11 @@
 
 mod support;
 
+/// The signer of the previous release: its validator, preserved as it was.
+#[allow(dead_code, unreachable_pub)]
+#[path = "fixtures/validate_before_scheduler.rs"]
+mod prior;
+
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::{Arc, OnceLock};
 
@@ -67,6 +72,55 @@ fn the_scheduler_certificate_is_signed_on_the_frontend_route() {
         scheduler(with_names(vec![dns("x.example")]), |_| {}),
         Ok(())
     );
+}
+
+// Catches: a validator that refuses every IPv6 address (the refusals below name only the
+// unspecified and multicast ones): an ordinary unicast IPv6 address is signed, alone, with
+// an IPv4 address, and with a name.
+#[test]
+fn the_scheduler_certificate_is_signed_for_an_ipv6_address() {
+    let ca = ca();
+    for names in [
+        &["2001:db8::7"][..],
+        &["192.0.2.7", "2001:db8::7"],
+        &["2001:db8::7", "sched.example"],
+    ] {
+        let tbs = support::scheduler_tbs(ca, names);
+        assert_eq!(check(&tbs, Route::Frontend), Ok(()), "{names:?}");
+    }
+}
+
+// Catches: the rollout order resting on a guess. A signer of the previous release (its
+// validator, preserved) refuses the scheduler's certificate with `RoleUri` on either route,
+// so a frontend that asks before the signer is rolled gets a refusal, never a certificate
+// of another shape; and it still signs the frontend's own certificate, which this change
+// leaves as it was, so rolling the signer first breaks nothing.
+#[test]
+fn a_signer_of_the_previous_release_refuses_the_scheduler_and_signs_the_frontend() {
+    let ca = ca();
+    let before =
+        |tbs: &[u8], route| prior::check_tbs(tbs, route, Policy::default(), &ca.root_subject, NOW);
+    for names in [
+        &["192.0.2.7", "sched.example"][..],
+        &["192.0.2.7"],
+        &["2001:db8::7"],
+    ] {
+        let tbs = support::scheduler_tbs(ca, names);
+        assert_eq!(
+            before(&tbs, prior::Route::Frontend),
+            Err(prior::Refusal::RoleUri),
+            "{names:?}"
+        );
+        assert_eq!(
+            before(&tbs, prior::Route::Node),
+            Err(prior::Refusal::RoleUri),
+            "{names:?}"
+        );
+        assert_eq!(check(&tbs, Route::Frontend), Ok(()), "{names:?}");
+    }
+    let frontend = support::frontend_tbs(ca);
+    assert_eq!(before(&frontend, prior::Route::Frontend), Ok(()));
+    assert_eq!(check(&frontend, Route::Frontend), Ok(()));
 }
 
 // Catches: the node route minting a scheduler certificate: a token-holding node could
@@ -241,7 +295,7 @@ fn the_socket_signs_a_scheduler_certificate_on_the_frontend_route_only() {
         let client = Arc::new(SocketSigner::connect(&socket, route).expect("connect"));
         let authority = Authority::import(client, Policy::default(), &ca.root).expect("authority");
         authority.issue_scheduler(
-            &["192.0.2.7", "sched.example"],
+            &["192.0.2.7", "2001:db8::7", "sched.example"],
             &fresh_key(),
             NOW,
             &mut support::Stream(4),
