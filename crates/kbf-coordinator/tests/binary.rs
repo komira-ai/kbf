@@ -331,7 +331,7 @@ fn a_pool_with_a_release_before_pools_kept_stops_the_start() {
     let files = Files::new("bin-pool-rollback");
     let mut flags = services_flags(&files, POOLED);
     flags.extend([
-        "--rollback-target=0.0.59".to_owned(),
+        "--rollback-target=0.0.60".to_owned(),
         "--rollback-target=0.0.57".to_owned(),
     ]);
     let (code, stdout, stderr) = run(&flags);
@@ -339,7 +339,7 @@ fn a_pool_with_a_release_before_pools_kept_stops_the_start() {
     assert_eq!(
         stderr.trim_end(),
         "kbf-coordinator: --services-file: services: tierstore: pool \"storage\" on storage: \
-         the rollback target 0.0.57 (--rollback-target) is a release before 0.0.59 and refuses \
+         the rollback target 0.0.57 (--rollback-target) is a release before 0.0.60 and refuses \
          the field `pool`; remove the pool, or the target once its image is no longer kept"
     );
 }
@@ -351,7 +351,7 @@ fn a_pool_with_only_releases_that_read_pools_kept_starts() {
     let stderr = stderr_of_a_start_with_flags(
         "bin-pool-rollback-ok",
         POOLED,
-        &["--rollback-target=0.0.59"],
+        &["--rollback-target=0.0.60"],
     );
     assert!(!stderr.contains("rollback"), "{stderr}");
     let stderr = stderr_of_a_start_with("bin-pool-rollback-none", POOLED);

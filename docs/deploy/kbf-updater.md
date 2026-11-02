@@ -743,9 +743,9 @@ not add a pool to the file before that.
 The coordinator checks the second step for the releases it is told about. Pass
 `--rollback-target=<version>` once for each coordinator release whose image is kept to go back to
 (`--rollback-target=0.0.57`). A services file that names a pool then stops the start while any of
-them is a release before 0.0.59 (the first that reads pools) or is not a release version (a bare
+them is a release before 0.0.60 (the first that reads pools) or is not a release version (a bare
 commit id, a tag word): `--services-file: services: tierstore: pool "storage" on storage: the
-rollback target 0.0.57 (--rollback-target) is a release before 0.0.59 and refuses the field
+rollback target 0.0.57 (--rollback-target) is a release before 0.0.60 and refuses the field
 `pool`; ...`. Remove the pool, or drop the target once its image is no longer kept. A file with no
 pool, and kbf's built-in storage pool, are never refused. Without the flag nothing is checked: the
 list is what the operator declares, not what the host holds.
