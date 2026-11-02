@@ -12,9 +12,11 @@
 //! - markers that cannot delimit the core: each of the two is a line of its own, exactly
 //!   once, the begin before the end;
 //! - a `CLAUDE.md` that no longer imports `AGENTS.md`: a line that is exactly
-//!   `@AGENTS.md`, outside a fenced code block of backticks or tildes (an import inside a
-//!   fence, inside a sentence or with anything after it, a carriage return included, is
-//!   not read as one).
+//!   `@AGENTS.md`, outside a fenced code block of backticks or tildes and outside an
+//!   inline code span, which may run over several lines of a paragraph (an import inside
+//!   a fence or a span, inside a sentence or with anything after it, a carriage return
+//!   included, is not read as one; a fence closes only on a line with nothing after it
+//!   but spaces and tabs).
 
 use sha2::{Digest, Sha256};
 
@@ -114,10 +116,13 @@ fn hash_matches(copy: &[u8], hash_file: &str) -> Result<(), String> {
     }
 }
 
-/// Whether `claude` has a line that is exactly `@AGENTS.md` outside a fenced code block.
+/// Whether `claude` has a line that is exactly `@AGENTS.md` outside a fenced code block
+/// and outside an inline code span (which may run over several lines of a paragraph).
 fn imports_agents(claude: &str) -> bool {
     // The open fence: its character and length; a closing fence is at least as long.
     let mut fence: Option<(char, usize)> = None;
+    // The lines of the paragraph being read: code spans do not cross a paragraph's end.
+    let mut para: Vec<&str> = Vec::new();
     for (_, line, _, _) in lines(claude) {
         let t = line.trim_start_matches(' ');
         let lead = line.len() - t.len();
@@ -129,15 +134,75 @@ fn imports_agents(claude: &str) -> bool {
             && run >= 3
             && !(ch == Some('`') && t[run..].contains('`'));
         match (fence, is_fence) {
-            (None, true) => fence = ch.map(|c| (c, run)),
-            (Some((c, n)), true) if ch == Some(c) && run >= n && t[run..].trim().is_empty() => {
+            (None, true) => {
+                if paragraph_imports(&para) {
+                    return true;
+                }
+                para.clear();
+                fence = ch.map(|c| (c, run));
+            }
+            // A closing fence has nothing after it but spaces and tabs.
+            (Some((c, n)), true)
+                if ch == Some(c) && run >= n && t[run..].chars().all(|x| x == ' ' || x == '\t') =>
+            {
                 fence = None
             }
-            (None, false) if line == IMPORT => return true,
+            (None, false) if line.chars().all(|x| x == ' ' || x == '\t') => {
+                if paragraph_imports(&para) {
+                    return true;
+                }
+                para.clear();
+            }
+            (None, false) => para.push(line),
             _ => {}
         }
     }
-    false
+    paragraph_imports(&para)
+}
+
+/// Whether a line of the paragraph is exactly `@AGENTS.md` and starts outside every code
+/// span: a run of backticks opens one, the next run of the same length closes it, and a
+/// run with no such match is plain text.
+fn paragraph_imports(para: &[&str]) -> bool {
+    let text = para.join("\n");
+    let b = text.as_bytes();
+    let run_at = |i: usize| b[i..].iter().take_while(|&&x| x == b'`').count();
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'`' {
+            i += 1;
+            continue;
+        }
+        let n = run_at(i);
+        let mut j = i + n;
+        let mut close = None;
+        while j < b.len() {
+            if b[j] == b'`' {
+                let m = run_at(j);
+                if m == n {
+                    close = Some(j);
+                    break;
+                }
+                j += m;
+            } else {
+                j += 1;
+            }
+        }
+        match close {
+            Some(c) => {
+                spans.push((i, c + n));
+                i = c + n;
+            }
+            None => i += n,
+        }
+    }
+    let mut start = 0;
+    para.iter().any(|line| {
+        let at = start;
+        start += line.len() + 1;
+        *line == IMPORT && !spans.iter().any(|&(a, z)| a < at && at < z)
+    })
 }
 
 fn read(rel: &str) -> String {
@@ -299,6 +364,21 @@ fn claude_md_imports_agents_md_only_by_a_line_of_its_own_outside_a_fence() {
         "```\ncode\n```\n@AGENTS.md\n",
         "~~~~\n```\n~~~~\n@AGENTS.md\n",
         "````\n```\n````\n@AGENTS.md\n",
+        // A closing fence may end in spaces and tabs.
+        "```\n```  \n@AGENTS.md\n",
+        "```\n```\t\n@AGENTS.md\n",
+        "~~~\n~~~ \t \n@AGENTS.md\n",
+        // After a matched code span, the import counts.
+        "``\nx\n``\n@AGENTS.md\n",
+        "``\nx\n``\n\n@AGENTS.md\n",
+        // Runs of different lengths do not match: the opener is plain text.
+        "``\n@AGENTS.md\n`\n",
+        "``\n@AGENTS.md\n```x\n",
+        // A span opener with no closer in its paragraph is plain text, and a blank line
+        // or a fence ends the paragraph.
+        "``\n@AGENTS.md\n",
+        "``\n\n@AGENTS.md\n``\n",
+        "``\n~~~\n~~~\n@AGENTS.md\n``\n",
     ] {
         assert!(imports_agents(good), "{good:?}");
     }
@@ -322,6 +402,14 @@ fn claude_md_imports_agents_md_only_by_a_line_of_its_own_outside_a_fence() {
         "```\n``` x\n@AGENTS.md\n",
         // A fence never closed holds the rest of the file.
         "```\n@AGENTS.md\n",
+        // A closing fence followed by anything but spaces and tabs does not close.
+        "```\n```\u{a0}\n@AGENTS.md\n",
+        "```\n```\u{3000}\n@AGENTS.md\n",
+        "```\n```\r\n@AGENTS.md\n",
+        // An inline code span over several lines holds the import.
+        "``\n@AGENTS.md\n``\n",
+        "`\n@AGENTS.md\n`\n",
+        "see ``a\n@AGENTS.md\nb`` here\n",
     ] {
         assert!(!imports_agents(bad), "{bad:?}");
     }
