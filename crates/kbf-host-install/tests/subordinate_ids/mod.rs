@@ -78,16 +78,21 @@ impl Drop for SubIds {
     }
 }
 
-/// `text` without the `appended` text: cut off its end when the file still ends with it,
-/// else its line taken out where it is; `None` when the line is not there (it was never
-/// written, or was taken out already).
+/// `text` without the `appended` text: cut off its end when the file still ends with it as
+/// whole lines, else its line taken out where it is as a whole line; `None` when no whole line
+/// is the rehearsal's (it was never written, was taken out already, or another account's line
+/// only ends the same way).
 fn without_appended(text: &str, appended: &str) -> Option<String> {
-    if let Some(before) = text.strip_suffix(appended) {
+    let starts_line = |at: usize| at == 0 || text.as_bytes()[at - 1] == b'\n';
+    if let Some(before) = text.strip_suffix(appended)
+        && (appended.starts_with('\n') || starts_line(before.len()))
+    {
         return Some(before.to_owned());
     }
     let line = appended.trim_start_matches('\n');
-    text.find(line)
-        .filter(|at| *at == 0 || text.as_bytes()[at - 1] == b'\n')
+    text.match_indices(line)
+        .map(|(at, _)| at)
+        .find(|at| starts_line(*at))
         .map(|at| format!("{}{}", &text[..at], &text[at + line.len()..]))
 }
 
@@ -245,6 +250,43 @@ mod tests {
             None
         );
         assert_eq!(without_appended("runner:100000:65536\n", ours), None);
+
+        // Appended with no newline before it (the file ended with one): another account whose
+        // name ends the same way, put in the rehearsal's place as the last line, is not cut.
+        let ours = "kbf-rehearsal:196608:65536\n";
+        let other = "runner:100000:65536\nx-kbf-rehearsal:196608:65536\n";
+        assert_eq!(without_appended(other, ours), None);
+        assert_eq!(
+            without_appended("x-kbf-rehearsal:196608:65536\n", ours),
+            None
+        );
+        // The rehearsal's own line after such a line is still found, whole.
+        assert_eq!(
+            without_appended(
+                "x-kbf-rehearsal:196608:65536\nkbf-rehearsal:196608:65536\nz:1:1\n",
+                ours
+            )
+            .as_deref(),
+            Some("x-kbf-rehearsal:196608:65536\nz:1:1\n")
+        );
+        assert_eq!(
+            without_appended("runner:100000:65536\nkbf-rehearsal:196608:65536\n", ours).as_deref(),
+            Some("runner:100000:65536\n")
+        );
+        assert_eq!(without_appended(ours, ours).as_deref(), Some(""));
+
+        // Through the guard: the rehearsal's line, replaced by another writer with the similar
+        // account's, leaves the whole file as that writer left it.
+        let dir = kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), "subids-similar");
+        let uid = dir.path().join("subuid");
+        fs::write(&uid, "runner:100000:65536\n").unwrap();
+        let guard = SubIds::add(&[&uid], "kbf-rehearsal").unwrap();
+        let replaced = fs::read_to_string(&uid)
+            .unwrap()
+            .replace("kbf-rehearsal:", "x-kbf-rehearsal:");
+        fs::write(&uid, &replaced).unwrap();
+        drop(guard);
+        assert_eq!(fs::read_to_string(&uid).unwrap(), replaced);
 
         let dir = kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), "subids-other");
         let uid = dir.path().join("subuid");
