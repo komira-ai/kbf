@@ -121,14 +121,15 @@ fn hash_matches(copy: &[u8], hash_file: &str) -> Result<(), String> {
 /// code span, a heading or an HTML block, and not quoted, indented or followed by anything.
 fn imports_agents(claude: &str) -> bool {
     use pulldown_cmark::{Event, Parser, Tag, TagEnd};
-    let b = claude.as_bytes();
+    let text = fence_tails_trimmed(claude);
+    let b = text.as_bytes();
     // CommonMark's line endings: LF, CR LF and a lone CR.
     let whole_line = |r: &std::ops::Range<usize>| {
         (r.start == 0 || matches!(b[r.start - 1], b'\n' | b'\r'))
             && (r.end == b.len() || matches!(b[r.end], b'\n' | b'\r'))
     };
     let mut in_paragraph = false;
-    for (event, range) in Parser::new(claude).into_offset_iter() {
+    for (event, range) in Parser::new(&text).into_offset_iter() {
         match event {
             Event::Start(Tag::Paragraph) => in_paragraph = true,
             Event::End(TagEnd::Paragraph) => in_paragraph = false,
@@ -137,6 +138,39 @@ fn imports_agents(claude: &str) -> bool {
         }
     }
     false
+}
+
+/// `text` with the spaces and tabs removed from the end of every fence line (up to three
+/// spaces, then three or more backticks or tildes, then only spaces and tabs). CommonMark
+/// lets a closing fence end in spaces and tabs, but pulldown-cmark 0.13 does not close a
+/// fence on a tab; without this, a later fence line would close the block in its place.
+/// The other lines, and every line ending, are kept as they are.
+fn fence_tails_trimmed(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while !rest.is_empty() {
+        let end = rest.find(['\n', '\r']).unwrap_or(rest.len());
+        let (line, after) = rest.split_at(end);
+        let eol = if after.starts_with("\r\n") {
+            2
+        } else {
+            usize::from(!after.is_empty())
+        };
+        let body = line.trim_end_matches([' ', '\t']);
+        let t = body.trim_start_matches(' ');
+        let run = t.chars().next().map_or(0, |c| {
+            if c == '`' || c == '~' {
+                t.chars().take_while(|&x| x == c).count()
+            } else {
+                0
+            }
+        });
+        let is_fence_line = body.len() - t.len() <= 3 && run >= 3 && run == t.len();
+        out.push_str(if is_fence_line { body } else { line });
+        out.push_str(&after[..eol]);
+        rest = &after[eol..];
+    }
+    out
 }
 
 fn read(rel: &str) -> String {
@@ -301,6 +335,9 @@ fn claude_md_imports_agents_md_only_by_a_line_of_its_own_outside_a_fence() {
         // A closing fence may end in spaces and tabs.
         "```\n```  \n@AGENTS.md\n",
         "~~~\n~~~   \n@AGENTS.md\n",
+        "```\n```\t\n@AGENTS.md\n",
+        "```\n``` \t \n@AGENTS.md\n",
+        "~~~\n~~~\t\t\r\n@AGENTS.md\r\n",
         // CR LF and a lone CR end a line as LF does.
         "@AGENTS.md\r\n",
         "x\r@AGENTS.md\r",
@@ -345,10 +382,11 @@ fn claude_md_imports_agents_md_only_by_a_line_of_its_own_outside_a_fence() {
         "```\n``` x\n@AGENTS.md\n",
         // A fence never closed holds the rest of the file.
         "```\n@AGENTS.md\n",
-        // A closing fence followed by anything but spaces does not close. (CommonMark
-        // also allows tabs there; pulldown-cmark 0.13 does not close on one, so the lint
-        // refuses such an import: stricter than the spec, never laxer.)
-        "```\n```\t\n@AGENTS.md\n",
+        // A closing fence ending in a tab closes, so the next fence opens a block that
+        // holds the import.
+        "```\n```\t\n```\n@AGENTS.md\n",
+        "~~~\n~~~ \t\n~~~\n@AGENTS.md\n",
+        // A closing fence followed by anything but spaces and tabs does not close.
         "```\n```\u{a0}\n@AGENTS.md\n",
         "```\n```\u{3000}\n@AGENTS.md\n",
         // An inline code span over several lines holds the import.
@@ -380,4 +418,28 @@ fn a_fence_is_indented_at_most_three_spaces() {
     // fence's info string may hold one.
     assert!(imports_agents("```a`b\n@AGENTS.md\n"));
     assert!(!imports_agents("~~~a`b\n@AGENTS.md\n"));
+}
+
+/// Catches the fence-tail trim reaching past fence lines: only a line that is a fence run
+/// (indented at most three spaces) loses its trailing spaces and tabs, and every line
+/// ending (LF, CR LF, a lone CR) and every other line is kept byte for byte.
+#[test]
+fn only_fence_lines_lose_their_trailing_spaces_and_tabs() {
+    for (input, want) in [
+        ("```\t\n", "```\n"),
+        ("   ~~~ \t\r\n", "   ~~~\r\n"),
+        ("````\t\r", "````\r"),
+        ("```\t", "```"),
+        ("x\n```  \nx", "x\n```\nx"),
+        ("@AGENTS.md \t\n", "@AGENTS.md \t\n"),
+        ("    ```\t\n", "    ```\t\n"),
+        ("``\t\n", "``\t\n"),
+        ("```x\t\n", "```x\t\n"),
+        ("`~~\t\n", "`~~\t\n"),
+        ("```\u{a0}\n", "```\u{a0}\n"),
+        ("", ""),
+        ("\n\r\n\r", "\n\r\n\r"),
+    ] {
+        assert_eq!(fence_tails_trimmed(input), want, "{input:?}");
+    }
 }
