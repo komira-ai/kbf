@@ -1,0 +1,13 @@
+# kbf-mdm.slice: the caps of every kbf-mdm service on the dev box (NanoHUB, the
+# SCEP server, NanoDEP, the HTTPS proxy, the certificate job), rendered by
+# `kbf-deploy mdm install` into /etc/systemd/system/. Edit the template,
+# not the installed copy. Past MemoryMax the slice's processes are OOM-killed
+# inside it; the box and other sessions stay up.
+[Unit]
+Description=kbf-mdm services on the dev box (capped)
+
+[Slice]
+MemoryMax=@MEMORY_MAX@
+MemorySwapMax=0
+CPUQuota=@CPU_QUOTA@
+TasksMax=@TASKS_MAX@

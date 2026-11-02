@@ -62,6 +62,9 @@ http-body-util = "0.1.5"
 # HTTP-date text of `Date` and `Last-Modified` (tierstore-bench's fault proxy). Already in the
 # tree through hyper.
 httpdate = "1.0.3"
+# The kernel's random source behind the MDM host layer's secrets (mdm-host); already in the
+# tree through ring.
+getrandom = "0.2.17"
 # `wait4` and `kill` for a measured child process (kbf-daemon's `usage` module); the
 # standard library reaps children without returning their resource usage.
 libc = "0.2.190"
@@ -124,6 +127,9 @@ prost-types = "0.14.4"
 # Message-only code for a proto with no gRPC service (kbf-invocation). Already in the
 # tree through tonic-prost-build.
 prost-build = "0.14.4"
+# The CommonMark parser that reads CLAUDE.md in kbf-integration-test's `agents_md` lint. Already
+# in the tree through prost-build; no default features: no HTML rendering, no getopts.
+pulldown-cmark = { version = "0.13.5", default-features = false }
 # The RFC 8187 `filename*` of the blob route's Content-Disposition (kbf-server). Already in
 # the tree through axum.
 percent-encoding = "2.3.2"
@@ -200,8 +206,9 @@ tracing = "0.1.44"
 tracing-core = "0.1.36"
 tracing-subscriber = "0.3.23"
 # HTTPS downloads for `cargo xtask fetch`, over the rustls (ring) above: no provider
-# feature, so neither aws-lc-rs nor the bundled webpki roots (CDLA licence) come in;
-# the agent is given ring and the host's roots.
+# feature, so aws-lc-rs does not come in; the agent is given ring and the host's roots.
+# mdm-host alone turns on `rustls-webpki-roots` (the bundled public roots, CDLA licence,
+# allowed for that crate only in deny.toml).
 ureq = { version = "3.4.2", default-features = false, features = ["rustls-no-provider"] }
 # Reads the fields of a peer's client certificate the listeners check (its role URI, DNS
 # and IP subjectAltNames, serial and public key: kbf-peer, the one reader); TLS has
@@ -260,6 +267,7 @@ kbf-sched = { path = "crates/kbf-sched" }
 kbf-seatbelt = { path = "crates/kbf-seatbelt" }
 kbf-segments = { path = "crates/kbf-segments" }
 kbf-server = { path = "crates/kbf-server" }
+kbf-retain = { path = "crates/kbf-retain" }
 kbf-setup = { path = "crates/kbf-setup" }
 kbf-signer = { path = "crates/kbf-signer" }
 kbf-sim = { path = "crates/kbf-sim" }
@@ -287,6 +295,10 @@ update-hook = { path = "crates/update-hook" }
 # The declaration loader, the widening comparer, the approval record and the transient-unit launcher
 # of the host updater; depends on update-hook alone (kbf-integration-test keeps it so).
 update-rights = { path = "crates/update-rights" }
+# The MDM host layer: the pure renderer, the host-step planner and the `mdm-host` binary. They link
+# no other workspace crate, and the farm links none of them (kbf-integration-test's `mdm_layering`).
+host-step = { path = "crates/host-step" }
+mdm-core = { path = "crates/mdm-core" }
 # The CI verbs (`cargo xtask`); kbf-integration-test reads the interpreter budget with its parser.
 xtask = { path = "crates/xtask" }
 

@@ -90,8 +90,8 @@ mod yaml;
 mod jobs;
 pub use jobs::{
     concurrency, job_env, job_environment, job_has_key, job_matrix, job_name, job_needs,
-    job_outputs, job_permission_levels, job_uses, job_with, push_filters, top_defaults_shell,
-    top_env, trigger_filters,
+    job_outputs, job_permission_levels, job_runs_on, job_strings, job_uses, job_with, push_filters,
+    top_defaults_shell, top_env, trigger_filters,
 };
 
 use yaml::{Node, Value};
@@ -345,6 +345,20 @@ pub fn job_names(text: &str) -> Result<Vec<String>, String> {
     Ok(jobs
         .iter()
         .filter_map(|(k, _)| k.as_str().map(str::to_owned))
+        .collect())
+}
+
+/// The names of the jobs of a workflow text with the 1-based line each key starts on, in file
+/// order, however the keys are spelt (quoted or plain) and whatever comments surround them. An
+/// error when [`job_names`] would give one.
+pub fn job_lines(text: &str) -> Result<Vec<(String, usize)>, String> {
+    let root = yaml::load(text)?;
+    let Some(Value::Map(jobs)) = get(top_of(&root)?, "jobs").map(|j| &j.value) else {
+        return Err("the workflow has no `jobs` mapping".to_owned());
+    };
+    Ok(jobs
+        .iter()
+        .filter_map(|(k, _)| k.as_str().map(|n| (n.to_owned(), k.line())))
         .collect())
 }
 
@@ -859,7 +873,7 @@ fn is_lower_hex(s: &str, len: usize) -> bool {
             .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
 }
 
-fn is_hosted_label(v: &str) -> bool {
+pub fn is_hosted_label(v: &str) -> bool {
     HOSTED_LABELS.contains(&v)
 }
 

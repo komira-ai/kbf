@@ -7,7 +7,9 @@
 //! apart from `desired.json` so that an earlier coordinator, which refuses a key it does not
 //! know there, still reads the desired state. The file is created by the first change (a
 //! farm that never uses it keeps its files as they are) and replaced whole after that, like
-//! the desired state: a temporary file, fsync, rename and a directory fsync.
+//! the desired state: a temporary file, fsync, rename and a directory fsync. What the halt
+//! release added to a halt and its acknowledgements is kept in a second file beside it, so that
+//! the release before still reads this one ([`crate::ops_file`]).
 //!
 //! The reader is strict. A key it does not know is a refusal to start, and so is a `schema`
 //! newer than this build: a coordinator rolled back below the build that wrote a halt would
@@ -25,11 +27,12 @@
 //! The caps on the counts (`MAX_HOSTS`, `MAX_EXCLUDED`) are checked under the same lock as the
 //! write ([`OpsStore::try_change`]), on the state the change is applied to.
 //!
-//! The writers are the operator actions ([`operate`]) and [`crate::reconcile`], which records
-//! the last good version and marks a version bad (a raise, so in memory first) and clears the
-//! mark when CI sets that version by hand. The decision reads the bad versions
-//! ([`crate::decide::decide_marked`]); nothing reads the rest when it decides what a host is
-//! told.
+//! The operator actions ([`operate`]) write exclusions, labels and the clear of a halt; the
+//! coordinator itself writes the raising of a halt ([`crate::halt`]) and, in
+//! [`crate::reconcile`], the last good version and the marking of a version bad (a raise, so in
+//! memory first); CI's override clears that mark when it sets that version by hand. The
+//! decision reads a halt and the bad versions ([`crate::halt::decide`]); nothing reads the rest
+//! when it decides what a host is told.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -42,7 +45,8 @@ use kbf_updater::version::Version;
 use kbf_updater::wire::UpdateResult;
 use serde::{Deserialize, Serialize};
 
-use crate::desired::{StoreError, io_at, write_whole};
+use crate::desired::StoreError;
+use crate::ops_file;
 use crate::service::Unauthorized;
 use crate::services::Services;
 
@@ -91,7 +95,7 @@ pub struct Exclusion {
     pub reason: String,
 }
 
-/// A halt of a service: set by a later change, cleared by the operator.
+/// A halt of a service: raised by a host's report ([`crate::halt`]), cleared by the operator.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Halt {
@@ -101,9 +105,14 @@ pub struct Halt {
     pub check: String,
     /// The version it was updating to.
     pub target: Version,
+    /// The `last_update` it reported, whole: what an acknowledgement of it matches. `None` in
+    /// a file written before reports were kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report: Option<UpdateResult>,
 }
 
-/// A host and the version whose halt report an operator cleared.
+/// A host and the halt report an operator cleared. It matches that report, whole: the same
+/// host reporting another `last_update`, of the same target too, is a different report.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HaltAck {
@@ -111,6 +120,33 @@ pub struct HaltAck {
     pub node_id: String,
     /// The version.
     pub target: Version,
+    /// The `last_update` the host reported. `None` in a file written before reports were kept:
+    /// such an acknowledgement matches no report, and ends on the host's first beat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report: Option<UpdateResult>,
+}
+
+impl HaltAck {
+    /// Whether this acknowledges `report` of the host `node`: the same host and the very same
+    /// `last_update`.
+    #[must_use]
+    pub fn matches(&self, node: &str, report: &UpdateResult) -> bool {
+        self.node_id == node && self.report.as_ref() == Some(report)
+    }
+}
+
+impl From<Halt> for HaltAck {
+    fn from(halt: Halt) -> Self {
+        Self {
+            node_id: halt.node_id,
+            target: halt.target,
+            report: halt.report,
+        }
+    }
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 /// A failure report an operator override acknowledged: the host and the whole report it made,
@@ -131,9 +167,18 @@ pub struct ServiceOps {
     /// The standing halt, if any.
     #[serde(default)]
     pub halt: Option<Halt>,
-    /// The halt reports an operator cleared.
+    /// The halt reports an operator cleared: one per host, the latest.
     #[serde(default)]
     pub halt_acked: Vec<HaltAck>,
+    /// The other halt reports received while the standing halt stood: one per host, the
+    /// latest. A clear acknowledges them with the halt's own. Empty unless a halt stands.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub halt_seen: Vec<HaltAck>,
+    /// How many halts an operator has cleared. Agents that announced `halt-v1` are told it
+    /// and lift their hold when it is newer than the one they halted under. Written only
+    /// once it is not zero, so a file of a service never cleared reads as it always did.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub halt_generation: u64,
     /// The newest version that converged and baked, as the coordinator recorded it; the
     /// version an automatic rollback goes back to.
     #[serde(default)]
@@ -155,8 +200,8 @@ pub struct AuditEntry {
     pub seq: u64,
     /// Who made it.
     pub by: String,
-    /// What it was (`exclude`, `include`, `set_labels`; the coordinator's own: `last_good`,
-    /// `clear_last_good`, `mark_bad`; CI's: `unmark_bad`).
+    /// What it was (`exclude`, `include`, `set_labels`, `clear_halt`, `halt`; the
+    /// coordinator's own: `last_good`, `clear_last_good`, `mark_bad`; CI's: `unmark_bad`).
     pub action: String,
     /// The service it concerned, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -261,6 +306,10 @@ pub enum Write {
     BeforeMemory,
 }
 
+/// A change [`OpsStore::interleave`] makes at the start of the next change.
+#[cfg(test)]
+type Interleaved = Box<dyn FnOnce(&mut OpsState) + Send>;
+
 /// What puts a state into the file.
 pub type Writer = Box<dyn Fn(&OpsState) -> Result<(), OpsError> + Send + Sync>;
 
@@ -271,6 +320,10 @@ pub struct OpsStore {
     /// `current` is only locked to read or to swap, never across the file's fsyncs.
     writing: Mutex<()>,
     write: Writer,
+    /// A change another writer makes between a caller's read and its change, applied once at
+    /// the start of the next change, under the writers' lock: what a race would do there.
+    #[cfg(test)]
+    interleave: Mutex<Option<Interleaved>>,
 }
 
 fn parse(path: &Path, bytes: &[u8]) -> Result<OpsState, OpsError> {
@@ -304,9 +357,13 @@ impl OpsStore {
     /// The store of the file at `path`: its state if it exists, empty if not. Nothing is
     /// created until the first change.
     ///
+    /// The halts file beside it ([`crate::ops_file`]) is read and joined to it, and every
+    /// change writes both.
+    ///
     /// # Errors
     /// [`OpsError`]: the file exists and cannot be read, holds a key this build does not
-    /// know, or has another schema.
+    /// know, or has another schema; or a halts file a change staged cannot be settled, or the
+    /// halts file exists and cannot be read or parsed.
     pub fn open(path: &Path) -> Result<Self, OpsError> {
         let state = match fs::read(path) {
             Ok(bytes) => parse(path, &bytes)?,
@@ -319,16 +376,11 @@ impl OpsStore {
                 .into());
             }
         };
+        let (state, _skipped) = ops_file::joined(path, state)?;
         let path = path.to_owned();
         Ok(Self::with_writer(
             state,
-            Box::new(move |state| {
-                let mut text = serde_json::to_vec_pretty(state)
-                    .map_err(io::Error::from)
-                    .map_err(io_at(&path))?;
-                text.push(b'\n');
-                Ok(write_whole(&path, &text)?)
-            }),
+            Box::new(move |state| ops_file::write(&path, state)),
         ))
     }
 
@@ -339,6 +391,8 @@ impl OpsStore {
             current: Mutex::new(state),
             writing: Mutex::new(()),
             write,
+            #[cfg(test)]
+            interleave: Mutex::new(None),
         }
     }
 
@@ -353,6 +407,12 @@ impl OpsStore {
     #[must_use]
     pub fn state(&self) -> OpsState {
         self.lock().clone()
+    }
+
+    /// What `read` makes of the state now, without copying it: for a decision that looks at
+    /// a little of it on every heartbeat.
+    pub fn read<T>(&self, read: impl FnOnce(&OpsState) -> T) -> T {
+        read(&self.lock())
     }
 
     /// The marks of `service` now: none if it has none.
@@ -398,12 +458,30 @@ impl OpsStore {
     pub fn try_change<E: From<OpsError>>(
         &self,
         write: Write,
-        mut entry: AuditEntry,
+        entry: AuditEntry,
         edit: impl FnOnce(&mut OpsState) -> Result<(), E>,
     ) -> Result<AuditEntry, E> {
+        self.decide_change(write, |state| edit(state).map(|()| entry))
+    }
+
+    /// [`Self::try_change`] with an edit that also says what the change is: it reads the state
+    /// under the lock that serialises writes and answers the entry to audit, so that a change
+    /// whose kind or subject depends on the state (raising a halt or keeping a report of one,
+    /// clearing the halt that stands) is decided on the state it is applied to, not on one
+    /// read before another writer changed it.
+    ///
+    /// # Errors
+    /// The edit's own error, or [`OpsError`] as for [`Self::change`].
+    pub(crate) fn decide_change<E: From<OpsError>>(
+        &self,
+        write: Write,
+        edit: impl FnOnce(&mut OpsState) -> Result<AuditEntry, E>,
+    ) -> Result<AuditEntry, E> {
         let _writer = self.writing.lock().unwrap_or_else(PoisonError::into_inner);
+        #[cfg(test)]
+        self.interleaved();
         let mut next = self.state();
-        edit(&mut next)?;
+        let mut entry = edit(&mut next)?;
         entry.seq = next.audit.last().map_or(1, |last| last.seq + 1);
         next.audit.push(entry.clone());
         let surplus = next.audit.len().saturating_sub(AUDIT_RING);
@@ -421,6 +499,29 @@ impl OpsStore {
             }
         }
         Ok(entry)
+    }
+}
+
+#[cfg(test)]
+impl OpsStore {
+    /// Makes `change` at the start of the next change, under the writers' lock, as another
+    /// writer that got there between that caller's read and its change would.
+    pub(crate) fn interleave(&self, change: impl FnOnce(&mut OpsState) + Send + 'static) {
+        *self
+            .interleave
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Box::new(change));
+    }
+
+    fn interleaved(&self) {
+        let change = self
+            .interleave
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(change) = change {
+            change(&mut self.lock());
+        }
     }
 }
 
@@ -455,6 +556,9 @@ enum Action {
         #[serde(deserialize_with = "labels_once")]
         labels: BTreeMap<String, String>,
     },
+    /// Lifts the halt of a service: orders resume, and the report that raised it is not
+    /// raised again.
+    ClearHalt { service: String, reason: String },
 }
 
 /// A map of labels in which no key is given twice.
@@ -627,6 +731,39 @@ pub fn operate(
                     state.hosts.insert(id, HostOps { labels });
                 }
                 Ok(())
+            })?
+        }
+        Action::ClearHalt {
+            service: name,
+            reason: why,
+        } => {
+            let name = service(services, &name)?.to_owned();
+            let why = reason(&why)?;
+            // Written first: a clear that cannot be written leaves the halt standing. The
+            // reports of the halt and of every other host that reported while it stood are
+            // acknowledged (one per host, the latest) so that a host, which keeps reporting
+            // until it updates again, does not raise the halt again: a clear clears the service.
+            // The halt is the one standing when the change is made, under the writers' lock:
+            // one read before could have been cleared by another clear since, and a halt raised
+            // after that one would be cleared with the old report's acknowledgement.
+            store.decide_change::<OperateError>(Write::BeforeMemory, |state| {
+                let marks = state.services.entry(name.clone()).or_default();
+                let halt = marks
+                    .halt
+                    .take()
+                    .ok_or(OperateError::Invalid("the service is not halted"))?;
+                let mut entry = AuditEntry::new(by, "clear_halt");
+                entry.service = Some(name);
+                entry.node_id = Some(halt.node_id.clone());
+                entry.reason = Some(why);
+                let seen = std::mem::take(&mut marks.halt_seen);
+                let reports = std::iter::once(HaltAck::from(halt)).chain(seen);
+                for report in reports {
+                    marks.halt_acked.retain(|ack| ack.node_id != report.node_id);
+                    marks.halt_acked.push(report);
+                }
+                marks.halt_generation = marks.halt_generation.saturating_add(1);
+                Ok(entry)
             })?
         }
     })

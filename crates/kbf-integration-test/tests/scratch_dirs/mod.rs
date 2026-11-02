@@ -38,6 +38,11 @@ const ALLOWED: &[(&str, usize, &str)] = &[
         "a secret file removed in the same function, before any assertion can fail",
     ),
     (
+        "crates/update-register/src/tests.rs",
+        1,
+        "a socket directory removed by the Drop of its guard; the crate may link no TestDir (layering.rs)",
+    ),
+    (
         "crates/xtask/src/darwin/mac.rs",
         1,
         "product code: a call's directory, removed by the Drop of its guard",

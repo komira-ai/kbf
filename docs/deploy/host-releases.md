@@ -88,11 +88,14 @@ sudo kbf-deploy host gc [--keep N] [--apply]
   records no release before it). It refuses when there is no previous release or its
   binary is gone.
 - `gc` removes release directories. It never removes the current, previous or staged
-  release, nor one the `current` or `previous` link points to; `--keep N` also keeps the
-  N newest others (by the directory's modification time). Anything in `releases/` that
-  is not a directory named by a commit id is left alone.
+  release, one the `current` or `previous` link points to, nor one `retain.json` pins or
+  names as the coordinator's last good; `--keep N` also keeps the N newest others (by the
+  directory's modification time; 2 or more, default 4). It removes nothing while a swap is
+  on trial. Anything in `releases/` that is not a directory named by a commit id is left
+  alone.
 
-Each refuses while a commit-confirm deploy is pending in the state.
+`install` and `rollback` refuse while a commit-confirm deploy is pending in the state; `gc` then
+removes nothing.
 
 **No verb restarts a service.** After `install --apply` or `rollback --apply`, restart
 the units that run `/var/lib/kbf-installer/releases/current/kbf` by hand (`sudo systemctl restart
@@ -122,8 +125,11 @@ installs nothing and leaves nothing behind.
    names.
 4. `gh attestation verify` accepts each tarball with the bundle, for the offered commit.
    Nothing has been unpacked or run yet.
-5. Each tarball must hold exactly one regular file named like the component, with no path
-   and no link; it is unpacked, and its header must be this host's kind of binary
+5. Each tarball must hold a regular file named like the component, with no path, and may
+   hold the component's updater declaration `updater.d/<component>.toml`, which is unpacked
+   at that path in the release. No member may be a link, a device or a FIFO or have an
+   absolute name or a `..` in it; a member of another name is ignored and logged. The
+   binary is unpacked, and its header must be this host's kind of binary
    (ELF on Linux, Mach-O on macOS, for this CPU). On macOS its code signature must be
    valid and ad hoc with the hardened runtime, which is what CI's `sign-darwin` makes.
 6. The binary runs `--version --json` as the unprivileged user (empty environment, empty
@@ -192,4 +198,5 @@ written once, so the process running the old release keeps its file, and only th
 | `reconcile` | after an interrupted verb, make the links agree with the state. |
 
 The window is bounded by the host (120 to 1800 seconds), not by the order. Retention is
-`gc --keep 1`: the running release, the previous one and the newest other.
+`gc --keep 4` after each confirm: the running release, the previous one, any pinned
+release, the coordinator's last good one and the four newest others.

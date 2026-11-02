@@ -27,13 +27,6 @@
 //! of that later call (komira-ai/jobscheduler#446). Such an operation is charged as it is with
 //! `off`.
 
-// Only the farm of the js core (and the tests) write the summaries; a build without it keeps
-// the pieces for them compiled.
-#![cfg_attr(
-    not(any(feature = "farm-core-js", test)),
-    allow(dead_code, unused_imports)
-)]
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 

@@ -311,12 +311,25 @@ impl InboxFault {
 pub enum ArchiveFault {
     #[error("it is not a gzip-compressed tar: {0}")]
     NotTarGz(String),
-    #[error("it holds {0} entries, not exactly one")]
+    #[error("it holds {0} entries")]
     Entries(usize),
-    #[error("its entry is not named {0:?}, alone and with no path")]
+    /// A member the unpack requires is not in the archive (under exactly that name).
+    #[error("it holds no member named {0:?}")]
     WrongName(String),
-    #[error("its entry is not a regular file")]
-    NotRegular,
+    /// A member that is a link, a device, a FIFO or another kind than a regular file (a
+    /// directory is refused only where a file was wanted under its name).
+    #[error("its member {name:?} is a {kind}, not a regular file")]
+    NotRegular { name: String, kind: &'static str },
+    /// A member whose name is empty, absolute or has a `..` component.
+    #[error("its member {0:?} has a name that leaves the directory it is unpacked into")]
+    UnsafePath(String),
+    /// A wanted member that is in the archive twice.
+    #[error("its member {0:?} is in it twice")]
+    Duplicate(String),
+    /// The unpack asked for a member name, or a destination, twice: the caller's mistake,
+    /// found before the tarball is opened.
+    #[error("the unpack asks for {0:?} by a name or a destination it already asks for")]
+    Request(String),
     #[error("it is larger than {cap} bytes (its entry, or what it decompresses to)")]
     Oversize { cap: u64 },
     #[error("data follows the end of the archive")]
@@ -331,7 +344,10 @@ impl ArchiveFault {
             ArchiveFault::NotTarGz(_) => "archive-malformed",
             ArchiveFault::Entries(_) => "archive-entries",
             ArchiveFault::WrongName(_) => "archive-name",
-            ArchiveFault::NotRegular => "archive-not-regular",
+            ArchiveFault::NotRegular { .. } => "archive-not-regular",
+            ArchiveFault::UnsafePath(_) => "archive-unsafe-path",
+            ArchiveFault::Duplicate(_) => "archive-duplicate",
+            ArchiveFault::Request(_) => "archive-request",
             ArchiveFault::Oversize { .. } => "archive-oversize",
             ArchiveFault::TrailingData => "archive-trailing",
             ArchiveFault::TimedOut => "archive-timeout",

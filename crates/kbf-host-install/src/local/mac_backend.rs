@@ -9,6 +9,9 @@
 //! daemon. The marker names the release that ran and the links as they were, so a revert,
 //! by the deadline or by request, puts both links back and starts the old release without
 //! the new one running. The marker is on disk: the first tick after a reboot reads it.
+//!
+//! `activate` moves the links to a release the kit keeps, clears the marker and restarts the
+//! daemon's job on it, with no marker and no going back.
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -23,10 +26,12 @@ use crate::mac::apply::{self, Plan};
 use crate::mac::channel::MacAllowlist;
 use crate::mac::kit::{self, Links};
 use crate::mac::layout::{BINARY, MacHost};
+use crate::mac::retain;
 use crate::mac::{self, conf, stage};
 use crate::outcome::{FailureCode, Outcome, Refusal};
 use crate::request::{Channel, Version};
 use crate::runner::Runner;
+use kbf_retain::Kept;
 
 /// What a switch leaves behind until it is confirmed or reverted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,7 +57,7 @@ impl MacBackend {
     }
 
     fn marker_file(&self) -> PathBuf {
-        self.host.work.join("pending.json")
+        self.host.pending_marker()
     }
 
     fn read_marker(&self) -> Result<Option<Marker>, Fault> {
@@ -128,6 +133,48 @@ fn stage_fault(outcome: Outcome) -> Fault {
     }
 }
 
+/// The fault an [`apply::select`] that did not leave the daemon running `commit` is. Links that
+/// were not put back are `revert_failed`, with what they name now.
+fn not_selected(host: &MacHost, commit: &str, not: apply::NotSelected) -> Fault {
+    let not_back = |why: &str| {
+        let now = kit::links(host).map_or_else(|e| e, |l| format!("{l:?}"));
+        Fault::failed(
+            Code::RevertFailed,
+            format!("{why}, and the links could not be put back: they are {now}"),
+        )
+    };
+    match not {
+        apply::NotSelected::Links { restored: true } => {
+            Fault::failed(Code::SwitchFailed, "links_failed")
+        }
+        apply::NotSelected::Links { restored: false } => not_back("links_failed"),
+        apply::NotSelected::AfterLinks {
+            why,
+            restored: true,
+        } => Fault::failed(Code::StateUnavailable, why),
+        apply::NotSelected::AfterLinks {
+            why,
+            restored: false,
+        } => not_back(&why),
+        apply::NotSelected::Restart(why) => Fault::failed(
+            Code::RestartFailed,
+            format!(
+                "the kit runs {} now, but: {why}",
+                commit.get(..12).unwrap_or(commit)
+            ),
+        ),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn not_selected_for_test(
+    host: &MacHost,
+    commit: &str,
+    not: apply::NotSelected,
+) -> Fault {
+    not_selected(host, commit, not)
+}
+
 impl Backend for MacBackend {
     fn lock_file(&self) -> PathBuf {
         // In the work directory, which `mac::ensure_work` makes before the server serves.
@@ -153,11 +200,12 @@ impl Backend for MacBackend {
         }))
     }
 
+    /// The release's binary is a regular file (not a link that would run another release's) and
+    /// root's to run.
     fn has(&self, commit: &str) -> bool {
-        self.host
-            .kit_trust
-            .check_file(&self.host.release(commit).join(BINARY))
-            .is_ok()
+        let binary = self.host.release(commit).join(BINARY);
+        fs::symlink_metadata(&binary).is_ok_and(|meta| meta.file_type().is_file())
+            && self.host.kit_trust.check_file(&binary).is_ok()
     }
 
     fn stage(&self, version: &Version, channel: &Channel) -> Result<String, Fault> {
@@ -229,5 +277,45 @@ impl Backend for MacBackend {
         apply::switch_back(&self.host, &*self.runner, &before)
             .map_err(|tail| Fault::failed(Code::RevertFailed, tail))?;
         self.clear_marker()
+    }
+
+    /// Refused while the ssh path's apply job may run (it holds no install lock): its status
+    /// file says `running`, or launchd does not say it has no such job or that it ended
+    /// ([`mac::status::apply_may_run`]: another failure of the query counts as running). The links move ([`apply::select`]), then the marker of a
+    /// release on trial is cleared, so no deadline puts back what this chose (a marker that
+    /// cannot be cleared puts the links back), then the daemon's job restarts on the release.
+    /// Links that cannot be put back are `revert_failed`, with what they name.
+    fn activate(&self, commit: &str) -> Result<(), Fault> {
+        let status = mac::status::effective(&self.host, &*self.runner);
+        if status == Some(mac::status::ApplyState::Running)
+            || mac::status::apply_may_run(&self.host, &*self.runner)
+        {
+            return Err(Fault::refused(
+                Code::Busy,
+                format!(
+                    "the ssh path's apply job ({}) is running, or launchd cannot say it is not",
+                    mac::layout::APPLY_LABEL
+                ),
+            ));
+        }
+        let before =
+            kit::links(&self.host).map_err(|why| Fault::failed(Code::StateUnavailable, why))?;
+        let cleared = || self.clear_marker().map_err(|fault| fault.detail);
+        apply::select(&self.host, &*self.runner, commit, &before, cleared)
+            .map_err(|not| not_selected(&self.host, commit, not))
+    }
+
+    fn kept(&self) -> Result<Vec<Kept>, Fault> {
+        let on_trial = self.read_marker()?.map(|m| m.commit);
+        retain::kept(&self.host, on_trial.as_deref())
+            .map_err(|why| Fault::failed(Code::StateUnavailable, why))
+    }
+
+    fn retain_file(&self) -> Option<PathBuf> {
+        Some(retain::file(&self.host))
+    }
+
+    fn prune(&self, keep: usize) -> Result<String, Fault> {
+        retain::prune(&self.host, keep).map_err(|why| Fault::failed(Code::StateUnavailable, why))
     }
 }

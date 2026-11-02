@@ -1,0 +1,49 @@
+# Caddyfile of js-mdm-proxy, rendered by `js-mdm install` into
+# /etc/js-mdm/Caddyfile. Edit the template in js-mdm-core.
+#
+# TLS only, on the LAN address only, with lego's certificate. Caddy's own ACME,
+# its HTTP->HTTPS redirect listener on :80 and its admin API are all off.
+{
+	admin off
+	auto_https off
+	persist_config off
+	default_bind @TEST_BIND@
+	servers {
+		protocols h1 h2
+	}
+}
+
+https://mdm.example.com:443 {
+	tls /var/lib/js-mdm/lego/certificates/mdm.example.com.crt /var/lib/js-mdm/lego/certificates/mdm.example.com.key
+
+	# MDM check-in and command channels (NanoHUB).
+	handle /mdm {
+		reverse_proxy 127.0.0.1:9004
+	}
+	handle /checkin {
+		reverse_proxy 127.0.0.1:9004
+	}
+	handle /version {
+		reverse_proxy 127.0.0.1:9004
+	}
+
+	# Identity certificates at enrollment (the SCEP server).
+	handle /scep {
+		reverse_proxy 127.0.0.1:9005
+	}
+
+	# The enrollment profile: ADE posts to this URL, a person downloads it with
+	# GET. Either way the same file, /var/lib/js-mdm/www/enroll.mobileconfig.
+	handle /enroll {
+		method GET
+		root * /var/lib/js-mdm/www
+		rewrite * /enroll.mobileconfig
+		header Content-Type application/x-apple-aspen-config
+		file_server
+	}
+
+	# Everything else, NanoHUB's /api/ and NanoDEP included, is not served here.
+	handle {
+		respond 404
+	}
+}

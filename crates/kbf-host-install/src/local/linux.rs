@@ -19,7 +19,10 @@
 //!   are restarted and waited for. A unit that does not come up puts the host back at once;
 //! - **confirm**: [`kbf_installer::activate::confirm`] clears the marker;
 //! - **revert**: [`kbf_installer::activate::revert`] writes the state first, then moves the
-//!   links back, and the units are restarted on the release that ran.
+//!   links back, and the units are restarted on the release that ran;
+//! - **activate**: [`kbf_installer::activate::select`] writes the state with the release named
+//!   current, the one that ran `previous` and nothing on trial, then moves the links; the units
+//!   are restarted on it, and nothing goes back if they do not come up.
 //!
 //! The channels are named in `/etc/kbf/host-install-releases.toml`, in the format of a Mac's
 //! allowlist ([`crate::mac::channel`]); the ssh forced command's `host-install.toml` is the
@@ -34,12 +37,16 @@ use std::time::Duration;
 
 use kbf_host::exec::Exec;
 use kbf_host::path::Root;
+use kbf_host::plan::Mode;
 use kbf_host::step::Owner;
 use kbf_installer::activate::{self, Activated, Arm};
 use kbf_installer::attest::{GhCheck, Signer};
 use kbf_installer::helper::leases::LeaseSource;
+use kbf_installer::helper::service::{self, HostProcs, Procs};
 use kbf_installer::layout::{Layout, Platform};
 use kbf_installer::refusal::Refusal as InstallerRefusal;
+use kbf_installer::release::{self, ReleaseError};
+use kbf_installer::retain::{self, Kept};
 use kbf_installer::run::Runner as InstallerRunner;
 use kbf_installer::settings::Settings;
 use kbf_installer::stage::{
@@ -136,6 +143,8 @@ pub struct Linux<E: Exec> {
     /// file of its own: it is part of the names of the scratch and check directories, so that
     /// two helpers staging at once never remove each other's download.
     pub(crate) scratch_tag: Option<String>,
+    /// Which releases a process executes from, so a prune never removes one.
+    pub(crate) procs: Box<dyn Procs>,
 }
 
 pub(super) fn commit_id(commit: &str) -> Result<CommitId, Fault> {
@@ -237,6 +246,24 @@ impl<E: Exec> Linux<E> {
             restart_and_wait(&*self.runner, unit, self.restart_wait, &self.pace)?;
         }
         Ok(())
+    }
+
+    /// Restart every unit and wait for each, whatever became of the ones before it: an
+    /// `activate` keeps the release named, so a unit left alone would go on running the release
+    /// it leaves. What did not come up, unit by unit.
+    fn restart_every_unit(&self) -> Result<(), String> {
+        let failed: Vec<String> = self
+            .units
+            .iter()
+            .filter_map(|unit| {
+                restart_and_wait(&*self.runner, unit, self.restart_wait, &self.pace).err()
+            })
+            .collect();
+        if failed.is_empty() {
+            Ok(())
+        } else {
+            Err(failed.join("; "))
+        }
     }
 
     /// Put the host back on the release that ran: state, links, restart. Whether the units
@@ -585,6 +612,59 @@ impl<E: Exec> Backend for Linux<E> {
     fn revert(&self, _pending: &Pending) -> Result<(), Fault> {
         self.put_back()
     }
+
+    /// The installer's [`activate::select`] (the state, then the links; no trial; refused at once
+    /// while another run holds the installer's state), then every unit restarted, each whatever
+    /// became of the others. A unit that does not come up leaves the host on the release named:
+    /// there is no going back to the release left.
+    fn activate(&self, commit: &str) -> Result<(), Fault> {
+        let id = commit_id(commit)?;
+        let mut out = Vec::new();
+        activate::select(&mut *self.exec.borrow_mut(), &self.layout, &id, &mut out).map_err(
+            |e| match e {
+                ReleaseError::NotInstalled(_) => Fault::refused(Code::NotKept, e.to_string()),
+                ReleaseError::State(state::StateError::Busy { .. }) => {
+                    Fault::refused(Code::Busy, format!("kbf-installer's {e}"))
+                }
+                other => Fault::failed(Code::StateUnavailable, other.to_string()),
+            },
+        )?;
+        self.restart_every_unit().map_err(|why| {
+            Fault::failed(
+                Code::RestartFailed,
+                format!(
+                    "the host runs {} now, but: {why}",
+                    commit.get(..12).unwrap_or(commit)
+                ),
+            )
+        })
+    }
+
+    fn kept(&self) -> Result<Vec<Kept>, Fault> {
+        release::kept(&self.layout).map_err(state_fault)
+    }
+
+    fn retain_file(&self) -> Option<PathBuf> {
+        Some(retain::path(&self.layout))
+    }
+
+    /// The installer's own `gc`, which keeps what `retain.json` names and removes nothing while
+    /// a swap is on trial.
+    fn prune(&self, keep: usize) -> Result<String, Fault> {
+        let in_use = service::in_use(&*self.procs, &self.layout)
+            .map_err(|e| state_fault(format!("cannot tell which releases run: {e}")))?;
+        let mut out = Vec::new();
+        release::gc(
+            &mut *self.exec.borrow_mut(),
+            &self.layout,
+            keep,
+            &in_use,
+            Mode::Apply,
+            &mut out,
+        )
+        .map_err(state_fault)?;
+        Ok(String::from_utf8_lossy(&out).trim_end().replace('\n', "; "))
+    }
 }
 
 /// The host as it is: the real `exec` and runners, this program's own paths.
@@ -605,5 +685,6 @@ pub fn production(units: Vec<Unit>) -> Linux<kbf_host::HostExec> {
         tools: Tools::production(),
         owner: Owner { uid: 0, gid: 0 },
         scratch_tag: None,
+        procs: Box::new(HostProcs::new(Platform::current())),
     }
 }

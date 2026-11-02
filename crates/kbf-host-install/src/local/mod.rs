@@ -3,7 +3,7 @@
 //!
 //! The ssh forced command ([`crate::host`], [`crate::mac`]) is unchanged and is reached the
 //! same way as before. This is the other door, for `kbf-updater`'s agent mode
-//! (`docs/design/updates.md`, section 4): a unix socket, mode 0600, and five requests
+//! (`docs/design/updates.md`, section 4): a unix socket, mode 0600, and the requests
 //! ([`request`]) that make up one host's A/B:
 //!
 //! - `install` fetches the release the version names, verifies it on this host and lays it
@@ -12,7 +12,10 @@
 //!   first, the links move and the service restarts on it;
 //! - `confirm` keeps it;
 //! - `revert` goes back to the release that ran;
-//! - `query` says what runs, what is on trial, and how the last update ended.
+//! - `query` says what runs, what is on trial, and how the last update ended;
+//! - `activate` makes a release the host keeps the one that runs, for good: no fetch and no
+//!   trial ([`core::activate`]). Root runs it on the host too, with a pin and a forced lock
+//!   ([`activate_cli`]).
 //!
 //! This program owns the revert. A release on trial that is not confirmed by its deadline is
 //! put back by this program ([`core::Ab::tick`]), whether or not the release, the updater
@@ -22,6 +25,7 @@
 //! daemon host whose units run `/usr/bin/kbf`; `--layout deb` or `--layout rpm`),
 //! [`mac_backend`] on the kit tree.
 
+pub mod activate_cli;
 pub mod answer;
 pub mod backend;
 pub mod core;
@@ -50,7 +54,11 @@ pub mod package_store;
 pub mod mac_backend;
 
 #[cfg(test)]
+mod activate_cli_tests;
+#[cfg(test)]
 mod answer_tests;
+#[cfg(test)]
+mod core_activate_tests;
 #[cfg(test)]
 mod core_tests;
 #[cfg(all(test, target_os = "linux"))]
@@ -62,7 +70,11 @@ pub(crate) mod package_tests;
 #[cfg(test)]
 mod production_tests;
 #[cfg(test)]
+mod request_retain_tests;
+#[cfg(test)]
 mod request_tests;
+#[cfg(test)]
+mod serve_keep_tests;
 #[cfg(test)]
 mod serve_tests;
 #[cfg(test)]

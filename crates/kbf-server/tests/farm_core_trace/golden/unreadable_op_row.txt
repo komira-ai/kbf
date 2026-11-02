@@ -1,0 +1,132 @@
+# an operation row that cannot be read is never lost
+> [t=0ms] start
+  farm term=7 lease_epoch=7
+  txn applied rev=1 counters=[]
+    put meta/epoch cond=absent len=8 sha=a3eb8db89fc5123c ttl=-
+  txn applied rev=2 counters=[]
+    put meta/next_op cond=absent len=8 sha=f44b28e2244100cb ttl=-
+  txn applied rev=3 counters=[]
+    put meta/next_seq cond=absent len=8 sha=f44b28e2244100cb ttl=-
+> [t=0ms] submit queued qos=ci kind=action cores_milli=1000 mem_gib=1 do_not_cache=false
+  ticket queued#1 name=operations/0
+  txn applied rev=7 counters=[]
+    put op/0000000000000000 cond=absent len=75 sha=8136470751ede4ae ttl=-
+    put subject/0000000000000000 cond=absent len=14 sha=827c837e24e402f5 ttl=-
+    put queue/0000000000000000 cond=absent len=0 sha=e3b0c44298fc1c14 ttl=-
+    put inflight/6d61696e/0101010101010101010101010101010101010101010101010101010101010101/1 cond=absent len=8 sha=af5570f5a1810b7a ttl=-
+  stage queued#1 waiting "no worker is connected"
+> [t=0ms] unreadable op/0000000000000000
+> [t=0ms] restart epoch=keep
+  not started: state store failure: the row op/0000000000000000 cannot be read
+  read refused op/0000000000000000
+> [t=0ms] readable
+> [t=0ms] restart epoch=keep
+  farm term=7 lease_epoch=7
+  txn applied rev=8 counters=[]
+    put meta/next_op cond=v2 len=8 sha=7df7e25947701db9 ttl=-
+  txn applied rev=9 counters=[]
+    put meta/next_seq cond=v3 len=8 sha=7df7e25947701db9 ttl=-
+> [t=0ms] wait operations/0 as queued-again
+  stage queued-again queued
+> [t=0ms] register node-a cores=2 gib=8 drivers=container
+  txn applied rev=10 counters=[]
+    put owner/node-a cond=absent len=16 sha=4ff190b4c2c573ec ttl=-
+  txn applied rev=11 counters=[]
+    put session/node-a cond=any len=70 sha=1c2132ea24a810fa ttl=60000ms
+  txn applied rev=14 counters=[]
+    check owner/node-a cond=v10
+    del queue/0000000000000000 cond=v6
+    put lease/0000000000000007.0000000000000400 cond=absent len=23 sha=390f8346ec2b36d2 ttl=-
+    put lease-by-op/0000000000000000 cond=any len=16 sha=2a74510e4d9f1a11 ttl=-
+  msg node-a welcome protocol=1 interval_ms=5000 epoch=7 pack_commit=false
+  msg node-a lease_offer lease=7/1024 kind=action action=queued
+  msg node-a start lease=7/1024 kind=action action=queued millicpus=1000 memory_bytes=1073741824 heartbeat_seq=0 valid_for_ms=14000 device="" job=false fence=0
+  stage queued-again executing
+> [t=0ms] result node-a lease=7/1024 action=queued ended=ran(exit=0)
+  ack lease=7/1024 accepted=true reason=RESULT_ACK_REASON_ACCEPTED
+  txn applied rev=25 counters=[]
+    check owner/node-a cond=v10
+    del lease/0000000000000007.0000000000000400 cond=v13
+    del inflight/6d61696e/0101010101010101010101010101010101010101010101010101010101010101/1 cond=v7
+    put doneof/0000000000000000 cond=any len=45 sha=f0fd36d49c3d8936 ttl=600000ms
+    del op/0000000000000000 cond=any
+    del queue/0000000000000000 cond=any
+    del loss/0000000000000000 cond=any
+    del fate/0000000000000000 cond=any
+    del subject/0000000000000000 cond=any
+    del opkey/0000000000000000 cond=any
+    del lease-by-op/0000000000000000 cond=any
+    put done/0000000000000000 cond=any len=57 sha=1cd7436773ff4409 ttl=600000ms
+  cache queued exit=0
+  stage queued-again done ran exit=0 stdout="output of queued" worker="node-a" queued_ms=1900000000000 started_ms=1900000000000 completed_ms=1900000000000
+> [t=0ms] submit leased qos=ci kind=action cores_milli=1000 mem_gib=1 do_not_cache=false
+  ticket leased#1 name=operations/1024
+  txn applied rev=29 counters=[]
+    put op/0000000000000400 cond=absent len=75 sha=05f7624d5bfec4de ttl=-
+    put subject/0000000000000400 cond=absent len=14 sha=c966e9e216144f31 ttl=-
+    put queue/0000000000000400 cond=absent len=0 sha=e3b0c44298fc1c14 ttl=-
+    put inflight/6d61696e/0202020202020202020202020202020202020202020202020202020202020202/2 cond=absent len=8 sha=f44b28e2244100cb ttl=-
+  txn applied rev=32 counters=[]
+    check owner/node-a cond=v10
+    del queue/0000000000000400 cond=v28
+    put lease/0000000000000007.0000000000000401 cond=absent len=26 sha=13aa512e613fbd55 ttl=-
+    put lease-by-op/0000000000000400 cond=any len=16 sha=c7761a175b97cc7d ttl=-
+  msg node-a lease_offer lease=7/1025 kind=action action=leased
+  msg node-a start lease=7/1025 kind=action action=leased millicpus=1000 memory_bytes=1073741824 heartbeat_seq=0 valid_for_ms=14000 device="" job=false fence=0
+  stage leased#1 executing
+> [t=0ms] restart epoch=keep
+  farm term=7 lease_epoch=7
+  txn applied rev=33 counters=[]
+    put meta/next_op cond=v8 len=8 sha=9c3cdf6c9c8e5131 ttl=-
+  txn applied rev=34 counters=[]
+    put meta/next_seq cond=v9 len=8 sha=9c3cdf6c9c8e5131 ttl=-
+> [t=0ms] unreadable op/0000000000000400
+> [t=0ms] wait operations/1024 as leased-unread
+  no such operation
+  read refused op/0000000000000400
+> [t=0ms] register node-a cores=2 gib=8 drivers=container
+  txn applied rev=35 counters=[]
+    put owner/node-a cond=v10 len=16 sha=8d91efc5106ff3a3 ttl=-
+  read refused op/0000000000000400
+  txn applied rev=36 counters=[]
+    put session/node-a cond=any len=70 sha=1c2132ea24a810fa ttl=60000ms
+  txn applied rev=37 counters=[]
+    put meta/alive cond=any len=0 sha=e3b0c44298fc1c14 ttl=-
+  txn applied rev=38 counters=[]
+    put owner/node-a cond=v35 len=16 sha=4258d21fa8b08977 ttl=-
+  msg node-a welcome protocol=1 interval_ms=5000 epoch=7 pack_commit=false
+> [t=0ms] heartbeat node-a seq=1 running=[7/1025]
+  acknowledged=false
+  txn applied rev=39 counters=[]
+    put meta/alive cond=any len=0 sha=e3b0c44298fc1c14 ttl=-
+  txn applied rev=40 counters=[]
+    put owner/node-a cond=v38 len=16 sha=811df171d767cf80 ttl=-
+  read refused op/0000000000000400
+  msg node-a cancel lease=7/1025
+> [t=0ms] readable
+> [t=0ms] heartbeat node-a seq=2 running=[7/1025]
+  acknowledged=true
+  txn applied rev=41 counters=[]
+    put meta/alive cond=any len=0 sha=e3b0c44298fc1c14 ttl=-
+  txn applied rev=42 counters=[]
+    put owner/node-a cond=v40 len=16 sha=ce4561620426d04c ttl=-
+> [t=0ms] wait operations/1024 as leased-again
+  stage leased-again queued
+> [t=0ms] result node-a lease=7/1025 action=leased ended=ran(exit=0)
+  ack lease=7/1025 accepted=true reason=RESULT_ACK_REASON_ACCEPTED
+  txn applied rev=53 counters=[]
+    check owner/node-a cond=v42
+    del lease/0000000000000007.0000000000000401 cond=v31
+    del inflight/6d61696e/0202020202020202020202020202020202020202020202020202020202020202/2 cond=v29
+    put doneof/0000000000000400 cond=any len=45 sha=a2c1eb6cc2381e02 ttl=600000ms
+    del op/0000000000000400 cond=any
+    del queue/0000000000000400 cond=any
+    del loss/0000000000000400 cond=any
+    del fate/0000000000000400 cond=any
+    del subject/0000000000000400 cond=any
+    del opkey/0000000000000400 cond=any
+    del lease-by-op/0000000000000400 cond=any
+    put done/0000000000000400 cond=any len=57 sha=83892bb7e5490e13 ttl=600000ms
+  cache leased exit=0
+  stage leased-again done ran exit=0 stdout="output of leased" worker="node-a" queued_ms=1900000000000 started_ms=1900000000000 completed_ms=1900000000000
+> [t=0ms] intake

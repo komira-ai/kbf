@@ -198,6 +198,13 @@ pub fn run(host: &MacHost, runner: &dyn Runner) -> u8 {
         Err(why) => ApplyState::Failed(why.clone()),
     };
     let _ = fs::remove_dir_all(host.stage());
+    if result.is_ok() {
+        // The release is applied: the ones the Mac no longer keeps go, before the status says
+        // done, so no install lays out a release meanwhile. A prune that fails removes less;
+        // the apply is done all the same, and the audit log says why.
+        let pruned = super::retain::prune_after_apply(host, kbf_retain::DEFAULT_KEEP);
+        record_prune(host, &pruned);
+    }
     // The result stays in the status file; an unwritable file is all there is to tell.
     let written = status::write(host, &state);
     record(host, plan.as_ref(), &state);
@@ -206,6 +213,30 @@ pub fn run(host: &MacHost, runner: &dyn Runner) -> u8 {
 
 /// Append the end of the apply to the audit log; a log that cannot be opened loses the line
 /// (the status file has the result).
+/// Append what the apply's prune did, or why it could not, to the audit log: `pruned` with its
+/// line, or `prune_failed` with the error. A log that cannot be opened loses the line.
+fn record_prune(host: &MacHost, pruned: &Result<String, String>) {
+    let Ok(mut log) = Audit::open(&host.trust, &host.audit) else {
+        return;
+    };
+    let (outcome, result) = match pruned {
+        Ok(done) => ("pruned", done.clone()),
+        Err(why) => ("prune_failed", why.clone()),
+    };
+    let entry = audit::Entry {
+        time: audit::now(),
+        verb: Some("prune"),
+        version: None,
+        channel: None,
+        unit: None,
+        outcome,
+        reason: None,
+        result: Some(result),
+        command: None,
+    };
+    let _ = log.append(&entry);
+}
+
 fn record(host: &MacHost, plan: Option<&Plan>, state: &ApplyState) {
     let Ok(mut log) = Audit::open(&host.trust, &host.audit) else {
         return;
@@ -282,6 +313,48 @@ pub(crate) fn switch(
         Err(failed) => failed,
     };
     Err(format!("{why}:{tail}"))
+}
+
+/// Why [`select`] did not leave the daemon running the release.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NotSelected {
+    /// The links could not be moved; `restored` when they name what `before` named (read back
+    /// after the attempt to put them back).
+    Links { restored: bool },
+    /// What had to follow the move of the links failed (the reason); `restored` as above.
+    AfterLinks { why: String, restored: bool },
+    /// The links name the release and the daemon did not come up on it: the reason.
+    Restart(&'static str),
+}
+
+/// Move the links to the laid-out release `commit` for good and restart the daemon on it:
+/// `activate`'s swap. `moved` runs once the links have moved and before the daemon is touched;
+/// when it fails, or the flip stops halfway, the links are put back as `before` had them, and
+/// whether they now name that is read back and told. A daemon that does not come up is not
+/// answered by going back (the release left is the one the operator is leaving).
+pub(crate) fn select(
+    host: &MacHost,
+    runner: &dyn Runner,
+    commit: &str,
+    before: &Links,
+    moved: impl FnOnce() -> Result<(), String>,
+) -> Result<(), NotSelected> {
+    let put_back = || {
+        let _ = restore(host, before);
+        kit::links(host).is_ok_and(|now| now == *before)
+    };
+    if flip(host, before, commit).is_err() {
+        return Err(NotSelected::Links {
+            restored: put_back(),
+        });
+    }
+    if let Err(why) = moved() {
+        return Err(NotSelected::AfterLinks {
+            why,
+            restored: put_back(),
+        });
+    }
+    restart(host, runner, commit).map_err(NotSelected::Restart)
 }
 
 /// Put both links back as `before` had them and start the release `before.current` names.

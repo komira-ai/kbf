@@ -18,11 +18,13 @@
 //!    commit as `--source-digest`. `gh` lists the file's sha256 among the attestation's
 //!    subjects itself. It runs unprivileged with an empty environment, a scratch home and
 //!    no network.
-//! 4. **Shape** ([`crate::archive`]): gzip and tar holding exactly one regular file named
-//!    for the component (no link, device, directory or path), a decompressed size under
-//!    the cap, nothing after the tar's end and nothing after the gzip member; unpacked by
-//!    root; its header is the executable this host runs; on macOS no quarantine attribute
-//!    and a valid code signature ([`crate::darwin`]).
+//! 4. **Shape** ([`crate::archive`]): gzip and tar holding a regular file named for the
+//!    component (with no path) and, when the release carries one, its updater declaration
+//!    `updater.d/<component>.toml`, unpacked at that path in the release; no member a link,
+//!    a device, an absolute path or one with `..` (a member of another name is ignored and
+//!    logged), a decompressed size under the cap, nothing after the tar's end and nothing
+//!    after the gzip member; unpacked by root; its header is the executable this host
+//!    runs; on macOS no quarantine attribute and a valid code signature ([`crate::darwin`]).
 //! 5. **The binary names itself**: `<name> --version --json`, run as the unprivileged
 //!    user in an empty directory with an empty environment, must print at most 4 KiB of
 //!    exactly the fields a build reports, name the order's commit and carry the facts the
@@ -68,7 +70,7 @@ use kbf_update::{Facts, Locator};
 use sha2::{Digest, Sha256};
 
 use crate::CommitId;
-use crate::archive::unpack_one;
+use crate::archive::{self, DECLARATION_CAP, Member};
 use crate::attest::{GhCheck, SourceRef, Tools};
 use crate::binary::{Arch, BinaryKind, Version};
 use crate::darwin;
@@ -417,6 +419,12 @@ impl Verifier for Pipeline<'_> {
 
         let names: Vec<String> = order.components.iter().map(|c| c.name.clone()).collect();
         let already_installed = self.install(fetched.partial, order.commit, &names)?;
+        // The version text is for the listing of kept releases only: a file that cannot be
+        // written loses the text, not the release.
+        let _ = crate::retain::Retained::update(&crate::retain::path(self.host), |r| {
+            r.versions
+                .insert(order.commit.clone(), version.version.clone());
+        });
         Ok(Staged {
             commit: order.commit.clone(),
             components: names,
@@ -619,8 +627,9 @@ impl Pipeline<'_> {
             .map(|verified| verified.source_ref)
     }
 
-    /// Steps 4 and 5 for one component: unpack it into the partial directory, check it is
-    /// the executable this host runs, and have it name itself.
+    /// Steps 4 and 5 for one component: unpack it (and its updater declaration, when the
+    /// release carries one) into the partial directory, check it is the executable this
+    /// host runs, and have it name itself.
     fn unpack_and_probe(
         &self,
         partial: &Partial,
@@ -631,17 +640,33 @@ impl Pipeline<'_> {
         order: &Order<'_>,
     ) -> Result<(Version, String), Refusal> {
         let binary = partial.path().join(name);
-        unpack_one(
-            tarball,
-            name,
-            &binary,
-            self.policy.max_binary_bytes,
-            self.policy.timeouts.extract,
-        )
-        .map_err(|fault: ArchiveFault| Refusal::Archive {
-            component: name.to_owned(),
-            fault,
-        })?;
+        let declaration = archive::declaration_member(name);
+        let declaration_dest = partial.path().join(&declaration);
+        let members = [
+            Member {
+                name,
+                dest: &binary,
+                mode: 0o755,
+                cap: self.policy.max_binary_bytes,
+                required: true,
+            },
+            Member {
+                name: &declaration,
+                dest: &declaration_dest,
+                mode: 0o644,
+                cap: DECLARATION_CAP,
+                required: false,
+            },
+        ];
+        let log = &mut |member: &str| {
+            tracing::info!(component = name, ?member, "member of the tarball ignored");
+        };
+        archive::unpack_members(tarball, &members, self.policy.timeouts.extract, log).map_err(
+            |fault: ArchiveFault| Refusal::Archive {
+                component: name.to_owned(),
+                fault,
+            },
+        )?;
         // Whatever the umask said, the unprivileged user must be able to run it.
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o755))
             .map_err(work_err(&binary))?;
@@ -792,12 +817,27 @@ impl Pipeline<'_> {
         // What the fetch left in `dl/` is not part of the release.
         let dl = partial.dl();
         fs::remove_dir_all(&dl).map_err(work_err(&dl))?;
-        let mut entries: Vec<&str> = names.iter().map(String::as_str).collect();
-        entries.push(VERIFIED);
+        let mut entries: Vec<String> = names.to_vec();
+        entries.push(VERIFIED.to_owned());
+        // The declarations the release carried, and their directory, when it carried any.
+        let declarations = names.iter().map(|n| archive::declaration_member(n));
+        let carried: Vec<String> = declarations
+            .filter(|d| fs::symlink_metadata(dir.join(d)).is_ok())
+            .collect();
+        let declares = !carried.is_empty();
+        if declares {
+            entries.push(archive::DECLARATIONS.to_owned());
+            entries.extend(carried);
+        }
         for entry in entries {
             let path = dir.join(entry);
-            std::os::unix::fs::chown(&path, Some(owner.uid), Some(owner.gid))
+            // Never through a link: the entry itself is the release's.
+            std::os::unix::fs::lchown(&path, Some(owner.uid), Some(owner.gid))
                 .map_err(work_err(&path))?;
+        }
+        // The names in `updater.d/` are on disk before the release that holds it is.
+        if declares {
+            sync_dir(&dir.join(archive::DECLARATIONS))?;
         }
         sync_dir(&dir)?;
 
@@ -829,8 +869,9 @@ impl Pipeline<'_> {
     }
 
     /// The release directory already on the host is this release: a plain directory with
-    /// the marker and the same bytes for each component. Anything else is refused, since
-    /// a release is never replaced.
+    /// the marker and the same bytes for each component, and for each component's updater
+    /// declaration the same bytes or, in both, none. Anything else is refused, since a
+    /// release is never replaced.
     fn same_release(&self, target: &Path, new: &Path, names: &[String]) -> Result<(), Refusal> {
         let differs = |path: &Path| Refusal::Differs {
             path: path.display().to_string(),
@@ -850,6 +891,10 @@ impl Pipeline<'_> {
                 && file_sha256(&old).ok() == file_sha256(&new.join(name)).ok();
             if !same {
                 return Err(differs(&old));
+            }
+            let old = archive::declaration_in(target, name);
+            if old.is_err() || old != archive::declaration_in(new, name) {
+                return Err(differs(&target.join(archive::declaration_member(name))));
             }
         }
         Ok(())
@@ -908,7 +953,7 @@ fn sha256_of(mut file: File) -> io::Result<String> {
     }
 }
 
-fn file_sha256(path: &Path) -> io::Result<String> {
+pub(crate) fn file_sha256(path: &Path) -> io::Result<String> {
     sha256_of(File::open(path)?)
 }
 

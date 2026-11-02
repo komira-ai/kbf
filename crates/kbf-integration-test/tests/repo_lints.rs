@@ -38,6 +38,11 @@
 //!   built, and again on the packaged tarball with `build-commit check-asset`), signing and
 //!   `darwin-asset`-checking every macOS binary, or docs/artifacts.md describing
 //!   another set (module `release_artifacts`);
+//! - a release file not built by the seed build: a platform job of `.github/workflows/artifacts.yml`
+//!   removed, off GitHub-hosted runners, given Buck2, a farm address, a remote-execution flag or a
+//!   cargo build that is not plain `cargo build --locked --release`; an assets artifact uploaded
+//!   by another job of the pipeline's run; the release no longer needing the seed jobs (module
+//!   `seed_build`, whose docs say why: a broken kbf is rebuilt without kbf);
 //! - a workflow, release asset list or docs/artifacts.md that ships a darwin `kbf-task` asset, package or image,
 //!   or a workflow that enables the test-only feature `unconfined-for-tests` of `kbf-task` (`no_darwin_task.rs`);
 //! - the push-to-main pipeline drifting from its shape (`ci` and `beta` together, `artifacts` after `ci`,
@@ -47,6 +52,8 @@
 //!   pipeline cancelling a running predecessor or holding anything that releases, or the release
 //!   not following the pipeline's success in a group that never cancels (modules
 //!   `pipeline_workflow` and `release_workflow`);
+//! - the job table of docs/design/gamma-cicd.md naming a job `.github/workflows/release.yml`
+//!   does not have, or omitting one it has (module `gamma_cicd_doc`);
 //! - the beta smoke workflow's Buck2 pin and its actions' commits drifting from
 //!   the copies they are of `ci.yml`'s (module `beta_pins`);
 //! - `beta.yml` or `smoke.yml` gaining a `continue-on-error`, a job-level `if:` or a step condition beyond the
@@ -61,21 +68,26 @@
 //!   instead of the defect it catches (module `test_wording`, whose docs state the rule);
 //! - a test that opens a `file://` cold store without naming its
 //!   free-space floor (module `store_floor`, whose docs say what it misses);
+//! - `AGENTS.md`'s shared core drifting from its hashed copy in `tools/agents/`, and
+//!   `CLAUDE.md` no longer importing `AGENTS.md` (module `agents_md`);
 //! - the scans passing vacuously because git listed nothing, no Markdown file was
 //!   scanned or the workflows moved;
 //! - a drift in the rules that pick which files each lint reads (module `selection`).
 
+mod agents_md;
 mod attested_assets;
 mod attested_bundles;
 mod beta_pins;
 mod beta_succeeds;
 mod coverage_wiring;
+mod gamma_cicd_doc;
 mod interpreters;
 mod kbf_spawns;
 mod pipeline_workflow;
 mod release_artifacts;
 mod release_workflow;
 mod scratch_dirs;
+mod seed_build;
 mod store_floor;
 mod test_spawns;
 mod test_wording;

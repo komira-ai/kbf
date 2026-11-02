@@ -2,8 +2,12 @@
 //! kbf's adapter instead of over [`kbf_server::Farm`]: the same calls, in the same words, and
 //! the text they write. Each method does what the method of the same name of `Farm` does with
 //! the call, through the functions of `kbf_server::farm_js::dispatch` where the farm's own
-//! work is in them and through the core where the scheduler's is.
+//! work is in them and through the core where the scheduler's is. The read faults of the store
+//! (`unreadable`, `readable`) are the tape's, as in the farm's session; the second frontend
+//! (`peer start`) is a second core over the same store, with its own clock zero and its own
+//! process term.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -34,6 +38,9 @@ use crate::transcript::{Node, Transcript};
 
 /// The term a new store is seeded with.
 const TERM: u64 = 7;
+/// The term of the second frontend of the store ([`Session::peer_start`]), which names it in
+/// the `owner/` rows apart from the first.
+const PEER_TERM: u64 = 8;
 /// The wall clock when the core is built, in milliseconds since the Unix epoch.
 const WALL_MS: u64 = 1_900_000_000_000;
 
@@ -43,6 +50,18 @@ pub struct Session {
     t: Transcript<Stream>,
     shapes: Shapes,
     backend: Backend,
+    wall: Wall,
+    started: tokio::time::Instant,
+    /// A second frontend of the same store, once the script starts one.
+    peer: Option<Peer>,
+    /// The nodes registered with the second frontend.
+    on_peer: BTreeSet<String>,
+}
+
+/// A frontend's core, with the wall clock it reads and the moment it was built (its farm time
+/// zero).
+struct Peer {
+    core: Core<KbfAdapter>,
     wall: Wall,
     started: tokio::time::Instant,
 }
@@ -117,8 +136,14 @@ impl Session {
             backend,
             wall: wall_from(started),
             started,
+            peer: None,
+            on_peer: BTreeSet::new(),
         };
-        session.core = Some(session.build(EpochPolicy::Keep));
+        session.core = Some(
+            session
+                .build(EpochPolicy::Keep)
+                .expect("a core over the store"),
+        );
         let epoch = session.epoch();
         session.t.say("start");
         session
@@ -133,21 +158,79 @@ impl Session {
         self.t.text()
     }
 
-    /// A core over the session's store, that starts now.
-    fn build(&mut self, policy: EpochPolicy) -> Core<KbfAdapter> {
-        self.started = tokio::time::Instant::now();
-        self.wall = wall_from(self.started);
+    /// A core over the session's store, that starts now, or why the store refused it, in the
+    /// words of the error.
+    fn build(&mut self, policy: EpochPolicy) -> Result<Core<KbfAdapter>, String> {
+        let built = self.build_as(TERM, policy);
+        (self.started, self.wall) = (built.started, built.wall);
+        built.core
+    }
+
+    /// A core over the session's store for a frontend whose process term is `term`, that
+    /// starts now, with its wall clock and its farm time zero.
+    fn build_as(&self, term: u64, policy: EpochPolicy) -> Built {
+        let started = tokio::time::Instant::now();
+        let wall = wall_from(started);
         let store: Arc<dyn Store> = self.t.tape.clone();
         let adapter = KbfAdapter::new(
-            TERM,
+            term,
             self.backend.clone(),
             Arc::clone(&store),
-            Arc::clone(&self.wall),
+            Arc::clone(&wall),
         );
         let unservable = kbf_sched::UNSERVABLE_WAIT;
         let retention = kbf_sched::FINISHED_RETENTION;
-        let config = open::config(TERM, unservable, retention, PlacementLoad::Off);
-        open::open(&config, adapter, store, policy, self.now()).expect("a core over the store")
+        let config = open::config(term, unservable, retention, PlacementLoad::Off);
+        let now = FarmTime::from_millis(elapsed_ms(started));
+        let core = open::open(&config, adapter, store, policy, now).map_err(|e| e.to_string());
+        Built {
+            core,
+            wall,
+            started,
+        }
+    }
+
+    /// The core `node` registered with (the second frontend's if it registered there), its
+    /// wall clock and its farm time zero.
+    fn frontend_of(&self, node: &str) -> (&Core<KbfAdapter>, &Wall, tokio::time::Instant) {
+        match self.peer.as_ref().filter(|_| self.on_peer.contains(node)) {
+            Some(peer) => (&peer.core, &peer.wall, peer.started),
+            None => (self.core(), &self.wall, self.started),
+        }
+    }
+
+    /// Starts a second frontend over the same store, as another process would: it takes the
+    /// store's epoch, and names itself apart in the `owner/` rows.
+    pub async fn peer_start(&mut self) {
+        self.t.say("peer start");
+        let Built {
+            core,
+            wall,
+            started,
+        } = self.build_as(PEER_TERM, EpochPolicy::Keep);
+        let core = core.expect("a second core over the store");
+        let note = format!("peer lease_epoch={}", core.epoch().expect("a store"));
+        self.peer = Some(Peer {
+            core,
+            wall,
+            started,
+        });
+        self.t.note(note);
+        self.t.sync().await;
+    }
+
+    /// Registers `name` with the second frontend, as [`Session::register`] does with the first.
+    pub async fn peer_register(&mut self, name: &str, cores: u64, gib: u64, drivers: &[&str]) {
+        self.on_peer.insert(name.to_owned());
+        self.register_with("peer register", name, cores, gib, drivers)
+            .await;
+    }
+
+    /// The caller `label` goes away (its client cancels): its stage is no longer watched.
+    pub async fn cancel(&mut self, label: &str) {
+        self.t.say(&format!("cancel {label}"));
+        self.t.cancel(label);
+        self.t.sync().await;
     }
 
     fn core(&self) -> &Core<KbfAdapter> {
@@ -166,8 +249,22 @@ impl Session {
 
     /// Registers `name` with `cores` cores and `gib` GiB, running `drivers`.
     pub async fn register(&mut self, name: &str, cores: u64, gib: u64, drivers: &[&str]) {
+        self.on_peer.remove(name);
+        self.register_with("register", name, cores, gib, drivers)
+            .await;
+    }
+
+    /// Registers `name` with the frontend it is noted on, writing the call as `verb`.
+    async fn register_with(
+        &mut self,
+        verb: &str,
+        name: &str,
+        cores: u64,
+        gib: u64,
+        drivers: &[&str],
+    ) {
         self.t.say(&format!(
-            "register {name} cores={cores} gib={gib} drivers={}",
+            "{verb} {name} cores={cores} gib={gib} drivers={}",
             drivers.join(",")
         ));
         let caps = NodeCaps::from_report([("arch", "x86_64"), ("os", "linux")])
@@ -179,13 +276,19 @@ impl Session {
             message: Some(server_message::Message::Welcome(worker::Welcome {
                 protocol_version: 1,
                 heartbeat_interval_ms: 5_000,
-                epoch: self.epoch(),
+                epoch: self
+                    .frontend_of(name)
+                    .0
+                    .epoch()
+                    .expect("a core over a store"),
                 ..Default::default()
             })),
         };
+        let (core, _, started) = self.frontend_of(name);
+        let now = FarmTime::from_millis(elapsed_ms(started));
         let stream = dispatch::register(
-            self.core(),
-            self.now(),
+            core,
+            now,
             &WorkerId::new(name),
             DaemonInstance::new(format!("daemon-{name}")),
             DaemonInstance::new(""),
@@ -218,14 +321,10 @@ impl Session {
             protocol: None,
         };
         let stream = self.t.nodes[name].stream;
-        dispatch::resize(
-            self.core(),
-            self.now(),
-            &WorkerId::new(name),
-            stream,
-            reported,
-        )
-        .expect("a host the core hears");
+        let (core, _, started) = self.frontend_of(name);
+        let now = FarmTime::from_millis(elapsed_ms(started));
+        dispatch::resize(core, now, &WorkerId::new(name), stream, reported)
+            .expect("a host the core hears");
         self.t.sync().await;
     }
 
@@ -312,14 +411,10 @@ impl Session {
             "heartbeat {name} seq={seq} running=[{}]",
             lease_list(&leases)
         ));
-        let acked = self
-            .core()
-            .heartbeat(
-                self.now(),
-                &WorkerId::new(name),
-                stream,
-                Beat::new(seq, leases),
-            )
+        let (core, _, started) = self.frontend_of(name);
+        let now = FarmTime::from_millis(elapsed_ms(started));
+        let acked = core
+            .heartbeat(now, &WorkerId::new(name), stream, Beat::new(seq, leases))
             .await
             .expect("a host the core hears");
         self.t.note(format!("acknowledged={acked}"));
@@ -347,11 +442,12 @@ impl Session {
             ended_text(ended)
         ));
         let digest = self.t.digest_of_start(label, lease);
+        let (core, wall, started) = self.frontend_of(name);
         let ack = dispatch::report(
-            self.core(),
+            core,
             &self.backend,
-            &self.wall,
-            &|| self.now(),
+            wall,
+            &|| FarmTime::from_millis(elapsed_ms(started)),
             &WorkerId::new(name),
             result_of(lease, digest, label, ended),
         )
@@ -438,7 +534,10 @@ impl Session {
     }
 
     /// The process dies and another starts over the same store, with `policy`. The
-    /// streams and the callers die with it; the store and the cache stay.
+    /// streams and the callers die with it; the store and the cache stay. A start the store
+    /// refuses is written down (`not started:` and the error), and leaves no process running
+    /// until the next restart: a script makes no other call before it. A second frontend
+    /// ([`Session::peer_start`]) dies with the first, and its nodes are forgotten.
     pub async fn restart(&mut self, policy: EpochPolicy) {
         let how = match policy {
             EpochPolicy::Keep => "keep",
@@ -446,11 +545,40 @@ impl Session {
         };
         self.t.say(&format!("restart epoch={how}"));
         drop(self.core.take());
+        drop(self.peer.take());
+        self.on_peer.clear();
         self.t.restart();
-        self.core = Some(self.build(policy));
-        let epoch = self.epoch();
-        self.t
-            .note(format!("farm term={epoch} lease_epoch={epoch}"));
+        match self.build(policy) {
+            Ok(core) => {
+                self.core = Some(core);
+                let epoch = self.epoch();
+                self.t
+                    .note(format!("farm term={epoch} lease_epoch={epoch}"));
+            }
+            Err(e) => self.t.note(format!("not started: {e}")),
+        }
+        self.t.sync().await;
+    }
+
+    /// An intake poll: what the other frontends of the store did is taken in, and the
+    /// callers that asked for an operation by name are shown what the store says of it.
+    pub async fn intake(&mut self) {
+        self.t.say("intake");
+        self.core().intake(self.now());
+        self.t.sync().await;
+    }
+
+    /// From now on a read of the row at `key` fails, as the backend's failures do.
+    pub async fn unreadable(&mut self, key: &str) {
+        self.t.say(&format!("unreadable {key}"));
+        self.t.tape.unreadable(key);
+        self.t.sync().await;
+    }
+
+    /// Every row can be read again.
+    pub async fn readable(&mut self) {
+        self.t.say("readable");
+        self.t.tape.readable();
         self.t.sync().await;
     }
 
@@ -468,6 +596,13 @@ impl Session {
     pub fn starts_of(&self, label: &str) -> usize {
         self.t.starts_of(label)
     }
+}
+
+/// A core, or why the store refused it, with its wall clock and farm time zero.
+struct Built {
+    core: Result<Core<KbfAdapter>, String>,
+    wall: Wall,
+    started: tokio::time::Instant,
 }
 
 /// The wall clock of a core built at `started`: `WALL_MS` then, moving with tokio's clock.

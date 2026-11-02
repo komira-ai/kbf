@@ -1,0 +1,12 @@
+# js-mdm-proxy-reload.path: when lego writes a new certificate, restart the proxy
+# so it serves it (Caddy runs with its admin API off, so a restart is how it
+# reloads). Rendered by `js-mdm tls`.
+[Unit]
+Description=js-mdm: restart the proxy when the certificate changes
+
+[Path]
+PathChanged=/var/lib/js-mdm/lego/certificates/mdm.example.com.crt
+Unit=js-mdm-proxy-reload.service
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,36 @@
+# js-mdm-depsyncer.service: NanoDEP's depsyncer. Every 30 minutes it fetches
+# the device list from Apple Business Manager and assigns the ADE profile the
+# assigner names to devices it has not seen. Rendered and
+# installed by `js-mdm install`, which does not enable it: it is enabled once
+# a token and an assigner exist (before that it only fails).
+[Unit]
+Description=js-mdm NanoDEP depsyncer
+After=network-online.target js-mdm-depserver.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=js-mdm
+Group=js-mdm
+Slice=js-mdm.slice
+ExecStart=/opt/js-mdm/bin/depsyncer -storage filekv -storage-dsn /var/lib/js-mdm/dep -duration 1800 example
+Restart=on-failure
+RestartSec=60
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ReadWritePaths=/var/lib/js-mdm/dep
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

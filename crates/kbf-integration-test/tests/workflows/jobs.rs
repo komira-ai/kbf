@@ -309,3 +309,51 @@ pub fn top_env(text: &str) -> Result<Vec<(String, String)>, String> {
         Some(_) => Err("the top-level `env` is not a mapping".to_owned()),
     }
 }
+
+/// The one runner label the job `job` names in `runs-on`, written out literally: a string, a
+/// one-entry list, or a mapping holding only `labels:` with such a value. An error for any
+/// other shape (a second label, a `group:`, no `runs-on`). A label holding an expression is
+/// returned as written: it is no hosted label, so a caller that checks for one refuses it.
+pub fn job_runs_on(text: &str, job: &str) -> Result<String, String> {
+    let root = yaml::load(text)?;
+    let found = job_of(&root, job)?;
+    let mut node =
+        get(found, "runs-on").ok_or_else(|| format!("the job `{job}` has no `runs-on`"))?;
+    loop {
+        match &node.value {
+            Value::Map(m) if m.len() == 1 && get(m, "labels").is_some() => {
+                node = get(m, "labels").expect("checked");
+            }
+            Value::Seq(items) if items.len() == 1 => node = &items[0],
+            _ => break,
+        }
+    }
+    match node.as_str() {
+        Some(label) => Ok(label.to_owned()),
+        _ => Err(format!(
+            "the `runs-on` of job `{job}` is not one runner label written out literally"
+        )),
+    }
+}
+
+/// Every scalar of the job `job`, keys and values, at any depth, in file order: what its
+/// runner, environment, steps, scripts and action inputs say.
+pub fn job_strings(text: &str, job: &str) -> Result<Vec<String>, String> {
+    fn walk(node: &Node, out: &mut Vec<String>) {
+        match &node.value {
+            Value::Scalar { text, .. } => out.push(text.clone()),
+            Value::Seq(items) => items.iter().for_each(|n| walk(n, out)),
+            Value::Map(entries) => entries.iter().for_each(|(k, v)| {
+                walk(k, out);
+                walk(v, out);
+            }),
+        }
+    }
+    let root = yaml::load(text)?;
+    let mut out = Vec::new();
+    for (k, v) in job_of(&root, job)? {
+        walk(k, &mut out);
+        walk(v, &mut out);
+    }
+    Ok(out)
+}

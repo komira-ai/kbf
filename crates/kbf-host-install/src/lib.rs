@@ -56,6 +56,11 @@
 //! trial that no one confirms by its deadline is put back by this program, with a pending
 //! marker on disk that a restart or a reboot finds. The forced command above is unchanged.
 //!
+//! `kbf-host-install activate kbf=<commit|version> [--pin] [--force-lock] [--restart-unit UNIT]...`
+//! is the operator's emergency command, run by root on the host
+//! ([`local::activate_cli`]): it makes a release the host keeps the one that runs, for good, with
+//! no fetch and no trial, and runs nothing of the release it leaves.
+//!
 //! The paths this program reads as root are constants of [`host::Host::production`]. The
 //! only way to point them elsewhere is a `cfg(test)` constructor: no environment variable
 //! and no argument does it. (One variable does exist, `KBF_HOST_INSTALL_UNIT`: it makes the
@@ -123,11 +128,12 @@ pub mod contract {
     /// mode of `kbf-updater`, which reads the answers and writes the requests.
     pub mod local {
         pub use crate::local::answer::{Answer, Code, LastView, PendingView, QueryView};
+        pub use crate::local::core::{LISTED_BYTES, MAX_LISTED};
         pub use crate::local::frontend::config::FrontendConfig;
         pub use crate::local::serve::ServeConfig;
 
         /// The verb of `line`, when it is a request the socket accepts (`stage`, `switch`,
-        /// `confirm`, `revert` or `query`); `None` for anything it would refuse.
+        /// `confirm`, `revert`, `query` or `activate`); `None` for anything it would refuse.
         #[must_use]
         pub fn request_verb(line: &str) -> Option<&'static str> {
             crate::local::request::LocalRequest::parse(line)
@@ -192,7 +198,11 @@ fn migrate_to_package(_args: &[String]) -> ExitCode {
 /// the status of the answer.
 #[must_use]
 pub fn main() -> ExitCode {
-    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    main_with(std::env::args_os().skip(1).collect())
+}
+
+/// [`main`] with the arguments (after the program's name) put in by the caller.
+fn main_with(args: Vec<std::ffi::OsString>) -> ExitCode {
     if asks_for_version(&args) {
         println!("{}", version_line());
         return ExitCode::SUCCESS;
@@ -222,6 +232,15 @@ pub fn main() -> ExitCode {
             .map(|arg| arg.to_str().map(str::to_owned))
             .collect();
         return rest.map_or(ExitCode::from(2), |rest| local::production::main(&rest));
+    }
+    // The operator's emergency command: make a release the host keeps the one that runs (see
+    // `local::activate_cli`). Root's, on the host; not an sshd request: sshd passes no arguments.
+    if args.first().is_some_and(|arg| arg == "activate") {
+        let rest: Option<Vec<String>> = args[1..]
+            .iter()
+            .map(|arg| arg.to_str().map(str::to_owned))
+            .collect();
+        return rest.map_or(ExitCode::from(2), |rest| local::activate_cli::main(&rest));
     }
     // The operator's act on the generic updater: approve one declaration that asks for more
     // rights (see `update_rights::cli`). Not a flag and not an sshd request: sshd passes no
@@ -285,6 +304,22 @@ mod tests {
         }
     }
 
+    /// `activate` reaches the emergency command, whose arguments must be text: a word that is
+    /// not refuses the whole command, and a command that does not parse is refused, both before
+    /// anything is read from the host.
+    ///
+    /// Catches: `activate` taken for an ssh request or a serve flag.
+    #[test]
+    fn activate_reaches_the_emergency_command() {
+        use std::os::unix::ffi::OsStringExt;
+        let not_text = OsString::from_vec(vec![b'k', 0xff]);
+        assert_eq!(
+            main_with(vec![OsString::from("activate"), not_text]),
+            ExitCode::from(2)
+        );
+        assert_eq!(main_with(args(&["activate", "--pin"])), ExitCode::from(2));
+    }
+
     #[test]
     fn the_version_line_names_the_binary_and_the_package_version() {
         assert_eq!(
@@ -293,3 +328,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "fixed_mark_tests.rs"]
+pub(crate) mod fixed_mark;

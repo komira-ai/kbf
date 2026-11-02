@@ -141,6 +141,9 @@ defaults:
     shell: bash
 
 jobs:
+  # The three platform jobs below are the seed build (docs/artifacts.md, "The seed build"): plain
+  # `cargo build --locked --release` on GitHub-hosted runners, so a broken kbf is rebuilt without
+  # kbf. A build on kbf may run beside them, never instead of them (tests/seed_build holds them).
   darwin-arm64:
     # A pull request builds it only with the label `needs-artifacts`, like every job here:
     # nothing is attested from a pull request and the macOS runners are the scarce ones.

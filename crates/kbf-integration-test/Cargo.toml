@@ -79,6 +79,8 @@ kbf-objstore = { workspace = true, features = ["testkit"] }
 kbf-state = { workspace = true, features = ["test-support", "test-database"] }
 kbf-storage.workspace = true
 kbf-types.workspace = true
+# `tests/mdm_layering.rs` reads the root layers.toml.
+toml.workspace = true
 kbf-proxy.workspace = true
 kbf-sched.workspace = true
 kbf-server.workspace = true
@@ -88,6 +90,8 @@ kbf-threads.workspace = true
 libc.workspace = true
 proc-macro2.workspace = true
 prost.workspace = true
+# `tests/agents_md`: CLAUDE.md read as CommonMark, so an import inside code is not counted.
+pulldown-cmark.workspace = true
 rustls.workspace = true
 saphyr-parser.workspace = true
 sha2.workspace = true
