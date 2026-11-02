@@ -502,7 +502,7 @@ jobs:
     # Every step has a timeout of its own, and the job's is at least their sum: a step that hangs
     # is cut by its own timeout, fails, and the restore still runs within its own. The deploy's
     # and the restore's cover the longest their verbs can run (their calls, tokens included, each
-    # tried again on a 503, and the deploy's --deadline-min): 82.5 and 28.5 minutes, and a
+    # tried again on a 503, and the deploy's --deadline-min): 81.5 and 28.5 minutes, and a
     # minute to start. The release workflow lint computes those from the verbs' own limits.
     timeout-minutes: 200
     environment: release
