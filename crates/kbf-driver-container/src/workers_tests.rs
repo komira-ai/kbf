@@ -28,7 +28,7 @@ use kbf_types::Resources;
 use rustix::fs::{CWD, FileType, Mode};
 
 use crate::blocking_steps::{create_logs, make_cgroup, oom_outcome, read_start, usage};
-use crate::cgroup::{LeaseCgroup, presses_into_swap};
+use crate::cgroup::{LeaseCgroup, SwapWatch, presses_into_swap};
 use crate::cgroup_usage::{NumaSample, Start};
 
 const WORKERS: usize = 2;
@@ -141,7 +141,8 @@ fn the_swap_watch_reads_off_the_async_workers() {
         "memory.events",
         write_end,
         |dir| async move {
-            presses_into_swap(&cgroup_at(&dir), Some(1 << 30), u64::MAX, Duration::ZERO).await;
+            let watch = SwapWatch::new(u64::MAX, 1 << 30);
+            presses_into_swap(&cgroup_at(&dir), Some(watch), Duration::ZERO).await;
         },
     );
 }
