@@ -13,7 +13,7 @@
 //! - `unmark_bad`: `V` loses its bad mark, if it had one;
 //! - `mark_bad`: the version the desired state named before (the version left) is marked bad,
 //!   and held so: CI's desired state does not lift that mark, only an operator's `unmark_bad`
-//!   does ([`held_bad`]), so CI cannot roll it out again by accident and the automatic rollback
+//!   does ([`before_ci_write`]), so CI cannot roll it out again by accident and the automatic rollback
 //!   never goes back to it;
 //! - `clear_halt`: the halt is cleared by the one path of a clear ([`crate::ops::clear_halt`]):
 //!   the reports are acknowledged and the clear generation goes up, so an agent that holds a
@@ -21,8 +21,9 @@
 //!
 //! The failure reports of `V` the hosts make at that moment are acknowledged in the same write
 //! (`failure_acked`): a host that failed `V` before is ordered again, as a new desired version
-//! would order it. The acknowledgement goes when the host is ordered, so a failure after the
-//! force holds the host as rule 4 does.
+//! would order it, as often as the order is lost or declined. The acknowledgement goes when the
+//! host's beat shows it updating (`acks::stale_acks`), so a failure after that attempt holds
+//! the host as rule 4 does.
 //!
 //! Then the desired state is set to `V`, its other fields as they were (none before: the
 //! default limits, no minimum). The fleet's lock is held across both, so no heartbeat is decided
@@ -41,7 +42,8 @@
 //!
 //! An order given while a force stands carries `forced: true` to an agent that announced
 //! [`FEATURE`]; an older agent gets the order it has always read. The next desired state CI
-//! sets ends the force ([`end`]).
+//! sets ends the force ([`before_ci_write`]); one that then cannot be written puts it back
+//! ([`restore`]).
 
 use std::collections::BTreeMap;
 
@@ -54,6 +56,7 @@ use crate::ops::{
     self, AuditEntry, FailureAck, Force, OperateError, OpsError, OpsState, OpsStore, ServiceOps,
     Write,
 };
+use crate::reconcile::CI;
 use crate::services::{ServiceDef, Services};
 
 /// The feature an agent announces to be told that an order is forced.
@@ -231,40 +234,105 @@ fn once(list: &mut Vec<Version>, version: &Version) {
     }
 }
 
-/// Whether CI may not set `version` of `service`: a force left it, and its mark stands until
-/// an operator lifts it.
-#[must_use]
-pub(crate) fn held_bad(ops: &OpsStore, service: &str, version: &Version) -> bool {
-    ops.read(|state| {
-        state
-            .services
-            .get(service)
-            .is_some_and(|marks| marks.bad_by_force.contains(version))
-    })
+/// Why CI's desired state was not let through by [`before_ci_write`].
+#[derive(Debug)]
+pub(crate) enum CiBlocked {
+    /// A force left the version and holds its bad mark.
+    Held,
+    /// The ops file could not be written.
+    Ops(OpsError),
 }
 
-/// Ends the force of `service`, if one is recorded, as `by`: an ordinary desired state is about
-/// to be set. Written first, like every clearing change.
+impl From<OpsError> for CiBlocked {
+    fn from(why: OpsError) -> Self {
+        Self::Ops(why)
+    }
+}
+
+/// What [`before_ci_write`] decided under the writers' lock.
+enum Decided {
+    Blocked(CiBlocked),
+    Nothing,
+}
+
+impl From<OpsError> for Decided {
+    fn from(why: OpsError) -> Self {
+        Self::Blocked(CiBlocked::Ops(why))
+    }
+}
+
+/// Readies the ops store for CI's desired state of `version` of `service`, in one write decided
+/// on the state it is applied to (under the writers' lock, so a force that holds the version
+/// after the caller read the state is seen): refused when a force holds the version's mark;
+/// otherwise the version's bad mark goes, with the failure reports of it the hosts make now
+/// acknowledged (CI set it by hand), and a recorded force ends (`force_ended`). Answers the
+/// force it ended, which [`restore`] puts back if the desired state then cannot be written.
+/// The caller holds the fleet's lock across this and the desired state's write, as a force
+/// does, so neither comes between the other's parts.
 ///
 /// # Errors
-/// [`OpsError`]: the ops file could not be written; the force is recorded still.
-pub(crate) fn end(ops: &OpsStore, service: &str, by: &str, to: &Version) -> Result<(), OpsError> {
-    let recorded = ops.read(|state| {
-        state
-            .services
-            .get(service)
-            .and_then(|marks| marks.force.as_ref().map(|force| force.version.clone()))
+/// [`CiBlocked::Held`], and nothing changes; [`CiBlocked::Ops`]: the ops file could not be
+/// written, and nothing changes.
+pub(crate) fn before_ci_write(
+    ops: &OpsStore,
+    fleet: &Fleet,
+    service: &str,
+    version: &Version,
+) -> Result<Option<Force>, CiBlocked> {
+    let acks = crate::acks::release_failures(fleet, service, version);
+    let mut ended = None;
+    let changed = ops.decide_changes::<Decided>(Write::BeforeMemory, |state| {
+        let marks = state.services.entry(service.to_owned()).or_default();
+        if marks.bad_by_force.contains(version) {
+            return Err(Decided::Blocked(CiBlocked::Held));
+        }
+        let mut entries = Vec::new();
+        if marks.bad.contains(version) {
+            marks.bad.retain(|bad| bad != version);
+            let why = format!(
+                "{version} was set by CI; {} failure reports acked",
+                acks.len()
+            );
+            for ack in acks {
+                marks.failure_acked.retain(|old| old.node_id != ack.node_id);
+                marks.failure_acked.push(ack);
+            }
+            entries.push(entry(CI, "unmark_bad", service, why));
+        }
+        if let Some(force) = marks.force.take() {
+            let why = format!("the force to {} ends: {version} was set", force.version);
+            entries.push(entry(CI, "force_ended", service, why));
+            ended = Some(force);
+        }
+        if entries.is_empty() {
+            return Err(Decided::Nothing);
+        }
+        let head = entries.remove(0);
+        Ok((head, entries))
     });
-    let Some(forced) = recorded else {
-        return Ok(());
-    };
-    let why = format!("the force to {forced} ends: {to} was set");
-    ops.change(
+    match changed {
+        Ok(_) => Ok(ended),
+        Err(Decided::Nothing) => Ok(None),
+        Err(Decided::Blocked(why)) => Err(why),
+    }
+}
+
+/// Puts back `force` of `service`, which [`before_ci_write`] ended for a desired state that
+/// then could not be written: the forced version is still desired, and still forced. A restore
+/// that cannot be written is logged; the force is then ended, and the operator forces again.
+pub(crate) fn restore(ops: &OpsStore, service: &str, force: Force) {
+    let why = format!(
+        "the desired state was not written: the force to {} stands",
+        force.version
+    );
+    let restored = ops.change(
         Write::BeforeMemory,
-        entry(by, "force_ended", service, why),
-        |state| state.services.entry(service.to_owned()).or_default().force = None,
-    )
-    .map(drop)
+        entry(CI, "force_restored", service, why),
+        |state| state.services.entry(service.to_owned()).or_default().force = Some(force),
+    );
+    if let Err(why) = restored {
+        tracing::error!(service, %why, "a force ended for a desired state that was not written could not be put back");
+    }
 }
 
 /// The operator's `unmark_bad` of `version` of `service`, as `by`: the mark goes, the hold a

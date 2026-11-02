@@ -96,6 +96,14 @@ pub struct LocalWorld {
     /// What `activate` answers; on `Ok` the release is the one that runs, with nothing on
     /// trial.
     pub activate: Result<(), LocalError>,
+    /// The commit an `activate` makes run, and the label the helper keeps for it: `None`, the
+    /// label asked for (what a kept release installed under that text has); `Some`, the
+    /// helper's own record, which may be another text or none.
+    pub activate_commit: String,
+    pub activate_label: Option<Option<Version>>,
+    /// The version `install` staged last: a `switch` takes only a staged release, as the real
+    /// helper's does (`not_staged` otherwise).
+    pub staged: Option<Version>,
     pub query: Result<(), LocalError>,
     /// The helper stops answering `query` once it has been asked to go back.
     pub mute_after_revert: bool,
@@ -140,6 +148,9 @@ impl FakeLocal {
             confirm: Ok(()),
             revert: Ok(()),
             activate: Ok(()),
+            activate_commit: COMMIT_B.to_owned(),
+            activate_label: None,
+            staged: None,
             query: Ok(()),
             mute_after_revert: false,
             before: None,
@@ -174,7 +185,14 @@ impl Local for FakeLocal {
         if let Some(hook) = hook {
             hook();
         }
-        self.world().install.clone()
+        let mut world = self.world();
+        // The real helper refuses an install while a release is on trial.
+        if world.state.pending.is_some() {
+            return Err(LocalError::Refused("pending".to_owned()));
+        }
+        let staged = world.install.clone()?;
+        world.staged = Some(version.clone());
+        Ok(staged)
     }
 
     fn switch(&self, version: &Version) -> Result<u64, LocalError> {
@@ -185,6 +203,9 @@ impl Local for FakeLocal {
         }
         let mut world = self.world();
         let deadline = world.switch.clone()?;
+        if world.staged.as_ref() != Some(version) {
+            return Err(LocalError::Refused("not_staged".to_owned()));
+        }
         world.before = world.state.version.clone();
         world.state.pending = Some(Trial {
             version: Some(version.clone()),
@@ -231,7 +252,7 @@ impl Local for FakeLocal {
         Ok(())
     }
 
-    fn activate(&self, version: &Version) -> Result<Activated, LocalError> {
+    fn activate(&self, version: &Version, _commit: Option<&str>) -> Result<Activated, LocalError> {
         self.events.push(format!("local:activate {version}"));
         let hook = self.world().on_activate.clone();
         if let Some(hook) = hook {
@@ -239,12 +260,17 @@ impl Local for FakeLocal {
         }
         let mut world = self.world();
         world.activate.clone()?;
-        let from = world.state.commit.replace(COMMIT_B.to_owned());
+        let made = world.activate_commit.clone();
+        let from = world.state.commit.replace(made);
+        let label = world
+            .activate_label
+            .clone()
+            .unwrap_or_else(|| Some(version.clone()));
         world.state.pending = None;
-        world.state.version = Some(version.clone());
+        world.state.version.clone_from(&label);
         Ok(Activated {
-            commit: COMMIT_B.to_owned(),
-            version: Some(version.clone()),
+            commit: world.activate_commit.clone(),
+            version: label,
             from,
         })
     }
@@ -473,6 +499,9 @@ pub struct FakeHealth {
     /// version has a queue; the last answer repeats.
     pub says: Arc<Mutex<Vec<(String, Answers)>>>,
     pub refuses: Arc<Mutex<Option<String>>>,
+    /// Called at the start of each look (`"check"` or `"held"`), without a lock held: a test
+    /// reads the state of the world at that point here.
+    pub on_look: Arc<Mutex<Option<LookHook>>>,
 }
 
 impl FakeHealth {
@@ -481,6 +510,7 @@ impl FakeHealth {
             events: events.clone(),
             says: Arc::default(),
             refuses: Arc::default(),
+            on_look: Arc::default(),
         }
     }
 
@@ -493,6 +523,10 @@ impl FakeHealth {
 
     fn answer(&self, kind: &str, version: &Version) -> Result<Health, PortError> {
         self.events.push(format!("health:{kind} {version}"));
+        let hook = lock(&self.on_look).clone();
+        if let Some(hook) = hook {
+            hook(kind);
+        }
         let mut says = lock(&self.says);
         let Some((_, queue)) = says.iter_mut().find(|(v, _)| v == version.as_str()) else {
             return Ok(Health::Waiting("nothing said".to_owned()));
@@ -518,6 +552,9 @@ impl HealthCheck for FakeHealth {
         self.answer("held", target)
     }
 }
+
+/// A test's hook on each look of the health check.
+pub type LookHook = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// A coordinator that records the heartbeats it is sent and gives the same reply to each.
 #[derive(Clone, Default)]

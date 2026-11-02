@@ -35,7 +35,7 @@ pub const HALT_V1: &str = "halt-v1";
 
 /// The reply may mark an update order as an operator's force, and the agent makes the target
 /// the release that runs, with no trial and no going back (`update_forced`).
-pub const FORCED_V1: &str = "forced-v1";
+pub(crate) const FORCED_V1: &str = "forced-v1";
 
 /// The features this agent announces in every heartbeat.
 pub const ANNOUNCED: [&str; 3] = [DEFERRED_V1, HALT_V1, FORCED_V1];
@@ -153,7 +153,14 @@ pub struct Halt {
     pub generation: Option<u64>,
 }
 
-/// The deferrals and halts on disk, one file each per unit.
+/// A forced update that has begun: the target of an operator's force, kept on disk from before
+/// the update until it ends, so a restart in the middle can finish it as a force.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForcedMark {
+    pub target: Version,
+}
+
+/// The deferrals, halts and forced marks on disk, one file each per unit.
 #[derive(Clone, Debug)]
 pub struct Marks {
     dir: PathBuf,
@@ -171,6 +178,38 @@ impl Marks {
 
     fn halt_path(&self, unit: &str) -> PathBuf {
         self.dir.join(format!("halt-{unit}"))
+    }
+
+    fn forced_path(&self, unit: &str) -> PathBuf {
+        self.dir.join(format!("forced-{unit}"))
+    }
+
+    /// The forced update of `unit` that was running, if one was.
+    ///
+    /// # Errors
+    /// The file is there and cannot be read, is too long, or is no mark.
+    pub fn load_forced(&self, unit: &str) -> Result<Option<ForcedMark>, String> {
+        self.read(&self.forced_path(unit))
+    }
+
+    /// Record that a forced update of `unit` has begun.
+    ///
+    /// # Errors
+    /// The directory does not take it.
+    pub fn save_forced(&self, unit: &str, mark: &ForcedMark) -> std::io::Result<()> {
+        self.write(
+            &self.forced_path(unit),
+            &format!(".forced-{unit}.tmp"),
+            mark,
+        )
+    }
+
+    /// Forget the forced update of `unit`; none is not an error.
+    ///
+    /// # Errors
+    /// The file is there and cannot be removed.
+    pub fn clear_forced(&self, unit: &str) -> std::io::Result<()> {
+        Self::remove(&self.forced_path(unit))
     }
 
     /// The deferral of `unit`, if there is one.

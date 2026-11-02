@@ -190,7 +190,7 @@ impl Local for FakeLocal {
             .map_err(|e| failed("revert", e))
     }
 
-    fn activate(&self, _version: &Version) -> Result<Activated, LocalError> {
+    fn activate(&self, _version: &Version, _commit: Option<&str>) -> Result<Activated, LocalError> {
         Err(LocalError::Refused("bad_command".to_owned()))
     }
 }

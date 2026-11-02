@@ -10,7 +10,7 @@ use std::time::Duration;
 use kbf_types::ReleasePlatform;
 
 use super::flags::Timing;
-use super::local::{Kept, LocalError, Trial};
+use super::local::{Kept, LocalError};
 use super::run::{Agent, World};
 use super::status::Status;
 use super::testing::{
@@ -22,25 +22,25 @@ use crate::ports::Health;
 use crate::testutil::scratch;
 use crate::wire::{Health as WireHealth, Outcome, Reply, UpdateResult};
 
-const T0: u64 = 10_000;
-const RETRY: u64 = 900;
-const ALL: [&str; 3] = ["deferred-v1", "halt-v1", "forced-v1"];
+pub(super) const T0: u64 = 10_000;
+pub(super) const RETRY: u64 = 900;
+pub(super) const ALL: [&str; 3] = ["deferred-v1", "halt-v1", "forced-v1"];
 
-struct Rig {
-    events: Events,
-    coordinator: FakeCoordinator,
-    local: FakeLocal,
-    drain: FakeDrain,
-    health: FakeHealth,
-    clock: Arc<ManualClock>,
-    logs: Arc<Mutex<Vec<String>>>,
-    dir: PathBuf,
+pub(super) struct Rig {
+    pub(super) events: Events,
+    pub(super) coordinator: FakeCoordinator,
+    pub(super) local: FakeLocal,
+    pub(super) drain: FakeDrain,
+    pub(super) health: FakeHealth,
+    pub(super) clock: Arc<ManualClock>,
+    pub(super) logs: Arc<Mutex<Vec<String>>>,
+    pub(super) dir: PathBuf,
 }
 
 impl Rig {
     /// A daemon host that runs `VA`, healthy, offered `VB`, whose node holds no lease. The
     /// coordinator advertises every feature and its answers are forced.
-    fn new(name: &str) -> Self {
+    pub(super) fn new(name: &str) -> Self {
         let events = Events::default();
         let health = FakeHealth::new(&events);
         health.say(VA, vec![Ok(Health::Healthy)]);
@@ -65,7 +65,7 @@ impl Rig {
         }
     }
 
-    fn timing() -> Timing {
+    pub(super) fn timing() -> Timing {
         Timing {
             drain_deadline: Some(Duration::from_secs(60)),
             retry: Duration::from_secs(RETRY),
@@ -73,7 +73,7 @@ impl Rig {
         }
     }
 
-    fn agent(&self) -> Agent {
+    pub(super) fn agent(&self) -> Agent {
         let (logs, unix) = (Arc::clone(&self.logs), Arc::new(AtomicU64::new(T0)));
         let agent = Agent::new(
             host(Role::Daemon),
@@ -97,7 +97,7 @@ impl Rig {
     }
 
     /// The helper keeps `VB` (and `VA`) among its releases.
-    fn keeps_vb(&self) {
+    pub(super) fn keeps_vb(&self) {
         self.local.world().state.releases = Some(vec![
             Kept {
                 commit: COMMIT_B.to_owned(),
@@ -111,12 +111,12 @@ impl Rig {
     }
 
     /// A heartbeat, and the order its answer holds, run the way the two threads do it.
-    fn take_order(&self, agent: &Agent) {
+    pub(super) fn take_order(&self, agent: &Agent) {
         let order = agent.beat_once().expect("an order");
         agent.order(order.0.as_deref(), &order.1, order.2);
     }
 
-    fn steps(&self) -> Vec<String> {
+    pub(super) fn steps(&self) -> Vec<String> {
         self.events.of(&[
             "local:install",
             "drain",
@@ -128,20 +128,20 @@ impl Rig {
         ])
     }
 
-    fn logged(&self, needle: &str) -> bool {
+    pub(super) fn logged(&self, needle: &str) -> bool {
         self.logs.lock().unwrap().iter().any(|l| l.contains(needle))
     }
 
-    fn last_update(&self, agent: &Agent) -> Option<UpdateResult> {
+    pub(super) fn last_update(&self, agent: &Agent) -> Option<UpdateResult> {
         agent.status().last_update
     }
 }
 
-fn result(target: &str, outcome: Outcome) -> Option<UpdateResult> {
+pub(super) fn result(target: &str, outcome: Outcome) -> Option<UpdateResult> {
     Some(UpdateResult::new(version(target), outcome))
 }
 
-fn not_healthy() -> Vec<Result<Health, crate::ports::PortError>> {
+pub(super) fn not_healthy() -> Vec<Result<Health, crate::ports::PortError>> {
     vec![Ok(Health::Waiting("starting".to_owned()))]
 }
 
@@ -292,32 +292,6 @@ fn a_forced_order_for_the_release_that_runs_is_done_at_once() {
     let agent = rig.agent();
     rig.take_order(&agent);
     assert!(rig.steps().is_empty());
-    assert_eq!(rig.last_update(&agent), result(VB, Outcome::Succeeded));
-}
-
-/// Catches: a fetch that finds the host running the target taken for a finished force while
-/// a trial is still pending: the helper has the target on trial and nothing keeps it, so the
-/// force still activates it and ends the trial.
-#[test]
-fn a_forced_order_ends_a_pending_trial_of_the_target_by_activating_it() {
-    let rig = Rig::new("forced-pending");
-    {
-        let mut world = rig.local.world();
-        world.state.version = Some(version(VB));
-        world.state.pending = Some(Trial {
-            version: Some(version(VB)),
-            commit: COMMIT_B.to_owned(),
-            deadline_unix: Some(T0 + 600),
-        });
-        world.install = Ok(super::local::Staged {
-            commit: COMMIT_B.to_owned(),
-            current: true,
-        });
-    }
-    let agent = rig.agent();
-    rig.take_order(&agent);
-    assert_eq!(rig.events.count("local:activate"), 1);
-    assert!(rig.local.world().state.pending.is_none());
     assert_eq!(rig.last_update(&agent), result(VB, Outcome::Succeeded));
 }
 

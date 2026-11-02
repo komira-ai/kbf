@@ -110,8 +110,9 @@ pub(crate) fn is_release_failure(host: &Host, version: &Version) -> bool {
 /// outvote a few failures) and nothing while the service is halted. Otherwise, the first that
 /// applies:
 ///
-/// 1. the desired version has converged and baked and nothing holds a slot: record it as
-///    the last good version (unless it is, or is marked bad);
+/// 1. the desired version has converged and baked and nothing holds a slot (and, while an
+///    operator's force of it stands, every live host is up on it): record it as the last good
+///    version (unless it is, or is marked bad);
 /// 2. the desired version is `min_version` and an older last good version is recorded: forget
 ///    it, since the version before the first release with hooks is no rollback target;
 /// 3. an older last good version is recorded, no operator's force stands
@@ -168,7 +169,11 @@ fn decide(
     let settled = convergence_of(def, Some(want), fleet, state, now).state == State::Converged
         && !live().any(|(id, h)| fleet.holds_slot(service, id, h, now));
     let recorded = marks.last_good.as_ref() == Some(wanted);
-    if settled && !recorded && !marked {
+    // A forced version is good only once every live host serves it healthy: the force passed
+    // the health gates, so convergence alone (with no bake, say) proves nothing of its health.
+    let forced = force::standing(marks, Some(want)).is_some();
+    let healthy = !forced || live().all(|(id, h)| fleet.is_up(service, id, h, now));
+    if settled && healthy && !recorded && !marked {
         return vec![Change::LastGood(wanted.clone())];
     }
     let floored = def
@@ -178,7 +183,7 @@ fn decide(
     if floored {
         return older.map(|_| Change::ClearLastGood).into_iter().collect();
     }
-    let Some(back) = older.filter(|_| force::standing(marks, Some(want)).is_none()) else {
+    let Some(back) = older.filter(|_| !forced) else {
         return Vec::new();
     };
     let failed = live()

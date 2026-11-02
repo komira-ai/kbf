@@ -474,7 +474,7 @@ fn the_fake_helper_does_not_know_activate() {
     let local = FakeLocal(paths(&dir));
     let before = fs::read_to_string(dir.join("world/helper.json")).unwrap();
     assert_eq!(
-        local.activate(&Version::parse("1.1.0").unwrap()),
+        local.activate(&Version::parse("1.1.0").unwrap(), None),
         Err(LocalError::Refused("bad_command".to_owned()))
     );
     assert_eq!(

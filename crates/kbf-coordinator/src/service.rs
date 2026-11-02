@@ -12,7 +12,7 @@ use kbf_updater::wire::{Answer, Heartbeat, ServiceReply};
 use serde::Serialize;
 use subtle::ConstantTimeEq;
 
-use crate::acks::{clear_bad, release_ack};
+use crate::acks::release_ack;
 use crate::converge::{Convergence, RoleCounts, converge_kbf, converge_service, role_counts};
 use crate::decide::{Decision, Hold};
 use crate::desired::{Desired, DesiredError, DesiredStore, KBF, StoreError};
@@ -24,7 +24,7 @@ use crate::membership::{Member, Standing, account, deferred_count, members, stan
 use crate::ops::{
     self, Action, AuditEntry, Force, OPERATOR, OperateError, OpsError, OpsState, OpsStore,
 };
-use crate::reconcile::{CI, reconcile};
+use crate::reconcile::reconcile;
 use crate::services::{ServiceDef, Services};
 
 /// The time since the coordinator started.
@@ -233,6 +233,9 @@ pub struct Coordinator {
     services_dropped: AtomicU64,
     extras: Mutex<ExtrasDropped>,
     features: Vec<String>,
+    /// Where CI's desired write waits in a test ([`Self::pause_ci_write`]).
+    #[cfg(test)]
+    pause: Mutex<Option<Arc<std::sync::Barrier>>>,
 }
 
 impl std::fmt::Debug for Coordinator {
@@ -263,6 +266,8 @@ impl Coordinator {
             services_dropped: AtomicU64::new(0),
             extras: Mutex::new(ExtrasDropped::default()),
             features: FEATURES.iter().map(|name| (*name).to_owned()).collect(),
+            #[cfg(test)]
+            pause: Mutex::new(None),
         }
     }
 
@@ -286,6 +291,27 @@ impl Coordinator {
     pub fn with_features(mut self, features: &[&str]) -> Self {
         self.features = features.iter().map(|name| (*name).to_owned()).collect();
         self
+    }
+
+    /// Waits at `pause`, if a test set one, just before CI's desired state is written.
+    #[cfg(test)]
+    fn paused(&self) {
+        let pause = self
+            .pause
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(pause) = pause {
+            pause.wait();
+            pause.wait();
+        }
+    }
+
+    /// Makes CI's next desired write wait twice at `pause` just before the state is written: a
+    /// test sees what holds at that moment between the two waits.
+    #[cfg(test)]
+    pub(crate) fn pause_ci_write(&self, pause: Arc<std::sync::Barrier>) {
+        *self.pause.lock().unwrap_or_else(PoisonError::into_inner) = Some(pause);
     }
 
     /// Whether the fleet's lock, which every decision and order is made under, is held now.
@@ -444,14 +470,16 @@ impl Coordinator {
                 now,
             );
             if let Decision::Update { version } = decision {
-                // The host's ack goes from the file before the order exists.
-                if !release_ack(&self.ops, name, &who.node_id) {
-                    continue;
-                }
-                fleet.order(name, who.node_id.clone(), version.clone(), now);
                 let forced = self
                     .ops
                     .read(|state| force::stands(state, name, desired.get(name)));
+                // The host's ack goes from the file before the order exists. Under a force it
+                // stays until the host is seen updating (`acks::stale_acks`): the force orders
+                // past it, and an order that is lost or declined is given again.
+                if !forced && !release_ack(&self.ops, name, &who.node_id) {
+                    continue;
+                }
+                fleet.order(name, who.node_id.clone(), version.clone(), now);
                 let reply = ServiceReply::Update {
                     service: (name != KBF).then(|| name.to_owned()),
                     version,
@@ -513,21 +541,31 @@ impl Coordinator {
             return Err(SetError::Forbidden);
         }
         // A version a force left is not CI's to set again: an operator lifts its mark first.
-        if force::held_bad(&self.ops, &service, &desired.version) {
-            tracing::warn!(%service, version = %desired.version, "refused a desired state: a force left the version");
-            return Err(SetError::HeldBad(desired.version));
-        }
-        // CI naming a version by hand lifts its mark. The mark goes first: a set that fails
-        // after it leaves nothing blocked, and the reverse would leave a wanted version that
-        // the next beat rolls back. A force that stands ends before the state is set, so a set
-        // that fails after it leaves the forced version under the ordinary rules.
+        // CI naming a version by hand lifts its mark, and ends a force. The marks go first: a
+        // set that fails after them leaves nothing blocked, and the reverse would leave a wanted
+        // version that the next beat rolls back. A force ended for a set that fails is put back.
+        // All of it under the fleet's lock, which a force takes too, so a force never comes
+        // between the check, the marks and the desired state.
         {
             let fleet = self.fleet.lock().unwrap_or_else(PoisonError::into_inner);
-            let why = format!("{} was set by CI", desired.version);
-            clear_bad(&self.ops, &fleet, CI, &service, &desired.version, &why)?;
-            force::end(&self.ops, &service, CI, &desired.version)?;
+            let ended = match force::before_ci_write(&self.ops, &fleet, &service, &desired.version)
+            {
+                Ok(ended) => ended,
+                Err(force::CiBlocked::Held) => {
+                    tracing::warn!(%service, version = %desired.version, "refused a desired state: a force left the version");
+                    return Err(SetError::HeldBad(desired.version));
+                }
+                Err(force::CiBlocked::Ops(why)) => return Err(why.into()),
+            };
+            #[cfg(test)]
+            self.paused();
+            if let Err(why) = self.desired.set(&service, desired.clone()) {
+                if let Some(force) = ended {
+                    force::restore(&self.ops, &service, force);
+                }
+                return Err(why.into());
+            }
         }
-        self.desired.set(&service, desired.clone())?;
         tracing::info!(
             workflow = %verified.job_workflow_ref,
             sha = ?verified.sha,
@@ -609,7 +647,7 @@ impl Coordinator {
 
     /// Whether `bearer` is a CI token the verifier accepts: the operator route answers such a
     /// caller that it may not, rather than that it is unknown.
-    pub async fn is_ci(&self, bearer: Option<&str>) -> bool {
+    pub(crate) async fn is_ci(&self, bearer: Option<&str>) -> bool {
         self.ci(bearer).await.is_ok()
     }
 
@@ -643,22 +681,38 @@ impl Coordinator {
         self.operator(bearer)?;
         let now = (self.clock)();
         let fleet = self.fleet.lock().unwrap_or_else(PoisonError::into_inner);
-        let hosts = fleet
-            .hosts()
-            .map(|(id, host)| host_status(&fleet, KBF, id, host, now))
-            .collect();
         let all = self.desired.all();
         let ops = self.ops.state();
+        // The version each service is forced to, if a force stands: its slots are counted by
+        // the forced rule, as the decision counts them.
+        let forced_to = |service: &str| {
+            ops.services
+                .get(service)
+                .and_then(|marks| force::standing(marks, all.get(service)))
+                .map(|force| force.version.clone())
+        };
+        let hosts = fleet
+            .hosts()
+            .map(|(id, host)| host_status(&fleet, KBF, forced_to(KBF).as_ref(), id, host, now))
+            .collect();
         let per_service = self
             .services
             .defs()
             .map(|def| {
                 let desired = self.desired.get(&def.name);
+                let forced_version = forced_to(&def.name);
                 let roles = role_counts(def, desired.as_ref(), &fleet, now);
                 let hosts: Vec<ServiceHostStatus> = fleet
                     .hosts_of(&def.name)
                     .map(|(id, host)| ServiceHostStatus {
-                        host: host_status(&fleet, &def.name, id, host, now),
+                        host: host_status(
+                            &fleet,
+                            &def.name,
+                            forced_version.as_ref(),
+                            id,
+                            host,
+                            now,
+                        ),
                         hold: match halt::decide(
                             &self.ops,
                             &self.services,
@@ -739,20 +793,25 @@ impl Coordinator {
 }
 
 /// The host `id` as the status shows it for `service`: whether it is up and holds a slot
-/// counted for that service.
+/// counted for that service, by the forced rule while the service is forced to `forced`.
 fn host_status(
     fleet: &Fleet,
     service: &str,
+    forced: Option<&kbf_updater::version::Version>,
     id: &kbf_types::NodeId,
     host: &Host,
     now: Duration,
 ) -> HostStatus {
+    let holds_slot = match forced {
+        Some(version) => fleet.holds_forced_slot(service, id, host, version, now),
+        None => fleet.holds_slot(service, id, host, now),
+    };
     HostStatus {
         node_id: id.to_string(),
         role: host.role_name().to_owned(),
         live: host.is_live(now),
         up: fleet.is_up(service, id, host, now),
-        holds_slot: fleet.holds_slot(service, id, host, now),
+        holds_slot,
         silent_secs: now.saturating_sub(host.seen).as_secs(),
         beat: host.beat.clone(),
     }

@@ -6,33 +6,68 @@
 //! release that keeps running, with no trial, no deadline and no revert. In this order, each
 //! step only if the one before it worked:
 //!
-//! 1. **Stage**, only if the helper does not list the target among the releases it keeps (or
-//!    lists none, as an older helper does): `install` fetches and verifies it and switches
-//!    nothing.
-//! 2. **Drain** the node as the ordinary update does: in-flight work is never cut, and a drain
+//! 1. **The trial the helper has**, if it has one. The helper refuses an `install` while a
+//!    release is on trial, so this comes first. A trial of the target is left for `activate`
+//!    to end. A trial of another release is ended by `activate` too when the helper keeps the
+//!    target; when it does not list the target (it keeps no such release, or its list is
+//!    unavailable or cut, which is not told apart: the target is unknown either way) the trial
+//!    is reverted, so the target can be staged.
+//! 2. **Stage**, only if the helper does not list the target among the releases it keeps:
+//!    `install` fetches and verifies it and switches nothing.
+//! 3. **Drain** the node as the ordinary update does: in-flight work is never cut, and a drain
 //!    bound is a deferral.
-//! 3. **Activate** the target. A helper that predates the request refuses it as `bad_command`:
-//!    then the target is switched and confirmed at once, with no wait between, so the helper's
-//!    trial cannot go back from it.
-//! 4. **Health** is waited for only to decide the undrain: a healthy target gets the node
+//! 4. **Activate** the target, naming the commit it must be: the helper's answer must name that
+//!    commit, under whatever label the helper keeps for it. A helper that predates the request
+//!    refuses it as `bad_command`: then the target is staged (`install`, which on such a helper
+//!    may fetch it again: its `switch` takes only a release that `install` staged, and a
+//!    release it kept from an earlier update is not staged), switched and confirmed at once,
+//!    with no wait between, so the helper's trial cannot go back from it.
+//! 5. **Publish** the result at once: the status says the target runs, `updating` is cleared
+//!    and the last update is a success, before the health wait, so the next heartbeat frees
+//!    the coordinator's slot.
+//! 6. **Health** is waited for only to decide the undrain: a healthy target gets the node
 //!    back; one that is not healthy stays, the node stays drained, and the result is still a
-//!    success, because the host runs what the operator asked for. The heartbeat's `health`
-//!    says the rest.
+//!    success, because the host runs what the operator asked for. A node that cannot be given
+//!    back stays drained and the result is still a success. The heartbeat's `health` says the
+//!    rest.
 //!
-//! Nothing is kept on disk for a forced order: an agent that restarts before `activate`
-//! leaves the host on its old release, and the coordinator sends the order again when it ages
-//! out.
+//! The agent writes a `forced-<unit>` mark (`super::hold::Marks`) before a forced update and
+//! removes it when the update ends. A restart in the middle that finds the helper's trial of
+//! that target (an older helper, between `switch` and `confirm`) runs the update again as a
+//! force: the trial is confirmed, not reverted. A restart after `install` and before
+//! `activate` leaves the host on its old release with nothing pending; the mark is removed at
+//! start, and the coordinator sends the order again when it ages out. One limit remains: the
+//! mark is written before the order runs, and a mark that cannot be written is logged and the
+//! force goes on without it, so a restart in the window of an older helper then resumes the
+//! trial as an ordinary order, which reverts it if it is not healthy by the helper's deadline.
 
 use super::hold::Features;
-use super::local::LocalError;
+use super::local::{HostState, LocalError, Trial};
 use super::update::{Done, Update, result};
 use crate::ports::{Health, Placed};
 use crate::version::Version;
-use crate::wire::Outcome;
+use crate::wire::{Health as WireHealth, Outcome};
+
+/// Why an older helper's way to the same end did not get there.
+#[derive(Debug, thiserror::Error)]
+enum Fallback {
+    #[error("the install that stages the target failed: {0}")]
+    Stage(LocalError),
+    #[error("the switch failed: {0}")]
+    Switch(LocalError),
+    #[error("the confirm failed: {0}")]
+    Confirm(LocalError),
+}
+
+/// Whether `trial` is the release `target` names.
+fn is_trial_of(trial: &Trial, target: &Version) -> bool {
+    trial.version.as_ref() == Some(target)
+        || target.commit().is_some_and(|c| trial.commit.starts_with(c))
+}
 
 impl Update<'_> {
     /// [`Update::run_for`] for an order that is an operator's force.
-    pub fn run_forced_for(&self, target: &Version, features: Features) -> Done {
+    pub(super) fn run_forced_for(&self, target: &Version, features: Features) -> Done {
         self.finish(target, features, |target| self.forced(target))
     }
 
@@ -44,66 +79,122 @@ impl Update<'_> {
             Ok(state) => state,
             Err(e) => return self.fail(target, &e),
         };
-        let settled = state.pending.is_none();
-        if settled && state.version.as_ref() == Some(target) {
+        if state.pending.is_none() && state.runs(target) {
             return result(target, Outcome::Succeeded).into();
         }
-        if !state.keeps(target) {
-            match self.ports.local.install(target, self.channel) {
-                Ok(staged) if staged.current && settled => {
-                    return result(target, Outcome::Succeeded).into();
-                }
-                Ok(_) => {}
-                Err(e) => return self.fail(target, &e),
-            }
-        }
+        let (commit, staged_now) = match self.settle_trial_and_stage(target, &state) {
+            Ok(found) => found,
+            Err(done) => return done,
+        };
         let placed = match self.drained(target) {
             Ok(placed) => placed,
             Err(done) => return done,
         };
-        match self.ports.local.activate(target) {
-            Ok(_) => {}
+        let on_trial = state
+            .pending
+            .as_ref()
+            .is_some_and(|trial| is_trial_of(trial, target));
+        match self.ports.local.activate(target, Some(&commit)) {
+            Ok(activated) => self.settle(target, placed, activated.commit),
             Err(LocalError::Refused(code)) if code == "bad_command" => {
                 self.log(&format!(
-                    "update to {target}: the helper does not know activate; switching and confirming at once"
+                    "update to {target}: the helper does not know activate; staging, switching and confirming at once"
                 ));
-                if let Err(e) = self.switch_and_confirm(target) {
-                    self.log(&format!("update to {target}: {e}"));
-                    return self.back_on_a(target, placed);
+                match self.switch_and_confirm(target, staged_now || on_trial, on_trial) {
+                    Ok(()) => self.settle(target, placed, commit),
+                    Err(e) => {
+                        self.log(&format!("update to {target}: {e}"));
+                        self.back_on_a(target, placed)
+                    }
                 }
             }
             Err(e) => {
                 self.log(&format!("update to {target}: the activation failed: {e}"));
-                return self.back_on_a(target, placed);
+                self.back_on_a(target, placed)
             }
         }
-        self.settle(target, placed)
     }
 
-    /// An older helper's way to the same end: the trial it opens is confirmed before anything
-    /// can wait on it.
-    fn switch_and_confirm(&self, target: &Version) -> Result<(), String> {
-        self.ports
-            .local
-            .switch(target)
-            .map_err(|e| format!("the switch failed: {e}"))?;
-        self.ports
-            .local
-            .confirm(target)
-            .map_err(|e| format!("the confirm failed: {e}"))
+    /// Steps 1 and 2: the commit the target is, and whether `install` staged it now; or the end
+    /// of the update (a failure, or the host found already running the target).
+    fn settle_trial_and_stage(
+        &self,
+        target: &Version,
+        state: &HostState,
+    ) -> Result<(String, bool), Done> {
+        if let Some(trial) = &state.pending
+            && is_trial_of(trial, target)
+        {
+            return Ok((trial.commit.clone(), false));
+        }
+        if let Some(commit) = state.kept_commit(target) {
+            return Ok((commit.to_owned(), false));
+        }
+        if state.pending.is_some() {
+            self.log(&format!(
+                "update to {target}: another release is on trial and the target is not listed among the releases the host keeps; reverting the trial first"
+            ));
+            match self.ports.local.revert() {
+                Ok(()) => {}
+                Err(LocalError::Refused(code)) if code == "nothing_pending" => {}
+                Err(e) => {
+                    return Err(self.fail(target, &format!("the trial could not be reverted: {e}")));
+                }
+            }
+        }
+        match self.ports.local.install(target, self.channel) {
+            Ok(staged) if staged.current => Err(result(target, Outcome::Succeeded).into()),
+            Ok(staged) => Ok((staged.commit, true)),
+            Err(e) => Err(self.fail(target, &e)),
+        }
     }
 
-    /// The target runs, for good. Whether it is healthy decides only whether the node goes
-    /// back into placement.
-    fn settle(&self, target: &Version, placed: Placed) -> Done {
+    /// An older helper's way to the same end: the target staged (unless it is already, or on
+    /// trial), switched, and confirmed before anything can wait on the trial.
+    fn switch_and_confirm(
+        &self,
+        target: &Version,
+        staged: bool,
+        on_trial: bool,
+    ) -> Result<(), Fallback> {
+        if !staged {
+            self.ports
+                .local
+                .install(target, self.channel)
+                .map_err(Fallback::Stage)?;
+        }
+        if !on_trial {
+            self.ports.local.switch(target).map_err(Fallback::Switch)?;
+        }
+        self.ports.local.confirm(target).map_err(Fallback::Confirm)
+    }
+
+    /// The target runs, for good: say so now, then see whether it is healthy, which decides
+    /// only whether the node goes back into placement.
+    fn settle(&self, target: &Version, placed: Placed, commit: String) -> Done {
+        self.status.update(|s| {
+            s.version = target.clone();
+            // Not known healthy until it has been looked at.
+            s.health = WireHealth::Unhealthy;
+            s.updating = None;
+            s.last_update = Some(result(target, Outcome::Succeeded));
+        });
         match self.wait_healthy(target, self.timing.health_timeout) {
-            Health::Healthy => self.keep(target, placed),
+            Health::Healthy => {
+                if let Err(e) = self.give_back(placed) {
+                    self.log(&format!(
+                        "update to {target}: forced, and it runs healthy, but the node stays drained: {e}"
+                    ));
+                }
+            }
             Health::Waiting(why) | Health::Abandoned(why) => {
                 self.log(&format!(
                     "update to {target}: forced, and it runs but is not healthy: {why}; it stays, and the node stays drained"
                 ));
-                result(target, Outcome::Succeeded).into()
             }
         }
+        let mut done = Done::from(result(target, Outcome::Succeeded));
+        done.activated = Some(commit);
+        done
     }
 }

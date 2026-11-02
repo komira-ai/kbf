@@ -96,7 +96,7 @@ pub(crate) fn update(target: &str) -> ServiceReply {
     }
 }
 
-fn halted(target: &str) -> UpdateResult {
+pub(crate) fn halted(target: &str) -> UpdateResult {
     UpdateResult {
         phase: Some(Phase::Halt),
         reason: kbf_updater::wire::Token::parse("disk_tainted"),
@@ -118,7 +118,7 @@ fn audit_from(rig: &Rig, from: u64) -> Vec<(String, String)> {
         .collect()
 }
 
-fn hold_of(rig: &Rig, name: &str) -> Option<Hold> {
+pub(crate) fn hold_of(rig: &Rig, name: &str) -> Option<Hold> {
     let status = rig.coordinator.status(Some(OPERATOR)).expect("status");
     status.per_service["kbf"]
         .hosts
@@ -554,7 +554,7 @@ async fn a_host_that_failed_the_target_before_the_force_is_ordered_once_more() {
     assert_eq!(hold_of(&rig, "d1"), Some(Hold::FailedHere));
 }
 
-fn updating_of(mut b: Heartbeat, target: &str) -> Heartbeat {
+pub(crate) fn updating_of(mut b: Heartbeat, target: &str) -> Heartbeat {
     b.updating = Some(version(target));
     b
 }

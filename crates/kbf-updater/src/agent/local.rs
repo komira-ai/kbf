@@ -115,16 +115,31 @@ pub struct HostState {
 }
 
 impl HostState {
-    /// Whether the helper's list of kept releases names `target`: by its version text, or by
-    /// the commit the version carries. False when there is no list.
+    /// The commit of the release the helper's list of kept releases names for `target`: by its
+    /// version text, or by the commit the version carries. None when there is no list or it
+    /// holds no such release.
     #[must_use]
-    pub fn keeps(&self, target: &Version) -> bool {
-        self.releases.as_deref().is_some_and(|releases| {
-            releases.iter().any(|kept| {
+    pub(super) fn kept_commit(&self, target: &Version) -> Option<&str> {
+        self.releases
+            .as_deref()?
+            .iter()
+            .find(|kept| {
                 kept.version.as_ref() == Some(target)
                     || target.commit().is_some_and(|c| kept.commit.starts_with(c))
             })
-        })
+            .map(|kept| kept.commit.as_str())
+    }
+
+    /// Whether the release that runs is `target`: its version text, or the commit the version
+    /// carries (the helper keeps the label a release was installed under, which may be another
+    /// or none).
+    #[must_use]
+    pub(super) fn runs(&self, target: &Version) -> bool {
+        self.version.as_ref() == Some(target)
+            || target
+                .commit()
+                .zip(self.commit.as_deref())
+                .is_some_and(|(prefix, commit)| commit.starts_with(prefix))
     }
 }
 
@@ -166,8 +181,11 @@ pub trait Local: Send + Sync {
     /// Go back to the release that ran before the one on trial.
     fn revert(&self) -> Result<(), LocalError>;
     /// Make `version`, a release the host keeps, the one that runs for good: no trial, no
-    /// deadline, no revert. A helper that predates the request refuses it as `bad_command`.
-    fn activate(&self, version: &Version) -> Result<Activated, LocalError>;
+    /// deadline, no revert. `commit` is the commit the release must be (the kept entry's or the
+    /// staged one's; a prefix is enough): an answer that names another is a protocol error, and
+    /// the version label the helper answers with is whatever it keeps for that commit. A helper
+    /// that predates the request refuses it as `bad_command`.
+    fn activate(&self, version: &Version, commit: Option<&str>) -> Result<Activated, LocalError>;
 }
 
 /// The real helper, over its unix socket.
@@ -361,21 +379,34 @@ impl Local for SocketLocal {
             .map(drop)
     }
 
-    fn activate(&self, version: &Version) -> Result<Activated, LocalError> {
+    fn activate(&self, version: &Version, commit: Option<&str>) -> Result<Activated, LocalError> {
         let request = format!("activate kbf={}", version.as_str());
         let line = self.call(&request, Some(self.limits.revert), "activated")?;
         let named = version_of(line.version.as_deref())?;
-        match (line.commit, named) {
-            (_, Some(named)) if named != *version => Err(protocol(
-                "an activation of a release that is not the one asked for",
-            )),
-            (Some(commit), named) => Ok(Activated {
-                commit,
-                version: named,
-                from: line.from,
-            }),
-            (None, _) => Err(protocol("an activation without a commit")),
+        let answered = line
+            .commit
+            .ok_or_else(|| protocol("an activation without a commit"))?;
+        // The commit is what identifies the release; the label is the helper's own record.
+        match commit.or_else(|| version.commit()) {
+            Some(expected) if answered.starts_with(expected) => {}
+            Some(_) => {
+                return Err(protocol(
+                    "an activation of a release that is not the one asked for",
+                ));
+            }
+            // Nothing names a commit: the label is all there is to check.
+            None if named.as_ref() == Some(version) => {}
+            None => {
+                return Err(protocol(
+                    "an activation of a release that cannot be told from the one asked for",
+                ));
+            }
         }
+        Ok(Activated {
+            commit: answered,
+            version: named,
+            from: line.from,
+        })
     }
 }
 

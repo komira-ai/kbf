@@ -21,16 +21,15 @@
 //! the host keeps reporting it: a different `last_update` (another target, reason or class, or no
 //! halt at all) ends the host's acknowledgement ([`end_ack`]), and a halt reported after that is
 //! new. Design kbf#2197 section 3.8 also ends it when the host is ordered the acknowledged
-//! target, and leaves it standing for an order of another target. That order cannot be given
-//! while the acknowledgement stands: the only place an order is produced is
-//! `Coordinator::reply_to` (`service.rs`, the call of `Fleet::order`), after [`decide`], and
-//! `decide_marked` holds a host whose beat's `last_update` is a failure of the desired version
-//! (`Hold::FailedHere`, `decide.rs`) and one that is updating (`Hold::Updating`). The
-//! acknowledgement stands only while the host's beat carries the acknowledged report, a failed
-//! update of its target, and any other beat ends it in [`note`], before [`decide`] and
-//! durably, with no order for the service if the write fails. No operator verb lifts
-//! `FailedHere`, and a change of the desired state does not change what the host reports.
-//! A service the host is updating is not read: its `last_update` is the one before.
+//! target. Under the ordinary rules that order cannot be given while the acknowledgement
+//! stands (`decide_marked` holds a host whose `last_update` is a failure of the desired version,
+//! `Hold::FailedHere`), but an operator's force orders it again ([`crate::force`]). So the
+//! acknowledgement also ends when the host's beat shows it updating the service to the
+//! acknowledged target: the new attempt has started (an order that is lost, or that the agent
+//! declines, is no attempt and ends nothing), and the same report made after it is a new halt.
+//! An update to another target leaves it standing, as the design says. It ends in [`note`], before
+//! [`decide`] and durably, with no order for the service if the write fails. A service the host
+//! is updating is not otherwise read: its `last_update` is the one before.
 //!
 //! Each clear raises the service's generation by one. A reply to an agent that announced
 //! [`FEATURE`] carries the generation of every service the coordinator defines that has one
@@ -128,12 +127,12 @@ pub(crate) fn note(
 ) -> Vec<String> {
     let state = ops.state();
     let listed = beat.services.as_deref().unwrap_or_default();
-    let top = std::iter::once((KBF, beat.last_update.as_ref(), beat.updating.is_some()));
+    let top = std::iter::once((KBF, beat.last_update.as_ref(), beat.updating.as_ref()));
     let reports = top.chain(listed.iter().map(|one| {
         (
             one.name.as_str(),
             one.last_update.as_ref(),
-            one.updating.is_some(),
+            one.updating.as_ref(),
         )
     }));
     let mut held = Vec::new();
@@ -141,34 +140,43 @@ pub(crate) fn note(
         let counted = services.get(service).is_some_and(|def| {
             membership::standing(def, &who.node_id, node, &state, now) == Standing::Counted
         });
-        if updating || !counted {
+        if !counted {
             continue;
         }
-        let report = reported(last, &who.node_id);
-        if !end_ack(ops, service, &who.node_id, report.as_ref()) {
+        if let Some(target) = updating {
+            // A new attempt at the acknowledged target ends its acknowledgement; the host's
+            // report is the one before, and is not read.
+            let attempt = |ack: &HaltAck| ack.target == *target;
+            if !end_ack(ops, service, &who.node_id, attempt) {
+                held.push(service.to_owned());
+            }
+            continue;
+        }
+        let report = reported(last, &who.node_id).and_then(|halt| halt.report.clone());
+        let node = who.node_id.to_string();
+        let differs = |ack: &HaltAck| !report.as_ref().is_some_and(|r| ack.matches(&node, r));
+        if !end_ack(ops, service, &who.node_id, differs) {
             held.push(service.to_owned());
         }
-        if let Some(halt) = report {
+        if let Some(halt) = reported(last, &who.node_id) {
             raise(ops, service, halt);
         }
     }
     held
 }
 
-/// Ends the acknowledgement the host `id` has for `service`, unless `report`, the halt the
-/// host reports now, is the very one acknowledged: a different `last_update` (another target,
-/// reason or class, or no halt at all) is a different report, so a halt the host reports from
-/// then on is a new failure, even of the same target. Written before it is in memory: it
-/// removes protection, and one that stays on disk would swallow the new failure after a
-/// restart. Decided under the writers' lock, on the state it changes. Answers whether it
-/// holds: `false` when the write failed and the acknowledgement stands, so no order may go out
-/// before it is gone.
-fn end_ack(ops: &OpsStore, service: &str, id: &NodeId, report: Option<&Halt>) -> bool {
+/// Ends the acknowledgement the host `id` has for `service` when `ends` says so of it: when
+/// the halt the host reports now is not the very one acknowledged (a different `last_update`,
+/// another target, reason or class, or no halt at all, is a different report, so a halt the
+/// host reports from then on is a new failure, even of the same target), or when the host is
+/// updating the acknowledged target again. Written before it is in memory: it removes
+/// protection, and one that stays on disk would swallow the new failure after a restart.
+/// Decided under the writers' lock, on the state it changes. Answers whether it holds: `false`
+/// when the write failed and the acknowledgement stands, so no order may go out before it is
+/// gone.
+fn end_ack(ops: &OpsStore, service: &str, id: &NodeId, ends: impl Fn(&HaltAck) -> bool) -> bool {
     let node = id.to_string();
-    let report = report.and_then(|halt| halt.report.clone());
-    let differs = |ack: &HaltAck| {
-        ack.node_id == node && !report.as_ref().is_some_and(|r| ack.matches(&node, r))
-    };
+    let differs = |ack: &HaltAck| ack.node_id == node && ends(ack);
     let held = ops.read(|state| {
         state
             .services

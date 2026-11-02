@@ -74,6 +74,8 @@ mod desired_tests;
 #[cfg(test)]
 mod extras_dropped_tests;
 #[cfg(test)]
+mod force_edge_tests;
+#[cfg(test)]
 mod force_http_tests;
 #[cfg(test)]
 mod force_tests;

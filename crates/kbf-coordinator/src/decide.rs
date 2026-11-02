@@ -316,7 +316,7 @@ fn waits_for_service(
 /// and the order between services. The canary, the bake, `min_up`, a deferral, a bad mark and
 /// a halt hold nothing back.
 #[must_use]
-pub fn decide_forced(
+pub(crate) fn decide_forced(
     services: &Services,
     desired: &BTreeMap<String, Desired>,
     marks: &ServiceOps,

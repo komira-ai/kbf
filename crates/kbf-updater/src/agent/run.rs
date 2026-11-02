@@ -29,7 +29,8 @@ use std::time::Duration;
 use super::coordinator::{Coordinator, CoordinatorError};
 use super::flags::Timing;
 use super::hold::{
-    ANNOUNCED, Deferral, Features, Fit, Halt, Hold, MAX_RETRY_SECS, Marks, UNREADABLE_HALT, fit,
+    ANNOUNCED, Deferral, Features, Fit, ForcedMark, Halt, Hold, MAX_RETRY_SECS, Marks,
+    UNREADABLE_HALT, fit,
 };
 use super::local::{HostState, Local};
 use super::renew::Renewer;
@@ -98,6 +99,15 @@ pub struct ServicePorts {
 /// operator's force (the answer says so and the coordinator advertised `forced-v1`).
 type Order = (Option<String>, Version, bool);
 
+/// Queue `order` behind `orders`: the newest order of a service replaces the queued one, flag
+/// included, and the order of the services is the order they were first queued.
+pub(super) fn coalesce(orders: &mut Vec<Order>, order: Order) {
+    match orders.iter_mut().find(|(service, ..)| *service == order.0) {
+        Some(queued) => *queued = order,
+        None => orders.push(order),
+    }
+}
+
 /// What the agent keeps for one service: its ports and its state.
 struct Slot {
     /// `None` for `kbf`.
@@ -117,6 +127,10 @@ struct Slot {
     /// Why the service is held after a halt: no order for it runs while the coordinator
     /// advertises `halt-v1`.
     halted: Mutex<Option<Halt>>,
+    /// The release a force made the one that runs, as `(commit, the version the order named)`.
+    /// The helper keeps its own label for a commit (another, or none), so while that commit runs
+    /// the status says the order's version.
+    named: Mutex<Option<(String, Version)>>,
 }
 
 fn held<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -143,6 +157,7 @@ impl Slot {
             unhealthy: Mutex::new(None),
             deferral: Mutex::new(None),
             halted: Mutex::new(None),
+            named: Mutex::new(None),
         }
     }
 
@@ -312,24 +327,62 @@ impl Agent {
         self.refresh();
         // The updater was restarted in the middle of an A/B: the helper has a release on trial.
         // The first heartbeat says so, and the trial is finished before any other order.
-        let mut resumed = Vec::new();
-        for (i, slot) in self.slots.iter().enumerate() {
-            if let Some(target) = self.trial_in_progress(slot) {
-                slot.status.update(|s| s.updating = Some(target.clone()));
-                resumed.push((i, target));
-            }
-        }
+        let resumed = self.resumable();
         let (orders, inbox) = channel();
         std::thread::scope(|scope| {
             scope.spawn(|| self.heartbeats(stop, &orders));
             if let Some(renewer) = &self.world.renewer {
                 scope.spawn(|| self.renewals(renewer.as_ref(), stop));
             }
-            for (i, target) in &resumed {
-                self.update(&self.slots[*i], target, false);
-            }
+            self.resume(&resumed);
             self.updates(stop, &inbox);
         });
+    }
+
+    /// The trials the helpers have, as `(slot, target, forced)`: a trial of the target of a
+    /// forced update the agent had begun (its mark) is finished as a force. A mark with no
+    /// trial of its target is the rest of an update that did not get to its end, and is
+    /// removed: the host is on the release it ran, and the coordinator orders again.
+    pub(super) fn resumable(&self) -> Vec<(usize, Version, bool)> {
+        let mut resumed = Vec::new();
+        for (i, slot) in self.slots.iter().enumerate() {
+            let mark = self.marks.as_ref().and_then(|marks| {
+                marks.load_forced(slot.unit()).unwrap_or_else(|e| {
+                    self.log(&slot.say(&format!("a forced mark on disk is ignored: {e}")));
+                    None
+                })
+            });
+            let trial = self.trial_in_progress(slot);
+            let forced = mark
+                .as_ref()
+                .is_some_and(|mark| trial.as_ref() == Some(&mark.target));
+            if mark.is_some() && !forced {
+                self.log(&slot.say("an unfinished forced update is dropped: it left no trial"));
+                self.clear_forced(slot);
+            }
+            if let Some(target) = trial {
+                slot.status.update(|s| s.updating = Some(target.clone()));
+                resumed.push((i, target, forced));
+            }
+        }
+        resumed
+    }
+
+    /// Finish what [`Agent::resumable`] found.
+    pub(super) fn resume(&self, resumed: &[(usize, Version, bool)]) {
+        for (i, target, forced) in resumed {
+            self.update(&self.slots[*i], target, *forced);
+        }
+    }
+
+    fn clear_forced(&self, slot: &Slot) {
+        if let Some(marks) = &self.marks
+            && let Err(e) = marks.clear_forced(slot.unit())
+        {
+            self.log(&slot.say(&format!(
+                "the forced mark on disk could not be removed: {e}"
+            )));
+        }
     }
 
     /// Ask the host what each of its services runs and whether it is healthy, and say so in the
@@ -351,10 +404,20 @@ impl Agent {
     }
 
     fn note(&self, slot: &Slot, state: &HostState) {
-        let running = state
-            .version
-            .clone()
+        let mut named = held(&slot.named);
+        if named
+            .as_ref()
+            .is_some_and(|(c, _)| state.commit.as_ref() != Some(c))
+        {
+            // Another release runs now: the force's name for the old one is over.
+            *named = None;
+        }
+        let running = named
+            .as_ref()
+            .map(|(_, version)| version.clone())
+            .or_else(|| state.version.clone())
             .or_else(|| state.commit.as_deref().and_then(version_of_commit));
+        drop(named);
         let Some(running) = running else {
             self.log_health(
                 slot,
@@ -505,10 +568,7 @@ impl Agent {
                 // same. They run one after the other: the host updates one service at a time.
                 let mut orders = vec![first];
                 for order in inbox.try_iter() {
-                    match orders.iter_mut().find(|(s, ..)| *s == order.0) {
-                        Some(queued) => *queued = order,
-                        None => orders.push(order),
-                    }
+                    coalesce(&mut orders, order);
                 }
                 for (service, target, forced) in &orders {
                     self.order(service.as_deref(), target, *forced);
@@ -608,7 +668,14 @@ impl Agent {
             .copied()
             .unwrap_or(0);
         let done = if forced {
-            update.run_forced_for(target, self.features())
+            self.mark_forced(slot, target);
+            let done = update.run_forced_for(target, self.features());
+            self.clear_forced(slot);
+            *held(&slot.named) = done
+                .activated
+                .clone()
+                .map(|commit| (commit, target.clone()));
+            done
         } else {
             update.run_for(target, self.features())
         };
@@ -621,6 +688,23 @@ impl Agent {
         *held(&slot.failed) = (done.result.outcome == Outcome::Failed && !deferred)
             .then(|| (done.result.target.clone(), self.world.clock.now()));
         self.refresh();
+    }
+
+    /// A forced update of `slot` to `target` begins: its mark goes to disk first. A mark that
+    /// cannot be written is logged and the force goes on without it.
+    fn mark_forced(&self, slot: &Slot, target: &Version) {
+        if let Some(marks) = &self.marks
+            && let Err(e) = marks.save_forced(
+                slot.unit(),
+                &ForcedMark {
+                    target: target.clone(),
+                },
+            )
+        {
+            self.log(&slot.say(&format!(
+                "the forced mark could not be recorded on disk, so a restart in the middle would not finish it as a force: {e}"
+            )));
+        }
     }
 
     /// The unit cannot be repaired by a retry: hold it, under the clear generation of the last

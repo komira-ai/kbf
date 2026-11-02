@@ -79,11 +79,18 @@ pub(super) fn result(target: &Version, outcome: Outcome) -> UpdateResult {
 pub struct Done {
     pub result: UpdateResult,
     pub hold: Option<Hold>,
+    /// The commit a force made the one that runs, so the agent can say the target for it while
+    /// the helper keeps another label (or none) for that commit.
+    pub(super) activated: Option<String>,
 }
 
 impl From<UpdateResult> for Done {
     fn from(result: UpdateResult) -> Self {
-        Self { result, hold: None }
+        Self {
+            result,
+            hold: None,
+            activated: None,
+        }
     }
 }
 
