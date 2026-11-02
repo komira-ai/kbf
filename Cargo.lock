@@ -3348,7 +3348,6 @@ dependencies = [
  "host-step",
  "mdm-core",
  "rustls",
- "rustls-native-certs",
  "sha2 0.11.0",
  "tar",
  "thiserror",
@@ -5363,6 +5362,7 @@ dependencies = [
  "rustls-pki-types",
  "ureq-proto",
  "utf8-zero",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -5548,6 +5548,15 @@ checksum = "88261b9deccee56594c11a3460c462c41f58d148598fe70ad77070126a68aba4"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f5f280bbb2b287bc8e7de7e3852945a0ff50d1bbcb5ed42b6c7a568c546df171"
+dependencies = [
+ "rustls-pki-types",
 ]
 
 [[package]]

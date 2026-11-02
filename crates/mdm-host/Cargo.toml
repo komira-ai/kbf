@@ -21,11 +21,12 @@ hex.workspace = true
 host-step.workspace = true
 mdm-core.workspace = true
 rustls.workspace = true
-rustls-native-certs.workspace = true
 sha2.workspace = true
 tar.workspace = true
 thiserror.workspace = true
-ureq.workspace = true
+# The bundled public web roots (webpki-roots), as the tool trusted before it moved here:
+# downloads trust a fixed root set, never one the host or its environment can change.
+ureq = { workspace = true, features = ["rustls-webpki-roots"] }
 
 [lints]
 workspace = true

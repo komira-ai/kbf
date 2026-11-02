@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use rustls::crypto::ring::default_provider;
 use ureq::Agent;
-use ureq::tls::{Certificate, RootCerts, TlsConfig, TlsProvider};
+use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
 
 /// How long one download may take, whole.
 const TIMEOUT: Duration = Duration::from_secs(600);
@@ -21,7 +21,7 @@ pub trait Download {
 
 /// [`Download`] over ureq: redirects are followed (release assets are served from a
 /// redirect target), every hop must be `https://` when `https_only`, no proxy setting is
-/// read, and the host's trusted roots (its system store) are trusted.
+/// read, and the public web roots are trusted.
 pub struct Net {
     agent: Agent,
 }
@@ -29,14 +29,9 @@ pub struct Net {
 impl Net {
     /// An agent; `https_only` is true outside tests.
     pub fn new(https_only: bool) -> Net {
-        let roots = rustls_native_certs::load_native_certs()
-            .certs
-            .iter()
-            .map(|c| Certificate::from_der(c.as_ref()).to_owned())
-            .collect();
         let tls = TlsConfig::builder()
             .provider(TlsProvider::Rustls)
-            .root_certs(RootCerts::Specific(Arc::new(roots)))
+            .root_certs(RootCerts::WebPki)
             .unversioned_rustls_crypto_provider(Arc::new(default_provider()))
             .build();
         let agent = Agent::config_builder()
