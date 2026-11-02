@@ -401,9 +401,9 @@ fn a_frontend_given_the_js_core_runs_it_and_serves_a_lease_end_to_end() {
             ..Action::default()
         };
         let action = put(&cas, action.encode_to_vec()).await;
-        let result = tokio::time::timeout(PROMPT, execute(channel, action))
-            .await
-            .expect("the action ran in time");
+        // No bound of its own: a lease that never ends is a hung test, which nextest's
+        // slow-timeout ends.
+        let result = execute(channel, action).await;
         assert_eq!(result.exit_code, 0, "{result:?}");
         let stdout = fetch(&cas, &result.stdout_digest.expect("a stdout digest"))
             .await
@@ -424,21 +424,24 @@ fn a_frontend_given_the_js_core_runs_it_and_serves_a_lease_end_to_end() {
 /// (it would run while the flag says otherwise), a refusal with a status other than 2, and
 /// one whose message does not name both flags. Each of `--learned-sizes=on` and
 /// `--no-memory-climb` beside `--scheduler-core=js` ends the start, before a start line, with
-/// status 2 and the error naming the flag and `--scheduler-core js`. Control: the same start
-/// with `--learned-sizes=shadow`, which the js core runs, prints its start line.
+/// status 2 and the error naming the flag and `--scheduler-core js`, logs no core, and leaves
+/// its state store uncreated (the refusal comes before anything opens). Control: the same
+/// start with `--learned-sizes=shadow`, which the js core runs, prints its start line and has
+/// created its state store by then.
 #[test]
 fn a_frontend_refuses_the_js_core_with_a_flag_it_cannot_run() {
     let dir = scratch("js-core-refused");
     let addrs = Addrs::new();
-    let start = |extra: &[&str], stderr: Stdio| {
-        let at = |name: &str| dir.join(name).display().to_string();
+    // Each start has a state store of its own, so a refused start that opened (and so
+    // created) it is seen.
+    let start = |state: &Path, extra: &[&str], stderr: Stdio| {
         Command::new(BIN)
             .args([
                 "--mode=frontend".to_owned(),
                 "--listen=127.0.0.1:0".to_owned(),
                 format!("--worker-listen={}", addrs.worker),
                 format!("--storage=http://{}", addrs.storage),
-                format!("--state-store=sqlite://{}", at("state.db")),
+                format!("--state-store=sqlite://{}", state.display()),
                 kbf_testkit::config::flag(&dir),
             ])
             .args(extra)
@@ -447,11 +450,16 @@ fn a_frontend_refuses_the_js_core_with_a_flag_it_cannot_run() {
             .spawn()
             .expect("spawn")
     };
-    for (flag, named) in [
-        ("--learned-sizes=on", "--learned-sizes on"),
-        ("--no-memory-climb", "--no-memory-climb"),
+    for (flag, named, state) in [
+        (
+            "--learned-sizes=on",
+            "--learned-sizes on",
+            "state-learned.db",
+        ),
+        ("--no-memory-climb", "--no-memory-climb", "state-climb.db"),
     ] {
-        let mut child = start(&["--scheduler-core=js", flag], Stdio::piped());
+        let state = dir.join(state);
+        let mut child = start(&state, &["--scheduler-core=js", flag], Stdio::piped());
         let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
         // A refused start ends its stdout with no line; a frontend that started prints its
         // start line, and is killed when `running` drops.
@@ -463,18 +471,33 @@ fn a_frontend_refuses_the_js_core_with_a_flag_it_cannot_run() {
         assert_eq!(line, "", "{flag}: the frontend started");
         let mut said = String::new();
         std::io::Read::read_to_string(&mut stderr.expect("stderr"), &mut said).expect("read");
-        let status = running.wait();
+        // Its stderr has ended, so the process has: no bound is needed to reap it.
+        let mut running = running;
+        let status = running.0.wait().expect("wait");
         assert_eq!(status.code(), Some(2), "{flag}: {status} {said}");
         assert!(said.contains(named), "{flag}: {said}");
         assert!(said.contains("--scheduler-core js"), "{flag}: {said}");
+        assert!(
+            !said.contains("scheduler core:"),
+            "{flag}: a core ran: {said}"
+        );
+        assert!(!state.exists(), "{flag}: {} was created", state.display());
     }
 
     let shadow = ["--scheduler-core=js", "--learned-sizes=shadow"];
-    let mut shadow = start(&shadow, Stdio::null());
+    let state = dir.join("state-shadow.db");
+    let mut shadow = start(&state, &shadow, Stdio::null());
     let stdout = BufReader::new(shadow.stdout.take().expect("stdout"));
     let running = Running(shadow);
     let line = stdout.lines().next().expect("a start line").expect("read");
     assert!(line.starts_with("kbf-frontend "), "{line}");
+    // The control opens its store before it prints the start line, so the check of the
+    // refused starts' stores above can fail.
+    assert!(
+        state.exists(),
+        "the started frontend made no {}",
+        state.display()
+    );
     drop(running);
 }
 
