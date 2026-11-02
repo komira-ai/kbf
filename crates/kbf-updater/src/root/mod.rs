@@ -711,7 +711,17 @@ pub fn run_config(
     flags: &flags::Flags,
     config: Config,
     parts: Parts,
-    ready: impl FnOnce(Stop),
+    ready: impl FnOnce(Stop) + '_,
+) -> (u8, String) {
+    run_ready(flags, config, parts, Box::new(ready))
+}
+
+/// [`run_config`] with `ready` boxed: one copy of the start, whatever the caller's `ready` is.
+fn run_ready(
+    flags: &flags::Flags,
+    config: Config,
+    parts: Parts,
+    ready: Box<dyn FnOnce(Stop) + '_>,
 ) -> (u8, String) {
     match serve(flags, config, parts, ready) {
         Ok(()) => (0, String::new()),
@@ -723,7 +733,7 @@ fn serve(
     flags: &flags::Flags,
     config: Config,
     parts: Parts,
-    ready: impl FnOnce(Stop),
+    ready: Box<dyn FnOnce(Stop) + '_>,
 ) -> Result<(), String> {
     let accounts = Arc::clone(&parts.accounts);
     let agent = accounts.user(&flags.socket_user).ok_or_else(|| {

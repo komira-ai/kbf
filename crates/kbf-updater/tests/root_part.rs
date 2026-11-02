@@ -932,6 +932,34 @@ fn a_state_directory_that_cannot_be_listed_is_reported_by_the_read_after_a_boot(
     assert_eq!(unread[0].0, "", "{unread:?}");
 }
 
+/// Catches a verdict whose leavings fail quietly: after a successful update the declaration kept
+/// for a restore is dropped, and when it cannot be (here a directory stands at its name) the
+/// answer says so instead of reporting the update done.
+#[test]
+fn a_kept_declaration_that_cannot_be_dropped_after_a_success_is_an_error() {
+    let world = World::new("settle-error");
+    world.declare("svc", &world.tierstore_shaped());
+    world.stage("svc", "1.0.0", None);
+    root_support::dir(&world.path("state"), 0o700);
+    root_support::dir(&world.path("state/svc"), 0o700);
+    root_support::dir(&world.path("state/svc/declaration.previous"), 0o700);
+    let answer = world.root_part().update("svc", "1.0.0");
+    assert_eq!(answer.token(), Some("internal"), "{answer:?}");
+}
+
+/// Catches a `current` link left unchanged in silence: when the release that succeeded cannot be
+/// made `current` (here a directory stands at the link's temporary name) the answer says so.
+#[test]
+fn a_release_that_cannot_be_made_current_after_a_success_is_an_error() {
+    let world = World::new("current-error");
+    world.declare("svc", &world.tierstore_shaped());
+    world.stage("svc", "1.0.0", None);
+    root_support::dir(&world.path("releases/svc/.current.tmp"), 0o700);
+    let answer = world.root_part().update("svc", "1.0.0");
+    assert_eq!(answer.token(), Some("internal"), "{answer:?}");
+    assert!(fs::read_link(world.path("releases/svc/current")).is_err());
+}
+
 /// Catches a boot rule kept only for the services whose declaration loaded: after a boot the
 /// root part reads the record of a service whose declaration is refused as well, so the
 /// `cutover` the boot cut off is rolled back once the declaration is put right, in the same boot,
