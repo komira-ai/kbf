@@ -7,6 +7,70 @@ fn read(path: &str) -> String {
     std::fs::read_to_string(crate::repo_root().join(path)).expect(path)
 }
 
+/// The jobs of the real `release.yml`, in file order.
+fn real_jobs() -> Vec<String> {
+    real_jobs_of(&read(RELEASE))
+}
+
+fn real_jobs_of(workflow: &str) -> Vec<String> {
+    workflows::job_names(workflow).expect("the workflow parses")
+}
+
+/// `preferred`, or it with `-new` added until it names no job of `taken`.
+fn fresh(taken: &[String], preferred: &str) -> String {
+    let mut name = preferred.to_owned();
+    while taken.contains(&name) {
+        name.push_str("-new");
+    }
+    name
+}
+
+/// `doc` with `edit` applied to the text between the markers only.
+fn in_table(doc: &str, edit: impl FnOnce(&str) -> String) -> String {
+    let (head, rest) = doc.split_once(BEGIN).expect("the doc has the begin marker");
+    let (table, tail) = rest.split_once(END).expect("the doc has the end marker");
+    format!("{head}{BEGIN}{}{END}{tail}", edit(table))
+}
+
+/// `doc` with the job table's row of `from` naming `to`; the table has that row once.
+fn rename_row(doc: &str, from: &str, to: &str) -> String {
+    let row = format!("\n| `{from}` |");
+    in_table(doc, |t| {
+        assert_eq!(t.matches(&row).count(), 1, "one row of `{from}`");
+        t.replacen(&row, &format!("\n| `{to}` |"), 1)
+    })
+}
+
+/// `doc` without the job table's row of `job`.
+fn remove_row(doc: &str, job: &str) -> String {
+    let row = format!("| `{job}` |");
+    in_table(doc, |t| {
+        assert_eq!(
+            t.matches(&format!("\n{row}")).count(),
+            1,
+            "one row of `{job}`"
+        );
+        t.split_inclusive('\n')
+            .filter(|l| !l.starts_with(&row))
+            .collect()
+    })
+}
+
+/// `workflow` with the job `from` renamed `to`; its header is there exactly once.
+fn rename_job(workflow: &str, from: &str, to: &str) -> String {
+    let header = format!("\n  {from}:\n");
+    assert_eq!(workflow.matches(&header).count(), 1, "one job `{from}`");
+    workflow.replacen(&header, &format!("\n  {to}:\n"), 1)
+}
+
+/// `workflow` without its last job `job`, which nothing after it needs.
+fn remove_last_job(workflow: &str, job: &str) -> String {
+    let header = format!("\n  {job}:\n");
+    assert_eq!(workflow.matches(&header).count(), 1, "one job `{job}`");
+    let at = workflow.find(&header).expect("the header is there");
+    workflow[..=at].to_owned()
+}
+
 /// A small workflow with three jobs, for the shape tests.
 const WORKFLOW: &str = "\
 name: release
@@ -76,19 +140,19 @@ fn a_wrong_job_name_in_the_doc_fails() {
 }
 
 #[test]
-fn the_real_doc_with_a_job_renamed_fails() {
-    let real = read(DOC);
-    let spoiled = real.replacen("| `rehearse-agent` |", "| `rehearse-agents` |", 1);
-    assert_ne!(spoiled, real, "the real doc has a `rehearse-agent` row");
-    assert_eq!(
-        problems(&spoiled, &read(RELEASE)),
-        vec![
-            format!(
-                "{DOC}: the job table names job `rehearse-agents`, which {RELEASE} does not have"
-            ),
-            format!("{DOC}: {RELEASE} has job `rehearse-agent`, which the job table omits"),
-        ]
-    );
+fn the_real_doc_with_any_job_renamed_fails() {
+    let (real, jobs) = (read(DOC), real_jobs());
+    for job in &jobs {
+        let other = fresh(&jobs, &format!("{job}-renamed"));
+        assert_eq!(
+            problems(&rename_row(&real, job, &other), &read(RELEASE)),
+            vec![
+                format!("{DOC}: the job table names job `{other}`, which {RELEASE} does not have"),
+                format!("{DOC}: {RELEASE} has job `{job}`, which the job table omits"),
+            ],
+            "renaming the row of `{job}`"
+        );
+    }
 }
 
 #[test]
@@ -103,19 +167,139 @@ fn a_workflow_job_the_doc_omits_fails() {
 
 #[test]
 fn a_job_added_to_the_real_workflow_fails() {
-    let real = read(RELEASE);
+    let (real, jobs) = (read(RELEASE), real_jobs());
+    let added = fresh(&jobs, "prod");
+    assert_eq!(
+        real.matches("\njobs:\n").count(),
+        1,
+        "release.yml has one `jobs:` line"
+    );
     let spoiled = real.replacen(
         "\njobs:\n",
-        "\njobs:\n  prod:\n    runs-on: ubuntu-24.04\n    steps:\n      - run: true\n",
+        &format!("\njobs:\n  {added}:\n    runs-on: ubuntu-24.04\n    steps:\n      - run: true\n"),
         1,
     );
-    assert_ne!(spoiled, real, "release.yml has a `jobs:` line");
     assert_eq!(
         problems(&read(DOC), &spoiled),
         vec![format!(
-            "{DOC}: {RELEASE} has job `prod`, which the job table omits"
+            "{DOC}: {RELEASE} has job `{added}`, which the job table omits"
         )]
     );
+}
+
+#[test]
+fn a_job_renamed_in_both_the_workflow_and_the_doc_passes() {
+    let jobs = real_jobs();
+    let last = jobs.last().expect("release.yml has jobs");
+    let other = fresh(&jobs, &format!("{last}-renamed"));
+    let workflow = rename_job(&read(RELEASE), last, &other);
+    assert_eq!(
+        problems(&rename_row(&read(DOC), last, &other), &workflow),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn a_job_removed_from_both_the_workflow_and_the_doc_passes() {
+    let jobs = real_jobs();
+    let last = jobs.last().expect("release.yml has jobs");
+    let workflow = remove_last_job(&read(RELEASE), last);
+    assert_eq!(real_jobs_of(&workflow), jobs[..jobs.len() - 1].to_vec());
+    assert_eq!(
+        problems(&remove_row(&read(DOC), last), &workflow),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn a_job_removed_from_the_workflow_alone_fails() {
+    let jobs = real_jobs();
+    let last = jobs.last().expect("release.yml has jobs");
+    assert_eq!(
+        problems(&read(DOC), &remove_last_job(&read(RELEASE), last)),
+        vec![format!(
+            "{DOC}: the job table names job `{last}`, which {RELEASE} does not have"
+        )]
+    );
+}
+
+#[test]
+fn a_fresh_name_is_never_one_already_taken() {
+    let taken = ["prod".to_owned(), "prod-new".to_owned()];
+    assert_eq!(fresh(&taken, "prod"), "prod-new-new");
+    assert_eq!(fresh(&taken, "beta"), "beta");
+    let jobs = real_jobs();
+    for job in &jobs {
+        let name = fresh(&jobs, job);
+        assert!(!jobs.contains(&name), "`{name}` is a job of release.yml");
+    }
+}
+
+#[test]
+fn a_row_inside_a_code_fence_does_not_count() {
+    for fence in ["```", "~~~", "```markdown"] {
+        let d = doc(&["plan", "publish", "gamma"])
+            .replace("| `gamma` |", &format!("{fence}\n| `gamma` |"))
+            .replace(&format!("{END}\n"), &format!("{}\n{END}\n", &fence[..3]));
+        assert_eq!(
+            problems(&d, WORKFLOW),
+            vec![
+                format!(
+                    "{DOC}:10: a code fence inside the job table: a row there would not render, so the table holds none"
+                ),
+                format!(
+                    "{DOC}:12: a code fence inside the job table: a row there would not render, so the table holds none"
+                ),
+            ],
+            "fence {fence}"
+        );
+    }
+}
+
+#[test]
+fn a_row_inside_an_html_comment_does_not_count() {
+    let one_line =
+        doc(&["plan", "publish", "gamma"]).replace("| `gamma` |", "<!-- | `gamma` | -->");
+    assert_eq!(
+        problems(&one_line, WORKFLOW),
+        vec![format!(
+            "{DOC}:10: an HTML comment inside the job table: a row there would not render, so the table holds none"
+        )]
+    );
+    let spanning =
+        doc(&["plan", "publish", "gamma"]).replace("| `gamma` |", "<!--\n| `gamma` |\n-->");
+    assert_eq!(
+        problems(&spanning, WORKFLOW),
+        vec![
+            format!(
+                "{DOC}:10: an HTML comment inside the job table: a row there would not render, so the table holds none"
+            ),
+            format!(
+                "{DOC}:12: an HTML comment inside the job table: a row there would not render, so the table holds none"
+            ),
+        ]
+    );
+}
+
+#[test]
+fn a_row_indented_as_code_does_not_count() {
+    for indent in ["    ", "\t", "  \t", "        "] {
+        let d = doc(&["plan", "publish", "gamma"])
+            .replace("| `gamma` |", &format!("{indent}| `gamma` |"));
+        assert_eq!(
+            problems(&d, WORKFLOW),
+            vec![format!(
+                "{DOC}:10: an indented code block inside the job table: a row there would not render, so the table holds none"
+            )],
+            "indent {indent:?}"
+        );
+    }
+}
+
+#[test]
+fn a_row_indented_less_than_code_is_a_row() {
+    let d = doc(&["plan", "publish", "gamma"]).replace("| `gamma` |", "   | `gamma` |");
+    assert_eq!(problems(&d, WORKFLOW), Vec::<String>::new());
 }
 
 #[test]

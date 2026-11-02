@@ -47,7 +47,9 @@ listed in order in section 4.
 
 - **Hosts drive their own updates.** The coordinator holds one desired version per
   service. Each host's updater asks for it and runs the service's update hook. Nothing
-  connects to a host to install a release, and the release workflow never reaches a host.
+  connects to a host to install a release. The release workflow talks only to the
+  coordinator (to set the desired version) and to the farm's remote-execution endpoint
+  (for the proof build), never to a host.
   There is no signed release feed, no `offer`, and no stage entry a host reads.
 - **Releases are automatic from `main`.** No tag is pushed by hand, no release is started
   by hand, and there is no release dry run. A failed release job is re-run from its run's
@@ -80,12 +82,14 @@ listed in order in section 4.
 |---|---|---|
 | `ci.yml` | `lint`, `test-shard`, `test`, `task-macos` | the merge: formatting, clippy, the repository lints, `cargo deny`, the fast tests in shards, and 99% line and branch coverage per crate. It also runs `cargo xtask release main-control`, a lint of the release workflow's main-only rule, not a release run. |
 | `update-rehearsal.yml` | `rehearse`, `rehearse-agent`, `rehearse-tierstore` | a change to the helper, installer, coordinator, updater, OIDC or CA crates, to `deploy-farm` or `release farm-version`, to `packaging/host-agent/linux`, or to the workflow itself (path filter). It updates a host on a runner from the previous release. It holds the run's read-only token, no write scope and no secret, and publishes nothing. |
+| `host-install-linux.yml` | `real-linux` | a change to the helper or to `packaging/host-agent/linux` (path filter): the helper's unit and drop-in tests as root under real systemd. It holds `contents: read` only. The release does not need it. |
 | `artifacts.yml` | the build and sums jobs | only with the label `needs-artifacts`: a build check that attests nothing. |
 
 `beta.yml` and `smoke.yml` have no trigger of their own (`workflow_call` only), so a pull
-request never runs them. `update-rehearsal.yml` also runs on a push to `main` that touches
-the same paths, and it can be started by hand (`workflow_dispatch`). It is the only workflow
-of this path that can be, and it publishes nothing.
+request never runs them. `update-rehearsal.yml` and `host-install-linux.yml` also run on a
+push to `main` that touches their paths, and both can be started by hand
+(`workflow_dispatch`). They test; neither publishes, tags or holds a write scope, and no
+release waits for either.
 
 ### 2.2 On a push to `main`: `pipeline.yml`
 
@@ -221,7 +225,7 @@ releases again, and its `gamma` sets a newer version. Only `RELEASE_FREEZE` stop
 | M6 | After a red gamma, set the farm back: choose the version, and set it as desired. Only a CI token can, so that means re-running an earlier release's `gamma` job. | every red gamma | by hand | G1 (the ordinary case), G2 (when CI is gone), C1 (when the ordinary rules hold the farm) |
 | M7 | Go back on a host when the coordinator is down or cannot order it | rare | by hand. `kbf-deploy host rollback` serves hand-laid hosts only. On a package host, the helper's `revert` goes back only from a release on trial, and `switch` needs a release staged by `install`, on a trial clock. Nothing switches to any other kept release. | H1, H2 |
 | M8 | Update a Mac: it takes no update order yet, because the installer has no lease source for a launchd job ([kbf-installer-macos.md](../deploy/kbf-installer-macos.md), "What is still by hand") | every release | by hand | G8 |
-| M9 | Update a farm's only frontend. A frontend is never the last one up, so the coordinator never orders it. The operator sends `install`, `switch` and `confirm` to the helper's socket in a window. | every release, on a one-frontend farm | by hand | stays by hand: run two frontends behind a load balancer (farm shape, [frontends-behind-a-load-balancer.md](../deploy/frontends-behind-a-load-balancer.md)) |
+| M9 | Update a farm's only frontend, or its only storage host. A frontend is never the last one up, and a lone storage host with the default storage minimum (`KBF_MIN_UP_STORAGE` unset, so 1) would leave none up, so the coordinator orders neither, and `gamma` fails at its stall or deadline. The operator sends `install`, `switch` and `confirm` to the helper's socket in a window. | every release, on such a farm | by hand ([kbf-updater.md](../deploy/kbf-updater.md), "A frontend host") | stays by hand: it is the operator's choice between an outage and more hosts. Either run two frontends behind a load balancer ([frontends-behind-a-load-balancer.md](../deploy/frontends-behind-a-load-balancer.md)) and two storage hosts, or set `KBF_MIN_UP_STORAGE` to 0 and accept that the storage host is down while it updates. |
 | M10 | Clear a halt that a host's hook reported (komira-ai/kbf#2187, open) | when a hook halts | will be by hand | stays by hand: a halt asks for a person by design |
 | M11 | Re-run a release job that failed for a reason outside the commit | rare | by hand, failed jobs only | stays by hand: the next code push releases the same code anyway |
 
@@ -240,7 +244,7 @@ never by elapsed time.
 | 2 | G2 kbf ships automatic rollback | M6 (CI gone) | none (komira-ai/kbf#2181 merged) | komira-ai/kbf#2240 |
 | 3 | C1 coordinator `force` | M6 (farm held by its rules) | komira-ai/kbf#2187 | komira-ai/kbf#2241 |
 | 4 | H1 local `activate` | M7 | none (komira-ai/kbf#2233 merged) | komira-ai/kbf#2242 |
-| 5 | H2 the agent's pin | M7 | H1 | komira-ai/kbf#2243 |
+| 5 | H2 the agent's pin | M7 | H1 (and C1 for its force case) | komira-ai/kbf#2243 |
 | 6 | G6 agent and helper units in the package | M3 | komira-ai/kbf#2236 | komira-ai/kbf#2244 |
 | 7 | G7 the coordinator updated by the updater | M2 | G6, [host-updates.md](host-updates.md) step 6a | komira-ai/kbf#2245 |
 | 8 | G8 a Mac takes update orders | M8 | the Mac lease users ([macos-end-state.md](macos-end-state.md), steps 3 and 4) | komira-ai/kbf#2246 |
@@ -252,44 +256,98 @@ is the largest.
 
 ### G1. A red gamma sets the farm back
 
-**Change.** `deploy-farm` already reads `GET /v1/convergence` before it sets anything. It
-now writes the `desired` it read there to the job's outputs as `baseline`.
+**Change.** The PR has two parts. The baseline the job goes back to is kept by the
+coordinator, not by the job, so it is there whatever happened to the job.
 
-A last step of the `gamma` job runs when an earlier step of the job failed and `baseline`
-is not empty. It runs `cargo xtask deploy-farm restore --to <baseline>`, which does three
-things:
+1. **The coordinator records what a write replaced.** These additions are additive, and
+   they are on the control API only.
+   - A service's desired state gains `generation` and `replaced`.
+   - `generation` is raised by every write that changes the state.
+   - `replaced` holds the version and the minimums that the write replaced. Setting the
+     same version again changes neither field, so `replaced` still names the version the
+     farm ran before this release.
+   - `POST /v1/desired` answers with both fields, and `GET /v1/convergence` shows them.
+   - `POST /v1/desired` takes an optional `if_generation`. When it does not name the current
+     generation, the write is refused with 409 `conflict` and changes nothing.
+2. **`cargo xtask deploy-farm restore --version <this release>`** is the last step of the
+   `gamma` job, run when an earlier step of the job failed. It reads `GET /v1/convergence`.
+   When the desired version is this release, it does three things:
+   - It sets `replaced` (version and minimums) as desired, with `if_generation` set to the
+     generation it read. It uses the same CI identity with a fresh OIDC token: the
+     coordinator accepts each token once, so no call reuses one. A 503 is retried as on
+     every other call.
+   - It prints what it set.
+   - It exits 1, so the run stays red.
 
-1. It sets that version as desired once, with the same CI token.
-2. It prints what it set.
-3. It exits 1, so the run stays red.
+It sets nothing, and says why, in each of these cases:
 
-It sets nothing in three cases, and says why in each:
-
-- the desired version is no longer this release's (another writer, a newer release, or the
+- the desired version is another one (another writer, a newer release, or the
   coordinator's own rollback has it now);
-- the coordinator has no earlier desired version (a first deploy);
+- `replaced` is empty (a first deploy);
+- the coordinator shows no `generation` (it is older than this change): the restore names
+  the forced rollback instead;
 - `KBF_COORDINATOR_URL` is unset.
 
-It sends the same minimums (`min_up`) as the set it undoes, because a desired write
-replaces the whole state. It is an ordinary desired set, so it goes through the ordinary
-rules.
+A 409 means a write came in between the read and the restore, even one that set the same
+version again. That write stands, and the restore exits 1 naming the desired version now.
 
-G1 stays after G2: the coordinator's automatic rollback sees only what hosts report, and
-`prove-farm` checks the whole farm, which no host reports.
+The baseline is the coordinator's record, so two cases restore the right version:
 
-`release_workflow` pins the step, its condition and its place as the job's last step.
+- the forward write took effect but its answer was lost;
+- a failed job is re-run while the desired version is already this release.
 
-**Tests** (`crates/xtask`, a fake coordinator):
+In both, the restore sets the version the farm ran before this release, never this release.
 
-- a failed proof after a green convergence makes exactly one `POST /v1/desired` of the
-  baseline, with the same minimums, after the release's own;
+**Time.** The workflow passes `--deadline-min` to `deploy-farm` explicitly. The job's
+`timeout-minutes` must leave room after it for the proof and the restore, and
+`release_workflow` checks that. A run that is cancelled, or that a runner loses before the
+last step, restores nothing. `GET /v1/convergence` still shows `replaced`, and the operator
+then does one of two things:
+
+- re-runs the failed jobs. The forward write sets the same version and changes nothing,
+  and the restore step runs.
+- or uses C1 `force` to `replaced`.
+
+It is an ordinary desired set, so it goes through the ordinary rules. G1 stays after G2:
+the coordinator's automatic rollback sees only what hosts report, and `prove-farm` checks
+the whole farm, which no host reports.
+
+`release_workflow` pins the step, its condition, its place as the job's last step, and the
+job's timeout.
+
+**Tests:**
+
+Coordinator:
+
+- a write records `replaced` and raises `generation`;
+- setting the same version again keeps both;
+- a stale `if_generation` is refused with 409 and changes nothing, including after writes
+  that went from A to B and back to A in between;
+- a request without `if_generation` behaves as today.
+
+`deploy-farm`, against a fake coordinator driven by handshakes:
+
+- a failed proof after a green convergence makes exactly one `POST /v1/desired` of
+  `replaced`, with its minimums and `if_generation`, after the release's own;
 - a `blocked`, a stall, a deadline and a lost host each do the same;
-- `Superseded` makes no second post and names the writer's version;
-- an empty baseline makes no post and says "nothing to go back to";
-- a 403 on the restore exits 1 and names the forced rollback;
-- a green run makes no restore;
-- the workflow lint fails on a copy of `release.yml` without the step, or with the step
-  given another condition.
+- the forward write is stored but its answer is dropped, and the restore still sets
+  `replaced`;
+- a re-run, with the desired version already this release, restores `replaced` and not
+  this release;
+- a competing write, applied by the fake when the restore's read arrives, gets the
+  restore a 409. The competing write survives, and the run exits 1 naming it;
+- the restore presents a token no earlier call used. The fake refuses a replayed `jti`
+  with 401, and the restore still lands;
+- `Superseded` and an empty `replaced` make no post;
+- a coordinator without `generation` makes no post, and the run names the forced
+  rollback;
+- a 503 on every attempt of the restore, and a 403, each exit 1, naming `replaced` and
+  the forced rollback;
+- a green run makes no restore.
+
+Workflow lint: it fails on a copy of `release.yml` that lacks the step, gives it another
+condition, or has a job timeout that leaves no room for the proof and the restore after
+the deadline.
 
 ### G2. kbf ships automatic rollback
 
@@ -314,35 +372,71 @@ file that replaces the `kbf` entry still decides for its farm.
 **Change.** A new operator action `force {service, version, reason, max_updating?}` on
 `POST /v1/operator`, for the operator token only. A CI token gets 403.
 
-It bypasses the canary, the bake, `min_up`, a deferral, a bad mark on the target, a
-standing halt and `min_version`. It keeps the role order and `max_updating`, which the
-request may raise.
+It bypasses:
+
+- the canary;
+- the bake;
+- `min_up`;
+- a deferral;
+- a bad mark on the target;
+- a standing halt;
+- each host's record that it failed the target before. A force lifts it, as a new desired
+  version does, while ordinary writes keep today's rule 4.
+
+It keeps:
+
+- the role order;
+- `max_updating`, which the request may raise;
+- `min_version`. A force below the service's `min_version` (the first release that has the
+  host-updates hook) is refused with that reason, and names the manual path.
 
 Its effects, each one audited:
 
 - the desired state is set with `forced: true` and a new force generation;
 - a halt is cleared through the same path as the operator's clear (komira-ai/kbf#2187);
 - the target is unmarked;
-- the version left is marked bad;
+- the version left is marked bad, so the coordinator never orders it on its own again:
+  automatic rollback never chooses it. An explicit CI desired write of it still clears
+  the mark, as today;
 - `last_good` moves only after the forced version has converged.
 
-A host's forced slot is freed when it reports running the forced version, whether or not
-it is healthy. The order carries an additive `forced: true`. The agent skips its
-revert-on-unhealthy but still reports health. A force below the first release that has the
-host-updates hook is refused with that reason. The next ordinary desired write ends the
-forced state.
+**On the host.** A host's forced slot is freed when it reports running the forced version,
+whether or not it is healthy. The agent that takes a forced order activates the target
+without a trial, so the helper's trial deadline never reverts it:
+
+- on a host that keeps the release, it uses H1 `activate`;
+- otherwise it runs `install`, `switch` and `confirm` at once, without waiting for health.
+
+It still reports health.
+
+**On the wire.** The agent parses the coordinator's reply with unknown fields refused
+(`RawReply`, `RawServiceReply`), so `forced` is sent only to an agent that announced
+`forced-v1` in `agent_features`, as `halt-v1` is today. An older agent gets today's reply
+shape. It goes back the ordinary way, with its own revert-on-unhealthy, and its slot is
+freed the ordinary way.
+
+The next ordinary desired write ends the forced state.
 
 **Tests:**
 
 - a force reaches every live host despite a halt, a bad mark, `min_up` and a deferral;
+- a host that failed the target before receives the forced order, while an ordinary write
+  of the same target still withholds it;
 - the halt is cleared, and the three effects are in the audit;
-- the version left is marked bad, and setting it again without unmarking it is refused;
+- the version left is never chosen by automatic rollback, and an explicit CI write of it
+  clears the mark and orders it;
 - `last_good` moves only after convergence;
 - `max_updating`, and a raised value, are honoured;
 - a CI token gets 403;
+- a force exactly at `min_version` is accepted, and one release below it is refused with
+  its reason;
 - hosts that report unhealthy after the swap still all receive the force;
-- a force below `min_version` is refused with its reason;
-- an old agent without `forced` still goes back.
+- an unhealthy forced target stays. The helper's injected clock is moved past the trial
+  deadline it would have had, the helper is restarted, and the host still runs the
+  target;
+- the reply sent to an agent that did not announce `forced-v1` parses with the previous
+  release's reply parser (a golden of its shape). That agent goes back when the target is
+  healthy, and reverts by its own rule when it is not.
 
 ### H1. Local `activate`
 
@@ -354,6 +448,16 @@ It refuses a release the host does not keep, and lists the ones it keeps. It tak
 install lock and refuses a live holder. `--force-lock` takes a dead holder's lock and
 audits it. It runs nothing from the release being left. It works on Linux and on a Mac.
 
+With `--pin`, the order is fixed so that a crash leaves the host held:
+
+1. it writes the hold file (H2) and syncs it, under the install lock;
+2. it switches;
+3. it records the switch.
+
+A crash after step 1 leaves a host that is held but not yet on the pinned release.
+Running `activate` again finishes the swap, and the heartbeat shows the pin and the
+release that runs, so the gap is visible.
+
 **Tests:**
 
 - `activate` swaps to a kept release with the network cut;
@@ -361,19 +465,36 @@ audits it. It runs nothing from the release being left. It works on Linux and on
 - the swap runs nothing from the release being left;
 - it refuses a live lock holder;
 - `--force-lock` takes a dead holder's lock and audits it;
+- for `--pin`, a crash injected at each step boundary, followed by a restart, leaves the
+  host held, and the next `activate` completes the swap;
 - the same on a Mac (type-checked in CI, run in the Mac job of `beta.yml`).
 
 ### H2. The agent's pin
 
-**Change.** `activate --pin` writes a root-owned hold file. While the file exists, the
-agent takes no order and reports `pinned <commit>` in every heartbeat. The coordinator
-shows the host as pinned and counts it neither failed nor converged.
-`kbf-host-install unpin`, or a C1 force naming the same commit, clears the pin.
+**Change.** `activate --pin` writes a root-owned hold file. While the file exists:
+
+- the agent takes no order, and reports `pinned <commit>` in every heartbeat (an additive
+  field);
+- the helper refuses `install` and `switch` from the agent (`pinned`), so an update the
+  agent accepted before the pin cannot complete after it.
+
+The coordinator shows the host as pinned, and counts it neither failed nor converged.
+`kbf-host-install unpin` clears the pin.
+
+A C1 force can also clear it. The coordinator sends a pinned host an order only when a
+force names exactly the pinned commit: `Update { version, forced, unpin }`. This is the one
+order a pinned host takes, even though the host already runs that version. The agent
+removes the hold, through the helper, and switches nothing. An ordinary order, or a force
+of another commit, leaves the pin.
 
 **Tests:**
 
 - a pinned host is not driven by the next heartbeat's order;
-- the coordinator shows it pinned and counts it neither failed nor converged;
+- the coordinator shows it pinned, and counts it neither failed nor converged;
+- an update accepted before the pin cannot finish: the fake agent sends `switch` after the
+  hold file appears, and the helper refuses it;
+- a force naming the pinned commit clears the pin and switches nothing;
+- an ordinary order, and a force of another commit, leave the pin;
 - `unpin` restores following the desired version;
 - an older coordinator that does not know the field ignores it, and the host still holds.
 
