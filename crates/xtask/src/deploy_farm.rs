@@ -467,9 +467,26 @@ pub fn deploy_on(
             .build()
             .into()
     };
-    let client = Client {
+    let transport = UreqTransport {
         runner: agent(roots.runner),
         coordinator: agent(roots.coordinator),
+    };
+    deploy_with(plan, service, &transport, clock, out)
+}
+
+/// [`deploy_on`] over a transport it is given (the URL is not checked here).
+///
+/// # Errors
+/// [`Error`]: anything but `converged`.
+pub fn deploy_with(
+    plan: &Plan,
+    service: &TokenService,
+    transport: &dyn Transport,
+    clock: &Clock<'_>,
+    out: &mut impl Write,
+) -> Result<(), Error> {
+    let client = Client {
+        transport,
         plan,
         service,
         clock,
@@ -591,9 +608,76 @@ fn log(out: &mut dyn Write, text: &str) -> Result<(), Error> {
         .map_err(|e| Error::Output(e.to_string()))
 }
 
-struct Client<'a> {
+/// Who a call goes to: each has its own trust roots.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Peer {
+    /// The runner's OIDC token service.
+    Runner,
+    /// The farm's update coordinator.
+    Coordinator,
+}
+
+/// One HTTP call.
+#[derive(Clone, Copy, Debug)]
+pub struct Call<'a> {
+    pub peer: Peer,
+    /// `GET` or `POST`.
+    pub method: &'static str,
+    pub url: &'a str,
+    /// The whole `Authorization` header value.
+    pub authorization: &'a str,
+    /// The JSON text of a POST.
+    pub body: Option<&'a str>,
+}
+
+/// What a call got back.
+#[derive(Clone, Debug)]
+pub struct Answer {
+    pub status: u16,
+    /// The body text, or why it could not be read.
+    pub body: Result<String, String>,
+}
+
+/// How calls reach the peers: HTTPS in production, memory in tests.
+pub trait Transport {
+    /// # Errors
+    /// Why the call did not get an answer.
+    fn call(&self, call: Call<'_>) -> Result<Answer, String>;
+}
+
+/// The production transport: one `ureq` agent per peer.
+struct UreqTransport {
     runner: ureq::Agent,
     coordinator: ureq::Agent,
+}
+
+impl Transport for UreqTransport {
+    fn call(&self, call: Call<'_>) -> Result<Answer, String> {
+        let agent = match call.peer {
+            Peer::Runner => &self.runner,
+            Peer::Coordinator => &self.coordinator,
+        };
+        let mut response = match call.body {
+            Some(body) => agent
+                .post(call.url)
+                .header("Authorization", call.authorization)
+                .content_type("application/json")
+                .send(body),
+            None => agent
+                .get(call.url)
+                .header("Authorization", call.authorization)
+                .call(),
+        }
+        .map_err(|e| e.to_string())?;
+        Ok(Answer {
+            status: response.status().as_u16(),
+            body: answer_text(&mut response),
+        })
+    }
+}
+
+struct Client<'a> {
+    transport: &'a dyn Transport,
     plan: &'a Plan,
     service: &'a TokenService,
     clock: &'a Clock<'a>,
@@ -638,16 +722,20 @@ impl Client<'_> {
         url.push(if url.contains('?') { '&' } else { '?' });
         url.push_str("audience=");
         url.push_str(&percent_encode(&self.plan.audience));
-        let mut response = self
-            .runner
-            .get(&url)
-            .header("Authorization", format!("Bearer {}", self.service.key))
-            .call()
-            .map_err(|e| call(e.to_string()))?;
-        let status = response.status().as_u16();
-        let text = answer_text(&mut response).map_err(call)?;
-        if status != 200 {
-            return Err(call(format!("status {status}")));
+        let authorization = format!("Bearer {}", self.service.key);
+        let answer = self
+            .transport
+            .call(Call {
+                peer: Peer::Runner,
+                method: "GET",
+                url: &url,
+                authorization: &authorization,
+                body: None,
+            })
+            .map_err(call)?;
+        let text = answer.body.map_err(call)?;
+        if answer.status != 200 {
+            return Err(call(format!("status {}", answer.status)));
         }
         let value: Value = serde_json::from_str(&text).map_err(|e| call(e.to_string()))?;
         let token = value["value"]
@@ -670,25 +758,22 @@ impl Client<'_> {
         let call = |why: String| Error::Call { what, why };
         let bearer = format!("Bearer {}", self.token(out)?);
         let url = format!("{}{path}", self.plan.url);
-        let mut response = match body {
-            Some(body) => self
-                .coordinator
-                .post(&url)
-                .header("Authorization", bearer)
-                .content_type("application/json")
-                .send(body.to_string().as_str()),
-            None => self
-                .coordinator
-                .get(&url)
-                .header("Authorization", bearer)
-                .call(),
-        }
-        .map_err(|e| call(e.to_string()))?;
-        let status = response.status().as_u16();
+        let body = body.map(Value::to_string);
+        let answer = self
+            .transport
+            .call(Call {
+                peer: Peer::Coordinator,
+                method: if body.is_some() { "POST" } else { "GET" },
+                url: &url,
+                authorization: &bearer,
+                body: body.as_deref(),
+            })
+            .map_err(call)?;
+        let status = answer.status;
         if matches!(status, 401 | 403) {
             return Err(Error::Refused { what, status });
         }
-        let text = answer_text(&mut response).map_err(call)?;
+        let text = answer.body.map_err(call)?;
         if status != 200 {
             return Err(call(format!("status {status}")));
         }
