@@ -59,6 +59,15 @@ struct Farm {
 
 impl Farm {
     async fn start(name: &str, extra: &[&str]) -> Self {
+        Self::start_in(name, extra, false).await
+    }
+
+    /// [`Farm::start`] with a `--worker-deny-list` file, empty at the start: [`Farm::deny_list`].
+    async fn with_deny_list(name: &str) -> Self {
+        Self::start_in(name, &[], true).await
+    }
+
+    async fn start_in(name: &str, extra: &[&str], deny_list: bool) -> Self {
         let dir = kbf_testkit::dir::TestDir::under(
             env!("CARGO_TARGET_TMPDIR"),
             &format!("kbf-worker-revocation-{name}"),
@@ -117,6 +126,11 @@ impl Farm {
             format!("--worker-client-ca={}", ca_dir.join("ca.pem").display()),
         ]);
         argv.extend(extra.iter().map(|a| (*a).to_owned()));
+        if deny_list {
+            let list = dir.join("deny.list");
+            std::fs::write(&list, "").expect("the deny list");
+            argv.push(format!("--worker-deny-list={}", list.display()));
+        }
         let flags: FrontendFlags = frontend::parse(
             &frontend::command()
                 .try_get_matches_from(argv)
@@ -312,34 +326,27 @@ impl Session {
     }
 }
 
+/// The node a resent `Hello` names in [`Session::ended_by`]: never the stream's own.
+const STRANGER: &str = "node-99";
+
 impl Session {
-    /// Sends `message`, then a heartbeat behind it, and reads the server's side until the
-    /// first of: the stream ends (the status), or the heartbeat is acknowledged (`None`). The
-    /// messages in between are returned. The stream is read in order, so when the heartbeat
-    /// has been answered `message` has been handled, and when the stream ended it ended at
-    /// `message` or at the heartbeat: which of the two is told by the refusal counts
-    /// ([`Farm::refused`]), not by this.
-    async fn ended_by(
-        mut self,
-        message: daemon_message::Message,
-    ) -> (Vec<ServerMessage>, Option<Status>) {
+    /// Sends `message`, then a resent `Hello` naming [`STRANGER`], and reads the server's side
+    /// until the stream ends; returns what came before the end, and the end. The stream is
+    /// read in order, and a `Hello` naming another node is refused before the deny list is
+    /// read, with its own text. So a stream that ends with that text took `message`, and one
+    /// that ends with another refusal ended at `message`.
+    async fn ended_by(mut self, message: daemon_message::Message) -> (Vec<ServerMessage>, Status) {
         send(&self.tx, message);
         // The stream may be closed by now: that is the answer, not an error.
         let _ = self.tx.unbounded_send(DaemonMessage {
-            message: Some(daemon_message::Message::Heartbeat(Heartbeat {
-                seq: 99,
-                ..Heartbeat::default()
-            })),
+            message: Some(hello(STRANGER)),
         });
         let mut seen = Vec::new();
         loop {
             match self.inbound.message().await {
-                Ok(Some(ServerMessage {
-                    message: Some(server_message::Message::HeartbeatAck(_)),
-                })) => return (seen, None),
                 Ok(Some(reply)) => seen.push(reply),
                 Ok(None) => panic!("the stream ended cleanly: {seen:?}"),
-                Err(status) => return (seen, Some(status)),
+                Err(status) => return (seen, status),
             }
         }
     }
@@ -369,18 +376,9 @@ impl Farm {
         serde_json::from_str(&body).expect("JSON")
     }
 
-    /// The refusal counts on `/metrics`, by message kind.
-    async fn refused(&self) -> std::collections::BTreeMap<String, u64> {
-        let (status, body) = self.call("GET", "/metrics".to_owned(), "").await;
-        assert_eq!(status, 200, "{body}");
-        let prefix = "kbf_worker_admission_refused_total{message=\"";
-        body.lines()
-            .filter_map(|line| line.strip_prefix(prefix))
-            .map(|rest| {
-                let (kind, count) = rest.split_once("\"} ").expect("a sample");
-                (kind.to_owned(), count.parse().expect("a count"))
-            })
-            .collect()
+    /// The `--worker-deny-list` file of a farm started [`Farm::with_deny_list`].
+    fn deny_list(&self) -> std::path::PathBuf {
+        self.dir.join("deny.list")
     }
 
     /// Enrolls `node`, opens its session, makes sure it is heard, and revokes it.
@@ -462,31 +460,30 @@ async fn taking_a_revoked_node_off_the_deny_list_readmits_it() {
     assert!(session.is_ok(), "readmitted: {:?}", session.err());
 }
 
-fn assert_denied(ended: Option<Status>) {
-    let status = ended.expect("the stream ended");
-    assert_eq!(status.code(), Code::PermissionDenied, "{status:?}");
+/// Asserts that `ended` is the refusal of the message [`Session::ended_by`] sent, with
+/// `code`, and not of the resent `Hello` behind it, which only a stream that took the
+/// message reads.
+fn assert_ended_at_the_message(ended: &Status, code: Code) {
+    assert_eq!(ended.code(), code, "{ended:?}");
+    assert!(
+        !ended.message().contains(STRANGER),
+        "the message was taken; the Hello behind it ended the stream: {ended:?}"
+    );
 }
 
-/// Asserts that the worker listener refused exactly one message, of kind `message`: the
-/// one the test sent, not the heartbeat behind it.
-async fn assert_refused_once(farm: &Farm, message: &str) {
-    let counts = farm.refused().await;
-    let expected = [
-        "hello",
-        "heartbeat",
-        "result",
-        "node_status",
-        "map_request",
-        "update_status",
-    ]
-    .map(|kind| (kind.to_owned(), u64::from(kind == message)));
-    assert_eq!(counts, expected.into_iter().collect(), "refusals");
+/// [`assert_ended_at_the_message`] for a revoked node: PERMISSION_DENIED, by the deny list.
+fn assert_denied(ended: &Status) {
+    assert_ended_at_the_message(ended, Code::PermissionDenied);
+    assert!(ended.message().starts_with("denied: "), "{ended:?}");
 }
 
 /// A revoked node's `Result` is refused before the farm sees it: the stream ends
-/// PERMISSION_DENIED and no `ResultAck` follows. The farm answers a `Result` for a lease it
-/// does not hold with a refusing `ResultAck`, so an acknowledgement here would mean the
-/// result reached it.
+/// PERMISSION_DENIED at the `Result`, not at the `Hello` behind it, and no `ResultAck` comes
+/// first. The farm answers a `Result` for a lease it does not hold with a refusing
+/// `ResultAck`, so an acknowledgement would mean the result reached it.
+///
+/// Catches: a `Result` handed to the farm without the admission check, which would let a
+/// revoked daemon write its output into the action cache on a stream still open.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_revoked_nodes_result_is_refused_and_never_reaches_the_farm() {
     let farm = Farm::start("result", &[]).await;
@@ -496,13 +493,17 @@ async fn a_revoked_nodes_result_is_refused_and_never_reaches_the_farm() {
         ..kbf_proto::worker::Result::default()
     };
     let (seen, ended) = open.ended_by(daemon_message::Message::Result(result)).await;
-    assert_denied(ended);
-    assert_refused_once(&farm, "result").await;
+    assert_denied(&ended);
     assert!(seen.is_empty(), "{seen:?}");
 }
 
 /// A revoked node's `NodeStatus` is refused and leaves the node's view as it was (no
-/// software status), while the same message from a node that is not revoked is kept.
+/// software status), while the same message from a node that is not revoked is kept, and
+/// that node's stream, having taken the message, ends at the `Hello` behind it (the control
+/// of [`Session::ended_by`]).
+///
+/// Catches: a `NodeStatus` taken without the admission check, or kept before it, which would
+/// let a revoked node write what the operator API reports for it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_revoked_nodes_node_status_does_not_reach_the_node_view() {
     let farm = Farm::start("node-status", &[]).await;
@@ -516,17 +517,23 @@ async fn a_revoked_nodes_node_status_does_not_reach_the_node_view() {
     let mut fine = farm.session(&other, "node-08").await.expect("not revoked");
     fine.handled(status(), 1).await;
     assert!(!farm.node("node-08").await["software"].is_null());
+    let (seen, taken) = fine.ended_by(status()).await;
+    assert_eq!(taken.code(), Code::PermissionDenied, "{taken:?}");
+    assert!(taken.message().contains(STRANGER), "{taken:?}");
+    assert!(seen.is_empty(), "{seen:?}");
 
     let open = farm.revoked("node-07").await;
     let (seen, ended) = open.ended_by(status()).await;
-    assert_denied(ended);
-    assert_refused_once(&farm, "node_status").await;
+    assert_denied(&ended);
     assert!(seen.is_empty(), "{seen:?}");
     assert!(farm.node("node-07").await["software"].is_null());
 }
 
-/// A revoked node's `UpdateStatus` is refused: the stream ends PERMISSION_DENIED at it, which
-/// the refusal count shows (the heartbeat behind it is never read).
+/// A revoked node's `UpdateStatus` is refused: the stream ends PERMISSION_DENIED at it, not
+/// at the `Hello` behind it.
+///
+/// Catches: an `UpdateStatus` taken without the admission check, which would let a revoked
+/// node write the update state the update controller reads for it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_revoked_nodes_update_status_is_refused() {
     let farm = Farm::start("update-status", &[]).await;
@@ -538,14 +545,16 @@ async fn a_revoked_nodes_update_status_is_refused() {
     let (seen, ended) = open
         .ended_by(daemon_message::Message::UpdateStatus(status))
         .await;
-    assert_denied(ended);
-    assert_refused_once(&farm, "update_status").await;
+    assert_denied(&ended);
     assert!(seen.is_empty(), "{seen:?}");
 }
 
-/// A revoked node's `MapRequest` is refused: the stream ends PERMISSION_DENIED at it, which
-/// the refusal count shows. This frontend holds no map yet, so an admitted request would be
-/// answered with nothing.
+/// A revoked node's `MapRequest` is refused: the stream ends PERMISSION_DENIED at it, not at
+/// the `Hello` behind it. (This frontend holds no map, so a request it took would be answered
+/// with nothing; what tells the two apart is where the stream ended.)
+///
+/// Catches: a `MapRequest` taken without the admission check, which would let a revoked node
+/// go on pulling the storage map.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_revoked_nodes_map_request_is_refused() {
     let farm = Farm::start("map-request", &[]).await;
@@ -555,14 +564,16 @@ async fn a_revoked_nodes_map_request_is_refused() {
             at_least: 1,
         }))
         .await;
-    assert_denied(ended);
-    assert_refused_once(&farm, "map_request").await;
+    assert_denied(&ended);
     assert!(seen.is_empty(), "{seen:?}");
 }
 
 /// A revoked node's resent `Hello` does not resize the node: its capacity stays what its
 /// first `Hello` reported, while the same resent `Hello` from a node that is not revoked
 /// changes it.
+///
+/// Catches: a resent `Hello` taken without the admission check, or applied before it, which
+/// would let a revoked node change the capacity the scheduler places work by.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_revoked_nodes_resent_hello_does_not_resize_the_node() {
     let farm = Farm::start("resent-hello", &[]).await;
@@ -574,8 +585,34 @@ async fn a_revoked_nodes_resent_hello_does_not_resize_the_node() {
 
     let open = farm.revoked("node-07").await;
     let (seen, ended) = open.ended_by(hello_with_cpus("node-07", "3")).await;
-    assert_denied(ended);
-    assert_refused_once(&farm, "hello").await;
+    assert_denied(&ended);
     assert!(seen.is_empty(), "{seen:?}");
     assert_eq!(farm.node("node-07").await["capacity"]["cpu_millis"], 1000);
+}
+
+/// A deny list that cannot be read refuses a node's message UNAVAILABLE before the farm sees
+/// it: the stream ends at the `NodeStatus`, not at the `Hello` behind it, and the node's view
+/// keeps no software status. The node is not revoked: the refusal is the unreadable list's.
+///
+/// Catches: an admission check that lets a message through when the list cannot be read, or
+/// that turns that failure into another code, so that a list broken by an operator's bad edit
+/// would admit every revoked node.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_deny_list_that_cannot_be_read_refuses_a_node_status_unavailable() {
+    let farm = Farm::with_deny_list("deny-unreadable").await;
+    let node = farm.enrolled("node-07").await;
+    let mut open = farm.session(&node, "node-07").await.expect("admitted");
+    assert!(matches!(open.heartbeat(1).await, Ok(Some(_))));
+
+    std::fs::write(farm.deny_list(), "not an entry\n").expect("the deny list");
+    let (seen, ended) = open
+        .ended_by(daemon_message::Message::NodeStatus(NodeStatus {
+            os_name: "Ubuntu".to_owned(),
+            ..NodeStatus::default()
+        }))
+        .await;
+    assert_ended_at_the_message(&ended, Code::Unavailable);
+    assert!(ended.message().contains("deny list"), "{ended:?}");
+    assert!(seen.is_empty(), "{seen:?}");
+    assert!(farm.node("node-07").await["software"].is_null());
 }

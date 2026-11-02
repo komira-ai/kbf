@@ -176,7 +176,6 @@ pub mod verbs;
 pub mod vitals;
 pub mod whole_node;
 pub mod worker;
-mod worker_refusals;
 pub mod worker_roles;
 pub mod write_tier;
 
