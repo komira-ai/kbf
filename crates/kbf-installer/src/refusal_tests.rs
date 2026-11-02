@@ -123,12 +123,30 @@ fn every_case() -> Vec<(&'static str, Refusal)> {
             "archive-malformed",
             archive(ArchiveFault::NotTarGz("eof".into())),
         ),
-        ("archive-entries", archive(ArchiveFault::Entries(2))),
+        ("archive-entries", archive(ArchiveFault::Entries(0))),
         (
             "archive-name",
             archive(ArchiveFault::WrongName("kbf".into())),
         ),
-        ("archive-not-regular", archive(ArchiveFault::NotRegular)),
+        (
+            "archive-not-regular",
+            archive(ArchiveFault::NotRegular {
+                name: "kbf".into(),
+                kind: "symbolic link",
+            }),
+        ),
+        (
+            "archive-unsafe-path",
+            archive(ArchiveFault::UnsafePath("../kbf".into())),
+        ),
+        (
+            "archive-duplicate",
+            archive(ArchiveFault::Duplicate("kbf".into())),
+        ),
+        (
+            "archive-request",
+            archive(ArchiveFault::Request("kbf".into())),
+        ),
         (
             "archive-oversize",
             archive(ArchiveFault::Oversize { cap: 10 }),
