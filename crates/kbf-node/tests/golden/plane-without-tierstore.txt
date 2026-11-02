@@ -6,7 +6,5 @@ get 1d5ffad67590e170f0b0c9c4de56f99e1209969bddb074fb0eb0aebeaab79570/9 -> Ok("in
 read_to 1d5ffad67590e170f0b0c9c4de56f99e1209969bddb074fb0eb0aebeaab79570/9 -> Ok(""), file "head:input two"
 get 5ad38304b535c2987dbd24657c1a11b884984ff600d9f389deb0d4e634fee792/6 -> Err(Missing("5ad38304b535c2987dbd24657c1a11b884984ff600d9f389deb0d4e634fee792/6"))
 read_to 5ad38304b535c2987dbd24657c1a11b884984ff600d9f389deb0d4e634fee792/6 -> Err(Missing("5ad38304b535c2987dbd24657c1a11b884984ff600d9f389deb0d4e634fee792/6")), file "head:"
-failing: get 1d5ffad67590e170f0b0c9c4de56f99e1209969bddb074fb0eb0aebeaab79570/9 -> Err(Unavailable("front", "the frontend is down"))
-failing: get 1d5ffad67590e170f0b0c9c4de56f99e1209969bddb074fb0eb0aebeaab79570/9 -> Err(Corrupt("front", "another digest"))
 lease get 9c13bf8d6f0b276c515b353a3493fa3367cbd7e8ad5488dfa1b2346698d20faa/9 -> Ok("input one")
-frontend calls ["put", "missing", "get", "read_to", "get", "read_to", "get", "read_to", "get", "get", "lease", "get"]
+the frontend holds the output -> Ok("an output")

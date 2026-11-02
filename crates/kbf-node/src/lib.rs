@@ -544,7 +544,16 @@ fn farm(
     maps: &Arc<MapHolder>,
     liveness: Liveness,
 ) -> Result<(Arc<FarmCas>, Liveness), Error> {
-    let server = Arc::new(transfer::engine(cli)?);
+    farm_over(cli, maps, liveness, Arc::new(transfer::engine(cli)?))
+}
+
+/// [`farm`] over the engine `server`, which a test gives an in-process channel.
+fn farm_over(
+    cli: &Cli,
+    maps: &Arc<MapHolder>,
+    liveness: Liveness,
+    server: Arc<kbf_transfer::Transfers>,
+) -> Result<(Arc<FarmCas>, Liveness), Error> {
     let nodes = kbf_daemon::storage_nodes(&DaemonConfig::from_args(&cli.daemon).tls, liveness)?;
     tracing::info!(
         "data plane: through --cas until the frontend sends a storage map, then to the \
