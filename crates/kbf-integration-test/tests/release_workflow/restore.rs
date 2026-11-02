@@ -10,9 +10,16 @@
 //!   flag.
 //! - **Time.** Every step of the job has a `timeout-minutes` of its own; the deploy is given
 //!   `--deadline-min` explicitly and its step's timeout is at least that and
-//!   [`DEPLOY_ROOM_MIN`] more; the restore's is at least [`RESTORE_MIN`]; and the job's
+//!   covers [`xtask::deploy_farm::deploy_bound`] of that deadline and of its `--every-secs`; the
+//!   restore's covers [`xtask::deploy_farm::restore::bound`]; each with [`START_MIN`] more to
+//!   start the program. The bounds are the clients' own: their call timeout, their tries and
+//!   their pauses, the token's call included. And the job's
 //!   `timeout-minutes` is at least the sum of the steps'. A step that hangs is then cut by its
 //!   own timeout and fails, the restore runs, and the job's timeout cannot cut the restore.
+
+use std::time::Duration;
+
+use xtask::deploy_farm::{EVERY_SECS, deploy_bound, restore};
 
 use super::{GAMMA, NONCE, command, flag_is, lines, value, workflows};
 
@@ -22,13 +29,15 @@ pub const RESTORE_IF: &str = "${{ failure() }}";
 /// The verb of the restore step.
 const RESTORE: &str = "cargo xtask deploy-farm restore ";
 
-/// The minutes the deploy step needs beyond its deadline: the reads and the POST before the
-/// deadline starts, each tried again on a 503, and the last read.
-pub const DEPLOY_ROOM_MIN: u64 = 15;
+/// The minutes a step needs, beyond the bound of the verb it runs, to start the program
+/// (`cargo xtask`, built by an earlier step of the job).
+pub const START_MIN: u64 = 1;
 
-/// The fewest minutes the restore step may have: two reads and a POST, each tried four times
-/// with a pause of 30 seconds, and a call bounded at 60 seconds.
-pub const RESTORE_MIN: u64 = 10;
+/// The whole minutes a step of a verb whose longest run is `bound` needs: the bound rounded
+/// up, and [`START_MIN`].
+pub fn step_minutes(bound: std::time::Duration) -> u64 {
+    bound.as_secs().div_ceil(60) + START_MIN
+}
 
 /// The words of the restore, exactly: each flag once, with its variable.
 pub const RESTORE_FLAGS: [(&str, &str); 4] = [
@@ -193,21 +202,28 @@ fn time(
             .find(|s| lines(s).any(|l| l.starts_with(prefix)))
             .and_then(|s| minutes(s.timeout_minutes.as_deref()))
     };
+    let every = value(deploy, "--every-secs")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(EVERY_SECS);
+    let every = Duration::from_secs(every);
     match value(deploy, "--deadline-min").and_then(|m| m.parse::<u64>().ok()) {
         None => out.push(
             "`cargo xtask deploy-farm` is not given `--deadline-min <minutes>`: its step's timeout must leave room after the deadline".to_owned(),
         ),
         Some(deadline) => {
-            if step_of("cargo xtask deploy-farm --url ").is_some_and(|n| n < deadline + DEPLOY_ROOM_MIN) {
+            let need = step_minutes(deploy_bound(Duration::from_secs(deadline * 60), every));
+            if step_of("cargo xtask deploy-farm --url ").is_some_and(|n| n < need) {
                 out.push(format!(
-                    "the deploy step's `timeout-minutes` is less than its deadline ({deadline}) and {DEPLOY_ROOM_MIN} minutes more: it would be cut before it ends by itself"
+                    "the deploy step's `timeout-minutes` is less than {need}, the longest the deploy with a deadline of {deadline} minutes can run (its reads and POST tried again, the token's calls included) and {START_MIN} to start: it would be cut before it ends by itself"
                 ));
             }
         }
     }
-    if step_of(RESTORE).is_some_and(|n| n < RESTORE_MIN) {
+    // The restore is given no `--every-secs` (its flags are exactly four): its default.
+    let need = step_minutes(restore::bound(Duration::from_secs(EVERY_SECS)));
+    if step_of(RESTORE).is_some_and(|n| n < need) {
         out.push(format!(
-            "the restore step's `timeout-minutes` is less than {RESTORE_MIN}: it could be cut before its tries end"
+            "the restore step's `timeout-minutes` is less than {need}, the longest the restore can run (two reads and a POST, each tried again, the token's calls included) and {START_MIN} to start: it could be cut before its tries end"
         ));
     }
     let job = workflows::job_scalar(release, GAMMA, "timeout-minutes")?;

@@ -114,10 +114,13 @@ fn the_restore_is_given_the_deploys_address_version_and_the_run() {
 #[test]
 fn every_step_is_bounded_and_the_job_timeout_covers_them_all() {
     // Catches: a step that can hang until the job's timeout cuts the restore, and a budget
-    // that does not add up: a step with no timeout of its own (the proof, the build), a
-    // deadline left to the verb's default, a deploy step cut before its deadline ends it, a
-    // restore with less than its tries need, and a job timeout one minute below the sum of
-    // its steps'. A longer job timeout is fine.
+    // shorter than the verbs can run: a step with no timeout of its own (the proof, the
+    // build), a deadline left to the verb's default, a deploy step shorter than the deploy's
+    // longest run (83 minutes for a deadline of 60: its baseline read and POST each tried four
+    // times with tokens, the deadline, a last read; 82 is short, as is 85 for a deadline of
+    // 63, or for a pause raised to 60 seconds), a restore step shorter than the restore's (30
+    // minutes: three calls each tried four times with tokens; 29 and the earlier 10 are short),
+    // and a job timeout one minute below the sum of its steps'. A longer job timeout is fine.
     let proof = "      - name: Prove the farm with a remote-only Buck2 build\n        timeout-minutes: 20\n";
     red(
         &plant(
@@ -139,33 +142,60 @@ fn every_step_is_bounded_and_the_job_timeout_covers_them_all() {
         &plant("gamma", "--deadline-min 60 ", ""),
         "is not given `--deadline-min <minutes>`",
     );
+    let deploy = "      - name: Set this release as the farm's desired version, and wait for the farm to converge\n";
+    let short_deploy = plant(
+        "gamma",
+        &format!("{deploy}        timeout-minutes: 85\n"),
+        &format!("{deploy}        timeout-minutes: 82\n"),
+    );
     red(
-        &plant("gamma", "--deadline-min 60 ", "--deadline-min 61 "),
-        "less than its deadline (61) and 15 minutes more",
+        &short_deploy,
+        "the deploy step's `timeout-minutes` is less than 83",
+    );
+    let at_bound = plant(
+        "gamma",
+        &format!("{deploy}        timeout-minutes: 85\n"),
+        &format!("{deploy}        timeout-minutes: 83\n"),
+    );
+    assert!(at_bound.is_empty(), "{at_bound:#?}");
+    red(
+        &plant("gamma", "--deadline-min 60 ", "--deadline-min 63 "),
+        "the deploy step's `timeout-minutes` is less than 86",
     );
     red(
         &plant(
             "gamma",
-            "        timeout-minutes: 10\n        if: ${{ failure() }}\n",
-            "        timeout-minutes: 9\n        if: ${{ failure() }}\n",
+            "--deadline-min 60 ",
+            "--deadline-min 60 --every-secs 60 ",
         ),
-        "the restore step's `timeout-minutes` is less than 10",
+        "the deploy step's `timeout-minutes` is less than",
     );
+    let restore = "        timeout-minutes: 30\n        if: ${{ failure() }}\n";
+    for short in ["29", "10"] {
+        red(
+            &plant(
+                "gamma",
+                restore,
+                &format!("        timeout-minutes: {short}\n        if: ${{{{ failure() }}}}\n"),
+            ),
+            "the restore step's `timeout-minutes` is less than 30",
+        );
+    }
     red(
         &plant(
             "gamma",
-            "    timeout-minutes: 170\n",
-            "    timeout-minutes: 164\n",
+            "    timeout-minutes: 200\n",
+            "    timeout-minutes: 194\n",
         ),
-        "the `timeout-minutes` of `gamma` (164) is less than the sum of its steps' (165)",
+        "the `timeout-minutes` of `gamma` (194) is less than the sum of its steps' (195)",
     );
     red(
-        &plant("gamma", "    timeout-minutes: 170\n", ""),
+        &plant("gamma", "    timeout-minutes: 200\n", ""),
         "the `timeout-minutes` of `gamma` (none)",
     );
     let longer = plant(
         "gamma",
-        "    timeout-minutes: 170\n",
+        "    timeout-minutes: 200\n",
         "    timeout-minutes: 240\n",
     );
     assert!(longer.is_empty(), "{longer:#?}");

@@ -499,11 +499,12 @@ jobs:
     needs: [plan, publish, rehearse, rehearse-agent]
     if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}
     runs-on: ubuntu-24.04
-    # Every step has a timeout of its own, the deploy's at least its --deadline-min (60) and 15
-    # minutes more, and the job's is at least their sum: a step that hangs is cut by its own
-    # timeout, fails, and the restore still runs within its own. The release workflow lint
-    # holds all of it.
-    timeout-minutes: 170
+    # Every step has a timeout of its own, and the job's is at least their sum: a step that hangs
+    # is cut by its own timeout, fails, and the restore still runs within its own. The deploy's
+    # and the restore's cover the longest their verbs can run (their calls, tokens included, each
+    # tried again on a 503, and the deploy's --deadline-min): 82.5 and 28.5 minutes, and a
+    # minute to start. The release workflow lint computes those from the verbs' own limits.
+    timeout-minutes: 200
     environment: release
     permissions:
       contents: read
@@ -560,7 +561,7 @@ jobs:
       # deadline is given here, not left to the verb's default, because the job's timeout must
       # leave room after it for the proof and the restore.
       - name: Set this release as the farm's desired version, and wait for the farm to converge
-        timeout-minutes: 75
+        timeout-minutes: 85
         env:
           COORDINATOR_URL: ${{ vars.KBF_COORDINATOR_URL }}
           # The farm CA's certificate (public), which the coordinator's certificate chains to.
@@ -598,7 +599,7 @@ jobs:
       # restores nothing, and the operator re-runs the failed jobs (docs/design/gamma-cicd.md,
       # G1). It must stay the job's last step.
       - name: Set the farm back to the version this release replaced, after a failed step
-        timeout-minutes: 10
+        timeout-minutes: 30
         if: ${{ failure() }}
         env:
           URL: ${{ vars.KBF_COORDINATOR_URL }}

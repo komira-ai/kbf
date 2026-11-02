@@ -66,6 +66,31 @@ const MAX_ANSWER: u64 = 1 << 20;
 /// How many times the POST is tried when the call fails for a reason that may pass.
 const POST_ATTEMPTS: u32 = 4;
 
+/// The seconds between two tries, and between two reads, when `--every-secs` is not given.
+pub const EVERY_SECS: u64 = 30;
+
+/// The longest one call to the coordinator may take: a fresh token from the runner's token
+/// service and then the coordinator's answer, each bounded by `CALL_TIMEOUT`.
+#[must_use]
+pub fn call_bound() -> Duration {
+    2 * CALL_TIMEOUT
+}
+
+/// The longest a call tried again on a 503 may take: `POST_ATTEMPTS` calls of
+/// [`call_bound`] and the pause of `every` between two of them.
+#[must_use]
+pub fn retried_bound(every: Duration) -> Duration {
+    call_bound() * POST_ATTEMPTS + every * (POST_ATTEMPTS - 1)
+}
+
+/// The longest the deploy may run with `deadline` and `every`: the baseline read and the
+/// POST, each tried again ([`retried_bound`]), the deadline, and the read and the pause that
+/// can end past it. A job step that runs the deploy needs at least this.
+#[must_use]
+pub fn deploy_bound(deadline: Duration, every: Duration) -> Duration {
+    retried_bound(every) * 2 + deadline + call_bound() + every
+}
+
 /// Whether a failed call may pass: the coordinator's 503 on the POST or on the baseline read,
 /// or on any call of the restore, and nothing else (a certificate it is not trusted by, or a
 /// runner without a token, does not get better; a poll that fails is tried again anyway).
@@ -221,7 +246,7 @@ pub struct Args {
     #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u64).range(1..=1440))]
     pub stall_min: u64,
     /// Seconds between two reads.
-    #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=3600))]
+    #[arg(long, default_value_t = EVERY_SECS, value_parser = clap::value_parser!(u64).range(1..=3600))]
     pub every_secs: u64,
     /// The storage hosts that must stay up while others update. `kbf` only: another service's
     /// minimums are in its definition, and none is sent.

@@ -774,9 +774,14 @@ Each accepted action is written to the file before it takes effect (a failed wri
    is reported and tried again, and counts as no change.
 
 The job gives `--deadline-min 60` explicitly. Every step of the job has a `timeout-minutes` of its
-own (the deploy's 75, the restore's 10), and the job's (170) is at least their sum: a step that
-hangs, the proof included, is cut by its own timeout and fails, and the restore still runs within
-its own. The release workflow lint holds each of these.
+own, and the job's (200) is at least their sum: a step that hangs, the proof included, is cut by its
+own timeout and fails, and the restore still runs within its own. The deploy's (85) and the
+restore's (30) cover the longest their verbs can run, and a minute to start: every call is a token
+call and a coordinator call of at most 60 seconds each, a call tried again on a 503 is four such
+calls and three pauses of `--every-secs` (30), the restore makes three of those (28.5 minutes), and
+the deploy two, its deadline, a last read and a pause (81.5 minutes). The release workflow lint
+computes these from the verbs' own limits (`deploy_bound` and `restore::bound` of
+`crates/xtask/src/deploy_farm.rs`) and holds each of them.
 
 When any earlier step of the `gamma` job failed (the deploy, or the proof after it), the job's
 last step, `cargo xtask deploy-farm restore --url ... --ca-pem ... --version <this release> --run

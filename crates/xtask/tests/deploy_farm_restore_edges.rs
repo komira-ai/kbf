@@ -344,3 +344,68 @@ fn the_restore_checks_its_run_before_any_request() {
     assert_eq!(result, Err(Error::Run(String::new())));
     assert!(fake.seen().is_empty());
 }
+
+/// Catches: a job budget derived from anything but the clients' own limits. A call with its
+/// token is two calls of at most 60 seconds; a call tried again is four of them and three
+/// pauses; the restore is three such calls (28.5 minutes at the default pause of 30 seconds);
+/// the deploy is two of them, the deadline, a last read and a pause (81.5 minutes for a
+/// deadline of 60). Each grows with the pause.
+#[test]
+fn the_bounds_of_the_verbs_come_from_their_calls_tries_and_pauses() {
+    use xtask::deploy_farm::{EVERY_SECS, call_bound, deploy_bound, restore, retried_bound};
+    let every = Duration::from_secs(EVERY_SECS);
+    assert_eq!(EVERY_SECS, 30);
+    assert_eq!(call_bound(), Duration::from_secs(120));
+    assert_eq!(retried_bound(every), Duration::from_secs(4 * 120 + 3 * 30));
+    assert_eq!(restore::bound(every), Duration::from_secs(1710));
+    assert_eq!(
+        deploy_bound(Duration::from_secs(3600), every),
+        Duration::from_secs(2 * 570 + 3600 + 120 + 30)
+    );
+    let slower = Duration::from_secs(60);
+    assert_eq!(
+        restore::bound(slower),
+        Duration::from_secs(3 * (4 * 120 + 3 * 60))
+    );
+    assert!(
+        deploy_bound(Duration::from_secs(3600), slower)
+            > deploy_bound(Duration::from_secs(3600), every)
+    );
+}
+
+/// Catches: an unknown outcome whose message shows a shortened write id, which the operator
+/// could never find in the coordinator's state. With a write id of 118 characters, a POST
+/// whose answer is lost and a read after it that is refused, the message names the whole id.
+#[test]
+fn an_unknown_outcome_names_the_whole_write_id() {
+    let run = format!("{}-1", "9".repeat(108));
+    let id = format!("restore-{run}");
+    let fake = serve(script(
+        vec![Fate::Drop],
+        vec![ReadFate::Answer, ReadFate::Status(403)],
+    ));
+    let mut long_run = args(&fake.base);
+    long_run.run = run;
+    let (result, _, _) = restore_timed(&fake, &long_run);
+    let error = result.expect_err("not known");
+    // The transport's own words for the lost answer are the TLS library's; the rest is exact.
+    let Error::Unknown {
+        version,
+        write_id,
+        why,
+    } = &error
+    else {
+        panic!("{error}");
+    };
+    assert_eq!((version.as_str(), write_id.as_str()), (BEFORE, id.as_str()));
+    let lost = why
+        .strip_suffix(", then read the farm after the restore was refused: refused with status 403: the coordinator's OIDC allow-list does not accept this job's token")
+        .expect("the read after it, refused");
+    assert!(lost.starts_with("set the farm back: "), "{lost}");
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "whether the farm is set back to {BEFORE} is not known: {why}; read GET /v1/convergence for the write `{id}`, and if it is not there, use {BY_HAND}"
+        )
+    );
+}

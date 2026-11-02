@@ -36,8 +36,8 @@ use clap::Args as ClapArgs;
 use serde_json::{Value, json};
 
 use super::{
-    Client, Clock, DESIRED_PATH, Error as Deploy, KBF, Plan, Roots, TokenService, check_args,
-    failed, fetch, log, pem_roots, plain,
+    Client, Clock, DESIRED_PATH, EVERY_SECS, Error as Deploy, KBF, Plan, Roots, TokenService,
+    check_args, failed, fetch, log, pem_roots, plain,
 };
 
 /// What the calls of the restore are named in an error.
@@ -49,6 +49,14 @@ pub(super) const READ_AFTER: &str = "read the farm after the restore was refused
 /// checkout supports for the whole farm (docs/design/gamma-cicd.md, section 3, M6). The
 /// coordinator's `force` (C1) is planned and not named here until it is built.
 pub const BY_HAND: &str = "the hand step: re-run, from its run's page, the `gamma` job of the release the farm should run, which sets that release as desired (docs/design/gamma-cicd.md, section 3, M6)";
+
+/// The longest the restore may run with `every` between two tries: its read, its POST and its
+/// read after the POST, each tried again on a 503 ([`super::retried_bound`]). A job step that
+/// runs the restore needs at least this.
+#[must_use]
+pub fn bound(every: Duration) -> Duration {
+    super::retried_bound(every) * 3
+}
 
 /// The prefix of the restore's `write_id`.
 pub const WRITE_ID_PREFIX: &str = "restore-";
@@ -81,7 +89,7 @@ pub struct Args {
     #[arg(long)]
     pub run: String,
     /// Seconds between two tries of a call the coordinator answered 503.
-    #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=3600))]
+    #[arg(long, default_value_t = EVERY_SECS, value_parser = clap::value_parser!(u64).range(1..=3600))]
     pub every_secs: u64,
 }
 
@@ -375,7 +383,7 @@ pub fn restore_on(
                 &format!(
                     "set back: desired version {}, min_up {min_up}, on generation {generation}, as {}",
                     plain(&version),
-                    plain(&id)
+                    id
                 ),
             )?;
             Err(restored())
@@ -387,9 +395,11 @@ pub fn restore_on(
         // state's `write_id` tells.
         Err(e) => {
             let conflict = matches!(e, Deploy::Conflict { .. });
+            // The id is the restore's own, checked to be visible ASCII: shown whole, since it is
+            // what the operator looks for.
             let unknown = |why: Deploy| Error::Unknown {
                 version: plain(&version),
-                write_id: plain(&id),
+                write_id: id.clone(),
                 why: format!("{e}, then {why}"),
             };
             let now = client
@@ -407,7 +417,7 @@ pub fn restore_on(
                     &format!(
                         "set back: desired version {}, by this restore ({}), whose answer was lost before",
                         now.shown(),
-                        plain(&id)
+                        id
                     ),
                 )?;
                 Err(restored())
