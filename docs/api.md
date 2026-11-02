@@ -1777,22 +1777,27 @@ under `--job-plain-http`, where the listener has no TLS files.
 
 **Pack reads by daemons.** A daemon started with `--pack-read` or `--tierstore-endpoint`
 ([kbf-modes.md](deploy/kbf-modes.md)) puts the counts of its pack reads in every heartbeat, and
-the frontend its worker stream is on keeps the newest of each node and exports them, one sample per node, labelled `node`. They
-are the counts of the daemon's process: they start again from 0 when it restarts, as any counter
-may. A node that sent none (a daemon without `--pack-read`, or one built before the field) has
-no sample, and with no node sending any the families are absent. A node whose stream has closed
-keeps the counts of its last heartbeat until the frontend restarts (a node's other facts are
-kept the same way); a node whose next heartbeat carries none, such as a daemon restarted without
-`--pack-read`, loses its samples. Each read of a blob counts in exactly one of served, elsewhere,
-unasked, lost and damaged.
+the frontend its worker stream is on keeps the newest of each node and exports them, one sample
+per node, labelled `node`. They are the counts of the daemon's process: they start again from 0
+when it restarts, as any counter may. A node that sent none (a daemon with neither
+`--pack-read` nor `--tierstore-endpoint`, or one built before the field) has no sample, and with
+no node sending any the families are absent. A node whose stream has closed keeps the counts of
+its last heartbeat until the frontend restarts (a node's other facts are kept the same way); a
+node whose next heartbeat carries none, such as a daemon restarted with neither flag, loses its
+samples. Each read of a blob counts in exactly one of served, elsewhere, unasked, lost, damaged,
+fallback_lost and fallback_damaged. A daemon of a release before the two fallback counts sends
+neither, and a frontend of such a release skips them: `lost` and `damaged` are always reads that
+failed.
 
 | Family | Type | What it measures |
 |---|---|---|
 | `kbf_pack_daemon_served_total{node}`, `kbf_pack_daemon_served_bytes_total{node}` | counter | blobs the node's daemon read from a pack, and their bytes |
 | `kbf_pack_daemon_elsewhere_total{node}` | counter | reads of a blob no pack holds (or that is not asked of the packs, or whose frontend serves no locations): answered by the storage nodes, as before packs |
 | `kbf_pack_daemon_unasked_total{node}` | counter | reads answered by the storage nodes because the packs could not be asked (the pack index or the pack store failed): the daemon is reading around the packs |
-| `kbf_pack_daemon_lost_total{node}` | counter | reads of a blob whose pack the index names is gone or too short. With `--pack-read` the read failed (UNAVAILABLE to the lease; alert on any); with `--tierstore-endpoint` it was answered by the frontend and did not fail (a pack the tierstore and its upstream do not have: watch the rate, not each one) |
-| `kbf_pack_daemon_damaged_total{node}` | counter | reads of a blob whose bytes in the pack are not the digest (never served). With `--pack-read` the read failed (alert on any); with `--tierstore-endpoint` it was answered by the frontend and did not fail, and each is still a damaged copy in the node's tierstore (alert on any) |
+| `kbf_pack_daemon_lost_total{node}` | counter | reads that failed because the pack the index names is gone or too short (UNAVAILABLE to the lease; alert on any) |
+| `kbf_pack_daemon_damaged_total{node}` | counter | reads that failed because the bytes in the pack are not the digest (never served; alert on any) |
+| `kbf_pack_daemon_fallback_lost_total{node}` | counter | reads of a daemon with `--tierstore-endpoint` whose pack its tierstore did not have (a 404, or too short), answered by the storage nodes instead: none failed. A steady rate is a pack the tierstore's upstream does not hold either |
+| `kbf_pack_daemon_fallback_damaged_total{node}` | counter | reads of a daemon with `--tierstore-endpoint` whose bytes from its tierstore were not the digest (never served), answered by the storage nodes instead: none failed, but each is a damaged copy in that node's tierstore (alert on any) |
 
 **Pack writes by daemons.** A daemon started with `--pack-write` (which needs `--pack-read`;
 [kbf-modes.md](deploy/kbf-modes.md)) also puts the counts of its pack writes in every heartbeat,
