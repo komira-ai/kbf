@@ -50,6 +50,8 @@ struct WatchState {
     armed: u64,
     active: Option<Active>,
     last_error: Option<Arc<LaunchError>>,
+    /// Disarms waiting for a stop under way.
+    disarming: usize,
 }
 
 /// What the runner tells the dead-man.
@@ -89,13 +91,22 @@ impl Watch {
     /// its outcome is not lost with the arming.
     pub fn disarm(&self) -> Option<Arc<LaunchError>> {
         let mut state = self.state();
+        state.disarming += 1;
         while state.active.as_ref().is_some_and(|a| a.stopping) {
             state = self
                 .settled
                 .wait(state)
                 .unwrap_or_else(PoisonError::into_inner);
         }
+        state.disarming -= 1;
         state.active.take().and_then(|a| a.stop_error)
+    }
+
+    /// Whether a [`Watch::disarm`] is waiting for a stop under way now: what a test watches for
+    /// before it lets the stop end, so that it knows the disarm came first.
+    pub fn disarm_waiting(&self) -> bool {
+        // Counted only while the lock is let go in the wait.
+        self.state().disarming > 0
     }
 
     /// Whether the dead-man is stopping the armed step now.

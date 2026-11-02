@@ -184,7 +184,9 @@ impl StepLauncher for HeldFirstStop {
 /// Catches the outcome of a stop that is under way when the step ends being lost: the step's
 /// run returns while the dead-man is still in its stop, which then fails. The runner waits for
 /// that stop, stops with `Unstopped`, leaves the step running in the record and runs no step
-/// after it; the next run stops the unit by name and runs the step again.
+/// after it; the next run stops the unit by name and runs the step again. The stop is let fail
+/// only once the runner is seen waiting for it in `Watch::disarm`, so a runner that does not wait
+/// never gets there and the test does not end; nothing here waits for a time.
 #[test]
 fn a_stop_that_fails_after_the_step_ended_still_stops_the_runner() {
     let rig = Rig::new("runf-stop-under-way");
@@ -197,7 +199,8 @@ fn a_stop_that_fails_after_the_step_ended_still_stops_the_runner() {
         outcome: Mutex::new(outcome),
     });
     let runner = StepRunner::new(launcher.clone(), rig.clock.clone(), rig.store());
-    let man = Arc::new(DeadMan::new(runner.watch(), launcher, rig.clock.clone()));
+    let watch = runner.watch();
+    let man = Arc::new(DeadMan::new(watch.clone(), launcher, rig.clock.clone()));
     let ticking = Arc::new(Mutex::new(None));
     let has_begun = Mutex::new(has_begun);
     let finish = Mutex::new(Some(finish));
@@ -215,10 +218,14 @@ fn a_stop_that_fails_after_the_step_ended_still_stops_the_runner() {
         clock.advance(call.timeout_secs);
         let man = seen.clone();
         *tick_slot.lock().unwrap() = Some(std::thread::spawn(move || man.tick()));
-        // The stop has begun; it fails once the step has returned its exit.
+        // The stop has begun; it fails once the runner, the step's exit in hand, waits for it.
         has_begun.lock().unwrap().recv().unwrap();
         let finish = finish.lock().unwrap().take().unwrap();
+        let watch = watch.clone();
         std::thread::spawn(move || {
+            while !watch.disarm_waiting() {
+                std::thread::yield_now();
+            }
             let refused = LaunchError::Launcher("systemd refused".to_owned());
             finish.send(Err(refused)).unwrap();
         });
