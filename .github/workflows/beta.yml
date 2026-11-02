@@ -482,6 +482,10 @@ jobs:
       # sign-darwin` signs it (crates/kbf-mac-session/tests/as_root.rs;
       # docs/design/fleet-updates-security.md S4.2, S4.3, S10).
       - run: cargo test -p kbf-mac-session --locked
+      # The registration client's connect on a Mac, where it is std's after a check of the deadline:
+      # a full backlog is refused at once, a connect that succeeds leaves the rest only what is left,
+      # and a missing or stale socket is a connect error (crates/update-register/src/tests.rs).
+      - run: cargo test -p update-register --locked -- --exact tests::a_listener_whose_backlog_is_full_is_refused_at_once tests::the_deadline_left_after_the_connect_is_all_that_follows_gets tests::a_socket_left_by_a_listener_that_is_gone_is_refused tests::a_missing_socket_names_its_path tests::a_deadline_already_passed_does_not_connect
       # The host installer's layout, offline attestation check and stage, compiled and run
       # on the platform they name, and the pinned gh for darwin-arm64 against a real
       # attestation (crates/kbf-installer, docs/deploy/host-releases.md).

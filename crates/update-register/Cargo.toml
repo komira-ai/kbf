@@ -18,5 +18,11 @@ publish.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
+# rustix, on Linux only: there the connect is made on a socket given its send timeout first, so
+# that a full backlog does not hold it for ever. Elsewhere the kernel refuses a full backlog and
+# `std`'s connect is used.
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { workspace = true, features = ["net"] }
+
 [lints]
 workspace = true

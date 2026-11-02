@@ -219,6 +219,9 @@ mod limits;
 #[path = "stage_more_tests.rs"]
 mod more;
 
+#[path = "stage_declaration_tests.rs"]
+mod declaration;
+
 /// Catches a stage that does not do the whole job, in order: the honest release is checked
 /// by `gh` (with the unprivileged user, a scratch home and the order's commit) and then
 /// run once, as the unprivileged user with an empty environment and a 10 s limit, and is
@@ -492,9 +495,9 @@ fn nothing_is_unpacked_before_the_attestation_holds() {
     rig.assert_nothing_installed();
 }
 
-/// Catches an archive that is accepted though it is not one plain file: a link entry, a
-/// second entry, a path in the name, trailing bytes. Each is `shape`, after `gh` accepted
-/// it and before anything ran.
+/// Catches an archive that is accepted though its binary is not one plain file: a link entry,
+/// a second member that leaves the release directory (`../kbf`), a path in the name, trailing
+/// bytes. Each is `shape`, after `gh` accepted it and before anything ran.
 ///
 /// Catches: the shape check dropped from the pipeline (the symlink entry installs).
 #[test]
@@ -509,8 +512,8 @@ fn an_attested_archive_of_the_wrong_shape_is_refused_unrun() {
     let cases = [
         ("link", tar_gz(&[link])),
         (
-            "two",
-            tar_gz(&[file("kbf", &elf(0x3e, "")), file("other", b"x")]),
+            "unsafe-second",
+            tar_gz(&[file("kbf", &elf(0x3e, "")), file("../kbf", b"x")]),
         ),
         ("path", tar_gz(&[file("bin/kbf", &elf(0x3e, ""))])),
         ("trailing", trailing),

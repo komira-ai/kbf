@@ -113,6 +113,8 @@ mod wire_dropped_facts_tests;
 #[cfg(test)]
 mod wire_features_tests;
 #[cfg(test)]
+mod wire_halts_tests;
+#[cfg(test)]
 mod wire_service_facts_tests;
 #[cfg(test)]
 mod wire_size_tests;

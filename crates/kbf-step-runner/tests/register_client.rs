@@ -51,17 +51,18 @@ impl Live {
         fs::create_dir_all(&dir).unwrap();
         fs::create_dir_all(&state).unwrap();
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o750)).unwrap();
-        let registry = Arc::new(Registry::load(&state, FakeClock::new()).unwrap());
         let grant = Grant {
             uid,
             health_ports: vec![9301, 9302],
             registration_ttl_secs: 300,
         };
-        let table = Table(BTreeMap::from([("svc".to_owned(), grant)]));
+        let table = Arc::new(Table(BTreeMap::from([("svc".to_owned(), grant)])));
+        let registry = Arc::new(Registry::load(&state, FakeClock::new(), &*table).unwrap());
         let sock = dir.join("s");
         let connections = Arc::new(Mutex::new(Vec::new()));
         let kept = connections.clone();
-        let server = Server::bind(&sock, me(), None, registry.clone(), Arc::new(table))
+        let group = rustix::process::getegid().as_raw();
+        let server = Server::bind(&sock, me(), group, registry.clone(), table)
             .unwrap()
             .with_spawner(Box::new(move |job| {
                 let handle = std::thread::Builder::new().spawn(job)?;
@@ -146,7 +147,9 @@ fn a_service_without_a_health_address_is_not_absent() {
 #[test]
 fn the_health_address_arrives_as_sent() {
     for (addr, port) in [("127.0.0.1:9301", 9301), ("[::1]:9302", 9302)] {
-        let live = Live::start("regc-health", me(), |s| s);
+        // A directory of its own per address: the previous server's connection thread, which
+        // is not joined, may still be writing the close into its state directory.
+        let live = Live::start(&format!("regc-health-{port}"), me(), |s| s);
         let held = live
             .register("1.0.0", Some(&health(addr, "/readyz")))
             .unwrap();

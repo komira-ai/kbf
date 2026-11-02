@@ -314,3 +314,41 @@ fn the_record_on_disk_has_this_shape() {
     assert_eq!(serde_json::to_string(&rec).unwrap(), json);
     assert_eq!(serde_json::from_str::<Record>(json).unwrap(), rec);
 }
+
+/// Catches a renamed variant of what the record holds besides its states and verdicts (those are
+/// pinned with the whole record above): every step, every hook choice, every phase and class of
+/// a failure is written under this name and read back from it, so that a rename (a lost
+/// `rename_all`, a new spelling) fails here and not in the updater of the next release.
+#[test]
+fn every_variant_name_in_the_record_is_pinned() {
+    fn pinned<T>(pairs: &[(T, &str)])
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
+    {
+        for (value, name) in pairs {
+            let written = serde_json::to_value(value).unwrap();
+            assert_eq!(written, *name, "{value:?}");
+            let read: T = serde_json::from_value(serde_json::Value::from(*name)).unwrap();
+            assert_eq!(&read, value, "{name}");
+        }
+    }
+    pinned(&[
+        (Step::Prepare, "prepare"),
+        (Step::Cutover, "cutover"),
+        (Step::Verify, "verify"),
+        (Step::Rollback, "rollback"),
+        (Step::Cleanup, "cleanup"),
+    ]);
+    pinned(&[(HookSel::New, "new"), (HookSel::Previous, "previous")]);
+    pinned(&[
+        (Phase::BeforeCommit, "before_commit"),
+        (Phase::GateRelease, "gate_release"),
+        (Phase::GateEnvironment, "gate_environment"),
+        (Phase::AfterCommit, "after_commit"),
+        (Phase::Halt, "halt"),
+    ]);
+    pinned(&[
+        (Class::Release, "release"),
+        (Class::Environment, "environment"),
+    ]);
+}
