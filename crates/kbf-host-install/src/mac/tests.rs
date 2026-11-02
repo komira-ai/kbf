@@ -10,5 +10,7 @@ mod pure;
 mod query;
 mod real_output;
 mod retain_tests;
+mod stage_members_tests;
 mod stage_tests;
 mod tierstore_signer_tests;
+mod unpack_tests;

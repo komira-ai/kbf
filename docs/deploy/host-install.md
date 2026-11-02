@@ -368,7 +368,10 @@ stage):
    `komira-ai/kbf`'s `artifacts.yml` workflow (the repository's former name is still accepted,
    for releases attested under it; a channel may name [another repository and
    workflow](#a-channel-of-another-repository)), and GitHub-hosted runners only;
-5. the tarball holds exactly one regular file named `kbf`, a Mach-O file for arm64;
+5. the tarball holds a regular file named `kbf`, a Mach-O file for arm64, and may hold the
+   release's updater declaration `updater.d/kbf.toml`, which is unpacked beside it in the
+   stage; no member is a link, a device or a FIFO or has an absolute name or a `..` in it,
+   and a member of another name is ignored with one line on stderr;
 6. the binary carries no `com.apple.quarantine` attribute (it is removed, and proven gone);
 7. `codesign --verify --strict` accepts it and its signature has the hardened runtime;
 8. the new binary, run as `_kbf`, accepts the daemon's live configuration
