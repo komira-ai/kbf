@@ -36,11 +36,13 @@ pub mod decide;
 pub mod defer;
 pub mod desired;
 pub mod fleet;
+pub mod halt;
 pub mod http;
 pub mod identity;
 pub mod listen;
 pub mod membership;
 pub mod ops;
+pub(crate) mod ops_file;
 pub mod reconcile;
 pub mod service;
 pub mod services;
@@ -75,6 +77,10 @@ mod extras_dropped_tests;
 #[cfg(test)]
 mod generation_tests;
 #[cfg(test)]
+mod halt_membership_tests;
+#[cfg(test)]
+mod halt_race_tests;
+#[cfg(test)]
 mod http_tests;
 #[cfg(test)]
 mod kbf_definition_tests;
@@ -82,6 +88,12 @@ mod kbf_definition_tests;
 mod kbf_review_tests;
 #[cfg(test)]
 mod membership_tests;
+#[cfg(test)]
+mod ops_commit_tests;
+#[cfg(test)]
+mod ops_crash_tests;
+#[cfg(test)]
+mod ops_downgrade_tests;
 #[cfg(test)]
 mod ops_tests;
 #[cfg(test)]

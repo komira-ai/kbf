@@ -12,7 +12,10 @@
 //!    tarball's sha256 is a subject, the signer is this repository's `artifacts.yml` on a
 //!    GitHub-hosted runner, and the build was of the full 40-digit commit on the channel's
 //!    branch. It runs as `nobody` and never as root. This is the trust anchor;
-//! 3. the tarball holds exactly one regular file, `kbf`, a Mach-O file for arm64;
+//! 3. the tarball holds a regular file `kbf`, a Mach-O file for arm64, and it may hold the
+//!    updater declaration `updater.d/kbf.toml`, unpacked at that path in the stage; no
+//!    member is a link, a device or a FIFO or has an absolute name or a `..` in it, and a
+//!    member of another name is ignored and told on stderr;
 //! 4. no `com.apple.quarantine` attribute is left on it;
 //! 5. `codesign --verify --strict` accepts it and its signature has the hardened runtime;
 //! 6. the new binary, run as the daemon's user, accepts the daemon's live configuration
@@ -27,7 +30,6 @@ use std::io::{self, Read};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt, chown};
 use std::path::Path;
 
-use flate2::read::GzDecoder;
 use sha2::{Digest, Sha256};
 
 use super::channel::{MacChannel, Source};
@@ -35,6 +37,7 @@ use super::fetch::{AssetKind, FetchError, Fetcher, Limits};
 use super::layout::{BINARY, DAEMON_USER, MacHost, UNPRIVILEGED_USER};
 use super::release::{self, Origin, PickError};
 use super::tools;
+use super::unpack::unpack_release;
 use crate::config::refusal;
 use crate::host::fail;
 use crate::outcome::{FailureCode, Outcome};
@@ -184,9 +187,9 @@ fn stage_inner(
     )?;
     set_mode(&stage, 0o700)?;
 
-    // 3. The binary.
+    // 3. The binary, and its updater declaration when the release carries one.
     let binary = stage.join(BINARY);
-    unpack(&tarball, &binary, tuning.binary_max)
+    unpack_release(&tarball, &stage, tuning.binary_max, &mut io::stderr())
         .map_err(|e| verify_failed(format!("tarball: {e}")))?;
     is_macho_arm64(&binary).map_err(|e| verify_failed(format!("{BINARY}: {e}")))?;
     let binary_sha256 = sha256_of(&binary).map_err(|e| verify_failed(format!("{BINARY}: {e}")))?;
@@ -496,42 +499,6 @@ fn attest(
         }
     }
     Err(verify_failed(format!("not attested: {why}")))
-}
-
-/// Unpack the one member of the gzipped tar at `tarball` to the new file `dst`.
-fn unpack(tarball: &Path, dst: &Path, cap: u64) -> Result<(), String> {
-    unpack_member(tarball, dst, cap).map_err(|e| e.to_string())
-}
-
-fn unpack_member(tarball: &Path, dst: &Path, cap: u64) -> io::Result<()> {
-    let bad = |why: String| Err(io::Error::other(why));
-    let mut archive = tar::Archive::new(GzDecoder::new(File::open(tarball)?));
-    let mut entries = archive.entries()?;
-    let Some(entry) = entries.next() else {
-        return bad("holds no file".to_owned());
-    };
-    let mut entry = entry?;
-    if entry.header().entry_type() != tar::EntryType::Regular {
-        return bad("the member is not a regular file".to_owned());
-    }
-    if entry.path_bytes().as_ref() != BINARY.as_bytes() {
-        return bad(format!("the member is not named {BINARY}"));
-    }
-    let size = entry.size();
-    if size > cap {
-        return bad(format!("the member is larger than {cap} bytes"));
-    }
-    let mut out = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o755)
-        .open(dst)?;
-    io::copy(&mut (&mut entry).take(size), &mut out)?;
-    drop(entry);
-    if entries.next().is_some() {
-        return bad("holds more than one member".to_owned());
-    }
-    Ok(())
 }
 
 /// Whether the file at `path` starts as a 64-bit arm64 Mach-O executable.

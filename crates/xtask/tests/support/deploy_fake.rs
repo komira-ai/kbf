@@ -4,19 +4,19 @@
 //! A test file includes it with `#[path = "support/deploy_fake.rs"] mod deploy_fake;`.
 #![allow(dead_code)] // Each test binary uses its own part of this module.
 
-use std::cell::{Cell, RefCell};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use rcgen::{CertificateParams, CertifiedIssuer, IsCa, KeyPair};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde_json::{Value, json};
-use xtask::deploy_farm::{Args, Clock, Error, Plan, Roots, TokenService, deploy_on};
+use xtask::deploy_farm::{Args, Error, Plan, Roots, TokenService, deploy_on};
 
-pub const RUNNER_KEY: &str = "runner-key";
+#[path = "deploy_data.rs"]
+mod deploy_data;
+pub use deploy_data::{RUNNER_KEY, Time, farm, plan_for};
 
 /// One request the fake saw.
 #[derive(Clone, Debug)]
@@ -88,18 +88,7 @@ impl Fake {
     }
 
     pub fn plan(&self) -> Plan {
-        Plan {
-            url: self.base.clone(),
-            service: "kbf".to_owned(),
-            audience: self.base.clone(),
-            version: "2.0.0+g000000000002".to_owned(),
-            min_up_storage: 1,
-            min_up_frontend: 1,
-            require_coordinator_current: false,
-            deadline: Duration::from_secs(30),
-            stall: Duration::from_secs(30),
-            every: Duration::from_secs(1),
-        }
+        plan_for(&self.base)
     }
 }
 
@@ -256,32 +245,6 @@ pub fn serve(script: Script) -> Fake {
         ca,
         ca_pem,
         seen,
-    }
-}
-
-pub fn farm(state: &str, updating: u64, failed: u64) -> Value {
-    json!({"desired": "2.0.0+g000000000002", "quiet": false, "state": state, "roles": [
-        {"role": "storage", "at_desired": 2, "updating": updating, "failed": failed, "down": 0},
-        {"role": "daemon", "at_desired": 1, "updating": 0, "failed": 0, "down": 1},
-    ]})
-}
-
-/// A virtual clock: `sleep` moves `now` and is recorded, so no test waits for a deadline.
-#[derive(Default)]
-pub struct Time {
-    pub now: Cell<Duration>,
-    pub slept: RefCell<Vec<Duration>>,
-}
-
-impl Time {
-    pub fn clock(&self) -> Clock<'_> {
-        Clock {
-            now: Box::new(|| self.now.get()),
-            sleep: Box::new(|d| {
-                self.now.set(self.now.get() + d);
-                self.slept.borrow_mut().push(d);
-            }),
-        }
     }
 }
 

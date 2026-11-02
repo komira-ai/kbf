@@ -28,6 +28,11 @@ pub const PLACEHOLDERS: &[(&str, &str)] = &[
     ("<RAM in GiB minus 4 to 8>", "248"),
     ("<storage host address>", "192.0.2.10"),
     ("<storage host name>", "storage-a.example"),
+    ("<node>", "node-1"),
+    ("<member id>", "1"),
+    ("<connection>", "cold"),
+    ("<new endpoint URL>", "http://store-b.example"),
+    ("<generation>", "7"),
 ];
 
 /// One example unit file.

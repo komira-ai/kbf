@@ -341,7 +341,13 @@ pub fn restore_on(
 ) -> Result<String, Error> {
     check(args)?;
     let plan = plan_of(args);
-    let client = Client::new(&plan, service, roots, clock)?;
+    let transport = super::ureq_transport(&plan, roots)?;
+    let client = Client {
+        transport: &transport,
+        plan: &plan,
+        service,
+        clock,
+    };
     let path = plan.convergence_path();
     let read = Read::of(&client.send_retrying(out, READ_BEFORE, &path, None, &plan)?)?;
     if read.desired.as_deref() != Some(plan.version.as_str()) {
