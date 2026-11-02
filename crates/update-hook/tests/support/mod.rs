@@ -47,12 +47,18 @@ pub fn example_with(defect: &str) -> HookCommand {
 pub struct ExampleFake {
     /// The fake cannot make a step halt (a service with no check that cannot be repaired).
     pub no_halt: bool,
+    /// An operator has cordoned the host before the update, with this lease state: it is in
+    /// the world from the start and is no residue of the update.
+    pub operator_cordon: Option<&'static str>,
 }
 
 impl FakeService for ExampleFake {
     fn init(&mut self, sandbox: &Sandbox) -> io::Result<()> {
         fs::write(sandbox.artifact().join("VERSION"), "v2\n")?;
         std::os::unix::fs::symlink("v1", sandbox.world().join("current"))?;
+        if let Some(lease) = self.operator_cordon {
+            fs::write(sandbox.world().join("cordon"), lease)?;
+        }
         fs::create_dir_all(sandbox.root().join("faults"))
     }
 
@@ -88,9 +94,15 @@ impl FakeService for ExampleFake {
     }
 
     fn residue(&self, sandbox: &Sandbox) -> io::Result<Vec<String>> {
+        let operators = |name: &str| {
+            name == "cordon"
+                && self.operator_cordon.is_some_and(|lease| {
+                    fs::read(sandbox.world().join(name)).is_ok_and(|held| held == lease.as_bytes())
+                })
+        };
         Ok(["next", "cordon"]
             .into_iter()
-            .filter(|name| sandbox.world().join(name).exists())
+            .filter(|name| sandbox.world().join(name).exists() && !operators(name))
             .map(str::to_owned)
             .collect())
     }
