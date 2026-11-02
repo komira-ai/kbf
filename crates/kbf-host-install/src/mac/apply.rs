@@ -315,21 +315,38 @@ pub(crate) fn switch(
     Err(format!("{why}:{tail}"))
 }
 
+/// Why [`select`] did not leave the daemon running the release.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NotSelected {
+    /// The links could not be moved; they are as `before` had them.
+    Links,
+    /// What had to follow the move of the links failed; they are back as `before` had them.
+    AfterLinks(String),
+    /// The links name the release and the daemon did not come up on it: the reason.
+    Restart(&'static str),
+}
+
 /// Move the links to the laid-out release `commit` for good and restart the daemon on it:
-/// `activate`'s swap. A flip that stops halfway puts the links back as `before` had them; a
-/// daemon that does not come up is not answered by going back (the release left is the one the
-/// operator is leaving), and the error is the reason.
+/// `activate`'s swap. `moved` runs once the links have moved and before the daemon is touched;
+/// when it fails, or the flip stops halfway, the links go back as `before` had them. A daemon
+/// that does not come up is not answered by going back (the release left is the one the
+/// operator is leaving).
 pub(crate) fn select(
     host: &MacHost,
     runner: &dyn Runner,
     commit: &str,
     before: &Links,
-) -> Result<(), String> {
+    moved: impl FnOnce() -> Result<(), String>,
+) -> Result<(), NotSelected> {
     if flip(host, before, commit).is_err() {
         let _ = restore(host, before);
-        return Err("links_failed".to_owned());
+        return Err(NotSelected::Links);
     }
-    restart(host, runner, commit).map_err(str::to_owned)
+    if let Err(why) = moved() {
+        let _ = restore(host, before);
+        return Err(NotSelected::AfterLinks(why));
+    }
+    restart(host, runner, commit).map_err(NotSelected::Restart)
 }
 
 /// Put both links back as `before` had them and start the release `before.current` names.

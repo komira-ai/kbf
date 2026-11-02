@@ -493,7 +493,7 @@ fn activate_ends_a_trial_and_no_deadline_reverts_it() {
 }
 
 /// Units that do not come up on the release named leave the host on it, failed with
-/// `restart_failed`: there is no going back to the release left. A kept directory with no
+/// `restart_failed` (and pinned, when asked): there is no going back to the release left. A kept directory with no
 /// binary is refused as not kept; links the layout cannot move fail with `state_unavailable`.
 ///
 /// Catches: a failed restart answered by starting the release left; a swap to a directory with
@@ -507,10 +507,14 @@ fn what_the_host_cannot_do_is_told_and_a_failed_restart_does_not_go_back() {
         .restart_fails
         .insert("kbf-daemon.service".to_owned());
     let (ab, _) = core(&rig);
-    let answer = ab.activate(&target(B), How::default());
+    let answer = ab.activate(&target(B), PIN);
     assert_eq!(
         answer.json_line(),
         "{\"result\":\"failed\",\"reason\":\"restart_failed\"}"
+    );
+    assert!(
+        rig.dir.join("agent/pin.json").exists(),
+        "the release the links name is pinned"
     );
     assert!(
         answer

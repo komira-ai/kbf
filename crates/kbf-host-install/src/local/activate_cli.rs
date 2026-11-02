@@ -213,6 +213,7 @@ fn result_of(answer: &Answer) -> Option<String> {
 /// A Linux host: `command` on the `kbf-installer` layout that `backend` makes (after the
 /// command is checked: nothing of the host is read before), the state in `state_dir` (made
 /// private if it is not there), the hold file at `hold`.
+// Called by the Linux build only; the Mac build compiles it and its tests run it everywhere.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(super) fn on_linux<B: Backend>(
     command: &Command,
@@ -245,6 +246,7 @@ pub(super) fn on_linux<B: Backend>(
 
 /// A Mac: `command` on the kit of `host`, whose tools `runner` runs, the state in its work
 /// directory, the hold file at `hold`.
+// Called by the Mac build only; the Linux build compiles it and its tests run it everywhere.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(super) fn on_mac(
     command: &Command,

@@ -183,7 +183,8 @@ fn hold_as(path: &std::path::Path, pid: &str) -> fs::File {
 }
 
 /// A live holder of the install lock is refused and named; the ssh path's apply job, which runs
-/// without the lock, is refused too while it runs. Nothing moves either time.
+/// without the lock, is refused too while it runs. Nothing moves either time, and nothing is
+/// pinned.
 ///
 /// Catches: a Mac activate that runs beside an install or an apply.
 #[test]
@@ -208,7 +209,11 @@ fn mac_activate_refuses_a_live_lock_holder_and_a_running_apply() {
     status::write(&fx.host, &ApplyState::Running).unwrap();
     sim.loaded.borrow_mut().insert(APPLY_LABEL.to_owned());
     sim.apply_running.set(true);
-    let answer = ab.activate(&target(NEW), How::default());
+    let pin = How {
+        pin: true,
+        force_lock: false,
+    };
+    let answer = ab.activate(&target(NEW), pin);
     assert_eq!(
         answer,
         Answer::Refused(
@@ -216,6 +221,7 @@ fn mac_activate_refuses_a_live_lock_holder_and_a_running_apply() {
             format!("the ssh path's apply job ({APPLY_LABEL}) is running")
         )
     );
+    assert!(!fx.dir.join("agent/pin.json").exists(), "nothing is pinned");
     assert_eq!(current(&fx).as_deref(), Some(OLD));
     assert_eq!(sim.daemon_bootouts.get(), 0);
 }
@@ -285,7 +291,8 @@ fn mac_pin_writes_the_hold_file_and_pins_the_release() {
 /// An activate during the socket's trial clears the marker, so no deadline puts the old
 /// release back; a daemon that does not come up on the release named leaves the kit on it
 /// (`restart_failed`, the release left not started); links that cannot be moved stay as they
-/// were (`switch_failed`); a marker that cannot be cleared moves nothing.
+/// were and keep a trial's marker (`switch_failed`); a marker that cannot be cleared puts the
+/// links back and the daemon is not touched.
 ///
 /// Catches: a marker that outlives the activate; a failed restart answered by going back.
 #[test]
@@ -326,9 +333,14 @@ fn mac_activate_ends_a_trial_and_a_failed_restart_does_not_go_back() {
         "the release left is not started"
     );
 
+    // A trial's marker stays when the links cannot move: the trial is not lost.
     let (fx, sim, _) = rig("mba-links");
     keep(&fx, NEW, NEW_VERSION, 2);
     let ab = core(&fx, &sim);
+    let marker = format!(
+        "{{\"commit\":\"{OLD}\",\"from\":\"{NEW}\",\"from_previous\":null,\"deadline_unix\":5}}"
+    );
+    write(&fx.host.pending_marker(), 0o600, marker.as_bytes());
     fs::set_permissions(&fx.host.kit, fs::Permissions::from_mode(0o555)).unwrap();
     let answer = ab.activate(&target(NEW), How::default());
     fs::set_permissions(&fx.host.kit, fs::Permissions::from_mode(0o755)).unwrap();
@@ -337,6 +349,10 @@ fn mac_activate_ends_a_trial_and_a_failed_restart_does_not_go_back() {
         Answer::Failed(Code::SwitchFailed, "links_failed".to_owned())
     );
     assert_eq!(current(&fx).as_deref(), Some(OLD));
+    assert_eq!(
+        fs::read_to_string(fx.host.pending_marker()).unwrap(),
+        marker
+    );
 
     let (fx, sim, _) = rig("mba-marker");
     keep(&fx, NEW, NEW_VERSION, 2);
@@ -349,6 +365,39 @@ fn mac_activate_ends_a_trial_and_a_failed_restart_does_not_go_back() {
         "{answer:?}"
     );
     assert_eq!(current(&fx).as_deref(), Some(OLD));
+    assert_eq!(sim.daemon_bootouts.get(), 0, "the daemon is not touched");
+}
+
+/// A trial's marker that cannot be removed once the links moved (the work directory cannot be
+/// written) puts the links back: the release on trial stays, its marker with it, and the daemon is
+/// not touched.
+///
+/// Catches: links left on a release whose marker's deadline would then put the old one back.
+#[test]
+fn mac_activate_puts_the_links_back_when_the_marker_cannot_be_cleared() {
+    let (fx, sim, _) = rig("mba-stuckmarker");
+    keep(&fx, NEW, NEW_VERSION, 2);
+    let ab = core(&fx, &sim);
+    let marker = format!(
+        "{{\"commit\":\"{OLD}\",\"from\":\"{NEW}\",\"from_previous\":null,\"deadline_unix\":5}}"
+    );
+    write(&fx.host.pending_marker(), 0o600, marker.as_bytes());
+    drop(crate::host::take_lock(&fx.host.lock_file()).unwrap());
+    crate::locks::wait_lockable(&fx.host.lock_file());
+    fs::set_permissions(&fx.host.work, fs::Permissions::from_mode(0o500)).unwrap();
+    let answer = ab.activate(&target(NEW), How::default());
+    fs::set_permissions(&fx.host.work, fs::Permissions::from_mode(0o711)).unwrap();
+    assert!(
+        matches!(&answer, Answer::Failed(Code::StateUnavailable, d) if d.starts_with("pending.json: ")),
+        "{answer:?}"
+    );
+    assert_eq!(current(&fx).as_deref(), Some(OLD));
+    assert_eq!(previous(&fx), None);
+    assert_eq!(
+        fs::read_to_string(fx.host.pending_marker()).unwrap(),
+        marker
+    );
+    assert_eq!(sim.daemon_bootouts.get(), 0);
 }
 
 /// Links that do not name releases cannot be swapped from: the activate fails with

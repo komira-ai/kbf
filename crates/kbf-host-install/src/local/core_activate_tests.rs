@@ -288,31 +288,69 @@ fn what_cannot_be_read_or_recorded_stops_the_activate_before_the_swap() {
     assert!(rig.activated().is_empty(), "never asked to swap");
 }
 
-/// A pin whose hold file cannot be written (no agent directory; something the agent's account
-/// made in the way that cannot be removed; a path with no name), or whose release cannot be
-/// pinned in `retain.json`, fails before the swap. A host with no `retain.json` writes only the
-/// hold file.
+/// A hold file whose directory is not there (no agent; a path with no directory) is refused
+/// before anything changes. A refused swap pins nothing. A hold file that cannot be written once
+/// the links moved (something the agent's account made in the way that cannot be removed), or a
+/// release that cannot be pinned in `retain.json`, fails: the release runs and the answer says it
+/// is not pinned. A host with no `retain.json` writes only the hold file.
 ///
-/// Catches: a swap with a pin that was not written.
+/// Catches: a hold file naming a release the host never swapped to; a pin that failed reported
+/// as done.
 #[test]
-fn a_pin_that_cannot_be_written_stops_the_activate_before_the_swap() {
+fn a_pin_follows_the_swap_and_a_hold_directory_that_is_not_there_is_refused_first() {
     let rig = Rig::new("ca-pin");
-    let failed = |ab: &Ab<Host>| {
+    for hold in [rig.dir.join("no-agent/pin.json"), PathBuf::from("/")] {
+        let answer = rig.ab(Some(hold.clone())).activate(&target(B), PIN);
+        assert!(
+            matches!(&answer, Answer::Refused(Code::ConfigInvalid, d)
+                if d.ends_with("is not there: without an agent, leave out --pin")),
+            "{hold:?}: {answer:?}"
+        );
+    }
+    assert!(rig.activated().is_empty(), "never asked to swap");
+
+    let agent = rig.dir.join("agent");
+    fs::create_dir_all(&agent).unwrap();
+    rig.shelf.borrow_mut().activate_fault = Some(Fault::refused(Code::Busy, "an apply runs"));
+    let answer = rig
+        .ab(Some(agent.join("pin.json")))
+        .activate(&target(B), PIN);
+    assert_eq!(
+        answer,
+        Answer::Refused(Code::Busy, "an apply runs".to_owned())
+    );
+    assert!(
+        !agent.join("pin.json").exists(),
+        "a refused swap pins nothing"
+    );
+    rig.shelf.borrow_mut().activate_fault = None;
+
+    let not_pinned = |ab: &Ab<Host>| {
         let answer = ab.activate(&target(B), PIN);
         assert!(
-            matches!(&answer, Answer::Failed(Code::StateUnavailable, _)),
+            matches!(&answer, Answer::Failed(Code::StateUnavailable, d)
+                if d.starts_with(&format!("{B} runs now, but it is not pinned: "))),
             "{answer:?}"
         );
     };
-    failed(&rig.ab(Some(rig.dir.join("no-agent/pin.json"))));
-    failed(&rig.ab(Some(PathBuf::from("/"))));
-    let agent = rig.dir.join("agent");
     fs::create_dir_all(agent.join(".pin.json.new/full")).unwrap();
-    failed(&rig.ab(Some(agent.join("pin.json"))));
+    not_pinned(&rig.ab(Some(agent.join("pin.json"))));
+    // A hold path with a directory and no name (`<agent>/..`).
+    not_pinned(&rig.ab(Some(agent.join(".."))));
     fs::remove_dir_all(agent.join(".pin.json.new")).unwrap();
     rig.shelf.borrow_mut().retain_file = Some(rig.dir.join("no/such/retain.json"));
-    failed(&rig.ab(Some(agent.join("pin.json"))));
-    assert!(rig.activated().is_empty(), "never asked to swap");
+    not_pinned(&rig.ab(Some(agent.join("pin.json"))));
+    assert_eq!(
+        rig.activated(),
+        [B, B, B, B],
+        "the refused swap was asked, then three were done"
+    );
+    assert!(
+        rig.notes
+            .borrow()
+            .iter()
+            .all(|n| n.starts_with("activate: the pin: "))
+    );
 
     rig.shelf.borrow_mut().retain_file = None;
     let answer = rig
@@ -323,6 +361,66 @@ fn a_pin_that_cannot_be_written_stops_the_activate_before_the_swap() {
         "{answer:?}"
     );
     assert!(agent.join("pin.json").exists());
+}
+
+/// A take of the lock is recorded at once, whatever the activate does next: a release that is
+/// not kept, after the lock was taken from its holder, leaves the record.
+///
+/// Catches: a lock taken from its holder with no trace when the activate then stops.
+#[test]
+fn a_take_of_the_lock_is_recorded_even_when_the_activate_then_stops() {
+    let rig = Rig::new("ca-take");
+    let _holder = crate::host::take_lock(&rig.dir.join("lock")).unwrap();
+    let force = How {
+        pin: false,
+        force_lock: true,
+    };
+    let answer = rig.ab(None).activate(&target("cccccccccccc"), force);
+    assert!(
+        matches!(
+            answer,
+            Answer::Unresolved {
+                code: Code::NotKept,
+                ..
+            }
+        ),
+        "{answer:?}"
+    );
+    let record = fs::read_to_string(rig.dir.join(LOCK_TAKES)).unwrap();
+    assert_eq!(
+        record,
+        format!(
+            "{{\"at_unix\":7,\"by\":\"activate\",\"target\":\"cccccccccccc\",\
+             \"holder_pid\":{},\"holder_alive\":true}}\n",
+            std::process::id()
+        )
+    );
+    assert!(rig.activated().is_empty());
+}
+
+/// Units that do not come up after the links moved: the failure is told, and the state still
+/// records the release's version and clears a `staged` that names it, keeping `last`.
+///
+/// Catches: a state that forgets the swap because the restart failed.
+#[test]
+fn a_failed_restart_still_records_the_swap_in_the_state() {
+    let rig = Rig::new("ca-restart");
+    rig.shelf.borrow_mut().kept[0].version = Some(VB.to_owned());
+    put_state(
+        &rig,
+        &format!("{{\"staged\":{{\"version\":\"{VB}\",\"commit\":\"{B}\"}}}}"),
+    );
+    rig.shelf.borrow_mut().activate_fault = Some(Fault::failed(Code::RestartFailed, "down"));
+    let answer = rig.ab(None).activate(&target(B), How::default());
+    assert_eq!(
+        answer,
+        Answer::Failed(Code::RestartFailed, "down".to_owned())
+    );
+    let state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(rig.dir.join("state.json")).unwrap()).unwrap();
+    assert_eq!(state["staged"], serde_json::Value::Null);
+    assert_eq!(state["versions"][B], VB);
+    assert_eq!(state["last"], serde_json::Value::Null);
 }
 
 /// A backend that cannot swap tells it; a state file that cannot be written after the swap is

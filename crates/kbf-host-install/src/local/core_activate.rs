@@ -13,10 +13,12 @@
 //! - **The install lock.** It is taken without waiting, as every install, switch and restart
 //!   takes it. A holder is refused and named ([`locks::Holder`]). `--force-lock` takes it from a
 //!   holder that is gone or stuck (the lock file is made anew), and the take is appended to
-//!   [`LOCK_TAKES`] beside the state file before anything else changes.
+//!   [`LOCK_TAKES`] beside the state file at once, before anything else is read or changes.
 //! - **The pin** (`--pin`) writes the hold file for the agent ([`Hold`], root's, 0644) and pins
-//!   the release in `retain.json`, so no prune removes it. The agent's reading of the hold file
-//!   is the agent's.
+//!   the release in `retain.json`, so no prune removes it, once the links name the release (a
+//!   refused or failed swap pins nothing; a swap whose units did not come up is pinned). A hold
+//!   file whose directory is not there is refused before anything changes. The agent's reading
+//!   of the hold file is the agent's.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
@@ -101,7 +103,7 @@ impl<B: Backend> Ab<B> {
     /// The install lock, taken without waiting, or from its holder when `force`; the holder it
     /// was taken from. A holder that keeps it is named in the refusal.
     fn activate_lock(&self, force: bool) -> Result<(Lock, Option<Holder>), Box<Answer>> {
-        // With `force` a busy lock is one another taker made anew at the same moment.
+        // With `force`, a lock still busy is one another taker made anew at the same moment.
         let path = self.backend.lock_file();
         let taken = if force {
             take_lock_over(&path)
@@ -142,6 +144,23 @@ impl<B: Backend> Ab<B> {
         holder: Option<Holder>,
     ) -> Result<Answer, Box<Answer>> {
         let refuse = |fault: Fault| Box::new(fault.answer());
+        // A take of the lock is recorded first: the lock file is already made anew, whatever
+        // the activate does next.
+        if let Some(holder) = &holder {
+            self.record_take(target, holder).map_err(refuse)?;
+        }
+        if let Some(dir) = hold.map(|hold| hold.parent().unwrap_or(Path::new("")))
+            && !dir.is_dir()
+        {
+            return Err(Box::new(Answer::Refused(
+                Code::ConfigInvalid,
+                format!(
+                    "the hold file's directory {:?} is not there: without an agent, leave out \
+                         --pin",
+                    dir.display().to_string()
+                ),
+            )));
+        }
         let mut saved = self.load().map_err(refuse)?;
         let mut kept = self.backend.kept().map_err(refuse)?;
         for k in &mut kept {
@@ -172,27 +191,42 @@ impl<B: Backend> Ab<B> {
         };
         let commit = chosen.commit.as_str();
         let from = self.backend.current().map_err(refuse)?;
-        if let Some(holder) = &holder {
-            self.record_take(target, holder).map_err(refuse)?;
+        let swapped = self.backend.activate(commit);
+        if let Err(fault) = &swapped
+            && fault.code != Code::RestartFailed
+        {
+            return Err(refuse(fault.clone()));
         }
-        if let Some(hold) = hold {
-            self.pin(hold, &chosen).map_err(refuse)?;
-        }
-        self.backend.activate(commit).map_err(refuse)?;
+        // The links name the release now (a `restart_failed` too): the state and the pin follow.
         if let Some(version) = &chosen.version {
             saved.note(commit, version, self.versions_kept());
         }
         if saved.staged.as_ref().is_some_and(|s| s.commit == commit) {
             saved.staged = None;
         }
-        saved.last = Some(Last {
-            target: chosen.version.clone().unwrap_or_else(|| commit.to_owned()),
-            ended: Ended::Succeeded,
-            why: None,
-        });
+        // `last` says how an update ended in words older helpers read; a release whose units did
+        // not come up has none of its own, and keeps the last one.
+        if swapped.is_ok() {
+            saved.last = Some(Last {
+                target: chosen.version.clone().unwrap_or_else(|| commit.to_owned()),
+                ended: Ended::Succeeded,
+                why: None,
+            });
+        }
         // The release runs: a state file that cannot be written is the lesser news.
         if let Err(fault) = self.save(&saved) {
             (self.note)(&format!("activate: {}", fault.detail));
+        }
+        let pinned = hold.map(|hold| self.pin(hold, &chosen));
+        if let Some(Err(fault)) = &pinned {
+            (self.note)(&format!("activate: the pin: {}", fault.detail));
+        }
+        swapped.map_err(refuse)?;
+        if let Some(Err(fault)) = pinned {
+            return Err(Box::new(Answer::Failed(
+                Code::StateUnavailable,
+                format!("{commit} runs now, but it is not pinned: {}", fault.detail),
+            )));
         }
         Ok(Answer::Activated {
             commit: commit.to_owned(),

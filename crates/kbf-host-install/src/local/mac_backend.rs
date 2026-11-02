@@ -10,7 +10,7 @@
 //! by the deadline or by request, puts both links back and starts the old release without
 //! the new one running. The marker is on disk: the first tick after a reboot reads it.
 //!
-//! `activate` clears the marker, moves the links to a release the kit keeps and restarts the
+//! `activate` moves the links to a release the kit keeps, clears the marker and restarts the
 //! daemon's job on it, with no marker and no going back.
 
 use std::fs::{self, OpenOptions};
@@ -236,9 +236,10 @@ impl Backend for MacBackend {
         self.clear_marker()
     }
 
-    /// Refused while the ssh path's apply job runs (it holds no install lock). The marker of
-    /// a release on trial is cleared first, so no deadline puts back what this chose; then the
-    /// links move ([`apply::select`]) and the daemon's job restarts on the release.
+    /// Refused while the ssh path's apply job runs (it holds no install lock). The links move
+    /// ([`apply::select`]), then the marker of a release on trial is cleared, so no deadline puts
+    /// back what this chose (a marker that cannot be cleared puts the links back), then the
+    /// daemon's job restarts on the release.
     fn activate(&self, commit: &str) -> Result<(), Fault> {
         if mac::status::effective(&self.host, &*self.runner)
             == Some(mac::status::ApplyState::Running)
@@ -253,20 +254,20 @@ impl Backend for MacBackend {
         }
         let before =
             kit::links(&self.host).map_err(|why| Fault::failed(Code::StateUnavailable, why))?;
-        self.clear_marker()?;
-        apply::select(&self.host, &*self.runner, commit, &before).map_err(|why| {
-            if why == "links_failed" {
-                Fault::failed(Code::SwitchFailed, why)
-            } else {
-                Fault::failed(
+        let cleared = || self.clear_marker().map_err(|fault| fault.detail);
+        apply::select(&self.host, &*self.runner, commit, &before, cleared).map_err(
+            |not| match not {
+                apply::NotSelected::Links => Fault::failed(Code::SwitchFailed, "links_failed"),
+                apply::NotSelected::AfterLinks(why) => Fault::failed(Code::StateUnavailable, why),
+                apply::NotSelected::Restart(why) => Fault::failed(
                     Code::RestartFailed,
                     format!(
                         "the kit runs {} now, but: {why}",
                         commit.get(..12).unwrap_or(commit)
                     ),
-                )
-            }
-        })
+                ),
+            },
+        )
     }
 
     fn kept(&self) -> Result<Vec<Kept>, Fault> {

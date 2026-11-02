@@ -761,7 +761,8 @@ kbf-host-install activate kbf=<commit|version> [--pin] [--force-lock] [--restart
 - **No trial.** The swap is final: there is no deadline and no revert. `previous` becomes the
   release that ran (the one left); a release that was on trial is on trial no more, so no deadline
   puts it back. On Linux the installer's `state.json` is written first, then the links; on a Mac
-  the socket's `pending.json` is removed, then the links move.
+  the links move, then the socket's `pending.json` is removed (one that cannot be removed puts the
+  links back and fails with `state_unavailable`).
 - **The restart.** On Linux `--restart-unit` names the units that run the release, as `--serve`
   takes them (at least one; the packaged unit is `kbf-daemon.service`); a Mac restarts the
   daemon's launchd job and takes none. A unit that does not come up on the release named is
@@ -780,7 +781,8 @@ kbf-host-install activate kbf=<commit|version> [--pin] [--force-lock] [--restart
 - **`--force-lock`** takes the lock from a holder that is gone or stuck: the lock file is made
   anew under its name and locked (a `flock` cannot be taken from its holder; the holder keeps the
   old file, and every later taker opens the new one). A stuck holder is not stopped: stop it first
-  if it may still move the links. Each take is appended, before the swap, to `lock-takes.jsonl`
+  if it may still move the links. Each take is appended at once (before the release is even
+  looked up) to `lock-takes.jsonl`
   beside the helper's `state.json` (`/var/lib/kbf-host-install` on Linux, the work directory on a
   Mac; root's, 0600), one line per take:
   `{"at_unix":N,"by":"activate","target":T,"holder_pid":N|null,"holder_alive":bool}`. It is a file
@@ -791,10 +793,12 @@ kbf-host-install activate kbf=<commit|version> [--pin] [--force-lock] [--restart
   `/var/lib/kbf-updater/pin.json` (a Mac: `/var/db/kbf-updater/pin.json`), in the packaged
   agent's state directory, root's and 0644,
   `{"commit":C,"version":V|null,"at_unix":N,"by":"activate"}`, and adds the commit to `pinned` in
-  `retain.json`, so no prune removes it. The file is written through the directory's descriptor,
-  made aside and renamed over the name, never through a link the agent's account put there. A
-  directory that is not there fails the activate before anything moves (`state_unavailable`):
-  without an agent, leave out `--pin`. Reading the hold file is the agent's; until it reads it, an
+  `retain.json`, so no prune removes it. Both are written once the links name the release (also
+  when its units then do not come up); a refused or failed swap pins nothing, and a pin that
+  cannot be written after the swap fails the command (`state_unavailable`, the release running).
+  The file is written through the directory's descriptor, made aside and renamed over the name,
+  never through a link the agent's account put there. A directory that is not there is refused
+  before anything changes (`config_invalid`): without an agent, leave out `--pin`. Reading the hold file is the agent's; until it reads it, an
   agent that runs re-drives the coordinator's desired release, which is why the agent is stopped
   first. The pin stays in `retain.json` until it is removed there.
 - **The answer** is the socket's JSON line on stdout (`activated`, with `from` the release left,
@@ -807,7 +811,7 @@ kbf-host-install activate kbf=<commit|version> [--pin] [--force-lock] [--restart
   and `activate` is refused there (`not_kept`, with nothing to list).
 
 If the session is cut during the restart, run the same command again: activating the release that
-runs restarts its units and changes nothing else.
+runs restarts its units and moves no link.
 
 ### On Linux
 
