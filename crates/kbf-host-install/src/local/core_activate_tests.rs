@@ -177,9 +177,9 @@ fn the_state_names_the_release_and_a_staged_one_is_cleared() {
     assert_eq!(
         ab.activate(&target(VB), How::default()),
         Answer::Activated {
-            commit: B.to_owned(),
+            commit: CommitId::new(B).unwrap(),
             version: Some(VB.to_owned()),
-            from: Some(A.to_owned()),
+            from: Some(CommitId::new(A).unwrap()),
             pinned: false,
             lock_taken: false,
         }
@@ -458,10 +458,7 @@ fn what_the_backend_says_is_told_and_a_lost_state_is_only_noted() {
     assert!(matches!(answer, Answer::Activated { .. }), "{answer:?}");
 
     // The trait's own answer, for a backend that keeps no release directories.
-    let fake = super::core_tests::Fake {
-        world: Rc::default(),
-        lock: rig.dir.join("fake.lock"),
-    };
+    let fake = NoReleases(rig.dir.join("fake.lock"));
     assert_eq!(
         fake.activate(B).unwrap_err(),
         Fault::refused(
@@ -482,4 +479,91 @@ fn what_the_backend_says_is_told_and_a_lost_state_is_only_noted() {
             .json_line(),
         "{\"result\":\"refused\",\"reason\":\"not_kept\",\"releases\":[]}"
     );
+}
+
+/// The hold file is published only as the file written: an owner of the directory that swaps
+/// the file aside for its own (or a link) between the write and the rename makes the write an
+/// error, not a published hold; one that removes it, too. Untouched, the name holds the text,
+/// root's (here the test's), 0644, a regular file.
+///
+/// Catches: a hold reported as written while the name holds what the directory's owner put there.
+#[test]
+fn a_hold_swapped_aside_before_its_rename_is_an_error() {
+    use super::core::activate::write_hold_for_test;
+    use rustix::fs::{AtFlags, Mode, OFlags};
+    let rig = Rig::new("ca-swap");
+    let dir = rig.dir.join("agent");
+    fs::create_dir_all(&dir).unwrap();
+    let hold = dir.join("pin.json");
+    let swap = |dirfd: &rustix::fd::OwnedFd| {
+        rustix::fs::unlinkat(dirfd, ".pin.json.new", AtFlags::empty()).unwrap();
+        let theirs = rustix::fs::openat(
+            dirfd,
+            ".pin.json.new",
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL,
+            Mode::from_raw_mode(0o644),
+        )
+        .unwrap();
+        rustix::io::write(&theirs, b"{\"commit\":\"theirs\"}").unwrap();
+    };
+    let err = write_hold_for_test(&hold, "{\"commit\":\"ours\"}", &swap).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "the hold file was replaced while it was written"
+    );
+
+    let link = |dirfd: &rustix::fd::OwnedFd| {
+        rustix::fs::unlinkat(dirfd, ".pin.json.new", AtFlags::empty()).unwrap();
+        rustix::fs::symlinkat("/etc/hostname", dirfd, ".pin.json.new").unwrap();
+    };
+    let err = write_hold_for_test(&hold, "{\"commit\":\"ours\"}", &link).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "the hold file was replaced while it was written"
+    );
+
+    let gone = |dirfd: &rustix::fd::OwnedFd| {
+        rustix::fs::unlinkat(dirfd, ".pin.json.new", AtFlags::empty()).unwrap();
+    };
+    assert!(write_hold_for_test(&hold, "{\"commit\":\"ours\"}", &gone).is_err());
+
+    write_hold_for_test(&hold, "{\"commit\":\"ours\"}", &|_| {}).unwrap();
+    let meta = fs::symlink_metadata(&hold).unwrap();
+    assert!(meta.is_file());
+    assert_eq!(meta.permissions().mode() & 0o7777, 0o644);
+    assert_eq!(meta.uid(), fs::metadata(&*rig.dir).unwrap().uid());
+    assert_eq!(fs::read_to_string(&hold).unwrap(), "{\"commit\":\"ours\"}");
+}
+
+/// A backend that keeps no release directories and says nothing of its own about `activate`.
+struct NoReleases(PathBuf);
+
+impl Backend for NoReleases {
+    fn lock_file(&self) -> PathBuf {
+        self.0.clone()
+    }
+    fn node_id(&self) -> Option<String> {
+        None
+    }
+    fn current(&self) -> Result<Option<String>, Fault> {
+        Ok(None)
+    }
+    fn pending(&self) -> Result<Option<Pending>, Fault> {
+        Ok(None)
+    }
+    fn has(&self, _commit: &str) -> bool {
+        false
+    }
+    fn stage(&self, _version: &Version, _channel: &Channel) -> Result<String, Fault> {
+        Err(Fault::refused(Code::UnknownRelease, "-"))
+    }
+    fn switch(&self, _commit: &str, _window_secs: u64, _now: u64) -> Result<u64, Fault> {
+        Err(Fault::refused(Code::NotStaged, "-"))
+    }
+    fn confirm(&self, _pending: &Pending) -> Result<(), Fault> {
+        Ok(())
+    }
+    fn revert(&self, _pending: &Pending) -> Result<(), Fault> {
+        Ok(())
+    }
 }

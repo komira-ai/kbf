@@ -133,6 +133,48 @@ fn stage_fault(outcome: Outcome) -> Fault {
     }
 }
 
+/// The fault an [`apply::select`] that did not leave the daemon running `commit` is. Links that
+/// were not put back are `revert_failed`, with what they name now.
+fn not_selected(host: &MacHost, commit: &str, not: apply::NotSelected) -> Fault {
+    let not_back = |why: &str| {
+        let now = kit::links(host).map_or_else(|e| e, |l| format!("{l:?}"));
+        Fault::failed(
+            Code::RevertFailed,
+            format!("{why}, and the links could not be put back: they are {now}"),
+        )
+    };
+    match not {
+        apply::NotSelected::Links { restored: true } => {
+            Fault::failed(Code::SwitchFailed, "links_failed")
+        }
+        apply::NotSelected::Links { restored: false } => not_back("links_failed"),
+        apply::NotSelected::AfterLinks {
+            why,
+            restored: true,
+        } => Fault::failed(Code::StateUnavailable, why),
+        apply::NotSelected::AfterLinks {
+            why,
+            restored: false,
+        } => not_back(&why),
+        apply::NotSelected::Restart(why) => Fault::failed(
+            Code::RestartFailed,
+            format!(
+                "the kit runs {} now, but: {why}",
+                commit.get(..12).unwrap_or(commit)
+            ),
+        ),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn not_selected_for_test(
+    host: &MacHost,
+    commit: &str,
+    not: apply::NotSelected,
+) -> Fault {
+    not_selected(host, commit, not)
+}
+
 impl Backend for MacBackend {
     fn lock_file(&self) -> PathBuf {
         // In the work directory, which `mac::ensure_work` makes before the server serves.
@@ -158,11 +200,12 @@ impl Backend for MacBackend {
         }))
     }
 
+    /// The release's binary is a regular file (not a link that would run another release's) and
+    /// root's to run.
     fn has(&self, commit: &str) -> bool {
-        self.host
-            .kit_trust
-            .check_file(&self.host.release(commit).join(BINARY))
-            .is_ok()
+        let binary = self.host.release(commit).join(BINARY);
+        fs::symlink_metadata(&binary).is_ok_and(|meta| meta.file_type().is_file())
+            && self.host.kit_trust.check_file(&binary).is_ok()
     }
 
     fn stage(&self, version: &Version, channel: &Channel) -> Result<String, Fault> {
@@ -236,18 +279,21 @@ impl Backend for MacBackend {
         self.clear_marker()
     }
 
-    /// Refused while the ssh path's apply job runs (it holds no install lock). The links move
-    /// ([`apply::select`]), then the marker of a release on trial is cleared, so no deadline puts
-    /// back what this chose (a marker that cannot be cleared puts the links back), then the
-    /// daemon's job restarts on the release.
+    /// Refused while the ssh path's apply job runs (it holds no install lock): its status file
+    /// says `running`, or launchd has the job and it has not ended (a job launchd cannot be
+    /// asked about counts as running). The links move ([`apply::select`]), then the marker of a
+    /// release on trial is cleared, so no deadline puts back what this chose (a marker that
+    /// cannot be cleared puts the links back), then the daemon's job restarts on the release.
+    /// Links that cannot be put back are `revert_failed`, with what they name.
     fn activate(&self, commit: &str) -> Result<(), Fault> {
-        if mac::status::effective(&self.host, &*self.runner)
-            == Some(mac::status::ApplyState::Running)
+        let status = mac::status::effective(&self.host, &*self.runner);
+        if status == Some(mac::status::ApplyState::Running)
+            || mac::status::job_running(&self.host, &*self.runner)
         {
             return Err(Fault::refused(
                 Code::Busy,
                 format!(
-                    "the ssh path's apply job ({}) is running",
+                    "the ssh path's apply job ({}) is running, or launchd cannot say it is not",
                     mac::layout::APPLY_LABEL
                 ),
             ));
@@ -255,19 +301,8 @@ impl Backend for MacBackend {
         let before =
             kit::links(&self.host).map_err(|why| Fault::failed(Code::StateUnavailable, why))?;
         let cleared = || self.clear_marker().map_err(|fault| fault.detail);
-        apply::select(&self.host, &*self.runner, commit, &before, cleared).map_err(
-            |not| match not {
-                apply::NotSelected::Links => Fault::failed(Code::SwitchFailed, "links_failed"),
-                apply::NotSelected::AfterLinks(why) => Fault::failed(Code::StateUnavailable, why),
-                apply::NotSelected::Restart(why) => Fault::failed(
-                    Code::RestartFailed,
-                    format!(
-                        "the kit runs {} now, but: {why}",
-                        commit.get(..12).unwrap_or(commit)
-                    ),
-                ),
-            },
-        )
+        apply::select(&self.host, &*self.runner, commit, &before, cleared)
+            .map_err(|not| not_selected(&self.host, commit, not))
     }
 
     fn kept(&self) -> Result<Vec<Kept>, Fault> {

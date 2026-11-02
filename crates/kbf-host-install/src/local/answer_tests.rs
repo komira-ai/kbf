@@ -191,17 +191,18 @@ fn the_codes_are_a_closed_set_of_distinct_words() {
 
 /// The `activate` answers: `activated` with the release, the one left, the pin and the take of
 /// the lock; a refusal that lists the kept releases (with the count left out, when any is), whose
-/// detail for the log names what was asked and what is kept.
+/// detail for the log is the one it was given.
 ///
 /// Catches: a refusal that loses the listing, or carries a `releases_omitted` of 0; an audit
 /// outcome that is not `activated` or `refused`.
 #[test]
 fn the_activate_lines_carry_the_release_and_the_kept_ones() {
     use kbf_retain::{CommitId, Kept};
+    let id = |c: char| CommitId::new(&c.to_string().repeat(40)).unwrap();
     let activated = Answer::Activated {
-        commit: "b".repeat(40),
+        commit: id('b'),
         version: None,
-        from: Some("a".repeat(40)),
+        from: Some(id('a')),
         pinned: true,
         lock_taken: false,
     };
@@ -214,14 +215,14 @@ fn the_activate_lines_carry_the_release_and_the_kept_ones() {
     assert_eq!(activated.log_detail(), None);
 
     let kept = |c: char| Kept {
-        commit: CommitId::new(&c.to_string().repeat(40)).unwrap(),
+        commit: id(c),
         version: None,
         why: vec!["current"],
         version_left_out: false,
     };
     let unkept = Answer::Unresolved {
         code: Code::NotKept,
-        target: "0.1-1".into(),
+        detail: "\"0.1-1\" names no release this host keeps".into(),
         releases: vec![kept('a')],
         releases_omitted: 0,
     };
@@ -233,37 +234,22 @@ fn the_activate_lines_carry_the_release_and_the_kept_ones() {
     assert_eq!(unkept.audit_fields(), ("refused", Some("not_kept")));
     assert_eq!(
         unkept.log_detail().unwrap(),
-        format!(
-            "\"0.1-1\" names no release this host keeps; it keeps {}",
-            "a".repeat(40)
-        )
+        "\"0.1-1\" names no release this host keeps"
     );
     let ambiguous = Answer::Unresolved {
         code: Code::AmbiguousRelease,
-        target: "aaaaaaaaaaaa".into(),
+        detail: "two of them".into(),
         releases: vec![kept('a'), kept('b')],
         releases_omitted: 3,
     };
     assert_eq!(line(&ambiguous)["releases_omitted"], 3);
-    assert_eq!(
-        ambiguous.log_detail().unwrap(),
-        format!(
-            "\"aaaaaaaaaaaa\" names more than one release this host keeps; it keeps {} {} and 3 \
-             more",
-            "a".repeat(40),
-            "b".repeat(40)
-        )
-    );
+    assert_eq!(line(&ambiguous)["reason"], "ambiguous_release");
     let none = Answer::Unresolved {
         code: Code::NotKept,
-        target: "x".into(),
+        detail: "none to name".into(),
         releases: Vec::new(),
         releases_omitted: 0,
     };
-    assert_eq!(
-        none.log_detail().unwrap(),
-        "\"x\" names no release this host keeps; it keeps none"
-    );
     assert_eq!(
         line(&none),
         json!({"result":"refused","reason":"not_kept","releases":[]})

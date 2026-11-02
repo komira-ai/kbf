@@ -253,18 +253,22 @@ pub struct Selected {
 }
 
 /// Make the installed release `commit` current for good, with no trial: the operator's
-/// emergency swap to a release the host keeps. The state gets `current` = `commit`,
+/// emergency swap to a release the host keeps. The state's lock is taken without waiting
+/// ([`Locked::try_acquire`]): another run that holds it is `StateError::Busy`, and nothing
+/// changes. The state gets `current` = `commit`,
 /// `previous` = the release that was current (unless that is `commit`, when `previous` stays),
 /// no `pending_confirm` (a swap on trial ends here, kept or left), and a `staged` that names
 /// `commit` is cleared; the state is written first and the links follow, as for every verb.
-/// Nothing is fetched and nothing is run: the caller restarts the service.
+/// Links that cannot follow put the state back as it was (and the links, as far as they can
+/// be). Nothing is fetched and nothing is run: the caller restarts the service.
 pub fn select<E: Exec>(
     exec: &mut E,
     host: &Layout,
     commit: &CommitId,
     out: &mut dyn Write,
 ) -> Result<Selected, ReleaseError> {
-    let (lock, state) = open(host)?;
+    let lock = Locked::try_acquire(host)?;
+    let state = lock.read()?.unwrap_or_default();
     if !has_binary(exec, host, commit) {
         return Err(ReleaseError::NotInstalled(commit.clone()));
     }
@@ -278,10 +282,17 @@ pub fn select<E: Exec>(
         previous,
         pending_confirm: None,
         staged: state.staged.clone().filter(|c| c != commit),
-        ..state
+        ..state.clone()
     };
     lock.write(&next)?;
-    converge(exec, host, &next, out)?;
+    if let Err(e) = converge(exec, host, &next, out) {
+        // The links did not follow: the state goes back to the release they still name, so the
+        // next select leaves the release that runs, and the links are put back as they were.
+        // What cannot be put back is for `reconcile`, which makes the links follow the state.
+        let _ = lock.write(&state);
+        let _ = converge(exec, host, &state, out);
+        return Err(e);
+    }
     Ok(Selected { from })
 }
 

@@ -45,7 +45,7 @@ use kbf_installer::helper::leases::LeaseSource;
 use kbf_installer::helper::service::{self, HostProcs, Procs};
 use kbf_installer::layout::{Layout, Platform};
 use kbf_installer::refusal::Refusal as InstallerRefusal;
-use kbf_installer::release;
+use kbf_installer::release::{self, ReleaseError};
 use kbf_installer::retain::{self, Kept};
 use kbf_installer::run::Runner as InstallerRunner;
 use kbf_installer::settings::Settings;
@@ -246,6 +246,24 @@ impl<E: Exec> Linux<E> {
             restart_and_wait(&*self.runner, unit, self.restart_wait, &self.pace)?;
         }
         Ok(())
+    }
+
+    /// Restart every unit and wait for each, whatever became of the ones before it: an
+    /// `activate` keeps the release named, so a unit left alone would go on running the release
+    /// it leaves. What did not come up, unit by unit.
+    fn restart_every_unit(&self) -> Result<(), String> {
+        let failed: Vec<String> = self
+            .units
+            .iter()
+            .filter_map(|unit| {
+                restart_and_wait(&*self.runner, unit, self.restart_wait, &self.pace).err()
+            })
+            .collect();
+        if failed.is_empty() {
+            Ok(())
+        } else {
+            Err(failed.join("; "))
+        }
     }
 
     /// Put the host back on the release that ran: state, links, restart. Whether the units
@@ -595,21 +613,23 @@ impl<E: Exec> Backend for Linux<E> {
         self.put_back()
     }
 
-    /// The installer's [`activate::select`] (the state, then the links; no trial), then the
-    /// units restarted. A unit that does not come up leaves the host on the release named: there
-    /// is no going back to the release left.
+    /// The installer's [`activate::select`] (the state, then the links; no trial; refused at once
+    /// while another run holds the installer's state), then every unit restarted, each whatever
+    /// became of the others. A unit that does not come up leaves the host on the release named:
+    /// there is no going back to the release left.
     fn activate(&self, commit: &str) -> Result<(), Fault> {
         let id = commit_id(commit)?;
         let mut out = Vec::new();
         activate::select(&mut *self.exec.borrow_mut(), &self.layout, &id, &mut out).map_err(
             |e| match e {
-                kbf_installer::release::ReleaseError::NotInstalled(_) => {
-                    Fault::refused(Code::NotKept, e.to_string())
+                ReleaseError::NotInstalled(_) => Fault::refused(Code::NotKept, e.to_string()),
+                ReleaseError::State(state::StateError::Busy { .. }) => {
+                    Fault::refused(Code::Busy, format!("kbf-installer's {e}"))
                 }
                 other => Fault::failed(Code::StateUnavailable, other.to_string()),
             },
         )?;
-        self.restart_units().map_err(|why| {
+        self.restart_every_unit().map_err(|why| {
             Fault::failed(
                 Code::RestartFailed,
                 format!(

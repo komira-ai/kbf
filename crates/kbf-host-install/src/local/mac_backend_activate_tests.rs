@@ -69,9 +69,9 @@ fn target(text: &str) -> Target {
 
 fn activated(commit: &str, version: &str, from: &str, pinned: bool, taken: bool) -> Answer {
     Answer::Activated {
-        commit: commit.to_owned(),
+        commit: CommitId::new(commit).unwrap(),
         version: Some(version.to_owned()),
-        from: Some(from.to_owned()),
+        from: Some(CommitId::new(from).unwrap()),
         pinned,
         lock_taken: taken,
     }
@@ -218,7 +218,10 @@ fn mac_activate_refuses_a_live_lock_holder_and_a_running_apply() {
         answer,
         Answer::Refused(
             Code::Busy,
-            format!("the ssh path's apply job ({APPLY_LABEL}) is running")
+            format!(
+                "the ssh path's apply job ({APPLY_LABEL}) is running, or launchd cannot say it \
+                 is not"
+            )
         )
     );
     assert!(!fx.dir.join("agent/pin.json").exists(), "nothing is pinned");
@@ -461,3 +464,6 @@ fn the_command_audits_what_it_did_on_a_mac() {
     );
     assert_eq!(code, 3);
 }
+
+#[path = "mac_backend_activate_more_tests.rs"]
+mod more;

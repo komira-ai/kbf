@@ -97,3 +97,51 @@ fn select_refuses_a_release_that_is_not_installed_and_changes_nothing() {
     assert_eq!(link(&exec, "current"), at(A));
     assert_eq!(link_steps(&exec), 0);
 }
+
+/// Another run that holds the state's lock is told at once (busy, naming the lock), and nothing
+/// changes: select does not wait behind it.
+///
+/// Catches: an emergency swap left hanging behind a run that does not let go.
+#[test]
+fn select_refuses_at_once_while_another_run_holds_the_state() {
+    let (mut exec, layout) = host("select-busy");
+    running(&exec, &layout, A, &[B]);
+    let held = Locked::acquire(&layout).expect("lock");
+    let err = select(&mut exec, &layout, &c(B), &mut Vec::new()).expect_err("busy");
+    assert!(
+        matches!(
+            &err,
+            ReleaseError::State(crate::state::StateError::Busy { .. })
+        ),
+        "{err}"
+    );
+    drop(held);
+    assert_eq!(state_of(&layout).current, Some(c(A)));
+    assert_eq!(link(&exec, "current"), at(A));
+}
+
+/// Links that cannot follow the state put the state back as it was: a select that failed
+/// leaves `current` naming the release that still runs, so the next select (to another
+/// release) leaves that one, and `previous` names it.
+///
+/// Catches: a failed select whose state names a release that never ran, which the next select
+/// then reports as left and makes `previous`.
+#[test]
+fn a_select_whose_links_cannot_follow_leaves_the_state_as_it_was() {
+    let (mut exec, layout) = host("select-stuck");
+    running(&exec, &layout, A, &[B, C]);
+    let before = state_of(&layout);
+    // A directory where `previous` goes: the link step refuses it.
+    let previous = exec.at("/var/lib/kbf-installer/releases/previous");
+    fs::create_dir(&previous).expect("dir");
+    fs::write(previous.join("x"), "in the way").expect("file");
+    select(&mut exec, &layout, &c(B), &mut Vec::new()).expect_err("cannot link");
+    assert_eq!(state_of(&layout), before, "the state is as it was");
+    assert_eq!(link(&exec, "current"), at(A));
+    fs::remove_dir_all(&previous).expect("clear");
+    let selected = select(&mut exec, &layout, &c(C), &mut Vec::new()).expect("to C");
+    assert_eq!(selected.from, Some(c(A)));
+    let state = state_of(&layout);
+    assert_eq!((state.current, state.previous), (Some(c(C)), Some(c(A))));
+    assert_eq!(link(&exec, "previous"), at(A));
+}

@@ -549,7 +549,12 @@ impl Drop for Lock {
 
 /// Take the advisory lock on the file at `path` without waiting, creating it root-only.
 pub(crate) fn take_lock(path: &std::path::Path) -> Result<Lock, Outcome> {
-    let file = OpenOptions::new()
+    lock_opened(path, open_lock(path)?)
+}
+
+/// The lock file at `path`, opened (made root-only when missing) without following a link.
+pub(crate) fn open_lock(path: &std::path::Path) -> Result<File, Outcome> {
+    OpenOptions::new()
         .create(true)
         .append(true)
         .mode(0o600)
@@ -560,38 +565,76 @@ pub(crate) fn take_lock(path: &std::path::Path) -> Result<Lock, Outcome> {
                 FailureCode::LockUnavailable,
                 format!("{}: {e}", path.display()),
             )
-        })?;
+        })
+}
+
+/// The device and inode of `file`, and of what `path` names now (without following a link).
+fn same_file(path: &std::path::Path, file: &File) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let id = |meta: std::fs::Metadata| (meta.dev(), meta.ino());
+    match (std::fs::symlink_metadata(path), file.metadata()) {
+        (Ok(named), Ok(opened)) => id(named) == id(opened),
+        _ => false,
+    }
+}
+
+/// Lock `file`, the lock file opened at `path`, without waiting. Busy when another holds it,
+/// and when it is no longer the file `path` names: an `activate --force-lock` made a new one
+/// while this taker had the old one open, and the holder of the new one runs.
+pub(crate) fn lock_opened(path: &std::path::Path, file: File) -> Result<Lock, Outcome> {
     // Anything but a lock taken means another install or restart runs (or the lock cannot be
     // held): either way nothing may start.
     file.try_lock()
         .map_err(|_| fail(FailureCode::Busy, BUSY_DETAIL))?;
+    let lock = Lock(file);
+    if !same_file(path, &lock.0) {
+        return Err(fail(FailureCode::Busy, BUSY_DETAIL));
+    }
     // Who holds it, for `activate` to name ([`locks::holder`]): this process's id, in place of
     // the last holder's. The lock is the `flock`; a record that cannot be written only names
     // no one.
-    let _ = file
+    let _ = lock
+        .0
         .set_len(0)
-        .and_then(|()| writeln!(&file, "{}", std::process::id()));
-    Ok(Lock(file))
+        .and_then(|()| writeln!(&lock.0, "{}", std::process::id()));
+    Ok(lock)
 }
 
 /// The install lock for `activate --force-lock`: taken as [`take_lock`] does, and when another
 /// process holds it, taken from that holder. A `flock` cannot be broken: the holder keeps its
 /// lock on the file it opened, so that file is removed from its name and a new one is made and
-/// locked there, which every later taker opens. The holder it was taken from, if it was taken.
+/// locked there, which every later taker opens (and a taker that had the old one open finds it
+/// is no longer the lock: [`lock_opened`]). The holder it was taken from, if it was taken.
 pub(crate) fn take_lock_over(
     path: &std::path::Path,
 ) -> Result<(Lock, Option<locks::Holder>), Outcome> {
-    match take_lock(path) {
-        Ok(lock) => Ok((lock, None)),
-        Err(Outcome::Failed(failure)) if failure.code == FailureCode::Busy => {
-            let holder = locks::holder(path);
-            // A file that cannot be removed is still the holder's: the take below is then
-            // refused as busy, which names it.
-            let _ = std::fs::remove_file(path);
-            take_lock(path).map(|lock| (lock, Some(holder)))
-        }
-        Err(other) => Err(other),
+    take_over_opened(path, open_lock(path)?)
+}
+
+/// [`take_lock_over`] with the lock file already opened as `first`. Only the file this taker
+/// found held is replaced, and one taker at a time replaces it (a lock on `<path>.take`, taken
+/// without waiting): a file another taker made meanwhile is that taker's, and this one is busy.
+pub(crate) fn take_over_opened(
+    path: &std::path::Path,
+    first: File,
+) -> Result<(Lock, Option<locks::Holder>), Outcome> {
+    let seen = first.try_clone();
+    // It fails only as busy: held by another, or no longer the file at the name.
+    if let Ok(lock) = lock_opened(path, first) {
+        return Ok((lock, None));
     }
+    let mut guard_path = path.as_os_str().to_owned();
+    guard_path.push(".take");
+    let _guard = take_lock(std::path::Path::new(&guard_path))?;
+    let still_held = seen.as_ref().is_ok_and(|seen| same_file(path, seen));
+    if !still_held {
+        return take_lock(path).map(|lock| (lock, None));
+    }
+    let holder = locks::holder(path);
+    // A file that cannot be removed is still the holder's: the take below is then refused as
+    // busy, which names it.
+    let _ = std::fs::remove_file(path);
+    take_lock(path).map(|lock| (lock, Some(holder)))
 }
 
 /// What a command printed to explain itself: its stderr, else its stdout.

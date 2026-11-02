@@ -736,6 +736,8 @@ forced command's, so the two never overlap.
 
 ### The emergency command: `activate`
 
+The decisions behind it are in [../design/host-activate.md](../design/host-activate.md).
+
 When a release misbehaves and the way back must not wait for the coordinator (it is down, or it
 still desires the bad release), root on the host makes a release the host keeps the one that
 runs, with the helper at its fixed path:
@@ -756,7 +758,8 @@ kbf-host-install activate kbf=<commit|version> [--pin] [--force-lock] [--restart
   one), by its version (whose `+g<12 hex>` names the commit), or by the version text the host
   recorded for it. It must be one the host keeps (`releases/` of the layout or the kit): nothing is
   fetched, so the release source and the network may be gone. A release the host does not keep,
-  or a name that fits two, is refused (`not_kept`, `ambiguous_release`) with the kept releases:
+  or a name that fits two, is refused (`not_kept`, `ambiguous_release`) with the kept releases, and
+  so is a kept release whose binary is not a regular file root may run (`not_kept`):
   in the JSON line as `releases`, and on stderr one line each (`kept: <commit> <version> (why)`).
 - **No trial.** The swap is final: there is no deadline and no revert. `previous` becomes the
   release that ran (the one left); a release that was on trial is on trial no more, so no deadline
@@ -765,9 +768,10 @@ kbf-host-install activate kbf=<commit|version> [--pin] [--force-lock] [--restart
   links back and fails with `state_unavailable`).
 - **The restart.** On Linux `--restart-unit` names the units that run the release, as `--serve`
   takes them (at least one; the packaged unit is `kbf-daemon.service`); a Mac restarts the
-  daemon's launchd job and takes none. A unit that does not come up on the release named is
-  `restart_failed` (exit 3), and the host stays on that release: it is not put back on the one it
-  left. Name another kept release to go elsewhere.
+  daemon's launchd job and takes none. Every unit is restarted, each whatever became of the others.
+  A unit that does not come up on the release named is `restart_failed` (exit 3), and the host
+  stays on that release: it is not put back on the one it left. Name another kept release to go
+  elsewhere.
 - **Nothing of the release left runs.** The helper is not part of any kbf release (it is at its
   fixed path, which no release install writes), it moves the links itself, and the service manager
   starts the release named: no program under `releases/<the release left>` is executed.
@@ -777,17 +781,21 @@ kbf-host-install activate kbf=<commit|version> [--pin] [--force-lock] [--restart
   stderr: `pid N, which is alive` (let it end or stop it), `pid N, which is gone` (a process it
   started keeps the lock), or `a process that wrote no id` (a helper from before this one). On a
   Mac an apply job of the ssh path that is running is refused the same way (`busy`), since it runs
-  without the lock.
+  without the lock: launchd is asked about the job whatever its status file says, and a launchd
+  that cannot be asked counts as running. The locks taken inside it (the installer's state lock,
+  `retain.json`'s) are taken without waiting too: a holder is refused (`busy`), not waited for.
 - **`--force-lock`** takes the lock from a holder that is gone or stuck: the lock file is made
   anew under its name and locked (a `flock` cannot be taken from its holder; the holder keeps the
-  old file, and every later taker opens the new one). A stuck holder is not stopped: stop it first
-  if it may still move the links. Each take is appended at once (before the release is even
+  old file, and every later taker opens the new one; a taker that had the old one open finds it is
+  no longer the lock and is busy). One forced taker at a time replaces it, and only the file it
+  found held (`<lock>.take` is locked meanwhile). A stuck holder is not stopped: stop it first if
+  it may still move the links. Each take is appended at once (before the release is even
   looked up) to `lock-takes.jsonl`
   beside the helper's `state.json` (`/var/lib/kbf-host-install` on Linux, the work directory on a
   Mac; root's, 0600), one line per take:
   `{"at_unix":N,"by":"activate","target":T,"holder_pid":N|null,"holder_alive":bool}`. It is a file
   of its own because helpers before this one read `state.json` strictly and would refuse a new
-  key. A take that cannot be recorded stops the activate (`state_unavailable`). The audit line says
+  key. A line cut short by a crash is ended before the next one is appended. A take that cannot be recorded stops the activate (`state_unavailable`). The audit line says
   `install lock taken` too.
 - **`--pin`** holds the host on the release: it writes the hold file
   `/var/lib/kbf-updater/pin.json` (a Mac: `/var/db/kbf-updater/pin.json`), in the packaged
@@ -797,7 +805,9 @@ kbf-host-install activate kbf=<commit|version> [--pin] [--force-lock] [--restart
   when its units then do not come up); a refused or failed swap pins nothing, and a pin that
   cannot be written after the swap fails the command (`state_unavailable`, the release running).
   The file is written through the directory's descriptor, made aside and renamed over the name,
-  never through a link the agent's account put there. A directory that is not there is refused
+  never through a link the agent's account put there; a file swapped in aside before the rename is
+  found and fails the pin, and the directory is synced. Another writer that holds `retain.json`
+  refuses the pin (`busy`) before anything changes. A directory that is not there is refused
   before anything changes (`config_invalid`): without an agent, leave out `--pin`. Reading the hold file is the agent's; until it reads it, an
   agent that runs re-drives the coordinator's desired release, which is why the agent is stopped
   first. The pin stays in `retain.json` until it is removed there.

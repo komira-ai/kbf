@@ -112,9 +112,9 @@ fn current_and_previous(rig: &Rig) -> (Option<String>, Option<String>) {
 
 fn activated(commit: &str, version: Option<&str>, from: &str) -> Answer {
     Answer::Activated {
-        commit: commit.to_owned(),
+        commit: CommitId::new(commit).unwrap(),
         version: version.map(str::to_owned),
-        from: Some(from.to_owned()),
+        from: Some(CommitId::new(from).unwrap()),
         pinned: false,
         lock_taken: false,
     }
@@ -211,7 +211,7 @@ fn activate_refuses_a_release_not_kept_and_lists_the_kept_ones() {
     );
     assert_eq!(
         answer.log_detail().unwrap(),
-        format!("\"cccccccccccc\" names no release this host keeps; it keeps {B} {A}")
+        "\"cccccccccccc\" names no release this host keeps"
     );
 
     let twin = format!("{}{}", &B[..12], "e".repeat(28));
@@ -476,9 +476,9 @@ fn activate_ends_a_trial_and_no_deadline_reverts_it() {
     assert_eq!(
         ab.activate(&target(A), How::default()),
         Answer::Activated {
-            commit: A.to_owned(),
+            commit: CommitId::new(A).unwrap(),
             version: None,
-            from: Some(B.to_owned()),
+            from: Some(CommitId::new(B).unwrap()),
             pinned: false,
             lock_taken: false,
         }
@@ -493,7 +493,8 @@ fn activate_ends_a_trial_and_no_deadline_reverts_it() {
 }
 
 /// Units that do not come up on the release named leave the host on it, failed with
-/// `restart_failed` (and pinned, when asked): there is no going back to the release left. A kept directory with no
+/// `restart_failed` (and pinned, when asked): there is no going back to the release left, and a
+/// unit after the one that failed is restarted all the same. A kept directory with no
 /// binary is refused as not kept; links the layout cannot move fail with `state_unavailable`.
 ///
 /// Catches: a failed restart answered by starting the release left; a swap to a directory with
@@ -527,21 +528,37 @@ fn what_the_host_cannot_do_is_told_and_a_failed_restart_does_not_go_back() {
         current_and_previous(&rig),
         (Some(B.to_owned()), Some(A.to_owned()))
     );
+    // The unit after the one that failed is restarted all the same (on B): none goes on
+    // running the release left, and none is started on it.
     assert_eq!(
         rig.systemctl(),
-        ["restart -- kbf-daemon.service"],
-        "the release left is not started"
+        [
+            "restart -- kbf-daemon.service",
+            "restart -- kbf-frontend@a.service",
+            "is-active -- kbf-frontend@a.service"
+        ]
     );
+    assert_eq!(rig.link("current").as_deref(), Some(B));
 
     let rig = Rig::new("act-nobinary");
     keep(&rig, B, None, 2);
     fs::remove_file(rig.releases().join(B).join("kbf")).unwrap();
     let (ab, _) = core(&rig);
-    let answer = ab.activate(&target(B), How::default());
+    let answer = ab.activate(&target(B), PIN);
     assert_eq!(
         answer.json_line(),
-        "{\"result\":\"refused\",\"reason\":\"not_kept\"}"
+        format!(
+            "{{\"result\":\"refused\",\"reason\":\"not_kept\",\"releases\":[\
+             {{\"commit\":\"{B}\",\"version\":null}},\
+             {{\"commit\":\"{A}\",\"version\":null,\"why\":[\"current\"]}}]}}"
+        )
     );
+    assert_eq!(
+        answer.log_detail().unwrap(),
+        format!("\"{B}\" names {B}, whose binary this host cannot run")
+    );
+    assert_eq!(current_and_previous(&rig), (Some(A.to_owned()), None));
+    assert!(!rig.dir.join("agent/pin.json").exists(), "nothing pinned");
 
     let rig = Rig::new("act-nolinks");
     keep(&rig, B, None, 2);
@@ -639,3 +656,6 @@ fn the_command_audits_what_it_did_on_a_linux_host() {
     );
     assert_eq!(code, 3);
 }
+
+#[path = "linux_activate_more_tests.rs"]
+mod more;

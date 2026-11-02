@@ -81,14 +81,14 @@ fn only_root_with_a_sound_command_reaches_the_run() {
         ran.set(ran.get() + 1);
         7
     };
-    assert_eq!(main_with(&args("--pin"), 0, go), ExitCode::from(2));
+    assert_eq!(main_with(&args("--pin"), 0, &go), ExitCode::from(2));
     assert_eq!(
-        main_with(&args("kbf=bbbbbbbbbbbb"), 1000, go),
+        main_with(&args("kbf=bbbbbbbbbbbb"), 1000, &go),
         ExitCode::from(2)
     );
     assert_eq!(ran.get(), 0);
     assert_eq!(
-        main_with(&args("kbf=bbbbbbbbbbbb"), 0, go),
+        main_with(&args("kbf=bbbbbbbbbbbb"), 0, &go),
         ExitCode::from(7)
     );
     assert_eq!(ran.get(), 1);
@@ -185,7 +185,7 @@ fn a_run_prints_the_answer_and_the_kept_releases_and_exits_by_it() {
     let go = |ab: &Ab<Two>, line: &str| {
         let (mut out, mut err) = (Vec::new(), Vec::new());
         let code = run(
-            ab,
+            &|target, how| ab.activate(target, how),
             &Command::parse(&args(line)).unwrap(),
             &place,
             &mut out,
@@ -211,8 +211,8 @@ fn a_run_prints_the_answer_and_the_kept_releases_and_exits_by_it() {
     assert_eq!(
         err,
         format!(
-            "kbf-host-install: activate: \"cccccccccccc\" names no release this host keeps; it \
-             keeps {b} {a}\n  kept: {b} 0.2.0+gbbbbbbbbbbbb-1\n  kept: {a} - (current, pinned)\n",
+            "kbf-host-install: activate: \"cccccccccccc\" names no release this host keeps\n  \
+             kept: {b} 0.2.0+gbbbbbbbbbbbb-1\n  kept: {a} - (current, pinned)\n",
             a = "a".repeat(40),
             b = "b".repeat(40)
         )
@@ -264,7 +264,7 @@ fn the_program_refuses_before_it_reads_the_host() {
         main_with(
             &args("kbf=bbbbbbbbbbbb"),
             0,
-            super::activate_cli::production
+            &super::activate_cli::production
         ),
         ExitCode::from(2)
     );

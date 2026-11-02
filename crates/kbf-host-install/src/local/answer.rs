@@ -9,12 +9,12 @@
 //! | activate | `{"result":"activated","commit":C,"version":V\|null,"from":C\|null,"pinned":bool,"lock_taken":bool}` |
 //! | query | `{"result":"query","commit":..,"version":..,"node_id":..,"pending":{..}\|null,"last":{..}\|null,"busy":bool}` |
 //! | no | `{"result":"refused","reason":CODE}` (nothing ran) or `{"result":"failed","reason":CODE}` |
-//! | no, for `activate` | `{"result":"refused","reason":"not_kept"\|"ambiguous_release","releases":[..]}`: the releases the host keeps |
+//! | no, for `activate` | `{"result":"refused","reason":"not_kept"\|"ambiguous_release","releases":[..]}`: the releases the host keeps (`not_kept` also for one whose binary cannot run) |
 //!
 //! A reason is a code from a closed set ([`Code`]), never text taken from the request or from
 //! a child process; the detail goes to the log, cleaned.
 
-use kbf_retain::Kept;
+use kbf_retain::{CommitId, Kept};
 use serde::Serialize;
 
 use crate::outcome::MAX_DETAIL_LEN;
@@ -200,12 +200,12 @@ pub enum Answer {
     Queried(QueryView),
     /// The release an `activate` named runs now, for good.
     Activated {
-        commit: String,
+        commit: CommitId,
         /// Its version text, when this host knows it.
         version: Option<String>,
         /// The release that ran before, now `previous` (none on a host that ran none, and the
         /// same commit when it was already the one that runs).
-        from: Option<String>,
+        from: Option<CommitId>,
         /// The host is held on it: the hold file is written and the release is pinned.
         pinned: bool,
         /// The install lock was taken from another holder (`--force-lock`).
@@ -215,8 +215,8 @@ pub enum Answer {
     /// (`ambiguous_release`): refused, nothing ran, and the releases the host keeps are told.
     Unresolved {
         code: Code,
-        /// What was asked for, for the log.
-        target: String,
+        /// What was asked for and why it names no release to run, for the log.
+        detail: String,
         releases: Vec<Kept>,
         releases_omitted: usize,
     },
@@ -274,9 +274,9 @@ struct Queried<'a> {
 #[derive(Serialize)]
 struct Activated<'a> {
     result: &'static str,
-    commit: &'a str,
+    commit: &'a CommitId,
     version: Option<&'a str>,
-    from: Option<&'a str>,
+    from: Option<&'a CommitId>,
     pinned: bool,
     lock_taken: bool,
 }
@@ -350,7 +350,7 @@ impl Answer {
                 result: "activated",
                 commit,
                 version: version.as_deref(),
-                from: from.as_deref(),
+                from: from.as_ref(),
                 pinned: *pinned,
                 lock_taken: *lock_taken,
             }),
@@ -395,36 +395,10 @@ impl Answer {
     /// The detail of a refusal or a failure, cleaned and cut, for the log; none for an
     /// answer that went well.
     pub fn log_detail(&self) -> Option<String> {
-        let unresolved;
         let detail = match self {
-            Self::Refused(_, detail) | Self::Failed(_, detail) => detail,
-            Self::Unresolved {
-                code,
-                target,
-                releases,
-                releases_omitted,
-            } => {
-                let held: Vec<&str> = releases.iter().map(|k| k.commit.as_str()).collect();
-                let many = if *code == Code::NotKept {
-                    "no"
-                } else {
-                    "more than one"
-                };
-                unresolved = format!(
-                    "{target:?} names {many} release this host keeps; it keeps {}{}",
-                    if held.is_empty() {
-                        "none".to_owned()
-                    } else {
-                        held.join(" ")
-                    },
-                    if *releases_omitted > 0 {
-                        format!(" and {releases_omitted} more")
-                    } else {
-                        String::new()
-                    }
-                );
-                &unresolved
-            }
+            Self::Refused(_, detail)
+            | Self::Failed(_, detail)
+            | Self::Unresolved { detail, .. } => detail,
             _ => return None,
         };
         let mut text = String::new();

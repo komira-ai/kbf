@@ -256,3 +256,80 @@ fn a_taker_writes_its_id_and_a_take_over_names_the_holder() {
     // A lock file that cannot be opened is no lock to take.
     assert!(take_lock_over(&dir.join("no/such/dir/lock")).is_err());
 }
+
+/// A taker that opened the lock file before a take over replaced it, and locks it once the
+/// displaced holder lets go, is busy: its file is no longer the lock, and the taker over still
+/// holds the one that is. A lock file removed under a taker is busy the same way.
+///
+/// Catches: two processes both running, one on the replaced file and one on the new one.
+#[test]
+fn a_taker_holding_the_replaced_lock_file_is_busy() {
+    use crate::host::{lock_opened, open_lock, take_lock_over};
+    let dir = TestDir::under(std::env::temp_dir(), "locks-stale");
+    let path = dir.join("lock");
+    let displaced = open_lock(&path).unwrap();
+    displaced.try_lock().unwrap();
+    // A normal taker opens the file now, before the take over, and waits its turn.
+    let late = open_lock(&path).unwrap();
+    let (over, taken) = take_lock_over(&path).unwrap();
+    assert!(
+        taken.is_some(),
+        "the lock was taken from the displaced holder"
+    );
+    drop(displaced);
+    assert!(
+        lock_opened(&path, late).is_err(),
+        "the replaced file is no lock"
+    );
+    assert!(flock_held(&path), "the taker over still holds the lock");
+    drop(over);
+    wait_lockable(&path);
+
+    let gone = open_lock(&path).unwrap();
+    fs::remove_file(&path).unwrap();
+    assert!(lock_opened(&path, gone).is_err(), "no file at the name");
+}
+
+/// Two forced takers that both found the same holder: the first replaces the lock file and holds
+/// the new one; the second finds the file it saw is no longer the lock, takes nothing from the
+/// first, and is busy. While one taker replaces the file (its `.take` lock held), another is busy
+/// at once.
+///
+/// Catches: a second forced taker that removes the first one's new lock file, so both run.
+#[test]
+fn two_forced_takers_never_both_hold_the_lock() {
+    use crate::host::{open_lock, take_lock, take_lock_over, take_over_opened};
+    use std::os::unix::fs::MetadataExt;
+    let dir = TestDir::under(std::env::temp_dir(), "locks-two");
+    let path = dir.join("lock");
+    let stuck = open_lock(&path).unwrap();
+    stuck.try_lock().unwrap();
+    // B opens the file the stuck holder holds, then A takes the lock over first.
+    let b_first = open_lock(&path).unwrap();
+    let (a, a_took) = take_lock_over(&path).unwrap();
+    assert!(a_took.is_some());
+    let a_file = fs::metadata(&path).unwrap().ino();
+    let b = take_over_opened(&path, b_first);
+    assert!(b.is_err(), "B is busy: A holds the lock");
+    assert_eq!(
+        fs::metadata(&path).unwrap().ino(),
+        a_file,
+        "A's file is the lock"
+    );
+    assert!(flock_held(&path));
+    drop(a);
+    wait_lockable(&path);
+
+    // A taker over that finds another replacing the file is busy at once.
+    let held = take_lock(&path).unwrap();
+    let mut guard = path.as_os_str().to_owned();
+    guard.push(".take");
+    let replacing = take_lock(std::path::Path::new(&guard)).unwrap();
+    assert!(take_lock_over(&path).is_err());
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        format!("{}\n", std::process::id()),
+        "the holder's file is untouched"
+    );
+    drop((held, replacing, stuck));
+}

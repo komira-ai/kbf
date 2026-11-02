@@ -21,6 +21,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use kbf_retain::CommitId;
+
 use super::answer::{Answer, Code};
 use super::backend::Backend;
 use super::core::Ab;
@@ -33,6 +35,8 @@ use crate::runner::Runner;
 use crate::trust::Trust;
 
 /// The hold file on Linux: in the packaged agent's state directory.
+// Read by the Linux build only; the Mac build compiles the Linux side and has no use for it.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub const LINUX_HOLD: &str = "/var/lib/kbf-updater/pin.json";
 
 /// The hold file on a Mac: in the packaged agent's state directory.
@@ -100,11 +104,11 @@ impl Command {
 
 /// The program: `activate` with the arguments after it, as root, on this platform.
 pub fn main(args: &[String]) -> ExitCode {
-    main_with(args, rustix::process::geteuid().as_raw(), production)
+    main_with(args, rustix::process::geteuid().as_raw(), &production)
 }
 
 /// [`main`] with the effective user and the platform's run put in by the caller.
-pub(super) fn main_with(args: &[String], euid: u32, run: impl FnOnce(&Command) -> u8) -> ExitCode {
+pub(super) fn main_with(args: &[String], euid: u32, run: &dyn Fn(&Command) -> u8) -> ExitCode {
     let command = match Command::parse(args) {
         Ok(command) => command,
         Err(why) => {
@@ -125,9 +129,10 @@ pub(super) struct Place<'a> {
     pub(super) audit: &'a Path,
 }
 
-/// Answer `command` with `ab`, audit it, and print the answer: the exit status.
-pub(super) fn run<B: Backend>(
-    ab: &Ab<B>,
+/// Answer `command` with `activate` (an [`Ab::activate`]), audit it, and print the answer: the
+/// exit status. One code path whatever the backend.
+pub(super) fn run(
+    activate: &dyn Fn(&Target, How) -> Answer,
     command: &Command,
     place: &Place<'_>,
     out: &mut dyn Write,
@@ -142,7 +147,7 @@ pub(super) fn run<B: Backend>(
                 place.audit.display()
             ),
         ),
-        Ok(_) => ab.activate(&command.target, command.how),
+        Ok(_) => activate(&command.target, command.how),
     };
     let (outcome, reason) = answer.audit_fields();
     let entry = audit::Entry {
@@ -200,7 +205,10 @@ fn result_of(answer: &Answer) -> Option<String> {
     else {
         return None;
     };
-    let mut line = format!("{commit} from {}", from.as_deref().unwrap_or("none"));
+    let mut line = format!(
+        "{commit} from {}",
+        from.as_ref().map_or("none", CommitId::as_str)
+    );
     if *pinned {
         line.push_str("; pinned");
     }
@@ -236,7 +244,7 @@ pub(super) fn on_linux<B: Backend>(
         audit: &env.audit,
     };
     run(
-        &ab,
+        &|target, how| ab.activate(target, how),
         command,
         &place,
         &mut std::io::stdout(),
@@ -274,7 +282,7 @@ pub(super) fn on_mac(
         audit: &audit,
     };
     run(
-        &ab,
+        &|target, how| ab.activate(target, how),
         command,
         &place,
         &mut std::io::stdout(),
