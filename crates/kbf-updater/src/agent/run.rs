@@ -228,6 +228,12 @@ impl Agent {
         self
     }
 
+    /// The hold file the agent honours, if it has one.
+    #[cfg(test)]
+    pub(super) fn pin_file(&self) -> Option<&PinFile> {
+        self.pin.as_ref()
+    }
+
     /// The pin the hold file holds now, if the host is pinned; a change from the last look is
     /// logged.
     fn pinned(&self) -> Option<PinReport> {
@@ -338,10 +344,18 @@ impl Agent {
     pub fn run(&self, stop: &Stop) {
         self.refresh();
         // The updater was restarted in the middle of an A/B: the helper has a release on trial.
-        // The first heartbeat says so, and the trial is finished before any other order.
+        // The first heartbeat says so, and the trial is finished before any other order. A
+        // pinned host's `kbf` trial is left to the helper, whose deadline puts it back: the
+        // agent does not run it, so it is not reported as updating.
         let mut resumed = Vec::new();
         for (i, slot) in self.slots.iter().enumerate() {
             if let Some(target) = self.trial_in_progress(slot) {
+                if slot.service.is_none() && self.pinned().is_some() {
+                    self.log(&format!(
+                        "update to {target}: not resumed, the host is pinned"
+                    ));
+                    continue;
+                }
                 slot.status.update(|s| s.updating = Some(target.clone()));
                 resumed.push((i, target));
             }
@@ -353,14 +367,7 @@ impl Agent {
                 scope.spawn(|| self.renewals(renewer.as_ref(), stop));
             }
             for (i, target) in &resumed {
-                let slot = &self.slots[*i];
-                if slot.service.is_none() && self.pinned().is_some() {
-                    self.log(&format!(
-                        "update to {target}: not resumed, the host is pinned"
-                    ));
-                    continue;
-                }
-                self.update(slot, target);
+                self.update(&self.slots[*i], target);
             }
             self.updates(stop, &inbox);
         });

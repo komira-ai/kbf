@@ -31,8 +31,9 @@
 //!   install lock, taken without waiting: the commit root's hold file names is taken out of
 //!   `retain.json`'s `pinned` first, then the hold file is removed, so a run cut short between
 //!   the two leaves the hold file and is finished by asking again. A host with no hold file is
-//!   not pinned, and the unpin says so and changes nothing. A hold file that is not root's, or
-//!   names no commit, is removed and unpins nothing in `retain.json`.
+//!   not pinned, and the unpin says so and changes nothing. A hold file that is not root's
+//!   regular file, that its group or others may write, that is over 4096 bytes, or that names
+//!   no commit is removed and unpins nothing in `retain.json`.
 //!
 //! The work is one code path over `&dyn Backend` ([`Activation`]), whatever the backend.
 
@@ -111,6 +112,17 @@ impl<B: Backend> Ab<B> {
 
     /// Undo the pin of an `activate --pin` (see the module docs).
     pub fn unpin(&self) -> Answer {
+        self.unpin_with(&|| {})
+    }
+
+    /// [`Self::unpin`] that runs `after_retain` once `retain.json` is changed and before the
+    /// hold file is removed: a test's way in to the moment between the two.
+    #[cfg(test)]
+    pub(crate) fn unpin_interrupted(&self, after_retain: &dyn Fn()) -> Answer {
+        self.unpin_with(after_retain)
+    }
+
+    fn unpin_with(&self, after_retain: &dyn Fn()) -> Answer {
         Activation {
             backend: &self.backend,
             state_file: &self.state_file,
@@ -120,7 +132,7 @@ impl<B: Backend> Ab<B> {
             hold_file: self.hold_file.as_deref(),
             versions_kept: self.versions_kept(),
         }
-        .unpin()
+        .unpin(after_retain)
     }
 }
 
@@ -410,7 +422,7 @@ impl Activation<'_> {
 
 impl Activation<'_> {
     /// Undo the pin, holding the install lock (see the module docs).
-    fn unpin(&self) -> Answer {
+    fn unpin(&self, after_retain: &dyn Fn()) -> Answer {
         let Some(hold) = self.hold_file else {
             return Answer::Refused(Code::ConfigInvalid, "this host has no hold file".to_owned());
         };
@@ -418,12 +430,17 @@ impl Activation<'_> {
             Ok((lock, _)) => lock,
             Err(answer) => return *answer,
         };
-        let done = self.unpin_held(hold);
+        let done = self.unpin_held(hold, after_retain);
         drop(lock);
         done.unwrap_or_else(Fault::answer)
     }
 
-    fn unpin_held(&self, hold: &Path) -> Result<Answer, Fault> {
+    /// The commit is taken out of `retain.json` before the hold file goes, so a run cut short
+    /// between the two leaves the hold file, and the next run finds it and finishes (taking out
+    /// a commit already gone changes nothing). The commit comes from root's file alone; what is
+    /// at the name when it is removed is removed whatever it is, which the directory's owner
+    /// could have done itself.
+    fn unpin_held(&self, hold: &Path, after_retain: &dyn Fn()) -> Result<Answer, Fault> {
         let commit = match read_hold(hold, self.trust) {
             Read::Absent => return Ok(Answer::Unpinned { commit: None }),
             Read::Commit(commit) => Some(commit),
@@ -441,6 +458,7 @@ impl Activation<'_> {
                 other => Fault::failed(Code::StateUnavailable, format!("the pin: {other}")),
             })?;
         }
+        after_retain();
         remove_hold(hold).map_err(|e| {
             Fault::failed(Code::StateUnavailable, format!("{}: {e}", hold.display()))
         })?;
@@ -452,7 +470,7 @@ impl Activation<'_> {
 enum Read {
     /// There is none.
     Absent,
-    /// Root's, naming this commit.
+    /// Root's, not writable by others, naming this commit.
     Commit(CommitId),
     /// Something is at the name, but it is not root's or names no commit, for this reason.
     NoCommit(String),
@@ -464,7 +482,11 @@ struct HoldRead {
     commit: String,
 }
 
-/// Read the hold file `path`, never through a link, trusting only a regular file `trust` owns.
+/// The most bytes of a hold file: one longer names no commit.
+const HOLD_MAX: u64 = 4096;
+
+/// Read the hold file `path`, never through a link, trusting only a regular file `trust` owns
+/// that its group and others may not write ([`Trust::check_meta`]).
 fn read_hold(path: &Path, trust: &Trust) -> Read {
     let opened = OpenOptions::new()
         .read(true)
@@ -478,17 +500,17 @@ fn read_hold(path: &Path, trust: &Trust) -> Read {
     let text = file
         .metadata()
         .and_then(|meta| {
-            if meta.is_file() && trust.owns(&meta) {
-                let mut text = String::new();
-                io::Read::read_to_string(&mut io::Read::take(file, 4096), &mut text)?;
-                Ok(text)
-            } else {
-                Err(io::Error::other("not a regular file root owns"))
+            trust.check_meta(&meta).map_err(io::Error::other)?;
+            let mut text = Vec::new();
+            io::Read::read_to_end(&mut io::Read::take(file, HOLD_MAX + 1), &mut text)?;
+            if text.len() as u64 > HOLD_MAX {
+                return Err(io::Error::other(format!("over {HOLD_MAX} bytes")));
             }
+            Ok(text)
         })
         .map_err(|e| format!("{}: {e}", path.display()));
     match text.and_then(|text| {
-        serde_json::from_str::<HoldRead>(&text)
+        serde_json::from_slice::<HoldRead>(&text)
             .map_err(|e| e.to_string())
             .and_then(|hold| CommitId::new(&hold.commit).map_err(|e| e.to_string()))
     }) {

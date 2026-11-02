@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::version::Version;
 pub use crate::wire_report::{
     Answer, Class, Commit, CommitState, DeferredReport, MAX_FEATURES, MAX_STEP_NAME, MAX_STEP_SECS,
-    MAX_TOKEN, Phase, PinReport, StepName, StepRun, Token,
+    MAX_TOKEN, NotACommit, Phase, PinReport, StepName, StepRun, Token,
 };
 use crate::wire_report::{features_text, is_false, lenient, or_default, step_secs_text};
 
@@ -600,3 +600,8 @@ mod platform_text {
             .ok_or_else(|| serde::de::Error::custom("not a platform kbf releases are built for"))
     }
 }
+
+// Under `wire`, so that the released heartbeat it freezes reads with the same private readers.
+#[cfg(test)]
+#[path = "wire_pin_tests.rs"]
+mod pin_tests;

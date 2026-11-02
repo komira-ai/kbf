@@ -83,10 +83,12 @@ hold the file written (an owner that swaps the aside file before the rename make
 error, not a published hold); the directory is synced. That account can always remove or replace
 the file afterwards: the agent that reads it trusts only a file owned by root.
 
-The agent looks at the hold file for every heartbeat and again before every order for `kbf`.
-While root's regular file is there it runs no such order and says `pinned` (with the commit the
-file names) in every heartbeat; a link, another account's file or anything but a regular file is
-no pin; root's file that cannot be read, or names no commit, pins all the same, with no commit.
+The agent looks at the hold file, at the helper's fixed path, for every heartbeat and again
+before every order for `kbf`. While root's regular file is there (one its group and others may
+not write) it runs no such order and says `pinned` (with the commit the file names) in every
+heartbeat; a link, another account's file, a writable one or anything but a regular file is no
+pin; root's file that cannot be read, or names no commit, and a name that cannot be looked at,
+pin all the same, with no commit. An update already running is not cut.
 The services besides `kbf` are not pinned: the hold names a `kbf` release. The coordinator holds
 a pinned host (`pinned`), keeps its slot (so a pin never lets the rollout go on to the next host),
 counts it neither failed nor at another version, and takes no vote for a rollback from it.

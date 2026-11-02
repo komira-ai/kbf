@@ -843,8 +843,10 @@ runs restarts its units and moves no link.
   following a link at its name) and syncs its directory. From its next heartbeat the agent follows
   the coordinator again. The release that runs stays: an unpin moves no link and restarts nothing.
 - A host with no hold file is not pinned: the unpin says so (`commit` null) and changes nothing. A
-  hold file that is not root's regular file, or names no commit, is removed and unpins nothing in
-  `retain.json` (the log says why). Another writer that holds `retain.json` refuses the unpin
+  hold file that is not root's regular file, that its group or others may write, that is over 4096
+  bytes, or that names no commit is removed and unpins nothing in `retain.json` (the log says
+  why). The commit comes from root's file alone: what the agent's account puts at the name while
+  the unpin runs is removed with it and unpins nothing. Another writer that holds `retain.json` refuses the unpin
   (`busy`) before anything changes. If the hold file cannot be removed after `retain.json` was
   changed, the unpin fails (`state_unavailable`); run it again.
 - **The answer** is `{"result":"unpinned","commit":C|null}` on stdout; the exit status is 0, 2

@@ -80,6 +80,8 @@ mod membership_tests;
 #[cfg(test)]
 mod ops_tests;
 #[cfg(test)]
+mod pin_rules_tests;
+#[cfg(test)]
 mod pin_tests;
 #[cfg(test)]
 mod priority_tests;

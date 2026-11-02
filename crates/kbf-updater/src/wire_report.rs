@@ -180,11 +180,19 @@ impl Commit {
     }
 }
 
+/// Text that is not a [`Commit`].
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("not a commit: {text:?} is not 40 lowercase hex digits")]
+pub struct NotACommit {
+    /// The text, as it was given.
+    pub text: String,
+}
+
 impl TryFrom<String> for Commit {
-    type Error = &'static str;
+    type Error = NotACommit;
 
     fn try_from(text: String) -> Result<Self, Self::Error> {
-        Self::parse(&text).ok_or("not a commit: 40 lowercase hex digits")
+        Self::parse(&text).ok_or(NotACommit { text })
     }
 }
 

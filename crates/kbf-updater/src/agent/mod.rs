@@ -59,6 +59,8 @@ mod hold_tests;
 #[cfg(test)]
 mod local_tests;
 #[cfg(test)]
+mod pin_agent_tests;
+#[cfg(test)]
 mod pin_tests;
 #[cfg(test)]
 mod pki;

@@ -128,6 +128,7 @@ pub mod contract {
     /// The local socket's requests and answers (`kbf-host-install --serve`), for the agent
     /// mode of `kbf-updater`, which reads the answers and writes the requests.
     pub mod local {
+        pub use crate::local::activate_cli::{LINUX_HOLD, MAC_HOLD};
         pub use crate::local::answer::{Answer, Code, LastView, PendingView, QueryView};
         pub use crate::local::core::{LISTED_BYTES, MAX_LISTED};
         pub use crate::local::frontend::config::FrontendConfig;

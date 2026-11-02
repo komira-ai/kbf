@@ -6,19 +6,23 @@
 //! ([`crate::wire::PinReport`]). The services besides `kbf` are not pinned: the hold names a
 //! `kbf` release. The file is looked at for every heartbeat and again before every order, so a
 //! pin written between the two still holds the order, and an unpin is followed from the next
-//! heartbeat on.
+//! heartbeat on. An update already running when the pin is written runs to its end: the pin
+//! holds the orders that have not started, and never cuts one that has.
 //!
-//! The hold file is `pin.json` in the agent's directory of marks (`--cordon-dir`, by default
-//! `--state-dir`): the packaged units' `/var/lib/kbf-updater` and `/var/db/kbf-updater`, where
-//! the helper writes it. That directory is the agent's account's, so only a file **owned by
-//! root** is a pin:
+//! The hold file is the helper's, at a fixed path whatever the agent's flags say:
+//! [`LINUX_PIN`] on Linux, [`MAC_PIN`] on a Mac (the packaged agent's state directory, which
+//! is the agent's account's). Since that account owns the directory, only a regular file
+//! **owned by root and not writable by its group or by others** is a pin:
 //!
 //! - no file: not pinned;
-//! - a link, anything but a regular file, or a file another account owns: not a pin (the
-//!   agent's own account could have put it there), and the agent says why;
+//! - a link, anything but a regular file, a file another account owns, or one others may
+//!   write: not a pin (the agent's own account could have put it there or written it), and the
+//!   agent says why;
 //! - root's regular file: pinned, with the commit it names (`{"commit": "<40 hex>", ...}`, other
 //!   keys ignored). One that cannot be read, is too long, or names no commit pins the host all
-//!   the same, with no commit: root put it there to hold the host.
+//!   the same, with no commit: root put it there to hold the host;
+//! - a name that cannot be looked at (the directory cannot be searched, an I/O error): pinned,
+//!   with no commit. That the file is not there, or not root's, is never assumed.
 //!
 //! A forced order of the coordinator that names the pinned commit is to clear the pin; that
 //! order does not exist yet, so until it does every order is held while the file is there.
@@ -26,14 +30,17 @@
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read as _};
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::Deserialize;
 
 use crate::wire::{Commit, PinReport};
 
-/// The name of the hold file in the agent's directory.
-pub const PIN_FILE: &str = "pin.json";
+/// The hold file on Linux: the helper writes it there (`kbf-host-install`'s `LINUX_HOLD`).
+pub const LINUX_PIN: &str = "/var/lib/kbf-updater/pin.json";
+
+/// The hold file on a Mac: the helper writes it there (`kbf-host-install`'s `MAC_HOLD`).
+pub const MAC_PIN: &str = "/var/db/kbf-updater/pin.json";
 
 /// The account a hold file must be owned by in production: root.
 pub const ROOT: u32 = 0;
@@ -86,7 +93,7 @@ impl Look {
 }
 
 /// The hold file, and the account a pin must be owned by.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PinFile {
     path: PathBuf,
     owner: u32,
@@ -108,10 +115,12 @@ impl PinFile {
         }
     }
 
-    /// The hold file of the agent whose directory of marks is `dir`, owned by root.
+    /// The helper's hold file on the operating system `os` (as Rust names it: `macos` is a Mac,
+    /// anything else is taken for Linux), owned by root.
     #[must_use]
-    pub fn in_dir(dir: &Path) -> Self {
-        Self::new(dir.join(PIN_FILE), ROOT)
+    pub fn of_platform(os: &str) -> Self {
+        let path = if os == "macos" { MAC_PIN } else { LINUX_PIN };
+        Self::new(path, ROOT)
     }
 
     /// What the hold file says now.
@@ -131,14 +140,16 @@ impl PinFile {
         let file = match opened {
             Ok(file) => file,
             Err(e) if e.kind() == ErrorKind::NotFound => return Look::Absent,
-            // Not opened: a link, a socket, or a file this account may not read. Root's
-            // regular file is a pin whose commit cannot be known.
+            // Not opened: a link, a socket, a file this account may not read, or a name that
+            // cannot be looked at. Root's regular file is a pin whose commit cannot be known,
+            // and so is a name whose file cannot be told: it may be root's.
             Err(e) => {
                 return match std::fs::symlink_metadata(&self.path) {
                     Ok(meta) => self
                         .untrusted(&meta)
                         .map_or_else(|| unknown(at(&e)), Look::NotAPin),
-                    Err(gone) => Look::NotAPin(at(&gone)),
+                    Err(gone) if gone.kind() == ErrorKind::NotFound => Look::Absent,
+                    Err(_) => unknown(at(&e)),
                 };
             }
         };
@@ -174,6 +185,8 @@ impl PinFile {
                 meta.uid(),
                 self.owner
             ));
+        } else if meta.mode() & 0o022 != 0 {
+            "writable by its group or by others"
         } else {
             return None;
         };

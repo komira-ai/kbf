@@ -367,7 +367,7 @@ pub fn build(cfg: &Config) -> Result<Agent, String> {
     )
     .with_services(services)
     .with_host_updates(cordon_dir(cfg))
-    .with_pin(PinFile::in_dir(&cordon_dir(cfg))))
+    .with_pin(PinFile::of_platform(std::env::consts::OS)))
 }
 
 /// The ports of `service`: its own helper socket, the node's drain

@@ -211,7 +211,9 @@ fn unpin_is_refused_behind_a_lock_and_without_a_hold_file() {
         Answer::Refused(Code::ConfigInvalid, "this host has no hold file".to_owned())
     );
 
-    // Root's hold file is unpinned in `retain.json`, then cannot be removed: a failure.
+    // A directory at the name names no commit and cannot be removed: nothing is unpinned in
+    // `retain.json`, and the unpin fails. (A cut after the retain change is
+    // `an_unpin_cut_short_leaves_the_hold_and_is_finished_by_running_it_again`.)
     fs::remove_file(&hold).unwrap();
     fs::create_dir(&hold).unwrap();
     fs::write(hold.join("x"), "in the way").unwrap();
@@ -299,4 +301,173 @@ fn the_unpin_command_audits_what_it_did_on_a_linux_host() {
         unpin_cli::on_linux(|| Borrowed(&rig.backend), &blocked, &trust, hold),
         3
     );
+}
+
+const C: &str = "cccccccccccccccccccccccccccccccccccccccc";
+
+/// A valid unpin takes out the named commit and nothing else: another pin, `last_good` and the
+/// recorded versions stay. A commit already gone from `pinned`, and a host with no
+/// `retain.json`, unpin all the same, and change nothing more.
+///
+/// Catches: an unpin that rewrites `retain.json` from scratch and loses another pin or the
+/// last good release; one that fails when the retain pin is already gone.
+#[test]
+fn a_valid_unpin_takes_out_the_named_commit_and_nothing_else() {
+    let rig = Rig::new("unpin-only");
+    keep(&rig, B, Some(VB), 2);
+    let (ab, _) = core(&rig);
+    assert!(matches!(
+        ab.activate(&target(B), PIN),
+        Answer::Activated { .. }
+    ));
+    let file = retain::path(&rig.layout);
+    Retained::update(&file, |r| {
+        r.pinned.insert(id(C));
+        r.last_good = Some(id(A));
+    })
+    .unwrap();
+    let before = Retained::read(&file).unwrap();
+    assert_eq!(ab.unpin(), unpinned(Some(B)));
+    let mut expected = before.clone();
+    expected.pinned.remove(&id(B));
+    assert_eq!(Retained::read(&file).unwrap(), expected);
+    assert_eq!(pinned(&rig), [C]);
+
+    // The retain pin already gone (a run cut short after it): the hold file still goes.
+    let hold = agent_dir(&rig).join("pin.json");
+    super::super::super::core::activate::write_hold_for_test(
+        &hold,
+        &format!("{{\"commit\":\"{B}\"}}"),
+        &|_| {},
+    )
+    .unwrap();
+    assert_eq!(ab.unpin(), unpinned(Some(B)));
+    assert!(!hold.exists());
+    assert_eq!(Retained::read(&file).unwrap(), expected);
+
+    // No retain.json at all.
+    fs::remove_file(&file).unwrap();
+    super::super::super::core::activate::write_hold_for_test(
+        &hold,
+        &format!("{{\"commit\":\"{B}\"}}"),
+        &|_| {},
+    )
+    .unwrap();
+    assert_eq!(ab.unpin(), unpinned(Some(B)));
+    assert!(!hold.exists());
+}
+
+/// The commit is read from the first 4096 bytes only when the file ends there: a good commit
+/// padded to the limit is unpinned, the same followed by one byte more names no commit and
+/// unpins nothing. Root's file its group or others may write names no commit either.
+///
+/// Catches: a hold file cut at the limit and read as whole; a commit taken from a file the
+/// agent's account could have written into.
+#[test]
+fn the_hold_file_is_read_whole_and_only_when_no_one_else_may_write_it() {
+    let rig = Rig::new("unpin-bounds");
+    keep(&rig, B, Some(VB), 2);
+    let (ab, notes) = core(&rig);
+    let file = retain::path(&rig.layout);
+    Retained::update(&file, |r| {
+        r.pinned.insert(id(B));
+    })
+    .unwrap();
+    let hold = agent_dir(&rig).join("pin.json");
+    let padded = format!("{{\"commit\":\"{B}\"}}{}", " ".repeat(4096));
+    let put = |text: &str, mode: u32| {
+        fs::write(&hold, text).unwrap();
+        fs::set_permissions(&hold, fs::Permissions::from_mode(mode)).unwrap();
+    };
+    put(&format!("{}x", &padded[..4096]), 0o644);
+    assert_eq!(ab.unpin(), unpinned(None));
+    assert_eq!(pinned(&rig), [B]);
+    for mode in [0o664, 0o646] {
+        put(&padded[..4096], mode);
+        assert_eq!(ab.unpin(), unpinned(None), "{mode:o}");
+        assert_eq!(pinned(&rig), [B]);
+    }
+    put(&padded[..4096], 0o644);
+    assert_eq!(ab.unpin(), unpinned(Some(B)));
+    assert!(pinned(&rig).is_empty());
+    let notes = notes.borrow();
+    assert_eq!(
+        notes.as_slice(),
+        [
+            format!(
+                "unpin: {}: over 4096 bytes: nothing is unpinned in retain.json",
+                hold.display()
+            ),
+            format!(
+                "unpin: {}: writable by its group or by others: nothing is unpinned in \
+                 retain.json",
+                hold.display()
+            ),
+            format!(
+                "unpin: {}: writable by its group or by others: nothing is unpinned in \
+                 retain.json",
+                hold.display()
+            ),
+        ]
+    );
+}
+
+/// An unpin cut short after `retain.json` changed and before the hold file went (here the hold
+/// file cannot be removed) fails and leaves the hold file, so the agent stays pinned; run again
+/// once the name can be removed, it finishes. A file the agent's account puts at the name in
+/// that moment is removed with it, and the commit unpinned is still the one root's file named.
+///
+/// Catches: an unpin that removes the hold file first (a cut leaves the release unprotected
+/// and unpinned in retain but the agent free); one whose retain change follows what is at the
+/// name when it removes it.
+#[test]
+fn an_unpin_cut_short_leaves_the_hold_and_is_finished_by_running_it_again() {
+    let rig = Rig::new("unpin-cut");
+    keep(&rig, B, Some(VB), 2);
+    let (ab, _) = core(&rig);
+    assert!(matches!(
+        ab.activate(&target(B), PIN),
+        Answer::Activated { .. }
+    ));
+    let hold = agent_dir(&rig).join("pin.json");
+    let in_the_way = || {
+        fs::remove_file(&hold).unwrap();
+        fs::create_dir(&hold).unwrap();
+        fs::write(hold.join("x"), "in the way").unwrap();
+    };
+    let answer = ab.unpin_interrupted(&in_the_way);
+    assert!(
+        matches!(&answer, Answer::Failed(Code::StateUnavailable, d)
+            if d.starts_with(&hold.display().to_string())),
+        "{answer:?}"
+    );
+    assert!(pinned(&rig).is_empty(), "retain.json changed first");
+    assert!(hold.exists(), "the hold stays: the agent is still pinned");
+
+    fs::remove_dir_all(&hold).unwrap();
+    super::super::super::core::activate::write_hold_for_test(
+        &hold,
+        &format!("{{\"commit\":\"{B}\"}}"),
+        &|_| {},
+    )
+    .unwrap();
+    assert_eq!(ab.unpin(), unpinned(Some(B)), "run again, it finishes");
+    assert!(!hold.exists());
+
+    // Root's pin of B; in the moment, the agent's account swaps in a file naming C.
+    assert!(matches!(
+        ab.activate(&target(B), PIN),
+        Answer::Activated { .. }
+    ));
+    Retained::update(&retain::path(&rig.layout), |r| {
+        r.pinned.insert(id(C));
+    })
+    .unwrap();
+    let swap = || {
+        fs::remove_file(&hold).unwrap();
+        fs::write(&hold, format!("{{\"commit\":\"{C}\"}}")).unwrap();
+    };
+    assert_eq!(ab.unpin_interrupted(&swap), unpinned(Some(B)));
+    assert!(!hold.exists());
+    assert_eq!(pinned(&rig), [C]);
 }

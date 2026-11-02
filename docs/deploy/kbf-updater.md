@@ -314,17 +314,21 @@ adds `"pinned": {"commit": "<40 hex>"}` ([The pin](#the-pin)).
 
 Root pins a host to a release it keeps with `kbf-host-install activate --pin`, and unpins it with
 `kbf-host-install unpin` ([host-install.md, "The emergency command"](host-install.md#the-emergency-command-activate)).
-The pin is the hold file `pin.json` in the agent's directory of marks (`--cordon-dir`, by default
-`--state-dir`): the packaged units' `/var/lib/kbf-updater` and `/var/db/kbf-updater`, where the
-helper writes it. An agent given another directory reads no pin there.
+The pin is the helper's hold file, at a fixed path whatever the agent's flags say:
+`/var/lib/kbf-updater/pin.json` on Linux, `/var/db/kbf-updater/pin.json` on a Mac (the packaged
+agent's state directory).
 
-- While the file is there the agent runs **no order for `kbf`**, whatever the coordinator desires,
-  and does not resume a trial it finds at start. It looks at the file for every heartbeat and
-  again before every order, and logs once each time what it finds changes. The services besides
-  `kbf` (`--service`) are not pinned.
-- Only **root's regular file** is a pin, since the directory is the agent's account's: a link,
-  another account's file or anything else is not (the log says why). Root's file that cannot be
-  read, or names no 40-digit commit, pins the host all the same, with no commit.
+- While the file is there the agent runs **no order for `kbf`**, whatever the coordinator desires.
+  A trial it finds at start is left to the helper (whose deadline puts it back) and not reported
+  as updating. It looks at the file for every heartbeat and again before every order, and logs
+  once each time what it finds changes. An update already running when the pin is written runs to
+  its end; the pin holds the orders after it. The services besides `kbf` (`--service`) are not
+  pinned.
+- Only **root's regular file that its group and others may not write** is a pin, since the
+  directory is the agent's account's: a link, another account's file, a writable one or anything
+  else is not (the log says why). Root's file that cannot be read, is over 4096 bytes, or names no
+  40-digit commit pins the host all the same, with no commit, and so does a name that cannot be
+  looked at (an I/O error): the agent never assumes the file is not there.
 - Every heartbeat of a pinned host says `"pinned": {"commit": C}` (`{}` when the commit is not
   known); the field is never dropped when a heartbeat is trimmed to fit. A coordinator from before
   the pin ignores the field (and orders the host, which does not run the order); this one reads a
@@ -337,7 +341,10 @@ helper writes it. An agent given another directory reads no pin there.
   the desired version), `failed` does not, so it does not make the farm `blocked`, and a host
   pinned to another version keeps it from `converged`. Its failure is no vote for an automatic
   rollback, and it is never chosen as a canary.
-- An unpinned host's next heartbeat carries no `pinned`, and the rules apply to it again.
+- An unpinned host's next heartbeat carries no `pinned`, and the rules apply to it again. The
+  unpin lifts the pin and nothing else: a target that failed a moment ago is left alone until
+  `--retry-secs` is up, a deferral declines until its retry time, and a halt holds until the
+  coordinator clears it, as they do without a pin.
 
 ### One A/B
 
