@@ -215,3 +215,48 @@ fn a_pinned_host_at_the_desired_version_defers_the_last_good_record() {
     );
     assert_eq!(plan_for(&automatic, &good(), &at_desired(true)), vec![]);
 }
+
+/// A pinned host's `kbf` halt report raises no halt: root holds the host on a release, and its
+/// report stops no other host. The same report from the host unpinned halts `kbf`.
+///
+/// Catches: a pin that stops the whole service through the halt it was meant to avoid.
+#[tokio::test]
+async fn a_pinned_hosts_halt_report_raises_no_halt() {
+    let halt_of = |rig: &crate::testutil::Rig| {
+        rig.coordinator
+            .status(Some(crate::testutil::OPERATOR))
+            .expect("status")
+            .ops
+            .services
+            .get(KBF)
+            .and_then(|m| m.halt.as_ref())
+            .map(|h| h.node_id.clone())
+    };
+    let report = || {
+        let mut b = beat("1.0");
+        b.last_update = Some(kbf_updater::wire::UpdateResult {
+            target: version("2.0"),
+            outcome: Outcome::Failed,
+            phase: Some(kbf_updater::wire::Phase::Halt),
+            class: None,
+            reason: kbf_updater::wire::Token::parse("disk_tainted"),
+        });
+        b
+    };
+    let who = crate::identity::Identity {
+        node_id: id("d1"),
+        role: HostRole::DAEMON,
+    };
+    for (name, pin, halted) in [
+        ("pin-halt-pinned", true, None),
+        ("pin-halt-unpinned", false, Some("d1".to_owned())),
+    ] {
+        let rig = crate::testutil::Rig::new(name);
+        rig.set(r#"{"version":"2.0","min_up":{"storage":0,"frontend":0}}"#)
+            .await;
+        rig.at(2_000);
+        let b = if pin { pinned(report()) } else { report() };
+        rig.coordinator.heartbeat(who.clone(), b);
+        assert_eq!(halt_of(&rig), halted, "{name}");
+    }
+}

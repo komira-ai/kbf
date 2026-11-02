@@ -340,7 +340,8 @@ agent's state directory).
   failed nor at another version**: the role's `pinned` count has it (and `at_desired` when it runs
   the desired version), `failed` does not, so it does not make the farm `blocked`, and a host
   pinned to another version keeps it from `converged`. Its failure is no vote for an automatic
-  rollback, and it is never chosen as a canary.
+  rollback, its `kbf` halt report raises no halt (the services it lists are not pinned, and theirs
+  do), and it is never chosen as a canary.
 - An unpinned host's next heartbeat carries no `pinned`, and the rules apply to it again. The
   unpin lifts the pin and nothing else: a target that failed a moment ago is left alone until
   `--retry-secs` is up, a deferral declines until its retry time, and a halt holds until the
