@@ -67,4 +67,6 @@ mod service_tests;
 #[cfg(test)]
 pub(crate) mod testing;
 #[cfg(test)]
+mod update_report_tests;
+#[cfg(test)]
 mod update_tests;

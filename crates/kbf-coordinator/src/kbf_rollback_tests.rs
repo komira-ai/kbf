@@ -212,3 +212,36 @@ async fn before_commit_and_environment_failures_never_count() {
     assert_eq!(wanted(&rig), version("1.0"));
     assert_eq!(marks(&rig).bad, vec![version("2.0")]);
 }
+
+/// A heartbeat of a host at 1.0 whose last update is `last`, the JSON an agent sends.
+fn reporting(last: &str) -> Heartbeat {
+    let text = format!(
+        r#"{{"platform":"linux-x86_64","version":"1.0","health":"healthy","last_update":{last}}}"#
+    );
+    serde_json::from_str(&text).expect("a heartbeat")
+}
+
+/// Catches: kbf rolled back on a report it cannot place. Every host sends the last update that
+/// kbf's own A/B update sends after failing past the switch (`kbf-updater`,
+/// `update_report_tests::a_failure_after_the_switch_is_reported_without_a_phase` pins these
+/// bytes): no phase, so not counted, round after round, and 2.0 stays desired and `blocked`.
+/// The same report with `"phase":"after_commit"` from two hosts rolls 2.0 back: the phase is
+/// all the agent's report lacks.
+#[tokio::test]
+async fn the_agents_own_failure_report_is_held_not_rolled_back() {
+    let rig = rolling_out_two("kbf-rb-agent").await;
+    let agent = reporting(r#"{"target":"2.0","outcome":"failed"}"#);
+    for at in [2_015, 2_030, 2_045] {
+        round(&rig, at, &all(&agent));
+        assert_eq!(wanted(&rig), version("2.0"), "at {at}");
+        assert!(marks(&rig).bad.is_empty(), "at {at}");
+    }
+    assert_eq!(
+        status(&rig).per_service[KBF].convergence.state,
+        State::Blocked
+    );
+    let phased = reporting(r#"{"target":"2.0","outcome":"failed","phase":"after_commit"}"#);
+    round(&rig, 2_060, &[("d1", phased.clone()), ("d2", phased)]);
+    assert_eq!(wanted(&rig), version("1.0"));
+    assert_eq!(marks(&rig).bad, vec![version("2.0")]);
+}
