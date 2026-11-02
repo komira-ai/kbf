@@ -1,0 +1,16 @@
+# The upstream binaries `kbf-deploy mdm fetch` downloads and `mdm install` installs:
+# tool, version, URL, sha256 of the download. Compiled into kbf-deploy; both verbs
+# refuse an archive whose sha256 differs. Each pin equals the sha256 GitHub records for
+# the release asset (`gh api repos/OWNER/REPO/releases/tags/TAG --jq '.assets[] |
+# .name, .digest'`), except scepserver, whose release predates asset digests: its pin
+# is the hash of a first download, so it proves "the same bytes as then", not
+# provenance. None of NanoHUB, NanoDEP, the SCEP server or MicroMDM publishes a
+# signature; lego and Caddy publish checksum files (the pins agree with them).
+# To move a pin: change version, URL and hash together, in one commit, with the
+# release notes read; the parser refuses a URL without /v<version>/.
+nanohub    0.2.0   https://github.com/micromdm/nanohub/releases/download/v0.2.0/nanohub-linux-amd64-v0.2.0.zip     286f2d7ed5fe6297ef48010ac6d7d921b90fe16e62367caaf18154ad649329cf
+nanodep    0.7.0   https://github.com/micromdm/nanodep/releases/download/v0.7.0/nanodep-linux-amd64-v0.7.0.zip     c62bcee59464222de24f149f3f782690e8efcc7ccea3101c8397f8eca506f4f3
+scepserver 2.3.0   https://github.com/micromdm/scep/releases/download/v2.3.0/scepserver-linux-amd64-v2.3.0.zip     cb429621a5dee8acaa19012b42e8126699a13469fe47e8a264793d6c4ba0f845
+caddy      2.11.7  https://github.com/caddyserver/caddy/releases/download/v2.11.7/caddy_2.11.7_linux_amd64.tar.gz  727b91701a392de6ebc5027509f548bf39979e5216340d0faed8fa5e69c84f8b
+lego       5.5.2   https://github.com/go-acme/lego/releases/download/v5.5.2/lego_v5.5.2_linux_amd64.tar.gz       2a35505089e7772c92e1e9ac144df91151ef2eca8568630db0ff91fca06d9bef
+mdmctl     1.13.1  https://github.com/micromdm/micromdm/releases/download/v1.13.1/micromdm_v1.13.1.zip             201b5c09faf55686feac4373fa5f69bd262689a9c74a3cca19d5291913650c37

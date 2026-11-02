@@ -1,0 +1,32 @@
+[package]
+name = "mdm-host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# `mdm-host`: applies mdm-core's rendered output to a Linux host (fetch, install, tls,
+# verify). The pure rendering is mdm-core; the steps that touch the host are host-step.
+[[bin]]
+name = "mdm-host"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+flate2.workspace = true
+getrandom = { workspace = true, features = ["std"] }
+hex.workspace = true
+host-step.workspace = true
+mdm-core.workspace = true
+rustls.workspace = true
+sha2.workspace = true
+tar.workspace = true
+thiserror.workspace = true
+# The bundled public web roots (webpki-roots), as the tool trusted before it moved here:
+# downloads trust a fixed root set, never one the host or its environment can change.
+ureq = { workspace = true, features = ["rustls-webpki-roots"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,40 @@
+# @PREFIX@-scep.service: the SCEP server that issues each Mac its MDM identity
+# certificate at enrollment, rendered by `js-mdm install`.
+#
+# Loopback only, and its sockets may talk to loopback only (IPAddressDeny).
+# The challenge comes from EnvironmentFile as SCEP_CHALLENGE_PASSWORD, never
+# argv. The CA key lives in the depot under the 0700 state directory, without
+# a passphrase (a passphrase would have to be on argv or in the same place).
+[Unit]
+Description=@PREFIX@ SCEP server (loopback only)
+After=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+Group=@USER@
+Slice=@SLICE@
+EnvironmentFile=@ETC@/scep.env
+ExecStart=@BIN@/scepserver -http-addr 127.0.0.1:@SCEP_PORT@ -depot @STATE@/scep/depot -crtvalid 365 -allowrenew 14
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ReadWritePaths=@STATE@/scep
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+IPAddressDeny=any
+IPAddressAllow=localhost
+
+[Install]
+WantedBy=multi-user.target
