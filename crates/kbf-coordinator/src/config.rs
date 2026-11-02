@@ -79,6 +79,13 @@ pub struct Cli {
     /// the allow-list entry that admits it (`--oidc-config`).
     #[arg(long)]
     pub services_file: Option<PathBuf>,
+    /// A coordinator release kept to go back to (its image is still loaded and its tag may be
+    /// put back in the unit), such as `0.0.57`; repeat the flag for each. A services file that
+    /// names a slot pool is refused while any of them is a release before
+    /// [`crate::rollback::FIRST_POOL_VERSION`] or is not a release version, since that release
+    /// would refuse the file and not start. Without the flag the file is accepted.
+    #[arg(long = "rollback-target", value_name = "VERSION")]
+    pub rollback_targets: Vec<String>,
     /// How often the TLS files are looked at again, in seconds.
     #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..))]
     pub tls_reload_secs: u64,
@@ -124,6 +131,8 @@ pub fn build(cli: &Cli) -> Result<Parts, Error> {
         Some(path) => Services::from_file(path).map_err(|why| format!("--services-file: {why}"))?,
         None => Services::default(),
     };
+    crate::rollback::check(&services, &cli.rollback_targets)
+        .map_err(|why| format!("--services-file: {why}"))?;
     for note in services.notes() {
         tracing::warn!(%note, "--services-file");
     }

@@ -40,6 +40,7 @@ pub mod listen;
 pub mod membership;
 pub mod ops;
 pub mod reconcile;
+pub mod rollback;
 pub mod service;
 pub mod services;
 
@@ -83,6 +84,8 @@ mod ops_tests;
 mod pool_load_tests;
 #[cfg(test)]
 mod pool_race_tests;
+#[cfg(test)]
+mod pool_rollback_tests;
 #[cfg(test)]
 mod pool_tests;
 #[cfg(test)]

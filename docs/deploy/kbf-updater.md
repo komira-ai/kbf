@@ -740,6 +740,16 @@ release is the oldest one any coordinator runs or may be rolled back to, a pool 
 (the tierstore entry's `pool = "storage"`): every release that may then read the file reads it. Do
 not add a pool to the file before that.
 
+The coordinator checks the second step for the releases it is told about. Pass
+`--rollback-target=<version>` once for each coordinator release whose image is kept to go back to
+(`--rollback-target=0.0.57`). A services file that names a pool then stops the start while any of
+them is a release before 0.0.59 (the first that reads pools) or is not a release version (a bare
+commit id, a tag word): `--services-file: services: tierstore: pool "storage" on storage: the
+rollback target 0.0.57 (--rollback-target) is a release before 0.0.59 and refuses the field
+`pool`; ...`. Remove the pool, or drop the target once its image is no longer kept. A file with no
+pool, and kbf's built-in storage pool, are never refused. Without the flag nothing is checked: the
+list is what the operator declares, not what the host holds.
+
 A service entry may also set two rollout fields, both off by default (a coordinator before the change refuses a file that names them, so set them only after every coordinator runs the new build):
 
 - `bake_beats = N` (default 0, at most 100; a larger number is refused with `bake_beats is over 100`). A host at the desired version keeps the update slot it used until it has sent `N` healthy beats in a row at that version, not updating and not waiting for a promotion. An unhealthy or updating beat, a pending promotion, a different version, or a silence of 45 s or more between two beats starts the count again. The count is kept in the coordinator's memory only: a restart forgets it, and a host at the desired version bakes again. A host that is silent for 45 s or more stops holding the slot for baking. `GET /v1/convergence` is `in_progress`, not `converged`, while a live host is still baking.

@@ -290,11 +290,14 @@ fn an_ops_file_this_build_cannot_read_stops_the_start() {
 /// Runs the binary with `services` as its services file until its start line, stops it, and
 /// returns what it wrote to stderr.
 fn stderr_of_a_start_with(name: &str, services: &str) -> String {
+    stderr_of_a_start_with_flags(name, services, &[])
+}
+
+/// [`stderr_of_a_start_with`], with `extra` after the other flags.
+fn stderr_of_a_start_with_flags(name: &str, services: &str, extra: &[&str]) -> String {
     let files = Files::new(name);
-    let path = files.path("services.toml");
-    std::fs::write(&path, services).expect("written");
-    let mut flags = files.flags();
-    flags.extend(["--services-file".to_owned(), path]);
+    let mut flags = services_flags(&files, services);
+    flags.extend(extra.iter().map(|f| (*f).to_owned()));
     let mut child = spawn(&flags);
     let mut stdout = BufReader::new(child.stdout.take().expect("stdout"));
     let mut line = String::new();
@@ -305,6 +308,54 @@ fn stderr_of_a_start_with(name: &str, services: &str) -> String {
     kill_process(pid, Signal::KILL).expect("stopped");
     let out = child.wait_with_output().expect("exited");
     String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+/// The flags of `files`, with `services` written as its services file.
+fn services_flags(files: &Files, services: &str) -> Vec<String> {
+    let path = files.path("services.toml");
+    std::fs::write(&path, services).expect("written");
+    let mut flags = files.flags();
+    flags.extend(["--services-file".to_owned(), path]);
+    flags
+}
+
+/// A services file whose tierstore puts storage in the pool `storage`.
+const POOLED: &str =
+    "[[service]]\nname = \"tierstore\"\n[service.roles.storage]\npool = \"storage\"\n";
+
+/// Catches: the flag not reaching the load. Started on a file that names a pool with
+/// `--rollback-target=0.0.57`, the coordinator does not start: exit 1, and stderr names the
+/// target, the field and the flag in one line.
+#[test]
+fn a_pool_with_a_release_before_pools_kept_stops_the_start() {
+    let files = Files::new("bin-pool-rollback");
+    let mut flags = services_flags(&files, POOLED);
+    flags.extend([
+        "--rollback-target=0.0.59".to_owned(),
+        "--rollback-target=0.0.57".to_owned(),
+    ]);
+    let (code, stdout, stderr) = run(&flags);
+    assert_eq!(code, 1, "{stdout}{stderr}");
+    assert_eq!(
+        stderr.trim_end(),
+        "kbf-coordinator: --services-file: services: tierstore: pool \"storage\" on storage: \
+         the rollback target 0.0.57 (--rollback-target) is a release before 0.0.59 and refuses \
+         the field `pool`; remove the pool, or the target once its image is no longer kept"
+    );
+}
+
+/// Catches: the flag refusing more than it should. The same file starts with only a target
+/// that reads pools, and with none.
+#[test]
+fn a_pool_with_only_releases_that_read_pools_kept_starts() {
+    let stderr = stderr_of_a_start_with_flags(
+        "bin-pool-rollback-ok",
+        POOLED,
+        &["--rollback-target=0.0.59"],
+    );
+    assert!(!stderr.contains("rollback"), "{stderr}");
+    let stderr = stderr_of_a_start_with("bin-pool-rollback-none", POOLED);
+    assert!(!stderr.contains("rollback"), "{stderr}");
 }
 
 /// Catches: a misspelt slot pool starting silently. A services file whose `tierstore` names

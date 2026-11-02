@@ -453,6 +453,7 @@ fn kbf_def(raw: RawService) -> Result<ServiceDef, ServicesError> {
 pub struct Services {
     defs: BTreeMap<String, ServiceDef>,
     notes: Vec<String>,
+    from_file: Vec<String>,
 }
 
 impl Default for Services {
@@ -461,6 +462,7 @@ impl Default for Services {
         Self {
             defs: BTreeMap::from([(KBF.to_owned(), ServiceDef::kbf())]),
             notes: Vec::new(),
+            from_file: Vec::new(),
         }
     }
 }
@@ -497,6 +499,7 @@ impl Services {
         let mut services = Self {
             defs: BTreeMap::from([(KBF.to_owned(), kbf)]),
             notes: Vec::new(),
+            from_file: Vec::new(),
         };
         let mut from_file = Vec::new();
         if replaced {
@@ -516,6 +519,7 @@ impl Services {
             services.defs.insert(def.name.clone(), def);
         }
         services.notes = services.lone_pools(&from_file);
+        services.from_file = from_file;
         Ok(services)
     }
 
@@ -545,6 +549,29 @@ impl Services {
             }
         }
         notes
+    }
+
+    /// Each pool a role of an entry of the file names, as (service, role, pool), services by
+    /// name and roles in [`ServiceDef::role_names`] order. The shipped kbf definition's pool
+    /// is not among them: it is built in, and no other release reads it from a file.
+    pub(crate) fn pools_from_file(&self) -> Vec<(&str, &str, &str)> {
+        let mut named: Vec<&ServiceDef> = self
+            .from_file
+            .iter()
+            .filter_map(|name| self.defs.get(name))
+            .collect();
+        named.sort_by(|a, b| a.name.cmp(&b.name));
+        named
+            .into_iter()
+            .flat_map(|def| {
+                def.role_names().into_iter().filter_map(move |role| {
+                    def.roles[role]
+                        .pool
+                        .as_deref()
+                        .map(|pool| (def.name.as_str(), role, pool))
+                })
+            })
+            .collect()
     }
 
     /// What the load noticed and did not refuse: each pool a role of the file names that no
@@ -585,6 +612,7 @@ impl Services {
                 .map(|def| (def.name.clone(), def))
                 .collect(),
             notes: Vec::new(),
+            from_file: Vec::new(),
         }
     }
 
