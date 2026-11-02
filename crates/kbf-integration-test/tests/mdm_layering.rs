@@ -3,13 +3,14 @@
 //! The MDM installer is its own binary (`mdm-host`), beside the update coordinator and never
 //! folded into the `kbf` binary, and it will leave this repository with the coordinator. So
 //! its three crates link no other crate of this workspace, and the farm links none of them.
-//! This test reads `cargo tree` for each crate (the features of that crate built alone) and
-//! `cargo metadata` for the direct dependencies of every kind.
+//! This test reads `cargo tree` for each crate with all its features on, so a dependency behind
+//! a feature is in the walk, and `cargo metadata` for the direct dependencies of every kind,
+//! optional ones included.
 //!
 //! Catches:
 //! - an MDM crate that links `kbf-server` or the `kbf` binary's crate (`kbf-cli`), directly
-//!   or through another crate, or names either as a dev- or build-dependency (the failure
-//!   names them);
+//!   or through another crate (behind a feature too), or declares either as a dependency of any
+//!   kind, optional or not (the failure names them);
 //! - an MDM crate that links, or takes as a dev- or build-dependency, any other crate of this
 //!   workspace (`kbf-testkit` included);
 //! - the order inside the layer broken: `mdm-core` and `host-step` link neither each other nor
@@ -63,11 +64,13 @@ const FORBIDDEN: &[&str] = &[
 
 const DENY_ATTR: &str = "#![deny(clippy::disallowed_methods, clippy::disallowed_types)]";
 
-/// What one MDM crate holds: the names `cargo tree` prints for its normal edges, and the
-/// names of its direct dev- and build-dependencies.
+/// What one MDM crate holds: the names `cargo tree` prints for its normal edges with every
+/// feature on, the names of its direct normal dependencies as declared (optional ones too),
+/// and those of its direct dev- and build-dependencies.
 struct Tree<'a> {
     name: &'a str,
     linked: BTreeSet<String>,
+    declared: BTreeSet<String>,
     dev: BTreeSet<String>,
     build: BTreeSet<String>,
 }
@@ -87,6 +90,7 @@ fn violations(trees: &[Tree<'_>], members: &BTreeSet<String>) -> Vec<String> {
             .map_or(&[], |(_, a)| a);
         for (how, set) in [
             ("links", &tree.linked),
+            ("declares", &tree.declared),
             ("dev-depends on", &tree.dev),
             ("build-depends on", &tree.build),
         ] {
@@ -119,7 +123,7 @@ fn linked_by(package: &str) -> BTreeSet<String> {
     let cargo = std::env::var("CARGO").expect("CARGO is set when cargo runs a test");
     let out = Command::new(cargo)
         .args(["tree", "--locked", "--edges", "normal", "--prefix", "none"])
-        .args(["--format", "{p}", "--package", package])
+        .args(["--format", "{p}", "--all-features", "--package", package])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
         .expect("run cargo tree");
@@ -156,13 +160,14 @@ fn package<'a>(packages: &'a [Value], name: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("{name} is a workspace member"))
 }
 
-/// The direct dependencies of a package of this kind (`dev` or `build`).
-fn dependencies_of_kind(pkg: &Value, kind: &str) -> BTreeSet<String> {
+/// The direct dependencies of a package of this kind (`dev`, `build`, or `None` for normal),
+/// optional ones included.
+fn dependencies_of_kind(pkg: &Value, kind: Option<&str>) -> BTreeSet<String> {
     pkg["dependencies"]
         .as_array()
         .expect("dependencies")
         .iter()
-        .filter(|d| d["kind"] == kind)
+        .filter(|d| d["kind"].as_str() == kind)
         .filter_map(|d| d["name"].as_str().map(str::to_owned))
         .collect()
 }
@@ -197,8 +202,9 @@ fn the_mdm_crates_link_no_farm_crate_and_no_other_workspace_crate() {
         .map(|name| Tree {
             name,
             linked: linked_by(name),
-            dev: dependencies_of_kind(package(&packages, name), "dev"),
-            build: dependencies_of_kind(package(&packages, name), "build"),
+            declared: dependencies_of_kind(package(&packages, name), None),
+            dev: dependencies_of_kind(package(&packages, name), Some("dev")),
+            build: dependencies_of_kind(package(&packages, name), Some("build")),
         })
         .collect();
     let host = &trees[2];
@@ -272,18 +278,21 @@ fn clean() -> Vec<Tree<'static>> {
         Tree {
             name: "mdm-core",
             linked: set(&["mdm-core", "sha2"]),
+            declared: BTreeSet::new(),
             dev: BTreeSet::new(),
             build: BTreeSet::new(),
         },
         Tree {
             name: "host-step",
             linked: set(&["host-step", "rustix"]),
+            declared: BTreeSet::new(),
             dev: BTreeSet::new(),
             build: BTreeSet::new(),
         },
         Tree {
             name: "mdm-host",
             linked: set(&["mdm-host", "mdm-core", "host-step", "ureq"]),
+            declared: BTreeSet::new(),
             dev: BTreeSet::new(),
             build: BTreeSet::new(),
         },
@@ -325,6 +334,18 @@ fn a_build_dependency_on_the_server_is_refused() {
     );
 }
 
+/// Catches a dependency on the `kbf` binary's crate declared optional, behind a feature no
+/// build turns on by default: the declaration alone is refused.
+#[test]
+fn an_optional_dependency_on_the_kbf_binary_is_refused() {
+    let mut trees = clean();
+    trees[2].declared.insert("kbf-cli".to_owned());
+    assert_eq!(
+        violations(&trees, &members()),
+        vec!["mdm-host declares kbf-cli, a crate of the farm".to_owned()]
+    );
+}
+
 /// Catches an MDM crate taking another workspace crate (the test kit here), or linking a crate
 /// of its own layer out of order.
 #[test]
@@ -354,6 +375,7 @@ fn an_impure_renderer_or_a_kbf_name_is_refused() {
     let named = [Tree {
         name: "kbf-mdm-tool",
         linked: set(&["kbf-mdm-tool", "sha2"]),
+        declared: BTreeSet::new(),
         dev: BTreeSet::new(),
         build: BTreeSet::new(),
     }];
