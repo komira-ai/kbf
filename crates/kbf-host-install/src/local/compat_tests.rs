@@ -1,6 +1,6 @@
 //! The helper and the release before it read each other's data: the state file each writes,
 //! the request lines, and the `query` line the agent reads. The previous release's shapes are
-//! fixtures here, copied from it (the format rule of CONTRIBUTING.md: a release starts on the
+//! fixtures here, copied from it (rule B8 of AGENTS.md: a release starts on the
 //! data the other wrote).
 
 use std::collections::BTreeMap;
