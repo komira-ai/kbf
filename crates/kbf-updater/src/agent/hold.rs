@@ -153,10 +153,30 @@ pub struct Halt {
     pub generation: Option<u64>,
 }
 
+/// Why a mark on disk could not be used, with the file it was in.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum MarkError {
+    /// The file is there and cannot be opened or read (a link, a directory, no permission).
+    #[error("{}: {source}", path.display())]
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    /// The file is longer than a mark ever is.
+    #[error("{}: it is too long", path.display())]
+    TooLong { path: PathBuf },
+    /// The file is no mark of the kind asked for.
+    #[error("{}: {source}", path.display())]
+    Decode {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
+}
+
 /// A forced update that has begun: the target of an operator's force, kept on disk from before
 /// the update until it ends, so a restart in the middle can finish it as a force.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ForcedMark {
+pub(crate) struct ForcedMark {
     pub target: Version,
 }
 
@@ -188,15 +208,15 @@ impl Marks {
     ///
     /// # Errors
     /// The file is there and cannot be read, is too long, or is no mark.
-    pub fn load_forced(&self, unit: &str) -> Result<Option<ForcedMark>, String> {
-        self.read(&self.forced_path(unit))
+    pub(crate) fn load_forced(&self, unit: &str) -> Result<Option<ForcedMark>, MarkError> {
+        Self::read_typed(&self.forced_path(unit))
     }
 
     /// Record that a forced update of `unit` has begun.
     ///
     /// # Errors
     /// The directory does not take it.
-    pub fn save_forced(&self, unit: &str, mark: &ForcedMark) -> std::io::Result<()> {
+    pub(crate) fn save_forced(&self, unit: &str, mark: &ForcedMark) -> std::io::Result<()> {
         self.write(
             &self.forced_path(unit),
             &format!(".forced-{unit}.tmp"),
@@ -208,7 +228,7 @@ impl Marks {
     ///
     /// # Errors
     /// The file is there and cannot be removed.
-    pub fn clear_forced(&self, unit: &str) -> std::io::Result<()> {
+    pub(crate) fn clear_forced(&self, unit: &str) -> std::io::Result<()> {
         Self::remove(&self.forced_path(unit))
     }
 
@@ -236,6 +256,12 @@ impl Marks {
         &self,
         path: &std::path::Path,
     ) -> Result<Option<T>, String> {
+        Self::read_typed(path).map_err(|e| e.to_string())
+    }
+
+    fn read_typed<T: serde::de::DeserializeOwned>(
+        path: &std::path::Path,
+    ) -> Result<Option<T>, MarkError> {
         // O_NOFOLLOW: a link planted in the state directory is no record.
         let read = OpenOptions::new()
             .read(true)
@@ -245,16 +271,27 @@ impl Marks {
                 let mut text = Vec::new();
                 file.take(MARK_MAX + 1).read_to_end(&mut text).map(|_| text)
             });
-        let bad = |why: &dyn std::fmt::Display| format!("{}: {why}", path.display());
         let text = match read {
             Ok(text) => text,
             Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(bad(&e)),
+            Err(source) => {
+                return Err(MarkError::Io {
+                    path: path.to_owned(),
+                    source,
+                });
+            }
         };
         if text.len() as u64 > MARK_MAX {
-            return Err(bad(&"it is too long"));
+            return Err(MarkError::TooLong {
+                path: path.to_owned(),
+            });
         }
-        serde_json::from_slice(&text).map(Some).map_err(|e| bad(&e))
+        serde_json::from_slice(&text)
+            .map(Some)
+            .map_err(|source| MarkError::Decode {
+                path: path.to_owned(),
+                source,
+            })
     }
 
     /// Record `deferral` for `unit`: written beside, synced and renamed over.

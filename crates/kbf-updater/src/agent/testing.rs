@@ -19,6 +19,13 @@ pub const COMMIT_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 pub const VA: &str = "0.1.5+gaaaaaaaaaaaa-2";
 pub const VB: &str = "0.1.7+gbbbbbbbbbbbb-3";
 
+/// The result of an update that began at `started` (Unix seconds).
+pub fn update_result(target: Version, outcome: wire::Outcome, started: u64) -> wire::UpdateResult {
+    let mut result = wire::UpdateResult::new(target, outcome);
+    result.started_unix = Some(started);
+    result
+}
+
 pub fn version(text: &str) -> Version {
     Version::parse(text).expect("a version")
 }

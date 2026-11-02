@@ -836,7 +836,7 @@ There is no operator command line for the actions; this is the one form. The ans
 
 **The version left** stays marked bad: the automatic rollback never goes back to it (when it is the last good version, a later release that fails is only marked bad, and the desired state stays), and CI's `POST /v1/desired` of it is refused with 409 `held_bad` until an operator's `unmark_bad` lifts the mark.
 
-**The end:** the next desired state CI sets ends the force (`force_ended` by `ci` in the audit), even of the forced version, and the ordinary rules apply from then on. When that desired state cannot be written, the force is put back (`force_restored`) and the forced version stays desired and forced. CI's write and a force are made under one lock, so neither comes between the other's parts.
+**The end:** the next desired state CI sets ends the force (`force_ended` by `ci` in the audit), even of the forced version, and the ordinary rules apply from then on. The force ends only once CI's state is written: a state that cannot be written leaves the force standing, and a stop between the two leaves a record that no longer stands (CI's version is not the forced one) and that the next CI write ends. CI's write and a force are made under one lock, so neither comes between the other's parts.
 
 **Across a coordinator rollback:** a coordinator from before the force release ignores the force and the hold (above). The force's record stays in the halts file until that coordinator rewrites the file (its next ops change does), so if it is rolled forward again while the desired version is still the forced one, the force stands again; set a desired state, or force again, to end or replace it.
 

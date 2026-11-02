@@ -34,6 +34,8 @@ pub(super) struct Rig {
     pub(super) health: FakeHealth,
     pub(super) clock: Arc<ManualClock>,
     pub(super) logs: Arc<Mutex<Vec<String>>>,
+    /// The Unix clock the agent reads.
+    pub(super) unix: Arc<AtomicU64>,
     pub(super) dir: PathBuf,
 }
 
@@ -60,6 +62,7 @@ impl Rig {
             health,
             clock: Arc::new(ManualClock::default()),
             logs: Arc::default(),
+            unix: Arc::new(AtomicU64::new(T0)),
             dir: scratch(name),
             events,
         }
@@ -74,7 +77,7 @@ impl Rig {
     }
 
     pub(super) fn agent(&self) -> Agent {
-        let (logs, unix) = (Arc::clone(&self.logs), Arc::new(AtomicU64::new(T0)));
+        let (logs, unix) = (Arc::clone(&self.logs), Arc::clone(&self.unix));
         let agent = Agent::new(
             host(Role::Daemon),
             "stable".to_owned(),
@@ -138,7 +141,9 @@ impl Rig {
 }
 
 pub(super) fn result(target: &str, outcome: Outcome) -> Option<UpdateResult> {
-    Some(UpdateResult::new(version(target), outcome))
+    let mut result = UpdateResult::new(version(target), outcome);
+    result.started_unix = Some(T0);
+    Some(result)
 }
 
 pub(super) fn not_healthy() -> Vec<Result<Health, crate::ports::PortError>> {

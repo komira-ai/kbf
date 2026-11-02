@@ -78,6 +78,8 @@ mod force_edge_tests;
 #[cfg(test)]
 mod force_http_tests;
 #[cfg(test)]
+mod force_scope_tests;
+#[cfg(test)]
 mod force_tests;
 #[cfg(test)]
 mod halt_membership_tests;

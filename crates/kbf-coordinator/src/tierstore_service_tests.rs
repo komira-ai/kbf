@@ -139,6 +139,7 @@ fn failed(target: &str) -> UpdateResult {
         phase: Some(Phase::AfterCommit),
         class: Some(Class::Release),
         reason: None,
+        started_unix: None,
     }
 }
 

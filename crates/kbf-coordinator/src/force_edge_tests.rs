@@ -88,9 +88,10 @@ async fn ci_cannot_lift_a_hold_that_appeared_after_its_request_was_read() {
     assert_eq!(desired_version(&rig), "2.0");
 }
 
-/// Catches: a force coming between CI's marks and CI's desired write, which would overwrite the
-/// force just made: CI's write is made under the fleet's lock, the lock a force takes, so at
-/// the moment CI's state is written the lock is held and no force can be in between.
+/// Catches: a force coming between CI's desired write and the end of the force it replaces,
+/// which would end the new force: CI's write is made under the fleet's lock, the lock a force
+/// takes, so between the state's write and the end the lock is held and no force can be in
+/// between; the force is ended only after the state is written.
 #[tokio::test]
 async fn ci_writes_its_desired_state_under_the_lock_a_force_takes() {
     let rig = rig("force-edge-race-lock", GATED);
@@ -114,17 +115,21 @@ async fn ci_writes_its_desired_state_under_the_lock_a_force_takes() {
             rig.coordinator.fleet_held(),
             "CI writes under the fleet's lock"
         );
-        assert_eq!(rig.coordinator.ops().marks("kbf").force, None);
+        // The state is written; the force is still recorded, and ends next.
+        assert!(rig.coordinator.ops().marks("kbf").force.is_some());
+        let file = std::fs::read_to_string(rig.dir.path().join("desired.json")).expect("desired");
+        assert!(file.contains(r#""version": "1.6""#), "{file}");
         pause.wait();
         writer.join().expect("joined").expect("set");
     });
     assert_eq!(desired_version(&rig), "1.6");
+    assert_eq!(rig.coordinator.ops().marks("kbf").force, None);
 }
 
 /// Catches: CI's write ending a force when its desired state then cannot be written, which
-/// would leave the forced version desired under the ordinary gates: the force is put back
-/// (`force_ended`, then `force_restored`), the forced version is desired and forced, and the
-/// write is answered as failed; written once the store is mended, it ends the force.
+/// would leave the forced version desired under the ordinary gates: nothing of the force is
+/// touched before the state is written, so it stands, with no entry in the audit; written once
+/// the store is mended, it ends the force.
 #[tokio::test]
 async fn a_force_stands_when_cis_desired_state_cannot_be_written() {
     let rig = rig("force-edge-ci-fails", GATED);
@@ -139,16 +144,14 @@ async fn a_force_stands_when_cis_desired_state_cannot_be_written() {
         .set_desired(Some(&ci_token()), body.as_bytes())
         .await;
     assert!(matches!(failed, Err(SetError::Store(_))));
-    assert_eq!(
-        actions_from(&rig, seq + 1),
-        ["force_ended", "force_restored"]
-    );
+    assert!(actions_from(&rig, seq + 1).is_empty());
     assert_eq!(rig.coordinator.ops().marks("kbf").force, before);
     assert_eq!(desired_version(&rig), "1.5");
     let answer = send(&rig, "d1", agent("2.0", Health::Healthy));
     assert!(answer.forced);
     mend_desired(&rig);
     rig.set(body).await;
+    assert_eq!(actions_from(&rig, seq + 1), ["force_ended"]);
     assert_eq!(rig.coordinator.ops().marks("kbf").force, None);
 }
 
@@ -560,28 +563,44 @@ fn failing_after(state: OpsState, ok: usize) -> OpsStore {
     )
 }
 
-/// Catches: a force that is neither standing nor said to be lost when CI's desired state cannot
-/// be written and the force cannot be put back either: CI is told its write failed, the
-/// desired version is still the forced one, and the force is ended (the operator forces
-/// again), not left half restored.
+/// Catches: a stop between CI's desired write and the end of the force (here the end cannot be
+/// written, and the coordinator starts again from its files) leaving a force that stands again
+/// when its version is desired later: the record left does not stand under CI's state, and the
+/// next CI write, of the forced version itself, ends it before writing, so that version is
+/// rolled under the ordinary rules.
 #[tokio::test]
-async fn a_force_that_cannot_be_put_back_is_ended_and_ci_is_told() {
-    let mut rig = rig("force-edge-restore-fails", GATED);
+async fn a_force_left_by_a_stop_after_cis_write_does_not_stand_again() {
+    let mut rig = rig("force-edge-end-fails", GATED);
     rig.set(DESIRED_2).await;
     force(&rig, "1.5", "");
     let state = rig.coordinator.ops().state();
     rig.coordinator = Rig::start(&rig.dir, &rig.clock)
         .with_services(Services::parse(GATED).expect("services"))
-        .with_ops(failing_after(state, 1));
-    break_desired(&rig);
-    let body = r#"{"version":"1.6","min_up":{"storage":0,"frontend":0}}"#;
-    let failed = rig
-        .coordinator
-        .set_desired(Some(&ci_token()), body.as_bytes())
+        .with_ops(failing_after(state, 0));
+    rig.set(r#"{"version":"1.6","min_up":{"storage":0,"frontend":0}}"#)
         .await;
-    assert!(matches!(failed, Err(SetError::Store(_))));
+    assert_eq!(desired_version(&rig), "1.6");
+    restart(&mut rig, GATED);
+    let marks = rig.coordinator.ops().marks("kbf");
+    assert_eq!(
+        marks.force.as_ref().map(|f| f.version.clone()),
+        Some(version("1.5"))
+    );
+    let status = rig.coordinator.status(Some(OPERATOR)).expect("status");
+    assert!(status.per_service["kbf"].forced.is_none());
+    let seq = last_seq(&rig);
+    rig.set(r#"{"version":"1.5","min_up":{"storage":0,"frontend":0}}"#)
+        .await;
+    let audit = rig.coordinator.ops().state().audit;
+    let ended: Vec<_> = audit.iter().filter(|e| e.seq > seq).collect();
+    assert_eq!(ended.len(), 1);
+    assert_eq!(
+        ended[0].reason.as_deref(),
+        Some("the force to 1.5 did not stand and ends: 1.5 is to be set")
+    );
     assert_eq!(rig.coordinator.ops().marks("kbf").force, None);
-    assert_eq!(desired_version(&rig), "1.5");
+    let answer = send(&rig, "d1", agent("2.0", Health::Healthy));
+    assert!(!answer.forced);
 }
 
 /// Catches: an order given while the halt acknowledgement a new attempt should end is still on

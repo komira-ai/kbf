@@ -70,6 +70,8 @@ pub(crate) mod testing;
 #[cfg(test)]
 mod update_forced_contract_tests;
 #[cfg(test)]
+mod update_forced_review_tests;
+#[cfg(test)]
 mod update_forced_tests;
 #[cfg(test)]
 mod update_tests;

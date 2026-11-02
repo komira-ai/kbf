@@ -118,7 +118,7 @@ impl Update<'_> {
 
     /// Step 2: the node drained and empty, and whether it was in placement before; or the
     /// ending of the update when it could not be.
-    pub(super) fn drained(&self, target: &Version) -> Result<Placed, Done> {
+    pub(super) fn drained(&self, target: &Version) -> Result<Placed, Box<Done>> {
         self.drain().map_err(|e| {
             let mut done = self.fail(target, &format!("the node could not be drained: {e}"));
             // Leases that run past the operator's bound are the host's moment, not the
@@ -126,7 +126,7 @@ impl Update<'_> {
             done.hold = matches!(e, DrainError::Bound(_))
                 .then(|| deferred(DRAIN_BOUND))
                 .flatten();
-            done
+            Box::new(done)
         })
     }
 
@@ -140,7 +140,7 @@ impl Update<'_> {
     /// deferred update is not a result: the status keeps the last result it had, and the
     /// caller gets the [`Hold`]. A halt is a failed result of phase `halt`.
     pub fn run_for(&self, target: &Version, features: Features) -> Done {
-        self.finish(target, features, |target| self.run_inner(target))
+        self.finish(target, features, |target, _| self.run_inner(target))
     }
 
     /// The status around an update, whichever way `run` does it: `updating` is the target
@@ -149,10 +149,14 @@ impl Update<'_> {
         &self,
         target: &Version,
         features: Features,
-        run: impl FnOnce(&Version) -> Done,
+        run: impl FnOnce(&Version, u64) -> Done,
     ) -> Done {
+        // This attempt began now, whatever the target's earlier attempts were: a trial resumed
+        // after a restart is an attempt that begins at the resume.
+        let started = (self.ports.unix_now)();
         self.status.update(|s| s.updating = Some(target.clone()));
-        let mut done = run(target);
+        let mut done = run(target, started);
+        done.result.started_unix = Some(started);
         done.hold = done.hold.filter(|hold| match hold {
             Hold::Deferred { .. } => features.deferred,
             Hold::Halt { .. } => features.halt,
@@ -199,7 +203,7 @@ impl Update<'_> {
         // 2. Drain.
         let placed = match self.drained(target) {
             Ok(placed) => placed,
-            Err(done) => return done,
+            Err(done) => return *done,
         };
         // 3. Switch.
         let deadline = match self.ports.local.switch(target) {

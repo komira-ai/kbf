@@ -58,6 +58,7 @@ pub(crate) fn failure(phase: Option<Phase>, class: Option<Class>, target: &str) 
         phase,
         class,
         reason: None,
+        started_unix: None,
     });
     b
 }

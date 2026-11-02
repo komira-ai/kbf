@@ -293,7 +293,8 @@ impl Coordinator {
         self
     }
 
-    /// Waits at `pause`, if a test set one, just before CI's desired state is written.
+    /// Waits at `pause`, if a test set one, just after CI's desired state is written and before
+    /// the force it ends is ended.
     #[cfg(test)]
     fn paused(&self) {
         let pause = self
@@ -307,8 +308,8 @@ impl Coordinator {
         }
     }
 
-    /// Makes CI's next desired write wait twice at `pause` just before the state is written: a
-    /// test sees what holds at that moment between the two waits.
+    /// Makes CI's next desired write wait twice at `pause` between writing the state and ending
+    /// the force: a test sees what holds at that moment between the two waits.
     #[cfg(test)]
     pub(crate) fn pause_ci_write(&self, pause: Arc<std::sync::Barrier>) {
         *self.pause.lock().unwrap_or_else(PoisonError::into_inner) = Some(pause);
@@ -543,28 +544,30 @@ impl Coordinator {
         // A version a force left is not CI's to set again: an operator lifts its mark first.
         // CI naming a version by hand lifts its mark, and ends a force. The marks go first: a
         // set that fails after them leaves nothing blocked, and the reverse would leave a wanted
-        // version that the next beat rolls back. A force ended for a set that fails is put back.
+        // version that the next beat rolls back. The force ends only once the set is written.
         // All of it under the fleet's lock, which a force takes too, so a force never comes
         // between the check, the marks and the desired state.
         {
             let fleet = self.fleet.lock().unwrap_or_else(PoisonError::into_inner);
-            let ended = match force::before_ci_write(&self.ops, &fleet, &service, &desired.version)
-            {
-                Ok(ended) => ended,
+            let current = self.desired.get(&service);
+            match force::before_ci_write(
+                &self.ops,
+                &fleet,
+                &service,
+                &desired.version,
+                current.as_ref(),
+            ) {
+                Ok(()) => {}
                 Err(force::CiBlocked::Held) => {
                     tracing::warn!(%service, version = %desired.version, "refused a desired state: a force left the version");
                     return Err(SetError::HeldBad(desired.version));
                 }
                 Err(force::CiBlocked::Ops(why)) => return Err(why.into()),
-            };
+            }
+            self.desired.set(&service, desired.clone())?;
             #[cfg(test)]
             self.paused();
-            if let Err(why) = self.desired.set(&service, desired.clone()) {
-                if let Some(force) = ended {
-                    force::restore(&self.ops, &service, force);
-                }
-                return Err(why.into());
-            }
+            force::end_after_ci_write(&self.ops, &service, &desired.version);
         }
         tracing::info!(
             workflow = %verified.job_workflow_ref,
