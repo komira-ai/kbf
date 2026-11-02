@@ -198,6 +198,59 @@ fn a_scheduler_names_one_to_eight_dns_names_and_addresses() {
     );
 }
 
+// Catches: the scheduler's cap of eight names leaking onto the roles that had no cap. At
+// nine names (and at thirty-two) the frontend's certificate is still signed on the
+// frontend route and a storage certificate on the node route, built by the farm's own
+// builder and by hand, while the scheduler's is refused at nine and signed at eight.
+#[test]
+fn the_cap_of_eight_names_is_the_schedulers_alone() {
+    let ca = ca();
+    let hosts = |n: usize| -> Vec<String> { (1..=n).map(|i| format!("h{i}.example")).collect() };
+    let both = vec![
+        ExtendedKeyUsagePurpose::ServerAuth,
+        ExtendedKeyUsagePurpose::ClientAuth,
+    ];
+    let with_role = |role: &str, n: usize, ekus: Vec<ExtendedKeyUsagePurpose>, route| {
+        let mut evil = Evil::new(ca);
+        evil.params.subject_alt_names = std::iter::once(role_uri(role))
+            .chain(hosts(n).iter().map(|h| dns(h)))
+            .collect();
+        evil.params.extended_key_usages = ekus;
+        check(&evil.tbs(), route)
+    };
+    for n in [9, 32] {
+        let names = hosts(n);
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let frontend = support::frontend_tbs_for(ca, &names);
+        assert_eq!(check(&frontend, Route::Frontend), Ok(()), "frontend, {n}");
+        assert_eq!(
+            with_role("frontend", n, both.clone(), Route::Frontend),
+            Ok(()),
+            "frontend by hand, {n}"
+        );
+        assert_eq!(
+            with_role("storage", n, both.clone(), Route::Node),
+            Ok(()),
+            "storage, {n}"
+        );
+        let scheduler = support::scheduler_tbs(ca, &names);
+        assert_eq!(
+            check(&scheduler, Route::Frontend),
+            Err(Refusal::Name),
+            "scheduler, {n}"
+        );
+    }
+    let server = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    assert_eq!(
+        with_role("scheduler", 8, server.clone(), Route::Frontend),
+        Ok(())
+    );
+    assert_eq!(
+        with_role("scheduler", 9, server, Route::Frontend),
+        Err(Refusal::Name)
+    );
+}
+
 // Catches: an iPAddress name that is no address (five bytes) read as a usable name: a
 // structure the farm's builder never makes, written by hand as a subjectAltName.
 #[test]

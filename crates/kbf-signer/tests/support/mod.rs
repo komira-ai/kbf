@@ -216,6 +216,15 @@ pub fn frontend_tbs(ca: &Ca) -> Vec<u8> {
     spy.last()
 }
 
+/// The to-be-signed structure `Authority::issue_frontend` builds for `names`.
+pub fn frontend_tbs_for(ca: &Ca, names: &[&str]) -> Vec<u8> {
+    let spy = Spy::new(&ca.spki);
+    authority_over(ca, &spy)
+        .issue_frontend(names, &fresh_key(), NOW, &mut Stream(10))
+        .expect("issue");
+    spy.last()
+}
+
 /// The to-be-signed structure `Authority::issue_scheduler` builds for `names`.
 pub fn scheduler_tbs(ca: &Ca, names: &[&str]) -> Vec<u8> {
     let spy = Spy::new(&ca.spki);
