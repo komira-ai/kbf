@@ -14,10 +14,10 @@ use crate::services::{Services, ServicesError};
 
 /// The first coordinator release that reads `pool` in a services file. The release that
 /// carries this check is that release.
-pub const FIRST_POOL_VERSION: &str = "0.0.60";
+pub const FIRST_POOL_VERSION: &str = "0.0.61";
 
 /// [`FIRST_POOL_VERSION`]'s [`Version::release_numbers`] (a test holds the two together).
-const FIRST_POOL: [u64; 3] = [0, 0, 60];
+const FIRST_POOL: [u64; 3] = [0, 0, 61];
 
 /// `text` as a release version: one [`Version`] whose leading numbers have at least two
 /// parts (`0.0.57`, `0.0.57+g0123456789ab`). A bare commit id or a word is none.

@@ -32,13 +32,13 @@ fn refusal(services: &Services, list: &[&str]) -> String {
 fn a_pool_is_refused_while_a_release_before_pools_is_a_rollback_target() {
     let services = pooled();
     let expected = "tierstore: pool \"storage\" on storage: the rollback target 0.0.57 \
-                    (--rollback-target) is a release before 0.0.60 and refuses the field `pool`; \
+                    (--rollback-target) is a release before 0.0.61 and refuses the field `pool`; \
                     remove the pool, or the target once its image is no longer kept";
     assert_eq!(refusal(&services, &["0.0.57"]), expected);
-    assert_eq!(refusal(&services, &["0.0.61", "0.0.57"]), expected);
+    assert_eq!(refusal(&services, &["0.0.62", "0.0.57"]), expected);
     assert_eq!(
-        refusal(&services, &["0.0.59+g0123456789ab"]),
-        expected.replace("0.0.57", "0.0.59+g0123456789ab")
+        refusal(&services, &["0.0.60+g0123456789ab"]),
+        expected.replace("0.0.57", "0.0.60+g0123456789ab")
     );
     assert!(refusal(&services, &["0.0"]).contains("rollback target 0.0 "));
 }
@@ -71,8 +71,8 @@ fn a_pool_is_accepted_once_no_release_before_pools_remains() {
     assert_eq!(check(&services, &[]), Ok(()));
     let capable = [
         FIRST_POOL_VERSION,
-        "0.0.60+g0123456789ab-8",
-        "0.0.61",
+        "0.0.61+g0123456789ab-8",
+        "0.0.62",
         "0.1",
         "1.0.0",
     ];
@@ -104,9 +104,9 @@ fn a_replaced_kbf_entry_with_a_pool_is_checked() {
 #[test]
 fn the_floor_is_first_pool_version() {
     let floor = Version::parse(FIRST_POOL_VERSION).expect("a version");
-    assert_eq!(floor.release_numbers(), [0, 0, 60]);
+    assert_eq!(floor.release_numbers(), [0, 0, 61]);
     let services = pooled();
-    let just_before = targets(&["0.0.59"]);
+    let just_before = targets(&["0.0.60"]);
     assert!(check(&services, &just_before).is_err());
-    assert_eq!(check(&services, &targets(&["0.0.60"])), Ok(()));
+    assert_eq!(check(&services, &targets(&["0.0.61"])), Ok(()));
 }
