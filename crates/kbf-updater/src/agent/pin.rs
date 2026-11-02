@@ -148,7 +148,6 @@ impl PinFile {
                     Ok(meta) => self
                         .untrusted(&meta)
                         .map_or_else(|| unknown(at(&e)), Look::NotAPin),
-                    Err(gone) if gone.kind() == ErrorKind::NotFound => Look::Absent,
                     Err(_) => unknown(at(&e)),
                 };
             }

@@ -27,6 +27,12 @@ fn pinned(rig: &Rig) -> Vec<String> {
         .collect()
 }
 
+/// A file at `path` holding `text`, mode 0644 whatever the umask, as root's hold file is.
+fn put(path: &std::path::Path, text: &str) {
+    fs::write(path, text).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o644)).unwrap();
+}
+
 fn unpinned(commit: Option<&str>) -> Answer {
     Answer::Unpinned {
         commit: commit.map(id),
@@ -100,14 +106,14 @@ fn a_hold_file_root_did_not_write_unpins_nothing_in_retain() {
     assert_eq!(pinned(&rig), [B]);
 
     for bad in ["{\"commit\":\"not a commit\"}", "not json"] {
-        fs::write(&hold, bad).unwrap();
+        put(&hold, bad);
         assert_eq!(ab.unpin(), unpinned(None), "{bad}");
         assert!(!hold.exists());
         assert_eq!(pinned(&rig), [B]);
     }
 
     // Another owner's file: the trust of an account that is not the test's.
-    fs::write(&hold, format!("{{\"commit\":\"{B}\"}}")).unwrap();
+    put(&hold, &format!("{{\"commit\":\"{B}\"}}"));
     let uid = fs::metadata(&*rig.dir).unwrap().uid();
     let strict = Ab::new(
         Borrowed(&rig.backend),
@@ -465,7 +471,7 @@ fn an_unpin_cut_short_leaves_the_hold_and_is_finished_by_running_it_again() {
     .unwrap();
     let swap = || {
         fs::remove_file(&hold).unwrap();
-        fs::write(&hold, format!("{{\"commit\":\"{C}\"}}")).unwrap();
+        put(&hold, &format!("{{\"commit\":\"{C}\"}}"));
     };
     assert_eq!(ab.unpin_interrupted(&swap), unpinned(Some(B)));
     assert!(!hold.exists());
