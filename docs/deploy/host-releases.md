@@ -125,8 +125,11 @@ installs nothing and leaves nothing behind.
    names.
 4. `gh attestation verify` accepts each tarball with the bundle, for the offered commit.
    Nothing has been unpacked or run yet.
-5. Each tarball must hold exactly one regular file named like the component, with no path
-   and no link; it is unpacked, and its header must be this host's kind of binary
+5. Each tarball must hold a regular file named like the component, with no path, and may
+   hold the component's updater declaration `updater.d/<component>.toml`, which is unpacked
+   at that path in the release. No member may be a link, a device or a FIFO or have an
+   absolute name or a `..` in it; a member of another name is ignored and logged. The
+   binary is unpacked, and its header must be this host's kind of binary
    (ELF on Linux, Mach-O on macOS, for this CPU). On macOS its code signature must be
    valid and ad hoc with the hardened runtime, which is what CI's `sign-darwin` makes.
 6. The binary runs `--version --json` as the unprivileged user (empty environment, empty
