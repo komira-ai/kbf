@@ -475,7 +475,10 @@ impl Coordinator {
         }
         // The fleet before the writer, the order a heartbeat's rollback takes them in
         // (`crate::reconcile`). The writer is held from the generation's check to the write,
-        // so no other write is accepted between them.
+        // so no other write is accepted between them. Holding the fleet across the write also
+        // keeps a heartbeat's rollback, which decides on the state it read under the fleet,
+        // from overwriting this write; heartbeats wait for the files' fsyncs, which CI's rare
+        // writes can afford.
         let fleet = self.fleet.lock().unwrap_or_else(PoisonError::into_inner);
         let writer = self.desired.writer();
         let now = writer.record(&service).generation;

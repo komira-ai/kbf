@@ -300,6 +300,25 @@ fn a_restore_that_lands_behind_a_503_reads_its_own_write_id_and_is_done() {
     assert!(out.contains("whose answer was lost before"), "{out}");
 }
 
+/// Catches: a restore that landed reported as one to do by hand. Its POST is stored and the
+/// connection is closed with no answer (a timeout or a dropped connection, not a 503); the
+/// read after it shows the restore's own `write_id`, so the restore is reported done, once.
+#[test]
+fn a_restore_whose_answer_is_lost_reads_its_own_write_id_and_is_done() {
+    let fake = serve(Script {
+        state: Some(State::released()),
+        fates: vec![Fate::Drop],
+        ..Script::new()
+    });
+    let (result, out) = restore(&fake);
+    assert_eq!(result, restored());
+    let posts = fake.posts();
+    assert_eq!(posts.len(), 1);
+    assert_eq!(posts[0].status, 0);
+    assert_eq!(fake.state(), Some(set_back(2)));
+    assert!(out.contains("whose answer was lost before"), "{out}");
+}
+
 /// Catches: the version alone taken as proof of the restore. Another writer sets the version
 /// the restore would set, between its read and its POST: once with other minimums and once
 /// with the very same ones. Both times the restore gets a 409, reads another `write_id`, and

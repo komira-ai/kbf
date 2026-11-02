@@ -20,8 +20,10 @@
 //!    lost, so the restore is done (exit 1, as in 3). Any other `write_id`, or none: that
 //!    write stands, nothing is restored, and it exits 1 naming the state now and its write.
 //!
-//! Any other failure of the POST (a 503 on every try, a 401 or 403, an answer it cannot
-//! read) exits 1 naming the version it could not set and the forced rollback.
+//! Any other failure of the POST (a 503 on every try, a lost connection, a timeout) is
+//! followed by the same read: a state showing `restore-<run>` is the restore done, whose
+//! answer was lost. Otherwise, and on a 401 or 403 (which set nothing), it exits 1 naming the
+//! version it could not set and the forced rollback.
 
 use std::io::Write;
 use std::time::Duration;
@@ -45,7 +47,8 @@ pub const FORCED_ROLLBACK: &str = "the forced rollback (docs/design/gamma-cicd.m
 /// The prefix of the restore's `write_id`.
 pub const WRITE_ID_PREFIX: &str = "restore-";
 
-/// The most bytes of a `write_id` the coordinator keeps.
+/// The most bytes of a `write_id` the coordinator keeps (`MAX_WRITE_ID` of
+/// `kbf_coordinator::writes`, which xtask does not depend on).
 const MAX_WRITE_ID: usize = 128;
 
 /// The flags of `deploy-farm restore`.
@@ -311,7 +314,12 @@ pub fn restore_on(
             )?;
             Err(restored())
         }
-        Err(Deploy::Conflict { .. }) => {
+        // A refusal of the token set nothing: no read can change that.
+        Err(e @ Deploy::Refused { .. }) => Err(not_set(e)),
+        // Some write was accepted, or the POST may have landed with its answer lost (a 503 on
+        // every try, a dropped connection, a timeout): the state's `write_id` tells.
+        Err(e) => {
+            let conflict = matches!(e, Deploy::Conflict { .. });
             let now = client
                 .send_retrying(out, READ_AFTER, &path, None, &plan)
                 .and_then(|answer| Read::of(&answer))
@@ -325,13 +333,14 @@ pub fn restore_on(
                     ),
                 )?;
                 Err(restored())
-            } else {
+            } else if conflict {
                 Err(Error::OtherWriter {
                     write: now.write(),
                     desired: now.desired,
                 })
+            } else {
+                Err(not_set(e))
             }
         }
-        Err(e) => Err(not_set(e)),
     }
 }

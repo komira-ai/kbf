@@ -726,6 +726,9 @@ earlier build ignores the `.writes` file). Each entry names the state it describ
 file holds another state at a start (a stop between the two writes, or a write by an earlier
 build), the entry's `replaced` and `write_id` are dropped and its generation is raised by one. A
 `.writes` file that is not JSON of its shape stops the start; a key it does not know is skipped.
+An earlier build that changed the state and changed it back to the very state an entry names is
+not seen: after running an earlier coordinator, set the desired version once before relying on
+`replaced`.
 
 `--ops-file` (default: the `--state-file` name with `.ops` added) holds what an operator decides, apart from CI's desired state: the hosts excluded from a service, the labels on a host, and a ring of the last 64 operator changes (it also holds the per-service marks: `halt`, `halt_acked`, `last_good`, `bad` and `failure_acked`; a coordinator from before the rollback release knows all of them but `failure_acked`, which is written only after CI sets by hand a version marked bad, and refuses a file that holds it as an unknown key, so that rolling back across that release means moving the file aside). The coordinator creates the file at the first change and replaces it whole (a temporary file beside it, fsync, rename, directory fsync), owner-only; with no file nothing is excluded or labelled and the coordinator behaves as before. The reader is strict: a key it does not know, or a `schema` newer than the build's, stops the start with the flag and the path in the message, so a coordinator rolled back below the build that wrote the file does not ignore what it holds. To start without the file anyway, move it aside on purpose. The directory must be writable by the coordinator. `GET /v1/status` shows the file's content as `ops` once anything has been changed (before that the key is absent).
 
@@ -787,7 +790,9 @@ last step, `cargo xtask deploy-farm restore --url ... --ca-pem ... --version <th
    POST that landed behind a lost answer, and the restore is done; any other write stands,
    nothing is restored, and it exits 1 naming the desired version and that write.
 
-A 503 on every try, a 401 or a 403 exits 1 naming the version it could not set and the forced
+Any other failure of the POST (a 503 on every try, a lost connection, a timeout) is followed by
+the same read, so a restore that landed with its answer lost is reported done. A POST that did
+not land, and a 401 or a 403, exit 1 naming the version it could not set and the forced
 rollback. The restore is an ordinary desired write, so it goes through every ordinary rule. A run
 that is cancelled, or whose runner is lost, restores nothing; `GET /v1/convergence` still shows
 `replaced`, and re-running the failed jobs sets this release again (which keeps `replaced`) and

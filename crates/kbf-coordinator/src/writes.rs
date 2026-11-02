@@ -13,7 +13,11 @@
 //! the one in the state file (a crash between the two writes, or an earlier build that wrote
 //! the state file alone) has its `replaced` and `write_id` dropped and its generation raised,
 //! so a write conditional on a generation read before cannot pass. A key this build does not
-//! know is skipped; a file that is not JSON of this shape stops the start.
+//! know is skipped; a file that is not JSON of this shape stops the start. What the entry
+//! cannot see: an earlier build that wrote the state file several times and left it holding
+//! the very state the entry names (A to B and back to A) leaves the entry's record as it was.
+//! After running an earlier build, set the desired version once before relying on
+//! `replaced`.
 
 use std::collections::BTreeMap;
 use std::fs;
