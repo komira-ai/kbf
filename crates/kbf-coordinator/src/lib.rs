@@ -80,6 +80,10 @@ mod membership_tests;
 #[cfg(test)]
 mod ops_tests;
 #[cfg(test)]
+mod pool_load_tests;
+#[cfg(test)]
+mod pool_race_tests;
+#[cfg(test)]
 mod pool_tests;
 #[cfg(test)]
 mod priority_tests;

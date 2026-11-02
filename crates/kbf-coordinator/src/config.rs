@@ -124,6 +124,9 @@ pub fn build(cli: &Cli) -> Result<Parts, Error> {
         Some(path) => Services::from_file(path).map_err(|why| format!("--services-file: {why}"))?,
         None => Services::default(),
     };
+    for note in services.notes() {
+        tracing::warn!(%note, "--services-file");
+    }
     for (n, entry) in oidc.entries().iter().enumerate() {
         if let Some(name) = entry.services.iter().find(|s| services.get(s).is_none()) {
             return Err(format!(

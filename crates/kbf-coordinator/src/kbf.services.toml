@@ -5,9 +5,10 @@
 # waits for every other role. The `min_up` keys a desired state of kbf must name (storage and
 # frontend) belong to the service and are not set here.
 #
-# The storage role is in the pool `storage`, the one tierstore's shipped entry names too: a
-# host holding a slot for either service on storage holds the one count both compare with
-# their own limit. With kbf alone the pool decides exactly as no pool.
+# The storage role is in the pool `storage`. Another service whose storage role names the
+# same pool (tierstore, once its entry does) shares one count of storage hosts holding a
+# slot with kbf, and each service's new order compares that count with its own limit. With
+# no other member the pool decides exactly as no pool.
 
 [[service]]
 name = "kbf"

@@ -7,9 +7,12 @@
 # other five must stay up. The first host goes alone, and no other starts until it has beaten
 # healthy three times at the new version. A release that fails after its commit on two
 # hosts is rolled back by the coordinator to the last version that converged and baked.
-# The storage role shares the pool `storage` with kbf's: a storage host updating, failed or
-# ordered for either service holds a slot of the one count, so a tierstore update and a kbf
-# update are never both taking storage capacity beyond each one's `max_updating`.
+#
+# The storage role names no slot pool, so that a coordinator of a release before pools still
+# reads this entry. Once every coordinator that may read the file (and any release it may be
+# rolled back to) reads `pool`, add `pool = "storage"` under [service.roles.storage]: the
+# role then shares one count of storage hosts holding a slot with kbf's storage role
+# (docs/deploy/kbf-updater.md, "Slot pools").
 
 [[service]]
 name = "tierstore"
@@ -25,4 +28,3 @@ roles = ["storage"]
 [service.roles.storage]
 max_updating = 1
 min_up = 4
-pool = "storage"

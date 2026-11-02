@@ -6,11 +6,11 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use kbf_types::HostRole;
-use kbf_updater::wire::Outcome;
+use kbf_updater::wire::{Heartbeat, Outcome};
 
 use crate::decide::{Decision, Hold, decide_why};
 use crate::desired::{Desired, KBF};
-use crate::fleet::Fleet;
+use crate::fleet::{Fleet, ORDER_AGE};
 use crate::services::{RoleDef, ServiceDef, Services};
 use crate::testutil::{beat, desired, id, last, unhealthy, updating, version};
 
@@ -40,10 +40,7 @@ fn want() -> BTreeMap<String, Desired> {
 
 /// A fleet where every `(host, role)` heartbeated both services at 1.0, with `special`
 /// replacing the beat of one service for one host.
-fn fleet_of(
-    hosts: &[(&str, HostRole)],
-    special: &[(&str, &str, kbf_updater::wire::Heartbeat)],
-) -> Fleet {
+fn fleet_of(hosts: &[(&str, HostRole)], special: &[(&str, &str, Heartbeat)]) -> Fleet {
     let mut fleet = Fleet::new(Duration::ZERO);
     for (host, role) in hosts {
         for service in ["a", "b"] {
@@ -348,19 +345,22 @@ fn a_host_baking_for_one_service_holds_the_pool_slot_for_the_other() {
     assert_eq!(ask(&alone, &fleet, "b", "d2"), update());
 }
 
-/// Catches: the shipped definitions not sharing storage. With kbf's shipped definition and
-/// the shipped tierstore entry, a storage host updating tierstore holds the storage slot kbf
-/// counts, so no other storage host is ordered kbf; a daemon, outside the pool, still is.
+/// Catches: kbf's shipped storage pool not reaching tierstore once tierstore's entry names it.
+/// With the shipped tierstore entry and the documented `pool = "storage"` line added, a
+/// storage host updating tierstore holds the storage slot kbf counts, so no other storage
+/// host is ordered kbf; a daemon, outside the pool, still is. The shipped entry as it is
+/// (no pool, for the release before pools) shares nothing: kbf orders that storage host.
 #[test]
-fn the_shipped_kbf_and_tierstore_share_storage() {
-    let shipped = Services::parse(crate::services::TIERSTORE_SERVICES).expect("parsed");
+fn kbf_and_tierstore_share_storage_once_the_entry_names_the_pool() {
+    let entry = crate::services::TIERSTORE_SERVICES;
+    let pooled = entry.replace("min_up = 4\n", "min_up = 4\npool = \"storage\"\n");
+    assert_ne!(pooled, entry, "the line is added under the storage role");
     let want = BTreeMap::from([
         (KBF.to_owned(), desired("2.0", 1, 1)),
         ("tierstore".to_owned(), desired("2.0", 0, 0)),
     ]);
     let storage = ["s1", "s2", "s3", "s4", "s5", "s6"];
-    let ask = |fleet: &Fleet, host: &str| decide_why(&shipped, &want, KBF, fleet, &id(host), NOW);
-    let fleet_with = |s1: kbf_updater::wire::Heartbeat| {
+    let fleet_with = |s1: Heartbeat| {
         let mut fleet = Fleet::new(Duration::ZERO);
         for host in storage {
             let ts = if host == "s1" {
@@ -375,8 +375,142 @@ fn the_shipped_kbf_and_tierstore_share_storage() {
         fleet
     };
     let busy = fleet_with(updating(beat("1.0"), "2.0"));
-    assert_eq!(ask(&busy, "s2"), Decision::Hold(Hold::NoSlot));
-    assert_eq!(ask(&busy, "d1"), update());
     let idle = fleet_with(beat("1.0"));
-    assert_eq!(ask(&idle, "s2"), update());
+
+    let shared = Services::parse(&pooled).expect("parsed");
+    assert!(shared.notes().is_empty(), "{:?}", shared.notes());
+    let ask = |services: &Services, fleet: &Fleet, host: &str| {
+        decide_why(services, &want, KBF, fleet, &id(host), NOW)
+    };
+    assert_eq!(ask(&shared, &busy, "s2"), Decision::Hold(Hold::NoSlot));
+    assert_eq!(ask(&shared, &busy, "d1"), update());
+    assert_eq!(ask(&shared, &idle, "s2"), update());
+
+    let shipped = Services::parse(entry).expect("parsed");
+    assert_eq!(ask(&shipped, &busy, "s2"), update());
+}
+
+// ---- the slot's life, across services -----------------------------------------------------
+
+/// `fleet` with every `(host, role)` beating both services at `at`, `special` replacing one
+/// service's beat for one host.
+fn beat_at(
+    fleet: &mut Fleet,
+    hosts: &[(&str, HostRole)],
+    special: &[(&str, &str, Heartbeat)],
+    at: Duration,
+) {
+    for (host, role) in hosts {
+        for service in ["a", "b"] {
+            let b = special
+                .iter()
+                .find(|(h, s, _)| h == host && *s == service)
+                .map_or_else(|| beat("1.0"), |(_, _, b)| b.clone());
+            fleet.record_in(service, id(host), role.clone(), b, at);
+        }
+    }
+}
+
+fn pooled(max_a: u32, max_b: u32) -> Services {
+    services(
+        &[("daemon", role(max_a, Some("p")))],
+        &[("daemon", role(max_b, Some("p")))],
+    )
+}
+
+/// Catches: a promotion pending for one service not holding the pool's slot for the other.
+/// d1 waits for its promotion of `a`: d2 is held for `b` until d1 reports the promotion done.
+#[test]
+fn a_pending_promotion_of_one_service_holds_the_pool_slot_until_cleared() {
+    let shared = pooled(1, 1);
+    let hosts = daemons(&["d1", "d2"]);
+    let mut waiting = beat("2.0");
+    waiting.promotion_pending = true;
+    let mut fleet = Fleet::new(Duration::ZERO);
+    beat_at(&mut fleet, &hosts, &[("d1", "a", waiting)], NOW);
+    assert_eq!(
+        ask(&shared, &fleet, "b", "d2"),
+        Decision::Hold(Hold::NoSlot)
+    );
+    let later = NOW + Duration::from_secs(15);
+    beat_at(&mut fleet, &hosts, &[("d1", "a", beat("2.0"))], later);
+    assert_eq!(
+        decide_why(&shared, &want(), "b", &fleet, &id("d2"), later),
+        update()
+    );
+}
+
+/// Catches: an order of one service that never ages out of the pool. d1 is ordered `a` and
+/// never reports it: d2 is held for `b` until [`ORDER_AGE`] has passed, then ordered.
+#[test]
+fn an_order_of_one_service_frees_the_pool_slot_when_it_ages_out() {
+    let shared = pooled(1, 1);
+    let hosts = daemons(&["d1", "d2"]);
+    let mut fleet = Fleet::new(Duration::ZERO);
+    beat_at(&mut fleet, &hosts, &[], NOW);
+    fleet.order("a", id("d1"), version("2.0"), NOW);
+    let just_before = NOW + ORDER_AGE - Duration::from_secs(1);
+    beat_at(&mut fleet, &hosts, &[], just_before);
+    assert_eq!(
+        decide_why(&shared, &want(), "b", &fleet, &id("d2"), just_before),
+        Decision::Hold(Hold::NoSlot)
+    );
+    let aged = NOW + ORDER_AGE;
+    beat_at(&mut fleet, &hosts, &[], aged);
+    assert_eq!(
+        decide_why(&shared, &want(), "b", &fleet, &id("d2"), aged),
+        update()
+    );
+}
+
+/// Catches: a bake of one service that holds the pool's slot past its count. `a` bakes for
+/// three beats: after d1's second healthy beat at 2.0 d2 is held for `b` (`baking`), after
+/// its third it is ordered.
+#[test]
+fn a_bake_of_one_service_frees_the_pool_slot_when_it_completes() {
+    let mut a = ServiceDef::new("a", &[("daemon", role(1, Some("p")))]);
+    a.bake_beats = 3;
+    let shared = Services::from_defs(vec![
+        a,
+        ServiceDef::new("b", &[("daemon", role(1, Some("p")))]),
+    ]);
+    let hosts = daemons(&["d1", "d2"]);
+    let mut fleet = Fleet::new(Duration::ZERO);
+    let mut at = NOW;
+    for _ in 0..2 {
+        beat_at(&mut fleet, &hosts, &[("d1", "a", beat("2.0"))], at);
+        assert_eq!(
+            decide_why(&shared, &want(), "b", &fleet, &id("d2"), at),
+            Decision::Hold(Hold::Baking)
+        );
+        at += Duration::from_secs(15);
+    }
+    beat_at(&mut fleet, &hosts, &[("d1", "a", beat("2.0"))], at);
+    assert_eq!(
+        decide_why(&shared, &want(), "b", &fleet, &id("d2"), at),
+        update()
+    );
+}
+
+/// Catches: a host counted twice when it holds one member's slot and bakes for another. d1
+/// updates `a` and has sent `b` one healthy beat at 2.0 (`b` bakes for three): it is one host
+/// in use, so with two slots d2 is ordered for `b`; counted as one holding and one baking it
+/// would be held at `baking`.
+#[test]
+fn a_host_holding_one_members_slot_and_baking_for_another_counts_once() {
+    let a = ServiceDef::new("a", &[("daemon", role(2, Some("p")))]);
+    let mut b = ServiceDef::new("b", &[("daemon", role(2, Some("p")))]);
+    b.bake_beats = 3;
+    let shared = Services::from_defs(vec![a, b]);
+    let mut fleet = Fleet::new(Duration::ZERO);
+    beat_at(
+        &mut fleet,
+        &daemons(&["d1", "d2", "d3"]),
+        &[
+            ("d1", "a", updating(beat("1.0"), "2.0")),
+            ("d1", "b", beat("2.0")),
+        ],
+        NOW,
+    );
+    assert_eq!(ask(&shared, &fleet, "b", "d2"), update());
 }

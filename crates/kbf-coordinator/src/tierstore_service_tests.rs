@@ -33,8 +33,9 @@ fn def() -> crate::services::ServiceDef {
 /// The shipped file is a definition of tierstore that the services file parser accepts and
 /// that says each of the values the rollout rests on: the storage role, one host at a time,
 /// four others up, a canary of one, a bake of three beats, automatic rollback at the default
-/// threshold, and a host that never registered is not ordered. A change to the shipped data
-/// shows here.
+/// threshold, and a host that never registered is not ordered. It names no slot pool yet, so
+/// that a coordinator of the release before pools still reads it (`pool_tests`). A change to
+/// the shipped data shows here.
 #[test]
 fn the_shipped_definition_says_what_the_rollout_rests_on() {
     let def = def();
@@ -49,7 +50,7 @@ fn the_shipped_definition_says_what_the_rollout_rests_on() {
                 min_up: Some(4),
                 never_last: false,
                 after: Vec::new(),
-                pool: Some("storage".to_owned()),
+                pool: None,
             }
         )]
     );

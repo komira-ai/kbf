@@ -402,9 +402,12 @@ file once at start:
 # other five must stay up. The first host goes alone, and no other starts until it has beaten
 # healthy three times at the new version. A release that fails after its commit on two
 # hosts is rolled back by the coordinator to the last version that converged and baked.
-# The storage role shares the pool `storage` with kbf's: a storage host updating, failed or
-# ordered for either service holds a slot of the one count, so a tierstore update and a kbf
-# update are never both taking storage capacity beyond each one's `max_updating`.
+#
+# The storage role names no slot pool, so that a coordinator of a release before pools still
+# reads this entry. Once every coordinator that may read the file (and any release it may be
+# rolled back to) reads `pool`, add `pool = "storage"` under [service.roles.storage]: the
+# role then shares one count of storage hosts holding a slot with kbf's storage role
+# (docs/deploy/kbf-updater.md, "Slot pools").
 
 [[service]]
 name = "tierstore"
@@ -420,7 +423,6 @@ roles = ["storage"]
 [service.roles.storage]
 max_updating = 1
 min_up = 4
-pool = "storage"
 ```
 
 What each value is for, for a farm of six storage hosts:
@@ -433,13 +435,13 @@ What each value is for, for a farm of six storage hosts:
   second one does, until one is back or `min_up` is lowered in the file. tierstore keeps serving through
   its hand-over, and the canary, the bake and the automatic rollback still gate each step. A farm of
   fewer than six storage hosts needs a smaller `min_up`.
-- `pool = "storage"`: tierstore's storage role and kbf's shipped one share one count of storage hosts
-  holding an update slot, each service comparing it with its own `max_updating`. A storage host
-  updating, ordered, or failed and not yet healthy for either service takes the slot for both, so a
-  tierstore update on one storage host and a kbf update on another do not run at once while either
-  limit is one. One service per host updates at a time whatever the pool, and on other roles kbf and
-  tierstore never share slots. A coordinator built before pools refuses this entry (`pool` is an
-  unknown field to it); drop the line there.
+- No `pool` yet: the entry is the one a coordinator of the release before slot pools reads, and
+  that coordinator refuses a file that names `pool`. While the entry names none, kbf and tierstore
+  may update different storage hosts at once (kbf restarting on one host while tierstore hands over
+  on another); one service per host updates at a time whatever the pools. Once every coordinator
+  that may read the file, and any release it may be rolled back to, reads pools, add
+  `pool = "storage"` under `[service.roles.storage]` to share kbf's storage slots (see "Slot pools"
+  below).
 - `canary = { count = 1 }` and `bake_beats = 3`: one host goes alone, and no other starts until it has
   sent three healthy beats at the new version; each host
   after it holds its slot for the same three beats, so the next host starts only once the last one has
@@ -708,7 +710,32 @@ will converge on it.
 
 A service may carry `install_when_absent = true` and a `[service.selector]` with `roles` (default: every role of the service) and `labels` (at most 8, key and value 1 to 32 bytes of `[a-z0-9-]`); a selector naming a role the service lacks is refused. Without a selector a host belongs to the service if it lists it, as always. With one, the coordinator decides who should run the service from the host's certificate role and the labels an operator set for it with `POST /v1/operator` (`set_labels`; a heartbeat can never set them). A selected, live host whose agent announced `heartbeat-v2` and that did not list the service is `missing`; one that reports it `absent` is `absent` and is ordered only with `install_when_absent`; one whose agent did not announce `heartbeat-v2` is `unmanaged` (not counted, not ordered); one an operator excluded is `excluded`. A silent host is `down` first of all. `GET /v1/convergence` shows `hosts: {missing, absent, excluded, unmanaged, deferred}` for a service with a selector, or any such host, and a service with a missing or absent host is `in_progress`; the status lists them with their reason. Exclusions apply to a service without a selector too. `deferred` counts the live hosts within the wait that follows their deferral of the desired version. This holds for `kbf` as for any service whose definition has a selector or an exclusion: a host that is not counted for `kbf` (excluded, or outside a `kbf` selector) has its beat not recorded, so it gets no `kbf` orders, is left out of the `kbf` convergence and appears only in `members`. Excluding a node from `kbf` therefore stops its `kbf` updates.
 
-A role of a service entry may name a slot pool, `pool = "<name>"` (1 to 64 bytes of `[a-z0-9-]`; anything else is refused with `<service>: pool "<name>" is not 1 to 64 bytes of lowercase letters, digits and -`, and the coordinator does not start). Two services whose role of the same name gives the same pool share one count of hosts of that role holding an update slot (updating, ordered, failed and not yet healthy, waiting for a promotion, or baking), a host counted once however many of the services it holds a slot for; each service compares the count with its own `max_updating`, and `min_up` stays per service. A pool is named and not declared elsewhere: a pool only one service names decides as no pool, and a role without one counts its own service's slots, as before. The shipped kbf definition puts storage in the pool `storage`, as the shipped tierstore entry does. A coordinator before the change refuses a file that names `pool`.
+**Slot pools.** A role of a service entry may name a slot pool, `pool = "<name>"`. Two services whose role of the
+same name gives the same pool share one count of hosts of that role holding an update slot
+(updating, ordered, waiting for a promotion, failed and not yet healthy, or baking), each host
+counted once however many of the services it holds a slot for. Each new order checks only the
+asking service's own `max_updating` against that count: with limits of one for both services
+there is never more than one host of the role updating for either, while with limits of one and
+two a host updating the first service does not stop a second host updating the second, so the
+pool's hosts holding a slot never number more than the largest limit among its members. `min_up`
+stays per service.
+
+A pool is named, not declared: there is no list of pools, and any well-formed name is one. A pool
+that only one service names decides exactly as no pool, so a misspelt name (`storag` for
+`storage`) shares nothing; the coordinator logs a warning at start for each pool a services-file
+entry names that no other service's role of the same name names
+(`<service>: pool "<name>" on <role> is named by no other service's <role> role, so it shares no
+slots`). A role without a pool counts its own service's slots, as before. The shipped kbf
+definition puts storage in the pool `storage`; it is built in, so the file need not repeat it.
+
+A pool name is 1 to 64 bytes of `[a-z0-9-]`. Another string is refused as invalid, naming the
+service (`services: <service>: pool "<name>" is not 1 to 64 bytes of lowercase letters, digits
+and -`); a value that is not a string (`pool = 3`) is refused by the TOML parse
+(`services: invalid type: ...`). Either stops the start.
+
+A coordinator before slot pools refuses a file that names `pool` (an unknown field) and does not
+start. Add a pool to the file only once every coordinator that may read it, and any release it may
+be rolled back to, reads pools.
 
 A service entry may also set two rollout fields, both off by default (a coordinator before the change refuses a file that names them, so set them only after every coordinator runs the new build):
 

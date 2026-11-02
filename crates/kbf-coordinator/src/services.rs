@@ -42,10 +42,18 @@
 //! ```
 //!
 //! A `pool` is named, not declared: two services whose role of one name gives the same pool
-//! share one count of hosts holding a slot on that role, and each compares the count with its
-//! own `max_updating`. A role without a pool counts the slots of its own service only, and a
-//! pool only one service names decides exactly as no pool. A pool name is 1 to
-//! [`MAX_SERVICE_NAME`] bytes of lowercase letters, digits and `-`.
+//! share one count of hosts holding a slot on that role. Each new order checks only the
+//! asking service's own `max_updating` against that count, so the hosts of the pool holding
+//! a slot never number more than the largest limit of its members, and two members whose
+//! limits are both one never update two hosts at once. A role without a pool counts the slots
+//! of its own service only, and a pool only one service names decides exactly as no pool:
+//! the load keeps it and notes it ([`Services::notes`]), since a misspelt pool shares with
+//! nothing. A pool name is 1 to [`MAX_SERVICE_NAME`] bytes of lowercase letters, digits and
+//! `-`; another string is refused as invalid, and a value that is not a string is refused by
+//! the parse.
+//!
+//! A coordinator before pools refuses a file that names one (every table of the file is read
+//! with unknown fields refused), so the shipped tierstore entry names none yet.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -444,6 +452,7 @@ fn kbf_def(raw: RawService) -> Result<ServiceDef, ServicesError> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Services {
     defs: BTreeMap<String, ServiceDef>,
+    notes: Vec<String>,
 }
 
 impl Default for Services {
@@ -451,6 +460,7 @@ impl Default for Services {
     fn default() -> Self {
         Self {
             defs: BTreeMap::from([(KBF.to_owned(), ServiceDef::kbf())]),
+            notes: Vec::new(),
         }
     }
 }
@@ -486,7 +496,12 @@ impl Services {
         };
         let mut services = Self {
             defs: BTreeMap::from([(KBF.to_owned(), kbf)]),
+            notes: Vec::new(),
         };
+        let mut from_file = Vec::new();
+        if replaced {
+            from_file.push(KBF.to_owned());
+        }
         for raw in entries {
             if raw.name == KBF {
                 return invalid(if replaced {
@@ -497,9 +512,47 @@ impl Services {
                 });
             }
             let def = service_def(raw, &services.defs)?;
+            from_file.push(def.name.clone());
             services.defs.insert(def.name.clone(), def);
         }
+        services.notes = services.lone_pools(&from_file);
         Ok(services)
+    }
+
+    /// A note for each pool that a role of a service in `named` (the entries of the file)
+    /// gives and that no other service's role of the same name gives: it shares no slots.
+    fn lone_pools(&self, named: &[String]) -> Vec<String> {
+        let mut notes = Vec::new();
+        for def in named.iter().filter_map(|name| self.defs.get(name)) {
+            for (role, pool) in def
+                .roles
+                .iter()
+                .filter_map(|(role, r)| r.pool.as_ref().map(|p| (role, p)))
+            {
+                let shared = self.defs.values().any(|other| {
+                    other.name != def.name
+                        && other
+                            .roles
+                            .get(role)
+                            .is_some_and(|r| r.pool.as_ref() == Some(pool))
+                });
+                if !shared {
+                    notes.push(format!(
+                        "{}: pool {pool:?} on {role} is named by no other service's {role} role, so it shares no slots",
+                        def.name
+                    ));
+                }
+            }
+        }
+        notes
+    }
+
+    /// What the load noticed and did not refuse: each pool a role of the file names that no
+    /// other service's role of that name names (a pool of one member decides as no pool, so a
+    /// misspelt pool shows here). The coordinator logs each at start.
+    #[must_use]
+    pub fn notes(&self) -> &[String] {
+        &self.notes
     }
 
     /// The services in the file at `path`. The file is read under the rule of the operator's
@@ -531,6 +584,7 @@ impl Services {
                 .into_iter()
                 .map(|def| (def.name.clone(), def))
                 .collect(),
+            notes: Vec::new(),
         }
     }
 
