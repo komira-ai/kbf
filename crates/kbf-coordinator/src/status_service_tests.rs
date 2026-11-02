@@ -241,7 +241,7 @@ async fn the_kbf_status_keeps_its_bytes_and_only_gains_keys() {
         r#""platform":"linux-x86_64","version":"2.0","health":"healthy","last_update":null,"updating":null,"hold":"up_to_date"}"#
     );
     let convergence = format!(
-        r#"{{"desired":"2.0","quiet":false,"state":"converged","roles":[{{"role":"storage","at_desired":1,"updating":0,"failed":0,"down":0}}],"commit":"{commit}"}}"#
+        r#"{{"desired":"2.0","quiet":false,"state":"converged","roles":[{{"role":"storage","at_desired":1,"updating":0,"failed":0,"down":0}}],"commit":"{commit}","generation":1,"replaced":null,"write_id":""}}"#
     );
     let want = format!(
         r#"{OLD_HEAD},"hosts":[{host}],"up":1,"slots_held":0,"convergence":{convergence}}}}},"commit":"{commit}"}}"#

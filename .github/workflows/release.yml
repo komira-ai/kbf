@@ -499,6 +499,9 @@ jobs:
     needs: [plan, publish, rehearse, rehearse-agent]
     if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}
     runs-on: ubuntu-24.04
+    # The deploy's --deadline-min (60) and 30 minutes more: the build and the reads before the
+    # deadline starts, the proof and the restore after it. The release workflow lint holds the
+    # sum, so a job cut by this timeout still had time to set the farm back.
     timeout-minutes: 90
     environment: release
     permissions:
@@ -547,7 +550,9 @@ jobs:
           oauth-client-id: ${{ vars.TS_CLIENT_ID }}
           audience: ${{ vars.TS_AUDIENCE }}
           tags: tag:ci
-      # The version is the release's; the minimums default to 1 and are the farm's to raise.
+      # The version is the release's; the minimums default to 1 and are the farm's to raise. The
+      # deadline is given here, not left to the verb's default, because the job's timeout must
+      # leave room after it for the proof and the restore.
       - name: Set this release as the farm's desired version, and wait for the farm to converge
         env:
           COORDINATOR_URL: ${{ vars.KBF_COORDINATOR_URL }}
@@ -559,7 +564,7 @@ jobs:
           # `true`: fail before setting anything when the coordinator runs another commit than
           # this release (docs/deploy/kbf-updater.md, "Updating the coordinator").
           REQUIRE_CURRENT: ${{ vars.KBF_REQUIRE_COORDINATOR_CURRENT }}
-        run: cargo xtask deploy-farm --url "$COORDINATOR_URL" --ca-pem "$COORDINATOR_CA" --version "$VERSION" --min-up-storage "$MIN_UP_STORAGE" --min-up-frontend "$MIN_UP_FRONTEND" --require-coordinator-current "$REQUIRE_CURRENT"
+        run: cargo xtask deploy-farm --url "$COORDINATOR_URL" --ca-pem "$COORDINATOR_CA" --version "$VERSION" --deadline-min 60 --min-up-storage "$MIN_UP_STORAGE" --min-up-frontend "$MIN_UP_FRONTEND" --require-coordinator-current "$REQUIRE_CURRENT"
       # The proof. The farm now runs this release; build a small project (four `/bin/sh -c`
       # actions that depend on each other) against it with remote execution on and local off, and
       # read Buck2's own count of the actions it ran: some remote, none local. The run id and
@@ -576,3 +581,18 @@ jobs:
           FARM_PROPERTIES: ${{ vars.FARM_LINUX_X86_64_PROPERTIES }}
           NONCE: ${{ github.run_id }}-${{ github.run_attempt }}
         run: cargo xtask prove-farm --address "$FARM_ADDRESS" --instance "$FARM_INSTANCE" --tls "$FARM_TLS" --properties "$FARM_PROPERTIES" --buck2 "$RUNNER_TEMP/tools/buck2" --project crates/kbf-integration-test/gamma/buck2 --nonce "$NONCE"
+      # When an earlier step of this job failed (the deploy was blocked, stalled, out of time or
+      # lost a host, or the proof failed): set the farm back to the version this release
+      # replaced, which the coordinator keeps, while this release is still the desired one. The
+      # write is conditional on the generation the step read, so it never overwrites another
+      # writer, and it exits 1, so the run stays red. A green job skips it; a cancelled one
+      # restores nothing, and the operator re-runs the failed jobs (docs/design/gamma-cicd.md,
+      # G1). It must stay the job's last step.
+      - name: Set the farm back to the version this release replaced, after a failed step
+        if: ${{ failure() }}
+        env:
+          URL: ${{ vars.KBF_COORDINATOR_URL }}
+          CA_PEM: ${{ vars.KBF_COORDINATOR_CA }}
+          RELEASE: ${{ steps.farm-version.outputs.version }}
+          RUN: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: cargo xtask deploy-farm restore --url "$URL" --ca-pem "$CA_PEM" --version "$RELEASE" --run "$RUN"

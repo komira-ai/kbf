@@ -44,8 +44,9 @@ fn a_dropped_limit_is_a_warning_naming_the_roles() {
     assert!(text.contains("builder") && text.contains("kbf"), "{text}");
 }
 
-/// The answer to the POST carries `dropped_roles` after the state's own fields when roles
-/// were dropped, and is byte for byte the state alone when none were.
+/// The answer to the POST is byte for byte the state, then the record of the write
+/// (`generation`, `replaced`, `write_id`), then `dropped_roles` when roles were dropped and
+/// nothing more when none were.
 #[tokio::test]
 async fn the_answer_names_the_dropped_roles_and_is_unchanged_without_any() {
     let mut rig = Rig::new("desired-dropped");
@@ -64,13 +65,17 @@ async fn the_answer_names_the_dropped_roles_and_is_unchanged_without_any() {
     let plain = answer(WITHOUT_BUILDER).await;
     assert!(plain.dropped_roles.is_empty());
     let state = serde_json::to_string(&plain.desired).expect("json");
+    let state = format!(
+        r#"{},"generation":1,"replaced":null,"write_id":""}}"#,
+        &state[..state.len() - 1]
+    );
     assert_eq!(serde_json::to_string(&plain).expect("json"), state);
 
     let dropped = answer(WITH_BUILDER).await;
     assert_eq!(dropped.dropped_roles, ["builder"]);
     let expected = format!(
         r#"{},"dropped_roles":["builder"]}}"#,
-        &state[..state.len() - 1]
+        &state[..state.len() - 1].replace(r#""generation":1"#, r#""generation":2"#)
     );
     assert_eq!(serde_json::to_string(&dropped).expect("json"), expected);
 }

@@ -31,6 +31,7 @@ use crate::desired::Desired;
 use crate::fleet::{Fleet, Host};
 use crate::membership::HostCounts;
 use crate::services::ServiceDef;
+use crate::writes::Record;
 
 /// Where the farm stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -78,6 +79,12 @@ pub struct Convergence {
     /// The commit this coordinator was built from ([`crate::BUILD_COMMIT`]): what a client
     /// compares with a release before it orders one.
     pub commit: &'static str,
+    /// The record of the writes of the desired state ([`crate::writes`]): its generation,
+    /// what the last change of version replaced, and the id of the write that made it. The
+    /// coordinator fills it in from its store; this module, which reads no store, leaves it
+    /// empty.
+    #[serde(flatten)]
+    pub record: Record,
 }
 
 fn failed_to_reach(host: &Host, desired: &Desired) -> bool {
@@ -191,6 +198,7 @@ fn converge_with(
             roles: Vec::new(),
             hosts: None,
             commit: crate::BUILD_COMMIT,
+            record: Record::default(),
         };
     };
     let service = def.name.as_str();
@@ -237,5 +245,6 @@ fn converge_with(
         roles,
         hosts: None,
         commit: crate::BUILD_COMMIT,
+        record: Record::default(),
     }
 }

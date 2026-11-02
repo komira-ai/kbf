@@ -708,6 +708,25 @@ A host whose heartbeat carries `promotion_pending` holds its update slot and doe
 
 The coordinator keeps its desired state per service name, and `kbf` is the only service it accepts unless `--services-file` defines more ([the design](../design/updates.md)): `POST /v1/desired` takes an optional `service` (absent means `kbf`; a name no file defines is a 400), and `GET /v1/status` adds `services` beside the unchanged `desired`, `services_dropped`, the number of heartbeats whose `services` list was bad and was dropped (the host is answered as a `kbf`-only host), and `per_service` (below). While `kbf` is the only service, the `--state-file` holds the single state in the form earlier coordinators wrote, so a downgrade to one of them starts on the same file; a file in the map form (`{"services": {...}}`), which a coordinator with a second service writes, is refused by an earlier build, and the operator then restores the file from before or writes `kbf`'s state alone in it.
 
+The coordinator keeps a record of the writes of each service's desired state. `generation` is
+raised by every accepted write, a `POST /v1/desired` or the coordinator's own rollback, including
+one that sets the version already desired (0 before the first). `replaced` is `{"version",
+"min_up"}`, the version and minimums that the last change of version replaced (`null` until a
+second version was set); a write of the version already desired keeps it. `write_id` is the
+caller's text for the write that made the state (empty for a write without one, and for the
+coordinator's own). `POST /v1/desired` takes two optional fields for these: `if_generation`, a
+number, makes the write conditional: when it is not the service's generation now the answer is 409
+`conflict` and nothing changes, the bad mark of the version included; `write_id` is 1 to 128
+visible ASCII characters. A malformed one is a 400. The answer of the POST is the state as stored
+followed by `generation`, `replaced` and `write_id`, and `GET /v1/convergence` (and so the status's
+`per_service.*.convergence`) shows them too. The record is kept in a file of its own beside the
+`--state-file`, its name with `.writes` added, written whole before the state file at each write,
+so the state file keeps the form earlier coordinators read and a downgrade still starts (the
+earlier build ignores the `.writes` file). Each entry names the state it describes: when the state
+file holds another state at a start (a stop between the two writes, or a write by an earlier
+build), the entry's `replaced` and `write_id` are dropped and its generation is raised by one. A
+`.writes` file that is not JSON of its shape stops the start; a key it does not know is skipped.
+
 `--ops-file` (default: the `--state-file` name with `.ops` added) holds what an operator decides, apart from CI's desired state: the hosts excluded from a service, the labels on a host, and a ring of the last 64 operator changes (it also holds the per-service marks: `halt`, `halt_acked`, `last_good`, `bad` and `failure_acked`; a coordinator from before the rollback release knows all of them but `failure_acked`, which is written only after CI sets by hand a version marked bad, and refuses a file that holds it as an unknown key, so that rolling back across that release means moving the file aside). The coordinator creates the file at the first change and replaces it whole (a temporary file beside it, fsync, rename, directory fsync), owner-only; with no file nothing is excluded or labelled and the coordinator behaves as before. The reader is strict: a key it does not know, or a `schema` newer than the build's, stops the start with the flag and the path in the message, so a coordinator rolled back below the build that wrote the file does not ignore what it holds. To start without the file anyway, move it aside on purpose. The directory must be writable by the coordinator. `GET /v1/status` shows the file's content as `ops` once anything has been changed (before that the key is absent).
 
 `POST /v1/operator` on the control listener takes the operator token as the bearer (CI's OIDC token is refused with 401, as is no token) and one action as JSON, at most 4096 bytes:
@@ -747,8 +766,37 @@ Each accepted action is written to the file before it takes effect (a failed wri
    convergence fails the job; the release stays published whatever it says. Another failed read
    is reported and tried again, and counts as no change.
 
+The job gives `--deadline-min 60` explicitly, and its `timeout-minutes` (90) leaves 30 minutes
+beyond it for the build before the deploy and the proof and the restore after it; the release
+workflow lint holds that sum.
+
+When any earlier step of the `gamma` job failed (the deploy, or the proof after it), the job's
+last step, `cargo xtask deploy-farm restore --url ... --ca-pem ... --version <this release> --run
+<run id>-<attempt>`, sets the farm back:
+
+1. it reads `GET /v1/convergence`. When the desired version is not this release (another writer,
+   a newer release or the coordinator's own rollback has it), it sets nothing, says so and exits
+   0. When the coordinator shows no `generation` (a coordinator older than this), or no
+   `replaced` (the release was the farm's first), it sets nothing and exits 1 naming the forced
+   rollback;
+2. it posts `replaced` (its version and minimums) to `/v1/desired` with `if_generation` set to
+   the generation it read and `write_id` set to `restore-<run id>-<attempt>`, with a fresh token
+   (a 503 is tried again, as for the deploy), prints what it set, and exits 1, so the run stays
+   red;
+3. on a 409 it reads once more: a state whose `write_id` is its own is an earlier try of the same
+   POST that landed behind a lost answer, and the restore is done; any other write stands,
+   nothing is restored, and it exits 1 naming the desired version and that write.
+
+A 503 on every try, a 401 or a 403 exits 1 naming the version it could not set and the forced
+rollback. The restore is an ordinary desired write, so it goes through every ordinary rule. A run
+that is cancelled, or whose runner is lost, restores nothing; `GET /v1/convergence` still shows
+`replaced`, and re-running the failed jobs sets this release again (which keeps `replaced`) and
+then runs the restore.
+
 `GET /v1/convergence` answers `{"desired", "quiet", "state", "roles": [{"role", "at_desired",
-"updating", "failed", "down"}]}`, where `state` is `converged`, `blocked` or `in_progress`. It
+"updating", "failed", "down"}], "commit", "generation", "replaced", "write_id"}`, where `state` is
+`converged`, `blocked` or `in_progress`, and the last three are the record of the writes of the
+desired state, below. It
 takes CI's OIDC token and refuses the operator token (the operator's read is `GET /v1/status`).
 It is computed from the heartbeats and the desired state, and stores nothing. `converged` needs
 the coordinator to be past its 30 second quiet start, at least one live host, every live host at

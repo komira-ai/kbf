@@ -55,6 +55,8 @@ use serde_json::{Value, json};
 
 use crate::fetch;
 
+pub mod restore;
+
 /// The longest any one call may take.
 const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -65,10 +67,17 @@ const MAX_ANSWER: u64 = 1 << 20;
 const POST_ATTEMPTS: u32 = 4;
 
 /// Whether a failed call may pass: the coordinator's 503 on the POST or on the baseline read,
-/// and nothing else (a certificate it is not trusted by, or a runner without a token, does
-/// not get better; a poll that fails is tried again anyway).
+/// or on any call of the restore, and nothing else (a certificate it is not trusted by, or a
+/// runner without a token, does not get better; a poll that fails is tried again anyway).
 fn retryable(what: &str, why: &str) -> bool {
-    matches!(what, SET_DESIRED | READ_BASELINE) && why == "status 503"
+    matches!(
+        what,
+        SET_DESIRED
+            | READ_BASELINE
+            | restore::READ_BEFORE
+            | restore::SET_BACK
+            | restore::READ_AFTER
+    ) && why == "status 503"
 }
 
 /// What the calls are named in an error.
@@ -145,6 +154,41 @@ fn check_args(args: &Args) -> Result<(), Error> {
 /// The variables the platform sets for a job that may ask for an OIDC token.
 const TOKEN_URL_VAR: &str = "ACTIONS_ID_TOKEN_REQUEST_URL";
 const TOKEN_KEY_VAR: &str = "ACTIONS_ID_TOKEN_REQUEST_TOKEN";
+
+/// The verb as it is called: a deploy, or `restore`, the last step of a deploy job that failed.
+#[derive(Debug, ClapArgs)]
+#[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
+pub struct Command {
+    /// What to do instead of a deploy.
+    #[command(subcommand)]
+    pub then: Option<Then>,
+    /// The flags of a deploy.
+    #[command(flatten)]
+    pub deploy: Option<Args>,
+}
+
+/// What `deploy-farm` does instead of a deploy.
+#[derive(Debug, clap::Subcommand)]
+pub enum Then {
+    /// After an earlier step of the job failed: set the version this release replaced back as
+    /// desired, if this release is still desired, and exit 1.
+    Restore(restore::Args),
+}
+
+/// The verb as called.
+///
+/// # Errors
+/// [`crate::Error`], for every end but convergence (a deploy) or nothing to set back (a
+/// restore).
+pub fn run_command(command: &Command) -> Result<Vec<String>, crate::Error> {
+    match (&command.then, &command.deploy) {
+        (Some(Then::Restore(args)), _) => restore::run(args),
+        (None, Some(args)) => run(args),
+        (None, None) => Err(crate::Error::Failed(
+            "deploy-farm needs --url and --version, or `restore`".to_owned(),
+        )),
+    }
+}
 
 /// The flags of the verb.
 #[derive(Debug, ClapArgs)]
@@ -233,6 +277,10 @@ pub enum Error {
         "{what}: refused with status {status}: the coordinator's OIDC allow-list does not accept this job's token"
     )]
     Refused { what: &'static str, status: u16 },
+    #[error(
+        "{what}: refused with status 409: another write was accepted since the coordinator was read"
+    )]
+    Conflict { what: &'static str },
     #[error("the coordinator answered something this client cannot read: {0}")]
     Answer(String),
     #[error("blocked: a host failed its update to {0}; the table above says which role")]
@@ -445,26 +493,7 @@ pub fn deploy_on(
     clock: &Clock<'_>,
     out: &mut impl Write,
 ) -> Result<(), Error> {
-    if !plan.url.starts_with("https://") || plan.url[8..].contains('/') {
-        return Err(Error::Url(plan.url.clone()));
-    }
-    let agent = |roots: &[CertificateDer<'static>]| -> ureq::Agent {
-        ureq::Agent::config_builder()
-            .https_only(true)
-            .max_redirects(0)
-            .http_status_as_error(false)
-            .timeout_global(Some(CALL_TIMEOUT))
-            .tls_config(fetch::tls_config(roots))
-            .build()
-            .into()
-    };
-    let client = Client {
-        runner: agent(roots.runner),
-        coordinator: agent(roots.coordinator),
-        plan,
-        service,
-        clock,
-    };
+    let client = Client::new(plan, service, roots, clock)?;
     let read_path = plan.convergence_path();
     let first = Read::of(&client.send_retrying(out, READ_BASELINE, &read_path, None, plan)?)?;
     if plan.service == KBF {
@@ -589,7 +618,39 @@ struct Client<'a> {
     clock: &'a Clock<'a>,
 }
 
-impl Client<'_> {
+impl<'a> Client<'a> {
+    /// The client of `plan`: its token from `service`, each side trusted by `roots`.
+    ///
+    /// # Errors
+    /// [`Error::Url`] when the plan's URL is not `https://<host>[:port]` with no path.
+    fn new(
+        plan: &'a Plan,
+        service: &'a TokenService,
+        roots: &Roots<'_>,
+        clock: &'a Clock<'a>,
+    ) -> Result<Self, Error> {
+        if !plan.url.starts_with("https://") || plan.url[8..].contains('/') {
+            return Err(Error::Url(plan.url.clone()));
+        }
+        let agent = |roots: &[CertificateDer<'static>]| -> ureq::Agent {
+            ureq::Agent::config_builder()
+                .https_only(true)
+                .max_redirects(0)
+                .http_status_as_error(false)
+                .timeout_global(Some(CALL_TIMEOUT))
+                .tls_config(fetch::tls_config(roots))
+                .build()
+                .into()
+        };
+        Ok(Self {
+            runner: agent(roots.runner),
+            coordinator: agent(roots.coordinator),
+            plan,
+            service,
+            clock,
+        })
+    }
+
     /// [`Client::send`], tried again (up to `POST_ATTEMPTS` calls) when the failure may pass:
     /// a 503 means the coordinator could not reach the token issuer, which is no verdict.
     fn send_retrying(
@@ -677,6 +738,9 @@ impl Client<'_> {
         let status = response.status().as_u16();
         if matches!(status, 401 | 403) {
             return Err(Error::Refused { what, status });
+        }
+        if status == 409 {
+            return Err(Error::Conflict { what });
         }
         let text = answer_text(&mut response).map_err(call)?;
         if status != 200 {
