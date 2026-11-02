@@ -238,10 +238,11 @@ pub enum Error {
     #[error("blocked: a host failed its update to {0}; the table above says which role")]
     Blocked(String),
     #[error(
-        "halted: {host} reported a failure no version can repair ({check}) while updating to {version}; an operator must clear the halt (`clear_halt` on /v1/operator) before anything is ordered again"
+        "halted: {host} reported a failure no version can repair ({check}) while updating to {target}; this deploy of {version} cannot proceed, and an operator must clear the halt (`clear_halt` on /v1/operator) before anything is ordered again"
     )]
     Halted {
         version: String,
+        target: String,
         host: String,
         check: String,
     },
@@ -737,6 +738,14 @@ fn baseline_line(baseline: &[(String, u64)]) -> String {
     )
 }
 
+/// The host, the check and the target version of a halt; the target is `unknown` when the
+/// coordinator gives none.
+struct Halt {
+    host: String,
+    check: String,
+    target: String,
+}
+
 /// What the coordinator said, as far as the table needs it.
 struct Read {
     state: String,
@@ -745,8 +754,10 @@ struct Read {
     roles: Vec<(String, [u64; 4])>,
     /// The commit the coordinator says it was built from; none from an older build.
     commit: Option<String>,
-    /// The host and the check of the halt the coordinator names, when the state is `halted`.
-    halt: Option<(String, String)>,
+    /// The host, the check and the target version of the halt the coordinator names, when the
+    /// state is `halted`; a halt outlives changes of the desired version, so the target is the
+    /// halt's own.
+    halt: Option<Halt>,
 }
 
 impl Read {
@@ -777,19 +788,28 @@ impl Read {
             halt: answer["halt"]["node_id"]
                 .as_str()
                 .zip(answer["halt"]["check"].as_str())
-                .map(|(host, check)| (plain(host), plain(check))),
+                .map(|(host, check)| Halt {
+                    host: plain(host),
+                    check: plain(check),
+                    target: answer["halt"]["target"]
+                        .as_str()
+                        .map_or_else(|| "unknown".to_owned(), plain),
+                }),
         })
     }
 
-    /// The failure of a deploy whose coordinator says `halted`, naming the host and the check
-    /// when it names them.
+    /// The failure of a deploy whose coordinator says `halted`, naming the host, the check and
+    /// the version the host failed on (the halt's own target, not the deploy's) when it names
+    /// them.
     fn halted(&self, version: &str) -> Error {
-        let (host, check) = self
-            .halt
-            .clone()
-            .unwrap_or_else(|| ("unknown".to_owned(), "unknown".to_owned()));
+        let unknown = || "unknown".to_owned();
+        let (host, check, target) = self.halt.as_ref().map_or_else(
+            || (unknown(), unknown(), unknown()),
+            |h| (h.host.clone(), h.check.clone(), h.target.clone()),
+        );
         Error::Halted {
             version: version.to_owned(),
+            target,
             host,
             check,
         }
