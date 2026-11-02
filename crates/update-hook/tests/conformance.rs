@@ -786,6 +786,14 @@ fn every_violation_says_what_it_found() {
             outcome: Outcome::Success,
             changes: vec![],
         },
+        Violation::RerunReasonChanged {
+            step: steps,
+            first: None,
+            second: Some("r".into()),
+        },
+        Violation::DeclinedRollbackChanged {
+            changes: vec!["c".into()],
+        },
     ];
     for violation in all {
         assert!(!violation.to_string().is_empty());

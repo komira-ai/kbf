@@ -13,8 +13,28 @@
 //! `halt`) and take effect when a step has done its work. `EXAMPLE_OUTSIDE` is the service's own
 //! data directory, which the hook must never write.
 //!
-//! Command line: `update-hook [--irreversible-cutover] [--defect=<name>] <step> [args]`, or the
-//! step first when the first argument is not `update-hook`.
+//! A `--behaviour=<name>` (repeatable) is a behaviour a hook may show for safety and that the
+//! harness accepts only when the test declares it (`conformance::Allowances`), with the
+//! variants that stay refused even then:
+//!
+//! - `forgets-commit`: `rollback` also removes the `stop_begun` tombstone, so a rerun that finds
+//!   no record says `reversible: true` where the first said `false`. `rollback-rerun-fails`:
+//!   such a rerun fails instead.
+//! - `cordon-unowned`: `prepare` records the cordon as its own right after placing it, and a run
+//!   that finds a cordon it has not recorded takes it for an operator's and never lifts it.
+//!   `cordon-recorded-late`: it records the cordon two changes later. `cordon-unowned-noted`:
+//!   as `cordon-unowned`, and it also notes the foreign cordon in the world.
+//! - `first-install-no-rollback`: with no previous release in the params, `rollback` after
+//!   `cutover` fails with `no_previous_release` and changes nothing. `no-rollback-after-cutover`:
+//!   it does so with a previous release too. `first-install-no-rollback-busy`: as the first, with
+//!   the reason `agent_busy`. `first-install-no-rollback-undoes`: as the first, after it took
+//!   `next` away. `first-install-no-rollback-then-busy`: as the first, and every later run
+//!   in the same harness says `agent_busy`. `first-install-no-rollback-once`: every later run
+//!   rolls back. `first-install-no-rollback-rerun-undoes`: every later run takes `next` away
+//!   before it declines.
+//!
+//! Command line: `update-hook [--irreversible-cutover] [--defect=<name>] [--behaviour=<name>]...
+//! <step> [args]`, or the step first when the first argument is not `update-hook`.
 
 use std::ffi::OsString;
 use std::fs::{self, File};
@@ -32,6 +52,7 @@ struct Hook {
     faults: PathBuf,
     irreversible: bool,
     defect: String,
+    behaviours: Vec<String>,
     /// Skip kill points (the whole hook, or just `cutover`).
     ungated: bool,
     /// The params file, to overwrite it for a defect.
@@ -47,6 +68,64 @@ fn var(name: &str) -> PathBuf {
 impl Hook {
     fn defect(&self, name: &str) -> bool {
         self.defect == name
+    }
+
+    fn behaves(&self, name: &str) -> bool {
+        self.behaviours.iter().any(|b| b == name)
+    }
+
+    /// Whether the hook keeps a record of its own cordon, and lifts only that one.
+    fn owns_cordons(&self) -> bool {
+        [
+            "cordon-unowned",
+            "cordon-recorded-late",
+            "cordon-unowned-noted",
+        ]
+        .iter()
+        .any(|name| self.behaves(name))
+    }
+
+    /// Lifts the cordon if it is the hook's own (always, for a hook that keeps no record of it).
+    fn lift_cordon(&self) -> io::Result<()> {
+        if self.owns_cordons() {
+            if self.rec_get("cordon_mine").is_none() {
+                return Ok(());
+            }
+            self.take(&self.world, "cordon")?;
+            return self.take(&self.record, "cordon_mine");
+        }
+        self.take(&self.world, "cordon")
+    }
+
+    /// The reason `rollback` declines to stop what `cutover` started, if it does.
+    fn declines_rollback(&self, params: &Params) -> Option<&'static str> {
+        // Nothing to decline before `cutover`.
+        self.rec_get("cutover")?;
+        let first_install = params.previous_release().is_none();
+        let once = self.behaves("first-install-no-rollback-once");
+        let busy = self.behaves("first-install-no-rollback-then-busy");
+        let undoes = self.behaves("first-install-no-rollback-rerun-undoes");
+        if first_install && (once || busy || undoes) {
+            // Beside the sandboxes, so that it counts across runs and is no change of theirs.
+            let seen = self.faults.join("../../declined");
+            if seen.exists() {
+                if undoes {
+                    let _ = self.take(&self.world, "next");
+                    return Some("no_previous_release");
+                }
+                return busy.then_some("agent_busy");
+            }
+            let _ = fs::write(&seen, "1");
+            return Some("no_previous_release");
+        }
+        if self.behaves("no-rollback-after-cutover")
+            || (first_install
+                && (self.behaves("first-install-no-rollback")
+                    || self.behaves("first-install-no-rollback-undoes")))
+        {
+            return Some("no_previous_release");
+        }
+        (first_install && self.behaves("first-install-no-rollback-busy")).then_some("agent_busy")
     }
 
     /// A kill point, unless the hook is the one that never has any.
@@ -183,10 +262,24 @@ impl Hook {
             Step::Prepare => {
                 let artifact = inv.artifact.clone().unwrap_or_default();
                 let target = fs::read_to_string(artifact.join("VERSION"))?;
+                // A cordon there and not recorded as the hook's own is an operator's.
+                let foreign = self.owns_cordons()
+                    && self.world_has("cordon")
+                    && self.rec_get("cordon_mine").is_none();
                 self.world_set("next", target.trim())?;
                 self.world_set("cordon", "1")?;
+                if foreign && self.behaves("cordon-unowned-noted") {
+                    self.world_set("foreign-cordon", "1")?;
+                }
+                let early = !foreign && !self.behaves("cordon-recorded-late");
+                if self.owns_cordons() && early {
+                    self.rec_set("cordon_mine", "1")?;
+                }
                 self.rec_set("target", target.trim())?;
                 self.rec_set("previous", &self.current())?;
+                if self.behaves("cordon-recorded-late") && !foreign {
+                    self.rec_set("cordon_mine", "1")?;
+                }
                 self.rec_set("prepared", "1")?;
                 if self.defect("writes-outside") {
                     fs::write(self.outside.join("state.json"), "{}")?;
@@ -251,6 +344,19 @@ impl Hook {
                 report.reversible = !self.lost();
             }
             Step::Rollback => {
+                if self.behaves("first-install-no-rollback-undoes") {
+                    self.take(&self.world, "next")?;
+                }
+                if let Some(reason) = self.declines_rollback(&params) {
+                    report.reason = Some(reason.to_owned());
+                    report.reversible = false;
+                    return Ok((Outcome::Failure, report));
+                }
+                if self.behaves("rollback-rerun-fails") && self.rec_get("prepared").is_none() {
+                    report.detail = Some("no record to roll back".to_owned());
+                    return Ok((Outcome::Failure, report));
+                }
+                let lost = self.lost();
                 if self.defect("rollback-diverges") {
                     let resumed = self.world_has("rb-marker") && self.rec_get("previous").is_some();
                     self.world_set("rb-marker", if resumed { "resumed" } else { "fresh" })?;
@@ -260,14 +366,18 @@ impl Hook {
                 }
                 self.take(&self.world, "next")?;
                 if !self.defect("leaves-cordon") && !self.defect("rollback-says-irreversible") {
-                    self.take(&self.world, "cordon")?;
+                    self.lift_cordon()?;
                 }
-                // The tombstone `stop_begun` stays, so that every rollback says the same.
+                // The tombstone `stop_begun` stays, so that every rollback says the same, unless
+                // the hook forgets the commit with the rest of its record.
                 for key in ["prepared", "cutover", "verified", "target", "previous"] {
                     self.take(&self.record, key)?;
                 }
+                if self.behaves("forgets-commit") {
+                    self.take(&self.record, "stop_begun")?;
+                }
                 report.reversible = self.defect("reversible-lie")
-                    || (!self.lost() && !self.defect("rollback-says-irreversible"));
+                    || (!lost && !self.defect("rollback-says-irreversible"));
             }
             Step::Cleanup => {
                 let seen = self.world_has("retired");
@@ -283,7 +393,7 @@ impl Hook {
                 self.world_set("retired", &previous)?;
                 self.take(&self.world, "next")?;
                 if !self.defect("cleanup-leaves-cordon") {
-                    self.take(&self.world, "cordon")?;
+                    self.lift_cordon()?;
                 }
                 report.reversible = self.defect("reversible-flips") && seen;
             }
@@ -304,6 +414,7 @@ fn main() -> ExitCode {
         faults: var("EXAMPLE_FAULTS"),
         irreversible: false,
         defect: String::new(),
+        behaviours: Vec::new(),
         late: false,
         ungated: false,
         params_file: PathBuf::new(),
@@ -313,6 +424,8 @@ fn main() -> ExitCode {
             hook.irreversible = true;
         } else if let Some(name) = flag.strip_prefix("--defect=") {
             hook.defect = name.to_owned();
+        } else if let Some(name) = flag.strip_prefix("--behaviour=") {
+            hook.behaviours.push(name.to_owned());
         } else {
             break;
         }
