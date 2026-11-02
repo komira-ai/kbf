@@ -677,3 +677,43 @@ fn a_version_too_long_to_list_is_left_out_of_its_entry_and_said_so() {
     let (none, all) = cut(kept, 64, 10);
     assert_eq!((none.len(), all), (0, 2));
 }
+
+/// The lock taken without waiting: free, it is taken and the change is made; held by another
+/// writer, the caller is told so at once and the file is not changed; with no directory there
+/// is nothing to hold and the read finds nothing.
+///
+/// Catches: a caller that must not hang left waiting behind a writer that holds the lock; a
+/// change written while another holds it.
+#[test]
+fn a_lock_taken_without_waiting_refuses_while_another_holds_it() {
+    let path = scratch_file("try");
+    let pinned = Retained::try_update(&path, |r| {
+        r.pinned.insert(c(A));
+    })
+    .unwrap();
+    assert_eq!(pinned.pinned.len(), 1);
+    let held = RetainLock::acquire(&path).unwrap();
+    let err = Retained::try_update(&path, |r| {
+        r.pinned.insert(c(C));
+    })
+    .unwrap_err();
+    assert!(
+        matches!(&err, RetainError::Busy { path: p } if *p == path.with_extension("lock")),
+        "{err:?}"
+    );
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "{} is held by another writer",
+            path.with_extension("lock").display()
+        )
+    );
+    drop(held);
+    assert_eq!(
+        Retained::read(&path).unwrap().pinned.len(),
+        1,
+        "nothing changed"
+    );
+    let missing = path.with_file_name("no/such/retain.json");
+    assert!(RetainLock::try_acquire(&missing).unwrap().read().unwrap() == Retained::default());
+}

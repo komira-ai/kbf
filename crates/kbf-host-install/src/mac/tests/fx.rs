@@ -101,6 +101,23 @@ pub fn tarball(members: &[(&str, tar::EntryType, &[u8])]) -> Vec<u8> {
     gzip(&tar)
 }
 
+/// A gzipped tar of `members` (name, type, bytes), each name written into the header as
+/// given, unchecked: an absolute name or one with `..` is written as it is.
+pub fn raw_tarball(members: &[(&[u8], tar::EntryType, &[u8])]) -> Vec<u8> {
+    let mut builder = tar::Builder::new(Vec::new());
+    for (name, kind, bytes) in members {
+        let mut header = tar::Header::new_gnu();
+        header.as_old_mut().name[..name.len()].copy_from_slice(name);
+        header.set_entry_type(*kind);
+        header.set_size(bytes.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        builder.append(&header, *bytes).unwrap();
+    }
+    let tar = builder.into_inner().unwrap();
+    gzip(&tar)
+}
+
 pub fn gzip(bytes: &[u8]) -> Vec<u8> {
     use std::io::Write;
     let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
@@ -421,6 +438,17 @@ impl Sim {
         match args.first().map(String::as_str) {
             Some("print") => {
                 let label = label_of(&args[1]);
+                if label == APPLY_LABEL && self.is_broken("print-apply-fails") {
+                    return exec(5, "", "Bad request.");
+                }
+                if label == APPLY_LABEL && self.is_broken("print-apply-killed") {
+                    return Ok(Exec {
+                        code: None,
+                        signal: Some(9),
+                        stdout: Vec::new(),
+                        stderr: Vec::new(),
+                    });
+                }
                 let mut loaded = self.loaded.borrow().contains(&label);
                 if label == DAEMON_LABEL && !loaded && self.lingering.get() > 0 {
                     self.lingering.set(self.lingering.get() - 1);

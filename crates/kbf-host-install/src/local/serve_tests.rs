@@ -779,3 +779,103 @@ fn the_frontend_config_flag_names_the_file() {
     ]));
     assert!(units.unwrap_err().contains("needs --frontend-container"));
 }
+
+/// `activate` over the socket: one line in and one out, audited as `activate` with the name as
+/// given and the outcome; a name the host does not keep is refused with the listing and audited
+/// as refused; a pin or a lock flag is no part of the socket's request (`bad_command`, nothing
+/// run); with no audit log nothing runs; a client that is gone before its answer still had the
+/// request done, and costs a line in the log.
+///
+/// Catches: an activate over the socket that is not audited, that runs without the audit log,
+/// or that takes the command line's flags from the agent's account.
+#[test]
+fn activate_over_the_socket_is_one_audited_line() {
+    use kbf_retain::{CommitId, Kept};
+    let kept = |c: &str, why: Vec<&'static str>| Kept {
+        commit: CommitId::new(c).unwrap(),
+        version: None,
+        why,
+        version_left_out: false,
+    };
+    let logged = with_serving("sv-activate", |fx, wire| {
+        {
+            let mut world = fx.world.borrow_mut();
+            world.kept = vec![kept(B, vec![]), kept(A, vec!["current"])];
+            world.on_disk.insert(B.to_owned());
+        }
+        assert_eq!(
+            wire.ask("activate kbf=bbbbbbbbbbbb"),
+            json!({"result":"activated","commit":B,"version":null,"from":A,"pinned":false,
+                   "lock_taken":false})
+        );
+        assert_eq!(fx.world.borrow().current.as_deref(), Some(B));
+        assert_eq!(
+            wire.ask("activate kbf=cccccccccccc"),
+            json!({"result":"refused","reason":"not_kept","releases":[
+                {"commit":B,"version":null},{"commit":A,"version":null,"why":["current"]}]})
+        );
+        let calls = fx.calls().len();
+        for line in [
+            "activate kbf=bbbbbbbbbbbb pin",
+            "activate kbf=bbbbbbbbbbbb --pin",
+            "activate kbf=bbbbbbbbbbbb --force-lock",
+        ] {
+            assert_eq!(
+                wire.ask(line),
+                json!({"result":"refused","reason":"bad_command"}),
+                "{line}"
+            );
+        }
+        assert_eq!(fx.calls().len(), calls, "nothing was run");
+        let lines = audit_lines(fx);
+        let fields: Vec<(Value, Value, Value)> = lines[..2]
+            .iter()
+            .map(|l| {
+                (
+                    l["verb"].clone(),
+                    l["version"].clone(),
+                    l["outcome"].clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            fields,
+            [
+                (json!("activate"), json!("bbbbbbbbbbbb"), json!("activated")),
+                (json!("activate"), json!("cccccccccccc"), json!("refused")),
+            ]
+        );
+        assert_eq!(lines[1]["reason"], "not_kept");
+
+        fs::remove_file(fx.dir.join("audit.log")).unwrap();
+        fs::create_dir(fx.dir.join("audit.log")).unwrap();
+        assert_eq!(
+            wire.ask(&format!("activate kbf={A}")),
+            json!({"result":"failed","reason":"audit_unavailable"})
+        );
+        assert_eq!(fx.calls().len(), calls, "nothing was run");
+        fs::remove_dir(fx.dir.join("audit.log")).unwrap();
+
+        let (client, server) = UnixStream::pair().unwrap();
+        (&client)
+            .write_all(format!("activate kbf={A}\n").as_bytes())
+            .unwrap();
+        drop(client);
+        wire.serving.serve_one(server);
+        assert_eq!(
+            fx.world.borrow().current.as_deref(),
+            Some(A),
+            "done all the same"
+        );
+    });
+    assert!(
+        logged.iter().any(|l| l.contains("the client is gone")),
+        "{logged:?}"
+    );
+    assert!(
+        logged
+            .iter()
+            .any(|l| l.contains("activate: not_kept: \"cccccccccccc\" names no release")),
+        "{logged:?}"
+    );
+}

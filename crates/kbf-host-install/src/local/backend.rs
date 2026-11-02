@@ -122,6 +122,21 @@ pub trait Backend {
     /// The host could not be put back; the marker stays, so the next try finds it.
     fn revert(&self, pending: &Pending) -> Result<(), Fault>;
 
+    /// Make the laid-out release `commit` the one that runs, for good: no trial and no
+    /// deadline (a release on trial stops being one), `previous` the release that ran, then
+    /// the service restarted on it. Nothing is fetched, and nothing of the release that ran is
+    /// executed: the links move and the service manager starts the release named.
+    ///
+    /// # Errors
+    /// A refusal when the host cannot do it and nothing changed; [`Code::RestartFailed`] when
+    /// the links moved and the service did not come up on the release, which stays.
+    fn activate(&self, _commit: &str) -> Result<(), Fault> {
+        Err(Fault::refused(
+            Code::NotKept,
+            "this host keeps no release directories to activate",
+        ))
+    }
+
     /// The releases the host holds, newest first, each with what the host knows of its
     /// version and why it must stay. None for a host that keeps no release directories (a
     /// package or a container image is the release there).

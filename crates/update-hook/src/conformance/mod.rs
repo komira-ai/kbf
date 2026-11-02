@@ -35,7 +35,16 @@
 //!
 //! Nothing here waits for a time: the only waiting is for a child to exit or to announce that it
 //! is parked at a kill point.
+//!
+//! **Allowances.** A hook may declare, through [`Conformance::with_allowances`], up to three
+//! behaviours that checks 2 and 5 refuse by default and that a hook may show for safety
+//! ([`Allowances`]): a `rollback` rerun that says `reversible: true` where the first said
+//! `false`; a cordon left to lapse after a crash between placing it and recording it; and, on a
+//! first install, a `rollback` after `cutover` that fails with `no_previous_release`. Each is
+//! accepted only as narrowly as [`Allowances`] says, and a hook that declares none is checked
+//! strictly.
 
+mod allow;
 pub mod gate;
 mod run;
 mod sandbox;
@@ -46,6 +55,7 @@ use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
 
+pub use allow::{Allowances, LapsingCordon, NO_PREVIOUS_RELEASE};
 pub use sandbox::{Entry, Sandbox, Tree, changes, snapshot};
 
 use crate::{
@@ -223,6 +233,14 @@ pub enum Violation {
         first: bool,
         second: bool,
     },
+    #[error("{step} failed with reason {first:?} the first time and {second:?} the second")]
+    RerunReasonChanged {
+        step: Step,
+        first: Option<String>,
+        second: Option<String>,
+    },
+    #[error("rollback declined to roll back a first install but changed things: {changes:?}")]
+    DeclinedRollbackChanged { changes: Vec<String> },
     #[error("{step} ended {outcome:?} when the params held an updater.* key it does not know")]
     RefusedUpdaterKey { step: Step, outcome: Outcome },
     #[error("{step} ran while another held the record lock: {outcome:?}, {changes:?}")]
@@ -265,6 +283,7 @@ pub struct Conformance<'a> {
     base: &'a Path,
     sandboxes: u32,
     first_install: bool,
+    allow: Allowances,
 }
 
 /// Runs every check on `hook` against `fake`, in sandboxes made under `base` (a directory of
@@ -289,7 +308,17 @@ impl<'a> Conformance<'a> {
             base,
             sandboxes: 0,
             first_install: false,
+            allow: Allowances::default(),
         }
+    }
+
+    /// Accepts the behaviours `allow` declares (see [`Allowances`]); without it, none. The
+    /// first-install allowance covers the first-install `rollback` of [`Self::idempotence`]
+    /// only: combined with [`Self::with_first_install`], [`Self::check_all`] still refuses a
+    /// declined rollback in crash-resume and in the sequences.
+    pub fn with_allowances(mut self, allow: Allowances) -> Conformance<'a> {
+        self.allow = allow;
+        self
     }
 
     /// Runs the checks as a first install: the params file has neither previous release nor
@@ -428,6 +457,11 @@ impl<'a> Conformance<'a> {
     /// Runs `step` twice in a row and requires the second to be a no-op. Returns the first.
     fn twice(&self, sandbox: &Sandbox, step: Step) -> Result<Done, Violation> {
         let first = self.exec_ok(sandbox, step)?;
+        self.again(sandbox, step, first)
+    }
+
+    /// Runs `step` again after `first` and requires the same end and no change.
+    fn again(&self, sandbox: &Sandbox, step: Step, first: Done) -> Result<Done, Violation> {
         let before = Self::state(sandbox)?;
         let second = self.exec(sandbox, step)?;
         if second.outcome != first.outcome {
@@ -437,7 +471,12 @@ impl<'a> Conformance<'a> {
                 second: second.outcome,
             });
         }
-        if second.report.reversible != first.report.reversible {
+        if second.report.reversible != first.report.reversible
+            && !(step == Step::Rollback
+                && self
+                    .allow
+                    .rollback_reversible_rise(first.report.reversible, second.report.reversible))
+        {
             return Err(Violation::RerunReversibleChanged {
                 step,
                 first: first.report.reversible,
@@ -503,14 +542,74 @@ impl<'a> Conformance<'a> {
         let start = Self::world(&sandbox)?;
         self.exec_ok(&sandbox, Step::Prepare)?;
         self.exec_ok(&sandbox, Step::Cutover)?;
-        let rolled = self.twice(&sandbox, Step::Rollback)?;
-        self.rolled_back(&sandbox, &start, &rolled.report)?;
+        let cut_over = Self::state(&sandbox)?;
+        let first = self.exec(&sandbox, Step::Rollback)?;
+        if self.declined(&first) {
+            self.declined_twice(&sandbox, &cut_over, &first)?;
+        } else {
+            require(Step::Rollback, Outcome::Success, first.outcome)?;
+            let rolled = self.again(&sandbox, Step::Rollback, first)?;
+            self.rolled_back(&sandbox, &start, &rolled.report)?;
+        }
         // The hook must not finish an update that was rolled back.
         let before = Self::world(&sandbox)?;
         self.exec(&sandbox, Step::Cleanup)?;
         let moved = changes(&before, &Self::world(&sandbox)?);
         if !moved.is_empty() {
             return Err(Violation::CleanupCommitted { changes: moved });
+        }
+        Ok(())
+    }
+
+    /// Whether a `rollback` that ended as `done` declined to roll back a first install
+    /// ([`Allowances::first_install_rollback_may_fail`]).
+    fn declined(&self, done: &Done) -> bool {
+        self.allow
+            .rollback_may_fail(self.first_install, done.outcome, &done.report)
+    }
+
+    /// After a `rollback` that declined (`first`): it changed nothing since `cut_over`, and run
+    /// again it fails the same way, with the same reason and the same `reversible` (which
+    /// decides between `Failed(after_commit)` and `halt` after a failed rollback), and changes
+    /// nothing.
+    fn declined_twice(
+        &self,
+        sandbox: &Sandbox,
+        cut_over: &Tree,
+        first: &Done,
+    ) -> Result<(), Violation> {
+        let moved = changes(cut_over, &Self::state(sandbox)?);
+        if !moved.is_empty() {
+            return Err(Violation::DeclinedRollbackChanged { changes: moved });
+        }
+        let second = self.exec(sandbox, Step::Rollback)?;
+        if second.outcome != first.outcome {
+            return Err(Violation::RerunOutcomeChanged {
+                step: Step::Rollback,
+                first: first.outcome,
+                second: second.outcome,
+            });
+        }
+        if second.report.reason != first.report.reason {
+            return Err(Violation::RerunReasonChanged {
+                step: Step::Rollback,
+                first: first.report.reason.clone(),
+                second: second.report.reason,
+            });
+        }
+        if second.report.reversible != first.report.reversible {
+            return Err(Violation::RerunReversibleChanged {
+                step: Step::Rollback,
+                first: first.report.reversible,
+                second: second.report.reversible,
+            });
+        }
+        let moved = changes(cut_over, &Self::state(sandbox)?);
+        if !moved.is_empty() {
+            return Err(Violation::NotIdempotent {
+                step: Step::Rollback,
+                changes: moved,
+            });
         }
         Ok(())
     }
@@ -547,15 +646,33 @@ impl<'a> Conformance<'a> {
         }
         let (_, (rollback_gates, _)) = points.remove(SUCCESS_PATH.len());
         for (index, (_, (gates, _))) in points.into_iter().enumerate() {
-            for kill_at in 0..=gates {
-                let (before, rest) = SUCCESS_PATH.split_at(index);
-                self.resume(before, rest, kill_at, &want)?;
-            }
+            let (before, rest) = SUCCESS_PATH.split_at(index);
+            self.resume_each(before, rest, gates, &want)?;
         }
-        for kill_at in 0..=rollback_gates {
-            self.resume(&ROLLBACK_PATH, &[Step::Rollback], kill_at, &rollback_want)?;
-        }
+        self.resume_each(
+            &ROLLBACK_PATH,
+            &[Step::Rollback],
+            rollback_gates,
+            &rollback_want,
+        )?;
         Ok(total)
+    }
+
+    /// [`Self::resume`] after the first of `rest` finished, then stopped at each of its `gates`
+    /// kill points in order, each given the state the kill point before it left.
+    fn resume_each(
+        &mut self,
+        before: &[Step],
+        rest: &[Step],
+        gates: u64,
+        want: &Tree,
+    ) -> Result<(), Violation> {
+        self.resume(before, rest, 0, want, None)?;
+        let mut previous = None;
+        for kill_at in 1..=gates {
+            previous = Some(self.resume(before, rest, kill_at, want, previous.as_ref())?);
+        }
+        Ok(())
     }
 
     /// Runs `step`, requires success, and returns its kill points and whether it changed the
@@ -567,28 +684,45 @@ impl<'a> Conformance<'a> {
     }
 
     /// Runs `before`, then the first of `rest` stopped at kill point `kill_at` (or, for `0`, to
-    /// its end), then all of `rest`; the state must be `want`.
+    /// its end), then all of `rest`; the state must be `want`, but for a cordon left to lapse
+    /// when the kill is in its window ([`Allowances::lapsing_cordon`]), judged against
+    /// `previous`, the state the kill point before this one left (`None`: the step's start).
+    /// Returns the state at the kill. The window is judged on which paths exist, since
+    /// `previous` comes from another sandbox.
     fn resume(
         &mut self,
         before: &[Step],
         rest: &[Step],
         kill_at: u64,
         want: &Tree,
-    ) -> Result<(), Violation> {
+        previous: Option<&Tree>,
+    ) -> Result<Tree, Violation> {
         let sandbox = self.fresh()?;
         for step in before {
             self.exec_ok(&sandbox, *step)?;
         }
+        let start = Self::state(&sandbox)?;
         let step = rest[0];
         if kill_at == 0 {
             self.exec_ok(&sandbox, step)?;
         } else if !self.exec_at(&sandbox, step, kill_at)?.parked {
             return Err(Violation::KillPointVanished { step, kill_at });
         }
+        let at_kill = Self::state(&sandbox)?;
         for step in rest {
             self.exec_ok(&sandbox, *step)?;
         }
-        let moved = changes(want, &Self::state(&sandbox)?);
+        let got = Self::state(&sandbox)?;
+        let window = kill_at > 0
+            && self
+                .allow
+                .in_cordon_window(previous.unwrap_or(&start), &at_kill);
+        let moved = if window {
+            let (want, got) = self.allow.without_lapsed(want, &got);
+            changes(&want, &got)
+        } else {
+            changes(want, &got)
+        };
         if !moved.is_empty() {
             return Err(Violation::CrashResumeDiverges {
                 step,
@@ -596,7 +730,7 @@ impl<'a> Conformance<'a> {
                 changes: moved,
             });
         }
-        Ok(())
+        Ok(at_kill)
     }
 
     /// Success, then a failure, a deferral and a halt at each of the four steps, and a few

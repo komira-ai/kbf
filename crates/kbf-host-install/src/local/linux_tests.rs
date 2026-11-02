@@ -67,6 +67,9 @@ impl Backend for Borrowed<'_> {
     fn revert(&self, pending: &super::backend::Pending) -> Result<(), Fault> {
         self.0.revert(pending)
     }
+    fn activate(&self, commit: &str) -> Result<(), Fault> {
+        self.0.activate(commit)
+    }
     fn kept(&self) -> Result<Vec<kbf_installer::retain::Kept>, Fault> {
         self.0.kept()
     }
@@ -838,3 +841,6 @@ mod retain;
 
 #[path = "linux_stage_tests.rs"]
 mod stage;
+
+#[path = "linux_activate_tests.rs"]
+mod activate_verb;

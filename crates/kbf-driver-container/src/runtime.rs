@@ -46,7 +46,7 @@ use prost_types::Timestamp;
 use tokio::sync::oneshot;
 
 use crate::blocking_steps::{self, create_logs, make_cgroup, oom_outcome, read_start};
-use crate::cgroup::{LeaseCgroup, SwapKill, memory_max, presses_into_swap};
+use crate::cgroup::{LeaseCgroup, SwapKill, presses_into_swap};
 use crate::cgroup_usage::{CPU_PSI, NUMA_EVERY, NumaSample, Start};
 use crate::container::{
     CONTAINER_OWNER, ContainerLimits, ContainerSpec, DAEMON_OWNER, Dirs, Ended, LEASE_PREFIX,
@@ -590,9 +590,9 @@ impl<C: Cas> ContainerRuntime<C> {
             .map_err(RuntimeError::Failed)?;
         let stdout_path = lease.dir.join(STDOUT);
         let stderr_path = lease.dir.join(STDERR);
-        let cap = memory_max(work.resources.memory_bytes);
         let swap_kill = self.config.swap_kill;
-        let threshold = swap_kill.threshold(work.resources.memory_bytes);
+        let watch = swap_kill.watch(work.resources.memory_bytes);
+        let cap = watch.map(|w| w.cap());
         let mut started = 0;
         let ended = loop {
             started += 1;
@@ -623,8 +623,8 @@ impl<C: Cas> ContainerRuntime<C> {
                 }
                 // Never ends: it samples while the others are waited for.
                 () = lease.numa.watch(lease.cgroup.dir(), self.config.numa_every) => {}
-                (now, own) = presses_into_swap(&lease.cgroup, cap, threshold, swap_kill.every) => {
-                    let limit = cap.unwrap_or(0);
+                (now, own) = presses_into_swap(&lease.cgroup, watch, swap_kill.every) => {
+                    let (limit, threshold) = watch.map_or((0, 0), |w| (w.cap(), w.threshold()));
                     let why = format!(
                         "at its memory cap of {limit} bytes and still pushing into swap: \
                          {own} of its {} bytes in swap pushed there at its cap (more than \

@@ -6,13 +6,15 @@
 //! | switch | `{"result":"switched","version":V,"commit":C,"deadline_unix":N}` |
 //! | confirm | `{"result":"confirmed","version":V}` |
 //! | revert | `{"result":"reverted","version":V\|null}` |
+//! | activate | `{"result":"activated","commit":C,"version":V\|null,"from":C\|null,"pinned":bool,"lock_taken":bool}` |
 //! | query | `{"result":"query","commit":..,"version":..,"node_id":..,"pending":{..}\|null,"last":{..}\|null,"busy":bool}` |
 //! | no | `{"result":"refused","reason":CODE}` (nothing ran) or `{"result":"failed","reason":CODE}` |
+//! | no, for `activate` | `{"result":"refused","reason":"not_kept"\|"ambiguous_release","releases":[..]}`: the releases the host keeps (`not_kept` also for one whose binary cannot run) |
 //!
 //! A reason is a code from a closed set ([`Code`]), never text taken from the request or from
 //! a child process; the detail goes to the log, cleaned.
 
-use kbf_retain::Kept;
+use kbf_retain::{CommitId, Kept};
 use serde::Serialize;
 
 use crate::outcome::MAX_DETAIL_LEN;
@@ -20,7 +22,7 @@ use crate::outcome::MAX_DETAIL_LEN;
 /// Why a request was refused or failed. The closed set of the socket's reasons.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Code {
-    /// Not one of the five forms.
+    /// Not one of the request forms.
     BadCommand,
     /// A channel the allowlist does not name.
     ChannelNotAllowed,
@@ -61,6 +63,11 @@ pub enum Code {
     PeerNotReady,
     /// The container runtime could not be asked, or did not do what it was asked.
     RuntimeFailed,
+    /// The release an `activate` names is not one the host keeps.
+    NotKept,
+    /// The links moved to the release an `activate` named and a unit did not come up on it;
+    /// the host stays on that release.
+    RestartFailed,
     /// Leases still run on the host, as root counts them: nothing was switched. The host's
     /// moment is wrong, not the release, and the same switch can be asked again later.
     LeasesLive,
@@ -68,7 +75,7 @@ pub enum Code {
 
 impl Code {
     /// Every code.
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 23] = [
         Self::BadCommand,
         Self::ChannelNotAllowed,
         Self::ConfigInvalid,
@@ -89,6 +96,8 @@ impl Code {
         Self::AuditUnavailable,
         Self::PeerNotReady,
         Self::RuntimeFailed,
+        Self::NotKept,
+        Self::RestartFailed,
         Self::LeasesLive,
     ];
 
@@ -120,6 +129,8 @@ impl Code {
             Self::AuditUnavailable => "audit_unavailable",
             Self::PeerNotReady => "peer_not_ready",
             Self::RuntimeFailed => "runtime_failed",
+            Self::NotKept => "not_kept",
+            Self::RestartFailed => "restart_failed",
             Self::LeasesLive => "leases_live",
         }
     }
@@ -192,6 +203,28 @@ pub enum Answer {
         version: Option<String>,
     },
     Queried(QueryView),
+    /// The release an `activate` named runs now, for good.
+    Activated {
+        commit: CommitId,
+        /// Its version text, when this host knows it.
+        version: Option<String>,
+        /// The release that ran before, now `previous` (none on a host that ran none, and the
+        /// same commit when it was already the one that runs).
+        from: Option<CommitId>,
+        /// The host is held on it: the hold file is written and the release is pinned.
+        pinned: bool,
+        /// The install lock was taken from another holder (`--force-lock`).
+        lock_taken: bool,
+    },
+    /// An `activate` named no release the host keeps (`not_kept`), or more than one
+    /// (`ambiguous_release`): refused, nothing ran, and the releases the host keeps are told.
+    Unresolved {
+        code: Code,
+        /// What was asked for and why it names no release to run, for the log.
+        detail: String,
+        releases: Vec<Kept>,
+        releases_omitted: usize,
+    },
     /// Refused, and nothing ran.
     Refused(Code, String),
     /// Failed after something started.
@@ -244,6 +277,25 @@ struct Queried<'a> {
 }
 
 #[derive(Serialize)]
+struct Activated<'a> {
+    result: &'static str,
+    commit: &'a CommitId,
+    version: Option<&'a str>,
+    from: Option<&'a CommitId>,
+    pinned: bool,
+    lock_taken: bool,
+}
+
+#[derive(Serialize)]
+struct Unresolved<'a> {
+    result: &'static str,
+    reason: &'static str,
+    releases: &'a [Kept],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    releases_omitted: Option<usize>,
+}
+
+#[derive(Serialize)]
 struct Reason {
     result: &'static str,
     reason: &'static str,
@@ -293,6 +345,31 @@ impl Answer {
                 releases_omitted: (view.releases_omitted > 0).then_some(view.releases_omitted),
                 releases_unavailable: view.releases_unavailable.then_some(true),
             }),
+            Self::Activated {
+                commit,
+                version,
+                from,
+                pinned,
+                lock_taken,
+            } => to_json(&Activated {
+                result: "activated",
+                commit,
+                version: version.as_deref(),
+                from: from.as_ref(),
+                pinned: *pinned,
+                lock_taken: *lock_taken,
+            }),
+            Self::Unresolved {
+                code,
+                releases,
+                releases_omitted,
+                ..
+            } => to_json(&Unresolved {
+                result: "refused",
+                reason: code.code(),
+                releases,
+                releases_omitted: (*releases_omitted > 0).then_some(*releases_omitted),
+            }),
             Self::Refused(code, _) => to_json(&Reason {
                 result: "refused",
                 reason: code.code(),
@@ -312,7 +389,10 @@ impl Answer {
             Self::Confirmed { .. } => ("confirmed", None),
             Self::Reverted { .. } => ("reverted", None),
             Self::Queried(_) => ("query", None),
-            Self::Refused(code, _) => ("refused", Some(code.code())),
+            Self::Activated { .. } => ("activated", None),
+            Self::Refused(code, _) | Self::Unresolved { code, .. } => {
+                ("refused", Some(code.code()))
+            }
             Self::Failed(code, _) => ("failed", Some(code.code())),
         }
     }
@@ -320,8 +400,11 @@ impl Answer {
     /// The detail of a refusal or a failure, cleaned and cut, for the log; none for an
     /// answer that went well.
     pub fn log_detail(&self) -> Option<String> {
-        let (Self::Refused(_, detail) | Self::Failed(_, detail)) = self else {
-            return None;
+        let detail = match self {
+            Self::Refused(_, detail)
+            | Self::Failed(_, detail)
+            | Self::Unresolved { detail, .. } => detail,
+            _ => return None,
         };
         let mut text = String::new();
         for c in detail.chars() {

@@ -104,3 +104,18 @@ pub fn effective(host: &MacHost, runner: &dyn Runner) -> Option<ApplyState> {
         state => Some(state),
     }
 }
+
+/// The status `launchctl print` exits with when launchd has no such service
+/// (`tests/fixtures/mac/print_missing.code`).
+pub const PRINT_NO_SERVICE: i32 = 113;
+
+/// Whether the apply job may be running, failing closed: it is not only when launchd says it
+/// has no such job (exit [`PRINT_NO_SERVICE`], no signal) or lists it as ended. Any other
+/// status, a signal, or a `launchctl` that cannot be run counts as running.
+pub(crate) fn apply_may_run(host: &MacHost, runner: &dyn Runner) -> bool {
+    match runner.run(&tools::print(APPLY_LABEL, host.tuning.tool)) {
+        Ok(exec) if exec.success() => !tools::print_finished(&exec.stdout_text()),
+        Ok(exec) => exec.signal.is_some() || exec.code != Some(PRINT_NO_SERVICE),
+        Err(_) => true,
+    }
+}
