@@ -7,7 +7,7 @@
 //! `FLOCK` ones; either counts.
 
 use std::fs::{self, OpenOptions};
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Read};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
@@ -29,6 +29,68 @@ pub fn flock_held(lock_file: &Path) -> bool {
     // A shared request conflicts with the exclusive lock an install holds, and the lock it
     // takes is let go with the file at the end of this function.
     !matches!(file.try_lock_shared(), Ok(()))
+}
+
+/// Who holds the install lock, as far as this host can tell: the process id the holder wrote
+/// into the lock file when it took the lock ([`crate::host::take_lock`]), and whether a process
+/// with that id is alive. A holder whose process is gone still holds the lock when a process it
+/// started kept the descriptor; a lock file that names no process was taken by a program that
+/// writes no id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Holder {
+    pub pid: Option<u32>,
+    pub alive: bool,
+}
+
+impl Holder {
+    /// The holder, in words: `pid 812, which is alive`, `pid 812, which is gone`, or `a process
+    /// that wrote no id`.
+    pub fn describe(&self) -> String {
+        match (self.pid, self.alive) {
+            (Some(pid), true) => format!("pid {pid}, which is alive"),
+            (Some(pid), false) => format!("pid {pid}, which is gone"),
+            (None, _) => "a process that wrote no id".to_owned(),
+        }
+    }
+}
+
+/// The most bytes of a lock file that are read for the holder's id.
+const HOLDER_BYTES: u64 = 32;
+
+/// The holder of the lock on `lock_file` (see [`Holder`]); a file that cannot be read, or that
+/// does not hold one process id, names no one.
+pub fn holder(lock_file: &Path) -> Holder {
+    let pid = OpenOptions::new()
+        .read(true)
+        .custom_flags(nofollow())
+        .open(lock_file)
+        .and_then(|file| {
+            let mut text = String::new();
+            file.take(HOLDER_BYTES).read_to_string(&mut text)?;
+            Ok(text)
+        })
+        .ok()
+        .and_then(|text| text.trim_end().parse::<u32>().ok());
+    Holder {
+        pid,
+        alive: pid.is_some_and(alive),
+    }
+}
+
+/// Whether a process with id `pid` exists: a signal 0 is sent to it, which checks without
+/// delivering. One that exists and may not be signalled (another user's) is alive; an id that is
+/// no process's, or is not a process id at all (0, or past the largest), is not.
+pub fn alive(pid: u32) -> bool {
+    let Some(pid) = i32::try_from(pid)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+    else {
+        return false;
+    };
+    !matches!(
+        rustix::process::test_kill_process(pid),
+        Err(rustix::io::Errno::SRCH)
+    )
 }
 
 /// For tests: wait (up to 500 looks, 10 ms apart: 5 s) until nobody holds or shares the

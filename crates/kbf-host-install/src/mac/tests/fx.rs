@@ -421,6 +421,17 @@ impl Sim {
         match args.first().map(String::as_str) {
             Some("print") => {
                 let label = label_of(&args[1]);
+                if label == APPLY_LABEL && self.is_broken("print-apply-fails") {
+                    return exec(5, "", "Bad request.");
+                }
+                if label == APPLY_LABEL && self.is_broken("print-apply-killed") {
+                    return Ok(Exec {
+                        code: None,
+                        signal: Some(9),
+                        stdout: Vec::new(),
+                        stderr: Vec::new(),
+                    });
+                }
                 let mut loaded = self.loaded.borrow().contains(&label);
                 if label == DAEMON_LABEL && !loaded && self.lingering.get() > 0 {
                     self.lingering.set(self.lingering.get() - 1);

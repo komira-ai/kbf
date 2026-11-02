@@ -36,7 +36,7 @@
 //! updated by installing that package ([`super::package`]). A Mac takes none.
 //!
 //! Every request but `query` and `revert` is audited, and is not run when the audit log
-//! cannot be opened. A revert is never held back by it.
+//! cannot be opened (an `activate` with them). A revert is never held back by it.
 
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt, chown};
@@ -393,6 +393,7 @@ impl<B: Backend> Serving<'_, B> {
             Some(LocalRequest::Switch { version } | LocalRequest::Confirm { version, .. }) => {
                 (Some(version.as_str().to_owned()), None)
             }
+            Some(LocalRequest::Activate { target }) => (Some(target.as_str().to_owned()), None),
             _ => (None, None),
         };
         let entry = audit::Entry {
