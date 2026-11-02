@@ -41,7 +41,7 @@ use update_hook::{Class, Outcome};
 use super::flags::Flags;
 use super::steps::Done;
 use super::{HookWorld, Setup, run};
-use crate::agent::local::{HostState, Local, LocalError, Staged, Trial};
+use crate::agent::local::{Activated, HostState, Local, LocalError, Staged, Trial};
 use crate::inventory::{Host, Role};
 use crate::ports::{Clock, Drain, Health, HealthCheck, Placed, PortError};
 use crate::version::Version;
@@ -135,6 +135,7 @@ impl Local for FakeLocal {
             }),
             last: None,
             busy: false,
+            releases: None,
         })
     }
 
@@ -187,6 +188,10 @@ impl Local for FakeLocal {
                 pending: false,
             })
             .map_err(|e| failed("revert", e))
+    }
+
+    fn activate(&self, _version: &Version, _commit: Option<&str>) -> Result<Activated, LocalError> {
+        Err(LocalError::Refused("bad_command".to_owned()))
     }
 }
 

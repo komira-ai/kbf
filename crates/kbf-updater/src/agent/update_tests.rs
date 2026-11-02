@@ -8,7 +8,7 @@ use super::local::{LocalError, Trial};
 use super::status::{Shared, Status};
 use super::testing::{
     COMMIT_A, COMMIT_B, Events, FakeDrain, FakeHealth, FakeLocal, ManualClock, VA, VB, host,
-    version,
+    update_result, version,
 };
 use super::update::{Ports, Update};
 use crate::inventory::Role;
@@ -99,11 +99,11 @@ impl Rig {
 }
 
 fn succeeded(target: &str) -> UpdateResult {
-    UpdateResult::new(version(target), Outcome::Succeeded)
+    update_result(version(target), Outcome::Succeeded, NOW)
 }
 
 fn failed(target: &str) -> UpdateResult {
-    UpdateResult::new(version(target), Outcome::Failed)
+    update_result(version(target), Outcome::Failed, NOW)
 }
 
 /// "Update to X" runs fetch and verify, drain, switch, health, confirm and undrain, in that

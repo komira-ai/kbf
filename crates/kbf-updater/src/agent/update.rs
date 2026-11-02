@@ -68,7 +68,7 @@ pub struct Update<'a> {
     pub status: &'a Shared,
 }
 
-fn result(target: &Version, outcome: Outcome) -> UpdateResult {
+pub(super) fn result(target: &Version, outcome: Outcome) -> UpdateResult {
     UpdateResult::new(target.clone(), outcome)
 }
 
@@ -79,11 +79,18 @@ fn result(target: &Version, outcome: Outcome) -> UpdateResult {
 pub struct Done {
     pub result: UpdateResult,
     pub hold: Option<Hold>,
+    /// The commit a force made the one that runs, so the agent can say the target for it while
+    /// the helper keeps another label (or none) for that commit.
+    pub(super) activated: Option<String>,
 }
 
 impl From<UpdateResult> for Done {
     fn from(result: UpdateResult) -> Self {
-        Self { result, hold: None }
+        Self {
+            result,
+            hold: None,
+            activated: None,
+        }
     }
 }
 
@@ -99,8 +106,28 @@ enum DrainError {
 }
 
 impl Update<'_> {
-    fn log(&self, line: &str) {
+    pub(super) fn log(&self, line: &str) {
         (self.ports.log)(line);
+    }
+
+    /// An update that ended without a verdict on the release: logged, and a failed result.
+    pub(super) fn fail(&self, target: &Version, why: &dyn std::fmt::Display) -> Done {
+        self.log(&format!("update to {target}: {why}"));
+        Done::from(result(target, Outcome::Failed))
+    }
+
+    /// Step 2: the node drained and empty, and whether it was in placement before; or the
+    /// ending of the update when it could not be.
+    pub(super) fn drained(&self, target: &Version) -> Result<Placed, Box<Done>> {
+        self.drain().map_err(|e| {
+            let mut done = self.fail(target, &format!("the node could not be drained: {e}"));
+            // Leases that run past the operator's bound are the host's moment, not the
+            // release: nothing was switched.
+            done.hold = matches!(e, DrainError::Bound(_))
+                .then(|| deferred(DRAIN_BOUND))
+                .flatten();
+            Box::new(done)
+        })
     }
 
     /// Run the update to `target`, or finish the one the helper is in the middle of, as an
@@ -113,8 +140,23 @@ impl Update<'_> {
     /// deferred update is not a result: the status keeps the last result it had, and the
     /// caller gets the [`Hold`]. A halt is a failed result of phase `halt`.
     pub fn run_for(&self, target: &Version, features: Features) -> Done {
+        self.finish(target, features, |target, _| self.run_inner(target))
+    }
+
+    /// The status around an update, whichever way `run` does it: `updating` is the target
+    /// while it runs, and the result is the last update unless the update was deferred.
+    pub(super) fn finish(
+        &self,
+        target: &Version,
+        features: Features,
+        run: impl FnOnce(&Version, u64) -> Done,
+    ) -> Done {
+        // This attempt began now, whatever the target's earlier attempts were: a trial resumed
+        // after a restart is an attempt that begins at the resume.
+        let started = (self.ports.unix_now)();
         self.status.update(|s| s.updating = Some(target.clone()));
-        let mut done = self.run_inner(target);
+        let mut done = run(target, started);
+        done.result.started_unix = Some(started);
         done.hold = done.hold.filter(|hold| match hold {
             Hold::Deferred { .. } => features.deferred,
             Hold::Halt { .. } => features.halt,
@@ -134,10 +176,7 @@ impl Update<'_> {
     }
 
     fn run_inner(&self, target: &Version) -> Done {
-        let failed = |why: &dyn std::fmt::Display| {
-            self.log(&format!("update to {target}: {why}"));
-            Done::from(result(target, Outcome::Failed))
-        };
+        let failed = |why: &dyn std::fmt::Display| self.fail(target, why);
         if let Some(why) = self.ports.health.refusal(self.host) {
             return failed(&why);
         }
@@ -162,17 +201,9 @@ impl Update<'_> {
             return result(target, Outcome::Succeeded).into();
         }
         // 2. Drain.
-        let placed = match self.drain() {
+        let placed = match self.drained(target) {
             Ok(placed) => placed,
-            Err(e) => {
-                let mut done = failed(&format!("the node could not be drained: {e}"));
-                // Leases that run past the operator's bound are the host's moment, not the
-                // release: nothing was switched.
-                done.hold = matches!(e, DrainError::Bound(_))
-                    .then(|| deferred(DRAIN_BOUND))
-                    .flatten();
-                return done;
-            }
+            Err(done) => return *done,
         };
         // 3. Switch.
         let deadline = match self.ports.local.switch(target) {
@@ -238,7 +269,7 @@ impl Update<'_> {
 
     /// Give the node back, unless it was out of placement before the roll: that one is left
     /// as it was found, and the log says so.
-    fn give_back(&self, placed: Placed) -> Result<(), PortError> {
+    pub(super) fn give_back(&self, placed: Placed) -> Result<(), PortError> {
         match placed {
             Placed::In => self.ports.drain.undrain(self.host),
             Placed::Out => {
@@ -249,7 +280,7 @@ impl Update<'_> {
     }
 
     /// B is confirmed: the node goes back into placement, if it was in it.
-    fn keep(&self, target: &Version, placed: Placed) -> Done {
+    pub(super) fn keep(&self, target: &Version, placed: Placed) -> Done {
         match self.give_back(placed) {
             Ok(()) => result(target, Outcome::Succeeded).into(),
             Err(e) => {
@@ -264,7 +295,7 @@ impl Update<'_> {
 
     /// B did not work: the helper puts A back, and the node is given back only if A is
     /// healthy.
-    fn back_on_a(&self, target: &Version, placed: Placed) -> Done {
+    pub(super) fn back_on_a(&self, target: &Version, placed: Placed) -> Done {
         let revert_failed = match self.ports.local.revert() {
             Ok(()) => false,
             // Nothing on trial: the helper went back by itself, or the switch never held.
@@ -352,7 +383,7 @@ impl Update<'_> {
 
     /// The node's health for `target`, held drained, until it is healthy, abandoned, or
     /// `bound` is out.
-    fn wait_healthy(&self, target: &Version, bound: Duration) -> Health {
+    pub(super) fn wait_healthy(&self, target: &Version, bound: Duration) -> Health {
         wait_healthy(
             self.ports.health,
             self.ports.clock,

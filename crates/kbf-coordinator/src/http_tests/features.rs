@@ -183,7 +183,8 @@ async fn a_heartbeat_with_every_new_fact_is_accepted_and_ordered_as_without_them
 /// handled, and a name is added in the change that handles it. For each advertised name that
 /// a heartbeat can use, the heartbeat that uses it is answered differently from the same
 /// heartbeat without it; `heartbeat-v2` is not seen in a reply, so its proof is the
-/// membership one. The table of what uses a name has no entry for a name that is not
+/// membership one, and `forced-v1` is used by a force, not by a heartbeat, so its proof is
+/// the force one. The table of what uses a name has no entry for a name that is not
 /// advertised.
 #[tokio::test]
 async fn advertised_features_equal_the_handled_set() {
@@ -209,6 +210,8 @@ async fn advertised_features_equal_the_handled_set() {
             let with_it = beat("1.0", &format!("{announce}{extra}"));
             let with = beat_text(&rig, "d2", "daemon", &with_it).await;
             assert_ne!(with, without, "{name} changes nothing");
+        } else if *name == "forced-v1" {
+            crate::force_http_tests::forced_v1_is_acted_on().await;
         } else {
             assert_eq!(*name, "heartbeat-v2");
             crate::membership_tests::heartbeat_v2_is_acted_on().await;
@@ -217,6 +220,7 @@ async fn advertised_features_equal_the_handled_set() {
     }
     let mut handled: Vec<&str> = uses.keys().copied().collect();
     handled.push("heartbeat-v2");
+    handled.push("forced-v1");
     handled.sort_unstable();
     proven.sort_unstable();
     assert_eq!(proven, handled);

@@ -9,10 +9,12 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use kbf_host_install::contract::local::{Answer, Code, LastView, PendingView, QueryView};
+use kbf_retain::{CommitId, Kept as HelperKept};
 use kbf_testkit::dir::TestDir;
 
 use super::local::{
-    Ended, HostState, Limits, Local, LocalError, LocalInstaller, SocketLocal, Trial,
+    Activated, Ended, HostState, Kept, Limits, Local, LocalError, LocalInstaller, SocketLocal,
+    Trial,
 };
 use super::testing::{COMMIT_A, COMMIT_B, Events, FakeLocal, VA, VB, host, version};
 use crate::inventory::Role;
@@ -208,6 +210,7 @@ fn the_helpers_real_answers_are_read() {
                 reason: Some("timeout".into())
             }),
             busy: true,
+            releases: None,
         }
     );
 
@@ -546,4 +549,281 @@ fn a_full_listing_of_long_versions_is_read_within_the_answer_limit() {
     let state = SocketLocal::new(&socket, limits()).query().unwrap();
     assert_eq!(state.commit.as_deref(), Some(COMMIT_A));
     assert_eq!(state.version, Some(version(VA)));
+}
+
+fn commit(text: &str) -> CommitId {
+    CommitId::new(text).unwrap()
+}
+
+fn helper_kept(commit_text: &str, version: Option<&str>) -> HelperKept {
+    HelperKept {
+        commit: commit(commit_text),
+        version: version.map(str::to_owned),
+        why: Vec::new(),
+        version_left_out: false,
+    }
+}
+
+fn query_view(releases: Vec<HelperKept>, unavailable: bool) -> QueryView {
+    QueryView {
+        commit: Some(COMMIT_A.into()),
+        version: Some(VA.into()),
+        node_id: None,
+        pending: None,
+        last: None,
+        busy: false,
+        releases,
+        releases_omitted: 0,
+        releases_unavailable: unavailable,
+    }
+}
+
+/// Catches: an activation written as anything but `activate kbf=<version>`, or an `activated`
+/// answer of the helper's own type that is not read: the release it names, its version when it
+/// knows one, and the release that ran before.
+#[test]
+fn an_activation_is_asked_by_version_and_the_activated_answer_is_read() {
+    let d = dir("lc-activate");
+    let (socket, asked) = serve(&d, 1, |_| {
+        line(&Answer::Activated {
+            commit: commit(COMMIT_B),
+            version: Some(VB.into()),
+            from: Some(commit(COMMIT_A)),
+            pinned: true,
+            lock_taken: false,
+        })
+    });
+    let helper = SocketLocal::new(&socket, limits());
+    assert_eq!(
+        helper.activate(&version(VB), None),
+        Ok(Activated {
+            commit: COMMIT_B.into(),
+            version: Some(version(VB)),
+            from: Some(COMMIT_A.into()),
+        })
+    );
+    assert_eq!(
+        asked.join().unwrap(),
+        ["activate kbf=0.1.7+gbbbbbbbbbbbb-3"]
+    );
+
+    let d = dir("lc-activate-no-version");
+    let (socket, _) = serve(&d, 1, |_| {
+        line(&Answer::Activated {
+            commit: commit(COMMIT_B),
+            version: None,
+            from: None,
+            pinned: false,
+            lock_taken: false,
+        })
+    });
+    assert_eq!(
+        SocketLocal::new(&socket, limits()).activate(&version(VB), None),
+        Ok(Activated {
+            commit: COMMIT_B.into(),
+            version: None,
+            from: None,
+        })
+    );
+}
+
+/// Catches: an activation of another release taken as the one asked for, an answer with no
+/// commit, or a version that is not one: each is a protocol error, not a guess.
+#[test]
+fn an_activation_that_does_not_fit_the_request_is_a_protocol_error() {
+    for (name, text) in [
+        (
+            "another version",
+            r#"{"result":"activated","commit":"b","version":"0.1.9+gdddddddddddd-5","from":null,"pinned":true,"lock_taken":false}"#,
+        ),
+        (
+            "no commit",
+            r#"{"result":"activated","version":"0.1.7+gbbbbbbbbbbbb-3"}"#,
+        ),
+        (
+            "a version that is not one",
+            r#"{"result":"activated","commit":"b","version":"/etc/passwd"}"#,
+        ),
+        ("another result", r#"{"result":"confirmed","version":"1"}"#),
+    ] {
+        let d = dir("lc-activate-protocol");
+        let text = format!("{text}\n");
+        let (socket, _) = serve(&d, 1, move |_| Some(text.clone()));
+        let err = SocketLocal::new(&socket, limits())
+            .activate(&version(VB), None)
+            .unwrap_err();
+        assert!(matches!(err, LocalError::Protocol(_)), "{name}: {err:?}");
+    }
+}
+
+/// Catches: a refusal of an activation read as anything but the closed code the helper gave:
+/// `bad_command` from a helper that predates the request (the agent falls back on it),
+/// `not_kept` with the list of what it keeps, and a failure after the restart began.
+#[test]
+fn an_activation_refused_or_failed_comes_back_as_its_code() {
+    let cases = [
+        (
+            Answer::Refused(Code::BadCommand, "no such verb".into()),
+            LocalError::Refused("bad_command".into()),
+        ),
+        (
+            Answer::Unresolved {
+                code: Code::NotKept,
+                detail: "not kept".into(),
+                releases: vec![helper_kept(COMMIT_A, Some(VA))],
+                releases_omitted: 0,
+            },
+            LocalError::Refused("not_kept".into()),
+        ),
+        (
+            Answer::Failed(Code::RestartFailed, "unit".into()),
+            LocalError::Failed("restart_failed".into()),
+        ),
+    ];
+    for (answer, expected) in cases {
+        let d = dir("lc-activate-refused");
+        let (socket, _) = serve(&d, 1, move |_| line(&answer));
+        assert_eq!(
+            SocketLocal::new(&socket, limits()).activate(&version(VB), None),
+            Err(expected)
+        );
+    }
+}
+
+/// Catches: a query that loses the releases the host keeps, or invents some: with a list the
+/// state has the releases (a version that is not one leaves the release known by its commit),
+/// and with no list, or one the helper says it could not read, it has none.
+#[test]
+fn a_query_carries_the_kept_releases_when_the_helper_lists_them() {
+    let list = vec![
+        helper_kept(COMMIT_B, Some(VB)),
+        helper_kept(COMMIT_A, Some("not a version")),
+    ];
+    let d = dir("lc-releases");
+    let (socket, _) = serve(&d, 1, move |_| {
+        line(&Answer::Queried(query_view(list.clone(), false)))
+    });
+    assert_eq!(
+        SocketLocal::new(&socket, limits())
+            .query()
+            .unwrap()
+            .releases,
+        Some(vec![
+            Kept {
+                commit: COMMIT_B.into(),
+                version: Some(version(VB)),
+            },
+            Kept {
+                commit: COMMIT_A.into(),
+                version: None,
+            },
+        ])
+    );
+
+    for (name, view) in [
+        ("an older helper", query_view(Vec::new(), false)),
+        (
+            "unavailable",
+            query_view(vec![helper_kept(COMMIT_A, Some(VA))], true),
+        ),
+    ] {
+        let d = dir("lc-no-releases");
+        let (socket, _) = serve(&d, 1, move |_| line(&Answer::Queried(view.clone())));
+        assert_eq!(
+            SocketLocal::new(&socket, limits())
+                .query()
+                .unwrap()
+                .releases,
+            None,
+            "{name}"
+        );
+    }
+}
+
+/// Catches: a kept release matched on less than its version or the commit its version names: a
+/// version with no commit in it (`2.0`) names none, and a list that is not there keeps nothing.
+/// The commit comes back, for the activation to hold the helper's answer to.
+#[test]
+fn a_state_keeps_a_release_by_its_version_or_the_commit_its_version_names() {
+    let mut state = FakeLocal::new(&Events::default()).world().state.clone();
+    assert_eq!(state.kept_commit(&version(VB)), None, "no list");
+    state.releases = Some(vec![
+        Kept {
+            commit: COMMIT_B.into(),
+            version: None,
+        },
+        Kept {
+            commit: COMMIT_A.into(),
+            version: Some(version("2.0")),
+        },
+    ]);
+    assert_eq!(state.kept_commit(&version(VB)), Some(COMMIT_B));
+    assert_eq!(state.kept_commit(&version("2.0")), Some(COMMIT_A));
+    assert_eq!(state.kept_commit(&version("3.0")), None);
+    assert_eq!(
+        state.kept_commit(&version("0.1.9+gdddddddddddd-5")),
+        None,
+        "another commit"
+    );
+}
+
+/// Catches: a host that runs the target under another label, or none, taken for one that does
+/// not: it runs the release when the version text is the target's or the commit is the one the
+/// target's version names.
+#[test]
+fn the_release_that_runs_is_the_target_by_its_version_or_its_commit() {
+    let mut state = FakeLocal::new(&Events::default()).world().state.clone();
+    assert!(!state.runs(&version(VB)));
+    state.version = None;
+    state.commit = Some(COMMIT_B.into());
+    assert!(state.runs(&version(VB)), "by the commit, with no label");
+    state.version = Some(version("9.9"));
+    assert!(
+        state.runs(&version(VB)),
+        "by the commit, under another label"
+    );
+    assert!(state.runs(&version("9.9")), "by the label");
+    assert!(!state.runs(&version("8.8")), "a label with no commit in it");
+    assert!(!state.runs(&version(VA)), "another commit");
+    state.commit = None;
+    assert!(!state.runs(&version(VB)), "no commit");
+}
+
+/// Catches: an activation judged by the version label the helper keeps rather than by the
+/// commit: an answer naming the commit asked for is the release whatever its label (another, or
+/// none), and one naming another commit is not, with a label or without; with no commit to hold
+/// it to (a version such as `2.0` names none) the label is all there is, and it must be the one
+/// asked for.
+#[test]
+fn an_activation_is_judged_by_its_commit_and_not_by_the_label_the_helper_keeps() {
+    let answer = |commit_text: &str, label: Option<&str>| Answer::Activated {
+        commit: commit(commit_text),
+        version: label.map(str::to_owned),
+        from: None,
+        pinned: false,
+        lock_taken: false,
+    };
+    let other_commit = "cccccccccccccccccccccccccccccccccccccccc";
+    let cases = [
+        // (the version asked, the commit expected, the answer, whether it is taken)
+        (VB, Some(COMMIT_B), answer(COMMIT_B, Some("9.9")), true),
+        (VB, Some(COMMIT_B), answer(COMMIT_B, None), true),
+        (VB, Some(COMMIT_B), answer(other_commit, None), false),
+        (VB, Some(COMMIT_B), answer(other_commit, Some(VB)), false),
+        (VB, None, answer(COMMIT_B, Some("9.9")), true),
+        (VB, None, answer(other_commit, None), false),
+        ("2.0", None, answer(COMMIT_B, Some("2.0")), true),
+        ("2.0", None, answer(COMMIT_B, Some("3.0")), false),
+        ("2.0", None, answer(COMMIT_B, None), false),
+        ("2.0", Some(COMMIT_B), answer(COMMIT_B, Some("3.0")), true),
+    ];
+    for (asked, expected, answer, taken) in cases {
+        let d = dir("lc-activate-commit");
+        let (socket, _) = serve(&d, 1, move |_| line(&answer));
+        let got = SocketLocal::new(&socket, limits()).activate(&version(asked), expected);
+        assert_eq!(got.is_ok(), taken, "{asked} {expected:?}: {got:?}");
+        if !taken {
+            assert!(matches!(got, Err(LocalError::Protocol(_))), "{got:?}");
+        }
+    }
 }

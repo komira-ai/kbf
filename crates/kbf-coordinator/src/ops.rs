@@ -190,6 +190,35 @@ pub struct ServiceOps {
     /// that is acked, whole, does not count towards an automatic rollback.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failure_acked: Vec<FailureAck>,
+    /// The operator's force that stands, if any ([`crate::force`]). It is in force while the
+    /// desired version is its version; the next ordinary desired state ends it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub force: Option<Force>,
+    /// How many forces an operator has made of the service: the generation of the next one is
+    /// one more. Written only once it is not zero.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub force_generation: u64,
+    /// The versions of `bad` that a force left: CI's desired state does not lift their mark,
+    /// only an operator's `unmark_bad` does.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bad_by_force: Vec<Version>,
+}
+
+/// An operator's force of a service to a version, past every health gate ([`crate::force`]).
+/// It is kept in the halts file ([`crate::ops_file`]), whose reader skips a key it does not
+/// know, so a later release may add one.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Force {
+    /// The version forced.
+    pub version: Version,
+    /// Which force of the service it is: one more than the one before.
+    pub generation: u64,
+    /// Why, in the operator's words.
+    pub reason: String,
+    /// The number of hosts of each role that may update at once while it stands, as the
+    /// request raised it; a role it does not name keeps the service's own.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub max_updating: BTreeMap<String, u32>,
 }
 
 /// One change, as the ring and the log say it.
@@ -200,8 +229,9 @@ pub struct AuditEntry {
     pub seq: u64,
     /// Who made it.
     pub by: String,
-    /// What it was (`exclude`, `include`, `set_labels`, `clear_halt`, `halt`; the
-    /// coordinator's own: `last_good`, `clear_last_good`, `mark_bad`; CI's: `unmark_bad`).
+    /// What it was (`exclude`, `include`, `set_labels`, `clear_halt`, `force`, `unmark_bad`,
+    /// `mark_bad`; the coordinator's own: `halt`, `last_good`, `clear_last_good`, `mark_bad`;
+    /// CI's: `unmark_bad`, `force_ended`).
     pub action: String,
     /// The service it concerned, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -477,28 +507,47 @@ impl OpsStore {
         write: Write,
         edit: impl FnOnce(&mut OpsState) -> Result<AuditEntry, E>,
     ) -> Result<AuditEntry, E> {
+        self.decide_changes(write, |state| edit(state).map(|entry| (entry, Vec::new())))
+    }
+
+    /// [`Self::decide_change`] for a change of several parts, each audited: the edit answers
+    /// the change's own entry and the entries of its other parts, which are numbered after it
+    /// in their order. The parts reach the file and memory as one change, so none of them is
+    /// made without the others. Answers the change's own entry, as numbered.
+    ///
+    /// # Errors
+    /// The edit's own error, or [`OpsError`] as for [`Self::change`].
+    pub(crate) fn decide_changes<E: From<OpsError>>(
+        &self,
+        write: Write,
+        edit: impl FnOnce(&mut OpsState) -> Result<(AuditEntry, Vec<AuditEntry>), E>,
+    ) -> Result<AuditEntry, E> {
         let _writer = self.writing.lock().unwrap_or_else(PoisonError::into_inner);
         #[cfg(test)]
         self.interleaved();
         let mut next = self.state();
-        let mut entry = edit(&mut next)?;
-        entry.seq = next.audit.last().map_or(1, |last| last.seq + 1);
-        next.audit.push(entry.clone());
+        let (head, parts) = edit(&mut next)?;
+        let mut entries = vec![head];
+        entries.extend(parts);
+        for entry in &mut entries {
+            entry.seq = next.audit.last().map_or(1, |last| last.seq + 1);
+            next.audit.push(entry.clone());
+        }
         let surplus = next.audit.len().saturating_sub(AUDIT_RING);
         next.audit.drain(..surplus);
         match write {
             Write::AfterMemory => {
                 *self.lock() = next.clone();
-                announce(&entry);
+                entries.iter().for_each(announce);
                 (self.write)(&next)?;
             }
             Write::BeforeMemory => {
                 (self.write)(&next)?;
                 *self.lock() = next;
-                announce(&entry);
+                entries.iter().for_each(announce);
             }
         }
-        Ok(entry)
+        Ok(entries.swap_remove(0))
     }
 }
 
@@ -541,7 +590,7 @@ fn announce(entry: &AuditEntry) {
 /// An operator action: `{"action": "<name>", ...}`, the name from a closed set.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
-enum Action {
+pub(crate) enum Action {
     /// Takes a host out of a service: its beats are not counted and it is not ordered.
     Exclude {
         service: String,
@@ -559,36 +608,56 @@ enum Action {
     /// Lifts the halt of a service: orders resume, and the report that raised it is not
     /// raised again.
     ClearHalt { service: String, reason: String },
+    /// Rolls a service to a version past every health gate ([`crate::force`]).
+    Force {
+        service: String,
+        version: Version,
+        reason: String,
+        /// Per role, how many hosts may update at once while the force stands.
+        #[serde(default, deserialize_with = "limits_once")]
+        max_updating: BTreeMap<String, u32>,
+    },
+    /// Lifts the mark that a version is bad, a force's mark too ([`crate::force`]).
+    UnmarkBad {
+        service: String,
+        version: Version,
+        reason: String,
+    },
 }
 
 /// A map of labels in which no key is given twice.
 fn labels_once<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<BTreeMap<String, String>, D::Error> {
-    struct Once;
+    deserializer.deserialize_map(Once::<String>(std::marker::PhantomData))
+}
 
-    impl<'de> serde::de::Visitor<'de> for Once {
-        type Value = BTreeMap<String, String>;
+/// A map of limits in which no role is given twice.
+fn limits_once<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<String, u32>, D::Error> {
+    deserializer.deserialize_map(Once::<u32>(std::marker::PhantomData))
+}
 
-        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("an object of labels")
-        }
+/// A map of text keys to `V` in which no key is given twice.
+struct Once<V>(std::marker::PhantomData<V>);
 
-        fn visit_map<A: serde::de::MapAccess<'de>>(
-            self,
-            mut map: A,
-        ) -> Result<Self::Value, A::Error> {
-            let mut labels = BTreeMap::new();
-            while let Some((key, value)) = map.next_entry::<String, String>()? {
-                if labels.insert(key, value).is_some() {
-                    return Err(serde::de::Error::custom("a label key is given twice"));
-                }
-            }
-            Ok(labels)
-        }
+impl<'de, V: Deserialize<'de>> serde::de::Visitor<'de> for Once<V> {
+    type Value = BTreeMap<String, V>;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("an object with no key given twice")
     }
 
-    deserializer.deserialize_map(Once)
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let mut entries = BTreeMap::new();
+        while let Some((key, value)) = map.next_entry::<String, V>()? {
+            if entries.insert(key, value).is_some() {
+                return Err(serde::de::Error::custom("a key is given twice"));
+            }
+        }
+        Ok(entries)
+    }
 }
 
 /// Why an operator action was not done.
@@ -614,15 +683,32 @@ pub enum OperateError {
     /// The ops file could not be written.
     #[error(transparent)]
     Store(#[from] OpsError),
+    /// A force names a version older than the service's `min_version`, the first release with
+    /// the host-updates hook: such a release is put on a host by its first install, by hand.
+    #[error(
+        "{version} is older than {floor}, the service's min_version: the first release with the \
+         host-updates hook. A force does not go below it; install the older release on each host \
+         by hand (docs/deploy/kbf-updater.md, \"Below min_version\")"
+    )]
+    BelowMinVersion {
+        /// The version asked for.
+        version: Version,
+        /// The service's `min_version`.
+        floor: Version,
+    },
+    /// The desired state of a force could not be written: the ops file holds the force's
+    /// marks, and the force is asked again.
+    #[error("the desired state could not be written: {0}")]
+    Desired(#[from] crate::desired::StoreError),
 }
 
-fn node(text: &str) -> Result<String, OperateError> {
+pub(crate) fn node(text: &str) -> Result<String, OperateError> {
     text.parse::<NodeId>()
         .map(|id| id.to_string())
         .map_err(|_| OperateError::Invalid("node_id is not a node id"))
 }
 
-fn service<'a>(services: &Services, name: &'a str) -> Result<&'a str, OperateError> {
+pub(crate) fn service<'a>(services: &Services, name: &'a str) -> Result<&'a str, OperateError> {
     services
         .get(name)
         .map(|_| name)
@@ -631,7 +717,7 @@ fn service<'a>(services: &Services, name: &'a str) -> Result<&'a str, OperateErr
         ))
 }
 
-fn reason(text: &str) -> Result<String, OperateError> {
+pub(crate) fn reason(text: &str) -> Result<String, OperateError> {
     let text = text.trim();
     if text.is_empty() || text.len() > MAX_REASON_BYTES || text.chars().any(char::is_control) {
         return Err(OperateError::Invalid(
@@ -648,20 +734,39 @@ pub(crate) fn label(text: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
 }
 
-/// Does the operator action in `body`, as `by`, in `store`. The caller has already checked
-/// who `by` is; the body is validated here before anything changes.
+/// The operator action in `body`.
+///
+/// # Errors
+/// [`OperateError::Invalid`]: the body is no action.
+pub(crate) fn parse_action(body: &[u8]) -> Result<Action, OperateError> {
+    serde_json::from_slice(body)
+        .map_err(|_| OperateError::Invalid("the body is not an operator action"))
+}
+
+/// Does the operator action in `body`, as `by`, in `store`, for an action the ops store makes
+/// alone (a force and an unmark need the coordinator: [`crate::force`]). The caller has
+/// already checked who `by` is; the body is validated here before anything changes.
 ///
 /// # Errors
 /// [`OperateError::Invalid`]: the body is no action, or names an unknown service, a bad node
-/// id, a bad reason or bad labels. [`OperateError::Store`]: the file could not be written.
+/// id, a bad reason or bad labels, or is an action the ops store does not make alone.
+/// [`OperateError::Store`]: the file could not be written.
 pub fn operate(
     store: &OpsStore,
     services: &Services,
     by: &str,
     body: &[u8],
 ) -> Result<AuditEntry, OperateError> {
-    let action: Action = serde_json::from_slice(body)
-        .map_err(|_| OperateError::Invalid("the body is not an operator action"))?;
+    apply(store, services, by, parse_action(body)?)
+}
+
+/// Does `action`, as [`operate`].
+pub(crate) fn apply(
+    store: &OpsStore,
+    services: &Services,
+    by: &str,
+    action: Action,
+) -> Result<AuditEntry, OperateError> {
     Ok(match action {
         Action::Exclude {
             service: name,
@@ -739,32 +844,51 @@ pub fn operate(
         } => {
             let name = service(services, &name)?.to_owned();
             let why = reason(&why)?;
-            // Written first: a clear that cannot be written leaves the halt standing. The
-            // reports of the halt and of every other host that reported while it stood are
-            // acknowledged (one per host, the latest) so that a host, which keeps reporting
-            // until it updates again, does not raise the halt again: a clear clears the service.
-            // The halt is the one standing when the change is made, under the writers' lock:
-            // one read before could have been cleared by another clear since, and a halt raised
-            // after that one would be cleared with the old report's acknowledgement.
+            // Written first: a clear that cannot be written leaves the halt standing. The halt
+            // is the one standing when the change is made, under the writers' lock: one read
+            // before could have been cleared by another clear since, and a halt raised after
+            // that one would be cleared with the old report's acknowledgement.
             store.decide_change::<OperateError>(Write::BeforeMemory, |state| {
                 let marks = state.services.entry(name.clone()).or_default();
-                let halt = marks
-                    .halt
-                    .take()
-                    .ok_or(OperateError::Invalid("the service is not halted"))?;
-                let mut entry = AuditEntry::new(by, "clear_halt");
-                entry.service = Some(name);
-                entry.node_id = Some(halt.node_id.clone());
-                entry.reason = Some(why);
-                let seen = std::mem::take(&mut marks.halt_seen);
-                let reports = std::iter::once(HaltAck::from(halt)).chain(seen);
-                for report in reports {
-                    marks.halt_acked.retain(|ack| ack.node_id != report.node_id);
-                    marks.halt_acked.push(report);
+                if marks.halt.is_none() {
+                    return Err(OperateError::Invalid("the service is not halted"));
                 }
-                marks.halt_generation = marks.halt_generation.saturating_add(1);
-                Ok(entry)
+                Ok(clear_halt(marks, by, &name, why))
             })?
         }
+        Action::Force { .. } | Action::UnmarkBad { .. } => {
+            return Err(OperateError::Invalid(
+                "a force or an unmark is made by the coordinator, not the ops store alone",
+            ));
+        }
     })
+}
+
+/// Clears the halt of `service` in `marks`, as `by`, for `why`: the one path of a clear, the
+/// operator's `clear_halt` and a force's alike. The reports of the halt and of every other host
+/// that reported while it stood are acknowledged (one per host, the latest) so that a host,
+/// which keeps reporting until it updates again, does not raise the halt again: a clear clears
+/// the service. The clear generation goes up by one, which lifts the hold of every agent that
+/// halted under an older one, whether or not a halt stands here (a force clears a service with
+/// none, so that an agent's own hold does not refuse the forced order). The caller writes it
+/// before it is in memory.
+pub(crate) fn clear_halt(
+    marks: &mut ServiceOps,
+    by: &str,
+    service: &str,
+    why: String,
+) -> AuditEntry {
+    let mut entry = AuditEntry::new(by, "clear_halt");
+    entry.service = Some(service.to_owned());
+    entry.reason = Some(why);
+    let halt = marks.halt.take();
+    entry.node_id = halt.as_ref().map(|halt| halt.node_id.clone());
+    let seen = std::mem::take(&mut marks.halt_seen);
+    let reports = halt.into_iter().map(HaltAck::from).chain(seen);
+    for report in reports {
+        marks.halt_acked.retain(|ack| ack.node_id != report.node_id);
+        marks.halt_acked.push(report);
+    }
+    marks.halt_generation = marks.halt_generation.saturating_add(1);
+    entry
 }

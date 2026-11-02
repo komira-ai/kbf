@@ -37,23 +37,20 @@ fn unwritable(rig: &mut Rig) {
         .with_ops(OpsStore::with_writer(OpsState::default(), writer));
 }
 
-/// Catches: the operator route taking CI's credential (or none): no bearer, CI's OIDC token,
-/// a wrong token, the operator token with a character added or removed, and a bearer in
-/// another scheme are each 401 and change nothing: no ops file, no status section. Only the
-/// operator token makes the change, and the answer is the audit entry it made.
+/// Catches: the operator route taking CI's credential (or none): CI's OIDC token is 403 (it is
+/// known, and may not), and no bearer, a wrong token, the operator token with a character added
+/// or removed, and a bearer in another scheme are each 401; none changes anything: no ops file,
+/// no status section. Only the operator token makes the change, and the answer is the audit
+/// entry it made.
 #[tokio::test]
 async fn only_the_operator_token_posts_an_operator_action() {
     let rig = Rig::new("op-token");
-    let ci = ci_token();
+    let (code, body) = post(&rig, Some(&ci_token()), EXCLUDE).await;
+    assert_eq!(code, StatusCode::FORBIDDEN);
+    assert_eq!(body, json!({"error": "forbidden"}));
     let longer = format!("{OPERATOR}x");
     let shorter = &OPERATOR[1..];
-    for bearer in [
-        None,
-        Some(ci.as_str()),
-        Some("nope"),
-        Some(longer.as_str()),
-        Some(shorter),
-    ] {
+    for bearer in [None, Some("nope"), Some(longer.as_str()), Some(shorter)] {
         let (code, body) = post(&rig, bearer, EXCLUDE).await;
         assert_eq!(code, StatusCode::UNAUTHORIZED, "{bearer:?}");
         assert_eq!(body, json!({"error": "unauthorized"}));

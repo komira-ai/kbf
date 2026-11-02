@@ -252,10 +252,10 @@ pub(crate) fn is_false(flag: &bool) -> bool {
 /// `agent_features`, the features the coordinator supports.
 ///
 /// Written flat: the reply's keys, then `features` when there is one, then `halts` when
-/// there are any. An agent that never announced features reads only
-/// [`Reply`](crate::wire::Reply) or [`ServiceReply`], both of which refuse an unknown field,
-/// so `features` is `None` and `halts` empty for it and the bytes are those of the reply
-/// alone. Equality with a reply compares the reply and ignores `features`.
+/// there are any, then `forced` when it is true. An agent that never announced features reads
+/// only [`Reply`](crate::wire::Reply) or [`ServiceReply`], both of which refuse an unknown
+/// field, so `features` is `None`, `halts` empty and `forced` false for it and the bytes are
+/// those of the reply alone. Equality with a reply compares the reply and ignores the rest.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Answer {
     /// What to do.
@@ -270,6 +270,12 @@ pub struct Answer {
     /// a clear is not lost with a heartbeat and a coordinator restart does not forget it.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub halts: BTreeMap<String, u64>,
+    /// The update in `reply` is an operator's force: the agent makes the target the release
+    /// that runs with no trial, and does not go back from it when it is not healthy. Only to an
+    /// agent that announced `forced-v1`, and only with an update; an agent that reads an answer
+    /// written before it reads it as false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub forced: bool,
 }
 
 impl Answer {
@@ -280,6 +286,7 @@ impl Answer {
             reply,
             features: None,
             halts: BTreeMap::new(),
+            forced: false,
         }
     }
 }
@@ -296,7 +303,8 @@ impl PartialEq<crate::wire::Reply> for Answer {
     }
 }
 
-/// An answer as it is read: [`ServiceReply`]'s fields and `features`, and no other.
+/// An answer as it is read: [`ServiceReply`]'s fields, `features`, `halts` and `forced`, and
+/// no other.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawAnswer {
@@ -306,6 +314,8 @@ struct RawAnswer {
     features: Option<Vec<String>>,
     #[serde(default)]
     halts: BTreeMap<String, u64>,
+    #[serde(default)]
+    forced: bool,
 }
 
 impl<'de> Deserialize<'de> for Answer {
@@ -318,10 +328,14 @@ impl<'de> Deserialize<'de> for Answer {
         check_halts(&raw.halts).map_err(D::Error::custom)?;
         let reply = ServiceReply::from_parts(raw.reply, raw.service, raw.version)
             .map_err(D::Error::custom)?;
+        if raw.forced && reply == ServiceReply::Nothing {
+            return Err(D::Error::custom("a reply of nothing is not forced"));
+        }
         Ok(Self {
             reply,
             features: raw.features,
             halts: raw.halts,
+            forced: raw.forced,
         })
     }
 }

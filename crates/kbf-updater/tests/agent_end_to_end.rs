@@ -239,7 +239,7 @@ fn an_update_by(way: Way) {
         );
         assert_eq!(
             beat["agent_features"],
-            serde_json::json!(["deferred-v1", "halt-v1"])
+            serde_json::json!(["deferred-v1", "halt-v1", "forced-v1"])
         );
         for forbidden in ["n1", "daemon", "node", "role"] {
             assert!(!beat.to_string().contains(forbidden), "{forbidden}: {beat}");

@@ -26,6 +26,7 @@ fn ack_of(node: &str, phase: Option<Phase>, class: Option<Class>, target: &str) 
             phase,
             class,
             reason: None,
+            started_unix: None,
         },
     }
 }

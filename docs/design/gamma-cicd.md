@@ -450,8 +450,9 @@ Its effects, each one audited:
 - a halt is cleared through the same path as the operator's clear (komira-ai/kbf#2187);
 - the target is unmarked;
 - the version left is marked bad, so the coordinator never orders it on its own again:
-  automatic rollback never chooses it. An explicit CI desired write of it still clears
-  the mark, as today;
+  automatic rollback never chooses it. CI's desired write of it is refused (409
+  `held_bad`) until an operator's `unmark_bad` lifts the mark, so CI cannot roll it out
+  again by accident;
 - `last_good` moves only after the forced version has converged.
 
 **On the host.** A host's forced slot is freed when it reports running the forced version,
@@ -480,8 +481,8 @@ The next ordinary desired write ends the forced state.
 - a host that failed the target before receives the forced order, while an ordinary write
   of the same target still withholds it;
 - the halt is cleared, and the three effects are in the audit;
-- the version left is never chosen by automatic rollback, and an explicit CI write of it
-  clears the mark and orders it;
+- the version left is never chosen by automatic rollback, an explicit CI write of it is
+  refused, and after an operator's `unmark_bad` CI's write of it is taken;
 - `last_good` moves only after convergence;
 - `max_updating`, and a raised value, are honoured;
 - a CI token gets 403;

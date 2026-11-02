@@ -33,8 +33,12 @@ pub const DEFERRED_V1: &str = "deferred-v1";
 /// The reply may carry a halt and the agent holds the service for it.
 pub const HALT_V1: &str = "halt-v1";
 
+/// The reply may mark an update order as an operator's force, and the agent makes the target
+/// the release that runs, with no trial and no going back (`update_forced`).
+pub(crate) const FORCED_V1: &str = "forced-v1";
+
 /// The features this agent announces in every heartbeat.
-pub const ANNOUNCED: [&str; 2] = [DEFERRED_V1, HALT_V1];
+pub const ANNOUNCED: [&str; 3] = [DEFERRED_V1, HALT_V1, FORCED_V1];
 
 /// The reason of a deferral whose drain bound passed.
 pub const DRAIN_BOUND: &str = "drain_bound";
@@ -62,6 +66,8 @@ pub struct Features {
     pub deferred: bool,
     /// Report a [`Hold::Halt`] and hold the service.
     pub halt: bool,
+    /// Run an order the reply marks `forced` as a force, not as an ordinary A/B.
+    pub forced: bool,
 }
 
 impl Features {
@@ -73,6 +79,7 @@ impl Features {
         Self {
             deferred: has(DEFERRED_V1),
             halt: has(HALT_V1),
+            forced: has(FORCED_V1),
         }
     }
 }
@@ -146,7 +153,34 @@ pub struct Halt {
     pub generation: Option<u64>,
 }
 
-/// The deferrals and halts on disk, one file each per unit.
+/// Why a mark on disk could not be used, with the file it was in.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum MarkError {
+    /// The file is there and cannot be opened or read (a link, a directory, no permission).
+    #[error("{}: {source}", path.display())]
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    /// The file is longer than a mark ever is.
+    #[error("{}: it is too long", path.display())]
+    TooLong { path: PathBuf },
+    /// The file is no mark of the kind asked for.
+    #[error("{}: {source}", path.display())]
+    Decode {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
+}
+
+/// A forced update that has begun: the target of an operator's force, kept on disk from before
+/// the update until it ends, so a restart in the middle can finish it as a force.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ForcedMark {
+    pub target: Version,
+}
+
+/// The deferrals, halts and forced marks on disk, one file each per unit.
 #[derive(Clone, Debug)]
 pub struct Marks {
     dir: PathBuf,
@@ -164,6 +198,38 @@ impl Marks {
 
     fn halt_path(&self, unit: &str) -> PathBuf {
         self.dir.join(format!("halt-{unit}"))
+    }
+
+    fn forced_path(&self, unit: &str) -> PathBuf {
+        self.dir.join(format!("forced-{unit}"))
+    }
+
+    /// The forced update of `unit` that was running, if one was.
+    ///
+    /// # Errors
+    /// The file is there and cannot be read, is too long, or is no mark.
+    pub(crate) fn load_forced(&self, unit: &str) -> Result<Option<ForcedMark>, MarkError> {
+        Self::read_typed(&self.forced_path(unit))
+    }
+
+    /// Record that a forced update of `unit` has begun.
+    ///
+    /// # Errors
+    /// The directory does not take it.
+    pub(crate) fn save_forced(&self, unit: &str, mark: &ForcedMark) -> std::io::Result<()> {
+        self.write(
+            &self.forced_path(unit),
+            &format!(".forced-{unit}.tmp"),
+            mark,
+        )
+    }
+
+    /// Forget the forced update of `unit`; none is not an error.
+    ///
+    /// # Errors
+    /// The file is there and cannot be removed.
+    pub(crate) fn clear_forced(&self, unit: &str) -> std::io::Result<()> {
+        Self::remove(&self.forced_path(unit))
     }
 
     /// The deferral of `unit`, if there is one.
@@ -190,6 +256,12 @@ impl Marks {
         &self,
         path: &std::path::Path,
     ) -> Result<Option<T>, String> {
+        Self::read_typed(path).map_err(|e| e.to_string())
+    }
+
+    fn read_typed<T: serde::de::DeserializeOwned>(
+        path: &std::path::Path,
+    ) -> Result<Option<T>, MarkError> {
         // O_NOFOLLOW: a link planted in the state directory is no record.
         let read = OpenOptions::new()
             .read(true)
@@ -199,16 +271,27 @@ impl Marks {
                 let mut text = Vec::new();
                 file.take(MARK_MAX + 1).read_to_end(&mut text).map(|_| text)
             });
-        let bad = |why: &dyn std::fmt::Display| format!("{}: {why}", path.display());
         let text = match read {
             Ok(text) => text,
             Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(bad(&e)),
+            Err(source) => {
+                return Err(MarkError::Io {
+                    path: path.to_owned(),
+                    source,
+                });
+            }
         };
         if text.len() as u64 > MARK_MAX {
-            return Err(bad(&"it is too long"));
+            return Err(MarkError::TooLong {
+                path: path.to_owned(),
+            });
         }
-        serde_json::from_slice(&text).map(Some).map_err(|e| bad(&e))
+        serde_json::from_slice(&text)
+            .map(Some)
+            .map_err(|source| MarkError::Decode {
+                path: path.to_owned(),
+                source,
+            })
     }
 
     /// Record `deferral` for `unit`: written beside, synced and renamed over.

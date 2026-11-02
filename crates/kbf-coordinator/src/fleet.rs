@@ -306,6 +306,38 @@ impl Fleet {
         host.holds_slot() || self.is_ordered(service, id, now)
     }
 
+    /// Whether the host `id` holds an update slot of `service` while a force to `forced`
+    /// stands ([`crate::force`]). No silent host holds one. A live host whose agent announced
+    /// [`crate::force::FEATURE`] holds one while it is not yet at `forced` and updates, has its
+    /// order outstanding, or waits for a promotion: one that runs `forced` holds none, healthy
+    /// or not and whatever else its beat says, and neither does one that failed (it is not
+    /// ordered again until it is acknowledged). Any other live host holds its slot as
+    /// [`Self::holds_slot`] says, since its agent goes back by its own rule when `forced` is
+    /// not healthy.
+    #[must_use]
+    pub(crate) fn holds_forced_slot(
+        &self,
+        service: &str,
+        id: &NodeId,
+        host: &Host,
+        forced: &Version,
+        now: Duration,
+    ) -> bool {
+        let announced = self.node(id).is_some_and(|node| {
+            node.features
+                .iter()
+                .any(|name| name == crate::force::FEATURE)
+        });
+        if !announced {
+            return host.is_live(now) && self.holds_slot(service, id, host, now);
+        }
+        host.is_live(now)
+            && host.beat.version != *forced
+            && (host.beat.updating.is_some()
+                || self.is_ordered(service, id, now)
+                || host.beat.promotion_pending)
+    }
+
     /// How many healthy beats in a row the host `id` has sent `service` at `version`.
     #[must_use]
     pub fn bake_beats(&self, service: &str, id: &NodeId, version: &Version) -> u32 {

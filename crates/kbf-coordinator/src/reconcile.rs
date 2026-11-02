@@ -17,6 +17,7 @@ use crate::acks::{drop_ack, is_acked, stale_acks};
 use crate::converge::State;
 use crate::desired::{Desired, DesiredStore, StoreError};
 use crate::fleet::{Fleet, Host};
+use crate::force;
 use crate::membership::{Standing, standing};
 use crate::ops::{AuditEntry, OpsError, OpsState, OpsStore, ServiceOps, Write};
 use crate::service::convergence_of;
@@ -109,17 +110,19 @@ pub(crate) fn is_release_failure(host: &Host, version: &Version) -> bool {
 /// outvote a few failures) and nothing while the service is halted. Otherwise, the first that
 /// applies:
 ///
-/// 1. the desired version has converged and baked and nothing holds a slot: record it as
-///    the last good version (unless it is, or is marked bad);
+/// 1. the desired version has converged and baked and nothing holds a slot (and, while an
+///    operator's force of it stands, every live host is up on it): record it as the last good
+///    version (unless it is, or is marked bad);
 /// 2. the desired version is `min_version` and an older last good version is recorded: forget
 ///    it, since the version before the first release with hooks is no rollback target;
-/// 3. an older last good version is recorded, and the
-///    desired version is marked bad or failed its release on [`FailThreshold::hosts`] live
-///    hosts: mark it bad (unless it already is), then set the desired version to the last
-///    good one (only if that is `min_version` or later, else it is only marked). The mark
-///    comes first, so a stop between the two leaves a marked desired version, which this
-///    finishes on the next beat. Failure reports acked by an override do not count
-///    ([`crate::acks`]).
+/// 3. an older last good version is recorded, no operator's force stands
+///    ([`crate::force`]: the operator chose the version, and a failure of it is no reason to
+///    leave it), and the desired version is marked bad or failed its release on
+///    [`FailThreshold::hosts`] live hosts: mark it bad (unless it already is), then set the
+///    desired version to the last good one (only if that is `min_version` or later and not
+///    marked bad itself, as a version a force left is, else it is only marked). The mark comes first, so a stop between the two leaves a marked desired
+///    version, which this finishes on the next beat. Failure reports acked by an override do
+///    not count ([`crate::acks`]).
 ///
 /// Acks that no longer match their host's report are dropped whatever else is planned.
 #[must_use]
@@ -166,7 +169,11 @@ fn decide(
     let settled = convergence_of(def, Some(want), fleet, state, now).state == State::Converged
         && !live().any(|(id, h)| fleet.holds_slot(service, id, h, now));
     let recorded = marks.last_good.as_ref() == Some(wanted);
-    if settled && !recorded && !marked {
+    // A forced version is good only once every live host serves it healthy: the force passed
+    // the health gates, so convergence alone (with no bake, say) proves nothing of its health.
+    let forced = force::standing(marks, Some(want)).is_some();
+    let healthy = !forced || live().all(|(id, h)| fleet.is_up(service, id, h, now));
+    if settled && healthy && !recorded && !marked {
         return vec![Change::LastGood(wanted.clone())];
     }
     let floored = def
@@ -176,7 +183,7 @@ fn decide(
     if floored {
         return older.map(|_| Change::ClearLastGood).into_iter().collect();
     }
-    let Some(back) = older else {
+    let Some(back) = older.filter(|_| !forced) else {
         return Vec::new();
     };
     let failed = live()
@@ -190,11 +197,13 @@ fn decide(
     if !marked {
         changes.push(Change::MarkBad(wanted.clone()));
     }
-    // The last good version is a target only at or above the floor.
+    // The last good version is a target only at or above the floor, and only while it is not
+    // marked bad itself (a force left it).
     if def
         .min_version
         .as_ref()
         .is_none_or(|floor| back.at_least(floor))
+        && !marks.bad.contains(back)
     {
         changes.push(Change::RollBackTo(back.clone()));
     }

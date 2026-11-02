@@ -56,10 +56,12 @@ use kbf_updater::version::Version;
 use kbf_updater::wire::{Health, Outcome, Reply};
 use serde::Serialize;
 
+use crate::acks::is_acked;
 use crate::canary;
 use crate::desired::{Desired, KBF};
 use crate::fleet::{Fleet, Host};
-use crate::services::{ServiceDef, Services};
+use crate::ops::ServiceOps;
+use crate::services::{RoleDef, ServiceDef, Services};
 
 /// What to tell the `kbf` host `id` at `now`, when `kbf` is the only service.
 #[must_use]
@@ -250,19 +252,11 @@ fn first_hold(
             Hold::Baking,
         ),
         (
-            others().any(|(_, h)| {
-                role.after.iter().any(|r| r == h.role_name()) && is_pending(h, desired, now)
-            }),
+            waits_for_role(role, fleet, service, id, desired, now),
             Hold::WaitingForRole,
         ),
         (
-            !def.after.iter().all(|earlier| {
-                all.get(earlier).is_none_or(|want| {
-                    fleet
-                        .hosts_of(earlier)
-                        .all(|(_, h)| !is_pending(h, want, now))
-                })
-            }),
+            waits_for_service(def, all, fleet, now),
             Hold::WaitingForService,
         ),
         (
@@ -273,6 +267,129 @@ fn first_hold(
                 .count()
                 < role.required_up(host.role_name(), desired),
             Hold::MinUp,
+        ),
+    ];
+    rules
+        .into_iter()
+        .find_map(|(holds, why)| holds.then_some(why))
+}
+
+/// Whether a role that `role` waits for has a live host other than `id` behind `desired`, or
+/// updating.
+fn waits_for_role(
+    role: &RoleDef,
+    fleet: &Fleet,
+    service: &str,
+    id: &NodeId,
+    desired: &Desired,
+    now: Duration,
+) -> bool {
+    fleet.hosts_of(service).any(|(other, h)| {
+        other != id && role.after.iter().any(|r| r == h.role_name()) && is_pending(h, desired, now)
+    })
+}
+
+/// Whether a service that `def` waits for has a live host behind its own desired version, or
+/// updating.
+fn waits_for_service(
+    def: &ServiceDef,
+    all: &BTreeMap<String, Desired>,
+    fleet: &Fleet,
+    now: Duration,
+) -> bool {
+    !def.after.iter().all(|earlier| {
+        all.get(earlier).is_none_or(|want| {
+            fleet
+                .hosts_of(earlier)
+                .all(|(_, h)| !is_pending(h, want, now))
+        })
+    })
+}
+
+/// The decision for the host `id` about `service` at `now` while an operator's force of it
+/// stands ([`crate::force`]): the desired version is the forced one, and `marks` are the
+/// service's marks, the force among them. The rules kept are, in order, the quiet start, an
+/// absent service, the host's own update and its other services', the host being at the
+/// version, rule 4 for a failure the force did not acknowledge (the failure reports standing
+/// when the force was made are, [`crate::acks`]), the slots of the role, counted by
+/// [`Fleet::holds_forced_slot`] against `max_updating` as the force raised it, the role order
+/// and the order between services. The canary, the bake, `min_up`, a deferral, a bad mark and
+/// a halt hold nothing back.
+#[must_use]
+pub(crate) fn decide_forced(
+    services: &Services,
+    desired: &BTreeMap<String, Desired>,
+    marks: &ServiceOps,
+    service: &str,
+    fleet: &Fleet,
+    id: &NodeId,
+    now: Duration,
+) -> Decision {
+    let Some(def) = services.get(service) else {
+        return Decision::Hold(Hold::NoDefinition);
+    };
+    let Some(want) = desired.get(service) else {
+        return Decision::Hold(Hold::NoDesired);
+    };
+    match forced_hold(def, want, desired, marks, fleet, id, now) {
+        Some(why) => Decision::Hold(why),
+        None => Decision::Update {
+            version: want.version.clone(),
+        },
+    }
+}
+
+/// The first rule of [`decide_forced`] that fails for the host `id`.
+fn forced_hold(
+    def: &ServiceDef,
+    desired: &Desired,
+    all: &BTreeMap<String, Desired>,
+    marks: &ServiceOps,
+    fleet: &Fleet,
+    id: &NodeId,
+    now: Duration,
+) -> Option<Hold> {
+    let service = def.name.as_str();
+    let member = fleet
+        .get_in(service, id)
+        .and_then(|h| def.roles.get(h.role_name()).map(|role| (h, role)));
+    let Some((host, role)) = member else {
+        return Some(Hold::NotAMember);
+    };
+    let failed_here = host.beat.last_update.as_ref().is_some_and(|r| {
+        r.outcome == Outcome::Failed && r.target == desired.version && !is_acked(marks, id, host)
+    });
+    let slots = fleet
+        .hosts_of(service)
+        .filter(|(other, h)| *other != id && h.role_name() == host.role_name())
+        .filter(|(o, h)| fleet.holds_forced_slot(service, o, h, &desired.version, now))
+        .count();
+    let raised = marks
+        .force
+        .as_ref()
+        .and_then(|force| force.max_updating.get(host.role_name()));
+    let limit = raised.map_or_else(
+        || role.max_updating(host.role_name(), desired),
+        |n| *n as usize,
+    );
+    let rules = [
+        (fleet.is_quiet(now), Hold::Quiet),
+        (
+            host.beat.health == Health::Absent && !def.install_when_absent,
+            Hold::Absent,
+        ),
+        (host.beat.updating.is_some(), Hold::Updating),
+        (fleet.is_busy_besides(service, id, now), Hold::BusyElsewhere),
+        (host.beat.version == desired.version, Hold::UpToDate),
+        (failed_here, Hold::FailedHere),
+        (slots >= limit, Hold::NoSlot),
+        (
+            waits_for_role(role, fleet, service, id, desired, now),
+            Hold::WaitingForRole,
+        ),
+        (
+            waits_for_service(def, all, fleet, now),
+            Hold::WaitingForService,
         ),
     ];
     rules

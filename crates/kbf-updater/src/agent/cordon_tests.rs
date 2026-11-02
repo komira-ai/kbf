@@ -12,7 +12,7 @@ use super::run::{Agent, World};
 use super::status::{Shared, Status};
 use super::testing::{
     COMMIT_B, Events, FakeCoordinator, FakeHealth, FakeLocal, ManualClock, ServingNode, VA, VB,
-    host, version,
+    host, update_result, version,
 };
 use super::update::{Ports, Update};
 use crate::inventory::Role;
@@ -36,7 +36,7 @@ fn marks(dir: &Path) -> usize {
 }
 
 fn result(target: &str, outcome: Outcome) -> UpdateResult {
-    UpdateResult::new(version(target), outcome)
+    update_result(version(target), outcome, NOW)
 }
 
 /// A node the updater cordoned reads as in placement afterwards, to this process and to one

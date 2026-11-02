@@ -29,6 +29,7 @@ pub mod run;
 pub mod service_health;
 pub mod status;
 pub mod update;
+mod update_forced;
 
 mod build;
 pub mod cordon;
@@ -66,5 +67,11 @@ mod run_tests;
 mod service_tests;
 #[cfg(test)]
 pub(crate) mod testing;
+#[cfg(test)]
+mod update_forced_contract_tests;
+#[cfg(test)]
+mod update_forced_attempt_tests;
+#[cfg(test)]
+mod update_forced_tests;
 #[cfg(test)]
 mod update_tests;

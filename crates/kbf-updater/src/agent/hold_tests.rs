@@ -17,7 +17,8 @@ use super::local::LocalError;
 use super::run::{Agent, World};
 use super::status::Status;
 use super::testing::{
-    Events, FakeCoordinator, FakeDrain, FakeHealth, FakeLocal, ManualClock, VA, VB, host, version,
+    Events, FakeCoordinator, FakeDrain, FakeHealth, FakeLocal, ManualClock, VA, VB, host,
+    update_result, version,
 };
 use crate::inventory::Role;
 use crate::ports::Health;
@@ -65,7 +66,6 @@ impl Rig {
             events,
         }
     }
-
     fn timing() -> Timing {
         Timing {
             drain_deadline: Some(Duration::from_secs(60)),
@@ -138,7 +138,7 @@ impl Rig {
     fn take_order(&self, agent: &Agent) {
         self.order_is(VB);
         let order = agent.beat_once().expect("an order");
-        agent.order(order.0.as_deref(), &order.1);
+        agent.order(order.0.as_deref(), &order.1, order.2);
     }
 
     fn installs(&self) -> usize {
@@ -167,7 +167,7 @@ impl Rig {
 }
 
 fn failed(target: &str) -> Option<UpdateResult> {
-    Some(UpdateResult::new(version(target), Outcome::Failed))
+    Some(update_result(version(target), Outcome::Failed, T0))
 }
 
 fn token(text: &str) -> Token {
@@ -215,7 +215,7 @@ fn an_agent_that_sees_no_features_never_defers_or_declines() {
         rig.take_order(&agent);
         agent.beat_once();
         let beat = rig.last_beat();
-        assert_eq!(beat.agent_features, ["deferred-v1", "halt-v1"]);
+        assert_eq!(beat.agent_features, ["deferred-v1", "halt-v1", "forced-v1"]);
         assert_eq!(beat.last_update, failed(VB));
         assert_eq!(beat.deferred, None);
         assert!(!rig.dir.join("defer-kbf").exists());
@@ -289,19 +289,19 @@ fn a_deferral_leaves_the_last_result_as_it_was() {
     agent.beat_once();
     assert_eq!(
         rig.last_beat().last_update,
-        Some(UpdateResult::new(version(VB), Outcome::Succeeded))
+        Some(update_result(version(VB), Outcome::Succeeded, T0))
     );
     // A second one that defers.
     *rig.drain.leases.lock().unwrap() = [2].into();
     rig.order_is(OTHER);
     let order = agent.beat_once().unwrap();
-    agent.order(None, &order.1);
+    agent.order(None, &order.1, order.2);
     agent.beat_once();
     let beat = rig.last_beat();
     assert_eq!(beat.deferred.unwrap().target, version(OTHER));
     assert_eq!(
         beat.last_update,
-        Some(UpdateResult::new(version(VB), Outcome::Succeeded))
+        Some(update_result(version(VB), Outcome::Succeeded, T0))
     );
 }
 
@@ -368,7 +368,7 @@ fn a_reorder_before_retry_after_is_declined_and_one_after_it_runs() {
     // Another target is not the one that was deferred.
     rig.order_is(OTHER);
     let order = agent.beat_once().unwrap();
-    agent.order(None, &order.1);
+    agent.order(None, &order.1, order.2);
     assert_eq!(rig.installs(), 3);
     let kept = Marks::new(&rig.dir).load("kbf").unwrap().unwrap();
     assert_eq!(kept.target, version(OTHER));
@@ -402,7 +402,7 @@ fn a_failed_heartbeat_keeps_what_was_advertised() {
     assert!(rig.logged("heartbeat: the coordinator is unreachable"));
     rig.advance_unix(10);
     rig.order_is(VB);
-    agent.order(None, &version(VB));
+    agent.order(None, &version(VB), false);
     assert_eq!(rig.installs(), 1);
 }
 
@@ -449,7 +449,7 @@ fn with_halt_v1_a_failed_rollback_halts_and_holds_the_service() {
     rig.take_order(&agent);
     agent.beat_once();
     let beat = rig.last_beat();
-    let mut want = UpdateResult::new(version(VB), Outcome::Failed);
+    let mut want = update_result(version(VB), Outcome::Failed, T0);
     want.phase = Some(Phase::Halt);
     want.reason = Some(token("rollback_failed"));
     assert_eq!(beat.last_update, Some(want));
@@ -458,7 +458,7 @@ fn with_halt_v1_a_failed_rollback_halts_and_holds_the_service() {
     rig.take_order(&agent);
     rig.order_is(OTHER);
     let order = agent.beat_once().unwrap();
-    agent.order(None, &order.1);
+    agent.order(None, &order.1, order.2);
     assert_eq!(rig.installs(), 1);
     assert!(rig.logged("held after a halt (rollback_failed)"));
 
@@ -501,7 +501,7 @@ fn a_heartbeat_over_the_limit_is_trimmed_or_not_sent() {
 
 fn rich() -> Heartbeat {
     let result = |target: &str| {
-        let mut result = UpdateResult::new(version(target), Outcome::Failed);
+        let mut result = update_result(version(target), Outcome::Failed, T0);
         result.phase = Some(Phase::Halt);
         result.reason = Some(token("rollback_failed"));
         Some(result)
@@ -619,20 +619,13 @@ fn a_deferral_is_over_at_its_retry_time() {
 fn features_are_the_known_names_advertised() {
     let names = |list: &[&str]| list.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
     assert_eq!(Features::of(&names(&[])), Features::default());
+    let halt = Features::of(&names(&["halt-v1", "future-v9"]));
     assert_eq!(
-        Features::of(&names(&["halt-v1", "future-v9"])),
-        Features {
-            deferred: false,
-            halt: true
-        }
+        [halt.deferred, halt.halt, halt.forced],
+        [false, true, false]
     );
-    assert_eq!(
-        Features::of(&names(&["deferred-v1", "halt-v1"])),
-        Features {
-            deferred: true,
-            halt: true
-        }
-    );
+    let both = Features::of(&names(&["deferred-v1", "halt-v1"]));
+    assert_eq!([both.deferred, both.halt, both.forced], [true, true, false]);
 }
 
 /// Catches: a clamp that drifts from the step runner's 3600 s bound.
@@ -814,7 +807,7 @@ fn an_agent_that_never_halted_ignores_halts() {
     assert_eq!(rig.installs(), 1);
     assert_eq!(
         rig.last_beat().last_update,
-        Some(UpdateResult::new(version(VB), Outcome::Succeeded))
+        Some(update_result(version(VB), Outcome::Succeeded, T0))
     );
     assert!(!rig.logged("lifted"));
     assert!(!rig.dir.join("halt-kbf").exists());

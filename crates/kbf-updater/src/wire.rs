@@ -85,10 +85,20 @@ pub struct UpdateResult {
         deserialize_with = "lenient"
     )]
     pub reason: Option<Token>,
+    /// When the update began, in Unix seconds, as the agent's clock said: what tells two
+    /// attempts at one target apart when they end the same way. Absent from an updater that
+    /// does not send it, and from a result of an update the coordinator never saw begin; a value
+    /// that is no number reads as `None`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient"
+    )]
+    pub started_unix: Option<u64>,
 }
 
 impl UpdateResult {
-    /// A result with no phase, class or reason: what an updater without them reports.
+    /// A result with no phase, class, reason or start: what an updater without them reports.
     #[must_use]
     pub fn new(target: Version, outcome: Outcome) -> Self {
         Self {
@@ -97,6 +107,7 @@ impl UpdateResult {
             phase: None,
             class: None,
             reason: None,
+            started_unix: None,
         }
     }
 }

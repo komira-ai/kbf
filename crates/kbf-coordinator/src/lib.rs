@@ -11,6 +11,7 @@
 //! - [`decide`]: the decision as a pure function of the desired state, the fleet, the host
 //!   and the time;
 //! - [`reconcile`]: the last good version, the bad ones, and the automatic rollback;
+//! - [`force`]: an operator's force of a service to a version, past every health gate;
 //! - [`ops`]: what operators decide (exclusions, labels, the audit ring), in a file of its own;
 //! - [`services`]: services as data: roles, limits and the order between services;
 //! - [`service`]: the coordinator itself: heartbeats in, the desired state set by CI's OIDC
@@ -34,6 +35,7 @@ pub mod decide;
 pub mod defer;
 pub mod desired;
 pub mod fleet;
+pub mod force;
 pub mod halt;
 pub mod http;
 pub mod identity;
@@ -71,6 +73,14 @@ mod desired_role_tests;
 mod desired_tests;
 #[cfg(test)]
 mod extras_dropped_tests;
+#[cfg(test)]
+mod force_edge_tests;
+#[cfg(test)]
+mod force_http_tests;
+#[cfg(test)]
+mod force_scope_tests;
+#[cfg(test)]
+mod force_tests;
 #[cfg(test)]
 mod halt_membership_tests;
 #[cfg(test)]
