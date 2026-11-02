@@ -5,7 +5,7 @@
 //! - **Features.** The agent announces [`ANNOUNCED`] in its heartbeat. The coordinator answers
 //!   with the ones it supports (`features` in the reply); the agent uses a behaviour only
 //!   while the last reply advertised it. An agent that sees none behaves as it did before: a
-//!   drain bound is a `Failed`, it never declines an order for a deferral, and a failure it
+//!   drain bound or a `leases_live` refusal of the switch is a `Failed`, it never declines an order for a deferral, and a failure it
 //!   cannot repair is a plain `Failed`.
 //! - **The deferral.** A deferred update leaves a [`Deferral`] on disk per unit
 //!   (`defer-<unit>` in the agent's state directory), so a restart keeps the `retry_after`. It
