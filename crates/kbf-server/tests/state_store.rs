@@ -50,6 +50,8 @@ mod floors;
 mod handover;
 #[path = "state_store/intake.rs"]
 mod intake;
+#[path = "state_store/lost_race.rs"]
+mod lost_race;
 #[path = "state_store/owner.rs"]
 mod owner;
 #[path = "state_store/result_ack.rs"]
@@ -463,6 +465,13 @@ fn submit(farm: &TestFarm, request: Request) -> Result<(), Status> {
         max_wall: None,
     })
     .map(drop)
+}
+
+/// The races with another frontend `farm` lost: [`Farm::lost_races`], on a core that counts
+/// them. The js core has no such count (`None`): it counts a lost race among its dropped
+/// writes, which are read instead.
+fn lost_races(farm: &TestFarm) -> u64 {
+    farm.lost_races().unwrap_or_else(|| farm.dropped_writes())
 }
 
 fn node() -> WorkerId {
@@ -1908,7 +1917,7 @@ async fn a_stale_record_in_the_feed_does_not_drop_a_written_answers_detail() {
     };
     assert_eq!(status.code, Code::InvalidArgument as i32);
     assert_eq!(status.message, "test", "the report's detail was dropped");
-    assert!(farm.dropped_writes() >= 1, "the grant was not refused");
+    assert!(lost_races(&farm) >= 1, "the grant was not refused");
     let row = farm.ended(OperationId(0)).expect("read").expect("a row");
     assert_eq!(row, Finished::Failed(status), "the row is what was sent");
 }
@@ -2071,7 +2080,7 @@ async fn a_stale_refusal_of_a_never_tried_effect_drops_it() {
         !matches!(*ticket.stage.borrow(), Stage::Done(_)),
         "a stale answer that was never written was delivered"
     );
-    assert!(farm.dropped_writes() >= 1);
+    assert!(lost_races(&farm) >= 1);
     drop(starts(&mut inbox));
 }
 
