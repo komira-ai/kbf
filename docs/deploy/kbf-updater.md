@@ -544,7 +544,10 @@ agent heartbeats and refuses every update order before it fetches anything, for 
 
 The coordinator is not one of the hosts it orders: it does not update itself. It is updated the
 way it was deployed ([containers.md](containers.md#run-the-coordinator-on-one-host): a new image,
-the tag changed in the unit, a restart; to go back, name the old tag). Hosts that were updating
+the tag changed in the unit, a restart; to go back, name the old tag). Going back to a release
+before 0.0.61 (the first with `--rollback-target`), also drop every `--rollback-target` flag from
+the unit, since that release does not know the flag and stops at start with a usage error, and
+take any `pool` out of the services file, which it refuses. Hosts that were updating
 finish or revert on their own while it is down, and the restarted coordinator orders nothing for
 its first 30 seconds.
 

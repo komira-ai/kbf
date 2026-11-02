@@ -19,15 +19,23 @@ pub const FIRST_POOL_VERSION: &str = "0.0.61";
 /// [`FIRST_POOL_VERSION`]'s [`Version::release_numbers`] (a test holds the two together).
 const FIRST_POOL: [u64; 3] = [0, 0, 61];
 
-/// `text` as a release version: one [`Version`] whose leading numbers have at least two
-/// parts (`0.0.57`, `0.0.57+g0123456789ab`). A bare commit id or a word is none.
+/// `text` as a release version: one [`Version`] that starts with at least two numbers joined
+/// by single dots, each of one or more digits, and has nothing after them or a suffix that
+/// starts with `+`, `-` or `~` (`0.0.57`, `0.0.57+g0123456789ab-8`). A bare commit id, a
+/// word, an empty number (`0..60`, `.0.60`, `0.0.60.`) or digits run into letters
+/// (`0.0.61abc`) is none: [`Version::release_numbers`] would order each of them as some
+/// release, and a wrong order here would let a release that refuses `pool` through.
 fn release(text: &str) -> Option<Version> {
     let version = Version::parse(text).ok()?;
-    let lead = text
-        .split(|c: char| !c.is_ascii_digit() && c != '.')
-        .next()
-        .unwrap_or_default();
-    (lead.split('.').filter(|part| !part.is_empty()).count() >= 2).then_some(version)
+    let end = text
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(text.len());
+    let (lead, rest) = text.split_at(end);
+    let numbers: Vec<&str> = lead.split('.').collect();
+    let well_formed = numbers.len() >= 2
+        && numbers.iter().all(|n| !n.is_empty())
+        && (rest.is_empty() || rest.starts_with(['+', '-', '~']));
+    well_formed.then_some(version)
 }
 
 /// Refuses `services` when an entry of its file names a pool and a target of `targets` (the

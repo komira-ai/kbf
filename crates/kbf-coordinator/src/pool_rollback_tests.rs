@@ -62,6 +62,45 @@ fn a_rollback_target_that_is_not_a_release_version_refuses_a_pool() {
     }
 }
 
+/// Catches: a malformed version ordered as a release. Each of these would be read by
+/// [`Version::release_numbers`] as some release at or after the floor (an empty number is
+/// skipped, letters after the digits are dropped), so each must be refused as not a release
+/// version: empty numbers inside, leading or trailing dots, a lone number, and digits run
+/// into a word.
+#[test]
+fn a_malformed_release_version_is_refused_not_ordered() {
+    let services = pooled();
+    for bad in [
+        "0..61",
+        "0.0..61",
+        ".0.61",
+        "0.0.61.",
+        "0.0.61.+g0123456789ab",
+        "..",
+        "61",
+        "0.0.61abc",
+        "0.0.61.x",
+    ] {
+        assert_eq!(
+            refusal(&services, &[bad]),
+            format!(
+                "tierstore: pool \"storage\" on storage: --rollback-target {bad:?} is not a \
+                 release version (such as 0.0.57); remove the pool, or the target once its \
+                 image is no longer kept"
+            ),
+            "{bad:?}"
+        );
+    }
+    let well_formed = [
+        "0.0.61",
+        "0.0.61+g0123456789ab-8",
+        "0.0.61-1",
+        "0.0.61~rc1",
+        "1.0",
+    ];
+    assert_eq!(check(&services, &targets(&well_formed)), Ok(()));
+}
+
 /// Catches: the refusal outliving its reason. With no target listed, or only targets at or
 /// after the first release that reads pools (with or without a build suffix, and a later
 /// minor), the pool-enabled file is accepted.
