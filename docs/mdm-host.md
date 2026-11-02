@@ -24,6 +24,31 @@ namespace), the comments of the rendered units, and the `.js-host.tmp` suffix of
 written. A host installed before the move therefore verifies `same`. They change together, in
 a later change, when the coordinator's product has its name.
 
+## Where it lives, and what comes next
+
+The crates came from the jobscheduler repository (`js-mdm-core`, `js-host-step`, `js-mdm`) as a
+move: the same code, tests and rendered files, with only the names of the crates and the program
+changed. The package boundaries and the rules that keep them:
+
+* `mdm-core` renders; it does no I/O and reaches no runtime, network or random source.
+* `host-step` is the only code that touches the host; it knows nothing of MDM.
+* `mdm-host` joins the two and is the only binary. Only it links the other two crates.
+* None of the three links another crate of this workspace, in any kind of dependency, optional
+  ones included, and neither `kbf-server` nor the `kbf` binary links them
+  (`crates/kbf-integration-test/tests/mdm_layering.rs`). That keeps them ready to leave this
+  repository with the update coordinator and the generic updater.
+
+What exists beside them, and what is left to do:
+
+* jobscheduler still holds its copy until a change there removes it and points its docs here.
+* kbf-deploy's `mdm` kit is the older installer `mdm-core` was first ported from; it also has
+  `push-cert`, `dep` and `erase-request`. The two install the same services, and the kit is
+  folded into `mdm-host` (or removed) in a later change. Until then, use one tool per host.
+* Wiring the MDM into the update coordinator is a later design step.
+* The on-disk `js-mdm` names change together, once the coordinator's product has its name.
+* Defects and test gaps that came over unchanged with the move are listed in
+  komira-ai/kbf#2248; each is fixed in a change of its own, with a test that fails first.
+
 ## Verbs
 
 Every verb that changes the host prints its plan by default (`DRY-RUN:` lines naming paths,
