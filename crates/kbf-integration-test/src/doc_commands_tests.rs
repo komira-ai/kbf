@@ -208,6 +208,20 @@ fn what_cannot_be_read_is_an_error_naming_its_line() {
             "{line}"
         );
     }
+    for line in [
+        "kbf cluster object-store status --token-file f >\"$(printf out)\" --misspelled",
+        "kbf cluster drain \"$(echo n)\" --bad",
+        "kbf cluster drain n --x \"a$(echo b)\"",
+    ] {
+        assert_eq!(
+            err(&format!("```\n{line}\n```\n")),
+            CommandError::Unsupported {
+                line: 2,
+                what: "a command substitution inside a kbf cluster command"
+            },
+            "{line}"
+        );
+    }
     assert_eq!(
         err("```\nkbf cluster drain `x`\n```\n"),
         CommandError::Unsupported {

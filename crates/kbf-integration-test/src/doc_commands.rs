@@ -14,11 +14,10 @@
 //! string (a line a script only prints) is not a command.
 //!
 //! What is refused, so that nothing escapes the check unseen: a placeholder or variable
-//! with no sample value, a backtick, a quote or substitution left open, a continued line
-//! with nothing after it, and a fence that never closes. A `<` followed by a letter is a
-//! placeholder; write an input redirection with a space (`< file`).
-
-use std::fmt;
+//! with no sample value, a backtick, a quote or substitution left open, a `$(...)` inside a
+//! `kbf cluster` command (its words would end the command, so later ones would go unread),
+//! a continued line with nothing after it, and a fence that never closes. A `<` followed by
+//! a letter is a placeholder; write an input redirection with a space (`< file`).
 
 use crate::deploy_units::PLACEHOLDERS;
 
@@ -46,46 +45,28 @@ pub struct ClusterCommand {
 }
 
 /// Why a doc's commands cannot be read. Each names the 1-based line it is about.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum CommandError {
     /// A `<placeholder>` [`PLACEHOLDERS`] does not have.
+    #[error("line {line}: placeholder {name} has no sample value in PLACEHOLDERS")]
     Placeholder { line: usize, name: String },
-    /// A shell variable [`SHELL_VARIABLES`] does not have (empty for a `$` followed by no
-    /// name, such as `$1` or `$?`).
+    /// A shell variable [`SHELL_VARIABLES`] does not have (`1` for `$1`, empty for a `$`
+    /// followed by no name, such as `$?`).
+    #[error("line {line}: shell variable ${name} has no sample value in SHELL_VARIABLES")]
     Variable { line: usize, name: String },
     /// A line ending in `\` with no line after it in its block.
+    #[error("line {0}: a command continued with `\\` has no next line in its block")]
     Unfinished(usize),
     /// A quote, a `$(` or a `(` that the line does not close.
+    #[error("line {0}: a quote or parenthesis never closes")]
     Unclosed(usize),
     /// A fence that never closes.
+    #[error("line {0}: the fenced block never closes")]
     Fence(usize),
     /// Shell syntax this reader does not take apart.
+    #[error("line {line}: {what} is not read")]
     Unsupported { line: usize, what: &'static str },
 }
-
-impl fmt::Display for CommandError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Placeholder { line, name } => write!(
-                f,
-                "line {line}: placeholder {name} has no sample value in PLACEHOLDERS"
-            ),
-            Self::Variable { line, name } => write!(
-                f,
-                "line {line}: shell variable ${name} has no sample value in SHELL_VARIABLES"
-            ),
-            Self::Unfinished(line) => write!(
-                f,
-                "line {line}: a command continued with `\\` has no next line in its block"
-            ),
-            Self::Unclosed(line) => write!(f, "line {line}: a quote or parenthesis never closes"),
-            Self::Fence(line) => write!(f, "line {line}: the fenced block never closes"),
-            Self::Unsupported { line, what } => write!(f, "line {line}: {what} is not read"),
-        }
-    }
-}
-
-impl std::error::Error for CommandError {}
 
 /// Every `kbf cluster ...` command in the fenced blocks of `markdown`, in order.
 pub fn cluster_commands(markdown: &str) -> Result<Vec<ClusterCommand>, CommandError> {
@@ -222,6 +203,14 @@ fn lex(line: &str, n: usize) -> Result<Vec<Token>, CommandError> {
         if c == '$' {
             if next == Some('(') {
                 word.flush(&mut out);
+                // The words of a substitution are read as a command of their own, which ends
+                // the command around it: refused there, so none of its words go unchecked.
+                if in_cluster_command(&out) {
+                    return Err(CommandError::Unsupported {
+                        line: n,
+                        what: "a command substitution inside a kbf cluster command",
+                    });
+                }
                 out.push(Token::Control);
                 stack.push(Context::Nested {
                     in_quotes: context == Context::Quoted,
@@ -386,6 +375,26 @@ fn placeholder(rest: &[char], n: usize) -> Result<(&'static str, usize), Command
         .ok_or(CommandError::Placeholder { line: n, name })
 }
 
+/// Whether `program` and `verb` start a `kbf cluster` command: a `kbf` by any path.
+fn is_kbf_cluster(program: &str, verb: &str) -> bool {
+    program.rsplit('/').next() == Some("kbf") && verb == "cluster"
+}
+
+/// Whether the command `out` ends in (the words since its last control operator,
+/// redirection targets among them) is a `kbf cluster` command.
+fn in_cluster_command(out: &[Token]) -> bool {
+    let words: Vec<&str> = out
+        .iter()
+        .rev()
+        .take_while(|t| **t != Token::Control)
+        .filter_map(|t| match t {
+            Token::Word(w) => Some(w.as_str()),
+            _ => None,
+        })
+        .collect();
+    words.windows(2).any(|w| is_kbf_cluster(w[1], w[0]))
+}
+
 /// The `kbf cluster` commands among `tokens`: each simple command (the words between two
 /// control operators, redirections and their targets taken out) from its `kbf` word on.
 fn commands(tokens: &[Token]) -> Vec<Vec<String>> {
@@ -399,9 +408,7 @@ fn commands(tokens: &[Token]) -> Vec<Vec<String>> {
             Token::Word(w) => words.push(w.clone()),
             Token::Control => {
                 target = false;
-                let at = words
-                    .windows(2)
-                    .position(|w| w[0].rsplit('/').next() == Some("kbf") && w[1] == "cluster");
+                let at = words.windows(2).position(|w| is_kbf_cluster(&w[0], &w[1]));
                 if let Some(at) = at {
                     let mut argv = words.split_off(at);
                     argv[0] = "kbf".to_owned();

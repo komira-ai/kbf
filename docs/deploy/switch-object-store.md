@@ -140,10 +140,13 @@ with the same walk as above: between steps 3 and 4,
   `--cold-store <uri>` with `--cold-store registered`, and remove `--cold-store-credentials-file`
   and its value (`registered` refuses it: the keys come from the frontend). The unit must also
   have `--frontend`: `registered` without it does not start;
-- look at **every** drop-in that applies to the unit, loaded or not: `<unit>.d/`, `service.d/`
-  and the prefix forms (`kbf-.service.d/`, ...) under `/etc/systemd/system`, `/run/systemd/system`,
-  `/usr/local/lib/systemd/system`, `/usr/lib/systemd/system` and `/lib/systemd/system`
-  (`systemctl show -P DropInPaths <unit>` lists the loaded ones). A drop-in that names a store
+- look at **every** drop-in that applies to the unit, loaded or not: for each of its names
+  (`systemctl show -P Names <unit>`, aliases included), `<name>.d/`, the template's
+  `<template>@.service.d/` for an instance, the prefix forms (`kbf-.service.d/`, ...) and
+  `service.d/`, under `/etc/systemd/system`, `/run/systemd/system`,
+  `/usr/local/lib/systemd/system`, `/usr/lib/systemd/system` and `/lib/systemd/system`, a
+  directory reached through a symbolic link included; and every file `systemctl show -P
+  DropInPaths <unit>` lists as loaded. A drop-in that names a store
   (`--cold-store`, an `s3://` URI, an `endpoint=`, `AWS_ENDPOINT_URL`) or sets `ExecStart=` is
   applied after the unit and wins, so move that line out of it;
 - `sudo systemctl daemon-reload`, and check the flag once on what systemd will run, not on the
@@ -216,7 +219,8 @@ Before any write it checks every listed member, and stops on the first problem:
 - the unit's effective `ExecStart` (what systemd will run) is the member: its `--advertise-addr`,
   or else its `--storage-listen`, is the member's address, and its `--node-id` is the node given
   (a unit with `--node-id` and no node given is refused: its daemon would be restarted undrained);
-- no drop-in, loaded or not, names a store or sets `ExecStart=`;
+- no drop-in names a store or sets `ExecStart=`: neither one systemd loaded (`DropInPaths`) nor
+  any file in a drop-in directory of any of the unit's names (the section above);
 - its `--cold-store` is `registered`, or with `--migrate` a store URL that the rewrite can take
   (the flag and its value on one line of the file, unquoted, as systemd runs them), with
   `--frontend` present;
@@ -391,24 +395,40 @@ remote_test() { # host, test args...
   return "$rc"
 }
 
-# Every drop-in directory systemd reads for $UNIT, in every unit directory.
-dropin_dirs() {
-  local base=${UNIT%.service} prefix= part dir
-  local names=("$UNIT.d" "service.d")
-  IFS=- read -ra parts <<<"$base"
+# The drop-in directory names systemd reads for one unit name: <name>.d, the template's
+# <template>@.service.d for an instance, each dash-prefix form (kbf-.service.d, ...) and
+# service.d.
+dropin_names() { # unit name
+  local base=${1%.service} prefix= part
+  echo "$1.d"
+  [[ $base != *@?* ]] || echo "${base%%@*}@.service.d"
+  IFS=- read -ra parts <<<"${base%%@*}"
   for part in "${parts[@]:0:${#parts[@]}-1}"; do
     prefix+="$part-"
-    names+=("$prefix.service.d")
+    echo "$prefix.service.d"
   done
-  for dir in /etc/systemd/system /run/systemd/system /usr/local/lib/systemd/system /usr/lib/systemd/system /lib/systemd/system; do
-    for part in "${names[@]}"; do echo "$dir/$part"; done
+  echo service.d
+}
+
+# Every drop-in directory systemd reads for $UNIT on a host, under each of its names
+# (aliases included), in every unit directory.
+dropin_dirs() { # host
+  local names name part dir
+  names=$(on "$1" systemctl show -P Names "$UNIT") || stop "$1: cannot read the names of $UNIT"
+  [ -n "$names" ] || stop "$1: systemd gives no names for $UNIT"
+  for name in $names; do
+    for part in $(dropin_names "$name"); do
+      for dir in /etc/systemd/system /run/systemd/system /usr/local/lib/systemd/system /usr/lib/systemd/system /lib/systemd/system; do
+        echo "$dir/$part"
+      done
+    done
   done
 }
 
 # Checks a member's host and unit. Sets FRAGMENT, ARGV, NEEDS_MIGRATION (0 or 1), and the
 # forms the rewrite replaces (STORE_FORM, CREDENTIALS_FORM).
 check_unit() { # index
-  local i=$1 host=${HOSTS[$1]} node=${NODES[$1]} addr dir files f rc store creds unit_node bound
+  local i=$1 host=${HOSTS[$1]} node=${NODES[$1]} addr dir dirs files found f rc store creds unit_node bound
   addr=$(member_field "${MEMBERS[$i]}" addr) || fail
   FRAGMENT=$(on "$host" systemctl show -P FragmentPath "$UNIT") || stop "$host: cannot read $UNIT"
   case "$FRAGMENT" in
@@ -417,17 +437,22 @@ check_unit() { # index
   esac
   [ "$(on "$host" systemctl show -P NeedDaemonReload "$UNIT")" = no ] \
     || stop "$host: $UNIT changed on disk since systemd read it; daemon-reload first"
-  for dir in $(dropin_dirs); do
+  # The drop-ins systemd loaded, and every file in a drop-in directory it would read
+  # (through a symbolic link too), loaded or not.
+  files=$(on "$host" systemctl show -P DropInPaths "$UNIT") || stop "$host: cannot read the drop-ins of $UNIT"
+  dirs=$(dropin_dirs "$host") || fail
+  for dir in $dirs; do
     remote_test "$host" -d "$dir" || continue
-    files=$(on "$host" find "$dir" -maxdepth 1 -name '*.conf') || stop "$host: cannot list $dir"
-    for f in $files; do
-      rc=0; on "$host" grep -nE 'ExecStart|cold-store|s3://|endpoint=|AWS_ENDPOINT' "$f" || rc=$?
-      case "$rc" in
-        0) stop "$host: the drop-in $f names a store or sets ExecStart (lines above); move that out of it by hand" ;;
-        1) ;;
-        *) stop "$host: cannot read the drop-in $f (exit $rc)" ;;
-      esac
-    done
+    found=$(on "$host" find -L "$dir" -maxdepth 1 -name '*.conf') || stop "$host: cannot list $dir"
+    files="$files $found"
+  done
+  for f in $files; do
+    rc=0; on "$host" grep -nE 'ExecStart|cold-store|s3://|endpoint=|AWS_ENDPOINT' "$f" || rc=$?
+    case "$rc" in
+      0) stop "$host: the drop-in $f names a store or sets ExecStart (lines above); move that out of it by hand" ;;
+      1) ;;
+      *) stop "$host: cannot read the drop-in $f (exit $rc)" ;;
+    esac
   done
   ARGV=$(effective_argv "$host") || fail
   bound=$(the_flag "$host" "$ARGV" --advertise-addr) || fail
