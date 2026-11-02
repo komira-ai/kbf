@@ -335,3 +335,36 @@ fn reports_kept_while_halted_join_to_a_halt_whose_report_cannot_be_read() {
     let seen: Vec<&str> = marks.halt_seen.iter().map(|a| a.node_id.as_str()).collect();
     assert_eq!(seen, ["s2"]);
 }
+
+/// Catches: a kept report joined by host alone, or by version alone: when the ops file's halt
+/// and acknowledgement are of the same hosts as the halts file's records but of other versions
+/// (or of the same version and another host), nothing joins: the
+/// halt and the acknowledgement read with no report, and the reports kept while the other halt
+/// stood are dropped.
+#[test]
+fn a_kept_report_of_the_same_host_and_another_version_joins_nothing() {
+    let dir = TestDir::under(std::env::temp_dir(), "ops-commit-other-version");
+    let path = dir.path().join("ops.json");
+    fs::write(
+        &path,
+        r#"{"schema":1,"services":{"kbf":{
+            "halt":{"node_id":"s1","check":"tainted","target":"2.0"},
+            "halt_acked":[{"node_id":"s4","target":"1.5"}]}}}"#,
+    )
+    .expect("written");
+    let report =
+        |target: &str| serde_json::json!({"target": target, "outcome": "failed", "phase": "halt"});
+    let halts = serde_json::json!({"services": {"kbf": {
+        "halt": {"node_id": "s1", "target": "2.1", "report": report("2.1")},
+        "halt_acked": [
+            {"node_id": "s5", "target": "1.5", "report": report("1.5")},
+            {"node_id": "s4", "target": "1.6", "report": report("1.6")},
+        ],
+        "halt_seen": [{"node_id": "s2", "target": "2.1", "report": report("2.1")}],
+    }}});
+    fs::write(halts_path(&path), halts.to_string()).expect("written");
+    let marks = OpsStore::open(&path).expect("read").marks("kbf");
+    assert_eq!(marks.halt.map(|h| h.report), Some(None));
+    assert_eq!(marks.halt_acked[0].report, None);
+    assert_eq!(marks.halt_seen, []);
+}
