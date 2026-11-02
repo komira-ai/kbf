@@ -195,6 +195,9 @@ async fn other_services_are_untouched() {
         json!({"reply": "update", "service": "other", "version": "3.0"})
     );
     assert_eq!(convergence(&rig, "other").await["state"], "in_progress");
+    // d1 reports `other` done, so its update no longer holds the one slot.
+    let done = r#","services":[{"name":"other","version":"3.0","health":"healthy"}]"#;
+    send(&rig, "d1", "daemon", &beat("2.0", done)).await;
 
     clear(&rig, "kbf").await;
     let halted = format!(

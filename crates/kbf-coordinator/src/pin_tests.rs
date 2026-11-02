@@ -160,7 +160,9 @@ fn a_pinned_hosts_failure_does_not_roll_the_service_back() {
 }
 
 /// A pinned host is never chosen as a canary: with a canary of one and the smallest id pinned,
-/// the next host goes.
+/// the gate is open to the next host and closed to the one after. While the pin stands the
+/// pinned host holds the farm's one live update slot, so the next host is held `no_slot` until
+/// it goes.
 ///
 /// Catches: a canary gate that waits forever for a host that will not update.
 #[test]
@@ -169,8 +171,16 @@ fn a_pinned_host_is_not_chosen_as_a_canary() {
     let mut f = Fleet::new(Duration::ZERO);
     started(&mut f, 100);
     beats(&mut f, "a", &pinned(beat("1.0")), 100);
+    let def = s.get(KBF).expect("kbf");
+    let want = desired("2.0", 0, 0);
+    let closed = |f: &Fleet, host: &str| {
+        let me = f.get(&id(host)).expect("a host");
+        crate::canary::closed_to(def, &want, f, &id(host), me, secs(100))
+    };
+    assert!(!closed(&f, "b"), "b takes the pinned host's canary place");
+    assert!(closed(&f, "c"));
     assert_eq!(why(&s, &f, "a", 100), held(Hold::Pinned));
-    assert_eq!(why(&s, &f, "b", 100), go());
+    assert_eq!(why(&s, &f, "b", 100), held(Hold::NoSlot));
     assert_eq!(why(&s, &f, "c", 100), held(Hold::CanaryWait));
 }
 
@@ -229,12 +239,14 @@ async fn the_status_lists_a_pinned_host_as_pinned() {
     assert_eq!(kbf["slots_held"], json!(1));
 }
 
-/// The pin is `kbf`'s: a pinned host that also runs `other` is still ordered `other`'s
-/// desired version, and is held `pinned` under `kbf` only.
+/// The pin is `kbf`'s, and the host is held `pinned` under `kbf` only: under `other` it carries
+/// no pin. But a pinned host keeps its update slot, and one update is live at a time across
+/// every service, so nothing else is ordered while the pin stands: `other` is held `no_slot`.
+/// Once the host beats unpinned (healthy, not failed), it is ordered again.
 ///
-/// Catches: a `kbf` pin that stalls the rollout of every service on the host.
+/// Catches: a `kbf` pin read as an `other` pin; a pin that frees the farm's one live slot.
 #[tokio::test]
-async fn a_pinned_host_is_still_ordered_another_service() {
+async fn a_pinned_host_holds_the_one_live_slot_for_every_service() {
     let mut rig = Rig::new("pin-other-service");
     let list = kbf_oidc::testkit::config_text(kbf_oidc::testkit::STATIC_ISSUER)
         + "services = [\"kbf\", \"other\"]\n";
@@ -272,19 +284,27 @@ async fn a_pinned_host_is_still_ordered_another_service() {
         role: HostRole::DAEMON,
     };
     assert_eq!(
-        rig.coordinator.heartbeat(who, b),
-        ServiceReply::Update {
-            service: Some("other".to_owned()),
-            version: version("3.0"),
-        }
+        rig.coordinator.heartbeat(who.clone(), b.clone()),
+        ServiceReply::Nothing
     );
     let status = status_of(&rig);
     assert_eq!(
         host(&status["per_service"]["kbf"]["hosts"], "d1")["hold"],
         json!("pinned")
     );
+    let under_other = host(&status["per_service"]["other"]["hosts"], "d1");
+    assert_eq!(under_other.get("pinned"), None);
+    assert_eq!(under_other["hold"], json!("no_slot"));
+
+    // Unpinned, the host is ordered again: `kbf` first (the services of one priority go `kbf`
+    // first), one update at a time.
+    b.pinned = None;
+    rig.at(2_015);
     assert_eq!(
-        host(&status["per_service"]["other"]["hosts"], "d1").get("pinned"),
-        None
+        rig.coordinator.heartbeat(who, b),
+        ServiceReply::Update {
+            service: None,
+            version: version("2.0"),
+        }
     );
 }

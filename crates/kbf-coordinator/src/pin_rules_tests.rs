@@ -83,10 +83,12 @@ fn a_silent_pinned_host_keeps_its_slot_until_it_beats_unpinned() {
 }
 
 /// A canary pinned at each stage. Ordered and then pinned: its order ends, it has not started,
-/// and the next host takes its place. Pinned while updating, or after failing the desired
-/// version: it has started, so it fills the canary and the others wait; unpinned after the
-/// failure, it is held as failed and the others still wait. Pinned at the desired version and
-/// up, it counts as baked, and the gate opens.
+/// and the gate opens to the next host in its place. Pinned while updating, or after failing
+/// the desired version: it has started, so it fills the canary and the others wait; unpinned
+/// after the failure, it is held as failed and the others still wait. Pinned at the desired
+/// version and up, it counts as baked, and the gate opens. Wherever the gate opens while the
+/// pin stands, the next host is still held `no_slot`: the pinned host holds the farm's one
+/// live update slot.
 ///
 /// Catches: a gate that a pinned canary keeps shut for good, or that opens on a failed one.
 #[test]
@@ -100,7 +102,8 @@ fn a_canary_pinned_at_each_stage() {
     assert_eq!(why(&s, &f, "b", 100), held(Hold::CanaryWait));
     beats(&mut f, "a", &pinned(beat("1.0")), 115);
     assert_eq!(why(&s, &f, "a", 115), held(Hold::Pinned));
-    assert_eq!(why(&s, &f, "b", 115), go(), "a no longer started");
+    assert!(!closed(&s, &f, "b", 115), "a no longer started");
+    assert_eq!(why(&s, &f, "b", 115), held(Hold::NoSlot));
     assert_eq!(why(&s, &f, "c", 115), held(Hold::CanaryWait));
 
     let mut f = Fleet::new(Duration::ZERO);
@@ -108,7 +111,8 @@ fn a_canary_pinned_at_each_stage() {
     beats(&mut f, "a", &pinned(updating(beat("1.0"), "2.0")), 115);
     assert_eq!(why(&s, &f, "b", 115), held(Hold::CanaryWait));
     beats(&mut f, "a", &pinned(beat("2.0")), 130);
-    assert_eq!(why(&s, &f, "b", 130), go(), "baked at the desired version");
+    assert!(!closed(&s, &f, "b", 130), "baked at the desired version");
+    assert_eq!(why(&s, &f, "b", 130), held(Hold::NoSlot));
 
     let mut f = Fleet::new(Duration::ZERO);
     started(&mut f, 100);
@@ -123,6 +127,13 @@ fn a_canary_pinned_at_each_stage() {
     beats(&mut f, "a", &last(beat("1.0"), "2.0", Outcome::Failed), 130);
     assert_eq!(why(&s, &f, "a", 130), held(Hold::FailedHere));
     assert_eq!(why(&s, &f, "b", 130), held(Hold::CanaryWait));
+}
+
+/// Whether the canary gate is closed to `host` at `now`, wanting 2.0.
+fn closed(s: &Services, f: &Fleet, host: &str, now: u64) -> bool {
+    let def = s.get(KBF).expect("kbf");
+    let me = f.get(&id(host)).expect("a host");
+    crate::canary::closed_to(def, &desired("2.0", 0, 0), f, &id(host), me, secs(now))
 }
 
 /// In a mixed fleet the unpinned failures alone are counted: three failed hosts of six with

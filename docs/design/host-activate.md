@@ -90,7 +90,8 @@ heartbeat; a link, another account's file, a writable one or anything but a regu
 pin; root's file that cannot be read, or names no commit, and a name that cannot be looked at,
 pin all the same, with no commit. An update already running is not cut.
 The services besides `kbf` are not pinned: the hold names a `kbf` release. The coordinator holds
-a pinned host (`pinned`), keeps its slot (so a pin never lets the rollout go on to the next host),
+a pinned host (`pinned`), keeps its slot (so a pin never lets the rollout go on to the next host;
+with one update live at a time across every service, nothing is ordered anywhere while it stands),
 counts it neither failed nor at another version, and takes no vote for a rollback from it.
 
 `kbf-host-install unpin` undoes the pin under the install lock: the commit is taken out of

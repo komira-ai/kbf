@@ -35,7 +35,7 @@ const KEY_REFETCH: Duration = Duration::from_secs(30);
 /// How long fetching the issuer's discovery document or keys may take.
 const KEY_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// `kbf-coordinator`: tells each host's updater which version to run, within per-role limits.
+/// `kbf-coordinator`: tells each host's updater which version to run, one live update at a time.
 #[derive(Clone, Debug, Parser)]
 #[command(
     name = "kbf-coordinator",

@@ -49,8 +49,8 @@ fn announcing(mut top: Heartbeat, services: &[(&str, &str)]) -> Heartbeat {
 /// - `s1` storage at 2.0; `s2` storage at 1.0 and updating to 2.0; `s3` storage at 1.0,
 ///   behind with the one storage slot taken by `s2`;
 /// - `d1` daemon at 2.0, running `other` at 3.0 and `third` at 1.0;
-/// - `d2` daemon at 2.0, running `other` at 1.0: it is ordered to update `other`, so under
-///   kbf it is busy elsewhere.
+/// - `d2` daemon at 2.0, running `other` at 1.0: behind on `other`, and not ordered, since
+///   `s2`'s kbf update is the one update live (`decide.rs`, rule 7).
 async fn farm(name: &str) -> Rig {
     let mut rig = Rig::new(name);
     let list = config_text(STATIC_ISSUER) + "services = [\"kbf\", \"other\", \"third\"]\n";
@@ -129,7 +129,7 @@ async fn status_lists_every_service_with_its_hosts_up_count_slots_and_hold() {
         rows(&status, "kbf"),
         [
             row("d1", true, false, json!("up_to_date")),
-            row("d2", true, false, json!("busy_elsewhere")),
+            row("d2", true, false, json!("up_to_date")),
             row("s1", true, false, json!("up_to_date")),
             row("s2", false, true, json!("updating")),
             row("s3", true, false, json!("no_slot")),
@@ -142,10 +142,10 @@ async fn status_lists_every_service_with_its_hosts_up_count_slots_and_hold() {
         rows(&status, "other"),
         [
             row("d1", true, false, json!("up_to_date")),
-            row("d2", false, true, Value::Null),
+            row("d2", true, false, json!("no_slot")),
         ]
     );
-    assert_eq!((&other["up"], &other["slots_held"]), (&json!(1), &json!(1)));
+    assert_eq!((&other["up"], &other["slots_held"]), (&json!(2), &json!(0)));
     assert_eq!(other["convergence"]["state"], "in_progress");
     assert_eq!(other["convergence"]["desired"], "3.0");
 
@@ -160,12 +160,27 @@ async fn status_lists_every_service_with_its_hosts_up_count_slots_and_hold() {
 }
 
 /// Behaviour: a host holding a slot of one service is shown holding it for that service
-/// only. `d2` was ordered to update `other`: under `other` it holds a slot and is not up;
-/// under kbf, and in the top-level kbf host list, it holds nothing and is up. Catches the
-/// kbf service being used where the service named should be.
+/// only. Once `s2` reports kbf done, `d2` is ordered to update `other`: under `other` it holds
+/// a slot and is not up; under kbf, and in the top-level kbf host list, it holds nothing and
+/// is up. Catches the kbf service being used where the service named should be.
 #[tokio::test]
 async fn an_order_for_another_service_is_shown_under_that_service_only() {
     let rig = farm("status-service-slot").await;
+    let c = &rig.coordinator;
+    c.heartbeat(who("s2", HostRole::STORAGE), beat("2.0"));
+    let ordered = c
+        .heartbeat(
+            who("d2", HostRole::DAEMON),
+            announcing(beat("2.0"), &[("other", "1.0")]),
+        )
+        .reply;
+    assert_eq!(
+        ordered,
+        kbf_updater::wire::ServiceReply::Update {
+            service: Some("other".to_owned()),
+            version: version("3.0"),
+        }
+    );
     let status = status_of(&rig);
     let d2 = |rows: Vec<(String, Value, Value, Value)>| {
         rows.into_iter().find(|r| r.0 == "d2").expect("d2")
@@ -241,7 +256,7 @@ async fn the_kbf_status_keeps_its_bytes_and_only_gains_keys() {
         r#""platform":"linux-x86_64","version":"2.0","health":"healthy","last_update":null,"updating":null,"hold":"up_to_date"}"#
     );
     let convergence = format!(
-        r#"{{"desired":"2.0","quiet":false,"state":"converged","roles":[{{"role":"storage","at_desired":1,"updating":0,"failed":0,"down":0}}],"commit":"{commit}"}}"#
+        r#"{{"desired":"2.0","quiet":false,"state":"converged","roles":[{{"role":"storage","at_desired":1,"updating":0,"failed":0,"down":0}}],"commit":"{commit}","generation":1,"replaced":null,"write_id":""}}"#
     );
     let want = format!(
         r#"{OLD_HEAD},"hosts":[{host}],"up":1,"slots_held":0,"convergence":{convergence}}}}},"commit":"{commit}"}}"#

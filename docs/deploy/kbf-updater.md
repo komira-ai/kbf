@@ -333,10 +333,12 @@ agent's state directory).
   known); the field is never dropped when a heartbeat is trimmed to fit. A coordinator from before
   the pin ignores the field (and orders the host, which does not run the order); this one reads a
   `pinned` it cannot parse as absent and counts it among the dropped facts.
-- The coordinator **orders a pinned host nothing for `kbf`** (`hold` `pinned` under `kbf`; its
-  other services are ordered as before), and a `kbf` order it gave before ends when the host says
-  it is pinned. The host **keeps a slot of its role** however healthy it
-  is, so pinning a host never lets the rollout go on to the next one. It is counted **neither
+- The coordinator **orders a pinned host nothing for `kbf`** (`hold` `pinned` under `kbf`; under
+  its other services it carries no pin), and a `kbf` order it gave before ends when the host says
+  it is pinned. The host **keeps an update slot** however healthy it is, so pinning a host never
+  lets the rollout go on to the next one. Since one update is live at a time across every service
+  and role, a pinned host holds that one: while the pin stands no host is ordered anything, of any
+  service (`no_slot`), and the rollout goes on once the host beats unpinned. It is counted **neither
   failed nor at another version**: the role's `pinned` count has it (and `at_desired` when it runs
   the desired version), `failed` does not, so it does not make the farm `blocked`, and a host
   pinned to another version keeps it from `converged`. Its failure is no vote for an automatic
@@ -462,13 +464,15 @@ What each value is for, for a farm of six storage hosts:
 - `[service.roles.storage]` and `roles = ["storage"]`: tierstore is ordered to hosts of the storage
   role and to no other. A host of another role that lists tierstore is not counted and is never
   ordered it.
-- `max_updating = 1` and `min_up = 4`: one storage host updates at a time and four others must be
-  up while it does, so one storage host that is down, drained or excluded does not hold the roll; a
+- `max_updating = 1` and `min_up = 4`: one storage host updates at a time (the coordinator allows
+  one live update at a time whatever the number says, see "One live update at a time" below) and
+  four others must be up while it does, so one storage host that is down, drained or excluded does not hold the roll; a
   second one does, until one is back or `min_up` is lowered in the file. tierstore keeps serving through
   its hand-over, and the canary, the bake and the automatic rollback still gate each step. A farm of
   fewer than six storage hosts needs a smaller `min_up`.
-- One service per host updates at a time, but kbf and tierstore may update different hosts at once:
-  kbf restarting on one host while tierstore hands over on another.
+- kbf and tierstore never update two hosts at once: while tierstore hands over on one storage host,
+  no host is ordered kbf, and while kbf restarts on one host, no host is ordered tierstore. The
+  bake below counts too: no other order goes out until the last tierstore host has baked.
 - `canary = { count = 1 }` and `bake_beats = 3`: one host goes alone, and no other starts until it has
   sent three healthy beats at the new version; each host
   after it holds its slot for the same three beats, so the next host starts only once the last one has
@@ -735,6 +739,34 @@ will converge on it.
 
 `--services-file` is read once at start, under the rule of `--operator-token-file`: a regular file (not a symlink) owned by the coordinator's user with mode `0600` or `0400`, at most 1 MiB; a file that fails it stops the start. Treat it as secret-grade: a file whose first entry is named `kbf` replaces the shipped kbf definition, and can set `max_updating` up to 10000, `min_up = 0`, drop `never_last` and every `after`, so whoever controls the file controls kbf's rollout safety. A replaced kbf must be the first entry, wait for no service and have a role, and its desired state still names `min_up` for storage and frontend.
 
+**One live update at a time.** The coordinator orders a new update only when no host, of any role,
+holds an update slot for any service. A host holds a slot from the order the coordinator gave it
+(until the host reports it, or for 120 s), while it is updating, while its promotion is pending,
+while it bakes (`bake_beats` below, at its service's desired version) and, after a failed update,
+until it heartbeats healthy. So two services with updates pending take turns: the second is
+ordered only once the first host is healthy and released. A failed host that is unhealthy holds
+the next order of every service until it is healthy again or the operator fixes it; only that
+host itself may be ordered a new desired version of the service it failed, as before. This holds
+for every service and role, with no setting. `max_updating`, in a services file entry and in a
+desired state, is still read and accepted as before, so files and states written for earlier
+releases load unchanged, but a number above 1 no longer lets more hosts update at once; 0 still
+holds the role (no host of it is ordered). `min_up` is unchanged. The one-update-per-host rule
+(`busy_elsewhere`) also still holds.
+
+A host that leaves a service while it holds a slot (the operator excludes it, its labels move it
+out of the selector, or its agent stops announcing the service) still holds the slot: the
+coordinator keeps the host's last word and any order it gave it, reads the host's further beats
+about the service, and frees the slot under the same rule (done, healthy, baked, or the order's
+120 s). A host that holds a slot and is never heard from again holds it until it is back, or
+until the coordinator restarts.
+
+After a restart the coordinator knows of a live update from the hosts' own beats in the 30 s
+quiet start, so the rule resumes as it was for a host updating, waiting for its promotion, failed
+and unhealthy, or baking (a bake counts again from the restart). Orders are not stored: a host
+ordered just before the restart that stays silent through the whole quiet start (it reports an
+order within one 15 s heartbeat) is not known to hold the slot, and another host may be ordered
+before its first report.
+
 A service may carry `install_when_absent = true` and a `[service.selector]` with `roles` (default: every role of the service) and `labels` (at most 8, key and value 1 to 32 bytes of `[a-z0-9-]`); a selector naming a role the service lacks is refused. Without a selector a host belongs to the service if it lists it, as always. With one, the coordinator decides who should run the service from the host's certificate role and the labels an operator set for it with `POST /v1/operator` (`set_labels`; a heartbeat can never set them). A selected, live host whose agent announced `heartbeat-v2` and that did not list the service is `missing`; one that reports it `absent` is `absent` and is ordered only with `install_when_absent`; one whose agent did not announce `heartbeat-v2` is `unmanaged` (not counted, not ordered); one an operator excluded is `excluded`. A silent host is `down` first of all. `GET /v1/convergence` shows `hosts: {missing, absent, excluded, unmanaged, deferred}` for a service with a selector, or any such host, and a service with a missing or absent host is `in_progress`; the status lists them with their reason. Exclusions apply to a service without a selector too. `deferred` counts the live hosts within the wait that follows their deferral of the desired version. This holds for `kbf` as for any service whose definition has a selector or an exclusion: a host that is not counted for `kbf` (excluded, or outside a `kbf` selector) has its beat not recorded, so it gets no `kbf` orders, is left out of the `kbf` convergence and appears only in `members`. Excluding a node from `kbf` therefore stops its `kbf` updates.
 
 A service entry may also set two rollout fields, both off by default (a coordinator before the change refuses a file that names them, so set them only after every coordinator runs the new build):
@@ -745,6 +777,32 @@ A service entry may also set two rollout fields, both off by default (a coordina
 A host whose heartbeat carries `promotion_pending` holds its update slot and does not count as up, whatever the definition says. The coordinator puts no bound of its own on a pending promotion. The design gives that bound to the updater (the service declaration's `promotion_ceiling_secs`, which turns an overdue promotion into a failed update, `after_commit`, while the agent keeps beating); no build implements it yet. A host that dies mid-promotion holds its slot until it is fixed, as an updating host does.
 
 The coordinator keeps its desired state per service name, and `kbf` is the only service it accepts unless `--services-file` defines more ([the design](../design/updates.md)): `POST /v1/desired` takes an optional `service` (absent means `kbf`; a name no file defines is a 400), and `GET /v1/status` adds `services` beside the unchanged `desired`, `services_dropped`, the number of heartbeats whose `services` list was bad and was dropped (the host is answered as a `kbf`-only host), and `per_service` (below). While `kbf` is the only service, the `--state-file` holds the single state in the form earlier coordinators wrote, so a downgrade to one of them starts on the same file; a file in the map form (`{"services": {...}}`), which a coordinator with a second service writes, is refused by an earlier build, and the operator then restores the file from before or writes `kbf`'s state alone in it.
+
+The coordinator keeps a record of the writes of each service's desired state. `generation` is
+raised by every accepted write, a `POST /v1/desired` or the coordinator's own rollback, including
+one that sets the version already desired (0 before the first). `replaced` is `{"version",
+"min_up"}`, the version and minimums that the last change of version replaced (`null` until a
+second version was set); a write of the version already desired keeps it. `write_id` is the
+caller's text for the write that made the state (empty for a write without one, and for the
+coordinator's own). `POST /v1/desired` takes two optional fields for these: `if_generation`, a
+number, makes the write conditional: when it is not the service's generation now the answer is 409
+`conflict` and nothing changes, the bad mark of the version included; `write_id` is 1 to 128
+visible ASCII characters. A malformed one is a 400. The answer of the POST is the state as stored
+followed by `generation`, `replaced` and `write_id`, and `GET /v1/convergence` (and so the status's
+`per_service.*.convergence`) shows them too. The record is kept in a file of its own beside the
+`--state-file`, its name with `.writes` added, so the state file keeps the form earlier
+coordinators read and a downgrade still starts (the earlier build ignores the `.writes` file). At
+each write the state is written whole to its temporary file, the `.writes` file is written naming
+that file (its inode and modification time) and the state each entry describes, and the temporary
+file is then renamed over the state file, which keeps both. Every replacement of the state file is
+another file (another inode, or a reused inode with the later time of its own write), so at a start
+the `.writes` file is trusted only when it names the state file in place and the state in it: after a
+stop between the two writes, or any write of the state file by an earlier coordinator (even one
+that changed the state and changed it back), the entries' `replaced` and `write_id` are dropped and
+their generations raised by one. A restore then finds nothing replaced and names the hand step. A
+generation that cannot be raised (it is at 2^64 - 1) refuses every write of that service, as a 500,
+and stops a start that would have to raise it. A `.writes` file that is not JSON of its shape stops
+the start; a key it does not know is skipped.
 
 `--ops-file` (default: the `--state-file` name with `.ops` added) holds what an operator decides, apart from CI's desired state: the hosts excluded from a service, the labels on a host, and a ring of the last 64 operator changes (it also holds the per-service marks: `halt`, `halt_acked`, `last_good`, `bad` and `failure_acked`; a coordinator from before the rollback release knows all of them but `failure_acked`, which is written only after CI sets by hand a version marked bad, and refuses a file that holds it as an unknown key, so that rolling back across that release means moving the file aside). What the halt release adds is kept beside the ops file, in `<ops-file>.halts`: the whole report each halt and each acknowledgement was made from, the reports received while a halt stood and each service's clear generation. The ops file keeps the shape a coordinator from before that release reads, so one rolled back starts on it, ignores the halts file and keeps the halt as it always did (it does not stop orders for a halt); rolled forward again, the coordinator joins the halts file back by host and target and drops what no longer matches. The halts file's reader skips a key it does not know, and passes over (and counts, in a warning at start) a record whose report it cannot read, such as an outcome a later release added; it refuses only a file it cannot parse. A change is committed by replacing the ops file: the halts file that goes with it is first written to `<ops-file>.halts.next`, naming the SHA-256 of the new ops file, then the ops file is replaced, then the staged file is renamed over the halts file. A start, and every change, first settles a staged file left behind: renamed in when the ops file is the one it names, removed otherwise. A change takes effect (and a clear's generation is told to agents) only once the halts file is renamed in; when that rename fails, the change fails and the next start or change renames the staged file in. A crash or a failed write therefore leaves the two files as they were before the change or as they are after it, never one of each: a clear's generation is on disk with the clear or not at all. A staged file that cannot be settled stops the start with its path in the message. The coordinator creates the file at the first change and replaces it whole (a temporary file beside it, fsync, rename, directory fsync), owner-only; with no file nothing is excluded or labelled and the coordinator behaves as before. The reader is strict: a key it does not know, or a `schema` newer than the build's, stops the start with the flag and the path in the message, so a coordinator rolled back below the build that wrote the file does not ignore what it holds. To start without the file anyway, move it aside on purpose. The directory must be writable by the coordinator. `GET /v1/status` shows the store's content (the two files joined) as `ops` once anything has been changed (before that the key is absent).
 
@@ -786,9 +844,51 @@ Each accepted action is written to the file before it takes effect (a failed wri
    convergence fails the job; the release stays published whatever it says. Another failed read
    is reported and tried again, and counts as no change.
 
+The job gives `--deadline-min 60` explicitly. Every step of the job has a `timeout-minutes` of its
+own, and the job's (200) is at least their sum: a step that hangs, the proof included, is cut by its
+own timeout and fails, and the restore still runs within its own. The deploy's (85) and the
+restore's (30) cover the longest their verbs can run, and a minute to start: every call is a token
+call and a coordinator call of at most 60 seconds each, a call tried again on a 503 is four such
+calls and three pauses of `--every-secs` (30), the restore makes three of those (28.5 minutes), and
+the deploy two, its deadline, a last read and a pause (81.5 minutes). The release workflow lint
+computes these from the verbs' own limits (`deploy_bound` and `restore::bound` of
+`crates/xtask/src/deploy_farm.rs`) and holds each of them.
+
+When any earlier step of the `gamma` job failed (the deploy, or the proof after it), the job's
+last step, `cargo xtask deploy-farm restore --url ... --ca-pem ... --version <this release> --run
+<run id>-<attempt>`, sets the farm back:
+
+1. it reads `GET /v1/convergence`. When the desired version is not this release (another writer,
+   a newer release or the coordinator's own rollback has it), it sets nothing, says so and exits
+   0. When the coordinator shows no `generation` (a coordinator older than this), or no
+   `replaced` (the release was the farm's first), it sets nothing and exits 1 naming the hand
+   step (below). An answer whose fields are not of their types (no `desired`, a `generation` that
+   is no count, and so on) is an error, never read as "another version";
+2. it posts `replaced` (its version and minimums) to `/v1/desired` with `if_generation` set to
+   the generation it read and `write_id` set to `restore-<run id>-<attempt>`, with a fresh token
+   (a 503 is tried again, as for the deploy), prints what it set, and exits 1, so the run stays
+   red;
+3. on a 409 it reads once more: a state whose `write_id` is its own is an earlier try of the same
+   POST that landed behind a lost answer, and the restore is done; any other write stands,
+   nothing is restored, and it exits 1 naming the desired version and that write.
+
+Any other failure of the POST (a 503 on every try, a lost connection, a timeout, an answer it
+cannot read) is followed by the same read, so a restore that landed with its answer lost is
+reported done. A POST that did not land, and a 401 or a 403, exit 1 naming the version it could
+not set and the hand step; when the read after an unseen POST fails too, it exits 1 saying the
+outcome is not known and which `write_id` to look for. Versions and write ids are compared and
+posted exactly as the coordinator sent them; only the log shortens them. The hand step, until the
+forced rollback of the design is built, is re-running, from its run's page, the `gamma` job of the
+release the farm should run, which sets that release as desired. The restore is an ordinary desired write, so it goes through every ordinary rule. A run
+that is cancelled, or whose runner is lost, restores nothing; `GET /v1/convergence` still shows
+`replaced`, and re-running the failed jobs sets this release again (which keeps `replaced`) and
+then runs the restore.
+
 `GET /v1/convergence` answers `{"desired", "quiet", "state", "roles": [{"role", "at_desired",
-"updating", "failed", "down"}]}`, where `state` is `converged`, `blocked`, `halted` or `in_progress` (`halted` adds `halt`: `{"node_id","check","target"}`). A role
-with a live pinned host also has `pinned`, their number ([The pin](#the-pin)); a pinned host is
+"updating", "failed", "down"}], "commit", "generation", "replaced", "write_id"}`, where `state` is
+`converged`, `blocked`, `halted` or `in_progress` (`halted` adds `halt`: `{"node_id","check","target"}`),
+and `generation`, `replaced` and `write_id` are the record of the writes of the desired state, below. A
+role with a live pinned host also has `pinned`, their number ([The pin](#the-pin)); a pinned host is
 never counted in `failed`. It
 takes CI's OIDC token and refuses the operator token (the operator's read is `GET /v1/status`).
 It is computed from the heartbeats and the desired state, and stores nothing. `converged` needs
@@ -816,7 +916,7 @@ ordering the host now (`quiet`, `pinned`, `updating`, `busy_elsewhere`, `up_to_d
 `deferred`, `no_slot`, `baking`, `canary_wait`, `waiting_for_role`, `waiting_for_service`, `min_up`, `not_a_member`, `no_desired`, `no_definition`; these spellings are public), or
 `null` when it would be ordered at its next heartbeat. `up` and `slots_held` count those hosts,
 and `convergence` is the answer of `GET /v1/convergence?service=NAME`. The top-level keys, and the
-top-level `hosts`, which are `kbf`'s, are unchanged. Two holds are for the rollout fields above: `baking` means every slot of the host's role is held and at least one holder is a host at the desired version that has not finished baking, and `canary_wait` means the service's canary gate is closed and the host is not one of the canaries. `deferred` means the host declined the update to the desired version and its wait (`defer_backoff`, never shorter than the host's own `retry_after`) has not ended.
+top-level `hosts`, which are `kbf`'s, are unchanged. `no_slot` means some host, of any role, holds an update slot for some service (one live update at a time), or the host's role has `max_updating = 0` (the role is held). Two holds are for the rollout fields above: `baking` means no host holds a slot, but some host, of any role and service, is at its service's desired version and has not finished baking, and `canary_wait` means the service's canary gate is closed and the host is not one of the canaries. `deferred` means the host declined the update to the desired version and its wait (`defer_backoff`, never shorter than the host's own `retry_after`) has not ended.
 
 `cargo xtask deploy-farm --service NAME` (default `kbf`) deploys another service the same way.
 For `kbf` the requests are the ones listed above. For another service the POST body also has

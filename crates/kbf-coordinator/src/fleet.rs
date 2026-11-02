@@ -85,10 +85,11 @@ impl Host {
         self.beat.pinned.is_some()
     }
 
-    /// Whether the host holds one of its role's update slots: it is updating, its promotion
-    /// is pending, its last update failed and it has not yet heartbeated healthy, or it is
-    /// pinned. A pinned host is neither done nor failed: it keeps its slot, so pinning a host
-    /// never lets the rollout go on to another.
+    /// Whether the host holds an update slot (one is live at a time across every service,
+    /// [`crate::decide`]): it is updating, its promotion is pending, its last update failed
+    /// and it has not yet heartbeated healthy, or it is pinned. A pinned host is neither done
+    /// nor failed: it keeps its slot, so pinning a host never lets the rollout go on to another
+    /// (and, the slot being the farm's one, nothing is ordered anywhere while the pin stands).
     #[must_use]
     pub fn holds_slot(&self) -> bool {
         let failed = self
@@ -132,6 +133,10 @@ pub struct Fleet {
     started: Duration,
     nodes: BTreeMap<NodeId, Node>,
     hosts: BTreeMap<String, BTreeMap<NodeId, Host>>,
+    /// What hosts the service no longer counts (excluded, or dropped by its selector) last
+    /// said of it, kept so that an update they still run holds its slot
+    /// ([`Self::occupants_of`]). A host is in `hosts` or here for a service, never both.
+    outside: BTreeMap<String, BTreeMap<NodeId, Host>>,
     orders: BTreeMap<(NodeId, String), Order>,
     /// Healthy beats in a row at one version, per service and host ([`Bake`]).
     bake: BTreeMap<(String, NodeId), Bake>,
@@ -146,6 +151,7 @@ impl Fleet {
             started,
             nodes: BTreeMap::new(),
             hosts: BTreeMap::new(),
+            outside: BTreeMap::new(),
             orders: BTreeMap::new(),
             bake: BTreeMap::new(),
             defers: Defers::default(),
@@ -180,12 +186,21 @@ impl Fleet {
         self.nodes.iter()
     }
 
-    /// Forgets what the host `id` said about `service`, and any order for it.
+    /// Stops counting the host `id` for `service`: what it said moves out of the service's
+    /// hosts, to be kept with any order for it as what the host still occupies
+    /// ([`Self::occupants_of`]), until its own beats, recorded with
+    /// [`Self::record_outside_in`], or the order's age release it.
     pub fn forget_in(&mut self, service: &str, id: &NodeId) {
-        if let Some(hosts) = self.hosts.get_mut(service) {
-            hosts.remove(id);
+        if let Some(host) = self
+            .hosts
+            .get_mut(service)
+            .and_then(|hosts| hosts.remove(id))
+        {
+            self.outside
+                .entry(service.to_owned())
+                .or_default()
+                .insert(id.clone(), host);
         }
-        self.orders.remove(&(id.clone(), service.to_owned()));
     }
 
     /// Notes a `kbf` heartbeat: [`Self::record_in`] for [`KBF`].
@@ -211,8 +226,7 @@ impl Fleet {
         self.record_named_in(service, id, role.name(), beat, now);
     }
 
-    /// [`Self::record_in`] for a host whose role is named `role`: the one place a role enters
-    /// the fleet.
+    /// [`Self::record_in`] for a host whose role is named `role`.
     pub(crate) fn record_named_in(
         &mut self,
         service: &str,
@@ -220,6 +234,35 @@ impl Fleet {
         role: &str,
         beat: Heartbeat,
         now: Duration,
+    ) {
+        self.note(service, id, role, beat, now, true);
+    }
+
+    /// Notes a heartbeat of `service` from a host the service does not count (excluded, or
+    /// dropped by its selector): it ends an order and counts a bake as [`Self::record_in`]
+    /// does, and is kept only as what the host occupies ([`Self::occupants_of`]), never as one
+    /// of the service's hosts.
+    pub fn record_outside_in(
+        &mut self,
+        service: &str,
+        id: NodeId,
+        role: &HostRole,
+        beat: Heartbeat,
+        now: Duration,
+    ) {
+        self.note(service, id, role.name(), beat, now, false);
+    }
+
+    /// The one place a role enters the fleet: the beat ends an order, counts a bake and a
+    /// deferral, and is kept as one of the service's hosts when `counted`, else as outside.
+    fn note(
+        &mut self,
+        service: &str,
+        id: NodeId,
+        role: &str,
+        beat: Heartbeat,
+        now: Duration,
+        counted: bool,
     ) {
         let key = (id, service.to_owned());
         let mut deferred_order = false;
@@ -251,7 +294,15 @@ impl Fleet {
             }
         }
         self.defers.observe(&key, &beat, deferred_order, now);
-        self.hosts.entry(key.1).or_default().insert(
+        let (kept, other) = if counted {
+            (&mut self.hosts, &mut self.outside)
+        } else {
+            (&mut self.outside, &mut self.hosts)
+        };
+        if let Some(hosts) = other.get_mut(&key.1) {
+            hosts.remove(&key.0);
+        }
+        kept.entry(key.1).or_default().insert(
             key.0,
             Host {
                 role: role.to_owned(),
@@ -369,6 +420,15 @@ impl Fleet {
     /// Every host that heartbeated `service`, by node id.
     pub fn hosts_of(&self, service: &str) -> impl Iterator<Item = (&NodeId, &Host)> {
         self.hosts.get(service).into_iter().flatten()
+    }
+
+    /// Every host whose last word about `service` the fleet keeps, counted or not: the
+    /// service's hosts and the ones it no longer counts. One live update at a time is counted
+    /// over these ([`crate::decide`]), so a host that leaves a service mid-update still holds
+    /// its slot.
+    pub fn occupants_of(&self, service: &str) -> impl Iterator<Item = (&NodeId, &Host)> {
+        self.hosts_of(service)
+            .chain(self.outside.get(service).into_iter().flatten())
     }
 
     /// Every `kbf` host, by node id.

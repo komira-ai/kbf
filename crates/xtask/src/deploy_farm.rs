@@ -56,6 +56,8 @@ use serde_json::{Value, json};
 
 use crate::fetch;
 
+pub mod restore;
+
 /// The longest any one call may take.
 const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -65,11 +67,43 @@ const MAX_ANSWER: u64 = 1 << 20;
 /// How many times the POST is tried when the call fails for a reason that may pass.
 const POST_ATTEMPTS: u32 = 4;
 
+/// The seconds between two tries, and between two reads, when `--every-secs` is not given.
+pub const EVERY_SECS: u64 = 30;
+
+/// The longest one call to the coordinator may take: a fresh token from the runner's token
+/// service and then the coordinator's answer, each bounded by `CALL_TIMEOUT`.
+#[must_use]
+pub fn call_bound() -> Duration {
+    2 * CALL_TIMEOUT
+}
+
+/// The longest a call tried again on a 503 may take: `POST_ATTEMPTS` calls of
+/// [`call_bound`] and the pause of `every` between two of them.
+#[must_use]
+pub fn retried_bound(every: Duration) -> Duration {
+    call_bound() * POST_ATTEMPTS + every * (POST_ATTEMPTS - 1)
+}
+
+/// The longest the deploy may run with `deadline` and `every`: the baseline read and the
+/// POST, each tried again ([`retried_bound`]), the deadline, and the read and the pause that
+/// can end past it. A job step that runs the deploy needs at least this.
+#[must_use]
+pub fn deploy_bound(deadline: Duration, every: Duration) -> Duration {
+    retried_bound(every) * 2 + deadline + call_bound() + every
+}
+
 /// Whether a failed call may pass: the coordinator's 503 on the POST or on the baseline read,
-/// and nothing else (a certificate it is not trusted by, or a runner without a token, does
-/// not get better; a poll that fails is tried again anyway).
+/// or on any call of the restore, and nothing else (a certificate it is not trusted by, or a
+/// runner without a token, does not get better; a poll that fails is tried again anyway).
 fn retryable(what: &str, why: &str) -> bool {
-    matches!(what, SET_DESIRED | READ_BASELINE) && why == "status 503"
+    matches!(
+        what,
+        SET_DESIRED
+            | READ_BASELINE
+            | restore::READ_BEFORE
+            | restore::SET_BACK
+            | restore::READ_AFTER
+    ) && why == "status 503"
 }
 
 /// What the calls are named in an error.
@@ -147,6 +181,41 @@ fn check_args(args: &Args) -> Result<(), Error> {
 const TOKEN_URL_VAR: &str = "ACTIONS_ID_TOKEN_REQUEST_URL";
 const TOKEN_KEY_VAR: &str = "ACTIONS_ID_TOKEN_REQUEST_TOKEN";
 
+/// The verb as it is called: a deploy, or `restore`, the last step of a deploy job that failed.
+#[derive(Debug, ClapArgs)]
+#[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
+pub struct Command {
+    /// What to do instead of a deploy.
+    #[command(subcommand)]
+    pub then: Option<Then>,
+    /// The flags of a deploy.
+    #[command(flatten)]
+    pub deploy: Option<Args>,
+}
+
+/// What `deploy-farm` does instead of a deploy.
+#[derive(Debug, clap::Subcommand)]
+pub enum Then {
+    /// After an earlier step of the job failed: set the version this release replaced back as
+    /// desired, if this release is still desired, and exit 1.
+    Restore(restore::Args),
+}
+
+/// The verb as called.
+///
+/// # Errors
+/// [`crate::Error`], for every end but convergence (a deploy) or nothing to set back (a
+/// restore).
+pub fn run_command(command: &Command) -> Result<Vec<String>, crate::Error> {
+    match (&command.then, &command.deploy) {
+        (Some(Then::Restore(args)), _) => restore::run(args),
+        (None, Some(args)) => run(args),
+        (None, None) => Err(crate::Error::Failed(
+            "deploy-farm needs --url and --version, or `restore`".to_owned(),
+        )),
+    }
+}
+
 /// The flags of the verb.
 #[derive(Debug, ClapArgs)]
 pub struct Args {
@@ -178,7 +247,7 @@ pub struct Args {
     #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u64).range(1..=1440))]
     pub stall_min: u64,
     /// Seconds between two reads.
-    #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=3600))]
+    #[arg(long, default_value_t = EVERY_SECS, value_parser = clap::value_parser!(u64).range(1..=3600))]
     pub every_secs: u64,
     /// The storage hosts that must stay up while others update. `kbf` only: another service's
     /// minimums are in its definition, and none is sent.
@@ -234,6 +303,10 @@ pub enum Error {
         "{what}: refused with status {status}: the coordinator's OIDC allow-list does not accept this job's token"
     )]
     Refused { what: &'static str, status: u16 },
+    #[error(
+        "{what}: refused with status 409: another write was accepted since the coordinator was read"
+    )]
+    Conflict { what: &'static str },
     #[error("the coordinator answered something this client cannot read: {0}")]
     Answer(String),
     #[error("blocked: a host failed its update to {0}; the table above says which role")]
@@ -455,23 +528,7 @@ pub fn deploy_on(
     clock: &Clock<'_>,
     out: &mut impl Write,
 ) -> Result<(), Error> {
-    if !plan.url.starts_with("https://") || plan.url[8..].contains('/') {
-        return Err(Error::Url(plan.url.clone()));
-    }
-    let agent = |roots: &[CertificateDer<'static>]| -> ureq::Agent {
-        ureq::Agent::config_builder()
-            .https_only(true)
-            .max_redirects(0)
-            .http_status_as_error(false)
-            .timeout_global(Some(CALL_TIMEOUT))
-            .tls_config(fetch::tls_config(roots))
-            .build()
-            .into()
-    };
-    let transport = UreqTransport {
-        runner: agent(roots.runner),
-        coordinator: agent(roots.coordinator),
-    };
+    let transport = ureq_transport(plan, roots)?;
     deploy_with(plan, service, &transport, clock, out)
 }
 
@@ -715,6 +772,30 @@ impl Transport for UreqTransport {
     }
 }
 
+/// The production transport of `plan`: one agent per peer, each trusting its side of `roots`.
+///
+/// # Errors
+/// [`Error::Url`] when the plan's URL is not `https://<host>[:port]` with no path.
+fn ureq_transport(plan: &Plan, roots: &Roots<'_>) -> Result<UreqTransport, Error> {
+    if !plan.url.starts_with("https://") || plan.url[8..].contains('/') {
+        return Err(Error::Url(plan.url.clone()));
+    }
+    let agent = |roots: &[CertificateDer<'static>]| -> ureq::Agent {
+        ureq::Agent::config_builder()
+            .https_only(true)
+            .max_redirects(0)
+            .http_status_as_error(false)
+            .timeout_global(Some(CALL_TIMEOUT))
+            .tls_config(fetch::tls_config(roots))
+            .build()
+            .into()
+    };
+    Ok(UreqTransport {
+        runner: agent(roots.runner),
+        coordinator: agent(roots.coordinator),
+    })
+}
+
 struct Client<'a> {
     transport: &'a dyn Transport,
     plan: &'a Plan,
@@ -811,6 +892,9 @@ impl Client<'_> {
         let status = answer.status;
         if matches!(status, 401 | 403) {
             return Err(Error::Refused { what, status });
+        }
+        if status == 409 {
+            return Err(Error::Conflict { what });
         }
         let text = answer.body.map_err(|e| call(e.to_string()))?;
         if status != 200 {

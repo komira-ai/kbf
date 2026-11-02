@@ -206,13 +206,16 @@ async fn the_kbf_status_and_convergence_bytes_are_unchanged() {
         r#"{"platform":"linux-x86_64","version":"2.0","health":"healthy"}"#,
     )
     .await;
-    // Each answer has kept its bytes, and ends with the build commit since that was added.
+    // Each answer has kept its bytes, and ends with the build commit since that was added,
+    // then the record of the writes since that was.
     let commit = format!(r#","commit":"{}"}}"#, crate::BUILD_COMMIT);
+    let record = r#","generation":1,"replaced":null,"write_id":""}"#;
     let converged = GOLDEN_CONVERGENCE
         .strip_suffix('}')
         .expect("an object")
         .to_owned()
-        + &commit;
+        + commit.strip_suffix('}').expect("an object")
+        + record;
     for path in [CONVERGENCE_PATH, "/v1/convergence?service=kbf"] {
         assert_eq!(
             get_raw(&rig, path, &ci_token()).await,

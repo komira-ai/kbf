@@ -9,6 +9,10 @@
 //! under its lock. A scenario that asks without ordering says so. There is no canary in
 //! today's decision (no host goes first for being a canary), so there is nothing to pin for
 //! one; it arrives with the generalisation, which must leave these literals unchanged.
+//!
+//! One update is live at a time across every service and role (`decide.rs`, rule 7): the
+//! literals that a `max_updating` above 1 used to widen moved to one host at a time, on
+//! purpose, in the change that made the rule.
 
 use std::time::Duration;
 
@@ -68,7 +72,8 @@ const ALL: [&str; 11] = [
 ];
 
 /// The first pass of a roll with the default limits (1 storage, 2 daemons, 2 Macs, 1 frontend):
-/// each role fills its slots and no more, and no frontend starts while any other host is behind.
+/// the first host asked goes and every other host waits for it, whatever its role's limit, and
+/// no frontend starts while any other host is behind.
 #[test]
 fn the_first_pass_of_a_roll_with_the_default_limits() {
     let mut f = all_roles("1.0");
@@ -78,33 +83,7 @@ fn the_first_pass_of_a_roll_with_the_default_limits() {
             "s1: update 2.0",
             "s2: nothing",
             "s3: nothing",
-            "d1: update 2.0",
-            "d2: update 2.0",
-            "d3: nothing",
-            "m1: update 2.0",
-            "m2: update 2.0",
-            "m3: nothing",
-            "f1: nothing",
-            "f2: nothing",
-        ]
-    );
-}
-
-/// The limits the desired state sets replace the defaults per role; zero holds a role.
-#[test]
-fn the_limits_of_the_desired_state_replace_the_defaults_per_role() {
-    let mut f = all_roles("1.0");
-    let mut d = desired("2.0", 1, 1);
-    d.max_updating.set("storage", 2);
-    d.max_updating.set("daemon", 1);
-    d.max_updating.set("mac-daemon", 0);
-    assert_eq!(
-        run(&mut f, &d, &ALL, NOW, true),
-        [
-            "s1: update 2.0",
-            "s2: update 2.0",
-            "s3: nothing",
-            "d1: update 2.0",
+            "d1: nothing",
             "d2: nothing",
             "d3: nothing",
             "m1: nothing",
@@ -116,9 +95,50 @@ fn the_limits_of_the_desired_state_replace_the_defaults_per_role() {
     );
 }
 
+/// The limits the desired state sets no longer widen a roll: a storage limit of 2 still orders
+/// one host, and nothing else goes while it holds its slot. Zero still holds a role: with the
+/// storage and daemon roles at the version, no Mac is ordered.
+#[test]
+fn the_limits_of_the_desired_state_replace_the_defaults_per_role() {
+    let mut f = all_roles("1.0");
+    let mut d = desired("2.0", 1, 1);
+    d.max_updating.set("storage", 2);
+    d.max_updating.set("daemon", 1);
+    d.max_updating.set("mac-daemon", 0);
+    assert_eq!(
+        run(&mut f, &d, &ALL, NOW, true),
+        [
+            "s1: update 2.0",
+            "s2: nothing",
+            "s3: nothing",
+            "d1: nothing",
+            "d2: nothing",
+            "d3: nothing",
+            "m1: nothing",
+            "m2: nothing",
+            "m3: nothing",
+            "f1: nothing",
+            "f2: nothing",
+        ]
+    );
+    let mut macs = fleet(
+        NOW,
+        &[
+            ("s1", HostRole::STORAGE, beat("2.0")),
+            ("d1", HostRole::DAEMON, beat("2.0")),
+            ("m1", HostRole::MAC_DAEMON, beat("1.0")),
+            ("m2", HostRole::MAC_DAEMON, beat("1.0")),
+        ],
+    );
+    assert_eq!(
+        run(&mut macs, &d, &["m1", "m2"], NOW, true),
+        ["m1: nothing", "m2: nothing"]
+    );
+}
+
 /// A roll in progress, asked without ordering: a host that is updating or at the version is
-/// told nothing, a host in a full role waits, a daemon with a free slot goes, and the frontends
-/// wait while a storage host is still updating.
+/// told nothing, and every host that is behind waits while another is updating, a daemon with
+/// a free slot of its role included.
 #[test]
 fn a_roll_in_progress() {
     let mut f = fleet(
@@ -144,7 +164,7 @@ fn a_roll_in_progress() {
             "s3: nothing",
             "d1: nothing",
             "d2: nothing",
-            "d3: update 2.0",
+            "d3: nothing",
             "m1: nothing",
             "f1: nothing",
             "f2: nothing",
@@ -222,10 +242,11 @@ fn the_minimums_hold_whatever_the_limits_say() {
     );
 }
 
-/// A host that failed the desired version is not ordered it again, healthy or not; a host that
-/// failed another version is not held back; a new desired version lifts the block. With a
-/// daemon limit of 1 the failed host that is unhealthy (d2) holds the only slot, so nobody else
-/// goes until it heartbeats healthy; the host that failed and is healthy (d1) holds none.
+/// A host that failed the desired version is not ordered it again, healthy or not; a new desired
+/// version lifts the block for it. The failed host that is unhealthy (d2) holds the one slot,
+/// so nobody else goes until it heartbeats healthy, whatever the daemon limit says, and only
+/// d2 itself may be told a new version; the host that failed and is healthy (d1) holds none,
+/// and a host that failed another version (d4) is not held back once d2 is healthy.
 #[test]
 fn a_failed_host_is_not_ordered_again() {
     let failed = |b: Heartbeat, target: &str| last(b, target, Outcome::Failed);
@@ -249,20 +270,15 @@ fn a_failed_host_is_not_ordered_again() {
     let mut f = with(false);
     assert_eq!(
         run(&mut f, &desired("2.0", 1, 1), &hosts, NOW, false),
-        [
-            "d1: nothing",
-            "d2: nothing",
-            "d3: update 2.0",
-            "d4: update 2.0"
-        ]
+        ["d1: nothing", "d2: nothing", "d3: nothing", "d4: nothing"]
     );
     assert_eq!(
         run(&mut f, &desired("3.0", 1, 1), &hosts, NOW, false),
         [
-            "d1: update 3.0",
+            "d1: nothing",
             "d2: update 3.0",
-            "d3: update 3.0",
-            "d4: update 3.0"
+            "d3: nothing",
+            "d4: nothing"
         ]
     );
     let mut one = desired("2.0", 1, 1);

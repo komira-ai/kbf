@@ -21,10 +21,10 @@
 //!   ([`release::farm_version`]): the version text the farm is told to converge on,
 //!   `<version>+g<12 hex digits of the commit>` as the hosts report it, read from the release's
 //!   own version facts (which `SHA256SUMS` must list); prints `version=<text>`.
-//! - `deploy-farm --url <url> --version <semver>+g<commit12> [--deadline-min 60] [--stall-min 20]` ([`deploy_farm`]): after a
-//!   release is published, set it as the update coordinator's desired version (CI's OIDC token)
-//!   and wait until the farm converges; exit 1 when it is blocked, stalled or out of time. An
-//!   empty `--url` prints a notice and exits 0.
+//! - `deploy-farm --url <url> --version <semver>+g<commit12> [--deadline-min 60] [--stall-min 20]` ([`deploy_farm`]): set a
+//!   published release as the coordinator's desired version (CI's OIDC token) and wait until the farm converges; exit 1
+//!   when blocked, stalled or out of time (an empty `--url`: a notice, exit 0). `deploy-farm restore --run <id>-<attempt>`
+//!   ([`deploy_farm::restore`]), the job's step after a failure, sets back the version the release replaced, and exits 1.
 //! - `prove-farm --address <grpc url> --instance <name> --tls <true|false> --properties <k=v,...> --buck2 <path>
 //!   --project <dir> --nonce <text>` ([`prove_farm`]): after the deploy, build a small Buck2 project against the
 //!   farm, remote only, and exit 1 unless some action ran remotely and none locally. An empty `--address` prints a
@@ -239,7 +239,7 @@ enum Verb {
     MergeProfiles(merge_profiles::Args),
     /// Set a published release as the farm's desired version on the update coordinator and
     /// wait for the farm to converge.
-    DeployFarm(deploy_farm::Args),
+    DeployFarm(deploy_farm::Command),
     /// Prove the farm after a deploy with a remote-only Buck2 build of a small project.
     ProveFarm(prove_farm::Args),
     /// Check that the runner's disk has the room the coverage run needs.
@@ -1170,7 +1170,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
         Verb::WaitArtifacts(args) => wait_artifacts::run(&args, &root, &cargo_program()),
         Verb::ProfilesComplete(args) => profiles_complete::run(&args),
         Verb::MergeProfiles(args) => merge_profiles::run(&args, &root),
-        Verb::DeployFarm(args) => deploy_farm::run(&args),
+        Verb::DeployFarm(command) => deploy_farm::run_command(&command),
         Verb::ProveFarm(args) => prove_farm::run(&args),
         Verb::RunnerDisk(args) => runner_disk::run(&args),
         Verb::StaticElf(args) => static_elf::run(&args),
