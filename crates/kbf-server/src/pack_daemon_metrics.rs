@@ -12,8 +12,8 @@
 //! count in `elsewhere`), with `kbf_pack_daemon_unasked_total` flat and
 //! `kbf_pack_daemon_lost_total` and `kbf_pack_daemon_damaged_total` staying 0 (`docs/api.md`,
 //! "Packs"). `kbf_pack_daemon_fallback_lost_total` and `kbf_pack_daemon_fallback_damaged_total`
-//! are reads a daemon's local tierstore did not serve, which the storage nodes answered: none
-//! failed.
+//! are reads a daemon's local tierstore did not serve, which it then sent to the storage nodes:
+//! each read's outcome is theirs (the blob, or their failure), never a failure of the tierstore.
 //!
 //! The daemons that write packs (`--pack-write`) say what their writes did in the same way
 //! ([`crate::farm::Farm::pack_writes`]): `kbf_pack_daemon_packs_written_total`,
@@ -72,13 +72,14 @@ const FAMILIES: [Family; 8] = [
     (
         "kbf_pack_daemon_fallback_lost_total",
         "Reads a daemon sent to the storage nodes because its local tierstore did not have the \
-         pack, per node, since its process started (none failed)",
+         pack, per node, since its process started (each read's outcome is the storage nodes')",
         |counts| counts.fallback_lost,
     ),
     (
         "kbf_pack_daemon_fallback_damaged_total",
         "Reads a daemon sent to the storage nodes because the bytes from its local tierstore \
-         were not the digest, per node, since its process started (none failed; alert on any)",
+         were not the digest, per node, since its process started (each read's outcome is the \
+         storage nodes'; alert on any)",
         |counts| counts.fallback_damaged,
     ),
 ];

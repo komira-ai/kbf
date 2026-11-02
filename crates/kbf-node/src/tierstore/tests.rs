@@ -11,6 +11,7 @@ use super::*;
 use crate::tests::{scratch, tls_files};
 
 mod plane;
+pub(in crate::tierstore) mod wire;
 
 /// The secret of the credentials files of these tests, which no message may carry.
 const SECRET: &str = "s3cr3t-tier-key";

@@ -26,8 +26,9 @@
 //! `::1`, as an IP literal: a name is refused, because a name is not known to stay on the host),
 //! and anything else is refused at start with [`NotLoopback`]: a tierstore elsewhere is a store
 //! the daemon was not meant to read, over a network its key and bytes would cross in plain
-//! text. The client ([`client::TierClient`]) connects to that address only: it takes no proxy
-//! (from the environment or the system) and follows no redirect.
+//! text. The client ([`client::TierClient`]) connects to that address only, with one HTTP/1.1
+//! exchange a read: it takes no proxy (from the environment or the system), resolves no name and
+//! follows no redirect.
 //!
 //! **A warm read asks nothing of the frontend.** The places the frontend's index answered are
 //! kept ([`placed::Placed`]), so a blob read through the tierstore once is found again without
@@ -58,7 +59,7 @@ use super::{Cli, Error, NodeHandle, farm, start_over, transfer};
 mod client;
 mod placed;
 
-use client::TierClient;
+use client::{Tcp, TierClient};
 use placed::{Placed, TierReads};
 
 /// The flag of the credentials file.
@@ -152,9 +153,6 @@ pub(crate) enum TierstoreError {
     /// The credentials file cannot be used.
     #[error(transparent)]
     KeyFile(#[from] KeyFileError),
-    /// The HTTP client cannot be made.
-    #[error("--tierstore-endpoint: the HTTP client cannot be made: {0}")]
-    Client(#[source] reqwest::Error),
 }
 
 impl TierstoreArgs {
@@ -313,19 +311,18 @@ fn over_placed<C: Cas, S: ObjectStore>(
 /// The client of the tierstore `settings` names, over its read-only key.
 ///
 /// # Errors
-/// [`TierstoreError::KeyFile`]: the credentials file cannot be used;
-/// [`TierstoreError::Client`]: the HTTP client cannot be made.
+/// [`TierstoreError::KeyFile`]: the credentials file cannot be used.
 fn store(settings: &Tierstore) -> Result<TierClient, TierstoreError> {
     let keys = pack_read::read_key_pair(&settings.credentials, CREDENTIALS_FLAG)?;
     let timeouts = (CONNECT_TIMEOUT, REQUEST_TIMEOUT);
-    let client = TierClient::new(
+    Ok(TierClient::new(
         &settings.endpoint,
         settings.bucket.clone(),
         keys,
         DEFAULT_REGION,
         timeouts,
-    );
-    client.map_err(TierstoreError::Client)
+        Arc::new(Tcp),
+    ))
 }
 
 #[cfg(test)]

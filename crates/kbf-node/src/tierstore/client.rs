@@ -4,34 +4,40 @@
 //! `kbf_pack::Reader` asks of a store.
 //!
 //! **The request stays on the host.** The endpoint is a loopback IP address, checked before the
-//! client is made ([`super::Endpoint`]), so no name is resolved. The HTTP client is built with
-//! proxies off, from the environment and from the system's settings alike (`no_proxy`), so a
-//! proxy variable or a macOS proxy setting cannot carry the request off the host, and with
-//! redirects off (`Policy::none`), so an answer that points elsewhere is a failed read, never a
-//! second request.
+//! client is made ([`super::Endpoint`]). Each read opens one connection to that address
+//! ([`Dial`]; [`Tcp`] in the daemon) and makes one HTTP/1.1 exchange over it with hyper's
+//! connection API: there is no proxy, from the environment or the system, because nothing reads
+//! one; no name is resolved; and no redirect is followed, because nothing makes a second request.
+//! The `Host` header is sent exactly as it is signed, the endpoint's authority as given.
 //!
 //! **No answer but the bytes asked for is taken.** `206` with a `Content-Range` that is the
 //! range asked for (cut at the object's end) and a body of exactly its length is the only
-//! success; the body is read in chunks and a body longer than the range is refused at the first
-//! byte too many, so no more than the range is ever held. `404` is [`ObjectStoreError::NotFound`]
-//! and `416` [`ObjectStoreError::InvalidRange`], which the reader takes as a pack that is not
-//! there; `200` (the range ignored), a redirect, a `Content-Range` that is missing, does not
-//! parse or is another range, and a body of another length are [`ObjectStoreError::Protocol`];
-//! any other status is [`ObjectStoreError::Service`]; a request that cannot be sent or whose
-//! answer does not come within the request timeout is [`ObjectStoreError::Transport`]. None of
-//! these is tried again: the plane reads the blob from the frontend instead.
+//! success; the body is read with a limit of that length, so a longer one is refused and no more
+//! than the range is ever held. `404` is [`ObjectStoreError::NotFound`] and `416`
+//! [`ObjectStoreError::InvalidRange`], which the reader takes as a pack that is not there; `200`
+//! (the range ignored), a redirect, a `Content-Range` that is missing, does not parse or is
+//! another range, and a body of another length are [`ObjectStoreError::Protocol`]; any other
+//! status is [`ObjectStoreError::Service`]; a connection that cannot be made within the connect
+//! timeout, an exchange that fails, and a read whose answer and body are not all in within the
+//! request timeout are [`ObjectStoreError::Transport`]. None of these is tried again: the plane
+//! reads the blob from the frontend instead.
 
 use std::fmt::Write as _;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
+use futures::future::BoxFuture;
+use http_body_util::{BodyExt as _, Empty, LengthLimitError, Limited};
+use hyper::header::{CONTENT_RANGE, HOST};
+use hyper_util::rt::TokioIo;
 use kbf_objstore::{
     ByteRange, Capabilities, KeyPrefix, ListPage, ListToken, ObjectKey, ObjectStore,
     ObjectStoreError, PageSize,
 };
-use reqwest::header::CONTENT_RANGE;
 use sha2::{Digest as _, Sha256};
+use tokio::io::{AsyncRead, AsyncWrite};
 
 use super::Endpoint;
 use crate::pack_read::KeyPair;
@@ -42,50 +48,77 @@ const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495
 /// What the client refuses to do: anything but read.
 const READ_ONLY: &str = "the tierstore client only reads";
 
+/// A connection the client makes its exchange over.
+pub(crate) trait Io: AsyncRead + AsyncWrite + Send + Unpin + 'static {}
+
+impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> Io for T {}
+
+/// How the client reaches the tierstore: one connection to its address for each read.
+pub(crate) trait Dial: Send + Sync + 'static {
+    /// A connection to `addr`.
+    fn dial(&self, addr: SocketAddr) -> BoxFuture<'_, std::io::Result<Box<dyn Io>>>;
+}
+
+/// The daemon's [`Dial`]: a TCP connection to the address.
+pub(crate) struct Tcp;
+
+impl Dial for Tcp {
+    fn dial(&self, addr: SocketAddr) -> BoxFuture<'_, std::io::Result<Box<dyn Io>>> {
+        Box::pin(
+            async move { Ok(Box::new(tokio::net::TcpStream::connect(addr).await?) as Box<dyn Io>) },
+        )
+    }
+}
+
 /// A client of one bucket of the tierstore on loopback (the module docs).
 pub(crate) struct TierClient {
-    http: reqwest::Client,
-    /// `http://<authority>`, the endpoint without a last `/`.
-    base: String,
+    dial: Arc<dyn Dial>,
+    addr: SocketAddr,
     /// The `Host` header the request carries and signs: the endpoint's authority.
     host: String,
     bucket: String,
     keys: KeyPair,
     region: String,
+    connect_timeout: Duration,
     request_timeout: Duration,
 }
 
 impl TierClient {
-    /// A client of `bucket` at `endpoint`, signing with `keys` for `region`; no I/O.
-    ///
-    /// # Errors
-    /// The HTTP client cannot be built.
+    /// A client of `bucket` at `endpoint`, reached through `dial`, signing with `keys` for
+    /// `region`, within `timeouts` (connect, request); no I/O.
     pub(crate) fn new(
         endpoint: &Endpoint,
         bucket: String,
         keys: KeyPair,
         region: &str,
         timeouts: (Duration, Duration),
-    ) -> Result<Self, reqwest::Error> {
+        dial: Arc<dyn Dial>,
+    ) -> Self {
         let (connect_timeout, request_timeout) = timeouts;
-        let http = reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(connect_timeout)
-            .build()?;
-        Ok(Self {
-            http,
-            base: format!("http://{}", endpoint.authority),
+        Self {
+            dial,
+            addr: endpoint.addr,
             host: endpoint.authority.clone(),
             bucket,
             keys,
             region: region.to_owned(),
+            connect_timeout,
             request_timeout,
-        })
+        }
     }
 
-    /// The bytes of `range` of the object `key`, as the module docs say.
+    /// The bytes of `range` of the object `key`, as the module docs say: all of it within the
+    /// request timeout.
     async fn read(&self, key: &ObjectKey, range: ByteRange) -> Result<Bytes, ObjectStoreError> {
+        let within = tokio::time::timeout(self.request_timeout, self.read_once(key, range)).await;
+        within.unwrap_or_else(|_| Err(timed_out("answer", self.request_timeout)))
+    }
+
+    async fn read_once(
+        &self,
+        key: &ObjectKey,
+        range: ByteRange,
+    ) -> Result<Bytes, ObjectStoreError> {
         let path = format!("/{}/{key}", self.bucket);
         let range_header = format!("bytes={}-{}", range.offset(), range.last());
         let amz_date = amz_date(SystemTime::now());
@@ -98,17 +131,25 @@ impl TierClient {
             secret: &self.keys.secret,
             region: &self.region,
         });
-        let sent = self
-            .http
-            .get(format!("{}{path}", self.base))
+        let request = hyper::Request::get(path.as_str())
+            .header(HOST, &self.host)
             .header("range", &range_header)
             .header("x-amz-content-sha256", EMPTY_SHA256)
             .header("x-amz-date", &amz_date)
             .header("authorization", authorization)
-            .timeout(self.request_timeout)
-            .send()
-            .await;
-        let mut answer = sent.map_err(transport)?;
+            .body(Empty::<Bytes>::new());
+        let request = request
+            .map_err(|e| ObjectStoreError::Protocol(format!("ranged read of {key}: {e}")))?;
+        let dialled = tokio::time::timeout(self.connect_timeout, self.dial.dial(self.addr)).await;
+        let io = dialled
+            .map_err(|_| timed_out("connection", self.connect_timeout))?
+            .map_err(transport)?;
+        let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(io))
+            .await
+            .map_err(transport)?;
+        // The connection is driven beside the exchange; its failure is the exchange's.
+        tokio::spawn(async move { drop(connection.await) });
+        let answer = sender.send_request(request).await.map_err(transport)?;
         let status = answer.status().as_u16();
         let refused =
             |why: String| ObjectStoreError::Protocol(format!("ranged read of {key}: {why}"));
@@ -140,28 +181,36 @@ impl TierClient {
             .get(CONTENT_RANGE)
             .and_then(|v| v.to_str().ok());
         let want = partial(content_range, range).map_err(refused)?;
-        let mut body = BytesMut::new();
-        while let Some(chunk) = answer.chunk().await.map_err(transport)? {
-            if (body.len() + chunk.len()) as u64 > want {
+        let limit = usize::try_from(want).unwrap_or(usize::MAX);
+        let collected = Limited::new(answer.into_body(), limit).collect().await;
+        let body = match collected {
+            Ok(body) => body.to_bytes(),
+            Err(error) if error.is::<LengthLimitError>() => {
                 return Err(refused(format!(
                     "the body is longer than the {want} bytes of its range"
                 )));
             }
-            body.extend_from_slice(&chunk);
-        }
+            Err(error) => return Err(ObjectStoreError::Transport(Arc::from(error))),
+        };
         if body.len() as u64 != want {
             let got = body.len();
             return Err(refused(format!(
                 "the body has {got} of the {want} bytes of its range"
             )));
         }
-        Ok(body.freeze())
+        Ok(body)
     }
 }
 
-/// A failure to send a request or to read its answer.
-fn transport(error: reqwest::Error) -> ObjectStoreError {
+/// A failure to connect, or of the exchange.
+fn transport(error: impl std::error::Error + Send + Sync + 'static) -> ObjectStoreError {
     ObjectStoreError::Transport(Arc::new(error))
+}
+
+/// The `what` of a read that did not come within `limit`.
+fn timed_out(what: &str, limit: Duration) -> ObjectStoreError {
+    let why = format!("the tierstore's {what} did not come within {limit:?}");
+    transport(std::io::Error::new(std::io::ErrorKind::TimedOut, why))
 }
 
 /// The length of the body a `206` answer to `range` must have, from its `Content-Range`: the

@@ -122,10 +122,11 @@ pub struct PackStats {
     /// Reads that failed because the bytes in the pack are not the digest.
     pub damaged: u64,
     /// Reads of a plane made with [`PackedCas::falling_back`] whose pack is gone or too short,
-    /// which the plane underneath answered instead; never counted in `lost`.
+    /// sent to the plane underneath, whose answer is the read's; never counted in `lost`.
     pub fallback_lost: u64,
     /// Reads of a plane made with [`PackedCas::falling_back`] whose bytes in the pack are not the
-    /// digest, which the plane underneath answered instead; never counted in `damaged`.
+    /// digest, sent to the plane underneath, whose answer is the read's; never counted in
+    /// `damaged`.
     pub fallback_damaged: u64,
     /// What the plane wrote into packs, and what it wrote elsewhere instead.
     pub writes: WriteStats,
@@ -303,9 +304,10 @@ impl<C: Cas> PackedCas<C> {
     /// from the plane underneath instead of failing the read: for packs read through a cache
     /// that is not the source of truth, such as a tierstore on loopback in front of the object
     /// store, where a miss, a stale or damaged copy, or a cache that is down must cost a read
-    /// from the plane underneath and never a failed one. The blob is still logged, and counted in
-    /// [`PackStats::fallback_lost`] or [`PackStats::fallback_damaged`], never in `lost` or
-    /// `damaged`, which stay the reads that failed.
+    /// from the plane underneath, whose answer (the blob, or its own failure) is the read's, and
+    /// never a failure of its own. The blob is still logged, and counted in
+    /// [`PackStats::fallback_lost`] or [`PackStats::fallback_damaged`] when the read is sent on,
+    /// never in `lost` or `damaged`, which stay the reads that failed at the packs.
     #[must_use]
     pub fn falling_back(mut self) -> Self {
         self.bad = BadPack::ReadElsewhere;

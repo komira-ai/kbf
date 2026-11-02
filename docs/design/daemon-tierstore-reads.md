@@ -86,8 +86,9 @@ would need a streaming `GET` in the object-store client and is not built.
 
 The heartbeat's `PackReadCounts` gains two fields, `fallback_lost = 7` and
 `fallback_damaged = 8`. `lost` and `damaged` keep their shipped meaning, reads that failed. A
-frontend of the previous release skips the two new fields and so reports a tierstore fallback as
-no failure; a frontend of this release reads a daemon of the previous release with both at 0.
+frontend of the previous release skips the two new fields and so counts a tierstore fallback in
+none of `lost` and `damaged` (the read's outcome is the frontend's answer, which the frontend
+sees for itself); a frontend of this release reads a daemon of the previous release with both at 0.
 The tests are `a_frontend_of_the_previous_release_skips_the_fallback_counts` and
 `counts_of_the_previous_release_decode_with_no_fallbacks`
 (`crates/kbf-proto/tests/heartbeat_pack_reads.rs`). The frontend exports the two as

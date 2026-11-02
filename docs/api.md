@@ -1796,8 +1796,8 @@ failed.
 | `kbf_pack_daemon_unasked_total{node}` | counter | reads answered by the storage nodes because the packs could not be asked (the pack index or the pack store failed): the daemon is reading around the packs |
 | `kbf_pack_daemon_lost_total{node}` | counter | reads that failed because the pack the index names is gone or too short (UNAVAILABLE to the lease; alert on any) |
 | `kbf_pack_daemon_damaged_total{node}` | counter | reads that failed because the bytes in the pack are not the digest (never served; alert on any) |
-| `kbf_pack_daemon_fallback_lost_total{node}` | counter | reads of a daemon with `--tierstore-endpoint` whose pack its tierstore did not have (a 404, or too short), answered by the storage nodes instead: none failed. A steady rate is a pack the tierstore's upstream does not hold either |
-| `kbf_pack_daemon_fallback_damaged_total{node}` | counter | reads of a daemon with `--tierstore-endpoint` whose bytes from its tierstore were not the digest (never served), answered by the storage nodes instead: none failed, but each is a damaged copy in that node's tierstore (alert on any) |
+| `kbf_pack_daemon_fallback_lost_total{node}` | counter | reads of a daemon with `--tierstore-endpoint` whose pack its tierstore did not have (a 404, or too short), sent to the storage nodes instead: each read's outcome is theirs (the blob, or their own failure), not the tierstore's. A steady rate is a pack the tierstore's upstream does not hold either |
+| `kbf_pack_daemon_fallback_damaged_total{node}` | counter | reads of a daemon with `--tierstore-endpoint` whose bytes from its tierstore were not the digest (never served), sent to the storage nodes instead: each read's outcome is theirs, not the tierstore's, and each is a damaged copy in that node's tierstore (alert on any) |
 
 **Pack writes by daemons.** A daemon started with `--pack-write` (which needs `--pack-read`;
 [kbf-modes.md](deploy/kbf-modes.md)) also puts the counts of its pack writes in every heartbeat,

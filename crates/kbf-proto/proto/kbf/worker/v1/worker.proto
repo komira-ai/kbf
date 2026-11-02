@@ -498,7 +498,7 @@ message PackReadCounts {
   uint64 lost = 5;
   // Reads that failed because the bytes in the pack are not the digest.
   uint64 damaged = 6;
-  // `--tierstore-endpoint`: like lost and damaged, but read elsewhere instead; none failed.
+  // `--tierstore-endpoint`: as lost and damaged, but sent on: the storage nodes answer the read.
   uint64 fallback_lost = 7;
   uint64 fallback_damaged = 8;
 }
