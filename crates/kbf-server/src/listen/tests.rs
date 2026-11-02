@@ -395,3 +395,81 @@ async fn a_node_without_a_metrics_address_binds_only_its_storage_socket() {
     assert!(metrics.is_none());
     assert_eq!(*tried.borrow(), [at]);
 }
+
+/// A binder holding `held` whose own binds are recorded and give a fresh listener on port 0.
+fn holding(held: Held) -> (Binder, Rc<RefCell<Vec<SocketAddr>>>) {
+    let tried = Rc::new(RefCell::new(Vec::new()));
+    let seen = Rc::clone(&tried);
+    let binder = Binder {
+        held: RefCell::new(held),
+        ..Binder::scripted(
+            BIND_BUDGET,
+            Box::new(move |addr| {
+                seen.borrow_mut().push(addr);
+                Ok(listener())
+            }),
+            Box::new(|wait| panic!("a wait of {wait:?}")),
+        )
+    };
+    (binder, tried)
+}
+
+/// Catches: a bind of an address a held socket is on that binds it again (the address is
+/// in use by the held socket itself, so the start fails with `AddrInUse`) instead of taking
+/// that socket, a held socket taken twice (the second bind of the address must bind), and a
+/// bind of any other address that does not bind.
+#[test]
+fn a_held_socket_is_taken_once_for_its_own_address_and_other_addresses_bind() {
+    let (first, second) = (listener(), listener());
+    let (a, b) = (
+        first.local_addr().expect("address"),
+        second.local_addr().expect("address"),
+    );
+    let (binder, tried) = holding(Held::new(vec![first, second]).expect("held"));
+
+    let taken = binder.bind(a).expect("the held socket");
+    assert_eq!(taken.local_addr().expect("address"), a);
+    assert!(tried.borrow().is_empty(), "bound {:?}", tried.borrow());
+    let client = TcpStream::connect(a).expect("connect");
+    let (accepted, from) = taken.accept().expect("the held socket accepts");
+    assert_eq!(from, client.local_addr().expect("address"));
+    drop(accepted);
+
+    binder.bind(a).expect("a bind of its own");
+    binder.bind(any()).expect("a bind of its own");
+    assert_eq!(*tried.borrow(), [a, any()]);
+
+    let taken = binder.bind(b).expect("the other held socket");
+    assert_eq!(taken.local_addr().expect("address"), b);
+    assert_eq!(tried.borrow().len(), 2);
+}
+
+/// Catches: a held socket no bind asked for kept open once the binder is gone (its port
+/// would stay taken for the life of the process): a connection waiting in its queue is
+/// reset when it closes, and would wait for ever if it were kept.
+#[test]
+fn a_held_socket_no_bind_asks_for_is_closed_with_the_binder() {
+    use std::io::Read as _;
+    let unused = listener();
+    let mut waiting = TcpStream::connect(unused.local_addr().expect("address")).expect("connect");
+    let (binder, tried) = holding(Held::new(vec![unused]).expect("held"));
+    binder.bind(any()).expect("a bind of its own");
+    drop(binder);
+    let read = waiting.read(&mut [0; 1]);
+    assert!(
+        matches!(&read, Err(e) if e.kind() == io::ErrorKind::ConnectionReset)
+            || matches!(read, Ok(0)),
+        "{read:?}"
+    );
+    assert_eq!(*tried.borrow(), [any()]);
+}
+
+/// Catches: a socket whose address cannot be read held anyway (it could never be matched to
+/// a bind) or dropped without a word: `Held::new` fails with the error of the read.
+#[test]
+fn a_descriptor_that_is_not_a_socket_cannot_be_held() {
+    let file = std::fs::File::open("/dev/null").expect("open");
+    let not_a_socket = TcpListener::from(std::os::fd::OwnedFd::from(file));
+    let refused = Held::new(vec![listener(), not_a_socket]).expect_err("refused");
+    assert_eq!(refused.raw_os_error(), Some(libc::ENOTSOCK));
+}

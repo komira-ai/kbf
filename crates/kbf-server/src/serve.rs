@@ -787,22 +787,14 @@ where
     )
 }
 
-/// [`bind_server_with_policy`] with all of its options: the scheduler's state in
-/// `state` ([`bind_server_with_state`]), the client's CAS, ByteStream and
-/// action-cache calls proxied to a `storage` node ([`bind_server_with_storage`]), and
-/// the storage map `map` sent to daemons ([`bind_server_with_map`]), and a TLS-terminating
-/// `proxy` in front of every listener (`--proxy-auth-file`, [`crate::proxy_auth`]; `None`:
-/// the server is reached directly), and the web UI under `/ui` on the operator API
-/// ([`crate::ui_mount`]) when `ui` is given and the operator API listens
-/// ([`crate::ui_mount::bind_server_with_options`] is this with the UI on).
-///
-/// # Errors
-/// As [`bind_server_with_state`].
+/// [`crate::bind_server_with_ui`], each listener bound through `binder`: one budget for the
+/// start, and a socket the caller holds taken instead of a bind ([`Binder::holding`]).
 #[expect(
     clippy::too_many_arguments,
-    reason = "every option the bind functions delegate"
+    reason = "every option the bind functions delegate, and the binder"
 )]
-pub fn bind_server_with_ui<M, O>(
+pub(crate) fn bind_server_through<M, O>(
+    binder: Binder,
     cache: Arc<Cache<M, O>>,
     listeners: Listeners,
     api: Option<Api>,
@@ -845,8 +837,6 @@ where
     let api_store = state.as_ref().map(|s| Arc::clone(&s.store));
     let node_store = api_store.clone();
     let farm = Arc::new(farm.with_state(state)?);
-    // One start, one bind budget: the three listeners wait for a late interface together.
-    let binder = Binder::new();
     let (reapi_incoming, reapi) = bind(listeners.reapi, &binder)?;
     let (worker_incoming, worker) = bind(listeners.worker, &binder)?;
     let (mut worker_server, peers, worker_tls) = worker_peers(

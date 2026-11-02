@@ -191,6 +191,7 @@ pub use identity::{DenyList, DenyListError, Peers};
 pub use kbf_sched::MemoryLadder;
 pub use kbf_tls::{TlsError, TlsFiles, TlsSource};
 pub use learned::LearnedSizes;
+pub use listen::Held;
 pub use local::LocalStore;
 pub use node_map::NodeMap;
 pub use placement_load::PlacementLoad;
@@ -200,8 +201,7 @@ pub use scheduler_core::SchedulerCore;
 pub use serve::{
     Api, Behind, Bound, BoundStorage, Listeners, ServeError, StorageListener, StreamTiming,
     WorkerTls, bind_server, bind_server_with_api, bind_server_with_map, bind_server_with_policy,
-    bind_server_with_state, bind_server_with_storage, bind_server_with_ui, bind_service,
-    bind_storage,
+    bind_server_with_state, bind_server_with_storage, bind_service, bind_storage,
 };
 pub use start::{ServerHandle, interrupted, serve_with, sizes_on, start, start_interruptible};
 pub use start_exit::{
@@ -211,7 +211,7 @@ pub use state_store::{
     OpenFailure, PackIndexFlagError, StateStore, StateStoreUri, StateStoreUriError,
 };
 pub use streams::{StreamArgs, StreamLimits};
-pub use ui_mount::bind_server_with_options;
+pub use ui_mount::{bind_server_holding, bind_server_with_options, bind_server_with_ui};
 pub use usage_profiles::UsageProfiles;
 pub use whole_node::WholeNodeFlags;
 pub use worker::HostFloor;
