@@ -15,7 +15,7 @@ use host_step::{GETENT, SYSTEMCTL};
 use mdm_core::acme::Acme;
 use mdm_core::config::MdmConfig;
 use mdm_core::pins::{Packing, Pins, Tool};
-use mdm_host::{Download, Env};
+use mdm_host::{Download, DownloadError, Env};
 use sha2::{Digest, Sha256};
 
 /// The documented example settings as committed: every key, with `MDM_BIND` and
@@ -254,12 +254,14 @@ impl FakeNet {
 }
 
 impl Download for FakeNet {
-    fn get(&self, url: &str, limit: u64) -> Result<Vec<u8>, String> {
+    fn get(&self, url: &str, limit: u64) -> Result<Vec<u8>, DownloadError> {
         self.asked.borrow_mut().push(url.to_owned());
-        let body = self.urls.get(url).ok_or("answered 404".to_owned())?;
+        let body = self.urls.get(url).ok_or(DownloadError::Status(404))?;
         match (body.len() as u64) <= limit {
             true => Ok(body.clone()),
-            false => Err("too large".to_owned()),
+            false => Err(DownloadError::Transport(ureq::Error::BodyExceedsLimit(
+                limit,
+            ))),
         }
     }
 }

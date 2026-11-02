@@ -8,6 +8,7 @@ use mdm_core::path::PathError;
 use mdm_core::template::TemplateError;
 
 use crate::archive::ArchiveError;
+use crate::net::DownloadError;
 
 /// Why a verb refused (exit 2: fix the input or the host) or failed (exit 1: a step, a
 /// download or a check did not work).
@@ -72,12 +73,13 @@ pub enum MdmError {
         kept: String,
     },
     /// A download failed.
-    #[error("download of {url} failed: {why}")]
+    #[error("download of {url} failed: {source}")]
     Download {
         /// The URL.
         url: String,
         /// Why.
-        why: String,
+        #[source]
+        source: DownloadError,
     },
     /// A verb that reads root-only files was run by someone else.
     #[error(

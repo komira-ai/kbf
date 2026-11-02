@@ -123,9 +123,9 @@ fn download(env: &Env<'_>, pin: &Pin, dir: &AbsPath, file: &str) -> Result<(), M
     let bytes = env
         .net
         .get(&url, MAX_ARCHIVE)
-        .map_err(|why| MdmError::Download {
+        .map_err(|source| MdmError::Download {
             url: url.clone(),
-            why,
+            source,
         })?;
     if host.stat(dir.as_str())?.is_none() {
         host.mkdir(dir.as_str(), 0o755, owner)?;

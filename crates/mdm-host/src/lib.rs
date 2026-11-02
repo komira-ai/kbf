@@ -84,7 +84,7 @@ use host_step::{Host, RealHost};
 
 pub use cli::{run, run_with};
 pub use error::MdmError;
-pub use net::{Download, Net};
+pub use net::{Download, DownloadError, Net};
 
 /// What a verb needs from the outside: the host, the network, a random source and the time.
 pub struct Env<'a> {

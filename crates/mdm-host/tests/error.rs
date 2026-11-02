@@ -2,7 +2,7 @@
 
 use host_step::ExecError;
 use mdm_core::config::MdmConfig;
-use mdm_host::MdmError;
+use mdm_host::{DownloadError, MdmError};
 
 /// Catches an error that calls a refusal a failure or the other way round: a script tells "fix
 /// the input" (2) from "retry" (1) by it.
@@ -25,7 +25,7 @@ fn failures_exit_1_and_refusals_exit_2() {
         },
         MdmError::Download {
             url: String::new(),
-            why: String::new(),
+            source: DownloadError::Status(500),
         },
         MdmError::Command {
             line: String::new(),
