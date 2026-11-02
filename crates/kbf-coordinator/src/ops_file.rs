@@ -16,10 +16,13 @@
 //! acknowledgement only halts the service again. Reports kept while a halt stood join only to
 //! that halt. A generation is kept whatever the ops file says.
 //!
-//! A change writes the ops file first, then the halts file, each replaced whole. A crash
-//! between the two leaves the halts file behind the ops file, which loses reports, never a
-//! halt: a clear whose halts file was not written leaves acknowledgements that match nothing,
-//! so the host's next report halts the service again, and its generation is not counted. A
+//! A change writes the ops file first, then the halts file, each replaced whole. When the
+//! halts file cannot be written, the ops file is put back as it was and the change fails, so
+//! a failed change leaves both files as they were. A crash between the two writes leaves the
+//! halts file behind the ops file, which loses reports and generations, never a halt for long:
+//! a clear whose halts file was not written leaves acknowledgements that match nothing, so the
+//! halted host's next report halts the service again, and the clear's generation is not
+//! counted (no agent lifts on it). A
 //! farm that never halted has no halts file: one is written once there is something to keep in
 //! it, and after that on every change.
 
@@ -199,16 +202,41 @@ fn pretty<T: Serialize>(path: &Path, value: &T) -> Result<Vec<u8>, OpsError> {
     Ok(text)
 }
 
-/// Writes `state` to the ops file at `path` and its halts file, in that order.
+/// Writes `state` to the ops file at `path` and its halts file, in that order. When the halts
+/// file cannot be written, the ops file is put back as it was (removed, if there was none) and
+/// the error is answered: a change that fails leaves both files as they were, so a clear that
+/// cannot be written leaves the halt standing on disk too.
 ///
 /// # Errors
-/// [`OpsError::Io`]: a file could not be replaced.
+/// [`OpsError::Io`]: a file could not be read or replaced.
 pub fn write(path: &Path, state: &OpsState) -> Result<(), OpsError> {
     let (ops, halts) = split(state);
-    write_whole(path, &pretty(path, &ops)?)?;
     let halts_path = halts_path(path);
-    if halts.services.is_empty() && !halts_path.exists() {
+    let halts_text = pretty(&halts_path, &halts)?;
+    let keep = !halts.services.is_empty() || halts_path.exists();
+    let before = match fs::read(path) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => return Err(io_at(path)(e).into()),
+    };
+    write_whole(path, &pretty(path, &ops)?)?;
+    if !keep {
         return Ok(());
     }
-    Ok(write_whole(&halts_path, &pretty(&halts_path, &halts)?)?)
+    let Err(why) = write_whole(&halts_path, &halts_text) else {
+        return Ok(());
+    };
+    let restored = match &before {
+        Some(bytes) => write_whole(path, bytes).map_err(|e| e.to_string()),
+        None => fs::remove_file(path).map_err(|e| e.to_string()),
+    };
+    if let Err(also) = restored {
+        tracing::error!(
+            path = %path.display(),
+            %why,
+            %also,
+            "the halts file could not be written and the ops file could not be put back"
+        );
+    }
+    Err(why.into())
 }

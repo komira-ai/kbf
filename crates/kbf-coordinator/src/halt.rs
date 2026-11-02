@@ -32,11 +32,12 @@
 //! `FailedHere`, and a change of the desired state does not change what the host reports.
 //! A service the host is updating is not read: its `last_update` is the one before.
 //!
-//! Each clear raises the service's generation by one. A reply to an agent that
-//! announced [`FEATURE`] carries the generation of every service that has one (`halts`): the
-//! agent lifts its hold when it sees a number newer than the one it halted under, so a lost
-//! heartbeat cannot make it miss a clear, and a restart of the coordinator, which reads the
-//! number from the ops file, does not forget it.
+//! Each clear raises the service's generation by one. A reply to an agent that announced
+//! [`FEATURE`] carries the generation of every service the coordinator defines that has one
+//! (`halts`): the agent lifts its hold when it sees a number newer than the one it halted
+//! under, so a lost heartbeat cannot make it miss a clear, and a restart of the coordinator,
+//! which reads the number from the halts file beside the ops file ([`crate::ops_file`]), does
+//! not forget it.
 //!
 //! A report is ignored when its host is not counted by the service (the service is not
 //! defined, the host's role or selector leaves it out, it is unmanaged, or an operator excluded

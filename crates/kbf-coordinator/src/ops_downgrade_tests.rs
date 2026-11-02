@@ -321,15 +321,15 @@ fn a_halts_file_that_cannot_be_parsed_refuses_to_start() {
     }
 }
 
-/// Catches: the halts file written before the ops file, or a failure between them read as a
-/// clear: a clear whose halts file could not be written fails, and what a restart reads is the
-/// cleared halt with acknowledgements that match no report (the host's next report halts the
-/// service again) and the old generation, never a generation counted for a halt that stands.
+/// Catches: a clear whose halts file cannot be written lifting the halt on disk all the same
+/// (the ops file, written first, no longer holds it): the clear fails, it is not in memory,
+/// and what a restart reads is the halt standing, its reports and the old generation.
 #[test]
-fn a_clear_whose_halts_file_was_not_written_loses_reports_not_a_halt() {
+fn a_clear_whose_halts_file_cannot_be_written_leaves_the_halt_on_disk() {
     let (_dir, path, _) = written("ops-prev-torn", |state| {
         state.services.insert("kbf".to_owned(), halted());
     });
+    let ops_before = text(&path);
     let store = OpsStore::open(&path).expect("read");
     let mut blocked = halts_path(&path).into_os_string();
     blocked.push(".new");
@@ -344,17 +344,53 @@ fn a_clear_whose_halts_file_was_not_written_loses_reports_not_a_halt() {
             marks.halt_generation += 1;
         },
     );
-    assert!(cleared.is_err());
+    assert!(matches!(cleared, Err(OpsError::Io(_))), "{cleared:?}");
     assert_eq!(store.marks("kbf"), halted(), "the clear is not in memory");
-    let marks = OpsStore::open(&path).expect("read").marks("kbf");
-    assert_eq!(marks.halt, None);
-    assert_eq!(marks.halt_generation, 2);
-    assert!(
-        marks
-            .halt_acked
-            .iter()
-            .any(|a| a.node_id == "s1" && a.report.is_none())
+    assert_eq!(text(&path), ops_before, "the ops file is put back");
+    assert_eq!(OpsStore::open(&path).expect("read").marks("kbf"), halted());
+}
+
+/// Catches: the first write of a store whose halts file cannot be written leaving an ops file
+/// behind (the change failed, so there was none): it is removed again.
+#[test]
+fn a_first_write_whose_halts_file_cannot_be_written_leaves_no_ops_file() {
+    let dir = TestDir::under(std::env::temp_dir(), "ops-file-first");
+    let path = dir.path().join("ops.json");
+    let mut blocked = halts_path(&path).into_os_string();
+    blocked.push(".new");
+    fs::create_dir(&blocked).expect("blocked");
+    let store = OpsStore::open(&path).expect("opened");
+    let raised = store.change(
+        Write::BeforeMemory,
+        AuditEntry::new("operator", "seed"),
+        |state| {
+            state.services.insert("kbf".to_owned(), halted());
+        },
     );
+    assert!(raised.is_err());
+    assert!(!path.exists());
+}
+
+/// Catches: an ops file that cannot be read before it is replaced (here a directory at its
+/// name) replaced without what it held being kept to put back: the change fails first.
+#[test]
+fn a_change_whose_ops_file_cannot_be_read_fails_before_writing() {
+    let dir = TestDir::under(std::env::temp_dir(), "ops-file-dir");
+    let path = dir.path().join("ops.json");
+    let store = OpsStore::open(&path).expect("opened");
+    fs::create_dir(&path).expect("a directory");
+    let changed = store.change(
+        Write::BeforeMemory,
+        AuditEntry::new("operator", "seed"),
+        |state| {
+            state.services.insert("kbf".to_owned(), halted());
+        },
+    );
+    match changed {
+        Err(why @ OpsError::Io(_)) => assert!(why.to_string().contains("ops.json"), "{why}"),
+        other => panic!("expected an I/O error, got {other:?}"),
+    }
+    assert!(!halts_path(&path).exists());
 }
 
 /// Catches: the generation of a service the ops file no longer lists dropped with the
