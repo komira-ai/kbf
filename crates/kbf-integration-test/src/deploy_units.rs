@@ -194,8 +194,9 @@ pub struct ClusterCommand {
 /// from `kbf cluster` (at the start of a word or after a `/`, as in `/usr/bin/kbf`) to the
 /// end of its line, a line ending in `\` joined with the next. Its `<placeholder>`s are
 /// replaced from [`PLACEHOLDERS`] first; then it is cut at the first `)`, `|`, `;`, `&`,
-/// `>`, `<` or backtick, so a command inside `$(...)` or before a pipe or a redirection is
-/// read alone; then `$NAME` is replaced from [`SHELL_VARIABLES`] and double quotes are
+/// `>` or backtick, so a command inside `$(...)` or before a pipe or an output redirection
+/// is read alone (a `<` after a command is read as a placeholder, and refused unless it is
+/// one); then `$NAME` is replaced from [`SHELL_VARIABLES`] and double quotes are
 /// dropped. A comment line (`#` first) is skipped.
 pub fn cluster_commands(markdown: &str) -> Result<Vec<ClusterCommand>, UnitError> {
     let mut out = Vec::new();
@@ -234,9 +235,19 @@ pub fn cluster_commands(markdown: &str) -> Result<Vec<ClusterCommand>, UnitError
             // Placeholders first: their own `<` and `>` are not a redirection.
             let rest = substitute(&logical[at..])?;
             let end = rest
-                .find([')', '|', ';', '&', '>', '<', '`'])
+                .find([')', '|', ';', '&', '>', '`'])
                 .unwrap_or(rest.len());
-            let text = variables(&rest[..end])?;
+            // The descriptor a redirection starts with (the `2` of `2>&1`: a word of digits
+            // only, right before the `>`) is not a word of the command.
+            let mut cmd = &rest[..end];
+            let digits = cmd.trim_end_matches(|c: char| c.is_ascii_digit());
+            if rest[end..].starts_with('>')
+                && digits.len() < cmd.len()
+                && digits.ends_with(char::is_whitespace)
+            {
+                cmd = digits;
+            }
+            let text = variables(cmd)?;
             out.push(ClusterCommand {
                 line: start,
                 argv: text.split_whitespace().map(str::to_owned).collect(),
@@ -455,8 +466,24 @@ kbf cluster
                         .to_owned()
                 ),
                 (12, "kbf cluster status".to_owned()),
-                (12, "kbf cluster member 1 --state active 2".to_owned()),
+                (12, "kbf cluster member 1 --state active".to_owned()),
                 (15, "kbf cluster".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn only_a_whole_word_of_digits_before_a_redirection_is_its_descriptor() {
+        // Catches: the `2` of `2>&1` passed to the parser as a word, and the digits that
+        // end a real word (`node9>out`) or a plain `>out` cut from the command.
+        let doc = "```\nkbf cluster drain n 2>&1\nkbf cluster drain node9>out\n\
+                   kbf cluster drain n >out\n```\n";
+        assert_eq!(
+            argvs(doc),
+            [
+                (2, "kbf cluster drain n".to_owned()),
+                (3, "kbf cluster drain node9".to_owned()),
+                (4, "kbf cluster drain n".to_owned()),
             ]
         );
     }

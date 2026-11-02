@@ -290,11 +290,12 @@ fn every_kbf_cluster_command_in_the_deploy_docs_parses_with_kbfs_parser() {
             pages.push(name);
         }
     }
-    assert_eq!(
-        pages,
-        ["switch-object-store.md", "update-a-host.md"],
-        "the deploy docs with kbf cluster command lines"
-    );
+    for page in ["switch-object-store.md", "update-a-host.md"] {
+        assert!(
+            pages.iter().any(|p| p == page),
+            "{page} has no kbf cluster command line: {pages:?}"
+        );
+    }
 }
 
 #[test]

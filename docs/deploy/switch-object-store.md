@@ -26,7 +26,8 @@ first ([below](#moving-a-node-to---cold-store-registered)).
   lists both).
 - The connection's key is valid at the new endpoint: the repoint probes the new store with it
   and changes nothing when the probe fails.
-- Every storage member was started with `--cold-store registered`.
+- Every storage member was started with `--cold-store registered`. The held script below reads
+  and rewrites hand-written units under `/etc/systemd/system` only.
 
 ## The command
 
@@ -141,9 +142,11 @@ switch-object-store.sh --node NODE,MEMBER,HOST [--node ...] [--connection NAME -
 Before any write it checks every node (the unit's `--cold-store`, every drop-in) and the
 registry's generation, so a problem stops the walk before the repoint. Waits have no deadline;
 Ctrl-C stops the walk, and the node it was on stays drained until `kbf cluster undrain`. To go
-on after a stop once the repoint is done, run it again without the repoint flags: it walks every
-listed node to the registry's current generation (a node already on it is restarted once more).
-`ssh` must reach each host without a prompt, and `sudo` there must not ask for a password.
+on after a stop once the repoint is done, run it again without the repoint flags and with only
+the `--node` entries not yet done: it walks them to the registry's current generation. Run it as
+a user that can read the token file; `ssh` must reach each host without a prompt, and `sudo`
+there must not ask for a password. It handles hand-written units under `/etc/systemd/system`
+only: a packaged unit takes its store from `kbf.toml`, and the walk stops on it.
 
 ```bash
 #!/usr/bin/env bash
@@ -163,7 +166,9 @@ MIGRATE=0
 APPLY=0
 NODES=()
 
-stop() { echo "STOP: $*" >&2; exit 1; }
+# STATE says what a stop leaves behind, when it leaves anything.
+STATE=
+stop() { echo "STOP: $*${STATE:+ ($STATE)}" >&2; exit 1; }
 say() { echo "== $*"; }
 
 usage() {
@@ -220,7 +225,7 @@ store_status() { kbf cluster --api "$API" object-store status --token-file "$TOK
 # the unit says `--cold-store registered`, 10 when it names a store URL; stops on anything
 # else.
 check_unit() {
-  local host=$1 fragment flag dropins f
+  local host=$1 fragment flag value dropins f rc
   fragment=$(on "$host" systemctl show -P FragmentPath "$UNIT")
   [ -n "$fragment" ] || stop "$host: systemd has no unit $UNIT"
   case "$fragment" in
@@ -228,20 +233,27 @@ check_unit() {
     *) stop "$host: $UNIT is $fragment, not a hand-written unit under /etc/systemd/system" ;;
   esac
   dropins=$(on "$host" systemctl show -P DropInPaths "$UNIT")
-  dropins="$dropins $(on "$host" find "/etc/systemd/system/$UNIT.d" -maxdepth 1 -type f -name '*.conf' 2>/dev/null | tr '\n' ' ' || true)"
+  if on "$host" test -d "/etc/systemd/system/$UNIT.d"; then
+    dropins="$dropins $(on "$host" find "/etc/systemd/system/$UNIT.d" -maxdepth 1 -name '*.conf' | tr '\n' ' ')"
+  fi
   for f in $dropins; do
-    if on "$host" grep -nE 'cold-store|s3://|endpoint=|AWS_ENDPOINT' "$f"; then
-      stop "$host: the drop-in $f names a store (lines above); move that line out of it by hand"
-    fi
+    rc=0; on "$host" grep -nE 'cold-store|s3://|endpoint=|AWS_ENDPOINT' "$f" || rc=$?
+    case "$rc" in
+      0) stop "$host: the drop-in $f names a store (lines above); move that line out of it by hand" ;;
+      1) ;;
+      *) stop "$host: could not read the drop-in $f (exit $rc)" ;;
+    esac
   done
-  flag=$(on "$host" grep -oE -- '--cold-store(=|[[:space:]]+)[^[:space:]\\]+' "$fragment" || true)
+  rc=0; flag=$(on "$host" grep -oE -- '--cold-store(=|[[:space:]]+)[^[:space:]\\]+' "$fragment") || rc=$?
+  [ "$rc" -le 1 ] || stop "$host: could not read $fragment (exit $rc)"
   echo "   $host: $fragment: ${flag:-no --cold-store}"
-  case "$flag" in
-    "") stop "$host: $fragment has no --cold-store" ;;
-    *registered) return 0 ;;
-    *) [ "$(printf '%s\n' "$flag" | wc -l)" = 1 ] || stop "$host: $fragment has more than one --cold-store"
-       return 10 ;;
-  esac
+  [ -n "$flag" ] || stop "$host: $fragment has no --cold-store"
+  [ "$(printf '%s\n' "$flag" | wc -l)" = 1 ] || stop "$host: $fragment has more than one --cold-store"
+  value=${flag#--cold-store}
+  value=${value#=}
+  value=${value#"${value%%[![:space:]]*}"}
+  [ "$value" = registered ] && return 0
+  return 10
 }
 
 # Rewrites the unit to `--cold-store registered`, keeping a copy, and checks the flag once.
@@ -281,6 +293,7 @@ say "checking every node's unit and drop-ins"
 for spec in "${NODES[@]}"; do
   IFS=, read -r node_id member_id host <<<"$spec"
   [ -n "$node_id" ] && [ -n "$member_id" ] && [ -n "$host" ] || stop "--node $spec: give NODE,MEMBER,HOST"
+  case "$member_id" in *[!0-9]*) stop "--node $spec: the member id $member_id is not a number" ;; esac
   rc=0; check_unit "$host" || rc=$?
   if [ "$rc" = 10 ] && [ "$MIGRATE" = 0 ]; then
     stop "$host: its unit names a store URL and would not follow; run with --migrate"
@@ -311,23 +324,26 @@ say "every node must apply generation $target"
 for spec in "${NODES[@]}"; do
   IFS=, read -r node_id member_id host <<<"$spec"
   say "$node_id (member $member_id, $host)"
+  STATE=
   kbf cluster --api "$API" safe-to-stop "$node_id" --token-file "$TOKEN_FILE" \
-    || stop "$node_id: not safe to stop now (above); run the walk again later, without the repoint flags"
+    || stop "$node_id: not safe to stop now (above); run the walk again later with the nodes not yet done, without the repoint flags"
   run kbf cluster --api "$API" drain "$node_id" --token-file "$TOKEN_FILE" \
     || stop "$node_id: the drain was refused (above)"
   [ "$APPLY" = 0 ] || wait_until "$node_id drained" node_drained "$node_id"
   run kbf cluster --api "$API" member "$member_id" --state planned-down --for-secs "$FOR_SECS" --token-file "$TOKEN_FILE" \
     || stop "member $member_id: planned-down was refused (above); $node_id stays drained"
+  STATE="member $member_id is planned-down and $node_id is drained"
   rc=0; check_unit "$host" || rc=$?
   [ "$rc" = 0 ] || migrate_unit "$host"
   run on "$host" sudo systemctl restart "$UNIT" \
-    || stop "$host: the restart of $UNIT failed; $node_id stays drained"
+    || stop "$host: the restart of $UNIT failed"
   if [ "$APPLY" = 1 ]; then
     wait_until "member $member_id active" member_active "$member_id"
     wait_until "$node_id applied generation $target" node_applied "$node_id" "$target"
   fi
   run kbf cluster --api "$API" undrain "$node_id" --token-file "$TOKEN_FILE" \
     || stop "$node_id: the undrain was refused (above)"
+  STATE=
 done
 
 # 4. The farm.
