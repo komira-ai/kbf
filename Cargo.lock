@@ -1170,6 +1170,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "host-step"
+version = "0.1.0"
+dependencies = [
+ "rustix",
+ "thiserror",
+]
+
+[[package]]
 name = "http"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2271,6 +2279,7 @@ dependencies = [
  "libc",
  "proc-macro2",
  "prost",
+ "pulldown-cmark",
  "rcgen",
  "reqwest",
  "rustix",
@@ -2282,6 +2291,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-rustls",
+ "toml",
  "tonic",
  "tracing-subscriber",
  "xtask",
@@ -3315,6 +3325,35 @@ checksum = "69b6441f590336821bb897fb28fc622898ccceb1d6cea3fde5ea86b090c4de98"
 dependencies = [
  "cfg-if",
  "digest 0.11.3",
+]
+
+[[package]]
+name = "mdm-core"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "plist",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror",
+]
+
+[[package]]
+name = "mdm-host"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "flate2",
+ "getrandom 0.2.17",
+ "hex",
+ "host-step",
+ "mdm-core",
+ "rustls",
+ "sha2 0.11.0",
+ "tar",
+ "thiserror",
+ "ureq",
 ]
 
 [[package]]
@@ -5293,6 +5332,7 @@ dependencies = [
 name = "update-register"
 version = "0.1.0"
 dependencies = [
+ "rustix",
  "serde_json",
  "thiserror",
 ]
@@ -5325,6 +5365,7 @@ dependencies = [
  "rustls-pki-types",
  "ureq-proto",
  "utf8-zero",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -5510,6 +5551,15 @@ checksum = "88261b9deccee56594c11a3460c462c41f58d148598fe70ad77070126a68aba4"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f5f280bbb2b287bc8e7de7e3852945a0ff50d1bbcb5ed42b6c7a568c546df171"
+dependencies = [
+ "rustls-pki-types",
 ]
 
 [[package]]

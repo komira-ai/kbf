@@ -137,6 +137,8 @@ pub enum RetainError {
     Write { path: PathBuf, source: io::Error },
     #[error("cannot lock {path}: {source}")]
     Lock { path: PathBuf, source: io::Error },
+    #[error("{path} is held by another writer")]
+    Busy { path: PathBuf },
 }
 
 /// The lock of `retain.json`: an exclusive `flock(2)` on `retain.lock` beside it. Every change
@@ -157,6 +159,19 @@ impl RetainLock {
     /// # Errors
     /// The lock file cannot be opened or locked.
     pub fn acquire(path: &Path) -> Result<Self, RetainError> {
+        Self::take(path, true)
+    }
+
+    /// [`RetainLock::acquire`] without waiting: [`RetainError::Busy`] when another holds it, for
+    /// a caller that must not hang behind a writer that does not let go.
+    ///
+    /// # Errors
+    /// The lock file cannot be opened, or another holds the lock.
+    pub fn try_acquire(path: &Path) -> Result<Self, RetainError> {
+        Self::take(path, false)
+    }
+
+    fn take(path: &Path, wait: bool) -> Result<Self, RetainError> {
         let lock_path = path.with_extension("lock");
         let fail = |source| RetainError::Lock {
             path: lock_path.clone(),
@@ -173,7 +188,13 @@ impl RetainLock {
             Err(e) if e.kind() == io::ErrorKind::NotFound => None,
             opened => {
                 let lock = opened.map_err(fail)?;
-                lock.lock().map_err(fail)?;
+                if wait {
+                    lock.lock().map_err(fail)?;
+                } else if lock.try_lock().is_err() {
+                    return Err(RetainError::Busy {
+                        path: lock_path.clone(),
+                    });
+                }
                 Some(lock)
             }
         };
@@ -284,8 +305,26 @@ impl Retained {
         Self::update_with(path, &mut |r| change.take().map_or((), |f| f(r)))
     }
 
+    /// [`Retained::update`] without waiting for the lock: [`RetainError::Busy`] when another
+    /// writer holds it, and nothing is changed.
+    ///
+    /// # Errors
+    /// The file cannot be locked at once, read, parsed or written.
+    pub fn try_update(path: &Path, change: impl FnOnce(&mut Self)) -> Result<Self, RetainError> {
+        let mut change = Some(change);
+        let lock = RetainLock::try_acquire(path)?;
+        Self::change_under(&lock, &mut |r| change.take().map_or((), |f| f(r)))
+    }
+
     fn update_with(path: &Path, change: &mut dyn FnMut(&mut Self)) -> Result<Self, RetainError> {
         let lock = RetainLock::acquire(path)?;
+        Self::change_under(&lock, change)
+    }
+
+    fn change_under(
+        lock: &RetainLock,
+        change: &mut dyn FnMut(&mut Self),
+    ) -> Result<Self, RetainError> {
         let was = lock.read()?;
         let mut now = was.clone();
         change(&mut now);

@@ -14,8 +14,9 @@
 //! (minutes), and a test takes milliseconds, so a run could only differ if the machine stalled
 //! for minutes between two lines of one test.
 //!
-//! The js core exists only in a build with the `farm-core-js` feature, so the file is empty
-//! without it.
+//! Both cores are in every build, and each test here builds both itself
+//! (`Farm::new_on_core`). The file is compiled only with the `farm-core-js` feature, so it
+//! runs once, in CI's `test-shard (js-1-of-1)`, and not again in each legacy shard.
 #![cfg(feature = "farm-core-js")]
 
 use std::collections::{BTreeMap, BTreeSet};

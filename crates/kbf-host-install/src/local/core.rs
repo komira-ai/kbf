@@ -34,6 +34,9 @@ use crate::mac::release::commit_prefix;
 use crate::request::{Channel, Version};
 use crate::trust::Trust;
 
+#[path = "core_activate.rs"]
+pub mod activate;
+
 /// How many versions the state file remembers, at the least: it never forgets a release the
 /// host keeps (see [`Ab::versions_kept`]).
 const KEEP_VERSIONS: usize = 16;
@@ -138,6 +141,39 @@ impl Saved {
     }
 }
 
+/// `state.json` at `state_file`, read as `trust` allows; nothing when there is none.
+fn load_saved(state_file: &Path, trust: &Trust) -> Result<Saved, Fault> {
+    let unavailable = |why: String| Fault::failed(Code::StateUnavailable, why);
+    match fs::symlink_metadata(state_file) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Saved::default()),
+        Err(e) => return Err(unavailable(format!("state.json: {e}"))),
+        Ok(_) => {}
+    }
+    let text = trust
+        .read(state_file)
+        .map_err(|e| unavailable(format!("state.json: {e}")))?;
+    serde_json::from_str(&text).map_err(|e| unavailable(format!("state.json: {e}")))
+}
+
+/// Replace `state.json` at `state_file` by `saved`: written beside it (root's, 0600) and renamed.
+fn save_saved(state_file: &Path, saved: &Saved) -> Result<(), Fault> {
+    let unavailable = |why: String| Fault::failed(Code::StateUnavailable, why);
+    let text = serde_json::to_string(saved).map_err(|e| unavailable(e.to_string()))?;
+    let aside = state_file.with_extension("json.new");
+    let _ = fs::remove_file(&aside);
+    let written = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&aside)
+        .and_then(|mut file| {
+            file.write_all(text.as_bytes())?;
+            file.sync_all()
+        })
+        .and_then(|()| fs::rename(&aside, state_file));
+    written.map_err(|e| unavailable(format!("state.json: {e}")))
+}
+
 /// At most `max` of the releases `kept` that fit in [`LISTED_BYTES`], the ones that must stay
 /// first, and how many are left out ([`kbf_retain::cut`]).
 fn cut(kept: Vec<Kept>, max: usize) -> (Vec<Kept>, usize) {
@@ -157,6 +193,8 @@ pub struct Ab<B: Backend> {
     keep: usize,
     /// Where what this program did besides answering is told (a prune after a confirm).
     note: Box<dyn Fn(&str)>,
+    /// The root-owned file an `activate --pin` writes for the agent ([`activate`]).
+    hold_file: Option<PathBuf>,
 }
 
 impl<B: Backend> Ab<B> {
@@ -175,7 +213,15 @@ impl<B: Backend> Ab<B> {
             clock,
             keep: kbf_retain::DEFAULT_KEEP,
             note: Box::new(|_| {}),
+            hold_file: None,
         }
+    }
+
+    /// Write the hold of an `activate --pin` to `hold_file`.
+    #[must_use]
+    pub fn holding(mut self, hold_file: PathBuf) -> Self {
+        self.hold_file = Some(hold_file);
+        self
     }
 
     /// Keep `keep` releases besides the ones that must stay (never fewer than
@@ -204,6 +250,9 @@ impl<B: Backend> Ab<B> {
                 self.locked(|| self.confirm(version, last_good.as_ref()))
             }
             LocalRequest::Revert => self.locked(|| self.go_back(Why::Reverted)),
+            LocalRequest::Activate { target } => {
+                return self.activate(target, activate::How::default());
+            }
         };
         done.unwrap_or_else(Fault::answer)
     }
@@ -236,35 +285,11 @@ impl<B: Backend> Ab<B> {
     }
 
     fn load(&self) -> Result<Saved, Fault> {
-        let unavailable = |why: String| Fault::failed(Code::StateUnavailable, why);
-        match fs::symlink_metadata(&self.state_file) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Saved::default()),
-            Err(e) => return Err(unavailable(format!("state.json: {e}"))),
-            Ok(_) => {}
-        }
-        let text = self
-            .trust
-            .read(&self.state_file)
-            .map_err(|e| unavailable(format!("state.json: {e}")))?;
-        serde_json::from_str(&text).map_err(|e| unavailable(format!("state.json: {e}")))
+        load_saved(&self.state_file, &self.trust)
     }
 
     fn save(&self, saved: &Saved) -> Result<(), Fault> {
-        let unavailable = |why: String| Fault::failed(Code::StateUnavailable, why);
-        let text = serde_json::to_string(saved).map_err(|e| unavailable(e.to_string()))?;
-        let aside = self.state_file.with_extension("json.new");
-        let _ = fs::remove_file(&aside);
-        let written = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&aside)
-            .and_then(|mut file| {
-                file.write_all(text.as_bytes())?;
-                file.sync_all()
-            })
-            .and_then(|()| fs::rename(&aside, &self.state_file));
-        written.map_err(|e| unavailable(format!("state.json: {e}")))
+        save_saved(&self.state_file, saved)
     }
 
     fn query(&self) -> Result<Answer, Fault> {

@@ -41,7 +41,6 @@ pub(crate) mod usage;
 
 pub use adapter::{KbfAdapter, Outbound, Wall};
 pub use host::{Caller, Connection};
-#[cfg_attr(not(any(feature = "farm-core-js", test)), allow(unused_imports))]
 pub(crate) use learning::{Gate, write_behind_now, write_learned};
 pub use open::KbfObserver;
 

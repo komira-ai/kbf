@@ -12,7 +12,7 @@
 //! never written from here.
 //!
 //! What these scripts do not reach: the `ResultAck` the adapter's `settle` sends to a node when
-//! a result was held until its record was written (no script makes the state store refuse).
+//! a result was held until its record was written (no script makes the state store refuse a write).
 //! `farm_js::dispatch_tests::a_held_result_is_acknowledged_and_answered_once_its_record_is_written`
 //! pins it. Nor do they read a store written by one driver with the other.
 
@@ -117,6 +117,10 @@ scripts!(
     epoch_change,
     handover,
     cordon_and_drain,
+    unreadable_op_row,
+    unreadable_done_row,
+    unreadable_leased_op_row,
+    unreadable_done_row_elsewhere,
 );
 
 /// Catches a normalisation that takes out more than the cost: a lease row with a cost is

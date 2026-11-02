@@ -156,3 +156,24 @@ fn a_store_that_cannot_be_read_fails_the_load() {
     let (key, _) = corrupt(load(&rows).expect_err("a bad counter"));
     assert_eq!(key, keys::NEXT_OP);
 }
+
+/// Asserts that an `op/` row that does not parse fails the load, naming the row, where the
+/// same store loaded before the row was damaged.
+///
+/// Catches: a load that skips a row it cannot read, which would leave the operation with
+/// no caller and its lease running to its timeout.
+#[test]
+fn a_garbage_op_row_fails_the_load_naming_the_row() {
+    let store: Arc<Fake> = store();
+    let rows = rows(&store, 1);
+    let operation = rows.reserve_operation(OperationId(4)).expect("ids");
+    rows.reserve_seqs(0).expect("sequences");
+    rows.submit(operation, &request(1), &parcel(), None)
+        .expect("submit");
+    let loaded = load(&rows).expect("an intact store loads");
+    assert_eq!(loaded.stored.operations.len(), 1);
+
+    super::testing::overwrite(&store, &keys::operation(operation), vec![0xff, 0xff, 0xff]);
+    let (key, _) = corrupt(load(&rows).expect_err("a garbage row"));
+    assert_eq!(key, keys::operation(operation));
+}

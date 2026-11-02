@@ -1,0 +1,126 @@
+# mdm-host: the settings of the MDM kit (`--config FILE`).
+#
+# Format: KEY=VALUE, one per line, no spaces around `=`, optional double quotes. A key
+# not listed here, or one given twice, is refused. Every key marked "required" must be
+# set; a key marked "default" may be left out and then takes the value described (an
+# empty value is refused, not defaulted). Absolute paths only.
+#
+# Put no secret in this file. The installer makes the API keys and the SCEP challenge
+# into 0600 root files under MDM_ETC; the DNS API key goes in MDM_ETC/dns.env, a
+# 0600 file of root's holding the variables lego reads for the provider:
+#   godaddy:    GODADDY_API_KEY=  GODADDY_API_SECRET=
+#   route53:    AWS_ACCESS_KEY_ID=  AWS_SECRET_ACCESS_KEY=  AWS_REGION=  AWS_HOSTED_ZONE_ID=
+#   cloudflare: CLOUDFLARE_DNS_API_TOKEN=
+
+# --- where the MDM answers ----------------------------------------------------
+# Required. The name the Macs dial (a DNS A record pointing at MDM_BIND). The TLS
+# certificate is for this name.
+MDM_DNS_NAME=mdm.example.com
+# Required. The LAN address the HTTPS proxy binds, and the only one: refused unless it
+# is private (an RFC 1918 range: 10/8, 172.16/12 or 192.168/16) and inside MDM_LAN_CIDR.
+# This file leaves it empty: give your site's address.
+MDM_BIND=
+# Required. The LAN in CIDR form: the proxy talks to it and to loopback only (systemd
+# IPAddressAllow=). It must lie inside the private block of MDM_BIND: at least 8 bits in
+# 10/8, 12 in 172.16/12, 16 in 192.168/16, and at most 30. (A wider prefix would be read
+# by systemd as public space.) This file leaves it empty: give your site's LAN, for
+# example the /24 of MDM_BIND.
+MDM_LAN_CIDR=
+
+# --- the services ---------------------------------------------------------------
+# Required. The system user every service runs as: an unprivileged account (not root).
+MDM_USER=js-mdm
+# Required. State (database, SCEP CA, DEP token, TLS key): owned by MDM_USER, mode 0700.
+MDM_STATE=/var/lib/js-mdm
+# Required. Unit inputs and the 0600 root env files (API keys, SCEP challenge, DNS key).
+MDM_ETC=/etc/js-mdm
+# Required. The pinned binaries (root-owned, 0755).
+MDM_BIN=/opt/js-mdm/bin
+# The erase path's replay ledger (root only, 0700). Accepted here so one file serves the
+# whole kit; the unit and profile builders do not read it.
+MDM_ERASE_STATE=/var/lib/js-mdm-erase
+# Required. Loopback ports of NanoHUB, the SCEP server and NanoDEP's depserver.
+MDM_NANOHUB_PORT=9004
+MDM_SCEP_PORT=9005
+MDM_DEP_PORT=9001
+# Required. Caps of the slice (all the services together).
+MDM_MEMORY_MAX=1G
+MDM_CPU_QUOTA=100%
+MDM_TASKS_MAX=256
+# Default js-mdm. The prefix of every systemd unit: <prefix>-scep.service,
+# <prefix>-nanohub.service, <prefix>-proxy.service and so on. Lower-case letters,
+# digits and `-`, starting with a letter, at most 40 characters. Two kits on one host
+# need two prefixes.
+MDM_UNIT_PREFIX=js-mdm
+# Default <MDM_UNIT_PREFIX>.slice. The slice that caps the services: MDM_UNIT_PREFIX or a
+# name below it (<prefix>-<more>), ending in `.slice`. systemd's own slices are refused.
+MDM_SLICE=js-mdm.slice
+
+# --- Apple ----------------------------------------------------------------------
+# Required. NanoDEP's name for the Apple Business Manager server token. Letters, digits,
+# `.`, `_`, `-`, starting with a letter or digit (it is a command-line argument and a URL
+# path part).
+MDM_DEP_NAME=example
+# Required. The organisation shown with the SCEP CA, the enrollment profile and the ADE
+# profile.
+MDM_ORG=Example
+# Required. The enrollment profile's identifier, reverse-DNS. A Mac keeps one profile
+# per identifier, so keep it once Macs are enrolled.
+MDM_PROFILE_ID=com.example.mdm
+# Default "<MDM_ORG> MDM". The enrollment profile's name in System Settings.
+MDM_PROFILE_DISPLAY_NAME=Example MDM
+# Default "<MDM_ORG> MDM". The ADE profile's name, as Apple stores it with the profile.
+MDM_ADE_PROFILE_NAME=Example MDM
+# Default <MDM_UNIT_PREFIX>. The ADE profile's org_magic. Letters, digits, `.`, `_`, `-`, starting with a letter or digit.
+MDM_ADE_ORG_MAGIC=js-mdm
+# Default: Accessibility Appearance AppleID AppStore Biometric Diagnostics DisplayTone
+# FileVault iCloudDiagnostics iCloudStorage Intelligence Privacy ScreenTime Siri
+# TermsOfAddress TOS UnlockWithWatch Wallpaper. The Setup Assistant panes an enrolled
+# Mac skips: Apple's skip keys as words separated by spaces, in quotes.
+MDM_ADE_SKIP_ITEMS="Accessibility Appearance AppleID AppStore Biometric Diagnostics DisplayTone FileVault iCloudDiagnostics iCloudStorage Intelligence Privacy ScreenTime Siri TermsOfAddress TOS UnlockWithWatch Wallpaper"
+# Default en. The ADE profile's language: two lower-case letters.
+MDM_LANGUAGE=en
+# Default US. The ADE profile's region: two upper-case letters.
+MDM_REGION=US
+# Default "<MDM_ORG> MDM SCEP CA". The common name of the SCEP CA, which is the issuer
+# of every Mac's MDM identity certificate. Replacing the CA later re-enrolls every Mac,
+# so choose it before the first Mac.
+MDM_SCEP_CA_CN=Example MDM SCEP CA
+# Default <MDM_UNIT_PREFIX>. The organizational unit of the SCEP CA.
+MDM_SCEP_CA_OU=js-mdm
+# Default 10. The SCEP CA's validity in years, 1 to 30.
+MDM_SCEP_CA_YEARS=10
+# Default <MDM_UNIT_PREFIX>. The common name of the DEP token certificate that Apple
+# Business Manager is given. Letters, digits, `.`, `_`, `-`, starting with a letter or digit.
+MDM_DEP_CERT_CN=js-mdm
+# Default 7. That certificate's validity in days, 1 to 365.
+MDM_DEP_CERT_DAYS=7
+
+# --- TLS: an ACME certificate over DNS-01 ---------------------------------------
+# Required by the TLS verb only. The ACME account's contact address (expiry mail).
+MDM_ACME_EMAIL=admin@example.com
+# The ACME directory. For a first trial, a CA's staging directory (its certificates
+# are not trusted).
+MDM_ACME_SERVER=https://acme-v02.api.letsencrypt.org/directory
+# lego's DNS provider: godaddy, route53 or cloudflare. With route53 or cloudflare,
+# _acme-challenge.<MDM_DNS_NAME> is a CNAME into a zone that provider serves, and
+# lego follows it.
+MDM_ACME_DNS_PROVIDER=cloudflare
+# The nameservers lego asks about the challenge name (its zone, a CNAME), IP:PORT
+# words separated by spaces, in quotes: two public resolvers, say. Not the host's
+# resolver: a local stub caches the record's NXDOMAIN from before lego set it.
+MDM_ACME_RESOLVERS="192.0.2.53:53 198.51.100.53:53"
+# How long lego waits after setting the record before it asks the CA to check it, in
+# seconds (300s).
+MDM_ACME_PROPAGATION_WAIT=300s
+
+# --- the erase path -------------------------------------------------------------
+# Default <MDM_UNIT_PREFIX>-erase. The ssh signature namespace of an erase request.
+# Letters, digits, `.`, `_`, `-`, starting with a letter or digit.
+MDM_SIGNATURE_NAMESPACE=js-mdm-erase
+# The principal of the operator's key. Accepted here so one file serves the whole kit;
+# the unit and profile builders do not read it.
+MDM_ERASE_PRINCIPAL=operator@example.com
+# A signed erase request older than this many seconds is refused. Accepted here, not
+# read by the unit and profile builders.
+MDM_ERASE_MAX_AGE=900

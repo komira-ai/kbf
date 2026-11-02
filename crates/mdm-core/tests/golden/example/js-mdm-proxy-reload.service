@@ -1,0 +1,8 @@
+# js-mdm-proxy-reload.service: started by js-mdm-proxy-reload.path. Rendered by
+# `js-mdm tls`.
+[Unit]
+Description=js-mdm: restart the proxy for a new certificate
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl try-restart js-mdm-proxy.service

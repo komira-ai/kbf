@@ -1,6 +1,6 @@
 # `kbf-installer deploy`: the gamma trigger
 
-> RETIRED: `gamma.yml`, the `kbf-installer deploy` verb and `cargo xtask gamma` are deleted. Hosts take releases from OS packages and kbf-updater. This page describes the retired deploy and is kept as history; nothing below exists.
+> RETIRED: `gamma.yml`, the `kbf-installer deploy` verb and `cargo xtask gamma` are deleted. Hosts take releases from OS packages and kbf-updater. This page describes the retired deploy and is kept as history; nothing below exists. The gamma stage as built today is [gamma-cicd.md](gamma-cicd.md).
 
 Status: deleted (it was `crates/kbf-installer/src/deploy/`). It drives the update API the frontend's
 proxy serves (`docs/design/frontend-proxy.md`, sections 4, 5 and 9), frontend first.

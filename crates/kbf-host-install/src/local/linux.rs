@@ -19,7 +19,10 @@
 //!   are restarted and waited for. A unit that does not come up puts the host back at once;
 //! - **confirm**: [`kbf_installer::activate::confirm`] clears the marker;
 //! - **revert**: [`kbf_installer::activate::revert`] writes the state first, then moves the
-//!   links back, and the units are restarted on the release that ran.
+//!   links back, and the units are restarted on the release that ran;
+//! - **activate**: [`kbf_installer::activate::select`] writes the state with the release named
+//!   current, the one that ran `previous` and nothing on trial, then moves the links; the units
+//!   are restarted on it, and nothing goes back if they do not come up.
 //!
 //! The channels are named in `/etc/kbf/host-install-releases.toml`, in the format of a Mac's
 //! allowlist ([`crate::mac::channel`]); the ssh forced command's `host-install.toml` is the
@@ -42,7 +45,7 @@ use kbf_installer::helper::leases::LeaseSource;
 use kbf_installer::helper::service::{self, HostProcs, Procs};
 use kbf_installer::layout::{Layout, Platform};
 use kbf_installer::refusal::Refusal as InstallerRefusal;
-use kbf_installer::release;
+use kbf_installer::release::{self, ReleaseError};
 use kbf_installer::retain::{self, Kept};
 use kbf_installer::run::Runner as InstallerRunner;
 use kbf_installer::settings::Settings;
@@ -243,6 +246,24 @@ impl<E: Exec> Linux<E> {
             restart_and_wait(&*self.runner, unit, self.restart_wait, &self.pace)?;
         }
         Ok(())
+    }
+
+    /// Restart every unit and wait for each, whatever became of the ones before it: an
+    /// `activate` keeps the release named, so a unit left alone would go on running the release
+    /// it leaves. What did not come up, unit by unit.
+    fn restart_every_unit(&self) -> Result<(), String> {
+        let failed: Vec<String> = self
+            .units
+            .iter()
+            .filter_map(|unit| {
+                restart_and_wait(&*self.runner, unit, self.restart_wait, &self.pace).err()
+            })
+            .collect();
+        if failed.is_empty() {
+            Ok(())
+        } else {
+            Err(failed.join("; "))
+        }
     }
 
     /// Put the host back on the release that ran: state, links, restart. Whether the units
@@ -590,6 +611,33 @@ impl<E: Exec> Backend for Linux<E> {
 
     fn revert(&self, _pending: &Pending) -> Result<(), Fault> {
         self.put_back()
+    }
+
+    /// The installer's [`activate::select`] (the state, then the links; no trial; refused at once
+    /// while another run holds the installer's state), then every unit restarted, each whatever
+    /// became of the others. A unit that does not come up leaves the host on the release named:
+    /// there is no going back to the release left.
+    fn activate(&self, commit: &str) -> Result<(), Fault> {
+        let id = commit_id(commit)?;
+        let mut out = Vec::new();
+        activate::select(&mut *self.exec.borrow_mut(), &self.layout, &id, &mut out).map_err(
+            |e| match e {
+                ReleaseError::NotInstalled(_) => Fault::refused(Code::NotKept, e.to_string()),
+                ReleaseError::State(state::StateError::Busy { .. }) => {
+                    Fault::refused(Code::Busy, format!("kbf-installer's {e}"))
+                }
+                other => Fault::failed(Code::StateUnavailable, other.to_string()),
+            },
+        )?;
+        self.restart_every_unit().map_err(|why| {
+            Fault::failed(
+                Code::RestartFailed,
+                format!(
+                    "the host runs {} now, but: {why}",
+                    commit.get(..12).unwrap_or(commit)
+                ),
+            )
+        })
     }
 
     fn kept(&self) -> Result<Vec<Kept>, Fault> {

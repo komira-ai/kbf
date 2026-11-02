@@ -1,0 +1,114 @@
+# a result row another frontend wrote that cannot be read
+> [t=0ms] start
+  farm term=7 lease_epoch=7
+  txn applied rev=1 counters=[]
+    put meta/epoch cond=absent len=8 sha=a3eb8db89fc5123c ttl=-
+  txn applied rev=2 counters=[]
+    put meta/next_op cond=absent len=8 sha=f44b28e2244100cb ttl=-
+  txn applied rev=3 counters=[]
+    put meta/next_seq cond=absent len=8 sha=f44b28e2244100cb ttl=-
+> [t=0ms] submit build qos=ci kind=action cores_milli=1000 mem_gib=1 do_not_cache=false
+  ticket build#1 name=operations/0
+  txn applied rev=7 counters=[]
+    put op/0000000000000000 cond=absent len=75 sha=8136470751ede4ae ttl=-
+    put subject/0000000000000000 cond=absent len=14 sha=c64bfc0cdd708074 ttl=-
+    put queue/0000000000000000 cond=absent len=0 sha=e3b0c44298fc1c14 ttl=-
+    put inflight/6d61696e/0101010101010101010101010101010101010101010101010101010101010101/1 cond=absent len=8 sha=af5570f5a1810b7a ttl=-
+  stage build#1 waiting "no worker is connected"
+> [t=0ms] submit build qos=ci kind=action cores_milli=1000 mem_gib=1 do_not_cache=false
+  ticket build#2 name=operations/0
+  stage build#2 waiting "no worker is connected"
+> [t=0ms] submit lint qos=ci kind=action cores_milli=1000 mem_gib=1 do_not_cache=false
+  ticket lint#1 name=operations/1
+  txn applied rev=11 counters=[]
+    put op/0000000000000001 cond=absent len=75 sha=05f7624d5bfec4de ttl=-
+    put subject/0000000000000001 cond=absent len=14 sha=7fc5eda1dcb3aa86 ttl=-
+    put queue/0000000000000001 cond=absent len=0 sha=e3b0c44298fc1c14 ttl=-
+    put inflight/6d61696e/0202020202020202020202020202020202020202020202020202020202020202/2 cond=absent len=8 sha=cd2662154e6d76b2 ttl=-
+  stage lint#1 waiting "no worker is connected"
+> [t=0ms] peer start
+  peer lease_epoch=7
+  txn applied rev=12 counters=[]
+    put meta/next_op cond=v2 len=8 sha=7df7e25947701db9 ttl=-
+  txn applied rev=13 counters=[]
+    put meta/next_seq cond=v3 len=8 sha=7df7e25947701db9 ttl=-
+> [t=0ms] peer register node-b cores=4 gib=8 drivers=container
+  txn applied rev=14 counters=[]
+    put owner/node-b cond=absent len=16 sha=e1204f7fab020db1 ttl=-
+  txn applied rev=15 counters=[]
+    put session/node-b cond=any len=70 sha=bbf330e872319459 ttl=60000ms
+  txn applied rev=18 counters=[]
+    check owner/node-b cond=v14
+    del queue/0000000000000000 cond=v6
+    put lease/0000000000000007.0000000000000400 cond=absent len=23 sha=bd3ec52dd3e8bf56 ttl=-
+    put lease-by-op/0000000000000000 cond=any len=16 sha=2a74510e4d9f1a11 ttl=-
+  txn applied rev=21 counters=[]
+    check owner/node-b cond=v14
+    del queue/0000000000000001 cond=v10
+    put lease/0000000000000007.0000000000000401 cond=absent len=25 sha=cdf62ff9ebc7f62b ttl=-
+    put lease-by-op/0000000000000001 cond=any len=16 sha=c7761a175b97cc7d ttl=-
+  msg node-b welcome protocol=1 interval_ms=5000 epoch=7 pack_commit=false
+  msg node-b lease_offer lease=7/1024 kind=action action=build
+  msg node-b lease_offer lease=7/1025 kind=action action=lint
+  msg node-b start lease=7/1024 kind=action action=build millicpus=1000 memory_bytes=1073741824 heartbeat_seq=0 valid_for_ms=14000 device="" job=false fence=0
+  msg node-b start lease=7/1025 kind=action action=lint millicpus=1000 memory_bytes=1073741824 heartbeat_seq=0 valid_for_ms=14000 device="" job=false fence=0
+> [t=0ms] intake
+  stage build#1 executing
+  stage build#2 executing
+  stage lint#1 executing
+> [t=0ms] unreadable done/0000000000000000
+> [t=0ms] result node-b lease=7/1024 action=build ended=ran(exit=0)
+  ack lease=7/1024 accepted=true reason=RESULT_ACK_REASON_ACCEPTED
+  txn applied rev=32 counters=[]
+    check owner/node-b cond=v14
+    del lease/0000000000000007.0000000000000400 cond=v17
+    del inflight/6d61696e/0101010101010101010101010101010101010101010101010101010101010101/1 cond=v7
+    put doneof/0000000000000000 cond=any len=45 sha=f0fd36d49c3d8936 ttl=600000ms
+    del op/0000000000000000 cond=any
+    del queue/0000000000000000 cond=any
+    del loss/0000000000000000 cond=any
+    del fate/0000000000000000 cond=any
+    del subject/0000000000000000 cond=any
+    del opkey/0000000000000000 cond=any
+    del lease-by-op/0000000000000000 cond=any
+    put done/0000000000000000 cond=any len=56 sha=895de7ff3f4c42d7 ttl=600000ms
+  cache build exit=0
+> [t=0ms] result node-b lease=7/1025 action=lint ended=ran(exit=0)
+  ack lease=7/1025 accepted=true reason=RESULT_ACK_REASON_ACCEPTED
+  txn applied rev=43 counters=[]
+    check owner/node-b cond=v14
+    del lease/0000000000000007.0000000000000401 cond=v20
+    del inflight/6d61696e/0202020202020202020202020202020202020202020202020202020202020202/2 cond=v11
+    put doneof/0000000000000001 cond=any len=45 sha=a2c1eb6cc2381e02 ttl=600000ms
+    del op/0000000000000001 cond=any
+    del queue/0000000000000001 cond=any
+    del loss/0000000000000001 cond=any
+    del fate/0000000000000001 cond=any
+    del subject/0000000000000001 cond=any
+    del opkey/0000000000000001 cond=any
+    del lease-by-op/0000000000000001 cond=any
+    put done/0000000000000001 cond=any len=59 sha=a399dcb6a9b57898 ttl=600000ms
+  cache lint exit=0
+> [t=0ms] intake
+  read refused done/0000000000000000
+  stage lint#1 done ran exit=0 stdout="output of lint" worker="node-b" queued_ms=1900000000000 started_ms=1900000000000 completed_ms=1900000000002
+> [t=0ms] wait operations/0 as build-late
+  no such operation
+  read refused done/0000000000000000
+> [t=0ms] submit build qos=ci kind=action cores_milli=1000 mem_gib=1 do_not_cache=false
+  ticket build#3 name=operations/2
+  txn applied rev=47 counters=[]
+    put op/0000000000000002 cond=absent len=75 sha=8136470751ede4ae ttl=-
+    put subject/0000000000000002 cond=absent len=14 sha=c64bfc0cdd708074 ttl=-
+    put queue/0000000000000002 cond=absent len=0 sha=e3b0c44298fc1c14 ttl=-
+    put inflight/6d61696e/0101010101010101010101010101010101010101010101010101010101010101/1 cond=absent len=8 sha=cd04a4754498e06d ttl=-
+  txn applied rev=48 counters=[]
+    put meta/alive cond=any len=0 sha=e3b0c44298fc1c14 ttl=-
+  stage build#3 waiting "no worker is connected"
+> [t=0ms] cancel build#2
+> [t=0ms] intake
+  read refused done/0000000000000000
+  stage build#3 waiting_kept "no worker is connected"
+> [t=0ms] readable
+> [t=0ms] intake
+  stage build#1 done ran exit=0 stdout="output of build" worker="node-b" queued_ms=1900000000000 started_ms=1900000000000 completed_ms=1900000000000

@@ -1,0 +1,13 @@
+# @SLICE@: the caps of every @PREFIX@ service (NanoHUB, the
+# SCEP server, NanoDEP, the HTTPS proxy, the certificate job), rendered by
+# `js-mdm install` into /etc/systemd/system/. Edit the template,
+# not the installed copy. Past MemoryMax the slice's processes are OOM-killed
+# inside it; the host and its other services stay up.
+[Unit]
+Description=@PREFIX@ services (capped)
+
+[Slice]
+MemoryMax=@MEMORY_MAX@
+MemorySwapMax=0
+CPUQuota=@CPU_QUOTA@
+TasksMax=@TASKS_MAX@

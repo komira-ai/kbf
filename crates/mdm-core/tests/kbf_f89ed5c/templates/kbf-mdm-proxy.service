@@ -1,0 +1,44 @@
+# kbf-mdm-proxy.service: Caddy as the TLS front of the MDM, rendered by
+# `kbf-deploy mdm install`. Edit the template.
+#
+# Binds the LAN address only (the Caddyfile's default_bind), port 443 through
+# CAP_NET_BIND_SERVICE and no other capability, and its sockets talk only to
+# loopback and the rack LAN (IPAddressAllow). It routes /mdm, /checkin, /scep,
+# /enroll and /version; everything else, NanoHUB's API included, is 404.
+# The certificate is lego's (kbf-mdm-cert.service); a renewal restarts this
+# unit through kbf-mdm-proxy-reload.path.
+[Unit]
+Description=kbf-mdm HTTPS proxy (LAN address only)
+After=network-online.target kbf-mdm-nanohub.service kbf-mdm-scep.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+Group=@USER@
+Slice=kbf-mdm.slice
+Environment=XDG_DATA_HOME=@STATE@/caddy XDG_CONFIG_HOME=@STATE@/caddy
+ExecStart=@BIN@/caddy run --config @ETC@/Caddyfile --adapter caddyfile
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=yes
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+ProtectSystem=strict
+ReadWritePaths=@STATE@/caddy
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+IPAddressDeny=any
+IPAddressAllow=localhost @LAN_CIDR@
+
+[Install]
+WantedBy=multi-user.target

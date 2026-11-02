@@ -1,7 +1,7 @@
 //! A frontend that runs as a container: the backend of `kbf-host-install --serve
 //! --frontend-container`.
 //!
-//! The release is an image. [`Frontend`] answers the same five requests as the other backends
+//! The release is an image. [`Frontend`] answers the same requests as the other backends
 //! ([`crate::local::backend::Backend`]), so the core's A/B, its pending marker and its
 //! deadline revert are the ones the other hosts have:
 //!

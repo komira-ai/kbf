@@ -54,7 +54,7 @@ the files each one is given.
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Every commit needs a DCO sign-off, and
-every test must have been seen failing on a planted defect.
+every change meets the rules in [AGENTS.md](AGENTS.md).
 
 ## Security
 

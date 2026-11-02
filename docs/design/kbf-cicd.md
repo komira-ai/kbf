@@ -26,7 +26,7 @@ kills a node while a build is running. The assertions are numbers, not logs: zer
 under-replicated blobs back to zero.
 
 A commit that passes beta may be offered to the operator's own farm: **gamma**. For our own build farm the trigger is
-automatic (RETIRED: `gamma.yml` and the `kbf-installer deploy` verb are deleted, and hosts take releases from OS packages and kbf-updater; the text of this page about the deploy is history): when a push to `main` has been cut into a release, `gamma.yml` verified the release, made the offer for gamma
+automatic (RETIRED: `gamma.yml` and the `kbf-installer deploy` verb are deleted, and hosts take releases from OS packages and kbf-updater; the text of this page about the deploy is history, and the gamma stage as built is [gamma-cicd.md](gamma-cicd.md)): when a push to `main` has been cut into a release, `gamma.yml` verified the release, made the offer for gamma
 and deployed the commit on the farm's frontend host over Tailscale SSH (section 5.4); the new frontend then offers it to
 the nodes, which pull it. The deploy is itself a test (no build failed because a connection was dropped). Planned: gamma's
 verdict (gamma verdict TBD, on a generic monitoring library) then comes from the operator's real usage over the metrics
@@ -146,7 +146,7 @@ result = "release.json"
 
 The lint refuses a workflow job that names a stage not in the file, an `actions` stage with no job, a `pull_request` trigger
 on any of these workflows, an unpinned `uses:`, and `id-token: write` anywhere but `attest`. `runs = "operator"` stages have
-no job. The stage file as built is `release/stages.yml`, which lists no gamma stage (no workflow runs gamma; hosts take releases from OS packages and kbf-updater), so `prod` follows `beta`.
+no job. The stage file as built is `release/stages.yml`, which lists no gamma stage: gamma is the `gamma` job of `release.yml`, in the `prod` stage, which sets the farm's desired version on the update coordinator ([gamma-cicd.md](gamma-cicd.md)), so `prod` follows `beta`.
 
 ## 3. The artifact every stage consumes
 
@@ -439,7 +439,7 @@ beta scenario in the same change that fixes it (section 11).
 
 ### 5.4 The gamma trigger, as built (RETIRED)
 
-> RETIRED: `gamma.yml` is deleted and no release workflow run starts a gamma deploy; gamma moves to kbf-updater (package-update design, section 13). This section describes the workflow as it was, until the xtask `gamma` and `release stage-offer` verbs it names are deleted.
+> RETIRED: `gamma.yml` is deleted; gamma is now the `gamma` job of `release.yml`, which sets the farm's desired version on the update coordinator for kbf-updater to take ([gamma-cicd.md](gamma-cicd.md)). This section describes the workflow as it was, until the xtask `gamma` and `release stage-offer` verbs it names are deleted.
 
 `.github/workflows/gamma.yml` (the stage row `gamma` of `release/stages.yml`: `runs: actions`, event `workflow_run`, the jobs
 `offer` and `deploy`):

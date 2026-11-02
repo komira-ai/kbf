@@ -164,9 +164,14 @@ pub(in crate::farm) struct Engine {
     /// The operation of each lease whose answer was settled, while the scheduler keeps
     /// the operation: a copy of its `Result` is a duplicate, not an unknown lease.
     pub(in crate::farm) answered: BTreeMap<LeaseId, OperationId>,
-    /// Writes given up on for good: dropped as stale or fenced, or over the cap
+    /// Writes given up on for good: dropped on a fence, for a node another frontend owns,
+    /// as unencodable, or over the cap
     /// ([`Farm::dropped_writes`](super::Farm::dropped_writes)).
     pub(in crate::farm) write_drops: u64,
+    /// Committed records the state store refused as stale because another frontend took
+    /// the same queue row first: the designed end of a race, not a drop
+    /// ([`Farm::lost_races`](super::Farm::lost_races)).
+    pub(in crate::farm) lost_races: u64,
     /// The most committed records `unwritten` holds before a new one is dropped.
     pub(in crate::farm) held_cap: usize,
     /// The scheduler was told the state store is unavailable ([`Engine::watch_store`]).
@@ -219,6 +224,7 @@ impl Engine {
             owed: BTreeMap::new(),
             answered: BTreeMap::new(),
             write_drops: 0,
+            lost_races: 0,
             held_cap: HELD_CAP,
             store_down: false,
             renewed: BTreeMap::new(),
