@@ -274,9 +274,16 @@ frontend sends), and succeeds if it would have: a blob the frontend does not loc
 frontend without `--pack-index`), a pack the tierstore answers 404 for (`lost`), bytes that are
 not the digest (`damaged`, never served), a tierstore that is down or answers an error
 (`unasked`), and a blob over 64 MiB. Where `--pack-read` fails a lost or damaged read, this
-falls back, because the tierstore is a cache and not the store. Nothing checks the tierstore at
+falls back, because the tierstore is a cache and not the store. A tierstore that refuses
+connections costs each read the S3 client's three tries (about 150 ms of back-off) before the
+frontend answers; one that accepts and never answers holds a read for the request timeout
+(60 s, not tried again), and at most 16 reads ask at once. Nothing checks the tierstore at
 start, so a daemon whose tierstore is down starts, reads every blob as it did without the flag,
-and uses the tierstore once it answers. The counts are the ones of `--pack-read`, logged and sent
+and uses the tierstore once it answers. The daemon reads ranges of packs, which are up to the
+writers' `--pack-bytes` (128 MiB by default): the tierstore keeps a pack it does not hold only
+if its `local_cache.whole_fill_limit` (64 MiB by default) is at least the pack's size, so set it
+to the largest pack size (`128MiB`); a larger pack is passed through and kept nowhere, and the
+read still succeeds. The counts are the ones of `--pack-read`, logged and sent
 in every heartbeat the same way. The flags are refused with `--pack-read`, and by
 `kbf storage-and-daemon` and `kbf all-in-one`. Left out, no tierstore is contacted and the
 daemon starts as before.
@@ -730,7 +737,7 @@ disks and CPUs, and `daemon` on hosts that only build.
 - **A draining member.** `--state draining` takes a member out of the write path without
   taking it `down`; it is read first. The state of every member is in `GET /v1/members`.
 - **Macs.** A Mac is a node only: `daemon` with the `native` driver, enrolled like any other
-  node. Macs build what Linux cannot (Xcode, iOS), and hold no blobs; `all-in-one` and
+  node. Macs build what Linux cannot (Xcode, iOS), and hold none of the farm's blobs; `all-in-one` and
   `storage-and-daemon` refuse any driver but `container`, so a Mac is never one of those. A Mac
   may read the packs through a tierstore on its own loopback (`--tierstore-endpoint`, above). Its
   `kbf.toml` is rendered by `kbf-mac-provision`. See

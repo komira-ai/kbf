@@ -44,9 +44,8 @@
 //! With `--pack-write` as well (off by default; `pack_read`) it writes its outputs into packs
 //! while the frontend takes pack commits.
 //!
-//! With `--tierstore-endpoint` (off by default; `tierstore`) the data plane of `kbf daemon` reads
-//! the same packs through a tierstore on loopback first, and reads every blob it does not serve
-//! where it always was, so a tierstore that misses, fails or is down never fails a build.
+//! With `--tierstore-endpoint` (off by default; `tierstore`) `kbf daemon` reads the same packs
+//! through a tierstore on loopback first, and every blob it does not serve where it always was.
 //!
 //! The log goes to stderr, in color only when stderr is a terminal: under launchd or
 //! systemd it is a file or a journal, where escape codes are noise (issue #170). The
@@ -345,6 +344,9 @@ pub struct Cli {
     #[arg(long, requires = "pool_users")]
     pool_first_uid: Option<u32>,
 }
+
+/// The modes whose daemon reads blobs in-process ([`start_with`]).
+const IN_PROCESS_MODES: &str = "`kbf all-in-one` or `kbf storage-and-daemon` without `--frontend`";
 
 /// The drivers this binary can run leases through.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -672,8 +674,7 @@ pub fn start_with<C: Cas>(
     plane: impl Fn(&Cli) -> Result<Arc<C>, Error> + 'static,
 ) -> Result<NodeHandle, Error> {
     cli.pack_read.refuse_in_process()?;
-    cli.tierstore
-        .refuse("a daemon that reads blobs in-process")?;
+    cli.tierstore.refuse(IN_PROCESS_MODES)?;
     start_over(cli, None, move |cli, _| plane(cli))
 }
 

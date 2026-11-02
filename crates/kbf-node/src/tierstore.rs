@@ -14,9 +14,12 @@
 //! exactly as without the flag: a blob the index does not place, a frontend that serves no
 //! locations, a pack the tierstore answers 404 for, bytes that are not the digest
 //! ([`kbf_daemon::PackedCas::falling_back`]), a tierstore that is down or answers an error, and a
-//! blob over 64 MiB (a read from a pack holds the blob whole). A dead tierstore costs each read a
-//! refused connection on loopback and never fails a build. Nothing checks the tierstore at start
-//! for the same reason: one that is down at start is read around, and is used once it is up.
+//! blob over 64 MiB (a read from a pack holds the blob whole). A dead tierstore never fails a
+//! build: each read costs the S3 client's three tries of a refused connection on loopback (about
+//! 150 ms of back-off) and then goes to the frontend; one that accepts and never answers holds a
+//! read for the client's request timeout (60 s, not tried again) first. Nothing checks the
+//! tierstore at start for the same reason: one that is down at start is read around, and is used
+//! once it is up.
 //! Outputs are stored where they always were.
 //!
 //! **Loopback only.** The endpoint is `http://` to a loopback address (any `127.*` address or
@@ -56,8 +59,9 @@ pub(crate) struct TierstoreArgs {
     /// `--cas`), reads that range of that pack through the tierstore and checks it against the
     /// digest. Every blob the tierstore does not serve (not in a pack, a 404, bytes that are not
     /// the digest, a tierstore that is down or answers an error, a blob over 64 MiB) is read from
-    /// the frontend as without this flag, so a dead tierstore never fails a build. Outputs are
-    /// stored where they were. An endpoint that is not on loopback is refused at start. Needs
+    /// the frontend as without this flag, so a dead tierstore slows reads and never fails a
+    /// build. Outputs are stored where they were. An endpoint that is not on loopback is refused
+    /// at start. Needs
     /// `--tierstore-bucket` and `--tierstore-credentials-file`; refused with `--pack-read`, and by
     /// `kbf storage-and-daemon` and `kbf all-in-one`. Left out, no tierstore is contacted.
     #[arg(
@@ -169,6 +173,9 @@ fn loopback(endpoint: &str) -> Result<(), NotLoopback> {
     let ip: IpAddr = host
         .parse()
         .map_err(|_| refused("the host is not an IP address"))?;
+    if authority.starts_with('[') && ip.is_ipv4() {
+        return Err(refused("an IPv4 address goes without brackets"));
+    }
     if !ip.to_canonical().is_loopback() {
         return Err(refused("the address is not a loopback address"));
     }

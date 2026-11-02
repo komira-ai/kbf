@@ -197,6 +197,14 @@ fn other_endpoints_are_refused_with_what_is_wrong() {
         ("http://[::1:9300", "not a bare host and port"),
         ("http://[::1]9300", "not a bare host and port"),
         ("http://::1:9300", "an IPv6 address goes in brackets"),
+        (
+            "http://[127.0.0.1]:9300",
+            "an IPv4 address goes without brackets",
+        ),
+        ("HTTP://127.0.0.1:9300", "not http://"),
+        ("http://127.0.0.1.:9300", "the host is not an IP address"),
+        ("http://[::1%25lo]:9300", "the host is not an IP address"),
+        (" http://127.0.0.1:9300", "not http://"),
     ];
     for (endpoint, why) in cases {
         let want = NotLoopback {
@@ -292,10 +300,11 @@ fn started(cli: &Cli) -> Result<String, String> {
     Ok(said)
 }
 
-/// Asserts that a daemon started without the flags starts as `main`'s did, byte for byte: the
-/// golden is what `main`'s start logged about its data plane (through `--cas` until a map, then
-/// the storage nodes; no tierstore line) and that its heartbeats carry no pack counts.
-/// Catches a daemon without the flag that builds or contacts a tierstore, or wraps its plane.
+/// Asserts that a daemon started without the flags says what `main`'s start said, byte for
+/// byte: the golden holds the lines `main`'s start logged about its data plane (through `--cas`
+/// until a map, then the storage nodes; no tierstore line) and that its heartbeats carry no pack
+/// counts.
+/// Catches a daemon without the flag that reads through a tierstore or counts pack reads.
 #[test]
 fn without_the_flags_the_daemon_starts_as_before_golden() {
     let dir = scratch("tierstore-golden");
@@ -375,8 +384,8 @@ fn the_in_process_start_refuses_the_tierstore() {
         .expect("refused");
     assert_eq!(
         refused.to_string(),
-        "--tierstore-endpoint: only `kbf daemon` reads through a local tierstore, not a daemon \
-         that reads blobs in-process"
+        "--tierstore-endpoint: only `kbf daemon` reads through a local tierstore, not `kbf \
+         all-in-one` or `kbf storage-and-daemon` without `--frontend`"
     );
     kbf_outputs::remove_tree(&dir).expect("clean");
 }
@@ -599,10 +608,11 @@ async fn both(cas: &PackedCas<Front>, dir: &Path, digest: &Digest) -> (Vec<u8>, 
 }
 
 /// Asserts that a blob the tierstore holds is served from it to `get` and to `read_to`, whole,
-/// and that the frontend's plane is never called: the bytes come from the tierstore only.
-/// Catches a read that goes to the frontend though the tierstore has the blob.
+/// and that the frontend's CAS plane is never called: the bytes come from the tierstore only
+/// (the blob's place comes from the frontend's pack index, here in memory).
+/// Catches a read that fetches the bytes from the frontend though the tierstore has the blob.
 #[tokio::test]
-async fn a_hit_is_served_from_the_tierstore_and_never_read_from_the_frontend() {
+async fn a_hit_is_served_from_the_tierstore_and_never_read_from_the_frontends_cas() {
     let dir = scratch("tierstore-hit");
     let rig = Rig::new();
     let digest = rig.pack(b"in the tierstore").await;
