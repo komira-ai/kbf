@@ -98,7 +98,10 @@ fn every_step_gets_the_same_params_and_prepare_gets_the_staged_release() {
 #[test]
 fn a_fault_the_fake_cannot_make_is_skipped_and_reported() {
     let scratch = Scratch::new("skip-halt");
-    let mut fake = ExampleFake { no_halt: true };
+    let mut fake = ExampleFake {
+        no_halt: true,
+        ..ExampleFake::default()
+    };
     let summary = check(&example(CONVENTION), &mut fake, scratch.path()).unwrap();
     assert_eq!(summary.scenarios.len(), 12);
     assert_eq!(
@@ -785,6 +788,14 @@ fn every_violation_says_what_it_found() {
             step: steps,
             outcome: Outcome::Success,
             changes: vec![],
+        },
+        Violation::RerunReasonChanged {
+            step: steps,
+            first: None,
+            second: Some("r".into()),
+        },
+        Violation::DeclinedRollbackChanged {
+            changes: vec!["c".into()],
         },
     ];
     for violation in all {

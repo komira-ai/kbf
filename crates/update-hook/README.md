@@ -107,8 +107,31 @@ the hook as the updater would and checks:
   and as a first install (neither); a params file with an unknown `updater.*` key is accepted;
 - with the record directory locked, every step refuses.
 
-Nothing waits for a time. A kill point announces itself on standard error and the harness kills the
-step's process group on that line.
+**Allowances.** A hook may declare, with `Conformance::with_allowances` and an `Allowances`, up to
+three behaviours the checks above refuse by default and that a hook may show for safety. Each is
+off unless declared, so a hook that declares none (the kbf hook) is checked strictly:
+
+- `rollback_rerun_may_say_reversible`: a `rollback` run again may say `reversible: true` where the
+  first run said `false` (a rerun that finds no record cannot know the first committed; the updater
+  ignores `reversible` on a `rollback` that succeeded). The rerun must still end as the first did
+  and change nothing; a flag that falls, or a flip on another step, is still refused.
+- `lapsing_cordon`: a `LapsingCordon`, the state paths of a cordon and the paths whose presence
+  means the hook has recorded it as its own. After a crash right after placing the cordon and before
+  recording it, a run again cannot tell it from an operator's and may leave it to lapse by its lease.
+  Only the kill point right after the change that made a cordon path appear is excused, only while no
+  ownership path is there (an empty ownership list excuses nothing), and only for the cordon paths,
+  added or changed; a cordon left by a crash at any other point, a renewal included, is still
+  refused. The kill point before a kill ran in another sandbox, so the window reads only which paths
+  exist, never their bytes, which may name the sandbox.
+- `first_install_rollback_may_fail`: on a first install, a `rollback` after `cutover` may fail
+  (exit `1`; not a deferral or a halt) with the reason `no_previous_release` rather than stop what
+  it started, changing nothing, and the same way, with the same reason and the same `reversible`,
+  when run again. With a previous release, or with another reason, the rollback must still
+  succeed. It covers the first-install `rollback` of `idempotence`, which `check_all` runs after its
+  update checks; with `with_first_install`, crash-resume and the sequences still require the
+  rollback to succeed.
 
 The tests of this crate run the harness against a small example hook
 (`tests/bin/example_hook.rs`) and against copies with one defect each, and require it to name each.
+`tests/allowances.rs` runs it against the example with each allowed behaviour: refused when not
+declared, accepted when declared, and refused, declared or not, just past what the allowance covers.

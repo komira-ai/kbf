@@ -245,6 +245,102 @@ pub fn first<E: Exec>(
     Ok(())
 }
 
+/// What [`select`] did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Selected {
+    /// The release that was current before, now `previous` (when it is not `commit`).
+    pub from: Option<CommitId>,
+}
+
+/// Make the installed release `commit` current for good, with no trial: the operator's
+/// emergency swap to a release the host keeps. The state's lock is taken without waiting
+/// ([`Locked::try_acquire`]): another run that holds it is `StateError::Busy`, and nothing
+/// changes. The state gets `current` = `commit`,
+/// `previous` = the release that was current (unless that is `commit`, when `previous` stays),
+/// no `pending_confirm` (a swap on trial ends here, kept or left), and a `staged` that names
+/// `commit` is cleared; the state is written first and the links follow, as for every verb.
+/// Links that cannot follow put the state back as it was (and the links, as far as they can
+/// be). Nothing is fetched and nothing is run: the caller restarts the service.
+pub fn select<E: Exec>(
+    exec: &mut E,
+    host: &Layout,
+    commit: &CommitId,
+    out: &mut dyn Write,
+) -> Result<Selected, ReleaseError> {
+    let lock = Locked::try_acquire(host)?;
+    let state = lock.read()?.unwrap_or_default();
+    if !has_binary(exec, host, commit) {
+        return Err(ReleaseError::NotInstalled(commit.clone()));
+    }
+    // The history is the links': the release left is the one `current` names, and the one
+    // before it the one `previous` names. The state can name others when a verb was cut short
+    // (or a select could not put it back); it is read only on a host with no `current` link. A
+    // link that cannot be read is refused before anything is written.
+    let (from, before) = match linked(exec, host, &host.current())? {
+        Some(ran) => (Some(ran), linked(exec, host, &host.previous())?),
+        None => (state.current.clone(), state.previous.clone()),
+    };
+    let previous = match &from {
+        Some(ran) if ran != commit => Some(ran.clone()),
+        _ => before,
+    };
+    let next = State {
+        current: Some(commit.clone()),
+        previous,
+        pending_confirm: None,
+        staged: state.staged.clone().filter(|c| c != commit),
+        ..state.clone()
+    };
+    lock.write(&next)?;
+    if let Err(e) = converge(exec, host, &next, out) {
+        // The links did not follow: the state goes back as it was, and the links too, as far as
+        // they can be. A state that could not be put back is told; the next select takes the
+        // release it leaves from the links, not from a state that names a release that never ran.
+        let restored = lock.write(&state);
+        let _ = converge(exec, host, &state, out);
+        return Err(match restored {
+            Ok(()) => e,
+            Err(restore) => ReleaseError::NotPutBack {
+                cause: e.to_string(),
+                restore: restore.to_string(),
+                current: match linked(exec, host, &host.current()) {
+                    Ok(Some(ran)) => format!("names {ran}"),
+                    Ok(None) => "is no link".to_owned(),
+                    Err(e) => format!("cannot be read ({e})"),
+                },
+            },
+        });
+    }
+    Ok(Selected { from })
+}
+
+/// The release the link `link` names: none when there is no link there; an error when it cannot
+/// be read, or is not a link to a release.
+fn linked<E: Exec>(
+    exec: &E,
+    host: &Layout,
+    link: &kbf_host::path::HostPath,
+) -> Result<Option<CommitId>, ReleaseError> {
+    let unreadable = |source: std::io::Error| ReleaseError::Read {
+        path: host.join(link),
+        source,
+    };
+    match exec.inspect(link).map_err(unreadable)? {
+        None => Ok(None),
+        Some(kbf_host::exec::Entry::Link { target }) => target
+            .to_str()
+            .and_then(|t| CommitId::new(t).ok())
+            .map(Some)
+            .ok_or_else(|| {
+                unreadable(std::io::Error::other(format!(
+                    "a link to {}, which is no release",
+                    target.display()
+                )))
+            }),
+        Some(_) => Err(unreadable(std::io::Error::other("not a link"))),
+    }
+}
+
 /// Keep the swap that `order_id` made. `commit` is the release the order named, so that
 /// a confirm after the swap was reverted is not taken for a repeat.
 pub fn confirm(

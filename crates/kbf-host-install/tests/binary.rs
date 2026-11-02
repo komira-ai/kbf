@@ -231,3 +231,22 @@ fn migrate_takes_its_own_flags_and_nothing_else() {
     assert_eq!(out.status.code(), Some(2));
     assert!(out.stdout.is_empty());
 }
+
+/// `activate` is the operator's emergency command: arguments that are not text are refused (exit
+/// 2) before anything of the host is read, whoever runs it, and print nothing on stdout.
+///
+/// Catches: `activate` taken for an ssh request (the closed refusal line), or run on arguments
+/// that are not what was typed.
+#[test]
+fn activate_with_arguments_that_are_not_text_is_refused() {
+    let out = Command::new(env!("CARGO_BIN_EXE_kbf-host-install"))
+        .arg("activate")
+        .arg(OsStr::from_bytes(b"kbf=\xff"))
+        .env_remove("SSH_ORIGINAL_COMMAND")
+        .env_remove("KBF_HOST_INSTALL_UNIT")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+}

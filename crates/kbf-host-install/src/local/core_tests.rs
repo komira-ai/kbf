@@ -123,6 +123,13 @@ impl Backend for Fake {
         Ok(())
     }
 
+    fn activate(&self, commit: &str) -> Result<(), Fault> {
+        let mut world = self.world.borrow_mut();
+        world.calls.push(format!("activate {}", &commit[..1]));
+        world.current = Some(commit.to_owned());
+        Ok(())
+    }
+
     fn revert(&self, pending: &Pending) -> Result<(), Fault> {
         let mut world = self.world.borrow_mut();
         world.calls.push("revert".to_owned());
