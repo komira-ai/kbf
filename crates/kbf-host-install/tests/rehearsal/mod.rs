@@ -541,14 +541,37 @@ pub fn lay_out(r: &Rehearsal, kbf_unit: &str) -> PathBuf {
     // The units: the kbf unit, and the helper's unit of this checkout restarting it.
     install_file(kbf_unit, &format!("{UNIT_DIR}/{KBF_UNIT}"), 0o644);
     let packaged = fs::read_to_string(host_agent.join(HELPER_UNIT)).unwrap();
-    assert_eq!(packaged.matches(PACKAGED_RESTART).count(), 1, "{packaged}");
-    assert_eq!(packaged.matches(PACKAGED_LAYOUT).count(), 1, "{packaged}");
-    let helper_unit = packaged
-        .replace(PACKAGED_RESTART, &format!("--restart-unit {KBF_UNIT}"))
-        .replace(PACKAGED_LAYOUT, "");
-    install_file(&helper_unit, &format!("{UNIT_DIR}/{HELPER_UNIT}"), 0o644);
+    install_file(
+        &hand_laid_helper(&packaged),
+        &format!("{UNIT_DIR}/{HELPER_UNIT}"),
+        0o644,
+    );
     systemctl("daemon_reload", &["daemon-reload"]);
     host_agent
+}
+
+/// The packaged helper unit as the rehearsal's hand-laid host places it: its one `ExecStart` line
+/// restarts [`KBF_UNIT`] and has no `--layout deb`; every other line (the comments, which name the
+/// flag too) is the package's.
+pub fn hand_laid_helper(packaged: &str) -> String {
+    let execs = packaged
+        .lines()
+        .filter(|l| l.starts_with("ExecStart="))
+        .count();
+    assert_eq!(execs, 1, "one ExecStart in the packaged unit: {packaged}");
+    packaged
+        .lines()
+        .map(|line| {
+            if !line.starts_with("ExecStart=") {
+                return line.to_owned();
+            }
+            assert_eq!(line.matches(PACKAGED_RESTART).count(), 1, "{line}");
+            assert_eq!(line.matches(PACKAGED_LAYOUT).count(), 1, "{line}");
+            line.replace(PACKAGED_RESTART, &format!("--restart-unit {KBF_UNIT}"))
+                .replace(PACKAGED_LAYOUT, "")
+        })
+        .map(|line| line + "\n")
+        .collect()
 }
 
 /// Whether the helper binary at `path` carries [`LONG_TOKEN_MARKER`].
@@ -568,6 +591,43 @@ pub fn start_helper() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The shipped helper unit, as the rehearsal places it on its hand-laid host: the command
+    /// line lays releases out by hand (no `--layout`) and restarts the rehearsal's unit, and the
+    /// rest of the file, comments that name `--layout deb` among them, is the package's.
+    ///
+    /// Catches: a rehearsal that refuses the shipped unit because its comments name the flag too,
+    /// or that leaves the package layout on a host laid out by hand.
+    #[test]
+    fn the_hand_laid_host_gets_the_packaged_helper_without_the_package_layout() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../packaging/host-agent/linux")
+            .join(HELPER_UNIT);
+        let packaged = fs::read_to_string(&path).unwrap();
+        assert!(
+            packaged.matches(PACKAGED_LAYOUT).count() > 1,
+            "the comments name it"
+        );
+        let placed = hand_laid_helper(&packaged);
+        let exec: Vec<&str> = placed
+            .lines()
+            .filter(|l| l.starts_with("ExecStart="))
+            .collect();
+        assert_eq!(
+            exec,
+            [format!(
+                "ExecStart=/usr/libexec/kbf/kbf-host-install --serve --socket {SOCKET} \
+                 --socket-user {UPDATER} --window-secs 600 --restart-unit {KBF_UNIT}"
+            )]
+        );
+        let others = |text: &str| -> Vec<String> {
+            text.lines()
+                .filter(|l| !l.starts_with("ExecStart="))
+                .map(str::to_owned)
+                .collect()
+        };
+        assert_eq!(others(&placed), others(&packaged));
+    }
 
     /// Catches a rate-limited helper reported as a bare "deploy_farm failed", and a journal
     /// that mentions nothing of the quota being blamed on it.
