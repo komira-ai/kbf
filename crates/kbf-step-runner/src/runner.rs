@@ -51,8 +51,10 @@ pub struct Bounds {
     pub cleanup_secs: u64,
     /// After `cutover` succeeded, `verify` must succeed by then or the update rolls back.
     pub verify_deadline_secs: u64,
-    /// The ceiling on a pending promotion; also written to the params file.
-    pub promotion_ceiling_secs: u64,
+    /// The ceiling on a pending promotion; also written to the params file. `None`: the
+    /// declaration gives none, the watch runs until the promotion, and the params file names no
+    /// ceiling.
+    pub promotion_ceiling_secs: Option<u64>,
     /// How often a failed `cleanup` is run again.
     pub cleanup_retries: u32,
 }
@@ -310,10 +312,10 @@ impl StepRunner {
         staged: &str,
         previous: Option<&str>,
     ) -> Result<Record, RunError> {
-        let mut params = order
-            .declared_params
-            .clone()
-            .with_promotion_ceiling_secs(order.bounds.promotion_ceiling_secs);
+        let mut params = order.declared_params.clone();
+        if let Some(secs) = order.bounds.promotion_ceiling_secs {
+            params = params.with_promotion_ceiling_secs(secs);
+        }
         let text = |s: &str| Scalar::Text(s.to_owned());
         params.insert(STAGED_RELEASE_KEY, text(staged));
         params.insert(TARGET_VERSION_KEY, text(&order.target_version));
@@ -585,9 +587,12 @@ impl StepRunner {
             phase: Phase::AfterCommit,
             class: report.class,
         };
-        let over = rec.progress.watching.as_ref().is_some_and(|began| {
-            began.elapsed_secs(&*self.clock) >= order.bounds.promotion_ceiling_secs
-        });
+        let over = rec
+            .progress
+            .watching
+            .as_ref()
+            .zip(order.bounds.promotion_ceiling_secs)
+            .is_some_and(|(began, ceiling)| began.elapsed_secs(&*self.clock) >= ceiling);
         let verdict = match outcome {
             Outcome::Success if !report.promotion_pending => Verdict::Succeeded {
                 promotion_pending: false,

@@ -4,21 +4,24 @@
 
 mod root_support;
 
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::fs::{FileTypeExt, MetadataExt, symlink};
-use std::os::unix::net::UnixStream;
+use std::os::linux::net::SocketAddrExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt, symlink};
+use std::os::unix::net::{SocketAddr, UnixDatagram, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
 use kbf_step_runner::record::{HookSel, Loaded, Progress, Record, RecordStore, SCHEMA, State};
 use kbf_step_runner::register::Declared as _;
 use kbf_step_runner::{LaunchError, Stamp, StepCall, StepLauncher};
-use kbf_updater::root::boot::{BOOT_ID_FILE, first_start_since_boot, read_as_killed};
+use kbf_updater::root::boot::{BOOT_ID_FILE, boot_changed, commit_boot, read_as_killed};
 use kbf_updater::root::flags::{self, Register};
-use kbf_updater::root::launch::{Grants, HookLauncher, Shared};
+use kbf_updater::root::launch::{Grants, HookLauncher, PARAMS_FILE, Shared};
 use kbf_updater::root::releases::{Releases, is_version};
 use kbf_updater::root::socket::{self, Answer, Request};
+use kbf_updater::root::{RootError, RootPart, announce_ready, notify_ready};
 use root_support::{Systemctl, World, accounts, dir, my_gid, my_uid, put};
 use update_hook::{Invocation, Step, Verdict};
 use update_rights::{Finished, Policy, Spawner, SystemdRun, load_dir};
@@ -75,7 +78,7 @@ fn call<'a>(service: &'a str, executable: &'a Path, unit: &'a str, step: Step) -
         invocation: Invocation {
             step,
             artifact: None,
-            params: Some(PathBuf::from("/run/params.toml")),
+            params: None,
         },
         executable,
         unit,
@@ -263,7 +266,7 @@ fn a_release_is_found_only_by_a_version_and_a_trusted_seal() {
     );
     // A tree changed after its seal is not the release that was verified.
     put(&world.path("releases/svc/1.0.0/extra"), b"x", 0o644);
-    let changed = releases.staged("svc", "1.0.0").unwrap_err();
+    let changed = releases.staged("svc", "1.0.0").unwrap_err().to_string();
     assert!(
         changed.contains("changed after it was verified"),
         "{changed}"
@@ -334,11 +337,21 @@ fn record(step: Step, state: State, watching: bool) -> Record {
 fn after_a_boot_a_running_step_and_a_pending_cutover_are_read_as_killed() {
     let world = World::new("killed");
     let store = RecordStore::new(&world.root);
-    assert!(!read_as_killed(&store).unwrap(), "no record");
+    // This start is in "boot-b"; the steps below began in "boot-a" unless said otherwise.
+    assert!(!read_as_killed(&store, "boot-b").unwrap(), "no record");
     let running = || State::Running {
         started: Stamp {
             boot_id: "boot-a".to_owned(),
             mono_secs: 5,
+        },
+        deadline_secs: 600,
+    };
+    // Begun by a start after this boot, which was stopped before it wrote the boot id: its unit
+    // may still run, and the runner stops it by name.
+    let running_now = State::Running {
+        started: Stamp {
+            boot_id: "boot-b".to_owned(),
+            mono_secs: 7,
         },
         deadline_secs: 600,
     };
@@ -353,10 +366,15 @@ fn after_a_boot_a_running_step_and_a_pending_cutover_are_read_as_killed() {
         (Step::Verify, State::Pending, false, false),
         (Step::Verify, running(), true, false),
         (Step::Cleanup, finished.clone(), false, false),
+        (Step::Cutover, running_now, false, false),
     ] {
         let before = record(step, state, watching);
         store.save(&before).unwrap();
-        assert_eq!(read_as_killed(&store).unwrap(), killed, "{step} {before:?}");
+        assert_eq!(
+            read_as_killed(&store, "boot-b").unwrap(),
+            killed,
+            "{step} {before:?}"
+        );
         let Loaded::Current(after) = store.load().unwrap() else {
             panic!("a record");
         };
@@ -378,21 +396,26 @@ fn after_a_boot_a_running_step_and_a_pending_cutover_are_read_as_killed() {
 fn a_start_is_the_first_since_a_boot_when_the_boot_id_changed() {
     let world = World::new("boot-id");
     let state = world.root.clone();
-    assert!(first_start_since_boot(&state, &*world.clock).unwrap());
-    assert!(!first_start_since_boot(&state, &*world.clock).unwrap());
+    let clock = &*world.clock;
+    assert!(boot_changed(&state, clock), "no boot id written yet");
+    commit_boot(&state, clock).unwrap();
+    assert!(!boot_changed(&state, clock));
     world.clock.reboot("boot-b");
-    assert!(first_start_since_boot(&state, &*world.clock).unwrap());
+    assert!(boot_changed(&state, clock));
+    commit_boot(&state, clock).unwrap();
     assert_eq!(
         fs::read_to_string(state.join(BOOT_ID_FILE)).unwrap(),
         "boot-b"
     );
-    assert!(first_start_since_boot(&world.path("missing"), &*world.clock).is_err());
+    assert!(commit_boot(&world.path("missing"), clock).is_err());
 }
 
-/// Catches an agent's socket that someone else can use, or that takes more than a service and a
-/// version: the socket is mode 0600 and owned by the agent's account; an update, a status and
-/// their answers go through it; a request that names a step, a command or anything else is
-/// refused as malformed and never reaches the root part.
+/// Catches an agent's socket that someone else can use, that another root part can take over, or
+/// that runs what is not an update or a status: the socket is mode 0600 and owned by the agent's
+/// account, and one that is answered is not bound again; an update, a status and their answers go
+/// through it; a field a later version adds (here `step`) is passed over and selects nothing, a
+/// request of an unknown kind is answered `unknown_request`, and a line that is not JSON is
+/// `malformed`, neither reaching the root part.
 #[test]
 fn the_agents_socket_is_0600_and_takes_only_a_service_and_a_version() {
     let world = World::new("socket");
@@ -406,19 +429,21 @@ fn the_agents_socket_is_0600_and_takes_only_a_service_and_a_version() {
     let asked: Arc<Mutex<Vec<Request>>> = Arc::default();
     let kept = asked.clone();
     let server = std::thread::spawn(move || {
-        for stream in listener.incoming().take(5) {
+        // The probe of the second bind is a connection too, closed at once.
+        for stream in listener.incoming().take(6) {
             let kept = kept.clone();
-            socket::serve_connection(&stream.unwrap(), &move |request| {
+            let _ = socket::serve_connection(&stream.unwrap(), &move |request| {
                 kept.lock().unwrap().push(request.clone());
                 Answer {
                     ok: true,
                     state: Some("pending".to_owned()),
                     ..Answer::default()
                 }
-            })
-            .unwrap();
+            });
         }
     });
+    let taken = socket::bind(&path, my_uid(), my_gid()).unwrap_err();
+    assert_eq!(taken.kind(), std::io::ErrorKind::AddrInUse, "{taken}");
     let update = Request::Update {
         service: "svc".to_owned(),
         version: "2.0.0".to_owned(),
@@ -430,21 +455,67 @@ fn the_agents_socket_is_0600_and_takes_only_a_service_and_a_version() {
         let answer = socket::request(&path, request).unwrap();
         assert_eq!(answer.state.as_deref(), Some("pending"));
     }
-    for line in [
-        r#"{"update":{"service":"svc","version":"2.0.0","step":"cleanup"}}"#,
-        r#"{"run":{"command":"/bin/true"}}"#,
-        "not json",
+    for (line, token) in [
+        (
+            r#"{"update":{"service":"svc","version":"2.0.0","step":"cleanup"}}"#,
+            None,
+        ),
+        (
+            r#"{"run":{"command":"/bin/true"}}"#,
+            Some("unknown_request"),
+        ),
+        ("not json", Some("malformed")),
     ] {
         let mut client = UnixStream::connect(&path).unwrap();
         writeln!(client, "{line}").unwrap();
         let mut answer = String::new();
         BufReader::new(&client).read_line(&mut answer).unwrap();
         let answer: Answer = serde_json::from_str(&answer).unwrap();
-        assert_eq!(answer.token(), Some("malformed"), "{line}");
-        assert!(!answer.ok);
+        assert_eq!(answer.token(), token, "{line}");
+        assert_eq!(answer.ok, token.is_none(), "{line}");
     }
     server.join().unwrap();
-    assert_eq!(*asked.lock().unwrap(), [update, status]);
+    assert_eq!(*asked.lock().unwrap(), [update.clone(), status, update]);
+}
+
+/// Catches a request taken from a partial or oversized line, or a wrong refusal: a request is one
+/// whole line within `MAX_LINE`, newline included; a line that fills the limit without its newline
+/// (a valid object in front of it or not) is `malformed`; so are bytes that are not UTF-8 or not
+/// JSON, and JSON that is not an object of one request or whose request has the wrong shape; a
+/// request of a kind this version does not know is `unknown_request`.
+#[test]
+fn a_request_is_one_whole_line_of_one_known_request() {
+    let update = br#"{"update":{"service":"svc","version":"2.0.0"}}"#.to_vec();
+    let line = |body: &[u8]| [body, b"\n"].concat();
+    let token = |bytes: &[u8]| socket::parse(bytes).unwrap_err().token().map(str::to_owned);
+    assert_eq!(
+        socket::parse(&line(&update)).unwrap(),
+        Request::Update {
+            service: "svc".to_owned(),
+            version: "2.0.0".to_owned()
+        }
+    );
+    let limit = usize::try_from(socket::MAX_LINE).unwrap();
+    let mut padded = update.clone();
+    padded.resize(limit - 1, b' ');
+    assert!(socket::parse(&line(&padded)).is_ok(), "exactly the limit");
+    let mut cut = update.clone();
+    cut.resize(limit, b' ');
+    for bad in [
+        update.clone(),
+        cut,
+        line(b"\xff\xfe"),
+        line(b"not json"),
+        line(b"[1, 2]"),
+        line(br#"{"update":{"service":"svc","version":"2.0.0"},"status":{"service":"svc"}}"#),
+        line(br#"{"update":5}"#),
+    ] {
+        assert_eq!(token(&bad).as_deref(), Some("malformed"), "{bad:?}");
+    }
+    assert_eq!(
+        token(&line(br#"{"future":{"service":"svc"}}"#)).as_deref(),
+        Some("unknown_request")
+    );
 }
 
 /// Catches requests the root part answers wrongly before it runs anything: an unknown service, a
@@ -475,7 +546,7 @@ fn the_root_part_refuses_what_it_cannot_run() {
     assert_eq!(status("nope").token(), Some("unknown_service"));
     let never = status("svc");
     assert!(never.ok && never.step.is_none(), "{never:?}");
-    assert_eq!(root.start("nope", false).token(), Some("unknown_service"));
+    assert_eq!(root.start("nope").token(), Some("unknown_service"));
 
     world.tell("svc", "prepare", "75 {\"retry_after_secs\":5}");
     let deferred = update("svc", "2.0.0");
@@ -486,7 +557,7 @@ fn the_root_part_refuses_what_it_cannot_run() {
     let state = world.path("state/svc/step-record.json");
     fs::write(&state, b"{ damaged").unwrap();
     assert_eq!(status("svc").token(), Some("record"));
-    assert_eq!(root.start("svc", false).token(), Some("record"));
+    assert_eq!(root.start("svc").token(), Some("record"));
 }
 
 /// Catches two updates of one service at once: while an update of `svc` is unfinished (the root
@@ -661,6 +732,180 @@ fn kbf_updater_approve_is_the_update_rights_command() {
     let (code, text) = kbf_updater::run(&strings(&["kbf-updater", "approve"]));
     assert_eq!(code, 2, "{text}");
     assert!(text.contains("usage: approve"), "{text}");
+}
+
+/// Catches an approval written where the root part does not read it: a root part given
+/// `--approvals FILE` reads `FILE`, and `approve --approvals FILE` records the digest there and
+/// nowhere else.
+#[test]
+fn approve_records_in_the_approval_file_it_is_given() {
+    let world = World::new("approve-file");
+    let env = update_rights::cli::Env {
+        approvals: world.path("updater.d/approved"),
+        trusted_uid: my_uid(),
+        effective_uid: my_uid(),
+    };
+    let elsewhere = world.path("updater.d/approved-here");
+    let digest = "cd".repeat(32);
+    let args = [
+        "kbf-updater",
+        "approve",
+        "--approvals",
+        elsewhere.to_str().unwrap(),
+        "svc",
+        &digest,
+    ];
+    let (code, text) = kbf_updater::run_approve_with(&strings(&args), &env);
+    assert_eq!(code, 0, "{text}");
+    assert!(fs::read_to_string(&elsewhere).unwrap().contains(&digest));
+    assert!(!world.path("updater.d/approved").exists());
+}
+
+/// Catches a hook given a params file it cannot read, or a unit bound longer than the runner's:
+/// the params file is copied into the hook's record directory (mode 0644, the same bytes) and the
+/// copy is what the hook is given; the unit's `RuntimeMaxSec=` is the runner's bound for the run
+/// when that is shorter than the declared one (a verify window with little left), the declared one
+/// otherwise.
+#[test]
+fn the_launcher_gives_the_hook_its_params_where_it_can_read_them_and_the_runners_bound() {
+    let world = World::new("launch-params");
+    world.declare("svc", &world.tierstore_shaped());
+    fs::create_dir_all(world.hook_dir("svc")).unwrap();
+    let params = world.path("params.toml");
+    put(&params, b"updater.target_version = \"2.0.0\"\n", 0o600);
+    let hook = Path::new("/var/lib/updater/releases/svc/2.0.0/hook");
+    let copy = world.hook_dir("svc").join(PARAMS_FILE);
+    for (timeout_secs, bound) in [(5, "5"), (5000, "1000")] {
+        let (launcher, spawner) = launcher(&world, Some(0), 0);
+        let mut verify = call("svc", hook, "updater-svc-verify-3", Step::Verify);
+        verify.invocation.params = Some(params.clone());
+        verify.timeout_secs = timeout_secs;
+        launcher.run(&verify).unwrap();
+        let seen = spawner.seen.lock().unwrap();
+        assert_eq!(
+            root_support::property(&seen[0], "RuntimeMaxSec").as_deref(),
+            Some(bound)
+        );
+        let words = root_support::words(&seen[0]);
+        assert!(words.contains(&copy.display().to_string()), "{words:?}");
+    }
+    assert_eq!(fs::read(&copy).unwrap(), fs::read(&params).unwrap());
+    assert_eq!(fs::metadata(&copy).unwrap().mode() & 0o777, 0o644);
+}
+
+/// Catches bookkeeping kept where another account can reach it, or two root parts on one state
+/// directory: a state directory that is a link, one open to others, or one below a directory
+/// others can change is refused before anything is read or written there, and one that cannot be
+/// made says why; a second root part on the same state directory is refused while the first one
+/// lives, and starts once it is gone.
+#[test]
+fn the_state_directory_is_the_updaters_own_and_one_root_part_holds_it() {
+    let world = World::new("state-own");
+    let refused = |state: &Path| {
+        let mut config = world.config();
+        config.state = state.to_path_buf();
+        RootPart::new(config, world.parts(None)).err().unwrap()
+    };
+    let state = world.path("state");
+    let elsewhere = world.path("elsewhere");
+    dir(&elsewhere, 0o700);
+    symlink(&elsewhere, &state).unwrap();
+    assert!(
+        matches!(refused(&state), RootError::Untrusted { .. }),
+        "a link"
+    );
+    fs::remove_file(&state).unwrap();
+    dir(&state, 0o777);
+    assert!(
+        matches!(refused(&state), RootError::Untrusted { .. }),
+        "open to others"
+    );
+    dir(&world.path("open"), 0o777);
+    assert!(
+        matches!(
+            refused(&world.path("open/state")),
+            RootError::Untrusted { .. }
+        ),
+        "below a directory others can change"
+    );
+    dir(&world.path("shut"), 0o555);
+    assert!(
+        matches!(refused(&world.path("shut/state")), RootError::Io { .. }),
+        "one that cannot be made"
+    );
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+    let first = world.root_part();
+    assert!(
+        matches!(refused(&state), RootError::Locked { .. }),
+        "a second root part"
+    );
+    drop(first);
+    drop(world.root_part());
+}
+
+/// Catches a `kbf-updater root` that tells the service manager it is ready before its start pass,
+/// or never: run as a host runs it, with a `NOTIFY_SOCKET`, it sends `READY=1` there before the
+/// agent is answered.
+#[test]
+fn kbf_updater_root_tells_the_service_manager_it_is_ready_before_it_answers() {
+    let world = World::new("binary-notify");
+    let notify = world.path("notify.sock");
+    let manager = UnixDatagram::bind(&notify).unwrap();
+    let me = passwd_name(my_uid(), "/etc/passwd");
+    let socket = world.path("root.sock");
+    let args = strings(&[
+        "kbf-updater",
+        "root",
+        "--socket",
+        &socket.display().to_string(),
+        "--socket-user",
+        &me,
+        "--declarations",
+        &world.path("updater.d").display().to_string(),
+        "--state-dir",
+        &world.path("state").display().to_string(),
+        "--releases-dir",
+        &world.path("releases").display().to_string(),
+    ]);
+    let (told, heard) = std::sync::mpsc::channel();
+    let (code, text) =
+        kbf_updater::run_root_notifying(&args, Some(notify.clone().into_os_string()), |stop| {
+            let mut buf = [0_u8; 64];
+            let n = manager.recv(&mut buf).unwrap();
+            told.send(buf[..n].to_vec()).unwrap();
+            stop.stop();
+        });
+    assert_eq!((code, text.as_str()), (0, ""));
+    assert_eq!(heard.recv().unwrap(), b"READY=1");
+}
+
+/// Catches a root part that tells the service manager nothing, or tells it in a way it does not
+/// hear: with a `NOTIFY_SOCKET` (a path, or an abstract name after `@`) it sends `READY=1` there;
+/// with none it sends nothing; a socket nobody listens on is an error, which `announce_ready`
+/// writes down and goes on.
+#[test]
+fn the_root_part_tells_the_service_manager_it_is_ready() {
+    assert!(!notify_ready(None).unwrap());
+    let world = World::new("notify");
+    let path = world.path("notify.sock");
+    let socket = UnixDatagram::bind(&path).unwrap();
+    let mut buf = [0_u8; 64];
+    assert!(notify_ready(Some(path.as_os_str())).unwrap());
+    let n = socket.recv(&mut buf).unwrap();
+    assert_eq!(&buf[..n], b"READY=1");
+    assert!(announce_ready(Some(path.as_os_str())));
+    let n = socket.recv(&mut buf).unwrap();
+    assert_eq!(&buf[..n], b"READY=1");
+    let name = format!("kbfu-notify-{}", std::process::id());
+    let hidden =
+        UnixDatagram::bind_addr(&SocketAddr::from_abstract_name(name.as_bytes()).unwrap()).unwrap();
+    let at = format!("@{name}");
+    assert!(notify_ready(Some(OsStr::new(&at))).unwrap());
+    let n = hidden.recv(&mut buf).unwrap();
+    assert_eq!(&buf[..n], b"READY=1");
+    let nobody = world.path("nobody.sock");
+    assert!(notify_ready(Some(nobody.as_os_str())).is_err());
+    assert!(!announce_ready(Some(nobody.as_os_str())));
 }
 
 /// Catches a root part that does not start beside a refused declaration: with a good declaration

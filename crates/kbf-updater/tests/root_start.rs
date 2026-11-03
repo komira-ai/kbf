@@ -6,10 +6,12 @@ mod root_support;
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::sync::Arc;
 
+use kbf_step_runner::CrashPoint;
 use kbf_updater::root::boot;
 use kbf_updater::root::socket::{self, Answer, Request};
-use root_support::{SUCCEEDED, World, pending_cutover_world, verdict};
+use root_support::{SUCCEEDED, World, dir, pending_cutover_world, put, verdict};
 use update_hook::{Class, Phase, Verdict};
 
 /// Catches a boot that runs a `cutover` it found pending, or that starts the units before the
@@ -22,11 +24,8 @@ fn a_pending_cutover_found_at_boot_is_rolled_back_before_the_boot_entry() {
     let before = world.steps("svc").len();
     world.clock.reboot("boot-b");
     let root = world.root_part();
-    let first =
-        kbf_updater::root::boot::first_start_since_boot(&world.path("state"), &*world.clock)
-            .unwrap();
-    assert!(first, "the boot id changed");
-    let started = root.start("svc", first);
+    assert!(root.read_after_boot().is_empty());
+    let started = root.start("svc");
     assert_eq!(
         started.verdict,
         Some(Verdict::Failed {
@@ -57,17 +56,9 @@ fn a_pending_cutover_found_at_boot_is_rolled_back_before_the_boot_entry() {
 fn a_pending_cutover_found_after_a_restart_in_the_same_boot_is_run() {
     let world = pending_cutover_world("restart-cutover");
     let before = world.steps("svc").len();
+    // In the same boot no record is read as cut off by a boot: the start resumes it as it is.
     let root = world.root_part();
-    let first =
-        kbf_updater::root::boot::first_start_since_boot(&world.path("state"), &*world.clock)
-            .unwrap();
-    // The first start of this world's root part wrote no boot id: it is read as a boot.
-    assert!(first);
-    let first =
-        kbf_updater::root::boot::first_start_since_boot(&world.path("state"), &*world.clock)
-            .unwrap();
-    assert!(!first, "the same boot");
-    let started = root.start("svc", first);
+    let started = root.start("svc");
     assert_eq!(started.verdict, Some(SUCCEEDED), "{started:?}");
     assert_eq!(
         &world.steps("svc")[before..],
@@ -91,7 +82,7 @@ fn a_boot_entry_whose_record_directory_the_service_can_write_runs_nothing() {
     // load after this refuses the declaration itself.
     let root = world.root_part();
     root_support::dir(&world.hook_dir("svc"), 0o777);
-    let started = root.start("svc", false);
+    let started = root.start("svc");
     assert_eq!(started.token(), Some("boot"), "{started:?}");
     assert!(
         started
@@ -218,6 +209,9 @@ fn a_state_directory_that_cannot_be_listed_is_reported_by_the_read_after_a_boot(
     fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
     assert_eq!(unread.len(), 1, "{unread:?}");
     assert_eq!(unread[0].0, "", "{unread:?}");
+    // Every service is unread until it is read: an order reads the record first (there is none),
+    // then goes its way (here to a release that is not staged).
+    assert_eq!(root.update("svc", "1.0.0").token(), Some("not_staged"));
 }
 
 /// Catches a boot rule kept only for the services whose declaration loaded: after a boot the
@@ -244,7 +238,7 @@ fn a_cutover_a_boot_cut_off_is_rolled_back_even_when_its_declaration_was_refused
     assert_eq!(committed_boot_id(&world), "boot-b");
     // Put right in the same boot; the root part restarted.
     mode(0o644);
-    let started = world.root_part().start("svc", false);
+    let started = world.root_part().start("svc");
     assert_eq!(
         started.verdict,
         Some(Verdict::Failed {
@@ -265,9 +259,192 @@ fn an_unfinished_update_whose_release_changed_is_halted_at_the_next_start() {
     let world = pending_cutover_world("resume-changed");
     let before = world.steps("svc").len();
     root_support::put(&world.path("releases/svc/2.0.0/extra"), b"x", 0o644);
-    let started = world.root_part().start("svc", false);
+    let started = world.root_part().start("svc");
     assert_eq!(started.verdict, Some(Verdict::Halt), "{started:?}");
     assert_eq!(started.reason.as_deref(), Some("artifact_changed"));
     assert_eq!(world.record("svc")["state"]["state"], "finished");
     assert_eq!(&world.steps("svc")[before..], ["restore"]);
+}
+
+/// The state an install leaves when the root part stops right after it: the declaration
+/// `installed` in place, and kept for a restore what was before it (`kept`: the active file, or
+/// `None` for a first install) with the generation the record had then (`began`).
+fn installed_then_stopped(world: &World, installed: &str, kept: Option<&str>, began: &str) {
+    let state = world.path("state/svc");
+    dir(&world.path("state"), 0o700);
+    dir(&state, 0o700);
+    match kept {
+        Some(text) => put(&state.join("declaration.previous"), text.as_bytes(), 0o600),
+        None => put(&state.join("declaration.first"), b"", 0o600),
+    }
+    put(&state.join("declaration.began"), began.as_bytes(), 0o600);
+    world.declare("svc", installed);
+}
+
+/// Catches a declaration left installed by an update that never began: the root part stopped
+/// between installing a narrower declaration and the first write of the new record (the record is
+/// still the finished one of generation 1); the next start puts the one that was active back and
+/// keeps nothing, and the update that succeeded stays as it was.
+#[test]
+fn a_declaration_installed_for_an_update_that_never_began_goes_back_at_the_start() {
+    let world = World::new("began-never");
+    let active = world.tierstore_shaped();
+    world.declare("svc", &active);
+    world.stage("svc", "1.0.0", None);
+    assert_eq!(
+        verdict(&world.root_part().update("svc", "1.0.0")),
+        SUCCEEDED
+    );
+    let narrower = active.replace("prepare = 600", "prepare = 500");
+    installed_then_stopped(&world, &narrower, Some(&active), "1");
+    let started = world.root_part().start("svc");
+    assert!(started.ok, "{started:?}");
+    assert_eq!(
+        fs::read_to_string(world.path("updater.d/svc.toml")).unwrap(),
+        active
+    );
+    for kept in ["declaration.previous", "declaration.began"] {
+        assert!(!world.path("state/svc").join(kept).exists(), "{kept}");
+    }
+    assert_eq!(world.record("svc")["generation"], 1);
+}
+
+/// Catches a first declaration left installed by an update that never began: with no record and
+/// the first declaration of the service installed, the start removes it, and the service is no
+/// longer declared: nothing is launched.
+#[test]
+fn a_first_declaration_installed_for_an_update_that_never_began_is_removed_at_the_start() {
+    let world = World::new("began-first");
+    installed_then_stopped(&world, &world.tierstore_shaped(), None, "none");
+    let started = world.root_part().start("svc");
+    assert!(started.ok, "{started:?}");
+    assert!(!world.path("updater.d/svc.toml").exists());
+    assert!(world.launched().is_empty());
+    assert_eq!(
+        world.root_part().start("svc").token(),
+        Some("unknown_service")
+    );
+}
+
+/// Catches a kept declaration's marker that is not one read as some generation: the start says
+/// so and changes nothing.
+#[test]
+fn a_marker_that_holds_no_generation_stops_the_start() {
+    let world = World::new("began-bad");
+    let active = world.tierstore_shaped();
+    world.declare("svc", &active);
+    installed_then_stopped(&world, &active, Some(&active), "seven");
+    assert_eq!(world.root_part().start("svc").token(), Some("internal"));
+    assert!(world.path("state/svc/declaration.began").exists());
+}
+
+/// Catches a service let through after the read after a boot failed on its record: the record
+/// of the update to 2.0.0, cut off before its `cutover`, cannot be read at the read after the
+/// boot; an order is refused (`boot_unread`) while it cannot; once it is put right, the next order
+/// to the same root part reads it as a boot cut it off first, and the `cutover` is rolled back,
+/// not run.
+#[test]
+fn a_record_unread_after_a_boot_is_read_before_the_next_order() {
+    let world = pending_cutover_world("boot-repaired");
+    let record = world.path("state/svc/step-record.json");
+    let bytes = fs::read(&record).unwrap();
+    put(&record, b"{", 0o600);
+    world.clock.reboot("boot-b");
+    let root = world.root_part();
+    let unread = root.read_after_boot();
+    assert_eq!(unread.len(), 1, "{unread:?}");
+    assert_eq!(unread[0].0, "svc");
+    assert_eq!(root.update("svc", "2.0.0").token(), Some("boot_unread"));
+    put(&record, &bytes, 0o600);
+    let before = world.steps("svc").len();
+    let answer = root.update("svc", "2.0.0");
+    assert!(
+        matches!(answer.verdict, Some(Verdict::Failed { .. })),
+        "{answer:?}"
+    );
+    assert_eq!(&world.steps("svc")[before..], ["rollback"]);
+}
+
+/// Catches a changed release halted while its step may still run: the update to 2.0.0 is cut off
+/// with its `cutover` running (in this boot), and 2.0.0 is changed; the start stops the step's
+/// unit by name before it halts the update with `artifact_changed`.
+#[test]
+fn a_running_step_of_a_changed_release_is_stopped_before_the_halt() {
+    let world = World::new("halt-running");
+    world.declare("svc", &world.tierstore_shaped());
+    world.stage("svc", "1.0.0", None);
+    world.stage("svc", "2.0.0", None);
+    assert_eq!(
+        verdict(&world.root_part().update("svc", "1.0.0")),
+        SUCCEEDED
+    );
+    let record = world.path("state/svc/step-record.json");
+    let gate = move |point: CrashPoint| {
+        let running_cutover = fs::read(&record)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .is_some_and(|rec| rec["step"] == "cutover" && rec["state"]["state"] == "running");
+        matches!(point, CrashPoint::AfterWrite(_)) && running_cutover
+    };
+    let killed = world.root_part_gated(Arc::new(gate)).update("svc", "2.0.0");
+    assert_eq!(killed.token(), Some("runner"), "{killed:?}");
+    let unit = format!("updater-svc-cutover-{}", world.record("svc")["generation"]);
+    put(&world.path("releases/svc/2.0.0/extra"), b"x", 0o644);
+    let started = world.root_part().start("svc");
+    assert_eq!(started.verdict, Some(Verdict::Halt), "{started:?}");
+    assert!(world.systemctl.stopped().contains(&unit), "{unit}");
+}
+
+/// Catches a resume that runs from a previous release that changed, or that gives up for good on
+/// one it cannot read for a moment: with only 1.0.0 (the previous release) changed, the update to
+/// 2.0.0 is halted (`artifact_changed`); with 2.0.0 unreadable for now, the start is refused
+/// (`artifact`) and the update stays unfinished, and once it can be read the update runs on.
+#[test]
+fn a_resume_halts_on_a_changed_previous_release_and_waits_on_an_unreadable_one() {
+    let world = pending_cutover_world("resume-previous");
+    put(&world.path("releases/svc/1.0.0/extra"), b"x", 0o644);
+    world.root_part().start("svc");
+    assert_eq!(world.record("svc")["state"]["state"], "finished");
+    assert_eq!(world.record("svc")["state"]["reason"], "artifact_changed");
+
+    let world = pending_cutover_world("resume-unreadable");
+    let hook = world.path("releases/svc/2.0.0/hook");
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o000)).unwrap();
+    let refused = world.root_part().start("svc");
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(refused.token(), Some("artifact"), "{refused:?}");
+    assert_eq!(world.record("svc")["state"]["state"], "pending");
+    let started = world.root_part().start("svc");
+    assert_eq!(started.verdict, Some(SUCCEEDED), "{started:?}");
+}
+
+/// Catches a resume without the params it began with: an unfinished update whose params file is
+/// gone is refused (`record`) and nothing runs.
+#[test]
+fn a_resume_whose_params_are_gone_is_refused() {
+    let world = pending_cutover_world("resume-params");
+    fs::remove_file(world.path("state/svc/params.toml")).unwrap();
+    let steps = world.steps("svc");
+    assert_eq!(world.root_part().start("svc").token(), Some("record"));
+    assert_eq!(world.steps("svc"), steps);
+}
+
+/// Catches a boot entry whose outcome is lost, or one run with nothing to run from: a boot entry
+/// that fails is reported `failure`; a declaration with a boot entry and no release installed by
+/// an update launches nothing.
+#[test]
+fn the_boot_entry_reports_how_it_ended_and_needs_an_installed_release() {
+    let world = World::new("boot-outcome");
+    world.declare("svc", &world.tierstore_shaped());
+    let none = world.root_part().start("svc");
+    assert_eq!(none.boot, None, "{none:?}");
+    assert!(world.launched().is_empty());
+    world.stage("svc", "1.0.0", None);
+    assert_eq!(
+        verdict(&world.root_part().update("svc", "1.0.0")),
+        SUCCEEDED
+    );
+    world.tell("svc", "restore", "1 {}");
+    let failed = world.root_part().start("svc");
+    assert_eq!(failed.boot.as_deref(), Some("failure"), "{failed:?}");
 }

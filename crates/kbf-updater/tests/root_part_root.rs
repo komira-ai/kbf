@@ -24,7 +24,10 @@ use root_support::{HOOK, dir, put};
 use update_hook::Verdict;
 use update_rights::{Accounts, EtcAccounts};
 
-const SERVICE: &str = "kbfue2e";
+/// The fake service, its name this process's: two runs share no unit, record or directory.
+fn service() -> String {
+    format!("kbfue2e-{}", std::process::id())
+}
 
 /// What the root part writes when it starts answering the agent.
 const SERVING: &str = "kbf-updater root: serving the agent at ";
@@ -90,7 +93,7 @@ fn start(base: &Path) -> Running {
 }
 
 fn steps(base: &Path) -> Vec<String> {
-    fs::read_to_string(base.join("hooks").join(SERVICE).join("steps.log"))
+    fs::read_to_string(base.join("hooks").join(service()).join("steps.log"))
         .unwrap_or_default()
         .lines()
         .map(str::to_owned)
@@ -114,9 +117,10 @@ fn the_root_part_binary_runs_a_declared_hook_through_systemd_and_writes_the_step
     for sub in ["", "updater.d", "releases", "run", "hooks"] {
         dir(&base.join(sub), 0o755);
     }
-    let state_dir = base.join("hooks").join(SERVICE);
+    let service = service();
+    let state_dir = base.join("hooks").join(&service);
     let declaration = format!(
-        "name = \"{SERVICE}\"\n\
+        "name = \"{service}\"\n\
          binary = \"hook\"\n\
          signer = {{ repository = \"komira-ai/kbf\", workflow = \"artifacts.yml\" }}\n\
          uid = \"daemon\"\n\
@@ -132,11 +136,11 @@ fn the_root_part_binary_runs_a_declared_hook_through_systemd_and_writes_the_step
         state = state_dir.display(),
     );
     put(
-        &base.join("updater.d").join(format!("{SERVICE}.toml")),
+        &base.join("updater.d").join(format!("{service}.toml")),
         declaration.as_bytes(),
         0o644,
     );
-    let tree = base.join("releases").join(SERVICE).join("1.0.0");
+    let tree = base.join("releases").join(&service).join("1.0.0");
     dir(&tree, 0o755);
     fs::copy(HOOK, tree.join("hook")).unwrap();
     // The hook's record directory, which it reads beside itself.
@@ -148,7 +152,7 @@ fn the_root_part_binary_runs_a_declared_hook_through_systemd_and_writes_the_step
     fs::set_permissions(tree.join("hook"), fs::Permissions::from_mode(0o755)).unwrap();
     let digest = kbf_step_runner::tree_digest(&tree).unwrap();
     put(
-        &base.join("releases").join(SERVICE).join("1.0.0.seal"),
+        &base.join("releases").join(&service).join("1.0.0.seal"),
         format!(
             "{{\"tree_digest\":\"{digest}\",\"artifact_digest\":\"{}\"}}",
             "ab".repeat(32)
@@ -172,7 +176,7 @@ fn the_root_part_binary_runs_a_declared_hook_through_systemd_and_writes_the_step
     let answer = socket::request(
         &socket_path,
         &Request::Update {
-            service: SERVICE.to_owned(),
+            service: service.clone(),
             version: "1.0.0".to_owned(),
         },
     )
@@ -192,12 +196,20 @@ fn the_root_part_binary_runs_a_declared_hook_through_systemd_and_writes_the_step
         "the hook ran as the declared account"
     );
     let record: serde_json::Value = serde_json::from_slice(
-        &fs::read(base.join("state").join(SERVICE).join("step-record.json")).unwrap(),
+        &fs::read(base.join("state").join(&service).join("step-record.json")).unwrap(),
     )
     .unwrap();
     assert_eq!(record["state"]["state"], "finished");
     assert_eq!(record["target_version"], "1.0.0");
+    // The hook, as `nobody`, read the params file it was given.
+    let seen = fs::read_to_string(state_dir.join("params.seen")).unwrap();
+    assert!(seen.contains("updater.target_version"), "{seen}");
     drop(root);
+    // The service's group may enter the record directory (its units execute from it); a start
+    // leaves that as it is.
+    let daemon = accounts.group("daemon").expect("a group daemon");
+    std::os::unix::fs::chown(&state_dir, None, Some(daemon)).unwrap();
+    fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o750)).unwrap();
 
     let again = start(base);
     assert_eq!(
@@ -205,5 +217,12 @@ fn the_root_part_binary_runs_a_declared_hook_through_systemd_and_writes_the_step
         ["prepare", "cutover", "verify", "cleanup", "restore"],
         "the boot entry ran before the socket answered"
     );
+    let record_dir = fs::metadata(&state_dir).unwrap();
+    assert_eq!(
+        record_dir.gid(),
+        daemon,
+        "the record directory keeps its group"
+    );
+    assert_eq!(record_dir.mode() & 0o777, 0o750);
     drop(again);
 }

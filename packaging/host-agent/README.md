@@ -87,7 +87,9 @@ of a service's hook as a transient systemd unit with the rights the declaration 
 reaches it only through its socket (`/run/kbf-updater-root/root.sock`, mode 0600, the agent's
 account's), with "update this service to this version" or "where is this service's update";
 it never names a step. At its start, before it answers, it rolls back a `cutover` a boot cut
-off and runs each declaration's boot entry.
+off and runs each declaration's boot entry; only then does it tell systemd it is ready
+(`Type=notify`), so the agent's unit, ordered after it, starts once that is done. One root part
+holds the state directory at a time.
 
 A declaration that asks for more than the active one, and the first declaration of a service, is
 installed only once an operator has approved its digest, which the deferred answer gives:
@@ -95,6 +97,9 @@ installed only once an operator has approved its digest, which the deferred answ
 ```sh
 sudo /usr/libexec/kbf/kbf-updater approve kbf <sha256 of the declaration>
 ```
+
+A root part started with another `--approvals FILE` reads that file; approve into it with
+`kbf-updater approve --approvals FILE kbf <sha256>`.
 
 The kbf declaration runs `kbf update-hook` as root, so it is approved once per host. Install it
 with the commands of `linux/install-declaration.txt`.

@@ -38,8 +38,11 @@ fn hook(words: &[&str], dir: &Path) -> (u8, String) {
 #[test]
 fn a_run_logs_its_word_and_arguments_and_succeeds_unless_told_otherwise() {
     let dir = testutil::scratch("test-hook-log");
+    let params = dir.join("p.toml");
+    fs::write(&params, "").unwrap();
+    let given = params.display().to_string();
     let ran = hook(
-        &["update-hook", "prepare", "/r/2.0.0", "--params", "/p"],
+        &["update-hook", "prepare", "/r/2.0.0", "--params", &given],
         &dir,
     );
     assert_eq!(
@@ -56,7 +59,7 @@ fn a_run_logs_its_word_and_arguments_and_succeeds_unless_told_otherwise() {
     );
     assert_eq!(
         fs::read_to_string(dir.join("args.log")).unwrap(),
-        "prepare /r/2.0.0 --params /p\nrestore\n"
+        format!("prepare /r/2.0.0 --params {given}\nrestore\n")
     );
 }
 
@@ -79,6 +82,23 @@ fn a_run_exits_and_reports_as_its_exit_file_says() {
         )
     );
     assert_eq!(hook(&["cutover"], &dir).0, 0);
+}
+
+/// Catches a hook that does not read the params file it is given: the bytes of the file after
+/// `--params` are in `params.seen`, and a params file it cannot read is a broken run.
+#[test]
+fn a_run_reads_the_params_file_it_is_given() {
+    let dir = testutil::scratch("test-hook-params");
+    let params = dir.join("given.toml");
+    fs::write(&params, "updater.target_version = \"2.0.0\"\n").unwrap();
+    let path = params.display().to_string();
+    assert_eq!(hook(&["verify", "--params", &path], &dir).0, 0);
+    assert_eq!(
+        fs::read_to_string(dir.join("params.seen")).unwrap(),
+        "updater.target_version = \"2.0.0\"\n"
+    );
+    let gone = dir.join("gone.toml").display().to_string();
+    assert_eq!(hook(&["verify", "--params", &gone], &dir).0, EXIT_BROKEN);
 }
 
 /// A standard output that refuses every write.

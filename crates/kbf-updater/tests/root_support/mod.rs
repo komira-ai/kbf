@@ -6,7 +6,7 @@
 
 use std::fs;
 use std::io;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -27,9 +27,10 @@ pub fn my_uid() -> u32 {
     kbf_updater::secret::euid()
 }
 
+/// The effective group of this process: the group of `/proc/self`, which the kernel gives the
+/// process's effective ids.
 pub fn my_gid() -> u32 {
-    // SAFETY: getegid has no preconditions and cannot fail.
-    unsafe { libc::getegid() }
+    fs::metadata("/proc/self").unwrap().gid()
 }
 
 /// A file of this mode, whatever the umask.
@@ -204,9 +205,17 @@ pub struct World {
 }
 
 impl World {
+    /// A fresh world of its own: `name`, this process and a count make its directory, so no two
+    /// runs or tests share one. It is under `CARGO_TARGET_TMPDIR`, not the system temporary
+    /// directory: the releases and record directories must sit below directories nobody else can
+    /// write, which the sticky, world-writable `/tmp` is not.
     pub fn new(name: &str) -> World {
-        let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("kbfu-root-{name}"));
-        let _ = fs::remove_dir_all(&root);
+        static WORLDS: AtomicU64 = AtomicU64::new(0);
+        let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+            "kbfu-root-{name}-{}-{}",
+            std::process::id(),
+            WORLDS.fetch_add(1, Ordering::SeqCst)
+        ));
         dir(&root, 0o755);
         for sub in ["updater.d", "releases", "hooks"] {
             dir(&root.join(sub), 0o755);

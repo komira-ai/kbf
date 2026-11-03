@@ -9,8 +9,10 @@
 //! Its record directory is named by the file `record-dir` beside the program in its release tree
 //! (a test's paths are longer than a declared argument may be, and nothing is read from the
 //! environment). Each run appends its word to `steps.log` there and its arguments to `args.log`,
-//! then exits as `exit-<word>` there says (`<code> [<last line>]`), or `0` with `{}`. A line of
-//! noise comes first on standard output, so the last line is the report.
+//! reads the params file it is given (`--params FILE`) into `params.seen` there (a run that cannot
+//! read it is broken, as a hook that cannot read its params is), then exits as `exit-<word>` there
+//! says (`<code> [<last line>]`), or `0` with `{}`. A line of noise comes first on standard
+//! output, so the last line is the report.
 
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
@@ -54,6 +56,15 @@ fn run(args: &[OsString], program: Option<&Path>, out: &mut dyn Write) -> Result
     let word = args.first().cloned().unwrap_or_default();
     append(&dir.join("steps.log"), &word)?;
     append(&dir.join("args.log"), &args.join(" "))?;
+    let params = args
+        .iter()
+        .position(|arg| arg == "--params")
+        .and_then(|at| args.get(at + 1));
+    if let Some(params) = params {
+        let bytes = fs::read(params).map_err(|e| format!("the params file {params}: {e}"))?;
+        let seen = dir.join("params.seen");
+        fs::write(&seen, bytes).map_err(|e| format!("{}: {e}", seen.display()))?;
+    }
     let told = fs::read_to_string(dir.join(format!("exit-{word}"))).unwrap_or_default();
     let told = told.trim();
     let (code, line) = told.split_once(' ').unwrap_or((told, "{}"));

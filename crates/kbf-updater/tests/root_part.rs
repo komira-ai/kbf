@@ -18,8 +18,9 @@ use update_hook::{Class, Phase, Step, Verdict};
 
 /// Catches the root part not running a declared hook through the step runner: an update of the
 /// fake service runs `prepare`, `cutover`, `verify` and `cleanup` in that order, each in the unit
-/// the runner names, `prepare` with the staged release and every step with the same params file;
-/// the step record is written and says the update succeeded, and the release is `current`.
+/// the runner names, `prepare` with the staged release and every step with the same params file,
+/// the copy in the hook's record directory, which the hook read; the step record is written and
+/// says the update succeeded, the runner's own params file is gone, and the release is `current`.
 #[test]
 fn an_update_runs_the_four_steps_in_order_and_writes_the_step_record() {
     let world = World::new("e2e");
@@ -54,12 +55,15 @@ fn an_update_runs_the_four_steps_in_order_and_writes_the_step_record() {
     }
     let args = fs::read_to_string(world.hook_dir("svc").join("args.log")).unwrap();
     let lines: Vec<&str> = args.lines().collect();
-    let params = world.path("state/svc/params.toml");
+    let given = world.hook_dir("svc").join("params");
     assert_eq!(
         lines[0],
-        format!("prepare {} --params {}", tree.display(), params.display())
+        format!("prepare {} --params {}", tree.display(), given.display())
     );
-    assert_eq!(lines[1], format!("cutover --params {}", params.display()));
+    assert_eq!(lines[1], format!("cutover --params {}", given.display()));
+    let seen = fs::read_to_string(world.hook_dir("svc").join("params.seen")).unwrap();
+    assert!(seen.contains("updater.target_version"), "{seen}");
+    let params = world.path("state/svc/params.toml");
 
     let record = world.record("svc");
     assert_eq!(record["target_version"], "2.0.0");
@@ -106,7 +110,7 @@ fn every_step_and_the_boot_entry_hold_the_hook_wide_set() {
             class: Class::Release
         }
     );
-    let booted = root.start("svc", false);
+    let booted = root.start("svc");
     assert_eq!(booted.boot.as_deref(), Some("success"), "{booted:?}");
 
     let mut words: Vec<String> = Vec::new();
@@ -183,7 +187,7 @@ fn a_step_with_an_entry_holds_only_that_list_and_one_without_the_hook_wide_set()
     bare.stage("svc", "1.0.0", None);
     let root = bare.root_part();
     assert_eq!(verdict(&root.update("svc", "1.0.0")), SUCCEEDED);
-    assert_eq!(root.start("svc", false).boot.as_deref(), Some("success"));
+    assert_eq!(root.start("svc").boot.as_deref(), Some("success"));
     let boot = bare.launched().pop().unwrap();
     assert_eq!(word(&boot), "restore");
     assert_eq!(property(&boot, "AmbientCapabilities").as_deref(), Some(""));
@@ -253,7 +257,7 @@ fn sweep(scenario: Scenario) {
                 .update("svc", "2.0.0");
             assert_eq!(killed.token(), Some("runner"), "{what}: {killed:?}");
             let restarted = world.root_part();
-            let started = restarted.start("svc", false);
+            let started = restarted.start("svc");
             assert!(started.ok, "{what}: {started:?}");
             let again = restarted.update("svc", "2.0.0");
             assert_eq!(verdict(&again), want, "{what}");
@@ -525,11 +529,12 @@ fn an_installed_declaration_the_load_refuses_is_put_back() {
     assert!(world.launched().is_empty());
 }
 
-/// Catches an installed declaration left in place when the runner refuses the order: while an
-/// update of the service is unfinished, an order whose release carries a narrower declaration is
-/// refused as busy, and the active declaration is the one that was.
+/// Catches a declaration installed for an order the runner refuses: while an update of the
+/// service is unfinished, an order for another release, whose release carries a narrower
+/// declaration, is refused as busy before anything changes: the active declaration stays and
+/// nothing is kept to put back.
 #[test]
-fn a_declaration_installed_for_an_order_the_runner_refuses_is_put_back() {
+fn a_declaration_carried_by_an_order_the_runner_refuses_is_not_installed() {
     let world = World::new("busy-carried");
     let active = world.tierstore_shaped();
     world.declare("svc", &active);
@@ -585,7 +590,7 @@ fn a_start_does_what_a_verdict_left_undone() {
     assert_eq!(world.record("svc")["state"]["state"], "finished");
     assert!(world.path("state/svc/declaration.previous").exists());
     assert!(fs::read_link(world.path("releases/svc/current")).is_err());
-    let started = world.root_part().start("svc", false);
+    let started = world.root_part().start("svc");
     assert!(started.ok, "{started:?}");
     assert_eq!(
         fs::read_link(world.path("releases/svc/current")).unwrap(),
@@ -615,7 +620,7 @@ fn a_killed_update_keeps_the_declaration_it_installed_until_its_verdict() {
         fs::read_to_string(world.path("updater.d/svc.toml")).unwrap(),
         narrower
     );
-    let started = world.root_part().start("svc", false);
+    let started = world.root_part().start("svc");
     assert!(started.ok, "{started:?}");
     assert_eq!(verdict(&started), SUCCEEDED);
     assert_eq!(

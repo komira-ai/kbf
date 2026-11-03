@@ -30,41 +30,42 @@ pub mod declare;
 pub mod flags;
 pub mod launch;
 pub mod releases;
+mod serve;
 pub mod socket;
+mod start;
 pub mod test_hook;
 
+#[cfg(test)]
+mod mod_tests;
 #[cfg(test)]
 mod test_hook_tests;
 
 use std::collections::BTreeMap;
-use std::fs::{self, DirBuilder};
+use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io;
-use std::os::unix::fs::{DirBuilderExt, chown};
-use std::os::unix::net::UnixStream;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, chown};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
-use kbf_step_runner::record::{
-    CrashGate, Loaded as Stored, Record, RecordError, RecordStore, State,
-};
-use kbf_step_runner::register::{Registry, Server};
-use kbf_step_runner::runner::REASON_ARTIFACT_CHANGED;
+use kbf_step_runner::record::{CrashGate, Loaded as Stored, Record, RecordStore, State};
+use kbf_step_runner::register::{Registry, RegistryError, Server};
 use kbf_step_runner::{
     Bounds, Clock, DeadMan, Finished, RunError, Staged, StepLauncher, StepRunner, SystemClock,
     UpdateOrder,
 };
-use update_hook::{Params, Verdict};
-use update_rights::declaration::MAX_CEILING_SECS;
+use update_hook::{Params, Phase, Verdict};
 use update_rights::{
-    Accounts, Declared, EtcAccounts, Loaded, Policy, Refused, Spawner, Systemd, boot_unit_name,
-    check_state_dir, load_dir, run_boot,
+    Accounts, Declared, EtcAccounts, Loaded, Policy, Refused, Spawner, Systemd, load_dir,
 };
 
 use self::declare::{Decision, Place};
 use self::launch::{Grants, HookLauncher, SYSTEMCTL, Shared, declared};
 use self::releases::{Releases, SealError};
 use self::socket::{Answer, Request};
+use self::start::Unread;
+
+pub use self::serve::{Stop, announce_ready, notify_ready, run_config};
 
 /// Where the root part keeps and finds things.
 #[derive(Clone, Debug)]
@@ -135,35 +136,137 @@ struct Service {
 /// Why a request was not done: a token for the agent, and a text for the log.
 type Refusal = (&'static str, String);
 
-fn because(token: &'static str) -> impl Fn(String) -> Refusal {
-    move |why| (token, why)
+fn because<E: std::fmt::Display>(token: &'static str) -> impl Fn(E) -> Refusal {
+    move |why| (token, why.to_string())
 }
 
 fn text(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
 
-/// Makes `dir` mode 0700 if it is missing, its parents 0755, so that what lies beside it stays
-/// reachable.
-fn make_private_dir(dir: &Path) -> io::Result<()> {
+/// Why the root part cannot start or serve.
+#[derive(Debug, thiserror::Error)]
+pub enum RootError {
+    #[error("{}: {source}", .path.display())]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("{} is not a directory of the updater's own: {why}", .path.display())]
+    Untrusted { path: PathBuf, why: &'static str },
+    #[error("another root part holds {}, or its lock cannot be taken: {source}", .path.display())]
+    Locked {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("the registrations: {0}")]
+    Registry(#[from] RegistryError),
+}
+
+fn io_at(path: &Path) -> impl Fn(io::Error) -> RootError + '_ {
+    move |source| RootError::Io {
+        path: path.to_path_buf(),
+        source,
+    }
+}
+
+/// Makes `dir` mode 0700 if it is missing, its missing parents 0755, so that what lies beside it
+/// stays reachable. `true` when it made it.
+fn create_dir_0700(dir: &Path) -> io::Result<bool> {
     DirBuilder::new()
         .recursive(true)
         .mode(0o755)
         .create(dir.parent().unwrap_or(dir))?;
     match DirBuilder::new().mode(0o700).create(dir) {
-        Err(e) if e.kind() != io::ErrorKind::AlreadyExists => Err(e),
-        _ => Ok(()),
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(e),
     }
 }
 
+/// Makes `dir`, a directory of the root part's own bookkeeping, if it is missing, then checks it
+/// and every directory above it before anything is read or written there: each a real directory
+/// (no link), `dir` owned by the account the root part runs as (root on a host) and closed to
+/// group and others, the ones above owned by root or that account and writable by nobody else.
+fn make_private_dir(dir: &Path) -> Result<(), RootError> {
+    let owner = crate::secret::euid();
+    create_dir_0700(dir).map_err(io_at(dir))?;
+    let mut at = PathBuf::new();
+    let last = dir.components().count();
+    for (n, part) in dir.components().enumerate() {
+        at.push(part);
+        let meta = fs::symlink_metadata(&at).map_err(io_at(&at))?;
+        let why = match (meta.is_dir(), n + 1 == last) {
+            (false, _) => Some("not a real directory"),
+            (true, true) => ((meta.uid() != owner) | (meta.mode() & 0o077 != 0))
+                .then_some("not the updater's, mode 0700"),
+            (true, false) => (![0, owner].contains(&meta.uid()) | (meta.mode() & 0o022 != 0))
+                .then_some("a directory above it others can change"),
+        };
+        if let Some(why) = why {
+            return Err(RootError::Untrusted { path: at, why });
+        }
+    }
+    Ok(())
+}
+
 /// The record directory of a hook (`state_dir`), made by the updater and owned by the hook's
-/// account (3.4.1). It is made mode 0700; a hook whose service's units execute from it gives the
-/// service's group what it needs itself.
+/// account (3.4.1) when it is missing. An existing one is left as it is (a hook whose service's
+/// units execute from it gave the service's group what it needs); it is checked before every
+/// launch (`update_rights::check_state_dir`).
 fn make_record_dir(declared: &Declared) -> io::Result<()> {
     let dir = Path::new(&declared.declaration().state_dir);
-    make_private_dir(dir)?;
-    let hook = declared.hook();
-    chown(dir, Some(hook.uid), Some(hook.gid))
+    if create_dir_0700(dir)? {
+        let hook = declared.hook();
+        chown(dir, Some(hook.uid), Some(hook.gid))?;
+    }
+    Ok(())
+}
+
+/// The step record of the service whose state directory is `dir`.
+fn stored(dir: &Path) -> Result<Option<Box<Record>>, Refusal> {
+    match RecordStore::new(dir).load() {
+        Ok(Stored::Current(rec)) => Ok(Some(rec)),
+        Ok(Stored::Absent) => Ok(None),
+        Ok(Stored::Newer { schema }) => Err((
+            "record_newer",
+            format!("the step record has schema {schema}, newer than this updater reads"),
+        )),
+        Err(e) => Err(("record", e.to_string())),
+    }
+}
+
+/// The verdict of `rec` that stands for an order of `version` from `release`: a halt holds every
+/// order, and the same update that ended is answered with how it ended, as the step runner answers
+/// it (a `Deferred` is run again).
+fn standing(rec: &Record, version: &str, release: &releases::Release) -> Option<Finished> {
+    let State::Finished { verdict, reason } = &rec.state else {
+        return None;
+    };
+    let ended = matches!(verdict, Verdict::Succeeded { .. } | Verdict::Failed { .. });
+    let stands = matches!(verdict, Verdict::Halt) | (ended & same_release(rec, version, release));
+    stands.then(|| Finished {
+        verdict: verdict.clone(),
+        reason: reason.clone(),
+    })
+}
+
+/// The refusal of an order whose run failed and whose installed declaration could not be put
+/// back: the run's token and reason, and why the declaration stays.
+fn kept_after(token: &str, why: &str, e: &str) -> Refusal {
+    (
+        "internal",
+        format!("{token}: {why}; the declaration it installed is kept: {e}"),
+    )
+}
+
+/// Whether `rec` is the update of `version` from `release`.
+fn same_release(rec: &Record, version: &str, release: &releases::Release) -> bool {
+    (rec.target_version == version)
+        & (rec.tarball_digest == release.artifact_digest)
+        & (rec.artifact_digest == release.staged.digest())
 }
 
 /// The update `UpdateOrder` the runner takes, from the declaration and the releases.
@@ -194,10 +297,7 @@ fn order(
             rollback_secs: timeouts.rollback,
             cleanup_secs: timeouts.cleanup,
             verify_deadline_secs: declaration.verify_deadline_secs,
-            // A declaration with no ceiling has the longest one a declaration may give.
-            promotion_ceiling_secs: declaration
-                .promotion_ceiling_secs
-                .unwrap_or(MAX_CEILING_SECS),
+            promotion_ceiling_secs: declaration.promotion_ceiling_secs,
             cleanup_retries: declaration.cleanup_retries,
         },
         declared_params,
@@ -249,26 +349,6 @@ fn resumed(declared: &Declared, rec: &Record) -> Result<Resumed, Refusal> {
     .map(|order| Resumed::Order(Box::new(order)))
 }
 
-/// Ends the update `rec` holds as the step runner ends one whose release changed after it was
-/// verified: a `Halt` with the reason `artifact_changed`, kept until an operator clears it.
-fn halt_changed(store: &RecordStore, rec: &Record, why: &str) -> Result<Finished, RecordError> {
-    eprintln!(
-        "kbf-updater root: {}: {why}; the update is halted",
-        rec.service
-    );
-    let finished = Finished {
-        verdict: Verdict::Halt,
-        reason: Some(REASON_ARTIFACT_CHANGED.to_owned()),
-    };
-    let mut halted = rec.clone();
-    halted.state = State::Finished {
-        verdict: finished.verdict.clone(),
-        reason: finished.reason.clone(),
-    };
-    store.save(&halted)?;
-    Ok(finished)
-}
-
 /// The generation of the step record in `dir`, `None` when there is none or it cannot be read:
 /// a run that changed it has begun an update.
 fn record_generation(dir: &Path) -> Option<u64> {
@@ -303,9 +383,16 @@ pub struct RootPart {
     loaded: Shared,
     launcher: Arc<HookLauncher>,
     services: Mutex<BTreeMap<String, Arc<Service>>>,
+    /// The records the read after a boot could not read, until each is read.
+    unread: Mutex<Unread>,
     /// Ends the dead-men and the registration server.
     stop: Arc<AtomicBool>,
+    /// Held while the root part lives: one root part per state directory.
+    _lock: File,
 }
+
+/// The lock file in the state directory.
+pub const LOCK_FILE: &str = "lock";
 
 impl Drop for RootPart {
     fn drop(&mut self) {
@@ -318,8 +405,22 @@ impl RootPart {
     ///
     /// # Errors
     /// The state directory cannot be made, or the directory of declarations cannot be listed.
-    pub fn new(config: Config, parts: Parts) -> Result<RootPart, String> {
-        make_private_dir(&config.state).map_err(text)?;
+    pub fn new(config: Config, parts: Parts) -> Result<RootPart, RootError> {
+        make_private_dir(&config.state)?;
+        let lock_path = config.state.join(LOCK_FILE);
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&lock_path)
+            .map_err(io_at(&lock_path))?;
+        lock.try_lock().map_err(|e| RootError::Locked {
+            path: lock_path.clone(),
+            source: io::Error::from(e),
+        })?;
         let loaded: Shared = Arc::new(RwLock::new(Loaded::default()));
         let launcher = Arc::new(HookLauncher::new(
             Arc::clone(&loaded),
@@ -332,7 +433,9 @@ impl RootPart {
             loaded,
             launcher,
             services: Mutex::default(),
+            unread: Mutex::default(),
             stop: Arc::new(AtomicBool::new(false)),
+            _lock: lock,
         };
         root.reload()?;
         Ok(root)
@@ -342,13 +445,13 @@ impl RootPart {
     ///
     /// # Errors
     /// The directory cannot be listed.
-    pub fn reload(&self) -> Result<(), String> {
+    pub fn reload(&self) -> Result<(), RootError> {
         let policy = Policy {
             trusted_uid: self.config.trusted_uid,
             accounts: &*self.parts.accounts,
         };
         let fresh = load_dir(&self.config.declarations, &policy)
-            .map_err(|e| format!("{}: {e}", self.config.declarations.display()))?;
+            .map_err(io_at(&self.config.declarations))?;
         *self.loaded.write().unwrap_or_else(PoisonError::into_inner) = fresh;
         Ok(())
     }
@@ -385,7 +488,7 @@ impl RootPart {
             return Ok(Arc::clone(service));
         }
         let dir = self.config.state.join(name);
-        make_private_dir(&dir).map_err(|e| ("internal", e.to_string()))?;
+        make_private_dir(&dir).map_err(because("internal"))?;
         let store = self
             .parts
             .crash_gate
@@ -447,6 +550,7 @@ impl RootPart {
         if !update_rights::names::is_service_name(service) {
             return Err(self.unknown(service));
         }
+        self.read_if_unread(service)?;
         let releases = self.releases();
         let release = releases
             .staged(service, version)
@@ -460,11 +564,42 @@ impl RootPart {
             .busy
             .try_lock()
             .map_err(|_| ("busy", format!("an update of {service} is running")))?;
+        // Before anything changes: a verdict that stands is answered (the same update that
+        // ended, or a halt, which holds every order), and an unfinished update of another
+        // release refuses this one.
+        let rec = stored(&unit.dir)?;
+        if let Some(rec) = &rec {
+            if let Some(finished) = standing(rec, version, &release) {
+                self.after(service, version, &unit.dir, &finished)?;
+                return Ok(Answer::finished(finished));
+            }
+            // A post-success watcher is stopped by a new order (3.2): the runner does that.
+            let finished = matches!(rec.state, State::Finished { .. });
+            let watching = rec.progress.watching.is_some();
+            if !finished & !watching & !same_release(rec, version, &release) {
+                return Err((
+                    "busy",
+                    format!(
+                        "an update of {service} to {} is not finished",
+                        rec.target_version
+                    ),
+                ));
+            }
+        }
+        let generation = rec.as_ref().map(|rec| rec.generation);
         let decision = match &carried {
             Some(bytes) => {
-                let loaded = self.loaded.read().unwrap_or_else(PoisonError::into_inner);
-                declare::decide(&self.place(&unit.dir), &loaded, service, bytes)
-                    .map_err(because("declaration_refused"))?
+                // The active declaration as it is now, not as it was at the last load.
+                self.reload().map_err(because("internal"))?;
+                let active = declared(&self.loaded, service);
+                declare::decide(
+                    &self.place(&unit.dir),
+                    active.as_ref(),
+                    service,
+                    bytes,
+                    generation,
+                )
+                .map_err(because("declaration_refused"))?
             }
             None => Decision::Unchanged,
         };
@@ -481,15 +616,18 @@ impl RootPart {
                 ..Answer::default()
             });
         }
-        let before = record_generation(&unit.dir);
         let ran = self.run_order(service, version, &releases, release, &unit);
-        if ran.is_err() & installed && record_generation(&unit.dir) == before {
-            // The runner began nothing under the declaration this order installed (it fails a rule
-            // of the load, or the runner refused the order): the one that was active goes back.
-            // Once the runner has begun the update's record, the declaration stays: the start pass
-            // runs that update to its verdict under it and does what the verdict leaves.
-            let _ = declare::restore(&self.place(&unit.dir), service);
-            let _ = self.reload();
+        // The runner began nothing under the declaration this order installed (it fails a rule of
+        // the load, or the runner refused the order): the one that was active goes back. Once the
+        // runner has begun the update's record, the declaration stays: the start pass runs that
+        // update to its verdict under it and does what it leaves.
+        if let Err((token, why)) = &ran
+            && installed & (record_generation(&unit.dir) == generation)
+        {
+            declare::restore(&self.place(&unit.dir), service)
+                .map_err(text)
+                .and_then(|_| self.reload().map_err(text))
+                .map_err(|e| kept_after(token, why, &e))?;
         }
         ran
     }
@@ -506,7 +644,7 @@ impl RootPart {
         self.reload().map_err(because("internal"))?;
         let declared = declared(&self.loaded, service)
             .ok_or_else(|| ("declaration_refused", self.unknown(service).1))?;
-        make_record_dir(&declared).map_err(|e| ("internal", text(e)))?;
+        make_record_dir(&declared).map_err(because("internal"))?;
         let previous = releases
             .current(service)
             .map_err(because("not_staged"))?
@@ -524,9 +662,10 @@ impl RootPart {
         Ok(Answer::finished(finished))
     }
 
-    /// What an update's verdict leaves: on success the release is `current` and the declaration
-    /// it installed stays; after a failure or a deferral the declaration it installed is taken
-    /// back; after a halt nothing is touched.
+    /// What an update's verdict leaves. When the release was committed (a success, or a failure
+    /// after a step reported `reversible: false`, from which nothing rolls back) it is `current`
+    /// and the declaration it installed stays; after any other failure or a deferral the
+    /// declaration it installed is taken back; after a halt nothing is touched.
     fn after(
         &self,
         service: &str,
@@ -535,17 +674,20 @@ impl RootPart {
         finished: &Finished,
     ) -> Result<(), Refusal> {
         let place = self.place(dir);
-        let internal = |e: io::Error| ("internal", e.to_string());
         match finished.verdict {
-            Verdict::Succeeded { .. } => {
+            Verdict::Succeeded { .. }
+            | Verdict::Failed {
+                phase: Phase::AfterCommit,
+                ..
+            } => {
                 self.releases()
                     .set_current(service, version)
-                    .map_err(internal)?;
-                declare::settle(&place).map_err(internal)
+                    .map_err(because("internal"))?;
+                declare::settle(&place).map_err(because("internal"))
             }
             Verdict::Halt => Ok(()),
             Verdict::Failed { .. } | Verdict::Deferred { .. } => {
-                if declare::restore(&place, service).map_err(internal)? {
+                if declare::restore(&place, service).map_err(because("internal"))? {
                     self.reload().map_err(because("internal"))?;
                 }
                 Ok(())
@@ -587,274 +729,25 @@ impl RootPart {
         }
     }
 
-    /// After a boot, reads every step record under the state directory with
-    /// [`boot::read_as_killed`]: those of the declared services and those of services whose
-    /// declaration the load refused, which an update may have left unfinished all the same. Run
-    /// before the start pass and before the agent is served, so no update of a service is running.
-    /// The services whose record could not be read, and why.
-    pub fn read_after_boot(&self) -> Vec<(String, String)> {
-        // The state directory is made when the root part is (`RootPart::new`).
-        let entries = match fs::read_dir(&self.config.state) {
-            Ok(entries) => entries,
-            Err(e) => return vec![(String::new(), e.to_string())],
-        };
-        let mut unread = Vec::new();
-        for entry in entries {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(e) => {
-                    unread.push((String::new(), e.to_string()));
-                    continue;
-                }
-            };
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let is_dir = entry.file_type().is_ok_and(|kind| kind.is_dir());
-            if !is_dir || !update_rights::names::is_service_name(&name) {
-                continue;
-            }
-            if let Err(e) = boot::read_as_killed(&RecordStore::new(&entry.path())) {
-                unread.push((name, e.to_string()));
-            }
-        }
-        unread
-    }
-
-    /// The start pass of one service: after a boot (`first_since_boot`) a step the boot cut off
-    /// is read as killed ([`boot::read_as_killed`]); an update the record holds unfinished is run
-    /// to its verdict; then the declaration's boot entry runs, from the release of the last
-    /// update that succeeded. The answer carries the verdict of a resumed update and the outcome
-    /// of the boot entry (`boot`).
-    pub fn start(&self, service: &str, first_since_boot: bool) -> Answer {
-        self.try_start(service, first_since_boot)
-            .unwrap_or_else(|(token, why)| Answer::refused(token, why))
-    }
-
-    fn try_start(&self, service: &str, first_since_boot: bool) -> Result<Answer, Refusal> {
-        let declared = declared(&self.loaded, service).ok_or_else(|| self.unknown(service))?;
-        let unit = self.service(service)?;
-        let _busy = unit.busy.lock().unwrap_or_else(PoisonError::into_inner);
-        let store = RecordStore::new(&unit.dir);
-        let record = |e: kbf_step_runner::RecordError| ("record", e.to_string());
-        if first_since_boot {
-            boot::read_as_killed(&store).map_err(record)?;
-        }
-        let rec = match store.load().map_err(record)? {
-            Stored::Current(rec) => Some(rec),
-            _ => None,
-        };
-        let generation = rec.as_ref().map_or(0, |rec| rec.generation);
-        let mut answer = Answer {
-            ok: true,
-            ..Answer::default()
-        };
-        if let Some(rec) = rec {
-            let finished = match rec.state.clone() {
-                State::Finished { verdict, reason } => Finished { verdict, reason },
-                _ => {
-                    make_record_dir(&declared).map_err(|e| ("internal", text(e)))?;
-                    let finished = match resumed(&declared, &rec)? {
-                        Resumed::Order(order) => unit.runner.run(&order).map_err(run_refusal)?,
-                        Resumed::Changed(why) => {
-                            halt_changed(&store, &rec, &why).map_err(record)?
-                        }
-                    };
-                    answer = Answer::finished(finished.clone());
-                    finished
-                }
-            };
-            // What the verdict leaves (the `current` link, the declaration kept or put back) is
-            // done again: a root part killed between the verdict and those has not done them.
-            self.after(service, &rec.target_version, &unit.dir, &finished)?;
-        }
-        answer.boot = self.boot_entry(service, generation)?;
-        Ok(answer)
-    }
-
-    /// Runs the boot entry of `service`, if its declaration names one and a release of it was
-    /// installed by an update: the tree is checked against its seal first, and a unit of the
-    /// same name left by an earlier start is stopped. The outcome, `None` when nothing ran.
-    fn boot_entry(&self, service: &str, generation: u64) -> Result<Option<String>, Refusal> {
-        let declared = declared(&self.loaded, service).ok_or_else(|| self.unknown(service))?;
-        let binary = &declared.declaration().binary;
-        let current = match declared.declaration().boot {
-            Some(_) => self
-                .releases()
-                .current(service)
-                .map_err(because("not_staged"))?,
-            None => None,
-        };
-        let Some(current) = current else {
-            return Ok(None);
-        };
-        current
-            .staged
-            .check(Path::new(binary))
-            .map_err(|e| ("artifact", e.to_string()))?;
-        make_record_dir(&declared).map_err(|e| ("internal", text(e)))?;
-        // As before every step (`launch::HookLauncher`): the record directory is checked again,
-        // on what it is now; one the service's account can write runs nothing.
-        check_state_dir(
-            &declared.declaration().state_dir,
-            declared.service().uid,
-            declared.service_gids(),
-        )
-        .map_err(|e| ("boot", e.to_string()))?;
-        self.launcher
-            .stop(&boot_unit_name(service, generation))
-            .map_err(|e| ("boot", e.to_string()))?;
-        let ran = run_boot(
-            &*self.parts.systemd_run,
-            &declared,
-            generation,
-            current.staged.dir(),
-        )
-        .map_err(|e| ("boot", e.to_string()))?;
-        Ok(ran.map(|run| format!("{:?}", run.outcome).to_lowercase()))
-    }
-
     /// Serves the registration socket at `socket` for the members of the group `gid`, on a
     /// thread of its own, until the root part is dropped or stopped.
     ///
     /// # Errors
     /// The socket's directory is not the trusted account's and closed to others, or the
     /// registrations kept on disk cannot be read.
-    pub fn serve_registrations(&self, socket: &Path, gid: u32) -> Result<(), String> {
+    pub fn serve_registrations(&self, socket: &Path, gid: u32) -> Result<(), RootError> {
         let grants = Arc::new(Grants(Arc::clone(&self.loaded)));
-        let registry = Registry::load(&self.config.state, Arc::clone(&self.parts.clock), &*grants)
-            .map_err(text)?;
+        let registry = Registry::load(&self.config.state, Arc::clone(&self.parts.clock), &*grants)?;
         let server = Server::bind(
             socket,
             self.config.trusted_uid,
             gid,
             Arc::new(registry),
             grants,
-        )
-        .map_err(text)?;
+        )?;
         let server = Arc::new(server);
         let stop = Arc::clone(&self.stop);
         let _ = std::thread::spawn(move || server.serve(&stop));
         Ok(())
     }
-}
-
-/// Stops a running root part.
-#[derive(Clone, Debug)]
-pub struct Stop {
-    flag: Arc<AtomicBool>,
-    socket: PathBuf,
-}
-
-impl Stop {
-    /// Ends the root part: it answers no more requests and returns.
-    pub fn stop(&self) {
-        self.flag.store(true, Ordering::Release);
-        // Wakes the accept.
-        let _ = UnixStream::connect(&self.socket);
-    }
-}
-
-/// `kbf-updater root` with its flags and `config` ([`Config::of`] the flags, on a host): loads the
-/// declarations, serves the registrations, runs the start pass of every service, then binds the
-/// agent's socket, calls `ready` and answers the agent until stopped. Exit 1 with the reason when
-/// it cannot start.
-pub fn run_config<'a>(
-    flags: &flags::Flags,
-    config: Config,
-    parts: Parts,
-    ready: impl FnOnce(Stop) + 'a,
-) -> (u8, String) {
-    run_ready(flags, config, parts, Box::new(ready))
-}
-
-/// [`run_config`] with `ready` boxed: one copy of the start, whatever the caller's `ready` is.
-fn run_ready(
-    flags: &flags::Flags,
-    config: Config,
-    parts: Parts,
-    ready: Box<dyn FnOnce(Stop) + '_>,
-) -> (u8, String) {
-    match serve(flags, config, parts, ready) {
-        Ok(()) => (0, String::new()),
-        Err(why) => (1, format!("kbf-updater root: {why}\n")),
-    }
-}
-
-fn serve(
-    flags: &flags::Flags,
-    config: Config,
-    parts: Parts,
-    ready: Box<dyn FnOnce(Stop) + '_>,
-) -> Result<(), String> {
-    let accounts = Arc::clone(&parts.accounts);
-    let agent = accounts.user(&flags.socket_user).ok_or_else(|| {
-        format!(
-            "--socket-user {:?} is not an account of this host",
-            flags.socket_user
-        )
-    })?;
-    let clock = Arc::clone(&parts.clock);
-    let state = config.state.clone();
-    let root = Arc::new(RootPart::new(config, parts)?);
-    for refused in root.refused() {
-        eprintln!(
-            "kbf-updater root: refused {} ({}): {}",
-            refused.service,
-            refused.file.display(),
-            refused.reason
-        );
-    }
-    if let Some(register) = &flags.register {
-        let gid = accounts.group(&register.group).ok_or_else(|| {
-            format!(
-                "--register-group {:?} is not a group of this host",
-                register.group
-            )
-        })?;
-        root.serve_registrations(&register.socket, gid)?;
-    }
-    // After a boot every record is read first, the services refused at the load included: a
-    // record the boot cut off is read as killed before any update is resumed. The boot id is
-    // written only once every record was read, so a start that could not read one reads it after
-    // a boot again; a service whose record was not read is not started in this pass.
-    let unread = if boot::boot_changed(&state, &*clock) {
-        root.read_after_boot()
-    } else {
-        Vec::new()
-    };
-    for (service, why) in &unread {
-        eprintln!("kbf-updater root: {service}: the record was not read after the boot: {why}");
-    }
-    for service in root.services() {
-        if unread.iter().any(|(name, _)| *name == service) {
-            continue;
-        }
-        let started = root.start(&service, false);
-        eprintln!(
-            "kbf-updater root: {service}: {}",
-            serde_json::to_string(&started).unwrap_or_default()
-        );
-    }
-    if unread.is_empty() {
-        boot::commit_boot(&state, &*clock).map_err(text)?;
-    }
-    let listener = socket::bind(&flags.socket, agent.uid, agent.gid).map_err(text)?;
-    let stop = Stop {
-        flag: Arc::new(AtomicBool::new(false)),
-        socket: flags.socket.clone(),
-    };
-    eprintln!(
-        "kbf-updater root: serving the agent at {}",
-        flags.socket.display()
-    );
-    ready(stop.clone());
-    for stream in listener.incoming() {
-        if stop.flag.load(Ordering::Acquire) {
-            break;
-        }
-        let root = Arc::clone(&root);
-        let _ = stream.map(|stream| {
-            std::thread::spawn(move || socket::serve_connection(&stream, &|r| root.answer(r)))
-        });
-    }
-    Ok(())
 }

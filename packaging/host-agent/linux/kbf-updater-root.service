@@ -7,7 +7,8 @@
 #
 # At its start it reads the step record of every declared service (a step a boot cut off is
 # rolled back as the contract's table says) and runs each declaration's boot entry, before it
-# answers the agent.
+# answers the agent. It tells systemd it is ready only then (Type=notify), so the units ordered
+# after it (Before= below) start once that is done.
 #
 # Root, on purpose, and with no User= (kbf-host-local.service says why): it starts transient
 # units, installs a verified declaration into /etc/updater.d through the approval gate, and keeps
@@ -20,7 +21,11 @@ After=local-fs.target systemd-tmpfiles-setup.service
 Before=kbf-updater-agent.service
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
+# Its start pass runs an update a stop or a boot cut off to its verdict before it is ready, and a
+# step may take as long as its declaration allows: no start timeout cuts it.
+TimeoutStartSec=infinity
 ExecStart=/usr/libexec/kbf/kbf-updater root --socket /run/kbf-updater-root/root.sock --socket-user kbf-updater --register-socket /run/updater/register.sock --register-group updater-register
 RuntimeDirectory=kbf-updater-root
 RuntimeDirectoryMode=0755

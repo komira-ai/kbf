@@ -323,6 +323,9 @@ fn the_root_part_unit_agrees_with_the_agent_and_its_registration_directory() {
             .starts_with(format!("/run/{}/", unit_value(&unit, "RuntimeDirectory")))
     );
     assert!(unit_value(&unit, "Before").contains("kbf-updater-agent.service"));
+    // Ready once its start pass is over, so what is ordered after it waits for that.
+    assert_eq!(unit_value(&unit, "Type"), "notify");
+    assert_eq!(unit_value(&unit, "TimeoutStartSec"), "infinity");
     assert_eq!(
         flags.declarations,
         Path::new(update_rights::DECLARATION_DIR)

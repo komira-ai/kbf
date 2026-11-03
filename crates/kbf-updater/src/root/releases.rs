@@ -43,8 +43,8 @@ pub fn is_version(version: &str) -> bool {
         & (version != CURRENT)
 }
 
+/// A field a later version adds to a seal is passed over; one of these missing is not a seal.
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct Seal {
     tree_digest: String,
     artifact_digest: String,
@@ -58,6 +58,33 @@ pub struct Release {
     pub staged: Staged,
     /// The sha256 of the attested tarball, 64 lower-case hex digits.
     pub artifact_digest: String,
+}
+
+/// Why a staged release cannot be used.
+#[derive(Debug, thiserror::Error)]
+pub enum ReleaseError {
+    #[error("{0:?} is not a version")]
+    NotAVersion(String),
+    #[error("the seal {}: {source}", .path.display())]
+    SealUntrusted {
+        path: PathBuf,
+        #[source]
+        source: update_rights::trust::TrustError,
+    },
+    #[error("the seal {}: {source}", .path.display())]
+    NotASeal {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error(transparent)]
+    Tree(#[from] SealError),
+    #[error("{}: {source}", .path.display())]
+    Link {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
 }
 
 /// Why a staged tree cannot be taken as the one that was verified.
@@ -120,20 +147,27 @@ impl Releases {
     /// The release `version` of `service`, as it was sealed.
     ///
     /// # Errors
-    /// No such release, a seal that is missing, untrusted or not a seal, or a version that is
-    /// not a file name.
-    pub fn staged(&self, service: &str, version: &str) -> Result<Release, String> {
+    /// No such release, a seal that is missing, untrusted or not a seal, a tree that is not the
+    /// one sealed, or a version that is not a file name.
+    pub fn staged(&self, service: &str, version: &str) -> Result<Release, ReleaseError> {
         if !is_version(version) {
-            return Err(format!("{version:?} is not a version"));
+            return Err(ReleaseError::NotAVersion(version.to_owned()));
         }
         let dir = self.service_dir(service);
         let seal_path = dir.join(format!("{version}{SEAL_SUFFIX}"));
-        let bytes = update_rights::trust::read_trusted(&seal_path, self.trusted_uid)
-            .map_err(|e| format!("the seal {}: {e}", seal_path.display()))?;
-        let seal: Seal = serde_json::from_slice(&bytes)
-            .map_err(|e| format!("the seal {}: {e}", seal_path.display()))?;
-        let tree = dir.join(version);
-        let staged = sealed_as(&tree, &seal.tree_digest).map_err(|e| e.to_string())?;
+        let bytes =
+            update_rights::trust::read_trusted(&seal_path, self.trusted_uid).map_err(|source| {
+                ReleaseError::SealUntrusted {
+                    path: seal_path.clone(),
+                    source,
+                }
+            })?;
+        let seal: Seal =
+            serde_json::from_slice(&bytes).map_err(|source| ReleaseError::NotASeal {
+                path: seal_path.clone(),
+                source,
+            })?;
+        let staged = sealed_as(&dir.join(version), &seal.tree_digest)?;
         Ok(Release {
             version: version.to_owned(),
             staged,
@@ -144,13 +178,13 @@ impl Releases {
     /// The release the `current` link names, `None` when there is no link.
     ///
     /// # Errors
-    /// A link that names no version, or a release that is not staged.
-    pub fn current(&self, service: &str) -> Result<Option<Release>, String> {
+    /// A link that cannot be read or names no version, or a release that is not staged.
+    pub fn current(&self, service: &str) -> Result<Option<Release>, ReleaseError> {
         let link = self.service_dir(service).join(CURRENT);
         let target = match fs::read_link(&link) {
             Ok(target) => target,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(format!("{}: {e}", link.display())),
+            Err(source) => return Err(ReleaseError::Link { path: link, source }),
         };
         let version = target.to_str().unwrap_or_default();
         self.staged(service, version).map(Some)

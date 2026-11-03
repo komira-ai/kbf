@@ -194,12 +194,41 @@ pub fn run_root_with(args: &[String], ready: impl FnOnce(root::Stop)) -> (u8, St
     }
 }
 
-/// `kbf-updater approve <service> <sha256>` (`update_rights::cli`): records an operator's
-/// approval of one exact declaration in `/etc/updater.d/approved`. A root act; the line it
-/// prints is the audit record. Exit 0 done, 1 refused, 2 usage.
+/// [`run_root_with`], telling the service manager the root part is ready once its start pass is
+/// over: `notify_socket` is the `NOTIFY_SOCKET` systemd sets for a `Type=notify` unit (a mark of
+/// the platform, not a setting), `None` when nothing asks. `ready` is called after that.
+pub fn run_root_notifying(
+    args: &[String],
+    notify_socket: Option<std::ffi::OsString>,
+    ready: impl FnOnce(root::Stop),
+) -> (u8, String) {
+    run_root_with(args, |stop| {
+        root::announce_ready(notify_socket.as_deref());
+        ready(stop);
+    })
+}
+
+/// `kbf-updater approve [--approvals FILE] <service> <sha256>` (`update_rights::cli`): records an
+/// operator's approval of one exact declaration in `env`'s approval file
+/// (`/etc/updater.d/approved` on a host), or in `FILE`, the one a root part given the same
+/// `--approvals` reads. A root act; the line it prints is the audit record. Exit 0 done, 1
+/// refused, 2 usage.
 pub fn run_approve_with(args: &[String], env: &update_rights::cli::Env) -> (u8, String) {
+    let rest = args.get(2..).unwrap_or_default();
+    let chosen;
+    let (rest, env) = match rest {
+        [flag, file, rest @ ..] if flag == "--approvals" => {
+            chosen = update_rights::cli::Env {
+                approvals: std::path::PathBuf::from(file),
+                trusted_uid: env.trusted_uid,
+                effective_uid: env.effective_uid,
+            };
+            (rest, &chosen)
+        }
+        _ => (rest, env),
+    };
     let (mut out, mut err) = (Vec::new(), Vec::new());
-    let code = update_rights::cli::run(args.get(2..).unwrap_or_default(), env, &mut out, &mut err);
+    let code = update_rights::cli::run(rest, env, &mut out, &mut err);
     let text = if code == 0 { out } else { err };
     (code, String::from_utf8_lossy(&text).into_owned())
 }
@@ -210,7 +239,7 @@ pub fn run(args: &[String]) -> (u8, String) {
     match args.get(1).map(String::as_str) {
         Some("agent") => run_agent_with(args, |_| {}),
         Some("enroll") => run_enroll_with(args),
-        Some("root") => run_root_with(args, |_| {}),
+        Some("root") => run_root_notifying(args, std::env::var_os("NOTIFY_SOCKET"), |_| {}),
         Some("approve") => run_approve_with(args, &update_rights::cli::Env::production()),
         _ => run_with(args, |_| {}),
     }
