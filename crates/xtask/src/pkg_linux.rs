@@ -859,4 +859,8 @@ pub fn build(nfpm: &mut Nfpm, b: &Build) -> Result<Vec<String>, Error> {
 }
 
 #[cfg(test)]
+mod agent_tests;
+#[cfg(test)]
+mod build_tests;
+#[cfg(test)]
 mod tests;

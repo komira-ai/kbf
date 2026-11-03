@@ -96,7 +96,8 @@ fn the_confirm_window_defaults_to_600_and_is_accepted_from_120_to_1800() {
 }
 
 /// The shipped unit's command line, and the settings the helper reads from it: the account,
-/// a 600 s window and the one restart unit `kbf-daemon.service`.
+/// a 600 s window, the package layout (the `kbf` deb ships the unit) and the one restart unit
+/// `kbf-daemon.service`.
 #[test]
 fn the_shipped_unit_gives_a_600_second_window_and_the_daemon_unit() {
     let exec: Vec<&str> = UNIT_FILE
@@ -106,7 +107,7 @@ fn the_shipped_unit_gives_a_600_second_window_and_the_daemon_unit() {
     assert_eq!(
         exec,
         [
-            "ExecStart=/usr/libexec/kbf/kbf-host-install --serve --socket /run/kbf-host-install/local.sock --socket-user kbf-updater --window-secs 600 --restart-unit kbf-daemon.service"
+            "ExecStart=/usr/libexec/kbf/kbf-host-install --serve --socket /run/kbf-host-install/local.sock --socket-user kbf-updater --window-secs 600 --layout deb --restart-unit kbf-daemon.service"
         ]
     );
     let words: Vec<&str> = exec[0].split_whitespace().collect();
@@ -114,6 +115,7 @@ fn the_shipped_unit_gives_a_600_second_window_and_the_daemon_unit() {
     let config = ServeConfig::parse(&args(&words[2..])).unwrap();
     assert_eq!(config.user, "kbf-updater");
     assert_eq!(config.window_secs, DEFAULT_WINDOW_SECS);
+    assert_eq!(config.layout, super::serve::Layout::Deb);
     let units: Vec<_> = config.units.iter().map(Unit::as_str).collect();
     assert_eq!(units, ["kbf-daemon.service"]);
 }

@@ -1,11 +1,8 @@
-use std::cell::RefCell;
-use std::os::unix::fs::MetadataExt;
-
 use super::*;
 use kbf_testkit::dir::TestDir;
 
 /// An empty directory of its own for one test, removed when it drops.
-fn scratch(name: &str) -> TestDir {
+pub(super) fn scratch(name: &str) -> TestDir {
     let beside = std::env::current_exe().expect("test binary");
     let deps = beside.parent().expect("deps");
     TestDir::under(deps.join("xtask-pkg-unit"), name)
@@ -20,12 +17,12 @@ const NOT_PACKAGED: [&str; 3] = [
 ];
 
 /// The inputs a package is built from, in `dir`.
-struct Tree {
-    dir: TestDir,
+pub(super) struct Tree {
+    pub(super) dir: TestDir,
 }
 
 impl Tree {
-    fn new(name: &str) -> Tree {
+    pub(super) fn new(name: &str) -> Tree {
         let dir = scratch(name);
         let t = Tree { dir };
         t.put("kbf", "kbf binary");
@@ -50,13 +47,13 @@ impl Tree {
         t
     }
 
-    fn put(&self, rel: &str, text: &str) {
+    pub(super) fn put(&self, rel: &str, text: &str) {
         let path = self.dir.join(rel);
         std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
         std::fs::write(path, text).expect("file");
     }
 
-    fn inputs(&self) -> Inputs<'_> {
+    pub(super) fn inputs(&self) -> Inputs<'_> {
         // The leaked paths live as long as the test.
         let at = |rel: &str| -> &'static Path { Box::leak(self.dir.join(rel).into_boxed_path()) };
         Inputs {
@@ -73,7 +70,7 @@ impl Tree {
     }
 }
 
-fn refused(r: Result<Vec<Entry>, Error>) -> String {
+pub(super) fn refused(r: Result<Vec<Entry>, Error>) -> String {
     match r {
         Err(Error::Refused(problems)) => problems.join("\n"),
         other => panic!("expected a refusal, got {other:?}"),
@@ -158,22 +155,6 @@ fn the_plan_is_the_contract_paths_with_their_modes() {
     assert_eq!(got, want);
 }
 
-/// Asserts that the host agent's files in the deb are the bytes of the host agent's directory:
-/// each unit and the account file is taken from there, not from the units directory.
-#[test]
-fn the_host_agent_files_are_the_host_agent_directorys() {
-    let t = Tree::new("agent-bytes");
-    let plan = kbf_plan(&t.inputs()).expect("plan");
-    for name in AGENT_UNITS.into_iter().chain([AGENT_SYSUSERS]) {
-        let src = t.dir.join("host-agent").join(name);
-        let e = plan
-            .iter()
-            .find(|e| e.src == src)
-            .unwrap_or_else(|| panic!("{name} is packaged"));
-        assert_eq!(e.sha256, Some(Sha256::of(name.as_bytes())), "{name}");
-    }
-}
-
 /// Asserts that the retired installer is not in the package: not its binary, not its proxy's or
 /// its own units, though the unit directory holds them, and not its share directory.
 #[test]
@@ -199,7 +180,7 @@ fn the_plan_leaves_out_the_installer_its_units_and_its_directory() {
 fn the_plan_refuses_what_the_package_does_not_ship() {
     // Each case changes the tree in one way and names what the refusal must say.
     type Change = fn(&Tree) -> Inputs<'_>;
-    let cases: [(&str, Change, &str); 16] = [
+    let cases: [(&str, Change, &str); 12] = [
         (
             "a missing kbf",
             |t| {
@@ -255,40 +236,6 @@ fn the_plan_refuses_what_the_package_does_not_ship() {
                 t.inputs()
             },
             "/sysusers.conf: No such file or directory",
-        ),
-        (
-            "a missing helper unit",
-            |t| {
-                std::fs::remove_file(t.dir.join("host-agent/kbf-host-local.service")).expect("rm");
-                t.inputs()
-            },
-            "host agent file kbf-host-local.service is missing",
-        ),
-        (
-            "a missing agent unit",
-            |t| {
-                std::fs::remove_file(t.dir.join("host-agent/kbf-updater-agent.service"))
-                    .expect("rm");
-                t.inputs()
-            },
-            "host agent file kbf-updater-agent.service is missing",
-        ),
-        (
-            "a missing agent account",
-            |t| {
-                std::fs::remove_file(t.dir.join("host-agent/kbf-updater.conf")).expect("rm");
-                t.inputs()
-            },
-            "host agent file kbf-updater.conf is missing",
-        ),
-        (
-            "a host agent directory that is not there",
-            |t| {
-                let mut i = t.inputs();
-                i.host_agent = Path::new("/nonexistent/host-agent");
-                i
-            },
-            "/nonexistent/host-agent cannot be read as a directory",
         ),
         (
             "a unit directory that is not there",
@@ -408,45 +355,6 @@ fn the_config_has_the_contract_dependencies_no_script_and_root_files() {
     );
     let arm = config(&entries, Platform::LinuxArm64, "1.2.3");
     assert!(arm.contains("arch: \"arm64\""), "{arm}");
-}
-
-/// Asserts that the configuration gives nfpm each link as a link (its target as `src`), and marks
-/// every entry of the host agent, and no other, as the deb's alone.
-#[test]
-fn the_config_links_the_agent_units_and_keeps_them_to_the_deb() {
-    let t = Tree::new("config-agent");
-    let entries = kbf_plan(&t.inputs()).expect("plan");
-    let text = config(&entries, Platform::LinuxX86_64, "1.2.3+ci");
-    for unit in AGENT_UNITS {
-        let want = format!(
-            "  - dst: \"{WANTS_DIR}/{unit}\"\n    src: \"../{unit}\"\n    type: \"symlink\"\n    \
-             packager: \"deb\"\n    file_info: {{mode: 0777, owner: root, group: root}}\n"
-        );
-        assert!(text.contains(&want), "{want} in {text}");
-        let unit_entry = format!("  - dst: \"{UNIT_DIR}/{unit}\"\n    src: ");
-        let at = text.find(&unit_entry).expect("the unit is an entry");
-        let rest = &text[at + unit_entry.len()..];
-        let next = rest.find("  - dst:").unwrap_or(rest.len());
-        assert!(rest[..next].contains("    packager: \"deb\"\n"), "{text}");
-    }
-    assert_eq!(text.matches("packager: \"deb\"").count(), 5, "{text}");
-    assert_eq!(text.matches("type: \"symlink\"").count(), 2, "{text}");
-}
-
-/// Asserts that the sources whose times `pkg-build` changes are the files the package copies, and
-/// not the targets of its links, which are paths inside the package.
-#[test]
-fn the_sources_of_a_config_are_its_files_and_not_its_links() {
-    let t = Tree::new("sources-links");
-    let entries = kbf_plan(&t.inputs()).expect("plan");
-    let got = sources(&config(&entries, Platform::LinuxX86_64, "1.0.0")).expect("sources");
-    let want: Vec<PathBuf> = entries
-        .iter()
-        .filter(|e| e.sha256.is_some())
-        .map(|e| e.src.clone())
-        .collect();
-    assert_eq!(got, want);
-    assert!(!got.iter().any(|p| p.starts_with("..")), "{got:?}");
 }
 
 /// Asserts that the deb replaces every `kbf-installer` below the bound, which is how a plain
@@ -704,229 +612,6 @@ fn the_trust_directory_is_the_one_the_layout_reads() {
         );
     }
     assert_eq!(names.len(), packaged.len());
-}
-
-/// The environment and arguments of one call of the model.
-type Call = (Vec<(String, String)>, Vec<String>);
-
-/// A model of nfpm: records its calls and writes `<dir>/kbf-installer.<format>` holding
-/// what `bytes` says of the call.
-struct Model {
-    calls: RefCell<Vec<Call>>,
-}
-
-impl Model {
-    fn new() -> Model {
-        Model {
-            calls: RefCell::new(Vec::new()),
-        }
-    }
-
-    /// The nfpm closure; `leave` says what a call leaves in its target directory:
-    /// the file names, with the bytes the source's time and the environment give.
-    fn nfpm<'a>(
-        &'a self,
-        source: &'a Path,
-        leave: impl Fn(&str, &str) -> Vec<(String, String)> + 'a,
-    ) -> impl FnMut(&[(&str, &str)], &[&str]) -> Result<Out, Error> + 'a {
-        move |env, args| {
-            let env: Vec<(String, String)> = env
-                .iter()
-                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
-                .collect();
-            self.calls
-                .borrow_mut()
-                .push((env.clone(), args.iter().map(|a| (*a).to_owned()).collect()));
-            let at = args.iter().position(|a| *a == "-p").expect("-p");
-            let format = args[at + 1];
-            let dir = Path::new(args[args.len() - 1]);
-            let mtime = std::fs::metadata(source)
-                .expect("source")
-                .mtime()
-                .to_string();
-            let epoch = env[0].1.clone();
-            for (name, text) in leave(format, &format!("{epoch}/{mtime}")) {
-                std::fs::write(dir.join(name), text).expect("package");
-            }
-            Ok(Out {
-                ok: true,
-                ..Out::default()
-            })
-        }
-    }
-}
-
-/// A config naming one source file, and the build over it.
-fn built(
-    name: &str,
-    leave: impl Fn(&str, &str) -> Vec<(String, String)>,
-) -> (Result<Vec<String>, Error>, TestDir, Model) {
-    let dir = scratch(name);
-    let source = dir.join("kbf-installer");
-    std::fs::write(&source, "binary").expect("source");
-    let config_path = dir.join("nfpm.yaml");
-    let config = format!(
-        "contents:\n  - dst: \"/x\"\n    src: {}\n",
-        quoted(&source.to_string_lossy())
-    );
-    std::fs::write(&config_path, config).expect("config");
-    let model = Model::new();
-    let out = dir.join("out");
-    let build = Build {
-        config: &config_path,
-        out: &out,
-        epoch: 77,
-    };
-    let result = super::build(&mut model.nfpm(&source, leave), &build);
-    // The caller holds the directory, which the output is in, until it is done.
-    (result, dir, model)
-}
-
-/// Package bytes that depend on the environment's time only.
-fn by_epoch(format: &str, seen: &str) -> Vec<(String, String)> {
-    let epoch = seen.split('/').next().expect("epoch");
-    vec![(
-        format!("kbf-installer.{format}"),
-        format!("{format} at {epoch}"),
-    )]
-}
-
-#[test]
-fn a_package_that_depends_on_the_epoch_alone_is_built_twice_and_the_same() {
-    let (result, dir, model) = built("build-same", by_epoch);
-    let out = dir.join("out");
-    let printed = result.expect("reproducible");
-    assert_eq!(printed.len(), 2);
-    assert!(printed[0].ends_with("kbf-installer.deb"), "{printed:?}");
-    assert!(printed[1].ends_with("kbf-installer.rpm"), "{printed:?}");
-    let calls = model.calls.borrow();
-    assert_eq!(calls.len(), 4, "two formats, two builds each");
-    for (env, args) in calls.iter() {
-        assert_eq!(env, &[("SOURCE_DATE_EPOCH".to_owned(), "77".to_owned())]);
-        assert_eq!(&args[..3], ["package", "-f", args[2].as_str()]);
-    }
-    assert!(out.join("kbf-installer.deb").is_file());
-    assert!(out.join("kbf-installer.rpm").is_file());
-    assert!(
-        !out.join("again").exists(),
-        "the second builds are not left"
-    );
-}
-
-#[test]
-fn a_package_that_carries_the_time_of_its_sources_is_refused() {
-    // The defect `SOURCE_DATE_EPOCH` is for: nfpm taking the sources' own times.
-    let (result, _, _) = built("build-mtime", |format, seen| {
-        let mtime = seen.split('/').nth(1).expect("mtime");
-        vec![(
-            format!("kbf-installer.{format}"),
-            format!("{format} at {mtime}"),
-        )]
-    });
-    let err = result.expect_err("not reproducible").to_string();
-    assert!(
-        err.contains("kbf-installer.deb is not reproducible"),
-        "{err}"
-    );
-}
-
-#[test]
-fn nfpm_failing_or_leaving_the_wrong_files_is_refused() {
-    let (result, _, _) = built("build-none", |_, _| Vec::new());
-    assert!(
-        result
-            .expect_err("none")
-            .to_string()
-            .contains("expected nfpm to leave one .deb")
-    );
-    let (result, _, _) = built("build-two", |format, _| {
-        vec![
-            (format!("a.{format}"), String::new()),
-            (format!("b.{format}"), String::new()),
-        ]
-    });
-    assert!(
-        result
-            .expect_err("two")
-            .to_string()
-            .contains("expected nfpm to leave one .deb")
-    );
-}
-
-#[test]
-fn nfpm_that_fails_is_reported_with_its_message() {
-    let dir = scratch("build-fails");
-    let config = dir.join("nfpm.yaml");
-    std::fs::write(&config, "contents: []\n").expect("config");
-    let mut fails = |_: &[(&str, &str)], _: &[&str]| {
-        Ok(Out {
-            ok: false,
-            stdout: String::new(),
-            stderr: " bad yaml \n".to_owned(),
-        })
-    };
-    let err = build(
-        &mut fails,
-        &Build {
-            config: &config,
-            out: &dir.join("out"),
-            epoch: 1,
-        },
-    )
-    .expect_err("fails");
-    assert_eq!(
-        err,
-        Error::Failed("nfpm package -p deb: bad yaml".to_owned())
-    );
-}
-
-#[test]
-fn a_config_with_a_broken_src_line_or_a_missing_source_is_refused() {
-    let dir = scratch("build-config");
-    let config = dir.join("nfpm.yaml");
-    let mut never = |_: &[(&str, &str)], _: &[&str]| -> Result<Out, Error> { panic!("not run") };
-    let build_with = |text: &str, never: &mut Nfpm| {
-        std::fs::write(&config, text).expect("config");
-        build(
-            never,
-            &Build {
-                config: &config,
-                out: &dir.join("out"),
-                epoch: 1,
-            },
-        )
-        .expect_err("refused")
-        .to_string()
-    };
-    assert!(build_with("    src: not json\n", &mut never).contains("not a src line"));
-    assert!(
-        build_with("    src: \"/nonexistent/x\"\n", &mut never)
-            .contains("set the time of /nonexistent/x")
-    );
-    let missing = dir.join("absent.yaml");
-    let err = build(
-        &mut never,
-        &Build {
-            config: &missing,
-            out: &dir,
-            epoch: 1,
-        },
-    )
-    .expect_err("absent");
-    assert!(err.to_string().contains("absent.yaml"), "{err}");
-}
-
-#[test]
-fn the_nfpm_process_gets_the_given_environment_and_nothing_else() {
-    let mut env = nfpm_process(Path::new("/usr/bin/env"));
-    let out = env(&[("A", "1")], &[]).expect("env");
-    assert!(out.ok);
-    assert_eq!(out.stdout, "A=1\n");
-    let mut no = nfpm_process(Path::new("/nonexistent/nfpm"));
-    let err = no(&[], &[]).expect_err("not a program");
-    assert!(err.to_string().contains("/nonexistent/nfpm"), "{err}");
-    let mut fails = nfpm_process(Path::new("/usr/bin/false"));
-    assert!(!fails(&[], &[]).expect("false").ok);
 }
 
 /// Asserts that the package ships the mode units and the slice of `packaging/linux/units`, and

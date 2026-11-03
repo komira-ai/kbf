@@ -24,7 +24,8 @@ pub const LOOK_EVERY: Duration = Duration::from_secs(5);
 
 /// How an agent that is not enrolled waits.
 pub struct Waiting<'a> {
-    /// Called between two looks; returns when the next look is due, or once `stop` is asked.
+    /// Called between two looks; returns when the next look is due, or at once when `stop` is
+    /// asked.
     pub nap: &'a dyn Fn(&Stop),
     /// Where the one line that says what the agent waits for goes.
     pub log: &'a dyn Fn(&str),
@@ -49,8 +50,9 @@ pub fn not_enrolled(state_dir: &Path) -> String {
     )
 }
 
-/// Waits until `state_dir` holds an enrollment, or `stop` is asked. Says [`not_enrolled`] once,
-/// before the first nap, and nothing when the host is enrolled already.
+/// Waits until `state_dir` holds an enrollment, or `stop` is asked (seen after a nap, which a stop
+/// cuts short). Says [`not_enrolled`] once, before the first nap, and nothing when the host is
+/// enrolled already.
 ///
 /// # Errors
 /// The enrollment cannot be read (the directory is not the agent's, or `node.json` is damaged).
@@ -65,9 +67,9 @@ pub fn wait(state_dir: &Path, stop: &Stop, waiting: &Waiting) -> Result<Waited, 
             (waiting.log)(&not_enrolled(state_dir));
             said = true;
         }
+        (waiting.nap)(stop);
         if stop.stopped() {
             return Ok(Waited::Stopped);
         }
-        (waiting.nap)(stop);
     }
 }

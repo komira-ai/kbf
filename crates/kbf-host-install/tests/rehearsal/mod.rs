@@ -50,6 +50,9 @@ pub const HELPER_UNIT: &str = "kbf-host-local.service";
 pub const KBF_UNIT: &str = "kbf-rehearsal.service";
 /// The `--restart-unit` of the packaged helper unit, replaced by [`KBF_UNIT`].
 pub const PACKAGED_RESTART: &str = "--restart-unit kbf-daemon.service";
+/// The layout of the packaged helper unit (the `kbf` deb's), taken out: the rehearsal's host is
+/// laid out by hand, as a hand-laid host places the unit (`packaging/host-agent/README.md`).
+pub const PACKAGED_LAYOUT: &str = " --layout deb";
 pub const CHANNEL: &str = "stable";
 pub const UPDATER: &str = "kbf-updater";
 /// How many times a unit may restart before it is ready: more means it fails at start, and the
@@ -539,7 +542,10 @@ pub fn lay_out(r: &Rehearsal, kbf_unit: &str) -> PathBuf {
     install_file(kbf_unit, &format!("{UNIT_DIR}/{KBF_UNIT}"), 0o644);
     let packaged = fs::read_to_string(host_agent.join(HELPER_UNIT)).unwrap();
     assert_eq!(packaged.matches(PACKAGED_RESTART).count(), 1, "{packaged}");
-    let helper_unit = packaged.replace(PACKAGED_RESTART, &format!("--restart-unit {KBF_UNIT}"));
+    assert_eq!(packaged.matches(PACKAGED_LAYOUT).count(), 1, "{packaged}");
+    let helper_unit = packaged
+        .replace(PACKAGED_RESTART, &format!("--restart-unit {KBF_UNIT}"))
+        .replace(PACKAGED_LAYOUT, "");
     install_file(&helper_unit, &format!("{UNIT_DIR}/{HELPER_UNIT}"), 0o644);
     systemctl("daemon_reload", &["daemon-reload"]);
     host_agent

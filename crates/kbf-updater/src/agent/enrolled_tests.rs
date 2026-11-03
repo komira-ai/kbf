@@ -283,7 +283,8 @@ fn a_damaged_enrollment_or_placed_files_are_never_waited_for() {
 }
 
 /// The wait alone: an agent asked to stop before its first look still looks once (an enrolled
-/// host is never kept waiting by a stop), says the line once, and ends without a nap.
+/// host is never kept waiting by a stop), says the line once, and ends after one nap, which a stop
+/// cuts short.
 #[test]
 fn a_stop_before_the_first_look_ends_the_wait_after_one_look() {
     let dir = TestDir::under(std::env::temp_dir(), "enrolled-stopped");
@@ -292,7 +293,10 @@ fn a_stop_before_the_first_look_ends_the_wait_after_one_look() {
     stop.stop();
     let lines = Mutex::new(Vec::new());
     let log = |line: &str| lines.lock().unwrap().push(line.to_owned());
-    let nap = |_: &Stop| panic!("no nap after a stop");
+    let naps = AtomicUsize::new(0);
+    let nap = |_: &Stop| {
+        naps.fetch_add(1, Ordering::SeqCst);
+    };
     let waited = wait(
         &state,
         &stop,
@@ -303,6 +307,8 @@ fn a_stop_before_the_first_look_ends_the_wait_after_one_look() {
     );
     assert_eq!(waited, Ok(Waited::Stopped));
     assert_eq!(*lines.lock().unwrap(), [said(&state)]);
+    assert_eq!(naps.load(Ordering::SeqCst), 1);
+    let nap = |_: &Stop| panic!("an enrolled host never naps");
 
     let pki = Pki::new();
     let state = enrolled_in(&dir, &pki, HostRole::DAEMON);
@@ -316,4 +322,25 @@ fn a_stop_before_the_first_look_ends_the_wait_after_one_look() {
         },
     );
     assert_eq!(waited, Ok(Waited::Enrolled));
+}
+
+/// The process's own wait (`run_config`, as `kbf-updater agent` runs it): an agent that is not
+/// enrolled and is stopped as it starts says its line on the error stream, naps until the stop
+/// (which cuts the nap short), and ends with exit 0, having called nothing.
+///
+/// Catches: a production nap that ignores the stop, so that stopping a waiting agent hangs.
+#[test]
+fn the_process_stops_while_it_waits_for_its_enrollment() {
+    let dir = TestDir::under(std::env::temp_dir(), "enrolled-process");
+    let coordinator = Watched::new();
+    let cfg = config(&flags(
+        coordinator.port(),
+        1,
+        &dir.join("state"),
+        &dir.join("no-helper.sock"),
+        &[],
+    ));
+    let (code, text) = super::run_config(&cfg, |stop| stop.stop());
+    assert_eq!((code, text.as_str()), (0, ""));
+    assert!(!coordinator.dialled(), "the coordinator was dialled");
 }
