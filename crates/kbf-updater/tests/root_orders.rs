@@ -423,3 +423,35 @@ fn a_carried_declaration_that_would_strand_the_previous_hook_is_refused_even_app
         assert_eq!(world.steps("svc"), steps);
     }
 }
+
+/// Catches a kept declaration overwritten: with one still kept for an update that has not ended
+/// (here left beside a record that is finished), an order whose release carries another is
+/// refused before anything is written, and the kept one and the active one stay.
+#[test]
+fn a_declaration_is_not_installed_over_one_still_kept() {
+    let world = World::new("kept-already");
+    let active = world.tierstore_shaped();
+    world.declare("svc", &active);
+    world.stage("svc", "1.0.0", None);
+    assert_eq!(
+        verdict(&world.root_part().update("svc", "1.0.0")),
+        SUCCEEDED
+    );
+    let kept = world.path("state/svc/declaration.previous");
+    put(&kept, b"kept for an update that has not ended", 0o600);
+    world.stage(
+        "svc",
+        "2.0.0",
+        Some(&active.replace("prepare = 600", "prepare = 500")),
+    );
+    let answer = world.root_part().update("svc", "2.0.0");
+    assert_eq!(answer.token(), Some("declaration_refused"), "{answer:?}");
+    assert_eq!(
+        fs::read(&kept).unwrap(),
+        b"kept for an update that has not ended"
+    );
+    assert_eq!(
+        fs::read_to_string(world.path("updater.d/svc.toml")).unwrap(),
+        active
+    );
+}

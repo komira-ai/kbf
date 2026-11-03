@@ -6,7 +6,6 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io;
 use std::path::Path;
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, PoisonError};
 
 use kbf_step_runner::record::{Record, RecordStore, State};
@@ -199,16 +198,14 @@ impl RootPart {
 
     /// Resumes the post-success watcher of `unit`'s update on a thread of its own: it takes the
     /// service's lock once the start pass lets it go, and runs until the promotion clears, its
-    /// ceiling, or a new order asks it to yield. One left waiting when the root part stops runs
-    /// nothing.
+    /// ceiling, or a new order (or the root part's stop) asks it to yield.
     fn watch_in_background(&self, unit: &Arc<Service>, order: Box<UpdateOrder>) {
         let unit = Arc::clone(unit);
-        let stop = Arc::clone(&self.stop);
+        // One that gets the lock after the root part was asked to stop runs no more than a poll:
+        // the request to yield (`stop_watchers`) waits for it.
         let watcher = std::thread::spawn(move || {
             let _busy = unit.busy.lock().unwrap_or_else(PoisonError::into_inner);
-            if !stop.load(Ordering::Acquire) {
-                let _ = unit.runner.run(&order);
-            }
+            let _ = unit.runner.run(&order);
         });
         let mut watchers = self.watchers.lock().unwrap_or_else(PoisonError::into_inner);
         watchers.push(watcher);

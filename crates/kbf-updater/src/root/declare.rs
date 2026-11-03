@@ -52,8 +52,6 @@ pub enum DeclareError {
     WrongName { found: String, service: String },
     #[error("the approvals: {0}")]
     Approvals(#[source] ApprovalError),
-    #[error("the active declaration {} changed since it was loaded", .path.display())]
-    ActiveChanged { path: PathBuf },
     #[error(
         "a declaration of {service} is kept for an update that has not ended; it is not replaced"
     )]
@@ -118,13 +116,13 @@ impl Place<'_> {
 /// `generation` is that of the step record now (`None` with no record), kept with the active
 /// declaration.
 ///
-/// The active declaration's file is read again and must still be the one loaded: the comparison
-/// is with the bytes the install replaces.
+/// The active declaration's file is read again: the gate and the recovery rule compare with the
+/// bytes the install replaces, not with what was loaded before.
 ///
 /// # Errors
-/// A declaration that is not one, an approval file that cannot be trusted, an active file that
-/// changed since it was loaded, a declaration already kept for an update that has not ended, or a
-/// write that failed.
+/// A declaration that is not one (the carried one or the active file), an approval file that
+/// cannot be trusted, a change that would strand the previous release's hook, a declaration
+/// already kept for an update that has not ended, or a write that failed.
 pub fn decide(
     place: &Place<'_>,
     active: Option<&Declared>,
@@ -144,8 +142,13 @@ pub fn decide(
             service: service.to_owned(),
         });
     }
-    if let Some(declared) = active {
-        let fields = recovery_unsafe(declared.declaration(), &incoming);
+    // The active declaration as its file is now: what the install replaces, and what the gate
+    // and the recovery rule compare with.
+    let current = active
+        .map(|declared| read_declaration(declared.file()))
+        .transpose()?;
+    if let Some((_, declaration)) = &current {
+        let fields = recovery_unsafe(declaration, &incoming);
         if !fields.is_empty() {
             return Err(DeclareError::RecoveryUnsafe { fields });
         }
@@ -153,7 +156,7 @@ pub fn decide(
     let approvals =
         Approvals::read(place.approvals, place.trusted_uid).map_err(DeclareError::Approvals)?;
     let verdict = gate(
-        active.map(Declared::declaration),
+        current.as_ref().map(|(_, declaration)| declaration),
         &incoming,
         &digest,
         &approvals,
@@ -166,19 +169,7 @@ pub fn decide(
             service: service.to_owned(),
         });
     }
-    let kept = match active {
-        Some(declared) => {
-            let file = declared.file();
-            let now = fs::read(file).map_err(io_at(file))?;
-            if &Digest::of(&now) != declared.digest() {
-                return Err(DeclareError::ActiveChanged {
-                    path: file.to_path_buf(),
-                });
-            }
-            (PREVIOUS, now)
-        }
-        None => (FIRST, Vec::new()),
-    };
+    let kept = current.map_or((FIRST, Vec::new()), |(bytes, _)| (PREVIOUS, bytes));
     let began = generation.map_or_else(|| "none".to_owned(), |n| n.to_string());
     write_file(place.state, BEGAN, began.as_bytes(), 0o600)?;
     write_file(place.state, kept.0, &kept.1, 0o600)?;
@@ -233,6 +224,14 @@ pub fn recovery_unsafe(active: &Declaration, incoming: &Declaration) -> Vec<&'st
     .into_iter()
     .filter_map(|(field, unsafe_change)| unsafe_change.then_some(field))
     .collect()
+}
+
+/// The declaration file at `path` as it is now: its bytes, and what they declare.
+fn read_declaration(path: &Path) -> Result<(Vec<u8>, Declaration), DeclareError> {
+    let bytes = fs::read(path).map_err(io_at(path))?;
+    let text = std::str::from_utf8(&bytes).map_err(|_| DeclareError::NotUtf8)?;
+    let declaration = Declaration::parse(text).map_err(DeclareError::Invalid)?;
+    Ok((bytes, declaration))
 }
 
 /// Whether a declaration is kept for an update that has not ended.

@@ -482,3 +482,44 @@ fn a_refused_declaration_installed_for_an_update_that_never_began_goes_back_at_t
     );
     assert!(!world.path("state/svc/declaration.began").exists());
 }
+
+/// Catches a start pass held by a post-success watcher: the update to 2.0.0 is in its watcher
+/// (the promotion pending) when the root part stops; the next start answers at once with the
+/// update committed, its promotion pending, makes 2.0.0 `current`, and leaves the watcher to a
+/// thread of its own, which the root part asks to yield and waits for when it is dropped.
+#[test]
+fn a_watcher_found_at_the_start_watches_beside_it_and_holds_nothing() {
+    let world = World::new("start-watching");
+    world.declare("svc", &world.tierstore_shaped());
+    world.stage("svc", "1.0.0", None);
+    world.stage("svc", "2.0.0", None);
+    assert_eq!(
+        verdict(&world.root_part().update("svc", "1.0.0")),
+        SUCCEEDED
+    );
+    world.tell("svc", "verify", "0 {\"promotion_pending\":true}");
+    let record = world.path("state/svc/step-record.json");
+    let gate = move |point: CrashPoint| {
+        let watching = fs::read(&record)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .is_some_and(|rec| rec["progress"]["watching"].is_object());
+        matches!(point, CrashPoint::AfterWrite(_)) && watching
+    };
+    let killed = world.root_part_gated(Arc::new(gate)).update("svc", "2.0.0");
+    assert_eq!(killed.token(), Some("runner"), "{killed:?}");
+    let root = world.root_part();
+    let started = root.start("svc");
+    assert_eq!(
+        started.verdict,
+        Some(Verdict::Succeeded {
+            promotion_pending: true
+        }),
+        "{started:?}"
+    );
+    assert_eq!(
+        fs::read_link(world.path("releases/svc/current")).unwrap(),
+        std::path::Path::new("2.0.0")
+    );
+    drop(root);
+}
