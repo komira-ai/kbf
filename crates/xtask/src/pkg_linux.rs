@@ -7,10 +7,13 @@
 //!   [`KBF_PATH`], the mode units ([`KBF_UNITS`]) and `kbf.slice`, the users and directories
 //!   they run with (sysusers and tmpfiles), the needrestart drop-in, and the trust directory
 //!   ([`TRUST_DIR`]) the pinned `gh` and the Sigstore trusted root verify attestations from.
-//!   It refuses a trust file other than the three and a unit directory that lacks one of the
-//!   units. Everything else in the unit directory (the retired installer's and proxy's units)
-//!   is not packaged;
-//! - [`config`] renders a list as the nfpm configuration, with the dependencies as
+//!   In the deb only, it adds the host agent ([`AGENT_UNITS`], the helper's and the agent's
+//!   units, and the agent's account, [`AGENT_SYSUSERS_PATH`]) and the links in [`WANTS_DIR`]
+//!   that enable both units. It refuses a trust file other than the three and a unit or host
+//!   agent directory that lacks one of its files. Everything else in the unit directory (the
+//!   retired installer's and proxy's units) and in the host agent's is not packaged;
+//! - [`config`] renders a list as the nfpm configuration (an entry of the deb only says so to
+//!   nfpm, `packager: deb`), with the dependencies as
 //!   constants here (never Podman, never Envoy), no maintainer script, every file
 //!   `root:root`, and no time (nfpm takes it from `SOURCE_DATE_EPOCH`). The package `Depends` on
 //!   nothing: a host that updates it with a plain `dpkg --install` (no apt, no resolution) must be
@@ -62,6 +65,24 @@ pub const INSTALLER_RETIRED_FROM: &str = "0.1.1";
 pub const KBF_DEB_REPLACES: [&str; 1] = ["kbf-installer (<< 0.1.1)"];
 /// Where the unit files go.
 pub const UNIT_DIR: &str = "/usr/lib/systemd/system";
+/// The units of the host's update agent (`packaging/host-agent/linux`) that the deb ships and
+/// enables: the helper's local socket, as root, which installs the attested package
+/// (`--layout deb`), and the agent, as `kbf-updater`, which heartbeats to the coordinator. Not in
+/// the rpm, whose helper would install with `--layout rpm`. The programs they run are in no
+/// package: they sit at fixed paths no release writes.
+pub const AGENT_UNITS: [&str; 2] = ["kbf-host-local.service", "kbf-updater-agent.service"];
+/// The sysusers.d file of the agent's account (`kbf-updater`, and the group `updater-register`),
+/// as the host agent directory names it.
+pub const AGENT_SYSUSERS: &str = "kbf-updater.conf";
+/// Where the deb puts it.
+pub const AGENT_SYSUSERS_PATH: &str = "/usr/lib/sysusers.d/kbf-updater.conf";
+/// Where the deb's links that enable [`AGENT_UNITS`] go: the target's `.wants` directory beside
+/// the units, which systemd reads at every boot and which a package may own (a maintainer script,
+/// which the package has none of, would write `/etc` instead). Each link is
+/// `<WANTS_DIR>/<unit> -> ../<unit>`. An operator turns one off with `systemctl mask`.
+pub const WANTS_DIR: &str = "/usr/lib/systemd/system/multi-user.target.wants";
+/// The mode a symbolic link has.
+pub const LINK_MODE: u32 = 0o777;
 /// The one packaged unit that is not a `kbf-*.service` or `kbf-*.socket`: the slice
 /// the units run in.
 pub const SLICE: &str = "kbf.slice";
@@ -162,17 +183,38 @@ pub const SOURCE_DATE_EPOCH: u64 = 1_790_000_000;
 /// The host name an rpm records as its build host; without it, the builder's.
 const BUILD_HOST: &str = "kbf-build";
 
-/// One thing the package installs.
+/// One thing the package installs: a file, a directory or a symbolic link.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
     /// Where it goes.
     pub dst: String,
     /// Its mode.
     pub mode: u32,
-    /// Its bytes' digest; `None` for a directory.
+    /// Its bytes' digest; `None` for a directory or a link.
     pub sha256: Option<Sha256>,
-    /// Where its bytes are (empty for a directory, and in a parsed [`listing`]).
+    /// Where its bytes are (empty for a directory or a link, and in a parsed [`listing`]).
     pub src: PathBuf,
+    /// What a symbolic link points to; `None` for a file or a directory.
+    pub link: Option<String>,
+    /// Whether only the deb holds it (the host agent: [`AGENT_UNITS`]).
+    pub deb_only: bool,
+}
+
+impl Entry {
+    /// The entry for the deb only.
+    #[must_use]
+    pub fn in_the_deb_only(self) -> Entry {
+        Entry {
+            deb_only: true,
+            ..self
+        }
+    }
+
+    /// Whether the package of `format` (`deb` or `rpm`) holds it.
+    #[must_use]
+    pub fn in_format(&self, format: &str) -> bool {
+        !self.deb_only || format == "deb"
+    }
 }
 
 /// What `pkg-config` is given.
@@ -190,6 +232,9 @@ pub struct Inputs<'a> {
     pub tmpfiles: &'a Path,
     /// The needrestart drop-in.
     pub needrestart: &'a Path,
+    /// The directory of the host agent's Linux files (`packaging/host-agent/linux`): the deb
+    /// takes [`AGENT_UNITS`] and [`AGENT_SYSUSERS`] from it, and no other.
+    pub host_agent: &'a Path,
     /// The platform the binary was built for.
     pub platform: Platform,
     /// The package version.
@@ -229,6 +274,8 @@ fn file(dst: String, mode: u32, src: &Path, problems: &mut Vec<String>) -> Entry
         mode,
         sha256,
         src: src.to_owned(),
+        link: None,
+        deb_only: false,
     }
 }
 
@@ -239,6 +286,20 @@ fn dir(dst: &str) -> Entry {
         mode: 0o755,
         sha256: None,
         src: PathBuf::new(),
+        link: None,
+        deb_only: false,
+    }
+}
+
+/// The link at `dst` to `target`.
+fn link(dst: String, target: String) -> Entry {
+    Entry {
+        dst,
+        mode: LINK_MODE,
+        sha256: None,
+        src: PathBuf::new(),
+        link: Some(target),
+        deb_only: false,
     }
 }
 
@@ -285,7 +346,8 @@ fn input_problems(i: &Inputs) -> Vec<String> {
 
 /// Everything the `kbf` package installs, sorted by path: the `kbf` binary, the units of the
 /// modes ([`KBF_UNITS`]) and the slice, which the unit directory must hold, the sysusers,
-/// tmpfiles and needrestart files, and the trust directory with its three files.
+/// tmpfiles and needrestart files, and the trust directory with its three files; and, in the deb
+/// only, the host agent's units and account ([`agent_plan`]).
 ///
 /// # Errors
 /// [`Error::Refused`] with every problem with the inputs.
@@ -337,11 +399,42 @@ pub fn kbf_plan(i: &Inputs) -> Result<Vec<Entry>, Error> {
             "{name}: the package ships no trust file of that name"
         ));
     }
+    entries.extend(agent_plan(i.host_agent, &mut problems));
     if !problems.is_empty() {
         return Err(Error::Refused(problems));
     }
     entries.sort_by(|a, b| a.dst.cmp(&b.dst));
     Ok(entries)
+}
+
+/// The host agent in the deb, from the directory `host_agent`: [`AGENT_UNITS`] in [`UNIT_DIR`],
+/// a link to each in [`WANTS_DIR`], which enables it, and the agent's account
+/// ([`AGENT_SYSUSERS_PATH`]). The directory holds other files (a frontend's unit, the root part,
+/// the hook's declaration), which the package does not take; what it lacks of these three is added
+/// to `problems`.
+fn agent_plan(host_agent: &Path, problems: &mut Vec<String>) -> Vec<Entry> {
+    if !host_agent.is_dir() {
+        problems.push(format!(
+            "{} cannot be read as a directory",
+            host_agent.display()
+        ));
+        return Vec::new();
+    }
+    let mut found = |name: &str, dst: String| -> Option<Entry> {
+        let src = host_agent.join(name);
+        if !src.is_file() {
+            problems.push(format!("host agent file {name} is missing"));
+            return None;
+        }
+        Some(file(dst, 0o644, &src, problems))
+    };
+    let mut entries = Vec::new();
+    for unit in AGENT_UNITS {
+        entries.extend(found(unit, format!("{UNIT_DIR}/{unit}")));
+        entries.push(link(format!("{WANTS_DIR}/{unit}"), format!("../{unit}")));
+    }
+    entries.extend(found(AGENT_SYSUSERS, AGENT_SYSUSERS_PATH.to_owned()));
+    entries.into_iter().map(Entry::in_the_deb_only).collect()
 }
 
 /// Everything the retired installer's package installed, sorted by path: the one list the
@@ -463,14 +556,23 @@ pub fn config(entries: &[Entry], platform: Platform, version: &str) -> String {
     );
     for e in entries {
         out.push_str(&format!("  - dst: {}\n", quoted(&e.dst)));
-        if e.sha256.is_some() {
-            out.push_str(&format!("    src: {}\n", quoted(&e.src.to_string_lossy())));
-        } else {
-            out.push_str("    type: \"dir\"\n");
+        match (&e.link, e.sha256) {
+            // nfpm takes a link's target as its `src`.
+            (Some(target), _) => {
+                out.push_str(&format!("    src: {}\n", quoted(target)));
+                out.push_str("    type: \"symlink\"\n");
+            }
+            (None, Some(_)) => {
+                out.push_str(&format!("    src: {}\n", quoted(&e.src.to_string_lossy())));
+            }
+            (None, None) => out.push_str("    type: \"dir\"\n"),
         }
         // Under /etc a file is configuration: an upgrade keeps the host's edits.
         if e.dst.starts_with("/etc/") {
             out.push_str("    type: \"config|noreplace\"\n");
+        }
+        if e.deb_only {
+            out.push_str("    packager: \"deb\"\n");
         }
         out.push_str(&format!(
             "    file_info: {{mode: 0{:o}, owner: root, group: root}}\n",
@@ -480,14 +582,19 @@ pub fn config(entries: &[Entry], platform: Platform, version: &str) -> String {
     out
 }
 
-/// `entries` as the lines of the file the install test reads: `file|dir`, mode, path,
-/// SHA-256 (`-` for a directory), separated by spaces.
+/// `entries` as the lines of the file the install test reads: `file|dir|link`, mode, path, and
+/// the SHA-256 of a file, `-` for a directory or the target of a link, separated by spaces; a
+/// fifth word `deb` for an entry of the deb only.
 pub fn listing(entries: &[Entry]) -> String {
     entries
         .iter()
-        .map(|e| match e.sha256 {
-            Some(sha) => format!("file {:04o} {} {sha}\n", e.mode, e.dst),
-            None => format!("dir {:04o} {} -\n", e.mode, e.dst),
+        .map(|e| {
+            let deb = if e.deb_only { " deb" } else { "" };
+            match (&e.link, e.sha256) {
+                (Some(target), _) => format!("link {:04o} {} {target}{deb}\n", e.mode, e.dst),
+                (None, Some(sha)) => format!("file {:04o} {} {sha}{deb}\n", e.mode, e.dst),
+                (None, None) => format!("dir {:04o} {} -{deb}\n", e.mode, e.dst),
+            }
         })
         .collect()
 }
@@ -501,22 +608,99 @@ pub fn parse_listing(text: &str) -> Result<Vec<Entry>, Error> {
         .map(|line| {
             let bad = || Error::Failed(format!("not a listing line: {line:?}"));
             let f: Vec<&str> = line.split(' ').collect();
-            let &[kind, mode, dst, sha] = f.as_slice() else {
-                return Err(bad());
+            let (kind, mode, dst, what, deb_only) = match *f.as_slice() {
+                [kind, mode, dst, what] => (kind, mode, dst, what, false),
+                [kind, mode, dst, what, "deb"] => (kind, mode, dst, what, true),
+                _ => return Err(bad()),
             };
-            let sha256 = match (kind, sha) {
-                ("dir", "-") => None,
-                ("file", hex) => Some(hex.parse::<Sha256>().map_err(|_| bad())?),
+            let mode = u32::from_str_radix(mode, 8).map_err(|_| bad())?;
+            let (sha256, link) = match (kind, what) {
+                ("dir", "-") => (None, None),
+                ("file", hex) => (Some(hex.parse::<Sha256>().map_err(|_| bad())?), None),
+                ("link", target) if mode == LINK_MODE && !matches!(target, "" | "-") => {
+                    (None, Some(target.to_owned()))
+                }
                 _ => return Err(bad()),
             };
             Ok(Entry {
                 dst: dst.to_owned(),
-                mode: u32::from_str_radix(mode, 8).map_err(|_| bad())?,
+                mode,
                 sha256,
                 src: PathBuf::new(),
+                link,
+                deb_only,
             })
         })
         .collect()
+}
+
+/// The flags of `pkg-config`.
+#[derive(clap::Args)]
+pub struct ConfigFlags {
+    /// The kbf binary the kbf packages carry at `/usr/bin/kbf` (mode 0755).
+    #[arg(long)]
+    pub kbf: PathBuf,
+    /// The directory of unit files: the kbf packages take the units of the modes and
+    /// `kbf.slice` from it.
+    #[arg(long)]
+    pub units: PathBuf,
+    /// The directory of the three trust files.
+    #[arg(long)]
+    pub trust: PathBuf,
+    /// The sysusers.d file.
+    #[arg(long)]
+    pub sysusers: PathBuf,
+    /// The tmpfiles.d file.
+    #[arg(long)]
+    pub tmpfiles: PathBuf,
+    /// The needrestart drop-in.
+    #[arg(long)]
+    pub needrestart: PathBuf,
+    /// The directory of the host agent's Linux files (`packaging/host-agent/linux`): the deb
+    /// takes the helper's and the agent's units and the agent's sysusers.d file from it.
+    #[arg(long)]
+    pub host_agent: PathBuf,
+    /// The platform the binary was built for (`linux-x86_64`, `linux-arm64`).
+    #[arg(long, value_enum)]
+    pub platform: Platform,
+    /// The package version.
+    /// (One of the two is required; the verb says so, exit 2, as clap does for a bad flag.)
+    #[arg(long, conflicts_with = "version_of")]
+    pub version: Option<String>,
+    /// Take the version from this binary's `--version` (`<version>+<12 of the commit>`).
+    #[arg(long)]
+    pub version_of: Option<PathBuf>,
+    /// The directory `nfpm.yaml` and `listing.txt` go in; created when missing.
+    #[arg(long)]
+    pub out: PathBuf,
+}
+
+/// The `pkg-config` verb from its flags: the version (given, or the binary's), then
+/// [`write_config`].
+///
+/// # Errors
+/// Neither version flag (a usage error), a binary whose version cannot be read, or as
+/// [`write_config`].
+pub fn config_verb(f: &ConfigFlags) -> Result<Vec<String>, Error> {
+    let version = match (&f.version, &f.version_of) {
+        (Some(version), _) => version.clone(),
+        (None, Some(of)) => crate::pkg_asset::binary_version(of)?,
+        (None, None) => return Err(Error::Usage("--version or --version-of".to_owned())),
+    };
+    write_config(
+        &Inputs {
+            kbf: &f.kbf,
+            units: &f.units,
+            trust: &f.trust,
+            sysusers: &f.sysusers,
+            tmpfiles: &f.tmpfiles,
+            needrestart: &f.needrestart,
+            host_agent: &f.host_agent,
+            platform: f.platform,
+            version: &version,
+        },
+        &f.out,
+    )
 }
 
 /// The `pkg-config` verb: writes `<out>/nfpm.yaml` and `<out>/listing.txt` for the `kbf`
@@ -613,11 +797,15 @@ fn once(nfpm: &mut Nfpm, b: &Build, format: &str, dir: &Path) -> Result<PathBuf,
     }
 }
 
-/// The source files a [`config`] names.
+/// The source files a [`config`] names (not the targets of its links, which are paths in the
+/// package).
 fn sources(config: &str) -> Result<Vec<PathBuf>, Error> {
-    config
-        .lines()
-        .filter_map(|l| l.strip_prefix("    src: "))
+    let lines: Vec<&str> = config.lines().collect();
+    lines
+        .iter()
+        .enumerate()
+        .filter(|(at, _)| lines.get(at + 1) != Some(&"    type: \"symlink\""))
+        .filter_map(|(_, l)| l.strip_prefix("    src: "))
         .map(|v| {
             serde_json::from_str::<String>(v)
                 .map(PathBuf::from)
@@ -670,5 +858,9 @@ pub fn build(nfpm: &mut Nfpm, b: &Build) -> Result<Vec<String>, Error> {
     Ok(printed)
 }
 
+#[cfg(test)]
+mod agent_tests;
+#[cfg(test)]
+mod build_tests;
 #[cfg(test)]
 mod tests;

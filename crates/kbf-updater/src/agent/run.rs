@@ -56,13 +56,13 @@ impl Stop {
         self.0.store(true, Ordering::SeqCst);
     }
 
-    fn stopped(&self) -> bool {
+    pub(crate) fn stopped(&self) -> bool {
         self.0.load(Ordering::SeqCst)
     }
 }
 
 /// Sleeps for `total`, or until `stop`.
-fn sleep(total: Duration, stop: &Stop) {
+pub(super) fn sleep(total: Duration, stop: &Stop) {
     let mut slept = Duration::ZERO;
     while slept < total && !stop.stopped() {
         let step = SLICE.min(total - slept);

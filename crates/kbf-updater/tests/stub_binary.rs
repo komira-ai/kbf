@@ -74,3 +74,54 @@ fn a_bad_start_exits_nonzero_with_the_reason_on_stderr() {
         "{err}"
     );
 }
+
+/// The binary as the packaged unit starts it on a host not enrolled yet: `kbf-updater agent` with
+/// an empty state directory writes exactly one line on stderr, the prefixed "not enrolled" line
+/// that names the directory, nothing on stdout, and is still running, waiting, once that line is
+/// out (it is stopped by the test then: the binary has no stop of its own but its unit's).
+///
+/// Catches: a binary that says something else on the error stream (the operator's journal), or
+/// that exits once it found no enrollment, which its unit would restart in a loop.
+#[test]
+fn the_agent_binary_says_once_that_it_is_not_enrolled_and_keeps_waiting() {
+    use std::io::{BufRead as _, Read as _};
+    use std::process::Stdio;
+
+    let dir = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "kbf-updater-binary-waits");
+    let state = dir.join("state");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_kbf-updater"))
+        .args(["agent", "--coordinator", "coordinator.farm.example:8443"])
+        .args(["--enroll-frontend", "frontend.farm.example:8444"])
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["--channel", "stable"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run kbf-updater");
+    let mut stderr = std::io::BufReader::new(child.stderr.take().expect("stderr"));
+    let mut line = String::new();
+    stderr.read_line(&mut line).expect("the first line");
+    // The line is out, so the wait has begun: the agent is still running.
+    assert_eq!(child.try_wait().expect("status"), None, "{line}");
+    child.kill().expect("stopped");
+    child.wait().expect("reaped");
+    let mut rest = String::new();
+    stderr.read_to_string(&mut rest).expect("the rest");
+    let mut out = String::new();
+    child
+        .stdout
+        .take()
+        .expect("stdout")
+        .read_to_string(&mut out)
+        .expect("stdout");
+    assert_eq!(
+        line,
+        format!(
+            "kbf-updater: not enrolled: {0} holds no enrollment yet; waiting for `kbf-updater \
+             enroll --state-dir {0}`, and starting once it has run\n",
+            state.display()
+        )
+    );
+    assert_eq!((rest.as_str(), out.as_str()), ("", ""));
+}

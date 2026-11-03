@@ -41,6 +41,16 @@ fn copy_inputs(dir: &Path) {
         std::fs::copy(packaging.join(file), dir.join(file.replace('/', "-"))).expect("copy");
     }
     std::fs::copy(STUB, dir.join("kbf")).expect("stub");
+    // The host agent's files the deb takes, from the repository's own directory.
+    let agent = packaging.join("../host-agent/linux");
+    std::fs::create_dir_all(dir.join("host-agent")).expect("dir");
+    for file in [
+        "kbf-host-local.service",
+        "kbf-updater-agent.service",
+        "kbf-updater.conf",
+    ] {
+        std::fs::copy(agent.join(file), dir.join("host-agent").join(file)).expect("copy");
+    }
 }
 
 fn s(p: &Path) -> &str {
@@ -73,6 +83,8 @@ fn config_args(dir: &Path, out: &Path) -> Vec<String> {
         &at("tmpfiles.d-kbf-installer.conf"),
         "--needrestart",
         &at("needrestart-kbf.conf"),
+        "--host-agent",
+        &at("host-agent"),
         "--platform",
         "linux-x86_64",
         "--out",
@@ -112,7 +124,8 @@ fn the_stub_prints_its_arguments_and_exits_zero() {
 /// the output directory: the binary, the five mode units, the slice, the sysusers and tmpfiles
 /// files, the needrestart drop-in and the three trust files, the recommendations of the deb
 /// and the rpm (no dependency), the replacement of `kbf-installer` in the deb only (no break), and none of the
-/// retired installer's files.
+/// retired installer's files; and, marked as the deb's alone, the host agent's two units, the
+/// agent's account and the links that enable both units.
 #[test]
 fn pkg_config_writes_the_kbf_package() {
     let dir = scratch("config");
@@ -156,7 +169,65 @@ fn pkg_config_writes_the_kbf_package() {
     }
     assert!(!listing.contains("kbf-installer"), "{listing}");
     assert!(!listing.contains("kbf-node.service"), "{listing}");
-    assert_eq!(listing.lines().count(), 15, "{listing}");
+    for line in [
+        "link 0777 /usr/lib/systemd/system/multi-user.target.wants/kbf-host-local.service ../kbf-host-local.service deb",
+        "link 0777 /usr/lib/systemd/system/multi-user.target.wants/kbf-updater-agent.service ../kbf-updater-agent.service deb",
+    ] {
+        assert!(listing.lines().any(|l| l == line), "{line} in {listing}");
+    }
+    for path in [
+        "/usr/lib/systemd/system/kbf-host-local.service",
+        "/usr/lib/systemd/system/kbf-updater-agent.service",
+        "/usr/lib/sysusers.d/kbf-updater.conf",
+    ] {
+        let line = listing
+            .lines()
+            .find(|l| l.split(' ').nth(2) == Some(path))
+            .unwrap_or_else(|| panic!("{path} in {listing}"));
+        assert!(
+            line.starts_with("file 0644 ") && line.ends_with(" deb"),
+            "{line}"
+        );
+    }
+    assert_eq!(listing.lines().filter(|l| l.ends_with(" deb")).count(), 5);
+    assert_eq!(listing.lines().count(), 20, "{listing}");
+}
+
+/// Asserts that `pkg-config` without `--host-agent` is a usage error that names it and writes
+/// nothing, and that a host agent directory without the agent's unit is refused naming the file.
+#[test]
+fn pkg_config_requires_the_host_agent_directory_and_its_units() {
+    let dir = scratch("config-no-agent");
+    copy_inputs(&dir);
+    let mut args = config_args(&dir, &dir.join("out"));
+    args.extend(["--version".to_owned(), "0.0.0+ci".to_owned()]);
+    let at = args
+        .iter()
+        .position(|a| a == "--host-agent")
+        .expect("--host-agent");
+    let without: Vec<String> = args
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != at && *i != at + 1)
+        .map(|(_, a)| a.clone())
+        .collect();
+    let out = xtask_with(&without);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("--host-agent"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert!(!dir.join("out").exists());
+    std::fs::remove_file(dir.join("host-agent/kbf-updater-agent.service")).expect("rm");
+    let out = xtask_with(&args);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("host agent file kbf-updater-agent.service is missing"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert!(!dir.join("out").exists());
 }
 
 /// Asserts that `pkg-config` without `--kbf` is a usage error and writes nothing, and that
@@ -418,6 +489,11 @@ fn pkg_install_test_names_a_directory_without_the_package_of_its_format() {
 }
 
 fn tgz(files: &[(&str, u32, &[u8])]) -> Vec<u8> {
+    tgz_with(files, &[])
+}
+
+/// [`tgz`] with the symbolic links `links` (path, target) after the files.
+fn tgz_with(files: &[(&str, u32, &[u8])], links: &[(&str, &str)]) -> Vec<u8> {
     let gzip = flate2::GzBuilder::new().write(Vec::new(), flate2::Compression::fast());
     let mut tar = tar::Builder::new(gzip);
     for (path, mode, bytes) in files {
@@ -428,6 +504,16 @@ fn tgz(files: &[(&str, u32, &[u8])]) -> Vec<u8> {
         h.set_mode(*mode);
         h.set_cksum();
         tar.append(&h, *bytes).expect("append");
+    }
+    for (path, target) in links {
+        let mut h = tar::Header::new_ustar();
+        h.set_path(format!("./{path}")).expect("path");
+        h.set_entry_type(tar::EntryType::Symlink);
+        h.set_link_name(target).expect("target");
+        h.set_size(0);
+        h.set_mode(0o777);
+        h.set_cksum();
+        tar.append(&h, &[][..]).expect("append");
     }
     tar.into_inner().expect("tar").finish().expect("gzip")
 }
@@ -440,7 +526,8 @@ const KBF_CONTROL: &[u8] = b"Package: kbf\nVersion: 0.1.0\nArchitecture: amd64\n
                              Replaces: kbf-installer (<< 0.1.1)\n";
 
 /// A deb as nfpm writes the `kbf` package, holding `kbf`, the unit of every mode, the slice, the
-/// sysusers, tmpfiles and needrestart files, and `gh` and the trust files for `source_ref`.
+/// sysusers, tmpfiles and needrestart files, `gh` and the trust files for `source_ref`, and the
+/// host agent: its two units, its account and the links that enable the units.
 fn kbf_deb_of(kbf: &[u8], source_ref: &str) -> Vec<u8> {
     let control = tgz(&[("control", 0o644, KBF_CONTROL)]);
     let conf = format!("SOURCE_REFS={source_ref}\n");
@@ -452,7 +539,10 @@ fn kbf_deb_of(kbf: &[u8], source_ref: &str) -> Vec<u8> {
         "usr/lib/systemd/system/kbf-storage-and-daemon.service",
         "usr/lib/systemd/system/kbf-storage.service",
         "usr/lib/systemd/system/kbf.slice",
+        "usr/lib/systemd/system/kbf-host-local.service",
+        "usr/lib/systemd/system/kbf-updater-agent.service",
         "usr/lib/sysusers.d/kbf.conf",
+        "usr/lib/sysusers.d/kbf-updater.conf",
         "usr/lib/tmpfiles.d/kbf.conf",
         "etc/needrestart/conf.d/kbf.conf",
     ] {
@@ -465,7 +555,19 @@ fn kbf_deb_of(kbf: &[u8], source_ref: &str) -> Vec<u8> {
         0o644,
         b"{\"mediaType\":\"trustedroot\"}\n",
     ));
-    deb_from(&control, &tgz(&files))
+    let wants = "usr/lib/systemd/system/multi-user.target.wants";
+    let links = [
+        (
+            format!("{wants}/kbf-host-local.service"),
+            "../kbf-host-local.service",
+        ),
+        (
+            format!("{wants}/kbf-updater-agent.service"),
+            "../kbf-updater-agent.service",
+        ),
+    ];
+    let links: Vec<(&str, &str)> = links.iter().map(|(p, t)| (p.as_str(), *t)).collect();
+    deb_from(&control, &tgz_with(&files, &links))
 }
 
 /// The `ar` archive of `control` and `data`, the tarballs of a deb.

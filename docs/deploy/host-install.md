@@ -16,7 +16,10 @@ the same run as every other asset ([../artifacts.md](../artifacts.md)):
 | macOS, Apple silicon | `kbf-host-install-<commit>-darwin-arm64.tar.gz` (ad hoc signed with the hardened runtime) |
 
 No package ships it: neither the `kbf` nor the `kbf-installer` deb installs it, so a Linux
-host gets it from the tarball too. Each tarball holds one member, `kbf-host-install`. Its
+host gets it from the tarball too. (The `kbf` deb ships the units that run it and the agent,
+`kbf-host-local.service` and `kbf-updater-agent.service`, enabled and gated on the two programs:
+[../../packaging/host-agent/README.md](../../packaging/host-agent/README.md), "A host that runs
+the package".) Each tarball holds one member, `kbf-host-install`. Its
 `<commit>` is the commit of the release the host is on or going to. The updater,
 `kbf-updater`, is the same kind of asset for the operator's Linux box and for a Mac's host agent
 (`kbf-updater-<commit>-linux-<arch>.tar.gz` and `kbf-updater-<commit>-darwin-arm64.tar.gz`, one
@@ -889,7 +892,9 @@ say it is that commit. Nothing is fetched when the trust files are not root's. A
 ### On a Linux daemon host that runs the package
 
 With `--layout deb` (or `rpm`) the host's units are the packaged ones
-([packaging/linux](../../packaging/linux/README.md)), which run `/usr/bin/kbf`. No release is laid
+([packaging/linux](../../packaging/linux/README.md)), which run `/usr/bin/kbf`. The `kbf` deb ships
+this program's unit, `kbf-host-local.service`, with `--layout deb` and `--restart-unit
+kbf-daemon.service`, and enables it. No release is laid
 out beside the running one and no link moves: the update is two installations of a package file,
 with the trial recorded first. The same requests apply, with the same answers and codes, and
 the same channels file as above. The package and a record of it live in the program's state

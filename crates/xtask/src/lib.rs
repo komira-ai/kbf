@@ -61,17 +61,19 @@
 //!   runner, for `packaging/install.sh`.
 //! - `pkg-config`, `pkg-build`, `pkg-install-test`, `pkg-upgrade-test` ([`pkg_linux`],
 //!   [`pkg_install`], [`pkg_upgrade`]): the `kbf` deb and rpm (`/usr/bin/kbf`, the units of
-//!   the modes and `kbf.slice`, the sysusers, tmpfiles and needrestart files, and the trust
-//!   directory): the nfpm configuration from the inputs, a package built twice to prove the
-//!   bytes, an install, remove and purge in a container, and the upgrade of a host that has
-//!   the `kbf-installer` deb of the release before.
+//!   the modes and `kbf.slice`, the sysusers, tmpfiles and needrestart files, the trust
+//!   directory and, in the deb, the host agent's units, enabled, and account): the nfpm
+//!   configuration from the inputs, a package built twice to prove the bytes, an install, remove
+//!   and purge in a container, and the upgrade of a host that has the `kbf-installer` deb of the
+//!   release before.
 //! - `pkg-trust` ([`pkg_trust`]): the trust directory of the packages from the pinned `gh`,
 //!   `gh`'s trusted root and the branch the package is attested on.
 //! - `pkg-kbf-asset` ([`pkg_kbf_asset`]): the `kbf` deb as the release asset
 //!   `kbf-<commit>-<platform>.deb`, refused unless its `/usr/bin/kbf` is the `kbf` of the
-//!   attested tarball, it replaces and breaks the old `kbf-installer`, it holds the units
-//!   of the modes, the slice, the sysusers and tmpfiles files, the drop-in and a trust
-//!   directory that trusts the branch it is attested for, and nothing else.
+//!   attested tarball, it replaces (and does not break) the old `kbf-installer`, it holds the units
+//!   of the modes, the slice, the sysusers and tmpfiles files, the drop-in, a trust
+//!   directory that trusts the branch it is attested for, and the host agent's two units, their
+//!   links and the agent's account, and nothing else.
 //! - `pkg-image-asset` ([`pkg_image_asset`]): the frontend, coordinator or task OCI image tarball as the
 //!   release asset `kbf-<service>-image-<commit>-<platform>.oci.tar`, refused unless its program
 //!   is the attested `kbf` (frontend) or the built `kbf-coordinator` or `kbf-task`, it runs as a user that is
@@ -396,40 +398,7 @@ enum Verb {
         out: PathBuf,
     },
     /// Write the nfpm configuration and the file listing of the kbf packages.
-    PkgConfig {
-        /// The kbf binary the kbf packages carry at `/usr/bin/kbf` (mode 0755).
-        #[arg(long)]
-        kbf: PathBuf,
-        /// The directory of unit files: the kbf packages take the units of the modes and
-        /// `kbf.slice` from it.
-        #[arg(long)]
-        units: PathBuf,
-        /// The directory of the three trust files.
-        #[arg(long)]
-        trust: PathBuf,
-        /// The sysusers.d file.
-        #[arg(long)]
-        sysusers: PathBuf,
-        /// The tmpfiles.d file.
-        #[arg(long)]
-        tmpfiles: PathBuf,
-        /// The needrestart drop-in.
-        #[arg(long)]
-        needrestart: PathBuf,
-        /// The platform the binary was built for (`linux-x86_64`, `linux-arm64`).
-        #[arg(long, value_enum)]
-        platform: package::Platform,
-        /// The package version.
-        /// (One of the two is required; the verb says so, exit 2, as clap does for a bad flag.)
-        #[arg(long, conflicts_with = "version_of")]
-        version: Option<String>,
-        /// Take the version from this binary's `--version` (`<version>+<12 of the commit>`).
-        #[arg(long)]
-        version_of: Option<PathBuf>,
-        /// The directory `nfpm.yaml` and `listing.txt` go in; created when missing.
-        #[arg(long)]
-        out: PathBuf,
-    },
+    PkgConfig(pkg_linux::ConfigFlags),
     /// Build the deb and the rpm with nfpm, and prove a second build is the same bytes.
     PkgBuild {
         /// The pinned nfpm program.
@@ -1256,37 +1225,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             },
             &out,
         ),
-        Verb::PkgConfig {
-            kbf,
-            units,
-            trust,
-            sysusers,
-            tmpfiles,
-            needrestart,
-            platform,
-            version,
-            version_of,
-            out,
-        } => {
-            let version = match (version, version_of) {
-                (Some(version), _) => version,
-                (None, Some(of)) => pkg_asset::binary_version(&of)?,
-                (None, None) => return Err(Error::Usage("--version or --version-of".to_owned())),
-            };
-            pkg_linux::write_config(
-                &pkg_linux::Inputs {
-                    kbf: &kbf,
-                    units: &units,
-                    trust: &trust,
-                    sysusers: &sysusers,
-                    tmpfiles: &tmpfiles,
-                    needrestart: &needrestart,
-                    platform,
-                    version: &version,
-                },
-                &out,
-            )
-        }
+        Verb::PkgConfig(flags) => pkg_linux::config_verb(&flags),
         Verb::PkgBuild {
             nfpm,
             config,

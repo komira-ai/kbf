@@ -351,3 +351,52 @@ fn the_root_part_unit_agrees_with_the_agent_and_its_registration_directory() {
         .collect();
     assert_eq!(groups, [register.group.as_str()]);
 }
+
+/// The two units the `kbf` deb ships and enables (`packaging/linux/README.md`): the helper's
+/// installs the attested package (`--layout deb`, with the daemon's unit to restart), and each is
+/// gated on the program its `ExecStart` runs, which no package carries, so that a host with the
+/// package and not yet the program skips the unit at boot instead of failing it in a loop. Both are
+/// wanted by `multi-user.target`, the target whose `.wants` directory the package links them into.
+///
+/// Catches: a packaged helper that would lay releases out by hand on a package host, a gate on a
+/// path the unit does not run, and a unit the package would enable for another target than its
+/// own `[Install]` names.
+#[test]
+fn the_packaged_units_install_the_package_and_wait_for_their_programs() {
+    let helper = read("linux/kbf-host-local.service");
+    let line = words(&unit_value(&helper, "ExecStart"));
+    ServeConfig::parse(&line[2..]).expect("the helper's flags");
+    assert!(
+        line.windows(2).any(|w| w == ["--layout", "deb"]),
+        "the packaged helper installs the package: {line:?}"
+    );
+    assert_eq!(
+        line.iter().filter(|w| *w == "--restart-unit").count(),
+        1,
+        "{line:?}"
+    );
+    assert!(
+        line.windows(2)
+            .any(|w| w == ["--restart-unit", "kbf-daemon.service"]),
+        "{line:?}"
+    );
+    for (unit, program) in [
+        (
+            "linux/kbf-host-local.service",
+            "/usr/libexec/kbf/kbf-host-install",
+        ),
+        (
+            "linux/kbf-updater-agent.service",
+            "/usr/libexec/kbf/kbf-updater",
+        ),
+    ] {
+        let text = read(unit);
+        assert_eq!(words(&unit_value(&text, "ExecStart"))[0], program, "{unit}");
+        assert_eq!(
+            unit_value(&text, "ConditionFileIsExecutable"),
+            program,
+            "{unit}"
+        );
+        assert_eq!(unit_value(&text, "WantedBy"), "multi-user.target", "{unit}");
+    }
+}

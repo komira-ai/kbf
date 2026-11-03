@@ -30,6 +30,12 @@ fn scratch(name: &str) -> PathBuf {
 
 /// The tar.gz of `files` as nfpm writes a data or control tarball: `./`-prefixed paths.
 fn tgz(files: &[(&str, u32, &[u8])]) -> Vec<u8> {
+    tgz_with(files, &[])
+}
+
+/// [`tgz`], with the symbolic links `links` (path, target) after the files, as nfpm writes them
+/// (mode 0777).
+fn tgz_with(files: &[(&str, u32, &[u8])], links: &[(String, String)]) -> Vec<u8> {
     let gzip = flate2::GzBuilder::new().write(Vec::new(), flate2::Compression::fast());
     let mut tar = tar::Builder::new(gzip);
     for (path, mode, bytes) in files {
@@ -41,7 +47,29 @@ fn tgz(files: &[(&str, u32, &[u8])]) -> Vec<u8> {
         h.set_cksum();
         tar.append(&h, *bytes).expect("append");
     }
+    for (path, target) in links {
+        let mut h = tar::Header::new_ustar();
+        h.set_path(format!("./{path}")).expect("path");
+        h.set_entry_type(tar::EntryType::Symlink);
+        h.set_link_name(target).expect("target");
+        h.set_size(0);
+        h.set_mode(0o777);
+        h.set_cksum();
+        tar.append(&h, &[][..]).expect("append");
+    }
     tar.into_inner().expect("tar").finish().expect("gzip")
+}
+
+/// The links of a good deb: the one that enables each of the host agent's units.
+fn agent_links() -> Vec<(String, String)> {
+    AGENT_UNITS
+        .map(|u| {
+            (
+                format!("usr/lib/systemd/system/multi-user.target.wants/{u}"),
+                format!("../{u}"),
+            )
+        })
+        .to_vec()
 }
 
 /// An `ar` archive of `members`, as `ar` and dpkg-deb write one.
@@ -90,6 +118,8 @@ struct Fix {
     drop: Option<String>,
     /// Files a good package does not hold, with their modes and bytes.
     extra: Vec<(String, u32, Vec<u8>)>,
+    /// The links of the data tarball (path, target).
+    links: Vec<(String, String)>,
 }
 
 impl Fix {
@@ -109,6 +139,7 @@ impl Fix {
             replaces: REPLACES.to_owned(),
             drop: None,
             extra: Vec::new(),
+            links: agent_links(),
         }
     }
 
@@ -138,11 +169,12 @@ impl Fix {
         let control_tgz = tgz(&[("control", 0o644, control.as_bytes())]);
         let binary = "usr/bin/kbf".to_owned();
         let mut files = vec![(binary, self.kbf_mode, self.kbf.as_slice())];
-        for unit in KBF_UNITS.into_iter().chain([SLICE]) {
+        for unit in KBF_UNITS.into_iter().chain([SLICE]).chain(AGENT_UNITS) {
             files.push((in_units(unit), self.unit_mode, unit.as_bytes()));
         }
         for (path, text) in [
             ("usr/lib/sysusers.d/kbf.conf", "u kbf"),
+            ("usr/lib/sysusers.d/kbf-updater.conf", "u kbf-updater"),
             ("usr/lib/tmpfiles.d/kbf.conf", "d /x"),
             ("etc/needrestart/conf.d/kbf.conf", "# n"),
         ] {
@@ -172,7 +204,7 @@ impl Fix {
         ar(&[
             ("debian-binary", b"2.0\n"),
             ("control.tar.gz", &control_tgz),
-            ("data.tar.gz", &tgz(&listed)),
+            ("data.tar.gz", &tgz_with(&listed, &self.links)),
         ])
     }
 }
@@ -278,10 +310,12 @@ fn the_kbf_must_be_executable_and_the_other_files_plain() {
     let mut want: Vec<String> = KBF_UNITS
         .into_iter()
         .chain([SLICE])
+        .chain(AGENT_UNITS)
         .map(in_units)
         .chain(
             [
                 "usr/lib/sysusers.d/kbf.conf",
+                "usr/lib/sysusers.d/kbf-updater.conf",
                 "usr/lib/tmpfiles.d/kbf.conf",
                 "etc/needrestart/conf.d/kbf.conf",
             ]
@@ -319,6 +353,103 @@ fn a_package_without_any_file_it_ships_is_refused() {
         fix.drop = Some(gone.clone());
         assert_eq!(found("missing", &fix), [format!("holds no {gone}")]);
     }
+}
+
+/// The package lint of the host agent: a deb without the helper's unit, or without the agent's,
+/// is refused naming the one it lacks and nothing else, and so is one without the agent's account
+/// file.
+///
+/// Catches: a published deb whose host has no agent or no helper after its install, or an agent
+/// unit whose account the package never makes.
+#[test]
+fn a_package_without_the_helper_or_the_agent_unit_is_refused() {
+    for gone in [
+        "usr/lib/systemd/system/kbf-host-local.service",
+        "usr/lib/systemd/system/kbf-updater-agent.service",
+        "usr/lib/sysusers.d/kbf-updater.conf",
+    ] {
+        let mut fix = Fix::new();
+        fix.drop = Some(gone.to_owned());
+        assert_eq!(found("missing-agent", &fix), [format!("holds no {gone}")]);
+    }
+}
+
+/// Asserts that a deb whose agent unit is not linked into `multi-user.target.wants`, or is linked
+/// to another target, or that holds a link it does not ship, is refused naming the link.
+///
+/// Catches: a deb that installs the host agent and never starts it, and a link that enables
+/// something else.
+#[test]
+fn a_package_whose_agent_units_are_not_enabled_is_refused() {
+    let unlinked = "usr/lib/systemd/system/multi-user.target.wants/kbf-updater-agent.service";
+    let mut fix = Fix::new();
+    fix.links.retain(|(p, _)| p != unlinked);
+    assert_eq!(
+        found("unlinked", &fix),
+        [format!(
+            "holds no link {unlinked}, which enables its unit at boot"
+        )]
+    );
+    let mut fix = Fix::new();
+    for (p, target) in &mut fix.links {
+        if p == unlinked {
+            *target = "../kbf-daemon.service".to_owned();
+        }
+    }
+    assert_eq!(
+        found("misdirected", &fix),
+        [format!(
+            "{unlinked} points to \"../kbf-daemon.service\", not \"../kbf-updater-agent.service\""
+        )]
+    );
+    let mut fix = Fix::new();
+    let extra = "usr/lib/systemd/system/multi-user.target.wants/kbf-daemon.service";
+    fix.links
+        .push((extra.to_owned(), "../kbf-daemon.service".to_owned()));
+    assert_eq!(
+        found("extra-link", &fix),
+        [format!(
+            "holds the link {extra} -> ../kbf-daemon.service, which the kbf package does not ship"
+        )]
+    );
+}
+
+/// Asserts that a deb that holds an enabling link twice, once to its unit and once elsewhere, is
+/// refused whichever comes first, naming the path held twice and the target that is wrong; and that
+/// a file and a link at one path are refused the same way.
+///
+/// Catches: a lint that checks the first of two entries at one path, while dpkg unpacks the last.
+#[test]
+fn a_package_that_holds_a_path_twice_is_refused() {
+    let link = "usr/lib/systemd/system/multi-user.target.wants/kbf-updater-agent.service";
+    let wrong = (link.to_owned(), "../kbf-daemon.service".to_owned());
+    let points =
+        format!("{link} points to \"../kbf-daemon.service\", not \"../kbf-updater-agent.service\"");
+    for wrong_first in [false, true] {
+        let mut fix = Fix::new();
+        if wrong_first {
+            fix.links.insert(0, wrong.clone());
+        } else {
+            fix.links.push(wrong.clone());
+        }
+        let mut got = found(&format!("path-twice-{wrong_first}"), &fix);
+        got.sort();
+        let mut want = vec![format!("holds {link} more than once"), points.clone()];
+        want.sort();
+        assert_eq!(got, want, "wrong first: {wrong_first}");
+    }
+    let mut fix = Fix::new();
+    fix.extra
+        .push((link.to_owned(), 0o644, b"[Unit]\n".to_vec()));
+    let mut got = found("file-and-link", &fix);
+    got.sort();
+    assert_eq!(
+        got,
+        [
+            format!("holds {link} more than once"),
+            format!("holds {link}, which the kbf package does not ship"),
+        ]
+    );
 }
 
 /// Asserts that a package that holds a file of the retired installer, or any file it does not

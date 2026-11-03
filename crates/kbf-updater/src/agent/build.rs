@@ -13,6 +13,7 @@ use super::container_health::ContainerHealth;
 use super::coordinator::{Endpoint, HttpsCoordinator, TlsFiles};
 use super::cordon::OwnCordon;
 use super::enroll::frontend_url;
+use super::enrolled::{self, LOOK_EVERY, Waited, Waiting};
 use super::flags::{Config, NodeApi, ServiceConfig, ServiceDrain, ServiceHealth};
 use super::local::{Limits, LocalInstaller, SocketLocal};
 use super::pin::PinFile;
@@ -407,10 +408,48 @@ pub fn run_agent(agent: &Agent, ready: impl FnOnce(Stop)) -> (u8, String) {
     (0, String::new())
 }
 
-/// [`build`], then [`run_agent`].
+/// [`run_config_waiting`] with the real ports ([`build`]), napping [`LOOK_EVERY`] between two
+/// looks at an enrollment that is not there yet and saying so on the error stream.
 pub fn run_config(cfg: &Config, ready: impl FnOnce(Stop)) -> (u8, String) {
-    match build(cfg) {
+    let log = |line: &str| eprintln!("kbf-updater: {line}");
+    let nap = |stop: &Stop| super::run::sleep(LOOK_EVERY, stop);
+    run_config_waiting(
+        cfg,
+        ready,
+        &Waiting {
+            nap: &nap,
+            log: &log,
+        },
+        build,
+    )
+}
+
+/// The agent of `cfg`, run until the handle given to `ready` stops it. An agent given
+/// `--state-dir` first waits there for the host's enrollment ([`enrolled::wait`]); then `make`
+/// makes the agent from `cfg` ([`build`] in the process: the ports are made only now, so nothing
+/// is dialled before the host is enrolled), and the agent runs. The exit code and text of the
+/// process: 0 once stopped, 1 with the reason when the enrollment cannot be read or the agent
+/// cannot be made.
+pub(crate) fn run_config_waiting(
+    cfg: &Config,
+    ready: impl FnOnce(Stop),
+    waiting: &Waiting,
+    make: impl FnOnce(&Config) -> Result<Agent, String>,
+) -> (u8, String) {
+    let stop = Stop::default();
+    ready(stop.clone());
+    if let Some(dir) = &cfg.state_dir {
+        match enrolled::wait(dir, &stop, waiting) {
+            Err(why) => return (1, format!("kbf-updater: {why}\n")),
+            Ok(Waited::Stopped) => return (0, String::new()),
+            Ok(Waited::Enrolled) => {}
+        }
+    }
+    match make(cfg) {
         Err(why) => (1, format!("kbf-updater: {why}\n")),
-        Ok(agent) => run_agent(&agent, ready),
+        Ok(agent) => {
+            agent.run(&stop);
+            (0, String::new())
+        }
     }
 }

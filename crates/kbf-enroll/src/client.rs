@@ -313,8 +313,7 @@ pub async fn enroll(
             .map(StoredConfig::from_proto)
             .unwrap_or_default(),
     );
-    store.stage(&certs, &response.ca_bundle_pem, &node)?;
-    store.commit()?;
+    store.install(&certs, &response.ca_bundle_pem, &node)?;
     if let Err(error) = token::remove(&config.token_file) {
         tracing::warn!(%error, "enrolled, but the token file could not be removed");
     }

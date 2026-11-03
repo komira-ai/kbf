@@ -37,7 +37,8 @@ coordinator side is done, but kbf's agent does not report that yet, section 2.5)
 What is still by hand (section 3):
 
 - the coordinator's own update;
-- a host's first install of the agent and helper;
+- a host's first install of the agent and helper programs (their units come with the package
+  since G6);
 - going back after a red gamma when the job cannot (CI is gone, until the agents report where
   kbf's update failed, or the coordinator's rules hold the farm);
 - updating a Mac;
@@ -234,7 +235,7 @@ that.
 |---|---|---|---|---|
 | M1 | Deploy the coordinator: its certificate from the farm CA with the role `coordinator`, the allow-list file, the operator token file, and `--services-file` for services other than kbf | once per farm | by hand ([kbf-updater.md](../deploy/kbf-updater.md), "Turn on the gamma stage", step 1) | stays by hand: it is the root of the farm's trust and is set where it is defined |
 | M2 | Update the coordinator: a new image, the tag changed in its unit, a restart. It is needed before any release that changes `crates/kbf-coordinator` or the wire (`crates/kbf-updater/src/wire.rs`). | every such release | by hand ([kbf-updater.md](../deploy/kbf-updater.md), "Updating the coordinator"). `KBF_REQUIRE_COORDINATOR_CURRENT=true` only fails the deploy. | G7 |
-| M3 | Install the agent and helper units on a new host (`packaging/host-agent`: "nothing here is in a package yet"), and add `--layout deb` to the helper's line | once per host | by hand | G6 |
+| M3 | Install the agent and helper units on a new host, and add `--layout deb` to the helper's line | once per host | done: the `kbf` deb ships and enables both units, the helper's with `--layout deb` (G6). Still by hand: placing the two programs, which no package carries so that no release writes them, and the farm's names, one drop-in that is the same on every host ([packaging/host-agent/README.md](../../packaging/host-agent/README.md), "A host that runs the package") | G6 (done) |
 | M4 | Issue a host's enrollment token (`POST /v1/enroll/tokens`) and run `kbf-updater enroll` | once per host | by hand | stays by hand: issuing an identity is the operator's act |
 | M5 | Set the repository and organisation variables (`KBF_COORDINATOR_URL`, `KBF_COORDINATOR_CA`, `KBF_MIN_UP_*`, `TS_CLIENT_ID`, `TS_AUDIENCE`, `FARM_*`), the Tailscale trust credential and its policy for `tag:ci`, and the `release` environment | once per farm | by hand | stays by hand: it is configuration of the farm, not of kbf |
 | M6 | After a red gamma, set the farm back: choose the version, and set it as desired. Only a CI token can, so that means re-running an earlier release's `gamma` job. | every red gamma | the ordinary case is done by the job (G1, done); when CI is gone, by the coordinator (G2, coordinator side done) once the agents report where kbf's update failed, by hand until then; by hand when the ordinary rules hold the farm | G1 (the ordinary case, done), G2 (when CI is gone; partial: it needs the agent's phase, section 2.5), C1 (when the ordinary rules hold the farm) |
@@ -260,7 +261,7 @@ never by elapsed time.
 | 3 | H1 local `activate` | M7 | none (komira-ai/kbf#2233 merged) | komira-ai/kbf#2242 |
 | 4 | C1 coordinator `force` | M6 (farm held by its rules) | komira-ai/kbf#2187, H1 | komira-ai/kbf#2241 |
 | 5 | H2 the agent's pin | M7 | H1, C1 | komira-ai/kbf#2243 |
-| 6 | G6 agent and helper units in the package | M3 | komira-ai/kbf#2236 | komira-ai/kbf#2244 |
+| 6 | G6 agent and helper units in the package (done) | M3 | komira-ai/kbf#2236 | komira-ai/kbf#2244 |
 | 7 | G7 the coordinator updated by the updater | M2 | G6, [host-updates.md](host-updates.md) step 6a | komira-ai/kbf#2245 |
 | 8 | G8 a Mac takes update orders | M8 | the Mac lease users ([macos-end-state.md](macos-end-state.md), steps 3 and 4) | komira-ai/kbf#2246 |
 
@@ -605,6 +606,8 @@ of another commit, leaves the pin.
 
 ### G6. Agent and helper units in the package
 
+**Status: done.** The as-built notes follow the tests below.
+
 **Change.** The `kbf` deb ships `kbf-host-local.service`, `kbf-updater-agent.service` and
 `kbf-updater.conf` from `packaging/host-agent`, with the helper's `--layout deb`. Installing
 the package enables both units. An agent that has no enrollment state yet waits for one.
@@ -619,6 +622,42 @@ With this, a host's first install is the package plus M4.
 - an agent started with no state reports "not enrolled" once and makes no call;
 - after `kbf-updater enroll` it heartbeats;
 - the package lint fails on a package without either unit.
+
+**As built.**
+
+- **What the deb holds.** `kbf-host-local.service` and `kbf-updater-agent.service` in
+  `/usr/lib/systemd/system`, and `kbf-updater.conf` as `/usr/lib/sysusers.d/kbf-updater.conf`,
+  from `packaging/host-agent/linux` (`pkg-config --host-agent`).
+- **How it enables them.** The package has no maintainer script, so it ships the links
+  `/usr/lib/systemd/system/multi-user.target.wants/<unit> -> ../<unit>`. systemd reads them at
+  every boot. An operator turns a unit off with `systemctl mask`, which an upgrade keeps.
+- **The rpm.** It holds none of these: its helper would need `--layout rpm`, and no rpm is
+  published.
+- **The programs.** The units are gated on their programs (`ConditionFileIsExecutable=`). The
+  programs stay in no package: an update is an installation of the package, and
+  komira-ai/kbf#2233 keeps the helper and agent paths out of every release's writes. A host with
+  the package and not yet the programs skips both units instead of failing them.
+- **The farm's names.** The coordinator's and the frontend's addresses are configuration of the
+  farm. The shipped agent line carries examples, and a host gives the farm's in one drop-in.
+  A host's first install is therefore the package, the two programs and that drop-in, then M4.
+- **Going back.** dpkg deletes what an older package does not list. Installing a deb older than
+  this release's deletes the units on a host that got them from the package, and neither starts
+  after the next boot. Before setting a farm back that far, copy the units to `/etc/systemd/system`
+  on such hosts. A host whose units were placed by hand under `/etc/systemd/system` is not
+  affected.
+- **The tests.**
+  - the `packages` job of `beta.yml` runs `pkg-install-test` with gates on both units;
+  - `pkg_install` checks the units are installed and wanted by `multi-user.target`, with
+    `--layout deb` on the helper's line, and that the rpm holds neither;
+  - `an_agent_with_no_enrollment_says_not_enrolled_once_and_calls_nothing` (`kbf-updater`): an
+    agent with no enrollment says "not enrolled" once and makes nothing, so it calls nothing;
+  - `once_the_host_is_enrolled_the_waiting_agent_heartbeats` (`kbf-updater`): after the
+    enrollment, the waiting agent is made from the enrolled certificate and heartbeats;
+  - `the_agent_looks_between_the_steps_of_an_enrollment_and_starts_once_it_is_usable`
+    (`kbf-updater`): a refused attempt, its retry and the installed answer, after which the
+    agent's TLS client, made from the enrolled files, completes a mutual-TLS handshake in memory
+    with a coordinator the farm's CA certified;
+  - `a_package_without_the_helper_or_the_agent_unit_is_refused` (`pkg_kbf_asset`).
 
 ### G7. The coordinator is updated by the updater
 
