@@ -6,19 +6,20 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io;
 use std::path::Path;
-use std::sync::PoisonError;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, PoisonError};
 
 use kbf_step_runner::record::{Record, RecordStore, State};
 use kbf_step_runner::runner::REASON_ARTIFACT_CHANGED;
-use kbf_step_runner::{Finished, StepLauncher};
+use kbf_step_runner::{Finished, StepLauncher, UpdateOrder};
 use update_hook::Verdict;
 use update_rights::{boot_unit_name, check_state_dir, run_boot};
 
 use super::launch::declared;
 use super::socket::Answer;
 use super::{
-    Refusal, Resumed, RootPart, because, boot, declare, make_record_dir, resumed, run_refusal,
-    stored,
+    Refusal, Resumed, RootPart, Service, because, boot, committed, declare, make_record_dir,
+    record_generation, resumed, run_refusal, stored,
 };
 
 /// The records a read after a boot has not read yet.
@@ -78,6 +79,45 @@ impl RootPart {
         unread
     }
 
+    /// Puts back, for every service whose state directory keeps a declaration installed for an
+    /// update that never began (the record still has the generation it had at the install), the
+    /// one that was active, then loads the declarations again. It reads only the root part's own
+    /// bookkeeping, so a service whose installed declaration the load refuses (an account the host
+    /// does not have) gets its valid one back. Run at the start, before the declarations are used.
+    /// The services it could not put back, and why (an empty name for the directory or the load).
+    pub fn recover_installs(&self) -> Vec<(String, String)> {
+        let listed = fs::read_dir(&self.config.state)
+            .and_then(|entries| entries.collect::<io::Result<Vec<_>>>());
+        let mut failed = Vec::new();
+        let entries = listed.unwrap_or_else(|e| {
+            failed.push((String::new(), e.to_string()));
+            Vec::new()
+        });
+        let services = entries
+            .into_iter()
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+            .map(|entry| {
+                (
+                    entry.file_name().to_string_lossy().into_owned(),
+                    entry.path(),
+                )
+            })
+            .filter(|(name, _)| update_rights::names::is_service_name(name));
+        for (name, dir) in services {
+            let place = self.place(&dir);
+            let generation = record_generation(&dir);
+            let put_back = declare::began(&place).and_then(|began| {
+                began
+                    .filter(|before| *before == generation)
+                    .map(|_| declare::restore(&place, &name))
+                    .transpose()
+            });
+            failed.extend(put_back.err().map(|e| (name, e.to_string())));
+        }
+        failed.extend(self.reload().err().map(|e| (String::new(), e.to_string())));
+        failed
+    }
+
     /// Reads the record of `service` after the boot, if the read after the boot could not.
     pub(super) fn read_if_unread(&self, service: &str) -> Result<(), Refusal> {
         let mut held = self.unread.lock().unwrap_or_else(PoisonError::into_inner);
@@ -135,6 +175,13 @@ impl RootPart {
                 _ => {
                     make_record_dir(&declared).map_err(because("internal"))?;
                     let finished = match resumed(&declared, &rec)? {
+                        // A post-success watcher does not hold the start pass (nor the agent's
+                        // socket, bound after it): it watches on a thread of its own, and its
+                        // committed release is `current` now.
+                        Resumed::Order(order) if rec.progress.watching.is_some() => {
+                            self.watch_in_background(&unit, order);
+                            committed(None)
+                        }
                         Resumed::Order(order) => unit.runner.run(&order).map_err(run_refusal)?,
                         Resumed::Changed(why) => self.halt_changed(&store, &rec, &why)?,
                     };
@@ -148,6 +195,37 @@ impl RootPart {
         }
         answer.boot = self.boot_entry(service, generation)?;
         Ok(answer)
+    }
+
+    /// Resumes the post-success watcher of `unit`'s update on a thread of its own: it takes the
+    /// service's lock once the start pass lets it go, and runs until the promotion clears, its
+    /// ceiling, or a new order asks it to yield. One left waiting when the root part stops runs
+    /// nothing.
+    fn watch_in_background(&self, unit: &Arc<Service>, order: Box<UpdateOrder>) {
+        let unit = Arc::clone(unit);
+        let stop = Arc::clone(&self.stop);
+        let watcher = std::thread::spawn(move || {
+            let _busy = unit.busy.lock().unwrap_or_else(PoisonError::into_inner);
+            if !stop.load(Ordering::Acquire) {
+                let _ = unit.runner.run(&order);
+            }
+        });
+        let mut watchers = self.watchers.lock().unwrap_or_else(PoisonError::into_inner);
+        watchers.push(watcher);
+    }
+
+    /// Asks every watcher the start pass resumed to yield, and waits for each to end.
+    pub(super) fn stop_watchers(&self) {
+        let watchers =
+            std::mem::take(&mut *self.watchers.lock().unwrap_or_else(PoisonError::into_inner));
+        let services = self.services.lock().unwrap_or_else(PoisonError::into_inner);
+        for service in services.values() {
+            service.runner.yield_watcher();
+        }
+        drop(services);
+        for watcher in watchers {
+            let _ = watcher.join();
+        }
     }
 
     /// Ends the update `rec` holds as the step runner ends one whose release changed after it

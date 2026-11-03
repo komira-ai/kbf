@@ -35,8 +35,10 @@ address_families = ["AF_UNIX", "AF_INET", "AF_INET6"]
 environment  = { }
 
 [hook.timeout_secs]
-# A drain waits for the node's leases however long they run (4.3): the longest bound there is.
-prepare  = 86400
+# A drain waits for the node's leases however long they run (4.3): 0 is no bound at all, so the
+# unit has no RuntimeMaxSec and the dead-man never stops it. An operator who wants a deadline
+# writes it here.
+prepare  = 0
 cutover  = 600
 verify   = 360
 rollback = 600

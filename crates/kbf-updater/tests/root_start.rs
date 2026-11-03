@@ -448,3 +448,37 @@ fn the_boot_entry_reports_how_it_ended_and_needs_an_installed_release() {
     let failed = world.root_part().start("svc");
     assert_eq!(failed.boot.as_deref(), Some("failure"), "{failed:?}");
 }
+
+/// Catches a declaration the load refuses left installed by an update that never began: the root
+/// part stopped right after installing one that names an account the host does not have, so the
+/// load refuses the service; started as a host starts it, the root part puts the one that was
+/// active back from its own bookkeeping before it reads the declarations, and the service is
+/// served again.
+#[test]
+fn a_refused_declaration_installed_for_an_update_that_never_began_goes_back_at_the_start() {
+    let world = World::new("began-refused");
+    let active = world.tierstore_shaped();
+    world.declare("svc", &active);
+    world.stage("svc", "1.0.0", None);
+    assert_eq!(
+        verdict(&world.root_part().update("svc", "1.0.0")),
+        SUCCEEDED
+    );
+    let refused = active.replace("user = \"svc-update\"", "user = \"nosuchaccount\"");
+    installed_then_stopped(&world, &refused, Some(&active), "1");
+    assert!(
+        world
+            .root_part()
+            .refused()
+            .iter()
+            .any(|r| r.service == "svc"),
+        "the load refuses what was installed"
+    );
+    let answer = serve_once(&world, || {});
+    assert!(answer.ok, "{answer:?}");
+    assert_eq!(
+        fs::read_to_string(world.path("updater.d/svc.toml")).unwrap(),
+        active
+    );
+    assert!(!world.path("state/svc/declaration.began").exists());
+}

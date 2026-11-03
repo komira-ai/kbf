@@ -21,6 +21,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use kbf_step_runner::{ArtifactError, Staged};
+use update_hook::Step;
 use update_rights::approval::ApprovalError;
 use update_rights::declaration::Refusal;
 use update_rights::{Approvals, Declaration, Declared, Deferral, Digest, Gate, gate};
@@ -59,6 +60,11 @@ pub enum DeclareError {
     Pending { service: String },
     #[error("{}: not a generation", .path.display())]
     BadMarker { path: PathBuf },
+    #[error(
+        "the declaration changes what the previous release's hook needs to recover ({}); such a change is made outside an update",
+        .fields.join(", ")
+    )]
+    RecoveryUnsafe { fields: Vec<&'static str> },
 }
 
 fn io_at(path: &Path) -> impl Fn(io::Error) -> DeclareError + '_ {
@@ -138,6 +144,12 @@ pub fn decide(
             service: service.to_owned(),
         });
     }
+    if let Some(declared) = active {
+        let fields = recovery_unsafe(declared.declaration(), &incoming);
+        if !fields.is_empty() {
+            return Err(DeclareError::RecoveryUnsafe { fields });
+        }
+    }
     let approvals =
         Approvals::read(place.approvals, place.trusted_uid).map_err(DeclareError::Approvals)?;
     let verdict = gate(
@@ -172,6 +184,55 @@ pub fn decide(
     write_file(place.state, kept.0, &kept.1, 0o600)?;
     write_file(place.declarations, &format!("{service}.toml"), bytes, 0o644)?;
     Ok(Decision::Installed)
+}
+
+/// The fields in which `incoming` would leave the previous release's hook unable to recover. The
+/// fallback `rollback` from the previous release (3.3) and a boot entry after a halt run that
+/// release's hook under the active declaration, which is `incoming` once it is installed: so it
+/// may not change what the hook is run as or with (the binary, its arguments, the boot entry, the
+/// accounts, the record directory, the environment), nor take away a right, a path, a unit or an
+/// address family the hook-wide grant or `rollback` held, nor shorten `rollback`. Empty when the
+/// previous hook runs under `incoming` as it ran under `active`.
+pub fn recovery_unsafe(active: &Declaration, incoming: &Declaration) -> Vec<&'static str> {
+    let (old, new) = (&active.hook, &incoming.hook);
+    [
+        ("binary", active.binary != incoming.binary),
+        ("hook_args", active.hook_args != incoming.hook_args),
+        ("boot", active.boot != incoming.boot),
+        ("state_dir", active.state_dir != incoming.state_dir),
+        ("hook.user", old.user != new.user),
+        ("hook.group", old.group != new.group),
+        ("hook.environment", old.environment != new.environment),
+        (
+            "hook.capabilities",
+            !old.capabilities.is_subset(&new.capabilities),
+        ),
+        (
+            "hook.step_capabilities.rollback",
+            !old.capabilities_for(Step::Rollback)
+                .is_subset(new.capabilities_for(Step::Rollback)),
+        ),
+        (
+            "hook.read_paths",
+            !old.read_paths.is_subset(&new.read_paths),
+        ),
+        (
+            "hook.write_paths",
+            !old.write_paths.is_subset(&new.write_paths),
+        ),
+        ("hook.units", !old.units.is_subset(&new.units)),
+        (
+            "hook.address_families",
+            !old.address_families.is_subset(&new.address_families),
+        ),
+        (
+            "hook.timeout_secs.rollback",
+            new.timeout_secs.rollback < old.timeout_secs.rollback,
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(field, unsafe_change)| unsafe_change.then_some(field))
+    .collect()
 }
 
 /// Whether a declaration is kept for an update that has not ended.

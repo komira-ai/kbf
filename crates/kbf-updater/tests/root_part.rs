@@ -706,3 +706,42 @@ fn a_release_that_cannot_be_made_current_after_a_success_is_an_error() {
     assert_eq!(answer.token(), Some("internal"), "{answer:?}");
     assert!(fs::read_link(world.path("releases/svc/current")).is_err());
 }
+
+/// Catches a drain cut by a bound nobody gave: with `prepare = 0` (as the kbf declaration ships
+/// it) the `prepare` unit runs with `RuntimeMaxSec=infinity`, and its step record's deadline is
+/// the last instant there is, which the dead-man's clock never reaches, however long the drain
+/// runs past the former bound of a day.
+#[test]
+fn an_unbounded_prepare_has_no_runtime_limit_and_no_deadline() {
+    let world = World::new("prepare-unbounded");
+    world.declare(
+        "svc",
+        &world
+            .tierstore_shaped()
+            .replace("prepare = 600", "prepare = 0"),
+    );
+    world.stage("svc", "1.0.0", None);
+    let record = world.path("state/svc/step-record.json");
+    let gate = move |point: CrashPoint| {
+        let running_prepare = fs::read(&record)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .is_some_and(|rec| rec["step"] == "prepare" && rec["state"]["state"] == "running");
+        matches!(point, CrashPoint::AfterWrite(_)) && running_prepare
+    };
+    let killed = world.root_part_gated(Arc::new(gate)).update("svc", "1.0.0");
+    assert_eq!(killed.token(), Some("runner"), "{killed:?}");
+    assert_eq!(
+        world.record("svc")["state"]["deadline_secs"].as_u64(),
+        Some(u64::MAX)
+    );
+    assert_eq!(
+        verdict(&world.root_part().update("svc", "1.0.0")),
+        SUCCEEDED
+    );
+    let prepare = &world.launched()[0];
+    assert_eq!(
+        property(prepare, "RuntimeMaxSec").as_deref(),
+        Some("infinity")
+    );
+}

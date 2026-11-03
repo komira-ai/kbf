@@ -112,6 +112,11 @@ fn serve(
     let clock = Arc::clone(&parts.clock);
     let state = config.state.clone();
     let root = Arc::new(RootPart::new(config, parts).map_err(text)?);
+    // A declaration installed for an update that never began goes back before anything reads
+    // the declarations, even one the load refuses.
+    for (service, why) in root.recover_installs() {
+        eprintln!("kbf-updater root: {service}: the kept declaration was not put back: {why}");
+    }
     for refused in root.refused() {
         eprintln!(
             "kbf-updater root: refused {} ({}): {}",

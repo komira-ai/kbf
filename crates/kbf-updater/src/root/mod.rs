@@ -47,6 +47,7 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, chown};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::thread::JoinHandle;
 
 use kbf_step_runner::record::{CrashGate, Loaded as Stored, Record, RecordStore, State};
 use kbf_step_runner::register::{Registry, RegistryError, Server};
@@ -55,6 +56,7 @@ use kbf_step_runner::{
     UpdateOrder,
 };
 use update_hook::{Params, Phase, Verdict};
+use update_rights::declaration::UNBOUNDED;
 use update_rights::{
     Accounts, Declared, EtcAccounts, Loaded, Policy, Refused, Spawner, Systemd, load_dir,
 };
@@ -253,6 +255,20 @@ fn standing(rec: &Record, version: &str, release: &releases::Release) -> Option<
     })
 }
 
+/// The reason an update whose post-success watcher yielded to a new order reports.
+pub const REASON_SUPERSEDED: &str = "superseded";
+
+/// How an update stands that was committed and is in its post-success watcher: succeeded, its
+/// promotion pending.
+fn committed(reason: Option<&str>) -> Finished {
+    Finished {
+        verdict: Verdict::Succeeded {
+            promotion_pending: true,
+        },
+        reason: reason.map(str::to_owned),
+    }
+}
+
 /// The refusal of an order whose run failed and whose installed declaration could not be put
 /// back: the run's token and reason, and why the declaration stays.
 fn kept_after(token: &str, why: &str, e: &str) -> Refusal {
@@ -291,7 +307,7 @@ fn order(
         previous,
         hook_binary: PathBuf::from(&declaration.binary),
         bounds: Bounds {
-            prepare_secs: timeouts.prepare,
+            prepare_secs: unbounded_as_max(timeouts.prepare),
             cutover_secs: timeouts.cutover,
             verify_secs: timeouts.verify,
             rollback_secs: timeouts.rollback,
@@ -303,6 +319,12 @@ fn order(
         declared_params,
         min_updater_protocol: None,
     })
+}
+
+/// A step's bound as the step runner takes it: `prepare = 0` (no bound) is the largest bound
+/// there is, so its dead-man deadline never comes; the unit itself has `RuntimeMaxSec=infinity`.
+fn unbounded_as_max(secs: u64) -> u64 {
+    if secs == UNBOUNDED { u64::MAX } else { secs }
 }
 
 /// What an unfinished record resumes as.
@@ -385,6 +407,8 @@ pub struct RootPart {
     services: Mutex<BTreeMap<String, Arc<Service>>>,
     /// The records the read after a boot could not read, until each is read.
     unread: Mutex<Unread>,
+    /// The post-success watchers the start pass resumed, each on a thread of its own.
+    watchers: Mutex<Vec<JoinHandle<()>>>,
     /// Ends the dead-men and the registration server.
     stop: Arc<AtomicBool>,
     /// Held while the root part lives: one root part per state directory.
@@ -397,6 +421,7 @@ pub const LOCK_FILE: &str = "lock";
 impl Drop for RootPart {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
+        self.stop_watchers();
     }
 }
 
@@ -434,6 +459,7 @@ impl RootPart {
             launcher,
             services: Mutex::default(),
             unread: Mutex::default(),
+            watchers: Mutex::default(),
             stop: Arc::new(AtomicBool::new(false)),
             _lock: lock,
         };
@@ -560,10 +586,18 @@ impl RootPart {
             return Err(self.unknown(service));
         }
         let unit = self.service(service)?;
-        let _busy = unit
-            .busy
-            .try_lock()
-            .map_err(|_| ("busy", format!("an update of {service} is running")))?;
+        let _busy = match unit.busy.try_lock() {
+            Ok(busy) => busy,
+            // A post-success watcher yields to a new order (3.2): it is asked to stop at its next
+            // poll, and the order waits for it. Anything else running makes the order busy.
+            Err(_) if stored(&unit.dir)?.is_some_and(|rec| rec.progress.watching.is_some()) => {
+                unit.runner.yield_watcher();
+                let busy = unit.busy.lock().unwrap_or_else(PoisonError::into_inner);
+                unit.runner.keep_watching();
+                busy
+            }
+            Err(_) => return Err(("busy", format!("an update of {service} is running"))),
+        };
         // Before anything changes: a verdict that stands is answered (the same update that
         // ended, or a halt, which holds every order), and an unfinished update of another
         // release refuses this one.
@@ -573,10 +607,13 @@ impl RootPart {
                 self.after(service, version, &unit.dir, &finished)?;
                 return Ok(Answer::finished(finished));
             }
-            // A post-success watcher is stopped by a new order (3.2): the runner does that.
+            // A post-success watcher is stopped by a new order (3.2): the runner does that. Its
+            // update was committed, so its release is made `current` first: the new order's
+            // previous release, and where a rollback of it goes.
             let finished = matches!(rec.state, State::Finished { .. });
             let watching = rec.progress.watching.is_some();
-            if !finished & !watching & !same_release(rec, version, &release) {
+            let same = same_release(rec, version, &release);
+            if !finished & !watching & !same {
                 return Err((
                     "busy",
                     format!(
@@ -584,6 +621,9 @@ impl RootPart {
                         rec.target_version
                     ),
                 ));
+            }
+            if watching & !same {
+                self.after(service, &rec.target_version, &unit.dir, &committed(None))?;
             }
         }
         let generation = rec.as_ref().map(|rec| rec.generation);
@@ -657,7 +697,11 @@ impl RootPart {
             release.staged,
             previous,
         )?;
-        let finished = unit.runner.run(&order).map_err(run_refusal)?;
+        let finished = match unit.runner.run(&order) {
+            // The watcher stopped for a new order: the update stands, committed.
+            Err(RunError::Yielded) => committed(Some(REASON_SUPERSEDED)),
+            ran => ran.map_err(run_refusal)?,
+        };
         self.after(service, version, &unit.dir, &finished)?;
         Ok(Answer::finished(finished))
     }

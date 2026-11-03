@@ -40,7 +40,7 @@ use std::process::{Command, Stdio};
 
 use update_hook::{Invocation, Outcome, Report, Step};
 
-use crate::declaration::{Declaration, Refusal};
+use crate::declaration::{Declaration, Refusal, UNBOUNDED};
 use crate::load::{Declared, recheck_targets};
 use crate::names::Capability;
 
@@ -217,7 +217,12 @@ fn properties_with(
             .iter()
             .map(|(name, value)| format!("Environment={name}={value}")),
     );
-    properties.push(format!("RuntimeMaxSec={timeout_secs}"));
+    // No bound (`prepare = 0`) is systemd's `infinity`, never its 0.
+    properties.push(if timeout_secs == UNBOUNDED {
+        "RuntimeMaxSec=infinity".to_owned()
+    } else {
+        format!("RuntimeMaxSec={timeout_secs}")
+    });
     properties.extend(
         FIXED_PROPERTIES
             .iter()
