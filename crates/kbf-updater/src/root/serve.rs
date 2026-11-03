@@ -2,7 +2,6 @@
 
 use std::ffi::OsStr;
 use std::io;
-use std::os::linux::net::SocketAddrExt;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::{SocketAddr, UnixDatagram, UnixStream};
 use std::path::PathBuf;
@@ -23,11 +22,27 @@ pub fn notify_ready(socket: Option<&OsStr>) -> io::Result<bool> {
         return Ok(false);
     };
     let address = match socket.as_bytes().strip_prefix(b"@") {
-        Some(name) => SocketAddr::from_abstract_name(name)?,
+        Some(name) => abstract_address(name)?,
         None => SocketAddr::from_pathname(socket)?,
     };
     UnixDatagram::unbound()?.send_to_addr(b"READY=1", &address)?;
     Ok(true)
+}
+
+/// The address of the abstract socket `name` (Linux's; systemd names one that way).
+#[cfg(target_os = "linux")]
+fn abstract_address(name: &[u8]) -> io::Result<SocketAddr> {
+    use std::os::linux::net::SocketAddrExt;
+    SocketAddr::from_abstract_name(name)
+}
+
+/// No other system has abstract sockets.
+#[cfg(not(target_os = "linux"))]
+fn abstract_address(_: &[u8]) -> io::Result<SocketAddr> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "abstract sockets are Linux's",
+    ))
 }
 
 /// [`notify_ready`], with what fails written to standard error: the root part serves the agent

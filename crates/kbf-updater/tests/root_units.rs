@@ -4,12 +4,10 @@
 
 mod root_support;
 
-use std::ffi::OsStr;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use std::os::linux::net::SocketAddrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt, symlink};
-use std::os::unix::net::{SocketAddr, UnixDatagram, UnixStream};
+use std::os::unix::net::{UnixDatagram, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -879,6 +877,24 @@ fn kbf_updater_root_tells_the_service_manager_it_is_ready_before_it_answers() {
     assert_eq!(heard.recv().unwrap(), b"READY=1");
 }
 
+/// Catches a `NOTIFY_SOCKET` that names an abstract socket (`@name`, Linux's) not heard:
+/// `READY=1` reaches the abstract socket of that name.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_root_part_tells_an_abstract_notify_socket_it_is_ready() {
+    use std::ffi::OsStr;
+    use std::os::linux::net::SocketAddrExt;
+    use std::os::unix::net::SocketAddr;
+    let name = format!("kbfu-notify-{}", std::process::id());
+    let hidden =
+        UnixDatagram::bind_addr(&SocketAddr::from_abstract_name(name.as_bytes()).unwrap()).unwrap();
+    let at = format!("@{name}");
+    assert!(notify_ready(Some(OsStr::new(&at))).unwrap());
+    let mut buf = [0_u8; 64];
+    let n = hidden.recv(&mut buf).unwrap();
+    assert_eq!(&buf[..n], b"READY=1");
+}
+
 /// Catches a root part that tells the service manager nothing, or tells it in a way it does not
 /// hear: with a `NOTIFY_SOCKET` (a path, or an abstract name after `@`) it sends `READY=1` there;
 /// with none it sends nothing; a socket nobody listens on is an error, which `announce_ready`
@@ -895,13 +911,6 @@ fn the_root_part_tells_the_service_manager_it_is_ready() {
     assert_eq!(&buf[..n], b"READY=1");
     assert!(announce_ready(Some(path.as_os_str())));
     let n = socket.recv(&mut buf).unwrap();
-    assert_eq!(&buf[..n], b"READY=1");
-    let name = format!("kbfu-notify-{}", std::process::id());
-    let hidden =
-        UnixDatagram::bind_addr(&SocketAddr::from_abstract_name(name.as_bytes()).unwrap()).unwrap();
-    let at = format!("@{name}");
-    assert!(notify_ready(Some(OsStr::new(&at))).unwrap());
-    let n = hidden.recv(&mut buf).unwrap();
     assert_eq!(&buf[..n], b"READY=1");
     let nobody = world.path("nobody.sock");
     assert!(notify_ready(Some(nobody.as_os_str())).is_err());
