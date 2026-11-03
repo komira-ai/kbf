@@ -18,6 +18,7 @@ use crate::testutil::{OPERATOR, Rig, ci_token};
 
 mod extras;
 mod features;
+mod generation;
 mod halt;
 mod operator;
 mod rollback;
@@ -660,7 +661,8 @@ async fn raw(
 
 /// Pins: the wire of the update path stays as it is. A heartbeat of a v0.0.18 updater is
 /// read to the same Heartbeat it was written from, deploy-farm's `POST /v1/desired` body
-/// (no `service`) is accepted and echoed as the state without a `service` key, and the
+/// (no `service`) is accepted and echoed as the state without a `service` key (then the
+/// record of the write, which an older deploy-farm does not read), and the
 /// updater behind gets exactly the bytes `{"reply":"update","version":...}` while a current
 /// one gets exactly `{"reply":"nothing"}`, with the same status line of 200.
 #[tokio::test]
@@ -677,7 +679,7 @@ async fn a_v0_0_18_updater_and_deploy_farm_get_the_bytes_they_always_got() {
     assert_eq!(code, 200);
     assert_eq!(
         String::from_utf8(set).expect("text"),
-        r#"{"version":"0.0.19+g123456abcdef-1","max_updating":{"frontend":1,"storage":1,"daemon":2,"mac-daemon":2},"min_up":{"storage":2,"frontend":1}}"#
+        r#"{"version":"0.0.19+g123456abcdef-1","max_updating":{"frontend":1,"storage":1,"daemon":2,"mac-daemon":2},"min_up":{"storage":2,"frontend":1},"generation":1,"replaced":null,"write_id":""}"#
     );
     rig.at(2_000);
     let (code, behind) = raw(
@@ -774,8 +776,8 @@ async fn a_service_the_token_may_not_set_is_a_403() {
 
 /// Catches: the status or the convergence losing a field a client already reads, or not
 /// saying which build answers: a coordinator that has seen no host and holds no desired state
-/// answers with exactly the earlier fields and one more, `commit`, the text `--version`
-/// shows after the `+`.
+/// answers with exactly the earlier fields, `commit` (the text `--version` shows after the
+/// `+`), and the empty record of the writes (`generation` 0, no `replaced`, no `write_id`).
 #[tokio::test]
 async fn the_status_and_the_convergence_say_the_build_commit_and_keep_their_fields() {
     let rig = Rig::new("http-commit");
@@ -787,7 +789,7 @@ async fn the_status_and_the_convergence_say_the_build_commit_and_keep_their_fiel
     );
     assert_eq!(
         status(&rig).await,
-        json!({"desired": null, "services": {}, "quiet": true, "services_dropped": 0, "hosts": [], "per_service": {"kbf": {"desired": null, "roles": [], "hosts": [], "up": 0, "slots_held": 0, "convergence": {"desired": null, "quiet": true, "state": "in_progress", "roles": [], "commit": commit}}}, "commit": commit})
+        json!({"desired": null, "services": {}, "quiet": true, "services_dropped": 0, "hosts": [], "per_service": {"kbf": {"desired": null, "roles": [], "hosts": [], "up": 0, "slots_held": 0, "convergence": {"desired": null, "quiet": true, "state": "in_progress", "roles": [], "commit": commit, "generation": 0, "replaced": null, "write_id": ""}}}, "commit": commit})
     );
     let (code, body) = convergence(&rig, Some(&ci_token())).await;
     assert_eq!(code, StatusCode::OK);
@@ -799,6 +801,9 @@ async fn the_status_and_the_convergence_say_the_build_commit_and_keep_their_fiel
             "state": "in_progress",
             "roles": [],
             "commit": commit,
+            "generation": 0,
+            "replaced": null,
+            "write_id": "",
         })
     );
     rig.set(STATE).await;

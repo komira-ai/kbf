@@ -36,8 +36,8 @@
 //!   step's `env:` and nothing else of the environment but the run id and attempt as the nonce
 //!   ([`NONCE`]); no other job reads a `FARM_` variable, and no address is written.
 //! - **Halt on red.** No `always()`, `failure()`, `cancelled()` or `continue-on-error`, and no
-//!   step under `if:` but the ones of `notes` that read the previous release and the network
-//!   join of `gamma`.
+//!   step under `if:` but the ones of `notes` that read the previous release, the network
+//!   join of `gamma`, and `gamma`'s last step, the restore, under the one `failure()` ([`restore`]).
 //! - **One commit.** The workflow sets `COMMIT` to the commit the pipeline run built and
 //!   `PIPELINE_RUN` to its id; every checkout is of that commit (a `ref` of exactly that, no
 //!   `repository` or `token`), and no expression reads `inputs.`, a pull request or `head_ref`,
@@ -60,6 +60,7 @@
 //!   defect planted in this file reads red from this test too.
 
 use super::workflows;
+mod restore;
 
 /// The job that holds the write scope and creates the GitHub release.
 const PUBLISH: &str = "publish";
@@ -534,7 +535,7 @@ fn graph(release: &str, out: &mut Vec<String>) -> Result<(), String> {
 /// No way for a job to pass or run after a red one, and no step under `if:` but the
 /// previous release's in `notes`.
 fn halting(release: &str, out: &mut Vec<String>) -> Result<(), String> {
-    let code = code(release);
+    let code = restore::without_its_condition(release, code(release))?;
     for word in CONTINUING {
         if code.contains(word) {
             out.push(format!(
@@ -543,16 +544,19 @@ fn halting(release: &str, out: &mut Vec<String>) -> Result<(), String> {
         }
     }
     for job in JOBS {
-        for step in workflows::job_steps(release, job)? {
+        let steps = workflows::job_steps(release, job)?;
+        for (at, step) in steps.iter().enumerate() {
             let previous = step
                 .condition
                 .as_deref()
                 .is_some_and(|c| c == "${{ steps.previous.outputs.previous != '' }}");
             let join =
-                job == GAMMA && uses(&step, TS_ACTION) && step.condition.as_deref() == Some(TS_IF);
-            if step.conditional && !(job == "notes" && previous) && !join {
+                job == GAMMA && uses(step, TS_ACTION) && step.condition.as_deref() == Some(TS_IF);
+            let allowed =
+                (job == "notes" && previous) || join || restore::is_restore(job, &steps, at);
+            if step.conditional && !allowed {
                 out.push(format!(
-                    "a step of `{job}` ({:?}) is under `if:` or `continue-on-error:`: only the previous release's steps of `notes` and the network join of `gamma` may be",
+                    "a step of `{job}` ({:?}) is under `if:` or `continue-on-error:`: only the previous release's steps of `notes`, the network join of `gamma` and its last step, the restore, may be",
                     step.name.as_deref().or(step.uses.as_deref()).unwrap_or("?")
                 ));
             }
@@ -1118,7 +1122,7 @@ fn gamma_job(release: &str, out: &mut Vec<String>) -> Result<(), String> {
             "the job `{job}` reads a secret: it holds the run's OIDC token and nothing else"
         ));
     }
-    let Some((at, step, words)) = run_of(job, &steps, "cargo xtask deploy-farm ", out) else {
+    let Some((at, step, words)) = restore::deploy_step(&steps, out) else {
         return Ok(());
     };
     tailnet_join(release, &steps, at, out)?;
@@ -1151,7 +1155,7 @@ fn gamma_job(release: &str, out: &mut Vec<String>) -> Result<(), String> {
     );
     farm_version(&steps, at, out);
     prove_farm(&steps, at, out);
-    Ok(())
+    restore::rules(release, &steps, &words, out)
 }
 
 /// The step of `gamma` that derives the version `deploy-farm` is given (at `farm_at`): the

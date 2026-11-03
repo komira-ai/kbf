@@ -1504,7 +1504,7 @@ fn gamma_reads_the_coordinators_address_from_the_variable_alone() {
         "`cargo xtask release farm-version` is not given `--tag $TAG`",
     );
     red(
-        &plant("gamma", "cargo xtask deploy-farm ", "cargo xtask other "),
+        &plant("gamma", "deploy-farm --url ", "other --url "),
         "does not run `cargo xtask deploy-farm`",
     );
 }
@@ -1836,3 +1836,4 @@ fn the_rehearsal_names_the_token_file_in_the_channel_the_helper_reads() {
         "{path}: still says the channel names no token"
     );
 }
+mod restore_tests;
