@@ -61,17 +61,19 @@
 //!   runner, for `packaging/install.sh`.
 //! - `pkg-config`, `pkg-build`, `pkg-install-test`, `pkg-upgrade-test` ([`pkg_linux`],
 //!   [`pkg_install`], [`pkg_upgrade`]): the `kbf` deb and rpm (`/usr/bin/kbf`, the units of
-//!   the modes and `kbf.slice`, the sysusers, tmpfiles and needrestart files, and the trust
-//!   directory): the nfpm configuration from the inputs, a package built twice to prove the
-//!   bytes, an install, remove and purge in a container, and the upgrade of a host that has
-//!   the `kbf-installer` deb of the release before.
+//!   the modes and `kbf.slice`, the sysusers, tmpfiles and needrestart files, the trust
+//!   directory and, in the deb, the host agent's units, enabled, and account): the nfpm
+//!   configuration from the inputs, a package built twice to prove the bytes, an install, remove
+//!   and purge in a container, and the upgrade of a host that has the `kbf-installer` deb of the
+//!   release before.
 //! - `pkg-trust` ([`pkg_trust`]): the trust directory of the packages from the pinned `gh`,
 //!   `gh`'s trusted root and the branch the package is attested on.
 //! - `pkg-kbf-asset` ([`pkg_kbf_asset`]): the `kbf` deb as the release asset
 //!   `kbf-<commit>-<platform>.deb`, refused unless its `/usr/bin/kbf` is the `kbf` of the
-//!   attested tarball, it replaces and breaks the old `kbf-installer`, it holds the units
-//!   of the modes, the slice, the sysusers and tmpfiles files, the drop-in and a trust
-//!   directory that trusts the branch it is attested for, and nothing else.
+//!   attested tarball, it replaces (and does not break) the old `kbf-installer`, it holds the units
+//!   of the modes, the slice, the sysusers and tmpfiles files, the drop-in, a trust
+//!   directory that trusts the branch it is attested for, and the host agent's two units, their
+//!   links and the agent's account, and nothing else.
 //! - `pkg-image-asset` ([`pkg_image_asset`]): the frontend, coordinator or task OCI image tarball as the
 //!   release asset `kbf-<service>-image-<commit>-<platform>.oci.tar`, refused unless its program
 //!   is the attested `kbf` (frontend) or the built `kbf-coordinator` or `kbf-task`, it runs as a user that is

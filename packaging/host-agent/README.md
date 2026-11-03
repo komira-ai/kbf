@@ -1,16 +1,17 @@
 # The host agent: units and jobs
 
-The files an operator places to run a host's update agent (`docs/design/updates.md`). Nothing
-here is in a package yet: the binaries are release assets (`docs/deploy/host-install.md`,
-"Getting the binary"), and these files go beside them.
+The files of a host's update agent (`docs/design/updates.md`). On Linux the `kbf` deb ships and
+enables the helper's and the agent's units and the agent's account ("A host that runs the package",
+below); the other files here an operator places. The binaries are in no package: they are release
+assets (`docs/deploy/host-install.md`, "Getting the binary"), placed at fixed paths no release
+writes.
 
 | file | what |
 |---|---|
 | `linux/kbf-host-local-frontend.service`, `linux/host-install-frontend.toml` | the same socket for a host whose frontend is a container (`--frontend-container`), and an example of its `/etc/kbf/host-install-frontend.toml`; use this unit or the next, not both |
-| `linux/kbf-host-local.service` | `kbf-host-install --serve`, as root: the local socket (`/run/kbf-host-install/local.sock`, mode 0600, owned by `kbf-updater`) that stages a release, switches to it on trial, and goes back by itself at the deadline |
-| `linux/kbf-host-local.service` on a host that runs the `kbf` package | add `--layout deb` (or `rpm`) to its `--serve` line: the update is then an installation of the attested package (`docs/deploy/host-install.md`, "On a Linux daemon host that runs the package"); a hand-placed host moves once with `kbf-host-install --migrate-to-package` (`docs/deploy/native-package-migration.md`) |
-| `linux/kbf-updater-agent.service` | `kbf-updater agent`, as `kbf-updater`: the heartbeat to the coordinator and the host's A/B through that socket |
-| `linux/kbf-updater.conf` | the sysusers.d entry of the `kbf-updater` account (no login, no home), and of the group `updater-register` whose members may register with the root part |
+| `linux/kbf-host-local.service` | in the `kbf` deb, enabled: `kbf-host-install --serve --layout deb`, as root: the local socket (`/run/kbf-host-install/local.sock`, mode 0600, owned by `kbf-updater`) that installs the attested package on trial, restarts `kbf-daemon.service`, and goes back by itself at the deadline (`docs/deploy/host-install.md`, "On a Linux daemon host that runs the package"). A host laid out by hand places this file itself without `--layout deb`, with a `--restart-unit` for each unit it runs; it moves to the package once with `kbf-host-install --migrate-to-package` (`docs/deploy/native-package-migration.md`) |
+| `linux/kbf-updater-agent.service` | in the `kbf` deb, enabled: `kbf-updater agent`, as `kbf-updater`: the heartbeat to the coordinator and the host's A/B through that socket |
+| `linux/kbf-updater.conf` | in the `kbf` deb, as `/usr/lib/sysusers.d/kbf-updater.conf`: the sysusers.d entry of the `kbf-updater` account (no login, no home), and of the group `updater-register` whose members may register with the root part |
 | `linux/kbf-updater-root.service` | `kbf-updater root`, as root: the root part of the generic host updater (below) |
 | `linux/kbf-updater-root.conf` | the tmpfiles.d entry of `/run/updater`, the directory of the registration socket: root's, group `updater-register`, mode 0750 |
 | `linux/updater.d/kbf.toml`, `linux/install-declaration.txt` | the declaration of the kbf hook, and the commands that install it as `/etc/updater.d/kbf.toml`, root-owned, mode 0644 |
@@ -19,10 +20,57 @@ here is in a package yet: the binaries are release assets (`docs/deploy/host-ins
 | `macos/com.komira.kbf-updater-agent.plist` | the agent on a Mac, as `_kbf-updater` |
 
 The values in the files are examples (`coordinator.farm.example`, `frontend.farm.example`, the
-state directory): edit them to the farm's. `crates/kbf-updater/tests/agent_packaging.rs`
+state directory): a host that runs the package gives the farm's in a drop-in (below); one laid out
+by hand edits its copies. `crates/kbf-updater/tests/agent_packaging.rs`
 reads these files and checks that every command line parses as the programs parse it, that
 the two ends agree on the socket and on the account that may connect to it, and that the agent
 is not root.
+
+## A host that runs the package
+
+The `kbf` deb installs `kbf-host-local.service` and `kbf-updater-agent.service` to
+`/usr/lib/systemd/system` and enables both with its own links in
+`/usr/lib/systemd/system/multi-user.target.wants/`, with no script (`packaging/linux/README.md`).
+Both are gated on their programs, which no package carries. A new Linux daemon host is then:
+
+1. **The package**: `apt-get install ./kbf-<commit>-linux-<arch>.deb` (or `dpkg --install`), of the
+   release the farm runs.
+2. **The two programs**: `kbf-host-install` and `kbf-updater` of the same release, from their
+   verified tarballs (`docs/deploy/host-install.md`, "Getting the binary"), placed at
+   `/usr/libexec/kbf/kbf-host-install` and `/usr/libexec/kbf/kbf-updater`, `root:root`, mode 0755,
+   in directories only root can write. No release writes these paths: an update installs the
+   package and leaves them as they are.
+3. **The farm's names**: one drop-in, the same file on every host of the farm, that gives the
+   agent the farm's coordinator and frontend. `ExecStart=` empty first clears the shipped line:
+
+   ```ini
+   # /etc/systemd/system/kbf-updater-agent.service.d/farm.conf
+   [Service]
+   ExecStart=
+   ExecStart=/usr/libexec/kbf/kbf-updater agent --coordinator <coordinator>:8443 --frontend <frontend>:8981 --enroll-frontend <frontend>:8444 --state-dir /var/lib/kbf-updater --cordon-dir /var/lib/kbf-updater --channel stable
+   ```
+
+   The helper's channels are `/etc/kbf/host-install-releases.toml`, as for any Linux host
+   (`docs/deploy/host-install.md`, "On Linux"). The shipped helper restarts `kbf-daemon.service`:
+   a host whose kbf runs under another mode unit gives the helper's whole line in a drop-in of
+   `kbf-host-local.service` the same way, with its own `--restart-unit`.
+4. **Boot**, or run what a boot runs: `systemd-sysusers` (the `kbf-updater` account), then
+   `systemctl daemon-reload` and `systemctl start kbf-updater-agent.service` (which starts the
+   helper too).
+5. **Enroll** (below). The agent started before the host was enrolled says so once in its journal
+   (`not enrolled: ... waiting for kbf-updater enroll`), calls nothing, and starts by itself once
+   `kbf-updater enroll` has run: no restart is needed.
+
+To turn a packaged unit off, `systemctl mask` it; an upgrade keeps the mask. A host whose frontend
+runs as a container masks `kbf-host-local.service` and runs `kbf-host-local-frontend.service`
+instead (the socket is the same). A host laid out by hand that has its own copies under
+`/etc/systemd/system` keeps them: they take precedence over the package's.
+
+**Going back below the first release that ships the units.** dpkg removes the files an older
+package does not list, so installing a `kbf` deb older than the first release that ships these
+units deletes them, and their links, on a host that got them from the package. The running agent
+and helper go on until the next boot, and then neither starts. Before a farm is set back that far,
+copy both units to `/etc/systemd/system` on such hosts and `systemctl enable` them there.
 
 ## Enrolling a host
 
