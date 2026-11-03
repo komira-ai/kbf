@@ -37,7 +37,9 @@ pub mod update;
 mod build;
 pub mod cordon;
 
-pub use build::{Access, NO_CREDENTIAL, NoCredential, run_agent, run_config, run_config_waiting};
+pub use build::{
+    Access, NO_CREDENTIAL, NoCredential, build, run_agent, run_config, run_config_waiting,
+};
 pub use run::{Agent, ServicePorts, Stop, World};
 
 #[cfg(test)]

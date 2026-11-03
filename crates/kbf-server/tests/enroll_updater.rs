@@ -498,20 +498,24 @@ fn coordinator(
 
 /// The agent as the packaged unit starts it, at boot, on a host not enrolled yet: it says once that
 /// it is not enrolled and waits, dialling no coordinator; the operator runs `kbf-updater enroll`
-/// against the frontend's real enroll listener; the agent, at its next look, starts and heartbeats
-/// to the coordinator with the certificate the enrollment made, with no restart.
+/// against the frontend's real enroll listener with a token for another node, which is refused, and
+/// the agent looks again and still waits, saying nothing more and dialling nothing; the operator
+/// runs it again with the right token; the agent, at its next look, starts and heartbeats to the
+/// coordinator with the certificate the enrollment made, with no restart.
 ///
 /// Catches: an agent that fails and is restarted in a loop until the host is enrolled, one that
-/// must be restarted by hand after `enroll`, and one that heartbeats with anything but the
-/// enrollment's certificate.
+/// takes what a refused attempt leaves (a key, no certificate) for an enrollment, one that must be
+/// restarted by hand after `enroll`, and one that heartbeats with anything but the enrollment's
+/// certificate.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_agent_started_before_kbf_updater_enroll_heartbeats_once_it_has_run() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc::channel;
 
     let farm = start("agent-waits").await;
+    let other_node = farm.updater_token(0x7a, "host-9", HostRole::DAEMON);
     let token = farm.updater_token(0x79, "host-1", HostRole::DAEMON);
-    let host = host("agent-waits-host", &farm, "host-1", &token);
+    let host = host("agent-waits-host", &farm, "host-1", &other_node);
     let dialled = Arc::new(AtomicUsize::new(0));
     let (port, coordinator) = coordinator(&farm, &dialled);
     let state = host.flags.state_dir.clone();
@@ -555,13 +559,20 @@ async fn an_agent_started_before_kbf_updater_enroll_heartbeats_once_it_has_run()
                 nap: &nap,
                 log: &log,
             },
+            kbf_updater::agent::build,
         )
     });
-
-    tokio::task::spawn_blocking(move || looked.recv())
+    // Waits until the agent has looked once more, and hands the receiver back.
+    let next_look = |looked: std::sync::mpsc::Receiver<()>| async move {
+        tokio::task::spawn_blocking(move || {
+            looked.recv().expect("the agent looked");
+            looked
+        })
         .await
         .expect("joined")
-        .expect("the agent looked");
+    };
+
+    let looked = next_look(looked).await;
     assert_eq!(
         *lines.lock().expect("log"),
         [format!(
@@ -572,6 +583,20 @@ async fn an_agent_started_before_kbf_updater_enroll_heartbeats_once_it_has_run()
     );
     assert_eq!(dialled.load(Ordering::SeqCst), 0, "nothing is dialled");
 
+    // A refused attempt: the token is for another node.
+    let error = enroll(&host).await.expect_err("refused");
+    assert!(
+        error.contains(RefusalReason::NodeIdNotAllowed.message()),
+        "{error}"
+    );
+    again.send(()).expect("the agent waits");
+    let _looked = next_look(looked).await;
+    assert_eq!(lines.lock().expect("log").len(), 1, "said once");
+    assert_eq!(dialled.load(Ordering::SeqCst), 0, "nothing is dialled");
+    assert!(!host.pki("node.json").exists());
+
+    // The operator runs it again with the token for this node.
+    std::fs::write(host.root.join("enroll.token"), token.to_line()).expect("token file");
     enroll(&host).await.expect("enrolled");
     again.send(()).expect("the agent waits");
     let (code, text) = agent.await.expect("joined");

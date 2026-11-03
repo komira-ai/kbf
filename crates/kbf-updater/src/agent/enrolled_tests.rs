@@ -1,25 +1,34 @@
 //! An agent started before its host is enrolled, as the packaged unit starts it at boot: it says
-//! once that it is not enrolled and what it waits for, calls nothing while it waits, and once the
-//! enrollment is in its state directory it starts and heartbeats. Every wait is driven by the
-//! test's own nap, never by a clock.
+//! once that it is not enrolled and what it waits for, makes no port while it waits (so it calls
+//! nothing), finishes an enrollment a crash cut short in its commit, and once the enrollment is
+//! usable it is made from the enrolled files and heartbeats. Every wait is driven by the test's
+//! own nap and every stop by a handshake, never by a clock; no test opens a socket: the agent is
+//! made over fake ports, with a coordinator that says when it got a heartbeat.
 
-use std::net::TcpListener;
-use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex};
 
+use kbf_ca::{PublicKey, SystemEntropy, UpdaterCert};
+use kbf_enroll::answer::Cert;
+use kbf_enroll::store::{Node, Store, StoredConfig};
 use kbf_testkit::dir::TestDir;
-use kbf_types::HostRole;
+use kbf_types::{CaPin, HostRole, ReleasePlatform, Role as PkiRole, RoleSet};
 
+use super::build::{identity_of_files, this_host};
 use super::build_tests::enrolled_in;
-use super::coordinator_tests::{ok, serve, server_config};
+use super::coordinator::{Coordinator, CoordinatorError};
 use super::enrolled::{Waited, Waiting, not_enrolled, wait};
 use super::flags::{Config, parse_flags};
-use super::pki::Pki;
-use super::run::Stop;
+use super::pki::{Pki, now, pem_of};
+use super::run::{Agent, Stop, World};
 use super::run_config_waiting;
-use crate::identity::identity_of;
+use super::status::Status;
+use super::testing::{Events, FakeCoordinator, FakeDrain, FakeHealth, FakeLocal, version};
+use crate::identity::Identity;
+use crate::ports::SystemClock;
+use crate::wire::{Answer, Heartbeat, Reply, ServiceReply};
 
 /// The text an agent says when its state directory holds no enrollment, spelled out so that a
 /// change to it shows here.
@@ -31,42 +40,73 @@ fn said(state: &Path) -> String {
     )
 }
 
-fn config(words: &[String]) -> Config {
-    parse_flags(words).expect("the agent's flags")
-}
-
 /// The flags of an agent with an enrollment directory, as the packaged unit gives them: the
 /// coordinator, the frontend's enroll listener (where the certificate is renewed), the directory,
-/// the channel, and the helper's socket.
-fn flags(
-    coordinator: u16,
-    enroll: u16,
-    state: &Path,
-    helper: &Path,
-    more: &[String],
-) -> Vec<String> {
-    let mut words: Vec<String> = [
-        "--coordinator".to_owned(),
-        format!("localhost:{coordinator}"),
-        "--enroll-frontend".to_owned(),
-        format!("localhost:{enroll}"),
-        "--state-dir".to_owned(),
-        state.display().to_string(),
-        "--channel".to_owned(),
-        "stable".to_owned(),
-        "--helper-socket".to_owned(),
-        helper.display().to_string(),
+/// the channel, and the helper's socket. No test here dials any of them: the agent is made over
+/// fakes.
+fn config(state: &Path) -> Config {
+    let words: Vec<String> = [
+        "--coordinator",
+        "coordinator.farm.example:8443",
+        "--enroll-frontend",
+        "frontend.farm.example:8444",
+        "--frontend",
+        "frontend.farm.example:8981",
+        "--state-dir",
+        &state.display().to_string(),
+        "--channel",
+        "stable",
+        "--helper-socket",
+        "/run/kbf-host-install/local.sock",
     ]
-    .to_vec();
-    words.extend_from_slice(more);
-    words
+    .iter()
+    .map(|w| (*w).to_owned())
+    .collect();
+    parse_flags(&words).expect("the agent's flags")
 }
 
-/// What a run saw: the lines it said and how many naps it took.
+/// A coordinator that records the heartbeats and says on `beat` when the first arrives.
+struct Signalling {
+    inner: FakeCoordinator,
+    beat: Mutex<Option<Sender<()>>>,
+}
+
+impl Signalling {
+    fn tell(&self) {
+        if let Some(beat) = self.beat.lock().unwrap().take() {
+            let _ = beat.send(());
+        }
+    }
+}
+
+impl Coordinator for Signalling {
+    fn heartbeat(&self, beat: &Heartbeat) -> Result<Reply, CoordinatorError> {
+        let reply = self.inner.heartbeat(beat);
+        self.tell();
+        reply
+    }
+
+    fn heartbeat_services(&self, beat: &Heartbeat) -> Result<ServiceReply, CoordinatorError> {
+        let reply = self.inner.heartbeat_services(beat);
+        self.tell();
+        reply
+    }
+
+    fn heartbeat_answer(&self, beat: &Heartbeat) -> Result<Answer, CoordinatorError> {
+        let reply = self.inner.heartbeat_answer(beat);
+        self.tell();
+        reply
+    }
+}
+
+/// What a run saw: the lines it said, its naps, the identities it made agents for, and the
+/// heartbeats its coordinator got.
 #[derive(Clone, Default)]
 struct Seen {
     lines: Arc<Mutex<Vec<String>>>,
     naps: Arc<AtomicUsize>,
+    made: Arc<Mutex<Vec<Identity>>>,
+    coordinator: FakeCoordinator,
 }
 
 impl Seen {
@@ -77,91 +117,189 @@ impl Seen {
     fn naps(&self) -> usize {
         self.naps.load(Ordering::SeqCst)
     }
+
+    fn made(&self) -> Vec<Identity> {
+        self.made.lock().unwrap().clone()
+    }
+
+    fn log(&self) -> impl Fn(&str) + '_ {
+        |line: &str| self.lines.lock().unwrap().push(line.to_owned())
+    }
+
+    /// The agent's maker: the identity of the certificate `cfg` names (the enrollment's), then
+    /// an agent of that host over fakes, whose coordinator says on `beat` when it got the first
+    /// heartbeat.
+    fn maker(&self, beat: Sender<()>) -> impl FnOnce(&Config) -> Result<Agent, String> + use<'_> {
+        move |cfg: &Config| {
+            let identity = identity_of_files(&cfg.files)?;
+            let host = this_host(&identity, None)?;
+            self.made.lock().unwrap().push(identity);
+            let events = Events::default();
+            Ok(Agent::new(
+                host,
+                cfg.channel.clone(),
+                cfg.timing,
+                World {
+                    coordinator: Arc::new(Signalling {
+                        inner: self.coordinator.clone(),
+                        beat: Mutex::new(Some(beat)),
+                    }),
+                    local: Arc::new(FakeLocal::new(&events)),
+                    drain: Arc::new(FakeDrain::new(&events)),
+                    health: Arc::new(FakeHealth::new(&events)),
+                    clock: Arc::new(SystemClock::new()),
+                    unix_now: Arc::new(|| 10_000),
+                    renewer: None,
+                    log: Arc::new(|_| {}),
+                },
+                Status::unknown(ReleasePlatform::LinuxX86_64, version("0")),
+            ))
+        }
+    }
 }
 
-/// A TCP listener whose port an agent is given, to tell afterwards whether anything dialled it: a
-/// connection made to it waits in its backlog until it is taken.
-struct Watched(TcpListener);
+/// Runs the agent of `state` until its coordinator has its first heartbeat, with `nap` between
+/// two looks. The exit code and text.
+fn run_until_a_heartbeat(seen: &Seen, state: &Path, nap: &dyn Fn(&Stop)) -> (u8, String) {
+    let (beat, beaten) = channel();
+    let log = seen.log();
+    run_config_waiting(
+        &config(state),
+        move |stop| {
+            std::thread::spawn(move || {
+                if beaten.recv().is_ok() {
+                    stop.stop();
+                }
+            });
+        },
+        &Waiting { nap, log: &log },
+        seen.maker(beat),
+    )
+}
 
-impl Watched {
-    fn new() -> Self {
-        Self(TcpListener::bind("127.0.0.1:0").unwrap())
+/// An enrollment as `kbf-updater enroll` makes one, step by step, in a state directory.
+struct Enrolling {
+    store: Store,
+    pki: Pki,
+    certs: Vec<Cert>,
+    node: Option<Node>,
+}
+
+impl Enrolling {
+    /// The directory, opened as `enroll` opens it.
+    fn new(state: &Path) -> Self {
+        Self {
+            store: Store::open(state).unwrap(),
+            pki: Pki::new(),
+            certs: Vec::new(),
+            node: None,
+        }
     }
 
-    fn port(&self) -> u16 {
-        self.0.local_addr().unwrap().port()
+    /// The key and the request, persisted before they are sent (what a failed attempt leaves).
+    fn pending(&mut self) {
+        let pending = self
+            .store
+            .pending(RoleSet::new([PkiRole::Updater]).unwrap())
+            .unwrap();
+        let public = PublicKey::from_spki(&pending[0].spki).unwrap();
+        let node_id = "n1".parse().unwrap();
+        let issued = self
+            .pki
+            .ca
+            .issue_updater(
+                &UpdaterCert {
+                    node_id: &node_id,
+                    host_role: &HostRole::DAEMON,
+                    key: &public,
+                },
+                now(),
+                &mut SystemEntropy,
+            )
+            .unwrap();
+        self.certs = vec![Cert {
+            role: PkiRole::Updater,
+            pem: pem_of("CERTIFICATE", &issued.der),
+            serial: "a1".to_owned(),
+            not_before: 1,
+            not_after: now() + 200_000,
+        }];
+        self.node = Some(Node::new(
+            &node_id,
+            &CaPin::from_bytes([3; 32]),
+            &self.certs,
+            now() + 100_000,
+            StoredConfig::default(),
+        ));
     }
 
-    fn dialled(&self) -> bool {
-        self.0.set_nonblocking(true).unwrap();
-        self.0.accept().is_ok()
+    /// The accepted answer, staged: `node.json` in `staging/`, nothing installed yet.
+    fn stage(&self) {
+        let node = self.node.as_ref().unwrap();
+        self.store
+            .stage(&self.certs, self.pki.root_pem().as_bytes(), node)
+            .unwrap();
+    }
+
+    /// The commit cut short after `moved` of the files it moves before `node.json` (the CA
+    /// bundle, the key, the certificate), as a crash leaves it.
+    fn commit_cut_after(&self, state: &Path, moved: usize) {
+        for name in ["ca.pem", "updater.key", "updater.pem"].iter().take(moved) {
+            std::fs::rename(
+                state.join("pki/staging").join(name),
+                state.join("pki").join(name),
+            )
+            .unwrap();
+        }
     }
 }
 
 /// An agent given a state directory that holds no enrollment says so once, in so many words,
-/// calls nothing while it waits (not the coordinator, not the frontend's worker or enroll listener,
-/// not the helper's socket), and ends with exit 0 when it is stopped during the wait, however many
-/// naps it took.
+/// makes no agent (no coordinator, frontend or helper port exists, so nothing is called) while it
+/// waits, and ends with exit 0 when it is stopped during the wait, however many naps it took.
 ///
 /// Catches: an agent that exits 1 on a missing certificate (and is restarted in a loop by its
-/// unit), that says the line on every look, or that dials anything before it is enrolled.
+/// unit), that says the line on every look, or that makes its ports before it is enrolled.
 #[test]
 fn an_agent_with_no_enrollment_says_not_enrolled_once_and_calls_nothing() {
     let dir = TestDir::under(std::env::temp_dir(), "enrolled-wait");
     let state = dir.join("state");
-    let (coordinator, frontend, enroll) = (Watched::new(), Watched::new(), Watched::new());
-    let helper = dir.join("local.sock");
-    let helper_listener = UnixListener::bind(&helper).unwrap();
-    let cfg = config(&flags(
-        coordinator.port(),
-        enroll.port(),
-        &state,
-        &helper,
-        &[
-            "--frontend".to_owned(),
-            format!("localhost:{}", frontend.port()),
-        ],
-    ));
     let seen = Seen::default();
     let stop_at = Arc::new(Mutex::new(None::<Stop>));
-    let (log_seen, nap_seen, handle) = (seen.clone(), seen.clone(), Arc::clone(&stop_at));
-    let log = move |line: &str| log_seen.lines.lock().unwrap().push(line.to_owned());
+    let handle = Arc::clone(&stop_at);
     // The third nap asks the agent to stop: it has looked three times by then.
-    let nap = move |_: &Stop| {
-        if nap_seen.naps.fetch_add(1, Ordering::SeqCst) + 1 == 3 {
+    let nap = |_: &Stop| {
+        if seen.naps.fetch_add(1, Ordering::SeqCst) + 1 == 3 {
             handle.lock().unwrap().as_ref().unwrap().stop();
         }
     };
+    let (beat, _) = channel();
+    let log = seen.log();
     let keep = Arc::clone(&stop_at);
     let (code, text) = run_config_waiting(
-        &cfg,
+        &config(&state),
         move |stop| *keep.lock().unwrap() = Some(stop),
         &Waiting {
             nap: &nap,
             log: &log,
         },
+        seen.maker(beat),
     );
     assert_eq!((code, text.as_str()), (0, ""));
     assert_eq!(seen.lines(), [said(&state)]);
     assert_eq!(seen.lines(), [not_enrolled(&state)]);
     assert_eq!(seen.naps(), 3);
-    assert!(!coordinator.dialled(), "the coordinator was dialled");
-    assert!(!frontend.dialled(), "the frontend was dialled");
-    assert!(!enroll.dialled(), "the enroll listener was dialled");
-    helper_listener.set_nonblocking(true).unwrap();
-    assert!(
-        helper_listener.accept().is_err(),
-        "the helper's socket was dialled"
-    );
+    assert!(seen.made().is_empty(), "an agent was made");
+    assert!(seen.coordinator.beats().is_empty());
 }
 
-/// An agent that waited and then finds the enrollment `kbf-updater enroll` leaves (here written
-/// at its first nap) starts: its first heartbeat reaches the coordinator over mutual TLS with the
-/// enrolled certificate, after one line and one nap. An agent whose host was enrolled before it
-/// started says nothing and naps never.
+/// An agent that waited and then finds the enrollment `kbf-updater enroll` leaves (written at its
+/// first nap) is made from the enrolled certificate, node `n1`, and heartbeats, after one line and
+/// one nap. An agent whose host was enrolled before it started says nothing and naps never.
 ///
 /// Catches: an agent that waits on after the enrollment is there, that must be restarted to pick
-/// it up, or that waits (and says it is not enrolled) on a host that is.
+/// it up, that is made from other files, or that waits (and says it is not enrolled) on a host that
+/// is.
 #[test]
 fn once_the_host_is_enrolled_the_waiting_agent_heartbeats() {
     for enrolled_before in [false, true] {
@@ -171,48 +309,17 @@ fn once_the_host_is_enrolled_the_waiting_agent_heartbeats() {
             enrolled_in(&dir, &pki, HostRole::DAEMON);
         }
         let state = dir.join("state");
-        let (addr, coordinator) = serve(
-            server_config(&pki, &pki.coordinator()),
-            vec![ok(r#"{"reply":"nothing"}"#)],
-        );
-        let cfg = config(&flags(
-            addr.port(),
-            1,
-            &state,
-            &dir.join("no-helper.sock"),
-            &[],
-        ));
         let seen = Seen::default();
-        let (log_seen, nap_seen) = (seen.clone(), seen.clone());
-        let log = move |line: &str| log_seen.lines.lock().unwrap().push(line.to_owned());
         let nap = |_: &Stop| {
-            nap_seen.naps.fetch_add(1, Ordering::SeqCst);
+            seen.naps.fetch_add(1, Ordering::SeqCst);
             enrolled_in(&dir, &pki, HostRole::DAEMON);
         };
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let got = Arc::clone(&calls);
-        // Stopped once the coordinator has answered its one heartbeat.
-        let (code, text) = run_config_waiting(
-            &cfg,
-            move |stop| {
-                std::thread::spawn(move || {
-                    *got.lock().unwrap() = coordinator.join().unwrap();
-                    stop.stop();
-                });
-            },
-            &Waiting {
-                nap: &nap,
-                log: &log,
-            },
-        );
+        let (code, text) = run_until_a_heartbeat(&seen, &state, &nap);
         assert_eq!((code, text.as_str()), (0, ""), "{enrolled_before}");
-        let calls = calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        let request = String::from_utf8_lossy(&calls[0].request);
-        assert!(request.starts_with("POST "), "{request}");
-        let client = identity_of(calls[0].client.as_deref().expect("a client certificate"))
-            .expect("an updater's certificate");
-        assert_eq!(client.node_id.to_string(), "n1");
+        let made = seen.made();
+        assert_eq!(made.len(), 1);
+        assert_eq!(made[0].node_id.to_string(), "n1");
+        assert!(!seen.coordinator.beats().is_empty());
         if enrolled_before {
             assert_eq!((seen.lines(), seen.naps()), (Vec::<String>::new(), 0));
         } else {
@@ -221,46 +328,136 @@ fn once_the_host_is_enrolled_the_waiting_agent_heartbeats() {
     }
 }
 
-/// A state directory whose enrollment cannot be read is not waited for: the agent is not started,
-/// exit 1 names the damaged file, and it neither naps nor says it is not enrolled. An agent given
-/// files an operator placed has no enrollment to wait for: it is built at once, and a certificate
-/// that is not there is exit 1 naming it, with no nap and no line.
+/// A first enrollment that a crash cut short in its commit, at every point of it (nothing moved,
+/// the CA bundle, then the key, then the certificate, `node.json` still staged), is finished by
+/// the agent at its first look, under the store's lock: the agent says nothing, naps never, is made
+/// from the enrolled certificate and heartbeats, and the directory holds the whole enrollment.
 ///
-/// Catches: an agent that takes a damaged enrollment for a missing one and waits forever, or one
-/// that waits for an enrollment it was not told to use.
+/// Catches: an agent that takes a staged enrollment for none and waits forever, so that the host
+/// needs an operator to run `enroll` again.
 #[test]
-fn a_damaged_enrollment_or_placed_files_are_never_waited_for() {
-    let dir = TestDir::under(std::env::temp_dir(), "enrolled-damaged");
+fn an_enrollment_a_crash_cut_short_in_its_commit_is_finished_and_the_agent_starts() {
+    for moved in 0..=3 {
+        let dir = TestDir::under(std::env::temp_dir(), "enrolled-cut");
+        let state = dir.join("state");
+        let mut enrolling = Enrolling::new(&state);
+        enrolling.pending();
+        enrolling.stage();
+        enrolling.commit_cut_after(&state, moved);
+        let seen = Seen::default();
+        let nap = |_: &Stop| panic!("a staged enrollment is finished at the first look");
+        let (code, text) = run_until_a_heartbeat(&seen, &state, &nap);
+        assert_eq!((code, text.as_str()), (0, ""), "{moved}");
+        assert_eq!((seen.lines(), seen.naps()), (Vec::<String>::new(), 0));
+        assert_eq!(seen.made()[0].node_id.to_string(), "n1");
+        assert!(!seen.coordinator.beats().is_empty());
+        assert!(state.join("pki/node.json").exists(), "{moved}");
+        assert!(!state.join("pki/staging").exists(), "{moved}");
+    }
+}
+
+/// The agent looks between the steps of an enrollment: after the key and request alone (what a
+/// refused attempt leaves, and what a retry starts from), after that attempt failed, and once the
+/// retry's answer is staged. It says its line once, makes no agent while only the key is there,
+/// and is made from the enrolled certificate and heartbeats once the answer is staged.
+///
+/// Catches: an agent that takes a key without a certificate for an enrollment, that says its line
+/// again after a failed attempt, or that is made before the enrollment is usable.
+#[test]
+fn the_agent_looks_between_the_steps_of_an_enrollment_and_starts_once_it_is_usable() {
+    let dir = TestDir::under(std::env::temp_dir(), "enrolled-steps");
     let state = dir.join("state");
+    let enrolling = Mutex::new(None::<Enrolling>);
+    let seen = Seen::default();
+    let nap = |_: &Stop| {
+        let n = seen.naps.fetch_add(1, Ordering::SeqCst) + 1;
+        assert!(
+            seen.made().is_empty(),
+            "made before the enrollment is usable"
+        );
+        let mut enrolling = enrolling.lock().unwrap();
+        match n {
+            // The first attempt sends its request: the key is kept; its answer is a refusal.
+            1 => {
+                let mut first = Enrolling::new(&state);
+                first.pending();
+                *enrolling = Some(first);
+            }
+            // Nothing new: the attempt failed, the operator has not run `enroll` again.
+            2 => {}
+            // The retry sends the same request and its answer is staged, then committed.
+            3 => enrolling.as_ref().unwrap().stage(),
+            _ => panic!("a usable enrollment is started from"),
+        }
+    };
+    let (code, text) = run_until_a_heartbeat(&seen, &state, &nap);
+    assert_eq!((code, text.as_str()), (0, ""));
+    assert_eq!((seen.lines(), seen.naps()), (vec![said(&state)], 3));
+    assert_eq!(seen.made().len(), 1);
+    assert_eq!(seen.made()[0].node_id.to_string(), "n1");
+    assert!(!seen.coordinator.beats().is_empty());
+}
+
+/// The text of the error the agent ends with when its enrollment cannot be read: the directory,
+/// then the store's own words.
+fn unreadable(state: &Path, store: &str) -> String {
+    format!(
+        "kbf-updater: the enrollment in {} cannot be read: {store}\n",
+        state.display()
+    )
+}
+
+/// A state directory whose enrollment cannot be read is not waited for, before the wait or after it
+/// began: a `node.json` that does not parse, and one that cannot be read at all (a directory in its
+/// place), are exit 1 with the whole error, no agent is made, and the line was said once at most.
+/// An agent given files an operator placed has no enrollment to wait for: it is made at once.
+///
+/// Catches: an agent that takes an unreadable enrollment for a missing one and waits forever, one
+/// that hides the store's error, and one that waits for an enrollment it was not told to use.
+#[test]
+fn an_enrollment_that_cannot_be_read_ends_the_wait_and_placed_files_are_never_waited_for() {
+    let dir = TestDir::under(std::env::temp_dir(), "enrolled-unreadable");
+    let none = |_: &Stop| panic!("no nap");
+
+    // Damaged, before the first look.
+    let state = dir.join("damaged");
     std::fs::create_dir_all(state.join("pki")).unwrap();
     std::fs::write(state.join("pki/node.json"), b"{not json").unwrap();
     let seen = Seen::default();
-    let (log_seen, nap_seen) = (seen.clone(), seen.clone());
-    let log = move |line: &str| log_seen.lines.lock().unwrap().push(line.to_owned());
-    let nap = move |_: &Stop| {
-        nap_seen.naps.fetch_add(1, Ordering::SeqCst);
-    };
-    let waiting = Waiting {
-        nap: &nap,
-        log: &log,
-    };
-    let cfg = config(&flags(1, 1, &state, &dir.join("no-helper.sock"), &[]));
-    let (code, text) = run_config_waiting(&cfg, |_| {}, &waiting);
-    assert_eq!(
-        (code, text),
-        (
-            1,
-            format!(
-                "kbf-updater: {} is damaged\n",
-                state.join("pki/node.json").display()
-            )
-        )
-    );
+    let (code, text) = run_until_a_heartbeat(&seen, &state, &none);
+    let store = format!("{} is damaged", state.join("pki/node.json").display());
+    assert_eq!((code, text), (1, unreadable(&state, &store)));
+    assert_eq!((seen.lines(), seen.made().len()), (Vec::<String>::new(), 0));
 
+    // Not readable, before the first look.
+    let state = dir.join("unreadable");
+    let node_json = state.join("pki/node.json");
+    std::fs::create_dir_all(&node_json).unwrap();
+    let why = std::fs::read(&node_json).unwrap_err();
+    let store = format!("{}: {why}", node_json.display());
+    let seen = Seen::default();
+    let (code, text) = run_until_a_heartbeat(&seen, &state, &none);
+    assert_eq!((code, text), (1, unreadable(&state, &store)));
+    assert_eq!((seen.lines(), seen.made().len()), (Vec::<String>::new(), 0));
+
+    // Not readable once the wait began: the first nap puts a directory where `node.json` goes.
+    let state = dir.join("unreadable-later");
+    let node_json = state.join("pki/node.json");
+    let seen = Seen::default();
+    let nap = |_: &Stop| {
+        seen.naps.fetch_add(1, Ordering::SeqCst);
+        std::fs::create_dir_all(&node_json).unwrap();
+    };
+    let (code, text) = run_until_a_heartbeat(&seen, &state, &nap);
+    assert_eq!((code, text), (1, unreadable(&state, &store_of(&node_json))));
+    assert_eq!((seen.lines(), seen.naps()), (vec![said(&state)], 1));
+    assert!(seen.made().is_empty());
+
+    // Placed files: made at once, from the files named, and never waited for.
     let placed: PathBuf = dir.join("placed");
     let words: Vec<String> = [
         "--coordinator",
-        "localhost:1",
+        "coordinator.farm.example:8443",
         "--client-cert",
         &placed.join("cert.pem").display().to_string(),
         "--client-key",
@@ -273,18 +470,34 @@ fn a_damaged_enrollment_or_placed_files_are_never_waited_for() {
     .iter()
     .map(|w| (*w).to_owned())
     .collect();
-    let (code, text) = run_config_waiting(&config(&words), |_| {}, &waiting);
+    let seen = Seen::default();
+    let (beat, _) = channel();
+    let log = seen.log();
+    let (code, text) = run_config_waiting(
+        &parse_flags(&words).unwrap(),
+        |_| {},
+        &Waiting {
+            nap: &none,
+            log: &log,
+        },
+        seen.maker(beat),
+    );
     assert_eq!(code, 1);
     assert!(
         text.contains(&placed.join("cert.pem").display().to_string()),
         "{text}"
     );
-    assert_eq!((seen.lines(), seen.naps()), (Vec::<String>::new(), 0));
+    assert_eq!(seen.lines(), Vec::<String>::new());
+}
+
+/// The store's words for a path that cannot be read as a file.
+fn store_of(path: &Path) -> String {
+    format!("{}: {}", path.display(), std::fs::read(path).unwrap_err())
 }
 
 /// The wait alone: an agent asked to stop before its first look still looks once (an enrolled
 /// host is never kept waiting by a stop), says the line once, and ends after one nap, which a stop
-/// cuts short.
+/// cuts short; an enrolled host never naps.
 #[test]
 fn a_stop_before_the_first_look_ends_the_wait_after_one_look() {
     let dir = TestDir::under(std::env::temp_dir(), "enrolled-stopped");
@@ -305,13 +518,13 @@ fn a_stop_before_the_first_look_ends_the_wait_after_one_look() {
             log: &log,
         },
     );
-    assert_eq!(waited, Ok(Waited::Stopped));
+    assert!(matches!(waited, Ok(Waited::Stopped)), "{waited:?}");
     assert_eq!(*lines.lock().unwrap(), [said(&state)]);
     assert_eq!(naps.load(Ordering::SeqCst), 1);
-    let nap = |_: &Stop| panic!("an enrolled host never naps");
 
     let pki = Pki::new();
     let state = enrolled_in(&dir, &pki, HostRole::DAEMON);
+    let nap = |_: &Stop| panic!("an enrolled host never naps");
     let quiet = |_: &str| panic!("an enrolled host is not said to be unenrolled");
     let waited = wait(
         &state,
@@ -321,26 +534,43 @@ fn a_stop_before_the_first_look_ends_the_wait_after_one_look() {
             log: &quiet,
         },
     );
-    assert_eq!(waited, Ok(Waited::Enrolled));
+    assert!(matches!(waited, Ok(Waited::Enrolled)), "{waited:?}");
 }
 
-/// The process's own wait (`run_config`, as `kbf-updater agent` runs it): an agent that is not
-/// enrolled and is stopped as it starts says its line on the error stream, naps until the stop
-/// (which cuts the nap short), and ends with exit 0, having called nothing.
+/// The process's own nap (the agent's `sleep` of [`super::enrolled::LOOK_EVERY`], which a stop cuts
+/// short), stopped once the wait has begun: the line the agent says is the sign it has, and the stop
+/// is asked only then. The run ends with exit 0 and no agent made.
 ///
-/// Catches: a production nap that ignores the stop, so that stopping a waiting agent hangs.
+/// Catches: a production nap that a stop does not end, so that stopping a waiting agent hangs.
 #[test]
-fn the_process_stops_while_it_waits_for_its_enrollment() {
+fn the_process_stops_once_its_wait_has_begun() {
     let dir = TestDir::under(std::env::temp_dir(), "enrolled-process");
-    let coordinator = Watched::new();
-    let cfg = config(&flags(
-        coordinator.port(),
-        1,
-        &dir.join("state"),
-        &dir.join("no-helper.sock"),
-        &[],
-    ));
-    let (code, text) = super::run_config(&cfg, |stop| stop.stop());
+    let state = dir.join("state");
+    let seen = Seen::default();
+    let (began, waiting) = channel::<()>();
+    let began = Mutex::new(began);
+    let log = |line: &str| {
+        seen.lines.lock().unwrap().push(line.to_owned());
+        began.lock().unwrap().send(()).unwrap();
+    };
+    let nap = |stop: &Stop| super::run::sleep(super::enrolled::LOOK_EVERY, stop);
+    let (beat, _) = channel();
+    let (code, text) = run_config_waiting(
+        &config(&state),
+        move |stop| {
+            std::thread::spawn(move || {
+                if waiting.recv().is_ok() {
+                    stop.stop();
+                }
+            });
+        },
+        &Waiting {
+            nap: &nap,
+            log: &log,
+        },
+        seen.maker(beat),
+    );
     assert_eq!((code, text.as_str()), (0, ""));
-    assert!(!coordinator.dialled(), "the coordinator was dialled");
+    assert_eq!(seen.lines(), [said(&state)]);
+    assert!(seen.made().is_empty());
 }

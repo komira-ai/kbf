@@ -6,16 +6,18 @@
 //! nothing (no coordinator, no frontend, no helper), and looks at the directory again after a
 //! nap. The enrollment is there once `enroll` has committed it (`node.json` is the last file it
 //! moves into place, [`kbf_enroll::store`]); the agent then starts as it would have if the files
-//! had been there from the start. A directory whose enrollment cannot be read is not waited for:
-//! it is refused with the reason, as a start that fails.
+//! had been there from the start. Each look is a [`Store::recover`]: an enrollment that `enroll`
+//! staged and a crash cut short in its commit is finished by the agent, under the store's lock, so
+//! never under an `enroll` that is about to commit it. A directory whose enrollment cannot be read
+//! is not waited for: it is refused with the reason ([`WaitError`]), as a start that fails.
 //!
 //! An agent given files an operator placed (`--client-cert`, `--client-key`, `--ca`) has no
 //! enrollment to wait for and starts at once.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use kbf_enroll::store::Store;
+use kbf_enroll::store::{Store, StoreError};
 
 use super::run::Stop;
 
@@ -40,6 +42,20 @@ pub enum Waited {
     Stopped,
 }
 
+/// Why the wait for an enrollment ended without one.
+#[derive(Debug, thiserror::Error)]
+pub enum WaitError {
+    /// The enrollment in the directory cannot be read, or a staged one cannot be finished.
+    #[error("the enrollment in {dir} cannot be read: {source}")]
+    Unreadable {
+        /// The state directory.
+        dir: PathBuf,
+        /// What the store said.
+        #[source]
+        source: StoreError,
+    },
+}
+
 /// The line an agent that is not enrolled says, once.
 #[must_use]
 pub fn not_enrolled(state_dir: &Path) -> String {
@@ -55,12 +71,17 @@ pub fn not_enrolled(state_dir: &Path) -> String {
 /// enrolled already.
 ///
 /// # Errors
-/// The enrollment cannot be read (the directory is not the agent's, or `node.json` is damaged).
-pub fn wait(state_dir: &Path, stop: &Stop, waiting: &Waiting) -> Result<Waited, String> {
+/// [`WaitError::Unreadable`]: the enrollment cannot be read (the directory is not the agent's,
+/// `node.json` is damaged) or a staged one cannot be finished.
+pub fn wait(state_dir: &Path, stop: &Stop, waiting: &Waiting) -> Result<Waited, WaitError> {
     let store = Store::unopened(state_dir);
     let mut said = false;
     loop {
-        if store.load().map_err(|e| e.to_string())?.is_some() {
+        let found = store.recover().map_err(|source| WaitError::Unreadable {
+            dir: state_dir.to_owned(),
+            source,
+        })?;
+        if found.is_some() {
             return Ok(Waited::Enrolled);
         }
         if !said {

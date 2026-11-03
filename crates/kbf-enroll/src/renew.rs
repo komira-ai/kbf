@@ -138,7 +138,6 @@ pub async fn renew(frontend: &Frontend, store: &Store, now: i64) -> Result<Node,
         .as_ref()
         .map_or_else(|| node.config.clone(), StoredConfig::from_proto);
     let updated = Node::new(&node_id, &pin, &certs, response.renew_after, config);
-    store.stage(&certs, &response.ca_bundle_pem, &updated)?;
-    store.commit()?;
+    store.install(&certs, &response.ca_bundle_pem, &updated)?;
     Ok(updated)
 }

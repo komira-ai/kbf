@@ -7,7 +7,7 @@ use kbf_testkit::dir::TestDir;
 
 /// A defect of the package or of the system, planted in the model of the container.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Defect {
+pub(super) enum Defect {
     None,
     InstallFails,
     NotInstalled,
@@ -46,6 +46,14 @@ enum Defect {
     AgentUnitMissing,
     /// The helper's command line lays releases out by hand (no `--layout deb`).
     HelperWithoutLayout,
+    /// The helper's command line names a layout that only begins with `deb`.
+    HelperLayoutDebug,
+    /// The helper's command line names two layouts.
+    HelperLayoutTwice,
+    /// The helper's command line names `deb` in the `--layout=deb` spelling (no defect).
+    HelperLayoutEquals,
+    /// A unit gated on its program starts with the program there and not executable.
+    GateIgnoresExecutable,
     /// A link points elsewhere than the listing says.
     LinkWrongTarget,
     /// The rpm holds the deb's host agent.
@@ -54,10 +62,12 @@ enum Defect {
 
 /// A model of a container: the files that exist, the users, what is installed, the
 /// answers of the tools. `log` holds every argv.
-struct World {
+pub(super) struct World {
     entries: Vec<Entry>,
     defect: Defect,
     files: BTreeSet<String>,
+    /// The files made with mode 0755 (`install -m 0755`).
+    executable: BTreeSet<String>,
     users_made: bool,
     installed: bool,
     purged: bool,
@@ -66,7 +76,7 @@ struct World {
     started: BTreeSet<String>,
     /// The journal: the unit and the line.
     journal: Vec<(String, String)>,
-    log: Vec<String>,
+    pub(super) log: Vec<String>,
 }
 
 fn ok(stdout: &str) -> Out {
@@ -160,6 +170,7 @@ impl World {
             entries: entries(),
             defect,
             files: BTreeSet::new(),
+            executable: BTreeSet::new(),
             users_made: false,
             installed: false,
             purged: false,
@@ -273,12 +284,20 @@ impl World {
                 ok("")
             }
             ["cat", path] if *path == unit_path("kbf-host-local.service") => {
-                ok(if self.is(Defect::HelperWithoutLayout) {
-                    "[Service]\nExecStart=/usr/libexec/kbf/kbf-host-install --serve --restart-unit kbf-daemon.service\n"
-                } else {
-                    "[Service]\nExecStart=/usr/libexec/kbf/kbf-host-install --serve  --layout   deb --restart-unit kbf-daemon.service\n"
-                })
+                let layout = match self.defect {
+                    Defect::HelperWithoutLayout => "",
+                    Defect::HelperLayoutDebug => "--layout debug",
+                    Defect::HelperLayoutTwice => "--layout deb --layout rpm",
+                    Defect::HelperLayoutEquals => "--layout=deb",
+                    _ => " --layout   deb",
+                };
+                ok(&format!(
+                    "[Service]\nExecStart=/usr/libexec/kbf/kbf-host-install --serve {layout} --restart-unit kbf-daemon.service\n"
+                ))
             }
+            ["systemctl", "cat", unit] if unit.contains("agent") => ok(&format!(
+                "[Unit]\nConditionFileIsExecutable={AGENT_PROGRAM}\n"
+            )),
             ["systemctl", "show", "-p", "WantedBy", "--value", unit] => self.wanted_by(unit),
             ["readlink", path] => {
                 let target = self
@@ -313,6 +332,11 @@ impl World {
             }
             ["install", .., "/dev/null", path] => {
                 self.files.insert((*path).to_owned());
+                if args.contains(&"0755") {
+                    self.executable.insert((*path).to_owned());
+                } else {
+                    self.executable.remove(*path);
+                }
                 // Its directory exists too (`install -D`; /etc/kbf for the config).
                 if let Some((dir, _)) = path.rsplit_once('/') {
                     self.files.insert(dir.to_owned());
@@ -465,13 +489,18 @@ impl World {
     /// once, as the stand-in for `kbf` does, so it is inactive again when the start returns (and
     /// `systemctl show -p ConditionResult` of it says `no` whatever the file holds).
     fn journal_start(&mut self, unit: &str) {
-        // The gate: the unit's condition holds when its file exists.
-        let path = if unit.contains("node") {
-            "/etc/kbf/kbf.toml"
+        // The gate: the unit's condition holds when its file exists (and, for the agent's, which
+        // is gated on its program, when the file is executable).
+        let (path, program) = if unit.contains("node") {
+            ("/etc/kbf/kbf.toml", false)
+        } else if unit.contains("agent") {
+            (AGENT_PROGRAM, true)
         } else {
-            "/etc/kbf/installer.toml"
+            ("/etc/kbf/installer.toml", false)
         };
-        let holds = (self.files.contains(path) && !self.is(Defect::GateNeverHolds))
+        let runs =
+            !program || self.executable.contains(path) || self.is(Defect::GateIgnoresExecutable);
+        let holds = (self.files.contains(path) && runs && !self.is(Defect::GateNeverHolds))
             || self.is(Defect::GateIgnored)
             || self.is(Defect::GateRunsWithoutFile);
         let lines: Vec<String> = if holds {
@@ -522,6 +551,9 @@ impl World {
     }
 }
 
+/// The agent's program, which its unit is gated on.
+pub(super) const AGENT_PROGRAM: &str = "/usr/libexec/kbf/kbf-updater";
+
 const GATES: [(&str, &str); 2] = [
     ("kbf-node.service", "/etc/kbf/kbf.toml"),
     ("kbf-installer.service", "/etc/kbf/installer.toml"),
@@ -544,6 +576,15 @@ fn probes() -> Vec<Probe> {
 
 /// The verb over a model with `defect`: the world after, and the result.
 fn run_with(format: Format, defect: Defect) -> (World, Result<Vec<String>, Error>) {
+    run_gated(format, defect, &gates())
+}
+
+/// [`run_with`], with the gates `gates`.
+pub(super) fn run_gated(
+    format: Format,
+    defect: Defect,
+    gates: &[Gate],
+) -> (World, Result<Vec<String>, Error>) {
     let beside = std::env::current_exe().expect("exe");
     let dir = TestDir::under(
         beside
@@ -560,7 +601,6 @@ fn run_with(format: Format, defect: Defect) -> (World, Result<Vec<String>, Error
     let mut model = World::new(defect);
     model.deb = format == Format::Deb;
     let world = std::cell::RefCell::new(model);
-    let gates = gates();
     let probes = probes();
     let result = run(
         &mut |args| Ok(world.borrow_mut().docker(args)),
@@ -570,7 +610,7 @@ fn run_with(format: Format, defect: Defect) -> (World, Result<Vec<String>, Error
             format,
             listing: &listing,
             image_dir: Path::new("/p/image"),
-            gates: &gates,
+            gates,
             probes: &probes,
             container: "c1",
         },
@@ -655,7 +695,7 @@ fn each_defect_of_the_package_or_the_system_is_a_named_problem() {
         (
             Format::Deb,
             Defect::HelperWithoutLayout,
-            "kbf-host-local.service does not install the package (--layout deb): \"ExecStart=/usr/libexec/kbf/kbf-host-install --serve --restart-unit kbf-daemon.service\"",
+            "kbf-host-local.service does not install the package (exactly one --layout deb): \"ExecStart=/usr/libexec/kbf/kbf-host-install --serve  --restart-unit kbf-daemon.service\"",
         ),
         (
             Format::Deb,

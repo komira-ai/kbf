@@ -65,7 +65,7 @@ fn the_sources_of_a_config_are_its_files_and_not_its_links() {
 #[test]
 fn the_plan_refuses_a_host_agent_directory_that_lacks_a_file() {
     type Change = fn(&Tree) -> Inputs<'_>;
-    let cases: [(&str, Change, &str); 4] = [
+    let cases: [(&str, Change, &str); 3] = [
         (
             "a missing helper unit",
             |t| {
@@ -91,19 +91,19 @@ fn the_plan_refuses_a_host_agent_directory_that_lacks_a_file() {
             },
             "host agent file kbf-updater.conf is missing",
         ),
-        (
-            "a host agent directory that is not there",
-            |t| {
-                let mut i = t.inputs();
-                i.host_agent = Path::new("/nonexistent/host-agent");
-                i
-            },
-            "/nonexistent/host-agent cannot be read as a directory",
-        ),
     ];
     for (n, (what, change, says)) in cases.iter().enumerate() {
         let t = Tree::new(&format!("refuse-agent-{n}"));
         let text = refused(kbf_plan(&change(&t)));
-        assert!(text.contains(says), "{what}: {text}");
+        assert_eq!(text, *says, "{what}");
     }
+    // A directory that is not there: a child of the test's own tree that was never made.
+    let t = Tree::new("refuse-agent-absent");
+    let absent = t.dir.join("absent-host-agent");
+    let mut inputs = t.inputs();
+    inputs.host_agent = &absent;
+    assert_eq!(
+        refused(kbf_plan(&inputs)),
+        format!("{} cannot be read as a directory", absent.display())
+    );
 }

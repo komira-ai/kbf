@@ -179,26 +179,52 @@ pub fn problems(deb: &[u8], c: &Check) -> Result<Vec<String>, Error> {
             ));
         }
     }
-    let wanted = links();
-    for (link, target) in &wanted {
-        match opened.links.iter().find(|(p, _)| p == link) {
-            None => problems.push(format!(
-                "holds no link {link}, which enables its unit at boot"
-            )),
-            Some((_, got)) if got != target => {
-                problems.push(format!("{link} points to {got:?}, not {target:?}"));
-            }
-            Some(_) => {}
-        }
+    problems.extend(link_problems(&opened));
+    Ok(problems)
+}
+
+/// What is wrong with the links of `opened`: a path the data tarball holds more than once (two
+/// entries, links or a file and a link, which dpkg would unpack one over the other), a link the
+/// package ships that is missing, every link that points elsewhere than [`links`] says, and a link
+/// it does not ship.
+fn link_problems(opened: &pkg_asset::Opened) -> Vec<String> {
+    let mut problems = Vec::new();
+    let mut paths: Vec<&str> = opened
+        .files
+        .iter()
+        .map(|m| m.path.as_str())
+        .chain(opened.links.iter().map(|(p, _)| p.as_str()))
+        .collect();
+    paths.sort_unstable();
+    let mut repeated: Vec<&str> = paths
+        .windows(2)
+        .filter(|w| w[0] == w[1])
+        .map(|w| w[0])
+        .collect();
+    repeated.dedup();
+    for path in repeated {
+        problems.push(format!("holds {path} more than once"));
     }
-    for (link, target) in &opened.links {
-        if !wanted.iter().any(|(p, _)| p == link) {
+    let wanted = links();
+    for (link, _) in &wanted {
+        if !opened.links.iter().any(|(p, _)| p == link) {
             problems.push(format!(
-                "holds the link {link} -> {target}, which the kbf package does not ship"
+                "holds no link {link}, which enables its unit at boot"
             ));
         }
     }
-    Ok(problems)
+    for (link, got) in &opened.links {
+        match wanted.iter().find(|(p, _)| p == link) {
+            Some((_, target)) if got != target => {
+                problems.push(format!("{link} points to {got:?}, not {target:?}"));
+            }
+            Some(_) => {}
+            None => problems.push(format!(
+                "holds the link {link} -> {got}, which the kbf package does not ship"
+            )),
+        }
+    }
+    problems
 }
 
 /// The `pkg-kbf-asset` verb: the lines to print.

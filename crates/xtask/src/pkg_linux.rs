@@ -617,7 +617,7 @@ pub fn parse_listing(text: &str) -> Result<Vec<Entry>, Error> {
             let (sha256, link) = match (kind, what) {
                 ("dir", "-") => (None, None),
                 ("file", hex) => (Some(hex.parse::<Sha256>().map_err(|_| bad())?), None),
-                ("link", target) if mode == LINK_MODE && target != "-" => {
+                ("link", target) if mode == LINK_MODE && !matches!(target, "" | "-") => {
                     (None, Some(target.to_owned()))
                 }
                 _ => return Err(bad()),

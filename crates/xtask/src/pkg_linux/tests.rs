@@ -445,6 +445,8 @@ fn a_listing_line_that_is_not_one_is_refused() {
         format!("file 9 /a {sha}"),
         format!("link 0644 /a {sha}"),
         "link 0777 /a -".to_owned(),
+        "link 0777 /a ".to_owned(),
+        "link 0777 /a  deb".to_owned(),
         format!("file 0644 /a {sha} rpm"),
         format!("file 0644 /a {sha} deb more"),
         "dir 0755 /a".to_owned(),

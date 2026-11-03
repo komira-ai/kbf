@@ -89,8 +89,10 @@ sudo -u kbf-updater /usr/libexec/kbf/kbf-updater enroll --frontend frontend.farm
 The key is made on the host and stays there (mode 0600, the account's); only a request signed
 by it is sent. The command checks the frontend against the CA pin in the token, checks what it
 gets back, writes `pki/updater.key`, `pki/updater.pem` and `pki/ca.pem` into the state
-directory, and removes the token file. The agent then starts (or is restarted, if it was
-waiting) and renews the certificate itself at half its life. `enroll-example.txt` is that
+directory, and removes the token file. An agent that is already running, waiting for the
+enrollment, picks it up at its next look (within 5 seconds) and starts, with no restart; one that
+is not running starts with its unit (`systemctl start kbf-updater-agent.service`, or at the next
+boot). Either way it renews the certificate itself at half its life. `enroll-example.txt` is that
 command, which `crates/kbf-updater/tests/agent_packaging.rs` checks against the unit's
 `--state-dir` and the program's flags.
 

@@ -408,8 +408,8 @@ pub fn run_agent(agent: &Agent, ready: impl FnOnce(Stop)) -> (u8, String) {
     (0, String::new())
 }
 
-/// [`run_config_waiting`], napping [`LOOK_EVERY`] between two looks at an enrollment that is not
-/// there yet and saying so on the error stream.
+/// [`run_config_waiting`] with the real ports ([`build`]), napping [`LOOK_EVERY`] between two
+/// looks at an enrollment that is not there yet and saying so on the error stream.
 pub fn run_config(cfg: &Config, ready: impl FnOnce(Stop)) -> (u8, String) {
     let log = |line: &str| eprintln!("kbf-updater: {line}");
     let nap = |stop: &Stop| super::run::sleep(LOOK_EVERY, stop);
@@ -420,17 +420,21 @@ pub fn run_config(cfg: &Config, ready: impl FnOnce(Stop)) -> (u8, String) {
             nap: &nap,
             log: &log,
         },
+        build,
     )
 }
 
 /// The agent of `cfg`, run until the handle given to `ready` stops it. An agent given
-/// `--state-dir` first waits there for the host's enrollment ([`enrolled::wait`]); then
-/// [`build`], then the agent's run. The exit code and text of the process: 0 once stopped, 1 with
-/// the reason when the enrollment cannot be read or the agent cannot be built.
+/// `--state-dir` first waits there for the host's enrollment ([`enrolled::wait`]); then `make`
+/// makes the agent from `cfg` ([`build`] in the process: the ports are made only now, so nothing
+/// is dialled before the host is enrolled), and the agent runs. The exit code and text of the
+/// process: 0 once stopped, 1 with the reason when the enrollment cannot be read or the agent
+/// cannot be made.
 pub fn run_config_waiting(
     cfg: &Config,
     ready: impl FnOnce(Stop),
     waiting: &Waiting,
+    make: impl FnOnce(&Config) -> Result<Agent, String>,
 ) -> (u8, String) {
     let stop = Stop::default();
     ready(stop.clone());
@@ -441,7 +445,7 @@ pub fn run_config_waiting(
             Ok(Waited::Enrolled) => {}
         }
     }
-    match build(cfg) {
+    match make(cfg) {
         Err(why) => (1, format!("kbf-updater: {why}\n")),
         Ok(agent) => {
             agent.run(&stop);

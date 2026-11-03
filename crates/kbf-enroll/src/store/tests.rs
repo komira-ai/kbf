@@ -475,3 +475,73 @@ fn an_updaters_files_are_named_for_its_role_and_found_without_opening_the_store(
     assert_eq!(named.ca_path(), store.ca_path());
     assert!(store.key_path(Role::Updater).ends_with("pki/updater.key"));
 }
+
+/// The store's lock is exclusive: while it is held, another open of `pki/` cannot take it, and
+/// once it is dropped it can. An install holds it and commits.
+///
+/// Catches: a lock taken on something else than the directory every writer opens, and an install
+/// that leaves its files staged.
+#[test]
+fn the_store_lock_excludes_another_holder_and_an_install_commits() {
+    let (_root, store) = store("store-lock");
+    let held = store.lock().unwrap();
+    let other = std::fs::File::open(&store.pki).unwrap();
+    assert!(matches!(
+        other.try_lock(),
+        Err(std::fs::TryLockError::WouldBlock)
+    ));
+    drop(held);
+    other.try_lock().unwrap();
+    drop(other);
+
+    store.pending(both()).unwrap();
+    let certs = [cert_for(&store, Role::Storage, true, "c1")];
+    let n = node(&certs, 1);
+    store.install(&certs, b"CA", &n).unwrap();
+    assert_eq!(store.load().unwrap(), Some(n));
+    assert!(!store.staging().exists());
+    assert!(pair_matches(&store, Role::Storage));
+}
+
+/// A recovery that finds an install staged waits for the writer that holds the lock between its
+/// stage and its commit, and then finds the install done: it commits nothing twice and fails on
+/// no file the writer moved.
+///
+/// Catches: an agent finishing a staged enrollment under an `enroll` that is about to commit it,
+/// which would leave one of the two failing on a file the other moved.
+#[test]
+fn a_recovery_waits_for_the_writer_between_its_stage_and_its_commit() {
+    let (_root, store) = store("store-lock-recover");
+    store.pending(both()).unwrap();
+    let certs = [cert_for(&store, Role::Storage, true, "c2")];
+    let n = node(&certs, 1);
+    let held = store.lock().unwrap();
+    store.stage(&certs, b"CA", &n).unwrap();
+    let (done, finished) = std::sync::mpsc::channel();
+    let other = store.clone();
+    let recovering = std::thread::spawn(move || {
+        let got = other.recover();
+        done.send(()).unwrap();
+        got
+    });
+    // The writer commits while it holds the lock, then lets go.
+    store.commit().unwrap();
+    drop(held);
+    finished.recv().unwrap();
+    assert_eq!(recovering.join().unwrap().unwrap(), Some(n));
+    assert!(pair_matches(&store, Role::Storage));
+}
+
+/// A recovery with nothing staged takes no lock, so it works on a directory that is not there
+/// yet; the lock itself on such a directory is an error that names it.
+#[test]
+fn a_recovery_with_nothing_staged_needs_no_lock() {
+    let (root, _store) = store("store-lock-absent");
+    let absent = Store::unopened(&root.join("absent"));
+    assert_eq!(absent.recover().unwrap(), None);
+    let err = absent.lock().unwrap_err();
+    assert!(
+        matches!(&err, StoreError::Io { path, .. } if path.ends_with("absent/pki")),
+        "{err:?}"
+    );
+}

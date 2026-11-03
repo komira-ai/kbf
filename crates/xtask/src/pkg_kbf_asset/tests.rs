@@ -414,6 +414,44 @@ fn a_package_whose_agent_units_are_not_enabled_is_refused() {
     );
 }
 
+/// Asserts that a deb that holds an enabling link twice, once to its unit and once elsewhere, is
+/// refused whichever comes first, naming the path held twice and the target that is wrong; and that
+/// a file and a link at one path are refused the same way.
+///
+/// Catches: a lint that checks the first of two entries at one path, while dpkg unpacks the last.
+#[test]
+fn a_package_that_holds_a_path_twice_is_refused() {
+    let link = "usr/lib/systemd/system/multi-user.target.wants/kbf-updater-agent.service";
+    let wrong = (link.to_owned(), "../kbf-daemon.service".to_owned());
+    let points =
+        format!("{link} points to \"../kbf-daemon.service\", not \"../kbf-updater-agent.service\"");
+    for wrong_first in [false, true] {
+        let mut fix = Fix::new();
+        if wrong_first {
+            fix.links.insert(0, wrong.clone());
+        } else {
+            fix.links.push(wrong.clone());
+        }
+        let mut got = found(&format!("path-twice-{wrong_first}"), &fix);
+        got.sort();
+        let mut want = vec![format!("holds {link} more than once"), points.clone()];
+        want.sort();
+        assert_eq!(got, want, "wrong first: {wrong_first}");
+    }
+    let mut fix = Fix::new();
+    fix.extra
+        .push((link.to_owned(), 0o644, b"[Unit]\n".to_vec()));
+    let mut got = found("file-and-link", &fix);
+    got.sort();
+    assert_eq!(
+        got,
+        [
+            format!("holds {link} more than once"),
+            format!("holds {link}, which the kbf package does not ship"),
+        ]
+    );
+}
+
 /// Asserts that a package that holds a file of the retired installer, or any file it does not
 /// ship, is refused naming it.
 #[test]

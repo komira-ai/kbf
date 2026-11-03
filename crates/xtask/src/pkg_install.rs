@@ -19,8 +19,9 @@
 //!    `kbf setup`, do) the three users exist with no login shell and the three
 //!    directories exist, `root:root` 0755;
 //! 5. each `--gate` unit does not start without its file (the journal says its condition
-//!    skipped the start), and begins to start once the file exists (an executable file, mode
-//!    0755, so that a unit gated on its program, `ConditionFileIsExecutable=`, starts too);
+//!    skipped the start), nor, when the unit is gated on a program (`ConditionFileIsExecutable=`
+//!    of the file), with the file there and mode 0644; and begins to start once the file exists,
+//!    mode 0755;
 //! 6. each `--probe` command exits 0 in the container and prints its text: the packaged
 //!    `gh` runs on the container's architecture, the binary names the commit.
 //!
@@ -145,8 +146,8 @@ impl Format {
 pub const ENABLED: [&str; 2] = ["kbf-host-local.service", "kbf-updater-agent.service"];
 /// The target that wants them at boot.
 const WANTED_BY: &str = "multi-user.target";
-/// The unit whose command line must install the package, and the words that say so.
-const HELPER: (&str, &str) = ("kbf-host-local.service", "--layout deb");
+/// The unit whose command line must install the package, and the one layout it must name.
+const HELPER: (&str, &str) = ("kbf-host-local.service", "deb");
 
 /// A unit and the file whose absence keeps it from starting.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -292,7 +293,9 @@ fn starts(c: &mut Container, unit: &str) -> Result<(usize, usize), Error> {
     Ok((skipped, begun))
 }
 
-/// The unit `gate` names, started without and then with its file.
+/// The unit `gate` names, started without and then with its file; for a unit gated on a program
+/// (`ConditionFileIsExecutable=` of the file), also with the file there and not executable, which
+/// must not start it either.
 fn gate(c: &mut Container, g: &Gate, problems: &mut Vec<String>) -> Result<(), Error> {
     let unit = &g.unit;
     // A start the condition skips succeeds; the journal says what happened.
@@ -308,6 +311,32 @@ fn gate(c: &mut Container, g: &Gate, problems: &mut Vec<String>) -> Result<(), E
     if begun != 0 {
         problems.push(format!("{unit} without {}: it began to start", g.path));
     }
+    let text = c.say(&["systemctl", "cat", unit])?;
+    let program = format!("ConditionFileIsExecutable={}", g.path);
+    let skipped = if text.lines().any(|l| l.trim() == program) {
+        c.must(
+            "creating the gate file, not executable",
+            &["install", "-D", "-m", "0644", "/dev/null", &g.path],
+            problems,
+        )?;
+        c.exec(&["systemctl", "start", unit])?;
+        let (skipped_plain, begun_plain) = starts(c, unit)?;
+        if skipped_plain == skipped {
+            problems.push(format!(
+                "{unit} with {} not executable: its start was not skipped by its condition",
+                g.path
+            ));
+        }
+        if begun_plain != begun {
+            problems.push(format!(
+                "{unit} with {} not executable: it began to start",
+                g.path
+            ));
+        }
+        skipped_plain
+    } else {
+        skipped
+    };
     c.must(
         "creating the gate file",
         &["install", "-D", "-m", "0755", "/dev/null", &g.path],
@@ -436,23 +465,33 @@ fn host_agent(c: &mut Container, format: Format, problems: &mut Vec<String>) -> 
             ));
         }
     }
-    let (unit, words) = HELPER;
+    let (unit, layout) = HELPER;
     let text = c.say(&["cat", &path(unit)])?;
     let line = text
         .lines()
         .find(|l| l.starts_with("ExecStart="))
         .unwrap_or_default();
-    if !line
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .contains(words)
-    {
+    if layouts(line) != [layout] {
         problems.push(format!(
-            "{unit} does not install the package ({words}): {line:?}"
+            "{unit} does not install the package (exactly one --layout {layout}): {line:?}"
         ));
     }
     Ok(())
+}
+
+/// The values of every `--layout` of the command line `line`, in either spelling (`--layout V`,
+/// `--layout=V`), compared as whole words.
+fn layouts(line: &str) -> Vec<&str> {
+    let words: Vec<&str> = line.split_whitespace().collect();
+    let mut found = Vec::new();
+    for (at, word) in words.iter().enumerate() {
+        if *word == "--layout" {
+            found.push(words.get(at + 1).copied().unwrap_or_default());
+        } else if let Some(value) = word.strip_prefix("--layout=") {
+            found.push(value);
+        }
+    }
+    found
 }
 
 /// Where the package is copied to in the container: apt takes only a path that ends
@@ -758,5 +797,7 @@ pub fn run(docker: &mut Docker, t: &InstallTest) -> Result<Vec<String>, Error> {
     Err(Error::Refused(problems))
 }
 
+#[cfg(test)]
+mod agent_tests;
 #[cfg(test)]
 mod tests;

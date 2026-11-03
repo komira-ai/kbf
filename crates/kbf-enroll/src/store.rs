@@ -18,7 +18,13 @@
 //! under `staging/`, `node.json` last; then the files are renamed into place in a fixed
 //! order, `node.json` last again, and the staging directory is removed. `staging/node.json`
 //! is therefore the commit point: when it exists, every other staged file does, and
-//! [`Store::recover`] finishes whatever a crash left undone. A renewal keeps the key, so
+//! [`Store::recover`] finishes whatever a crash left undone.
+//!
+//! **One writer at a time.** An install ([`Store::install`]: stage, then commit) and a recovery
+//! hold an exclusive lock on the `pki/` directory itself (no lock file), so a process that
+//! finishes a staged install another process left (an agent waiting for its host's enrollment)
+//! never commits under an `enroll` that is between its stage and its commit. A recovery takes the
+//! lock only when something is staged, and looks again once it holds it. A renewal keeps the key, so
 //! it replaces the CA bundle and certificates only, and a crash at any step leaves a
 //! certificate that still matches the key. The keys and the requests of an enrollment in
 //! flight are persisted in staging before the request is sent, so a retry after a lost
@@ -225,6 +231,12 @@ pub struct Pending {
     pub csr_der: Vec<u8>,
 }
 
+/// The store's lock ([`Store::lock`]); dropping it closes the directory, which releases the lock.
+#[derive(Debug)]
+pub struct StoreLock {
+    _dir: std::fs::File,
+}
+
 /// The node's state directory.
 #[derive(Clone, Debug)]
 pub struct Store {
@@ -342,16 +354,42 @@ impl Store {
             .transpose()
     }
 
-    /// Finishes an install a crash cut short (when `staging/node.json` exists), then
-    /// loads `node.json`.
+    /// Finishes an install a crash cut short (when `staging/node.json` exists), under the
+    /// store's lock, then loads `node.json`.
     ///
     /// # Errors
-    /// As [`Store::load`] and [`Store::commit`].
+    /// As [`Store::load`], [`Store::lock`] and [`Store::commit`].
     pub fn recover(&self) -> Result<Option<Node>, StoreError> {
         if self.staging().join(NODE_JSON).exists() {
-            self.commit()?;
+            let _held = self.lock()?;
+            // Looked at again under the lock: the writer that held it may have committed.
+            if self.staging().join(NODE_JSON).exists() {
+                self.commit()?;
+            }
         }
         self.load()
+    }
+
+    /// The store's lock, held until the value is dropped: an exclusive lock on the `pki/`
+    /// directory. It waits for another holder.
+    ///
+    /// # Errors
+    /// The directory cannot be opened or locked.
+    pub fn lock(&self) -> Result<StoreLock, StoreError> {
+        let dir = std::fs::File::open(&self.pki).map_err(io(&self.pki))?;
+        dir.lock().map_err(io(&self.pki))?;
+        Ok(StoreLock { _dir: dir })
+    }
+
+    /// [`Store::stage`], then [`Store::commit`], under the store's lock: how an accepted answer
+    /// is installed.
+    ///
+    /// # Errors
+    /// As [`Store::lock`], [`Store::stage`] and [`Store::commit`].
+    pub fn install(&self, certs: &[Cert], ca_bundle: &[u8], node: &Node) -> Result<(), StoreError> {
+        let _held = self.lock()?;
+        self.stage(certs, ca_bundle, node)?;
+        self.commit()
     }
 
     /// The keys and requests for `roles`: those a previous attempt persisted, so a retry
