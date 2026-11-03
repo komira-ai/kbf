@@ -25,15 +25,15 @@ fn refusal(extra: &str) -> String {
 }
 
 /// A service that says nothing about it rolls back by hand, at the default threshold: a quarter
-/// of the hosts and at least two, and kbf as shipped does the same.
+/// of the hosts and at least two. kbf as shipped names `automatic` at that same threshold
+/// (`kbf_rollback_tests`).
 #[test]
 fn rollback_defaults_to_manual_with_a_quarter_of_the_hosts_and_at_least_two() {
-    for def in [parsed(""), ServiceDef::kbf()] {
-        assert_eq!(def.rollback, Rollback::Manual);
-        assert_eq!(def.rollback_after_failed.percent, 25);
-        assert_eq!(def.rollback_after_failed.min_hosts, 2);
-        assert_eq!(def.min_version, None);
-    }
+    let def = parsed("");
+    assert_eq!(def.rollback, Rollback::Manual);
+    assert_eq!(def.rollback_after_failed.percent, 25);
+    assert_eq!(def.rollback_after_failed.min_hosts, 2);
+    assert_eq!(def.min_version, None);
     assert_eq!(
         FailThreshold::default(),
         FailThreshold {

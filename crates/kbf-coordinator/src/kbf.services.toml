@@ -4,9 +4,15 @@
 # All four roles, limits from the desired state; a frontend is never the last one up and
 # waits for every other role. The `min_up` keys a desired state of kbf must name (storage and
 # frontend) belong to the service and are not set here.
+#
+# A release that fails after its commit on enough live hosts (a quarter of them, at least
+# two) is marked bad, and the coordinator sets the last version the farm converged on back
+# as desired on its own: no CI job has to be running for the farm to go back.
 
 [[service]]
 name = "kbf"
+rollback = "automatic"
+rollback_after_failed = { percent = 25, min_hosts = 2 }
 
 [service.roles.frontend]
 never_last = true

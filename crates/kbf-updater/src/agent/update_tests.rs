@@ -25,11 +25,12 @@ fn timing() -> Timing {
     }
 }
 
-struct Rig {
+/// One host's A/B over the fakes; `update_report_tests` uses it too.
+pub(super) struct Rig {
     events: Events,
-    local: FakeLocal,
+    pub(super) local: FakeLocal,
     drain: FakeDrain,
-    health: FakeHealth,
+    pub(super) health: FakeHealth,
     clock: Arc<ManualClock>,
     status: Shared,
     logs: Arc<Mutex<Vec<String>>>,
@@ -40,7 +41,7 @@ struct Rig {
 impl Rig {
     /// A daemon host that runs `VA`, whose node is serving, offered `VB`, which turns out
     /// healthy.
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let events = Events::default();
         let health = FakeHealth::new(&events);
         health.say(VA, vec![Ok(Health::Healthy)]);
@@ -59,7 +60,7 @@ impl Rig {
         }
     }
 
-    fn run(&self, target: &str) -> UpdateResult {
+    pub(super) fn run(&self, target: &str) -> UpdateResult {
         let host = host(Role::Daemon);
         let logs = Arc::clone(&self.logs);
         let log = move |line: &str| logs.lock().unwrap().push(line.to_owned());

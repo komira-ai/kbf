@@ -191,8 +191,10 @@ pub struct Status {
     /// Every service the coordinator manages, `kbf` included, by name: its desired state, the
     /// counts of its hosts per role, its hosts, and its convergence.
     pub per_service: BTreeMap<String, ServiceStatus>,
-    /// What operators changed ([`crate::ops`]): exclusions, labels, the audit ring. Left out
-    /// until the first change, so a farm that never uses it reads the status it always did.
+    /// What operators changed ([`crate::ops`]): exclusions, labels, the audit ring, and the
+    /// marks of an automatic rollback. Left out until the first change. kbf as shipped rolls
+    /// back automatically, so its first change is the last good version, recorded once its
+    /// farm converges.
     #[serde(skip_serializing_if = "OpsState::is_empty")]
     pub ops: OpsState,
     /// The commit this coordinator was built from ([`crate::BUILD_COMMIT`]).
