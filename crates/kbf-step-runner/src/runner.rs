@@ -10,6 +10,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use update_hook::{
     ARTIFACT_DIGEST_KEY, Context, Invocation, Next, Outcome, PREVIOUS_RELEASE_KEY,
@@ -51,8 +52,10 @@ pub struct Bounds {
     pub cleanup_secs: u64,
     /// After `cutover` succeeded, `verify` must succeed by then or the update rolls back.
     pub verify_deadline_secs: u64,
-    /// The ceiling on a pending promotion; also written to the params file.
-    pub promotion_ceiling_secs: u64,
+    /// The ceiling on a pending promotion; also written to the params file. `None`: the
+    /// declaration gives none, the watch runs until the promotion, and the params file names no
+    /// ceiling.
+    pub promotion_ceiling_secs: Option<u64>,
     /// How often a failed `cleanup` is run again.
     pub cleanup_retries: u32,
 }
@@ -139,6 +142,11 @@ pub enum RunError {
         #[source]
         error: Arc<LaunchError>,
     },
+    /// The post-success watcher stopped at its next poll because [`StepRunner::yield_watcher`]
+    /// asked it to: a new order is waiting (3.2). The update stands committed with its promotion
+    /// pending; the record is left in the watcher, which the new order's run ends.
+    #[error("the post-success watcher yielded to a new order")]
+    Yielded,
 }
 
 /// A test's way to make the check of the staged release fail with an I/O error before a step:
@@ -157,6 +165,8 @@ pub struct StepRunner {
     store: RecordStore,
     watch: Arc<Watch>,
     fault: Option<CheckFault>,
+    /// Set by [`StepRunner::yield_watcher`], taken by the watcher at its next poll.
+    yielding: AtomicBool,
 }
 
 impl StepRunner {
@@ -171,7 +181,21 @@ impl StepRunner {
             store,
             watch: Watch::new(),
             fault: None,
+            yielding: AtomicBool::new(false),
         }
+    }
+
+    /// Asks a post-success watcher running in another thread to stop at its next poll, so that
+    /// a new order can take the service: its run ends with [`RunError::Yielded`]. A run that is
+    /// not watching is not stopped; the request stands until a watcher takes it or
+    /// [`StepRunner::keep_watching`] withdraws it.
+    pub fn yield_watcher(&self) {
+        self.yielding.store(true, Ordering::SeqCst);
+    }
+
+    /// Withdraws a [`StepRunner::yield_watcher`] no watcher took (the watcher ended on its own).
+    pub fn keep_watching(&self) {
+        self.yielding.store(false, Ordering::SeqCst);
     }
 
     /// The same runner, its check of the staged release failed wherever `fault` says: the seam of
@@ -310,10 +334,10 @@ impl StepRunner {
         staged: &str,
         previous: Option<&str>,
     ) -> Result<Record, RunError> {
-        let mut params = order
-            .declared_params
-            .clone()
-            .with_promotion_ceiling_secs(order.bounds.promotion_ceiling_secs);
+        let mut params = order.declared_params.clone();
+        if let Some(secs) = order.bounds.promotion_ceiling_secs {
+            params = params.with_promotion_ceiling_secs(secs);
+        }
         let text = |s: &str| Scalar::Text(s.to_owned());
         params.insert(STAGED_RELEASE_KEY, text(staged));
         params.insert(TARGET_VERSION_KEY, text(&order.target_version));
@@ -361,6 +385,12 @@ impl StepRunner {
                     rec.attempt += 1;
                     rec.state = State::Pending;
                     self.store.save(&rec)?;
+                }
+                State::Pending
+                    if rec.progress.watching.is_some()
+                        && self.yielding.swap(false, Ordering::SeqCst) =>
+                {
+                    return Err(RunError::Yielded);
                 }
                 State::Pending => self.start(order, &mut rec)?,
                 State::Done { code, last_line } => self.after(order, &mut rec, code, last_line)?,
@@ -585,9 +615,12 @@ impl StepRunner {
             phase: Phase::AfterCommit,
             class: report.class,
         };
-        let over = rec.progress.watching.as_ref().is_some_and(|began| {
-            began.elapsed_secs(&*self.clock) >= order.bounds.promotion_ceiling_secs
-        });
+        let over = rec
+            .progress
+            .watching
+            .as_ref()
+            .zip(order.bounds.promotion_ceiling_secs)
+            .is_some_and(|(began, ceiling)| began.elapsed_secs(&*self.clock) >= ceiling);
         let verdict = match outcome {
             Outcome::Success if !report.promotion_pending => Verdict::Succeeded {
                 promotion_pending: false,

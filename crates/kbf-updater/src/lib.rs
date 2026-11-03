@@ -32,6 +32,11 @@
 //!
 //! And for the coordinator that tells each host's updater what to run
 //! (`docs/design/updates.md`): [`wire`], the heartbeat and the reply.
+//!
+//! And the root part of the generic host updater (`docs/design/host-updates.md`): [`root`], which
+//! runs the update hooks declared in `/etc/updater.d` through the step runner, each step a
+//! transient unit with its declared rights, and `approve`, which records an operator's approval
+//! of a declaration that asks for more.
 
 pub mod agent;
 pub mod api;
@@ -49,6 +54,7 @@ pub mod operator;
 pub mod ports;
 pub mod record;
 pub mod reply;
+pub mod root;
 pub mod safe_http;
 pub mod secret;
 pub mod server;
@@ -174,12 +180,67 @@ pub fn run_enroll_with(args: &[String]) -> (u8, String) {
     agent::enroll::run_enroll(args.get(2..).unwrap_or_default(), secret::euid(), now)
 }
 
-/// [`run_with`], [`run_agent_with`] or [`run_enroll_with`], for the binary: nothing to do once
-/// started.
+/// The root part (`kbf-updater root ...`, [`root`]): the flags in, `ready` called with a handle
+/// that stops it, and the exit code and text out when it is stopped. A usage error is exit 2, a
+/// start that fails is exit 1 with the reason.
+pub fn run_root_with(args: &[String], ready: impl FnOnce(root::Stop)) -> (u8, String) {
+    let flags = match root::flags::parse(args.get(2..).unwrap_or_default()) {
+        Ok(flags) => flags,
+        Err(why) => return (2, format!("kbf-updater: {why}\n{}", root::flags::USAGE)),
+    };
+    match root::Parts::host() {
+        Ok(parts) => root::run_config(&flags, root::Config::of(&flags), parts, ready),
+        Err(e) => (1, format!("kbf-updater root: the account files: {e}\n")),
+    }
+}
+
+/// [`run_root_with`], telling the service manager the root part is ready once its start pass is
+/// over: `notify_socket` is the `NOTIFY_SOCKET` systemd sets for a `Type=notify` unit (a mark of
+/// the platform, not a setting), `None` when nothing asks. `ready` is called after that.
+pub fn run_root_notifying(
+    args: &[String],
+    notify_socket: Option<std::ffi::OsString>,
+    ready: impl FnOnce(root::Stop),
+) -> (u8, String) {
+    run_root_with(args, |stop| {
+        root::announce_ready(notify_socket.as_deref());
+        ready(stop);
+    })
+}
+
+/// `kbf-updater approve [--approvals FILE] <service> <sha256>` (`update_rights::cli`): records an
+/// operator's approval of one exact declaration in `env`'s approval file
+/// (`/etc/updater.d/approved` on a host), or in `FILE`, the one a root part given the same
+/// `--approvals` reads. A root act; the line it prints is the audit record. Exit 0 done, 1
+/// refused, 2 usage.
+pub fn run_approve_with(args: &[String], env: &update_rights::cli::Env) -> (u8, String) {
+    let rest = args.get(2..).unwrap_or_default();
+    let chosen;
+    let (rest, env) = match rest {
+        [flag, file, rest @ ..] if flag == "--approvals" => {
+            chosen = update_rights::cli::Env {
+                approvals: std::path::PathBuf::from(file),
+                trusted_uid: env.trusted_uid,
+                effective_uid: env.effective_uid,
+            };
+            (rest, &chosen)
+        }
+        _ => (rest, env),
+    };
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let code = update_rights::cli::run(rest, env, &mut out, &mut err);
+    let text = if code == 0 { out } else { err };
+    (code, String::from_utf8_lossy(&text).into_owned())
+}
+
+/// [`run_with`], [`run_agent_with`], [`run_enroll_with`], [`run_root_with`] or
+/// [`run_approve_with`], for the binary: nothing to do once started.
 pub fn run(args: &[String]) -> (u8, String) {
     match args.get(1).map(String::as_str) {
         Some("agent") => run_agent_with(args, |_| {}),
         Some("enroll") => run_enroll_with(args),
+        Some("root") => run_root_notifying(args, std::env::var_os("NOTIFY_SOCKET"), |_| {}),
+        Some("approve") => run_approve_with(args, &update_rights::cli::Env::production()),
         _ => run_with(args, |_| {}),
     }
 }

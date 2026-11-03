@@ -20,6 +20,8 @@ use crate::reserved::{self, Kind};
 
 /// The longest a step, a deadline or a registration may be given: one day.
 pub const MAX_SECS: u64 = 86_400;
+/// `hook.timeout_secs.prepare = 0`: `prepare` has no bound. No other step may have none.
+pub const UNBOUNDED: u64 = 0;
 /// The longest promotion ceiling: one week.
 pub const MAX_CEILING_SECS: u64 = 604_800;
 /// The most times `cleanup` may be re-run.
@@ -321,8 +323,16 @@ impl Declaration {
                 ),
             ));
         }
+        // `prepare` may be 0: no bound (its drain waits as long as the work it waits for runs,
+        // 3.6). Every other bound is 1 to MAX_SECS.
+        if self.hook.timeout_secs.prepare != UNBOUNDED {
+            in_range(
+                "hook.timeout_secs.prepare",
+                self.hook.timeout_secs.prepare,
+                MAX_SECS,
+            )?;
+        }
         for (field, number) in [
-            ("hook.timeout_secs.prepare", self.hook.timeout_secs.prepare),
             ("hook.timeout_secs.cutover", self.hook.timeout_secs.cutover),
             ("hook.timeout_secs.verify", self.hook.timeout_secs.verify),
             (

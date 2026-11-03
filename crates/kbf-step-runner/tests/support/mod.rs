@@ -291,7 +291,7 @@ impl Rig {
             rollback_secs: 600,
             cleanup_secs: 1300,
             verify_deadline_secs: 1600,
-            promotion_ceiling_secs: 3600,
+            promotion_ceiling_secs: Some(3600),
             cleanup_retries: 3,
         }
     }

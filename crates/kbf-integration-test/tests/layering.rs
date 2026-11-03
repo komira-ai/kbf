@@ -82,6 +82,7 @@
 //!   its name; and a walk that cannot see its dependencies, which would make that check pass
 //!   vacuously.
 
+mod step_runner_layer;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::process::Command;
 

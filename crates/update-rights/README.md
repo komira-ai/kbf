@@ -13,7 +13,7 @@ The crate names no product and depends on no crate of this workspace but the hoo
 | `widening` | `widening(old, new)`: the fields that ask for more. Any change other than removing a set element or lowering a number. |
 | `approval`, `cli` | The record of approved declaration digests (`/etc/updater.d/approved`) and `approve <service> <sha256>`, which the root part of the updater runs as `approve`. |
 | `gate` | `gate(active, incoming, digest, approvals)`: install, or `Deferred` with the reason `rights_change`. |
-| `launch` | The `systemd-run` command of one step as a pure function (`command`, `properties`), `run_step` over a `Spawner`, and `Systemd`, the real one. |
+| `launch` | The `systemd-run` command of one step as a pure function (`command`, `properties`), `run_step` over a `Spawner`, and `Systemd`, the real one. The boot entry (`boot`) through the same path: `boot_command`, `boot_properties` and `run_boot`, in a unit `updater-<service>-boot-<generation>`, with the hook-wide `capabilities` and never a step's, and the `rollback` bound. |
 
 ## Choices the design left open
 
@@ -87,3 +87,5 @@ must not grant it either. The root tests assert both halves through `pkcheck`.
 `tests/` runs without root. `tests/rights_root.rs` needs root and systemd and runs in the
 `update-rights-linux` workflow through `cargo xtask sudo-test -p update-rights --test rights_root`:
 a hook that exceeds its rights fails, and the six probes of section 11 each run as a test.
+`tests/boot_root.rs` runs there too: a boot entry with `CAP_NET_ADMIN` hook-wide runs `nft`, and
+the same entry with the capability only in a step's list cannot.
