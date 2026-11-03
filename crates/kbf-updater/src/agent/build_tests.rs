@@ -489,3 +489,22 @@ fn a_role_the_agent_has_no_duties_for_is_refused() {
         Ok(Role::MacDaemon)
     );
 }
+
+/// The agent honours the hold file at the helper's fixed path for the platform, whatever
+/// `--cordon-dir` and the key's directory are: the helper writes the pin there and nowhere
+/// else.
+///
+/// Catches: a pin the helper wrote that the agent never sees because its marks directory was
+/// moved.
+#[test]
+fn the_pin_is_read_where_the_helper_writes_it_whatever_the_directories() {
+    let mut rig = Rig::new("bd-pin", HostRole::DAEMON);
+    let want = super::pin::PinFile::of_platform(std::env::consts::OS);
+    let agent = build(&rig.config).unwrap();
+    assert_eq!(agent.pin_file(), Some(&want));
+    let elsewhere = rig.dir.join("cordons");
+    std::fs::create_dir(&elsewhere).unwrap();
+    rig.config.cordon_dir = Some(elsewhere);
+    let agent = build(&rig.config).unwrap();
+    assert_eq!(agent.pin_file(), Some(&want));
+}

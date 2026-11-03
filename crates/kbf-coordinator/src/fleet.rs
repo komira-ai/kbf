@@ -78,9 +78,18 @@ impl Host {
             && !self.beat.promotion_pending
     }
 
+    /// Whether the host says it is pinned: root on the host holds it on a release, and its
+    /// agent runs no order for `kbf` until the pin is removed.
+    #[must_use]
+    pub fn is_pinned(&self) -> bool {
+        self.beat.pinned.is_some()
+    }
+
     /// Whether the host holds an update slot (one is live at a time across every service,
-    /// [`crate::decide`]): it is updating, its promotion is pending, or its last update failed
-    /// and it has not yet heartbeated healthy.
+    /// [`crate::decide`]): it is updating, its promotion is pending, its last update failed
+    /// and it has not yet heartbeated healthy, or it is pinned. A pinned host is neither done
+    /// nor failed: it keeps its slot, so pinning a host never lets the rollout go on to another
+    /// (and, the slot being the farm's one, nothing is ordered anywhere while the pin stands).
     #[must_use]
     pub fn holds_slot(&self) -> bool {
         let failed = self
@@ -91,6 +100,7 @@ impl Host {
         self.beat.updating.is_some()
             || self.beat.promotion_pending
             || (failed && self.beat.health != Health::Healthy)
+            || self.is_pinned()
     }
 }
 
@@ -202,9 +212,9 @@ impl Fleet {
     /// one.
     ///
     /// An order for the host and service ends when the beat shows it updating (the beat
-    /// counts from then), runs the ordered version, reports that update failed, or reports
-    /// that it declined it ([`crate::defer`]): a deferral holds no slot, so the order must not
-    /// hold it for [`ORDER_AGE`] either.
+    /// counts from then), runs the ordered version, reports that update failed, reports that
+    /// it declined it ([`crate::defer`]): a deferral holds no slot, so the order must not hold
+    /// it for [`ORDER_AGE`] either, or says it is pinned (its agent will not run the order).
     pub fn record_in(
         &mut self,
         service: &str,
@@ -265,7 +275,12 @@ impl Fleet {
                 .deferred
                 .as_ref()
                 .is_some_and(|d| d.target == order.target);
-            if beat.updating.is_some() || beat.version == order.target || failed || deferred_order {
+            if beat.updating.is_some()
+                || beat.version == order.target
+                || failed
+                || deferred_order
+                || beat.pinned.is_some()
+            {
                 self.orders.remove(&key);
             }
         }

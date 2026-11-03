@@ -307,7 +307,47 @@ helper knows for the release that runs; for a release placed by hand it is
 `0.1.0+g<12 hex digits>`, which names the commit and nothing else, and an update to the same commit
 teaches the helper the text. `health` is the node's health check against the running version.
 `updating` is the target while an A/B runs; `last_update` is how the last one ended. **The node id
-and the role are in no field**: the coordinator reads them from the certificate.
+and the role are in no field**: the coordinator reads them from the certificate. A pinned host
+adds `"pinned": {"commit": "<40 hex>"}` ([The pin](#the-pin)).
+
+### The pin
+
+Root pins a host to a release it keeps with `kbf-host-install activate --pin`, and unpins it with
+`kbf-host-install unpin` ([host-install.md, "The emergency command"](host-install.md#the-emergency-command-activate)).
+The pin is the helper's hold file, at a fixed path whatever the agent's flags say:
+`/var/lib/kbf-updater/pin.json` on Linux, `/var/db/kbf-updater/pin.json` on a Mac (the packaged
+agent's state directory).
+
+- While the file is there the agent runs **no order for `kbf`**, whatever the coordinator desires.
+  A trial it finds at start is left to the helper (whose deadline puts it back) and not reported
+  as updating. It looks at the file for every heartbeat and again before every order, and logs
+  once each time what it finds changes. An update already running when the pin is written runs to
+  its end; the pin holds the orders after it. The services besides `kbf` (`--service`) are not
+  pinned.
+- Only **root's regular file that its group and others may not write** is a pin, since the
+  directory is the agent's account's: a link, another account's file, a writable one or anything
+  else is not (the log says why). Root's file that cannot be read, is over 4096 bytes, or names no
+  40-digit commit pins the host all the same, with no commit, and so does a name that cannot be
+  looked at (an I/O error): the agent never assumes the file is not there.
+- Every heartbeat of a pinned host says `"pinned": {"commit": C}` (`{}` when the commit is not
+  known); the field is never dropped when a heartbeat is trimmed to fit. A coordinator from before
+  the pin ignores the field (and orders the host, which does not run the order); this one reads a
+  `pinned` it cannot parse as absent and counts it among the dropped facts.
+- The coordinator **orders a pinned host nothing for `kbf`** (`hold` `pinned` under `kbf`; under
+  its other services it carries no pin), and a `kbf` order it gave before ends when the host says
+  it is pinned. The host **keeps an update slot** however healthy it is, so pinning a host never
+  lets the rollout go on to the next one. Since one update is live at a time across every service
+  and role, a pinned host holds that one: while the pin stands no host is ordered anything, of any
+  service (`no_slot`), and the rollout goes on once the host beats unpinned. It is counted **neither
+  failed nor at another version**: the role's `pinned` count has it (and `at_desired` when it runs
+  the desired version), `failed` does not, so it does not make the farm `blocked`, and a host
+  pinned to another version keeps it from `converged`. Its failure is no vote for an automatic
+  rollback, its `kbf` halt report raises no halt (the services it lists are not pinned, and theirs
+  do), and it is never chosen as a canary.
+- An unpinned host's next heartbeat carries no `pinned`, and the rules apply to it again. The
+  unpin lifts the pin and nothing else: a target that failed a moment ago is left alone until
+  `--retry-secs` is up, a deferral declines until its retry time, and a halt holds until the
+  coordinator clears it, as they do without a pin.
 
 ### One A/B
 
@@ -847,7 +887,9 @@ then runs the restore.
 `GET /v1/convergence` answers `{"desired", "quiet", "state", "roles": [{"role", "at_desired",
 "updating", "failed", "down"}], "commit", "generation", "replaced", "write_id"}`, where `state` is
 `converged`, `blocked`, `halted` or `in_progress` (`halted` adds `halt`: `{"node_id","check","target"}`),
-and `generation`, `replaced` and `write_id` are the record of the writes of the desired state, below. It
+and `generation`, `replaced` and `write_id` are the record of the writes of the desired state, below. A
+role with a live pinned host also has `pinned`, their number ([The pin](#the-pin)); a pinned host is
+never counted in `failed`. It
 takes CI's OIDC token and refuses the operator token (the operator's read is `GET /v1/status`).
 It is computed from the heartbeats and the desired state, and stores nothing. `converged` needs
 the coordinator to be past its 30 second quiet start, at least one live host, every live host at
@@ -870,7 +912,7 @@ being those of `GET /v1/convergence` for the service. `hosts` is every host that
 service, by node id: the fields of the top-level `hosts` entries, with `up` and `holds_slot`
 counted for this service (a host ordered to update `other` holds `other`'s slot and is not up for
 it, while it holds nothing under `kbf`), and `hold`: the rule that keeps the coordinator from
-ordering the host now (`quiet`, `updating`, `busy_elsewhere`, `up_to_date`, `failed_here`,
+ordering the host now (`quiet`, `pinned`, `updating`, `busy_elsewhere`, `up_to_date`, `failed_here`,
 `deferred`, `no_slot`, `baking`, `canary_wait`, `waiting_for_role`, `waiting_for_service`, `min_up`, `not_a_member`, `no_desired`, `no_definition`; these spellings are public), or
 `null` when it would be ordered at its next heartbeat. `up` and `slots_held` count those hosts,
 and `convergence` is the answer of `GET /v1/convergence?service=NAME`. The top-level keys, and the

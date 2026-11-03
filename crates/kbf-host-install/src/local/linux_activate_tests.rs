@@ -659,3 +659,5 @@ fn the_command_audits_what_it_did_on_a_linux_host() {
 
 #[path = "linux_activate_more_tests.rs"]
 mod more;
+#[path = "linux_unpin_tests.rs"]
+mod unpin;

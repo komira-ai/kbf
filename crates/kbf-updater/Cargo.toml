@@ -46,6 +46,8 @@ kbf-host-install = { path = "../kbf-host-install" }
 # The releases a helper lists in its query, cut as the helper cuts them (local_tests.rs).
 kbf-retain.workspace = true
 kbf-testkit.workspace = true
+# A pipe at the name of the hold file, which no pin is (agent/pin_tests.rs).
+rustix = { workspace = true, features = ["fs"] }
 
 # `kbf update-hook` over a fake host kept in a directory, the program the conformance harness
 # runs (tests/hook_conformance.rs). Not shipped: the release jobs package kbf-updater alone.

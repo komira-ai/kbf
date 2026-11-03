@@ -13,6 +13,7 @@
 //! - [`cordon`]: which cordons on the node are the updater's own, kept on disk;
 //! - [`hold`]: `Deferred` and `halt`: the features announced, the deferral kept on disk, the
 //!   heartbeat's size;
+//! - [`pin`]: root's hold file, which keeps the host on a release while it is there;
 //! - [`status`]: what the heartbeat says;
 //! - [`update`]: one host's A/B, step by step;
 //! - [`run`]: the two threads, and the wiring of the real ports ([`build`]).
@@ -24,6 +25,7 @@ pub mod flags;
 pub mod hold;
 pub mod hook;
 pub mod local;
+pub mod pin;
 pub mod renew;
 pub mod run;
 pub mod service_health;
@@ -56,6 +58,10 @@ mod frontend_tests;
 mod hold_tests;
 #[cfg(test)]
 mod local_tests;
+#[cfg(test)]
+mod pin_agent_tests;
+#[cfg(test)]
+mod pin_tests;
 #[cfg(test)]
 mod pki;
 #[cfg(test)]

@@ -7,7 +7,9 @@
 //! definition; `kbf`'s definition, [`crate::services::ServiceDef::kbf`], gives the rules their
 //! old wording):
 //!
-//! 1. the coordinator has been up for [`crate::fleet::QUIET_START`];
+//! 1. the coordinator has been up for [`crate::fleet::QUIET_START`], and the host is not
+//!    pinned (root on the host holds it on a release, and its agent would not run the order:
+//!    [`Hold::Pinned`]);
 //! 2. the host is not already updating, and no other service updates on it or has an order
 //!    outstanding for it (a host does one update at a time);
 //! 3. the host is behind: it does not run the desired version (a rollback is a desired
@@ -110,6 +112,9 @@ pub enum Hold {
     NotAMember,
     /// The coordinator started less than [`crate::fleet::QUIET_START`] ago.
     Quiet,
+    /// The host is pinned: its heartbeat says root holds it on a release
+    /// ([`crate::fleet::Host::is_pinned`]).
+    Pinned,
     /// The service is declared on the host and has never registered, and the definition does
     /// not say `install_when_absent`.
     Absent,
@@ -226,6 +231,7 @@ fn first_hold(
     let room = role.max_updating(host.role_name(), desired).min(1);
     let rules = [
         (fleet.is_quiet(now), Hold::Quiet),
+        (host.is_pinned(), Hold::Pinned),
         (bad.contains(&desired.version), Hold::Bad),
         (
             host.beat.health == Health::Absent && !def.install_when_absent,
