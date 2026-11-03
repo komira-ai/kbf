@@ -22,7 +22,7 @@
 pub mod container_health;
 pub mod coordinator;
 pub mod enroll;
-pub mod enrolled;
+pub(crate) mod enrolled;
 pub mod flags;
 pub mod hold;
 pub mod hook;
@@ -37,9 +37,9 @@ pub mod update;
 mod build;
 pub mod cordon;
 
-pub use build::{
-    Access, NO_CREDENTIAL, NoCredential, build, run_agent, run_config, run_config_waiting,
-};
+#[cfg(test)]
+use build::run_config_waiting;
+pub use build::{Access, NO_CREDENTIAL, NoCredential, run_agent, run_config};
 pub use run::{Agent, ServicePorts, Stop, World};
 
 #[cfg(test)]

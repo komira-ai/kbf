@@ -430,7 +430,7 @@ pub fn run_config(cfg: &Config, ready: impl FnOnce(Stop)) -> (u8, String) {
 /// is dialled before the host is enrolled), and the agent runs. The exit code and text of the
 /// process: 0 once stopped, 1 with the reason when the enrollment cannot be read or the agent
 /// cannot be made.
-pub fn run_config_waiting(
+pub(crate) fn run_config_waiting(
     cfg: &Config,
     ready: impl FnOnce(Stop),
     waiting: &Waiting,

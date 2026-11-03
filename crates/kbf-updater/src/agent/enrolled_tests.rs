@@ -18,7 +18,8 @@ use kbf_types::{CaPin, HostRole, ReleasePlatform, Role as PkiRole, RoleSet};
 
 use super::build::{identity_of_files, this_host};
 use super::build_tests::enrolled_in;
-use super::coordinator::{Coordinator, CoordinatorError};
+use super::coordinator::{Coordinator, CoordinatorError, client_config};
+use super::coordinator_tests::server_config;
 use super::enrolled::{Waited, Waiting, not_enrolled, wait};
 use super::flags::{Config, parse_flags};
 use super::pki::{Pki, now, pem_of};
@@ -29,6 +30,7 @@ use super::testing::{Events, FakeCoordinator, FakeDrain, FakeHealth, FakeLocal, 
 use crate::identity::Identity;
 use crate::ports::SystemClock;
 use crate::wire::{Answer, Heartbeat, Reply, ServiceReply};
+use rustls::pki_types::pem::PemObject as _;
 
 /// The text an agent says when its state directory holds no enrollment, spelled out so that a
 /// change to it shows here.
@@ -241,6 +243,15 @@ impl Enrolling {
             .unwrap();
     }
 
+    /// The accepted answer, installed as `enroll` installs it: staged and committed under the
+    /// store's lock.
+    fn install(&self) {
+        let node = self.node.as_ref().unwrap();
+        self.store
+            .install(&self.certs, self.pki.root_pem().as_bytes(), node)
+            .unwrap();
+    }
+
     /// The commit cut short after `moved` of the files it moves before `node.json` (the CA
     /// bundle, the key, the certificate), as a crash leaves it.
     fn commit_cut_after(&self, state: &Path, moved: usize) {
@@ -358,11 +369,15 @@ fn an_enrollment_a_crash_cut_short_in_its_commit_is_finished_and_the_agent_start
 
 /// The agent looks between the steps of an enrollment: after the key and request alone (what a
 /// refused attempt leaves, and what a retry starts from), after that attempt failed, and once the
-/// retry's answer is staged. It says its line once, makes no agent while only the key is there,
-/// and is made from the enrolled certificate and heartbeats once the answer is staged.
+/// retry's answer is installed as `enroll` installs it. It says its line once, makes no agent while
+/// only the key is there, and is made from the enrolled certificate and heartbeats once the answer
+/// is in. The agent's own TLS client configuration, made from the files the enrollment wrote,
+/// completes a mutual-TLS handshake, in memory, with a coordinator whose certificate the farm's CA
+/// issued, and the coordinator is shown the enrolled certificate.
 ///
 /// Catches: an agent that takes a key without a certificate for an enrollment, that says its line
-/// again after a failed attempt, or that is made before the enrollment is usable.
+/// again after a failed attempt, that is made before the enrollment is usable, or an enrollment
+/// whose files the coordinator would refuse.
 #[test]
 fn the_agent_looks_between_the_steps_of_an_enrollment_and_starts_once_it_is_usable() {
     let dir = TestDir::under(std::env::temp_dir(), "enrolled-steps");
@@ -385,8 +400,8 @@ fn the_agent_looks_between_the_steps_of_an_enrollment_and_starts_once_it_is_usab
             }
             // Nothing new: the attempt failed, the operator has not run `enroll` again.
             2 => {}
-            // The retry sends the same request and its answer is staged, then committed.
-            3 => enrolling.as_ref().unwrap().stage(),
+            // The retry sends the same request and its answer is installed.
+            3 => enrolling.as_ref().unwrap().install(),
             _ => panic!("a usable enrollment is started from"),
         }
     };
@@ -396,6 +411,66 @@ fn the_agent_looks_between_the_steps_of_an_enrollment_and_starts_once_it_is_usab
     assert_eq!(seen.made().len(), 1);
     assert_eq!(seen.made()[0].node_id.to_string(), "n1");
     assert!(!seen.coordinator.beats().is_empty());
+
+    let enrolling = enrolling.lock().unwrap();
+    let pki = &enrolling.as_ref().unwrap().pki;
+    let client = client_config(&config(&state).files).expect("the enrolled files");
+    let shown = handshake_in_memory(
+        client,
+        server_config(pki, &pki.coordinator_for(&[COORDINATOR])),
+    );
+    let enrolled = std::fs::read(state.join("pki/updater.pem")).unwrap();
+    let enrolled = rustls::pki_types::CertificateDer::from_pem_slice(&enrolled).unwrap();
+    assert_eq!(shown, Ok(enrolled.as_ref().to_vec()));
+}
+
+/// The coordinator's name, as the agent is given it and the coordinator's certificate names it.
+const COORDINATOR: &str = "coordinator.farm.example";
+
+/// A whole handshake between the agent's TLS client configuration and a coordinator's side,
+/// exchanged in memory: no socket and no name lookup. The certificate the coordinator was shown,
+/// or why the handshake failed.
+fn handshake_in_memory(
+    client: Arc<rustls::ClientConfig>,
+    server: Arc<rustls::ServerConfig>,
+) -> Result<Vec<u8>, String> {
+    let name = rustls::pki_types::ServerName::try_from(COORDINATOR).map_err(|e| e.to_string())?;
+    let mut agent = rustls::ClientConnection::new(client, name).map_err(|e| e.to_string())?;
+    let mut coordinator = rustls::ServerConnection::new(server).map_err(|e| e.to_string())?;
+    // Each round moves what one side has to say to the other; a handshake is a handful of them.
+    for _ in 0..16 {
+        if !agent.is_handshaking() && !coordinator.is_handshaking() {
+            break;
+        }
+        let mut flight = Vec::new();
+        while agent.wants_write() {
+            agent.write_tls(&mut flight).map_err(|e| e.to_string())?;
+        }
+        coordinator
+            .read_tls(&mut flight.as_slice())
+            .map_err(|e| e.to_string())?;
+        coordinator
+            .process_new_packets()
+            .map_err(|e| e.to_string())?;
+        let mut flight = Vec::new();
+        while coordinator.wants_write() {
+            coordinator
+                .write_tls(&mut flight)
+                .map_err(|e| e.to_string())?;
+        }
+        agent
+            .read_tls(&mut flight.as_slice())
+            .map_err(|e| e.to_string())?;
+        agent.process_new_packets().map_err(|e| e.to_string())?;
+    }
+    if agent.is_handshaking() || coordinator.is_handshaking() {
+        return Err("the handshake did not end".to_owned());
+    }
+    coordinator
+        .peer_certificates()
+        .and_then(|c| c.first())
+        .map(|c| c.as_ref().to_vec())
+        .ok_or_else(|| "the agent showed no certificate".to_owned())
 }
 
 /// The text of the error the agent ends with when its enrollment cannot be read: the directory,

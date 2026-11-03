@@ -649,9 +649,14 @@ With this, a host's first install is the package plus M4.
   - the `packages` job of `beta.yml` runs `pkg-install-test` with gates on both units;
   - `pkg_install` checks the units are installed and wanted by `multi-user.target`, with
     `--layout deb` on the helper's line, and that the rpm holds neither;
-  - `an_agent_with_no_enrollment_says_not_enrolled_once_and_calls_nothing` (`kbf-updater`);
-  - `an_agent_started_before_kbf_updater_enroll_heartbeats_once_it_has_run` (`kbf-server`,
-    against the real enroll listener);
+  - `an_agent_with_no_enrollment_says_not_enrolled_once_and_calls_nothing` (`kbf-updater`): an
+    agent with no enrollment says "not enrolled" once and makes nothing, so it calls nothing;
+  - `once_the_host_is_enrolled_the_waiting_agent_heartbeats` (`kbf-updater`): after the
+    enrollment, the waiting agent is made from the enrolled certificate and heartbeats;
+  - `the_agent_looks_between_the_steps_of_an_enrollment_and_starts_once_it_is_usable`
+    (`kbf-updater`): a refused attempt, its retry and the installed answer, after which the
+    agent's TLS client, made from the enrolled files, completes a mutual-TLS handshake in memory
+    with a coordinator the farm's CA certified;
   - `a_package_without_the_helper_or_the_agent_unit_is_refused` (`pkg_kbf_asset`).
 
 ### G7. The coordinator is updated by the updater
