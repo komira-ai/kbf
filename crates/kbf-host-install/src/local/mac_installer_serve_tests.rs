@@ -256,3 +256,52 @@ fn the_state_directory_lets_the_socket_account_reach_the_shipped_socket() {
         "{err}"
     );
 }
+
+/// Catches a state path that changes the mode of something it is not: a state directory path
+/// that is a link to another private (0700) directory, or that is a file, is refused naming the
+/// path, and the target of the link keeps its mode (0700) and the file its own; nothing is
+/// made in place of either. A directory the trust check refuses (others may write it) is
+/// refused before its mode is touched.
+#[test]
+fn a_state_directory_path_that_is_a_link_or_a_file_is_refused_and_changes_nothing() {
+    use std::os::unix::fs::symlink;
+    let fx = Fx::new("pr-macinst-workdir-link");
+    let trust = Trust::owned_by(fs::metadata(&*fx.dir).unwrap().uid(), &fx.dir);
+    let mode = |path: &Path| fs::symlink_metadata(path).unwrap().permissions().mode() & 0o777;
+    let private = fx.dir.join("private");
+    fs::create_dir(&private).unwrap();
+    fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+    let link = fx.dir.join("state-link");
+    symlink(&private, &link).unwrap();
+    assert_eq!(
+        work_dir(&trust, &link).unwrap_err(),
+        format!("{} is a link", link.display())
+    );
+    assert_eq!(mode(&private), 0o700);
+    assert!(
+        fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+
+    let file = fx.dir.join("state-file");
+    fs::write(&file, "x").unwrap();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(
+        work_dir(&trust, &file).unwrap_err(),
+        format!("{} is not a directory", file.display())
+    );
+    assert_eq!(mode(&file), 0o600);
+
+    let open = fx.dir.join("state-open");
+    fs::create_dir(&open).unwrap();
+    fs::set_permissions(&open, fs::Permissions::from_mode(0o777)).unwrap();
+    let err = work_dir(&trust, &open).unwrap_err();
+    assert!(err.starts_with(&open.display().to_string()), "{err}");
+    assert_eq!(
+        mode(&open),
+        0o777,
+        "a directory the trust check refuses keeps its mode"
+    );
+}

@@ -311,18 +311,36 @@ pub const MAC_STATE_DIR: &str = "/var/db/kbf-host-install";
 /// 0600. (The kit's work directory, the same directory, has the same mode.)
 pub const MAC_WORK_MODE: u32 = 0o711;
 
-/// Make root's directory `dir` (mode [`MAC_WORK_MODE`]) if it is not there, give it that mode,
-/// and check it.
+/// Make root's directory `dir` (mode [`MAC_WORK_MODE`]) if it is not there, check it, and then
+/// give it that mode. Nothing is changed on a path that is a link or not a directory, or on a
+/// directory the trust check refuses (another owner's, or under a directory others may write):
+/// the mode is set through a descriptor opened without following a link, on the directory
+/// that was checked.
 pub(super) fn work_dir(trust: &Trust, dir: &Path) -> Result<(), String> {
+    use std::os::unix::fs::OpenOptionsExt;
     let say = |e: std::io::Error| format!("{}: {e}", dir.display());
     match fs::DirBuilder::new().mode(MAC_WORK_MODE).create(dir) {
         Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(say(e)),
         _ => {}
     }
-    fs::set_permissions(dir, fs::Permissions::from_mode(MAC_WORK_MODE)).map_err(say)?;
+    let meta = fs::symlink_metadata(dir).map_err(say)?;
+    if meta.file_type().is_symlink() {
+        return Err(format!("{} is a link", dir.display()));
+    }
+    if !meta.is_dir() {
+        return Err(format!("{} is not a directory", dir.display()));
+    }
     trust
         .check_dir(dir)
-        .map_err(|e| format!("{}: {e}", dir.display()))
+        .map_err(|e| format!("{}: {e}", dir.display()))?;
+    let opened = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(crate::trust::nofollow() | libc::O_DIRECTORY)
+        .open(dir)
+        .map_err(say)?;
+    opened
+        .set_permissions(fs::Permissions::from_mode(MAC_WORK_MODE))
+        .map_err(say)
 }
 
 /// The file of that state.
