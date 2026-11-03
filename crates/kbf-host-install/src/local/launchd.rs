@@ -7,36 +7,67 @@
 //! link: `launchctl print` gives its pid, and `lsof` names the file the kernel mapped as its
 //! program, links resolved. A process that runs another release, or none, is not up yet.
 
-use std::path::Path;
+use std::io;
+use std::path::{Path, PathBuf};
 
 use crate::mac::tools;
 use crate::pace::Pace;
 use crate::plan::Wait;
 use crate::runner::Runner;
 
+/// Why the daemon's job did not come up on the release.
+#[derive(Debug, thiserror::Error)]
+pub enum RestartError {
+    /// `launchctl` could not be started.
+    #[error("launchctl kickstart system/{label}: {source}")]
+    Spawn {
+        label: String,
+        #[source]
+        source: io::Error,
+    },
+    /// `launchctl kickstart` ran and did not succeed.
+    #[error("launchctl kickstart system/{label}: exit status {code:?}: {stderr}")]
+    Kickstart {
+        label: String,
+        code: Option<i32>,
+        stderr: String,
+    },
+    /// The job's process did not run `program` within the wait.
+    #[error("system/{label} did not run {} {} seconds after the restart", program.display(), waited.as_secs())]
+    NotRunning {
+        label: String,
+        program: PathBuf,
+        waited: std::time::Duration,
+    },
+}
+
 /// Kickstart the job `label` and wait until its process runs `program`.
 ///
 /// # Errors
-/// Why not, in a line for the log: the kickstart failed, or the job did not run `program`
-/// within the wait.
+/// [`RestartError`]: the kickstart failed, or the job did not run `program` within the wait.
 pub fn restart_and_wait(
     runner: &dyn Runner,
     label: &str,
     program: &Path,
     wait: Wait,
     pace: &Pace,
-) -> Result<(), String> {
+) -> Result<(), RestartError> {
     let limit = wait.timeout;
     match runner.run(&tools::kickstart(label, limit)) {
         Ok(exec) if exec.success() => {}
         Ok(exec) => {
-            return Err(format!(
-                "launchctl kickstart system/{label}: exit status {:?}: {}",
-                exec.code,
-                exec.stderr_text()
-            ));
+            return Err(RestartError::Kickstart {
+                label: label.to_owned(),
+                code: exec.code,
+                stderr: exec.stderr_text(),
+            });
         }
-        Err(e) => return Err(format!("launchctl kickstart system/{label}: {e}")),
+        Err(source) => {
+            return Err(RestartError::Spawn {
+                label: label.to_owned(),
+                source,
+            });
+        }
     }
     let deadline = (pace.now)() + wait.timeout;
     loop {
@@ -44,16 +75,15 @@ pub fn restart_and_wait(
             return Ok(());
         }
         if (pace.now)() >= deadline {
-            return Err(format!(
-                "system/{label} did not run {} {} seconds after the restart",
-                program.display(),
-                wait.timeout.as_secs()
-            ));
+            return Err(RestartError::NotRunning {
+                label: label.to_owned(),
+                program: program.to_owned(),
+                waited: wait.timeout,
+            });
         }
         (pace.sleep)(wait.interval);
     }
 }
-
 /// Whether the process of the job `label` has `program` mapped as its program. (`lsof`
 /// exits 1 when it only warns, with its listing intact, so its output is read whatever its
 /// status.)

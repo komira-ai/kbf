@@ -21,7 +21,7 @@ use crate::wire::Outcome;
 
 /// A helper that answers each connection from `answer`, which sees the request line and gives
 /// the bytes to write back (none: close without an answer). The lines it was asked, at the end.
-fn serve(
+pub(super) fn serve(
     dir: &TestDir,
     connections: usize,
     answer: impl Fn(&str) -> Option<String> + Send + 'static,
@@ -45,7 +45,7 @@ fn serve(
     (socket, handle)
 }
 
-fn limits() -> Limits {
+pub(super) fn limits() -> Limits {
     Limits {
         install: Duration::from_secs(5),
         switch: None,
@@ -54,11 +54,11 @@ fn limits() -> Limits {
     }
 }
 
-fn dir(name: &str) -> TestDir {
+pub(super) fn dir(name: &str) -> TestDir {
     TestDir::under(std::env::temp_dir(), name)
 }
 
-fn line(answer: &Answer) -> Option<String> {
+pub(super) fn line(answer: &Answer) -> Option<String> {
     Some(format!("{}\n", answer.json_line()))
 }
 

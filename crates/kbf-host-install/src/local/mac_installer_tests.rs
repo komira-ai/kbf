@@ -75,6 +75,18 @@ struct Launchd {
     kickstart_unstartable: Cell<bool>,
     /// The commit whose binary never comes up: its process ends at once.
     crashes: RefCell<Option<String>>,
+    /// A slow restart: after a kickstart the job's process (a live pid) still runs the
+    /// program it ran, and `pending` is what it moves to when the test says (`settle`).
+    slow: Cell<bool>,
+    pending: RefCell<Option<PathBuf>>,
+}
+
+impl Launchd {
+    /// The slow restart's process moves to the program it was kickstarted onto.
+    fn settle(&self) {
+        let next = self.pending.borrow_mut().take();
+        *self.running.borrow_mut() = next;
+    }
 }
 
 /// `curl` and `gh` as the Linux rig plays them, `launchctl` and `lsof` as a Mac's.
@@ -91,6 +103,9 @@ impl Runner for MacSim {
             .to_string_lossy()
             .into_owned();
         let launchd = &self.launchd;
+        if name == "lsof" {
+            self.sim.calls.borrow_mut().push(cmd.clone());
+        }
         match (name.as_str(), cmd.args.first().map(String::as_str)) {
             ("launchctl", Some("kickstart")) => {
                 self.sim.calls.borrow_mut().push(cmd.clone());
@@ -102,9 +117,13 @@ impl Runner for MacSim {
                 }
                 let commit = fs::read_link(launchd.releases.join("current")).unwrap();
                 let commit = commit.to_string_lossy().into_owned();
-                *launchd.running.borrow_mut() = (launchd.crashes.borrow().as_deref()
-                    != Some(commit.as_str()))
-                .then(|| launchd.releases.join(&commit).join("kbf"));
+                let next = (launchd.crashes.borrow().as_deref() != Some(commit.as_str()))
+                    .then(|| launchd.releases.join(&commit).join("kbf"));
+                if launchd.slow.replace(false) {
+                    *launchd.pending.borrow_mut() = next;
+                } else {
+                    *launchd.running.borrow_mut() = next;
+                }
                 exec(0, "", "")
             }
             ("launchctl", Some("print")) => match &*launchd.running.borrow() {
@@ -159,6 +178,8 @@ struct Rig {
     launchd: Rc<Launchd>,
     leases: Leases,
     logged: Rc<RefCell<Vec<String>>>,
+    /// The clock the restart's wait is counted on, moved only by its sleeps.
+    clock: crate::pace::fake::Fake,
     /// The node's key: root's alone on a root daemon.
     key: PathBuf,
 }
@@ -241,8 +262,11 @@ impl Rig {
             kickstart_fails: Cell::new(false),
             kickstart_unstartable: Cell::new(false),
             crashes: RefCell::new(None),
+            slow: Cell::new(false),
+            pending: RefCell::new(None),
         });
         let leases = Leases(Rc::new(RefCell::new(Ok((0, None)))));
+        let clock = crate::pace::fake::Fake::new();
         let logged = Rc::new(RefCell::new(Vec::new()));
         let backend = Linux {
             layout: layout.clone(),
@@ -261,7 +285,7 @@ impl Rig {
                 timeout: Duration::from_millis(40),
                 interval: Duration::from_millis(1),
             },
-            pace: crate::pace::fake::Fake::new().pace(),
+            pace: clock.pace(),
             runner: Box::new(MacSim {
                 sim: Sim {
                     net: Rc::clone(&net),
@@ -294,6 +318,7 @@ impl Rig {
             launchd,
             leases,
             logged,
+            clock,
             key,
         };
         rig.offer(COMMIT);
@@ -600,4 +625,74 @@ fn an_activate_kickstarts_the_job_onto_the_release_named() {
     let fault = rig.backend.activate(A).unwrap_err();
     assert_eq!(fault.code, Code::RestartFailed, "{fault:?}");
     assert_eq!(rig.current_link(), A);
+}
+
+/// The `lsof` asks the restart made, one per look at the job's process.
+fn lsof_looks(rig: &Rig) -> usize {
+    rig.calls
+        .borrow()
+        .iter()
+        .filter(|c| c.program.ends_with("lsof"))
+        .count()
+}
+
+/// Catches a restart taken as done while the job's live process still runs the release it
+/// left: after the kickstart the job keeps a pid whose program is A's binary for three
+/// sleeps of the injected clock; the switch waits, looking each interval, and is made only
+/// once the process runs the new release (four looks, three sleeps of the interval), with
+/// the host on the new release and nothing put back.
+#[test]
+fn a_job_still_running_the_old_release_is_waited_for_until_it_runs_the_new_one() {
+    let rig = Rig::new("slow");
+    rig.backend
+        .stage(&version(), &super::linux_tests::stable())
+        .unwrap();
+    rig.launchd.slow.set(true);
+    let launchd = Rc::clone(&rig.launchd);
+    rig.clock.on_sleep(move |n| {
+        if n == 3 {
+            launchd.settle();
+        }
+    });
+    let looks = lsof_looks(&rig);
+    assert_eq!(rig.backend.switch(COMMIT, 600, 1_000).unwrap(), 1_600);
+    assert_eq!(lsof_looks(&rig) - looks, 4);
+    assert_eq!(rig.clock.sleeps(), vec![Duration::from_millis(1); 3]);
+    assert_eq!(rig.current_link(), COMMIT);
+    assert_eq!(rig.kickstarts(), 1);
+    assert_eq!(
+        *rig.launchd.running.borrow(),
+        Some(rig.releases().join(COMMIT).join("kbf"))
+    );
+}
+
+/// Catches a job that never leaves the old release taken as up, or one waited for past the
+/// wait: the job's live process runs A's binary however long the switch looks; when the
+/// injected clock reaches the wait (40 ms in sleeps of 1 ms) the switch fails naming the
+/// program it waited for, the host is put back on A (state and link), and the job,
+/// kickstarted again, runs A.
+#[test]
+fn a_job_that_keeps_running_the_old_release_fails_the_switch_and_goes_back() {
+    let rig = Rig::new("stuck");
+    rig.backend
+        .stage(&version(), &super::linux_tests::stable())
+        .unwrap();
+    rig.launchd.slow.set(true);
+    let fault = rig.backend.switch(COMMIT, 600, 1_000).unwrap_err();
+    assert_eq!(fault.code, Code::SwitchFailed, "{fault:?}");
+    assert_eq!(
+        fault.detail,
+        format!(
+            "system/{LABEL} did not run {} 0 seconds after the restart",
+            rig.releases().join(COMMIT).join("kbf").display()
+        )
+    );
+    assert_eq!(rig.clock.sleeps(), vec![Duration::from_millis(1); 40]);
+    assert_eq!(rig.current_link(), A);
+    assert_eq!(rig.state().current.unwrap().to_string(), A);
+    assert_eq!(rig.kickstarts(), 2);
+    assert_eq!(
+        *rig.launchd.running.borrow(),
+        Some(rig.releases().join(A).join("kbf"))
+    );
 }

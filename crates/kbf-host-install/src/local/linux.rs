@@ -311,6 +311,7 @@ impl<E: Exec> Linux<E> {
             self.restart_wait,
             &self.pace,
         )
+        .map_err(|e| e.to_string())
     }
 
     /// `Ok` when no lease runs on the host; the refusal that changes nothing otherwise. A

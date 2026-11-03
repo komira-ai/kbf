@@ -12,7 +12,8 @@ use serde_json::Value;
 
 use super::core_tests::{A, Fake, Fx};
 use super::production::{
-    LinuxEnv, MAC_INSTALLER_STATE, serve_linux_with, serve_mac, serve_mac_installer_with,
+    LinuxEnv, MAC_INSTALLER_STATE, MAC_STATE_DIR, MAC_WORK_MODE, serve_linux_with, serve_mac,
+    serve_mac_installer_with, work_dir,
 };
 use super::serve::{Layout, ServeConfig};
 use crate::mac::tests::fx::Fx as MacFx;
@@ -125,7 +126,7 @@ fn a_mac_on_the_installer_layout_asks_dscl_and_makes_its_state_directory() {
     assert_eq!(answer["commit"], A);
     assert_eq!(
         fs::metadata(&state_dir).unwrap().permissions().mode() & 0o777,
-        0o700
+        MAC_WORK_MODE
     );
     assert_eq!(MAC_INSTALLER_STATE, "installer-state.json");
 
@@ -193,4 +194,65 @@ fn the_label_is_refused_on_linux_and_takes_a_mac_to_the_installer_layout() {
         let err = serve_mac(&config).unwrap_err();
         assert!(err.starts_with("dscl: "), "{err}");
     }
+}
+
+/// The `<string>` values of the `ProgramArguments` of the plist `text`.
+fn program_arguments(text: &str) -> Vec<String> {
+    let start = text
+        .find("<key>ProgramArguments</key>")
+        .expect("ProgramArguments");
+    let rest = &text[start..];
+    let end = rest.find("</array>").expect("the end of the array");
+    rest[..end]
+        .split("<string>")
+        .skip(1)
+        .map(|part| {
+            part.split("</string>")
+                .next()
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .collect()
+}
+
+/// Catches a state directory that locks the agent out of the shipped socket: the helper job
+/// `packaging/host-agent/macos` ships puts `local.sock` in the very directory the installer
+/// layout keeps its state in (`/var/db/kbf-host-install`), so that directory must let the
+/// socket's account search it. It is made, and an existing 0700 one is changed, to 0711:
+/// others may search it (and reach the socket, which is theirs, by name) and may not list or
+/// write it; the directory is checked as root's; one that cannot be made says which.
+#[test]
+fn the_state_directory_lets_the_socket_account_reach_the_shipped_socket() {
+    let shipped = include_str!(
+        "../../../../packaging/host-agent/macos/com.komira.kbf-host-install-local.plist"
+    );
+    let args = program_arguments(shipped);
+    let socket = args
+        .windows(2)
+        .find(|w| w[0] == "--socket")
+        .map(|w| Path::new(&w[1]).to_owned())
+        .expect("the socket flag");
+    assert_eq!(socket.parent(), Some(Path::new(MAC_STATE_DIR)));
+    assert!(args.windows(2).any(|w| w[0] == "--launchd-label"));
+
+    let fx = Fx::new("pr-macinst-workdir");
+    let trust = Trust::owned_by(fs::metadata(&*fx.dir).unwrap().uid(), &fx.dir);
+    let mode = |dir: &Path| fs::metadata(dir).unwrap().permissions().mode() & 0o777;
+    let made = fx.dir.join("made");
+    work_dir(&trust, &made).unwrap();
+    let existing = fx.dir.join("existing");
+    fs::create_dir(&existing).unwrap();
+    fs::set_permissions(&existing, fs::Permissions::from_mode(0o700)).unwrap();
+    work_dir(&trust, &existing).unwrap();
+    for dir in [&made, &existing] {
+        let bits = mode(dir);
+        assert_eq!(bits, 0o711, "{}", dir.display());
+        assert_eq!(bits & 0o001, 0o001, "others search it");
+        assert_eq!(bits & 0o066, 0, "no one else lists or writes it");
+    }
+    let err = work_dir(&trust, &fx.dir.join("no/such")).unwrap_err();
+    assert!(
+        err.starts_with(&fx.dir.join("no/such").display().to_string()),
+        "{err}"
+    );
 }

@@ -260,24 +260,15 @@ fn the_previous_helper_refuses_an_activate_and_runs_nothing() {
     }
 }
 
-/// The previous release's agent's reading of a helper's answer line, as v0.0.63's
-/// `kbf-updater/src/agent/local.rs` declares it (the fields a refusal can carry; unknown
-/// fields ignored): `result` `refused` with a `reason` is its `LocalError::Refused(reason)`.
-#[derive(Debug, Deserialize)]
-struct PreviousAgentLine {
-    result: String,
-    reason: Option<String>,
-}
-
 /// The line a `leases_live` refusal is, byte for byte, as the agent's own tests read it.
 const LEASES_LIVE_LINE: &str = "{\"result\":\"refused\",\"reason\":\"leases_live\"}";
 
-/// Catches a `leases_live` refusal that the previous release's agent cannot read, or whose
-/// next step changes the host: the line is exactly `LEASES_LIVE_LINE`, the previous agent's
-/// reader takes it as a refusal with that reason (and so goes back on the release that runs,
-/// as it does for any refused switch: `revert`, then `query`); this helper answers that
-/// `revert` `nothing_pending` without asking the backend to revert, and the `query` after it
-/// tells the release that runs, nothing on trial and no end recorded for the target.
+/// Catches a `leases_live` refusal whose way back, as the previous release's agent takes it,
+/// changes the host: the line is exactly `LEASES_LIVE_LINE`; the previous agent goes back on
+/// any refused switch with `revert`, then `query` (run by `kbf-updater`'s
+/// `the_previous_agent_goes_back_on_a_leases_live_refusal_and_switches_nothing`); this helper
+/// answers that `revert` `nothing_pending` without asking the backend to revert, and the `query`
+/// after it tells the release that runs, nothing on trial and no end recorded for the target.
 #[test]
 fn the_previous_agent_reads_a_leases_live_refusal_and_its_way_back_changes_nothing() {
     let fx = Fx::new("compat-leases-live");
@@ -288,11 +279,6 @@ fn the_previous_agent_reads_a_leases_live_refusal_and_its_way_back_changes_nothi
     ));
     let answer = fx.ask(&format!("switch kbf={VB}"));
     assert_eq!(answer.json_line(), LEASES_LIVE_LINE);
-    let read: PreviousAgentLine = serde_json::from_str(LEASES_LIVE_LINE).unwrap();
-    assert_eq!(
-        (read.result.as_str(), read.reason.as_deref()),
-        ("refused", Some("leases_live"))
-    );
     let calls = fx.calls().len();
     assert_eq!(
         fx.ask("revert").json_line(),

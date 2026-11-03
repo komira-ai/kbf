@@ -302,8 +302,28 @@ pub(super) fn serve_mac_with(
 }
 
 /// Where a Mac on the installer layout keeps the socket's own state: beside the kit's, in a
-/// file of its own, so a Mac that moves from the kit starts with no stale record.
+/// file of its own, so a Mac that moves from the kit starts with no stale record. The shipped
+/// job's socket (`local.sock`) is in it too, so it is searchable by others ([`work_dir`]).
 pub const MAC_STATE_DIR: &str = "/var/db/kbf-host-install";
+
+/// The mode of that directory: root's, searchable by others and listable by no one else. The
+/// socket's account reaches `local.sock` inside it by name; the state files in it are root's,
+/// 0600. (The kit's work directory, the same directory, has the same mode.)
+pub const MAC_WORK_MODE: u32 = 0o711;
+
+/// Make root's directory `dir` (mode [`MAC_WORK_MODE`]) if it is not there, give it that mode,
+/// and check it.
+pub(super) fn work_dir(trust: &Trust, dir: &Path) -> Result<(), String> {
+    let say = |e: std::io::Error| format!("{}: {e}", dir.display());
+    match fs::DirBuilder::new().mode(MAC_WORK_MODE).create(dir) {
+        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(say(e)),
+        _ => {}
+    }
+    fs::set_permissions(dir, fs::Permissions::from_mode(MAC_WORK_MODE)).map_err(say)?;
+    trust
+        .check_dir(dir)
+        .map_err(|e| format!("{}: {e}", dir.display()))
+}
 
 /// The file of that state.
 pub const MAC_INSTALLER_STATE: &str = "installer-state.json";
@@ -312,7 +332,8 @@ pub const MAC_INSTALLER_STATE: &str = "installer-state.json";
 const DSCL_LIMIT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// A Mac on the installer layout: the account of the socket from `dscl` (through `runner`,
-/// never root), the private state directory `state_dir` made, then the serving of `backend`.
+/// never root), the state directory `state_dir` made ([`work_dir`]), then the serving of
+/// `backend`.
 pub(super) fn serve_mac_installer_with<B: Backend>(
     config: &ServeConfig,
     trust: &Trust,
@@ -327,7 +348,7 @@ pub(super) fn serve_mac_installer_with<B: Backend>(
     let who = crate::mac::tools::parse_ids(&exec.stdout_text())
         .filter(|id| id.uid != 0 && id.gid != 0)
         .ok_or_else(|| format!("the account {} has no usable ids", config.user))?;
-    private_dir(trust, state_dir)?;
+    work_dir(trust, state_dir)?;
     let place = Place {
         state_dir,
         state_name: MAC_INSTALLER_STATE,
