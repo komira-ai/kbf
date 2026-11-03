@@ -5,7 +5,7 @@
 //! - **Features.** The agent announces [`ANNOUNCED`] in its heartbeat. The coordinator answers
 //!   with the ones it supports (`features` in the reply); the agent uses a behaviour only
 //!   while the last reply advertised it. An agent that sees none behaves as it did before: a
-//!   drain bound is a `Failed`, it never declines an order for a deferral, and a failure it
+//!   drain bound or a `leases_live` refusal of the switch is a `Failed`, it never declines an order for a deferral, and a failure it
 //!   cannot repair is a plain `Failed`.
 //! - **The deferral.** A deferred update leaves a [`Deferral`] on disk per unit
 //!   (`defer-<unit>` in the agent's state directory), so a restart keeps the `retry_after`. It
@@ -38,6 +38,11 @@ pub const ANNOUNCED: [&str; 2] = [DEFERRED_V1, HALT_V1];
 
 /// The reason of a deferral whose drain bound passed.
 pub const DRAIN_BOUND: &str = "drain_bound";
+
+/// The reason of a deferral whose switch the helper refused because leases still run on the
+/// host as root counts them (the helper's code `leases_live`): a Mac's helper counts them
+/// itself before it switches.
+pub const LEASES_LIVE: &str = "leases_live";
 
 /// The reason of a halt: the helper could not put the previous release back and it does not run
 /// healthy.

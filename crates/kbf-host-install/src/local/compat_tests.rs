@@ -259,3 +259,34 @@ fn the_previous_helper_refuses_an_activate_and_runs_nothing() {
         assert!(!line.starts_with(form), "{form}");
     }
 }
+
+/// The line a `leases_live` refusal is, byte for byte, as the agent's own tests read it.
+const LEASES_LIVE_LINE: &str = "{\"result\":\"refused\",\"reason\":\"leases_live\"}";
+
+/// Catches a `leases_live` refusal whose way back, as the previous release's agent takes it,
+/// changes the host: the line is exactly `LEASES_LIVE_LINE`; the previous agent goes back on
+/// any refused switch with `revert`, then `query` (run by `kbf-updater`'s
+/// `the_previous_agent_goes_back_on_a_leases_live_refusal_and_switches_nothing`); this helper
+/// answers that `revert` `nothing_pending` without asking the backend to revert, and the `query`
+/// after it tells the release that runs, nothing on trial and no end recorded for the target.
+#[test]
+fn the_previous_agent_reads_a_leases_live_refusal_and_its_way_back_changes_nothing() {
+    let fx = Fx::new("compat-leases-live");
+    fx.install(VB);
+    fx.world.borrow_mut().switch_fault = Some(crate::local::backend::Fault::refused(
+        crate::local::answer::Code::LeasesLive,
+        "1 leases are live; not switching",
+    ));
+    let answer = fx.ask(&format!("switch kbf={VB}"));
+    assert_eq!(answer.json_line(), LEASES_LIVE_LINE);
+    let calls = fx.calls().len();
+    assert_eq!(
+        fx.ask("revert").json_line(),
+        "{\"result\":\"refused\",\"reason\":\"nothing_pending\"}"
+    );
+    assert!(!fx.calls()[calls..].iter().any(|c| c.starts_with("revert")));
+    let view = fx.query();
+    assert_eq!(view.commit.as_deref(), Some(super::A));
+    assert!(view.pending.is_none());
+    assert!(view.last.is_none());
+}

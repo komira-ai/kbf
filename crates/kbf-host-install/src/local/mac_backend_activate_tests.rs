@@ -1,6 +1,7 @@
 //! `activate` on a Mac: the kit under a scratch directory, launchd played by the test, the
 //! channel's release files gone.
 
+use crate::local::mac_backend_lease_tests::Leases;
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -54,7 +55,11 @@ fn core(fx: &Fx, sim: &Rc<Sim>) -> Ab<MacBackend> {
     let agent = fx.dir.join("agent");
     mkdir(&agent, 0o700);
     Ab::new(
-        MacBackend::new(fx.host.clone(), Box::new(Shared(Rc::clone(sim)))),
+        MacBackend::new(
+            fx.host.clone(),
+            Box::new(Shared(Rc::clone(sim))),
+            Box::new(Leases::idle()),
+        ),
         fx.host.work.join("state.json"),
         fx.host.trust.clone(),
         600,
@@ -303,7 +308,11 @@ fn mac_activate_ends_a_trial_and_a_failed_restart_does_not_go_back() {
     let (fx, sim, _) = rig("mba-trial");
     keep(&fx, NEW, NEW_VERSION, 2);
     let ab = core(&fx, &sim);
-    let backend = MacBackend::new(fx.host.clone(), Box::new(Shared(Rc::clone(&sim))));
+    let backend = MacBackend::new(
+        fx.host.clone(),
+        Box::new(Shared(Rc::clone(&sim))),
+        Box::new(Leases::idle()),
+    );
     backend.switch(NEW, 600, 1).unwrap();
     assert!(backend.pending().unwrap().is_some());
     assert!(matches!(
@@ -411,7 +420,11 @@ fn mac_activate_puts_the_links_back_when_the_marker_cannot_be_cleared() {
 fn mac_activate_needs_links_it_can_read() {
     let (fx, sim, _) = rig("mba-badlink");
     keep(&fx, NEW, NEW_VERSION, 2);
-    let backend = MacBackend::new(fx.host.clone(), Box::new(Shared(Rc::clone(&sim))));
+    let backend = MacBackend::new(
+        fx.host.clone(),
+        Box::new(Shared(Rc::clone(&sim))),
+        Box::new(Leases::idle()),
+    );
     std::os::unix::fs::symlink("/somewhere/else", fx.host.previous()).unwrap();
     let fault = backend.activate(NEW).unwrap_err();
     assert_eq!(fault.code, Code::StateUnavailable, "{fault:?}");

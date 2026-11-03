@@ -38,7 +38,7 @@ What is still by hand (section 3):
 - a host's first install of the agent and helper;
 - going back after a red gamma when the job cannot (CI is gone, or the coordinator's rules hold
   the farm);
-- updating a Mac;
+- updating a Mac (removed by G8, which is done);
 - one-time setup (the coordinator, its allow-list, the repository variables, enrolling
   each host).
 
@@ -230,7 +230,7 @@ that.
 | M5 | Set the repository and organisation variables (`KBF_COORDINATOR_URL`, `KBF_COORDINATOR_CA`, `KBF_MIN_UP_*`, `TS_CLIENT_ID`, `TS_AUDIENCE`, `FARM_*`), the Tailscale trust credential and its policy for `tag:ci`, and the `release` environment | once per farm | by hand | stays by hand: it is configuration of the farm, not of kbf |
 | M6 | After a red gamma, set the farm back: choose the version, and set it as desired. Only a CI token can, so that means re-running an earlier release's `gamma` job. | every red gamma | the ordinary case is done by the job (G1, done); by hand when CI is gone or the ordinary rules hold the farm | G1 (the ordinary case, done), G2 (when CI is gone), C1 (when the ordinary rules hold the farm) |
 | M7 | Go back on a host when the coordinator is down or cannot order it | rare | by hand. `kbf-deploy host rollback` serves hand-laid hosts only. On a package host, the helper's `revert` goes back only from a release on trial, and `switch` needs a release staged by `install`, on a trial clock. Nothing switches to any other kept release. | H1, H2 |
-| M8 | Update a Mac: it takes no update order yet, because the installer has no lease source for a launchd job ([kbf-installer-macos.md](../deploy/kbf-installer-macos.md), "What is still by hand") | every release | by hand | G8 |
+| M8 | Update a Mac. Before G8, the Mac side of the root helper served only the older kit layout, not the installer layout of the `kbf-installer` package, and switched with no lease count of its own; the installer's Mac lease source refused a Mac in pool mode, the root daemon with lease users that farm Macs run | every release | by hand before G8 | G8 (done) |
 | M9 | Update a farm's only frontend, or its only storage host. A frontend is never the last one up, and a lone storage host with the default storage minimum (`KBF_MIN_UP_STORAGE` unset, so 1) would leave none up, so the coordinator orders neither, and `gamma` fails at its stall or deadline. The operator sends `install`, `switch` and `confirm` to the helper's socket in a window. | every release, on such a farm | by hand ([kbf-updater.md](../deploy/kbf-updater.md), "A frontend host") | stays by hand: it is the operator's choice between an outage and more hosts. Either run two frontends behind a load balancer ([frontends-behind-a-load-balancer.md](../deploy/frontends-behind-a-load-balancer.md)) and two storage hosts, or set `KBF_MIN_UP_STORAGE` to 0 and accept that the storage host is down while it updates. |
 | M10 | Clear a halt that a host's hook reported (komira-ai/kbf#2187, open) | when a hook halts | will be by hand | stays by hand: a halt asks for a person by design |
 | M11 | Re-run a release job that failed for a reason outside the commit | rare | by hand, failed jobs only | stays by hand: the next code push releases the same code anyway |
@@ -253,7 +253,7 @@ never by elapsed time.
 | 5 | H2 the agent's pin | M7 | H1, C1 | komira-ai/kbf#2243 |
 | 6 | G6 agent and helper units in the package | M3 | komira-ai/kbf#2236 | komira-ai/kbf#2244 |
 | 7 | G7 the coordinator updated by the updater | M2 | G6, [host-updates.md](host-updates.md) step 6a | komira-ai/kbf#2245 |
-| 8 | G8 a Mac takes update orders | M8 | the Mac lease users ([macos-end-state.md](macos-end-state.md), steps 3 and 4) | komira-ai/kbf#2246 |
+| 8 | G8 a Mac takes update orders (done) | M8 | the Mac lease users ([macos-end-state.md](macos-end-state.md), steps 3 and 4, merged) | komira-ai/kbf#2246 |
 
 G1 and G2 come first because they close the gap of section 2.5. H1, C1 and H2 are the
 forced rollback, in that order: a forced order on a host ends in H1's `activate`, and the
@@ -604,16 +604,83 @@ The `gamma` job then sets `kbf-coordinator` first and `kbf` after it. It always 
 
 ### G8. A Mac takes update orders
 
+**Status: done.**
+
 **Change.** The installer counts a Mac's live leases from the native driver's lease
 records, as it does a container's. A launchd job then has a lease source. With live leases
 the order is `Deferred`. With none, the release is activated.
 
+A Mac's order travels through the agent and the root helper's local socket
+(`kbf-host-install --serve`), not through the order spool of `kbf-installer run`, which
+nothing writes any more. So the count is made where the switch is:
+
+- **The lease source.** `MacLeases` (`crates/kbf-installer/src/helper/mac_leases.rs`) counts
+  the daemon's keepers and its lease directories (`<data-dir>/leases/lease-*`). It now
+  reads a daemon in pool mode (`[macos] pool-users`, the root daemon with lease users of
+  [macos-end-state.md](macos-end-state.md)) as it reads one in daemon-user mode. Both leave
+  the same keepers and lease directories. Before, it refused the pool keys.
+- **The helper on the installer layout.** A Mac that the `kbf-installer` package and
+  `kbf-mac-provision` laid out has no kit: its releases are in
+  `/usr/local/kbf-installer/releases`, the state is the installer's, and the daemon's
+  launchd job runs `releases/current/kbf` as root. The local socket serves it with
+  `--launchd-label <label>` (`crates/kbf-host-install/src/local/linux.rs`,
+  `production_mac`). That is the installer-layout backend Linux hosts use, with three
+  differences:
+  - the restart is `launchctl kickstart -k system/<label>` plus a wait until the job's
+    process runs the release (`local/launchd.rs`);
+  - the release fetched is the `darwin-<arch>` one;
+  - the leases are counted before a switch.
+  The stage verifies the release as the installer does: attestation, Mach-O, quarantine,
+  signature, and the binary's own word on its commit, asked unprivileged with no
+  configuration. Nothing in it runs as `_kbf` or reads the node's key. The shipped helper job
+  (`packaging/host-agent/macos`) passes `--launchd-label com.komira.kbf-daemon`.
+- **The count, on both Mac layouts.** Before a switch the helper asks the lease source:
+  - with a lease live it refuses `leases_live`, a new code of the socket's closed set, and
+    nothing moves;
+  - when the count cannot be made it refuses `state_unavailable` with the reason;
+  - when the count lets the switch through on a judgment (lease directories left with no
+    daemon running), the note goes to the log;
+  - with none it switches, as before.
+  The agent has already drained the node at the frontend, so the count is 0 unless the
+  frontend's view and the host's disagree. A `leases_live` refusal is not recorded as the
+  end of the update. The older kit layout (`local/mac_backend.rs`, without `--launchd-label`)
+  makes the same count.
+- **The agent.** A switch refused `leases_live` ends the update as a drain bound does: nothing
+  is reverted, and the node is left drained. To a coordinator that advertises `deferred-v1`
+  it is a `Hold::Deferred` with reason `leases_live`. The coordinator then frees the host's
+  slot and orders it again after the wait. An older coordinator sees a plain `Failed`, and
+  the agent takes the order again after its `--retry-secs`.
+- **Not changed.** The Linux helper keeps its `NoLeases`: the drain is its lease check. The
+  kit layout still checks a new binary as the account `_kbf`, as its daemon runs as `_kbf`.
+
 **Tests:**
 
-- an order with a live lease is deferred and holds no slot;
-- with none, the release is activated and confirmed;
-- a lease record that cannot be read refuses the order with the reason, as today;
-- the coordinator's `mac-daemon` role converges on a fake fleet with one Mac.
+- an order with a live lease is deferred and holds no slot:
+  - `an_order_with_a_live_lease_is_refused_leases_live_and_nothing_moves` (helper);
+  - `an_order_with_a_live_lease_is_deferred_and_holds_no_slot` (agent);
+  - `a_mac_deferred_for_a_live_lease_holds_no_slot` (coordinator);
+  - `a_pool_mode_mac_counts_its_lease_directories_and_its_slot_keepers` (lease source);
+- with none, the release is activated and confirmed:
+  - `a_provisioned_mac_is_updated_on_the_installer_layout` (helper, installer layout: a
+    live-lease refusal, then the switch, the kickstart and the confirm);
+  - `with_no_live_lease_the_release_is_activated_and_confirmed` (helper, kit layout);
+  - `a_pool_mode_mac_with_no_live_lease_reads_idle` (lease source);
+- a lease record that cannot be read refuses the order with the reason, as today:
+  - `a_lease_record_that_cannot_be_read_refuses_the_switch_with_the_reason` (helper, kit);
+  - `a_judged_lease_count_is_logged_and_one_that_cannot_be_made_refuses` (helper,
+    installer layout);
+  - `a_pool_mode_mac_whose_lease_records_cannot_be_read_cannot_tell` (lease source);
+- the coordinator's `mac-daemon` role converges on a fake fleet with one Mac:
+  - `the_mac_daemon_role_converges_on_a_fleet_of_one_mac`. The coordinator already treated
+    `mac-daemon` as any role, so this test and the coordinator's slot test hold what main
+    did, rather than fail before the change.
+- beside those, on the installer layout: `a_pool_mode_stage_reads_no_node_key_and_runs_nothing_as_the_daemon`,
+  `a_release_whose_daemon_does_not_run_is_put_back_at_once`,
+  `a_kickstart_that_fails_fails_the_switch_and_says_why` and
+  `an_activate_kickstarts_the_job_onto_the_release_named`; across releases (B8):
+  `the_previous_agent_reads_a_leases_live_refusal_and_its_way_back_changes_nothing`,
+  `the_socket_reader_takes_a_leases_live_line_as_a_refusal` and
+  `with_a_previous_helper_a_refused_switch_still_goes_back_as_before`.
 
 ### Deferred: RH1, rehearse the forced rollback every release
 

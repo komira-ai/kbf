@@ -12,6 +12,11 @@ use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use kbf_host::path::Root;
+use kbf_installer::helper::leases::LeaseSource;
+use kbf_installer::helper::mac_leases::MacLeases;
+use kbf_installer::layout::{Layout as HostLayout, Platform};
+
 use super::backend::Backend;
 use super::core::Ab;
 use super::serve::{self, Layout, ServeConfig, Serving};
@@ -79,7 +84,6 @@ pub(super) fn log(line: &str) {
 }
 
 /// Make root's private directory `dir` (0700) if it is not there, and check it.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(super) fn private_dir(trust: &Trust, dir: &Path) -> Result<(), String> {
     let say = |e: std::io::Error| format!("{}: {e}", dir.display());
     match fs::DirBuilder::new().mode(0o700).create(dir) {
@@ -165,6 +169,9 @@ pub(super) fn serve_linux_with<B: Backend>(
     backend: B,
     stop: &AtomicBool,
 ) -> Result<(), String> {
+    if config.launchd_label.is_some() {
+        return Err("--launchd-label is for a Mac: a Linux host restarts its units".to_owned());
+    }
     if config.units.is_empty() && !config.frontend_container {
         return Err(
             "--restart-unit is required on a Linux host (or --frontend-container)".to_owned(),
@@ -253,13 +260,15 @@ fn serve_linux_for(_config: &ServeConfig) -> Result<(), String> {
 }
 
 /// A Mac: the account of the socket from `dscl` (through `runner`, never root), the work
-/// directory made, then the serving of the kit by `backend_runner`'s tools.
+/// directory made, then the serving of the kit by `backend_runner`'s tools, with the leases
+/// counted by `leases` before a switch.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(super) fn serve_mac_with(
     config: &ServeConfig,
     host: MacHost,
     runner: &dyn Runner,
     backend_runner: Box<dyn Runner>,
+    leases: Box<dyn LeaseSource>,
     stop: &AtomicBool,
 ) -> Result<(), String> {
     use crate::mac::tools;
@@ -281,7 +290,7 @@ pub(super) fn serve_mac_with(
         .ok_or_else(|| format!("the account {} has no usable ids", config.user))?;
     crate::mac::ensure_work(&host).map_err(|_| "the work directory is not usable".to_owned())?;
     let (trust, work, audit) = (host.trust.clone(), host.work.clone(), host.audit.clone());
-    let backend = super::mac_backend::MacBackend::new(host, backend_runner);
+    let backend = super::mac_backend::MacBackend::new(host, backend_runner, leases);
     let place = Place {
         state_dir: &work,
         state_name: "state.json",
@@ -292,14 +301,105 @@ pub(super) fn serve_mac_with(
     serve_with(config, backend, &place, stop)
 }
 
-/// The Mac side as the program runs it.
+/// Where a Mac on the installer layout keeps the socket's own state: beside the kit's, in a
+/// file of its own, so a Mac that moves from the kit starts with no stale record. The shipped
+/// job's socket (`local.sock`) is in it too, so it is searchable by others ([`work_dir`]).
+pub const MAC_STATE_DIR: &str = "/var/db/kbf-host-install";
+
+/// The mode of that directory: root's, searchable by others and listable by no one else. The
+/// socket's account reaches `local.sock` inside it by name; the state files in it are root's,
+/// 0600. (The kit's work directory, the same directory, has the same mode.)
+pub const MAC_WORK_MODE: u32 = 0o711;
+
+/// Make root's directory `dir` (mode [`MAC_WORK_MODE`]) if it is not there, check it, and then
+/// give it that mode. Nothing is changed on a path that is a link or not a directory, or on a
+/// directory the trust check refuses (another owner's, or under a directory others may write):
+/// the mode is set through a descriptor opened without following a link, on the directory
+/// that was checked.
+pub(super) fn work_dir(trust: &Trust, dir: &Path) -> Result<(), String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let say = |e: std::io::Error| format!("{}: {e}", dir.display());
+    match fs::DirBuilder::new().mode(MAC_WORK_MODE).create(dir) {
+        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(say(e)),
+        _ => {}
+    }
+    let meta = fs::symlink_metadata(dir).map_err(say)?;
+    if meta.file_type().is_symlink() {
+        return Err(format!("{} is a link", dir.display()));
+    }
+    if !meta.is_dir() {
+        return Err(format!("{} is not a directory", dir.display()));
+    }
+    trust
+        .check_dir(dir)
+        .map_err(|e| format!("{}: {e}", dir.display()))?;
+    let opened = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(crate::trust::nofollow() | libc::O_DIRECTORY)
+        .open(dir)
+        .map_err(say)?;
+    opened
+        .set_permissions(fs::Permissions::from_mode(MAC_WORK_MODE))
+        .map_err(say)
+}
+
+/// The file of that state.
+pub const MAC_INSTALLER_STATE: &str = "installer-state.json";
+
+/// How long `dscl` may take to name the socket's account.
+const DSCL_LIMIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// A Mac on the installer layout: the account of the socket from `dscl` (through `runner`,
+/// never root), the state directory `state_dir` made ([`work_dir`]), then the serving of
+/// `backend`.
+pub(super) fn serve_mac_installer_with<B: Backend>(
+    config: &ServeConfig,
+    trust: &Trust,
+    runner: &dyn Runner,
+    (state_dir, audit): (&Path, &Path),
+    backend: B,
+    stop: &AtomicBool,
+) -> Result<(), String> {
+    let exec = runner
+        .run(&crate::mac::tools::dscl_ids(&config.user, DSCL_LIMIT))
+        .map_err(|e| format!("dscl: {e}"))?;
+    let who = crate::mac::tools::parse_ids(&exec.stdout_text())
+        .filter(|id| id.uid != 0 && id.gid != 0)
+        .ok_or_else(|| format!("the account {} has no usable ids", config.user))?;
+    work_dir(trust, state_dir)?;
+    let place = Place {
+        state_dir,
+        state_name: MAC_INSTALLER_STATE,
+        trust,
+        ids: (who.uid, who.gid),
+        audit,
+    };
+    serve_with(config, backend, &place, stop)
+}
+
+/// The Mac side as the program runs it: the installer layout when `--launchd-label` names
+/// the daemon's job, the kit otherwise.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(super) fn serve_mac(config: &ServeConfig) -> Result<(), String> {
+    if let Some(label) = &config.launchd_label {
+        return serve_mac_installer_with(
+            config,
+            &Trust::root(),
+            &SystemRunner,
+            (Path::new(MAC_STATE_DIR), Path::new(AUDIT)),
+            super::linux::production_mac(label),
+            &AtomicBool::new(false),
+        );
+    }
     serve_mac_with(
         config,
         MacHost::production(),
         &SystemRunner,
         Box::new(SystemRunner),
+        Box::new(MacLeases::on_host(HostLayout::new(
+            Root::host(),
+            Platform::MacOs,
+        ))),
         &AtomicBool::new(false),
     )
 }

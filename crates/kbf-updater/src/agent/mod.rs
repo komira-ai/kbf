@@ -39,6 +39,8 @@ pub use run::{Agent, ServicePorts, Stop, World};
 #[cfg(test)]
 mod build_tests;
 #[cfg(test)]
+mod compat_tests;
+#[cfg(test)]
 mod container_health_tests;
 #[cfg(test)]
 mod coordinator_tests;
@@ -54,6 +56,8 @@ mod flags_tests;
 mod frontend_tests;
 #[cfg(test)]
 mod hold_tests;
+#[cfg(test)]
+mod lease_defer_tests;
 #[cfg(test)]
 mod local_tests;
 #[cfg(test)]

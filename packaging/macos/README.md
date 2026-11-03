@@ -7,8 +7,10 @@ user-owned prefix.
 
 Neither way starts anything. `kbf` itself is never in the package: after
 `sudo /usr/local/kbf-installer/bin/kbf-installer setup` writes `installer.toml`, the
-installer fetches and verifies the first release into `/usr/local/kbf-installer/releases`,
-and the service then takes the frontend's update orders. Macs are nodes only.
+installer fetches and verifies the first release into `/usr/local/kbf-installer/releases`.
+A Mac takes its update orders through the host agent and the root helper's local socket
+(`packaging/host-agent/macos`, `docs/deploy/host-install.md`), not through this service:
+the frontend sends a node no orders any more. Macs are nodes only.
 
 ## The package
 

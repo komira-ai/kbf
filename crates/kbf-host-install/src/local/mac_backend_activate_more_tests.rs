@@ -2,6 +2,7 @@
 //! alone, links that cannot be put back, the daemon's job failing in each way, the release that
 //! runs or is on trial named again, what a pin protects, and a run that was interrupted.
 
+use crate::local::mac_backend_lease_tests::Leases;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::rc::Rc;
@@ -267,7 +268,11 @@ fn the_release_that_runs_or_is_on_trial_named_again_keeps_previous() {
 
     let (fx, sim, _) = rig("mbam-ontrial");
     keep(&fx, NEW, NEW_VERSION, 2);
-    let backend = MacBackend::new(fx.host.clone(), Box::new(Shared(Rc::clone(&sim))));
+    let backend = MacBackend::new(
+        fx.host.clone(),
+        Box::new(Shared(Rc::clone(&sim))),
+        Box::new(Leases::idle()),
+    );
     backend.switch(NEW, 600, 1).unwrap();
     let answer = core(&fx, &sim).activate(&target(NEW), PIN);
     assert_eq!(answer, activated(NEW, NEW_VERSION, NEW, true, false));

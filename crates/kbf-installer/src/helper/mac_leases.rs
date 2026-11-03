@@ -1,7 +1,9 @@
-//! macOS, daemon-user mode: the lease check for a Mac whose daemon runs as its own
-//! account (`_kbf`) with no lease-user pool. A uid count says nothing there (the daemon and
-//! every action share a uid), so the installer looks at two things only root can see for
-//! itself, never at the order record:
+//! macOS: the lease check for a Mac whose daemon runs as its own account (`_kbf`) with no
+//! lease-user pool, or as root with a pool of lease users (`[macos] pool-users`,
+//! `docs/design/macos-end-state.md`). In the first a uid count says nothing (the daemon and
+//! every action share a uid); in both, the native driver leaves the same two signs of a
+//! lease, so the installer looks at those, two things only root can see for itself, never at
+//! the order record:
 //!
 //! - **O1, keepers.** Every action the daemon runs has a keeper process: the daemon's own
 //!   binary under the name `kbf-keeper`, started `__keeper <mode>`. It starts before the
@@ -90,7 +92,7 @@ enum Daemon {
     Running,
 }
 
-/// The lease source of a Mac whose daemon runs as its own account.
+/// The lease source of a Mac whose daemon runs as its own account or as root with a pool.
 pub struct MacLeases {
     layout: Layout,
     trust: Box<dyn Exec>,

@@ -68,11 +68,14 @@ pub enum Code {
     /// The links moved to the release an `activate` named and a unit did not come up on it;
     /// the host stays on that release.
     RestartFailed,
+    /// Leases still run on the host, as root counts them: nothing was switched. The host's
+    /// moment is wrong, not the release, and the same switch can be asked again later.
+    LeasesLive,
 }
 
 impl Code {
     /// Every code.
-    pub const ALL: [Self; 22] = [
+    pub const ALL: [Self; 23] = [
         Self::BadCommand,
         Self::ChannelNotAllowed,
         Self::ConfigInvalid,
@@ -95,6 +98,7 @@ impl Code {
         Self::RuntimeFailed,
         Self::NotKept,
         Self::RestartFailed,
+        Self::LeasesLive,
     ];
 
     /// The code whose closed spelling this is.
@@ -127,6 +131,7 @@ impl Code {
             Self::RuntimeFailed => "runtime_failed",
             Self::NotKept => "not_kept",
             Self::RestartFailed => "restart_failed",
+            Self::LeasesLive => "leases_live",
         }
     }
 }

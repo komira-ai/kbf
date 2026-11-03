@@ -14,9 +14,12 @@
 //! - a `[daemon] driver` that is not exactly `["native"]` (another driver holds leases
 //!   this check does not see);
 //! - a `[daemon] data-dir` that is missing (the daemon would default to a directory this
-//!   crate does not copy) or not absolute;
-//! - a `[macos]` pool key (`pool-users`, `pool-first-uid`): pool mode is not read by this
-//!   source yet.
+//!   crate does not copy) or not absolute.
+//!
+//! A daemon in pool mode (`[macos] pool-users` and `pool-first-uid`: a root daemon that runs
+//! each action as a lease user of its own) is read like one in daemon-user mode: its lease
+//! directories are `<data-dir>/leases/lease-*` too, made by the daemon as root, and its
+//! keepers have the same name, so the pool keys change nothing this check reads.
 //!
 //! The file's last change is the later of its modification and status-change times, read
 //! after its bytes: a file replaced between the two reads then reads as newer, never older.
@@ -70,7 +73,8 @@ pub fn read(trust: &dyn Exec, layout: &Layout) -> Result<DaemonConfig, String> {
     })
 }
 
-/// `Ok` when the file describes a daemon in daemon-user mode with the native driver.
+/// `Ok` when the file describes a daemon with the native driver, in daemon-user mode or in
+/// pool mode.
 fn check_daemon(file: &HostPath, table: &toml::Table) -> Result<(), String> {
     match table.get("mode").and_then(toml::Value::as_str) {
         Some("daemon") => {}
@@ -90,15 +94,6 @@ fn check_daemon(file: &HostPath, table: &toml::Table) -> Result<(), String> {
             "{file} driver is {driver:?}, not [\"native\"]: another driver holds leases this installer cannot see"
         ));
     }
-    if let Some(macos) = section(table, "macos")
-        && ["pool-users", "pool-first-uid"]
-            .iter()
-            .any(|k| macos.contains_key(*k))
-    {
-        return Err(format!(
-            "{file} sets a pool key: pool mode leases are not read by this installer yet"
-        ));
-    }
     Ok(())
 }
 
@@ -115,3 +110,7 @@ fn data_dir(file: &HostPath, table: &toml::Table) -> Result<HostPath, String> {
 fn section<'a>(table: &'a toml::Table, name: &str) -> Option<&'a toml::Table> {
     table.get(name).and_then(toml::Value::as_table)
 }
+
+#[cfg(test)]
+#[path = "mac_config_tests.rs"]
+mod tests;

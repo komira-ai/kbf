@@ -27,6 +27,25 @@
 //! The channels are named in `/etc/kbf/host-install-releases.toml`, in the format of a Mac's
 //! allowlist ([`crate::mac::channel`]); the ssh forced command's `host-install.toml` is the
 //! apt channels' and is not read.
+//!
+//! # A Mac on the installer layout
+//!
+//! The same backend serves a Mac that the `kbf-installer` package and `kbf-mac-provision` laid
+//! out ([`production_mac`]): `/usr/local/kbf-installer/releases`, the state in
+//! `/var/db/kbf-installer`, the daemon's launchd job running `releases/current/kbf` as root.
+//! What differs:
+//!
+//! - the restart is the job's: `launchctl kickstart -k system/<label>`, then a wait until the
+//!   job's process runs the release's binary ([`super::launchd`]), in place of the units;
+//! - the release fetched is the `darwin-<arch>` one, and the verify pipeline checks it as a
+//!   Mac's (a Mach-O of this CPU, no quarantine, the signature CI makes, and the binary's own
+//!   word on its commit, asked with no configuration: nothing reads the node's key, which is
+//!   root's alone on a root daemon);
+//! - before a switch the leases that run on the Mac are counted as root sees them
+//!   ([`kbf_installer::helper::mac_leases`]): with one live the switch is refused
+//!   `leases_live` and nothing moves, the agent takes that as a deferral; a count that cannot
+//!   be made is refused `state_unavailable`. On Linux the drain is the lease check, and no
+//!   count is made here.
 
 use std::cell::RefCell;
 use std::fs::{self, File, OpenOptions};
@@ -42,6 +61,7 @@ use kbf_host::step::Owner;
 use kbf_installer::activate::{self, Activated, Arm};
 use kbf_installer::attest::{GhCheck, Signer};
 use kbf_installer::helper::leases::LeaseSource;
+use kbf_installer::helper::mac_leases::MacLeases;
 use kbf_installer::helper::service::{self, HostProcs, Procs};
 use kbf_installer::layout::{Layout, Platform};
 use kbf_installer::refusal::Refusal as InstallerRefusal;
@@ -73,7 +93,20 @@ use crate::trust::{Trust, nofollow};
 use super::answer::Code;
 
 /// The channels of the local socket on a Linux host.
+// Read by the program on Linux only (its serving, the frontend image, the package host); a
+// Mac build compiles it for the installer layout and does not.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub const ALLOWLIST: &str = "/etc/kbf/host-install-releases.toml";
+
+/// The channels of the local socket on a Mac: the file the kit's helper reads too.
+pub const MAC_ALLOWLIST: &str = "/usr/local/etc/kbf/host-install.toml";
+
+/// How long a Mac's daemon has to run the new release after its job is kickstarted, and how
+/// often that is looked at: the kit's wait for the new daemon (`mac::layout::Tuning`).
+pub const MAC_RESTART_WAIT: Wait = Wait {
+    timeout: std::time::Duration::from_secs(180),
+    interval: std::time::Duration::from_millis(500),
+};
 
 /// The most a release's tarball may be, in bytes.
 pub const TARBALL_MAX: u64 = 512 * 1024 * 1024;
@@ -93,6 +126,9 @@ pub struct Tools {
     /// The largest tarball taken in.
     pub tarball_max: u64,
     /// The largest frontend image taken in.
+    // Read by the program on Linux only (its serving, the frontend image, the package host); a
+    // Mac build compiles it for the installer layout and does not.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub image_max: u64,
 }
 
@@ -118,7 +154,7 @@ impl LeaseSource for NoLeases {
     }
 }
 
-/// A Linux host as the backend of an update.
+/// A host on the installer layout, Linux or a Mac, as the backend of an update.
 pub struct Linux<E: Exec> {
     pub(crate) layout: Layout,
     /// The steps that move the links.
@@ -129,6 +165,12 @@ pub struct Linux<E: Exec> {
     pub(crate) host: Host,
     pub(crate) allowlist: PathBuf,
     pub(crate) units: Vec<Unit>,
+    /// On a Mac, the daemon's launchd job, restarted in place of the units.
+    pub(crate) launchd: Option<String>,
+    /// The leases that run on the host, counted before a switch ([`NoLeases`] on Linux).
+    pub(crate) leases: Box<dyn LeaseSource>,
+    /// Where a note the lease count gives goes (the program's log).
+    pub(crate) log: Box<dyn Fn(&str)>,
     pub(crate) restart_wait: Wait,
     /// The clock the wait is counted on.
     pub(crate) pace: crate::pace::Pace,
@@ -204,6 +246,9 @@ pub(super) struct Prepared {
     /// The unprivileged user the fetch runs as.
     pub(super) who: Identity,
     /// The channel's pinned sums, if it has some.
+    // Read by the program on Linux only (its serving, the frontend image, the package host); a
+    // Mac build compiles it for the installer layout and does not.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(super) sums: Option<PathBuf>,
 }
 
@@ -242,16 +287,62 @@ pub(crate) fn signed_by(mut settings: Settings, origin: &Origin) -> Settings {
 
 impl<E: Exec> Linux<E> {
     fn restart_units(&self) -> Result<(), String> {
+        if let Some(label) = &self.launchd {
+            return self.restart_job(label);
+        }
         for unit in &self.units {
             restart_and_wait(&*self.runner, unit, self.restart_wait, &self.pace)?;
         }
         Ok(())
     }
 
+    /// Kickstart the launchd job `label` and wait until it runs the release the state names
+    /// current.
+    fn restart_job(&self, label: &str) -> Result<(), String> {
+        let current = state::read_unlocked(&self.layout)
+            .map_err(|e| e.to_string())?
+            .and_then(|state| state.current)
+            .ok_or("the state names no current release")?;
+        let program = self.layout.join(&self.layout.release_file(&current, "kbf"));
+        super::launchd::restart_and_wait(
+            &*self.runner,
+            label,
+            &program,
+            self.restart_wait,
+            &self.pace,
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    /// `Ok` when no lease runs on the host; the refusal that changes nothing otherwise. A
+    /// note the count gives (lease directories left by a daemon that is not running) goes to
+    /// the log.
+    fn idle(&self) -> Result<(), Fault> {
+        match self.leases.live_noted() {
+            Ok((0, note)) => {
+                if let Some(note) = note {
+                    (self.log)(&format!("leases: {note}"));
+                }
+                Ok(())
+            }
+            Ok((n, _)) => Err(Fault::refused(
+                Code::LeasesLive,
+                format!("{n} leases are live; not switching"),
+            )),
+            Err(why) => Err(Fault::refused(
+                Code::StateUnavailable,
+                format!("cannot tell whether leases are live: {why}"),
+            )),
+        }
+    }
+
     /// Restart every unit and wait for each, whatever became of the ones before it: an
     /// `activate` keeps the release named, so a unit left alone would go on running the release
     /// it leaves. What did not come up, unit by unit.
     fn restart_every_unit(&self) -> Result<(), String> {
+        if let Some(label) = &self.launchd {
+            return self.restart_job(label);
+        }
         let failed: Vec<String> = self
             .units
             .iter()
@@ -367,7 +458,11 @@ impl<E: Exec> Linux<E> {
         who: Identity,
         scratch: &Path,
     ) -> Result<String, Fault> {
-        let platform = format!("linux-{}", settings.arch);
+        let os = match self.layout.platform() {
+            Platform::Linux => "linux",
+            Platform::MacOs => "darwin",
+        };
+        let platform = format!("{os}-{}", settings.arch);
         let gh = self.layout.join(&self.layout.gh());
         let home = scratch.join("home");
         let fetcher = Fetcher {
@@ -566,6 +661,8 @@ impl<E: Exec> Backend for Linux<E> {
     }
 
     fn switch(&self, commit: &str, window_secs: u64, now: u64) -> Result<u64, Fault> {
+        // The leases first: a refusal here writes no state, moves no link, restarts nothing.
+        self.idle()?;
         let order = activate::Order {
             commit: commit_id(commit)?,
             order_id: format!("host-install-{}", &commit[..12]),
@@ -668,6 +765,9 @@ impl<E: Exec> Backend for Linux<E> {
 }
 
 /// The host as it is: the real `exec` and runners, this program's own paths.
+// Read by the program on Linux only (its serving, the frontend image, the package host); a
+// Mac build compiles it for the installer layout and does not.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn production(units: Vec<Unit>) -> Linux<kbf_host::HostExec> {
     let root = Root::host();
     let layout = Layout::new(root.clone(), Platform::current()).with_trust_fallback();
@@ -678,6 +778,9 @@ pub fn production(units: Vec<Unit>) -> Linux<kbf_host::HostExec> {
         host: Host::production(),
         allowlist: PathBuf::from(ALLOWLIST),
         units,
+        launchd: None,
+        leases: Box::new(NoLeases),
+        log: Box::new(super::production::log),
         restart_wait: crate::plan::ACTIVE_WAIT,
         pace: crate::pace::Pace::real(),
         runner: Box::new(crate::runner::SystemRunner),
@@ -686,5 +789,31 @@ pub fn production(units: Vec<Unit>) -> Linux<kbf_host::HostExec> {
         owner: Owner { uid: 0, gid: 0 },
         scratch_tag: None,
         procs: Box::new(HostProcs::new(Platform::current())),
+    }
+}
+
+/// A Mac on the installer layout as it is: the daemon's launchd job `label`, the Mac's paths
+/// and the lease count of [`MacLeases`] over the host root.
+pub fn production_mac(label: &str) -> Linux<kbf_host::HostExec> {
+    let root = Root::host();
+    let layout = Layout::new(root.clone(), Platform::MacOs);
+    Linux {
+        leases: Box::new(MacLeases::on_host(layout.clone())),
+        layout,
+        exec: RefCell::new(kbf_host::HostExec::new(root.clone())),
+        trust: Box::new(kbf_host::HostExec::new(root)),
+        host: Host::production_mac(),
+        allowlist: PathBuf::from(MAC_ALLOWLIST),
+        units: Vec::new(),
+        launchd: Some(label.to_owned()),
+        log: Box::new(super::production::log),
+        restart_wait: MAC_RESTART_WAIT,
+        pace: crate::pace::Pace::real(),
+        runner: Box::new(crate::runner::SystemRunner),
+        installer_runner: Box::new(kbf_installer::run::SystemRunner),
+        tools: Tools::production(),
+        owner: Owner { uid: 0, gid: 0 },
+        scratch_tag: None,
+        procs: Box::new(HostProcs::new(Platform::MacOs)),
     }
 }

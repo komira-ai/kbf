@@ -420,6 +420,9 @@ impl<B: Backend> Ab<B> {
                 commit: staged.commit,
                 deadline_unix,
             }),
+            // Leases that still run are the host's moment, not an end of this update:
+            // nothing was switched, and the last end stays as it was.
+            Err(fault) if fault.code == Code::LeasesLive => Err(fault),
             Err(fault) => {
                 saved.last = Some(Last {
                     target: staged.version,

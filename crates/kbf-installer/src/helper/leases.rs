@@ -4,9 +4,11 @@
 //! service user's word).
 //!
 //! The real sources are [`CgroupLeases`] (Linux: the lease cgroups of the daemon's
-//! `actions/` cgroup), [`MacLeases`] (a Mac whose daemon runs as its own account: the
-//! daemon's keeper processes and lease directories) and [`PoolLeases`] (the processes of a
-//! lease-user pool, not yet chosen by [`for_restart`]). `run` chooses by the service it
+//! `actions/` cgroup), [`MacLeases`] (a Mac, whose daemon runs as its own account or as root
+//! with a pool of lease users: the daemon's keeper processes and lease directories) and
+//! [`PoolLeases`] (the processes of a lease-user pool, which [`for_restart`] does not choose).
+//! The Mac backend of `kbf-host-install`'s local socket asks [`MacLeases`] too, before it
+//! switches a release. `run` chooses by the service it
 //! restarts ([`for_restart`]): a mode's systemd unit gets [`CgroupLeases`]; a launchd label
 //! gets [`MacLeases`], which says it cannot tell wherever it could be blind, and an
 //! activation is then refused (fail closed). A frontend's unit holds no leases, so its count would
@@ -173,7 +175,8 @@ pub struct LeaseHost {
 ///   of a unit that is no mode's are not the daemon's, so a count read from it would be
 ///   "idle" by accident.
 /// - A launchd label gets [`MacLeases`], the source of a daemon that runs as its own
-///   account (no lease-user pool); an empty label names no service and cannot tell.
+///   account or as root with a lease-user pool; an empty label names no service and cannot
+///   tell.
 pub fn for_restart(restart: &Restart, host: &LeaseHost) -> Box<dyn LeaseSource> {
     match restart {
         Restart::Systemd(unit) if is_mode_unit(unit) => {

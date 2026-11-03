@@ -275,7 +275,13 @@ pub(super) fn on_mac(
         host.work.join("state.json"),
         host.audit.clone(),
     );
-    let backend = super::mac_backend::MacBackend::new(host, runner);
+    // An operator's `activate` never switches, so no lease source is asked: one that cannot
+    // tell refuses any switch that reached it.
+    let backend = super::mac_backend::MacBackend::new(
+        host,
+        runner,
+        Box::new(kbf_installer::helper::leases::NotWired),
+    );
     let ab = new_ab(backend, state, &trust, hold);
     let place = Place {
         trust: &trust,

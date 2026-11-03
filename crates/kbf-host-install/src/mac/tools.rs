@@ -46,6 +46,16 @@ pub fn bootout(label: &str, limit: Duration) -> Cmd {
     cmd(LAUNCHCTL, &["bootout", &format!("system/{label}")], limit)
 }
 
+/// `launchctl kickstart -k system/<label>`: kills the running service and starts it again,
+/// on what its job names (the installer layout's `releases/current/kbf`).
+pub fn kickstart(label: &str, limit: Duration) -> Cmd {
+    cmd(
+        LAUNCHCTL,
+        &["kickstart", "-k", &format!("system/{label}")],
+        limit,
+    )
+}
+
 /// `launchctl bootstrap system <plist>`.
 pub fn bootstrap(plist: &Path, limit: Duration) -> Cmd {
     Cmd {

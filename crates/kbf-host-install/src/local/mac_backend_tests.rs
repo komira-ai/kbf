@@ -9,6 +9,7 @@ use super::answer::{Answer, Code};
 use super::backend::{Backend, Fault, Pending};
 use super::core::Ab;
 use super::mac_backend::MacBackend;
+use super::mac_backend_lease_tests::Leases;
 use super::request::LocalRequest;
 use crate::mac::kit;
 use crate::mac::release::{bundle_name, tarball_name};
@@ -31,7 +32,11 @@ fn rig(name: &str) -> (Fx, Rc<Sim>, MacBackend) {
     let fx = Fx::new(name);
     mkdir(&fx.host.work, 0o711);
     let sim = Rc::new(fx.sim());
-    let backend = MacBackend::new(fx.host.clone(), Box::new(Shared(Rc::clone(&sim))));
+    let backend = MacBackend::new(
+        fx.host.clone(),
+        Box::new(Shared(Rc::clone(&sim))),
+        Box::new(Leases::idle()),
+    );
     (fx, sim, backend)
 }
 

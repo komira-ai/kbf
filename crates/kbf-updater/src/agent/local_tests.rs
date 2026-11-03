@@ -21,7 +21,7 @@ use crate::wire::Outcome;
 
 /// A helper that answers each connection from `answer`, which sees the request line and gives
 /// the bytes to write back (none: close without an answer). The lines it was asked, at the end.
-fn serve(
+pub(super) fn serve(
     dir: &TestDir,
     connections: usize,
     answer: impl Fn(&str) -> Option<String> + Send + 'static,
@@ -45,7 +45,7 @@ fn serve(
     (socket, handle)
 }
 
-fn limits() -> Limits {
+pub(super) fn limits() -> Limits {
     Limits {
         install: Duration::from_secs(5),
         switch: None,
@@ -54,11 +54,11 @@ fn limits() -> Limits {
     }
 }
 
-fn dir(name: &str) -> TestDir {
+pub(super) fn dir(name: &str) -> TestDir {
     TestDir::under(std::env::temp_dir(), name)
 }
 
-fn line(answer: &Answer) -> Option<String> {
+pub(super) fn line(answer: &Answer) -> Option<String> {
     Some(format!("{}\n", answer.json_line()))
 }
 
@@ -546,4 +546,25 @@ fn a_full_listing_of_long_versions_is_read_within_the_answer_limit() {
     let state = SocketLocal::new(&socket, limits()).query().unwrap();
     assert_eq!(state.commit.as_deref(), Some(COMMIT_A));
     assert_eq!(state.version, Some(version(VA)));
+}
+
+/// Catches a `leases_live` refusal that an agent of the previous release cannot read: the
+/// socket's reader (`SocketLocal`, the same code as in v0.0.63) takes the helper's real
+/// `leases_live` line as a refusal with that code, like any other refusal, and not as a broken
+/// answer; the detail stays in the helper's log.
+#[test]
+fn the_socket_reader_takes_a_leases_live_line_as_a_refusal() {
+    let d = dir("lc-leases-live");
+    let (socket, server) = serve(&d, 1, |_| {
+        line(&Answer::Refused(
+            Code::LeasesLive,
+            "1 leases are live; not switching".to_owned(),
+        ))
+    });
+    let helper = SocketLocal::new(&socket, limits());
+    assert_eq!(
+        helper.switch(&version(VB)),
+        Err(LocalError::Refused("leases_live".to_owned()))
+    );
+    assert_eq!(server.join().unwrap(), [format!("switch kbf={VB}")]);
 }
