@@ -156,6 +156,15 @@ const FORGED: &str = "cas/d/node1/boot1/00000000000000ff";
 
 impl Rig {
     fn new() -> Self {
+        Self::made(BadPack::Fail)
+    }
+
+    /// A rig whose plane reads a lost or damaged blob from the plane underneath.
+    fn falling_back() -> Self {
+        Self::made(BadPack::ReadElsewhere)
+    }
+
+    fn made(bad: BadPack) -> Self {
         let caps = Capabilities {
             conditional_put: true,
             object_lock: false,
@@ -169,6 +178,10 @@ impl Rig {
         let reader = Reader::new(Arc::clone(&store), shared, None, ReaderConfig::default());
         let held = Held::default();
         let cas = PackedCas::new(Arc::new(held.clone()), Arc::new(reader));
+        let cas = match bad {
+            BadPack::Fail => cas,
+            BadPack::ReadElsewhere => cas.falling_back(),
+        };
         Self {
             held,
             store,
@@ -303,6 +316,69 @@ async fn damaged_bytes_in_a_pack_fail_the_read_corrupt() {
     assert!(std::fs::read(dir.join("blob")).expect("read").is_empty());
     assert!(rig.held.calls().is_empty());
     assert_eq!(rig.cas.stats().damaged, 2);
+}
+
+/// Asserts that a plane made with `falling_back` reads a blob whose pack is gone from the plane
+/// underneath, for `get` and for `read_to`, and the read succeeds with that plane's bytes; each
+/// is still counted as lost, and none as served or as read elsewhere.
+/// Catches a cache in front of the packs that, by missing a pack, fails a build the plane
+/// underneath can serve.
+#[tokio::test]
+async fn falling_back_a_lost_pack_is_read_from_the_plane_underneath() {
+    let rig = Rig::falling_back();
+    let digest = rig.forge(b"gone", None).await;
+    rig.held.insert(b"gone");
+    assert_eq!(rig.cas.get(&digest).await, Ok(b"gone".to_vec()));
+    let dir = TestDir::under(std::env::temp_dir(), "packed-cas-lost-fallback");
+    let mut file = open(&dir, "blob").await;
+    rig.cas.read_to(&digest, &mut file).await.expect("read_to");
+    assert_eq!(std::fs::read(dir.join("blob")).expect("read back"), b"gone");
+    assert_eq!(rig.held.calls(), ["get", "read_to"]);
+    let stats = rig.cas.stats();
+    assert_eq!((stats.fallback_lost, stats.lost), (2, 0));
+    assert_eq!(
+        (stats.served, stats.elsewhere, stats.fallback_damaged),
+        (0, 0, 0)
+    );
+}
+
+/// Asserts that a plane made with `falling_back` never serves bytes of a pack that are not the
+/// digest: `get` and `read_to` answer the plane underneath's true bytes, nothing of the pack's
+/// is written into the file, and each read is counted as damaged.
+/// Catches a damaged cached copy that is served, or that fails the read.
+#[tokio::test]
+async fn falling_back_damaged_bytes_are_read_from_the_plane_underneath() {
+    let rig = Rig::falling_back();
+    let digest = rig.forge(b"true", Some(b"xxxx")).await;
+    rig.held.insert(b"true");
+    assert_eq!(rig.cas.get(&digest).await, Ok(b"true".to_vec()));
+    let dir = TestDir::under(std::env::temp_dir(), "packed-cas-damaged-fallback");
+    let mut file = open(&dir, "blob").await;
+    rig.cas.read_to(&digest, &mut file).await.expect("read_to");
+    assert_eq!(std::fs::read(dir.join("blob")).expect("read back"), b"true");
+    assert_eq!(rig.held.calls(), ["get", "read_to"]);
+    let stats = rig.cas.stats();
+    assert_eq!((stats.fallback_damaged, stats.damaged), (2, 0));
+    assert_eq!(
+        (stats.served, stats.elsewhere, stats.fallback_lost),
+        (0, 0, 0)
+    );
+}
+
+/// Asserts that a lease of a plane made with `falling_back` falls back as its plane does: a lost
+/// blob read through the lease is the plane underneath's, not a failed read.
+#[tokio::test]
+async fn falling_back_holds_for_the_leases_of_the_plane() {
+    let rig = Rig::falling_back();
+    let digest = rig.forge(b"leased", None).await;
+    rig.held.insert(b"leased");
+    let lease = rig.cas.lease(&LeaseId::new(1, 2));
+    assert_eq!(lease.get(&digest).await, Ok(b"leased".to_vec()));
+    assert_eq!(rig.held.calls(), ["lease", "get"]);
+    assert_eq!(
+        (rig.cas.stats().fallback_lost, rig.cas.stats().lost),
+        (1, 0)
+    );
 }
 
 /// Asserts that a digest that is not SHA-256 (a hash that is not hex, one of another length, a
@@ -483,6 +559,8 @@ fn the_wire_counts_are_the_planes_counts() {
         unasked: 1,
         lost: 3,
         damaged: 4,
+        fallback_lost: 6,
+        fallback_damaged: 7,
         writes: WriteStats::default(),
     };
     let want = PackReadCounts {
@@ -492,6 +570,8 @@ fn the_wire_counts_are_the_planes_counts() {
         unasked: 1,
         lost: 3,
         damaged: 4,
+        fallback_lost: 6,
+        fallback_damaged: 7,
     };
     assert_eq!(PackReadCounts::from(stats), want);
 }
@@ -543,11 +623,23 @@ fn the_counts_are_spelled_for_the_log() {
         unasked: 1,
         lost: 3,
         damaged: 4,
+        fallback_lost: 0,
+        fallback_damaged: 0,
         writes: WriteStats::default(),
     };
     assert_eq!(
         stats.to_string(),
         "served=5 served_bytes=4096 elsewhere=2 unasked=1 lost=3 damaged=4"
+    );
+    // The fallback counts are spelled only by a plane that has counted one.
+    let fell_back = PackStats {
+        fallback_damaged: 1,
+        ..stats
+    };
+    assert_eq!(
+        fell_back.to_string(),
+        "served=5 served_bytes=4096 elsewhere=2 unasked=1 lost=3 damaged=4 fallback_lost=0 \
+         fallback_damaged=1"
     );
     assert_eq!(PackStats::default().served, 0);
 }

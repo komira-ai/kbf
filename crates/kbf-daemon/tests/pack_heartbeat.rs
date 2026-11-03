@@ -81,6 +81,8 @@ async fn each_heartbeat_carries_the_pack_reads_so_far() {
         unasked: 4,
         lost: 2,
         damaged: 3,
+        fallback_lost: 0,
+        fallback_damaged: 0,
     };
     assert_eq!(first.pack_reads, Some(want));
     assert_eq!(first.pack_writes, None);

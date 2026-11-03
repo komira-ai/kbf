@@ -1,5 +1,5 @@
-//! `kbf_pack_daemon_*` on `GET /metrics`: what each daemon that reads packs (`--pack-read`)
-//! says its reads did, from the counts on its heartbeats ([`crate::farm::Farm::pack_reads`]).
+//! `kbf_pack_daemon_*` on `GET /metrics`: what each daemon that reads packs (`--pack-read`, or
+//! through a local tierstore with `--tierstore-endpoint`) says its reads did, from the counts on its heartbeats ([`crate::farm::Farm::pack_reads`]).
 //!
 //! One sample per node and family, labelled `node`, as the counters of the daemon's process
 //! (they start again from 0 when it restarts, as a counter may). A node that sent no counts
@@ -11,7 +11,9 @@
 //! storage nodes, apart from blobs over 64 MiB and digests that are not SHA-256, which always
 //! count in `elsewhere`), with `kbf_pack_daemon_unasked_total` flat and
 //! `kbf_pack_daemon_lost_total` and `kbf_pack_daemon_damaged_total` staying 0 (`docs/api.md`,
-//! "Packs").
+//! "Packs"). `kbf_pack_daemon_fallback_lost_total` and `kbf_pack_daemon_fallback_damaged_total`
+//! are reads a daemon's local tierstore did not serve, which it then sent to the storage nodes:
+//! each read's outcome is theirs (the blob, or their failure), never a failure of the tierstore.
 //!
 //! The daemons that write packs (`--pack-write`) say what their writes did in the same way
 //! ([`crate::farm::Farm::pack_writes`]): `kbf_pack_daemon_packs_written_total`,
@@ -32,7 +34,7 @@ use crate::farm::Farm;
 type Family = (&'static str, &'static str, fn(&PackReadCounts) -> u64);
 
 /// The families, in the order they are written.
-const FAMILIES: [Family; 6] = [
+const FAMILIES: [Family; 8] = [
     (
         "kbf_pack_daemon_served_total",
         "Blobs a daemon read from a pack, per node, since its process started",
@@ -66,6 +68,19 @@ const FAMILIES: [Family; 6] = [
         "Reads that failed because the bytes in the pack are not the digest, per node, since \
          the daemon's process started (alert on any)",
         |counts| counts.damaged,
+    ),
+    (
+        "kbf_pack_daemon_fallback_lost_total",
+        "Reads a daemon sent to the storage nodes because its local tierstore did not have the \
+         pack, per node, since its process started (each read's outcome is the storage nodes')",
+        |counts| counts.fallback_lost,
+    ),
+    (
+        "kbf_pack_daemon_fallback_damaged_total",
+        "Reads a daemon sent to the storage nodes because the bytes from its local tierstore \
+         were not the digest, per node, since its process started (each read's outcome is the \
+         storage nodes'; alert on any)",
+        |counts| counts.fallback_damaged,
     ),
 ];
 
