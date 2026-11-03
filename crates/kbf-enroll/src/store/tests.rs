@@ -503,12 +503,15 @@ fn the_store_lock_excludes_another_holder_and_an_install_commits() {
     assert!(pair_matches(&store, Role::Storage));
 }
 
-/// A recovery that finds an install staged waits for the writer that holds the lock between its
-/// stage and its commit, and then finds the install done: it commits nothing twice and fails on
-/// no file the writer moved.
+/// A recovery that finds an install staged, while the writer that staged it still holds the lock
+/// and has not committed, goes for the lock; the writer commits only once the recovery has seen
+/// the staged record and is on its way to the lock (the hook says so), then lets go. The recovery
+/// then finds the install done when it looks again under the lock: it commits nothing twice and
+/// fails on no file the writer moved, and returns the writer's record.
 ///
-/// Catches: an agent finishing a staged enrollment under an `enroll` that is about to commit it,
-/// which would leave one of the two failing on a file the other moved.
+/// Catches: an agent finishing a staged enrollment under an `enroll` that is about to commit it
+/// (no lock, or no second look once it holds it), which leaves one of the two failing on a file
+/// the other moved.
 #[test]
 fn a_recovery_waits_for_the_writer_between_its_stage_and_its_commit() {
     let (_root, store) = store("store-lock-recover");
@@ -517,19 +520,22 @@ fn a_recovery_waits_for_the_writer_between_its_stage_and_its_commit() {
     let n = node(&certs, 1);
     let held = store.lock().unwrap();
     store.stage(&certs, b"CA", &n).unwrap();
-    let (done, finished) = std::sync::mpsc::channel();
+    let (seen, staged_seen) = std::sync::mpsc::channel();
     let other = store.clone();
     let recovering = std::thread::spawn(move || {
-        let got = other.recover();
-        done.send(()).unwrap();
-        got
+        other.recover_with(|| seen.send(()).expect("the writer listens"))
     });
+    // The recovery has seen the install staged and goes for the lock the writer holds.
+    staged_seen
+        .recv()
+        .expect("the recovery found the install staged");
+    assert!(store.staging().join("node.json").exists());
     // The writer commits while it holds the lock, then lets go.
     store.commit().unwrap();
     drop(held);
-    finished.recv().unwrap();
     assert_eq!(recovering.join().unwrap().unwrap(), Some(n));
     assert!(pair_matches(&store, Role::Storage));
+    assert!(!store.staging().exists());
 }
 
 /// A recovery with nothing staged takes no lock, so it works on a directory that is not there

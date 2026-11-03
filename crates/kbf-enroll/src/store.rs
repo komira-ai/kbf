@@ -360,7 +360,14 @@ impl Store {
     /// # Errors
     /// As [`Store::load`], [`Store::lock`] and [`Store::commit`].
     pub fn recover(&self) -> Result<Option<Node>, StoreError> {
+        self.recover_with(|| {})
+    }
+
+    /// [`Store::recover`], calling `before_lock` once it has found an install staged and before it
+    /// waits for the lock: the point a test holds a writer at.
+    fn recover_with(&self, before_lock: impl FnOnce()) -> Result<Option<Node>, StoreError> {
         if self.staging().join(NODE_JSON).exists() {
+            before_lock();
             let _held = self.lock()?;
             // Looked at again under the lock: the writer that held it may have committed.
             if self.staging().join(NODE_JSON).exists() {
