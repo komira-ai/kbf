@@ -396,40 +396,7 @@ enum Verb {
         out: PathBuf,
     },
     /// Write the nfpm configuration and the file listing of the kbf packages.
-    PkgConfig {
-        /// The kbf binary the kbf packages carry at `/usr/bin/kbf` (mode 0755).
-        #[arg(long)]
-        kbf: PathBuf,
-        /// The directory of unit files: the kbf packages take the units of the modes and
-        /// `kbf.slice` from it.
-        #[arg(long)]
-        units: PathBuf,
-        /// The directory of the three trust files.
-        #[arg(long)]
-        trust: PathBuf,
-        /// The sysusers.d file.
-        #[arg(long)]
-        sysusers: PathBuf,
-        /// The tmpfiles.d file.
-        #[arg(long)]
-        tmpfiles: PathBuf,
-        /// The needrestart drop-in.
-        #[arg(long)]
-        needrestart: PathBuf,
-        /// The platform the binary was built for (`linux-x86_64`, `linux-arm64`).
-        #[arg(long, value_enum)]
-        platform: package::Platform,
-        /// The package version.
-        /// (One of the two is required; the verb says so, exit 2, as clap does for a bad flag.)
-        #[arg(long, conflicts_with = "version_of")]
-        version: Option<String>,
-        /// Take the version from this binary's `--version` (`<version>+<12 of the commit>`).
-        #[arg(long)]
-        version_of: Option<PathBuf>,
-        /// The directory `nfpm.yaml` and `listing.txt` go in; created when missing.
-        #[arg(long)]
-        out: PathBuf,
-    },
+    PkgConfig(pkg_linux::ConfigFlags),
     /// Build the deb and the rpm with nfpm, and prove a second build is the same bytes.
     PkgBuild {
         /// The pinned nfpm program.
@@ -1256,37 +1223,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             },
             &out,
         ),
-        Verb::PkgConfig {
-            kbf,
-            units,
-            trust,
-            sysusers,
-            tmpfiles,
-            needrestart,
-            platform,
-            version,
-            version_of,
-            out,
-        } => {
-            let version = match (version, version_of) {
-                (Some(version), _) => version,
-                (None, Some(of)) => pkg_asset::binary_version(&of)?,
-                (None, None) => return Err(Error::Usage("--version or --version-of".to_owned())),
-            };
-            pkg_linux::write_config(
-                &pkg_linux::Inputs {
-                    kbf: &kbf,
-                    units: &units,
-                    trust: &trust,
-                    sysusers: &sysusers,
-                    tmpfiles: &tmpfiles,
-                    needrestart: &needrestart,
-                    platform,
-                    version: &version,
-                },
-                &out,
-            )
-        }
+        Verb::PkgConfig(flags) => pkg_linux::config_verb(&flags),
         Verb::PkgBuild {
             nfpm,
             config,

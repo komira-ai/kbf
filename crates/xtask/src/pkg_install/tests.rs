@@ -40,6 +40,16 @@ enum Defect {
     BuildFails,
     GhWrongVersion,
     GhNotRunnable,
+    /// The deb's links that enable the host agent's units are not there.
+    AgentNotEnabled,
+    /// The agent's unit is not installed.
+    AgentUnitMissing,
+    /// The helper's command line lays releases out by hand (no `--layout deb`).
+    HelperWithoutLayout,
+    /// A link points elsewhere than the listing says.
+    LinkWrongTarget,
+    /// The rpm holds the deb's host agent.
+    RpmHoldsAgent,
 }
 
 /// A model of a container: the files that exist, the users, what is installed, the
@@ -81,6 +91,8 @@ fn entry_file(dst: &str, mode: u32, text: &str) -> Entry {
         mode,
         sha256: Some(Sha256::of(text.as_bytes())),
         src: PathBuf::new(),
+        link: None,
+        deb_only: false,
     }
 }
 
@@ -90,7 +102,39 @@ fn entry_dir(dst: &str) -> Entry {
         mode: 0o755,
         sha256: None,
         src: PathBuf::new(),
+        link: None,
+        deb_only: false,
     }
+}
+
+/// The path of the unit `unit`.
+fn unit_path(unit: &str) -> String {
+    format!("{}/{unit}", pkg_linux::UNIT_DIR)
+}
+
+/// The deb's link that enables `unit`.
+fn wants_path(unit: &str) -> String {
+    format!("{}/{unit}", pkg_linux::WANTS_DIR)
+}
+
+/// The host agent of the deb: its two units and a link to each that enables it.
+fn agent_entries() -> Vec<Entry> {
+    let mut entries = Vec::new();
+    for unit in ENABLED {
+        entries.push(entry_file(&unit_path(unit), 0o644, unit).in_the_deb_only());
+        entries.push(
+            Entry {
+                dst: wants_path(unit),
+                mode: pkg_linux::LINK_MODE,
+                sha256: None,
+                src: PathBuf::new(),
+                link: Some(format!("../{unit}")),
+                deb_only: false,
+            }
+            .in_the_deb_only(),
+        );
+    }
+    entries
 }
 
 fn entries() -> Vec<Entry> {
@@ -105,6 +149,9 @@ fn entries() -> Vec<Entry> {
         // A conffile: dpkg keeps it on remove and deletes it on purge.
         entry_file("/etc/needrestart/conf.d/kbf.conf", 0o644, "conffile"),
     ]
+    .into_iter()
+    .chain(agent_entries())
+    .collect()
 }
 
 impl World {
@@ -225,6 +272,31 @@ impl World {
                 self.users_made = true;
                 ok("")
             }
+            ["cat", path] if *path == unit_path("kbf-host-local.service") => {
+                ok(if self.is(Defect::HelperWithoutLayout) {
+                    "[Service]\nExecStart=/usr/libexec/kbf/kbf-host-install --serve --restart-unit kbf-daemon.service\n"
+                } else {
+                    "[Service]\nExecStart=/usr/libexec/kbf/kbf-host-install --serve  --layout   deb --restart-unit kbf-daemon.service\n"
+                })
+            }
+            ["systemctl", "show", "-p", "WantedBy", "--value", unit] => self.wanted_by(unit),
+            ["readlink", path] => {
+                let target = self
+                    .entries
+                    .iter()
+                    .find(|e| e.dst == *path)
+                    .and_then(|e| e.link.clone())
+                    .expect("a link");
+                ok(&if self.is(Defect::LinkWrongTarget) {
+                    "/dev/null\n".to_owned()
+                } else {
+                    format!("{target}\n")
+                })
+            }
+            ["test", "-f" | "-L", path] => Out {
+                ok: self.files.contains(*path),
+                ..ok("")
+            },
             ["cat", path] if path.ends_with(".service") => {
                 ok(if self.is(Defect::UnitNamesMissingUser) {
                     "[Service]\nUser=kbf-ghost\n"
@@ -269,9 +341,29 @@ impl World {
             return fail("E: unable to locate package");
         }
         self.installed = !self.is(Defect::NotInstalled);
-        self.files
-            .extend(self.entries.iter().map(|e| e.dst.clone()));
+        let format = if self.deb { "deb" } else { "rpm" };
+        let all = self.is(Defect::RpmHoldsAgent);
+        let missing = |e: &Entry| {
+            (e.dst == unit_path("kbf-updater-agent.service") && self.is(Defect::AgentUnitMissing))
+                || (e.link.is_some() && self.is(Defect::AgentNotEnabled))
+        };
+        let held: Vec<String> = self
+            .entries
+            .iter()
+            .filter(|e| (all || e.in_format(format)) && !missing(e))
+            .map(|e| e.dst.clone())
+            .collect();
+        self.files.extend(held);
         ok("")
+    }
+
+    /// `systemctl show -p WantedBy --value <unit>`: the target whose `.wants` link to it is there.
+    fn wanted_by(&self, unit: &str) -> Out {
+        ok(if self.files.contains(&wants_path(unit)) {
+            "multi-user.target\n"
+        } else {
+            "\n"
+        })
     }
 
     fn remove(&mut self, purge: bool) -> Out {
@@ -322,10 +414,10 @@ impl World {
                 } else {
                     "root"
                 };
-                let kind = if e.sha256.is_some() {
-                    "regular file"
-                } else {
-                    "directory"
+                let kind = match (&e.link, e.sha256) {
+                    (Some(_), _) => "symbolic link",
+                    (None, Some(_)) => "regular file",
+                    (None, None) => "directory",
                 };
                 ok(&format!("{owner}:root:{:o}:{kind}\n", e.mode))
             }
@@ -518,25 +610,63 @@ fn the_unit_account_check_reads_unit_files_and_skips_directories() {
     for format in [Format::Deb, Format::Rpm] {
         let (world, result) = run_with(format, Defect::None);
         result.unwrap_or_else(|e| panic!("{format:?}: {e}"));
-        let cats: Vec<&String> = world
+        let cats: Vec<&str> = world
             .log
             .iter()
-            .filter(|l| l.starts_with("exec c1 cat "))
+            .filter_map(|l| l.strip_prefix("exec c1 cat "))
             .collect();
-        assert_eq!(
-            cats,
-            [
-                "exec c1 cat /usr/lib/systemd/system/kbf-node.service",
-                "exec c1 cat /usr/lib/systemd/system/kbf.slice",
+        // The deb's helper is read for its command line first, then every unit for its accounts,
+        // the deb's host agent among them.
+        let want: &[&str] = match format {
+            Format::Deb => &[
+                "/usr/lib/systemd/system/kbf-host-local.service",
+                "/usr/lib/systemd/system/kbf-node.service",
+                "/usr/lib/systemd/system/kbf.slice",
+                "/usr/lib/systemd/system/kbf-host-local.service",
+                "/usr/lib/systemd/system/kbf-updater-agent.service",
             ],
-            "{format:?}"
-        );
+            Format::Rpm => &[
+                "/usr/lib/systemd/system/kbf-node.service",
+                "/usr/lib/systemd/system/kbf.slice",
+            ],
+        };
+        assert_eq!(cats, want, "{format:?}");
     }
 }
 
 #[test]
 fn each_defect_of_the_package_or_the_system_is_a_named_problem() {
-    let cases: [(Format, Defect, &str); 22] = [
+    let cases: [(Format, Defect, &str); 28] = [
+        (
+            Format::Deb,
+            Defect::AgentNotEnabled,
+            "kbf-updater-agent.service is not enabled: it is wanted by \"\", not multi-user.target",
+        ),
+        (
+            Format::Deb,
+            Defect::AgentNotEnabled,
+            "/usr/lib/systemd/system/multi-user.target.wants/kbf-host-local.service: \"\", not \"root:root:777:symbolic link\"",
+        ),
+        (
+            Format::Deb,
+            Defect::AgentUnitMissing,
+            "kbf-updater-agent.service is not installed",
+        ),
+        (
+            Format::Deb,
+            Defect::HelperWithoutLayout,
+            "kbf-host-local.service does not install the package (--layout deb): \"ExecStart=/usr/libexec/kbf/kbf-host-install --serve --restart-unit kbf-daemon.service\"",
+        ),
+        (
+            Format::Deb,
+            Defect::LinkWrongTarget,
+            "/usr/lib/systemd/system/multi-user.target.wants/kbf-updater-agent.service target: \"/dev/null\", not \"../kbf-updater-agent.service\"",
+        ),
+        (
+            Format::Rpm,
+            Defect::RpmHoldsAgent,
+            "the rpm holds kbf-updater-agent.service: the host agent is the deb's, whose helper installs a deb",
+        ),
         (
             Format::Deb,
             Defect::NotInstalled,
@@ -766,4 +896,36 @@ fn a_probe_is_a_command_and_the_text_it_must_print() {
     for bad in ["kbf --version", "::text", "gh --version::"] {
         assert!(bad.parse::<Probe>().is_err(), "{bad:?}");
     }
+}
+
+/// A start has begun when the journal says `Starting` (a unit with a start job of its own, such as
+/// one with `ExecStartPre=`) or only `Started` (a `Type=simple` unit, as the host agent's are,
+/// which systemd counts as started once forked); a skip says neither.
+///
+/// Catches: a gate on a simple unit read as never starting once its file is there.
+#[test]
+fn a_start_has_begun_on_starting_or_on_started_alone() {
+    let mut model = World::new(Defect::None);
+    model.journal = [
+        ("simple.service", "Started simple.service - a simple unit."),
+        (
+            "simple.service",
+            "simple.service - a simple unit was skipped because of an unmet condition check (ConditionFileIsExecutable=/x).",
+        ),
+        ("pre.service", "Starting pre.service - a unit with a start job..."),
+        ("pre.service", "Started pre.service - a unit with a start job."),
+        (
+            "skipped.service",
+            "skipped.service - a unit was skipped because of an unmet condition check (ConditionPathExists=/y).",
+        ),
+    ]
+    .iter()
+    .map(|(u, l)| ((*u).to_owned(), (*l).to_owned()))
+    .collect();
+    let world = std::cell::RefCell::new(model);
+    let mut docker = |args: &[&str]| Ok(world.borrow_mut().docker(args));
+    let mut c = Container::booted(&mut docker, "c1").expect("booted");
+    assert_eq!(starts(&mut c, "simple.service").expect("journal"), (1, 1));
+    assert_eq!(starts(&mut c, "pre.service").expect("journal"), (0, 2));
+    assert_eq!(starts(&mut c, "skipped.service").expect("journal"), (1, 0));
 }

@@ -49,6 +49,9 @@ struct Farm {
     port: u16,
     pin: CaPin,
     ca_dir: PathBuf,
+    /// The CA the listener issues from: the farm's, which also issues the coordinator's
+    /// certificate.
+    ca: Arc<kbf_server::enroll::ca::Ca>,
     _latch: kbf_server::enroll::start::Serving,
     /// Declared last: the directory outlives the listener that reads the CA from it.
     _dir: TestDir,
@@ -78,7 +81,7 @@ async fn start(name: &str) -> Farm {
         renew_every: None,
     };
     let prepared = prepare(&flags).expect("prepared");
-    let (port, pin) = (prepared.local().port(), prepared.ca().pin());
+    let (port, pin, ca) = (prepared.local().port(), prepared.ca().pin(), prepared.ca());
     let mut serving = prepared.serve(Arc::clone(&store), None).expect("serving");
     let listener = std::mem::replace(&mut serving.listener, Box::pin(std::future::pending()));
     tokio::spawn(listener);
@@ -88,6 +91,7 @@ async fn start(name: &str) -> Farm {
         port,
         pin,
         ca_dir,
+        ca,
         _latch: serving,
         _dir: dir,
     }
@@ -397,4 +401,183 @@ async fn the_agent_renews_the_certificate_at_half_its_life_with_the_same_key() {
     tokio::task::spawn_blocking(move || drop(renewer))
         .await
         .expect("joined");
+}
+
+/// A coordinator on loopback, with a certificate the farm's CA issued it for `localhost`: it takes
+/// one heartbeat over mutual TLS, answers that there is nothing to do, and returns the caller's
+/// certificate. `dialled` counts the connections it took.
+fn coordinator(
+    farm: &Farm,
+    dialled: &Arc<std::sync::atomic::AtomicUsize>,
+) -> (u16, std::thread::JoinHandle<Vec<u8>>) {
+    use std::io::{Read as _, Write as _};
+
+    use rcgen::PublicKeyData as _;
+    use rustls::pki_types::pem::PemObject as _;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+    let pair = rcgen::KeyPair::generate().expect("a key");
+    let public =
+        kbf_ca::PublicKey::from_spki(&pair.subject_public_key_info()).expect("a P-256 key");
+    let issued = farm
+        .ca
+        .node()
+        .issue_coordinator(
+            &["localhost"],
+            &public,
+            unix_now(),
+            &mut kbf_ca::SystemEntropy,
+        )
+        .expect("the coordinator's certificate");
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(CertificateDer::from(farm.ca.node().root_der().to_vec()))
+        .expect("the root");
+    let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+        Arc::new(roots),
+        provider.clone(),
+    )
+    .build()
+    .expect("a verifier");
+    let mut config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("versions")
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(
+            vec![CertificateDer::from(issued.der)],
+            PrivateKeyDer::from_pem_slice(pair.serialize_pem().as_bytes()).expect("the key"),
+        )
+        .expect("a server configuration");
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
+    let port = listener.local_addr().expect("bound").port();
+    let dialled = Arc::clone(dialled);
+    let handle = std::thread::spawn(move || {
+        let (tcp, _) = listener.accept().expect("a heartbeat");
+        dialled.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let connection = rustls::ServerConnection::new(Arc::new(config)).expect("a connection");
+        let mut tls = rustls::StreamOwned::new(connection, tcp);
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            let n = tls.read(&mut chunk).expect("the request");
+            assert_ne!(n, 0, "the request ended early");
+            request.extend_from_slice(&chunk[..n]);
+            let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+                continue;
+            };
+            let head = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+            let length: usize = head
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length: "))
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0);
+            if request.len() >= end + 4 + length {
+                break;
+            }
+        }
+        assert!(request.starts_with(b"POST "), "a heartbeat is a POST");
+        let body = r#"{"reply":"nothing"}"#;
+        let answer = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{body}",
+            body.len()
+        );
+        tls.write_all(answer.as_bytes()).expect("the answer");
+        tls.conn.send_close_notify();
+        tls.flush().expect("sent");
+        tls.conn
+            .peer_certificates()
+            .and_then(|c| c.first())
+            .map(|c| c.as_ref().to_vec())
+            .expect("the caller's certificate")
+    });
+    (port, handle)
+}
+
+/// The agent as the packaged unit starts it, at boot, on a host not enrolled yet: it says once that
+/// it is not enrolled and waits, dialling no coordinator; the operator runs `kbf-updater enroll`
+/// against the frontend's real enroll listener; the agent, at its next look, starts and heartbeats
+/// to the coordinator with the certificate the enrollment made, with no restart.
+///
+/// Catches: an agent that fails and is restarted in a loop until the host is enrolled, one that
+/// must be restarted by hand after `enroll`, and one that heartbeats with anything but the
+/// enrollment's certificate.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_agent_started_before_kbf_updater_enroll_heartbeats_once_it_has_run() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc::channel;
+
+    let farm = start("agent-waits").await;
+    let token = farm.updater_token(0x79, "host-1", HostRole::DAEMON);
+    let host = host("agent-waits-host", &farm, "host-1", &token);
+    let dialled = Arc::new(AtomicUsize::new(0));
+    let (port, coordinator) = coordinator(&farm, &dialled);
+    let state = host.flags.state_dir.clone();
+    let args: Vec<String> = [
+        "--coordinator".to_owned(),
+        format!("localhost:{port}"),
+        "--enroll-frontend".to_owned(),
+        format!("localhost:{}", farm.port),
+        "--state-dir".to_owned(),
+        state.display().to_string(),
+        "--channel".to_owned(),
+        "stable".to_owned(),
+        "--helper-socket".to_owned(),
+        host.root.join("no-helper.sock").display().to_string(),
+    ]
+    .to_vec();
+    let config = kbf_updater::agent::flags::parse_flags(&args).expect("the agent's flags");
+
+    // The agent's nap says it has looked and waits for the test's word to look again.
+    let (napped, looked) = channel::<()>();
+    let (again, go) = channel::<()>();
+    let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+    let said = Arc::clone(&lines);
+    let (stopped, caller) = channel::<Vec<u8>>();
+    let agent = tokio::task::spawn_blocking(move || {
+        let log = |line: &str| said.lock().expect("log").push(line.to_owned());
+        let nap = |_: &kbf_updater::agent::Stop| {
+            napped.send(()).expect("the test listens");
+            go.recv().expect("the test says when");
+        };
+        kbf_updater::agent::run_config_waiting(
+            &config,
+            move |stop| {
+                std::thread::spawn(move || {
+                    let certificate = coordinator.join().expect("the coordinator");
+                    stop.stop();
+                    stopped.send(certificate).expect("the test listens");
+                });
+            },
+            &kbf_updater::agent::enrolled::Waiting {
+                nap: &nap,
+                log: &log,
+            },
+        )
+    });
+
+    tokio::task::spawn_blocking(move || looked.recv())
+        .await
+        .expect("joined")
+        .expect("the agent looked");
+    assert_eq!(
+        *lines.lock().expect("log"),
+        [format!(
+            "not enrolled: {0} holds no enrollment yet; waiting for `kbf-updater enroll \
+             --state-dir {0}`, and starting once it has run",
+            state.display()
+        )]
+    );
+    assert_eq!(dialled.load(Ordering::SeqCst), 0, "nothing is dialled");
+
+    enroll(&host).await.expect("enrolled");
+    again.send(()).expect("the agent waits");
+    let (code, text) = agent.await.expect("joined");
+    assert_eq!((code, text.as_str()), (0, ""));
+    let certificate = caller.recv().expect("the coordinator's caller");
+    assert_eq!(certificate, host.cert_der(), "the enrollment's certificate");
+    assert_eq!(dialled.load(Ordering::SeqCst), 1);
+    assert_eq!(lines.lock().expect("log").len(), 1, "said once");
 }

@@ -9,13 +9,18 @@
 //!
 //! 1. it has no dependency, its recommendations are exactly the ones this crate lists, and it
 //!    has no maintainer script (nothing can start or enable anything);
-//! 2. every entry of the listing is at its path, `root:root`, with its mode and bytes;
-//! 3. every packaged unit is `disabled` or `static` and none is active;
+//! 2. every entry of the listing that the format holds is at its path, `root:root`, with its mode
+//!    and bytes (a link with its target); an entry of the deb only is not in the rpm;
+//! 3. every packaged unit is `disabled` or `static` and none is active, but the host agent's
+//!    ([`ENABLED`]): the deb holds both units, and after a `systemctl daemon-reload` (what a boot
+//!    does) each is wanted by `multi-user.target`, through the package's own links, and the
+//!    helper's command line installs the package (`--layout deb`); the rpm holds neither;
 //! 4. after `systemd-sysusers` and `systemd-tmpfiles --create` (what a boot, and
 //!    `kbf setup`, do) the three users exist with no login shell and the three
 //!    directories exist, `root:root` 0755;
 //! 5. each `--gate` unit does not start without its file (the journal says its condition
-//!    skipped the start), and begins to start once the file exists;
+//!    skipped the start), and begins to start once the file exists (an executable file, mode
+//!    0755, so that a unit gated on its program, `ConditionFileIsExecutable=`, starts too);
 //! 6. each `--probe` command exits 0 in the container and prints its text: the packaged
 //!    `gh` runs on the container's architecture, the binary names the commit.
 //!
@@ -52,6 +57,14 @@ pub enum Format {
 }
 
 impl Format {
+    /// The format's name, as a listing marks an entry of the deb only.
+    fn name(self) -> &'static str {
+        match self {
+            Format::Deb => "deb",
+            Format::Rpm => "rpm",
+        }
+    }
+
     /// The recommendations the package must list, as the contract says them (and not as
     /// `pkg_linux` does: a check that read `pkg_linux`'s lists would pass whatever they held).
     /// It must list no dependency at all.
@@ -125,6 +138,15 @@ impl Format {
         }
     }
 }
+
+/// The units the deb enables, as the contract says them (and not as `pkg_linux` does): the host
+/// agent's, the helper's local socket and the agent (`packaging/host-agent/linux`). Every other
+/// packaged unit ships disabled. The rpm holds neither: its helper would install a deb.
+pub const ENABLED: [&str; 2] = ["kbf-host-local.service", "kbf-updater-agent.service"];
+/// The target that wants them at boot.
+const WANTED_BY: &str = "multi-user.target";
+/// The unit whose command line must install the package, and the words that say so.
+const HELPER: (&str, &str) = ("kbf-host-local.service", "--layout deb");
 
 /// A unit and the file whose absence keeps it from starting.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -245,7 +267,9 @@ fn names(text: &str) -> Vec<String> {
 }
 
 /// What the journal says of the starts of `unit` since boot: how many the condition skipped and how
-/// many began (`Starting ...`, which systemd logs only once the conditions hold). A skipped start
+/// many began (`Starting ...`, or `Started ...` for a `Type=simple` unit, which systemd counts as
+/// started once it has forked and so logs no `Starting`; systemd logs either only once the
+/// conditions hold). A skipped start
 /// is the line that says `unmet condition check`, which both systemds in the test images write:
 /// Ubuntu's 255 `... was skipped because of an unmet condition check (...)`, Fedora's 259
 /// `... skipped, unmet condition check ...`. (Not the message id: a skipped start is logged with
@@ -261,7 +285,10 @@ fn starts(c: &mut Container, unit: &str) -> Result<(usize, usize), Error> {
         .lines()
         .filter(|l| l.contains("unmet condition check"))
         .count();
-    let begun = log.lines().filter(|l| l.starts_with("Starting ")).count();
+    let begun = log
+        .lines()
+        .filter(|l| l.starts_with("Starting ") || l.starts_with("Started "))
+        .count();
     Ok((skipped, begun))
 }
 
@@ -283,7 +310,7 @@ fn gate(c: &mut Container, g: &Gate, problems: &mut Vec<String>) -> Result<(), E
     }
     c.must(
         "creating the gate file",
-        &["install", "-D", "-m", "0644", "/dev/null", &g.path],
+        &["install", "-D", "-m", "0755", "/dev/null", &g.path],
         problems,
     )?;
     c.exec(&["systemctl", "start", unit])?;
@@ -306,14 +333,18 @@ fn gate(c: &mut Container, g: &Gate, problems: &mut Vec<String>) -> Result<(), E
 
 /// The path of `e` in the container must be what the listing says.
 pub(crate) fn entry(c: &mut Container, e: &Entry, problems: &mut Vec<String>) -> Result<(), Error> {
-    let kind = if e.sha256.is_some() {
-        "regular file"
-    } else {
-        "directory"
+    let kind = match (&e.link, e.sha256) {
+        (Some(_), _) => "symbolic link",
+        (None, Some(_)) => "regular file",
+        (None, None) => "directory",
     };
     let want = format!("root:root:{:o}:{kind}", e.mode);
     let got = c.say(&["stat", "-c", "%U:%G:%a:%F", &e.dst])?;
     eq(problems, &e.dst, &got, &want);
+    if let Some(target) = &e.link {
+        let got = c.say(&["readlink", &e.dst])?;
+        eq(problems, &format!("{} target", e.dst), &got, target);
+    }
     if let Some(sha) = e.sha256 {
         let sum = c.say(&["sha256sum", &e.dst])?;
         eq(
@@ -352,6 +383,11 @@ fn deletes(format: Format, after: &str, e: &Entry) -> bool {
     !(format == Format::Deb && after == "remove" && e.dst.starts_with("/etc/"))
 }
 
+/// Whether the path of `e` is in the container: a link is, whether or not what it points to is.
+fn present(c: &mut Container, e: &Entry) -> Result<bool, Error> {
+    Ok(c.ok(&["test", "-e", &e.dst])? || (e.link.is_some() && c.ok(&["test", "-L", &e.dst])?))
+}
+
 /// Every packaged path that `after` deletes must be gone.
 fn gone(
     c: &mut Container,
@@ -361,9 +397,60 @@ fn gone(
     problems: &mut Vec<String>,
 ) -> Result<(), Error> {
     for e in entries.iter().filter(|e| deletes(format, after, e)) {
-        if c.ok(&["test", "-e", &e.dst])? {
+        if present(c, e)? {
             problems.push(format!("{} is still there after {after}", e.dst));
         }
+    }
+    Ok(())
+}
+
+/// The host agent's units ([`ENABLED`]): in the deb, installed, wanted by [`WANTED_BY`] once
+/// systemd has read the unit directory again, as a boot does, and the helper's command line
+/// installing the package; in the rpm, not there at all.
+fn host_agent(c: &mut Container, format: Format, problems: &mut Vec<String>) -> Result<(), Error> {
+    let path = |unit: &str| format!("{}/{unit}", pkg_linux::UNIT_DIR);
+    if format == Format::Rpm {
+        for unit in ENABLED {
+            if c.ok(&["test", "-e", &path(unit)])? {
+                problems.push(format!(
+                    "the rpm holds {unit}: the host agent is the deb's, whose helper installs a deb"
+                ));
+            }
+        }
+        return Ok(());
+    }
+    c.must(
+        "systemctl daemon-reload",
+        &["systemctl", "daemon-reload"],
+        problems,
+    )?;
+    for unit in ENABLED {
+        if !c.ok(&["test", "-f", &path(unit)])? {
+            problems.push(format!("{unit} is not installed"));
+            continue;
+        }
+        let wanted = c.say(&["systemctl", "show", "-p", "WantedBy", "--value", unit])?;
+        if !wanted.split_whitespace().any(|w| w == WANTED_BY) {
+            problems.push(format!(
+                "{unit} is not enabled: it is wanted by {wanted:?}, not {WANTED_BY}"
+            ));
+        }
+    }
+    let (unit, words) = HELPER;
+    let text = c.say(&["cat", &path(unit)])?;
+    let line = text
+        .lines()
+        .find(|l| l.starts_with("ExecStart="))
+        .unwrap_or_default();
+    if !line
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .contains(words)
+    {
+        problems.push(format!(
+            "{unit} does not install the package ({words}): {line:?}"
+        ));
     }
     Ok(())
 }
@@ -377,8 +464,14 @@ pub(crate) fn inside(package: &Path) -> String {
     )
 }
 
-/// The checks after the container is up.
-fn checks(c: &mut Container, t: &InstallTest, entries: &[Entry]) -> Result<Vec<String>, Error> {
+/// The checks after the container is up: `entries` are the listing's entries the format holds,
+/// `others` the ones it must not (the deb's own, in an rpm).
+fn checks(
+    c: &mut Container,
+    t: &InstallTest,
+    entries: &[Entry],
+    others: &[Entry],
+) -> Result<Vec<String>, Error> {
     let (format, gates) = (t.format, t.gates);
     let mut problems = Vec::new();
     let [manager, yes] = format.manager();
@@ -411,6 +504,15 @@ fn checks(c: &mut Container, t: &InstallTest, entries: &[Entry]) -> Result<Vec<S
     for e in entries {
         entry(c, e, &mut problems)?;
     }
+    for e in others {
+        if present(c, e)? {
+            problems.push(format!(
+                "{} is in the {}, which holds no such entry",
+                e.dst,
+                format.name()
+            ));
+        }
+    }
     // `kbf*`, not `kbf-*`: the slice is `kbf.slice`, which the hyphen glob does not match.
     let known = c.say(&["systemctl", "list-unit-files", "kbf*", "--no-legend"])?;
     let states: BTreeMap<&str, &str> = known
@@ -418,7 +520,7 @@ fn checks(c: &mut Container, t: &InstallTest, entries: &[Entry]) -> Result<Vec<S
         .filter_map(|l| l.split_once(' '))
         .map(|(unit, rest)| (unit, rest.trim().split(' ').next().unwrap_or("")))
         .collect();
-    for e in entries {
+    for e in entries.iter().filter(|e| e.link.is_none()) {
         let Some(unit) = e
             .dst
             .strip_prefix(pkg_linux::UNIT_DIR)
@@ -426,6 +528,10 @@ fn checks(c: &mut Container, t: &InstallTest, entries: &[Entry]) -> Result<Vec<S
         else {
             continue;
         };
+        // The host agent's are enabled; [`host_agent`] holds them to that.
+        if ENABLED.contains(&unit) {
+            continue;
+        }
         let state = states.get(unit).copied().unwrap_or("not known to systemd");
         if !matches!(state, "disabled" | "static") {
             problems.push(format!("{unit} is {state:?} after install, not disabled"));
@@ -445,6 +551,7 @@ fn checks(c: &mut Container, t: &InstallTest, entries: &[Entry]) -> Result<Vec<S
         &running,
         "",
     );
+    host_agent(c, format, &mut problems)?;
     c.must("systemd-sysusers", &["systemd-sysusers"], &mut problems)?;
     c.must(
         "systemd-tmpfiles",
@@ -623,7 +730,11 @@ fn session(docker: &mut Docker, t: &InstallTest, entries: &[Entry]) -> Result<Ve
     let target = format!("{}:{}", t.container, inside(t.package));
     must(docker, &["cp", &t.package.to_string_lossy(), &target])?;
     let mut c = Container::booted(docker, t.container)?;
-    checks(&mut c, t, entries)
+    let (held, others): (Vec<Entry>, Vec<Entry>) = entries
+        .iter()
+        .cloned()
+        .partition(|e| e.in_format(t.format.name()));
+    checks(&mut c, t, &held, &others)
 }
 
 /// The `pkg-install-test` verb: the lines to print.
@@ -640,7 +751,7 @@ pub fn run(docker: &mut Docker, t: &InstallTest) -> Result<Vec<String>, Error> {
     let problems = result?;
     if problems.is_empty() {
         return Ok(vec![format!(
-            "{} installs disabled, gated and without scripts; remove (and purge, for a deb) leave the operator's files",
+            "{} installs without scripts, every unit disabled and gated but the host agent's (enabled in a deb); remove (and purge, for a deb) leave the operator's files",
             t.package.display()
         )]);
     }

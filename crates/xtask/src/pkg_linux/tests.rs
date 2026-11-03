@@ -41,6 +41,12 @@ impl Tree {
         t.put("sysusers.conf", "u kbf");
         t.put("tmpfiles.conf", "d /x");
         t.put("needrestart.conf", "# n");
+        for name in AGENT_UNITS.into_iter().chain([AGENT_SYSUSERS]) {
+            t.put(&format!("host-agent/{name}"), name);
+        }
+        // What else the host agent's directory holds, which the package does not take.
+        t.put("host-agent/kbf-updater-root.service", "root part");
+        t.put("host-agent/updater.d/kbf.toml", "declaration");
         t
     }
 
@@ -60,6 +66,7 @@ impl Tree {
             sysusers: at("sysusers.conf"),
             tmpfiles: at("tmpfiles.conf"),
             needrestart: at("needrestart.conf"),
+            host_agent: at("host-agent"),
             platform: Platform::LinuxX86_64,
             version: "0.0.0+ci",
         }
@@ -88,52 +95,83 @@ fn real_inputs(root: &Path) -> Inputs<'_> {
         sysusers: at("sysusers.d/kbf-installer.conf"),
         tmpfiles: at("tmpfiles.d/kbf-installer.conf"),
         needrestart: at("needrestart/kbf.conf"),
+        host_agent: at("../host-agent/linux"),
         platform: Platform::LinuxX86_64,
         version: "0.0.0+ci",
     }
 }
 
+/// One entry of a plan as the tests compare it: the path, the mode, whether it is a file, what a
+/// link points to, and whether the deb alone holds it.
+type Seen = (String, u32, bool, Option<String>, bool);
+
 /// Asserts that the package holds the runtime, the units of the modes, the slice, the users and
-/// directories they run with, the needrestart drop-in and the trust directory, each at its mode,
-/// and holds nothing else.
+/// directories they run with, the needrestart drop-in and the trust directory, each at its mode;
+/// that the deb alone holds the host agent's two units, a link to each in the `.wants` directory
+/// of `multi-user.target` (which enables it) and the agent's account; and that it holds nothing
+/// else (not the root part's unit nor the hook's declaration beside them).
 #[test]
 fn the_plan_is_the_contract_paths_with_their_modes() {
     let t = Tree::new("plan");
-    let got: Vec<(String, u32, bool)> = kbf_plan(&t.inputs())
+    let got: Vec<Seen> = kbf_plan(&t.inputs())
         .expect("plan")
         .into_iter()
-        .map(|e| (e.dst, e.mode, e.sha256.is_some()))
+        .map(|e| (e.dst, e.mode, e.sha256.is_some(), e.link, e.deb_only))
         .collect();
-    let want = [
-        ("/etc/needrestart/conf.d/kbf.conf", 0o644, true),
-        ("/usr/bin/kbf", 0o755, true),
+    let file = |p: &str, m: u32| (p.to_owned(), m, true, None, false);
+    let dir = |p: &str| (p.to_owned(), 0o755, false, None, false);
+    let agent = |p: &str| (p.to_owned(), 0o644, true, None, true);
+    let wants = |unit: &str| {
         (
-            "/usr/lib/systemd/system/kbf-all-in-one.service",
-            0o644,
+            format!("/usr/lib/systemd/system/multi-user.target.wants/{unit}"),
+            0o777,
+            false,
+            Some(format!("../{unit}")),
             true,
-        ),
-        ("/usr/lib/systemd/system/kbf-daemon.service", 0o644, true),
-        ("/usr/lib/systemd/system/kbf-frontend.service", 0o644, true),
-        (
+        )
+    };
+    let want: Vec<Seen> = vec![
+        file("/etc/needrestart/conf.d/kbf.conf", 0o644),
+        file("/usr/bin/kbf", 0o755),
+        file("/usr/lib/systemd/system/kbf-all-in-one.service", 0o644),
+        file("/usr/lib/systemd/system/kbf-daemon.service", 0o644),
+        file("/usr/lib/systemd/system/kbf-frontend.service", 0o644),
+        agent("/usr/lib/systemd/system/kbf-host-local.service"),
+        file(
             "/usr/lib/systemd/system/kbf-storage-and-daemon.service",
             0o644,
-            true,
         ),
-        ("/usr/lib/systemd/system/kbf-storage.service", 0o644, true),
-        ("/usr/lib/systemd/system/kbf.slice", 0o644, true),
-        ("/usr/lib/sysusers.d/kbf.conf", 0o644, true),
-        ("/usr/lib/tmpfiles.d/kbf.conf", 0o644, true),
-        ("/usr/share/kbf", 0o755, false),
-        ("/usr/share/kbf/trust", 0o755, false),
-        ("/usr/share/kbf/trust/gh", 0o755, true),
-        ("/usr/share/kbf/trust/installer.conf", 0o644, true),
-        ("/usr/share/kbf/trust/trusted_root.jsonl", 0o644, true),
+        file("/usr/lib/systemd/system/kbf-storage.service", 0o644),
+        agent("/usr/lib/systemd/system/kbf-updater-agent.service"),
+        file("/usr/lib/systemd/system/kbf.slice", 0o644),
+        wants("kbf-host-local.service"),
+        wants("kbf-updater-agent.service"),
+        agent("/usr/lib/sysusers.d/kbf-updater.conf"),
+        file("/usr/lib/sysusers.d/kbf.conf", 0o644),
+        file("/usr/lib/tmpfiles.d/kbf.conf", 0o644),
+        dir("/usr/share/kbf"),
+        dir("/usr/share/kbf/trust"),
+        file("/usr/share/kbf/trust/gh", 0o755),
+        file("/usr/share/kbf/trust/installer.conf", 0o644),
+        file("/usr/share/kbf/trust/trusted_root.jsonl", 0o644),
     ];
-    let want: Vec<(String, u32, bool)> = want
-        .iter()
-        .map(|(p, m, f)| ((*p).to_owned(), *m, *f))
-        .collect();
     assert_eq!(got, want);
+}
+
+/// Asserts that the host agent's files in the deb are the bytes of the host agent's directory:
+/// each unit and the account file is taken from there, not from the units directory.
+#[test]
+fn the_host_agent_files_are_the_host_agent_directorys() {
+    let t = Tree::new("agent-bytes");
+    let plan = kbf_plan(&t.inputs()).expect("plan");
+    for name in AGENT_UNITS.into_iter().chain([AGENT_SYSUSERS]) {
+        let src = t.dir.join("host-agent").join(name);
+        let e = plan
+            .iter()
+            .find(|e| e.src == src)
+            .unwrap_or_else(|| panic!("{name} is packaged"));
+        assert_eq!(e.sha256, Some(Sha256::of(name.as_bytes())), "{name}");
+    }
 }
 
 /// Asserts that the retired installer is not in the package: not its binary, not its proxy's or
@@ -161,7 +199,7 @@ fn the_plan_leaves_out_the_installer_its_units_and_its_directory() {
 fn the_plan_refuses_what_the_package_does_not_ship() {
     // Each case changes the tree in one way and names what the refusal must say.
     type Change = fn(&Tree) -> Inputs<'_>;
-    let cases: [(&str, Change, &str); 12] = [
+    let cases: [(&str, Change, &str); 16] = [
         (
             "a missing kbf",
             |t| {
@@ -219,6 +257,40 @@ fn the_plan_refuses_what_the_package_does_not_ship() {
             "/sysusers.conf: No such file or directory",
         ),
         (
+            "a missing helper unit",
+            |t| {
+                std::fs::remove_file(t.dir.join("host-agent/kbf-host-local.service")).expect("rm");
+                t.inputs()
+            },
+            "host agent file kbf-host-local.service is missing",
+        ),
+        (
+            "a missing agent unit",
+            |t| {
+                std::fs::remove_file(t.dir.join("host-agent/kbf-updater-agent.service"))
+                    .expect("rm");
+                t.inputs()
+            },
+            "host agent file kbf-updater-agent.service is missing",
+        ),
+        (
+            "a missing agent account",
+            |t| {
+                std::fs::remove_file(t.dir.join("host-agent/kbf-updater.conf")).expect("rm");
+                t.inputs()
+            },
+            "host agent file kbf-updater.conf is missing",
+        ),
+        (
+            "a host agent directory that is not there",
+            |t| {
+                let mut i = t.inputs();
+                i.host_agent = Path::new("/nonexistent/host-agent");
+                i
+            },
+            "/nonexistent/host-agent cannot be read as a directory",
+        ),
+        (
             "a unit directory that is not there",
             |t| {
                 let mut i = t.inputs();
@@ -273,8 +345,9 @@ fn the_plan_refuses_what_the_package_does_not_ship() {
     std::fs::remove_file(t.dir.join("units/kbf-daemon.service")).expect("rm");
     std::fs::remove_file(t.dir.join("units/kbf-storage.service")).expect("rm");
     std::fs::remove_file(t.dir.join("trust/gh")).expect("rm");
+    std::fs::remove_file(t.dir.join("host-agent/kbf-updater-agent.service")).expect("rm");
     let text = refused(kbf_plan(&t.inputs()));
-    assert_eq!(text.lines().count(), 3, "{text}");
+    assert_eq!(text.lines().count(), 4, "{text}");
 }
 
 /// Asserts that the configuration is named `kbf`, recommends what the installer's package
@@ -337,6 +410,45 @@ fn the_config_has_the_contract_dependencies_no_script_and_root_files() {
     assert!(arm.contains("arch: \"arm64\""), "{arm}");
 }
 
+/// Asserts that the configuration gives nfpm each link as a link (its target as `src`), and marks
+/// every entry of the host agent, and no other, as the deb's alone.
+#[test]
+fn the_config_links_the_agent_units_and_keeps_them_to_the_deb() {
+    let t = Tree::new("config-agent");
+    let entries = kbf_plan(&t.inputs()).expect("plan");
+    let text = config(&entries, Platform::LinuxX86_64, "1.2.3+ci");
+    for unit in AGENT_UNITS {
+        let want = format!(
+            "  - dst: \"{WANTS_DIR}/{unit}\"\n    src: \"../{unit}\"\n    type: \"symlink\"\n    \
+             packager: \"deb\"\n    file_info: {{mode: 0777, owner: root, group: root}}\n"
+        );
+        assert!(text.contains(&want), "{want} in {text}");
+        let unit_entry = format!("  - dst: \"{UNIT_DIR}/{unit}\"\n    src: ");
+        let at = text.find(&unit_entry).expect("the unit is an entry");
+        let rest = &text[at + unit_entry.len()..];
+        let next = rest.find("  - dst:").unwrap_or(rest.len());
+        assert!(rest[..next].contains("    packager: \"deb\"\n"), "{text}");
+    }
+    assert_eq!(text.matches("packager: \"deb\"").count(), 5, "{text}");
+    assert_eq!(text.matches("type: \"symlink\"").count(), 2, "{text}");
+}
+
+/// Asserts that the sources whose times `pkg-build` changes are the files the package copies, and
+/// not the targets of its links, which are paths inside the package.
+#[test]
+fn the_sources_of_a_config_are_its_files_and_not_its_links() {
+    let t = Tree::new("sources-links");
+    let entries = kbf_plan(&t.inputs()).expect("plan");
+    let got = sources(&config(&entries, Platform::LinuxX86_64, "1.0.0")).expect("sources");
+    let want: Vec<PathBuf> = entries
+        .iter()
+        .filter(|e| e.sha256.is_some())
+        .map(|e| e.src.clone())
+        .collect();
+    assert_eq!(got, want);
+    assert!(!got.iter().any(|p| p.starts_with("..")), "{got:?}");
+}
+
 /// Asserts that the deb replaces every `kbf-installer` below the bound, which is how a plain
 /// `dpkg --install` unpacks over its files, that it does not break it (dpkg would refuse on a host
 /// that has it), that the rpm names neither, and that the bound is above every version of the
@@ -386,12 +498,33 @@ fn the_listing_round_trips() {
     let entries = kbf_plan(&t.inputs()).expect("plan");
     let text = listing(&entries);
     assert!(text.contains("dir 0755 /usr/share/kbf -\n"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "link 0777 {WANTS_DIR}/kbf-updater-agent.service ../kbf-updater-agent.service deb\n"
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains("file 0644 /usr/lib/sysusers.d/kbf-updater.conf "),
+        "{text}"
+    );
     let parsed = parse_listing(&text).expect("parse");
     assert_eq!(parsed.len(), entries.len());
     for (p, e) in parsed.iter().zip(&entries) {
-        assert_eq!((&p.dst, p.mode, p.sha256), (&e.dst, e.mode, e.sha256));
+        assert_eq!(
+            (&p.dst, p.mode, p.sha256, &p.link, p.deb_only),
+            (&e.dst, e.mode, e.sha256, &e.link, e.deb_only)
+        );
         assert!(p.src.as_os_str().is_empty());
     }
+    assert_eq!(parsed.iter().filter(|e| e.deb_only).count(), 5);
+    assert!(
+        parsed
+            .iter()
+            .filter(|e| e.deb_only)
+            .all(|e| !e.in_format("rpm"))
+    );
+    assert!(parsed.iter().all(|e| e.in_format("deb")));
 }
 
 #[test]
@@ -403,6 +536,10 @@ fn a_listing_line_that_is_not_one_is_refused() {
         "file 0644 /a nothex".to_owned(),
         format!("file 9 /a {sha}"),
         format!("link 0644 /a {sha}"),
+        "link 0777 /a -".to_owned(),
+        format!("file 0644 /a {sha} rpm"),
+        format!("file 0644 /a {sha} deb more"),
+        "dir 0755 /a".to_owned(),
     ] {
         let err = parse_listing(&line).expect_err(&line);
         assert_eq!(err, Error::Failed(format!("not a listing line: {line:?}")));

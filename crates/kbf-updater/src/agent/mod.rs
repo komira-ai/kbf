@@ -8,7 +8,8 @@
 //! - [`local`]: `kbf-host-install`'s local socket, which does the root work (a frontend's
 //!   container included: [`container_health`]);
 //! - [`enroll`] and [`renew`]: the host's certificate, made once with a token and renewed by the
-//!   agent at half its life;
+//!   agent at half its life; [`enrolled`]: an agent started before the host is enrolled waits for
+//!   the enrollment;
 //! - [`service_health`]: a service's readiness URL;
 //! - [`cordon`]: which cordons on the node are the updater's own, kept on disk;
 //! - [`hold`]: `Deferred` and `halt`: the features announced, the deferral kept on disk, the
@@ -21,6 +22,7 @@
 pub mod container_health;
 pub mod coordinator;
 pub mod enroll;
+pub mod enrolled;
 pub mod flags;
 pub mod hold;
 pub mod hook;
@@ -35,7 +37,7 @@ pub mod update;
 mod build;
 pub mod cordon;
 
-pub use build::{Access, NO_CREDENTIAL, NoCredential, run_agent, run_config};
+pub use build::{Access, NO_CREDENTIAL, NoCredential, run_agent, run_config, run_config_waiting};
 pub use run::{Agent, ServicePorts, Stop, World};
 
 #[cfg(test)]
@@ -48,6 +50,8 @@ mod coordinator_tests;
 mod cordon_tests;
 #[cfg(test)]
 mod enroll_tests;
+#[cfg(test)]
+mod enrolled_tests;
 #[cfg(test)]
 mod entry_tests;
 #[cfg(test)]

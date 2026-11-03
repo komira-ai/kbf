@@ -20,12 +20,17 @@
 //! - it holds the unit of every mode ([`crate::pkg_linux::KBF_UNITS`]) and `kbf.slice` in
 //!   `usr/lib/systemd/system`, the sysusers.d and tmpfiles.d files and the needrestart
 //!   drop-in, all mode 0644;
+//! - it holds the host agent: the helper's and the agent's units
+//!   ([`crate::pkg_linux::AGENT_UNITS`]) beside the others and the agent's sysusers.d file, mode
+//!   0644, and the link that enables each, `<WANTS_DIR>/<unit> -> ../<unit>`
+//!   ([`crate::pkg_linux::WANTS_DIR`]): a host that installs the published deb runs its agent
+//!   from its next boot;
 //! - its trust directory `usr/share/kbf/trust` holds the pinned `gh` (mode 0755, and byte for
 //!   byte `--gh`, the program the job downloaded and checked by SHA-256, when given), the
 //!   Sigstore trusted root and an `installer.conf` that is exactly `SOURCE_REFS=` and
 //!   `--expect-ref` ([`crate::pkg_asset::trust_problems`]): a deb built on `main` trusts
 //!   `main` and a deb built on a feature branch trusts that branch, never the reverse;
-//! - it holds no other file.
+//! - it holds no other file and no other link.
 //!
 //! Then, without `--verify-only`, it copies the deb to `<out>/kbf-<commit>-<platform>.deb`
 //! and appends its line to `<out>/SHA256SUMS.<platform>` ([`crate::sums`]), refusing a deb
@@ -39,8 +44,9 @@ use crate::Error;
 use crate::package::Platform;
 use crate::pkg_asset::{self, Mode};
 use crate::pkg_linux::{
-    DEB_RECOMMENDS, DEB_SUGGESTS, KBF_DEB_REPLACES, KBF_NAME, KBF_PATH, KBF_UNITS,
-    NEEDRESTART_PATH, SLICE, SYSUSERS_PATH, TMPFILES_PATH, TRUST_DIR, TRUST_FILES, UNIT_DIR,
+    AGENT_SYSUSERS_PATH, AGENT_UNITS, DEB_RECOMMENDS, DEB_SUGGESTS, KBF_DEB_REPLACES, KBF_NAME,
+    KBF_PATH, KBF_UNITS, NEEDRESTART_PATH, SLICE, SYSUSERS_PATH, TMPFILES_PATH, TRUST_DIR,
+    TRUST_FILES, UNIT_DIR, WANTS_DIR,
 };
 
 /// The file name of the asset.
@@ -88,13 +94,27 @@ fn trust_paths() -> Vec<String> {
 
 /// The regular files of the package other than `usr/bin/kbf` and the trust files (which
 /// [`pkg_asset::trust_problems`] holds to their modes and contents), as a data tarball names
-/// them, each with the mode it has: the units, the slice, and the sysusers, tmpfiles and
-/// needrestart files.
+/// them, each with the mode it has: the units (the host agent's among them), the slice, and the
+/// sysusers (the agent's too), tmpfiles and needrestart files.
 fn other_files() -> Vec<(String, u32)> {
-    let units = KBF_UNITS.into_iter().chain([SLICE]);
+    let units = KBF_UNITS.into_iter().chain([SLICE]).chain(AGENT_UNITS);
     let units = units.map(|u| (member_path(&format!("{UNIT_DIR}/{u}")), 0o644));
-    let single = [SYSUSERS_PATH, TMPFILES_PATH, NEEDRESTART_PATH].map(|p| (member_path(p), 0o644));
+    let single = [
+        SYSUSERS_PATH,
+        AGENT_SYSUSERS_PATH,
+        TMPFILES_PATH,
+        NEEDRESTART_PATH,
+    ]
+    .map(|p| (member_path(p), 0o644));
     units.chain(single).collect()
+}
+
+/// The links of the package, as a data tarball names them, each with its target: the one that
+/// enables each of the host agent's units.
+fn links() -> Vec<(String, String)> {
+    AGENT_UNITS
+        .map(|u| (member_path(&format!("{WANTS_DIR}/{u}")), format!("../{u}")))
+        .to_vec()
 }
 
 /// What is wrong with `deb` (the bytes of the package) as the `kbf` package for `c`: one
@@ -156,6 +176,25 @@ pub fn problems(deb: &[u8], c: &Check) -> Result<Vec<String>, Error> {
             problems.push(format!(
                 "holds {}, which the kbf package does not ship",
                 m.path
+            ));
+        }
+    }
+    let wanted = links();
+    for (link, target) in &wanted {
+        match opened.links.iter().find(|(p, _)| p == link) {
+            None => problems.push(format!(
+                "holds no link {link}, which enables its unit at boot"
+            )),
+            Some((_, got)) if got != target => {
+                problems.push(format!("{link} points to {got:?}, not {target:?}"));
+            }
+            Some(_) => {}
+        }
+    }
+    for (link, target) in &opened.links {
+        if !wanted.iter().any(|(p, _)| p == link) {
+            problems.push(format!(
+                "holds the link {link} -> {target}, which the kbf package does not ship"
             ));
         }
     }
