@@ -173,9 +173,8 @@ async fn record_unapplied(shared: &Shared, method: &str, request: http::Request<
     let body = request.into_body().collect().await;
     let body = body.map(|whole| whole.to_bytes()).unwrap_or_default();
     let message = body.get(5..).unwrap_or_default();
-    if let Some(call) = decode_call(method, message) {
-        shared.record(call);
-    }
+    let call = decode_call(method, message);
+    call.into_iter().for_each(|call| shared.record(call));
 }
 
 /// The call `method` with `message` as its request, decoded.

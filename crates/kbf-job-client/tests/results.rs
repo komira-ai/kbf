@@ -172,10 +172,7 @@ async fn the_times_of_a_job_are_those_of_its_steps() {
         ended_at_ms: Some(7500),
     };
     assert_eq!(server.now_ms(), 7500);
-    assert_eq!(
-        client.get_job("timed").await.unwrap().times,
-        Some(times.clone())
-    );
+    assert_eq!(client.get_job("timed").await.unwrap().times, Some(times));
     assert_eq!(client.get_result("timed").await.unwrap().times, Some(times));
 }
 
