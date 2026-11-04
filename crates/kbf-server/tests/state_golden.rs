@@ -114,6 +114,7 @@ fn request(tag: u8, resources: Resources) -> Request {
         hermetic: true,
         do_not_cache: false,
         whole_worker: false,
+        pin: None,
         needs: kbf_caps::Request::default(),
     }
 }

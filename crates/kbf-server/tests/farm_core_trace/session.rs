@@ -259,6 +259,7 @@ impl Session {
             hermetic: true,
             do_not_cache: job.do_not_cache,
             whole_worker: false,
+            pin: None,
             needs: kbf_caps::Request::default(),
         };
         let described = Described {

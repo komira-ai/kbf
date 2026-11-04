@@ -106,6 +106,9 @@ fn unavailable(not_queued: NotQueued) -> Status {
         NotQueued::Superseded => Status::failed_precondition(
             "this scheduler was superseded by a newer writer of the state store",
         ),
+        NotQueued::Probe => {
+            Status::failed_precondition("this scheduler queues no probe pinned to a host")
+        }
     }
 }
 

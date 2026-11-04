@@ -53,6 +53,7 @@ fn submission(tag: u8, argv: &str) -> Submission {
         do_not_cache: false,
         needs: kbf_caps::Request::from_platform([("OSFamily", "linux")]).expect("a platform"),
         whole_worker: false,
+        pin: None,
     };
     Submission {
         request,

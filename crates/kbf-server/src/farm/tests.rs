@@ -141,6 +141,7 @@ fn a_report_the_scheduler_does_not_take_is_refused() {
         do_not_cache: false,
         needs: kbf_caps::Request::default(),
         whole_worker: false,
+        pin: None,
     };
     farm.submit(Submission {
         request,
@@ -185,6 +186,7 @@ fn a_request_keyed_by_something_other_than_an_action_is_refused() {
         do_not_cache: false,
         needs: kbf_caps::Request::default(),
         whole_worker: false,
+        pin: None,
     };
     let refused = farm.submit(Submission {
         request,

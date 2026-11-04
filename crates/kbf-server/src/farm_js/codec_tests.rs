@@ -35,6 +35,7 @@ fn request() -> Request {
         do_not_cache: false,
         needs: kbf_caps::Request::default(),
         whole_worker: false,
+        pin: None,
     }
 }
 
