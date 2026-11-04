@@ -1,0 +1,80 @@
+# Copied unchanged from crates/js-proto/tests/golden/job.hex of komira-ai/jobscheduler at the revision
+# the root Cargo.toml pins; the file names in the comments below are js-proto's own.
+# The encoding of the fully populated Job that tests/common/mod.rs builds, 361 bytes.
+# Hex pairs; '#' starts a comment. Fields in number order, map entries in key order.
+0a 05                                                  # id (field 1, 5 bytes):
+  6a 6f 62 2d 31                                       # 'job-1'
+12 95 02                                               # spec (field 2, message of 277 bytes):
+  0a 05                                                # job_id (field 1, 5 bytes):
+    6a 6f 62 2d 31                                     # 'job-1'
+  12 5c                                                # image (field 2, 92 bytes):
+    72 65 67 69 73 74 72 79 2e 65 78 61 6d 70 6c 65    # 'registry.example'
+    2f 61 70 70 40 73 68 61 32 35 36 3a 30 31 32 33    # '/app@sha256:0123'
+    34 35 36 37 38 39 61 62 63 64 65 66 30 31 32 33    # '456789abcdef0123'
+    34 35 36 37 38 39 61 62 63 64 65 66 30 31 32 33    # '456789abcdef0123'
+    34 35 36 37 38 39 61 62 63 64 65 66 30 31 32 33    # '456789abcdef0123'
+    34 35 36 37 38 39 61 62 63 64 65 66                # '456789abcdef'
+  1a 08                                                # command (field 3, 8 bytes):
+    2f 62 69 6e 2f 72 75 6e                            # '/bin/run'
+  22 06                                                # args (field 4, 6 bytes):
+    2d 2d 66 61 73 74                                  # '--fast'
+  22 05                                                # args (field 4, 5 bytes):
+    69 6e 70 75 74                                     # 'input'
+  2a 0a                                                # env A_VAR (field 5, message of 10 bytes):
+    0a 05                                              # key (field 1, 5 bytes):
+      41 5f 56 41 52                                   # 'A_VAR'
+    12 01                                              # value (field 2, 1 byte):
+      31                                               # '1'
+  2a 0a                                                # env B_VAR (field 5, message of 10 bytes):
+    0a 05                                              # key (field 1, 5 bytes):
+      42 5f 56 41 52                                   # 'B_VAR'
+    12 01                                              # value (field 2, 1 byte):
+      32                                               # '2'
+  52 2a                                                # needs (field 10, message of 42 bytes):
+    08 dc 0b                                           # cpu_millis = 1500 (field 1, varint)
+    10 80 80 80 80 08                                  # memory_bytes = 2147483648 (field 2, varint)
+    18 80 80 80 80 04                                  # disk_bytes = 1073741824 (field 3, varint)
+    20 01                                              # gpus = 1 (field 4, varint)
+    2a 15                                              # gpu_class (field 5, 21 bytes):
+      6e 76 69 64 69 61 2d 61 31 30 30 2d 73 78 6d 34  # 'nvidia-a100-sxm4'
+      2d 38 30 67 62                                   # '-80gb'
+    30 01                                              # whole_host = 1 (field 6, varint)
+  5a 11                                                # constraints (field 11, message of 17 bytes):
+    0a 05                                              # os (field 1, 5 bytes):
+      6c 69 6e 75 78                                   # 'linux'
+    12 06                                              # arch (field 2, 6 bytes):
+      78 38 36 5f 36 34                                # 'x86_64'
+    18 01                                              # exec (EXEC_MODE_CONTAINER) = 1 (field 3, varint)
+  a0 01 90 1c                                          # wall_limit_seconds = 3600 (field 20, varint)
+  f0 01 02                                             # network (NETWORK_LEVEL_ALLOW_LIST) = 2 (field 30, varint)
+  fa 01 05                                             # ports (field 31, message of 5 bytes):
+    08 90 3f                                           # host_port = 8080 (field 1, varint)
+    10 50                                              # container_port = 80 (field 2, varint)
+  c2 02 0c                                             # files (field 40, message of 12 bytes):
+    0a 0a                                              # name (field 1, 10 bytes):
+      75 70 6c 6f 61 64 2d 75 72 6c                    # 'upload-url'
+  90 03 07                                             # priority = 7 (field 50, varint)
+  9a 03 0c                                             # labels kind (field 51, message of 12 bytes):
+    0a 04                                              # key (field 1, 4 bytes):
+      6b 69 6e 64                                      # 'kind'
+    12 04                                              # value (field 2, 4 bytes):
+      74 65 73 74                                      # 'test'
+  9a 03 0d                                             # labels team (field 51, message of 13 bytes):
+    0a 04                                              # key (field 1, 4 bytes):
+      74 65 61 6d                                      # 'team'
+    12 05                                              # value (field 2, 5 bytes):
+      62 75 69 6c 64                                   # 'build'
+18 09                                                  # state (JOB_STATE_FAILED_TO_START) = 9 (field 3, varint)
+20 04                                                  # start_failure (START_FAILURE_CODE_AGENT_REFUSED) = 4 (field 4, varint)
+2a 12                                                  # start_failure_detail (field 5, 18 bytes):
+  69 6d 61 67 65 2d 66 65 74 63 68 2d 66 61 69 6c      # 'image-fetch-fail'
+  65 64                                                # 'ed'
+52 06                                                  # host_id (field 10, 6 bytes):
+  68 6f 73 74 2d 61                                    # 'host-a'
+a2 01 1c                                               # times (field 20, message of 28 bytes):
+  08 80 a0 f1 c2 b1 34                                 # queued_at_ms = 1800000000000 (field 1, varint)
+  10 e8 a7 f1 c2 b1 34                                 # placed_at_ms = 1800000001000 (field 2, varint)
+  18 d0 af f1 c2 b1 34                                 # started_at_ms = 1800000002000 (field 3, varint)
+  20 b8 b7 f1 c2 b1 34                                 # ended_at_ms = 1800000003000 (field 4, varint)
+f0 01 a0 bf f1 c2 b1 34                                # host_silent_since_ms = 1800000004000 (field 30, varint)
+f8 01 01                                               # cancel_requested = 1 (field 31, varint)

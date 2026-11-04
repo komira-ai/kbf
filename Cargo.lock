@@ -1463,6 +1463,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "js-proto"
+version = "0.1.0"
+source = "git+https://github.com/komira-ai/jobscheduler?rev=e73a5af2ec9ab54e2aeb131c1d8a4a6879a8abb5#e73a5af2ec9ab54e2aeb131c1d8a4a6879a8abb5"
+dependencies = [
+ "bytes",
+ "prost",
+ "prost-types",
+ "protox 0.10.0",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+]
+
+[[package]]
 name = "js-sched"
 version = "0.1.0"
 source = "git+https://github.com/komira-ai/jobscheduler?rev=e73a5af2ec9ab54e2aeb131c1d8a4a6879a8abb5#e73a5af2ec9ab54e2aeb131c1d8a4a6879a8abb5"
@@ -2062,7 +2076,7 @@ dependencies = [
  "kbf-types",
  "prost",
  "prost-types",
- "protox",
+ "protox 0.9.1",
  "rcgen",
  "serde_json",
  "sha2 0.11.0",
@@ -2307,7 +2321,29 @@ dependencies = [
  "kbf-types",
  "prost",
  "prost-build",
- "protox",
+ "protox 0.9.1",
+]
+
+[[package]]
+name = "kbf-job-client"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "http",
+ "http-body",
+ "hyper",
+ "hyper-util",
+ "js-proto",
+ "kbf-job-client",
+ "kbf-testkit",
+ "prost",
+ "rcgen",
+ "rustls",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
+ "tonic",
+ "tonic-prost",
 ]
 
 [[package]]
@@ -2436,7 +2472,7 @@ name = "kbf-mdm-api"
 version = "0.1.0"
 dependencies = [
  "prost",
- "protox",
+ "protox 0.9.1",
  "serde_json",
  "thiserror",
  "tokio",
@@ -2627,7 +2663,7 @@ dependencies = [
  "kbf-types",
  "prost",
  "prost-types",
- "protox",
+ "protox 0.9.1",
  "sha2 0.11.0",
  "thiserror",
  "tonic",
@@ -4065,7 +4101,22 @@ dependencies = [
  "prost",
  "prost-reflect",
  "prost-types",
- "protox-parse",
+ "protox-parse 0.9.0",
+ "thiserror",
+]
+
+[[package]]
+name = "protox"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f43240d7f22cf77d1625885e547acf874dd63cd2790f29f4a38e86256f41996f"
+dependencies = [
+ "bytes",
+ "miette",
+ "prost",
+ "prost-reflect",
+ "prost-types",
+ "protox-parse 0.10.0",
  "thiserror",
 ]
 
@@ -4076,6 +4127,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "072eee358134396a4643dff81cfff1c255c9fbd3fb296be14bdb6a26f9156366"
 dependencies = [
  "logos 0.15.1",
+ "miette",
+ "prost-types",
+ "thiserror",
+]
+
+[[package]]
+name = "protox-parse"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "34efee6fad0cf6d71642d20a66bfe0c281919c9577e7c66d20360dfcb7549272"
+dependencies = [
+ "logos 0.16.1",
  "miette",
  "prost-types",
  "thiserror",
@@ -5079,9 +5142,9 @@ checksum = "06bdbd8cfc056b8d2e2e85f29b56a3bdbecb527cef81eb39e3e7b98af4652770"
 
 [[package]]
 name = "tonic"
-version = "0.14.6"
+version = "0.14.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac2a5518c70fa84342385732db33fb3f44bc4cc748936eb5833d2df34d6445ef"
+checksum = "e2cdfc673aabd30fe8fee92e65837b644c37c5d47f0f97ae6d5e0f1237d15e1b"
 dependencies = [
  "async-trait",
  "axum",
@@ -5102,6 +5165,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-stream",
+ "tokio-util",
  "tower",
  "tower-layer",
  "tower-service",
@@ -5110,9 +5174,9 @@ dependencies = [
 
 [[package]]
 name = "tonic-build"
-version = "0.14.6"
+version = "0.14.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c68f61875ac5293cf72e6c8cf0158086428c82c37229e98c840878f1706b0322"
+checksum = "ac6d916d206ed7bdda1778ddff9bda43303789c258877e7bc22fb44ee5c984b4"
 dependencies = [
  "prettyplease",
  "proc-macro2",
@@ -5122,9 +5186,9 @@ dependencies = [
 
 [[package]]
 name = "tonic-prost"
-version = "0.14.6"
+version = "0.14.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "50849f68853be452acf590cde0b146665b8d507b3b8af17261df47e02c209ea0"
+checksum = "eba464054e2226f182a34489b8b079bf4c6e3e7ab5fd7fc30e024f24aa92a484"
 dependencies = [
  "bytes",
  "prost",
@@ -5133,9 +5197,9 @@ dependencies = [
 
 [[package]]
 name = "tonic-prost-build"
-version = "0.14.6"
+version = "0.14.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "654e5643eff75d7f8c99197ce1440ed19a3474eada74c12bbac488b2cafdae27"
+checksum = "2ea216ddc448e08e7839ab09e20e60b06b6a1c32745ccb212c0ebd161c199f1b"
 dependencies = [
  "prettyplease",
  "proc-macro2",
