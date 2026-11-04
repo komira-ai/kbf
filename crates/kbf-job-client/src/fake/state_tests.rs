@@ -4,6 +4,9 @@ use tonic::Code;
 
 use super::*;
 
+/// A change made to a job spec.
+type Change = fn(&mut JobSpec);
+
 const IMAGE: &str =
     "registry.example/app@sha256:0000000000000000000000000000000000000000000000000000000000000000";
 const GIB: u64 = 1 << 30;
@@ -75,7 +78,7 @@ fn each_rule_of_fit_refuses_on_its_own() {
         ..spec("edge")
     };
     assert!(state().submit(at_edge.clone()).is_ok());
-    let past: [(&str, fn(&mut JobSpec)); 8] = [
+    let past: [(&str, Change); 8] = [
         ("cpu", |s| s.needs.as_mut().unwrap().cpu_millis += 1),
         ("memory", |s| s.needs.as_mut().unwrap().memory_bytes += 1),
         ("disk", |s| {

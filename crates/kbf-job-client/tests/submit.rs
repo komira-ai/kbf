@@ -8,6 +8,9 @@ use kbf_job_client::Error;
 use kbf_job_client::fake::Call;
 use support::{HOST, IMAGE, fake, spec, status_code, to_running};
 
+/// A change made to a job spec.
+type Change = fn(&mut JobSpec);
+
 /// Asserts the retry rule the executor relies on: when the fake applies a submit and then
 /// loses its answer, the call is `Error::Transport` with `may_have_applied()` true; the same
 /// spec submitted again with the same id answers a job with that id in the state the first
@@ -54,7 +57,7 @@ async fn submit_retry_after_a_lost_answer_makes_one_job() {
 async fn same_id_different_job_is_a_conflict() {
     let (server, client) = fake().await;
     let first = client.submit_job(spec("build-8")).await.unwrap();
-    let different: [(&str, fn(&mut JobSpec)); 3] = [
+    let different: [(&str, Change); 3] = [
         ("image", |job| {
             job.image = IMAGE.replace("kbf-task", "kbf-other")
         }),
@@ -76,7 +79,11 @@ async fn same_id_different_job_is_a_conflict() {
         let refusal = error.refusal().unwrap();
         assert_eq!(refusal.detail, "build-8 names another job");
     }
-    assert_eq!(server.jobs(), [first.clone()], "the held job is unchanged");
+    assert_eq!(
+        server.jobs(),
+        std::slice::from_ref(&first),
+        "the held job is unchanged"
+    );
 
     let mut reprioritised = spec("build-8");
     reprioritised.priority = 9;

@@ -35,17 +35,31 @@ trait Conn: AsyncRead + AsyncWrite + Send + Unpin {}
 impl<T: AsyncRead + AsyncWrite + Send + Unpin> Conn for T {}
 
 /// Accepts connections until the fake drops, which aborts this task and with it every
-/// connection in `connections`, or until accepting fails. A connection that ended stays in
-/// the set until then; a fake lives for one test.
+/// connection it serves, or until accepting fails.
 pub(super) async fn accept_loop(
     listener: TcpListener,
     acceptor: Option<TlsAcceptor>,
     shared: Arc<Shared>,
 ) {
     let mut connections = JoinSet::new();
-    while let Ok((tcp, _)) = listener.accept().await {
+    // A failed accept ends the fake's serving; there is no one to tell but the test, which
+    // then sees its calls refused.
+    let _ = accept_all(&listener, acceptor, &shared, &mut connections).await;
+}
+
+/// Accepts and serves connections, each on a task of `connections`, until accepting fails.
+/// A connection that ended stays in the set until the fake drops; a fake lives for one
+/// test.
+async fn accept_all(
+    listener: &TcpListener,
+    acceptor: Option<TlsAcceptor>,
+    shared: &Arc<Shared>,
+    connections: &mut JoinSet<()>,
+) -> std::io::Result<()> {
+    loop {
+        let (tcp, _) = listener.accept().await?;
         let acceptor = acceptor.clone();
-        let shared = Arc::clone(&shared);
+        let shared = Arc::clone(shared);
         connections.spawn(async move {
             let io: Box<dyn Conn> = match acceptor {
                 // A client that does not trust the certificate ends the handshake.

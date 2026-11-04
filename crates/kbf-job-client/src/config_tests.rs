@@ -74,9 +74,9 @@ fn an_origin_with_anything_but_a_scheme_host_and_port_is_refused() {
 
 /// Asserts that plain `http` builds a client for a loopback name or address
 /// (`127.0.0.1`, `[::1]`, `localhost`) and is refused for any other host, and that `https`
-/// needs the pinned CA, refuses a CA for `http`, and refuses a PEM with no certificate or a
-/// broken one; each refusal is its own `ConfigError`, and a client that builds dials nothing
-/// until it is called. Catches a loopback check that matches a prefix
+/// needs the pinned CA, refuses a CA for `http`, refuses a PEM with no certificate or a
+/// broken one, and builds with one that holds a CA; each refusal is its own `ConfigError`,
+/// and a client that builds dials nothing until it is called. Catches a loopback check that matches a prefix
 /// (`127.0.0.1.example.com` is a name like any other), a client that falls back to no TLS or
 /// to system roots without a CA, and a build that connects.
 #[tokio::test]
@@ -133,6 +133,12 @@ async fn plain_http_is_refused_off_loopback_and_https_needs_the_pinned_ca() {
             String::from_utf8_lossy(pem)
         );
     }
+    // The same check with a PEM that holds a CA: the client builds, trusting that root.
+    let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let key = rcgen::KeyPair::generate().unwrap();
+    let ca = rcgen::CertifiedIssuer::self_signed(params, key).unwrap();
+    assert!(Client::new(https().with_ca_pem(ca.pem().into_bytes())).is_ok());
     let unnamed =
         Config::new(origin("https://a..b:1").unwrap(), token()).with_ca_pem(b"unused".to_vec());
     assert!(matches!(
