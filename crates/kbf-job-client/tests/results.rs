@@ -123,7 +123,7 @@ async fn a_start_failure_keeps_its_code() {
         client.submit_job(spec(id)).await.unwrap();
     }
     assert!(server.place("placed", support::HOST));
-    assert!(server.place("starting", support::HOST) && server.start("starting"));
+    assert!(server.place("starting", support::HOST) && server.starting("starting"));
     to_running(&server, "running");
     let code = js_proto::v1::StartFailureCode::StartTimeout;
     for id in ["queued", "placed", "starting"] {

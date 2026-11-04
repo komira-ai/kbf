@@ -199,7 +199,7 @@ pub fn status_code(error: &Error) -> tonic::Code {
 /// Moves the job `id` of `server` from queued to running on [`HOST`].
 pub fn to_running(server: &FakeJobServer, id: &str) {
     assert!(server.place(id, HOST), "place {id}");
-    assert!(server.start(id), "start {id}");
+    assert!(server.starting(id), "start {id}");
     assert!(server.run(id), "run {id}");
 }
 

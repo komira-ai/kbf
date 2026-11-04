@@ -23,7 +23,7 @@ async fn host_silence_shows_on_get_job_and_changes_no_state() {
         client.submit_job(spec(id)).await.unwrap();
     }
     assert!(server.place("placed", HOST));
-    assert!(server.place("starting", HOST) && server.start("starting"));
+    assert!(server.place("starting", HOST) && server.starting("starting"));
     to_running(&server, "running");
     assert!(server.place("other", "host-b"));
 
@@ -91,7 +91,7 @@ async fn cancel_follows_the_states_of_the_design() {
     );
 
     assert!(server.place("placed", HOST));
-    assert!(server.place("starting", HOST) && server.start("starting"));
+    assert!(server.place("starting", HOST) && server.starting("starting"));
     to_running(&server, "running");
     for (id, state) in [
         ("placed", JobState::Placed),

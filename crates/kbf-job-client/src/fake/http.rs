@@ -25,7 +25,6 @@ use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 use tonic::Status;
 use tonic::body::Body;
-use tonic::codegen::Service as _;
 
 use super::service::Service;
 use super::{Fault, Shared, TOKEN};
@@ -117,16 +116,16 @@ impl tonic::codegen::Service<http::Request<Incoming>> for Gate {
             let path = request.uri().path();
             let method = path.rsplit('/').next().unwrap_or_default().to_owned();
             match shared.fault_for(&method) {
-                None => inner.call(request).await,
+                None => tonic::codegen::Service::call(&mut inner, request).await,
                 Some(Fault::Hang) => std::future::pending().await,
                 Some(Fault::Status { code, message }) => Ok(Status::new(code, message).into_http()),
                 Some(Fault::LoseAnswer) => {
-                    let _applied = inner.call(request).await;
+                    let _applied = tonic::codegen::Service::call(&mut inner, request).await;
                     lose.notify_one();
                     std::future::pending().await
                 }
                 Some(Fault::Answer(message)) => {
-                    let _applied = inner.call(request).await;
+                    let _applied = tonic::codegen::Service::call(&mut inner, request).await;
                     Ok(answer(&message))
                 }
             }

@@ -15,7 +15,7 @@
 //!   `wall-time-above-ceiling`. An id the service would not take, or an image not pinned by
 //!   digest, is `INVALID_ARGUMENT` without a refusal.
 //! - **States are the test's to move**, one step at a time: [`place`](FakeJobServer::place),
-//!   [`start`](FakeJobServer::start), [`run`](FakeJobServer::run),
+//!   [`starting`](FakeJobServer::starting), [`run`](FakeJobServer::run),
 //!   [`finish`](FakeJobServer::finish), [`fail_to_start`](FakeJobServer::fail_to_start),
 //!   [`lose`](FakeJobServer::lose), [`host_stopped`](FakeJobServer::host_stopped). Cancel of a
 //!   queued job cancels it at once; of a placed, starting or running job it records the intent
@@ -266,7 +266,7 @@ impl FakeJobServer {
     }
 
     /// A placed job is starting: its host's agent has the start.
-    pub fn start(&self, job: &str) -> bool {
+    pub fn starting(&self, job: &str) -> bool {
         self.shared.state().start(job)
     }
 
