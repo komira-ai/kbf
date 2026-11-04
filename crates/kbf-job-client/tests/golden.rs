@@ -6,12 +6,16 @@ mod support;
 
 use std::collections::BTreeMap;
 
+use bytes::Bytes;
 use http::{HeaderMap, HeaderValue};
 use js_proto::refusal::{refusal_of, refusal_status};
-use js_proto::v1::{Job, JobResult, RefusalCode, SubmitJobRequest};
+use js_proto::v1::{
+    GetJobResponse, GetResultResponse, Job, JobResult, JobState, RefusalCode, SubmitJobRequest,
+};
 use kbf_job_client::Error;
 use kbf_job_client::fake::{Call, Fault};
 use prost::Message;
+use prost::encoding::{WireType, encode_key, encode_varint};
 use support::{fake, full_job, full_result, full_spec, golden_bytes, golden_text};
 use tonic::{Code, Status};
 
@@ -145,4 +149,118 @@ async fn what_the_client_sends_is_what_the_server_reads() {
     let sent = SubmitJobRequest { spec: Some(spec) };
     assert_eq!(server.calls(), [Call::SubmitJob(Box::new(sent.clone()))]);
     assert_eq!(sent.encode_to_vec(), golden_bytes("submit_job_request.hex"));
+}
+
+/// Appends two fields no message of the service has (numbers over 100000), one varint and
+/// one length-delimited, to `buf`.
+fn add_unknown_fields(buf: &mut Vec<u8>) {
+    encode_key(100_000, WireType::Varint, buf);
+    encode_varint(7, buf);
+    encode_key(100_001, WireType::LengthDelimited, buf);
+    encode_varint(3, buf);
+    buf.extend_from_slice(b"abc");
+}
+
+/// `message` as field 1 of a response, with unknown fields after it inside the message
+/// (when `inside`) and after it in the response.
+fn response_with_unknown_fields(message: &[u8], inside: bool) -> Bytes {
+    let mut inner = message.to_vec();
+    if inside {
+        add_unknown_fields(&mut inner);
+    }
+    let mut out = Vec::new();
+    encode_key(1, WireType::LengthDelimited, &mut out);
+    encode_varint(inner.len() as u64, &mut out);
+    out.extend_from_slice(&inner);
+    add_unknown_fields(&mut out);
+    out.into()
+}
+
+/// Asserts that fully populated answers served by the fake come out of the client unchanged:
+/// a `GetJobResponse` with `full_job()` gives exactly `full_job()`; a `GetResultResponse`
+/// with `full_result()` (usage populated, exit code 3) gives exactly `full_result()`; a result
+/// whose exit code is `Some(0)` keeps `Some(0)`. Catches a client that drops or rewrites a
+/// field of the answer, and an optional zero read as absent.
+#[tokio::test]
+async fn full_answers_come_through_the_client_unchanged() {
+    let (server, client) = fake().await;
+    server.inject(Fault::Answer(
+        GetJobResponse {
+            job: Some(full_job()),
+        }
+        .encode_to_vec()
+        .into(),
+    ));
+    assert_eq!(client.get_job("job-1").await.unwrap(), full_job());
+
+    server.inject(Fault::Answer(
+        GetResultResponse {
+            result: Some(full_result()),
+        }
+        .encode_to_vec()
+        .into(),
+    ));
+    let result = client.get_result("job-1").await.unwrap();
+    assert_eq!(result, full_result());
+    assert_eq!(result.exit_code, Some(3));
+    assert!(result.usage.is_some());
+
+    let zero = JobResult {
+        exit_code: Some(0),
+        ..full_result()
+    };
+    server.inject(Fault::Answer(
+        GetResultResponse {
+            result: Some(zero.clone()),
+        }
+        .encode_to_vec()
+        .into(),
+    ));
+    let read = client.get_result("job-1").await.unwrap();
+    assert_eq!(read.exit_code, Some(0));
+    assert_eq!(read, zero);
+}
+
+/// Asserts that fields a newer server adds (unknown numbers, varint and length-delimited,
+/// inside the job or result and beside it) are skipped: the client returns the same value as
+/// without them. Catches a client that refuses an answer for fields it does not know.
+#[tokio::test]
+async fn unknown_fields_in_an_answer_are_skipped() {
+    let (server, client) = fake().await;
+    for inside in [false, true] {
+        server.inject(Fault::Answer(response_with_unknown_fields(
+            &full_job().encode_to_vec(),
+            inside,
+        )));
+        assert_eq!(client.get_job("job-1").await.unwrap(), full_job());
+
+        server.inject(Fault::Answer(response_with_unknown_fields(
+            &full_result().encode_to_vec(),
+            inside,
+        )));
+        assert_eq!(client.get_result("job-1").await.unwrap(), full_result());
+    }
+}
+
+/// Asserts that a job whose state is a number this client does not know (42) is returned with
+/// that number in `state` and `JobState::Unspecified` from `state()`. Catches an answer
+/// refused or the number changed because a newer server added a state.
+#[tokio::test]
+async fn an_unknown_job_state_is_kept_as_its_number() {
+    let (server, client) = fake().await;
+    let newer = Job {
+        state: 42,
+        ..full_job()
+    };
+    server.inject(Fault::Answer(
+        GetJobResponse {
+            job: Some(newer.clone()),
+        }
+        .encode_to_vec()
+        .into(),
+    ));
+    let job = client.get_job("job-1").await.unwrap();
+    assert_eq!(job.state, 42);
+    assert_eq!(job.state(), JobState::Unspecified);
+    assert_eq!(job, newer);
 }

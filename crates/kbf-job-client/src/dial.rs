@@ -125,6 +125,12 @@ fn connector(
         origin: origin.authority().to_owned(),
         reason: "not a name a certificate can carry",
     })?;
+    let config = client_config(roots(pem)?)?;
+    Ok((TlsConnector::from(Arc::new(config)), name))
+}
+
+/// The trust anchors: every certificate of `pem`, and nothing else (no system root).
+fn roots(pem: &[u8]) -> Result<rustls::RootCertStore, ConfigError> {
     let mut roots = rustls::RootCertStore::empty();
     for cert in CertificateDer::pem_slice_iter(pem) {
         let cert = cert.map_err(|cause| ConfigError::BadCa(cause.to_string()))?;
@@ -135,6 +141,12 @@ fn connector(
     if roots.is_empty() {
         return Err(ConfigError::BadCa("no certificate".to_owned()));
     }
+    Ok(roots)
+}
+
+/// The TLS settings of a client: the `ring` provider, its safe default versions (TLS 1.2 and
+/// 1.3), `roots` as the only trust anchors, no client certificate, and `h2` offered.
+fn client_config(roots: rustls::RootCertStore) -> Result<rustls::ClientConfig, ConfigError> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut config = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()?
@@ -142,5 +154,9 @@ fn connector(
         .with_no_client_auth();
     // gRPC runs over HTTP/2, which TLS names `h2`.
     config.alpn_protocols = vec![b"h2".to_vec()];
-    Ok((TlsConnector::from(Arc::new(config)), name))
+    Ok(config)
 }
+
+#[cfg(test)]
+#[path = "dial_tests.rs"]
+mod tests;

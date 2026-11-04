@@ -1,12 +1,13 @@
 //! The fake's state and the service's rules over it: the jobs, the hosts and offers the test
 //! gave, and the clock, which only [`State::advance`] moves.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use js_proto::refusal::refusal_status;
 use js_proto::v1::{
-    ExecMode, GetLogsResponse, Job, JobResult, JobSpec, JobState, JobTimes, ListJobsRequest,
-    ListJobsResponse, RefusalCode, ResultReason, Shape, StartFailureCode,
+    ExecMode, GetLogsResponse, Job, JobFile, JobResult, JobSpec, JobState, JobTimes,
+    ListJobsRequest, ListJobsResponse, PortForward, RefusalCode, ResultReason, Shape,
+    StartFailureCode,
 };
 use tonic::Status;
 
@@ -46,7 +47,7 @@ impl Machine {
         let disk = needs
             .disk_bytes
             .is_none_or(|disk| have.disk_bytes.is_some_and(|room| disk <= room));
-        let any_exec = wants.exec == i32::from(ExecMode::Unspecified);
+        let any_exec = wants.exec() == ExecMode::Unspecified;
         // Each term is one rule of fit; all are evaluated, none short-circuits another.
         [
             needs.cpu_millis <= have.cpu_millis,
@@ -156,6 +157,48 @@ fn not_found(id: &str) -> Status {
     Status::not_found(format!("no job {id}"))
 }
 
+/// Whether `image` is pinned by digest: `NAME@sha256:` and 64 lower-case hex digits.
+fn pinned(image: &str) -> bool {
+    let (name, digest) = image.split_once('@').unwrap_or_default();
+    let hex = digest.strip_prefix("sha256:").unwrap_or_default();
+    let lower_hex = |b: u8| b.is_ascii_digit() | (b'a'..=b'f').contains(&b);
+    !name.is_empty() & (hex.len() == 64) & hex.bytes().all(lower_hex)
+}
+
+/// Whether every file name is letters, digits, dot, underscore and dash, starts with a
+/// letter or a digit, and is given once.
+fn files_named(files: &[JobFile]) -> bool {
+    let mut seen = BTreeSet::new();
+    files.iter().all(|file| {
+        let name = file.name.as_str();
+        let first = name
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphanumeric());
+        let rest = name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() | (b == b'.') | (b == b'_') | (b == b'-'));
+        first & rest & seen.insert(name)
+    })
+}
+
+/// Whether every port of every forward is 1 to 65535.
+fn ports_in_range(ports: &[PortForward]) -> bool {
+    let port = |p: u32| (1..=65_535).contains(&p);
+    ports
+        .iter()
+        .all(|forward| port(forward.host_port) & port(forward.container_port))
+}
+
+/// A listing without its page: what a page token is bound to.
+fn without_page(request: &ListJobsRequest) -> ListJobsRequest {
+    ListJobsRequest {
+        page_size: 0,
+        page_token: String::new(),
+        ..request.clone()
+    }
+}
+
 /// Whether the job `record` matches the filters of `request` (not its page).
 fn listed(record: &Record, request: &ListJobsRequest) -> bool {
     let queued = record.times.queued_at_ms;
@@ -179,6 +222,9 @@ pub(super) struct State {
     jobs: BTreeMap<String, Record>,
     seq: u64,
     minted: u64,
+    /// Every page token given, with the listing (without its page) it continues and the
+    /// order number it continues after.
+    tokens: BTreeMap<String, (ListJobsRequest, u64)>,
 }
 
 impl State {
@@ -192,6 +238,7 @@ impl State {
             jobs: BTreeMap::new(),
             seq: 0,
             minted: 0,
+            tokens: BTreeMap::new(),
         }
     }
 
@@ -264,10 +311,19 @@ impl State {
             let checked = crate::id::check(&spec.job_id);
             checked.map_err(|bad| Status::invalid_argument(bad.to_string()))?;
         }
-        if !spec.image.contains("@sha256:") {
-            return Err(Status::invalid_argument(
+        let rules = [
+            (
+                pinned(&spec.image),
                 "the image is not pinned by digest (NAME@sha256:HEX)",
-            ));
+            ),
+            (
+                files_named(&spec.files),
+                "a file name is not valid, or is given twice",
+            ),
+            (ports_in_range(&spec.ports), "a port is not 1 to 65535"),
+        ];
+        if let Some((_, broken)) = rules.into_iter().find(|(kept, _)| !kept) {
+            return Err(Status::invalid_argument(broken));
         }
         let wall = spec.wall_limit_seconds.unwrap_or(0);
         if wall == 0 {
@@ -337,14 +393,20 @@ impl State {
     }
 
     /// `ListJobs`: the matching jobs in the order they were recorded, a page at a time. A
-    /// page token is the order number of the last job of the page before.
+    /// page token is one this fake gave (`p<n>`), bound to the filters of the listing it
+    /// continues; any other token, or one given with other filters, is `INVALID_ARGUMENT`.
     pub(super) fn list(&mut self, request: &ListJobsRequest) -> Result<ListJobsResponse, Status> {
         self.sweep();
-        let after: u64 = match request.page_token.as_str() {
+        let filter = without_page(request);
+        let after = match request.page_token.as_str() {
             "" => 0,
-            token => token.parse().map_err(|_| {
-                Status::invalid_argument("the page token is not one this service wrote")
-            })?,
+            token => match self.tokens.get(token) {
+                Some((bound, after)) if *bound == filter => *after,
+                _ => {
+                    let refused = "the page token is not one this service gave for this listing";
+                    return Err(Status::invalid_argument(refused));
+                }
+            },
         };
         let size = match request.page_size {
             0 => DEFAULT_PAGE,
@@ -358,13 +420,22 @@ impl State {
         matching.sort_by_key(|record| record.seq);
         let more = matching.len() > size;
         matching.truncate(size);
-        let last = matching.last().map(|record| record.seq.to_string());
+        let last = matching.last().map(|record| record.seq).filter(|_| more);
+        let jobs = matching
+            .into_iter()
+            .map(|record| view(record, &self.hosts))
+            .collect();
+        let next_page_token = match last {
+            Some(seq) => {
+                let token = format!("p{}", self.tokens.len() + 1);
+                self.tokens.insert(token.clone(), (filter, seq));
+                token
+            }
+            None => String::new(),
+        };
         Ok(ListJobsResponse {
-            jobs: matching
-                .into_iter()
-                .map(|record| view(record, &self.hosts))
-                .collect(),
-            next_page_token: last.filter(|_| more).unwrap_or_default(),
+            jobs,
+            next_page_token,
         })
     }
 

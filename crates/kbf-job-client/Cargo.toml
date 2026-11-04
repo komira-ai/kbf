@@ -14,6 +14,7 @@ publish.workspace = true
 # own server already builds into the tree.
 fake = [
     "dep:http-body",
+    "dep:http-body-util",
     "dep:hyper",
     "hyper/http2",
     "hyper/server",
@@ -29,9 +30,11 @@ fake = [
 bytes.workspace = true
 http.workspace = true
 http-body = { workspace = true, optional = true }
+http-body-util = { workspace = true, optional = true }
 hyper = { workspace = true, optional = true }
 hyper-util = { workspace = true, features = ["tokio"] }
 js-proto.workspace = true
+libc.workspace = true
 prost.workspace = true
 rustls.workspace = true
 thiserror.workspace = true
@@ -43,8 +46,10 @@ tonic-prost.workspace = true
 [dev-dependencies]
 kbf-job-client = { workspace = true, features = ["fake"] }
 kbf-testkit.workspace = true
+prost-types.workspace = true
 rcgen.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+rustix = { workspace = true, features = ["fs"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 
 [lints]
 workspace = true

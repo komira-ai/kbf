@@ -68,9 +68,11 @@ pub enum Fault {
     /// The call is applied, then the connection is closed before the answer: the server has
     /// acted and the client has no answer.
     LoseAnswer,
-    /// The call is read and never answered, and not applied.
+    /// The call is read and logged, never answered, and not applied.
+    /// [`FakeJobServer::hung`] tells when a call has taken it.
     Hang,
-    /// The call is answered with this status, without details, and not applied.
+    /// The call is read and logged, answered with this status without details, and not
+    /// applied.
     Status {
         /// The status's code.
         code: Code,
@@ -79,6 +81,14 @@ pub enum Fault {
     },
     /// The call is applied and answered OK with these bytes as its message.
     Answer(Bytes),
+    /// The call is applied and answered with `body` as the whole response body, as it is
+    /// (well-formed gRPC frames or not), then trailers of status `code`.
+    Raw {
+        /// The response body.
+        body: Bytes,
+        /// The `grpc-status` of the trailers.
+        code: Code,
+    },
 }
 
 /// One call the service handled, with its request as decoded.
@@ -103,6 +113,8 @@ struct Shared {
     /// Each fault, with the method it breaks (empty: any).
     faults: Mutex<VecDeque<(String, Fault)>>,
     calls: Mutex<Vec<Call>>,
+    /// Told each time a call takes a [`Fault::Hang`].
+    hung: tokio::sync::Notify,
 }
 
 impl Shared {
@@ -175,6 +187,7 @@ impl FakeJobServer {
             state: Mutex::new(State::new()),
             faults: Mutex::new(VecDeque::new()),
             calls: Mutex::new(Vec::new()),
+            hung: tokio::sync::Notify::new(),
         });
         let tls = acceptor.is_some();
         let task = tokio::spawn(http::accept_loop(listener, acceptor, Arc::clone(&shared)));
@@ -337,13 +350,20 @@ impl FakeJobServer {
         locked(&self.shared.faults).push_back((method.to_owned(), fault));
     }
 
+    /// Waits until a call has taken a [`Fault::Hang`] (at once if one has since the last
+    /// wait): the request has reached the fake and will never be answered.
+    pub async fn hung(&self) {
+        self.shared.hung.notified().await;
+    }
+
     /// The next call is applied and its answer lost: [`Fault::LoseAnswer`].
     pub fn lose_next_answer(&self) {
         self.inject(Fault::LoseAnswer);
     }
 
-    /// Every call the service handled, in arrival order, with its request as decoded. A call
-    /// refused for its token, or broken by a [`Fault`] that does not apply it, is not here.
+    /// Every call the service read, in arrival order, with its request as decoded: the calls
+    /// it handled and those a [`Fault`] answered without applying them. A call refused for its
+    /// token is not here.
     #[must_use]
     pub fn calls(&self) -> Vec<Call> {
         locked(&self.shared.calls).clone()

@@ -1,6 +1,9 @@
 use std::collections::BTreeMap;
 
-use js_proto::refusal::refusal_status;
+use bytes::Bytes;
+use js_proto::refusal::{REFUSAL_TYPE_URL, refusal_status};
+use prost::Message;
+use prost_types::Any;
 
 use super::*;
 
@@ -256,4 +259,122 @@ fn each_config_error_names_its_part() {
     for (error, text) in cases {
         assert_eq!(error.to_string(), text);
     }
+}
+
+/// The wire form of `google.rpc.Status`, as the test writes it by hand.
+#[derive(Clone, PartialEq, prost::Message)]
+struct RpcStatus {
+    #[prost(int32, tag = "1")]
+    code: i32,
+    #[prost(string, tag = "2")]
+    message: String,
+    #[prost(message, repeated, tag = "3")]
+    details: Vec<Any>,
+}
+
+/// Asserts, against a table written out here by hand (not derived from `class_of` or from the
+/// documentation), the error each of the 17 gRPC codes becomes when a status without details
+/// ends a call: a code that may have applied is `Transport(Broken::Status)` with the status
+/// kept, a definite one is `Status` with the code and message, and `may_have_applied` agrees.
+/// Catches a code moved to the wrong class in `class_of` together with its doc row, and a
+/// code that is dropped or renamed on the way into the error.
+#[test]
+fn each_grpc_code_becomes_the_error_the_table_here_says() {
+    let expected: [(Code, bool); 17] = [
+        (Code::Ok, true),
+        (Code::Cancelled, true),
+        (Code::Unknown, true),
+        (Code::InvalidArgument, false),
+        (Code::DeadlineExceeded, true),
+        (Code::NotFound, false),
+        (Code::AlreadyExists, false),
+        (Code::PermissionDenied, false),
+        (Code::ResourceExhausted, false),
+        (Code::FailedPrecondition, false),
+        (Code::Aborted, true),
+        (Code::OutOfRange, true),
+        (Code::Unimplemented, false),
+        (Code::Internal, true),
+        (Code::Unavailable, true),
+        (Code::DataLoss, true),
+        (Code::Unauthenticated, false),
+    ];
+    for (code, applied) in expected {
+        let error = from_status(Status::new(code, "m"));
+        assert_eq!(error.may_have_applied(), applied, "{code:?}: {error:?}");
+        if applied {
+            assert!(
+                matches!(&error, Error::Transport(Broken::Status(s)) if s.code() == code && s.message() == "m"),
+                "{code:?}: {error:?}"
+            );
+        } else {
+            assert!(
+                matches!(&error, Error::Status { code: c, message } if *c == code && message == "m"),
+                "{code:?}: {error:?}"
+            );
+        }
+    }
+}
+
+/// Asserts that details which are not a refusal leave the status an ordinary one, and that a
+/// refusal with a code this client does not know is still a refusal: bytes that are no
+/// `google.rpc.Status`, and a `google.rpc.Status` whose only detail is another type's `Any`,
+/// give `Status` by the status's code; a refusal detail with code 99 gives `Refused` whose
+/// raw code is 99 and whose enum reading is `Unspecified`. Catches details that fail to
+/// parse taken for a refusal or for a lost answer, a foreign detail taken for a refusal, and
+/// an unknown refusal code dropped or refused.
+#[test]
+fn details_that_are_no_known_refusal_are_read_as_they_are() {
+    let garbled = from_status(Status::with_details(
+        Code::NotFound,
+        "m",
+        Bytes::from_static(&[0x00, 0x01]),
+    ));
+    assert!(
+        matches!(&garbled, Error::Status { code: Code::NotFound, message } if message == "m"),
+        "{garbled:?}"
+    );
+    assert!(!garbled.may_have_applied());
+
+    let foreign = RpcStatus {
+        code: Code::PermissionDenied as i32,
+        message: "m".to_owned(),
+        details: vec![Any {
+            type_url: "type.googleapis.com/google.rpc.ErrorInfo".to_owned(),
+            value: vec![0x0a, 0x01, b'x'],
+        }],
+    };
+    let other = from_status(Status::with_details(
+        Code::PermissionDenied,
+        "m",
+        Bytes::from(foreign.encode_to_vec()),
+    ));
+    assert!(
+        matches!(&other, Error::Status { code: Code::PermissionDenied, message } if message == "m"),
+        "{other:?}"
+    );
+    assert!(other.refusal().is_none());
+
+    let newer = Refusal {
+        code: 99,
+        detail: "from a newer server".to_owned(),
+    };
+    let details = RpcStatus {
+        code: Code::FailedPrecondition as i32,
+        message: "from a newer server".to_owned(),
+        details: vec![Any {
+            type_url: REFUSAL_TYPE_URL.to_owned(),
+            value: newer.encode_to_vec(),
+        }],
+    };
+    let unknown = from_status(Status::with_details(
+        Code::FailedPrecondition,
+        "from a newer server",
+        Bytes::from(details.encode_to_vec()),
+    ));
+    let refusal = unknown.refusal().expect("a refusal");
+    assert_eq!(refusal.code, 99);
+    assert_eq!(refusal.code(), RefusalCode::Unspecified);
+    assert_eq!(refusal.detail, "from a newer server");
+    assert!(!unknown.may_have_applied());
 }

@@ -3,10 +3,10 @@
 
 mod support;
 
-use js_proto::v1::{JobSpec, JobState, Needs, RefusalCode};
+use js_proto::v1::{JobFile, JobSpec, JobState, Needs, NetworkLevel, PortForward, RefusalCode};
 use kbf_job_client::Error;
 use kbf_job_client::fake::Call;
-use support::{HOST, IMAGE, fake, spec, status_code, to_running};
+use support::{HOST, IMAGE, fake, full_spec, map, spec, status_code, to_running};
 
 /// A change made to a job spec.
 type Change = fn(&mut JobSpec);
@@ -123,4 +123,101 @@ async fn an_id_is_checked_before_sending_and_an_image_by_the_service() {
     let minted = server.record(spec("")).unwrap();
     assert_eq!(minted.id, "j-1");
     assert_eq!(server.jobs().len(), 1);
+}
+
+/// Asserts that every field of a fully populated job but its priority is part of its
+/// identity: under the id of a held job, a spec that differs in its image, command, args,
+/// env, needs, constraints, wall limit, network level, ports, files (their names, their
+/// contents alone, and their number) or labels, one field at a time, is `job-id-conflict`
+/// and the held job is unchanged; one that differs in its priority only is answered from the
+/// held job; and once the held job has ended the same spec answers the ended job, unchanged,
+/// and records no new job. Catches a comparison that skips a field (the second submit would
+/// be taken for a retry and its work lost) and one that compares the priority.
+#[tokio::test]
+async fn each_field_but_the_priority_is_part_of_the_job() {
+    let (server, client) = fake().await;
+    let held = client
+        .submit_job(full_spec("https://a.example/x"))
+        .await
+        .unwrap();
+    assert_eq!(held.id, "job-1");
+    let changes: [(&str, Change); 16] = [
+        ("image", |job| job.image = digest_of('f')),
+        ("command", |job| job.command = "/bin/other".to_owned()),
+        ("args", |job| job.args.push("more".to_owned())),
+        ("env", |job| {
+            job.env.insert("C_VAR".to_owned(), "3".to_owned());
+        }),
+        ("env value", |job| {
+            job.env.insert("A_VAR".to_owned(), "9".to_owned());
+        }),
+        ("needs", |job| job.needs.as_mut().unwrap().cpu_millis += 1),
+        ("constraints", |job| {
+            job.constraints.as_mut().unwrap().arch = String::new();
+        }),
+        ("wall limit", |job| job.wall_limit_seconds = Some(3601)),
+        ("network", |job| job.network = NetworkLevel::Open.into()),
+        ("ports", |job| {
+            job.ports.push(PortForward {
+                host_port: 9090,
+                container_port: 90,
+            });
+        }),
+        ("file name", |job| {
+            job.files[0].name = "other-name".to_owned()
+        }),
+        ("file contents", |job| {
+            job.files[0].contents = "https://b.example/y".to_owned();
+        }),
+        ("another file", |job| {
+            job.files.push(JobFile {
+                name: "second".to_owned(),
+                contents: String::new(),
+            });
+        }),
+        ("no file", |job| job.files.clear()),
+        ("labels", |job| {
+            job.labels.insert("extra".to_owned(), "1".to_owned());
+        }),
+        ("labels value", |job| {
+            job.labels = map(&[("team", "other"), ("kind", "test")]);
+        }),
+    ];
+    for (field, apply) in changes {
+        let mut job = full_spec("https://a.example/x");
+        apply(&mut job);
+        assert_ne!(
+            job,
+            full_spec("https://a.example/x"),
+            "{field} changed nothing"
+        );
+        let error = client.submit_job(job).await.unwrap_err();
+        assert!(error.is(RefusalCode::JobIdConflict), "{field}: {error:?}");
+        assert!(!error.may_have_applied());
+        assert_eq!(server.jobs(), std::slice::from_ref(&held), "{field}");
+    }
+
+    let mut reprioritised = full_spec("https://a.example/x");
+    reprioritised.priority = 1;
+    assert_eq!(client.submit_job(reprioritised).await.unwrap(), held);
+    assert_eq!(server.jobs(), std::slice::from_ref(&held));
+
+    to_running(&server, "job-1");
+    assert!(server.finish("job-1", 0));
+    let ended = client.get_job("job-1").await.unwrap();
+    assert_eq!(ended.state(), JobState::Succeeded);
+    let replay = client
+        .submit_job(full_spec("https://a.example/x"))
+        .await
+        .unwrap();
+    assert_eq!(replay, ended);
+    assert_eq!(server.jobs(), [ended]);
+}
+
+/// The image of the full sample with the digest made of `digit` instead.
+fn digest_of(digit: char) -> String {
+    format!(
+        "registry.example/app@sha256:{}",
+        digit.to_string().repeat(64)
+    )
 }

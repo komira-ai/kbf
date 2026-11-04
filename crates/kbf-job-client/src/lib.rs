@@ -66,4 +66,4 @@ mod id;
 
 pub use client::Client;
 pub use config::{Config, Origin, Token};
-pub use error::{BadId, Broken, ConfigError, Error, Undecodable, Unsent};
+pub use error::{BadId, Broken, ConfigError, Error, Stuck, Undecodable, Unsent};

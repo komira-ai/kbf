@@ -5,8 +5,11 @@ mod support;
 
 use std::time::Duration;
 
-use js_proto::v1::{JobState, ListJobsRequest};
-use kbf_job_client::Error;
+use bytes::Bytes;
+use js_proto::v1::{Job, JobState, ListJobsRequest, ListJobsResponse};
+use kbf_job_client::fake::{Call, FakeJobServer, Fault};
+use kbf_job_client::{Client, Error, Stuck};
+use prost::Message as _;
 use support::{HOST, fake, machine, map, spec, status_code, to_running};
 use tonic::Code;
 
@@ -263,4 +266,264 @@ async fn list_all_jobs_stops_at_the_cap() {
     let error = client.list_all_jobs(pages).await.unwrap_err();
     assert!(matches!(error, Error::TooMany(10_000)), "{error:?}");
     assert!(!error.may_have_applied());
+}
+
+/// A scripted answer of `ListJobs`: one job for each id in `ids`, and `token` to go on with.
+fn page(ids: &[String], token: &str) -> Fault {
+    let jobs = ids
+        .iter()
+        .map(|id| Job {
+            id: id.clone(),
+            ..Job::default()
+        })
+        .collect();
+    let response = ListJobsResponse {
+        jobs,
+        next_page_token: token.to_owned(),
+    };
+    Fault::Answer(Bytes::from(response.encode_to_vec()))
+}
+
+/// A scripted page of one job `id` that goes on with `token`.
+fn full(id: &str, token: &str) -> Fault {
+    page(&[id.to_owned()], token)
+}
+
+/// A scripted empty page that goes on with `token`.
+fn empty(token: &str) -> Fault {
+    page(&[], token)
+}
+
+/// Queues `pages` as the answers of the next calls of `ListJobs`, in order.
+fn script(server: &FakeJobServer, pages: impl IntoIterator<Item = Fault>) {
+    for fault in pages {
+        server.inject_on("ListJobs", fault);
+    }
+}
+
+/// How many calls of `ListJobs` the fake read.
+fn list_calls(server: &FakeJobServer) -> usize {
+    let listed = |call: &Call| matches!(call, Call::ListJobs(_));
+    server.calls().iter().filter(|call| listed(call)).count()
+}
+
+/// Asserts that a listing that follows its pages stops, with the token, when the service
+/// gives a token it gave before: a nonempty page with `t1` followed by a nonempty page with
+/// `t1` again, and a cycle `t1`, `t2`, `t1`, are each `Error::Stuck(RepeatedToken("t1"))`
+/// after exactly the pages needed to see the repeat (2 and 3 calls), and the error is not a
+/// transport error a caller would retry. Catches a listing that asks for ever, one that
+/// compares only with the previous token, and one that reports the wrong token.
+#[tokio::test]
+async fn list_all_jobs_stops_on_a_repeated_token() {
+    let (server, client) = fake().await;
+    script(&server, [full("x", "t1"), full("y", "t1")]);
+    let error = client
+        .list_all_jobs(ListJobsRequest::default())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, Error::Stuck(Stuck::RepeatedToken(token)) if token == "t1"),
+        "{error:?}"
+    );
+    assert!(!error.may_have_applied());
+    assert_eq!(list_calls(&server), 2);
+
+    let (server, client) = fake().await;
+    script(&server, [full("x", "t1"), full("y", "t2"), full("z", "t1")]);
+    let error = client
+        .list_all_jobs(ListJobsRequest::default())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, Error::Stuck(Stuck::RepeatedToken(token)) if token == "t1"),
+        "{error:?}"
+    );
+    assert_eq!(list_calls(&server), 3);
+}
+
+/// Asserts the bound on empty pages: `Client::MAX_EMPTY_PAGES` empty pages in a row, each
+/// with a fresh token, are `Stuck(EmptyPages(100))` after 100 calls; 99 empty pages then an
+/// empty page with no token are an empty listing after 100 calls; and a nonempty page resets
+/// the count, so 99 empty pages, a page of one job, two empty pages and a last page of one
+/// job are both jobs after 103 calls. Catches a bound off by one either way, a count that
+/// never resets, and a count that includes the last page.
+#[tokio::test]
+async fn list_all_jobs_bounds_the_empty_pages() {
+    let max = Client::MAX_EMPTY_PAGES;
+    assert_eq!(max, 100);
+    let token = |n: usize| format!("t{n}");
+
+    let (server, client) = fake().await;
+    script(&server, (0..max).map(|n| empty(&token(n))));
+    let error = client
+        .list_all_jobs(ListJobsRequest::default())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, Error::Stuck(Stuck::EmptyPages(100))),
+        "{error:?}"
+    );
+    assert!(!error.may_have_applied());
+    assert_eq!(list_calls(&server), 100);
+
+    let (server, client) = fake().await;
+    script(&server, (0..max - 1).map(|n| empty(&token(n))));
+    script(&server, [empty("")]);
+    let all = client
+        .list_all_jobs(ListJobsRequest::default())
+        .await
+        .unwrap();
+    assert!(all.is_empty());
+    assert_eq!(list_calls(&server), 100);
+
+    let (server, client) = fake().await;
+    script(&server, (0..max - 1).map(|n| empty(&token(n))));
+    script(&server, [full("first", &token(max))]);
+    script(&server, [empty(&token(max + 1)), empty(&token(max + 2))]);
+    script(&server, [full("last", "")]);
+    let all = client
+        .list_all_jobs(ListJobsRequest::default())
+        .await
+        .unwrap();
+    let ids: Vec<&str> = all.iter().map(|job| job.id.as_str()).collect();
+    assert_eq!(ids, ["first", "last"]);
+    assert_eq!(list_calls(&server), 103);
+}
+
+/// Asserts a filtered listing in pages of one: by label, states and queued times with
+/// `page_size` 1, `list_all_jobs` returns every match once in order, and each of the three
+/// requests the fake read carries the same states, labels, times and page size, with the
+/// page token empty, then the tokens the service gave; a listing started from a continuation
+/// token returns the rest only. Catches a follow-up page that drops the filters or the page
+/// size, and a continuation that starts again from the first page.
+#[tokio::test]
+async fn a_filtered_listing_keeps_its_filters_on_every_page() {
+    let (server, client) = fake().await;
+    let teams = [
+        ("a", "build"),
+        ("b", "build"),
+        ("c", "test"),
+        ("d", "build"),
+        ("e", "build"),
+        ("f", "build"),
+    ];
+    for (id, team) in teams {
+        let mut job = spec(id);
+        job.labels = map(&[("team", team)]);
+        client.submit_job(job).await.unwrap();
+        server.advance(Duration::from_secs(1));
+    }
+    let filter = ListJobsRequest {
+        states: vec![JobState::Queued.into()],
+        labels: map(&[("team", "build")]),
+        queued_after_ms: Some(1000),
+        queued_before_ms: Some(5000),
+        page_size: 1,
+        page_token: String::new(),
+    };
+    let ids = |jobs: Vec<Job>| -> Vec<String> { jobs.into_iter().map(|job| job.id).collect() };
+
+    let all = client.list_all_jobs(filter.clone()).await.unwrap();
+    assert_eq!(ids(all), ["b", "d", "e"]);
+    let requests: Vec<ListJobsRequest> = server
+        .calls()
+        .into_iter()
+        .filter_map(|call| match call {
+            Call::ListJobs(request) => Some(request),
+            _ => None,
+        })
+        .collect();
+    let tokens: Vec<&str> = requests.iter().map(|r| r.page_token.as_str()).collect();
+    assert_eq!(tokens, ["", "p1", "p2"]);
+    for request in &requests {
+        let same = ListJobsRequest {
+            page_token: String::new(),
+            ..request.clone()
+        };
+        assert_eq!(same, filter);
+    }
+
+    let first = client.list_jobs(filter.clone()).await.unwrap();
+    assert_eq!(first.next_page_token, "p3");
+    let rest = ListJobsRequest {
+        page_token: first.next_page_token,
+        ..filter
+    };
+    let before = list_calls(&server);
+    assert_eq!(ids(client.list_all_jobs(rest).await.unwrap()), ["d", "e"]);
+    assert_eq!(list_calls(&server) - before, 2);
+}
+
+/// Asserts that a failure on a later page is the error of the listing and not a short list:
+/// a scripted first page with a token, then `UNAVAILABLE` on the second, is
+/// `Error::Transport`, with two calls read. Catches a loop that returns the jobs collected so
+/// far when a page fails.
+#[tokio::test]
+async fn a_later_page_that_fails_fails_the_listing() {
+    let (server, client) = fake().await;
+    script(&server, [full("x", "t1")]);
+    server.inject_on(
+        "ListJobs",
+        Fault::Status {
+            code: Code::Unavailable,
+            message: "draining".to_owned(),
+        },
+    );
+    let error = client
+        .list_all_jobs(ListJobsRequest::default())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::Transport(_)), "{error:?}");
+    assert!(error.may_have_applied());
+    assert_eq!(list_calls(&server), 2);
+}
+
+/// Asserts that a page token is the service's: `p999`, written like a real token but never
+/// given, is `INVALID_ARGUMENT`; a real token given with another listing's labels is too,
+/// and with its own labels it answers the next page. Catches a fake that reads any
+/// well-formed token as a place in the list, and a token that continues a different listing.
+#[tokio::test]
+async fn a_page_token_belongs_to_its_listing() {
+    let (server, client) = fake().await;
+    for id in ["a", "b", "c"] {
+        let mut job = spec(id);
+        job.labels = map(&[("team", "build")]);
+        client.submit_job(job).await.unwrap();
+    }
+    let forged = ListJobsRequest {
+        page_token: "p999".to_owned(),
+        ..ListJobsRequest::default()
+    };
+    let error = client.list_jobs(forged).await.unwrap_err();
+    assert_eq!(status_code(&error), Code::InvalidArgument);
+
+    let build = ListJobsRequest {
+        labels: map(&[("team", "build")]),
+        page_size: 1,
+        ..ListJobsRequest::default()
+    };
+    let first = client.list_jobs(build.clone()).await.unwrap();
+    assert_eq!(first.next_page_token, "p1");
+    let other = ListJobsRequest {
+        labels: map(&[("team", "test")]),
+        page_token: first.next_page_token.clone(),
+        ..build.clone()
+    };
+    let error = client.list_jobs(other).await.unwrap_err();
+    assert_eq!(status_code(&error), Code::InvalidArgument);
+    let unfiltered = ListJobsRequest {
+        labels: map(&[]),
+        page_token: first.next_page_token.clone(),
+        ..build.clone()
+    };
+    let error = client.list_all_jobs(unfiltered).await.unwrap_err();
+    assert_eq!(status_code(&error), Code::InvalidArgument);
+
+    let own = ListJobsRequest {
+        page_token: first.next_page_token,
+        ..build
+    };
+    let second = client.list_jobs(own).await.unwrap();
+    let ids: Vec<&str> = second.jobs.iter().map(|job| job.id.as_str()).collect();
+    assert_eq!(ids, ["b"]);
 }

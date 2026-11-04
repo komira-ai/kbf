@@ -6,6 +6,7 @@
 //! flight at once. The client never retries: what a caller does after an error is
 //! [`Error::may_have_applied`]'s to say.
 
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use http::uri::PathAndQuery;
@@ -22,7 +23,7 @@ use tonic::transport::{Channel, Endpoint};
 use crate::codec::Lenient;
 use crate::config::{Config, Origin, Token};
 use crate::dial::Dial;
-use crate::error::{Broken, ConfigError, Error, Undecodable, Unsent, from_status};
+use crate::error::{Broken, ConfigError, Error, Stuck, Undecodable, Unsent, from_status};
 use crate::id;
 
 // The path of each method of `jobscheduler.v1.JobService` the client calls.
@@ -40,7 +41,8 @@ pub struct Client {
     grpc: Grpc<Channel>,
     origin: Origin,
     token: Token,
-    request_timeout: Duration,
+    /// The most a call may take: connecting, then the exchange (see [`Config::with_timeouts`]).
+    deadline: Duration,
 }
 
 impl std::fmt::Debug for Client {
@@ -60,6 +62,10 @@ impl Client {
     /// The most jobs [`Client::list_all_jobs`] collects before it stops with
     /// [`Error::TooMany`].
     pub const MAX_LISTED: usize = 10_000;
+
+    /// The most empty pages in a row, each with a next page token, that
+    /// [`Client::list_all_jobs`] follows before it stops with [`Error::Stuck`].
+    pub const MAX_EMPTY_PAGES: usize = 100;
 
     /// A client for `config`. Nothing is dialled until the first call.
     ///
@@ -87,7 +93,7 @@ impl Client {
             grpc,
             origin,
             token,
-            request_timeout,
+            deadline: connect_timeout.saturating_add(request_timeout),
         })
     }
 
@@ -140,25 +146,38 @@ impl Client {
     }
 
     /// Every job that matches `filter`, following the page tokens from the filter's own
-    /// token to the last page. It stops with [`Error::TooMany`] once more than
+    /// token to the last page; each page is asked for with the filter's states, labels,
+    /// times and page size. It stops with [`Error::TooMany`] once more than
     /// [`Client::MAX_LISTED`] jobs have come, rather than hold an unbounded listing or cut
-    /// it short without saying so.
+    /// it short without saying so, and with [`Error::Stuck`] when the service gives a page
+    /// token a second time or [`Client::MAX_EMPTY_PAGES`] empty pages in a row, rather than
+    /// ask for ever.
     ///
     /// # Errors
-    /// [`Error::TooMany`], and as [`Client::list_jobs`] for each page.
+    /// [`Error::TooMany`], [`Error::Stuck`], and as [`Client::list_jobs`] for each page.
     pub async fn list_all_jobs(&self, filter: ListJobsRequest) -> Result<Vec<Job>, Error> {
         let mut page = filter;
         let mut jobs = Vec::new();
+        let mut tokens = BTreeSet::new();
+        let mut empty = 0;
         loop {
             let answer = self.list_jobs(page.clone()).await?;
+            empty = if answer.jobs.is_empty() { empty + 1 } else { 0 };
             jobs.extend(answer.jobs);
             if jobs.len() > Self::MAX_LISTED {
                 return Err(Error::TooMany(Self::MAX_LISTED));
             }
-            if answer.next_page_token.is_empty() {
+            let next = answer.next_page_token;
+            if next.is_empty() {
                 return Ok(jobs);
             }
-            page.page_token = answer.next_page_token;
+            if empty >= Self::MAX_EMPTY_PAGES {
+                return Err(Error::Stuck(Stuck::EmptyPages(empty)));
+            }
+            if !tokens.insert(next.clone()) {
+                return Err(Error::Stuck(Stuck::RepeatedToken(next)));
+            }
+            page.page_token = next;
         }
     }
 
@@ -210,8 +229,9 @@ impl Client {
     }
 
     /// One call of the method at `path`: the request checked against the size cap, the token
-    /// put in its metadata, the whole exchange under the request timeout, and the answer
-    /// decoded.
+    /// put in its metadata, the whole call under the connect and request timeouts together,
+    /// and the answer decoded. A connection not made within the connect timeout fails in the
+    /// connector, as nothing sent, before this deadline can pass.
     async fn call<Req, Resp>(&self, path: &'static str, message: Req) -> Result<Resp, Error>
     where
         Req: Message + Send + Sync + 'static,
@@ -234,8 +254,8 @@ impl Client {
                 .map_err(|cause| Status::from_error(cause.into()))?;
             grpc.unary(request, path, Lenient::<Req, Resp>::new()).await
         };
-        match tokio::time::timeout(self.request_timeout, exchange).await {
-            Err(_) => Err(Error::Transport(Broken::Deadline(self.request_timeout))),
+        match tokio::time::timeout(self.deadline, exchange).await {
+            Err(_) => Err(Error::Transport(Broken::Deadline(self.deadline))),
             Ok(Err(status)) => Err(from_status(status)),
             Ok(Ok(answer)) => answer
                 .into_inner()

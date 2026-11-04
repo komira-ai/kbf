@@ -241,3 +241,34 @@ pub fn server_config(pki: &Pki) -> Arc<rustls::ServerConfig> {
         .unwrap();
     Arc::new(config)
 }
+
+/// The server side of `pki` for the TLS tests: speaking only `versions`, and, when
+/// `require_client_cert` is set, demanding a client certificate signed by the CA of `pki`.
+pub fn server_config_with(
+    pki: &Pki,
+    versions: &[&'static rustls::SupportedProtocolVersion],
+    require_client_cert: bool,
+) -> Arc<rustls::ServerConfig> {
+    let chain: Vec<_> = CertificateDer::pem_slice_iter(pki.chain.as_bytes())
+        .map(Result::unwrap)
+        .collect();
+    let key = PrivateKeyDer::from_pem_slice(pki.key.as_bytes()).unwrap();
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let builder = rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
+        .with_protocol_versions(versions)
+        .unwrap();
+    let builder = if require_client_cert {
+        let mut roots = rustls::RootCertStore::empty();
+        for root in CertificateDer::pem_slice_iter(pki.ca.as_bytes()) {
+            roots.add(root.unwrap()).unwrap();
+        }
+        let verifier =
+            rustls::server::WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider)
+                .build()
+                .unwrap();
+        builder.with_client_cert_verifier(verifier)
+    } else {
+        builder.with_no_client_auth()
+    };
+    Arc::new(builder.with_single_cert(chain, key).unwrap())
+}

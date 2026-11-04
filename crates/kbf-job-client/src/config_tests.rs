@@ -252,3 +252,56 @@ fn a_config_keeps_its_parts() {
     assert_eq!(config.request_timeout, Duration::from_secs(2));
     assert!(!format!("{config:?}").contains("abcdefgh"));
 }
+
+/// Asserts that a FIFO with no writer at the token path is refused at once as not a regular
+/// file, instead of blocking the open until something writes to it. Catches an open that
+/// waits, which would hang the configuration of a farm on a wrong path. (Linux only: the
+/// call that makes the FIFO, `mkfifoat`, is not offered on macOS by rustix.)
+#[cfg(target_os = "linux")]
+#[test]
+fn a_token_fifo_is_refused_without_blocking() {
+    let dir = scratch("token-fifo");
+    let fifo = dir.path().join("token");
+    let mode = rustix::fs::Mode::from_raw_mode(0o600);
+    rustix::fs::mkfifoat(rustix::fs::CWD, &fifo, mode).unwrap();
+    assert!(matches!(
+        Token::from_file(&fifo),
+        Err(ConfigError::TokenFileMode {
+            problem: "not a regular file",
+            ..
+        })
+    ));
+}
+
+/// Asserts that the token is read through the handle the checks were made on: a file opened,
+/// then replaced at its path by a file holding another token, gives the token of the file
+/// opened. Catches a read that opens the path again after the checks, which another writer
+/// could swap in between.
+#[test]
+fn the_token_is_read_through_the_handle_that_was_checked() {
+    let dir = scratch("token-handle");
+    let path = token_file(&dir, "token", 0o600, b"the-first-token\n");
+    let file = std::fs::File::open(&path).unwrap();
+    let other = token_file(&dir, "other", 0o600, b"a-second-token\n");
+    std::fs::rename(&other, &path).unwrap();
+    let token = Token::from_open(file, &path).unwrap();
+    assert_eq!(token.value().as_bytes(), b"Bearer the-first-token");
+    assert_eq!(
+        Token::from_file(&path).unwrap().value().as_bytes(),
+        b"Bearer a-second-token"
+    );
+}
+
+/// Asserts the whole `Debug` text of a config and of its origin: the origin as written,
+/// `Token(..)`, whether a CA is given (never the PEM), and the timeouts. Catches a field
+/// added to the text that would print the token or the CA.
+#[test]
+fn a_config_prints_its_origin_and_timeouts_only() {
+    let config = Config::new(origin("http://127.0.0.1:8080").unwrap(), token())
+        .with_ca_pem(b"-----BEGIN CERTIFICATE-----".to_vec());
+    assert_eq!(
+        format!("{config:?}"),
+        "Config { origin: Origin(\"http://127.0.0.1:8080/\"), token: Token(..), ca: true, \
+         connect_timeout: 5s, request_timeout: 30s }"
+    );
+}

@@ -15,6 +15,8 @@
 //! - [`Error::Status`]: any other status the table marks "definite". The server did not
 //!   act; the code says why.
 //! - [`Error::TooMany`]: a listing that follows its pages held more jobs than the cap.
+//! - [`Error::Stuck`]: a listing that follows its pages made no progress: the service gave a
+//!   page token a second time, or too many empty pages in a row.
 //!
 //! [`Error::may_have_applied`] is true for `Transport` and `Decode` only. `SubmitJob` is
 //! idempotent on the job id and `CancelJob` on the job, so after either of those the caller
@@ -105,6 +107,17 @@ pub enum Undecodable {
     Missing(&'static str),
 }
 
+/// Why a listing that follows its pages stopped without reaching the last one.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum Stuck {
+    /// The service answered a page token it had already given in this listing.
+    #[error("the service gave the page token {0:?} a second time")]
+    RepeatedToken(String),
+    /// The service answered this many empty pages in a row, each with a next page token.
+    #[error("the service gave {0} empty pages in a row, each with a next page token")]
+    EmptyPages(usize),
+}
+
 /// A call to the job service failed.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -132,6 +145,9 @@ pub enum Error {
     /// ([`Client::MAX_LISTED`](crate::Client::MAX_LISTED)).
     #[error("the listing holds more than {0} jobs")]
     TooMany(usize),
+    /// A listing that follows its pages makes no progress; the reads changed nothing.
+    #[error("the listing makes no progress: {0}")]
+    Stuck(#[source] Stuck),
 }
 
 impl Error {

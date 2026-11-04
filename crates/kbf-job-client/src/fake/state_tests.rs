@@ -1,5 +1,5 @@
 use js_proto::refusal::refusal_of;
-use js_proto::v1::{Constraints, JobFile, Needs};
+use js_proto::v1::{Constraints, JobFile, Needs, PortForward};
 use tonic::Code;
 
 use super::*;
@@ -295,10 +295,11 @@ fn a_tail_keeps_the_last_8_kib() {
     assert_eq!((logs.stderr_tail.len(), logs.truncated), (TAIL, true));
 }
 
-/// Asserts a listing's page token: a token the service did not write is
-/// `INVALID_ARGUMENT`; a page size of 0 is the default of 100; the pages follow the order the
+/// Asserts a listing's page token: a token the service did not write (a made-up word, or a
+/// plausible `p999`) and a token given with other filters than the listing that issued it
+/// are `INVALID_ARGUMENT`; a page size of 0 is the default of 100; the pages follow the order the
 /// jobs were recorded in, not their ids. Catches a listing ordered by id, which a job
-/// recorded during the listing could reorder.
+/// recorded during the listing could reorder, and a token accepted for any listing.
 #[test]
 fn a_listing_follows_the_order_of_recording() {
     let mut state = state();
@@ -310,13 +311,28 @@ fn a_listing_follows_the_order_of_recording() {
         state.list(&token).unwrap_err().code(),
         Code::InvalidArgument
     );
+    let forged = ListJobsRequest {
+        page_token: "p999".to_owned(),
+        ..ListJobsRequest::default()
+    };
+    assert_eq!(
+        state.list(&forged).unwrap_err().code(),
+        Code::InvalidArgument
+    );
     for n in (0..=DEFAULT_PAGE).rev() {
         state.submit(spec(&format!("job-{n:03}"))).unwrap();
     }
     let first = state.list(&ListJobsRequest::default()).unwrap();
     assert_eq!(first.jobs.len(), DEFAULT_PAGE);
     assert_eq!(first.jobs[0].id, "job-100");
-    assert_eq!(first.next_page_token, DEFAULT_PAGE.to_string());
+    assert_eq!(first.next_page_token, "p1");
+    let refiltered = ListJobsRequest {
+        page_token: first.next_page_token.clone(),
+        states: vec![JobState::Queued.into()],
+        ..ListJobsRequest::default()
+    };
+    let status = state.list(&refiltered).unwrap_err();
+    assert_eq!(status.code(), Code::InvalidArgument);
     let rest = ListJobsRequest {
         page_token: first.next_page_token,
         ..ListJobsRequest::default()
@@ -379,4 +395,217 @@ fn file_contents_are_kept_and_never_read_back() {
         kept.files[0].contents,
         "https://bucket.example/put?sig=secret"
     );
+}
+
+/// Asserts a job whose `constraints.exec` is a number the enum does not know (99, -1) reads
+/// as Unspecified: a container host admits it exactly as it admits an explicit Unspecified,
+/// and a container-only host still refuses `SandboxExec`. Catches an unknown exec value that
+/// matches no host, or one that is read as a specific mode.
+#[test]
+fn an_unknown_exec_number_matches_any_host() {
+    let with_exec = |id: &str, exec: i32| JobSpec {
+        constraints: Some(Constraints {
+            os: String::new(),
+            arch: String::new(),
+            exec,
+        }),
+        ..spec(id)
+    };
+    let mut state = state();
+    for (id, exec) in [
+        ("unspecified", i32::from(ExecMode::Unspecified)),
+        ("high", 99),
+        ("negative", -1),
+    ] {
+        assert!(state.submit(with_exec(id, exec)).is_ok(), "{id}");
+    }
+    let sandbox = with_exec("sandbox", ExecMode::SandboxExec.into());
+    assert_eq!(
+        refusal(state.submit(sandbox)),
+        Some(RefusalCode::NoCapableHost)
+    );
+    assert_eq!(state.jobs().len(), 3);
+}
+
+/// Asserts what a submit takes as an image, a file name and a port: an image without a
+/// digest, without a name, with 63 hex digits, in upper case or not hex, a file name that
+/// is empty, starts with a dot, holds a slash or is given twice, and a port of 0 or 65536
+/// (host or container side) are each `INVALID_ARGUMENT` with no refusal details and record
+/// nothing; ports 1 and 65535 and the name `a.b_c-1` are taken. Catches a pin check that
+/// accepts a short or upper-case digest, and a port range off by one.
+#[test]
+fn a_submit_with_a_bad_image_file_or_port_is_invalid() {
+    let file = |name: &str| JobFile {
+        name: name.to_owned(),
+        contents: String::new(),
+    };
+    let port = |host_port: u32, container_port: u32| PortForward {
+        host_port,
+        container_port,
+    };
+    let images = [
+        "registry.example/app@sha256:".to_owned(),
+        format!("@sha256:{}", "0".repeat(64)),
+        format!("registry.example/app@sha256:{}", "0".repeat(63)),
+        format!("registry.example/app@sha256:{}", "A".repeat(64)),
+        format!("registry.example/app@sha256:{}", "g".repeat(64)),
+    ];
+    let mut bad: Vec<JobSpec> = images
+        .into_iter()
+        .map(|image| JobSpec {
+            image,
+            ..spec("bad")
+        })
+        .collect();
+    for files in [
+        vec![file("")],
+        vec![file(".hidden")],
+        vec![file("a/b")],
+        vec![file("same"), file("same")],
+    ] {
+        bad.push(JobSpec {
+            files,
+            ..spec("bad")
+        });
+    }
+    for forward in [port(0, 80), port(65_536, 80), port(80, 0), port(80, 65_536)] {
+        bad.push(JobSpec {
+            ports: vec![forward],
+            ..spec("bad")
+        });
+    }
+    let mut state = state();
+    for job in bad {
+        let status = state.submit(job.clone()).unwrap_err();
+        assert_eq!(status.code(), Code::InvalidArgument, "{job:?}");
+        assert!(refusal_of(&status).is_none(), "{job:?}");
+        assert!(state.jobs().is_empty(), "{job:?}");
+    }
+    let edges = JobSpec {
+        files: vec![file("a.b_c-1")],
+        ports: vec![port(1, 65_535), port(65_535, 1)],
+        ..spec("edges")
+    };
+    assert!(state.submit(edges).is_ok());
+}
+
+/// A step a host takes on the job `j`.
+type Step = fn(&mut State) -> bool;
+
+fn place(s: &mut State) -> bool {
+    s.place("j", "h")
+}
+fn start(s: &mut State) -> bool {
+    s.start("j")
+}
+fn run(s: &mut State) -> bool {
+    s.run("j")
+}
+fn write_logs(s: &mut State) -> bool {
+    s.write_logs("j", b"o", b"e")
+}
+fn finish(s: &mut State) -> bool {
+    s.finish("j", 0)
+}
+fn finish_failing(s: &mut State) -> bool {
+    s.finish("j", 1)
+}
+fn fail_to_start(s: &mut State) -> bool {
+    s.fail_to_start("j", StartFailureCode::NoCapacity)
+}
+fn lose(s: &mut State) -> bool {
+    s.lose("j")
+}
+fn host_stopped(s: &mut State) -> bool {
+    s.host_stopped("j")
+}
+
+/// A state holding the job `j` in `want`, by the steps that reach it.
+fn job_in(want: JobState) -> State {
+    let mut s = state();
+    s.submit(spec("j")).unwrap();
+    let steps: &[Step] = match want {
+        JobState::Queued => &[],
+        JobState::Placed => &[place],
+        JobState::Starting => &[place, start],
+        JobState::Running => &[place, start, run],
+        JobState::Succeeded => &[place, start, run, finish],
+        JobState::Failed => &[place, start, run, finish_failing],
+        JobState::Lost => &[place, lose],
+        JobState::FailedToStart => &[fail_to_start],
+        JobState::Cancelled => {
+            s.cancel("j").unwrap();
+            &[]
+        }
+        JobState::Unspecified => unreachable!("a job is never in no state"),
+    };
+    for step in steps {
+        assert!(step(&mut s));
+    }
+    assert_eq!(s.get("j").unwrap().state(), want);
+    s
+}
+
+/// Asserts every step against every state: `place` is taken from Queued; `start` from
+/// Placed; `run` from Starting; `write_logs` and `finish` from Running; `fail_to_start` from
+/// Queued, Placed and Starting; `lose` from Placed, Starting and Running; `host_stopped` from
+/// those three only when a cancel was asked. Each step a state refuses answers false and
+/// leaves the whole job and its logs as they were; each step on an unknown id is false.
+/// Catches a step allowed from a state the design does not give it, and a refused step that
+/// still changes the job.
+#[test]
+fn every_step_is_allowed_from_exactly_its_states() {
+    use JobState::{Cancelled, Failed, FailedToStart, Lost, Placed, Queued, Running};
+    use JobState::{Starting, Succeeded};
+    let steps: [(&str, Step, &[JobState]); 9] = [
+        ("place", place, &[Queued]),
+        ("start", start, &[Placed]),
+        ("run", run, &[Starting]),
+        ("write_logs", write_logs, &[Running]),
+        ("finish", finish, &[Running]),
+        ("fail_to_start", fail_to_start, &[Queued, Placed, Starting]),
+        ("lose", lose, &[Placed, Starting, Running]),
+        ("host_stopped", host_stopped, &[]),
+        (
+            "host_stopped, cancel asked",
+            host_stopped,
+            &[Placed, Starting, Running],
+        ),
+    ];
+    let every = [
+        Queued,
+        Placed,
+        Starting,
+        Running,
+        Succeeded,
+        Failed,
+        Cancelled,
+        Lost,
+        FailedToStart,
+    ];
+    for (name, step, allowed) in steps {
+        let asked = name.contains("cancel asked");
+        for from in every {
+            let mut s = job_in(from);
+            if asked {
+                s.cancel("j").unwrap();
+            }
+            let (job, logs) = (s.get("j").unwrap(), s.logs("j").unwrap());
+            let taken = step(&mut s);
+            assert_eq!(taken, allowed.contains(&from), "{name} from {from:?}");
+            if !taken {
+                assert_eq!(s.get("j").unwrap(), job, "{name} from {from:?}");
+                assert_eq!(s.logs("j").unwrap(), logs, "{name} from {from:?}");
+            }
+        }
+    }
+    let mut s = state();
+    assert!(!s.place("missing", "h"));
+    assert!(!s.start("missing"));
+    assert!(!s.run("missing"));
+    assert!(!s.write_logs("missing", b"", b""));
+    assert!(!s.finish("missing", 0));
+    assert!(!s.fail_to_start("missing", StartFailureCode::NoCapacity));
+    assert!(!s.lose("missing"));
+    assert!(!s.host_stopped("missing"));
 }

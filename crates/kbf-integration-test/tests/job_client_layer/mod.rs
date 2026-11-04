@@ -3,12 +3,12 @@
 //! makes kbf a client of the job service that links none of the scheduler's server crates;
 //! this is where that starts.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::process::Command;
 
 use serde_json::Value;
 
-use super::{load_graph, normal_closure};
+use super::{Graph, load_graph, normal_closure};
 
 /// The client's package name.
 const CLIENT: &str = "kbf-job-client";
@@ -31,6 +31,21 @@ fn forbidden_js<'a>(reached: impl IntoIterator<Item = &'a str>) -> BTreeSet<&'a 
         .into_iter()
         .filter(|name| scheduler_crate(name) && !JS_ALLOWED.contains(name))
         .collect()
+}
+
+/// The chains, from `root_id`, to every crate its normal closure reaches that it may not: a
+/// scheduler crate other than `js-proto`, or any kbf crate. Sorted.
+fn violations(g: &Graph, root_id: &str) -> Vec<String> {
+    let mut found: Vec<String> = normal_closure(g, root_id)
+        .into_iter()
+        .filter(|(dep, _)| {
+            let name = g.names[dep].as_str();
+            name.starts_with("kbf-") || !forbidden_js([name]).is_empty()
+        })
+        .map(|(_, chain)| chain)
+        .collect();
+    found.sort();
+    found
 }
 
 /// Each dependency on the client among `packages` (of `cargo metadata --no-deps`), as
@@ -124,17 +139,8 @@ fn the_job_client_reaches_only_js_proto() {
         reached.contains(&"js-proto") && reached.contains(&"tonic"),
         "the walk must see js-proto and tonic, or it proves nothing: {reached:?}"
     );
-    let forbidden = forbidden_js(reached.iter().copied());
-    assert!(forbidden.is_empty(), "the job client reaches {forbidden:?}");
-    let kbf: Vec<&String> = closure
-        .iter()
-        .filter(|(dep, _)| g.names[*dep].starts_with("kbf-"))
-        .map(|(_, chain)| chain)
-        .collect();
-    assert!(
-        kbf.is_empty(),
-        "the job client reaches a kbf crate: {kbf:?}"
-    );
+    let found = violations(&g, id);
+    assert!(found.is_empty(), "the job client reaches {found:?}");
 
     let sources: BTreeSet<Option<&str>> = g
         .names
@@ -169,4 +175,44 @@ fn a_job_client_that_reaches_a_server_crate_is_named() {
         BTreeSet::from(["js-sched", "js-server-core"])
     );
     assert!(forbidden_js(["js-proto", "tonic", "prost"]).is_empty());
+}
+
+/// Asserts that the evaluator names the chain to every forbidden crate of a graph in which the
+/// client reaches a kbf crate through `tonic` and `js-sched` directly, and nothing for the
+/// allowed `js-proto` and `prost`. Catches an evaluator that stops at the first hit or skips
+/// kbf crates.
+#[test]
+fn a_graph_that_reaches_kbf_and_scheduler_crates_names_both_chains() {
+    let ids = [
+        ("c", "kbf-job-client"),
+        ("t", "tonic"),
+        ("k", "kbf-types"),
+        ("s", "js-sched"),
+        ("p", "js-proto"),
+        ("r", "prost"),
+    ];
+    let g = Graph {
+        names: ids
+            .iter()
+            .map(|(id, name)| ((*id).to_owned(), (*name).to_owned()))
+            .collect(),
+        sources: ids.iter().map(|(id, _)| ((*id).to_owned(), None)).collect(),
+        normal: [
+            ("c", vec!["t", "s", "p"]),
+            ("t", vec!["k", "r"]),
+            ("p", vec!["r"]),
+        ]
+        .into_iter()
+        .map(|(id, deps)| (id.to_owned(), deps.into_iter().map(str::to_owned).collect()))
+        .collect(),
+        members: BTreeMap::new(),
+    };
+    assert_eq!(
+        violations(&g, "c"),
+        [
+            "kbf-job-client -> js-sched",
+            "kbf-job-client -> tonic -> kbf-types"
+        ]
+    );
+    assert!(violations(&g, "p").is_empty());
 }

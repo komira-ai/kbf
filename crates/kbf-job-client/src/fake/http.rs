@@ -13,21 +13,27 @@ use bytes::{BufMut as _, Bytes, BytesMut};
 use http::header::{AUTHORIZATION, CONTENT_TYPE};
 use http::{HeaderMap, HeaderValue};
 use http_body::Frame;
+use http_body_util::BodyExt as _;
 use hyper::body::Incoming;
 use hyper::server::conn::http2;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::service::TowerToHyperService;
 use js_proto::v1::job_service_server::JobServiceServer;
+use js_proto::v1::{
+    CancelJobRequest, GetJobRequest, GetLogsRequest, GetResultRequest, ListJobsRequest,
+    SubmitJobRequest,
+};
+use prost::Message as _;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
-use tonic::Status;
 use tonic::body::Body;
+use tonic::{Code, Status};
 
 use super::service::Service;
-use super::{Fault, Shared, TOKEN};
+use super::{Call, Fault, Shared, TOKEN};
 
 /// A connection, over TLS or not.
 trait Conn: AsyncRead + AsyncWrite + Send + Unpin {}
@@ -129,35 +135,79 @@ impl tonic::codegen::Service<http::Request<Incoming>> for Gate {
             }
             let path = request.uri().path();
             let method = path.rsplit('/').next().unwrap_or_default().to_owned();
+            let mut applied = |request: http::Request<Incoming>| {
+                tonic::codegen::Service::call(&mut inner, request)
+            };
             match shared.fault_for(&method) {
-                None => tonic::codegen::Service::call(&mut inner, request).await,
-                Some(Fault::Hang) => std::future::pending().await,
-                Some(Fault::Status { code, message }) => Ok(Status::new(code, message).into_http()),
+                None => applied(request).await,
+                Some(Fault::Hang) => {
+                    record_unapplied(&shared, &method, request).await;
+                    shared.hung.notify_one();
+                    std::future::pending().await
+                }
+                Some(Fault::Status { code, message }) => {
+                    record_unapplied(&shared, &method, request).await;
+                    Ok(Status::new(code, message).into_http())
+                }
                 Some(Fault::LoseAnswer) => {
-                    let _applied = tonic::codegen::Service::call(&mut inner, request).await;
+                    let _answer = applied(request).await;
                     lose.notify_one();
                     std::future::pending().await
                 }
                 Some(Fault::Answer(message)) => {
-                    let _applied = tonic::codegen::Service::call(&mut inner, request).await;
-                    Ok(answer(&message))
+                    let _answer = applied(request).await;
+                    Ok(raw(frame(&message), Code::Ok))
+                }
+                Some(Fault::Raw { body, code }) => {
+                    let _answer = applied(request).await;
+                    Ok(raw(body, code))
                 }
             }
         })
     }
 }
 
-/// An OK answer whose one message is `message`, as gRPC frames it: a flag byte (not
-/// compressed), the length in four bytes, the bytes; then the trailers with status 0.
-fn answer(message: &[u8]) -> http::Response<Body> {
+/// Reads the request of a call a fault answers without applying it, and logs it as the
+/// service would have; a body that is not one message of `method` is not logged.
+async fn record_unapplied(shared: &Shared, method: &str, request: http::Request<Incoming>) {
+    let body = request.into_body().collect().await;
+    let body = body.map(|whole| whole.to_bytes()).unwrap_or_default();
+    let message = body.get(5..).unwrap_or_default();
+    if let Some(call) = decode_call(method, message) {
+        shared.record(call);
+    }
+}
+
+/// The call `method` with `message` as its request, decoded.
+fn decode_call(method: &str, message: &[u8]) -> Option<Call> {
+    let call = match method {
+        "SubmitJob" => Call::SubmitJob(Box::new(SubmitJobRequest::decode(message).ok()?)),
+        "GetJob" => Call::GetJob(GetJobRequest::decode(message).ok()?),
+        "ListJobs" => Call::ListJobs(ListJobsRequest::decode(message).ok()?),
+        "CancelJob" => Call::CancelJob(CancelJobRequest::decode(message).ok()?),
+        "GetResult" => Call::GetResult(GetResultRequest::decode(message).ok()?),
+        "GetLogs" => Call::GetLogs(GetLogsRequest::decode(message).ok()?),
+        _ => return None,
+    };
+    Some(call)
+}
+
+/// `message` as gRPC frames one message: a flag byte (not compressed), the length in four
+/// bytes, the bytes.
+fn frame(message: &[u8]) -> Bytes {
     let mut frame = BytesMut::with_capacity(5 + message.len());
     frame.put_u8(0);
     frame.put_u32(message.len() as u32);
     frame.put_slice(message);
+    frame.freeze()
+}
+
+/// An answer whose body is `body` as it is, then the trailers with status `code`.
+fn raw(body: Bytes, code: Code) -> http::Response<Body> {
     let mut trailers = HeaderMap::new();
-    trailers.insert("grpc-status", HeaderValue::from_static("0"));
+    trailers.insert("grpc-status", HeaderValue::from(i32::from(code)));
     let frames = Frames(VecDeque::from([
-        Frame::data(frame.freeze()),
+        Frame::data(body),
         Frame::trailers(trailers),
     ]));
     let mut response = http::Response::new(Body::new(frames));
