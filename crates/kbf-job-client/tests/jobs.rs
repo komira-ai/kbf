@@ -526,4 +526,6 @@ async fn a_page_token_belongs_to_its_listing() {
     let second = client.list_jobs(own).await.unwrap();
     let ids: Vec<&str> = second.jobs.iter().map(|job| job.id.as_str()).collect();
     assert_eq!(ids, ["b"]);
+    let held: Vec<String> = server.jobs().into_iter().map(|job| job.id).collect();
+    assert_eq!(held, ["a", "b", "c"], "a refused listing changes no job");
 }
