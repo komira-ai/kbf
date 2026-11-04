@@ -81,8 +81,8 @@ hyper-util = { version = "0.1.21", default-features = false }
 # The scheduler libraries moved to the jobscheduler repository (https://github.com/komira-ai/jobscheduler).
 # Every `js-*` crate is taken from this one repository at this one revision, so a type
 # (a lease id, say) is the same type in every kbf crate; a test in kbf-integration-test
-# reads Cargo.lock and refuses a second source. The revision is raised by a pull request
-# of its own that runs the whole CI, never along with other changes.
+# reads Cargo.lock and refuses a second source. The revision is raised by a commit of its
+# own, holding only the raise and the fixes it forces, and the whole CI runs on it.
 js-agent-usage = { git = "https://github.com/komira-ai/jobscheduler", rev = "e73a5af2ec9ab54e2aeb131c1d8a4a6879a8abb5" }
 js-caps = { git = "https://github.com/komira-ai/jobscheduler", rev = "e73a5af2ec9ab54e2aeb131c1d8a4a6879a8abb5" }
 js-proto = { git = "https://github.com/komira-ai/jobscheduler", rev = "e73a5af2ec9ab54e2aeb131c1d8a4a6879a8abb5" }

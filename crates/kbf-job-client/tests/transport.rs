@@ -14,7 +14,7 @@ use support::{fake, pki, server_config, spec, status_code};
 use tonic::Code;
 
 /// A request timeout the fake's [`Fault::Hang`] is sure to outlast: it never answers.
-const SHORT: Duration = Duration::from_millis(300);
+const SHORT: Duration = Duration::from_secs(1);
 
 /// The four calls whose errors a caller acts on.
 const METHODS: [&str; 4] = ["SubmitJob", "CancelJob", "GetJob", "GetResult"];
@@ -61,6 +61,12 @@ fn token() -> Token {
 async fn a_transport_error_is_marked_may_have_applied() {
     let (server, client) = fake().await;
     let impatient = support::client_with_deadline(&server, SHORT);
+    // The connection is made outside any deadline below: each `Hang` then reaches the fake
+    // on a connection already open, and only an answer that never comes ends the call.
+    assert_eq!(
+        status_code(&impatient.get_job("warm").await.unwrap_err()),
+        Code::NotFound
+    );
     for method in METHODS {
         server.lose_next_answer();
         let lost = call(&client, method).await.unwrap_err();

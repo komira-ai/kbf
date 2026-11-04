@@ -104,8 +104,8 @@ async fn plain_http_is_refused_off_loopback_and_https_needs_the_pinned_ca() {
         "http://127.0.0.1.example.com:1",
         "http://0.0.0.0:1",
         "http://jobs.example",
-        "http://[fd00::1]:1",
-        "http://10.0.0.1:1",
+        "http://[2001:db8::1]:1",
+        "http://192.0.2.1:1",
     ] {
         assert!(
             matches!(origin(text), Err(ConfigError::PlainHttp(_))),

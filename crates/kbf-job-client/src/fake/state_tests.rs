@@ -244,6 +244,12 @@ fn each_end_has_its_state_and_reason() {
         assert!(!state.get(id).unwrap().cancel_requested);
     }
     state.submit(spec("never")).unwrap();
+    let queued = state.result("never").unwrap_err();
+    assert_eq!(
+        queued.code(),
+        Code::FailedPrecondition,
+        "a queued job has no result"
+    );
     assert!(state.fail_to_start("never", StartFailureCode::NoCapacity));
     let job = state.get("never").unwrap();
     assert_eq!(job.start_failure(), StartFailureCode::NoCapacity);

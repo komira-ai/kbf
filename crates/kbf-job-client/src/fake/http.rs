@@ -30,40 +30,39 @@ use tonic::codegen::Service as _;
 use super::service::Service;
 use super::{Fault, Shared, TOKEN};
 
-/// Accepts connections until the fake drops (which aborts this task, and with it every
-/// connection in `connections`).
+/// A connection, over TLS or not.
+trait Conn: AsyncRead + AsyncWrite + Send + Unpin {}
+
+impl<T: AsyncRead + AsyncWrite + Send + Unpin> Conn for T {}
+
+/// Accepts connections until the fake drops, which aborts this task and with it every
+/// connection in `connections`, or until accepting fails. A connection that ended stays in
+/// the set until then; a fake lives for one test.
 pub(super) async fn accept_loop(
     listener: TcpListener,
     acceptor: Option<TlsAcceptor>,
     shared: Arc<Shared>,
 ) {
     let mut connections = JoinSet::new();
-    loop {
-        while connections.try_join_next().is_some() {}
-        let Ok((tcp, _)) = listener.accept().await else {
-            continue;
-        };
+    while let Ok((tcp, _)) = listener.accept().await {
         let acceptor = acceptor.clone();
         let shared = Arc::clone(&shared);
         connections.spawn(async move {
-            match acceptor {
-                Some(acceptor) => {
-                    // A client that does not trust the certificate ends the handshake.
-                    if let Ok(tls) = acceptor.accept(tcp).await {
-                        serve(tls, shared).await;
-                    }
-                }
-                None => serve(tcp, shared).await,
-            }
+            let io: Box<dyn Conn> = match acceptor {
+                // A client that does not trust the certificate ends the handshake.
+                Some(acceptor) => match acceptor.accept(tcp).await {
+                    Ok(tls) => Box::new(tls),
+                    Err(_) => return,
+                },
+                None => Box::new(tcp),
+            };
+            serve(io, shared).await;
         });
     }
 }
 
 /// Serves one connection until it closes, or until a [`Fault::LoseAnswer`] drops it.
-async fn serve<Io>(io: Io, shared: Arc<Shared>)
-where
-    Io: AsyncRead + AsyncWrite + Send + Unpin + 'static,
-{
+async fn serve(io: Box<dyn Conn>, shared: Arc<Shared>) {
     let lose = Arc::new(Notify::new());
     let gate = Gate {
         inner: JobServiceServer::new(Service {

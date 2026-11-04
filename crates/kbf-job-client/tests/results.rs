@@ -65,14 +65,16 @@ async fn a_result_is_kept_for_the_window_then_not_found() {
     );
 }
 
-/// Asserts what a live job answers: `get_result` of a running job is a definite
-/// `FAILED_PRECONDITION`, not `NOT_FOUND`; `get_logs` of it answers the tail so far, each
+/// Asserts what a live job answers: `get_result` of a queued and of a running job is a
+/// definite `FAILED_PRECONDITION`, not `NOT_FOUND`; `get_logs` of a running job answers the tail so far, each
 /// stream cut to its last 8 KiB and marked truncated once cut. Catches a running job's logs
 /// refused, a tail that keeps the head, and a missing result taken for a missing job.
 #[tokio::test]
 async fn a_live_job_has_logs_and_no_result() {
     let (server, client) = fake().await;
     client.submit_job(spec("live")).await.unwrap();
+    let queued = client.get_result("live").await.unwrap_err();
+    assert_eq!(status_code(&queued), Code::FailedPrecondition);
     to_running(&server, "live");
 
     let early = client.get_result("live").await.unwrap_err();
@@ -108,4 +110,36 @@ async fn a_live_job_has_logs_and_no_result() {
     assert!(logs.stdout_tail.ends_with(b"xxEND"));
     assert!(logs.truncated);
     assert_eq!(logs.stderr_tail, b"warn\n");
+}
+
+/// Asserts a job that fails to start: from queued, placed and starting it ends failed to
+/// start with the code the fake was given, its result has no exit code and no reason, and a
+/// running job cannot fail to start. Catches a start failure that loses its code or reads as
+/// an exit.
+#[tokio::test]
+async fn a_start_failure_keeps_its_code() {
+    let (server, client) = fake().await;
+    for id in ["queued", "placed", "starting", "running"] {
+        client.submit_job(spec(id)).await.unwrap();
+    }
+    assert!(server.place("placed", support::HOST));
+    assert!(server.place("starting", support::HOST) && server.start("starting"));
+    to_running(&server, "running");
+    let code = js_proto::v1::StartFailureCode::StartTimeout;
+    for id in ["queued", "placed", "starting"] {
+        assert!(server.fail_to_start(id, code), "{id}");
+        let job = client.get_job(id).await.unwrap();
+        assert_eq!(
+            (job.state(), job.start_failure()),
+            (JobState::FailedToStart, code),
+            "{id}"
+        );
+        let result = client.get_result(id).await.unwrap();
+        assert_eq!(
+            (result.exit_code, result.reason()),
+            (None, ResultReason::Unspecified),
+            "{id}"
+        );
+    }
+    assert!(!server.fail_to_start("running", code));
 }
