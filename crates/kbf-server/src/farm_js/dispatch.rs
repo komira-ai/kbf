@@ -92,7 +92,7 @@ pub fn resize(
 }
 
 /// The refusal of a request the core did not queue, as the front is told it.
-fn unavailable(not_queued: NotQueued) -> Status {
+pub(super) fn unavailable(not_queued: NotQueued) -> Status {
     match not_queued {
         NotQueued::Fenced => {
             Status::unavailable("this frontend is handing its work to its successor")

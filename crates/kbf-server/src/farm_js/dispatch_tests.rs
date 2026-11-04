@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use js_server_core::Beat;
+use js_server_core::{Beat, NotQueued};
 use kbf_front::{Cache, Stage, Submission};
 use kbf_proto::worker::{self, ResultAckReason, server_message};
 use kbf_sched::Request;
@@ -583,4 +583,44 @@ async fn a_submit_reports_the_time_it_waited_for_the_lock() {
     assert_eq!(waits(), 1);
     rig.core.tick(at(0)).await;
     assert_eq!(waits(), 1);
+}
+
+/// Asserts that each way the core can leave a request unqueued is told to the front with its
+/// own code and message: UNAVAILABLE for a fenced core, a store that did not take the request
+/// and a finishing run, and FAILED_PRECONDITION for a superseded scheduler and a pinned probe.
+/// Catches a refusal told with another code, or two refusals sharing one message.
+#[test]
+fn each_unqueued_request_is_told_with_its_code_and_message() {
+    let cases = [
+        (
+            NotQueued::Fenced,
+            Code::Unavailable,
+            "this frontend is handing its work to its successor",
+        ),
+        (
+            NotQueued::Unavailable,
+            Code::Unavailable,
+            "the scheduler's state store did not take the request",
+        ),
+        (
+            NotQueued::Finishing,
+            Code::Unavailable,
+            "the action's previous run is finishing; the request is not queued",
+        ),
+        (
+            NotQueued::Superseded,
+            Code::FailedPrecondition,
+            "this scheduler was superseded by a newer writer of the state store",
+        ),
+        (
+            NotQueued::Probe,
+            Code::FailedPrecondition,
+            "this scheduler queues no probe pinned to a host",
+        ),
+    ];
+    for (not_queued, code, message) in cases {
+        let status = dispatch::unavailable(not_queued);
+        assert_eq!(status.code(), code, "{not_queued:?}");
+        assert_eq!(status.message(), message, "{not_queued:?}");
+    }
 }
