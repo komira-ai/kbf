@@ -81,6 +81,7 @@ pub(super) fn request(tag: u8) -> Request {
         hermetic: true,
         do_not_cache: false,
         whole_worker: false,
+        pin: None,
         needs: kbf_caps::Request::from_platform([("OSFamily", "linux")]).expect("a platform"),
     }
 }

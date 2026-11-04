@@ -1,0 +1,277 @@
+//! Where the client dials, what it presents, and which CA it trusts.
+//!
+//! [`Origin`] and [`Token`] are the lease client's (`kbf-lease-client`), copied: that crate
+//! goes away when the farm stops leasing hosts, and a crate shared by the two for that time
+//! would be more than the copy. The token here is a gRPC metadata value, not an HTTP header.
+
+use std::io::Read as _;
+use std::net::IpAddr;
+use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+use std::path::Path;
+use std::str::FromStr;
+use std::time::Duration;
+
+use http::uri::Uri;
+use tonic::metadata::{Ascii, MetadataValue};
+
+use crate::error::ConfigError;
+
+/// The most a token file may hold, in bytes. This only keeps a wrong file from being read
+/// whole.
+const MAX_TOKEN_FILE: u64 = 4096;
+
+/// The job service's address: a scheme, a host and a port, and nothing else. The token is
+/// sent only here.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Origin {
+    tls: bool,
+    /// The host as dialled and as TLS names it: a DNS name or an IP, without brackets.
+    host: String,
+    port: u16,
+    /// The authority as written: the host (with brackets for IPv6) and the port if given.
+    authority: String,
+    /// The origin as written, which each request names as its scheme and authority.
+    uri: Uri,
+    /// The same authority under `http`: the address tonic's channel is given, since the
+    /// connector does TLS itself (tonic would add its own TLS to an `https` endpoint).
+    endpoint: Uri,
+}
+
+impl Origin {
+    /// Whether the origin is `https`.
+    #[must_use]
+    pub fn is_tls(&self) -> bool {
+        self.tls
+    }
+
+    pub(crate) fn host(&self) -> &str {
+        &self.host
+    }
+
+    pub(crate) fn port(&self) -> u16 {
+        self.port
+    }
+
+    pub(crate) fn authority(&self) -> &str {
+        &self.authority
+    }
+
+    pub(crate) fn uri(&self) -> &Uri {
+        &self.uri
+    }
+
+    pub(crate) fn endpoint(&self) -> &Uri {
+        &self.endpoint
+    }
+}
+
+/// Prints the origin as written: `Origin("https://jobs.example:8443/")`.
+impl std::fmt::Debug for Origin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Origin")
+            .field(&self.uri.to_string())
+            .finish()
+    }
+}
+
+impl FromStr for Origin {
+    type Err = ConfigError;
+
+    /// Reads `http://host[:port]` or `https://host[:port]`, with an optional trailing `/`.
+    /// A path, query, user name or any other scheme is refused, and so is `http` for a host
+    /// that is not loopback: the token would cross the network in clear.
+    fn from_str(text: &str) -> Result<Self, ConfigError> {
+        let refuse = |reason| ConfigError::Origin {
+            origin: text.to_owned(),
+            reason,
+        };
+        let uri: Uri = text.parse().map_err(|_| refuse("not a URI"))?;
+        let tls = match uri.scheme_str() {
+            Some("https") => true,
+            Some("http") => false,
+            _ => return Err(refuse("the scheme must be http or https")),
+        };
+        let authority = uri.authority().ok_or_else(|| refuse("no host"))?;
+        if authority.as_str().contains('@') {
+            return Err(refuse("a user name or password has no place in an origin"));
+        }
+        if uri.query().is_some() || uri.path() != "/" {
+            return Err(refuse("an origin has no path or query"));
+        }
+        let host = authority
+            .host()
+            .trim_start_matches('[')
+            .trim_end_matches(']');
+        let loopback =
+            host == "localhost" || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback());
+        if !tls && !loopback {
+            return Err(ConfigError::PlainHttp(text.to_owned()));
+        }
+        // `Authority::port` reads a port that does not fit a u16 as no port at all.
+        let after_host = authority.as_str().strip_prefix(authority.host());
+        let port = match after_host.and_then(|rest| rest.strip_prefix(':')) {
+            Some(digits) => digits
+                .parse()
+                .map_err(|_| refuse("the port is not a number below 65536"))?,
+            None if tls => 443,
+            None => 80,
+        };
+        let endpoint: Uri = format!("http://{authority}")
+            .parse()
+            .map_err(|_| refuse("not a URI"))?;
+        Ok(Self {
+            tls,
+            host: host.to_owned(),
+            port,
+            authority: authority.as_str().to_owned(),
+            uri: uri.clone(),
+            endpoint,
+        })
+    }
+}
+
+/// The bearer token. It prints as `Token(..)` and goes into the `authorization` metadata of
+/// every call, marked sensitive so the HTTP/2 stack does not log it.
+#[derive(Clone)]
+pub struct Token(MetadataValue<Ascii>);
+
+impl std::fmt::Debug for Token {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Token(..)")
+    }
+}
+
+impl Token {
+    /// A token from its text: one or more printable ASCII characters, no space.
+    ///
+    /// # Errors
+    /// The text is empty or holds a byte outside `!` to `~`.
+    pub fn new(secret: &str) -> Result<Self, ConfigError> {
+        let printable =
+            !secret.is_empty() && secret.bytes().all(|byte| (0x21..=0x7e).contains(&byte));
+        let value = printable.then(|| MetadataValue::try_from(format!("Bearer {secret}")).ok());
+        let mut value = value.flatten().ok_or(ConfigError::BadToken(
+            "empty, or not printable ASCII without spaces",
+        ))?;
+        value.set_sensitive(true);
+        Ok(Self(value))
+    }
+
+    /// Reads the token from a file only its owner can use (mode 0600 or 0400). One trailing
+    /// newline is dropped. The file is opened without blocking, so a FIFO or a device is
+    /// refused as not a regular file instead of waiting for a writer.
+    ///
+    /// # Errors
+    /// The file cannot be read, is not a regular file, has a mode other than 0600 or 0400
+    /// (the file's owner is not checked), is over 4 KiB, or holds something that is not a token.
+    pub fn from_file(path: &Path) -> Result<Self, ConfigError> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+            .map_err(|source| ConfigError::TokenFile {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        Self::from_open(file, path)
+    }
+
+    /// Checks and reads the token through `file`, the one handle `path` was opened as, so the
+    /// file cannot change between the checks and the read; `path` only names it in errors.
+    pub(crate) fn from_open(file: std::fs::File, path: &Path) -> Result<Self, ConfigError> {
+        let file_error = |source| ConfigError::TokenFile {
+            path: path.to_path_buf(),
+            source,
+        };
+        let mode_error = |problem| ConfigError::TokenFileMode {
+            path: path.to_path_buf(),
+            problem,
+        };
+        let meta = file.metadata().map_err(file_error)?;
+        if !meta.is_file() {
+            return Err(mode_error("not a regular file"));
+        }
+        if !matches!(meta.permissions().mode() & 0o777, 0o600 | 0o400) {
+            return Err(mode_error("mode is not 0600 or 0400"));
+        }
+        let mut text = String::new();
+        let read = file.take(MAX_TOKEN_FILE + 1).read_to_string(&mut text);
+        read.map_err(file_error)?;
+        if text.len() as u64 > MAX_TOKEN_FILE {
+            return Err(mode_error("over 4 KiB"));
+        }
+        let secret = text.strip_suffix('\n').unwrap_or(&text);
+        Self::new(secret)
+    }
+
+    pub(crate) fn value(&self) -> &MetadataValue<Ascii> {
+        &self.0
+    }
+}
+
+/// How to reach one job service. Its `Debug` shows the origin, `Token(..)`, whether a CA is
+/// given and the timeouts.
+#[derive(Clone)]
+pub struct Config {
+    pub(crate) origin: Origin,
+    pub(crate) token: Token,
+    pub(crate) ca_pem: Option<Vec<u8>>,
+    pub(crate) connect_timeout: Duration,
+    pub(crate) request_timeout: Duration,
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("origin", &self.origin)
+            .field("token", &self.token)
+            .field("ca", &self.ca_pem.is_some())
+            .field("connect_timeout", &self.connect_timeout)
+            .field("request_timeout", &self.request_timeout)
+            .finish()
+    }
+}
+
+impl Config {
+    /// The connect timeout of [`Config::new`].
+    pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+    /// The request timeout of [`Config::new`].
+    pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// A config for `origin` and `token`, with the default timeouts and no CA.
+    #[must_use]
+    pub fn new(origin: Origin, token: Token) -> Self {
+        Self {
+            origin,
+            token,
+            ca_pem: None,
+            connect_timeout: Self::CONNECT_TIMEOUT,
+            request_timeout: Self::REQUEST_TIMEOUT,
+        }
+    }
+
+    /// The CA certificate (PEM) that signed the server's certificate. It is the only trust
+    /// anchor: no system roots are consulted. An `https` origin needs it; an `http` one
+    /// refuses it.
+    #[must_use]
+    pub fn with_ca_pem(mut self, pem: Vec<u8>) -> Self {
+        self.ca_pem = Some(pem);
+        self
+    }
+
+    /// How long connecting (TCP and the TLS handshake) may take, and then how long the
+    /// exchange may take. A call ends within the two together: a connection that is not made
+    /// within `connect` is [`Error::Unreachable`](crate::Error::Unreachable), nothing sent,
+    /// whatever `request` is; a call that is not answered by `connect + request` is
+    /// [`Error::Transport`](crate::Error::Transport).
+    #[must_use]
+    pub fn with_timeouts(mut self, connect: Duration, request: Duration) -> Self {
+        self.connect_timeout = connect;
+        self.request_timeout = request;
+        self
+    }
+}
+
+#[cfg(test)]
+#[path = "config_tests.rs"]
+mod tests;

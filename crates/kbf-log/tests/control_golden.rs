@@ -45,6 +45,7 @@ fn request(qos: Qos, kind: LeaseKind) -> Request {
         hermetic: true,
         do_not_cache: true,
         whole_worker: false,
+        pin: None,
     }
 }
 

@@ -1,0 +1,55 @@
+[package]
+name = "kbf-job-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+# `fake`: `fake::FakeJobServer`, an in-process job service on loopback that keeps the
+# service's rules, for other crates' tests (and this one's, through the dev-dependency on
+# itself). It serves the generated `JobService` over hyper's HTTP/2 server, which tonic's
+# own server already builds into the tree.
+fake = [
+    "dep:http-body",
+    "dep:http-body-util",
+    "dep:hyper",
+    "hyper/http2",
+    "hyper/server",
+    "hyper-util/service",
+    "tokio/macros",
+    "tokio/sync",
+]
+
+# A typed gRPC client of the job service (see the crate documentation), over the messages
+# js-proto generates. No farm crate depends on it yet. The connection is tonic's channel
+# over a connector of this crate: TCP, then TLS with tokio-rustls pinned to one CA.
+[dependencies]
+bytes.workspace = true
+http.workspace = true
+http-body = { workspace = true, optional = true }
+http-body-util = { workspace = true, optional = true }
+hyper = { workspace = true, optional = true }
+hyper-util = { workspace = true, features = ["tokio"] }
+js-proto.workspace = true
+libc.workspace = true
+prost.workspace = true
+rustls.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["net", "rt", "time"] }
+tokio-rustls.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
+
+[dev-dependencies]
+kbf-job-client = { workspace = true, features = ["fake"] }
+kbf-testkit.workspace = true
+prost-types.workspace = true
+rcgen.workspace = true
+rustix = { workspace = true, features = ["fs"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+
+[lints]
+workspace = true

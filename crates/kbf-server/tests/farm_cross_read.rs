@@ -267,6 +267,7 @@ fn request(tag: u8, memory_gib: u64, do_not_cache: bool) -> Request {
         do_not_cache,
         needs: kbf_caps::Request::from_platform([("OSFamily", "linux")]).expect("a platform"),
         whole_worker: false,
+        pin: None,
     }
 }
 

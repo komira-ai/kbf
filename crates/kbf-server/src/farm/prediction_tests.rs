@@ -110,6 +110,7 @@ impl Job {
             do_not_cache: false,
             needs: kbf_caps::Request::from_platform(self.platform.iter().copied()).unwrap(),
             whole_worker: false,
+            pin: None,
         };
         let arguments = if self.bare {
             Vec::new()
@@ -662,6 +663,7 @@ fn a_stored_operation_that_cannot_be_named_is_counted_and_gets_no_prediction() {
                     do_not_cache: false,
                     needs: needs.clone(),
                     whole_worker: false,
+                    pin: None,
                 },
                 lease: None,
                 losses: 0,

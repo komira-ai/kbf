@@ -217,6 +217,7 @@ async fn an_action_runs_end_to_end_through_the_flags_and_the_frontends_own_seams
                 do_not_cache: false,
                 needs: kbf_caps::Request::default(),
                 whole_worker: false,
+                pin: None,
             },
             call: None,
             described: Described {

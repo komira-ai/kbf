@@ -81,20 +81,21 @@ hyper-util = { version = "0.1.21", default-features = false }
 # The scheduler libraries moved to the jobscheduler repository (https://github.com/komira-ai/jobscheduler).
 # Every `js-*` crate is taken from this one repository at this one revision, so a type
 # (a lease id, say) is the same type in every kbf crate; a test in kbf-integration-test
-# reads Cargo.lock and refuses a second source. The revision is raised by a pull request
-# of its own that runs the whole CI, never along with other changes.
-js-agent-usage = { git = "https://github.com/komira-ai/jobscheduler", rev = "f8fc1148c58879b055e44341de722b112c77f694" }
-js-caps = { git = "https://github.com/komira-ai/jobscheduler", rev = "f8fc1148c58879b055e44341de722b112c77f694" }
-js-sched = { git = "https://github.com/komira-ai/jobscheduler", rev = "f8fc1148c58879b055e44341de722b112c77f694" }
-js-server-core = { git = "https://github.com/komira-ai/jobscheduler", rev = "f8fc1148c58879b055e44341de722b112c77f694" }
-js-sim = { git = "https://github.com/komira-ai/jobscheduler", rev = "f8fc1148c58879b055e44341de722b112c77f694" }
-js-sizing = { git = "https://github.com/komira-ai/jobscheduler", rev = "f8fc1148c58879b055e44341de722b112c77f694" }
-js-state = { git = "https://github.com/komira-ai/jobscheduler", rev = "f8fc1148c58879b055e44341de722b112c77f694" }
-js-store = { git = "https://github.com/komira-ai/jobscheduler", rev = "f8fc1148c58879b055e44341de722b112c77f694" }
-js-testkit = { git = "https://github.com/komira-ai/jobscheduler", rev = "f8fc1148c58879b055e44341de722b112c77f694" }
-js-types = { git = "https://github.com/komira-ai/jobscheduler", rev = "f8fc1148c58879b055e44341de722b112c77f694" }
-js-usage = { git = "https://github.com/komira-ai/jobscheduler", rev = "f8fc1148c58879b055e44341de722b112c77f694" }
-js-whole = { git = "https://github.com/komira-ai/jobscheduler", rev = "f8fc1148c58879b055e44341de722b112c77f694" }
+# reads Cargo.lock and refuses a second source. The revision is raised by a commit of its
+# own, holding only the raise and the fixes it forces, and the whole CI runs on it.
+js-agent-usage = { git = "https://github.com/komira-ai/jobscheduler", rev = "e73a5af2ec9ab54e2aeb131c1d8a4a6879a8abb5" }
+js-caps = { git = "https://github.com/komira-ai/jobscheduler", rev = "e73a5af2ec9ab54e2aeb131c1d8a4a6879a8abb5" }
+js-proto = { git = "https://github.com/komira-ai/jobscheduler", rev = "e73a5af2ec9ab54e2aeb131c1d8a4a6879a8abb5" }
+js-sched = { git = "https://github.com/komira-ai/jobscheduler", rev = "e73a5af2ec9ab54e2aeb131c1d8a4a6879a8abb5" }
+js-server-core = { git = "https://github.com/komira-ai/jobscheduler", rev = "e73a5af2ec9ab54e2aeb131c1d8a4a6879a8abb5" }
+js-sim = { git = "https://github.com/komira-ai/jobscheduler", rev = "e73a5af2ec9ab54e2aeb131c1d8a4a6879a8abb5" }
+js-sizing = { git = "https://github.com/komira-ai/jobscheduler", rev = "e73a5af2ec9ab54e2aeb131c1d8a4a6879a8abb5" }
+js-state = { git = "https://github.com/komira-ai/jobscheduler", rev = "e73a5af2ec9ab54e2aeb131c1d8a4a6879a8abb5" }
+js-store = { git = "https://github.com/komira-ai/jobscheduler", rev = "e73a5af2ec9ab54e2aeb131c1d8a4a6879a8abb5" }
+js-testkit = { git = "https://github.com/komira-ai/jobscheduler", rev = "e73a5af2ec9ab54e2aeb131c1d8a4a6879a8abb5" }
+js-types = { git = "https://github.com/komira-ai/jobscheduler", rev = "e73a5af2ec9ab54e2aeb131c1d8a4a6879a8abb5" }
+js-usage = { git = "https://github.com/komira-ai/jobscheduler", rev = "e73a5af2ec9ab54e2aeb131c1d8a4a6879a8abb5" }
+js-whole = { git = "https://github.com/komira-ai/jobscheduler", rev = "e73a5af2ec9ab54e2aeb131c1d8a4a6879a8abb5" }
 # tierstore and objstore-s3 moved to the tierstore repository (https://github.com/komira-ai/tierstore).
 # Both are taken from it at this one revision. The revision is raised by a pull request of
 # its own that runs the whole CI, never along with other changes.
@@ -245,6 +246,7 @@ kbf-host = { path = "crates/kbf-host" }
 kbf-installer = { path = "crates/kbf-installer" }
 kbf-invocation = { path = "crates/kbf-invocation" }
 kbf-integration-test = { path = "crates/kbf-integration-test" }
+kbf-job-client = { path = "crates/kbf-job-client" }
 kbf-lease-client = { path = "crates/kbf-lease-client" }
 kbf-log = { path = "crates/kbf-log" }
 kbf-map = { path = "crates/kbf-map" }

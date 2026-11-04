@@ -127,6 +127,7 @@ pub(super) fn submission(tag: u8) -> Submission {
         do_not_cache: true,
         needs: kbf_caps::Request::from_platform([("OSFamily", "linux")]).expect("a platform"),
         whole_worker: false,
+        pin: None,
     };
     Submission {
         request,

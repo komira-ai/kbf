@@ -90,6 +90,7 @@ fn request(tag: u8, gpus: u64) -> Request {
         do_not_cache: false,
         needs: kbf_caps::Request::from_platform([("OSFamily", "linux")]).expect("a platform"),
         whole_worker: false,
+        pin: None,
     }
 }
 

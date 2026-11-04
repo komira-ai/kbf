@@ -259,6 +259,7 @@ fn request(action: Digest) -> Request {
         needs: kbf_caps::Request::default(),
         hermetic: true,
         whole_worker: false,
+        pin: None,
         do_not_cache: false,
     }
 }

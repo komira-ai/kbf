@@ -645,6 +645,7 @@ fn from_request(r: proto::Request) -> Result<Request, DecodeError> {
         hermetic: r.hermetic,
         do_not_cache: r.do_not_cache,
         whole_worker: false,
+        pin: None,
     })
 }
 

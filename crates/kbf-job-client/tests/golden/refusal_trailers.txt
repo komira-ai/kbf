@@ -1,0 +1,30 @@
+# The trailers a refused SubmitJob is answered with: for each refusal, the status that
+# js_proto::refusal::refusal_status(code, detail) makes, as tonic writes it into the
+# trailers (grpc-message percent-encoded, grpc-status-details-bin base64 without padding).
+# Each [name] block is one refusal; 'detail:' is the text given to refusal_status and
+# is not a trailer. Written by hand from the field numbers of google.rpc.Status, Any and
+# Refusal, not by a test run; tests/golden.rs checks them against the pinned js-proto.
+
+[job-id-conflict]
+detail: job-1 names another job
+grpc-status: 6
+grpc-message: job-1%20names%20another%20job
+grpc-status-details-bin: CAYSF2pvYi0xIG5hbWVzIGFub3RoZXIgam9iGkoKK3R5cGUuZ29vZ2xlYXBpcy5jb20vam9ic2NoZWR1bGVyLnYxLlJlZnVzYWwSGwgBEhdqb2ItMSBuYW1lcyBhbm90aGVyIGpvYg
+
+[no-capable-host]
+detail: no host or offer has 8 GPUs of class nvidia-a100
+grpc-status: 9
+grpc-message: no%20host%20or%20offer%20has%208%20GPUs%20of%20class%20nvidia-a100
+grpc-status-details-bin: CAkSMG5vIGhvc3Qgb3Igb2ZmZXIgaGFzIDggR1BVcyBvZiBjbGFzcyBudmlkaWEtYTEwMBpjCit0eXBlLmdvb2dsZWFwaXMuY29tL2pvYnNjaGVkdWxlci52MS5SZWZ1c2FsEjQIAhIwbm8gaG9zdCBvciBvZmZlciBoYXMgOCBHUFVzIG9mIGNsYXNzIG52aWRpYS1hMTAw
+
+[wall-time-not-positive]
+detail: the job has no wall limit
+grpc-status: 3
+grpc-message: the%20job%20has%20no%20wall%20limit
+grpc-status-details-bin: CAMSGXRoZSBqb2IgaGFzIG5vIHdhbGwgbGltaXQaTAordHlwZS5nb29nbGVhcGlzLmNvbS9qb2JzY2hlZHVsZXIudjEuUmVmdXNhbBIdCAMSGXRoZSBqb2IgaGFzIG5vIHdhbGwgbGltaXQ
+
+[wall-time-above-ceiling]
+detail: the wall limit 90000 s is above the ceiling of 86400 s
+grpc-status: 3
+grpc-message: the%20wall%20limit%2090000%20s%20is%20above%20the%20ceiling%20of%2086400%20s
+grpc-status-details-bin: CAMSNnRoZSB3YWxsIGxpbWl0IDkwMDAwIHMgaXMgYWJvdmUgdGhlIGNlaWxpbmcgb2YgODY0MDAgcxppCit0eXBlLmdvb2dsZWFwaXMuY29tL2pvYnNjaGVkdWxlci52MS5SZWZ1c2FsEjoIBBI2dGhlIHdhbGwgbGltaXQgOTAwMDAgcyBpcyBhYm92ZSB0aGUgY2VpbGluZyBvZiA4NjQwMCBz

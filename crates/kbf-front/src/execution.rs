@@ -860,6 +860,7 @@ impl<D> ExecutionService<D> {
                 hermetic: true,
                 do_not_cache: decoded.do_not_cache,
                 whole_worker: self.exclusive_actions && kind == LeaseKind::Action,
+                pin: None,
                 needs,
             },
             call: None,

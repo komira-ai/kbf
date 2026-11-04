@@ -82,6 +82,7 @@ fn request<const N: usize>(qos: Qos, kind: LeaseKind, needs: [(&str, &str); N]) 
         hermetic: true,
         do_not_cache: true,
         whole_worker: false,
+        pin: None,
     }
 }
 
