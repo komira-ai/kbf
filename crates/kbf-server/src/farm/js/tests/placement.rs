@@ -68,6 +68,7 @@ fn placed(farm: &Farm) -> LoadCounters {
             do_not_cache: false,
             needs: kbf_caps::Request::default(),
             whole_worker: false,
+            pin: None,
         },
         call: None,
         described: kbf_front::Described::default(),

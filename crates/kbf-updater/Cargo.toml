@@ -33,6 +33,11 @@ serde_json.workspace = true
 thiserror.workspace = true
 # The hook contract (`kbf update-hook`, `agent::hook`): the steps, the exit codes and the last line.
 update-hook.workspace = true
+# The root part of the generic updater (`kbf-updater root`, `root`): the declarations, the gate
+# on a declaration that asks for more, and the transient units that run a step with its rights.
+update-rights.workspace = true
+# The root part's step runner: the step record, resume, the dead-man, the registration socket.
+kbf-step-runner = { path = "../kbf-step-runner" }
 # `kbf-updater enroll` and the renewal call `kbf-enroll`, which is async; each runs a
 # current-thread runtime of its own, on a thread of its own. Nothing else here is async.
 tokio = { workspace = true, features = ["net", "rt", "time"] }
@@ -46,6 +51,8 @@ kbf-host-install = { path = "../kbf-host-install" }
 # The releases a helper lists in its query, cut as the helper cuts them (local_tests.rs).
 kbf-retain.workspace = true
 kbf-testkit.workspace = true
+# A pipe at the name of the hold file, which no pin is (agent/pin_tests.rs).
+rustix = { workspace = true, features = ["fs"] }
 
 # `kbf update-hook` over a fake host kept in a directory, the program the conformance harness
 # runs (tests/hook_conformance.rs). Not shipped: the release jobs package kbf-updater alone.
@@ -55,6 +62,12 @@ kbf-testkit.workspace = true
 [[bin]]
 name = "kbf-updater-hook-fake"
 path = "src/bin/kbf-updater-hook-fake.rs"
+
+# The hook of a fake service the tests of the root part declare (`root::test_hook`): it logs the
+# step it is run for in its record directory and exits as a file there says. Not shipped.
+[[bin]]
+name = "kbf-updater-test-hook"
+path = "src/bin/kbf-updater-test-hook.rs"
 
 [lints]
 workspace = true

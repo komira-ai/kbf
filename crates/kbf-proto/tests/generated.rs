@@ -221,6 +221,8 @@ fn worker_messages_round_trip() {
                 unasked: 1,
                 lost: 3,
                 damaged: 4,
+                fallback_lost: 13,
+                fallback_damaged: 14,
             }),
             pack_writes: Some(worker::PackWriteCounts {
                 packs: 1,

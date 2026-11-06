@@ -208,6 +208,7 @@ impl Rng {
             hermetic: self.below(2) == 0,
             do_not_cache: self.below(2) == 0,
             whole_worker: false,
+            pin: None,
         }
     }
 
@@ -952,6 +953,7 @@ fn a_work_key_that_is_not_an_action_is_not_written() {
         hermetic: true,
         do_not_cache: false,
         whole_worker: false,
+        pin: None,
     };
     assert_eq!(
         encode(Format::V1, &batch(FarmInput::Submit(request("job 7")))),

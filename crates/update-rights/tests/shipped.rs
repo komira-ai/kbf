@@ -62,6 +62,7 @@ fn every_shipped_declaration_parses() {
         .collect();
     assert!(names.contains(&"tierstore.toml".to_owned()), "{names:?}");
     assert!(names.contains(&"js-agent.toml".to_owned()), "{names:?}");
+    assert!(names.contains(&"kbf.toml".to_owned()), "{names:?}");
     for file in files {
         let text = fs::read_to_string(&file).unwrap();
         if let Err(refusal) = Declaration::parse(&text) {
@@ -130,4 +131,76 @@ fn the_write_paths_of_shipped_root_hooks_are_named_for_their_service() {
         checked >= 2,
         "the js-agent fixture writes in two places: {checked}"
     );
+}
+
+/// The keys a declaration has at its top level, from the type the loader reads: every key of a
+/// declaration that sets them all, but the `[hook]` table.
+fn top_level_keys() -> Vec<String> {
+    let text = fs::read_to_string(
+        root().join("crates/update-rights/tests/fixtures/updater.d/tierstore.toml"),
+    )
+    .unwrap();
+    let declaration = Declaration::parse(&text).unwrap();
+    assert!(declaration.boot.is_some() && declaration.min_version.is_some());
+    let table = toml::Table::try_from(&declaration).unwrap();
+    let keys: Vec<String> = table.keys().filter(|k| *k != "hook").cloned().collect();
+    assert!(
+        keys.contains(&"verify_deadline_secs".to_owned()),
+        "{keys:?}"
+    );
+    keys
+}
+
+/// The lines of `text` that set a top-level key after a table header, where TOML reads them as
+/// keys of that table.
+fn misplaced(text: &str, top: &[String]) -> Vec<String> {
+    let mut in_table = false;
+    let mut found = Vec::new();
+    for line in text.lines().map(str::trim) {
+        in_table |= line.starts_with('[');
+        let key = line.split('=').next().unwrap_or_default().trim();
+        if in_table & top.iter().any(|t| t == key) {
+            found.push(line.to_owned());
+        }
+    }
+    found
+}
+
+/// Catches a top-level key written after a table header, which TOML reads as a key of that
+/// table: under `[hook]` the loader refuses it, but under the opaque `[hook.params]` it would load
+/// as a parameter and the declaration would silently lose the key. Every shipped declaration,
+/// the kbf one among them, has its top-level keys before its first table header.
+#[test]
+fn every_shipped_declaration_has_its_top_level_keys_before_any_table() {
+    let top = top_level_keys();
+    let files = shipped();
+    assert!(
+        files
+            .iter()
+            .any(|f| f.ends_with("host-agent/linux/updater.d/kbf.toml"))
+    );
+    for file in files {
+        let text = fs::read_to_string(&file).unwrap();
+        let found = misplaced(&text, &top);
+        assert!(found.is_empty(), "{}: {found:?}", file.display());
+    }
+}
+
+/// Catches the placement scan being unable to fail: the tierstore fixture with its boot entry
+/// moved under `[hook.params]` still loads (the table is opaque), and the scan finds the line.
+#[test]
+fn a_top_level_key_under_hook_params_loads_and_is_found_by_the_scan() {
+    let text = fs::read_to_string(
+        root().join("crates/update-rights/tests/fixtures/updater.d/tierstore.toml"),
+    )
+    .unwrap();
+    let moved = text.replacen("boot = \"restore\"\n", "", 1).replacen(
+        "[hook.params]\n",
+        "[hook.params]\nboot = \"restore\"\n",
+        1,
+    );
+    assert_ne!(moved, text);
+    let loaded = Declaration::parse(&moved).expect("the opaque table takes it");
+    assert_eq!(loaded.boot, None, "the boot entry is lost");
+    assert_eq!(misplaced(&moved, &top_level_keys()), ["boot = \"restore\""]);
 }

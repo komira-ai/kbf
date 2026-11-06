@@ -1,11 +1,8 @@
-use std::cell::RefCell;
-use std::os::unix::fs::MetadataExt;
-
 use super::*;
 use kbf_testkit::dir::TestDir;
 
 /// An empty directory of its own for one test, removed when it drops.
-fn scratch(name: &str) -> TestDir {
+pub(super) fn scratch(name: &str) -> TestDir {
     let beside = std::env::current_exe().expect("test binary");
     let deps = beside.parent().expect("deps");
     TestDir::under(deps.join("xtask-pkg-unit"), name)
@@ -20,12 +17,12 @@ const NOT_PACKAGED: [&str; 3] = [
 ];
 
 /// The inputs a package is built from, in `dir`.
-struct Tree {
-    dir: TestDir,
+pub(super) struct Tree {
+    pub(super) dir: TestDir,
 }
 
 impl Tree {
-    fn new(name: &str) -> Tree {
+    pub(super) fn new(name: &str) -> Tree {
         let dir = scratch(name);
         let t = Tree { dir };
         t.put("kbf", "kbf binary");
@@ -41,16 +38,22 @@ impl Tree {
         t.put("sysusers.conf", "u kbf");
         t.put("tmpfiles.conf", "d /x");
         t.put("needrestart.conf", "# n");
+        for name in AGENT_UNITS.into_iter().chain([AGENT_SYSUSERS]) {
+            t.put(&format!("host-agent/{name}"), name);
+        }
+        // What else the host agent's directory holds, which the package does not take.
+        t.put("host-agent/kbf-updater-root.service", "root part");
+        t.put("host-agent/updater.d/kbf.toml", "declaration");
         t
     }
 
-    fn put(&self, rel: &str, text: &str) {
+    pub(super) fn put(&self, rel: &str, text: &str) {
         let path = self.dir.join(rel);
         std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
         std::fs::write(path, text).expect("file");
     }
 
-    fn inputs(&self) -> Inputs<'_> {
+    pub(super) fn inputs(&self) -> Inputs<'_> {
         // The leaked paths live as long as the test.
         let at = |rel: &str| -> &'static Path { Box::leak(self.dir.join(rel).into_boxed_path()) };
         Inputs {
@@ -60,13 +63,14 @@ impl Tree {
             sysusers: at("sysusers.conf"),
             tmpfiles: at("tmpfiles.conf"),
             needrestart: at("needrestart.conf"),
+            host_agent: at("host-agent"),
             platform: Platform::LinuxX86_64,
             version: "0.0.0+ci",
         }
     }
 }
 
-fn refused(r: Result<Vec<Entry>, Error>) -> String {
+pub(super) fn refused(r: Result<Vec<Entry>, Error>) -> String {
     match r {
         Err(Error::Refused(problems)) => problems.join("\n"),
         other => panic!("expected a refusal, got {other:?}"),
@@ -88,51 +92,66 @@ fn real_inputs(root: &Path) -> Inputs<'_> {
         sysusers: at("sysusers.d/kbf-installer.conf"),
         tmpfiles: at("tmpfiles.d/kbf-installer.conf"),
         needrestart: at("needrestart/kbf.conf"),
+        host_agent: at("../host-agent/linux"),
         platform: Platform::LinuxX86_64,
         version: "0.0.0+ci",
     }
 }
 
+/// One entry of a plan as the tests compare it: the path, the mode, whether it is a file, what a
+/// link points to, and whether the deb alone holds it.
+type Seen = (String, u32, bool, Option<String>, bool);
+
 /// Asserts that the package holds the runtime, the units of the modes, the slice, the users and
-/// directories they run with, the needrestart drop-in and the trust directory, each at its mode,
-/// and holds nothing else.
+/// directories they run with, the needrestart drop-in and the trust directory, each at its mode;
+/// that the deb alone holds the host agent's two units, a link to each in the `.wants` directory
+/// of `multi-user.target` (which enables it) and the agent's account; and that it holds nothing
+/// else (not the root part's unit nor the hook's declaration beside them).
 #[test]
 fn the_plan_is_the_contract_paths_with_their_modes() {
     let t = Tree::new("plan");
-    let got: Vec<(String, u32, bool)> = kbf_plan(&t.inputs())
+    let got: Vec<Seen> = kbf_plan(&t.inputs())
         .expect("plan")
         .into_iter()
-        .map(|e| (e.dst, e.mode, e.sha256.is_some()))
+        .map(|e| (e.dst, e.mode, e.sha256.is_some(), e.link, e.deb_only))
         .collect();
-    let want = [
-        ("/etc/needrestart/conf.d/kbf.conf", 0o644, true),
-        ("/usr/bin/kbf", 0o755, true),
+    let file = |p: &str, m: u32| (p.to_owned(), m, true, None, false);
+    let dir = |p: &str| (p.to_owned(), 0o755, false, None, false);
+    let agent = |p: &str| (p.to_owned(), 0o644, true, None, true);
+    let wants = |unit: &str| {
         (
-            "/usr/lib/systemd/system/kbf-all-in-one.service",
-            0o644,
+            format!("/usr/lib/systemd/system/multi-user.target.wants/{unit}"),
+            0o777,
+            false,
+            Some(format!("../{unit}")),
             true,
-        ),
-        ("/usr/lib/systemd/system/kbf-daemon.service", 0o644, true),
-        ("/usr/lib/systemd/system/kbf-frontend.service", 0o644, true),
-        (
+        )
+    };
+    let want: Vec<Seen> = vec![
+        file("/etc/needrestart/conf.d/kbf.conf", 0o644),
+        file("/usr/bin/kbf", 0o755),
+        file("/usr/lib/systemd/system/kbf-all-in-one.service", 0o644),
+        file("/usr/lib/systemd/system/kbf-daemon.service", 0o644),
+        file("/usr/lib/systemd/system/kbf-frontend.service", 0o644),
+        agent("/usr/lib/systemd/system/kbf-host-local.service"),
+        file(
             "/usr/lib/systemd/system/kbf-storage-and-daemon.service",
             0o644,
-            true,
         ),
-        ("/usr/lib/systemd/system/kbf-storage.service", 0o644, true),
-        ("/usr/lib/systemd/system/kbf.slice", 0o644, true),
-        ("/usr/lib/sysusers.d/kbf.conf", 0o644, true),
-        ("/usr/lib/tmpfiles.d/kbf.conf", 0o644, true),
-        ("/usr/share/kbf", 0o755, false),
-        ("/usr/share/kbf/trust", 0o755, false),
-        ("/usr/share/kbf/trust/gh", 0o755, true),
-        ("/usr/share/kbf/trust/installer.conf", 0o644, true),
-        ("/usr/share/kbf/trust/trusted_root.jsonl", 0o644, true),
+        file("/usr/lib/systemd/system/kbf-storage.service", 0o644),
+        agent("/usr/lib/systemd/system/kbf-updater-agent.service"),
+        file("/usr/lib/systemd/system/kbf.slice", 0o644),
+        wants("kbf-host-local.service"),
+        wants("kbf-updater-agent.service"),
+        agent("/usr/lib/sysusers.d/kbf-updater.conf"),
+        file("/usr/lib/sysusers.d/kbf.conf", 0o644),
+        file("/usr/lib/tmpfiles.d/kbf.conf", 0o644),
+        dir("/usr/share/kbf"),
+        dir("/usr/share/kbf/trust"),
+        file("/usr/share/kbf/trust/gh", 0o755),
+        file("/usr/share/kbf/trust/installer.conf", 0o644),
+        file("/usr/share/kbf/trust/trusted_root.jsonl", 0o644),
     ];
-    let want: Vec<(String, u32, bool)> = want
-        .iter()
-        .map(|(p, m, f)| ((*p).to_owned(), *m, *f))
-        .collect();
     assert_eq!(got, want);
 }
 
@@ -273,8 +292,9 @@ fn the_plan_refuses_what_the_package_does_not_ship() {
     std::fs::remove_file(t.dir.join("units/kbf-daemon.service")).expect("rm");
     std::fs::remove_file(t.dir.join("units/kbf-storage.service")).expect("rm");
     std::fs::remove_file(t.dir.join("trust/gh")).expect("rm");
+    std::fs::remove_file(t.dir.join("host-agent/kbf-updater-agent.service")).expect("rm");
     let text = refused(kbf_plan(&t.inputs()));
-    assert_eq!(text.lines().count(), 3, "{text}");
+    assert_eq!(text.lines().count(), 4, "{text}");
 }
 
 /// Asserts that the configuration is named `kbf`, recommends what the installer's package
@@ -386,12 +406,33 @@ fn the_listing_round_trips() {
     let entries = kbf_plan(&t.inputs()).expect("plan");
     let text = listing(&entries);
     assert!(text.contains("dir 0755 /usr/share/kbf -\n"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "link 0777 {WANTS_DIR}/kbf-updater-agent.service ../kbf-updater-agent.service deb\n"
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains("file 0644 /usr/lib/sysusers.d/kbf-updater.conf "),
+        "{text}"
+    );
     let parsed = parse_listing(&text).expect("parse");
     assert_eq!(parsed.len(), entries.len());
     for (p, e) in parsed.iter().zip(&entries) {
-        assert_eq!((&p.dst, p.mode, p.sha256), (&e.dst, e.mode, e.sha256));
+        assert_eq!(
+            (&p.dst, p.mode, p.sha256, &p.link, p.deb_only),
+            (&e.dst, e.mode, e.sha256, &e.link, e.deb_only)
+        );
         assert!(p.src.as_os_str().is_empty());
     }
+    assert_eq!(parsed.iter().filter(|e| e.deb_only).count(), 5);
+    assert!(
+        parsed
+            .iter()
+            .filter(|e| e.deb_only)
+            .all(|e| !e.in_format("rpm"))
+    );
+    assert!(parsed.iter().all(|e| e.in_format("deb")));
 }
 
 #[test]
@@ -403,6 +444,12 @@ fn a_listing_line_that_is_not_one_is_refused() {
         "file 0644 /a nothex".to_owned(),
         format!("file 9 /a {sha}"),
         format!("link 0644 /a {sha}"),
+        "link 0777 /a -".to_owned(),
+        "link 0777 /a ".to_owned(),
+        "link 0777 /a  deb".to_owned(),
+        format!("file 0644 /a {sha} rpm"),
+        format!("file 0644 /a {sha} deb more"),
+        "dir 0755 /a".to_owned(),
     ] {
         let err = parse_listing(&line).expect_err(&line);
         assert_eq!(err, Error::Failed(format!("not a listing line: {line:?}")));
@@ -567,229 +614,6 @@ fn the_trust_directory_is_the_one_the_layout_reads() {
         );
     }
     assert_eq!(names.len(), packaged.len());
-}
-
-/// The environment and arguments of one call of the model.
-type Call = (Vec<(String, String)>, Vec<String>);
-
-/// A model of nfpm: records its calls and writes `<dir>/kbf-installer.<format>` holding
-/// what `bytes` says of the call.
-struct Model {
-    calls: RefCell<Vec<Call>>,
-}
-
-impl Model {
-    fn new() -> Model {
-        Model {
-            calls: RefCell::new(Vec::new()),
-        }
-    }
-
-    /// The nfpm closure; `leave` says what a call leaves in its target directory:
-    /// the file names, with the bytes the source's time and the environment give.
-    fn nfpm<'a>(
-        &'a self,
-        source: &'a Path,
-        leave: impl Fn(&str, &str) -> Vec<(String, String)> + 'a,
-    ) -> impl FnMut(&[(&str, &str)], &[&str]) -> Result<Out, Error> + 'a {
-        move |env, args| {
-            let env: Vec<(String, String)> = env
-                .iter()
-                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
-                .collect();
-            self.calls
-                .borrow_mut()
-                .push((env.clone(), args.iter().map(|a| (*a).to_owned()).collect()));
-            let at = args.iter().position(|a| *a == "-p").expect("-p");
-            let format = args[at + 1];
-            let dir = Path::new(args[args.len() - 1]);
-            let mtime = std::fs::metadata(source)
-                .expect("source")
-                .mtime()
-                .to_string();
-            let epoch = env[0].1.clone();
-            for (name, text) in leave(format, &format!("{epoch}/{mtime}")) {
-                std::fs::write(dir.join(name), text).expect("package");
-            }
-            Ok(Out {
-                ok: true,
-                ..Out::default()
-            })
-        }
-    }
-}
-
-/// A config naming one source file, and the build over it.
-fn built(
-    name: &str,
-    leave: impl Fn(&str, &str) -> Vec<(String, String)>,
-) -> (Result<Vec<String>, Error>, TestDir, Model) {
-    let dir = scratch(name);
-    let source = dir.join("kbf-installer");
-    std::fs::write(&source, "binary").expect("source");
-    let config_path = dir.join("nfpm.yaml");
-    let config = format!(
-        "contents:\n  - dst: \"/x\"\n    src: {}\n",
-        quoted(&source.to_string_lossy())
-    );
-    std::fs::write(&config_path, config).expect("config");
-    let model = Model::new();
-    let out = dir.join("out");
-    let build = Build {
-        config: &config_path,
-        out: &out,
-        epoch: 77,
-    };
-    let result = super::build(&mut model.nfpm(&source, leave), &build);
-    // The caller holds the directory, which the output is in, until it is done.
-    (result, dir, model)
-}
-
-/// Package bytes that depend on the environment's time only.
-fn by_epoch(format: &str, seen: &str) -> Vec<(String, String)> {
-    let epoch = seen.split('/').next().expect("epoch");
-    vec![(
-        format!("kbf-installer.{format}"),
-        format!("{format} at {epoch}"),
-    )]
-}
-
-#[test]
-fn a_package_that_depends_on_the_epoch_alone_is_built_twice_and_the_same() {
-    let (result, dir, model) = built("build-same", by_epoch);
-    let out = dir.join("out");
-    let printed = result.expect("reproducible");
-    assert_eq!(printed.len(), 2);
-    assert!(printed[0].ends_with("kbf-installer.deb"), "{printed:?}");
-    assert!(printed[1].ends_with("kbf-installer.rpm"), "{printed:?}");
-    let calls = model.calls.borrow();
-    assert_eq!(calls.len(), 4, "two formats, two builds each");
-    for (env, args) in calls.iter() {
-        assert_eq!(env, &[("SOURCE_DATE_EPOCH".to_owned(), "77".to_owned())]);
-        assert_eq!(&args[..3], ["package", "-f", args[2].as_str()]);
-    }
-    assert!(out.join("kbf-installer.deb").is_file());
-    assert!(out.join("kbf-installer.rpm").is_file());
-    assert!(
-        !out.join("again").exists(),
-        "the second builds are not left"
-    );
-}
-
-#[test]
-fn a_package_that_carries_the_time_of_its_sources_is_refused() {
-    // The defect `SOURCE_DATE_EPOCH` is for: nfpm taking the sources' own times.
-    let (result, _, _) = built("build-mtime", |format, seen| {
-        let mtime = seen.split('/').nth(1).expect("mtime");
-        vec![(
-            format!("kbf-installer.{format}"),
-            format!("{format} at {mtime}"),
-        )]
-    });
-    let err = result.expect_err("not reproducible").to_string();
-    assert!(
-        err.contains("kbf-installer.deb is not reproducible"),
-        "{err}"
-    );
-}
-
-#[test]
-fn nfpm_failing_or_leaving_the_wrong_files_is_refused() {
-    let (result, _, _) = built("build-none", |_, _| Vec::new());
-    assert!(
-        result
-            .expect_err("none")
-            .to_string()
-            .contains("expected nfpm to leave one .deb")
-    );
-    let (result, _, _) = built("build-two", |format, _| {
-        vec![
-            (format!("a.{format}"), String::new()),
-            (format!("b.{format}"), String::new()),
-        ]
-    });
-    assert!(
-        result
-            .expect_err("two")
-            .to_string()
-            .contains("expected nfpm to leave one .deb")
-    );
-}
-
-#[test]
-fn nfpm_that_fails_is_reported_with_its_message() {
-    let dir = scratch("build-fails");
-    let config = dir.join("nfpm.yaml");
-    std::fs::write(&config, "contents: []\n").expect("config");
-    let mut fails = |_: &[(&str, &str)], _: &[&str]| {
-        Ok(Out {
-            ok: false,
-            stdout: String::new(),
-            stderr: " bad yaml \n".to_owned(),
-        })
-    };
-    let err = build(
-        &mut fails,
-        &Build {
-            config: &config,
-            out: &dir.join("out"),
-            epoch: 1,
-        },
-    )
-    .expect_err("fails");
-    assert_eq!(
-        err,
-        Error::Failed("nfpm package -p deb: bad yaml".to_owned())
-    );
-}
-
-#[test]
-fn a_config_with_a_broken_src_line_or_a_missing_source_is_refused() {
-    let dir = scratch("build-config");
-    let config = dir.join("nfpm.yaml");
-    let mut never = |_: &[(&str, &str)], _: &[&str]| -> Result<Out, Error> { panic!("not run") };
-    let build_with = |text: &str, never: &mut Nfpm| {
-        std::fs::write(&config, text).expect("config");
-        build(
-            never,
-            &Build {
-                config: &config,
-                out: &dir.join("out"),
-                epoch: 1,
-            },
-        )
-        .expect_err("refused")
-        .to_string()
-    };
-    assert!(build_with("    src: not json\n", &mut never).contains("not a src line"));
-    assert!(
-        build_with("    src: \"/nonexistent/x\"\n", &mut never)
-            .contains("set the time of /nonexistent/x")
-    );
-    let missing = dir.join("absent.yaml");
-    let err = build(
-        &mut never,
-        &Build {
-            config: &missing,
-            out: &dir,
-            epoch: 1,
-        },
-    )
-    .expect_err("absent");
-    assert!(err.to_string().contains("absent.yaml"), "{err}");
-}
-
-#[test]
-fn the_nfpm_process_gets_the_given_environment_and_nothing_else() {
-    let mut env = nfpm_process(Path::new("/usr/bin/env"));
-    let out = env(&[("A", "1")], &[]).expect("env");
-    assert!(out.ok);
-    assert_eq!(out.stdout, "A=1\n");
-    let mut no = nfpm_process(Path::new("/nonexistent/nfpm"));
-    let err = no(&[], &[]).expect_err("not a program");
-    assert!(err.to_string().contains("/nonexistent/nfpm"), "{err}");
-    let mut fails = nfpm_process(Path::new("/usr/bin/false"));
-    assert!(!fails(&[], &[]).expect("false").ok);
 }
 
 /// Asserts that the package ships the mode units and the slice of `packaging/linux/units`, and

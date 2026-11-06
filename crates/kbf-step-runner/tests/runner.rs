@@ -380,7 +380,7 @@ fn a_pending_promotion_is_watched_until_it_clears() {
 fn the_promotion_ceiling_ends_the_watch_without_a_rollback() {
     let rig = Rig::new("run-ceiling");
     let mut order = rig.order();
-    order.bounds.promotion_ceiling_secs = 100;
+    order.bounds.promotion_ceiling_secs = Some(100);
     rig.fake.say(Step::Verify, &[PENDING; 10]);
     let got = rig.runner().run(&order).unwrap();
     assert_eq!(got, failed(Phase::AfterCommit, Class::Release));

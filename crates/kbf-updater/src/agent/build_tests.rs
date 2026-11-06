@@ -179,7 +179,8 @@ fn every_host_is_drained_through_the_frontend() {
 
 /// `run_config` builds the agent and runs it until it is stopped: with nothing reachable it
 /// heartbeats into the void and ends with exit 0 when told to; an agent that cannot be built is
-/// exit 1 with the reason.
+/// exit 1 with the reason. The caller is handed the stop handle before anything else, so that an
+/// agent that waits for its enrollment can be stopped too.
 #[test]
 fn the_process_runs_until_stopped_and_says_why_it_cannot_start() {
     let rig = Rig::new("bd-run", HostRole::DAEMON);
@@ -193,7 +194,12 @@ fn the_process_runs_until_stopped_and_says_why_it_cannot_start() {
 
     let mut broken = Rig::new("bd-run-broken", HostRole::FRONTEND);
     broken.config.files.cert = broken.dir.join("absent.pem");
-    let (code, text) = run_config(&broken.config, |_| unreachable!("not started"));
+    let handed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen = Arc::clone(&handed);
+    let (code, text) = run_config(&broken.config, move |_| {
+        seen.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+    assert!(handed.load(std::sync::atomic::Ordering::SeqCst));
     assert_eq!(code, 1);
     assert!(
         text.starts_with("kbf-updater: ") && text.contains("absent.pem"),
@@ -242,7 +248,7 @@ fn an_agent_without_the_operator_credential_refuses_every_update() {
 
 /// A host enrolled in a state directory: the files `kbf-updater enroll` leaves (the key and the
 /// certificate of an updater, the CA, and `node.json` with its renewal due long from now).
-fn enrolled_in(dir: &TestDir, pki: &Pki, role: HostRole) -> std::path::PathBuf {
+pub(super) fn enrolled_in(dir: &TestDir, pki: &Pki, role: HostRole) -> std::path::PathBuf {
     use kbf_enroll::answer::Cert;
     use kbf_enroll::store::{Node, Store, StoredConfig};
     let now = i64::try_from(unix_now()).unwrap();
@@ -488,4 +494,23 @@ fn a_role_the_agent_has_no_duties_for_is_refused() {
         super::build::kind_of(&HostRole::MAC_DAEMON),
         Ok(Role::MacDaemon)
     );
+}
+
+/// The agent honours the hold file at the helper's fixed path for the platform, whatever
+/// `--cordon-dir` and the key's directory are: the helper writes the pin there and nowhere
+/// else.
+///
+/// Catches: a pin the helper wrote that the agent never sees because its marks directory was
+/// moved.
+#[test]
+fn the_pin_is_read_where_the_helper_writes_it_whatever_the_directories() {
+    let mut rig = Rig::new("bd-pin", HostRole::DAEMON);
+    let want = super::pin::PinFile::of_platform(std::env::consts::OS);
+    let agent = build(&rig.config).unwrap();
+    assert_eq!(agent.pin_file(), Some(&want));
+    let elsewhere = rig.dir.join("cordons");
+    std::fs::create_dir(&elsewhere).unwrap();
+    rig.config.cordon_dir = Some(elsewhere);
+    let agent = build(&rig.config).unwrap();
+    assert_eq!(agent.pin_file(), Some(&want));
 }

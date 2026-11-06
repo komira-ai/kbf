@@ -3,6 +3,7 @@
 //! read per service with a query.
 
 use super::*;
+use crate::status_service_tests::OPS_LAST_GOOD_TWO;
 
 const SERVICES_TEXT: &str = "[[service]]\nname = \"other\"\n[service.roles.daemon]\nmin_up = 0\n";
 
@@ -181,7 +182,8 @@ const GOLDEN_STATUS: &str = concat!(
 /// managed, the convergence is byte for byte the old answer followed by the build `commit`,
 /// whether or not `?service=kbf` is given, and the status is the old answer followed by the
 /// new `per_service` key (kbf's `desired` and `roles` as they were, then `hosts`, `up`,
-/// `slots_held` and `convergence`) and then `commit`.
+/// `slots_held` and `convergence`), then `ops` (kbf's automatic rollback records the version
+/// the farm converged on as the last good one) and then `commit`.
 #[tokio::test]
 async fn the_kbf_status_and_convergence_bytes_are_unchanged() {
     let rig = Rig::new("http-golden-status");
@@ -206,13 +208,16 @@ async fn the_kbf_status_and_convergence_bytes_are_unchanged() {
         r#"{"platform":"linux-x86_64","version":"2.0","health":"healthy"}"#,
     )
     .await;
-    // Each answer has kept its bytes, and ends with the build commit since that was added.
+    // Each answer has kept its bytes, and ends with the build commit since that was added,
+    // then the record of the writes since that was.
     let commit = format!(r#","commit":"{}"}}"#, crate::BUILD_COMMIT);
+    let record = r#","generation":1,"replaced":null,"write_id":""}"#;
     let converged = GOLDEN_CONVERGENCE
         .strip_suffix('}')
         .expect("an object")
         .to_owned()
-        + &commit;
+        + commit.strip_suffix('}').expect("an object")
+        + record;
     for path in [CONVERGENCE_PATH, "/v1/convergence?service=kbf"] {
         assert_eq!(
             get_raw(&rig, path, &ci_token()).await,
@@ -231,7 +236,7 @@ async fn the_kbf_status_and_convergence_bytes_are_unchanged() {
     // The convergence in the status is the answer of `GET /v1/convergence`, with its commit.
     assert_eq!(
         status,
-        format!("{GOLDEN_STATUS}{tail}{converged}}}}}{commit}")
+        format!("{GOLDEN_STATUS}{tail}{converged}}}}}{OPS_LAST_GOOD_TWO}{commit}")
     );
 }
 

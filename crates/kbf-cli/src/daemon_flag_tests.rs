@@ -1,5 +1,5 @@
 //! The daemon's flags: it takes no store, credential or environment variable, but for the
-//! flags of `--pack-read`.
+//! flags of `--pack-read` and of `--tierstore-endpoint`.
 
 use super::*;
 
@@ -9,13 +9,15 @@ use super::*;
 /// read a variable, is off in the workspace. The daemon's only credentials are its node
 /// identity (`--ca-cert`, `--cert`, `--key`) and, for `--pack-read`, the file of a key pair that
 /// may read the farm's packs and write nothing, and, for `--pack-write`, the file of one that
-/// may create them. The words are the wire test's
+/// may create them, and, for `--tierstore-endpoint`, the file of one that may read through the
+/// tierstore on loopback. The words are the wire test's
 /// (kbf-proto's tests/daemon_wire.rs): a part (`store`) is matched anywhere in a flag, a
 /// short word (`sts`, `url`, `key`) only as a whole word between dashes, except in the
 /// reviewed flags of `REVIEWED_DAEMON_FLAGS`, each of which must still be a flag, and the
-/// nine flags of `PACK_READ_FLAGS`, which name a store, a bucket, an endpoint, a region and
-/// a credentials file as a path and are checked for neither. Of all the daemon's flags,
-/// only `--pack-store-credentials-file` names a credential, and it takes a `PATH`.
+/// nine flags of `PACK_READ_FLAGS` and the three of `TIERSTORE_FLAGS`, which name a store, a
+/// bucket, an endpoint, a region and a credentials file as a path and are checked for
+/// neither. Of all the daemon's flags, only the three credentials files name a credential,
+/// and each takes a `PATH`.
 #[test]
 fn the_daemon_takes_no_store_credential_or_environment_variable() {
     /// Flags that hold a short word and were reviewed.
@@ -38,9 +40,16 @@ fn the_daemon_takes_no_store_credential_or_environment_variable() {
         "pack-store-write-credentials-file",
         "pack-write",
     ];
+    /// The flags of `--tierstore-endpoint` (`kbf_node`'s `tierstore`): the tierstore on loopback
+    /// the daemon reads packs through, and the file of its read-only key pair.
+    const TIERSTORE_FLAGS: &[&str] = &[
+        "tierstore-bucket",
+        "tierstore-credentials-file",
+        "tierstore-endpoint",
+    ];
     let flags = longs(&kbf_node::Cli::command());
     for flag in &flags {
-        if PACK_READ_FLAGS.contains(&flag.as_str()) {
+        if PACK_READ_FLAGS.contains(&flag.as_str()) || TIERSTORE_FLAGS.contains(&flag.as_str()) {
             continue;
         }
         for part in [
@@ -76,7 +85,8 @@ fn the_daemon_takes_no_store_credential_or_environment_variable() {
     for identity in ["ca-cert", "cert", "key"] {
         assert!(flags.contains(identity), "{identity}");
     }
-    for reviewed in REVIEWED_DAEMON_FLAGS.iter().chain(PACK_READ_FLAGS) {
+    let reviewed = REVIEWED_DAEMON_FLAGS.iter().chain(PACK_READ_FLAGS);
+    for reviewed in reviewed.chain(TIERSTORE_FLAGS) {
         assert!(
             flags.contains(*reviewed),
             "--{reviewed} is no longer a flag"
@@ -87,6 +97,7 @@ fn the_daemon_takes_no_store_credential_or_environment_variable() {
     let files = [
         "pack-store-credentials-file",
         "pack-store-write-credentials-file",
+        "tierstore-credentials-file",
     ];
     assert_eq!(named, files);
     let command = kbf_node::Cli::command();

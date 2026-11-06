@@ -30,6 +30,7 @@ fn a_heartbeat_is_written_and_read_in_one_spelling() {
         step_secs: Default::default(),
         promotion_pending: false,
         deferred: None,
+        pinned: None,
     };
     assert_eq!(
         serde_json::to_value(&busy).expect("json"),

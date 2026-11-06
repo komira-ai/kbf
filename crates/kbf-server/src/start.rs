@@ -632,42 +632,51 @@ mod tests {
         serve_with(args, None, log, store, prefix, id, interrupted).await
     }
 
-    /// Asserts that `--pack-index` reaches the started server: over a Postgres state store a
-    /// server given the flag carries the index and one without it carries none, and a start is
-    /// refused with the line that says why when the flag has no state store or a SQLite one.
+    /// Asserts what `--pack-index` does to a start with no Postgres server anywhere: a server
+    /// without the flag and with no state store starts and carries no index, and a start with
+    /// the flag is refused, with the line that says why, when there is no state store or a
+    /// SQLite one, before the SQLite file is made. A start over Postgres, which opens the
+    /// index, is `a_started_server_carries_the_pack_index_the_flag_names` in
+    /// `tests/pack_index_flag.rs`, with the other tests that need the test server.
     #[tokio::test(flavor = "current_thread")]
-    async fn a_started_server_carries_the_pack_index_the_flag_names() {
-        // The test database makes and drops itself with a runtime of its own, which tokio
-        // refuses on a thread that is running tasks: both happen on a thread of their own.
-        let db = std::thread::spawn(kbf_pack_index::schema::test_database);
-        let db = db.join().expect("a test database");
+    async fn a_start_with_the_pack_index_flag_needs_a_postgres_state_store() {
+        use crate::PackIndexFlagError::{self as Flag, NeedsPostgres, NeedsStateStore};
         let root = crate::test_dir::scratch_dir("kbf-server-pack-index");
         let mut args = Args::parse_from([
             "kbf-server",
             "--listen=127.0.0.1:0",
             "--worker-listen=127.0.0.1:0",
         ]);
-        args.state_store = Some(db.url().parse().expect("a postgres URL"));
         let off = boot(&args, &root, "off").await;
         let off = off.expect("starts without the flag");
         assert!(off.pack_index().is_none());
         drop(off);
         args.pack_index = true;
-        let on = boot(&args, &root, "on").await;
-        let on = on.expect("starts with the flag");
-        assert!(on.pack_index().is_some());
-        drop(on);
         let file = root.join("state.db");
-        args.state_store = Some(crate::StateStoreUri::Sqlite(file));
-        let refused = boot(&args, &root, "sqlite").await;
-        let said = refused.err().expect("SQLite").to_string();
-        assert!(said.contains("not SQLite"), "{said}");
+        args.state_store = Some(crate::StateStoreUri::Sqlite(file.clone()));
+        let refused = boot(&args, &root, "sqlite").await.err().expect("SQLite");
+        assert!(
+            matches!(refused.downcast_ref::<Flag>(), Some(NeedsPostgres)),
+            "{refused}"
+        );
+        let said = refused.to_string();
+        assert_eq!(
+            said,
+            "--pack-index needs a postgres:// --state-store, not SQLite"
+        );
+        assert!(!file.exists(), "refused before the state store is opened");
         args.state_store = None;
         let refused = boot(&args, &root, "none").await;
-        let said = refused.err().expect("no state store").to_string();
-        assert!(said.contains("needs --state-store"), "{said}");
-        let dropped = std::thread::spawn(move || drop(db));
-        dropped.join().expect("the test database is dropped");
+        let refused = refused.err().expect("no state store");
+        assert!(
+            matches!(refused.downcast_ref::<Flag>(), Some(NeedsStateStore)),
+            "{refused}"
+        );
+        let said = refused.to_string();
+        assert_eq!(
+            said,
+            "--pack-index needs --state-store: the pack index is kept there"
+        );
     }
 
     /// Catches the server sizing itself from anything but the CPU count: on the 44-core,

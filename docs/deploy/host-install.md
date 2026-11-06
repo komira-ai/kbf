@@ -16,7 +16,10 @@ the same run as every other asset ([../artifacts.md](../artifacts.md)):
 | macOS, Apple silicon | `kbf-host-install-<commit>-darwin-arm64.tar.gz` (ad hoc signed with the hardened runtime) |
 
 No package ships it: neither the `kbf` nor the `kbf-installer` deb installs it, so a Linux
-host gets it from the tarball too. Each tarball holds one member, `kbf-host-install`. Its
+host gets it from the tarball too. (The `kbf` deb ships the units that run it and the agent,
+`kbf-host-local.service` and `kbf-updater-agent.service`, enabled and gated on the two programs:
+[../../packaging/host-agent/README.md](../../packaging/host-agent/README.md), "A host that runs
+the package".) Each tarball holds one member, `kbf-host-install`. Its
 `<commit>` is the commit of the release the host is on or going to. The updater,
 `kbf-updater`, is the same kind of asset for the operator's Linux box and for a Mac's host agent
 (`kbf-updater-<commit>-linux-<arch>.tar.gz` and `kbf-updater-<commit>-darwin-arm64.tar.gz`, one
@@ -814,9 +817,13 @@ kbf-host-install activate kbf=<commit|version> [--pin] [--force-lock] [--restart
   never through a link the agent's account put there; a file swapped in aside before the rename is
   found and fails the pin, and the directory is synced. Another writer that holds `retain.json`
   refuses the pin (`busy`) before anything changes. A directory that is not there is refused
-  before anything changes (`config_invalid`): without an agent, leave out `--pin`. Reading the hold file is the agent's; until it reads it, an
-  agent that runs re-drives the coordinator's desired release, which is why the agent is stopped
-  first. The pin stays in `retain.json` until it is removed there.
+  before anything changes (`config_invalid`): without an agent, leave out `--pin`. While the hold
+  file is there, an agent that reads it (one from the release that adds the pin, or later) runs no
+  order for `kbf`, whatever the coordinator desires, and says `pinned` with the commit in every
+  heartbeat; the coordinator shows the host as pinned and orders it nothing
+  ([kbf-updater.md, "The pin"](kbf-updater.md#the-pin)). An agent from before that release reads
+  no hold file and re-drives the coordinator's desired release, which is why the agent is stopped
+  first. The pin stays until `unpin` ([below](#undoing-the-pin-unpin)) removes it.
 - **The answer** is the socket's JSON line on stdout (`activated`, with `from` the release left,
   `pinned` and `lock_taken`); the exit status is 0 (done), 2 (refused: nothing changed) or 3
   (failed). It is audited (verb `activate`, `version` the name as given, and on success a `result`
@@ -828,6 +835,31 @@ kbf-host-install activate kbf=<commit|version> [--pin] [--force-lock] [--restart
 
 If the session is cut during the restart, run the same command again: activating the release that
 runs restarts its units and moves no link.
+
+#### Undoing the pin: `unpin`
+
+```text
+/usr/libexec/kbf/kbf-host-install unpin        # a Mac: /usr/local/libexec/kbf/kbf-host-install unpin
+```
+
+- **Root only**, and it takes no argument; anything else is refused (exit 2) before anything runs.
+- **What it does**, under the install lock taken without waiting as `activate` takes it (a holder
+  is refused, `busy`, and named): it takes the commit the hold file names out of `pinned` in
+  `retain.json`, so a prune may remove the release again, then removes the hold file (never
+  following a link at its name) and syncs its directory. From its next heartbeat the agent follows
+  the coordinator again. The release that runs stays: an unpin moves no link and restarts nothing.
+- A host with no hold file is not pinned: the unpin says so (`commit` null) and changes nothing. A
+  hold file that is not root's regular file, that its group or others may write, that is over 4096
+  bytes, or that names no commit is removed and unpins nothing in `retain.json` (the log says
+  why). The commit comes from root's file alone: what the agent's account puts at the name while
+  the unpin runs is removed with it and unpins nothing. Another writer that holds `retain.json` refuses the unpin
+  (`busy`) before anything changes. If the hold file cannot be removed after `retain.json` was
+  changed, the unpin fails (`state_unavailable`); run it again.
+- **The answer** is `{"result":"unpinned","commit":C|null}` on stdout; the exit status is 0, 2
+  (refused) or 3 (failed). It is audited (verb `unpin`, a `result` of `unpinned <commit>` or
+  `nothing unpinned`), and not run when the audit log cannot be opened (`audit_unavailable`).
+- A pin of an earlier `activate --pin` whose hold file was since replaced by a later one stays in
+  `retain.json`; only the commit the hold file names is unpinned.
 
 ### On Linux
 
@@ -860,7 +892,9 @@ say it is that commit. Nothing is fetched when the trust files are not root's. A
 ### On a Linux daemon host that runs the package
 
 With `--layout deb` (or `rpm`) the host's units are the packaged ones
-([packaging/linux](../../packaging/linux/README.md)), which run `/usr/bin/kbf`. No release is laid
+([packaging/linux](../../packaging/linux/README.md)), which run `/usr/bin/kbf`. The `kbf` deb ships
+this program's unit, `kbf-host-local.service`, with `--layout deb` and `--restart-unit
+kbf-daemon.service`, and enables it. No release is laid
 out beside the running one and no link moves: the update is two installations of a package file,
 with the trial recorded first. The same requests apply, with the same answers and codes, and
 the same channels file as above. The package and a record of it live in the program's state

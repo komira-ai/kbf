@@ -521,20 +521,14 @@ fn rich() -> Heartbeat {
         promotion_pending: true,
         deferred: None,
     };
-    Heartbeat {
-        platform: ReleasePlatform::LinuxX86_64,
-        version: version(VA),
-        health: WireHealth::Healthy,
-        last_update: result(VB),
-        updating: None,
-        services: Some(vec![service]),
-        agent_features: vec!["deferred-v1".to_owned()],
-        step: None,
-        commit: None,
-        step_secs: [(StepName::parse("fetch").unwrap(), 1)].into(),
-        promotion_pending: true,
-        deferred: None,
-    }
+    let mut beat = Status::unknown(ReleasePlatform::LinuxX86_64, version(VA)).heartbeat();
+    beat.health = WireHealth::Healthy;
+    beat.last_update = result(VB);
+    beat.services = Some(vec![service]);
+    beat.agent_features = vec!["deferred-v1".to_owned()];
+    beat.step_secs = [(StepName::parse("fetch").unwrap(), 1)].into();
+    beat.promotion_pending = true;
+    beat
 }
 
 /// Catches: `fit` dropping what the coordinator needs or keeping what it can do without. Within

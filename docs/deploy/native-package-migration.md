@@ -177,10 +177,14 @@ should come up on exactly the flags it ran on.
 
 ## After
 
-- Point the node's update agent at the package. In `kbf-host-local.service`
-  ([packaging/host-agent](../../packaging/host-agent/README.md)) add `--layout deb` (or `rpm`) to the
-  `kbf-host-install --serve` line, keep the `--restart-unit` for the same unit, and restart it.
-  From then on `install`, `switch`, `confirm` and `revert` work on the package.
+- Point the node's update agent at the package. The `kbf` deb ships `kbf-host-local.service` with
+  `--layout deb` and `--restart-unit kbf-daemon.service`, enabled
+  ([packaging/host-agent](../../packaging/host-agent/README.md), "A host that runs the package"):
+  remove the node's hand-placed copy from `/etc/systemd/system`, which takes precedence over it,
+  or, when the node runs another unit than `kbf-daemon.service`, keep its own line in a drop-in;
+  run `systemctl daemon-reload` and restart it. A hand-placed copy that stays instead gets
+  `--layout deb` (or `rpm`) added to its `--serve` line, once: the helper refuses a flag given
+  twice. From then on `install`, `switch`, `confirm` and `revert` work on the package.
 - Check the node as the updater does (`kbf-updater` status, the frontend's view of the node).
 - When the node has been healthy as long as the operator likes, delete
   `/etc/systemd/system/<unit>.hand-placed`. Nothing reads it.

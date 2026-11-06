@@ -33,7 +33,9 @@
 //! defer_backoff = { initial_secs = 300, factor = 2, max_secs = 3600 }   # the defaults
 //!
 //! [service.roles.daemon]
-//! max_updating = 2               # optional; absent: the desired state's number
+//! max_updating = 2               # optional; absent: the desired state's number. Only 0
+//!                                # matters (it holds the role): one update is live at a
+//!                                # time across every service and role (crate::decide)
 //! min_up = 0                     # optional; absent: the desired state's number
 //! never_last = false             # default false
 //! after = ["storage"]            # roles of this service this role waits for
@@ -71,6 +73,8 @@ pub const TIERSTORE_SERVICES: &str = include_str!("tierstore.services.toml");
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RoleDef {
     /// How many hosts of the role may update at once. `None`: the desired state's number.
+    /// Superseded above 1: one update is live at a time across every service and role, so only
+    /// 0 (the role is held) changes a decision ([`crate::decide`]).
     pub max_updating: Option<u32>,
     /// How many other hosts of the role must be up while one updates. `None`: the desired
     /// state's number.
@@ -96,7 +100,8 @@ impl RoleDef {
 
     /// The limit on hosts of the role `role` updating at once under `desired`: the
     /// definition's number, else the desired state's, else the default (2 for the daemon
-    /// roles, 1 for any other). A role the service does not name is never ordered, whatever
+    /// roles, 1 for any other). The decision reads it only as 0 or not: one update is live at
+    /// a time whatever it says. A role the service does not name is never ordered, whatever
     /// these say ([`crate::decide`]).
     #[must_use]
     pub fn max_updating(&self, role: &str, desired: &Desired) -> usize {

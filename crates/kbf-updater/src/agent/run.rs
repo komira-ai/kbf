@@ -32,6 +32,7 @@ use super::hold::{
     ANNOUNCED, Deferral, Features, Fit, Halt, Hold, MAX_RETRY_SECS, Marks, UNREADABLE_HALT, fit,
 };
 use super::local::{HostState, Local};
+use super::pin::{Look, PinFile};
 use super::renew::Renewer;
 use super::status::{Shared, Status, version_of_commit};
 use super::update::{Ports, Update};
@@ -39,7 +40,8 @@ use crate::inventory::Host;
 use crate::ports::{Clock, Drain, Health, HealthCheck};
 use crate::version::Version;
 use crate::wire::{
-    self, DeferredReport, Heartbeat, KBF_SERVICE, MAX_HEARTBEAT_BYTES, Outcome, ServiceReply, Token,
+    self, DeferredReport, Heartbeat, KBF_SERVICE, MAX_HEARTBEAT_BYTES, Outcome, PinReport,
+    ServiceReply, Token,
 };
 
 /// How long the loops sleep between looks at whether they are stopped.
@@ -54,13 +56,13 @@ impl Stop {
         self.0.store(true, Ordering::SeqCst);
     }
 
-    fn stopped(&self) -> bool {
+    pub(crate) fn stopped(&self) -> bool {
         self.0.load(Ordering::SeqCst)
     }
 }
 
 /// Sleeps for `total`, or until `stop`.
-fn sleep(total: Duration, stop: &Stop) {
+pub(super) fn sleep(total: Duration, stop: &Stop) {
     let mut slept = Duration::ZERO;
     while slept < total && !stop.stopped() {
         let step = SLICE.min(total - slept);
@@ -185,6 +187,10 @@ pub struct Agent {
     marks: Option<Marks>,
     /// The most bytes of a heartbeat that are sent.
     max_beat: usize,
+    /// Root's hold file ([`super::pin`]), for an agent that has one.
+    pin: Option<PinFile>,
+    /// What the hold file said when it was last looked at, so a change is logged once.
+    pin_seen: Mutex<Look>,
 }
 
 impl Agent {
@@ -209,7 +215,35 @@ impl Agent {
             generations: Mutex::new(BTreeMap::new()),
             marks: None,
             max_beat: MAX_HEARTBEAT_BYTES,
+            pin: None,
+            pin_seen: Mutex::new(Look::Absent),
         }
+    }
+
+    /// The agent also honours a pin: while `pin` holds root's hold file, it runs no order for
+    /// `kbf` and every heartbeat says `pinned` ([`super::pin`]).
+    #[must_use]
+    pub fn with_pin(mut self, pin: PinFile) -> Self {
+        self.pin = Some(pin);
+        self
+    }
+
+    /// The hold file the agent honours, if it has one.
+    #[cfg(test)]
+    pub(super) fn pin_file(&self) -> Option<&PinFile> {
+        self.pin.as_ref()
+    }
+
+    /// The pin the hold file holds now, if the host is pinned; a change from the last look is
+    /// logged.
+    fn pinned(&self) -> Option<PinReport> {
+        let look = self.pin.as_ref().map_or(Look::Absent, PinFile::look);
+        let report = look.report().cloned();
+        let before = std::mem::replace(&mut *held(&self.pin_seen), look.clone());
+        if before != look {
+            self.log(&look.line());
+        }
+        report
     }
 
     /// The agent also does `Deferred` and `halt` (`docs/design/host-updates.md`, 3.8): it
@@ -310,10 +344,18 @@ impl Agent {
     pub fn run(&self, stop: &Stop) {
         self.refresh();
         // The updater was restarted in the middle of an A/B: the helper has a release on trial.
-        // The first heartbeat says so, and the trial is finished before any other order.
+        // The first heartbeat says so, and the trial is finished before any other order. A
+        // pinned host's `kbf` trial is left to the helper, whose deadline puts it back: the
+        // agent does not run it, so it is not reported as updating.
         let mut resumed = Vec::new();
         for (i, slot) in self.slots.iter().enumerate() {
             if let Some(target) = self.trial_in_progress(slot) {
+                if slot.service.is_none() && self.pinned().is_some() {
+                    self.log(&format!(
+                        "update to {target}: not resumed, the host is pinned"
+                    ));
+                    continue;
+                }
                 slot.status.update(|s| s.updating = Some(target.clone()));
                 resumed.push((i, target));
             }
@@ -439,6 +481,7 @@ impl Agent {
         let mut beat = self.slots[0].status.get().heartbeat();
         beat.agent_features.clone_from(&self.announced);
         beat.deferred = self.slots[0].deferred_report(features, now);
+        beat.pinned = self.pinned();
         if self.slots.len() > 1 {
             beat.services = Some(
                 self.slots[1..]
@@ -520,9 +563,10 @@ impl Agent {
         }
     }
 
-    /// An order for `target` of `service` (`None`: `kbf`): run it, unless the service is held
-    /// after a halt, or the same target was deferred and its retry time has not come (both only
-    /// while the coordinator advertises the feature), or the same target failed a moment ago.
+    /// An order for `target` of `service` (`None`: `kbf`): run it, unless it is for `kbf` and
+    /// the host is pinned, or the service is held after a halt, or the same target was deferred
+    /// and its retry time has not come (both only while the coordinator advertises the
+    /// feature), or the same target failed a moment ago.
     pub(super) fn order(&self, service: Option<&str>, target: &Version) {
         let Some(slot) = self.slots.iter().find(|s| s.service.as_deref() == service) else {
             self.log(&format!(
@@ -531,6 +575,17 @@ impl Agent {
             ));
             return;
         };
+        if service.is_none()
+            && let Some(pin) = self.pinned()
+        {
+            let to = pin
+                .commit
+                .map_or_else(String::new, |commit| format!(" to {commit}"));
+            self.log(&format!(
+                "update to {target}: not run, the host is pinned{to}"
+            ));
+            return;
+        }
         let features = self.features();
         let unix = (self.world.unix_now)();
         if features.halt

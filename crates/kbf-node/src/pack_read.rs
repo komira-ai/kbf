@@ -65,17 +65,17 @@ use zeroize::Zeroizing;
 use super::{Cli, Error, NodeHandle, farm, member, start_over, transfer};
 
 /// What makes the endpoint of the connection that asks the frontend where blobs lie.
-type Locate = fn(&Cli) -> Result<Endpoint, Error>;
+pub(crate) type Locate = fn(&Cli) -> Result<Endpoint, Error>;
 
 /// The signing region when `--pack-store-region` is left out: the one S3-compatible stores
 /// accept unless they are configured to another.
-const DEFAULT_REGION: &str = "us-east-1";
+pub(crate) const DEFAULT_REGION: &str = "us-east-1";
 
 /// How long opening a connection to the object store may take.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long a request to the object store may go without an answer or a byte of one.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// What a credentials file that is not JSON of the key pair is told.
 const NOT_KEYS: &str = "not JSON with access_key_id and secret_access_key";
@@ -335,7 +335,7 @@ fn over_store<C: Cas, S: ObjectStore>(
 
 /// The frontend's pack index over the connection `locate` makes (lazily, on the current
 /// runtime).
-fn index(cli: &Cli, locate: Locate) -> Result<Arc<RemoteIndex>, Error> {
+pub(crate) fn index(cli: &Cli, locate: Locate) -> Result<Arc<RemoteIndex>, Error> {
     let channel = locate(cli)?.connect_lazy();
     Ok(Arc::new(RemoteIndex::new(
         channel,
@@ -461,10 +461,51 @@ fn said(flag: &str, error: impl std::fmt::Display) -> String {
     format!("{flag}: {error}")
 }
 
-/// The key pair in the file at `path`, which only its owner may be able to read. No message
-/// carries the secret.
-fn read_credentials(path: &Path, flag: &str) -> Result<Credentials, Error> {
-    let bad = |why: &str| format!("{flag} {}: {why}", path.display());
+/// A key pair read from a credentials file. `Debug` never shows the secret.
+pub(crate) struct KeyPair {
+    /// The access key id.
+    pub(crate) id: String,
+    /// The secret, wiped when the pair goes.
+    pub(crate) secret: Zeroizing<String>,
+}
+
+impl std::fmt::Debug for KeyPair {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeyPair")
+            .field("id", &self.id)
+            .field("secret", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Why the credentials file of `flag` at `path` cannot be used. No message carries the secret.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum KeyFileError {
+    /// The file cannot be opened or read.
+    #[error("{flag} {}: {source}", path.display())]
+    Unreadable {
+        flag: &'static str,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    /// Others than its owner may read the file.
+    #[error("{flag} {}: mode {mode:04o} lets others read a secret: use 0600", path.display())]
+    Open {
+        flag: &'static str,
+        path: PathBuf,
+        mode: u32,
+    },
+    /// The file is not JSON of the key pair.
+    #[error("{flag} {}: {NOT_KEYS}", path.display())]
+    NotKeys { flag: &'static str, path: PathBuf },
+}
+
+/// The key pair in the file at `path`, which only its owner may be able to read, for `flag`.
+///
+/// # Errors
+/// [`KeyFileError`]: the file cannot be read, others may read it, or it is not the key pair.
+pub(crate) fn read_key_pair(path: &Path, flag: &'static str) -> Result<KeyPair, KeyFileError> {
     let read = std::fs::File::open(path).and_then(|mut file| {
         file.metadata().and_then(|meta| {
             let mut text = String::new();
@@ -472,21 +513,38 @@ fn read_credentials(path: &Path, flag: &str) -> Result<Credentials, Error> {
             read.map(|_| (meta.permissions().mode(), text))
         })
     });
-    let (mode, text) = read.map_err(|e| bad(&e.to_string()))?;
-    // Only the text is wiped when it goes: the parsed pair is the object-store client's, for as
-    // long as the process runs.
+    let (mode, text) = read.map_err(|source| KeyFileError::Unreadable {
+        flag,
+        path: path.to_owned(),
+        source,
+    })?;
     let text = Zeroizing::new(text);
     if mode & 0o077 != 0 {
-        let shown = mode & 0o777;
-        let why = format!("mode {shown:04o} lets others read a secret: use 0600");
-        return Err(bad(&why).into());
+        let mode = mode & 0o777;
+        let path = path.to_owned();
+        return Err(KeyFileError::Open { flag, path, mode });
     }
-    let parsed: serde_json::Value = serde_json::from_str(&text).map_err(|_| bad(NOT_KEYS))?;
+    let not_keys = || KeyFileError::NotKeys {
+        flag,
+        path: path.to_owned(),
+    };
+    let parsed: serde_json::Value = serde_json::from_str(&text).map_err(|_| not_keys())?;
     let field = |name: &str| parsed.get(name).and_then(serde_json::Value::as_str);
     let (Some(id), Some(secret)) = (field("access_key_id"), field("secret_access_key")) else {
-        return Err(bad(NOT_KEYS).into());
+        return Err(not_keys());
     };
-    Ok(Credentials::new(id, secret))
+    Ok(KeyPair {
+        id: id.to_owned(),
+        secret: Zeroizing::new(secret.to_owned()),
+    })
+}
+
+/// The key pair in the file at `path` ([`read_key_pair`]), as the object-store client takes it.
+/// Only the file's text and the pair read from it are wiped when they go: the client's copy
+/// lives as long as the client.
+pub(crate) fn read_credentials(path: &Path, flag: &'static str) -> Result<Credentials, Error> {
+    let pair = read_key_pair(path, flag)?;
+    Ok(Credentials::new(pair.id, pair.secret.as_str()))
 }
 
 #[cfg(test)]

@@ -10,10 +10,12 @@
 //!
 //! - `blocked`: some live host failed an update to the desired version and is still behind
 //!   it. It stays so until the host is fixed or another version is set (the coordinator
-//!   does not tell it again, `decide`).
+//!   does not tell it again, `decide`). A pinned host is not counted failed: root holds it on
+//!   a release, which is no verdict on the desired one.
 //! - `converged`: past the quiet start, at least one live host, every live host at the
 //!   desired version, none updating or failed or still baking or waiting for a promotion,
-//!   and at least `min_up` hosts of the storage and of the frontend role up. The last two
+//!   and at least `min_up` hosts of the storage and of the frontend role up (so a host pinned
+//!   to another version keeps the farm `in_progress`). The last two
 //!   keep a coordinator that has just restarted, and has heard from few hosts, from
 //!   reporting a farm converged.
 //! - `halted`: a host reported a failure no version can repair and an operator has not
@@ -35,6 +37,7 @@ use crate::fleet::{Fleet, Host};
 use crate::membership::HostCounts;
 use crate::ops::Halt;
 use crate::services::ServiceDef;
+use crate::writes::Record;
 
 /// Where the farm stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -61,10 +64,20 @@ pub struct RoleCounts {
     pub at_desired: usize,
     /// Live and updating.
     pub updating: usize,
-    /// Live, behind, not updating, and the last update to the desired version failed.
+    /// Live, behind, not updating, not pinned, and the last update to the desired version
+    /// failed.
     pub failed: usize,
     /// Silent for [`crate::fleet::DOWN_AFTER`] or more.
     pub down: usize,
+    /// Live and pinned ([`Host::is_pinned`]), whatever they run: counted in `at_desired` too
+    /// when they run the desired version, never in `failed`. Left out when there are none, so
+    /// the answer of a farm with no pin is the one it has always been.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub pinned: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 /// The halt a convergence names: the host, the check and the version.
@@ -109,6 +122,12 @@ pub struct Convergence {
     /// The commit this coordinator was built from ([`crate::BUILD_COMMIT`]): what a client
     /// compares with a release before it orders one.
     pub commit: &'static str,
+    /// The record of the writes of the desired state ([`crate::writes`]): its generation,
+    /// what the last change of version replaced, and the id of the write that made it. The
+    /// coordinator fills it in from its store; this module, which reads no store, leaves it
+    /// empty.
+    #[serde(flatten)]
+    pub record: Record,
 }
 
 impl Convergence {
@@ -124,7 +143,8 @@ impl Convergence {
 }
 
 fn failed_to_reach(host: &Host, desired: &Desired) -> bool {
-    host.beat.version != desired.version
+    !host.is_pinned()
+        && host.beat.version != desired.version
         && host.beat.updating.is_none()
         && host
             .beat
@@ -158,6 +178,7 @@ fn counts(
             .filter(|h| h.is_live(now) && failed_to_reach(h, desired))
             .count(),
         down: mine().filter(|h| !h.is_live(now)).count(),
+        pinned: mine().filter(|h| h.is_live(now) && h.is_pinned()).count(),
     }
 }
 
@@ -176,7 +197,7 @@ pub fn role_counts(
     def.role_names()
         .into_iter()
         .map(|role| counts(&def.name, role, desired, fleet, now))
-        .filter(|c| c.at_desired + c.updating + c.failed + c.down > 0)
+        .filter(|c| c.at_desired + c.updating + c.failed + c.down + c.pinned > 0)
         .collect()
 }
 
@@ -235,6 +256,7 @@ fn converge_with(
             halt: None,
             hosts: None,
             commit: crate::BUILD_COMMIT,
+            record: Record::default(),
         };
     };
     let service = def.name.as_str();
@@ -282,5 +304,6 @@ fn converge_with(
         halt: None,
         hosts: None,
         commit: crate::BUILD_COMMIT,
+        record: Record::default(),
     }
 }

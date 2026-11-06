@@ -149,8 +149,8 @@ fn a_slot_held_by_an_update_is_no_slot_not_baking() {
     assert_eq!(why(&s, &f, "b", 100), held(Hold::NoSlot));
 }
 
-/// A pending promotion holds the slot, and the host is not up: with a minimum of one other
-/// host up, the next host waits while it is pending and goes when it clears.
+/// A pending promotion holds the slot, and the host is not up: the next host waits while it
+/// is pending, with a limit of two as with one, and goes when it clears.
 #[test]
 fn promotion_pending_holds_the_slot_and_is_not_up_until_it_clears() {
     let mut pending = beat("2.0");
@@ -169,7 +169,13 @@ fn promotion_pending_holds_the_slot_and_is_not_up_until_it_clears() {
     let mut f = Fleet::new(Duration::ZERO);
     beats(&mut f, "a", &pending, 100);
     beats(&mut f, "b", &beat("1.0"), 100);
-    assert_eq!(why(&up, &f, "b", 100), held(Hold::MinUp), "a is not up");
+    assert_eq!(
+        why(&up, &f, "b", 100),
+        held(Hold::NoSlot),
+        "a holds the one slot"
+    );
+    let a = f.get(&id("a")).expect("a");
+    assert!(!f.is_up(KBF, &id("a"), a, secs(100)), "a is not up");
     beats(&mut f, "a", &beat("2.0"), 115);
     beats(&mut f, "b", &beat("1.0"), 115);
     assert_eq!(why(&up, &f, "b", 115), go());

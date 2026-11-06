@@ -2,10 +2,17 @@
 # heartbeats to the coordinator over mutual TLS and runs this host's update through the local
 # socket of kbf-host-local.service. It listens on nothing.
 #
+# The `kbf` deb ships this unit and enables it (packaging/linux/README.md). The program is in no
+# package: an operator places it at /usr/libexec/kbf/kbf-updater (docs/deploy/host-install.md,
+# "Getting the binary"), where no release writes, and until it is there this unit is skipped, not
+# failed. The farm's names below are examples: a host gives the farm's in a drop-in that replaces
+# ExecStart (README.md beside this directory, "A host that runs the package").
+#
 # The certificate and key are the host's own: `kbf-updater enroll` (README.md, "Enrolling a host")
 # makes them in the state directory with a one-time token, and the agent renews them there at half
 # their life at the frontend's enroll listener (--enroll-frontend). The state directory is the
-# agent's alone (mode 0700). Edit the names to the farm's.
+# agent's alone (mode 0700). An agent started before the host is enrolled says once that it is not
+# enrolled, calls nothing, and starts by itself once `kbf-updater enroll` has run.
 #
 # This unit gives the agent NO operator token. The drain of the node, its undrain and its status
 # (a storage host's: its own storage health) are calls to the frontend's worker listener
@@ -26,6 +33,7 @@ Description=kbf-updater agent, this host's update agent
 Documentation=https://github.com/komira-ai/kbf/blob/main/docs/design/updates.md
 After=network-online.target kbf-host-local.service
 Wants=network-online.target kbf-host-local.service
+ConditionFileIsExecutable=/usr/libexec/kbf/kbf-updater
 
 [Service]
 Type=simple

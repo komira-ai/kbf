@@ -41,6 +41,8 @@ async fn a_server_shows_the_pack_reads_its_daemons_report() {
         unasked: 1,
         lost: 3,
         damaged: 4,
+        fallback_lost: 6,
+        fallback_damaged: 7,
     };
     reading.beat_acked(&[], Some(counts)).await;
     plain.beat_acked(&[], None).await;
@@ -52,6 +54,8 @@ async fn a_server_shows_the_pack_reads_its_daemons_report() {
         ("unasked", 1),
         ("lost", 3),
         ("damaged", 4),
+        ("fallback_lost", 6),
+        ("fallback_damaged", 7),
     ] {
         let header = format!("# TYPE kbf_pack_daemon_{family}_total counter\n");
         assert!(text.contains(&header), "{header}{text}");
@@ -146,7 +150,8 @@ async fn a_server_shows_the_pack_writes_its_daemons_report() {
     }
     let node_b = text.lines().filter(|l| l.contains("node=\"node-b\""));
     let node_b: Vec<&str> = node_b.collect();
-    assert_eq!(node_b.len(), 6, "{text}");
+    // The eight read families, and none of the writes.
+    assert_eq!(node_b.len(), 8, "{text}");
     assert!(
         node_b.iter().all(|l| l.starts_with("kbf_pack_daemon_")),
         "{text}"

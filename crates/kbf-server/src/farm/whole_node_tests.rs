@@ -109,6 +109,7 @@ impl Rig {
                     do_not_cache: false,
                     needs,
                     whole_worker: false,
+                    pin: None,
                 },
                 call: None,
                 described: kbf_front::Described::default(),

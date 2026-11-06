@@ -1,8 +1,8 @@
 # kbf: the Linux package
 
 One package, `kbf`: the runtime `/usr/bin/kbf`, the systemd units of its modes and `kbf.slice`,
-the users and directories they run with, and the trust directory that verifies attestations
-offline. Installing a newer `kbf` package is the update: the package manager replaces
+the users and directories they run with, the trust directory that verifies attestations
+offline, and, in the deb, the units of the host's update agent, enabled. Installing a newer `kbf` package is the update: the package manager replaces
 `/usr/bin/kbf`. (Until v0.0.7 a second package, `kbf-installer`, carried the users, directories,
 slice and trust directory and the proxy; releases no longer publish it, and the `kbf` package
 takes over its files: see "Upgrading a host that has kbf-installer" in
@@ -20,6 +20,7 @@ and `crates/xtask/src/pkg_linux.rs` is the one place that says what goes in it.
 | `units/` | the unit files, installed to `/usr/lib/systemd/system`: the five mode units and `kbf.slice` go in the package; `kbf-installer.service`, `kbf-proxy.service` and `kbf-proxy.socket` are the retired installer's and proxy's and are in no package (a test names them); `testdata/units` is the fixture for the unit tests only |
 | `testdata/` | fixtures for the package tests only: gated units (the five mode units and the slice among them) and three stand-in trust files |
 | `test/ubuntu`, `test/fedora` | the fresh systems the install test uses, systemd as PID 1, pinned by digest |
+| `../host-agent/linux` | the deb takes three files from it: `kbf-host-local.service` and `kbf-updater-agent.service`, installed to `/usr/lib/systemd/system`, and `kbf-updater.conf`, the agent's account, installed to `/usr/lib/sysusers.d/kbf-updater.conf` (`--host-agent`; the other files there are not packaged) |
 
 (The source files keep the name `kbf-installer.conf`: `packaging/install.sh` and `cargo xtask
 installer-tarball`, which no release publishes, still place them under it.)
@@ -36,6 +37,19 @@ installer-tarball`, which no release publishes, still place them under it.)
 - `/usr/lib/sysusers.d/kbf.conf` (the users and the group) and `/usr/lib/tmpfiles.d/kbf.conf` (the
   unit author's file, packaged unchanged; `/var/lib/kbf-installer` is made by `kbf-installer
   setup`, not at install);
+- in the deb only, the host's update agent (`AGENT_UNITS` in `pkg_linux.rs`;
+  [../host-agent/README.md](../host-agent/README.md), "A host that runs the package"):
+  `kbf-host-local.service`, the helper's local socket, which installs the attested package
+  (`--layout deb`) and restarts `kbf-daemon.service`, and `kbf-updater-agent.service`, the agent,
+  both 0644 in `/usr/lib/systemd/system`; a link to each in
+  `/usr/lib/systemd/system/multi-user.target.wants/`, which enables it (below); and
+  `/usr/lib/sysusers.d/kbf-updater.conf`, the agent's account `kbf-updater` and the group
+  `updater-register`. The programs the two units run, `/usr/libexec/kbf/kbf-host-install` and
+  `/usr/libexec/kbf/kbf-updater`, are in no package: they sit at fixed paths that no release
+  writes, so that going back to a release never runs code of the release it leaves
+  ([../../docs/deploy/host-install.md](../../docs/deploy/host-install.md), "Getting the binary").
+  The rpm has none of these: its helper would install with `--layout rpm`, and no rpm is
+  published;
 - `/etc/needrestart/conf.d/kbf.conf` (0644): on Ubuntu, needrestart restarts every service that
   maps a library an unattended upgrade replaced. A restart of a storage member in the middle of
   a build leaves the blobs only that member holds unreadable for the restart, and the client's
@@ -87,18 +101,29 @@ ignored and logged as retired).
 Never Podman, never Envoy (a test pins it): nothing in the package depends on, installs or checks
 Envoy, and kbf runs none.
 
-## Installing starts and enables nothing
+## Installing starts nothing and enables only the host agent
 
 The package has no maintainer script (`xtask pkg-install-test` fails on one or on a dependency, in both formats; the
 configuration names none, which a test in `pkg_linux/tests.rs` pins), so nothing runs at install,
-upgrade, remove or purge: no unit is enabled, started or restarted, no user or directory is
-created by a script.
+upgrade, remove or purge: no unit is started or restarted, and no user or directory is created by
+a script.
 
-- Units ship disabled. Each gates on its configuration (`ConditionPathExists=` of
+- The units of the modes ship disabled. Each gates on its configuration (`ConditionPathExists=` of
   `/etc/kbf/kbf.toml` for a mode unit); the test starts each `--gate` unit of the package
   without its file (skipped, `ConditionResult=no`, no `ExecStart` run) and with it (condition
   holds). The mode units' gates are held by
   `crates/kbf-integration-test/tests/package_units.rs`, which reads the files.
+- The deb enables the host agent's two units with files, not a script: the links
+  `/usr/lib/systemd/system/multi-user.target.wants/<unit> -> ../<unit>` are the package's own, and
+  systemd reads them at every boot, so both units start from the next boot (or after
+  `systemctl daemon-reload` and a `systemctl start`). Systemd 255 prints `disabled` for them in
+  `systemctl is-enabled`, which reports only links under `/etc`; `systemctl show -p WantedBy`
+  says `multi-user.target`, and that is what the install test checks. An operator turns one off
+  with `systemctl mask`, which an upgrade keeps (`systemctl disable` removes nothing of the
+  package's). Each is gated on its program (`ConditionFileIsExecutable=` of
+  `/usr/libexec/kbf/...`), so a host with the package and not yet the programs skips both at boot
+  instead of failing them in a loop; the test gates both. The agent started before the host is
+  enrolled says once that it is not enrolled and starts once `kbf-updater enroll` has run.
 - **Upgrading `kbf` restarts nothing.** `apt install kbf` or `dnf upgrade kbf` replaces
   `/usr/bin/kbf`; a running process keeps the old file. An operator (or the tool that drains a
   node and installs the new package) restarts the mode unit after the install
@@ -116,8 +141,8 @@ created by a script.
 - The users and directories come from `systemd-sysusers` and `systemd-tmpfiles`, which
   run at boot, and from `kbf-installer setup`. After `dpkg -i` and before either, they do
   not exist; the test runs both commands as boot does and checks the result.
-- `remove` deletes the packaged files and keeps `/etc/kbf`, `/var/lib/kbf-installer` and
-  the users. `purge` (deb) does the same and drops the package's record: the package owns
+- `remove` deletes the packaged files, the host agent's units and their links with them, and
+  keeps `/etc/kbf`, `/var/lib/kbf-installer` and the users. `purge` (deb) does the same and drops the package's record: the package owns
   none of what `setup` and the operator write, so it deletes none of it.
 
 ## In CI: the real packages, attested
@@ -166,11 +191,14 @@ cargo xtask pkg-config --kbf <kbf> --units packaging/linux/units \
   --sysusers packaging/linux/sysusers.d/kbf-installer.conf \
   --tmpfiles packaging/linux/tmpfiles.d/kbf-installer.conf \
   --needrestart packaging/linux/needrestart/kbf.conf \
+  --host-agent packaging/host-agent/linux \
   --platform linux-x86_64 --version <v> --out <dir>
       # <dir>/nfpm.yaml and listing.txt
 cargo xtask pkg-build --nfpm <nfpm> --config <dir>/nfpm.yaml --out <pkgs>
 cargo xtask pkg-install-test --name kbf --package <file> --format deb|rpm --listing <dir>/listing.txt \
-  --image-dir packaging/linux/test/ubuntu --gate kbf-daemon.service=/etc/kbf/kbf.toml ...
+  --image-dir packaging/linux/test/ubuntu --gate kbf-daemon.service=/etc/kbf/kbf.toml \
+  --gate kbf-host-local.service=/usr/libexec/kbf/kbf-host-install \
+  --gate kbf-updater-agent.service=/usr/libexec/kbf/kbf-updater ...
 cargo xtask pkg-upgrade-test --old-installer <kbf-installer deb> --old-kbf <kbf deb> \
   --package <pkgs> --listing <dir>/listing.txt --image-dir packaging/linux/test/ubuntu
 cargo xtask pkg-kbf-asset --package <pkgs> --platform linux-x86_64 --commit <sha> \

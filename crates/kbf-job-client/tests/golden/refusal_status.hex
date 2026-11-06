@@ -1,0 +1,20 @@
+# Copied unchanged from crates/js-proto/tests/golden/refusal_status.hex of komira-ai/jobscheduler at the revision
+# the root Cargo.toml pins; the file names in the comments below are js-proto's own.
+# The details of the status refusal_status(JobIdConflict, "job-1 names another job") answers, 103 bytes:
+# a google.rpc.Status (code 1, message 2, details 3) whose one google.protobuf.Any
+# (type_url 1, value 2) holds the Refusal. Written by hand from those field numbers, not
+# by the crate, and read by tests/wire.rs. Hex pairs; '#' starts a comment.
+08 06                                                  # code = 6, ALREADY_EXISTS (field 1, varint)
+12 17                                                  # message (field 2, 23 bytes): the detail
+  6a 6f 62 2d 31 20 6e 61 6d 65 73 20 61 6e 6f 74      # 'job-1 names anot'
+  68 65 72 20 6a 6f 62                                 # 'her job'
+1a 4a                                                  # details (field 3, one google.protobuf.Any of 74 bytes):
+  0a 2b                                                # type_url (field 1, 43 bytes): type.googleapis.com/jobscheduler.v1.Refusal
+    74 79 70 65 2e 67 6f 6f 67 6c 65 61 70 69 73 2e    # 'type.googleapis.'
+    63 6f 6d 2f 6a 6f 62 73 63 68 65 64 75 6c 65 72    # 'com/jobscheduler'
+    2e 76 31 2e 52 65 66 75 73 61 6c                   # '.v1.Refusal'
+  12 1b                                                # value (field 2, an encoded jobscheduler.v1.Refusal of 27 bytes):
+    08 01                                              # code = 1, REFUSAL_CODE_JOB_ID_CONFLICT (field 1, varint)
+    12 17                                              # detail (field 2, 23 bytes)
+      6a 6f 62 2d 31 20 6e 61 6d 65 73 20 61 6e 6f 74  # 'job-1 names anot'
+      68 65 72 20 6a 6f 62                             # 'her job'

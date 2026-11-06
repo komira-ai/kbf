@@ -49,8 +49,10 @@ is tried again keeps its unit name; bound its `stop` and escalate to `SIGKILL`; 
 `RuntimeMaxSec=` does nothing), since a killed updater takes the dead-man with it.
 
 What is not here: the unprivileged agent that talks to the coordinator, the registration client crate
-(step 4a), the declaration loader and approval, the transient-unit launcher (step 3), and wiring a
-binary. The root-only checks (a registration from another user, the real systemd restart limit) need
+(step 4a), the declaration loader and approval, and the transient-unit launcher (step 3). The binary
+that wires them to this crate is the root part of `kbf-updater` (`kbf-updater root`,
+`crates/kbf-updater/src/root`): its launcher is `update_rights`'s transient unit, and its
+`register::Declared` is the loaded declarations. The root-only checks (a registration from another user, the real systemd restart limit) need
 the `cargo xtask sudo-test` job and are not part of this crate's fast tests.
 
 ## Limits the caller should know

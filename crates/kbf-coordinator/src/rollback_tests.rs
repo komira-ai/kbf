@@ -724,8 +724,8 @@ async fn a_restart_after_the_mark_and_before_the_desired_write_finishes_the_roll
 }
 
 /// CI setting a version by hand removes its mark (design 5.3), in the file as well, and the
-/// version is ordered again; the coordinator does not roll it back. Setting another version
-/// leaves the mark where it is.
+/// version is ordered again, to one host at a time (the first asked); the coordinator does not
+/// roll it back. Setting another version leaves the mark where it is.
 #[tokio::test]
 async fn setting_a_bad_version_by_hand_clears_the_mark() {
     let mut rig = rig("rb-by-hand", AUTO, TWO).await;
@@ -745,10 +745,12 @@ async fn setting_a_bad_version_by_hand_clears_the_mark() {
     let replies = round(&rig, 2_100, &[]);
     assert_eq!(wanted(&rig), version("2.0"));
     assert!(
-        replies
-            .iter()
-            .all(|r| matches!(r, ServiceReply::Update { .. })),
+        matches!(&replies[0], ServiceReply::Update { version: v, .. } if *v == version("2.0")),
         "{replies:?}"
+    );
+    assert!(
+        replies[1..].iter().all(|r| *r == ServiceReply::Nothing),
+        "one update at a time: {replies:?}"
     );
     let audit = status(&rig).ops.audit;
     assert!(audit.iter().any(|e| e.action == "unmark_bad"), "{audit:?}");

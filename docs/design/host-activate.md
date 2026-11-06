@@ -81,7 +81,23 @@ The agent's directory is the agent account's, so the hold file is written throug
 descriptor, made aside with `O_EXCL|O_NOFOLLOW`, renamed over the name, and the name is checked to
 hold the file written (an owner that swaps the aside file before the rename makes the write an
 error, not a published hold); the directory is synced. That account can always remove or replace
-the file afterwards: the agent that reads it is to trust only a file owned by root.
+the file afterwards: the agent that reads it trusts only a file owned by root.
+
+The agent looks at the hold file, at the helper's fixed path, for every heartbeat and again
+before every order for `kbf`. While root's regular file is there (one its group and others may
+not write) it runs no such order and says `pinned` (with the commit the file names) in every
+heartbeat; a link, another account's file, a writable one or anything but a regular file is no
+pin; root's file that cannot be read, or names no commit, and a name that cannot be looked at,
+pin all the same, with no commit. An update already running is not cut.
+The services besides `kbf` are not pinned: the hold names a `kbf` release. The coordinator holds
+a pinned host (`pinned`), keeps its slot (so a pin never lets the rollout go on to the next host;
+with one update live at a time across every service, nothing is ordered anywhere while it stands),
+counts it neither failed nor at another version, and takes no vote for a rollback from it.
+
+`kbf-host-install unpin` undoes the pin under the install lock: the commit is taken out of
+`retain.json` first, then the hold file is removed, so a run cut short between the two is
+finished by asking again. A coordinator `force` that names the pinned commit is to clear the pin
+too; that action does not exist yet, and until it does an unpin is the only way.
 
 ### Compatibility
 

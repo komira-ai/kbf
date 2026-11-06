@@ -312,7 +312,14 @@ fn numbers_stay_within_bounds() {
         ("rollback = 600", "rollback"),
         ("cleanup = 1300", "cleanup"),
     ] {
-        for n in ["0", over.as_str()] {
+        // `prepare = 0` is no bound (tests/unbounded_prepare.rs); for every other step 0 is out of
+        // range, and for every step a number over the cap is.
+        let numbers: &[&str] = if step == "prepare" {
+            &[over.as_str()]
+        } else {
+            &["0", over.as_str()]
+        };
+        for n in numbers {
             let text = with_in(SAMPLE, anchor, &format!("{step} = {n}"));
             assert_eq!(
                 field_of(&refusal(&text)),

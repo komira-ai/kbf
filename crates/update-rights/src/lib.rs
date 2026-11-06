@@ -25,8 +25,8 @@ pub use declaration::{Declaration, Hook, Refusal, Signer, StepCapabilities, Time
 pub use digest::{BadDigest, Digest};
 pub use gate::{Deferral, FIRST_INSTALL, Gate, RIGHTS_CHANGE, gate};
 pub use launch::{
-    Finished, Launch, LaunchError, RunError, Spawner, StepRun, Systemd, SystemdRun, command,
-    properties, run_step, unit_name,
+    Finished, Launch, LaunchError, RunError, Spawner, StepRun, Systemd, SystemdRun, boot_command,
+    boot_properties, boot_unit_name, command, properties, run_boot, run_step, unit_name,
 };
 pub use load::{DECLARATION_DIR, Declared, Loaded, Policy, Refused, check_state_dir, load_dir};
 pub use widening::widening;

@@ -36,6 +36,7 @@ pub fn beat(running: &str) -> Heartbeat {
         step_secs: Default::default(),
         promotion_pending: false,
         deferred: None,
+        pinned: None,
     }
 }
 

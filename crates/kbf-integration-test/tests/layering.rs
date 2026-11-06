@@ -80,8 +80,12 @@
 //! - the declaration and rights crate (`update-rights`) linking, in its normal tree or among its
 //!   dev-dependencies, any other crate of this workspace but the hook contract, or having `kbf` in
 //!   its name; and a walk that cannot see its dependencies, which would make that check pass
-//!   vacuously.
+//!   vacuously;
+//! - the job service client (`kbf-job-client`, in `job_client_layer`) reaching a scheduler crate
+//!   other than `js-proto`, or a kbf crate, or being depended on by any crate of this workspace.
 
+mod job_client_layer;
+mod step_runner_layer;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::process::Command;
 

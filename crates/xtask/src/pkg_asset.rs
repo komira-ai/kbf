@@ -92,15 +92,39 @@ fn not_a_tar(e: std::io::Error) -> String {
 
 /// The regular files of the gzip-compressed tar `tgz`.
 pub(crate) fn members(tgz: &[u8]) -> Result<Vec<Member>, String> {
+    contents(tgz).map(|(files, _)| files)
+}
+
+/// The path of a tar entry without a leading `./` or `/`.
+fn bare(path: &[u8]) -> String {
+    String::from_utf8_lossy(path)
+        .trim_start_matches("./")
+        .trim_start_matches('/')
+        .to_owned()
+}
+
+/// A symbolic link of a tar: its path, without a leading `./` or `/`, and what it points to.
+pub(crate) type Link = (String, String);
+
+/// The regular files of the gzip-compressed tar `tgz`, and its symbolic links.
+pub(crate) fn contents(tgz: &[u8]) -> Result<(Vec<Member>, Vec<Link>), String> {
     let mut tar = Vec::new();
     flate2::read::GzDecoder::new(tgz)
         .read_to_end(&mut tar)
         .map_err(|e| format!("not a gzip stream: {e}"))?;
     let mut archive = tar::Archive::new(&tar[..]);
     let mut found = Vec::new();
+    let mut links = Vec::new();
     for entry in archive.entries().map_err(not_a_tar)? {
         let mut entry = entry.map_err(not_a_tar)?;
-        if entry.header().entry_type() != tar::EntryType::Regular {
+        let kind = entry.header().entry_type();
+        if kind == tar::EntryType::Symlink {
+            let target = entry.link_name_bytes().unwrap_or_default();
+            let target = String::from_utf8_lossy(&target).into_owned();
+            links.push((bare(&entry.path_bytes()), target));
+            continue;
+        }
+        if kind != tar::EntryType::Regular {
             continue;
         }
         let path = String::from_utf8_lossy(&entry.path_bytes()).into_owned();
@@ -110,17 +134,13 @@ pub(crate) fn members(tgz: &[u8]) -> Result<Vec<Member>, String> {
             .mode()
             .and_then(|mode| entry.read_to_end(&mut bytes).map(|_| mode))
             .map_err(|e| format!("{path}: {e}"))?;
-        let path = path
-            .trim_start_matches("./")
-            .trim_start_matches('/')
-            .to_owned();
         found.push(Member {
-            path,
+            path: bare(path.as_bytes()),
             mode: mode & 0o777,
             bytes,
         });
     }
-    Ok(found)
+    Ok((found, links))
 }
 
 /// The members of an `ar` archive (a deb): name without the trailing `/`, and bytes.
@@ -155,11 +175,12 @@ fn ar_members(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>, String> {
     Ok(found)
 }
 
-/// A deb as the checks read it: the text of its `control` file and the regular files of its
-/// data tarball.
+/// A deb as the checks read it: the text of its `control` file and the regular files and the
+/// symbolic links (path and target) of its data tarball.
 pub(crate) struct Opened {
     pub(crate) control: String,
     pub(crate) files: Vec<Member>,
+    pub(crate) links: Vec<Link>,
 }
 
 impl Opened {
@@ -213,10 +234,11 @@ pub(crate) fn open(deb: &[u8], platform: Platform, problems: &mut Vec<String>) -
             text
         }
     };
-    match members(data) {
-        Ok(files) => Some(Opened {
+    match contents(data) {
+        Ok((files, links)) => Some(Opened {
             control: text,
             files,
+            links,
         }),
         Err(e) => {
             problems.push(format!("data.tar.gz: {e}"));

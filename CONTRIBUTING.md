@@ -62,7 +62,10 @@ cargo fmt --all --check
 
 There is no other build system in this repository.
 
-The tests that need Postgres fail, and are not skipped, when no server is named. Set
+The tests that need Postgres fail, and are not skipped, when no server is named. The one
+exception is `crates/kbf-server/tests/pack_index_flag.rs`: outside CI (no `CI` variable) its
+Postgres tests pass without running and print a line naming the variable; under CI they fail
+like the rest. No kbf-server lib test needs a server. Set
 `KBF_TEST_POSTGRES_URL` to the URL of a server and a superuser role (the tests create and
 drop databases and roles), for example `postgres://postgres@localhost:5432/postgres`; the
 Postgres service container of `.github/workflows/ci.yml` is one. Each such test makes a

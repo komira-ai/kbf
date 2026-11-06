@@ -103,7 +103,7 @@ The packages are the two Linux jobs' debs (one each) and container images (three
 
 | Asset | Built by | Holds |
 |---|---|---|
-| `kbf-<commit>-linux-x86_64.deb` | the `linux-x86_64` job (`ubuntu-24.04`, nfpm for amd64) | the `kbf` of the tarball of the same name at `/usr/bin/kbf`, the unit of every mode, `kbf.slice`, the users and directories they run with, and the trust directory (the pinned `gh` for amd64, the Sigstore trusted root, `installer.conf`); it replaces the old `kbf-installer` |
+| `kbf-<commit>-linux-x86_64.deb` | the `linux-x86_64` job (`ubuntu-24.04`, nfpm for amd64) | the `kbf` of the tarball of the same name at `/usr/bin/kbf`, the unit of every mode, `kbf.slice`, the users and directories they run with, the trust directory (the pinned `gh` for amd64, the Sigstore trusted root, `installer.conf`), and the host agent's two units, enabled, with the agent's account; it replaces the old `kbf-installer` |
 | `kbf-<commit>-linux-arm64.deb` | the `linux-arm64` job (`ubuntu-24.04-arm`, nfpm for arm64) | the same for arm64 |
 | `kbf-frontend-image-<commit>-linux-x86_64.oci.tar` | the `linux-x86_64` job (`ubuntu-24.04`, BuildKit) | an OCI image of the `kbf` of the tarball of the same name, which runs `kbf --mode=frontend` as a user that is not root |
 | `kbf-frontend-image-<commit>-linux-arm64.oci.tar` | the `linux-arm64` job | the same for arm64 |
@@ -415,6 +415,13 @@ How a bundle is made, and what is checked of it:
   make them at boot, and no maintainer script does;
 - `/etc/needrestart/conf.d/kbf.conf`, a configuration file a host may edit, which keeps
   needrestart from restarting a kbf unit in the middle of a build;
+- the host's update agent: `kbf-host-local.service` (the helper's local socket, which installs this
+  package, `--layout deb`) and `kbf-updater-agent.service` (the agent), enabled by the package's
+  own links in `/usr/lib/systemd/system/multi-user.target.wants/`, and
+  `/usr/lib/sysusers.d/kbf-updater.conf`, the agent's account. The two programs they run are in no
+  package (their tarballs are below); until they are placed, both units are skipped at boot
+  ([../packaging/host-agent/README.md](../packaging/host-agent/README.md), "A host that runs the
+  package");
 - the trust directory `/usr/share/kbf/trust/`, which `kbf-host-install` and the installer read to
   verify an attestation without a network: `gh` is the pinned `gh` the job downloaded (checked by
   SHA-256 before use) and executable, `trusted_root.jsonl` is the Sigstore trusted root that `gh`
@@ -426,7 +433,8 @@ How a bundle is made, and what is checked of it:
   fallback is removed in v0.0.9.)
 
 The package has no maintainer script, so the package manager replaces the file and restarts
-nothing: the operator restarts the mode unit that runs it (a stop drains).
+nothing: the operator restarts the mode unit that runs it (a stop drains). It enables only the host
+agent's two units, by the links above, and starts nothing.
 Each mode unit runs `kbf boot-check` before it starts `kbf`: the check is the `kbf` file itself
 (it brings the state database to the schema that `kbf` needs, for the modes that keep state in
 it). The package depends on no package: a host updates it with a plain `dpkg --install`

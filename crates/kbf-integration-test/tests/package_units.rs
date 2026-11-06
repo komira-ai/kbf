@@ -1511,6 +1511,7 @@ fn setup_enables_only_units_the_kbf_deb_ships() {
         sysusers: &at("sysusers.d/kbf-installer.conf"),
         tmpfiles: &at("tmpfiles.d/kbf-installer.conf"),
         needrestart: &at("needrestart/kbf.conf"),
+        host_agent: &at("../host-agent/linux"),
         platform: xtask::package::Platform::LinuxX86_64,
         version: "0.0.0+ci",
     })

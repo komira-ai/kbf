@@ -16,7 +16,10 @@
 //! - **Lost** (the index has a row and the object store does not have the bytes it points at) and
 //!   **damaged** (the bytes are not the digest): the read fails, as [`CasError::Unavailable`] and
 //!   [`CasError::Corrupt`], and is logged and counted. Nothing falls back to `C` for these: the
-//!   index says the blob is in a pack, and a bad pack is for the operator to know.
+//!   index says the blob is in a pack, and a bad pack is for the operator to know. A plane made
+//!   with [`PackedCas::falling_back`] reads the packs through a cache that is not the source of
+//!   truth (a tierstore on loopback): there a lost or damaged blob is still logged, counted apart
+//!   ([`PackStats::fallback_lost`], [`PackStats::fallback_damaged`]), and the read goes to `C`.
 //!
 //! **Writes** are `C`'s, unchanged, unless the plane was built to write packs
 //! ([`PackedCas::with_writes`]): then [`Cas::put`], [`Cas::put_chunks`], [`Cas::put_records`] and
@@ -118,6 +121,13 @@ pub struct PackStats {
     pub lost: u64,
     /// Reads that failed because the bytes in the pack are not the digest.
     pub damaged: u64,
+    /// Reads of a plane made with [`PackedCas::falling_back`] whose pack is gone or too short,
+    /// sent to the plane underneath, whose answer is the read's; never counted in `lost`.
+    pub fallback_lost: u64,
+    /// Reads of a plane made with [`PackedCas::falling_back`] whose bytes in the pack are not the
+    /// digest, sent to the plane underneath, whose answer is the read's; never counted in
+    /// `damaged`.
+    pub fallback_damaged: u64,
     /// What the plane wrote into packs, and what it wrote elsewhere instead.
     pub writes: WriteStats,
 }
@@ -128,6 +138,16 @@ impl fmt::Display for PackStats {
             f,
             "served={} served_bytes={} elsewhere={} unasked={} lost={} damaged={}",
             self.served, self.served_bytes, self.elsewhere, self.unasked, self.lost, self.damaged
+        )?;
+        // Only a plane that falls back counts these, so the line of one that does not is the
+        // line it always was.
+        if self.fallback_lost + self.fallback_damaged == 0 {
+            return Ok(());
+        }
+        write!(
+            f,
+            " fallback_lost={} fallback_damaged={}",
+            self.fallback_lost, self.fallback_damaged
         )
     }
 }
@@ -141,6 +161,8 @@ impl From<PackStats> for PackReadCounts {
             unasked: stats.unasked,
             lost: stats.lost,
             damaged: stats.damaged,
+            fallback_lost: stats.fallback_lost,
+            fallback_damaged: stats.fallback_damaged,
         }
     }
 }
@@ -188,6 +210,8 @@ struct Counts {
     unasked: AtomicU64,
     lost: AtomicU64,
     damaged: AtomicU64,
+    fallback_lost: AtomicU64,
+    fallback_damaged: AtomicU64,
     /// Whether the last read that asked the packs could not (and it was logged as a warning).
     failing: AtomicBool,
     writes: WriteCounts,
@@ -203,6 +227,8 @@ impl Counts {
             unasked: get(&self.unasked),
             lost: get(&self.lost),
             damaged: get(&self.damaged),
+            fallback_lost: get(&self.fallback_lost),
+            fallback_damaged: get(&self.fallback_damaged),
             writes: self.writes.stats(),
         }
     }
@@ -219,6 +245,16 @@ impl Drop for Counts {
 /// Adds `n` to `counter`.
 fn add(counter: &AtomicU64, n: u64) {
     counter.fetch_add(n, Ordering::Relaxed);
+}
+
+/// What a read does with a blob whose pack is gone or whose bytes are not its digest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BadPack {
+    /// The read fails: the packs are the farm's object store, and a bad pack is the operator's.
+    Fail,
+    /// The plane underneath reads the blob: the packs are read through a cache in front of the
+    /// object store, and the plane underneath is the source of truth.
+    ReadElsewhere,
 }
 
 /// What the packs said about one read.
@@ -239,6 +275,8 @@ pub struct PackedCas<C: Cas> {
     asking: Arc<Semaphore>,
     /// What this plane writes packs with; `None` for a plane that only reads them.
     writes: Option<Writes>,
+    /// What a read does with a lost or damaged blob.
+    bad: BadPack,
 }
 
 impl<C: Cas> PackedCas<C> {
@@ -258,7 +296,22 @@ impl<C: Cas> PackedCas<C> {
             counts: Arc::clone(&counter.0),
             asking: Arc::new(Semaphore::new(MAX_ASKING)),
             writes: None,
+            bad: BadPack::Fail,
         }
+    }
+
+    /// This plane, reading a blob whose pack is gone or whose bytes in it are not its digest
+    /// from the plane underneath instead of failing the read: for packs read through a cache
+    /// that is not the source of truth, such as a tierstore on loopback in front of the object
+    /// store, where a miss, a stale or damaged copy, or a cache that is down must cost a read
+    /// from the plane underneath, whose answer (the blob, or its own failure) is the read's, and
+    /// never a failure of its own. The blob is still logged, and counted in
+    /// [`PackStats::fallback_lost`] or [`PackStats::fallback_damaged`] when the read is sent on,
+    /// never in `lost` or `damaged`, which stay the reads that failed at the packs.
+    #[must_use]
+    pub fn falling_back(mut self) -> Self {
+        self.bad = BadPack::ReadElsewhere;
+        self
     }
 
     /// This plane, its outputs written into packs by `writer` while `commit` is on (the `write`
@@ -389,20 +442,39 @@ impl<C: Cas> PackedCas<C> {
                 Found::Elsewhere
             }
             Fetch::Lost => {
-                add(&self.counts.lost, 1);
+                let (count, said) = match self.bad {
+                    BadPack::Fail => (&self.counts.lost, ""),
+                    BadPack::ReadElsewhere => {
+                        (&self.counts.fallback_lost, "; reading the blob as before")
+                    }
+                };
+                add(count, 1);
                 tracing::warn!(
                     blob = %label(digest),
-                    "pack reads: the pack that holds the blob is gone or too short"
+                    "pack reads: the pack that holds the blob is gone or too short{said}"
                 );
+                if self.bad == BadPack::ReadElsewhere {
+                    return Found::Elsewhere;
+                }
                 let why = "the pack that holds it is gone or shorter than the index says";
                 Found::Refused(CasError::Unavailable(label(digest), why.to_owned()))
             }
             Fetch::Damaged => {
-                add(&self.counts.damaged, 1);
+                let (count, said) = match self.bad {
+                    BadPack::Fail => (&self.counts.damaged, ""),
+                    BadPack::ReadElsewhere => (
+                        &self.counts.fallback_damaged,
+                        "; reading the blob as before",
+                    ),
+                };
+                add(count, 1);
                 tracing::error!(
                     blob = %label(digest),
-                    "pack reads: the bytes of the blob in its pack are not its digest"
+                    "pack reads: the bytes of the blob in its pack are not its digest{said}"
                 );
+                if self.bad == BadPack::ReadElsewhere {
+                    return Found::Elsewhere;
+                }
                 let other = "another digest, read from its pack";
                 Found::Refused(CasError::Corrupt(label(digest), other.to_owned()))
             }
@@ -436,6 +508,7 @@ impl<C: Cas> Cas for PackedCas<C> {
             counts: Arc::clone(&self.counts),
             asking: Arc::clone(&self.asking),
             writes: self.writes.clone(),
+            bad: self.bad,
         }
     }
 

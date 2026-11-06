@@ -29,13 +29,18 @@ version is this release". Its token is the run's own GitHub OIDC token, and it s
 heartbeats to the coordinator, is told the version, and updates itself through the root
 helper `kbf-host-install`, which fetches the release's package and checks its attestation.
 The job waits until the coordinator reports the farm converged. It then proves the farm
-with a remote-only Buck2 build.
+with a remote-only Buck2 build. When any of its steps fails, its last step sets the farm back to
+the version the release replaced (G1, done). The coordinator also sets the farm back on its own,
+job or no job, when enough hosts report the release failed after its commit (G2, partial: the
+coordinator side is done, but kbf's agent does not report that yet, section 2.5).
 
 What is still by hand (section 3):
 
 - the coordinator's own update;
-- a host's first install of the agent and helper;
-- going back after a red gamma;
+- a host's first install of the agent and helper programs (their units come with the package
+  since G6);
+- going back after a red gamma when the job cannot (CI is gone, until the agents report where
+  kbf's update failed, or the coordinator's rules hold the farm);
 - updating a Mac;
 - one-time setup (the coordinator, its allow-list, the repository variables, enrolling
   each host).
@@ -137,7 +142,7 @@ The job table below lists the jobs in the order they run. The repository lint `g
 | `bump` | `plan`, `tag`, `publish` | `contents: read`, plus a release-bot App token scoped to the downstream repository that pins kbf as a submodule, in environment `release` | opens a pull request there that moves the pin to the released commit | nothing: no job needs it, and the farm path does not depend on it |
 | `rehearse` | `plan`, `publish` | `contents: read`, the run token passed as a file | a host laid out from the previous release is updated to this one by the real helper under real systemd (`update_rehearsal`) | `gamma` |
 | `rehearse-agent` | `plan`, `publish` | `contents: read`, the run token passed as a file | the same host is updated through the whole control loop: this commit's coordinator, `cargo xtask deploy-farm`, and the previous release's agent and frontend (`update_rehearsal_agent`) | `gamma` |
-| `gamma` | `plan`, `publish`, `rehearse`, `rehearse-agent` | `contents: read`, `id-token: write` (the only job with OIDC), in environment `release`, no secret | `release farm-version` (the version the hosts report, `<semver>+g<12 hex>`). Then it joins the farm's Tailscale network when `TS_CLIENT_ID` is set, through workload identity federation. Then `cargo xtask deploy-farm`: it records a baseline, sends `POST /v1/desired`, and polls `GET /v1/convergence` until the farm converges. Then `cargo xtask prove-farm`: a remote-only Buck2 build, every action new. | nothing after it. The release stays published whatever it says. Its result is the run's colour. |
+| `gamma` | `plan`, `publish`, `rehearse`, `rehearse-agent` | `contents: read`, `id-token: write` (the only job with OIDC), in environment `release`, no secret | `release farm-version` (the version the hosts report, `<semver>+g<12 hex>`). Then it joins the farm's Tailscale network when `TS_CLIENT_ID` is set, through workload identity federation. Then `cargo xtask deploy-farm --deadline-min 60`: it records a baseline, sends `POST /v1/desired`, and polls `GET /v1/convergence` until the farm converges. Then `cargo xtask prove-farm`: a remote-only Buck2 build, every action new. Last, only when an earlier step failed, `cargo xtask deploy-farm restore`: the version this release replaced is set back as desired (G1). | nothing after it. The release stays published whatever it says. Its result is the run's colour. |
 <!-- release-jobs: end -->
 
 ### 2.4 The desired version, from the CI token to the hosts
@@ -171,15 +176,15 @@ clears the mark.
 version, `min_up` per role, and an optional `max_updating`). Nothing is sent to a host. On
 each heartbeat (every 15 s) the coordinator decides for that host, in a fixed order of
 rules: the quiet start after a restart, a bad mark, the host updating or busy, the host up
-to date, the host failed at this version, a deferral, the canary, a free slot within
-`max_updating` for the role (1 for frontend and storage, 2 for daemon and mac-daemon), the
-bake, the role order (a frontend waits for every other role), and `min_up` (a frontend is
+to date, the host failed at this version, a deferral, the canary, no update live anywhere (no host of any role holds an update slot for any
+service; a `max_updating` of 0 holds the role, a larger number has no effect), the bake, the role order (a frontend waits for every other role), and `min_up` (a frontend is
 never the last one up). The first rule that holds back the order wins. Otherwise the reply
 is `Update { version }`.
 
 The agent then has the helper fetch, verify, drain, switch and check health. It confirms,
 or the helper reverts on its own. kbf's shipped definition (`kbf.services.toml`) sets no
-canary, no bake and no automatic rollback.
+canary and no bake, and sets automatic rollback at the default threshold (G2): the larger of
+25% of the live hosts and two.
 
 **What makes the job red.** `deploy-farm` exits 1 when:
 
@@ -204,14 +209,25 @@ configuration, not code, and it is not committed.
 
 ### 2.5 What a red gamma does to the farm today
 
-Nothing stops the roll. The desired version stays at the new release. A host whose update
-failed its health check is put back by its helper, and it keeps its slot only until it
-heartbeats healthy again
-(rule 7 of `crates/kbf-coordinator/src/decide.rs`). Then the next host of that role is
-ordered to the same version. Automatic rollback (`rollback = "automatic"`,
-komira-ai/kbf#2181) exists in the coordinator, but kbf's shipped definition does not turn
-it on. A red proof (`prove-farm`) is not seen by the coordinator at all. The next code push
-releases again, and its `gamma` sets a newer version. Only `RELEASE_FREEZE` stops that.
+The job's last step, run only when an earlier one failed, sets the farm back (G1): while this
+release is still the desired version, it sets the version and minimums the release replaced,
+which the coordinator keeps as `replaced`, conditional on the generation it read, and the run
+stays red. That covers a red deploy (`blocked`, a stall, the deadline, a lost host) and a red
+proof (`prove-farm`), which the coordinator does not see at all. Until the restore runs, nothing
+stops the roll: a host whose update failed its health check is put back by its helper, and it
+keeps its slot only until it heartbeats healthy again (rule 7 of
+`crates/kbf-coordinator/src/decide.rs`). Then the next host of that role is ordered to the same
+version. kbf's shipped definition turns on the coordinator's automatic rollback
+(`rollback = "automatic"`, komira-ai/kbf#2181; G2): when the larger of 25% of the live hosts and
+two (two of six) report the release failed after its commit, the coordinator marks it bad and
+sets the last good version back as desired, with or without the job. It counts only a failure
+that a host reports with its phase (`after_commit` or `gate_release`, not blamed on the
+environment). kbf's own A/B update on a host (`crates/kbf-updater/src/agent/update.rs`) reports a
+failed update with no phase, so on a farm of today's agents the coordinator still holds the
+release (`blocked`), and the job's restore is the way back. A run that is cancelled, or
+whose runner is lost, restores nothing; the operator re-runs the failed jobs, or uses C1. The
+next code push releases again, and its `gamma` sets a newer version. Only `RELEASE_FREEZE` stops
+that.
 
 ## 3. Steps still done by hand
 
@@ -219,10 +235,10 @@ releases again, and its `gamma` sets a newer version. Only `RELEASE_FREEZE` stop
 |---|---|---|---|---|
 | M1 | Deploy the coordinator: its certificate from the farm CA with the role `coordinator`, the allow-list file, the operator token file, and `--services-file` for services other than kbf | once per farm | by hand ([kbf-updater.md](../deploy/kbf-updater.md), "Turn on the gamma stage", step 1) | stays by hand: it is the root of the farm's trust and is set where it is defined |
 | M2 | Update the coordinator: a new image, the tag changed in its unit, a restart. It is needed before any release that changes `crates/kbf-coordinator` or the wire (`crates/kbf-updater/src/wire.rs`). | every such release | by hand ([kbf-updater.md](../deploy/kbf-updater.md), "Updating the coordinator"). `KBF_REQUIRE_COORDINATOR_CURRENT=true` only fails the deploy. | G7 |
-| M3 | Install the agent and helper units on a new host (`packaging/host-agent`: "nothing here is in a package yet"), and add `--layout deb` to the helper's line | once per host | by hand | G6 |
+| M3 | Install the agent and helper units on a new host, and add `--layout deb` to the helper's line | once per host | done: the `kbf` deb ships and enables both units, the helper's with `--layout deb` (G6). Still by hand: placing the two programs, which no package carries so that no release writes them, and the farm's names, one drop-in that is the same on every host ([packaging/host-agent/README.md](../../packaging/host-agent/README.md), "A host that runs the package") | G6 (done) |
 | M4 | Issue a host's enrollment token (`POST /v1/enroll/tokens`) and run `kbf-updater enroll` | once per host | by hand | stays by hand: issuing an identity is the operator's act |
 | M5 | Set the repository and organisation variables (`KBF_COORDINATOR_URL`, `KBF_COORDINATOR_CA`, `KBF_MIN_UP_*`, `TS_CLIENT_ID`, `TS_AUDIENCE`, `FARM_*`), the Tailscale trust credential and its policy for `tag:ci`, and the `release` environment | once per farm | by hand | stays by hand: it is configuration of the farm, not of kbf |
-| M6 | After a red gamma, set the farm back: choose the version, and set it as desired. Only a CI token can, so that means re-running an earlier release's `gamma` job. | every red gamma | by hand | G1 (the ordinary case), G2 (when CI is gone), C1 (when the ordinary rules hold the farm) |
+| M6 | After a red gamma, set the farm back: choose the version, and set it as desired. Only a CI token can, so that means re-running an earlier release's `gamma` job. | every red gamma | the ordinary case is done by the job (G1, done); when CI is gone, by the coordinator (G2, coordinator side done) once the agents report where kbf's update failed, by hand until then; by hand when the ordinary rules hold the farm | G1 (the ordinary case, done), G2 (when CI is gone; partial: it needs the agent's phase, section 2.5), C1 (when the ordinary rules hold the farm) |
 | M7 | Go back on a host when the coordinator is down or cannot order it | rare | by hand. `kbf-deploy host rollback` serves hand-laid hosts only. On a package host, the helper's `revert` goes back only from a release on trial, and `switch` needs a release staged by `install`, on a trial clock. Nothing switches to any other kept release. | H1, H2 |
 | M8 | Update a Mac: it takes no update order yet, because the installer has no lease source for a launchd job ([kbf-installer-macos.md](../deploy/kbf-installer-macos.md), "What is still by hand") | every release | by hand | G8 |
 | M9 | Update a farm's only frontend, or its only storage host. A frontend is never the last one up, and a lone storage host with the default storage minimum (`KBF_MIN_UP_STORAGE` unset, so 1) would leave none up, so the coordinator orders neither, and `gamma` fails at its stall or deadline. The operator sends `install`, `switch` and `confirm` to the helper's socket in a window. | every release, on such a farm | by hand ([kbf-updater.md](../deploy/kbf-updater.md), "A frontend host") | stays by hand: it is the operator's choice between an outage and more hosts. Either run two frontends behind a load balancer ([frontends-behind-a-load-balancer.md](../deploy/frontends-behind-a-load-balancer.md)) and two storage hosts, or set `KBF_MIN_UP_STORAGE` to 0 and accept that the storage host is down while it updates. |
@@ -240,12 +256,12 @@ never by elapsed time.
 
 | order | task | removes | needs | issue |
 |---|---|---|---|---|
-| 1 | G1 a red gamma sets the farm back | M6 (ordinary case) | none | komira-ai/kbf#2239 |
-| 2 | G2 kbf ships automatic rollback | M6 (CI gone) | none (komira-ai/kbf#2181 merged) | komira-ai/kbf#2240 |
+| 1 | G1 a red gamma sets the farm back (done) | M6 (ordinary case) | none | komira-ai/kbf#2239 |
+| 2 | G2 kbf ships automatic rollback (partial: the coordinator side is done, the agent's phase is not) | M6 (CI gone) | none (komira-ai/kbf#2181 merged) | komira-ai/kbf#2240 |
 | 3 | H1 local `activate` | M7 | none (komira-ai/kbf#2233 merged) | komira-ai/kbf#2242 |
 | 4 | C1 coordinator `force` | M6 (farm held by its rules) | komira-ai/kbf#2187, H1 | komira-ai/kbf#2241 |
 | 5 | H2 the agent's pin | M7 | H1, C1 | komira-ai/kbf#2243 |
-| 6 | G6 agent and helper units in the package | M3 | komira-ai/kbf#2236 | komira-ai/kbf#2244 |
+| 6 | G6 agent and helper units in the package (done) | M3 | komira-ai/kbf#2236 | komira-ai/kbf#2244 |
 | 7 | G7 the coordinator updated by the updater | M2 | G6, [host-updates.md](host-updates.md) step 6a | komira-ai/kbf#2245 |
 | 8 | G8 a Mac takes update orders | M8 | the Mac lease users ([macos-end-state.md](macos-end-state.md), steps 3 and 4) | komira-ai/kbf#2246 |
 
@@ -256,6 +272,19 @@ remaining hand steps out of the release-to-release path. G8 is last because its 
 is the largest.
 
 ### G1. A red gamma sets the farm back
+
+**Status: done.** The coordinator's record is `crates/kbf-coordinator/src/writes.rs`, the
+restore is `crates/xtask/src/deploy_farm/restore.rs`, and the workflow rules are
+`crates/kbf-integration-test/tests/release_workflow/restore.rs`. The record of the writes is kept
+in a file beside the state file (its name with `.writes` added), so the state file keeps the form
+earlier builds read; it names the state file by its inode and modification time, so any rewrite of the state file it did
+not see (a stop between the two writes, an earlier build) drops it. The coordinator's own rollback
+is a write too, and raises the generation. "A green run makes no restore" is held by the
+workflow: the step runs under `if: ${{ failure() }}` only, which the release workflow lint pins.
+Where this section says the restore names the forced rollback, it names the hand step of M6 (a
+re-run of the `gamma` job of the release to go back to) until C1 is built. For "Time",
+every step of the job has its own `timeout-minutes` and the job's is at least their sum, so a
+hanging proof is cut and the restore still runs.
 
 **Change.** The PR has two parts. The baseline the job goes back to is kept by the
 coordinator, not by the job, so it is there whatever happened to the job.
@@ -374,6 +403,34 @@ the deadline.
 
 ### G2. kbf ships automatic rollback
 
+**Status: partial.** The coordinator side is done:
+`crates/kbf-coordinator/src/kbf.services.toml` sets `rollback = "automatic"` and
+`rollback_after_failed = { percent = 25, min_hosts = 2 }`. The release path is not: kbf's agent
+does not yet report the phase this rollback counts (the first limit below), so on a farm of today's
+agents M6 (CI gone) is still a hand step. The tests of the coordinator are
+`crates/kbf-coordinator/src/kbf_rollback_tests.rs`; the deploy, the restore and a fleet whose
+updates take beats, against the coordinator as shipped, are
+`crates/kbf-coordinator/tests/gamma_rollback.rs`; and what the agent's own update reports on a
+failure is pinned in `crates/kbf-updater/src/agent/update_report_tests.rs`, whose exact bytes
+`kbf_rollback_tests` feeds to the coordinator. Two limits, both stated where they are found:
+
+- The coordinator counts only failures that a host reports with a phase after the commit. kbf's own
+  A/B update on a host (`crates/kbf-updater/src/agent/update.rs`) reports a failed update with no
+  phase, so on a farm of today's agents the coordinator holds a release that kbf hosts fail
+  (`blocked`); it does not roll it back. The rollback acts on kbf once the agent reports the phase
+  of its own update, or once kbf is updated through its hook ([host-updates.md](host-updates.md),
+  section 8, step 5). Until then the way back when CI is gone stays the hand step of M6.
+- The deploy reads every 30 s and hosts beat every 15 s, and one update is live at a time. The
+  first failed host makes the farm `blocked` before the second fails, so a deploy whose read falls
+  between the two ends `blocked`, and G1's restore then sets `replaced` back. The failed version is
+  then no longer desired, so the coordinator marks nothing. The deploy ends `Superseded` only when
+  both failures land between two of its reads. `gamma_rollback.rs` has both orders: at the
+  shipped interval the deploy ends `blocked` and the restore sets `replaced` back, and with reads
+  45 s apart it ends `Superseded` and the restore posts nothing.
+
+A coordinator of a kbf farm now writes its ops file (`--ops-file`) once the farm first converges,
+to keep the last good version, and `GET /v1/status` shows it as `ops`.
+
 **Change.** `crates/kbf-coordinator/src/kbf.services.toml` sets `rollback = "automatic"`
 for `kbf`, with the default threshold (25% of live hosts, at least 2). The coordinator
 then marks a version bad and goes back to `last_good` on its own, from the failures hosts
@@ -440,7 +497,7 @@ It bypasses:
 It keeps:
 
 - the role order;
-- `max_updating`, which the request may raise;
+- `max_updating`, which the request may raise (a raise has no effect while the coordinator allows one live update at a time across every service);
 - `min_version`. A force below the service's `min_version` (the first release that has the
   host-updates hook) is refused with that reason, and names the manual path.
 
@@ -549,6 +606,8 @@ of another commit, leaves the pin.
 
 ### G6. Agent and helper units in the package
 
+**Status: done.** The as-built notes follow the tests below.
+
 **Change.** The `kbf` deb ships `kbf-host-local.service`, `kbf-updater-agent.service` and
 `kbf-updater.conf` from `packaging/host-agent`, with the helper's `--layout deb`. Installing
 the package enables both units. An agent that has no enrollment state yet waits for one.
@@ -563,6 +622,42 @@ With this, a host's first install is the package plus M4.
 - an agent started with no state reports "not enrolled" once and makes no call;
 - after `kbf-updater enroll` it heartbeats;
 - the package lint fails on a package without either unit.
+
+**As built.**
+
+- **What the deb holds.** `kbf-host-local.service` and `kbf-updater-agent.service` in
+  `/usr/lib/systemd/system`, and `kbf-updater.conf` as `/usr/lib/sysusers.d/kbf-updater.conf`,
+  from `packaging/host-agent/linux` (`pkg-config --host-agent`).
+- **How it enables them.** The package has no maintainer script, so it ships the links
+  `/usr/lib/systemd/system/multi-user.target.wants/<unit> -> ../<unit>`. systemd reads them at
+  every boot. An operator turns a unit off with `systemctl mask`, which an upgrade keeps.
+- **The rpm.** It holds none of these: its helper would need `--layout rpm`, and no rpm is
+  published.
+- **The programs.** The units are gated on their programs (`ConditionFileIsExecutable=`). The
+  programs stay in no package: an update is an installation of the package, and
+  komira-ai/kbf#2233 keeps the helper and agent paths out of every release's writes. A host with
+  the package and not yet the programs skips both units instead of failing them.
+- **The farm's names.** The coordinator's and the frontend's addresses are configuration of the
+  farm. The shipped agent line carries examples, and a host gives the farm's in one drop-in.
+  A host's first install is therefore the package, the two programs and that drop-in, then M4.
+- **Going back.** dpkg deletes what an older package does not list. Installing a deb older than
+  this release's deletes the units on a host that got them from the package, and neither starts
+  after the next boot. Before setting a farm back that far, copy the units to `/etc/systemd/system`
+  on such hosts. A host whose units were placed by hand under `/etc/systemd/system` is not
+  affected.
+- **The tests.**
+  - the `packages` job of `beta.yml` runs `pkg-install-test` with gates on both units;
+  - `pkg_install` checks the units are installed and wanted by `multi-user.target`, with
+    `--layout deb` on the helper's line, and that the rpm holds neither;
+  - `an_agent_with_no_enrollment_says_not_enrolled_once_and_calls_nothing` (`kbf-updater`): an
+    agent with no enrollment says "not enrolled" once and makes nothing, so it calls nothing;
+  - `once_the_host_is_enrolled_the_waiting_agent_heartbeats` (`kbf-updater`): after the
+    enrollment, the waiting agent is made from the enrolled certificate and heartbeats;
+  - `the_agent_looks_between_the_steps_of_an_enrollment_and_starts_once_it_is_usable`
+    (`kbf-updater`): a refused attempt, its retry and the installed answer, after which the
+    agent's TLS client, made from the enrolled files, completes a mutual-TLS handshake in memory
+    with a coordinator the farm's CA certified;
+  - `a_package_without_the_helper_or_the_agent_unit_is_refused` (`pkg_kbf_asset`).
 
 ### G7. The coordinator is updated by the updater
 

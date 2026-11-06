@@ -138,6 +138,31 @@ pub(super) fn run(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> u8 {
+    let target = &command.target;
+    let act = || activate(target, command.how);
+    let asked = Asked {
+        verb: "activate",
+        version: Some(target.as_str().to_owned()),
+    };
+    answer(&asked, &act, place, out, err)
+}
+
+/// The verb of a root command and the release it names, for the audit line.
+pub(super) struct Asked {
+    pub(super) verb: &'static str,
+    pub(super) version: Option<String>,
+}
+
+/// Answer with `act` once the audit log is open, audit it as `asked`, and print the answer: the
+/// exit status (0 done, 2 refused, 3 failed).
+pub(super) fn answer(
+    asked: &Asked,
+    act: &dyn Fn() -> Answer,
+    place: &Place<'_>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> u8 {
+    let verb = asked.verb;
     let log = Audit::open(place.trust, place.audit);
     let answer = match &log {
         Err(e) => Answer::Failed(
@@ -147,13 +172,13 @@ pub(super) fn run(
                 place.audit.display()
             ),
         ),
-        Ok(_) => activate(&command.target, command.how),
+        Ok(_) => act(),
     };
     let (outcome, reason) = answer.audit_fields();
     let entry = audit::Entry {
         time: audit::now(),
-        verb: Some("activate"),
-        version: Some(command.target.as_str().to_owned()),
+        verb: Some(verb),
+        version: asked.version.clone(),
         channel: None,
         unit: None,
         outcome,
@@ -169,7 +194,7 @@ pub(super) fn run(
     }
     let _ = writeln!(out, "{}", answer.json_line());
     if let Some(detail) = answer.log_detail() {
-        let _ = writeln!(err, "kbf-host-install: activate: {detail}");
+        let _ = writeln!(err, "kbf-host-install: {verb}: {detail}");
     }
     if let Answer::Unresolved { releases, .. } = &answer {
         for k in releases {
@@ -187,14 +212,21 @@ pub(super) fn run(
         }
     }
     match answer {
-        Answer::Activated { .. } => 0,
+        Answer::Activated { .. } | Answer::Unpinned { .. } => 0,
         Answer::Failed(..) => 3,
         _ => 2,
     }
 }
 
-/// What the audit line says an activate did: the release, the one left, the pin and the lock.
+/// What the audit line says an activate did: the release, the one left, the pin and the lock;
+/// and what an unpin did: the commit unpinned, or that nothing was.
 fn result_of(answer: &Answer) -> Option<String> {
+    if let Answer::Unpinned { commit } = answer {
+        return Some(commit.as_ref().map_or_else(
+            || "nothing unpinned".to_owned(),
+            |c| format!("unpinned {c}"),
+        ));
+    }
     let Answer::Activated {
         commit,
         from,
@@ -290,7 +322,12 @@ pub(super) fn on_mac(
     )
 }
 
-fn new_ab<B: Backend>(backend: B, state_file: PathBuf, trust: &Trust, hold: PathBuf) -> Ab<B> {
+pub(super) fn new_ab<B: Backend>(
+    backend: B,
+    state_file: PathBuf,
+    trust: &Trust,
+    hold: PathBuf,
+) -> Ab<B> {
     Ab::new(
         backend,
         state_file,

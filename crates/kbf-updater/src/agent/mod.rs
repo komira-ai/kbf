@@ -8,11 +8,13 @@
 //! - [`local`]: `kbf-host-install`'s local socket, which does the root work (a frontend's
 //!   container included: [`container_health`]);
 //! - [`enroll`] and [`renew`]: the host's certificate, made once with a token and renewed by the
-//!   agent at half its life;
+//!   agent at half its life; [`enrolled`]: an agent started before the host is enrolled waits for
+//!   the enrollment;
 //! - [`service_health`]: a service's readiness URL;
 //! - [`cordon`]: which cordons on the node are the updater's own, kept on disk;
 //! - [`hold`]: `Deferred` and `halt`: the features announced, the deferral kept on disk, the
 //!   heartbeat's size;
+//! - [`pin`]: root's hold file, which keeps the host on a release while it is there;
 //! - [`status`]: what the heartbeat says;
 //! - [`update`]: one host's A/B, step by step;
 //! - [`run`]: the two threads, and the wiring of the real ports ([`build`]).
@@ -20,10 +22,12 @@
 pub mod container_health;
 pub mod coordinator;
 pub mod enroll;
+pub(crate) mod enrolled;
 pub mod flags;
 pub mod hold;
 pub mod hook;
 pub mod local;
+pub mod pin;
 pub mod renew;
 pub mod run;
 pub mod service_health;
@@ -33,6 +37,8 @@ pub mod update;
 mod build;
 pub mod cordon;
 
+#[cfg(test)]
+use build::run_config_waiting;
 pub use build::{Access, NO_CREDENTIAL, NoCredential, run_agent, run_config};
 pub use run::{Agent, ServicePorts, Stop, World};
 
@@ -47,6 +53,8 @@ mod cordon_tests;
 #[cfg(test)]
 mod enroll_tests;
 #[cfg(test)]
+mod enrolled_tests;
+#[cfg(test)]
 mod entry_tests;
 #[cfg(test)]
 mod flags_tests;
@@ -57,6 +65,10 @@ mod hold_tests;
 #[cfg(test)]
 mod local_tests;
 #[cfg(test)]
+mod pin_agent_tests;
+#[cfg(test)]
+mod pin_tests;
+#[cfg(test)]
 mod pki;
 #[cfg(test)]
 mod renew_tests;
@@ -66,5 +78,7 @@ mod run_tests;
 mod service_tests;
 #[cfg(test)]
 pub(crate) mod testing;
+#[cfg(test)]
+mod update_report_tests;
 #[cfg(test)]
 mod update_tests;

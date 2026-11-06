@@ -350,6 +350,7 @@ impl Sim<'_> {
             needs: self.needs.clone(),
             hermetic: true,
             whole_worker: false,
+            pin: None,
             do_not_cache: false,
         };
         let effects = self.feed(Event::Submit {

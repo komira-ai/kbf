@@ -19,8 +19,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::version::Version;
 pub use crate::wire_report::{
-    Answer, Class, CommitState, DeferredReport, MAX_FEATURES, MAX_STEP_NAME, MAX_STEP_SECS,
-    MAX_TOKEN, Phase, StepName, StepRun, Token,
+    Answer, Class, Commit, CommitState, DeferredReport, MAX_FEATURES, MAX_STEP_NAME, MAX_STEP_SECS,
+    MAX_TOKEN, NotACommit, Phase, PinReport, StepName, StepRun, Token,
 };
 use crate::wire_report::{features_text, is_false, lenient, or_default, step_secs_text};
 
@@ -163,6 +163,11 @@ pub struct Heartbeat {
     /// An update the host declined for a reason about its moment, not the release.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deferred: Option<DeferredReport>,
+    /// The host is pinned to a release and acts on no order for `kbf` ([`PinReport`]). Absent
+    /// from a host that is not pinned, and from an agent that knows no pin; a coordinator that
+    /// knows none ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned: Option<PinReport>,
 }
 
 /// What a host says of one service besides `kbf`: the same four facts as the top level.
@@ -223,6 +228,7 @@ impl ServiceBeat {
             step_secs: self.step_secs.clone(),
             promotion_pending: self.promotion_pending,
             deferred: self.deferred.clone(),
+            pinned: None,
         }
     }
 }
@@ -283,11 +289,11 @@ pub struct HeartbeatRead {
     /// Why the `services` list was dropped, if it was.
     pub services_dropped: Option<String>,
     /// Why one of the optional facts (`agent_features`, `step`, `commit`, `step_secs`,
-    /// `promotion_pending`, `deferred`) was dropped, if one was.
+    /// `promotion_pending`, `deferred`, `pinned`) was dropped, if one was.
     pub extras_dropped: Option<String>,
     /// The names of the facts `extras_dropped` is about, sorted, each once: `step`, `commit`,
-    /// `step_secs`, `promotion_pending`, `deferred` or `agent_features`, whether the bad one
-    /// was at the top level or in a service entry.
+    /// `step_secs`, `promotion_pending`, `deferred`, `pinned` or `agent_features`, whether the
+    /// bad one was at the top level or in a service entry.
     pub extras_dropped_facts: Vec<&'static str>,
 }
 
@@ -349,6 +355,8 @@ struct HeartbeatLoose {
     promotion_pending: Option<serde_json::Value>,
     #[serde(default)]
     deferred: Option<serde_json::Value>,
+    #[serde(default)]
+    pinned: Option<serde_json::Value>,
 }
 
 /// One droppable value read as `T`: its default, and the reason, when it is bad.
@@ -438,6 +446,7 @@ fn without_droppable(bytes: &[u8]) -> Option<HeartbeatRead> {
             .unwrap_or_default(),
         promotion_pending: loose("promotion_pending", rest.promotion_pending, &mut extras),
         deferred: loose("deferred", rest.deferred, &mut extras),
+        pinned: loose("pinned", rest.pinned, &mut extras),
     };
     let mut facts: Vec<&'static str> = extras.iter().map(|(fact, _)| *fact).collect();
     facts.sort_unstable();
@@ -591,3 +600,8 @@ mod platform_text {
             .ok_or_else(|| serde::de::Error::custom("not a platform kbf releases are built for"))
     }
 }
+
+// Under `wire`, so that the released heartbeat it freezes reads with the same private readers.
+#[cfg(test)]
+#[path = "wire_pin_tests.rs"]
+mod pin_tests;

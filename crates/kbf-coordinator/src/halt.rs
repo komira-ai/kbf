@@ -42,8 +42,10 @@
 //! A report is ignored when its host is not counted by the service (the service is not
 //! defined, the host's role or selector leaves it out, it is unmanaged, or an operator excluded
 //! it: [`crate::membership::standing`], the test recording uses), when an operator cleared
-//! exactly that report, and when the service is halted already: the first halt stands until it
-//! is cleared (the convergence names it).
+//! exactly that report, when the service is halted already: the first halt stands until it
+//! is cleared (the convergence names it), and, for `kbf`, when the host is pinned: root holds it
+//! on a release, and what it reports of `kbf` stops no other host (the services it lists are
+//! not pinned, and their reports count).
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -127,6 +129,9 @@ pub(crate) fn note(
 ) -> Vec<String> {
     let state = ops.state();
     let listed = beat.services.as_deref().unwrap_or_default();
+    // A pinned host's `kbf` report raises no halt; it still ends an acknowledgement it differs
+    // from, as any report does.
+    let pinned = beat.pinned.is_some();
     let top = std::iter::once((KBF, beat.last_update.as_ref(), beat.updating.is_some()));
     let reports = top.chain(listed.iter().map(|one| {
         (
@@ -147,7 +152,7 @@ pub(crate) fn note(
         if !end_ack(ops, service, &who.node_id, report.as_ref()) {
             held.push(service.to_owned());
         }
-        if let Some(halt) = report {
+        if let Some(halt) = report.filter(|_| !(pinned && service == KBF)) {
             raise(ops, service, halt);
         }
     }

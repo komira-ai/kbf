@@ -21,10 +21,10 @@
 //!   ([`release::farm_version`]): the version text the farm is told to converge on,
 //!   `<version>+g<12 hex digits of the commit>` as the hosts report it, read from the release's
 //!   own version facts (which `SHA256SUMS` must list); prints `version=<text>`.
-//! - `deploy-farm --url <url> --version <semver>+g<commit12> [--deadline-min 60] [--stall-min 20]` ([`deploy_farm`]): after a
-//!   release is published, set it as the update coordinator's desired version (CI's OIDC token)
-//!   and wait until the farm converges; exit 1 when it is blocked, stalled or out of time. An
-//!   empty `--url` prints a notice and exits 0.
+//! - `deploy-farm --url <url> --version <semver>+g<commit12> [--deadline-min 60] [--stall-min 20]` ([`deploy_farm`]): set a
+//!   published release as the coordinator's desired version (CI's OIDC token) and wait until the farm converges; exit 1
+//!   when blocked, stalled or out of time (an empty `--url`: a notice, exit 0). `deploy-farm restore --run <id>-<attempt>`
+//!   ([`deploy_farm::restore`]), the job's step after a failure, sets back the version the release replaced, and exits 1.
 //! - `prove-farm --address <grpc url> --instance <name> --tls <true|false> --properties <k=v,...> --buck2 <path>
 //!   --project <dir> --nonce <text>` ([`prove_farm`]): after the deploy, build a small Buck2 project against the
 //!   farm, remote only, and exit 1 unless some action ran remotely and none locally. An empty `--address` prints a
@@ -61,17 +61,19 @@
 //!   runner, for `packaging/install.sh`.
 //! - `pkg-config`, `pkg-build`, `pkg-install-test`, `pkg-upgrade-test` ([`pkg_linux`],
 //!   [`pkg_install`], [`pkg_upgrade`]): the `kbf` deb and rpm (`/usr/bin/kbf`, the units of
-//!   the modes and `kbf.slice`, the sysusers, tmpfiles and needrestart files, and the trust
-//!   directory): the nfpm configuration from the inputs, a package built twice to prove the
-//!   bytes, an install, remove and purge in a container, and the upgrade of a host that has
-//!   the `kbf-installer` deb of the release before.
+//!   the modes and `kbf.slice`, the sysusers, tmpfiles and needrestart files, the trust
+//!   directory and, in the deb, the host agent's units, enabled, and account): the nfpm
+//!   configuration from the inputs, a package built twice to prove the bytes, an install, remove
+//!   and purge in a container, and the upgrade of a host that has the `kbf-installer` deb of the
+//!   release before.
 //! - `pkg-trust` ([`pkg_trust`]): the trust directory of the packages from the pinned `gh`,
 //!   `gh`'s trusted root and the branch the package is attested on.
 //! - `pkg-kbf-asset` ([`pkg_kbf_asset`]): the `kbf` deb as the release asset
 //!   `kbf-<commit>-<platform>.deb`, refused unless its `/usr/bin/kbf` is the `kbf` of the
-//!   attested tarball, it replaces and breaks the old `kbf-installer`, it holds the units
-//!   of the modes, the slice, the sysusers and tmpfiles files, the drop-in and a trust
-//!   directory that trusts the branch it is attested for, and nothing else.
+//!   attested tarball, it replaces (and does not break) the old `kbf-installer`, it holds the units
+//!   of the modes, the slice, the sysusers and tmpfiles files, the drop-in, a trust
+//!   directory that trusts the branch it is attested for, and the host agent's two units, their
+//!   links and the agent's account, and nothing else.
 //! - `pkg-image-asset` ([`pkg_image_asset`]): the frontend, coordinator or task OCI image tarball as the
 //!   release asset `kbf-<service>-image-<commit>-<platform>.oci.tar`, refused unless its program
 //!   is the attested `kbf` (frontend) or the built `kbf-coordinator` or `kbf-task`, it runs as a user that is
@@ -239,7 +241,7 @@ enum Verb {
     MergeProfiles(merge_profiles::Args),
     /// Set a published release as the farm's desired version on the update coordinator and
     /// wait for the farm to converge.
-    DeployFarm(deploy_farm::Args),
+    DeployFarm(deploy_farm::Command),
     /// Prove the farm after a deploy with a remote-only Buck2 build of a small project.
     ProveFarm(prove_farm::Args),
     /// Check that the runner's disk has the room the coverage run needs.
@@ -396,40 +398,7 @@ enum Verb {
         out: PathBuf,
     },
     /// Write the nfpm configuration and the file listing of the kbf packages.
-    PkgConfig {
-        /// The kbf binary the kbf packages carry at `/usr/bin/kbf` (mode 0755).
-        #[arg(long)]
-        kbf: PathBuf,
-        /// The directory of unit files: the kbf packages take the units of the modes and
-        /// `kbf.slice` from it.
-        #[arg(long)]
-        units: PathBuf,
-        /// The directory of the three trust files.
-        #[arg(long)]
-        trust: PathBuf,
-        /// The sysusers.d file.
-        #[arg(long)]
-        sysusers: PathBuf,
-        /// The tmpfiles.d file.
-        #[arg(long)]
-        tmpfiles: PathBuf,
-        /// The needrestart drop-in.
-        #[arg(long)]
-        needrestart: PathBuf,
-        /// The platform the binary was built for (`linux-x86_64`, `linux-arm64`).
-        #[arg(long, value_enum)]
-        platform: package::Platform,
-        /// The package version.
-        /// (One of the two is required; the verb says so, exit 2, as clap does for a bad flag.)
-        #[arg(long, conflicts_with = "version_of")]
-        version: Option<String>,
-        /// Take the version from this binary's `--version` (`<version>+<12 of the commit>`).
-        #[arg(long)]
-        version_of: Option<PathBuf>,
-        /// The directory `nfpm.yaml` and `listing.txt` go in; created when missing.
-        #[arg(long)]
-        out: PathBuf,
-    },
+    PkgConfig(pkg_linux::ConfigFlags),
     /// Build the deb and the rpm with nfpm, and prove a second build is the same bytes.
     PkgBuild {
         /// The pinned nfpm program.
@@ -1170,7 +1139,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
         Verb::WaitArtifacts(args) => wait_artifacts::run(&args, &root, &cargo_program()),
         Verb::ProfilesComplete(args) => profiles_complete::run(&args),
         Verb::MergeProfiles(args) => merge_profiles::run(&args, &root),
-        Verb::DeployFarm(args) => deploy_farm::run(&args),
+        Verb::DeployFarm(command) => deploy_farm::run_command(&command),
         Verb::ProveFarm(args) => prove_farm::run(&args),
         Verb::RunnerDisk(args) => runner_disk::run(&args),
         Verb::StaticElf(args) => static_elf::run(&args),
@@ -1256,37 +1225,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             },
             &out,
         ),
-        Verb::PkgConfig {
-            kbf,
-            units,
-            trust,
-            sysusers,
-            tmpfiles,
-            needrestart,
-            platform,
-            version,
-            version_of,
-            out,
-        } => {
-            let version = match (version, version_of) {
-                (Some(version), _) => version,
-                (None, Some(of)) => pkg_asset::binary_version(&of)?,
-                (None, None) => return Err(Error::Usage("--version or --version-of".to_owned())),
-            };
-            pkg_linux::write_config(
-                &pkg_linux::Inputs {
-                    kbf: &kbf,
-                    units: &units,
-                    trust: &trust,
-                    sysusers: &sysusers,
-                    tmpfiles: &tmpfiles,
-                    needrestart: &needrestart,
-                    platform,
-                    version: &version,
-                },
-                &out,
-            )
-        }
+        Verb::PkgConfig(flags) => pkg_linux::config_verb(&flags),
         Verb::PkgBuild {
             nfpm,
             config,

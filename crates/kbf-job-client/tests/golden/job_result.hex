@@ -1,0 +1,23 @@
+# The encoding of the fully populated JobResult that tests/support/mod.rs builds, 98 bytes.
+# Hex pairs; '#' starts a comment. Fields in number order. Written by hand from the field
+# numbers of job.proto (js-proto has no golden of a JobResult), not by a test run.
+08 06                                                  # state (JOB_STATE_FAILED) = 6 (field 1, varint)
+10 03                                                  # exit_code = 3 (field 2, varint)
+18 01                                                  # reason (RESULT_REASON_EXIT) = 1 (field 3, varint)
+22 11                                                  # stdout_tail (field 4, 17 bytes):
+  62 75 69 6c 74 20 31 32 20 74 61 72 67 65 74 73      # 'built 12 targets'
+  0a                                                   # '\n'
+2a 13                                                  # stderr_tail (field 5, 19 bytes):
+  65 72 72 6f 72 3a 20 6c 69 6e 6b 20 66 61 69 6c      # 'error: link fail'
+  65 64 0a                                             # 'ed\n'
+30 01                                                  # truncated = 1 (field 6, varint)
+52 1c                                                  # times (field 10, message of 28 bytes):
+  08 80 a0 f1 c2 b1 34                                 # queued_at_ms = 1800000000000 (field 1, varint)
+  10 e8 a7 f1 c2 b1 34                                 # placed_at_ms = 1800000001000 (field 2, varint)
+  18 d0 af f1 c2 b1 34                                 # started_at_ms = 1800000002000 (field 3, varint)
+  20 b8 b7 f1 c2 b1 34                                 # ended_at_ms = 1800000003000 (field 4, varint)
+5a 12                                                  # usage (field 11, message of 18 bytes):
+  08 e0 c6 5b                                          # cpu_usec = 1500000 (field 1, varint)
+  10 80 80 80 80 08                                    # peak_memory_bytes = 2147483648 (field 2, varint)
+  18 80 80 80 80 04                                    # disk_bytes = 1073741824 (field 3, varint)
+  20 01                                                # gpus = 1 (field 4, varint)

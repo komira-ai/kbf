@@ -24,7 +24,7 @@ use std::collections::BTreeSet;
 
 use update_hook::Step;
 
-use crate::declaration::{Declaration, Hook, Signer};
+use crate::declaration::{Declaration, Hook, Signer, UNBOUNDED};
 
 fn grew<T: Ord>(old: &BTreeSet<T>, new: &BTreeSet<T>) -> bool {
     !new.is_subset(old)
@@ -32,6 +32,12 @@ fn grew<T: Ord>(old: &BTreeSet<T>, new: &BTreeSet<T>) -> bool {
 
 fn raised(old: u64, new: u64) -> bool {
     new > old
+}
+
+/// A step's bound, where `UNBOUNDED` (0) is the highest of all.
+fn bound_raised(old: u64, new: u64) -> bool {
+    let rank = |secs: u64| (secs == UNBOUNDED, secs);
+    rank(new) > rank(old)
 }
 
 fn changed<T: PartialEq>(old: &T, new: &T) -> bool {
@@ -218,7 +224,7 @@ fn hook_level(old: &Hook, new: &Hook) -> Vec<(String, bool)> {
     named.extend(Step::ALL.iter().map(|step| {
         (
             format!("hook.timeout_secs.{step}"),
-            raised(old_timeouts.get(*step), new_timeouts.get(*step)),
+            bound_raised(old_timeouts.get(*step), new_timeouts.get(*step)),
         )
     }));
     named.extend(keys_widened(

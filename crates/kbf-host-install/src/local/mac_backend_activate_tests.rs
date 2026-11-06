@@ -17,6 +17,7 @@ use crate::local::core::Ab;
 use crate::local::core::activate::{How, LOCK_TAKES};
 use crate::local::mac_backend::MacBackend;
 use crate::local::request::Target;
+use crate::local::unpin_cli;
 use crate::mac::layout::APPLY_LABEL;
 use crate::mac::status::{self, ApplyState};
 use crate::mac::tests::fx::{Fx, NEW, NEW_VERSION, OLD, OLD_VERSION, Sim, binary, mkdir, write};
@@ -462,6 +463,46 @@ fn the_command_audits_what_it_did_on_a_mac() {
         Box::new(Shared(Rc::clone(&sim))),
         hold.clone(),
     );
+    assert_eq!(code, 3);
+}
+
+/// `unpin` as root runs it on a Mac: after `activate --pin` it removes the hold file and the
+/// retain pin and is audited (verb `unpin`); a work directory that cannot be used fails.
+///
+/// Catches: a Mac whose pin cannot be undone; an unpin that is not audited.
+#[test]
+fn the_unpin_command_undoes_the_pin_on_a_mac() {
+    let (fx, sim, _) = rig("mba-unpin");
+    keep(&fx, NEW, NEW_VERSION, 2);
+    let hold = fx.dir.join("agent/pin.json");
+    mkdir(&fx.dir.join("agent"), 0o700);
+    let args = vec!["kbf=bbbbbbbbbbbb".to_owned(), "--pin".to_owned()];
+    let pin = activate_cli::on_mac(
+        &Command::parse(&args).unwrap(),
+        fx.host.clone(),
+        Box::new(Shared(Rc::clone(&sim))),
+        hold.clone(),
+    );
+    assert_eq!(pin, 0);
+    let retained = || Retained::read(&retain::file(&fx.host)).unwrap().pinned;
+    assert_eq!(retained().len(), 1);
+    let code = unpin_cli::on_mac(
+        fx.host.clone(),
+        Box::new(Shared(Rc::clone(&sim))),
+        hold.clone(),
+    );
+    assert_eq!(code, 0);
+    assert!(!hold.exists());
+    assert!(retained().is_empty());
+    let audit = fs::read_to_string(&fx.host.audit).unwrap();
+    let line: serde_json::Value = serde_json::from_str(audit.lines().last().unwrap()).unwrap();
+    assert_eq!(line["verb"], "unpin");
+    assert_eq!(line["result"], format!("unpinned {NEW}"));
+
+    let mut host = fx.host.clone();
+    host.work = fx.dir.join("not-a-directory");
+    write(&host.work, 0o644, b"a file");
+    let code = unpin_cli::on_mac(host, Box::new(Shared(Rc::clone(&sim))), hold);
     assert_eq!(code, 3);
 }
 

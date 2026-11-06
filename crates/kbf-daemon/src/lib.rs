@@ -28,6 +28,9 @@
 //! - [`packed`] and [`remote_index`]: with `--pack-read`, a data plane that reads blobs from
 //!   the packs of the farm's object store first ([`PackedCas`]), finding them through the
 //!   frontend's pack index ([`RemoteIndex`]); a blob not in a pack is read where it always was.
+//!   With `--tierstore-endpoint`, the same reads go through a tierstore on loopback, and a blob
+//!   it does not serve, for whatever reason, is read where it always was
+//!   ([`PackedCas::falling_back`]).
 //! - `cache` (Linux): the node's input cache, which the container driver links input
 //!   files from (`docs/design/worker-cache.md`).
 //! - [`clock`]: the suspend-counting [`Clock`] the fence reads (issue #78).

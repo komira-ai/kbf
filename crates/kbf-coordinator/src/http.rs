@@ -5,7 +5,8 @@
 //!   ([`identity_of`]); a certificate that names none is refused with 403 before the body
 //!   is read.
 //! - **Control** (TLS, no client certificate): `POST /v1/desired` with CI's OIDC token as
-//!   the bearer and the desired state as JSON; `GET /v1/status` with the operator token as
+//!   the bearer and the desired state as JSON (with an `if_generation` that is not the
+//!   service's generation now, it is 409 `conflict` and changes nothing); `GET /v1/status` with the operator token as
 //!   the bearer; `GET /v1/convergence[?service=<name>]` with CI's OIDC token as the bearer
 //!   (the operator token is refused there; no query means `kbf`); `POST /v1/operator` with the
 //!   operator token as the bearer and an action as JSON (`crate::ops`; CI's token is refused).
@@ -223,6 +224,7 @@ where
         Err(SetError::Unauthorized(_)) => error(StatusCode::UNAUTHORIZED, "unauthorized"),
         Err(SetError::Unavailable) => error(StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
         Err(SetError::Forbidden) => error(StatusCode::FORBIDDEN, "forbidden"),
+        Err(SetError::Conflict { .. }) => error(StatusCode::CONFLICT, "conflict"),
         Err(SetError::Invalid(_)) => error(StatusCode::BAD_REQUEST, "bad_request"),
         Err(why @ (SetError::Store(_) | SetError::Ops(_))) => {
             tracing::error!(%why, "the desired state could not be stored");
