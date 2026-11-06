@@ -1,8 +1,8 @@
 //! The executor as the frontend builds it: from the `--executor` flags, over the frontend's own
-//! seams (the ingest of the packs, the CAS, the key mint) and the real farm, against a lease
-//! server in this process. An action is placed, its run is posted with the task tool's exact
-//! command line and mounts, the pack the task wrote is ingested by the frontend's code, the
-//! result reaches the caller, and stopping releases the lease.
+//! seams (the ingest of the packs, the CAS, the key mint) and the real farm, against a job
+//! service in this process. An action is placed, its job is submitted with the task tool's exact
+//! command line, image and limits, the pack the task wrote is ingested by the frontend's code,
+//! the result reaches the caller, and stopping leaves nothing to cancel.
 
 use std::os::unix::fs::PermissionsExt as _;
 use std::sync::{Arc, Mutex};
@@ -13,8 +13,7 @@ use kbf_front::{
     Backend, Cache, CacheStorage, Described, Dispatch as _, Finished, PackKeyMint, PackSettings,
     Packs, SegmentsConfig, Stage, Submission, VerifiedBlob,
 };
-use kbf_lease_client::fake::{FakeLeaseServer, Pool, TOKEN};
-use kbf_lease_client::{LeaseState, Outcome};
+use kbf_job_client::fake::{Call, FakeJobServer, TOKEN};
 use kbf_objstore::{Capabilities, MemoryStore, ObjectKey, ObjectStore as _};
 use kbf_pack::{PackKeys, Slot, TaskManifest, Timing, Usage, WriterKind, write_pack};
 use kbf_pack_index::PackIndex;
@@ -31,7 +30,7 @@ use kbf_state::ManualClock;
 use kbf_types::{ActionKey, Digest, LeaseKind, Qos, Resources};
 use prost::Message as _;
 
-use crate::rig::{ClockHold, GIB, settle};
+use crate::rig::{ClockHold, GIB, machine, settle};
 
 const SECRET: &[u8] = b"0123456789abcdef0123456789abcdef";
 const KBF_IMAGE: &str =
@@ -80,9 +79,10 @@ fn wire(digest: &Digest) -> kbf_proto::reapi::Digest {
 
 /// Catches an executor that does not work end to end as the frontend builds it. The flags
 /// become the executor's config; the action is read from the CAS for its image and timeout; the
-/// run is posted with the task tool's command line, the secrets the preparation made, from
-/// the kbf image and with nothing mounted; a pack the task wrote under the issued key is ingested
-/// by the frontend's own code into the result the caller gets; and stopping releases the lease.
+/// job is submitted with the task tool's command line, the secrets the preparation made, the
+/// kbf image, the action's wall and the frontend's label; a pack the task wrote under the issued
+/// key is ingested by the frontend's own code into the result the caller gets; and stopping the
+/// executor cancels no job, as none is left to cancel.
 #[tokio::test(start_paused = true)]
 async fn an_action_runs_end_to_end_through_the_flags_and_the_frontends_own_seams() {
     // The cache lingers before it writes a batch, on the clock: the blobs are stored while it
@@ -117,12 +117,9 @@ async fn an_action_runs_end_to_end_through_the_flags_and_the_frontends_own_seams
 
     let _hold = ClockHold::new();
     let dir = kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), "kbf-server-wiring");
-    let mut pool = Pool::new("farm-linux", &["node1"], 2_000, 16 * GIB);
-    pool.capabilities
-        .insert("arch".to_owned(), "x86_64".to_owned());
-    let fake = FakeLeaseServer::start(pool).await;
-    let api = fake.client().expect("a client");
-    let token = dir.path().join("lease-token");
+    let fake = FakeJobServer::start().await.expect("a loopback port");
+    fake.add_host("host-1", machine(64, "x86_64"));
+    let token = dir.path().join("job-token");
     std::fs::write(&token, TOKEN).expect("written");
     std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).expect("mode");
 
@@ -146,10 +143,9 @@ async fn an_action_runs_end_to_end_through_the_flags_and_the_frontends_own_seams
         "--job-tls-key=/nowhere/job.key".to_owned(),
         "--job-grant-secret-file=/nowhere/secret".to_owned(),
         "--executor=js-agent".to_owned(),
-        format!("--executor-lease-url={}", fake.origin()),
-        format!("--executor-lease-token-file={}", token.display()),
+        format!("--executor-job-url={}", fake.origin()),
+        format!("--executor-job-token-file={}", token.display()),
         "--executor-frontend-id=front-1".to_owned(),
-        "--executor-class=farm-linux".to_owned(),
         "--executor-hosts=1".to_owned(),
         "--executor-host-cpus=2".to_owned(),
         "--executor-host-memory-gib=16".to_owned(),
@@ -231,15 +227,10 @@ async fn an_action_runs_end_to_end_through_the_flags_and_the_frontends_own_seams
         .expect("the farm takes the action");
     let stage = ticket.stage;
 
-    // The run is posted.
-    let posted = loop {
-        let leases = api.leases().await.expect("leases");
-        let mut runs = Vec::new();
-        for lease in leases {
-            runs.extend(api.runs(lease.id).await.expect("runs"));
-        }
-        if let Some(run) = runs.pop() {
-            break run;
+    // The job is submitted.
+    let (job, spec) = loop {
+        if let Some(job) = fake.jobs().first() {
+            break (job.id.clone(), fake.submitted(&job.id).expect("a job"));
         }
         step(&farm, &fake).await;
     };
@@ -251,7 +242,7 @@ async fn an_action_runs_end_to_end_through_the_flags_and_the_frontends_own_seams
         "the action's timeout and the margin"
     );
     let key = format!("cas/b/{build}/");
-    let args = fake.run_args(&posted.run_id).expect("a run");
+    let args = spec.args.clone();
     let url = args[args.iter().position(|a| a == "--pack-url").expect("a url") + 1].clone();
     let pack_key = url
         .strip_prefix("http://tier.test/")
@@ -281,11 +272,16 @@ async fn an_action_runs_end_to_end_through_the_flags_and_the_frontends_own_seams
     .map(ToString::to_string)
     .collect();
     assert_eq!(args, expected);
-    // The run is launched from the kbf image, not the base the action names, with nothing
-    // mounted: the task tool is that image's entrypoint.
-    assert_eq!(fake.run_image(&posted.run_id).as_deref(), Some(KBF_IMAGE));
-    assert_eq!(fake.run_mounts(&posted.run_id), Some(Vec::new()));
-    assert_eq!(fake.run_wall_ms(&posted.run_id), Some(390_000));
+    // The job is the kbf image, not the base the action names, with its entrypoint (the task
+    // tool) kept: the command is empty, and the secrets are arguments, not files.
+    assert_eq!(spec.image, KBF_IMAGE);
+    assert_eq!(spec.command, "");
+    assert!(spec.files.is_empty(), "{:?}", spec.files);
+    assert_eq!(spec.wall_limit_seconds, Some(390));
+    assert_eq!(
+        spec.labels.get("kbf-frontend").map(String::as_str),
+        Some("front-1")
+    );
 
     // The task writes its pack under the key it was issued, and exits 0: the action ran, and
     // exited 5.
@@ -310,8 +306,10 @@ async fn an_action_runs_end_to_end_through_the_flags_and_the_frontends_own_seams
         .put_new(&object, Bytes::from(pack), None)
         .await
         .expect("written");
-    fake.run_started(&posted.run_id);
-    assert!(fake.finish_run(&posted.run_id, Outcome::Succeeded, Some(0), None));
+    assert!(fake.place(&job, "host-1"));
+    assert!(fake.starting(&job));
+    assert!(fake.run(&job));
+    assert!(fake.finish(&job, 0));
 
     let finished = loop {
         if let Stage::Done(finished) = &*stage.borrow() {
@@ -327,7 +325,7 @@ async fn an_action_runs_end_to_end_through_the_flags_and_the_frontends_own_seams
     let mut counted = String::new();
     metrics.render(&mut counted);
     for row in [
-        "kbf_executor_leases_held 1\n",
+        "kbf_executor_jobs_submitted_total 1\n",
         "kbf_executor_runs_total{outcome=\"ran\"} 1\n",
         "kbf_executor_ingests_total{result=\"ok\"} 1\n",
     ] {
@@ -335,17 +333,19 @@ async fn an_action_runs_end_to_end_through_the_flags_and_the_frontends_own_seams
     }
 
     running.stop().await;
-    let leases = api.leases().await.expect("leases");
-    assert!(
-        leases.iter().all(|l| l.state == LeaseState::Releasing),
-        "released: {leases:?}"
+    let cancelled = fake
+        .calls()
+        .iter()
+        .filter(|call| matches!(call, Call::CancelJob(_)))
+        .count();
+    assert_eq!(
+        cancelled, 0,
+        "the job had ended: nothing was left to cancel"
     );
-    let release = format!("DELETE /v1/leases/{}", leases[0].id);
-    assert!(fake.requests().contains(&release), "{:?}", fake.requests());
 }
 
 /// Five seconds pass on the clocks, and the farm and the executor's task run.
-async fn step(farm: &Farm, fake: &FakeLeaseServer) {
+async fn step(farm: &Farm, fake: &FakeJobServer) {
     tokio::time::advance(Duration::from_secs(5)).await;
     fake.advance(Duration::from_secs(5));
     settle().await;

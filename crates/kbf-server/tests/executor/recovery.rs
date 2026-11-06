@@ -1,373 +1,274 @@
-//! What the executor does when the world breaks: the lease server restarts, a lease or a host
-//! is lost, the farm ends the stream, an answer is lost, the farm gives a lease up.
+//! What the executor does when the world breaks: the job service stops answering, the farm ends
+//! a stream or gives a lease up, an answer is lost, a worker falls silent.
 
 use std::time::Duration;
 
+use js_proto::v1::JobState;
 use kbf_front::Finished;
-use kbf_lease_client::Outcome;
-use kbf_lease_client::fake::Fault;
-use tonic::Status;
+use kbf_job_client::fake::Fault;
+use kbf_sched::fence::{LEADER_LEASE_MARGIN, LEASE_GRACE};
+use kbf_server::executor::{Config, ConfigError};
+use tonic::{Code, Status};
 
-use crate::rig::{Rig, count, count_tail};
+use crate::rig::{Caller, GIB, Posted, Rig, cancels, submits};
 
-fn short_leases(cfg: &mut kbf_server::executor::Config) {
-    cfg.max_run = Duration::from_secs(30);
-    cfg.default_timeout = Duration::from_secs(30);
-    cfg.run_margin = Duration::from_secs(20);
-    cfg.lease_ttl = Duration::from_secs(60);
-    cfg.drain_before_end = Duration::from_secs(120);
-    cfg.max_wall = Duration::from_secs(300);
-}
+const HOST: &str = "node1";
 
-/// A rig with one action posted: its caller and its run.
-async fn running(mut rig: Rig) -> (Rig, crate::rig::Caller, crate::rig::Posted) {
+/// A rig with one action running: its caller and its job as it was submitted.
+async fn running(mut rig: Rig) -> (Rig, Caller, Posted) {
     rig.pump().await;
-    rig.inputs
-        .facts
-        .lock()
-        .expect("facts")
-        .as_mut()
-        .expect("ok")
-        .timeout = Some(Duration::from_secs(20));
     let caller = rig.submit(1);
     rig.pump().await;
-    let run = rig.runs_of(1).await.remove(0);
-    (rig, caller, run)
-}
-
-/// Catches a lease-server restart that double-reports or loses an action: every run is
-/// forgotten (the leases are kept), the run is reported lost once, the farm runs the action
-/// again on the same lease, and the caller is answered by that second run alone.
-#[tokio::test(start_paused = true)]
-async fn a_lease_server_restart_that_keeps_the_leases_reruns_the_action_once() {
-    let (mut rig, caller, first) = running(Rig::start(&["node1"], 1, |_| {}).await).await;
-    rig.fake.restart();
-    assert!(rig.fake.host_hello("node1"));
+    let job = rig.jobs_of(1).remove(0);
+    rig.host_runs(job.id(), HOST);
     rig.pump().await;
-    assert!(
-        caller.finished().is_none(),
-        "the lost run answered the caller"
-    );
-    let runs = rig.runs_of(1).await;
-    assert_eq!(runs.len(), 1, "{runs:?}");
-    assert_ne!(
-        runs[0].run, first.run,
-        "the forgotten run was taken for the new one"
-    );
-    assert_eq!(runs[0].lease, first.lease, "the lease was kept");
-    rig.host_finishes(&runs[0].run, Outcome::Succeeded, Some(0));
-    assert!(matches!(rig.until_done(&caller, 4).await, Finished::Ran(_)));
-    assert_eq!(rig.ingest.calls.lock().expect("calls").len(), 1);
-    assert_eq!(rig.exec.hosts()[0].runs, 0);
+    (rig, caller, job)
 }
 
-/// Catches a worker that goes on after its host fell silent to the lease server again: the
-/// hosts say hello after a restart, and until they do the lease server refuses runs with
-/// `host-not-registered`. The worker is taken down, its lease released, and the action runs
-/// again on a worker of the lease that replaces it.
-#[tokio::test(start_paused = true)]
-async fn a_host_that_has_not_said_hello_is_given_up_and_replaced() {
-    let (mut rig, caller, first) = running(Rig::start(&["node1"], 1, |_| {}).await).await;
-    rig.fake.restart();
-    rig.pump().await;
-    assert!(rig.exec.hosts().is_empty(), "the host had not said hello");
-    assert!(rig.fake.host_hello("node1"));
-    rig.elapse(75).await;
-    let runs = rig.runs_of(1).await;
-    assert_eq!(runs.len(), 1, "{runs:?}");
-    assert_ne!(runs[0].lease, first.lease);
-    rig.host_finishes(&runs[0].run, Outcome::Succeeded, Some(0));
-    assert!(matches!(rig.until_done(&caller, 4).await, Finished::Ran(_)));
-}
-
-/// Catches a lease that the server no longer has (it expired, or an operator released it)
-/// being waited on: the runs on it are reported lost at once, so the action runs again
-/// without waiting for the farm's silence grace, and the slot is filled by a new lease.
-#[tokio::test(start_paused = true)]
-async fn a_vanished_lease_loses_its_runs_and_is_replaced() {
-    let (mut rig, caller, first) = running(Rig::start(&["node1"], 1, |_| {}).await).await;
-    rig.api.release(first.lease).await.expect("released");
-    rig.pump().await;
-    assert!(rig.exec.hosts().is_empty());
-    assert!(caller.finished().is_none());
-    rig.elapse(10).await;
-    let runs = rig.runs_of(1).await;
-    assert_eq!(runs.len(), 1, "{runs:?}");
-    assert_ne!(runs[0].lease, first.lease);
-    rig.host_finishes(&runs[0].run, Outcome::Succeeded, Some(0));
-    assert!(matches!(rig.until_done(&caller, 4).await, Finished::Ran(_)));
-}
-
-/// As above, found when the lease is renewed rather than when its runs are read.
-#[tokio::test(start_paused = true)]
-async fn a_lease_that_is_gone_at_its_renewal_is_replaced() {
-    let (mut rig, _caller, first) = running(Rig::start(&["node1"], 1, short_leases).await).await;
-    rig.api.release(first.lease).await.expect("released");
-    rig.advance(Duration::from_secs(25)).await;
-    rig.pump().await;
-    assert!(rig.exec.hosts().is_empty());
-}
-
-/// Catches a renewal that fails (the server answers 500) taking the worker down: it is tried
-/// again, and the lease is kept.
-#[tokio::test(start_paused = true)]
-async fn a_failed_renewal_is_tried_again() {
-    let (mut rig, _caller, first) = running(Rig::start(&["node1"], 1, short_leases).await).await;
-    rig.advance(Duration::from_secs(25)).await;
-    for _ in 0..2 {
-        rig.fake.inject(Fault::Reply {
-            status: 500,
-            body: bytes::Bytes::from_static(b"{}"),
-        });
+/// Runs the rig until the job service holds `n` jobs of the action of `tag`, or panics after
+/// `steps` of 5 s.
+pub async fn until_jobs(rig: &mut Rig, tag: u8, n: usize, steps: usize) -> Vec<Posted> {
+    for _ in 0..steps {
+        let jobs = rig.jobs_of(tag);
+        if jobs.len() >= n {
+            return jobs;
+        }
+        rig.advance(Duration::from_secs(5)).await;
+        rig.pump().await;
     }
-    rig.pump().await;
-    assert_eq!(rig.exec.hosts()[0].lease, first.lease);
-    rig.elapse(5).await;
-    let renewals = count_tail(&rig.requests(), "POST", "/renew");
-    assert!(renewals >= 2, "{renewals}");
+    panic!(
+        "{n} jobs of action {tag} not made: {:?}\nworkers {:?}\ncalls {:?}",
+        rig.jobs_of(tag),
+        rig.exec.workers(),
+        rig.methods()
+    );
 }
 
-/// Catches a lost host's runs outliving their retry: the lease server says the host is lost,
-/// and the worker asks for its run to stop and falls silent (releasing its lease) at once. The
-/// farm, hearing nothing, gives the lease up only after the scheduler's grace (60 s), and the
-/// retry is posted after the stop, on another host.
-#[tokio::test(start_paused = true)]
-async fn a_lost_host_has_its_run_stopped_before_the_farm_requeues_it() {
-    let (mut rig, caller, first) = running(Rig::start(&["node1", "node2"], 1, |_| {}).await).await;
-    assert!(rig.fake.set_lost("node1", true));
-    rig.advance(Duration::from_secs(6)).await;
-    rig.pump().await;
-    assert!(
-        rig.exec.hosts().is_empty(),
-        "the worker of a lost host went on"
-    );
-    let stop = format!("DELETE /v1/leases/{}/runs/{}", first.lease, first.run);
-    assert_eq!(count(&rig.requests(), &stop), 1);
-    assert!(caller.finished().is_none());
-    assert_eq!(
-        count_tail(&rig.requests(), "POST", "/runs"),
-        1,
-        "the retry was posted before the grace"
-    );
-    rig.elapse(75).await;
-    let runs = rig.runs_of(1).await;
-    assert_eq!(
-        runs.len(),
-        1,
-        "the farm did not run the action again: {runs:?}"
-    );
-    assert_eq!(runs[0].host, "node2");
-    let requests = rig.requests();
-    let stopped_at = requests.iter().position(|r| *r == stop).expect("a stop");
-    let retried_at = requests
-        .iter()
-        .rposition(|r| r.ends_with("/runs") && r.starts_with("POST"))
-        .expect("a post");
-    assert!(
-        stopped_at < retried_at,
-        "the retry was posted before the stop"
-    );
-    rig.host_finishes(&runs[0].run, Outcome::Succeeded, Some(0));
-    assert!(matches!(rig.until_done(&caller, 4).await, Finished::Ran(_)));
-}
-
-/// Catches a worker that keeps heartbeating a farm while it cannot reach the lease server, so
-/// its runs may be lost for good with nobody asking: after the fence time (T, under the
-/// scheduler's grace G) without an answer the worker is taken down and goes silent, so the
-/// farm runs its leases again after G.
-#[tokio::test(start_paused = true)]
-async fn an_unreachable_lease_server_fences_the_worker_at_the_fence_time() {
-    let (mut rig, caller, first) = running(Rig::start(&["node1"], 1, |_| {}).await).await;
-    for _ in 0..400 {
-        rig.fake.inject(Fault::Close);
+/// The job service says `UNAVAILABLE` to the next `n` calls of `method` (any call, if empty).
+fn unavailable(rig: &Rig, method: &str, n: usize) {
+    for _ in 0..n {
+        rig.fake.inject_on(
+            method,
+            Fault::Status {
+                code: Code::Unavailable,
+                message: "down".to_owned(),
+            },
+        );
     }
+}
+
+/// Catches a worker that keeps heartbeating a farm while it cannot reach the job service, so
+/// its jobs may be lost for good with nobody asking: after the fence time (T, under the
+/// scheduler's grace G) without an answer the worker cancels its job (the call is made, even
+/// if it is not answered) and goes silent, so the farm runs its leases again after G; the job
+/// that could not be cancelled goes on.
+#[tokio::test(start_paused = true)]
+async fn an_unreachable_job_service_fences_the_worker_at_the_fence_time() {
+    let (mut rig, caller, first) = running(Rig::start(&[HOST], 1, |_| {}).await).await;
+    unavailable(&rig, "", 200);
     let mut seconds = 0;
-    while !rig.exec.hosts().is_empty() {
-        assert!(seconds <= 45, "not fenced after {seconds} s");
+    while !rig.exec.workers()[0].silent {
+        assert!(seconds <= 60, "not fenced after {seconds} s");
         rig.advance(Duration::from_secs(5)).await;
         seconds += 5;
         rig.pump().await;
     }
-    assert!(seconds > 35, "fenced after {seconds} s: before T");
-    assert!(seconds < 60, "fenced after {seconds} s: not before G");
+    assert!(
+        seconds + 5 > rig.cfg.fence_after.as_secs(),
+        "fenced after {seconds} s: before T"
+    );
+    assert!(
+        seconds < LEASE_GRACE.as_secs(),
+        "fenced after {seconds} s: not before G"
+    );
     assert!(caller.finished().is_none());
-    assert!(rig.fake.run_state(&first.run).is_some());
+    assert_eq!(cancels(&rig.fake.calls()), [first.id()]);
+    let held = rig.jobs();
+    assert_eq!(held.len(), 1);
+    assert_eq!(held[0].state(), JobState::Running, "the cancel was applied");
+}
+
+/// Catches a fence that cancels some of a worker's jobs, or none, or goes on talking: with
+/// two jobs running and the job service silent past the fence time, the worker asks to
+/// cancel each of them once, makes no call while it is silent, and the farm, which heard
+/// nothing, runs both actions again as new farm leases, which are new jobs, once the service
+/// answers again and the silence is over; the old jobs are cancelled for good.
+#[tokio::test(start_paused = true)]
+async fn the_fence_cancels_every_job_and_falls_silent() {
+    let mut rig = Rig::start(&[HOST], 1, |_| {}).await;
+    rig.pump().await;
+    let callers = [rig.submit(1), rig.submit(2)];
+    rig.pump().await;
+    let mut old: Vec<String> = rig.jobs().iter().map(|p| p.id().to_owned()).collect();
+    assert_eq!(old.len(), 2, "{:?}", rig.jobs());
+    old.sort();
+    for id in &old {
+        rig.host_runs(id, HOST);
+    }
+    rig.pump().await;
+    assert_eq!(rig.exec.workers()[0].runs, 2);
+
+    // Every read of a job fails from here on; the cancels the fence sends are answered.
+    unavailable(&rig, "GetJob", 200);
+    let mut seconds = 0;
+    while !rig.exec.workers()[0].silent {
+        assert!(seconds <= 60, "not fenced after {seconds} s");
+        rig.advance(Duration::from_secs(5)).await;
+        seconds += 5;
+        rig.pump().await;
+    }
+    assert_eq!(
+        rig.exec.workers()[0].runs,
+        0,
+        "the fenced worker kept tasks"
+    );
+    let mut cancelled = cancels(&rig.fake.calls());
+    cancelled.sort();
+    assert_eq!(cancelled, old, "each job is cancelled once");
+    assert!(
+        rig.jobs().iter().all(|p| p.job.cancel_requested),
+        "{:?}",
+        rig.jobs()
+    );
+    assert!(callers.iter().all(|c| c.finished().is_none()));
+
+    // Silent: nothing is asked of the job service, and nothing is submitted, while the
+    // worker waits for the farm to give its leases up.
+    let calls = rig.fake.calls().len();
+    rig.elapse(35).await;
+    assert!(rig.exec.workers()[0].silent);
+    assert_eq!(rig.fake.calls().len(), calls, "{:?}", rig.methods());
+    assert_eq!(rig.jobs().len(), 2);
+
+    // The service answers again: the rest of the failures are used up.
+    let mut answered = false;
+    for _ in 0..256 {
+        if rig.api.get_job(&old[0]).await.is_ok() {
+            answered = true;
+            break;
+        }
+    }
+    assert!(answered, "the injected failures were never used up");
+    for tag in [1, 2] {
+        let jobs = until_jobs(&mut rig, tag, 2, 12).await;
+        assert!(!old.contains(&jobs[1].id().to_owned()), "{jobs:?}");
+    }
+    for id in &old {
+        assert!(rig.fake.host_stopped(id), "{id} was not cancelled");
+    }
+    let mut cancelled = cancels(&rig.fake.calls());
+    cancelled.sort();
+    assert_eq!(cancelled, old, "a job that was not fenced was cancelled");
+    for (tag, caller) in [1_u8, 2].into_iter().zip(&callers) {
+        let job = rig.jobs_of(tag).remove(1);
+        rig.host_finishes(job.id(), HOST, 0);
+        assert!(matches!(rig.until_done(caller, 6).await, Finished::Ran(_)));
+    }
+    assert_eq!(rig.ingest.calls.lock().expect("calls").len(), 2);
+}
+
+/// Catches a fence time that leaves the scheduler no margin before it requeues: a worker that
+/// is silent for T cancels its jobs, and the farm requeues them after G, so T plus the
+/// scheduler's margin and one step stays under G, and the config that breaks it is refused.
+#[test]
+fn a_fence_time_that_leaves_no_margin_under_the_farms_grace_is_refused() {
+    let mut cfg = Config::new("front", 1, 2_000, 16 * GIB);
+    cfg.insecure_argv_secrets = true;
+    cfg.fence_after = LEASE_GRACE - LEADER_LEASE_MARGIN - cfg.poll;
+    assert_eq!(cfg.validate(), Err(ConfigError::Fence));
+    cfg.fence_after = LEASE_GRACE;
+    assert_eq!(cfg.validate(), Err(ConfigError::Fence));
 }
 
 /// Catches a stream the farm ended (a handover sends a status in place of a message) being
-/// treated as an error to retry, or ignored: the runs the farm gave up are stopped, the worker
-/// registers again as a new process naming the old one stopped, and the farm runs the action
-/// again at once on the new stream.
+/// treated as an error to retry, or ignored: the jobs the farm gave up are cancelled, the
+/// worker registers again as a new process naming the old one, and the farm runs the action
+/// again at once as a new farm lease, which is a new job.
 #[tokio::test(start_paused = true)]
 async fn a_stream_the_farm_ended_has_its_runs_stopped_and_is_registered_again() {
-    let (mut rig, caller, first) = running(Rig::start(&["node1"], 1, |_| {}).await).await;
+    let (mut rig, caller, first) = running(Rig::start(&[HOST], 1, |_| {}).await).await;
     assert_eq!(
         rig.farm
             .end_worker_streams(&Status::unavailable("handover")),
         1
     );
     rig.pump().await;
-    let stop = format!("DELETE /v1/leases/{}/runs/{}", first.lease, first.run);
-    assert_eq!(count(&rig.requests(), &stop), 1);
-    let runs = rig.runs_of(1).await;
-    assert_eq!(
-        runs.len(),
-        2,
-        "the action was not run again on the new stream: {runs:?}"
-    );
-    assert_eq!(runs[0].lease, runs[1].lease, "the lease was kept");
-    rig.host_finishes(&runs[1].run, Outcome::Succeeded, Some(0));
+    assert_eq!(cancels(&rig.fake.calls()), [first.id()]);
+    let jobs = until_jobs(&mut rig, 1, 2, 3).await;
+    assert_eq!(jobs.len(), 2, "{jobs:?}");
+    assert_ne!(jobs[1].id(), first.id());
+    assert!(rig.fake.host_stopped(first.id()), "the old job runs on");
+    rig.host_finishes(jobs[1].id(), HOST, 0);
     assert!(matches!(rig.until_done(&caller, 4).await, Finished::Ran(_)));
 }
 
-/// Catches the lease the farm gave up being run to its end beside its retry: the worker's
-/// heartbeat lists a lease the farm no longer holds, the farm answers with a `Cancel`, and the
-/// run is stopped; the late result is never reported.
+/// Catches the lease the farm gave up being run to its end beside its retry: a worker that is
+/// not stepped for longer than the scheduler's grace is one the farm has given up, and its
+/// next pass finds the farm last acknowledged it too long ago, so it cancels its job and
+/// falls silent; the job's late result is never reported, and the action runs again as a new
+/// job.
 #[tokio::test(start_paused = true)]
 async fn a_lease_the_farm_gave_up_is_cancelled_and_its_run_stopped() {
-    let (mut rig, caller, first) = running(Rig::start(&["node1"], 1, |_| {}).await).await;
+    let (mut rig, caller, first) = running(Rig::start(&[HOST], 1, |_| {}).await).await;
     // The executor is not stepped for longer than the grace: the farm gives the lease up
     // and places the action again.
     rig.advance(Duration::from_secs(65)).await;
     rig.farm.tick().await;
     rig.pump().await;
-    rig.elapse(10).await;
-    let stop = format!("DELETE /v1/leases/{}/runs/{}", first.lease, first.run);
-    assert!(
-        count(&rig.requests(), &stop) >= 1,
-        "the old run was not stopped"
-    );
-    let runs = rig.runs_of(1).await;
-    assert_eq!(runs.len(), 1, "{runs:?}");
-    assert_ne!(runs[0].run, first.run);
-    // The first run's late result, if its host still sends one, is not reported.
-    let _ = rig
-        .fake
-        .finish_run(&first.run, Outcome::Succeeded, Some(0), None);
-    rig.host_finishes(&runs[0].run, Outcome::Succeeded, Some(0));
+    assert_eq!(cancels(&rig.fake.calls()), [first.id()]);
+    // The first job's late result, if its host still sends one, is not reported.
+    assert!(rig.fake.finish(first.id(), 0));
+    let jobs = until_jobs(&mut rig, 1, 2, 16).await;
+    let newest = jobs.last().expect("a job").id().to_owned();
+    assert_ne!(newest, first.id());
+    rig.host_finishes(&newest, HOST, 0);
     assert!(matches!(rig.until_done(&caller, 4).await, Finished::Ran(_)));
     assert_eq!(rig.ingest.calls.lock().expect("calls").len(), 1);
 }
 
-/// Catches a post whose answer was lost being posted again (the run is queued, and a second
-/// run of the action would run beside it): the worker cannot know, so it asks for its lease
-/// to be released (which stops anything queued), is taken down, and the farm gives the lease
-/// up and runs the action on a new lease.
+/// Catches a submit whose answer was lost being given up on, or making a second job: the job
+/// service made the job, and the worker cannot know, so it sends the submit again with the same
+/// job id; the service answers from the job it has, there is one job of the action, and it is
+/// counted as submitted once and sent again once.
 #[tokio::test(start_paused = true)]
-async fn a_post_whose_answer_was_lost_is_not_posted_again() {
-    let mut rig = Rig::start(&["node1"], 1, |_| {}).await;
+async fn a_post_whose_answer_was_lost_is_submitted_again_with_the_same_id_and_makes_one_job() {
+    let mut rig = Rig::start(&[HOST], 1, |_| {}).await;
     rig.pump().await;
-    let lease = rig.exec.hosts()[0].lease;
     let caller = rig.submit(1);
-    rig.fake.inject(Fault::Reply {
-        status: 202,
-        body: bytes::Bytes::from_static(b"not json"),
-    });
+    rig.fake.inject_on("SubmitJob", Fault::LoseAnswer);
     rig.pump().await;
-    assert!(
-        rig.exec.hosts().is_empty(),
-        "the worker went on after an unknown post"
-    );
+    let sent = submits(&rig.fake.calls());
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    assert_eq!(sent[0].job_id, sent[1].job_id);
+    let jobs = rig.jobs();
+    assert_eq!(jobs.len(), 1, "{jobs:?}");
+    assert_eq!(jobs[0].id(), sent[0].job_id);
+    assert_eq!(rig.counter("kbf_executor_jobs_submitted_total"), 1);
     assert_eq!(
-        count(&rig.requests(), &format!("DELETE /v1/leases/{lease}")),
+        rig.counter("kbf_executor_jobs_resubmitted_after_lost_answer_total"),
         1
     );
-    assert_eq!(
-        count_tail(&rig.requests(), "POST", "/runs"),
-        1,
-        "posted again"
-    );
-    rig.elapse(75).await;
-    let runs = rig.runs_of(1).await;
-    assert_eq!(runs.len(), 1, "{runs:?}");
-    rig.host_finishes(&runs[0].run, Outcome::Succeeded, Some(0));
-    assert!(matches!(rig.until_done(&caller, 4).await, Finished::Ran(_)));
-}
-
-/// Catches a host that reports a taint between two reads of the host list failing the action
-/// or going on: the post is refused with `host-tainted`, the action is rerun (the farm's
-/// fault), and the worker stops taking work.
-#[tokio::test(start_paused = true)]
-async fn a_post_refused_for_a_taint_reruns_the_action_and_drains_the_worker() {
-    let mut rig = Rig::start(&["node1"], 1, |_| {}).await;
-    rig.pump().await;
-    assert!(rig.fake.taint_host("node1", "post-job-check"));
-    let caller = rig.submit(1);
-    rig.pump().await;
-    assert!(rig.exec.hosts()[0].draining);
-    assert!(rig.runs().await.is_empty());
     assert!(caller.finished().is_none());
-}
-
-/// Catches a post to a host the lease server lost being retried on that host: the worker is
-/// taken down silently, and its lease released.
-#[tokio::test(start_paused = true)]
-async fn a_post_refused_for_a_lost_host_takes_the_worker_down() {
-    let mut rig = Rig::start(&["node1"], 1, |_| {}).await;
-    rig.pump().await;
-    assert!(rig.fake.set_lost("node1", true));
-    let _caller = rig.submit(1);
-    rig.pump().await;
-    assert!(rig.exec.hosts().is_empty());
-    assert!(rig.runs().await.is_empty());
-}
-
-/// Catches a lease that is gone being posted to anyway, or its refusal being taken for the
-/// action's: the lease server answers `not-held` (or `unknown-lease`), the worker is taken
-/// down, and the action is reported lost so the farm runs it again on the lease that replaces
-/// this one.
-#[tokio::test(start_paused = true)]
-async fn a_post_to_a_lease_that_is_gone_loses_the_start_and_replaces_the_lease() {
-    for renewing_first in [false, true] {
-        let mut rig = Rig::start(&["node1"], 1, |cfg| {
-            if renewing_first {
-                // A ttl that only just covers the longest run: the lease is renewed
-                // before a run is posted, and that renewal finds the lease gone.
-                cfg.lease_ttl = cfg.max_run + cfg.run_margin + cfg.heartbeat * 2;
-                cfg.drain_before_end = cfg.lease_ttl + Duration::from_secs(60);
-            }
-        })
-        .await;
-        rig.pump().await;
-        let lease = rig.exec.hosts()[0].lease;
-        rig.api.release(lease).await.expect("released");
-        rig.advance(Duration::from_secs(1)).await;
-        rig.inputs
-            .facts
-            .lock()
-            .expect("facts")
-            .as_mut()
-            .expect("ok")
-            .timeout = Some(rig.cfg.max_run);
-        let caller = rig.submit(1);
-        rig.pump().await;
-        assert!(
-            rig.exec.hosts().is_empty(),
-            "renewing first: {renewing_first}"
-        );
-        rig.elapse(10).await;
-        let runs = rig.runs_of(1).await;
-        assert_eq!(runs.len(), 1, "renewing first: {renewing_first}");
-        assert_ne!(runs[0].lease, lease);
-        rig.host_finishes(&runs[0].run, Outcome::Succeeded, Some(0));
-        assert!(matches!(rig.until_done(&caller, 4).await, Finished::Ran(_)));
-    }
+    rig.host_finishes(jobs[0].id(), HOST, 0);
+    assert!(matches!(rig.until_done(&caller, 4).await, Finished::Ran(_)));
+    assert_eq!(rig.ingest.calls.lock().expect("calls").len(), 1);
 }
 
 /// Catches a stream the farm dropped without a word (another stream registered as the same
-/// worker) being taken for a quiet one: the runs are stopped, the worker registers again, and
-/// the action, whose lease the farm gives up, runs again.
+/// worker) being taken for a quiet one: the job is cancelled, the worker registers again,
+/// and the action, whose lease the farm gives up, runs again as a new job.
 #[tokio::test(start_paused = true)]
 async fn a_worker_registered_again_by_another_stream_registers_again_in_turn() {
     use kbf_sched::DaemonInstance;
     use kbf_server::farm::Reported;
-    let (mut rig, caller, first) = running(Rig::start(&["node1"], 1, |_| {}).await).await;
+    let (mut rig, caller, first) = running(Rig::start(&[HOST], 1, |_| {}).await).await;
     let caps = kbf_caps::NodeCaps::from_report([("arch", "x86_64"), ("os", "linux")])
         .expect("caps")
         .with_drivers(["container"]);
     let (outbound, _inbox) = tokio::sync::mpsc::unbounded_channel();
+    let worker = rig.exec.workers()[0].worker.clone();
     rig.farm.register(
-        &kbf_types::WorkerId::new("js:node1"),
+        &worker,
         DaemonInstance::new("another-process"),
         DaemonInstance::new(""),
         Reported::serving(kbf_types::Resources::new(2_000, 4 << 30), caps),
@@ -375,32 +276,36 @@ async fn a_worker_registered_again_by_another_stream_registers_again_in_turn() {
         kbf_proto::worker::ServerMessage::default(),
     );
     rig.pump().await;
-    let stop = format!("DELETE /v1/leases/{}/runs/{}", first.lease, first.run);
-    assert_eq!(count(&rig.requests(), &stop), 1);
+    assert_eq!(cancels(&rig.fake.calls()), [first.id()]);
     rig.elapse(75).await;
-    let runs = rig.runs_of(1).await;
-    assert_eq!(runs.len(), 2, "{runs:?}");
-    rig.host_finishes(&runs[1].run, Outcome::Succeeded, Some(0));
+    let jobs = rig.jobs_of(1);
+    assert_eq!(jobs.len(), 2, "{jobs:?}");
+    rig.host_finishes(jobs[1].id(), HOST, 0);
     assert!(matches!(rig.until_done(&caller, 4).await, Finished::Ran(_)));
 }
 
-/// Catches a run the lease server refuses for the job's own sake (a 422) being the action's
-/// failure or being posted again unchanged: it is infrastructure, so the farm runs the action
-/// again.
+/// Catches a submit the job service refuses for its own sake (it did not take the job, and
+/// says nothing about the job being wrong) being the action's failure or being sent again
+/// unchanged: it is infrastructure, so the farm runs the action again, and the refused submit
+/// made no job.
 #[tokio::test(start_paused = true)]
-async fn a_refused_post_is_rerun() {
-    let mut rig = Rig::start(&["node1"], 1, |_| {}).await;
+async fn a_refused_submit_is_rerun() {
+    let mut rig = Rig::start(&[HOST], 1, |_| {}).await;
     rig.pump().await;
     let caller = rig.submit(1);
-    rig.fake.inject(Fault::Reply {
-        status: 422,
-        body: bytes::Bytes::from_static(br#"{"error":"invalid-job"}"#),
-    });
+    rig.fake.inject_on(
+        "SubmitJob",
+        Fault::Status {
+            code: Code::ResourceExhausted,
+            message: "busy".to_owned(),
+        },
+    );
     rig.pump().await;
     assert!(caller.finished().is_none());
-    let runs = rig.runs_of(1).await;
-    assert_eq!(runs.len(), 1, "{runs:?}");
-    rig.host_finishes(&runs[0].run, Outcome::Succeeded, Some(0));
+    assert_eq!(rig.counter("kbf_executor_runs_total{outcome=\"infra\"}"), 1);
+    let jobs = until_jobs(&mut rig, 1, 1, 12).await;
+    assert_eq!(jobs.len(), 1, "{jobs:?}");
+    rig.host_finishes(jobs[0].id(), HOST, 0);
     assert!(matches!(rig.until_done(&caller, 4).await, Finished::Ran(_)));
 }
 
@@ -410,72 +315,88 @@ async fn a_refused_post_is_rerun() {
 /// the read ends.
 #[tokio::test(start_paused = true)]
 async fn a_slow_ingest_does_not_stop_the_heartbeats() {
-    let (mut rig, caller, run) = running(Rig::start(&["node1"], 1, |_| {}).await).await;
+    let (mut rig, caller, job) = running(Rig::start(&[HOST], 1, |_| {}).await).await;
     rig.ingest
         .hold
         .store(true, std::sync::atomic::Ordering::SeqCst);
-    rig.host_finishes(&run.run, Outcome::Succeeded, Some(0));
+    assert!(rig.fake.finish(job.id(), 0));
     rig.pump().await;
     rig.elapse(150).await;
     assert!(caller.finished().is_none());
-    assert_eq!(rig.exec.hosts()[0].runs, 1);
-    assert_eq!(
-        rig.runs_of(1).await.len(),
-        1,
-        "the farm ran the action again"
-    );
+    assert_eq!(rig.exec.workers()[0].runs, 1);
+    assert!(!rig.exec.workers()[0].silent);
+    assert_eq!(rig.jobs_of(1).len(), 1, "the farm ran the action again");
     rig.ingest.release.notify_one();
     assert!(matches!(rig.until_done(&caller, 4).await, Finished::Ran(_)));
 }
 
-/// Catches a read left running for a worker that is gone: it is abandoned with the worker.
+/// Catches a read left running for a worker that has let its tasks go: the farm ended the
+/// stream while the pack of a finished job was being read, the worker forgot the task, and
+/// the read is abandoned with it. One release of the ingest then lets the read of the
+/// action's next job end (a read left behind would take it), and the job that had ended is
+/// never cancelled.
 #[tokio::test(start_paused = true)]
 async fn the_read_of_a_worker_that_goes_is_abandoned() {
-    let (mut rig, caller, run) = running(Rig::start(&["node1"], 1, |_| {}).await).await;
+    let (mut rig, caller, job) = running(Rig::start(&[HOST], 1, |_| {}).await).await;
     rig.ingest
         .hold
         .store(true, std::sync::atomic::Ordering::SeqCst);
-    rig.host_finishes(&run.run, Outcome::Succeeded, Some(0));
+    assert!(rig.fake.finish(job.id(), 0));
     rig.pump().await;
     assert_eq!(rig.ingest.calls.lock().expect("calls").len(), 1);
-    assert!(rig.fake.set_lost("node1", true));
-    rig.advance(Duration::from_secs(6)).await;
+    assert_eq!(
+        rig.farm
+            .end_worker_streams(&Status::unavailable("handover")),
+        1
+    );
     rig.pump().await;
-    assert!(rig.exec.hosts().is_empty());
+    assert_eq!(rig.exec.workers()[0].runs, 0);
     assert!(caller.finished().is_none());
+    assert!(cancels(&rig.fake.calls()).is_empty());
+    let jobs = until_jobs(&mut rig, 1, 2, 12).await;
+    rig.host_finishes(jobs[1].id(), HOST, 0);
+    rig.pump().await;
+    assert_eq!(rig.ingest.calls.lock().expect("calls").len(), 2);
+    rig.ingest.release.notify_one();
+    assert!(matches!(rig.until_done(&caller, 4).await, Finished::Ran(_)));
 }
 
-/// Catches a lease server that accepts a request and never answers holding the executor's
-/// pass for the client's own 30 s a call: a pass makes several, one after another, with the
+/// Catches a job service that accepts a request and never answers holding the executor's pass
+/// for the client's own 30 s a call: a pass makes several, one after another, with the
 /// heartbeats to the farm among them, and the farm requeues a worker it has not heard from
-/// after a minute. Each call gives up after the call timeout, the pass ends, and the run goes
+/// after a minute. Each call gives up after the call timeout, the pass ends, and the job goes
 /// on being tracked.
 #[tokio::test(start_paused = true)]
-async fn a_lease_server_that_never_answers_does_not_hold_the_pass() {
-    let (mut rig, caller, run) = running(Rig::start(&["node1"], 1, |_| {}).await).await;
-    rig.fake.inject_on("GET /v1/leases/", Fault::Hang);
+async fn a_job_service_that_never_answers_does_not_hold_the_pass() {
+    let (mut rig, caller, job) = running(Rig::start(&[HOST], 1, |_| {}).await).await;
+    rig.fake.inject_on("GetJob", Fault::Hang);
     let in_time = rig.step_through(Duration::from_secs(6)).await;
     assert!(in_time, "the pass waited for the client's own timeout");
-    assert_eq!(rig.exec.hosts().len(), 1);
-    rig.host_finishes(&run.run, Outcome::Succeeded, Some(0));
+    assert_eq!(rig.exec.workers().len(), 1);
+    assert!(!rig.exec.workers()[0].silent);
+    assert_eq!(rig.exec.workers()[0].runs, 1);
+    assert!(rig.fake.finish(job.id(), 0));
     assert!(matches!(rig.until_done(&caller, 4).await, Finished::Ran(_)));
 }
 
 /// Catches the fence being judged by the clock at the start of the pass: a pass that spent
-/// its time waiting for the lease server would then fence a pass late, with the lease server
+/// its time waiting for the job service would then fence a pass late, with the job service
 /// silent for longer than the fence time. The clock is read where the silence is counted.
 #[tokio::test(start_paused = true)]
 async fn the_fence_counts_the_time_the_pass_itself_took() {
-    let mut rig = Rig::start(&["node1"], 1, |cfg| {
-        cfg.fence_after = Duration::from_secs(10);
-    })
+    let (mut rig, _caller, job) = running(
+        Rig::start(&[HOST], 1, |cfg| {
+            cfg.fence_after = Duration::from_secs(10);
+        })
+        .await,
+    )
     .await;
-    rig.pump().await;
-    assert_eq!(rig.exec.hosts().len(), 1);
+    assert!(!rig.exec.workers()[0].silent);
     rig.advance(Duration::from_secs(9)).await;
-    rig.fake.inject_on("GET /v1/leases/", Fault::Hang);
-    // The pass starts 9 s after the lease server last answered, and waits 5 s for it.
+    rig.fake.inject_on("GetJob", Fault::Hang);
+    // The pass starts 9 s after the job service last answered, and waits 5 s for it.
     let in_time = rig.step_through(Duration::from_secs(6)).await;
     assert!(in_time);
-    assert!(rig.exec.hosts().is_empty(), "the worker was not fenced");
+    assert!(rig.exec.workers()[0].silent, "the worker was not fenced");
+    assert_eq!(cancels(&rig.fake.calls()), [job.id()]);
 }

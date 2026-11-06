@@ -49,12 +49,11 @@ const BASE: &str =
 const KBF: &str =
     "registry.test/kbf@sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
 
-const JS: [&str; 12] = [
+const JS: [&str; 11] = [
     "--executor=js-agent",
-    "--executor-lease-url=http://127.0.0.1:7",
-    "--executor-lease-token-file=/etc/token",
+    "--executor-job-url=http://127.0.0.1:7",
+    "--executor-job-token-file=/etc/token",
     "--executor-frontend-id=front-1",
-    "--executor-class=farm-linux",
     "--executor-hosts=2",
     "--executor-host-cpus=8",
     "--executor-host-memory-gib=32",
@@ -95,12 +94,12 @@ fn a_frontend_with_no_executor_flag_runs_on_daemons_and_holds_no_settings() {
 }
 
 /// Catches the rollback losing its settings or tripping on them: with `--executor kbf-daemon`
-/// (or none) every setting of the lease server may stay in the unit or `kbf.toml`, the one that
+/// (or none) every setting of the job service may stay in the unit or `kbf.toml`, the one that
 /// lets secrets travel as arguments too, and none is read. Flipping the one flag is the
 /// rollback: a frontend that refused to start over a setting nothing reads would need a second
 /// edit in an incident.
 #[test]
-fn the_daemon_executor_keeps_the_lease_servers_settings_unread() {
+fn the_daemon_executor_keeps_the_job_services_settings_unread() {
     // The warning is made (its arguments are only evaluated under a subscriber).
     let _logged =
         tracing::subscriber::set_default(tracing_subscriber::fmt().with_test_writer().finish());
@@ -127,10 +126,9 @@ fn the_daemon_executor_keeps_the_lease_servers_settings_unread() {
 fn js_agent_names_each_flag_it_needs() {
     let why = parsed(argv(&["--executor=js-agent"])).expect_err("refused");
     for flag in [
-        "--executor-lease-url",
-        "--executor-lease-token-file",
+        "--executor-job-url",
+        "--executor-job-token-file",
         "--executor-frontend-id",
-        "--executor-class",
         "--executor-hosts",
         "--executor-host-cpus",
         "--executor-host-memory-gib",
@@ -139,7 +137,7 @@ fn js_agent_names_each_flag_it_needs() {
     ] {
         assert!(why.contains(flag), "{flag} in {why}");
     }
-    for (at, flag) in JS.iter().enumerate().skip(1).take(9) {
+    for (at, flag) in JS.iter().enumerate().skip(1).take(8) {
         let name = name(flag);
         let mut all = JS.to_vec();
         all.remove(at);
@@ -178,7 +176,6 @@ fn js_agent_settings_become_the_executors_config() {
         "--executor-allow-plain-http-put",
         "--executor-allow-plain-http-grant",
         "--executor-run-margin-secs=120",
-        "--executor-lease-ttl-secs=7200",
         "--executor-max-run-secs=1800",
         "--executor-default-timeout-secs=900",
         "--executor-call-timeout-secs=3",
@@ -188,13 +185,12 @@ fn js_agent_settings_become_the_executors_config() {
     let js = flags.executor.js.expect("js-agent");
     let config = &js.config;
     assert_eq!(flags.executor.kind, ExecutorKind::JsAgent);
-    assert_eq!(js.lease_url, "http://127.0.0.1:7");
+    assert_eq!(js.job_url, "http://127.0.0.1:7");
     assert_eq!(js.token_file, Path::new("/etc/token"));
     assert!(js.ca_file.is_none());
     assert_eq!(js.base_image.to_string(), BASE);
     assert_eq!(js.kbf_image.to_string(), KBF);
     assert_eq!(config.frontend, "front-1");
-    assert_eq!(config.class, "farm-linux");
     assert_eq!(config.hosts, 2);
     assert_eq!(config.cpu_millis, 8_000);
     assert_eq!(config.memory_bytes, 32 << 30);
@@ -205,7 +201,6 @@ fn js_agent_settings_become_the_executors_config() {
     assert!(config.allow_plain_http_grant);
     assert!(config.insecure_argv_secrets);
     assert_eq!(config.run_margin, Duration::from_secs(120));
-    assert_eq!(config.lease_ttl, Duration::from_secs(7200));
     assert_eq!(config.max_run, Duration::from_secs(1800));
     assert_eq!(config.default_timeout, Duration::from_secs(900));
     assert_eq!(config.call_timeout, Duration::from_secs(3));
@@ -245,7 +240,7 @@ fn the_defaults_are_the_executors_own() {
     all.push("--task-put-endpoint=https://127.0.0.1:9");
     let flags = parsed(argv(&all)).expect("flags");
     let config = flags.executor.js.expect("js-agent").config;
-    let own = Config::new("front-1", 2, "farm-linux", 8_000, 32 << 30);
+    let own = Config::new("front-1", 2, 8_000, 32 << 30);
     assert_eq!(config.slots, own.slots);
     assert_eq!(config.arch, own.arch);
     assert_eq!(config.work_dir, own.work_dir);
@@ -253,7 +248,6 @@ fn the_defaults_are_the_executors_own() {
     assert_eq!(config.allow_plain_http_grant, own.allow_plain_http_grant);
     assert!(!config.allow_plain_http_grant, "off by default");
     assert_eq!(config.run_margin, own.run_margin);
-    assert_eq!(config.lease_ttl, own.lease_ttl);
     assert_eq!(config.max_run, own.max_run);
     assert_eq!(config.default_timeout, own.default_timeout);
     assert_eq!(config.call_timeout, own.call_timeout);
@@ -326,23 +320,23 @@ fn the_flags_of_the_host_preloaded_tool_are_gone() {
     }
 }
 
-/// Catches a lease server or a directory that is not one being taken:
+/// Catches a job service or a directory that is not one being taken:
 /// each is refused at the flags, naming the flag.
 #[test]
 fn settings_that_are_not_what_they_name_are_refused_naming_the_flag() {
     let cases: [(&[&str], &str); 6] = [
-        (&["--executor-lease-url=ftp://x"], "--executor-lease-url"),
+        (&["--executor-job-url=ftp://x"], "--executor-job-url"),
         (
-            &["--executor-lease-url=http://lease.example:80"],
-            "--executor-lease-url",
+            &["--executor-job-url=http://jobs.example:80"],
+            "--executor-job-url",
         ),
         (
-            &["--executor-lease-url=https://lease.example"],
-            "--executor-lease-ca-file",
+            &["--executor-job-url=https://jobs.example"],
+            "--executor-job-ca-file",
         ),
         (
-            &["--executor-lease-ca-file=/etc/ca.pem"],
-            "--executor-lease-ca-file",
+            &["--executor-job-ca-file=/etc/ca.pem"],
+            "--executor-job-ca-file",
         ),
         (&["--executor-work-dir=scratch"], "--executor-work-dir"),
         (
@@ -357,13 +351,12 @@ fn settings_that_are_not_what_they_name_are_refused_naming_the_flag() {
 }
 
 /// Catches settings that break a rule the executor's safety rests on starting anyway: the
-/// executor's own validation is run on the flags, and a frontend id that cannot label a lease
+/// executor's own validation is run on the flags, and a frontend id that cannot label a job
 /// is refused.
 #[test]
 fn settings_that_break_a_rule_of_the_executor_are_refused() {
     for more in [
-        &["--executor-lease-ttl-secs=10"][..],
-        &["--executor-default-timeout-secs=4000"],
+        &["--executor-default-timeout-secs=4000"][..],
         &["--executor-call-timeout-secs=60"],
         &["--executor-max-run-secs=20000"],
     ] {
@@ -377,10 +370,10 @@ fn settings_that_break_a_rule_of_the_executor_are_refused() {
 }
 
 fn flags_of(url: &str, token: &Path, ca: Option<&Path>) -> JsAgentFlags {
-    let config = Config::new("front-1", 1, "farm-linux", 2_000, 16 << 30);
+    let config = Config::new("front-1", 1, 2_000, 16 << 30);
     JsAgentFlags {
         config,
-        lease_url: url.to_owned(),
+        job_url: url.to_owned(),
         token_file: token.to_path_buf(),
         ca_file: ca.map(Path::to_path_buf),
         base_image: ImageRef::parse(&format!("docker://{BASE}")).expect("an image"),
@@ -394,10 +387,10 @@ fn write_private(path: &Path, text: &str, mode: u32) {
 }
 
 /// Catches a client built from files it should have refused: a token file that others can read
-/// or that is missing, a CA file that is missing or holds no certificate, and a plain URL with a
+/// (the job client takes mode 0600 or 0400 alone) or that is missing, a CA file that is missing or holds no certificate, and a plain URL with a
 /// CA. A good token and a plain loopback URL give a client.
-#[test]
-fn the_client_is_built_from_a_private_token_and_a_ca_that_is_a_certificate() {
+#[tokio::test]
+async fn the_client_is_built_from_a_private_token_and_a_ca_that_is_a_certificate() {
     let dir = scratch_dir("executor-client");
     let token = dir.path().join("token");
     write_private(&token, "a-token-of-printable-bytes-0123456789\n", 0o600);
@@ -413,7 +406,7 @@ fn the_client_is_built_from_a_private_token_and_a_ca_that_is_a_certificate() {
         .client()
         .expect_err("refused")
         .to_string();
-    assert!(why.contains("--executor-lease-token-file"), "{why}");
+    assert!(why.contains("--executor-job-token-file"), "{why}");
     let absent = dir.path().join("absent");
     assert!(
         flags_of("http://127.0.0.1:7", &absent, None)
@@ -427,17 +420,17 @@ fn the_client_is_built_from_a_private_token_and_a_ca_that_is_a_certificate() {
         .client()
         .expect_err("refused")
         .to_string();
-    assert!(why.contains("--executor-lease-url"), "{why}");
+    assert!(why.contains("--executor-job-url"), "{why}");
     let why = flags_of("https://localhost:7", &token, Some(&absent))
         .client()
         .expect_err("refused")
         .to_string();
-    assert!(why.contains("--executor-lease-ca-file"), "{why}");
+    assert!(why.contains("--executor-job-ca-file"), "{why}");
     let why = flags_of("http://127.0.0.1:7", &token, Some(&ca))
         .client()
         .expect_err("refused")
         .to_string();
-    assert!(why.contains("--executor-lease-url"), "{why}");
+    assert!(why.contains("--executor-job-url"), "{why}");
 }
 
 /// [`JS`] without the insecure flag, and with `more`.
@@ -502,4 +495,61 @@ fn the_daemon_executor_refuses_the_files_delivery() {
     assert!(why.contains("--executor-secret-delivery"), "{why}");
     let flags = parsed(argv(&["--executor-secret-delivery=argv"])).expect("flags");
     assert_eq!(flags.executor.kind, ExecutorKind::KbfDaemon);
+}
+
+/// Catches the lease server's flags still being read, or the job service's being optional: each
+/// removed flag is refused when the command line is parsed, with an error naming it, so a unit
+/// that still has one fails at start and never runs on the wrong protocol; each flag that
+/// replaced them is named, in the order of `REQUIRED`, when it is missing; and daemons, given
+/// none of them, build no executor and no client.
+#[test]
+fn old_lease_flags_are_refused_and_job_flags_are_required() {
+    for removed in [
+        "--executor-lease-url=http://127.0.0.1:7",
+        "--executor-lease-token-file=/etc/token",
+        "--executor-lease-ca-file=/etc/ca.pem",
+        "--executor-lease-ttl-secs=7200",
+        "--executor-class=farm-linux",
+    ] {
+        let why = refused(&[removed]);
+        assert!(why.contains(name(removed)), "{removed}: {why}");
+        assert!(why.contains("unexpected argument"), "{removed}: {why}");
+        // The same with daemons: the rollback keeps the job flags, not the removed ones.
+        let why = parsed(argv(&[removed])).expect_err("refused");
+        assert!(why.contains(name(removed)), "{removed}: {why}");
+    }
+
+    let order: Vec<&str> = REQUIRED.iter().map(|(_, long)| *long).collect();
+    assert_eq!(
+        order,
+        [
+            "--executor-job-url",
+            "--executor-job-token-file",
+            "--executor-frontend-id",
+            "--executor-hosts",
+            "--executor-host-cpus",
+            "--executor-host-memory-gib",
+            "--executor-base-image",
+            "--executor-kbf-image",
+        ]
+    );
+    let why = parsed(argv(&["--executor=js-agent"])).expect_err("refused");
+    let first = why.lines().next().expect("a line");
+    let all = format!("--executor js-agent needs {}", order.join(", "));
+    assert!(first.ends_with(&all), "{all} in {why}");
+    for missing in &order {
+        let mut all = JS.to_vec();
+        all.retain(|flag| name(flag) != *missing);
+        let why = parsed(argv(&all)).expect_err("refused");
+        let first = why.lines().next().expect("a line");
+        let one = format!("--executor js-agent needs {missing}");
+        assert!(first.ends_with(&one), "{one} in {why}");
+    }
+
+    let flags = parsed(argv(&["--executor=kbf-daemon"])).expect("flags");
+    assert_eq!(flags.executor.kind, ExecutorKind::KbfDaemon);
+    assert!(flags.executor.js.is_none(), "no executor, so no client");
+    let none = ExecutorFlags::default();
+    assert_eq!(none.kind, ExecutorKind::KbfDaemon);
+    assert!(none.js.is_none());
 }

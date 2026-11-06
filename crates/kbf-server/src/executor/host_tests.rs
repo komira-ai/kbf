@@ -1,13 +1,13 @@
 use std::time::Duration;
 
-use kbf_proto::worker::{Cancel, ResultAck, ServerMessage, server_message};
+use kbf_job_client::fake::Call;
+use kbf_proto::worker::{ResultAck, ServerMessage, server_message};
 use kbf_types::LeaseId;
 use tokio::time::Instant;
 
 use super::HostWorker;
-use crate::executor::View;
 use crate::executor::runs::Stage;
-use crate::executor::test_support::{GIB, Harness, start};
+use crate::executor::test_support::{Harness, start};
 
 fn message(message: server_message::Message) -> Result<ServerMessage, tonic::Status> {
     Ok(ServerMessage {
@@ -20,19 +20,29 @@ fn stage_of(worker: &HostWorker, lease: LeaseId) -> &'static str {
         None => "none",
         Some(Stage::Waiting(_)) => "waiting",
         Some(Stage::Running(_)) => "running",
+        Some(Stage::Withdrawing(_)) => "withdrawing",
         Some(Stage::Ingesting(_)) => "ingesting",
         Some(Stage::Reporting(_)) => "reporting",
     }
 }
 
+fn submits(harness: &Harness) -> usize {
+    harness
+        .fake
+        .calls()
+        .iter()
+        .filter(|call| matches!(call, Call::SubmitJob(_)))
+        .count()
+}
+
 /// Catches a `Start` acted on that names a heartbeat the worker never sent (a daemon refuses
 /// it: it may be a copy from another stream), and one with no window (a server that sent none
-/// bounds nothing, which here is read as no time at all, the safe way): neither is posted, and
-/// neither is kept.
+/// bounds nothing, which here is read as no time at all, the safe way): neither is submitted,
+/// and neither is kept.
 #[tokio::test(start_paused = true)]
-async fn a_start_outside_what_it_names_is_dropped_unposted() {
+async fn a_start_outside_what_it_names_is_dropped_unsubmitted() {
     let harness = Harness::new().await;
-    let (mut worker, messages) = harness.worker().await;
+    let (mut worker, messages) = harness.worker();
     let (unknown_beat, no_window) = (
         kbf_proto::worker::Start {
             heartbeat_seq: 99,
@@ -49,58 +59,10 @@ async fn a_start_outside_what_it_names_is_dropped_unposted() {
     messages
         .send(message(server_message::Message::Start(no_window)))
         .expect("sent");
-    let flow = worker
-        .step(&harness.ctx(), &View::default(), Instant::now())
-        .await;
-    assert_eq!(flow, None);
+    worker.step(&harness.ctx(), Instant::now()).await;
     assert!(worker.tasks.is_empty());
-    let runs = harness.deps.client.runs(worker.lease).await.expect("runs");
-    assert!(runs.is_empty());
-}
-
-/// Catches a `Cancel` that leaves a run going or does not forget its lease: a running run is
-/// asked to stop and the task forgotten once the lease server has answered, any other task
-/// (waiting, or not a lease of this worker at all) is forgotten at once.
-#[tokio::test(start_paused = true)]
-async fn a_cancel_stops_a_run_and_forgets_the_lease() {
-    let harness = Harness::new().await;
-    let (mut worker, messages) = harness.worker().await;
-    let (ctx, view) = (harness.ctx(), View::default());
-    messages
-        .send(message(server_message::Message::Start(start(1, 1))))
-        .expect("sent");
-    messages
-        .send(message(server_message::Message::Start(start(1, 2))))
-        .expect("sent");
-    worker.step(&ctx, &view, Instant::now()).await;
-    assert_eq!(stage_of(&worker, LeaseId::new(1, 1)), "running");
-    let run = harness.deps.client.runs(worker.lease).await.expect("runs")[0]
-        .run_id
-        .clone();
-    let cancel = |seq| {
-        message(server_message::Message::Cancel(Cancel {
-            lease_id: Some(kbf_proto::worker::LeaseId { term: 1, seq }),
-        }))
-    };
-    messages.send(cancel(1)).expect("sent");
-    messages.send(cancel(77)).expect("sent");
-    worker.step(&ctx, &view, Instant::now()).await;
-    assert_eq!(stage_of(&worker, LeaseId::new(1, 1)), "none");
-    assert_eq!(
-        stage_of(&worker, LeaseId::new(1, 2)),
-        "running",
-        "another lease was cancelled"
-    );
-    let stop = format!("DELETE /v1/leases/{}/runs/{run}", worker.lease);
-    assert_eq!(
-        harness
-            .fake
-            .requests()
-            .iter()
-            .filter(|r| **r == stop)
-            .count(),
-        1
-    );
+    assert!(harness.fake.calls().is_empty());
+    assert!(harness.fake.jobs().is_empty());
 }
 
 /// Catches an acknowledgement that does not release the result it answers, or one that
@@ -109,7 +71,7 @@ async fn a_cancel_stops_a_run_and_forgets_the_lease() {
 #[tokio::test(start_paused = true)]
 async fn an_acknowledgement_forgets_its_lease_only() {
     let harness = Harness::new().await;
-    let (mut worker, _messages) = harness.worker().await;
+    let (mut worker, _messages) = harness.worker();
     for seq in [1, 2] {
         worker.accept(&start(1, seq));
     }
@@ -135,7 +97,7 @@ async fn an_acknowledgement_forgets_its_lease_only() {
 #[tokio::test(start_paused = true)]
 async fn an_unacknowledged_heartbeat_does_not_move_the_fence() {
     let harness = Harness::new().await;
-    let (mut worker, _messages) = harness.worker().await;
+    let (mut worker, _messages) = harness.worker();
     let ctx = harness.ctx();
     let registered = Instant::now();
     tokio::time::advance(Duration::from_secs(6)).await;
@@ -158,27 +120,27 @@ async fn an_unacknowledged_heartbeat_does_not_move_the_fence() {
     assert_eq!(worker.seq, 1);
 }
 
-/// Catches a `Start` that the farm sends twice for one lease posting two runs of it (the
+/// Catches a `Start` that the farm sends twice for one lease submitting two jobs of it (the
 /// second would run beside the first and report beside it): the second changes nothing, even
-/// after the first was posted.
+/// after the first was submitted.
 #[tokio::test(start_paused = true)]
-async fn a_start_sent_twice_posts_one_run() {
+async fn a_start_sent_twice_submits_one_job() {
     let harness = Harness::new().await;
-    let (mut worker, messages) = harness.worker().await;
-    let (ctx, view) = (harness.ctx(), View::default());
+    let (mut worker, messages) = harness.worker();
+    let ctx = harness.ctx();
     for _ in 0..2 {
         messages
             .send(message(server_message::Message::Start(start(1, 1))))
             .expect("sent");
     }
-    worker.step(&ctx, &view, Instant::now()).await;
+    worker.step(&ctx, Instant::now()).await;
     messages
         .send(message(server_message::Message::Start(start(1, 1))))
         .expect("sent");
-    worker.step(&ctx, &view, Instant::now()).await;
+    worker.step(&ctx, Instant::now()).await;
     assert_eq!(stage_of(&worker, LeaseId::new(1, 1)), "running");
-    let runs = harness.deps.client.runs(worker.lease).await.expect("runs");
-    assert_eq!(runs.len(), 1);
+    assert_eq!(submits(&harness), 1);
+    assert_eq!(harness.fake.jobs().len(), 1);
 }
 
 /// Catches a worker that forgets when it sent a heartbeat that a `Start` may still name: the
@@ -190,7 +152,7 @@ async fn a_start_sent_twice_posts_one_run() {
 async fn the_sends_remembered_cover_the_start_window_at_any_heartbeat_interval() {
     let mut harness = Harness::new().await;
     harness.cfg.heartbeat = Duration::from_millis(100);
-    let (mut worker, _messages) = harness.worker().await;
+    let (mut worker, _messages) = harness.worker();
     let ctx = harness.ctx();
     for _ in 0..139 {
         tokio::time::advance(Duration::from_millis(100)).await;
@@ -209,82 +171,23 @@ async fn the_sends_remembered_cover_the_start_window_at_any_heartbeat_interval()
     assert!(worker.sent_at(worker.seq).is_some());
 }
 
-/// A load as the lease server lists it, of `seq`.
-fn listed(seq: u64) -> kbf_lease_client::HostLoad {
-    kbf_lease_client::HostLoad {
-        seq,
-        mono_usec: seq * 1_000_000,
-        cpu_usage_usec: seq * 500_000,
-        memory_working_set_bytes: 2 * GIB,
-        memory_active_file_bytes: 0,
-        actions_cpu_limited: false,
-        covered: Vec::new(),
-        lease_clocks: Vec::new(),
-        minutes: Vec::new(),
-    }
-}
-
-/// The lease server's host list as one pass reads it.
-async fn polled(harness: &Harness) -> View {
-    View {
-        leases: None,
-        hosts: harness.deps.client.hosts().await.expect("hosts"),
-    }
-}
-
-/// The working set the farm shows for the worker, if it holds a reading of it.
-fn farm_working_set(harness: &Harness, worker: &HostWorker) -> Option<u64> {
-    harness
-        .farm
-        .node_loads()
-        .into_iter()
-        .find(|(id, _)| *id == worker.id)
-        .map(|(_, load)| load.memory_working_set_bytes)
-}
-
-/// Catches a host's listed load that never reaches the farm (the worker heartbeats with
-/// none, as it did before the feed), and one that reaches it as another figure: the farm
-/// holds the reading the lease server listed for the worker's own host.
+/// Catches a worker that holds no job being fenced for the job service's silence: with no
+/// task there is nothing to cancel and nothing the silence endangers, so the worker goes on
+/// heartbeating, and is never silent, for longer than twice the fence time while the farm
+/// acknowledges it.
 #[tokio::test(start_paused = true)]
-async fn the_load_the_host_reports_reaches_the_farm_with_the_heartbeat() {
+async fn a_worker_that_holds_no_job_is_not_fenced_by_the_job_services_silence() {
     let harness = Harness::new().await;
-    let (mut worker, _messages) = harness.worker().await;
-    assert_eq!(farm_working_set(&harness, &worker), None);
-    assert!(harness.fake.set_host_load("node1", Some(listed(5))));
-    let view = polled(&harness).await;
-    worker.step(&harness.ctx(), &view, Instant::now()).await;
-    assert_eq!(farm_working_set(&harness, &worker), Some(2 * GIB));
-}
-
-/// Catches a zero invented for a host that reports nothing: a host listed with no load, and
-/// a pass whose host list was not read, leave the farm with no reading at all.
-#[tokio::test(start_paused = true)]
-async fn a_host_with_no_load_gives_the_farm_none() {
-    let harness = Harness::new().await;
-    let (mut worker, _messages) = harness.worker().await;
+    let (mut worker, _messages) = harness.worker();
     let ctx = harness.ctx();
-    let view = polled(&harness).await;
-    worker.step(&ctx, &view, Instant::now()).await;
-    assert_eq!(farm_working_set(&harness, &worker), None);
-    tokio::time::advance(harness.cfg.heartbeat).await;
-    worker.step(&ctx, &View::default(), Instant::now()).await;
-    assert_eq!(farm_working_set(&harness, &worker), None);
-}
-
-/// Catches a reading that outlives the agent's silence: one seen long ago (more than three
-/// windows and a poll) is not handed with a later heartbeat. The limit itself is pinned in
-/// `load_tests.rs`.
-#[tokio::test(start_paused = true)]
-async fn a_stale_reading_gives_the_farm_none() {
-    let mut harness = Harness::new().await;
-    harness.cfg.host_check = Duration::from_secs(1);
-    let ctx = harness.ctx();
-    assert!(harness.fake.set_host_load("node1", Some(listed(5))));
-    let view = polled(&harness).await;
-
-    let (mut late, _messages) = harness.worker().await;
-    assert!(late.watch(&ctx, &view, Instant::now()).is_continue());
-    tokio::time::advance(Duration::from_secs(5)).await;
-    assert!(late.beat(&ctx).await.is_continue());
-    assert_eq!(farm_working_set(&harness, &late), None);
+    let mut passed = Duration::ZERO;
+    while passed <= 2 * harness.cfg.fence_after {
+        tokio::time::advance(harness.cfg.heartbeat).await;
+        passed += harness.cfg.heartbeat;
+        worker.step(&ctx, Instant::now()).await;
+        assert!(!worker.info().silent, "fenced after {passed:?}");
+    }
+    assert!(worker.seq > 1);
+    assert_eq!(worker.generation, 0, "registered again");
+    assert!(harness.fake.calls().is_empty());
 }

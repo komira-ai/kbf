@@ -2,13 +2,15 @@
 //! flags: each disagreement is refused when the flags are read, naming them, and not on the
 //! first run.
 
+use std::time::Duration;
+
 use super::super::{FrontendFlags, command, parse};
 use super::*;
 
 /// A frontend that runs placed actions on hosts, with everything it needs and nothing it can
 /// do without. The tier store and the read listener are at IP addresses, the store `http://`
 /// as it is today.
-const BASE: [&str; 28] = [
+const BASE: [&str; 27] = [
     "frontend",
     "--storage=http://127.0.0.1:1",
     "--state-store=postgres:///kbf?host=/run/postgresql",
@@ -26,10 +28,9 @@ const BASE: [&str; 28] = [
     "--job-tls-key=/nowhere/job.key",
     "--job-grant-secret-file=/nowhere/secret",
     "--executor=js-agent",
-    "--executor-lease-url=http://127.0.0.1:7",
-    "--executor-lease-token-file=/etc/token",
+    "--executor-job-url=http://127.0.0.1:7",
+    "--executor-job-token-file=/etc/token",
     "--executor-frontend-id=front-1",
-    "--executor-class=farm-linux",
     "--executor-hosts=2",
     "--executor-host-cpus=8",
     "--executor-host-memory-gib=32",
@@ -124,7 +125,6 @@ fn the_longest_run_must_fit_the_presign_ceiling_less_the_slack() {
     let slack = [
         "--task-url-slack-secs=10000",
         "--task-run-wall-secs=4000",
-        "--executor-lease-ttl-secs=5000",
         "--executor-default-timeout-secs=3000",
     ];
     let with = |max_run: &'static str| {
@@ -294,28 +294,6 @@ fn the_task_writes_to_the_bucket_the_packs_are_read_from() {
         why.contains("--task-put-bucket \"elsewhere\"")
             && why.contains("--pack-store-bucket \"packs\""),
         "{why}"
-    );
-}
-
-/// Catches a lease ttl past what the lease server grants going unsaid: the server clamps it, and
-/// the executor plans its renewals by the ask. It is a warning, as a server may be started to
-/// grant more.
-#[test]
-fn a_lease_ttl_past_the_servers_default_maximum_is_warned() {
-    let mut flags = parsed(argv(&[], &[])).expect("parses");
-    let js = flags.executor.js.as_mut().expect("js-agent");
-    let beside = Beside {
-        task: flags.task.as_ref(),
-        job_read: flags.job_read.as_ref(),
-        packs: flags.packs.as_ref(),
-    };
-    assert_eq!(check(js, &beside).expect("checks"), Vec::<String>::new());
-    js.config.lease_ttl = Duration::from_secs(3601);
-    let warnings = check(js, &beside).expect("checks");
-    assert_eq!(warnings.len(), 1, "{warnings:?}");
-    assert!(
-        warnings[0].contains("--executor-lease-ttl-secs 3601"),
-        "{warnings:?}"
     );
 }
 

@@ -24,7 +24,8 @@ fake = [
 ]
 
 # A typed gRPC client of the job service (see the crate documentation), over the messages
-# js-proto generates. No farm crate depends on it yet. The connection is tonic's channel
+# js-proto generates. Only kbf-server depends on it (its host executor, and the fake in its
+# tests). The connection is tonic's channel
 # over a connector of this crate: TCP, then TLS with tokio-rustls pinned to one CA.
 [dependencies]
 bytes.workspace = true

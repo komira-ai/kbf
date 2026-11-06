@@ -1,10 +1,9 @@
-use std::collections::BTreeSet;
 use std::time::Duration;
 
 use kbf_proto::reapi::Digest;
 use kbf_types::LeaseId;
 
-use super::{Delivery, Nonce, PackKey, Secret, TaskArgs, build_id};
+use super::{Delivery, PackKey, Secret, TaskArgs, build_id};
 
 fn args<'a>(action: &'a Digest, grant: &'a Secret, url: &'a Secret, plain: bool) -> TaskArgs<'a> {
     TaskArgs {
@@ -26,18 +25,6 @@ fn digest() -> Digest {
         hash: "ab".repeat(32),
         size_bytes: 12,
     }
-}
-
-/// Catches a nonce drawn from anything but fresh randomness (a counter, the clock, a
-/// per-process value): a zombie of an earlier run holds the url of its key, and a reused key
-/// would meet it. Distinct across many draws, and written as 32 hex digits.
-#[test]
-fn nonces_are_random_and_never_repeat() {
-    let drawn: BTreeSet<Nonce> = (0..200).map(|_| Nonce::random()).collect();
-    assert_eq!(drawn.len(), 200);
-    let text = Nonce::random().to_string();
-    assert_eq!(text.len(), 32);
-    assert!(text.bytes().all(|b| b.is_ascii_hexdigit()));
 }
 
 /// Catches a build id the neighbours refuse: the farm prints a lease as `7.3`, and the pack
@@ -71,9 +58,9 @@ fn a_secret_never_prints() {
 }
 
 /// Catches an argument vector that does not match the task tool's command line: flags only,
-/// the first one `--action` (the kbf image's entrypoint is the tool, and the lease server puts
-/// these after it, so a path in front would be taken for a flag), the action as `<hash>/<size>`, the interim secret flags, and the optional flags
-/// only when asked for.
+/// the first one `--action` (the kbf image's entrypoint is the tool, and the job's arguments
+/// come after it, so a path in front would be taken for a flag), the action as
+/// `<hash>/<size>`, the interim secret flags, and the optional flags only when asked for.
 #[test]
 fn the_argv_is_the_task_tools_command_line() {
     let (action, grant, url) = (
@@ -217,7 +204,7 @@ const PACK_URL: &str = "https://store.test/cas/b/7-3/ab-0?X-Sig=plant-put-8831";
 const READ_TOKEN: &str = "plant-read-token-5527";
 
 /// The two secrets of a run, distinct and recognisable in any output.
-fn planted() -> (Digest, Secret, Secret) {
+fn secrets() -> (Digest, Secret, Secret) {
     (digest(), Secret::new(READ_TOKEN), Secret::new(PACK_URL))
 }
 
@@ -226,7 +213,7 @@ fn planted() -> (Digest, Secret, Secret) {
 /// of the files and of the files' list never holds them either.
 #[test]
 fn files_delivery_puts_no_secret_in_any_argument() {
-    let (action, grant, url) = planted();
+    let (action, grant, url) = secrets();
     let task = TaskArgs {
         work_dir: Some("/work"),
         allow_plain_http_put: true,
@@ -243,17 +230,22 @@ fn files_delivery_puts_no_secret_in_any_argument() {
     for flag in ["--pack-url", "--grant-token", "--insecure-argv-secrets"] {
         assert!(!argv.iter().any(|a| a == flag), "{flag} is in {argv:?}");
     }
+    assert_eq!(
+        files.len(),
+        2,
+        "the secrets are in the files and only there"
+    );
     let shown = format!("{task:?} {files:?}");
     assert!(!shown.contains("plant-put-8831"), "{shown}");
     assert!(!shown.contains("plant-read-token"), "{shown}");
 }
 
-/// Catches argument paths that do not lead to the files: each path is the directory the lease
-/// server mounts (`/run/js-files`) and the name of a file of the run, and the file holds
+/// Catches argument paths that do not lead to the files: each path is the directory the job
+/// service mounts (`/run/js-files`) and the name of a file of the run, and the file holds
 /// exactly the presigned url, or exactly the token, and nothing else.
 #[test]
 fn files_delivery_names_the_two_files_the_tool_reads() {
-    let (action, grant, url) = planted();
+    let (action, grant, url) = secrets();
     let task = args(&action, &grant, &url, false);
     let argv = task.argv(Delivery::Files);
     let files = task.files(Delivery::Files);
@@ -273,7 +265,7 @@ fn files_delivery_names_the_two_files_the_tool_reads() {
 /// flags, and everything else, before and after them, is where it is under `argv`.
 #[test]
 fn files_delivery_keeps_the_order_of_the_arguments() {
-    let (action, grant, url) = planted();
+    let (action, grant, url) = secrets();
     let task = TaskArgs {
         work_dir: Some("/work"),
         allow_plain_http_put: true,
@@ -306,10 +298,10 @@ fn files_delivery_keeps_the_order_of_the_arguments() {
 }
 
 /// Catches the default delivery changing: the argument vector of today, byte for byte, with
-/// every optional flag, and no file for the lease server.
+/// every optional flag, and no file for the job.
 #[test]
 fn argv_delivery_is_unchanged() {
-    let (action, grant, url) = planted();
+    let (action, grant, url) = secrets();
     let task = TaskArgs {
         work_dir: Some("/work"),
         allow_plain_http_put: true,

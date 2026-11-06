@@ -1,108 +1,93 @@
-//! A virtual worker: the daemon a held lease of a host stands in for.
+//! A virtual worker: the daemon the job service stands behind.
 //!
-//! The farm sees an ordinary worker, `js:<host>`, that registers, takes `Start`s, lists what
-//! it runs in its heartbeats and reports results. Nothing of the farm knows otherwise: the
-//! worker owns the receiving end of the `Outbound` channel the farm sends a daemon's messages
-//! on, and calls the farm's own `register`, `resize`, `heartbeat_with_load` and `report`.
+//! The farm sees an ordinary worker, `js:<frontend>-<n>`, that registers, takes `Start`s,
+//! lists what it runs in its heartbeats and reports results. Nothing of the farm knows
+//! otherwise: the worker owns the receiving end of the `Outbound` channel the farm sends a
+//! daemon's messages on, and calls the farm's own `register`, `resize`, `heartbeat` and
+//! `report`. Its shape (the cores, the memory and the slots the flags declare) is how many
+//! actions of which size the farm may have in flight on it; each becomes a job, and the job
+//! service decides which host runs it. The worker holds no host, and is never retired because
+//! a host went away: a job is.
 //!
 //! What a real session does and this one skips, and why that is safe:
 //!
-//! - `peers.admit` (the certificate check): nothing here is a peer; the lease server's
-//!   token is the credential, and the host is named by the lease the executor holds.
+//! - `peers.admit` (the certificate check): nothing here is a peer; the job service's token
+//!   is the credential.
 //! - `MapRequest` and `MapUpdate`: the task reads through a grant, not the storage map.
 //! - `note_pack_reads` and `note_pack_writes`: the task's reads and its one pack are
 //!   counted by the frontend's own ingest.
 //! - `Welcome.pack_commit` and `placement_load`: nothing here commits a pack through
-//!   `CommitPack`. The host's load is not the worker's to measure: it is the agent's, listed
-//!   by the lease server with the host and handed to the farm with a heartbeat ([`super::load`]);
-//!   a host with none listed, or one gone stale, sends none, and the farm places it by
-//!   booking alone.
+//!   `CommitPack`. No load is reported: a job's host is the service's, and the farm places a
+//!   worker with no load reading by booking alone.
 //! - `Start.kind`, `device_id`, `job` and `fence`: the node report names `container` as its
-//!   only driver, so the farm places only actions on it, with no device; the worker fences
-//!   every run it starts, as a daemon does that is told nothing else.
+//!   only driver, so the farm places only actions on it, with no device (a whole-machine
+//!   `Start` that comes anyway is answered as infrastructure, unsubmitted); the worker fences
+//!   every job it submits, as a daemon does that is told nothing else.
 //!
 //! # Time
 //!
 //! Every time here is a clock read where it is used, and the safety of the whole rests on two
-//! numbers. `T` ([`Config::fence_after`]) is how long the worker goes on after the farm
-//! last acknowledged a heartbeat, or the lease server last answered, before it asks its runs
-//! to stop and falls silent. `G` ([`kbf_sched::fence::LEASE_GRACE`]) is how long the farm waits
-//! after last hearing a worker before it requeues the worker's leases. `T` plus the
-//! scheduler's margin stays under `G` ([`Config::validate`]), so a silent worker's runs
-//! were asked to stop before the farm starts their retry.
+//! numbers. `T` ([`Config::fence_after`]) is how long the worker goes on after the farm last
+//! acknowledged a heartbeat, or the job service last answered a call while the worker may hold
+//! a job, before it cancels its jobs and falls silent. `G` ([`LEASE_GRACE`]) is how long the
+//! farm waits after last hearing a worker before it requeues the worker's leases. `T` plus the
+//! scheduler's margin stays under `G` ([`Config::validate`]), so a silent worker's jobs were
+//! cancelled before the farm starts their retry. A worker that holds no job makes no call, and
+//! the service's silence is not counted against it.
 //!
 //! What that needs, and what it does not give:
 //!
-//! - A pass is a series of calls to the lease server with the heartbeat and the fence
-//!   inside it, so every call is bounded ([`Config::call_timeout`]), a pass starts no new
-//!   task once its budget is spent ([`Config::pass_budget`]), and the heartbeat and the fence
-//!   read the clock where they act. A pass is bounded by those, not by a timer of its own: the
-//!   caller steps the executor again when it returns, and a caller that does not step it
-//!   leaves the farm hearing nothing.
-//! - Asking a run to stop is a call to the lease server. If that is what cannot be
-//!   reached, the fence falls silent and the farm requeues the action while the run goes on
-//!   to its wall time: the work is done twice, and the second copy is not harmed by the first
-//!   (each run writes only its own key). The fence bounds wasted work; it does not stop a run
-//!   the lease server cannot be asked to stop.
-//! - A `Start` posted at the end of its window ([`kbf_sched::fence::START_VALIDITY`]) is
-//!   stopped `T` after the farm last heard the worker, and the farm reruns the action
+//! - A pass is a series of calls to the job service with the heartbeat and the fence inside
+//!   it, so every call is bounded ([`Config::call_timeout`]), a pass starts no new task once
+//!   its budget is spent ([`Config::pass_budget`]), and the heartbeat and the fence read the
+//!   clock where they act. A pass is bounded by those, not by a timer of its own: the caller
+//!   steps the executor again when it returns, and a caller that does not step it leaves the
+//!   farm hearing nothing.
+//! - Cancelling a job is a call to the job service. If that is what cannot be reached, the
+//!   fence falls silent and the farm requeues the action while the job goes on to its wall
+//!   limit: the work is done twice, and the second copy is not harmed by the first (each job
+//!   writes only its own key). The fence bounds wasted work; it does not stop a job the
+//!   service cannot be asked to cancel.
+//! - A `Start` submitted at the end of its window ([`START_VALIDITY`]) is cancelled `T` after
+//!   the farm last heard the worker, and the farm reruns the action
 //!   [`kbf_sched::fence::START_GRACE`] after the `Start`: the window, `T` and the margin stay
 //!   under it ([`Config::validate`]).
+//! - A fenced worker stays silent for `G`, by when the farm has requeued every lease it held,
+//!   and then registers again as a new process that names the old one its predecessor.
+//!
+//! [`Config::fence_after`]: super::Config::fence_after
+//! [`Config::validate`]: super::Config::validate
+//! [`Config::call_timeout`]: super::Config::call_timeout
+//! [`Config::pass_budget`]: super::Config::pass_budget
 
 use std::collections::{BTreeMap, VecDeque};
 use std::ops::ControlFlow;
 
-use kbf_lease_client::LeaseId;
+use kbf_job_client::Error;
 use kbf_proto::worker::{Cancel, ResultAck, ServerMessage, Welcome, server_message};
 use kbf_sched::DaemonInstance;
-use kbf_sched::fence::START_VALIDITY;
+use kbf_sched::fence::{LEASE_GRACE, START_VALIDITY};
 use kbf_types::WorkerId;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
-use crate::executor::load::Seen;
+use crate::executor::api::answered;
 use crate::executor::runs::Task;
-use crate::executor::{Ctx, HostInfo, View, lease_gone, release_lease};
+use crate::executor::{Ctx, WorkerInfo};
 use crate::farm::{Outbound, Reported, StreamId};
 use crate::worker::{HostFloor, PROTOCOL_VERSION, reported};
 
-/// Why a worker is taken down.
+/// Why a worker's pass ends early.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Retire {
-    /// The lease server no longer has the lease.
-    Gone,
-    /// The host is lost.
-    Lost,
-    /// The farm or the lease server went silent for the fence time.
+    /// The farm or the job service went silent for the fence time.
     Fenced,
-    /// A run may be queued that the worker cannot find.
-    Ambiguous,
-    /// The host stopped taking work and is idle: a rotation, or a taint.
-    Drained,
-    /// The host's scratch quota is out of order and it is idle: its lease is kept, unused,
-    /// until the given time, so the lease server cannot hand the same host out again.
-    Benched(Instant),
-}
-
-/// Why a worker stopped taking work.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Drain {
-    /// The lease nears the end of its wall time.
-    Rotation,
-    /// The host reports a taint.
-    Tainted,
-    /// The host refused a start because its scratch quota is out of order. Not a taint: it
-    /// recovers by itself, so the lease is kept idle until the time given, and not handed
-    /// back to be leased again at once.
-    Quota(Instant),
 }
 
 type Inbox = mpsc::UnboundedReceiver<Result<ServerMessage, tonic::Status>>;
 
-/// One held lease, and the worker that stands for its host.
+/// One virtual worker of the farm, and the tasks it was told to run.
 pub(super) struct HostWorker {
-    pub(super) lease: LeaseId,
-    pub(super) host: String,
     pub(super) id: WorkerId,
     instance: String,
     generation: u32,
@@ -117,16 +102,14 @@ pub(super) struct HostWorker {
     next_beat: Instant,
     /// When the newest heartbeat the farm acknowledged was sent.
     last_ack: Instant,
-    /// When the lease server last answered.
+    /// When the job service last answered, or when the worker last held no job.
     server_ok: Instant,
-    renew_at: Instant,
-    /// When the lease expires unless renewed, as the lease server last said.
-    pub(super) expires_at: Instant,
-    pub(super) ends_at: Instant,
-    pub(super) draining: Option<Drain>,
+    pub(super) draining: bool,
     pub(super) tasks: BTreeMap<kbf_types::LeaseId, Task>,
-    /// The newest load the lease server listed for the host, until the farm has it.
-    load: Option<Seen>,
+    /// Fenced: silent, until then.
+    silent_until: Option<Instant>,
+    /// The farm lease whose job was read last: the next pass's reads begin after it.
+    pub(super) read_after: Option<kbf_types::LeaseId>,
 }
 
 impl Drop for HostWorker {
@@ -136,19 +119,11 @@ impl Drop for HostWorker {
 }
 
 impl HostWorker {
-    /// Registers the worker of the host `host` under `lease`, which ends at `ends_at`.
-    pub(super) fn start(
-        ctx: &Ctx<'_>,
-        lease: LeaseId,
-        host: String,
-        (expires_at, ends_at): (Instant, Instant),
-        now: Instant,
-    ) -> Self {
-        let id = WorkerId::new(format!("js:{host}"));
-        let (stream, instance, reported, inbox) = register(ctx, &id, lease, 0, "");
+    /// Registers the `n`th virtual worker of this frontend.
+    pub(super) fn start(ctx: &Ctx<'_>, n: usize, now: Instant) -> Self {
+        let id = WorkerId::new(format!("js:{}-{n}", ctx.cfg.frontend));
+        let (stream, instance, reported, inbox) = register(ctx, &id, 0, "");
         Self {
-            lease,
-            host,
             id,
             instance,
             generation: 0,
@@ -160,12 +135,10 @@ impl HostWorker {
             next_beat: now,
             last_ack: now,
             server_ok: now,
-            renew_at: renew_after(ctx, expires_at, now),
-            expires_at,
-            ends_at,
-            draining: None,
+            draining: false,
             tasks: BTreeMap::new(),
-            load: None,
+            silent_until: None,
+            read_after: None,
         }
     }
 
@@ -175,13 +148,12 @@ impl HostWorker {
         self.inbox = inbox;
     }
 
-    pub(super) fn info(&self) -> HostInfo {
-        HostInfo {
+    pub(super) fn info(&self) -> WorkerInfo {
+        WorkerInfo {
             worker: self.id.clone(),
-            lease: self.lease,
-            host: self.host.clone(),
             runs: self.tasks.len(),
-            draining: self.draining.is_some(),
+            draining: self.draining,
+            silent: self.silent_until.is_some(),
         }
     }
 
@@ -192,28 +164,27 @@ impl HostWorker {
         self.tasks.clear();
     }
 
-    /// One pass: take the farm's messages, keep the lease, act on what the lease server says of
-    /// the host, start what was told to start, read the results, settle them, and heartbeat.
-    pub(super) async fn step(
-        &mut self,
-        ctx: &Ctx<'_>,
-        view: &View,
-        now: Instant,
-    ) -> Option<Retire> {
-        let flow = self.pass(ctx, view, now).await;
-        flow.break_value()
+    /// One pass: take the farm's messages, submit what was told to start, read the jobs,
+    /// settle them, and heartbeat; or, fenced, stay silent until the farm has requeued.
+    pub(super) async fn step(&mut self, ctx: &Ctx<'_>, now: Instant) {
+        if let Some(until) = self.silent_until {
+            if now < until {
+                return;
+            }
+            self.wake(ctx, now);
+        }
+        if let ControlFlow::Break(Retire::Fenced) = self.pass(ctx, now).await {
+            self.fence(ctx, now).await;
+        }
     }
 
-    async fn pass(&mut self, ctx: &Ctx<'_>, view: &View, now: Instant) -> ControlFlow<Retire> {
+    async fn pass(&mut self, ctx: &Ctx<'_>, now: Instant) -> ControlFlow<Retire> {
         if self.intake() {
             self.reconnect(ctx, now).await;
         }
-        self.renew(ctx, now, false).await?;
-        self.watch(ctx, view, now)?;
-        self.launch(ctx, now).await?;
-        self.poll(ctx, now).await?;
+        self.launch(ctx, now).await;
+        self.poll(ctx, now).await;
         self.settle(ctx, now);
-        self.rotate(ctx, now)?;
         self.beat(ctx).await
     }
 
@@ -259,19 +230,24 @@ impl HostWorker {
             .find_map(|(sent, at)| (*sent == seq).then_some(*at))
     }
 
-    /// The farm closed the stream, or replaced it: it gave up the leases it knew. Stops the
-    /// runs, and registers again as a new process that names the old one its predecessor.
+    /// The farm closed the stream, or replaced it: it gave up the leases it knew. Cancels the
+    /// jobs, and registers again as a new process that names the old one its predecessor.
     async fn reconnect(&mut self, ctx: &Ctx<'_>, now: Instant) {
-        tracing::warn!(worker = %self.id, "the farm's stream ended: stopping the runs and registering again");
-        self.stop_all(ctx).await;
+        tracing::warn!(worker = %self.id, "the farm's stream ended: cancelling the jobs and registering again");
+        self.cancel_all(ctx).await;
         self.forget();
-        // Closed before the new registration, so the farm sees the old stream as ended: the
-        // runs it knew are stopped, which is what lets it give their leases up at once.
+        self.register_again(ctx, now);
+    }
+
+    /// Registers again, under a new instance that names the old one: the farm sees the old
+    /// stream as ended, so it gives up at once whatever lease it still knew of it.
+    fn register_again(&mut self, ctx: &Ctx<'_>, now: Instant) {
+        // Closed before the new registration, so the farm sees the old stream as ended.
         self.inbox.close();
         self.generation += 1;
         let predecessor = std::mem::take(&mut self.instance);
         let (stream, instance, reported, inbox) =
-            register(ctx, &self.id, self.lease, self.generation, &predecessor);
+            register(ctx, &self.id, self.generation, &predecessor);
         self.stream = stream;
         self.instance = instance;
         self.reported = reported;
@@ -280,63 +256,38 @@ impl HostWorker {
         self.beats = VecDeque::from([(0, now)]);
         self.next_beat = now;
         self.last_ack = now;
-        self.draining = None;
+        self.server_ok = now;
+        self.draining = false;
     }
 
-    /// Renews the lease when a third of its ttl (or [`Config::renew_every`]) has passed, or at once if `due`.
-    pub(super) async fn renew(
-        &mut self,
-        ctx: &Ctx<'_>,
-        now: Instant,
-        due: bool,
-    ) -> ControlFlow<Retire> {
-        if now < self.renew_at && !due {
-            return ControlFlow::Continue(());
-        }
-        let renewed = ctx.api().renew(self.lease, Some(ctx.cfg.lease_ttl)).await;
-        self.heard(now, &renewed);
-        match renewed {
-            Ok(renewed) => {
-                // A third of what the server granted, which is at most its own maximum,
-                // not of what was asked.
-                self.expires_at = ctx.clock.local(renewed.expires_at_ms, now);
-                self.renew_at = renew_after(ctx, self.expires_at, now);
-            }
-            Err(e) if lease_gone(&e) => return ControlFlow::Break(Retire::Gone),
-            Err(e) => tracing::warn!(worker = %self.id, error = %e, "renewing the lease failed"),
-        }
-        ControlFlow::Continue(())
+    /// The fence: every job is cancelled, as far as the service can be reached, the tasks are
+    /// forgotten, and the worker says nothing to the farm for [`LEASE_GRACE`], by when the farm
+    /// has requeued every lease it held.
+    async fn fence(&mut self, ctx: &Ctx<'_>, now: Instant) {
+        tracing::warn!(worker = %self.id, "the farm or the job service has been silent for the fence time: cancelling the jobs and falling silent");
+        self.cancel_all(ctx).await;
+        self.forget();
+        self.silent_until = Some(now + LEASE_GRACE);
     }
 
-    /// Notes that the lease server answered, whatever it said.
-    pub(super) fn heard<T>(&mut self, now: Instant, answer: &Result<T, kbf_lease_client::Error>) {
-        if answer.as_ref().err().is_none_or(|e| e.api().is_some()) {
-            self.server_ok = now;
+    /// The silence after a fence is over: the worker registers again.
+    fn wake(&mut self, ctx: &Ctx<'_>, now: Instant) {
+        tracing::info!(worker = %self.id, "the fence's silence is over: registering again");
+        self.silent_until = None;
+        self.register_again(ctx, now);
+    }
+
+    /// Notes that the job service answered, whatever it said.
+    pub(super) fn heard<T>(&mut self, ctx: &Ctx<'_>, answer: &Result<T, Error>) {
+        if answered(answer) {
+            self.server_ok = ctx.now();
         }
     }
 
-    /// What the lease server's host list says of this host: lost is fenced, tainted drains.
-    fn watch(&mut self, ctx: &Ctx<'_>, view: &View, now: Instant) -> ControlFlow<Retire> {
-        let host = view.host(&self.host);
-        if let Some(host) = host {
-            self.load = Seen::after_poll(self.load.take(), host.load.as_ref(), now);
-        }
-        let lost = host.is_some_and(kbf_lease_client::Host::is_lost);
-        let tainted = host.is_some_and(kbf_lease_client::Host::is_tainted);
-        if tainted {
-            self.begin_drain(ctx, Drain::Tainted);
-        }
-        match lost {
-            true => ControlFlow::Break(Retire::Lost),
-            false => ControlFlow::Continue(()),
-        }
-    }
-
-    /// Stops taking work: the farm is told the node is draining, and the worker is released
-    /// once it holds nothing.
-    pub(super) fn begin_drain(&mut self, ctx: &Ctx<'_>, why: Drain) {
-        if self.draining.is_none() {
-            self.draining = Some(why);
+    /// Stops taking work: the farm is told the node is draining.
+    pub(super) fn begin_drain(&mut self, ctx: &Ctx<'_>) {
+        if !self.draining {
+            self.draining = true;
             self.reported.phase = kbf_sched::NodePhase::Draining;
             ctx.deps
                 .farm
@@ -344,34 +295,15 @@ impl HostWorker {
         }
     }
 
-    /// The host refused a start for a fault of its own that it recovers from by itself (a
-    /// scratch quota out of order, a files root that is gone): it takes no more work, and is
-    /// held out for [`Config::held_out_for`] from `now`, so the lease server cannot hand it
-    /// out again at once.
-    pub(super) fn hold_out(&mut self, ctx: &Ctx<'_>, now: Instant) {
-        self.begin_drain(ctx, Drain::Quota(now + ctx.cfg.held_out_for()));
-    }
-
-    /// Starts the drain when the lease nears the end of its wall time, and ends the worker
-    /// once it is draining and idle.
-    fn rotate(&mut self, ctx: &Ctx<'_>, now: Instant) -> ControlFlow<Retire> {
-        let rotate_at = self.ends_at.checked_sub(ctx.cfg.drain_before_end);
-        if rotate_at.is_none_or(|at| now >= at) {
-            self.begin_drain(ctx, Drain::Rotation);
-        }
-        match (self.draining, self.tasks.is_empty()) {
-            (Some(Drain::Quota(until)), true) => ControlFlow::Break(Retire::Benched(until)),
-            (Some(_), true) => ControlFlow::Break(Retire::Drained),
-            _ => ControlFlow::Continue(()),
-        }
-    }
-
-    /// Heartbeats the farm when one is due, and fences when the farm or the lease server
-    /// has been silent for the fence time. The clock is read here, not taken from the start
-    /// of the pass: the calls before this took as long as they took, and the silence is
-    /// counted to now.
+    /// Heartbeats the farm when one is due, and fences when the farm, or the job service while
+    /// the worker may hold a job, has been silent for the fence time. The clock is read here,
+    /// not taken from the start of the pass: the calls before this took as long as they took,
+    /// and the silence is counted to now.
     async fn beat(&mut self, ctx: &Ctx<'_>) -> ControlFlow<Retire> {
-        let now = ctx.clock.now();
+        let now = ctx.now();
+        if !self.holds_jobs() {
+            self.server_ok = now;
+        }
         let older = self.last_ack.min(self.server_ok);
         if now.saturating_duration_since(older) > ctx.cfg.fence_after {
             return ControlFlow::Break(Retire::Fenced);
@@ -384,20 +316,10 @@ impl HostWorker {
         self.beats.retain(|(_, sent)| now < *sent + START_VALIDITY);
         self.next_beat = now + ctx.cfg.heartbeat;
         let running = self.listed();
-        let load = self
-            .load
-            .as_mut()
-            .and_then(|seen| seen.take(now, ctx.cfg.host_check));
-        // Taken by the accept rule like a daemon's reading: the scheduler is handed what it
-        // accepts, with the heartbeat.
-        let fed = ctx
-            .deps
-            .farm
-            .note_node_load(&self.id, self.stream, load.as_ref());
         let acked = ctx
             .deps
             .farm
-            .heartbeat_with_load(&self.id, self.stream, self.seq, running, fed)
+            .heartbeat(&self.id, self.stream, self.seq, running)
             .await;
         if acked {
             self.last_ack = now;
@@ -405,34 +327,14 @@ impl HostWorker {
         ControlFlow::Continue(())
     }
 
-    /// Takes the worker down.
-    pub(super) async fn retire(mut self, ctx: &Ctx<'_>, why: Retire) {
-        tracing::info!(worker = %self.id, lease = %self.lease, ?why, "retiring the worker");
-        match why {
-            Retire::Gone => {
-                self.begin_drain(ctx, Drain::Rotation);
-                self.report_lost(ctx).await;
-            }
-            Retire::Ambiguous => {
-                self.begin_drain(ctx, Drain::Rotation);
-                self.stop_all(ctx).await;
-            }
-            Retire::Lost | Retire::Fenced => self.stop_all(ctx).await,
-            Retire::Drained | Retire::Benched(_) => {}
-        }
-        // A benched host's lease is kept, and the pool releases it when the hold ends.
-        if !matches!(why, Retire::Benched(_)) {
-            release_lease(ctx, self.lease).await;
-        }
+    /// Takes the worker down: the farm is told it takes no more work, and its jobs are
+    /// cancelled.
+    pub(super) async fn retire(mut self, ctx: &Ctx<'_>) {
+        tracing::info!(worker = %self.id, "retiring the worker");
+        self.begin_drain(ctx);
+        self.cancel_all(ctx).await;
         self.forget();
     }
-}
-
-/// When the lease is renewed: a third of the time from `now` to `expires_at`, and at the
-/// latest [`Config::renew_every`] from `now`.
-fn renew_after(ctx: &Ctx<'_>, expires_at: Instant, now: Instant) -> Instant {
-    let third = expires_at.saturating_duration_since(now) / 3;
-    now + third.min(ctx.cfg.renew_every)
 }
 
 /// Registers a worker with the farm: the `Hello` a real node would send, the `Welcome` the
@@ -440,11 +342,10 @@ fn renew_after(ctx: &Ctx<'_>, expires_at: Instant, now: Instant) -> Instant {
 fn register(
     ctx: &Ctx<'_>,
     id: &WorkerId,
-    lease: LeaseId,
     generation: u32,
     predecessor: &str,
 ) -> (StreamId, String, Reported, Inbox) {
-    let instance = format!("kbf-executor/{}/{lease}/{generation}", ctx.cfg.frontend);
+    let instance = format!("kbf-executor/{id}/{}/{generation}", ctx.cfg.instance);
     let hello = ctx.cfg.hello(&id.to_string(), &instance, predecessor);
     let mut reported =
         reported(&hello, HostFloor::DEFAULT).expect("a validated config makes a valid Hello");

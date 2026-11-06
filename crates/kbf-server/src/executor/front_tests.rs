@@ -264,11 +264,11 @@ async fn a_run_is_prepared_once_and_its_key_write_and_grant_are_handed_out_once(
 
     let url = rig
         .front
-        .put_url("node1", &key, wall, 1 << 20)
+        .put_url(&key, wall, 1 << 20)
         .await
         .expect("the write");
     assert_eq!(url.expose(), "http://store.test/cas/b/7-3/aa-0?sig=put");
-    let again = rig.front.put_url("node1", &key, wall, 1 << 20).await;
+    let again = rig.front.put_url(&key, wall, 1 << 20).await;
     assert!(matches!(again, Err(PresignError::Refused(_))));
 
     let grant = rig
@@ -299,7 +299,7 @@ async fn a_write_is_found_by_its_key_and_a_stranger_gets_none() {
         .await
         .expect("a key");
     let other = PackKey::new("cas/b/7-4/bb-0");
-    let refused = rig.front.put_url("node1", &other, wall, 1).await;
+    let refused = rig.front.put_url(&other, wall, 1).await;
     assert!(matches!(refused, Err(PresignError::Refused(_))));
     let grant = rig
         .front
@@ -407,7 +407,7 @@ async fn preparing_a_lease_again_replaces_what_was_parked() {
         .await
         .expect("a key");
     assert_eq!(rig.front.parked().len(), 1);
-    assert!(rig.front.put_url("node1", &key, wall, 1).await.is_ok());
+    assert!(rig.front.put_url(&key, wall, 1).await.is_ok());
 }
 
 /// Catches an action's run being launched from anything but the kbf image, and a timeout that is

@@ -70,31 +70,65 @@ fn every_ending_and_every_ingest_result_has_a_row_of_its_own() {
     }
 }
 
-/// Catches the plain counters and the gauge: a host held is read as last set, and a late start
-/// and a released stray are counted.
+/// Catches a plain counter that is not rendered, is rendered under another name, or counts
+/// with another's calls: each of them is counted a different number of times, and its row
+/// carries that number and its own name, as a counter.
 #[test]
-fn the_gauge_is_what_was_last_held_and_the_counters_count() {
+fn each_plain_counter_renders_under_its_name_and_counts() {
     let metrics = Metrics::default();
-    metrics.hold(3);
-    metrics.hold(2);
-    metrics.late_start();
-    metrics.late_start();
-    metrics.stray_released();
-    assert_eq!(metrics.held(), 2);
+    let calls: [(&str, &dyn Fn(&Metrics), u32); 6] = [
+        ("kbf_executor_late_starts_total", &Metrics::late_start, 1),
+        (
+            "kbf_executor_jobs_submitted_total",
+            &Metrics::job_submitted,
+            2,
+        ),
+        (
+            "kbf_executor_jobs_resubmitted_after_lost_answer_total",
+            &Metrics::job_resubmitted,
+            3,
+        ),
+        (
+            "kbf_executor_jobs_cancelled_total",
+            &Metrics::job_cancelled,
+            4,
+        ),
+        (
+            "kbf_executor_jobs_adopted_cancelled_total",
+            &Metrics::job_adopted_cancelled,
+            5,
+        ),
+        (
+            "kbf_executor_host_silence_seen_total",
+            &Metrics::host_silence,
+            6,
+        ),
+    ];
+    for (_, call, times) in &calls {
+        for _ in 0..*times {
+            call(&metrics);
+        }
+    }
     let mut text = String::new();
     metrics.render(&mut text);
-    for row in [
-        "kbf_executor_leases_held 2\n",
-        "kbf_executor_late_starts_total 2\n",
-        "kbf_executor_stray_leases_released_total 1\n",
-    ] {
-        assert!(text.contains(row), "{row}in {text}");
+    for (name, _, times) in &calls {
+        let row = format!("{name} {times}\n");
+        assert!(text.contains(&row), "{row}in {text}");
+        let family = format!("# TYPE {name} counter\n");
+        assert!(text.contains(&family), "{family}in {text}");
     }
     for family in [
-        "# TYPE kbf_executor_leases_held gauge",
         "# TYPE kbf_executor_runs_total counter",
         "# TYPE kbf_executor_ingests_total counter",
     ] {
         assert!(text.contains(family), "{family}");
     }
+    assert!(
+        !text.contains("leases_held"),
+        "no gauge of held leases: {text}"
+    );
+    assert!(
+        !text.contains("stray_leases"),
+        "no stray lease counter: {text}"
+    );
 }

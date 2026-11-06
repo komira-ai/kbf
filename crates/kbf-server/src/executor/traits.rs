@@ -86,7 +86,7 @@ pub enum Ingested {
 /// answer when it is refused, and may give another when the store was unavailable.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum MintError {
-    /// The run cannot be prepared as asked (an input missing or over budget, a digest that is
+    /// The job cannot be prepared as asked (an input missing or over budget, a digest that is
     /// not one, a configuration that does not sign): the caller's to fix, and settled as such.
     #[error("{0}")]
     Refused(String),
@@ -135,14 +135,12 @@ pub enum PresignError {
 /// Mints the one-shot, create-only `PUT` url a task writes its pack to. The url is a secret.
 #[tonic::async_trait]
 pub trait Presign: Send + Sync {
-    /// A url for `key` that stays good for `expires`, on the store proxy of `host`, for an
-    /// object of at most `max_bytes`.
+    /// A url for `key` that stays good for `expires`, for an object of at most `max_bytes`.
     ///
     /// # Errors
     /// [`PresignError`].
     async fn put_url(
         &self,
-        host: &str,
         key: &PackKey,
         expires: Duration,
         max_bytes: u64,
@@ -152,7 +150,7 @@ pub trait Presign: Send + Sync {
 /// What the executor reads of an action before it runs one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ActionFacts {
-    /// The image to launch the run from, pinned by digest, without the `docker://` scheme: the
+    /// The image to launch the job from, pinned by digest, without the `docker://` scheme: the
     /// kbf image, which keeps the task tool as its `ENTRYPOINT`.
     pub image: String,
     /// The action's timeout; `None` when it names none, and the executor applies its own.

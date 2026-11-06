@@ -1,13 +1,13 @@
-//! A worker, a farm and a lease server to call the executor's private parts with: for the
+//! A worker, a farm and a job service to call the executor's private parts with: for the
 //! arms the farm-level tests (`tests/executor`) cannot reach, because the farm never sends
-//! them or the lease server's fake cannot make them happen.
+//! them or the job service's fake cannot make them happen.
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use js_proto::v1::{ExecMode, Shape};
 use kbf_front::Cache;
-use kbf_lease_client::fake::{FakeLeaseServer, Pool};
-use kbf_lease_client::{AcquireRequest, Acquired, Resources};
+use kbf_job_client::fake::{FakeJobServer, Machine};
 use kbf_proto::reapi::Digest;
 use kbf_types::LeaseId;
 use tokio::sync::mpsc;
@@ -19,9 +19,12 @@ use crate::executor::traits::{
     ActionFacts, Ingest, Ingested, Inputs, InputsError, MintError, Presign, PresignError,
     ReadGrant, UntrustedLimits,
 };
-use crate::executor::{Bench, Clock, Config, Ctx, Deps, PackKey, Secret, Strays, build_id};
+use crate::executor::{Config, Ctx, Deps, PackKey, Secret, Twin, build_id};
 
 pub(super) const GIB: u64 = 1 << 30;
+
+/// The one host of the fake job service.
+pub(super) const HOST: &str = "host-1";
 
 /// Fakes that answer at once and never fail.
 struct Easy;
@@ -39,13 +42,7 @@ impl Ingest for Easy {
 
 #[tonic::async_trait]
 impl Presign for Easy {
-    async fn put_url(
-        &self,
-        _: &str,
-        key: &PackKey,
-        _: Duration,
-        _: u64,
-    ) -> Result<Secret, PresignError> {
+    async fn put_url(&self, key: &PackKey, _: Duration, _: u64) -> Result<Secret, PresignError> {
         Ok(Secret::new(format!("https://store.test/{key}")))
     }
 }
@@ -73,15 +70,30 @@ impl Inputs for Easy {
     }
 }
 
+/// A Linux host of 16 cores, 64 GiB and 1 TiB of disk, running containers: it can run every
+/// job these tests submit.
+pub(super) fn machine() -> Machine {
+    Machine {
+        shape: Shape {
+            cpu_millis: 16_000,
+            memory_bytes: 64 * GIB,
+            gpus: 0,
+            gpu_class: String::new(),
+            disk_bytes: Some(1 << 40),
+        },
+        os: "linux".to_owned(),
+        arch: "x86_64".to_owned(),
+        exec: ExecMode::Container,
+    }
+}
+
 /// The tokio clock is held while the harness lives: see `tests/executor/rig.rs`.
 pub(super) struct Harness {
-    pub(super) fake: FakeLeaseServer,
+    pub(super) fake: FakeJobServer,
     pub(super) farm: Arc<Farm>,
     pub(super) cfg: Config,
     pub(super) deps: Deps,
-    pub(super) clock: Clock,
-    pub(super) strays: Strays,
-    pub(super) bench: Bench,
+    pub(super) twin: Twin,
     release: Option<std::sync::mpsc::Sender<()>>,
 }
 
@@ -99,13 +111,14 @@ impl Harness {
         drop(tokio::task::spawn_blocking(move || {
             let _ = hold.recv();
         }));
-        let fake = FakeLeaseServer::start(Pool::new("pool", &["node1"], 2_000, 16 * GIB)).await;
+        let fake = FakeJobServer::start().await.expect("a loopback port");
+        fake.add_host(HOST, machine());
         let farm = Arc::new(Farm::new_legacy(
             Arc::new(Cache::memory()),
             kbf_sched::UNSERVABLE_WAIT,
             kbf_sched::FINISHED_RETENTION,
         ));
-        let mut cfg = Config::new("front", 1, "pool", 2_000, 16 * GIB);
+        let mut cfg = Config::new("front", 1, 2_000, 16 * GIB);
         cfg.slots = 2;
         cfg.insecure_argv_secrets = true;
         let deps = Deps {
@@ -116,15 +129,12 @@ impl Harness {
             inputs: Arc::new(Easy),
             metrics: Arc::default(),
         };
-        let clock = Clock::from_unix_ms(fake.now_ms());
         Self {
             fake,
             farm,
             cfg,
             deps,
-            clock,
-            strays: Strays::default(),
-            bench: Bench::default(),
+            twin: Twin::default(),
             release: Some(release),
         }
     }
@@ -133,41 +143,26 @@ impl Harness {
         Ctx {
             cfg: &self.cfg,
             deps: &self.deps,
-            clock: &self.clock,
-            strays: &self.strays,
-            bench: &self.bench,
+            twin: &self.twin,
         }
     }
 
-    /// A worker over a lease of the fake's one host, taking its messages from the returned
-    /// sender instead of the farm.
-    pub(super) async fn worker(
+    /// The first virtual worker, taking its messages from the returned sender instead of the
+    /// farm.
+    pub(super) fn worker(
         &self,
     ) -> (
         HostWorker,
         mpsc::UnboundedSender<Result<kbf_proto::worker::ServerMessage, tonic::Status>>,
     ) {
-        let resources = Resources {
-            cpu_millis: 2_000,
-            memory_bytes: 16 * GIB,
-            gpus: 0,
-            gpu_class: None,
-        };
-        let request = AcquireRequest::new("pool", resources, self.cfg.max_wall);
-        let Acquired::Granted(granted) = self.deps.client.acquire(&request).await.expect("a lease")
-        else {
-            panic!("the lease is booked, not granted");
-        };
-        let now = Instant::now();
-        let ends = (now + self.cfg.lease_ttl, now + self.cfg.max_wall);
-        let mut worker = HostWorker::start(&self.ctx(), granted.id, granted.host, ends, now);
+        let mut worker = HostWorker::start(&self.ctx(), 0, Instant::now());
         let (messages, inbox) = mpsc::unbounded_channel();
         worker.replace_inbox(inbox);
         (worker, messages)
     }
 }
 
-/// A `Start` of the action of `tag`, naming the registration's heartbeat.
+/// A `Start` of the farm lease `term`.`seq`, naming the registration's heartbeat.
 pub(super) fn start(term: u64, seq: u64) -> kbf_proto::worker::Start {
     kbf_proto::worker::Start {
         lease_id: Some(kbf_proto::worker::LeaseId { term, seq }),

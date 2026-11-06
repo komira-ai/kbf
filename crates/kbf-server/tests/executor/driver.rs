@@ -1,12 +1,15 @@
 //! The task that steps an executor beside the listeners: it steps until it is stopped, stops by
-//! itself when another frontend holds hosts, and releases what it holds when it ends.
+//! itself when another frontend has live jobs, and cancels what it submitted when it ends.
 
 use std::time::Duration;
 
-use kbf_lease_client::{AcquireRequest, Lease, LeaseState, Resources};
+use js_proto::v1::{Job, JobState};
+use kbf_job_client::fake::Fault;
 use kbf_server::executor::Running;
+use tonic::Code;
 
-use crate::rig::{GIB, Rig, count, count_tail, settle};
+use crate::pool::{earlier, job, record, spec_of};
+use crate::rig::{Posted, Rig, cancels, settle, submits};
 
 /// Lets `seconds` pass in steps of 5 s, the farm ticking after each.
 async fn pass(rig: &Rig, seconds: u64) {
@@ -18,17 +21,14 @@ async fn pass(rig: &Rig, seconds: u64) {
     }
 }
 
-async fn live(rig: &Rig) -> Vec<Lease> {
-    let leases = rig.api.leases().await.expect("leases");
-    leases
-        .into_iter()
-        .filter(|l| matches!(l.state, LeaseState::Held | LeaseState::Pending))
-        .collect()
+/// Seconds enough for two checks for a rival, and the watch of an earlier process's jobs.
+fn long(rig: &Rig) -> u64 {
+    rig.cfg.adopt_watch().as_secs() * 2 + 30
 }
 
 /// Lets time pass in steps of 5 s, at most `steps` of them, until `running` says why it
 /// stopped. No wall-clock assertion: a driver that never stops is `None`, not a hang.
-async fn stopped_within(rig: &Rig, running: &mut Running, steps: u32) -> Option<String> {
+async fn stopped_within(rig: &Rig, running: &mut Running, steps: u64) -> Option<String> {
     let failed = running.failed();
     tokio::pin!(failed);
     for _ in 0..steps {
@@ -40,189 +40,244 @@ async fn stopped_within(rig: &Rig, running: &mut Running, steps: u32) -> Option<
     None
 }
 
-/// Books a lease for the frontend `frontend`, from the lease server itself.
-async fn book_for(rig: &Rig, frontend: &str) {
-    let resources = Resources {
-        cpu_millis: 2_000,
-        memory_bytes: 16 * GIB,
-        gpus: 0,
-        gpu_class: None,
-    };
-    let request = AcquireRequest::new("farm-linux", resources, rig.cfg.max_wall)
-        .label("kbf-frontend", frontend);
-    rig.api.acquire(&request).await.expect("booked");
+/// Whether `running` has not stopped by itself.
+async fn goes_on(running: &mut Running) -> bool {
+    tokio::time::timeout(Duration::ZERO, running.failed())
+        .await
+        .is_err()
 }
 
-/// Catches a driver that does not step the executor, or leaves its hosts behind: while it
-/// runs the executor holds its hosts and the farm has their workers, and once stopped every
-/// lease is released and the stop has waited for it.
+/// The workers the farm knows, in node-id order.
+fn nodes(rig: &Rig) -> Vec<String> {
+    let view = rig.farm.nodes();
+    view.nodes.into_iter().map(|node| node.node_id).collect()
+}
+
+/// The frontend a posted job was made for.
+fn owner(posted: &Posted) -> String {
+    posted
+        .spec
+        .labels
+        .get("kbf-frontend")
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Whether `job` has been asked to stop, or has ended cancelled.
+fn stopped(job: &Job) -> bool {
+    job.cancel_requested || job.state() == JobState::Cancelled
+}
+
+/// Catches a driver that does not step the executor, or leaves its jobs behind: while it runs
+/// the farm has its workers and an action becomes a job, and once stopped the job is cancelled
+/// and the stop has waited for it.
 #[tokio::test(start_paused = true)]
-async fn the_driver_holds_hosts_while_it_runs_and_releases_them_when_stopped() {
-    let rig = Rig::start(&["node1", "node2"], 2, |_| {}).await;
+async fn the_driver_holds_workers_while_it_runs_and_cancels_its_jobs_when_stopped() {
+    let rig = Rig::start(&["node1"], 2, |_| {}).await;
     let running = Running::spawn(rig.restarted_executor());
-    pass(&rig, 10).await;
-    assert_eq!(live(&rig).await.len(), 2);
-    assert!(rig.counted().contains("kbf_executor_leases_held 2\n"));
+    pass(&rig, 20).await;
+    assert_eq!(nodes(&rig), ["js:front-1-0", "js:front-1-1"]);
+    let _caller = rig.submit(1);
+    pass(&rig, 20).await;
+    let posted = rig.jobs_of(1);
+    assert_eq!(posted.len(), 1, "{posted:?}");
+    let id = posted[0].id().to_owned();
+    assert!(!stopped(&job(&rig, &id)));
     running.stop().await;
-    assert!(live(&rig).await.is_empty(), "every lease is released");
-    assert!(rig.counted().contains("kbf_executor_leases_held 0\n"));
+    assert_eq!(job(&rig, &id).state(), JobState::Cancelled);
+    assert_eq!(cancels(&rig.fake.calls()), [id]);
 }
 
-/// Catches a driver whose handle is dropped leaving its hosts leased: the task ends with its
-/// handle, and releases them as a stop does.
+/// Catches a second frontend that has jobs beside this one: the executor runs on exactly one
+/// frontend, so the driver that finds another frontend's live job before its first pass says
+/// so, registers no worker and submits nothing, and leaves that frontend's job alone.
 #[tokio::test(start_paused = true)]
-async fn a_driver_that_is_dropped_releases_its_hosts() {
-    let rig = Rig::start(&["node1"], 1, |_| {}).await;
-    let running = Running::spawn(rig.restarted_executor());
-    pass(&rig, 10).await;
-    assert_eq!(live(&rig).await.len(), 1);
-    drop(running);
-    pass(&rig, 5).await;
-    assert!(live(&rig).await.is_empty());
-}
-
-/// Catches a second frontend that holds hosts beside this one: the executor runs on exactly one
-/// frontend, so the driver that finds another frontend's lease before its first pass says so,
-/// and leases nothing.
-#[tokio::test(start_paused = true)]
-async fn a_rival_found_at_the_start_stops_the_driver_before_it_leases_anything() {
+async fn a_rival_found_at_the_start_stops_the_driver_before_it_submits_anything() {
     let rig = Rig::start(&["node1", "node2"], 1, |_| {}).await;
-    book_for(&rig, "front-2").await;
+    let rival = earlier(&rig, "front-2", "elsewhere");
+    let _caller = rig.submit(1);
     let mut running = Running::spawn(rig.restarted_executor());
     let why = stopped_within(&rig, &mut running, 40)
         .await
         .expect("the driver did not stop");
     assert!(why.contains("front-2"), "{why}");
     running.stop().await;
-    assert_eq!(
-        count(&rig.requests(), "POST /v1/leases"),
-        1,
-        "only the rival's"
-    );
-    assert_eq!(live(&rig).await.len(), 1);
+    assert!(submits(&rig.fake.calls()).is_empty());
+    assert!(nodes(&rig).is_empty());
+    assert!(cancels(&rig.fake.calls()).is_empty());
+    assert!(!stopped(&job(&rig, &rival)));
 }
 
 /// Catches a running driver stopped by a frontend that came after it: the older frontend goes
-/// on holding its host through the checks that find the newer one's lease, and the newer one,
-/// which stops itself at its own first check, is the one that leaves.
+/// on, with its worker and its job, through the checks that find the newer one's job, and
+/// the newer one's job is not touched.
 #[tokio::test(start_paused = true)]
 async fn a_rival_that_appears_later_does_not_stop_the_older_driver() {
     let rig = Rig::start(&["node1", "node2"], 1, |_| {}).await;
     let mut running = Running::spawn(rig.restarted_executor());
-    pass(&rig, 10).await;
-    assert_eq!(live(&rig).await.len(), 1);
-    book_for(&rig, "front-2").await;
-    pass(&rig, 130).await;
-    let failed = tokio::time::timeout(Duration::ZERO, running.failed()).await;
-    assert!(failed.is_err(), "the older frontend stopped");
-    assert_eq!(live(&rig).await.len(), 2, "it holds its host");
+    let _caller = rig.submit(1);
+    pass(&rig, 20).await;
+    let mine = rig.jobs_of(1);
+    assert_eq!(mine.len(), 1, "{mine:?}");
+    let rival = earlier(&rig, "front-2", "elsewhere");
+    pass(&rig, long(&rig)).await;
+    assert!(goes_on(&mut running).await, "the older frontend stopped");
+    assert_eq!(nodes(&rig), ["js:front-1-0"]);
+    assert!(!stopped(&job(&rig, mine[0].id())), "it lost its job");
     running.stop().await;
-    let held = live(&rig).await;
-    assert_eq!(held.len(), 1, "{held:?}");
-    assert_eq!(held[0].labels["kbf-frontend"], "front-2");
+    assert_eq!(cancels(&rig.fake.calls()), [mine[0].id().to_owned()]);
+    assert!(!stopped(&job(&rig, &rival)));
 }
 
-/// Catches two frontends that started together, each leasing a host before it saw the other's,
-/// both stopping at the next check and the farm left with no executor, or neither stopping and
-/// the farm with two: exactly one stops and releases its host, whether the two have different
-/// ids or (a config copied to a second frontend) the same one.
+/// Catches two frontends that started together, each submitting before it saw the other's
+/// job, both stopping at the next check and the farm left with no executor, or neither stopping
+/// and the farm with two: exactly one stops and cancels its job, and it is the one whose oldest
+/// job is the younger (a tie goes to the lower frontend id). Time passes between the two
+/// submits, so the order the job service recorded decides when it can.
 #[tokio::test(start_paused = true)]
 async fn of_two_frontends_that_started_together_exactly_one_stops() {
-    for (first, second) in [("front-1", "front-2"), ("front-1", "front-1")] {
-        let rig = Rig::start(&["node1", "node2"], 1, |_| {}).await;
-        let mut a = Running::spawn(rig.other_executor(first));
-        let mut b = Running::spawn(rig.other_executor(second));
-        pass(&rig, 130).await;
-        let stopped = [
-            tokio::time::timeout(Duration::ZERO, a.failed())
-                .await
-                .is_ok(),
-            tokio::time::timeout(Duration::ZERO, b.failed())
-                .await
-                .is_ok(),
-        ];
-        assert_eq!(
-            stopped.iter().filter(|stopped| **stopped).count(),
-            1,
-            "{first} and {second}: {stopped:?}"
-        );
-        a.stop().await;
-        b.stop().await;
+    let rig = Rig::start(&["node1", "node2"], 1, |cfg| cfg.slots = 1).await;
+    let mut a = Running::spawn(rig.other_executor("front-1"));
+    let mut b = Running::spawn(rig.other_executor("front-2"));
+    pass(&rig, 20).await;
+    let _first = rig.submit(1);
+    pass(&rig, 5).await;
+    let _second = rig.submit(2);
+    pass(&rig, long(&rig)).await;
+    let flags = [!goes_on(&mut a).await, !goes_on(&mut b).await];
+    let jobs = rig.jobs();
+    let oldest = jobs
+        .iter()
+        .map(|p| (p.job.times.as_ref().map_or(0, |t| t.queued_at_ms), owner(p)))
+        .min()
+        .expect("a job")
+        .1;
+    assert_eq!(
+        flags,
+        [oldest != "front-1", oldest != "front-2"],
+        "the oldest job is {oldest}'s: {flags:?}"
+    );
+    for posted in &jobs {
+        assert_eq!(stopped(&posted.job), owner(posted) != oldest, "{posted:?}");
     }
+    a.stop().await;
+    b.stop().await;
 }
 
-/// Catches a second process under the same frontend id that takes the first one's leases and
-/// stops their runs (a config copied to a second frontend): it finds the leases renewed while it
-/// watches them, stops with an error that says the id is shared, and the first process keeps
-/// its host and its run.
+/// Catches a second process under the same frontend id that cancels the first one's jobs (a
+/// config copied to a second frontend): it finds the first making a new job while it watches,
+/// stops with an error that says the id is shared, and the first process keeps its worker and
+/// its jobs.
 #[tokio::test(start_paused = true)]
-async fn a_second_process_under_a_live_frontends_id_stops_and_leaves_its_hosts_alone() {
+async fn a_second_process_under_a_live_frontends_id_stops_and_leaves_its_jobs_alone() {
     let rig = Rig::start(&["node1", "node2"], 1, |_| {}).await;
     let mut first = Running::spawn(rig.restarted_executor());
-    pass(&rig, 10).await;
-    assert_eq!(live(&rig).await.len(), 1);
+    let _one = rig.submit(1);
+    pass(&rig, 20).await;
+    assert_eq!(rig.jobs_of(1).len(), 1);
     let mut second = Running::spawn(rig.restarted_executor());
-    let why = stopped_within(&rig, &mut second, 40)
+    pass(&rig, 5).await;
+    let _two = rig.submit(2);
+    let steps = long(&rig) / 5;
+    let why = stopped_within(&rig, &mut second, steps)
         .await
         .expect("the second process did not stop");
     assert!(why.contains("same id"), "{why}");
     second.stop().await;
-    assert_eq!(live(&rig).await.len(), 1, "the first process lost its host");
-    assert_eq!(count_tail(&rig.requests(), "DELETE", ""), 0);
-    let failed = tokio::time::timeout(Duration::ZERO, first.failed()).await;
-    assert!(failed.is_err(), "the first process stopped");
+    let jobs = rig.jobs();
+    assert_eq!(jobs.len(), 2, "{jobs:?}");
+    assert!(jobs.iter().all(|p| !stopped(&p.job)), "{jobs:?}");
+    assert!(cancels(&rig.fake.calls()).is_empty());
+    assert!(goes_on(&mut first).await, "the first process stopped");
     first.stop().await;
 }
 
-/// Catches a list of leases that could not be read being taken for a rival, or for the want of
-/// one: nothing is concluded, the executor goes on, and the next check reads it.
+/// Catches a list of jobs that could not be read being taken for a rival, or for the want of
+/// one: nothing is concluded, the executor goes on and registers its worker, and the next check
+/// reads the list and finds the rival.
 #[tokio::test(start_paused = true)]
 async fn a_list_that_cannot_be_read_is_no_rival() {
     let rig = Rig::start(&["node1"], 1, |_| {}).await;
-    rig.fake
-        .inject_on("GET /v1/leases", kbf_lease_client::fake::Fault::Close);
+    let rival = earlier(&rig, "front-2", "elsewhere");
+    rig.fake.inject_on(
+        "ListJobs",
+        Fault::Status {
+            code: Code::Unavailable,
+            message: "try later".to_owned(),
+        },
+    );
     let mut running = Running::spawn(rig.restarted_executor());
-    pass(&rig, 10).await;
-    let failed = tokio::time::timeout(Duration::ZERO, running.failed()).await;
-    assert!(failed.is_err(), "nothing was concluded");
-    assert_eq!(live(&rig).await.len(), 1, "and it holds its host");
+    pass(&rig, 20).await;
+    assert!(goes_on(&mut running).await, "nothing was concluded");
+    assert_eq!(nodes(&rig), ["js:front-1-0"], "and it goes on");
+    let steps = long(&rig) / 5;
+    let why = stopped_within(&rig, &mut running, steps)
+        .await
+        .expect("the next check did not find the rival");
+    assert!(why.contains("front-2"), "{why}");
     running.stop().await;
+    assert!(!stopped(&job(&rig, &rival)));
 }
 
-/// Catches leases that are not another frontend's being taken for one: a lease of another
-/// frontend that has been released, a lease with no frontend label at all, and the frontend's
-/// own are no rival, and the driver goes on and leases its host.
+/// Catches jobs that are not another frontend's live jobs being taken for a rival: a job of
+/// another frontend that has ended, a job with no frontend label at all, and a job of another
+/// frontend whose cancel was asked for are no rival, and the driver goes on and registers its
+/// worker.
 #[tokio::test(start_paused = true)]
-async fn leases_that_are_not_a_live_lease_of_another_frontend_are_no_rival() {
-    let rig = Rig::start(&["node1", "node2", "node3"], 1, |_| {}).await;
-    let resources = Resources {
-        cpu_millis: 2_000,
-        memory_bytes: 16 * GIB,
-        gpus: 0,
-        gpu_class: None,
-    };
-    let unlabelled = AcquireRequest::new("farm-linux", resources, rig.cfg.max_wall);
-    rig.api.acquire(&unlabelled).await.expect("booked");
-    book_for(&rig, "front-2").await;
-    let released = rig
-        .api
-        .leases()
-        .await
-        .expect("leases")
-        .into_iter()
-        .find(|l| l.labels.get("kbf-frontend").is_some_and(|v| v == "front-2"))
-        .expect("the booking");
-    rig.api.release(released.id).await.expect("released");
+async fn jobs_that_are_not_a_live_job_of_another_frontend_are_no_rival() {
+    let rig = Rig::start(&["node1"], 1, |_| {}).await;
+    let ended = earlier(&rig, "front-2", "elsewhere");
+    rig.host_finishes(&ended, "node1", 0);
+    let mut bare = spec_of("front-2", "elsewhere");
+    bare.labels.clear();
+    record(&rig, bare);
+    let leaving = earlier(&rig, "front-2", "elsewhere");
+    rig.host_runs(&leaving, "node1");
+    rig.api.cancel_job(&leaving).await.expect("asked");
 
     let mut running = Running::spawn(rig.restarted_executor());
-    pass(&rig, 10).await;
-    let failed = tokio::time::timeout(Duration::ZERO, running.failed()).await;
-    assert!(failed.is_err(), "no rival");
-    let ours = live(&rig)
-        .await
-        .into_iter()
-        .filter(|l| l.labels.get("kbf-frontend").is_some_and(|v| v == "front-1"))
-        .count();
-    assert_eq!(ours, 1);
+    pass(&rig, 20).await;
+    pass(&rig, long(&rig)).await;
+    assert!(goes_on(&mut running).await, "no rival");
+    assert_eq!(nodes(&rig), ["js:front-1-0"]);
     running.stop().await;
+    assert_eq!(
+        cancels(&rig.fake.calls()),
+        [leaving],
+        "the driver cancelled a job it did not make"
+    );
+    assert_eq!(job(&rig, &ended).state(), JobState::Succeeded);
+}
+
+/// Catches a process under this frontend's id that starts after this one has taken up the
+/// earlier jobs going unseen, and a job on its way out being taken for one: once the adoption is
+/// done, a live job of another instance under the same id is a twin, named as such, unless its
+/// cancel was asked for.
+#[tokio::test(start_paused = true)]
+async fn a_twin_that_appears_after_the_adoption_is_found_by_the_rival_check() {
+    let mut rig = Rig::start(&["node1"], 1, |_| {}).await;
+    rig.exec.step().await;
+    assert_eq!(rig.exec.workers().len(), 1, "the adoption is done");
+    assert_eq!(rig.exec.rival().await, None);
+
+    let leaving = earlier(&rig, "front-1", "intruder");
+    rig.host_runs(&leaving, "node1");
+    rig.api
+        .cancel_job(&leaving)
+        .await
+        .expect("the cancel is taken");
+    assert_eq!(
+        rig.exec.rival().await,
+        None,
+        "a job being cancelled is no one's"
+    );
+
+    earlier(&rig, "front-1", "intruder");
+    assert_eq!(
+        rig.exec.rival().await.as_deref(),
+        Some(
+            "another frontend runs under the same id \"front-1\": --executor-frontend-id must be \
+             different for each frontend"
+        )
+    );
 }

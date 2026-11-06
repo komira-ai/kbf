@@ -2,6 +2,8 @@ use std::time::Duration;
 
 use kbf_sched::fence::{LEADER_LEASE_MARGIN, LEASE_GRACE, START_GRACE, START_VALIDITY};
 
+use js_proto::v1::ExecMode;
+
 use super::{Config, ConfigError, Delivery, HARD_CAP_PAD, PRESIGN_LIMIT};
 use crate::config::MAX_HEARTBEAT_INTERVAL_MS;
 
@@ -10,7 +12,7 @@ const GIB: u64 = 1 << 30;
 fn base() -> Config {
     Config {
         insecure_argv_secrets: true,
-        ..Config::new("front-1", 2, "farm-linux", 16_000, 64 * GIB)
+        ..Config::new("front-1", 2, 16_000, 64 * GIB)
     }
 }
 
@@ -19,7 +21,7 @@ fn base() -> Config {
 /// until the operator says the secrets may travel as arguments, and is valid once they do.
 #[test]
 fn the_defaults_are_valid_once_the_operator_allows_argv_secrets() {
-    let defaults = Config::new("front-1", 2, "farm-linux", 16_000, 64 * GIB);
+    let defaults = Config::new("front-1", 2, 16_000, 64 * GIB);
     assert!(!defaults.insecure_argv_secrets);
     assert_eq!(defaults.validate(), Err(ConfigError::InsecureArgv));
     assert_eq!(base().validate(), Ok(()));
@@ -180,28 +182,6 @@ fn each_unsafe_setting_is_refused_by_name() {
         ),
         (
             Config {
-                lease_ttl: Duration::from_secs(29),
-                ..base()
-            },
-            ConfigError::Ttl,
-        ),
-        (
-            Config {
-                lease_ttl: Duration::from_secs(30),
-                poll: Duration::from_secs(11),
-                ..base()
-            },
-            ConfigError::Ttl,
-        ),
-        (
-            Config {
-                lease_ttl: Duration::from_secs(3299),
-                ..base()
-            },
-            ConfigError::Ttl,
-        ),
-        (
-            Config {
                 default_timeout: Duration::ZERO,
                 ..base()
             },
@@ -251,31 +231,10 @@ fn each_unsafe_setting_is_refused_by_name() {
         ),
         (
             Config {
-                renew_every: Duration::ZERO,
-                ..base()
-            },
-            ConfigError::Renew,
-        ),
-        (
-            Config {
                 insecure_argv_secrets: false,
                 ..base()
             },
             ConfigError::InsecureArgv,
-        ),
-        (
-            Config {
-                drain_before_end: Duration::from_secs(3300),
-                ..base()
-            },
-            ConfigError::Drain,
-        ),
-        (
-            Config {
-                drain_before_end: Duration::from_secs(6 * 3600),
-                ..base()
-            },
-            ConfigError::Drain,
         ),
     ];
     for (config, want) in rows {
@@ -283,7 +242,7 @@ fn each_unsafe_setting_is_refused_by_name() {
     }
 }
 
-/// Catches a Hello that books more memory than the lease server will admit: the runs the
+/// Catches a Hello that books more memory than a host of the shape holds: the runs the
 /// farm may book on the host, capped at 1.5 times the booking plus the padding each, must
 /// fit the shape; and a host that books nothing is refused.
 #[test]
@@ -345,89 +304,6 @@ fn the_hello_reports_a_container_host_and_nothing_else() {
     assert_eq!(reported.capacity.memory_bytes, 40 * GIB);
 }
 
-/// Catches a lease ttl that only just covers the longest run: the lease server cuts a run's
-/// wall time again from the time left when the run reaches the host, which can be a heartbeat
-/// late, so a run delivered late under a ttl equal to the longest run is cut and read as
-/// finished by its own timeout. The ttl exceeds the longest run by two heartbeats.
-#[test]
-fn the_ttl_exceeds_the_longest_run_by_two_heartbeats() {
-    let base = base();
-    let longest = base.max_run + base.run_margin;
-    let with = |lease_ttl| Config {
-        lease_ttl,
-        ..base.clone()
-    };
-    let room = longest + base.heartbeat * 2;
-    assert_eq!(with(room).validate(), Ok(()));
-    assert_eq!(
-        with(room - Duration::from_millis(1)).validate(),
-        Err(ConfigError::Ttl)
-    );
-}
-
-/// Catches a watch of an earlier process's leases that is shorter than a live executor's gap
-/// between two renewals: it would take the leases of a process that is alive and has not yet
-/// had the chance to renew them.
-#[test]
-fn the_watch_over_earlier_leases_outlasts_a_renewal_and_a_held_pass() {
-    let config = base();
-    assert!(config.adopt_watch() > config.renew_every + config.fence_after);
-}
-
-/// Catches a hold on a host with a sick quota that is zero (the host would be handed back at
-/// once and leased again), or longer than a lease lasts without renewal (the held-out lease
-/// would expire under the executor): a third of the ttl is the least a renewed lease has
-/// left, so the hold is cut to it and the config stays usable with a short ttl.
-#[test]
-fn the_quota_hold_is_above_zero_and_cut_to_a_third_of_the_ttl() {
-    let with = |quota_hold, lease_ttl| Config {
-        quota_hold,
-        lease_ttl,
-        ..base()
-    };
-    let ttl = base().lease_ttl;
-    assert!(base().quota_hold > Duration::ZERO);
-    assert_eq!(base().held_out_for(), base().quota_hold);
-    assert_eq!(
-        with(Duration::ZERO, ttl).validate(),
-        Err(ConfigError::QuotaHold)
-    );
-    assert_eq!(
-        with(ttl, ttl).held_out_for(),
-        ttl / 3,
-        "a hold over a third of the ttl is cut"
-    );
-    assert_eq!(with(ttl / 3, ttl).held_out_for(), ttl / 3);
-    assert_eq!(
-        with(Duration::from_secs(10), ttl).held_out_for(),
-        Duration::from_secs(10)
-    );
-}
-
-/// Catches a files run asked of a host that cannot mount files, and a plain run asking for
-/// more than it did: under `files` the acquire asks for `run-files=true` besides the system and
-/// the architecture; under `argv` it asks for those two alone.
-#[test]
-fn files_delivery_asks_acquire_for_run_files() {
-    let argv = base().host_capabilities();
-    assert_eq!(
-        argv.keys().map(String::as_str).collect::<Vec<_>>(),
-        ["arch", "os"]
-    );
-    let files = Config {
-        delivery: Delivery::Files,
-        ..base()
-    }
-    .host_capabilities();
-    assert_eq!(
-        files.keys().map(String::as_str).collect::<Vec<_>>(),
-        ["arch", "os", "run-files"]
-    );
-    assert_eq!(files.get("run-files").map(String::as_str), Some("true"));
-    assert_eq!(files.get("os"), argv.get("os"));
-    assert_eq!(files.get("arch"), argv.get("arch"));
-}
-
 /// Catches the insecure flag demanded of a delivery that sends no secret in arguments, and
 /// dropped from the one that does: `argv` is refused without it, `files` is valid without it.
 #[test]
@@ -456,4 +332,58 @@ fn files_delivery_refuses_the_insecure_opt_in() {
         ..base()
     };
     assert_eq!(both.validate(), Err(ConfigError::InsecureWithFiles));
+}
+
+/// Catches a job that asks its host for the wrong system, architecture or way to run: a job
+/// asks for linux, the architecture the config names (not a fixed one) and a container, and
+/// for nothing else, whatever the delivery of the secrets.
+#[test]
+fn a_job_asks_for_a_linux_host_of_the_configured_arch_that_runs_containers() {
+    let wanted = |config: &Config| {
+        let constraints = config.constraints();
+        (
+            constraints.os,
+            constraints.arch,
+            constraints.exec == i32::from(ExecMode::Container),
+        )
+    };
+    assert_eq!(
+        wanted(&base()),
+        ("linux".to_owned(), "x86_64".to_owned(), true)
+    );
+    let arm = Config {
+        arch: "aarch64".to_owned(),
+        delivery: Delivery::Files,
+        insecure_argv_secrets: false,
+        ..base()
+    };
+    assert_eq!(
+        wanted(&arm),
+        ("linux".to_owned(), "aarch64".to_owned(), true)
+    );
+}
+
+/// Catches a watch over another process's jobs that is shorter than a live executor's longest
+/// pass: it would cancel the jobs of a process that is alive and has not yet had the chance to
+/// submit. The watch is the fence time (the longest a pass is held) and one step.
+#[test]
+fn the_watch_over_earlier_jobs_is_the_fence_time_and_a_step() {
+    let config = base();
+    assert_eq!(config.adopt_watch(), config.fence_after + config.poll);
+    let slower = Config {
+        fence_after: Duration::from_secs(20),
+        poll: Duration::from_secs(3),
+        ..base()
+    };
+    assert_eq!(slower.adopt_watch(), Duration::from_secs(23));
+}
+
+/// Catches an instance id that is shared by two processes or empty: two configs made one after
+/// the other carry different ids, each a non-empty label value of hex.
+#[test]
+fn each_config_gets_an_instance_id_of_its_own() {
+    let (one, two) = (base(), base());
+    assert!(!one.instance.is_empty());
+    assert_ne!(one.instance, two.instance);
+    assert!(one.instance.chars().all(|c| c.is_ascii_hexdigit()));
 }

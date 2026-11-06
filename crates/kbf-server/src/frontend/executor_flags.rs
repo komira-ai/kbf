@@ -1,44 +1,49 @@
 //! The flags that choose where placed actions run: `--executor` and its companions.
 //!
 //! `--executor kbf-daemon`, the default, is what a frontend has always done: the farm places
-//! actions on the daemons that dialled it. No executor is built, no lease server is dialled and
-//! none of the companions is read. `--executor js-agent` runs them on hosts leased from the job
-//! scheduler's lease server instead ([`crate::executor`]).
+//! actions on the daemons that dialled it. No executor is built, no job service is dialled and
+//! none of the companions is read. `--executor js-agent` runs each of them as a job of the job
+//! scheduler's job service instead ([`crate::executor`]).
 //!
 //! The companions are the frontend's own. They are not refused with `kbf-daemon`, so a unit or
-//! `kbf.toml` that names the lease server keeps its settings when the executor is switched back
+//! `kbf.toml` that names the job service keeps its settings when the executor is switched back
 //! (the rollback is the one flag). `--executor-insecure-argv-secrets` too: it is ignored with a
 //! warning, since nothing reads it there, and refusing it would make the rollback a second edit.
 //!
 //! The executor runs on exactly one frontend. There is no flag that says a frontend is one of
 //! several: any frontends that open the same state store are, so the executor itself looks for
-//! another frontend's leases on the lease server and stops if it finds one
+//! another frontend's jobs on the job service and stops if it finds one
 //! ([`crate::executor::Running`]).
 //!
-//! Every secret is a file: the lease server's token (mode 0600 or 0400) and its CA certificate.
+//! The executor speaks to a job service only. The flags of the lease server it once leased
+//! hosts from (`--executor-lease-url`, `--executor-lease-token-file`,
+//! `--executor-lease-ca-file`, `--executor-lease-ttl-secs`, `--executor-class`) are gone, not
+//! aliased: a frontend started with one fails at start, naming it, and never runs on the wrong
+//! protocol.
+//!
+//! Every secret is a file: the job service's token (mode 0600 or 0400) and its CA certificate.
 
 use std::error::Error;
 use std::path::PathBuf;
 use std::str::FromStr as _;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use clap::{Arg, ArgAction, ArgMatches};
 use kbf_front::{Backend, Packs};
-use kbf_lease_client::{Client, Origin, Token};
+use kbf_job_client::{Client, Origin, Token};
 use kbf_types::ImageRef;
 
 use crate::Farm;
 use crate::executor::{
-    Clock, Config, Delivery, Deps, Executor, ExecutorKind, Front, FrontParts, Metrics, RunSource,
+    Config, Delivery, Deps, Executor, ExecutorKind, Front, FrontParts, Metrics, RunSource,
 };
 
 const KIND: &str = "executor";
 const FRONTEND: &str = "executor_frontend_id";
-const LEASE_URL: &str = "executor_lease_url";
-const TOKEN_FILE: &str = "executor_lease_token_file";
-const CA_FILE: &str = "executor_lease_ca_file";
-const CLASS: &str = "executor_class";
+const JOB_URL: &str = "executor_job_url";
+const TOKEN_FILE: &str = "executor_job_token_file";
+const CA_FILE: &str = "executor_job_ca_file";
 const HOSTS: &str = "executor_hosts";
 const CPUS: &str = "executor_host_cpus";
 const MEMORY_GIB: &str = "executor_host_memory_gib";
@@ -53,18 +58,16 @@ const DELIVERY: &str = "executor_secret_delivery";
 const BASE_IMAGE: &str = "executor_base_image";
 const KBF_IMAGE: &str = "executor_kbf_image";
 const MARGIN: &str = "executor_run_margin_secs";
-const TTL: &str = "executor_lease_ttl_secs";
 const MAX_RUN: &str = "executor_max_run_secs";
 const DEFAULT_TIMEOUT: &str = "executor_default_timeout_secs";
 const CALL_TIMEOUT: &str = "executor_call_timeout_secs";
 const OUTPUT_DISK: &str = "executor_output_disk_bytes";
 
 /// The flags a `js-agent` executor cannot do without, in the order their absence is named.
-const REQUIRED: [(&str, &str); 9] = [
-    (LEASE_URL, "--executor-lease-url"),
-    (TOKEN_FILE, "--executor-lease-token-file"),
+const REQUIRED: [(&str, &str); 8] = [
+    (JOB_URL, "--executor-job-url"),
+    (TOKEN_FILE, "--executor-job-token-file"),
     (FRONTEND, "--executor-frontend-id"),
-    (CLASS, "--executor-class"),
     (HOSTS, "--executor-hosts"),
     (CPUS, "--executor-host-cpus"),
     (MEMORY_GIB, "--executor-host-memory-gib"),
@@ -115,85 +118,80 @@ pub(super) fn args() -> Vec<Arg> {
             .help(
                 "Where the farm runs the actions it places. `kbf-daemon`, the default, is the \
                  daemon of each node, over the worker listener: no executor is built and no \
-                 lease server is contacted, whatever the other `--executor-*` flags say. \
-                 `js-agent` runs them on hosts leased from the job scheduler's lease server, in \
-                 the kbf image (`--executor-kbf-image`, built from `--executor-base-image`), \
-                 whose task tool runs the action inside it; it needs the lease \
-                 server's flags (`--executor-lease-url`, `--executor-lease-token-file`, and \
-                 `--executor-lease-ca-file` for https), the pool's (`--executor-class`, \
-                 `--executor-hosts`, `--executor-host-cpus`, `--executor-host-memory-gib`), \
+                 job service is contacted, whatever the other `--executor-*` flags say. \
+                 `js-agent` runs each as a job of the job scheduler's job service, in the kbf \
+                 image (`--executor-kbf-image`, built from `--executor-base-image`), whose \
+                 task tool runs the action inside it; it needs the job service's flags \
+                 (`--executor-job-url`, `--executor-job-token-file`, and \
+                 `--executor-job-ca-file` for https), the virtual workers' \
+                 (`--executor-hosts`, `--executor-host-cpus`, `--executor-host-memory-gib`), \
                  `--executor-frontend-id`, the packs (`--pack-store-endpoint`) and the secret \
                  delivery (`--executor-secret-delivery`, with \
-                 `--executor-insecure-argv-secrets` for its default `argv`). The executor runs on exactly one \
-                 frontend: a second frontend that holds hosts on the same lease server stops. \
-                 A restart of the frontend fails the builds in flight. Switching back to \
-                 `kbf-daemon` releases the leases when the frontend is stopped, not when it is \
-                 killed: a killed frontend's leases stay held until their ttl ends \
-                 (`--executor-lease-ttl-secs`), unless a later `js-agent` start releases them. \
+                 `--executor-insecure-argv-secrets` for its default `argv`). The executor runs \
+                 on exactly one frontend: a second frontend that has jobs on the same job \
+                 service stops. A restart of the frontend fails the builds in flight. \
+                 Switching back to `kbf-daemon` cancels the jobs when the frontend is stopped, \
+                 not when it is killed: a killed frontend's jobs run to their wall limit, \
+                 unless a later `js-agent` start cancels them. \
                  `--executor-insecure-argv-secrets` is ignored with `kbf-daemon`",
             ),
         text(
             FRONTEND,
             "executor-frontend-id",
             "ID",
-            "The name of this frontend on the lease server: the value of the `kbf-frontend` \
-             label on its leases, by which a restarted frontend finds them and releases the \
-             ones it no longer needs. 1 to 63 of letters, digits, `-`, `_` and `.`. It must be \
+            "The name of this frontend on the job service: the value of the `kbf-frontend` \
+             label on its jobs, by which a restarted frontend finds and cancels the ones an \
+             earlier process left, hashed into every job id, and the name of its virtual \
+             workers (`js:<ID>-<n>`). 1 to 63 of letters, digits, `-`, `_` and `.`. It must be \
              different for each frontend (not copied with the config). Used only with \
              `--executor js-agent`",
         ),
         text(
-            LEASE_URL,
-            "executor-lease-url",
+            JOB_URL,
+            "executor-job-url",
             "URL",
-            "The lease server, as `https://host[:port]`, or `http://` to a loopback host. Used \
+            "The job service, as `https://host[:port]`, or `http://` to a loopback host. Used \
              only with `--executor js-agent`",
         ),
         path(
             TOKEN_FILE,
-            "executor-lease-token-file",
-            "A file with the bearer token of the lease server, readable by its owner alone (mode \
+            "executor-job-token-file",
+            "A file with the bearer token of the job service, readable by its owner alone (mode \
              0600 or 0400). The secret is never a flag: a command line is world-readable. Used \
              only with `--executor js-agent`",
         ),
         path(
             CA_FILE,
-            "executor-lease-ca-file",
-            "The CA certificate (PEM) the lease server's certificate chains to: the only trust \
-             anchor, no system roots are consulted. Needed for an `https` lease server and \
+            "executor-job-ca-file",
+            "The CA certificate (PEM) the job service's certificate chains to: the only trust \
+             anchor, no system roots are consulted. Needed for an `https` job service and \
              refused for an `http` one. Used only with `--executor js-agent`",
-        ),
-        text(
-            CLASS,
-            "executor-class",
-            "CLASS",
-            "The lease server's class every lease asks for (the pool of hosts the executor \
-             draws from). Used only with `--executor js-agent`",
         ),
         Arg::new(HOSTS)
             .long("executor-hosts")
-            .value_name("HOSTS")
+            .value_name("WORKERS")
             .value_parser(clap::value_parser!(usize))
             .help(
-                "How many hosts to hold, a lease each. A host is leased whole for the shape \
-                 below and released before its lease ends. Used only with `--executor js-agent`",
+                "How many virtual workers the farm places actions on, each of the shape below: \
+                 how many actions of which size the farm may have in flight as jobs. The job \
+                 service decides which host runs each job. Used only with `--executor js-agent`",
             ),
         Arg::new(CPUS)
             .long("executor-host-cpus")
             .value_name("CORES")
             .value_parser(clap::value_parser!(u64).range(1..))
             .help(
-                "The CPU cores a host's lease holds: the pool's shape. At least 1. Used only \
-                 with `--executor js-agent`",
+                "The CPU cores of a virtual worker: the most the farm books on it at once. At \
+                 least 1. Used only with `--executor js-agent`",
             ),
         Arg::new(MEMORY_GIB)
             .long("executor-host-memory-gib")
             .value_name("GIB")
             .value_parser(clap::value_parser!(u64).range(1..))
             .help(
-                "The memory, in GiB, a host's lease holds: the pool's shape. Each run is \
-                 capped at 1.5 times its booking plus 512 MiB, and the bookings of a host add \
-                 up to what is left after that. Used only with `--executor js-agent`",
+                "The memory, in GiB, of a virtual worker. Each job needs 1.5 times its booking \
+                 plus 512 MiB, and the bookings of a worker add up to what is left after that. \
+                 Used only with `--executor js-agent`",
             ),
         Arg::new(SLOTS)
             .long("executor-host-slots")
@@ -201,8 +199,8 @@ pub(super) fn args() -> Vec<Arg> {
             .value_parser(clap::value_parser!(u64).range(1..=256))
             .default_value("8")
             .help(
-                "The most runs a host takes at once, reported to the farm as the host's action \
-                 slots. Used only with `--executor js-agent`",
+                "The most actions a virtual worker has in flight at once, reported to the farm \
+                 as its action slots. Used only with `--executor js-agent`",
             ),
         Arg::new(ARCH)
             .long("executor-arch")
@@ -210,9 +208,9 @@ pub(super) fn args() -> Vec<Arg> {
             .value_parser(["x86_64", "arm64"])
             .default_value("x86_64")
             .help(
-                "The CPU architecture of the hosts. Every lease asks for a host of `os=linux` \
-                 and this `arch`, and the hosts report them to the farm. Used only with \
-                 `--executor js-agent`",
+                "The CPU architecture of the hosts. Every job asks for a host of `os=linux`, \
+                 this `arch` and containers, and the virtual workers report them to the farm. \
+                 Used only with `--executor js-agent`",
             ),
         text(
             WORK_DIR,
@@ -252,7 +250,7 @@ pub(super) fn args() -> Vec<Arg> {
             INSECURE,
             "executor-insecure-argv-secrets",
             "Says the secrets of a task (the presigned write url, the read token) may travel as \
-             arguments of the run, where the action can read them from `/proc` and the engine's \
+             arguments of the job, where the action can read them from `/proc` and the engine's \
              inspect shows them. It is what the default `--executor-secret-delivery argv` needs, \
              and `--executor-secret-delivery files` refuses it. Off by default",
         ),
@@ -263,12 +261,13 @@ pub(super) fn args() -> Vec<Arg> {
             .default_value("argv")
             .help(
                 "How the secrets of a task (the presigned write url, the read token) reach it. \
-                 `argv`, the default, passes them as arguments of the run and needs \
-                 `--executor-insecure-argv-secrets`. `files` passes each as a file of the run, \
-                 which the lease server mounts read-only at `/run/js-files`: no argument holds \
-                 a secret, `--executor-insecure-argv-secrets` is refused with it, and only hosts \
-                 that report `run-files` are leased; a pool of none holds no host and no run is \
-                 sent. `files` is refused with `--executor kbf-daemon`, which builds no command line",
+                 `argv`, the default, passes them as arguments of the job and needs \
+                 `--executor-insecure-argv-secrets`. `files` passes each as a file of the job, \
+                 which its host writes read-only at `/run/js-files`: no argument holds a \
+                 secret, and `--executor-insecure-argv-secrets` is refused with it; a host whose \
+                 agent cannot write files refuses to start the job, and the farm runs the \
+                 action again. `files` is refused with `--executor kbf-daemon`, which builds no \
+                 command line",
             ),
         text(
             BASE_IMAGE,
@@ -285,26 +284,18 @@ pub(super) fn args() -> Vec<Arg> {
             "executor-kbf-image",
             "IMAGE",
             "The kbf image, pinned by digest like `--executor-base-image` and built from it, \
-             that every run is launched from. It keeps the task tool as its `ENTRYPOINT`, so \
-             the run's arguments are the tool's flags and the action runs inside this image. \
+             that every job is launched from. It keeps the task tool as its `ENTRYPOINT`, so \
+             the job's arguments are the tool's flags and the action runs inside this image. \
              Must be another image than the base. Needed with `--executor js-agent`",
         ),
         number(
             MARGIN,
             "executor-run-margin-secs",
-            "What a run's wall time adds to the action's timeout, in seconds: the fetch of the \
-             inputs and the upload of the pack. An action that fetches or uploads for longer \
-             than this ends at the wall time and is answered to the caller as a timeout. Used \
-             only with `--executor js-agent`",
+            "What a job's wall limit adds to the action's timeout, in seconds: the fetch of \
+             the inputs and the upload of the pack. An action that fetches or uploads for \
+             longer than this ends at the wall limit and is answered to the caller as a \
+             timeout. Used only with `--executor js-agent`",
             "300",
-        ),
-        number(
-            TTL,
-            "executor-lease-ttl-secs",
-            "How long a lease lasts without a renewal, in seconds, asked at each renewal. It \
-             must cover the longest run and two heartbeats, and the lease server grants at \
-             most its own `--max-ttl`. Used only with `--executor js-agent`",
-            "3600",
         ),
         number(
             MAX_RUN,
@@ -323,7 +314,7 @@ pub(super) fn args() -> Vec<Arg> {
         number(
             CALL_TIMEOUT,
             "executor-call-timeout-secs",
-            "How long one call to the lease server may take before it counts as unanswered, in \
+            "How long one call to the job service may take before it counts as unanswered, in \
              seconds. Under the fence time. Used only with `--executor js-agent`",
             "5",
         ),
@@ -333,10 +324,10 @@ pub(super) fn args() -> Vec<Arg> {
             .value_parser(clap::value_parser!(u64).range(1..))
             .default_value("8589934592")
             .help(
-                "The scratch disk a run books for what it writes, in bytes: its outputs, the \
-                 pack and the private home, tmp and cache. A run books this, the bytes of its \
-                 inputs and a fixed 1 GiB margin against the host's scratch, and the lease \
-                 server refuses a run the host's disk cannot hold. Used only with `--executor \
+                "The scratch disk a job needs for what it writes, in bytes: its outputs, the \
+                 pack and the private home, tmp and cache. A job needs this, the bytes of its \
+                 inputs and a fixed 1 GiB margin of its host's scratch, and the job service \
+                 places it only on a host whose disk can hold it. Used only with `--executor \
                  js-agent`",
             ),
     ]
@@ -353,11 +344,11 @@ pub(super) fn plain_http_grant(m: &ArgMatches) -> bool {
 pub struct JsAgentFlags {
     /// The executor's settings.
     pub config: Config,
-    /// `--executor-lease-url`.
-    pub lease_url: String,
-    /// `--executor-lease-token-file`.
+    /// `--executor-job-url`.
+    pub job_url: String,
+    /// `--executor-job-token-file`.
     pub token_file: PathBuf,
-    /// `--executor-lease-ca-file`.
+    /// `--executor-job-ca-file`.
     pub ca_file: Option<PathBuf>,
     /// `--executor-base-image`, by digest.
     pub base_image: ImageRef,
@@ -365,7 +356,7 @@ pub struct JsAgentFlags {
     pub kbf_image: ImageRef,
 }
 
-/// What `--executor` says: the daemons, or hosts of a lease server.
+/// What `--executor` says: the daemons, or jobs of a job service.
 #[derive(Clone, Debug)]
 pub struct ExecutorFlags {
     /// Which executor.
@@ -387,7 +378,7 @@ impl Default for ExecutorFlags {
 ///
 /// # Errors
 /// For `js-agent`, a flag it
-/// needs that is missing, a setting that breaks a rule ([`Config::validate`]), a lease server
+/// needs that is missing, a setting that breaks a rule ([`Config::validate`]), a job service
 /// URL that is not one or does not agree with the CA flag, or a base or kbf image that is not
 /// pinned by digest or is the same image twice.
 pub(super) fn from_matches(m: &ArgMatches) -> Result<ExecutorFlags, String> {
@@ -455,15 +446,15 @@ fn js_agent_flags(m: &ArgMatches) -> Result<JsAgentFlags, String> {
     let one = |id: &str| m.get_one::<String>(id).cloned().unwrap_or_default();
     let count = |id: &str| m.get_one::<u64>(id).copied().unwrap_or_default();
     let secs = |id: &str| Duration::from_secs(count(id));
-    let lease_url = one(LEASE_URL);
-    let origin = Origin::from_str(&lease_url).map_err(|e| format!("--executor-lease-url: {e}"))?;
+    let job_url = one(JOB_URL);
+    let origin = Origin::from_str(&job_url).map_err(|e| format!("--executor-job-url: {e}"))?;
     let ca_file = m.get_one::<PathBuf>(CA_FILE).cloned();
     match (origin.is_tls(), ca_file.is_some()) {
         (true, false) => {
-            return Err("--executor-lease-url is https: give --executor-lease-ca-file".to_owned());
+            return Err("--executor-job-url is https: give --executor-job-ca-file".to_owned());
         }
         (false, true) => {
-            return Err("--executor-lease-ca-file is for an https --executor-lease-url".to_owned());
+            return Err("--executor-job-ca-file is for an https --executor-job-url".to_owned());
         }
         _ => {}
     }
@@ -479,7 +470,6 @@ fn js_agent_flags(m: &ArgMatches) -> Result<JsAgentFlags, String> {
     let mut config = Config::new(
         &one(FRONTEND),
         hosts,
-        &one(CLASS),
         count(CPUS).saturating_mul(1_000),
         count(MEMORY_GIB).saturating_mul(1 << 30),
     );
@@ -499,14 +489,13 @@ fn js_agent_flags(m: &ArgMatches) -> Result<JsAgentFlags, String> {
     config.insecure_argv_secrets = m.get_flag(INSECURE);
     config.delivery = delivery(m);
     config.run_margin = secs(MARGIN);
-    config.lease_ttl = secs(TTL);
     config.max_run = secs(MAX_RUN);
     config.default_timeout = secs(DEFAULT_TIMEOUT);
     config.call_timeout = secs(CALL_TIMEOUT);
     config.output_disk_bytes = count(OUTPUT_DISK);
     Ok(JsAgentFlags {
         config,
-        lease_url,
+        job_url,
         token_file: m
             .get_one::<PathBuf>(TOKEN_FILE)
             .cloned()
@@ -551,27 +540,30 @@ impl JsAgentFlags {
         })
     }
 
-    /// The client of the lease server these flags describe. Nothing is sent: the server is
+    /// The client of the job service these flags describe. Nothing is sent: the service is
     /// first contacted when the executor is stepped.
     ///
     /// # Errors
     /// The token file cannot be used (missing, readable by others, not a token), the CA file
     /// cannot be read or holds no certificate, or the URL and the CA do not go together.
+    ///
+    /// # Panics
+    /// Outside a Tokio runtime, as [`Client::new`].
     pub fn client(&self) -> Result<Client, Box<dyn Error>> {
-        let origin = Origin::from_str(&self.lease_url)?;
+        let origin = Origin::from_str(&self.job_url)?;
         let token = Token::from_file(&self.token_file)
-            .map_err(|e| format!("--executor-lease-token-file: {e}"))?;
-        let mut lease = kbf_lease_client::Config::new(origin, token);
+            .map_err(|e| format!("--executor-job-token-file: {e}"))?;
+        let mut config = kbf_job_client::Config::new(origin, token);
         if let Some(ca) = &self.ca_file {
             let pem = std::fs::read(ca)
-                .map_err(|e| format!("--executor-lease-ca-file {}: {e}", ca.display()))?;
-            lease = lease.with_ca_pem(pem);
+                .map_err(|e| format!("--executor-job-ca-file {}: {e}", ca.display()))?;
+            config = config.with_ca_pem(pem);
         }
-        Ok(Client::new(lease).map_err(|e| format!("--executor-lease-url: {e}"))?)
+        Ok(Client::new(config).map_err(|e| format!("--executor-job-url: {e}"))?)
     }
 
     /// The executor these flags describe, over `farm` and the seams `front`, counting into
-    /// `metrics`. The lease server is not contacted until it is stepped.
+    /// `metrics`. The job service is not contacted until it is stepped.
     ///
     /// # Errors
     /// As [`JsAgentFlags::client`].
@@ -589,12 +581,8 @@ impl JsAgentFlags {
             inputs: front,
             metrics,
         };
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |since| since.as_millis());
-        let clock = Clock::from_unix_ms(u64::try_from(now).unwrap_or(u64::MAX));
         // The flags were checked when they were parsed.
-        Ok(Executor::new(self.config.clone(), deps, clock)?)
+        Ok(Executor::new(self.config.clone(), deps)?)
     }
 }
 

@@ -39,53 +39,49 @@ enroll-rate-per-minute = 60
 # frontend-name = []
 
 [executor]
-# Where the farm runs the actions it places. `kbf-daemon`, the default, is the daemon of each node, over the worker listener: no executor is built and no lease server is contacted, whatever the other `--executor-*` flags say. `js-agent` runs them on hosts leased from the job scheduler's lease server, in the kbf image (`--executor-kbf-image`, built from `--executor-base-image`), whose task tool runs the action inside it; it needs the lease server's flags (`--executor-lease-url`, `--executor-lease-token-file`, and `--executor-lease-ca-file` for https), the pool's (`--executor-class`, `--executor-hosts`, `--executor-host-cpus`, `--executor-host-memory-gib`), `--executor-frontend-id`, the packs (`--pack-store-endpoint`) and the secret delivery (`--executor-secret-delivery`, with `--executor-insecure-argv-secrets` for its default `argv`). The executor runs on exactly one frontend: a second frontend that holds hosts on the same lease server stops. A restart of the frontend fails the builds in flight. Switching back to `kbf-daemon` releases the leases when the frontend is stopped, not when it is killed: a killed frontend's leases stay held until their ttl ends (`--executor-lease-ttl-secs`), unless a later `js-agent` start releases them. `--executor-insecure-argv-secrets` is ignored with `kbf-daemon`
+# Where the farm runs the actions it places. `kbf-daemon`, the default, is the daemon of each node, over the worker listener: no executor is built and no job service is contacted, whatever the other `--executor-*` flags say. `js-agent` runs each as a job of the job scheduler's job service, in the kbf image (`--executor-kbf-image`, built from `--executor-base-image`), whose task tool runs the action inside it; it needs the job service's flags (`--executor-job-url`, `--executor-job-token-file`, and `--executor-job-ca-file` for https), the virtual workers' (`--executor-hosts`, `--executor-host-cpus`, `--executor-host-memory-gib`), `--executor-frontend-id`, the packs (`--pack-store-endpoint`) and the secret delivery (`--executor-secret-delivery`, with `--executor-insecure-argv-secrets` for its default `argv`). The executor runs on exactly one frontend: a second frontend that has jobs on the same job service stops. A restart of the frontend fails the builds in flight. Switching back to `kbf-daemon` cancels the jobs when the frontend is stopped, not when it is killed: a killed frontend's jobs run to their wall limit, unless a later `js-agent` start cancels them. `--executor-insecure-argv-secrets` is ignored with `kbf-daemon`
 executor = "kbf-daemon"
 # Lets the task read its inputs through a read grant served over `http://`: an `http://` `--task-read-url` is accepted, and the task tool is given `--allow-plain-http-grant`. The read token then crosses the job network in clear, so this is for a farm on its own network. Off by default, and an `http://` read url is refused without it. Used only with `--executor js-agent`
 executor-allow-plain-http-grant = false
 # Lets the task write its pack to an `http://` url, until the store serves TLS. The reads stay https unless `--executor-allow-plain-http-grant` says otherwise. Used only with `--executor js-agent`
 executor-allow-plain-http-put = false
-# The CPU architecture of the hosts. Every lease asks for a host of `os=linux` and this `arch`, and the hosts report them to the farm. Used only with `--executor js-agent`
+# The CPU architecture of the hosts. Every job asks for a host of `os=linux`, this `arch` and containers, and the virtual workers report them to the farm. Used only with `--executor js-agent`
 executor-arch = "x86_64"
 # The base environment the Command of an action sees, pinned by digest as `<repository>@sha256:<64 hex digits>` (a leading `docker://` is optional). It is the one image an action's `container-image` platform property may name: an action that names another is refused as invalid, one that names none gets this. A tag is refused. Needed with `--executor js-agent`
 # executor-base-image = "IMAGE"
-# How long one call to the lease server may take before it counts as unanswered, in seconds. Under the fence time. Used only with `--executor js-agent`
+# How long one call to the job service may take before it counts as unanswered, in seconds. Under the fence time. Used only with `--executor js-agent`
 executor-call-timeout-secs = 5
-# The lease server's class every lease asks for (the pool of hosts the executor draws from). Used only with `--executor js-agent`
-# executor-class = "CLASS"
 # The timeout, in seconds, of an action that names none: at most `--executor-max-run-secs`. Used only with `--executor js-agent`
 executor-default-timeout-secs = 3000
-# The name of this frontend on the lease server: the value of the `kbf-frontend` label on its leases, by which a restarted frontend finds them and releases the ones it no longer needs. 1 to 63 of letters, digits, `-`, `_` and `.`. It must be different for each frontend (not copied with the config). Used only with `--executor js-agent`
+# The name of this frontend on the job service: the value of the `kbf-frontend` label on its jobs, by which a restarted frontend finds and cancels the ones an earlier process left, hashed into every job id, and the name of its virtual workers (`js:<ID>-<n>`). 1 to 63 of letters, digits, `-`, `_` and `.`. It must be different for each frontend (not copied with the config). Used only with `--executor js-agent`
 # executor-frontend-id = "ID"
-# The CPU cores a host's lease holds: the pool's shape. At least 1. Used only with `--executor js-agent`
+# The CPU cores of a virtual worker: the most the farm books on it at once. At least 1. Used only with `--executor js-agent`
 # executor-host-cpus = "CORES"
-# The memory, in GiB, a host's lease holds: the pool's shape. Each run is capped at 1.5 times its booking plus 512 MiB, and the bookings of a host add up to what is left after that. Used only with `--executor js-agent`
+# The memory, in GiB, of a virtual worker. Each job needs 1.5 times its booking plus 512 MiB, and the bookings of a worker add up to what is left after that. Used only with `--executor js-agent`
 # executor-host-memory-gib = "GIB"
-# The most runs a host takes at once, reported to the farm as the host's action slots. Used only with `--executor js-agent`
+# The most actions a virtual worker has in flight at once, reported to the farm as its action slots. Used only with `--executor js-agent`
 executor-host-slots = 8
-# How many hosts to hold, a lease each. A host is leased whole for the shape below and released before its lease ends. Used only with `--executor js-agent`
-# executor-hosts = "HOSTS"
-# Says the secrets of a task (the presigned write url, the read token) may travel as arguments of the run, where the action can read them from `/proc` and the engine's inspect shows them. It is what the default `--executor-secret-delivery argv` needs, and `--executor-secret-delivery files` refuses it. Off by default
+# How many virtual workers the farm places actions on, each of the shape below: how many actions of which size the farm may have in flight as jobs. The job service decides which host runs each job. Used only with `--executor js-agent`
+# executor-hosts = "WORKERS"
+# Says the secrets of a task (the presigned write url, the read token) may travel as arguments of the job, where the action can read them from `/proc` and the engine's inspect shows them. It is what the default `--executor-secret-delivery argv` needs, and `--executor-secret-delivery files` refuses it. Off by default
 executor-insecure-argv-secrets = false
-# The kbf image, pinned by digest like `--executor-base-image` and built from it, that every run is launched from. It keeps the task tool as its `ENTRYPOINT`, so the run's arguments are the tool's flags and the action runs inside this image. Must be another image than the base. Needed with `--executor js-agent`
+# The CA certificate (PEM) the job service's certificate chains to: the only trust anchor, no system roots are consulted. Needed for an `https` job service and refused for an `http` one. Used only with `--executor js-agent`
+# executor-job-ca-file = "PATH"
+# A file with the bearer token of the job service, readable by its owner alone (mode 0600 or 0400). The secret is never a flag: a command line is world-readable. Used only with `--executor js-agent`
+# executor-job-token-file = "PATH"
+# The job service, as `https://host[:port]`, or `http://` to a loopback host. Used only with `--executor js-agent`
+# executor-job-url = "URL"
+# The kbf image, pinned by digest like `--executor-base-image` and built from it, that every job is launched from. It keeps the task tool as its `ENTRYPOINT`, so the job's arguments are the tool's flags and the action runs inside this image. Must be another image than the base. Needed with `--executor js-agent`
 # executor-kbf-image = "IMAGE"
-# The CA certificate (PEM) the lease server's certificate chains to: the only trust anchor, no system roots are consulted. Needed for an `https` lease server and refused for an `http` one. Used only with `--executor js-agent`
-# executor-lease-ca-file = "PATH"
-# A file with the bearer token of the lease server, readable by its owner alone (mode 0600 or 0400). The secret is never a flag: a command line is world-readable. Used only with `--executor js-agent`
-# executor-lease-token-file = "PATH"
-# How long a lease lasts without a renewal, in seconds, asked at each renewal. It must cover the longest run and two heartbeats, and the lease server grants at most its own `--max-ttl`. Used only with `--executor js-agent`
-executor-lease-ttl-secs = 3600
-# The lease server, as `https://host[:port]`, or `http://` to a loopback host. Used only with `--executor js-agent`
-# executor-lease-url = "URL"
 # Has the task tool ask the read listener where each input is kept (`GET /locate`) and read it straight from that store, with the read grants the answer carries, and from the listener any input whose direct read fails; every byte is still checked against its digest. Off by default: the task reads every input through the listener. With no grants in the answer it reads from the listener as without the flag. An `http://` store needs `--executor-allow-plain-http-grant`. Used only with `--executor js-agent`, and refused with `--executor kbf-daemon`
 executor-locate = false
 # The longest action timeout the executor runs, in seconds; an action that asks for more is refused. Used only with `--executor js-agent`
 executor-max-run-secs = 3000
-# The scratch disk a run books for what it writes, in bytes: its outputs, the pack and the private home, tmp and cache. A run books this, the bytes of its inputs and a fixed 1 GiB margin against the host's scratch, and the lease server refuses a run the host's disk cannot hold. Used only with `--executor js-agent`
+# The scratch disk a job needs for what it writes, in bytes: its outputs, the pack and the private home, tmp and cache. A job needs this, the bytes of its inputs and a fixed 1 GiB margin of its host's scratch, and the job service places it only on a host whose disk can hold it. Used only with `--executor js-agent`
 executor-output-disk-bytes = 8589934592
-# What a run's wall time adds to the action's timeout, in seconds: the fetch of the inputs and the upload of the pack. An action that fetches or uploads for longer than this ends at the wall time and is answered to the caller as a timeout. Used only with `--executor js-agent`
+# What a job's wall limit adds to the action's timeout, in seconds: the fetch of the inputs and the upload of the pack. An action that fetches or uploads for longer than this ends at the wall limit and is answered to the caller as a timeout. Used only with `--executor js-agent`
 executor-run-margin-secs = 300
-# How the secrets of a task (the presigned write url, the read token) reach it. `argv`, the default, passes them as arguments of the run and needs `--executor-insecure-argv-secrets`. `files` passes each as a file of the run, which the lease server mounts read-only at `/run/js-files`: no argument holds a secret, `--executor-insecure-argv-secrets` is refused with it, and only hosts that report `run-files` are leased; a pool of none holds no host and no run is sent. `files` is refused with `--executor kbf-daemon`, which builds no command line
+# How the secrets of a task (the presigned write url, the read token) reach it. `argv`, the default, passes them as arguments of the job and needs `--executor-insecure-argv-secrets`. `files` passes each as a file of the job, which its host writes read-only at `/run/js-files`: no argument holds a secret, and `--executor-insecure-argv-secrets` is refused with it; a host whose agent cannot write files refuses to start the job, and the farm runs the action again. `files` is refused with `--executor kbf-daemon`, which builds no command line
 executor-secret-delivery = "argv"
 # Where the task tool works in the container, if not in its own default: the kbf image must have a writable directory there. Used only with `--executor js-agent`
 # executor-work-dir = "DIR"

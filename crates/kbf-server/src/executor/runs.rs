@@ -1,51 +1,61 @@
-//! The runs of a worker: what a `Start` becomes, how it is posted, read back and settled.
+//! The tasks of a worker: what a `Start` becomes, how its job is submitted, read back,
+//! cancelled and settled.
 //!
-//! A task is one farm lease. It is `Waiting` from its `Start` until the lease server accepts
-//! it, `Running` while the host has it, `Ingesting` once the task tool exited 0 and the
-//! frontend reads the pack, and `Reporting` from the moment its `Result` is formed until
-//! the farm acknowledges it.
+//! A task is one farm lease. It is `Waiting` from its `Start` until the job service has
+//! answered its submit with the job, `Running` while the job is queued, placed, starting or
+//! running, `Withdrawing` once the farm cancelled it (or its window ended after a submit whose
+//! answer was lost) and until the service answers the cancel, `Ingesting` once the task tool
+//! exited 0 and the frontend reads the pack, and `Reporting` from the moment its `Result` is
+//! formed until the farm acknowledges it.
+//!
+//! Two guards keep one farm lease to one job. The in-memory task is the first: a `Start` sent
+//! again finds its task and changes nothing. The job id ([`job_id`](super::job_id)) is the
+//! second: a submit whose answer was lost is sent again with the same id and the same job,
+//! which the task keeps, and the service answers from the job the first made. A process that
+//! restarts loses its tasks with its farm; the jobs it left are cancelled by the next one
+//! (`pool::adopt_jobs`), and a job built again under the same id would differ (a new key and
+//! url) and be refused as a conflict, never run twice.
 
-use std::collections::BTreeMap;
-use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures::FutureExt as _;
-use kbf_lease_client::{Error, ErrorCode, Run, RunId, RunLimits, RunSpec, RunState};
+use js_proto::v1::JobState;
 use kbf_proto::reapi::Digest;
-use kbf_proto::worker::{Lost, ResultAck, Start};
+use kbf_proto::worker::{ResultAck, Start};
 use kbf_sched::fence::START_VALIDITY;
+use kbf_types::LeaseId;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use crate::executor::config::Config;
-use crate::executor::host::{Drain, HostWorker, Retire};
+use crate::executor::api::{answered, not_found, note};
+use crate::executor::host::HostWorker;
 use crate::executor::metrics::{IngestEnd, Metrics, RunEnd};
-use crate::executor::outcome::{
-    Settled, Verdict, judge, ran, refused_for_files, refused_for_quota, result_of,
-};
+use crate::executor::outcome::{Settled, Verdict, forgotten, judge, ran, refused, result_of};
 use crate::executor::phases::{Mark, Timeline};
-use crate::executor::task::{Nonce, PackKey, TaskArgs};
-use crate::executor::traits::{Ingested, InputsError, MintError, PresignError, UntrustedLimits};
-use crate::executor::{Ctx, note};
+use crate::executor::submit::{Booking, Prepared, prepare};
+use crate::executor::task::PackKey;
+use crate::executor::traits::{Ingested, UntrustedLimits};
+use crate::executor::{Ctx, twin_message};
 
-/// The label that names a run by the nonce drawn for its `POST`, so a run whose `202` was
-/// lost can be found again.
-pub(super) const RUN_LABEL: &str = "kbf-run";
+/// The kind of a `Start` that asks for a whole machine.
+const WHOLE_MACHINE: &str = "whole_machine";
 
 /// One farm lease the worker was told to run.
 pub(super) struct Task {
     pub(super) action: Digest,
     pub(super) stage: Stage,
-    /// When the run passed each of its moments, on the executor's clock.
+    /// When the job passed each of its moments, on the executor's clock.
     pub(super) timeline: Timeline,
 }
 
 pub(super) enum Stage {
-    /// Told to start, not accepted by the lease server yet.
+    /// Told to start, its submit not answered with the job yet.
     Waiting(Waiting),
-    /// Queued or running on the host.
+    /// The job is live on the service.
     Running(Running),
+    /// The job of a task nothing is owed for any more: cancelled until the service answers.
+    Withdrawing(String),
     /// Exited 0; the frontend is reading its pack.
     Ingesting(JoinHandle<Ingested>),
     /// Has a result the farm has not acknowledged.
@@ -57,28 +67,29 @@ pub(super) struct Waiting {
     /// Until when the `Start` may be acted on; `None` for one that names a heartbeat the
     /// worker did not send.
     deadline: Option<Instant>,
-    millicpus: u64,
-    memory_bytes: u64,
-    /// What the run is made of, kept while the lease server cannot take it yet: a read of the
-    /// CAS, a url and a grant are not made again on each pass of the up to 14 s it may wait.
+    booking: Booking,
+    /// The `Start` asks for a whole machine.
+    whole_machine: bool,
+    /// The job, kept from the first try: a read of the CAS, a url and a grant are not made
+    /// again on each pass, and a submit sent again sends the same job.
     prepared: Option<Arc<Prepared>>,
+    /// A submit was sent whose answer was lost: the job may exist.
+    sent: bool,
 }
 
-/// A run ready to post.
-pub(super) struct Prepared {
-    spec: RunSpec,
-    key: PackKey,
-    nonce: Nonce,
-    wall: Duration,
+impl Waiting {
+    /// The id of the job that may exist.
+    fn sent_job(&self) -> Option<String> {
+        let prepared = self.prepared.as_ref().filter(|_| self.sent)?;
+        Some(prepared.spec.job_id.clone())
+    }
 }
 
 pub(super) struct Running {
-    run: RunId,
+    pub(super) job: String,
     key: PackKey,
-    /// The lease cut the run's wall time short of what was asked.
-    truncated: bool,
-    /// The farm cancelled the lease: the run is stopped and forgotten.
-    cancelled: bool,
+    /// The host's silence was seen and counted.
+    silence_seen: bool,
 }
 
 pub(super) struct Reporting {
@@ -95,56 +106,28 @@ impl Task {
             _ => {}
         }
     }
-}
 
-/// What came of trying to start a task.
-enum Queued {
-    /// Not now: try again while the `Start` is valid, with the run as it was prepared.
-    Wait(Arc<Prepared>),
-    Posted(Running),
-    Settled(Settled),
-    Retire(Retire),
-    /// The `Start`'s window ended while the task was being prepared: dropped, as one that
-    /// arrived late is.
-    Late,
-}
-
-impl From<InputsError> for Settled {
-    fn from(error: InputsError) -> Self {
-        match error {
-            InputsError::Invalid(why) => Self::Invalid(why),
-            InputsError::Unavailable(why) => Self::Infra(why),
+    /// The id of the job this task may have on the service.
+    pub(super) fn job(&self) -> Option<String> {
+        match &self.stage {
+            Stage::Running(running) => Some(running.job.clone()),
+            Stage::Withdrawing(job) => Some(job.clone()),
+            Stage::Waiting(waiting) => waiting.sent_job(),
+            _ => None,
         }
     }
 }
 
-impl From<PresignError> for Settled {
-    fn from(error: PresignError) -> Self {
-        let (PresignError::Refused(why) | PresignError::Unavailable(why)) = error;
-        Self::Infra(format!("no url for the pack: {why}"))
-    }
-}
-
-/// `image` as the lease server takes it, if it is pinned by digest: a name, then
-/// `@sha256:` and 64 hex digits. The `docker://` scheme the platform property carries is
-/// dropped.
-fn pinned(image: &str) -> Result<String, Settled> {
-    let image = image.strip_prefix("docker://").unwrap_or(image);
-    let digest = image.rsplit_once("@sha256:").map(|(_, digest)| digest);
-    let pinned = digest.is_some_and(|d| d.len() == 64 && d.bytes().all(|b| b.is_ascii_hexdigit()));
-    match pinned {
-        true => Ok(image.to_owned()),
-        false => Err(Settled::Invalid(format!(
-            "the action's image {image:?} is not pinned by an @sha256 digest"
-        ))),
-    }
-}
-
-fn require(ok: bool, why: impl FnOnce() -> String) -> Result<(), Settled> {
-    match ok {
-        true => Ok(()),
-        false => Err(Settled::Invalid(why())),
-    }
+/// What came of trying to submit a task.
+enum Submitted {
+    /// Not now: try again while the `Start` is valid.
+    Wait(Waiting),
+    Running(Running),
+    Settled(Settled),
+    /// The `Start`'s window ended while the task was being prepared or its submit was not
+    /// answered: dropped, as one that arrived late is, after the job that may exist is
+    /// cancelled.
+    Late(Option<String>),
 }
 
 impl HostWorker {
@@ -157,15 +140,19 @@ impl HostWorker {
         let window = Duration::from_millis(start.valid_for_ms).min(START_VALIDITY);
         let waiting = Waiting {
             deadline: self.sent_at(start.heartbeat_seq).map(|sent| sent + window),
-            millicpus: start.millicpus,
-            memory_bytes: start.memory_bytes,
+            booking: Booking {
+                millicpus: start.millicpus,
+                memory_bytes: start.memory_bytes,
+            },
+            whole_machine: start.kind == WHOLE_MACHINE,
             prepared: None,
+            sent: false,
         };
         let action = start.action_digest.clone().unwrap_or_default();
         // A `Start` sent again, for a lease that is already known, changes nothing: it must
-        // never post a second run.
+        // never submit a second job.
         self.tasks
-            .entry(kbf_types::LeaseId::new(lease.term, lease.seq))
+            .entry(LeaseId::new(lease.term, lease.seq))
             .or_insert(Task {
                 action,
                 stage: Stage::Waiting(waiting),
@@ -173,36 +160,47 @@ impl HostWorker {
             });
     }
 
-    /// The farm no longer holds the lease: whatever is stopped, and nothing is owed.
-    pub(super) fn cancel(&mut self, lease: kbf_types::LeaseId) {
-        match self.tasks.get_mut(&lease).map(|task| &mut task.stage) {
-            Some(Stage::Running(running)) => running.cancelled = true,
-            _ => self.drop_task(lease),
+    /// The farm no longer holds the lease: its job is cancelled, and nothing is owed. A task
+    /// that never submitted is dropped without a call.
+    pub(super) fn cancel(&mut self, lease: LeaseId) {
+        let Some(task) = self.tasks.get(&lease) else {
+            return;
+        };
+        let done = matches!(task.stage, Stage::Ingesting(_) | Stage::Reporting(_));
+        match task.job().filter(|_| !done) {
+            Some(job) => self.set_stage(lease, Stage::Withdrawing(job)),
+            None => self.drop_task(lease),
         }
     }
 
     /// The farm acknowledged the result of `lease`: it is forgotten.
-    pub(super) fn acked(&mut self, lease: kbf_types::LeaseId) {
+    pub(super) fn acked(&mut self, lease: LeaseId) {
         self.drop_task(lease);
     }
 
-    fn drop_task(&mut self, lease: kbf_types::LeaseId) {
+    fn drop_task(&mut self, lease: LeaseId) {
         self.tasks.remove(&lease).iter().for_each(Task::abort);
     }
 
     /// The leases a heartbeat lists: those running, and those whose result the farm has
-    /// not acknowledged. A `Start` not yet accepted is not listed, as a daemon lists only what
-    /// it started.
-    pub(super) fn listed(&self) -> Vec<kbf_types::LeaseId> {
+    /// not acknowledged. A `Start` not yet submitted is not listed, as a daemon lists only what
+    /// it started, and nor is a job being withdrawn, which the farm no longer runs here.
+    pub(super) fn listed(&self) -> Vec<LeaseId> {
         self.tasks
             .iter()
-            .filter(|(_, task)| !matches!(task.stage, Stage::Waiting(_)))
+            .filter(|(_, task)| !matches!(task.stage, Stage::Waiting(_) | Stage::Withdrawing(_)))
             .map(|(lease, _)| *lease)
             .collect()
     }
 
-    /// Posts every waiting task the lease server will take.
-    pub(super) async fn launch(&mut self, ctx: &Ctx<'_>, now: Instant) -> ControlFlow<Retire> {
+    /// Whether a job of this worker may be live on the service: the calls about it are what
+    /// the self-fence counts the service's silence by.
+    pub(super) fn holds_jobs(&self) -> bool {
+        self.tasks.values().any(|task| task.job().is_some())
+    }
+
+    /// Submits every waiting task the job service will take.
+    pub(super) async fn launch(&mut self, ctx: &Ctx<'_>, now: Instant) {
         let waiting: Vec<_> = self
             .tasks
             .iter()
@@ -213,7 +211,7 @@ impl HostWorker {
             .collect();
         for (lease, action, w) in waiting {
             // Read again for each task: the ones before it took time.
-            let at = ctx.clock.now();
+            let at = ctx.now();
             // The heartbeats and the fence come after this, in the same pass: it starts no more
             // once its budget is spent, and the tasks left are taken up by the next.
             if at.saturating_duration_since(now) >= ctx.cfg.pass_budget {
@@ -221,379 +219,261 @@ impl HostWorker {
             }
             let Some(deadline) = w.deadline.filter(|deadline| at < *deadline) else {
                 tracing::warn!(worker = %self.id, %lease, "a Start outside its window is dropped");
-                ctx.deps.metrics.late_start();
-                self.drop_task(lease);
+                self.late(ctx, lease, w.sent_job());
                 continue;
             };
+            if w.whole_machine {
+                let why = "a whole-machine action is not run by this executor: its workers \
+                           offer the container driver only";
+                self.settle_with(
+                    lease,
+                    &Settled::Infra(why.to_owned()),
+                    now,
+                    &ctx.deps.metrics,
+                );
+                continue;
+            }
             self.stamp(lease, Mark::Seen, at, ctx);
-            match self.queue(ctx, lease, &action, &w, deadline).await {
-                Queued::Wait(prepared) => {
-                    let w = Waiting {
-                        prepared: Some(prepared),
-                        ..w
-                    };
-                    self.set_stage(lease, Stage::Waiting(w));
-                }
-                Queued::Posted(running) => {
-                    self.stamp(lease, Mark::Posted, ctx.clock.now(), ctx);
+            match self.submit(ctx, lease, &action, w, deadline).await {
+                Submitted::Wait(w) => self.set_stage(lease, Stage::Waiting(w)),
+                Submitted::Running(running) => {
+                    self.stamp(lease, Mark::Posted, ctx.now(), ctx);
                     self.set_stage(lease, Stage::Running(running));
                 }
-                Queued::Settled(settled) => {
+                Submitted::Settled(settled) => {
                     self.settle_with(lease, &settled, now, &ctx.deps.metrics);
                 }
-                Queued::Retire(why) => return ControlFlow::Break(why),
-                Queued::Late => {
-                    tracing::warn!(worker = %self.id, %lease, "a Start ran out of its window while it was prepared and is dropped");
-                    ctx.deps.metrics.late_start();
-                    self.drop_task(lease);
+                Submitted::Late(job) => {
+                    tracing::warn!(worker = %self.id, %lease, "a Start ran out of its window before its job was submitted and is dropped");
+                    self.late(ctx, lease, job);
                 }
             }
         }
-        ControlFlow::Continue(())
     }
 
-    /// Stamps `mark` of `lease`'s run at `at`: the first stamp of each is kept.
-    fn stamp(&mut self, lease: kbf_types::LeaseId, mark: Mark, at: Instant, ctx: &Ctx<'_>) {
+    /// Drops a `Start` whose window ended: at once if no job of it may exist, else once the
+    /// job is cancelled.
+    fn late(&mut self, ctx: &Ctx<'_>, lease: LeaseId, job: Option<String>) {
+        ctx.deps.metrics.late_start();
+        match job {
+            Some(job) => self.set_stage(lease, Stage::Withdrawing(job)),
+            None => self.drop_task(lease),
+        }
+    }
+
+    /// Stamps `mark` of `lease`'s job at `at`: the first stamp of each is kept.
+    fn stamp(&mut self, lease: LeaseId, mark: Mark, at: Instant, ctx: &Ctx<'_>) {
         let metrics = &ctx.deps.metrics;
         self.tasks
             .entry(lease)
             .and_modify(|task| task.timeline.stamp(mark, at, metrics));
     }
 
-    fn set_stage(&mut self, lease: kbf_types::LeaseId, stage: Stage) {
+    fn set_stage(&mut self, lease: LeaseId, stage: Stage) {
         self.tasks
             .entry(lease)
             .and_modify(|task| task.stage = stage);
     }
 
     /// Forms the result of `lease` from `settled`, to be reported.
-    fn settle_with(
-        &mut self,
-        lease: kbf_types::LeaseId,
-        settled: &Settled,
-        now: Instant,
-        metrics: &Metrics,
-    ) {
-        let action = self.tasks[&lease].action.clone();
-        let result = result_of(lease, &action, settled);
+    fn settle_with(&mut self, lease: LeaseId, settled: &Settled, now: Instant, metrics: &Metrics) {
+        let Some(task) = self.tasks.get_mut(&lease) else {
+            return;
+        };
+        let result = result_of(lease, &task.action, settled);
         metrics.run_ended(RunEnd::of(&result));
-        self.set_stage(lease, reporting(result, now));
+        task.stage = reporting(result, now);
     }
 
-    async fn queue(
+    async fn submit(
         &mut self,
         ctx: &Ctx<'_>,
-        lease: kbf_types::LeaseId,
+        lease: LeaseId,
         action: &Digest,
-        w: &Waiting,
+        w: Waiting,
         deadline: Instant,
-    ) -> Queued {
-        // What preparing reads (the CAS, the store, the grant service) is not the lease
-        // server's and is not bounded by it: it is bounded by the window, which it cannot
-        // outlast and have the post still be good.
+    ) -> Submitted {
+        // What preparing reads (the CAS, the store, the grant service) is not the job
+        // service's and is not bounded by it: it is bounded by the window, which it cannot
+        // outlast and have the submit still be good.
         let prepared = match &w.prepared {
             Some(prepared) => Arc::clone(prepared),
             None => {
-                let preparing =
-                    tokio::time::timeout_at(deadline, self.prepare(ctx, lease, action, w));
-                match preparing.await {
+                let worker = self.id.to_string();
+                let preparing = prepare(ctx, &worker, lease, action, w.booking);
+                match tokio::time::timeout_at(deadline, preparing).await {
                     Ok(Ok(prepared)) => {
-                        self.stamp(lease, Mark::Prepared, ctx.clock.now(), ctx);
-                        Arc::new(prepared)
+                        self.stamp(lease, Mark::Prepared, ctx.now(), ctx);
+                        prepared
                     }
-                    Ok(Err(settled)) => return Queued::Settled(settled),
-                    Err(_) => return Queued::Late,
+                    Ok(Err(settled)) => return Submitted::Settled(settled),
+                    Err(_) => return Submitted::Late(None),
                 }
             }
         };
-        let wall = prepared.wall;
-        // The lease server cuts the run's wall time to what the lease has left when it is
-        // posted, and a renewal later does not stretch it: renew first when the lease would
-        // end before the run does.
-        let now = ctx.clock.now();
-        let renewed = self.renew(ctx, now, self.left(now) < wall).await;
-        if let ControlFlow::Break(why) = renewed {
-            return Queued::Retire(why);
-        }
-        // The CAS read, the url, the grant and the renewal each took as long as the lease
-        // server or the store took: the window is judged by the clock now, the last moment
-        // before the post, not by the one read when the pass began.
-        let now = ctx.clock.now();
+        // The CAS read, the url and the grant each took as long as the store took: the window
+        // is judged by the clock now, the last moment before the submit.
+        let now = ctx.now();
         if now >= deadline {
-            return Queued::Late;
+            return Submitted::Late(w.sent_job());
         }
-        let truncated = wall > self.left(now);
-        let posted = ctx.api().queue_run(self.lease, &prepared.spec).await;
-        self.heard(now, &posted);
-        let label = prepared.nonce.to_string();
-        let running = |run: RunId| Running {
-            run,
-            key: prepared.key.clone(),
-            truncated,
-            cancelled: false,
-        };
-        match posted {
-            Ok(accepted) => Queued::Posted(running(accepted.run_id)),
-            Err(e) if e.may_have_applied() => self.recover(ctx, &label, running).await,
-            Err(e) => self.refused(ctx, &e, prepared),
+        if w.sent {
+            ctx.deps.metrics.job_resubmitted();
         }
-    }
-
-    /// How long the lease lasts from `now`: until it expires unless renewed, or ends.
-    fn left(&self, now: Instant) -> Duration {
-        self.expires_at
-            .min(self.ends_at)
-            .saturating_duration_since(now)
-    }
-
-    /// The run, its key, and the wall time it asks for.
-    async fn prepare(
-        &self,
-        ctx: &Ctx<'_>,
-        lease: kbf_types::LeaseId,
-        action: &Digest,
-        w: &Waiting,
-    ) -> Result<Prepared, Settled> {
-        let facts = ctx.deps.inputs.action(action).await?;
-        let timeout = facts.timeout.unwrap_or(ctx.cfg.default_timeout);
-        require(timeout <= ctx.cfg.max_run, || {
-            format!("the action's timeout {timeout:?} is over the executor's limit")
-        })?;
-        let image = pinned(&facts.image)?;
-        let wall = ctx.cfg.wall(timeout);
-        let nonce = Nonce::random();
-        let key = ctx
-            .deps
-            .ingest
-            .mint(lease, action, wall)
-            .await
-            .map_err(|e| match e {
-                MintError::Refused(why) => Settled::Invalid(format!("no key for the pack: {why}")),
-                MintError::Unavailable(why) => {
-                    Settled::Infra(format!("no key for the pack: {why}"))
+        let answer = ctx.api().submit_job(prepared.spec.clone()).await;
+        self.heard(ctx, &answer);
+        match answer {
+            Ok(job) => {
+                ctx.deps.metrics.job_submitted();
+                Submitted::Running(Running {
+                    job: job.id,
+                    key: prepared.key.clone(),
+                    silence_seen: false,
+                })
+            }
+            Err(error) => match refused(&error) {
+                None => {
+                    tracing::warn!(worker = %self.id, %lease, %error, "the submit was not answered; it is sent again");
+                    Submitted::Wait(Waiting {
+                        sent: w.sent || error.may_have_applied(),
+                        prepared: Some(prepared),
+                        ..w
+                    })
                 }
-            })?;
-        let pack = ctx
-            .deps
-            .presign
-            .put_url(&self.host, &key, wall, ctx.cfg.max_pack_bytes)
-            .await?;
-        // The signed url is the task's write permission: sent in clear only if the operator
-        // said the store does not serve TLS yet.
-        if !ctx.cfg.allow_plain_http_put && !pack.expose().starts_with("https://") {
-            return Err(Settled::Infra("the pack url is not https".to_owned()));
-        }
-        let grant = ctx.deps.inputs.read_grant(lease, action, wall).await?;
-        // The bearer token goes into the arguments: not over a scheme that sends it in clear,
-        // unless the operator said the job network is trusted for it.
-        if !ctx.cfg.allow_plain_http_grant && !grant.url.starts_with("https://") {
-            return Err(Settled::Infra(
-                "the read grant is not served over https".to_owned(),
-            ));
-        }
-        let args = TaskArgs {
-            action,
-            lease,
-            grant_url: &grant.url,
-            grant_token: &grant.token,
-            pack_url: &pack,
-            deadline: timeout,
-            work_dir: ctx.cfg.work_dir.as_deref(),
-            allow_plain_http_put: ctx.cfg.allow_plain_http_put,
-            allow_plain_http_grant: ctx.cfg.allow_plain_http_grant,
-            locate: ctx.cfg.locate,
-        };
-        let limits = RunLimits {
-            cpu_millis: w.millicpus.max(1),
-            memory_bytes: Config::hard_memory(w.memory_bytes),
-            pids: None,
-            wall_ms: Some(u64::try_from(wall.as_millis()).unwrap_or(u64::MAX)),
-            disk_bytes: Some(ctx.cfg.disk_bytes(grant.input_bytes)),
-        };
-        if grant.input_bytes.is_none() {
-            tracing::warn!(
-                worker = %self.id,
-                %lease,
-                "the size of the inputs is not known; the run books the allowance and the margin only"
-            );
-        }
-        let mut spec = RunSpec::new(image, limits);
-        spec.args = args.argv(ctx.cfg.delivery);
-        spec.files = args.files(ctx.cfg.delivery);
-        // The labels are listed back with every run and are not secret-safe: the nonce only.
-        spec.labels = BTreeMap::from([(RUN_LABEL.to_owned(), nonce.to_string())]);
-        Ok(Prepared {
-            spec,
-            key,
-            nonce,
-            wall,
-        })
-    }
-
-    /// The post's answer was lost: the run may be queued. Found by its label, it is the
-    /// run; not found, the worker cannot know, and is taken down with its lease.
-    async fn recover(
-        &self,
-        ctx: &Ctx<'_>,
-        label: &str,
-        running: impl FnOnce(RunId) -> Running,
-    ) -> Queued {
-        let found = ctx.api().runs(self.lease).await.ok().and_then(|runs| {
-            runs.into_iter()
-                .find(|run| run.labels.get(RUN_LABEL).is_some_and(|v| v == label))
-        });
-        match found {
-            Some(run) => Queued::Posted(running(run.run_id)),
-            None => Queued::Retire(Retire::Ambiguous),
+                Some(refusal) => {
+                    if refusal.twin {
+                        ctx.twin.flag(twin_message(&ctx.cfg.frontend));
+                    }
+                    Submitted::Settled(refusal.settled)
+                }
+            },
         }
     }
 
-    /// The lease server refused the run: nothing was queued.
-    fn refused(&mut self, ctx: &Ctx<'_>, e: &Error, prepared: Arc<Prepared>) -> Queued {
-        match e.api().map(|api| &api.code) {
-            None | Some(ErrorCode::NoCapacity | ErrorCode::NotReady) => Queued::Wait(prepared),
-            Some(ErrorCode::HostTainted) => {
-                self.begin_drain(ctx, Drain::Tainted);
-                Queued::Settled(Settled::Infra("the host is tainted".to_owned()))
-            }
-            // The host said it could mount files and now cannot (its files root is gone): it
-            // is held out like a host with a sick quota, so that it is not leased again at
-            // once, and the farm runs the action again elsewhere.
-            Some(ErrorCode::FilesUnsupported) => {
-                self.hold_out(ctx, ctx.clock.now());
-                Queued::Settled(Settled::Infra(
-                    "the host cannot deliver the files of a run".to_owned(),
-                ))
-            }
-            // A file the lease server refuses is ours to fix, and no host takes it: the
-            // message repeats nothing of the file.
-            Some(ErrorCode::InvalidFile) => Queued::Settled(Settled::Invalid(
-                "the lease server refused a file of the run".to_owned(),
-            )),
-            Some(ErrorCode::QuotaUnavailable) => {
-                self.hold_out(ctx, ctx.clock.now());
-                Queued::Settled(Settled::Lost(Lost::Fenced))
-            }
-            Some(ErrorCode::HostLost | ErrorCode::HostNotRegistered) => {
-                Queued::Retire(Retire::Lost)
-            }
-            Some(ErrorCode::NotHeld | ErrorCode::UnknownLease | ErrorCode::Expired) => {
-                Queued::Retire(Retire::Gone)
-            }
-            // Every host holds the pool's shape, so a run over it fits no host and rerunning
-            // the action never helps: the action's limits are the caller's to fix.
-            Some(ErrorCode::LimitsExceedShape) => {
-                let limits = &prepared.spec.limits;
-                let disk = limits
-                    .disk_bytes
-                    .map_or_else(|| "none".to_owned(), |bytes| format!("{bytes} bytes"));
-                Queued::Settled(Settled::Invalid(format!(
-                    "the run's limits (cpu {} millis, memory {} bytes, disk {disk}) exceed the \
-                     pool's shape (cpu {} millis, memory {} bytes), which every host shares",
-                    limits.cpu_millis,
-                    limits.memory_bytes,
-                    ctx.cfg.cpu_millis,
-                    ctx.cfg.memory_bytes,
-                )))
-            }
-            Some(other) => Queued::Settled(Settled::Infra(format!(
-                "the lease server refused the run: {other}"
-            ))),
-        }
-    }
-
-    /// Reads the host's runs and acts on each running task: stop the ones the farm cancelled,
-    /// and take the verdict on those that ended.
-    pub(super) async fn poll(&mut self, ctx: &Ctx<'_>, now: Instant) -> ControlFlow<Retire> {
-        let listed = ctx.api().runs(self.lease).await;
-        self.heard(now, &listed);
-        let runs = match listed {
-            Ok(runs) => runs,
-            Err(e) if crate::executor::lease_gone(&e) => return ControlFlow::Break(Retire::Gone),
-            Err(e) => {
-                tracing::warn!(worker = %self.id, error = %e, "reading the runs failed");
-                return ControlFlow::Continue(());
-            }
-        };
-        let running: Vec<_> = self
+    /// Reads the job of each running task and moves on the ones that ended, and cancels the
+    /// jobs of the tasks being withdrawn. Each call is bounded, and the reads stop once the
+    /// pass budget is spent from the first of them, so a service that never answers holds the
+    /// pass for a budget and a call, not a call per job; the next pass begins after the last
+    /// task read, so every task is read in turn.
+    pub(super) async fn poll(&mut self, ctx: &Ctx<'_>, now: Instant) {
+        let mut jobs: Vec<(LeaseId, String, bool)> = self
             .tasks
             .iter()
             .filter_map(|(lease, task)| match &task.stage {
-                Stage::Running(r) => Some((
-                    *lease,
-                    r.run.clone(),
-                    r.cancelled,
-                    r.truncated,
-                    r.key.clone(),
-                )),
+                Stage::Running(r) => Some((*lease, r.job.clone(), true)),
+                Stage::Withdrawing(job) => Some((*lease, job.clone(), false)),
                 _ => None,
             })
             .collect();
-        for (lease, run_id, cancelled, truncated, key) in running {
-            match cancelled {
-                true => self.stop(ctx, lease, &run_id).await,
-                false => {
-                    let seen = runs.iter().find(|run| run.run_id == run_id).cloned();
-                    let run = seen.unwrap_or_else(|| absent(run_id));
-                    self.take_verdict(ctx, now, lease, &run, truncated, key);
-                }
+        let after = self.read_after;
+        jobs.sort_by_key(|(lease, _, _)| (after.is_some_and(|last| *lease <= last), *lease));
+        let began = ctx.now();
+        for (lease, job, running) in jobs {
+            if ctx.now().saturating_duration_since(began) >= ctx.cfg.pass_budget {
+                break;
+            }
+            self.read_after = Some(lease);
+            match running {
+                true => self.read(ctx, now, lease, &job).await,
+                false => self.withdraw(ctx, lease, &job).await,
             }
         }
-        ControlFlow::Continue(())
     }
 
-    /// Asks the lease server to stop a run the farm cancelled, and forgets it once the server
-    /// has answered: a server that knows no such run has nothing to stop.
-    async fn stop(&mut self, ctx: &Ctx<'_>, lease: kbf_types::LeaseId, run: &RunId) {
-        let stopped = ctx.api().stop_run(self.lease, run).await;
-        note("stopping a run", &stopped);
-        let answered = stopped.as_ref().err().is_none_or(|e| e.api().is_some());
-        answered
-            .then_some(lease)
-            .iter()
-            .for_each(|l| self.drop_task(*l));
+    /// Cancels the job of a task nothing is owed for, and forgets the task once the service
+    /// has answered: an ended job and one the service does not know are answers too.
+    async fn withdraw(&mut self, ctx: &Ctx<'_>, lease: LeaseId, job: &str) {
+        let answer = ctx.api().cancel_job(job).await;
+        self.heard(ctx, &answer);
+        note("cancelling a job", &answer);
+        if answer.is_ok() {
+            ctx.deps.metrics.job_cancelled();
+        }
+        if answered(&answer) {
+            self.drop_task(lease);
+        }
     }
 
-    /// Moves a running task on if its run ended.
-    fn take_verdict(
-        &mut self,
-        ctx: &Ctx<'_>,
-        now: Instant,
-        lease: kbf_types::LeaseId,
-        run: &Run,
-        truncated: bool,
-        key: PackKey,
-    ) {
-        if run.state == RunState::Running {
-            self.stamp(lease, Mark::Running, now, ctx);
+    /// Reads one running task's job, and its result once it has ended.
+    async fn read(&mut self, ctx: &Ctx<'_>, now: Instant, lease: LeaseId, id: &str) {
+        let answer = ctx.api().get_job(id).await;
+        self.heard(ctx, &answer);
+        let job = match answer {
+            Ok(job) => job,
+            Err(error) if not_found(&error) => {
+                tracing::warn!(worker = %self.id, %lease, job = %id, "the job service no longer knows the job");
+                self.settle_with(lease, &forgotten(), now, &ctx.deps.metrics);
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(worker = %self.id, %lease, %error, "reading the job failed");
+                return;
+            }
+        };
+        if job.host_silent_since_ms.is_some() {
+            self.saw_silence(ctx, lease, &job.host_id);
         }
-        let exited = matches!(run.state, RunState::Exited | RunState::Ended);
-        if exited {
-            self.stamp(lease, Mark::Ended, now, ctx);
-        }
-        let ended = exited || run.state == RunState::NeverStarted;
-        if !ended {
+        let live = match job.state() {
+            JobState::Queued | JobState::Placed | JobState::Starting => true,
+            JobState::Running => {
+                self.stamp(lease, Mark::Running, now, ctx);
+                true
+            }
+            // A state this server does not know may be live or ended: the result says which.
+            _ => false,
+        };
+        if live {
             return;
         }
-        if refused_for_quota(run) || refused_for_files(run) {
-            self.hold_out(ctx, now);
-        }
-        match judge(run, truncated) {
-            Verdict::Settled(settled) => {
-                self.settle_with(lease, &settled, now, &ctx.deps.metrics);
+        let result = ctx.api().get_result(id).await;
+        self.heard(ctx, &result);
+        let result = match result {
+            Ok(result) => result,
+            Err(error) if not_found(&error) => {
+                self.settle_with(lease, &forgotten(), now, &ctx.deps.metrics);
+                return;
             }
-            Verdict::Ingest => {
-                let action = self.tasks[&lease].action.clone();
-                let ingest = std::sync::Arc::clone(&ctx.deps.ingest);
-                let limits = UntrustedLimits {
-                    max_pack_bytes: ctx.cfg.max_pack_bytes,
-                    max_blob_bytes: ctx.cfg.max_blob_bytes,
-                };
-                let handle =
-                    tokio::spawn(async move { ingest.ingest(lease, &key, &action, &limits).await });
-                self.set_stage(lease, Stage::Ingesting(handle));
+            Err(error) => {
+                tracing::warn!(worker = %self.id, %lease, %error, "reading the result of a job failed");
+                return;
             }
+        };
+        self.stamp(lease, Mark::Ended, now, ctx);
+        match judge(&job, &result) {
+            Verdict::Settled(settled) => self.settle_with(lease, &settled, now, &ctx.deps.metrics),
+            Verdict::Ingest => self.ingest(ctx, lease),
         }
+    }
+
+    /// Logs and counts, once a task, that the host holding its job has missed its grace.
+    /// The service ends the job as lost if the host does not come back; nothing changes here.
+    fn saw_silence(&mut self, ctx: &Ctx<'_>, lease: LeaseId, host: &str) {
+        let Some(Stage::Running(running)) = self.tasks.get_mut(&lease).map(|t| &mut t.stage) else {
+            return;
+        };
+        if !std::mem::replace(&mut running.silence_seen, true) {
+            tracing::warn!(worker = %self.id, %lease, %host, "the host of a job has missed its grace");
+            ctx.deps.metrics.host_silence();
+        }
+    }
+
+    /// Starts the frontend's read of the pack of a job that ended well.
+    fn ingest(&mut self, ctx: &Ctx<'_>, lease: LeaseId) {
+        let Some(task) = self.tasks.get_mut(&lease) else {
+            return;
+        };
+        let Stage::Running(running) = &task.stage else {
+            return;
+        };
+        let (action, key) = (task.action.clone(), running.key.clone());
+        let ingest = Arc::clone(&ctx.deps.ingest);
+        let limits = UntrustedLimits {
+            max_pack_bytes: ctx.cfg.max_pack_bytes,
+            max_blob_bytes: ctx.cfg.max_blob_bytes,
+        };
+        let handle =
+            tokio::spawn(async move { ingest.ingest(lease, &key, &action, &limits).await });
+        task.stage = Stage::Ingesting(handle);
     }
 
     /// Moves ingested tasks to their result, and sends or resends the results the farm has
@@ -623,36 +503,17 @@ impl HostWorker {
         acked.into_iter().for_each(|lease| self.drop_task(lease));
     }
 
-    /// Asks the lease server to stop every run the worker has, as far as it can be reached.
-    pub(super) async fn stop_all(&self, ctx: &Ctx<'_>) {
-        let runs: Vec<RunId> = self
-            .tasks
-            .values()
-            .filter_map(|task| match &task.stage {
-                Stage::Running(r) => Some(r.run.clone()),
-                _ => None,
-            })
-            .collect();
-        for run in runs {
-            note(
-                "stopping a run",
-                &ctx.api().stop_run(self.lease, &run).await,
-            );
-        }
-    }
-
-    /// Tells the farm that every run of a lease the lease server no longer has is lost, so it
-    /// runs them again at once. A result already formed is sent as it is.
-    pub(super) async fn report_lost(&self, ctx: &Ctx<'_>) {
-        for (lease, task) in &self.tasks {
-            let result = match &task.stage {
-                Stage::Reporting(report) => report.result.clone(),
-                _ => {
-                    ctx.deps.metrics.run_ended(RunEnd::Lost);
-                    result_of(*lease, &task.action, &Settled::Lost(Lost::DaemonRestarted))
-                }
-            };
-            ctx.deps.farm.report(&self.id, result).await;
+    /// Cancels every job the worker may have, once each, as far as the service can be
+    /// reached: a cancel that is not answered is not sent again, and its job runs to its
+    /// wall limit.
+    pub(super) async fn cancel_all(&self, ctx: &Ctx<'_>) {
+        let jobs: Vec<String> = self.tasks.values().filter_map(Task::job).collect();
+        for job in jobs {
+            let answer = ctx.api().cancel_job(&job).await;
+            note("cancelling a job", &answer);
+            if answer.is_ok() {
+                ctx.deps.metrics.job_cancelled();
+            }
         }
     }
 }
@@ -662,7 +523,7 @@ impl Reporting {
     /// in flight and the last send was long enough ago. True once the farm acknowledged.
     fn drive(
         &mut self,
-        farm: &std::sync::Arc<crate::Farm>,
+        farm: &Arc<crate::Farm>,
         worker: &kbf_types::WorkerId,
         now: Instant,
         resend: Duration,
@@ -678,27 +539,12 @@ impl Reporting {
             .all(|b| b);
         if due {
             self.retry_at = now + resend;
-            let (farm, worker, result) = (
-                std::sync::Arc::clone(farm),
-                worker.clone(),
-                self.result.clone(),
-            );
+            let (farm, worker, result) = (Arc::clone(farm), worker.clone(), self.result.clone());
             self.in_flight = Some(tokio::spawn(
                 async move { farm.report(&worker, result).await },
             ));
         }
         acked
-    }
-}
-
-fn absent(run: RunId) -> Run {
-    Run {
-        run_id: run,
-        state: RunState::NeverStarted,
-        outcome: None,
-        exit_code: None,
-        detail: None,
-        labels: BTreeMap::new(),
     }
 }
 
@@ -711,7 +557,7 @@ fn reporting(result: kbf_proto::worker::Result, now: Instant) -> Stage {
 }
 
 fn ingested(
-    lease: kbf_types::LeaseId,
+    lease: LeaseId,
     action: &Digest,
     done: Result<Ingested, tokio::task::JoinError>,
 ) -> (kbf_proto::worker::Result, IngestEnd) {
