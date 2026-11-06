@@ -171,8 +171,18 @@ static CLAIMED: std::sync::Mutex<Vec<std::fs::File>> = std::sync::Mutex::new(Vec
 /// apart (their port sets overlap) probe the same free ports and then one child finds its port
 /// taken and exits. Each port is therefore also claimed
 /// by an exclusive lock on a file named for it, held until this process exits. The bases stay
-/// below the ephemeral range, so no outgoing connection takes one of them either.
+/// below the ephemeral range, so no outgoing connection takes one of them either. A process
+/// that uses none of these claims can still bind a port before the child does: a server in
+/// this process takes [`held_base`] instead.
 pub fn free_base() -> u16 {
+    held_base().0
+}
+
+/// [`free_base`], with every port of it still bound: the base, and a listener on each of its
+/// ports ([`OFFSETS`], in that order). A server in this process serves on these very sockets
+/// (`kbf_server::bind_server_holding`), so no process can take one of the ports between the
+/// pick and the serve, whatever it claims or binds.
+pub fn held_base() -> (u16, Vec<TcpListener>) {
     const FIRST: u16 = 20_000;
     const SPAN: u16 = 12_000;
     let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("proxy-ports");
@@ -202,7 +212,7 @@ pub fn free_base() -> u16 {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .extend(claims);
-            return base;
+            return (base, bound);
         }
         base += 20;
         if base + 13 >= FIRST + SPAN {

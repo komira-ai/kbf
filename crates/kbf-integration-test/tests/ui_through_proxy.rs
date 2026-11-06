@@ -2,9 +2,11 @@
 //! real sockets and real TLS, and nothing but the proxy's one public port to talk to
 //! (`docs/design/kbf-ui-v1.md`: open, read-only, on by default, and opening nothing else).
 //!
-//! The server is the production one (`bind_server_with_ui`, its operator API, REAPI and
-//! worker listeners on the ports of the proxy's member, and `Behind` the proxy's secret file, so a
-//! request's client address is believed only when the proxy forwarded it). The proxy runs
+//! The server is the production one (`bind_server_holding`, its operator API, REAPI and
+//! worker listeners on the ports of the proxy's member, served on the sockets this test bound
+//! when it picked those ports, so no other process can take one first, and `Behind` the
+//! proxy's secret file, so a request's client address is believed only when the proxy
+//! forwarded it). The proxy runs
 //! `buck2_auth = "bearer"` so that REAPI has a credential to refuse. The browser is a bare
 //! TLS client with no certificate; the operator and the Buck2 client use their bearer
 //! tokens.
@@ -44,9 +46,9 @@ use kbf_proto::reapi::content_addressable_storage_client::ContentAddressableStor
 use kbf_proxy::control::NoUpdates;
 use kbf_proxy::{Proxy, ProxyHandle};
 use kbf_server::proxy_auth::ProxySecret;
-use kbf_server::{Api, Behind, Listeners, bind_server_with_ui};
+use kbf_server::{Api, Behind, Held, Listeners, bind_server_holding};
 use kbf_testkit::dir::TestDir;
-use proxy_support::{OPERATOR_TOKEN, connect, digest_of, free_base, grpc_request};
+use proxy_support::{OPERATOR_TOKEN, connect, digest_of, grpc_request, held_base};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpSocket, TcpStream};
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint};
@@ -90,7 +92,10 @@ impl Rig {
             env!("CARGO_TARGET_TMPDIR"),
             &format!("ui-through-proxy-{name}"),
         );
-        let base = free_base();
+        // The server's three ports stay bound from the pick until it serves on them: the
+        // first member's REAPI, worker and operator ports (the base plus 0 to 2).
+        let (base, mut held) = held_base();
+        held.truncate(3);
         let pki = kbf_integration_test::pki::write(&dir.path().join("pki"), "ui-test")
             .expect("certificates");
         private(
@@ -160,7 +165,8 @@ impl Rig {
             local_cache: None,
         };
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-        let bound = bind_server_with_ui(
+        let bound = bind_server_holding(
+            Held::new(held).expect("the held ports"),
             Arc::clone(&cache),
             listeners,
             Some(api),

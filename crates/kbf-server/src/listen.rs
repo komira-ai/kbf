@@ -1,6 +1,7 @@
 //! The frontend's listening sockets, bound here, and the latch that closes one.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -94,6 +95,28 @@ pub(crate) const BIND_BUDGET: Duration = Duration::from_secs(90);
 const BIND_WAIT_FIRST: Duration = Duration::from_millis(250);
 const BIND_WAIT_MAX: Duration = Duration::from_secs(2);
 
+/// Listening sockets a caller bound before the server starts, which the server serves on
+/// instead of binding their addresses again ([`crate::bind_server_holding`]). A caller that
+/// chose a port holds it from then on, so no other process can take it between the choice
+/// and the serve. A bind of an address none of them is on binds as usual; a held socket no
+/// bind asks for is closed when the binds are done.
+#[derive(Debug, Default)]
+pub struct Held(BTreeMap<SocketAddr, std::net::TcpListener>);
+
+impl Held {
+    /// `listeners`, each served for a bind of the address it is bound to.
+    ///
+    /// # Errors
+    /// The address a listener is bound to cannot be read.
+    pub fn new(listeners: Vec<std::net::TcpListener>) -> io::Result<Self> {
+        let mut held = BTreeMap::new();
+        for listener in listeners {
+            held.insert(listener.local_addr()?, listener);
+        }
+        Ok(Self(held))
+    }
+}
+
 /// Binds the listeners of one process start, and holds the one retry budget they share.
 ///
 /// A bind whose address is not on this host yet (`AddrNotAvailable`) is retried, every
@@ -102,8 +125,10 @@ const BIND_WAIT_MAX: Duration = Duration::from_secs(2);
 /// interface wait for it together, not one after the other (three sequential waits of
 /// the whole budget would outlast the unit's start timeout). Each mode makes one
 /// `Binder` when it starts and passes it to every bind. Blocks the thread while it
-/// waits: it runs at start-up, before serving.
+/// waits: it runs at start-up, before serving. A bind of an address a [`Held`] socket is on
+/// takes that socket ([`Binder::holding`]) and neither binds nor waits.
 pub(crate) struct Binder {
+    held: RefCell<Held>,
     left: Cell<Duration>,
     attempt: Box<dyn Fn(SocketAddr) -> io::Result<std::net::TcpListener>>,
     sleep: Box<dyn Fn(Duration)>,
@@ -115,9 +140,18 @@ impl Binder {
         Self::within(BIND_BUDGET)
     }
 
+    /// [`Binder::new`], taking the socket of `held` on an address instead of binding it.
+    pub fn holding(held: Held) -> Self {
+        Self {
+            held: RefCell::new(held),
+            ..Self::new()
+        }
+    }
+
     /// A binder that really binds, with `budget` instead of [`BIND_BUDGET`].
     fn within(budget: Duration) -> Self {
         Self {
+            held: RefCell::default(),
             left: Cell::new(budget),
             attempt: Box::new(std::net::TcpListener::bind),
             sleep: Box::new(std::thread::sleep),
@@ -133,6 +167,7 @@ impl Binder {
         sleep: Box<dyn Fn(Duration)>,
     ) -> Self {
         Self {
+            held: RefCell::default(),
             left: Cell::new(budget),
             attempt,
             sleep,
@@ -141,6 +176,9 @@ impl Binder {
 
     /// A std listener on `addr`, retried for as much of the budget as is left.
     pub fn bind(&self, addr: SocketAddr) -> io::Result<std::net::TcpListener> {
+        if let Some(held) = self.held.borrow_mut().0.remove(&addr) {
+            return Ok(held);
+        }
         let before = self.left.get();
         let mut left = before;
         let mut retries = 0_u32;

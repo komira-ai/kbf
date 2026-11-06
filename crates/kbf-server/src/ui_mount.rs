@@ -58,9 +58,10 @@ use tower_service::Service;
 use crate::history::HistoryReads;
 use crate::http_blobs::{BlobReaders, ReadBudget};
 use crate::http_invocations::InvocationReaders;
+use crate::listen::{Binder, Held};
 use crate::proxy_auth::Trust;
 use crate::read_limit::{PER_CALLER, ReadLimit, limited};
-use crate::serve::{Api, Behind, Bound, Listeners, ServeError, bind_server_with_ui};
+use crate::serve::{Api, Behind, Bound, Listeners, ServeError, bind_server_through};
 use crate::state_store::StateStore;
 
 /// [`bind_server_with_policy`](crate::bind_server_with_policy) with all of its options: the
@@ -94,6 +95,98 @@ where
 {
     bind_server_with_ui(
         cache, listeners, api, policy, state, storage, map, proxy, true, shutdown,
+    )
+}
+
+/// [`bind_server_with_policy`](crate::bind_server_with_policy) with all of its options: the
+/// scheduler's state in `state` ([`crate::bind_server_with_state`]), the client's CAS,
+/// ByteStream and action-cache calls proxied to a `storage` node
+/// ([`crate::bind_server_with_storage`]), and the storage map `map` sent to daemons
+/// ([`crate::bind_server_with_map`]), and a TLS-terminating `proxy` in front of every
+/// listener (`--proxy-auth-file`, [`crate::proxy_auth`]; `None`: the server is reached
+/// directly), and the web UI under `/ui` on the operator API (this module) when `ui` is
+/// given and the operator API listens ([`bind_server_with_options`] is this with the UI on).
+///
+/// # Errors
+/// As [`crate::bind_server_with_state`].
+#[expect(
+    clippy::too_many_arguments,
+    reason = "every option the bind functions delegate"
+)]
+pub fn bind_server_with_ui<M, O>(
+    cache: Arc<Cache<M, O>>,
+    listeners: Listeners,
+    api: Option<Api>,
+    policy: Policy,
+    state: Option<StateStore>,
+    storage: Option<tonic::transport::Endpoint>,
+    map: Option<Arc<dyn MapSource>>,
+    proxy: Option<Behind>,
+    ui: bool,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<Bound<impl Future<Output = Result<(), ServeError>>>, ServeError>
+where
+    M: MetaLog,
+    O: ObjectStore + 'static,
+{
+    bind_server_holding(
+        Held::default(),
+        cache,
+        listeners,
+        api,
+        policy,
+        state,
+        storage,
+        map,
+        proxy,
+        ui,
+        shutdown,
+    )
+}
+
+/// [`bind_server_with_ui`], serving on the sockets of `held` instead of binding their
+/// addresses: a listener (`listeners.reapi`, `listeners.worker`, the operator API's
+/// `api.listen`) whose address one of them is bound to is served on it, and the others
+/// are bound as usual. A caller that picks the ports holds them from the pick to the serve,
+/// so no other process can take one in between; a held socket on no listener's address is
+/// closed before this returns.
+///
+/// # Errors
+/// As [`bind_server_with_ui`].
+#[expect(
+    clippy::too_many_arguments,
+    reason = "every option the bind functions delegate, and the sockets held"
+)]
+pub fn bind_server_holding<M, O>(
+    held: Held,
+    cache: Arc<Cache<M, O>>,
+    listeners: Listeners,
+    api: Option<Api>,
+    policy: Policy,
+    state: Option<StateStore>,
+    storage: Option<tonic::transport::Endpoint>,
+    map: Option<Arc<dyn MapSource>>,
+    proxy: Option<Behind>,
+    ui: bool,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<Bound<impl Future<Output = Result<(), ServeError>>>, ServeError>
+where
+    M: MetaLog,
+    O: ObjectStore + 'static,
+{
+    // One start, one bind budget: the three listeners wait for a late interface together.
+    bind_server_through(
+        Binder::holding(held),
+        cache,
+        listeners,
+        api,
+        policy,
+        state,
+        storage,
+        map,
+        proxy,
+        ui,
+        shutdown,
     )
 }
 
