@@ -85,6 +85,14 @@ kbf-proxy.workspace = true
 kbf-sched.workspace = true
 kbf-server.workspace = true
 kbf-threads.workspace = true
+# `tests/js_real_service.rs`: kbf-job-client against the pinned js-lease-server and against
+# its fake, the messages' descriptor set for the field sets, and test archives of the
+# release's shape.
+flate2.workspace = true
+js-proto.workspace = true
+kbf-job-client = { workspace = true, features = ["fake"] }
+prost-types.workspace = true
+tar.workspace = true
 # SIGPIPE ignored by the fake `kbf-server` of tests/cross_version.rs, which runs before
 # the Rust runtime has (a write to a socket the peer closed would end the process).
 libc.workspace = true

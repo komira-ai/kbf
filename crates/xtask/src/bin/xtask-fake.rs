@@ -47,7 +47,8 @@
 //! - Run as `gh attestation verify <file> <flags>`, it appends its arguments as one line
 //!   to `gh-args` next to it, and verifies the file when `attested` next to it holds
 //!   the line `<SHA-256 of the file> <flags>`: the store of attestations, each the file
-//!   it covers and the exact flags it verifies under.
+//!   it covers and the exact flags it verifies under. A file it verifies is answered on stdout
+//!   with the file `gh-stdout` next to it, when there is one (what `--format json` prints).
 //! - Run as `gh attestation verify <file> --bundle <bundle> [--custom-trusted-root
 //!   <root>] <flags>`, it verifies the file when the JSON object in `<bundle>` lists, in
 //!   `fakeAttestations`, the line `<SHA-256 of the file> <flags>` (the flags without the
@@ -380,6 +381,9 @@ fn gh(argv0: &str, args: &[String]) -> ExitCode {
             .is_some_and(|(sha, f)| ((sha == sha256) | !by_bytes) & (f == flags))
     });
     if attested | defect("accepts-all") {
+        if let Ok(said) = std::fs::read(dir.join("gh-stdout")) {
+            std::io::stdout().write_all(&said).expect("stdout");
+        }
         return ExitCode::SUCCESS;
     }
     eprintln!("xtask-fake: no attestation of {file} verifies with {flags}");

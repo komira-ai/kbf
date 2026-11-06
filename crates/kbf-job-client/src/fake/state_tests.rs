@@ -609,3 +609,67 @@ fn every_step_is_allowed_from_exactly_its_states() {
     assert!(!s.lose("missing"));
     assert!(!s.host_stopped("missing"));
 }
+
+/// Asserts the network level the released service records: a job submitted without one is
+/// answered, read and handed to its host with `none`; a repeat that names `none` is the same
+/// job, and one that names `open` is `job-id-conflict`; a level given is kept; and a value the
+/// enum does not have is kept as sent, not read as unspecified. Catches a fake that echoes an
+/// unspecified level the service would answer as `none` (the real-service comparison in
+/// kbf-integration-test's tests/js_real_service.rs), and one that takes `none` and unspecified
+/// for two jobs.
+#[test]
+fn an_unspecified_network_level_is_recorded_as_none() {
+    let mut state = state();
+    let job = state.submit(spec("quiet")).unwrap();
+    let none = i32::from(NetworkLevel::None);
+    assert_eq!(job.spec.unwrap().network, none);
+    assert_eq!(state.get("quiet").unwrap().spec.unwrap().network, none);
+    assert_eq!(state.submitted("quiet").unwrap().network, none);
+
+    let mut named = spec("quiet");
+    named.set_network(NetworkLevel::None);
+    assert_eq!(state.submit(named).unwrap(), state.get("quiet").unwrap());
+    let mut open = spec("quiet");
+    open.set_network(NetworkLevel::Open);
+    assert_eq!(
+        refusal(state.submit(open)),
+        Some(RefusalCode::JobIdConflict)
+    );
+
+    let mut open = spec("open");
+    open.set_network(NetworkLevel::Open);
+    let job = state.submit(open).unwrap();
+    assert_eq!(job.spec.unwrap().network(), NetworkLevel::Open);
+    let mut unknown = spec("unknown");
+    unknown.network = 99;
+    let job = state.submit(unknown).unwrap();
+    assert_eq!(job.spec.unwrap().network, 99);
+}
+
+/// Asserts the cancel intent on each way a cancel ends a job: a queued job cancelled keeps it,
+/// on the answer and on every later read, as the released service answers; a job cancelled on
+/// its host loses it once the host reports it stopped. Catches a fake that clears the intent
+/// of a queued job the service keeps (the real-service comparison), and one that keeps it on a
+/// job its host stopped.
+#[test]
+fn a_cancelled_queued_job_keeps_the_intent() {
+    let mut state = state();
+    state.submit(spec("queued")).unwrap();
+    let cancelled = state.cancel("queued").unwrap();
+    assert_eq!(
+        (cancelled.state(), cancelled.cancel_requested),
+        (JobState::Cancelled, true)
+    );
+    assert_eq!(state.cancel("queued").unwrap(), cancelled);
+    assert_eq!(state.get("queued").unwrap(), cancelled);
+
+    state.submit(spec("placed")).unwrap();
+    assert!(state.place("placed", "h"));
+    assert!(state.cancel("placed").unwrap().cancel_requested);
+    assert!(state.host_stopped("placed"));
+    let stopped = state.get("placed").unwrap();
+    assert_eq!(
+        (stopped.state(), stopped.cancel_requested),
+        (JobState::Cancelled, false)
+    );
+}

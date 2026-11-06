@@ -67,9 +67,11 @@ async fn host_silence_shows_on_get_job_and_changes_no_state() {
     assert!(!server.unsilence_host("host-z"));
 }
 
-/// Asserts each branch of the design's cancel: a queued job is cancelled at once; a running
-/// job answers with `cancel_requested` set and stays running until its host reports it
-/// stopped, then is cancelled; a placed and a starting job wait the same way; an ended job is
+/// Asserts each branch of the design's cancel: a queued job is cancelled at once and keeps
+/// `cancel_requested`, as the released service answers it (kbf-integration-test's
+/// tests/js_real_service.rs holds the fake to that service); a running job answers with
+/// `cancel_requested` set and stays running until its host reports it stopped, then is
+/// cancelled; a placed and a starting job wait the same way; an ended job is
 /// unchanged; cancelling twice answers as once; an unknown id is `NOT_FOUND`. Catches a
 /// cancel that ends a running job before its host stops it, one that changes an ended job,
 /// and a second cancel that is refused.
@@ -83,8 +85,8 @@ async fn cancel_follows_the_states_of_the_design() {
     let cancelled = client.cancel_job("queued").await.unwrap();
     assert_eq!(cancelled.state(), JobState::Cancelled);
     assert!(
-        !cancelled.cancel_requested,
-        "an ended job has no pending cancel"
+        cancelled.cancel_requested,
+        "a queued job cancelled keeps the intent, as the service answers"
     );
     assert!(cancelled.times.unwrap().ended_at_ms.is_some());
     assert_eq!(

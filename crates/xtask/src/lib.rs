@@ -44,6 +44,8 @@
 //!   <program> --repo <owner/repo> --signer-workflow <path> --source-ref <ref> --source-digest <sha>`
 //!   ([`fetch_attested`]): a pinned release archive, refused unless its SHA-256 matches and `gh attestation
 //!   verify` accepts the file, and only then the member is taken out of that file.
+//! - `fetch-pinned-js` ([`js_pin`]): the same, for a program of the jobscheduler release that
+//!   `kbf-js-version.toml` pins, every value taken from that file.
 //! - `package --binary <path> --sbom <path> --platform <platform> --commit <sha> --out
 //!   <dir>` ([`package`]): one binary as a release asset, a tarball that is the same
 //!   bytes on every runner, and its SBOM, with their lines in `SHA256SUMS.<platform>`.
@@ -152,6 +154,7 @@ pub mod entitlements;
 pub mod fetch;
 pub mod fetch_attested;
 pub mod installer_tarball;
+pub mod js_pin;
 pub mod merge_profiles;
 pub mod package;
 pub mod pipeline_rerun;
@@ -323,6 +326,8 @@ enum Verb {
         #[arg(long)]
         source_digest: String,
     },
+    /// Fetch a program of the pinned jobscheduler release (`kbf-js-version.toml`), checked.
+    FetchPinnedJs(js_pin::Args),
     /// Package one binary and its SBOM as release assets in `--out`.
     Package {
         /// The binary; its file name is the asset's name.
@@ -1186,6 +1191,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             &gh,
         )
         .map(|line| vec![line]),
+        Verb::FetchPinnedJs(args) => js_pin::fetch_pinned_js(&args).map(|line| vec![line]),
         Verb::Package {
             binary,
             sbom,

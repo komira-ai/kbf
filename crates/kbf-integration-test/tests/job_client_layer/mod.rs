@@ -2,7 +2,9 @@
 //! over the jobscheduler's `js-proto`, and no farm crate uses it yet. The design makes kbf a
 //! client of the job service that links none of the scheduler's server crates; this is where
 //! that starts. The one crate that uses it is the operator's deploy tool, `kbf-deploy`, whose
-//! `job-service check` calls the service with the client the executor will use.
+//! `job-service check` calls the service with the client the executor will use. The
+//! integration tests use it too, as a dev-dependency only: `tests/js_real_service.rs` drives
+//! it against the real service.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::process::Command;
@@ -17,6 +19,10 @@ const CLIENT: &str = "kbf-job-client";
 /// The crates that may depend on the client (with its fake as a dev-dependency too): the
 /// deploy tool, whose `job-service check` is no farm code.
 const USERS: [&str; 1] = ["kbf-deploy"];
+
+/// The crates whose tests alone may depend on the client, as a dev-dependency only: the
+/// real-service tests of kbf-integration-test.
+const TESTS: [&str; 1] = ["kbf-integration-test"];
 
 /// The `js-*` crates the client may reach: the generated messages and service. What
 /// `js-proto` needs is not a `js-*` crate.
@@ -55,7 +61,8 @@ fn violations(g: &Graph, root_id: &str) -> Vec<String> {
 
 /// Each dependency on the client among `packages` (of `cargo metadata --no-deps`), as
 /// `<package> (<kind>)`, except the client's own dev-dependency on itself, which its tests
-/// use for the fake, and the dependencies of the [`USERS`].
+/// use for the fake, the dependencies of the [`USERS`], and the dev-dependencies of the
+/// [`TESTS`].
 fn dependents(packages: &[Value]) -> Vec<String> {
     let mut found = Vec::new();
     for package in packages {
@@ -66,7 +73,8 @@ fn dependents(packages: &[Value]) -> Vec<String> {
             }
             let kind = dep["kind"].as_str().unwrap_or("normal");
             let own_fake = name == CLIENT && kind == "dev";
-            if !own_fake && !USERS.contains(&name) {
+            let test_only = TESTS.contains(&name) && kind == "dev";
+            if !own_fake && !test_only && !USERS.contains(&name) {
                 found.push(format!("{name} ({kind})"));
             }
         }
@@ -75,8 +83,8 @@ fn dependents(packages: &[Value]) -> Vec<String> {
 }
 
 /// Asserts that no crate of the workspace but the [`USERS`] depends on the job client yet, in
-/// any kind of dependency; that each of the [`USERS`] is a member that does (so the list does
-/// not outlive its reason); and that the client's own manifest names itself once, as the
+/// any kind of dependency, but the [`TESTS`] as a dev-dependency; that each of the [`USERS`]
+/// and [`TESTS`] is a member that does (so the lists do not outlive their reason); and that the client's own manifest names itself once, as the
 /// dev-dependency of its tests (so the walk reads the dependencies it checks). The host
 /// executor moving to the client is the change that edits this test.
 #[test]
@@ -116,6 +124,21 @@ fn no_workspace_crate_depends_on_the_job_client_yet() {
             "{user} is listed as a user of the client and does not use it"
         );
     }
+    for tests in TESTS {
+        let package = packages
+            .iter()
+            .find(|p| p["name"] == tests)
+            .unwrap_or_else(|| panic!("{tests} is a workspace member"));
+        let uses = package["dependencies"]
+            .as_array()
+            .expect("dependencies")
+            .iter()
+            .any(|d| d["name"] == CLIENT && d["kind"] == "dev");
+        assert!(
+            uses,
+            "{tests} is listed as testing with the client and does not"
+        );
+    }
     let found = dependents(packages);
     assert!(
         found.is_empty(),
@@ -138,13 +161,21 @@ fn a_crate_that_depends_on_the_job_client_is_named() {
             {"name": "kbf-deploy", "dependencies": [
                 {"name": "kbf-job-client", "kind": null},
                 {"name": "kbf-job-client", "kind": "dev"}]},
-            {"name": "kbf-cli", "dependencies": [{"name": "kbf-job-client", "kind": "build"}]}
+            {"name": "kbf-cli", "dependencies": [{"name": "kbf-job-client", "kind": "build"}]},
+            {"name": "kbf-integration-test", "dependencies": [
+                {"name": "kbf-job-client", "kind": "dev"},
+                {"name": "kbf-job-client", "kind": null}]}
         ]"#,
     )
     .unwrap();
     assert_eq!(
         dependents(&packages),
-        ["kbf-server (normal)", "kbf-front (dev)", "kbf-cli (build)"]
+        [
+            "kbf-server (normal)",
+            "kbf-front (dev)",
+            "kbf-cli (build)",
+            "kbf-integration-test (normal)"
+        ]
     );
     let only_itself = &packages[..1];
     assert!(dependents(only_itself).is_empty());
