@@ -7,8 +7,9 @@
 //!
 //! - the tier store's proxy, `task-put-endpoint`: every pack and large object is PUT there;
 //! - the job-facing read listener, `task-read-url`: the inputs are read there;
-//! - with `executor-locate = true`, the store of `job-store-url` too: the task reads inputs
-//!   straight from it.
+//! - with `executor-locate = true` and a `job-store-url`, that store too: the task reads
+//!   inputs straight from it (without the url, its locate answers carry no grant and it reads
+//!   from the listener alone).
 //!
 //! The verb prints `--egress=allow-list` and one `--egress-allow=IPV4:PORT` per destination,
 //! each once, in that order. The agent's ceiling `allow-list` admits the jobs kbf submits; its
@@ -243,8 +244,10 @@ pub(crate) fn render(text: &str, file: &Path) -> Result<String, EgressError> {
             wanted: "true or false",
         })?,
     };
-    if locate {
-        let why = "with `executor-locate = true` a task reads its inputs from that store";
+    // A locating task reads from the store only when the frontend names one; without
+    // `job-store-url` its locate answers carry no grant and it reads from the listener.
+    if locate && find(&doc, STORE_KEY, &file)?.is_some() {
+        let why = "a locating task reads its inputs there";
         wanted.push((STORE_KEY, url_of(&doc, STORE_KEY, why, &file)?));
     }
     // One line per endpoint, in the order above; a later key that names one already listed

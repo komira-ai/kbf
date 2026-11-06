@@ -77,6 +77,20 @@ fn the_store_is_allowed_only_when_the_task_locates() {
     );
     assert_eq!(render_text(&off), render_text(FRONTEND));
     assert_eq!(render_text(&with_store), render_text(FRONTEND));
+    // Locating with no store named: its tasks read from the listener, so the two stand alone.
+    let no_store = FRONTEND.replace(
+        "executor = \"js-agent\"\n",
+        "executor = \"js-agent\"\nexecutor-locate = true\n",
+    );
+    assert_eq!(render_text(&no_store), render_text(FRONTEND));
+    // A named store is checked as the other two are.
+    let bad_store = locating.replace("192.0.2.30", "store.example");
+    assert!(
+        render_text(&bad_store)
+            .unwrap_err()
+            .to_string()
+            .starts_with("--config /etc/kbf/kbf.toml: `job-store-url` = \"http://store.example:9100\": the host is not an IPv4 address"),
+    );
 }
 
 /// Two keys naming one address and port give one line whose comment names both.
@@ -106,7 +120,7 @@ fn a_url_without_a_port_has_its_schemes_port() {
 }
 
 /// A frontend file without the proxy, or without the read listener, is refused naming the
-/// missing key; so is a locating one without its store.
+/// missing key.
 #[test]
 fn a_missing_destination_is_refused_naming_its_key() {
     let no_put = FRONTEND.replace("task-put-endpoint = \"http://192.0.2.10:9000\"\n", "");
@@ -118,15 +132,6 @@ fn a_missing_destination_is_refused_naming_its_key() {
     assert_eq!(
         render_text(&no_read).unwrap_err().to_string(),
         "--config /etc/kbf/kbf.toml: no `task-read-url`: a task reads its inputs there"
-    );
-    let no_store = FRONTEND.replace(
-        "executor = \"js-agent\"\n",
-        "executor = \"js-agent\"\nexecutor-locate = true\n",
-    );
-    assert_eq!(
-        render_text(&no_store).unwrap_err().to_string(),
-        "--config /etc/kbf/kbf.toml: no `job-store-url`: with `executor-locate = true` a task \
-         reads its inputs from that store"
     );
 }
 
