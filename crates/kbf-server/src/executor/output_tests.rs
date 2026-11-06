@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use js_proto::v1::{GetLogsResponse, JobFile, JobResult, JobSpec};
+use js_proto::v1::{GetLogsResponse, JobFile, JobResult, JobSpec, Refusal};
 use kbf_job_client::{Broken, Error, Stuck, Undecodable, Unsent};
 use kbf_proto::google::rpc::{self, ErrorInfo};
 use kbf_proto::worker;
@@ -34,11 +34,21 @@ fn assert_hidden(text: &str, secret: &str) {
 /// one marker, wherever it is, and so is the url's signature alone.
 #[test]
 fn every_occurrence_of_a_grant_is_replaced_by_one_marker() {
-    let text = format!("{URL} start {TOKEN} middle {TOKEN}{TOKEN} sig {SIGNATURE} end {URL}");
+    let text = format!(
+        "{URL} start {TOKEN} middle {TOKEN}{TOKEN} sig {SIGNATURE} value {} end {URL}",
+        &SIGNATURE["X-Signature=".len()..]
+    );
     let redacted = grants().redact(text.as_bytes(), false);
     assert_eq!(
         String::from_utf8(redacted).expect("utf-8"),
-        "[redacted] start [redacted] middle [redacted] sig [redacted] end [redacted]"
+        "[redacted] start [redacted] middle [redacted] sig [redacted] value [redacted] end \
+         [redacted]"
+    );
+    // A short query value is not a grant of its own: it would redact ordinary text.
+    let short = Grants::of(&JobSpec::default(), ["https://s.test/k?a=1&sig=0123456789"]);
+    assert_eq!(
+        short.redact(b"a=1 sig 0123456789", false),
+        b"a=1 sig [redacted]"
     );
 }
 
@@ -219,6 +229,11 @@ fn a_result_without_output_has_no_tail_and_the_logs_answer_one() {
         truncated: true,
     };
     assert_eq!(Tail::of_logs(logs), expected);
+    assert_eq!(
+        format!("{expected:?}"),
+        "Tail { stdout_bytes: 3, stderr_bytes: 3, truncated: true }",
+        "a tail never prints its text"
+    );
 }
 
 fn failed() -> worker::Result {
@@ -315,6 +330,10 @@ fn a_failed_read_is_a_short_note_that_never_quotes_the_service() {
         (
             Error::Decode(Undecodable::Missing("result")),
             "the answer could not be decoded",
+        ),
+        (
+            Error::Refused(Refusal::default()),
+            "the job service gave an answer a read does not have",
         ),
         (
             Error::TooMany(1),

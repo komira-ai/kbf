@@ -64,8 +64,9 @@ impl fmt::Debug for Grants {
 
 impl Grants {
     /// The grants of the job `spec`: `secrets`, each file's contents and each environment
-    /// value of the spec, and the query of each url among them (a presigned url's signature,
-    /// which is the credential on its own). Empty values are left out.
+    /// value of the spec, and the query of each url among them with each of its values of
+    /// [`MIN_CUT_SECRET`] bytes or more (a presigned url's signature, which is the credential
+    /// on its own, printed without the rest). Empty values are left out.
     pub(super) fn of<'a>(spec: &'a JobSpec, secrets: impl IntoIterator<Item = &'a str>) -> Self {
         let named = secrets.into_iter();
         let files = spec.files.iter().map(|file| file.contents.as_str());
@@ -75,7 +76,14 @@ impl Grants {
             .iter()
             .filter_map(|value| value.split_once('?').map(|(_, query)| query))
             .collect();
+        let params = queries
+            .iter()
+            .flat_map(|query| query.split('&'))
+            .filter_map(|param| param.split_once('=').map(|(_, value)| value))
+            .filter(|value| value.len() >= MIN_CUT_SECRET);
+        let params: Vec<&str> = params.collect();
         values.extend(queries);
+        values.extend(params);
         let mut grants: Vec<Secret> = Vec::new();
         for value in values.into_iter().filter(|value| !value.is_empty()) {
             let secret = Secret::new(value);
@@ -119,13 +127,24 @@ impl Grants {
     }
 }
 
-/// The tails of a job's two streams as the job service holds them.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// The tails of a job's two streams as the job service holds them, not yet redacted: it
+/// formats as their lengths, never as the text.
+#[derive(Clone, Default, PartialEq, Eq)]
 pub(super) struct Tail {
     pub(super) stdout: Vec<u8>,
     pub(super) stderr: Vec<u8>,
     /// The service cut a stream: the job wrote more than its tail holds.
     pub(super) truncated: bool,
+}
+
+impl fmt::Debug for Tail {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Tail")
+            .field("stdout_bytes", &self.stdout.len())
+            .field("stderr_bytes", &self.stderr.len())
+            .field("truncated", &self.truncated)
+            .finish()
+    }
 }
 
 impl Tail {
