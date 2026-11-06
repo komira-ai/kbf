@@ -460,6 +460,15 @@ pub(super) fn from_matches(m: &ArgMatches) -> Result<ExecutorFlags, String> {
     js.config
         .validate()
         .map_err(|e| format!("--executor js-agent: {e}"))?;
+    // The network every action's command will have, logged at start: an open one, which the
+    // operator asked for twice, as a warning.
+    match js.config.network {
+        Network::Open => tracing::warn!(
+            "--executor-network open with --executor-allow-open-network: every job may reach \
+             any address but those its host's agent always denies"
+        ),
+        network => tracing::info!(?network, "--executor-network: the network of every job"),
+    }
     Ok(ExecutorFlags {
         kind: ExecutorKind::JsAgent,
         js: Some(js),

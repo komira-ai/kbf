@@ -605,3 +605,35 @@ fn executor_network_is_the_jobs_network_and_open_needs_its_opt_in() {
     let daemons = parsed(argv(&["--executor-network=open"])).expect("ignored with daemons");
     assert!(daemons.executor.js.is_none());
 }
+
+/// Catches an open job network taken without a line in the log: the network every job gets is
+/// logged when the flags are read, `open` as a warning that names both flags and the
+/// allow-list (the default) at info, naming the level.
+#[test]
+fn the_job_network_is_logged_at_start() {
+    let log = crate::test_log::capture();
+    js_with(&["--executor-network=open", "--executor-allow-open-network"]).expect("flags");
+    let text = log.text();
+    let open: Vec<&str> = text.lines().filter(|l| l.contains("WARN")).collect();
+    assert_eq!(open.len(), 1, "{text}");
+    assert!(
+        open[0].contains(
+            "--executor-network open with --executor-allow-open-network: every job may reach \
+             any address but those its host's agent always denies"
+        ),
+        "{text}"
+    );
+    drop(log);
+    let log = crate::test_log::capture();
+    js_with(&[]).expect("flags");
+    let text = log.text();
+    let line = text
+        .lines()
+        .find(|l| l.contains("--executor-network: the network of every job"))
+        .unwrap_or_else(|| panic!("no network line in {text}"));
+    assert!(
+        line.contains("INFO") && line.contains("network=AllowList"),
+        "{line}"
+    );
+    assert!(!text.contains("WARN"), "{text}");
+}
