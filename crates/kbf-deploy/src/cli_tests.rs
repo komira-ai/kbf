@@ -834,3 +834,48 @@ fn the_retired_envoy_kit_is_an_unknown_subcommand() {
         assert!(exec.queries.borrow().is_empty(), "{args:?}");
     }
 }
+
+/// Catches a `job-service check` the command line does not reach, or that runs a host step:
+/// through `run`, a token file that is missing is refused (exit 2) naming the flag, an
+/// address nothing listens on fails (exit 1) as unreachable, a missing `--url` is a usage
+/// error, and nothing is run on the host.
+#[test]
+fn job_service_check_runs_through_the_same_command_line() {
+    let dir = TestDir::under(std::env::temp_dir(), "kbf-deploy-cli-job-service");
+    let token = dir.path().join("token");
+    std::fs::write(&token, "a-token-of-the-cli-test-0123456789\n").unwrap();
+    std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let token = token.to_str().unwrap();
+    let url = format!("http://{}", kbf_testkit::port::dead_addr());
+    let missing = dir.path().join("missing");
+    let missing = missing.to_str().unwrap();
+
+    let mut exec = FakeExec::new(501);
+    let check = ["job-service", "check", "--url", &url, "--token-file"];
+    let (code, out, err) = cli(&mut exec, &no_env, &[&check[..], &[missing]].concat());
+    assert_eq!(code, ExitCode::from(2), "{err}");
+    assert_eq!(out, "");
+    assert!(
+        err.starts_with(&format!("REFUSED: --token-file: token file {missing}: ")),
+        "{err}"
+    );
+
+    let (code, out, err) = cli(&mut exec, &no_env, &[&check[..], &[token]].concat());
+    assert_eq!(code, ExitCode::from(1), "{err}");
+    assert_eq!(out, format!("job service: {url}\ntoken file: {token}\n"));
+    assert!(
+        err.starts_with(&format!(
+            "FAIL: unreachable: cannot connect to the job service at {url}: "
+        )),
+        "{err}"
+    );
+
+    let (code, _, err) = cli(
+        &mut exec,
+        &no_env,
+        &["job-service", "check", "--token-file", token],
+    );
+    assert_eq!(code, ExitCode::from(2), "{err}");
+    assert!(err.contains("--url"), "{err}");
+    assert!(exec.queries.borrow().is_empty());
+}

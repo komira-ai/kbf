@@ -30,6 +30,7 @@
 //! kbf-deploy log (--log-dir DIR | --hot-store DIR) [--lines N]
 //! kbf-deploy host-status --coordinator URL|HOST:PORT --operator-token-file FILE --node ID
 //!                        [--service NAME] [--ca-pem PEM] [--json]
+//! kbf-deploy job-service check --url URL --token-file FILE [--ca-file FILE]
 //! ```
 //!
 //! Bad flags exit 2 for every subcommand. The `minio` subcommands change a host: without
@@ -55,6 +56,10 @@
 //! /v1/status`, and exits 0 found, 1 the node is not in the status or the coordinator could
 //! not be asked (connection, TLS or HTTP), or 2 refused (`REFUSED: ...` on stderr: bad
 //! arguments or a bad token file) ([`crate::host_status`]).
+//! `job-service check` only reads: one `ListJobs` call to the job service with kbf's client
+//! token, and exits 0 answered (an empty list too), 1 unreachable, unauthorized or another
+//! error (`FAIL: ...` on stderr), or 2 refused (`REFUSED: ...` on stderr: a bad `--url`, token
+//! file or CA file) ([`crate::job_service`]).
 //! `minio buckets` reads the MinIO admin key pair from `MINIO_ROOT_USER` and
 //! `MINIO_ROOT_PASSWORD` in the environment (secrets are never flags: argv is
 //! world-readable).
@@ -127,6 +132,10 @@ enum Kit {
     /// One host's row from the coordinator's status: version, health, update, hold. Only
     /// reads.
     HostStatus(crate::host_status::HostStatusArgs),
+    /// The job service a frontend's executor will submit to: `check` calls ListJobs with
+    /// kbf's client token. Only reads.
+    #[command(subcommand)]
+    JobService(crate::job_service::JobService),
 }
 
 #[derive(Subcommand)]
@@ -435,6 +444,7 @@ pub fn run_at<E: Exec>(
         Kit::Mdm(m) => return mdm_kit(m, exec, now, out, err),
         Kit::Log(a) => return log::run(&a, out, err),
         Kit::HostStatus(a) => return crate::host_status::run(&a, exec.euid(), out, err),
+        Kit::JobService(v) => return crate::job_service::run(&v, out, err),
         Kit::Pilot(p) => {
             return pilot::cli::run(p, exec, env, now, out, err, &pilot::cli::sleep_a_second);
         }

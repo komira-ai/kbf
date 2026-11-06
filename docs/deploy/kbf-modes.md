@@ -157,7 +157,10 @@ process under its own id watches them for a renewal (the longest a live executor
 one, 30 s, plus the fence time) before it takes them over, and stops if one is renewed; it takes
 them if none is, as after a crash. Nothing asks for a host meanwhile. A restart of the frontend fails the builds in flight, and
 stopping it stops the runs and releases the leases. The executor prepares each run with the
-frontend's **task runs** (below) and its job-facing read listener (`--job-listen`), so
+frontend's **task runs** (below) and its job-facing read listener (`--job-listen`: the frontend's
+own listener, not an executor mode and not the jobscheduler's job service, whose lease server has a
+flag of the same name; moving the executor onto that service is
+[job-service-cutover.md](job-service-cutover.md)), so
 `--executor js-agent` is refused when the flags are read unless `--task-secret-file` (with the
 four flags it needs), `--job-listen` (with its companions) and `--pack-store-endpoint` are given, and
 unless they agree with it: the tier store and the read url must be IP addresses (the job network
@@ -412,7 +415,10 @@ index knows, so a read of one still goes to the members. `kbf-pack-adopt`, an op
 a binary of its own, indexes those segments where they lie, with no byte copied and nothing
 written to the object store: [pack-adopt.md](pack-adopt.md) gives the order to run it in.
 
-**The job-facing read listener** (off by default; the `[job-read]` table of `kbf.toml`). A task
+**The job-facing read listener** (off by default; the `[job-read]` table of `kbf.toml`). It is
+the frontend's own read listener, not an executor mode: the jobscheduler's job service, which its
+lease server serves under a `--job-listen` of its own, is another process, and the checks before
+an executor is moved onto it are in [job-service-cutover.md](job-service-cutover.md). A task
 that runs an action on a worker fetches the action's input files from the frontend, with a read
 grant (a token the frontend gives the run, valid until its expiry, for one Action: it reads that
 Action, its Command and its input tree, and no other blob). The task is untrusted code that holds
@@ -914,4 +920,7 @@ maintenance without stopping it, `kbf cluster drain <node>`.
   the daemon.
 - [pack-adopt.md](pack-adopt.md): indexing the segments the storage members already hold into
   the pack index, in place.
+- [job-service-cutover.md](job-service-cutover.md): what must run before a frontend's executor is
+  moved onto the jobscheduler's job service, kbf's client token, and `kbf-deploy job-service
+  check`. Not the frontend's own `--job-listen`, which is its job-facing read listener.
 - The operator API, with its gates, in [api.md](../api.md).

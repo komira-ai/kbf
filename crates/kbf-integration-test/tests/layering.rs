@@ -82,7 +82,8 @@
 //!   its name; and a walk that cannot see its dependencies, which would make that check pass
 //!   vacuously;
 //! - the job service client (`kbf-job-client`, in `job_client_layer`) reaching a scheduler crate
-//!   other than `js-proto`, or a kbf crate, or being depended on by any crate of this workspace.
+//!   other than `js-proto`, or a kbf crate, or being depended on by any crate of this workspace
+//!   but the deploy tool (`kbf-deploy`, for `job-service check`).
 
 mod job_client_layer;
 mod step_runner_layer;
