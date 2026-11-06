@@ -362,20 +362,21 @@ impl Config {
     }
 }
 
-/// An id of this process: 128 random bits from the operating system's source, in hex. A
-/// source that fails (which nothing here can repair) gives the process id and the time
-/// instead, which still tells two processes apart.
+/// An id of this process, in hex: 128 random bits from the operating system's source, then
+/// the process id and the time. A source that fails (which nothing here can repair) leaves
+/// the bits zero, and the process id and the time still tell two processes apart.
 fn instance_id() -> String {
     let mut bytes = [0_u8; 16];
-    match SystemRandom::new().fill(&mut bytes) {
-        Ok(()) => format!("{:032x}", u128::from_be_bytes(bytes)),
-        Err(_) => {
-            let since = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default();
-            format!("p{}-{}", std::process::id(), since.as_nanos())
-        }
-    }
+    let _ = SystemRandom::new().fill(&mut bytes);
+    let since = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    format!(
+        "{:032x}{:08x}{:x}",
+        u128::from_be_bytes(bytes),
+        std::process::id(),
+        since.as_nanos()
+    )
 }
 
 #[cfg(test)]

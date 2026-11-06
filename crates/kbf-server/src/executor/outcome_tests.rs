@@ -235,6 +235,10 @@ fn cases() -> Vec<(&'static str, Case)> {
             }),
         ),
         (
+            "refused at submit with a code this server does not know",
+            Refused(refusal(RefusalCode::Unspecified)),
+        ),
+        (
             "refused at submit otherwise",
             Refused(Error::Status {
                 code: Code::PermissionDenied,
@@ -446,6 +450,7 @@ fn an_agent_detail_is_read_by_its_leading_code_only() {
         "the quota-unavailable",
         "files-unsupported-ish",
         "host-unsafe-ish",
+        "quota-unavailable2",
         "",
     ] {
         assert!(

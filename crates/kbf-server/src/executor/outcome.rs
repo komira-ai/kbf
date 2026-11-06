@@ -32,6 +32,7 @@
 //! | refused at submit wall-time-above-ceiling | `invalid` | `INVALID_ARGUMENT`: nothing could ever run it |
 //! | refused at submit job-id-conflict | `twin` | `UNAVAILABLE`, and the executor stops: another process wrote the id |
 //! | refused at submit as written (`INVALID_ARGUMENT`) | `invalid` | `INVALID_ARGUMENT`: nothing could ever run it |
+//! | refused at submit with a code this server does not know | `infra` | `UNAVAILABLE`: rerun |
 //! | refused at submit otherwise | `infra` | `UNAVAILABLE`: rerun |
 //!
 //! A message to the farm names the code, never the job: a job carries the arguments, which
@@ -161,17 +162,6 @@ pub(super) fn forgotten() -> Settled {
     Settled::Lost(Lost::DaemonRestarted)
 }
 
-/// The name a refusal code has on the wire.
-fn refusal_name(code: RefusalCode) -> &'static str {
-    match code {
-        RefusalCode::JobIdConflict => "job-id-conflict",
-        RefusalCode::NoCapableHost => "no-capable-host",
-        RefusalCode::WallTimeNotPositive => "wall-time-not-positive",
-        RefusalCode::WallTimeAboveCeiling => "wall-time-above-ceiling",
-        RefusalCode::Unspecified => "unspecified",
-    }
-}
-
 /// What a submit that failed with `error` comes to; `None` when nothing is decided, because
 /// nothing was sent or the answer was lost, and the same submit is sent again.
 pub(super) fn refused(error: &Error) -> Option<Refused> {
@@ -195,7 +185,7 @@ pub(super) fn refused(error: &Error) -> Option<Refused> {
             | RefusalCode::WallTimeNotPositive
             | RefusalCode::WallTimeAboveCeiling) => settled(Settled::Invalid(format!(
                 "the job service refused the job: {}",
-                refusal_name(code)
+                code.as_str()
             ))),
             RefusalCode::Unspecified => settled(Settled::Infra(
                 "the job service refused the job for a reason this server does not know".to_owned(),

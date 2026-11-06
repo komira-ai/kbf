@@ -286,13 +286,11 @@ impl HostWorker {
 
     /// Stops taking work: the farm is told the node is draining.
     pub(super) fn begin_drain(&mut self, ctx: &Ctx<'_>) {
-        if !self.draining {
-            self.draining = true;
-            self.reported.phase = kbf_sched::NodePhase::Draining;
-            ctx.deps
-                .farm
-                .resize(&self.id, self.stream, self.reported.clone());
-        }
+        self.draining = true;
+        self.reported.phase = kbf_sched::NodePhase::Draining;
+        ctx.deps
+            .farm
+            .resize(&self.id, self.stream, self.reported.clone());
     }
 
     /// Heartbeats the farm when one is due, and fences when the farm, or the job service while

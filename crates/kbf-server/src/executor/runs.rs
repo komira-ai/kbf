@@ -47,6 +47,8 @@ pub(super) struct Task {
     pub(super) stage: Stage,
     /// When the job passed each of its moments, on the executor's clock.
     pub(super) timeline: Timeline,
+    /// The silence of the host holding its job was seen and counted.
+    silence_seen: bool,
 }
 
 pub(super) enum Stage {
@@ -88,8 +90,6 @@ impl Waiting {
 pub(super) struct Running {
     pub(super) job: String,
     key: PackKey,
-    /// The host's silence was seen and counted.
-    silence_seen: bool,
 }
 
 pub(super) struct Reporting {
@@ -157,6 +157,7 @@ impl HostWorker {
                 action,
                 stage: Stage::Waiting(waiting),
                 timeline: Timeline::default(),
+                silence_seen: false,
             });
     }
 
@@ -277,12 +278,11 @@ impl HostWorker {
 
     /// Forms the result of `lease` from `settled`, to be reported.
     fn settle_with(&mut self, lease: LeaseId, settled: &Settled, now: Instant, metrics: &Metrics) {
-        let Some(task) = self.tasks.get_mut(&lease) else {
-            return;
-        };
-        let result = result_of(lease, &task.action, settled);
-        metrics.run_ended(RunEnd::of(&result));
-        task.stage = reporting(result, now);
+        self.tasks.entry(lease).and_modify(|task| {
+            let result = result_of(lease, &task.action, settled);
+            metrics.run_ended(RunEnd::of(&result));
+            task.stage = reporting(result, now);
+        });
     }
 
     async fn submit(
@@ -328,7 +328,6 @@ impl HostWorker {
                 Submitted::Running(Running {
                     job: job.id,
                     key: prepared.key.clone(),
-                    silence_seen: false,
                 })
             }
             Err(error) => match refused(&error) {
@@ -356,26 +355,31 @@ impl HostWorker {
     /// pass for a budget and a call, not a call per job; the next pass begins after the last
     /// task read, so every task is read in turn.
     pub(super) async fn poll(&mut self, ctx: &Ctx<'_>, now: Instant) {
-        let mut jobs: Vec<(LeaseId, String, bool)> = self
+        // The action and the key of a running task, for the ingest if its job ended well.
+        type Read = Option<(Digest, PackKey)>;
+        let mut jobs: Vec<(LeaseId, String, Read)> = self
             .tasks
             .iter()
             .filter_map(|(lease, task)| match &task.stage {
-                Stage::Running(r) => Some((*lease, r.job.clone(), true)),
-                Stage::Withdrawing(job) => Some((*lease, job.clone(), false)),
+                Stage::Running(r) => {
+                    let read = Some((task.action.clone(), r.key.clone()));
+                    Some((*lease, r.job.clone(), read))
+                }
+                Stage::Withdrawing(job) => Some((*lease, job.clone(), None)),
                 _ => None,
             })
             .collect();
         let after = self.read_after;
         jobs.sort_by_key(|(lease, _, _)| (after.is_some_and(|last| *lease <= last), *lease));
         let began = ctx.now();
-        for (lease, job, running) in jobs {
+        for (lease, job, read) in jobs {
             if ctx.now().saturating_duration_since(began) >= ctx.cfg.pass_budget {
                 break;
             }
             self.read_after = Some(lease);
-            match running {
-                true => self.read(ctx, now, lease, &job).await,
-                false => self.withdraw(ctx, lease, &job).await,
+            match read {
+                Some(ingest) => self.read(ctx, now, lease, &job, ingest).await,
+                None => self.withdraw(ctx, lease, &job).await,
             }
         }
     }
@@ -395,7 +399,14 @@ impl HostWorker {
     }
 
     /// Reads one running task's job, and its result once it has ended.
-    async fn read(&mut self, ctx: &Ctx<'_>, now: Instant, lease: LeaseId, id: &str) {
+    async fn read(
+        &mut self,
+        ctx: &Ctx<'_>,
+        now: Instant,
+        lease: LeaseId,
+        id: &str,
+        (action, key): (Digest, PackKey),
+    ) {
         let answer = ctx.api().get_job(id).await;
         self.heard(ctx, &answer);
         let job = match answer {
@@ -441,31 +452,24 @@ impl HostWorker {
         self.stamp(lease, Mark::Ended, now, ctx);
         match judge(&job, &result) {
             Verdict::Settled(settled) => self.settle_with(lease, &settled, now, &ctx.deps.metrics),
-            Verdict::Ingest => self.ingest(ctx, lease),
+            Verdict::Ingest => self.ingest(ctx, lease, action, key),
         }
     }
 
     /// Logs and counts, once a task, that the host holding its job has missed its grace.
     /// The service ends the job as lost if the host does not come back; nothing changes here.
     fn saw_silence(&mut self, ctx: &Ctx<'_>, lease: LeaseId, host: &str) {
-        let Some(Stage::Running(running)) = self.tasks.get_mut(&lease).map(|t| &mut t.stage) else {
-            return;
-        };
-        if !std::mem::replace(&mut running.silence_seen, true) {
-            tracing::warn!(worker = %self.id, %lease, %host, "the host of a job has missed its grace");
-            ctx.deps.metrics.host_silence();
-        }
+        let worker = &self.id;
+        self.tasks.entry(lease).and_modify(|task| {
+            if !std::mem::replace(&mut task.silence_seen, true) {
+                tracing::warn!(%worker, %lease, %host, "the host of a job has missed its grace");
+                ctx.deps.metrics.host_silence();
+            }
+        });
     }
 
     /// Starts the frontend's read of the pack of a job that ended well.
-    fn ingest(&mut self, ctx: &Ctx<'_>, lease: LeaseId) {
-        let Some(task) = self.tasks.get_mut(&lease) else {
-            return;
-        };
-        let Stage::Running(running) = &task.stage else {
-            return;
-        };
-        let (action, key) = (task.action.clone(), running.key.clone());
+    fn ingest(&mut self, ctx: &Ctx<'_>, lease: LeaseId, action: Digest, key: PackKey) {
         let ingest = Arc::clone(&ctx.deps.ingest);
         let limits = UntrustedLimits {
             max_pack_bytes: ctx.cfg.max_pack_bytes,
@@ -473,7 +477,7 @@ impl HostWorker {
         };
         let handle =
             tokio::spawn(async move { ingest.ingest(lease, &key, &action, &limits).await });
-        task.stage = Stage::Ingesting(handle);
+        self.set_stage(lease, Stage::Ingesting(handle));
     }
 
     /// Moves ingested tasks to their result, and sends or resends the results the farm has

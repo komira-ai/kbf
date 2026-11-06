@@ -106,10 +106,7 @@ pub(crate) struct Twin(Mutex<Option<String>>);
 
 impl Twin {
     pub(crate) fn flag(&self, why: String) {
-        let mut flagged = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        if flagged.is_none() {
-            *flagged = Some(why);
-        }
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Some(why);
     }
 
     fn take(&self) -> Option<String> {
