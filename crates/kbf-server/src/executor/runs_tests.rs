@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use js_proto::v1::{CancelJobRequest, JobSpec, JobState, Needs};
+use js_proto::v1::{CancelJobRequest, JobSpec, JobState, Needs, NetworkLevel};
 use kbf_job_client::fake::{Call, Fault};
 use kbf_proto::worker::{Cancel, Lost, ResultAck, ServerMessage, Start, server_message};
 use kbf_types::LeaseId;
@@ -325,6 +325,8 @@ async fn a_job_conflict_on_resubmit_is_infra_and_flags_a_twin() {
             ..Needs::default()
         }),
         wall_limit_seconds: Some(60),
+        // As the service records an unspecified network.
+        network: NetworkLevel::None.into(),
         ..JobSpec::default()
     };
     harness.fake.record(stranger.clone()).expect("recorded");

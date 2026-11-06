@@ -646,10 +646,18 @@ pub fn hex(tag: u8) -> String {
 /// Lets the tasks the executor and the farm spawned run to rest. The farm's cache lingers
 /// 2 ms before it writes a batch, and the clock is held, so the clock moves 3 ms a round: the
 /// tests' own clock is `Rig::advance` and `Rig::elapse`.
+///
+/// Each round also waits on a blocking task that does nothing, which lets the runtime park on
+/// its I/O driver: a call of a spawned task to the job service on loopback takes several
+/// socket hops, and yielding alone polls sockets too seldom for it to be answered. No time is
+/// waited for, real or virtual.
 pub async fn settle() {
     for _ in 0..3 {
-        for _ in 0..64 {
-            tokio::task::yield_now().await;
+        for _ in 0..16 {
+            let _ = tokio::task::spawn_blocking(|| ()).await;
+            for _ in 0..4 {
+                tokio::task::yield_now().await;
+            }
         }
         tokio::time::advance(Duration::from_millis(3)).await;
     }
