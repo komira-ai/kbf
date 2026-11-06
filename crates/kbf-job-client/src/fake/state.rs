@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use js_proto::refusal::refusal_status;
 use js_proto::v1::{
     ExecMode, GetLogsResponse, Job, JobFile, JobResult, JobSpec, JobState, JobTimes,
-    ListJobsRequest, ListJobsResponse, PortForward, RefusalCode, ResultReason, Shape,
+    ListJobsRequest, ListJobsResponse, NetworkLevel, PortForward, RefusalCode, ResultReason, Shape,
     StartFailureCode,
 };
 use tonic::Status;
@@ -137,8 +137,9 @@ fn same_job(held: &JobSpec, given: &JobSpec) -> bool {
     held == *given
 }
 
-/// Ends the job in `state` at `now`. A cancel that was asked for stays marked only on a
-/// job that ends lost (`Job.cancel_requested`).
+/// Ends the job in `state` at `now`. A cancel that was asked for of a job on a host stays
+/// marked only on a job that ends lost (`Job.cancel_requested`); [`State::cancel`] marks a
+/// queued job it cancels after this.
 fn end(record: &mut Record, state: JobState, now: u64) {
     record.state = state;
     record.times.ended_at_ms = Some(now);
@@ -305,8 +306,15 @@ impl State {
 
     /// `SubmitJob` (design section 5.3): validate, answer a repeat from the job it made or
     /// refuse a different job under its id, admit, record as queued.
-    pub(super) fn submit(&mut self, spec: JobSpec) -> Result<Job, Status> {
+    ///
+    /// A network level left unspecified is recorded, and compared and answered, as `none`, the
+    /// level the proto reads it as: the released service stores it so, and a repeat that names
+    /// `none` or leaves it unspecified is the same job.
+    pub(super) fn submit(&mut self, mut spec: JobSpec) -> Result<Job, Status> {
         self.sweep();
+        if spec.network == i32::from(NetworkLevel::Unspecified) {
+            spec.set_network(NetworkLevel::None);
+        }
         if !spec.job_id.is_empty() {
             let checked = crate::id::check(&spec.job_id);
             checked.map_err(|bad| Status::invalid_argument(bad.to_string()))?;
@@ -439,8 +447,9 @@ impl State {
         })
     }
 
-    /// `CancelJob` (design section 5.3): a queued job is cancelled at once; a job on a host
-    /// gets the intent and ends when the host reports it stopped; an ended job is unchanged.
+    /// `CancelJob` (design section 5.3): a queued job is cancelled at once and keeps the
+    /// intent (`cancel_requested`), as the released service answers it; a job on a host gets
+    /// the intent and ends when the host reports it stopped; an ended job is unchanged.
     pub(super) fn cancel(&mut self, id: &str) -> Result<Job, Status> {
         self.sweep();
         let now = self.now_ms;
@@ -448,6 +457,7 @@ impl State {
         if record.state == JobState::Queued {
             record.reason = ResultReason::Cancelled;
             end(record, JobState::Cancelled, now);
+            record.cancel_requested = true;
         } else if on_host(record.state) {
             record.cancel_requested = true;
         }

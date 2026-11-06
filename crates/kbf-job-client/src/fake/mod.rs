@@ -18,8 +18,9 @@
 //!   [`starting`](FakeJobServer::starting), [`run`](FakeJobServer::run),
 //!   [`finish`](FakeJobServer::finish), [`fail_to_start`](FakeJobServer::fail_to_start),
 //!   [`lose`](FakeJobServer::lose), [`host_stopped`](FakeJobServer::host_stopped). Cancel of a
-//!   queued job cancels it at once; of a placed, starting or running job it records the intent
-//!   and the job is cancelled only at `host_stopped`; of an ended job it changes nothing.
+//!   queued job cancels it at once and marks it `cancel_requested`, as the released service
+//!   does; of a placed, starting or running job it records the intent and the job is cancelled
+//!   only at `host_stopped`; of an ended job it changes nothing.
 //! - **Results and logs are kept for the retention window** after a job ends, on the fake's
 //!   own clock ([`advance`](FakeJobServer::advance); nothing here reads a clock), seven days
 //!   unless [`set_retention`](FakeJobServer::set_retention) says otherwise. A job past it is
@@ -28,6 +29,9 @@
 //!   to the last 8 KiB of each stream.
 //! - **Host silence shows on `GetJob`** ([`silence_host`](FakeJobServer::silence_host)) on
 //!   the placed, starting and running jobs of the host, and changes no state.
+//! - **A network level left unspecified is `none`**, as the released service records it: a
+//!   job submitted without one is answered with `NETWORK_LEVEL_NONE`, and the two are the same
+//!   job to a repeated submit.
 //! - **File contents are never returned**: every job a call answers has them empty.
 //! - **The bearer token ([`TOKEN`]) is required** on every call, else `UNAUTHENTICATED`.
 //!
