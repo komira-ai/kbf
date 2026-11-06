@@ -6,7 +6,9 @@ mod support;
 
 use std::time::Duration;
 
-use js_proto::v1::{GetLogsResponse, JobSpec, ListJobsRequest, RefusalCode, SubmitJobRequest};
+use js_proto::v1::{
+    GetLogsResponse, JobSpec, ListJobsRequest, NetworkLevel, RefusalCode, SubmitJobRequest,
+};
 use kbf_job_client::fake::{Call, FakeJobServer, Fault, TOKEN};
 use kbf_job_client::{BadId, Broken, Client, Config, Error, Token, Unsent};
 use prost::Message as _;
@@ -401,9 +403,13 @@ async fn submits_of_one_id_at_once_agree_with_what_was_recorded() {
     assert_eq!(jobs.len(), 1);
     assert!(answers.iter().all(|job| *job == jobs[0]), "{answers:?}");
 
-    let mut other = spec("contested");
+    // Both name the network level `none`, which the fake records an unspecified one as, so
+    // the spec it recorded compares equal to the one that won.
+    let mut first = spec("contested");
+    first.set_network(NetworkLevel::None);
+    let mut other = first.clone();
     other.command = "/bin/other".to_owned();
-    let specs = [spec("contested"), other];
+    let specs = [first, other];
     let racing: Vec<_> = (0..8)
         .map(|n| {
             let client = client.clone();
