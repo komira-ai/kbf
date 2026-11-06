@@ -127,10 +127,12 @@ certificate names the host of `--url`.
 
 **Unauthorized** (exit 1): the service refused the token. `UNAUTHENTICATED` is a token that is no
 client's (a typo, a file not delivered, a client not added, or a server not restarted after it was
-added); `PERMISSION_DENIED` is a token the service knows that may not make the call:
+added); `PERMISSION_DENIED` is a token the service knows that may not make the call. The service
+gives `UNAUTHENTICATED` no reason, so the code is shown alone; a status that has a reason shows it
+after the code (`PermissionDenied: <reason>`):
 
 ```text
-FAIL: unauthorized: the job service at https://jobs.example:8443 refused the token in /etc/kbf/job-service.token (Unauthenticated: <the service's reason>)
+FAIL: unauthorized: the job service at https://jobs.example:8443 refused the token in /etc/kbf/job-service.token (Unauthenticated)
 ```
 
 **Another answer** (exit 1): the service answered some other error, which the message quotes. An
@@ -152,11 +154,14 @@ nothing, and a frontend runs as it did. To take kbf off the service altogether, 
 `[[client]]` entry and restart the lease server, and delete the token file on the frontend's host.
 
 After a frontend has been switched onto the service, the way back is to set its executor back to the
-mode it ran before (its `--executor` and the flags of that mode, as they were; `kbf-daemon` is the
-default), through the same update path. **That flag flip works only while kbf still carries its
-embedded engine.** A later release removes the embedded engine; from that release on, a frontend
-cannot be flipped back by a flag, and the way back is the previous kbf release. The steps for the
-switch and for this back-out are written with the switch itself (see "Not covered yet").
+mode it ran before, through the same update path: its `--executor` and the flags of that mode as
+they were, or `executor = "kbf-daemon"`, the default, with `--executor-locate` removed in the same
+edit ([kbf-modes.md](kbf-modes.md) gives the rule). **That flag flip works only while the release
+still carries the mode it flips back to.** A frontend that ran on the embedded engine (the
+jobscheduler core built into kbf, `--scheduler-core js`) or on the lease-based `js-agent` executor
+can be flipped back to it only with a release that has it; once a release without them is
+installed, the way back to them is the previous kbf release, not a flag. The steps for the switch
+and for its back-out are written with the switch itself (see "Not covered yet").
 
 ## Related pages
 

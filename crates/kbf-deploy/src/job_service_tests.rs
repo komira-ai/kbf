@@ -238,6 +238,32 @@ async fn a_token_that_may_not_list_fails_as_unauthorized() {
     );
 }
 
+/// Behaviour: the job service's own bearer layer refuses a token with `UNAUTHENTICATED` and an
+/// empty message; the failure then shows the code alone, with no dangling `: `.
+#[tokio::test]
+async fn a_refusal_with_no_message_shows_the_code_alone() {
+    let dir = scratch("unauthorized-bare");
+    let token = file(dir.path(), "token", 0o600, TOKEN);
+    let server = FakeJobServer::start().await.unwrap();
+    server.inject(Fault::Status {
+        code: Code::Unauthenticated,
+        message: String::new(),
+    });
+    let url = server.origin();
+
+    let ran = checked(&args(&url, &token, None)).await;
+
+    assert_eq!(ran.code, ExitCode::from(1));
+    assert_eq!(
+        ran.err,
+        format!(
+            "FAIL: unauthorized: the job service at {url} refused the token in {} \
+             (Unauthenticated)\n",
+            token.display()
+        )
+    );
+}
+
 /// Behaviour: an address on which connecting is refused fails with exit 1, and the message
 /// says unreachable, names the address and carries the connect failure down to the system's
 /// own words. Nothing was answered, so there is no pass line.

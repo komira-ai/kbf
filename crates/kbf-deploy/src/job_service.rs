@@ -61,14 +61,13 @@ enum CheckError {
     Refused(String),
     #[error("unreachable: cannot connect to the job service at {url}: {cause}")]
     Unreachable { url: String, cause: String },
-    #[error(
-        "unauthorized: the job service at {url} refused the token in {token_file} ({code:?}: {message})"
-    )]
+    #[error("unauthorized: the job service at {url} refused the token in {token_file} ({answer})")]
     Unauthorized {
         url: String,
         token_file: String,
-        code: Code,
-        message: String,
+        /// The status code, then `: ` and its message when it has one: the job service's
+        /// bearer layer refuses a token with no message.
+        answer: String,
     },
     #[error("the job service at {url} did not answer ListJobs: {cause}")]
     Failed { url: String, cause: String },
@@ -129,8 +128,11 @@ fn judge(answer: Result<usize, Error>, url: &str, token_file: &Path) -> Result<u
         }) => Err(CheckError::Unauthorized {
             url,
             token_file: token_file.display().to_string(),
-            code,
-            message,
+            answer: if message.is_empty() {
+                format!("{code:?}")
+            } else {
+                format!("{code:?}: {message}")
+            },
         }),
         Err(other) => Err(CheckError::Failed {
             url,
