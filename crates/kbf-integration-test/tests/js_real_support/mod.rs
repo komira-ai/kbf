@@ -134,17 +134,21 @@ pub fn job_addr_of(line: &str) -> Option<SocketAddr> {
 
 /// A `js-lease-server` with the job service on, until it drops.
 pub struct RealJobServer {
-    child: Child,
+    child: Reaped,
     job_addr: SocketAddr,
     log: Arc<Mutex<String>>,
     /// Dropped last: the process is gone before its directory is removed.
     dir: TestDir,
 }
 
-impl Drop for RealJobServer {
+/// A child process killed and reaped when it drops: from the moment it is spawned, so a
+/// failed start leaves no server behind.
+struct Reaped(Child);
+
+impl Drop for Reaped {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.0.kill();
+        let _ = self.0.wait();
     }
 }
 
@@ -167,7 +171,7 @@ impl RealJobServer {
         let token = write(&dir, "token", TOKEN, 0o600);
         let joins = write(&dir, "agent-tokens", &format!("{JOIN}\n"), 0o600);
         let pool = write(&dir, "pool.toml", POOL, 0o644);
-        let mut child = Command::new(&binary)
+        let child = Command::new(&binary)
             .args(["--listen", "127.0.0.1:0", "--job-listen", "127.0.0.1:0"])
             .arg("--state-file")
             .arg(dir.join("leases.toml"))
@@ -182,8 +186,9 @@ impl RealJobServer {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap_or_else(|e| panic!("start {}: {e}", binary.display()));
-        let stdout = child.stdout.take().expect("piped stdout");
-        let stderr = child.stderr.take().expect("piped stderr");
+        let mut child = Reaped(child);
+        let stdout = child.0.stdout.take().expect("piped stdout");
+        let stderr = child.0.stderr.take().expect("piped stderr");
         let log = Arc::new(Mutex::new(String::new()));
         let (found, job_port) = mpsc::channel();
         let kept = Arc::clone(&log);
@@ -197,21 +202,28 @@ impl RealJobServer {
                 log.push('\n');
             }
         });
+        let mut stdout = BufReader::new(stdout);
         let mut first = String::new();
-        let _ = BufReader::new(stdout).read_line(&mut first);
+        let _ = stdout.read_line(&mut first);
+        // The rest of standard output is read and dropped, so a later line never meets a
+        // closed pipe.
+        std::thread::spawn(move || std::io::copy(&mut stdout, &mut std::io::sink()));
         let Some(lease_addr) = first
             .trim_end()
             .strip_prefix("listening on ")
             .and_then(|addr| addr.parse().ok())
         else {
-            let status = child.wait();
+            let _ = child.0.kill();
+            let status = child.0.wait();
             let _ = reader.join();
             let log = log.lock().unwrap_or_else(PoisonError::into_inner);
             panic!(
                 "js-lease-server did not start ({status:?}); it printed {first:?}; its log:\n{log}"
             );
         };
-        // The job port is logged before the line above is printed.
+        // The job port is logged before the line above is printed (v0.1.179 binds every
+        // listener, logs each, then prints it); a release that stopped logging it would hold
+        // this read until the job's timeout, and is a change the pin bump has to answer.
         let job_addr = job_port.recv().unwrap_or_else(|_| {
             let log = log.lock().unwrap_or_else(PoisonError::into_inner);
             panic!("js-lease-server named no job port; its log:\n{log}")

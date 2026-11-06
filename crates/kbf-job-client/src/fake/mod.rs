@@ -20,7 +20,11 @@
 //!   [`lose`](FakeJobServer::lose), [`host_stopped`](FakeJobServer::host_stopped). Cancel of a
 //!   queued job cancels it at once and marks it `cancel_requested`, as the released service
 //!   does; of a placed, starting or running job it records the intent and the job is cancelled
-//!   only at `host_stopped`; of an ended job it changes nothing.
+//!   only at `host_stopped`; of an ended job it changes nothing. The mark on a cancelled queued
+//!   job is the pinned release's behaviour, not `job.proto`'s (which keeps the mark only until
+//!   the job ends, or on a job that ends lost); the service is to be changed to match the proto
+//!   (komira-ai/jobscheduler#773). When that release is pinned, the real-service comparison in
+//!   kbf-integration-test fails on this field, and the fake goes back to the proto's rule.
 //! - **Results and logs are kept for the retention window** after a job ends, on the fake's
 //!   own clock ([`advance`](FakeJobServer::advance); nothing here reads a clock), seven days
 //!   unless [`set_retention`](FakeJobServer::set_retention) says otherwise. A job past it is

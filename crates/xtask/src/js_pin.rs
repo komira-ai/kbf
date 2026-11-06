@@ -359,28 +359,58 @@ impl Verifier for PinnedGh<'_> {
     }
 }
 
+/// The flags of `fetch-pinned-js`.
+#[derive(clap::Args, Debug)]
+pub struct Args {
+    /// The pin file.
+    #[arg(long)]
+    pub pin: PathBuf,
+    /// The program, as a row of the pin names it.
+    #[arg(long)]
+    pub program: String,
+    /// The target triple, as the row names it.
+    #[arg(long)]
+    pub target: String,
+    /// The `gh` program.
+    #[arg(long)]
+    pub gh: PathBuf,
+    /// Where the archive and the program are written (the archive must not be there yet).
+    #[arg(long)]
+    pub dir: PathBuf,
+}
+
 /// The `fetch-pinned-js` verb: the line to print.
 ///
 /// # Errors
-/// The pin is refused or has no row for `program` on `target`; the download fails; its SHA-256
-/// is not the pinned one; `gh` does not verify the pinned attestation of it; the program cannot
-/// be taken out of it or written.
-pub fn fetch_pinned_js(
-    pin: &Path,
-    program: &str,
-    target: &str,
+/// The pin is refused or has no row for the program on the target; the download fails; and
+/// as [`install`].
+pub fn fetch_pinned_js(args: &Args) -> Result<String, Error> {
+    let pin = Pin::read(&args.pin)?;
+    let archive = pin.archive(&args.program, &args.target)?;
+    let bytes = fetch::download(&pin.url(archive), &fetch::host_roots())?;
+    install(&pin, archive, &bytes, &args.gh, &args.dir)
+}
+
+/// The downloaded `bytes` of `archive` checked and installed into `dir`: refused unless their
+/// SHA-256 is the pinned one and `gh` verifies the pinned attestation of the file written, and
+/// only then the program taken out of that file. The line to print.
+///
+/// # Errors
+/// The SHA-256 is not the pinned one; `gh` cannot run or does not verify the pinned
+/// attestation; the archive or the program cannot be written.
+pub fn install(
+    pin: &Pin,
+    archive: &Archive,
+    bytes: &[u8],
     gh: &Path,
     dir: &Path,
 ) -> Result<String, Error> {
-    let pin = Pin::read(pin)?;
-    let archive = pin.archive(program, target)?;
     let url = pin.url(archive);
     let verifier = PinnedGh {
         gh,
         log_index: archive.attestation_log_index,
     };
-    let request = pin.request(archive, &url, dir);
-    fetch_attested::download_and_install(&request, &fetch::host_roots, &verifier)
+    fetch_attested::install_verified(&pin.request(archive, &url, dir), bytes, &verifier)
 }
 
 #[cfg(test)]

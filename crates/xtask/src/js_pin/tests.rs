@@ -386,29 +386,24 @@ fn a_gh_that_cannot_start_is_an_error_naming_it() {
 fn the_verb_refuses_before_any_download() {
     let dir = Path::new("/nonexistent/js-dir");
     let pin = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../kbf-js-version.toml");
-    let error = fetch_pinned_js(
-        &pin,
-        "js-other",
-        "x86_64-unknown-linux-musl",
-        Path::new("gh"),
-        dir,
-    )
-    .unwrap_err()
-    .to_string();
+    let args = |pin: &Path, program: &str| Args {
+        pin: pin.to_path_buf(),
+        program: program.to_owned(),
+        target: "x86_64-unknown-linux-musl".to_owned(),
+        gh: PathBuf::from("gh"),
+        dir: dir.to_path_buf(),
+    };
+    let error = fetch_pinned_js(&args(&pin, "js-other"))
+        .unwrap_err()
+        .to_string();
     assert_eq!(
         error,
         "kbf-js-version.toml: no [[archive]] row for js-other on x86_64-unknown-linux-musl"
     );
     let missing = Path::new("/nonexistent/pin.toml");
-    let error = fetch_pinned_js(
-        missing,
-        "js-agent",
-        "x86_64-unknown-linux-musl",
-        Path::new("gh"),
-        dir,
-    )
-    .unwrap_err()
-    .to_string();
+    let error = fetch_pinned_js(&args(missing, "js-agent"))
+        .unwrap_err()
+        .to_string();
     assert!(
         error.starts_with("read the pin /nonexistent/pin.toml: "),
         "{error}"

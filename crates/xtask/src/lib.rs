@@ -44,9 +44,8 @@
 //!   <program> --repo <owner/repo> --signer-workflow <path> --source-ref <ref> --source-digest <sha>`
 //!   ([`fetch_attested`]): a pinned release archive, refused unless its SHA-256 matches and `gh attestation
 //!   verify` accepts the file, and only then the member is taken out of that file.
-//! - `fetch-pinned-js --pin <file> --program <name> --target <triple> --gh <program> --dir <dir>`
-//!   ([`js_pin`]): the same, for a program of the jobscheduler release `kbf-js-version.toml` pins, with
-//!   every value taken from that file and the attestation held to the pinned transparency log entry.
+//! - `fetch-pinned-js` ([`js_pin`]): the same, for a program of the jobscheduler release that
+//!   `kbf-js-version.toml` pins, every value taken from that file.
 //! - `package --binary <path> --sbom <path> --platform <platform> --commit <sha> --out
 //!   <dir>` ([`package`]): one binary as a release asset, a tarball that is the same
 //!   bytes on every runner, and its SBOM, with their lines in `SHA256SUMS.<platform>`.
@@ -327,25 +326,8 @@ enum Verb {
         #[arg(long)]
         source_digest: String,
     },
-    /// Fetch a program of the pinned jobscheduler release (`kbf-js-version.toml`): its archive,
-    /// checked against the pinned SHA-256 and the pinned build attestation, then the program out of it.
-    FetchPinnedJs {
-        /// The pin file.
-        #[arg(long)]
-        pin: PathBuf,
-        /// The program, as a row of the pin names it.
-        #[arg(long)]
-        program: String,
-        /// The target triple, as the row names it.
-        #[arg(long)]
-        target: String,
-        /// The `gh` program.
-        #[arg(long)]
-        gh: PathBuf,
-        /// Where the archive and the program are written (the archive must not be there yet).
-        #[arg(long)]
-        dir: PathBuf,
-    },
+    /// Fetch a program of the pinned jobscheduler release (`kbf-js-version.toml`), checked.
+    FetchPinnedJs(js_pin::Args),
     /// Package one binary and its SBOM as release assets in `--out`.
     Package {
         /// The binary; its file name is the asset's name.
@@ -1209,13 +1191,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             &gh,
         )
         .map(|line| vec![line]),
-        Verb::FetchPinnedJs {
-            pin,
-            program,
-            target,
-            gh,
-            dir,
-        } => js_pin::fetch_pinned_js(&pin, &program, &target, &gh, &dir).map(|line| vec![line]),
+        Verb::FetchPinnedJs(args) => js_pin::fetch_pinned_js(&args).map(|line| vec![line]),
         Verb::Package {
             binary,
             sbom,

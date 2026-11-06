@@ -449,7 +449,9 @@ impl State {
 
     /// `CancelJob` (design section 5.3): a queued job is cancelled at once and keeps the
     /// intent (`cancel_requested`), as the released service answers it; a job on a host gets
-    /// the intent and ends when the host reports it stopped; an ended job is unchanged.
+    /// the intent and ends when the host reports it stopped; an ended job is unchanged. The
+    /// intent on a cancelled queued job follows the pinned release, until the service matches
+    /// `job.proto` (see the module docs).
     pub(super) fn cancel(&mut self, id: &str) -> Result<Job, Status> {
         self.sweep();
         let now = self.now_ms;
