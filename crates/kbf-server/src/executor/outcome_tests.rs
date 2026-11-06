@@ -204,6 +204,10 @@ fn cases() -> Vec<(&'static str, Case)> {
             judged(refused_to_start("host-unsafe"), none.clone()),
         ),
         (
+            "failed to start egress-unchecked",
+            judged(refused_to_start("egress-unchecked"), none.clone()),
+        ),
+        (
             "failed to start, any other code or detail",
             judged(refused_to_start("scratch-failed"), none.clone()),
         ),
@@ -450,6 +454,7 @@ fn an_agent_detail_is_read_by_its_leading_code_only() {
         "the quota-unavailable",
         "files-unsupported-ish",
         "host-unsafe-ish",
+        "egress-unchecked-ish",
         "quota-unavailable2",
         "",
     ] {
@@ -465,6 +470,11 @@ fn an_agent_detail_is_read_by_its_leading_code_only() {
     assert_eq!(
         infra(judged("host-unsafe: tainted")),
         "the job failed to start: host-unsafe"
+    );
+    assert_eq!(
+        infra(judged("egress-unchecked: no nft table")),
+        "the host refused to start the job: its agent could not check the limits of the \
+         job's network (egress-unchecked)"
     );
 }
 

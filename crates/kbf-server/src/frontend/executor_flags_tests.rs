@@ -253,6 +253,8 @@ fn the_defaults_are_the_executors_own() {
     assert_eq!(config.call_timeout, own.call_timeout);
     assert_eq!(config.output_disk_bytes, own.output_disk_bytes);
     assert_eq!(own.delivery, config.delivery);
+    assert_eq!(config.network, own.network);
+    assert_eq!(config.allow_open_network, own.allow_open_network);
 }
 
 /// Catches an image that is taken when it is not pinned by digest, or dropped when it is: for
@@ -552,4 +554,54 @@ fn old_lease_flags_are_refused_and_job_flags_are_required() {
     let none = ExecutorFlags::default();
     assert_eq!(none.kind, ExecutorKind::KbfDaemon);
     assert!(none.js.is_none());
+}
+
+/// Catches `--executor-network` not becoming the executor's network, an open network taken on
+/// one flag, or a stray opt-in: each level names its network; `open` alone is refused when the
+/// flags are read, the message naming both flags; `open` with `--executor-allow-open-network`
+/// is accepted; the opt-in with another level is refused naming it; a level that is not one is
+/// refused naming the flag; and with `--executor kbf-daemon` neither flag is read.
+#[test]
+fn executor_network_is_the_jobs_network_and_open_needs_its_opt_in() {
+    let network = |more: &[&str]| {
+        let flags = js_with(more).expect("flags");
+        let config = flags.executor.js.expect("js-agent").config;
+        (config.network, config.allow_open_network)
+    };
+    assert_eq!(network(&[]), (Network::AllowList, false));
+    assert_eq!(
+        network(&["--executor-network=allow-list"]),
+        (Network::AllowList, false)
+    );
+    assert_eq!(
+        network(&["--executor-network=none"]),
+        (Network::None, false)
+    );
+    assert_eq!(
+        network(&["--executor-network=open", "--executor-allow-open-network"]),
+        (Network::Open, true)
+    );
+    let first = |why: String| why.lines().next().unwrap_or_default().to_owned();
+    assert_eq!(
+        first(refused(&["--executor-network=open"])),
+        "error: --executor js-agent: --executor-network open lets every job reach any address: give \
+         --executor-allow-open-network as well to say so"
+    );
+    for level in ["allow-list", "none"] {
+        let flag = format!("--executor-network={level}");
+        let why = first(refused(&[&flag, "--executor-allow-open-network"]));
+        assert_eq!(
+            why,
+            "error: --executor js-agent: --executor-allow-open-network is only for --executor-network \
+             open: drop it",
+            "{level}"
+        );
+    }
+    assert!(
+        refused(&["--executor-allow-open-network"]).contains("only for --executor-network open")
+    );
+    let why = refused(&["--executor-network=wide"]);
+    assert!(why.contains("--executor-network"), "{why}");
+    let daemons = parsed(argv(&["--executor-network=open"])).expect("ignored with daemons");
+    assert!(daemons.executor.js.is_none());
 }

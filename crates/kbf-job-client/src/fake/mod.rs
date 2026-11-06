@@ -17,6 +17,7 @@
 //! - **States are the test's to move**, one step at a time: [`place`](FakeJobServer::place),
 //!   [`starting`](FakeJobServer::starting), [`run`](FakeJobServer::run),
 //!   [`finish`](FakeJobServer::finish), [`fail_to_start`](FakeJobServer::fail_to_start),
+//!   [`refuse_start`](FakeJobServer::refuse_start) (with the agent's detail),
 //!   [`lose`](FakeJobServer::lose), [`host_stopped`](FakeJobServer::host_stopped). Cancel of a
 //!   queued job cancels it at once and marks it `cancel_requested`, as the released service
 //!   does; of a placed, starting or running job it records the intent and the job is cancelled
@@ -309,6 +310,14 @@ impl FakeJobServer {
     /// A queued, placed or starting job fails to start with `code`.
     pub fn fail_to_start(&self, job: &str, code: StartFailureCode) -> bool {
         self.shared.state().fail_to_start(job, code)
+    }
+
+    /// A queued, placed or starting job is refused by its host's agent
+    /// (`AGENT_REFUSED`), with the agent's own code as the detail every read of it shows.
+    pub fn refuse_start(&self, job: &str, detail: &str) -> bool {
+        self.shared
+            .state()
+            .fail_to_start_with(job, StartFailureCode::AgentRefused, detail)
     }
 
     /// A job on a host is lost (the provider reads the host absent, or the host came back

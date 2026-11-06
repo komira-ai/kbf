@@ -213,8 +213,15 @@ plain-http flags are off by default), and `--executor-locate` (off by default: t
 answer names, from the listener when that read fails; with no grants in the answer it reads from the
 listener as before; refused with `--executor kbf-daemon`; the task image must carry kbf-task
 v0.0.44 or later, the first release that knows `--locate`: an older one refuses the flag and every
-job fails). A setting that breaks a rule the executor's safety rests on (the fence time against
-the scheduler's grace and the start window) is refused at start, exit status 2.
+job fails), and `--executor-network` (the network every job is given on its host: `allow-list`,
+the default, the endpoints the host's agent is set up to allow and nothing else, so each agent must
+allow the read listener and the pack store before the switch; `none`, no route out, with which
+every action fails; `open`, any address but those the agent always denies, refused at start unless
+`--executor-allow-open-network` is also given, and that flag is refused with any other level). A
+start the agent refuses because it cannot check the limits of a job's network (`egress-unchecked`)
+is an infrastructure failure, and the farm runs the action again. A setting that breaks a rule the
+executor's safety rests on (the fence time against the scheduler's grace and the start window, an
+open network without its opt-in) is refused at start, exit status 2.
 
 Per-action overhead of the executor, for comparing it with a daemon, is read from two places. The
 executor's own phases are the histogram `kbf_executor_phase_seconds{phase=...}` on `GET /metrics`:

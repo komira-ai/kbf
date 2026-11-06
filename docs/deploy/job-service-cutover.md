@@ -46,6 +46,14 @@ each part is set up:
 3. **At least one farm agent** (`js-agent`) registered with that pool, so that a job can be
    placed. The check does not need one (an empty list passes), but every job a frontend submits
    waits in the queue until one is there.
+4. **Each agent's job network allows the frontend's read listener and the pack store.** Every job
+   the executor submits asks for the network `--executor-network` names, by default the agent's
+   allow-list, and its task reads its inputs from the read listener and writes its pack to the
+   store. If an agent's allow-list leaves either out, the task cannot reach it and every action on
+   that host fails as an infrastructure error; an agent that cannot check the limits of its job
+   network refuses the start (`egress-unchecked`), and the farm runs the action again on another
+   host. The check does not test this: switch a frontend over only once the agents are set up for
+   it.
 
 ## kbf's client token
 

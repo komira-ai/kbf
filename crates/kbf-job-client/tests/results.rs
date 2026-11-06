@@ -145,6 +145,56 @@ async fn a_start_failure_keeps_its_code() {
     assert!(!server.fail_to_start("running", code));
 }
 
+/// Asserts a start the host's agent refused: from queued, placed and starting it ends failed to
+/// start with `AGENT_REFUSED` and every read of it shows the agent's detail as given, a job
+/// failed to start with a code alone shows no detail, and a running job cannot be refused.
+/// Catches a refusal that drops the detail, or one detail shown on another job.
+#[tokio::test]
+async fn a_refused_start_keeps_the_agents_detail() {
+    let (server, client) = fake().await;
+    for id in ["queued", "placed", "starting", "running", "bare"] {
+        client.submit_job(spec(id)).await.unwrap();
+    }
+    assert!(server.place("placed", support::HOST));
+    assert!(server.place("starting", support::HOST) && server.starting("starting"));
+    to_running(&server, "running");
+    for (id, detail) in [
+        ("queued", "egress-unchecked"),
+        ("placed", "host-tainted: marker"),
+        ("starting", ""),
+    ] {
+        assert!(server.refuse_start(id, detail), "{id}");
+        let job = client.get_job(id).await.unwrap();
+        assert_eq!(
+            (
+                job.state(),
+                job.start_failure(),
+                job.start_failure_detail.as_str()
+            ),
+            (
+                JobState::FailedToStart,
+                StartFailureCode::AgentRefused,
+                detail
+            ),
+            "{id}"
+        );
+    }
+    assert!(server.fail_to_start("bare", StartFailureCode::NoCapacity));
+    assert_eq!(
+        client.get_job("bare").await.unwrap().start_failure_detail,
+        ""
+    );
+    assert!(!server.refuse_start("running", "egress-unchecked"));
+    assert_eq!(
+        client
+            .get_job("running")
+            .await
+            .unwrap()
+            .start_failure_detail,
+        ""
+    );
+}
+
 /// Asserts the times of a job: with the clock moved on between each step, a job queued at 0,
 /// placed 1 s later, starting 2 s after that, running 500 ms after that and finished 4 s
 /// later has, in `get_job` and in `get_result`, exactly the times 0, 1000, 3500 and 7500 ms

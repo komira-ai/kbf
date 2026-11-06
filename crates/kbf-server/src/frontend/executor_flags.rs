@@ -36,7 +36,7 @@ use kbf_types::ImageRef;
 
 use crate::Farm;
 use crate::executor::{
-    Config, Delivery, Deps, Executor, ExecutorKind, Front, FrontParts, Metrics, RunSource,
+    Config, Delivery, Deps, Executor, ExecutorKind, Front, FrontParts, Metrics, Network, RunSource,
 };
 
 const KIND: &str = "executor";
@@ -62,6 +62,8 @@ const MAX_RUN: &str = "executor_max_run_secs";
 const DEFAULT_TIMEOUT: &str = "executor_default_timeout_secs";
 const CALL_TIMEOUT: &str = "executor_call_timeout_secs";
 const OUTPUT_DISK: &str = "executor_output_disk_bytes";
+const NETWORK: &str = "executor_network";
+const OPEN_NETWORK: &str = "executor_allow_open_network";
 
 /// The flags a `js-agent` executor cannot do without, in the order their absence is named.
 const REQUIRED: [(&str, &str); 8] = [
@@ -330,6 +332,28 @@ pub(super) fn args() -> Vec<Arg> {
                  places it only on a host whose disk can hold it. Used only with `--executor \
                  js-agent`",
             ),
+        Arg::new(NETWORK)
+            .long("executor-network")
+            .value_name("LEVEL")
+            .value_parser(["none", "allow-list", "open"])
+            .default_value("allow-list")
+            .help(
+                "The network every job is given on its host. `allow-list`, the default, is the \
+                 endpoints the host's agent is set up to allow and nothing else: the task \
+                 reaches the read listener and the pack store only once each agent allows them, \
+                 and a host whose agent cannot check those limits refuses the job \
+                 (`egress-unchecked`), which the farm runs again. `none` is no route out: every \
+                 action fails, as the task can reach neither. `open` is any address but those \
+                 the agent always denies, and needs `--executor-allow-open-network`. Used only \
+                 with `--executor js-agent`",
+            ),
+        switch(
+            OPEN_NETWORK,
+            "executor-allow-open-network",
+            "Says jobs may be given an open network: what `--executor-network open` needs, and \
+             refused with any other `--executor-network`. Off by default. Used only with \
+             `--executor js-agent`",
+        ),
     ]
 }
 
@@ -493,6 +517,8 @@ fn js_agent_flags(m: &ArgMatches) -> Result<JsAgentFlags, String> {
     config.default_timeout = secs(DEFAULT_TIMEOUT);
     config.call_timeout = secs(CALL_TIMEOUT);
     config.output_disk_bytes = count(OUTPUT_DISK);
+    config.network = network(m);
+    config.allow_open_network = m.get_flag(OPEN_NETWORK);
     Ok(JsAgentFlags {
         config,
         job_url,
@@ -511,6 +537,15 @@ fn delivery(m: &ArgMatches) -> Delivery {
     match m.get_one::<String>(DELIVERY).map(String::as_str) {
         Some("files") => Delivery::Files,
         _ => Delivery::InsecureArgv,
+    }
+}
+
+/// The network `--executor-network` names.
+fn network(m: &ArgMatches) -> Network {
+    match m.get_one::<String>(NETWORK).map(String::as_str) {
+        Some("none") => Network::None,
+        Some("open") => Network::Open,
+        _ => Network::AllowList,
     }
 }
 

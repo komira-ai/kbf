@@ -85,6 +85,8 @@ struct Record {
     spec: JobSpec,
     state: JobState,
     start_failure: StartFailureCode,
+    /// The agent's own code of a start it refused; empty otherwise.
+    start_failure_detail: String,
     host: String,
     times: JobTimes,
     cancel_requested: bool,
@@ -122,7 +124,7 @@ fn view(record: &Record, hosts: &BTreeMap<String, Host>) -> Job {
         spec: Some(spec),
         state: record.state.into(),
         start_failure: record.start_failure.into(),
-        start_failure_detail: String::new(),
+        start_failure_detail: record.start_failure_detail.clone(),
         host_id: record.host.clone(),
         times: Some(record.times),
         host_silent_since_ms: silent,
@@ -365,6 +367,7 @@ impl State {
             spec,
             state: JobState::Queued,
             start_failure: StartFailureCode::Unspecified,
+            start_failure_detail: String::new(),
             host: String::new(),
             times: JobTimes {
                 queued_at_ms: self.now_ms,
@@ -584,6 +587,15 @@ impl State {
     }
 
     pub(super) fn fail_to_start(&mut self, id: &str, code: StartFailureCode) -> bool {
+        self.fail_to_start_with(id, code, "")
+    }
+
+    pub(super) fn fail_to_start_with(
+        &mut self,
+        id: &str,
+        code: StartFailureCode,
+        detail: &str,
+    ) -> bool {
         self.step(
             id,
             |record| {
@@ -594,6 +606,7 @@ impl State {
             },
             |record, now| {
                 record.start_failure = code;
+                detail.clone_into(&mut record.start_failure_detail);
                 end(record, JobState::FailedToStart, now);
             },
         )

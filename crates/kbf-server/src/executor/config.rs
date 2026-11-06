@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use js_proto::v1::{Constraints, ExecMode};
+use js_proto::v1::{Constraints, ExecMode, NetworkLevel};
 use kbf_proto::worker::{Capability, Hello};
 use kbf_sched::fence::{LEADER_LEASE_MARGIN, LEASE_GRACE, SELF_FENCE, START_GRACE, START_VALIDITY};
 use ring::rand::{SecureRandom, SystemRandom};
@@ -34,6 +34,35 @@ pub const DEFAULT_OUTPUT_DISK: u64 = 8 * GIB;
 /// What a job needs beyond its inputs and its output allowance: 1 GiB for what neither counts
 /// (the task tool's own files, the manifest and logs, the filesystem's rounding).
 pub const DISK_MARGIN: u64 = GIB;
+
+/// The network a job of the executor is given on its host (`--executor-network`): the
+/// job's `network` level, which the job service passes to the host's agent. A job that asks
+/// for none is given none, so every job names one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Network {
+    /// No route out: the task can reach neither the read listener nor the store, so every
+    /// action fails. For a farm whose agents give jobs no network yet.
+    None,
+    /// The endpoints the host's agent allows, and nothing else: the read listener and the
+    /// store, when the agent is set up for them. The default.
+    #[default]
+    AllowList,
+    /// Any address but those the agent always denies. Only with
+    /// [`Config::allow_open_network`].
+    Open,
+}
+
+impl Network {
+    /// The job's `network` level: never unspecified, which the service reads as none.
+    #[must_use]
+    pub fn level(self) -> NetworkLevel {
+        match self {
+            Self::None => NetworkLevel::None,
+            Self::AllowList => NetworkLevel::AllowList,
+            Self::Open => NetworkLevel::Open,
+        }
+    }
+}
 
 /// The executor's settings. Every duration is an upper or lower bound the executor holds
 /// itself to; [`Config::validate`] refuses a set that breaks the ones the scheduler's
@@ -113,6 +142,12 @@ pub struct Config {
     /// (`--executor-output-disk-bytes`). A job needs this, the bytes of its input closure and
     /// [`DISK_MARGIN`] ([`Config::disk_bytes`]).
     pub output_disk_bytes: u64,
+    /// The network every job is given (`--executor-network`).
+    pub network: Network,
+    /// Whether the operator has said a job may have an open network
+    /// (`--executor-allow-open-network`). [`Config::validate`] refuses
+    /// [`Network::Open`] without it, and it without [`Network::Open`].
+    pub allow_open_network: bool,
 }
 
 /// Why a [`Config`] is refused.
@@ -163,6 +198,16 @@ pub enum ConfigError {
     /// A presign ceiling or a job longer than a url may be good for.
     #[error("the presign ceiling and the longest job's wall limit must be at most 4 hours")]
     PresignLimit,
+    /// An open network for the jobs, which the operator has not allowed.
+    #[error(
+        "--executor-network open lets every job reach any address: give \
+         --executor-allow-open-network as well to say so"
+    )]
+    OpenNetwork,
+    /// The opt-in for an open network, with another network: it would open the network on a
+    /// later change of one flag.
+    #[error("--executor-allow-open-network is only for --executor-network open: drop it")]
+    OpenNetworkUnused,
 }
 
 impl Config {
@@ -196,6 +241,8 @@ impl Config {
             max_blob_bytes: 64 << 20,
             presign_ceiling: PRESIGN_LIMIT,
             output_disk_bytes: DEFAULT_OUTPUT_DISK,
+            network: Network::AllowList,
+            allow_open_network: false,
         }
     }
 
@@ -280,6 +327,14 @@ impl Config {
             (
                 self.delivery != Delivery::Files || !self.insecure_argv_secrets,
                 ConfigError::InsecureWithFiles,
+            ),
+            (
+                self.network != Network::Open || self.allow_open_network,
+                ConfigError::OpenNetwork,
+            ),
+            (
+                self.network == Network::Open || !self.allow_open_network,
+                ConfigError::OpenNetworkUnused,
             ),
         ];
         checks
