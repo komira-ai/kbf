@@ -16,8 +16,8 @@
 //! submit idempotent; the client never makes one up. The service is still the authority on
 //! every rule.
 //!
-//! No farm code calls the client yet: the host executor moves to it in a later change, and
-//! `kbf-lease-client` stays until the farm stops leasing hosts.
+//! The host executor of `kbf-server` (`crates/kbf-server/src/executor`) is its one caller: it
+//! submits each placed action as a job and reads its result.
 //!
 //! # Safety of the credential
 //!

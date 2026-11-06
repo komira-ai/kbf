@@ -57,13 +57,13 @@
 //! and says so in `Welcome.pack_commit`.
 //!
 //! **The executor** is off unless `--executor js-agent` is given (`executor_flags` has the flags):
-//! the farm then runs the actions it places on hosts leased from the job scheduler's lease
-//! server ([`crate::executor`]), and `FrontendHandle::serve` steps it beside the listeners and
-//! releases its leases when the frontend stops. It needs the packs and the preparation of task
+//! the farm then runs each action it places as a job of the job scheduler's job service
+//! ([`crate::executor`]), and `FrontendHandle::serve` steps it beside the listeners and
+//! cancels its jobs when the frontend stops. It needs the packs and the preparation of task
 //! runs (below, with the `--job-*` listener its read grants point at): `--executor js-agent` is
 //! refused when the flags are parsed without them, and where its settings disagree with them
 //! (`executor_bind` lists the checks). By default, `--executor kbf-daemon`, nothing is built and
-//! no lease server is contacted.
+//! no job service is contacted.
 //!
 //! **Task runs** are prepared only if `--task-secret-file` is given (`task_flags` has the flags
 //! and what they need): the started frontend then carries a [`kbf_front::prepare_run::RunPrep`]
@@ -673,7 +673,7 @@ impl FrontendHandle {
         let _tasks: Vec<AbortOnDrop> = tasks
             .map(|task| AbortOnDrop(tokio::spawn(task).abort_handle()))
             .collect();
-        // Started with the listeners: a frontend that never serves leases no host. Stopped
+        // Started with the listeners: a frontend that never serves submits no job. Stopped
         // after the serving future (the listeners and their drain) is over, so the runs of
         // builds still open are not cut before the drain ends; the background tasks above are
         // not listeners and live to the end of this function.
@@ -754,7 +754,7 @@ where
 /// takes none and ignores it.
 ///
 /// # Errors
-/// As [`start_frontend`]; and `--executor js-agent` without a `source`, a lease server token
+/// As [`start_frontend`]; and `--executor js-agent` without a `source`, a job service token
 /// that cannot be used, a CA file that cannot be read, or settings that break a rule of the
 /// executor.
 pub fn start_frontend_with<S, F>(
@@ -1346,7 +1346,7 @@ struct ExecutorParts {
 }
 
 /// The executor `--executor js-agent` describes, over `farm`, with the metrics it counts into;
-/// none for `kbf-daemon`, which builds nothing and contacts no lease server. The seams are the
+/// none for `kbf-daemon`, which builds nothing and contacts no job service. The seams are the
 /// frontend's own: the ingest of the packs, the CAS `backend` over the same packs, and the
 /// `source` of the keys, writes and grants.
 ///

@@ -1,7 +1,7 @@
 //! The executor over the frontend's own run preparation: the real `prepare_run` of
 //! `kbf_front::prepare_run`, opened from the task flags the way a started frontend opens it,
 //! and no stand-in for the key, the presigned write or the read grant. The farm is the real
-//! one, the lease server is in this process, and the tier store is a memory object store the
+//! one, the job service is in this process, and the tier store is a memory object store the
 //! test writes the task's pack to (the task itself is not run).
 
 use std::os::unix::fs::PermissionsExt as _;
@@ -14,8 +14,7 @@ use kbf_front::{
     Backend, Cache, CacheStorage, Described, Dispatch as _, Finished, PackSettings, Packs,
     SegmentsConfig, Stage, Submission, VerifiedBlob,
 };
-use kbf_lease_client::fake::{FakeLeaseServer, Pool, TOKEN};
-use kbf_lease_client::{Outcome, RunId};
+use kbf_job_client::fake::{FakeJobServer, TOKEN};
 use kbf_objstore::{Capabilities, MemoryStore, ObjectKey, ObjectStore as _};
 use kbf_pack::{PackKeys, TaskManifest, Timing, Usage, WriterKind, write_pack};
 use kbf_pack_index::PackIndex;
@@ -31,13 +30,15 @@ use kbf_types::{ActionKey, Digest, LeaseKind, Qos, Resources};
 use prost::Message as _;
 use tonic::Code;
 
-use crate::rig::{ClockHold, GIB, settle};
+use crate::rig::{ClockHold, GIB, machine, settle};
 
 const SECRET: &[u8] = b"0123456789abcdef0123456789abcdef";
 const KBF_IMAGE: &str =
     "registry.test/kbf@sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
 const IMAGE: &str = "docker://registry.test/app@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const BUCKET: &str = "packs";
+/// The host the job service has, which the test places the executor's jobs on.
+const HOST: &str = "host-1";
 
 /// The most steps a wait takes before the test fails with what the executor did, rather than
 /// waiting for ever.
@@ -99,7 +100,7 @@ fn private(path: &std::path::Path, bytes: &[u8]) {
 /// preparation over a CAS, the packs over a memory object store, the farm, and the executor.
 struct World {
     farm: Arc<Farm>,
-    fake: FakeLeaseServer,
+    fake: FakeJobServer,
     objects: Arc<MemoryStore>,
     metrics: Arc<Metrics>,
     running: Running,
@@ -120,11 +121,9 @@ impl World {
         }
         let hold = ClockHold::new();
         let dir = kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), "kbf-server-real");
-        let mut pool = Pool::new("farm-linux", &["node1"], 2_000, 16 * GIB);
-        pool.capabilities
-            .insert("arch".to_owned(), "x86_64".to_owned());
-        let fake = FakeLeaseServer::start(pool).await;
-        let token = dir.path().join("lease-token");
+        let fake = FakeJobServer::start().await.expect("a loopback port");
+        fake.add_host(HOST, machine(64, "x86_64"));
+        let token = dir.path().join("job-token");
         private(&token, TOKEN.as_bytes());
         let secret = dir.path().join("secret");
         private(&secret, &[SECRET, b"\n".as_slice()].concat());
@@ -152,10 +151,9 @@ impl World {
             "--job-tls-key=/nowhere/job.key".to_owned(),
             format!("--job-grant-secret-file={}", secret.display()),
             "--executor=js-agent".to_owned(),
-            format!("--executor-lease-url={}", fake.origin()),
-            format!("--executor-lease-token-file={}", token.display()),
+            format!("--executor-job-url={}", fake.origin()),
+            format!("--executor-job-token-file={}", token.display()),
             "--executor-frontend-id=front-1".to_owned(),
-            "--executor-class=farm-linux".to_owned(),
             "--executor-hosts=1".to_owned(),
             "--executor-host-cpus=2".to_owned(),
             "--executor-host-memory-gib=16".to_owned(),
@@ -246,10 +244,14 @@ impl World {
     }
 
     /// Five seconds pass on the clocks, and the farm and the executor's task run.
+    /// 5 s pass, a second at a time with the executor's task let run in between (a call in
+    /// flight on loopback is answered before its bound passes), and the farm ticks.
     async fn step(&self) {
-        tokio::time::advance(Duration::from_secs(5)).await;
-        self.fake.advance(Duration::from_secs(5));
-        settle().await;
+        for _ in 0..5 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            self.fake.advance(Duration::from_secs(1));
+            settle().await;
+        }
         self.farm.tick().await;
         settle().await;
     }
@@ -268,21 +270,31 @@ impl World {
     fn said(&self) -> String {
         let mut counted = String::new();
         self.metrics.render(&mut counted);
-        format!("{counted}\n{:?}", self.fake.requests())
+        format!("{counted}\n{:?}", self.fake.jobs())
     }
 
-    /// The run the executor posts, once it has.
-    async fn posted(&self) -> RunId {
-        let api = self.fake.client().expect("a client");
+    /// The id of the job the executor submits, once it has.
+    async fn posted(&self) -> String {
         for _ in 0..STEPS {
-            for lease in api.leases().await.expect("leases") {
-                if let Some(run) = api.runs(lease.id).await.expect("runs").pop() {
-                    return run.run_id;
-                }
+            if let Some(job) = self.fake.jobs().first() {
+                return job.id.clone();
             }
             self.step().await;
         }
-        panic!("no run posted after {STEPS} steps: {}", self.said());
+        panic!("no job submitted after {STEPS} steps: {}", self.said());
+    }
+
+    /// The arguments job `id` was submitted with.
+    fn args_of(&self, id: &str) -> Vec<String> {
+        self.fake.submitted(id).expect("a job").args
+    }
+
+    /// The host takes the queued job `id` and runs it to its end with `exit_code`.
+    fn host_finishes(&self, id: &str, exit_code: i32) {
+        assert!(self.fake.place(id, HOST), "{id} is placed");
+        assert!(self.fake.starting(id), "{id} is starting");
+        assert!(self.fake.run(id), "{id} is running");
+        assert!(self.fake.finish(id, exit_code), "{id} finishes");
     }
 }
 
@@ -352,7 +364,7 @@ async fn the_run_books_the_bytes_of_the_closure_the_real_preparation_found() {
     let content = [7u8; 1000];
     let (world, actions) = World::start(&[(&content, true)]).await;
     let _stage = world.submit(actions[0]);
-    let run = world.posted().await;
+    let job = world.posted().await;
     let file = VerifiedBlob::hashed(Bytes::copy_from_slice(&content)).digest();
     let root = Directory {
         files: vec![FileNode {
@@ -364,13 +376,17 @@ async fn the_run_books_the_bytes_of_the_closure_the_real_preparation_found() {
     };
     let inputs = 1000 + root.encode_to_vec().len() as u64;
     assert_eq!(
-        world.fake.run_disk_bytes(&run),
+        world
+            .fake
+            .submitted(&job)
+            .and_then(|spec| spec.needs)
+            .and_then(|needs| needs.disk_bytes),
         Some(inputs + DEFAULT_OUTPUT_DISK + DISK_MARGIN)
     );
 }
 
 /// Catches an executor that does not run an action end to end over the real preparation, with
-/// nothing standing in for the key, the presigned write or the grant: the run is posted with a
+/// nothing standing in for the key, the presigned write or the grant: the job is submitted with a
 /// write of exactly the key it was issued, good for the wall and the slack, and a read grant
 /// the listener's own key verifies for this lease and action; a pack under that key is ingested
 /// under the same mint, and the caller gets the result. No log line, metric or settled detail
@@ -391,10 +407,10 @@ async fn an_action_runs_and_ingests_over_the_real_run_preparation() {
     let action = actions[0];
     let stage = world.submit(action);
     let before = unix_now();
-    let run = world.posted().await;
+    let job = world.posted().await;
     let after = unix_now();
 
-    let args = world.fake.run_args(&run).expect("a run");
+    let args = world.args_of(&job);
     let build = arg(&args, "--lease");
     let (pack_url, token) = (arg(&args, "--pack-url"), arg(&args, "--grant-token"));
     assert_eq!(arg(&args, "--grant-url"), "https://127.0.0.1:9400");
@@ -460,19 +476,14 @@ async fn an_action_runs_and_ingests_over_the_real_run_preparation() {
         )
         .await
         .expect("written");
-    world.fake.run_started(&run);
-    assert!(
-        world
-            .fake
-            .finish_run(&run, Outcome::Succeeded, Some(0), None)
-    );
+    world.host_finishes(&job, 0);
     let Finished::Ran(result) = world.until_done(&stage).await else {
         panic!("the action did not run");
     };
     assert_eq!(result.exit_code, 5);
 
     // A second action whose input is not held is the caller's: it is refused, nothing is
-    // posted for it, and the refusal says what is missing without saying anything secret.
+    // submitted for it, and the refusal says what is missing without saying anything secret.
     let refused = world.submit(actions[1]);
     let Finished::Failed(status) = world.until_done(&refused).await else {
         panic!("not refused");
@@ -499,13 +510,8 @@ async fn an_action_runs_and_ingests_over_the_real_run_preparation() {
         .split('&')
         .find_map(|q| q.strip_prefix("X-Amz-Signature="))
         .expect("a signature");
-    let said = [
-        log.text(),
-        counted,
-        format!("{status:?}"),
-        format!("{:?}", world.fake.requests()),
-    ]
-    .join("\n");
+    // (The job service is not among them: the job it holds carries both, as it is sent to run.)
+    let said = [log.text(), counted, format!("{status:?}")].join("\n");
     assert!(
         said.contains("retiring the worker"),
         "the log was captured: {said}"
@@ -515,11 +521,14 @@ async fn an_action_runs_and_ingests_over_the_real_run_preparation() {
     }
 }
 
-/// Catches a host's failure text reaching the log: a driver's error can quote the argument
-/// list, which holds the signed write and the read token, and the executor logs a run that
-/// ends badly. Nothing it logs may carry either, whatever the host wrote.
+/// Guards the log against a failed job's text: a job's output can quote the argument list,
+/// which holds the signed write and the read token, and the executor logs a job that ends
+/// badly. The host writes both into the job's standard error and the job exits 1; nothing the
+/// executor logs may carry either. (The job service gives a start failure no free text the
+/// executor could log; the executor never reads a job's logs, so this holds, and the test keeps
+/// it holding.)
 #[tokio::test(start_paused = true)]
-async fn a_failed_runs_detail_quoting_the_arguments_never_reaches_the_log() {
+async fn a_failed_jobs_output_quoting_the_arguments_never_reaches_the_log() {
     let log = Log::default();
     let dispatch = tracing::Dispatch::new(
         tracing_subscriber::fmt()
@@ -532,8 +541,8 @@ async fn a_failed_runs_detail_quoting_the_arguments_never_reaches_the_log() {
 
     let (world, actions) = World::start(&[(b"input", true)]).await;
     let stage = world.submit(actions[0]);
-    let run = world.posted().await;
-    let args = world.fake.run_args(&run).expect("a run");
+    let job = world.posted().await;
+    let args = world.args_of(&job);
     let (pack_url, token) = (arg(&args, "--pack-url"), arg(&args, "--grant-token"));
     let signature = pack_url
         .split_once('?')
@@ -545,15 +554,14 @@ async fn a_failed_runs_detail_quoting_the_arguments_never_reaches_the_log() {
         .expect("a signature")
         .to_owned();
 
-    world.fake.run_started(&run);
-    let detail = format!("exec failed: --pack-url {pack_url} --grant-token {token}");
-    assert!(
-        world
-            .fake
-            .finish_run(&run, Outcome::Failed, Some(1), Some(&detail))
-    );
+    assert!(world.fake.place(&job, HOST));
+    assert!(world.fake.starting(&job));
+    assert!(world.fake.run(&job));
+    let output = format!("exec failed: --pack-url {pack_url} --grant-token {token}");
+    assert!(world.fake.write_logs(&job, b"", output.as_bytes()));
+    assert!(world.fake.finish(&job, 1));
     // The farm may run the action again after an infrastructure failure, so the stage is not
-    // waited on: the executor has judged the run once it has had its turns.
+    // waited on: the executor has judged the job once it has had its turns.
     for _ in 0..10 {
         world.step().await;
     }
@@ -562,8 +570,8 @@ async fn a_failed_runs_detail_quoting_the_arguments_never_reaches_the_log() {
 
     let said = log.text();
     assert!(
-        said.contains("the task tool failed"),
-        "the run was logged: {said}"
+        said.contains("the task tool exited nonzero"),
+        "the job was logged: {said}"
     );
     for secret in [signature.as_str(), token.as_str(), pack_url.as_str()] {
         assert!(!said.contains(secret), "{secret} in {said}");

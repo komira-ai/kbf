@@ -10,7 +10,7 @@
 //!   `kbf_front::prepare_run`): the pack key, one presigned `PUT` of exactly that key, and the
 //!   read grant. The executor asks for them in three steps ([`Ingest::mint`], then
 //!   [`Presign::put_url`], then [`Inputs::read_grant`]), so what the one call returned is parked
-//!   under the lease and handed out once. The write host and the size cap are the
+//!   under the farm lease and handed out once. The write host and the size cap are the
 //!   preparation's: it signs for one store endpoint and the signer limits the object. A run
 //!   that cannot be prepared is the caller's ([`MintError::Refused`]) unless the store could
 //!   not be read ([`MintError::Unavailable`]): see [`RunPrep`]'s [`PrepareFault`].
@@ -345,7 +345,6 @@ fn reason(why: kbf_front::RejectReason) -> RejectReason {
 impl Presign for Front {
     async fn put_url(
         &self,
-        _host: &str,
         key: &PackKey,
         _expires: Duration,
         _max_bytes: u64,

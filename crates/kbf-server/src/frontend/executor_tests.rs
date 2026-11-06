@@ -1,17 +1,19 @@
-//! A frontend started with the executor flags, over a lease server in this process: with no
-//! executor it never contacts the lease server; with `js-agent` it holds hosts while it serves,
-//! counts them on `GET /metrics`, releases them when it stops, and stops by itself when another
-//! frontend holds hosts.
+//! A frontend started with the executor flags, over a job service in this process: with no
+//! executor it never contacts the job service; with `js-agent` it registers its workers while
+//! it serves, takes up the jobs an earlier process left and cancels its own when it stops, and
+//! stops by itself when another frontend has jobs.
 
 use std::error::Error;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::sync::Arc;
 
+use js_proto::v1::{ExecMode, JobSpec, JobState, ListJobsRequest, Shape};
 use kbf_front::PackKeyMint;
-use kbf_lease_client::fake::{FakeLeaseServer, Pool, TOKEN};
-use kbf_lease_client::{AcquireRequest, Client, LeaseState, Resources};
+use kbf_job_client::fake::{Call, FakeJobServer, Machine, TOKEN};
 use kbf_objstore::s3::fake::FakeS3;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::net::TcpStream;
 use tokio::sync::oneshot;
 
 use super::pack_tests::{flags_of, index, pack_flags, scrape};
@@ -45,12 +47,30 @@ fn source() -> RunSource {
     }
 }
 
-/// A lease server of `hosts`, hosts that report what the executor asks for.
-async fn lease_server(hosts: &[&str]) -> FakeLeaseServer {
-    let mut pool = Pool::new("farm-linux", hosts, 2_000, 16 << 30);
-    pool.capabilities
-        .insert("arch".to_owned(), "x86_64".to_owned());
-    FakeLeaseServer::start(pool).await
+/// A job service with the hosts `hosts`, each a machine that fits every job the executor
+/// submits.
+async fn job_server(hosts: &[&str]) -> FakeJobServer {
+    let fake = FakeJobServer::start().await.expect("a job service");
+    for host in hosts {
+        fake.add_host(host, machine());
+    }
+    fake
+}
+
+/// A Linux host of 16 cores, 64 GiB and 1 TiB of disk, running containers.
+fn machine() -> Machine {
+    Machine {
+        shape: Shape {
+            cpu_millis: 16_000,
+            memory_bytes: 64 << 30,
+            gpus: 0,
+            gpu_class: String::new(),
+            disk_bytes: Some(1 << 40),
+        },
+        os: "linux".to_owned(),
+        arch: "x86_64".to_owned(),
+        exec: ExecMode::Container,
+    }
 }
 
 /// The flags the host executor prepares its runs with, over files in `dir`: the task flags and
@@ -94,18 +114,17 @@ fn beside_flags(dir: &Path) -> Vec<String> {
 }
 
 /// The flags of a frontend with packs on the S3 service at `endpoint`, and the executor flags
-/// `executor`, which name the lease server `fake`.
-fn flags(dir: &Path, s3: &FakeS3, fake: &FakeLeaseServer, executor: &[&str]) -> FrontendFlags {
-    let token = dir.join("lease-token");
+/// `executor`, which name the job service `fake`.
+fn flags(dir: &Path, s3: &FakeS3, fake: &FakeJobServer, executor: &[&str]) -> FrontendFlags {
+    let token = dir.join("job-token");
     std::fs::write(&token, TOKEN).expect("written");
     std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).expect("mode");
     let mut more = pack_flags(s3.endpoint(), dir);
     more.extend(beside_flags(dir));
     more.extend([
-        format!("--executor-lease-url={}", fake.origin()),
-        format!("--executor-lease-token-file={}", token.display()),
+        format!("--executor-job-url={}", fake.origin()),
+        format!("--executor-job-token-file={}", token.display()),
         "--executor-frontend-id=front-1".to_owned(),
-        "--executor-class=farm-linux".to_owned(),
         "--executor-hosts=1".to_owned(),
         "--executor-host-cpus=2".to_owned(),
         "--executor-host-memory-gib=16".to_owned(),
@@ -131,55 +150,52 @@ fn started(
     Ok((handle, stop))
 }
 
-fn live(leases: &[kbf_lease_client::Lease]) -> usize {
-    leases
-        .iter()
-        .filter(|l| matches!(l.state, LeaseState::Held | LeaseState::Pending))
-        .count()
-}
-
-async fn leases_of(client: &Client) -> Vec<kbf_lease_client::Lease> {
-    client.leases().await.expect("leases")
-}
-
-/// Waits until the lease server lists a lease of the frontend `id`, and returns the leases.
-async fn leased_by(client: &Client, id: &str) -> Vec<kbf_lease_client::Lease> {
-    loop {
-        let leases = leases_of(client).await;
-        if leases
-            .iter()
-            .any(|l| l.labels.get("kbf-frontend").is_some_and(|v| v == id))
-        {
-            return leases;
-        }
-        tokio::task::yield_now().await;
-    }
-}
-
-/// Waits until `check` holds of the scraped metrics of `api`, asking again each time the
-/// frontend has had the chance to do something.
-async fn scraped_until(api: std::net::SocketAddr, check: impl Fn(&str) -> bool) -> String {
+/// The whole answer (head and body) of `GET path` on the operator listener at `api`.
+async fn get(api: std::net::SocketAddr, path: &str) -> String {
+    let mut stream = TcpStream::connect(api).await.expect("connects");
+    let request = format!("GET {path} HTTP/1.1\r\nHost: kbf\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).await.expect("sent");
     let mut text = String::new();
-    for _ in 0..100_000 {
-        text = scrape(api).await;
-        if check(&text) {
-            return text;
+    stream.read_to_string(&mut text).await.expect("answered");
+    text
+}
+
+/// Waits until the farm lists the worker `worker`, as a registered node.
+async fn registered(api: std::net::SocketAddr, worker: &str) -> String {
+    loop {
+        let nodes = get(api, "/v1/nodes").await;
+        if nodes.contains(worker) {
+            return nodes;
         }
         tokio::task::yield_now().await;
     }
-    panic!("the metrics never held: {text}");
+}
+
+/// The calls the job service has handled, by method.
+fn methods(fake: &FakeJobServer) -> Vec<&'static str> {
+    fake.calls()
+        .iter()
+        .map(|call| match call {
+            Call::SubmitJob(_) => "SubmitJob",
+            Call::GetJob(_) => "GetJob",
+            Call::ListJobs(_) => "ListJobs",
+            Call::CancelJob(_) => "CancelJob",
+            Call::GetResult(_) => "GetResult",
+            Call::GetLogs(_) => "GetLogs",
+        })
+        .collect()
 }
 
 /// Catches an executor built where none was asked for: a frontend of `kbf-daemon`, given or not
-/// given the flag, and given every setting of a lease server (as a unit is, after the rollback),
-/// serves and stops without one request to the lease server, and its metrics have no executor
-/// family. An executor would have asked for its leases before it could be stopped.
+/// given the flag, and given every setting of a job service (as a unit is, after the rollback),
+/// serves and stops without one call to the job service, and its metrics have no executor
+/// family. An executor would have listed its jobs before it could be stopped.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_frontend_that_runs_on_daemons_never_contacts_the_lease_server() {
+async fn a_frontend_that_runs_on_daemons_never_contacts_the_job_service() {
     for executor in [&["--executor=kbf-daemon"][..], &[]] {
         let s3 = FakeS3::start().await;
         let dir = scratch_dir("executor-default");
-        let fake = lease_server(&["node1"]).await;
+        let fake = job_server(&["host-1"]).await;
         let flags = flags(dir.path(), &s3, &fake, executor);
         let (handle, stop) = started(&flags, Some(source())).expect("starts");
         let api = handle.api.expect("the operator API");
@@ -188,19 +204,19 @@ async fn a_frontend_that_runs_on_daemons_never_contacts_the_lease_server() {
         assert!(!text.contains("kbf_executor_"), "{text}");
         stop.send(()).expect("stopped");
         served.await.expect("joined").expect("served");
-        assert!(fake.requests().is_empty(), "{:?}", fake.requests());
+        assert!(fake.calls().is_empty(), "{:?}", fake.calls());
     }
 }
 
-/// Catches an executor that does not live with the frontend: it holds a host while the frontend
-/// serves, says so on `GET /metrics`, and the lease is released by the time the frontend has
-/// stopped.
+/// Catches an executor that does not live with the frontend: it asks nothing of the job service
+/// until the frontend serves, then lists the jobs an earlier process left under its id and
+/// registers its worker with the farm (which lists it as a node), says so on `GET /metrics`,
+/// and has nothing of its own left on the job service once the frontend has stopped.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_frontend_with_js_agent_holds_a_host_while_it_serves_and_releases_it_when_it_stops() {
+async fn a_frontend_with_js_agent_registers_its_workers_while_it_serves_and_leaves_no_job() {
     let s3 = FakeS3::start().await;
     let dir = scratch_dir("executor-js");
-    let fake = lease_server(&["node1"]).await;
-    let api_client = fake.client().expect("a client");
+    let fake = job_server(&["host-1"]).await;
     let flags = flags(
         dir.path(),
         &s3,
@@ -210,49 +226,71 @@ async fn a_frontend_with_js_agent_holds_a_host_while_it_serves_and_releases_it_w
     let (handle, stop) = started(&flags, Some(source())).expect("starts");
     let api = handle.api.expect("the operator API");
     assert!(
-        fake.requests().is_empty(),
+        fake.calls().is_empty(),
         "nothing is asked until the frontend serves"
     );
     let served = tokio::spawn(handle.serve());
 
-    let text = scraped_until(api, |text| text.contains("kbf_executor_leases_held 1\n")).await;
+    let nodes = registered(api, "js:front-1-0").await;
+    assert!(nodes.contains("js:front-1-0"), "{nodes}");
+    let text = scrape(api).await;
     for family in [
         "kbf_executor_runs_total{outcome=\"ran\"} 0\n",
         "kbf_executor_ingests_total{result=\"ok\"} 0\n",
         "kbf_executor_late_starts_total 0\n",
-        "kbf_executor_stray_leases_released_total 0\n",
+        "kbf_executor_jobs_submitted_total 0\n",
+        "kbf_executor_jobs_adopted_cancelled_total 0\n",
     ] {
         assert!(text.contains(family), "{family} in {text}");
     }
-    let held = leases_of(&api_client).await;
-    assert_eq!(live(&held), 1);
-    assert_eq!(held[0].labels["kbf-frontend"], "front-1");
+    // The jobs of the frontend's id were listed for adoption (the rival check's listing, of
+    // every live job, has no label), and no action was placed.
+    let listed = fake.calls().into_iter().find_map(|call| match call {
+        Call::ListJobs(request) if !request.labels.is_empty() => Some(request),
+        _ => None,
+    });
+    let listed: ListJobsRequest = listed.expect("the earlier jobs were listed");
+    assert_eq!(
+        listed.labels.get("kbf-frontend").map(String::as_str),
+        Some("front-1")
+    );
+    assert!(
+        !methods(&fake).contains(&"SubmitJob"),
+        "{:?}",
+        methods(&fake)
+    );
 
     stop.send(()).expect("stopped");
     served.await.expect("joined").expect("served");
-    assert_eq!(live(&leases_of(&api_client).await), 0, "released");
+    assert!(fake.jobs().is_empty(), "{:?}", fake.jobs());
+    assert!(
+        !methods(&fake).contains(&"CancelJob"),
+        "{:?}",
+        methods(&fake)
+    );
 }
 
-/// Catches two frontends that both run hosts: a lease of another frontend on the lease server
-/// stops this frontend with an error naming it, before it has leased a host of its own.
+/// Catches two frontends that both run workers: a live job of another frontend on the job
+/// service stops this frontend with an error naming it, before it has registered a worker or
+/// submitted a job of its own, and the other frontend's job is left alone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_frontend_stops_when_another_frontend_holds_hosts() {
+async fn a_frontend_stops_when_another_frontend_has_jobs() {
     let s3 = FakeS3::start().await;
     let dir = scratch_dir("executor-rival");
-    let fake = lease_server(&["node1", "node2"]).await;
-    let api_client = fake.client().expect("a client");
-    let rival = AcquireRequest::new(
-        "farm-linux",
-        Resources {
-            cpu_millis: 2_000,
-            memory_bytes: 16 << 30,
-            gpus: 0,
-            gpu_class: None,
-        },
-        std::time::Duration::from_secs(3_600),
-    )
-    .label("kbf-frontend", "front-2");
-    api_client.acquire(&rival).await.expect("booked");
+    let fake = job_server(&["host-1", "host-2"]).await;
+    let theirs = JobSpec {
+        job_id: "kother-1-1-1".to_owned(),
+        image: "registry.test/kbf@sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+            .to_owned(),
+        wall_limit_seconds: Some(3_600),
+        labels: [
+            ("kbf-frontend".to_owned(), "front-2".to_owned()),
+            ("kbf-instance".to_owned(), "other-process".to_owned()),
+        ]
+        .into(),
+        ..JobSpec::default()
+    };
+    fake.record(theirs).expect("recorded");
     let flags = flags(
         dir.path(),
         &s3,
@@ -260,29 +298,38 @@ async fn a_frontend_stops_when_another_frontend_holds_hosts() {
         &["--executor=js-agent", "--executor-insecure-argv-secrets"],
     );
     let (handle, _stop) = started(&flags, Some(source())).expect("starts");
-    // A frontend that does not stop would lease a host of its own: the test fails then, with
-    // the leases, instead of waiting for a stop that does not come.
+    let api = handle.api.expect("the operator API");
+    // A frontend that does not stop would register a worker of its own: the test fails then,
+    // with the nodes, instead of waiting for a stop that does not come.
     let served = tokio::select! {
         served = handle.serve() => served,
-        held = leased_by(&api_client, "front-1") => panic!("it leased a host of its own: {held:?}"),
+        nodes = registered(api, "js:front-1-0") => panic!("it registered a worker: {nodes}"),
     };
     let Err(ServeError::Executor(why)) = served else {
         panic!("not refused: {served:?}");
     };
     assert!(why.contains("front-2"), "{why}");
-    let held = leases_of(&api_client).await;
-    assert_eq!(held.len(), 1, "no lease of its own: {held:?}");
-    assert_eq!(held[0].labels["kbf-frontend"], "front-2");
+    let jobs = fake.jobs();
+    assert_eq!(jobs.len(), 1, "no job of its own: {jobs:?}");
+    assert_eq!(jobs[0].id, "kother-1-1-1");
+    assert_eq!(jobs[0].state(), JobState::Queued, "left alone");
+    assert!(!jobs[0].cancel_requested);
+    assert!(
+        !methods(&fake).contains(&"SubmitJob"),
+        "{:?}",
+        methods(&fake)
+    );
 }
 
 /// Catches a frontend that starts an executor it cannot run: `js-agent` without the
-/// preparation of runs, with a token file others can read, or with its pack flags removed
-/// after they were parsed is refused at the start, before anything is bound or asked.
+/// preparation of runs, with its pack flags removed after they were parsed, or with a job
+/// service token file that others can read or that is missing, is refused at the start, before
+/// anything is bound or asked.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_frontend_that_cannot_build_its_executor_does_not_start() {
     let s3 = FakeS3::start().await;
     let dir = scratch_dir("executor-refused");
-    let fake = lease_server(&["node1"]).await;
+    let fake = job_server(&["host-1"]).await;
     let js = ["--executor=js-agent", "--executor-insecure-argv-secrets"];
 
     let good = flags(dir.path(), &s3, &fake, &js);
@@ -303,15 +350,19 @@ async fn a_frontend_that_cannot_build_its_executor_does_not_start() {
         .to_string();
     assert!(why.contains("--pack-store-endpoint"), "{why}");
 
-    std::fs::set_permissions(
-        dir.path().join("lease-token"),
-        std::fs::Permissions::from_mode(0o644),
-    )
-    .expect("mode");
+    let token = dir.path().join("job-token");
+    std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o644)).expect("mode");
     let why = started(&good, Some(source()))
         .err()
         .expect("refused")
         .to_string();
-    assert!(why.contains("--executor-lease-token-file"), "{why}");
-    assert!(fake.requests().is_empty());
+    assert!(why.contains("--executor-job-token-file"), "{why}");
+
+    std::fs::remove_file(&token).expect("removed");
+    let why = started(&good, Some(source()))
+        .err()
+        .expect("refused")
+        .to_string();
+    assert!(why.contains("--executor-job-token-file"), "{why}");
+    assert!(fake.calls().is_empty(), "{:?}", fake.calls());
 }

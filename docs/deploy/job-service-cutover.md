@@ -19,7 +19,10 @@ This page and `kbf-deploy job-service check` are the first part of the cutover. 
 not written yet, because the executor that submits jobs is not in a release yet:
 
 - **The executor's flags**: rendering the flags that point a frontend's executor at the job
-  service (its address, the token file, the shape of the virtual workers).
+  service (its address, the token file, the shape of the virtual workers:
+  `--executor-job-url`, `--executor-job-token-file`, `--executor-job-ca-file`,
+  `--executor-hosts`, `--executor-host-cpus`, `--executor-host-memory-gib`; see
+  [kbf-modes.md](kbf-modes.md)).
 - **`apply`**: switching a frontend onto the service through the update path.
 - **The canary**: one action run through the job service, checked to complete, after the switch.
 

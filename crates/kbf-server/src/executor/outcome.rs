@@ -1,37 +1,66 @@
-//! How a run ends, as the farm is told.
+//! How a job ends, as the farm is told.
 //!
-//! The lease server reports a run's outcome and exit code and nothing else, so the task
-//! tool's own exit status carries the contract: exit 0 means the action ran, whatever its own
-//! exit code, and the pack holds the rest. Any other ending says why the action did not run,
-//! and the farm runs it again or answers the caller:
+//! The job service reports a job's state, its exit code, why it ended and, for one that did
+//! not start, a code; nothing else. So the task tool's own exit status carries the contract:
+//! exit 0 means the action ran, whatever its own exit code, and the pack holds the rest. Any
+//! other ending says why the action did not run, and the farm runs it again or answers the
+//! caller. Each row's class is what the code below decides, and a test reads this table and
+//! holds the code to it:
 //!
-//! | the run | the farm is told |
-//! |---|---|
-//! | succeeded, exit 0 | whatever the frontend's ingest of the pack says |
-//! | out of memory | `RESOURCE_EXHAUSTED`, killed at its own limit: a farm fault, rerun with more memory |
-//! | timed out at the wall the executor asked for | `DEADLINE_EXCEEDED`: the caller's timeout |
-//! | timed out at a wall the lease cut short | lost (fenced): the farm's fault, rerun |
-//! | failed to start because the host's scratch quota is out of order (`quota-unavailable`) | lost (fenced): the host's fault, rerun elsewhere |
-//! | failed (the tool exited nonzero), killed unasked, failed to start, unknown | `UNAVAILABLE`: infrastructure, rerun |
-//! | the server forgot the run (it is not listed any more) or the host never listed it | lost (daemon restarted): rerun |
+//! | the job | class | the farm is told |
+//! |---|---|---|
+//! | succeeded (exit 0) | `ingest` | whatever the frontend's ingest of the pack says |
+//! | succeeded with a nonzero exit code | `infra` | `UNAVAILABLE`: infrastructure, rerun |
+//! | failed, reason wall limit | `timeout` | `DEADLINE_EXCEEDED`: the action's own timeout, since nothing cuts a job's wall limit |
+//! | failed, reason memory | `out-of-memory` | `RESOURCE_EXHAUSTED`, killed at its own limit (`MemoryKill::OwnLimit`): rerun with more memory |
+//! | failed, reason exit | `infra` | `UNAVAILABLE`: the task tool exited nonzero, rerun |
+//! | failed, any other reason | `infra` | `UNAVAILABLE`: rerun |
+//! | cancelled by anyone else | `infra` | `UNAVAILABLE`: rerun |
+//! | lost | `fenced` | lost (fenced): the container is gone with no result, the host's fault, rerun elsewhere |
+//! | not found after it was seen | `restarted` | lost (daemon restarted): the service no longer knows the id, rerun |
+//! | failed to start quota-unavailable | `fenced` | lost (fenced): the host's scratch quota is out of order, rerun elsewhere |
+//! | failed to start files-unsupported | `infra` | `UNAVAILABLE`: the host cannot write the files of a job, rerun |
+//! | failed to start invalid-file | `invalid` | `INVALID_ARGUMENT`: a file of the job is ours to fix |
+//! | failed to start no-capacity | `infra` | `UNAVAILABLE`: rerun, as the farm's own retry policy says |
+//! | failed to start start-timeout | `infra` | `UNAVAILABLE`: rerun, as the farm's own retry policy says |
+//! | failed to start exclusive-not-ready | `infra` | `UNAVAILABLE`: rerun, as the farm's own retry policy says |
+//! | failed to start host-unsafe | `infra` | `UNAVAILABLE`: rerun, as the farm's own retry policy says |
+//! | failed to start, any other code or detail | `infra` | `UNAVAILABLE`: rerun |
+//! | in a state this server does not know | `infra` | `UNAVAILABLE`: rerun |
+//! | refused at submit no-capable-host | `invalid` | `INVALID_ARGUMENT`: nothing could ever run it |
+//! | refused at submit wall-time-not-positive | `invalid` | `INVALID_ARGUMENT`: nothing could ever run it |
+//! | refused at submit wall-time-above-ceiling | `invalid` | `INVALID_ARGUMENT`: nothing could ever run it |
+//! | refused at submit job-id-conflict | `twin` | `UNAVAILABLE`, and the executor stops: another process wrote the id |
+//! | refused at submit as written (`INVALID_ARGUMENT`) | `invalid` | `INVALID_ARGUMENT`: nothing could ever run it |
+//! | refused at submit with a code this server does not know | `infra` | `UNAVAILABLE`: rerun |
+//! | refused at submit otherwise | `infra` | `UNAVAILABLE`: rerun |
+//!
+//! A message to the farm names the code, never the job: a job carries the arguments, which
+//! may hold the pack url and the read token. The agent's detail of a start it refused is a
+//! code (`quota-unavailable`, ...) or text that can quote those arguments: only the code is
+//! read, from the start of the detail, and only the detail's length is logged.
+//!
+//! A job this executor cancelled is not judged here: the farm cancelled its lease and owes
+//! itself no result, so the task is dropped once the service has answered the cancel.
 
-use kbf_lease_client::{Outcome, Run, RunState};
+use js_proto::v1::{Job, JobResult, JobState, RefusalCode, ResultReason, StartFailureCode};
+use kbf_job_client::Error;
 use kbf_proto::google::rpc;
 use kbf_proto::reapi::Digest;
 use kbf_proto::worker::{self, Lost, MemoryKill};
 use kbf_types::LeaseId;
 use tonic::Code;
 
-/// What a finished run comes to.
+/// What an ended job comes to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Verdict {
     /// The action ran and its pack is to be ingested.
     Ingest,
-    /// The run did not produce a result.
+    /// The job did not produce a result.
     Settled(Settled),
 }
 
-/// A run that did not produce a pack, by what the farm does about it.
+/// A job that did not produce a pack, by what the farm does about it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Settled {
     /// Infrastructure: the farm runs the action again.
@@ -40,75 +69,140 @@ pub(super) enum Settled {
     Timeout,
     /// Killed at its own memory limit.
     OutOfMemory,
-    /// Lost to the host or the lease server: the farm runs the action again elsewhere.
+    /// Lost to the host or the job service: the farm runs the action again elsewhere.
     Lost(Lost),
     /// The action cannot run here: the caller's to fix.
     Invalid(String),
 }
 
-/// The detail a js-agent gives a start it refuses because its scratch disk quota is out of
-/// order (`js-agent-wire`'s `QUOTA_UNAVAILABLE`). Nothing was created, the host is clean, and
-/// it recovers by itself.
-const QUOTA_UNAVAILABLE: &str = "quota-unavailable";
-
-/// Whether `run` never started because the host's scratch quota is out of order: the host's
-/// fault, and no taint.
-pub(super) fn refused_for_quota(run: &Run) -> bool {
-    refused_start(run, QUOTA_UNAVAILABLE)
+/// A submit the service refused: what the farm is told, and whether another process holds
+/// this frontend's id.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Refused {
+    pub(super) settled: Settled,
+    pub(super) twin: bool,
 }
 
-/// The details a js-agent gives a start it refuses because of the files of the run
-/// (`js-agent-wire`): it has no files root, or a file is invalid.
+/// The codes an agent gives a start it refuses, as `js-agent-wire` spells them.
+const QUOTA_UNAVAILABLE: &str = "quota-unavailable";
 const FILES_UNSUPPORTED: &str = "files-unsupported";
 const INVALID_FILE: &str = "invalid-file";
 
-/// Whether `run` never started and the host says why with exactly `detail`.
-fn refused_start(run: &Run, detail: &str) -> bool {
-    run.outcome == Some(Outcome::FailedToStart) && run.detail.as_deref() == Some(detail)
+/// The code an agent's detail starts with: its leading run of lower-case letters, digits and
+/// dashes. The rest is never read.
+fn agent_code(detail: &str) -> &str {
+    let end = detail
+        .find(|c: char| !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'))
+        .unwrap_or(detail.len());
+    &detail[..end]
 }
 
-/// Whether `run` never started because its host cannot deliver the files of a run.
-pub(super) fn refused_for_files(run: &Run) -> bool {
-    refused_start(run, FILES_UNSUPPORTED)
+/// An infrastructure ending, logged with the job id and the detail's length only.
+fn infra(job: &Job, what: &str) -> Verdict {
+    let detail_bytes = job.start_failure_detail.len();
+    tracing::warn!(job = %job.id, detail_bytes, "{what}");
+    Verdict::Settled(Settled::Infra(what.to_owned()))
 }
 
-/// The verdict on `run`. `truncated` says the lease cut the run's wall time short of what
-/// was asked, so a timeout was the lease's.
-pub(super) fn judge(run: &Run, truncated: bool) -> Verdict {
-    // The host's detail is a driver's text, and a driver's error can quote the arguments, which
-    // hold the pack url and the read token: neither the log nor the caller gets it, only its
-    // length. The caller is told the fixed phrase and the exit code.
-    let infra = |what: &str| {
-        let detail_bytes = run.detail.as_deref().map_or(0, str::len);
-        tracing::warn!(run = %run.run_id, detail_bytes, exit_code = ?run.exit_code, "{what}");
-        Verdict::Settled(Settled::Infra(format!(
-            "{what} (exit code {:?})",
-            run.exit_code
-        )))
-    };
-    match (run.state, run.outcome) {
-        (RunState::NeverStarted, _) => Verdict::Settled(Settled::Lost(Lost::DaemonRestarted)),
-        (_, Some(Outcome::Succeeded)) if run.exit_code.unwrap_or(0) == 0 => Verdict::Ingest,
-        (_, Some(Outcome::Succeeded)) => infra("the run succeeded with a nonzero exit code"),
-        (_, Some(Outcome::Failed)) => infra("the task tool failed"),
-        (_, Some(Outcome::Killed)) => infra("the run was killed unasked"),
-        (_, Some(Outcome::TimedOut)) if truncated => Verdict::Settled(Settled::Lost(Lost::Fenced)),
-        (_, Some(Outcome::TimedOut)) => Verdict::Settled(Settled::Timeout),
-        (_, Some(Outcome::OutOfMemory)) => Verdict::Settled(Settled::OutOfMemory),
-        (_, Some(Outcome::FailedToStart)) if refused_for_quota(run) => {
-            tracing::warn!(run = %run.run_id, "the host refused the start: its scratch quota is out of order");
+/// The verdict on `job`, which has ended, with its `result`.
+pub(super) fn judge(job: &Job, result: &JobResult) -> Verdict {
+    match job.state() {
+        JobState::Succeeded => match result.exit_code.unwrap_or(0) {
+            0 => Verdict::Ingest,
+            code => infra(job, &format!("the job succeeded with exit code {code}")),
+        },
+        JobState::Failed => match result.reason() {
+            ResultReason::WallLimit => Verdict::Settled(Settled::Timeout),
+            ResultReason::Memory => Verdict::Settled(Settled::OutOfMemory),
+            ResultReason::Exit => infra(
+                job,
+                &format!(
+                    "the task tool exited nonzero (exit code {:?})",
+                    result.exit_code
+                ),
+            ),
+            _ => infra(job, "the job failed for a reason this server does not know"),
+        },
+        JobState::Cancelled => infra(job, "the job was cancelled by another client"),
+        JobState::Lost => {
+            tracing::warn!(job = %job.id, "the job was lost with its host");
             Verdict::Settled(Settled::Lost(Lost::Fenced))
         }
-        (_, Some(Outcome::FailedToStart)) if refused_for_files(run) => {
-            infra("the host cannot deliver the files of a run")
+        JobState::FailedToStart => failed_to_start(job),
+        _ => infra(job, "the job ended in a state this server does not know"),
+    }
+}
+
+/// The verdict on a job that did not start.
+fn failed_to_start(job: &Job) -> Verdict {
+    match job.start_failure() {
+        StartFailureCode::NoCapacity => infra(job, "the job failed to start: no-capacity"),
+        StartFailureCode::StartTimeout => infra(job, "the job failed to start: start-timeout"),
+        StartFailureCode::ExclusiveNotReady => {
+            infra(job, "the job failed to start: exclusive-not-ready")
         }
-        // A file the agent refuses is ours to fix, and no host takes it.
-        (_, Some(Outcome::FailedToStart)) if refused_start(run, INVALID_FILE) => Verdict::Settled(
-            Settled::Invalid("the agent refused a file of the run".to_owned()),
-        ),
-        (_, Some(Outcome::FailedToStart)) => infra("the run could not start"),
-        (_, Some(Outcome::Unknown)) => infra("the run ended in a way this server does not know"),
-        (_, None) => infra("the run ended with no outcome"),
+        StartFailureCode::AgentRefused => match agent_code(&job.start_failure_detail) {
+            QUOTA_UNAVAILABLE => {
+                tracing::warn!(job = %job.id, "the host refused the start: its scratch quota is out of order");
+                Verdict::Settled(Settled::Lost(Lost::Fenced))
+            }
+            FILES_UNSUPPORTED => infra(job, "the host cannot write the files of a job"),
+            INVALID_FILE => Verdict::Settled(Settled::Invalid(
+                "the host refused a file of the job".to_owned(),
+            )),
+            "host-unsafe" => infra(job, "the job failed to start: host-unsafe"),
+            _ => infra(job, "the host refused to start the job"),
+        },
+        StartFailureCode::Unspecified => infra(job, "the job failed to start"),
+    }
+}
+
+/// The ending of a job the service no longer knows, after it was seen.
+pub(super) fn forgotten() -> Settled {
+    Settled::Lost(Lost::DaemonRestarted)
+}
+
+/// What a submit that failed with `error` comes to; `None` when nothing is decided, because
+/// nothing was sent or the answer was lost, and the same submit is sent again.
+pub(super) fn refused(error: &Error) -> Option<Refused> {
+    let settled = |settled| {
+        Some(Refused {
+            settled,
+            twin: false,
+        })
+    };
+    match error {
+        Error::Unreachable(_) | Error::Transport(_) | Error::Decode(_) => None,
+        Error::Refused(refusal) => match refusal.code() {
+            RefusalCode::JobIdConflict => Some(Refused {
+                settled: Settled::Infra(
+                    "the job service holds another job under this job's id (job-id-conflict)"
+                        .to_owned(),
+                ),
+                twin: true,
+            }),
+            code @ (RefusalCode::NoCapableHost
+            | RefusalCode::WallTimeNotPositive
+            | RefusalCode::WallTimeAboveCeiling) => settled(Settled::Invalid(format!(
+                "the job service refused the job: {}",
+                code.as_str()
+            ))),
+            RefusalCode::Unspecified => settled(Settled::Infra(
+                "the job service refused the job for a reason this server does not know".to_owned(),
+            )),
+        },
+        Error::Status {
+            code: Code::InvalidArgument,
+            ..
+        } => settled(Settled::Invalid(
+            "the job service refused the job as written (INVALID_ARGUMENT)".to_owned(),
+        )),
+        Error::Status { code, .. } => settled(Settled::Infra(format!(
+            "the job service did not take the job ({code:?})"
+        ))),
+        Error::TooMany(_) | Error::Stuck(_) => settled(Settled::Infra(
+            "the job service gave an answer a submit does not have".to_owned(),
+        )),
     }
 }
 
@@ -143,7 +237,7 @@ pub(super) fn result_of(lease: LeaseId, action: &Digest, settled: &Settled) -> w
             result.memory_kill = MemoryKill::OwnLimit as i32;
         }
         Settled::Lost(why) => {
-            result.status = status(Code::Unavailable, "the run was lost");
+            result.status = status(Code::Unavailable, "the job was lost");
             result.lost = *why as i32;
         }
         Settled::Invalid(why) => result.status = status(Code::InvalidArgument, why),
@@ -151,7 +245,7 @@ pub(super) fn result_of(lease: LeaseId, action: &Digest, settled: &Settled) -> w
     result
 }
 
-/// The `Result` of a run that ended well: the action ran and the frontend rebuilt its result.
+/// The `Result` of a job that ended well: the action ran and the frontend rebuilt its result.
 pub(super) fn ran(
     lease: LeaseId,
     action: &Digest,

@@ -288,7 +288,7 @@ const GROUPS: &[(&str, &[&str])] = &[
     ),
     (
         // Where the frontend runs placed actions (`kbf_server::frontend`'s `executor_flags`): the
-        // daemons of the nodes, or hosts leased from the job scheduler's lease server.
+        // daemons of the nodes, or jobs of the job scheduler's job service.
         "executor",
         &[
             "executor",
@@ -297,7 +297,6 @@ const GROUPS: &[(&str, &[&str])] = &[
             "executor-arch",
             "executor-base-image",
             "executor-call-timeout-secs",
-            "executor-class",
             "executor-default-timeout-secs",
             "executor-frontend-id",
             "executor-host-cpus",
@@ -305,11 +304,10 @@ const GROUPS: &[(&str, &[&str])] = &[
             "executor-host-slots",
             "executor-hosts",
             "executor-insecure-argv-secrets",
+            "executor-job-ca-file",
+            "executor-job-token-file",
+            "executor-job-url",
             "executor-kbf-image",
-            "executor-lease-ca-file",
-            "executor-lease-token-file",
-            "executor-lease-ttl-secs",
-            "executor-lease-url",
             "executor-locate",
             "executor-max-run-secs",
             "executor-output-disk-bytes",

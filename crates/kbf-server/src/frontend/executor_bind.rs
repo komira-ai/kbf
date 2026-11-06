@@ -13,7 +13,6 @@
 
 use std::net::IpAddr;
 use std::str::FromStr as _;
-use std::time::Duration;
 
 use axum::http::Uri;
 use kbf_front::prepare_run::MAX_EXPIRY;
@@ -22,10 +21,6 @@ use super::executor_flags::JsAgentFlags;
 use super::job_read::JobReadFlags;
 use super::pack_flags::PackFlags;
 use super::task_flags::TaskFlags;
-
-/// The most a lease server grants a lease for unless it is started with another `--max-ttl`;
-/// it clamps a longer ask to it.
-const SERVER_MAX_TTL: Duration = Duration::from_secs(3600);
 
 /// The settings `--executor js-agent` rests on, as the flags beside it give them.
 pub(super) struct Beside<'a> {
@@ -147,15 +142,6 @@ pub(super) fn check(js: &mut JsAgentFlags, beside: &Beside<'_>) -> Result<Vec<St
              the first and the frontend reads it from the second",
             task.put_bucket, packs.bucket
         )));
-    }
-    if config.lease_ttl > SERVER_MAX_TTL {
-        warnings.push(format!(
-            "--executor-lease-ttl-secs {} is more than the {} s a lease server grants unless \
-             it is started with a longer --max-ttl; it clamps the ask, and a lease may then \
-             end sooner than the executor expects",
-            config.lease_ttl.as_secs(),
-            SERVER_MAX_TTL.as_secs()
-        ));
     }
     Ok(warnings)
 }

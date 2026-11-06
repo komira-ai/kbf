@@ -1,29 +1,29 @@
 //! Where the time of one executor run goes, as the executor itself sees it.
 //!
 //! A run is stamped, on the executor's own clock, at the moments it passes: its `Start` first
-//! seen, its run prepared, its `POST` accepted, the run first read back as running, and read
-//! back as ended, and its ingest done. The time between two stamps is a phase, observed into
+//! seen, its job prepared, its submit answered with the job, the job first read back as
+//! running, and read back as ended, and its ingest done. The time between two stamps is a phase, observed into
 //! `kbf_executor_phase_seconds{phase=...}` the moment the second stamp is set. A phase whose
 //! first stamp was never set (the run was not seen running, the run never started) is not
 //! observed: it is absent, never zero.
 //!
-//! What the stamps can know is bounded by how the executor learns. The lease server's `Run`
-//! has no timestamps, and it learns a run's state from the agent's heartbeat, which trails the
-//! host by one or two beats; the executor reads the host's runs once per pass. So `queue` and
-//! `task` are the executor's passes that first saw the run running and ended, not the instants
-//! the host started and finished it: each is good to a pass plus a heartbeat or two, and a run
-//! that starts and ends between two reads is seen ended without having been seen running (it has
-//! a `run` phase and no `queue` or `task`).
+//! What the stamps can know is bounded by how the executor learns. The stamps are the
+//! executor's own clock, not the job's times, and the service learns a job's state from its
+//! host's agent, which trails the host by one or two beats; the executor reads each job once
+//! per pass. So `queue` and `task` are the executor's passes that first saw the job running and
+//! ended, not the instants the host started and finished it: each is good to a pass plus a
+//! heartbeat or two, and a job that starts and ends between two reads is seen ended without
+//! having been seen running (it has a `run` phase and no `queue` or `task`).
 //!
 //! The phases:
 //!
-//! - `prepare`: the `Start` first seen to its run being ready (the CAS read, the key, the url
+//! - `prepare`: the `Start` first seen to its job being ready (the CAS read, the key, the url
 //!   and the grant);
-//! - `start`: ready to the lease server accepting the `POST` (the lease renewal if one was
-//!   needed, and every pass the lease server answered "no capacity" or "not ready");
-//! - `queue`: accepted to first read back as running;
-//! - `task`: first read back as running to read back as exited or ended;
-//! - `run`: accepted to read back as exited or ended, seen or not seen running in between
+//! - `start`: ready to the job service answering the submit with the job (every pass a submit
+//!   was not answered and was sent again);
+//! - `queue`: accepted to first read back as running (queued, placed and starting);
+//! - `task`: first read back as running to read back as ended;
+//! - `run`: accepted to read back as ended, seen or not seen running in between
 //!   (`queue` plus `task` when both are observed);
 //! - `ingest`: read back as ended to the frontend's read of the pack done.
 
@@ -79,13 +79,13 @@ impl Phase {
 pub(crate) enum Mark {
     /// The `Start` first acted on.
     Seen,
-    /// The run is ready to post.
+    /// The job is ready to submit.
     Prepared,
-    /// The lease server accepted the `POST`.
+    /// The job service answered the submit with the job.
     Posted,
-    /// The run first read back as running.
+    /// The job first read back as running.
     Running,
-    /// The run read back as exited or ended.
+    /// The job read back as ended.
     Ended,
     /// The frontend's read of the pack is done.
     Done,

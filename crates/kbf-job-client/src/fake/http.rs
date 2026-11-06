@@ -64,6 +64,10 @@ async fn accept_all(
 ) -> std::io::Result<()> {
     loop {
         let (tcp, _) = listener.accept().await?;
+        // As the client does (`dial.rs`): without it the small frame that ends an answer
+        // (its trailers) waits for the client's delayed acknowledgement, tens of milliseconds
+        // of real time, which a test on tokio's paused clock does not wait for.
+        let _ = tcp.set_nodelay(true);
         let acceptor = acceptor.clone();
         let shared = Arc::clone(shared);
         connections.spawn(async move {

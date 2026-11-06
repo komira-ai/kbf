@@ -1,6 +1,7 @@
-//! What the executor counts, for `GET /metrics`: the hosts it holds, how the runs ended, what
-//! the ingest made of the packs, the `Start`s it dropped as late, and the leases it released
-//! that no slot held.
+//! What the executor counts, for `GET /metrics`: how the runs ended, what the ingest made of
+//! the packs, the `Start`s it dropped as late, and what it asked of the job service: the jobs
+//! submitted, those submitted again after an answer was lost, those cancelled, those of an
+//! earlier process cancelled at start, and the jobs seen on a host that missed its grace.
 //!
 //! The counters are shared by the executor and the page that renders them. A server that never
 //! builds an executor builds none of this and renders none of it.
@@ -25,7 +26,7 @@ pub(crate) enum RunEnd {
     Timeout,
     /// Killed at its own memory limit.
     OutOfMemory,
-    /// Lost to the host or the lease server.
+    /// Lost to the host or the job service.
     Lost,
     /// An action that cannot run here.
     Invalid,
@@ -122,20 +123,18 @@ const REASONS: [(RejectReason, &str); 9] = [
 /// The executor's counters.
 #[derive(Debug, Default)]
 pub struct Metrics {
-    held: AtomicU64,
     runs: [AtomicU64; 6],
     ingests: [AtomicU64; 12],
     late_starts: AtomicU64,
-    strays_released: AtomicU64,
+    jobs_submitted: AtomicU64,
+    jobs_resubmitted: AtomicU64,
+    jobs_cancelled: AtomicU64,
+    jobs_adopted_cancelled: AtomicU64,
+    host_silence_seen: AtomicU64,
     phases: PhaseHistograms,
 }
 
 impl Metrics {
-    /// The hosts held now.
-    pub(crate) fn hold(&self, hosts: usize) {
-        self.held.store(hosts as u64, Ordering::Relaxed);
-    }
-
     pub(crate) fn run_ended(&self, end: RunEnd) {
         let at = RunEnd::ALL
             .iter()
@@ -157,24 +156,33 @@ impl Metrics {
         self.phases.observe(phase, took);
     }
 
-    pub(crate) fn stray_released(&self) {
-        self.strays_released.fetch_add(1, Ordering::Relaxed);
+    /// The job service answered a submit with the job.
+    pub(crate) fn job_submitted(&self) {
+        self.jobs_submitted.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// The hosts held, as last stepped.
-    #[must_use]
-    pub fn held(&self) -> u64 {
-        self.held.load(Ordering::Relaxed)
+    /// A submit is sent again because the answer to the one before was lost.
+    pub(crate) fn job_resubmitted(&self) {
+        self.jobs_resubmitted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The job service answered a cancel of a job of this process.
+    pub(crate) fn job_cancelled(&self) {
+        self.jobs_cancelled.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The job service answered a cancel of a job an earlier process left.
+    pub(crate) fn job_adopted_cancelled(&self) {
+        self.jobs_adopted_cancelled.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A job was seen on a host that has missed its grace.
+    pub(crate) fn host_silence(&self) {
+        self.host_silence_seen.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Appends the families to `out`, in the Prometheus text format.
     pub fn render(&self, out: &mut String) {
-        let held = self.held();
-        let _ = writeln!(
-            out,
-            "# HELP kbf_executor_leases_held Host leases the executor holds now\n\
-             # TYPE kbf_executor_leases_held gauge\nkbf_executor_leases_held {held}"
-        );
         let _ = writeln!(
             out,
             "# HELP kbf_executor_runs_total Runs the executor ended, by how the farm was told\n\
@@ -203,13 +211,33 @@ impl Metrics {
         let counters = [
             (
                 "kbf_executor_late_starts_total",
-                "Starts dropped because their window ended before the run was posted",
+                "Starts dropped because their window ended before their job was submitted",
                 &self.late_starts,
             ),
             (
-                "kbf_executor_stray_leases_released_total",
-                "Leases released because no slot of the executor held them",
-                &self.strays_released,
+                "kbf_executor_jobs_submitted_total",
+                "Submits the job service answered with the job",
+                &self.jobs_submitted,
+            ),
+            (
+                "kbf_executor_jobs_resubmitted_after_lost_answer_total",
+                "Submits sent again, with the same job id, because the answer to the one before was lost",
+                &self.jobs_resubmitted,
+            ),
+            (
+                "kbf_executor_jobs_cancelled_total",
+                "Cancels of this process's jobs the job service answered",
+                &self.jobs_cancelled,
+            ),
+            (
+                "kbf_executor_jobs_adopted_cancelled_total",
+                "Live jobs of an earlier process under this frontend's id cancelled at start",
+                &self.jobs_adopted_cancelled,
+            ),
+            (
+                "kbf_executor_host_silence_seen_total",
+                "Jobs seen on a host that has missed its grace, once a job",
+                &self.host_silence_seen,
             ),
         ];
         for (name, help, count) in counters {

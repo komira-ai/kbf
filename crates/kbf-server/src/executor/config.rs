@@ -1,11 +1,13 @@
 //! What the executor is configured with, and what follows from it: the node report of a
-//! host, the memory cap of a run, the wall time of a run, and the timers, which are
-//! checked against the scheduler's own.
+//! virtual worker, the needs and the constraints of a job, the wall limit of a job, and the
+//! timers, which are checked against the scheduler's own.
 
 use std::time::Duration;
 
+use js_proto::v1::{Constraints, ExecMode};
 use kbf_proto::worker::{Capability, Hello};
 use kbf_sched::fence::{LEADER_LEASE_MARGIN, LEASE_GRACE, SELF_FENCE, START_GRACE, START_VALIDITY};
+use ring::rand::{SecureRandom, SystemRandom};
 
 use crate::config::MAX_HEARTBEAT_INTERVAL_MS;
 use crate::executor::task::Delivery;
@@ -14,22 +16,22 @@ use crate::worker::PROTOCOL_VERSION;
 const GIB: u64 = 1 << 30;
 
 /// The longest a presigned url may be asked to stay good. The store refuses more, and the
-/// executor does not ask: [`Config::presign_ceiling`] stays under it, and the longest run's
-/// wall time under that.
+/// executor does not ask: [`Config::presign_ceiling`] stays under it, and the longest job's
+/// wall limit under that.
 pub const PRESIGN_LIMIT: Duration = Duration::from_secs(4 * 3600);
 
 /// What the container driver adds to 1.5 times a booking for the hard memory cap of a run
-/// (`kbf-driver-container`, `cgroup.rs`). The lease server caps a run at the number it is
-/// sent, so the executor sends the same one and an out-of-memory run is the same event
-/// on either executor.
+/// (`kbf-driver-container`, `cgroup.rs`). A job needs the memory it is sent and its host caps
+/// it there, so the executor sends the same number and an out-of-memory job is the same event
+/// as an out-of-memory run on a daemon.
 const HARD_CAP_PAD: u64 = 512 << 20;
 
-/// What a run books for its outputs when the operator says nothing: 8 GiB. A host reports its
-/// scratch as one share for all its runs, so this times the host's slots (and the margin, and
-/// the inputs) is what a full host asks of it.
+/// What a job needs for its outputs when the operator says nothing: 8 GiB. A host serves its
+/// scratch to all its jobs, so this times the jobs a host runs at once (and the margin, and the
+/// inputs) is what a full host asks of it.
 pub const DEFAULT_OUTPUT_DISK: u64 = 8 * GIB;
 
-/// What a run books beyond its inputs and its output allowance: 1 GiB for what neither counts
+/// What a job needs beyond its inputs and its output allowance: 1 GiB for what neither counts
 /// (the task tool's own files, the manifest and logs, the filesystem's rounding).
 pub const DISK_MARGIN: u64 = GIB;
 
@@ -38,46 +40,30 @@ pub const DISK_MARGIN: u64 = GIB;
 /// safety rests on.
 #[derive(Clone, Debug)]
 pub struct Config {
-    /// This frontend's id: the value of the `kbf-frontend` label on its leases, the prefix
-    /// of its workers' instances.
+    /// This frontend's id: the value of the `kbf-frontend` label on its jobs, hashed into
+    /// their ids, and the name of its virtual workers (`js:<frontend>-<n>`).
     pub frontend: String,
     /// Which process of this frontend id this is: the value of the `kbf-instance` label on its
-    /// leases, made up at start. A lease of another process under the same frontend id is never
-    /// taken for this one's while that process renews it.
+    /// jobs, made up at start. A job of another process under the same frontend id is cancelled
+    /// at start only once that process is seen to make no new job ([`Config::adopt_watch`]).
     pub instance: String,
-    /// How many hosts to hold, a lease each.
+    /// How many virtual workers the farm places on, each of the shape below.
     pub hosts: usize,
-    /// The class every lease asks for.
-    pub class: String,
-    /// What a host's lease holds in CPU, in thousandths of a core: the pool's `[shape]`.
+    /// What a virtual worker holds in CPU, in thousandths of a core: the most the farm books
+    /// on it at once.
     pub cpu_millis: u64,
-    /// What a host's lease holds in memory, in bytes: the pool's `[shape]`.
+    /// What a virtual worker holds in memory, in bytes: the bookings on it and their hard
+    /// caps fit in it ([`Config::booked_memory_gib`]).
     pub memory_bytes: u64,
-    /// The most runs a host takes at once (`action_slots` of its node report).
+    /// The most actions a virtual worker has in flight (`action_slots` of its node report).
     pub slots: u64,
-    /// The CPU architecture of the hosts.
+    /// The CPU architecture a job asks its host for.
     pub arch: String,
-    /// The longest a worker goes between two renewals of its lease, whatever the ttl: a
-    /// process that starts under the same frontend id tells a live executor from a dead one's
-    /// leftovers by a renewal ([`Config::adopt_watch`]).
-    pub renew_every: Duration,
-    /// How long a lease lasts without a renewal, asked at each renewal. A run's wall time is
-    /// cut to what the lease has left when it is posted, so this must cover the longest run
-    /// ([`Config::max_run`] and [`Config::run_margin`]) and two heartbeats more (the server cuts
-    /// a run's wall time again from the time left when the run is delivered to the host, which
-    /// can be a heartbeat late); the lease server grants at most its
-    /// `--max-ttl`, and a worker that is granted less treats a run the lease cuts short as
-    /// lost, not as the action's timeout.
-    pub lease_ttl: Duration,
-    /// How long a lease may last in all: its `max_wall_seconds`.
-    pub max_wall: Duration,
-    /// How long before the end of its `max_wall` a host stops taking work and is released.
-    pub drain_before_end: Duration,
     /// The longest action timeout the executor runs.
     pub max_run: Duration,
-    /// What a run's wall time adds to the action's timeout: fetch, pack and upload. The task
+    /// What a job's wall limit adds to the action's timeout: fetch, pack and upload. The task
     /// tool's own deadline bounds only the action's command, so a fetch of a large input tree
-    /// or an upload that outlasts this margin ends the run at the wall time, and is answered
+    /// or an upload that outlasts this margin ends the job at its wall limit, and is answered
     /// to the caller as a timeout and not rerun: raise it for slower stores.
     pub run_margin: Duration,
     /// The timeout of an action that names none: at most [`Config::max_run`].
@@ -86,29 +72,16 @@ pub struct Config {
     pub heartbeat: Duration,
     /// How often the caller steps the executor.
     pub poll: Duration,
-    /// How long before a vacant host is asked for again.
-    pub acquire_retry: Duration,
-    /// How long a host whose scratch quota is out of order (a run refused `quota-unavailable`)
-    /// is kept out of use: its lease is held idle, so the lease server hands out another
-    /// host, and released when this has passed (at most a third of [`Config::lease_ttl`]: see
-    /// [`Config::held_out_for`]). The host recovers by itself and re-checks
-    /// about once a minute, so this is a little over two of its checks.
-    pub quota_hold: Duration,
-    /// How often the lease server's host list is read, to see a host lost or tainted.
-    pub host_check: Duration,
-    /// How often the leases under this frontend's label are compared with the slots', to
-    /// release one no slot holds: one booked by a request whose answer was lost, or one a
-    /// release did not reach. The same check runs at once after either.
-    pub reconcile_every: Duration,
-    /// How long one call to the lease server may take before it counts as unanswered. A pass
+    /// How long one call to the job service may take before it counts as unanswered. A pass
     /// of the executor is a series of calls, and it carries the heartbeats and the
-    /// self-fence, so a server that never answers must not hold it for the client's own
+    /// self-fence, so a service that never answers must not hold it for the client's own
     /// 30 s a call.
     pub call_timeout: Duration,
     /// How long a pass goes on starting waiting tasks: past it the rest wait for the next.
     pub pass_budget: Duration,
-    /// T: how long a worker goes on with its runs after the farm last acknowledged a
-    /// heartbeat, or the lease server last answered, before it stops them and goes silent.
+    /// T: how long a worker goes on with its jobs after the farm last acknowledged a
+    /// heartbeat, or the job service last answered a call about a job it holds, before it
+    /// cancels them and goes silent.
     pub fence_after: Duration,
     /// How the secrets reach the task.
     pub delivery: Delivery,
@@ -123,8 +96,8 @@ pub struct Config {
     /// Whether the task may `PUT` over plain http.
     pub allow_plain_http_put: bool,
     /// Whether the task may read its inputs through a read grant served over plain http, and
-    /// the executor may post a run whose grant url is `http://` (the bearer token then crosses
-    /// the job network in clear).
+    /// the executor may submit a job whose grant url is `http://` (the bearer token then
+    /// crosses the job network in clear).
     pub allow_plain_http_grant: bool,
     /// Whether the task is told to read its inputs where `GET /locate` says they are kept
     /// (`--locate`), and from the listener when that read fails.
@@ -135,9 +108,9 @@ pub struct Config {
     pub max_blob_bytes: u64,
     /// The longest a pack url may stay good: the store's presign ceiling.
     pub presign_ceiling: Duration,
-    /// The scratch disk a run books for what it writes, in bytes, on top of its inputs: the
+    /// The scratch disk a job needs for what it writes, in bytes, on top of its inputs: the
     /// outputs, the pack it builds and the private home, tmp and cache of the work directory
-    /// (`--executor-output-disk-bytes`). A run books this, the bytes of its input closure and
+    /// (`--executor-output-disk-bytes`). A job needs this, the bytes of its input closure and
     /// [`DISK_MARGIN`] ([`Config::disk_bytes`]).
     pub output_disk_bytes: u64,
 }
@@ -148,14 +121,14 @@ pub enum ConfigError {
     /// A name that cannot be a label value.
     #[error("the frontend id must be 1 to 63 of letters, digits, '-', '_' and '.'")]
     Frontend,
-    /// No host to hold.
-    #[error("at least one host must be held")]
+    /// No virtual worker.
+    #[error("at least one virtual worker is needed")]
     NoHosts,
-    /// No CPU, no slot or more slots than a host takes.
-    #[error("a host needs at least 1000 millicores and 1 to 256 slots")]
+    /// No CPU, no slot or more slots than a worker takes.
+    #[error("a virtual worker needs at least 1000 millicores and 1 to 256 slots")]
     Shape,
-    /// The shape leaves no whole GiB to book after the runs' hard-cap padding.
-    #[error("the host's memory leaves nothing to book after {0} slots")]
+    /// The shape leaves no whole GiB to book after the jobs' hard-cap padding.
+    #[error("the virtual worker's memory leaves nothing to book after {0} slots")]
     Memory(u64),
     /// A heartbeat interval the farm refuses.
     #[error("the heartbeat interval must be 1 ms to {MAX_HEARTBEAT_INTERVAL_MS} ms")]
@@ -166,23 +139,9 @@ pub enum ConfigError {
     /// A fence time that is not longer than the heartbeat it counts from.
     #[error("the fence time must exceed the heartbeat interval")]
     FenceShort,
-    /// A drain that starts too late for the longest run to end before the lease does.
-    #[error("the drain must start at least a run's wall time before the lease ends")]
-    Drain,
-    /// A run whose pack url the store would not sign.
-    #[error("the longest run's wall time exceeds the presign ceiling")]
+    /// A job whose pack url the store would not sign.
+    #[error("the longest job's wall limit exceeds the presign ceiling")]
     Presign,
-    /// A lease ttl that cannot be renewed in time, or that does not cover the longest run.
-    #[error(
-        "the lease ttl must be at least 30 s, three times the step, and cover the longest run and two heartbeats"
-    )]
-    Ttl,
-    /// A hold on a host with a sick quota of zero.
-    #[error("the quota hold must be above zero")]
-    QuotaHold,
-    /// A renewal interval of zero.
-    #[error("the renewal interval must be above zero")]
-    Renew,
     /// A default timeout of zero or over the longest run.
     #[error("the default timeout must be above zero and no more than the longest run")]
     Timeout,
@@ -201,44 +160,29 @@ pub enum ConfigError {
     /// Secrets as files, and the opt-in for secrets as arguments: a contradiction.
     #[error("the secrets travel as files: insecure_argv_secrets must not be set")]
     InsecureWithFiles,
-    /// A presign ceiling or a run longer than a url may be good for.
-    #[error("the presign ceiling and the longest run's wall time must be at most 4 hours")]
+    /// A presign ceiling or a job longer than a url may be good for.
+    #[error("the presign ceiling and the longest job's wall limit must be at most 4 hours")]
     PresignLimit,
 }
 
 impl Config {
-    /// A config for `frontend` holding `hosts` hosts of `cpu_millis` and `memory_bytes`
-    /// under `class`, with the defaults of every other setting.
+    /// A config for `frontend` with `hosts` virtual workers of `cpu_millis` and
+    /// `memory_bytes`, with the defaults of every other setting.
     #[must_use]
-    pub fn new(
-        frontend: &str,
-        hosts: usize,
-        class: &str,
-        cpu_millis: u64,
-        memory_bytes: u64,
-    ) -> Self {
+    pub fn new(frontend: &str, hosts: usize, cpu_millis: u64, memory_bytes: u64) -> Self {
         Self {
             frontend: frontend.to_owned(),
-            instance: super::Nonce::random().to_string(),
+            instance: instance_id(),
             hosts,
-            class: class.to_owned(),
             cpu_millis,
             memory_bytes,
             slots: 8,
             arch: "x86_64".to_owned(),
-            renew_every: Duration::from_secs(30),
-            lease_ttl: Duration::from_secs(3600),
-            max_wall: Duration::from_secs(6 * 3600),
-            drain_before_end: Duration::from_secs(90 * 60),
             max_run: Duration::from_secs(3000),
             run_margin: Duration::from_secs(300),
             default_timeout: Duration::from_secs(3000),
             heartbeat: Duration::from_secs(5),
             poll: Duration::from_millis(500),
-            acquire_retry: Duration::from_secs(5),
-            quota_hold: Duration::from_secs(150),
-            host_check: Duration::from_secs(5),
-            reconcile_every: Duration::from_secs(60),
             call_timeout: Duration::from_secs(5),
             pass_budget: Duration::from_secs(10),
             fence_after: SELF_FENCE,
@@ -255,35 +199,31 @@ impl Config {
         }
     }
 
-    /// How long a lease is kept idle for a host with a sick quota: [`Config::quota_hold`], cut
-    /// to a third of the lease ttl. The idle lease is not renewed, and a renewed lease has at
-    /// least a third of its ttl left.
-    #[must_use]
-    pub fn held_out_for(&self) -> Duration {
-        self.quota_hold.min(self.lease_ttl / 3)
-    }
-
-    /// How long a process that finds another's leases under its own frontend id watches them
-    /// before it takes them: the longest a live executor goes between two renewals of a lease
-    /// ([`Config::renew_every`]), plus the longest a pass can be held ([`Config::fence_after`]:
-    /// a worker that cannot reach the lease server for longer has fenced itself and is no
-    /// longer a holder), plus a step.
+    /// How long a process that finds live jobs of another process under its own frontend id
+    /// watches for a new one before it cancels them: a live executor's workers submit what the
+    /// farm places on them within a pass, and a pass is held at most the fence time
+    /// ([`Config::fence_after`]: a worker that cannot reach the job service for longer has
+    /// fenced itself), so the watch is that and a step. It is also how often the executor
+    /// looks for another frontend's jobs ([`Executor::rival_check`](super::Executor::rival_check)).
+    ///
+    /// An idle process makes no job, so the watch cannot tell it from a gone one: its jobs are
+    /// cancelled, and the rival check stops this process once the other submits again.
     #[must_use]
     pub fn adopt_watch(&self) -> Duration {
-        self.renew_every + self.fence_after + self.poll
+        self.fence_after + self.poll
     }
 
     /// Checks what the executor's safety rests on.
     ///
     /// The fence time T plus the scheduler's margin plus one step must stay under the
     /// scheduler's re-dispatch grace G ([`LEASE_GRACE`]): a worker the farm last heard from
-    /// is silent after T, and its runs are asked to stop by then, so the farm that requeues
-    /// them after G does not run the action beside the first copy. The ask goes to the lease
-    /// server; if that is the one that cannot be reached, the run goes on to its wall time,
+    /// is silent after T, and its jobs are cancelled by then, so the farm that requeues
+    /// them after G does not run the action beside the first copy. The cancel goes to the job
+    /// service; if that is the one that cannot be reached, the job goes on to its wall limit,
     /// which wastes the work and is harmless: its pack key is its own.
     ///
-    /// A `Start` posted at the end of its window ([`START_VALIDITY`]) is then a run whose
-    /// stop is asked T later, and the farm runs the action again [`START_GRACE`] after the
+    /// A `Start` submitted at the end of its window ([`START_VALIDITY`]) is then a job whose
+    /// cancel is sent T later, and the farm runs the action again [`START_GRACE`] after the
     /// `Start`: the window, T and the margin stay under it.
     ///
     /// # Errors
@@ -315,17 +255,6 @@ impl Config {
                 ConfigError::Fence,
             ),
             (
-                [
-                    self.lease_ttl >= Duration::from_secs(30),
-                    self.lease_ttl >= self.poll * 3,
-                    self.lease_ttl >= longest + self.heartbeat * 2,
-                ]
-                .into_iter()
-                .all(|ok| ok),
-                ConfigError::Ttl,
-            ),
-            (!self.renew_every.is_zero(), ConfigError::Renew),
-            (
                 !self.default_timeout.is_zero() && self.default_timeout <= self.max_run,
                 ConfigError::Timeout,
             ),
@@ -352,11 +281,6 @@ impl Config {
                 self.delivery != Delivery::Files || !self.insecure_argv_secrets,
                 ConfigError::InsecureWithFiles,
             ),
-            (
-                self.max_wall > self.drain_before_end && self.drain_before_end > longest,
-                ConfigError::Drain,
-            ),
-            (!self.quota_hold.is_zero(), ConfigError::QuotaHold),
         ];
         checks
             .into_iter()
@@ -364,24 +288,23 @@ impl Config {
             .map_or(Ok(()), Err)
     }
 
-    /// What a lease must ask of its host: the system and the architecture, the same as the
-    /// worker's node report says, and under [`Delivery::Files`] `run-files`, so that a host
-    /// that cannot mount files is never leased.
+    /// What a job asks of its host beside resources: the system and the architecture the
+    /// worker's node report names, in a container. The task tool and its static binary run
+    /// nowhere else.
     #[must_use]
-    pub fn host_capabilities(&self) -> std::collections::BTreeMap<String, String> {
-        let files = (self.delivery == Delivery::Files).then_some(("run-files", "true"));
-        [("os", "linux"), ("arch", self.arch.as_str())]
-            .into_iter()
-            .chain(files)
-            .map(|(key, value)| (key.to_owned(), value.to_owned()))
-            .collect()
+    pub fn constraints(&self) -> Constraints {
+        Constraints {
+            os: "linux".to_owned(),
+            arch: self.arch.clone(),
+            exec: ExecMode::Container.into(),
+        }
     }
 
-    /// How many whole GiB of memory the farm may book on a host.
+    /// How many whole GiB of memory the farm may book on a virtual worker.
     ///
-    /// A run is capped at 1.5 times its booking plus [`HARD_CAP_PAD`], and the lease server
-    /// admits runs while the caps add up to the shape. Booking `m` bytes over at most
-    /// `slots` runs caps them at `1.5 m + slots * pad`, which must stay within the shape.
+    /// A job needs 1.5 times its booking plus [`HARD_CAP_PAD`]. Booking `m` bytes over at most
+    /// `slots` jobs needs `1.5 m + slots * pad`, which stays within the shape, so what the farm
+    /// has in flight on one worker fits a host of that shape.
     #[must_use]
     pub fn booked_memory_gib(&self) -> u64 {
         let usable = self
@@ -390,13 +313,13 @@ impl Config {
         usable / 3 * 2 / GIB
     }
 
-    /// The hard memory cap of a run the farm booked `booking` bytes for.
+    /// The hard memory cap of a job the farm booked `booking` bytes for: what the job needs.
     #[must_use]
     pub fn hard_memory(booking: u64) -> u64 {
         booking.saturating_mul(3) / 2 + HARD_CAP_PAD
     }
 
-    /// The scratch disk a run books: its `input_bytes` (`None` when the size of its input
+    /// The scratch disk a job needs: its `input_bytes` (`None` when the size of its input
     /// closure is not known), [`Config::output_disk_bytes`] and [`DISK_MARGIN`].
     #[must_use]
     pub fn disk_bytes(&self, input_bytes: Option<u64>) -> u64 {
@@ -406,15 +329,15 @@ impl Config {
             .saturating_add(DISK_MARGIN)
     }
 
-    /// The wall time of a run of an action of `timeout`. Never the time a lease has left:
-    /// the run a stop cannot reach ends by itself by then.
+    /// The wall limit of a job of an action of `timeout`: the action's own, and nothing cuts
+    /// it shorter, so a job stopped at it is the action's timeout.
     #[must_use]
     pub fn wall(&self, timeout: Duration) -> Duration {
         timeout + self.run_margin
     }
 
-    /// The `Hello` of a worker on a host: what a real node would report, and no more. The
-    /// only driver is `container`, so no whole-machine or VM lease is placed on it.
+    /// The `Hello` of a virtual worker: what a real node of the shape would report, and no
+    /// more. The only driver is `container`, so no whole-machine or VM lease is placed on it.
     pub(super) fn hello(&self, node: &str, instance: &str, predecessor: &str) -> Hello {
         let entry = |key: &str, value: String| Capability {
             key: key.to_owned(),
@@ -437,6 +360,23 @@ impl Config {
             ..Hello::default()
         }
     }
+}
+
+/// An id of this process, in hex: 128 random bits from the operating system's source, then
+/// the process id and the time. A source that fails (which nothing here can repair) leaves
+/// the bits zero, and the process id and the time still tell two processes apart.
+fn instance_id() -> String {
+    let mut bytes = [0_u8; 16];
+    let _ = SystemRandom::new().fill(&mut bytes);
+    let since = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    format!(
+        "{:032x}{:08x}{:x}",
+        u128::from_be_bytes(bytes),
+        std::process::id(),
+        since.as_nanos()
+    )
 }
 
 #[cfg(test)]

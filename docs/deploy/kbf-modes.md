@@ -115,80 +115,97 @@ accepted and ignored without `--pack-store-endpoint`.
 
 Where the frontend runs the actions it places is `--executor` (the `[executor]` table of
 `kbf.toml`). `kbf-daemon`, the default, is the daemon of each node over the worker listener,
-as always: the frontend builds no executor and contacts no lease server, whatever the other
-`--executor-*` flags say, so a unit or `kbf.toml` that names a lease server keeps its settings
+as always: the frontend builds no executor and contacts no job service, whatever the other
+`--executor-*` flags say, so a unit or `kbf.toml` that names a job service keeps its settings
 when the executor is switched back, `--executor-insecure-argv-secrets` too (it is ignored, with a
 warning, so the rollback is the one flag: `executor = "kbf-daemon"`, except `--executor-locate`,
 which is refused with `kbf-daemon` and must be removed in the same edit). Stopping the frontend
-releases its leases; a frontend that is killed (a stop timeout, SIGKILL) leaves them, and the
-hosts stay held until their ttl ends (`--executor-lease-ttl-secs`, an hour by default) unless a
-later `js-agent` start releases them. `js-agent` leases hosts from the job scheduler's lease server
-instead, one lease for each of `--executor-hosts` hosts of `--executor-host-cpus` cores and
-`--executor-host-memory-gib` GiB in the class `--executor-class`, asked for with
-`os=linux` and `--executor-arch` (default `x86_64`), and runs each placed action in the kbf
-image (`--executor-kbf-image`), whose `ENTRYPOINT` is the task tool: the run's arguments are the
-tool's flags and nothing is mounted into the container. The kbf image is built from the base
-environment the actions' Commands see (`--executor-base-image`); both are named by digest, and
-the host pulls the kbf image. An action's `container-image` platform property names the base: an
-action that names another image is refused as invalid (the message names both), one that names
-none gets the base, and a tag is refused. It needs both image flags, and the
-lease server (`--executor-lease-url`, `https://`, or `http://` to loopback only;
-`--executor-lease-token-file`, mode 0600 or 0400; `--executor-lease-ca-file` for an `https`
-URL), `--executor-frontend-id` (the `kbf-frontend` label on the frontend's leases, by which a
-restarted frontend finds and releases them; it must be different for each frontend, so a
-`kbf.toml` is not copied to a second frontend with it), the packs (`--pack-store-endpoint`, through which
-the pack a task writes is read, hashed and turned into the action's result) and the delivery
-of the secrets, `--executor-secret-delivery`. With `argv`, the default, the presigned write url
-and the read token travel as arguments of the run, where the action can read them, and
-`--executor-insecure-argv-secrets` says the operator accepts it. With `files` each is a file of
-the run, which the lease server mounts read-only at `/run/js-files`, and the task tool is given
-the paths (`--pack-url-file`, `--grant-token-file`): no argument holds a secret,
-`--executor-insecure-argv-secrets` is refused with it, and the lease asks for hosts that report
-`run-files=true`. There is no fall back to arguments: a pool whose agents do not report
-`run-files` holds no host, and no run is sent. A start the lease server refuses with
-`files-unsupported`, or an agent that ends a start with that detail, holds that host out for the
-quota hold (the lease stays booked and idle, so it is not leased again at once) and the action is
-rerun elsewhere; `invalid-file`, from either, ends the action as invalid. `files` is refused with `--executor kbf-daemon`, which builds no command
-line. The executor runs on exactly one frontend: it looks for another frontend's leases on
-the lease server before its first pass and every minute after, and a frontend that finds one
-older than its own (or finds one before it has any) stops with an error naming it. Each lease
-also carries the process that made it: a frontend that starts and finds leases of another
-process under its own id watches them for a renewal (the longest a live executor goes without
-one, 30 s, plus the fence time) before it takes them over, and stops if one is renewed; it takes
-them if none is, as after a crash. Nothing asks for a host meanwhile. A restart of the frontend fails the builds in flight, and
-stopping it stops the runs and releases the leases. The executor prepares each run with the
-frontend's **task runs** (below) and its job-facing read listener (`--job-listen`: the frontend's
-own listener, not an executor mode and not the jobscheduler's job service, whose lease server has a
-flag of the same name; moving the executor onto that service is
-[job-service-cutover.md](job-service-cutover.md)), so
-`--executor js-agent` is refused when the flags are read unless `--task-secret-file` (with the
-four flags it needs), `--job-listen` (with its companions) and `--pack-store-endpoint` are given, and
-unless they agree with it: the tier store and the read url must be IP addresses (the job network
-has no DNS); `--task-put-bucket` must be `--pack-store-bucket`, the bucket the pack is read
-from; an `http://` `--task-put-endpoint` needs `--executor-allow-plain-http-put` (with an
-`https://` one the flag is only warned about); an `http://` `--task-read-url` needs
-`--executor-allow-plain-http-grant` (the same, with the read grant: the task tool is then
-given `--allow-plain-http-grant`, and the read token crosses the job network in clear); and the longest run (`--executor-max-run-secs`
-plus `--executor-run-margin-secs`) must fit 14400 s less `--task-url-slack-secs`, the longest a
-presigned write may be good for once the slack is added. A lease ttl over 3600 s is warned
-about: the lease server grants at most its `--max-ttl` (3600 s unless started with another) and
-clamps the ask. The run's wall time is the action's timeout plus the margin, and
-`--task-run-wall-secs` is not used by the executor. A run that cannot be prepared because an
-input blob is missing, malformed or over the closure budget ends as an invalid argument to its
-caller and is not rerun; one that cannot be prepared because the store cannot be read is rerun.
-`--executor-base-image` and `--executor-kbf-image` (`<repository>@sha256:<digest>`, the
-`docker://` scheme optional) replace the former `--executor-default-image`,
-`--executor-images-have-no-entrypoint`, `--executor-task-tool` and `--executor-root-der`: a
-missing or tag-named image, or the same image twice, is refused when the flags are read. The farm's
-certificate authority for the task's `https` reads must be in the kbf image. The
-presigned write and the read token are never part of an error, a log line or a metric.
-`GET /metrics` gains the `kbf_executor_*` families. The remaining settings are `--executor-host-slots` (default 8),
-`--executor-run-margin-secs` (300; what a run's wall time adds to the action's timeout),
-`--executor-lease-ttl-secs` (3600), `--executor-max-run-secs` and
-`--executor-default-timeout-secs` (3000), `--executor-call-timeout-secs` (5),
-`--executor-work-dir` (for the task tool),
-`--executor-output-disk-bytes` (8 GiB; the scratch disk a run books for its outputs, the pack and its
-private home, on top of the bytes of its inputs and a fixed 1 GiB margin),
+cancels its jobs; a frontend that is killed (a stop timeout, SIGKILL) leaves them, and they run to
+their wall limit unless a later `js-agent` start cancels them. `js-agent` runs each placed action
+as a job of the job scheduler's job service instead. The frontend registers `--executor-hosts`
+virtual workers with its farm, `js:<frontend id>-<n>`, each of `--executor-host-cpus` cores,
+`--executor-host-memory-gib` GiB and `--executor-host-slots` actions at once: that is how many
+actions of which size the farm may have in flight, and the job service decides which host runs
+each job. A job is the kbf image (`--executor-kbf-image`), whose `ENTRYPOINT` is the task tool:
+the job's arguments are the tool's flags and nothing is mounted into the container. It needs the
+cores and memory the farm booked (the memory as the hard cap a daemon would set, 1.5 times the
+booking plus 512 MiB), the scratch of its inputs and outputs, a host of `os=linux` and
+`--executor-arch` (default `x86_64`) that runs containers, and a wall limit of the action's
+timeout plus the run margin. The kbf image is built from the base environment the actions'
+Commands see (`--executor-base-image`); both are named by digest, and the host pulls the kbf
+image. An action's `container-image` platform property names the base: an action that names
+another image is refused as invalid (the message names both), one that names none gets the base,
+and a tag is refused. It needs both image flags, and the job service (`--executor-job-url`,
+`https://`, or `http://` to loopback only; `--executor-job-token-file`, mode 0600 or 0400;
+`--executor-job-ca-file` for an `https` URL), `--executor-frontend-id` (the `kbf-frontend` label
+on the frontend's jobs, by which a restarted frontend finds and cancels those an earlier process
+left, and hashed into every job id; it must be different for each frontend, so a `kbf.toml` is
+not copied to a second frontend with it), the packs (`--pack-store-endpoint`, through which the
+pack a task writes is read, hashed and turned into the action's result) and the delivery of the
+secrets, `--executor-secret-delivery`. With `argv`, the default, the presigned write url and the
+read token travel as arguments of the job, where the action can read them, and
+`--executor-insecure-argv-secrets` says the operator accepts it. With `files` each is a file of the
+job, which its host writes read-only at `/run/js-files`, and the task tool is given the paths
+(`--pack-url-file`, `--grant-token-file`): no argument holds a secret, and
+`--executor-insecure-argv-secrets` is refused with it. There is no fall back to arguments: a host
+whose agent cannot write the files refuses to start the job (`files-unsupported`) and the action
+is rerun; `invalid-file` ends the action as invalid. `files` is refused with `--executor
+kbf-daemon`, which builds no command line. The executor no longer speaks to a lease server: the
+flags `--executor-lease-url`, `--executor-lease-token-file`, `--executor-lease-ca-file`,
+`--executor-lease-ttl-secs` and `--executor-class` are gone, and a frontend started with one (or
+a `kbf.toml` that names one) fails at start naming it.
+
+Each farm lease is one job, whose id is made from the frontend id and the farm lease
+(`k<8 hex digits of the sha256 of the frontend id>-<term>-<seq>-<attempt>`): a `Start` the farm
+sends again, and a submit sent again after its answer was lost, name the job already made, so no
+action is submitted twice. A farm `Cancel` is a cancel of the job. How a job ends is mapped to the
+farm's failure classes as the table in `crates/kbf-server/src/executor/outcome.rs` says: a job
+stopped at its wall limit is the action's own timeout, one stopped for memory is rerun with more,
+a lost job is the host's fault and rerun elsewhere, and a submit the service refuses because no
+host could ever run it ends the action as invalid. A whole-machine action is not submitted: the
+virtual workers offer the container driver only, and one that is placed anyway ends as an
+infrastructure failure. A worker that has not had a heartbeat acknowledged by the farm, or an
+answer from the job service while it holds a job, for the fence time cancels all its jobs and
+falls silent until the farm has requeued them.
+
+The executor runs on exactly one frontend: it looks for another frontend's live jobs on the job
+service before its first pass and every 40 s after, and a frontend that finds some older than its
+own (or finds some before it has any) stops with an error naming it. Each job also carries the
+process that made it: a frontend that starts and finds live jobs of another process under its own
+id watches for a new one for the fence time and a step (40.5 s by default) before it cancels them,
+and stops if a new one appears; it cancels them if none does, as after a crash. Nothing is
+submitted meanwhile. A restart of the frontend fails the builds in flight, and stopping it cancels
+the jobs. The executor prepares each job with the frontend's **task runs** (below) and its
+job-facing read listener (`--job-listen`: the frontend's own listener, not an executor mode
+and not the jobscheduler's job service, whose lease server has a flag of the same name; moving the
+executor onto that service is [job-service-cutover.md](job-service-cutover.md)), so
+`--executor js-agent` is refused when the flags are read unless `--task-secret-file` (with the four flags it needs), `--job-listen` (with its
+companions) and `--pack-store-endpoint` are given, and unless they agree with it: the tier store
+and the read url must be IP addresses (the job network has no DNS); `--task-put-bucket` must be
+`--pack-store-bucket`, the bucket the pack is read from; an `http://` `--task-put-endpoint` needs
+`--executor-allow-plain-http-put` (with an `https://` one the flag is only warned about); an
+`http://` `--task-read-url` needs `--executor-allow-plain-http-grant` (the same, with the read
+grant: the task tool is then given `--allow-plain-http-grant`, and the read token crosses the job
+network in clear); and the longest job (`--executor-max-run-secs` plus
+`--executor-run-margin-secs`) must fit 14400 s less `--task-url-slack-secs`, the longest a
+presigned write may be good for once the slack is added. The job's wall limit is the action's
+timeout plus the margin, and `--task-run-wall-secs` is not used by the executor. A job that
+cannot be prepared because an input blob is missing, malformed or over the closure budget ends as
+an invalid argument to its caller and is not rerun; one that cannot be prepared because the store
+cannot be read is rerun. `--executor-base-image` and `--executor-kbf-image`
+(`<repository>@sha256:<digest>`, the `docker://` scheme optional) replace the former
+`--executor-default-image`, `--executor-images-have-no-entrypoint`, `--executor-task-tool` and
+`--executor-root-der`: a missing or tag-named image, or the same image twice, is refused when the
+flags are read. The farm's certificate authority for the task's `https` reads must be in the kbf
+image. The presigned write and the read token are never part of an error, a log line or a
+metric. `GET /metrics` gains the `kbf_executor_*` families, among them the jobs submitted, those
+submitted again after a lost answer, those cancelled, those of an earlier process cancelled at
+start, and the jobs seen on a host that missed its grace. The remaining settings are
+`--executor-host-slots` (default 8), `--executor-run-margin-secs` (300; what a job's wall limit
+adds to the action's timeout), `--executor-max-run-secs` and `--executor-default-timeout-secs`
+(3000), `--executor-call-timeout-secs` (5), `--executor-work-dir` (for the task tool),
+`--executor-output-disk-bytes` (8 GiB; the scratch disk a job needs for its outputs, the pack and
+its private home, on top of the bytes of its inputs and a fixed 1 GiB margin),
 `--executor-allow-plain-http-put` (until the store serves TLS), and
 `--executor-allow-plain-http-grant` (a read listener without TLS, on a farm's own network; both
 plain-http flags are off by default), and `--executor-locate` (off by default: the task is given
@@ -196,20 +213,19 @@ plain-http flags are off by default), and `--executor-locate` (off by default: t
 answer names, from the listener when that read fails; with no grants in the answer it reads from the
 listener as before; refused with `--executor kbf-daemon`; the task image must carry kbf-task
 v0.0.44 or later, the first release that knows `--locate`: an older one refuses the flag and every
-run fails). A setting that breaks a rule
-the executor's safety rests on (the fence time against the scheduler's grace, the lease ttl
-against the longest run) is refused at start, exit status 2.
+job fails). A setting that breaks a rule the executor's safety rests on (the fence time against
+the scheduler's grace and the start window) is refused at start, exit status 2.
 
 Per-action overhead of the executor, for comparing it with a daemon, is read from two places. The
 executor's own phases are the histogram `kbf_executor_phase_seconds{phase=...}` on `GET /metrics`:
-`prepare` (the `Start` first seen to its run being ready), `start` (ready to the lease server accepting
-the run), `queue` (accepted to first read back as running), `task` (first read back as running to read
-back as exited), `run` (accepted to read back as exited, whether or not it was seen running) and
-`ingest` (read back as exited to the read of the pack done). They are stamped by the executor on its
-own clock, once per pass over the host's runs, and the lease server learns a run's state from the
-agent's heartbeat, which trails the host by one or two beats: `queue`, `task` and `run` are good to a
-pass plus a heartbeat or two, not to the instant the host started or ended the run, and a run that
-starts and ends between two reads has a `run` and no `queue` or `task`. A phase that was not observed
+`prepare` (the `Start` first seen to its job being ready), `start` (ready to the job service
+answering the submit with the job), `queue` (accepted to first read back as running), `task` (first
+read back as running to read back as ended), `run` (accepted to read back as ended, whether or not
+it was seen running) and `ingest` (read back as ended to the read of the pack done). They are
+stamped by the executor on its own clock, once per pass over its jobs, and the job service learns a
+job's state from its host's agent, which trails the host by one or two beats: `queue`, `task` and
+`run` are good to a pass plus a heartbeat or two, not to the instant the host started or ended the
+job, and a job that starts and ends between two reads has a `run` and no `queue` or `task`. A phase that was not observed
 is absent, never zero. The task's own account of its steps (`fetch_ms`, `run_ms` and `pack_ms` of the manifest) is carried
 in the result's execution metadata as the `input_fetch`, `execution` and `output_upload` start and
 completed times, marked as a task's claim, and the run record and the read API say so with

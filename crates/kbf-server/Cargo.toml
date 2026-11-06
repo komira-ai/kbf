@@ -32,6 +32,8 @@ http-body-util.workspace = true
 # The job-facing read listener serves HTTP/1.1 over its own TLS connections (src/frontend/job_read.rs).
 hyper = { workspace = true, features = ["http1", "server"] }
 hyper-util = { workspace = true, features = ["service", "tokio"] }
+# The messages of the job service the host executor submits jobs to (src/executor).
+js-proto.workspace = true
 # The loop around the scheduler (src/farm_js): `KbfAdapter` is its `Adapter`.
 js-server-core.workspace = true
 # The scheduler's rows in the state store (src/farm_js): the farm's row codec and its
@@ -45,7 +47,10 @@ kbf-ca.workspace = true
 kbf-front.workspace = true
 kbf-history.workspace = true
 kbf-invocation.workspace = true
-# The host executor's client of the job scheduler's lease server (src/executor).
+# The host executor's client of the job service (src/executor).
+kbf-job-client.workspace = true
+# No code of this crate calls the lease server since the host executor submits jobs; the
+# dependency is removed with the lease client crate itself.
 kbf-lease-client.workspace = true
 kbf-log.workspace = true
 kbf-map.workspace = true
@@ -122,7 +127,9 @@ x509-parser.workspace = true
 kbf-segments.workspace = true
 # The deterministic simulation kernel's seeded random stream (src/machine.rs, tests/invocations_paging.rs).
 kbf-sim.workspace = true
-# An in-process lease server on loopback (tests/executor).
+# An in-process job service on loopback (src/executor, tests/executor).
+kbf-job-client = { workspace = true, features = ["fake"] }
+# Unused since the host executor submits jobs; removed with the lease client crate itself.
 kbf-lease-client = { workspace = true, features = ["fake"] }
 # The in-memory state store (src/start.rs, src/frontend, src/farm/durable and tests/), and a
 # Postgres database of its own for a test (tests/state_store_postgres.rs).

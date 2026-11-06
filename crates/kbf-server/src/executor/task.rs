@@ -1,9 +1,10 @@
-//! What one run is told: the pack key it may write, and the command line of the task tool.
+//! What one job is told: the pack key it may write, and the command line of the task tool.
 //!
 //! The pack url and the read token reach the task one of two ways. [`Delivery::Files`] puts
-//! each in a file of the run (the lease server mounts them read-only at `/run/js-files`) and
-//! gives the tool the paths: no argument holds a secret. [`Delivery::InsecureArgv`], the
-//! default, puts them in the arguments, where the action can read them (`/proc/1/cmdline`)
+//! each in a file of the job (its host writes them before the job starts, read-only at
+//! `/run/js-files`) and gives the tool the paths: no argument holds a secret.
+//! [`Delivery::InsecureArgv`], the default, puts them in the arguments, where the action can
+//! read them (`/proc/1/cmdline`)
 //! and the engine's inspect shows them, and the executor refuses to run with it unless told to:
 //! [`Config::validate`] fails unless `insecure_argv_secrets` is set. There is no fall back from
 //! the first to the second. Nothing here prints a secret: [`Secret`] formats as
@@ -14,10 +15,9 @@
 use std::fmt;
 use std::time::Duration;
 
-use kbf_lease_client::RunFile;
+use js_proto::v1::JobFile;
 use kbf_proto::reapi::Digest;
 use kbf_types::LeaseId;
-use ring::rand::{SecureRandom, SystemRandom};
 
 /// A value that must not reach a log or an error: a presigned url, a bearer token.
 #[derive(Clone, PartialEq, Eq)]
@@ -43,32 +43,6 @@ impl fmt::Debug for Secret {
     }
 }
 
-/// 128 random bits, drawn for every `POST` of a run and never reused: not per process, not per
-/// attempt. It labels the run, so that a run whose `202` was lost can be found again in the
-/// lease server's list. (The pack key is not drawn here: the frontend's ingest issues it,
-/// see [`PackKey`].)
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Nonce(u128);
-
-impl Nonce {
-    /// A nonce from the operating system's random source, which cannot fail in a way a
-    /// caller could repair: a failure stops the process rather than reuse a label.
-    #[must_use]
-    pub fn random() -> Self {
-        let mut bytes = [0_u8; 16];
-        SystemRandom::new()
-            .fill(&mut bytes)
-            .expect("the operating system's random source failed");
-        Self(u128::from_be_bytes(bytes))
-    }
-}
-
-impl fmt::Display for Nonce {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:032x}", self.0)
-    }
-}
-
 /// The build id of a farm lease, in a pack key and in the task's `--lease`: `<term>-<seq>`.
 /// The farm's own spelling, `<term>.<seq>`, holds a dot, which a build id may not
 /// (`kbf_pack::check_build` allows `0-9`, `a-z`, `A-Z`, `-` and `_`): a pack that names it is
@@ -83,10 +57,11 @@ pub fn build_id(lease: LeaseId) -> String {
 /// one action and verified by the same ingest when the pack is read. The executor does not
 /// look inside it.
 ///
-/// A farm lease is run at most once: a worker that cannot tell whether a run was queued is
-/// taken down and the farm rules the action again as a new farm lease, so the key of a lease
-/// is never handed to a second run, and a zombie of an earlier run, which holds the url of
-/// its own key, never meets the create-only refusal of a key it did not write.
+/// A farm lease is one job: its id is made from the lease ([`job_id`](crate::executor::job_id)),
+/// a submit whose answer was lost is sent again with the same id and makes no second job, and
+/// the farm runs an action again only as a new farm lease. So the key of a lease is never
+/// handed to a second job, and a zombie of an earlier job, which holds the url of its own key,
+/// never meets the create-only refusal of a key it did not write.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PackKey(String);
 
@@ -110,7 +85,7 @@ impl fmt::Display for PackKey {
     }
 }
 
-/// Where the lease server mounts the files of a run, read-only.
+/// Where the host of a job writes its files, read-only.
 const FILES_DIR: &str = "/run/js-files";
 const PACK_URL_FILE: &str = "pack-url";
 const GRANT_TOKEN_FILE: &str = "grant-token";
@@ -119,11 +94,11 @@ const GRANT_TOKEN_FILE: &str = "grant-token";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Delivery {
-    /// As arguments, behind the tool's `--insecure-argv-secrets`: the default, for a lease
-    /// server whose agents do not report `run-files`.
+    /// As arguments, behind the tool's `--insecure-argv-secrets`: the default, for hosts
+    /// whose agents cannot write the files of a job.
     InsecureArgv,
-    /// As files of the run, which the lease server mounts read-only at `/run/js-files`; the
-    /// tool is given the paths.
+    /// As files of the job, which its host writes read-only at `/run/js-files`; the tool is
+    /// given the paths.
     Files,
 }
 
@@ -131,7 +106,7 @@ pub enum Delivery {
 pub struct TaskArgs<'a> {
     /// The action to run.
     pub action: &'a Digest,
-    /// The farm lease the run belongs to.
+    /// The farm lease the job belongs to.
     pub lease: LeaseId,
     /// The base url of the read endpoint.
     pub grant_url: &'a str,
@@ -154,8 +129,8 @@ pub struct TaskArgs<'a> {
 }
 
 impl TaskArgs<'_> {
-    /// The flags of the task tool, for [`Delivery::InsecureArgv`]. The tool is the kbf image's
-    /// `ENTRYPOINT`, which the lease server prepends the arguments to: no path comes first.
+    /// The flags of the task tool, the arguments of the job. The tool is the kbf image's
+    /// `ENTRYPOINT`, which the job's command is left empty to keep: no path comes first.
     #[must_use]
     pub fn argv(&self, delivery: Delivery) -> Vec<String> {
         let mut argv = vec![
@@ -200,19 +175,19 @@ impl TaskArgs<'_> {
 }
 
 impl TaskArgs<'_> {
-    /// The files of the run for `delivery`: none for [`Delivery::InsecureArgv`], and for
+    /// The files of the job for `delivery`: none for [`Delivery::InsecureArgv`], and for
     /// [`Delivery::Files`] the presigned url and the read token, each alone in a file the
     /// arguments of [`TaskArgs::argv`] name.
     #[must_use]
-    pub fn files(&self, delivery: Delivery) -> Vec<RunFile> {
+    pub fn files(&self, delivery: Delivery) -> Vec<JobFile> {
         match delivery {
             Delivery::InsecureArgv => Vec::new(),
             Delivery::Files => vec![
-                RunFile {
+                JobFile {
                     name: PACK_URL_FILE.to_owned(),
                     contents: self.pack_url.expose().to_owned(),
                 },
-                RunFile {
+                JobFile {
                     name: GRANT_TOKEN_FILE.to_owned(),
                     contents: self.grant_token.expose().to_owned(),
                 },

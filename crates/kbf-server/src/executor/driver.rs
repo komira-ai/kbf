@@ -2,11 +2,10 @@
 //! frontend does.
 //!
 //! The executor is stepped every [`Executor::poll`], a pass run to its end. Before the first
-//! pass, and every [`Executor::rival_check`] after, it asks the lease server whether another
-//! frontend holds hosts: the executor runs on exactly one frontend, and a second one stops, its
-//! hosts released, and says so ([`Running::failed`]). On [`Running::stop`] the farm is told
-//! each worker takes no more work, the runs are stopped and every lease is released
-//! ([`Executor::shutdown`]).
+//! pass, and every [`Executor::rival_check`] after, it asks the job service whether another
+//! frontend has live jobs: the executor runs on exactly one frontend, and a second one stops,
+//! its jobs cancelled, and says so ([`Running::failed`]). On [`Running::stop`] the farm is told
+//! each worker takes no more work and every job is cancelled ([`Executor::shutdown`]).
 
 use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
@@ -22,8 +21,8 @@ pub struct Running {
 }
 
 impl Running {
-    /// Steps `executor` until [`stop`](Self::stop), or until another frontend is found to hold
-    /// hosts.
+    /// Steps `executor` until [`stop`](Self::stop), or until another frontend is found to have
+    /// jobs.
     #[must_use]
     pub fn spawn(executor: Executor) -> Self {
         let (stop, stopped) = watch::channel(false);
@@ -41,7 +40,7 @@ impl Running {
         }
     }
 
-    /// Stops the executor and waits until its leases are released.
+    /// Stops the executor and waits until its jobs are cancelled.
     pub async fn stop(self) {
         let _ = self.stop.send(true);
         if let Err(e) = self.task.await {
@@ -60,7 +59,7 @@ async fn drive(
         if Instant::now() >= next_check {
             next_check = Instant::now() + executor.rival_check();
             if let Some(why) = executor.rival().await {
-                tracing::error!(%why, "another frontend holds hosts: the executor runs on exactly one frontend");
+                tracing::error!(%why, "another frontend has jobs: the executor runs on exactly one frontend");
                 let _ = failed.send(why);
                 break;
             }
