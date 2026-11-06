@@ -243,13 +243,17 @@ async fn a_frontend_with_js_agent_registers_its_workers_while_it_serves_and_leav
     ] {
         assert!(text.contains(family), "{family} in {text}");
     }
-    // The jobs of the frontend's id were listed for adoption, and no action was placed.
+    // The jobs of the frontend's id were listed for adoption (the rival check's listing, of
+    // every live job, has no label), and no action was placed.
     let listed = fake.calls().into_iter().find_map(|call| match call {
-        Call::ListJobs(request) => Some(request),
+        Call::ListJobs(request) if !request.labels.is_empty() => Some(request),
         _ => None,
     });
     let listed: ListJobsRequest = listed.expect("the earlier jobs were listed");
-    assert_eq!(listed.labels["kbf-frontend"], "front-1");
+    assert_eq!(
+        listed.labels.get("kbf-frontend").map(String::as_str),
+        Some("front-1")
+    );
     assert!(
         !methods(&fake).contains(&"SubmitJob"),
         "{:?}",

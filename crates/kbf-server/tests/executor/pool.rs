@@ -263,7 +263,9 @@ async fn adoption_that_could_not_ask_is_asked_again() {
     assert!(rig.exec.workers().is_empty());
     assert!(submits(&rig.fake.calls()).is_empty());
     rig.exec.step().await;
-    assert_eq!(rig.methods(), ["ListJobs", "ListJobs"]);
+    // The second listing is answered; the worker the step then registers is placed on at
+    // once, and its job submitted in the same step.
+    assert_eq!(rig.methods()[..2], ["ListJobs", "ListJobs"]);
     assert_eq!(rig.exec.workers().len(), 1);
     rig.pump().await;
     assert_eq!(rig.jobs_of(1).len(), 1);

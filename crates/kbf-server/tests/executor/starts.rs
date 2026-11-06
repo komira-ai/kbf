@@ -180,7 +180,7 @@ async fn a_late_start_never_runs_twice() {
     // The window of a Start is 14 s from the heartbeat it names.
     rig.advance(Duration::from_secs(15)).await;
     rig.exec.step().await;
-    assert_eq!(cancels(&rig.fake.calls()), [late.clone()]);
+    assert_eq!(cancels(&rig.fake.calls()), std::slice::from_ref(&late));
     assert_eq!(rig.jobs_of(1)[0].state(), JobState::Cancelled);
     assert_eq!(rig.counter("kbf_executor_late_starts_total"), 1);
     // The farm, whose heartbeats leave the lease out, gives it up after the grace and

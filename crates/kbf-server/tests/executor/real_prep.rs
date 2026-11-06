@@ -244,10 +244,14 @@ impl World {
     }
 
     /// Five seconds pass on the clocks, and the farm and the executor's task run.
+    /// 5 s pass, a second at a time with the executor's task let run in between (a call in
+    /// flight on loopback is answered before its bound passes), and the farm ticks.
     async fn step(&self) {
-        tokio::time::advance(Duration::from_secs(5)).await;
-        self.fake.advance(Duration::from_secs(5));
-        settle().await;
+        for _ in 0..5 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            self.fake.advance(Duration::from_secs(1));
+            settle().await;
+        }
         self.farm.tick().await;
         settle().await;
     }

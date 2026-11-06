@@ -289,7 +289,7 @@ async fn a_pack_key_that_cannot_be_issued_is_rerun_not_submitted() {
 /// kind.
 #[tokio::test(start_paused = true)]
 async fn a_job_asks_for_linux_the_configured_architecture_and_containers() {
-    for arch in ["x86_64", "aarch64"] {
+    for arch in ["x86_64", "arm64"] {
         let mut rig = Rig::start(&[], 1, move |cfg| cfg.arch = arch.to_owned()).await;
         rig.fake.add_host(HOST, machine(64, arch));
         let job = submitted(&mut rig).await;

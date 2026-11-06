@@ -346,9 +346,13 @@ async fn an_action_runs_end_to_end_through_the_flags_and_the_frontends_own_seams
 
 /// Five seconds pass on the clocks, and the farm and the executor's task run.
 async fn step(farm: &Farm, fake: &FakeJobServer) {
-    tokio::time::advance(Duration::from_secs(5)).await;
-    fake.advance(Duration::from_secs(5));
-    settle().await;
+    // A second at a time, with the executor's task let run in between: a call in flight on
+    // loopback is answered before its bound passes.
+    for _ in 0..5 {
+        tokio::time::advance(Duration::from_secs(1)).await;
+        fake.advance(Duration::from_secs(1));
+        settle().await;
+    }
     farm.tick().await;
     settle().await;
 }

@@ -11,11 +11,15 @@ use tonic::Code;
 use crate::pool::{earlier, job, record, spec_of};
 use crate::rig::{Posted, Rig, cancels, settle, submits};
 
-/// Lets `seconds` pass in steps of 5 s, the farm ticking after each.
+/// Lets `seconds` pass in steps of 5 s, the farm ticking after each. Each step moves the clock
+/// a second at a time and lets the driver's task run in between: a call it has in flight to the
+/// job service on loopback is answered before its bound passes, as on a real clock.
 async fn pass(rig: &Rig, seconds: u64) {
     for _ in 0..seconds.div_ceil(5) {
-        rig.advance(Duration::from_secs(5)).await;
-        settle().await;
+        for _ in 0..5 {
+            rig.advance(Duration::from_secs(1)).await;
+            settle().await;
+        }
         rig.farm.tick().await;
         settle().await;
     }

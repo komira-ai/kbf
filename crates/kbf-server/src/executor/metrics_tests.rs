@@ -70,13 +70,16 @@ fn every_ending_and_every_ingest_result_has_a_row_of_its_own() {
     }
 }
 
+/// A counter's name, the call that counts it once, and how many times it is called.
+type Counted<'a> = (&'a str, &'a dyn Fn(&Metrics), u32);
+
 /// Catches a plain counter that is not rendered, is rendered under another name, or counts
 /// with another's calls: each of them is counted a different number of times, and its row
 /// carries that number and its own name, as a counter.
 #[test]
 fn each_plain_counter_renders_under_its_name_and_counts() {
     let metrics = Metrics::default();
-    let calls: [(&str, &dyn Fn(&Metrics), u32); 6] = [
+    let calls: [Counted<'_>; 6] = [
         ("kbf_executor_late_starts_total", &Metrics::late_start, 1),
         (
             "kbf_executor_jobs_submitted_total",

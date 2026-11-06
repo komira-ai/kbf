@@ -560,7 +560,14 @@ impl Rig {
             settle().await;
             tokio::time::advance(by).await;
             fake.advance(by);
-            settle().await;
+            // The calls the step makes after the clock has moved are answered over loopback
+            // in a few rounds of the runtime; the clock moves only 3 ms a round meanwhile.
+            for _ in 0..20 {
+                settle().await;
+                if done.load(Ordering::SeqCst) {
+                    break;
+                }
+            }
             let in_time = done.load(Ordering::SeqCst);
             if !in_time {
                 // Whatever the step waits on is let go, so that a failure fails and does not hang.

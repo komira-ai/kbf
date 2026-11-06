@@ -350,7 +350,9 @@ async fn the_read_of_a_worker_that_goes_is_abandoned() {
         1
     );
     rig.pump().await;
-    assert_eq!(rig.exec.workers()[0].runs, 0);
+    // The worker registered again, and the farm may already have placed the action's next
+    // job on it in the same pump: what shows the old task is gone is the ingest below.
+    assert!(!rig.exec.workers()[0].silent);
     assert!(caller.finished().is_none());
     assert!(cancels(&rig.fake.calls()).is_empty());
     let jobs = until_jobs(&mut rig, 1, 2, 12).await;
