@@ -33,6 +33,8 @@
 //!   (`log`; read-only).
 //! - [`host_status`]: one host's row from the coordinator's `GET /v1/status` (`host-status`;
 //!   read-only), for an operator rolling agents node by node.
+//! - [`job_service`]: whether the job service answers kbf's client token, one `ListJobs` call
+//!   (`job-service check`; read-only), before a frontend's executor is pointed at it.
 //! - [`pilot`]: a pilot kbf-server run as a systemd user service by the operator's own
 //!   user (`pilot server-install`), and the buck2 overlay that points one linked
 //!   worktree at it, which never replaces a file it did not write (`pilot buckconfig`).
@@ -42,6 +44,7 @@ pub mod config;
 pub mod host;
 pub mod host_status;
 pub mod https;
+pub mod job_service;
 pub mod linux;
 pub mod log;
 pub mod mdm;

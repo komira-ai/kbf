@@ -1,9 +1,10 @@
 //! The job service client (`kbf-job-client`) in the layering of `tests/layering.rs`: a leaf
-//! over the jobscheduler's `js-proto`, and one crate of the workspace uses it: `kbf-server`,
-//! whose host executor submits its jobs to the job service through it, as a normal dependency
-//! and, for the fake job server of its tests, as a dev-dependency. The design makes kbf a
-//! client of the job service that links none of the scheduler's server crates, and the host
-//! executor no longer leases hosts: no file of it names the lease client.
+//! over the jobscheduler's `js-proto`, used by two crates of the workspace: `kbf-server`, whose
+//! host executor submits its jobs to the job service through it (and whose tests take its fake
+//! job server), and the operator's deploy tool, `kbf-deploy`, whose `job-service check` calls
+//! the service with the same client. The design makes kbf a client of the job service that
+//! links none of the scheduler's server crates, and the host executor no longer leases hosts:
+//! no file of it names the lease client.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -16,8 +17,10 @@ use super::{Graph, load_graph, normal_closure};
 /// The client's package name.
 const CLIENT: &str = "kbf-job-client";
 
-/// The one crate that uses the client.
-const USER: &str = "kbf-server";
+/// The crates that may depend on the client (with its fake as a dev-dependency too): the
+/// deploy tool, whose `job-service check` is no farm code, and the server, whose host executor
+/// submits its jobs through it.
+const USERS: [&str; 2] = ["kbf-deploy", "kbf-server"];
 
 /// The crate the host executor must not name.
 const LEASE_CLIENT: &str = "kbf_lease_client";
@@ -59,7 +62,7 @@ fn violations(g: &Graph, root_id: &str) -> Vec<String> {
 
 /// Each dependency on the client among `packages` (of `cargo metadata --no-deps`), as
 /// `<package> (<kind>)`, except the client's own dev-dependency on itself, which its tests
-/// use for the fake.
+/// use for the fake, and the dependencies of the [`USERS`].
 fn dependents(packages: &[Value]) -> Vec<String> {
     let mut found = Vec::new();
     for package in packages {
@@ -69,7 +72,8 @@ fn dependents(packages: &[Value]) -> Vec<String> {
                 continue;
             }
             let kind = dep["kind"].as_str().unwrap_or("normal");
-            if name != CLIENT || kind != "dev" {
+            let own_fake = name == CLIENT && kind == "dev";
+            if !own_fake && !USERS.contains(&name) {
                 found.push(format!("{name} ({kind})"));
             }
         }
@@ -77,12 +81,12 @@ fn dependents(packages: &[Value]) -> Vec<String> {
     found
 }
 
-/// Asserts that the only crate of the workspace that depends on the job client is the server
-/// (the host executor), as a normal dependency and as a dev-dependency for the fake job
-/// server, and that the client's own manifest names itself once, as the dev-dependency of its
-/// tests (so the walk reads the dependencies it checks).
+/// Asserts that no crate of the workspace but the [`USERS`] depends on the job client, in
+/// any kind of dependency; that each of the [`USERS`] is a member that does (so the list does
+/// not outlive its reason); and that the client's own manifest names itself once, as the
+/// dev-dependency of its tests (so the walk reads the dependencies it checks).
 #[test]
-fn only_the_server_depends_on_the_job_client() {
+fn only_the_users_depend_on_the_job_client() {
     let cargo = std::env::var("CARGO").expect("CARGO is set when cargo runs a test");
     let out = Command::new(cargo)
         .args(["metadata", "--format-version", "1", "--no-deps", "--locked"])
@@ -103,35 +107,60 @@ fn only_the_server_depends_on_the_job_client() {
         .filter(|d| d["name"] == CLIENT && d["kind"] == "dev")
         .count();
     assert_eq!(itself, 1, "the client's tests take it with the fake");
-    let mut found = dependents(packages);
-    found.sort();
-    assert_eq!(
-        found,
-        [format!("{USER} (dev)"), format!("{USER} (normal)")],
-        "the server alone depends on the job client, normally and with the fake"
+    for user in USERS {
+        let package = packages
+            .iter()
+            .find(|p| p["name"] == user)
+            .unwrap_or_else(|| panic!("{user} is a workspace member"));
+        let uses = package["dependencies"]
+            .as_array()
+            .expect("dependencies")
+            .iter()
+            .any(|d| d["name"] == CLIENT && d["kind"].is_null());
+        assert!(
+            uses,
+            "{user} is listed as a user of the client and does not use it"
+        );
+    }
+    let found = dependents(packages);
+    assert!(
+        found.is_empty(),
+        "a crate that is not one of the users depends on the job client: {found:?}"
     );
 }
 
-/// Asserts that a dependency on the client is named whatever its kind, and the client's own
-/// dev-dependency is not, while a normal dependency of the client on itself would be.
+/// Asserts that a dependency on the client is named whatever its kind (a build-dependency
+/// too), and the client's own dev-dependency and the users' dependencies are not, while
+/// a normal dependency of the client on itself would be.
 #[test]
 fn a_crate_that_depends_on_the_job_client_is_named() {
     let packages: Vec<Value> = serde_json::from_str(
         r#"[
             {"name": "kbf-job-client", "dependencies": [
                 {"name": "kbf-job-client", "kind": "dev"}, {"name": "tonic", "kind": null}]},
-            {"name": "kbf-server", "dependencies": [{"name": "kbf-job-client", "kind": null}]},
+            {"name": "kbf-storage", "dependencies": [{"name": "kbf-job-client", "kind": null}]},
             {"name": "kbf-front", "dependencies": [{"name": "kbf-job-client", "kind": "dev"}]},
-            {"name": "kbf-node", "dependencies": [{"name": "tonic", "kind": null}]}
+            {"name": "kbf-node", "dependencies": [{"name": "tonic", "kind": null}]},
+            {"name": "kbf-deploy", "dependencies": [
+                {"name": "kbf-job-client", "kind": null},
+                {"name": "kbf-job-client", "kind": "dev"}]},
+            {"name": "kbf-cli", "dependencies": [{"name": "kbf-job-client", "kind": "build"}]}
         ]"#,
     )
     .unwrap();
     assert_eq!(
         dependents(&packages),
-        ["kbf-server (normal)", "kbf-front (dev)"]
+        ["kbf-storage (normal)", "kbf-front (dev)", "kbf-cli (build)"]
     );
     let only_itself = &packages[..1];
     assert!(dependents(only_itself).is_empty());
+    let only_the_deploy_tool = &packages[4..5];
+    assert!(dependents(only_the_deploy_tool).is_empty());
+    let itself_normal: Vec<Value> = serde_json::from_str(
+        r#"[{"name": "kbf-job-client", "dependencies": [{"name": "kbf-job-client", "kind": null}]}]"#,
+    )
+    .unwrap();
+    assert_eq!(dependents(&itself_normal), ["kbf-job-client (normal)"]);
 }
 
 /// Asserts that the job client's normal tree reaches `js-proto` and no other scheduler
