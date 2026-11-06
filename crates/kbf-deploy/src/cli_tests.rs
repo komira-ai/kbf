@@ -879,3 +879,49 @@ fn job_service_check_runs_through_the_same_command_line() {
     assert!(err.contains("--url"), "{err}");
     assert!(exec.queries.borrow().is_empty());
 }
+
+/// Catches a `job-service agent-egress` the command line does not reach, or that runs a host
+/// step: through `run`, a frontend file renders the allow-list lines (exit 0), a file that is
+/// not there is refused (exit 2) naming it, a missing `--config` is a usage error, and nothing
+/// is run on the host.
+#[test]
+fn job_service_agent_egress_runs_through_the_same_command_line() {
+    let dir = TestDir::under(std::env::temp_dir(), "kbf-deploy-cli-agent-egress");
+    let config = dir.path().join("kbf.toml");
+    std::fs::write(
+        &config,
+        "[task-runs]\ntask-put-endpoint = \"http://192.0.2.10:9000\"\n\
+         task-read-url = \"https://192.0.2.20:8444\"\n",
+    )
+    .unwrap();
+    let config = config.to_str().unwrap();
+    let missing = dir.path().join("missing.toml");
+    let missing = missing.to_str().unwrap();
+    let verb = ["job-service", "agent-egress", "--config"];
+
+    let mut exec = FakeExec::new(501);
+    let (code, out, err) = cli(&mut exec, &no_env, &[&verb[..], &[config]].concat());
+    assert_eq!(code, ExitCode::SUCCESS, "{err}");
+    assert_eq!(err, "");
+    assert!(
+        out.ends_with(
+            "--egress=allow-list\n# task-put-endpoint = http://192.0.2.10:9000\n\
+             --egress-allow=192.0.2.10:9000\n# task-read-url = https://192.0.2.20:8444\n\
+             --egress-allow=192.0.2.20:8444\n"
+        ),
+        "{out}"
+    );
+
+    let (code, out, err) = cli(&mut exec, &no_env, &[&verb[..], &[missing]].concat());
+    assert_eq!(code, ExitCode::from(2), "{err}");
+    assert_eq!(out, "");
+    assert!(
+        err.starts_with(&format!("REFUSED: --config {missing}: cannot be read: ")),
+        "{err}"
+    );
+
+    let (code, _, err) = cli(&mut exec, &no_env, &["job-service", "agent-egress"]);
+    assert_eq!(code, ExitCode::from(2), "{err}");
+    assert!(err.contains("--config"), "{err}");
+    assert!(exec.queries.borrow().is_empty());
+}

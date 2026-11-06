@@ -31,6 +31,7 @@
 //! kbf-deploy host-status --coordinator URL|HOST:PORT --operator-token-file FILE --node ID
 //!                        [--service NAME] [--ca-pem PEM] [--json]
 //! kbf-deploy job-service check --url URL --token-file FILE [--ca-file FILE]
+//! kbf-deploy job-service agent-egress --config FILE
 //! ```
 //!
 //! Bad flags exit 2 for every subcommand. The `minio` subcommands change a host: without
@@ -60,6 +61,9 @@
 //! token, and exits 0 answered (an empty list too), 1 unreachable, unauthorized or another
 //! error (`FAIL: ...` on stderr), or 2 refused (`REFUSED: ...` on stderr: a bad `--url`, token
 //! file or CA file) ([`crate::job_service`]).
+//! `job-service agent-egress` only reads: it prints the egress lines of a farm agent's flags
+//! file from the frontend's `kbf.toml`, and exits 0, or 2 refused (`REFUSED: ...` on stderr: the
+//! file cannot be read, or lacks or misstates a destination) ([`crate::agent_egress`]).
 //! `minio buckets` reads the MinIO admin key pair from `MINIO_ROOT_USER` and
 //! `MINIO_ROOT_PASSWORD` in the environment (secrets are never flags: argv is
 //! world-readable).
@@ -133,7 +137,8 @@ enum Kit {
     /// reads.
     HostStatus(crate::host_status::HostStatusArgs),
     /// The job service a frontend's executor will submit to: `check` calls ListJobs with
-    /// kbf's client token. Only reads.
+    /// kbf's client token; `agent-egress` prints the egress lines of a farm agent's flags
+    /// file. Only reads.
     #[command(subcommand)]
     JobService(crate::job_service::JobService),
 }
