@@ -1,16 +1,22 @@
+use std::collections::BTreeMap;
 use std::time::Duration;
 
-use js_proto::v1::{CancelJobRequest, JobSpec, JobState, Needs, NetworkLevel};
+use js_proto::v1::{
+    CancelJobRequest, GetResultResponse, JobResult, JobSpec, JobState, Needs, NetworkLevel,
+    ResultReason, StartFailureCode,
+};
 use kbf_job_client::fake::{Call, Fault};
+use kbf_proto::google::rpc::ErrorInfo;
 use kbf_proto::worker::{Cancel, Lost, ResultAck, ServerMessage, Start, server_message};
 use kbf_types::LeaseId;
+use prost::Message;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::Instant;
 use tonic::Code;
 
 use super::{Reporting, Stage};
 use crate::executor::host::HostWorker;
-use crate::executor::test_support::{GIB, HOST, Harness, start};
+use crate::executor::test_support::{GIB, HOST, Harness, Log, start};
 use crate::executor::{job_id, twin_message};
 
 type Messages = UnboundedSender<Result<ServerMessage, tonic::Status>>;
@@ -574,4 +580,255 @@ async fn a_pass_reads_no_more_jobs_once_its_budget_is_spent() {
         read(calls_since(&harness, before)),
         [ids[1].clone(), ids[2].clone(), ids[0].clone()]
     );
+}
+
+/// The output attached to a result's status (`executor::output`), as its fields; `None` when
+/// none is.
+fn output_of(result: &kbf_proto::worker::Result) -> Option<BTreeMap<String, String>> {
+    let status = result.status.as_ref()?;
+    let detail = status.details.iter().find(|detail| {
+        detail.type_url == "type.googleapis.com/google.rpc.ErrorInfo"
+            && ErrorInfo::decode(detail.value.as_slice())
+                .is_ok_and(|info| info.reason == "JOB_OUTPUT_TAIL")
+    })?;
+    let info = ErrorInfo::decode(detail.value.as_slice()).expect("an ErrorInfo");
+    Some(info.metadata.into_iter().collect())
+}
+
+fn fields(stdout: &str, stderr: &str, truncated: bool) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        ("stdout".to_owned(), stdout.to_owned()),
+        ("stderr".to_owned(), stderr.to_owned()),
+        ("truncated".to_owned(), truncated.to_string()),
+    ])
+}
+
+fn logs_calls(calls: &[Call]) -> usize {
+    calls
+        .iter()
+        .filter(|call| matches!(call, Call::GetLogs(_)))
+        .count()
+}
+
+fn result_calls(calls: &[Call]) -> usize {
+    calls
+        .iter()
+        .filter(|call| matches!(call, Call::GetResult(_)))
+        .count()
+}
+
+/// The value after `flag` in the arguments the job `id` was submitted with.
+fn arg_of(harness: &Harness, id: &str, flag: &str) -> String {
+    let spec = harness.fake.submitted(id).expect("the job was submitted");
+    let at = spec
+        .args
+        .iter()
+        .position(|arg| arg == flag)
+        .expect("the flag");
+    spec.args[at + 1].clone()
+}
+
+/// Catches a failed job's output not reaching its result, or reaching the log: the tails
+/// `GetResult` answered go with the result as its stdout and stderr, beside the unchanged
+/// reason, the log holds their lengths only, and no `GetLogs` is made for output already in
+/// hand.
+#[tokio::test(start_paused = true)]
+async fn a_failed_job_s_output_goes_with_its_result() {
+    let harness = Harness::new().await;
+    let (mut worker, messages) = harness.worker();
+    let id = running_job(&harness, &mut worker, &messages).await;
+    assert!(
+        harness
+            .fake
+            .write_logs(&id, b"compiling\n", b"error: disk full\n")
+    );
+    assert!(harness.fake.finish(&id, 1));
+    let before = harness.fake.calls().len();
+    let log = Log::default();
+    let guard = log.install();
+    step(&harness, &mut worker).await;
+    drop(guard);
+    let text = log.text();
+    assert!(
+        text.contains("stdout_bytes=10 stderr_bytes=17 truncated=false unread=false"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("compiling") && !text.contains("disk full"),
+        "{text}"
+    );
+    let result = reported(&worker, LeaseId::new(1, 1));
+    assert_eq!(
+        status_of(result),
+        (
+            Code::Unavailable as i32,
+            "the task tool exited nonzero (exit code Some(1))"
+        )
+    );
+    assert_eq!(
+        output_of(result),
+        Some(fields("compiling\n", "error: disk full\n", false))
+    );
+    let calls = calls_since(&harness, before);
+    assert_eq!((result_calls(&calls), logs_calls(&calls)), (1, 0));
+}
+
+/// Catches a grant of the job reaching its attached output: the pack url and the read token
+/// the job was handed, written at the start, in the middle, and where the cap cuts, are each
+/// replaced, and no piece of either longer than the marker is left.
+#[tokio::test(start_paused = true)]
+async fn the_grants_of_a_job_never_appear_in_its_output() {
+    let harness = Harness::new().await;
+    let (mut worker, messages) = harness.worker();
+    let id = running_job(&harness, &mut worker, &messages).await;
+    let url = arg_of(&harness, &id, "--pack-url");
+    let token = arg_of(&harness, &id, "--grant-token");
+    // stdout over half the cap, so each stream keeps its last 4096 bytes; redacted, stderr
+    // is 16 bytes over that, which cuts five bytes into the marker of its url.
+    let stdout = format!("{url} {token}{} {url}", "o".repeat(4096));
+    let stderr = format!("{token}-{url}{}{token}-mid-{token}", "e".repeat(4066));
+    assert!(
+        harness
+            .fake
+            .write_logs(&id, stdout.as_bytes(), stderr.as_bytes())
+    );
+    assert!(harness.fake.finish(&id, 1));
+    step(&harness, &mut worker).await;
+    let result = reported(&worker, LeaseId::new(1, 1));
+    let output = output_of(result).expect("an output");
+    let window = "[redacted]".len() + 1;
+    for secret in [&url, &token] {
+        for text in output.values().chain([&status_of(result).1.to_owned()]) {
+            assert!(!text.contains(secret.as_str()));
+            for at in 0..=secret.len().saturating_sub(window) {
+                let piece = &secret[at..(at + window).min(secret.len())];
+                assert!(!text.contains(piece), "{piece:?} is in the output");
+            }
+        }
+    }
+    assert!(output["stderr"].starts_with("cted]e"));
+    assert!(output["stderr"].ends_with("e[redacted]-mid-[redacted]"));
+    assert!(output["stdout"].ends_with("o [redacted]"));
+    assert_eq!(output["truncated"], "true");
+}
+
+/// Catches output over the cap being attached whole or by its head, and a cut inside a
+/// character: each stream keeps its end, the two within 8 KiB, on a character boundary,
+/// marked truncated.
+#[tokio::test(start_paused = true)]
+async fn output_over_the_cap_is_its_tail_and_marked_truncated() {
+    let harness = Harness::new().await;
+    let (mut worker, messages) = harness.worker();
+    let id = running_job(&harness, &mut worker, &messages).await;
+    let stdout = format!("{}x", "é".repeat(3000));
+    assert!(
+        harness
+            .fake
+            .write_logs(&id, stdout.as_bytes(), "e".repeat(6000).as_bytes())
+    );
+    assert!(harness.fake.finish(&id, 1));
+    step(&harness, &mut worker).await;
+    let output = output_of(reported(&worker, LeaseId::new(1, 1))).expect("an output");
+    let expected = fields(&format!("{}x", "é".repeat(2047)), &"e".repeat(4096), true);
+    assert_eq!(output, expected);
+    assert!(output["stdout"].len() + output["stderr"].len() <= 8 << 10);
+}
+
+/// Catches the fallback not being made when the result holds no output: one `GetLogs` is,
+/// and its tails are attached.
+#[tokio::test(start_paused = true)]
+async fn a_result_without_output_falls_back_to_one_read_of_the_logs() {
+    let harness = Harness::new().await;
+    let (mut worker, messages) = harness.worker();
+    let id = running_job(&harness, &mut worker, &messages).await;
+    assert!(harness.fake.write_logs(&id, b"from the logs\n", b""));
+    assert!(harness.fake.finish(&id, 1));
+    let bare = GetResultResponse {
+        result: Some(JobResult {
+            state: JobState::Failed.into(),
+            exit_code: Some(1),
+            reason: ResultReason::Exit.into(),
+            ..JobResult::default()
+        }),
+    };
+    harness
+        .fake
+        .inject_on("GetResult", Fault::Answer(bare.encode_to_vec().into()));
+    let before = harness.fake.calls().len();
+    step(&harness, &mut worker).await;
+    let result = reported(&worker, LeaseId::new(1, 1));
+    assert_eq!(
+        output_of(result),
+        Some(fields("from the logs\n", "", false))
+    );
+    assert_eq!(logs_calls(&calls_since(&harness, before)), 1);
+}
+
+/// Catches a failed read of the output replacing the failure's reason or going unsaid: with
+/// `GetResult` and `GetLogs` both failing, the result is the lost job it was, and its output
+/// is a note of why it could not be read.
+#[tokio::test(start_paused = true)]
+async fn when_no_output_can_be_read_the_reason_stays_and_a_note_says_so() {
+    let harness = Harness::new().await;
+    let (mut worker, messages) = harness.worker();
+    let id = running_job(&harness, &mut worker, &messages).await;
+    assert!(harness.fake.finish(&id, 1));
+    fail_next(&harness, "GetResult", Code::NotFound);
+    fail_next(&harness, "GetLogs", Code::PermissionDenied);
+    let before = harness.fake.calls().len();
+    step(&harness, &mut worker).await;
+    let result = reported(&worker, LeaseId::new(1, 1));
+    assert_eq!(result.lost, Lost::DaemonRestarted as i32);
+    assert_eq!(
+        status_of(result),
+        (Code::Unavailable as i32, "the job was lost")
+    );
+    let mut expected = fields("", "", false);
+    expected.insert(
+        "note".to_owned(),
+        "the job's output could not be read: the job service answered PermissionDenied".to_owned(),
+    );
+    assert_eq!(output_of(result), Some(expected));
+    assert_eq!(logs_calls(&calls_since(&harness, before)), 1);
+}
+
+/// Catches a job that wrote nothing getting an empty detail: the logs are read once, and the
+/// result is as it was.
+#[tokio::test(start_paused = true)]
+async fn a_job_that_wrote_nothing_has_no_output_attached() {
+    let harness = Harness::new().await;
+    let (mut worker, messages) = harness.worker();
+    tell_start(&messages, start(1, 1));
+    step(&harness, &mut worker).await;
+    let id = job_of(&worker, LeaseId::new(1, 1));
+    assert!(
+        harness
+            .fake
+            .fail_to_start(&id, StartFailureCode::NoCapacity)
+    );
+    let before = harness.fake.calls().len();
+    step(&harness, &mut worker).await;
+    let result = reported(&worker, LeaseId::new(1, 1));
+    assert_eq!(output_of(result), None);
+    assert!(result.status.as_ref().is_some_and(|s| s.details.is_empty()));
+    assert_eq!(logs_calls(&calls_since(&harness, before)), 1);
+}
+
+/// Catches the success path paying for the failure's output: a job that ended well is read
+/// with its one `GetResult`, as before, and `GetLogs` is never called.
+#[tokio::test(start_paused = true)]
+async fn a_job_that_ended_well_makes_no_call_for_its_output() {
+    let harness = Harness::new().await;
+    let (mut worker, messages) = harness.worker();
+    let id = running_job(&harness, &mut worker, &messages).await;
+    assert!(harness.fake.write_logs(&id, b"all good\n", b""));
+    assert!(harness.fake.finish(&id, 0));
+    let before = harness.fake.calls().len();
+    step(&harness, &mut worker).await;
+    assert!(matches!(
+        worker.tasks[&LeaseId::new(1, 1)].stage,
+        Stage::Ingesting(_)
+    ));
+    let calls = calls_since(&harness, before);
+    assert_eq!((result_calls(&calls), logs_calls(&calls)), (1, 0));
 }

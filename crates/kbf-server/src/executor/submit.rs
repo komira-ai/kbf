@@ -25,6 +25,7 @@ use ring::digest::{SHA256, digest};
 use crate::executor::Ctx;
 use crate::executor::config::Config;
 use crate::executor::outcome::Settled;
+use crate::executor::output::Grants;
 use crate::executor::task::{PackKey, TaskArgs, build_id};
 use crate::executor::traits::{InputsError, MintError, PresignError};
 
@@ -63,6 +64,8 @@ pub fn job_id(frontend: &str, lease: LeaseId, attempt: u32) -> String {
 pub(super) struct Prepared {
     pub(super) spec: JobSpec,
     pub(super) key: PackKey,
+    /// What the job was handed that its attached output must never show.
+    pub(super) grants: Grants,
 }
 
 impl From<InputsError> for Settled {
@@ -209,7 +212,8 @@ pub(super) async fn prepare(
         .map(|(key, value)| (key.to_owned(), value.to_owned()))
         .collect(),
     };
-    Ok(Arc::new(Prepared { spec, key }))
+    let grants = Grants::of(&spec, [pack.expose(), grant.token.expose()]);
+    Ok(Arc::new(Prepared { spec, key, grants }))
 }
 
 #[cfg(test)]

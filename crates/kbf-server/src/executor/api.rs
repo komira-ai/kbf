@@ -1,4 +1,4 @@
-//! The job service, as the executor calls it: the five calls it makes, every one bounded.
+//! The job service, as the executor calls it: the six calls it makes, every one bounded.
 //!
 //! The client gives a call its connect timeout and then 30 s, and a pass of the executor makes
 //! several calls one after another, with the heartbeats and the self-fence between them. A job
@@ -14,6 +14,8 @@ use std::time::Duration;
 
 use js_proto::v1::{Job, JobResult, JobSpec, ListJobsRequest};
 use kbf_job_client::{Broken, Client, Error};
+
+use crate::executor::output::Tail;
 
 /// The client of the job service, with a limit on each call.
 #[derive(Clone, Copy)]
@@ -54,6 +56,16 @@ impl Api<'_> {
     /// `GetResult` of an ended job.
     pub(crate) async fn get_result(&self, id: &str) -> Result<JobResult, Error> {
         self.within(self.client.get_result(id)).await
+    }
+
+    /// The tails of the output of job `id`, by `GetLogs`: for a job that did not end well and
+    /// whose result holds no output ([`output`](super::output)). The service answers each
+    /// stream's last 8 KiB, which is the most of it the executor keeps. When `GetLogs` takes an
+    /// offset, this is the one place that asks for the last
+    /// [`OUTPUT_CAP`](super::output::OUTPUT_CAP) bytes by it instead.
+    pub(super) async fn logs_tail(&self, id: &str) -> Result<Tail, Error> {
+        let logs = self.within(self.client.get_logs(id)).await?;
+        Ok(Tail::of_logs(logs))
     }
 }
 

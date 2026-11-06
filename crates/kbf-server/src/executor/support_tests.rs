@@ -2,7 +2,7 @@
 //! arms the farm-level tests (`tests/executor`) cannot reach, because the farm never sends
 //! them or the job service's fake cannot make them happen.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use js_proto::v1::{ExecMode, Shape};
@@ -176,5 +176,60 @@ pub(super) fn start(term: u64, seq: u64) -> kbf_proto::worker::Start {
         heartbeat_seq: 0,
         valid_for_ms: 14_000,
         ..Default::default()
+    }
+}
+
+/// The log of a test, as text.
+#[derive(Clone, Default)]
+pub(super) struct Log(Arc<Mutex<Vec<u8>>>);
+
+pub(super) struct LogWriter(Log);
+
+impl std::io::Write for LogWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        (self.0)
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Log {
+    type Writer = LogWriter;
+
+    fn make_writer(&'a self) -> LogWriter {
+        LogWriter(self.clone())
+    }
+}
+
+impl Log {
+    pub(super) fn text(&self) -> String {
+        let bytes = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// Runs `f` with everything it logs written here.
+    pub(super) fn capture<T>(&self, f: impl FnOnce() -> T) -> T {
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(self.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f)
+    }
+
+    /// Writes everything the current thread logs here until the guard is dropped: for an
+    /// async test on one thread.
+    pub(super) fn install(&self) -> tracing::subscriber::DefaultGuard {
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(self.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::set_default(subscriber)
     }
 }

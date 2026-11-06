@@ -36,6 +36,7 @@ mod front;
 mod host;
 mod metrics;
 mod outcome;
+mod output;
 mod phases;
 mod pool;
 mod runs;
