@@ -26,6 +26,8 @@ publish.workspace = true
 # signature check, and reads the security key's public half with ssh-key.
 # `host state-backup` and `host state-restore` work on the SQLite state store's file
 # through kbf-state's own backup, check, lock and restore; time stamps the kept file.
+# `job-service check` calls ListJobs with kbf-job-client, the client the executor uses (its
+# messages are js-proto's, its status codes tonic's), on a current-thread tokio runtime.
 
 [[bin]]
 name = "kbf-deploy"
@@ -37,9 +39,11 @@ clap.workspace = true
 flate2.workspace = true
 hex.workspace = true
 httparse.workspace = true
+js-proto.workspace = true
 kbf-ca.workspace = true
 kbf-host.workspace = true
 kbf-installer.workspace = true
+kbf-job-client.workspace = true
 kbf-mdm.workspace = true
 kbf-state.workspace = true
 kbf-unitfile.workspace = true
@@ -55,12 +59,17 @@ ssh-key.workspace = true
 tar.workspace = true
 thiserror.workspace = true
 time.workspace = true
+tokio = { workspace = true, features = ["rt"] }
+tonic.workspace = true
 x509-parser.workspace = true
 zip.workspace = true
 
 [dev-dependencies]
 # Loopback ports nothing can take (kbf_testkit::port).
 kbf-testkit.workspace = true
+# The in-process job service `job-service check` is tested against.
+kbf-job-client = { workspace = true, features = ["fake"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 kbf-host = { workspace = true, features = ["testkit"] }
 # The scratch host and state the `host` verbs' tests build.
 kbf-installer = { workspace = true, features = ["testkit"] }
