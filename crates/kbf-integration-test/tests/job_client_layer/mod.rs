@@ -1,7 +1,8 @@
 //! The job service client (`kbf-job-client`) in the layering of `tests/layering.rs`: a leaf
-//! over the jobscheduler's `js-proto`, and no crate of the workspace uses it yet. The design
-//! makes kbf a client of the job service that links none of the scheduler's server crates;
-//! this is where that starts.
+//! over the jobscheduler's `js-proto`, and no farm crate uses it yet: only the integration
+//! tests do, as a dev-dependency (`tests/js_real_service.rs` drives it against the real
+//! service). The design makes kbf a client of the job service that links none of the
+//! scheduler's server crates; this is where that starts.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::process::Command;
@@ -69,11 +70,12 @@ fn dependents(packages: &[Value]) -> Vec<String> {
 }
 
 /// Asserts that no crate of the workspace depends on the job client yet, in any kind of
-/// dependency, and that the client's own manifest names itself once, as the dev-dependency
-/// of its tests (so the walk reads the dependencies it checks). The host executor moving to
+/// dependency, but the integration tests, as a dev-dependency (the real-service tests); and
+/// that the client's own manifest names itself once, as the dev-dependency of its tests (so
+/// the walk reads the dependencies it checks). The host executor moving to
 /// the client is the change that edits this test.
 #[test]
-fn no_workspace_crate_depends_on_the_job_client_yet() {
+fn only_the_integration_tests_depend_on_the_job_client_yet() {
     let cargo = std::env::var("CARGO").expect("CARGO is set when cargo runs a test");
     let out = Command::new(cargo)
         .args(["metadata", "--format-version", "1", "--no-deps", "--locked"])
@@ -95,9 +97,10 @@ fn no_workspace_crate_depends_on_the_job_client_yet() {
         .count();
     assert_eq!(itself, 1, "the client's tests take it with the fake");
     let found = dependents(packages);
-    assert!(
-        found.is_empty(),
-        "a crate depends on the job client before the executor uses it: {found:?}"
+    assert_eq!(
+        found,
+        ["kbf-integration-test (dev)"],
+        "a crate depends on the job client before the executor uses it"
     );
 }
 

@@ -1,0 +1,39 @@
+# The jobscheduler release kbf's real-service tests run against: the release, the commit and
+# workflow it was built by, and for each archive a test fetches, its SHA-256 and the entry of its
+# build attestation in the public transparency log (Rekor).
+#
+# `cargo xtask fetch-pinned-js --pin kbf-js-version.toml --program <program> --target <target>
+# --gh <gh> --dir <dir>` (crates/xtask/src/js_pin.rs) reads this file, downloads
+# `<program>-<version>-<target>.tar.gz` of the release, refuses it unless its SHA-256 is the one
+# below, runs `gh attestation verify` on it (signed by `signer_workflow` in `repository`, built
+# from `commit` on `source_ref`, on a GitHub-hosted runner) and refuses it unless one of the
+# attestations that verify is the logged entry below, and only then unpacks `<program>` into
+# `<dir>`. The tests (crates/kbf-integration-test/tests/js_real_service.rs) hash the archive in
+# `<dir>` against this file again before they start the program. Any mismatch, and a program or
+# target with no row here, is a refusal.
+#
+# To move the pin to another release: set `version` and `commit` (the release's tag and the commit
+# it names), hash each archive yourself (`sha256sum`, not only the release's SHA256SUMS), and take
+# each `attestation_log_index` from `gh attestation verify <archive> --repo komira-ai/jobscheduler
+# --format json` (`attestation.bundle.verificationMaterial.tlogEntries[].logIndex`).
+
+[release]
+repository = "komira-ai/jobscheduler"
+version = "0.1.179"
+commit = "9cf5b5a987e77aa39cac7c15a5dd4e635af4742c"
+signer_workflow = "komira-ai/jobscheduler/.github/workflows/release.yml"
+source_ref = "refs/heads/main"
+
+# The job service the tests drive.
+[[archive]]
+program = "js-lease-server"
+target = "x86_64-unknown-linux-musl"
+sha256 = "cd8759affe0f109b797695490d5a9e644f268659c7e70a8a422868ac1f57d4d5"
+attestation_log_index = 3722910151
+
+# The host agent, which the cases that run a job need. CI fetches and verifies it on every run.
+[[archive]]
+program = "js-agent"
+target = "x86_64-unknown-linux-musl"
+sha256 = "95fe12d5308c825e6351559ed350733cd4c335f302c01ff50a44a20686e64fcd"
+attestation_log_index = 3722910151

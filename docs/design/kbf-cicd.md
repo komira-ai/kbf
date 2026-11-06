@@ -616,7 +616,7 @@ A push to `main` runs one pipeline, `pipeline.yml`:
   release, no push to another repository, no environment and no secret. The only write scopes it grants are the signing
   scopes of the two `artifacts.yml` calls (only the sign call runs a job that uses them) and `actions: write` of the `watch` job (to cancel this run), both under the exact `if:`
   of a push to `main` (the `beta` call grants `attestations: read`
-  for its `mixed-version` job); a called workflow gets at most what the caller grants, and GitHub refuses the whole
+  for its `mixed-version` and `js-real-service` jobs); a called workflow gets at most what the caller grants, and GitHub refuses the whole
   workflow at startup when one asks for more, so the workflow lint compares every job of each called workflow with its
   caller's grant. No stage call passes `secrets:`.
 - **The release is another workflow, started by the pipeline's success.** `release.yml` runs on `workflow_run` of

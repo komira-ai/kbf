@@ -50,6 +50,8 @@ rustls-native-certs.workspace = true
 sha2.workspace = true
 tar.workspace = true
 thiserror.workspace = true
+# `fetch-pinned-js` reads kbf-js-version.toml.
+toml.workspace = true
 ureq.workspace = true
 # The zip archive of a pinned tool (`fetch --extract zip`).
 zip.workspace = true

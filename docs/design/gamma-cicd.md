@@ -100,7 +100,8 @@ release waits for either.
 
 The pipeline's jobs are `ci` (`ci.yml` again, on the merged commit), `beta` (`beta.yml`:
 the full test run with slow tests, Arm, Postgres, the object stores, crun, the Mac jobs,
-the Linux packages, and the cross-version and mixed-version cells), `artifacts` (stage
+the Linux packages, the cross-version and mixed-version cells, and `kbf-job-client` against
+the pinned jobscheduler release), `artifacts` (stage
 `build`: the seed build, plain `cargo build --locked --release` on GitHub-hosted runners),
 `artifacts-sign` (stage `sign`: the attestations, after `ci` and `artifacts`), `smoke`
 (after `artifacts-sign`: the end-to-end smoke on this run's files), `watch` (cancels the
