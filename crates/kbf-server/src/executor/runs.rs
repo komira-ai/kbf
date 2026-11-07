@@ -32,6 +32,7 @@ use crate::executor::api::{answered, not_found, note};
 use crate::executor::host::HostWorker;
 use crate::executor::metrics::{IngestEnd, Metrics, RunEnd};
 use crate::executor::outcome::{Settled, Verdict, forgotten, judge, ran, refused, result_of};
+use crate::executor::output::{Grants, Output, Tail};
 use crate::executor::phases::{Mark, Timeline};
 use crate::executor::submit::{Booking, Prepared, prepare};
 use crate::executor::task::PackKey;
@@ -90,6 +91,8 @@ impl Waiting {
 pub(super) struct Running {
     pub(super) job: String,
     key: PackKey,
+    /// What the job was handed, redacted from its output if it does not end well.
+    grants: Arc<Grants>,
 }
 
 pub(super) struct Reporting {
@@ -328,6 +331,7 @@ impl HostWorker {
                 Submitted::Running(Running {
                     job: job.id,
                     key: prepared.key.clone(),
+                    grants: Arc::new(prepared.grants.clone()),
                 })
             }
             Err(error) => match refused(&error) {
@@ -355,14 +359,15 @@ impl HostWorker {
     /// pass for a budget and a call, not a call per job; the next pass begins after the last
     /// task read, so every task is read in turn.
     pub(super) async fn poll(&mut self, ctx: &Ctx<'_>, now: Instant) {
-        // The action and the key of a running task, for the ingest if its job ended well.
-        type Read = Option<(Digest, PackKey)>;
+        // The action and the key of a running task, for the ingest if its job ended well, and
+        // its grants, for its output if it did not.
+        type Read = Option<(Digest, PackKey, Arc<Grants>)>;
         let mut jobs: Vec<(LeaseId, String, Read)> = self
             .tasks
             .iter()
             .filter_map(|(lease, task)| match &task.stage {
                 Stage::Running(r) => {
-                    let read = Some((task.action.clone(), r.key.clone()));
+                    let read = Some((task.action.clone(), r.key.clone(), Arc::clone(&r.grants)));
                     Some((*lease, r.job.clone(), read))
                 }
                 Stage::Withdrawing(job) => Some((*lease, job.clone(), None)),
@@ -398,14 +403,15 @@ impl HostWorker {
         }
     }
 
-    /// Reads one running task's job, and its result once it has ended.
+    /// Reads one running task's job, and its result once it has ended; the output of one that
+    /// did not end well goes with its `Result` ([`output`](super::output)).
     async fn read(
         &mut self,
         ctx: &Ctx<'_>,
         now: Instant,
         lease: LeaseId,
         id: &str,
-        (action, key): (Digest, PackKey),
+        (action, key, grants): (Digest, PackKey, Arc<Grants>),
     ) {
         let answer = ctx.api().get_job(id).await;
         self.heard(ctx, &answer);
@@ -441,7 +447,8 @@ impl HostWorker {
         let result = match result {
             Ok(result) => result,
             Err(error) if not_found(&error) => {
-                self.settle_with(lease, &forgotten(), now, &ctx.deps.metrics);
+                let output = self.output(ctx, lease, id, None, &grants).await;
+                self.settle_failed(lease, &forgotten(), &output, now, &ctx.deps.metrics);
                 return;
             }
             Err(error) => {
@@ -451,9 +458,64 @@ impl HostWorker {
         };
         self.stamp(lease, Mark::Ended, now, ctx);
         match judge(&job, &result) {
-            Verdict::Settled(settled) => self.settle_with(lease, &settled, now, &ctx.deps.metrics),
+            Verdict::Settled(settled) => {
+                let output = self.output(ctx, lease, id, Some(&result), &grants).await;
+                self.settle_failed(lease, &settled, &output, now, &ctx.deps.metrics);
+            }
             Verdict::Ingest => self.ingest(ctx, lease, action, key),
         }
+    }
+
+    /// The output of job `id`, which did not end well: the tails of its `result` if they hold
+    /// any, else one `GetLogs`; redacted of `grants` and cut to the cap. Only the lengths are
+    /// logged.
+    async fn output(
+        &mut self,
+        ctx: &Ctx<'_>,
+        lease: LeaseId,
+        id: &str,
+        result: Option<&js_proto::v1::JobResult>,
+        grants: &Grants,
+    ) -> Output {
+        let tail = match result.and_then(Tail::of_result) {
+            Some(tail) => Ok(tail),
+            None => {
+                let logs = ctx.api().logs_tail(id).await;
+                self.heard(ctx, &logs);
+                logs
+            }
+        };
+        let output = match tail {
+            Ok(tail) => Output::of(&tail, grants),
+            Err(error) => Output::unread(&error),
+        };
+        tracing::info!(
+            worker = %self.id,
+            %lease,
+            stdout_bytes = output.stdout.len(),
+            stderr_bytes = output.stderr.len(),
+            truncated = output.truncated,
+            unread = output.note.is_some(),
+            "the output of a job that did not end well goes with its result"
+        );
+        output
+    }
+
+    /// Forms the result of `lease` from `settled`, with the output of its job.
+    fn settle_failed(
+        &mut self,
+        lease: LeaseId,
+        settled: &Settled,
+        output: &Output,
+        now: Instant,
+        metrics: &Metrics,
+    ) {
+        self.tasks.entry(lease).and_modify(|task| {
+            let mut result = result_of(lease, &task.action, settled);
+            output.attach(&mut result);
+            metrics.run_ended(RunEnd::of(&result));
+            task.stage = reporting(result, now);
+        });
     }
 
     /// Logs and counts, once a task, that the host holding its job has missed its grace.

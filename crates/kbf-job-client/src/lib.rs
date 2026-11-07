@@ -17,7 +17,8 @@
 //! every rule.
 //!
 //! The host executor of `kbf-server` (`crates/kbf-server/src/executor`) is its one caller: it
-//! submits each placed action as a job and reads its result.
+//! submits each placed action as a job and reads its result, and the logs of a job that did
+//! not end well whose result holds no output.
 //!
 //! # Safety of the credential
 //!

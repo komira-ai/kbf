@@ -40,6 +40,10 @@
 //! code (`quota-unavailable`, ...) or text that can quote those arguments: only the code is
 //! read, from the start of the detail, and only the detail's length is logged.
 //!
+//! What a job that did not end well wrote goes with its `Result` as a detail of the status,
+//! redacted of the job's grants and cut to a cap ([`output`](super::output)); the code and the
+//! message above are unchanged by it.
+//!
 //! A job this executor cancelled is not judged here: the farm cancelled its lease and owes
 //! itself no result, so the task is dropped once the service has answered the cancel.
 

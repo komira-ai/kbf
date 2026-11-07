@@ -1,5 +1,4 @@
 use std::collections::BTreeSet;
-use std::sync::{Arc, Mutex, PoisonError};
 
 use js_proto::v1::{
     Job, JobResult, JobState, Refusal, RefusalCode, ResultReason, StartFailureCode,
@@ -12,51 +11,7 @@ use kbf_types::LeaseId;
 use tonic::Code;
 
 use super::{Settled, Verdict, forgotten, judge, ran, refused, result_of};
-
-/// The log of a test, as text.
-#[derive(Clone, Default)]
-struct Log(Arc<Mutex<Vec<u8>>>);
-
-struct LogWriter(Log);
-
-impl std::io::Write for LogWriter {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        (self.0)
-            .0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Log {
-    type Writer = LogWriter;
-
-    fn make_writer(&'a self) -> LogWriter {
-        LogWriter(self.clone())
-    }
-}
-
-impl Log {
-    fn text(&self) -> String {
-        let bytes = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        String::from_utf8_lossy(&bytes).into_owned()
-    }
-
-    /// Runs `f` with everything it logs written here.
-    fn capture<T>(&self, f: impl FnOnce() -> T) -> T {
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(self.clone())
-            .with_ansi(false)
-            .finish();
-        tracing::subscriber::with_default(subscriber, f)
-    }
-}
+use crate::executor::test_support::Log;
 
 fn job(state: JobState, failure: StartFailureCode, detail: &str) -> Job {
     Job {
