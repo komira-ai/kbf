@@ -1,7 +1,8 @@
 # The Mac and service-manager surface of the repository. A pull request that adds, changes,
 # deletes or renames a path listed here runs the macOS jobs of .github/workflows/macos-pr.yml
 # (`cargo xtask pr-paths`, crates/xtask/src/pr_paths.rs); a pull request that touches none of
-# them takes no macOS runner.
+# them takes no macOS runner from that workflow (AGENTS.md, B9 of this repository, lists the
+# others a pull request can run).
 #
 # One pattern a line: a file, written out exactly, or `<dir>/**` for a directory and everything
 # under it. `#` starts a comment line. The repository lint `macos_pr`

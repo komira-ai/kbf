@@ -5,7 +5,8 @@
 # actions from the set the repository's Actions policy allows (actions/* and
 # tailscale/github-action), and to a top-level `permissions: {}`.
 #
-# A pull request runs only this. The rest of the suite (the slow tests, the Arm run, the
+# A pull request runs this, and macos-pr.yml (which takes a Mac only when the pull request changes
+# the macOS surface). The rest of the suite (the slow tests, the Arm run, the
 # jobs that need a service, root, crun or a Mac, the packages and the beta smoke) runs on a
 # push to main, in beta.yml. On a push to main this workflow is the first stage of the one
 # pipeline (pipeline.yml calls it, `workflow_call`), so the merged result meets the same gate

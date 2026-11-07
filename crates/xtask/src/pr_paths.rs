@@ -12,8 +12,8 @@
 //! into), they are every path the pull request adds, changes or deletes. A rename counts as
 //! both its old path and its new one (`--no-renames`), so moving a file out of a matched
 //! directory still matches. A base git cannot read is an error, and so is a pattern file
-//! that does not parse ([`parse`]): the step fails, so the jobs that need it fail too and
-//! are never skipped.
+//! that does not parse ([`parse`]): the step fails, the macOS jobs that need it are skipped,
+//! and macos-pr.yml's `macos` check fails because `changes` did not pass.
 //!
 //! The pattern file has one pattern per line. Blank lines and lines that start with `#` are
 //! skipped. A pattern is a path relative to the repository root, in one of two forms
@@ -164,7 +164,8 @@ pub fn report(key: &str, found: &[(&str, &Pattern)]) -> Vec<String> {
     lines
 }
 
-/// The paths `git diff --no-renames --name-only -z <base> HEAD` lists in `root`.
+/// The paths `git diff --no-renames --name-only -z <base> HEAD` lists in `root`. `base` is read
+/// as a revision even when it starts with `-` (`--end-of-options`).
 fn changed_paths(root: &Path, base: &str) -> Result<Vec<String>, Error> {
     let out = Command::new("git")
         .arg("-C")
@@ -174,6 +175,7 @@ fn changed_paths(root: &Path, base: &str) -> Result<Vec<String>, Error> {
             "--no-renames",
             "--name-only",
             "-z",
+            "--end-of-options",
             base,
             "HEAD",
             "--",

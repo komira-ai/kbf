@@ -273,3 +273,30 @@ fn without_an_output_file_it_only_prints() {
     );
     assert_eq!(output(&root), None);
 }
+
+#[test]
+fn a_base_that_looks_like_an_option_is_read_as_a_revision() {
+    // Catches: a `--base` git takes as one of its own options (`--output=<file>` writes a file),
+    // where it can only be a revision.
+    let root = repo("option-base");
+    let (code, out, err) = outcome(
+        Command::new(XTASK)
+            .arg("--root")
+            .arg(&*root)
+            .args([
+                "pr-paths",
+                "--base=--output=written",
+                "--patterns",
+                "tools/paths.txt",
+            ])
+            .args(["--key", "macos"])
+            .output()
+            .expect("run xtask"),
+    );
+    assert_eq!((code, out.as_str()), (Some(1), ""));
+    assert!(
+        err.starts_with("xtask: git diff --output=written HEAD: "),
+        "stderr: {err}"
+    );
+    assert!(!root.join("written").exists());
+}

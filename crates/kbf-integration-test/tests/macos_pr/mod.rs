@@ -5,18 +5,22 @@
 //!
 //! - **The expected list.** Every job a pull request can run on a macOS runner is one of
 //!   [`PR_MACOS_JOBS`], behind its gate ([`Gate`]): macos-pr.yml's two jobs behind its paths
-//!   check (`if:` exactly [`MACOS_IF`]), artifacts.yml's darwin build behind the label
-//!   `needs-artifacts`, and the jobs of the three workflows that have their own
-//!   `pull_request.paths`. A macOS job of a workflow that runs on `pull_request` is a pull
-//!   request's unless its `if:` is exactly [`NOT_ON_A_PULL_REQUEST`] (ci.yml's `task-macos`,
-//!   which runs after the merge). A listed job that is gone, or not on a Mac, is stale.
-//! - **No secret, no OIDC, no write.** A pull request's macOS job names no `secrets.` context
-//!   and no `secrets:` key, nor does its workflow's top-level `env:`; it has no `environment`;
-//!   every token scope it names is `read` or `none`, and `id-token` is `none`.
-//! - **macos-pr.yml's shape.** It runs on `pull_request` alone, with no filter (a filter on the
-//!   trigger would leave its `macos` check unreported, so a required check would wait for
-//!   ever); its concurrency group is the pull request's number, and cancels the run in
-//!   progress; its jobs are [`MACOS_PR_JOBS`]; `changes` runs on Linux under no condition, its
+//!   check (`if:` exactly [`MACOS_IF`]), artifacts.yml's darwin build behind exactly its label
+//!   condition ([`LABEL_IF`]), and the jobs of the three workflows that have their own
+//!   `pull_request.paths` (none of them `*` or `**`). A macOS job (any case of `macos-`) of a
+//!   workflow that runs on `pull_request` is a pull request's unless its `if:` is exactly
+//!   [`NOT_ON_A_PULL_REQUEST`] (ci.yml's `task-macos`, which runs after the merge); a job of such
+//!   a workflow that calls a local workflow with a macOS job is refused, as the lint cannot gate
+//!   the call. A listed job that is gone, or not on a Mac, is stale.
+//! - **No secret, no OIDC, no write.** A pull request's macOS job names no `secrets` context in
+//!   any form (`secrets.X`, `secrets['X']`, `toJSON(secrets)`: the word `secrets` as an
+//!   identifier, [`names_secrets`]) and has no `secrets:` key, nor does its workflow's top-level
+//!   `env:`; it has no `environment`; every token scope it names is `read` or `none`, and
+//!   `id-token` is `none`.
+//! - **macos-pr.yml's shape.** It runs on `pull_request` and `merge_group`, each with no filter (a
+//!   filter on a trigger would leave its `macos` check unreported, so a required check would wait
+//!   for ever); its concurrency group is the pull request's number (a queue entry's own ref), and
+//!   cancels the run in progress on a pull request only ([`GROUP`], [`CANCEL`]); its jobs are [`MACOS_PR_JOBS`]; `changes` runs on Linux under no condition, its
 //!   last step is [`PR_PATHS`] with the id `paths`, and it outputs `macos` from that step; the
 //!   two macOS jobs need `changes` alone and run under [`MACOS_IF`]; `macos` runs on Linux,
 //!   needs the other three under `!cancelled()`, and has one conditional step, `run: "false"`
@@ -69,7 +73,11 @@ pub const NOT_ON_A_PULL_REQUEST: &str = "${{ github.event_name != 'pull_request'
 pub const PR_PATHS: &str = "cargo xtask pr-paths --base HEAD^1 --patterns tools/ci/macos-pr-paths.txt --key macos --output \"$GITHUB_OUTPUT\"";
 
 /// The concurrency of [`MACOS_PR`]: one run per pull request, a newer push cancels the older.
-const GROUP: &str = "macos-pr-${{ github.event.pull_request.number }}";
+pub const GROUP: &str = "macos-pr-${{ github.event.pull_request.number || github.ref }}";
+
+/// The `cancel-in-progress` of [`MACOS_PR`]: a newer push to a pull request cancels its run; a
+/// merge queue entry's run is never cancelled.
+pub const CANCEL: &str = "${{ github.event_name == 'pull_request' }}";
 
 /// The `if:` of the `macos` job's failing step.
 pub const GATE_FAIL_IF: &str = "${{ needs.changes.result != 'success' || (needs.changes.outputs.macos == 'true' && (needs.macos-test.result != 'success' || needs.macos-device.result != 'success')) }}";
@@ -105,12 +113,31 @@ pub const ALWAYS: [&str; 3] = [
     "crates/xtask/src/pr_paths.rs",
 ];
 
-/// The label condition of artifacts.yml's build jobs (`release_artifacts` holds the rest).
-const LABEL: &str = "labels.*.name, 'needs-artifacts'";
+/// The `if:` of artifacts.yml's darwin build: on a pull request, only with the label
+/// `needs-artifacts` (`release_artifacts` holds the build jobs' label rule).
+pub const LABEL_IF: &str = "${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'needs-artifacts')) && inputs.stage != 'sign' }}";
 
-/// Whether `label` is a macOS runner.
+/// Whether `label` is a macOS runner, in any case.
 fn is_macos(label: &str) -> bool {
-    label.starts_with("macos-")
+    label.to_ascii_lowercase().starts_with("macos-")
+}
+
+/// Whether `s` names the `secrets` context in any form: the word `secrets`, in any case, not
+/// part of a longer identifier and not a key's name (`secrets:`), so `secrets.X`, `secrets['X']`,
+/// `toJSON(secrets)` and `${{ secrets }}`.
+pub fn names_secrets(s: &str) -> bool {
+    let lower = s.to_ascii_lowercase();
+    let ident = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
+    lower.match_indices("secrets").any(|(at, word)| {
+        let before = lower[..at].chars().next_back();
+        let after = lower[at + word.len()..].chars().next();
+        !before.is_some_and(ident) && !after.is_some_and(|c| ident(c) || c == ':')
+    })
+}
+
+/// The workflow file a job's `uses:` names in this repository (`./.github/workflows/<file>`).
+fn local_callee(uses: &str) -> Option<&str> {
+    uses.strip_prefix("./")?.strip_prefix(WORKFLOW_DIR)
 }
 
 /// The text of the workflow `name` of `workflows`.
@@ -156,6 +183,22 @@ fn expected_list(workflows: &[(String, String)], out: &mut Vec<String>) -> Resul
         if !on_pr {
             continue;
         }
+        for job in workflows::job_names(text)? {
+            let callee = workflows::job_uses(text, &job)?;
+            let Some(callee) = callee.as_deref().and_then(local_callee) else {
+                continue;
+            };
+            let calls_mac = workflows
+                .iter()
+                .find(|(n, _)| n == callee)
+                .is_some_and(|(_, t)| macos_jobs(t).is_ok_and(|j| !j.is_empty()));
+            if calls_mac {
+                out.push(format!(
+                    "{name}#{job} calls {callee}, which has a macOS job, on a pull request: this lint \
+                     cannot gate a called job, so run it from {MACOS_PR}"
+                ));
+            }
+        }
         for job in macos_jobs(text).map_err(|e| format!("{name}: {e}"))? {
             let condition =
                 workflows::job_condition(text, &job).map_err(|e| format!("{name}: {e}"))?;
@@ -188,9 +231,12 @@ fn expected_list(workflows: &[(String, String)], out: &mut Vec<String>) -> Resul
         let condition = workflows::job_condition(text, job)?.unwrap_or_default();
         let gated = match gate {
             Gate::PathsCheck => condition == MACOS_IF,
-            Gate::Label => condition.contains(LABEL),
-            Gate::TriggerPaths => workflows::trigger_filters(text, "pull_request")
-                .is_ok_and(|f| f.iter().any(|(k, v)| k == "paths" && !v.is_empty())),
+            Gate::Label => condition == LABEL_IF,
+            Gate::TriggerPaths => workflows::trigger_filters(text, "pull_request").is_ok_and(|f| {
+                f.iter().any(|(k, v)| {
+                    k == "paths" && !v.is_empty() && v.iter().all(|p| p != "*" && p != "**")
+                })
+            }),
         };
         if !gated {
             out.push(format!(
@@ -212,12 +258,9 @@ fn no_secrets(workflows: &[(String, String)], out: &mut Vec<String>) -> Result<(
         }
         let at = format!("{name}#{job}");
         let strings = workflows::job_strings(text, job)?;
-        if strings
-            .iter()
-            .any(|s| s.to_ascii_lowercase().contains("secrets."))
-        {
+        if strings.iter().any(|s| names_secrets(s)) {
             out.push(format!(
-                "{at} names a secret (`secrets.`); a pull request's macOS job holds none"
+                "{at} names a secret (the `secrets` context); a pull request's macOS job holds none"
             ));
         }
         if workflows::job_has_key(text, job, "secrets")? {
@@ -249,7 +292,7 @@ fn no_secrets(workflows: &[(String, String)], out: &mut Vec<String>) -> Result<(
         }
         if workflows::top_env(text)?
             .iter()
-            .any(|(_, v)| v.to_ascii_lowercase().contains("secrets."))
+            .any(|(_, v)| names_secrets(v))
         {
             out.push(format!(
                 "{name}'s top-level `env:` names a secret, which {at} would hold"
@@ -267,22 +310,24 @@ fn shape(workflows: &[(String, String)], out: &mut Vec<String>) -> Result<(), St
     };
     let mut say = |what: String| out.push(format!("{MACOS_PR}: {what}"));
     let events = workflows::events(text)?;
-    if events != ["pull_request"] {
+    if events != ["pull_request", "merge_group"] {
         say(format!(
-            "runs on {events:?}; it runs on `pull_request` alone"
+            "runs on {events:?}; it runs on `pull_request` and `merge_group` alone"
         ));
     }
-    if let Ok(filters) = workflows::trigger_filters(text, "pull_request")
-        && !filters.is_empty()
-    {
-        say(format!(
-            "filters its `pull_request` trigger ({filters:?}): a run that never starts leaves the `macos` check unreported"
-        ));
+    for trigger in ["pull_request", "merge_group"] {
+        if let Ok(filters) = workflows::trigger_filters(text, trigger)
+            && !filters.is_empty()
+        {
+            say(format!(
+                "filters its `{trigger}` trigger ({filters:?}): a run that never starts leaves the `macos` check unreported"
+            ));
+        }
     }
     let concurrency = workflows::concurrency(text)?;
-    if concurrency != Some((GROUP.to_owned(), "true".to_owned())) {
+    if concurrency != Some((GROUP.to_owned(), CANCEL.to_owned())) {
         say(format!(
-            "its concurrency is {concurrency:?}; it is the group `{GROUP}` with `cancel-in-progress: true`"
+            "its concurrency is {concurrency:?}; it is the group `{GROUP}` with `cancel-in-progress: {CANCEL}`"
         ));
     }
     let jobs = workflows::job_names(text)?;
