@@ -916,5 +916,5 @@ async fn a_job_that_ended_well_makes_no_call_for_its_output() {
     assert_eq!((result_calls(&calls), logs_calls(&calls)), (1, 0));
 }
 
-#[path = "runs_window_tests.rs"]
-mod window;
+#[path = "runs_submit_tests.rs"]
+mod submit;
