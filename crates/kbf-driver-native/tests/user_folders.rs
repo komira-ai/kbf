@@ -668,15 +668,19 @@ async fn a_temporary_items_of_another_user_is_not_swept() {
     assert!(kept, "swept a TemporaryItems owned by root");
 }
 
-/// The newest Xcode on this runner whose `xcrun --find metal` finds the Metal
-/// compiler (a node without the Metal toolchain installed has none to test).
+/// The newest Xcode on this runner whose `xcrun --find` finds both tools the test runs,
+/// the Metal compiler and `metallib`, outside any sandbox (a node without the Metal
+/// toolchain installed has none to test; the macos-15 runner's Xcode 26 has `metal` and no
+/// `metallib`). A tool found here and not under the lease's sandbox still fails the test.
 fn xcode_with_metal() -> Option<(String, PathBuf)> {
     xcodes().into_iter().rev().find(|(_, developer_dir)| {
-        std::process::Command::new(xcode::XCRUN)
-            .args(["--find", "metal"])
-            .env("DEVELOPER_DIR", developer_dir)
-            .output()
-            .is_ok_and(|out| out.status.success())
+        ["metal", "metallib"].iter().all(|tool| {
+            std::process::Command::new(xcode::XCRUN)
+                .args(["--find", tool])
+                .env("DEVELOPER_DIR", developer_dir)
+                .output()
+                .is_ok_and(|out| out.status.success())
+        })
     })
 }
 
@@ -694,7 +698,7 @@ async fn a_metal_shader_compiles_with_no_flags() {
     setup();
     let _tools = DEVELOPER_TOOLS.read().await;
     let Some((build, developer_dir)) = xcode_with_metal() else {
-        eprintln!("no Xcode with a Metal compiler on this runner: nothing to check");
+        eprintln!("no Xcode with the Metal compiler and metallib on this runner: nothing to check");
         return;
     };
     let dir = scratch("metal");
