@@ -29,7 +29,8 @@ fn a_grant_for_this_mac_and_lease_is_accepted() {
 /// The `grant-admin` answer the gate's own code produced for `kbf-mdm`'s grant test
 /// (seed `[5; 32]`, serial `C02X`, lease `lease-1`, issued at 1 800 000 000), printed
 /// by running that test: its `token` is what the server hands this helper, its `key`
-/// the line of the Mac's key file. Catches: the two sides drifting apart in the text,
+/// the line of the Mac's key file. `kbf-mdm` is deleted; these bytes keep the format
+/// it issued. Catches: the two sides drifting apart in the text,
 /// the time form, the base64 alphabets or the key encoding.
 #[test]
 fn the_gates_own_grant_verifies_here() {

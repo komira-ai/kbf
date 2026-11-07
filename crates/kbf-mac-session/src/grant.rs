@@ -1,8 +1,10 @@
 //! The MDM gate's admin grant: the only way a lease user becomes an administrator
 //! (docs/design/fleet-updates-security.md S5.2 "The admin grant", S8).
 //!
-//! The gate defines the format (`kbf-mdm`'s `grant` module); this module accepts
-//! exactly that and nothing else. The grant text is exactly five lines, each ending in
+//! The gate defined the format (the `grant` module of `kbf-mdm`, a gate that was never
+//! deployed and is deleted; the MDM gate is now `hostkeeper-mdm-gate` in
+//! komira-ai/hostkeeper). This module holds that format and accepts exactly it and
+//! nothing else. The grant text is exactly five lines, each ending in
 //! one LF, each field separated from its value by one space:
 //!
 //! ```text

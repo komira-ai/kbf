@@ -1,5 +1,10 @@
 # MDM as a backend: what kbf asks of device management
 
+**Superseded.** `kbf-mdm-gate` (crates `kbf-mdm` and `kbf-mdm-api`, and `kbf-server`'s
+client of it) was never deployed and is deleted. The MDM gate is `hostkeeper-mdm-gate` in
+komira-ai/hostkeeper, linked into its coordinator (that repository's
+`docs/design/hostkeeper-mdm.md`). What follows is the design as it was written.
+
 This is the third part of the fleet-updates design, after
 [fleet-updates.md](fleet-updates.md) (sections "7.6" and so on) and
 [fleet-updates-security.md](fleet-updates-security.md) (sections "S5" and so on).

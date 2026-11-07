@@ -27,8 +27,8 @@
 //!   modes are not here: `kbf-installer` installs the packaged ones.
 //! - [`mdm`]: an Apple MDM on one Linux host: its pinned upstream archives fetched
 //!   (`mdm fetch`), its services installed as root (`mdm install`), and read-only
-//!   checks of what runs (`mdm verify`); and, on an operator's own machine, an erase
-//!   request for one Mac signed with their security key (`mdm erase-request`).
+//!   checks of what runs (`mdm verify`). Frozen: its successor is `hostkeeper-mdm` in
+//!   komira-ai/hostkeeper.
 //! - [`log`]: the last lines of a kbf-server's durable log across its rotated files
 //!   (`log`; read-only).
 //! - [`host_status`]: one host's row from the coordinator's `GET /v1/status` (`host-status`;

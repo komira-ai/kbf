@@ -570,7 +570,8 @@ way to block updates. This path is for the time before MDM is live, not a design
   network, not only on an overlay network, because a freshly erased Mac enrolls
   before any overlay client is installed (M6). Its API is not: only `kbf-mdm-gate`
   holds the API key.
-- **`kbf-mdm-gate`** (decision: build it, S5). A small process beside the MDM that
+- **`kbf-mdm-gate`** (decision: build it, S5; superseded: it was never deployed and is
+  deleted, and the MDM gate is `hostkeeper-mdm-gate` in komira-ai/hostkeeper). A small process beside the MDM that
   holds the API key and offers `kbf-server`, over mTLS pinned to the server's
   identity, only the verbs of M2.2: `status`, `enforce` (and `withdraw`) of a build
   a signed set names for that Mac's pool, `profile` (an allowlisted one),
@@ -943,7 +944,7 @@ Changes by crate (rough sizes, tests included):
 | `kbf-updater` (new) | socket and caller check, key statements, set checks of S3.1, profile / package / bootc backends, state file | ~2,100 |
 | `kbf-mac-session` (new) | socket and caller check, the verbs of S4.2, sweep, leak scan | ~1,700 |
 | `kbf-driver-container` | `--userns=nomap`, so no container uid is the daemon's; the overlay handed to the container's root and back; the subordinate id check at startup | ~300 |
-| `kbf-mdm` (new) | `MdmBackend`; NanoHUB backend; DDM status; `kbf-mdm-gate` with mTLS, inventory, caps, the profile allowlist, signed-erase verification and its own alerts; `kbf-admin erase` | ~1,500 |
+| `kbf-mdm` (new; superseded: never deployed and deleted; the gate is `hostkeeper-mdm-gate` in komira-ai/hostkeeper) | `MdmBackend`; NanoHUB backend; DDM status; `kbf-mdm-gate` with mTLS, inventory, caps, the profile allowlist, signed-erase verification and its own alerts; `kbf-admin erase` | ~1,500 |
 | `kbf-types`, `kbf-sched` | node states; cordon in placement; rollout state machine; slots; `min_serving` by hardware class; `accept_outage`; internal submitter for `kbf-node`; whole-Mac reservation | ~1,900 |
 | `kbf-server` | rollout driver, durable record and startup reconciliation, roles and OIDC tokens, identity binding and revocation, audit, `/v1/nodes`, `/v1/software`, `/v1/rollouts`, Fleet page, absence suppression | ~1,500 |
 | `kbf-caps`, `kbf-front` | membership comparison; new exact and set keys, `probe.*`; `kbf-node` refused from clients | ~300 |

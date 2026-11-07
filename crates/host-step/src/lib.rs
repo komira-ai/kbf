@@ -5,6 +5,10 @@
 //! plan (`Mode::DryRun`, the default of every verb built on this crate) or carries it out
 //! (`Mode::Apply`). A second run finds nothing to change and prints `nothing to do`.
 //!
+//! **Frozen.** The successor of this crate is `hostkeeper-mdm-step` in komira-ai/hostkeeper. It
+//! takes no new work, and is deleted once the live MDM host runs the hostkeeper kit
+//! (`docs/mdm-host.md`).
+//!
 //! The host is the [`Host`] trait: [`RealHost`] is the machine, [`fake::FakeHost`] keeps a
 //! file tree in memory and runs no program it was not told about, which is what the tests of
 //! every verb use.

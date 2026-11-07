@@ -3,6 +3,10 @@
 //! of the MDM services, the pinned upstream binaries and the arguments the host layer
 //! passes to them.
 //!
+//! **Frozen.** The successor of this crate is `hostkeeper-mdm-core` in komira-ai/hostkeeper. It
+//! takes no new work, and is deleted once the live MDM host runs the hostkeeper kit
+//! (`docs/mdm-host.md`).
+//!
 //! This is a pure crate: no I/O, no process, no clock, no randomness and no hashed
 //! collections. Everything is a function from settings text to bytes, so a site's files
 //! are the same on every render and can be compared with what is installed. The binary

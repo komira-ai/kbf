@@ -33,9 +33,6 @@
 //! - Node rolling ([`update`]): the durable rows and facts of a split-mode update
 //!   (`docs/design/split-mode-updates.md`, sections 2.6 to 2.11). Nothing picks hosts or
 //!   steps them: updates are OS packages, driven by `kbf-updater`.
-//! - The MDM gate ([`mdm`]): the server's verbs at `kbf-mdm-gate` (inventory, enforce
-//!   and withdraw a macOS build, install an allowlisted profile; no erase), a client
-//!   over mutual TLS, and the polling of an update's DDM progress. Nothing calls it yet.
 //! - Build history ([`history`]): off unless `--history-objects` is given, each attempt and
 //!   cache hit of an invocation a client named is recorded in an object store, off the
 //!   path of the call it belongs to, with a run id the build pages name the run by. It
@@ -114,7 +111,6 @@ mod local;
 pub mod log_file;
 pub mod machine;
 mod map_push;
-pub mod mdm;
 pub mod members;
 pub mod members_rpc;
 mod memory;

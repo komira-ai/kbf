@@ -497,6 +497,12 @@ socket mode 0660. Two controls, the first being the one that matters:
 
 ## S5. `kbf-mdm-gate`
 
+**Superseded.** `kbf-mdm-gate` (crates `kbf-mdm` and `kbf-mdm-api`, and `kbf-server`'s
+client of it) was never deployed and is deleted. The MDM gate is `hostkeeper-mdm-gate` in
+komira-ai/hostkeeper, linked into its coordinator (that repository's
+`docs/design/hostkeeper-mdm.md`). The admin grant's format (S5.2) is kept by
+`kbf-mac-session`'s `grant` module.
+
 ### S5.1 Why a gate
 
 NanoHUB's API with the escrowed bootstrap tokens can erase every Mac and enforce any
@@ -536,7 +542,7 @@ holds the API and the design says so, costs nothing to build and was rejected.
   Macs in an MDM profile. Rotation is a new profile, and Macs accept either key during
   the overlap. A grant is single-use: `kbf-mac-session` records used lease ids across
   reboots. The grant's exact format follows.
-- **The admin grant.** `kbf-mdm-gate` defines it (`crates/kbf-mdm/src/grant.rs`);
+- **The admin grant.** `kbf-mdm-gate` defined it (its `grant` module, deleted with the gate);
   `kbf-mac-session` accepts exactly this and nothing else.
   - *Text.* Exactly five lines, each ending in one LF (no CR, no blank line, no
     trailing whitespace), each field separated from its value by one space:

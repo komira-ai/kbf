@@ -151,10 +151,11 @@ default, `--ui=false` turns them off. Open: no gate, whatever the REAPI policy s
 | farm summary (ready, nodes by state, queue, leases, storage) | `GET /v1/health` | [F] | open |
 | metrics | `GET /metrics` | [F] | none |
 
-The Mac device manager is a separate service, not the operator API (`crates/kbf-mdm`: `GET
-/v1/macs`, `GET /v1/macs/{serial}`, `POST` on `.../enforce`, `.../withdraw`, `.../profile`,
-`.../grant-admin`, `.../erase` and `.../bring-forward`). It leaves the product (distribution.md
-section 8) and is not an operator verb of the farm.
+The Mac device manager is a separate service, not the operator API. kbf's (`kbf-mdm`, with
+`GET /v1/macs`, `GET /v1/macs/{serial}`, and `POST` on `.../enforce`, `.../withdraw`,
+`.../profile`, `.../grant-admin`, `.../erase` and `.../bring-forward`) was never deployed and is
+deleted; the MDM gate is `hostkeeper-mdm-gate` in komira-ai/hostkeeper. It is not an operator
+verb of the farm.
 
 ## 2. Verbs that are not routes
 
@@ -169,7 +170,7 @@ section 8) and is not an operator verb of the farm.
 | start a mode, `--check` | `kbf <mode>` **[F]** | the local runtime; it installs nothing |
 | frontend handover, enroll, `kbf node` | `kbf frontend handover`, `kbf enroll`, `kbf node` **[F]** | removed: a frontend is updated by a roll of the `kbf-proxy` pool, driven by `kbf-updater` (`frontend-proxy.md` section 4) **[V]** |
 | render, check, install units, swap, verify certificate (the `envoy render, check, apply` verbs are retired: no Envoy) | `kbf-deploy` **[F]** | become installer logic and package units; root |
-| `mdm`, `minio`, `pilot`, `erase-request` | `kbf-deploy` **[F]** | leave the product (distribution.md section 8); an erase request is signed with a security key on the operator's machine |
+| `mdm`, `minio`, `pilot` | `kbf-deploy` **[F]** | leave the product (distribution.md section 8); `mdm` is frozen, its successor `hostkeeper-mdm` in komira-ai/hostkeeper; `erase-request` is deleted with the gate it signed for |
 | `kbf cluster status`, `drain`, `undrain`, `member`, `denied`, `epoch-bump`, `object-store status\|audit\|connection\|bind\|unbind\|verify` | the `kbf` CLI **[F]** (the last two groups: unit G1) | a thin client of the routes above, no logic |
 | frontend log tail | none | cut (Q4) |
 | update policy, image pull | none | no source verb exists (Q5) |
