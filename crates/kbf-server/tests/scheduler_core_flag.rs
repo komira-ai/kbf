@@ -5,10 +5,13 @@
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
+use kbf_testkit::dir::TestDir;
+
 /// Runs the binary with `flag` and every path it creates under a scratch directory, and
-/// returns its output and the paths it must not have created.
-fn run(flag: &str) -> (Output, Vec<PathBuf>) {
-    let scratch = kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), "kbf-core-flag");
+/// returns the scratch directory (kept, so the paths are still there to look at while the
+/// caller holds it), its output and the paths it must not have created.
+fn run(flag: &str) -> (TestDir, Output, Vec<PathBuf>) {
+    let scratch = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "kbf-core-flag");
     let (log, hot, meta, state) = (
         scratch.join("log"),
         scratch.join("hot"),
@@ -25,14 +28,14 @@ fn run(flag: &str) -> (Output, Vec<PathBuf>) {
         .output()
         .expect("spawn");
     let parent = state.parent().expect("a parent").to_path_buf();
-    (out, vec![log, hot, meta, state, parent])
+    (scratch, out, vec![log, hot, meta, state, parent])
 }
 
 /// Catches `js` accepted as a scheduler core, a status other than 2, and a message that
 /// does not name the flag and say the core was removed.
 #[test]
 fn the_removed_js_core_is_refused_before_the_binary_creates_anything() {
-    let (out, created) = run("--scheduler-core=js");
+    let (_scratch, out, created) = run("--scheduler-core=js");
     assert_eq!(out.status.code(), Some(2), "{out:?}");
     let said = String::from_utf8_lossy(&out.stderr);
     assert!(said.contains("--scheduler-core"), "{said}");
@@ -47,7 +50,7 @@ fn the_removed_js_core_is_refused_before_the_binary_creates_anything() {
 /// exact one.
 #[test]
 fn usage_profiles_record_is_refused_before_the_binary_creates_anything() {
-    let (out, created) = run("--usage-profiles=record");
+    let (_scratch, out, created) = run("--usage-profiles=record");
     assert_eq!(out.status.code(), Some(2), "{out:?}");
     let said = String::from_utf8_lossy(&out.stderr);
     assert!(
