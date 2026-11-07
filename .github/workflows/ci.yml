@@ -1,11 +1,13 @@
-# The pull-request gate: the required checks `lint` and `test` plus `task-macos`; `test` is the coverage gate, and the
-# tests it measures run beside it in the matrix job `test-shard`. GitHub-hosted runners only; the repository
-# lints in crates/kbf-integration-test/tests/repo_lints.rs hold every workflow to that, to commit-SHA pinned
-# actions from the set the repository's Actions policy allows (actions/* and
-# tailscale/github-action), and to a top-level `permissions: {}`.
+# The pull-request gate: the required checks `lint` and `test`; `test` is the coverage gate, and the
+# tests it measures run beside it in the matrix job `test-shard`. `task-macos` runs after the merge
+# and in the merge queue; every pull request runs the macOS tests in macos-pr.yml. GitHub-hosted
+# runners only; the repository lints in crates/kbf-integration-test/tests/repo_lints.rs hold every
+# workflow to that, to commit-SHA pinned actions from the set the repository's Actions policy
+# allows (actions/* and tailscale/github-action), and to a top-level `permissions: {}`.
 #
-# A pull request runs only this. The rest of the suite (the slow tests, the Arm run, the
-# jobs that need a service, root, crun or a Mac, but `task-macos`, the packages and the beta smoke) runs on a
+# A pull request runs this, and macos-pr.yml (the macOS tests and the root and device steps of
+# beta.yml's `native-macos`). The rest of the suite (the slow tests, the Arm run, the
+# jobs that need a service, root, crun or a Mac, the packages and the beta smoke) runs on a
 # push to main, in beta.yml. On a push to main this workflow is the first stage of the one
 # pipeline (pipeline.yml calls it, `workflow_call`), so the merged result meets the same gate
 # and the Cargo cache below is saved. It no longer has a push trigger of its own: a push to
@@ -118,7 +120,9 @@ jobs:
       # `--target=arm64-apple-macosx`, which Zig refuses (its compiler-family probe runs the
       # program without `cc`, so it takes Zig for clang); without them (CRATE_CC_NO_DEFAULTS) Zig
       # gets its own `-target` and each build script's flags.
-      # The crates a Mac job tests whole: every test target, and the libraries' unit tests.
+      # The crates a Mac job tests whole: every test target, and the libraries' unit tests
+      # (macos-pr.yml's `macos-test` tests these on every pull request; the repository lint
+      # `macos_pr` requires each crate it tests whole to be here).
       - name: Check for aarch64-apple-darwin the tests of the crates the Mac jobs test whole
         if: ${{ !cancelled() }}
         env:
@@ -127,7 +131,7 @@ jobs:
           CRATE_CC_NO_DEFAULTS: "1"
           # The oldest macOS the binaries support, as artifacts.yml builds them.
           MACOSX_DEPLOYMENT_TARGET: "14.0"
-        run: cargo check --locked --target aarch64-apple-darwin --tests --features kbf-setup/proxy -p kbf-outputs -p kbf-driver-native -p kbf-node -p kbf-mac-session -p kbf-installer -p kbf-setup -p kbf-guest -p kbf-mac-provision -p kbf-vmm
+        run: cargo check --locked --target aarch64-apple-darwin --tests --features kbf-setup/proxy -p kbf-outputs -p kbf-driver-native -p kbf-node -p kbf-mac-session -p kbf-installer -p kbf-setup -p kbf-guest -p kbf-mac-provision -p kbf-vmm -p update-register -p kbf-host -p kbf-host-install -p kbf-seatbelt -p kbf-step-runner -p kbf-updater -p kbf-update -p update-hook
       # The binaries the Mac jobs build and run (`cargo xtask` included) and the darwin artifacts are.
       - name: Check for aarch64-apple-darwin the binaries the Mac jobs build
         if: ${{ !cancelled() }}
@@ -599,7 +603,10 @@ jobs:
   # The task runner's tests on a hosted Mac, without its test-only feature: they run the Command
   # under the macOS confine for real (a denied Command's connect is refused, a credential file is
   # unreadable, an allowed Command runs). Tests only: no binary of it is built for release here.
+  # After the merge (the pipeline's call) and in the merge queue only: a pull request runs the
+  # same tests in macos-pr.yml's `macos-test`, so it does not run them twice.
   task-macos:
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: macos-latest
     timeout-minutes: 45
     permissions:
