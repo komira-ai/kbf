@@ -117,8 +117,9 @@ impl<B: Backend> Ab<B> {
 
     /// [`Self::unpin`] that runs `after_retain` once `retain.json` is changed and before the
     /// hold file is removed: a test's way in to the moment between the two. An error from it
-    /// stops the unpin there, as a crash would.
-    #[cfg(test)]
+    /// stops the unpin there, as a crash would. Only the Linux tests (`linux_unpin_tests.rs`)
+    /// call it.
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn unpin_interrupted(&self, after_retain: &dyn Fn() -> io::Result<()>) -> Answer {
         self.unpin_with(after_retain)
     }

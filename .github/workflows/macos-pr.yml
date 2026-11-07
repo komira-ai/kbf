@@ -1,0 +1,234 @@
+# macOS on a pull request, for the pull requests that change the Mac and service-manager surface:
+# the paths tools/ci/macos-pr-paths.txt lists (the Mac daemon and executor platform, the launchd and
+# macOS adapters, Mac packaging, the step runner and self-update, and the workflows and xtask code
+# that build or check them). A pull request that changes none of them takes no macOS runner: its
+# macOS jobs are skipped by their `if:` before a runner is asked for, and `macos` passes.
+#
+# - `changes` (Linux) runs `cargo xtask pr-paths` on the merge commit against its first parent, the
+#   base branch: `macos=true` when some changed path matches.
+# - `macos-test` runs the tests of the macOS crates as an ordinary user: the steps of beta.yml's
+#   `native-macos` that need no root and no device, the task runner's tests (ci.yml's `task-macos`
+#   runs them after the merge), and the crates of the launchd adapters, the step runner and
+#   self-update, which no Mac job tested before.
+# - `macos-device` runs the rest of `native-macos`: the steps as root (the lease-user pool, the slot
+#   clean and its profile, the root helper, the guest agent under launchd, the `.pkg` through
+#   Installer, the provisioning) and the real simulator, gh and signing tests.
+# - `macos` (Linux) is the one check to require: it passes when `changes` passed and each macOS
+#   job either passed or was not needed, so a pull request that needs no Mac never waits for one.
+#
+# The repository lint `macos_pr` (crates/kbf-integration-test/tests/macos_pr) holds this file to
+# that shape and holds every step of `native-macos` to a step here. Neither macOS job holds a
+# secret, an environment or any write scope: their token can read the repository, nothing more.
+# beta.yml, which gates the release after the merge, is unchanged.
+#
+# The macOS jobs restore no Cargo cache: beta.yml's `native-macos` saves one, but from another
+# macOS image (`macos-latest`), and nothing here saves one, so a pull request never writes a cache.
+name: macos-pr
+
+on:
+  pull_request:
+
+permissions: {}
+
+# One run per pull request: a newer push cancels the run of the one before, so a burst of pushes
+# holds at most one set of macOS runners.
+concurrency:
+  group: macos-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      macos: ${{ steps.paths.outputs.macos }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # The merge commit and its first parent, the base branch the pull request merges into.
+          fetch-depth: 2
+      - run: rustup toolchain install
+      # beta.yml's `packages` job builds xtask and saves its cache on main; it is restored here,
+      # never saved.
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-packages-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-packages-
+      - name: Whether this pull request changes a path of the macOS surface
+        id: paths
+        run: cargo xtask pr-paths --base HEAD^1 --patterns tools/ci/macos-pr-paths.txt --key macos --output "$GITHUB_OUTPUT"
+
+  macos-test:
+    needs: changes
+    if: ${{ needs.changes.outputs.macos == 'true' }}
+    runs-on: macos-15
+    timeout-minutes: 75
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - run: sw_vers
+      - run: uname -m
+      - run: sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize
+      - run: cargo build -p kbf-node --bin kbf-daemon --locked
+      # kbf-testkit has no tests of its own now (it re-exports js-testkit, whose database tests
+      # run in the jobscheduler repository's CI).
+      - run: 'cargo test -p kbf-outputs -p kbf-driver-native -p kbf-node --locked'
+      # `kbf daemon --driver native` started with the words the Mac's launchd unit
+      # writes, against a fake front, and the helpers it re-runs itself as (each action's
+      # keeper, the lease-user pool's `as-user` step) through the `kbf` binary
+      # (crates/kbf-cli/tests/macos_daemon.rs).
+      - run: cargo test -p kbf-cli --test macos_daemon --locked
+      # The daemon's unit tests, which read its suspend-counting clock on macOS
+      # (CLOCK_MONOTONIC_RAW), the fence across a suspend (issue #78), and a keeper
+      # started after the binary was renamed over, which macOS finds by its path.
+      - run: cargo test -p kbf-daemon --lib --test suspend --test keeper --test cache_clone --test trees_clone --locked
+      # The root helper's unit tests (its tests as root are in `macos-device`).
+      - run: cargo test -p kbf-mac-session --locked
+      # The registration client's connect on a Mac, where it is std's after a check of the deadline:
+      # a full backlog is refused at once, a connect that succeeds leaves the rest only what is left,
+      # and a missing or stale socket is a connect error (crates/update-register/src/tests.rs).
+      - run: cargo test -p update-register --locked -- --exact tests::a_listener_whose_backlog_is_full_is_refused_at_once tests::the_deadline_left_after_the_connect_is_all_that_follows_gets tests::a_socket_left_by_a_listener_that_is_gone_is_refused tests::a_missing_socket_names_its_path tests::a_deadline_already_passed_does_not_connect
+      # The host installer's layout, offline attestation check and stage, compiled and run
+      # on the platform they name (crates/kbf-installer, docs/deploy/host-releases.md).
+      # Not the tests that need a Postgres server (a hosted Mac has none, and they fail, not
+      # skip, without one; the Linux jobs run them): those in a module named `database` (skipped
+      # by `::database::`), the `provisioned` module of database_tests.rs, and the three
+      # tests of that file and the one of setup/more_tests.rs that use `TestDatabase`.
+      - run: 'cargo test -p kbf-installer --locked -- --skip ::database:: --skip database::tests::provisioned:: --skip database::tests::setup_creates_the_schema_once --skip database::tests::the_update_step_migrates --skip database::tests::the_bounded_step_gives_up --skip setup_creates_the_schema_over_a_real_server'
+      # The same for the setup library (crates/kbf-setup), which holds the `database` module and
+      # setup/more_tests.rs.
+      - run: 'cargo test -p kbf-setup --features proxy --locked -- --skip database::tests::provisioned:: --skip database::tests::setup_creates_the_schema_once --skip database::tests::the_update_step_migrates --skip database::tests::the_bounded_step_gives_up --skip setup_creates_the_schema_over_a_real_server'
+      # The guest agent's unit tests (the agent under launchd is in `macos-device`).
+      - run: cargo test -p kbf-guest --locked
+      # The task runner's tests without its test-only feature: they run the Command under the
+      # macOS confine for real (ci.yml's `task-macos`, which runs them after the merge).
+      - run: cargo test -p kbf-task --locked --no-fail-fast
+      # The crates no Mac job tested before: the launchd adapters (the host helper's launchd side,
+      # the user and group lookups), the sandbox profile writer, the virtual machine tool and the
+      # provisioning tool as an ordinary user, the step runner and self-update (the updater
+      # agent's Mac pin, the update hooks). Their tests that need root or a real launchd domain
+      # are `#[ignore]`d here and run as root in host-install-mac.yml and in `macos-device`.
+      - run: cargo test --locked --no-fail-fast -p kbf-host -p kbf-host-install -p kbf-seatbelt -p kbf-vmm -p kbf-mac-provision -p kbf-step-runner -p kbf-updater -p kbf-update -p update-hook
+
+  macos-device:
+    needs: changes
+    if: ${{ needs.changes.outputs.macos == 'true' }}
+    runs-on: macos-15
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      # The darwin-arm64 build of the GitHub CLI a Mac pins (beta.yml's `native-macos`).
+      GH_VERSION: 2.102.0
+      GH_SHA256: da922c20d1792e5b2cbf375593d7a658acf034c12c84e007e71c76ef959c337e
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - run: sw_vers
+      - run: uname -m
+      - run: sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize
+      - run: cargo build -p kbf-node --bin kbf-daemon --locked
+      # A lease's own simulator, made, booted and deleted for real under the actions'
+      # sandbox; one a killed daemon left deleted at the next start; and xcodebuild
+      # finding a device of the default set but not one of another set
+      # (crates/kbf-driver-native/tests/lease/simulator.rs).
+      - run: cargo test -p kbf-driver-native --test lease --locked -- --ignored --nocapture simulator::real
+      - name: Fetch gh (pinned release, checked by SHA-256)
+        run: cargo xtask fetch --url "https://github.com/cli/cli/releases/download/v$GH_VERSION/gh_${GH_VERSION}_macOS_arm64.zip" --sha256 "$GH_SHA256" --out "$RUNNER_TEMP/tools/gh" --extract zip --member "gh_${GH_VERSION}_macOS_arm64/bin/gh"
+      - name: The pinned gh verifies a real attestation offline
+        run: cargo test -p kbf-installer --test real_gh --locked -- --ignored --test-threads=1
+        env:
+          KBF_TEST_GH: ${{ runner.temp }}/tools/gh
+      # The root helper for per-lease users run as root (passwordless sudo) with real users,
+      # launchd, libproc, the sweep, the leak scan and the caller check by code signature,
+      # signed as `cargo xtask sign-darwin` signs it (crates/kbf-mac-session/tests/as_root.rs).
+      - run: cargo xtask sudo-test -p kbf-mac-session --test as_root -- --test-threads=1 --nocapture
+      # The native driver's lease-user pool as root, with throwaway users from uid 690:
+      # actions as pool users through `launchctl asuser`, the kill by uid, the keeper's,
+      # parallel leases (crates/kbf-driver-native/tests/slots.rs); then the clean of a
+      # slot between two leases in one pass, its deadline, and a failed clean leaving the
+      # user dirty (tests/slot_clean.rs). One test at a time: they make users at free uids.
+      - run: cargo xtask sudo-test -p kbf-driver-native --test slots -- --test-threads=1 --nocapture
+      - run: cargo xtask sudo-test -p kbf-driver-native --test slot_clean -- --test-threads=1 --nocapture
+      # The profile canaries (tests/slot_canary.rs): as a pool user under the generated
+      # profile, a write outside the allowed paths and a hard link of a root-owned file are
+      # refused, and a profile without `(deny file-write*)` fails them.
+      - run: cargo xtask sudo-test -p kbf-driver-native --test slot_canary -- --test-threads=1 --nocapture
+      # What an action as a pool user reaches of another slot, measured and printed, not
+      # asserted, with and without the sandbox (crates/kbf-driver-native/tests/slot_reach.rs).
+      - run: cargo xtask sudo-test -p kbf-driver-native --test slot_reach -- --test-threads=1 --nocapture
+      # SIGTERM before SIGKILL when a pool lease or a slot clean ends the user's processes
+      # (crates/kbf-driver-native/tests/slot_term.rs).
+      - run: cargo xtask sudo-test -p kbf-driver-native --test slot_term -- --test-threads=1 --nocapture
+      # The GPU under the slot profile (crates/kbf-driver-native/tests/slot_gpu.rs), on this
+      # runner's paravirtual GPU.
+      - run: cargo xtask sudo-test -p kbf-driver-native --test slot_gpu -- --test-threads=1 --nocapture
+      # Two pool users and the real `kbf daemon --driver native --pool-users 2` as root behind a
+      # fake front, one action per question, each fact a `SPIKE` line in this log
+      # (crates/kbf-daemon-test/tests/mac_pool_spike). The daemon is the `kbf` binary built here.
+      - run: cargo build -p kbf-cli --bin kbf --locked
+      - run: cargo xtask sudo-test -p kbf-daemon-test --test mac_pool_spike -- --test-threads=1 --nocapture
+      # The per-binary entitlement allow list (tools/ci/darwin-entitlements.txt), signed and
+      # checked by `darwin-asset` (crates/kbf-vmm/tests/signing.rs).
+      - run: cargo test -p kbf-vmm --test signing --locked -- --ignored
+      # The guest agent under launchd: Aqua from a LaunchAgent in this runner's GUI session,
+      # System from a LaunchDaemon, and its refusal to run as root (crates/kbf-guest/tests/as_root.rs).
+      - run: cargo xtask sudo-test -p kbf-guest --test as_root
+      # The assertion that a pool user holds nothing a lease left
+      # (crates/kbf-driver-native/tests/slot_assert.rs). One test at a time.
+      - run: cargo xtask sudo-test -p kbf-driver-native --test slot_assert -- --test-threads=1 --nocapture
+        if: ${{ !cancelled() }}
+      # kbf-installer's `.pkg` through Installer and its Homebrew cask
+      # (crates/xtask/tests/pkg_macos.rs): the package as root, then the cask as this user.
+      - run: cargo xtask sudo-test -p xtask --test pkg_macos -- installer
+        if: ${{ !cancelled() }}
+        env:
+          # The oldest macOS the binaries support (the test signs with `--minos 14.0`).
+          MACOSX_DEPLOYMENT_TARGET: "14.0"
+      - run: cargo test -p xtask --test pkg_macos --locked -- --ignored homebrew
+        if: ${{ !cancelled() }}
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "14.0"
+      # kbf-mac-provision on this VM, as root (crates/kbf-mac-provision/tests/as_root.rs). Last,
+      # because it changes this runner's settings.
+      - run: cargo xtask sudo-test -p kbf-mac-provision --test as_root -- --test-threads=1 --nocapture
+        if: ${{ !cancelled() }}
+
+  # The check to require. It runs whenever the run was not cancelled, after the jobs it needs
+  # (a skipped macOS job included), and fails when `changes` did not pass, or when the macOS
+  # surface changed and a macOS job did not pass.
+  macos:
+    needs: [changes, macos-test, macos-device]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: What ran
+        env:
+          CHANGES: ${{ needs.changes.result }}
+          MACOS: ${{ needs.changes.outputs.macos }}
+          TEST: ${{ needs.macos-test.result }}
+          DEVICE: ${{ needs.macos-device.result }}
+        run: echo "changes $CHANGES, macos=$MACOS, macos-test $TEST, macos-device $DEVICE"
+      - name: Fail unless the path check passed and every macOS job it asked for passed
+        if: ${{ needs.changes.result != 'success' || (needs.changes.outputs.macos == 'true' && (needs.macos-test.result != 'success' || needs.macos-device.result != 'success')) }}
+        run: "false"

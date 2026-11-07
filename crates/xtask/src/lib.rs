@@ -33,6 +33,9 @@
 //!   row the working tree's budget file has and `<rev>`'s does not is refused, unless
 //!   git sees the row's path renamed from a path `<rev>` has a row for. CI runs
 //!   it on pull requests, with the base branch as `<rev>`.
+//! - `pr-paths --base <rev> --patterns <file> --key <name> [--output <file>]` ([`pr_paths`]):
+//!   `<key>=true` when a path changed since `<rev>` matches the pattern file. macos-pr.yml runs
+//!   its macOS jobs only then.
 //! - `sign-darwin <binary> --minos <version> [--summary <file>]` and `darwin-asset
 //!   <tarball> <name>` ([`darwin`]): the macOS binary signed ad hoc with the hardened
 //!   runtime and exactly the entitlements the allow list ([`entitlements`]) gives it,
@@ -173,6 +176,7 @@ pub mod pkg_size;
 pub mod pkg_trust;
 pub mod pkg_upgrade;
 pub mod pkg_version;
+pub mod pr_paths;
 pub mod profiles_complete;
 pub mod prove_farm;
 pub mod release;
@@ -249,6 +253,8 @@ enum Verb {
     ProveFarm(prove_farm::Args),
     /// Check that the runner's disk has the room the coverage run needs.
     RunnerDisk(runner_disk::Args),
+    /// Say whether a path changed since `--base` matches the pattern file.
+    PrPaths(pr_paths::Args),
     /// Refuse a binary that has a dynamic loader (`PT_INTERP`) or a needed shared library
     /// (`DT_NEEDED`).
     StaticElf(static_elf::Args),
@@ -1147,6 +1153,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
         Verb::DeployFarm(command) => deploy_farm::run_command(&command),
         Verb::ProveFarm(args) => prove_farm::run(&args),
         Verb::RunnerDisk(args) => runner_disk::run(&args),
+        Verb::PrPaths(args) => pr_paths::run(&args, &root),
         Verb::StaticElf(args) => static_elf::run(&args),
         Verb::PipelineWatch(args) => pipeline_watch::run(&args),
         Verb::PipelineRerun(args) => pipeline_rerun::run(&args),

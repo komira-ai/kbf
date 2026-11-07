@@ -1,0 +1,80 @@
+# The Mac and service-manager surface of the repository. A pull request that adds, changes,
+# deletes or renames a path listed here runs the macOS jobs of .github/workflows/macos-pr.yml
+# (`cargo xtask pr-paths`, crates/xtask/src/pr_paths.rs); a pull request that touches none of
+# them takes no macOS runner.
+#
+# One pattern a line: a file, written out exactly, or `<dir>/**` for a directory and everything
+# under it. `#` starts a comment line. The repository lint `macos_pr`
+# (crates/kbf-integration-test/tests/macos_pr) refuses this file when a pattern matches no
+# file git knows, when a crate a macOS job of macos-pr.yml or beta.yml tests whole lacks its
+# `crates/<crate>/**` line, when a test target such a job names alone is not matched, or when a
+# workflow with a macOS job, macos-pr.yml's own logic or this file is not listed.
+
+# The Mac daemon, the Mac executor platform (the native driver, its sandbox profiles and
+# per-lease users) and the task runner, whose macOS confine is `sandbox-exec`.
+crates/kbf-node/**
+crates/kbf-daemon/**
+crates/kbf-daemon-test/**
+crates/kbf-driver-native/**
+crates/kbf-outputs/**
+crates/kbf-mac-session/**
+crates/kbf-seatbelt/**
+crates/kbf-task/**
+crates/kbf-cli/src/node.rs
+crates/kbf-cli/tests/macos_daemon.rs
+
+# The macOS virtual machines, their guest agent, and the Mac provisioning tool.
+crates/kbf-guest/**
+crates/kbf-vmm/**
+crates/kbf-mac-provision/**
+
+# The launchd and macOS adapters: the host installer and setup (LaunchDaemon, layout, users),
+# and the host helper's launchd side.
+crates/kbf-host/**
+crates/kbf-host-install/**
+crates/kbf-installer/**
+crates/kbf-setup/**
+
+# The step runner and self-update: the updater agent (its Mac pin and launchd unit), the
+# update hooks and the registration client.
+crates/kbf-step-runner/**
+crates/kbf-updater/**
+crates/kbf-update/**
+crates/update-hook/**
+crates/update-register/**
+
+# Mac packaging: the installer's LaunchDaemon, the host agent's LaunchDaemons.
+packaging/macos/**
+packaging/host-agent/macos/**
+
+# The darwin parts of the release in xtask: signing and its entitlement list, the `.pkg` and
+# the Homebrew cask, the macOS asset check, the task bundle, and the root test runner the Mac
+# jobs use.
+crates/xtask/src/darwin.rs
+crates/xtask/src/darwin/**
+crates/xtask/src/entitlements.rs
+tools/ci/darwin-entitlements.txt
+crates/xtask/src/pkg.rs
+crates/xtask/src/pkg/**
+crates/xtask/src/pkg_macos_asset.rs
+crates/xtask/src/pkg_macos_asset/**
+crates/xtask/src/pkg_macos_install.rs
+crates/xtask/src/task_bundle.rs
+crates/xtask/src/task_bundle/**
+crates/xtask/src/sudo_test.rs
+crates/xtask/tests/pkg_macos.rs
+
+# The workflows that build or test on a Mac, and this check itself: its workflow, the verb that
+# reads this file, and this file.
+.github/workflows/macos-pr.yml
+.github/workflows/beta.yml
+.github/workflows/artifacts.yml
+.github/workflows/ci.yml
+.github/workflows/host-install-mac.yml
+.github/workflows/mac-provision.yml
+.github/workflows/vmm-probe.yml
+.github/workflows/spike-slot-reach.yml
+.github/workflows/spike-xcuitest.yml
+crates/xtask/src/pr_paths.rs
+crates/xtask/src/pr_paths/**
+tools/ci/macos-pr-paths.txt
