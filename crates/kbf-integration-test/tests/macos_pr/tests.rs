@@ -307,7 +307,7 @@ fn a_pull_request_macos_job_with_an_environment_oidc_or_a_write_scope_is_refused
 }
 
 #[test]
-fn the_workflow_runs_on_every_pull_request_and_only_on_pull_requests() {
+fn the_workflow_runs_on_every_pull_request_and_queue_entry_and_nothing_else() {
     // Catches: a push trigger (the after-merge Mac jobs are beta.yml's), and a filter on the
     // trigger, which leaves the `macos` check unreported on a pull request it filters out.
     let found = changed_to(
