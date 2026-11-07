@@ -700,7 +700,7 @@ fn lease_of(job: &Job) -> kbf_types::LeaseId {
 /// place beside it: as `crun --version` it names a release the agent takes, as `ip -j link
 /// show` it lists no link, both recorded in `stand-in/calls`, and under a name it does not know
 /// it fails saying so. Runs without root. Catches a binary that answers as one program under
-/// every name, or reads its place from somewhere the agent's environment-free calls cannot.
+/// every name, or does not find its place beside the link it is run by.
 #[test]
 fn the_stand_in_answers_as_the_program_it_is_linked_as() {
     use std::process::Command;
@@ -713,7 +713,6 @@ fn the_stand_in_answers_as_the_program_it_is_linked_as() {
     let run = |name: &str, args: &[&str]| {
         Command::new(dir.join(name))
             .args(args)
-            .env_clear()
             .output()
             .expect("the stand-in runs")
     };

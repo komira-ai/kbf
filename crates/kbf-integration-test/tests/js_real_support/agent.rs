@@ -432,6 +432,8 @@ impl RealAgent {
         std::thread::spawn(move || {
             let mut registered = Some(registered);
             for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                // Also as it comes, so a run that stops making progress still shows the agent.
+                eprintln!("{line}");
                 kept.lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .push_str(&format!("{line}\n"));
