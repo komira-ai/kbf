@@ -19,8 +19,12 @@
 //!    executor of the job service is the one running.
 //! 6. The canary ([`crate::canary`]): one job through the job service, checked to succeed.
 //!
-//! `back-out --apply` checks the backup with `kbf --check`, renames it over the file, and
-//! restarts the same way (steps 4). Neither verb has a `--force`, and no flag skips a step.
+//! A frontend whose operator API refuses the connection before the drain is not running: it is
+//! not drained, and the restart starts it.
+//!
+//! `back-out --apply` checks the backup with `kbf --check`, puts it back over the file,
+//! restarts the same way (step 4), and only then removes the backup, so a back-out that
+//! stopped can be run again. Neither verb has a `--force`, and no flag skips a step.
 //!
 //! The waits ask once per `--poll-secs`; the pause between asks is injected ([`Host`]), so
 //! a test reads no clock and never sleeps. A deadline is a number of asks.
@@ -200,8 +204,11 @@ enum Step {
     PutInPlace,
     /// Rename the backup over the file.
     Restore { file: PathBuf, backup: PathBuf },
-    /// `kbf cluster drain --frontend`.
-    Drain(Cmd),
+    /// `kbf cluster drain --frontend`, unless `url` (the operator API) refuses the
+    /// connection: a frontend that is not running has nothing to drain.
+    Drain { cmd: Cmd, url: HttpUrl },
+    /// Remove the backup, once the back-out's restart is done.
+    Forget(PathBuf),
     /// Wait until the operator API refuses the connection.
     AwaitExit { url: HttpUrl, asks: Option<u64> },
     /// The forced command `restart frontend=<instance>`, over ssh.
@@ -231,10 +238,12 @@ impl std::fmt::Display for Step {
                 cutover_edit::beside(file, cutover_edit::STAGED_SUFFIX).display(),
                 cutover_edit::beside(file, cutover_edit::BACKUP_SUFFIX).display()
             ),
-            Step::CheckConfig(cmd) | Step::Drain(cmd) => write!(f, "{cmd}"),
+            Step::CheckConfig(cmd) => write!(f, "{cmd}"),
+            Step::Drain { cmd, url } => write!(f, "{cmd} (unless {url} refuses the connection)"),
+            Step::Forget(backup) => write!(f, "remove {}", backup.display()),
             Step::PutInPlace => f.write_str("rename the staged file over the config"),
             Step::Restore { file, backup } => {
-                write!(f, "rename {} over {}", backup.display(), file.display())
+                write!(f, "put {} back over {}", backup.display(), file.display())
             }
             Step::AwaitExit { url, asks: None } => {
                 write!(
@@ -337,7 +346,10 @@ fn restart_steps(r: &Restart) -> Result<Vec<Step>, CutoverError> {
         .env("HOME", "/")
         .env("LANG", "C");
     Ok(vec![
-        Step::Drain(drain),
+        Step::Drain {
+            cmd: drain,
+            url: url("/healthz")?,
+        },
         Step::AwaitExit {
             url: url("/healthz")?,
             asks: r.drain_deadline_secs.map(|s| asks(s, r.poll_secs)),
@@ -477,7 +489,14 @@ impl Carry<'_> {
                 None => Err(CutoverError::Failed("nothing is staged".to_owned())),
             },
             Step::Restore { file, backup } => cutover_edit::restore(file, backup),
-            Step::Drain(cmd) => ran(self.host, cmd, "the drain").map(drop),
+            Step::Drain { cmd, url } => {
+                if exited(&self.host.status(url)) {
+                    let _ = writeln!(out, "the frontend is not running: nothing to drain");
+                    return Ok(());
+                }
+                ran(self.host, cmd, "the drain").map(drop)
+            }
+            Step::Forget(backup) => cutover_edit::forget(backup),
             Step::AwaitExit { url, asks } => {
                 if self.wait(url, *asks, exited) {
                     Ok(())
@@ -710,6 +729,7 @@ pub(crate) async fn back_out(
         },
     ];
     steps.extend(restart);
+    steps.push(Step::Forget(backup.clone()));
     let mode = if a.apply { "apply" } else { "dry run" };
     let _ = writeln!(out, "kbf-deploy job-service back-out ({mode})");
     let _ = writeln!(
@@ -723,7 +743,16 @@ pub(crate) async fn back_out(
     for flag in then.back_out_flags() {
         let _ = writeln!(out, "  {flag}");
     }
-    carry(&steps, a.apply, host, a.restart.poll_secs, None, out).await?;
+    let (before, after) = steps.split_at(1);
+    carry(before, a.apply, host, a.restart.poll_secs, None, out).await?;
+    if let Err(e) = carry(after, a.apply, host, a.restart.poll_secs, None, out).await {
+        let _ = writeln!(
+            out,
+            "the back-out stopped; {} is kept: run back-out again once the cause is fixed",
+            backup.display()
+        );
+        return Err(e);
+    }
     if a.apply {
         let _ = writeln!(
             out,
@@ -768,3 +797,7 @@ pub(crate) fn run_on(
 #[cfg(test)]
 #[path = "cutover_apply_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "cutover_apply_unit_tests.rs"]
+mod unit_tests;

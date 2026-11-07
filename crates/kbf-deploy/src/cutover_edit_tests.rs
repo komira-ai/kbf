@@ -96,7 +96,8 @@ fn a_file_the_line_edit_cannot_rewrite_is_refused() {
 
 /// Behaviour: staging keeps the original byte for byte with the file's mode, and the
 /// staged text with it too; placing renames the staged file over the file and keeps the
-/// backup; restoring puts the original back and the backup is gone.
+/// backup; restoring puts the original back, with its mode, and keeps the backup until it is
+/// forgotten.
 #[test]
 fn stage_place_and_restore_keep_the_original_byte_for_byte() {
     let dir = scratch("stage");
@@ -120,7 +121,13 @@ fn stage_place_and_restore_keep_the_original_byte_for_byte() {
     );
     restore(&file, &found).unwrap();
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "old\n");
+    assert_eq!(std::fs::metadata(&file).unwrap().mode() & 0o7777, 0o640);
+    assert!(!beside(&file, STAGED_SUFFIX).exists());
+    // The backup stays until the back-out is done, so a stopped back-out can run again.
+    assert!(backup.exists());
+    forget(&backup).unwrap();
     assert!(!backup.exists());
+    assert_eq!(forget(&backup).unwrap_err().code(), 1);
     let e = read_backup(&file).unwrap_err();
     assert!(
         e.to_string().contains("there is no switch to back out"),
@@ -206,4 +213,25 @@ fn a_staging_that_cannot_write_fails_and_leaves_nothing() {
     assert_eq!(e.code(), 1);
     assert!(e.to_string().starts_with("cannot write "), "{e}");
     assert!(!beside(&file, BACKUP_SUFFIX).exists());
+}
+
+/// Behaviour: a restore whose staged file cannot be made, or cannot be renamed over the
+/// file, fails, leaves the backup, and leaves no staged file of its own.
+#[test]
+fn a_restore_that_cannot_stage_or_rename_keeps_the_backup() {
+    let dir = scratch("restore-fail");
+    let file = write(dir.path(), "kbf.toml", "new\n");
+    let backup = write(dir.path(), "kbf.toml.pre-job-service", "old\n");
+    let stale = write(dir.path(), "kbf.toml.job-service-new", "theirs\n");
+    let e = restore(&file, &backup).unwrap_err();
+    assert!(e.to_string().starts_with("cannot read or write "), "{e}");
+    assert_eq!(std::fs::read_to_string(&stale).unwrap(), "theirs\n");
+    std::fs::remove_file(&stale).unwrap();
+    let as_dir = dir.path().join("dir.toml");
+    std::fs::create_dir(&as_dir).unwrap();
+    std::fs::write(as_dir.join("x"), "").unwrap();
+    let e = restore(&as_dir, &backup).unwrap_err();
+    assert!(e.to_string().starts_with("cannot rename "), "{e}");
+    assert!(!beside(&as_dir, STAGED_SUFFIX).exists());
+    assert_eq!(std::fs::read_to_string(&backup).unwrap(), "old\n");
 }

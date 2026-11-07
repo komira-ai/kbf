@@ -334,9 +334,10 @@ and stops at the first that fails:
    `kbf-host-install` over ssh, with the updater's key and the updater's own argument vector
    (`ssh -F /dev/null -i KEY -o BatchMode=yes ... -T -- USER@ADDRESS 'restart frontend=NAME'`;
    [host-install.md](host-install.md#what-a-restart-does)). The answer must be `restarted`; a
-   `refused` (`busy` while an install runs) or `failed` answer is quoted. A frontend that is
-   not running refuses the drain itself and fails here: start it, or restart it by hand
-   after checking the file. Then a wait until `GET /readyz` answers 200.
+   `refused` (`busy` while an install runs) or `failed` answer is quoted. A frontend whose
+   operator API refuses the connection before the drain is not running: it is not drained
+   (`the frontend is not running: nothing to drain`), and the restart starts it. Then a wait
+   until `GET /readyz` answers 200.
 5. **The first worker**: a wait until `GET /v1/nodes/js:<frontend id>-0` answers 200, which
    it does once the executor of the job service runs and has registered its virtual workers.
 6. **The canary** (below).
@@ -352,7 +353,7 @@ pass: the job service answered ListJobs (no job of this client yet)
 + stage /etc/kbf/kbf.toml.job-service-new and keep the original as /etc/kbf/kbf.toml.pre-job-service
 + /usr/bin/kbf --mode=frontend --config /etc/kbf/kbf.toml.job-service-new --check
 + rename the staged file over the config
-+ /usr/bin/kbf cluster --api 127.0.0.1:8982 drain --frontend --token-file /etc/kbf/api-token
++ /usr/bin/kbf cluster --api 127.0.0.1:8982 drain --frontend --token-file /etc/kbf/api-token (unless http://127.0.0.1:8982/healthz refuses the connection)
 + wait until http://127.0.0.1:8982/healthz refuses the connection (the frontend has exited), however long
 + /usr/bin/ssh -F /dev/null -i /var/lib/kbf-updater/id_ed25519 ... -T -- kbf-updater@192.0.2.20 "restart frontend=-" (env PATH, HOME, LANG)
 + wait for http://127.0.0.1:8982/readyz to answer 200 (the frontend is ready), at most 60 asks
@@ -365,9 +366,9 @@ back-out: kbf-deploy job-service back-out --config /etc/kbf/kbf.toml with the sa
   ...
 ```
 
-The dry run prints the same plan and each step as `DRY-RUN: <step>`, and ends with `dry run:
-nothing changed. Re-run with --apply.` It contacts nothing: not the job service, not the
-operator API, not ssh.
+The dry run prints the same plan and each step as `DRY-RUN: <step>`, then `dry run: nothing
+changed. Re-run with --apply.` and the back-out. It contacts nothing: not the job service, not
+the operator API, not ssh.
 
 Exit 0 done. Exit 1 a step failed (`FAIL: <step's message>` on stderr; after step 3, stdout
 also says the switch is in place and prints the back-out). Exit 2 refused before any step:
@@ -413,11 +414,14 @@ kbf-deploy job-service back-out --config FILE <the restart flags> [--apply]
 ```
 
 `back-out` puts back the file `apply` kept and restarts the frontend the same way. With
-`--apply`: `kbf --check` on `kbf.toml.pre-job-service`, the rename of it over `kbf.toml` (the
-file is the original again, byte for byte, with its mode and owner, and the backup is gone),
-then the drain, the wait for the exit, `restart frontend=<instance>` through `kbf-host-install`
-and the wait for `/readyz`. Without `--apply` it prints the flags it returns to and its steps,
-and changes nothing.
+`--apply`: `kbf --check` on `kbf.toml.pre-job-service`; the backup put back over `kbf.toml`
+(its bytes, mode and owner are staged beside the file and renamed over it, so the file is the
+original again, byte for byte); the drain (skipped for a frontend that is not running), the wait
+for the exit, `restart frontend=<instance>` through `kbf-host-install` and the wait for
+`/readyz`; and only then the removal of the backup. A back-out that stops on the way says
+`the back-out stopped; ... is kept: run back-out again once the cause is fixed`, and run again
+it starts over from the check. Without `--apply` it prints the flags it returns to and its
+steps, and changes nothing.
 
 ```text
 kbf-deploy job-service back-out (dry run)
@@ -428,9 +432,10 @@ the flags it returns to:
   no --executor-job-url
   ...
 DRY-RUN: /usr/bin/kbf --mode=frontend --config /etc/kbf/kbf.toml.pre-job-service --check
-DRY-RUN: rename /etc/kbf/kbf.toml.pre-job-service over /etc/kbf/kbf.toml
-DRY-RUN: /usr/bin/kbf cluster --api 127.0.0.1:8982 drain --frontend --token-file /etc/kbf/api-token
+DRY-RUN: put /etc/kbf/kbf.toml.pre-job-service back over /etc/kbf/kbf.toml
+DRY-RUN: /usr/bin/kbf cluster --api 127.0.0.1:8982 drain --frontend --token-file /etc/kbf/api-token (unless http://127.0.0.1:8982/healthz refuses the connection)
 ...
+DRY-RUN: remove /etc/kbf/kbf.toml.pre-job-service
 dry run: nothing changed. Re-run with --apply.
 ```
 

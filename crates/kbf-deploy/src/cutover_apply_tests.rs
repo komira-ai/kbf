@@ -9,7 +9,7 @@ use std::io::Write as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::Path;
 
-use kbf_host::testkit::{FakeExec, reply};
+use kbf_host::testkit::reply;
 use kbf_job_client::fake::{Call, FakeJobServer, Fault, Machine, TOKEN};
 
 use super::*;
@@ -144,7 +144,7 @@ fn token_file(dir: &Path, text: &str) -> std::path::PathBuf {
     path
 }
 
-fn restart() -> Restart {
+pub(super) fn restart() -> Restart {
     let p = |s: &str| HostPath::new(s).unwrap();
     Restart {
         instance: "-".to_owned(),
@@ -251,7 +251,7 @@ async fn a_dry_run_runs_asks_and_writes_nothing() {
             ),
             format!("DRY-RUN: /usr/bin/kbf --mode=frontend --config {}.job-service-new --check", file.display()),
             "DRY-RUN: rename the staged file over the config".to_owned(),
-            "DRY-RUN: /usr/bin/kbf cluster --api 127.0.0.1:8982 drain --frontend --token-file /etc/kbf/api-token".to_owned(),
+            "DRY-RUN: /usr/bin/kbf cluster --api 127.0.0.1:8982 drain --frontend --token-file /etc/kbf/api-token (unless http://127.0.0.1:8982/healthz refuses the connection)".to_owned(),
             "DRY-RUN: wait until http://127.0.0.1:8982/healthz refuses the connection (the frontend has exited), however long".to_owned(),
             format!("DRY-RUN: /usr/bin/ssh {} (env PATH, HOME, LANG)", ssh_args().join(" ").replace("restart frontend=-", "\"restart frontend=-\"")),
             "DRY-RUN: wait for http://127.0.0.1:8982/readyz to answer 200 (the frontend is ready), at most 4 asks".to_owned(),
@@ -339,8 +339,9 @@ async fn an_apply_switches_restarts_and_passes_the_canary() {
             "/v1/nodes/js:fe-a-0"
         ]
     );
-    // One pause in each of the three waits, and one before the canary's second ask.
-    assert_eq!(host.pauses, [5, 5, 5, 5]);
+    // The drain's ask sees the frontend up, and the exit wait sees it gone at once; one pause
+    // in the readiness and the worker waits, and one before the canary's second ask.
+    assert_eq!(host.pauses, [5, 5, 5]);
     let spec = server.submitted(CANARY).unwrap();
     assert_eq!(spec.image, KBF_IMAGE);
     assert!(!spec.labels.contains_key("kbf-frontend"));
@@ -626,6 +627,7 @@ async fn a_back_out_restores_the_original_and_restarts() {
     let (done, out) = backed_out(&back_args(&config, true), &mut host).await;
     done.unwrap();
     assert_eq!(std::fs::read_to_string(&file).unwrap(), text);
+    assert!(!dir.path().join("kbf.toml.pre-job-service").exists());
     assert_eq!(host.runs.len(), 3);
     assert_eq!(host.runs[2].args, ssh_args());
     assert!(
@@ -766,14 +768,6 @@ fn only_a_refused_connection_is_an_exit() {
     assert_eq!(host.pauses, [1, 1]);
 }
 
-/// Behaviour: a deadline is a number of asks, at least one.
-#[test]
-fn a_deadline_is_a_number_of_asks() {
-    assert_eq!(asks(300, 5), 60);
-    assert_eq!(asks(301, 5), 61);
-    assert_eq!(asks(1, 5), 1);
-}
-
 /// Behaviour: a step that has nothing staged to put in place, and a canary with no client,
 /// fail rather than pass.
 #[tokio::test]
@@ -826,120 +820,6 @@ fn no_runtime_fails_the_verb() {
     );
 }
 
-/// Behaviour: the real host runs tools and asks URLs through the host's `Exec`.
-#[test]
-fn the_real_host_goes_through_exec() {
-    let mut exec = FakeExec::new(501);
-    exec.http = Err(io::ErrorKind::ConnectionRefused);
-    exec.answer = Box::new(|_| Ok(reply(7, "", "")));
-    let mut host = OnHost { exec: &exec };
-    let cmd = Cmd::new(HostPath::new("/bin/x").unwrap());
-    assert_eq!(host.run(&cmd).unwrap().status.code(), Some(7));
-    let url = api_url("127.0.0.1:1".parse().unwrap(), "/").unwrap();
-    assert_eq!(
-        host.status(&url).unwrap_err().kind(),
-        io::ErrorKind::ConnectionRefused
-    );
-}
-
-/// Behaviour: the restart's names are checked as `kbf-host-install` and the updater check
-/// them, and an address ssh would read as an option is refused.
-#[test]
-fn the_restart_names_are_checked_as_the_host_checks_them() {
-    for ok in ["-", "a", "fe-a1", &"a".repeat(32)] {
-        assert!(instance_ok(ok), "{ok}");
-    }
-    for bad in ["", "Bad", "1a", "a_b", "a.b", &"a".repeat(33)] {
-        assert!(!instance_ok(bad), "{bad}");
-    }
-    for ok in ["kbf-updater", "_u", "u9_x-y", &"u".repeat(32)] {
-        assert!(user_ok(ok), "{ok}");
-    }
-    for bad in ["", "9x", "-u", "U", "u.x", &"u".repeat(33)] {
-        assert!(!user_ok(bad), "{bad}");
-    }
-    for ok in ["fe.farm.example", "192.0.2.10", "[2001:db8::1]"] {
-        assert!(address_ok(ok), "{ok}");
-    }
-    for bad in ["", "-oX", "a b", "a;b"] {
-        assert!(!address_ok(bad), "{bad}");
-    }
-}
-
-/// Behaviour: an operator API on port 0 cannot be asked, and is refused.
-#[test]
-fn an_api_on_port_0_is_refused() {
-    let e = restart_steps(&Restart {
-        api: "127.0.0.1:0".parse().unwrap(),
-        ..restart()
-    })
-    .unwrap_err();
-    assert!(e.to_string().starts_with("--api: "), "{e}");
-}
-
-/// Behaviour: a config path that is not UTF-8 cannot be given to `kbf --check`, and is
-/// refused naming the flag.
-#[test]
-fn a_config_path_that_is_not_utf8_is_refused() {
-    use std::os::unix::ffi::OsStrExt as _;
-    let path = Path::new(std::ffi::OsStr::from_bytes(b"/etc/\xff.toml"));
-    let e = check_config(&restart(), path).unwrap_err();
-    assert_eq!(e.to_string(), "--config: /etc/\u{fffd}.toml is not UTF-8");
-}
-
-/// Behaviour: the canary is the file's kbf image without `docker://`, on its `executor-arch`
-/// (`x86_64` when the file names none), named by the instant.
-#[test]
-fn the_canary_is_made_from_the_file() {
-    let table = |extra: &str| {
-        Executor::parse(
-            Path::new("k"),
-            &format!("[executor]\nexecutor-frontend-id = \"fe-b\"\n{extra}"),
-        )
-        .unwrap()
-    };
-    let c = canary_of(
-        &table("executor-arch = \"arm64\"\nexecutor-kbf-image = \"docker://r/k@sha256:aa\"\n"),
-        7,
-    );
-    assert_eq!(
-        c,
-        Canary {
-            id: "kbf-canary-7".into(),
-            image: "r/k@sha256:aa".into(),
-            arch: "arm64".into(),
-            frontend: "fe-b".into()
-        }
-    );
-    let c = canary_of(&table("executor-kbf-image = \"r/k@sha256:aa\"\n"), 8);
-    assert_eq!(
-        (c.image.as_str(), c.arch.as_str()),
-        ("r/k@sha256:aa", "x86_64")
-    );
-}
-
-/// Behaviour: kbf-host-install's answer must be both exit 0 and `restarted`: a refusal on exit
-/// 0 is still a refusal.
-#[test]
-fn a_restart_answer_must_say_restarted() {
-    let e = restarted(&reply(
-        0,
-        "{\"result\":\"refused\",\"reason\":\"busy\"}\n",
-        "",
-    ))
-    .unwrap_err();
-    assert_eq!(
-        e.to_string(),
-        "the restart through kbf-host-install: exit 0: refused: busy"
-    );
-    restarted(&reply(
-        0,
-        "{\"result\":\"restarted\",\"unit\":\"kbf-frontend.service\"}",
-        "",
-    ))
-    .unwrap();
-}
-
 /// Behaviour: the verb's exit code is 0 for a back-out dry run on its own runtime.
 #[test]
 fn a_dry_run_on_the_verbs_runtime_exits_0() {
@@ -963,9 +843,52 @@ fn a_dry_run_on_the_verbs_runtime_exits_0() {
     assert!(err.is_empty());
 }
 
-/// Behaviour: the real host's pause returns (a pause of no seconds; nothing is timed).
-#[test]
-fn the_real_host_pauses() {
-    let exec = FakeExec::new(501);
-    OnHost { exec: &exec }.pause(0);
+/// Behaviour: a back-out whose restart fails keeps the backup and says so, and run again it
+/// finishes; a frontend that is not running (its operator API refuses the connection) is not
+/// drained, and the restart starts it.
+#[tokio::test]
+async fn a_stopped_back_out_can_run_again_and_a_down_frontend_is_not_drained() {
+    let dir = scratch("back-out-again");
+    let text = ready_config();
+    let config = write(
+        dir.path(),
+        "kbf.toml",
+        "[executor]\nexecutor = \"js-agent\"\n",
+    );
+    let backup = write(dir.path(), "kbf.toml.pre-job-service", &text);
+    let mut host = Script::healthy();
+    host.answer = Box::new(|cmd| {
+        Ok(if cmd.program.as_str() == "/usr/bin/ssh" {
+            reply(2, "{\"result\":\"refused\",\"reason\":\"busy\"}", "")
+        } else {
+            reply(0, "", "")
+        })
+    });
+    let (done, out) = backed_out(&back_args(&config, true), &mut host).await;
+    assert_eq!(
+        done.unwrap_err().to_string(),
+        "the restart through kbf-host-install: exit 2: refused: busy"
+    );
+    let kept = std::fs::canonicalize(&backup).unwrap();
+    assert!(
+        out.ends_with(&format!(
+            "the back-out stopped; {} is kept: run back-out again once the cause is fixed\n",
+            kept.display()
+        )),
+        "{out}"
+    );
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), text);
+    assert!(backup.exists());
+
+    let mut host = Script::healthy().answers("/healthz", vec![refused()]);
+    let (done, out) = backed_out(&back_args(&config, true), &mut host).await;
+    done.unwrap();
+    assert!(
+        out.contains("\nthe frontend is not running: nothing to drain\n"),
+        "{out}"
+    );
+    let programs: Vec<String> = host.runs.iter().map(|c| c.program.to_string()).collect();
+    assert_eq!(programs, ["/usr/bin/kbf", "/usr/bin/ssh"]);
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), text);
+    assert!(!backup.exists());
 }

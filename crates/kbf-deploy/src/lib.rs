@@ -34,7 +34,8 @@
 //! - [`host_status`]: one host's row from the coordinator's `GET /v1/status` (`host-status`;
 //!   read-only), for an operator rolling agents node by node.
 //! - [`job_service`]: whether the job service answers kbf's client token, one `ListJobs` call
-//!   (`job-service check`; read-only), before a frontend's executor is pointed at it.
+//!   (`job-service check`; read-only), before a frontend's executor is pointed at it, and the
+//!   dispatch of the `job-service` verbs.
 //! - [`agent_egress`]: the egress lines of a farm agent's flags file, from the frontend's
 //!   `kbf.toml` (`job-service agent-egress`; read-only).
 //! - [`cutover`]: what switching a frontend's executor onto the job service sets in its

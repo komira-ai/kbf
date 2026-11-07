@@ -12,7 +12,8 @@
 //! file's mode and owner, and the new text is staged as `<file>.job-service-new`, also with
 //! them, so that `kbf --check` can read it before it is put in place by a rename. Both are
 //! made with `create_new`: a backup that is there already (from a switch that was not backed
-//! out) is refused and left alone. `back-out` renames the backup over the file.
+//! out) is refused and left alone. `back-out` stages the backup's bytes, mode and owner and
+//! renames them over the file, and removes the backup only once its restart is done.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
@@ -160,15 +161,26 @@ fn create(path: &Path, bytes: &[u8], mode: u32, uid: u32, gid: u32) -> std::io::
     filled
 }
 
-/// Rename `from` over `to` and sync their directory, so that the rename survives a power cut.
-fn rename_synced(from: &Path, to: &Path) -> Result<(), CutoverError> {
-    fs::rename(from, to)
-        .and_then(|()| File::open(to.parent().unwrap_or(Path::new("/")))?.sync_all())
+/// Rename `from` over `to`.
+fn rename(from: &Path, to: &Path) -> Result<(), CutoverError> {
+    fs::rename(from, to).map_err(|e| {
+        CutoverError::Failed(format!(
+            "cannot rename {} over {}: {e}",
+            from.display(),
+            to.display()
+        ))
+    })
+}
+
+/// Sync the directory of `file` after a rename in it, so that the rename survives a power
+/// cut. The rename is made either way: the message says so.
+fn sync_dir(file: &Path) -> Result<(), CutoverError> {
+    File::open(file.parent().unwrap_or(Path::new("/")))
+        .and_then(|dir| dir.sync_all())
         .map_err(|e| {
             CutoverError::Failed(format!(
-                "cannot rename {} over {}: {e}",
-                from.display(),
-                to.display()
+                "{} was renamed into place, but its directory could not be synced: {e}",
+                file.display()
             ))
         })
 }
@@ -231,13 +243,12 @@ impl Staged {
         Ok(staged)
     }
 
-    /// Rename the staged file over the file. The backup stays: it is the back-out.
+    /// Rename the staged file over the file. The backup stays: it is the back-out, and once
+    /// the rename is made it is kept whatever follows.
     pub(crate) fn put_in_place(mut self) -> Result<(), CutoverError> {
-        let done = rename_synced(&self.staged, &self.file);
-        if done.is_ok() {
-            self.made.clear();
-        }
-        done
+        rename(&self.staged, &self.file)?;
+        self.made.clear();
+        sync_dir(&self.file)
     }
 }
 
@@ -266,10 +277,32 @@ pub(crate) fn read_backup(file: &Path) -> Result<(PathBuf, String), CutoverError
     Ok((backup, text))
 }
 
-/// Rename the backup of `file` over it: the file is the original again, byte for byte,
-/// with its mode and owner, and the backup is gone.
+/// Put the backup of `file` back over it: its bytes, mode and owner are staged beside the
+/// file and renamed over it. The backup stays until [`forget`] removes it, so a back-out
+/// whose restart fails can be run again.
 pub(crate) fn restore(file: &Path, backup: &Path) -> Result<(), CutoverError> {
-    rename_synced(backup, file)
+    let failed = |what: &Path, e: std::io::Error| {
+        CutoverError::Failed(format!("cannot read or write {}: {e}", what.display()))
+    };
+    let staged = beside(file, STAGED_SUFFIX);
+    let bytes = fs::read(backup).map_err(|e| failed(backup, e))?;
+    let meta = fs::metadata(backup).map_err(|e| failed(backup, e))?;
+    create(&staged, &bytes, meta.mode(), meta.uid(), meta.gid()).map_err(|e| failed(&staged, e))?;
+    if let Err(e) = rename(&staged, file) {
+        let _ = fs::remove_file(&staged);
+        return Err(e);
+    }
+    sync_dir(file)
+}
+
+/// Remove the backup once the back-out is done.
+pub(crate) fn forget(backup: &Path) -> Result<(), CutoverError> {
+    fs::remove_file(backup).map_err(|e| {
+        CutoverError::Failed(format!(
+            "the back-out is done, but {} could not be removed: {e}",
+            backup.display()
+        ))
+    })
 }
 
 #[cfg(test)]
