@@ -15,6 +15,13 @@ use crate::worker::PROTOCOL_VERSION;
 
 const GIB: u64 = 1 << 30;
 
+/// The drivers a virtual worker's `Hello` lists, in the spelling the scheduler reads a lease
+/// kind's drivers by (`LeaseKind::drivers`): `container` serves an `action` lease, which
+/// becomes a job that needs a share of a host, and `native-whole-machine` serves a
+/// `whole_machine` lease, which becomes a job that needs the whole host. No VM driver: no VM
+/// lease is placed on it.
+pub(super) const DRIVERS: [&str; 2] = ["container", "native-whole-machine"];
+
 /// The longest a presigned url may be asked to stay good. The store refuses more, and the
 /// executor does not ask: [`Config::presign_ceiling`] stays under it, and the longest job's
 /// wall limit under that.
@@ -392,7 +399,8 @@ impl Config {
     }
 
     /// The `Hello` of a virtual worker: what a real node of the shape would report, and no
-    /// more. The only driver is `container`, so no whole-machine or VM lease is placed on it.
+    /// more. Its drivers are [`DRIVERS`]: `action` and `whole_machine` leases are placed on it,
+    /// a VM lease is not.
     pub(super) fn hello(&self, node: &str, instance: &str, predecessor: &str) -> Hello {
         let entry = |key: &str, value: String| Capability {
             key: key.to_owned(),
@@ -406,7 +414,8 @@ impl Config {
                 entry("action_slots", self.slots.to_string()),
                 entry("arch", self.arch.clone()),
                 entry("cpus", (self.cpu_millis / 1_000).to_string()),
-                entry("drivers", "container".to_owned()),
+                entry("drivers", DRIVERS[0].to_owned()),
+                entry("drivers", DRIVERS[1].to_owned()),
                 entry("mem_gib", self.booked_memory_gib().to_string()),
                 entry("os", "linux".to_owned()),
             ],

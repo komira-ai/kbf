@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use js_proto::v1::{JobFile, JobResult, JobState, JobTimes, NetworkLevel, ResultReason};
+use js_proto::v1::{JobFile, JobResult, JobState, JobTimes, Needs, NetworkLevel, ResultReason};
 use kbf_job_client::fake::Call;
 use kbf_proto::reapi::Digest;
 use kbf_types::LeaseId;
@@ -166,7 +166,7 @@ fn action() -> Digest {
     }
 }
 
-const BOOKING: Booking = Booking {
+const BOOKING: Booking = Booking::Share {
     millicpus: 1_500,
     memory_bytes: GIB,
 };
@@ -314,12 +314,76 @@ async fn prepare_builds_the_job_the_service_is_asked_for() {
     assert_eq!(arg(&spec.args, "--lease"), Some("7-8"));
     assert!(built.key.as_str().contains(&build_id(LeaseId::new(7, 8))));
 
-    let none = Booking {
+    let none = Booking::Share {
         millicpus: 0,
         memory_bytes: GIB,
     };
     let idle = prepared(&harness, None, none).await.expect("prepared");
     assert_eq!(idle.spec.needs.as_ref().map(|n| n.cpu_millis), Some(1));
+}
+
+/// Catches a `Start` read as the wrong booking: only the kind `whole_machine`, spelt as the
+/// protocol spells it, is the whole host, whatever CPU and memory it carries; every other kind
+/// (`action`, none, another spelling, a kind no driver here serves) is the share it booked.
+#[test]
+fn a_start_books_the_whole_host_only_for_a_whole_machine_lease() {
+    let start = |kind: &str| kbf_proto::worker::Start {
+        kind: kind.to_owned(),
+        millicpus: 3_000,
+        memory_bytes: 5 * GIB,
+        ..Default::default()
+    };
+    let share = Booking::Share {
+        millicpus: 3_000,
+        memory_bytes: 5 * GIB,
+    };
+    for (kind, booking) in [
+        ("whole_machine", Booking::WholeHost),
+        ("action", share),
+        ("", share),
+        ("Whole_Machine", share),
+        ("whole-machine", share),
+        ("vm", share),
+    ] {
+        assert_eq!(Booking::of(&start(kind)), booking, "{kind:?}");
+    }
+}
+
+/// Catches a whole-host job the service would refuse, or one that differs from a shared job
+/// in more than its needs: it needs the whole host and nothing else (no CPU, memory, disk or
+/// GPU, which the service refuses beside `whole_host`, even when the size of the inputs is
+/// known); its id, image, command, environment, constraints, wall limit, network, ports,
+/// priority and labels are those of the same lease's shared job, and its arguments name the
+/// same lease and action (the pack url in them is minted again for each prepare).
+#[tokio::test(start_paused = true)]
+async fn a_whole_host_job_needs_the_whole_host_alone() {
+    let harness = Harness::new().await;
+    let whole = prepared(&harness, None, Booking::WholeHost)
+        .await
+        .expect("prepared");
+    let shared = prepared(&harness, None, BOOKING).await.expect("prepared");
+    assert_eq!(
+        whole.spec.needs,
+        Some(Needs {
+            whole_host: true,
+            ..Needs::default()
+        })
+    );
+    let shared_needs = shared.spec.needs.clone().expect("needs");
+    assert!(shared_needs.disk_bytes.is_some() && !shared_needs.whole_host);
+    let without_needs = |spec: &js_proto::v1::JobSpec| js_proto::v1::JobSpec {
+        needs: None,
+        // The grant and the pack url are made again for each prepare.
+        args: Vec::new(),
+        files: Vec::new(),
+        ..spec.clone()
+    };
+    assert_eq!(without_needs(&whole.spec), without_needs(&shared.spec));
+    assert_eq!(arg(&whole.spec.args, "--lease"), Some("7-8"));
+    assert_eq!(
+        arg(&whole.spec.args, "--action"),
+        arg(&shared.spec.args, "--action")
+    );
 }
 
 /// Catches the secrets travelling the way the operator did not choose: under `Files` the

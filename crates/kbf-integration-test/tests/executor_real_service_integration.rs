@@ -25,8 +25,10 @@
 //! - `a_lost_answer_to_a_submit_makes_one_job`: the answer to the submit is lost after the
 //!   service made the job; the executor submits again under the same id, and the service holds
 //!   one job.
-//! - `a_whole_machine_action_is_never_a_job`: the executor's workers offer the container
-//!   driver only, so the farm never gives one a whole-machine action, and no job is made of it.
+//! - `a_whole_machine_action_is_one_whole_host_job_the_service_takes`: the farm gives a
+//!   worker a whole-machine action, and the executor submits it as one job that needs the whole
+//!   host, which the real service takes. Whether a host runs it is the service's placement, not
+//!   asserted here.
 //! - `a_restarted_frontend_cancels_the_earlier_job_and_runs_the_action_again`: restart.
 //!
 //! One test runs everywhere, as a pull request's tests do:
@@ -43,7 +45,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use js_proto::v1::{Job, JobState, ListJobsRequest, ResultReason};
+use js_proto::v1::{Job, JobState, ListJobsRequest, Needs, ResultReason};
 use kbf_front::{Cache, Described, Dispatch as _, Finished, Stage, Submission};
 use kbf_job_client::Client;
 use kbf_proto::reapi::Digest;
@@ -611,27 +613,50 @@ async fn a_lost_answer_to_a_submit_makes_one_job() {
     assert_eq!(rig.ingest.ingested.lock().expect("ingested").len(), 1);
 }
 
-/// Asserts that a whole-machine action is never made a job: the executor's workers offer the
-/// container driver only, so the farm places it on none of them, while a container action
-/// submitted after it runs to its end on the same workers; the service then holds the
-/// container action's job and nothing of the other. Catches an executor that sends the real
-/// service a job its agents cannot run (whole-host jobs are not placed by this release).
+/// Asserts that a whole-machine action is one job of the whole host that the real service
+/// takes: the farm places it on the executor's worker, which lists the `native-whole-machine`
+/// driver, and the executor submits one job that needs the whole host and nothing beside it,
+/// which the service records as a live job and does not refuse (the action is not answered).
+/// Catches an executor that never submits a whole-machine action, or that sends the real service
+/// a whole-host job it refuses (a need beside `whole_host`). Whether and where the service
+/// places the job is its own placement's concern and is not waited for.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs root, systemd and the pinned js-lease-server and js-agent: beta.yml's js-real-service job fetches them and runs these with cargo xtask sudo-test"]
-async fn a_whole_machine_action_is_never_a_job() {
+async fn a_whole_machine_action_is_one_whole_host_job_the_service_takes() {
     let mut rig = Rig::start("xrs-whole").await;
     let whole = rig.submit(5, LeaseKind::WholeMachine);
-    let container = rig.submit(6, LeaseKind::Action);
-    let finished = rig.finish(&container).await;
-    assert!(
-        matches!(finished, Finished::Ran(_)),
-        "{finished:?}\n{}",
-        rig.logs()
-    );
-    let jobs = rig.jobs().await;
+    let mut pace = tokio::time::interval(rig.exec.poll());
+    let jobs = loop {
+        let jobs = rig.jobs_of(5).await;
+        if !jobs.is_empty() {
+            break jobs;
+        }
+        if let Some(finished) = whole.finished() {
+            panic!(
+                "answered before a job was made: {finished:?}\n{}",
+                rig.logs()
+            );
+        }
+        turn(&mut rig.exec, &rig.farm, &mut pace).await;
+    };
     assert_eq!(jobs.len(), 1, "{jobs:?}");
-    assert_eq!(rig.jobs_of(6).await.len(), 1);
-    assert!(rig.jobs_of(5).await.is_empty());
+    let spec = jobs[0].spec.clone().unwrap_or_default();
+    assert_eq!(
+        spec.needs,
+        Some(Needs {
+            whole_host: true,
+            ..Needs::default()
+        })
+    );
+    let ended = [
+        JobState::Unspecified,
+        JobState::Succeeded,
+        JobState::Failed,
+        JobState::Cancelled,
+        JobState::Lost,
+        JobState::FailedToStart,
+    ];
+    assert!(!ended.contains(&jobs[0].state()), "{jobs:?}");
     assert!(whole.finished().is_none(), "{:?}", whole.stage.borrow());
     assert_eq!(rig.counter("kbf_executor_jobs_submitted_total"), 1);
 }

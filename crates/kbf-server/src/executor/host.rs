@@ -19,10 +19,12 @@
 //! - `Welcome.pack_commit` and `placement_load`: nothing here commits a pack through
 //!   `CommitPack`. No load is reported: a job's host is the service's, and the farm places a
 //!   worker with no load reading by booking alone.
-//! - `Start.kind`, `device_id`, `job` and `fence`: the node report names `container` as its
-//!   only driver, so the farm places only actions on it, with no device (a whole-machine
-//!   `Start` that comes anyway is answered as infrastructure, unsubmitted); the worker fences
-//!   every job it submits, as a daemon does that is told nothing else.
+//! - `Start.device_id`, `job` and `fence`: the node report names the `container` and
+//!   `native-whole-machine` drivers ([`DRIVERS`](super::config::DRIVERS)) and no device, so the
+//!   farm places `action` and `whole_machine` leases on it, never a device or a `job`; the
+//!   worker fences every job it submits, as a daemon does that is told nothing else.
+//!   `Start.kind` is read: a `whole_machine` lease is submitted as a job that needs the whole
+//!   host, any other as one that needs the share the farm booked.
 //!
 //! # Time
 //!
