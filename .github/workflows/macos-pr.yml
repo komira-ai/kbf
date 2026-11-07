@@ -3,8 +3,10 @@
 #
 # - `macos-test` runs the tests of the macOS crates as an ordinary user: the steps of beta.yml's
 #   `native-macos` that need no root and no device, the task runner's tests (ci.yml's `task-macos`
-#   runs them after the merge), and the crates of the launchd adapters, the step runner and
-#   self-update. Not the whole workspace: its Linux-only test targets do not build on a Mac.
+#   runs them after the merge), and the other crates whose tests pass on a Mac (the sandbox
+#   profile writer, the virtual machine and provisioning tools, the update types). Not the whole
+#   workspace: its Linux-only test targets do not build on a Mac, and the tests of the launchd
+#   adapters, the step runner and the updater fail there today (komira-ai/kbf#2283).
 # - `macos-device` runs the rest of `native-macos`: the steps as root (the lease-user pool, the slot
 #   clean and its profile, the root helper, the guest agent under launchd, the `.pkg` through
 #   Installer, the provisioning) and the real simulator, gh and signing tests.
@@ -86,12 +88,13 @@ jobs:
       # The task runner's tests without its test-only feature: they run the Command under the
       # macOS confine for real (ci.yml's `task-macos`, which runs them after the merge).
       - run: cargo test -p kbf-task --locked --no-fail-fast
-      # The crates no Mac job tested before: the launchd adapters (the host helper's launchd side,
-      # the user and group lookups), the sandbox profile writer, the virtual machine tool and the
-      # provisioning tool as an ordinary user, the step runner and self-update (the updater
-      # agent's Mac pin, the update hooks). Their `#[ignore]`d tests do not run here; the host
-      # helper's run as root in host-install-mac.yml, the provisioning tool's in `macos-device`.
-      - run: cargo test --locked --no-fail-fast -p kbf-host -p kbf-host-install -p kbf-seatbelt -p kbf-vmm -p kbf-mac-provision -p kbf-step-runner -p kbf-updater -p kbf-update -p update-hook
+      # The crates no Mac job tested before whose tests pass on a Mac: the sandbox profile writer,
+      # the virtual machine tool and the provisioning tool as an ordinary user, and the update
+      # types. Their `#[ignore]`d tests do not run here (the provisioning tool's run as root in
+      # `macos-device`). kbf-host, kbf-host-install, kbf-step-runner, kbf-updater and update-hook
+      # are not here yet: their tests fail or hang on a Mac (komira-ai/kbf#2283); ci.yml's Linux
+      # check of them for aarch64-apple-darwin holds that they compile.
+      - run: cargo test --locked --no-fail-fast -p kbf-seatbelt -p kbf-vmm -p kbf-mac-provision -p kbf-update
 
   macos-device:
     runs-on: macos-15

@@ -455,10 +455,10 @@ fn a_step_of_the_after_merge_mac_jobs_that_no_pull_request_runs_is_refused() {
 fn a_crate_the_mac_tests_whole_and_the_linux_check_misses_is_refused() {
     // Catches: a crate added to `macos-test` and not to ci.yml's darwin `--tests` check, so a
     // macOS compile error in it reaches main from a pull request that runs no Mac.
-    let found = changed_to("ci.yml", " -p kbf-updater -p kbf-update", " -p kbf-update");
+    let found = changed_to("ci.yml", " -p kbf-update -p update-hook", " -p update-hook");
     has(
         &found,
-        "macos-pr.yml#macos-test tests kbf-updater whole, and ci.yml's `lint` job does not check its tests for aarch64-apple-darwin: add `-p kbf-updater` there",
+        "macos-pr.yml#macos-test tests kbf-update whole, and ci.yml's `lint` job does not check its tests for aarch64-apple-darwin: add `-p kbf-update` there",
     );
 }
 
