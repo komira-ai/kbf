@@ -118,19 +118,32 @@ fn only_a_plain_relative_regular_file_is_a_hook() {
     }
 }
 
-/// Catches a digest that quietly skips what it cannot hash: a FIFO in the tree is refused by
-/// name, and a tree that is not there is an I/O error.
-#[test]
-fn what_cannot_be_hashed_is_refused() {
-    let s = tree("art-fifo");
+/// A file at `path` that is neither a regular file, a directory nor a symlink: a FIFO.
+#[cfg(not(target_vendor = "apple"))]
+fn special_file(path: &Path) {
     rustix::fs::mknodat(
         rustix::fs::CWD,
-        s.path().join("pipe"),
+        path,
         rustix::fs::FileType::Fifo,
         rustix::fs::Mode::from_raw_mode(0o600),
         0,
     )
     .unwrap();
+}
+
+/// A file at `path` that is neither a regular file, a directory nor a symlink: a Unix socket,
+/// because rustix makes no FIFO on a Mac. The socket file stays after the listener is dropped.
+#[cfg(target_vendor = "apple")]
+fn special_file(path: &Path) {
+    drop(std::os::unix::net::UnixListener::bind(path).unwrap());
+}
+
+/// Catches a digest that quietly skips what it cannot hash: a FIFO (a Unix socket on a Mac) in
+/// the tree is refused by name, and a tree that is not there is an I/O error.
+#[test]
+fn what_cannot_be_hashed_is_refused() {
+    let s = tree("art-fifo");
+    special_file(&s.path().join("pipe"));
     let err = tree_digest(s.path()).unwrap_err();
     assert!(matches!(&err, ArtifactError::Unsupported(p) if p == Path::new("pipe")));
     assert!(err.to_string().contains("neither a file"));

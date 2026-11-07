@@ -85,7 +85,8 @@ listed in order in section 4.
 
 | workflow | jobs | what it gates |
 |---|---|---|
-| `ci.yml` | `lint`, `test-shard`, `test`, `task-macos` | the merge: formatting, clippy, the repository lints, `cargo deny`, the fast tests in shards, and 99% line and branch coverage per crate. It also runs `cargo xtask release main-control`, a lint of the release workflow's main-only rule, not a release run. |
+| `ci.yml` | `lint`, `test-shard`, `test` | the merge: formatting, clippy, the repository lints, `cargo deny`, the fast tests in shards, and 99% line and branch coverage per crate. It also runs `cargo xtask release main-control`, a lint of the release workflow's main-only rule, not a release run. Its `task-macos` runs after the merge and in the merge queue only. |
+| `macos-pr.yml` | `macos-test`, `macos-device` | every pull request and merge queue entry: the macOS crates' tests and every step of `beta.yml`'s `native-macos`, on `macos-15`. It holds the run's read-only token, no secret and no write scope, and publishes nothing. |
 | `update-rehearsal.yml` | `rehearse`, `rehearse-agent`, `rehearse-tierstore` | a change to the helper, installer, coordinator, updater, OIDC or CA crates, to `deploy-farm` or `release farm-version`, to `packaging/host-agent/linux`, or to the workflow itself (path filter). It updates a host on a runner from the previous release. It holds the run's read-only token, no write scope and no secret, and publishes nothing. |
 | `host-install-linux.yml` | `real-linux` | a change to the helper or to `packaging/host-agent/linux` (path filter): the helper's unit and drop-in tests as root under real systemd. It holds `contents: read` only. The release does not need it. |
 | `artifacts.yml` | the build and sums jobs | only with the label `needs-artifacts`: a build check that attests nothing. |

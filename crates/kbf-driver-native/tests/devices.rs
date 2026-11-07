@@ -62,9 +62,12 @@ async fn run_long(
 
 /// Catches a profile that lets an action reach `CoreDeviceService` (the CoreDevice
 /// mach rule dropped, or naming another service): `devicectl list devices` must
-/// fail, saying its connection to the service was invalidated (what the sandbox's
-/// refused lookup looks like to it), with or without the network. Control: the same
-/// action without a sandbox lists the devices (none on the runner) and exits 0.
+/// fail, with or without the network, and the refused lookup of the service must show:
+/// either `devicectl` says its connection to the service was invalidated (what the
+/// sandbox's refused lookup looks like to it on macOS 26), or it says something else
+/// (macOS 15's says it timed out waiting for the service) and the driver's report of the
+/// lease's sandbox denials names `mach-lookup` of the service. Control: the same action
+/// without a sandbox lists the devices (none on the runner) and exits 0.
 #[tokio::test]
 async fn no_action_reaches_coredevice() {
     let cas = Arc::new(MemoryCas::default());
@@ -82,8 +85,10 @@ async fn no_action_reaches_coredevice() {
             result.exit_code, 0,
             "network={network}: devicectl ran: {out}{err}"
         );
+        let refused = err.contains("The connection was invalidated")
+            || err.contains(&format!("mach-lookup {service}"));
         assert!(
-            err.contains(service) && err.contains("The connection was invalidated"),
+            err.contains(service) && refused,
             "network={network}: devicectl failed for another reason: {out}{err}"
         );
     }

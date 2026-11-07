@@ -170,18 +170,22 @@ fn a_link_a_directory_a_socket_or_a_pipe_is_no_pin() {
     );
     drop(socket);
     fs::remove_file(&path).unwrap();
-    rustix::fs::mknodat(
-        rustix::fs::CWD,
-        &path,
-        rustix::fs::FileType::Fifo,
-        rustix::fs::Mode::from_raw_mode(0o644),
-        0,
-    )
-    .unwrap();
-    assert_eq!(
-        pin.look(),
-        Look::NotAPin(format!("{shown} is not a regular file"))
-    );
+    // rustix makes no FIFO on a Mac, so there the socket above is the special file.
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &path,
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::from_raw_mode(0o644),
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            pin.look(),
+            Look::NotAPin(format!("{shown} is not a regular file"))
+        );
+    }
 }
 
 /// A name that cannot be looked at is a pin with no commit: the hold file may be there. A
