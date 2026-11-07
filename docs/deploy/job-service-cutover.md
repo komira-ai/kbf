@@ -45,7 +45,60 @@ each part is set up:
    "The job service's port").
 3. **At least one farm agent** (`js-agent`) registered with that pool, so that a job can be
    placed. The check does not need one (an empty list passes), but every job a frontend submits
-   waits in the queue until one is there.
+   waits in the queue until one is there. Each agent also needs the egress below, or no job of
+   kbf's is placed on it.
+
+## The farm agents' egress
+
+The executor submits every job with the network level `allow-list`: a task PUTs its packs to the
+tier store's proxy and reads its inputs from the frontend's job-facing read listener, and nothing
+else. A farm agent runs such a job only if its own ceiling is `allow-list` (`--egress allow-list`,
+on `--runtime crun`), and the job reaches only the endpoints its `--egress-allow` lines name. An
+agent with the default ceiling, `none`, is never given kbf's jobs. kbf never asks for `open`.
+
+Those lines are made from the frontend's own `kbf.toml`, so that they name the places the frontend
+gives its tasks:
+
+```text
+kbf-deploy job-service agent-egress --config /etc/kbf/kbf.toml
+```
+
+It reads the file and prints the lines; it changes nothing. For a frontend whose `[task-runs]`
+says `task-put-endpoint = "http://192.0.2.10:9000"` and
+`task-read-url = "https://192.0.2.20:8444"`:
+
+```text
+# The egress of kbf's tasks, from /etc/kbf/kbf.toml. Put these lines in /etc/js-agent/flags on
+# every agent of the farm (js-agent --runtime crun): a job of kbf's reaches these and
+# nothing else.
+--egress=allow-list
+# task-put-endpoint = http://192.0.2.10:9000
+--egress-allow=192.0.2.10:9000
+# task-read-url = https://192.0.2.20:8444
+--egress-allow=192.0.2.20:8444
+```
+
+With `executor-locate = true` and a `job-store-url`, a task also reads straight from that store,
+and a third `--egress-allow` names it (without the url a locating task reads from the listener
+alone, and no third line is printed). An endpoint named by two keys is printed once. Put the lines in
+the flags file of every farm agent (the jobscheduler's
+[farm node runbook](https://github.com/komira-ai/jobscheduler/blob/main/docs/runbooks/farm-node-enroll.md)
+gives the file's rules). The agent reads the file when it starts, so restart it as that runbook
+says. When the frontend's
+`task-put-endpoint`, `task-read-url` or `job-store-url` changes, render the lines again and replace
+them on every agent.
+
+**Refused** (exit 2, nothing printed; the message names the file and the key):
+
+- `task-put-endpoint` or `task-read-url` is not in the file: the task would have nowhere to
+  write its packs or read its inputs;
+- a url whose host is not an IPv4 address: a job's network has no DNS, and the agent allows
+  IPv4 endpoints only. Give the frontend IP addresses (with certificates that name them);
+- an IPv6 address, a port that is not 1 to 65535, or a scheme other than `http` or `https`;
+- a loopback, unspecified, link-local (the cloud metadata range), multicast or broadcast address,
+  which no job reaches through the host;
+- a file that cannot be read, is not TOML, has a key of the wrong type, or has a key in two
+  tables.
 
 ## kbf's client token
 

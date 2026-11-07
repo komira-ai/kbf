@@ -1879,6 +1879,7 @@ dependencies = [
  "thiserror",
  "time",
  "tokio",
+ "toml",
  "tonic",
  "x509-parser",
  "zip",
