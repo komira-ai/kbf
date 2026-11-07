@@ -840,3 +840,82 @@ fn job_service_agent_egress_runs_through_the_same_command_line() {
     assert!(err.contains("--config"), "{err}");
     assert!(exec.queries.borrow().is_empty());
 }
+
+/// Catches a `job-service plan`, `apply` or `back-out` the command line does not reach, or a
+/// dry run that runs anything on the host: through `run`, a plan of a file that lacks the
+/// executor's keys fails (exit 1) after printing the plan, an `apply` dry run of the same file
+/// is refused (exit 2) and a `back-out` with no backup is refused (exit 2), a missing flag is
+/// a usage error, and no tool is run.
+#[test]
+fn job_service_plan_apply_and_back_out_run_through_the_same_command_line() {
+    let dir = TestDir::under(std::env::temp_dir(), "kbf-deploy-cli-cutover");
+    let config = dir.path().join("kbf.toml");
+    std::fs::write(&config, "[executor]\n").unwrap();
+    let config = config.to_str().unwrap();
+    let target = [
+        "--config",
+        config,
+        "--url",
+        "http://127.0.0.1:9443",
+        "--token-file",
+        "/etc/kbf/job-service.token",
+        "--hosts",
+        "2",
+        "--host-cpus",
+        "8",
+        "--host-memory-gib",
+        "32",
+    ];
+    let restart = [
+        "--instance",
+        "-",
+        "--api-token-file",
+        "/etc/kbf/api-token",
+        "--ssh-host",
+        "fe.farm.example",
+        "--ssh-user",
+        "kbf-updater",
+        "--ssh-key-file",
+        "/etc/kbf/key",
+        "--known-hosts",
+        "/etc/kbf/known_hosts",
+    ];
+    let mut exec = FakeExec::new(501);
+
+    let (code, out, err) = cli(
+        &mut exec,
+        &no_env,
+        &[&["job-service", "plan"][..], &target].concat(),
+    );
+    assert_eq!(code, ExitCode::from(1), "{err}");
+    assert!(
+        out.starts_with("kbf-deploy job-service plan (changes nothing)\n"),
+        "{out}"
+    );
+    assert!(err.starts_with("FAIL: not ready: "), "{err}");
+
+    let apply = [&["job-service", "apply"][..], &target, &restart].concat();
+    let (code, out, err) = cli(&mut exec, &no_env, &apply);
+    assert_eq!(code, ExitCode::from(2), "{err}");
+    assert_eq!(out, "");
+    assert!(err.contains("lacks executor-frontend-id"), "{err}");
+
+    let back_out = [
+        &["job-service", "back-out", "--config", config][..],
+        &restart,
+    ]
+    .concat();
+    let (code, out, err) = cli(&mut exec, &no_env, &back_out);
+    assert_eq!(code, ExitCode::from(2), "{err}");
+    assert_eq!(out, "");
+    assert!(err.contains("there is no switch to back out"), "{err}");
+
+    let (code, _, err) = cli(
+        &mut exec,
+        &no_env,
+        &["job-service", "plan", "--config", config],
+    );
+    assert_eq!(code, ExitCode::from(2), "{err}");
+    assert!(err.contains("--url"), "{err}");
+    assert!(exec.queries.borrow().is_empty());
+}

@@ -37,13 +37,22 @@
 //!   (`job-service check`; read-only), before a frontend's executor is pointed at it.
 //! - [`agent_egress`]: the egress lines of a farm agent's flags file, from the frontend's
 //!   `kbf.toml` (`job-service agent-egress`; read-only).
+//! - [`cutover`]: what switching a frontend's executor onto the job service sets in its
+//!   `kbf.toml` (`job-service plan`; read-only); [`cutover_edit`], the edit of that file and
+//!   its backup; [`cutover_apply`], the switch and its back-out through the frontend's drain
+//!   and `kbf-host-install`'s restart (`job-service apply`, `back-out`; dry runs without
+//!   `--apply`); [`canary`], the one job run through the service after the switch.
 //! - [`pilot`]: a pilot kbf-server run as a systemd user service by the operator's own
 //!   user (`pilot server-install`), and the buck2 overlay that points one linked
 //!   worktree at it, which never replaces a file it did not write (`pilot buckconfig`).
 
 pub mod agent_egress;
+pub mod canary;
 pub mod cli;
 pub mod config;
+pub mod cutover;
+pub mod cutover_apply;
+pub mod cutover_edit;
 pub mod host;
 pub mod host_status;
 pub mod https;

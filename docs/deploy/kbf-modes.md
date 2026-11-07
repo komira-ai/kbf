@@ -227,6 +227,18 @@ is an infrastructure failure, and the farm runs the action again. A setting that
 executor's safety rests on (the fence time against the scheduler's grace and the start window, an
 open network without its opt-in) is refused at start, exit status 2.
 
+**Switching a running frontend onto the job service, and back.** The executor-to-job-service
+mode is `executor = "js-agent"` with the job service's keys (`executor-job-url`,
+`executor-job-token-file`, `executor-job-ca-file` for `https`) and the virtual workers'
+(`executor-hosts`, `executor-host-cpus`, `executor-host-memory-gib`, `executor-host-slots`) in
+the `[executor]` table. `kbf-deploy job-service plan` prints what the switch sets in a frontend's
+`kbf.toml` and the flags of the mode it runs now; `kbf-deploy job-service apply --apply` checks
+the service with kbf's client token, writes those keys (the original kept as
+`kbf.toml.pre-job-service`), drains and restarts the frontend through `kbf-host-install`, waits
+for its first virtual worker and runs one canary job; `kbf-deploy job-service back-out --apply`
+puts the original back and restarts the same way. Both are dry runs without `--apply`. The
+procedure, the canary and the refusals are in [job-service-cutover.md](job-service-cutover.md).
+
 Per-action overhead of the executor, for comparing it with a daemon, is read from two places. The
 executor's own phases are the histogram `kbf_executor_phase_seconds{phase=...}` on `GET /metrics`:
 `prepare` (the `Start` first seen to its job being ready), `start` (ready to the job service
@@ -444,8 +456,8 @@ written to the object store: [pack-adopt.md](pack-adopt.md) gives the order to r
 
 **The job-facing read listener** (off by default; the `[job-read]` table of `kbf.toml`). It is
 the frontend's own read listener, not an executor mode: the jobscheduler's job service, which its
-lease server serves under a `--job-listen` of its own, is another process, and the checks before
-an executor is moved onto it are in [job-service-cutover.md](job-service-cutover.md). A task
+lease server serves under a `--job-listen` of its own, is another process, and the switch of
+an executor onto it is in [job-service-cutover.md](job-service-cutover.md). A task
 that runs an action on a worker fetches the action's input files from the frontend, with a read
 grant (a token the frontend gives the run, valid until its expiry, for one Action: it reads that
 Action, its Command and its input tree, and no other blob). The task is untrusted code that holds
@@ -947,7 +959,8 @@ maintenance without stopping it, `kbf cluster drain <node>`.
   the daemon.
 - [pack-adopt.md](pack-adopt.md): indexing the segments the storage members already hold into
   the pack index, in place.
-- [job-service-cutover.md](job-service-cutover.md): what must run before a frontend's executor is
-  moved onto the jobscheduler's job service, kbf's client token, and `kbf-deploy job-service
-  check`. Not the frontend's own `--job-listen`, which is its job-facing read listener.
+- [job-service-cutover.md](job-service-cutover.md): moving a frontend's executor onto the
+  jobscheduler's job service and back: what must run first, kbf's client token, and
+  `kbf-deploy job-service check`, `plan`, `apply` (with its canary) and `back-out`. Not the
+  frontend's own `--job-listen`, which is its job-facing read listener.
 - The operator API, with its gates, in [api.md](../api.md).
