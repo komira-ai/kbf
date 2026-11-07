@@ -1,5 +1,5 @@
-//! `kbf frontend --scheduler-core`: taken by the frontend (`legacy` and `js`), and logged at
-//! start as the core the farm runs. Alone in its test
+//! `kbf frontend --scheduler-core`: `legacy` is taken by the frontend and logged at start as
+//! the core the farm runs; `js` is refused as removed. Alone in its test
 //! binary: a log event is seen by a subscriber set for one thread only if no other thread
 //! has already made the callsite uninteresting, which other frontend starts in the same
 //! process would do.
@@ -68,10 +68,9 @@ fn flags(more: &[&str]) -> frontend::FrontendFlags {
     .expect("a frontend takes --scheduler-core")
 }
 
-/// Catches a frontend that refuses `--scheduler-core` as a flag it does not take (a unit
-/// file for the js core could not be written for a frontend), a frontend that cannot
-/// start on `js`, and a start that does not log the core the farm runs, in the words the
-/// all-in-one server uses (`scheduler core: legacy` or `scheduler core: js`, once per start).
+/// Catches a frontend that refuses `--scheduler-core` as a flag it does not take, and a
+/// start that does not log the core the farm runs, in the words the all-in-one server uses
+/// (`scheduler core: legacy`, once per start).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_frontend_takes_the_scheduler_core_flag_and_logs_the_core_it_runs() {
     let log = Log::default();
@@ -100,13 +99,24 @@ async fn a_frontend_takes_the_scheduler_core_flag_and_logs_the_core_it_runs() {
         log.text()
     );
     assert!(!log.text().contains("scheduler core: js"));
+}
 
-    let js = flags(&["--scheduler-core=js"]);
-    let _js = start(&js).expect("js starts");
-    assert_eq!(
-        log.text().matches("scheduler core: js").count(),
-        1,
-        "{}",
-        log.text()
-    );
+/// Catches a frontend that takes `--scheduler-core=js` (the core is removed), and a refusal
+/// that does not name the flag and the removal.
+#[test]
+fn a_frontend_refuses_the_removed_js_scheduler_core() {
+    let err = frontend::command()
+        .try_get_matches_from([
+            "frontend",
+            "--listen=127.0.0.1:0",
+            "--worker-listen=127.0.0.1:0",
+            "--api-listen=127.0.0.1:0",
+            "--storage=http://127.0.0.1:1",
+            "--scheduler-core=js",
+        ])
+        .expect_err("js is refused");
+    assert_eq!(err.exit_code(), 2);
+    let said = err.to_string();
+    assert!(said.contains("--scheduler-core"), "{said}");
+    assert!(said.contains("the js scheduler core was removed"), "{said}");
 }

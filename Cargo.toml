@@ -86,11 +86,9 @@ js-agent-usage = { git = "https://github.com/komira-ai/jobscheduler", rev = "e73
 js-caps = { git = "https://github.com/komira-ai/jobscheduler", rev = "e73a5af2ec9ab54e2aeb131c1d8a4a6879a8abb5" }
 js-proto = { git = "https://github.com/komira-ai/jobscheduler", rev = "e73a5af2ec9ab54e2aeb131c1d8a4a6879a8abb5" }
 js-sched = { git = "https://github.com/komira-ai/jobscheduler", rev = "e73a5af2ec9ab54e2aeb131c1d8a4a6879a8abb5" }
-js-server-core = { git = "https://github.com/komira-ai/jobscheduler", rev = "e73a5af2ec9ab54e2aeb131c1d8a4a6879a8abb5" }
 js-sim = { git = "https://github.com/komira-ai/jobscheduler", rev = "e73a5af2ec9ab54e2aeb131c1d8a4a6879a8abb5" }
 js-sizing = { git = "https://github.com/komira-ai/jobscheduler", rev = "e73a5af2ec9ab54e2aeb131c1d8a4a6879a8abb5" }
 js-state = { git = "https://github.com/komira-ai/jobscheduler", rev = "e73a5af2ec9ab54e2aeb131c1d8a4a6879a8abb5" }
-js-store = { git = "https://github.com/komira-ai/jobscheduler", rev = "e73a5af2ec9ab54e2aeb131c1d8a4a6879a8abb5" }
 js-testkit = { git = "https://github.com/komira-ai/jobscheduler", rev = "e73a5af2ec9ab54e2aeb131c1d8a4a6879a8abb5" }
 js-types = { git = "https://github.com/komira-ai/jobscheduler", rev = "e73a5af2ec9ab54e2aeb131c1d8a4a6879a8abb5" }
 js-usage = { git = "https://github.com/komira-ai/jobscheduler", rev = "e73a5af2ec9ab54e2aeb131c1d8a4a6879a8abb5" }
@@ -241,7 +239,6 @@ kbf-installer = { path = "crates/kbf-installer" }
 kbf-invocation = { path = "crates/kbf-invocation" }
 kbf-integration-test = { path = "crates/kbf-integration-test" }
 kbf-job-client = { path = "crates/kbf-job-client" }
-kbf-lease-client = { path = "crates/kbf-lease-client" }
 kbf-log = { path = "crates/kbf-log" }
 kbf-map = { path = "crates/kbf-map" }
 kbf-mapsync = { path = "crates/kbf-mapsync" }

@@ -4,7 +4,7 @@
 
 use kbf_types::WorkerId;
 
-use super::cordon_owner::{key, parse, shown};
+use super::cordon_owner::{key, parse};
 use crate::fleet::Owner;
 
 /// Asserts that the row of a node is in a family of its own, which the scans of the
@@ -63,10 +63,4 @@ fn an_owner_is_shown_as_its_row_word() {
     assert_eq!(shown(&Owner::Operator), "\"operator\"");
     assert_eq!(shown(&Owner::Updater("u1".to_owned())), "\"updater:u1\"");
     assert_eq!(Owner::default(), Owner::Operator);
-}
-
-/// Asserts that a farm with no state store has no owner row to read and says the operator.
-#[test]
-fn a_farm_with_no_store_says_the_operator() {
-    assert_eq!(shown(None, &WorkerId::new("node-a")), Owner::Operator);
 }

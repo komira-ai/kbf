@@ -217,8 +217,9 @@ mode it ran before, through the same update path: its `--executor` and the flags
 they were, or `executor = "kbf-daemon"`, the default, with `--executor-locate` removed in the same
 edit ([kbf-modes.md](kbf-modes.md) gives the rule). **That flag flip works only while the release
 still carries the mode it flips back to.** A frontend that ran on the embedded engine (the
-jobscheduler core built into kbf, `--scheduler-core js`) or on the lease-based `js-agent` executor
-can be flipped back to it only with a release that has it; once a release without them is
+jobscheduler core that was built into kbf, `--scheduler-core js`, which this release refuses at
+start) or on the lease-based `js-agent` executor can be flipped back to it only with a release
+that has it; once a release without them is
 installed, the way back to them is the previous kbf release, not a flag. The steps for the switch
 and for its back-out are written with the switch itself (see "Not covered yet").
 

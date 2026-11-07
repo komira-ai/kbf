@@ -1,0 +1,39 @@
+{
+  "packages": [
+    {"id": "path+file:///w/crates/kbf-alpha#0.1.0", "name": "kbf-alpha"},
+    {"id": "path+file:///w/crates/kbf-beta#0.1.0", "name": "kbf-beta"},
+    {
+      "id": "git+https://github.com/komira-ai/jobscheduler?rev=0#js-sched@0.1.0",
+      "name": "js-sched"
+    }
+  ],
+  "workspace_members": [
+    "path+file:///w/crates/kbf-alpha#0.1.0",
+    "path+file:///w/crates/kbf-beta#0.1.0"
+  ],
+  "resolve": {
+    "nodes": [
+      {
+        "id": "path+file:///w/crates/kbf-alpha#0.1.0",
+        "deps": [
+          {
+            "name": "kbf_beta",
+            "pkg": "path+file:///w/crates/kbf-beta#0.1.0",
+            "dep_kinds": [{"kind": "dev", "target": null}]
+          }
+        ]
+      },
+      {
+        "id": "path+file:///w/crates/kbf-beta#0.1.0",
+        "deps": [
+          {
+            "name": "js_sched",
+            "pkg": "git+https://github.com/komira-ai/jobscheduler?rev=0#js-sched@0.1.0",
+            "dep_kinds": [{"kind": null, "target": null}, {"kind": "build", "target": null}]
+          }
+        ]
+      },
+      {"id": "git+https://github.com/komira-ai/jobscheduler?rev=0#js-sched@0.1.0", "deps": []}
+    ]
+  }
+}

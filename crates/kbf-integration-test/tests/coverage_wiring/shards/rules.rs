@@ -1,4 +1,4 @@
-//! The rules of [`super`], on planted workflows: each way the split stops being whole, and the
+//! The rules of [`super`], on small workflows: each way the split stops being whole, and the
 //! shape `ci.yml` has, which passes.
 
 use super::*;
@@ -6,11 +6,9 @@ use super::*;
 const LINT_JOB: &str = "  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo\n";
 
 const LEGACY_ARGS: &str = "--workspace";
-const JS_ARGS: &str = "-p kbf-server --features kbf-server/farm-core-js";
 
 fn entry(core: &str, part: usize, parts: usize, args: &str) -> String {
-    let gb = if core == "js" { 35 } else { 40 };
-    entry_with_disk(core, part, parts, args, &gb.to_string())
+    entry_with_disk(core, part, parts, args, "40")
 }
 
 fn entry_with_disk(core: &str, part: usize, parts: usize, args: &str, gb: &str) -> String {
@@ -25,10 +23,9 @@ fn matrix(entries: &str) -> String {
 
 fn good_matrix() -> String {
     matrix(&format!(
-        "{}{}{}",
+        "{}{}",
         entry("legacy", 1, 2, LEGACY_ARGS),
-        entry("legacy", 2, 2, LEGACY_ARGS),
-        entry("js", 1, 1, JS_ARGS)
+        entry("legacy", 2, 2, LEGACY_ARGS)
     ))
 }
 
@@ -43,11 +40,10 @@ fn shard_job(matrix: &str) -> String {
 
 const GATE_HEAD: &str = "  test:\n    runs-on: ubuntu-latest\n    permissions:\n      contents: read\n      actions: read\n    steps:\n";
 const BUILD_LEGACY: &str = "      - run: cargo llvm-cov nextest --workspace --locked --branch --no-report --profile pr -E 'none()' --no-tests=pass\n";
-const BUILD_JS: &str = "      - run: cargo llvm-cov nextest -p kbf-server --features kbf-server/farm-core-js --locked --branch --no-report --profile pr -E 'none()' --no-tests=pass\n";
 const CLEAN: &str = "      - run: cargo llvm-cov clean --profraw-only\n";
-const WAIT: &str = "      - run: cargo xtask wait-artifacts --repo r --run-id 1 --job-prefix test-shard --artifact \"profdata-legacy-1=(legacy-1-of-2)\" --artifact \"profdata-legacy-2=(legacy-2-of-2)\" --artifact \"profdata-js-1=(js-1-of-1)\"\n";
+const WAIT: &str = "      - run: cargo xtask wait-artifacts --repo r --run-id 1 --job-prefix test-shard --artifact \"profdata-legacy-1=(legacy-1-of-2)\" --artifact \"profdata-legacy-2=(legacy-2-of-2)\"\n";
 const DOWNLOAD: &str = "      - uses: actions/download-artifact@abc # v8\n        with:\n          pattern: profdata-*\n          path: target/shard-profdata\n          merge-multiple: true\n";
-const COMPLETE: &str = "      - run: cargo xtask profiles-complete --dir target/shard-profdata --extension profdata --prefix kbf-legacy-1- --prefix kbf-legacy-2- --prefix kbf-js-1-\n";
+const COMPLETE: &str = "      - run: cargo xtask profiles-complete --dir target/shard-profdata --extension profdata --prefix kbf-legacy-1- --prefix kbf-legacy-2-\n";
 const MERGE: &str = "      - run: cargo xtask merge-profiles --dir target/shard-profdata --extension profdata --workspace-profile-in target/llvm-cov-target\n";
 const REPORT: &str = "      - run: cargo llvm-cov report --branch --lcov\n";
 const GATE_STEP: &str = "      - run: cargo run -p kbf-coverage --locked -- --lcov l\n";
@@ -59,7 +55,6 @@ fn gate_job(steps: &[&str]) -> String {
 fn good_steps() -> Vec<&'static str> {
     vec![
         BUILD_LEGACY,
-        BUILD_JS,
         CLEAN,
         WAIT,
         DOWNLOAD,
@@ -95,73 +90,54 @@ fn changed(from: &str, to: &str) -> String {
 
 #[test]
 fn each_drift_of_the_partition_is_refused() {
-    // Catches: each way the matrix stops running every test of every core exactly once.
-    let legacy_only =
+    // Catches: each way the matrix stops running every test of the core exactly once.
+    let with_entries =
         |entries: &str| workflow(&shard_job(&matrix(entries)), &gate_job(&good_steps()));
-    let js = entry("js", 1, 1, JS_ARGS);
     let l1 = entry("legacy", 1, 2, LEGACY_ARGS);
     let l2 = entry("legacy", 2, 2, LEGACY_ARGS);
     let cases = [
         (
-            legacy_only(&format!("{l1}{l2}")),
-            "the matrix of `test-shard` has no `js` entry, so that core's tests would not run",
-        ),
-        (
-            legacy_only(&js),
-            "the matrix of `test-shard` has no `legacy` entry, so that core's tests would not run",
-        ),
-        (
-            legacy_only(&format!("{l1}{js}")),
+            with_entries(&l1),
             "the `legacy` entries are parts [1] of 2, not each of 1 to 2 once, so some tests would run twice or not at all",
         ),
         (
-            legacy_only(&format!("{l1}{l1}{l2}{js}")),
+            with_entries(&format!("{l1}{l1}{l2}")),
             "the `legacy` entries are parts [1, 1, 2] of 2, not each of 1 to 2 once, so some tests would run twice or not at all",
         ),
         (
-            legacy_only(&format!("{l1}{}{js}", entry("legacy", 3, 2, LEGACY_ARGS))),
+            with_entries(&format!("{l1}{}", entry("legacy", 3, 2, LEGACY_ARGS))),
             "the `legacy` entries are parts [1, 3] of 2, not each of 1 to 2 once, so some tests would run twice or not at all",
         ),
         (
-            legacy_only(&format!("{l1}{}{js}", entry("legacy", 2, 3, LEGACY_ARGS))),
+            with_entries(&format!("{l1}{}", entry("legacy", 2, 3, LEGACY_ARGS))),
             "the `legacy` entries do not all say `parts: 2`, so their parts are of different splits",
         ),
         (
-            legacy_only(&format!(
-                "{l1}{}{js}",
+            with_entries(&format!(
+                "{l1}{}",
                 entry("legacy", 2, 2, "--workspace --exclude kbf-front")
             )),
             "the `legacy` entries do not run the same packages (`args`), so the parts are not parts of one set of tests",
         ),
         (
-            legacy_only(&format!(
-                "{}{}{js}",
+            with_entries(&format!(
+                "{}{}",
                 entry("legacy", 1, 2, "-p kbf-front"),
                 entry("legacy", 2, 2, "-p kbf-front")
             )),
             "the `args` of the `legacy` entries do not contain `--workspace`",
         ),
         (
-            legacy_only(&format!("{l1}{l2}{}", entry("js", 1, 1, "-p kbf-server"))),
-            "the `args` of the `js` entries do not contain `--features kbf-server/farm-core-js`",
+            with_entries(&format!("{l1}{l2}{}", entry("arm", 1, 1, "--workspace"))),
+            "a matrix entry names the core Some(\"arm\"), which is not `legacy`",
         ),
         (
-            legacy_only(&format!(
-                "{l1}{l2}{js}{}",
-                entry("arm", 1, 1, "--workspace")
-            )),
-            "a matrix entry names the core Some(\"arm\"), which is neither `legacy` nor `js`",
+            with_entries(&format!("{}{l2}", l1.replace("parts: 2", "parts: many"))),
+            "a `legacy` entry has no numeric `parts`",
         ),
         (
-            legacy_only(&format!(
-                "{l1}{l2}{}",
-                js.replace("parts: 1", "parts: many")
-            )),
-            "a `js` entry has no numeric `parts`",
-        ),
-        (
-            legacy_only(&format!("{l1}{l2}{}", js.replace("part: 1", "part: first"))),
-            "a `js` entry has no numeric `part`",
+            with_entries(&format!("{l1}{}", l2.replace("part: 2", "part: second"))),
+            "a `legacy` entry has no numeric `part`",
         ),
     ];
     for (w, want) in cases {
@@ -402,45 +378,32 @@ fn each_drift_of_a_shard_is_refused() {
 
 #[test]
 fn a_shard_with_too_little_disk_is_refused() {
-    // Catches: an early disk check set below what the core's build and tests measured (legacy
-    // about 67 GB, js about 50), which passes a runner that then fails tests for want of room;
-    // a number that is missing or is not one.
+    // Catches: an early disk check set below what the core's build and tests measured (about
+    // 26 GB of use), which passes a runner that then fails tests for want of room; a number that
+    // is missing or is not one.
     let l2 = entry("legacy", 2, 2, LEGACY_ARGS);
-    let js = entry("js", 1, 1, JS_ARGS);
-    let with = |l1: String, js: String| {
+    let with = |l1: String| {
         workflow(
-            &shard_job(&matrix(&format!("{l1}{l2}{js}"))),
+            &shard_job(&matrix(&format!("{l1}{l2}"))),
             &gate_job(&good_steps()),
         )
     };
     let l1 = |gb: &str| entry_with_disk("legacy", 1, 2, LEGACY_ARGS, gb);
-    let js_gb = |gb: &str| entry_with_disk("js", 1, 1, JS_ARGS, gb);
     let cases = [
         (
-            with(l1("39"), js.clone()),
+            with(l1("39")),
             "a `legacy` entry says `min_free_gb: 39`, under the 40",
         ),
         (
-            with(l1("30"), js.clone()),
+            with(l1("30")),
             "a `legacy` entry says `min_free_gb: 30`, under the 40",
         ),
         (
-            with(l1("40"), js_gb("34")),
-            "a `js` entry says `min_free_gb: 34`, under the 35",
-        ),
-        (
-            with(l1("40"), js_gb("20")),
-            "a `js` entry says `min_free_gb: 20`, under the 35",
-        ),
-        (
-            with(l1("lots"), js.clone()),
+            with(l1("lots")),
             "a `legacy` entry has no numeric `min_free_gb`",
         ),
         (
-            with(
-                l1("40").replace("            min_free_gb: 40\n", ""),
-                js.clone(),
-            ),
+            with(l1("40").replace("            min_free_gb: 40\n", "")),
             "a `legacy` entry has no numeric `min_free_gb`",
         ),
     ];
@@ -451,9 +414,9 @@ fn a_shard_with_too_little_disk_is_refused() {
             "want `{want}`, got {got:?}"
         );
     }
-    // The measured numbers and more pass.
-    assert_eq!(shard_wiring(&with(l1("40"), js_gb("35"))), Ok(()));
-    assert_eq!(shard_wiring(&with(l1("120"), js_gb("90"))), Ok(()));
+    // The measured number and more pass.
+    assert_eq!(shard_wiring(&with(l1("40"))), Ok(()));
+    assert_eq!(shard_wiring(&with(l1("120"))), Ok(()));
 }
 
 #[test]
@@ -466,7 +429,7 @@ fn a_shard_may_say_no_tests_fail() {
 #[test]
 fn each_drift_of_the_gate_is_refused() {
     // Catches: each way `test` stops reading every shard's profiles, in the order that makes
-    // one whole report, with the binaries of both cores.
+    // one whole report.
     let without = |i: usize| {
         let mut steps = good_steps();
         steps.remove(i);
@@ -491,56 +454,49 @@ fn each_drift_of_the_gate_is_refused() {
             "the job `test` has no step that builds the instrumented tests of the `legacy` core (`llvm-cov nextest --workspace ... --no-tests=pass`)",
         ),
         (
-            without(1),
-            "the job `test` has no step that builds the instrumented tests of the `js` core (`llvm-cov nextest -p kbf-server --features kbf-server/farm-core-js ... --no-tests=pass`)",
-        ),
-        (
-            changed(
-                " --no-tests=pass\n      - run: cargo llvm-cov nextest -p",
-                "\n      - run: cargo llvm-cov nextest -p",
-            ),
+            changed(" --no-tests=pass\n", "\n"),
             "the job `test` has no step that builds the instrumented tests of the `legacy` core",
         ),
         (
-            without(2),
+            without(1),
             "the job `test` has no step that drops the profiles the builds' test listing wrote (`llvm-cov clean --profraw-only`), which would be merged into the report",
         ),
         (
-            without(3),
+            without(2),
             "the job `test` has no step running `cargo xtask wait-artifacts`",
         ),
         (
-            without(4),
+            without(3),
             "the job `test` has no step that downloads the shards' raw profiles",
         ),
         (
-            without(5),
+            without(4),
             "the job `test` has no step running `cargo xtask profiles-complete`",
         ),
         (
-            without(6),
+            without(5),
             "the job `test` has no step running `cargo xtask merge-profiles` on the shards' profiles",
         ),
         (
-            without(7),
+            without(6),
             "the job `test` has no step running `llvm-cov report`",
         ),
         (
-            without(8),
+            without(7),
             "the job `test` has no step running the gate (`-p kbf-coverage`)",
         ),
         (
-            order(2, 4),
+            order(1, 3),
             "the steps of `test` are not in the order build, drop listing profiles (before the download), wait, download, check the profiles, merge them, report, gate",
         ),
+        (order(2, 3), "the steps of `test` are not in the order"),
         (order(3, 4), "the steps of `test` are not in the order"),
         (order(4, 5), "the steps of `test` are not in the order"),
         (order(5, 6), "the steps of `test` are not in the order"),
         (order(6, 7), "the steps of `test` are not in the order"),
-        (order(7, 8), "the steps of `test` are not in the order"),
-        (order(1, 2), "the steps of `test` are not in the order"),
+        (order(0, 1), "the steps of `test` are not in the order"),
         (
-            conditioned(BUILD_JS),
+            conditioned(BUILD_LEGACY),
             "the build step of `test` has an `if:` or `continue-on-error`, so the gate could pass without it",
         ),
         (
@@ -572,33 +528,33 @@ fn each_drift_of_the_gate_is_refused() {
             "the wait step does not pass `--job-prefix test-shard`, so a failed shard would not end it",
         ),
         (
-            changed(" --artifact \"profdata-js-1=(js-1-of-1)\"", ""),
+            changed(" --artifact \"profdata-legacy-2=(legacy-2-of-2)\"", ""),
             "the wait step's `--artifact` names are not the shards' artifacts",
         ),
         (
             changed(
-                " --artifact \"profdata-js-1=(js-1-of-1)\"",
-                " --artifact \"profdata-js-1=(js-1-of-1)\" --artifact \"profdata-js-2=(js-2-of-1)\"",
+                " --artifact \"profdata-legacy-2=(legacy-2-of-2)\"",
+                " --artifact \"profdata-legacy-2=(legacy-2-of-2)\" --artifact \"profdata-legacy-3=(legacy-3-of-2)\"",
             ),
             "the wait step's `--artifact` names are not the shards' artifacts",
         ),
         (
             changed(
-                " --artifact \"profdata-js-1=(js-1-of-1)\"",
-                " --artifact \"profdata-js-1=(js-1-of-1)\" --artifact \"profdata-js-1=(js-1-of-1)\"",
+                " --artifact \"profdata-legacy-2=(legacy-2-of-2)\"",
+                " --artifact \"profdata-legacy-2=(legacy-2-of-2)\" --artifact \"profdata-legacy-2=(legacy-2-of-2)\"",
             ),
             "the wait step's `--artifact` names are not the shards' artifacts",
         ),
         // An artifact asked for by its name alone would count whatever attempt made it.
         (
-            changed("\"profdata-js-1=(js-1-of-1)\"", "profdata-js-1"),
+            changed("\"profdata-legacy-2=(legacy-2-of-2)\"", "profdata-legacy-2"),
             "the wait step's `--artifact` names are not the shards' artifacts",
         ),
         // Or for the wrong shard's job: the key must be that of the artifact's own shard.
         (
             changed(
-                "\"profdata-js-1=(js-1-of-1)\"",
-                "\"profdata-js-1=(legacy-1-of-2)\"",
+                "\"profdata-legacy-2=(legacy-2-of-2)\"",
+                "\"profdata-legacy-2=(legacy-1-of-2)\"",
             ),
             "the wait step's `--artifact` names are not the shards' artifacts",
         ),
@@ -639,11 +595,11 @@ fn each_drift_of_the_gate_is_refused() {
             "the merge step of `test` must merge the `.profdata` files of `target/shard-profdata` into the profile `llvm-cov report` reads",
         ),
         (
-            changed(" --prefix kbf-js-1-", ""),
+            changed(" --prefix kbf-legacy-2-", ""),
             "the profiles-complete step's `--prefix` values are not the shards' file prefixes",
         ),
         (
-            changed(" --prefix kbf-js-1-", " --prefix kbf-js-2-"),
+            changed(" --prefix kbf-legacy-2-", " --prefix kbf-legacy-3-"),
             "the profiles-complete step's `--prefix` values are not the shards' file prefixes",
         ),
     ];
@@ -654,14 +610,14 @@ fn each_drift_of_the_gate_is_refused() {
             "want `{want}`, got {got:?}:\n{w}"
         );
     }
-    // A workflow whose matrix has no entry for a core has nothing to build for it.
+    // A workflow whose matrix has no entry for the core has nothing to build for it.
     let no_args = workflow(
-        &shard_job(&matrix(&entry("legacy", 1, 1, LEGACY_ARGS))),
+        &shard_job(&matrix(&entry("arm", 1, 1, LEGACY_ARGS))),
         &gate_job(&good_steps()),
     );
     assert_eq!(
         gate_wiring(&no_args),
-        Err("the matrix has no `args` for the `js` core".to_owned())
+        Err("the matrix has no `args` for the `legacy` core".to_owned())
     );
 }
 

@@ -105,10 +105,6 @@ mod fake {
     }
 
     fn server(args: &[String]) -> i32 {
-        // The start line of a server given the core, as the real one logs it.
-        if args.iter().any(|a| a == "--scheduler-core=js") && !defect("core-line-missing") {
-            eprintln!("\x1b[2mT\x1b[0m \x1b[32m INFO\x1b[0m kbf_server::start: scheduler core: js");
-        }
         if !defect("server-silent") {
             // The frontend's start line has the same fields after its name.
             let name = if args.first().is_some_and(|a| a == "--mode=frontend") {
@@ -428,14 +424,6 @@ fn answer(request: &Request, defect: &str, counts: &Counts) -> (&'static str, St
                 "serving"
             };
             ("200 OK", placement(state, ""))
-        }
-        ("GET", "/metrics") => {
-            let (legacy, js) = if has("gauge-legacy") { (1, 0) } else { (0, 1) };
-            let body = format!(
-                "# TYPE kbf_scheduler_core gauge\nkbf_scheduler_core{{core=\"legacy\"}} {legacy}\n\
-                 kbf_scheduler_core{{core=\"js\"}} {js}\nkbf_other 7\n"
-            );
-            ("200 OK", body)
         }
         _ => ("404 Not Found", String::new()),
     }
@@ -901,73 +889,38 @@ fn a_bucket_left_empty_fails() {
     fails("bucket-empty", 1, "FAIL: the bucket kbf-m1 holds no object");
 }
 
-/// `kbf-cell m1` as the js-core gate runs it: the flags for the server and the core it must
-/// report.
-fn js_core_command(cell: &Cell) -> Command {
+/// `kbf-cell m1` with two `--server-arg` flags for the server.
+fn server_args_command(cell: &Cell) -> Command {
     let mut command = cell.command(&["buck2"]);
     command.args([
-        "--server-arg=--scheduler-core=js",
-        "--server-arg=--placement-load=on",
-        "--expect-scheduler-core",
-        "js",
+        "--server-arg=--learned-sizes=shadow",
+        "--server-arg=--no-memory-climb",
     ]);
     command
 }
 
-/// Catches: `--server-arg` flags that do not reach `kbf-server` (in order, after the cell's
-/// own), and `--expect-scheduler-core` that does not read the start line and the gauge
-/// both before the builds and after them.
+/// Catches: `--server-arg` flags that do not reach `kbf-server`, or reach it out of order or
+/// before the cell's own.
 #[test]
-fn a_server_given_the_js_core_that_reports_it_passes() {
-    let cell = Cell::new("js-core", "none");
-    let out = js_core_command(&cell).output().expect("run kbf-cell m1");
+fn server_args_reach_the_server_in_order_after_the_cells_own() {
+    let cell = Cell::new("server-args", "none");
+    let out = server_args_command(&cell)
+        .output()
+        .expect("run kbf-cell m1");
     assert_eq!(out.status.code(), Some(0), "{}", both(&out));
-    let ok = "OK: the server runs the js scheduler core (start line and gauge)";
-    assert_eq!(text(&out.stdout).matches(ok).count(), 2, "{}", both(&out));
     let w = cell.work();
     let server = cell.calls("kbf-server");
     assert_eq!(server.len(), 1);
     let tail = format!(
-        "--api-token-file {}/api-token --scheduler-core=js --placement-load=on",
+        "--api-token-file {}/api-token --learned-sizes=shadow --no-memory-climb",
         w.display()
     );
     assert!(server[0].1.ends_with(&tail), "{}", server[0].1);
-    let scrapes = cell
-        .http
-        .requests()
-        .iter()
-        .filter(|r| r.target == "/metrics")
-        .count();
-    assert_eq!(scrapes, 2);
 }
 
-/// Catches: a run that expects a core and passes when the server never logged it (the
-/// gauge alone would pass on a server that reports the core but did not start it).
-#[test]
-fn a_server_that_does_not_log_the_expected_core_fails() {
-    let cell = Cell::new("js-core-silent", "core-line-missing");
-    let out = js_core_command(&cell).output().expect("run kbf-cell m1");
-    assert_eq!(out.status.code(), Some(1), "{}", both(&out));
-    let why = "FAIL: kbf-server did not log `scheduler core: js`";
-    assert!(text(&out.stderr).contains(why), "{}", both(&out));
-    assert!(cell.calls("kbf-cell").is_empty(), "no daemon starts");
-}
-
-/// Catches: a run that expects the js core and passes on a server whose gauge says legacy
-/// (a server that logged the flag but ran the legacy driver).
-#[test]
-fn a_server_whose_gauge_says_another_core_fails() {
-    let cell = Cell::new("js-core-gauge", "gauge-legacy");
-    let out = js_core_command(&cell).output().expect("run kbf-cell m1");
-    assert_eq!(out.status.code(), Some(1), "{}", both(&out));
-    let why = "FAIL: the server does not report the js core running";
-    assert!(text(&out.stderr).contains(why), "{}", both(&out));
-}
-
-/// `kbf-cell m1` as the js-core gate runs it: the shipping `kbf` for the farm, the frontend's
-/// flags and the core it must report.
+/// `kbf-cell m1` with the shipping `kbf` for the farm and the flags for the frontend.
 fn shipping_command(cell: &Cell) -> Command {
-    let mut command = js_core_command(cell);
+    let mut command = server_args_command(cell);
     command.arg("--kbf-bin").arg(cell.dir.join("bin/kbf"));
     command
 }
@@ -975,8 +928,7 @@ fn shipping_command(cell: &Cell) -> Command {
 /// Catches: `--kbf-bin` that starts `kbf-server` anyway, starts the frontend before its
 /// storage node, gives either mode another mode's flags (the fakes refuse them, as the real
 /// ones do), leaves the daemon on the frontend's worker listener for its blobs, lets
-/// `--server-arg` flags reach the storage node instead of the frontend, or loses the
-/// two checks of the core.
+/// `--server-arg` flags reach the storage node instead of the frontend.
 #[test]
 fn the_shipping_binary_runs_a_storage_node_and_a_frontend_and_passes() {
     let cell = Cell::new("kbf-bin", "none");
@@ -987,7 +939,6 @@ fn the_shipping_binary_runs_a_storage_node_and_a_frontend_and_passes() {
         "kbf-storage 0 storage=127.0.0.1:8983",
         "kbf-frontend 0 reapi=127.0.0.1:8980",
         "daemon joined",
-        "OK: the server runs the js scheduler core (start line and gauge)",
     ] {
         assert!(stdout.contains(line), "no {line:?}\n{}", both(&out));
     }
@@ -1011,16 +962,13 @@ fn the_shipping_binary_runs_a_storage_node_and_a_frontend_and_passes() {
          --storage=https://localhost:8983 --storage-client-cert {w}/pki/frontend.pem \
          --storage-client-key {w}/pki/frontend.key --storage-ca {w}/pki/ca.pem \
          --state-store=sqlite://{w}/frontend-state.db --config={w}/kbf.toml \
-         --scheduler-core=js --placement-load=on"
+         --learned-sizes=shadow --no-memory-climb"
     );
     assert_eq!(args, [storage.as_str(), frontend.as_str()]);
     let daemon = cell.calls("kbf-cell");
     assert_eq!(daemon.len(), 1);
     let blobs = "--server https://127.0.0.1:8981 --cas https://127.0.0.1:8983 --ca-cert";
     assert!(daemon[0].1.contains(blobs), "{}", daemon[0].1);
-    let scrapes = cell.http.requests();
-    let scrapes = scrapes.iter().filter(|r| r.target == "/metrics").count();
-    assert_eq!(scrapes, 2);
 }
 
 /// Catches: a cell on the shipping binary that goes on, or reports a server failure, when
@@ -1035,16 +983,4 @@ fn a_storage_node_that_does_not_start_fails() {
     assert!(text(&out.stderr).contains(why), "{}", both(&out));
     assert!(text(&out.stdout).contains("--- last lines of storage.err"));
     assert_eq!(cell.calls("kbf").len(), 1, "only the storage node ran");
-}
-
-/// Catches: a frontend that never logs the core it was asked for passing on the shipping
-/// binary, and a failure that names the wrong program.
-#[test]
-fn a_frontend_that_does_not_log_the_expected_core_fails() {
-    let cell = Cell::new("kbf-bin-core-silent", "core-line-missing");
-    let out = shipping_command(&cell).output().expect("run kbf-cell m1");
-    assert_eq!(out.status.code(), Some(1), "{}", both(&out));
-    let why = "FAIL: kbf --mode=frontend did not log `scheduler core: js`";
-    assert!(text(&out.stderr).contains(why), "{}", both(&out));
-    assert!(cell.calls("kbf-cell").is_empty(), "no daemon starts");
 }

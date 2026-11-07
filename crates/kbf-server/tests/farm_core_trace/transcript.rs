@@ -1,8 +1,7 @@
 //! The text of a scripted session, and what the drivers of the scripts share to write it:
 //! the state store's tape, the action cache, the nodes' inboxes and the callers' stages.
 //!
-//! A driver (the farm's, in `session.rs`, the scheduler core's, in `tests/farm_core_adapter`)
-//! makes the calls and says what each was ([`Transcript::say`], [`Transcript::note`]); after
+//! A driver (the farm's, in `session.rs`) makes the calls and says what each was ([`Transcript::say`], [`Transcript::note`]); after
 //! each call [`Transcript::sync`] writes down what the call led to, in the order
 //! `session.rs` describes.
 

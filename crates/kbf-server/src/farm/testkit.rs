@@ -53,19 +53,6 @@ impl TestCore {
 }
 
 impl Farm {
-    /// [`Farm::new`] on `core`, whatever core [`crate::SchedulerCore::under_test`] names: for
-    /// a test that runs the two cores over one state store. Both cores are in every build:
-    /// `Js` builds the js core's farm with or without the `farm-core-js` feature.
-    #[must_use]
-    pub fn new_on_core(
-        core: crate::SchedulerCore,
-        cache: impl Into<Backend>,
-        unservable_wait: Duration,
-        finished_retention: Duration,
-    ) -> Self {
-        Self::on_core(core, cache.into(), unservable_wait, finished_retention)
-    }
-
     /// A farm over `cache` that drives `core`, and reads the wall clock and the term of a
     /// new incarnation from it instead of from the process, so what it does depends on
     /// the calls made and on tokio's clock alone. The cache's metadata log is not asked

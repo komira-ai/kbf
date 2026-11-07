@@ -16,9 +16,8 @@ impl Farm {
     /// recorder, the state store).
     #[must_use]
     pub(crate) fn from_listeners(cache: impl Into<Backend>, listeners: &Listeners) -> Self {
-        Self::on_core(
-            listeners.scheduler_core,
-            cache.into(),
+        Self::new(
+            cache,
             listeners.unservable_wait,
             listeners.finished_retention,
         )
@@ -31,20 +30,11 @@ impl Farm {
         .with_whole_node(listeners.whole_node.clone())
     }
 
-    /// The core this farm runs on, as its driver is (not as a flag says).
-    #[must_use]
-    pub const fn scheduler_core(&self) -> crate::SchedulerCore {
-        self.driver.core()
-    }
-
-    /// This farm, learning as `mode` says (`--usage-profiles`): `record` and `on` learn a
-    /// profile from the runs the js core's farm hears of, once the farm has a state store,
-    /// and hand the scheduler no curve. Set before the farm takes a state store over.
+    /// This farm, learning as `mode` says (`--usage-profiles`): recorded for the start line
+    /// and the gauge: this farm learns no usage profile.
     #[must_use]
     pub fn with_usage_profiles(mut self, mode: crate::UsageProfiles) -> Self {
         self.usage_profiles = mode;
-        self.settings.usage = mode.mode();
-        self.driver.set_usage(&self.settings);
         self
     }
 

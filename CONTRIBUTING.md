@@ -118,15 +118,14 @@ lines and 99.00% of branches in every crate, measured on the fast tests (the
 `pr` profile of `.config/nextest.toml`) by the `test` job. The target is 100%, and reviewers hold the rest: a pull request
 covers the code it adds or changes.
 
-The fast tests run in shards, in the matrix job `test-shard`: the scheduler's
-legacy core on the workspace in three parts and the js core on the four packages
-that link the server in one, each part a `nextest --partition count:<part>/<parts>`
-of that core's tests. The `test` job builds both cores' instrumented tests itself
-(without running them), waits for every shard's raw profiles, checks that each
-shard's profiles are there, makes one report of them all and gates it, so a crate's
-coverage is that of all the tests of both cores together, as when one job ran them
-in turn. The matrix is the list of shards: a core's entries are its parts 1 to N,
-each once (`crates/kbf-integration-test/tests/coverage_wiring` holds that).
+The fast tests run in shards, in the matrix job `test-shard`: the workspace in
+three parts, each a `nextest --partition count:<part>/<parts>`. The `test` job
+builds the instrumented tests itself (without running them), waits for every
+shard's raw profiles, checks that each shard's profiles are there, makes one report
+of them all and gates it, so a crate's coverage is that of all the tests together,
+as when one job ran them in turn. The matrix is the list of shards: its entries are
+parts 1 to N, each once (`crates/kbf-integration-test/tests/coverage_wiring` holds
+that).
 
 The job runs `kbf-coverage` against [coverage-floors](coverage-floors) and fails
 a crate whose line or branch coverage is under its threshold: 99.00%, or, for a

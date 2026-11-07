@@ -1,21 +1,18 @@
-//! `--usage-profiles`: whether the farm learns what its leases use, for the scheduler's
-//! admission by load. `off`, the default, learns nothing; `record` is for learning and
-//! storing; `on` is for learning, storing and handing the curves to the scheduler.
+//! `--usage-profiles`: whether the farm learns what its leases use. Only `off`, the default,
+//! is accepted: `record` and `on` were run by the js scheduler core, which was removed, and
+//! the flag still parses them so that a start given one is refused with a message that says
+//! so ([`UsageProfilesError::JsCoreRemoved`]) instead of a parse error.
 //!
-//! `record` learns and stores the profiles from the runs the farm hears of
-//! ([`crate::farm_js::usage`]) and gives the scheduler no curve, so it places as `off` does. `on`
-//! learns and stores the same and gives the scheduler the curves, so an action with a
-//! prediction and a curve is charged by the curve and `on` can place work where `record` would
-//! queue it. `off` does none of it and writes no row. A value
-//! other than `off` also moves the start line ([`UsageProfiles::start_line`]) and the gauge
-//! `kbf_usage_profiles_mode{mode}` ([`render`]). The mode itself is [`kbf_usage::UsageMode`]; this type is its flag spelling.
+//! The mode is logged at start ([`UsageProfiles::start_line`]) and exported as the gauge
+//! `kbf_usage_profiles_mode{mode}` ([`render`]). The mode itself is [`kbf_usage::UsageMode`];
+//! this type is its flag spelling.
 
 use std::fmt::Write as _;
 
 use clap::ValueEnum;
 use kbf_usage::UsageMode;
 
-use crate::{Args, PlacementLoad, PlacementPredictions, SchedulerCore};
+use crate::Args;
 
 /// What `--usage-profiles` selects.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
@@ -23,9 +20,9 @@ pub enum UsageProfiles {
     /// Nothing is learned or stored
     #[default]
     Off,
-    /// Runs are learned and stored; the scheduler does not read the curves
+    /// Refused at start: the core that ran it was removed
     Record,
-    /// Runs are learned and stored, and the scheduler reads the curves
+    /// Refused at start: the core that ran it was removed
     On,
 }
 
@@ -53,61 +50,27 @@ impl UsageProfiles {
     }
 }
 
-/// A `--usage-profiles` that would do nothing, or something other than it says.
+/// A `--usage-profiles` that the server cannot run.
 #[derive(Debug, thiserror::Error)]
 pub enum UsageProfilesError {
-    /// `record` or `on` without `--scheduler-core js`.
+    /// `record` or `on`, which the removed js core ran.
     #[error(
-        "--usage-profiles {0} needs --scheduler-core js: the legacy core has nothing that \
-         records a run"
+        "--usage-profiles {0} needs the js scheduler core, which was removed: scheduling runs \
+         in the job service; leave the flag out or use --usage-profiles off"
     )]
-    NeedsJsCore(&'static str),
-    /// `record` or `on` without `--state-store`.
-    #[error(
-        "--usage-profiles {0} needs --state-store: the profiles are kept in the state store, \
-         and would be lost at every restart without it"
-    )]
-    NeedsStateStore(&'static str),
-    /// `on` without `--placement-load on`.
-    #[error(
-        "--usage-profiles on needs --placement-load on: with it off the scheduler books by \
-         cores and reads no curve"
-    )]
-    OnNeedsPlacementLoad,
-    /// `on` without `--placement-predictions on`.
-    #[error(
-        "--usage-profiles on needs --placement-predictions on: the scheduler reads a curve only \
-         for an action that has a prediction"
-    )]
-    OnNeedsPredictions,
+    JsCoreRemoved(&'static str),
 }
 
 impl Args {
-    /// Refuses a `--usage-profiles` that would do nothing, or something other than it says.
+    /// Refuses a `--usage-profiles` other than `off`.
     ///
     /// # Errors
-    /// [`UsageProfilesError`]: `record` or `on` without the js core or without a state
-    /// store; `on` without `--placement-load on` or without `--placement-predictions on`.
+    /// [`UsageProfilesError::JsCoreRemoved`]: `record` or `on`.
     pub(crate) fn usage_profiles_fit(&self) -> Result<(), UsageProfilesError> {
-        let mode = self.usage_profiles;
-        if mode == UsageProfiles::Off {
-            return Ok(());
+        match self.usage_profiles {
+            UsageProfiles::Off => Ok(()),
+            mode => Err(UsageProfilesError::JsCoreRemoved(mode.name())),
         }
-        if self.scheduler_core != SchedulerCore::Js {
-            return Err(UsageProfilesError::NeedsJsCore(mode.name()));
-        }
-        if self.state_store.is_none() {
-            return Err(UsageProfilesError::NeedsStateStore(mode.name()));
-        }
-        if mode == UsageProfiles::On {
-            if self.placement_load != PlacementLoad::On {
-                return Err(UsageProfilesError::OnNeedsPlacementLoad);
-            }
-            if self.placement_predictions != PlacementPredictions::On {
-                return Err(UsageProfilesError::OnNeedsPredictions);
-            }
-        }
-        Ok(())
     }
 }
 

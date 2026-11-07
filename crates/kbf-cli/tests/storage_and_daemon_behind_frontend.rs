@@ -3,9 +3,9 @@
 //! half (its container driver over a stand-in `crun`, `kbf-cli-fake-crun`, which runs the
 //! action as a plain process, and a cgroup tree of plain directories), its outputs, stdout
 //! and stderr stored in the node's storage in-process and read back through the frontend;
-//! the node's one cache across a crash; and a frontend started with `--scheduler-core=js`
-//! as a production host starts it (`kbf --mode=frontend`), which runs that core and serves a
-//! lease on it, and refuses it beside a flag that core cannot run.
+//! the node's one cache across a crash; and a frontend started as a production host starts
+//! it (`kbf --mode=frontend`), which reports the one scheduler core, legacy, and refuses
+//! `--scheduler-core=js` and the `--usage-profiles` values that needed the removed js core.
 //!
 //! The node has no `--frontend`, so it is the whole farm's storage, a map of itself: the
 //! frontend reaches it through `--storage`, and the node's daemon half dials the frontend's
@@ -331,174 +331,163 @@ fn core_gauge(samples: &std::collections::BTreeMap<String, u64>) -> Vec<(String,
         .collect()
 }
 
-/// Catches a `kbf frontend` given `--scheduler-core=js` whose farm runs the legacy core all
-/// the same (the flag not carried from the parsed flags to the farm the frontend builds), and
-/// a js core that cannot serve a lease in the shipped binary built with its default features
-/// (the suites reach the js core through the test-only `farm-core-js` feature; this binary
-/// has none). The frontend is started as a production host starts it, `kbf
-/// --mode=frontend`, with the flag and an operator listener; before the
-/// action and after it, its `/metrics` says `kbf_scheduler_core{core="js"} 1` and
-/// `{core="legacy"} 0`; one action is executed through its REAPI listener, leased to the
-/// node's daemon half over the worker listener, run, and its result and stdout read back;
-/// and its log holds the start line `scheduler core: js` once and no `scheduler core:
-/// legacy`.
+/// What a `kbf --mode=frontend` start that is refused left behind.
+struct Refused {
+    /// The first line of its stdout: empty when it printed no start line.
+    first_line: String,
+    /// Its exit status code.
+    code: Option<i32>,
+    /// Its stderr.
+    said: String,
+}
+
+/// Starts `kbf --mode=frontend` with `extra` flags and a state store at `state`, both its
+/// stdout and stderr piped, and waits for it to end or print its first line. A start that is
+/// refused ends with no line; one that started is killed when it drops.
+fn refused_start(dir: &Path, addrs: &Addrs, state: &Path, extra: &[&str]) -> Refused {
+    let mut child = Command::new(BIN)
+        .args([
+            "--mode=frontend".to_owned(),
+            "--listen=127.0.0.1:0".to_owned(),
+            format!("--worker-listen={}", addrs.worker),
+            format!("--storage=http://{}", addrs.storage),
+            format!("--state-store=sqlite://{}", state.display()),
+            kbf_testkit::config::flag(dir),
+        ])
+        .args(extra)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
+    let mut running = Running(child);
+    let mut first_line = String::new();
+    BufReader::new(stdout.expect("stdout"))
+        .read_line(&mut first_line)
+        .expect("read");
+    let mut said = String::new();
+    if first_line.is_empty() {
+        // Its stdout has ended, so the process has: no bound is needed to reap it.
+        std::io::Read::read_to_string(&mut stderr.expect("stderr"), &mut said).expect("read");
+    }
+    let code = if first_line.is_empty() {
+        running.0.wait().expect("wait").code()
+    } else {
+        None
+    };
+    Refused {
+        first_line,
+        code,
+        said,
+    }
+}
+
+/// Catches `kbf --mode=frontend --scheduler-core=js` still starting (a farm that runs the
+/// legacy core while the flag says js), a refusal with a status other than 2, and one whose
+/// message does not name the flag and say the js core was removed. The start ends with status
+/// 2 before a start line, its stderr names `--scheduler-core` and says `the js scheduler core
+/// was removed`, it logs no core, and its state store is left uncreated (the refusal comes
+/// before anything opens).
 #[test]
-fn a_frontend_given_the_js_core_runs_it_and_serves_a_lease_end_to_end() {
+fn scheduler_core_js_is_refused_with_a_message() {
+    let dir = scratch("js-core-refused");
+    let addrs = Addrs::new();
+    let state = dir.join("state.db");
+    let refused = refused_start(&dir, &addrs, &state, &["--scheduler-core=js"]);
+    assert_eq!(refused.first_line, "", "the frontend started");
+    assert_eq!(refused.code, Some(2), "{}", refused.said);
+    assert!(
+        refused.said.contains("--scheduler-core"),
+        "{}",
+        refused.said
+    );
+    assert!(
+        refused.said.contains("the js scheduler core was removed"),
+        "{}",
+        refused.said
+    );
+    assert!(
+        !refused.said.contains("scheduler core:"),
+        "a core ran: {}",
+        refused.said
+    );
+    assert!(!state.exists(), "{} was created", state.display());
+}
+
+/// Catches `--usage-profiles=record` or `--usage-profiles=on`, which needed the removed js
+/// core, starting a frontend, a refusal with a status other than 2, and a message that does
+/// not name the flag and its value. Each ends the start with status 2 before a start line,
+/// its stderr holds the whole message for that value, and its state store is left uncreated.
+#[test]
+fn flags_that_needed_the_js_core_are_refused_with_a_message() {
+    let dir = scratch("usage-profiles-refused");
+    let addrs = Addrs::new();
+    for value in ["record", "on"] {
+        let state = dir.join(format!("state-{value}.db"));
+        let flag = format!("--usage-profiles={value}");
+        let refused = refused_start(&dir, &addrs, &state, &[flag.as_str()]);
+        assert_eq!(refused.first_line, "", "{flag}: the frontend started");
+        assert_eq!(refused.code, Some(2), "{flag}: {}", refused.said);
+        let message = format!(
+            "--usage-profiles {value} needs the js scheduler core, which was removed: \
+             scheduling runs in the job service; leave the flag out or use --usage-profiles off"
+        );
+        assert!(refused.said.contains(&message), "{flag}: {}", refused.said);
+        assert!(!state.exists(), "{flag}: {} was created", state.display());
+    }
+}
+
+/// Catches a frontend that does not start on the one scheduler core, or whose gauge names a
+/// core other than it. With `--scheduler-core=legacy` and with the flag absent, the frontend
+/// is started as a production host starts it (`kbf --mode=frontend`, with an operator
+/// listener); its `/metrics` says `kbf_scheduler_core{core="legacy"} 1` and has no other
+/// `kbf_scheduler_core` series (in particular no `core="js"`), and its log holds the start
+/// line `scheduler core: legacy` once.
+#[test]
+fn scheduler_core_legacy_still_starts_and_reports_it() {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
 
-    let dir = scratch("js-core");
-    pki(&dir);
-    let bin = dir.join("bin");
-    std::fs::create_dir_all(&bin).expect("mkdir");
-    let image = crun(
-        &bin,
-        &dir.join("data"),
-        FAKE_CRUN,
-        &["echo", "on the js core"],
-    );
-    let token = dir.join("api-token");
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&token)
-        .and_then(|mut f| f.write_all(&[b'7'; 64]))
-        .expect("write the token");
-    let log = dir.join("frontend.err");
-    let addrs = Addrs::new();
-    let node = start_node(&bin, &node_flags(&dir, &addrs, &[]));
-    let extra = [
-        "--scheduler-core=js".to_owned(),
-        "--api-listen=127.0.0.1:0".to_owned(),
-        format!("--api-token-file={}", token.display()),
-    ];
-    let stderr = std::fs::File::create(&log).expect("the log file");
-    let (_frontend, line) =
-        start_frontend_with(&dir, &addrs, "--mode=frontend", &extra, stderr.into());
-    let reapi: SocketAddr = field(&line, "reapi=").parse().expect("an address");
-    let api: SocketAddr = field(&line, "api=").parse().expect("an address");
-    let js_running = vec![("js".to_owned(), 1), ("legacy".to_owned(), 0)];
-    assert_eq!(core_gauge(&metrics(api)), js_running, "before the action");
-
-    let tokio = tokio::runtime::Runtime::new().expect("runtime");
-    tokio.block_on(async {
-        let channel = connect(reapi).await;
-        let cas = Transfers::over(channel.clone(), TransferConfig::default());
-        let command = ReapiCommand {
-            arguments: vec!["true".to_owned()],
-            ..ReapiCommand::default()
-        };
-        let action = Action {
-            command_digest: Some(put(&cas, command.encode_to_vec()).await),
-            input_root_digest: Some(put(&cas, Directory::default().encode_to_vec()).await),
-            platform: Some(Platform {
-                properties: vec![Property {
-                    name: "container-image".to_owned(),
-                    value: image,
-                }],
-            }),
-            ..Action::default()
-        };
-        let action = put(&cas, action.encode_to_vec()).await;
-        // No bound of its own: a lease that never ends is a hung test, which nextest's
-        // slow-timeout ends.
-        let result = execute(channel, action).await;
-        assert_eq!(result.exit_code, 0, "{result:?}");
-        let stdout = fetch(&cas, &result.stdout_digest.expect("a stdout digest"))
-            .await
-            .expect("read back");
-        assert_eq!(stdout, b"on the js core\n");
-    });
-    drop(tokio);
-
-    assert_eq!(core_gauge(&metrics(api)), js_running, "after the action");
-    let said = std::fs::read_to_string(&log).expect("the log");
-    assert_eq!(said.matches("scheduler core: js").count(), 1, "{said}");
-    assert!(!said.contains("scheduler core: legacy"), "{said}");
-    let status = terminate(node);
-    assert!(status.success(), "{status}");
-}
-
-/// Catches `kbf --mode=frontend` starting the js core with a flag that core cannot honour
-/// (it would run while the flag says otherwise), a refusal with a status other than 2, and
-/// one whose message does not name both flags. Each of `--learned-sizes=on` and
-/// `--no-memory-climb` beside `--scheduler-core=js` ends the start, before a start line, with
-/// status 2 and the error naming the flag and `--scheduler-core js`, logs no core, and leaves
-/// its state store uncreated (the refusal comes before anything opens). Control: the same
-/// start with `--learned-sizes=shadow`, which the js core runs, prints its start line and has
-/// created its state store by then.
-#[test]
-fn a_frontend_refuses_the_js_core_with_a_flag_it_cannot_run() {
-    let dir = scratch("js-core-refused");
-    let addrs = Addrs::new();
-    // Each start has a state store of its own, so a refused start that opened (and so
-    // created) it is seen.
-    let start = |state: &Path, extra: &[&str], stderr: Stdio| {
-        Command::new(BIN)
-            .args([
-                "--mode=frontend".to_owned(),
-                "--listen=127.0.0.1:0".to_owned(),
-                format!("--worker-listen={}", addrs.worker),
-                format!("--storage=http://{}", addrs.storage),
-                format!("--state-store=sqlite://{}", state.display()),
-                kbf_testkit::config::flag(&dir),
-            ])
-            .args(extra)
-            .stdout(Stdio::piped())
-            .stderr(stderr)
-            .spawn()
-            .expect("spawn")
-    };
-    for (flag, named, state) in [
-        (
-            "--learned-sizes=on",
-            "--learned-sizes on",
-            "state-learned.db",
-        ),
-        ("--no-memory-climb", "--no-memory-climb", "state-climb.db"),
+    for (name, flag) in [
+        ("legacy-flag", Some("--scheduler-core=legacy")),
+        ("legacy-default", None),
     ] {
-        let state = dir.join(state);
-        let mut child = start(&state, &["--scheduler-core=js", flag], Stdio::piped());
-        let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
-        // A refused start ends its stdout with no line; a frontend that started prints its
-        // start line, and is killed when `running` drops.
-        let running = Running(child);
-        let mut line = String::new();
-        BufReader::new(stdout.expect("stdout"))
-            .read_line(&mut line)
-            .expect("read");
-        assert_eq!(line, "", "{flag}: the frontend started");
-        let mut said = String::new();
-        std::io::Read::read_to_string(&mut stderr.expect("stderr"), &mut said).expect("read");
-        // Its stderr has ended, so the process has: no bound is needed to reap it.
-        let mut running = running;
-        let status = running.0.wait().expect("wait");
-        assert_eq!(status.code(), Some(2), "{flag}: {status} {said}");
-        assert!(said.contains(named), "{flag}: {said}");
-        assert!(said.contains("--scheduler-core js"), "{flag}: {said}");
-        assert!(
-            !said.contains("scheduler core:"),
-            "{flag}: a core ran: {said}"
+        let dir = scratch(name);
+        pki(&dir);
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).expect("mkdir");
+        crun(&bin, &dir.join("data"), FAKE_CRUN, &["true"]);
+        let token = dir.join("api-token");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&token)
+            .and_then(|mut f| f.write_all(&[b'7'; 64]))
+            .expect("write the token");
+        let log = dir.join("frontend.err");
+        let addrs = Addrs::new();
+        let node = start_node(&bin, &node_flags(&dir, &addrs, &[]));
+        let mut extra = vec![
+            "--api-listen=127.0.0.1:0".to_owned(),
+            format!("--api-token-file={}", token.display()),
+        ];
+        extra.extend(flag.map(str::to_owned));
+        let stderr = std::fs::File::create(&log).expect("the log file");
+        let (_frontend, line) =
+            start_frontend_with(&dir, &addrs, "--mode=frontend", &extra, stderr.into());
+        let api: SocketAddr = field(&line, "api=").parse().expect("an address");
+        assert_eq!(
+            core_gauge(&metrics(api)),
+            vec![("legacy".to_owned(), 1)],
+            "{name}"
         );
-        assert!(!state.exists(), "{flag}: {} was created", state.display());
+        let said = std::fs::read_to_string(&log).expect("the log");
+        assert_eq!(said.matches("scheduler core: legacy").count(), 1, "{said}");
+        assert!(!said.contains("scheduler core: js"), "{said}");
+        let status = terminate(node);
+        assert!(status.success(), "{name}: {status}");
     }
-
-    let shadow = ["--scheduler-core=js", "--learned-sizes=shadow"];
-    let state = dir.join("state-shadow.db");
-    let mut shadow = start(&state, &shadow, Stdio::null());
-    let stdout = BufReader::new(shadow.stdout.take().expect("stdout"));
-    let running = Running(shadow);
-    let line = stdout.lines().next().expect("a start line").expect("read");
-    assert!(line.starts_with("kbf-frontend "), "{line}");
-    // The control opens its store before it prints the start line, so the check of the
-    // refused starts' stores above can fail.
-    assert!(
-        state.exists(),
-        "the started frontend made no {}",
-        state.display()
-    );
-    drop(running);
 }
 
 /// Runs one action whose input root holds `input` as `in/input.bin`; the action

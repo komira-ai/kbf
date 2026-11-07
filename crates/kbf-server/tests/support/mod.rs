@@ -302,9 +302,8 @@ impl Cell {
         .await
     }
 
-    /// A cell that books `ladder`'s first rung and never climbs it (`--no-memory-climb`), on
-    /// the legacy core whichever core the tests run on, with learned sizes `mode`, keeping its
-    /// scheduler's state in `state` if given.
+    /// A cell that books `ladder`'s first rung and never climbs it (`--no-memory-climb`), with
+    /// learned sizes `mode`, keeping its scheduler's state in `state` if given.
     pub async fn start_no_climb(
         mode: kbf_server::LearnedSizes,
         ladder: MemoryLadder,
@@ -686,12 +685,6 @@ impl Cell {
             vm_host_floor: kbf_server::HostFloor::default(),
             learned_sizes: learned,
             exclusive_actions: false,
-            // The js core cannot be told not to climb (the server refuses the flag with it).
-            scheduler_core: if climb {
-                kbf_server::SchedulerCore::under_test()
-            } else {
-                kbf_server::SchedulerCore::Legacy
-            },
             placement_load: kbf_server::PlacementLoad::Off,
             placement_predictions: kbf_server::PlacementPredictions::Off,
             usage_profiles: kbf_server::UsageProfiles::Off,

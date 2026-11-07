@@ -41,7 +41,7 @@ const ALL: [Unset; 8] = [
 
 /// A farm that learns in shadow, places by load, and predicts as `predictions` says.
 fn farm(predictions: PlacementPredictions) -> Farm {
-    Farm::new_legacy(
+    Farm::new(
         Arc::new(Cache::memory()),
         kbf_sched::UNSERVABLE_WAIT,
         kbf_sched::FINISHED_RETENTION,
@@ -397,7 +397,7 @@ fn off_changes_nothing() {
     };
     let off = charged(farm(PlacementPredictions::Off));
     booked(&off);
-    let unmentioned = Farm::new_legacy(
+    let unmentioned = Farm::new(
         Arc::new(Cache::memory()),
         kbf_sched::UNSERVABLE_WAIT,
         kbf_sched::FINISHED_RETENTION,
@@ -478,7 +478,7 @@ fn succeed(
 #[tokio::test(start_paused = true)]
 async fn shadow_sets_nothing_and_counts_each_run_against_its_prediction() {
     let cache = Arc::new(Cache::memory());
-    let farm = Farm::new_legacy(
+    let farm = Farm::new(
         cache.clone(),
         kbf_sched::UNSERVABLE_WAIT,
         kbf_sched::FINISHED_RETENTION,
@@ -748,7 +748,7 @@ fn the_farm_a_server_builds_takes_the_flag_in_either_order() {
         PlacementPredictions::On
     );
     let plain = || {
-        Farm::new_legacy(
+        Farm::new(
             Arc::new(Cache::memory()),
             kbf_sched::UNSERVABLE_WAIT,
             kbf_sched::FINISHED_RETENTION,
@@ -794,7 +794,7 @@ fn reading(seq: u64, limited: bool) -> NodeLoad {
 async fn a_cpu_quota_under_placement_load_on_is_counted_and_warned_of_once() {
     let log = crate::test_log::capture();
     let cache = Arc::new(Cache::memory());
-    let farm = Farm::new_legacy(
+    let farm = Farm::new(
         cache.clone(),
         kbf_sched::UNSERVABLE_WAIT,
         kbf_sched::FINISHED_RETENTION,
@@ -838,7 +838,7 @@ async fn a_cpu_quota_under_placement_load_on_is_counted_and_warned_of_once() {
     assert_eq!(limited_nodes(), 0, "a stale reading is not counted");
 
     let quiet_cache = Arc::new(Cache::memory());
-    let off = Farm::new_legacy(
+    let off = Farm::new(
         quiet_cache.clone(),
         kbf_sched::UNSERVABLE_WAIT,
         kbf_sched::FINISHED_RETENTION,

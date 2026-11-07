@@ -154,7 +154,7 @@ fn wiring(workflow: &str, job: &str, floors_exist: bool) -> Result<(), String> {
 
 #[test]
 fn the_coverage_run_is_sharded_and_merged_whole() {
-    // Catches: a part of a core left out or run twice, a core left out, a shard whose profiles
+    // Catches: a part left out or run twice, an entry of another core, a shard whose profiles
     // could overwrite another's or go unchecked, a gate that does not wait for every shard
     // (so tests would count as never run), and a required check renamed or skippable.
     let text = std::fs::read_to_string(super::repo_root().join(CI)).expect(CI);

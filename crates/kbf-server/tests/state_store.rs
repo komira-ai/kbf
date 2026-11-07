@@ -468,9 +468,8 @@ fn submit(farm: &TestFarm, request: Request) -> Result<(), Status> {
     .map(drop)
 }
 
-/// The races with another frontend `farm` lost: [`Farm::lost_races`], on a core that counts
-/// them. The js core has no such count (`None`): it counts a lost race among its dropped
-/// writes, which are read instead.
+/// The races with another frontend `farm` lost: [`Farm::lost_races`], or the dropped writes
+/// where the farm keeps no such count.
 fn lost_races(farm: &TestFarm) -> u64 {
     farm.lost_races().unwrap_or_else(|| farm.dropped_writes())
 }
@@ -1192,33 +1191,21 @@ restarts!(
 );
 
 /// `an_old_form_name_is_answered_by_the_issuing_frontend` over each store, as `restarts!` runs
-/// a test, written out so that the js core's difference can be marked on it.
+/// a test.
 mod an_old_form_name_is_answered_by_the_issuing_frontend {
     use super::*;
 
     #[tokio::test(start_paused = true)]
-    #[cfg_attr(
-        feature = "farm-core-js",
-        ignore = "known-different-on-js: a name of the old form operations/<term>-<waiter> is not answered"
-    )]
     async fn over_the_fake() {
         super::an_old_form_name_is_answered_by_the_issuing_frontend(Backing::Fake).await;
     }
 
     #[tokio::test(start_paused = true)]
-    #[cfg_attr(
-        feature = "farm-core-js",
-        ignore = "known-different-on-js: a name of the old form operations/<term>-<waiter> is not answered"
-    )]
     async fn over_sqlite() {
         super::an_old_form_name_is_answered_by_the_issuing_frontend(Backing::Sqlite).await;
     }
 
     #[tokio::test(start_paused = true)]
-    #[cfg_attr(
-        feature = "farm-core-js",
-        ignore = "known-different-on-js: a name of the old form operations/<term>-<waiter> is not answered"
-    )]
     async fn over_postgres() {
         super::an_old_form_name_is_answered_by_the_issuing_frontend(Backing::Postgres).await;
     }
@@ -1296,7 +1283,6 @@ fn listeners() -> Listeners {
         vm_host_floor: kbf_server::HostFloor::default(),
         learned_sizes: kbf_server::LearnedSizes::Off,
         exclusive_actions: false,
-        scheduler_core: kbf_server::SchedulerCore::under_test(),
         placement_load: kbf_server::PlacementLoad::Off,
         placement_predictions: kbf_server::PlacementPredictions::Off,
         usage_profiles: kbf_server::UsageProfiles::Off,

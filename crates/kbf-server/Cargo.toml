@@ -12,13 +12,6 @@ publish.workspace = true
 # scripted session of it can be written down and compared. Test-only: a production build
 # carries none of it. This crate's own tests enable it through the dev-dependency on itself.
 testkit = []
-# Test-only: `SchedulerCore::under_test()` names the js core (`Driver::Js`, `src/farm/js`)
-# instead of the legacy one, so that every farm test of the packages that reach it runs on the
-# js core. Both cores are in every build; `--scheduler-core` picks the one a server runs, and
-# nothing but tests reads `under_test()`. CI runs the fast tests once without the feature and
-# once with it and reports one coverage over both runs, so no default feature set may turn it
-# on: `tests/farm_core_js_gate.rs` in kbf-integration-test fails a manifest that does.
-farm-core-js = []
 
 [dependencies]
 axum = { workspace = true, features = ["http1", "tokio"] }
@@ -34,14 +27,6 @@ hyper = { workspace = true, features = ["http1", "server"] }
 hyper-util = { workspace = true, features = ["service", "tokio"] }
 # The messages of the job service the host executor submits jobs to (src/executor).
 js-proto.workspace = true
-# The loop around the scheduler (src/farm_js): `KbfAdapter` is its `Adapter`.
-js-server-core.workspace = true
-# The scheduler's rows in the state store (src/farm_js): the farm's row codec and its
-# build-only rows are written against this crate's `RowCodec` and `Ext`.
-js-store.workspace = true
-# The ids a recorded run is told by, and the recorder the farm's usage side runs (src/farm_js/usage.rs).
-js-types.workspace = true
-js-usage.workspace = true
 kbf-auth.workspace = true
 kbf-ca.workspace = true
 kbf-front.workspace = true
@@ -49,9 +34,6 @@ kbf-history.workspace = true
 kbf-invocation.workspace = true
 # The host executor's client of the job service (src/executor).
 kbf-job-client.workspace = true
-# No code of this crate calls the lease server since the host executor submits jobs; the
-# dependency is removed with the lease client crate itself.
-kbf-lease-client.workspace = true
 kbf-log.workspace = true
 kbf-map.workspace = true
 kbf-mapsync.workspace = true
@@ -128,8 +110,6 @@ kbf-segments.workspace = true
 kbf-sim.workspace = true
 # An in-process job service on loopback (src/executor, tests/executor).
 kbf-job-client = { workspace = true, features = ["fake"] }
-# Unused since the host executor submits jobs; removed with the lease client crate itself.
-kbf-lease-client = { workspace = true, features = ["fake"] }
 # The in-memory state store (src/start.rs, src/frontend, src/farm/durable and tests/), and a
 # Postgres database of its own for a test (tests/state_store_postgres.rs).
 kbf-pack-index = { workspace = true, features = ["test-database", "test-support"] }

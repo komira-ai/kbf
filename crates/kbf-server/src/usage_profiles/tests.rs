@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use clap::error::ErrorKind;
-use clap::{CommandFactory, Parser, ValueEnum};
+use clap::{Parser, ValueEnum};
 use kbf_front::Cache;
 use kbf_usage::UsageMode;
 
@@ -61,136 +61,43 @@ fn the_flag_defaults_to_off_and_takes_off_record_and_on() {
     assert_eq!(modes, [UsageMode::Off, UsageMode::Record, UsageMode::On]);
 }
 
-/// Catches `record` or `on` accepted on the legacy core (default or explicit), which has
-/// nothing that records a run, and `off` refused on either core.
+/// Catches `record` or `on` accepted (with or without a state store, whatever the other
+/// flags say), a refusal text other than the one that says the js core was removed and where
+/// scheduling runs, a refusal that is not exit status 2, and `off` refused with or without a
+/// state store.
 #[test]
-fn usage_profiles_needs_scheduler_core_js() {
+fn record_and_on_are_refused_because_the_js_core_was_removed() {
     for mode in ["record", "on"] {
         let flag = format!("--usage-profiles={mode}");
-        let default: &[&str] = &[];
-        let explicit: &[&str] = &["--scheduler-core=legacy"];
-        for core in [default, explicit] {
-            let mut args = vec![STORE, flag.as_str()];
-            args.extend_from_slice(core);
-            let error = refused(&args);
+        let with_store = [STORE, flag.as_str()];
+        let without_store = [flag.as_str()];
+        let loaded = [
+            STORE,
+            flag.as_str(),
+            "--placement-load=on",
+            "--learned-sizes=shadow",
+            "--placement-predictions=on",
+        ];
+        for args in [&with_store[..], &without_store[..], &loaded[..]] {
+            let error = refused(args);
             assert!(
-                matches!(&error, UsageProfilesError::NeedsJsCore(m) if *m == mode),
-                "{mode} {core:?}: {error:?}"
+                matches!(&error, UsageProfilesError::JsCoreRemoved(m) if *m == mode),
+                "{mode} {args:?}: {error:?}"
             );
-            let said = error.to_string();
-            assert!(said.contains(&flag.replace('=', " ")), "{said}");
-            assert!(said.contains("--scheduler-core js"), "{said}");
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "--usage-profiles {mode} needs the js scheduler core, which was removed: \
+                     scheduling runs in the job service; leave the flag out or use \
+                     --usage-profiles off"
+                )
+            );
+            let refusal = checked(args).expect_err("refused");
+            assert_eq!(StartFailure::of(&refusal).status(), REFUSED);
         }
     }
-    for core in ["legacy", "js"] {
-        let core = format!("--scheduler-core={core}");
-        checked(&[core.as_str(), "--usage-profiles=off"]).expect("off is accepted");
-    }
-}
-
-/// Catches `record` or `on` accepted with no `--state-store`, where the profiles would be lost
-/// at every restart, and the js-core refusal coming after it for a legacy server.
-#[test]
-fn usage_profiles_needs_a_state_store() {
-    for mode in ["record", "on"] {
-        let flag = format!("--usage-profiles={mode}");
-        let error = refused(&["--scheduler-core=js", flag.as_str()]);
-        assert!(
-            matches!(&error, UsageProfilesError::NeedsStateStore(m) if *m == mode),
-            "{mode}: {error:?}"
-        );
-        let said = error.to_string();
-        assert!(said.contains(&flag.replace('=', " ")), "{said}");
-        assert!(said.contains("--state-store"), "{said}");
-    }
-    let both = refused(&["--usage-profiles=record"]);
-    assert!(matches!(both, UsageProfilesError::NeedsJsCore("record")));
-}
-
-/// Catches `on` accepted while the scheduler books by cores (it would read no curve), or
-/// without a prediction (a curve is read only for a predicted action), and a combination that
-/// leaves the estimator out of it: the js core takes predictions only over
-/// `--learned-sizes shadow`, so a farm that is not on it never reaches `on`.
-#[test]
-fn usage_profiles_on_needs_placement_load_on_and_predictions_on() {
-    let base = [
-        "--scheduler-core=js",
-        STORE,
-        "--usage-profiles=on",
-        "--learned-sizes=shadow",
-    ];
-    let with = |more: &[&'static str]| {
-        let mut args = base.to_vec();
-        args.extend_from_slice(more);
-        args
-    };
-    let no_load = refused(&with(&["--placement-predictions=on"]));
-    assert!(matches!(no_load, UsageProfilesError::OnNeedsPlacementLoad));
-    let said = no_load.to_string();
-    assert!(said.contains("--usage-profiles on"), "{said}");
-    assert!(said.contains("--placement-load on"), "{said}");
-    let off_load = refused(&with(&[
-        "--placement-load=off",
-        "--placement-predictions=on",
-    ]));
-    assert!(matches!(off_load, UsageProfilesError::OnNeedsPlacementLoad));
-
-    let no_predictions = refused(&with(&["--placement-load=on"]));
-    assert!(matches!(
-        no_predictions,
-        UsageProfilesError::OnNeedsPredictions
-    ));
-    let said = no_predictions.to_string();
-    assert!(said.contains("--placement-predictions on"), "{said}");
-    let shadow = refused(&with(&[
-        "--placement-load=on",
-        "--placement-predictions=shadow",
-    ]));
-    assert!(matches!(shadow, UsageProfilesError::OnNeedsPredictions));
-
-    let sound = with(&["--placement-load=on", "--placement-predictions=on"]);
-    checked(&sound).expect("js, a store, load and predictions");
-    let blind = [
-        "--scheduler-core=js",
-        STORE,
-        "--usage-profiles=on",
-        "--placement-load=on",
-        "--placement-predictions=on",
-    ];
-    let error = checked(&blind).expect_err("no estimator");
-    assert!(matches!(
-        error,
-        ConfigError::PredictionsNeedLearnedSizes("on")
-    ));
-    let sizes_on = [
-        "--scheduler-core=js",
-        STORE,
-        "--usage-profiles=on",
-        "--learned-sizes=on",
-        "--placement-load=on",
-        "--placement-predictions=on",
-    ];
-    let error = checked(&sizes_on).expect_err("sizes on under js");
-    assert!(matches!(error, ConfigError::LearnedSizesOnUnderJs));
-}
-
-/// Catches `record` asking for more than the js core and a store (it learns and stores, and
-/// reads no curve, so placement and prediction flags are none of its business), and a refusal
-/// that is not exit status 2.
-#[test]
-fn record_needs_nothing_more_than_js_and_a_store() {
-    let flags = ["--scheduler-core=js", STORE, "--usage-profiles=record"];
-    checked(&flags).expect("record over js and a store");
-    let mut loaded = flags.to_vec();
-    loaded.push("--placement-load=on");
-    checked(&loaded).expect("record with placement by load");
-    let mut predicted = flags.to_vec();
-    predicted.extend(["--learned-sizes=shadow", "--placement-predictions=shadow"]);
-    checked(&predicted).expect("record with shadow predictions");
-    let error = checked(&["--usage-profiles=record"]).expect_err("legacy");
-    assert_eq!(StartFailure::of(&error).status(), REFUSED);
-    let error = checked(&["--scheduler-core=js", "--usage-profiles=on"]).expect_err("no store");
-    assert_eq!(StartFailure::of(&error).status(), REFUSED);
+    checked(&["--usage-profiles=off"]).expect("off without a store");
+    checked(&[STORE, "--usage-profiles=off"]).expect("off with a store");
 }
 
 /// The farm a server builds from `flags`, as `serve` and `frontend` both build it.
@@ -252,25 +159,4 @@ fn metrics_mode_gauge_is_one_for_the_running_mode() {
         crate::metrics::render_farm(&mut out, &farm(flags));
         assert!(out.contains(&expected), "{flags:?}: {out}");
     }
-}
-
-/// Catches the flag's help naming a staleness bound other than the one the curves use: the
-/// help says how long a key may go unrun before it is charged flat, and that number is
-/// `js_usage::STALE_DAYS`, read from the clap command so the two cannot drift.
-#[test]
-fn the_help_names_the_staleness_bound_the_curves_use() {
-    let command = Args::command();
-    let argument = command
-        .get_arguments()
-        .find(|argument| argument.get_id() == "usage_profiles")
-        .expect("the flag exists");
-    let help = argument
-        .get_long_help()
-        .or_else(|| argument.get_help())
-        .expect("the flag has help")
-        .to_string();
-    assert!(
-        help.contains(&format!("over {} days", js_usage::STALE_DAYS)),
-        "{help}"
-    );
 }

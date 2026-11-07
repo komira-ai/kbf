@@ -56,18 +56,6 @@ pub(super) fn read(store: &dyn Store, worker: &WorkerId) -> Result<Owner, StoreE
     }))
 }
 
-/// [`read`] for a farm that may have no store, which logs a store that cannot be read and
-/// takes the owner for the operator's.
-pub(super) fn shown(store: Option<&dyn Store>, worker: &WorkerId) -> Owner {
-    let Some(store) = store else {
-        return Owner::Operator;
-    };
-    read(store, worker).unwrap_or_else(|error| {
-        tracing::warn!(%worker, %error, "the cordon owner could not be read: the operator's");
-        Owner::Operator
-    })
-}
-
 /// `detail` with the owner of its cordon, `read` when the node is out of placement.
 pub(super) fn with_owner(mut detail: NodeDetail, read: impl FnOnce() -> Owner) -> NodeDetail {
     if detail.node.placement != PlacementView::Serving {

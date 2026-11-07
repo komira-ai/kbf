@@ -334,8 +334,7 @@ fn the_admission_working_set_drops_active_file_beyond_a_quarter_of_memory() {
 
 // The farm's wiring.
 
-/// A farm on the core under test: the farm's own, and the js core in a build with
-/// `farm-core-js`.
+/// A farm over an in-memory cache.
 fn farm() -> Farm {
     Farm::new(
         Arc::new(kbf_front::Cache::memory()),

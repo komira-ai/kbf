@@ -2,6 +2,13 @@
 
 Status: DESIGN, for review. Nothing here is built. Issue: komira-ai/kbf#169. Revised to the whole-node ruling: reserve the host with the least tail. Amended: the lease server's live reservation engine is `js-registry`, not `js-sched` (2.4); where the rule is placed is decided: Path S, approved 2026-11-01 (3.2).
 
+**Since this was written, the js scheduler core was removed.** `--scheduler-core js` is refused at
+start (exit status 2), the `crates/kbf-server/src/farm_js` and `src/farm/js` modules and the
+`js-server-core`, `js-store` and `kbf-lease-client` crates no longer exist, and `legacy` is the
+only core: scheduling runs in the job service. The text below is kept as the record of the
+analysis; every statement about the js core, the embedded core or `--scheduler-core js` describes
+the code as it was then, and `path:line` references into those modules are to the code as it was.
+
 Each claim is marked **[code]** (read from the named file and function, at the kbf
 `main` and at the jobscheduler commit pinned below), **[doc]** (stated by a comment or
 document, not checked against behaviour), **[proposed]**, or **[verify]** (believed, not

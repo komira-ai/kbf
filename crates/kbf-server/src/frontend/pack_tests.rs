@@ -523,17 +523,12 @@ async fn a_frontend_exports_its_failed_actions_by_class() {
     served.abort();
 }
 
-/// Asserts that a frontend writes `kbf_scheduler_core` on `GET /metrics` for the core its
-/// farm runs: 1 for it and 0 for the other, the page the flip gate reads. The core is the one
-/// `--scheduler-core` names (legacy when it is not given), whatever core the build's tests
-/// default to.
+/// Asserts that a frontend writes `kbf_scheduler_core` on `GET /metrics`: the one series,
+/// `legacy` at 1, whether `--scheduler-core legacy` is given or left out, and no series for
+/// the js core.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_frontend_exports_the_scheduler_core_it_runs() {
-    for (given, running, other) in [
-        (None, "legacy", "js"),
-        (Some("--scheduler-core=legacy"), "legacy", "js"),
-        (Some("--scheduler-core=js"), "js", "legacy"),
-    ] {
+    for given in [None, Some("--scheduler-core=legacy")] {
         let more: Vec<String> = given.into_iter().map(str::to_owned).collect();
         let flags = flags_of(&more);
         let handle = started(&flags, Some(index())).expect("starts");
@@ -541,10 +536,9 @@ async fn a_frontend_exports_the_scheduler_core_it_runs() {
         let served = tokio::spawn(handle.serve());
         let text = scrape(api).await;
         assert!(text.contains("# TYPE kbf_scheduler_core gauge\n"), "{text}");
-        let on = format!("kbf_scheduler_core{{core=\"{running}\"}} 1\n");
-        let off = format!("kbf_scheduler_core{{core=\"{other}\"}} 0\n");
-        assert!(text.contains(&on), "{given:?}: {on}{text}");
-        assert!(text.contains(&off), "{given:?}: {off}{text}");
+        let on = "kbf_scheduler_core{core=\"legacy\"} 1\n";
+        assert!(text.contains(on), "{given:?}: {on}{text}");
+        assert!(!text.contains("core=\"js\""), "{given:?}: {text}");
         served.abort();
     }
 }

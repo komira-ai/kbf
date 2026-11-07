@@ -375,7 +375,7 @@ pub struct RunRecord {
     pub booked_millicpus: Option<u64>,
     /// The scheduler's operation the attempt belonged to: every attempt of one operation
     /// (a ladder of memory bookings) carries the same one, so they can be regrouped.
-    /// Unique over one state store: every frontend of the store, on either scheduler core,
+    /// Unique over one state store: every frontend of the store
     /// numbers operations from blocks it reserves with a compare-and-set on the store's
     /// shared counter (`meta/next_op`), so ids do not repeat across frontends or restarts.
     /// A server with no state store numbers from its own counter, which starts again at a

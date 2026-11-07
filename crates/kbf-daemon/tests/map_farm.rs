@@ -69,7 +69,6 @@ async fn farm(name: &str, source: Arc<dyn MapSource>) -> Arc<MapHolder> {
         vm_host_floor: kbf_server::HostFloor::default(),
         learned_sizes: kbf_server::LearnedSizes::Off,
         exclusive_actions: false,
-        scheduler_core: kbf_server::SchedulerCore::under_test(),
         placement_load: kbf_server::PlacementLoad::Off,
         placement_predictions: kbf_server::PlacementPredictions::Off,
         usage_profiles: kbf_server::UsageProfiles::Off,
