@@ -26,6 +26,9 @@ publish.workspace = true
 # through kbf-state's own backup, check, lock and restore; time stamps the kept file.
 # `job-service check` calls ListJobs with kbf-job-client, the client the executor uses (its
 # messages are js-proto's, its status codes tonic's), on a current-thread tokio runtime.
+# `job-service plan`, `apply` and `back-out` read and rewrite the frontend's `kbf.toml` with
+# toml (the edit is checked by parsing it), read kbf-host-install's answer with serde_json, and
+# submit the canary job with kbf-job-client.
 
 [[bin]]
 name = "kbf-deploy"

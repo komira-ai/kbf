@@ -84,7 +84,7 @@
 //! - the job service client (`kbf-job-client`, in `job_client_layer`) reaching a scheduler crate
 //!   other than `js-proto`, or a kbf crate, or being depended on by any crate of this workspace
 //!   but `kbf-server` (normally and for its fake), the deploy tool (`kbf-deploy`, for
-//!   `job-service check`) and the integration tests (a dev-dependency, for the real-service
+//!   `job-service check` and the canary job of `job-service apply`) and the integration tests (a dev-dependency, for the real-service
 //!   tests), and a file of the host executor naming `kbf_lease_client`.
 //! - the manifest holding a package of the job scheduler's server (`js-server-core`, `js-store`),
 //!   reached by any workspace crate through a normal, dev or build edge, or a package named
