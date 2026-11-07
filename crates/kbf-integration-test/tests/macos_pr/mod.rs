@@ -1,55 +1,41 @@
-//! macOS on a pull request (AGENTS.md, section 3, B9 of this repository): exactly when a pull
-//! request takes a macOS runner, and what such a job may hold. [`problems`] reads the workflow
-//! files, the pattern file `tools/ci/macos-pr-paths.txt` and the files git lists, and reports
-//! each way they differ from these rules:
+//! macOS on a pull request (AGENTS.md, section 3, B9 of this repository): which jobs a pull
+//! request runs on a macOS runner, and what such a job may hold. [`problems`] reads the workflow
+//! files and reports each way they differ from these rules:
 //!
 //! - **The expected list.** Every job a pull request can run on a macOS runner is one of
-//!   [`PR_MACOS_JOBS`], behind its gate ([`Gate`]): macos-pr.yml's two jobs behind its paths
-//!   check (`if:` exactly [`MACOS_IF`]), artifacts.yml's darwin build behind exactly its label
-//!   condition ([`LABEL_IF`]), and the jobs of the three workflows that have their own
-//!   `pull_request.paths` (none of them `*` or `**`). A macOS job (any case of `macos-`) of a
-//!   workflow that runs on `pull_request` is a pull request's unless its `if:` is exactly
-//!   [`NOT_ON_A_PULL_REQUEST`] (ci.yml's `task-macos`, which runs after the merge); a job of such
-//!   a workflow that calls a local workflow with a macOS job is refused, as the lint cannot gate
-//!   the call. A listed job that is gone, or not on a Mac, is stale.
+//!   [`PR_MACOS_JOBS`], with its gate ([`Gate`]): macos-pr.yml's two jobs with none at all (no
+//!   `if:`, so they run, and report, on every pull request), artifacts.yml's darwin build behind
+//!   exactly its label condition ([`LABEL_IF`]), and the jobs of the three workflows that have
+//!   their own `pull_request.paths` (none of them `*` or `**`). A macOS job (any case of
+//!   `macos-`) of a workflow that runs on `pull_request` is a pull request's unless its `if:` is
+//!   exactly [`NOT_ON_A_PULL_REQUEST`] (ci.yml's `task-macos`, which runs after the merge); a job
+//!   of such a workflow that calls a local workflow with a macOS job is refused, as the lint cannot
+//!   read the call's gate. A listed job that is gone, or not on a Mac, is stale.
 //! - **No secret, no OIDC, no write.** A pull request's macOS job names no `secrets` context in
 //!   any form (`secrets.X`, `secrets['X']`, `toJSON(secrets)`: the word `secrets` as an
 //!   identifier, [`names_secrets`]) and has no `secrets:` key, nor does its workflow's top-level
 //!   `env:`; it has no `environment`; every token scope it names is `read` or `none`, and
 //!   `id-token` is `none`.
-//! - **macos-pr.yml's shape.** It runs on `pull_request` and `merge_group`, each with no filter (a
-//!   filter on a trigger would leave its `macos` check unreported, so a required check would wait
-//!   for ever); its concurrency group is the pull request's number (a queue entry's own ref), and
-//!   cancels the run in progress on a pull request only ([`GROUP`], [`CANCEL`]); its jobs are [`MACOS_PR_JOBS`]; `changes` runs on Linux under no condition, its
-//!   last step is [`PR_PATHS`] with the id `paths`, and it outputs `macos` from that step; the
-//!   two macOS jobs need `changes` alone and run under [`MACOS_IF`]; `macos` runs on Linux,
-//!   needs the other three under `!cancelled()`, and has one conditional step, `run: "false"`
-//!   under [`GATE_FAIL_IF`]; no job or step is `continue-on-error`.
+//! - **macos-pr.yml's shape.** It runs on `pull_request` and `merge_group`, each with no filter
+//!   (a filtered-out run leaves its checks unreported, so a required check would wait for ever);
+//!   its concurrency group is the pull request's number (a queue entry's own ref), and cancels the
+//!   run in progress on a pull request only ([`GROUP`], [`CANCEL`]); its jobs are [`MACOS_JOBS`],
+//!   each on `macos-15`, with no `needs`, and no job or step is `continue-on-error`.
 //! - **The after-merge steps, all of them.** Every step of the after-merge Mac jobs
 //!   [`AFTER_MERGE`] (beta.yml's `native-macos`, ci.yml's `task-macos`) but their cache steps
 //!   is, field for field, a step of `macos-test` or `macos-device`, and the job `env:` of each
 //!   is in `macos-device`'s. A step added to `native-macos` is added here too, or this fails.
-//! - **The pattern file covers what the jobs test.** It parses (`xtask::pr_paths::parse`) and
-//!   every pattern matches a file git lists. It matches every file of each crate a macOS job of
-//!   macos-pr.yml or of [`AFTER_MERGE`] tests or builds whole (`-p <crate>` without `--lib`,
-//!   `--bin` or `--test`), the files of each test target such a job names alone
-//!   (`--test <name>`: `crates/<crate>/tests/<name>.rs` or `tests/<name>/`), some file of every
-//!   other crate it names, every workflow with a macOS job, and [`ALWAYS`].
 //! - **The Linux check of the same crates.** Every crate `macos-test` tests whole is named in a
 //!   `cargo check --target aarch64-apple-darwin --tests` step of ci.yml's `lint` job, so a
-//!   macOS compile error in one is red on every pull request, whether it runs a Mac or not.
+//!   macOS compile error in one is also named by a Linux job.
 //!
-//! What it does not check: that the patterns name the whole Mac surface (a Mac crate that no
-//! job tests yet is added to the file by hand), and that a test passes on a Mac (the jobs do).
+//! What it does not check: that a test passes on a Mac (the jobs do), or that the crates
+//! `macos-test` tests are all of the Mac code (a new Mac crate is added to the job by hand).
 
 use super::workflows;
-use xtask::pr_paths::{self, Pattern};
 
 #[cfg(test)]
 mod tests;
-
-/// The pattern file, relative to the root.
-pub const PATTERNS: &str = "tools/ci/macos-pr-paths.txt";
 
 /// The directory of the workflow files.
 const WORKFLOW_DIR: &str = ".github/workflows/";
@@ -57,36 +43,27 @@ const WORKFLOW_DIR: &str = ".github/workflows/";
 /// The workflow of the pull request's macOS jobs, in [`WORKFLOW_DIR`].
 pub const MACOS_PR: &str = "macos-pr.yml";
 
-/// Its jobs, in file order.
-const MACOS_PR_JOBS: [&str; 4] = ["changes", "macos-test", "macos-device", "macos"];
-
-/// The two macOS jobs of [`MACOS_PR`].
+/// Its jobs, in file order: both on a Mac.
 const MACOS_JOBS: [&str; 2] = ["macos-test", "macos-device"];
 
-/// The `if:` of [`MACOS_JOBS`]: the paths check said the macOS surface changed.
-pub const MACOS_IF: &str = "${{ needs.changes.outputs.macos == 'true' }}";
+/// The runner of [`MACOS_JOBS`].
+const RUNNER: &str = "macos-15";
 
 /// The `if:` of a macOS job of a pull-request workflow that runs only after the merge.
 pub const NOT_ON_A_PULL_REQUEST: &str = "${{ github.event_name != 'pull_request' }}";
 
-/// The last step of `changes`.
-pub const PR_PATHS: &str = "cargo xtask pr-paths --base HEAD^1 --patterns tools/ci/macos-pr-paths.txt --key macos --output \"$GITHUB_OUTPUT\"";
-
-/// The concurrency of [`MACOS_PR`]: one run per pull request, a newer push cancels the older.
+/// The concurrency group of [`MACOS_PR`]: one run per pull request (a merge queue entry's ref).
 pub const GROUP: &str = "macos-pr-${{ github.event.pull_request.number || github.ref }}";
 
 /// The `cancel-in-progress` of [`MACOS_PR`]: a newer push to a pull request cancels its run; a
 /// merge queue entry's run is never cancelled.
 pub const CANCEL: &str = "${{ github.event_name == 'pull_request' }}";
 
-/// The `if:` of the `macos` job's failing step.
-pub const GATE_FAIL_IF: &str = "${{ needs.changes.result != 'success' || (needs.changes.outputs.macos == 'true' && (needs.macos-test.result != 'success' || needs.macos-device.result != 'success')) }}";
-
 /// What lets a pull request's macOS job run, and not on every pull request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Gate {
-    /// The job's `if:` is exactly [`MACOS_IF`].
-    PathsCheck,
+    /// None: the job has no `if:`, and runs on every pull request.
+    Always,
     /// The job's `if:` asks for the label `needs-artifacts`.
     Label,
     /// The workflow's `pull_request` trigger has a `paths` filter.
@@ -99,19 +76,12 @@ pub const PR_MACOS_JOBS: [(&str, &str, Gate); 6] = [
     ("host-install-mac.yml", "real-mac", Gate::TriggerPaths),
     ("mac-provision.yml", "darwin-arm64", Gate::TriggerPaths),
     ("vmm-probe.yml", "darwin-arm64", Gate::TriggerPaths),
-    (MACOS_PR, "macos-test", Gate::PathsCheck),
-    (MACOS_PR, "macos-device", Gate::PathsCheck),
+    (MACOS_PR, "macos-test", Gate::Always),
+    (MACOS_PR, "macos-device", Gate::Always),
 ];
 
 /// The Mac jobs that run after the merge, whose every step a pull request's macOS job runs.
 pub const AFTER_MERGE: [(&str, &str); 2] = [("beta.yml", "native-macos"), ("ci.yml", "task-macos")];
-
-/// The files the pattern file must match whatever the jobs test: the check itself.
-pub const ALWAYS: [&str; 3] = [
-    ".github/workflows/macos-pr.yml",
-    PATTERNS,
-    "crates/xtask/src/pr_paths.rs",
-];
 
 /// The `if:` of artifacts.yml's darwin build: on a pull request, only with the label
 /// `needs-artifacts` (`release_artifacts` holds the build jobs' label rule).
@@ -156,9 +126,9 @@ fn macos_jobs(text: &str) -> Result<Vec<String>, String> {
         .collect())
 }
 
-/// Every way the workflows (`(file name in .github/workflows, text)`), the pattern file's
-/// text and the files git lists differ from the rules of this module, one sentence each.
-pub fn problems(workflows: &[(String, String)], patterns: &str, listed: &[String]) -> Vec<String> {
+/// Every way the workflows (`(file name in .github/workflows, text)`) differ from the rules of
+/// this module, one sentence each.
+pub fn problems(workflows: &[(String, String)]) -> Vec<String> {
     let mut out = Vec::new();
     // A file a check cannot read is a problem of its own, and the other checks still run.
     let unread = [
@@ -166,7 +136,6 @@ pub fn problems(workflows: &[(String, String)], patterns: &str, listed: &[String
         no_secrets(workflows, &mut out),
         shape(workflows, &mut out),
         after_merge(workflows, &mut out),
-        coverage(workflows, patterns, listed, &mut out),
         cross_check(workflows, &mut out),
     ];
     out.extend(unread.into_iter().filter_map(Result::err));
@@ -208,7 +177,7 @@ fn expected_list(workflows: &[(String, String)], out: &mut Vec<String>) -> Resul
             if !PR_MACOS_JOBS.iter().any(|(w, j, _)| w == name && *j == job) {
                 out.push(format!(
                     "{name}#{job} runs on a Mac for a pull request and is not one of the pull request's \
-                     macOS jobs (PR_MACOS_JOBS): gate it on the paths check in {MACOS_PR}, or give it \
+                     macOS jobs (PR_MACOS_JOBS): run it in {MACOS_PR}, or give it \
                      `if: {NOT_ON_A_PULL_REQUEST}`"
                 ));
             }
@@ -230,7 +199,7 @@ fn expected_list(workflows: &[(String, String)], out: &mut Vec<String>) -> Resul
         }
         let condition = workflows::job_condition(text, job)?.unwrap_or_default();
         let gated = match gate {
-            Gate::PathsCheck => condition == MACOS_IF,
+            Gate::Always => condition.is_empty(),
             Gate::Label => condition == LABEL_IF,
             Gate::TriggerPaths => workflows::trigger_filters(text, "pull_request").is_ok_and(|f| {
                 f.iter().any(|(k, v)| {
@@ -239,9 +208,15 @@ fn expected_list(workflows: &[(String, String)], out: &mut Vec<String>) -> Resul
             }),
         };
         if !gated {
-            out.push(format!(
-                "{name}#{job} would run on a Mac for every pull request: its gate ({gate:?}) is gone"
-            ));
+            out.push(match gate {
+                Gate::Always => format!(
+                    "{name}#{job} has `if: {condition}`; it runs on every pull request, and a job its \
+                     condition skips reports success without having run on a Mac"
+                ),
+                _ => format!(
+                    "{name}#{job} would run on a Mac for every pull request: its gate ({gate:?}) is gone"
+                ),
+            });
         }
     }
     Ok(())
@@ -320,7 +295,7 @@ fn shape(workflows: &[(String, String)], out: &mut Vec<String>) -> Result<(), St
             && !filters.is_empty()
         {
             say(format!(
-                "filters its `{trigger}` trigger ({filters:?}): a run that never starts leaves the `macos` check unreported"
+                "filters its `{trigger}` trigger ({filters:?}): a run that never starts leaves its checks unreported"
             ));
         }
     }
@@ -331,11 +306,11 @@ fn shape(workflows: &[(String, String)], out: &mut Vec<String>) -> Result<(), St
         ));
     }
     let jobs = workflows::job_names(text)?;
-    if jobs != MACOS_PR_JOBS {
-        say(format!("its jobs are {jobs:?}, not {MACOS_PR_JOBS:?}"));
+    if jobs != MACOS_JOBS {
+        say(format!("its jobs are {jobs:?}, not {MACOS_JOBS:?}"));
         return Ok(());
     }
-    for job in &jobs {
+    for job in MACOS_JOBS {
         let strings = workflows::job_strings(text, job)?;
         if strings
             .iter()
@@ -345,62 +320,16 @@ fn shape(workflows: &[(String, String)], out: &mut Vec<String>) -> Result<(), St
                 "`{job}` has a `continue-on-error`, which lets it pass on a failure"
             ));
         }
-    }
-    for job in ["changes", "macos"] {
-        if is_macos(&workflows::job_runs_on(text, job)?) {
-            say(format!("`{job}` runs on a Mac; it runs on Linux"));
+        let runner = workflows::job_runs_on(text, job)?;
+        if runner != RUNNER {
+            say(format!("`{job}` runs on `{runner}`, not `{RUNNER}`"));
         }
-    }
-    if let Some(c) = workflows::job_condition(text, "changes")? {
-        say(format!("`changes` has `if: {c}`; it always runs"));
-    }
-    let steps = workflows::job_steps(text, "changes")?;
-    let last = steps.last();
-    if last.and_then(|s| s.run.as_deref()) != Some(PR_PATHS)
-        || last.and_then(|s| s.id.as_deref()) != Some("paths")
-        || last.is_some_and(|s| s.conditional)
-    {
-        say(format!(
-            "the last step of `changes` is not `{PR_PATHS}` with the id `paths`"
-        ));
-    }
-    let outputs = workflows::job_outputs(text, "changes")?;
-    let wanted = vec![(
-        "macos".to_owned(),
-        "${{ steps.paths.outputs.macos }}".to_owned(),
-    )];
-    if outputs != wanted {
-        say(format!("`changes` outputs {outputs:?}, not {wanted:?}"));
-    }
-    for job in MACOS_JOBS {
-        if workflows::job_needs(text, job)? != ["changes"] {
-            say(format!("`{job}` does not need `changes` alone"));
+        let needs = workflows::job_needs(text, job)?;
+        if !needs.is_empty() {
+            say(format!(
+                "`{job}` needs {needs:?}: a failed or skipped need skips it, and a skipped required check passes"
+            ));
         }
-        let c = workflows::job_condition(text, job)?;
-        if c.as_deref() != Some(MACOS_IF) {
-            say(format!("`{job}` runs under {c:?}, not `{MACOS_IF}`"));
-        }
-    }
-    if workflows::job_needs(text, "macos")? != ["changes", "macos-test", "macos-device"] {
-        say("`macos` does not need `changes`, `macos-test` and `macos-device`".to_owned());
-    }
-    let c = workflows::job_condition(text, "macos")?;
-    if c.as_deref() != Some("${{ !cancelled() }}") {
-        say(format!(
-            "`macos` runs under {c:?}, not `${{{{ !cancelled() }}}}`: a skipped macOS job would skip it"
-        ));
-    }
-    let gate: Vec<_> = workflows::job_steps(text, "macos")?
-        .into_iter()
-        .filter(|s| s.conditional)
-        .collect();
-    let fails = gate.len() == 1
-        && gate[0].condition.as_deref() == Some(GATE_FAIL_IF)
-        && gate[0].run.as_deref() == Some("false");
-    if !fails {
-        say(format!(
-            "`macos` does not have exactly one conditional step, `run: \"false\"` under `{GATE_FAIL_IF}`"
-        ));
     }
     Ok(())
 }
@@ -453,13 +382,12 @@ fn after_merge(workflows: &[(String, String)], out: &mut Vec<String>) -> Result<
     Ok(())
 }
 
-/// What one cargo line selects: its packages, whether it takes them whole, and the test
-/// targets it names.
+/// What one cargo line selects: its packages, and whether it takes them whole (no `--lib`,
+/// `--bin` or `--test`).
 #[derive(Debug, PartialEq, Eq)]
 pub struct Selection {
     pub packages: Vec<String>,
     pub whole: bool,
-    pub tests: Vec<String>,
 }
 
 /// The selection of a `cargo test`, `cargo build`, `cargo check` or `cargo xtask sudo-test`
@@ -474,17 +402,12 @@ pub fn selection(run: &str) -> Option<Selection> {
     let mut s = Selection {
         packages: Vec::new(),
         whole: true,
-        tests: Vec::new(),
     };
     let mut words = rest.iter().take_while(|w| **w != "--");
     while let Some(w) = words.next() {
         match *w {
             "-p" | "--package" => s.packages.extend(words.next().map(|p| (*p).to_owned())),
-            "--test" => {
-                s.whole = false;
-                s.tests.extend(words.next().map(|t| (*t).to_owned()));
-            }
-            "--bin" => {
+            "--test" | "--bin" => {
                 s.whole = false;
                 words.next();
             }
@@ -501,102 +424,6 @@ fn selections(text: &str, job: &str) -> Result<Vec<Selection>, String> {
         .iter()
         .filter_map(|s| s.run.as_deref().and_then(selection))
         .collect())
-}
-
-/// The pattern file covers what the jobs test.
-fn coverage(
-    workflows: &[(String, String)],
-    patterns: &str,
-    listed: &[String],
-    out: &mut Vec<String>,
-) -> Result<(), String> {
-    let patterns: Vec<Pattern> = match pr_paths::parse(patterns) {
-        Ok(p) => p,
-        Err(problems) => {
-            out.extend(problems.into_iter().map(|p| format!("{PATTERNS}: {p}")));
-            return Ok(());
-        }
-    };
-    for p in &patterns {
-        if !listed.iter().any(|f| p.matches(f)) {
-            out.push(format!(
-                "{PATTERNS}: `{}` matches no file git lists",
-                p.spelling()
-            ));
-        }
-    }
-    let covered = |path: &str| patterns.iter().any(|p| p.matches(path));
-    for file in ALWAYS {
-        if !covered(file) {
-            out.push(format!(
-                "{PATTERNS} does not match {file}, which the check itself is"
-            ));
-        }
-    }
-    let mut jobs: Vec<(&str, &str)> = AFTER_MERGE.to_vec();
-    jobs.extend(MACOS_JOBS.iter().map(|j| (MACOS_PR, *j)));
-    let mut whole: Vec<String> = Vec::new();
-    let mut named: Vec<(String, Vec<String>)> = Vec::new();
-    for (name, job) in jobs {
-        let Some(text) = text(workflows, name) else {
-            continue;
-        };
-        for s in selections(text, job)? {
-            for p in s.packages {
-                if s.whole {
-                    whole.push(p.clone());
-                }
-                named.push((p, s.tests.clone()));
-            }
-        }
-    }
-    for (package, tests) in &named {
-        let dir = format!("crates/{package}/");
-        let files: Vec<&String> = listed.iter().filter(|f| f.starts_with(&dir)).collect();
-        if files.is_empty() {
-            out.push(format!(
-                "a macOS job names `-p {package}`, and git lists nothing under {dir}"
-            ));
-            continue;
-        }
-        if whole.contains(package) {
-            if let Some(missed) = files.iter().find(|f| !covered(f)) {
-                out.push(format!(
-                    "{PATTERNS} does not match {missed}, of {package}, which a macOS job tests whole: add `{dir}**`"
-                ));
-            }
-            continue;
-        }
-        if !files.iter().any(|f| covered(f)) {
-            out.push(format!(
-                "{PATTERNS} matches no file of {package}, which a macOS job builds or tests"
-            ));
-        }
-        for test in tests {
-            let target = format!("{dir}tests/{test}");
-            let of_it: Vec<&&String> = files
-                .iter()
-                .filter(|f| **f == &format!("{target}.rs") || f.starts_with(&format!("{target}/")))
-                .collect();
-            if of_it.is_empty() {
-                out.push(format!(
-                    "a macOS job runs `--test {test}` of {package}, and git lists no {target}.rs"
-                ));
-            } else if let Some(missed) = of_it.iter().find(|f| !covered(f)) {
-                out.push(format!(
-                    "{PATTERNS} does not match {missed}, the test target `{test}` a macOS job runs"
-                ));
-            }
-        }
-    }
-    for (name, text) in workflows {
-        if !macos_jobs(text)?.is_empty() && !covered(&format!("{WORKFLOW_DIR}{name}")) {
-            out.push(format!(
-                "{PATTERNS} does not match {WORKFLOW_DIR}{name}, which has a macOS job"
-            ));
-        }
-    }
-    Ok(())
 }
 
 /// Every crate `macos-test` tests whole is in a darwin `--tests` check of ci.yml's `lint` job.
@@ -627,12 +454,11 @@ fn cross_check(workflows: &[(String, String)], out: &mut Vec<String>) -> Result<
     Ok(())
 }
 
-/// The repository's workflows (`(file name, text)`), its pattern file and the files git lists.
+/// The repository's workflows, `(file name, text)`.
 #[cfg(test)]
-fn real_files() -> (Vec<(String, String)>, String, Vec<String>) {
+fn real_files() -> Vec<(String, String)> {
     let root = super::repo_root();
-    let listed = super::listed_files(&root);
-    let workflows: Vec<(String, String)> = listed
+    let workflows: Vec<(String, String)> = super::listed_files(&root)
         .iter()
         .filter(|f| super::is_workflow(f))
         .filter_map(|f| {
@@ -645,18 +471,13 @@ fn real_files() -> (Vec<(String, String)>, String, Vec<String>) {
         "the workflows were not found; the lint would check nothing: {:?}",
         workflows.iter().map(|(n, _)| n).collect::<Vec<_>>()
     );
-    let patterns = std::fs::read_to_string(root.join(PATTERNS)).expect(PATTERNS);
-    (workflows, patterns, listed)
+    workflows
 }
 
 #[test]
-fn macos_runs_on_a_pull_request_exactly_when_the_rules_say() {
-    // Catches, on the real files: a pull request's macOS job outside the list or ungated, one that
-    // holds a secret or a write scope, macos-pr.yml drifting from its shape, a step of native-macos
-    // that no pull request runs, and a crate a macOS job tests that the paths file misses.
-    let (workflows, patterns, listed) = real_files();
-    assert_eq!(
-        problems(&workflows, &patterns, &listed),
-        Vec::<String>::new()
-    );
+fn macos_runs_on_every_pull_request_and_holds_no_secret() {
+    // Catches, on the real files: a pull request's macOS job outside the list or skippable, one
+    // that holds a secret or a write scope, macos-pr.yml drifting from its shape, a step of
+    // native-macos that no pull request runs, and a crate it tests that the Linux check misses.
+    assert_eq!(problems(&real_files()), Vec::<String>::new());
 }

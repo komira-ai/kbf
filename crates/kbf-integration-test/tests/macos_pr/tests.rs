@@ -2,23 +2,19 @@
 
 use super::*;
 
-/// The problems of the real files with the first `from` in `file` (a workflow's file name, or
-/// [`PATTERNS`]) replaced by `to`. The change must alter the text.
+/// The problems of the real workflows with the first `from` in the workflow `file` replaced by
+/// `to`. The change must alter the text.
 fn changed_to(file: &str, from: &str, to: &str) -> Vec<String> {
-    let (mut workflows, mut patterns, listed) = real_files();
-    let text = if file == PATTERNS {
-        &mut patterns
-    } else {
-        &mut workflows
-            .iter_mut()
-            .find(|(n, _)| n == file)
-            .unwrap_or_else(|| panic!("no {file}"))
-            .1
-    };
+    let mut workflows = real_files();
+    let text = &mut workflows
+        .iter_mut()
+        .find(|(n, _)| n == file)
+        .unwrap_or_else(|| panic!("no {file}"))
+        .1;
     let changed = text.replacen(from, to, 1);
     assert_ne!(&changed, text, "{file}: `{from}` is not in the file");
     *text = changed;
-    problems(&workflows, &patterns, &listed)
+    problems(&workflows)
 }
 
 /// `found` holds exactly `want` among its lines.
@@ -43,13 +39,12 @@ const TASK_MACOS_IF: &str =
 #[test]
 fn a_macos_job_a_pull_request_runs_outside_the_list_is_refused() {
     // Catches: ci.yml's `task-macos` back on every pull request (its after-merge `if:` dropped),
-    // and a macOS job added to a pull-request workflow that is not on the list, neither of which
-    // the paths check gates.
+    // and a macOS job added to a pull-request workflow that is not on the list.
     let found = changed_to("ci.yml", TASK_MACOS_IF, "    runs-on: macos-latest");
     has(
         &found,
         "ci.yml#task-macos runs on a Mac for a pull request and is not one of the pull request's \
-         macOS jobs (PR_MACOS_JOBS): gate it on the paths check in macos-pr.yml, or give it \
+         macOS jobs (PR_MACOS_JOBS): run it in macos-pr.yml, or give it \
          `if: ${{ github.event_name != 'pull_request' }}`",
     );
     let found = changed_to(
@@ -119,18 +114,23 @@ fn the_secrets_context_is_found_in_every_spelling_and_nothing_else() {
 
 #[test]
 fn a_listed_job_that_lost_its_gate_is_refused() {
-    // Catches: each listed job made to run on every pull request: macos-pr.yml's jobs without the
-    // paths check, artifacts.yml's darwin build without its label, and a workflow's own
-    // `pull_request.paths` dropped.
-    let found = changed_to(
-        MACOS_PR,
-        "  macos-test:\n    needs: changes\n    if: ${{ needs.changes.outputs.macos == 'true' }}",
-        "  macos-test:\n    needs: changes\n    if: ${{ always() }}",
-    );
-    has(
-        &found,
-        "macos-pr.yml#macos-test would run on a Mac for every pull request: its gate (PathsCheck) is gone",
-    );
+    // Catches: macos-pr.yml's jobs given a condition (a job it skips reports success, so a
+    // required check would pass without a Mac), artifacts.yml's darwin build without its label,
+    // and a workflow's own `pull_request.paths` dropped.
+    for job in ["macos-test", "macos-device"] {
+        let found = changed_to(
+            MACOS_PR,
+            &format!("  {job}:\n"),
+            &format!("  {job}:\n    if: ${{{{ github.actor != 'x' }}}}\n"),
+        );
+        has(
+            &found,
+            &format!(
+                "macos-pr.yml#{job} has `if: ${{{{ github.actor != 'x' }}}}`; it runs on every pull request, \
+                 and a job its condition skips reports success without having run on a Mac"
+            ),
+        );
+    }
     let found = changed_to(
         "artifacts.yml",
         "    if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'needs-artifacts')) && inputs.stage != 'sign' }}\n    runs-on: macos-15",
@@ -309,7 +309,7 @@ fn a_pull_request_macos_job_with_an_environment_oidc_or_a_write_scope_is_refused
 #[test]
 fn the_workflow_runs_on_every_pull_request_and_queue_entry_and_nothing_else() {
     // Catches: a push trigger (the after-merge Mac jobs are beta.yml's), and a filter on the
-    // trigger, which leaves the `macos` check unreported on a pull request it filters out.
+    // trigger, which leaves the macOS checks unreported on a pull request it filters out.
     let found = changed_to(
         MACOS_PR,
         "  merge_group:\n",
@@ -325,7 +325,7 @@ fn the_workflow_runs_on_every_pull_request_and_queue_entry_and_nothing_else() {
         "on:\n  pull_request:\n    paths: ['crates/**']\n",
     );
     has_part(&found, "macos-pr.yml: filters its `pull_request` trigger");
-    // Without the merge queue trigger, a required `macos` never reports for a queue entry.
+    // Without the merge queue trigger, a required macOS check never reports for a queue entry.
     let found = changed_to(MACOS_PR, "  merge_group:\n", "");
     has(
         &found,
@@ -361,55 +361,20 @@ fn a_burst_of_pushes_cancels_the_older_runs() {
 }
 
 #[test]
-fn the_paths_check_and_the_gate_keep_their_shape() {
-    // Catches: the paths check run with another file or key, or under a condition; the macOS
-    // jobs freed from it; and the one check to require made to pass when a macOS job failed,
-    // or to be skipped with them.
+fn the_jobs_keep_their_runner_and_their_independence() {
+    // Catches: a job moved off macos-15, made to need another job (a failed or skipped need
+    // skips it, and a skipped required check passes), allowed to fail, or a job added, dropped
+    // or renamed (the required check names it).
     for (from, to, want) in [
         (
-            "--key macos --output",
-            "--key mac --output",
-            "macos-pr.yml: the last step of `changes` is not `cargo xtask pr-paths --base HEAD^1 --patterns tools/ci/macos-pr-paths.txt --key macos --output \"$GITHUB_OUTPUT\"` with the id `paths`",
+            "  macos-test:\n    runs-on: macos-15\n",
+            "  macos-test:\n    runs-on: macos-26\n",
+            "macos-pr.yml: `macos-test` runs on `macos-26`, not `macos-15`",
         ),
         (
-            "      macos: ${{ steps.paths.outputs.macos }}\n",
-            "      macos: 'true'\n",
-            "macos-pr.yml: `changes` outputs [(\"macos\", \"true\")], not [(\"macos\", \"${{ steps.paths.outputs.macos }}\")]",
-        ),
-        (
-            "  changes:\n    runs-on: ubuntu-latest\n",
-            "  changes:\n    if: ${{ github.actor != 'x' }}\n    runs-on: ubuntu-latest\n",
-            "macos-pr.yml: `changes` has `if: ${{ github.actor != 'x' }}`; it always runs",
-        ),
-        (
-            "  changes:\n    runs-on: ubuntu-latest\n",
-            "  changes:\n    runs-on: macos-15\n",
-            "macos-pr.yml: `changes` runs on a Mac; it runs on Linux",
-        ),
-        (
-            "  macos-device:\n    needs: changes\n",
-            "  macos-device:\n    needs: [changes, macos-test]\n",
-            "macos-pr.yml: `macos-device` does not need `changes` alone",
-        ),
-        (
-            "    needs: [changes, macos-test, macos-device]\n",
-            "    needs: [changes, macos-test]\n",
-            "macos-pr.yml: `macos` does not need `changes`, `macos-test` and `macos-device`",
-        ),
-        (
-            "    needs: [changes, macos-test, macos-device]\n    if: ${{ !cancelled() }}\n",
-            "    needs: [changes, macos-test, macos-device]\n",
-            "macos-pr.yml: `macos` runs under None, not `${{ !cancelled() }}`: a skipped macOS job would skip it",
-        ),
-        (
-            "        run: \"false\"\n",
-            "        run: \"true\"\n",
-            "macos-pr.yml: `macos` does not have exactly one conditional step, `run: \"false\"` under `${{ needs.changes.result != 'success' || (needs.changes.outputs.macos == 'true' && (needs.macos-test.result != 'success' || needs.macos-device.result != 'success')) }}`",
-        ),
-        (
-            "needs.macos-test.result != 'success' || needs.macos-device.result != 'success'",
-            "needs.macos-test.result != 'success'",
-            "macos-pr.yml: `macos` does not have exactly one conditional step, `run: \"false\"` under `${{ needs.changes.result != 'success' || (needs.changes.outputs.macos == 'true' && (needs.macos-test.result != 'success' || needs.macos-device.result != 'success')) }}`",
+            "  macos-device:\n",
+            "  macos-device:\n    needs: macos-test\n",
+            "macos-pr.yml: `macos-device` needs [\"macos-test\"]: a failed or skipped need skips it, and a skipped required check passes",
         ),
         (
             "    timeout-minutes: 90\n",
@@ -417,9 +382,9 @@ fn the_paths_check_and_the_gate_keep_their_shape() {
             "macos-pr.yml: `macos-device` has a `continue-on-error`, which lets it pass on a failure",
         ),
         (
-            "\n  macos:\n",
-            "\n  macos-gate:\n",
-            "macos-pr.yml: its jobs are [\"changes\", \"macos-test\", \"macos-device\", \"macos-gate\"], not [\"changes\", \"macos-test\", \"macos-device\", \"macos\"]",
+            "  macos-device:\n",
+            "  macos-devices:\n",
+            "macos-pr.yml: its jobs are [\"macos-test\", \"macos-devices\"], not [\"macos-test\", \"macos-device\"]",
         ),
     ] {
         has(&changed_to(MACOS_PR, from, to), want);
@@ -487,86 +452,6 @@ fn a_step_of_the_after_merge_mac_jobs_that_no_pull_request_runs_is_refused() {
 }
 
 #[test]
-fn a_pattern_file_that_misses_what_the_jobs_test_is_refused() {
-    // Catches: a crate a macOS job tests whole, or a test target it runs alone, that no pattern
-    // matches (a change to it would skip the jobs that test it); a workflow with a macOS job, or
-    // the check itself, left out; a pattern that matches nothing; and a pattern file that does
-    // not parse.
-    let found = changed_to(PATTERNS, "crates/kbf-task/**\n", "");
-    has(
-        &found,
-        "tools/ci/macos-pr-paths.txt does not match crates/kbf-task/Cargo.toml, of kbf-task, which a macOS job tests whole: add `crates/kbf-task/**`",
-    );
-    let found = changed_to(PATTERNS, "crates/kbf-task/**\n", "crates/kbf-task/src/**\n");
-    has(
-        &found,
-        "tools/ci/macos-pr-paths.txt does not match crates/kbf-task/Cargo.toml, of kbf-task, which a macOS job tests whole: add `crates/kbf-task/**`",
-    );
-    let found = changed_to(PATTERNS, "crates/xtask/tests/pkg_macos.rs\n", "");
-    has(
-        &found,
-        "tools/ci/macos-pr-paths.txt does not match crates/xtask/tests/pkg_macos.rs, the test target `pkg_macos` a macOS job runs",
-    );
-    let found = changed_to(
-        PATTERNS,
-        "crates/kbf-cli/src/node.rs\ncrates/kbf-cli/tests/macos_daemon.rs\n",
-        "",
-    );
-    has(
-        &found,
-        "tools/ci/macos-pr-paths.txt matches no file of kbf-cli, which a macOS job builds or tests",
-    );
-    has(
-        &found,
-        "tools/ci/macos-pr-paths.txt does not match crates/kbf-cli/tests/macos_daemon.rs, the test target `macos_daemon` a macOS job runs",
-    );
-    let found = changed_to(PATTERNS, ".github/workflows/vmm-probe.yml\n", "");
-    has(
-        &found,
-        "tools/ci/macos-pr-paths.txt does not match .github/workflows/vmm-probe.yml, which has a macOS job",
-    );
-    let found = changed_to(PATTERNS, "crates/xtask/src/pr_paths.rs\n", "");
-    has(
-        &found,
-        "tools/ci/macos-pr-paths.txt does not match crates/xtask/src/pr_paths.rs, which the check itself is",
-    );
-    let found = changed_to(
-        PATTERNS,
-        "crates/kbf-task/**\n",
-        "crates/kbf-task/**\ncrates/kbf-nothing/**\n",
-    );
-    has(
-        &found,
-        "tools/ci/macos-pr-paths.txt: `crates/kbf-nothing/**` matches no file git lists",
-    );
-    let found = changed_to(PATTERNS, "crates/kbf-task/**\n", "crates/kbf-*/**\n");
-    has_part(&found, "tools/ci/macos-pr-paths.txt: line ");
-    has_part(
-        &found,
-        "`crates/kbf-*/**` holds a `*` that is not the final `/**`",
-    );
-}
-
-#[test]
-fn a_crate_or_test_target_that_does_not_exist_is_refused() {
-    // Catches: a job that names a crate or a test target git does not list (renamed or deleted),
-    // which no pattern can cover and so would never be asked for.
-    let found = changed_to(
-        MACOS_PR,
-        "      - run: cargo test -p kbf-task --locked --no-fail-fast\n",
-        "      - run: cargo test -p kbf-task --locked --no-fail-fast\n      - run: cargo test -p kbf-gone --locked\n      - run: cargo test -p kbf-cli --test gone --locked\n",
-    );
-    has(
-        &found,
-        "a macOS job names `-p kbf-gone`, and git lists nothing under crates/kbf-gone/",
-    );
-    has(
-        &found,
-        "a macOS job runs `--test gone` of kbf-cli, and git lists no crates/kbf-cli/tests/gone.rs",
-    );
-}
-
-#[test]
 fn a_crate_the_mac_tests_whole_and_the_linux_check_misses_is_refused() {
     // Catches: a crate added to `macos-test` and not to ci.yml's darwin `--tests` check, so a
     // macOS compile error in it reaches main from a pull request that runs no Mac.
@@ -587,7 +472,6 @@ fn a_cargo_line_selects_its_packages_and_targets() {
         Some(Selection {
             packages: vec!["a".into(), "b".into()],
             whole: true,
-            tests: vec![],
         })
     );
     assert_eq!(
@@ -595,7 +479,6 @@ fn a_cargo_line_selects_its_packages_and_targets() {
         Some(Selection {
             packages: vec!["a".into()],
             whole: false,
-            tests: vec!["t1".into(), "t2".into()],
         })
     );
     for partial in ["cargo build -p a --bin b", "cargo check -p a --lib"] {
@@ -604,7 +487,6 @@ fn a_cargo_line_selects_its_packages_and_targets() {
             Some(Selection {
                 packages: vec!["a".into()],
                 whole: false,
-                tests: vec![],
             }),
             "{partial}"
         );

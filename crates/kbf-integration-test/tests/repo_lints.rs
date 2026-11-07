@@ -54,9 +54,8 @@
 //!   `pipeline_workflow` and `release_workflow`);
 //! - a pull request taking a macOS runner outside the expected jobs or without their gate, a
 //!   pull request's macOS job holding a secret, an environment, an OIDC token or a write scope,
-//!   `.github/workflows/macos-pr.yml` drifting from its shape or from the steps of beta.yml's
-//!   `native-macos`, and `tools/ci/macos-pr-paths.txt` missing a crate those jobs test (module
-//!   `macos_pr`);
+//!   and `.github/workflows/macos-pr.yml` drifting from its shape (every pull request, no
+//!   condition) or from the steps of beta.yml's `native-macos` (module `macos_pr`);
 //! - the job table of docs/design/gamma-cicd.md naming a job `.github/workflows/release.yml`
 //!   does not have, or omitting one it has (module `gamma_cicd_doc`);
 //! - the beta smoke workflow's Buck2 pin and its actions' commits drifting from

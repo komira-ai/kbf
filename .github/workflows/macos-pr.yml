@@ -1,26 +1,20 @@
-# macOS on a pull request, for the pull requests that change the Mac and service-manager surface:
-# the paths tools/ci/macos-pr-paths.txt lists (the Mac daemon and executor platform, the launchd and
-# macOS adapters, Mac packaging, the step runner and self-update, and the workflows and xtask code
-# that build or check them). A pull request that changes none of them takes no macOS runner from
-# this workflow: its macOS jobs are skipped by their `if:` before a runner is asked for, and
-# `macos` passes. It runs the same way for a merge queue entry, so `macos` reports there too.
+# macOS on every pull request and merge queue entry, on GitHub's hosted macos-15 runner, so a change
+# that breaks the Mac is red before it merges, not on main:
 #
-# - `changes` (Linux) runs `cargo xtask pr-paths` on the merge commit (or the queue's commit)
-#   against its first parent, the base it merges into: `macos=true` when some changed path matches.
 # - `macos-test` runs the tests of the macOS crates as an ordinary user: the steps of beta.yml's
 #   `native-macos` that need no root and no device, the task runner's tests (ci.yml's `task-macos`
 #   runs them after the merge), and the crates of the launchd adapters, the step runner and
-#   self-update, which no Mac job tested before.
+#   self-update. Not the whole workspace: its Linux-only test targets do not build on a Mac.
 # - `macos-device` runs the rest of `native-macos`: the steps as root (the lease-user pool, the slot
 #   clean and its profile, the root helper, the guest agent under launchd, the `.pkg` through
 #   Installer, the provisioning) and the real simulator, gh and signing tests.
-# - `macos` (Linux) is the one check to require (on pull requests and in the merge queue): it passes when `changes` passed and each macOS
-#   job either passed or was not needed, so a pull request that needs no Mac never waits for one.
 #
-# The repository lint `macos_pr` (crates/kbf-integration-test/tests/macos_pr) holds this file to
-# that shape and holds every step of `native-macos` to a step here. Neither macOS job holds a
-# secret, an environment or any write scope: their token can read the repository, nothing more.
-# beta.yml, which gates the release after the merge, is unchanged.
+# Both run unconditionally (no paths filter, no `if:`), so each is a check that can be required:
+# it reports on every pull request and merge queue entry. The repository lint `macos_pr`
+# (crates/kbf-integration-test/tests/macos_pr) holds this file to that shape and holds every step
+# of `native-macos` and `task-macos` to a step here. Neither job holds a secret, an environment or
+# any write scope: their token can read the repository, nothing more. beta.yml, which gates the
+# release after the merge, is unchanged.
 #
 # The macOS jobs restore no Cargo cache: beta.yml's `native-macos` saves one, but from another
 # macOS image (`macos-latest`), and nothing here saves one, so a pull request never writes a cache.
@@ -45,37 +39,7 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
-  changes:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    permissions:
-      contents: read
-    outputs:
-      macos: ${{ steps.paths.outputs.macos }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          # The merge commit (or the queue's commit) and its first parent, the base it merges into.
-          fetch-depth: 2
-      - run: rustup toolchain install
-      # beta.yml's `packages` job builds xtask and saves its cache on main; it is restored here,
-      # never saved.
-      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-${{ runner.os }}-${{ runner.arch }}-packages-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
-          restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-packages-
-      - name: Whether this pull request changes a path of the macOS surface
-        id: paths
-        run: cargo xtask pr-paths --base HEAD^1 --patterns tools/ci/macos-pr-paths.txt --key macos --output "$GITHUB_OUTPUT"
-
   macos-test:
-    needs: changes
-    if: ${{ needs.changes.outputs.macos == 'true' }}
     runs-on: macos-15
     timeout-minutes: 75
     permissions:
@@ -130,8 +94,6 @@ jobs:
       - run: cargo test --locked --no-fail-fast -p kbf-host -p kbf-host-install -p kbf-seatbelt -p kbf-vmm -p kbf-mac-provision -p kbf-step-runner -p kbf-updater -p kbf-update -p update-hook
 
   macos-device:
-    needs: changes
-    if: ${{ needs.changes.outputs.macos == 'true' }}
     runs-on: macos-15
     timeout-minutes: 90
     permissions:
@@ -214,24 +176,3 @@ jobs:
       # because it changes this runner's settings.
       - run: cargo xtask sudo-test -p kbf-mac-provision --test as_root -- --test-threads=1 --nocapture
         if: ${{ !cancelled() }}
-
-  # The check to require. It runs whenever the run was not cancelled, after the jobs it needs
-  # (a skipped macOS job included), and fails when `changes` did not pass, or when the macOS
-  # surface changed and a macOS job did not pass.
-  macos:
-    needs: [changes, macos-test, macos-device]
-    if: ${{ !cancelled() }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions: {}
-    steps:
-      - name: What ran
-        env:
-          CHANGES: ${{ needs.changes.result }}
-          MACOS: ${{ needs.changes.outputs.macos }}
-          TEST: ${{ needs.macos-test.result }}
-          DEVICE: ${{ needs.macos-device.result }}
-        run: echo "changes $CHANGES, macos=$MACOS, macos-test $TEST, macos-device $DEVICE"
-      - name: Fail unless the path check passed and every macOS job it asked for passed
-        if: ${{ needs.changes.result != 'success' || (needs.changes.outputs.macos == 'true' && (needs.macos-test.result != 'success' || needs.macos-device.result != 'success')) }}
-        run: "false"

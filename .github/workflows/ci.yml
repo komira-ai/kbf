@@ -1,12 +1,12 @@
 # The pull-request gate: the required checks `lint` and `test`; `test` is the coverage gate, and the
 # tests it measures run beside it in the matrix job `test-shard`. `task-macos` runs after the merge
-# and in the merge queue; a pull request that changes the macOS surface runs macos-pr.yml.
-# GitHub-hosted runners only; the repository lints in crates/kbf-integration-test/tests/repo_lints.rs hold every workflow to that, to commit-SHA pinned
-# actions from the set the repository's Actions policy allows (actions/* and
-# tailscale/github-action), and to a top-level `permissions: {}`.
+# and in the merge queue; every pull request runs the macOS tests in macos-pr.yml. GitHub-hosted
+# runners only; the repository lints in crates/kbf-integration-test/tests/repo_lints.rs hold every
+# workflow to that, to commit-SHA pinned actions from the set the repository's Actions policy
+# allows (actions/* and tailscale/github-action), and to a top-level `permissions: {}`.
 #
-# A pull request runs this, and macos-pr.yml (which takes a Mac only when the pull request changes
-# the macOS surface). The rest of the suite (the slow tests, the Arm run, the
+# A pull request runs this, and macos-pr.yml (the macOS tests and the root and device steps of
+# beta.yml's `native-macos`). The rest of the suite (the slow tests, the Arm run, the
 # jobs that need a service, root, crun or a Mac, the packages and the beta smoke) runs on a
 # push to main, in beta.yml. On a push to main this workflow is the first stage of the one
 # pipeline (pipeline.yml calls it, `workflow_call`), so the merged result meets the same gate
@@ -121,8 +121,8 @@ jobs:
       # program without `cc`, so it takes Zig for clang); without them (CRATE_CC_NO_DEFAULTS) Zig
       # gets its own `-target` and each build script's flags.
       # The crates a Mac job tests whole: every test target, and the libraries' unit tests
-      # (macos-pr.yml's `macos-test` tests these on a pull request that changes the macOS surface;
-      # the repository lint `macos_pr` requires each crate it tests whole to be here).
+      # (macos-pr.yml's `macos-test` tests these on every pull request; the repository lint
+      # `macos_pr` requires each crate it tests whole to be here).
       - name: Check for aarch64-apple-darwin the tests of the crates the Mac jobs test whole
         if: ${{ !cancelled() }}
         env:
@@ -604,8 +604,7 @@ jobs:
   # under the macOS confine for real (a denied Command's connect is refused, a credential file is
   # unreadable, an allowed Command runs). Tests only: no binary of it is built for release here.
   # After the merge (the pipeline's call) and in the merge queue only: a pull request runs the
-  # same tests in macos-pr.yml's `macos-test`, and only when it changes the macOS surface
-  # (tools/ci/macos-pr-paths.txt), so a pull request that does not takes no Mac.
+  # same tests in macos-pr.yml's `macos-test`, so it does not run them twice.
   task-macos:
     if: ${{ github.event_name != 'pull_request' }}
     runs-on: macos-latest
