@@ -13,7 +13,7 @@ publish.workspace = true
 # (swap, meta-backup, meta-verify and verify-cert), `mdm`
 # (fetch the pinned upstream archives; as root install the MDM services, the TLS
 # certificate, the push certificate and the enrollment profile, and link NanoDEP to
-# Apple Business Manager; verify them; sign an operator's erase request) and `pilot`
+# Apple Business Manager; verify them; frozen, its successor is hostkeeper-mdm) and `pilot`
 # (server-install, a kbf-server as a systemd user service, and buckconfig, a
 # worktree's buck2 overlay).
 # rustls (ring), httparse and rustls-native-certs make the HTTPS client of `mdm fetch`,

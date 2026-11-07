@@ -5,7 +5,8 @@
 `hostkeeper-mdm` (for `mdm-host`, and for the `push-cert` and `dep` verbs of kbf-deploy's
 `mdm` kit), with hostkeeper's names on the host. `hostkeeper-mdm migrate --from` moves a host
 installed by this kit or by kbf-deploy's onto them, keeping the old state directory for a
-back-out. The copies here take no new work. They stay, unchanged, until the live MDM host has
+back-out. The copies here take no new work. They stay, unchanged but for the removal of
+`erase-request` (below), until the live MDM host has
 been migrated, because its stack was installed from this code; then they are deleted:
 `mdm-core`, `host-step`, `mdm-host` and kbf-deploy's `mdm` kit. The MDM gate `kbf-mdm`
 (binary `kbf-mdm-gate`), its protocol crate `kbf-mdm-api` and `kbf-server`'s client of it are
