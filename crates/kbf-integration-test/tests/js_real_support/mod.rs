@@ -20,12 +20,18 @@
 //! ever serve it, a cordoned host counts, and it is given no work, so every job a test submits
 //! stays queued until the test cancels it, whenever a tick runs. No agent runs. Dropping the
 //! server kills and reaps the process; its directory goes after.
+//!
+//! [`RealJobServer::start_placing`] runs it for jobs that run: the same flags, the scheduler
+//! that places jobs (`--placement js-sched`) and the pool [`AGENT_POOL`], whose hosts
+//! heartbeat four times a second, and no host of its own: the hosts are the agents a test
+//! starts ([`agent`]), and a job is placed on the next heartbeat of one of them.
 
 #![allow(
     dead_code,
     reason = "each test binary uses a part of this module, and its unit tests the rest"
 )]
 
+pub mod agent;
 pub mod drop_answer;
 pub mod fields;
 
@@ -60,8 +66,36 @@ os = "linux"
 arch = "x86_64"
 "#;
 
-/// The pool's join token (at least 32 bytes), which the hello of [`HOST`] presents.
-const JOIN: &str = "join-token-0123456789-abcdefghijklmnop";
+/// The pool of [`RealJobServer::start_placing`]: the hosts are agents, which heartbeat every
+/// 250 ms (so a queued job is placed soon after it is submitted) and are lost after 5 s of
+/// silence; each is booked as two cores, 4 GiB of memory and 1 GiB of disk, which a hosted
+/// runner offers (a job of the executor asks for half again its farm booking and 512 MiB of
+/// memory, at most 3.5 GiB here, and for 1 GiB of disk beside its output's). Its
+/// capabilities are what the scheduler holds a host to when it admits a job: a job of the
+/// executor runs in a container (`exec`), asks for 1 GiB of disk (`disk-gib`, a whole GiB at
+/// least) and an allow-listed network (`egress`), and a host joins only if it reports them.
+pub const AGENT_POOL: &str = r#"name = "kbf-tests"
+class = "linux-host"
+max_machines = 2
+heartbeat_interval = "250ms"
+grace = "5s"
+
+[shape]
+cpu_millis = 2000
+memory_bytes = 4294967296
+disk_bytes = 1073741824
+
+[capabilities]
+os = "linux"
+arch = "x86_64"
+exec = "container"
+disk-gib = "1"
+egress = "allow-list"
+"#;
+
+/// The pool's join token (at least 32 bytes), which the hello of [`HOST`] and of every agent
+/// presents.
+pub const JOIN: &str = "join-token-0123456789-abcdefghijklmnop";
 
 /// The one host of the pool: registered and cordoned, so it admits jobs and runs none.
 pub const HOST: &str = "kbf-test-host";
@@ -135,6 +169,7 @@ pub fn job_addr_of(line: &str) -> Option<SocketAddr> {
 /// A `js-lease-server` with the job service on, until it drops.
 pub struct RealJobServer {
     child: Reaped,
+    lease_addr: SocketAddr,
     job_addr: SocketAddr,
     log: Arc<Mutex<String>>,
     /// Dropped last: the process is gone before its directory is removed.
@@ -164,15 +199,28 @@ fn write(dir: &Path, name: &str, text: &str, mode: u32) -> PathBuf {
 
 impl RealJobServer {
     /// Starts the pinned server in a directory of its own named after `name`, and returns once
-    /// it serves.
+    /// it serves, with its one cordoned host registered.
     pub async fn start(name: &str) -> RealJobServer {
+        let server = RealJobServer::launch(name, POOL, &[]).await;
+        server.register_cordoned_host().await;
+        server
+    }
+
+    /// Starts the pinned server for jobs that run: jobs are placed on the agents that join
+    /// [`AGENT_POOL`]. It has no host until an agent registers.
+    pub async fn start_placing(name: &str) -> RealJobServer {
+        RealJobServer::launch(name, AGENT_POOL, &["--placement", "js-sched"]).await
+    }
+
+    async fn launch(name: &str, pool: &str, extra: &[&str]) -> RealJobServer {
         let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), name);
         let binary = program("js-lease-server", &dir);
         let token = write(&dir, "token", TOKEN, 0o600);
         let joins = write(&dir, "agent-tokens", &format!("{JOIN}\n"), 0o600);
-        let pool = write(&dir, "pool.toml", POOL, 0o644);
+        let pool = write(&dir, "pool.toml", pool, 0o644);
         let child = Command::new(&binary)
             .args(["--listen", "127.0.0.1:0", "--job-listen", "127.0.0.1:0"])
+            .args(extra)
             .arg("--state-file")
             .arg(dir.join("leases.toml"))
             .args(["--boot", "initialise", "--tick", "1h"])
@@ -228,14 +276,13 @@ impl RealJobServer {
             let log = log.lock().unwrap_or_else(PoisonError::into_inner);
             panic!("js-lease-server named no job port; its log:\n{log}")
         });
-        let server = RealJobServer {
+        RealJobServer {
             child,
+            lease_addr,
             job_addr,
             log,
             dir,
-        };
-        server.register_cordoned_host(lease_addr).await;
-        server
+        }
     }
 
     /// Registers [`HOST`] in the pool, as an agent's hello does, and cordons it.
@@ -244,7 +291,8 @@ impl RealJobServer {
     /// could ever serve it, and a cordoned host counts; a cordoned host takes no work, so every
     /// job stays queued whenever a tick runs. No agent runs: the host is a hello and nothing
     /// more.
-    async fn register_cordoned_host(&self, lease_addr: SocketAddr) {
+    async fn register_cordoned_host(&self) {
+        let lease_addr = self.lease_addr;
         let hello = serde_json::json!({
             "host_id": HOST,
             "pool": "kbf-tests",
@@ -280,6 +328,29 @@ impl RealJobServer {
             .cordon_host(request)
             .await
             .unwrap_or_else(|status| panic!("cordon {HOST}: {status:?}\n{}", self.log()));
+    }
+
+    /// The address agents register at (the lease server's own listener).
+    pub fn lease_addr(&self) -> SocketAddr {
+        self.lease_addr
+    }
+
+    /// The hosts the job service lists, for a failure's message.
+    pub async fn hosts(&self) -> String {
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://{}", self.job_addr))
+            .expect("a loopback endpoint")
+            .connect()
+            .await;
+        let Ok(channel) = channel else {
+            return format!("the job service cannot be reached: {channel:?}");
+        };
+        let mut request = tonic::Request::new(js_proto::v1::ListHostsRequest::default());
+        let bearer = format!("Bearer {TOKEN}").parse().expect("ASCII");
+        request.metadata_mut().insert("authorization", bearer);
+        match JobServiceClient::new(channel).list_hosts(request).await {
+            Ok(hosts) => format!("{:#?}", hosts.into_inner()),
+            Err(status) => format!("ListHosts: {status:?}"),
+        }
     }
 
     /// The job service's address.

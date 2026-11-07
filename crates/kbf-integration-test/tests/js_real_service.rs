@@ -302,6 +302,35 @@ async fn the_relay_loses_the_first_answer_after_the_call_applied() {
     assert_eq!(fake.jobs(), [again]);
 }
 
+/// Asserts that a held relay passes every answer until it is armed, then loses exactly the
+/// next one, after the service applied it, and passes the answers after that: in front of the
+/// fake, a submit before the arming is answered, the first after it is `Error::Transport` with
+/// the job made, and the repeat is answered from that job. Catches a relay that loses an answer
+/// a test meant to let through (the executor's first calls), or more than one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_held_relay_loses_only_the_answer_after_it_is_armed() {
+    let fake = fake_like_the_pool().await;
+    let addr = fake
+        .origin()
+        .strip_prefix("http://")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let relay = DropFirstAnswer::held(addr).await;
+    let through = RealJobServer::client_at(&relay.origin(), kbf_job_client::fake::TOKEN);
+    let before = through.submit_job(spec("held-1")).await.unwrap();
+    assert!(!relay.dropped());
+    relay.arm();
+    let lost = through.submit_job(spec("held-2")).await.unwrap_err();
+    assert!(relay.dropped());
+    assert!(matches!(lost, Error::Transport(_)), "{lost:?}");
+    assert_eq!(fake.jobs().len(), 2, "the lost submit was applied");
+    let again = through.submit_job(spec("held-2")).await.unwrap();
+    let after = through.submit_job(spec("held-3")).await.unwrap();
+    let ids: Vec<String> = fake.jobs().into_iter().map(|job| job.id).collect();
+    assert_eq!(ids, [before.id, again.id, after.id]);
+}
+
 /// Asserts the frame reading of the relay: a frame is whole only with its 9-byte head and all of
 /// its payload, and only a `HEADERS` frame of a stream other than 0 is the head of an answer.
 #[test]

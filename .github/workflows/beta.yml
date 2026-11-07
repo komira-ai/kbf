@@ -841,19 +841,27 @@ jobs:
       - name: The farm of N and N-1
         run: cargo test -p kbf-integration-test --test mixed_version --locked -- --test-threads=1 --nocapture
 
-  # kbf-job-client against the real job service (crates/kbf-integration-test/tests/js_real_service.rs):
-  # the js-lease-server of the jobscheduler release kbf-js-version.toml pins, started on loopback
-  # ports the system picks, and the four cases that need it (submit then read, cancel twice, a
-  # resubmit after a lost answer, and the fake's answers held field by field to the server's).
+  # kbf-job-client and kbf-server's host executor against the real job service: the
+  # js-lease-server and js-agent of the jobscheduler release kbf-js-version.toml pins, started on
+  # loopback ports the system picks.
+  # - crates/kbf-integration-test/tests/js_real_service.rs: the four cases of the client that
+  #   need the server (submit then read, cancel twice, a resubmit after a lost answer, and the
+  #   fake's answers held field by field to the server's).
+  # - crates/kbf-integration-test/tests/executor_real_service_integration.rs: the executor over
+  #   the real farm, the server and an agent whose crun is a stand-in (success, a wall limit,
+  #   cancel, a lost answer to a submit, a whole-machine action, a restarted frontend). The
+  #   released agent runs jobs only as root, so `cargo xtask sudo-test` runs them as root (sudo
+  #   names the runner's user as the job user); each starts its agent in a systemd scope of its
+  #   own, one test at a time.
   # `cargo xtask fetch-pinned-js` reads the pin and refuses an archive whose SHA-256 or build
   # attestation is not the pinned one (crates/xtask/src/js_pin.rs); the tests hash the archive
   # again and run only a program unpacked from those bytes, and fail (never skip) without it.
-  # js-agent is fetched and verified too, for the cases that run a job, which come later. Here
-  # and not in the pull-request gate: a pull request runs build and unit tests only, and these
-  # need a download from GitHub and its attestation API. The harness's own parts (the pin, the
-  # relay that loses an answer, the field sets) run in every pull request's tests. Built before
-  # any step holds a token, and the cache is saved before the fetch, as in mixed-version: the
-  # fetch refuses an archive already in --dir. x86_64 only (the pin names the x86_64 archives).
+  # Here and not in the pull-request gate: a pull request runs build and unit tests only, and
+  # these need a download from GitHub and its attestation API, and root. The harness's own parts
+  # (the pin, the relay that loses an answer, the field sets, the stand-in programs) run in every
+  # pull request's tests. Built before any step holds a token, and the cache is saved before the
+  # fetch, as in mixed-version: the fetch refuses an archive already in --dir. x86_64 only (the
+  # pin names the x86_64 archives).
   js-real-service:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -881,7 +889,7 @@ jobs:
       - name: Build xtask
         run: cargo build -p xtask --locked
       - name: Build the real-service tests
-        run: cargo test -p kbf-integration-test --test js_real_service --locked --no-run
+        run: cargo test -p kbf-integration-test --test js_real_service --test executor_real_service_integration --locked --no-run
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
         with:
@@ -902,3 +910,5 @@ jobs:
         run: cargo xtask fetch-pinned-js --pin kbf-js-version.toml --program js-agent --target x86_64-unknown-linux-musl --gh "$RUNNER_TEMP/tools/gh" --dir target/tmp/js
       - name: kbf-job-client against the pinned job service
         run: cargo test -p kbf-integration-test --test js_real_service --locked -- --ignored
+      - name: The host executor against the pinned job service and agent (as root)
+        run: cargo xtask sudo-test -p kbf-integration-test --test executor_real_service_integration -- --test-threads=1 --nocapture

@@ -43,6 +43,8 @@ pub mod deploy_units;
 pub mod doc_commands;
 pub mod hygiene;
 #[cfg(target_os = "linux")]
+pub mod js_stand_in;
+#[cfg(target_os = "linux")]
 pub mod m1;
 #[cfg(target_os = "linux")]
 pub mod m2;
