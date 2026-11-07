@@ -150,21 +150,25 @@ fn started(
     Ok((handle, stop))
 }
 
-/// The whole answer (head and body) of `GET path` on the operator listener at `api`.
-async fn get(api: std::net::SocketAddr, path: &str) -> String {
-    let mut stream = TcpStream::connect(api).await.expect("connects");
+/// The whole answer of `GET path` on the operator listener at `api`, or `None` when the
+/// listener refused, reset or closed the connection before it answered.
+async fn try_get(api: std::net::SocketAddr, path: &str) -> Option<String> {
+    let mut stream = TcpStream::connect(api).await.ok()?;
     let request = format!("GET {path} HTTP/1.1\r\nHost: kbf\r\nConnection: close\r\n\r\n");
-    stream.write_all(request.as_bytes()).await.expect("sent");
+    stream.write_all(request.as_bytes()).await.ok()?;
     let mut text = String::new();
-    stream.read_to_string(&mut text).await.expect("answered");
-    text
+    stream.read_to_string(&mut text).await.ok()?;
+    Some(text)
 }
 
-/// Waits until the farm lists the worker `worker`, as a registered node.
+/// Waits until the farm lists the worker `worker`, as a registered node. A connection the
+/// listener drops (a frontend that is stopping closes it) is not an answer, and is asked
+/// again: whether the frontend stops is for its `serve` to say, not for this poll.
 async fn registered(api: std::net::SocketAddr, worker: &str) -> String {
     loop {
-        let nodes = get(api, "/v1/nodes").await;
-        if nodes.contains(worker) {
+        if let Some(nodes) = try_get(api, "/v1/nodes").await
+            && nodes.contains(worker)
+        {
             return nodes;
         }
         tokio::task::yield_now().await;

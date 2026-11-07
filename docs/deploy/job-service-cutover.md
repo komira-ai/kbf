@@ -50,11 +50,14 @@ each part is set up:
 
 ## The farm agents' egress
 
-The executor submits every job with the network level `allow-list`: a task PUTs its packs to the
-tier store's proxy and reads its inputs from the frontend's job-facing read listener, and nothing
-else. A farm agent runs such a job only if its own ceiling is `allow-list` (`--egress allow-list`,
-on `--runtime crun`), and the job reaches only the endpoints its `--egress-allow` lines name. An
-agent with the default ceiling, `none`, is never given kbf's jobs. kbf never asks for `open`.
+The executor submits every job with the network level `--executor-network` names, by default
+`allow-list`: a task PUTs its packs to the tier store's proxy and reads its inputs from the
+frontend's job-facing read listener, and nothing else. A farm agent runs such a job only if its own
+ceiling is `allow-list` (`--egress allow-list`, on `--runtime crun`), and the job reaches only the
+endpoints its `--egress-allow` lines name. An agent with the default ceiling, `none`, is never
+given kbf's jobs. kbf asks for `open` only when the frontend is given `--executor-network open`
+with `--executor-allow-open-network`. An agent that cannot check the limits of its job network
+refuses the start (`egress-unchecked`), and the farm runs the action again.
 
 Those lines are made from the frontend's own `kbf.toml`, so that they name the places the frontend
 gives its tasks:

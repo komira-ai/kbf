@@ -3,10 +3,10 @@
 
 use std::time::Duration;
 
-use js_proto::v1::JobState;
+use js_proto::v1::{JobState, NetworkLevel};
 use kbf_front::Finished;
 use kbf_job_client::fake::Fault;
-use kbf_server::executor::{InputsError, PresignError};
+use kbf_server::executor::{Config, ConfigError, InputsError, Network, PresignError};
 use tonic::Code;
 
 use crate::rig::{Rig, cancels, hex, settle, submits};
@@ -364,4 +364,148 @@ async fn a_grant_that_cannot_be_given_is_the_callers_to_fix() {
     assert_eq!(code(&finished), Code::InvalidArgument);
     assert_eq!(rig.inputs.looked_up.lock().expect("looked up").len(), 1);
     assert!(rig.jobs().is_empty());
+}
+
+/// Submits the action of `tag` on a fresh rig whose config `adjust` changes, and returns the
+/// rig, the caller and the job's id.
+async fn one_job(adjust: impl FnOnce(&mut Config)) -> (Rig, crate::rig::Caller, String) {
+    let mut rig = Rig::start(&[HOST], 1, adjust).await;
+    rig.pump().await;
+    let caller = rig.submit(3);
+    rig.pump().await;
+    let jobs = rig.jobs_of(3);
+    assert_eq!(jobs.len(), 1, "{jobs:?}");
+    let id = jobs[0].id().to_owned();
+    (rig, caller, id)
+}
+
+/// Catches a job submitted with its network left unspecified, which the job service reads as
+/// none (no route out, so the task reaches neither the read listener nor the store and every
+/// action fails): with the default config the `JobSpec` that reaches the service names the
+/// allow-list, as a number too, not the unspecified 0 nor none's 1.
+#[tokio::test(start_paused = true)]
+async fn the_default_job_asks_for_the_allow_list_network() {
+    let (rig, _caller, _id) = one_job(|_| {}).await;
+    assert_eq!(rig.cfg.network, Network::AllowList);
+    let sent = submits(&rig.fake.calls());
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0].network(), NetworkLevel::AllowList);
+    assert_eq!(
+        sent[0].network, 2,
+        "the wire value of NETWORK_LEVEL_ALLOW_LIST"
+    );
+    assert_eq!(rig.jobs()[0].spec.network(), NetworkLevel::AllowList);
+}
+
+/// Catches `--executor-network` not reaching the job, or one value standing for another: each
+/// of the three levels is the network of the job the service is sent, and none is ever
+/// unspecified.
+#[tokio::test(start_paused = true)]
+async fn each_configured_network_is_the_jobs_network() {
+    for (network, open, level) in [
+        (Network::None, false, NetworkLevel::None),
+        (Network::AllowList, false, NetworkLevel::AllowList),
+        (Network::Open, true, NetworkLevel::Open),
+    ] {
+        let (rig, _caller, _id) = one_job(|cfg| {
+            cfg.network = network;
+            cfg.allow_open_network = open;
+        })
+        .await;
+        let sent = submits(&rig.fake.calls());
+        assert_eq!(sent.len(), 1, "{network:?}: {sent:?}");
+        assert_eq!(sent[0].network(), level, "{network:?}");
+        assert_ne!(sent[0].network(), NetworkLevel::Unspecified, "{network:?}");
+    }
+}
+
+/// Catches a start the host's agent refused (`AGENT_REFUSED`) being answered as the action's
+/// failure: the detail the agent gives when it cannot check the limits of the job's network
+/// (`egress-unchecked`), and any other detail, and none, are infrastructure. The caller is not
+/// answered, the run is counted as `infra`, the farm runs the action again as a new job, and
+/// that job's success is the caller's answer.
+#[tokio::test(start_paused = true)]
+async fn a_start_the_agent_refused_is_infrastructure_and_rerun() {
+    for detail in [
+        "egress-unchecked",
+        "egress-unchecked: no nft table",
+        "runtime-failed",
+        "",
+    ] {
+        let (mut rig, caller, id) = one_job(|_| {}).await;
+        assert!(rig.fake.refuse_start(&id, detail), "{detail:?}");
+        let read = rig.api.get_job(&id).await.expect("the job");
+        assert_eq!(
+            read.start_failure_detail, detail,
+            "the fake carries the detail"
+        );
+        rig.pump().await;
+        assert!(
+            caller.finished().is_none(),
+            "{detail:?} answered the caller: {:?}",
+            caller.finished()
+        );
+        assert_eq!(
+            rig.counter("kbf_executor_runs_total{outcome=\"infra\"}"),
+            1,
+            "{detail:?}"
+        );
+        let jobs = rig.jobs_of(3);
+        assert_eq!(jobs.len(), 2, "{detail:?} was not rerun: {jobs:?}");
+        assert_eq!(jobs[0].state(), JobState::FailedToStart);
+        rig.host_finishes(jobs[1].id(), HOST, 0);
+        let finished = rig.until_done(&caller, 4).await;
+        assert!(
+            matches!(finished, Finished::Ran(_)),
+            "{detail:?}: {finished:?}"
+        );
+    }
+}
+
+/// Catches an open network for the jobs that the operator did not ask for twice, or an opt-in
+/// left set that would open it on a later edit of one flag: `open` alone is refused with a
+/// message that names both flags, `open` with `allow_open_network` is accepted, and the
+/// opt-in with the allow-list or none is refused. The default is the allow-list, opt-in off.
+#[test]
+fn an_open_network_needs_its_own_opt_in() {
+    let base = || Config {
+        insecure_argv_secrets: true,
+        ..Config::new("front-1", 1, 2_000, 16 << 30)
+    };
+    assert_eq!(base().network, Network::AllowList);
+    assert!(!base().allow_open_network);
+    let open = Config {
+        network: Network::Open,
+        ..base()
+    };
+    let refused = open.validate().expect_err("open alone");
+    assert_eq!(refused, ConfigError::OpenNetwork);
+    assert_eq!(
+        refused.to_string(),
+        "--executor-network open lets every job reach any address: give \
+         --executor-allow-open-network as well to say so"
+    );
+    let allowed = Config {
+        allow_open_network: true,
+        ..open
+    };
+    assert_eq!(allowed.validate(), Ok(()));
+    for network in [Network::AllowList, Network::None] {
+        let stray = Config {
+            network,
+            allow_open_network: true,
+            ..base()
+        };
+        assert_eq!(
+            stray.validate(),
+            Err(ConfigError::OpenNetworkUnused),
+            "{network:?}"
+        );
+        let plain = Config { network, ..base() };
+        assert_eq!(plain.validate(), Ok(()), "{network:?}");
+    }
+    assert_eq!(
+        ConfigError::OpenNetworkUnused.to_string(),
+        "--executor-allow-open-network is only for --executor-network open: drop it"
+    );
 }

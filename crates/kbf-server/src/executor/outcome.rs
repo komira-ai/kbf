@@ -25,6 +25,7 @@
 //! | failed to start start-timeout | `infra` | `UNAVAILABLE`: rerun, as the farm's own retry policy says |
 //! | failed to start exclusive-not-ready | `infra` | `UNAVAILABLE`: rerun, as the farm's own retry policy says |
 //! | failed to start host-unsafe | `infra` | `UNAVAILABLE`: rerun, as the farm's own retry policy says |
+//! | failed to start egress-unchecked | `infra` | `UNAVAILABLE`: the host's agent could not check the limits of the job's network (`--executor-network`), rerun |
 //! | failed to start, any other code or detail | `infra` | `UNAVAILABLE`: rerun |
 //! | in a state this server does not know | `infra` | `UNAVAILABLE`: rerun |
 //! | refused at submit no-capable-host | `invalid` | `INVALID_ARGUMENT`: nothing could ever run it |
@@ -91,6 +92,10 @@ pub(super) struct Refused {
 const QUOTA_UNAVAILABLE: &str = "quota-unavailable";
 const FILES_UNSUPPORTED: &str = "files-unsupported";
 const INVALID_FILE: &str = "invalid-file";
+/// The agent could not check that the network the job would get is limited as it was told
+/// (its firewall or its job network is missing or changed), and created nothing. The proto has
+/// no start-failure code of its own for it: it is a detail of `AGENT_REFUSED`.
+const EGRESS_UNCHECKED: &str = "egress-unchecked";
 
 /// The code an agent's detail starts with: its leading run of lower-case letters, digits and
 /// dashes. The rest is never read.
@@ -155,6 +160,11 @@ fn failed_to_start(job: &Job) -> Verdict {
                 "the host refused a file of the job".to_owned(),
             )),
             "host-unsafe" => infra(job, "the job failed to start: host-unsafe"),
+            EGRESS_UNCHECKED => infra(
+                job,
+                "the host refused to start the job: its agent could not check the limits of \
+                 the job's network (egress-unchecked)",
+            ),
             _ => infra(job, "the host refused to start the job"),
         },
         StartFailureCode::Unspecified => infra(job, "the job failed to start"),

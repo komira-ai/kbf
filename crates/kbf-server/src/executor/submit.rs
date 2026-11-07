@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use js_proto::v1::{JobSpec, Needs, NetworkLevel};
+use js_proto::v1::{JobSpec, Needs};
 use kbf_proto::reapi::Digest;
 use kbf_types::LeaseId;
 use ring::digest::{SHA256, digest};
@@ -198,9 +198,10 @@ pub(super) async fn prepare(
         }),
         constraints: Some(ctx.cfg.constraints()),
         wall_limit_seconds: Some(wall_seconds(wall)),
-        // The task tool reaches the read listener and the store, and nothing else: the
-        // endpoints the host's agent allows.
-        network: NetworkLevel::AllowList.into(),
+        // The operator's level, by default the allow-list: the task tool reaches the read
+        // listener and the store, the endpoints the host's agent allows, and nothing else.
+        // Never left unspecified, which the service reads as none.
+        network: ctx.cfg.network.level().into(),
         ports: Vec::new(),
         files: args.files(ctx.cfg.delivery),
         priority: 0,
