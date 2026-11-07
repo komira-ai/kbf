@@ -2,7 +2,8 @@
 //! over the jobscheduler's `js-proto`, used by two crates of the workspace: `kbf-server`, whose
 //! host executor submits its jobs to the job service through it (and whose tests take its fake
 //! job server), and the operator's deploy tool, `kbf-deploy`, whose `job-service check` calls
-//! the service with the same client. The integration tests use it too, as a dev-dependency
+//! the service with the same client, and whose `job-service apply` submits its canary job
+//! through it. The integration tests use it too, as a dev-dependency
 //! only: `tests/js_real_service.rs` drives it against the real service. The design makes kbf a
 //! client of the job service that links none of the scheduler's server crates, and the host
 //! executor no longer leases hosts: no file of it names the lease client.

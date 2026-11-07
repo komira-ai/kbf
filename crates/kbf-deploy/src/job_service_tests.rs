@@ -497,10 +497,18 @@ fn the_verb_runs_on_its_own_runtime() {
     let serving = tokio::runtime::Runtime::new().unwrap();
     let server = serving.block_on(FakeJobServer::start()).unwrap();
     let url = server.origin();
+    let exec = kbf_host::testkit::FakeExec::new(501);
+    let mut host = crate::cutover_apply::OnHost {
+        exec: &exec,
+        sleep: &|_| panic!("check never pauses"),
+    };
 
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let verb = JobService::Check(args(&url, &good, None));
-    assert_eq!(run(&verb, &mut out, &mut err), ExitCode::SUCCESS);
+    assert_eq!(
+        run(&verb, &mut host, 0, &mut out, &mut err),
+        ExitCode::SUCCESS
+    );
     assert!(
         String::from_utf8(out)
             .unwrap()
@@ -510,7 +518,10 @@ fn the_verb_runs_on_its_own_runtime() {
 
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let verb = JobService::Check(args(&url, &wrong, None));
-    assert_eq!(run(&verb, &mut out, &mut err), ExitCode::from(1));
+    assert_eq!(
+        run(&verb, &mut host, 0, &mut out, &mut err),
+        ExitCode::from(1)
+    );
     let err = String::from_utf8(err).unwrap();
     assert!(err.starts_with("FAIL: unauthorized: "), "{err}");
 }

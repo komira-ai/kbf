@@ -30,6 +30,15 @@
 //!                        [--service NAME] [--ca-pem PEM] [--json]
 //! kbf-deploy job-service check --url URL --token-file FILE [--ca-file FILE]
 //! kbf-deploy job-service agent-egress --config FILE
+//! kbf-deploy job-service plan --config FILE --url URL --token-file FILE [--ca-file FILE]
+//!                             --hosts N --host-cpus N --host-memory-gib N [--host-slots N]
+//! kbf-deploy job-service apply <the flags of plan> <the restart flags>
+//!                              [--canary-deadline-secs SECS] [--apply]
+//! kbf-deploy job-service back-out --config FILE <the restart flags> [--apply]
+//!   restart flags: --instance NAME --api-token-file FILE --ssh-host ADDRESS --ssh-user USER
+//!                  --ssh-key-file FILE --known-hosts FILE [--api ADDR] [--ssh-port PORT]
+//!                  [--kbf FILE] [--ssh FILE] [--poll-secs SECS] [--drain-deadline-secs SECS]
+//!                  [--ready-deadline-secs SECS]
 //! ```
 //!
 //! Bad flags exit 2 for every subcommand. The `minio` subcommands change a host: without
@@ -62,6 +71,12 @@
 //! `job-service agent-egress` only reads: it prints the egress lines of a farm agent's flags
 //! file from the frontend's `kbf.toml`, and exits 0, or 2 refused (`REFUSED: ...` on stderr: the
 //! file cannot be read, or lacks or misstates a destination) ([`crate::agent_egress`]).
+//! `job-service plan` only reads the frontend's `kbf.toml` (never the token): it prints what the
+//! switch onto the job service sets, and exits 0, 1 the file lacks a key the executor needs
+//! (`FAIL: ...` on stderr, after the plan), or 2 refused ([`crate::cutover`]). `job-service
+//! apply` and `back-out` change the frontend only with `--apply`: they print their steps as
+//! `DRY-RUN:` lines without it, and exit 0 done, 1 a step failed (`FAIL: ...` on stderr), or 2
+//! refused ([`crate::cutover_apply`]).
 //! `minio buckets` reads the MinIO admin key pair from `MINIO_ROOT_USER` and
 //! `MINIO_ROOT_PASSWORD` in the environment (secrets are never flags: argv is
 //! world-readable).
@@ -133,9 +148,10 @@ enum Kit {
     /// One host's row from the coordinator's status: version, health, update, hold. Only
     /// reads.
     HostStatus(crate::host_status::HostStatusArgs),
-    /// The job service a frontend's executor will submit to: `check` calls ListJobs with
-    /// kbf's client token; `agent-egress` prints the egress lines of a farm agent's flags
-    /// file. Only reads.
+    /// The job service a frontend's executor submits to: `check` calls ListJobs with kbf's
+    /// client token; `agent-egress` prints the egress lines of a farm agent's flags file;
+    /// `plan` prints the switch of the executor onto the service (those three only read);
+    /// `apply` makes the switch and `back-out` undoes it, each a dry run without --apply.
     #[command(subcommand)]
     JobService(crate::job_service::JobService),
 }
@@ -418,7 +434,16 @@ pub fn run_at<E: Exec>(
         Kit::Mdm(m) => return mdm_kit(m, exec, now, out, err),
         Kit::Log(a) => return log::run(&a, out, err),
         Kit::HostStatus(a) => return crate::host_status::run(&a, exec.euid(), out, err),
-        Kit::JobService(v) => return crate::job_service::run(&v, out, err),
+        Kit::JobService(v) => {
+            let now_secs = now
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            let mut host = crate::cutover_apply::OnHost {
+                exec: &*exec,
+                sleep: &std::thread::sleep,
+            };
+            return crate::job_service::run(&v, &mut host, now_secs, out, err);
+        }
         Kit::Pilot(p) => {
             return pilot::cli::run(p, exec, env, now, out, err, &pilot::cli::sleep_a_second);
         }

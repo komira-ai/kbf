@@ -1,11 +1,12 @@
-# Moving a frontend's executor onto the job service: what must be in place, and the check
+# Moving a frontend's executor onto the job service: the check, the switch and the back-out
 
 The job service is the jobscheduler's `jobscheduler.v1.JobService`, served by its lease server
-(`js-lease-server`) on the port of that server's `--job-listen`. The design makes kbf a client of
-it: a frontend's executor will submit each action as a job and read the job's result, instead of
-leasing hosts. This page covers what has to be running before a frontend is pointed at the
-service, how kbf's client token gets to the frontend's host, the read-only check that the service
-answers that token, and the way back.
+(`js-lease-server`) on the port of that server's `--job-listen`. kbf is a client of it: a
+frontend whose executor is `js-agent` submits each action as a job and reads the job's result,
+instead of running it on a node's daemon. This page covers what has to be running before a
+frontend is pointed at the service, how kbf's client token gets to the frontend's host, the
+read-only check that the service answers that token, the switch itself (`kbf-deploy job-service
+plan` and `apply`, with a canary job), and the way back (`kbf-deploy job-service back-out`).
 
 **This is not kbf's own `--job-listen`.** A kbf frontend also has a flag of that name: the
 frontend's job-facing read listener, from which a task fetches an action's inputs with a read
@@ -13,20 +14,33 @@ grant ([kbf-modes.md](kbf-modes.md), "The job-facing read listener"). That liste
 kbf and is not an executor mode. The job service on this page is another process, on another
 host or port, reached with the jobscheduler lease server's `--job-listen`.
 
-## Not covered yet
+## The mode
 
-This page and `kbf-deploy job-service check` are the first part of the cutover. Three parts are
-not written yet, because the executor that submits jobs is not in a release yet:
+The executor-to-job-service mode is `executor = "js-agent"` in the `[executor]` table of the
+frontend's `kbf.toml` (the `--executor` flag; [kbf-modes.md](kbf-modes.md) describes every key).
+The switch sets exactly these keys and leaves every other line of the file as it was:
 
-- **The executor's flags**: rendering the flags that point a frontend's executor at the job
-  service (its address, the token file, the shape of the virtual workers:
-  `--executor-job-url`, `--executor-job-token-file`, `--executor-job-ca-file`,
-  `--executor-hosts`, `--executor-host-cpus`, `--executor-host-memory-gib`; see
-  [kbf-modes.md](kbf-modes.md)).
-- **`apply`**: switching a frontend onto the service through the update path.
-- **The canary**: one action run through the job service, checked to complete, after the switch.
+| key (flag) | set to |
+|---|---|
+| `executor` | `"js-agent"` |
+| `executor-job-url` | the job service, `https://host:port` (or `http://` to loopback) |
+| `executor-job-token-file` | the path of kbf's client token on the frontend's host |
+| `executor-job-ca-file` | the CA of the service's certificate, for an `https` URL; removed for an `http` one |
+| `executor-hosts` | how many virtual workers the frontend registers, `js:<frontend id>-<n>` |
+| `executor-host-cpus` | the cores of each virtual worker |
+| `executor-host-memory-gib` | the memory of each virtual worker, in GiB |
+| `executor-host-slots` | the actions each virtual worker runs at once (default 8) |
 
-Until they are, nothing on this page changes a frontend: the check only reads.
+The rest of what `js-agent` needs must be in the file already, and the switch does not write
+it: `executor-frontend-id`, `executor-base-image`, `executor-kbf-image`, the secret delivery
+(`executor-secret-delivery = "files"`, or `executor-insecure-argv-secrets = true` for the
+default `argv`), the packs (`--pack-store-endpoint`), the task runs and the job-facing read
+listener. `plan` names the `[executor]` keys that are missing, and `apply` checks the whole
+new file with `kbf --check` before it puts it in place.
+
+**A flag on the frontend's command line overrides its key.** The switch changes `kbf.toml`
+only. If the unit or a drop-in of it (`systemctl cat <unit>`) passes an `--executor*` flag,
+take that flag out first, or the frontend goes on reading it.
 
 ## What must be running
 
@@ -206,21 +220,242 @@ certificate. The message names the flag.
 **The token never prints.** The output names the token file by its path, in the pass and in every
 failure, and never holds the token itself.
 
+## The plan
+
+```text
+kbf-deploy job-service plan --config FILE --url URL --token-file FILE [--ca-file FILE]
+                            --hosts N --host-cpus N --host-memory-gib N [--host-slots N]
+```
+
+| Flag | Meaning |
+|---|---|
+| `--config <FILE>` | the frontend's `kbf.toml` |
+| `--url`, `--token-file`, `--ca-file` | the job service, as for the check; the token file is named by its path, and `plan` never opens it |
+| `--hosts`, `--host-cpus`, `--host-memory-gib` | the virtual workers' number and shape (each at least 1) |
+| `--host-slots` | the actions each virtual worker runs at once, 1 to 256, default 8 |
+
+It reads the file and prints, for each key the switch sets, what the file holds now and what the
+switch sets; the executor flags of the job-service mode; what the switch keeps from the file;
+and the back-out, the flags of the mode the frontend runs now. It changes nothing.
+
+```text
+kbf-deploy job-service plan (changes nothing)
+config: [executor] in /etc/kbf/kbf.toml
+  executor now: kbf-daemon
+  executor: absent -> "js-agent"
+  executor-job-url: absent -> "https://192.0.2.30:8443"
+  executor-job-token-file: absent -> "/etc/kbf/job-service.token"
+  executor-job-ca-file: absent -> "/etc/kbf/job-service-ca.pem"
+  executor-hosts: absent -> 4
+  executor-host-cpus: absent -> 16
+  executor-host-memory-gib: absent -> 64
+  executor-host-slots: absent -> 8
+the executor flags of the job-service mode:
+  --executor=js-agent
+  --executor-job-url=https://192.0.2.30:8443
+  --executor-job-token-file=/etc/kbf/job-service.token
+  --executor-job-ca-file=/etc/kbf/job-service-ca.pem
+  --executor-hosts=4
+  --executor-host-cpus=16
+  --executor-host-memory-gib=64
+  --executor-host-slots=8
+kept from the file (the executor needs them):
+  executor-frontend-id = "fe-a"
+  executor-base-image = "registry.example/kbf-base@sha256:bbbb...bbbb"
+  executor-kbf-image = "registry.example/kbf@sha256:aaaa...aaaa"
+  executor-secret-delivery = "files"
+back-out: the flags of the mode it runs now:
+  --executor=kbf-daemon (the default: the file has no key)
+  no --executor-job-url
+  no --executor-job-token-file
+  no --executor-job-ca-file
+  no --executor-hosts
+  no --executor-host-cpus
+  no --executor-host-memory-gib
+  no --executor-host-slots
+to switch: kbf-deploy job-service apply with these flags and the restart's (a dry run without --apply)
+```
+
+`no --<flag>` is a key the file does not have. Keep the output: its back-out is the way back
+if the backup that `apply` keeps is ever lost.
+
+Exit 0 the plan is complete. Exit 1 the file lacks something the executor needs: the plan is
+printed with a `MISSING:` line for each, and `FAIL: not ready: ...` names them on stderr. Exit 2
+refused, with nothing printed: a URL that is not `http(s)://host[:port]` or is `http` off the
+loopback, an `https` URL without `--ca-file` or an `http` one with it, a path that is not
+absolute or holds a space, quote, backslash, control character, `%` or `$`, or a file that
+cannot be read, is not TOML, or has an `executor` that is not a table.
+
+## The switch
+
+`apply` is a held step: only an operator runs it, at a time they chose, and without `--apply`
+it is a dry run that changes nothing. There is no `--force`, and no flag skips a step.
+
+```text
+kbf-deploy job-service apply <the flags of plan> <the restart flags>
+                             [--canary-deadline-secs SECS] [--apply]
+```
+
+The restart flags (`back-out` takes the same):
+
+| Flag | Meaning |
+|---|---|
+| `--instance <NAME>` | the frontend's unit as `kbf-host-install` names it: `-` for `kbf-frontend.service`, `NAME` for `kbf-frontend@NAME.service` |
+| `--api <ADDR>` | the frontend's operator API (its `--api-listen`), on loopback; default `127.0.0.1:8982` |
+| `--api-token-file <FILE>` | the operator API's token file, for the drain |
+| `--ssh-host <ADDRESS>`, `--ssh-port <PORT>` | the frontend's host as the updater's inventory lists it, and its ssh port when it is not 22 |
+| `--ssh-user <USER>`, `--ssh-key-file <FILE>` | the user and key the updater logs in with: the key the forced command of `kbf-host-install` is set up for |
+| `--known-hosts <FILE>` | a known-hosts file with the host's key: the only key that is trusted |
+| `--kbf <FILE>`, `--ssh <FILE>` | the `kbf` and `ssh` binaries; default `/usr/bin/kbf` and `/usr/bin/ssh` |
+| `--poll-secs <SECS>` | the time between two asks of a wait; default 5 |
+| `--drain-deadline-secs <SECS>` | how long to wait for the drained frontend to exit. Not given (the default): however long its open executions run, and none is cut |
+| `--ready-deadline-secs <SECS>` | how long to wait for the restarted frontend to be ready, and for its first worker; default 300 |
+| `--canary-deadline-secs <SECS>` | (`apply` only) how long the canary job may take to end; default 600 |
+
+Run it on the frontend's host, as root or as the user that can read the token files and the
+updater's key. With `--apply` it makes these steps in order, printing each first (`+ <step>`),
+and stops at the first that fails:
+
+1. **The check**: one `ListJobs` with kbf's client token, exactly as `job-service check`. A
+   service that cannot be reached or refuses the token stops the switch here, with the message
+   of [The check](#the-check), and nothing has changed.
+2. **The new file**: the switched text is written beside the file as
+   `kbf.toml.job-service-new`, and the original, byte for byte, as `kbf.toml.pre-job-service`,
+   both with the file's mode and owner. `kbf --mode=frontend --config kbf.toml.job-service-new
+   --check` must pass on it (its startup checks: a key the executor needs that is missing or
+   wrong fails here, with kbf's own message). If it fails, both files are removed, and the
+   frontend and its file are as they were.
+3. **The switch**: the staged file is renamed over `kbf.toml`. From here on, a failure says
+   that the switch is in place and prints the back-out.
+4. **The drain and the restart**, the way a roll takes a frontend: `kbf cluster drain
+   --frontend` (`POST /v1/frontend/drain`: the frontend goes out of `/readyz`, refuses new
+   Execute calls and exits when its open executions are done), a wait until its operator API
+   refuses the connection (it has exited), then `restart frontend=<instance>` to the host's
+   `kbf-host-install` over ssh, with the updater's key and the updater's own argument vector
+   (`ssh -F /dev/null -i KEY -o BatchMode=yes ... -T -- USER@ADDRESS 'restart frontend=NAME'`;
+   [host-install.md](host-install.md#what-a-restart-does)). The answer must be `restarted`; a
+   `refused` (`busy` while an install runs) or `failed` answer is quoted. A frontend whose
+   operator API refuses the connection before the drain is not running: it is not drained
+   (`the frontend is not running: nothing to drain`), and the restart starts it. Then a wait
+   until `GET /readyz` answers 200.
+5. **The first worker**: a wait until `GET /v1/nodes/js:<frontend id>-0` answers 200, which
+   it does once the executor of the job service runs and has registered its virtual workers.
+6. **The canary** (below).
+
+```text
+kbf-deploy job-service apply (apply)
+config: [executor] in /etc/kbf/kbf.toml
+  ... the plan, as above ...
++ check: ListJobs on https://192.0.2.30:8443 with the token in /etc/kbf/job-service.token
+job service: https://192.0.2.30:8443
+token file: /etc/kbf/job-service.token
+pass: the job service answered ListJobs (no job of this client yet)
++ stage /etc/kbf/kbf.toml.job-service-new and keep the original as /etc/kbf/kbf.toml.pre-job-service
++ /usr/bin/kbf --mode=frontend --config /etc/kbf/kbf.toml.job-service-new --check
++ rename the staged file over the config
++ /usr/bin/kbf cluster --api 127.0.0.1:8982 drain --frontend --token-file /etc/kbf/api-token (unless http://127.0.0.1:8982/healthz refuses the connection)
++ wait until http://127.0.0.1:8982/healthz refuses the connection (the frontend has exited), however long
++ /usr/bin/ssh -F /dev/null -i /var/lib/kbf-updater/id_ed25519 ... -T -- kbf-updater@192.0.2.20 "restart frontend=-" (env PATH, HOME, LANG)
++ wait for http://127.0.0.1:8982/readyz to answer 200 (the frontend is ready), at most 60 asks
++ wait for http://127.0.0.1:8982/v1/nodes/js:fe-a-0 to answer 200 (the executor of the job service registered its first worker), at most 60 asks
++ canary: submit job kbf-canary-1794048581 (registry.example/kbf@sha256:aaaa...aaaa --version, no network, label kbf-canary=fe-a) and ask after it at most 120 times
+pass: the canary job kbf-canary-1794048581 succeeded on host farm-7
+done: the frontend runs executor = "js-agent"
+back-out: kbf-deploy job-service back-out --config /etc/kbf/kbf.toml with the same restart flags (restores /etc/kbf/kbf.toml.pre-job-service and restarts the same way); it returns to:
+  --executor=kbf-daemon (the default: the file has no key)
+  ...
+```
+
+The dry run prints the same plan and each step as `DRY-RUN: <step>`, then `dry run: nothing
+changed. Re-run with --apply.` and the back-out. It contacts nothing: not the job service, not
+the operator API, not ssh.
+
+Exit 0 done. Exit 1 a step failed (`FAIL: <step's message>` on stderr; after step 3, stdout
+also says the switch is in place and prints the back-out). Exit 2 refused before any step:
+the refusals of `plan`; a file that lacks a key the executor needs (run `plan`); a file that
+already runs `executor = "js-agent"`; a `kbf.toml.pre-job-service` or
+`kbf.toml.job-service-new` that is there already (a switch that was not backed out); a file
+the switch cannot rewrite line by line (a key written as a dotted or quoted name, a value over
+several lines: make the change by hand); an `--instance`, `--ssh-user` or `--ssh-host` that
+`kbf-host-install` or ssh would not take; an `--api` off the loopback.
+
+A restart of the frontend fails the builds in flight on it, so the drain waits for them
+first; pick a quiet time all the same, as for any restart of a frontend.
+
+## The canary
+
+After the switch, `apply` submits one job to the job service with kbf's client token and asks
+after it once per `--poll-secs` until it ends:
+
+- **What it runs**: the frontend's own kbf image (`executor-kbf-image`, without `docker://`),
+  whose entrypoint is the task tool, with the one argument `--version`. It needs no grant, no
+  pack and no network: it shows that the service takes kbf's token and places a job of the
+  executor's kind (`os=linux`, `executor-arch`, containers), and that a farm agent pulls the kbf
+  image by its digest and runs it to exit 0.
+- **Its shape**: 1 core, 1 GiB of memory and 1 GiB of disk, no network
+  (`NETWORK_LEVEL_NONE`), a wall limit of 300 seconds. Its id is `kbf-canary-<seconds since
+  the epoch>`, so every run makes a new job.
+- **Its label**: `kbf-canary=<frontend id>`, and no `kbf-frontend` label. The executor reads
+  `kbf-frontend` to find the jobs of other frontends and stops when it finds one, so a canary
+  carrying it would stop the frontend it checks.
+
+A job that `SUCCEEDED` passes (`pass: the canary job <id> succeeded on host <host>`). One that
+ended any other way (`failed`, `failed to start`, with the agent's words when it gave some,
+`cancelled`, `lost`), or that the service does not know, fails, naming how. One that has not
+ended by `--canary-deadline-secs` is cancelled, and the canary fails naming its last state
+(`queued` means no farm agent took it: see [What must be running](#what-must-be-running)). A
+failed canary leaves the switch in place and prints the back-out: the frontend runs on the job
+service, but whether its jobs can run is in doubt until the cause is found.
+
 ## Backing out
 
-Until the executor that submits jobs is released, there is nothing to back out: the check changes
-nothing, and a frontend runs as it did. To take kbf off the service altogether, remove its
-`[[client]]` entry and restart the lease server, and delete the token file on the frontend's host.
+```text
+kbf-deploy job-service back-out --config FILE <the restart flags> [--apply]
+```
 
-After a frontend has been switched onto the service, the way back is to set its executor back to the
-mode it ran before, through the same update path: its `--executor` and the flags of that mode as
-they were, or `executor = "kbf-daemon"`, the default, with `--executor-locate` removed in the same
-edit ([kbf-modes.md](kbf-modes.md) gives the rule). **That flag flip works only while the release
-still carries the mode it flips back to.** A frontend that ran on the embedded engine (the
-jobscheduler core built into kbf, `--scheduler-core js`) or on the lease-based `js-agent` executor
-can be flipped back to it only with a release that has it; once a release without them is
-installed, the way back to them is the previous kbf release, not a flag. The steps for the switch
-and for its back-out are written with the switch itself (see "Not covered yet").
+`back-out` puts back the file `apply` kept and restarts the frontend the same way. With
+`--apply`: `kbf --check` on `kbf.toml.pre-job-service`; the backup put back over `kbf.toml`
+(its bytes, mode and owner are staged beside the file and renamed over it, so the file is the
+original again, byte for byte); the drain (skipped for a frontend that is not running), the wait
+for the exit, `restart frontend=<instance>` through `kbf-host-install` and the wait for
+`/readyz`; and only then the removal of the backup. A back-out that stops on the way says
+`the back-out stopped; ... is kept: run back-out again once the cause is fixed`, and run again
+it starts over from the check. Without `--apply` it prints the flags it returns to and its
+steps, and changes nothing.
+
+```text
+kbf-deploy job-service back-out (dry run)
+config: /etc/kbf/kbf.toml.pre-job-service back over /etc/kbf/kbf.toml
+  executor now: js-agent, then: kbf-daemon
+the flags it returns to:
+  --executor=kbf-daemon (the default: the file has no key)
+  no --executor-job-url
+  ...
+DRY-RUN: /usr/bin/kbf --mode=frontend --config /etc/kbf/kbf.toml.pre-job-service --check
+DRY-RUN: put /etc/kbf/kbf.toml.pre-job-service back over /etc/kbf/kbf.toml
+DRY-RUN: /usr/bin/kbf cluster --api 127.0.0.1:8982 drain --frontend --token-file /etc/kbf/api-token (unless http://127.0.0.1:8982/healthz refuses the connection)
+...
+DRY-RUN: remove /etc/kbf/kbf.toml.pre-job-service
+dry run: nothing changed. Re-run with --apply.
+```
+
+It is refused (exit 2) when there is no `kbf.toml.pre-job-service`. The whole file is put back,
+not only the executor's keys: a change made to it by hand after the switch is lost, and has to
+be made again. Stopping the frontend for the restart cancels any job of its still on the
+service; the drain before it has waited for the builds open on it.
+
+Without the backup, the back-out is the flags `plan` printed before the switch: set those keys
+back as they were (`no --<flag>`: remove the key), or `executor = "kbf-daemon"`, the default,
+with `executor-locate` and `executor-secret-delivery = "files"` removed in the same edit, since
+`kbf-daemon` refuses them ([kbf-modes.md](kbf-modes.md) gives the rule); then restart through
+the same path. **That flip works only while the release still carries the mode it flips back
+to.** A frontend that ran on the embedded engine (the jobscheduler core built into kbf,
+`--scheduler-core js`) or on the lease-based `js-agent` executor can be flipped back to it only
+with a release that has it; once a release without it is installed, the way back to it is the
+previous kbf release, not a flag.
+
+To take kbf off the service altogether, back the frontend out, then remove kbf's `[[client]]`
+entry, restart the lease server, and delete the token file on the frontend's host.
 
 ## Related pages
 
@@ -228,4 +463,7 @@ and for its back-out are written with the switch itself (see "Not covered yet").
   job-facing read listener.
 - [state-store-cutover.md](state-store-cutover.md): the other cutover of a frontend, its state onto
   Postgres.
-- [kbf-updater.md](kbf-updater.md): the update path a switch goes through.
+- [kbf-updater.md](kbf-updater.md): the roll, whose drain and `kbf-host-install` restart the
+  switch and its back-out use.
+- [host-install.md](host-install.md): `kbf-host-install`'s forced command, its `restart` request
+  and its answers.
