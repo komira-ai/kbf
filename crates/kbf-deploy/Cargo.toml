@@ -60,6 +60,8 @@ tar.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tokio = { workspace = true, features = ["rt"] }
+# `job-service agent-egress` reads the frontend's `kbf.toml`.
+toml.workspace = true
 tonic.workspace = true
 x509-parser.workspace = true
 zip.workspace = true

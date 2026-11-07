@@ -35,6 +35,11 @@ pub enum JobService {
     /// answers, fails naming the address when it cannot be reached, and fails as unauthorized
     /// when it refuses the token. Only reads.
     Check(CheckArgs),
+    /// Print the egress lines of a farm agent's flags file (`/etc/js-agent/flags`) from the
+    /// frontend's `kbf.toml`: the allow-list ceiling and one `--egress-allow` for the tier
+    /// store's proxy, the read listener and, with `executor-locate`, the store a task reads
+    /// from. Only reads.
+    AgentEgress(crate::agent_egress::AgentEgressArgs),
 }
 
 /// The arguments of `kbf-deploy job-service check`.
@@ -204,6 +209,7 @@ pub fn run(verb: &JobService, out: &mut dyn Write, err: &mut dyn Write) -> ExitC
                 .build();
             run_on(runtime, a, out, err)
         }
+        JobService::AgentEgress(a) => crate::agent_egress::run(a, out, err),
     }
 }
 
