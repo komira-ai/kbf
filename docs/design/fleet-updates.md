@@ -570,7 +570,8 @@ way to block updates. This path is for the time before MDM is live, not a design
   network, not only on an overlay network, because a freshly erased Mac enrolls
   before any overlay client is installed (M6). Its API is not: only `kbf-mdm-gate`
   holds the API key.
-- **`kbf-mdm-gate`** (decision: build it, S5). A small process beside the MDM that
+- **`kbf-mdm-gate`** (decision: build it, S5; superseded: it was never deployed and is
+  deleted, and the MDM gate is `hostkeeper-mdm-gate` in komira-ai/hostkeeper). A small process beside the MDM that
   holds the API key and offers `kbf-server`, over mTLS pinned to the server's
   identity, only the verbs of M2.2: `status`, `enforce` (and `withdraw`) of a build
   a signed set names for that Mac's pool, `profile` (an allowlisted one),

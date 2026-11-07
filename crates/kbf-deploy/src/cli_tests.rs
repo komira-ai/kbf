@@ -580,42 +580,15 @@ fn a_pilot_verb_runs_through_the_same_command_line() {
     assert!(exec.log.is_empty() && exec.queries.borrow().is_empty());
 }
 
-/// Catches `mdm erase-request` not wired to the kit, a pair that does not check
-/// exiting other than 1, and a refusal other than 2. Also catches the verb not wired to
-/// the clock: the signed request's not-after must equal the run's instant plus 15 min
-/// (a stuck or zero clock, or a wrong offset, fails). And catches a fixed or counted
-/// nonce: two signed requests must carry nonces that differ in at least 8 of their 16
-/// bytes (equal nonces make the gate's replay check refuse every request after the
-/// first; a counter differs in one byte).
-/// In-process, so the lib tests' instantiation of `run` covers the arm.
+/// Catches `mdm erase-request` still taken by the command line (or answered by anything
+/// but clap's usage error, exit 2 with nothing asked of the host or written): the MDM
+/// gate that read its requests is deleted, so an operator who still calls the verb must
+/// fail loudly, not be handed a signed file that nothing checks.
 #[test]
-fn mdm_erase_request_signs_and_its_refusals_exit_2() {
-    use kbf_host::exec::Entry;
-    use kbf_mdm::signers::{FLAG_USER_PRESENT, NAMESPACE};
-    use kbf_mdm::testkit::SkKey;
-
-    let key = SkKey::new(9);
+fn the_retired_erase_request_verb_is_a_usage_error() {
     let mut exec = FakeExec::new(501);
-    let public = HostPath::new("/srv/op/id_erase_sk.pub").expect("path");
-    let bytes = format!("{}\n", key.openssh()).into_bytes();
-    exec.entries.insert(
-        public,
-        Entry::File {
-            perms: kbf_host::step::Perms::new(0o644),
-            owner: kbf_host::testkit::RUNNER,
-            bytes,
-        },
-    );
-    let flags = Rc::new(RefCell::new(FLAG_USER_PRESENT));
-    let seen = Rc::clone(&flags);
-    let signed = Rc::new(RefCell::new(Vec::<Vec<u8>>::new()));
-    let log = Rc::clone(&signed);
-    exec.answer = Box::new(move |cmd| {
-        log.borrow_mut().push(cmd.stdin.clone());
-        let sig = key.sign_with(NAMESPACE, &cmd.stdin, *seen.borrow());
-        Ok(reply(0, &sig, ""))
-    });
-    let base = [
+    // Every argument the verb required, with `--apply`, so it parsed before.
+    let args = [
         "mdm",
         "erase-request",
         "--serial",
@@ -624,76 +597,18 @@ fn mdm_erase_request_signs_and_its_refusals_exit_2() {
         "leak after reboot",
         "--key",
         "/srv/op/id_erase_sk",
+        "--out",
+        "/srv/op/a.req",
+        "--apply",
     ];
-    let with = |out: &str, extra: &[&'static str]| -> Vec<String> {
-        let mut v: Vec<String> = base.iter().map(|s| (*s).to_owned()).collect();
-        v.extend(["--out".to_owned(), out.to_owned()]);
-        v.extend(extra.iter().map(|s| (*s).to_owned()));
-        v
-    };
-    let call = |exec: &mut FakeExec, v: &[String]| {
-        let v: Vec<&str> = v.iter().map(String::as_str).collect();
-        cli(exec, &no_env, &v)
-    };
-
-    let (code, out, err) = call(&mut exec, &with("/srv/op/a.req", &["--apply"]));
-    assert_eq!(code, ExitCode::SUCCESS, "{err}");
+    let (code, out, err) = cli(&mut exec, &no_env, &args);
+    assert_eq!((code, out.as_str()), (ExitCode::from(2), ""), "{err}");
     assert!(
-        out.starts_with("erase request for C02ABC123XYZ, acceptable until "),
-        "{out}"
-    );
-    assert!(out.contains("    purpose erase-now\n"), "{out}");
-    assert!(
-        out.contains("+ run /usr/bin/ssh-keygen -Y sign -n kbf-mdm-erase"),
-        "{out}"
-    );
-    assert!(
-        out.contains("send /srv/op/a.req and /srv/op/a.req.sig"),
-        "{out}"
-    );
-
-    let (code, _, err) = call(&mut exec, &with("/srv/op/a2.req", &["--apply"]));
-    assert_eq!(code, ExitCode::SUCCESS, "{err}");
-    let requests: Vec<kbf_mdm::request::EraseRequest> = signed
-        .borrow()
-        .iter()
-        .map(|b| kbf_mdm::request::parse(std::str::from_utf8(b).expect("utf-8")).expect("parse"))
-        .collect();
-    assert_eq!(requests.len(), 2);
-    let not_after = requests[0].not_after;
-    assert_eq!(
-        not_after,
-        i64::try_from(NOW_SECS).expect("secs") + 15 * 60,
-        "not-after is the run's instant plus 900 s"
-    );
-    let nonce = |r: &kbf_mdm::request::EraseRequest| hex::decode(&r.nonce).expect("hex");
-    let (n1, n2) = (nonce(&requests[0]), nonce(&requests[1]));
-    assert_eq!((n1.len(), n2.len()), (16, 16));
-    let differ = n1.iter().zip(&n2).filter(|(a, b)| a != b).count();
-    assert!(
-        differ >= 8,
-        "nonces {} and {} differ in {differ} bytes",
-        requests[0].nonce,
-        requests[1].nonce
-    );
-
-    *flags.borrow_mut() = 0;
-    let (code, _, err) = call(&mut exec, &with("/srv/op/b.req", &["--apply"]));
-    assert_eq!(code, ExitCode::FAILURE, "{err}");
-    assert!(
-        err.starts_with(
-            "kbf-deploy: /srv/op/b.req and /srv/op/b.req.sig would be refused by the gate"
-        ),
+        err.contains("unrecognized subcommand 'erase-request'"),
         "{err}"
     );
-
-    let (code, out, err) = call(&mut exec, &with("/srv/op/c.req", &["--valid-for", "61"]));
-    assert_eq!((code, out.as_str()), (ExitCode::from(2), ""), "{err}");
-    assert!(err.starts_with("REFUSED: --valid-for 61"), "{err}");
-
-    let (code, _, err) = call(&mut exec, &with("c.req", &[]));
-    assert_eq!(code, ExitCode::from(2), "{err}");
-    assert!(err.contains("is not absolute"), "{err}");
+    assert!(exec.queries.borrow().is_empty(), "the verb asked the host");
+    assert!(exec.log.is_empty(), "the verb changed the host");
 }
 
 /// Catches a `tls`, `push-cert` or `dep` verb not wired to its kit (each reaches the

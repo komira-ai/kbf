@@ -58,7 +58,6 @@ kbf-mapsync.workspace = true
 kbf-caps.workspace = true
 kbf-estimator.workspace = true
 kbf-enroll-registry.workspace = true
-kbf-mdm-api.workspace = true
 kbf-meta.workspace = true
 kbf-objstore.workspace = true
 # The pack keys, the read cache and the errors of the frontend's packs (frontend/pack_flags.rs).

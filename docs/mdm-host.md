@@ -1,5 +1,19 @@
 # mdm-host: the MDM host layer
 
+**Frozen: the MDM kit moved to komira-ai/hostkeeper.** Its successors there are
+`hostkeeper-mdm-core` (for `mdm-core`), `hostkeeper-mdm-step` (for `host-step`) and
+`hostkeeper-mdm` (for `mdm-host`, and for the `push-cert` and `dep` verbs of kbf-deploy's
+`mdm` kit), with hostkeeper's names on the host. `hostkeeper-mdm migrate --from` moves a host
+installed by this kit or by kbf-deploy's onto them, keeping the old state directory for a
+back-out. The copies here take no new work. They stay, unchanged, until the live MDM host has
+been migrated, because its stack was installed from this code; then they are deleted:
+`mdm-core`, `host-step`, `mdm-host` and kbf-deploy's `mdm` kit. The MDM gate `kbf-mdm`
+(binary `kbf-mdm-gate`), its protocol crate `kbf-mdm-api` and `kbf-server`'s client of it are
+already deleted: they were never deployed, nothing ran them, and the gate is
+`hostkeeper-mdm-gate`, linked into hostkeeper's coordinator. kbf-deploy's `mdm erase-request`,
+which signed requests for that gate alone, went with it. The rest of this page describes the
+frozen code as it is.
+
 `mdm-host` is the MDM for enrolling Macs as compute hosts. It runs NanoHUB, a SCEP server,
 NanoDEP and Caddy as capped systemd services on one Linux host. It belongs with the update
 coordinator (the coordinator tracks every device and updates the software on it; MDM is the
@@ -40,14 +54,15 @@ changed. The package boundaries and the rules that keep them:
 
 What exists beside them, and what is left to do:
 
-* jobscheduler still holds its copy until a change there removes it and points its docs here.
+* jobscheduler still holds its copy until a change there removes it, pointing at hostkeeper.
 * kbf-deploy's `mdm` kit is the older installer `mdm-core` was first ported from; it also has
-  `push-cert`, `dep` and `erase-request`. The two install the same services, and the kit is
-  folded into `mdm-host` (or removed) in a later change. Until then, use one tool per host.
-* Wiring the MDM into the update coordinator is a later design step.
-* The on-disk `js-mdm` names change together, once the coordinator's product has its name.
+  `push-cert` and `dep`. The two install the same services; use one tool per host. Both are
+  frozen and are deleted together (above).
+* Wiring the MDM into the update coordinator, and the hostkeeper names on the host, are
+  hostkeeper's.
 * Defects and test gaps that came over unchanged with the move are listed in
-  komira-ai/kbf#2248; each is fixed in a change of its own, with a test that fails first.
+  komira-ai/kbf#2248. They are fixed in hostkeeper's port, each with a test that fails on the
+  code as it was moved; this frozen copy keeps them until it is deleted.
 
 ## Verbs
 
@@ -111,7 +126,7 @@ stderr).
 ## Not in this slice
 
 `push-cert` (the APNs push certificate and the enrollment profile), `dep` (Apple Business
-Manager) and `erase`, and the checks that dial the proxy over HTTPS. The enrollment profile is
+Manager) and the checks that dial the proxy over HTTPS (`hostkeeper-mdm` has the first two). The enrollment profile is
 therefore not yet written or compared. Security notes for the profile are in `mdm-core`'s
 crate documentation.
 

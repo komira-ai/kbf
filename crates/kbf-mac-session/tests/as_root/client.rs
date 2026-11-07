@@ -252,8 +252,8 @@ mod macos {
                 println!("{}", if existed { "existed" } else { "absent" });
             }
             ["grant", seed, serial, lease, issued] => {
-                // The `token` of the gate's `grant-admin` answer (kbf-mdm's
-                // `GrantKey::sign`): valid for an hour from `issued`.
+                // The `token` of the gate's `grant-admin` answer (the deleted
+                // kbf-mdm's `GrantKey::sign`): valid for an hour from `issued`.
                 let issued: i64 = issued.parse().expect("issued is unix seconds");
                 let time = |secs: i64| {
                     let utc = format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]Z");

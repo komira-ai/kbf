@@ -3,12 +3,9 @@
 //! accepted exactly as issued, and every tampered form refused.
 //!
 //! The fixtures were printed by running `GrantKey::sign` in `kbf-mdm` for each row
-//! below (seed `[seed; 32]`); `kbf-mdm`'s test
-//! `the_tokens_kbf_mac_session_pins_are_what_sign_produces` pins the same bytes on
-//! the gate's side, so a change to the format on either side goes red on that side.
-//! This crate does not depend on `kbf-mdm` (the Linux gate); `kbf-mdm`'s
-//! `tests/mac_session_verifies.rs` links the two and checks freshly signed grants
-//! against this verifier.
+//! below (seed `[seed; 32]`). `kbf-mdm`, a Linux gate that was never deployed, is
+//! deleted, so these fixed bytes are now the only record of the format it issued, and
+//! a change to this crate's reading of it fails here.
 
 use std::time::{Duration, UNIX_EPOCH};
 

@@ -1,5 +1,9 @@
 //! `mdm-host`: applies [`mdm_core`]'s rendered output to a Linux host.
 //!
+//! **Frozen.** The successor of this crate is `hostkeeper-mdm` in komira-ai/hostkeeper. It
+//! takes no new work, and is deleted once the live MDM host runs the hostkeeper kit
+//! (`docs/mdm-host.md`).
+//!
 //! mdm-host is the MDM for enrolling Macs as compute hosts (NanoHUB, a SCEP server, NanoDEP
 //! and Caddy as capped systemd services on one Linux host). It is its own binary, beside the
 //! update coordinator and apart from the `kbf` binary, and links no other crate of this
