@@ -56,9 +56,11 @@ pub(crate) trait Host {
     fn pause(&mut self, secs: u64);
 }
 
-/// The real host: tools and HTTP through `exec`, and a pause that sleeps.
+/// The real host: tools and HTTP through `exec`, and a pause of `sleep`.
 pub(crate) struct OnHost<'a, E: Exec> {
     pub(crate) exec: &'a E,
+    /// How a pause waits: `std::thread::sleep` on a host.
+    pub(crate) sleep: &'a dyn Fn(Duration),
 }
 
 impl<E: Exec> Host for OnHost<'_, E> {
@@ -72,7 +74,7 @@ impl<E: Exec> Host for OnHost<'_, E> {
 
     fn pause(&mut self, secs: u64) {
         // Nothing else runs on the cutover's runtime between two asks.
-        std::thread::sleep(Duration::from_secs(secs));
+        (self.sleep)(Duration::from_secs(secs));
     }
 }
 

@@ -438,7 +438,10 @@ pub fn run_at<E: Exec>(
             let now_secs = now
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs());
-            let mut host = crate::cutover_apply::OnHost { exec: &*exec };
+            let mut host = crate::cutover_apply::OnHost {
+                exec: &*exec,
+                sleep: &std::thread::sleep,
+            };
             return crate::job_service::run(&v, &mut host, now_secs, out, err);
         }
         Kit::Pilot(p) => {

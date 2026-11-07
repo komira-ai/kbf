@@ -119,7 +119,10 @@ fn the_real_host_goes_through_exec() {
     let mut exec = FakeExec::new(501);
     exec.http = Err(io::ErrorKind::ConnectionRefused);
     exec.answer = Box::new(|_| Ok(reply(7, "", "")));
-    let mut host = OnHost { exec: &exec };
+    let mut host = OnHost {
+        exec: &exec,
+        sleep: &|_| panic!("no pause"),
+    };
     let cmd = Cmd::new(HostPath::new("/bin/x").unwrap());
     assert_eq!(host.run(&cmd).unwrap().status.code(), Some(7));
     let url = api_url("127.0.0.1:1".parse().unwrap(), "/").unwrap();
@@ -129,9 +132,21 @@ fn the_real_host_goes_through_exec() {
     );
 }
 
-/// Behaviour: the real host's pause returns (a pause of no seconds; nothing is timed).
+/// Behaviour: the real host's pause waits the seconds it is asked for, through its sleep,
+/// once per pause (the sleep is recorded, not timed).
 #[test]
-fn the_real_host_pauses() {
+fn the_real_host_pauses_for_the_seconds_asked() {
     let exec = FakeExec::new(501);
-    OnHost { exec: &exec }.pause(0);
+    let slept = std::cell::RefCell::new(Vec::new());
+    let sleep = |d: Duration| slept.borrow_mut().push(d);
+    let mut host = OnHost {
+        exec: &exec,
+        sleep: &sleep,
+    };
+    host.pause(5);
+    host.pause(1);
+    assert_eq!(
+        *slept.borrow(),
+        [Duration::from_secs(5), Duration::from_secs(1)]
+    );
 }

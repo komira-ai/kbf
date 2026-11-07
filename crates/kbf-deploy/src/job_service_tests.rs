@@ -498,7 +498,10 @@ fn the_verb_runs_on_its_own_runtime() {
     let server = serving.block_on(FakeJobServer::start()).unwrap();
     let url = server.origin();
     let exec = kbf_host::testkit::FakeExec::new(501);
-    let mut host = crate::cutover_apply::OnHost { exec: &exec };
+    let mut host = crate::cutover_apply::OnHost {
+        exec: &exec,
+        sleep: &|_| panic!("check never pauses"),
+    };
 
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let verb = JobService::Check(args(&url, &good, None));
