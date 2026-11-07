@@ -204,8 +204,8 @@ impl Rig {
         // The job's wall limit is the action's timeout: no margin is added.
         cfg.run_margin = Duration::ZERO;
         // A job asks for 1 GiB of disk beside its output's, and the service wants a host whose
-        // scratch has that many whole GiB free: the node's scratch is on `/run`, a tmpfs of a
-        // tenth of a hosted runner's memory, which has more than 1 GiB and less than 2.
+        // scratch has that many whole GiB free: the node's scratch is on `/run`, a tmpfs (3.2 GiB
+        // on a hosted runner), which holds 1 GiB but not the 9 GiB of the default output disk.
         cfg.output_disk_bytes = 0;
         let farm = Arc::new(Farm::new(
             Arc::new(Cache::memory()),
