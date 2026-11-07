@@ -668,19 +668,22 @@ async fn a_temporary_items_of_another_user_is_not_swept() {
     assert!(kept, "swept a TemporaryItems owned by root");
 }
 
-/// The newest Xcode on this runner whose `xcrun --find` finds both tools the test runs,
-/// the Metal compiler and `metallib`, outside any sandbox (a node without the Metal
-/// toolchain installed has none to test; the macos-15 runner's Xcode 26 has `metal` and no
-/// `metallib`). A tool found here and not under the lease's sandbox still fails the test.
+/// The newest Xcode on this runner whose Metal toolchain works outside any sandbox:
+/// `xcrun metal --version` runs the compiler and `xcrun --find metallib` finds the linker. A
+/// node without the Metal toolchain installed has none to test: the macos-15 runner's Xcode 26
+/// finds `metal`, then refuses to run it ("missing Metal Toolchain"), and finds no `metallib`.
+/// A tool that works here and not under the lease's sandbox still fails the test.
 fn xcode_with_metal() -> Option<(String, PathBuf)> {
+    let works = |developer_dir: &PathBuf, args: &[&str]| {
+        std::process::Command::new(xcode::XCRUN)
+            .args(args)
+            .env("DEVELOPER_DIR", developer_dir)
+            .output()
+            .is_ok_and(|out| out.status.success())
+    };
     xcodes().into_iter().rev().find(|(_, developer_dir)| {
-        ["metal", "metallib"].iter().all(|tool| {
-            std::process::Command::new(xcode::XCRUN)
-                .args(["--find", tool])
-                .env("DEVELOPER_DIR", developer_dir)
-                .output()
-                .is_ok_and(|out| out.status.success())
-        })
+        works(developer_dir, &["metal", "--version"])
+            && works(developer_dir, &["--find", "metallib"])
     })
 }
 
