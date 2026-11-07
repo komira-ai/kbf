@@ -206,7 +206,7 @@ pub(super) fn request(tag: u8) -> Request {
 }
 
 fn try_farm_over(store: &Arc<Racing>) -> Result<Farm, StateError> {
-    Farm::new_legacy(
+    Farm::new(
         Arc::new(Cache::memory()),
         kbf_sched::UNSERVABLE_WAIT,
         kbf_sched::FINISHED_RETENTION,
@@ -653,7 +653,7 @@ fn a_bump_through_a_farm_is_served_by_the_next_start() {
     assert_eq!(farm.lease_epoch(), epoch);
     assert_eq!(counter(&store, EPOCH), epoch + 1);
     assert_eq!(farm_over(&store).lease_epoch(), epoch + 1);
-    let bare = Farm::new_legacy(
+    let bare = Farm::new(
         Arc::new(Cache::memory()),
         kbf_sched::UNSERVABLE_WAIT,
         kbf_sched::FINISHED_RETENTION,

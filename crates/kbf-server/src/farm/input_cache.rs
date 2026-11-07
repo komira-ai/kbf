@@ -19,7 +19,6 @@ impl Farm {
         stream: StreamId,
         counts: Option<InputCacheCounts>,
     ) {
-        js_arm!(self, views::note_input_cache(worker, stream, counts));
         let mut state = self.lock();
         if !state.side.is_current(worker, stream) {
             return;
@@ -33,7 +32,6 @@ impl Farm {
     /// The newest input cache counts of every node that sent any, in node-id order.
     #[must_use]
     pub fn input_caches(&self) -> Vec<(WorkerId, InputCacheCounts)> {
-        js_arm!(self, views::input_caches());
         let state = self.lock();
         let kept = state.side.input_caches.iter();
         kept.map(|(worker, counts)| (worker.clone(), *counts))

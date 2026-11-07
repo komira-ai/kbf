@@ -19,8 +19,8 @@ pub enum PlacementPredictions {
     /// The prediction is computed and counted at submit and compared with the run when it
     /// ends; the scheduler is given nothing, so placement is what `off` does.
     Shadow,
-    /// The prediction is computed at submit (on the legacy core, and again for an operation
-    /// read back from the state store) and given to the scheduler as the cost of the
+    /// The prediction is computed at submit (and again for an operation read back from
+    /// the state store) and given to the scheduler as the cost of the
     /// operation's lease.
     On,
 }

@@ -356,8 +356,7 @@ pub struct Args {
     /// booking is therefore the first rung, or the GiB the action names in
     /// `kbf-book-mem-gib`. No floor is raised, so with `--learned-sizes on` an own-limit
     /// kill leaves none either. A kill the node made under memory pressure is not the
-    /// action's: it runs again with the same booking, as it does without this flag. Needs
-    /// `--scheduler-core legacy`; a server given it with `js` refuses to start (exit status 2)
+    /// action's: it runs again with the same booking, as it does without this flag
     #[arg(long)]
     pub no_memory_climb: bool,
     /// The cores a node that reports VM slots (`vm.slots`) keeps for the host itself:
@@ -389,19 +388,17 @@ pub struct Args {
     /// until it ends.
     #[arg(long, value_enum, default_value_t = crate::LearnedSizes::Off)]
     pub learned_sizes: crate::LearnedSizes,
-    /// Which core drives the farm's scheduling. `legacy`, the default, is the driver the
-    /// server has always had. `js` runs the farm on the js scheduler core: it learns sizes in
-    /// `shadow` at most (`--learned-sizes on` with it is refused at start, exit status 2), and
-    /// it answers an operation by its `operations/<id>` name only. Either core reads the rows
-    /// the other wrote to the state store, so a restart with the other value takes them up.
-    /// The core a server runs is logged at start and exported as `kbf_scheduler_core{core}`,
-    /// 1 for it and 0 for the other
+    /// Which core drives the farm's scheduling. The one value is `legacy`, the default: the
+    /// driver the server has always had. `js` names a core that was removed, because
+    /// scheduling runs in the job service, and is refused at start (exit status 2). The core a
+    /// server runs is logged at start and exported as `kbf_scheduler_core{core}`, the one
+    /// series `kbf_scheduler_core{core="legacy"} 1`
     // The text above states the default; the help golden cannot hold the whitespace-only
     // line clap prints before a `[default: ...]` line.
     #[arg(
         long,
-        value_enum,
-        default_value_t = crate::SchedulerCore::Legacy,
+        value_parser = crate::scheduler_core::parse,
+        default_value = "legacy",
         hide_default_value = true
     )]
     pub scheduler_core: crate::SchedulerCore,
@@ -411,15 +408,9 @@ pub struct Args {
     /// a node that reports none is charged by prediction alone, and a node that has never sent
     /// a reading the server accepted is charged at least 1000 m for each lease (the node's
     /// whole CPU capacity, if that is less), so a prediction under one core changes nothing for
-    /// such a node. It is read under either `--scheduler-core`. With `js`, `on` is the
-    /// scheduler's placement by load as a whole, with settings the server fixes
-    /// (`placement_load.rs`; none is a flag): besides the reading it applies the guard that
-    /// keeps the flat memory charged to a node within its memory, and scores nodes by balance.
-    /// It also sets a learned time profile charged per minute and an expected-life charge that
-    /// ends a new lease at its key's expected life plus two minutes; both read curves, which the
-    /// scheduler has only under `--usage-profiles on` and is idle without. The memory guard counts
-    /// only leases that carry a memory (a retry up the memory ladder, a VM) unless
-    /// `--placement-predictions on` gives leases one
+    /// such a node. `on` also keeps the flat memory charged to a node's leases within the
+    /// node's memory; that guard counts only leases that carry a memory (a retry up the
+    /// memory ladder, a VM) unless `--placement-predictions on` gives leases one
     // The text above states the default; the help golden cannot hold the whitespace-only
     // line clap prints before a `[default: ...]` line.
     #[arg(
@@ -439,13 +430,12 @@ pub struct Args {
     /// it) or over (less than half of it) in `kbf_prediction_vs_run_total`; the operations
     /// given a prediction are counted in `kbf_prediction_made_total` and those given none,
     /// by why, in `kbf_prediction_unset_total`. Placement is exactly what `off` does. `on`
-    /// gives the scheduler the prediction as the cost of the operation's lease, at submit (on
-    /// the legacy core also again for an operation read back from the state store at a
-    /// start), which charges the learned memory as well as the cores: a lease is admitted to
-    /// a node only while the memory charged to the node's leases stays within the node's
-    /// memory. An operation the estimator has no usable row for, or is not asked about (not
-    /// an action, one that asks for a GPU, no OS pinned, no subject), gets none and is
-    /// charged as it is with `off`. `shadow` and `on` need `--learned-sizes shadow` or `on`;
+    /// gives the scheduler the prediction as the cost of the operation's lease, at submit (and
+    /// again for an operation read back from the state store at a start), which charges the
+    /// learned memory as well as the cores: a lease is admitted to a node only while the
+    /// memory charged to the node's leases stays within the node's memory. An operation the
+    /// estimator has no usable row for, or is not asked about (not an action, one that asks
+    /// for a GPU, no OS pinned, no subject), gets none and is charged as it is with `off`. `shadow` and `on` need `--learned-sizes shadow` or `on`;
     /// `on` needs `--placement-load on`; a prediction only changes what the lease is charged:
     /// the memory limit and the cores it is booked and run with stay the request's and the
     /// ladder's. A server given a combination that breaks one of these refuses to start
@@ -458,19 +448,12 @@ pub struct Args {
         hide_default_value = true
     )]
     pub placement_predictions: crate::PlacementPredictions,
-    /// Whether the farm learns what its leases use, for the scheduler's admission by load.
-    /// `off`, the default, learns nothing and writes no row. `record` and `on` need
-    /// `--scheduler-core js` and `--state-store`, and learn a profile of each action shape from
-    /// the runs the farm hears of, which they store; `on` also needs `--placement-load on` and
-    /// `--placement-predictions on`, since the scheduler reads a curve only for an action that
-    /// has a prediction. `record` places as `off` does. `on` gives the scheduler the curves, so
-    /// that an action with a prediction and a curve is charged by the curve (its cores per
-    /// minute, its remaining maximum memory, an expected life) instead of flat, which can place
-    /// work where `record` would queue it; an action with no prediction, or whose key has not
-    /// been run for over 60 days, is charged flat. A value other than `off` also changes the start line
-    /// `usage profiles: <mode>` and the gauge `kbf_usage_profiles_mode{mode}`, 1 for the mode
-    /// and 0 for the others. A server given a combination that breaks one of these refuses to
-    /// start
+    /// Whether the farm learns what its leases use. Only `off`, the default, is accepted: it
+    /// learns nothing and writes no row. `record` and `on` were run by the js scheduler core,
+    /// which was removed because scheduling runs in the job service, and a start given one is
+    /// refused (exit status 2). The mode a server runs is logged at start as
+    /// `usage profiles: <mode>` and exported as the gauge `kbf_usage_profiles_mode{mode}`, 1
+    /// for the mode and 0 for the others
     // The text above states the default; the help golden cannot hold the whitespace-only
     // line clap prints before a `[default: ...]` line.
     #[arg(
@@ -894,43 +877,18 @@ pub enum ConfigError {
          by cores and ignores a prediction"
     )]
     PredictionsNeedPlacementLoad,
-    /// `--learned-sizes on` was given with `--scheduler-core js`, which learns sizes in `shadow`
-    /// only: it would book as `off` does while the flag says otherwise.
-    #[error(
-        "--learned-sizes on is not supported with --scheduler-core js yet; use --learned-sizes \
-         shadow or off, or --scheduler-core legacy"
-    )]
-    LearnedSizesOnUnderJs,
-    /// `--no-memory-climb` was given with `--scheduler-core js`, whose scheduler is built
-    /// inside the core with no setting for it: the climb would stay on while the flag says
-    /// otherwise.
-    #[error(
-        "--no-memory-climb is not supported with --scheduler-core js yet; use --scheduler-core \
-         legacy, or leave the flag out"
-    )]
-    NoMemoryClimbUnderJs,
-    /// `--usage-profiles` was given a value that would do nothing.
+    /// `--usage-profiles` was given a value other than `off`.
     #[error(transparent)]
     UsageProfiles(#[from] crate::usage_profiles::UsageProfilesError),
 }
 
 impl Args {
-    /// Refuses a combination of `--scheduler-core` and the flags that the core cannot run.
-    /// Both cores are built into every binary.
+    /// Refuses a flag value the server cannot run: a `--usage-profiles` other than `off`.
     ///
     /// # Errors
-    /// [`ConfigError::LearnedSizesOnUnderJs`]: the core is `js` and `--learned-sizes` is `on`.
-    /// [`ConfigError::NoMemoryClimbUnderJs`]: the core is `js` and `--no-memory-climb` is set.
-    /// [`ConfigError::UsageProfiles`]: `--usage-profiles` would do nothing (see
+    /// [`ConfigError::UsageProfiles`]: `--usage-profiles` is `record` or `on` (see
     /// [`crate::usage_profiles::UsageProfilesError`]).
     pub fn check_scheduler_core(&self) -> Result<(), ConfigError> {
-        let js = self.scheduler_core == crate::SchedulerCore::Js;
-        if js && self.learned_sizes == crate::LearnedSizes::On {
-            return Err(ConfigError::LearnedSizesOnUnderJs);
-        }
-        if js && self.no_memory_climb {
-            return Err(ConfigError::NoMemoryClimbUnderJs);
-        }
         self.usage_profiles_fit()?;
         Ok(())
     }
@@ -1066,7 +1024,6 @@ impl Args {
             vm_host_floor: HostFloor::new(self.vm_host_floor_cpus, self.vm_host_floor_mem_gib),
             learned_sizes: self.learned_sizes,
             exclusive_actions: self.exclusive_actions,
-            scheduler_core: self.scheduler_core,
             placement_load: self.placement_load,
             placement_predictions: self.placement_predictions,
             usage_profiles: self.usage_profiles,

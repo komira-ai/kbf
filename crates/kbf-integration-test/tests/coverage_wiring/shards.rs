@@ -1,4 +1,4 @@
-//! The coverage run is split: the matrix job `test-shard` runs each core's fast tests in parts
+//! The coverage run is split: the matrix job `test-shard` runs the fast tests in parts
 //! (`nextest --partition count:<part>/<parts>`), and the job `test` builds the same instrumented
 //! binaries, waits for every shard's raw profiles, makes ONE report of them all and gates it.
 //! The gate is the same gate only while the split loses nothing, and nothing but this reads the
@@ -6,24 +6,23 @@
 //! the whole set of tests (a crate could then fail, or, worse, pass on a number that left tests
 //! out) or the required check would pass over a red shard:
 //!
-//! - **Each shard partitions the whole set exactly once.** For each core (`legacy`, `js`), the
-//!   matrix lists parts 1 to N, each once, and every entry says `parts: N`; every entry of a core
-//!   runs the same packages (`args`), and a shard's nextest command is `--partition
-//!   count:$PART/$PARTS` of `$ARGS` with the branch coverage and the `pr` profile and no filter.
-//!   Both cores are in the matrix, the legacy one on the whole workspace and the js one on the
-//!   `farm-core-js` build.
+//! - **Each shard partitions the whole set exactly once.** For the one scheduler core
+//!   (`legacy`), the matrix lists parts 1 to N, each once, and every entry says `parts: N`; every
+//!   entry runs the same packages (`args`, the whole workspace), and a shard's nextest command is
+//!   `--partition count:$PART/$PARTS` of `$ARGS` with the branch coverage and the `pr` profile
+//!   and no filter.
 //! - **A shard's profiles are its own and arrive.** Their file names carry the core and the part
 //!   (the process id alone repeats between machines); the shard's last step uploads them, with no
 //!   `if:`, so the job has succeeded exactly when they are up.
 //! - **A shard has the disk it needs.** The matrix entry's `min_free_gb`, which the early disk
-//!   check refuses below, is at least the core's measured need ([`CORES`]), so a runner that is
+//!   check refuses below, is at least the core's measured need ([`CORE_MIN_FREE_GB`]), so a runner that is
 //!   too short stops there and not with tests failing for want of room. The test step does not
 //!   pass when there are no tests (`--no-tests=pass`), so a part that ran nothing is red.
 //! - **A shard is found by its name.** The job is named `test-shard (<core>-<part>-of-<parts>)`,
 //!   and `test` asks for each artifact with that text (`--artifact <name>=<text>`), so that it
 //!   counts an artifact only when the shard's job of the latest attempt made it (a re-run of
 //!   the run leaves the earlier attempt's artifacts there).
-//! - **`test` takes every shard.** It builds each core's instrumented tests (the `args` of the
+//! - **`test` takes every shard.** It builds the instrumented tests (the `args` of the
 //!   matrix), drops the profiles that listing them wrote, waits for the artifact of every shard of
 //!   the matrix (and fails when a shard failed), downloads them flat into the one directory the
 //!   report merges, refuses a directory in which a shard's profiles are missing, reports, and
@@ -40,14 +39,12 @@ const SHARD: &str = "test-shard";
 /// The gate job, and the other required check.
 const GATE: &str = "test";
 const LINT: &str = "lint";
-/// The cores, and what a core's `args` must hold.
-/// The least `min_free_gb` of a core: its measured disk use (legacy about 26 GB, js about 21,
-/// of the build without debug info, the tests' files and profiles), the store's floor (7.5) and
-/// a margin.
-const CORES: [(&str, &str, usize); 2] = [
-    ("legacy", "--workspace", 40),
-    ("js", "--features kbf-server/farm-core-js", 35),
-];
+/// The one core, and what its entries' `args` must hold.
+const CORE: &str = "legacy";
+const CORE_ARGS: &str = "--workspace";
+/// The least `min_free_gb` of the core: its measured disk use (about 26 GB, of the build without
+/// debug info, the tests' files and profiles), the store's floor (7.5) and a margin.
+const CORE_MIN_FREE_GB: usize = 40;
 /// The directory a shard merges its raw profiles in, and the `test` job merges the shards'
 /// merged profiles into: the one `llvm-cov report` reads.
 const PROFILES: &str = "target/llvm-cov-target";
@@ -100,76 +97,64 @@ fn expected(entries: &[Entry]) -> (Vec<String>, Vec<String>) {
     )
 }
 
-/// The matrix runs each part of each core's tests once.
+/// The matrix runs each part of the core's tests once.
 fn partition_rules(entries: &[Entry]) -> Result<(), String> {
-    if let Some(e) = entries
-        .iter()
-        .find(|e| !CORES.iter().any(|(c, _, _)| e.get("core") == Some(*c)))
-    {
+    let core = CORE;
+    if let Some(e) = entries.iter().find(|e| e.get("core") != Some(core)) {
         return Err(format!(
-            "a matrix entry names the core {:?}, which is neither `legacy` nor `js`",
+            "a matrix entry names the core {:?}, which is not `{core}`",
             e.get("core")
         ));
     }
-    for (core, needs, _) in CORES {
-        let mine: Vec<&Entry> = entries
-            .iter()
-            .filter(|e| e.get("core") == Some(core))
-            .collect();
-        let Some(first) = mine.first() else {
+    let Some(first) = entries.first() else {
+        return Err(format!(
+            "the matrix of `{SHARD}` has no `{core}` entry, so that core's tests would not run"
+        ));
+    };
+    let number = |e: &Entry, key: &str| e.get(key).and_then(|v| v.parse::<usize>().ok());
+    let Some(parts) = number(first, "parts") else {
+        return Err(format!("a `{core}` entry has no numeric `parts`"));
+    };
+    let mut got = Vec::new();
+    for e in entries {
+        if number(e, "parts") != Some(parts) {
             return Err(format!(
-                "the matrix of `{SHARD}` has no `{core}` entry, so that core's tests would not run"
+                "the `{core}` entries do not all say `parts: {parts}`, so their parts are of different splits"
             ));
+        }
+        let Some(part) = number(e, "part") else {
+            return Err(format!("a `{core}` entry has no numeric `part`"));
         };
-        let number = |e: &Entry, key: &str| e.get(key).and_then(|v| v.parse::<usize>().ok());
-        let Some(parts) = number(first, "parts") else {
-            return Err(format!("a `{core}` entry has no numeric `parts`"));
-        };
-        let mut got = Vec::new();
-        for e in &mine {
-            if number(e, "parts") != Some(parts) {
+        got.push(part);
+    }
+    got.sort_unstable();
+    if got != (1..=parts).collect::<Vec<_>>() {
+        return Err(format!(
+            "the `{core}` entries are parts {got:?} of {parts}, not each of 1 to {parts} once, so some tests would run twice or not at all"
+        ));
+    }
+    if entries.iter().any(|e| e.get("args") != first.get("args")) {
+        return Err(format!(
+            "the `{core}` entries do not run the same packages (`args`), so the parts are not parts of one set of tests"
+        ));
+    }
+    for e in entries {
+        match number(e, "min_free_gb") {
+            None => {
+                return Err(format!("a `{core}` entry has no numeric `min_free_gb`"));
+            }
+            Some(gb) if gb < CORE_MIN_FREE_GB => {
                 return Err(format!(
-                    "the `{core}` entries do not all say `parts: {parts}`, so their parts are of different splits"
+                    "a `{core}` entry says `min_free_gb: {gb}`, under the {CORE_MIN_FREE_GB} its build and tests need, so the early disk check would pass a runner that is too short"
                 ));
             }
-            let Some(part) = number(e, "part") else {
-                return Err(format!("a `{core}` entry has no numeric `part`"));
-            };
-            got.push(part);
+            Some(_) => {}
         }
-        got.sort_unstable();
-        if got != (1..=parts).collect::<Vec<_>>() {
-            return Err(format!(
-                "the `{core}` entries are parts {got:?} of {parts}, not each of 1 to {parts} once, so some tests would run twice or not at all"
-            ));
-        }
-        if mine.iter().any(|e| e.get("args") != first.get("args")) {
-            return Err(format!(
-                "the `{core}` entries do not run the same packages (`args`), so the parts are not parts of one set of tests"
-            ));
-        }
-        for e in &mine {
-            let least = CORES
-                .iter()
-                .find(|(c, _, _)| *c == core)
-                .map_or(0, |(_, _, gb)| *gb);
-            match number(e, "min_free_gb") {
-                None => {
-                    return Err(format!("a `{core}` entry has no numeric `min_free_gb`"));
-                }
-                Some(gb) if gb < least => {
-                    return Err(format!(
-                        "a `{core}` entry says `min_free_gb: {gb}`, under the {least} its build and tests need, so the early disk check would pass a runner that is too short"
-                    ));
-                }
-                Some(_) => {}
-            }
-        }
-        if !first.get("args").is_some_and(|a| a.contains(needs)) {
-            return Err(format!(
-                "the `args` of the `{core}` entries do not contain `{needs}`"
-            ));
-        }
+    }
+    if !first.get("args").is_some_and(|a| a.contains(CORE_ARGS)) {
+        return Err(format!(
+            "the `args` of the `{core}` entries do not contain `{CORE_ARGS}`"
+        ));
     }
     Ok(())
 }
@@ -349,26 +334,23 @@ pub fn gate_wiring(workflow: &str) -> Result<(), String> {
     let steps = workflows::job_steps(workflow, GATE)?;
     let find = |pred: &dyn Fn(&workflows::Step) -> bool| steps.iter().position(pred);
     let run = |s: &workflows::Step| s.run.clone().unwrap_or_default();
-    let mut builds = Vec::new();
-    for (core, _, _) in CORES {
-        let args = entries
-            .iter()
-            .find(|e| e.get("core") == Some(core))
-            .and_then(|e| e.get("args"))
-            .ok_or_else(|| format!("the matrix has no `args` for the `{core}` core"))?;
-        let at = find(&|s| {
-            let r = run(s);
-            r.contains("llvm-cov nextest")
-                && r.contains(args)
-                && r.contains("--no-report")
-                && r.contains("--branch")
-                && r.contains("--no-tests=pass")
-        })
-        .ok_or_else(|| {
-            format!("the job `{GATE}` has no step that builds the instrumented tests of the `{core}` core (`llvm-cov nextest {args} ... --no-tests=pass`)")
-        })?;
-        builds.push(at);
-    }
+    let core = CORE;
+    let args = entries
+        .iter()
+        .find(|e| e.get("core") == Some(core))
+        .and_then(|e| e.get("args"))
+        .ok_or_else(|| format!("the matrix has no `args` for the `{core}` core"))?;
+    let build = find(&|s| {
+        let r = run(s);
+        r.contains("llvm-cov nextest")
+            && r.contains(args)
+            && r.contains("--no-report")
+            && r.contains("--branch")
+            && r.contains("--no-tests=pass")
+    })
+    .ok_or_else(|| {
+        format!("the job `{GATE}` has no step that builds the instrumented tests of the `{core}` core (`llvm-cov nextest {args} ... --no-tests=pass`)")
+    })?;
     let clean = find(&|s| run(s).contains("llvm-cov clean --profraw-only"))
         .ok_or_else(|| format!("the job `{GATE}` has no step that drops the profiles the builds' test listing wrote (`llvm-cov clean --profraw-only`), which would be merged into the report"))?;
     let wait = find(&|s| run(s).contains("xtask wait-artifacts")).ok_or_else(|| {
@@ -395,8 +377,7 @@ pub fn gate_wiring(workflow: &str) -> Result<(), String> {
         r.contains("-p kbf-coverage ") && !r.contains("no-lowering")
     })
     .ok_or_else(|| format!("the job `{GATE}` has no step running the gate (`-p kbf-coverage`)"))?;
-    let after_builds = builds.iter().all(|b| *b < clean);
-    if !(after_builds
+    if !(build < clean
         && clean < download
         && wait < download
         && download < complete
@@ -407,8 +388,7 @@ pub fn gate_wiring(workflow: &str) -> Result<(), String> {
         return Err("the steps of `test` are not in the order build, drop listing profiles (before the download), wait, download, check the profiles, merge them, report, gate".to_owned());
     }
     for (what, i) in [
-        ("build", builds[0]),
-        ("build", builds[1]),
+        ("build", build),
         ("profile-dropping", clean),
         ("wait", wait),
         ("download", download),

@@ -449,9 +449,9 @@ back as they were (`no --<flag>`: remove the key), or `executor = "kbf-daemon"`,
 with `executor-locate` and `executor-secret-delivery = "files"` removed in the same edit, since
 `kbf-daemon` refuses them ([kbf-modes.md](kbf-modes.md) gives the rule); then restart through
 the same path. **That flip works only while the release still carries the mode it flips back
-to.** A frontend that ran on the embedded engine (the jobscheduler core built into kbf,
-`--scheduler-core js`) or on the lease-based `js-agent` executor can be flipped back to it only
-with a release that has it; once a release without it is installed, the way back to it is the
+to.** A frontend that ran on the embedded engine (the jobscheduler core that was built into
+kbf, `--scheduler-core js`, which this release refuses at start) or on the lease-based
+`js-agent` executor can be flipped back to it only with a release that has it; once a release without it is installed, the way back to it is the
 previous kbf release, not a flag.
 
 To take kbf off the service altogether, back the frontend out, then remove kbf's `[[client]]`

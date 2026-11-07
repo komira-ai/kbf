@@ -121,7 +121,7 @@ fn request(tag: u8) -> Request {
 }
 
 fn farm_over(store: &Arc<LostAck>) -> Farm {
-    Farm::new_legacy(
+    Farm::new(
         Arc::new(Cache::memory()),
         kbf_sched::UNSERVABLE_WAIT,
         kbf_sched::FINISHED_RETENTION,
@@ -605,7 +605,7 @@ fn a_store_that_is_down_refuses_the_submit_and_a_farm_without_one_queues() {
     assert!(submit(&farm, 1).is_ok());
     assert_eq!(rows(&store, "op/"), 1);
 
-    let bare = Farm::new_legacy(
+    let bare = Farm::new(
         Arc::new(Cache::memory()),
         kbf_sched::UNSERVABLE_WAIT,
         kbf_sched::FINISHED_RETENTION,

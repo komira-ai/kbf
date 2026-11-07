@@ -25,12 +25,9 @@ const LOST_RACE: &str = "another frontend won the race for the operation: this f
 /// field, left out of the race count, or counted as a dropped write. Two frontends over one
 /// store race for one queued operation; the one that loses logs exactly one WARN line, the
 /// whole race message ending in `operations=op-0`, no ERROR line, one lost race and no
-/// dropped write; the winner counts neither. The js core (`--scheduler-core js`) does not
-/// tell a lost race apart: there the loser has no race count and one dropped write, and its
-/// log is not asserted.
+/// dropped write; the winner counts neither.
 #[test]
 fn a_lost_race_logs_one_warning_and_counts_a_race_not_a_drop() {
-    let js = cfg!(feature = "farm-core-js");
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .start_paused(true)
@@ -55,16 +52,8 @@ fn a_lost_race_logs_one_warning_and_counts_a_race_not_a_drop() {
         });
     });
 
-    if js {
-        assert_eq!((a.lost_races(), a.dropped_writes()), (None, 1));
-        assert_eq!((b.lost_races(), b.dropped_writes()), (None, 0));
-    } else {
-        assert_eq!((a.lost_races(), a.dropped_writes()), (Some(1), 0));
-        assert_eq!((b.lost_races(), b.dropped_writes()), (Some(0), 0));
-    }
-    if js {
-        return;
-    }
+    assert_eq!((a.lost_races(), a.dropped_writes()), (Some(1), 0));
+    assert_eq!((b.lost_races(), b.dropped_writes()), (Some(0), 0));
     let warnings: Vec<_> = log.lines().filter(|line| line.contains(" WARN ")).collect();
     let [warning] = &warnings[..] else {
         panic!("one WARN line expected: {log}");
@@ -94,12 +83,11 @@ fn a_write_refused_for_a_moved_node_still_logs_errors_and_counts_a_drop() {
 
         assert!(ack.is_none_or(|ack| !ack.accepted));
         assert_eq!(a.dropped_writes(), 1);
-        let none = if cfg!(feature = "farm-core-js") {
-            None
-        } else {
-            Some(0)
-        };
-        assert_eq!(a.lost_races(), none, "a moved node counted as a lost race");
+        assert_eq!(
+            a.lost_races(),
+            Some(0),
+            "a moved node counted as a lost race"
+        );
     });
     let errors = log.lines().filter(|line| line.contains("ERROR")).count();
     assert_eq!(errors, 2, "{log}");

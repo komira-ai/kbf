@@ -1,45 +1,53 @@
-//! `--scheduler-core`: which core drives the farm's scheduling. `legacy`, the driver the
-//! server has always had, is the default; `js` runs the farm on the js scheduler core. Every
-//! build has both.
+//! `--scheduler-core`: which core drives the farm's scheduling. The one core is `legacy`, the
+//! driver the server has always had and the default. The flag still takes its value so that a
+//! unit file naming it keeps starting; `js` names a core that was removed and is refused at
+//! start, before anything opens.
 //!
 //! The core a server runs is logged once at start ([`SchedulerCore::start_line`]) and
 //! exported as the gauge `kbf_scheduler_core{core}` ([`render`]).
 
 use std::fmt::Write as _;
 
-use clap::ValueEnum;
-
-/// What `--scheduler-core` selects.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+/// The core a server runs, and what `--scheduler-core` selects.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SchedulerCore {
     /// The scheduler driver the server has always had
     #[default]
     Legacy,
-    /// The farm on the js scheduler core
-    Js,
+}
+
+/// A `--scheduler-core` value the server does not run.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum SchedulerCoreError {
+    /// `js`, the core that was removed.
+    #[error(
+        "the js scheduler core was removed: scheduling runs in the job service; use \
+         --scheduler-core legacy or leave the flag out"
+    )]
+    JsRemoved,
+    /// Any other word.
+    #[error("the one scheduler core is legacy")]
+    Unknown,
+}
+
+/// The parser of `--scheduler-core`: `legacy`, and a refusal of every other word.
+///
+/// # Errors
+/// [`SchedulerCoreError::JsRemoved`] for `js`, [`SchedulerCoreError::Unknown`] for the rest.
+pub(crate) fn parse(value: &str) -> Result<SchedulerCore, SchedulerCoreError> {
+    match value {
+        "legacy" => Ok(SchedulerCore::Legacy),
+        "js" => Err(SchedulerCoreError::JsRemoved),
+        _ => Err(SchedulerCoreError::Unknown),
+    }
 }
 
 impl SchedulerCore {
-    /// The core a `Listeners` built by a test names, and the one `Farm::new` builds:
-    /// `Legacy`, and `Js` in a build with the test-only `farm-core-js` feature, so that the
-    /// suites run on it. No server reads it: a server runs the core its flag names.
-    #[must_use]
-    pub const fn under_test() -> Self {
-        Self::UNDER_TEST
-    }
-
-    #[cfg(not(feature = "farm-core-js"))]
-    const UNDER_TEST: Self = Self::Legacy;
-
-    #[cfg(feature = "farm-core-js")]
-    const UNDER_TEST: Self = Self::Js;
-
     /// The value the flag takes and the gauge's `core` label carries.
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
             Self::Legacy => "legacy",
-            Self::Js => "js",
         }
     }
 
@@ -50,20 +58,16 @@ impl SchedulerCore {
     }
 }
 
-/// Appends the gauge `kbf_scheduler_core{core}` to `out`: 1 for `running`, 0 for each
-/// other core, so a dashboard can tell a core that is off from a server that does not
-/// report one.
-pub(crate) fn render(out: &mut String, running: SchedulerCore) {
+/// Appends the gauge `kbf_scheduler_core{core}` to `out`: the one series, `legacy`, at 1, so
+/// a dashboard can tell a server that runs the core from one that does not report it.
+pub(crate) fn render(out: &mut String) {
     let name = "kbf_scheduler_core";
     let _ = writeln!(
         out,
-        "# HELP {name} The scheduler core the server runs: 1 for it, 0 for the others\n\
+        "# HELP {name} The scheduler core the server runs: 1 for it\n\
          # TYPE {name} gauge"
     );
-    for core in SchedulerCore::value_variants() {
-        let value = u8::from(*core == running);
-        let _ = writeln!(out, "{name}{{core=\"{}\"}} {value}", core.name());
-    }
+    let _ = writeln!(out, "{name}{{core=\"{}\"}} 1", SchedulerCore::Legacy.name());
 }
 
 #[cfg(test)]

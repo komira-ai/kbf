@@ -1,11 +1,9 @@
 //! What the farm tells the invocation recorder (`docs/design/invocations.md`, section 3.4):
 //! each lease granted, started and given up, and each operation's end, with the lease that
-//! ended it and, for a failure, the daemon's reason. Both scheduler cores (the legacy farm's
-//! `Side` and the js core's `KbfAdapter`) hold one [`Recording`], so what a core records of
-//! its operations cannot differ from the other's by the code that records it. Every event is
-//! sent under the core's lock, in the order the scheduler made the change and after the
-//! Execute call that queued or joined the operation, which the dispatcher sends before it
-//! queues anything.
+//! ended it and, for a failure, the daemon's reason. The farm's `Side` holds one
+//! [`Recording`]. Every event is sent under the core's lock, in the order the scheduler made
+//! the change and after the Execute call that queued or joined the operation, which the
+//! dispatcher sends before it queues anything.
 //!
 //! Only operations a recorded call waits on are told: those [`Recording::submit`] noted,
 //! which a call without an invocation id, or any call with the recorder off, never is. For

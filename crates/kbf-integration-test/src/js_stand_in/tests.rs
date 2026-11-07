@@ -348,7 +348,9 @@ fn a_jobs_container_reports_to_the_test_and_follows_its_plan() {
 
     for (hash, why) in [("dd", "plan: exit \"x\""), ("ee", "plan: \"dance\\n\"")] {
         let running = start(&place, dir.path(), hash);
-        let _ = events.accept().expect("the container connects");
+        // Held until the container ends: a stream dropped at once can close before the
+        // container writes its start line, which it then fails on instead of on its plan.
+        let (_stream, _) = events.accept().expect("the container connects");
         assert_eq!(
             running.join().expect("ran"),
             exited(125, &format!("crun run c1: {why}"))

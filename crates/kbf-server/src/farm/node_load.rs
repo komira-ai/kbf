@@ -54,9 +54,8 @@ const MAX_MEMORY_MULTIPLE: u64 = 4;
 /// How many windows without a reading make the load stale.
 const STALE_AFTER_WINDOWS: u128 = 3;
 
-/// What each node's readings have come to: the legacy driver keeps it in its side state, the
-/// js core in its adapter. Both take a reading through [`accept`] and show a node's through
-/// [`shown`], so the accept rule is one.
+/// What each node's readings have come to: the farm keeps it in its side state. It takes a
+/// reading through [`accept`] and shows a node's through [`shown`].
 pub(crate) type NodeLoads = BTreeMap<WorkerId, Kept>;
 
 /// Which daemon session a reading belongs to.
@@ -329,7 +328,6 @@ impl Farm {
     /// the server restarts or its daemon's next stream starts a new session.
     #[must_use]
     pub fn node_loads(&self) -> Vec<(WorkerId, LoadView)> {
-        js_arm!(self, load::node_loads());
         let state = self.lock();
         shown_all(
             &state.side.node_loads,
@@ -351,7 +349,6 @@ impl Farm {
         stream: StreamId,
         load: Option<&NodeLoad>,
     ) -> Option<usage::NodeLoad> {
-        js_arm!(self, load::note_node_load(worker, stream, load));
         let load = load?;
         let mut state = self.lock();
         let link = state
@@ -396,7 +393,6 @@ impl Farm {
     /// What is kept of `worker`'s readings, on either core.
     #[cfg(test)]
     fn kept_load(&self, worker: &WorkerId) -> Option<Kept> {
-        js_arm!(self, load::kept_load(worker));
         self.lock().side.node_loads.get(worker).cloned()
     }
 

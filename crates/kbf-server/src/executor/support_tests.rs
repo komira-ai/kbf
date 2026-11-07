@@ -113,7 +113,7 @@ impl Harness {
         }));
         let fake = FakeJobServer::start().await.expect("a loopback port");
         fake.add_host(HOST, machine());
-        let farm = Arc::new(Farm::new_legacy(
+        let farm = Arc::new(Farm::new(
             Arc::new(Cache::memory()),
             kbf_sched::UNSERVABLE_WAIT,
             kbf_sched::FINISHED_RETENTION,

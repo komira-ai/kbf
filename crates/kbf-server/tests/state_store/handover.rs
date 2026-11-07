@@ -233,10 +233,7 @@ async fn a_farm_with_no_state_store_follows_no_one() {
 
 /// Asserts what following the callers of a fenced farm does when the `done/` row of an
 /// operation they wait on cannot be read: a corrupt store is never taken for the absence
-/// of an operation. The legacy core fails the follow, naming the row, and leaves the caller
-/// waiting. The js core reads the row's bytes and ends the caller with UNAVAILABLE, which
-/// clients ask again, so that no caller waits for a result that will not come; the follow
-/// itself succeeds, with nobody left waiting.
+/// of an operation. The follow fails, naming the row, and leaves the caller waiting.
 #[tokio::test(start_paused = true)]
 async fn following_a_done_row_that_cannot_be_read_is_an_error_naming_the_row() {
     let disk = Disk::new();
@@ -246,18 +243,6 @@ async fn following_a_done_row_that_cannot_be_read_is_an_error_naming_the_row() {
     let key = "done/0000000000000000";
     let row = Txn::new().put(key.to_owned(), vec![0xff], Cond::Any);
     disk.store.txn(row).expect("store").expect("put");
-    if old.scheduler_core() == kbf_server::SchedulerCore::Js {
-        assert_eq!(old.follow().expect("the follow"), 0);
-        let ended = done(&waiting).expect("the caller is answered");
-        assert_eq!(
-            status(&ended),
-            (
-                Code::Unavailable as i32,
-                "the stored result of this operation cannot be read".to_owned()
-            )
-        );
-        return;
-    }
     let refused = old.follow().expect_err("an unreadable done row");
     assert!(refused.to_string().contains(key), "{refused}");
     assert!(done(&waiting).is_none());

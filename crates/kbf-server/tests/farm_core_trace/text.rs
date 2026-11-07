@@ -1,8 +1,7 @@
 //! The words of a scripted session: the actions it submits, how a node reports the end of a
 //! lease, and the text each message, result and stage is written as. Shared by every
-//! driver of the scripts in `scenarios.rs` (the farm's, in `session.rs`, and the scheduler
-//! core's, in `tests/farm_core_adapter`), so that the same step is written in the same
-//! words.
+//! driver of the scripts in `scenarios.rs` (the farm's, in `session.rs`), so that the same
+//! step is written in the same words.
 
 use std::collections::BTreeMap;
 

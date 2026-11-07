@@ -11,7 +11,7 @@ use super::*;
 use crate::{Args, PlacementLoad};
 
 fn plain() -> Farm {
-    Farm::new_legacy(
+    Farm::new(
         Arc::new(Cache::memory()),
         kbf_sched::UNSERVABLE_WAIT,
         kbf_sched::FINISHED_RETENTION,

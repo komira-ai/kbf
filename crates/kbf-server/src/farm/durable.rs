@@ -291,25 +291,6 @@ pub enum StateError {
     Open(String),
 }
 
-/// The errors of the core's rows ([`js_store`]) are the farm's own, variant for variant. The
-/// core has no encode error of the log's kind: its codec's text is a row that cannot be
-/// written, which is [`StateError::Corrupt`] here.
-impl From<js_store::StateError> for StateError {
-    fn from(error: js_store::StateError) -> Self {
-        match error {
-            js_store::StateError::Store(cause) => Self::Store(cause),
-            js_store::StateError::Conflict(conflict) => Self::Conflict(conflict),
-            js_store::StateError::Missing(row) => Self::Missing(row),
-            js_store::StateError::StaleOwner(worker) => Self::StaleOwner(worker),
-            js_store::StateError::Corrupt { key, why } => Self::Corrupt { key, why },
-            js_store::StateError::Codec(why) => Self::Corrupt {
-                key: "(encode)".to_owned(),
-                why,
-            },
-        }
-    }
-}
-
 /// What a store holds of the scheduler, as a start reads it.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct Stored {
@@ -443,8 +424,6 @@ pub(super) enum Held {
 
 mod blocks;
 mod codec;
-// `estimate`, `named` and `subject` hold the formats of the build-only rows, which the
-// adapter over `js-store` (`crate::farm_js`) writes too.
 pub(crate) mod estimate;
 mod ext;
 mod fate;
@@ -1248,12 +1227,6 @@ impl Farm {
     /// The store cannot be read or written, or holds a row that is not one the scheduler
     /// wrote.
     pub fn with_state(mut self, state: Option<StateStore>) -> Result<Self, StateError> {
-        if let super::driver::Driver::Js(js) = &mut self.driver {
-            let epoch = js.keep_in(state, &self.settings)?;
-            self.term = epoch.unwrap_or(self.term);
-            self.lease_epoch = epoch.unwrap_or(self.lease_epoch);
-            return Ok(self);
-        }
         let epoch = self.driver.state_mut().keep_in(state)?;
         self.term = epoch.unwrap_or(self.term);
         self.lease_epoch = epoch.unwrap_or(self.lease_epoch);
@@ -1270,7 +1243,6 @@ impl Farm {
     /// # Errors
     /// The store cannot be read, or the row is not a result.
     pub fn ended(&self, operation: OperationId) -> Result<Option<Finished>, StateError> {
-        js_arm!(self, lifecycle::ended(operation));
         let state = self.lock();
         state
             .engine
@@ -1288,7 +1260,6 @@ impl Farm {
     /// # Errors
     /// The store cannot be read or written, or holds no epoch.
     pub fn bump_epoch(&self) -> Result<Option<EpochBump>, StateError> {
-        js_arm!(self, lifecycle::bump_epoch());
         let state = self.lock();
         state
             .engine

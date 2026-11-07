@@ -49,7 +49,6 @@ impl Farm {
     /// The leases held now: all of them, or only `node`'s (none for a node that holds
     /// none or does not exist).
     pub fn lease_views(&self, node: Option<&WorkerId>) -> LeaseViews {
-        js_arm!(self, views::lease_views(node));
         let state = self.lock();
         LeaseViews {
             term: state.engine.sched.term(),
@@ -60,7 +59,6 @@ impl Farm {
 
     /// The queue now, summarised.
     pub fn queue_view(&self) -> QueueView {
-        js_arm!(self, views::queue_view());
         self.lock().engine.sched.queue_snapshot()
     }
 
@@ -68,41 +66,23 @@ impl Farm {
     /// `readings_accepted` and `readings_dropped` show whether the readings the farm hands it
     /// (see [`Farm::heartbeat_with_load`]) are taken, in every `--placement-load` mode.
     pub fn load_counters(&self) -> LoadCounters {
-        js_arm!(self, views::load_counters());
         self.lock().engine.sched.load_counters()
     }
 
-    /// What the js core counted for the ablation's rows, with the scheduler's load counters
-    /// they are read beside; `None` on the farm's own driver.
-    pub(crate) fn ablation(&self) -> Option<(crate::farm_js::ablation::Ablation, LoadCounters)> {
-        js_arm!(self, views::ablation());
-        None
-    }
-
-    /// What the farm's usage side holds and has counted; `None` when it records nothing
-    /// (`--usage-profiles off`, the legacy core, or no state store).
-    pub(crate) fn usage_stats(&self) -> Option<crate::farm_js::usage::UsageStats> {
-        js_arm!(self, views::usage_stats());
-        None
-    }
-
     /// Flushes what the usage side learned, whatever its schedule says: the last thing a
-    /// server does. Whether the store took it; `true` for a farm that records nothing.
+    /// server does. Whether the store took it; `true`, as this farm records nothing.
     pub async fn finish_usage(&self) -> bool {
-        js_arm_async!(self, hot::finish_usage());
         true
     }
 
     /// The whole-node view of the queue now; `None` unless the farm runs with whole-node
     /// settings.
     pub fn whole_view(&self) -> Option<WholeView> {
-        js_arm!(self, views::whole_view());
         whole_of(self.now(), &self.lock().engine.sched)
     }
 
     /// The queue and its whole-node view from one read of the scheduler, so the two agree.
     pub fn queue_views(&self) -> (QueueView, Option<WholeView>) {
-        js_arm!(self, views::queue_views());
         let state = self.lock();
         let sched = &state.engine.sched;
         (sched.queue_snapshot(), whole_of(self.now(), sched))

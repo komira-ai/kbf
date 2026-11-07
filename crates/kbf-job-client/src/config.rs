@@ -1,8 +1,7 @@
 //! Where the client dials, what it presents, and which CA it trusts.
 //!
-//! [`Origin`] and [`Token`] are the lease client's (`kbf-lease-client`), copied: that crate
-//! goes away when the farm stops leasing hosts, and a crate shared by the two for that time
-//! would be more than the copy. The token here is a gRPC metadata value, not an HTTP header.
+//! [`Origin`] and [`Token`] are those of the lease client this crate replaced, copied from it.
+//! The token here is a gRPC metadata value, not an HTTP header.
 
 use std::io::Read as _;
 use std::net::IpAddr;

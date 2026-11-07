@@ -40,11 +40,7 @@
 //! frontend's go to `server.out` and `server.err`, the storage node's to `storage.out` and
 //! `storage.err`). Without the flag nothing above changes.
 //!
-//! `--server-arg` adds flags to the `kbf-server` (or the `kbf --mode=frontend`) the cell starts, and
-//! `--expect-scheduler-core <core>` makes the run also require, after the server starts
-//! and again after the builds, that the server logged `scheduler core: <core>` and that
-//! its `/metrics` says `kbf_scheduler_core{core="<core>"} 1`, so a run given
-//! `--server-arg=--scheduler-core=js` cannot pass on a server that ran another core.
+//! `--server-arg` adds flags to the `kbf-server` (or the `kbf --mode=frontend`) the cell starts.
 //!
 //! Every log is under `<work>/logs`. The store's key pair comes from
 //! `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, never the command line.
@@ -121,13 +117,9 @@ pub struct M1Args {
     pub kbf_bin: Option<PathBuf>,
     /// A flag for the frontend (`kbf-server`, or `kbf --mode=frontend` with `--kbf-bin`),
     /// after the cell's own; once for each, in the `=` form
-    /// (`--server-arg=--scheduler-core=js`).
+    /// (`--server-arg=--learned-sizes=shadow`).
     #[arg(long = "server-arg", allow_hyphen_values = true)]
     pub server_args: Vec<String>,
-    /// The scheduler core the server must report running (`legacy` or `js`): its start
-    /// line and its `kbf_scheduler_core` gauge are checked, see the module docs.
-    #[arg(long)]
-    pub expect_scheduler_core: Option<String>,
 }
 
 /// Runs the M1 test (the module docs say what it checks). Prints what it does on
@@ -165,7 +157,6 @@ struct Cell {
     bazel: Option<PathBuf>,
     buck2: Option<PathBuf>,
     server_args: Vec<String>,
-    expect_core: Option<String>,
     kbf_bin: Option<PathBuf>,
 }
 
@@ -214,7 +205,6 @@ impl Cell {
             bazel: args.bazel.as_deref().map(absolute).transpose()?,
             buck2: args.buck2.as_deref().map(absolute).transpose()?,
             server_args: args.server_args.clone(),
-            expect_core: args.expect_scheduler_core.clone(),
             kbf_bin: args.kbf_bin.as_deref().map(absolute).transpose()?,
         })
     }
@@ -226,7 +216,6 @@ impl Cell {
         let pki = pki.or_broken(&"the certificates")?;
         let token = self.write_token()?;
         let _farm = self.start_farm(&pki)?;
-        self.check_core()?;
         let _daemon = self.start_daemon(&pki)?;
         if let Some(bazel) = &self.bazel {
             self.bazel_sample(bazel)?;
@@ -234,8 +223,6 @@ impl Cell {
         if let Some(buck2) = &self.buck2 {
             self.buck2_sample(buck2, &token)?;
         }
-        // Still the same core after the builds (a server that fell back would say so here).
-        self.check_core()?;
         let held = self.objects()?;
         let bucket = &self.bucket;
         ensure(held > 0, format!("the bucket {bucket} holds no object"))?;
@@ -381,38 +368,6 @@ impl Cell {
         let line = wait_for_line(&out, " reapi=", "kbf-server did not start")?;
         println!("{line}");
         Ok(server)
-    }
-
-    /// With `--expect-scheduler-core`: requires the server's log to hold the start line of
-    /// that core and its `/metrics` to say that core runs.
-    fn check_core(&self) -> Result<(), CellError> {
-        let Some(core) = &self.expect_core else {
-            return Ok(());
-        };
-        let line = format!("scheduler core: {core}");
-        let err = self.logs.join("server.err");
-        let program = if self.kbf_bin.is_some() {
-            "kbf --mode=frontend"
-        } else {
-            "kbf-server"
-        };
-        wait_for_line(&err, &line, &format!("{program} did not log `{line}`"))?;
-        let url = format!("http://{}/metrics", self.api_listen);
-        let body = self.runtime.block_on(async {
-            let answer = self.http.get(url).send().await?.error_for_status()?;
-            answer.bytes().await
-        });
-        let body = body.or_broken(&"the metrics")?;
-        let body = String::from_utf8_lossy(&body);
-        let running = format!("kbf_scheduler_core{{core=\"{core}\"}} 1");
-        let gauge: Vec<&str> = body
-            .lines()
-            .filter(|l| l.starts_with("kbf_scheduler_core{"))
-            .collect();
-        let why = format!("the server does not report the {core} core running: {gauge:?}");
-        ensure(gauge.contains(&running.as_str()), why)?;
-        println!("OK: the server runs the {core} scheduler core (start line and gauge)");
-        Ok(())
     }
 
     fn start_daemon(&self, pki: &PkiFiles) -> Result<Process, CellError> {

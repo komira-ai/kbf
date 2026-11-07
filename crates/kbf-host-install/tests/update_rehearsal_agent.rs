@@ -501,14 +501,6 @@ fn the_agent_updates_the_host_when_the_coordinator_is_told_the_next_release() {
         desired, r.version,
         "farm-version and the version facts agree"
     );
-    // The record is the legacy scheduler core's (the frontend's default): the js core places
-    // a node without the `operator action` line.
-    let started = fs::read_to_string(&frontend.log).unwrap();
-    assert!(
-        !started.contains("scheduler core: js"),
-        "the frontend runs the js scheduler core, which does not log the node's drain and \
-         undrain the rehearsal reads"
-    );
     let watch = farm::Watch::start(&frontend.log);
     let deployed = deploy("deploy_farm", &desired);
     assert!(

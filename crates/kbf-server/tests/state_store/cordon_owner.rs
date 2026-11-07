@@ -1,7 +1,6 @@
 //! Who owns a node's cordon, as `GET /v1/nodes/{id}` reads it from the `cordon-owner/<node>`
 //! row. Nothing writes the row yet: the tests put it into the store by hand, and check that
-//! the farm's own placements write what they wrote before. On the js core (the
-//! `farm-core-js` feature) the same tests read it through that core's farm.
+//! the farm's own placements write what they wrote before.
 
 use kbf_server::farm::NodeAction;
 use kbf_server::fleet::{NodeDetail, Owner, PlacementView};
@@ -83,13 +82,8 @@ async fn a_cordon_with_no_owner_row_is_the_operators() {
 }
 
 /// Asserts that a row another frontend's node is read through shows the owner too, on the
-/// frontend that does not hold the node (answered from the store). The js core does not
-/// answer a node it does not hold.
+/// frontend that does not hold the node (answered from the store).
 #[tokio::test(start_paused = true)]
-#[cfg_attr(
-    feature = "farm-core-js",
-    ignore = "known-different-on-js: the detail of a node another frontend holds is not answered on the js core"
-)]
 async fn a_frontend_that_does_not_hold_the_node_shows_the_owner_too() {
     let c = cordoned();
     put(&c.disk, "cordon-owner/node-b", b"updater:kbf-daemon");

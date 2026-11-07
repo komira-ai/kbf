@@ -1,6 +1,5 @@
 //! Tests of [`Recording`] by itself: what it tells the invocation recorder of an operation a
-//! recorded call waits on, and that it tells nothing of any other. Both scheduler cores hold
-//! this one type, so these tests cover each of them.
+//! recorded call waits on, and that it tells nothing of any other.
 
 use kbf_front::{CallMetadata, ExecuteCall, Finished, Recorder};
 use kbf_invocation::{

@@ -3,7 +3,7 @@
 //!
 //! # How it sits in the server
 //!
-//! Neither scheduler core knows. The executor registers virtual workers, `js:<frontend>-<n>`,
+//! The scheduler core knows nothing of this. The executor registers virtual workers, `js:<frontend>-<n>`,
 //! each a node of the declared shape whose drivers are `container` and `native-whole-machine`,
 //! and takes the messages the farm sends a daemon on the channel it owns the receiving end of.
 //! A `Start` is submitted to the job service as a job of the kbf image, whose entrypoint is the
@@ -12,7 +12,7 @@
 //! until it ends, its ending is mapped to the farm's failure classes ([`outcome`]), and the
 //! result is reported the way a daemon reports one. A `Cancel` is a cancel of the job. The
 //! executor holds no capacity, renews nothing and never sees where a job runs. `worker.rs`, the
-//! two cores and the sched crates are untouched, and a server that never builds an
+//! scheduler core and the sched crates are untouched, and a server that never builds an
 //! [`Executor`] never opens a connection to a job service: [`ExecutorKind::KbfDaemon`] is the
 //! path every server runs by default.
 //!

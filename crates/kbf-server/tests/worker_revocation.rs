@@ -126,11 +126,7 @@ impl Farm {
             format!("--worker-tls-key={}", dir.join("server.key").display()),
             format!("--worker-client-ca={}", ca_dir.join("ca.pem").display()),
         ]);
-        // The core the suite runs on: js in a build with `farm-core-js`, legacy otherwise.
-        argv.push(format!(
-            "--scheduler-core={}",
-            SchedulerCore::under_test().name()
-        ));
+        argv.push(format!("--scheduler-core={}", SchedulerCore::Legacy.name()));
         argv.extend(extra.iter().map(|a| (*a).to_owned()));
         if deny_list {
             let list = dir.join("deny.list");
@@ -163,13 +159,13 @@ impl Farm {
         farm
     }
 
-    /// Asserts that the frontend runs the core under test, as `kbf_scheduler_core` says.
+    /// Asserts that the frontend runs the legacy core, as `kbf_scheduler_core` says.
     async fn assert_core(&self) {
         let (status, body) = self.call("GET", "/metrics".to_owned(), "").await;
         assert_eq!(status, 200, "{body}");
         let running = format!(
             "kbf_scheduler_core{{core=\"{}\"}} 1",
-            SchedulerCore::under_test().name()
+            SchedulerCore::Legacy.name()
         );
         assert!(
             body.lines().any(|line| line == running),

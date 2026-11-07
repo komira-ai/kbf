@@ -226,7 +226,6 @@ impl Farm {
     ///
     /// Placement follows at the next tick.
     pub fn intake(&self) {
-        js_arm!(self, lifecycle::intake());
         let now = self.now();
         let mut guard = self.lock();
         let state = &mut *guard;
@@ -252,7 +251,6 @@ impl Farm {
     /// it saw everything written before it.
     #[must_use]
     pub fn intake_polls(&self) -> tokio::sync::watch::Receiver<u64> {
-        js_arm!(self, lifecycle::intake_polls());
         self.lock().engine.intake.polls.subscribe()
     }
 
@@ -261,7 +259,6 @@ impl Farm {
     /// frontend serves the epoch it started under until it is restarted.
     #[must_use]
     pub fn epoch_ahead(&self) -> Option<u64> {
-        js_arm!(self, lifecycle::epoch_ahead());
         self.lock().engine.intake.epoch_ahead
     }
 

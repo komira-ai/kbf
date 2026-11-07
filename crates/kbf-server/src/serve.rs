@@ -90,7 +90,7 @@ pub struct Listeners {
     /// limit, before a whole host (`--memory-ladder-gib`).
     pub memory_ladder: MemoryLadder,
     /// Whether an action that passes its own memory limit runs again on the next rung
-    /// (`false` is `--no-memory-climb`: the kill finishes it, and the legacy core only).
+    /// (`false` is `--no-memory-climb`: the kill finishes it).
     pub memory_climb: bool,
     /// What a node that reports VM slots keeps for the host: its CPUs and memory,
     /// subtracted from what placement may book on it (`--vm-host-floor-cpus`,
@@ -101,8 +101,6 @@ pub struct Listeners {
     /// Whether every `action` lease books the whole worker it lands on, so that one action
     /// runs per worker (`--exclusive-actions`).
     pub exclusive_actions: bool,
-    /// Which core drives the farm's scheduling (`--scheduler-core`).
-    pub scheduler_core: crate::SchedulerCore,
     /// Whether placement reads the load the nodes report (`--placement-load`).
     pub placement_load: crate::PlacementLoad,
     /// Whether the scheduler is given the estimator's prediction of a new operation's cost
@@ -564,11 +562,11 @@ pub(crate) fn sweeping(members: Option<Arc<Members>>) -> Pin<Box<dyn Future<Outp
     }
 }
 
-/// Logs the core `farm` runs on, as its driver says (not as the flag does), and whether an
+/// Logs the core a server runs, the usage profiles mode of `farm`, and whether an
 /// own-limit kill climbs the ladder (`--no-memory-climb`), in the words the all-in-one server
 /// and the frontend both use.
 pub(crate) fn log_core(farm: &Farm) {
-    tracing::info!("{}", farm.scheduler_core().start_line());
+    tracing::info!("{}", crate::SchedulerCore::Legacy.start_line());
     tracing::info!("{}", farm.usage_profiles().start_line());
     tracing::info!(
         "memory climb: {}",

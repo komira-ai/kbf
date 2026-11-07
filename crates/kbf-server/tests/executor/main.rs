@@ -1,7 +1,6 @@
 //! The host executor against the real farm and an in-process job service.
 //!
-//! The farm is [`kbf_server::Farm`] on the scheduler core the build names (the legacy one,
-//! and the js core in the `farm-core-js` build, which CI runs these on too); the job service
+//! The farm is [`kbf_server::Farm`] on the legacy scheduler core; the job service
 //! is `kbf_job_client::fake::FakeJobServer`, which keeps the service's rules
 //! and leaves what the hosts do to the test. Time is tokio's paused clock, moved by hand: the
 //! tests assert on what happened, never on how long it took.

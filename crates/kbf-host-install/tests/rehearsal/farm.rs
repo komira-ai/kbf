@@ -537,7 +537,7 @@ pub fn seen() -> Option<Seen> {
 /// listener the agent uses alike; a drain the frontend answers "no such node" writes none),
 /// `worker registered` when a daemon's stream registers the node, and `worker stream ended`
 /// when a daemon's stream ends (its connection closes as its process stops). The `operator action`
-/// line is the legacy scheduler core's, the default; the js core does not write it.
+/// line is written by the scheduler core.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NodeEvent {
     /// A daemon registered as the node.

@@ -2,9 +2,8 @@
 //! scheduler's outcome for a report, the detail the report carries beyond it, and the
 //! [`Finished`] a finished operation's callers see (and its `done/` row keeps).
 //!
-//! Both scheduling cores use these: the farm's own ([`crate::farm`]) and the one built on
-//! `js-server-core` ([`crate::farm_js`]). A change here is a change in what a caller of
-//! either is answered.
+//! The farm ([`crate::farm`]) uses these. A change here is a change in what a caller is
+//! answered.
 
 use std::time::{Duration, SystemTime};
 

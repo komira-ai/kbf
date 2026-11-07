@@ -887,6 +887,3 @@ fn a_version_1_size_summary_row_still_reads() {
     assert_eq!(again.len(), summary.len() + 32, "the minute ring is added");
     assert_eq!(kbf_estimator::Summary::decode(&again), Some(read));
 }
-
-/// The same scenarios through `js-store`.
-mod via_js_store;

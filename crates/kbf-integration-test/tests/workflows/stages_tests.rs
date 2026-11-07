@@ -60,6 +60,38 @@ fn the_real_stage_file_matches_the_real_workflows() {
 }
 
 #[test]
+fn a_row_for_the_deleted_js_core_gate_is_refused() {
+    // Catches: the stage file keeping (or regaining) the row of the js core's gate, whose
+    // workflow went with the core: the real stage file, with the row put back, names a
+    // workflow file that is not there.
+    let (stages, workflows) = real();
+    assert!(
+        workflows.iter().all(|(f, _)| f != "js-core-gate.yml"),
+        "js-core-gate.yml is back"
+    );
+    let row = "  - job: js-core-gate.yml#m1-cell-js\n    stage: suite\n";
+    let bad = stages.replacen("jobs:\n", &format!("jobs:\n{row}"), 1);
+    assert_ne!(stages, bad, "the row was not added");
+    let found = check(&bad, &workflows);
+    assert_eq!(
+        found,
+        [format!(
+            "{STAGE_FILE}: line {}: `js-core-gate.yml#m1-cell-js` names a workflow file that \
+             is not in {WORKFLOW_DIR}",
+            line_of(&bad, "js-core-gate.yml")
+        )]
+    );
+}
+
+/// The 1-based line of `bad` that holds `needle`.
+fn line_of(bad: &str, needle: &str) -> usize {
+    bad.lines()
+        .position(|l| l.contains(needle))
+        .expect("the needle")
+        + 1
+}
+
+#[test]
 fn a_pull_request_trigger_on_the_release_workflow_is_refused() {
     // Catches: a stage workflow gaining `pull_request`, which the prod stage does not
     // allow. Control: the real text above.

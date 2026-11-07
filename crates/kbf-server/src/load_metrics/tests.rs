@@ -1,6 +1,6 @@
 //! The `kbf_sched_load_*` and `kbf_node_load_*` families as a scrape writes them
-//! (`crate::metrics::render_farm`, the one call of `GET /metrics`), over a farm on the core
-//! under test: the farm's own, and the js core in a build with `farm-core-js`. The farm's clock
+//! (`crate::metrics::render_farm`, the one call of `GET /metrics`), over the farm.
+//! The farm's clock
 //! is tokio's, and these tests stop and advance it; none reads a real one.
 
 use std::sync::Arc;

@@ -1304,9 +1304,7 @@ fn learned_sizes_come_from_their_flag() {
 
 /// Catches: `--exclusive-actions` not parsed into the listeners (a farm that ignores it
 /// books an action as it always did), a default other than off (the flag changes every
-/// booking, so only an operator sets it), a value given to the switch, and the flag
-/// accepted under `--scheduler-core js` being refused (the js core takes the request as
-/// the front sends it).
+/// booking, so only an operator sets it), and a value given to the switch.
 #[test]
 fn exclusive_actions_come_from_their_flag() {
     use clap::Parser;
@@ -1322,9 +1320,6 @@ fn exclusive_actions_come_from_their_flag() {
     };
     assert!(!on(&[]));
     assert!(on(&["--exclusive-actions"]));
-    assert!(on(&["--exclusive-actions", "--scheduler-core", "js"]));
-    let js = args(&["--exclusive-actions", "--scheduler-core=js"]).expect("flags parse");
-    assert!(js.check_scheduler_core().is_ok());
     args(&["--exclusive-actions=true"]).expect_err("a switch takes no value");
 }
 
@@ -1347,27 +1342,18 @@ fn the_memory_climb_is_on_unless_its_flag_turns_it_off() {
     );
 }
 
-/// Catches `--no-memory-climb` accepted with the js core, whose scheduler the flag cannot
-/// reach (the climb would stay on while the flag says off), and the refusal applied to the
-/// combinations the core runs: the flag on the legacy core, and the js core without it.
+/// Catches `--no-memory-climb` refused by the scheduler-core check, with or without
+/// `--scheduler-core=legacy` and with learned sizes on: it is a legacy-core feature, always
+/// accepted.
 #[test]
-fn no_memory_climb_is_refused_with_the_js_core_only() {
+fn no_memory_climb_is_accepted() {
     use clap::Parser;
     let check = |flags: &[&str]| {
         kbf_server::Args::parse_from(std::iter::once("kbf-server").chain(flags.iter().copied()))
             .check_scheduler_core()
     };
-    let refused = check(&["--scheduler-core=js", "--no-memory-climb"]).expect_err("refused");
-    assert!(matches!(
-        refused,
-        kbf_server::ConfigError::NoMemoryClimbUnderJs
-    ));
-    let said = refused.to_string();
-    assert!(said.contains("--no-memory-climb"), "{said}");
-    assert!(said.contains("--scheduler-core js"), "{said}");
+    check(&["--no-memory-climb"]).expect("the flag alone");
     check(&["--scheduler-core=legacy", "--no-memory-climb"]).expect("legacy");
-    check(&["--scheduler-core=js"]).expect("js without the flag");
-    // Allowed with learned sizes on: no kill raises a booking floor.
     check(&["--no-memory-climb", "--learned-sizes=on"]).expect("learned on");
 }
 
