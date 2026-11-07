@@ -8,7 +8,7 @@ use js_proto::v1::{
 use kbf_job_client::fake::{Call, Fault};
 use kbf_proto::google::rpc::ErrorInfo;
 use kbf_proto::worker::{Cancel, Lost, ResultAck, ServerMessage, Start, server_message};
-use kbf_types::LeaseId;
+use kbf_types::{LeaseId, LeaseKind};
 use prost::Message;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::Instant;
@@ -350,11 +350,91 @@ async fn a_job_conflict_on_resubmit_is_infra_and_flags_a_twin() {
     assert_eq!(harness.fake.jobs().len(), 1);
 }
 
-/// Catches a whole-machine `Start` being submitted as a job (the executor offers the container
-/// driver only): nothing is sent to the job service, and the farm is told it is
-/// infrastructure, so it places the action elsewhere.
+/// Catches a whole-machine action that the executor's workers are never given, or that is
+/// submitted as a share of a host. The `Hello` a worker registers with lists `container` and
+/// `native-whole-machine` and no other driver, so the scheduler places `action` and
+/// `whole_machine` leases on it and no VM lease. A `whole_machine` `Start` is one submit, of a
+/// job that needs the whole host and nothing beside it (the CPU and memory the `Start` carries
+/// are the worker's whole capacity, not a host's), and is otherwise the job a container
+/// action's `Start` makes: the same image, command, environment, constraints, network, wall
+/// limit and labels, and as many arguments (theirs name each its own lease). The task follows
+/// the job as any other's.
 #[tokio::test(start_paused = true)]
-async fn a_whole_machine_start_is_infra_and_never_submitted() {
+async fn a_whole_machine_action_submits_a_whole_host_job() {
+    let harness = Harness::new().await;
+    let hello = harness.cfg.hello("js:front-0", "inst", "");
+    let drivers: Vec<&str> = hello
+        .capabilities
+        .iter()
+        .filter(|entry| entry.key == "drivers")
+        .map(|entry| entry.value.as_str())
+        .collect();
+    assert_eq!(drivers, ["container", "native-whole-machine"]);
+    let caps = crate::worker::reported(&hello, crate::worker::HostFloor::DEFAULT)
+        .expect("the farm reads the hello")
+        .caps;
+    let served = |kind: LeaseKind| caps.drivers.iter().any(|driver| kind.served_by(driver));
+    assert_eq!(
+        LeaseKind::ALL.map(|kind| (kind, served(kind))),
+        [
+            (LeaseKind::Action, true),
+            (LeaseKind::WholeMachine, true),
+            (LeaseKind::Vm, false),
+        ]
+    );
+
+    let (mut worker, messages) = harness.worker();
+    tell_start(
+        &messages,
+        Start {
+            kind: "whole_machine".to_owned(),
+            millicpus: 2_000_000,
+            memory_bytes: 4_096 * GIB,
+            ..start(1, 1)
+        },
+    );
+    tell_start(&messages, start(1, 2));
+    step(&harness, &mut worker).await;
+    let specs = submitted_specs(&harness);
+    assert_eq!(specs.len(), 2, "{specs:?}");
+    let (whole, shared) = (&specs[0], &specs[1]);
+    assert_eq!(whole.job_id, job_id("front", LeaseId::new(1, 1), 0));
+    assert_eq!(
+        whole.needs,
+        Some(Needs {
+            whole_host: true,
+            ..Needs::default()
+        })
+    );
+    assert!(shared.needs.as_ref().is_some_and(|needs| !needs.whole_host));
+    let without_needs = |spec: &JobSpec| JobSpec {
+        job_id: String::new(),
+        needs: None,
+        // The arguments and files name the lease, the grant and the pack url, which are the
+        // lease's own: they are compared without the lease's values.
+        args: Vec::new(),
+        files: Vec::new(),
+        ..spec.clone()
+    };
+    assert_eq!(without_needs(whole), without_needs(shared));
+    assert_eq!(whole.args.len(), shared.args.len());
+    let Some(Stage::Running(running)) = worker
+        .tasks
+        .get(&LeaseId::new(1, 1))
+        .map(|task| &task.stage)
+    else {
+        panic!("the whole-host task is not running");
+    };
+    assert_eq!(running.job, whole.job_id);
+    assert_eq!(counted(&harness, "kbf_executor_jobs_submitted_total"), 2);
+}
+
+/// Catches a whole-host job that the service could not ready a host for being answered as
+/// the action's failure, or followed by a second job of the same lease: it ends the lease as
+/// an infrastructure failure, by the outcome table's row for `exclusive-not-ready`, and the
+/// farm runs the action again as a new lease.
+#[tokio::test(start_paused = true)]
+async fn a_whole_host_job_whose_host_was_not_readied_is_an_infrastructure_failure() {
     let harness = Harness::new().await;
     let (mut worker, messages) = harness.worker();
     tell_start(
@@ -365,15 +445,18 @@ async fn a_whole_machine_start_is_infra_and_never_submitted() {
         },
     );
     step(&harness, &mut worker).await;
-    assert!(submitted_specs(&harness).is_empty());
-    assert!(harness.fake.calls().is_empty());
+    let id = job_of(&worker, LeaseId::new(1, 1));
+    assert!(harness.fake.place(&id, HOST));
+    assert!(
+        harness
+            .fake
+            .fail_to_start(&id, StartFailureCode::ExclusiveNotReady)
+    );
+    step(&harness, &mut worker).await;
     let (code, message) = status_of(reported(&worker, LeaseId::new(1, 1)));
     assert_eq!(code, Code::Unavailable as i32);
-    assert_eq!(
-        message,
-        "a whole-machine action is not run by this executor: its workers offer the container \
-         driver only"
-    );
+    assert_eq!(message, "the job failed to start: exclusive-not-ready");
+    assert_eq!(submitted_specs(&harness).len(), 1);
 }
 
 /// Catches a queued job being submitted again on each pass, and the silence of a host being

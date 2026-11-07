@@ -8,6 +8,11 @@
 //! exited 0 and the frontend reads the pack, and `Reporting` from the moment its `Result` is
 //! formed until the farm acknowledges it.
 //!
+//! A `Start` of a `whole_machine` lease takes the same path: it is submitted as a job that
+//! needs the whole host ([`Booking::WholeHost`]), and its end is read as any job's is, by the
+//! table of [`outcome`](super::outcome) (a host the service could not ready for it is
+//! `exclusive-not-ready`, an infrastructure failure the farm reruns).
+//!
 //! Two guards keep one farm lease to one job. The in-memory task is the first: a `Start` sent
 //! again finds its task and changes nothing. The job id ([`job_id`](super::job_id)) is the
 //! second: a submit whose answer was lost is sent again with the same id and the same job,
@@ -39,9 +44,6 @@ use crate::executor::task::PackKey;
 use crate::executor::traits::{Ingested, UntrustedLimits};
 use crate::executor::{Ctx, twin_message};
 
-/// The kind of a `Start` that asks for a whole machine.
-const WHOLE_MACHINE: &str = "whole_machine";
-
 /// One farm lease the worker was told to run.
 pub(super) struct Task {
     pub(super) action: Digest,
@@ -70,9 +72,8 @@ pub(super) struct Waiting {
     /// Until when the `Start` may be acted on; `None` for one that names a heartbeat the
     /// worker did not send.
     deadline: Option<Instant>,
+    /// A share of a host, or the whole host for a `whole_machine` lease.
     booking: Booking,
-    /// The `Start` asks for a whole machine.
-    whole_machine: bool,
     /// The job, kept from the first try: a read of the CAS, a url and a grant are not made
     /// again on each pass, and a submit sent again sends the same job.
     prepared: Option<Arc<Prepared>>,
@@ -143,11 +144,7 @@ impl HostWorker {
         let window = Duration::from_millis(start.valid_for_ms).min(START_VALIDITY);
         let waiting = Waiting {
             deadline: self.sent_at(start.heartbeat_seq).map(|sent| sent + window),
-            booking: Booking {
-                millicpus: start.millicpus,
-                memory_bytes: start.memory_bytes,
-            },
-            whole_machine: start.kind == WHOLE_MACHINE,
+            booking: Booking::of(start),
             prepared: None,
             sent: false,
         };
@@ -226,17 +223,6 @@ impl HostWorker {
                 self.late(ctx, lease, w.sent_job());
                 continue;
             };
-            if w.whole_machine {
-                let why = "a whole-machine action is not run by this executor: its workers \
-                           offer the container driver only";
-                self.settle_with(
-                    lease,
-                    &Settled::Infra(why.to_owned()),
-                    now,
-                    &ctx.deps.metrics,
-                );
-                continue;
-            }
             self.stamp(lease, Mark::Seen, at, ctx);
             match self.submit(ctx, lease, &action, w, deadline).await {
                 Submitted::Wait(w) => self.set_stage(lease, Stage::Waiting(w)),

@@ -21,4 +21,5 @@ mod recovery;
 mod rig;
 mod spec;
 mod starts;
+mod whole;
 mod wiring;

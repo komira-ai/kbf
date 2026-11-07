@@ -4,9 +4,10 @@
 //! # How it sits in the server
 //!
 //! Neither scheduler core knows. The executor registers virtual workers, `js:<frontend>-<n>`,
-//! each a node of the declared shape whose only driver is `container`, and takes the messages
-//! the farm sends a daemon on the channel it owns the receiving end of. A `Start` is submitted
-//! to the job service as a job of the kbf image, whose entrypoint is the task tool, under an id
+//! each a node of the declared shape whose drivers are `container` and `native-whole-machine`,
+//! and takes the messages the farm sends a daemon on the channel it owns the receiving end of.
+//! A `Start` is submitted to the job service as a job of the kbf image, whose entrypoint is the
+//! task tool (a `whole_machine` lease's as a job that needs the whole host), under an id
 //! made from the farm lease, so a submit sent again makes no second job; the job is read back
 //! until it ends, its ending is mapped to the farm's failure classes ([`outcome`]), and the
 //! result is reported the way a daemon reports one. A `Cancel` is a cancel of the job. The

@@ -274,10 +274,11 @@ fn a_run_is_capped_as_the_container_driver_caps_it() {
     );
 }
 
-/// Catches a Hello that places a whole-machine or VM lease on a host (a driver other than
-/// `container`), that omits the slot cap, or that carries the wrong capacity.
+/// Catches a Hello that places a VM lease on a host or no whole-machine lease (a driver other
+/// than `container` and `native-whole-machine`, or one of them missing), that omits the slot
+/// cap, or that carries the wrong capacity.
 #[test]
-fn the_hello_reports_a_container_host_and_nothing_else() {
+fn the_hello_reports_a_container_and_whole_machine_host_and_nothing_else() {
     let hello = base().hello("js:node1", "inst", "pred");
     let entries: Vec<(&str, &str)> = hello
         .capabilities
@@ -291,6 +292,7 @@ fn the_hello_reports_a_container_host_and_nothing_else() {
             ("arch", "x86_64"),
             ("cpus", "16"),
             ("drivers", "container"),
+            ("drivers", "native-whole-machine"),
             ("mem_gib", "40"),
             ("os", "linux"),
         ]

@@ -5,7 +5,8 @@
 //! task kept, after its answer was lost, names the job already made, and the service answers
 //! from it (design section 5.3). The job is the kbf image, whose entrypoint is the
 //! task tool, run with the tool's flags; it needs what the farm booked, with the hard memory cap
-//! a daemon would set and the scratch of its inputs and outputs, of a Linux host of the
+//! a daemon would set and the scratch of its inputs and outputs, or, for a `whole_machine`
+//! lease, the whole host and nothing beside it ([`Booking`]), of a Linux host of the
 //! configured architecture in a container, for the action's timeout and the run margin. The
 //! read grant and the presigned `PUT` travel as the job's files, or as arguments where the
 //! operator allowed it (`insecure_argv_secrets`). Two labels name the frontend and the
@@ -19,6 +20,7 @@ use std::time::Duration;
 
 use js_proto::v1::{JobSpec, Needs};
 use kbf_proto::reapi::Digest;
+use kbf_proto::worker::Start;
 use kbf_types::LeaseId;
 use ring::digest::{SHA256, digest};
 
@@ -113,11 +115,56 @@ pub(super) fn wall_seconds(wall: Duration) -> u64 {
     wall.as_secs() + u64::from(wall.subsec_nanos() > 0)
 }
 
-/// What a `Start` asks for: the CPU and memory the farm booked.
-#[derive(Clone, Copy, Debug)]
-pub(super) struct Booking {
-    pub(super) millicpus: u64,
-    pub(super) memory_bytes: u64,
+/// The kind of a `Start` that asks for a whole machine.
+const WHOLE_MACHINE: &str = "whole_machine";
+
+/// What a `Start` asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Booking {
+    /// A share of a host: the CPU and memory the farm booked.
+    Share { millicpus: u64, memory_bytes: u64 },
+    /// A `whole_machine` lease: the whole host, with no other job beside it. The CPU and
+    /// memory the `Start` carries are the virtual worker's whole capacity, not a host's, and
+    /// are not asked for.
+    WholeHost,
+}
+
+impl Booking {
+    /// What `start` asks for: the whole host for a `whole_machine` lease, else the share it
+    /// booked.
+    pub(super) fn of(start: &Start) -> Self {
+        match start.kind == WHOLE_MACHINE {
+            true => Self::WholeHost,
+            false => Self::Share {
+                millicpus: start.millicpus,
+                memory_bytes: start.memory_bytes,
+            },
+        }
+    }
+
+    /// What the job needs. A share needs at least one thousandth of a CPU, the hard memory
+    /// cap of its booking and the disk of its inputs (`input_bytes`, when known) and outputs.
+    /// The whole host is asked for alone: the job service takes a whole-host job only with no
+    /// other need, and the host's cores, memory and disk are all the job's.
+    fn needs(self, cfg: &Config, input_bytes: Option<u64>) -> Needs {
+        match self {
+            Self::Share {
+                millicpus,
+                memory_bytes,
+            } => Needs {
+                cpu_millis: millicpus.max(1),
+                memory_bytes: Config::hard_memory(memory_bytes),
+                disk_bytes: Some(cfg.disk_bytes(input_bytes)),
+                gpus: 0,
+                gpu_class: String::new(),
+                whole_host: false,
+            },
+            Self::WholeHost => Needs {
+                whole_host: true,
+                ..Needs::default()
+            },
+        }
+    }
 }
 
 /// The job of `lease`, which runs `action` with `booking`, with its pack key.
@@ -178,7 +225,7 @@ pub(super) async fn prepare(
         tracing::warn!(
             %worker,
             %lease,
-            "the size of the inputs is not known; the job needs the allowance and the margin only"
+            "the size of the inputs is not known; a shared job needs the allowance and the margin only"
         );
     }
     let spec = JobSpec {
@@ -188,14 +235,7 @@ pub(super) async fn prepare(
         command: String::new(),
         args: args.argv(ctx.cfg.delivery),
         env: BTreeMap::new(),
-        needs: Some(Needs {
-            cpu_millis: booking.millicpus.max(1),
-            memory_bytes: Config::hard_memory(booking.memory_bytes),
-            disk_bytes: Some(ctx.cfg.disk_bytes(grant.input_bytes)),
-            gpus: 0,
-            gpu_class: String::new(),
-            whole_host: false,
-        }),
+        needs: Some(booking.needs(ctx.cfg, grant.input_bytes)),
         constraints: Some(ctx.cfg.constraints()),
         wall_limit_seconds: Some(wall_seconds(wall)),
         // The operator's level, by default the allow-list: the task tool reaches the read

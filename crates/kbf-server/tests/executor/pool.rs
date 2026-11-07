@@ -82,10 +82,12 @@ async fn building_an_executor_asks_the_job_service_for_nothing() {
 
 /// Catches a pool that registers one worker twice or none at all: each of the frontend's
 /// workers is a node of its own, `js:<frontend>-<n>`, of the declared cores and memory on
-/// linux and the declared architecture, that takes only containers: a whole-machine action is
-/// never placed on one, and an ordinary action is.
+/// linux and the declared architecture, that takes ordinary and whole-machine actions: a
+/// whole-machine action becomes one job of the whole host, and an ordinary action submitted
+/// after it still becomes a job (that a whole-machine action books its worker whole is held by
+/// `whole.rs`).
 #[tokio::test(start_paused = true)]
-async fn each_worker_is_a_node_of_the_declared_shape_that_takes_only_containers() {
+async fn each_worker_is_a_node_of_the_declared_shape_that_takes_whole_machine_actions_too() {
     let mut rig = Rig::start(&["node1", "node2", "node3"], 2, |cfg| {
         cfg.cpu_millis = 8_000
     })
@@ -118,15 +120,14 @@ async fn each_worker_is_a_node_of_the_declared_shape_that_takes_only_containers(
     }
     let whole = rig.submit_kind(1, LeaseKind::WholeMachine);
     rig.pump().await;
-    assert!(
-        rig.jobs().is_empty(),
-        "a whole-machine action was sent to a worker"
-    );
-    assert!(whole.finished().is_none());
+    let jobs = rig.jobs_of(1);
+    assert_eq!(jobs.len(), 1, "{jobs:?}");
+    assert!(jobs[0].spec.needs.as_ref().is_some_and(|n| n.whole_host));
     let action = rig.submit(2);
     rig.pump().await;
     assert_eq!(rig.jobs_of(2).len(), 1);
-    drop(action);
+    assert_eq!(rig.jobs().len(), 2);
+    drop((whole, action));
 }
 
 /// Catches a worker that takes more actions than the slots it declared: with two slots and
