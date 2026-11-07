@@ -668,16 +668,20 @@ async fn a_temporary_items_of_another_user_is_not_swept() {
     assert!(kept, "swept a TemporaryItems owned by root");
 }
 
-/// The newest Xcode on this runner whose Metal toolchain works outside any sandbox:
-/// `xcrun metal --version` runs the compiler and `xcrun --find metallib` finds the linker. A
-/// node without the Metal toolchain installed has none to test: the macos-15 runner's Xcode 26
-/// finds `metal`, then refuses to run it ("missing Metal Toolchain"), and finds no `metallib`.
-/// A tool that works here and not under the lease's sandbox still fails the test.
+/// The newest Xcode on this runner whose Metal toolchain a lease can use: outside any sandbox,
+/// with an empty home of its own as a lease has (`HOME` and `CFFIXED_USER_HOME`), `xcrun metal
+/// --version` runs the compiler and `xcrun --find metallib` finds the linker. An Xcode that
+/// installs the toolchain per user, under the runner user's own home (the macos-15 runner's
+/// Xcode 26.3; from 26.5 it is a system cryptex), has none a lease can use: komira-ai/kbf#2282.
+/// A toolchain that works here and not under the lease's sandbox still fails the test.
 fn xcode_with_metal() -> Option<(String, PathBuf)> {
+    let home = scratch("metal-probe-home");
     let works = |developer_dir: &PathBuf, args: &[&str]| {
         std::process::Command::new(xcode::XCRUN)
             .args(args)
             .env("DEVELOPER_DIR", developer_dir)
+            .env("HOME", &*home)
+            .env("CFFIXED_USER_HOME", &*home)
             .output()
             .is_ok_and(|out| out.status.success())
     };
@@ -701,7 +705,10 @@ async fn a_metal_shader_compiles_with_no_flags() {
     setup();
     let _tools = DEVELOPER_TOOLS.read().await;
     let Some((build, developer_dir)) = xcode_with_metal() else {
-        eprintln!("no Xcode with the Metal compiler and metallib on this runner: nothing to check");
+        eprintln!(
+            "no Xcode on this runner has a Metal toolchain a lease's own home can use \
+             (komira-ai/kbf#2282): nothing to check"
+        );
         return;
     };
     let dir = scratch("metal");
