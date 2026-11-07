@@ -1,13 +1,15 @@
-//! A relay on a loopback port in front of a job service that loses the first answer: what a
-//! client sees when the network drops an answer after the server has acted.
+//! A relay on a loopback port in front of a job service that loses one answer: what a client
+//! sees when the network drops an answer after the server has acted.
 //!
-//! Every byte from the client is passed to the server. From the server, the frames of the
-//! connection itself (stream 0: settings, pings, window updates) are passed back, and so is
-//! every frame of the first connection until the first `HEADERS` frame of a request's stream:
-//! the head of the first answer, which the server sends only once its handler has returned. At
-//! that frame the relay closes both sides of that connection without passing it on. Every later
-//! connection is relayed whole. [`DropFirstAnswer::dropped`] says whether an answer was lost, so
-//! a test cannot pass on a relay that lost nothing.
+//! Every byte from the client is passed to the server. From the server, the frames of each
+//! connection are passed back one by one until, while the relay is armed, a `HEADERS` frame of
+//! a request's stream comes: the head of an answer, which the server sends only once its
+//! handler has returned. At that frame the relay disarms, and closes both sides of that
+//! connection without passing it on; every other frame, and every frame once it has disarmed,
+//! is relayed. [`DropFirstAnswer::start`] is armed from the start, so it loses the first answer
+//! of all; [`DropFirstAnswer::held`] loses the first answer after [`DropFirstAnswer::arm`], so
+//! a test can let a client's earlier calls through. [`DropFirstAnswer::dropped`] says whether
+//! an answer was lost, so a test cannot pass on a relay that lost nothing.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -23,6 +25,7 @@ const HEADERS: u8 = 0x1;
 /// The relay, until it drops.
 pub struct DropFirstAnswer {
     addr: SocketAddr,
+    armed: Arc<AtomicBool>,
     dropped: Arc<AtomicBool>,
     task: JoinHandle<()>,
 }
@@ -34,19 +37,40 @@ impl Drop for DropFirstAnswer {
 }
 
 impl DropFirstAnswer {
-    /// A relay to `upstream` on a port of `127.0.0.1` the system picks.
+    /// A relay to `upstream` on a port of `127.0.0.1` the system picks, armed: it loses the
+    /// first answer.
     pub async fn start(upstream: SocketAddr) -> DropFirstAnswer {
+        let relay = DropFirstAnswer::held(upstream).await;
+        relay.arm();
+        relay
+    }
+
+    /// A relay to `upstream` on a port of `127.0.0.1` the system picks that passes every answer
+    /// until it is armed.
+    pub async fn held(upstream: SocketAddr) -> DropFirstAnswer {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind a loopback port");
         let addr = listener.local_addr().expect("the relay's address");
+        let armed = Arc::new(AtomicBool::new(false));
         let dropped = Arc::new(AtomicBool::new(false));
-        let task = tokio::spawn(accept(listener, upstream, Arc::clone(&dropped)));
+        let task = tokio::spawn(accept(
+            listener,
+            upstream,
+            Arc::clone(&armed),
+            Arc::clone(&dropped),
+        ));
         DropFirstAnswer {
             addr,
+            armed,
             dropped,
             task,
         }
+    }
+
+    /// Loses the next answer the server sends, on whichever connection it comes.
+    pub fn arm(&self) {
+        self.armed.store(true, Ordering::SeqCst);
     }
 
     /// The origin a client dials to go through the relay.
@@ -60,27 +84,33 @@ impl DropFirstAnswer {
     }
 }
 
-async fn accept(listener: TcpListener, upstream: SocketAddr, dropped: Arc<AtomicBool>) {
-    let mut first = true;
+async fn accept(
+    listener: TcpListener,
+    upstream: SocketAddr,
+    armed: Arc<AtomicBool>,
+    dropped: Arc<AtomicBool>,
+) {
     while let Ok((client, _)) = listener.accept().await {
         let Ok(server) = TcpStream::connect(upstream).await else {
             continue;
         };
-        if std::mem::take(&mut first) {
-            tokio::spawn(relay_dropping(client, server, Arc::clone(&dropped)));
-        } else {
-            tokio::spawn(relay(client, server));
-        }
+        tokio::spawn(relay(
+            client,
+            server,
+            Arc::clone(&armed),
+            Arc::clone(&dropped),
+        ));
     }
 }
 
-/// Relays a connection whole.
-async fn relay(mut client: TcpStream, mut server: TcpStream) {
-    let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
-}
-
-/// Relays a connection until the server sends the head of an answer, then closes it.
-async fn relay_dropping(client: TcpStream, server: TcpStream, dropped: Arc<AtomicBool>) {
+/// Relays a connection frame by frame; at the head of an answer while `armed`, disarms and
+/// closes it.
+async fn relay(
+    client: TcpStream,
+    server: TcpStream,
+    armed: Arc<AtomicBool>,
+    dropped: Arc<AtomicBool>,
+) {
     let (mut client_read, mut client_write) = client.into_split();
     let (mut server_read, mut server_write) = server.into_split();
     let upward = tokio::spawn(async move {
@@ -92,7 +122,7 @@ async fn relay_dropping(client: TcpStream, server: TcpStream, dropped: Arc<Atomi
     'read: while let Ok(read @ 1..) = server_read.read(&mut chunk).await {
         pending.extend_from_slice(&chunk[..read]);
         while let Some(len) = whole_frame(&pending) {
-            if answer_head(&pending) {
+            if answer_head(&pending) && armed.swap(false, Ordering::SeqCst) {
                 dropped.store(true, Ordering::SeqCst);
                 break 'read;
             }
