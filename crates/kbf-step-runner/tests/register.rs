@@ -649,7 +649,40 @@ fn a_line_that_is_out_of_time_is_refused() {
         .unwrap()
         .with_line_deadline(std::time::Duration::ZERO);
     rig.server = Arc::new(server);
-    assert_eq!(refused(&rig, &registration("2.0.0", None)), "malformed");
+    // The server refuses and closes without reading the line, so the write may find the
+    // connection closed; the refusal it left is still read and is what is asserted.
+    let (client, served) = rig.connect();
+    match (&client).write_all(registration("2.0.0", None).as_bytes()) {
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+        other => other.unwrap(),
+    }
+    let reply = answer(&client);
+    served.join().unwrap().unwrap();
+    assert_eq!(
+        (&reply["ok"], &reply["error"]),
+        (&false.into(), &"malformed".into())
+    );
+    assert_eq!(rig.registry.report("svc", None), Reported::Absent);
+}
+
+/// Catches a refusal that is lost when the server has closed before the peer wrote: the write finds
+/// the connection closed (broken pipe), and the refusal the server sent first is still there to
+/// read. The server runs to its end before the peer writes, so the order is fixed.
+#[test]
+fn a_refusal_is_readable_after_the_server_has_closed() {
+    let mut rig = Rig::new("reg-closed-first", me());
+    let server = Arc::try_unwrap(rig.server)
+        .ok()
+        .unwrap()
+        .with_line_deadline(std::time::Duration::ZERO);
+    rig.server = Arc::new(server);
+    let (client, served) = UnixStream::pair().unwrap();
+    rig.server.serve_connection(served).unwrap();
+    let err = (&client)
+        .write_all(registration("2.0.0", None).as_bytes())
+        .unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+    assert_eq!(answer(&client)["error"], "malformed");
     assert_eq!(rig.registry.report("svc", None), Reported::Absent);
 }
 
