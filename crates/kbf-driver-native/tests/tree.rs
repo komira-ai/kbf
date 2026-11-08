@@ -280,8 +280,11 @@ async fn a_lease_reports_its_usage_on_macos_only() {
 }
 
 /// Catches: a lease that ended in an error (here a timeout) reporting no usage through
-/// `failed_usage`, the usage handed out twice, and one kept under another lease's id.
-/// The action held its memory and burned CPU for over a second before the timeout.
+/// `failed_usage`, the usage handed out twice, one kept under another lease's id, and a
+/// wall time shorter than the run. How much of its memory and CPU the action reached
+/// before the timeout depends on how fast the runner is, so the amounts are asserted by
+/// [`a_killed_lease_tells_the_usage_of_what_it_ran`], which ends the lease only after
+/// the action says its work is done.
 /// Catches (Linux unit test of the same map): `remove` replaced by `get().cloned()`;
 /// this test itself ran green on a macOS runner.
 #[tokio::test]
@@ -298,11 +301,60 @@ async fn a_timed_out_lease_tells_its_usage_once() {
     assert_eq!(rt.failed_usage(LeaseId::new(1, 4)), None, "another lease's");
     let usage = rt.failed_usage(LeaseId::new(1, 3));
     if cfg!(target_os = "macos") {
-        assert_heavy(&usage.expect("a usage"), Duration::from_millis(1900));
+        let usage = usage.expect("a usage");
+        assert_eq!(usage.basis(), UsageBasis::MacFootprint);
+        let f = usage.footprint.expect("a footprint block");
+        assert_eq!(
+            usage.peak_memory_bytes,
+            f.peak_footprint_bytes.expect("a peak")
+        );
+        assert_eq!(usage.cpu_user_micros, f.cpu_user_micros.expect("user cpu"));
+        let wall = f.wall_micros.expect("wall");
+        assert!(wall >= 1_900_000, "wall {wall} us of a 2 s timeout");
     } else {
         assert_eq!(usage, None);
     }
     assert_eq!(rt.failed_usage(LeaseId::new(1, 3)), None, "taken once");
+}
+
+/// Catches: a lease that ended in an error (here a kill) reporting less than its action
+/// used: a peak under the 208 MiB it touched, or CPU time not read. The action writes
+/// `touched` in its lease once it has held the memory and burned the CPU, and only then
+/// is the lease killed, so the amounts do not depend on how fast the runner is.
+#[tokio::test]
+async fn a_killed_lease_tells_the_usage_of_what_it_ran() {
+    let dir = scratch("usage-kill");
+    let config = config(&dir);
+    let cas = Arc::new(MemoryCas::default());
+    let rt = Arc::new(runtime(config.clone(), &cas));
+    let touched = config
+        .scratch
+        .join("lease-1-5")
+        .join("root")
+        .join("touched");
+    let action = Spec::act(&format!("{HEAVY} ; write-lines touched ; sleep 300")).store(&cas);
+    let running = tokio::spawn({
+        let rt = Arc::clone(&rt);
+        async move { rt.run(work(5, action, 0)).await }
+    });
+    // A bound so that an action that never gets there fails the test instead of hanging it.
+    let give_up = tokio::time::Instant::now() + PROMPT * 3;
+    while !touched.exists() {
+        assert!(
+            tokio::time::Instant::now() < give_up,
+            "the action never touched its memory"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    rt.kill(LeaseId::new(1, 5)).await;
+    let outcome = running.await.expect("run task");
+    assert!(matches!(outcome, Err(RuntimeError::Killed)), "{outcome:?}");
+    let usage = rt.failed_usage(LeaseId::new(1, 5));
+    if cfg!(target_os = "macos") {
+        assert_heavy(&usage.expect("a usage"), Duration::from_millis(1400));
+    } else {
+        assert_eq!(usage, None);
+    }
 }
 
 /// A fresh name prefix for the shared-memory names of one test.
