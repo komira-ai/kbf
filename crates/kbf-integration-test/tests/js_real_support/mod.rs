@@ -132,8 +132,21 @@ pub fn unpack_pinned(
     fetched: &Path,
     into: &Path,
 ) -> Result<PathBuf, String> {
-    let target = target();
-    let archive = pin.archive(program, &target).map_err(|e| e.to_string())?;
+    unpack_pinned_for(pin, program, &target(), fetched, into)
+}
+
+/// [`unpack_pinned`] for `target`, which need not be this machine's.
+///
+/// # Errors
+/// As [`unpack_pinned`], with the row looked up for `target`.
+pub fn unpack_pinned_for(
+    pin: &Pin,
+    program: &str,
+    target: &str,
+    fetched: &Path,
+    into: &Path,
+) -> Result<PathBuf, String> {
+    let archive = pin.archive(program, target).map_err(|e| e.to_string())?;
     let file = fetched.join(pin.file_name(archive));
     let bytes = std::fs::read(&file).map_err(|e| {
         format!(

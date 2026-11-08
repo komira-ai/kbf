@@ -844,6 +844,69 @@ async fn xcodebuild_builds_a_swift_package() {
     );
 }
 
+/// Catches a scratch directory that cannot be removed because a volume is mounted below
+/// it: removing a tree with a mounted volume in it fails (`EBUSY` or `EPERM` for the
+/// writable image made here; `EROFS` for the read-only Metal toolchain image the system
+/// mounts below the `HOME` of the probe in [`xcode_with_metal`] on macOS 26). The test
+/// mounts an image in a scratch directory, drops the directory, and requires that the
+/// directory is gone and no mount stays below it. It mounts a real volume, so it runs
+/// with no other developer tool running ([`DEVELOPER_TOOLS`]), as the test below that
+/// compares the machine's mounts does.
+#[tokio::test]
+async fn a_scratch_directory_with_a_volume_mounted_below_it_is_removed() {
+    let _tools = DEVELOPER_TOOLS.write().await;
+    let scratch_dir = scratch("scratch-mount");
+    let dir = std::fs::canonicalize(&scratch_dir).expect("real");
+    let image = dir.join("i.dmg");
+    let mount_point = dir.join("m");
+    std::fs::create_dir(&mount_point).expect("mount point");
+    let hdiutil = |args: &[&Path]| {
+        let out = std::process::Command::new("/usr/bin/hdiutil")
+            .args(args)
+            .output()
+            .expect("hdiutil");
+        assert!(
+            out.status.success(),
+            "hdiutil {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let p = Path::new;
+    hdiutil(&[
+        p("create"),
+        p("-size"),
+        p("8m"),
+        p("-fs"),
+        p("HFS+"),
+        p("-volname"),
+        p("kbfscratch"),
+        &image,
+    ]);
+    let attached = hdiutil(&[
+        p("attach"),
+        &image,
+        p("-nobrowse"),
+        p("-noverify"),
+        p("-noautoopen"),
+        p("-mountpoint"),
+        &mount_point,
+    ]);
+    assert!(
+        !below(&mounted(), &dir).is_empty(),
+        "the volume is not mounted, so this checks nothing"
+    );
+    drop(scratch_dir);
+    assert!(!dir.exists(), "the scratch directory stays");
+    assert_eq!(below(&mounted(), &dir), Vec::<PathBuf>::new());
+    // The volume is unmounted; the image's device stays attached until detached.
+    let device = attached
+        .split_whitespace()
+        .next()
+        .expect("hdiutil names the device");
+    hdiutil(&[p("detach"), p(device), p("-force")]);
+}
+
 /// The mount points of the machine now.
 fn mounted() -> Vec<PathBuf> {
     let out = std::process::Command::new("/sbin/mount")
@@ -870,9 +933,10 @@ fn mounted() -> Vec<PathBuf> {
 #[tokio::test]
 async fn a_volume_mounted_in_the_leases_home_does_not_keep_the_lease() {
     setup();
-    // The write lock: other tests here mount and unmount nothing, but the comparison
-    // of the machine's mounts before and after must not span a Metal compile that has
-    // the asset service mount the toolchain meanwhile.
+    // The write lock: the comparison of the machine's mounts before and after must not
+    // span a test that mounts or unmounts meanwhile. The tests that run a developer tool
+    // hold the read lock, and a Metal compile has the system mount the toolchain; the one
+    // other test that mounts a volume itself holds the write lock too.
     let _tools = DEVELOPER_TOOLS.write().await;
     // `mount` lists real paths, and the scratch directory may sit under a symlink
     // (`/var`, `/tmp`): without this `below(&after, &dir)` is empty and checks nothing.

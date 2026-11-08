@@ -31,7 +31,7 @@ use xtask::js_pin::Pin;
 
 use js_real_support::drop_answer::{DropFirstAnswer, answer_head, whole_frame};
 use js_real_support::fields::Schema;
-use js_real_support::{RealJobServer, as_read, job_addr_of, spec, unpack_pinned};
+use js_real_support::{RealJobServer, as_read, job_addr_of, spec, unpack_pinned_for};
 
 /// Asserts that a job submitted to the real server is answered queued, under its id, with the
 /// spec as submitted less its file contents; that `GetJob` reads back the same job; and that a
@@ -387,12 +387,15 @@ fn archive(member: &str, program: &[u8]) -> Vec<u8> {
     gz.finish().unwrap()
 }
 
-/// The checked-in pin with its `js-lease-server` row for this target pinned to `bytes`.
+/// The target of the rows the checked-in pin has, whatever machine the test runs on: the
+/// harness logic under test does not depend on the host's architecture.
+const PINNED_TARGET: &str = "x86_64-unknown-linux-musl";
+
+/// The checked-in pin with its `js-lease-server` row for [`PINNED_TARGET`] pinned to `bytes`.
 fn pinned_to(bytes: &[u8]) -> Pin {
     let mut pin = js_real_support::pin();
-    let target = js_real_support::target();
     for row in &mut pin.archives {
-        if row.program == "js-lease-server" && row.target == target {
+        if row.program == "js-lease-server" && row.target == PINNED_TARGET {
             row.sha256 = Sha256::of(bytes);
         }
     }
@@ -410,16 +413,15 @@ fn the_harness_unpacks_only_the_pinned_bytes() {
     let fetched = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "js-real-pin");
     let into = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "js-real-unpack");
     let probe = pinned_to(b"");
-    let row = probe
-        .archive("js-lease-server", &js_real_support::target())
-        .unwrap();
+    let row = probe.archive("js-lease-server", PINNED_TARGET).unwrap();
     let name = probe.file_name(row);
     let member = probe.member(row);
     let bytes = archive(member.to_str().unwrap(), b"the server's bytes");
     std::fs::write(fetched.join(&name), &bytes).unwrap();
 
     let pin = pinned_to(&bytes);
-    let program = unpack_pinned(&pin, "js-lease-server", &fetched, &into).unwrap();
+    let program =
+        unpack_pinned_for(&pin, "js-lease-server", PINNED_TARGET, &fetched, &into).unwrap();
     assert_eq!(std::fs::read(&program).unwrap(), b"the server's bytes");
     std::fs::remove_file(&program).unwrap();
 
@@ -427,7 +429,8 @@ fn the_harness_unpacks_only_the_pinned_bytes() {
     let last = changed.len() - 1;
     changed[last] ^= 1;
     std::fs::write(fetched.join(&name), &changed).unwrap();
-    let error = unpack_pinned(&pin, "js-lease-server", &fetched, &into).unwrap_err();
+    let error =
+        unpack_pinned_for(&pin, "js-lease-server", PINNED_TARGET, &fetched, &into).unwrap_err();
     assert!(error.contains("not the pinned"), "{error}");
     assert!(
         !program.exists(),
@@ -439,12 +442,20 @@ fn the_harness_unpacks_only_the_pinned_bytes() {
     for row in &mut off_by_one.archives {
         row.sha256.0[0] ^= 1;
     }
-    let error = unpack_pinned(&off_by_one, "js-lease-server", &fetched, &into).unwrap_err();
+    let error = unpack_pinned_for(
+        &off_by_one,
+        "js-lease-server",
+        PINNED_TARGET,
+        &fetched,
+        &into,
+    )
+    .unwrap_err();
     assert!(error.contains("not the pinned"), "{error}");
     assert!(!program.exists());
 
     std::fs::remove_file(fetched.join(&name)).unwrap();
-    let error = unpack_pinned(&pin, "js-lease-server", &fetched, &into).unwrap_err();
+    let error =
+        unpack_pinned_for(&pin, "js-lease-server", PINNED_TARGET, &fetched, &into).unwrap_err();
     assert!(
         error.contains(
             "cargo xtask fetch-pinned-js --pin kbf-js-version.toml --program js-lease-server"
@@ -452,11 +463,38 @@ fn the_harness_unpacks_only_the_pinned_bytes() {
         "{error}"
     );
 
-    let error = unpack_pinned(&pin, "js-other", &fetched, &into).unwrap_err();
+    let error = unpack_pinned_for(&pin, "js-other", PINNED_TARGET, &fetched, &into).unwrap_err();
     assert!(
         error.starts_with("kbf-js-version.toml: no [[archive]] row for js-other"),
         "{error}"
     );
+}
+
+/// Asserts that a pin with rows for another target only is refused for this one, naming the
+/// program and the target: a pin whose rows are all `x86_64-unknown-linux-musl` asked for
+/// `aarch64-unknown-linux-musl` gives exactly "kbf-js-version.toml: no [[archive]] row for
+/// js-lease-server on aarch64-unknown-linux-musl", and the same pin asked for its own target
+/// finds the row. Catches a harness that falls back to a row of another target.
+#[test]
+fn a_target_with_no_row_is_refused_naming_it() {
+    let fetched = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "js-real-norow-fetched");
+    let into = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "js-real-norow-unpack");
+    let pin = pinned_to(b"");
+    let error = unpack_pinned_for(
+        &pin,
+        "js-lease-server",
+        "aarch64-unknown-linux-musl",
+        &fetched,
+        &into,
+    )
+    .unwrap_err();
+    assert_eq!(
+        error,
+        "kbf-js-version.toml: no [[archive]] row for js-lease-server on aarch64-unknown-linux-musl"
+    );
+    let error =
+        unpack_pinned_for(&pin, "js-lease-server", PINNED_TARGET, &fetched, &into).unwrap_err();
+    assert!(error.contains("cargo xtask fetch-pinned-js"), "{error}");
 }
 
 /// Asserts the field sets the comparison is made of, on messages built here: a queued job's
