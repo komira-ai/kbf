@@ -9,8 +9,8 @@ use std::fs;
 
 use kbf_mac_provision::cli;
 use support::{
-    DROPIN, ERR_LOG, FakeMac, INTENT, LOGINWINDOW, PLIST, assert_only_fails, check, check_keys,
-    lines,
+    DROPIN, ERR_LOG, FakeMac, INTENT, LOGINWINDOW, PLIST, assert_only_fails, calls, check,
+    check_keys, lines, sshd::Fault,
 };
 
 /// Catches: an item dropped from the table (the script's defects "check skips a key"
@@ -550,6 +550,77 @@ fn what_sshd_reports_is_checked() {
         },
         "sshd -T reports 'kbdinteractiveauthentication no;passwordauthentication no;permitrootlogin yes', want 'kbdinteractiveauthentication no;passwordauthentication no;permitrootlogin no'",
     );
+}
+
+/// Catches: a failing `sshd -T` reported as an empty answer (`sshd -T reports ''`),
+/// which hid why sshd printed nothing: the failure names the exit code and what sshd
+/// said on standard error, without its trailing newline.
+#[test]
+fn a_failing_sshd_is_reported_with_its_exit_code_and_stderr() {
+    assert_only_fails(
+        "ssh_password_auth",
+        |m| {
+            m.state_mut().faults.push((
+                "sshd -T".into(),
+                Fault::Exit(255, "sshd: Bad configuration option: Foo\n".into()),
+            ));
+        },
+        "sshd -T exited 255: sshd: Bad configuration option: Foo",
+    );
+}
+
+/// Catches: a failing `sshd -T` that said nothing, ended by a signal, or that could not
+/// be started: each failure says which, and none is an empty answer.
+#[test]
+fn sshd_failures_without_stderr_a_signal_or_a_start_are_told_apart() {
+    for (fault, want) in [
+        (
+            Fault::Exit(1, "\n".into()),
+            "FAIL ssh_password_auth: sshd -T exited 1\ncheck: 0 pass, 1 fail\n",
+        ),
+        (
+            Fault::Signal("Killed\n".into()),
+            "FAIL ssh_password_auth: sshd -T was killed by a signal: Killed\ncheck: 0 pass, 1 fail\n",
+        ),
+        (
+            Fault::Missing,
+            "FAIL ssh_password_auth: sshd -T did not run: entity not found\ncheck: 0 pass, 1 fail\n",
+        ),
+    ] {
+        let mut mac = FakeMac::converged("sshd-faults");
+        mac.state_mut().faults.push(("sshd -T".into(), fault));
+        let r = check_keys(&mac, Some("ssh_password_auth"));
+        assert_eq!(r.text, want);
+    }
+}
+
+/// Catches: a Mac with no host key, where sshd refuses to start even for `-T` (a fresh
+/// macOS runner): the item fails naming the missing key and the fix, and sshd is not
+/// run.
+#[test]
+fn a_mac_with_no_host_key_fails_naming_it() {
+    let mac = FakeMac::converged("no-host-key");
+    mac.remove_host_keys();
+    let r = check_keys(&mac, Some("ssh_password_auth"));
+    assert_eq!(
+        r.text,
+        "FAIL ssh_password_auth: no host key in /etc/ssh (apply makes them with ssh-keygen -A)\ncheck: 0 pass, 1 fail\n"
+    );
+    assert!(calls(&mac, "sshd").is_empty());
+}
+
+/// Catches: files in `/etc/ssh` that are not host keys counted as one: a public key
+/// file or another name leaves the Mac without a host key.
+#[test]
+fn only_a_host_key_file_counts_as_a_host_key() {
+    let mac = FakeMac::converged("not-host-keys");
+    mac.remove_host_keys();
+    mac.write("/etc/ssh/ssh_host_ed25519_key.pub", "pub\n");
+    mac.write("/etc/ssh/ssh_config", "\n");
+    mac.write("/etc/ssh/moduli_key", "\n");
+    let r = check_keys(&mac, Some("ssh_password_auth"));
+    assert_eq!(r.failed, 1, "{}", r.text);
+    assert!(r.text.contains("no host key in /etc/ssh"), "{}", r.text);
 }
 
 /// Catches: `sshd -T` run as another user, which it refuses (the script's defect "sshd

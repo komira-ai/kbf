@@ -6,6 +6,8 @@ use crate::items::{Ctx, Lines, Outcome, fail, pass};
 
 const SSHD: &str = "/usr/sbin/sshd";
 const SSHD_CONFIG: &str = "/etc/ssh/sshd_config";
+const KEYGEN: &str = "/usr/bin/ssh-keygen";
+const HOST_KEY_DIR: &str = "/etc/ssh";
 const DROPIN_DIR: &str = "/etc/ssh/sshd_config.d";
 /// `000-` sorts first, and sshd keeps the first value it reads for each keyword.
 pub const DROPIN_NAME: &str = "000-kbf.conf";
@@ -68,6 +70,33 @@ fn sorted_lower(lines: impl Iterator<Item = String>) -> String {
     lines.join(";")
 }
 
+/// Whether `/etc/ssh` holds a host key (`ssh_host_<type>_key`): sshd refuses to start,
+/// even to print its settings, without one.
+fn has_host_key(c: &Ctx<'_>) -> bool {
+    c.mac
+        .list(HOST_KEY_DIR)
+        .iter()
+        .any(|name| name.starts_with("ssh_host_") && name.ends_with("_key"))
+}
+
+/// Runs `program args` (`what` names it in a failure): its stdout when it exits 0, and
+/// otherwise how it ended (exit code, or a signal) with what it said on standard error.
+fn run_ok(c: &Ctx<'_>, program: &str, args: &[&str], what: &str) -> Result<String, String> {
+    let o = match c.mac.run(program, args) {
+        Ok(o) if o.success => return Ok(o.stdout),
+        Ok(o) => o,
+        Err(e) => return Err(format!("{what} did not run: {e}")),
+    };
+    let ended = o.code.map_or_else(
+        || "was killed by a signal".to_owned(),
+        |code| format!("exited {code}"),
+    );
+    match o.stderr.trim() {
+        "" => Err(format!("{what} {ended}")),
+        said => Err(format!("{what} {ended}: {said}")),
+    }
+}
+
 pub(crate) fn ssh_password_auth(c: &Ctx<'_>) -> Outcome {
     let want = dropin(c.value() == "1");
     let config = String::from_utf8_lossy(&c.mac.read(SSHD_CONFIG).unwrap_or_default()).into_owned();
@@ -98,7 +127,16 @@ pub(crate) fn ssh_password_auth(c: &Ctx<'_>) -> Outcome {
         return pass(format!("{joined} (sshd -T not run: needs root)"));
     }
     let wanted = sorted_lower(want.lines().map(str::to_owned));
-    let reported = sorted_lower(c.mac.out(SSHD, &["-T"]).lines().filter_map(|line| {
+    if !has_host_key(c) {
+        return fail(format!(
+            "no host key in {HOST_KEY_DIR} (apply makes them with ssh-keygen -A)"
+        ));
+    }
+    let printed = match run_ok(c, SSHD, &["-T"], "sshd -T") {
+        Ok(printed) => printed,
+        Err(why) => return fail(why),
+    };
+    let reported = sorted_lower(printed.lines().filter_map(|line| {
         let mut words = line.split_whitespace();
         let keyword = words.next()?;
         EFFECTIVE
@@ -112,10 +150,26 @@ pub(crate) fn ssh_password_auth(c: &Ctx<'_>) -> Outcome {
     }
 }
 
+/// Writes the drop-in (see [`write_dropin`]), then makes the host keys when `/etc/ssh`
+/// has none: `ssh-keygen -A` makes each default type that is missing. A Mac that has a
+/// key is left as it is.
+pub(crate) fn fix_ssh_password_auth(c: &Ctx<'_>, out: &mut Lines) -> io::Result<()> {
+    write_dropin(c, out)?;
+    if has_host_key(c) {
+        return Ok(());
+    }
+    run_ok(c, KEYGEN, &["-A"], "ssh-keygen -A").map_err(io::Error::other)?;
+    out.change(
+        c.key,
+        format!("made the host keys in {HOST_KEY_DIR} (ssh-keygen -A)"),
+    );
+    Ok(())
+}
+
 /// Writes the drop-in, root's, mode 644, when sshd_config has the `Include` line and
 /// the drop-in is not already that file. Drop-ins read before it and keywords before
 /// the `Include` line are left: `check` reports them, and they are the operator's.
-pub(crate) fn fix_ssh_password_auth(c: &Ctx<'_>, out: &mut Lines) -> io::Result<()> {
+fn write_dropin(c: &Ctx<'_>, out: &mut Lines) -> io::Result<()> {
     let config = String::from_utf8_lossy(&c.mac.read(SSHD_CONFIG).unwrap_or_default()).into_owned();
     if !config.split('\n').any(|line| line == INCLUDE) {
         return Ok(());

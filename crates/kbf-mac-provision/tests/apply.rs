@@ -10,7 +10,7 @@ use std::fs;
 use kbf_mac_provision::cli::{self, Error};
 use support::{
     CONFIG, DROPIN, ERR_LOG, FakeMac, INTENT, LOGINWINDOW, PLIST, XCODE, apply, apply_keys, calls,
-    check, check_keys, golden_config, golden_plist, lines, ls, preference, sha256_hex,
+    check, check_keys, golden_config, golden_plist, lines, ls, preference, sha256_hex, sshd::Fault,
 };
 
 const RECORD: &str = "/var/db/kbf-mac-provision/settings.before";
@@ -57,6 +57,7 @@ fn one_apply_converges_a_fresh_mac() {
             "CHANGE appstore_auto_update: com.apple.commerce AutoUpdate = 0",
             "CHANGE xcode_disable_manifest_sandbox: com.apple.dt.Xcode IDEPackageSupportDisableManifestSandbox = 1",
             "CHANGE ssh_password_auth: wrote /etc/ssh/sshd_config.d/000-kbf.conf",
+            "CHANGE ssh_password_auth: made the host keys in /etc/ssh (ssh-keygen -A)",
             "CHANGE firewall: firewall on",
             "CHANGE time_server: network time on, server time.example.net",
             "CHANGE xcode: installed Xcode 17A000 at /Applications/Xcode-26.6.app",
@@ -433,4 +434,54 @@ fn apply_does_not_take_over_another_accounts_id() {
     assert_eq!(calls(&mac, "dscl . -create"), Vec::<String>::new());
     let r = check_keys(&mac, Some("role_user"));
     assert_eq!(r.failed, 1);
+}
+
+/// Catches: a Mac with no host key left that way by `apply`, so `sshd -T` cannot run:
+/// `ssh-keygen -A` runs once, a CHANGE line says so, and the item passes.
+#[test]
+fn apply_makes_the_host_keys_when_the_mac_has_none() {
+    let mac = FakeMac::converged("apply-no-host-key");
+    mac.remove_host_keys();
+    let r = apply_keys(&mac, Some("ssh_password_auth"));
+    assert_eq!(
+        r.text,
+        "CHANGE ssh_password_auth: made the host keys in /etc/ssh (ssh-keygen -A)\n"
+    );
+    assert_eq!(r.failed, 0);
+    assert_eq!(calls(&mac, "ssh-keygen"), ["ssh-keygen -A"]);
+    assert!(mac.has_host_key());
+}
+
+/// Catches: `ssh-keygen -A` run, or its CHANGE line printed, on a Mac that has a host
+/// key: only the drop-in's own CHANGE line is printed.
+#[test]
+fn apply_leaves_the_host_keys_of_a_mac_that_has_them() {
+    let mac = FakeMac::converged("apply-host-key");
+    mac.remove(DROPIN);
+    let r = apply_keys(&mac, Some("ssh_password_auth"));
+    assert_eq!(
+        r.text,
+        "CHANGE ssh_password_auth: wrote /etc/ssh/sshd_config.d/000-kbf.conf\n"
+    );
+    assert_eq!(calls(&mac, "ssh-keygen"), Vec::<String>::new());
+}
+
+/// Catches: a failing `ssh-keygen -A` lost: a NOTE gives its exit code and what it said
+/// on standard error, the item still fails, and no CHANGE line claims keys.
+#[test]
+fn a_failing_ssh_keygen_is_reported_with_its_exit_code_and_stderr() {
+    let mut mac = FakeMac::converged("apply-keygen-fails");
+    mac.remove_host_keys();
+    mac.state_mut().faults.push((
+        "ssh-keygen -A".into(),
+        Fault::Exit(1, "ssh-keygen: cannot write /etc/ssh\n".into()),
+    ));
+    let r = apply_keys(&mac, Some("ssh_password_auth"));
+    assert_eq!(
+        r.text,
+        "NOTE ssh_password_auth: ssh-keygen -A exited 1: ssh-keygen: cannot write /etc/ssh\n\
+         FAIL ssh_password_auth: no host key in /etc/ssh (apply makes them with ssh-keygen -A)\n"
+    );
+    assert_eq!(r.failed, 1);
+    assert!(!mac.has_host_key());
 }

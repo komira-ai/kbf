@@ -14,12 +14,15 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use kbf_mac_provision::host::{Host, Output, Stat};
-use kbf_mac_provision::items::Report;
 use sha2::{Digest as _, Sha256};
 
+mod drive;
 mod golden;
 mod pool;
+pub mod sshd;
 pub mod vm;
+#[allow(unused_imports, reason = "each test binary uses part of the fake")]
+pub use drive::*;
 pub use golden::{golden_config, golden_plist, golden_plist_as};
 
 /// The example profile the tests start from.
@@ -83,6 +86,8 @@ pub struct State {
     pub records: BTreeMap<String, Vec<(String, String)>>,
     /// What `sshd -T` prints; `None` prints the drop-in's lines in lower case.
     pub sshd_effective: Option<String>,
+    /// Calls (as the log shows them) that start with the text fail as the fault says.
+    pub faults: Vec<(String, sshd::Fault)>,
     /// Loaded launchd jobs, as `system/<label>`.
     pub loaded: BTreeSet<String>,
     pub xcode_select: Option<String>,
@@ -298,6 +303,7 @@ impl FakeMac {
         );
         mac.chmod(DROPIN, 0o644);
         mac.own(DROPIN, 0, 0);
+        mac.host_keys();
         mac.install_xcode("Xcode-26.6.app", "17A000");
         mac.install_xcode("Xcode-27.0.app", "18A000");
         let profile = mac.profile_text();
@@ -470,6 +476,10 @@ impl FakeMac {
             return done(true);
         }
         match (name, args) {
+            ("ssh-keygen", ["-A"]) => {
+                self.host_keys();
+                done(true)
+            }
             ("pmset", ["-a", key, value]) => {
                 s.pmset_set(key, value);
                 done(true)
@@ -846,13 +856,21 @@ impl Host for FakeMac {
         self.log
             .borrow_mut()
             .push(format!("{env}{name} {}", args.join(" ")));
+        if let Some(faulted) = self.fault(name, args) {
+            return faulted;
+        }
         let answer = match dir {
             None => self.answer(name, args),
             Some(_) => None,
         }
         .or_else(|| self.change(name, args, dir));
         match answer {
-            Some((success, stdout)) => Ok(Output { success, stdout }),
+            Some((success, stdout)) => Ok(Output {
+                success,
+                code: Some(i32::from(!success)),
+                stdout,
+                ..Output::default()
+            }),
             None => Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("no fake for {program} {args:?}"),
@@ -878,8 +896,8 @@ impl Host for FakeMac {
         let mut s = self.state.borrow_mut();
         if s.stdin_fails {
             return Ok(Output {
-                success: false,
-                stdout: String::new(),
+                code: Some(1),
+                ..Output::default()
             });
         }
         let rejects = s.stdin_rejects.clone();
@@ -925,7 +943,9 @@ impl Host for FakeMac {
         }
         Ok(Output {
             success: !rejected,
+            code: Some(i32::from(rejected)),
             stdout: printed,
+            ..Output::default()
         })
     }
 
@@ -1031,91 +1051,4 @@ impl Host for FakeMac {
             .map(|i| seed.wrapping_mul(37).wrapping_add(i as u8 * 3 + 1))
             .collect())
     }
-}
-
-pub fn check_keys(mac: &FakeMac, keys: Option<&str>) -> Report {
-    let path = mac.profile_file(&mac.profile_text());
-    kbf_mac_provision::cli::check(&path, keys, mac).unwrap()
-}
-
-pub fn check(mac: &FakeMac) -> Report {
-    check_keys(mac, None)
-}
-
-/// The lines of a report that start with `prefix`.
-pub fn lines<'a>(r: &'a Report, prefix: &str) -> Vec<&'a str> {
-    r.text.lines().filter(|l| l.starts_with(prefix)).collect()
-}
-
-/// On a converged Mac changed by `drift`, check fails `item` and nothing else, and
-/// says `text`. `Err` says what went wrong instead.
-pub fn only_fails(
-    name: &str,
-    item: &str,
-    drift: fn(&mut FakeMac),
-    text: &str,
-) -> Result<(), String> {
-    let mut mac = FakeMac::converged(name);
-    drift(&mut mac);
-    let r = check(&mac);
-    let failed = lines(&r, "FAIL");
-    let ok = r.failed == 1
-        && failed.len() == 1
-        && failed[0].starts_with(&format!("FAIL {item}: "))
-        && failed[0].contains(text);
-    if ok {
-        Ok(())
-    } else {
-        Err(format!(
-            "{name}: want only FAIL {item}: ..{text}.., got:\n{}",
-            r.text
-        ))
-    }
-}
-
-pub fn assert_only_fails(item: &str, drift: fn(&mut FakeMac), text: &str) {
-    if let Err(e) = only_fails(&format!("only-{item}"), item, drift, text) {
-        panic!("{e}");
-    }
-}
-
-pub fn apply_keys(mac: &FakeMac, keys: Option<&str>) -> Report {
-    let path = mac.profile_file(&mac.profile_text());
-    kbf_mac_provision::cli::apply(&path, keys, mac).unwrap()
-}
-
-pub fn apply(mac: &FakeMac) -> Report {
-    apply_keys(mac, None)
-}
-
-/// The value `pmset -g` reports for `key` on the fake.
-pub fn pmset_value(mac: &FakeMac, key: &str) -> Option<String> {
-    let s = mac.state.borrow();
-    s.pmset
-        .iter()
-        .find_map(|(k, v)| (k == key).then(|| v.clone()))
-}
-
-/// The fake's `defaults` value of `domain` and `key`.
-pub fn preference(mac: &FakeMac, domain: &str, key: &str) -> Option<String> {
-    mac.state
-        .borrow()
-        .defaults
-        .get(&(domain.to_owned(), key.to_owned()))
-        .cloned()
-}
-
-/// `lstat` of `path` on the fake, as `ls -ldn`'s fields.
-pub fn ls(mac: &FakeMac, path: &str) -> String {
-    kbf_mac_provision::host::Host::lstat(mac, path).map_or_else(|| "missing".into(), |s| s.ls())
-}
-
-/// The program calls in the log that start with `prefix`.
-pub fn calls(mac: &FakeMac, prefix: &str) -> Vec<String> {
-    mac.log
-        .borrow()
-        .iter()
-        .filter(|c| c.starts_with(prefix))
-        .cloned()
-        .collect()
 }

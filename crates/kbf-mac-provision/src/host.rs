@@ -10,11 +10,14 @@ use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-/// What a program printed on stdout, and whether it exited 0.
+/// What a program printed on stdout and standard error, whether it exited 0, and its
+/// exit code (`None` when a signal ended it). `run_with_input` leaves `stderr` empty.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Output {
     pub success: bool,
+    pub code: Option<i32>,
     pub stdout: String,
+    pub stderr: String,
 }
 
 /// A path's type, permission bits, link count and owner, as `lstat` reports them
@@ -98,8 +101,8 @@ pub trait Host {
     /// The effective uid the verbs run as.
     fn euid(&self) -> u32;
     /// Runs the program at `program` (a path on the Mac) with `args`, in directory
-    /// `dir` (a path on the Mac; `None` leaves it as it is), its standard input and
-    /// error closed and its environment empty but for `LC_ALL=C` and `env`.
+    /// `dir` (a path on the Mac; `None` leaves it as it is), its standard input closed,
+    /// its standard error captured and its environment empty but for `LC_ALL=C` and `env`.
     ///
     /// # Errors
     /// The program could not be started or waited for.
@@ -206,15 +209,16 @@ impl Host for RealHost {
             .env_clear()
             .env("LC_ALL", "C")
             .envs(env.iter().copied())
-            .stdin(Stdio::null())
-            .stderr(Stdio::null());
+            .stdin(Stdio::null());
         if let Some(dir) = dir {
             command.current_dir(self.on(dir));
         }
         let out = command.output()?;
         Ok(Output {
             success: out.status.success(),
+            code: out.status.code(),
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         })
     }
 
@@ -243,7 +247,9 @@ impl Host for RealHost {
         })?;
         Ok(Output {
             success: out.status.success(),
+            code: out.status.code(),
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::new(),
         })
     }
 
@@ -331,6 +337,11 @@ impl<'a> Mac<'a> {
             .run(program, args)
             .map(|o| o.stdout.trim_end_matches('\n').to_owned())
             .unwrap_or_default()
+    }
+
+    /// `program args` run, with its stdout, standard error and exit code.
+    pub(crate) fn run(&self, program: &str, args: &[&str]) -> io::Result<Output> {
+        self.host.run(program, args)
     }
 
     /// What `program args` prints on stdout, as [`Mac::out`] gives it, when it runs and
