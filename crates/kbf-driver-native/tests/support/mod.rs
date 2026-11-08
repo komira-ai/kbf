@@ -271,9 +271,12 @@ fn directory_of(cas: &MemoryCas, inputs: &[(String, Vec<u8>)]) -> Directory {
 }
 
 /// A scratch directory a test owns: a [`TestDir`] that, when the test passed, is first
-/// removed with the driver's own tree removal (it opens a directory a test closed, and
-/// does not recurse once per level). Declare it before anything that runs in it, so
-/// those are gone first.
+/// removed the way the driver removes a lease directory: what a system service mounted
+/// below it is unmounted, then the tree is removed (it opens a directory a test closed,
+/// and does not recurse once per level). A plain tree removal fails on a volume mounted
+/// below the directory: `EROFS` for a read-only one, such as a Metal toolchain image the
+/// system may mount below the `HOME` of a bare `xcrun metal`. Declare it before anything
+/// that runs in it, so those are gone first.
 #[derive(Debug)]
 pub struct Scratch(TestDir);
 
@@ -296,7 +299,7 @@ impl Drop for Scratch {
         // After a panic the `TestDir` keeps or removes the directory: a second panic
         // while unwinding would abort the process.
         if !std::thread::panicking() && std::fs::symlink_metadata(self.0.path()).is_ok() {
-            kbf_outputs::remove_tree(self.0.path()).expect("remove scratch");
+            kbf_driver_native::mounts::remove_lease_dir(self.0.path()).expect("remove scratch");
         }
     }
 }
