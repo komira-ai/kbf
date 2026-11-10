@@ -100,9 +100,9 @@ pub(crate) fn whole_queue_doc() -> Value {
             whole_request("op-20", "early", "early", json!({"may_hold_in_ms": 12_300})),
             whole_request("op-21", "holding", "holding", json!({
                 "worker": "node-a", "held_for_ms": 61_000, "deadline_in_ms": 100_000,
-                "give_ups": 1, "draining": true})),
+                "give_ups": 0, "draining": true})),
             whole_request("op-22", "barred", "barred", json!({
-                "give_ups": 2, "barred": [{"worker": "node-b", "until_in_ms": 300_000}]})),
+                "give_ups": 0, "barred": [{"worker": "node-b", "until_in_ms": 300_000}]})),
             whole_request("op-23", "stopped", "cap_ceiling", json!({})),
             whole_request("op-24", "stopped", "last_capable", json!({})),
             whole_request("op-25", "queued", "queued", json!({})),

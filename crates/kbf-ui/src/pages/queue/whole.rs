@@ -32,19 +32,18 @@ fn detail(r: &WholeRequest) -> String {
             } else {
                 "no leases left"
             };
-            let until = r
-                .deadline_in_ms
-                .map_or_else(|| "never".to_owned(), |ms| format!("in {}", age(ms)));
+            // The deadline is when the worker is expected to be empty; reaching it does not
+            // end the hold, which stays until the request is granted or cancelled.
+            let until = r.deadline_in_ms.map_or_else(
+                || "with no deadline".to_owned(),
+                |ms| format!("expected empty in {}", age(ms)),
+            );
             format!(
-                "holds {worker} for {}, {drain}; gives it up {until}; holds given up: {}",
-                some(r.held_for_ms),
-                r.give_ups.unwrap_or(0)
+                "holds {worker} for {}, {drain}; {until}",
+                some(r.held_for_ms)
             )
         }
-        "barred" => format!(
-            "barred from every worker it could hold; holds given up: {}",
-            r.give_ups.unwrap_or(0)
-        ),
+        "barred" => "barred from every worker it could hold".to_owned(),
         "stopped" => stop_words(&r.reason).to_owned(),
         "queued" => "waiting for a worker".to_owned(),
         "unservable" => r.unservable.clone().unwrap_or_default(),

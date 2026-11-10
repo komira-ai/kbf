@@ -281,7 +281,7 @@ impl RealJobServer {
                 "js-lease-server did not start ({status:?}); it printed {first:?}; its log:\n{log}"
             );
         };
-        // The job port is logged before the line above is printed (v0.1.179 binds every
+        // The job port is logged before the line above is printed (0.1.218 binds every
         // listener, logs each, then prints it); a release that stopped logging it would hold
         // this read until the job's timeout, and is a change the pin bump has to answer.
         let job_addr = job_port.recv().unwrap_or_else(|_| {

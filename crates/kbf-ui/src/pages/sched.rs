@@ -70,7 +70,8 @@ pub(crate) struct WholeNode {
 }
 
 /// One queued whole-machine request: `state` and `reason` always, the rest where the
-/// state has them.
+/// state has them. The document's `give_ups` is not read: a hold is no longer given up, and
+/// the server writes it as 0.
 #[derive(Debug, Deserialize)]
 pub(crate) struct WholeRequest {
     pub(crate) operation: String,
@@ -81,13 +82,12 @@ pub(crate) struct WholeRequest {
     pub(crate) worker: Option<String>,
     pub(crate) held_for_ms: Option<u64>,
     pub(crate) deadline_in_ms: Option<u64>,
-    pub(crate) give_ups: Option<u64>,
     pub(crate) draining: Option<bool>,
     pub(crate) barred: Vec<BarredWorker>,
     pub(crate) unservable: Option<String>,
 }
 
-/// A worker a request gave up and may not hold until its back-off ends.
+/// A worker barred to a request, which may not hold it until its bar ends.
 #[derive(Debug, Deserialize)]
 pub(crate) struct BarredWorker {
     pub(crate) worker: String,

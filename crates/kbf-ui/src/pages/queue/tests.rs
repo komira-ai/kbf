@@ -261,13 +261,9 @@ fn each_whole_machine_state_is_told_in_its_own_words() {
         (
             "op-21",
             "Holding",
-            "holds node-a for 1 min 1 s, waiting for its leases to end; gives it up in 1 min 40 s; holds given up: 1",
+            "holds node-a for 1 min 1 s, waiting for its leases to end; expected empty in 1 min 40 s",
         ),
-        (
-            "op-22",
-            "Barred",
-            "barred from every worker it could hold; holds given up: 2",
-        ),
+        ("op-22", "Barred", "barred from every worker it could hold"),
         (
             "op-23",
             "Stopped",
@@ -315,9 +311,7 @@ fn a_whole_machine_section_says_what_it_cannot_show_and_escapes() {
     doc["whole_node"]["requests_total"] = json!(101);
     let (_, html) = page(&with(&doc), "/ui/queue");
     assert!(
-        html.contains(
-            "holds node-a for 0 ms, no leases left; gives it up never; holds given up: 2"
-        ),
+        html.contains("holds node-a for 0 ms, no leases left; with no deadline"),
         "{html}"
     );
     assert!(html.contains("Showing 1 of 101"), "{html}");
@@ -396,7 +390,7 @@ fn every_cap_has_words_and_an_unknown_state_is_shown_as_sent() {
     assert!(html.contains("<td>paused</td><td>paused</td>"), "{html}");
     assert!(html.contains("may hold a worker in -"), "{html}");
     assert!(
-        html.contains("holds - for -, no leases left; gives it up never; holds given up: 0"),
+        html.contains("holds - for -, no leases left; with no deadline"),
         "{html}"
     );
     assert!(

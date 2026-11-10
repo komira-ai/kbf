@@ -8,10 +8,11 @@
 # below, runs `gh attestation verify` on it (signed by `signer_workflow` in `repository`, built
 # from `commit` on `source_ref`, on a GitHub-hosted runner) and refuses it unless one of the
 # attestations that verify is the logged entry below, and only then unpacks `<program>` into
-# `<dir>`. The tests (crates/kbf-integration-test/tests/js_real_service.rs and
-# executor_real_service_integration.rs, through tests/js_real_support) hash the archive in
-# `<dir>` against this file again before they start the program. Any mismatch, and a program or
-# target with no row here, is a refusal. A pull request that moves the pin keeps both green.
+# `<dir>`. The tests (crates/kbf-integration-test/tests/js_real_service.rs,
+# executor_real_service_integration.rs and cutover_real_service_integration.rs, through
+# tests/js_real_support) hash the archive in `<dir>` against this file again before they start
+# the program. Any mismatch, and a program or target with no row here, is a refusal. A pull
+# request that moves the pin keeps them green.
 #
 # To move the pin to another release: set `version` and `commit` (the release's tag and the commit
 # it names), hash each archive yourself (`sha256sum`, not only the release's SHA256SUMS), and take

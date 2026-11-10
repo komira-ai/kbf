@@ -853,6 +853,10 @@ jobs:
   #   released agent runs jobs only as root, so `cargo xtask sudo-test` runs them as root (sudo
   #   names the runner's user as the job user); each starts its agent in a systemd scope of its
   #   own, one test at a time.
+  # - crates/kbf-integration-test/tests/cutover_real_service_integration.rs: kbf-deploy's
+  #   `job-service apply --apply`, the frontend's host scripted, its check and canary against the
+  #   server and an agent as above (a canary that passes, one that exits 3, one that holds and
+  #   is cancelled); as root, one test at a time, for the same reason.
   # `cargo xtask fetch-pinned-js` reads the pin and refuses an archive whose SHA-256 or build
   # attestation is not the pinned one (crates/xtask/src/js_pin.rs); the tests hash the archive
   # again and run only a program unpacked from those bytes, and fail (never skip) without it.

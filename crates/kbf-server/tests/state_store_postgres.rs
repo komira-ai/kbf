@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use kbf_front::Cache;
-use kbf_server::{EpochPolicy, Farm, StateError, StateStore, StateStoreUri};
+use kbf_server::{EpochPolicy, Farm, OpenFailure, StateError, StateStore, StateStoreUri};
 use kbf_state::postgres::{PostgresConfig, PostgresStore, TestDatabase, test_database};
 use kbf_state::{Cond, GENERATION, SHARED_WRITERS, Store, Txn};
 
@@ -237,4 +237,23 @@ fn a_server_that_does_not_flush_commits_refuses_the_start() {
         );
         assert!(!said.contains("kbf-ci-throwaway"), "{said}");
     }
+}
+
+/// Catches a URL that asks for TLS of a server that offers none being taken for a server that
+/// is not up yet (a frontend's start would wait for it for ever): the test server offers no
+/// TLS, so `sslmode=require` is a refusal no wait changes, which says TLS and does not quote
+/// the URL's password.
+#[test]
+fn tls_a_server_does_not_offer_is_a_refusal_not_a_wait() {
+    let db = TestDatabase::empty();
+    let base = db.url();
+    let sep = if base.contains('?') { '&' } else { '?' };
+    let with = format!("{base}{sep}sslmode=require");
+    let failure = uri(&with).try_open().err().expect("refused");
+    let OpenFailure::Refused(refused) = failure else {
+        panic!("a TLS refusal taken for a server that is not up: {failure:?}");
+    };
+    let said = refused.to_string();
+    assert!(said.contains("TLS"), "{said}");
+    assert!(!said.contains("kbf-ci-throwaway"), "{said}");
 }

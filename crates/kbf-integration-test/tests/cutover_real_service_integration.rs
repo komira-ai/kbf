@@ -17,7 +17,8 @@
 //! - `a_canary_that_exits_non_zero_fails_the_cutover_after_the_switch`: the canary's container
 //!   exits 3, the job ends `FAILED` with that exit code, and the cutover fails, saying so.
 //! - `a_canary_that_does_not_end_is_cancelled_and_fails_the_cutover`: the canary's container
-//!   holds; after its asks the cutover cancels it, the service stops it, and the cutover fails.
+//!   starts and holds; after its asks the cutover cancels it, the agent stops the container, and
+//!   the cutover fails.
 //!
 //! The cases need root (the agent runs jobs only as root), systemd (each agent runs in a scope
 //! of its own) and the fetched release, so each is `#[ignore]`d with that reason: beta.yml's
@@ -387,26 +388,40 @@ async fn a_canary_that_exits_non_zero_fails_the_cutover_after_the_switch() {
     );
 }
 
-/// Asserts a canary that does not end: its container holds, the cutover asks after it until
-/// its deadline, then cancels it and exits 1 saying it did not end in time and was
-/// cancelled; the service stops the container and records the job `CANCELLED` with the
-/// reason cancelled, and the job, having ended, no longer shows the cancel as pending.
-/// Catches a canary left running on the farm, and a cancel the current service does not
-/// carry out.
+/// Asserts a canary that does not end: its container starts and holds, the cutover asks
+/// after it until its deadline, then cancels it and exits 1 saying it did not end in time
+/// and was cancelled; the agent stops the running container, the service records the job
+/// `CANCELLED` with the reason cancelled, and the job, having ended, no longer shows the
+/// cancel as pending. The deadline (30 asks) is long beside an agent that heartbeats four
+/// times a second; a verb that returns before the container starts fails the test, naming
+/// that, rather than passing on a cancel of a job that never ran. Catches a canary left
+/// running on the farm, and a cancel the current service does not carry to the host.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs root, systemd and the pinned js-lease-server and js-agent: beta.yml's js-real-service job fetches them and runs these with cargo xtask sudo-test"]
 async fn a_canary_that_does_not_end_is_cancelled_and_fails_the_cutover() {
     let rig = Rig::start("cut-hold").await;
     rig.node.plan(NO_ACTION, "hold");
-    let (code, said) = rig.cutover(2).await;
+    let verb = rig.cutover(30);
+    tokio::pin!(verb);
+    let name = tokio::select! {
+        event = rig.node.next() => match event {
+            Event::Started { name, .. } => name,
+            other => panic!("the canary's container started first, not {other:?}"),
+        },
+        (code, said) = &mut verb => panic!(
+            "the cutover returned ({code:?}) before the canary's container started: {said}\n{}",
+            rig.logs()
+        ),
+    };
+    let (code, said) = verb.await;
     assert_eq!(code, ExitCode::FAILURE, "{said}\n{}", rig.logs());
     assert!(
         said.contains(&format!(
-            "the canary job {CANARY} did not end in time (still "
+            "the canary job {CANARY} did not end in time (still running); it was cancelled"
         )),
         "{said}"
     );
-    assert!(said.contains("); it was cancelled"), "{said}");
+    assert_eq!(rig.node.next().await, Event::Ended { name });
     let job = rig.until_canary(JobState::Cancelled).await;
     assert!(!job.cancel_requested, "{job:?}");
     let result = rig
