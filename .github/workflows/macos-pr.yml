@@ -16,10 +16,10 @@
 # (crates/kbf-integration-test/tests/macos_pr) holds this file to that shape and holds every step
 # of `native-macos` and `task-macos` to a step here. Neither job holds a secret, an environment or
 # any write scope: their token can read the repository, nothing more. beta.yml, which gates the
-# release after the merge, is unchanged.
+# release after the merge, keeps its after-merge trigger.
 #
 # The macOS jobs restore no Cargo cache: beta.yml's `native-macos` saves one, but from another
-# macOS image (`macos-latest`), and nothing here saves one, so a pull request never writes a cache.
+# macOS image (`macos-26`), and nothing here saves one, so a pull request never writes a cache.
 name: macos-pr
 
 on:

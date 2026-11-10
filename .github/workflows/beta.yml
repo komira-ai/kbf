@@ -433,8 +433,11 @@ jobs:
   # package steps were jobs of their own (about 4 and 3.5 minutes of tests) and are steps here,
   # so one runner is taken for them instead of three. Recent passing runs took 51 to 71 minutes
   # before the fold; 71 plus those 8 is 79, so 95 leaves room for a slow runner.
+  # macos-26, named: macos-latest moves to the next major release when GitHub moves it, and
+  # the macOS a job proves should change in a commit. The label still takes macOS 26 point
+  # releases (26.6.2 to 26.7.2 changed sshd -T's output), which `sw_vers` below prints.
   native-macos:
-    runs-on: macos-latest
+    runs-on: macos-26
     timeout-minutes: 95
     permissions:
       contents: read
