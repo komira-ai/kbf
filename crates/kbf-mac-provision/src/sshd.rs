@@ -29,7 +29,10 @@ const EARLY: &[&str] = &[
     "permitrootlogin",
 ];
 
-/// The keywords `sshd -T` must report at the drop-in's values.
+/// The keywords `sshd -T` must report at the drop-in's values, in lower case. `sshd -T`
+/// prints its keywords in lower case on macOS 15 (OpenSSH 9.9p2) and in the mixed case
+/// of `sshd_config(5)` on macOS 26.7.2 (OpenSSH 10.5p1), so a keyword is compared in
+/// lower case.
 const EFFECTIVE: &[&str] = &[
     "passwordauthentication",
     "kbdinteractiveauthentication",
@@ -138,9 +141,9 @@ pub(crate) fn ssh_password_auth(c: &Ctx<'_>) -> Outcome {
     };
     let reported = sorted_lower(printed.lines().filter_map(|line| {
         let mut words = line.split_whitespace();
-        let keyword = words.next()?;
+        let keyword = words.next()?.to_ascii_lowercase();
         EFFECTIVE
-            .contains(&keyword)
+            .contains(&keyword.as_str())
             .then(|| format!("{keyword} {}", words.next().unwrap_or_default()))
     }));
     if reported == wanted {

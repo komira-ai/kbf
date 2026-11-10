@@ -552,6 +552,62 @@ fn what_sshd_reports_is_checked() {
     );
 }
 
+/// Lines of `sshd -T` as OpenSSH 10.5p1 prints them on macOS 26.7.2: keywords in the
+/// mixed case of `sshd_config(5)`, not lower case.
+const SSHD_T_MIXED_CASE: &str = "Port 22\nUsePAM yes\nPermitRootLogin no\nPubkeyAuthentication yes\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nPrintMotd yes\n";
+
+/// Catches: a check that reads only lower-case keywords from `sshd -T`, so the mixed
+/// case of OpenSSH 10.5p1 (macOS 26.7.2) matched no line and failed a converged Mac
+/// with `sshd -T reports ''`: those lines pass, and the PASS line is exact.
+#[test]
+fn sshd_keywords_in_mixed_case_are_read() {
+    let mut mac = FakeMac::converged("sshd-mixed-case");
+    mac.state_mut().sshd_effective = Some(SSHD_T_MIXED_CASE.into());
+    let r = check_keys(&mac, Some("ssh_password_auth"));
+    assert_eq!(
+        r.text,
+        "PASS ssh_password_auth: PasswordAuthentication no;KbdInteractiveAuthentication no;PermitRootLogin no (sshd -T agrees)\ncheck: 1 pass, 0 fail\n"
+    );
+}
+
+/// Catches: a case-blind read that passes what it should fail: a mixed-case value that
+/// differs from the drop-in's, a keyword missing, and a longer keyword that only starts
+/// with one of the three (not counted) each fail, naming what sshd reports.
+#[test]
+fn sshd_keywords_in_mixed_case_that_differ_or_are_missing_fail() {
+    for (printed, reported) in [
+        (
+            SSHD_T_MIXED_CASE.replace("PasswordAuthentication no", "PasswordAuthentication yes"),
+            "kbdinteractiveauthentication no;passwordauthentication yes;permitrootlogin no",
+        ),
+        (
+            SSHD_T_MIXED_CASE.replace("PermitRootLogin no", "PermitRootLogin prohibit-password"),
+            "kbdinteractiveauthentication no;passwordauthentication no;permitrootlogin prohibit-password",
+        ),
+        (
+            SSHD_T_MIXED_CASE.replace("KbdInteractiveAuthentication no\n", ""),
+            "passwordauthentication no;permitrootlogin no",
+        ),
+        (
+            SSHD_T_MIXED_CASE.replace(
+                "KbdInteractiveAuthentication no",
+                "KbdInteractiveAuthenticationX no",
+            ),
+            "passwordauthentication no;permitrootlogin no",
+        ),
+    ] {
+        let mut mac = FakeMac::converged("sshd-mixed-case-drift");
+        mac.state_mut().sshd_effective = Some(printed);
+        let r = check_keys(&mac, Some("ssh_password_auth"));
+        assert_eq!(
+            r.text,
+            format!(
+                "FAIL ssh_password_auth: sshd -T reports '{reported}', want 'kbdinteractiveauthentication no;passwordauthentication no;permitrootlogin no'\ncheck: 0 pass, 1 fail\n"
+            )
+        );
+    }
+}
+
 /// Catches: a failing `sshd -T` reported as an empty answer (`sshd -T reports ''`),
 /// which hid why sshd printed nothing: the failure names the exit code and what sshd
 /// said on standard error, without its trailing newline.

@@ -611,7 +611,8 @@ fn a_link_at_the_error_log_is_refused_by_restart_and_replaced_by_apply() {
 
 /// Catches: an sshd item that passes while sshd uses other values than the drop-in's:
 /// the item runs `sshd -T` as root and says it agrees, and `sshd -T`, asked here,
-/// reports each of the drop-in's three values.
+/// reports each of the drop-in's three values. A keyword is compared in lower case:
+/// macOS 15 prints it so, macOS 26.7.2 (OpenSSH 10.5p1) in mixed case.
 #[test]
 #[ignore = "needs root: run by `cargo xtask sudo-test -p kbf-mac-provision --test as_root`"]
 fn sshd_reports_the_drop_ins_values() {
@@ -625,7 +626,10 @@ fn sshd_reports_the_drop_ins_values() {
         "kbdinteractiveauthentication no",
         "permitrootlogin no",
     ] {
-        assert!(effective.lines().any(|l| l == want), "sshd -T lacks {want}");
+        assert!(
+            effective.lines().any(|l| l.to_ascii_lowercase() == want),
+            "sshd -T lacks {want}"
+        );
     }
 }
 
