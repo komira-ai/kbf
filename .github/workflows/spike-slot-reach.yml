@@ -13,7 +13,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-26, macos-15]
+        os: [macos-26]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     permissions:
@@ -23,20 +23,17 @@ jobs:
       - name: probe
         shell: bash
         run: |
+          set +e
           set -u
           now() { perl -MTime::HiRes=time -e 'printf "%.3f\n", time'; }
           P='sender == "Sandbox" OR subsystem == "com.apple.sandbox.reporting" OR eventMessage BEGINSWITH "Sandbox: " OR eventMessage CONTAINS "deny("'
           timed() { local label="$1"; shift; local s e; s=$(now); "$@" > "$RUNNER_TEMP/out.txt" 2>"$RUNNER_TEMP/err.txt"; local rc=$?; e=$(now); echo "TIMING $label rc=$rc secs=$(echo "$e - $s" | bc) lines=$(wc -l < "$RUNNER_TEMP/out.txt") bytes=$(wc -c < "$RUNNER_TEMP/out.txt")"; head -c 300 "$RUNNER_TEMP/err.txt"; }
           sudo du -sh /private/var/db/diagnostics /private/var/db/uuidtext 2>/dev/null
-          timed cold-120s-driver /usr/bin/log show --style compact --last 120s --predicate "$P"
-          timed warm-120s-driver /usr/bin/log show --style compact --last 120s --predicate "$P"
-          timed warm-120s-driver-again /usr/bin/log show --style compact --last 120s --predicate "$P"
-          timed warm-10m-driver /usr/bin/log show --style compact --last 10m --predicate "$P"
-          timed warm-120s-contains /usr/bin/log show --style compact --last 120s --predicate 'eventMessage CONTAINS "deny("'
-          timed warm-120s-metadata /usr/bin/log show --style compact --last 120s --predicate 'sender == "Sandbox" OR subsystem == "com.apple.sandbox.reporting"'
-          timed warm-120s-gated /usr/bin/log show --style compact --last 120s --predicate '(process == "kernel" OR sender == "Sandbox" OR subsystem == "com.apple.sandbox.reporting") AND eventMessage BEGINSWITH "Sandbox: "'
-          timed warm-120s-all /usr/bin/log show --style compact --last 120s
-          timed warm-10s-driver /usr/bin/log show --style compact --last 10s --predicate "$P"
+          timed idle-120s-driver /usr/bin/log show --style compact --last 120s --predicate "$P"
+          N=$(sysctl -n hw.ncpu); PIDS=""; for i in $(seq 1 $((N*2))); do yes > /dev/null & PIDS="$PIDS $!"; done
+          timed loaded-120s-driver /usr/bin/log show --style compact --last 120s --predicate "$P"
+          timed loaded-10s-driver /usr/bin/log show --style compact --last 10s --predicate "$P"
+          kill $PIDS; wait $PIDS 2>/dev/null
           echo "== sample of the driver predicate's lines"; /usr/bin/log show --style compact --last 120s --predicate "$P" | tail -n 15 | cut -c1-250
           echo "== a denial: how long until log show has it"
           mkdir -p /private/tmp/probe-d
