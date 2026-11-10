@@ -1,5 +1,6 @@
-//! `kbf-coordinator`'s flags and start-up: read every file, bind both listeners, print the
-//! start line, then serve until SIGTERM or SIGINT.
+//! `kbf-coordinator`'s flags and start-up: take the state file's lock, read every file, bind
+//! both listeners (and the health listener when `--health-listen` is given), print the start
+//! line, then serve until SIGTERM or SIGINT.
 //!
 //! Everything is a flag; the coordinator reads no environment variable. It holds no CA key:
 //! its certificate and key are files the farm CA issued, and the CA certificate it checks
@@ -20,11 +21,13 @@ use kbf_tls::{TlsFiles, TlsSource};
 use tokio::net::TcpListener;
 
 use crate::desired::DesiredStore;
+use crate::health;
 use crate::http::Surface;
 use crate::listen::{CLIENT_PATIENCE, Listener, MAX_CONNECTIONS, reload_every, serve};
 use crate::ops::OpsStore;
 use crate::service::{Clock, Coordinator};
 use crate::services::Services;
+use crate::state_lock::StateLock;
 
 /// A start-up error, for the operator.
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -59,7 +62,9 @@ pub struct Cli {
     #[arg(long)]
     pub client_ca: PathBuf,
     /// The desired-state file: written by the coordinator, read back at start. Its
-    /// directory must be writable by the coordinator.
+    /// directory must be writable by the coordinator. A start first takes an exclusive lock
+    /// on the file's name with `.lock` added, and is refused at once while another
+    /// coordinator holds it.
     #[arg(long)]
     pub state_file: PathBuf,
     /// The allow-list of CI's OIDC token: a TOML file with a `[remote_operator]` table.
@@ -82,6 +87,11 @@ pub struct Cli {
     /// How often the TLS files are looked at again, in seconds.
     #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..))]
     pub tls_reload_secs: u64,
+    /// Where to answer `GET /healthz` over plain HTTP: 200 while the coordinator serves. A
+    /// loopback address only (IPv4 127.*, or ::1); without the flag there is no health
+    /// listener.
+    #[arg(long, value_parser = health::loopback)]
+    pub health_listen: Option<SocketAddr>,
 }
 
 /// Where the listeners are bound.
@@ -91,6 +101,8 @@ pub struct Bound {
     pub heartbeat: SocketAddr,
     /// The control listener.
     pub control: SocketAddr,
+    /// The health listener, when one was asked for.
+    pub health: Option<SocketAddr>,
 }
 
 /// What a running coordinator is made of.
@@ -105,6 +117,8 @@ pub struct Parts {
     pub heartbeat_listen: SocketAddr,
     /// Where to bind the control listener.
     pub control_listen: SocketAddr,
+    /// Where to bind the health listener, if anywhere.
+    pub health_listen: Option<SocketAddr>,
     /// How often to look at the TLS files.
     pub reload: Duration,
 }
@@ -161,12 +175,13 @@ pub fn build(cli: &Cli) -> Result<Parts, Error> {
         control_tls: TlsSource::files("control", files(None), interval)?,
         heartbeat_listen: cli.heartbeat_listen,
         control_listen: cli.control_listen,
+        health_listen: cli.health_listen,
         reload: interval,
     })
 }
 
-/// Binds both listeners, calls `ready` with their addresses, and serves until the future is
-/// dropped. It never returns `Ok`.
+/// Binds both listeners and the health listener if one is asked for, calls `ready` with their
+/// addresses, and serves until the future is dropped. It never returns `Ok`.
 ///
 /// # Errors
 /// An address cannot be bound.
@@ -181,12 +196,23 @@ pub async fn run(parts: Parts, ready: impl FnOnce(Bound)) -> Result<Infallible, 
         tls: parts.control_tls.clone(),
         surface: Surface::Control,
     };
+    let health = match parts.health_listen {
+        Some(addr) => Some(TcpListener::bind(addr).await?),
+        None => None,
+    };
     ready(Bound {
         heartbeat: heartbeat.local_addr()?,
         control: control.local_addr()?,
+        health: health.as_ref().map(TcpListener::local_addr).transpose()?,
     });
     let coordinator = parts.coordinator;
-    let (never, _, _) = tokio::join!(
+    let health = async move {
+        match health {
+            Some(tcp) => health::serve(tcp, CLIENT_PATIENCE).await,
+            None => std::future::pending::<Infallible>().await,
+        }
+    };
+    let (never, _, _, _) = tokio::join!(
         serve(
             heartbeat,
             Arc::clone(&coordinator),
@@ -195,6 +221,7 @@ pub async fn run(parts: Parts, ready: impl FnOnce(Bound)) -> Result<Infallible, 
         ),
         serve(control, coordinator, CLIENT_PATIENCE, MAX_CONNECTIONS),
         reload_every(vec![parts.heartbeat_tls, parts.control_tls], parts.reload),
+        health,
     );
     match never {}
 }
@@ -211,17 +238,36 @@ async fn signalled() -> std::io::Result<()> {
     Ok(())
 }
 
-/// Runs the coordinator until `stop` resolves.
+/// What a start writes into the state file's lock for a refused second start to show.
+fn holder_note(cli: &Cli) -> String {
+    format!(
+        "pid={} heartbeat={} control={}",
+        std::process::id(),
+        cli.heartbeat_listen,
+        cli.control_listen
+    )
+}
+
+/// The start line: the version and every bound address.
+fn start_line(bound: Bound) -> String {
+    let mut line = format!(
+        "kbf-coordinator {} heartbeat={} control={}",
+        env!("CARGO_PKG_VERSION"),
+        bound.heartbeat,
+        bound.control
+    );
+    if let Some(health) = bound.health {
+        line.push_str(&format!(" health={health}"));
+    }
+    line
+}
+
+/// Runs the coordinator until `stop` resolves. The state file's lock is taken first, before
+/// any file is read or any address bound, and held until this returns.
 async fn start(cli: Cli, stop: impl Future<Output = std::io::Result<()>>) -> Result<(), Error> {
+    let _lock = StateLock::acquire(&cli.state_file, &holder_note(&cli))?;
     let parts = build(&cli)?;
-    let serving = run(parts, |bound| {
-        println!(
-            "kbf-coordinator {} heartbeat={} control={}",
-            env!("CARGO_PKG_VERSION"),
-            bound.heartbeat,
-            bound.control
-        );
-    });
+    let serving = run(parts, |bound| println!("{}", start_line(bound)));
     tokio::select! {
         stopped = stop => stopped.map_err(Error::from),
         served = serving => {

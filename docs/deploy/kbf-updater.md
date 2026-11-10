@@ -579,6 +579,29 @@ the tag changed in the unit, a restart; to go back, name the old tag). Hosts tha
 finish or revert on their own while it is down, and the restarted coordinator orders nothing for
 its first 30 seconds.
 
+**One coordinator per state file.** A start first takes an exclusive lock (`flock`) on the
+`--state-file` name with `.lock` added (`desired.json.lock` beside `desired.json`), before it
+reads any file or binds any address, and writes its pid and its listen flags into that file. While
+another coordinator holds the lock, a second start on the same state file exits 1 at once and
+changes no file:
+
+```text
+kbf-coordinator: /var/lib/kbf-coordinator/desired.json.lock: another kbf-coordinator holds the lock of this state file (pid=1 heartbeat=0.0.0.0:8443 control=0.0.0.0:8444); a second coordinator on one state file is refused
+```
+
+So an update stops the old coordinator before it starts the new one. The kernel frees the lock
+when its holder exits, however it exits (a crash or `SIGKILL` included), so there is nothing to
+clean up; the lock file stays and the next holder rewrites it. A state directory the coordinator
+cannot create the lock file in (missing, or not writable) stops the start with the lock file's
+path in the message.
+
+**The health listener.** `--health-listen <addr>` (a loopback address only: IPv4 `127.*` or
+`::1`; any other is a usage error, exit 2) adds a plain-HTTP listener that answers `GET /healthz`
+(or `HEAD`) with 200 `ok` while the coordinator serves its two listeners; another method is 405
+and another path 404. It has no TLS and no token, and it says nothing about the farm (the quiet
+start and convergence are on `GET /v1/convergence`). The start line then ends with
+`health=<address>`. Without the flag there is no health listener, as before.
+
 Update it first when a release changes the coordinator or the messages between it and the
 hosts (`crates/kbf-coordinator`, `crates/kbf-updater/src/wire.rs`): a newer agent's heartbeat
 reaches an older coordinator, but a coordinator that does not know a newer rule would order the

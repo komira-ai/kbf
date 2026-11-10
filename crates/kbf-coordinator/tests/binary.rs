@@ -2,13 +2,15 @@
 
 mod support;
 
-use std::io::{BufRead, BufReader};
+use std::collections::BTreeMap;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdout, Command, Stdio};
 
 use kbf_testkit::dir::TestDir;
 use rustix::process::{Pid, Signal, kill_process};
-use support::{OPERATOR, Pki, client_config, exchange};
+use support::{OPERATOR, Pki, STATE, client_config, exchange};
 
 const BIN: &str = env!("CARGO_BIN_EXE_kbf-coordinator");
 
@@ -120,6 +122,11 @@ fn it_announces_its_addresses_serves_and_stops_on_sigterm() {
     let mut line = String::new();
     stdout.read_line(&mut line).expect("a start line");
     let words: Vec<&str> = line.split_whitespace().collect();
+    assert_eq!(
+        words.len(),
+        4,
+        "no health listener without the flag: {line}"
+    );
     assert_eq!(words[0], "kbf-coordinator", "{line}");
     assert_eq!(words[1], env!("CARGO_PKG_VERSION"));
     let control = words[3]
@@ -285,4 +292,238 @@ fn an_ops_file_this_build_cannot_read_stops_the_start() {
     );
     assert!(err.contains("newer"), "{err}");
     assert_eq!(std::fs::read_to_string(&default).expect("read"), newer);
+}
+
+/// The addresses a start line names.
+struct StartLine {
+    heartbeat: SocketAddr,
+    control: SocketAddr,
+    health: SocketAddr,
+}
+
+/// Reads the start line of a coordinator started with `--health-listen`.
+fn start_line(stdout: &mut BufReader<ChildStdout>) -> StartLine {
+    let mut line = String::new();
+    stdout.read_line(&mut line).expect("a start line");
+    let addr = |key: &str| -> SocketAddr {
+        line.split_whitespace()
+            .find_map(|w| w.strip_prefix(key))
+            .unwrap_or_else(|| panic!("no {key} in {line:?}"))
+            .parse()
+            .expect("an address")
+    };
+    StartLine {
+        heartbeat: addr("heartbeat="),
+        control: addr("control="),
+        health: addr("health="),
+    }
+}
+
+/// Every file of `dir`, by name, with its bytes.
+fn snapshot(dir: &std::path::Path) -> BTreeMap<String, Vec<u8>> {
+    std::fs::read_dir(dir)
+        .expect("listed")
+        .map(|entry| {
+            let path = entry.expect("an entry").path();
+            let name = path
+                .file_name()
+                .expect("a name")
+                .to_string_lossy()
+                .into_owned();
+            (name, std::fs::read(&path).expect("read"))
+        })
+        .collect()
+}
+
+/// The answer of a plain-HTTP `GET path` to `addr`, whole.
+fn get(addr: SocketAddr, path: &str) -> String {
+    let mut stream = std::net::TcpStream::connect(addr).expect("connected");
+    let request = format!("GET {path} HTTP/1.1\r\nHost: health\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).expect("sent");
+    let mut answer = String::new();
+    stream.read_to_string(&mut answer).expect("read");
+    answer
+}
+
+fn pid_of(child: &Child) -> Pid {
+    Pid::from_raw(i32::try_from(child.id()).expect("a pid")).expect("not zero")
+}
+
+/// Catches: two coordinators on one state directory, each ordering hosts from its own memory.
+/// With one coordinator serving, a second start on the same state file, given the very
+/// addresses the first is bound to, exits 1 with the lock's refusal naming the first's pid
+/// (by the whole message: not "address in use", so the lock was taken before any bind), prints
+/// no start line, and leaves every file of the state directory byte for byte as it was. The
+/// first goes on serving its state. Once the first is killed (SIGKILL: no clean-up of its own),
+/// the next start takes the lock, serves, and the lock file names it.
+#[test]
+fn a_second_coordinator_on_the_state_directory_is_refused_and_writes_nothing() {
+    let files = Files::new("bin-lock");
+    std::fs::write(files.path("desired.json"), STATE).expect("a desired state");
+    let mut flags = files.flags();
+    flags.extend(["--health-listen".to_owned(), "127.0.0.1:0".to_owned()]);
+    let mut first = spawn(&flags);
+    let mut stdout = BufReader::new(first.stdout.take().expect("stdout"));
+    let bound = start_line(&mut stdout);
+    let lock = files.path("desired.json.lock");
+    let first_note = format!(
+        "pid={} heartbeat=127.0.0.1:0 control=127.0.0.1:0\n",
+        first.id()
+    );
+    assert_eq!(
+        std::fs::read_to_string(&lock).expect("the lock file"),
+        first_note
+    );
+    let before = snapshot(files.dir.path());
+
+    let mut second = with(&flags, "--heartbeat-listen", &bound.heartbeat.to_string());
+    second = with(&second, "--control-listen", &bound.control.to_string());
+    second = with(&second, "--health-listen", &bound.health.to_string());
+    let (code, out, err) = run(&second);
+    assert_eq!(code, 1, "{err}");
+    assert_eq!(out, "", "a refused start prints no start line");
+    assert_eq!(
+        err,
+        format!(
+            "kbf-coordinator: {lock}: another kbf-coordinator holds the lock of this state file \
+             ({}); a second coordinator on one state file is refused\n",
+            first_note.trim_end()
+        )
+    );
+    assert_eq!(
+        snapshot(files.dir.path()),
+        before,
+        "the refused start wrote nothing"
+    );
+
+    assert!(get(bound.health, "/healthz").starts_with("HTTP/1.1 200 OK\r\n"));
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let config = client_config(&files.pki, None);
+    let (code, body) = runtime
+        .block_on(exchange(
+            bound.control,
+            &config,
+            "GET",
+            "/v1/status",
+            Some(OPERATOR),
+            "",
+        ))
+        .expect("answered");
+    assert_eq!(code, 200, "{body}");
+    assert!(
+        body.contains(r#""version":"2.0""#),
+        "the first serves its state: {body}"
+    );
+
+    kill_process(pid_of(&first), Signal::KILL).expect("killed");
+    first.wait().expect("reaped");
+    let mut next = spawn(&flags);
+    let mut stdout = BufReader::new(next.stdout.take().expect("stdout"));
+    let bound = start_line(&mut stdout);
+    assert!(get(bound.health, "/healthz").ends_with("\r\n\r\nok\n"));
+    assert_eq!(
+        std::fs::read_to_string(&lock).expect("the lock file"),
+        format!(
+            "pid={} heartbeat=127.0.0.1:0 control=127.0.0.1:0\n",
+            next.id()
+        )
+    );
+    kill_process(pid_of(&next), Signal::TERM).expect("signalled");
+    assert_eq!(next.wait().expect("exited").code(), Some(0));
+}
+
+/// Catches: a health listener on an address others reach, or one the start line does not
+/// name: `--health-listen` with the unspecified or a non-loopback address is a usage error
+/// (exit 2, the reason on stderr) before anything is read or locked; on loopback it is named
+/// as `health=` after the other two and answers `GET /healthz` with 200 `ok` and any other
+/// path with 404.
+#[test]
+fn the_health_listener_is_loopback_only_and_answers_healthz() {
+    let files = Files::new("bin-health");
+    for addr in ["0.0.0.0:0", "192.0.2.1:0", "[::]:0"] {
+        let mut flags = files.flags();
+        flags.extend(["--health-listen".to_owned(), addr.to_owned()]);
+        let (code, _, err) = run(&flags);
+        assert_eq!(code, 2, "{addr}: {err}");
+        assert!(err.contains("is not a loopback address"), "{err}");
+    }
+    assert!(
+        !files.dir.path().join("desired.json.lock").exists(),
+        "a usage error takes no lock"
+    );
+
+    let mut flags = files.flags();
+    flags.extend(["--health-listen".to_owned(), "127.0.0.1:0".to_owned()]);
+    let mut child = spawn(&flags);
+    let mut stdout = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut line = String::new();
+    stdout.read_line(&mut line).expect("a start line");
+    let words: Vec<&str> = line.split_whitespace().collect();
+    assert_eq!(words.len(), 5, "{line}");
+    let health: SocketAddr = words[4]
+        .strip_prefix("health=")
+        .expect("health= last")
+        .parse()
+        .expect("an address");
+    assert!(health.ip().is_loopback() && health.port() != 0, "{health}");
+    let ok = get(health, "/healthz");
+    assert!(
+        ok.starts_with("HTTP/1.1 200 OK\r\n") && ok.ends_with("\r\n\r\nok\n"),
+        "{ok}"
+    );
+    let missing = get(health, "/v1/status");
+    assert!(
+        missing.starts_with("HTTP/1.1 404 Not Found\r\n"),
+        "{missing}"
+    );
+    kill_process(pid_of(&child), Signal::TERM).expect("signalled");
+    assert_eq!(child.wait().expect("exited").code(), Some(0));
+}
+
+/// Catches: a start that reads its files, or goes on, without the state file's lock: a state
+/// file in a directory that does not exist stops the start with exit 1 and the lock file's
+/// path, before anything else is looked at (the operator token file it names is missing too,
+/// and the message is the lock's).
+#[test]
+fn a_start_whose_lock_file_cannot_be_made_is_refused_naming_it() {
+    let files = Files::new("bin-nolock");
+    let state = files.path("missing/desired.json");
+    let flags = with(&files.flags(), "--state-file", &state);
+    let flags = with(
+        &flags,
+        "--operator-token-file",
+        &files.path("missing.token"),
+    );
+    let (code, out, err) = run(&flags);
+    assert_eq!(code, 1, "{err}");
+    assert_eq!(out, "");
+    assert_eq!(
+        err,
+        format!("kbf-coordinator: {state}.lock: No such file or directory (os error 2)\n")
+    );
+}
+
+/// Catches: a start that keeps the state file's lock, or goes on serving, when its health
+/// address cannot be bound: with the address already taken it exits 1, prints no start line,
+/// and the lock is free at once for the next start, which serves.
+#[test]
+fn a_start_whose_health_address_is_taken_exits_and_frees_the_lock() {
+    let files = Files::new("bin-health-taken");
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").expect("bound");
+    let addr = taken.local_addr().expect("addr").to_string();
+    let mut flags = files.flags();
+    flags.extend(["--health-listen".to_owned(), addr]);
+    let (code, out, err) = run(&flags);
+    assert_eq!(code, 1, "{err}");
+    assert_eq!(out, "");
+    assert!(err.starts_with("kbf-coordinator: "), "{err}");
+    drop(taken);
+
+    let flags = with(&flags, "--health-listen", "127.0.0.1:0");
+    let mut next = spawn(&flags);
+    let mut stdout = BufReader::new(next.stdout.take().expect("stdout"));
+    let bound = start_line(&mut stdout);
+    assert!(get(bound.health, "/healthz").starts_with("HTTP/1.1 200 OK\r\n"));
+    kill_process(pid_of(&next), Signal::TERM).expect("signalled");
+    assert_eq!(next.wait().expect("exited").code(), Some(0));
 }
