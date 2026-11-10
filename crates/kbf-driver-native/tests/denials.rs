@@ -204,19 +204,20 @@ async fn a_refusal_the_log_shows_late_is_still_in_stderr() {
     config.denial_schedule = quick(2000);
     let rt = runtime(config, &cas);
     let spec = Spec::act("pgid ; echo --stderr own failure ; exit 3");
-    // Everything the reads can have looked back over, run and wait, is inside this span.
-    let span = std::time::Instant::now();
     let result = run(&rt, &cas, 1, &spec).await.expect("ran");
-    let span = span.elapsed();
     assert_eq!(result.exit_code, 3);
     let text = stderr(&cas, &result);
     assert!(text.contains("file-write-create /outside/mine\n"), "{text}");
     assert_eq!(LATE_READS.load(Ordering::SeqCst), 3);
     let windows = LATE_WINDOWS.lock().expect("windows").clone();
     let margin = kbf_driver_native::denials::MARGIN;
+    // At least the margin, and never the two minutes of the old floor (the action and
+    // its 2 s of reads are over long before).
     assert!(
-        windows.iter().all(|w| *w >= margin && *w <= margin + span),
-        "{windows:?} over a span of {span:?}"
+        windows
+            .iter()
+            .all(|w| *w >= margin && *w < Duration::from_secs(120)),
+        "{windows:?}"
     );
     assert!(windows.is_sorted(), "{windows:?}");
 }

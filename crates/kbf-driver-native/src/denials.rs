@@ -4,8 +4,8 @@
 //! directory sees only `EPERM`, which reads like any file-permission error. The
 //! refusal is in the unified log, one `Sandbox: <process>(<pid>) deny(1) <operation>
 //! <target>` line each. When an action fails, the driver reads the log for the
-//! last minutes ([`system_log`]), keeps the lines of the processes it watched
-//! ([`Found`]), and adds them to the end of the action's stderr ([`Found::note`]) and
+//! action's run and the wait since ([`window`], [`system_log`]), keeps the lines of the
+//! processes it watched ([`Found`]), and adds them to the end of the action's stderr ([`Found::note`]) and
 //! to the daemon's log, both capped ([`MAX_LINES`], [`MAX_NOTE_BYTES`]).
 //!
 //! The unified log shows a kernel-reported line seconds after the refusal, so [`collect`]
