@@ -629,6 +629,10 @@ impl Store for Refusing {
         self.inner.changes(after, limit)
     }
 
+    fn trim_feed(&self, before: kbf_state::Revision) -> Result<u64, kbf_state::StoreError> {
+        self.inner.trim_feed(before)
+    }
+
     fn reap_expired(&self) -> Result<usize, kbf_state::StoreError> {
         self.inner.reap_expired()
     }

@@ -109,6 +109,7 @@ pub fn full_spec(contents: &str) -> JobSpec {
             os: "linux".to_owned(),
             arch: "x86_64".to_owned(),
             exec: ExecMode::Container.into(),
+            ..Constraints::default()
         }),
         wall_limit_seconds: Some(3600),
         network: NetworkLevel::AllowList.into(),
@@ -137,6 +138,7 @@ pub fn full_job() -> Job {
         times: Some(times()),
         host_silent_since_ms: Some(T0 + 4000),
         cancel_requested: true,
+        ..Job::default()
     }
 }
 

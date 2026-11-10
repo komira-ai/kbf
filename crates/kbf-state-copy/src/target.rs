@@ -6,8 +6,8 @@
 //! (`kv`, `counters`, `head`, `rev_seq`), and a store whose schema is not the version this
 //! tool was built for is refused before anything is written.
 
-use kbf_state::postgres::PostgresConfig;
 use kbf_state::postgres::schema::{self, SchemaError};
+use kbf_state::postgres::{PostgresConfig, TlsMode};
 use postgres::{Client, GenericClient, NoTls, Row, Transaction};
 
 use crate::digest::{self, Counter, Entry, Summary};
@@ -76,9 +76,20 @@ impl Target {
     /// The target `url` names.
     ///
     /// # Errors
-    /// [`Error::Failed`] when the URL is not one the store accepts.
+    /// [`Error::Failed`] when the URL is not one the store accepts, or asks for TLS: this
+    /// tool connects without it (the store's reader takes such a URL now; this tool does not).
     pub fn new(url: &str) -> Result<Target, Error> {
         let config = PostgresConfig::parse(url)?;
+        if matches!(
+            config.tls_mode(),
+            TlsMode::Require | TlsMode::VerifyCa | TlsMode::VerifyFull
+        ) {
+            return Err(Error::Failed(
+                "the URL asks for TLS (sslmode), which kbf-state-copy does not speak: give a \
+                 Unix-socket or plain postgres:// URL"
+                    .to_owned(),
+            ));
+        }
         Ok(Target {
             url: url.trim().to_owned(),
             config,

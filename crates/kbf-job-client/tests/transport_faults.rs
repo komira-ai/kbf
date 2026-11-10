@@ -55,7 +55,10 @@ fn logged(method: &str) -> Call {
         "GetJob" => Call::GetJob(GetJobRequest { job_id }),
         "GetResult" => Call::GetResult(GetResultRequest { job_id }),
         "ListJobs" => Call::ListJobs(ListJobsRequest::default()),
-        "GetLogs" => Call::GetLogs(GetLogsRequest { job_id }),
+        "GetLogs" => Call::GetLogs(GetLogsRequest {
+            job_id,
+            ..GetLogsRequest::default()
+        }),
         other => panic!("no method {other}"),
     }
 }

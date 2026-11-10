@@ -19,7 +19,7 @@
 
 use std::fmt::Write as _;
 
-use js_proto::v1::{Constraints, ExecMode, Job, JobSpec, JobState, Needs, NetworkLevel};
+use js_proto::v1::{Constraints, ExecMode, Isolation, Job, JobSpec, JobState, Needs, NetworkLevel};
 use kbf_job_client::{Client, Error};
 use tonic::Code;
 
@@ -60,6 +60,11 @@ impl Canary {
                 os: "linux".to_owned(),
                 arch: self.arch.clone(),
                 exec: ExecMode::Container.into(),
+                // No ISA level, no accelerator, and confinement left unspecified (contained):
+                // the request's bytes stay those an older job service also reads.
+                isa_level: String::new(),
+                accelerator: None,
+                isolation: Isolation::Unspecified.into(),
             }),
             wall_limit_seconds: Some(WALL_SECS),
             network: NetworkLevel::None.into(),

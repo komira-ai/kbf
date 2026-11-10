@@ -67,8 +67,8 @@ async fn host_silence_shows_on_get_job_and_changes_no_state() {
     assert!(!server.unsilence_host("host-z"));
 }
 
-/// Asserts each branch of the design's cancel: a queued job is cancelled at once and keeps
-/// `cancel_requested`, as the released service answers it (kbf-integration-test's
+/// Asserts each branch of the design's cancel: a queued job is cancelled at once and, having
+/// ended, answers without `cancel_requested`, as the service answers it (kbf-integration-test's
 /// tests/js_real_service.rs holds the fake to that service); a running job answers with
 /// `cancel_requested` set and stays running until its host reports it stopped, then is
 /// cancelled; a placed and a starting job wait the same way; an ended job is
@@ -85,8 +85,8 @@ async fn cancel_follows_the_states_of_the_design() {
     let cancelled = client.cancel_job("queued").await.unwrap();
     assert_eq!(cancelled.state(), JobState::Cancelled);
     assert!(
-        cancelled.cancel_requested,
-        "a queued job cancelled keeps the intent, as the service answers"
+        !cancelled.cancel_requested,
+        "a queued job cancelled has ended, and answers without the intent"
     );
     assert!(cancelled.times.unwrap().ended_at_ms.is_some());
     assert_eq!(
@@ -422,6 +422,7 @@ async fn a_filtered_listing_keeps_its_filters_on_every_page() {
         queued_before_ms: Some(5000),
         page_size: 1,
         page_token: String::new(),
+        client: None,
     };
     let ids = |jobs: Vec<Job>| -> Vec<String> { jobs.into_iter().map(|job| job.id).collect() };
 

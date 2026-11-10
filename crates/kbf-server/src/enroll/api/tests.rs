@@ -820,6 +820,17 @@ async fn each_registry_failure_has_its_own_status() {
         (RegistryError::Contended, StatusCode::SERVICE_UNAVAILABLE),
         (down, StatusCode::SERVICE_UNAVAILABLE),
         (
+            RegistryError::Store(StoreError::Disconnected("reset at /secret/place".into())),
+            StatusCode::SERVICE_UNAVAILABLE,
+        ),
+        (
+            RegistryError::Store(StoreError::StaleCursor {
+                after: kbf_state::Revision(1),
+                floor: kbf_state::Revision(5),
+            }),
+            StatusCode::SERVICE_UNAVAILABLE,
+        ),
+        (
             RegistryError::Store(StoreError::Fenced),
             StatusCode::CONFLICT,
         ),

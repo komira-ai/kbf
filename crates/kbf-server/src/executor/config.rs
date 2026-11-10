@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use js_proto::v1::{Constraints, ExecMode, NetworkLevel};
+use js_proto::v1::{Constraints, ExecMode, Isolation, NetworkLevel};
 use kbf_proto::worker::{Capability, Hello};
 use kbf_sched::fence::{LEADER_LEASE_MARGIN, LEASE_GRACE, SELF_FENCE, START_GRACE, START_VALIDITY};
 use ring::rand::{SecureRandom, SystemRandom};
@@ -359,6 +359,11 @@ impl Config {
             os: "linux".to_owned(),
             arch: self.arch.clone(),
             exec: ExecMode::Container.into(),
+            // No ISA level, no accelerator, and confinement left unspecified (contained):
+            // the request's bytes stay those an older job service also reads.
+            isa_level: String::new(),
+            accelerator: None,
+            isolation: Isolation::Unspecified.into(),
         }
     }
 

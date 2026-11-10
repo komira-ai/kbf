@@ -142,9 +142,11 @@ impl From<RegistryError> for Failure {
                 "this frontend is not the signer: it no longer holds the writer role; \
                  call the current frontend",
             ),
-            RegistryError::Store(StoreError::Failed(_)) => {
-                Self::new(StatusCode::SERVICE_UNAVAILABLE, "the state store failed")
-            }
+            RegistryError::Store(
+                StoreError::Failed(_)
+                | StoreError::Disconnected(_)
+                | StoreError::StaleCursor { .. },
+            ) => Self::new(StatusCode::SERVICE_UNAVAILABLE, "the state store failed"),
         }
     }
 }

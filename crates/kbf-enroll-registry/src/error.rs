@@ -86,12 +86,15 @@ impl From<RefusalReason> for Fail {
 }
 
 /// A fenced handle is not the signer (default 4: there is no `enroll/signer` row); any
-/// other store failure is the store being unavailable.
+/// other store failure (a failed call, a lost connection, a trimmed change feed) is the
+/// store being unavailable.
 impl From<StoreError> for Fail {
     fn from(e: StoreError) -> Self {
         match e {
             StoreError::Fenced => Self(RefusalReason::NotSigner),
-            StoreError::Failed(_) => Self(RefusalReason::StoreUnavailable),
+            StoreError::Failed(_)
+            | StoreError::Disconnected(_)
+            | StoreError::StaleCursor { .. } => Self(RefusalReason::StoreUnavailable),
         }
     }
 }
@@ -101,5 +104,38 @@ impl From<StoreError> for Fail {
 impl From<Corrupt> for Fail {
     fn from(_: Corrupt) -> Self {
         Self(RefusalReason::StoreUnavailable)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kbf_state::Revision;
+
+    /// Every store failure other than fencing, the two the store gained with the connection
+    /// loss and the trimmed feed included, is answered StoreUnavailable; fencing is NotSigner.
+    #[test]
+    fn each_store_error_maps_to_its_refusal() {
+        let cases = [
+            (StoreError::Fenced, RefusalReason::NotSigner),
+            (
+                StoreError::Failed("down".to_owned()),
+                RefusalReason::StoreUnavailable,
+            ),
+            (
+                StoreError::Disconnected("reset".to_owned()),
+                RefusalReason::StoreUnavailable,
+            ),
+            (
+                StoreError::StaleCursor {
+                    after: Revision(1),
+                    floor: Revision(5),
+                },
+                RefusalReason::StoreUnavailable,
+            ),
+        ];
+        for (error, reason) in cases {
+            assert_eq!(Fail::from(error), Fail(reason));
+        }
     }
 }

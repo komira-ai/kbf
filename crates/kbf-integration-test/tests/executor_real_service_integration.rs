@@ -556,7 +556,9 @@ async fn a_frontend_that_stops_cancels_its_running_job() {
     rig.exec.shutdown().await;
     assert_eq!(rig.node.next().await, Event::Ended { name: name.clone() });
     let job = rig.until_state(&id, JobState::Cancelled).await;
-    assert!(job.cancel_requested, "{job:?}");
+    // Ended, the job no longer shows the cancel as pending (`job.proto`); the result's reason
+    // says it was the client's.
+    assert!(!job.cancel_requested, "{job:?}");
     let result = rig.api.get_result(&id).await.expect("GetResult");
     assert_eq!(result.reason(), ResultReason::Cancelled);
     assert_eq!(rig.counter("kbf_executor_jobs_cancelled_total"), 1);
@@ -685,7 +687,12 @@ async fn a_restarted_frontend_cancels_the_earlier_job_and_runs_the_action_again(
     rig.exec = rig.restarted();
     assert_eq!(rig.next_event(&caller).await, Event::Ended { name: first });
     let job = rig.until_state(&earlier.id, JobState::Cancelled).await;
-    assert!(job.cancel_requested, "{job:?}");
+    assert!(
+        !job.cancel_requested,
+        "ended, the cancel is no longer pending: {job:?}"
+    );
+    let result = rig.api.get_result(&earlier.id).await.expect("GetResult");
+    assert_eq!(result.reason(), ResultReason::Cancelled);
     assert_eq!(rig.counter("kbf_executor_jobs_adopted_cancelled_total"), 1);
     let finished = rig.finish(&caller).await;
     assert!(

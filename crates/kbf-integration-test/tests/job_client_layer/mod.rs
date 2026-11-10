@@ -31,9 +31,11 @@ const LEASE_CLIENT: &str = "kbf_lease_client";
 /// real-service tests of kbf-integration-test.
 const TESTS: [&str; 1] = ["kbf-integration-test"];
 
-/// The `js-*` crates the client may reach: the generated messages and service. What
-/// `js-proto` needs is not a `js-*` crate.
-const JS_ALLOWED: [&str; 1] = ["js-proto"];
+/// The `js-*` crates the client may reach: the generated messages and service, and what
+/// `js-proto` needs: `js-caps` (through which it converts a job's needs into capability keys,
+/// `js_proto::request_need`) and `js-types`, which `js-caps` depends on. Both are pure
+/// libraries: no runtime, no network, no server.
+const JS_ALLOWED: [&str; 3] = ["js-proto", "js-caps", "js-types"];
 
 /// Crates of crates.io whose names begin `js-` but that are not the scheduler's.
 const NOT_OURS: [&str; 1] = ["js-sys"];
@@ -195,13 +197,13 @@ fn a_crate_that_depends_on_the_job_client_is_named() {
     assert_eq!(dependents(&itself_normal), ["kbf-job-client (normal)"]);
 }
 
-/// Asserts that the job client's normal tree reaches `js-proto` and no other scheduler
-/// crate (no `js-server-core`, `js-sched`, `js-state`, `js-store`, `js-usage`, ...), and no
+/// Asserts that the job client's normal tree reaches `js-proto` and what it needs (`js-caps`,
+/// `js-types`) and no other scheduler crate (no `js-sched`, `js-state`, `js-usage`, ...), and no
 /// kbf crate; that the walk sees `js-proto` and `tonic`, or it would prove nothing; and that
 /// `js-proto` comes from the jobscheduler repository by the same source and revision as every
 /// other scheduler crate of the graph.
 #[test]
-fn the_job_client_reaches_only_js_proto() {
+fn the_job_client_reaches_only_js_proto_and_what_it_needs() {
     let g = load_graph();
     let (id, root) = &g.members[CLIENT];
     assert!(root.is_some(), "kbf-job-client must have a library target");
@@ -237,8 +239,8 @@ fn the_job_client_reaches_only_js_proto() {
     );
 }
 
-/// Asserts that the rule names a scheduler crate other than `js-proto` and passes
-/// `js-proto`, crates outside the scheduler, and `js-sys` of crates.io.
+/// Asserts that the rule names a scheduler crate other than `js-proto` and the two it needs,
+/// and passes those three, crates outside the scheduler, and `js-sys` of crates.io.
 #[test]
 fn a_job_client_that_reaches_a_server_crate_is_named() {
     let reached = ["js-proto", "tonic", "js-sched", "js-server-core", "js-sys"];
@@ -246,7 +248,11 @@ fn a_job_client_that_reaches_a_server_crate_is_named() {
         forbidden_js(reached),
         BTreeSet::from(["js-sched", "js-server-core"])
     );
-    assert!(forbidden_js(["js-proto", "tonic", "prost"]).is_empty());
+    assert!(forbidden_js(["js-proto", "js-caps", "js-types", "tonic", "prost"]).is_empty());
+    assert_eq!(
+        forbidden_js(["js-caps", "js-state", "js-usage"]),
+        BTreeSet::from(["js-state", "js-usage"])
+    );
 }
 
 /// Asserts that the evaluator names the chain to every forbidden crate of a graph in which the

@@ -100,11 +100,15 @@ fn the_database_setting_is_read_and_every_fault_is_refused_without_quoting_the_u
             "{err}"
         );
     }
-    let tls = "postgres://db.example/kbf?sslmode=require";
+    // The one sslmode the state store's URL reader refuses is a bad URL, said without the
+    // host; a URL that asks for TLS is taken.
+    let allow = "postgres://db.example/kbf?sslmode=allow";
     let err =
-        Database::from_installer_toml(&toml_file(&format!("database = \"{tls}\""))).unwrap_err();
+        Database::from_installer_toml(&toml_file(&format!("database = \"{allow}\""))).unwrap_err();
     assert!(matches!(err, DatabaseError::BadUrl { .. }));
     assert!(!err.to_string().contains("db.example"), "{err}");
+    let tls = "postgres://db.example/kbf?sslmode=require";
+    assert!(Database::from_installer_toml(&toml_file(&format!("database = \"{tls}\""))).is_ok());
 }
 
 // ---- against a server -----------------------------------------------------------------

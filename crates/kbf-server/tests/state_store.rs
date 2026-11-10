@@ -294,6 +294,10 @@ impl Store for Flaky {
         self.inner.store().changes(after, limit)
     }
 
+    fn trim_feed(&self, before: Revision) -> Result<u64, StoreError> {
+        self.inner.store().trim_feed(before)
+    }
+
     fn reap_expired(&self) -> Result<usize, StoreError> {
         self.inner.store().reap_expired()
     }

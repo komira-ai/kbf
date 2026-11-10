@@ -16,6 +16,7 @@ use super::*;
 use crate::setup::os::Os;
 use crate::setup::provision;
 use crate::setup::validate::LocalDatabase;
+use kbf_state::postgres::TlsError;
 
 const URL: &str = "postgres:///secretdb?host=/run/secretsock&user=secretrole";
 const NAMES: [&str; 3] = ["secretrole", "secretdb", "secretsock"];
@@ -662,7 +663,7 @@ fn a_creation_the_server_refuses_is_reported_without_its_words() {
 /// one and that the package only suggests it; a refused login gives the exact pg_hba.conf rule
 /// and the two pg_ident.conf lines, with the service's account filled in and the operator's
 /// names left as placeholders; a missing database says to create it; any other answer gives
-/// its SQLSTATE. All are exit 5 and none names a value from the URL; nothing is fetched or
+/// its SQLSTATE; a TLS failure says the URL's TLS could not be had. All are exit 5 and none names a value from the URL; nothing is fetched or
 /// written after one.
 ///
 /// Catches: the pg_ident line for root dropped; the map name dropped from the
@@ -676,6 +677,10 @@ fn each_refused_login_has_its_recipe_and_names_nothing() {
             "has no database of the name --database gives",
         ),
         (Unreached::Other("57P03".to_owned()), "SQLSTATE 57P03"),
+        (
+            Unreached::Tls(TlsError::NotOffered),
+            "the TLS the --database URL asks for could not be had",
+        ),
         (
             Unreached::Login,
             "`local  <database>  <role>  peer map=kbf`",

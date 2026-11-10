@@ -67,11 +67,13 @@ async fn a_result_is_kept_for_the_window_then_not_found() {
 }
 
 /// Asserts what a live job answers: `get_result` of a queued and of a running job is a
-/// definite `FAILED_PRECONDITION`, not `NOT_FOUND`; `get_logs` of a running job answers the tail so far, each
-/// stream cut to its last 8 KiB and marked truncated once cut. Catches a running job's logs
-/// refused, a tail that keeps the head, and a missing result taken for a missing job.
+/// definite `FAILED_PRECONDITION`, not `NOT_FOUND`; `get_logs` (without a stream, the call
+/// the client makes) of a running job answers its state with empty tails, as the service
+/// does; once the job ends, the tails show, each stream cut to its last 8 KiB and marked
+/// truncated once cut. Catches a running job's logs refused or shown before the job ends,
+/// a tail that keeps the head, and a missing result taken for a missing job.
 #[tokio::test]
-async fn a_live_job_has_logs_and_no_result() {
+async fn a_live_job_has_no_result_and_its_logs_show_once_it_ends() {
     let (server, client) = fake().await;
     client.submit_job(spec("live")).await.unwrap();
     let queued = client.get_result("live").await.unwrap_err();
@@ -92,6 +94,9 @@ async fn a_live_job_has_logs_and_no_result() {
     assert!(!early.may_have_applied());
 
     assert!(server.write_logs("live", b"line 1\n", b"warn\n"));
+    let mut long = vec![b'x'; 8192];
+    long.extend_from_slice(b"END");
+    assert!(server.write_logs("live", &long, b""));
     let logs = client.get_logs("live").await.unwrap();
     assert_eq!(
         (
@@ -100,13 +105,13 @@ async fn a_live_job_has_logs_and_no_result() {
             logs.stderr_tail.as_slice(),
             logs.truncated
         ),
-        (JobState::Running, &b"line 1\n"[..], &b"warn\n"[..], false)
+        (JobState::Running, &b""[..], &b""[..], false),
+        "a running job's tails wait for its end"
     );
 
-    let mut long = vec![b'x'; 8192];
-    long.extend_from_slice(b"END");
-    assert!(server.write_logs("live", &long, b""));
+    assert!(server.finish("live", 0));
     let logs = client.get_logs("live").await.unwrap();
+    assert_eq!(logs.state(), JobState::Succeeded);
     assert_eq!(logs.stdout_tail.len(), 8192);
     assert!(logs.stdout_tail.ends_with(b"xxEND"));
     assert!(logs.truncated);

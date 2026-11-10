@@ -183,8 +183,8 @@ fn a_run_that_stopped_at_the_database_is_finished_by_running_again() {
 /// keep state in Postgres take the local default when it is left out (the database `kbf` on the
 /// local socket, as the account the mode's unit runs as, marked as defaulted) and a given URL is
 /// not marked; the other modes refuse the flag; a password (the file is world-readable), another
-/// scheme or a character a TOML string would escape is refused; and the message never quotes the
-/// URL.
+/// scheme, a character a TOML string would escape or an `sslmode` the URL reader refuses is
+/// refused; a URL that asks for TLS is taken; and the message never quotes the URL.
 #[test]
 fn the_database_flag_defaults_where_there_is_state_and_is_refused_with_a_password() {
     let local = "postgres:///kbf?host=/run/postgresql&user=kbf";
@@ -218,7 +218,8 @@ fn the_database_flag_defaults_where_there_is_state_and_is_refused_with_a_passwor
         "sqlite:///var/lib/kbf/state.db",
         "postgres:///kbf?host=/run/postgresql\"x",
         "postgres:///kbf?host=/run/post gresql",
-        "postgres:///kbf?host=/run/postgresql&sslmode=require",
+        // The one sslmode the state store's URL reader refuses.
+        "postgres:///kbf?host=/run/postgresql&user=kbf&sslmode=allow",
     ] {
         let mut r = raw(Mode::Frontend);
         r.database = Some(bad.to_owned());
@@ -226,9 +227,15 @@ fn the_database_flag_defaults_where_there_is_state_and_is_refused_with_a_passwor
         assert!(why.contains("not a usable Postgres URL"), "{bad}: {why}");
         assert!(!why.contains(bad), "{why}");
     }
-    let mut ok = raw(Mode::Frontend);
-    ok.database = Some("postgresql:///kbf?host=/run/postgresql&user=kbf".to_owned());
-    assert!(ok.validate(Platform::Linux).is_ok());
+    // A plain URL, and one that asks for TLS, which the state store's reader takes.
+    for good in [
+        "postgresql:///kbf?host=/run/postgresql&user=kbf",
+        "postgres://db.example/kbf?user=kbf&sslmode=require",
+    ] {
+        let mut ok = raw(Mode::Frontend);
+        ok.database = Some(good.to_owned());
+        assert!(ok.validate(Platform::Linux).is_ok(), "{good}");
+    }
 }
 
 /// Catches a setup that writes a settings file somewhere the unit does not read: the unit

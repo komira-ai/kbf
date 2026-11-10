@@ -98,6 +98,9 @@ kbf-threads.workspace = true
 flate2.workspace = true
 js-proto.workspace = true
 kbf-job-client = { workspace = true, features = ["fake"] }
+# `tests/cutover_real_service_integration.rs`: `kbf-deploy job-service apply`, run as the
+# binary runs it, against the pinned js-lease-server and js-agent.
+kbf-deploy.workspace = true
 prost-types.workspace = true
 tar.workspace = true
 # SIGPIPE ignored by the fake `kbf-server` of tests/cross_version.rs, which runs before

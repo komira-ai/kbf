@@ -39,7 +39,7 @@ fn wall_rows(store: &Arc<Fake>) -> Vec<String> {
 async fn restarted_hold(
     wall: Option<Duration>,
     before: impl FnOnce(&Arc<Fake>, OperationId),
-) -> (u64, Option<u64>) {
+) -> (u64, u64) {
     let store = store();
     let whole = {
         let first = Rig::over(&FLAGS, &[], &store);
@@ -52,7 +52,7 @@ async fn restarted_hold(
     let Some(WholeState::Holding { made, deadline, .. }) = second.whole_state(whole) else {
         panic!("not holding: {:?}", second.whole_state(whole));
     };
-    (made.as_millis(), deadline.map(|d| d.as_millis()))
+    (made.as_millis(), deadline.as_millis())
 }
 
 /// Catches a wall time lost between the first farm and the second (not written with the
@@ -64,7 +64,7 @@ async fn a_queued_request_keeps_its_wall_time_over_a_restart() {
         assert_eq!(wall_rows(store), [format!("opwall/{:016x}", whole.0)]);
     })
     .await;
-    assert_eq!(deadline, Some(made + 100_500));
+    assert_eq!(deadline, made + 100_500);
 }
 
 /// Catches a wall time invented for a request that has none: no row is written, and the
@@ -75,7 +75,7 @@ async fn a_queued_request_with_no_wall_time_recovers_with_none() {
         assert!(wall_rows(store).is_empty());
     })
     .await;
-    assert_eq!(deadline, Some(u64::MAX));
+    assert_eq!(deadline, u64::MAX);
 }
 
 /// Catches a store written before the wall rows existed refusing to start or recovering a
@@ -91,5 +91,5 @@ async fn a_row_written_without_a_wall_row_recovers_with_none() {
         store.txn(gone).expect("write").expect("applied");
     })
     .await;
-    assert_eq!(deadline, Some(u64::MAX));
+    assert_eq!(deadline, u64::MAX);
 }

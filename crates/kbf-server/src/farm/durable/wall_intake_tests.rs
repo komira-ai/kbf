@@ -64,12 +64,7 @@ async fn a_request_another_frontend_queued_comes_in_with_its_wall_time() {
     );
     rig.farm.intake();
     rig.pass(Duration::from_secs(10)).await;
-    let Some(WholeState::Holding {
-        made,
-        deadline: Some(deadline),
-        ..
-    }) = rig.whole_state(whole)
-    else {
+    let Some(WholeState::Holding { made, deadline, .. }) = rig.whole_state(whole) else {
         panic!("not holding: {:?}", rig.whole_state(whole));
     };
     assert_eq!(deadline.as_millis(), made.as_millis() + 100_000);

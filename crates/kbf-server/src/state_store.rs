@@ -94,9 +94,10 @@ pub enum StateStoreUriError {
     )]
     Unsupported,
     /// A `postgres://` or `postgresql://` value that is not a URL this client can use: it
-    /// names no host, asks for TLS or does not parse.
+    /// names no host, asks for `sslmode=allow` (the one mode the client does not take) or
+    /// does not parse.
     #[error(
-        "postgres:// needs a URL with a host and no TLS, as in \
+        "postgres:// needs a URL with a host and an sslmode other than allow, as in \
          postgres:///kbf?host=/run/postgresql"
     )]
     PostgresUrl,
@@ -372,7 +373,10 @@ fn open_postgres(url: &PostgresUrl) -> Result<Arc<dyn Store>, OpenFailure> {
     match kbf_state::postgres::PostgresStore::try_open(&url.config) {
         Ok(store) => Ok(Arc::new(store)),
         Err(OpenError::NotUp(e)) => Err(OpenFailure::NotUp(open_error(e))),
-        Err(OpenError::Refused(e)) => Err(OpenFailure::Refused(open_error(e))),
+        // A refusal, or TLS the URL asks for and cannot have: no wait changes either.
+        Err(e @ (OpenError::Refused(_) | OpenError::Tls(_))) => {
+            Err(OpenFailure::Refused(open_error(e)))
+        }
     }
 }
 

@@ -165,6 +165,9 @@ impl Store for FailsAudit {
     fn changes(&self, after: Revision, limit: usize) -> Result<Changes, StoreError> {
         self.0.changes(after, limit)
     }
+    fn trim_feed(&self, before: Revision) -> Result<u64, StoreError> {
+        self.0.trim_feed(before)
+    }
     fn reap_expired(&self) -> Result<usize, StoreError> {
         self.0.reap_expired()
     }
