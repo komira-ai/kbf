@@ -35,7 +35,7 @@ memory ladder and the farm's rerun budgets, the Macs (still `kbf-daemon`), and t
 
 Contents: 1 rulings; 2 where things stand; 3 action to job; 4 inputs; 5 outputs; 6 failures and retries; 7 what is
 deleted and what stays; 8 the flip; 9 tests; 10 numbers; 11 build items; 12 decisions; 13 what this asks of
-jobscheduler; 14 macOS later and other open points.
+jobscheduler and tierstore; 14 macOS later and other open points.
 
 ## 1. The rulings this starts from
 
@@ -130,8 +130,14 @@ Every rerun of section 6 is a new farm lease, so it has a new job id and fresh m
 
 ### 3.2 The image
 
-The kbf image stays the job's image: the action's `container-image` names the base, and an action that names another
-is refused as today (`docs/deploy/kbf-modes.md`). The tree is the input root, never the root file system.
+For the first flip the kbf image stays the job's image (D16, option a): the action's `container-image` names the base,
+and an action that names another is refused as today (`docs/deploy/kbf-modes.md`). The tree is the input root, never
+the root file system.
+
+Running each action in its own image is a later design (D16, option c): the job's image would be the action's, and
+`kbf-task` would reach the job as a read-only tree. That needs a way to name a mount outside `/work` in the public job
+API, which `TreeInput.dest` (relative to the exec root) cannot say today. Like `JobSpec.trees` itself, it is a change
+to jobscheduler's public interface, and both go to the owner's review of public interfaces before they are built.
 
 ### 3.3 Resources
 
@@ -182,10 +188,12 @@ One manifest per REAPI `Directory`, built bottom-up:
 | `DirectoryNode {name, digest}` | `{"name", "kind":"dir", "sha256": <child manifest's digest>, "size": <child manifest's length>}` |
 | `SymlinkNode {name, target}` | `{"name", "kind":"symlink", "target"}` |
 
-Children are sorted bytewise by name across REAPI's three node lists. `node_properties` (mtime, mode) are not carried,
-and kbf does not honour them today either: `kbf-task` sets only the mode from `is_executable` (0755, else 0644;
-`crates/kbf-task/src/fetch.rs`, `create_file`), and a fetched file's mtime is the time it was written [code]. A tree
-gives the same modes and one fixed mtime (ts D10).
+Children are sorted bytewise by name across REAPI's three node lists. A manifest has no field for REAPI's
+`node_properties` (`unix_mode`, `mtime`, and named properties), so a `Directory` that sets any of them, on itself or on
+a node it lists, is not written as a tree: the job is today's (`why=unrepresentable`, 4.2). The download does not
+honour them either (`kbf-task` sets only the mode from `is_executable`, 0755 or 0644, `crates/kbf-task/src/fetch.rs`,
+`create_file`) [code], so the fallback changes nothing an action sees; it keeps the tree from claiming a property it
+drops. Without properties, a tree gives the same modes as the download and one fixed mtime (ts D10).
 
 A manifest's digest is the SHA-256 of its bytes. Each new manifest is written with a create-only PUT to
 `cas/l/<sha256>` in the store the node's tierstore reads (ts 6.1: child manifests are fetched from there), through the
@@ -202,7 +210,7 @@ The executor submits **without** `trees` (today's job, inputs fetched) when [pro
 | `whole_host` | a `whole_machine` lease (3.1, D15) |
 | `unlocated` | a non-empty blob of the closure has no location: it is only in a storage node's write tier or an open segment, or a large blob is not in `cas/l/` yet (large objects reach it only by the backfill or the ingest's write-through) |
 | `store` | the index or tierstore did not answer within the writer's deadline, or a manifest PUT failed |
-| `unrepresentable` | a name tierstore refuses (`.wh.` prefix, ts 6.1), or the closure is over a tierstore limit (2^24 - 1 entries, a manifest over 64 MiB, depth over 4096) |
+| `unrepresentable` | a name tierstore refuses (`.wh.` prefix, ts 6.1), a `Directory` or node with `node_properties` (4.1), or the closure is over a tierstore limit (2^24 - 1 entries, a manifest over 64 MiB, depth over 4096) |
 | `refused` | the resubmit of a tree job whose submit or start was refused (section 6) |
 
 Each is counted (`kbf_executor_inputs_total{from="fetch",why}` beside `{from="tree"}`), because the share of actions
@@ -253,7 +261,7 @@ tree or from the download [proposed, D6]:
 | Path | Before | After |
 |---|---|---|
 | input root, the Command's exec root | `/scratch/work/in` | `/work` |
-| the Command's `HOME`, `TMPDIR`, caches (`private/`) | `/scratch/work/private` | unchanged: never inside the input root |
+| `private/` (the Command's home, temporary and cache directories) | `/scratch/work/private`, named by `HOME`, `TMPDIR`, `XDG_CACHE_HOME` | still `/scratch/work/private` on disk, never inside the input root; the Command sees it only at the paths of the next paragraph |
 | stdout, stderr | `/scratch/work/{stdout,stderr}` | unchanged |
 | outputs | collected relative to the input root | the same, relative to `/work` |
 
@@ -276,12 +284,36 @@ With `--inputs tree`, `kbf-task`:
    never runs over a root that lost its tree without the agent saying so. (An old server that drops `trees` is caught
    earlier, by the spec check of section 6; failing that, its job would run `kbf-task` after the entrypoint, js TI 2.5,
    and fail on its arguments before any action ran.)
-3. makes the output paths' parents and the working directory (in the overlay, so in the upper directory), runs the
-   Command there, and collects, packs and PUTs as today;
+3. before the Command starts, makes the parent directory of every output path and the working directory under `/work`
+   (in the overlay, so in the upper directory), as REAPI asks of the worker; then runs the Command there in the
+   sandbox below, and collects, packs and PUTs as today;
 4. records `"from": "tree"` or `"from": "fetched"` in the manifest's existing advisory `inputs` statistics
    (`kbf-task-pack` `InputStats`, version 2 manifests), which the ingest counts (D12). `InputStats` refuses an unknown
    member (`deny_unknown_fields`), so the ingest that reads `from` ships one release before any task writes it
-   (section 11, items 5 and 6).
+   (section 11, items 6 and 7).
+
+**The Command's sandbox inside the job** [proposed, D17]. In both modes, before the tree switch exists (section 11,
+item 4), `kbf-task` starts the Command in its own mount and PID namespaces, beside the user and network namespaces it
+already makes (`crates/kbf-task/src/network.rs`, `CLONE_NEWUSER | CLONE_NEWNET`) [code]:
+
+| Path in the Command's view | What it is |
+|---|---|
+| `/work` | the input root (the overlay), the exec root |
+| `/tmp`, `/var/tmp`, `/run` | bound from `private/tmp`, `private/var-tmp`, `private/run`: on the scratch volume, writable, executable, not the job's 64 MiB `noexec` tmpfs. Actions that hard-code `/tmp` or run a program from it work as under the daemon, whose container binds disk-backed `/tmp`, `/var/tmp` and `/run` |
+| `/root` (`HOME`; `XDG_CACHE_HOME` is `/root/.cache`) | bound from `private/home` |
+| `/scratch` | an empty read-only tmpfs over it, mounted after the binds above |
+| `/run/js-files` (the read grant and the PUT URLs) | gone: `/run` is the bind above |
+
+So the Command cannot read the job's grants or the task's stdout and stderr files, and cannot write anywhere but
+`/work` and its own private directories. The PID namespace ends every process the Command started when it exits, so no
+process of the action is left running while `kbf-task` reads the outputs (`kbf-outputs` requires it). The frontend's
+MAC key (`--task-secret-file`) is never in the job: it stays in the frontend.
+
+The outputs are read by `kbf-outputs`' walk, which already opens every component relative to its parent's descriptor
+with `O_NOFOLLOW` (`crates/kbf-outputs/src/collect.rs`) [code]. On Linux each of those opens becomes `openat2` with
+`RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS`, so the kernel refuses any path out of `/work`, a `..`
+included, in an upper directory the action wrote; macOS keeps `O_NOFOLLOW`. The action controls the upper directory,
+and the walk trusts nothing in it.
 
 Known differences from a laid-out tree, measured by tierstore over this overlay (ts 6.6, Measured: linux E4) and
 accepted: renaming an input **directory** with `rename(2)` fails `EXDEV` (GNU `mv` falls back to a copy); an input's
@@ -320,7 +352,14 @@ Already built, and kept [code; O2]:
    presigns one create-only PUT per key with a presign-only credential, good for the wall limit plus
    `--task-url-slack-secs`. The job can write those keys once and nothing else; it holds no delete right and no store
    credential (B16).
-2. **The promotion.** After a job ends with exit 0 the frontend's ingest
+2. **The promotion.** The ingest starts only from the job's **result**, never from a PUT [proposed, D18]: a pack is
+   promoted only when `GetResult` says state `SUCCEEDED`, reason `EXIT`, exit code 0 and no `input_failure`. Any other
+   result leaves the keys to the janitor, however complete the pack looks. A tree read that failed while the task had
+   already PUT its pack (the action swallowed an `EIO` and exited 0) is therefore never promoted: js TI 2.4 makes such
+   a result `FAILED` with `INPUT_FAILED`, and kbf checks `input_failure` itself as well, so a result that carries one
+   is refused whatever its state. Today's executor already ingests only after the job's end (`executor/runs.rs`,
+   `Verdict::Ingest`) [code]; item 9 of section 11 makes the rule the four conditions and tests each. Then the
+   frontend's ingest
    (`crates/kbf-front/src/proxy/packed/commit/untrusted/task.rs`, `ingest_set`) verifies the keys' MACs, the packs'
    shape and footers, the manifest (this lease, this action), each digest's single place and the output `Tree`s,
    streams large objects through SHA-256 into the CAS, hashes every record of every pack as it records it in the pack
@@ -375,6 +414,12 @@ Notes:
   `DEADLINE_EXCEEDED`. Section 13 asks for `stall_ms` in the job's result; with it the executor applies the same rule to
   the action's timeout (stall over a tenth of it: rerun, not a timeout). Until then it is a known gap, and section 10
   counts timeouts per arm.
+- **Fill time is the action's time.** A file's bytes are fetched on its first open, inside the action's run: the
+  120 s attach bound covers the manifests only, and the first open of a large toolchain file waits for the whole blob.
+  On a cold node that time counts against the action's timeout. Section 13 asks jobscheduler and tierstore for a
+  prefetch the agent waits for in the preparing stage, which the wall limit does not count; until then the cold
+  first-byte latency of the largest toolchain files is measured before the trees switch (section 10, 8.3), and the
+  switch waits for it.
 - **A rerun may land on the same host.** The farm avoids a virtual worker, not a host (`farm.rs`, `avoided`), and the
   job spec has no way to say "not that host", so a node with a broken `tierstore fs` can take both reruns of an action
   and end it `INTERNAL`. Section 10 counts input failures by `Job.host_id`, section 13 asks jobscheduler for a host to
@@ -384,7 +429,7 @@ Notes:
 
 ## 7. What is deleted after the flip, and what stays
 
-In the order of section 11 (items 13 and 14), after the flip has held for one release with no rollback [proposed]:
+In the order of section 11 (items 15 and 16), after the flip has held for one release with no rollback [proposed]:
 
 1. **The nodes move first**: the six nodes run `kbf storage` instead of `kbf storage-and-daemon` (an operations step
    through the host updater; the storage half is the same process code, so the store keeps serving throughout). This
@@ -429,7 +474,10 @@ Preconditions, checked once before `kbf-deploy job-service apply`:
 3. The pool books no disk (O4), and kbf's executor no longer asks for it (section 11, item 2).
 4. The `cas/b/` janitor is on, on the leader (`--task-janitor-key-file`).
 5. Secrets go as files (`executor-secret-delivery = "files"`).
-6. The placement filter of 8.2 is in the running release (section 11, item 3).
+6. The placement filter of 8.2 and the Command's sandbox of 4.4 are in the running release (section 11, items 3 and 4).
+7. **The no-op benchmark** of section 10 has run on the six nodes and its result is reported to the owner: the latency
+   of an action that does nothing as a job against the same action on today's daemon. The switch waits for it. It is
+   a measurement read by people, not a test with a threshold (T10).
 
 The switch is the existing procedure: `kbf-deploy job-service apply --apply` (staged `kbf.toml`, `kbf --check`, a drain
 that waits by default (B15), restart, the canary job).
@@ -455,7 +503,7 @@ connection; the node's cores and memory are the agent's (`memory_schedulable_per
 `executor-input-trees = true` [proposed, D10]. Preconditions, checked once:
 
 1. jobscheduler's tree items 1 to 4 (js TI 9) released; the lease server upgraded to that release; kbf's pin moved to it
-   (section 11, item 8).
+   (section 11, item 11).
 2. On each of the six nodes: tierstore's package with `tierstore fs` running (`tierstore-fs@a`, its marker made, `[fs]`
    with `fs.owner` equal to the agent's job uid, which the agent's start-time probe checks, js TI 3.1); the node's
    tierstore reading the bucket and prefix the frontend's pack store writes (the manifests' `source` keys are that
@@ -464,6 +512,8 @@ connection; the node's cores and memory are the agent's (`memory_schedulable_per
    capability is probed once, at the agent's start).
 3. `ListHosts` shows `tierstore-trees=true` on all six.
 4. The one-node run of js TI 9 item 6 passed, with a kbf task reading a tree.
+5. The cold first-byte latency of the largest toolchain files through `tierstore fs` (section 10) is measured and
+   reported to the owner.
 
 The kernel: passthrough needs 6.9 or later; ts C8 chose the 7.0 kernel for the farm, which also has FUSE resend, so a
 restart of `tierstore fs` is invisible to running jobs. On a 6.8 node there is no resend: a crash or restart of
@@ -504,7 +554,10 @@ echo), in `crates/kbf-server/tests/executor/`:**
 - `no_capable_host_is_still_invalid_for_a_job_without_trees`;
 - `a_spec_answered_without_its_trees_is_cancelled_and_rerun` (the fake drops `trees`);
 - `a_resubmit_after_a_lost_answer_sends_the_same_trees`, with the memo changed between the two sends;
-- the outcome table's test (which holds `outcome.rs` to its table) with the new rows.
+- the outcome table's test (which holds `outcome.rs` to its table) with the new rows;
+- `a_pack_is_promoted_only_from_a_clean_result`: with a complete, valid pack already PUT, nothing is promoted for a
+  result that is `FAILED`, that has reason `INPUT_FAILED` or `WALL_LIMIT`, that has a nonzero exit, or that is
+  `SUCCEEDED` with exit 0 but carries an `input_failure`; the one clean result promotes it.
 
 **Manifest writer, in `crates/kbf-front`:**
 
@@ -521,7 +574,9 @@ echo), in `crates/kbf-server/tests/executor/`:**
   not the listener's caps); an index that does not answer by the deadline: no tree, `why=store`;
 - a non-empty blob with no location: no tree, `why=unlocated`; a create-only PUT that finds the key present is
   success; one that fails is `why=store`;
-- `collect_closure` with trees on keeps the `Directory` messages and with trees off keeps none.
+- `collect_closure` with trees on keeps the `Directory` messages and with trees off keeps none;
+- a `Directory` with `node_properties` on itself, on a file node and on a directory node: each no tree,
+  `why=unrepresentable`.
 
 **`kbf-task`, in `crates/kbf-task` (the library is given the `JS_TREES_UNATTACHED` value as a parameter, so no test
 sets the process environment):**
@@ -533,15 +588,20 @@ sets the process environment):**
 - an executable input is 0755 and another 0644, attached and fetched;
 - outputs that are unchanged inputs, changed inputs, new files and directories, collected from the exec root;
 - `InputStats.from` written as `tree` and as `fetched`;
-- one test of the binary run as a child process with the variable set on the child only, proving `main` passes it on.
+- one test of the binary run as a child process with the variable set on the child only, proving `main` passes it on;
+- the output paths' parents and the working directory exist before the Command starts, in both modes;
+- the sandbox (on Linux, in the CI job that already runs `kbf-task`'s namespace tests): the Command writes and runs a
+  program from `/tmp`, `/var/tmp` and `/run`, and the bytes are under `private/`; it cannot see `/run/js-files` or any
+  file under `/scratch`; a background process it leaves is gone before the outputs are read; an output that is a
+  symlink out of `/work`, a directory renamed to one, and a `..` in a path are each refused by the walk.
 
 **Frontend farm:** `linux_daemons_get_no_lease_while_the_executor_runs`,
 `a_mac_daemon_is_placed_beside_the_virtual_workers` (a macOS action on a Mac daemon, a Linux action on a virtual
 worker), and `a_restart_under_kbf_daemon_places_the_linux_daemons_and_leaves_no_cordon_row`.
 
-**Compatibility (B8):** the one format touched is the task manifest's `InputStats`. The reader (item 5) accepts a
-version 2 manifest whose `inputs` has `from` and one without it; the writer (item 6) ships a release later, and its
-test reads the written manifest with the reader of item 5. That a previous reader refuses `from` is pinned by a test,
+**Compatibility (B8):** the one format touched is the task manifest's `InputStats`. The reader (item 6) accepts a
+version 2 manifest whose `inputs` has `from` and one without it; the writer (item 7) ships a release later, and its
+test reads the written manifest with the reader of item 6. That a previous reader refuses `from` is pinned by a test,
 since it is why the order is what it is. The field-set comparison of fake and real job service
 (`the_fake_and_the_real_server_answer_with_the_same_fields`) gains `trees` and `input_failure` when the pin has them.
 
@@ -566,8 +626,10 @@ action digest, and actions that differ only by an embedded exec-root path (4.4) 
 submit and at start, each of the three `input_failure` codes with each exit, the dropped `trees`), each reason of 4.2,
 each tierstore limit and each lookup bound on both sides of its boundary, each row of 4.6 (attached, refused, hung,
 not capable anywhere), each branch of the task's steps 1 and 2 of 4.4, the memo's bound, expiry and parent rule, the
-lost-answer resubmit, both directions and the release order of the one format change, and the placement filter on, off
-and after a rollback. Rows of section 6 that are unchanged keep the tests they have.
+lost-answer resubmit, both directions and the release order of the one format change, the placement filter on, off
+and after a rollback, each result that must not promote a pack and the one that must, each place a `node_properties`
+can be set, and each way out of the Command's sandbox (a hidden path, a leftover process, a symlink, a rename, a `..`).
+Rows of section 6 that are unchanged keep the tests they have.
 
 ## 10. Numbers to measure
 
@@ -588,23 +650,30 @@ Each as p50, p90 and p99 with its interval, and each marked measured or inferred
    stage, the attach included, and the heartbeat waits; the pool's `heartbeat_interval` is recorded with the arm), task
    and ingest from `kbf_executor_phase_seconds{phase}`; fetch, run and pack from the manifest's `timing` (the task's
    own claims, labelled so); the rest of the task span after pack is the PUT. Arm A from the daemon's `lease phases:`
-   line. Client side, from Buck2's event logs, by `kbf-baseline`. A no-op action (`true`, an empty input root)
-   isolates the fixed cost per job.
-2. **Cold, warm and partial.** Cold: tierstore's cache and the node input cache emptied, and `skip_cache_lookup`.
+   line. Client side, from Buck2's event logs, by `kbf-baseline`.
+2. **The no-op benchmark, the gate of the executor switch (8.1).** An action that runs `true` over an empty input root,
+   with `skip_cache_lookup`, submitted serially and then 64 at a time, through arm A (today's daemon) and arm B (a job),
+   interleaved, at least 30 runs per arm after labelled warm-ups. Reported: Execute to answer at the client, and its
+   parts by the phases above, p50 and p90 with their intervals. It isolates what a job adds per action: the submit,
+   placement, the start, the task's start and namespaces, the result's round trip and the ingest.
+3. **Cold first-byte latency, the gate of the trees switch (8.3).** The time to the first byte of `read` on the largest
+   files of the farm's toolchains (the compilers and linkers, each 100 MB or more) through `tierstore fs` with its cache
+   empty, on a 6.8 node and on a 7.0 node, against the same file from a laid-out tree.
+4. **Cold, warm and partial.** Cold: tierstore's cache and the node input cache emptied, and `skip_cache_lookup`.
    Warm: the same build again with `skip_cache_lookup`. Partial: one input changed. Plus, for C and D, the prepare
    phase of a large toolchain root with the memo cold and warm.
-3. **Build wall time** of the conformance builds.
-4. **The share of actions served by trees** and each `why` of 4.2 (`kbf_executor_inputs_total`), and `from` of the
+5. **Build wall time** of the conformance builds.
+6. **The share of actions served by trees** and each `why` of 4.2 (`kbf_executor_inputs_total`), and `from` of the
    manifests: an arm with trees on and most actions `fetched` is a store or node mismatch to fix at its source.
-5. **Bytes**: inputs read per action against the input root's size (tierstore's fill counters), scratch bytes written.
-6. **Failures**: `INPUT_FAILED` per thousand actions by code and by host, `EXDEV` failures, timeouts per arm.
+7. **Bytes**: inputs read per action against the input root's size (tierstore's fill counters), scratch bytes written.
+8. **Failures**: `INPUT_FAILED` per thousand actions by code and by host, `EXDEV` failures, timeouts per arm.
 
-These numbers do not decide whether to flip (O6 decided that); they decide what to fix first: if B's overhead over A is
+Apart from the two gates, these numbers do not decide whether to flip (O6 decided that); they decide what to fix first: if B's overhead over A is
 mostly in queue, the pool's heartbeat; if C's is in reads, passthrough and prefetch (ts 12, phase 3).
 
 ## 11. Build items, in order
 
-Code items are one pull request each; items 4, 12 and 13 are operations steps, not pull requests. Items 1 to 7 need
+Code items are one pull request each; items 5, 14 and 15 are operations steps, not pull requests. Items 1 to 9 need
 nothing new from jobscheduler. Each pull request updates the documents named with it.
 
 1. **This design.**
@@ -612,30 +681,39 @@ nothing new from jobscheduler. Each pull request updates the documents named wit
    Docs: `docs/deploy/kbf-modes.md`.
 3. **Farm: Linux daemons get no lease under `--executor js-agent`** (8.2) and its three tests. Docs: `kbf-modes.md`,
    `job-service-cutover.md`.
-4. **The executor switch** (8.1), by `kbf-deploy`. Arms A and B of section 10 are measured after it.
-5. **kbf-task-pack: `InputStats.from` read** (optional, `tree` or `fetched`) and counted by the ingest; the reader's
+4. **kbf-task: the Command's own mount and PID namespaces** (4.4): disk-backed `/tmp`, `/var/tmp` and `/run` bound from
+   `private/`, `/scratch` and `/run/js-files` out of its sight, the new `HOME` and cache paths, and the output walk's
+   `openat2` resolution; its tests. Docs: `kbf-modes.md` where it describes the task's environment.
+5. **The executor switch** (8.1), by `kbf-deploy`, after the no-op benchmark of section 10 (its gate). Arms A and B of
+   section 10 are measured after it.
+6. **kbf-task-pack: `InputStats.from` read** (optional, `tree` or `fetched`) and counted by the ingest; the reader's
    tests.
-6. **kbf-task: the input root at `/work`, `--inputs tree`, `JS_TREES_UNATTACHED`, the root check and writing
-   `InputStats.from`**, one release after item 5; the `kbf-task` tests. No job sends `--inputs tree` yet; the layout
+7. **kbf-task: the input root at `/work`, `--inputs tree`, `JS_TREES_UNATTACHED`, the root check and writing
+   `InputStats.from`**, one release after item 6; the `kbf-task` tests. No job sends `--inputs tree` yet; the layout
    change ships alone and runs on today's path. Docs: `docs/artifacts.md` and `kbf-modes.md` where they describe the
    task's layout.
-7. **tierstore pin** moved to a release with `tree_manifest` (a test dependency of item 9).
-8. **jobscheduler pin** moved to the release with js TI items 1 to 4 (`kbf-js-version.toml`, the workspace pins, the
-   fake taught `trees`, `INPUT_FAILED` and the spec echo, the field-set test).
-9. **kbf-front: the manifest writer**: `collect_closure` keeping the `Directory` messages, the index and presence
-   lookups in chunks, the manifests, the memo, the PUTs; no caller yet.
-10. **kbf-server executor: trees in the job**: 3.1, `executor-input-trees`, the counter, the rows of section 6, the
+8. **tierstore pin** moved to a release with `tree_manifest` (a test dependency of item 10).
+9. **kbf-server executor: the ingest gate** (section 5): a pack is promoted only after a result with state `SUCCEEDED`,
+   reason `EXIT`, exit 0 and no `input_failure`; its tests. It needs no new field to land: today's results already
+   carry the first three, and an absent `input_failure` reads as empty.
+10. **kbf-front: the manifest writer**: `collect_closure` keeping the `Directory` messages, the index and presence
+    lookups in chunks, the manifests, the memo, the `NodeProperties` check, the PUTs; no caller yet.
+11. **jobscheduler pin** moved to the release with js TI items 1 to 4 (`kbf-js-version.toml`, the workspace pins, the
+    fake taught `trees`, `INPUT_FAILED` and the spec echo, the field-set test).
+12. **kbf-server executor: trees in the job**: 3.1, `executor-input-trees`, the counter, the rows of section 6, the
     resubmit without trees; the executor tests. Docs: `kbf-modes.md`, `job-service-cutover.md`, `docs/api.md` (its
     `kbf_executor_*` metrics).
-11. **kbf-integration-test: the real-service tree cases** (beta).
-12. **The trees switch** (8.3), after the one-node run and `tierstore fs` on all six. Arms C and D after it.
-13. **The nodes move to `kbf storage`** (section 7, step 1), after one release with the executor switch on and no
+13. **kbf-integration-test: the real-service tree cases** (beta).
+14. **The trees switch** (8.3), after the one-node run, `tierstore fs` on all six and the cold first-byte measurement
+    of section 10. Arms C and D after it.
+15. **The nodes move to `kbf storage`** (section 7, step 1), after one release with the executor switch on and no
     rollback.
-14. **Delete the Linux container driver**, the daemon's Linux-only wiring and the placement filter of item 3, once no
+16. **Delete the Linux container driver**, the daemon's Linux-only wiring and the placement filter of item 3, once no
     unit selects `--driver container`. Docs: `kbf-modes.md`, `job-service-cutover.md`, `docs/artifacts.md`,
     `docs/design/daemon.md` where they describe the container driver.
 
-The measurements' results are written into this document when they exist; nothing waits on them.
+The measurements' results are written into this document when they exist. Two of them are gates: the no-op benchmark
+before the executor switch, and the cold first-byte measurement before the trees switch (8.1, 8.3).
 
 ## 12. Decisions
 
@@ -674,20 +752,50 @@ Each was not decided by the rulings or the two designs; the owner may overturn a
   a farm-wide mark on a shared toolchain root would take trees from every action that uses it.
 - **D15. `whole_machine` leases get no tree for now**: the order of the attach and the whole-host start is not
   designed by js TI (section 13).
+- **D16. The job's image is the kbf image for the first flip** (option a); each action in its own image with
+  `kbf-task` given as a read-only tree (option c) is a later design. Option b, a root file system nested inside the
+  job's, is not taken. Option c, and `JobSpec.trees` itself, change jobscheduler's public interface and go to the
+  owner's review of public interfaces (3.2).
+- **D17. The Command runs in its own mount and PID namespaces inside the job** (4.4): disk-backed `/tmp`, `/var/tmp`
+  and `/run` as under the daemon, the job's grants and `/scratch` out of its sight, every process of it ended before
+  its outputs are read, and the output walk resolved beneath `/work` by the kernel. It ships before the executor switch,
+  since the job's own `/tmp` is a small `noexec` tmpfs for both modes.
+- **D18. Outputs are promoted only from the job's result** (state `SUCCEEDED`, reason `EXIT`, exit 0, no
+  `input_failure`), never from a PUT: the task PUTs before the agent's detach can report a failed read.
+- **D19. Two measurements gate the two switches** (8.1, 8.3): the no-op benchmark and the cold first-byte latency, each
+  reported to the owner before the switch. Every other number of section 10 decides what to fix first.
 
-## 13. What this asks of jobscheduler
+## 13. What this asks of jobscheduler and tierstore
 
-All additive, for its tree build items or after:
+None of these is kbf code; each is a change for its own repository and design. jobscheduler, all additive, for its
+tree build items or after:
 
 - `stall_ms` in the public `JobResult` (the detach's answer), so kbf can tell a stall from the action's own timeout
   (section 6);
 - `Job.start_failure_detail` filled from the agent's refusal code (kbf#2287 item 1), so a refused tree can be told from
   a refused host;
 - a host to avoid on a job (a rerun's previous host), so a rerun of an input failure goes elsewhere (section 6);
-- how the attach orders with a whole-host start, so `whole_machine` leases can have trees (D15).
+- how the attach orders with a whole-host start, so `whole_machine` leases can have trees (D15);
+- **a prefetch inside the preparing stage**: the agent attaches with `prefetch all` (ts 6.5) and waits for it, under
+  the preparing bound the wall limit does not count, so fill time stops being charged to the action (section 6);
+- **digest authorization**: a tree digest is today the only credential for reading what it names, and a manifest's
+  `source` may name any key of the store. The server should accept a tree from a client only within what that client
+  may read (and tierstore's fill socket should take sources only from a prefix tied to the writer), so that one
+  client of the job service cannot read another's blobs by naming a digest or writing a manifest;
+- **a low-water stop at run time**: the scratch volume is shared with tierstore's cache and nothing bounds a job's
+  writes (no quota, O4); `--scratch-low-water-gib` is checked at admission only. When free space falls below it while
+  jobs run, the agent should stop the job that is growing and report a reason of its own, so one runaway action does
+  not turn into `EIO` in every other job on the node. This is not a quota.
 
-tierstore: nothing new. kbf relies on the manifest format of ts 6.1 as merged, `cas/l/<sha256>` for manifests and
-large objects, and ranged `source`s into kbf's packs.
+tierstore:
+
+- **refuse at attach, not during the job**, when a tree's flattened manifests or its pins would pass the node's memory
+  or `pin_limit`: many large distinct trees at once must give `tree-unavailable` (the fetch fallback), never an `EIO`
+  in a running job;
+- the fill-source restriction above, on its side.
+
+kbf relies on the manifest format of ts 6.1 as merged, `cas/l/<sha256>` for manifests and large objects, and ranged
+`source`s into kbf's packs.
 
 ## 14. macOS later, and other open points
 
@@ -703,7 +811,7 @@ large objects, and ranged `source`s into kbf's packs.
 
 - **Collecting `cas/l/`.** Nothing deletes there today, manifests included. A collector must not delete a manifest or a
   blob an attached tree uses (ts 6.1); its design belongs with storage retention.
-- **`kbf-task-pack` refuses unknown fields** in a manifest, which is why item 5 must ship before item 6. Making its
+- **`kbf-task-pack` refuses unknown fields** in a manifest, which is why item 6 must ship before item 7. Making its
   readers skip unknown members, as B8 asks of readers, is a change of its own.
 - **The farm's virtual workers** bound kbf's in-flight work by configured shapes, not by the pool's real capacity;
   unchanged here.
