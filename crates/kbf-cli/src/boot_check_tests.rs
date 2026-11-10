@@ -179,17 +179,18 @@ fn the_database_of_an_installer_toml_is_a_step_or_none_or_an_error_without_the_u
 }
 
 /// Asserts that a `database` URL that carries a password (in the user information or as a
-/// parameter), asks for TLS or is not a Postgres URL is refused with the file named and the
-/// reason, and that no refusal quotes the password or the host.
+/// parameter), asks for the one sslmode the store refuses (`allow`) or is not a Postgres URL
+/// is refused with the file named and the reason, that no refusal quotes the password or the
+/// host, and that a URL that asks for TLS is taken.
 #[test]
 fn a_url_that_cannot_be_used_is_refused_without_quoting_it() {
     let with_password = "postgres://kbf:hunter2@db/kbf";
     let as_parameter = "postgres:///kbf?host=/run/postgresql&password=hunter2";
-    let wants_tls = "postgres://db.example/kbf?sslmode=require";
+    let allow = "postgres://db.example/kbf?sslmode=allow";
     let refused = [
         (with_password, "carries a password", "hunter2"),
         (as_parameter, "carries a password", "hunter2"),
-        (wants_tls, "is not usable", "db.example"),
+        (allow, "is not usable", "db.example"),
         ("mysql://db.example/kbf", "is not usable", "db.example"),
     ];
     for (url, says, secret) in refused {
@@ -199,6 +200,8 @@ fn a_url_that_cannot_be_used_is_refused_without_quoting_it() {
         assert!(why.contains(says), "{url}: {why}");
         assert!(!why.contains(secret), "{url}: {why}");
     }
+    let tls = "database = \"postgres://db.example/kbf?sslmode=require\"\n";
+    assert!(database_in("installer.toml", tls).is_ok());
 }
 
 /// Asserts that a check that did something says it in one line on standard error and stands
