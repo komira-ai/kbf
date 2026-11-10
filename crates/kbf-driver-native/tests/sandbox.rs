@@ -392,6 +392,33 @@ async fn compiles_still_work_and_their_caches_stay_in_the_lease() {
     }
 }
 
+/// Has a process outside every action refused a write of `path` by a profile of its own,
+/// so the log holds a denial near the action's that is not the action's.
+fn refused_outside_the_action(path: &Path) {
+    // The sandbox compares real paths.
+    let parent = path
+        .parent()
+        .expect("a parent")
+        .canonicalize()
+        .expect("real path");
+    let real = parent.join(path.file_name().expect("a name"));
+    let profile = format!(
+        "(version 1)(allow default)(deny file-write* (literal {}))",
+        kbf_seatbelt::quoted(&real).expect("a path a profile can hold")
+    );
+    let status = std::process::Command::new(kbf_driver_native::network::SANDBOX_EXEC)
+        .args(["-p", &profile, "/usr/bin/touch"])
+        .arg(path)
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("sandbox-exec runs");
+    assert!(
+        !status.success(),
+        "the other process's write was not refused"
+    );
+    assert!(!path.exists(), "the other process's write went through");
+}
+
 /// The Xcodes on this runner, at most two: the lowest build and the highest.
 fn some_xcodes() -> Vec<(String, PathBuf)> {
     let all: Vec<(String, PathBuf)> = xcode::discover(
@@ -447,6 +474,12 @@ async fn the_xcode_an_action_names_is_the_one_it_runs() {
 /// from the unified log: the operation and the path. Control: the same action without a
 /// sandbox writes the file and gets no note, so the note is the sandbox's and not
 /// the driver's habit.
+///
+/// The host is never quiet: its own daemons are refused all the time (on the macOS 26
+/// runner, dozens of writes under `~/Library` in any minute), and just before the action
+/// runs this test has a process of its own, outside the action, refused a write of
+/// `other-<pid>`. Every denial the note lists must be the action's (it names the
+/// action's path), and the other process's path is never in it.
 #[tokio::test]
 async fn a_denied_write_is_named_in_the_failed_actions_stderr() {
     let dir = scratch("denials");
@@ -458,6 +491,8 @@ async fn a_denied_write_is_named_in_the_failed_actions_stderr() {
     let name = format!("denied-{}", std::process::id());
     let target = dir.join(&name);
     let script = format!("echo x > {} ; exit 1", target.display());
+    let other = format!("other-{}", std::process::id());
+    refused_outside_the_action(&dir.join(&other));
 
     let spec = Spec::sh(&script).env("PATH", PATH);
     let result = run(&sandboxed, &cas, 1, &spec).await.expect("ran");
@@ -469,11 +504,20 @@ async fn a_denied_write_is_named_in_the_failed_actions_stderr() {
         "no denial in stderr: {text}\n{}",
         support::sandbox_denials()
     );
-    let line = text
-        .lines()
-        .find(|l| l.starts_with("kbf:   ") && l.contains(&name))
+    let listed: Vec<&str> = text.lines().filter(|l| l.starts_with("kbf:   ")).collect();
+    let line = listed
+        .iter()
+        .find(|l| l.contains(&name))
         .unwrap_or_else(|| panic!("no denial names {name}: {text}"));
     assert!(line.contains("file-write-create"), "{line}");
+    assert!(
+        listed.iter().all(|l| l.contains(&name)),
+        "a denial that is not the action's is listed: {text}"
+    );
+    assert!(
+        !text.contains(&other),
+        "the other process's denial is listed: {text}"
+    );
 
     let result = run(&open, &cas, 2, &spec).await.expect("ran");
     let text = stderr(&cas, &result);
