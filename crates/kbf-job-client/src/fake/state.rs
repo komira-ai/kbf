@@ -110,8 +110,12 @@ fn live(state: JobState) -> bool {
     state == JobState::Queued || on_host(state)
 }
 
+/// The name the service records on a job submitted with its `--token-file` token, the one
+/// token the fake takes (`Job.client`).
+pub const CLIENT: &str = "default";
+
 /// The job as a read answers it: the file contents empty, the host's silence shown while
-/// the job holds the host.
+/// the job holds the host, and the client that submitted it.
 fn view(record: &Record, hosts: &BTreeMap<String, Host>) -> Job {
     let mut spec = record.spec.clone();
     spec.files.iter_mut().for_each(|file| file.contents.clear());
@@ -129,6 +133,11 @@ fn view(record: &Record, hosts: &BTreeMap<String, Host>) -> Job {
         times: Some(record.times),
         host_silent_since_ms: silent,
         cancel_requested: record.cancel_requested,
+        client: Some(CLIENT.to_owned()),
+        queue_status: None,
+        attempts: 0,
+        events: Vec::new(),
+        dropped_events: 0,
     }
 }
 
@@ -450,11 +459,9 @@ impl State {
         })
     }
 
-    /// `CancelJob` (design section 5.3): a queued job is cancelled at once and keeps the
-    /// intent (`cancel_requested`), as the released service answers it; a job on a host gets
-    /// the intent and ends when the host reports it stopped; an ended job is unchanged. The
-    /// intent on a cancelled queued job follows the pinned release, until the service matches
-    /// `job.proto` (see the module docs).
+    /// `CancelJob` (design section 5.3): a queued job is cancelled at once, and has ended, so
+    /// it answers without the intent (`cancel_requested`); a job on a host gets the intent and
+    /// ends when the host reports it stopped; an ended job is unchanged.
     pub(super) fn cancel(&mut self, id: &str) -> Result<Job, Status> {
         self.sweep();
         let now = self.now_ms;
@@ -462,7 +469,6 @@ impl State {
         if record.state == JobState::Queued {
             record.reason = ResultReason::Cancelled;
             end(record, JobState::Cancelled, now);
-            record.cancel_requested = true;
         } else if on_host(record.state) {
             record.cancel_requested = true;
         }
@@ -490,15 +496,27 @@ impl State {
         })
     }
 
-    /// `GetLogs`: the tail held so far, of a live job too.
+    /// `GetLogs` without a stream (the one call the client makes): the job's state, and the
+    /// tails of its result once it has one; a live job answers empty tails. A stream, an
+    /// offset, a page size and a follow are not read.
     pub(super) fn logs(&mut self, id: &str) -> Result<GetLogsResponse, Status> {
         self.sweep();
         let record = self.jobs.get(id).ok_or_else(|| not_found(id))?;
+        let ended = !live(record.state);
         Ok(GetLogsResponse {
             state: record.state.into(),
-            stdout_tail: record.stdout.clone(),
-            stderr_tail: record.stderr.clone(),
-            truncated: record.truncated,
+            stdout_tail: if ended {
+                record.stdout.clone()
+            } else {
+                Vec::new()
+            },
+            stderr_tail: if ended {
+                record.stderr.clone()
+            } else {
+                Vec::new()
+            },
+            truncated: ended && record.truncated,
+            ..GetLogsResponse::default()
         })
     }
 

@@ -413,6 +413,9 @@ pub fn unreached(why: &Unreached, mode: Mode) -> SetupError {
         Unreached::Other(code) => format!(
             "the Postgres server answered the login with an error (SQLSTATE {code}); its log says why ({DOCS})"
         ),
+        Unreached::Tls(why) => format!(
+            "the connection to the Postgres server failed in TLS ({why}); setup connects through the Unix socket --database names, which takes no sslmode: give a URL without one ({DOCS})"
+        ),
     };
     SetupError::NeedsOperator(text)
 }

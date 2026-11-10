@@ -8,7 +8,8 @@
 //! - `calls`: every run appends a line, its name and its arguments joined by spaces;
 //! - `plan/<hash>`: what the container of the action whose digest has that hash does, one
 //!   line: `exit <n>` (it exits `n`) or `hold` (it runs until it is signalled, or until the
-//!   test hangs up); without the file it exits 0;
+//!   test hangs up); without the file it exits 0. A job that names no action (the cutover's
+//!   canary, the task tool with `--version` alone) follows `plan/no-action` ([`NO_ACTION`]);
 //! - `events.sock`: the test's listener, or a link to it (a socket's path is short, and the
 //!   link's target is what is dialled). The container of each run connects, sends one line,
 //!   `start <container name>` and the job's arguments, each after a tab, and keeps the
@@ -33,6 +34,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use serde_json::Value;
+
+/// The plan a job that names no `--action` follows: `plan/no-action`.
+pub const NO_ACTION: &str = "no-action";
 
 /// What `nft -j list table <family> <table>` prints: the listing of a table with nothing in
 /// it, which the agent reads back the same way every time.
@@ -283,8 +287,9 @@ fn container(bundle_dir: &Path, name: &str, root: &Path, place: &Place) -> Resul
         .map_err(|why| format!("joining {}: {why}", cgroup.display()))?;
     std::fs::create_dir_all(root).map_err(|why| format!("{}: {why}", root.display()))?;
     std::fs::write(root.join("pid"), &me).map_err(|why| format!("recording the pid: {why}"))?;
-    let action = after(&args, "--action").unwrap_or_default();
-    let hash = action.split('/').next().unwrap_or_default();
+    let hash = after(&args, "--action").map_or(NO_ACTION, |action| {
+        action.split('/').next().unwrap_or_default()
+    });
     let plan = std::fs::read_to_string(place.dir.join("plan").join(hash)).unwrap_or_default();
     let socket = place.dir.join("events.sock");
     let socket = std::fs::read_link(&socket).unwrap_or(socket);

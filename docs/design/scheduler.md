@@ -580,13 +580,13 @@ What the code does today:
   `--whole-node-drain-after-secs` (0), then holds the worker that will empty soonest: the
   one whose leases' longest wall times end first, then the fewest leases, then the lowest
   name. A wall time is the `timeout` of an action; one that names none (or zero) is taken
-  to end last. The hold is given up at its deadline,
-  `--whole-node-drain-deadline-secs` or, left out, the request's own wall time (an action
-  with no wall time and no such flag is never given up, so set the flag when clients may
-  send no timeout); the worker is then barred to the
-  request for `--whole-node-reserve-backoff-secs` (300) and another is held. After
-  `--whole-node-max-reserve-attempts` (2) give-ups the deadline is the wall time. No lease
-  is stopped. The caps: at most N workers whole (held or reserved) at once, at most
+  to end last. The hold has a deadline, `--whole-node-drain-deadline-secs` or, left out,
+  the request's own wall time (the end of time for an action with none), which says when
+  the worker is expected to be empty and gives nothing up: the hold stays until the request
+  is granted or cancelled, or the worker can no longer hold it.
+  `--whole-node-reserve-backoff-secs` and `--whole-node-max-reserve-attempts` are still read
+  and change nothing (kbf bars no worker after a failed prepare, and no hold is given up to
+  count). No lease is stopped. The caps: at most N workers whole (held or reserved) at once, at most
   `--whole-node-max-draining` (1) reserved while still running leases, at least
   `--whole-node-keep-for-ordinary` (1) workers left with neither, and no reservation on the
   last worker an older ordinary request could run on unless

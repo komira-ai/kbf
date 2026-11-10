@@ -554,6 +554,10 @@ impl Store for PlantedStore {
         Err(StoreError::Failed("planted".to_owned()))
     }
 
+    fn trim_feed(&self, _: Revision) -> Result<u64, StoreError> {
+        Err(StoreError::Failed("down".to_owned()))
+    }
+
     fn reap_expired(&self) -> Result<usize, StoreError> {
         Ok(0)
     }

@@ -13,7 +13,7 @@ use http::uri::PathAndQuery;
 use js_proto::v1::{
     CancelJobRequest, CancelJobResponse, GetJobRequest, GetJobResponse, GetLogsRequest,
     GetLogsResponse, GetResultRequest, GetResultResponse, Job, JobResult, JobSpec, ListJobsRequest,
-    ListJobsResponse, SubmitJobRequest, SubmitJobResponse,
+    ListJobsResponse, LogStream, SubmitJobRequest, SubmitJobResponse,
 };
 use prost::Message;
 use tonic::Status;
@@ -214,8 +214,10 @@ impl Client {
             .ok_or(Error::Decode(Undecodable::Missing("result")))
     }
 
-    /// The log tail held so far (`GetLogs`): of a running job too, and of an ended one for
-    /// its retention window. Each stream's tail is at most 8 KiB. Changes nothing.
+    /// The job's state and its result's log tails (`GetLogs` without a stream): of an ended
+    /// job for its retention window; a job that has not ended, or ended with no result (lost,
+    /// failed to start), answers empty tails. Each stream's tail is at most 8 KiB. Live output
+    /// is a stream read, which this client does not make. Changes nothing.
     ///
     /// # Errors
     /// `NOT_FOUND` for a job the service does not have or whose window has passed, and the
@@ -224,6 +226,10 @@ impl Client {
         checked(id)?;
         let request = GetLogsRequest {
             job_id: id.to_owned(),
+            stream: LogStream::Unspecified.into(),
+            from_offset: None,
+            max_bytes: None,
+            follow: None,
         };
         self.call(GET_LOGS, request).await
     }

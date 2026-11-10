@@ -37,7 +37,7 @@ const TOO_MANY_FOOTERS: &str = "--footer-concurrency: at most 64 footers can be 
 const PREFIX_SLASH: &str = "--source-prefix must be empty or end in /";
 
 const BAD_INDEX_URL: &str = "--pack-index: not a postgres:// URL this client can use (it \
-     needs a host and no TLS), as in postgres:///kbf?host=/run/postgresql";
+     needs a host, and an sslmode other than allow), as in postgres:///kbf?host=/run/postgresql";
 
 const INDEX_PASSWORD: &str = "--pack-index: the URL must carry no password (a command line \
      is world-readable); use the Unix socket with peer authentication, as in \

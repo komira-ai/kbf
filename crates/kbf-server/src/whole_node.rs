@@ -22,10 +22,9 @@ pub struct WholeNodeFlags {
     /// The ceiling is also at most the workers that serve whole-machine leases less
     /// `--whole-node-keep-for-ordinary`, and falls as workers leave. Left out, the
     /// scheduler books whole-machine requests as it always has, and the other
-    /// `--whole-node-*` flags are refused. A request's reservation is given up at its action's
-    /// timeout, and a client may send none: without `--whole-node-drain-deadline-secs` the
-    /// reservation of such a request is never given up (it ends when its worker is empty), so
-    /// set that flag when clients may send no timeout
+    /// `--whole-node-*` flags are refused. A request's reservation is never given up: it ends
+    /// when its worker is empty and the request is granted, or when the request is cancelled
+    /// or the worker can no longer hold it
     #[arg(
         long,
         value_name = "WORKERS",
@@ -68,11 +67,12 @@ pub struct WholeNodeFlags {
         requires = "whole_node_max"
     )]
     pub whole_node_drain_after_secs: u64,
-    /// How long, in seconds, a reservation may drain its worker before it is given up
-    /// (nothing running is stopped): the worker is barred to the request for
-    /// `--whole-node-reserve-backoff-secs` and another is reserved. Left out, the
-    /// request's longest wall time, the `timeout` of its action; an action that names
-    /// none has no wall time, and without this flag its reservation is never given up
+    /// How long, in seconds, a reservation is expected to drain its worker: the deadline
+    /// the queue document shows. Reaching it gives nothing up: the reservation stays until
+    /// the request is granted or cancelled, or the worker can no longer hold it, and nothing
+    /// running is stopped. Left out, the request's longest wall time, the `timeout` of its
+    /// action; an action that names none has no wall time, and its deadline is the end of
+    /// time
     #[arg(
         long,
         value_name = "SECONDS",
@@ -80,8 +80,10 @@ pub struct WholeNodeFlags {
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     pub whole_node_drain_deadline_secs: Option<u64>,
-    /// How long, in seconds, a worker stays barred to a request after the request gave
-    /// its reservation up. Default 300
+    /// How long, in seconds, a worker stays barred to a request after a failed prepare
+    /// there. kbf bars no worker this way and a reservation is never given up, so the
+    /// setting changes nothing; it is still read, so a configuration that names it starts.
+    /// Default 300
     #[arg(
         long,
         value_name = "SECONDS",
@@ -91,8 +93,9 @@ pub struct WholeNodeFlags {
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     pub whole_node_reserve_backoff_secs: u64,
-    /// The reservations a request gives up before its next one has the request's longest
-    /// wall time as its deadline, and so ends in a grant. Default 2
+    /// Deprecated: a reservation is never given up, so there is no attempt to count. Still
+    /// read, and refused at 0, so a configuration that names it starts; it changes nothing.
+    /// Default 2
     #[arg(
         long,
         value_name = "COUNT",

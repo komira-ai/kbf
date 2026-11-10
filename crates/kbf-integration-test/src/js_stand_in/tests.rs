@@ -358,6 +358,39 @@ fn a_jobs_container_reports_to_the_test_and_follows_its_plan() {
     }
 }
 
+/// Asserts that the container of a job that names no action (the cutover's canary: the task
+/// tool with `--version` alone) tells the test its arguments and follows the plan
+/// `no-action`. Catches a canary whose end the test cannot choose.
+#[test]
+fn a_job_with_no_action_follows_the_no_action_plan() {
+    let (dir, place) = place("stand-in-no-action");
+    let events = listen(&place);
+    std::fs::write(place.dir.join("plan").join(NO_ACTION), "exit 4\n").expect("a plan");
+    let config = json!({
+        "process": {"args": ["/dev/js-init", "--", "/bin/task", "--version"]},
+        "linux": {"cgroupsPath": "/agent/actions/c1/ctr"},
+    });
+    let bundle = bundle_at(dir.path(), "canary", &config);
+    let root = dir.path().join("root").display().to_string();
+    let running = {
+        let place = place.clone();
+        std::thread::spawn(move || {
+            call(
+                &place,
+                "crun",
+                &["--root", &root, "run", "--bundle", &bundle, "c1"],
+            )
+        })
+    };
+    let (stream, _) = events.accept().expect("the container connects");
+    let mut line = String::new();
+    BufReader::new(&stream)
+        .read_line(&mut line)
+        .expect("its line");
+    assert_eq!(line, "start\tc1\t/dev/js-init\t--\t/bin/task\t--version\n");
+    assert_eq!(running.join().expect("ran").code, 4);
+}
+
 /// Asserts that a job's container fails (125), saying where, when it cannot make or join its
 /// cgroup, record its process id, or reach the test. Catches a container that runs on
 /// although the agent or the test could not see it.

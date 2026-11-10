@@ -468,6 +468,9 @@ impl kbf_state::Store for FencedColdRows {
     ) -> Result<kbf_state::Changes, kbf_state::StoreError> {
         self.0.changes(after, limit)
     }
+    fn trim_feed(&self, before: kbf_state::Revision) -> Result<u64, kbf_state::StoreError> {
+        self.0.trim_feed(before)
+    }
     fn reap_expired(&self) -> Result<usize, kbf_state::StoreError> {
         self.0.reap_expired()
     }

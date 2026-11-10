@@ -889,7 +889,7 @@ jobs:
       - name: Build xtask
         run: cargo build -p xtask --locked
       - name: Build the real-service tests
-        run: cargo test -p kbf-integration-test --test js_real_service --test executor_real_service_integration --locked --no-run
+        run: cargo test -p kbf-integration-test --test js_real_service --test executor_real_service_integration --test cutover_real_service_integration --locked --no-run
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
         with:
@@ -912,3 +912,5 @@ jobs:
         run: cargo test -p kbf-integration-test --test js_real_service --locked -- --ignored
       - name: The host executor against the pinned job service and agent (as root)
         run: cargo xtask sudo-test -p kbf-integration-test --test executor_real_service_integration -- --test-threads=1 --nocapture
+      - name: kbf-deploy's job-service cutover and canary against the pinned job service and agent (as root)
+        run: cargo xtask sudo-test -p kbf-integration-test --test cutover_real_service_integration -- --test-threads=1 --nocapture

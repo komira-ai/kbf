@@ -14,8 +14,9 @@ fn parse(value: &str) -> Result<StateStoreUri, StateStoreUriError> {
 
 /// Catches: a value the design does not admit accepted (a `file://` store the server
 /// could not open), a relative or empty SQLite path (a database created wherever the
-/// process happens to run), a Postgres URL that this client cannot use (no host, TLS asked
-/// for) taken and failing only at the first connection, a Postgres URL not taken when it
+/// process happens to run), a Postgres URL that this client cannot use (no host,
+/// `sslmode=allow`) taken and failing only at the first connection, a URL that asks for TLS
+/// refused, a Postgres URL not taken when it
 /// is a Unix-socket one, and a refusal that carries any of the value (a mistyped
 /// Postgres URL holds its password).
 #[test]
@@ -34,6 +35,8 @@ fn a_sqlite_path_and_a_postgres_url_are_accepted_and_nothing_else() {
         "postgresql:///kbf?host=/run/postgresql",
         "postgres://kbf@/kbf?host=/run/postgresql",
         "postgres://db.example/kbf",
+        // TLS, which the state store's reader takes.
+        "postgres://db.example/kbf?sslmode=require",
     ] {
         assert!(
             matches!(parse(url), Ok(StateStoreUri::Postgres(_))),
@@ -44,7 +47,8 @@ fn a_sqlite_path_and_a_postgres_url_are_accepted_and_nothing_else() {
     for unusable in [
         "postgres://",
         "postgres:///kbf",
-        "postgres://kbf:hunter2@db/state?sslmode=require",
+        // The one sslmode the state store's reader refuses.
+        "postgres://kbf:hunter2@db/state?sslmode=allow",
         "postgres://kbf:hunter2@db:notaport/state",
     ] {
         let refused = parse(unusable).expect_err(unusable);

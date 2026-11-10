@@ -80,7 +80,7 @@ unit in the key and times are milliseconds since the Unix epoch.
       "operation": "op-12", "instance": "main", "digest": "<hash>/<size>",
       "state": "holding", "reason": "holding", "may_hold_in_ms": null,
       "worker": "node-a", "held_for_ms": 61000, "deadline_in_ms": 100000,
-      "give_ups": 1, "draining": true, "barred": [], "unservable": null
+      "give_ups": 0, "draining": true, "barred": [], "unservable": null
     }],
     "requests_total": 2
   }
@@ -92,13 +92,16 @@ unit in the key and times are milliseconds since the Unix epoch.
   `whole_summary`. `waiting` counts the queued whole-machine requests by `reason`, every
   reason present. `requests` lists them in queue order, at most 100 of `requests_total`.
   `state` is `early` (before `--whole-node-drain-after-secs`: `may_hold_in_ms`), `holding`
-  (`worker`, `held_for_ms`, `deadline_in_ms` or `null` when the hold is never given up,
-  `give_ups`, `draining`: whether the worker still has leases), `barred` (`give_ups` and
-  `barred`, each worker with `until_in_ms`, `null` when the bar has no end), `stopped`, `queued` (nothing is recorded
+  (`worker`, `held_for_ms`, `deadline_in_ms`: when the worker is expected to be drained,
+  which does not end the hold, `give_ups`, `draining`: whether the worker still has leases),
+  `barred` (`give_ups` and `barred`, each worker with `until_in_ms`, `null` when the bar has no end), `stopped`, `queued` (nothing is recorded
   against it: it waits for a worker; the UI says "Waiting") or `unservable` (`unservable`
   is the scheduler's text, free-form, shown as it is and not to be matched on). `reason`
   is the `waiting` key: the state's name, and for `stopped` the cap (`cap_ceiling`,
   `cap_keep_for_ordinary`, `cap_max_draining`, `cap_per_consumer`) or `last_capable`.
   Times are milliseconds from the answer; fields a state does not have are `null`, and
-  `barred` is empty. The marks and waits are as of the last placement round.
+  `barred` is empty. `give_ups` is always 0: a hold is no longer given up at its deadline,
+  and stays until the request is placed or cancelled or the worker can no longer hold it;
+  the field is kept for readers that take it. The marks and waits are as of the last
+  placement round.
 

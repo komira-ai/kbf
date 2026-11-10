@@ -19,26 +19,27 @@
 //!   [`finish`](FakeJobServer::finish), [`fail_to_start`](FakeJobServer::fail_to_start),
 //!   [`refuse_start`](FakeJobServer::refuse_start) (with the agent's detail),
 //!   [`lose`](FakeJobServer::lose), [`host_stopped`](FakeJobServer::host_stopped). Cancel of a
-//!   queued job cancels it at once and marks it `cancel_requested`, as the released service
-//!   does; of a placed, starting or running job it records the intent and the job is cancelled
-//!   only at `host_stopped`; of an ended job it changes nothing. The mark on a cancelled queued
-//!   job is the pinned release's behaviour, not `job.proto`'s (which keeps the mark only until
-//!   the job ends, or on a job that ends lost); the service is to be changed to match the proto
-//!   (komira-ai/jobscheduler#773). When that release is pinned, the real-service comparison in
-//!   kbf-integration-test fails on this field, and the fake goes back to the proto's rule.
+//!   queued job cancels it at once, and the job, having ended, answers without
+//!   `cancel_requested`; of a placed, starting or running job it records the intent and the job
+//!   is cancelled only at `host_stopped`; of an ended job it changes nothing. The mark is kept
+//!   only until the job ends, or on a job that ends lost, as `job.proto` says and the service
+//!   answers.
 //! - **Results and logs are kept for the retention window** after a job ends, on the fake's
 //!   own clock ([`advance`](FakeJobServer::advance); nothing here reads a clock), seven days
 //!   unless [`set_retention`](FakeJobServer::set_retention) says otherwise. A job past it is
-//!   `NOT_FOUND` to every call. `GetResult` of a live job is `FAILED_PRECONDITION`; `GetLogs`
-//!   of a running job answers the tail so far ([`write_logs`](FakeJobServer::write_logs)), cut
-//!   to the last 8 KiB of each stream.
+//!   `NOT_FOUND` to every call. `GetResult` of a live job is `FAILED_PRECONDITION`. What a
+//!   running job writes ([`write_logs`](FakeJobServer::write_logs)) is kept as each stream's
+//!   last 8 KiB and shows in the result's tails, and in `GetLogs`, once the job has ended;
+//!   `GetLogs` of a live job answers its state with empty tails, as the service answers the
+//!   call without a stream (the one the client makes).
 //! - **Host silence shows on `GetJob`** ([`silence_host`](FakeJobServer::silence_host)) on
 //!   the placed, starting and running jobs of the host, and changes no state.
 //! - **A network level left unspecified is `none`**, as the released service records it: a
 //!   job submitted without one is answered with `NETWORK_LEVEL_NONE`, and the two are the same
 //!   job to a repeated submit.
 //! - **File contents are never returned**: every job a call answers has them empty.
-//! - **The bearer token ([`TOKEN`]) is required** on every call, else `UNAUTHENTICATED`.
+//! - **The bearer token ([`TOKEN`]) is required** on every call, else `UNAUTHENTICATED`. It
+//!   is the service's `default` client: every job a call answers names it in `Job.client`.
 //!
 //! A [`Fault`] breaks the next call in a way a real service or network can.
 //! [`calls`](FakeJobServer::calls) is every request the service handled, decoded; no
@@ -65,8 +66,8 @@ use tonic::{Code, Status};
 use crate::config::{Config, Token};
 use crate::{Client, ConfigError};
 
-pub use state::Machine;
 use state::State;
+pub use state::{CLIENT, Machine};
 
 /// The bearer token the fake accepts.
 pub const TOKEN: &str = "fake-job-server-token-0123456789abcdef";

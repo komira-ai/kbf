@@ -74,6 +74,7 @@ fn each_rule_of_fit_refuses_on_its_own() {
             os: "linux".to_owned(),
             arch: "x86_64".to_owned(),
             exec: ExecMode::Container.into(),
+            ..Constraints::default()
         }),
         ..spec("edge")
     };
@@ -279,18 +280,23 @@ fn each_end_has_its_state_and_reason() {
 #[test]
 fn a_tail_keeps_the_last_8_kib() {
     let mut state = state();
-    for id in ["out", "err"] {
+    for id in ["exact", "out", "err"] {
         state.submit(spec(id)).unwrap();
         assert!(state.place(id, "h") && state.start(id) && state.run(id));
     }
+    assert!(state.write_logs("exact", &[b'a'; TAIL], b""));
     assert!(state.write_logs("out", &[b'a'; TAIL], b""));
-    let logs = state.logs("out").unwrap();
-    assert_eq!((logs.stdout_tail.len(), logs.truncated), (TAIL, false));
     assert!(state.write_logs("out", b"z", b""));
+    assert!(state.write_logs("err", b"", &[b'e'; TAIL + 1]));
+    // The tails show once the job has ended.
+    for id in ["exact", "out", "err"] {
+        assert!(state.finish(id, 0));
+    }
+    let logs = state.logs("exact").unwrap();
+    assert_eq!((logs.stdout_tail.len(), logs.truncated), (TAIL, false));
     let logs = state.logs("out").unwrap();
     assert_eq!((logs.stdout_tail.len(), logs.truncated), (TAIL, true));
     assert_eq!(logs.stdout_tail.last(), Some(&b'z'));
-    assert!(state.write_logs("err", b"", &[b'e'; TAIL + 1]));
     let logs = state.logs("err").unwrap();
     assert_eq!((logs.stderr_tail.len(), logs.truncated), (TAIL, true));
 }
@@ -408,6 +414,7 @@ fn an_unknown_exec_number_matches_any_host() {
             os: String::new(),
             arch: String::new(),
             exec,
+            ..Constraints::default()
         }),
         ..spec(id)
     };
@@ -646,19 +653,19 @@ fn an_unspecified_network_level_is_recorded_as_none() {
     assert_eq!(job.spec.unwrap().network, 99);
 }
 
-/// Asserts the cancel intent on each way a cancel ends a job: a queued job cancelled keeps it,
-/// on the answer and on every later read, as the released service answers; a job cancelled on
-/// its host loses it once the host reports it stopped. Catches a fake that clears the intent
-/// of a queued job the service keeps (the real-service comparison), and one that keeps it on a
-/// job its host stopped.
+/// Asserts the cancel intent on each way a cancel ends a job: a queued job cancelled has
+/// ended and answers without it, on the answer and on every later read, as the service
+/// answers; a job cancelled on its host has it until the host reports it stopped, and loses it
+/// then. Catches a fake that keeps the intent on a queued job the service clears (the
+/// real-service comparison), and one that keeps it on a job its host stopped.
 #[test]
-fn a_cancelled_queued_job_keeps_the_intent() {
+fn a_cancelled_job_has_the_intent_only_until_it_ends() {
     let mut state = state();
     state.submit(spec("queued")).unwrap();
     let cancelled = state.cancel("queued").unwrap();
     assert_eq!(
         (cancelled.state(), cancelled.cancel_requested),
-        (JobState::Cancelled, true)
+        (JobState::Cancelled, false)
     );
     assert_eq!(state.cancel("queued").unwrap(), cancelled);
     assert_eq!(state.get("queued").unwrap(), cancelled);

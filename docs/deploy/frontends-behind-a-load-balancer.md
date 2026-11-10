@@ -103,10 +103,11 @@ Several frontends over one store are supported on `main` today:
   and lease sequences in the store, so a second frontend never hands out an id another
   took ([kbf-units.md](kbf-units.md), "The epoch, and a restore from a backup").
 
-The Postgres URL carries no password (kbf refuses one) and the client does not speak
-TLS to Postgres (an `sslmode=require` URL is refused). Reach the database by a local
-socket, or over a network on which only the frontends can reach it, with the server's
-role authorized by address.
+The Postgres URL carries no password (kbf refuses one). The client speaks TLS to Postgres
+when the URL asks for it (`sslmode=require`, or `verify-ca`/`verify-full` with
+`sslrootcert` naming the root certificates' PEM file; `sslmode=allow` is refused). Reach
+the database by a local socket, or over a network on which only the frontends can reach
+it, with the server's role authorized by address.
 
 **One object store.** The cold store is the storage nodes' (`--cold-store`). The
 frontends do not open it for blobs. If you run with build history, `--history-objects`

@@ -601,6 +601,9 @@ fn from_node_caps(
                 )
             })
             .collect(),
+        // The log's NodeCaps has no accelerator: no kbf daemon reports `accelerator.*`
+        // entries, so a node read back has none.
+        accelerator: None,
     })
 }
 

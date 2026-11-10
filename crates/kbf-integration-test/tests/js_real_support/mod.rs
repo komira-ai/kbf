@@ -21,8 +21,8 @@
 //! stays queued until the test cancels it, whenever a tick runs. No agent runs. Dropping the
 //! server kills and reaps the process; its directory goes after.
 //!
-//! [`RealJobServer::start_placing`] runs it for jobs that run: the same flags, the scheduler
-//! that places jobs (`--placement js-sched`) and the pool [`AGENT_POOL`], whose hosts
+//! [`RealJobServer::start_placing`] runs it for jobs that run: the same flags (the server's one
+//! placement, js-sched, places the jobs) and the pool [`AGENT_POOL`], whose hosts
 //! heartbeat four times a second, and no host of its own: the hosts are the agents a test
 //! starts ([`agent`]), and a job is placed on the next heartbeat of one of them.
 
@@ -214,7 +214,7 @@ impl RealJobServer {
     /// Starts the pinned server in a directory of its own named after `name`, and returns once
     /// it serves, with its one cordoned host registered.
     pub async fn start(name: &str) -> RealJobServer {
-        let server = RealJobServer::launch(name, POOL, &[]).await;
+        let server = RealJobServer::launch(name, POOL).await;
         server.register_cordoned_host().await;
         server
     }
@@ -222,10 +222,10 @@ impl RealJobServer {
     /// Starts the pinned server for jobs that run: jobs are placed on the agents that join
     /// [`AGENT_POOL`]. It has no host until an agent registers.
     pub async fn start_placing(name: &str) -> RealJobServer {
-        RealJobServer::launch(name, AGENT_POOL, &["--placement", "js-sched"]).await
+        RealJobServer::launch(name, AGENT_POOL).await
     }
 
-    async fn launch(name: &str, pool: &str, extra: &[&str]) -> RealJobServer {
+    async fn launch(name: &str, pool: &str) -> RealJobServer {
         let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), name);
         let binary = program("js-lease-server", &dir);
         let token = write(&dir, "token", TOKEN, 0o600);
@@ -233,7 +233,6 @@ impl RealJobServer {
         let pool = write(&dir, "pool.toml", pool, 0o644);
         let child = Command::new(&binary)
             .args(["--listen", "127.0.0.1:0", "--job-listen", "127.0.0.1:0"])
-            .args(extra)
             .arg("--state-file")
             .arg(dir.join("leases.toml"))
             .args(["--boot", "initialise", "--tick", "1h"])

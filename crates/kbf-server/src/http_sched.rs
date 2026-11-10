@@ -279,8 +279,8 @@ fn whole_body(view: &WholeView) -> Value {
                     worker,
                     made,
                     deadline,
-                    give_ups,
                     draining,
+                    tail_end: _,
                 } => {
                     fields.insert("state".into(), json!("holding"));
                     fields.insert("worker".into(), json!(worker.as_str()));
@@ -288,16 +288,16 @@ fn whole_body(view: &WholeView) -> Value {
                         "held_for_ms".into(),
                         json!(now.as_millis().saturating_sub(made.as_millis())),
                     );
-                    fields.insert(
-                        "deadline_in_ms".into(),
-                        deadline.map_or(Value::Null, |at| until(at, now)),
-                    );
-                    fields.insert("give_ups".into(), json!(give_ups));
+                    fields.insert("deadline_in_ms".into(), until(*deadline, now));
+                    // A hold no longer gives up at its deadline (it stays until the request is
+                    // placed or cancelled, or the worker can no longer hold it): the count a
+                    // reader of this field takes is always 0.
+                    fields.insert("give_ups".into(), json!(0));
                     fields.insert("draining".into(), json!(draining));
                 }
-                WholeState::Barred { workers, give_ups } => {
+                WholeState::Barred { workers } => {
                     fields.insert("state".into(), json!("barred"));
-                    fields.insert("give_ups".into(), json!(give_ups));
+                    fields.insert("give_ups".into(), json!(0));
                     let barred: Vec<Value> = workers
                         .iter()
                         .map(|(worker, end)| {

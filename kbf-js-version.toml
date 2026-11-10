@@ -20,22 +20,22 @@
 
 [release]
 repository = "komira-ai/jobscheduler"
-version = "0.1.179"
-commit = "9cf5b5a987e77aa39cac7c15a5dd4e635af4742c"
-signer_workflow = "komira-ai/jobscheduler/.github/workflows/release.yml"
+version = "0.1.218"
+commit = "0c104a1d3ecae641ed28bf9b46b0394daddc12a5"
+signer_workflow = "komira-ai/jobscheduler/.github/workflows/artifacts.yml"
 source_ref = "refs/heads/main"
 
 # The job service the tests drive.
 [[archive]]
 program = "js-lease-server"
 target = "x86_64-unknown-linux-musl"
-sha256 = "cd8759affe0f109b797695490d5a9e644f268659c7e70a8a422868ac1f57d4d5"
-attestation_log_index = 3722910151
+sha256 = "3a3ee336d96cc3384f0692518f2f24a0cdf353249f9081a8ebf0f383ce24188c"
+attestation_log_index = 3782503064
 
 # The host agent, which the cases that run a job need
 # (crates/kbf-integration-test/tests/executor_real_service_integration.rs).
 [[archive]]
 program = "js-agent"
 target = "x86_64-unknown-linux-musl"
-sha256 = "95fe12d5308c825e6351559ed350733cd4c335f302c01ff50a44a20686e64fcd"
-attestation_log_index = 3722910151
+sha256 = "46fa7b9462f9e4b0d41f25e739bc7e33bd8bb2e7258f70cf9a05e8c00e20b482"
+attestation_log_index = 3782503064

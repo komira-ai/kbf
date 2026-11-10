@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use kbf_front::{Cache, Submission};
-use kbf_sched::{Blocked, WholeReason, WholeState, WholeWait};
+use kbf_sched::{Bar, Blocked, WholeReason, WholeState, WholeWait};
 use kbf_state::fake::Fake;
 use kbf_types::{LeaseKind, OperationId};
 
@@ -167,6 +167,18 @@ impl Rig {
         self.farm.lock().sched.whole_state(operation)
     }
 
+    /// Bars `worker` to the whole-machine request `operation` with `bar`, as a caller that
+    /// learned from outside that the worker must not run it would (the scheduler bars no
+    /// worker itself, and gives no hold up), then runs a placement round.
+    async fn bar(&mut self, operation: OperationId, worker: &str, bar: Bar) {
+        self.farm
+            .lock()
+            .sched
+            .bar_whole(operation, WorkerId::new(worker), bar)
+            .expect("a whole-machine request");
+        self.beat().await;
+    }
+
     /// Fills each of the first two workers with one action: `long` (a wall time of ten
     /// minutes) is submitted first and so placed on the first worker, `short` (one minute)
     /// next and so on the second, which the order of the assertions pins.
@@ -182,11 +194,12 @@ impl Rig {
 /// Catches a whole-machine request that holds the first worker by name instead of the one
 /// that empties soonest (every worker's end bound is the wall time of the actions it runs,
 /// which the farm gives the scheduler with each submit), one that holds before
-/// `drain_after`, one that is never given up at its deadline, and a give-up that holds the
-/// worker just given up, or none. The cheapest worker is the second by name, so a farm that
-/// names no wall time (every bound then the same) holds the first and fails here.
+/// `drain_after`, and one that gives its hold up at its deadline: a drain never ends while
+/// the request waits, so past the deadline it still holds the worker it chose. The cheapest
+/// worker is the second by name, so a farm that names no wall time (every bound then the
+/// same) holds the first and fails here.
 #[tokio::test(start_paused = true)]
-async fn a_request_holds_the_cheapest_worker_after_drain_after_and_gives_up_at_its_deadline() {
+async fn a_request_holds_the_cheapest_worker_after_drain_after_and_keeps_it_past_its_deadline() {
     let mut rig = Rig::new(
         &[
             "--whole-node-max=2",
@@ -213,35 +226,35 @@ async fn a_request_holds_the_cheapest_worker_after_drain_after_and_gives_up_at_i
     let Some(WholeState::Holding {
         worker,
         made,
-        deadline: Some(deadline),
-        give_ups: 0,
+        deadline,
         draining: true,
+        ..
     }) = rig.whole_state(whole)
     else {
         panic!("not holding: {:?}", rig.whole_state(whole));
     };
     assert_eq!(worker, WorkerId::new("node-b"), "the cheapest worker");
     assert_eq!(deadline.as_millis(), made.as_millis() + 100_000);
-    // One round before the deadline it still holds node-b; at it, the hold is given up and
-    // node-a, the one that is left, is held (node-b is barred to this request).
-    rig.pass(Duration::from_secs(95)).await;
-    assert!(
-        matches!(
-            rig.whole_state(whole),
-            Some(WholeState::Holding { give_ups: 0, .. })
-        ),
-        "given up before its deadline"
-    );
-    rig.pass(Duration::from_secs(10)).await;
-    let Some(WholeState::Holding {
-        worker, give_ups, ..
-    }) = rig.whole_state(whole)
-    else {
-        panic!("not holding: {:?}", rig.whole_state(whole));
-    };
-    assert_eq!(worker, WorkerId::new("node-a"), "another worker");
-    assert_eq!(give_ups, 1);
-    assert_eq!(rig.farm.lock().sched.whole_give_ups(whole), 1);
+    // One round before the deadline and one past it, the request holds node-b as it was
+    // made: the deadline neither ends the hold nor moves it to node-a.
+    for (secs, when) in [(95, "before its deadline"), (10, "past its deadline")] {
+        rig.pass(Duration::from_secs(secs)).await;
+        let Some(WholeState::Holding {
+            worker: held,
+            made: held_made,
+            deadline: held_deadline,
+            draining,
+            ..
+        }) = rig.whole_state(whole)
+        else {
+            panic!("{when}: not holding: {:?}", rig.whole_state(whole));
+        };
+        assert_eq!(
+            (held, held_made, held_deadline, draining),
+            (WorkerId::new("node-b"), made, deadline, true),
+            "{when}"
+        );
+    }
 }
 
 /// The setups in which a second whole-machine request is stopped by a cap, with the cap.
@@ -338,15 +351,11 @@ async fn a_requests_wall_time_is_its_deadline() {
     let deadlines: Vec<_> = requests
         .iter()
         .map(|op| match rig.whole_state(*op) {
-            Some(WholeState::Holding {
-                made,
-                deadline: Some(deadline),
-                ..
-            }) => (
+            Some(WholeState::Holding { made, deadline, .. }) => (
                 deadline.as_millis() - made.as_millis(),
                 deadline.as_millis(),
             ),
-            other => panic!("{op:?} not holding with a deadline: {other:?}"),
+            other => panic!("{op:?} not holding: {other:?}"),
         })
         .collect();
     assert_eq!(deadlines[0].0, 100_000);
@@ -376,12 +385,7 @@ async fn a_caller_that_joins_keeps_the_wall_time_of_the_operation() {
         "joined none"
     );
     rig.pass(Duration::from_secs(10)).await;
-    let Some(WholeState::Holding {
-        made,
-        deadline: Some(deadline),
-        ..
-    }) = rig.whole_state(whole)
-    else {
+    let Some(WholeState::Holding { made, deadline, .. }) = rig.whole_state(whole) else {
         panic!("not holding: {:?}", rig.whole_state(whole));
     };
     assert_eq!(deadline.as_millis() - made.as_millis(), 100_000);
@@ -402,12 +406,7 @@ async fn the_drain_deadline_comes_before_the_wall_time() {
     );
     rig.submit(10, LeaseKind::Action, None);
     let whole = rig.submit(1, LeaseKind::WholeMachine, Some(Duration::from_secs(400)));
-    let Some(WholeState::Holding {
-        made,
-        deadline: Some(deadline),
-        ..
-    }) = rig.whole_state(whole)
-    else {
+    let Some(WholeState::Holding { made, deadline, .. }) = rig.whole_state(whole) else {
         panic!("not holding: {:?}", rig.whole_state(whole));
     };
     assert_eq!(deadline.as_millis() - made.as_millis(), 50_000);
@@ -533,8 +532,9 @@ async fn off_shows_no_whole_node_section_and_no_gauges() {
 /// farm's zero, not now), a field that is not the state's, and a request that loses its
 /// place: one node busy with a long action, two whole-machine requests asking to hold it
 /// for twenty seconds, `--whole-node-drain-after-secs=30`. Both are early; the first then
-/// holds the node and the second, which has nothing to hold, is queued; the first gives its
-/// hold up at its deadline and is barred from the node, which the second holds.
+/// holds the node and the second, which has nothing to hold, is queued; past its deadline the
+/// first still holds the node (a hold is not given up); barred from the node for five
+/// minutes, the first shows the bar and the second holds the node.
 #[tokio::test(start_paused = true)]
 async fn the_document_shows_early_holding_queued_and_barred_requests() {
     let mut rig = Rig::new(
@@ -589,10 +589,32 @@ async fn the_document_shows_early_holding_queued_and_barred_requests() {
         &item(
             first,
             1,
+            "holding",
+            "holding",
+            json!({
+                "worker": "node-a", "held_for_ms": 20_000, "deadline_in_ms": 0,
+                "give_ups": 0, "draining": true
+            })
+        ),
+        "kept past its deadline"
+    );
+    assert_eq!(
+        shown(&section, second),
+        &item(second, 2, "queued", "queued", json!({}))
+    );
+
+    let until = FarmTime::from_millis(rig.farm.now().as_millis() + 300_000);
+    rig.bar(first, "node-a", Bar::Until(until)).await;
+    let section = document(&rig);
+    assert_eq!(
+        shown(&section, first),
+        &item(
+            first,
+            1,
             "barred",
             "barred",
             json!({
-                "give_ups": 1,
+                "give_ups": 0,
                 "barred": [{"worker": "node-a", "until_in_ms": 300_000}]
             })
         )
@@ -796,8 +818,8 @@ fn agree(rig: &Rig) -> kbf_sched::WholeSummary {
 /// Catches a summary in the document or a gauge that differs from the scheduler's own
 /// `whole_summary`, and a gauge that does not move when requests change state or does not
 /// fall back to zero: at each step of one node, two whole-machine requests (early, one
-/// holding and one queued, one barred and one holding) the numbers and the count of every
-/// reason are compared with the scheduler's, and the counts are what the states are.
+/// holding and one queued, the first barred and the second holding) the numbers and the count
+/// of every reason are compared with the scheduler's, and the counts are what the states are.
 #[tokio::test(start_paused = true)]
 async fn the_summary_and_the_gauges_follow_the_scheduler() {
     let mut rig = Rig::new(
@@ -809,7 +831,7 @@ async fn the_summary_and_the_gauges_follow_the_scheduler() {
         &["node-a"],
     );
     rig.submit(10, LeaseKind::Action, Some(Duration::from_secs(600)));
-    rig.submit(1, LeaseKind::WholeMachine, Some(Duration::from_secs(20)));
+    let first = rig.submit(1, LeaseKind::WholeMachine, Some(Duration::from_secs(20)));
     rig.submit(2, LeaseKind::WholeMachine, Some(Duration::from_secs(20)));
     let counts =
         |rig: &Rig| -> Vec<(WholeReason, usize)> { agree(rig).waiting.into_iter().collect() };
@@ -839,6 +861,13 @@ async fn the_summary_and_the_gauges_follow_the_scheduler() {
         ]
     );
     rig.pass(Duration::from_secs(20)).await;
+    assert_eq!(
+        counts(&rig),
+        [(WholeReason::Holding, 1), (WholeReason::Queued, 1)],
+        "a hold is kept past its deadline"
+    );
+    let until = FarmTime::from_millis(rig.farm.now().as_millis() + 300_000);
+    rig.bar(first, "node-a", Bar::Until(until)).await;
     assert_eq!(
         counts(&rig),
         [(WholeReason::Holding, 1), (WholeReason::Barred, 1)]
@@ -889,47 +918,53 @@ async fn the_ceiling_is_the_schedulers_not_the_setting() {
     assert_eq!(section["whole_node"]["max_whole_node"], 3);
 }
 
-/// Catches a hold that is never given up shown with a deadline: after
-/// `--whole-node-max-reserve-attempts` give-ups the next hold has none, which the document
-/// shows as `null` (not 0, which would read as due now), with the give-up counted.
+/// Catches a hold with no deadline shown as due now, and a hold given up at its deadline or
+/// by the deprecated reservation settings: a request with no wall time holds with the end of
+/// time as its deadline, which the document shows as `null` (not 0), and one with a wall time,
+/// with `--whole-node-max-reserve-attempts=1` and a one-second back-off, still holds the same
+/// worker long past its deadline, with no give-up counted.
 #[tokio::test(start_paused = true)]
-async fn a_hold_that_is_not_given_up_again_has_a_null_deadline() {
-    let mut rig = Rig::new(
-        &[
-            "--whole-node-max=1",
-            "--whole-node-keep-for-ordinary=0",
-            "--whole-node-max-reserve-attempts=1",
-            "--whole-node-reserve-backoff-secs=1",
-        ],
-        &["node-a"],
-    );
-    rig.submit(10, LeaseKind::Action, Some(Duration::from_secs(600)));
-    let whole = rig.submit(1, LeaseKind::WholeMachine, Some(Duration::from_secs(20)));
-    rig.pass(Duration::from_secs(10)).await;
-    assert_eq!(shown(&document(&rig), whole)["deadline_in_ms"], 10_000);
-    rig.pass(Duration::from_secs(50)).await;
-    let section = document(&rig);
-    let request = shown(&section, whole);
-    assert_eq!(request["state"], "holding", "{request}");
-    assert_eq!(request["give_ups"], 1);
-    assert_eq!(request["deadline_in_ms"], Value::Null);
+async fn a_hold_is_kept_past_its_deadline_and_one_with_no_wall_time_has_a_null_deadline() {
+    for (wall, deadline_then) in [(None, Value::Null), (Some(20), json!(10_000))] {
+        let mut rig = Rig::new(
+            &[
+                "--whole-node-max=1",
+                "--whole-node-keep-for-ordinary=0",
+                "--whole-node-max-reserve-attempts=1",
+                "--whole-node-reserve-backoff-secs=1",
+            ],
+            &["node-a"],
+        );
+        rig.submit(10, LeaseKind::Action, Some(Duration::from_secs(600)));
+        let whole = rig.submit(1, LeaseKind::WholeMachine, wall.map(Duration::from_secs));
+        rig.pass(Duration::from_secs(10)).await;
+        assert_eq!(
+            shown(&document(&rig), whole)["deadline_in_ms"],
+            deadline_then,
+            "{wall:?}"
+        );
+        rig.pass(Duration::from_secs(50)).await;
+        let section = document(&rig);
+        let request = shown(&section, whole);
+        assert_eq!(request["state"], "holding", "{wall:?}: {request}");
+        assert_eq!(request["worker"], "node-a", "{wall:?}: {request}");
+        assert_eq!(request["held_for_ms"], 60_000, "{wall:?}: {request}");
+        assert_eq!(request["give_ups"], 0, "{wall:?}: {request}");
+    }
 }
 
-/// Catches a back-off with no end shown as a number: with a back-off of the longest
-/// possible length the bar's end is the end of time, and `until_in_ms` is `null`.
+/// Catches a bar with no end shown as a number: a worker barred for life to a request has the
+/// end of time as its bar's end, and `until_in_ms` is `null`.
 #[tokio::test(start_paused = true)]
 async fn a_bar_with_no_end_shows_a_null_until() {
     let mut rig = Rig::new(
-        &[
-            "--whole-node-max=1",
-            "--whole-node-keep-for-ordinary=0",
-            "--whole-node-reserve-backoff-secs=18446744073709551615",
-        ],
+        &["--whole-node-max=1", "--whole-node-keep-for-ordinary=0"],
         &["node-a"],
     );
     rig.submit(10, LeaseKind::Action, Some(Duration::from_secs(600)));
     let whole = rig.submit(1, LeaseKind::WholeMachine, Some(Duration::from_secs(20)));
-    rig.pass(Duration::from_secs(30)).await;
+    rig.pass(Duration::from_secs(5)).await;
+    rig.bar(whole, "node-a", Bar::ForLife).await;
     let section = document(&rig);
     let request = shown(&section, whole);
     assert_eq!(request["state"], "barred", "{request}");

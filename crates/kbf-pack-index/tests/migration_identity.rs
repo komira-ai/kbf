@@ -32,19 +32,23 @@ fn the_migration_is_what_an_existing_database_recorded() {
     assert_eq!(migration.kind(), Kind::Expand);
 }
 
-/// Asserts that the set a release embeds is the state store's migration followed by this
-/// one, numbered 1 and 2, and that the state store's own set stops at the first (so a caller
-/// that takes its set from the state store alone would not create the pack tables, which the
-/// tests of the callers pin by taking theirs from here).
+/// Asserts that the set a release embeds is the state store's first migration followed by
+/// this one, numbered 1 and 2, though the state store's own set goes on past the first (its
+/// migration 2, `writer_generation`, would take the number a database recorded for
+/// `pack_index`). Catches: the state store's whole set taken, which would renumber or rename
+/// what a deployed database has; a caller that took its set from the state store alone
+/// would not create the pack tables, which the tests of the callers pin by taking theirs from
+/// here.
 #[test]
-fn the_release_set_is_the_state_store_then_the_pack_index() {
+fn the_release_set_is_the_state_stores_first_then_the_pack_index() {
     let own = state_schema::embedded();
-    assert_eq!(own.len(), 1);
+    let own_named: Vec<(u32, &str)> = own.iter().map(|m| (m.version(), m.name())).collect();
+    assert_eq!(own_named, [(1, "state"), (2, "writer_generation")]);
+    assert_eq!(schema::STATE_STORE_UPTO, 1);
     let set = schema::embedded();
     let named: Vec<(u32, &str)> = set.iter().map(|m| (m.version(), m.name())).collect();
     assert_eq!(named, [(1, "state"), (2, "pack_index")]);
-    assert_eq!(&set[..1], own.as_slice());
+    assert_eq!(&set[..1], &own[..1]);
     assert_eq!(schema::latest(), 2);
     assert_eq!(state_schema::latest_of(&set), schema::latest());
-    assert_eq!(state_schema::latest(), 1);
 }

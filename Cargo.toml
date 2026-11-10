@@ -82,17 +82,17 @@ hyper-util = { version = "0.1.21", default-features = false }
 # (a lease id, say) is the same type in every kbf crate; a test in kbf-integration-test
 # reads Cargo.lock and refuses a second source. The revision is raised by a commit of its
 # own, holding only the raise and the fixes it forces, and the whole CI runs on it.
-js-agent-usage = { git = "https://github.com/komira-ai/jobscheduler", rev = "e73a5af2ec9ab54e2aeb131c1d8a4a6879a8abb5" }
-js-caps = { git = "https://github.com/komira-ai/jobscheduler", rev = "e73a5af2ec9ab54e2aeb131c1d8a4a6879a8abb5" }
-js-proto = { git = "https://github.com/komira-ai/jobscheduler", rev = "e73a5af2ec9ab54e2aeb131c1d8a4a6879a8abb5" }
-js-sched = { git = "https://github.com/komira-ai/jobscheduler", rev = "e73a5af2ec9ab54e2aeb131c1d8a4a6879a8abb5" }
-js-sim = { git = "https://github.com/komira-ai/jobscheduler", rev = "e73a5af2ec9ab54e2aeb131c1d8a4a6879a8abb5" }
-js-sizing = { git = "https://github.com/komira-ai/jobscheduler", rev = "e73a5af2ec9ab54e2aeb131c1d8a4a6879a8abb5" }
-js-state = { git = "https://github.com/komira-ai/jobscheduler", rev = "e73a5af2ec9ab54e2aeb131c1d8a4a6879a8abb5" }
-js-testkit = { git = "https://github.com/komira-ai/jobscheduler", rev = "e73a5af2ec9ab54e2aeb131c1d8a4a6879a8abb5" }
-js-types = { git = "https://github.com/komira-ai/jobscheduler", rev = "e73a5af2ec9ab54e2aeb131c1d8a4a6879a8abb5" }
-js-usage = { git = "https://github.com/komira-ai/jobscheduler", rev = "e73a5af2ec9ab54e2aeb131c1d8a4a6879a8abb5" }
-js-whole = { git = "https://github.com/komira-ai/jobscheduler", rev = "e73a5af2ec9ab54e2aeb131c1d8a4a6879a8abb5" }
+js-agent-usage = { git = "https://github.com/komira-ai/jobscheduler", rev = "0c104a1d3ecae641ed28bf9b46b0394daddc12a5" }
+js-caps = { git = "https://github.com/komira-ai/jobscheduler", rev = "0c104a1d3ecae641ed28bf9b46b0394daddc12a5" }
+js-proto = { git = "https://github.com/komira-ai/jobscheduler", rev = "0c104a1d3ecae641ed28bf9b46b0394daddc12a5" }
+js-sched = { git = "https://github.com/komira-ai/jobscheduler", rev = "0c104a1d3ecae641ed28bf9b46b0394daddc12a5" }
+js-sim = { git = "https://github.com/komira-ai/jobscheduler", rev = "0c104a1d3ecae641ed28bf9b46b0394daddc12a5" }
+js-sizing = { git = "https://github.com/komira-ai/jobscheduler", rev = "0c104a1d3ecae641ed28bf9b46b0394daddc12a5" }
+js-state = { git = "https://github.com/komira-ai/jobscheduler", rev = "0c104a1d3ecae641ed28bf9b46b0394daddc12a5" }
+js-testkit = { git = "https://github.com/komira-ai/jobscheduler", rev = "0c104a1d3ecae641ed28bf9b46b0394daddc12a5" }
+js-types = { git = "https://github.com/komira-ai/jobscheduler", rev = "0c104a1d3ecae641ed28bf9b46b0394daddc12a5" }
+js-usage = { git = "https://github.com/komira-ai/jobscheduler", rev = "0c104a1d3ecae641ed28bf9b46b0394daddc12a5" }
+js-whole = { git = "https://github.com/komira-ai/jobscheduler", rev = "0c104a1d3ecae641ed28bf9b46b0394daddc12a5" }
 # tierstore and objstore-s3 moved to the tierstore repository (https://github.com/komira-ai/tierstore).
 # Both are taken from it at this one revision. The revision is raised by a pull request of
 # its own that runs the whole CI, never along with other changes.
@@ -155,8 +155,9 @@ ruzstd = "0.9.1"
 runc = { version = "0.3.0", features = ["async"] }
 # The SQLite state store (kbf-state): the C library is compiled in (`bundled`), so the file
 # format and WAL behaviour do not depend on the host's libsqlite3; `hooks` for the commit
-# counter. No default features: no statement cache (hashlink) and no wasm shim.
-rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
+# counter. No default features: no wasm shim. The version is the one js-state takes (one
+# `libsqlite3-sys` links per build); js-state also turns on the statement cache (`cache`).
+rusqlite = { version = "0.41.0", default-features = false, features = ["bundled"] }
 # Directory-relative, no-follow file access (openat with O_NOFOLLOW) for reading outputs;
 # the effective uid, to check who owns the operator API token file (kbf-server).
 rustix = "1.1.5"

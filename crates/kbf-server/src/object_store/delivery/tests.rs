@@ -208,6 +208,9 @@ impl Store for Interleaved {
     fn changes(&self, after: Revision, limit: usize) -> Result<Changes, StoreError> {
         self.inner.changes(after, limit)
     }
+    fn trim_feed(&self, before: Revision) -> Result<u64, StoreError> {
+        self.inner.trim_feed(before)
+    }
     fn reap_expired(&self) -> Result<usize, StoreError> {
         self.inner.reap_expired()
     }

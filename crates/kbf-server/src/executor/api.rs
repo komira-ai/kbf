@@ -58,11 +58,12 @@ impl Api<'_> {
         self.within(self.client.get_result(id)).await
     }
 
-    /// The tails of the output of job `id`, by `GetLogs`: for a job that did not end well and
-    /// whose result holds no output ([`output`](super::output)). The service answers each
-    /// stream's last 8 KiB, which is the most of it the executor keeps. When `GetLogs` takes an
-    /// offset, this is the one place that asks for the last
-    /// [`OUTPUT_CAP`](super::output::OUTPUT_CAP) bytes by it instead.
+    /// The tails of the output of job `id`, by `GetLogs` without a stream: for a job that did
+    /// not end well and whose result holds no output ([`output`](super::output)). The service
+    /// answers the tails of the job's result (each stream's last 8 KiB, the most of it the
+    /// executor keeps), and none for a job with no result. `GetLogs` also reads a stream from an
+    /// offset, from the service's log store; this is the one place that would ask for the last
+    /// [`OUTPUT_CAP`](super::output::OUTPUT_CAP) bytes by it, and does not yet.
     pub(super) async fn logs_tail(&self, id: &str) -> Result<Tail, Error> {
         let logs = self.within(self.client.get_logs(id)).await?;
         Ok(Tail::of_logs(logs))

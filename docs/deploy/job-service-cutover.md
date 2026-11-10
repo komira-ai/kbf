@@ -210,7 +210,8 @@ FAIL: unauthorized: the job service at https://jobs.example:8443 refused the tok
 
 **Another answer** (exit 1): the service answered some other error, which the message quotes. An
 `UNIMPLEMENTED` answer usually means the address is a port of the lease server that does not serve
-the job service, such as its lease port (`--listen`), and not its `--job-listen`.
+the job service, such as its agent and status port (`--listen`; the server has no lease routes
+since jobscheduler's release 0.1.218), and not its `--job-listen`.
 
 **Refused** (exit 2, nothing is dialled): a `--url` that is not `http(s)://host[:port]`, or is
 `http` off the loopback; a token file that cannot be read or breaks the rules above; an `https`
