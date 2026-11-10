@@ -147,8 +147,10 @@ are configuration (the unit below, the certificate, and each agent's `--coordina
    otherwise every file in the bind mount fails to open, whatever its own mode. The state
    directory is mounted read-write and the rest read-only (`:ro`). The coordinator checks no
    mode on the directory: it must let uid 65532 create and rename files in it (the state file is
-   written as `desired.json.new`, mode 0600, and renamed over `desired.json`), and 0700 is the
-   least that does. The certificate and key are looked at again every 60 s
+   written as `desired.json.new`, mode 0600, and renamed over `desired.json`; its lock,
+   `desired.json.lock`, is made there too, and a second coordinator on the same directory is
+   refused while one runs: [kbf-updater.md](kbf-updater.md#updating-the-coordinator)), and 0700
+   is the least that does. The certificate and key are looked at again every 60 s
    (`--tls-reload-secs`), so a renewed pair is picked up without a restart.
 3. **Install the unit** [`kbf-coordinator-container.service`](../../packaging/container/kbf-coordinator/kbf-coordinator-container.service)
    as `/etc/systemd/system/kbf-coordinator.service`, replace `<commit>` and the placeholder

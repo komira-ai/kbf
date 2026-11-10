@@ -193,8 +193,10 @@ fn log_shows_it_late(file: &Path, window: Duration) -> io::Result<String> {
 
 /// Catches a report that reads the log once: a refusal the log shows seconds after it
 /// happened (the kernel-reported line of a slot user's denied write) never reaches
-/// stderr. Also that no read looks back less than the floor, and that reads stop at
-/// the first holding the action's own refusal.
+/// stderr. Also that each read looks back over the action's run and the wait since
+/// plus the margin and not minutes more (the whole host's log over a wide window is
+/// what made a read too slow on a busy runner), and that reads stop at the first
+/// holding the action's own refusal.
 #[tokio::test]
 async fn a_refusal_the_log_shows_late_is_still_in_stderr() {
     let (_dir, mut config, cas) = sandboxed("denials-late");
@@ -208,12 +210,16 @@ async fn a_refusal_the_log_shows_late_is_still_in_stderr() {
     assert!(text.contains("file-write-create /outside/mine\n"), "{text}");
     assert_eq!(LATE_READS.load(Ordering::SeqCst), 3);
     let windows = LATE_WINDOWS.lock().expect("windows").clone();
+    let margin = kbf_driver_native::denials::MARGIN;
+    // At least the margin, and never the two minutes of the old floor (the action and
+    // its 2 s of reads are over long before).
     assert!(
         windows
             .iter()
-            .all(|w| *w >= kbf_driver_native::denials::MIN_WINDOW),
+            .all(|w| *w >= margin && *w < Duration::from_secs(120)),
         "{windows:?}"
     );
+    assert!(windows.is_sorted(), "{windows:?}");
 }
 
 /// Reads 5 ms apart, for at most `give_up_ms`.
