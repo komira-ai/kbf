@@ -272,6 +272,7 @@ impl Farm {
             control_tls: control_tls.clone(),
             heartbeat_listen: "127.0.0.1:0".parse().expect("an address"),
             control_listen: "127.0.0.1:0".parse().expect("an address"),
+            health_listen: None,
             reload,
         };
         let (tx, rx) = tokio::sync::oneshot::channel();

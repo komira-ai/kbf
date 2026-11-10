@@ -18,6 +18,8 @@
 //! - [`service`]: the coordinator itself: heartbeats in, the desired state set by CI's OIDC
 //!   token, the status read by the operator token;
 //! - [`http`] and [`listen`]: the two HTTP surfaces and the TLS listeners under them;
+//! - [`health`]: the plain-HTTP health listener on loopback (`--health-listen`);
+//! - [`state_lock`]: one coordinator per state file, by an exclusive lock beside it;
 //! - [`config`]: the flags and the start.
 //!
 //! The wire types of the heartbeat and the reply are `kbf_updater::wire`.
@@ -37,6 +39,7 @@ pub mod defer;
 pub mod desired;
 pub mod fleet;
 pub mod halt;
+pub mod health;
 pub mod http;
 pub mod identity;
 pub mod listen;
@@ -46,6 +49,7 @@ pub(crate) mod ops_file;
 pub mod reconcile;
 pub mod service;
 pub mod services;
+pub mod state_lock;
 pub mod writes;
 
 #[cfg(test)]
@@ -80,6 +84,8 @@ mod generation_tests;
 mod halt_membership_tests;
 #[cfg(test)]
 mod halt_race_tests;
+#[cfg(test)]
+mod health_tests;
 #[cfg(test)]
 mod http_tests;
 #[cfg(test)]
@@ -122,6 +128,8 @@ mod rollback_tests;
 mod service_tests;
 #[cfg(test)]
 mod services_tests;
+#[cfg(test)]
+mod state_lock_tests;
 #[cfg(test)]
 mod status_service_tests;
 #[cfg(test)]
