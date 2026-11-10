@@ -1,6 +1,17 @@
-# Probe: how long the sandbox log reads take on a macOS 26 runner, cold and warm, how late a
-# denial reaches `log show` and `log stream`, and whether a profile's `(with message ...)`
-# reaches the log line. Measurement only; reverted before the change is reviewed.
+# What a pool action reaches of another slot (T026 M0): two pool users, two leases under the
+# driver's slot profile and a control with no sandbox, each cross-slot attempt recorded as a
+# `REACH` row (crates/kbf-driver-native/tests/slot_reach.rs). It asserts nothing about the
+# profile, only that the harness ran; the table in the log is the measurement the profile
+# change (M1) is decided on. The same test runs in beta.yml's native-macos job after a push
+# to main; this workflow runs it by hand on a branch first, so a probe change is measured
+# before it merges. A pull request does not run it (a pull request runs the fast gate of
+# ci.yml only; the macOS pool is small).
+#
+# The second job, `pool-spike`, is M0 of the Mac legs of the isolation suites (T018,
+# crates/kbf-daemon-test/tests/mac_pool_spike): the real daemon with a pool of two users as
+# root behind a fake front, and what the runner does for them (`launchctl asuser`, the
+# `user/<uid>` domain without a login, `security`, `pbcopy`, the lease directory), each fact a
+# `SPIKE` line. Also in beta.yml's native-macos job; here it runs by hand on a branch first.
 name: spike-slot-reach
 
 on:
@@ -8,77 +19,258 @@ on:
 
 permissions: {}
 
+concurrency:
+  group: spike-slot-reach-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  log-timing:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-26]
-    runs-on: ${{ matrix.os }}
+  slot-reach:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sw_vers
+      - run: uname -m
+      - run: rustup toolchain install
+      - name: Cross-slot reach of a pool action, sandboxed and not (root, real users)
+        run: cargo xtask sudo-test -p kbf-driver-native --test slot_reach -- --test-threads=1 --nocapture
+
+  # The usage a native lease reports on a Mac (crates/kbf-driver-native/src/usage.rs): a lease that
+  # holds 208 MiB and burns CPU for 1.5 s, as the daemon's user (the process-tree path) and as a pool
+  # user (the uid path, root). The `USAGE` lines carry the measured peak, CPU and wall time. Also run
+  # by beta.yml's native-macos job after a push to main; here by hand on a branch first.
+  native-usage:
+    runs-on: macos-latest
     timeout-minutes: 30
     permissions:
       contents: read
     steps:
-      - run: sw_vers; uptime; sysctl -n hw.ncpu hw.memsize; whoami
-      - name: probe
-        shell: bash
-        run: |
-          set +e
-          set -u
-          now() { perl -MTime::HiRes=time -e 'printf "%.3f\n", time'; }
-          P='sender == "Sandbox" OR subsystem == "com.apple.sandbox.reporting" OR eventMessage BEGINSWITH "Sandbox: " OR eventMessage CONTAINS "deny("'
-          timed() { local label="$1"; shift; local s e; s=$(now); "$@" > "$RUNNER_TEMP/out.txt" 2>"$RUNNER_TEMP/err.txt"; local rc=$?; e=$(now); echo "TIMING $label rc=$rc secs=$(echo "$e - $s" | bc) lines=$(wc -l < "$RUNNER_TEMP/out.txt") bytes=$(wc -c < "$RUNNER_TEMP/out.txt")"; head -c 300 "$RUNNER_TEMP/err.txt"; }
-          sudo du -sh /private/var/db/diagnostics /private/var/db/uuidtext 2>/dev/null
-          timed idle-120s-driver /usr/bin/log show --style compact --last 120s --predicate "$P"
-          N=$(sysctl -n hw.ncpu); PIDS=""; for i in $(seq 1 $((N*2))); do yes > /dev/null & PIDS="$PIDS $!"; done
-          timed loaded-120s-driver /usr/bin/log show --style compact --last 120s --predicate "$P"
-          timed loaded-10s-driver /usr/bin/log show --style compact --last 10s --predicate "$P"
-          kill $PIDS; wait $PIDS 2>/dev/null
-          echo "== sample of the driver predicate's lines"; /usr/bin/log show --style compact --last 120s --predicate "$P" | tail -n 15 | cut -c1-250
-          echo "== a denial: how long until log show has it"
-          mkdir -p /private/tmp/probe-d
-          T0=$(now); /usr/bin/sandbox-exec -p '(version 1)(allow default)(deny file-write* (subpath "/private/tmp/probe-d"))' /usr/bin/touch /private/tmp/probe-d/show-1; echo "touch rc=$? pid-unknown"
-          for i in $(seq 1 40); do if /usr/bin/log show --style compact --last 60s --predicate "$P" | grep -q 'probe-d/show-1'; then echo "SHOW-LATENCY found after $(echo "$(now) - $T0" | bc)s (try $i)"; break; fi; sleep 0.5; done
-          /usr/bin/log show --style ndjson --last 60s --predicate "$P" | grep 'probe-d/show-1' | head -n 2
-          echo "== log stream: readiness and arrival"
-          for round in 1 2 3; do
-            S="$RUNNER_TEMP/stream-$round.txt"
-            /usr/bin/log stream --style compact --predicate "$P" > "$S" 2>&1 &
-            SP=$!
-            TS=$(now)
-            /usr/bin/sandbox-exec -p '(version 1)(allow default)(deny file-write* (subpath "/private/tmp/probe-d"))' /usr/bin/touch /private/tmp/probe-d/r$round-immediate
-            for i in $(seq 1 100); do if [ -s "$S" ]; then echo "STREAM round $round first output after $(echo "$(now) - $TS" | bc)s"; break; fi; sleep 0.05; done
-            /usr/bin/sandbox-exec -p '(version 1)(allow default)(deny file-write* (subpath "/private/tmp/probe-d"))' /usr/bin/touch /private/tmp/probe-d/r$round-after-header
-            TH=$(now)
-            for i in $(seq 1 200); do if grep -q "r$round-after-header" "$S"; then echo "STREAM round $round after-header line arrived after $(echo "$(now) - $TH" | bc)s"; break; fi; sleep 0.05; done
-            sleep 0.3
-            /usr/bin/sandbox-exec -p '(version 1)(allow default)(deny file-write* (subpath "/private/tmp/probe-d"))' /usr/bin/touch /private/tmp/probe-d/r$round-later
-            sleep 3
-            kill $SP; wait $SP 2>/dev/null
-            echo "STREAM round $round: immediate=$(grep -c "r$round-immediate" "$S") after-header=$(grep -c "r$round-after-header" "$S") later=$(grep -c "r$round-later" "$S") total-lines=$(wc -l < "$S")"
-            head -n 3 "$S" | cut -c1-250; grep "probe-d" "$S" | cut -c1-250
-          done
-          echo "== logger probe through the stream"
-          S="$RUNNER_TEMP/stream-logger.txt"
-          /usr/bin/log stream --style compact --predicate "$P OR (process == \"logger\" AND eventMessage CONTAINS \"kbf-ready-\")" > "$S" 2>&1 &
-          SP=$!; TS=$(now)
-          for i in $(seq 1 60); do /usr/bin/logger "kbf-ready-$i"; sleep 0.05; if grep -q "kbf-ready-" "$S"; then echo "LOGGER first seen after $(echo "$(now) - $TS" | bc)s, probe $i"; break; fi; done
-          sleep 1; kill $SP; wait $SP 2>/dev/null; head -n 4 "$S" | cut -c1-250
-          echo "== with message"
-          S="$RUNNER_TEMP/stream-msg.txt"
-          /usr/bin/log stream --style compact --predicate "$P" > "$S" 2>&1 &
-          SP=$!; sleep 2
-          mkdir -p /private/tmp/probe-m
-          /usr/bin/sandbox-exec -p '(version 1)(allow default)(deny file-write* (subpath "/private/tmp/probe-m") (with message "kbf-marker-1234"))' /usr/bin/touch /private/tmp/probe-m/x; echo "with-message rc=$?"
-          sleep 4; kill $SP; wait $SP 2>/dev/null
-          cat "$S" | cut -c1-400
-          /usr/bin/log show --style ndjson --last 30s --predicate 'eventMessage CONTAINS "kbf-marker" OR eventMessage CONTAINS "probe-m"' | head -n 3
-          echo "== stream as root"
-          S="$RUNNER_TEMP/stream-root.txt"
-          sudo /usr/bin/log stream --style compact --predicate "$P" > "$S" 2>&1 &
-          SP=$!; sleep 2
-          /usr/bin/sandbox-exec -p '(version 1)(allow default)(deny file-write* (subpath "/private/tmp/probe-d"))' /usr/bin/touch /private/tmp/probe-d/root-1
-          sleep 3; sudo pkill -f "log stream --style compact" ; sleep 1
-          grep -c "root-1" "$S"; head -n 2 "$S" | cut -c1-200
-          echo "== cold again: a second kind of read"
-          timed final-120s-driver /usr/bin/log show --style compact --last 120s --predicate "$P"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sw_vers
+      - run: uname -m
+      - run: rustup toolchain install
+      - name: Usage of a lease run as a process tree
+        run: cargo test -p kbf-driver-native --test tree --locked -- usage --nocapture
+      - name: Usage of a lease run as a pool user (root, real users)
+        run: cargo xtask sudo-test -p kbf-driver-native --test slots -- usage --test-threads=1 --nocapture
+
+  # A descriptor another thread opens while a program is being started must not reach it
+  # (crates/kbf-installer/src/run.rs, the sweep in the child). The race test, then the fetch
+  # end-to-end test that once saw a stray descriptor, 20 times over.
+  child-descriptors:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sw_vers
+      - run: uname -m
+      - run: rustup toolchain install
+      - name: Descriptors of the child, in the run module
+        run: cargo test -p kbf-installer --locked --lib -- run::tests --nocapture
+
+  pool-spike:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sw_vers
+      - run: uname -m
+      - run: rustup toolchain install
+      # The daemon the test starts is found beside the test binary.
+      - run: cargo build -p kbf-cli --bin kbf --locked
+      - name: What the runner does for a root daemon with a pool of two users (root, real users)
+        run: cargo xtask sudo-test -p kbf-daemon-test --test mac_pool_spike -- --test-threads=1 --nocapture
+
+  # How a Mac behaves with a pool of 100 and of 1000 users (a measurement spike for the pool
+  # and reset design): as root on a hosted Mac, make the users `kbf-scale-<i>` in the uid
+  # block 61000 to 62023, time their creation, the first `getpwnam` that sees each, the
+  # pool's per-user check and opendirectoryd lookups before and after, time one full reset
+  # (`Slot::release`) for a sample of 20, and remove every user, home and /var/folders entry
+  # made, whatever the result (crates/kbf-driver-native/tests/pool_scale_spike). The log
+  # carries `MEASURE` lines and a closing `SUMMARY`; the test asserts only that the harness
+  # ran and left nothing behind. It makes up to 1000 real users and takes most of an hour,
+  # so it has a limit of its own. This workflow's `cancel-in-progress: true` would cancel a
+  # run in its clean-up when a second dispatch starts on the branch; do not dispatch it
+  # twice.
+  pool-scale:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sw_vers
+      - run: uname -m
+      - run: rustup toolchain install
+      - name: Pool of 100 then 1000 hidden users, and one full reset for 20 (root, real users)
+        run: cargo xtask sudo-test -p kbf-driver-native --test pool_scale_spike -- --test-threads=1 --nocapture
+
+  # M2 of the Mac legs (crates/kbf-driver-native/tests/slot_clean.rs): the freshness
+  # scenario of the slot clean, and the mutant tests that run it with one step of the
+  # clean skipped and print which rows turn red. By hand on a branch, so what the mutants
+  # show on a Mac (the bootout's and the image detach's rows are printed, not asserted) is
+  # measured before the branch merges. The same command as the native-macos job of
+  # beta.yml runs after a push to main.
+  slot-clean-mutants:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sw_vers
+      - run: uname -m
+      - run: rustup toolchain install
+      - name: The slot clean and its mutants, on real users (root)
+        run: cargo xtask sudo-test -p kbf-driver-native --test slot_clean -- --test-threads=1 --nocapture
+      # The test binary, for a run of it on a Mac Studio: a launch daemon without Full
+      # Disk Access, which the hosted runner's agent is not.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
+        with:
+          name: slot-clean-test-darwin-arm64
+          path: target/debug/deps/slot_clean-*
+          retention-days: 14
+          if-no-files-found: error
+
+  # SIGTERM before SIGKILL (crates/kbf-driver-native/tests/slot_term.rs): a pool lease whose
+  # workload keeps POSIX shared memory and semaphores through a tracker process, ended while
+  # it runs, with the grace on (no name is left), with none (all are left) and in the clean of
+  # a slot; and a workload that ignores SIGTERM, named in the lease's stderr. The same command
+  # as the native-macos job of beta.yml runs after a push to main.
+  slot-term:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sw_vers
+      - run: uname -m
+      - run: rustup toolchain install
+      - name: Ending a pool lease with SIGTERM first (root, real users)
+        run: cargo xtask sudo-test -p kbf-driver-native --test slot_term -- --test-threads=1 --nocapture
+
+  # The profile canaries (crates/kbf-driver-native/tests/slot_canary.rs): refused under the
+  # real profile with their latency printed (`CANARY-LATENCY`), and red when the generated
+  # profile loses `(deny file-write*)` (`CANARY-WEAKENED`). The same command as the
+  # native-macos job of beta.yml runs after a push to main.
+  slot-canary:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sw_vers
+      - run: uname -m
+      - run: rustup toolchain install
+      - name: The profile canaries and the weakened profiles, on real users (root)
+        run: cargo xtask sudo-test -p kbf-driver-native --test slot_canary -- --test-threads=1 --nocapture
+
+  # The GPU state of a pool lease (crates/kbf-driver-native/tests/slot_gpu_clean.rs): a Metal run
+  # as a pool user, a second process holding its device, then the clean, and a check that none of
+  # it is left. The same command as the native-macos job of beta.yml runs after a push to main.
+  slot-gpu-clean:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sw_vers
+      - run: uname -m
+      - run: rustup toolchain install
+      - name: A pool lease's Metal state and the clean (root, real users)
+        run: cargo xtask sudo-test -p kbf-driver-native --test slot_gpu_clean -- --test-threads=1 --nocapture
+      # The test binary the step above built, for a run by hand on a Mac with no Rust
+      # toolchain (it still needs root, swiftc and a Metal device).
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: slot-gpu-test-darwin-arm64
+          path: target/debug/deps/slot_gpu_clean-*
+          retention-days: 14
+          if-no-files-found: error
+
+  # The assertion that a pool user holds nothing a lease left
+  # (crates/kbf-driver-native/tests/slot_assert.rs): a clean user is green at every look,
+  # and each probe is red on the state planted for it and green after the clean. The same
+  # command as the slot_assert step of beta.yml's native-macos job runs after a push to main.
+  slot-assert:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sw_vers
+      - run: uname -m
+      - run: rustup toolchain install
+      - name: The assertion and its positive controls, on real users (root)
+        run: cargo xtask sudo-test -p kbf-driver-native --test slot_assert -- --test-threads=1 --nocapture
+
+  # The GPU under the slot profile (crates/kbf-driver-native/tests/slot_gpu.rs): a pool user
+  # finds a Metal device, compiles a kernel at run time and runs it on the GPU, and each
+  # deny that takes the GPU away fails the probe at its step (`GPU-STAGE` lines). The runner
+  # is a virtual machine with a paravirtual GPU, not a farm Mac. The same command as the
+  # native-macos job of beta.yml runs after a push to main.
+  slot-gpu:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sw_vers
+      - run: uname -m
+      - run: rustup toolchain install
+      - name: What this Mac reports of its GPU (the detection the daemon runs)
+        run: cargo test -p kbf-daemon --lib --locked -- this_mac_reports_its_gpu --nocapture
+      - name: The GPU under the slot profile, on real users (root)
+        run: cargo xtask sudo-test -p kbf-driver-native --test slot_gpu -- --test-threads=1 --nocapture
+
+  # kbf-mac-provision on a real Mac, as root (crates/kbf-mac-provision/tests/as_root.rs), with
+  # the pool test that feeds `dscl .` a batch on standard input and reads `dscl -readall`. The
+  # same command as the native-macos job of beta.yml runs after a push to main.
+  mac-provision:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sw_vers
+      - run: uname -m
+      - run: rustup toolchain install
+      - name: The provisioning verbs and the pool batch on real directory records (root)
+        run: cargo xtask sudo-test -p kbf-mac-provision --test as_root -- --test-threads=1 --nocapture
