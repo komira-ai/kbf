@@ -375,3 +375,50 @@ async fn a_failing_beat_read_ages_the_copy_and_the_next_good_one_restores_it() {
     assert_eq!(deny_rows_failing(&checks).await, None);
     sweeper.abort();
 }
+
+/// `GET /readyz` on the health router over these checks: the status and the JSON body.
+async fn get_readyz(checks: Arc<Checks>) -> (axum::http::StatusCode, serde_json::Value) {
+    use tower_service::Service as _;
+    let mut router = crate::health::router_of(checks);
+    let request = axum::http::Request::builder()
+        .uri("/readyz")
+        .body(axum::body::Body::empty())
+        .expect("a request");
+    let answer = router.call(request).await.expect("an answer");
+    let code = answer.status();
+    let bytes = axum::body::to_bytes(answer.into_body(), usize::MAX)
+        .await
+        .expect("a body");
+    (code, serde_json::from_slice(&bytes).expect("a JSON body"))
+}
+
+/// Through the mounted `/readyz` route: 503 with exactly the `deny_rows` failure before any
+/// read of the rows, then 200 with nothing failing once a read has found them.
+///
+/// Catches: a `deny_rows` check that the probe reports but the route does not answer with.
+#[tokio::test]
+async fn readyz_answers_503_naming_deny_rows_until_the_rows_are_read() {
+    let members = members_over(Arc::new(Fake::with_flaw(
+        Arc::new(ManualClock::default()),
+        Flaw::None,
+    )));
+    let peers = certified().with_denied_rows(Some(Arc::clone(&members)));
+    let checks = Arc::new(probing(Checks::new(Arc::new(Readiness::default())), &peers));
+
+    let (code, body) = get_readyz(Arc::clone(&checks)).await;
+    assert_eq!(code, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["ready"], false);
+    assert_eq!(
+        body["failing"],
+        serde_json::json!([{
+            "check": "deny_rows",
+            "reason": "the worker listener refuses every call: the deny rows: no refresh has read them yet"
+        }])
+    );
+
+    members.refresh_denied().expect("read");
+    let (code, body) = get_readyz(checks).await;
+    assert_eq!(code, axum::http::StatusCode::OK);
+    assert_eq!(body["ready"], true);
+    assert_eq!(body["failing"], serde_json::json!([]));
+}
