@@ -5,8 +5,10 @@
 //! tool, started with `--version` alone: it needs no grant, no pack and no network, so it shows
 //! that the service takes kbf's token and places a job of the executor's shape, that a farm
 //! agent pulls the kbf image by its digest, and that the container starts and exits 0. It is
-//! given no network (`NETWORK_LEVEL_NONE`), 1 core, 1 GiB, a wall limit of [`WALL_SECS`], and
-//! the constraints of the executor's jobs (`linux`, `executor-arch`, containers).
+//! given no network (`NETWORK_LEVEL_NONE`), 1 core, 1 GiB of memory and no disk (the executor's
+//! jobs book none, so the canary is placed as they are, on a host whatever disk it reports), a
+//! wall limit of [`WALL_SECS`], and the constraints of the executor's jobs (`linux`,
+//! `executor-arch`, containers).
 //!
 //! **It carries no `kbf-frontend` label.** The executor reads that label to find another
 //! frontend's jobs and stops when it finds one; a canary with it would stop the frontend it
@@ -53,7 +55,7 @@ impl Canary {
             needs: Some(Needs {
                 cpu_millis: 1000,
                 memory_bytes: 1 << 30,
-                disk_bytes: Some(1 << 30),
+                disk_bytes: None,
                 ..Needs::default()
             }),
             constraints: Some(Constraints {

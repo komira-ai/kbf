@@ -102,7 +102,6 @@ impl Inputs for FakeInputs {
         Ok(ReadGrant {
             url: "https://grant.test:9400".to_owned(),
             token: Secret::new("read-token-0001"),
-            input_bytes: Some(0),
         })
     }
 }
@@ -205,10 +204,6 @@ impl Rig {
         cfg.insecure_argv_secrets = true;
         // The job's wall limit is the action's timeout: no margin is added.
         cfg.run_margin = Duration::ZERO;
-        // A job asks for 1 GiB of disk beside its output's, and the service wants a host whose
-        // scratch has that many whole GiB free: the node's scratch is on `/run`, a tmpfs (3.2 GiB
-        // on a hosted runner), which holds 1 GiB but not the 9 GiB of the default output disk.
-        cfg.output_disk_bytes = 0;
         let farm = Arc::new(Farm::new(
             Arc::new(Cache::memory()),
             kbf_sched::UNSERVABLE_WAIT,

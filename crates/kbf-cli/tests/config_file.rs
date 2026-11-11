@@ -336,6 +336,52 @@ fn a_label_key_is_refused_with_its_replacement() {
     }
 }
 
+/// Catches `executor-output-disk-bytes` (the scratch a job of the executor once booked; a job
+/// books no disk now) read again from a frontend's `kbf.toml`, or refused without naming it: in
+/// `[executor]`, where the template put it, with the default executor and with `js-agent`, the
+/// file exits 2 naming the key, the file and that the mode has no such flag. The same key given
+/// as a flag on the command line exits 2 naming the flag.
+#[test]
+fn the_output_disk_key_is_refused_naming_it() {
+    let dir = scratch("output-disk-key");
+    for executor in ["", "executor = \"js-agent\"\n"] {
+        let body = format!(
+            "[storage-client]\nstorage = \"http://127.0.0.1:1\"\n\n\
+             [executor]\n{executor}executor-output-disk-bytes = 8589934592\n"
+        );
+        let path = file(&dir, &body, 0o600);
+        let err =
+            kbf_cli::parse_with(argv(&["kbf", "frontend"], Some(&path)), None).expect_err(executor);
+        assert_eq!(err.exit_code(), 2, "{executor}");
+        let msg = err.to_string();
+        let want = format!(
+            "unknown key `executor.executor-output-disk-bytes` in {}: kbf has no flag \
+             --executor-output-disk-bytes in this mode",
+            path.display()
+        );
+        assert!(msg.contains(&want), "{executor}: {msg}");
+    }
+    let err = kbf_cli::parse_with(
+        argv(
+            &[
+                "kbf",
+                "frontend",
+                "--storage=http://127.0.0.1:1",
+                "--executor-output-disk-bytes=8589934592",
+            ],
+            None,
+        ),
+        None,
+    )
+    .expect_err("the flag");
+    assert_eq!(err.exit_code(), 2);
+    let msg = err.to_string();
+    assert!(
+        msg.contains("unexpected argument '--executor-output-disk-bytes'"),
+        "{msg}"
+    );
+}
+
 /// Catches a repeatable flag read as one value, and a switch read as a value: `server`
 /// (given once per frontend on the command line) is an array in the file, and a switch is
 /// `true` to turn it on and `false` to leave it off, refused for anything else.
