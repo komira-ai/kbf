@@ -1451,6 +1451,7 @@ dependencies = [
  "kbf-server",
  "kbf-transfer",
  "prost",
+ "prost-types",
  "rcgen",
  "serde",
  "serde_json",

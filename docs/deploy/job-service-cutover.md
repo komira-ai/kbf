@@ -392,7 +392,7 @@ after it once per `--poll-secs` until it ends:
   pack and no network: it shows that the service takes kbf's token and places a job of the
   executor's kind (`os=linux`, `executor-arch`, containers), and that a farm agent pulls the kbf
   image by its digest and runs it to exit 0.
-- **Its shape**: 1 core, 1 GiB of memory and 1 GiB of disk, no network
+- **Its shape**: 1 core, 1 GiB of memory and no disk (the executor's jobs book none), no network
   (`NETWORK_LEVEL_NONE`), a wall limit of 300 seconds. Its id is `kbf-canary-<seconds since
   the epoch>`, so every run makes a new job.
 - **Its label**: `kbf-canary=<frontend id>`, and no `kbf-frontend` label. The executor reads

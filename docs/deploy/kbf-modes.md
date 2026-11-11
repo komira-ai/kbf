@@ -129,11 +129,12 @@ actions of which size the farm may have in flight, and the job service decides w
 each job. A job is the kbf image (`--executor-kbf-image`), whose `ENTRYPOINT` is the task tool:
 the job's arguments are the tool's flags and nothing is mounted into the container. It needs the
 cores and memory the farm booked (the memory as the hard cap a daemon would set, 1.5 times the
-booking plus 512 MiB), the scratch of its inputs and outputs, a host of `os=linux` and
-`--executor-arch` (default `x86_64`) that runs containers, and a wall limit of the action's
-timeout plus the run margin. The kbf image is built from the base environment the actions'
-Commands see (`--executor-base-image`); both are named by digest, and the host pulls the kbf
-image. An action's `container-image` platform property names the base: an action that names
+booking plus 512 MiB), a host of `os=linux` and `--executor-arch` (default `x86_64`) that runs
+containers, and a wall limit of the action's timeout plus the run margin. It books no disk: the
+job carries no `disk_bytes`, so the job service places it on a host whatever scratch disk that
+host reports, and the job writes to its host's scratch with no quota. The kbf image is built from
+the base environment the actions' Commands see (`--executor-base-image`); both are named by
+digest, and the host pulls the kbf image. An action's `container-image` platform property names the base: an action that names
 another image is refused as invalid (the message names both), one that names none gets the base,
 and a tag is refused. It needs both image flags, and the job service (`--executor-job-url`,
 `https://`, or `http://` to loopback only; `--executor-job-token-file`, mode 0600 or 0400;
@@ -153,7 +154,10 @@ is rerun; `invalid-file` ends the action as invalid. `files` is refused with `--
 kbf-daemon`, which builds no command line. The executor no longer speaks to a lease server: the
 flags `--executor-lease-url`, `--executor-lease-token-file`, `--executor-lease-ca-file`,
 `--executor-lease-ttl-secs` and `--executor-class` are gone, and a frontend started with one (or
-a `kbf.toml` that names one) fails at start naming it.
+a `kbf.toml` that names one) fails at start naming it. `--executor-output-disk-bytes`, the scratch
+disk a job once asked for its outputs, is gone the same way, since a job books no disk: a frontend
+started with it, with either executor, or a `kbf.toml` whose `[executor]` table still has
+`executor-output-disk-bytes`, fails at start naming it; delete the flag or the key.
 
 Each farm lease is one job, whose id is made from the frontend id and the farm lease
 (`k<8 hex digits of the sha256 of the frontend id>-<term>-<seq>-<attempt>`): a `Start` the farm
@@ -162,7 +166,11 @@ action is submitted twice. A farm `Cancel` is a cancel of the job. How a job end
 farm's failure classes as the table in `crates/kbf-server/src/executor/outcome.rs` says: a job
 stopped at its wall limit is the action's own timeout, one stopped for memory is rerun with more,
 a lost job is the host's fault and rerun elsewhere, and a submit the service refuses because no
-host could ever run it ends the action as invalid. A whole-machine action
+host could ever run it ends the action as invalid. A job's pack is read, and its outputs
+promoted, only from a clean result: the job and its result both say succeeded, the result's
+reason is the job's exit and its exit code is 0. Any other ending, a result that leaves out its
+exit code included, leaves the pack unread however complete it is, and the farm runs the action
+again (or answers it, as the table says). A whole-machine action
 (`kbf-lease=whole_machine`) is one job too: each virtual worker lists the `container` and
 `native-whole-machine` drivers, so the farm places it on a worker it books whole, and the job
 needs the whole host and nothing beside it (no cores, memory or disk of its own: the host's are
@@ -208,8 +216,6 @@ start, and the jobs seen on a host that missed its grace. The remaining settings
 `--executor-host-slots` (default 8), `--executor-run-margin-secs` (300; what a job's wall limit
 adds to the action's timeout), `--executor-max-run-secs` and `--executor-default-timeout-secs`
 (3000), `--executor-call-timeout-secs` (5), `--executor-work-dir` (for the task tool),
-`--executor-output-disk-bytes` (8 GiB; the scratch disk a job needs for its outputs, the pack and
-its private home, on top of the bytes of its inputs and a fixed 1 GiB margin),
 `--executor-allow-plain-http-put` (until the store serves TLS), and
 `--executor-allow-plain-http-grant` (a read listener without TLS, on a farm's own network; both
 plain-http flags are off by default), and `--executor-locate` (off by default: the task is given

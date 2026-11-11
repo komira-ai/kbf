@@ -98,7 +98,7 @@ fn a_live_job_is_pending() {
 
 /// Behaviour: the canary is the kbf image's `--version`, with no network and no
 /// `kbf-frontend` label (the executor stops on another frontend's labelled job), on the
-/// executor's kind of host.
+/// executor's kind of host, needing 1 core and 1 GiB of memory and no disk.
 #[test]
 fn the_canary_job_has_no_network_and_no_frontend_label() {
     let spec = canary().spec();
@@ -119,9 +119,11 @@ fn the_canary_job_has_no_network_and_no_frontend_label() {
     assert_eq!(c.exec, i32::from(ExecMode::Container));
     let needs = spec.needs.unwrap();
     assert_eq!((needs.cpu_millis, needs.memory_bytes), (1000, 1 << 30));
+    assert_eq!(needs.disk_bytes, None, "the canary books no disk");
 }
 
-/// A service with one host the canary fits on.
+/// A service with one host the canary fits on, which reports no disk, as a host of a pool that
+/// books none.
 async fn served() -> FakeJobServer {
     let server = FakeJobServer::start().await.unwrap();
     server.add_host(
@@ -130,7 +132,7 @@ async fn served() -> FakeJobServer {
             shape: Shape {
                 cpu_millis: 4000,
                 memory_bytes: 16 << 30,
-                disk_bytes: Some(100 << 30),
+                disk_bytes: None,
                 ..Shape::default()
             },
             os: "linux".to_owned(),

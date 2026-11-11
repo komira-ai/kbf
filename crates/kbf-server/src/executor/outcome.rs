@@ -4,13 +4,25 @@
 //! not start, a code; nothing else. So the task tool's own exit status carries the contract:
 //! exit 0 means the action ran, whatever its own exit code, and the pack holds the rest. Any
 //! other ending says why the action did not run, and the farm runs it again or answers the
-//! caller. Each row's class is what the code below decides, and a test reads this table and
-//! holds the code to it:
+//! caller.
+//!
+//! **The promotion rule.** A job's pack is read, and its outputs promoted to CAS and
+//! action-cache entries, only from a clean result: the job's state is succeeded, and its
+//! result's state is succeeded, its reason is exit and its exit code is 0. A result that says
+//! anything else, or leaves any of it out, is not clean, however complete the pack the job
+//! already wrote: the pack is never read (its key is left to the janitor) and the farm is told
+//! the row's class. Nothing written to the store is promoted for having been written.
+//!
+//! Each row's class is what the code below decides, and a test reads this table and holds the
+//! code to it:
 //!
 //! | the job | class | the farm is told |
 //! |---|---|---|
-//! | succeeded (exit 0) | `ingest` | whatever the frontend's ingest of the pack says |
+//! | succeeded, its result succeeded, reason exit, exit code 0 | `ingest` | whatever the frontend's ingest of the pack says |
 //! | succeeded with a nonzero exit code | `infra` | `UNAVAILABLE`: infrastructure, rerun |
+//! | succeeded with no exit code | `infra` | `UNAVAILABLE`: not a clean result, rerun |
+//! | succeeded for a reason other than exit | `infra` | `UNAVAILABLE`: not a clean result, rerun |
+//! | succeeded, its result in another state | `infra` | `UNAVAILABLE`: not a clean result, rerun |
 //! | failed, reason wall limit | `timeout` | `DEADLINE_EXCEEDED`: the action's own timeout, since nothing cuts a job's wall limit |
 //! | failed, reason memory | `out-of-memory` | `RESOURCE_EXHAUSTED`, killed at its own limit (`MemoryKill::OwnLimit`): rerun with more memory |
 //! | failed, reason exit | `infra` | `UNAVAILABLE`: the task tool exited nonzero, rerun |
@@ -116,10 +128,7 @@ fn infra(job: &Job, what: &str) -> Verdict {
 /// The verdict on `job`, which has ended, with its `result`.
 pub(super) fn judge(job: &Job, result: &JobResult) -> Verdict {
     match job.state() {
-        JobState::Succeeded => match result.exit_code.unwrap_or(0) {
-            0 => Verdict::Ingest,
-            code => infra(job, &format!("the job succeeded with exit code {code}")),
-        },
+        JobState::Succeeded => promote(job, result),
         JobState::Failed => match result.reason() {
             ResultReason::WallLimit => Verdict::Settled(Settled::Timeout),
             ResultReason::Memory => Verdict::Settled(Settled::OutOfMemory),
@@ -139,6 +148,34 @@ pub(super) fn judge(job: &Job, result: &JobResult) -> Verdict {
         }
         JobState::FailedToStart => failed_to_start(job),
         _ => infra(job, "the job ended in a state this server does not know"),
+    }
+}
+
+/// The verdict on `job`, which succeeded, by the promotion rule: its pack is ingested only
+/// when `result` also says succeeded, for its exit, with exit code 0.
+fn promote(job: &Job, result: &JobResult) -> Verdict {
+    match (result.state(), result.reason(), result.exit_code) {
+        (JobState::Succeeded, ResultReason::Exit, Some(0)) => Verdict::Ingest,
+        (JobState::Succeeded, ResultReason::Exit, Some(code)) => {
+            infra(job, &format!("the job succeeded with exit code {code}"))
+        }
+        (JobState::Succeeded, ResultReason::Exit, None) => {
+            infra(job, "the job succeeded with no exit code")
+        }
+        (JobState::Succeeded, reason, _) => infra(
+            job,
+            &format!(
+                "the job succeeded for a reason other than its exit ({})",
+                reason.as_str_name()
+            ),
+        ),
+        (state, _, _) => infra(
+            job,
+            &format!(
+                "the job succeeded but its result says {}",
+                state.as_str_name()
+            ),
+        ),
     }
 }
 
