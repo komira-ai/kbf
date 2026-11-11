@@ -18,6 +18,8 @@ kbf-proto.workspace = true
 # sends and reads blobs exactly as a daemon does.
 kbf-transfer.workspace = true
 prost.workspace = true
+# The timestamps of a result's execution metadata.
+prost-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -29,6 +31,8 @@ tonic = { workspace = true, features = ["tls-ring"] }
 kbf-front.workspace = true
 kbf-server.workspace = true
 rcgen.workspace = true
+# The fake frontend's gate (`Barrier`), and tokio's paused clock for the times a run records.
+tokio = { workspace = true, features = ["sync", "test-util"] }
 
 [lints]
 workspace = true

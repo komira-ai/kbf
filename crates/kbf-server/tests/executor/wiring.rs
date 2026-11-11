@@ -68,7 +68,6 @@ impl RunPrepare for Preparing {
             grant_url: "https://grant.test:9400".to_owned(),
             grant_token: Secret::new("read-token"),
             not_after: since.as_secs() + wall.as_secs() + 600,
-            input_bytes: None,
         })
     }
 }
@@ -299,6 +298,7 @@ async fn an_action_runs_end_to_end_through_the_flags_and_the_frontends_own_seams
         packs: 1,
         large: vec![],
         inputs: None,
+        objects: None,
     };
     let pack = write_pack(&manifest, &[]).expect("a pack");
     let object = ObjectKey::new(pack_key).expect("an object key");

@@ -90,7 +90,6 @@ fn run(key: &str, not_after: u64) -> PreparedRun {
         grant_url: "https://grant.test:9400".to_owned(),
         grant_token: Secret::new("grant-token"),
         not_after,
-        input_bytes: Some(12_345),
     }
 }
 
@@ -278,11 +277,6 @@ async fn a_run_is_prepared_once_and_its_key_write_and_grant_are_handed_out_once(
         .expect("the grant");
     assert_eq!(grant.url, "https://grant.test:9400");
     assert_eq!(grant.token.expose(), "grant-token");
-    assert_eq!(
-        grant.input_bytes,
-        Some(12_345),
-        "the closure size is the grant's"
-    );
     let again = rig.front.read_grant(lease(), &action_digest(), wall).await;
     assert!(matches!(again, Err(InputsError::Unavailable(_))));
     assert!(rig.front.parked().is_empty(), "nothing is kept once used");
@@ -730,6 +724,7 @@ async fn a_pack_under_the_issued_key_becomes_the_actions_result() {
             packs: 1,
             large: vec![],
             inputs: None,
+            objects: None,
         };
         let pack = write_pack(&manifest, &[]).expect("a pack");
         let object = ObjectKey::new(key.as_str().to_owned()).expect("an object key");
@@ -789,6 +784,7 @@ fn manifest_of(build: &str, action: &Digest) -> TaskManifest {
         packs: 1,
         large: vec![],
         inputs: None,
+        objects: None,
     }
 }
 

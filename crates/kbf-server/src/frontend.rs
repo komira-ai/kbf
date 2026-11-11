@@ -954,7 +954,9 @@ impl<'a> Prepared<'a> {
             exclusive_actions: listeners.exclusive_actions,
         };
         let durable = state.is_some();
-        let farm = Farm::from_listeners(backend.clone(), &listeners).recording(recorder.clone());
+        let farm = Farm::from_listeners(backend.clone(), &listeners)
+            .recording(recorder.clone())
+            .with_executor(flags.executor.kind);
         crate::serve::log_core(&farm);
         crate::serve::log_exclusive(listeners.exclusive_actions);
         let farm = Arc::new(farm.with_state(state)?);

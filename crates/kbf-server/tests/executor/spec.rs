@@ -4,11 +4,11 @@
 use js_proto::v1::{ExecMode, NetworkLevel, Shape};
 use kbf_front::Finished;
 use kbf_job_client::fake::{Fault, Machine};
-use kbf_server::executor::{DISK_MARGIN, Delivery, MintError};
+use kbf_server::executor::{Delivery, MintError};
+use kbf_types::LeaseKind;
 use tonic::Code;
 
-use crate::real_prep::Log;
-use crate::rig::{GIB, INPUT_BYTES, Posted, Rig, machine, submits};
+use crate::rig::{Posted, Rig, machine, submits};
 
 const HOST: &str = "node1";
 
@@ -33,12 +33,13 @@ async fn submitted(rig: &mut Rig) -> Posted {
     rig.jobs_of(3).remove(0)
 }
 
-/// A host of the default machine whose scratch disk is `disk` bytes.
-fn host_with_disk(disk: u64) -> Machine {
+/// A host of the default machine that reports `disk` bytes of scratch disk (`None`: reports no
+/// disk at all).
+fn host_with_disk(disk: Option<u64>) -> Machine {
     let base = machine(64, "x86_64");
     Machine {
         shape: Shape {
-            disk_bytes: Some(disk),
+            disk_bytes: disk,
             ..base.shape.clone()
         },
         ..base
@@ -326,90 +327,50 @@ async fn only_hosts_of_the_reported_system_and_architecture_take_the_job() {
     }
 }
 
-/// Catches a job that needs the wrong scratch disk: the job carries the bytes of the input
-/// closure the grant reports, the operator's output allowance and the fixed margin, each once.
-/// The allowance is set to a number the default is not, so a job that ignores the config
-/// cannot match; the input bytes are not a whole GiB, so a sum that drops them cannot either.
+/// Catches a job that asks the job service for disk: neither a shared job nor a whole-host job
+/// carries `disk_bytes` (unset, not zero, so the service has no disk to place it by), whatever
+/// the host reports. The shared job still needs its CPU and memory, so the check is not about
+/// an empty `needs`.
 #[tokio::test(start_paused = true)]
-async fn a_job_needs_its_inputs_plus_the_output_allowance_plus_the_margin() {
-    let mut rig = Rig::start(&[HOST], 1, |cfg| cfg.output_disk_bytes = 5 * GIB + 7).await;
-    let job = submitted(&mut rig).await;
-    let needs = job.spec.needs.as_ref().expect("needs");
-    assert_eq!(
-        needs.disk_bytes,
-        Some(INPUT_BYTES + 5 * GIB + 7 + DISK_MARGIN)
-    );
+async fn no_job_books_disk() {
+    let mut rig = Rig::start(&[HOST], 1, |_| {}).await;
+    let shared = submitted(&mut rig).await;
+    let needs = shared.spec.needs.as_ref().expect("needs");
+    assert_eq!(needs.disk_bytes, None, "{needs:?}");
+    assert!(needs.cpu_millis > 0 && needs.memory_bytes > 0, "{needs:?}");
+    assert!(!needs.whole_host, "{needs:?}");
+
+    let mut rig = Rig::start(&[HOST], 1, |_| {}).await;
+    rig.pump().await;
+    let _caller = rig.submit_kind(4, LeaseKind::WholeMachine);
+    rig.pump().await;
+    let whole = rig.jobs_of(4).remove(0);
+    let needs = whole.spec.needs.as_ref().expect("needs");
+    assert_eq!(needs.disk_bytes, None, "{needs:?}");
+    assert!(needs.whole_host, "{needs:?}");
 }
 
-/// Catches a grant that does not say how large its closure is booking nothing, or booking the
-/// wrong thing: the job needs the allowance and the margin, and the executor says in its log
-/// that it did not know the inputs, so an operator who finds a full host can see why.
+/// Catches a job placed only on a host that reports scratch disk: a host that reports none, and
+/// one that reports zero bytes, each take the job: the job service makes it (it is never refused
+/// `no-capable-host`, which would end the action), after one submit and no rerun, and the
+/// worker stays.
 #[tokio::test(start_paused = true)]
-async fn a_job_whose_inputs_are_not_measured_needs_the_allowance_and_says_so() {
-    let log = Log::default();
-    let dispatch = tracing::Dispatch::new(
-        tracing_subscriber::fmt()
-            .with_writer(log.clone())
-            .with_ansi(false)
-            .with_max_level(tracing::Level::TRACE)
-            .finish(),
-    );
-    let _logged = tracing::dispatcher::set_default(&dispatch);
-    let mut rig = Rig::start(&[HOST], 1, |cfg| cfg.output_disk_bytes = 5 * GIB + 7).await;
-    rig.pump().await;
-    rig.inputs
-        .grant
-        .lock()
-        .expect("grant")
-        .as_mut()
-        .expect("ok")
-        .input_bytes = None;
-    let _caller = rig.submit(3);
-    rig.pump().await;
-    let job = rig.jobs_of(3).remove(0);
-    let needs = job.spec.needs.as_ref().expect("needs");
-    assert_eq!(needs.disk_bytes, Some(5 * GIB + 7 + DISK_MARGIN));
-    let said = log.text();
-    assert!(
-        said.contains("size of the inputs is not known")
-            && said.contains("needs the allowance and the margin"),
-        "{said}"
-    );
-}
-
-/// Catches a job whose disk no host has being rerun for ever: the job service refuses it
-/// `no-capable-host`, which is the caller's, not the farm's. Nothing is queued, the worker
-/// stays (a refusal is not a reason to drop or silence it), and the action ends
-/// `InvalidArgument` (no rerun), the message naming the code and none of the job's secrets.
-/// With a host whose disk holds the job, the same executor submits it.
-#[tokio::test(start_paused = true)]
-async fn a_job_whose_disk_no_host_has_is_refused_cleanly() {
-    let booked = INPUT_BYTES + 8 * GIB + DISK_MARGIN;
-    let mut rig = Rig::start(&[], 1, |_| {}).await;
-    rig.fake.add_host(HOST, host_with_disk(booked - 1));
-    rig.pump().await;
-    let caller = rig.submit(3);
-    let finished = rig.until_done(&caller, 3).await;
-    assert_eq!(code(&finished), Code::InvalidArgument, "{finished:?}");
-    let said = message(&finished);
-    assert!(
-        said.contains("no-capable-host"),
-        "the message does not name the code: {said}"
-    );
-    for secret in ["read-token-0001", "s3cr3t", "--pack-url", "--grant-token"] {
-        assert!(!said.contains(secret), "the message holds {secret}: {said}");
+async fn a_job_is_placed_on_a_host_that_reports_no_disk() {
+    for disk in [None, Some(0)] {
+        let mut rig = Rig::start(&[], 1, |_| {}).await;
+        rig.fake.add_host(HOST, host_with_disk(disk));
+        let job = submitted(&mut rig).await;
+        assert_eq!(job.spec.needs.as_ref().and_then(|n| n.disk_bytes), None);
+        assert_eq!(rig.jobs().len(), 1, "{disk:?}: the job was not made");
+        assert_eq!(
+            submits(&rig.fake.calls()).len(),
+            1,
+            "{disk:?}: the action was rerun"
+        );
+        let workers = rig.exec.workers();
+        assert_eq!(workers.len(), 1, "{disk:?}: the worker was dropped");
+        assert!(!workers[0].silent && !workers[0].draining, "{disk:?}");
     }
-    assert!(rig.jobs().is_empty(), "a job no host can hold");
-    assert_eq!(submits(&rig.fake.calls()).len(), 1, "the action was rerun");
-    let workers = rig.exec.workers();
-    assert_eq!(workers.len(), 1, "the worker was dropped");
-    assert!(!workers[0].silent && !workers[0].draining);
-
-    let mut rig = Rig::start(&[], 1, |_| {}).await;
-    rig.fake.add_host(HOST, host_with_disk(booked));
-    let job = submitted(&mut rig).await;
-    let needs = job.spec.needs.as_ref().expect("needs");
-    assert_eq!(needs.disk_bytes, Some(booked));
 }
 
 /// Catches the refusal rule swallowing every failure of a submit: a status that is not about

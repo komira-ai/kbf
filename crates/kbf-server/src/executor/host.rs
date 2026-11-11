@@ -2,12 +2,13 @@
 //!
 //! The farm sees an ordinary worker, `js:<frontend>-<n>`, that registers, takes `Start`s,
 //! lists what it runs in its heartbeats and reports results. Nothing of the farm knows
-//! otherwise: the worker owns the receiving end of the `Outbound` channel the farm sends a
-//! daemon's messages on, and calls the farm's own `register`, `resize`, `heartbeat` and
-//! `report`. Its shape (the cores, the memory and the slots the flags declare) is how many
+//! otherwise but its registration: the worker owns the receiving end of the `Outbound` channel
+//! the farm sends a daemon's messages on, and calls the farm's own `register_virtual` and
+//! `resize_virtual` (a daemon's `register` and `resize` that skip no Linux worker), `heartbeat`
+//! and `report`. Its shape (the cores, the memory and the slots the flags declare) is how many
 //! actions of which size the farm may have in flight on it; each becomes a job, and the job
-//! service decides which host runs it. The worker holds no host, and is never retired because
-//! a host went away: a job is.
+//! service decides which host runs it. The worker holds no host, and is never retired because a host went
+//! away: a job is.
 //!
 //! What a real session does and this one skips, and why that is safe:
 //!
@@ -292,7 +293,7 @@ impl HostWorker {
         self.reported.phase = kbf_sched::NodePhase::Draining;
         ctx.deps
             .farm
-            .resize(&self.id, self.stream, self.reported.clone());
+            .resize_virtual(&self.id, self.stream, self.reported.clone());
     }
 
     /// Heartbeats the farm when one is due, and fences when the farm, or the job service while
@@ -359,7 +360,7 @@ fn register(
         })),
     };
     let (outbound, inbox): (Outbound, Inbox) = mpsc::unbounded_channel();
-    let stream = ctx.deps.farm.register(
+    let stream = ctx.deps.farm.register_virtual(
         id,
         DaemonInstance::new(instance.clone()),
         DaemonInstance::new(predecessor),
