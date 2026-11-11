@@ -247,11 +247,16 @@ fn pin(written: Written, arch: Arch) -> Result<Pin, String> {
 /// The download of one URL: its bytes, or why it failed (one line).
 pub type Get<'a> = &'a dyn Fn(&str) -> Result<Vec<u8>, String>;
 
-/// Downloads over HTTPS trusting `roots`, each attempt given up after [`ATTEMPT_TIMEOUT`].
-pub fn https<'a>(
-    roots: &'a [CertificateDer<'static>],
-) -> impl Fn(&str) -> Result<Vec<u8>, String> + 'a {
-    move |url| fetch::download_within(url, roots, ATTEMPT_TIMEOUT).map_err(|e| e.to_string())
+/// The client of the downloads: HTTPS only, trusting `roots`, each attempt given up after
+/// [`ATTEMPT_TIMEOUT`].
+pub fn https_agent(roots: &[CertificateDer<'static>]) -> ureq::Agent {
+    fetch::agent(roots, ATTEMPT_TIMEOUT)
+}
+
+/// Downloads with [`https_agent`]: one client for every attempt.
+pub fn https(roots: &[CertificateDer<'static>]) -> impl Fn(&str) -> Result<Vec<u8>, String> {
+    let agent = https_agent(roots);
+    move |url| fetch::download_with(&agent, url).map_err(|e| e.to_string())
 }
 
 /// The verb: [`fill`] for this host's architecture, downloading over HTTPS with the host's

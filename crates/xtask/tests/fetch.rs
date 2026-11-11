@@ -119,6 +119,47 @@ fn a_download_follows_redirects_and_returns_the_body() {
 }
 
 #[test]
+fn each_client_carries_its_own_time_budget_and_is_https_only() {
+    // Catches: a caller's timeout dropped for the default (the debs downloads would then wait
+    // ten minutes per mirror instead of two), the default budget changed, or a client that
+    // accepts plain http. Read from the client's own configuration: no request, no clock.
+    use std::time::Duration;
+    let budget = |agent: &ureq::Agent| agent.config().timeouts().global;
+    let seven = fetch::agent(&[], Duration::from_secs(7));
+    assert_eq!(budget(&seven), Some(Duration::from_secs(7)));
+    assert!(seven.config().https_only());
+    assert_eq!(fetch::DOWNLOAD_TIMEOUT, Duration::from_secs(600));
+    let default = fetch::download_agent(&[]);
+    assert_eq!(budget(&default), Some(fetch::DOWNLOAD_TIMEOUT));
+    assert!(default.config().https_only());
+    let debs = xtask::debs::https_agent(&[]);
+    assert_eq!(budget(&debs), Some(xtask::debs::ATTEMPT_TIMEOUT));
+    assert_ne!(xtask::debs::ATTEMPT_TIMEOUT, fetch::DOWNLOAD_TIMEOUT);
+    assert!(debs.config().https_only());
+}
+
+#[test]
+fn the_debs_download_fetches_over_https_and_reports_a_failure_in_one_line() {
+    // Catches: the debs downloader not reaching the server through its own client, following
+    // no redirect, or returning a 404 as bytes (which would read as a wrong SHA-256, not a
+    // missing file).
+    let (base, ca) = serve(true, |origin, path| match path {
+        "/pool/a.deb" => response(
+            "302 Found",
+            &[("Location", &format!("{origin}/blob"))],
+            b"go",
+        ),
+        "/blob" => response("200 OK", &[], TOOL),
+        _ => response("404 Not Found", &[], b"gone"),
+    });
+    let get = xtask::debs::https(std::slice::from_ref(&ca));
+    assert_eq!(get(&format!("{base}/pool/a.deb")).expect("download"), TOOL);
+    let missing = format!("{base}/pool/b.deb");
+    let refused = get(&missing).expect_err("404");
+    assert_eq!(refused, format!("download {missing}: http status: 404"));
+}
+
+#[test]
 fn a_status_that_is_not_2xx_is_an_error() {
     // Catches: an error page taken as the download (the hash check would refuse it,
     // with a message that hides the 404).

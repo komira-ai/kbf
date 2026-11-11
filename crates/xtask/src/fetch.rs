@@ -30,7 +30,7 @@ use sha2::Digest;
 pub const MAX_DOWNLOAD: u64 = 512 * 1024 * 1024;
 
 /// How long one download may take, redirects included.
-const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
+pub const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// A SHA-256 digest, written as 64 lowercase hex digits.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -184,24 +184,30 @@ pub fn tls_config(roots: &[CertificateDer<'static>]) -> ureq::tls::TlsConfig {
         .build()
 }
 
-/// The body of `url`, over HTTPS only, trusting `roots`.
+/// The body of `url`, over HTTPS only, trusting `roots`, given up after
+/// [`DOWNLOAD_TIMEOUT`].
 pub fn download(url: &str, roots: &[CertificateDer<'static>]) -> Result<Vec<u8>, Error> {
-    download_within(url, roots, DOWNLOAD_TIMEOUT)
+    download_with(&download_agent(roots), url)
 }
 
-/// [`download`], given up after `timeout` (redirects included).
-pub fn download_within(
-    url: &str,
-    roots: &[CertificateDer<'static>],
-    timeout: Duration,
-) -> Result<Vec<u8>, Error> {
-    let tls = tls_config(roots);
-    let agent: ureq::Agent = ureq::Agent::config_builder()
+/// The client of [`download`]: [`agent`] with [`DOWNLOAD_TIMEOUT`].
+pub fn download_agent(roots: &[CertificateDer<'static>]) -> ureq::Agent {
+    agent(roots, DOWNLOAD_TIMEOUT)
+}
+
+/// The client of every download: HTTPS only (redirects too), trusting `roots` and nothing
+/// else, each request given up after `timeout` (redirects included).
+pub fn agent(roots: &[CertificateDer<'static>], timeout: Duration) -> ureq::Agent {
+    ureq::Agent::config_builder()
         .https_only(true)
         .timeout_global(Some(timeout))
-        .tls_config(tls)
+        .tls_config(tls_config(roots))
         .build()
-        .into();
+        .into()
+}
+
+/// The body of `url`, fetched with `agent` and read up to [`MAX_DOWNLOAD`].
+pub fn download_with(agent: &ureq::Agent, url: &str) -> Result<Vec<u8>, Error> {
     let failed = |e: ureq::Error| Error::Download {
         url: url.to_owned(),
         why: e.to_string(),
