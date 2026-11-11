@@ -332,20 +332,21 @@ impl Rootfs {
                 ));
             }
         }
-        let kept: Vec<&Stanza> = stanzas
+        let (kept, left): (Vec<&Stanza>, Vec<&Stanza>) = stanzas
             .iter()
-            .filter(|s| !gone_packages.contains(s.package.as_str()))
-            .collect();
-        let given: BTreeSet<&str> = kept
-            .iter()
-            .flat_map(|s| {
-                std::iter::once(s.package.as_str()).chain(s.provides.iter().map(String::as_str))
-            })
-            .collect();
+            .partition(|s| !gone_packages.contains(s.package.as_str()));
+        // What a package satisfies: its own name and each name it provides.
+        let gives = |of: &[&Stanza]| -> BTreeSet<String> {
+            of.iter()
+                .flat_map(|s| std::iter::once(&s.package).chain(&s.provides))
+                .cloned()
+                .collect()
+        };
+        let (given, taken) = (gives(&kept), gives(&left));
         for stanza in &kept {
             for (group, names) in &stanza.needs {
-                let lost = names.iter().any(|n| gone_packages.contains(n.as_str()));
-                if lost && !names.iter().any(|n| given.contains(n.as_str())) {
+                let lost = names.iter().any(|n| taken.contains(n));
+                if lost && !names.iter().any(|n| given.contains(n)) {
                     problems.push(format!(
                         "{}: needs {group}, which only packages left out give",
                         stanza.package

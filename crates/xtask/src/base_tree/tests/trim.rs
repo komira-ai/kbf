@@ -15,8 +15,7 @@ fn status(stanzas: &[&str]) -> String {
 }
 
 const KEEP: &str = "Package: keep\nStatus: install ok installed\nPre-Depends: libc6 (>= 2.34), gone:any | keep\nProvides: toolkit, kit (= 1)\nDescription: kept\n a long\n .\n description";
-const GONE: &str =
-    "Package: gone\nStatus: install ok installed\nDepends: keep\nDescription: left out";
+const GONE: &str = "Package: gone\nStatus: install ok installed\nDepends: keep\nProvides: gone-virtual\nDescription: left out";
 
 /// A base with a dpkg database of the packages `keep` and `gone`, and `extra` entries after
 /// them: `gone` brings a set-uid `su`, a set-gid `chage`, a conffile, a documentation directory,
@@ -33,6 +32,14 @@ fn base(stanzas: &[&str], extra: Vec<E>) -> Vec<u8> {
         E::file("usr/bin/more", 0o755, b"more"),
         E::symlink("usr/bin/pager", "/etc/alternatives/pager"),
         E::symlink("etc/alternatives/pager", "/bin/more"),
+        E::symlink(
+            "usr/share/man/man1/pager.1.gz",
+            "/etc/alternatives/pager.1.gz",
+        ),
+        E::symlink(
+            "etc/alternatives/pager.1.gz",
+            "/usr/share/man/man1/more.1.gz",
+        ),
         E::file("etc/gone.conf", 0o644, b"conf"),
         E::file("usr/share/doc/gone/copyright", 0o644, b"c"),
         E::file("usr/share/gone/listed", 0o644, b"l"),
@@ -62,7 +69,7 @@ fn base(stanzas: &[&str], extra: Vec<E>) -> Vec<u8> {
         E::file("var/lib/dpkg/info/keep.list", 0o644, b"/.\n/usr\n/usr/bin\n/usr/bin/tool\n"),
         E::file("var/lib/dpkg/info/keep.md5sums", 0o644, b"k"),
         E::file(
-            "var/lib/dpkg/info/gone.list",
+            "var/lib/dpkg/info/gone:amd64.list",
             0o644,
             b"/.\n/etc\n/etc/gone.conf\n/usr\n/usr/bin\n/usr/bin/su\n/usr/bin/chage\n/usr/bin/more\n/usr/share\n/usr/share/doc\n/usr/share/doc/gone\n/usr/share/doc/gone/copyright\n/usr/share/gone\n/usr/share/gone/listed\n/usr/share/gone/never-there\n/usr/bin/tool/below-a-file\n",
         ),
@@ -103,17 +110,19 @@ fn refused_without(layers: &[Vec<u8>], removed: &[&str]) -> Vec<String> {
 }
 
 /// Asserts leaving out a package removes every file and symbolic link its list names (a conffile
-/// included), each directory it alone lists once nothing is left in it, its control files with
+/// included; the list named with an architecture, `gone:amd64.list`, as multi-arch packages
+/// have it), each directory it alone lists once nothing is left in it, its control files with
 /// and without an architecture, its stanza of the status file and its diversions, and the
-/// alternative whose one choice it brought, with the links of that alternative; and that it keeps
-/// a directory a kept package also lists, a directory still holding a file no package lists, a
-/// listed path that is not there, and everything of the kept package, byte for byte. The tree is
-/// then accepted: the set-uid and set-gid files went with the package, and the set-gid directory
-/// `/var/mail` is normalised as before.
-/// Catches: a removal that leaves a file of the package, takes a shared directory or one with
-/// another file in it, leaves its control files or its stanza (dpkg would still call it
-/// installed), drops a kept stanza or diversion, or leaves the links of an alternative pointing at
-/// nothing.
+/// alternative whose one choice it brought, with the links of that alternative and of its
+/// follower (whose `/etc/alternatives` link already pointed at nothing); and that it keeps a
+/// directory a kept package also lists, a directory still holding a file no package lists, a
+/// listed path that is not there or is below a regular file, another alternative, and everything
+/// of the kept package, byte for byte. The tree is then accepted: the set-uid and set-gid files
+/// went with the package, and the set-gid directory `/var/mail` is normalised as before.
+/// Catches: a removal that leaves a file of the package, misses a list named with an
+/// architecture, takes a shared directory or one with another file in it, leaves its control
+/// files or its stanza (dpkg would still call it installed), drops a kept stanza or diversion, or
+/// leaves the links of an alternative or of its followers behind.
 #[test]
 fn leaving_out_a_package_removes_what_dpkg_lists_for_it_and_nothing_else() {
     let tree = without(&[base(&[KEEP, GONE], vec![])], &["gone"]).expect("accepted");
@@ -132,6 +141,8 @@ fn leaving_out_a_package_removes_what_dpkg_lists_for_it_and_nothing_else() {
             ("/usr/share", Seen::Dir),
             ("/usr/share/gone", Seen::Dir),
             ("/usr/share/gone/unlisted", file("u", false)),
+            ("/usr/share/man", Seen::Dir),
+            ("/usr/share/man/man1", Seen::Dir),
             ("/var", Seen::Dir),
             ("/var/lib", Seen::Dir),
             ("/var/lib/dpkg", Seen::Dir),
@@ -190,19 +201,23 @@ fn a_set_uid_or_set_gid_file_left_in_the_base_is_refused_by_path() {
     );
 }
 
-/// Asserts a kept package's dependency on a package left out is refused unless a kept package
-/// satisfies the same group, by name or by what it provides; a dependency on a package the base
-/// does not hold at all is not refused (it was never satisfied by the base).
-/// Catches: a removal that breaks a kept package's `Depends` or `Pre-Depends`, and one refused
-/// although a kept alternative or provider satisfies it.
+/// Asserts a kept package's dependency on a package left out, by its name or by a name only it
+/// provides, is refused unless a kept package satisfies the same group, by name or by what it
+/// provides; a dependency on a package the base does not hold at all is not refused (it was never
+/// satisfied by the base).
+/// Catches: a removal that breaks a kept package's `Depends` or `Pre-Depends`, a virtual package
+/// whose one provider goes, and a removal refused although a kept alternative or provider
+/// satisfies it.
 #[test]
 fn a_kept_package_that_needs_a_package_left_out_is_refused() {
-    let needy = "Package: needy\nDepends: gone (>= 1), libc6\nPre-Depends: gone | elsewhere";
+    let needy =
+        "Package: needy\nDepends: gone (>= 1), libc6, gone-virtual\nPre-Depends: gone | elsewhere";
     assert_eq!(
         refused_without(&[base(&[KEEP, GONE, needy], vec![])], &["gone"]),
         [
             "needy: needs gone | elsewhere, which only packages left out give",
             "needy: needs gone (>= 1), which only packages left out give",
+            "needy: needs gone-virtual, which only packages left out give",
         ]
     );
     let served =
@@ -495,9 +510,41 @@ fn a_path_of_a_kept_package_is_left_out_as_dpkg_excludes_it() {
     );
 }
 
-/// Asserts the verb leaves out the packages and paths it is given and prints one line for each,
-/// with its reason, after the lines naming the bundle.
-/// Catches: a release whose log does not say what the base tree left out, or why.
+/// The paths of the tree in the bundle `bytes`, as tierstore's flattener reads its manifests.
+fn bundle_paths(bytes: &[u8]) -> BTreeSet<String> {
+    let mut root = None;
+    let mut objects = std::collections::BTreeMap::new();
+    kbf_tree_bundle::read(bytes, |item| {
+        match item {
+            Item::Facts(facts) => root = Some(facts.root),
+            Item::Object { sha256, bytes } => {
+                objects.insert(sha256, bytes);
+            }
+        }
+        Ok::<(), String>(())
+    })
+    .expect("a bundle");
+    let root = tierstore::TreeDigest::from_hex(&root.expect("facts")).expect("root");
+    let flat = tierstore::flatten(&root, |d: &tierstore::TreeDigest| {
+        objects.get(&d.to_string()).cloned().ok_or("missing")
+    })
+    .expect("flattens");
+    let mut paths: Vec<String> = Vec::new();
+    for e in &flat {
+        let path = match e.parent {
+            None => String::new(),
+            Some(parent) => format!("{}/{}", paths[parent as usize], e.name),
+        };
+        paths.push(path);
+    }
+    paths.into_iter().collect()
+}
+
+/// Asserts the verb leaves out the packages and paths it is given (the bundle it writes holds
+/// none of them, and still holds the kept package's files) and prints one line for each, with
+/// its reason, after the lines naming the bundle.
+/// Catches: a release whose log says a package or path was left out while its bundle still holds
+/// it, and one whose log does not say what was left out, or why.
 #[test]
 fn the_verb_prints_each_package_and_path_left_out_with_its_reason() {
     let dir = super::scratch("trim-verb");
@@ -523,6 +570,23 @@ fn the_verb_prints_each_package_and_path_left_out_with_its_reason() {
     assert_eq!(printed.len(), 5);
     assert_eq!(printed[3], "left out gone: a test's reason");
     assert_eq!(printed[4], "left out /usr/bin/tool: another reason");
+    let name = kbf_tree_bundle::file_name(COMMIT, "linux-x86_64");
+    let paths = bundle_paths(&std::fs::read(dir.join("dist").join(name)).expect("bundle"));
+    for gone in [
+        "/usr/bin/su",
+        "/usr/bin/more",
+        "/usr/bin/tool",
+        "/var/lib/dpkg/info/gone.md5sums",
+    ] {
+        assert!(!paths.contains(gone), "{gone} is in the bundle");
+    }
+    for kept in [
+        "/usr/bin",
+        "/var/lib/dpkg/info/keep.list",
+        "/.kbf-tools/kbf-task",
+    ] {
+        assert!(paths.contains(kept), "{kept} is not in the bundle");
+    }
 }
 
 /// Asserts the packages and paths the release leaves out are each named once, each with a
