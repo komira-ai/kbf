@@ -383,6 +383,14 @@ several lines: make the change by hand); an `--instance`, `--ssh-user` or `--ssh
 A restart of the frontend fails the builds in flight on it, so the drain waits for them
 first; pick a quiet time all the same, as for any restart of a frontend.
 
+**The Linux nodes' daemons after the switch.** Leave them running: the back-out needs them. While
+the frontend runs `executor = "js-agent"` its farm places no lease on a daemon that reports
+`os=linux` (each is registered with no driver, and `GET /v1/nodes` still lists it), and Mac
+daemons are placed as before. Do not cordon or drain the Linux nodes for the switch: nothing
+needs it, and a cordon is a `cordon/` row only the operator lifts, which would still hold them
+after a back-out. The frontend's log names each Linux daemon it skips, once per stream: `a Linux
+daemon under --executor js-agent: the farm places no lease on it`.
+
 ## The canary
 
 After the switch, `apply` submits one job to the job service with kbf's client token and asks
@@ -440,7 +448,9 @@ DRY-RUN: remove /etc/kbf/kbf.toml.pre-job-service
 dry run: nothing changed. Re-run with --apply.
 ```
 
-It is refused (exit 2) when there is no `kbf.toml.pre-job-service`. The whole file is put back,
+The restarted frontend, under `kbf-daemon`, places the Linux daemons again as they say `Hello`
+to it: the switch left no row to lift. It is refused (exit 2) when there is no
+`kbf.toml.pre-job-service`. The whole file is put back,
 not only the executor's keys: a change made to it by hand after the switch is lost, and has to
 be made again. Stopping the frontend for the restart cancels any job of its still on the
 service; the drain before it has waited for the builds open on it.

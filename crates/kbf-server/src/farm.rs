@@ -71,6 +71,7 @@ pub(crate) mod failed_actions;
 mod handover;
 mod input_cache;
 mod learning;
+mod linux_daemons;
 mod named;
 mod node_load;
 mod node_types;
@@ -488,8 +489,24 @@ impl Farm {
     /// #140), unless it is proven stopped. It is when the new process names it as its
     /// `predecessor` (whose runs the new daemon's drivers killed before its `Hello`) and
     /// the earlier stream has closed: a process still connected may be another
-    /// machine's, with a copy of this one's disk (issue #22).
+    /// machine's, with a copy of this one's disk (issue #22). Under `--executor js-agent` a
+    /// Linux daemon is registered with no driver, so nothing is placed on it
+    /// (`farm/linux_daemons.rs`).
     pub fn register(
+        &self,
+        worker: &WorkerId,
+        instance: DaemonInstance,
+        predecessor: DaemonInstance,
+        reported: Reported,
+        outbound: Outbound,
+        welcome: ServerMessage,
+    ) -> StreamId {
+        let reported = self.placed(worker, reported, true);
+        self.enroll(worker, instance, predecessor, reported, outbound, welcome)
+    }
+
+    /// [`Self::register`] of `reported` as it is, which the executor's virtual workers use.
+    fn enroll(
         &self,
         worker: &WorkerId,
         instance: DaemonInstance,
@@ -558,8 +575,14 @@ impl Farm {
     /// worker, whose `Start` went to an earlier session, sends that `Start` again (the
     /// daemon restarted for the session switch); one naming a lease of this process it
     /// does not hold there is sent a `Cancel`, so the daemon cleans up after it. A
-    /// change into or out of quarantine is logged as an attention item.
+    /// change into or out of quarantine is logged as an attention item. A Linux daemon stays
+    /// without drivers under `--executor js-agent`, as [`Self::register`] says.
     pub fn resize(&self, worker: &WorkerId, stream: StreamId, reported: Reported) {
+        self.retake(worker, stream, self.placed(worker, reported, false));
+    }
+
+    /// [`Self::resize`] with `reported` as it is, which the executor's virtual workers use.
+    fn retake(&self, worker: &WorkerId, stream: StreamId, reported: Reported) {
         let now = self.now();
         let mut state = self.lock();
         let (os, arch) = identity(&reported.caps);

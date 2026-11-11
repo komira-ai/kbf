@@ -12,6 +12,7 @@ use kbf_sched::{MEMORY_FLOORS, MemoryLadder, Scheduler, WholeNodeConfig};
 use super::State;
 use super::durable::ORPHAN_WAIT;
 use super::engine::HELD_CAP;
+use crate::executor::ExecutorKind;
 use crate::learned::{Learned, LearnedSizes};
 use crate::placement_load::PlacementLoad;
 use crate::placement_predictions::PlacementPredictions;
@@ -42,6 +43,9 @@ pub(crate) struct Settings {
     pub recorder: Recorder,
     /// Held-back committed records kept for a refusing state store at most.
     pub held_cap: usize,
+    /// Where placed actions run (`--executor`): under `js-agent` no Linux daemon is placed on
+    /// ([`Farm::with_executor`](super::Farm::with_executor)).
+    pub executor: ExecutorKind,
 }
 
 impl Default for Settings {
@@ -59,6 +63,7 @@ impl Default for Settings {
             whole_node: None,
             recorder: Recorder::default(),
             held_cap: HELD_CAP,
+            executor: ExecutorKind::KbfDaemon,
         }
     }
 }
