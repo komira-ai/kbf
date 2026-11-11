@@ -1865,6 +1865,8 @@ mod golden_tests;
 #[cfg(test)]
 mod intake_tests;
 #[cfg(test)]
+mod job_tree_tests;
+#[cfg(test)]
 mod leases_tests;
 #[cfg(test)]
 mod named_tests;

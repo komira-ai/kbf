@@ -101,6 +101,7 @@ pub mod http_invocations;
 pub mod http_sched;
 pub mod identity;
 mod input_cache_metrics;
+pub mod job_tree;
 pub mod join;
 mod key_file;
 pub mod learned;

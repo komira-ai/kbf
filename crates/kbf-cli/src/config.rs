@@ -299,6 +299,7 @@ const GROUPS: &[(&str, &[&str])] = &[
             "executor-allow-plain-http-put",
             "executor-arch",
             "executor-base-image",
+            "executor-base-tree",
             "executor-call-timeout-secs",
             "executor-default-timeout-secs",
             "executor-frontend-id",

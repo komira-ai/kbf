@@ -118,7 +118,7 @@ const SIM_KERNEL: &[&str] = &["kbf-sim"];
 
 /// Crates that do a little file I/O (so they are not `PURE`) but are shared by every CI/CD
 /// stage and by xtask: they may reach no `FORBIDDEN` crate and no other kbf crate.
-const LEAF: &[&str] = &["kbf-gate"];
+const LEAF: &[&str] = &["kbf-gate", "kbf-tree-bundle"];
 
 const FORBIDDEN: &[&str] = &[
     "tokio",

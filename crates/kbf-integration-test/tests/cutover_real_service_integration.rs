@@ -143,17 +143,21 @@ struct Rig {
 }
 
 /// The frontend's `kbf.toml` before the cutover: ready for the switch, its kbf image the one
-/// the node's image store holds, so the agent can run the canary.
-fn ready_config() -> String {
+/// the node's image store holds, so the agent can run the canary, and `base_tree` the directory
+/// of the release's base tree bundles. The cutover only checks that the file holds the key: the
+/// frontend here is the scripted host's, no kbf binary runs, so nothing reads the directory.
+fn ready_config(base_tree: &std::path::Path) -> String {
     format!(
         "[scheduler]\nstate-store = \"postgres:///kbf\"\n\n[executor]\n\
          executor = \"kbf-daemon\"\nexecutor-frontend-id = \"{FRONTEND}\"\n\
          executor-base-image = \"registry.example/base@sha256:{base}\"\n\
          executor-kbf-image = \"docker://{kbf}\"\n\
+         executor-base-tree = \"{base_tree}\"\n\
          executor-secret-delivery = \"files\"\nexecutor-host-slots = 8\n\n[packs]\n\
          pack-read = true\n",
         base = "ff".repeat(32),
         kbf = image(),
+        base_tree = base_tree.display(),
     )
 }
 
@@ -165,7 +169,9 @@ impl Rig {
         let node = Node::new(name).await;
         let agent = RealAgent::start(&node, &server).await;
         let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), &format!("{name}-frontend"));
-        std::fs::write(dir.path().join("kbf.toml"), ready_config()).expect("kbf.toml");
+        let base_tree = dir.path().join("base-tree");
+        std::fs::create_dir(&base_tree).expect("the base tree directory");
+        std::fs::write(dir.path().join("kbf.toml"), ready_config(&base_tree)).expect("kbf.toml");
         let mut token = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)

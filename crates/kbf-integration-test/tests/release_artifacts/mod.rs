@@ -192,6 +192,7 @@ pub fn problems(workflow: &str) -> Result<Vec<String>, String> {
     kbf_package::rules(workflow, &mut out)?;
     images::rules(workflow, &mut out)?;
     image_sbom::rules(workflow, &mut out)?;
+    base_tree::rules(workflow, &mut out)?;
     mac_package(workflow, &mut out)?;
     darwin(workflow, &mut out)?;
     pull_request_gate(workflow, &mut out)?;
@@ -725,6 +726,7 @@ fn the_docs_describe_the_release_set() {
             format!("`kbf-task-image-<commit>-{platform}.oci.tar`"),
             format!("`kbf-task-image-<commit>-{platform}.facts.json`"),
             format!("`kbf-task-image-<commit>-{platform}.cdx.json`"),
+            format!("`kbf-base-tree-<commit>-{platform}.tree.tar`"),
         ] {
             if !doc.contains(&file) {
                 missing.push(format!("docs/artifacts.md does not list {file}"));
@@ -981,6 +983,7 @@ mod rules {
                 w.push_str(&task_steps(platform));
                 w.push_str(&syft_fetch_step(platform));
                 w.push_str(&task_sbom_step(platform));
+                w.push_str(&base_tree_step(platform));
             }
             if *job == MAC_PACKAGE {
                 w.push_str(&mac_package_steps());
@@ -1895,16 +1898,19 @@ mod rules {
         }
     }
 
+    mod base_tree_tests;
     mod deb_steps;
     mod image_sbom_tests;
     mod images_tests;
     mod kbf_package_tests;
+    use base_tree_tests::base_tree_step;
     use deb_steps::{
         kbf_asset_step, native_asset_step, native_config_and_build, native_steps,
         verify_kbf_package_step, verify_native_step,
     };
 }
 
+mod base_tree;
 mod facts;
 mod image_sbom;
 mod images;

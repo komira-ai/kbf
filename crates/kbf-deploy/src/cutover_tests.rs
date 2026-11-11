@@ -21,6 +21,7 @@ pub(crate) fn ready_config() -> String {
          # where actions run\nexecutor = \"kbf-daemon\"\nexecutor-frontend-id = \"fe-a\"\n\
          executor-base-image = \"registry.example/base@sha256:{d}\"\n\
          executor-kbf-image = \"docker://{KBF_IMAGE}\"\n\
+         executor-base-tree = \"/opt/kbf/base-tree\"\n\
          executor-secret-delivery = \"files\"\nexecutor-host-slots = 8\n\n[packs]\n\
          pack-read = true\n",
         d = "ff".repeat(32)
@@ -125,6 +126,7 @@ fn the_plan_of_a_ready_file_prints_now_then_and_the_back_out() {
          \x20 executor-frontend-id = \"fe-a\"\n\
          \x20 executor-base-image = \"registry.example/base@sha256:{d}\"\n\
          \x20 executor-kbf-image = \"docker://{KBF_IMAGE}\"\n\
+         \x20 executor-base-tree = \"/opt/kbf/base-tree\"\n\
          \x20 executor-secret-delivery = \"files\"\n\
          back-out: the flags of the mode it runs now:\n\
          \x20 --executor=kbf-daemon\n\
@@ -172,7 +174,8 @@ fn a_file_that_lacks_the_kept_keys_fails_after_the_plan() {
         err,
         format!(
             "FAIL: not ready: [executor] in {} lacks executor-frontend-id (a text value); \
-             executor-base-image (a text value); executor-kbf-image (a text value); the secret \
+             executor-base-image (a text value); executor-kbf-image (a text value); \
+             executor-base-tree (a text value); the secret \
              delivery: executor-secret-delivery = \"files\", or executor-insecure-argv-secrets = \
              true for \"argv\"\n",
             config.display()

@@ -114,6 +114,9 @@ kbf-job-client = { workspace = true, features = ["fake"] }
 # Postgres database of its own for a test (tests/state_store_postgres.rs).
 kbf-pack-index = { workspace = true, features = ["test-database", "test-support"] }
 kbf-state = { workspace = true, features = ["test-database", "test-support"] }
+# The release's bundles, written for the tests that start a frontend over them
+# (src/frontend/base_tree_tests.rs).
+kbf-tree-bundle.workspace = true
 # fcntl and kill for the test that holds the server at its start line (tests/binary.rs).
 libc.workspace = true
 # The client the Postgres flag tests read the catalog and the sessions with
