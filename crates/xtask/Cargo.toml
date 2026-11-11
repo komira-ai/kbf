@@ -47,6 +47,8 @@ lzma-rs.workspace = true
 ruzstd.workspace = true
 # The runner user's uid and gid, and `uname -m`, for `crun-tests`.
 rustix = { workspace = true, features = ["fs", "process", "system"] }
+# `debs` reads the pins files of `.github/debs/`.
+serde.workspace = true
 serde_json.workspace = true
 rustls.workspace = true
 rustls-native-certs.workspace = true

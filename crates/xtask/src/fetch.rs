@@ -186,10 +186,19 @@ pub fn tls_config(roots: &[CertificateDer<'static>]) -> ureq::tls::TlsConfig {
 
 /// The body of `url`, over HTTPS only, trusting `roots`.
 pub fn download(url: &str, roots: &[CertificateDer<'static>]) -> Result<Vec<u8>, Error> {
+    download_within(url, roots, DOWNLOAD_TIMEOUT)
+}
+
+/// [`download`], given up after `timeout` (redirects included).
+pub fn download_within(
+    url: &str,
+    roots: &[CertificateDer<'static>],
+    timeout: Duration,
+) -> Result<Vec<u8>, Error> {
     let tls = tls_config(roots);
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .https_only(true)
-        .timeout_global(Some(DOWNLOAD_TIMEOUT))
+        .timeout_global(Some(timeout))
         .tls_config(tls)
         .build()
         .into();
@@ -212,7 +221,7 @@ pub fn install(bytes: &[u8], sha256: &Sha256, unpack: &Unpack, out: &Path) -> Re
         });
     }
     let file = unpack.apply(bytes)?;
-    write_executable(out, &file).map_err(|e| Error::Install {
+    write_file(out, &file, 0o755).map_err(|e| Error::Install {
         path: out.to_owned(),
         why: e.to_string(),
     })
@@ -241,13 +250,13 @@ pub fn part_path(out: &Path) -> PathBuf {
     PathBuf::from(part)
 }
 
-/// Writes `data` to `out` (mode 0755) through [`part_path`], removing the part file
+/// Writes `data` to `out` (mode `mode`) through [`part_path`], removing the part file
 /// when a step fails.
-fn write_executable(out: &Path, data: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_file(out: &Path, data: &[u8], mode: u32) -> std::io::Result<()> {
     out.parent().map_or(Ok(()), std::fs::create_dir_all)?;
     let part = part_path(out);
     let written = std::fs::write(&part, data)
-        .and_then(|()| std::fs::set_permissions(&part, std::fs::Permissions::from_mode(0o755)))
+        .and_then(|()| std::fs::set_permissions(&part, std::fs::Permissions::from_mode(mode)))
         .and_then(|()| std::fs::rename(&part, out));
     if written.is_err() {
         // A part file that cannot be removed is reported by the write error itself.

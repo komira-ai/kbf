@@ -72,6 +72,8 @@
 //!   instead of the defect it catches (module `test_wording`, whose docs state the rule);
 //! - a test that opens a `file://` cold store without naming its
 //!   free-space floor (module `store_floor`, whose docs say what it misses);
+//! - a workflow that runs apt or names a Canonical host, or installs a pinned `.github/debs` set
+//!   other than by restore, `cargo xtask debs`, save on a miss and dpkg (module `pinned_debs`);
 //! - `AGENTS.md`'s shared core drifting from its hashed copy in `tools/agents/`, and
 //!   `CLAUDE.md` no longer importing `AGENTS.md` (module `agents_md`);
 //! - the scans passing vacuously because git listed nothing, no Markdown file was
@@ -89,6 +91,7 @@ mod hostkeeper_desired;
 mod interpreters;
 mod kbf_spawns;
 mod macos_pr;
+mod pinned_debs;
 mod pipeline_workflow;
 mod release_artifacts;
 mod release_workflow;

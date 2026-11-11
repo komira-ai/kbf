@@ -87,7 +87,9 @@ statically linked: it needs no libc of the image it runs in. A host does not mou
 kbf image carries it as its `ENTRYPOINT`, and the frontend's js-agent executor runs the kbf image (by digest,
 built from the served base) and gives the tool its flags only (`kbf-task` takes every path as a flag). It is built and
 tested on a native runner of each architecture, which installs the target with `rustup target add` and
-`musl-tools` (ring compiles C for the target with `musl-gcc`); the job runs `build-commit check` on the
+`musl-tools` (ring compiles C for the target with `musl-gcc`), pinned by version and SHA-256 in
+`.github/debs/musl-tools.toml` and installed with `dpkg` from the actions cache or, when it missed, the pinned
+mirrors (`cargo xtask debs`, no `apt-get`); the job runs `build-commit check` on the
 binary, which runs it, and `cargo xtask static-elf`, which refuses it unless it has no program
 interpreter and no needed library. The task image
 carries the same file. It writes its pack with `kbf-task-pack` (`crates/kbf-task-pack`), the task pack types

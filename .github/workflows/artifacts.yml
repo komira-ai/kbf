@@ -344,12 +344,6 @@ jobs:
       - run: rustup toolchain install
       - name: Add the static target kbf-task is built for
         run: rustup target add "$STATIC_TARGET"
-      # ring (through rustls) compiles C for the static target: its build looks for a musl C
-      # compiler, which the runner image does not have. `musl-tools` provides `musl-gcc`.
-      - name: Refresh the package lists for the musl C compiler
-        run: sudo apt-get update
-      - name: Install the musl C compiler ring's build uses for the static target
-        run: sudo apt-get install --yes --no-install-recommends musl-tools
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: cargo-cache
         with:
@@ -364,6 +358,29 @@ jobs:
           # never on a cached one. The lookup still tells the save step below whether
           # this key exists.
           lookup-only: ${{ github.event_name == 'push' }}
+      # ring (through rustls) compiles C for the static target: its build looks for a musl C
+      # compiler, which the runner image does not have. `musl-tools` provides `musl-gcc`, pinned
+      # for this runner's architecture by version and SHA-256 in .github/debs/musl-tools.toml:
+      # restored from the actions cache, or fetched from the pinned mirrors (Canonical's and two
+      # others) when the cache missed, checked either way, and installed with dpkg. No apt-get,
+      # so an outage of the Ubuntu archive does not stop the job.
+      - name: Restore the musl-tools packages
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: musl-debs
+        with:
+          path: ${{ runner.temp }}/debs/musl-tools
+          key: debs-musl-tools-${{ runner.arch }}-${{ hashFiles('.github/debs/musl-tools.toml') }}
+      - name: Fetch the pinned musl-tools packages
+        id: musl-debs-fetch
+        run: cargo xtask debs --pins .github/debs/musl-tools.toml --dir "$RUNNER_TEMP/debs/musl-tools"
+      - name: Save the musl-tools packages
+        if: ${{ steps.musl-debs-fetch.outcome == 'success' && steps.musl-debs.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/debs/musl-tools
+          key: ${{ steps.musl-debs.outputs.cache-primary-key }}
+      - name: Install the musl C compiler ring's build uses for the static target
+        run: sudo dpkg --install --recursive "$RUNNER_TEMP/debs/musl-tools"
       - name: Install cargo-cyclonedx (pinned version and checksum)
         run: cargo xtask fetch --url "https://github.com/CycloneDX/cyclonedx-rust-cargo/releases/download/cargo-cyclonedx-$CYCLONEDX_VERSION/cargo-cyclonedx-$TARGET.tar.xz" --sha256 "$CYCLONEDX_SHA256_X86_64_LINUX" --out "$HOME/.cargo/bin/cargo-cyclonedx" --extract tar.xz --member "cargo-cyclonedx-$TARGET/cargo-cyclonedx"
       - run: cargo cyclonedx --version
@@ -574,12 +591,6 @@ jobs:
       - run: rustup toolchain install
       - name: Add the static target kbf-task is built for
         run: rustup target add "$STATIC_TARGET"
-      # ring (through rustls) compiles C for the static target: its build looks for a musl C
-      # compiler, which the runner image does not have. `musl-tools` provides `musl-gcc`.
-      - name: Refresh the package lists for the musl C compiler
-        run: sudo apt-get update
-      - name: Install the musl C compiler ring's build uses for the static target
-        run: sudo apt-get install --yes --no-install-recommends musl-tools
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: cargo-cache
         with:
@@ -594,6 +605,29 @@ jobs:
           # never on a cached one. The lookup still tells the save step below whether
           # this key exists.
           lookup-only: ${{ github.event_name == 'push' }}
+      # ring (through rustls) compiles C for the static target: its build looks for a musl C
+      # compiler, which the runner image does not have. `musl-tools` provides `musl-gcc`, pinned
+      # for this runner's architecture by version and SHA-256 in .github/debs/musl-tools.toml:
+      # restored from the actions cache, or fetched from the pinned mirrors (Canonical's and two
+      # others) when the cache missed, checked either way, and installed with dpkg. No apt-get,
+      # so an outage of the Ubuntu archive does not stop the job.
+      - name: Restore the musl-tools packages
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: musl-debs
+        with:
+          path: ${{ runner.temp }}/debs/musl-tools
+          key: debs-musl-tools-${{ runner.arch }}-${{ hashFiles('.github/debs/musl-tools.toml') }}
+      - name: Fetch the pinned musl-tools packages
+        id: musl-debs-fetch
+        run: cargo xtask debs --pins .github/debs/musl-tools.toml --dir "$RUNNER_TEMP/debs/musl-tools"
+      - name: Save the musl-tools packages
+        if: ${{ steps.musl-debs-fetch.outcome == 'success' && steps.musl-debs.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/debs/musl-tools
+          key: ${{ steps.musl-debs.outputs.cache-primary-key }}
+      - name: Install the musl C compiler ring's build uses for the static target
+        run: sudo dpkg --install --recursive "$RUNNER_TEMP/debs/musl-tools"
       - name: Install cargo-cyclonedx (pinned version and checksum)
         run: cargo xtask fetch --url "https://github.com/CycloneDX/cyclonedx-rust-cargo/releases/download/cargo-cyclonedx-$CYCLONEDX_VERSION/cargo-cyclonedx-$TARGET.tar.xz" --sha256 "$CYCLONEDX_SHA256_AARCH64_LINUX" --out "$HOME/.cargo/bin/cargo-cyclonedx" --extract tar.xz --member "cargo-cyclonedx-$TARGET/cargo-cyclonedx"
       - run: cargo cyclonedx --version
