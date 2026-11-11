@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 
 use super::super::removed::{EXCLUDED, Excluded, REMOVED, Removed};
 use super::super::*;
-use super::support::{E, Seen, image, layer, listing};
+use super::support::{E, Seen, bundle_paths, image, layer, listing};
 use super::{COMMIT, file, norm, rows};
 
 /// The status file of the stanzas `stanzas`, as dpkg writes it: each stanza and a blank line.
@@ -522,36 +522,6 @@ fn a_path_of_a_kept_package_is_left_out_as_dpkg_excludes_it() {
             "/usr/bin: a directory, not a file",
         ]
     );
-}
-
-/// The paths of the tree in the bundle `bytes`, as tierstore's flattener reads its manifests.
-fn bundle_paths(bytes: &[u8]) -> BTreeSet<String> {
-    let mut root = None;
-    let mut objects = std::collections::BTreeMap::new();
-    kbf_tree_bundle::read(bytes, |item| {
-        match item {
-            Item::Facts(facts) => root = Some(facts.root),
-            Item::Object { sha256, bytes } => {
-                objects.insert(sha256, bytes);
-            }
-        }
-        Ok::<(), String>(())
-    })
-    .expect("a bundle");
-    let root = tierstore::TreeDigest::from_hex(&root.expect("facts")).expect("root");
-    let flat = tierstore::flatten(&root, |d: &tierstore::TreeDigest| {
-        objects.get(&d.to_string()).cloned().ok_or("missing")
-    })
-    .expect("flattens");
-    let mut paths: Vec<String> = Vec::new();
-    for e in &flat {
-        let path = match e.parent {
-            None => String::new(),
-            Some(parent) => format!("{}/{}", paths[parent as usize], e.name),
-        };
-        paths.push(path);
-    }
-    paths.into_iter().collect()
 }
 
 /// Asserts the verb leaves out the packages and paths it is given (the bundle it writes holds

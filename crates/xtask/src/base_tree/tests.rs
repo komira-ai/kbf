@@ -2,6 +2,7 @@
 //! path and kind, how modes are normalised, and the bundle that is written.
 
 mod bundle;
+mod pinned;
 mod support;
 mod trim;
 

@@ -319,3 +319,33 @@ pub fn top_level(tree: &Tree) -> BTreeMap<String, String> {
         })
         .collect()
 }
+
+/// The paths of the tree in the bundle `bytes`, as tierstore's flattener reads its manifests.
+pub fn bundle_paths(bytes: &[u8]) -> std::collections::BTreeSet<String> {
+    let mut root = None;
+    let mut objects = std::collections::BTreeMap::new();
+    kbf_tree_bundle::read(bytes, |item| {
+        match item {
+            kbf_tree_bundle::Item::Facts(facts) => root = Some(facts.root),
+            kbf_tree_bundle::Item::Object { sha256, bytes } => {
+                objects.insert(sha256, bytes);
+            }
+        }
+        Ok::<(), String>(())
+    })
+    .expect("a bundle");
+    let root = tierstore::TreeDigest::from_hex(&root.expect("facts")).expect("root");
+    let flat = tierstore::flatten(&root, |d: &tierstore::TreeDigest| {
+        objects.get(&d.to_string()).cloned().ok_or("missing")
+    })
+    .expect("flattens");
+    let mut paths: Vec<String> = Vec::new();
+    for e in &flat {
+        let path = match e.parent {
+            None => String::new(),
+            Some(parent) => format!("{}/{}", paths[parent as usize], e.name),
+        };
+        paths.push(path);
+    }
+    paths.into_iter().collect()
+}
