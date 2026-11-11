@@ -9,35 +9,31 @@
 //!   every job of [`CHAIN`] is present: a pipeline run cuts a release only through the whole chain.
 //!   Every job names the run that started it in its own `if:` or through `plan`: its conclusion is
 //!   `success`, its event `push`, its branch `main` and its repository this one ([`PLAN_IF`]).
-//! - **The graph.** The jobs [`JOBS`], in that order, each with exactly the `needs`, token
-//!   scopes, `if:` and `environment` of [`RULES`]; the jobs that write need `plan` and `verify`,
+//! - **The graph.** The jobs of [`jobs`], in that order, each with exactly the `needs`, token
+//!   scopes, `if:` and `environment` of [`rules`]; the jobs that write need `plan` and `verify`,
 //!   directly or through another. Only `publish` holds a write scope (`contents`), `id-token` is
-//!   held by `gamma` alone ([`ID_TOKEN`]), and the jobs that tag, publish, bump or run the gamma stage
-//!   only under [`RELEASE_IF`]: a successful pipeline run for a push to `main` of code that is
-//!   not a change to the pipeline.
+//!   held by `gamma` and the apt read and write jobs alone ([`may_hold_id_token`]), and the jobs
+//!   that tag, publish, bump, run the gamma stage or build the tool of the apt jobs only under
+//!   [`RELEASE_IF`]: a successful pipeline run for a push to `main` of code that is not a change
+//!   to the pipeline (the apt jobs after the first add the clauses of `workflows::release_ifs`).
 //! - **Never cancelled, never queued behind a skipped run.** The concurrency group is `release`
 //!   for a successful pipeline run and the run's own for any other (a cancelled or red pipeline
 //!   run starts this workflow too, to skip it, and must not replace a release waiting in the
 //!   group), and it never cancels.
-//! - **The gamma stage.** `gamma` needs `plan`, `publish`, `rehearse` and `rehearse-agent` (it
-//!   runs after the release is published and a host has been updated to it, by the helper alone
-//!   and through the coordinator and the agent), holds `contents: read` and `id-token: write`
-//!   and no secret, and reads the coordinator's address from the repository variable `KBF_COORDINATOR_URL` alone: no address
-//!   is written in the file and no other job reads the variable ([`COORDINATOR_URL_VAR`]). Its one
-//!   `deploy-farm` step is given the release's version and that address, and has no `if:` (an
-//!   unset variable is a notice from the verb, not a skipped step). It may join a Tailscale
-//!   network first, in one step of [`TS_ACTION`] after the build and before the verb, under
-//!   [`TS_IF`] and given exactly [`TS_WITH`] (variables and the tag; the run token, no secret).
-//!   No other job uses that action.
-//! - **The gamma proof.** After `deploy-farm`, `gamma` fetches the pinned Buck2 (the fetch
-//!   line of [`BUCK2_FETCH`], the one place the job may name an `https://` address) and runs
-//!   `cargo xtask prove-farm` once, unconditionally (an unset `FARM_ADDRESS` is a notice from
-//!   the verb). The verb is given the four organisation variables ([`FARM_VARS`]) through the
-//!   step's `env:` and nothing else of the environment but the run id and attempt as the nonce
-//!   ([`NONCE`]); no other job reads a `FARM_` variable, and no address is written.
+//! - **The gamma stage** ([`gamma`]). `gamma` needs `plan`, `publish`, `rehearse` and
+//!   `rehearse-agent`, holds `contents: read` and `id-token: write` and no secret, no longer sets
+//!   kbf's update coordinator (no job reads its variables, it runs no `deploy-farm`), prints a
+//!   notice as its first step after the checkout, and runs every later step only when the
+//!   repository variable `KBF_SETS_DESIRED` is `true`: the tailnet join and the Buck2 proof.
+//! - **The apt jobs** ([`apt`]). `deploy-tool` builds the tool; the read, index and write jobs of
+//!   the suites `testing` and `stable` (three attempts each) and the two install checks publish
+//!   the release's native .debs. No job that holds the cloud role or the signing key checks out
+//!   or compiles; none holds both; every step after the gate is under the gate's output.
 //! - **Halt on red.** No `always()`, `failure()`, `cancelled()` or `continue-on-error`, and no
-//!   step under `if:` but the ones of `notes` that read the previous release, the network
-//!   join of `gamma`, and `gamma`'s last step, the restore, under the one `failure()` ([`restore`]).
+//!   step under `if:` but the ones of `notes` that read the previous release, the steps of `gamma`
+//!   under the switch of [`gamma`], and the steps of the apt jobs under the gate's output. The one
+//!   place that has `!cancelled() && !failure()` is the `if:` of the apt jobs that follow a job that
+//!   may have been skipped, which is held to the exact string of `workflows::release_ifs`.
 //! - **One commit.** The workflow sets `COMMIT` to the commit the pipeline run built and
 //!   `PIPELINE_RUN` to its id; every checkout is of that commit (a `ref` of exactly that, no
 //!   `repository` or `token`), and no expression reads `inputs.`, a pull request or `head_ref`,
@@ -60,60 +56,21 @@
 //!   defect planted in this file reads red from this test too.
 
 use super::workflows;
-mod restore;
+mod apt;
+mod gamma;
 
 /// The job that holds the write scope and creates the GitHub release.
 const PUBLISH: &str = "publish";
 
-/// The job that sets the published release as the farm's desired version and waits.
+/// The gamma stage: the proof of the farm, after the release is published.
 const GAMMA: &str = "gamma";
 /// The update rehearsal, which `gamma` needs.
 const REHEARSE: &str = "rehearse";
 /// The update rehearsal of the agent and the coordinator, which `gamma` needs too.
 const REHEARSE_AGENT: &str = "rehearse-agent";
 
-/// The repository variable that holds the coordinator's address, and the one environment
-/// variable of `gamma` it is read into.
-const COORDINATOR_URL_VAR: &str = "vars.KBF_COORDINATOR_URL";
-
-/// The organisation variables of the farm the proof builds against, as the `env:` key of the
-/// proof step that reads each and the variable.
-const FARM_VARS: [(&str, &str); 4] = [
-    ("FARM_ADDRESS", "${{ vars.FARM_ADDRESS }}"),
-    ("FARM_INSTANCE", "${{ vars.FARM_INSTANCE }}"),
-    ("FARM_TLS", "${{ vars.FARM_TLS }}"),
-    (
-        "FARM_PROPERTIES",
-        "${{ vars.FARM_LINUX_X86_64_PROPERTIES }}",
-    ),
-];
-
-/// The nonce of the proof: every action of the project takes it, so each run's are new.
-const NONCE: &str = "${{ github.run_id }}-${{ github.run_attempt }}";
-
-/// The step of `gamma` that fetches Buck2, exactly as `beta.yml` does.
-const BUCK2_FETCH: &str = "cargo xtask fetch --url \"https://github.com/facebook/buck2/releases/download/$BUCK2_VERSION/buck2-x86_64-unknown-linux-gnu.zst\" --sha256 \"$BUCK2_SHA256\" --out \"$RUNNER_TEMP/tools/buck2\" --extract zst";
-
-/// The action `gamma` joins a Tailscale network with, pinned by commit.
-const TS_ACTION: &str = "tailscale/github-action@";
-
-/// The one condition of the network join: the trust credential's client id is set and so is
-/// one of the farm's addresses, the coordinator's (the deploy step) or the build endpoint's (the
-/// remote-only build after it); otherwise the step is skipped.
-const TS_IF: &str =
-    "${{ vars.TS_CLIENT_ID != '' && (vars.KBF_COORDINATOR_URL != '' || vars.FARM_ADDRESS != '') }}";
-
-/// The inputs of the network join, all of them: workload identity federation with the run's
-/// token (the CI trust credential, `TS_CLIENT_ID` and `TS_AUDIENCE`, as `tag:ci`), so no
-/// `authkey` or `oauth-secret`.
-const TS_WITH: [(&str, &str); 3] = [
-    ("oauth-client-id", "${{ vars.TS_CLIENT_ID }}"),
-    ("audience", "${{ vars.TS_AUDIENCE }}"),
-    ("tags", "tag:ci"),
-];
-
-/// The jobs, in file order.
-const JOBS: [&str; 9] = [
+/// The jobs the release had before the apt jobs, in file order.
+const CORE_JOBS: [&str; 9] = [
     "plan",
     "verify",
     "tag",
@@ -124,6 +81,15 @@ const JOBS: [&str; 9] = [
     REHEARSE_AGENT,
     GAMMA,
 ];
+
+/// The jobs, in file order: [`CORE_JOBS`], then the jobs of [`apt`].
+pub fn jobs() -> Vec<String> {
+    CORE_JOBS
+        .iter()
+        .map(|j| (*j).to_owned())
+        .chain(apt::jobs())
+        .collect()
+}
 
 /// The events that start the workflow: the completion of a run of [`PIPELINE`], filtered to
 /// [`TYPES`] and `branches: [main]`, and only while [`CHAIN`] is whole.
@@ -161,20 +127,42 @@ pub const RELEASE_IF: &str = "${{ github.event.workflow_run.conclusion == 'succe
 /// repository.
 pub const PLAN_IF: &str = "${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository }}";
 
-/// The jobs that may hold `id-token: write`: the gamma stage, which presents the token to the
-/// farm's update coordinator and signs nothing.
-const ID_TOKEN: &[&str] = &[GAMMA];
+/// Whether `job` may hold `id-token: write`: the gamma stage, which presents the token to the
+/// tailnet's identity federation, and the apt read and write jobs, which present it to the cloud
+/// provider. None signs anything.
+fn may_hold_id_token(job: &str) -> bool {
+    job == GAMMA || apt::may_hold_id_token(job)
+}
 
 /// The `(job, scope)` pairs that may be `write`.
 const WRITERS: &[(&str, &str)] = &[(PUBLISH, "contents")];
 
 /// What a job must be.
-struct Rule {
-    job: &'static str,
-    needs: &'static [&'static str],
-    permissions: &'static [(&'static str, &'static str)],
-    condition: Option<&'static str>,
-    environment: Option<&'static str>,
+pub struct Rule {
+    job: String,
+    needs: Vec<String>,
+    permissions: Vec<(String, String)>,
+    condition: Option<String>,
+    environment: Option<String>,
+}
+
+fn rule(
+    job: &str,
+    needs: &[&str],
+    permissions: &[(&str, &str)],
+    condition: &str,
+    environment: Option<&str>,
+) -> Rule {
+    Rule {
+        job: job.to_owned(),
+        needs: needs.iter().map(|n| (*n).to_owned()).collect(),
+        permissions: permissions
+            .iter()
+            .map(|(s, l)| ((*s).to_owned(), (*l).to_owned()))
+            .collect(),
+        condition: Some(condition.to_owned()),
+        environment: environment.map(str::to_owned),
+    }
 }
 
 const READ: &[(&str, &str)] = &[
@@ -183,71 +171,64 @@ const READ: &[(&str, &str)] = &[
     ("attestations", "read"),
 ];
 
-const RULES: [Rule; 9] = [
-    Rule {
-        job: "plan",
-        needs: &[],
-        permissions: &[("contents", "read"), ("actions", "read")],
-        condition: Some(PLAN_IF),
-        environment: None,
-    },
-    Rule {
-        job: "verify",
-        needs: &["plan"],
-        permissions: READ,
-        condition: Some(VERIFY_IF),
-        environment: None,
-    },
-    Rule {
-        job: "tag",
-        needs: &["plan", "verify"],
-        permissions: &[("contents", "read")],
-        condition: Some(RELEASE_IF),
-        environment: Some(ENVIRONMENT),
-    },
-    Rule {
-        job: "notes",
-        needs: &["plan", "verify", "tag"],
-        permissions: READ,
-        condition: Some(RELEASE_IF),
-        environment: None,
-    },
-    Rule {
-        job: PUBLISH,
-        needs: &["plan", "verify", "tag", "notes"],
-        permissions: &[("contents", "write")],
-        condition: Some(RELEASE_IF),
-        environment: Some(ENVIRONMENT),
-    },
-    Rule {
-        job: "bump",
-        needs: &["plan", "tag", PUBLISH],
-        permissions: &[("contents", "read")],
-        condition: Some(RELEASE_IF),
-        environment: Some(ENVIRONMENT),
-    },
-    Rule {
-        job: REHEARSE,
-        needs: &["plan", PUBLISH],
-        permissions: &[("contents", "read")],
-        condition: Some(RELEASE_IF),
-        environment: None,
-    },
-    Rule {
-        job: REHEARSE_AGENT,
-        needs: &["plan", PUBLISH],
-        permissions: &[("contents", "read")],
-        condition: Some(RELEASE_IF),
-        environment: None,
-    },
-    Rule {
-        job: GAMMA,
-        needs: &["plan", PUBLISH, REHEARSE, REHEARSE_AGENT],
-        permissions: &[("contents", "read"), ("id-token", "write")],
-        condition: Some(RELEASE_IF),
-        environment: Some(ENVIRONMENT),
-    },
-];
+/// The row of every job: the rules of the jobs before the apt jobs, then those of [`apt`].
+fn rules() -> Vec<Rule> {
+    let mut all = vec![
+        rule(
+            "plan",
+            &[],
+            &[("contents", "read"), ("actions", "read")],
+            PLAN_IF,
+            None,
+        ),
+        rule("verify", &["plan"], READ, VERIFY_IF, None),
+        rule(
+            "tag",
+            &["plan", "verify"],
+            &[("contents", "read")],
+            RELEASE_IF,
+            Some(ENVIRONMENT),
+        ),
+        rule("notes", &["plan", "verify", "tag"], READ, RELEASE_IF, None),
+        rule(
+            PUBLISH,
+            &["plan", "verify", "tag", "notes"],
+            &[("contents", "write")],
+            RELEASE_IF,
+            Some(ENVIRONMENT),
+        ),
+        rule(
+            "bump",
+            &["plan", "tag", PUBLISH],
+            &[("contents", "read")],
+            RELEASE_IF,
+            Some(ENVIRONMENT),
+        ),
+        rule(
+            REHEARSE,
+            &["plan", PUBLISH],
+            &[("contents", "read")],
+            RELEASE_IF,
+            None,
+        ),
+        rule(
+            REHEARSE_AGENT,
+            &["plan", PUBLISH],
+            &[("contents", "read")],
+            RELEASE_IF,
+            None,
+        ),
+        rule(
+            GAMMA,
+            &["plan", PUBLISH, REHEARSE, REHEARSE_AGENT],
+            &[("contents", "read"), ("id-token", "write")],
+            RELEASE_IF,
+            Some(ENVIRONMENT),
+        ),
+    ];
+    all.extend(apt::rules());
+    all
+}
 
 /// The jobs that read the release bot's key and mint its token.
 const BOT_JOBS: &[&str] = &["tag", "bump"];
@@ -257,6 +238,16 @@ const APP_TOKEN: &str = "actions/create-github-app-token@";
 const GATING: &[&str] = &["plan", "verify"];
 /// The jobs that write, or hold a token that can.
 const WRITING: &[&str] = &["tag", "notes", PUBLISH, "bump", GAMMA];
+
+/// The jobs that write, or hold a token, a key or a role that can: [`WRITING`] and the apt jobs
+/// that hold the role or the key.
+fn writing() -> Vec<String> {
+    WRITING
+        .iter()
+        .map(|j| (*j).to_owned())
+        .chain(apt::holding())
+        .collect()
+}
 
 /// The group and the no-cancel of the one release at a time. A pipeline run that did not
 /// succeed starts this workflow too (every job skips); its group is its own, so it never
@@ -384,7 +375,9 @@ pub fn problems(release: &str) -> Result<Vec<String>, String> {
     publish_job(release, &mut out)?;
     bump_job(release, &mut out)?;
     rehearse_job(release, &mut out)?;
-    gamma_job(release, &mut out)?;
+    gamma::rules(release, &mut out)?;
+    apt::problems(release, &mut out)?;
+    apt::package_version(release, &mut out)?;
     // The shared rules, as the workflow lint reads them (pins, runners, permissions).
     out.extend(
         workflows::scan(release, &workflows::Repo::default())
@@ -431,9 +424,10 @@ fn triggers(release: &str, out: &mut Vec<String>) -> Result<(), String> {
         }
     }
     let names = workflows::job_names(release)?;
-    if names != JOBS {
+    let want = jobs();
+    if names != want {
         out.push(format!(
-            "the jobs are {names:?}, not {JOBS:?} in that order (`{PUBLISH}` by that exact name)"
+            "the jobs are {names:?}, not {want:?} in that order (`{PUBLISH}` by that exact name)"
         ));
     }
     let concurrency = workflows::concurrency(release)?;
@@ -468,10 +462,10 @@ fn closure(release: &str, job: &str) -> Result<Vec<String>, String> {
 }
 
 fn graph(release: &str, out: &mut Vec<String>) -> Result<(), String> {
-    for rule in &RULES {
-        let job = rule.job;
+    for rule in &rules() {
+        let job = rule.job.as_str();
         let needs = workflows::job_needs(release, job)?;
-        if sorted(needs.clone()) != sorted(rule.needs.iter().copied()) {
+        if sorted(needs.clone()) != sorted(rule.needs.iter().cloned()) {
             out.push(format!(
                 "the job `{job}` needs {needs:?}, not {:?}",
                 rule.needs
@@ -496,30 +490,31 @@ fn graph(release: &str, out: &mut Vec<String>) -> Result<(), String> {
                     "the job `{job}` holds `{scope}: {level}`: only {WRITERS:?} may write"
                 ));
             }
-            if scope == "id-token" && on && !ID_TOKEN.contains(&job) {
+            if scope == "id-token" && on && !may_hold_id_token(job) {
                 out.push(format!(
-                    "the job `{job}` holds `id-token: {level}`, which only {ID_TOKEN:?} may"
+                    "the job `{job}` holds `id-token: {level}`, which only `{GAMMA}` and the apt read and write jobs may"
                 ));
             }
         }
         let condition = workflows::job_condition(release, job)?;
-        if condition.as_deref() != rule.condition {
+        if condition != rule.condition {
             out.push(format!(
                 "the job `{job}` has `if: {}`, not {}",
                 condition.as_deref().unwrap_or("(none)"),
                 rule.condition
+                    .as_ref()
                     .map_or("none".to_owned(), |c| format!("exactly `{c}`")),
             ));
         }
         let environment = workflows::job_environment(release, job)?;
-        if environment.as_deref() != rule.environment {
+        if environment != rule.environment {
             out.push(format!(
                 "the job `{job}` has environment {environment:?}, not {:?}",
                 rule.environment
             ));
         }
     }
-    for job in WRITING {
+    for job in &writing() {
         let needs = closure(release, job)?;
         for gate in GATING {
             if !needs.iter().any(|n| n == gate) {
@@ -532,10 +527,30 @@ fn graph(release: &str, out: &mut Vec<String>) -> Result<(), String> {
     Ok(())
 }
 
+/// `code` without the `if:` of each job that has the exact condition of its row, when that
+/// condition says `!cancelled()`: the apt jobs that follow a job that may have been skipped. Any
+/// other `!cancelled()` or `failure()`, in another job or in another spelling, stays.
+fn without_apt_conditions(release: &str, mut code: String) -> Result<String, String> {
+    for rule in rules() {
+        let Some(want) = rule
+            .condition
+            .as_deref()
+            .filter(|c| c.contains("cancelled()"))
+        else {
+            continue;
+        };
+        if workflows::job_condition(release, &rule.job)?.as_deref() == Some(want) {
+            code = code.replacen(want, "", 1);
+        }
+    }
+    Ok(code)
+}
+
 /// No way for a job to pass or run after a red one, and no step under `if:` but the
-/// previous release's in `notes`.
+/// previous release's in `notes`, the steps of `gamma` under its switch and the steps of an apt
+/// job under the gate's output.
 fn halting(release: &str, out: &mut Vec<String>) -> Result<(), String> {
-    let code = restore::without_its_condition(release, code(release))?;
+    let code = without_apt_conditions(release, code(release))?;
     for word in CONTINUING {
         if code.contains(word) {
             out.push(format!(
@@ -543,20 +558,18 @@ fn halting(release: &str, out: &mut Vec<String>) -> Result<(), String> {
             ));
         }
     }
-    for job in JOBS {
+    for job in &jobs() {
         let steps = workflows::job_steps(release, job)?;
-        for (at, step) in steps.iter().enumerate() {
-            let previous = step
-                .condition
-                .as_deref()
-                .is_some_and(|c| c == "${{ steps.previous.outputs.previous != '' }}");
-            let join =
-                job == GAMMA && uses(step, TS_ACTION) && step.condition.as_deref() == Some(TS_IF);
-            let allowed =
-                (job == "notes" && previous) || join || restore::is_restore(job, &steps, at);
+        for step in &steps {
+            let condition = step.condition.as_deref();
+            let allowed = match job.as_str() {
+                "notes" => condition == Some("${{ steps.previous.outputs.previous != '' }}"),
+                GAMMA => condition == Some(gamma::SETS_IF) || condition == Some(gamma::JOIN_IF),
+                _ => apt::spec(job).is_some() && condition == Some(apt::GATE_IF),
+            };
             if step.conditional && !allowed {
                 out.push(format!(
-                    "a step of `{job}` ({:?}) is under `if:` or `continue-on-error:`: only the previous release's steps of `notes`, the network join of `gamma` and its last step, the restore, may be",
+                    "a step of `{job}` ({:?}) is under `if:` or `continue-on-error:`: only the previous release's steps of `notes`, the steps of `gamma` under `KBF_SETS_DESIRED` and the steps of an apt job under the gate's output may be",
                     step.name.as_deref().or(step.uses.as_deref()).unwrap_or("?")
                 ));
             }
@@ -591,9 +604,9 @@ fn secrets(release: &str, out: &mut Vec<String>) -> Result<(), String> {
             "the workflow names `RELEASE_TAGGER_*`: the one App is `RELEASE_BOT_*`".to_owned(),
         );
     }
-    for job in JOBS {
+    for job in &jobs() {
         let text = job_text(release, job);
-        let bot = BOT_JOBS.contains(&job);
+        let bot = BOT_JOBS.contains(&job.as_str());
         if text.contains("RELEASE_BOT_") && !bot {
             out.push(format!(
                 "the job `{job}` reads `RELEASE_BOT_*`: only {BOT_JOBS:?} may hold the release bot's key"
@@ -617,9 +630,13 @@ fn secrets(release: &str, out: &mut Vec<String>) -> Result<(), String> {
             ));
         }
         for at in text.match_indices("secrets.").map(|(i, _)| &text[i..]) {
-            if !at.starts_with("secrets.RELEASE_BOT_PRIVATE_KEY") {
+            // The signing key is the apt index jobs', and `apt` holds where each may read it.
+            let key = apt::spec(job).is_some_and(|s| s.kind == workflows::release_ifs::Kind::Index)
+                && (at.starts_with("secrets.APT_GPG_PRIVATE_KEY")
+                    || at.starts_with("secrets.APT_GPG_PASSPHRASE"));
+            if !at.starts_with("secrets.RELEASE_BOT_PRIVATE_KEY") && !key {
                 out.push(format!(
-                    "the job `{job}` reads a secret other than `RELEASE_BOT_PRIVATE_KEY`"
+                    "the job `{job}` reads a secret other than `RELEASE_BOT_PRIVATE_KEY` (the apt index jobs read the signing key besides)"
                 ));
             }
         }
@@ -635,7 +652,11 @@ fn secrets(release: &str, out: &mut Vec<String>) -> Result<(), String> {
 
 /// Every checkout is of the commit the pipeline run built, with no credentials left behind.
 fn checkouts(release: &str, out: &mut Vec<String>) -> Result<(), String> {
-    for job in JOBS {
+    for job in &jobs() {
+        if apt::consumes_tool(job) {
+            // Holds the cloud role or the signing key, so it has no checkout: `apt` holds that.
+            continue;
+        }
         let steps = workflows::job_steps(release, job)?;
         let mut seen = 0;
         for step in steps.iter().filter(|s| uses(s, "actions/checkout@")) {
@@ -766,7 +787,7 @@ fn context(release: &str, out: &mut Vec<String>) -> Result<(), String> {
             ));
         }
     }
-    for job in JOBS {
+    for job in &jobs() {
         let own = workflows::job_env(release, job)?;
         if own
             .iter()
@@ -784,9 +805,9 @@ fn context(release: &str, out: &mut Vec<String>) -> Result<(), String> {
 /// another run, and each of the pipeline run that started this one: every later job takes the
 /// files `verify` checked.
 fn downloads_of_this_run(release: &str, out: &mut Vec<String>) -> Result<(), String> {
-    for rule in &RULES {
-        let steps = workflows::job_steps(release, rule.job)?;
-        let reads_other_run = ["plan", "verify"].contains(&rule.job);
+    for rule in &rules() {
+        let steps = workflows::job_steps(release, &rule.job)?;
+        let reads_other_run = ["plan", "verify"].contains(&rule.job.as_str());
         for d in steps
             .iter()
             .filter(|s| uses(s, "actions/download-artifact@"))
@@ -1079,248 +1100,6 @@ fn bump_job(release: &str, out: &mut Vec<String>) -> Result<(), String> {
         bot.id.as_deref().unwrap_or("")
     );
     env_is(job, bs, "GH_TOKEN", &want, out);
-    Ok(())
-}
-
-/// The gamma stage: the address from the repository variable alone, in no other job and in
-/// no literal, the release's version, and the one verb unconditionally.
-fn gamma_job(release: &str, out: &mut Vec<String>) -> Result<(), String> {
-    let job = GAMMA;
-    let steps = workflows::job_steps(release, job)?;
-    for other in JOBS.iter().filter(|j| **j != job) {
-        if job_text(release, other).contains(COORDINATOR_URL_VAR) {
-            out.push(format!(
-                "the job `{other}` reads `{COORDINATOR_URL_VAR}`: the coordinator's address is `{job}`'s alone"
-            ));
-        }
-    }
-    for other in JOBS.iter().filter(|j| **j != job) {
-        if job_text(release, other).contains("vars.FARM_") {
-            out.push(format!(
-                "the job `{other}` reads a `FARM_` variable: the farm's address and platform are `{job}`'s alone"
-            ));
-        }
-    }
-    // The pinned Buck2 download is the one address the job names.
-    let text: String = job_text(release, job)
-        .lines()
-        .filter(|l| !l.contains(BUCK2_FETCH))
-        .collect::<Vec<_>>()
-        .join("\n");
-    if text.contains("http://") || text.contains("https://") {
-        out.push(format!(
-            "the job `{job}` writes an address: the coordinator's is the repository variable `{COORDINATOR_URL_VAR}`, never a literal"
-        ));
-    }
-    if text.contains("grpc://") || text.contains("grpcs://") {
-        out.push(format!(
-            "the job `{job}` writes a farm address: it is the organisation variable `FARM_ADDRESS`, never a literal"
-        ));
-    }
-    if text.contains("secrets.") {
-        out.push(format!(
-            "the job `{job}` reads a secret: it holds the run's OIDC token and nothing else"
-        ));
-    }
-    let Some((at, step, words)) = restore::deploy_step(&steps, out) else {
-        return Ok(());
-    };
-    tailnet_join(release, &steps, at, out)?;
-    let verb = "cargo xtask deploy-farm";
-    flag_is(&words, verb, "--url", "$COORDINATOR_URL", out);
-    flag_is(&words, verb, "--ca-pem", "$COORDINATOR_CA", out);
-    flag_is(&words, verb, "--version", "$VERSION", out);
-    env_is(
-        job,
-        step,
-        "COORDINATOR_CA",
-        "${{ vars.KBF_COORDINATOR_CA }}",
-        out,
-    );
-    env_is(
-        job,
-        step,
-        "COORDINATOR_URL",
-        &format!("${{{{ {COORDINATOR_URL_VAR} }}}}"),
-        out,
-    );
-    // The release's tag is not what the hosts report; the version given is the one the
-    // farm-version step derived from the release's own facts.
-    env_is(
-        job,
-        step,
-        "VERSION",
-        "${{ steps.farm-version.outputs.version }}",
-        out,
-    );
-    farm_version(&steps, at, out);
-    prove_farm(&steps, at, out);
-    restore::rules(release, &steps, &words, out)
-}
-
-/// The step of `gamma` that derives the version `deploy-farm` is given (at `farm_at`): the
-/// hosts' form, `<version>+g<commit>`, read from the release's version facts by
-/// `release farm-version` for this run's commit, before the deploy, under the id the deploy
-/// step reads it by.
-fn farm_version(steps: &[workflows::Step], farm_at: usize, out: &mut Vec<String>) {
-    let job = GAMMA;
-    let verb = "cargo xtask release farm-version";
-    let Some((at, step, words)) = run_of(job, steps, "cargo xtask release farm-version ", out)
-    else {
-        return;
-    };
-    if at > farm_at {
-        out.push(format!(
-            "`{verb}` runs after `cargo xtask deploy-farm`: the deploy would be given another version"
-        ));
-    }
-    if step.id.as_deref() != Some("farm-version") {
-        out.push(format!(
-            "the step that runs `{verb}` does not have `id: farm-version`"
-        ));
-    }
-    if step.condition.is_some() || step.conditional {
-        out.push(format!(
-            "`{verb}` is under a condition: the deploy step reads its output"
-        ));
-    }
-    flag_is(&words, verb, "--commit", "$COMMIT", out);
-    flag_is(&words, verb, "--output", "$GITHUB_OUTPUT", out);
-    flag_is(&words, verb, "--repo", "$GITHUB_REPOSITORY", out);
-    flag_is(&words, verb, "--tag", "$TAG", out);
-    env_is(GAMMA, step, "TAG", "${{ needs.plan.outputs.tag }}", out);
-}
-
-/// The proof step of `gamma`: Buck2 fetched as `beta.yml` does, then one unconditional
-/// `prove-farm` after `deploy-farm` (at `farm_at`), given the four `FARM_` variables and the
-/// nonce through `env:` and the fetched Buck2 and the project by their paths.
-fn prove_farm(steps: &[workflows::Step], farm_at: usize, out: &mut Vec<String>) {
-    let job = GAMMA;
-    let verb = "cargo xtask prove-farm";
-    let Some((at, step, words)) = run_of(job, steps, "cargo xtask prove-farm ", out) else {
-        return;
-    };
-    if at < farm_at {
-        out.push(format!(
-            "`{verb}` runs before `cargo xtask deploy-farm`: it would prove the farm of the last release"
-        ));
-    }
-    let count = steps
-        .iter()
-        .filter(|s| lines(s).any(|l| l.starts_with("cargo xtask prove-farm ")))
-        .count();
-    if count != 1 {
-        out.push(format!("`{job}` runs `{verb}` {count} times, not once"));
-    }
-    if step.condition.is_some() || step.conditional {
-        out.push(format!(
-            "`{verb}` is under a condition: an unset `FARM_ADDRESS` is the verb's notice, not a skipped step"
-        ));
-    }
-    let fetched = steps
-        .iter()
-        .position(|s| s.run.as_deref().map(str::trim) == Some(BUCK2_FETCH));
-    if fetched.is_none_or(|f| f > at) {
-        out.push(format!(
-            "`{job}` does not fetch Buck2 with `{BUCK2_FETCH}` before `{verb}`"
-        ));
-    }
-    if let Some(f) = fetched
-        && !steps[f].env.is_empty()
-    {
-        out.push(format!(
-                "the Buck2 fetch step of `{job}` has an `env:`: its pins are the job's `BUCK2_VERSION` and `BUCK2_SHA256`, which the pins lint ties to beta.yml, and a step's own could fetch other bytes"
-            ));
-    }
-    flag_is(&words, verb, "--address", "$FARM_ADDRESS", out);
-    flag_is(&words, verb, "--instance", "$FARM_INSTANCE", out);
-    flag_is(&words, verb, "--tls", "$FARM_TLS", out);
-    flag_is(&words, verb, "--properties", "$FARM_PROPERTIES", out);
-    flag_is(&words, verb, "--buck2", "$RUNNER_TEMP/tools/buck2", out);
-    flag_is(
-        &words,
-        verb,
-        "--project",
-        "crates/kbf-integration-test/gamma/buck2",
-        out,
-    );
-    flag_is(&words, verb, "--nonce", "$NONCE", out);
-    for (key, want) in FARM_VARS {
-        env_is(job, step, key, want, out);
-    }
-    env_is(job, step, "NONCE", NONCE, out);
-    if step.env.len() != FARM_VARS.len() + 1 {
-        out.push(format!(
-            "the step of `{job}` that runs `{verb}` has {} `env:` entries, not the four `FARM_` variables and the nonce",
-            step.env.len()
-        ));
-    }
-}
-
-/// The network join of `gamma`, if there is one: one step, after the build of xtask and before
-/// the verb (at `verb_at`), under [`TS_IF`], given exactly [`TS_WITH`] and no `env:`; and in no
-/// other job.
-fn tailnet_join(
-    release: &str,
-    steps: &[workflows::Step],
-    verb_at: usize,
-    out: &mut Vec<String>,
-) -> Result<(), String> {
-    for job in JOBS.iter().filter(|j| **j != GAMMA) {
-        if workflows::job_steps(release, job)?
-            .iter()
-            .any(|s| uses(s, TS_ACTION))
-        {
-            out.push(format!(
-                "the job `{job}` uses `{TS_ACTION}`: only `{GAMMA}` joins the farm's network"
-            ));
-        }
-    }
-    let joins: Vec<usize> = (0..steps.len())
-        .filter(|&i| uses(&steps[i], TS_ACTION))
-        .collect();
-    if joins.len() > 1 {
-        out.push(format!(
-            "`{GAMMA}` uses `{TS_ACTION}` {} times, not once",
-            joins.len()
-        ));
-    }
-    let built = steps.iter().position(|s| {
-        s.run
-            .as_deref()
-            .is_some_and(|r| r.trim() == "cargo build -p xtask --locked")
-    });
-    for &i in &joins {
-        let step = &steps[i];
-        if step.condition.as_deref() != Some(TS_IF) {
-            out.push(format!(
-                "the network join of `{GAMMA}` is not under exactly `if: {TS_IF}`"
-            ));
-        }
-        let mut with: Vec<(&str, &str)> = step
-            .with
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect();
-        with.sort_unstable();
-        let mut want = TS_WITH.to_vec();
-        want.sort_unstable();
-        if with != want {
-            out.push(format!(
-                "the network join of `{GAMMA}` is given {with:?}, not exactly {want:?}: the client id and audience are the CI trust credential's variables, the tag is `tag:ci`, and the run token is its only credential"
-            ));
-        }
-        if !step.env.is_empty() {
-            out.push(format!(
-                "the network join of `{GAMMA}` has an `env:`: its inputs are the three of `with:` alone"
-            ));
-        }
-        if i > verb_at || built.is_none_or(|b| i < b) {
-            out.push(format!(
-                "the network join of `{GAMMA}` is not after `cargo build -p xtask` and before `cargo xtask deploy-farm`: the build's scripts would see the network, or the verb would run without it"
-            ));
-        }
-    }
     Ok(())
 }
 

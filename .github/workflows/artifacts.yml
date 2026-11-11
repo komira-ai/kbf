@@ -440,7 +440,7 @@ jobs:
       # inside one it names), so it may hold a previous run's package files; pkg-trust and
       # pkg-config refuse to overwrite a file.
       - name: Remove the package files a restored target/ may hold
-        run: rm -rf target/pkg target/pkg-trust
+        run: rm -rf target/pkg target/pkg-trust target/pkg-native
       - name: Write the package's trust directory
         run: cargo xtask pkg-trust --gh "$RUNNER_TEMP/tools/gh" --trusted-root "$RUNNER_TEMP/trusted_root.jsonl" --source-ref "$PKG_SOURCE_REF" --out target/pkg-trust
       - name: Write the nfpm configuration
@@ -457,6 +457,15 @@ jobs:
         run: cargo xtask pkg-upgrade-test --old-installer "$RUNNER_TEMP/upgrade/kbf-installer-old.deb" --old-kbf "$RUNNER_TEMP/upgrade/kbf-old.deb" --package target/pkg/out --listing target/pkg/listing.txt --image-dir packaging/linux/test/ubuntu
       - name: The kbf deb is the attested kbf with the units of the modes and a trust directory for this branch, and is an asset
         run: cargo xtask pkg-kbf-asset --package target/pkg/out --platform linux-x86_64 --commit "$GITHUB_SHA" --kbf-tarball "dist/kbf-$GITHUB_SHA-linux-x86_64.tar.gz" --expect-ref "$PKG_SOURCE_REF" --gh "$RUNNER_TEMP/tools/gh" --out dist
+      # The native package: the same kbf deb without the host agent, at the version
+      # <major>.<minor>.<seq> that `kbf --version --json` names, which hostkeeper installs from the apt
+      # repository (packaging/linux/README.md). Its asset is kbf-native-<commit>-linux-x86_64.deb.
+      - name: Write the nfpm configuration of the native package
+        run: cargo xtask pkg-config --kbf "target/$TARGET/release/kbf" --units packaging/linux/units --trust target/pkg-trust --sysusers packaging/linux/sysusers.d/kbf-installer.conf --tmpfiles packaging/linux/tmpfiles.d/kbf-installer.conf --needrestart packaging/linux/needrestart/kbf.conf --no-host-agent --platform linux-x86_64 --native-version-of "target/$TARGET/release/kbf" --out target/pkg-native
+      - name: Build the deb and the rpm of the native package, each twice
+        run: cargo xtask pkg-build --nfpm "$RUNNER_TEMP/tools/nfpm" --config target/pkg-native/nfpm.yaml --out target/pkg-native/out
+      - name: The native deb is the attested kbf with the units of the modes, no host agent and a native version, and is an asset
+        run: cargo xtask pkg-kbf-asset --native --native-version-of "target/$TARGET/release/kbf" --package target/pkg-native/out --platform linux-x86_64 --commit "$GITHUB_SHA" --kbf-tarball "dist/kbf-$GITHUB_SHA-linux-x86_64.tar.gz" --expect-ref "$PKG_SOURCE_REF" --gh "$RUNNER_TEMP/tools/gh" --out dist
       # The frontend image (packaging/container/frontend/Dockerfile): the attested kbf, unpacked from
       # the tarball above and not rebuilt, on a pinned base. It is built twice from the commit's time
       # (SOURCE_DATE_EPOCH, no provenance or SBOM attachments of buildx's own) and the two
@@ -659,7 +668,7 @@ jobs:
       # inside one it names), so it may hold a previous run's package files; pkg-trust and
       # pkg-config refuse to overwrite a file.
       - name: Remove the package files a restored target/ may hold
-        run: rm -rf target/pkg target/pkg-trust
+        run: rm -rf target/pkg target/pkg-trust target/pkg-native
       - name: Write the package's trust directory
         run: cargo xtask pkg-trust --gh "$RUNNER_TEMP/tools/gh" --trusted-root "$RUNNER_TEMP/trusted_root.jsonl" --source-ref "$PKG_SOURCE_REF" --out target/pkg-trust
       - name: Write the nfpm configuration
@@ -676,6 +685,15 @@ jobs:
         run: cargo xtask pkg-upgrade-test --old-installer "$RUNNER_TEMP/upgrade/kbf-installer-old.deb" --old-kbf "$RUNNER_TEMP/upgrade/kbf-old.deb" --package target/pkg/out --listing target/pkg/listing.txt --image-dir packaging/linux/test/ubuntu
       - name: The kbf deb is the attested kbf with the units of the modes and a trust directory for this branch, and is an asset
         run: cargo xtask pkg-kbf-asset --package target/pkg/out --platform linux-arm64 --commit "$GITHUB_SHA" --kbf-tarball "dist/kbf-$GITHUB_SHA-linux-arm64.tar.gz" --expect-ref "$PKG_SOURCE_REF" --gh "$RUNNER_TEMP/tools/gh" --out dist
+      # The native package: the same kbf deb without the host agent, at the version
+      # <major>.<minor>.<seq> that `kbf --version --json` names, which hostkeeper installs from the apt
+      # repository (packaging/linux/README.md). Its asset is kbf-native-<commit>-linux-arm64.deb.
+      - name: Write the nfpm configuration of the native package
+        run: cargo xtask pkg-config --kbf "target/$TARGET/release/kbf" --units packaging/linux/units --trust target/pkg-trust --sysusers packaging/linux/sysusers.d/kbf-installer.conf --tmpfiles packaging/linux/tmpfiles.d/kbf-installer.conf --needrestart packaging/linux/needrestart/kbf.conf --no-host-agent --platform linux-arm64 --native-version-of "target/$TARGET/release/kbf" --out target/pkg-native
+      - name: Build the deb and the rpm of the native package, each twice
+        run: cargo xtask pkg-build --nfpm "$RUNNER_TEMP/tools/nfpm" --config target/pkg-native/nfpm.yaml --out target/pkg-native/out
+      - name: The native deb is the attested kbf with the units of the modes, no host agent and a native version, and is an asset
+        run: cargo xtask pkg-kbf-asset --native --native-version-of "target/$TARGET/release/kbf" --package target/pkg-native/out --platform linux-arm64 --commit "$GITHUB_SHA" --kbf-tarball "dist/kbf-$GITHUB_SHA-linux-arm64.tar.gz" --expect-ref "$PKG_SOURCE_REF" --gh "$RUNNER_TEMP/tools/gh" --out dist
       # The frontend image (packaging/container/frontend/Dockerfile): the attested kbf, unpacked from
       # the tarball above and not rebuilt, on a pinned base. It is built twice from the commit's time
       # (SOURCE_DATE_EPOCH, no provenance or SBOM attachments of buildx's own) and the two
@@ -1051,6 +1069,14 @@ jobs:
         env:
           BUNDLE: ${{ steps.provenance-kbf-deb-linux-x86_64.outputs.bundle-path }}
         run: cp "$BUNDLE" "dist/kbf-${GITHUB_SHA}-linux-x86_64.deb.sigstore.json"
+      - id: provenance-kbf-native-deb-linux-x86_64
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/kbf-native-${{ github.sha }}-linux-x86_64.deb
+      - name: Name the bundle of the native kbf package for linux-x86_64
+        env:
+          BUNDLE: ${{ steps.provenance-kbf-native-deb-linux-x86_64.outputs.bundle-path }}
+        run: cp "$BUNDLE" "dist/kbf-native-${GITHUB_SHA}-linux-x86_64.deb.sigstore.json"
       - id: provenance-kbf-frontend-image-linux-x86_64
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
@@ -1147,6 +1173,14 @@ jobs:
         env:
           BUNDLE: ${{ steps.provenance-kbf-deb-linux-arm64.outputs.bundle-path }}
         run: cp "$BUNDLE" "dist/kbf-${GITHUB_SHA}-linux-arm64.deb.sigstore.json"
+      - id: provenance-kbf-native-deb-linux-arm64
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/kbf-native-${{ github.sha }}-linux-arm64.deb
+      - name: Name the bundle of the native kbf package for linux-arm64
+        env:
+          BUNDLE: ${{ steps.provenance-kbf-native-deb-linux-arm64.outputs.bundle-path }}
+        run: cp "$BUNDLE" "dist/kbf-native-${GITHUB_SHA}-linux-arm64.deb.sigstore.json"
       - id: provenance-kbf-frontend-image-linux-arm64
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
@@ -1370,6 +1404,8 @@ jobs:
         run: cargo xtask verify-assets attestations dist --repo "$GITHUB_REPOSITORY" --workflow-ref "$GITHUB_REPOSITORY/.github/workflows/artifacts.yml" --source-ref "$GITHUB_REF" --commit "$GITHUB_SHA" --trusted-root "$RUNNER_TEMP/trusted_root.jsonl"
       - name: The signed linux-x86_64 kbf package holds the attested kbf, the units of the modes and a trust directory for this branch
         run: cargo xtask pkg-kbf-asset --verify-only --package "dist/kbf-$GITHUB_SHA-linux-x86_64.deb" --platform linux-x86_64 --commit "$GITHUB_SHA" --kbf-tarball "dist/kbf-$GITHUB_SHA-linux-x86_64.tar.gz" --expect-ref "$GITHUB_REF"
+      - name: The signed linux-x86_64 native kbf package holds the attested kbf, the units of the modes, no host agent and a trust directory for this branch
+        run: cargo xtask pkg-kbf-asset --verify-only --native --package "dist/kbf-native-$GITHUB_SHA-linux-x86_64.deb" --platform linux-x86_64 --commit "$GITHUB_SHA" --kbf-tarball "dist/kbf-$GITHUB_SHA-linux-x86_64.tar.gz" --expect-ref "$GITHUB_REF"
       - name: The signed linux-x86_64 frontend image holds the attested kbf
         run: cargo xtask pkg-image-asset --verify-only --service frontend --image "dist/kbf-frontend-image-$GITHUB_SHA-linux-x86_64.oci.tar" --platform linux-x86_64 --commit "$GITHUB_SHA" --kbf-tarball "dist/kbf-$GITHUB_SHA-linux-x86_64.tar.gz"
       - name: The signed linux-x86_64 coordinator image runs the coordinator as a user that is not root
@@ -1380,6 +1416,8 @@ jobs:
         run: cargo xtask pkg-image-sbom --verify-only --service task --image "dist/kbf-task-image-$GITHUB_SHA-linux-x86_64.oci.tar" --platform linux-x86_64 --commit "$GITHUB_SHA"
       - name: The signed linux-arm64 kbf package holds the attested kbf, the units of the modes and a trust directory for this branch
         run: cargo xtask pkg-kbf-asset --verify-only --package "dist/kbf-$GITHUB_SHA-linux-arm64.deb" --platform linux-arm64 --commit "$GITHUB_SHA" --kbf-tarball "dist/kbf-$GITHUB_SHA-linux-arm64.tar.gz" --expect-ref "$GITHUB_REF"
+      - name: The signed linux-arm64 native kbf package holds the attested kbf, the units of the modes, no host agent and a trust directory for this branch
+        run: cargo xtask pkg-kbf-asset --verify-only --native --package "dist/kbf-native-$GITHUB_SHA-linux-arm64.deb" --platform linux-arm64 --commit "$GITHUB_SHA" --kbf-tarball "dist/kbf-$GITHUB_SHA-linux-arm64.tar.gz" --expect-ref "$GITHUB_REF"
       - name: The signed linux-arm64 frontend image holds the attested kbf
         run: cargo xtask pkg-image-asset --verify-only --service frontend --image "dist/kbf-frontend-image-$GITHUB_SHA-linux-arm64.oci.tar" --platform linux-arm64 --commit "$GITHUB_SHA" --kbf-tarball "dist/kbf-$GITHUB_SHA-linux-arm64.tar.gz"
       - name: The signed linux-arm64 coordinator image runs the coordinator as a user that is not root

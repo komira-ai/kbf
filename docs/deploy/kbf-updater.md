@@ -667,7 +667,12 @@ hold: updating
 
 ## Turn on the gamma stage
 
-The last job of `release.yml`, `gamma`, tells the update coordinator "desired = this release" once
+**Retired for the farm.** The farm's Linux nodes are deployed by hostkeeper
+([farm-hostkeeper.md](farm-hostkeeper.md)), and `gamma` no longer runs `cargo xtask deploy-farm` or reads
+the variables below. The rest of this section describes the step as it was, for a farm that still runs the
+coordinator by hand.
+
+The last job of `release.yml`, `gamma`, told the update coordinator "desired = this release" once
 `publish` has made the release, and waits until the farm converges. It is the end-to-end check of
 a release on a real farm. It does nothing until an operator has done the three things below, once;
 until then the job prints `::notice::the deploy step is off` and passes, so a fork or a repository

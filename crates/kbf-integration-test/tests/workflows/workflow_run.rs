@@ -11,36 +11,52 @@
 //! (`only_the_release_workflow_follows_the_pipeline`) holds the trigger to `release.yml` and the
 //! workflow named `pipeline` to a push to main alone. The message begins `line 0:` (the reader
 //! gives no line).
+//!
+//! One more shape is allowed, in the one workflow named `hostkeeper-desired` (`hostkeeper-desired.yml`):
+//! `workflows: [release]` with the same `types` and `branches`, which sets hostkeeper's desired
+//! version after a release run. The lint holds it by the workflow's `name:`, and the repository
+//! test `only_the_hostkeeper_workflow_is_named_so_and_follows_the_release` holds that name to the
+//! file.
 
 use super::*;
 
 /// What a workflow with the trigger in any other shape is told.
-const REFUSED: &str = "triggers on workflow_run, which no workflow may but the release and the rerun after the pipeline (workflows: [pipeline], types: [completed], branches: [main])";
+const REFUSED: &str = "triggers on workflow_run, which no workflow may but the release and the rerun after the pipeline (workflows: [pipeline], types: [completed], branches: [main]) and, in hostkeeper-desired.yml, the setting of hostkeeper's desired version after the release (workflows: [release])";
 
-/// The filters of the one allowed shape, by key.
-const ALLOWED: [(&str, &str); 3] = [
-    ("branches", "main"),
-    ("types", "completed"),
-    ("workflows", "pipeline"),
-];
+/// The filters of the allowed shape, by key, following `workflow`.
+fn allowed(workflow: &str) -> [(&'static str, String); 3] {
+    [
+        ("branches", "main".to_owned()),
+        ("types", "completed".to_owned()),
+        ("workflows", workflow.to_owned()),
+    ]
+}
 
 pub(super) fn is_workflow_run(name: &str) -> bool {
     name.trim().eq_ignore_ascii_case("workflow_run")
 }
 
-/// Whether the workflow's `workflow_run` filters are exactly [`ALLOWED`].
-fn is_the_allowed_shape(text: &str) -> bool {
+/// Whether the workflow's `workflow_run` filters are exactly [`allowed`] after the workflow
+/// `followed`.
+fn follows_exactly(text: &str, followed: &str) -> bool {
     let Ok(mut filters) = trigger_filters(text, "workflow_run") else {
         return false;
     };
     filters.sort();
-    filters.len() == ALLOWED.len()
+    let want = allowed(followed);
+    filters.len() == want.len()
         && filters
             .iter()
-            .zip(ALLOWED)
-            .all(|((key, values), (want_key, want))| {
-                key == want_key && values.as_slice() == [want.to_owned()]
-            })
+            .zip(want)
+            .all(|((key, values), (want_key, want))| key == want_key && values.as_slice() == [want])
+}
+
+/// Whether the workflow's `workflow_run` trigger is the pipeline's shape, or the release's in the
+/// workflow named `hostkeeper-desired`.
+fn is_the_allowed_shape(text: &str) -> bool {
+    follows_exactly(text, "pipeline")
+        || (yaml::load(text).is_ok_and(|root| hostkeeper::is_named(&root))
+            && follows_exactly(text, "release"))
 }
 
 /// The problems with a workflow that triggers on `workflow_run`: one unless it is the allowed
@@ -130,7 +146,7 @@ mod tests {
     }
 
     #[test]
-    fn only_the_release_and_the_rerun_workflows_follow_the_pipeline() {
+    fn only_the_release_the_rerun_and_the_hostkeeper_workflows_follow_another() {
         let dir = crate::repo_root().join(".github/workflows");
         let mut followers = Vec::new();
         let mut pipelines = Vec::new();
@@ -151,7 +167,11 @@ mod tests {
         followers.sort();
         assert_eq!(
             followers,
-            ["pipeline-rerun.yml", "release.yml"],
+            [
+                "hostkeeper-desired.yml",
+                "pipeline-rerun.yml",
+                "release.yml"
+            ],
             "the workflows that follow another"
         );
         assert_eq!(
@@ -176,6 +196,59 @@ mod tests {
             "    workflows: [pipeline]\n    types: [completed]\n    branches: [main]\n    branches-ignore: [x]",
         ] {
             assert_eq!(rules(&on(bad)).len(), 1, "{bad}");
+        }
+    }
+
+    #[test]
+    fn only_the_hostkeeper_workflow_is_named_so_and_follows_the_release() {
+        // Catches: the shape of `workflows: [release]` allowed for a file that is not
+        // `hostkeeper-desired.yml` (the lint knows the workflow by its name, so the name is held
+        // to the file here), and `hostkeeper-desired.yml` following another workflow.
+        let dir = crate::repo_root().join(".github/workflows");
+        let mut named = Vec::new();
+        let mut follows_release = Vec::new();
+        for entry in std::fs::read_dir(&dir).expect("workflow dir") {
+            let path = entry.expect("entry").path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if !(name.ends_with(".yml") || name.ends_with(".yaml")) {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("workflow text");
+            if name_of(&text) == hostkeeper::NAME {
+                named.push(name.clone());
+            }
+            if follows_exactly(&text, "release") {
+                follows_release.push(name);
+            }
+        }
+        assert_eq!(named, ["hostkeeper-desired.yml"], "the workflow named so");
+        assert_eq!(
+            follows_release,
+            ["hostkeeper-desired.yml"],
+            "the workflows that follow the release"
+        );
+    }
+
+    #[test]
+    fn the_release_is_followed_only_by_the_hostkeeper_workflow() {
+        // Catches: a workflow that follows the release without being the one that sets
+        // hostkeeper's desired version, and that one following the pipeline or the release in
+        // another shape.
+        let file = |name: &str, body: &str| {
+            format!("name: {name}\non:\n  workflow_run:\n{body}\npermissions: {{}}\njobs: {{}}\n")
+        };
+        let release = "    workflows: [release]\n    types: [completed]\n    branches: [main]";
+        assert!(rules(&file("hostkeeper-desired", release)).is_empty());
+        assert_eq!(rules(&file("other", release)).len(), 1);
+        assert_eq!(rules(&file("hostkeeper-desired-2", release)).len(), 1);
+        for bad in [
+            "    workflows: [release, pipeline]\n    types: [completed]\n    branches: [main]",
+            "    workflows: [release]\n    types: [requested]\n    branches: [main]",
+            "    workflows: [release]\n    types: [completed]\n    branches: ['**']",
+            "    workflows: [release]\n    types: [completed]",
+            "    workflows: [ci]\n    types: [completed]\n    branches: [main]",
+        ] {
+            assert_eq!(rules(&file("hostkeeper-desired", bad)).len(), 1, "{bad}");
         }
     }
 

@@ -76,7 +76,14 @@ pub fn packaged_task_bundles(workflow: &str) -> Result<Vec<(String, String)>, St
 /// makes the `kbf` deb an asset (it has no `--verify-only`: that one only checks the file the
 /// attest job signed), in file order. An error names a line without `--platform`.
 pub fn packaged_kbf_debs(workflow: &str) -> Result<Vec<String>, String> {
-    deb_platforms(workflow, "pkg-kbf-asset")
+    deb_platforms(workflow, "pkg-kbf-asset", false)
+}
+
+/// The platform of every `cargo xtask pkg-kbf-asset --native` line in the workflow's `run:`
+/// steps that makes the native `kbf` deb an asset (`kbf-native-<commit>-<platform>.deb`; it has
+/// no `--verify-only`), in file order.
+pub fn packaged_native_debs(workflow: &str) -> Result<Vec<String>, String> {
+    deb_platforms(workflow, "pkg-kbf-asset", true)
 }
 
 /// The (service, platform) of every `cargo xtask pkg-image-asset` line in the workflow's `run:`
@@ -113,8 +120,9 @@ pub fn packaged_images(workflow: &str) -> Result<Vec<(String, String)>, String> 
 }
 
 /// The platform of every `cargo xtask <verb>` line of the `run:` steps without
-/// `--verify-only`, in file order.
-fn deb_platforms(workflow: &str, verb: &str) -> Result<Vec<String>, String> {
+/// `--verify-only`, in file order; of the lines with `--native` when `native`, of those without
+/// it otherwise.
+fn deb_platforms(workflow: &str, verb: &str, native: bool) -> Result<Vec<String>, String> {
     let prefix = format!("cargo xtask {verb} ");
     let mut found = Vec::new();
     for step in workflows::run_steps(workflow)? {
@@ -123,7 +131,7 @@ fn deb_platforms(workflow: &str, verb: &str) -> Result<Vec<String>, String> {
                 continue;
             };
             let words: Vec<&str> = args.split_whitespace().collect();
-            if words.contains(&"--verify-only") {
+            if words.contains(&"--verify-only") || words.contains(&"--native") != native {
                 continue;
             }
             let platform = words

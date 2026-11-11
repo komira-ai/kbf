@@ -4,11 +4,12 @@ There is no gamma trigger. `.github/workflows/gamma.yml` is deleted, and so are 
 `kbf-installer deploy` (and the `update` verb), `kbf-installer setup --deploy-*` and the
 `/etc/kbf-installer/deploy.json` it wrote, and `cargo xtask gamma`. Nothing in a release run connects to a host to
 install a release.
-The gamma stage today is the `gamma` job of `release.yml`: it sets the release as the farm's desired version on the
-update coordinator, each host's updater takes it from there, and the job then runs a remote-only build on the farm ([the design](../design/gamma-cicd.md); setup in
-[kbf-updater.md](kbf-updater.md#turn-on-the-gamma-stage)).
+The gamma stage today is the `gamma` job of `release.yml`: it no longer sets the farm's desired version. The
+farm's Linux nodes take a release from the apt repository through hostkeeper, which `hostkeeper-desired.yml` tells
+the version ([farm-hostkeeper.md](farm-hostkeeper.md)); `gamma` prints a notice saying so and, when
+`KBF_SETS_DESIRED` is `true`, runs a remote-only build on the farm ([the design](../design/gamma-cicd.md)).
 
-A host takes a release from its operating-system package and from `kbf-updater`; see
+A host outside the farm takes a release from its operating-system package and from `kbf-updater`; see
 `docs/deploy/kbf-installer-setup.md` for installing a host. The page `docs/design/gamma-deploy.md` describes the
 retired deploy and is kept as history.
 

@@ -71,6 +71,10 @@
 //!   ([`bump`]): after the release is published, a pull request in the internal repository
 //!   that moves its submodule to `--sha`, with auto-merge on, if the tag `v<v>` names `--sha`
 //!   and the submodule is not already at or beyond it. The token is `GH_TOKEN`.
+//! - `release desired --repo <owner/repo> --version <X.Y.Z or ""> --after-run <run id or ""> --dir <dir>
+//!   [--output <file>] [--apt-url <url>] [--gh <program>] [--curl <program>]` ([`desired`]): the release
+//!   hostkeeper's `set-desired` sets as the farm's desired version, or `set=false`; prints and appends
+//!   `set`, `package-version` and `targets`.
 //! - `release tag --repo <owner/repo> --sha <sha> --tag <tag> --message-file <file>
 //!   [--tagger <login>] [--output <file>] [--gh <program>]` ([`tag`]): the annotated tag
 //!   `--tag` at `--sha` through the GitHub API, create-only, after the same stale-run
@@ -82,6 +86,7 @@
 
 pub mod attest_gh;
 pub mod bump;
+pub mod desired;
 pub mod farm_version;
 pub mod fetch_previous;
 mod git;

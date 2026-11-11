@@ -82,10 +82,12 @@
 //! and action files before it merges. This lint keeps those files from asking for
 //! anything else, so that review has less to catch.
 
+mod hostkeeper;
+pub mod release_ifs;
 #[cfg(test)]
 mod stages;
 mod workflow_run;
-mod yaml;
+pub(crate) mod yaml;
 
 mod jobs;
 pub use jobs::{
@@ -454,6 +456,7 @@ fn run(text: &str, repo: &Repo, check: impl FnOnce(&mut Lint<'_>, &Node)) -> Vec
         text,
         repo,
         out: Vec::new(),
+        hostkeeper: hostkeeper::is_named(&root),
     };
     lint.every_node(&root);
     check(&mut lint, &root);
@@ -464,6 +467,8 @@ struct Lint<'a> {
     text: &'a str,
     repo: &'a Repo,
     out: Vec<String>,
+    /// Whether the workflow is the one that sets hostkeeper's desired version ([`hostkeeper`]).
+    hostkeeper: bool,
 }
 
 impl Lint<'_> {
@@ -528,8 +533,8 @@ impl Lint<'_> {
                 value: Value::Map(jobs),
                 ..
             }) => {
-                for (_, job) in jobs {
-                    self.job(job);
+                for (key, job) in jobs {
+                    self.job(key, job);
                 }
             }
             Some(other) => self.refuse(other, "`jobs` must be a mapping"),
@@ -607,17 +612,14 @@ impl Lint<'_> {
         }
     }
 
-    fn job(&mut self, job: &Node) {
+    fn job(&mut self, key: &Node, job: &Node) {
         let Value::Map(job_map) = &job.value else {
             self.refuse(job, "a job must be a mapping");
             return;
         };
         if let Some(called) = get(job_map, "uses") {
             match called.as_str().and_then(|w| w.strip_prefix("./")) {
-                None => self.refuse(
-                    called,
-                    "a reusable workflow outside this repository runs where this lint cannot see",
-                ),
+                None => self.outside_call(key, called),
                 Some(path) if self.repo.workflows.iter().any(|w| w == path) => {}
                 Some(path) => self.refuse(
                     called,
@@ -626,7 +628,7 @@ impl Lint<'_> {
             }
         }
         if let Some(p) = get(job_map, "permissions") {
-            self.job_permissions(p, get(job_map, "if").and_then(Node::as_str));
+            self.job_permissions(key, p, get(job_map, "if").and_then(Node::as_str));
         }
         match get(job_map, "runs-on") {
             Some(r) => self.runs_on(r),
@@ -691,7 +693,7 @@ impl Lint<'_> {
     /// `if:` is exactly [`RELEASE_PUSH_ONLY`], [`ISSUE_SCOPES`] in one whose `if:`
     /// is exactly [`ISSUES_MAIN_ONLY`]. Scope names and levels are compared
     /// exactly, so another spelling is refused (the safe side).
-    fn job_permissions(&mut self, p: &Node, condition: Option<&str>) {
+    fn job_permissions(&mut self, key: &Node, p: &Node, condition: Option<&str>) {
         let Value::Map(scopes) = &p.value else {
             self.refuse(
                 p,
@@ -705,7 +707,7 @@ impl Lint<'_> {
             if granted == "read" || granted == "none" {
                 continue;
             }
-            if name == DEPLOY_SCOPE && granted == "write" && condition == Some(RELEASE_PUSH_ONLY) {
+            if name == DEPLOY_SCOPE && granted == "write" && self.deploy_scope_ok(key, condition) {
                 continue;
             }
             let gate: &[&str] = if SIGNING_SCOPES.contains(&name) {
