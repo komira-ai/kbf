@@ -2888,6 +2888,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-tree-bundle"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tar",
+ "thiserror",
+ "tierstore",
+]
+
+[[package]]
 name = "kbf-types"
 version = "0.1.0"
 dependencies = [
