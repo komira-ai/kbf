@@ -93,14 +93,24 @@ pub fn rules(workflow: &str, out: &mut Vec<String>) -> Result<(), String> {
         build_job(workflow, platform, out)?;
         native_build(workflow, platform, out)?;
     }
+    for line in workflow.lines().map(str::trim) {
+        if line.starts_with("run: rm -rf ") && line != CLEANUP {
+            out.push(format!(
+                "the cleanup step is `{line}`, not `{CLEANUP}`: the native package is built under target/pkg/native, which that removal already covers"
+            ));
+        }
+    }
     verify_job(workflow, out)?;
     native_verify(workflow, out)
 }
 
+/// The only recursive removal of the workflow's build directories.
+const CLEANUP: &str = "run: rm -rf target/pkg target/pkg-trust";
+
 /// Where `pkg-config --no-host-agent` writes the native package's configuration, and `pkg-build`
 /// its packages.
-const NATIVE_CONFIG: &str = "target/pkg-native/nfpm.yaml";
-const NATIVE_BUILT: &str = "target/pkg-native/out";
+const NATIVE_CONFIG: &str = "target/pkg/native/nfpm.yaml";
+const NATIVE_BUILT: &str = "target/pkg/native/out";
 
 /// What is wrong with how the job `platform` makes the native deb an asset: the configuration
 /// written without the host agent from the job's `kbf` and at the version that `kbf` names
@@ -165,7 +175,7 @@ fn native_build(workflow: &str, platform: &str, out: &mut Vec<String>) -> Result
         };
     let configured = first(&steps, 0, |l| {
         args(l, "cargo xtask pkg-config ").is_some_and(|a| {
-            flag(&a, "--out") == Some("target/pkg-native")
+            flag(&a, "--out") == Some("target/pkg/native")
                 && a.contains(&"--no-host-agent")
                 && !a.contains(&"--host-agent")
                 && flag(&a, "--native-version-of") == shipped
@@ -175,7 +185,7 @@ fn native_build(workflow: &str, platform: &str, out: &mut Vec<String>) -> Result
     });
     before(
         configured,
-        "`cargo xtask pkg-config --no-host-agent --native-version-of` of the job's kbf into `target/pkg-native`",
+        "`cargo xtask pkg-config --no-host-agent --native-version-of` of the job's kbf into `target/pkg/native`",
         out,
     );
     let built = first(&steps, 0, |l| {

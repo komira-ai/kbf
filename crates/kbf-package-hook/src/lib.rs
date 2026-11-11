@@ -31,6 +31,8 @@ mod steps;
 mod steps_tests;
 mod systemd;
 #[cfg(test)]
+mod systemd_tests;
+#[cfg(test)]
 mod testing;
 #[cfg(test)]
 mod value_tests;

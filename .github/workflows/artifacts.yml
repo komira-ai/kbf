@@ -440,7 +440,7 @@ jobs:
       # inside one it names), so it may hold a previous run's package files; pkg-trust and
       # pkg-config refuse to overwrite a file.
       - name: Remove the package files a restored target/ may hold
-        run: rm -rf target/pkg target/pkg-trust target/pkg-native
+        run: rm -rf target/pkg target/pkg-trust
       - name: Write the package's trust directory
         run: cargo xtask pkg-trust --gh "$RUNNER_TEMP/tools/gh" --trusted-root "$RUNNER_TEMP/trusted_root.jsonl" --source-ref "$PKG_SOURCE_REF" --out target/pkg-trust
       - name: Write the nfpm configuration
@@ -461,11 +461,11 @@ jobs:
       # <major>.<minor>.<seq> that `kbf --version --json` names, which hostkeeper installs from the apt
       # repository (packaging/linux/README.md). Its asset is kbf-native-<commit>-linux-x86_64.deb.
       - name: Write the nfpm configuration of the native package
-        run: cargo xtask pkg-config --kbf "target/$TARGET/release/kbf" --units packaging/linux/units --trust target/pkg-trust --sysusers packaging/linux/sysusers.d/kbf-installer.conf --tmpfiles packaging/linux/tmpfiles.d/kbf-installer.conf --needrestart packaging/linux/needrestart/kbf.conf --no-host-agent --platform linux-x86_64 --native-version-of "target/$TARGET/release/kbf" --out target/pkg-native
+        run: cargo xtask pkg-config --kbf "target/$TARGET/release/kbf" --units packaging/linux/units --trust target/pkg-trust --sysusers packaging/linux/sysusers.d/kbf-installer.conf --tmpfiles packaging/linux/tmpfiles.d/kbf-installer.conf --needrestart packaging/linux/needrestart/kbf.conf --no-host-agent --platform linux-x86_64 --native-version-of "target/$TARGET/release/kbf" --out target/pkg/native
       - name: Build the deb and the rpm of the native package, each twice
-        run: cargo xtask pkg-build --nfpm "$RUNNER_TEMP/tools/nfpm" --config target/pkg-native/nfpm.yaml --out target/pkg-native/out
+        run: cargo xtask pkg-build --nfpm "$RUNNER_TEMP/tools/nfpm" --config target/pkg/native/nfpm.yaml --out target/pkg/native/out
       - name: The native deb is the attested kbf with the units of the modes, no host agent and a native version, and is an asset
-        run: cargo xtask pkg-kbf-asset --native --native-version-of "target/$TARGET/release/kbf" --package target/pkg-native/out --platform linux-x86_64 --commit "$GITHUB_SHA" --kbf-tarball "dist/kbf-$GITHUB_SHA-linux-x86_64.tar.gz" --expect-ref "$PKG_SOURCE_REF" --gh "$RUNNER_TEMP/tools/gh" --out dist
+        run: cargo xtask pkg-kbf-asset --native --native-version-of "target/$TARGET/release/kbf" --package target/pkg/native/out --platform linux-x86_64 --commit "$GITHUB_SHA" --kbf-tarball "dist/kbf-$GITHUB_SHA-linux-x86_64.tar.gz" --expect-ref "$PKG_SOURCE_REF" --gh "$RUNNER_TEMP/tools/gh" --out dist
       # The frontend image (packaging/container/frontend/Dockerfile): the attested kbf, unpacked from
       # the tarball above and not rebuilt, on a pinned base. It is built twice from the commit's time
       # (SOURCE_DATE_EPOCH, no provenance or SBOM attachments of buildx's own) and the two
@@ -668,7 +668,7 @@ jobs:
       # inside one it names), so it may hold a previous run's package files; pkg-trust and
       # pkg-config refuse to overwrite a file.
       - name: Remove the package files a restored target/ may hold
-        run: rm -rf target/pkg target/pkg-trust target/pkg-native
+        run: rm -rf target/pkg target/pkg-trust
       - name: Write the package's trust directory
         run: cargo xtask pkg-trust --gh "$RUNNER_TEMP/tools/gh" --trusted-root "$RUNNER_TEMP/trusted_root.jsonl" --source-ref "$PKG_SOURCE_REF" --out target/pkg-trust
       - name: Write the nfpm configuration
@@ -689,11 +689,11 @@ jobs:
       # <major>.<minor>.<seq> that `kbf --version --json` names, which hostkeeper installs from the apt
       # repository (packaging/linux/README.md). Its asset is kbf-native-<commit>-linux-arm64.deb.
       - name: Write the nfpm configuration of the native package
-        run: cargo xtask pkg-config --kbf "target/$TARGET/release/kbf" --units packaging/linux/units --trust target/pkg-trust --sysusers packaging/linux/sysusers.d/kbf-installer.conf --tmpfiles packaging/linux/tmpfiles.d/kbf-installer.conf --needrestart packaging/linux/needrestart/kbf.conf --no-host-agent --platform linux-arm64 --native-version-of "target/$TARGET/release/kbf" --out target/pkg-native
+        run: cargo xtask pkg-config --kbf "target/$TARGET/release/kbf" --units packaging/linux/units --trust target/pkg-trust --sysusers packaging/linux/sysusers.d/kbf-installer.conf --tmpfiles packaging/linux/tmpfiles.d/kbf-installer.conf --needrestart packaging/linux/needrestart/kbf.conf --no-host-agent --platform linux-arm64 --native-version-of "target/$TARGET/release/kbf" --out target/pkg/native
       - name: Build the deb and the rpm of the native package, each twice
-        run: cargo xtask pkg-build --nfpm "$RUNNER_TEMP/tools/nfpm" --config target/pkg-native/nfpm.yaml --out target/pkg-native/out
+        run: cargo xtask pkg-build --nfpm "$RUNNER_TEMP/tools/nfpm" --config target/pkg/native/nfpm.yaml --out target/pkg/native/out
       - name: The native deb is the attested kbf with the units of the modes, no host agent and a native version, and is an asset
-        run: cargo xtask pkg-kbf-asset --native --native-version-of "target/$TARGET/release/kbf" --package target/pkg-native/out --platform linux-arm64 --commit "$GITHUB_SHA" --kbf-tarball "dist/kbf-$GITHUB_SHA-linux-arm64.tar.gz" --expect-ref "$PKG_SOURCE_REF" --gh "$RUNNER_TEMP/tools/gh" --out dist
+        run: cargo xtask pkg-kbf-asset --native --native-version-of "target/$TARGET/release/kbf" --package target/pkg/native/out --platform linux-arm64 --commit "$GITHUB_SHA" --kbf-tarball "dist/kbf-$GITHUB_SHA-linux-arm64.tar.gz" --expect-ref "$PKG_SOURCE_REF" --gh "$RUNNER_TEMP/tools/gh" --out dist
       # The frontend image (packaging/container/frontend/Dockerfile): the attested kbf, unpacked from
       # the tarball above and not rebuilt, on a pinned base. It is built twice from the commit's time
       # (SOURCE_DATE_EPOCH, no provenance or SBOM attachments of buildx's own) and the two

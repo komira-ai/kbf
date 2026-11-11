@@ -480,7 +480,7 @@ contents were checked.
 
 The same two jobs also build `kbf-native-<commit>-<platform>.deb`, the package that hostkeeper
 installs and updates from the apt repository (`packages.komira.ai`). `cargo xtask pkg-config
---no-host-agent --native-version-of <kbf>` writes its configuration into `target/pkg-native`,
+--no-host-agent --native-version-of <kbf>` writes its configuration into `target/pkg/native`,
 `pkg-build` builds it twice, and `cargo xtask pkg-kbf-asset --native --native-version-of <kbf>`
 makes it the asset and lists it in `SHA256SUMS`. It is held to the checks above (its `kbf` is the
 tarball's, the same files and modes, the trust directory, no `Depends`) with these differences: it

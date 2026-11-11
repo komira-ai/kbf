@@ -18,8 +18,8 @@ const REFUSED: i32 = 2;
 
 /// The host of a real run.
 pub struct Systemd {
-    systemctl: PathBuf,
-    kbf: PathBuf,
+    pub(crate) systemctl: PathBuf,
+    pub(crate) kbf: PathBuf,
 }
 
 impl Default for Systemd {

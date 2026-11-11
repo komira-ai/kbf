@@ -7,16 +7,16 @@
 pub(super) fn native_config_and_build(platform: &str) -> (String, String) {
     (
         format!(
-            "      - name: Native config\n        run: cargo xtask pkg-config --kbf \"target/$TARGET/release/kbf\" --units u --trust t --sysusers s --tmpfiles f --no-host-agent --platform {platform} --native-version-of \"target/$TARGET/release/kbf\" --out target/pkg-native\n"
+            "      - name: Native config\n        run: cargo xtask pkg-config --kbf \"target/$TARGET/release/kbf\" --units u --trust t --sysusers s --tmpfiles f --no-host-agent --platform {platform} --native-version-of \"target/$TARGET/release/kbf\" --out target/pkg/native\n"
         ),
-        "      - name: Native build\n        run: cargo xtask pkg-build --nfpm n --config target/pkg-native/nfpm.yaml --out target/pkg-native/out\n".to_owned(),
+        "      - name: Native build\n        run: cargo xtask pkg-build --nfpm n --config target/pkg/native/nfpm.yaml --out target/pkg/native/out\n".to_owned(),
     )
 }
 
 /// The step that makes the native deb of `platform` an asset.
 pub(super) fn native_asset_step(platform: &str) -> String {
     format!(
-        "      - name: Native asset\n        run: cargo xtask pkg-kbf-asset --native --native-version-of \"target/$TARGET/release/kbf\" --package target/pkg-native/out --platform {platform} --commit \"$GITHUB_SHA\" --kbf-tarball \"dist/kbf-$GITHUB_SHA-{platform}.tar.gz\" --expect-ref \"$PKG_SOURCE_REF\" --gh \"$RUNNER_TEMP/tools/gh\" --out dist\n"
+        "      - name: Native asset\n        run: cargo xtask pkg-kbf-asset --native --native-version-of \"target/$TARGET/release/kbf\" --package target/pkg/native/out --platform {platform} --commit \"$GITHUB_SHA\" --kbf-tarball \"dist/kbf-$GITHUB_SHA-{platform}.tar.gz\" --expect-ref \"$PKG_SOURCE_REF\" --gh \"$RUNNER_TEMP/tools/gh\" --out dist\n"
     )
 }
 

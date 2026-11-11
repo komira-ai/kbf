@@ -108,10 +108,3 @@ fn the_staged_binary_is_run_with_its_mode_and_its_exit_code_is_the_answer() {
     };
     assert!(why.contains("cannot run /no/such/kbf"), "{why}");
 }
-
-/// `Systemd::new` names the system's own programs.
-#[test]
-fn the_default_host_uses_the_system_programs() {
-    // Only its construction: the real systemctl is never run by a test.
-    let _host: Systemd = Systemd::default();
-}

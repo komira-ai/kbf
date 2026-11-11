@@ -203,9 +203,9 @@ fn the_native_package_is_configured_built_and_made_an_asset_for_the_kbf_the_job_
         "has --kbf-tarball \"dist/kbf-installer-$GITHUB_SHA-linux-x86_64.tar.gz\", not `dist/kbf-$GITHUB_SHA-linux-x86_64.tar.gz`",
     );
     change(
-        "--package target/pkg-native/out",
+        "--package target/pkg/native/out",
         "--package target/pkg/out",
-        "has --package \"target/pkg/out\", not `target/pkg-native/out`",
+        "has --package \"target/pkg/out\", not `target/pkg/native/out`",
     );
     change(
         "--out dist",
@@ -228,7 +228,7 @@ fn the_native_package_is_configured_built_and_made_an_asset_for_the_kbf_the_job_
         "is not given the pinned gh",
     );
     let (config, build) = native_config_and_build("linux-x86_64");
-    let missing_config = "is made an asset without `cargo xtask pkg-config --no-host-agent --native-version-of` of the job's kbf into `target/pkg-native` in a step before";
+    let missing_config = "is made an asset without `cargo xtask pkg-config --no-host-agent --native-version-of` of the job's kbf into `target/pkg/native` in a step before";
     names(&good().replacen(&config, "", 1), &[missing_config]);
     for (from, to) in [
         (" --no-host-agent", ""),
@@ -236,7 +236,7 @@ fn the_native_package_is_configured_built_and_made_an_asset_for_the_kbf_the_job_
             " --no-host-agent",
             " --host-agent packaging/host-agent/linux",
         ),
-        ("--out target/pkg-native", "--out target/pkg"),
+        ("--out target/pkg/native", "--out target/pkg"),
         (
             "--native-version-of \"target/$TARGET/release/kbf\" --out",
             "--version 0.1.0+ci --out",
@@ -249,7 +249,7 @@ fn the_native_package_is_configured_built_and_made_an_asset_for_the_kbf_the_job_
     }
     let missing_build = "is made an asset without `cargo xtask pkg-build` of the native configuration in a step before";
     names(&good().replacen(&build, "", 1), &[missing_build]);
-    let elsewhere = build.replace("target/pkg-native/nfpm.yaml", "target/pkg/nfpm.yaml");
+    let elsewhere = build.replace("target/pkg/native/nfpm.yaml", "target/pkg/nfpm.yaml");
     names(&good().replacen(&build, &elsewhere, 1), &[missing_build]);
     let without = good().replacen(&build, "", 1);
     let after = without.replacen(&step, &format!("{step}{build}"), 1);
@@ -304,4 +304,23 @@ fn the_verify_job_checks_the_signed_native_package_with_its_tarball_and_commit()
         assert_ne!(w, good());
         names(&w, &[wanted]);
     }
+}
+
+/// Asserts that the lint names a cleanup step that removes more than `target/pkg` and
+/// `target/pkg-trust`, and accepts the one that removes those two.
+#[test]
+fn the_cleanup_step_removes_only_the_two_build_directories() {
+    let (_, build) = native_config_and_build("linux-x86_64");
+    let clean = |run: &str| format!("      - name: Clean\n        {run}\n{build}");
+    let accepted = good().replacen(&build, &clean("run: rm -rf target/pkg target/pkg-trust"), 1);
+    assert_ne!(accepted, good(), "in the fixture");
+    assert_eq!(found(&accepted), Vec::<String>::new());
+    names(
+        &good().replacen(
+            &build,
+            &clean("run: rm -rf target/pkg target/pkg-trust target/pkg-native"),
+            1,
+        ),
+        &["the cleanup step is `run: rm -rf target/pkg target/pkg-trust target/pkg-native`, not"],
+    );
 }
