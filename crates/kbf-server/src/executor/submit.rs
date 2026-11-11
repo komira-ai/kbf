@@ -5,7 +5,7 @@
 //! task kept, after its answer was lost, names the job already made, and the service answers
 //! from it (design section 5.3). The job is the kbf image, whose entrypoint is the
 //! task tool, run with the tool's flags; it needs what the farm booked, with the hard memory cap
-//! a daemon would set and the scratch of its inputs and outputs, or, for a `whole_machine`
+//! a daemon would set and no disk, or, for a `whole_machine`
 //! lease, the whole host and nothing beside it ([`Booking`]), of a Linux host of the
 //! configured architecture in a container, for the action's timeout and the run margin. The
 //! read grant and the presigned `PUT` travel as the job's files, or as arguments where the
@@ -142,11 +142,12 @@ impl Booking {
         }
     }
 
-    /// What the job needs. A share needs at least one thousandth of a CPU, the hard memory
-    /// cap of its booking and the disk of its inputs (`input_bytes`, when known) and outputs.
-    /// The whole host is asked for alone: the job service takes a whole-host job only with no
-    /// other need, and the host's cores, memory and disk are all the job's.
-    fn needs(self, cfg: &Config, input_bytes: Option<u64>) -> Needs {
+    /// What the job needs. A share needs at least one thousandth of a CPU and the hard memory
+    /// cap of its booking, and no disk: the pool books none, so the job service places the job
+    /// on any host whatever disk it reports, and the job writes to its host's scratch with no
+    /// quota. The whole host is asked for alone: the job service takes a whole-host job only
+    /// with no other need, and the host's cores and memory are all the job's.
+    fn needs(self) -> Needs {
         match self {
             Self::Share {
                 millicpus,
@@ -154,7 +155,7 @@ impl Booking {
             } => Needs {
                 cpu_millis: millicpus.max(1),
                 memory_bytes: Config::hard_memory(memory_bytes),
-                disk_bytes: Some(cfg.disk_bytes(input_bytes)),
+                disk_bytes: None,
                 gpus: 0,
                 gpu_class: String::new(),
                 whole_host: false,
@@ -170,7 +171,6 @@ impl Booking {
 /// The job of `lease`, which runs `action` with `booking`, with its pack key.
 pub(super) async fn prepare(
     ctx: &Ctx<'_>,
-    worker: &str,
     lease: LeaseId,
     action: &Digest,
     booking: Booking,
@@ -221,13 +221,6 @@ pub(super) async fn prepare(
         allow_plain_http_grant: ctx.cfg.allow_plain_http_grant,
         locate: ctx.cfg.locate,
     };
-    if grant.input_bytes.is_none() {
-        tracing::warn!(
-            %worker,
-            %lease,
-            "the size of the inputs is not known; a shared job needs the allowance and the margin only"
-        );
-    }
     let spec = JobSpec {
         job_id: job_id(&ctx.cfg.frontend, lease, 0),
         image,
@@ -235,7 +228,7 @@ pub(super) async fn prepare(
         command: String::new(),
         args: args.argv(ctx.cfg.delivery),
         env: BTreeMap::new(),
-        needs: Some(booking.needs(ctx.cfg, grant.input_bytes)),
+        needs: Some(booking.needs()),
         constraints: Some(ctx.cfg.constraints()),
         wall_limit_seconds: Some(wall_seconds(wall)),
         // The operator's level, by default the allow-list: the task tool reaches the read

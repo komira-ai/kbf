@@ -154,7 +154,6 @@ impl Inputs for Timed {
         Ok(ReadGrant {
             url: "https://grant.test:9400".to_owned(),
             token: Secret::new("the-token"),
-            input_bytes: Some(3 * GIB),
         })
     }
 }
@@ -190,7 +189,7 @@ async fn prepared(
         deps: &deps,
         twin: &harness.twin,
     };
-    prepare(&ctx, "js:front-0", LeaseId::new(7, 8), &action(), booking).await
+    prepare(&ctx, LeaseId::new(7, 8), &action(), booking).await
 }
 
 /// Catches the job's wall limit being a lease's or the executor's longest run instead of the
@@ -277,7 +276,7 @@ fn arg<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
 }
 
 /// Catches a job asking for the wrong thing of the service: its needs are what the farm
-/// booked (at least one millicpu), the hard memory cap and the scratch of its inputs; it runs
+/// booked (at least one millicpu) and the hard memory cap, and no disk; it runs
 /// on a Linux container host of the configured architecture, with the allow-listed network, the
 /// image's own entrypoint, and labels naming the frontend and the process; and its id is the
 /// lease's, attempt 0.
@@ -297,7 +296,7 @@ async fn prepare_builds_the_job_the_service_is_asked_for() {
     let needs = spec.needs.as_ref().expect("needs");
     assert_eq!(needs.cpu_millis, 1_500);
     assert_eq!(needs.memory_bytes, Config::hard_memory(GIB));
-    assert_eq!(needs.disk_bytes, Some(cfg.disk_bytes(Some(3 * GIB))));
+    assert_eq!(needs.disk_bytes, None, "a job books no disk");
     assert_eq!((needs.gpus, needs.whole_host), (0, false));
     assert_eq!(spec.constraints.as_ref(), Some(&cfg.constraints()));
     assert_eq!(spec.network(), NetworkLevel::AllowList);
@@ -351,8 +350,7 @@ fn a_start_books_the_whole_host_only_for_a_whole_machine_lease() {
 
 /// Catches a whole-host job the service would refuse, or one that differs from a shared job
 /// in more than its needs: it needs the whole host and nothing else (no CPU, memory, disk or
-/// GPU, which the service refuses beside `whole_host`, even when the size of the inputs is
-/// known); its id, image, command, environment, constraints, wall limit, network, ports,
+/// GPU, which the service refuses beside `whole_host`); its id, image, command, environment, constraints, wall limit, network, ports,
 /// priority and labels are those of the same lease's shared job, and its arguments name the
 /// same lease and action (the pack url in them is minted again for each prepare).
 #[tokio::test(start_paused = true)]
@@ -370,7 +368,7 @@ async fn a_whole_host_job_needs_the_whole_host_alone() {
         })
     );
     let shared_needs = shared.spec.needs.clone().expect("needs");
-    assert!(shared_needs.disk_bytes.is_some() && !shared_needs.whole_host);
+    assert!(shared_needs.cpu_millis > 0 && !shared_needs.whole_host);
     let without_needs = |spec: &js_proto::v1::JobSpec| js_proto::v1::JobSpec {
         needs: None,
         // The grant and the pack url are made again for each prepare.

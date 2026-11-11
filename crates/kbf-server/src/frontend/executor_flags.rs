@@ -21,6 +21,10 @@
 //! aliased: a frontend started with one fails at start, naming it, and never runs on the wrong
 //! protocol.
 //!
+//! A job books no disk: the pool books none, and a job writes to its host's scratch with no
+//! quota. `--executor-output-disk-bytes`, the scratch a job once asked for its outputs, is gone
+//! the same way: a frontend started with it, with either executor, fails at start, naming it.
+//!
 //! Every secret is a file: the job service's token (mode 0600 or 0400) and its CA certificate.
 
 use std::error::Error;
@@ -61,7 +65,6 @@ const MARGIN: &str = "executor_run_margin_secs";
 const MAX_RUN: &str = "executor_max_run_secs";
 const DEFAULT_TIMEOUT: &str = "executor_default_timeout_secs";
 const CALL_TIMEOUT: &str = "executor_call_timeout_secs";
-const OUTPUT_DISK: &str = "executor_output_disk_bytes";
 const NETWORK: &str = "executor_network";
 const OPEN_NETWORK: &str = "executor_allow_open_network";
 
@@ -320,18 +323,6 @@ pub(super) fn args() -> Vec<Arg> {
              seconds. Under the fence time. Used only with `--executor js-agent`",
             "5",
         ),
-        Arg::new(OUTPUT_DISK)
-            .long("executor-output-disk-bytes")
-            .value_name("BYTES")
-            .value_parser(clap::value_parser!(u64).range(1..))
-            .default_value("8589934592")
-            .help(
-                "The scratch disk a job needs for what it writes, in bytes: its outputs, the \
-                 pack and the private home, tmp and cache. A job needs this, the bytes of its \
-                 inputs and a fixed 1 GiB margin of its host's scratch, and the job service \
-                 places it only on a host whose disk can hold it. Used only with `--executor \
-                 js-agent`",
-            ),
         Arg::new(NETWORK)
             .long("executor-network")
             .value_name("LEVEL")
@@ -525,7 +516,6 @@ fn js_agent_flags(m: &ArgMatches) -> Result<JsAgentFlags, String> {
     config.max_run = secs(MAX_RUN);
     config.default_timeout = secs(DEFAULT_TIMEOUT);
     config.call_timeout = secs(CALL_TIMEOUT);
-    config.output_disk_bytes = count(OUTPUT_DISK);
     config.network = network(m);
     config.allow_open_network = m.get_flag(OPEN_NETWORK);
     Ok(JsAgentFlags {

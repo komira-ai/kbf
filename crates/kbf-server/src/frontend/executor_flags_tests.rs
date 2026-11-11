@@ -179,7 +179,6 @@ fn js_agent_settings_become_the_executors_config() {
         "--executor-max-run-secs=1800",
         "--executor-default-timeout-secs=900",
         "--executor-call-timeout-secs=3",
-        "--executor-output-disk-bytes=4294967296",
     ])
     .expect("flags");
     let js = flags.executor.js.expect("js-agent");
@@ -204,7 +203,6 @@ fn js_agent_settings_become_the_executors_config() {
     assert_eq!(config.max_run, Duration::from_secs(1800));
     assert_eq!(config.default_timeout, Duration::from_secs(900));
     assert_eq!(config.call_timeout, Duration::from_secs(3));
-    assert_eq!(config.output_disk_bytes, 4 << 30);
 }
 
 /// Catches `--executor-locate` not becoming the executor's setting, or being on by default: it
@@ -251,7 +249,6 @@ fn the_defaults_are_the_executors_own() {
     assert_eq!(config.max_run, own.max_run);
     assert_eq!(config.default_timeout, own.default_timeout);
     assert_eq!(config.call_timeout, own.call_timeout);
-    assert_eq!(config.output_disk_bytes, own.output_disk_bytes);
     assert_eq!(own.delivery, config.delivery);
     assert_eq!(config.network, own.network);
     assert_eq!(config.allow_open_network, own.allow_open_network);
@@ -326,7 +323,7 @@ fn the_flags_of_the_host_preloaded_tool_are_gone() {
 /// each is refused at the flags, naming the flag.
 #[test]
 fn settings_that_are_not_what_they_name_are_refused_naming_the_flag() {
-    let cases: [(&[&str], &str); 6] = [
+    let cases: [(&[&str], &str); 5] = [
         (&["--executor-job-url=ftp://x"], "--executor-job-url"),
         (
             &["--executor-job-url=http://jobs.example:80"],
@@ -341,10 +338,6 @@ fn settings_that_are_not_what_they_name_are_refused_naming_the_flag() {
             "--executor-job-ca-file",
         ),
         (&["--executor-work-dir=scratch"], "--executor-work-dir"),
-        (
-            &["--executor-output-disk-bytes=0"],
-            "--executor-output-disk-bytes",
-        ),
     ];
     for (more, flag) in cases {
         let why = refused(more);
@@ -497,6 +490,33 @@ fn the_daemon_executor_refuses_the_files_delivery() {
     assert!(why.contains("--executor-secret-delivery"), "{why}");
     let flags = parsed(argv(&["--executor-secret-delivery=argv"])).expect("flags");
     assert_eq!(flags.executor.kind, ExecutorKind::KbfDaemon);
+}
+
+/// Catches `--executor-output-disk-bytes` still being read: a job books no disk, so the flag
+/// that sized its scratch is gone, and a frontend given it, as `--flag=value` or as
+/// `--flag value`, with `--executor js-agent` or with the default `kbf-daemon` (a rollback keeps
+/// the unit's flags), is refused when the command line is parsed, with clap's unknown-argument
+/// error naming the flag; with every value it once took (the old default, the smallest and a
+/// zero it refused) the same. The same command line without it parses, so the refusal is the
+/// flag's.
+#[test]
+fn the_output_disk_flag_is_refused_naming_it() {
+    const FLAG: &str = "--executor-output-disk-bytes";
+    for value in ["8589934592", "1", "0"] {
+        let joined = format!("{FLAG}={value}");
+        for given in [vec![joined.as_str()], vec![FLAG, value]] {
+            let why = refused(&given);
+            assert!(why.contains("unexpected argument"), "{given:?}: {why}");
+            assert!(why.contains(&format!("'{FLAG}'")), "{given:?}: {why}");
+            let mut daemons = argv(&[]);
+            daemons.extend(given.iter().map(ToString::to_string));
+            let why = parsed(daemons).expect_err("refused with daemons");
+            assert!(why.contains("unexpected argument"), "{given:?}: {why}");
+            assert!(why.contains(&format!("'{FLAG}'")), "{given:?}: {why}");
+        }
+    }
+    js_with(&[]).expect("js-agent without the flag parses");
+    parsed(argv(&[])).expect("daemons without the flag parse");
 }
 
 /// Catches the lease server's flags still being read, or the job service's being optional: each

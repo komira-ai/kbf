@@ -70,10 +70,10 @@ arch = "x86_64"
 /// 250 ms (so a queued job is placed soon after it is submitted) and are lost after 5 s of
 /// silence; each is booked as two cores, 4 GiB of memory and 1 GiB of disk, which a hosted
 /// runner offers (a job of the executor asks for half again its farm booking and 512 MiB of
-/// memory, at most 3.5 GiB here, and for 1 GiB of disk beside its output's). Its
-/// capabilities are what the scheduler holds a host to when it admits a job: a job of the
-/// executor runs in a container (`exec`), asks for 1 GiB of disk (`disk-gib`, a whole GiB at
-/// least) and an allow-listed network (`egress`), and a host joins only if it reports them.
+/// memory, at most 3.5 GiB here, and for no disk). Its capabilities are what the scheduler holds
+/// a host to when it admits a job: a job of the executor runs in a container (`exec`) with an
+/// allow-listed network (`egress`), a job that asks for disk (none here does) needs `disk-gib`
+/// (a whole GiB at least), and a host joins only if it reports them.
 pub const AGENT_POOL: &str = r#"name = "kbf-tests"
 class = "linux-host"
 max_machines = 2
