@@ -20,8 +20,9 @@ when the deploy ends rolled back, failed or paused, and when 240 minutes pass fi
 then goes on; a frontend's drain waits for its open work, however long that takes).
 
 Nothing deploys while the repository variable `CP_DEPLOY_ENDPOINT` is unset or empty: both jobs
-are skipped and the release ends as it does without them. A failed `deploy` makes the release
-run red; the release stays published.
+are skipped and the release ends as it does without them. `deploy` needs `gamma`, so a release
+whose gamma stage failed is not deployed (re-run the failed jobs once the farm takes it). A failed
+`deploy` makes the release run red; the release stays published.
 
 ## Turn it on
 
