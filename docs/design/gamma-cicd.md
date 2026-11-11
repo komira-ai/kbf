@@ -127,7 +127,8 @@ release.
 
 The workflow has no secret but the release bot's GitHub App key (`RELEASE_BOT_PRIVATE_KEY`,
 with the variable `RELEASE_BOT_APP_ID`). The `release` environment is used by `tag`,
-`publish`, `bump` and `gamma`.
+`publish`, `bump` and `gamma`; the workflow `deploy` calls runs in the `controlplane`
+environment.
 
 The job table below lists the jobs in the order they run. The repository lint `gamma_cicd_doc` (in
 `crates/kbf-integration-test/tests/repo_lints.rs`) fails when this table names a job that
@@ -144,7 +145,9 @@ The job table below lists the jobs in the order they run. The repository lint `g
 | `bump` | `plan`, `tag`, `publish` | `contents: read`, plus a release-bot App token scoped to the downstream repository that pins kbf as a submodule, in environment `release` | opens a pull request there that moves the pin to the released commit | nothing: no job needs it, and the farm path does not depend on it |
 | `rehearse` | `plan`, `publish` | `contents: read`, the run token passed as a file | a host laid out from the previous release is updated to this one by the real helper under real systemd (`update_rehearsal`) | `gamma` |
 | `rehearse-agent` | `plan`, `publish` | `contents: read`, the run token passed as a file | the same host is updated through the whole control loop: this commit's coordinator, `cargo xtask deploy-farm`, and the previous release's agent and frontend (`update_rehearsal_agent`) | `gamma` |
-| `gamma` | `plan`, `publish`, `rehearse`, `rehearse-agent` | `contents: read`, `id-token: write` (the only job with OIDC), in environment `release`, no secret | `release farm-version` (the version the hosts report, `<semver>+g<12 hex>`). Then it joins the farm's Tailscale network when `TS_CLIENT_ID` is set, through workload identity federation. Then `cargo xtask deploy-farm --deadline-min 60`: it records a baseline, sends `POST /v1/desired`, and polls `GET /v1/convergence` until the farm converges. Then `cargo xtask prove-farm`: a remote-only Buck2 build, every action new. Last, only when an earlier step failed, `cargo xtask deploy-farm restore`: the version this release replaced is set back as desired (G1). | nothing after it. The release stays published whatever it says. Its result is the run's colour. |
+| `gamma` | `plan`, `publish`, `rehearse`, `rehearse-agent` | `contents: read`, `id-token: write` (with `deploy`, the only jobs with OIDC), in environment `release`, no secret | `release farm-version` (the version the hosts report, `<semver>+g<12 hex>`). Then it joins the farm's Tailscale network when `TS_CLIENT_ID` is set, through workload identity federation. Then `cargo xtask deploy-farm --deadline-min 60`: it records a baseline, sends `POST /v1/desired`, and polls `GET /v1/convergence` until the farm converges. Then `cargo xtask prove-farm`: a remote-only Buck2 build, every action new. Last, only when an earlier step failed, `cargo xtask deploy-farm restore`: the version this release replaced is set back as desired (G1). | `deploy`. The release stays published whatever it says. Its result is the run's colour. |
+| `deploy-digest` | `plan`, `publish` | `contents: read`, the run token for the download | only while `CP_DEPLOY_ENDPOINT` is set: `cargo xtask release image-digest` downloads `SHA256SUMS`, the linux-x86_64 frontend image and its bundle from the published release, holds the image to the sums, and outputs the manifest digest its `index.json` names and the release's addresses of the image and the bundle | `deploy` |
+| `deploy` | `plan`, `gamma`, `deploy-digest` | `id-token: write` alone, no secret; calls `komira-ai/docker-swarm-updater/.github/workflows/deploy.yml` at a pinned commit, whose job runs in environment `controlplane` | only while `CP_DEPLOY_ENDPOINT` is set: deploys the frontend image to its Docker Swarm service through docker-swarm-updater ([docs/deploy/swarm-frontend.md](../deploy/swarm-frontend.md)) and waits up to 240 minutes for it to converge | nothing after it |
 <!-- release-jobs: end -->
 
 ### 2.4 The desired version, from the CI token to the hosts

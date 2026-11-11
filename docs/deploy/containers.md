@@ -14,6 +14,9 @@ image is a release asset, an OCI image layout in one tar:
 checked, and how they are attested is [artifacts.md](../artifacts.md#the-frontend-and-coordinator-images-oci). The
 Dockerfiles are in [`packaging/container`](../../packaging/container).
 
+Under Docker Swarm with docker-swarm-updater, each release can deploy the frontend image itself:
+[swarm-frontend.md](swarm-frontend.md).
+
 ## Verify and import (k3s)
 
 Verify the archive before it goes anywhere, offline, with its bundle
