@@ -19,10 +19,10 @@ become ready. The job passes when the deploy ends `converged`. It fails with the
 when the deploy ends rolled back, failed or paused, and when 240 minutes pass first (the deploy
 then goes on; a frontend's drain waits for its open work, however long that takes).
 
-Nothing deploys while the repository variable `CP_DEPLOY_ENDPOINT` is unset or empty: both jobs
-are skipped and the release ends as it does without them. `deploy` needs `gamma`, so a release
-whose gamma stage failed is not deployed (re-run the failed jobs once the farm takes it). A failed
-`deploy` makes the release run red; the release stays published.
+Nothing deploys while either repository variable `CP_DEPLOY_ENDPOINT` or `CP_DEPLOY_TAILSCALE_TAGS`
+is unset or empty: both jobs are skipped and the release ends as it does without them. `deploy`
+needs `gamma`, so a release whose gamma stage failed is not deployed (re-run the failed jobs once
+the farm takes it). A failed `deploy` makes the release run red; the release stays published.
 
 ## Turn it on
 
@@ -39,18 +39,23 @@ updater check, the attestation check and Swarm's rollback.
    this repository's numeric `repository_id`, `job_workflow_ref`
    `komira-ai/docker-swarm-updater/.github/workflows/deploy.yml@<the commit release.yml pins>`,
    `ref` `refs/heads/main`, `environment` `controlplane`, `runner_environment` `github-hosted`.
-3. When the deploy front is reachable only on a Tailscale network, create a workload-identity
-   client that issues `tag:cp-deploy` to this repository's `controlplane` environment.
+3. When the deploy front is reachable only on a Tailscale network, use a workload-identity client
+   that trusts this repository's `controlplane` environment (the token's subject is
+   `repo:<owner>/<repo>:environment:controlplane`) and can issue a tag the tailnet's policy lets
+   reach the deploy front. The client that CI jobs join with as `tag:ci` can serve, once its trust
+   also covers `controlplane`. The deploy joins with the tags of `CP_DEPLOY_TAILSCALE_TAGS`, which
+   must be tags that client can issue, or the join fails.
 4. Set the repository variables:
 
 | variable | value |
 |---|---|
-| `CP_DEPLOY_ENDPOINT` | the deploy front, `http[s]://<host>[:<port>]`; setting it turns the deploy on |
+| `CP_DEPLOY_ENDPOINT` | the deploy front, `http[s]://<host>[:<port>]`; setting it, with `CP_DEPLOY_TAILSCALE_TAGS`, turns the deploy on |
 | `CP_DEPLOY_AUDIENCE` | the audience the deploy front expects of every token |
-| `CP_DEPLOY_TAILSCALE_CLIENT_ID` | the workload-identity client of step 3; empty: the job joins no network |
+| `CP_DEPLOY_TAILSCALE_CLIENT_ID` | the workload-identity client of step 3; empty: the job joins no network (`CP_DEPLOY_TAILSCALE_TAGS` must still be set, or nothing deploys) |
 | `CP_DEPLOY_TAILSCALE_AUDIENCE` | that client's audience |
+| `CP_DEPLOY_TAILSCALE_TAGS` | the tags the job joins the tailnet with, comma-separated, each one the client of step 3 can issue; required: while it is empty nothing deploys |
 
-To turn the deploy off, clear `CP_DEPLOY_ENDPOINT`.
+To turn the deploy off, clear `CP_DEPLOY_ENDPOINT` (or `CP_DEPLOY_TAILSCALE_TAGS`).
 
 ## Moving the pin
 

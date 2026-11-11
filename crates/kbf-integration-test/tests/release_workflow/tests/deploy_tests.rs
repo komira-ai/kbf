@@ -5,7 +5,10 @@ use super::*;
 
 const DIGEST: &str = "deploy-digest";
 const DEPLOY: &str = "deploy";
-const ENDPOINT_IF: &str = " && vars.CP_DEPLOY_ENDPOINT != '' }}";
+const ENDPOINT_IF: &str = " && vars.CP_DEPLOY_ENDPOINT != ''";
+const TAGS_IF: &str = " && vars.CP_DEPLOY_TAILSCALE_TAGS != ''";
+const TAGS_INPUT: &str = "tailscale-tags: ${{ vars.CP_DEPLOY_TAILSCALE_TAGS }}";
+const TAGS_LINE: &str = "      tailscale-tags: ${{ vars.CP_DEPLOY_TAILSCALE_TAGS }}\n";
 const CALL: &str = "komira-ai/docker-swarm-updater/.github/workflows/deploy.yml@c1fcc47610e2886d4d9e561be3c0c76f0452d1f6 # v0.1.3";
 const VERB: &str = "run: cargo xtask release image-digest --repo \"$GITHUB_REPOSITORY\" --tag \"$TAG\" --commit \"$COMMIT\" --output \"$GITHUB_OUTPUT\"";
 
@@ -17,18 +20,27 @@ fn each_red(job: &str, plants: &[(&str, &str, &str)]) {
 }
 
 #[test]
-fn both_jobs_run_only_for_a_release_with_the_endpoint_set_and_in_their_order() {
+fn both_jobs_run_only_for_a_release_with_the_endpoint_and_tags_set_and_in_their_order() {
     // Catches: a deploy that runs when no endpoint is set (the endpoint test dropped from
     // either job, so a fork or a repository without the deploy front would call it), a
-    // deploy that no longer waits for `gamma` or for the digest it is given, and a digest
-    // job that runs before the release is published.
+    // deploy that runs when no tailnet tag is set (the tags test dropped, turned round, or
+    // made a test of another variable, so the call would ask for an empty tag), a deploy
+    // that no longer waits for `gamma` or for the digest it is given, and a digest job that
+    // runs before the release is published.
     let found = problems(&real()).expect("read");
     assert!(found.is_empty(), "{found:#?}");
+    let tags_altered = [
+        "",
+        " && vars.CP_DEPLOY_TAILSCALE_TAGS == ''",
+        " && vars.CP_DEPLOY_TAILSCALE_CLIENT_ID != ''",
+        " || vars.CP_DEPLOY_TAILSCALE_TAGS != ''",
+    ];
     for job in [DIGEST, DEPLOY] {
-        red(
-            &plant(job, ENDPOINT_IF, " }}"),
-            &format!("the job `{job}` has `if: "),
-        );
+        let want = format!("the job `{job}` has `if: ");
+        red(&plant(job, ENDPOINT_IF, ""), &want);
+        for to in tags_altered {
+            red(&plant(job, TAGS_IF, to), &want);
+        }
     }
     each_red(
         DEPLOY,
@@ -70,7 +82,17 @@ fn the_deploy_calls_exactly_the_pinned_workflow_with_exactly_its_inputs() {
             "version: ${{ needs.plan.outputs.tag }}",
         ),
         ("environment: controlplane", "environment: release"),
-        ("tailscale-tags: tag:cp-deploy", "tailscale-tags: tag:ci"),
+        (TAGS_INPUT, "tailscale-tags: tag:cp-deploy"),
+        (TAGS_INPUT, "tailscale-tags: tag:ci"),
+        (
+            TAGS_INPUT,
+            "tailscale-tags: ${{ vars.CP_DEPLOY_TAILSCALE_AUDIENCE }}",
+        ),
+        (
+            TAGS_INPUT,
+            "tailscale-tags: ${{ vars.CP_DEPLOY_TAILSCALE_TAGS }},tag:ci",
+        ),
+        (TAGS_LINE, ""),
         ("wait-minutes: 240", "wait-minutes: 0"),
         ("      wait-minutes: 240\n", ""),
         (
@@ -78,8 +100,8 @@ fn the_deploy_calls_exactly_the_pinned_workflow_with_exactly_its_inputs() {
             "image-url: https://example.com/x.tar",
         ),
         (
-            "      tailscale-tags: tag:cp-deploy\n",
-            "      tailscale-tags: tag:cp-deploy\n      signer-ref: refs/heads/other\n",
+            TAGS_LINE,
+            "      tailscale-tags: ${{ vars.CP_DEPLOY_TAILSCALE_TAGS }}\n      signer-ref: refs/heads/other\n",
         ),
     ];
     for (from, to) in plants {
