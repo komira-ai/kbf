@@ -525,6 +525,7 @@ pub(crate) async fn execute_with(
         packs: 1,
         large: Vec::new(),
         inputs: None,
+        objects: None,
     };
     for file in &result.output_files {
         manifest.output_files.push(OutputFile {

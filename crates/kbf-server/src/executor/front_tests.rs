@@ -730,6 +730,7 @@ async fn a_pack_under_the_issued_key_becomes_the_actions_result() {
             packs: 1,
             large: vec![],
             inputs: None,
+            objects: None,
         };
         let pack = write_pack(&manifest, &[]).expect("a pack");
         let object = ObjectKey::new(key.as_str().to_owned()).expect("an object key");
@@ -789,6 +790,7 @@ fn manifest_of(build: &str, action: &Digest) -> TaskManifest {
         packs: 1,
         large: vec![],
         inputs: None,
+        objects: None,
     }
 }
 
