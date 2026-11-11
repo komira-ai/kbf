@@ -6,9 +6,12 @@
 //! The task image is opened like `pkg-image-asset` opens it ([`crate::pkg_image_asset`]) and
 //! refused unless its layers begin with those of the pinned base, in order ([`Base`]). Those
 //! layers, each checked against its digest, are applied in order onto one tree ([`layers`]: the
-//! whiteouts, hard links as separate entries, the refusals), `--binary` is added as the
-//! executable `/.kbf-tools/kbf-task` and nothing else is in `/.kbf-tools`, the tree is written
-//! as tierstore manifests ([`kbf_tree_bundle::Dir::build`]), and the bundle is written to
+//! whiteouts, hard links as separate entries, the refusals), the packages and paths of
+//! [`removed`] are left out as dpkg would leave them out, a set-uid or set-gid file still there
+//! is refused, `--binary`
+//! is added as the executable `/.kbf-tools/kbf-task` and nothing else is in `/.kbf-tools`, the
+//! tree is written as tierstore manifests ([`kbf_tree_bundle::Dir::build`]), and the bundle is
+//! written to
 //! `<out>/<file name>` ([`kbf_tree_bundle::bundle`]): the facts, every file's bytes in the
 //! order of the tree, then the manifests, the root's last. The layers above the base (the
 //! image's own `kbf-task` layer) are not read: the tree takes `--binary` instead.
@@ -16,7 +19,10 @@
 //! A tree has one owner and the modes 0644 and 0755 only: a file becomes 0755 if any execute bit
 //! is set and else 0644, a directory 0755, and every path whose mode was another is listed in
 //! the facts, with the mode it had and the one it has. An image that holds what a tree cannot
-//! hold, or what the kbf tree makes itself, is refused by path and kind and nothing is written.
+//! hold, or what the kbf tree makes itself, is refused by path and kind and nothing is written;
+//! so is one whose packages cannot all be left out consistently, and one with a set-uid or
+//! set-gid file left once they are. The lines printed end with each package and path left out,
+//! and why.
 //!
 //! Once written, the bundle is read back ([`kbf_tree_bundle::read`]: each object is checked
 //! against its name) and held to what was written, and only then listed in
@@ -24,6 +30,9 @@
 //! The release attests it with the rest of `SHA256SUMS`.
 
 mod layers;
+mod removed;
+
+use removed::{EXCLUDED, Excluded, REMOVED, Removed};
 
 use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -101,16 +110,35 @@ pub fn run(args: &Args) -> Result<Vec<String>, Error> {
             args.platform.name()
         )]));
     };
-    run_with(args, &base)
+    run_with(args, &base, REMOVED, EXCLUDED)
 }
 
-/// [`run`] on the base `base`.
-fn run_with(args: &Args, base: &Base) -> Result<Vec<String>, Error> {
+/// [`run`] on the base `base`, with the packages `removed` and the paths `excluded` left out;
+/// the lines printed end with one for each package and path left out, with its reason.
+fn run_with(
+    args: &Args,
+    base: &Base,
+    removed: &[Removed],
+    excluded: &[Excluded],
+) -> Result<Vec<String>, Error> {
     build_commit::full_commit("--commit", &args.commit)?;
     let image = read(&args.image)?;
     let binary = read(&args.binary)?;
-    let tree = tree_of(&image, base, binary)?;
-    write(&args.out, &args.commit, args.platform, &tree)
+    let packages: Vec<&str> = removed.iter().map(|r| r.package).collect();
+    let paths: Vec<&str> = excluded.iter().map(|e| e.path).collect();
+    let tree = tree_of(&image, base, &packages, &paths, binary)?;
+    let mut lines = write(&args.out, &args.commit, args.platform, &tree)?;
+    lines.extend(
+        removed
+            .iter()
+            .map(|r| format!("left out {}: {}", r.package, r.why)),
+    );
+    lines.extend(
+        excluded
+            .iter()
+            .map(|e| format!("left out {}: {}", e.path, e.why)),
+    );
+    Ok(lines)
 }
 
 /// What is wrong with the layers `layers` of an image as the start of a base whose layers are
@@ -132,13 +160,21 @@ fn layer_problems(layers: &[String], base: &[String]) -> Vec<String> {
 }
 
 /// The tree of the first layers of `image` (the bytes of its tar), which must be those of
-/// `base`, with `binary` added as `/.kbf-tools/kbf-task`.
+/// `base`, with the packages `removed` and the paths `excluded` of kept packages left out and
+/// `binary` added as `/.kbf-tools/kbf-task`.
 ///
 /// # Errors
 /// [`Error::Refused`], one line per problem: the image is not an OCI layout, its layers do not
 /// begin with the base's, a layer is not a tar, a layer holds what a tree cannot hold
-/// ([`layers`]), or the tree build refuses a name or a limit.
-fn tree_of(image: &[u8], base: &Base, binary: Vec<u8>) -> Result<Tree, Error> {
+/// ([`layers`]), a package cannot be left out consistently, a set-uid or set-gid file is left,
+/// or the tree build refuses a name or a limit.
+fn tree_of(
+    image: &[u8],
+    base: &Base,
+    removed: &[&str],
+    excluded: &[&str],
+    binary: Vec<u8>,
+) -> Result<Tree, Error> {
     let refused = |why: String| Error::Refused(vec![why]);
     let layout = pkg_image_asset::layout(image).map_err(|e| refused(format!("the image {e}")))?;
     let held = pkg_image_asset::layer_digests(&layout.manifest);
@@ -157,6 +193,14 @@ fn tree_of(image: &[u8], base: &Base, binary: Vec<u8>) -> Result<Tree, Error> {
     }
     if !problems.is_empty() {
         return Err(Error::Refused(problems));
+    }
+    rootfs.remove_packages(removed, excluded, &mut problems);
+    if !problems.is_empty() {
+        return Err(Error::Refused(problems));
+    }
+    let set_id = rootfs.set_id_files();
+    if !set_id.is_empty() {
+        return Err(Error::Refused(set_id));
     }
     rootfs.add_tool(binary);
     let flat = rootfs.flatten();

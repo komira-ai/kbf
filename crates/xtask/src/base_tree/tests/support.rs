@@ -19,6 +19,7 @@ pub struct E {
     link: Vec<u8>,
     pax: Vec<(String, String)>,
     bad_mode: bool,
+    raw_link: bool,
 }
 
 impl E {
@@ -31,6 +32,7 @@ impl E {
             link: Vec::new(),
             pax: Vec::new(),
             bad_mode: false,
+            raw_link: false,
         }
     }
 
@@ -83,6 +85,13 @@ impl E {
     /// The same entry with a link target of raw bytes.
     pub fn linking(mut self, target: &[u8]) -> E {
         self.link = target.to_vec();
+        self
+    }
+
+    /// The same entry with its link target in the header byte for byte, as an image's tar may
+    /// have it (`set_link_name` drops a `.` component and a trailing `/`).
+    pub fn raw(mut self) -> E {
+        self.raw_link = true;
         self
     }
 
@@ -139,7 +148,9 @@ pub fn layer(entries: &[E]) -> Vec<u8> {
             tar.append(&h, body.as_slice()).expect("pax");
         }
         let mut h = header(&e.path, e.kind, e.mode, e.body.len());
-        if !e.link.is_empty() {
+        if e.raw_link {
+            h.as_old_mut().linkname[..e.link.len()].copy_from_slice(&e.link);
+        } else if !e.link.is_empty() {
             h.set_link_name(OsStr::from_bytes(&e.link)).expect("link");
         }
         if e.bad_mode {

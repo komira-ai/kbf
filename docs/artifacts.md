@@ -716,15 +716,29 @@ it, in the `linux-*` jobs after the task image is an asset, from that same image
    layers below, and one named `.wh..wh..opq` removes everything the lower layers put in its directory, before what its own layer
    adds, whatever the order of the tar. A later entry replaces an earlier one at the same path (a directory over a
    directory keeps what it holds). A hard link becomes a separate file with the bytes and the mode of its target.
-3. `--binary` is added as the executable `/.kbf-tools/kbf-task` (mode 0755), and nothing else is in `/.kbf-tools`.
-4. The tree is written as tierstore manifests (the names and limits tierstore's reader enforces are enforced here first),
+3. The packages of `crates/xtask/src/base_tree/removed.rs` are left out, each as `dpkg --purge` would remove it with no
+   maintainer script run, from the base's own dpkg database: every path of its file list (a directory only once it is
+   empty and no kept package lists it), its control files, its stanza of `/var/lib/dpkg/status` and its diversions, an
+   alternative whose every choice it brought (with that alternative's links), and a link no package lists that pointed at
+   what it removed (an enabled unit). They are the account, login and PAM tools, `mount`, the ext2/3/4 tools, `apt` and
+   what installs packages, the helpers of init scripts, and the libraries only those used. One path of a kept package is
+   left out too, as dpkg's `path-exclude` leaves a path out (the file goes, the package's file list still names it):
+   `/usr/bin/su`, the set-uid program of util-linux, which stays for `flock`. The farm's actions run none of what is left
+   out (each package and path is listed with its reason, and the verb prints them). A removal that would leave the tree
+   inconsistent is refused by name: a package the base does not hold or whose file list is missing, a kept package that
+   depends on a removed one with no kept alternative, a listed path below a symbolic link, an alternative with a choice
+   kept and one removed, a link a kept package lists left pointing at a removed path, a path to leave out that is not
+   absolute, that no kept package lists, that is not in the base or that is a directory, and a database that cannot be
+   read as dpkg writes it. A set-uid or set-gid file still in the tree is then refused by path: the tree holds none.
+4. `--binary` is added as the executable `/.kbf-tools/kbf-task` (mode 0755), and nothing else is in `/.kbf-tools`.
+5. The tree is written as tierstore manifests (the names and limits tierstore's reader enforces are enforced here first),
    and the bundle to `<out>/kbf-base-tree-<commit>-<platform>.tree.tar`, a file that must not exist. It is read back as the
    frontend reads it (each object hashed to its name, the facts and the order held to what was written) and only then listed
    in `SHA256SUMS.<platform>`; a bundle that is already listed is refused.
 
 A tree has one owner and the modes 0644 and 0755 only. A file becomes 0755 if any execute bit is set and else 0644, a
-directory 0755, and the owner is dropped, with the set-uid, set-gid and sticky bits (a tree has one owner, so they grant
-nothing there; `/usr/bin/su` 4755 becomes 0755); every file or directory whose mode (the 12 permission bits) was another is listed in `normalised` with its
+directory 0755, and the owner is dropped, with a directory's set-gid and sticky bits (a tree has one owner, so they grant
+nothing there; `/var/mail` 2775 and `/tmp` 1777 become 0755; a set-uid or set-gid file is refused, step 3); every file or directory whose mode (the 12 permission bits) was another is listed in `normalised` with its
 path from the root, the mode it had and the one it has (`{"path": "/etc/shadow", "from": "0640", "to": "0644"}`), sorted by path.
 So `/etc/shadow` of the base is world-readable in the tree, which is why the base holds no secret. What changes behaviour
 or what tierstore refuses is refused by path and kind, all problems at once, and nothing is written (a refused base fails the

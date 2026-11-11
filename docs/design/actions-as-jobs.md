@@ -132,7 +132,8 @@ entry per top-level name of the base, and two more), written once per action. Be
 is the same manifest and the same blobs as in every other; tierstore's caches are keyed by blob SHA-256, and a
 manifest is a blob too (4.2), so each node fetches, caches and (with passthrough) shares the pages of the base's files
 once for all jobs, as it does for a toolchain subtree two input roots share. A kbf release changes the base tree's
-root and its `/.kbf-tools` only; `/usr`, `/etc` and the rest stay the same digests while the pinned base image does,
+root and its `/.kbf-tools` only; `/usr`, `/etc` and the rest stay the same digests while the pinned base image and the
+packages it leaves out do,
 and stay warm in every cache across kbf releases. What is not shared today is tierstore's **flattened** form: it
 flattens a tree whole when it first attaches it (ts 6.3, I1), and each action tree is a tree of its own, so each
 action's flatten covers the base's entries again (E8: about 1.7 µs and 110 bytes of table per entry, a table held while
@@ -170,9 +171,10 @@ from the node nor a layer of its own. The image's contents are chosen in its own
 allow (hermetic actions bring their toolchains as inputs); this design requires only that the base tree holds the
 mount-point directories above, `/tmp`, `/var/tmp` and `/run` as directories, the action user in `/etc/passwd` and
 `/etc/group`, and none of `/work`, `/.kbf` (the names each action tree adds, 4.1) and `/.kbf-run` (`kbf-task`'s run
-directory, 4.4). The image starts as today's
-pinned base (`base-<platform>.manifest.json`), flattened with modes normalised (below); making it barer is that
-image's own change.
+directory, 4.4). The image is today's
+pinned base (`base-<platform>.manifest.json`), flattened with modes normalised and with the packages no action needs
+left out (below, item 2): the account, login and PAM tools, `mount`, the ext2/3/4 tools, what installs packages, the
+init-script helpers, the libraries only those use, and util-linux's `su`, so the tree holds no set-uid or set-gid file.
 
 **Who builds it, and how (O13, O16)** [proposed, D3]. kbf's release builds it, and the release's frontend publishes it:
 
@@ -183,13 +185,19 @@ image's own change.
    directory's manifest, named by SHA-256, the base tree's root digest, and its facts (below). The bundle is a release
    asset like the others, listed in `SHA256SUMS` and covered by the release's attestation. The root digest changes
    with every release (its `/.kbf-tools` does); the manifest of every other top-level directory (`/usr`, `/etc`, ...)
-   is a function of the pinned base manifest alone, so it changes only when that pin does: one base-image version, one
-   set of subtrees, shared by digest across kbf releases.
+   is a function of the pinned base manifest and the list of packages left out alone, so it changes only when one of
+   them does: one base-image version, one set of subtrees, shared by digest across kbf releases.
 2. **Flattened to what a tree can hold.** A tree has one owner and modes 0644 and 0755 only (ts 6.1, D10). The step
    normalises what only narrows access (a file becomes 0755 if any execute bit is set, else 0644; a directory 0755; the
-   owner is dropped, so `/etc/shadow` 0640 becomes 0644, which is why the base holds no secret; the set-uid, set-gid
-   and sticky bits are dropped too, so `/usr/bin/su` 4755 becomes 0755: a tree has one owner, so they grant nothing
-   there), lists every normalised
+   owner is dropped, so `/etc/shadow` 0640 becomes 0644, which is why the base holds no secret; a directory's set-gid
+   and sticky bits are dropped too, so `/tmp` 1777 becomes 0755: a tree has one owner, so they grant nothing there).
+   Before that it leaves out the packages of `crates/xtask/src/base_tree/removed.rs`, as `dpkg --purge` would with no
+   maintainer script run, and its paths of kept packages, as dpkg's `path-exclude` would, from the base's own dpkg
+   database (docs/artifacts.md, "The kbf base tree bundle", says what goes and what is refused), measured against the
+   farm's actions: they run or look for the C library and the libraries their tools load, the shells, coreutils,
+   `sed`, `grep`, `awk`, `diff`, `find`, `tar`, `gzip`, `hostname` and util-linux's `flock`, and nothing left out. A
+   set-uid or set-gid file still there is refused, so the base's facts list none (the pinned base's twelve, `su`,
+   `passwd`, `mount` and the rest, go with their packages, and `su` alone from util-linux). It lists every normalised
    path in the bundle's facts with the tree's entry count and depth (which every action tree counts with its own,
    4.6), and refuses, by name, what changes behaviour or what tierstore would refuse: a
    device node, a FIFO or socket, an extended attribute, a name with tierstore's `.wh.` prefix left after the
@@ -707,7 +715,15 @@ passed-through port and the spec echo, and a fake of tierstore's `hydrate` and `
 
 **Base tree bundle and publishing** (`cargo xtask base-tree`, the frontend's start): a base image with each refused kind
 (a device, a FIFO, a socket, an extended attribute, a reserved path) fails the build by name; modes
-0600, 0640, 0700, 0750, 1777 and the set-uid and set-gid 4755, 2755 and 6755 are normalised to 0644 or 0755 and listed in the facts; whiteouts across layers are
+0600, 0640, 0700, 0750, 1777 and a directory's 2775 are normalised to 0644 or 0755 and listed in the facts; a set-uid
+or set-gid file (4755, 2755, 6755, 4644, a hard link to one) left in the tree fails the build by path; a package left
+out takes every path of its file list (a directory only once empty and listed by no kept package), its control files,
+stanza and diversions, an alternative whose every choice it brought, and a link no package lists into what it removed,
+and keeps a link that pointed at nothing already; a path left out of a kept package goes and its file list stays; each
+inconsistent removal (a package not in the base or with no file list, a kept package's broken dependency, a listed path
+below a link, a mixed alternative, a kept package's link into what is removed, a path to leave out that is not
+absolute, listed by no kept package, absent or a directory, a database not as dpkg writes it) fails the build by name;
+whiteouts across layers are
 applied; a hard link becomes two entries; `/.kbf-tools` holds exactly the release's `kbf-task`, mode 0755; the
 same pinned base gives the same manifest digest for every top-level directory but `/.kbf-tools` from two releases
 with different `kbf-task` builds, and a different root digest; the facts' entry count and depth equal the tree's; the
@@ -1025,5 +1041,6 @@ it, is for a macOS design.
 - **`kbf-task-pack` refused unknown fields** until item 8, which is why that reader ships a release before the writer
   (D13).
 - **The farm's virtual workers** bound kbf's in-flight work by configured shapes, not the pool's real capacity.
-- **The base image's contents**: this design fixes what the base tree must and must not hold, not what else; making it
-  barer is the base image's own change, measured by the conformance build.
+- **The base image's contents**: this design fixes what the base tree must and must not hold, not what else; the
+  packages left out (3.3) were measured against a sample of the farm's actions; leaving out more is a change to that
+  list, measured the same way and by the conformance build.
