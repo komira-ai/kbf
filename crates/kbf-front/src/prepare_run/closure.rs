@@ -16,8 +16,13 @@
 //! - **Deterministic.** The closure is a sorted set, and the error of two failures is the
 //!   one of the Directory read first in level order (the reads of a level are issued
 //!   together and answered in order), so the same store gives the same answer.
+//!
+//! [`collect_closure_keeping`] makes the same walk and keeps every `Directory` it read, its
+//! digests parsed, for the action tree's manifest writer ([`crate::action_tree`]): the walk the
+//! frontend makes before every submit stays the only walk. What it keeps is bounded by the same
+//! [`ClosureLimits`], and is dropped with the [`KeptClosure`].
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use bytes::Bytes;
 use futures::stream;
@@ -148,6 +153,95 @@ impl InputClosure {
     }
 }
 
+/// An [`InputClosure`] with every `Directory` of its input root kept, by digest, its digests
+/// parsed: what the action tree's manifest writer ([`crate::action_tree::TreeWriter`]) builds the
+/// manifests from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeptClosure {
+    closure: InputClosure,
+    root: Digest,
+    directories: BTreeMap<Digest, KeptDirectory>,
+}
+
+impl KeptClosure {
+    /// The closure, as [`collect_closure`] gives it.
+    #[must_use]
+    pub const fn closure(&self) -> &InputClosure {
+        &self.closure
+    }
+
+    /// The Action's input root.
+    #[must_use]
+    pub const fn root(&self) -> &Digest {
+        &self.root
+    }
+
+    /// How many `Directory` messages are kept: each of the tree's, once.
+    #[must_use]
+    pub fn directory_count(&self) -> usize {
+        self.directories.len()
+    }
+
+    /// The kept `Directory` `digest`.
+    pub(crate) fn directory(&self, digest: &Digest) -> Option<&KeptDirectory> {
+        self.directories.get(digest)
+    }
+}
+
+/// One kept `Directory`: its nodes in the order the message lists them, their digests parsed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct KeptDirectory {
+    /// The `FileNode`s: name, digest and whether it is executable.
+    pub(crate) files: Vec<(String, Digest, bool)>,
+    /// The `DirectoryNode`s: name and digest.
+    pub(crate) directories: Vec<(String, Digest)>,
+    /// The `SymlinkNode`s: name and target.
+    pub(crate) symlinks: Vec<(String, String)>,
+    /// Where REAPI `node_properties` are set (any property, an `mtime` or a `unix_mode`), the
+    /// first place found: `Some("")` on the `Directory` itself, `Some(name)` on the node
+    /// `name`, `None` nowhere.
+    pub(crate) properties: Option<String>,
+}
+
+impl KeptDirectory {
+    /// The `Directory` `message`, its file and subdirectory nodes already parsed.
+    fn of(
+        message: reapi::Directory,
+        files: Vec<(String, Digest, bool)>,
+        directories: Vec<(String, Digest)>,
+    ) -> Self {
+        let properties = if sets(message.node_properties.as_ref()) {
+            Some(String::new())
+        } else {
+            let files = message.files.iter();
+            let files = files.map(|node| (&node.name, node.node_properties.as_ref()));
+            let symlinks = message.symlinks.iter();
+            let symlinks = symlinks.map(|node| (&node.name, node.node_properties.as_ref()));
+            let mut nodes = files.chain(symlinks);
+            nodes
+                .find(|(_, properties)| sets(*properties))
+                .map(|(name, _)| name.clone())
+        };
+        Self {
+            files,
+            directories,
+            symlinks: message
+                .symlinks
+                .into_iter()
+                .map(|node| (node.name, node.target))
+                .collect(),
+            properties,
+        }
+    }
+}
+
+/// Whether `properties` sets anything: a named property, an `mtime` or a `unix_mode`. An empty
+/// `NodeProperties` message sets nothing.
+fn sets(properties: Option<&reapi::NodeProperties>) -> bool {
+    properties
+        .is_some_and(|p| !p.properties.is_empty() || p.mtime.is_some() || p.unix_mode.is_some())
+}
+
 /// The distinct digests of a tree so far, and the bytes they name, kept within the limits.
 struct Seen {
     limits: ClosureLimits,
@@ -186,6 +280,34 @@ pub async fn collect_closure(
     action: &Digest,
     limits: ClosureLimits,
 ) -> Result<InputClosure, ClosureError> {
+    let (closure, _, _) = collect(backend, action, limits, false).await?;
+    Ok(closure)
+}
+
+/// [`collect_closure`], keeping every `Directory` of the input root it reads.
+///
+/// # Errors
+/// As [`collect_closure`].
+pub async fn collect_closure_keeping(
+    backend: &Backend,
+    action: &Digest,
+    limits: ClosureLimits,
+) -> Result<KeptClosure, ClosureError> {
+    let (closure, root, directories) = collect(backend, action, limits, true).await?;
+    Ok(KeptClosure {
+        closure,
+        root,
+        directories,
+    })
+}
+
+/// The closure of `action`, its input root, and, when `keep` is set, every `Directory` of it.
+async fn collect(
+    backend: &Backend,
+    action: &Digest,
+    limits: ClosureLimits,
+    keep: bool,
+) -> Result<(InputClosure, Digest, BTreeMap<Digest, KeptDirectory>), ClosureError> {
     let blob = read(backend, "the Action", action).await?;
     let decoded = reapi::Action::decode(blob).map_err(|e| invalid("the Action", action, &e))?;
     let named = |what, digest: Option<&reapi::Digest>| {
@@ -205,6 +327,7 @@ pub async fn collect_closure(
         bytes: 0,
     };
     seen.add(root)?;
+    let mut kept = BTreeMap::new();
     let mut files = Vec::new();
     let mut level = vec![root];
     while !level.is_empty() {
@@ -214,28 +337,42 @@ pub async fn collect_closure(
             .try_collect()
             .await?;
         level = Vec::new();
-        for (parent, directory) in &directories {
-            for file in &directory.files {
-                let file = named_in(parent, "a file", file.digest.as_ref())?;
+        for (parent, directory) in directories {
+            // Parsed nodes are kept only when asked: the walk before every submit holds none.
+            let mut kept_files = Vec::new();
+            let mut kept_directories = Vec::new();
+            for node in &directory.files {
+                let file = named_in(&parent, "a file", node.digest.as_ref())?;
                 if seen.add(file)? {
                     files.push(file);
                 }
+                if keep {
+                    kept_files.push((node.name.clone(), file, node.is_executable));
+                }
             }
-            for child in &directory.directories {
-                let child = named_in(parent, "a subdirectory", child.digest.as_ref())?;
+            for node in &directory.directories {
+                let child = named_in(&parent, "a subdirectory", node.digest.as_ref())?;
                 if seen.add(child)? {
                     level.push(child);
                 }
+                if keep {
+                    kept_directories.push((node.name.clone(), child));
+                }
+            }
+            if keep {
+                let directory = KeptDirectory::of(directory, kept_files, kept_directories);
+                kept.insert(parent, directory);
             }
         }
     }
     require_held(backend, &command, files).await?;
-    Ok(InputClosure {
+    let closure = InputClosure {
         action: *action,
         command,
         inputs: seen.digests,
         bytes: seen.bytes,
-    })
+    };
+    Ok((closure, root, kept))
 }
 
 /// The digest a Directory `parent` names for `what`.
