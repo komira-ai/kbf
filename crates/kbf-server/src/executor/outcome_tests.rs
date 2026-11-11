@@ -47,6 +47,15 @@ fn result(reason: ResultReason, exit_code: Option<i32>) -> JobResult {
     }
 }
 
+/// The result of a job that succeeded, as the job service reports one: its state is
+/// succeeded too.
+fn succeeded(reason: ResultReason, exit_code: Option<i32>) -> JobResult {
+    JobResult {
+        state: JobState::Succeeded.into(),
+        ..result(reason, exit_code)
+    }
+}
+
 fn refusal(code: RefusalCode) -> Error {
     Error::Refused(Refusal {
         code: code.into(),
@@ -80,17 +89,41 @@ fn cases() -> Vec<(&'static str, Case)> {
     let none = JobResult::default();
     vec![
         (
-            "succeeded (exit 0)",
+            "succeeded, its result succeeded, reason exit, exit code 0",
             judged(
                 ended(JobState::Succeeded),
-                result(ResultReason::Exit, Some(0)),
+                succeeded(ResultReason::Exit, Some(0)),
             ),
         ),
         (
             "succeeded with a nonzero exit code",
             judged(
                 ended(JobState::Succeeded),
-                result(ResultReason::Exit, Some(3)),
+                succeeded(ResultReason::Exit, Some(3)),
+            ),
+        ),
+        (
+            "succeeded with no exit code",
+            judged(
+                ended(JobState::Succeeded),
+                succeeded(ResultReason::Exit, None),
+            ),
+        ),
+        (
+            "succeeded for a reason other than exit",
+            judged(
+                ended(JobState::Succeeded),
+                succeeded(ResultReason::Unspecified, Some(0)),
+            ),
+        ),
+        (
+            "succeeded, its result in another state",
+            judged(
+                ended(JobState::Succeeded),
+                JobResult {
+                    state: JobState::Failed.into(),
+                    ..result(ResultReason::Exit, Some(0))
+                },
             ),
         ),
         (
@@ -444,9 +477,94 @@ fn an_infra_reason_carries_the_exit_code() {
     assert!(why.contains("Some(13)"), "{why}");
     let why = infra(judge(
         &ended(JobState::Succeeded),
-        &result(ResultReason::Exit, Some(3)),
+        &succeeded(ResultReason::Exit, Some(3)),
     ));
     assert!(why.contains('3'), "{why}");
+}
+
+/// Catches a pack being promoted from anything but a clean result. Every combination of the
+/// job's state, the result's state, the result's reason and its exit code is judged, each
+/// enum over all its values and one value no release has (99), the exit code absent, 0, 1,
+/// -1, `i32::MIN` and `i32::MAX`: exactly one combination is ingested, the job and its result
+/// succeeded for the job's exit with exit code 0.
+#[test]
+fn only_a_clean_result_is_ingested() {
+    let states: Vec<i32> = (0..=9).chain([99]).collect();
+    let reasons: Vec<i32> = (0..=4).chain([99]).collect();
+    let exits = [
+        None,
+        Some(0),
+        Some(1),
+        Some(-1),
+        Some(i32::MIN),
+        Some(i32::MAX),
+    ];
+    let (succeeded, exit) = (JobState::Succeeded as i32, ResultReason::Exit as i32);
+    let mut promoted = Vec::new();
+    for &job_state in &states {
+        let job = Job {
+            state: job_state,
+            ..ended(JobState::Unspecified)
+        };
+        for &result_state in &states {
+            for &reason in &reasons {
+                for exit_code in exits {
+                    let result = JobResult {
+                        state: result_state,
+                        reason,
+                        exit_code,
+                        ..JobResult::default()
+                    };
+                    if judge(&job, &result) == Verdict::Ingest {
+                        promoted.push((job_state, result_state, reason, exit_code));
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(promoted, vec![(succeeded, succeeded, exit, Some(0))]);
+}
+
+/// Catches a job that succeeded with a result that is not clean being answered with a message
+/// that does not say which part of the result was wrong: each is the whole message, as the
+/// farm and the operator read it.
+#[test]
+fn a_result_that_is_not_clean_is_named_in_full() {
+    let judged = |result: JobResult| infra(judge(&ended(JobState::Succeeded), &result));
+    assert_eq!(
+        judged(succeeded(ResultReason::Exit, Some(-1))),
+        "the job succeeded with exit code -1"
+    );
+    assert_eq!(
+        judged(succeeded(ResultReason::Exit, None)),
+        "the job succeeded with no exit code"
+    );
+    for (reason, name) in [
+        (ResultReason::Unspecified, "RESULT_REASON_UNSPECIFIED"),
+        (ResultReason::WallLimit, "RESULT_REASON_WALL_LIMIT"),
+        (ResultReason::Memory, "RESULT_REASON_MEMORY"),
+        (ResultReason::Cancelled, "RESULT_REASON_CANCELLED"),
+    ] {
+        assert_eq!(
+            judged(succeeded(reason, Some(0))),
+            format!("the job succeeded for a reason other than its exit ({name})")
+        );
+    }
+    for (state, name) in [
+        (JobState::Unspecified, "JOB_STATE_UNSPECIFIED"),
+        (JobState::Running, "JOB_STATE_RUNNING"),
+        (JobState::Failed, "JOB_STATE_FAILED"),
+        (JobState::Cancelled, "JOB_STATE_CANCELLED"),
+    ] {
+        let result = JobResult {
+            state: state.into(),
+            ..result(ResultReason::Exit, Some(0))
+        };
+        assert_eq!(
+            judged(result),
+            format!("the job succeeded but its result says {name}")
+        );
+    }
 }
 
 /// Catches a class that reaches the farm as another: the status code, and the two fields
