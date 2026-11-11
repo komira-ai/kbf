@@ -49,7 +49,11 @@ use kbf_types::Digest;
 use tierstore::server::presign::PresignError;
 use tierstore::server::{PresignRequest, presign_put};
 
-pub use self::closure::{ClosureError, ClosureLimits, InputClosure, collect_closure};
+pub(crate) use self::closure::KeptDirectory;
+pub use self::closure::{
+    ClosureError, ClosureLimits, InputClosure, KeptClosure, collect_closure,
+    collect_closure_keeping,
+};
 pub use tierstore::server::AccessKey;
 
 use crate::backend::Backend;
