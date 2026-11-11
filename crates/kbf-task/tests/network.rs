@@ -61,6 +61,7 @@ async fn probe_run(name: &str, network: Network, args: &[&str]) -> (Ran, String)
             deadline: Duration::from_secs(60),
             network,
             unreadable: &[],
+            hidden: &[],
         },
     )
     .await
@@ -540,7 +541,7 @@ async fn a_filter_that_cannot_be_installed_fails_the_run_and_the_command_never_r
 
 /// Catches: a namespace step that fails failing the run, or the Command then running without the
 /// filter: with `unshare` refused the Command still runs, under the filter alone, and the
-/// layers say so.
+/// layers and the sandbox say so.
 #[tokio::test]
 async fn a_namespace_that_cannot_be_made_leaves_the_filter_and_says_so() {
     let marker_dir = scratch("unshare-marker");
@@ -554,7 +555,7 @@ async fn a_namespace_that_cannot_be_made_leaves_the_filter_and_says_so() {
     .await;
     assert_eq!(
         text,
-        "layers=seccomp only, no inet (netns: unshare 1)\nexit=0\n"
+        "layers=seccomp only, no inet (netns: unshare 1)\nsandbox=incomplete (unshare 1)\nexit=0\n"
     );
     assert!(marker.exists());
     for (n, mode) in ["inet", "inet6", "tcp-loopback", "netlink"]
@@ -567,6 +568,16 @@ async fn a_namespace_that_cannot_be_made_leaves_the_filter_and_says_so() {
             "{mode}: {text}"
         );
     }
+}
+
+/// Catches: a Command a signal ended reported as anything but 128 plus the signal where the run
+/// made no PID namespace, so the signal reaches the tool as itself rather than as an exit code
+/// of the namespace's first process.
+#[tokio::test]
+async fn without_a_namespace_a_signal_is_reported_as_128_plus_its_number() {
+    let (_, text) = under("unshare-signal", "unshare", "no", &["signal"]).await;
+    assert!(text.contains("sandbox=incomplete (unshare 1)\n"), "{text}");
+    assert!(text.ends_with("exit=143\n"), "{text}");
 }
 
 /// Catches: the tool being open to the Command that runs beside it as the same user: the process

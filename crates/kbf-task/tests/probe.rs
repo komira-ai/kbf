@@ -64,7 +64,7 @@ fn status(rest: &str) -> &str {
     rest.split(' ').next().expect("a status")
 }
 
-const NAMES: [&str; 19] = [
+const NAMES: [&str; 20] = [
     "layers",
     "child",
     "netns_distinct",
@@ -74,6 +74,7 @@ const NAMES: [&str; 19] = [
     "packet",
     "io_uring",
     "secret_path",
+    "sandbox",
     "apparmor_restrict_unprivileged_userns",
     "max_user_namespaces",
     "io_uring_disabled",
@@ -110,7 +111,19 @@ fn the_probe_prints_the_documented_lines_and_its_exit_code_is_the_verdict() {
         Some(i32::from(last.ends_with("FAIL"))),
         "{last}"
     );
-    assert_eq!(rest(&checks, "secret_path"), "ok readable");
+    // Under the system temporary directory, which the sandbox binds to the run's own.
+    if rest(&checks, "sandbox") == "ok mount and pid namespaces" {
+        assert_eq!(
+            rest(&checks, "secret_path"),
+            "ok not readable (ENOENT (2): hidden from the Command)"
+        );
+    } else {
+        assert!(
+            rest(&checks, "sandbox").starts_with("ok incomplete ("),
+            "{checks:?}"
+        );
+        assert_eq!(rest(&checks, "secret_path"), "ok readable");
+    }
     assert!(!String::from_utf8_lossy(&out.stdout).contains(SENTINEL));
     assert!(!String::from_utf8_lossy(&out.stderr).contains(SENTINEL));
     let layers = rest(&checks, "layers");

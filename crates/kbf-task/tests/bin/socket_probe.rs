@@ -13,6 +13,14 @@
 //! descriptor out of another process with `pidfd_getfd` (exit 0 if it worked, else the errno),
 //! and `hidden <pid>` exits 0 when `/proc/<pid>/status` is not owned by its own user, which is what a
 //! non-dumpable process looks like.
+//!
+//! For the sandbox (`tests/sandbox.rs`): `ls <dir>` prints the names in a directory, sorted, one a
+//! line (or exits with the errno); `exec-from <dir>` copies this program to `<dir>/prog` and runs
+//! it there as `prog touch <dir>/ran` (its code, or the errno of the copy); `pid` prints its process
+//! id, `nnp` its `no_new_privs`, and `signal` ends it with `SIGTERM`; `linger <lock> <pidfile>` starts a copy of this program in a
+//! process group of its own that takes an exclusive `flock` of `<lock>`, writes its process id as
+//! the job sees it (from `/proc/self`) to `<pidfile>`, says so, and then waits for ever; `linger`
+//! exits 0 once it has said so.
 
 use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::process::ExitStatusExt as _;
@@ -48,6 +56,27 @@ fn probe(args: &[&str]) -> u8 {
             std::fs::rename(from, to).map_or_else(|e| errno_of(&e), |()| probe(&["read", to]))
         }
         ["touch", path] => u8::from(std::fs::File::create(path).is_err()),
+        ["signal"] => {
+            // SAFETY: integer argument only; the default action of SIGTERM ends this process.
+            unsafe { libc::raise(libc::SIGTERM) };
+            UNKNOWN_MODE
+        }
+        ["ls", dir] => ls(dir),
+        ["exec-from", dir] => exec_from(dir),
+        ["pid"] => {
+            println!("{}", std::process::id());
+            0
+        }
+        #[cfg(target_os = "linux")]
+        ["nnp"] => {
+            // SAFETY: integer arguments only.
+            println!("{}", unsafe {
+                libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0)
+            });
+            0
+        }
+        ["linger", lock, pidfile] => linger(lock, pidfile),
+        ["hold", lock, pidfile] => hold(lock, pidfile),
         ["ifaces"] => ifaces(),
         ["tcp-loopback"] => tcp_loopback(),
         ["tcp-outside"] => tcp_outside(),
@@ -192,6 +221,94 @@ fn int80() -> u8 {
     }
     // A result in -4095..0 is an error number (negated).
     u8::from(result > u64::MAX - 4095)
+}
+
+fn ls(dir: &str) -> u8 {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => return errno_of(&e),
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    for name in names {
+        println!("{name}");
+    }
+    0
+}
+
+fn exec_from(dir: &str) -> u8 {
+    use std::os::unix::fs::PermissionsExt as _;
+    let Ok(me) = std::env::current_exe() else {
+        return UNKNOWN_MODE;
+    };
+    let prog = format!("{dir}/prog");
+    if let Err(e) = std::fs::copy(me, &prog)
+        .and_then(|_| std::fs::set_permissions(&prog, std::fs::Permissions::from_mode(0o755)))
+    {
+        return errno_of(&e);
+    }
+    match Command::new(&prog)
+        .args(["touch", &format!("{dir}/ran")])
+        .status()
+    {
+        Ok(status) => status
+            .code()
+            .and_then(|code| u8::try_from(code).ok())
+            .unwrap_or(UNKNOWN_MODE),
+        Err(e) => errno_of(&e),
+    }
+}
+
+/// Starts `hold` in a process group of its own and returns once it holds the lock.
+fn linger(lock: &str, pidfile: &str) -> u8 {
+    use std::io::BufRead as _;
+    use std::os::unix::process::CommandExt as _;
+    let Ok(me) = std::env::current_exe() else {
+        return UNKNOWN_MODE;
+    };
+    let Ok(mut held) = Command::new(me)
+        .args(["hold", lock, pidfile])
+        .stdout(std::process::Stdio::piped())
+        .process_group(0)
+        .spawn()
+    else {
+        return UNKNOWN_MODE;
+    };
+    let mut line = String::new();
+    let said = held
+        .stdout
+        .take()
+        .map(|out| std::io::BufReader::new(out).read_line(&mut line));
+    u8::from(!matches!(said, Some(Ok(_))) || line != "held\n")
+}
+
+/// Takes the lock, writes its id as `/proc/self` names it, says `held`, and waits for ever.
+fn hold(lock: &str, pidfile: &str) -> u8 {
+    use std::io::Write as _;
+    use std::os::fd::AsRawFd as _;
+    let Ok(file) = std::fs::File::create(lock) else {
+        return UNKNOWN_MODE;
+    };
+    // SAFETY: integer arguments only.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return UNKNOWN_MODE;
+    }
+    let Ok(me) = std::fs::read_link("/proc/self") else {
+        return UNKNOWN_MODE;
+    };
+    if std::fs::write(pidfile, me.to_string_lossy().as_bytes()).is_err() {
+        return UNKNOWN_MODE;
+    }
+    let mut out = std::io::stdout();
+    if out.write_all(b"held\n").and_then(|()| out.flush()).is_err() {
+        return UNKNOWN_MODE;
+    }
+    loop {
+        std::thread::park();
+    }
 }
 
 fn errno_of(e: &std::io::Error) -> u8 {

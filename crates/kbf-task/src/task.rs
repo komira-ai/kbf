@@ -16,7 +16,7 @@
 //! | 0 | the action ran (whatever its exit code, a timeout included) and its pack was stored |
 //! | 2 | the flags are wrong (clap) |
 //! | 10 | fetch: the Action, the Command or an input could not be read or checked, or laid out |
-//! | 11 | run-start: the Command could not be started (bad paths, no program, a `kbf-network` property other than `allow`), or the run's `private/` home, tmp and cache directories could not be made |
+//! | 11 | run-start: the Command could not be started (bad paths, no program, a `kbf-network` property other than `allow`), or the run's `private/` home, tmp and cache directories, or the directories of its sandbox (`crate::sandbox`), could not be made or opened |
 //! | 12 | pack: the outputs could not be collected, did not fit the run's packs and large objects (`output-too-large`), changed after they were hashed (`output-changed`), or made a manifest or pack the frontend would refuse (`invalid-manifest`, `invalid-pack`) |
 //! | 13 | put: a pack or large object could not be stored (refused, key already taken, still no room after the retries of a 503, unreachable), or a large object's bytes changed while it was sent (the stored object is an orphan) |
 //! | 14 | setup: `--lease` is not a build id, a credential or root certificate is unusable, a credential given as a flag value without `--insecure-argv-secrets`, or the runtime did not start |
@@ -51,6 +51,7 @@ use crate::put::{
 };
 use crate::put_urls::PutUrls;
 use crate::run::{Run, RunError, output_paths, run};
+use crate::sandbox;
 
 /// Exit code: an input could not be read, checked or laid out.
 pub const EXIT_FETCH: u8 = 10;
@@ -201,7 +202,9 @@ pub struct Cli {
     /// Command's `HOME`, `TMPDIR`, `XDG_CACHE_HOME` and `CLANG_MODULE_CACHE_PATH` name directories
     /// under `private/` here, made new for the run (an existing `private` is refused) with mode 0700, beside `in/` and so never collected as outputs: a job's
     /// image root is read-only and its `/tmp` is small and `noexec`. A variable the Command sets
-    /// itself keeps its value.
+    /// itself keeps its value. On Linux the parent of this directory (`/scratch`) and
+    /// `/run/js-files` are hidden from the Command, all but `in/` and `private/`, and `/tmp`,
+    /// `/var/tmp`, `/run` and `/root` are directories under `private/` (`crate::sandbox`).
     #[arg(long, default_value = "/scratch/work")]
     pub work_dir: PathBuf,
     /// The longest the Command may run, in milliseconds: the Action's timeout when it sets a
@@ -482,9 +485,14 @@ pub(crate) async fn execute_with(
             deadline: deadline(&action, Duration::from_millis(cli.deadline_ms)),
             network,
             unreadable: &unreadable,
+            hidden: &sandbox::hidden_for(&cli.work_dir),
         },
     )
     .await?;
+    // None only where no sandbox is built (not Linux).
+    sandbox::notice(&cli.action, &ran.sandbox)
+        .into_iter()
+        .for_each(|line| eprintln!("{line}"));
     if network != network::Network::Allowed {
         eprintln!("{}", network::layers_notice(&cli.action, &ran.layers));
     }

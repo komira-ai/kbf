@@ -101,37 +101,88 @@ fn the_layers_notice_names_the_action_and_each_layer() {
     assert!(line(Layers::Open).contains("open (kbf-network=allow)"));
 }
 
-/// Catches the use site of the root rule being wrong: a plan for euid 0 skips the namespace
-/// steps (its outcome is `SKIPPED_FOR_ROOT`, with nothing done) and the strict program is the
-/// one installed after it; a plan for anyone else does not skip.
+/// Catches the use site of the root rule being wrong: a plan for euid 0 makes no user or
+/// network namespace (its `unshare` has neither flag) and gets the strict program whatever its
+/// steps did; a plan for anyone else makes both, and gets the program that lets the internet
+/// domains through only when no step of the network namespace failed.
 #[cfg(target_os = "linux")]
 #[test]
-fn a_plan_for_root_skips_the_namespace_and_gets_the_strict_filter() {
-    let (root, _report) = super::netns::plan(0, 0, super::netns::make_pipe).unwrap();
-    assert!(root.skips());
-    // Nothing is done for root, so this is safe to run in the test process.
-    let outcome = root.apply();
-    assert_eq!(outcome, (super::netns::SKIPPED_FOR_ROOT, 0));
+fn a_plan_for_root_makes_no_network_namespace_and_gets_the_strict_filter() {
+    use crate::child::{self, Outcome, Step};
+    let outcome = |step, errno| Outcome {
+        step,
+        errno,
+        unshared: true,
+    };
     let strict = super::seccomp::filter(false);
     let in_netns = super::seccomp::filter(true);
-    assert!(std::ptr::eq(
-        super::pick(outcome, &strict, &in_netns),
-        strict.as_slice()
-    ));
-    for uid in [1, 1000, u32::MAX] {
-        let (plan, _report) = super::netns::plan(uid, uid, super::netns::make_pipe).unwrap();
-        assert!(!plan.skips(), "{uid}");
+    let (root, _report) = child::plan(
+        0,
+        0,
+        true,
+        rustix::process::getpgrp(),
+        Vec::new(),
+        child::make_pipe,
+    )
+    .unwrap();
+    assert_eq!(
+        root.steps(),
+        [(
+            child::UNSHARE,
+            Step::Unshare(libc::CLONE_NEWNS | libc::CLONE_NEWPID)
+        )]
+    );
+    for done in [outcome(child::OK, 0), outcome(child::PRIVATE, 1)] {
+        assert!(!root.netns_made(done));
+        assert!(std::ptr::eq(
+            super::pick(root.netns_made(done), &strict, &in_netns),
+            strict.as_slice()
+        ));
     }
-    // Only a clean outcome gets the program that lets the internet domains through.
-    let clean = (super::netns::OK, 0);
-    assert!(std::ptr::eq(
-        super::pick(clean, &strict, &in_netns),
-        in_netns.as_slice()
-    ));
-    assert!(std::ptr::eq(
-        super::pick((5, 1), &strict, &in_netns),
-        strict.as_slice()
-    ));
+    for uid in [1, 1000, u32::MAX] {
+        let (plan, _report) = child::plan(
+            uid,
+            uid,
+            true,
+            rustix::process::getpgrp(),
+            Vec::new(),
+            child::make_pipe,
+        )
+        .unwrap();
+        assert!(
+            plan.steps().contains(&(
+                child::UNSHARE,
+                Step::Unshare(
+                    libc::CLONE_NEWUSER
+                        | libc::CLONE_NEWNS
+                        | libc::CLONE_NEWPID
+                        | libc::CLONE_NEWNET
+                )
+            )),
+            "{uid}"
+        );
+        // A clean outcome, or one whose failure is past the network namespace (a mount step),
+        // gets the program that lets the internet domains through; a failed namespace step not.
+        assert!(plan.netns_made(outcome(child::OK, 0)), "{uid}");
+        assert!(plan.netns_made(outcome(child::PRIVATE, 1)), "{uid}");
+        assert!(!plan.netns_made(outcome(child::LOOPBACK, 1)), "{uid}");
+    }
+    // A Command allowed the network gets no network namespace, and no filter is picked for it.
+    let (open, _report) = child::plan(
+        1000,
+        1000,
+        false,
+        rustix::process::getpgrp(),
+        Vec::new(),
+        child::make_pipe,
+    )
+    .unwrap();
+    assert!(!open.netns_made(outcome(child::OK, 0)));
+    assert!(open.steps().contains(&(
+        child::UNSHARE,
+        Step::Unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS | libc::CLONE_NEWPID)
+    )));
+    assert!(!open.steps().iter().any(|(n, _)| *n == child::LOOPBACK));
 }
 
 #[test]
@@ -148,10 +199,10 @@ fn an_unreported_child_is_named_unknown() {
 #[cfg(target_os = "linux")]
 #[test]
 fn only_root_skips_the_namespace_layer() {
-    assert!(super::netns::skips_namespace(0));
-    assert!(!super::netns::skips_namespace(1));
-    assert!(!super::netns::skips_namespace(1000));
-    assert!(!super::netns::skips_namespace(u32::MAX));
+    assert!(crate::child::skips_namespace(0));
+    assert!(!crate::child::skips_namespace(1));
+    assert!(!crate::child::skips_namespace(1000));
+    assert!(!crate::child::skips_namespace(u32::MAX));
 }
 
 #[test]
@@ -322,62 +373,25 @@ fn every_layer_has_a_line() {
     }
 }
 
-/// The parts of the child's work that change the process they run in, or that only a forked
-/// copy of the test process can show: each runs in a forked child that leaves through `exit`,
-/// so its coverage data is written like any process's, and reports through its exit code.
+/// The parts of the child's work that change the process they run in: each runs in a forked
+/// child ([`crate::in_child`]) and reports through its exit code.
 #[cfg(target_os = "linux")]
 mod forked {
-    use std::ffi::CString;
     use std::io;
     use std::os::fd::OwnedFd;
 
-    use super::super::{child_setup, confine_with, netns, pick, seccomp};
+    use super::super::{Filters, child_setup, confine_with, pick, seccomp};
     use super::*;
+    use crate::child;
+    use crate::in_child::{dumpable, in_child, socket};
 
     const EPERM: i32 = 1;
-    /// What a child that panicked exits with.
-    const PANICKED: i32 = 99;
 
-    /// Runs `f` in a forked copy of this process and returns its exit code.
-    fn in_child(f: impl FnOnce() -> i32) -> i32 {
-        // SAFETY: the child runs `f` and leaves through `exit`; nothing else of the parent
-        // runs in it. The tests are one process each (nextest) or tolerate the usual fork
-        // caveats of a threaded parent for the few allocations `f` makes.
-        let pid = unsafe { libc::fork() };
-        assert!(pid >= 0, "fork");
-        if pid == 0 {
-            let code =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or(PANICKED);
-            // SAFETY: `exit` runs the handlers that write the coverage profile.
-            unsafe { libc::exit(code) };
+    fn filters() -> Filters {
+        Filters {
+            strict: seccomp::filter(false),
+            in_netns: seccomp::filter(true),
         }
-        let mut status = 0;
-        // SAFETY: `status` is writable; `pid` is our child.
-        assert_eq!(unsafe { libc::waitpid(pid, &raw mut status, 0) }, pid);
-        if libc::WIFEXITED(status) {
-            libc::WEXITSTATUS(status)
-        } else {
-            128 + libc::WTERMSIG(status)
-        }
-    }
-
-    /// The errno of `socket(domain)`, or 0.
-    fn socket(domain: libc::c_int) -> i32 {
-        // SAFETY: integer arguments only.
-        if unsafe { libc::socket(domain, libc::SOCK_STREAM, 0) } >= 0 {
-            0
-        } else {
-            io::Error::last_os_error().raw_os_error().unwrap_or(-1)
-        }
-    }
-
-    fn dumpable() -> i32 {
-        // SAFETY: integer arguments only.
-        unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) }
-    }
-
-    fn temp(name: &str) -> kbf_testkit::dir::TestDir {
-        kbf_testkit::dir::TestDir::under(std::env::temp_dir(), &format!("kbf-task-netns-{name}"))
     }
 
     #[test]
@@ -432,21 +446,30 @@ mod forked {
 
     /// Catches the child's setup not choosing, installing and reporting as one: whatever the
     /// host allows, the layer it reports is the one in force (an internet socket is made
-    /// exactly when the namespace is), and the child ends non-dumpable.
+    /// exactly when the namespace is), and the child ends non-dumpable. Where the `unshare`
+    /// succeeds the setup also makes the PID namespace's processes, and the code below runs in
+    /// the one that is to become the Command; its exit code comes back up through them.
     #[test]
     fn the_child_setup_installs_the_filter_its_report_names() {
-        // SAFETY: no arguments.
-        let uid = unsafe { libc::geteuid() };
-        let (plan, report) = netns::plan(uid, uid, netns::make_pipe).unwrap();
-        let (strict, in_netns) = (seccomp::filter(false), seccomp::filter(true));
+        let uid = rustix::process::geteuid().as_raw();
+        let (mut plan, report) = child::plan(
+            uid,
+            uid,
+            true,
+            rustix::process::getpgrp(),
+            Vec::new(),
+            child::make_pipe,
+        )
+        .unwrap();
+        let filters = filters();
         let code = in_child(|| {
-            child_setup(&plan, &strict, &in_netns).unwrap();
+            child_setup(&mut plan, Some(&filters), libc::exit).unwrap();
             if dumpable() != 0 {
                 return 98;
             }
             socket(libc::AF_INET)
         });
-        let layers = report.read();
+        let (layers, _) = report.read();
         let want = if layers == Layers::SeccompAndNetns {
             0
         } else {
@@ -455,77 +478,83 @@ mod forked {
         assert_eq!(code, want, "{layers}");
     }
 
-    /// Catches a skip for root still doing the steps: with a plan for euid 0 the child does
-    /// nothing, reports the skip, and gets the strict filter.
+    /// Catches a plan for root being given a network namespace or the open filter: with a plan
+    /// for euid 0 the child reports root's layers and gets the strict filter.
     #[test]
-    fn a_child_setup_for_root_reports_the_skip() {
-        let (plan, report) = netns::plan(0, 0, netns::make_pipe).unwrap();
-        let (strict, in_netns) = (seccomp::filter(false), seccomp::filter(true));
+    fn a_child_setup_for_root_reports_the_strict_filter() {
+        let (mut plan, report) = child::plan(
+            0,
+            0,
+            true,
+            rustix::process::getpgrp(),
+            Vec::new(),
+            child::make_pipe,
+        )
+        .unwrap();
+        let filters = filters();
         let code = in_child(|| {
-            child_setup(&plan, &strict, &in_netns).unwrap();
+            child_setup(&mut plan, Some(&filters), libc::exit).unwrap();
             socket(libc::AF_INET)
         });
-        assert_eq!(report.read(), Layers::SeccompOnlyForRoot);
+        assert_eq!(report.read().0, Layers::SeccompOnlyForRoot);
         assert_eq!(code, EPERM);
+    }
+
+    /// Catches a filter installed for a Command allowed the network: its setup installs none, so
+    /// it makes an internet socket, and its report says the network is open.
+    #[test]
+    fn a_child_setup_allowed_the_network_installs_no_filter() {
+        let uid = rustix::process::geteuid().as_raw();
+        let (mut plan, report) = child::plan(
+            uid,
+            uid,
+            false,
+            rustix::process::getpgrp(),
+            Vec::new(),
+            child::make_pipe,
+        )
+        .unwrap();
+        let code = in_child(|| {
+            child_setup(&mut plan, None, libc::exit).unwrap();
+            socket(libc::AF_INET)
+        });
+        assert_eq!(report.read().0, Layers::Open);
+        assert_eq!(code, 0);
     }
 
     #[test]
     fn a_setup_whose_filter_is_refused_fails_before_the_report() {
-        let (plan, report) = netns::plan(0, 0, netns::make_pipe).unwrap();
+        let (mut plan, report) = child::plan(
+            0,
+            0,
+            true,
+            rustix::process::getpgrp(),
+            Vec::new(),
+            child::make_pipe,
+        )
+        .unwrap();
         let garbage = [libc::sock_filter {
             code: 0xffff,
             jt: 0,
             jf: 0,
             k: 0,
         }];
+        let refused = Filters {
+            strict: garbage.to_vec(),
+            in_netns: garbage.to_vec(),
+        };
         assert_eq!(
-            in_child(|| i32::from(child_setup(&plan, &garbage, &garbage).is_err())),
+            in_child(|| i32::from(child_setup(&mut plan, Some(&refused), libc::exit).is_err())),
             1
         );
-        assert_eq!(report.read(), Layers::Unreported);
-    }
-
-    /// Catches the steps or their order changing: the child must be dumpable to write its own
-    /// `/proc` files, which need the namespace to exist first, and must be non-dumpable again
-    /// before `lo` and the filter. Root's plan has no steps. Each step has the number the
-    /// parent reads in the report.
-    #[test]
-    fn the_plan_is_these_steps_in_this_order() {
-        use netns::Step;
-        let path = |p: &str| CString::new(p).unwrap();
-        let (plan, _report) = netns::plan(1000, 2000, netns::make_pipe).unwrap();
-        assert!(!plan.skips());
-        assert_eq!(
-            plan.steps(),
-            [
-                (7, Step::Dumpable(1)),
-                (1, Step::Unshare),
-                (
-                    2,
-                    Step::Write(path("/proc/self/setgroups"), b"deny".to_vec())
-                ),
-                (
-                    3,
-                    Step::Write(path("/proc/self/uid_map"), b"1000 1000 1".to_vec())
-                ),
-                (
-                    4,
-                    Step::Write(path("/proc/self/gid_map"), b"2000 2000 1".to_vec())
-                ),
-                (7, Step::Dumpable(0)),
-                (5, Step::Loopback),
-            ]
-        );
-        let (root, _report) = netns::plan(0, 0, netns::make_pipe).unwrap();
-        assert!(root.skips());
-        assert!(root.steps().is_empty());
+        assert_eq!(report.read().0, Layers::Unreported);
     }
 
     #[test]
-    fn the_dumpable_step_and_the_protection_set_the_flag() {
+    fn the_protection_makes_the_process_non_dumpable() {
         assert_eq!(
             in_child(|| {
-                netns::run_step(&netns::Step::Dumpable(1)).unwrap();
+                child::set_dumpable(true).unwrap();
                 let was = dumpable();
                 crate::network::protect_this_process().unwrap();
                 was * 10 + dumpable()
@@ -534,125 +563,32 @@ mod forked {
         );
     }
 
-    /// The `unshare` step ends in one of the two ways a host can answer, and either way the
-    /// child lives to report it.
-    #[test]
-    fn the_unshare_step_succeeds_or_fails_with_an_errno() {
-        let code = in_child(|| match netns::run_step(&netns::Step::Unshare) {
-            Ok(()) => 0,
-            Err(e) => netns::code(&e).into(),
-        });
-        assert!(
-            code == 0 || code == EPERM || code == libc::EINVAL || code == libc::ENOSPC,
-            "{code}"
-        );
-    }
-
-    #[test]
-    fn a_map_file_is_written_in_one_write_or_the_errno_is_returned() {
-        let dir = temp("write");
-        let file = dir.join("file");
-        let path = CString::new(file.to_str().unwrap()).unwrap();
-        std::fs::write(&file, b"").unwrap();
-        netns::run_step(&netns::Step::Write(path.clone(), b"deny".to_vec())).unwrap();
-        assert_eq!(std::fs::read(&file).unwrap(), b"deny");
-        std::fs::remove_file(&file).unwrap();
-        let missing = netns::write_file(&path, b"x").unwrap_err();
-        assert_eq!(missing.raw_os_error(), Some(libc::ENOENT));
-        let full = CString::new("/dev/full").unwrap();
-        let error = netns::write_file(&full, b"x").unwrap_err();
-        assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
-        assert_eq!(netns::code(&error), u8::try_from(libc::ENOSPC).unwrap());
-    }
-
-    #[test]
-    fn steps_run_in_order_up_to_the_first_that_fails() {
-        let dir = temp("steps");
-        let (a, b) = (dir.join("a"), dir.join("b"));
-        let c = |p: &std::path::Path| CString::new(p.to_str().unwrap()).unwrap();
-        std::fs::write(&a, b"").unwrap();
-        assert_eq!(netns::run_steps(&[]), (netns::OK, 0));
-        let ok = (3, netns::Step::Write(c(&a), b"1".to_vec()));
-        assert_eq!(netns::run_steps(&[ok]), (netns::OK, 0));
-        let steps = [
-            (3, netns::Step::Write(c(&a), b"2".to_vec())),
-            (4, netns::Step::Write(c(&b), b"x".to_vec())),
-            (5, netns::Step::Write(c(&a), b"3".to_vec())),
-        ];
-        let want = (4, u8::try_from(libc::ENOENT).unwrap());
-        assert_eq!(netns::run_steps(&steps), want);
-        assert_eq!(
-            std::fs::read(&a).unwrap(),
-            b"2",
-            "the step after the failure ran"
-        );
-        std::fs::remove_file(&a).unwrap();
-    }
-
-    /// `lo` is raised where the process may, and refused with the errno where it may not.
-    #[test]
-    fn the_loopback_step_raises_lo_or_returns_the_errno() {
-        match netns::run_step(&netns::Step::Loopback).and(netns::raise_loopback()) {
-            Ok(()) => {}
-            Err(e) => assert_eq!(e.raw_os_error(), Some(libc::EPERM)),
-        }
-    }
-
-    #[test]
-    fn what_the_child_wrote_is_what_the_parent_reads() {
-        let say = |bytes: Option<(u8, u8)>| {
-            let (plan, report) = netns::plan(1000, 1000, netns::make_pipe).unwrap();
-            if let Some(outcome) = bytes {
-                plan.tell(outcome);
-            }
-            report.read()
-        };
-        assert_eq!(say(Some((netns::OK, 0))), Layers::SeccompAndNetns);
-        assert_eq!(
-            say(Some((netns::SKIPPED_FOR_ROOT, 0))),
-            Layers::SeccompOnlyForRoot
-        );
-        assert_eq!(
-            say(Some((3, 13))),
-            Layers::SeccompOnly {
-                step: "uid_map",
-                errno: 13
-            }
-        );
-        assert_eq!(
-            say(Some((7, 1))),
-            Layers::SeccompOnly {
-                step: "dumpable",
-                errno: 1
-            }
-        );
-        assert_eq!(say(Some((9, 1))), Layers::Unreported);
-        assert_eq!(say(None), Layers::Unreported);
-    }
-
     fn no_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
         Err(io::Error::from_raw_os_error(libc::EMFILE))
     }
 
+    /// Catches a Command started without the report its sandbox needs: whatever the network,
+    /// a pipe that cannot be made fails the start.
     #[test]
     fn a_report_pipe_that_cannot_be_made_is_an_io_error() {
-        let mut process = Process::new("true");
-        let Err(error) = confine_with(&mut process, Network::Denied, no_pipe) else {
-            panic!("confined without a pipe");
-        };
-        assert!(matches!(error, RunError::Io { .. }), "{error}");
-        assert!(confine_with(&mut process, Network::Allowed, no_pipe).is_ok());
+        for network in [Network::Denied, Network::Allowed] {
+            let mut process = Process::new("true");
+            let Err(error) = confine_with(&mut process, network, Layout::default(), no_pipe) else {
+                panic!("confined without a pipe");
+            };
+            assert!(matches!(error, RunError::Io { .. }), "{error}");
+        }
     }
 
     #[test]
-    fn only_a_clean_outcome_picks_the_namespace_program() {
+    fn only_a_whole_network_namespace_picks_the_namespace_program() {
         let (strict, in_netns) = (seccomp::filter(false), seccomp::filter(true));
         assert!(std::ptr::eq(
-            pick((netns::OK, 0), &strict, &in_netns),
+            pick(true, &strict, &in_netns),
             in_netns.as_slice()
         ));
         assert!(std::ptr::eq(
-            pick((netns::OK, 1), &strict, &in_netns),
+            pick(false, &strict, &in_netns),
             strict.as_slice()
         ));
     }
@@ -692,15 +628,18 @@ fn the_test_feature_warns_and_lets_a_denied_command_run() {
 #[test]
 fn confine_refuses_a_denied_command_unless_the_test_feature_is_on() {
     let mut process = Process::new("true");
-    let result = confine(&mut process, Network::Denied);
+    let result = confine(&mut process, Network::Denied, Layout::default());
     if cfg!(feature = "unconfined-for-tests") {
-        assert_eq!(result.expect("tolerated").layers(), Layers::Unavailable);
+        assert_eq!(
+            result.expect("tolerated").read(),
+            (Layers::Unavailable, Sandbox::Unavailable)
+        );
     } else {
         assert!(matches!(result, Err(RunError::NoConfine)));
     }
     let mut process = Process::new("true");
-    let allowed = confine(&mut process, Network::Allowed).expect("allowed");
-    assert_eq!(allowed.layers(), Layers::Open);
+    let allowed = confine(&mut process, Network::Allowed, Layout::default()).expect("allowed");
+    assert_eq!(allowed.read(), (Layers::Open, Sandbox::Unavailable));
 }
 
 fn paths(list: &[&str]) -> Vec<PathBuf> {
@@ -821,28 +760,29 @@ fn on_macos_a_credential_file_that_does_not_exist_is_still_named() {
 }
 
 /// Catches `confine` accepting a denied Command whose process was not made by `launch`, which
-/// would run it with the network on macOS; a process that is `sandbox-exec` passes, and layers say so.
+/// would run it with the network on macOS; a process that is `sandbox-exec` passes, and layers say
+/// so. There is no sandbox on macOS.
 #[cfg(target_os = "macos")]
 #[test]
 fn on_macos_confine_refuses_a_denied_command_that_is_not_under_sandbox_exec() {
     let mut plain = Process::new("/bin/echo");
     assert!(matches!(
-        confine(&mut plain, Network::Denied),
+        confine(&mut plain, Network::Denied, Layout::default()),
         Err(RunError::NoConfine)
     ));
     let mut wrapped = Process::new("/usr/bin/sandbox-exec");
     assert_eq!(
-        confine(&mut wrapped, Network::Denied)
+        confine(&mut wrapped, Network::Denied, Layout::default())
             .expect("wrapped")
-            .layers(),
-        Layers::Seatbelt
+            .read(),
+        (Layers::Seatbelt, Sandbox::Unavailable)
     );
     let mut allowed = Process::new("/bin/echo");
     assert_eq!(
-        confine(&mut allowed, Network::Allowed)
+        confine(&mut allowed, Network::Allowed, Layout::default())
             .expect("allowed")
-            .layers(),
-        Layers::Open
+            .read(),
+        (Layers::Open, Sandbox::Unavailable)
     );
 }
 

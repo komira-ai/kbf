@@ -172,6 +172,29 @@ failure, and the farm runs the action again. A worker that has not had a heartbe
 answer from the job service while it holds a job, for the fence time cancels all its jobs and
 falls silent until the farm has requeued them.
 
+**What an action's Command sees in its job.** The task tool starts the Command in mount and PID
+namespaces of its own (`crates/kbf-task/src/sandbox.rs`), made by the same `unshare` as its user
+and network namespaces. The job's files at `/run/js-files` (the read token and the write URLs of
+`--executor-secret-delivery files`) and the parent of the tool's work directory (`/scratch`, which
+holds the input root, the run's `private/` directory and the captured stdout and stderr) are
+covered by an empty read-only tmpfs, with the input root and `private/` bound again at their own
+paths, so the Command's working directory and its `HOME`, `TMPDIR` and cache variables still name
+them. `/tmp`, `/var/tmp`, `/run` and `/root` are the run's own `private/tmp`, `private/var-tmp`,
+`private/run` and `private/home`: on the job's scratch disk and executable, where the job's own
+`/tmp` is a 64 MiB `noexec` tmpfs. The Command is the second process of its PID namespace, and
+every process it started is ended when it ends, before its outputs are read, whether or not it
+left its process group. It holds no capability and runs under `no_new_privs`, also when it is
+allowed the network (`kbf-network=allow`), so a set-id program or a file capability gives it none,
+and it cannot take a cover off. The namespace keeps the job's `/proc`. A Command that runs as root
+gets the mount and PID namespaces without a user namespace, and could unmount the covers; the
+kbf image runs as a user other than root. The outputs are then read with `openat2`, refusing any
+symlink, magic link or `..` in any component. Each action's job log has the line
+`kbf-task: action <digest>: sandbox: mount and pid namespaces`, or `sandbox: incomplete (<step>
+<errno>)` where the host refused a step (a host that does not let an unprivileged user namespace
+keep its capabilities, AppArmor's `apparmor_restrict_unprivileged_userns`, refuses `setgroups` or
+`uid_map`): the steps before it hold, the action still runs, and what it would have hidden is
+visible to it. `kbf-task --probe-confinement` prints the same as `probe sandbox:`.
+
 The executor runs on exactly one frontend: it looks for another frontend's live jobs on the job
 service before its first pass and every 40 s after, and a frontend that finds some older than its
 own (or finds some before it has any) stops with an error naming it. Each job also carries the

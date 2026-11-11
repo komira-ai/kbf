@@ -12,14 +12,22 @@
 //! Unless the action asked for it (`kbf-network=allow`, [`network`]), the program and everything it
 //! starts can make no socket but a Unix one.
 //!
-//! The program leads its own process group. When the deadline passes the whole group is killed
-//! with SIGKILL and reaped, and the run is reported as timed out with exit code 137. A process a
-//! signal ended reports 128 plus the signal number, as the daemon does.
+//! On Linux the program runs in mount and PID namespaces of its own ([`sandbox`]): the directories
+//! of [`Run::hidden`] are covered, the run's own directories are bound at `/tmp`, `/var/tmp`, `/run`
+//! and `/root`, and every process it started is ended when it ends. One line per action says how
+//! that came out.
+//!
+//! The process this tool starts leads its own process group, and so does the program where no PID
+//! namespace was made. When the deadline passes the whole group is killed with SIGKILL and reaped
+//! (in a PID namespace, the kill of its first process ends every process in it), and the run is
+//! reported as timed out with exit code 137. A process a signal ended reports 128 plus the signal
+//! number, as the daemon does.
 //!
 //! CPU time and peak memory come from `getrusage(RUSAGE_CHILDREN)`: the difference in CPU time
 //! over the run, and the largest resident set of any child this process has reaped. They cover
-//! the program and every descendant it waited for, and are exact only while this tool runs one
-//! Command at a time, which it does.
+//! the program and every descendant it waited for (in a PID namespace, every process of it, a
+//! timed-out run's included), and are exact only while this tool runs one Command at a time,
+//! which it does.
 
 use std::ffi::OsString;
 use std::io::ErrorKind;
@@ -34,6 +42,7 @@ use tokio::process::Command as Process;
 
 use crate::fetch;
 use crate::network::{self, Layers, Network};
+use crate::sandbox::{self, Sandbox};
 
 /// The exit code reported for a run the deadline ended: 128 plus SIGKILL.
 pub const TIMED_OUT_EXIT_CODE: i32 = 128 + 9;
@@ -84,6 +93,8 @@ pub struct Ran {
     pub peak_rss_bytes: u64,
     /// The layers that kept the Command off the network ([`network`]).
     pub layers: Layers,
+    /// How the Command's mount and PID namespaces came out ([`sandbox`]).
+    pub sandbox: Sandbox,
 }
 
 /// Where a Command runs and where its output streams go.
@@ -104,13 +115,19 @@ pub struct Run<'a> {
     pub network: Network,
     /// Files holding a credential or a presigned URL this tool was given (the grant token file,
     /// the PUT URL files). On macOS the Command's sandbox profile denies reading each; on Linux
-    /// the Command's own filesystem does not hold them and the list is not used.
+    /// the list is not used: the directory the job's host writes them to is one of `hidden`.
     pub unreadable: &'a [PathBuf],
+    /// Directories the Command must not see (Linux): each that exists is covered by an empty
+    /// read-only tmpfs in its mount namespace ([`sandbox`]); `root` and `private` stay visible at
+    /// their paths when one of these holds them. A task passes [`sandbox::hidden_for`] its work
+    /// directory.
+    pub hidden: &'a [PathBuf],
 }
 
 /// Runs `command` under `run.root`.
 ///
 /// # Errors
+/// [`RunError::Io`] or [`RunError::Invalid`] also for the sandbox's directories ([`sandbox::layout`]).
 /// [`RunError::Invalid`]: no arguments, a working directory or output path that is not relative
 /// and plain, or one the input root made something other than a directory (a symlink or a file).
 /// [`RunError::Io`]: a directory (the run's private ones included) or an output stream file could
@@ -148,6 +165,7 @@ pub async fn run(command: &Command, run: &Run<'_>) -> Result<Ran, RunError> {
         run.network,
         run.unreadable,
     )?;
+    let layout = sandbox::layout(run.hidden, run.private, run.root, &work_dir)?;
     let mut process = Process::new(&launch.program);
     process
         .args(&launch.args)
@@ -165,7 +183,7 @@ pub async fn run(command: &Command, run: &Run<'_>) -> Result<Ran, RunError> {
         .stderr(stderr)
         .process_group(0)
         .kill_on_drop(true);
-    let confinement = network::confine(&mut process, run.network)?;
+    let confinement = network::confine(&mut process, run.network, layout)?;
 
     let cpu_before = children_usage().cpu_us;
     let started = Instant::now();
@@ -175,7 +193,7 @@ pub async fn run(command: &Command, run: &Run<'_>) -> Result<Ran, RunError> {
         source,
     };
     let mut child = process.spawn().map_err(spawn_error)?;
-    let layers = confinement.layers();
+    let (layers, sandbox) = confinement.read();
     // Taken before the wait: the pid is also the id of the group the child leads.
     let group = child.id();
     let waited = tokio::time::timeout(run.deadline, child.wait()).await;
@@ -204,13 +222,18 @@ pub async fn run(command: &Command, run: &Run<'_>) -> Result<Ran, RunError> {
         cpu_us: usage.cpu_us.saturating_sub(cpu_before),
         peak_rss_bytes: usage.peak_rss_bytes,
         layers,
+        sandbox,
     })
 }
 
-/// The directories made under the run's private directory, parents first.
-const PRIVATE_DIRS: [&str; 5] = [
+/// The directories made under the run's private directory, parents first. `var-tmp` and `run`
+/// are bound at `/var/tmp` and `/run` in the Command's mount namespace (Linux, [`sandbox::BOUND`]),
+/// as `tmp` and `home` are at `/tmp` and `/root`.
+const PRIVATE_DIRS: [&str; 7] = [
     "home",
     "tmp",
+    "var-tmp",
+    "run",
     "cache",
     "cache/clang",
     "cache/clang/ModuleCache",
@@ -391,6 +414,7 @@ mod tests {
                     deadline,
                     network: NETWORK,
                     unreadable: &[],
+                    hidden: &[],
                 },
             )
             .await
@@ -812,6 +836,7 @@ mod tests {
                 deadline: LONG,
                 network: NETWORK,
                 unreadable: &[],
+                hidden: &[],
             },
         )
         .await

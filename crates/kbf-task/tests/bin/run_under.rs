@@ -3,13 +3,14 @@
 //! does when the kernel refuses a step (`tests/network.rs`).
 //!
 //! `run_under <dir> <deny> <protect> <program> [args]`
-//! - `deny`: `none`, `seccomp` or `unshare`: an outer seccomp filter that answers that system
-//!   call with `EPERM`, installed before the run. The tool's own filter is then refused, or its
-//!   namespace step is.
+//! - `deny`: `none`, `seccomp`, `unshare` or `mount`: an outer seccomp filter that answers that
+//!   system call with `EPERM`, installed before the run. The tool's own filter is then refused,
+//!   or its namespace step is, or the sandbox's first mount.
 //! - `protect`: `yes` calls `network::protect_this_process`, as the binary does.
 //! - In the arguments, `{FD}` is a UDP socket this process holds open and `{PID}` is its pid.
 //!
-//! It prints `layers=<..>` and `exit=<code>`, or `error=<..>` when the run did not start.
+//! It prints `layers=<..>`, `sandbox=<..>` and `exit=<code>`, or `error=<..>` when the run did
+//! not start.
 
 #[cfg(not(target_os = "linux"))]
 fn main() {}
@@ -40,6 +41,7 @@ mod linux {
             "none" => {}
             "seccomp" => deny_syscall(libc::SYS_seccomp),
             "unshare" => deny_syscall(libc::SYS_unshare),
+            "mount" => deny_syscall(libc::SYS_mount),
             other => panic!("unknown deny {other}"),
         }
         let arguments = std::iter::once(program)
@@ -66,11 +68,13 @@ mod linux {
                 deadline: Duration::from_secs(60),
                 network: Network::Denied,
                 unreadable: &[],
+                hidden: &[],
             },
         ));
         match result {
             Ok(ran) => {
                 println!("layers={}", ran.layers);
+                println!("sandbox={}", ran.sandbox);
                 println!("exit={}", ran.exit_code);
             }
             Err(e) => {

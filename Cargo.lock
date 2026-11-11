@@ -2765,6 +2765,7 @@ dependencies = [
  "libc",
  "prost",
  "prost-types",
+ "rustix",
  "rustls",
  "rustls-native-certs",
  "serde_json",

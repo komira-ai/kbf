@@ -41,6 +41,7 @@ async fn probe_run(name: &str, network: Network, unreadable: &[PathBuf], args: &
             deadline: Duration::from_secs(60),
             network,
             unreadable,
+            hidden: &[],
         },
     )
     .await

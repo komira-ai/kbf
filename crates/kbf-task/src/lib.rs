@@ -24,7 +24,14 @@
 //!    directory, mode 0700, made new for the run (an existing `private` is refused), beside the input root and not in it. A job's image root is read-only
 //!    and its `/tmp` is a small `noexec` tmpfs, so a compiler that writes under `~` or the
 //!    temporary directory would otherwise fail; and since outputs are collected relative to the
-//!    input root, nothing written there is packed. A variable the Command sets itself keeps its
+//!    input root, nothing written there is packed. On Linux the Command also runs in mount and
+//!    PID namespaces of its own ([`sandbox`]): the job's grants (`/run/js-files`) and the parent of
+//!    the working directory (`/scratch` by default) are covered by an empty read-only tmpfs, with
+//!    the input root and `private/` bound again at their paths; `private/tmp`, `private/var-tmp`,
+//!    `private/run` and `private/home` are bound at `/tmp`, `/var/tmp`, `/run` and `/root`; and
+//!    every process the Command started ends when it does, before the outputs are read. One line
+//!    per action says how that came out (`sandbox: mount and pid namespaces`, or `sandbox:
+//!    incomplete (<step> <errno>)` where the host refused a step, which does not fail the run). A variable the Command sets itself keeps its
 //!    value. A directory that cannot be made fails the run start (exit 11). The Command has no
 //!    network: it runs in a user and network namespace of its own (only `lo`), where the host
 //!    allows one, and a seccomp filter lets it and everything it starts make Unix sockets and,
@@ -105,14 +112,16 @@
 //! which would then be stored in the content-addressable store. That is allowed: the URL permits
 //! one create-only PUT of this task's own pack key and nothing else, so what the Command learns
 //! from it, it could already produce as an output. The grant token is read from
-//! `--grant-token-file`, which is not removed, and its path stays in the tool's argv: the job's
-//! sandbox must keep that file and the tool's `/proc` entry out of the Command's reach (a
-//! separate user or a separate process namespace), or the Command can read the token. The flag
+//! `--grant-token-file`, which is not removed, and its path stays in the tool's argv. Where the
+//! sandbox is made ([`sandbox`]), the directory the job's host writes it to, `/run/js-files`, is
+//! covered for the Command, and the tool's `/proc` entry is root's (the tool is non-dumpable);
+//! where the host refuses the sandbox, the Command can read the token. The flag
 //! forms `--pack-url` and `--grant-token`, accepted only with `--insecure-argv-secrets`
 //! (komira-ai/kbf#1934), put the values in argv for every process on the host to read; they are
 //! a stopgap until the job scheduler delivers job secrets as files, and are removed then. A
-//! process of the Command that leaves its process group (for example with `setsid`) survives the
-//! group kill at the deadline; only such a sandbox ends it.
+//! process of the Command that leaves its process group (for example with `setsid`) is ended
+//! with the Command's PID namespace; where the host made none, it survives the group kill at the
+//! deadline.
 //!
 //! # The confinement probe
 //!
@@ -120,6 +129,8 @@
 //! prints whether it holds, one `probe <name>: ok|FAIL|n/a` line per check ([`probe`]). It needs
 //! no grant, server or network.
 
+#[cfg(target_os = "linux")]
+pub(crate) mod child;
 pub mod digest;
 pub mod fetch;
 pub mod network;
@@ -130,10 +141,13 @@ pub mod probe;
 pub mod put;
 pub mod put_urls;
 pub mod run;
+pub mod sandbox;
 pub mod task;
 
 #[cfg(test)]
 pub(crate) mod fake_http;
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) mod in_child;
 
 // The feature that lets a denied Command run with the network where no confine exists is for tests:
 // a build for a system that is neither Linux nor macOS, without debug assertions (a release build),
