@@ -104,7 +104,7 @@
 //!   attestations` and `release check` hold a directory to one bundle per tarball,
 //!   each that tarball's (its one subject is the tarball's digest); `verify-assets
 //!   attestations` also has `gh` verify each tarball against its bundle.
-//! - `release {locate,main-control,check,verify,notes,plan,identity,farm-version,previous,fetch-previous,publish,bump-internal}` ([`release`]): a GitHub release of
+//! - `release {locate,main-control,check,verify,notes,plan,identity,farm-version,image-digest,previous,fetch-previous,publish,bump-internal}` ([`release`]): a GitHub release of
 //!   the files the artifacts stage of a push run of the pipeline on `main` built and attested for a
 //!   commit on `main`, checked again and never rebuilt; a re-run adds nothing twice and
 //!   replaces nothing.
@@ -879,6 +879,9 @@ enum ReleaseVerb {
     /// The version text the farm's coordinator is told to converge on, `<version>+g<commit>`,
     /// from the release's version facts.
     FarmVersion(release::farm_version::Args),
+    /// The manifest digest of the release's linux-x86_64 frontend image and the addresses of
+    /// the image and its bundle, for a deploy of it.
+    ImageDigest(release::image_digest::Args),
     /// The same checks, then write the release's notes.
     Notes {
         #[command(flatten)]
@@ -1510,6 +1513,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
         Verb::Release(ReleaseVerb::Tag(args)) => release::tag::run(&args),
         Verb::Release(ReleaseVerb::VersionFacts(args)) => version_facts::run(&args),
         Verb::Release(ReleaseVerb::FarmVersion(args)) => release::farm_version::run(&args),
+        Verb::Release(ReleaseVerb::ImageDigest(args)) => release::image_digest::run(&args),
         Verb::Release(ReleaseVerb::VerdictWrite(args)) => release::verdict_write::run(&args),
         Verb::Release(ReleaseVerb::Identity { dir, commit, out }) => {
             // The binary's unpacking place, of this process alone.
