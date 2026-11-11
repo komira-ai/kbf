@@ -140,6 +140,8 @@ pub mod plan;
 pub mod probe;
 pub mod put;
 pub mod put_urls;
+#[cfg(target_os = "linux")]
+pub mod relay;
 pub mod run;
 pub mod sandbox;
 pub mod task;

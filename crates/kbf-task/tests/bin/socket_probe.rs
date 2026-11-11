@@ -20,7 +20,8 @@
 //! id, `nnp` its `no_new_privs`, and `signal` ends it with `SIGTERM`; `linger <lock> <pidfile>` starts a copy of this program in a
 //! process group of its own that takes an exclusive `flock` of `<lock>`, writes its process id as
 //! the job sees it (from `/proc/self`) to `<pidfile>`, says so, and then waits for ever; `linger`
-//! exits 0 once it has said so.
+//! exits 0 once it has said so; `holds <own> <lock> <pidfile>` takes an exclusive `flock` of
+//! `<own>` and runs `hold <lock> <pidfile>` as its child (in its own process group) and waits.
 
 use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::process::ExitStatusExt as _;
@@ -56,9 +57,11 @@ fn probe(args: &[&str]) -> u8 {
             std::fs::rename(from, to).map_or_else(|e| errno_of(&e), |()| probe(&["read", to]))
         }
         ["touch", path] => u8::from(std::fs::File::create(path).is_err()),
+        #[cfg(target_os = "linux")]
         ["signal"] => {
-            // SAFETY: integer argument only; the default action of SIGTERM ends this process.
-            unsafe { libc::raise(libc::SIGTERM) };
+            // The default action of SIGTERM ends this process.
+            let me = rustix::process::getpid();
+            let _ = rustix::process::kill_process(me, rustix::process::Signal::TERM);
             UNKNOWN_MODE
         }
         ["ls", dir] => ls(dir),
@@ -69,14 +72,17 @@ fn probe(args: &[&str]) -> u8 {
         }
         #[cfg(target_os = "linux")]
         ["nnp"] => {
-            // SAFETY: integer arguments only.
-            println!("{}", unsafe {
-                libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0)
-            });
+            println!(
+                "{}",
+                u8::from(rustix::thread::no_new_privs().unwrap_or(false))
+            );
             0
         }
         ["linger", lock, pidfile] => linger(lock, pidfile),
+        #[cfg(target_os = "linux")]
         ["hold", lock, pidfile] => hold(lock, pidfile),
+        #[cfg(target_os = "linux")]
+        ["holds", own, lock, pidfile] => holds(own, lock, pidfile),
         ["ifaces"] => ifaces(),
         ["tcp-loopback"] => tcp_loopback(),
         ["tcp-outside"] => tcp_outside(),
@@ -285,15 +291,27 @@ fn linger(lock: &str, pidfile: &str) -> u8 {
     u8::from(!matches!(said, Some(Ok(_))) || line != "held\n")
 }
 
+/// Takes an exclusive `flock` of `own`, then runs `hold <lock> <pidfile>` as a child in its own
+/// process group and waits for it: a Command and a descendant that both hold a lock.
+#[cfg(target_os = "linux")]
+fn holds(own: &str, lock: &str, pidfile: &str) -> u8 {
+    let Ok(file) = std::fs::File::create(own) else {
+        return UNKNOWN_MODE;
+    };
+    if rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive).is_err() {
+        return UNKNOWN_MODE;
+    }
+    child(&["hold", lock, pidfile])
+}
+
 /// Takes the lock, writes its id as `/proc/self` names it, says `held`, and waits for ever.
+#[cfg(target_os = "linux")]
 fn hold(lock: &str, pidfile: &str) -> u8 {
     use std::io::Write as _;
-    use std::os::fd::AsRawFd as _;
     let Ok(file) = std::fs::File::create(lock) else {
         return UNKNOWN_MODE;
     };
-    // SAFETY: integer arguments only.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+    if rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive).is_err() {
         return UNKNOWN_MODE;
     }
     let Ok(me) = std::fs::read_link("/proc/self") else {

@@ -265,26 +265,32 @@ pub struct Confinement {
 }
 
 impl Confinement {
-    /// The layers that confine the process that was started, and how its sandbox came out. Call
-    /// it after a successful spawn: the child has by then written its report and executed the
-    /// Command.
+    /// The layers that confine the process that was started, how its sandbox came out, and the
+    /// `errno` of a Command the relay could not start (none when it started). Call it after a
+    /// successful spawn, once every handle of the process's builder has been dropped (a write
+    /// end of the report pipe is in it).
     #[must_use]
     #[cfg(target_os = "linux")]
-    pub fn read(self) -> (Layers, Sandbox) {
-        self.report.read()
+    pub fn read(self) -> (Layers, Sandbox, Option<i32>) {
+        let (layers, sandbox, start) = self.report.read();
+        let refused = match start {
+            crate::child::Start::Started => None,
+            crate::child::Start::NotStarted(errno) => Some(errno),
+        };
+        (layers, sandbox, refused)
     }
 
     /// The layers that confine the process that was started: the `sandbox-exec` profile on macOS
     /// for a denied Command, none on another system. There is no sandbox.
     #[must_use]
     #[cfg(not(target_os = "linux"))]
-    pub fn read(self) -> (Layers, Sandbox) {
+    pub fn read(self) -> (Layers, Sandbox, Option<i32>) {
         let layers = match (self.denied, cfg!(target_os = "macos")) {
             (false, _) => Layers::Open,
             (true, true) => Layers::Seatbelt,
             (true, false) => Layers::Unavailable,
         };
-        (layers, Sandbox::Unavailable)
+        (layers, Sandbox::Unavailable, None)
     }
 }
 
@@ -292,8 +298,9 @@ impl Confinement {
 /// be started. This is the one place a confinement layer is added. On Linux, in the child before
 /// the `exec`: the namespaces of its own and the sandbox's mounts ([`crate::child`]), then, for a
 /// Command denied the network, the seccomp filter, which is last because the namespace steps need
-/// an `AF_INET` socket, then the processes that keep the Command off PID 1 of its namespace. See
-/// the module documentation.
+/// an `AF_INET` socket. With `relayed` (the program `process` starts is this binary's relay,
+/// [`crate::relay`]), the `unshare` also makes a PID namespace, and the relay gets the report
+/// pipe as its standard input. See the module documentation.
 ///
 /// # Errors
 /// [`RunError::Io`] when the pipe the child reports on cannot be made.
@@ -302,8 +309,9 @@ pub fn confine(
     process: &mut Process,
     network: Network,
     layout: Layout,
+    relayed: bool,
 ) -> Result<Confinement, RunError> {
-    confine_with(process, network, layout, crate::child::make_pipe)
+    confine_with(process, network, layout, relayed, crate::child::make_pipe)
 }
 
 /// [`confine`] with the pipe maker a parameter, so a failing one can be tried.
@@ -312,6 +320,7 @@ fn confine_with(
     process: &mut Process,
     network: Network,
     layout: Layout,
+    relayed: bool,
     pipe: fn() -> std::io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)>,
 ) -> Result<Confinement, RunError> {
     let filters = (network == Network::Denied).then(|| Filters {
@@ -320,12 +329,11 @@ fn confine_with(
     });
     let uid = rustix::process::geteuid().as_raw();
     let gid = rustix::process::getegid().as_raw();
-    let group = rustix::process::getpgrp();
-    let (mut plan, report) = crate::child::plan(
+    let (mut plan, report, stdin) = crate::child::plan(
         uid,
         gid,
         filters.is_some(),
-        group,
+        relayed,
         layout.into_steps(),
         pipe,
     )
@@ -336,7 +344,10 @@ fn confine_with(
     // SAFETY: the hook runs between fork and exec in the child and makes only system calls on
     // memory built before the fork (`child_setup`): no allocation, no lock, no panic.
     unsafe {
-        process.pre_exec(move || child_setup(&mut plan, filters.as_ref(), libc::_exit));
+        process.pre_exec(move || child_setup(&mut plan, filters.as_ref()));
+    }
+    if let Some(stdin) = stdin {
+        process.stdin(std::process::Stdio::from(stdin));
     }
     Ok(Confinement { report })
 }
@@ -364,6 +375,7 @@ pub fn confine(
     process: &mut Process,
     network: Network,
     _layout: Layout,
+    _relayed: bool,
 ) -> Result<Confinement, RunError> {
     let denied = network == Network::Denied;
     if cfg!(target_os = "macos") {
@@ -521,16 +533,10 @@ fn pick<'a>(
 
 /// Everything the child does between `fork` and `exec`, in order: the namespace and mount
 /// steps, the filter that follows from how they went (none for a Command allowed the network),
-/// the report to the parent, and, when a PID namespace was made, the processes that keep the
-/// Command off its PID 1 (those processes leave through `leave`). Only system calls on memory
-/// made before the fork. An error is the errno of a filter that could not be installed or of a
-/// process that could not be made, which stops the Command from starting.
+/// and the report to the parent. Only system calls on memory made before the fork. An error is
+/// the errno of a filter that could not be installed, which stops the Command from starting.
 #[cfg(target_os = "linux")]
-fn child_setup(
-    plan: &mut crate::child::Plan,
-    filters: Option<&Filters>,
-    leave: crate::child::Leave,
-) -> std::io::Result<()> {
+fn child_setup(plan: &mut crate::child::Plan, filters: Option<&Filters>) -> std::io::Result<()> {
     let outcome = plan.apply();
     if let Some(filters) = filters {
         seccomp::install(pick(
@@ -540,9 +546,6 @@ fn child_setup(
         ))?;
     }
     plan.tell(outcome);
-    if outcome.unshared {
-        plan.chain(leave)?;
-    }
     Ok(())
 }
 

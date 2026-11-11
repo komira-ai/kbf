@@ -9,7 +9,6 @@
 
 #![cfg(target_os = "linux")]
 
-use std::os::fd::AsRawFd as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -30,6 +29,8 @@ struct Rig {
     _dir: TestDir,
     scratch: PathBuf,
     runs: std::cell::Cell<usize>,
+    /// The Command is started through the relay, in a PID namespace of its own.
+    relayed: bool,
 }
 
 impl Rig {
@@ -42,6 +43,7 @@ impl Rig {
             _dir: dir,
             scratch,
             runs: std::cell::Cell::new(0),
+            relayed: true,
         }
     }
 
@@ -78,6 +80,9 @@ impl Rig {
                 network,
                 unreadable: &[],
                 hidden: std::slice::from_ref(&self.scratch),
+                relay: self
+                    .relayed
+                    .then(|| Path::new(env!("CARGO_BIN_EXE_kbf-task"))),
             },
         )
         .await
@@ -214,8 +219,8 @@ async fn a_process_the_command_leaves_is_gone_when_the_run_returns() {
     );
     let (_, pid) = rig.run(Network::Denied, &["pid"]).await;
     let file = std::fs::File::open(&lock).expect("lock");
-    // SAFETY: integer arguments only.
-    let free = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+    let free =
+        rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive).is_ok();
     if pid.trim() == "2" {
         assert!(free, "a process of the action outlived it");
         // Gone: its pid may already be another process's.
@@ -228,14 +233,113 @@ async fn a_process_the_command_leaves_is_gone_when_the_run_returns() {
     }
 }
 
+/// Catches: a run that is dropped before its Command ends (the task's future cancelled) leaving
+/// the Command or a process it started running. The Command holds one lock and starts a child
+/// that holds another and says so on a FIFO; once that has been read the run is dropped, and
+/// each lock can then be taken, which happens only when its holder has died. Without the relay
+/// (no PID namespace, the dropped child process alone is killed) only the kill of the Command's
+/// process group ends the child.
+#[tokio::test]
+async fn a_dropped_run_ends_the_command_and_what_it_started() {
+    for relayed in [true, false] {
+        dropped_run(relayed).await;
+    }
+}
+
+async fn dropped_run(relayed: bool) {
+    let mut rig = Rig::new(&format!("dropped-{relayed}"));
+    rig.relayed = relayed;
+    let (own, lock, fifo) = (
+        rig.root().join("own"),
+        rig.root().join("lock"),
+        rig.root().join("fifo"),
+    );
+    rustix::fs::mknodat(
+        rustix::fs::CWD,
+        &fifo,
+        rustix::fs::FileType::Fifo,
+        rustix::fs::Mode::from_raw_mode(0o600),
+        0,
+    )
+    .expect("fifo");
+    let args: Vec<String> = [
+        "holds",
+        &*own.to_string_lossy(),
+        &*lock.to_string_lossy(),
+        &*fifo.to_string_lossy(),
+    ]
+    .iter()
+    .map(|a| (*a).to_owned())
+    .collect();
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    // Boxed, so that dropping it below drops the run itself.
+    let mut run = Box::pin(rig.run(Network::Denied, &args));
+    // Blocks until the descendant has its lock and opens the FIFO to write its id.
+    let read = fifo.clone();
+    let reader = tokio::task::spawn_blocking(move || std::fs::read_to_string(read));
+    let pid = tokio::select! {
+        _ = &mut run => panic!("the run ended by itself"),
+        pid = reader => pid.expect("reader").expect("the descendant's id"),
+    };
+    let mut left = Leftover(pid.trim().parse().ok());
+    // The run is dropped while its Command and the descendant still run.
+    drop(run);
+    for held in [own, lock] {
+        // Returns once the process holding the lock has died.
+        let taken = tokio::task::spawn_blocking(move || {
+            let file = std::fs::File::open(&held).expect("lock");
+            rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive).is_ok()
+        })
+        .await
+        .expect("locker");
+        assert!(taken, "relayed: {relayed}");
+    }
+    // Gone: its pid may already be another process's.
+    left.0 = None;
+}
+
+/// Catches: a program the first process cannot start being taken for a Command that ran: the
+/// start report makes it the start error it is without a relay, `ENOENT` for a missing one.
+#[tokio::test]
+async fn a_program_the_relay_cannot_start_is_a_start_error() {
+    let rig = Rig::new("missing");
+    let root = rig.root();
+    let error = run(
+        &Command {
+            arguments: vec!["./no-such-program".into()],
+            ..Command::default()
+        },
+        &Run {
+            root: &root,
+            private: &rig.private(),
+            stdout: &rig.scratch.join("stdout"),
+            stderr: &rig.scratch.join("stderr"),
+            deadline: Duration::from_secs(60),
+            network: Network::Denied,
+            unreadable: &[],
+            hidden: &[],
+            relay: Some(Path::new(env!("CARGO_BIN_EXE_kbf-task"))),
+        },
+    )
+    .await
+    .expect_err("a missing program does not run");
+    match error {
+        kbf_task::run::RunError::Spawn { program, source } => {
+            assert_eq!(source.raw_os_error(), Some(libc::ENOENT), "{source}");
+            assert_eq!(program, root.join("no-such-program"));
+        }
+        other => panic!("{other}"),
+    }
+}
+
 /// A process a Command left, killed when dropped.
 struct Leftover(Option<libc::pid_t>);
 
 impl Drop for Leftover {
     fn drop(&mut self) {
-        if let Some(pid) = self.0 {
-            // SAFETY: integer arguments only; the process is the one the Command left.
-            unsafe { libc::kill(pid, libc::SIGKILL) };
+        if let Some(pid) = self.0.and_then(rustix::process::Pid::from_raw) {
+            // The process is the one the Command left; one already gone is nothing to kill.
+            let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
         }
     }
 }
@@ -245,8 +349,7 @@ impl Drop for Leftover {
 /// the network has no seccomp filter, so this is the only place it gets it.
 #[tokio::test]
 async fn a_command_in_a_user_namespace_has_no_new_privs_even_with_the_network() {
-    // SAFETY: no arguments.
-    if unsafe { libc::geteuid() } == 0 {
+    if rustix::process::geteuid().is_root() {
         eprintln!("skipped: root gets no user namespace, and keeps its privileges");
         return;
     }
@@ -288,8 +391,7 @@ async fn sandbox_is_made_strict() {
     assert!(rig.private().join("tmp/ran").exists());
     let (_, pid) = rig.run(Network::Denied, &["pid"]).await;
     assert_eq!(pid, "2\n");
-    // SAFETY: no arguments.
-    if unsafe { libc::geteuid() } != 0 {
+    if !rustix::process::geteuid().is_root() {
         let (_, nnp) = rig.run(Network::Allowed, &["nnp"]).await;
         assert_eq!(nnp, "1\n");
     }

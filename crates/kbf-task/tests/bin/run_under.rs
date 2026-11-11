@@ -2,11 +2,13 @@
 //! network denied, from a process that first limits itself, so the tests can see what the run
 //! does when the kernel refuses a step (`tests/network.rs`).
 //!
-//! `run_under <dir> <deny> <protect> <program> [args]`
+//! `run_under <dir> <deny> <protect> <relay> <program> [args]`
 //! - `deny`: `none`, `seccomp`, `unshare` or `mount`: an outer seccomp filter that answers that
 //!   system call with `EPERM`, installed before the run. The tool's own filter is then refused,
 //!   or its namespace step is, or the sandbox's first mount.
 //! - `protect`: `yes` calls `network::protect_this_process`, as the binary does.
+//! - `relay`: the `kbf-task` binary whose relay starts the Command in a PID namespace, or `-` for
+//!   none.
 //! - In the arguments, `{FD}` is a UDP socket this process holds open and `{PID}` is its pid.
 //!
 //! It prints `layers=<..>`, `sandbox=<..>` and `exit=<code>`, or `error=<..>` when the run did
@@ -27,8 +29,8 @@ mod linux {
 
     pub fn main() -> ExitCode {
         let args: Vec<String> = std::env::args().skip(1).collect();
-        let [dir, deny, protect, program, rest @ ..] = args.as_slice() else {
-            eprintln!("usage: run_under <dir> <deny> <protect> <program> [args]");
+        let [dir, deny, protect, relay, program, rest @ ..] = args.as_slice() else {
+            eprintln!("usage: run_under <dir> <deny> <protect> <relay|-> <program> [args]");
             return ExitCode::from(2);
         };
         if protect == "yes" {
@@ -69,6 +71,7 @@ mod linux {
                 network: Network::Denied,
                 unreadable: &[],
                 hidden: &[],
+                relay: (relay != "-").then(|| Path::new(relay.as_str())),
             },
         ));
         match result {

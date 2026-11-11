@@ -13,11 +13,6 @@ impl PartialEq for Step {
     }
 }
 
-/// This process's group, which a plan names as the tool's.
-fn group() -> Pid {
-    rustix::process::getpgrp()
-}
-
 const EPERM: u8 = 1;
 
 fn temp(name: &str) -> kbf_testkit::dir::TestDir {
@@ -28,12 +23,8 @@ fn c(path: &Path) -> CString {
     CString::new(path.to_str().expect("utf-8")).expect("no NUL")
 }
 
-fn outcome(step: u8, errno: u8, unshared: bool) -> Outcome {
-    Outcome {
-        step,
-        errno,
-        unshared,
-    }
+fn outcome(step: u8, errno: u8) -> Outcome {
+    Outcome { step, errno }
 }
 
 /// Catches the steps or their order changing: the child must be dumpable to write its own
@@ -70,19 +61,19 @@ fn the_plan_is_these_steps_in_this_order() {
             (DUMPABLE, Step::Dumpable(false)),
         ]
     };
-    let (denied, _report) = plan(1000, 2000, true, group(), mounts(), make_pipe).unwrap();
+    let (denied, _report, _) = plan(1000, 2000, true, true, mounts(), make_pipe).unwrap();
     let mut want = user(libc::CLONE_NEWNET);
     want.push((LOOPBACK, Step::Loopback));
     want.extend(mounts());
     assert_eq!(denied.steps(), want);
 
-    let (allowed, _report) = plan(1000, 2000, false, group(), mounts(), make_pipe).unwrap();
+    let (allowed, _report, _) = plan(1000, 2000, false, true, mounts(), make_pipe).unwrap();
     let mut want = user(0);
     want.extend(mounts());
     assert_eq!(allowed.steps(), want);
 
     for denied in [true, false] {
-        let (root, _report) = plan(0, 0, denied, group(), mounts(), make_pipe).unwrap();
+        let (root, _report, _) = plan(0, 0, denied, true, mounts(), make_pipe).unwrap();
         let mut want = vec![(
             UNSHARE,
             Step::Unshare(libc::CLONE_NEWNS | libc::CLONE_NEWPID),
@@ -187,18 +178,21 @@ fn a_report_is_read_as_the_sandbox_it_means() {
 fn what_the_child_wrote_is_what_the_parent_reads() {
     let say = |root: bool, bytes: Option<Outcome>| {
         let uid = if root { 0 } else { 1000 };
-        let (plan, report) = plan(uid, uid, true, group(), Vec::new(), make_pipe).unwrap();
+        let (plan, report, _) = plan(uid, uid, true, false, Vec::new(), make_pipe).unwrap();
         if let Some(outcome) = bytes {
             plan.tell(outcome);
         }
-        report.read()
+        drop(plan);
+        let (layers, sandbox, start) = report.read();
+        assert_eq!(start, Start::Started, "no relay, no start report");
+        (layers, sandbox)
     };
     assert_eq!(
-        say(false, Some(outcome(OK, 0, true))),
+        say(false, Some(outcome(OK, 0))),
         (Layers::SeccompAndNetns, Sandbox::Made)
     );
     assert_eq!(
-        say(false, Some(outcome(GID_MAP, 13, true))),
+        say(false, Some(outcome(GID_MAP, 13))),
         (
             Layers::SeccompOnly {
                 step: "gid_map",
@@ -211,7 +205,7 @@ fn what_the_child_wrote_is_what_the_parent_reads() {
         )
     );
     assert_eq!(
-        say(false, Some(outcome(COVER, 1, true))),
+        say(false, Some(outcome(COVER, 1))),
         (
             Layers::SeccompAndNetns,
             Sandbox::Incomplete {
@@ -221,7 +215,7 @@ fn what_the_child_wrote_is_what_the_parent_reads() {
         )
     );
     assert_eq!(
-        say(true, Some(outcome(OK, 0, true))),
+        say(true, Some(outcome(OK, 0))),
         (Layers::SeccompOnlyForRoot, Sandbox::Made)
     );
     assert_eq!(say(false, None), (Layers::Unreported, Sandbox::Unreported));
@@ -275,24 +269,23 @@ fn a_map_file_is_written_in_one_write_or_the_errno_is_returned() {
     assert_eq!(code(&error), u8::try_from(libc::ENOSPC).unwrap());
 }
 
-/// Catches the steps not stopping at the first failure, a later step running after it, or the
-/// `unshare` reported as done when it did not run. (`unshare(0)` makes no namespace and
-/// succeeds, so it stands for a successful `unshare` here.)
+/// Catches the steps not stopping at the first failure, or a later step running after it.
+/// (`unshare(0)` makes no namespace and succeeds, so it stands for a successful `unshare`.)
 #[test]
 fn steps_run_in_order_up_to_the_first_that_fails() {
     let dir = temp("steps");
     let (a, b) = (dir.join("a"), dir.join("b"));
     std::fs::write(&a, b"").unwrap();
-    assert_eq!(run_steps(&mut []), outcome(OK, 0, false));
+    assert_eq!(run_steps(&mut []), outcome(OK, 0));
     let ok = (3, Step::Write(c(&a), b"1".to_vec()));
-    assert_eq!(run_steps(&mut [ok]), outcome(OK, 0, false));
+    assert_eq!(run_steps(&mut [ok]), outcome(OK, 0));
     let mut steps = [
         (3, Step::Write(c(&a), b"2".to_vec())),
         (4, Step::Write(c(&b), b"x".to_vec())),
         (5, Step::Write(c(&a), b"3".to_vec())),
     ];
     let enoent = u8::try_from(libc::ENOENT).unwrap();
-    assert_eq!(run_steps(&mut steps), outcome(4, enoent, false));
+    assert_eq!(run_steps(&mut steps), outcome(4, enoent));
     assert_eq!(
         std::fs::read(&a).unwrap(),
         b"2",
@@ -302,15 +295,15 @@ fn steps_run_in_order_up_to_the_first_that_fails() {
         (UNSHARE, Step::Unshare(0)),
         (MKDIR, Step::Mkdir(c(&dir.join("no/such")))),
     ];
-    assert_eq!(run_steps(&mut unshared), outcome(MKDIR, enoent, true));
+    assert_eq!(run_steps(&mut unshared), outcome(MKDIR, enoent));
     let mut before = [
         (MKDIR, Step::Mkdir(c(&dir.join("no/such")))),
         (UNSHARE, Step::Unshare(0)),
     ];
-    assert_eq!(run_steps(&mut before), outcome(MKDIR, enoent, false));
+    assert_eq!(run_steps(&mut before), outcome(MKDIR, enoent));
     assert_eq!(
         run_steps(&mut [(UNSHARE, Step::Unshare(0))]),
-        outcome(OK, 0, true)
+        outcome(OK, 0)
     );
 }
 
@@ -432,7 +425,7 @@ fn the_mount_steps_cover_bind_and_seal_where_the_host_allows() {
     ];
     let uid = rustix::process::geteuid().as_raw();
     let gid = rustix::process::getegid().as_raw();
-    let (mut plan, report) = plan(uid, gid, false, group(), mounts, make_pipe).unwrap();
+    let (mut plan, report, _) = plan(uid, gid, false, false, mounts, make_pipe).unwrap();
     let code = in_child(|| {
         let outcome = plan.apply();
         plan.tell(outcome);
@@ -490,147 +483,53 @@ fn outside_a_namespace_the_mount_steps_are_refused() {
     }
 }
 
-/// Catches the chain not passing the Command's exit up, or passing a signal up as anything but
-/// 128 plus its number: the code below runs in the process that is to become the Command.
+/// Catches the relay's start report read as anything but what it says, read where no relay
+/// writes one, or a relay that executed the Command itself (the end of the pipe) read as a
+/// failure. The relay writes on its standard input, the second write end.
 #[test]
-fn the_chain_passes_the_commands_exit_code_and_signal_up() {
+fn the_relays_start_report_is_read_after_the_childs() {
+    let read = |start: Option<[u8; 2]>| {
+        let (plan, report, stdin) = plan(1000, 1000, true, true, Vec::new(), make_pipe).unwrap();
+        let stdin = stdin.expect("a write end for the relay");
+        plan.tell(outcome(OK, 0));
+        if let Some(bytes) = start {
+            rustix::io::write(&stdin, &bytes).unwrap();
+        }
+        drop((plan, stdin));
+        report.read()
+    };
+    let made = (Layers::SeccompAndNetns, Sandbox::Made);
     assert_eq!(
-        in_child(|| {
-            chain(libc::exit, group(), false).unwrap();
-            7
-        }),
-        7
+        read(Some([crate::relay::STARTED, 0])),
+        (made.0.clone(), made.1.clone(), Start::Started)
     );
     assert_eq!(
-        in_child(|| {
-            chain(libc::exit, group(), false).unwrap();
-            // SAFETY: integer argument only.
-            unsafe { libc::raise(libc::SIGTERM) };
-            0
-        }),
-        128 + libc::SIGTERM
+        read(Some([crate::relay::NOT_STARTED, 2])),
+        (made.0.clone(), made.1.clone(), Start::NotStarted(2))
     );
+    assert_eq!(read(None), (made.0, made.1, Start::Started));
+    // A child that never reported: no start report is waited for either.
+    let (silent, report, stdin) = plan(1000, 1000, true, true, Vec::new(), make_pipe).unwrap();
+    drop((silent, stdin));
+    assert_eq!(
+        report.read(),
+        (Layers::Unreported, Sandbox::Unreported, Start::Started)
+    );
+    // Without a relay there is no second write end, and the `unshare` makes no PID namespace.
+    let (plan, _report, stdin) = plan(1000, 1000, true, false, Vec::new(), make_pipe).unwrap();
+    assert!(stdin.is_none());
+    assert!(plan.steps().contains(&(
+        UNSHARE,
+        Step::Unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS | libc::CLONE_NEWNET)
+    )));
 }
 
-/// Catches the process outside the namespace staying in the Command's process group (where a
-/// `kill 0` of the Command's, or the deadline's kill, would end it before it reaps the rest) or
-/// not joining the group it is given, and a Command's process left with a capability or without
-/// `no_new_privs`. The Command's process reads its parent's parent's group once both have
-/// closed their copies of a pipe: by then the relay has moved.
 #[test]
-fn the_relay_leaves_the_commands_group_and_the_command_holds_no_capability() {
-    let group = group();
-    let code = in_child(|| {
-        // A group of its own, so that joining `group` is a move this test can see.
-        rustix::process::setpgid(None, None).unwrap();
-        let relay = rustix::process::getpid();
-        let (read_end, write_end) = rustix::pipe::pipe().unwrap();
-        chain(libc::exit, group, true).unwrap();
-        drop(write_end);
-        // Returns 0 at EOF, once the relay and the first process have closed every descriptor.
-        let read = rustix::io::read(&read_end, &mut [0u8; 1]).unwrap();
-        let moved = rustix::process::getpgid(Some(relay)).unwrap() == group;
-        let in_own = rustix::process::getpgid(None).unwrap() != group;
-        let nnp = rustix::thread::no_new_privs().unwrap();
-        let caps = rustix::thread::capabilities(None).unwrap();
-        let none = rustix::thread::CapabilitySet::empty();
-        let no_caps = caps.effective == none && caps.permitted == none && caps.inheritable == none;
-        i32::from(read != 0)
-            | i32::from(!moved) << 1
-            | i32::from(!in_own) << 2
-            | i32::from(!nnp) << 3
-            | i32::from(!no_caps) << 4
-    });
-    assert_eq!(code, 0);
-}
-
-/// Catches the first process returning before the Command's end, or not reaping a process
-/// handed to it: it waits for every child until the one it was told of ends. The other child
-/// ends first, which ends the Command's wait on their pipe.
-#[test]
-fn the_first_process_reaps_every_child_until_the_commands_ends() {
-    let code = in_child(|| {
-        let (read_end, write_end) = rustix::pipe::pipe().unwrap();
-        let Some(command) = Pid::from_raw(fork().unwrap()) else {
-            // Ends once the other child has: the read sees EOF when its write end closes.
-            drop(write_end);
-            let _ = rustix::io::read(&read_end, &mut [0u8; 1]);
-            // SAFETY: leaves this child.
-            unsafe { libc::_exit(5) };
-        };
-        if fork().unwrap() == 0 {
-            // SAFETY: leaves this child, closing its write end.
-            unsafe { libc::_exit(0) };
-        }
-        drop(write_end);
-        wait_until(command, true)
-    });
-    assert_eq!(code, 5);
-}
-
-/// Catches a wait that cannot succeed looping or being taken for the Command's exit: it is
-/// reported as a kill by `SIGKILL`.
-#[test]
-fn a_wait_for_no_child_is_a_kill() {
-    let nobody = Pid::from_raw(i32::MAX).unwrap();
-    assert_eq!(wait_until(nobody, false), 128 + libc::SIGKILL);
-    assert_eq!(in_child(|| wait_until(nobody, true)), 128 + libc::SIGKILL);
-}
-
-/// Catches an exit status passed up as anything but its code, or 128 plus the signal that ended
-/// the process.
-#[test]
-fn an_exit_status_is_its_code_or_128_plus_its_signal() {
-    for code in [0, 1, 255] {
-        assert_eq!(in_child(|| code), code);
-    }
-    for signal in [libc::SIGKILL, libc::SIGTERM, libc::SIGUSR1] {
-        let ended = in_child(|| {
-            // SAFETY: integer argument only; the signal ends this child.
-            unsafe { libc::raise(signal) };
-            0
-        });
-        assert_eq!(ended, 128 + signal);
-    }
-}
-
-/// Catches the chain going on when a process cannot be made: the error comes back to the caller,
-/// which fails the start. (Root may pass the process limit; there it is skipped.)
-#[test]
-fn a_process_that_cannot_be_made_is_an_error() {
-    if rustix::process::geteuid().is_root() {
-        eprintln!("skipped: root is not held to the process limit");
-        return;
-    }
-    let code = in_child(|| {
-        let none = rustix::process::Rlimit {
-            current: Some(0),
-            maximum: Some(0),
-        };
-        rustix::process::setrlimit(Resource::Nproc, none).unwrap();
-        match chain(libc::exit, group(), false) {
-            Err(e) => i32::from(e.raw_os_error() != Some(libc::EAGAIN)),
-            Ok(()) => 2,
-        }
-    });
-    assert_eq!(code, 0);
-}
-
-/// Catches a waiting process keeping a descriptor (the parent's spawn would then wait for the
-/// Command's end): every one is closed, by `close_range` or, where it fails, one by one.
-#[test]
-fn every_descriptor_is_closed_with_or_without_close_range() {
-    // An unknown flag makes `close_range` fail with EINVAL, as an old kernel would with ENOSYS.
-    for flags in [0, 0x8000_0000] {
-        let code = in_child(|| {
-            let file = std::fs::File::open("/dev/null").unwrap();
-            let fd = std::os::fd::IntoRawFd::into_raw_fd(file);
-            close_all(flags);
-            // SAFETY: integer arguments only.
-            i32::from(unsafe { libc::fcntl(fd, libc::F_GETFD) } != -1)
-        });
-        assert_eq!(code, 0, "flags {flags:#x}");
-    }
-    let limit = open_limit();
-    assert!(limit > 2 && limit <= 1 << 20, "{limit}");
+fn a_start_report_is_a_start_unless_it_says_otherwise() {
+    assert_eq!(started([crate::relay::STARTED, 0]), Start::Started);
+    assert_eq!(
+        started([crate::relay::NOT_STARTED, 13]),
+        Start::NotStarted(13)
+    );
+    assert_eq!(started([7, 7]), Start::Started);
 }

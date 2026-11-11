@@ -181,7 +181,9 @@ covered by an empty read-only tmpfs, with the input root and `private/` bound ag
 paths, so the Command's working directory and its `HOME`, `TMPDIR` and cache variables still name
 them. `/tmp`, `/var/tmp`, `/run` and `/root` are the run's own `private/tmp`, `private/var-tmp`,
 `private/run` and `private/home`: on the job's scratch disk and executable, where the job's own
-`/tmp` is a 64 MiB `noexec` tmpfs. The Command is the second process of its PID namespace, and
+`/tmp` is a 64 MiB `noexec` tmpfs. The Command is the second process of its PID namespace (the
+tool starts it through two processes of its own binary, `kbf-task --sandbox-relay` outside the
+namespace and `--sandbox-init` as its first process), and
 every process it started is ended when it ends, before its outputs are read, whether or not it
 left its process group. It holds no capability and runs under `no_new_privs`, also when it is
 allowed the network (`kbf-network=allow`), so a set-id program or a file capability gives it none,

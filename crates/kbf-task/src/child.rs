@@ -1,21 +1,21 @@
 //! What the process that becomes the Command does between `fork` and `exec` on Linux: the
 //! namespace steps of the network layer ([`crate::network`]) and of the sandbox
-//! ([`crate::sandbox`]) as one list, the two-byte report to the parent, and the processes that
-//! keep the Command off PID 1 of its namespace ([`chain`]).
+//! ([`crate::sandbox`]) as one list, and the two-byte report to the parent. Where a PID namespace
+//! is made, the program it then executes is this binary's relay ([`crate::relay`]), which keeps
+//! the Command off PID 1 of that namespace.
 //!
 //! It all runs in a child of a multi-threaded process before `exec`, so it makes only system
 //! calls on memory made before the fork: no allocation, no lock, no C library function that may
-//! take one. A new process is made with the `clone` system call itself ([`fork`]), not the C
-//! library's `fork`, whose handlers take locks a thread of the parent may have held.
+//! take one.
 //!
 //! # The steps
 //!
 //! [`plan`] lists them, each with the number the report names it by ([`STEPS`]):
 //!
-//! - for a Command that is not root: dumpable on, `unshare` of a user, mount and PID namespace
-//!   (and a network one for a Command denied the network), `setgroups` denied, the user and group
+//! - for a Command that is not root: dumpable on, `unshare` of a user and mount namespace (a PID
+//!   namespace where a relay starts the Command, a network one for a Command denied the network), `setgroups` denied, the user and group
 //!   id mapped to themselves, dumpable off, then `lo` raised (network namespace only);
-//! - for root: `unshare` of a mount and PID namespace only (a user namespace that maps one id would
+//! - for root: `unshare` of a mount (and PID) namespace only (a user namespace that maps one id would
 //!   make `chown`, `setuid` and `setgroups` fail for it);
 //! - then the sandbox's mount steps ([`crate::sandbox`]).
 //!
@@ -25,11 +25,11 @@
 
 use std::ffi::{CStr, CString};
 use std::io::{self, Read as _};
-use std::os::fd::{AsRawFd as _, OwnedFd, RawFd};
+use std::os::fd::OwnedFd;
 
 use rustix::fs::{Mode, OFlags};
 use rustix::mount::{MountFlags, MountPropagationFlags};
-use rustix::process::{DumpableBehavior, Pid, Resource, Signal, WaitOptions, WaitStatus};
+use rustix::process::DumpableBehavior;
 
 use crate::network::Layers;
 use crate::sandbox::Sandbox;
@@ -153,24 +153,30 @@ pub enum Step {
 pub struct Plan {
     /// A network namespace is among the namespaces made.
     netns: bool,
-    /// A user namespace is among them (the Command is not root).
-    userns: bool,
-    /// The process group of the tool, which the process outside the PID namespace joins
-    /// ([`chain`]).
-    group: Pid,
     steps: Vec<(u8, Step)>,
-    write_end: RawFd,
+    /// The write end of the report pipe (closing on `exec`).
+    report: OwnedFd,
 }
 
-/// The parent's end of the pipe the child reports on.
+/// The parent's end of the pipe the child reports on. The parent must have let go of every
+/// write end (the plan, the relay's standard input) before it reads.
 pub struct Report {
     read: OwnedFd,
-    // Held so that the child's copy is the only one once the parent lets this go.
-    write: OwnedFd,
     /// The Command is denied the network.
     denied: bool,
     /// The Command runs as root, which gets no user or network namespace.
     root: bool,
+    /// A relay starts the Command ([`crate::relay`]), and writes a start report after the
+    /// child's.
+    relayed: bool,
+}
+
+/// Whether the Command was started, as the relay reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Start {
+    Started,
+    /// It could not be started, with this `errno`.
+    NotStarted(i32),
 }
 
 /// How the steps went, in the child.
@@ -180,9 +186,6 @@ pub struct Outcome {
     pub step: u8,
     /// Its `errno` (0 for [`OK`]).
     pub errno: u8,
-    /// The `unshare` step succeeded: a PID namespace exists for the children of this process,
-    /// and its first child must not be the Command ([`chain`]).
-    pub unshared: bool,
 }
 
 /// Whether the namespace layer is left out for a Command run as `euid`: root, for which a
@@ -202,33 +205,38 @@ pub fn make_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
 
 /// The plan for a Command run as `uid` and `gid` (the effective ids, read once before the
 /// fork), denied the network or not, with the sandbox's `mounts` after the namespace steps, and
-/// the pipe it reports on, made by `pipe`. `group` is the tool's own process group.
+/// the pipe it reports on, made by `pipe`. With `relayed`, the `unshare` also makes a PID
+/// namespace, and a second write end of the pipe is returned: the relay's standard input
+/// ([`crate::relay`]).
 ///
 /// # Errors
-/// `pipe` failed.
+/// `pipe` failed, or its write end could not be copied.
 pub fn plan(
     uid: u32,
     gid: u32,
     denied: bool,
-    group: Pid,
+    relayed: bool,
     mounts: Vec<(u8, Step)>,
     pipe: fn() -> io::Result<(OwnedFd, OwnedFd)>,
-) -> io::Result<(Plan, Report)> {
+) -> io::Result<(Plan, Report, Option<OwnedFd>)> {
     let (read, write) = pipe()?;
+    let stdin = if relayed {
+        Some(write.try_clone()?)
+    } else {
+        None
+    };
     let root = skips_namespace(uid);
     let netns = denied && !root;
+    let pid = if relayed { libc::CLONE_NEWPID } else { 0 };
     let mut steps = if root {
-        vec![(
-            UNSHARE,
-            Step::Unshare(libc::CLONE_NEWNS | libc::CLONE_NEWPID),
-        )]
+        vec![(UNSHARE, Step::Unshare(libc::CLONE_NEWNS | pid))]
     } else {
         let net = if netns { libc::CLONE_NEWNET } else { 0 };
         vec![
             (DUMPABLE, Step::Dumpable(true)),
             (
                 UNSHARE,
-                Step::Unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS | libc::CLONE_NEWPID | net),
+                Step::Unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS | pid | net),
             ),
             (
                 SETGROUPS,
@@ -258,20 +266,16 @@ pub fn plan(
     steps.extend(mounts);
     let plan = Plan {
         netns,
-        userns: !root,
-        group,
         steps,
-        write_end: write.as_raw_fd(),
+        report: write,
     };
-    Ok((
-        plan,
-        Report {
-            read,
-            write,
-            denied,
-            root,
-        },
-    ))
+    let report = Report {
+        read,
+        denied,
+        root,
+        relayed,
+    };
+    Ok((plan, report, stdin))
 }
 
 impl Plan {
@@ -279,15 +283,6 @@ impl Plan {
     #[cfg(test)]
     pub fn steps(&self) -> &[(u8, Step)] {
         &self.steps
-    }
-
-    /// After the steps and the report, when the `unshare` succeeded: the processes that keep the
-    /// Command off PID 1 ([`chain`]). Returns only in the process that is to become the Command.
-    ///
-    /// # Errors
-    /// As [`chain`].
-    pub fn chain(&self, leave: Leave) -> io::Result<()> {
-        chain(leave, self.group, self.userns)
     }
 
     /// Whether, after `outcome`, the Command is in a network namespace of its own with `lo` up:
@@ -308,20 +303,36 @@ impl Plan {
     /// Writes `outcome` to the parent. A failed write is not an error of the run: the parent
     /// then reports that the child did not say.
     pub fn tell(&self, outcome: Outcome) {
-        let bytes = [outcome.step, outcome.errno];
-        // SAFETY: `bytes` is two readable bytes.
-        unsafe { libc::write(self.write_end, bytes.as_ptr().cast(), 2) };
+        let _ = rustix::io::write(&self.report, &[outcome.step, outcome.errno]);
     }
 }
 
 impl Report {
-    /// What the child said, once it has executed: the network layers and the sandbox.
-    pub fn read(self) -> (Layers, Sandbox) {
-        drop(self.write);
-        let mut said = [0u8; 2];
+    /// What the child said, once it has executed: the network layers, the sandbox, and (from the
+    /// relay, when there is one) whether the Command was started. The end of the pipe before a
+    /// start report is a start: the relay executed the Command itself.
+    pub fn read(self) -> (Layers, Sandbox, Start) {
         let mut read = std::fs::File::from(self.read);
+        let mut said = [0u8; 2];
         let said = read.read_exact(&mut said).ok().map(|()| (said[0], said[1]));
-        (layers(self.denied, self.root, said), sandbox(said))
+        let mut start = [crate::relay::STARTED, 0];
+        if self.relayed && said.is_some() {
+            let _ = read.read_exact(&mut start);
+        }
+        (
+            layers(self.denied, self.root, said),
+            sandbox(said),
+            started(start),
+        )
+    }
+}
+
+/// The start a start report means.
+pub fn started(report: [u8; 2]) -> Start {
+    if report[0] == crate::relay::NOT_STARTED {
+        Start::NotStarted(i32::from(report[1]))
+    } else {
+        Start::Started
     }
 }
 
@@ -365,22 +376,15 @@ pub fn sandbox(said: Option<(u8, u8)>) -> Sandbox {
 
 /// Runs `steps` in order up to the first that fails.
 pub fn run_steps(steps: &mut [(u8, Step)]) -> Outcome {
-    let mut unshared = false;
     for (number, step) in steps {
         if let Err(error) = run_step(step) {
             return Outcome {
                 step: *number,
                 errno: code(&error),
-                unshared,
             };
         }
-        unshared |= matches!(step, Step::Unshare(_));
     }
-    Outcome {
-        step: OK,
-        errno: 0,
-        unshared,
-    }
+    Outcome { step: OK, errno: 0 }
 }
 
 /// The flags of every cover: no set-id, no device, nothing to run (it holds nothing).
@@ -470,166 +474,6 @@ fn set_loopback_flags(fd: libc::c_int) -> io::Result<()> {
     // SAFETY: as above.
     cvt_int(unsafe { libc::ioctl(fd, libc::SIOCSIFFLAGS as libc::Ioctl, &raw mut request) })
         .map(drop)
-}
-
-/// How a process of the chain ends: `_exit` in the child of a real run; `exit` in a test, which
-/// writes the coverage profile.
-pub type Leave = unsafe extern "C" fn(libc::c_int) -> !;
-
-/// A copy of this process, as `fork` makes, by the `clone` system call itself: the C library's
-/// `fork` runs handlers that take locks, which a thread of the multi-threaded parent may have
-/// held when the first fork was made. Returns the child's pid in the parent and 0 in the child.
-///
-/// # Errors
-/// The `clone` failed (no process could be made).
-pub fn fork() -> io::Result<libc::pid_t> {
-    // SAFETY: a clone with no flag but the signal sent to the parent at the child's end shares
-    // nothing with the parent; the child goes on from here on its copy of the stack, as after
-    // `fork`. The arguments past the flags (stack, thread ids, TLS) are all zero, in either
-    // architecture's order.
-    let pid = cvt(unsafe {
-        libc::syscall(
-            libc::SYS_clone,
-            libc::c_long::from(libc::SIGCHLD),
-            0 as libc::c_long,
-            0 as libc::c_long,
-            0 as libc::c_long,
-            0 as libc::c_long,
-        )
-    })?;
-    libc::pid_t::try_from(pid).map_err(|_| io::Error::from_raw_os_error(libc::EOVERFLOW))
-}
-
-/// Keeps the Command off PID 1 of the PID namespace the `unshare` step made. Called by the
-/// child once its steps and its report are done; returns only in the process that is to become
-/// the Command.
-///
-/// - The calling process (outside the namespace, the one the tool started) makes the namespace's
-///   first process, then leaves the Command's process group for `group` (the tool's own), waits
-///   for the first process and leaves with its exit code ([`relay`]). Out of the group, it is
-///   neither ended by a Command that signals its own group (`kill 0`) nor by the tool's kill of
-///   the Command's group at the deadline, so it still reaps the first process, and the tool's
-///   resource figures still cover every process of the run.
-/// - The first process (PID 1 in the namespace) is killed when the caller dies
-///   (`PR_SET_PDEATHSIG`), makes the Command's process, then reaps every process handed to it
-///   until the Command's ends, and leaves with the Command's exit code ([`reap`]). When it
-///   ends, the kernel kills every process left in the namespace, and its end is seen by the
-///   caller only once they are all gone.
-/// - The Command's process, when `userns` (it is in a user namespace of its own, where it holds
-///   every capability until it is executed), drops every capability and sets `no_new_privs`
-///   ([`drop_capabilities`]), and returns `Ok`, to be executed.
-///
-/// An exit code is passed up as it is; a process a signal ended is passed up as 128 plus the
-/// signal. Both waiting processes close every descriptor first, so the pipe on which the parent
-/// learns that the `exec` happened closes when it does.
-///
-/// # Errors
-/// A process could not be made, or the death signal, `no_new_privs` or the capabilities could
-/// not be set: the process that failed returns the error, and the start of the Command fails
-/// with it.
-pub fn chain(leave: Leave, group: Pid, userns: bool) -> io::Result<()> {
-    if let Some(init) = Pid::from_raw(fork()?) {
-        relay(init, group, leave);
-    }
-    rustix::process::set_parent_process_death_signal(Some(Signal::KILL))?;
-    if let Some(command) = Pid::from_raw(fork()?) {
-        reap(command, leave);
-    }
-    if userns {
-        drop_capabilities()?;
-    }
-    Ok(())
-}
-
-/// The process outside the namespace: joins `group`, closes every descriptor, waits for `init`
-/// and leaves with its exit code.
-fn relay(init: Pid, group: Pid, leave: Leave) -> ! {
-    // A failure leaves it in the Command's group, where the deadline's kill ends it too, before
-    // it reaps the rest; nothing else changes.
-    let _ = rustix::process::setpgid(None, Some(group));
-    close_all(0);
-    // SAFETY: `leave` is `_exit` (or, in a test, `exit`), which takes any status.
-    unsafe { leave(wait_until(init, false)) }
-}
-
-/// The namespace's first process: closes every descriptor, reaps every child until `command`
-/// ends, and leaves with its exit code.
-fn reap(command: Pid, leave: Leave) -> ! {
-    close_all(0);
-    // SAFETY: `leave` is `_exit` (or, in a test, `exit`), which takes any status.
-    unsafe { leave(wait_until(command, true)) }
-}
-
-/// Sets `no_new_privs` and empties the effective, permitted and inheritable capabilities of this
-/// process. A program it executes then gains none, a file capability included: under
-/// `no_new_privs` the new permitted set is at most the old one, which is empty.
-///
-/// # Errors
-/// The `prctl` or the `capset` failed.
-pub fn drop_capabilities() -> io::Result<()> {
-    rustix::thread::set_no_new_privs(true)?;
-    let none = rustix::thread::CapabilitySet::empty();
-    rustix::thread::set_capabilities(
-        None,
-        rustix::thread::CapabilitySets {
-            effective: none,
-            permitted: none,
-            inheritable: none,
-        },
-    )?;
-    Ok(())
-}
-
-/// Closes every descriptor of this process: `close_range` with `flags` (0 in a real run), or,
-/// where that call fails (a kernel before 5.9, or a system call filter that does not know it),
-/// each descriptor up to the open-file limit.
-pub fn close_all(flags: libc::c_uint) {
-    // SAFETY: closes this process's descriptors; called only by a process that uses none of them
-    // again (it waits and leaves).
-    if unsafe { libc::syscall(libc::SYS_close_range, 0, libc::c_uint::MAX, flags) } != 0 {
-        close_each(open_limit());
-    }
-}
-
-/// Closes the descriptors below `limit`.
-pub fn close_each(limit: libc::c_int) {
-    for fd in 0..limit {
-        // SAFETY: as for `close_all`; a descriptor that is not open fails with EBADF and does
-        // nothing.
-        unsafe { libc::close(fd) };
-    }
-}
-
-/// The open-file limit of this process, at most 2^20 (65536 where it cannot be read or has
-/// none).
-pub fn open_limit() -> libc::c_int {
-    let limit = rustix::process::getrlimit(Resource::Nofile)
-        .current
-        .unwrap_or(1 << 16);
-    libc::c_int::try_from(limit.min(1 << 20)).unwrap_or(1 << 20)
-}
-
-/// Waits for the child `target` and returns the exit code it is passed up as ([`exit_code`]).
-/// With `any`, every child is waited for until `target` is, so a process the namespace handed to
-/// its first process is reaped. A wait that fails for a reason other than a signal (it cannot
-/// while `target` is this process's child) is reported as a kill by `SIGKILL`.
-pub fn wait_until(target: Pid, any: bool) -> libc::c_int {
-    let which = if any { None } else { Some(target) };
-    loop {
-        match rustix::process::waitpid(which, WaitOptions::empty()) {
-            Ok(Some((pid, status))) if pid == target => return exit_code(status),
-            Ok(_) | Err(rustix::io::Errno::INTR) => {}
-            Err(_) => return 128 + libc::SIGKILL,
-        }
-    }
-}
-
-/// The exit code a wait status is passed up as: the code itself, or 128 plus the signal that
-/// ended the process.
-pub fn exit_code(status: WaitStatus) -> libc::c_int {
-    status
-        .exit_status()
-        .unwrap_or_else(|| 128 + status.terminating_signal().unwrap_or(0))
 }
 
 #[cfg(test)]

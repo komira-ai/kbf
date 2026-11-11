@@ -125,6 +125,10 @@ pub struct Run<'a> {
     /// their paths when one of these holds them. A task passes [`sandbox::hidden_for`] its work
     /// directory.
     pub hidden: &'a [PathBuf],
+    /// This tool's binary, to start the Command through its relay ([`crate::relay`]) in a PID
+    /// namespace of its own (Linux): the tool passes its own path (`std::env::current_exe`). `None`
+    /// makes no PID namespace, and the Command is started as it is.
+    pub relay: Option<&'a Path>,
 }
 
 /// Runs `command` under `run.root`.
@@ -169,9 +173,10 @@ pub async fn run(command: &Command, run: &Run<'_>) -> Result<Ran, RunError> {
         run.unreadable,
     )?;
     let layout = sandbox::layout(run.hidden, run.private, run.root, &work_dir)?;
-    let mut process = Process::new(&launch.program);
+    let (started, relayed) = relayed(launch.clone(), run.relay);
+    let mut process = Process::new(&started.program);
     process
-        .args(&launch.args)
+        .args(&started.args)
         .current_dir(&work_dir)
         .env_clear()
         .envs(private)
@@ -186,23 +191,31 @@ pub async fn run(command: &Command, run: &Run<'_>) -> Result<Ran, RunError> {
         .stderr(stderr)
         .process_group(0)
         .kill_on_drop(true);
-    let confinement = network::confine(&mut process, run.network, layout)?;
+    let confinement = network::confine(&mut process, run.network, layout, relayed)?;
 
     let cpu_before = children_usage().cpu_us;
-    let started = Instant::now();
+    let clock = Instant::now();
     let started_as = launch.name(&program);
     let spawn_error = |source| RunError::Spawn {
         program: started_as.clone(),
         source,
     };
-    let mut child = process.spawn().map_err(spawn_error)?;
-    let (layers, sandbox) = confinement.read();
+    let mut child = process.spawn().map_err(|source| RunError::Spawn {
+        program: started.name(&program),
+        source,
+    })?;
     // Taken before the wait: the pid is also the id of the group the child leads. The group is
     // killed however this function is left, a dropped future included: `kill_on_drop` ends the
     // child alone, which in a PID namespace is the relay, and the processes it made may not yet
     // be set to die with it.
     let group = child.id();
     let mut ends_group = GroupKill(group);
+    // The builder holds write ends of the report pipe; the report is read to its end.
+    drop(process);
+    let (layers, sandbox, refused) = confinement.read();
+    if let Some(errno) = refused {
+        return Err(spawn_error(std::io::Error::from_raw_os_error(errno)));
+    }
     let waited = tokio::time::timeout(run.deadline, child.wait()).await;
     let (status, timed_out) = if let Ok(status) = waited {
         (status, false)
@@ -213,7 +226,7 @@ pub async fn run(command: &Command, run: &Run<'_>) -> Result<Ran, RunError> {
     // Whatever the program left running in its group is ended with it.
     ends_group.now();
     let status = status.map_err(spawn_error)?;
-    let wall_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let wall_ms = u64::try_from(clock.elapsed().as_millis()).unwrap_or(u64::MAX);
     let usage = children_usage();
     let exit_code = if timed_out {
         TIMED_OUT_EXIT_CODE
@@ -231,6 +244,28 @@ pub async fn run(command: &Command, run: &Run<'_>) -> Result<Ran, RunError> {
         layers,
         sandbox,
     })
+}
+
+/// What to start for `launch` through `relay`: the relay's arguments for it (Linux, `relay`
+/// given), and whether they are those; else `launch` itself.
+#[cfg(target_os = "linux")]
+fn relayed(launch: network::Launch, relay: Option<&Path>) -> (network::Launch, bool) {
+    match relay {
+        Some(relay) => {
+            let userns = !rustix::process::geteuid().is_root();
+            let group = rustix::process::getpgrp();
+            let args = crate::relay::argv(group, userns, &launch.program, &launch.args);
+            let program = relay.to_owned();
+            (network::Launch { program, args }, true)
+        }
+        None => (launch, false),
+    }
+}
+
+/// No relay on this system: `launch` itself.
+#[cfg(not(target_os = "linux"))]
+fn relayed(launch: network::Launch, _relay: Option<&Path>) -> (network::Launch, bool) {
+    (launch, false)
 }
 
 /// The directories made under the run's private directory, parents first. `var-tmp` and `run`
@@ -437,6 +472,7 @@ mod tests {
                     network: NETWORK,
                     unreadable: &[],
                     hidden: &[],
+                    relay: None,
                 },
             )
             .await
@@ -859,6 +895,7 @@ mod tests {
                 network: NETWORK,
                 unreadable: &[],
                 hidden: &[],
+                relay: None,
             },
         )
         .await

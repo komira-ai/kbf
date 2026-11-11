@@ -31,24 +31,24 @@
 //! files.
 //!
 //! The Command cannot undo this. It runs as a user other than root in its user namespace, and
-//! before it is executed it drops every capability and sets `no_new_privs` ([`child::chain`]),
-//! so it holds none there, and neither a set-id program nor a file capability gives it one (a
+//! before it is started the namespace's first process drops every capability and sets
+//! `no_new_privs` ([`crate::relay`]), so it holds none there, and neither a set-id program nor a file capability gives it one (a
 //! Command allowed the network, which has no seccomp filter, gets `no_new_privs` here). A user
 //! namespace it makes of its own gets the mounts locked together, so a cover cannot be taken off
 //! what it covers there either.
 //!
 //! # Nothing outlives the Command
 //!
-//! The Command is the second process of the PID namespace. The first ([`child::chain`]) starts
-//! it, reaps every process handed to it, and ends when the Command does; the kernel then kills
+//! The Command is the second process of the PID namespace. The tool starts it through this
+//! binary's relay ([`Run::relay`](crate::run::Run), [`crate::relay`]): the first process of the
+//! namespace starts it, reaps every process handed to it, and ends when the Command does; the kernel then kills
 //! every other process of the namespace, and the end of the first is seen only once they are all
 //! gone. So no process of the action runs when its outputs are read, whatever it did with its
 //! process group (`setsid` included). The exit status is passed up: the Command's code, or 128
-//! plus the signal that ended it. The namespace has no `/proc` of its own: the job's is kept
+//! plus the signal that ended it. A run with no relay (`Run::relay` is `None`) makes no PID
+//! namespace, and its Command is started as it is. The namespace has no `/proc` of its own: the job's is kept
 //! (a new one cannot be mounted where the job's runtime has masked parts of it), so the Command
 //! sees the job's process ids there, and it can signal none of them.
-//!
-//! [`child::chain`]: crate::child::chain
 //!
 //! # When the host refuses
 //!

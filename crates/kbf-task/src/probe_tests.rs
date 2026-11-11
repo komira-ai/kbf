@@ -455,7 +455,7 @@ mod confined {
         let dir = TestDir::under(std::env::temp_dir(), &format!("kbf-task-probe-unit-{name}"));
         std::fs::create_dir(dir.join("root")).expect("root");
         let argv = argv.iter().map(|a| (*a).to_owned()).collect();
-        run_confined(&dir, argv, deadline, None).await
+        run_confined(&dir, argv, deadline, None, None).await
     }
 
     /// Catches: a Command that cannot start passing, or its error being lost.

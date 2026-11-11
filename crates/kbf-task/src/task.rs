@@ -112,7 +112,7 @@ pub const EXIT_NO_CONFINE: u8 = 15;
 /// connection that broke after it was made is retried the same way. Every other answer is final
 /// (429, 500, 502 and 504 deliberately not retried), and a 412 means the key exists (a
 /// re-attempt of the task gets a new key).
-#[derive(Parser)]
+#[derive(Clone, Parser)]
 #[command(
     name = "kbf-task",
     version = concat!(env!("CARGO_PKG_VERSION"), "+", env!("KBF_BUILD_COMMIT")),
@@ -217,6 +217,12 @@ pub struct Cli {
     /// The limits on what the action may leave.
     #[command(flatten)]
     pub limits: OutputLimits,
+    /// Not a flag: the binary whose relay starts the Command in a PID namespace of its own
+    /// ([`crate::run::Run::relay`]). The binary's own start sets it to
+    /// its own path ([`run_cli_with`]); a task run in another process (a test)
+    /// has none, and its Command gets no PID namespace.
+    #[arg(skip)]
+    pub relay: Option<PathBuf>,
 }
 
 /// Why a task did not complete; each class has its own exit code.
@@ -486,6 +492,7 @@ pub(crate) async fn execute_with(
             network,
             unreadable: &unreadable,
             hidden: &sandbox::hidden_for(&cli.work_dir),
+            relay: cli.relay.as_deref(),
         },
     )
     .await?;
@@ -825,12 +832,28 @@ async fn finish(cli: &Cli, connected: Result<Connected, Failure>) -> ExitCode {
 /// rather than run with the Command able to take its sockets.
 pub fn run_cli_with(protection: std::io::Result<()>, cli: &Cli) -> ExitCode {
     match protection {
-        Ok(()) => run_cli(cli),
+        Ok(()) => run_cli(&relayed(cli)),
         Err(e) => {
             eprintln!("kbf-task: cannot make this process non-dumpable: {e}");
             ExitCode::from(EXIT_SETUP)
         }
     }
+}
+
+/// `cli` with this binary as the relay of its Command ([`Cli::relay`]). The path is resolved
+/// now: the child that executes it is no longer dumpable, and a non-dumpable process may not
+/// follow its own `/proc/self/exe`.
+#[cfg(target_os = "linux")]
+fn relayed(cli: &Cli) -> Cli {
+    let mut cli = cli.clone();
+    cli.relay = std::env::current_exe().ok();
+    cli
+}
+
+/// No relay on this system: `cli` itself.
+#[cfg(not(target_os = "linux"))]
+fn relayed(cli: &Cli) -> Cli {
+    cli.clone()
 }
 
 /// Runs the task the flags describe on a fresh single-threaded runtime and returns the exit code;

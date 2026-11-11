@@ -26,24 +26,23 @@ pub fn status_of(pid: libc::pid_t) -> i32 {
     let pid = rustix::process::Pid::from_raw(pid).expect("a child's pid");
     let waited = rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::empty());
     let (_, status) = waited.expect("waitpid").expect("a status");
-    crate::child::exit_code(status)
+    crate::relay::exit_code(status)
 }
 
 /// The errno of `socket(domain)`, or 0.
 pub fn socket(domain: libc::c_int) -> i32 {
     // SAFETY: integer arguments only.
-    let fd = unsafe { libc::socket(domain, libc::SOCK_STREAM, 0) };
-    if fd >= 0 {
-        // SAFETY: `fd` was opened above.
-        unsafe { libc::close(fd) };
+    if unsafe { libc::socket(domain, libc::SOCK_STREAM, 0) } >= 0 {
         0
     } else {
         std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
     }
 }
 
-/// Whether this process is dumpable.
+/// Whether this process is dumpable (1) or not (0).
 pub fn dumpable() -> i32 {
-    // SAFETY: integer arguments only.
-    unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) }
+    i32::from(
+        rustix::process::dumpable_behavior().unwrap()
+            == rustix::process::DumpableBehavior::Dumpable,
+    )
 }

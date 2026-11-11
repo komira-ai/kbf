@@ -109,22 +109,10 @@ fn the_layers_notice_names_the_action_and_each_layer() {
 #[test]
 fn a_plan_for_root_makes_no_network_namespace_and_gets_the_strict_filter() {
     use crate::child::{self, Outcome, Step};
-    let outcome = |step, errno| Outcome {
-        step,
-        errno,
-        unshared: true,
-    };
+    let outcome = |step, errno| Outcome { step, errno };
     let strict = super::seccomp::filter(false);
     let in_netns = super::seccomp::filter(true);
-    let (root, _report) = child::plan(
-        0,
-        0,
-        true,
-        rustix::process::getpgrp(),
-        Vec::new(),
-        child::make_pipe,
-    )
-    .unwrap();
+    let (root, _report, _) = child::plan(0, 0, true, true, Vec::new(), child::make_pipe).unwrap();
     assert_eq!(
         root.steps(),
         [(
@@ -140,15 +128,8 @@ fn a_plan_for_root_makes_no_network_namespace_and_gets_the_strict_filter() {
         ));
     }
     for uid in [1, 1000, u32::MAX] {
-        let (plan, _report) = child::plan(
-            uid,
-            uid,
-            true,
-            rustix::process::getpgrp(),
-            Vec::new(),
-            child::make_pipe,
-        )
-        .unwrap();
+        let (plan, _report, _) =
+            child::plan(uid, uid, true, true, Vec::new(), child::make_pipe).unwrap();
         assert!(
             plan.steps().contains(&(
                 child::UNSHARE,
@@ -168,15 +149,8 @@ fn a_plan_for_root_makes_no_network_namespace_and_gets_the_strict_filter() {
         assert!(!plan.netns_made(outcome(child::LOOPBACK, 1)), "{uid}");
     }
     // A Command allowed the network gets no network namespace, and no filter is picked for it.
-    let (open, _report) = child::plan(
-        1000,
-        1000,
-        false,
-        rustix::process::getpgrp(),
-        Vec::new(),
-        child::make_pipe,
-    )
-    .unwrap();
+    let (open, _report, _) =
+        child::plan(1000, 1000, false, true, Vec::new(), child::make_pipe).unwrap();
     assert!(!open.netns_made(outcome(child::OK, 0)));
     assert!(open.steps().contains(&(
         child::UNSHARE,
@@ -452,24 +426,17 @@ mod forked {
     #[test]
     fn the_child_setup_installs_the_filter_its_report_names() {
         let uid = rustix::process::geteuid().as_raw();
-        let (mut plan, report) = child::plan(
-            uid,
-            uid,
-            true,
-            rustix::process::getpgrp(),
-            Vec::new(),
-            child::make_pipe,
-        )
-        .unwrap();
+        let (mut plan, report, _) =
+            child::plan(uid, uid, true, false, Vec::new(), child::make_pipe).unwrap();
         let filters = filters();
         let code = in_child(|| {
-            child_setup(&mut plan, Some(&filters), libc::exit).unwrap();
+            child_setup(&mut plan, Some(&filters)).unwrap();
             if dumpable() != 0 {
                 return 98;
             }
             socket(libc::AF_INET)
         });
-        let (layers, _) = report.read();
+        let (layers, _, _) = report.read();
         let want = if layers == Layers::SeccompAndNetns {
             0
         } else {
@@ -482,18 +449,11 @@ mod forked {
     /// for euid 0 the child reports root's layers and gets the strict filter.
     #[test]
     fn a_child_setup_for_root_reports_the_strict_filter() {
-        let (mut plan, report) = child::plan(
-            0,
-            0,
-            true,
-            rustix::process::getpgrp(),
-            Vec::new(),
-            child::make_pipe,
-        )
-        .unwrap();
+        let (mut plan, report, _) =
+            child::plan(0, 0, true, false, Vec::new(), child::make_pipe).unwrap();
         let filters = filters();
         let code = in_child(|| {
-            child_setup(&mut plan, Some(&filters), libc::exit).unwrap();
+            child_setup(&mut plan, Some(&filters)).unwrap();
             socket(libc::AF_INET)
         });
         assert_eq!(report.read().0, Layers::SeccompOnlyForRoot);
@@ -505,17 +465,10 @@ mod forked {
     #[test]
     fn a_child_setup_allowed_the_network_installs_no_filter() {
         let uid = rustix::process::geteuid().as_raw();
-        let (mut plan, report) = child::plan(
-            uid,
-            uid,
-            false,
-            rustix::process::getpgrp(),
-            Vec::new(),
-            child::make_pipe,
-        )
-        .unwrap();
+        let (mut plan, report, _) =
+            child::plan(uid, uid, false, false, Vec::new(), child::make_pipe).unwrap();
         let code = in_child(|| {
-            child_setup(&mut plan, None, libc::exit).unwrap();
+            child_setup(&mut plan, None).unwrap();
             socket(libc::AF_INET)
         });
         assert_eq!(report.read().0, Layers::Open);
@@ -524,15 +477,8 @@ mod forked {
 
     #[test]
     fn a_setup_whose_filter_is_refused_fails_before_the_report() {
-        let (mut plan, report) = child::plan(
-            0,
-            0,
-            true,
-            rustix::process::getpgrp(),
-            Vec::new(),
-            child::make_pipe,
-        )
-        .unwrap();
+        let (mut plan, report, _) =
+            child::plan(0, 0, true, false, Vec::new(), child::make_pipe).unwrap();
         let garbage = [libc::sock_filter {
             code: 0xffff,
             jt: 0,
@@ -544,9 +490,11 @@ mod forked {
             in_netns: garbage.to_vec(),
         };
         assert_eq!(
-            in_child(|| i32::from(child_setup(&mut plan, Some(&refused), libc::exit).is_err())),
+            in_child(|| i32::from(child_setup(&mut plan, Some(&refused)).is_err())),
             1
         );
+        // The plan's write end is the last one: once it is gone the report ends unwritten.
+        drop(plan);
         assert_eq!(report.read().0, Layers::Unreported);
     }
 
@@ -573,7 +521,8 @@ mod forked {
     fn a_report_pipe_that_cannot_be_made_is_an_io_error() {
         for network in [Network::Denied, Network::Allowed] {
             let mut process = Process::new("true");
-            let Err(error) = confine_with(&mut process, network, Layout::default(), no_pipe) else {
+            let Err(error) = confine_with(&mut process, network, Layout::default(), false, no_pipe)
+            else {
                 panic!("confined without a pipe");
             };
             assert!(matches!(error, RunError::Io { .. }), "{error}");
@@ -628,18 +577,19 @@ fn the_test_feature_warns_and_lets_a_denied_command_run() {
 #[test]
 fn confine_refuses_a_denied_command_unless_the_test_feature_is_on() {
     let mut process = Process::new("true");
-    let result = confine(&mut process, Network::Denied, Layout::default());
+    let result = confine(&mut process, Network::Denied, Layout::default(), false);
     if cfg!(feature = "unconfined-for-tests") {
         assert_eq!(
             result.expect("tolerated").read(),
-            (Layers::Unavailable, Sandbox::Unavailable)
+            (Layers::Unavailable, Sandbox::Unavailable, None)
         );
     } else {
         assert!(matches!(result, Err(RunError::NoConfine)));
     }
     let mut process = Process::new("true");
-    let allowed = confine(&mut process, Network::Allowed, Layout::default()).expect("allowed");
-    assert_eq!(allowed.read(), (Layers::Open, Sandbox::Unavailable));
+    let allowed =
+        confine(&mut process, Network::Allowed, Layout::default(), false).expect("allowed");
+    assert_eq!(allowed.read(), (Layers::Open, Sandbox::Unavailable, None));
 }
 
 fn paths(list: &[&str]) -> Vec<PathBuf> {
@@ -767,22 +717,22 @@ fn on_macos_a_credential_file_that_does_not_exist_is_still_named() {
 fn on_macos_confine_refuses_a_denied_command_that_is_not_under_sandbox_exec() {
     let mut plain = Process::new("/bin/echo");
     assert!(matches!(
-        confine(&mut plain, Network::Denied, Layout::default()),
+        confine(&mut plain, Network::Denied, Layout::default(), false),
         Err(RunError::NoConfine)
     ));
     let mut wrapped = Process::new("/usr/bin/sandbox-exec");
     assert_eq!(
-        confine(&mut wrapped, Network::Denied, Layout::default())
+        confine(&mut wrapped, Network::Denied, Layout::default(), false)
             .expect("wrapped")
             .read(),
-        (Layers::Seatbelt, Sandbox::Unavailable)
+        (Layers::Seatbelt, Sandbox::Unavailable, None)
     );
     let mut allowed = Process::new("/bin/echo");
     assert_eq!(
-        confine(&mut allowed, Network::Allowed, Layout::default())
+        confine(&mut allowed, Network::Allowed, Layout::default(), false)
             .expect("allowed")
             .read(),
-        (Layers::Open, Sandbox::Unavailable)
+        (Layers::Open, Sandbox::Unavailable, None)
     );
 }
 

@@ -93,6 +93,7 @@ const REQUIRED: [&str; 6] = [
 ///
 /// Built with clap's builder, not its derive: the code the derive expands to has branches no
 /// test of this crate reaches (the coverage gate counts them), and there are four flags.
+#[derive(Clone)]
 pub struct ProbeCli {
     /// Run the probe.
     pub probe_confinement: bool,
@@ -102,6 +103,9 @@ pub struct ProbeCli {
     pub probe_secret_path: Option<PathBuf>,
     /// Where the scratch directory is made; the system temporary directory by default.
     pub probe_work_dir: Option<PathBuf>,
+    /// Not a flag: the binary whose relay starts the Command, as an action's
+    /// ([`crate::task::Cli::relay`]); set by the binary's own start ([`run_cli_with`]).
+    pub relay: Option<PathBuf>,
 }
 
 impl ProbeCli {
@@ -161,6 +165,7 @@ impl ProbeCli {
             probe_confinement_child: found.get_flag("probe_confinement_child"),
             probe_secret_path: found.get_one::<PathBuf>("probe_secret_path").cloned(),
             probe_work_dir: found.get_one::<PathBuf>("probe_work_dir").cloned(),
+            relay: None,
         }
     }
 }
@@ -608,6 +613,7 @@ async fn run_confined(
     argv: Vec<String>,
     deadline: Duration,
     secret_path: Option<&Path>,
+    relay: Option<&Path>,
 ) -> Vec<Check> {
     let command = Command {
         arguments: argv,
@@ -626,6 +632,7 @@ async fn run_confined(
             unreadable: &[],
             // An action's Command does not see the job's grants; nor does the probe's.
             hidden: &[PathBuf::from(crate::sandbox::GRANTS_DIR)],
+            relay,
         },
     )
     .await;
@@ -692,6 +699,7 @@ pub fn run_probe(cli: &ProbeCli) -> ExitCode {
                     child_argv(secret_path),
                     Duration::from_secs(60),
                     secret_path,
+                    cli.relay.as_deref(),
                 ));
                 // Best effort: a leftover directory in a job's scratch is harmless.
                 let _ = std::fs::remove_dir_all(&dir);
@@ -716,8 +724,23 @@ pub fn run_cli_with(protection: std::io::Result<()>, cli: &ProbeCli) -> ExitCode
             eprintln!("kbf-task: cannot make this process non-dumpable: {e}");
             ExitCode::from(crate::task::EXIT_SETUP)
         },
-        |()| sides[usize::from(cli.probe_confinement_child)](cli),
+        |()| sides[usize::from(cli.probe_confinement_child)](&relayed(cli)),
     )
+}
+
+/// `cli` with this binary as the relay of the probe's Command, as a task's
+/// ([`crate::task::Cli::relay`]).
+#[cfg(target_os = "linux")]
+fn relayed(cli: &ProbeCli) -> ProbeCli {
+    let mut cli = cli.clone();
+    cli.relay = std::env::current_exe().ok();
+    cli
+}
+
+/// No relay on this system: `cli` itself.
+#[cfg(not(target_os = "linux"))]
+fn relayed(cli: &ProbeCli) -> ProbeCli {
+    cli.clone()
 }
 
 // The tests feed Linux errno numbers (ENETUNREACH is 101) and Linux observations to the checks, so
