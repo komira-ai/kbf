@@ -1,5 +1,6 @@
-//! The start of a frontend with a state store reads the deny rows once before any listener
-//! serves, so the worker listener does not refuse every daemon until the sweeper's first beat.
+//! The start of a frontend with a state store reads the deny rows when it opens the members,
+//! before any listener serves (and again just before, `crate::deny_rows`), so the worker
+//! listener does not refuse every daemon until the sweeper's first beat.
 
 use std::sync::Arc;
 use std::time::Duration;

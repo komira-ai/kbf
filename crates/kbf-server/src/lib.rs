@@ -81,6 +81,7 @@ pub mod build_seq;
 pub mod cold_apply;
 mod cold_counted;
 pub mod config;
+mod deny_rows;
 pub mod drain;
 pub mod enroll;
 pub mod executor;

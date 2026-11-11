@@ -569,7 +569,7 @@ async fn the_state_stores_deny_rows_refuse_blob_calls_from_the_next_one_on() {
         pki.channel(worker, Some(&by_serial.identity)).await,
         pki.channel(worker, Some(&unrelated.identity)).await,
     ];
-    // The sweeper's first refresh, which gives the listener the rows, runs at start.
+    // The start reads the rows just before it serves, and the sweeper reads them again at once.
     let mut served = false;
     for _ in 0..100 {
         if write(&channels[0], b"before").await.is_ok() {
