@@ -59,19 +59,18 @@ fn is_version_comment(comment: &str) -> bool {
 }
 
 impl Lint<'_> {
-    /// A job-level `uses:` that is not one of this repository's workflow files: allowed only for
-    /// the job [`SET_JOB`] of the workflow [`NAME`], at [`SET_DESIRED`], pinned by a full commit SHA
-    /// with a version comment.
+    /// A job-level `uses:` that is not one of this repository's workflow files: allowed for the
+    /// job [`SET_JOB`] of the workflow [`NAME`], at [`SET_DESIRED`], pinned by a full commit SHA
+    /// with a version comment, and for exactly the calls of [`called::CALLABLE`] anywhere.
     pub(super) fn outside_call(&mut self, key: &Node, called: &Node) {
         let Some(v) = called.as_str() else {
             self.refuse(called, "a reusable workflow's `uses` must be a string");
             return;
         };
         if !self.hostkeeper || key.as_str() != Some(SET_JOB) {
-            self.refuse(
-                called,
-                "a reusable workflow outside this repository runs where this lint cannot see",
-            );
+            if let Some(why) = called::refusal(self.text, called) {
+                self.refuse(called, why);
+            }
         } else if !is_the_pinned_call(v) {
             self.refuse(
                 called,
@@ -92,13 +91,15 @@ impl Lint<'_> {
     }
 
     /// Whether `id-token: write` is allowed in the job `key` with the `if:` `condition`: under the
-    /// release's own conditions (the gamma stage, the apt read and write jobs), or in the job
+    /// release's own conditions (the gamma stage, the apt read and write jobs, and the deploy
+    /// of [`called::DEPLOY_ONLY`]), or in the job
     /// [`SET_JOB`] of the workflow [`NAME`] under [`SET_IF`].
     pub(super) fn deploy_scope_ok(&self, key: &Node, condition: Option<&str>) -> bool {
         let Some(condition) = condition else {
             return false;
         };
         condition == RELEASE_PUSH_ONLY
+            || condition == called::DEPLOY_ONLY
             || release_ifs::id_token_conditions()
                 .iter()
                 .any(|c| c == condition)

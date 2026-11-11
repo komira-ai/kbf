@@ -227,6 +227,16 @@ jobs:
   - job: release.yml#stable-apt-write-3
     stage: prod
     signing: true
+  # Reads the published release only: the frontend image's digest and the addresses the deploy
+  # below is given.
+  - job: release.yml#deploy-digest
+    stage: prod
+  # Calls docker-swarm-updater's deploy workflow, which presents the run's OIDC token to the
+  # deployer and signs nothing: the row is `signing: true` because the job holds
+  # `id-token: write`, which only a signing row may.
+  - job: release.yml#deploy
+    stage: prod
+    signing: true
   - job: hostkeeper-desired.yml#check
     stage: deploy
   # Calls hostkeeper's reusable workflow with the run's OIDC token; signs nothing.

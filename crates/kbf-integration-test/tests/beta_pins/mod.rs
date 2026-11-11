@@ -132,6 +132,10 @@ fn gamma_mismatches(release: &str, beta: &str) -> Result<Vec<String>, String> {
 fn fetch_step_overrides(text: &str) -> Result<Vec<String>, String> {
     let mut found = Vec::new();
     for job in workflows::job_names(text)? {
+        // A job that calls a reusable workflow has no steps of its own.
+        if workflows::job_uses(text, &job)?.is_some() {
+            continue;
+        }
         for step in workflows::job_steps(text, &job)? {
             let fetches = step
                 .run

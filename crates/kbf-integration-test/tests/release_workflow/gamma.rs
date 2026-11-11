@@ -237,6 +237,9 @@ fn tailnet_join(
     out: &mut Vec<String>,
 ) -> Result<(), String> {
     for job in super::jobs().iter().filter(|j| j.as_str() != GAMMA) {
+        if super::deploy::calls(release, job)? {
+            continue;
+        }
         if workflows::job_steps(release, job)?
             .iter()
             .any(|s| uses(s, TS_ACTION))

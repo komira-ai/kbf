@@ -12,10 +12,12 @@
 //! - **The graph.** The jobs of [`jobs`], in that order, each with exactly the `needs`, token
 //!   scopes, `if:` and `environment` of [`rules`]; the jobs that write need `plan` and `verify`,
 //!   directly or through another. Only `publish` holds a write scope (`contents`), `id-token` is
-//!   held by `gamma` and the apt read and write jobs alone ([`may_hold_id_token`]), and the jobs
-//!   that tag, publish, bump, run the gamma stage or build the tool of the apt jobs only under
-//!   [`RELEASE_IF`]: a successful pipeline run for a push to `main` of code that is not a change
-//!   to the pipeline (the apt jobs after the first add the clauses of `workflows::release_ifs`).
+//!   held by `gamma`, the apt read and write jobs and `deploy` alone ([`may_hold_id_token`]), and the
+//!   jobs that tag, publish, bump, run the gamma stage or build the tool of the apt jobs only
+//!   under [`RELEASE_IF`]: a successful pipeline run for a push to `main` of code that is not a
+//!   change to the pipeline (the apt jobs after the first add the clauses of
+//!   `workflows::release_ifs`). The frontend's deploy runs under the same condition with its
+//!   endpoint set ([`deploy`]).
 //! - **Never cancelled, never queued behind a skipped run.** The concurrency group is `release`
 //!   for a successful pipeline run and the run's own for any other (a cancelled or red pipeline
 //!   run starts this workflow too, to skip it, and must not replace a release waiting in the
@@ -57,6 +59,7 @@
 
 use super::workflows;
 mod apt;
+mod deploy;
 mod gamma;
 
 /// The job that holds the write scope and creates the GitHub release.
@@ -70,7 +73,7 @@ const REHEARSE: &str = "rehearse";
 const REHEARSE_AGENT: &str = "rehearse-agent";
 
 /// The jobs the release had before the apt jobs, in file order.
-const CORE_JOBS: [&str; 9] = [
+const CORE_JOBS: [&str; 11] = [
     "plan",
     "verify",
     "tag",
@@ -79,6 +82,8 @@ const CORE_JOBS: [&str; 9] = [
     "bump",
     REHEARSE,
     REHEARSE_AGENT,
+    deploy::DIGEST,
+    deploy::DEPLOY,
     GAMMA,
 ];
 
@@ -128,10 +133,11 @@ pub const RELEASE_IF: &str = "${{ github.event.workflow_run.conclusion == 'succe
 pub const PLAN_IF: &str = "${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository }}";
 
 /// Whether `job` may hold `id-token: write`: the gamma stage, which presents the token to the
-/// tailnet's identity federation, and the apt read and write jobs, which present it to the cloud
-/// provider. None signs anything.
+/// tailnet's identity federation, the apt read and write jobs, which present it to the cloud
+/// provider, and the frontend's deploy, whose called workflow presents it to docker-swarm-updater
+/// ([`deploy`]). None signs anything.
 fn may_hold_id_token(job: &str) -> bool {
-    job == GAMMA || apt::may_hold_id_token(job)
+    job == GAMMA || job == deploy::DEPLOY || apt::may_hold_id_token(job)
 }
 
 /// The `(job, scope)` pairs that may be `write`.
@@ -218,14 +224,15 @@ fn rules() -> Vec<Rule> {
             RELEASE_IF,
             None,
         ),
-        rule(
-            GAMMA,
-            &["plan", PUBLISH, REHEARSE, REHEARSE_AGENT],
-            &[("contents", "read"), ("id-token", "write")],
-            RELEASE_IF,
-            Some(ENVIRONMENT),
-        ),
     ];
+    all.extend(deploy::rules());
+    all.push(rule(
+        GAMMA,
+        &["plan", PUBLISH, REHEARSE, REHEARSE_AGENT],
+        &[("contents", "read"), ("id-token", "write")],
+        RELEASE_IF,
+        Some(ENVIRONMENT),
+    ));
     all.extend(apt::rules());
     all
 }
@@ -237,7 +244,7 @@ const APP_TOKEN: &str = "actions/create-github-app-token@";
 /// The jobs that write must (transitively) need these.
 const GATING: &[&str] = &["plan", "verify"];
 /// The jobs that write, or hold a token that can.
-const WRITING: &[&str] = &["tag", "notes", PUBLISH, "bump", GAMMA];
+const WRITING: &[&str] = &["tag", "notes", PUBLISH, "bump", GAMMA, deploy::DEPLOY];
 
 /// The jobs that write, or hold a token, a key or a role that can: [`WRITING`] and the apt jobs
 /// that hold the role or the key.
@@ -378,6 +385,7 @@ pub fn problems(release: &str) -> Result<Vec<String>, String> {
     gamma::rules(release, &mut out)?;
     apt::problems(release, &mut out)?;
     apt::package_version(release, &mut out)?;
+    deploy::problems(release, &mut out)?;
     // The shared rules, as the workflow lint reads them (pins, runners, permissions).
     out.extend(
         workflows::scan(release, &workflows::Repo::default())
@@ -559,6 +567,9 @@ fn halting(release: &str, out: &mut Vec<String>) -> Result<(), String> {
         }
     }
     for job in &jobs() {
+        if deploy::calls(release, job)? {
+            continue;
+        }
         let steps = workflows::job_steps(release, job)?;
         for step in &steps {
             let condition = step.condition.as_deref();
@@ -653,6 +664,9 @@ fn secrets(release: &str, out: &mut Vec<String>) -> Result<(), String> {
 /// Every checkout is of the commit the pipeline run built, with no credentials left behind.
 fn checkouts(release: &str, out: &mut Vec<String>) -> Result<(), String> {
     for job in &jobs() {
+        if deploy::calls(release, job)? {
+            continue;
+        }
         if apt::consumes_tool(job) {
             // Holds the cloud role or the signing key, so it has no checkout: `apt` holds that.
             continue;
@@ -806,6 +820,9 @@ fn context(release: &str, out: &mut Vec<String>) -> Result<(), String> {
 /// files `verify` checked.
 fn downloads_of_this_run(release: &str, out: &mut Vec<String>) -> Result<(), String> {
     for rule in &rules() {
+        if deploy::calls(release, &rule.job)? {
+            continue;
+        }
         let steps = workflows::job_steps(release, &rule.job)?;
         let reads_other_run = ["plan", "verify"].contains(&rule.job.as_str());
         for d in steps

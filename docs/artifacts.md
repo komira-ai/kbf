@@ -297,7 +297,7 @@ and a host that trusts one asks for that branch with `--source-ref`; an asset at
 only takes the files of the pipeline run of a push to `main`, so a file built from any other branch is
 never released.
 
-Only the `attest-*` jobs (`attest-linux`, `attest-darwin-arm64`) hold `id-token: write` and `attestations: write` (in the release workflow, `gamma` holds `id-token: write` for its network join and the apt read and write jobs for the cloud role they assume, and none of them signs anything; see [Releases](#releases)), and only
+Only the `attest-*` jobs (`attest-linux`, `attest-darwin-arm64`) hold `id-token: write` and `attestations: write` (in the release workflow, `gamma` holds `id-token: write` for its network join, the apt read and write jobs for the cloud role they assume, and `deploy` for the docker-swarm-updater workflow it calls, and none of them signs anything; see [Releases](#releases)), and only
 under the exact `if:` that limits it to a push to `main` (the
 `verify-*` jobs run under the same one). The workflow lint
 (`crates/kbf-integration-test/tests/workflows`) refuses those scopes in any other job, and in one
@@ -845,11 +845,7 @@ can create one. The jobs, each with the least token it needs:
 | `notes` | checks the tag (`release verify`), the identity of this release and of the one before it, and writes the notes | read |
 | `publish` | creates the release with those files and notes (`release publish`) | `contents: write`; environment `release` |
 | `bump` | opens the pull request in the internal repository that moves its submodule to the release (`release bump-internal`) | `contents: read`; environment `release` |
-| `deploy-tool` | after `publish`, builds `xtask` once, with no token, for the apt jobs, which never check out or compile | `contents: read` |
-| `testing-apt-read`, `-index`, `-write` (and the attempts `-2`, `-3`) | put the native packages (`kbf-native-<commit>-linux-<arch>.deb`) into the suite `testing` of `https://packages.komira.ai/apt`, after checking the files against `SHA256SUMS` and each package against its attestation; the signing key and the cloud role are never in one job ([deploy/farm-hostkeeper.md](deploy/farm-hostkeeper.md)) | read and write jobs `id-token: write`, environment `apt-publish`; index jobs `contents: read`, environment `apt-signing` |
-| `check-apt-amd64`, `check-apt-arm64` | install `kbf` from `testing` in a clean Ubuntu container and check what it installed (`channels check-apt`) | `contents: read` |
-| `stable-apt-read`, `-index`, `-write` (and `-2`, `-3`) | list the same pool files in the suite `stable` | as the `testing` jobs |
-| `gamma` | prints a notice that the farm's Linux nodes are deployed by hostkeeper (`hostkeeper-desired.yml`) and that it no longer sets kbf's update coordinator; when `KBF_SETS_DESIRED` is `true`, builds a small Buck2 project against the farm, remote only, and fails unless some action ran remotely and none locally (`prove-farm`) | `contents: read`, `id-token: write`; environment `release` |
+Only the `attest-*` jobs (`attest-linux`, `attest-darwin-arm64`) hold `id-token: write` and `attestations: write` (in the release workflow, `gamma` holds `id-token: write` for its network join, the apt read and write jobs for the cloud role they assume, and `deploy` for the docker-swarm-updater workflow it calls, and none of them signs anything; see [Releases](#releases)), and only
 
 Every job after `plan` runs only when `plan` says the push ships code and does not change the
 pipeline (`.github/`, `infra/`, `crates/xtask/` and the like): a push of docs only releases
@@ -904,7 +900,7 @@ commit. (The notes are written after the tag, because they read it.)
 
 `crates/kbf-integration-test/tests/release_workflow` holds the file to all of this (and `pipeline_workflow` holds the pipeline it follows to its order, its cancel and its triggers): the events
 (the completion of a `pipeline` run for `main` only), the job graph and the scopes, `if:` and environment of each job, the halt on
-red, a checkout of the commit the pipeline built alone, the release bot's key read in `tag` and `bump` only, `id-token: write` in `gamma` and the apt read and write jobs only (the farm's `FARM_*` settings are read from repository variables in `gamma` and nowhere else),
+Only the `attest-*` jobs (`attest-linux`, `attest-darwin-arm64`) hold `id-token: write` and `attestations: write` (in the release workflow, `gamma` holds `id-token: write` for its network join, the apt read and write jobs for the cloud role they assume, and `deploy` for the docker-swarm-updater workflow it calls, and none of them signs anything; see [Releases](#releases)), and only
 the data that flows from job to job, pinned actions and an empty top-level `permissions`. The
 job list is pinned, `publish` among them (`gamma.yml`, which followed the workflow, is deleted). On every
 pull request into `main`, CI asks GitHub the same on-`main` question for the pull request's base

@@ -151,19 +151,23 @@ fn a_stage_whose_only_job_is_deleted_is_refused() {
     let cut = format!("{before}  - job: hostkeeper-desired.yml#check{after}");
     let found = check(&cut, &workflows);
     refused(&found, "stage `prod` is an `actions` stage with no job");
-    // The release's jobs that hold `id-token: write` (the gamma stage and the apt reads and
-    // writes), which only a signing row may: with their rows gone they are named too, and
-    // nothing else is.
+    // The release's jobs that hold `id-token: write` (the gamma stage, the apt reads and writes
+    // and the deploy), which only a signing row may: with their rows gone they are named too,
+    // and nothing else is.
     refused(&found, "job `gamma` can write `id-token` or `attestations`");
     refused(
         &found,
         "job `testing-apt-write` can write `id-token` or `attestations`",
     );
+    refused(
+        &found,
+        "job `deploy` can write `id-token` or `attestations`",
+    );
     let signing = found
         .iter()
         .filter(|f| f.contains("can write `id-token`"))
         .count();
-    assert_eq!(signing, 13, "{found:#?}");
+    assert_eq!(signing, 14, "{found:#?}");
     assert_eq!(found.len(), 1 + signing, "{found:#?}");
 }
 

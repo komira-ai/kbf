@@ -26,6 +26,10 @@
 //! - `release farm-version --repo <owner/name> --tag <tag> --commit <sha> [--output <file>]
 //!   [--gh <path>]` ([`farm_version`]): the version text the farm is told to converge on,
 //!   `<version>+g<commit>` as the build said it, from the release's own version facts.
+//! - `release image-digest --repo <owner/name> --tag <tag> --commit <sha> [--output <file>]
+//!   [--gh <path>]` ([`image_digest`]): what a deploy of the published linux-x86_64 frontend
+//!   image is given: its manifest digest (the image must be the file `SHA256SUMS` lists) and the
+//!   release's addresses of the image and of its bundle.
 //! - `release verify <dir> --repo-dir <checkout> --tag <tag> --commit <sha> [--main-ref
 //!   <ref>] [--output <file>]` ([`verify`]): the tag names that commit, which is on main.
 //!   It reads no verdict: the tag's message is an audit record that nothing gates on, and a
@@ -92,6 +96,7 @@ pub mod fetch_previous;
 mod git;
 pub mod identity;
 mod identity_file;
+pub mod image_digest;
 pub mod notes;
 pub mod plan;
 pub mod tag;

@@ -65,7 +65,7 @@
 #          (with TS_CLIENT_ID and FARM_ADDRESS set too, as an ephemeral node with the same run
 #          token), and the proof, a Buck2 build of a small project, remote only, every action new
 #          in this run (cargo xtask prove-farm). The one job here that holds `id-token: write`
-#          besides the apt read and write jobs, and no write scope.
+#          besides the apt read and write jobs and `deploy`, and no write scope.
 # deploy-tool
 #          builds `xtask --release` in a job with no token and no secret and uploads it, for the
 #          apt jobs below, which hold the cloud role or the signing key and never compile.
@@ -79,6 +79,12 @@
 # stable-apt-read, stable-apt-index, stable-apt-write
 #          the release promoted from `testing` into the suite `stable` once both install checks
 #          passed (and -2, -3 as above). hostkeeper installs from `stable`.
+# deploy-digest, deploy
+#          only while the repository variable CP_DEPLOY_ENDPOINT is not empty, after `gamma`:
+#          deploy the release's frontend image to its Docker Swarm service by calling the
+#          reusable workflow deploy.yml of komira-ai/docker-swarm-updater (the job `deploy`
+#          holds `id-token: write` for that alone, and no other scope). See the comment above
+#          the two jobs.
 #
 # A run releases one commit; a run of an old commit tags and publishes nothing (the highest
 # release tag must name this commit or an ancestor of it: `release tag` and `release publish`
@@ -504,6 +510,74 @@ jobs:
       - name: The coordinator of this commit
         run: cargo build --locked -p kbf-coordinator
       - run: cargo xtask sudo-test -p kbf-host-install --test update_rehearsal_agent -- --exact the_agent_updates_the_host_when_the_coordinator_is_told_the_next_release --nocapture
+
+  # deploy-digest and deploy: the frontend on Docker Swarm (docs/deploy/swarm-frontend.md). They
+  # run only while the repository variable CP_DEPLOY_ENDPOINT is not empty: unset or empty,
+  # both are skipped and the release ends as it did without them. The workflow lint
+  # (crates/kbf-integration-test/tests/release_workflow, `deploy.rs`) holds the two jobs to
+  # this shape.
+  #
+  # deploy-digest  reads the published release (`contents: read`) and nothing else: `cargo
+  #          xtask release image-digest` downloads SHA256SUMS, the linux-x86_64 frontend image
+  #          and its bundle, holds the image to the sums, and outputs the manifest digest its
+  #          index.json names and the release's download addresses of the image and the bundle.
+  # deploy   calls the reusable workflow deploy.yml of komira-ai/docker-swarm-updater, pinned
+  #          like any action by a full commit with its version comment, with exactly
+  #          `id-token: write`: the called workflow asks GitHub for an OIDC token for every
+  #          request and runs in this repository's environment `controlplane` (main only, no
+  #          required reviewer, no wait timer). It sends the service `kbf-frontend`, the commit
+  #          as the version, that digest and those addresses; docker-swarm-updater checks the
+  #          token's claims and the bundle against this repository's artifacts.yml on main,
+  #          then updates the service by digest, and Swarm rolls back an update whose task does
+  #          not become ready. The run is a `workflow_run` of main, so the token's `ref` is
+  #          refs/heads/main. It needs `gamma`: the frontend takes a release only after the
+  #          farm has. The job ends once the deploy is reported converged and fails otherwise;
+  #          it waits up to 240 minutes, since a frontend's drain waits for its open work.
+  deploy-digest:
+    needs: [plan, publish]
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' && vars.CP_DEPLOY_ENDPOINT != '' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      digest: ${{ steps.image.outputs.digest }}
+      image-url: ${{ steps.image.outputs.image-url }}
+      bundle-url: ${{ steps.image.outputs.bundle-url }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+      - run: rustup toolchain install
+      # Built before any step holds a token, so no build script runs beside one.
+      - run: cargo build -p xtask --locked
+      - name: The frontend image's manifest digest and the release's addresses of it and its bundle
+        id: image
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.plan.outputs.tag }}
+        run: cargo xtask release image-digest --repo "$GITHUB_REPOSITORY" --tag "$TAG" --commit "$COMMIT" --output "$GITHUB_OUTPUT"
+
+  deploy:
+    needs: [plan, gamma, deploy-digest]
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' && vars.CP_DEPLOY_ENDPOINT != '' }}
+    permissions:
+      id-token: write
+    uses: komira-ai/docker-swarm-updater/.github/workflows/deploy.yml@c1fcc47610e2886d4d9e561be3c0c76f0452d1f6 # v0.1.3
+    with:
+      service: kbf-frontend
+      version: ${{ github.event.workflow_run.head_sha }}
+      image-digest: ${{ needs.deploy-digest.outputs.digest }}
+      image-url: ${{ needs.deploy-digest.outputs.image-url }}
+      bundle-url: ${{ needs.deploy-digest.outputs.bundle-url }}
+      endpoint: ${{ vars.CP_DEPLOY_ENDPOINT }}
+      audience: ${{ vars.CP_DEPLOY_AUDIENCE }}
+      environment: controlplane
+      wait-minutes: 240
+      tailscale-oauth-client-id: ${{ vars.CP_DEPLOY_TAILSCALE_CLIENT_ID }}
+      tailscale-audience: ${{ vars.CP_DEPLOY_TAILSCALE_AUDIENCE }}
+      tailscale-tags: tag:cp-deploy
 
   # The gamma stage, the last step of a release. The farm's Linux nodes are deployed by
   # hostkeeper, which hostkeeper-desired.yml tells after this workflow (it is on when the
