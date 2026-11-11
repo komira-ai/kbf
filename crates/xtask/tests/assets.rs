@@ -685,8 +685,8 @@ fn attestations_refuse_a_foreign_workflow_an_unknown_file_and_a_missing_gh() {
     assert_eq!(code, Some(1));
     assert_eq!(
         err,
-        "xtask: SHA256SUMS lists notes.txt, neither a tarball, a package, an SBOM \
-         nor facts\n"
+        "xtask: SHA256SUMS lists notes.txt, neither a tarball, a package, an SBOM, \
+         facts nor a base tree bundle\n"
     );
 }
 
@@ -950,6 +950,52 @@ fn the_facts_of_the_task_image_are_verified_for_build_provenance_and_nothing_els
          {WORKFLOW} verifies\n"
     );
     assert_eq!(err, want);
+}
+
+#[test]
+fn the_base_tree_bundle_is_verified_for_build_provenance_and_nothing_else() {
+    // Catches: a bundle the attest job signs through the sums that the verify job refuses as
+    // neither a tarball, a package, an SBOM nor facts; one held to what only a tarball has (an
+    // SBOM attestation, a bundle of its own: neither exists); and one whose provenance is not
+    // checked, or whose missing attestation is passed over. A name that only ends `.tree.tar`
+    // is refused as it was.
+    let names: &[&str] = &["kbf", "kbf-daemon"];
+    let r = Release::build_with("base-tree-attested", &[("linux-x86_64", names)]);
+    let bundle = format!("kbf-base-tree-{COMMIT}-linux-x86_64.tree.tar");
+    r.add_listed(&bundle, "the kbf base tree\n");
+    r.attest(None);
+    let (code, out, err) = r.verify(&format!("{WORKFLOW}@refs/heads/main"), None);
+    assert_eq!(code, Some(0), "{err}");
+    let line = format!("verified: {bundle} (provenance)\n");
+    assert!(out.contains(&line), "{out}");
+    let path = s(&r.dist.join(&bundle)).to_owned();
+    let calls = r.gh_calls();
+    let mine: Vec<&String> = calls.iter().filter(|c| c.contains(&path)).collect();
+    assert_eq!(mine.len(), 1, "{mine:#?}");
+    assert_eq!(
+        *mine[0],
+        format!("attestation verify {path} {}", flags(WORKFLOW))
+    );
+    r.attest(Some((bundle.as_str(), false)));
+    let (code, _, err) = r.verify(WORKFLOW, None);
+    assert_eq!(code, Some(1), "{err}");
+    assert_eq!(
+        err,
+        format!("xtask: {path}: no build provenance attestation signed by {WORKFLOW} verifies\n")
+    );
+
+    let r = Release::build_with("base-tree-odd-name", &[("linux-x86_64", names)]);
+    let odd = "kbf-base-tree-notacommit-linux-x86_64.tree.tar";
+    r.add_listed(odd, "not a bundle\n");
+    r.attest(None);
+    let (code, _, err) = r.verify(WORKFLOW, None);
+    assert_eq!(code, Some(1), "{err}");
+    assert_eq!(
+        err,
+        format!(
+            "xtask: SHA256SUMS lists {odd}, neither a tarball, a package, an SBOM, facts nor a base tree bundle\n"
+        )
+    );
 }
 
 #[test]

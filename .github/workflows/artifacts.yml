@@ -12,7 +12,9 @@
 # run its binary). The Linux jobs also ship the frontend, the update coordinator and the task runner
 # as OCI images, `kbf-frontend-image-<commit>-<platform>.oci.tar`,
 # `kbf-coordinator-image-<commit>-<platform>.oci.tar` and
-# `kbf-task-image-<commit>-<platform>.oci.tar` (docs/artifacts.md).
+# `kbf-task-image-<commit>-<platform>.oci.tar` (docs/artifacts.md), and the kbf base tree of each
+# Linux platform, `kbf-base-tree-<commit>-<platform>.tree.tar`: the task image's base flattened with
+# the built kbf-task (docs/artifacts.md, "The kbf base tree bundle").
 #
 # A pull request runs none of it unless it carries the label `needs-artifacts` (add the
 # label to get the files; every build and sums job carries the same condition, so an unlabelled
@@ -520,6 +522,14 @@ jobs:
         run: cmp target/task-image-out/1.oci.tar target/task-image-out/2.oci.tar
       - name: The task image is the built kbf-task, and is an asset
         run: cargo xtask pkg-image-asset --service task --image target/task-image-out/1.oci.tar --platform linux-x86_64 --commit "$GITHUB_SHA" --binary "target/$STATIC_TARGET/release/kbf-task" --out dist
+      # The kbf base tree (docs/artifacts.md, "The kbf base tree bundle"): the task image's base layers
+      # flattened into one tierstore tree with the built kbf-task added as /.kbf-tools/kbf-task, as one
+      # asset holding the tree's manifests, its files and its facts. `base-tree` refuses an image that holds
+      # what a tree cannot hold (a set-uid file, a device, an extended attribute, a reserved path) and lists
+      # the bundle in SHA256SUMS.linux-x86_64; the attest job signs it with the rest of SHA256SUMS, as it signs
+      # the facts files.
+      - name: The kbf base tree is the task image's base and the built kbf-task, and is an asset
+        run: cargo xtask base-tree --image target/task-image-out/1.oci.tar --platform linux-x86_64 --commit "$GITHUB_SHA" --binary "target/$STATIC_TARGET/release/kbf-task" --out dist
       # The task image's CycloneDX SBOM, read from the image the release ships (its layers: the Ubuntu base's
       # packages and the kbf-task), with the pinned syft. `pkg-image-sbom` gives it the serial number and the time
       # of the image and the commit, so the same image has the same SBOM bytes, refuses a document that is not this
@@ -748,6 +758,14 @@ jobs:
         run: cmp target/task-image-out/1.oci.tar target/task-image-out/2.oci.tar
       - name: The task image is the built kbf-task, and is an asset
         run: cargo xtask pkg-image-asset --service task --image target/task-image-out/1.oci.tar --platform linux-arm64 --commit "$GITHUB_SHA" --binary "target/$STATIC_TARGET/release/kbf-task" --out dist
+      # The kbf base tree (docs/artifacts.md, "The kbf base tree bundle"): the task image's base layers
+      # flattened into one tierstore tree with the built kbf-task added as /.kbf-tools/kbf-task, as one
+      # asset holding the tree's manifests, its files and its facts. `base-tree` refuses an image that holds
+      # what a tree cannot hold (a set-uid file, a device, an extended attribute, a reserved path) and lists
+      # the bundle in SHA256SUMS.linux-arm64; the attest job signs it with the rest of SHA256SUMS, as it signs
+      # the facts files.
+      - name: The kbf base tree is the task image's base and the built kbf-task, and is an asset
+        run: cargo xtask base-tree --image target/task-image-out/1.oci.tar --platform linux-arm64 --commit "$GITHUB_SHA" --binary "target/$STATIC_TARGET/release/kbf-task" --out dist
       # The task image's CycloneDX SBOM, read from the image the release ships (its layers: the Ubuntu base's
       # packages and the kbf-task), with the pinned syft. `pkg-image-sbom` gives it the serial number and the time
       # of the image and the commit, so the same image has the same SBOM bytes, refuses a document that is not this

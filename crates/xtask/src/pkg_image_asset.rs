@@ -348,7 +348,7 @@ fn architecture(platform: Platform) -> &'static str {
 }
 
 /// The tar `bytes` as a plain tar: gunzipped when it is gzip-compressed.
-fn plain_tar(bytes: &[u8]) -> Result<Vec<u8>, String> {
+pub(crate) fn plain_tar(bytes: &[u8]) -> Result<Vec<u8>, String> {
     if !bytes.starts_with(&[0x1f, 0x8b]) {
         return Ok(bytes.to_vec());
     }
@@ -417,7 +417,7 @@ fn files(bytes: &[u8]) -> Result<Vec<(String, u32, Vec<u8>)>, String> {
 
 /// The blob `digest` names (`sha256:<hex>`) in the layout `blobs`, or what is wrong with it:
 /// absent, or bytes that do not hash to the digest.
-fn blob<'a>(
+pub(crate) fn blob<'a>(
     blobs: &'a BTreeMap<String, Vec<u8>>,
     digest: &str,
     what: &str,
@@ -475,17 +475,17 @@ pub fn problems(image: &[u8], c: &Check) -> Result<Vec<String>, Error> {
 }
 
 /// An image layout opened: its one manifest and config, each hashed to the digest that names it.
-struct Layout {
-    blobs: BTreeMap<String, Vec<u8>>,
+pub(crate) struct Layout {
+    pub(crate) blobs: BTreeMap<String, Vec<u8>>,
     /// The digest `index.json` gives the manifest.
     manifest_digest: String,
-    manifest: Value,
+    pub(crate) manifest: Value,
     config_digest: String,
     config: Value,
 }
 
 /// The layout in the tar `image`, or what is wrong with it.
-fn layout(image: &[u8]) -> Result<Layout, String> {
+pub(crate) fn layout(image: &[u8]) -> Result<Layout, String> {
     let outer = files(image).map_err(|e| format!("is not an OCI image tar: {e}"))?;
     let blobs: BTreeMap<String, Vec<u8>> = outer.into_iter().map(|(p, _, b)| (p, b)).collect();
     let index: Value = blobs
@@ -515,7 +515,7 @@ fn layout(image: &[u8]) -> Result<Layout, String> {
 }
 
 /// The digests of the layers `manifest` lists, bottom first.
-fn layer_digests(manifest: &Value) -> Vec<String> {
+pub(crate) fn layer_digests(manifest: &Value) -> Vec<String> {
     manifest["layers"]
         .as_array()
         .map_or(&[][..], Vec::as_slice)

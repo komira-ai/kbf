@@ -19,8 +19,9 @@
 //!   image its facts and its CycloneDX SBOM; no flag waives them, for the previous release or
 //!   any other), every file `SHA256SUMS`
 //!   lists is `<binary>-<sha>-<platform>.tar.gz` or `.cdx.json` (the task image's too), or `kbf`'s
-//!   `kbf-<sha>-<platform>.version.json` ([`crate::version_facts`]): the assets of that
-//!   commit and no other, and each tarball has exactly
+//!   `kbf-<sha>-<platform>.version.json` ([`crate::version_facts`]), or the base tree bundle of a
+//!   Linux platform, `kbf-base-tree-<sha>-<platform>.tree.tar` ([`crate::base_tree`]): the assets of
+//!   that commit and no other, and each tarball has exactly
 //!   one provenance bundle, `<tarball>.sigstore.json`, whose one subject is that
 //!   tarball's digest ([`bundles`]), and no bundle is there for anything else.
 //! - `release farm-version --repo <owner/name> --tag <tag> --commit <sha> [--output <file>]
@@ -111,6 +112,7 @@ use std::process::Command;
 use serde_json::Value;
 
 use crate::Error;
+use crate::base_tree;
 use crate::build_commit::full_commit;
 use crate::bundles;
 use crate::fetch::Sha256;
@@ -270,10 +272,14 @@ pub fn main_control(gh: &Path, repo: &str, on: &str, off: &str) -> Result<String
 /// `.tar.gz`, `.cdx.json`, `.deb`, `.pkg` or `.oci.tar` (the packages; and the frontend or coordinator image,
 /// [`crate::pkg_image_asset`], which exists for the Linux platforms only; nfpm's own `kbf-installer_<version>_
 /// <arch>.deb` and `pkg build`'s `kbf-installer-<version>-macos-arm64.pkg` name no commit and are
-/// not one), the version facts of `kbf` for a platform ([`version_facts::is_facts_of`]) or the facts of
-/// the task image ([`pkg_image_asset::is_facts_of`]).
+/// not one), the version facts of `kbf` for a platform ([`version_facts::is_facts_of`]), the facts of
+/// the task image ([`pkg_image_asset::is_facts_of`]) or the kbf base tree bundle of a Linux platform
+/// (`kbf-base-tree-<commit>-<platform>.tree.tar`, [`base_tree::is_bundle_of`]).
 fn is_asset_of(name: &str, commit: &str) -> bool {
-    if version_facts::is_facts_of(name, commit) || pkg_image_asset::is_facts_of(name, commit) {
+    if version_facts::is_facts_of(name, commit)
+        || pkg_image_asset::is_facts_of(name, commit)
+        || base_tree::is_bundle_of(name, commit)
+    {
         return true;
     }
     let stem = name
