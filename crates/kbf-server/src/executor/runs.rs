@@ -288,8 +288,7 @@ impl HostWorker {
         let prepared = match &w.prepared {
             Some(prepared) => Arc::clone(prepared),
             None => {
-                let worker = self.id.to_string();
-                let preparing = prepare(ctx, &worker, lease, action, w.booking);
+                let preparing = prepare(ctx, lease, action, w.booking);
                 match tokio::time::timeout_at(deadline, preparing).await {
                     Ok(Ok(prepared)) => {
                         self.stamp(lease, Mark::Prepared, ctx.now(), ctx);
