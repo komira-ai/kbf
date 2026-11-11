@@ -46,6 +46,7 @@ fn manifest() -> TaskManifest {
         packs: 1,
         large: Vec::new(),
         inputs: None,
+        objects: None,
     }
 }
 
@@ -117,7 +118,8 @@ fn an_empty_blob_gets_no_record() {
 }
 
 /// Catches a manifest the tool writes that its own reader refuses: each valid fixture of the
-/// shared types is built into a pack and read back unchanged.
+/// shared types is built into a pack and read back unchanged (those with members the reader does
+/// not know read as the manifest without them, and are built and read back as that).
 #[test]
 fn every_valid_fixture_manifest_builds_and_reads_back() {
     let mut stems = Vec::new();
@@ -143,7 +145,10 @@ fn every_valid_fixture_manifest_builds_and_reads_back() {
             "dotted_names",
             "empty_output_file",
             "failed_action",
-            "minimal"
+            "minimal",
+            "unknown_field_put_ms",
+            "unknown_members_everywhere",
+            "unknown_top_level_field"
         ]
     );
 }

@@ -544,6 +544,7 @@ async fn recorded_files(name: &str, count: usize) -> (TestDir, TaskManifest, Blo
         packs: 1,
         large: Vec::new(),
         inputs: None,
+        objects: None,
     };
     (dir, manifest, outputs.blobs)
 }

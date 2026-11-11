@@ -421,3 +421,39 @@ fn a_multi_pack_manifest_is_written_and_read_only_by_the_with_forms() {
     ));
     assert_eq!(read_manifest_with(&pack, 0).expect("read"), manifest);
 }
+
+/// Asserts that a manifest of objects (version 3) never travels as a pack: `write_pack` and
+/// `write_pack_with` refuse it, and a pack whose record at offset 0 is one is refused by
+/// `read_manifest` and `read_manifest_with` (`ByDigest`), so ingest of packs never reads a run
+/// that wrote none.
+#[test]
+fn a_manifest_of_objects_is_not_written_or_read_as_a_pack() {
+    let manifest = TaskManifest {
+        packs: 0,
+        objects: Some(golden().output_digests().chain([sha256(X)]).collect()),
+        ..golden()
+    };
+    let json = manifest
+        .objects_json()
+        .expect("a valid manifest of objects");
+    assert!(matches!(
+        write_pack(&manifest, &[A_O]),
+        Err(WritePackError::Manifest(ManifestError::ByDigest))
+    ));
+    assert!(matches!(
+        write_pack_with(&manifest, &[A_O], 1 << 30),
+        Err(WritePackError::Manifest(ManifestError::ByDigest))
+    ));
+    let mut writer = SegmentWriter::new(MAX_PACK_BYTES);
+    writer.push(&json).expect("fits");
+    writer.push(A_O).expect("fits");
+    let pack = writer.finish();
+    assert!(matches!(
+        read_manifest(&pack),
+        Err(TaskPackError::Manifest(ManifestError::ByDigest))
+    ));
+    assert!(matches!(
+        read_manifest_with(&pack, 1 << 30),
+        Err(TaskPackError::Manifest(ManifestError::ByDigest))
+    ));
+}
