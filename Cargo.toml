@@ -250,6 +250,8 @@ kbf-objstore = { path = "crates/kbf-objstore" }
 kbf-outputs = { path = "crates/kbf-outputs" }
 kbf-pack = { path = "crates/kbf-pack" }
 kbf-pack-index = { path = "crates/kbf-pack-index" }
+# The update hook of the native kbf package (`kbf package-hook`); depends on update-hook alone.
+kbf-package-hook = { path = "crates/kbf-package-hook" }
 kbf-peer = { path = "crates/kbf-peer" }
 kbf-proto = { path = "crates/kbf-proto" }
 kbf-proxy = { path = "crates/kbf-proxy" }

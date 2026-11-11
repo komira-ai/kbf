@@ -9,7 +9,8 @@
 //!   ([`TRUST_DIR`]) the pinned `gh` and the Sigstore trusted root verify attestations from.
 //!   In the deb only, it adds the host agent ([`AGENT_UNITS`], the helper's and the agent's
 //!   units, and the agent's account, [`AGENT_SYSUSERS_PATH`]) and the links in [`WANTS_DIR`]
-//!   that enable both units. It refuses a trust file other than the three and a unit or host
+//!   that enable both units (not when [`Inputs::host_agent`] is `None`, `pkg-config --no-host-agent`: the
+//!   native package, which hostkeeper installs, has none of them). It refuses a trust file other than the three and a unit or host
 //!   agent directory that lacks one of its files. Everything else in the unit directory (the
 //!   retired installer's and proxy's units) and in the host agent's is not packaged;
 //! - [`config`] renders a list as the nfpm configuration (an entry of the deb only says so to
@@ -233,8 +234,9 @@ pub struct Inputs<'a> {
     /// The needrestart drop-in.
     pub needrestart: &'a Path,
     /// The directory of the host agent's Linux files (`packaging/host-agent/linux`): the deb
-    /// takes [`AGENT_UNITS`] and [`AGENT_SYSUSERS`] from it, and no other.
-    pub host_agent: &'a Path,
+    /// takes [`AGENT_UNITS`] and [`AGENT_SYSUSERS`] from it, and no other. `None` makes the
+    /// native package, which has no host agent: hostkeeper runs the units, not the agent.
+    pub host_agent: Option<&'a Path>,
     /// The platform the binary was built for.
     pub platform: Platform,
     /// The package version.
@@ -399,7 +401,9 @@ pub fn kbf_plan(i: &Inputs) -> Result<Vec<Entry>, Error> {
             "{name}: the package ships no trust file of that name"
         ));
     }
-    entries.extend(agent_plan(i.host_agent, &mut problems));
+    if let Some(host_agent) = i.host_agent {
+        entries.extend(agent_plan(host_agent, &mut problems));
+    }
     if !problems.is_empty() {
         return Err(Error::Refused(problems));
     }
@@ -658,18 +662,26 @@ pub struct ConfigFlags {
     pub needrestart: PathBuf,
     /// The directory of the host agent's Linux files (`packaging/host-agent/linux`): the deb
     /// takes the helper's and the agent's units and the agent's sysusers.d file from it.
-    #[arg(long)]
-    pub host_agent: PathBuf,
+    /// (One of this and `--no-host-agent` is required.)
+    #[arg(long, required_unless_present = "no_host_agent")]
+    pub host_agent: Option<PathBuf>,
+    /// Leave the host agent out: the native package, which hostkeeper installs and updates.
+    #[arg(long, conflicts_with = "host_agent")]
+    pub no_host_agent: bool,
     /// The platform the binary was built for (`linux-x86_64`, `linux-arm64`).
     #[arg(long, value_enum)]
     pub platform: Platform,
     /// The package version.
-    /// (One of the two is required; the verb says so, exit 2, as clap does for a bad flag.)
-    #[arg(long, conflicts_with = "version_of")]
+    /// (One of the three is required; the verb says so, exit 2, as clap does for a bad flag.)
+    #[arg(long, conflicts_with_all = ["version_of", "native_version_of"])]
     pub version: Option<String>,
     /// Take the version from this binary's `--version` (`<version>+<12 of the commit>`).
-    #[arg(long)]
+    #[arg(long, conflicts_with = "native_version_of")]
     pub version_of: Option<PathBuf>,
+    /// Take the native version, `<major>.<minor>.<seq>`, from this binary's `--version --json`
+    /// (its `version` and `seq`): the version of the package hostkeeper installs.
+    #[arg(long)]
+    pub native_version_of: Option<PathBuf>,
     /// The directory `nfpm.yaml` and `listing.txt` go in; created when missing.
     #[arg(long)]
     pub out: PathBuf,
@@ -682,10 +694,15 @@ pub struct ConfigFlags {
 /// Neither version flag (a usage error), a binary whose version cannot be read, or as
 /// [`write_config`].
 pub fn config_verb(f: &ConfigFlags) -> Result<Vec<String>, Error> {
-    let version = match (&f.version, &f.version_of) {
-        (Some(version), _) => version.clone(),
-        (None, Some(of)) => crate::pkg_asset::binary_version(of)?,
-        (None, None) => return Err(Error::Usage("--version or --version-of".to_owned())),
+    let version = match (&f.version, &f.version_of, &f.native_version_of) {
+        (Some(version), _, _) => version.clone(),
+        (None, Some(of), _) => crate::pkg_asset::binary_version(of)?,
+        (None, None, Some(of)) => crate::pkg_asset::binary_native_version(of)?,
+        (None, None, None) => {
+            return Err(Error::Usage(
+                "--version, --version-of or --native-version-of".to_owned(),
+            ));
+        }
     };
     write_config(
         &Inputs {
@@ -695,7 +712,7 @@ pub fn config_verb(f: &ConfigFlags) -> Result<Vec<String>, Error> {
             sysusers: &f.sysusers,
             tmpfiles: &f.tmpfiles,
             needrestart: &f.needrestart,
-            host_agent: &f.host_agent,
+            host_agent: f.host_agent.as_deref(),
             platform: f.platform,
             version: &version,
         },

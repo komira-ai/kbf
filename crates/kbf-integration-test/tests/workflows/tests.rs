@@ -162,6 +162,19 @@ fn self_hosted_is_refused_in_any_form() {
 }
 
 #[test]
+fn the_flag_that_denies_self_hosted_runners_is_not_a_self_hosted_runner() {
+    // Catches: a lint that refuses `gh attestation verify --deny-self-hosted-runners`, and one
+    // that lets the flag hide a real mention of a self-hosted runner in the same value.
+    clean(&workflow(
+        "    runs-on: ubuntu-24.04\n    steps:\n      - run: gh attestation verify f --deny-self-hosted-runners\n",
+    ));
+    refused(
+        "    runs-on: ubuntu-24.04\n    steps:\n      - run: echo self-hosted --deny-self-hosted-runners\n",
+        "names self-hosted",
+    );
+}
+
+#[test]
 fn runs_on_that_cannot_be_evaluated_is_refused() {
     // Catches: an expression or matrix, a runner group, a custom label or an empty
     // value accepted as hosted; the last two catch an `is_hosted_label` that checks

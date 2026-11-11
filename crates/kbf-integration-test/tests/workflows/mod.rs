@@ -30,8 +30,11 @@
 //!   only in a job whose `if:` is exactly [`ISSUES_MAIN_ONLY`] (the advisories workflow
 //!   keeps one issue; no pull request run holds a token that can write issues);
 //! - a job calls a reusable workflow that is not one of this repository's linted
-//!   workflow files (its runners are not in a file this lint read), but for exactly the
-//!   pinned calls of [`called::CALLABLE`], each with its version comment;
+//!   workflow files (its runners are not in a file this lint read), but for exactly the two
+//!   calls AGENTS.md's B10 names, each pinned by a full commit SHA with its version comment:
+//!   docker-swarm-updater's `deploy.yml` from the release's `deploy` job ([`called::CALLABLE`])
+//!   and hostkeeper's `set-desired.yml` from `hostkeeper-desired.yml`'s `set-desired` job
+//!   ([`hostkeeper`]);
 //! - a step's `uses:` is not pinned to a full 40-character commit SHA followed on the
 //!   same line by a version comment, written as a plain (unquoted) scalar so the
 //!   comment's place is exact;
@@ -46,7 +49,9 @@
 //!   repository, whose `./<dir>` this lint never read);
 //! - it lacks a top-level `permissions: {}`, so jobs start with no token rights;
 //! - any key or value names `self-hosted` or `pull_request_target`, whatever key it
-//!   sits under (a second line of defence behind the structural checks).
+//!   sits under (a second line of defence behind the structural checks); the one flag
+//!   `--deny-self-hosted-runners` of `gh attestation verify` is not such a name, and is read
+//!   as nothing.
 //!
 //! Every tracked `action.yml` or `action.yaml` (any directory, any case) is linted by
 //! [`scan_action`] with the same step, local-path and whole-document rules: its
@@ -84,10 +89,12 @@
 //! anything else, so that review has less to catch.
 
 mod called;
+mod hostkeeper;
+pub mod release_ifs;
 #[cfg(test)]
 mod stages;
 mod workflow_run;
-mod yaml;
+pub(crate) mod yaml;
 
 mod jobs;
 pub use jobs::{
@@ -170,8 +177,8 @@ const SIGNING_PUSH_ONLY: &str =
 const SIGNING_STAGE_ONLY: &str = "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && inputs.stage == 'sign' }}";
 
 /// The one signing scope a job may also set to `write` under [`RELEASE_PUSH_ONLY`] or
-/// [`called::DEPLOY_ONLY`]: the OIDC token, which the release workflow's gamma stage presents to
-/// the farm's update coordinator and its frontend deploy to docker-swarm-updater. It signs
+/// [`called::DEPLOY_ONLY`]: the OIDC token, which the release workflow's gamma stage uses for its
+/// network join and its frontend deploy presents to docker-swarm-updater. It signs
 /// nothing (`attestations` stays under [`SIGNING_PUSH_ONLY`]), and the workflow lint of
 /// `release.yml` holds the two jobs that have it to exactly their scopes.
 const DEPLOY_SCOPE: &str = "id-token";
@@ -457,16 +464,23 @@ fn run(text: &str, repo: &Repo, check: impl FnOnce(&mut Lint<'_>, &Node)) -> Vec
         text,
         repo,
         out: Vec::new(),
+        hostkeeper: hostkeeper::is_named(&root),
     };
     lint.every_node(&root);
     check(&mut lint, &root);
     lint.out
 }
 
+/// The flag of `gh attestation verify` that refuses a signer that ran on a self-hosted runner:
+/// the only text that holds the word `self-hosted` and keeps runners off, so it is not refused.
+const DENY_SELF_HOSTED_FLAG: &str = "--deny-self-hosted-runners";
+
 struct Lint<'a> {
     text: &'a str,
     repo: &'a Repo,
     out: Vec<String>,
+    /// Whether the workflow is the one that sets hostkeeper's desired version ([`hostkeeper`]).
+    hostkeeper: bool,
 }
 
 impl Lint<'_> {
@@ -478,7 +492,7 @@ impl Lint<'_> {
     fn every_node(&mut self, node: &Node) {
         match &node.value {
             Value::Scalar { text, .. } => {
-                let lower = text.to_ascii_lowercase();
+                let lower = text.to_ascii_lowercase().replace(DENY_SELF_HOSTED_FLAG, "");
                 for word in ["self-hosted", "pull_request_target"] {
                     if lower.contains(word) {
                         self.refuse(node, format_args!("a key or value names {word}"));
@@ -531,8 +545,8 @@ impl Lint<'_> {
                 value: Value::Map(jobs),
                 ..
             }) => {
-                for (_, job) in jobs {
-                    self.job(job);
+                for (key, job) in jobs {
+                    self.job(key, job);
                 }
             }
             Some(other) => self.refuse(other, "`jobs` must be a mapping"),
@@ -610,18 +624,14 @@ impl Lint<'_> {
         }
     }
 
-    fn job(&mut self, job: &Node) {
+    fn job(&mut self, key: &Node, job: &Node) {
         let Value::Map(job_map) = &job.value else {
             self.refuse(job, "a job must be a mapping");
             return;
         };
         if let Some(called) = get(job_map, "uses") {
             match called.as_str().and_then(|w| w.strip_prefix("./")) {
-                None => {
-                    if let Some(why) = called::refusal(self.text, called) {
-                        self.refuse(called, why);
-                    }
-                }
+                None => self.outside_call(key, called),
                 Some(path) if self.repo.workflows.iter().any(|w| w == path) => {}
                 Some(path) => self.refuse(
                     called,
@@ -630,7 +640,7 @@ impl Lint<'_> {
             }
         }
         if let Some(p) = get(job_map, "permissions") {
-            self.job_permissions(p, get(job_map, "if").and_then(Node::as_str));
+            self.job_permissions(key, p, get(job_map, "if").and_then(Node::as_str));
         }
         match get(job_map, "runs-on") {
             Some(r) => self.runs_on(r),
@@ -695,7 +705,7 @@ impl Lint<'_> {
     /// `if:` is exactly [`RELEASE_PUSH_ONLY`], [`ISSUE_SCOPES`] in one whose `if:`
     /// is exactly [`ISSUES_MAIN_ONLY`]. Scope names and levels are compared
     /// exactly, so another spelling is refused (the safe side).
-    fn job_permissions(&mut self, p: &Node, condition: Option<&str>) {
+    fn job_permissions(&mut self, key: &Node, p: &Node, condition: Option<&str>) {
         let Value::Map(scopes) = &p.value else {
             self.refuse(
                 p,
@@ -709,11 +719,7 @@ impl Lint<'_> {
             if granted == "read" || granted == "none" {
                 continue;
             }
-            let deploy = [RELEASE_PUSH_ONLY, called::DEPLOY_ONLY];
-            if name == DEPLOY_SCOPE
-                && granted == "write"
-                && condition.is_some_and(|c| deploy.contains(&c))
-            {
+            if name == DEPLOY_SCOPE && granted == "write" && self.deploy_scope_ok(key, condition) {
                 continue;
             }
             let gate: &[&str] = if SIGNING_SCOPES.contains(&name) {

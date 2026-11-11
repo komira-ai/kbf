@@ -1,0 +1,137 @@
+# Sets the desired version of the hostkeeper service `kbf-storage-and-daemon` on the hostkeeper
+# coordinator to a published release, by its targets: each host is ordered the .deb of its own
+# platform from the apt repository https://packages.komira.ai/apt (suite `stable`, which
+# release.yml promotes a release into after its install checks passed). Two ways in:
+#
+# - `workflow_run`: the completion of a run of `release.yml` on main of this repository. Only a run
+#   that succeeded is acted on, and of those only one whose job `publish` succeeded: then the
+#   newest published release is set (release runs are one at a time, so it is the release that
+#   run published, or a newer one whose run comes next). Most release runs publish nothing, and
+#   then nothing is set. Since the promotion into `stable` is part of the run of `release.yml`,
+#   the fleet is moved last.
+# - `workflow_dispatch`, from main ("Run workflow"), with one input, the released version `X.Y.Z`
+#   (its tag without the v), an older one included (a rollback).
+#
+# It is OFF until the repository variable KBF_SETS_DESIRED is `true`, exactly: unset, or
+# anything else, both jobs are skipped (their job-level `if:`), whichever way it started. Its
+# other settings are repository variables too; none is a secret:
+#  - HOSTKEEPER_COORDINATOR_URL      the coordinator's private listener, https://<host>[:<port>],
+#                                    by the name it has on the tailnet and in its certificate;
+#  - HOSTKEEPER_COORDINATOR_CA       the PEM certificates of the CA that listener chains to;
+#  - HOSTKEEPER_TAILNET_CLIENT_ID    the client ID of the tailnet's federated identity for this
+#                                    repository; empty: the runner does not join the tailnet;
+#  - HOSTKEEPER_TAILNET_AUDIENCE     the audience of that federated identity;
+#  - HOSTKEEPER_TAILNET_COORDINATOR  the coordinator's name on the tailnet, which the join pings;
+#  - HOSTKEEPER_TAILNET_TAG          the tag the join gives the runner's node, the one that
+#                                    identity's trust credential issues (such as `tag:ci`).
+# The coordinator lets the job's OIDC token set the version only through an allow-list entry for
+# this repository (by id), refs/heads/main, the events workflow_run and workflow_dispatch, the
+# audience below, the service kbf-storage-and-daemon, and the `job_workflow_ref` of the called
+# workflow pinned below (komira-ai/hostkeeper/.github/workflows/set-desired.yml@<that commit>).
+# Moving the pin moves the `job_workflow_ref`, so the entry moves with it.
+#
+# The call names the service only: which hosts are ordered the package is the coordinator's
+# placement of the service kbf-storage-and-daemon (its rollout file), not an input of this call.
+#
+# Two jobs:
+#  - check        holds no token that writes. `cargo xtask release desired` (crates/xtask,
+#                 src/release/desired.rs) decides the release (`--version` by hand,
+#                 `--after-run` after a run of release.yml; one of the two is empty) and hands on
+#                 `set=false` when that run published none. Otherwise it refuses a release unless
+#                 its SHA256SUMS lists the two native .debs of the commit its tag names and the
+#                 index of the suite `stable`, read through the CDN as a host reads it, lists each
+#                 at the digest SHA256SUMS gives. It hands on the package version (the `Version`
+#                 of those index entries) and the release's targets: one `apt` entry of the host
+#                 repository `komira-stable` per platform, with the manifest of kbf's update hook
+#                 (hostkeeper's native entries carry the manifest in the call, not in the
+#                 package).
+#  - set-desired  needs check, and is hostkeeper's reusable workflow (the CI client), pinned below
+#                 with the hostkeeper release whose hkctl makes the call: it proves that release
+#                 (SHA256SUMS, the attestation by its artifacts.yml on refs/heads/main, the
+#                 attested commit, `hkctl --version`) before any step can hold a token, joins the
+#                 runner to the tailnet when HOSTKEEPER_TAILNET_CLIENT_ID is set (the
+#                 coordinator's private listener is on the tailnet only), and calls `releases
+#                 set-desired` with the job's OIDC token, naming the release by its targets. It
+#                 does not wait for the fleet: the coordinator's update plan rolls the version out
+#                 stage by stage, longer than a job should hold this workflow's group. The job
+#                 ends once the coordinator stored the version (`reason` `not_waited`).
+#
+# One run at a time of each way in, never cancelled: the runs after a release share the group
+# `hostkeeper-desired-release`, where a newer waiting run replaces an older one (each derives the
+# newest release itself, so nothing is lost), and the runs by hand share
+# `hostkeeper-desired-dispatch`, so that a rollback waiting for its turn is never replaced by the
+# completion of a release run.
+#
+# The repository lint `hostkeeper_desired`
+# (crates/kbf-integration-test/tests/hostkeeper_desired) holds this file to what is said here.
+name: hostkeeper-desired
+
+on:
+  workflow_run:
+    workflows: [release]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "A released version of kbf, X.Y.Z (the tag without the v)"
+        type: string
+        required: true
+
+permissions: {}
+
+concurrency:
+  group: hostkeeper-desired-${{ github.event_name == 'workflow_dispatch' && 'dispatch' || 'release' }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    if: ${{ github.ref == 'refs/heads/main' && vars.KBF_SETS_DESIRED == 'true' && (github.event_name == 'workflow_dispatch' || (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository)) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      set: ${{ steps.desired.outputs.set }}
+      package-version: ${{ steps.desired.outputs.package-version }}
+      targets: ${{ steps.desired.outputs.targets }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      # Built before any step holds a token, so no build script runs beside one.
+      - run: cargo build -p xtask --locked
+      # The input and the run id are read as environment variables of the step, never spliced into
+      # a script. One of the two is empty: the input on a workflow_run, the run id on a dispatch.
+      - name: The release to set, refused when its .debs are not in the stable index
+        id: desired
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: cargo xtask release desired --repo "$GITHUB_REPOSITORY" --version "$VERSION" --after-run "$RUN_ID" --dir "$RUNNER_TEMP/desired" --output "$GITHUB_OUTPUT"
+
+  set-desired:
+    needs: [check]
+    if: ${{ github.ref == 'refs/heads/main' && vars.KBF_SETS_DESIRED == 'true' && needs.check.outputs.set == 'true' }}
+    permissions:
+      contents: read
+      id-token: write
+    uses: komira-ai/hostkeeper/.github/workflows/set-desired.yml@318bcc93c9bcd009d40597c45227278742acc622 # v0.1.242
+    with:
+      service: kbf-storage-and-daemon
+      version: ${{ needs.check.outputs.package-version }}
+      targets: ${{ needs.check.outputs.targets }}
+      hostkeeper_version: 0.1.242
+      hostkeeper_commit: 318bcc93c9bcd009d40597c45227278742acc622
+      coordinator_url: ${{ vars.HOSTKEEPER_COORDINATOR_URL }}
+      coordinator_ca: ${{ vars.HOSTKEEPER_COORDINATOR_CA }}
+      audience: kbf-hostkeeper-desired
+      wait: false
+      join_tailnet: ${{ vars.HOSTKEEPER_TAILNET_CLIENT_ID != '' }}
+      tailnet_client_id: ${{ vars.HOSTKEEPER_TAILNET_CLIENT_ID }}
+      tailnet_audience: ${{ vars.HOSTKEEPER_TAILNET_AUDIENCE }}
+      tailnet_coordinator: ${{ vars.HOSTKEEPER_TAILNET_COORDINATOR }}
+      tailnet_tag: ${{ vars.HOSTKEEPER_TAILNET_TAG }}

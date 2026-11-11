@@ -141,20 +141,34 @@ fn a_stage_whose_only_job_is_deleted_is_refused() {
     // Catches: a stage left empty. Delete every prod job from the stage file (the rows
     // go, the workflow keeps its jobs).
     let (stages, workflows) = real();
-    let cut = stages
-        .split("  - job: release.yml#plan")
-        .next()
+    let (before, rest) = stages
+        .split_once("  - job: release.yml#plan")
         .expect("text");
-    let found = check(cut, &workflows);
+    let after = rest
+        .split_once("  - job: hostkeeper-desired.yml#check")
+        .expect("the rows of the deploy stage")
+        .1;
+    let cut = format!("{before}  - job: hostkeeper-desired.yml#check{after}");
+    let found = check(&cut, &workflows);
     refused(&found, "stage `prod` is an `actions` stage with no job");
-    // The release's gamma and deploy jobs hold `id-token: write`, which only a signing row may:
-    // with their rows gone they are named too, and nothing else is.
+    // The release's jobs that hold `id-token: write` (the gamma stage, the apt reads and writes
+    // and the deploy), which only a signing row may: with their rows gone they are named too,
+    // and nothing else is.
     refused(&found, "job `gamma` can write `id-token` or `attestations`");
+    refused(
+        &found,
+        "job `testing-apt-write` can write `id-token` or `attestations`",
+    );
     refused(
         &found,
         "job `deploy` can write `id-token` or `attestations`",
     );
-    assert_eq!(found.len(), 3, "{found:#?}");
+    let signing = found
+        .iter()
+        .filter(|f| f.contains("can write `id-token`"))
+        .count();
+    assert_eq!(signing, 14, "{found:#?}");
+    assert_eq!(found.len(), 1 + signing, "{found:#?}");
 }
 
 #[test]

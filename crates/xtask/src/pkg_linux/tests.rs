@@ -63,7 +63,7 @@ impl Tree {
             sysusers: at("sysusers.conf"),
             tmpfiles: at("tmpfiles.conf"),
             needrestart: at("needrestart.conf"),
-            host_agent: at("host-agent"),
+            host_agent: Some(at("host-agent")),
             platform: Platform::LinuxX86_64,
             version: "0.0.0+ci",
         }
@@ -92,7 +92,7 @@ fn real_inputs(root: &Path) -> Inputs<'_> {
         sysusers: at("sysusers.d/kbf-installer.conf"),
         tmpfiles: at("tmpfiles.d/kbf-installer.conf"),
         needrestart: at("needrestart/kbf.conf"),
-        host_agent: at("../host-agent/linux"),
+        host_agent: Some(at("../host-agent/linux")),
         platform: Platform::LinuxX86_64,
         version: "0.0.0+ci",
     }

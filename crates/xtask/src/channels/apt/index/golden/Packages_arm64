@@ -1,0 +1,16 @@
+Package: buildrules
+Version: 1.2.3
+Architecture: arm64
+Maintainer: buildrules authors <buildrules@users.noreply.github.com>
+Installed-Size: 1
+Section: devel
+Priority: optional
+Homepage: https://buildrules.dev
+Filename: pool/main/b/buildrules/buildrules_1.2.3_arm64.deb
+Size: 1074
+SHA256: 32e4e215c23a4b6fd6ad57f87bb33eb10baae41ba92a78ae181a600d3eecd7e4
+Description: hermetic Buck2 rules and toolchains
+ Builds, tests and releases a repository with pinned toolchains.
+ .
+ A static binary: it needs nothing else installed.
+

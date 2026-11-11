@@ -33,8 +33,9 @@
 #          does not releases both.
 # verify   refuses a commit not on main, downloads the files of the pipeline run that started
 #          this one, checks the files against SHA256SUMS and the commit's assets, and verifies
-#          every attestation as a deployment does and every bundle offline as a host does.
-#          Read-only, and it runs before anything is tagged.
+#          every attestation as a deployment does and every bundle offline as a host does,
+#          then reads the version of the native package from its two .debs (the output
+#          `package-version`). Read-only, and it runs before anything is tagged.
 # tag      writes the Beta record (an audit record nothing gates on) and creates the annotated
 #          tag, create-only, naming exactly this commit, with a token of the release bot,
 #          the only identity the `v*` tag ruleset lets create one. The token is minted in
@@ -49,22 +50,35 @@
 # bump     opens the pull request in the internal repository that moves its submodule to the
 #          released commit, with a token of the release bot scoped to that repository.
 # rehearse a host laid out by hand from the release before this one is updated to this one by
-#          the real helper under the real systemd, as the farm's hosts will be
+#          the real helper under the real systemd, as the farm's hosts were
 #          (crates/kbf-host-install/tests/update_rehearsal.rs). gamma needs it. Read-only.
 # rehearse-agent
-#          the same host is updated through the whole control loop the farm uses: the real
-#          coordinator of this commit, `cargo xtask deploy-farm` with the version `release
-#          farm-version` prints, and the real agent and frontend of the release before this one
+#          the same host is updated through the whole control loop of kbf's update coordinator:
+#          the real coordinator of this commit, `cargo xtask deploy-farm`, and the real agent and
+#          frontend of the release before this one
 #          (crates/kbf-host-install/tests/update_rehearsal_agent.rs). gamma needs it. Read-only.
-# gamma    the gamma stage. Sets the published release as the desired version on the farm's
-#          update coordinator and waits for the farm to converge (cargo xtask deploy-farm); it
-#          passes with a notice when the repository variable KBF_COORDINATOR_URL is unset. Then
-#          it proves the farm with a Buck2 build of a small project, remote only, every action
-#          new in this run (cargo xtask prove-farm); it passes with a notice when FARM_ADDRESS
-#          is unset. It holds `id-token: write` (as `deploy` does) and no write scope. When the
-#          coordinator and the farm are reachable only on a Tailscale network, it joins that
-#          network first as an ephemeral node, with the same run token (TS_CLIENT_ID set and
-#          either KBF_COORDINATOR_URL or FARM_ADDRESS set; skipped otherwise).
+# gamma    the gamma stage. The farm's Linux nodes are deployed by hostkeeper, which
+#          hostkeeper-desired.yml tells after this workflow when the repository variable
+#          KBF_SETS_DESIRED is `true`, so this job no longer sets kbf's update coordinator: its
+#          first step after the checkout prints a notice that says so. Every later step runs only
+#          when KBF_SETS_DESIRED is `true`: the build, the join of the farm's Tailscale network
+#          (with TS_CLIENT_ID and FARM_ADDRESS set too, as an ephemeral node with the same run
+#          token), and the proof, a Buck2 build of a small project, remote only, every action new
+#          in this run (cargo xtask prove-farm). The one job here that holds `id-token: write`
+#          besides the apt read and write jobs and `deploy`, and no write scope.
+# deploy-tool
+#          builds `xtask --release` in a job with no token and no secret and uploads it, for the
+#          apt jobs below, which hold the cloud role or the signing key and never compile.
+# testing-apt-read, testing-apt-index, testing-apt-write
+#          the release's two native .debs into the apt repository's suite `testing`; the same
+#          three with the suffixes -2 and -3 are the second and third attempt after a lost
+#          race for the index.
+# check-apt-amd64, check-apt-arm64
+#          kbf installed from the suite `testing` in a clean Ubuntu container, on each
+#          architecture, and held to what the package promises.
+# stable-apt-read, stable-apt-index, stable-apt-write
+#          the release promoted from `testing` into the suite `stable` once both install checks
+#          passed (and -2, -3 as above). hostkeeper installs from `stable`.
 # deploy-digest, deploy
 #          only while the repository variable CP_DEPLOY_ENDPOINT is not empty, after `gamma`:
 #          deploy the release's frontend image to its Docker Swarm service by calling the
@@ -154,6 +168,8 @@ jobs:
       contents: read
       actions: read
       attestations: read
+    outputs:
+      package-version: ${{ steps.package.outputs.package-version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -212,6 +228,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: cargo xtask verify-assets attestations dist --repo "$GITHUB_REPOSITORY" --workflow-ref "$GITHUB_REPOSITORY/.github/workflows/artifacts.yml" --commit "$COMMIT" --trusted-root "$RUNNER_TEMP/trusted_root.jsonl"
+      # The Debian version of the native package, read from the control files of the two native
+      # .debs, which must agree: the version every apt job below is given.
+      - name: The version of the native package, from the two .debs
+        id: package
+        run: cargo xtask channels apt version --debs dist --commit "$COMMIT" --output "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-assets
@@ -458,8 +479,7 @@ jobs:
 
   # The rehearsal of the control loop, which the gamma stage needs too: the host of the rehearsal
   # above is updated by the real agent that the real coordinator of this commit orders, after
-  # `cargo xtask deploy-farm` told that coordinator "desired = this release" with the version text
-  # `cargo xtask release farm-version` prints, as the gamma stage does below; the farm's frontend
+  # `cargo xtask deploy-farm` told that coordinator "desired = this release"; the farm's frontend
   # is the release before this one, and only the issuer of the OIDC token is a stand-in
   # (crates/kbf-host-install/tests/update_rehearsal_agent.rs). A release whose version the hosts
   # never report, or whose coordinator and agent do not agree, stops here. It holds
@@ -559,26 +579,21 @@ jobs:
       tailscale-audience: ${{ vars.CP_DEPLOY_TAILSCALE_AUDIENCE }}
       tailscale-tags: tag:cp-deploy
 
-  # The gamma stage, the last step of a release: tell the farm's update coordinator "desired =
-  # this release" and wait until the farm converges (docs/deploy/kbf-updater.md, "Turn on the gamma stage"). It
-  # runs only after the release is published, holds no write scope and no secret, and holds the
-  # run's OIDC token (`id-token: write`) for the one thing it is for: the coordinator accepts a
-  # token of this workflow on main, for the `release` environment, and nothing else. The
-  # coordinator's address is a repository variable, never written here: unset, the verb
-  # prints a notice and the job passes, so a fork or a repository that does not run a farm is
-  # unaffected. The wait is bounded (the verb's `--deadline-min`, 60 by default, under this
-  # job's timeout), and a farm that is blocked, stalled or out of time fails the job; the
-  # release stays published whatever this job says.
+  # The gamma stage, the last step of a release. The farm's Linux nodes are deployed by
+  # hostkeeper, which hostkeeper-desired.yml tells after this workflow (it is on when the
+  # repository variable KBF_SETS_DESIRED is `true`), so this job no longer sets kbf's update
+  # coordinator. What it still does is prove the farm: when KBF_SETS_DESIRED is `true`, it joins
+  # the farm's Tailscale network and builds a small project against the farm with Buck2, remote
+  # only. Its first step after the checkout prints a notice that says so, and every later step
+  # runs only under that variable, so with it unset the job ends green after the notice. It holds
+  # the run's OIDC token (`id-token: write`) for the tailnet join alone, no write scope and no
+  # secret. The release stays published whatever this job says.
   gamma:
     needs: [plan, publish, rehearse, rehearse-agent]
     if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}
     runs-on: ubuntu-24.04
-    # Every step has a timeout of its own, and the job's is at least their sum: a step that hangs
-    # is cut by its own timeout, fails, and the restore still runs within its own. The deploy's
-    # and the restore's cover the longest their verbs can run (their calls, tokens included, each
-    # tried again on a 503, and the deploy's --deadline-min): 81.5 and 28.5 minutes, and a
-    # minute to start. The release workflow lint computes those from the verbs' own limits.
-    timeout-minutes: 200
+    # Every step has a timeout of its own, and the job's is at least their sum.
+    timeout-minutes: 90
     environment: release
     permissions:
       contents: read
@@ -592,72 +607,44 @@ jobs:
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
           persist-credentials: false
+      - name: The farm's Linux nodes are deployed by hostkeeper
+        timeout-minutes: 1
+        run: echo "::notice title=gamma::The farm's Linux nodes are deployed by hostkeeper, which hostkeeper-desired.yml tells after this workflow when the repository variable KBF_SETS_DESIRED is true. This job no longer sets kbf's update coordinator, and its other steps run only when that variable is true."
       - run: rustup toolchain install
         timeout-minutes: 10
-      # The token service's address and key are in the environment of every step of this job, the
-      # build's scripts included: the build runs from the locked dependency set, and the
-      # coordinator's allow-list (this workflow, on main, for `release`) and the hosts' own
-      # signature and hash checks bound what a token can do.
+        if: ${{ vars.KBF_SETS_DESIRED == 'true' }}
+      # The tailnet's address and key are in the environment of every later step of this job, the
+      # build's scripts included: the build runs from the locked dependency set.
       - run: cargo build -p xtask --locked
         timeout-minutes: 30
-      # The version the farm is told to converge on is the one its hosts report in their
-      # heartbeats, `<version>+g<12 hex digits of the commit>` (0.1.0+g0123456789ab), which the
-      # coordinator compares with the desired version and a host's installer finds the commit in.
-      # It is not the release's tag. It is read from the facts the linux build kept of itself
-      # (kbf-<commit>-linux-x86_64.version.json, a release asset), which must be the file the
-      # release's SHA256SUMS lists and the release build of this commit; the job fails here if
-      # the facts are missing or are not.
-      - name: The version the hosts will report, from this release's version facts
-        timeout-minutes: 5
-        id: farm-version
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.plan.outputs.tag }}
-        run: cargo xtask release farm-version --repo "$GITHUB_REPOSITORY" --tag "$TAG" --commit "$COMMIT" --output "$GITHUB_OUTPUT"
-      # When the coordinator is reachable only on a Tailscale network: join it, after the build
-      # (its scripts never see that network), as an ephemeral node. Tailscale's workload identity
+        if: ${{ vars.KBF_SETS_DESIRED == 'true' }}
+      # When the farm is reachable only on a Tailscale network: join it, after the build (its
+      # scripts never see that network), as an ephemeral node. Tailscale's workload identity
       # federation takes this run's OIDC token, so the job still holds no secret. The client id and
       # the audience are the variables TS_CLIENT_ID and TS_AUDIENCE, the trust credential CI jobs
-      # join the network with, as `tag:ci`. Both the deploy step and the remote-only build after it
-      # reach the farm over that network, so the job joins when TS_CLIENT_ID is set and either
-      # KBF_COORDINATOR_URL or FARM_ADDRESS is; with the deploy step off (no KBF_COORDINATOR_URL)
-      # the build still needs the network. With TS_CLIENT_ID unset, or neither address set (a fork,
-      # a repository with no farm or no network), the step is skipped and the verbs run as before.
+      # join the network with, as `tag:ci`. With TS_CLIENT_ID or FARM_ADDRESS unset (a fork, a
+      # repository with no farm or no network) the step is skipped.
       - name: Join the farm's Tailscale network
         timeout-minutes: 5
-        if: ${{ vars.TS_CLIENT_ID != '' && (vars.KBF_COORDINATOR_URL != '' || vars.FARM_ADDRESS != '') }}
+        if: ${{ vars.KBF_SETS_DESIRED == 'true' && vars.TS_CLIENT_ID != '' && vars.FARM_ADDRESS != '' }}
         uses: tailscale/github-action@d1b6cd204f8dceda5b3eaad7f1f767be390056cd # v4.2.0
         with:
           oauth-client-id: ${{ vars.TS_CLIENT_ID }}
           audience: ${{ vars.TS_AUDIENCE }}
           tags: tag:ci
-      # The version is the release's; the minimums default to 1 and are the farm's to raise. The
-      # deadline is given here, not left to the verb's default, because the job's timeout must
-      # leave room after it for the proof and the restore.
-      - name: Set this release as the farm's desired version, and wait for the farm to converge
-        timeout-minutes: 85
-        env:
-          COORDINATOR_URL: ${{ vars.KBF_COORDINATOR_URL }}
-          # The farm CA's certificate (public), which the coordinator's certificate chains to.
-          COORDINATOR_CA: ${{ vars.KBF_COORDINATOR_CA }}
-          VERSION: ${{ steps.farm-version.outputs.version }}
-          MIN_UP_STORAGE: ${{ vars.KBF_MIN_UP_STORAGE || '1' }}
-          MIN_UP_FRONTEND: ${{ vars.KBF_MIN_UP_FRONTEND || '1' }}
-          # `true`: fail before setting anything when the coordinator runs another commit than
-          # this release (docs/deploy/kbf-updater.md, "Updating the coordinator").
-          REQUIRE_CURRENT: ${{ vars.KBF_REQUIRE_COORDINATOR_CURRENT }}
-        run: cargo xtask deploy-farm --url "$COORDINATOR_URL" --ca-pem "$COORDINATOR_CA" --version "$VERSION" --deadline-min 60 --min-up-storage "$MIN_UP_STORAGE" --min-up-frontend "$MIN_UP_FRONTEND" --require-coordinator-current "$REQUIRE_CURRENT"
-      # The proof. The farm now runs this release; build a small project (four `/bin/sh -c`
-      # actions that depend on each other) against it with remote execution on and local off, and
-      # read Buck2's own count of the actions it ran: some remote, none local. The run id and
-      # attempt are an argument of every action, so none is answered from a cache. The farm's
-      # address, instance, TLS and platform properties are the organisation variables FARM_*;
-      # with FARM_ADDRESS unset the verb prints a notice and passes, as deploy-farm does.
+      # The proof. Build a small project (four `/bin/sh -c` actions that depend on each other)
+      # against the farm with remote execution on and local off, and read Buck2's own count of the
+      # actions it ran: some remote, none local. The run id and attempt are an argument of every
+      # action, so none is answered from a cache. The farm's address, instance, TLS and platform
+      # properties are the organisation variables FARM_*; with FARM_ADDRESS unset the verb prints a
+      # notice and passes.
       - name: Fetch buck2 (pinned version, checked by SHA-256)
         timeout-minutes: 5
+        if: ${{ vars.KBF_SETS_DESIRED == 'true' }}
         run: cargo xtask fetch --url "https://github.com/facebook/buck2/releases/download/$BUCK2_VERSION/buck2-x86_64-unknown-linux-gnu.zst" --sha256 "$BUCK2_SHA256" --out "$RUNNER_TEMP/tools/buck2" --extract zst
       - name: Prove the farm with a remote-only Buck2 build
         timeout-minutes: 20
+        if: ${{ vars.KBF_SETS_DESIRED == 'true' }}
         env:
           FARM_ADDRESS: ${{ vars.FARM_ADDRESS }}
           FARM_INSTANCE: ${{ vars.FARM_INSTANCE }}
@@ -665,19 +652,1203 @@ jobs:
           FARM_PROPERTIES: ${{ vars.FARM_LINUX_X86_64_PROPERTIES }}
           NONCE: ${{ github.run_id }}-${{ github.run_attempt }}
         run: cargo xtask prove-farm --address "$FARM_ADDRESS" --instance "$FARM_INSTANCE" --tls "$FARM_TLS" --properties "$FARM_PROPERTIES" --buck2 "$RUNNER_TEMP/tools/buck2" --project crates/kbf-integration-test/gamma/buck2 --nonce "$NONCE"
-      # When an earlier step of this job failed (the deploy was blocked, stalled, out of time or
-      # lost a host, or the proof failed): set the farm back to the version this release
-      # replaced, which the coordinator keeps, while this release is still the desired one. The
-      # write is conditional on the generation the step read, so it never overwrites another
-      # writer, and it exits 1, so the run stays red. A green job skips it; a cancelled one
-      # restores nothing, and the operator re-runs the failed jobs (docs/design/gamma-cicd.md,
-      # G1). It must stay the job's last step.
-      - name: Set the farm back to the version this release replaced, after a failed step
-        timeout-minutes: 30
-        if: ${{ failure() }}
+
+  # Builds the `xtask` binary that every apt read, index and write job runs. A job of its own so
+  # that the build, whose scripts run code from the locked dependency set, is in no job that holds
+  # `id-token: write` or the signing key.
+  deploy-tool:
+    needs: [plan]
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+      - run: rustup toolchain install
+      - run: cargo build -p xtask --locked --release
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: deploy-tool
+          path: target/release/xtask
+          if-no-files-found: error
+          retention-days: 1
+
+  # PUBLICATION, the apt repository of the organisation's products (packages.komira.ai/apt), suite
+  # `testing`: the release's two native .debs (`kbf-native-<commit>-linux-<platform>.deb`), signed
+  # into the pool pool/kbf/ and the index of the suite. The same three jobs, and up to three
+  # attempts, for each suite, and no job holds both the signing key and the cloud role. No job
+  # that holds one of them checks out the repository or compiles: each downloads the `xtask` that
+  # `deploy-tool` built, in a job with no token and no secret, and runs `tool/xtask channels ...`:
+  #   testing-apt-read   (environment apt-publish: the role, no key) reads the index of the suite
+  #                      with the ETag of each object, from S3, never through the CDN;
+  #   testing-apt-index  (environment apt-signing: the key, no role) checks the files against
+  #                      SHA256SUMS and each .deb against its bundle, merges the .debs into the
+  #                      index that was read (every other product's entries are kept) and signs
+  #                      Release;
+  #   testing-apt-write  (environment apt-publish) checks the files again, uploads each .deb once,
+  #                      then writes the signed index with If-Match on the ETags that were read.
+  # A write that finds the index changed in between (another product's release) reports
+  # conflict=true and ends green; attempt 2 (the jobs with the suffix -2), and then 3, read, merge
+  # and sign again, and the last one fails instead of asking for a fourth. A job without its
+  # settings (the variables of the environments apt-publish and apt-signing) ends green with a
+  # notice and writes nothing. The version of the package is the output `package-version` of
+  # `verify`, which read it from the two .debs.
+
+  testing-apt-read:
+    needs: [plan, publish, deploy-tool]
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: apt-publish
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      enabled: ${{ steps.gate.outputs.enabled }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: deploy-tool
+          path: tool
+      - name: Make the tool executable
+        run: chmod +x tool/xtask
+      - name: Gate on the settings of the apt repository, a job without them does nothing and ends green
+        id: gate
         env:
-          URL: ${{ vars.KBF_COORDINATOR_URL }}
-          CA_PEM: ${{ vars.KBF_COORDINATOR_CA }}
-          RELEASE: ${{ steps.farm-version.outputs.version }}
-          RUN: ${{ github.run_id }}-${{ github.run_attempt }}
-        run: cargo xtask deploy-farm restore --url "$URL" --ca-pem "$CA_PEM" --version "$RELEASE" --run "$RUN"
+          APT_PUBLISH_ROLE_ARN: ${{ vars.APT_PUBLISH_ROLE_ARN }}
+          APT_BUCKET: ${{ vars.APT_BUCKET }}
+          APT_DISTRIBUTION_ID: ${{ vars.APT_DISTRIBUTION_ID }}
+          APT_HOSTNAME: ${{ vars.APT_HOSTNAME }}
+        run: tool/xtask channels gate --label testing-apt-read --output "$GITHUB_OUTPUT" --setting "APT_PUBLISH_ROLE_ARN=$APT_PUBLISH_ROLE_ARN" --setting "APT_BUCKET=$APT_BUCKET" --setting "APT_DISTRIBUTION_ID=$APT_DISTRIBUTION_ID" --setting "APT_HOSTNAME=$APT_HOSTNAME"
+      - name: Assume the apt publish role through OIDC
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          ROLE_ARN: ${{ vars.APT_PUBLISH_ROLE_ARN }}
+        run: tool/xtask channels assume --role-arn "$ROLE_ARN" --session-name "kbf-testing-apt-read-$GITHUB_RUN_ID" --region us-east-1 --env-file "$GITHUB_ENV" --token-url "$ACTIONS_ID_TOKEN_REQUEST_URL"
+      - name: Read the current index and the ETag of each object from S3, never through the CDN, which caches the index
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          APT_BUCKET: ${{ vars.APT_BUCKET }}
+        run: tool/xtask channels apt read --suite testing --bucket "$APT_BUCKET" --out "$RUNNER_TEMP/apt-current"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        with:
+          name: apt-current
+          path: ${{ runner.temp }}/apt-current
+          if-no-files-found: error
+          retention-days: 1
+
+  testing-apt-index:
+    needs: [plan, verify, testing-apt-read, deploy-tool]
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: apt-signing
+    permissions:
+      contents: read
+    outputs:
+      enabled: ${{ steps.gate.outputs.enabled }}
+      signed: ${{ steps.sign.outputs.signed }}
+    env:
+      PACKAGE_VERSION: ${{ needs.verify.outputs.package-version }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: deploy-tool
+          path: tool
+      - name: Make the tool executable
+        run: chmod +x tool/xtask
+      - name: Gate on the signing key and on the read, a job without them does nothing and ends green
+        id: gate
+        env:
+          READ_ENABLED: ${{ needs.testing-apt-read.outputs.enabled }}
+          APT_GPG_FINGERPRINT: ${{ vars.APT_GPG_FINGERPRINT }}
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+          APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
+        run: tool/xtask channels gate --label testing-apt-index --output "$GITHUB_OUTPUT" --require "READ_ENABLED=$READ_ENABLED" --setting "APT_GPG_FINGERPRINT=$APT_GPG_FINGERPRINT" --secret APT_GPG_PRIVATE_KEY --secret APT_GPG_PASSPHRASE
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        with:
+          name: apt-current
+          path: ${{ runner.temp }}/apt-current
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        with:
+          name: release-assets
+          path: dist
+      - name: The files are exactly the assets of this run, and match SHA256SUMS
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        working-directory: dist
+        run: sha256sum --check --strict SHA256SUMS
+      - name: The amd64 .deb is the one artifacts.yml attested, from main at this commit (from its bundle)
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: gh attestation verify "dist/kbf-native-$COMMIT-linux-x86_64.deb" --bundle "dist/kbf-native-$COMMIT-linux-x86_64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT" --deny-self-hosted-runners
+      - name: The arm64 .deb is the one artifacts.yml attested, from main at this commit (from its bundle)
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: gh attestation verify "dist/kbf-native-$COMMIT-linux-arm64.deb" --bundle "dist/kbf-native-$COMMIT-linux-arm64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT" --deny-self-hosted-runners
+      - name: Merge the .debs into the index that was read, the entries of every other product are kept
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: tool/xtask channels apt index --suite testing --current "$RUNNER_TEMP/apt-current" --out "$RUNNER_TEMP/apt-next" --debs dist --commit "$COMMIT" --version "$PACKAGE_VERSION" --origin "$OWNER" --label "$OWNER" --description "$OWNER packages"
+      - name: Sign Release with the signing subkey, InRelease and Release.gpg, then remove the key
+        id: sign
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          APT_GPG_FINGERPRINT: ${{ vars.APT_GPG_FINGERPRINT }}
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+          APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
+        run: tool/xtask channels apt sign --dir "$RUNNER_TEMP/apt-next/dists/testing" --work "$RUNNER_TEMP/apt-sign" --fingerprint "$APT_GPG_FINGERPRINT" --key-env APT_GPG_PRIVATE_KEY --passphrase-env APT_GPG_PASSPHRASE --output "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        with:
+          name: apt-next
+          path: |
+            ${{ runner.temp }}/apt-next/dists
+            ${{ runner.temp }}/apt-next/etags.txt
+          if-no-files-found: error
+          retention-days: 1
+
+  testing-apt-write:
+    needs: [plan, verify, testing-apt-read, testing-apt-index, deploy-tool]
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: apt-publish
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      conflict: ${{ steps.put.outputs.conflict }}
+    env:
+      PACKAGE_VERSION: ${{ needs.verify.outputs.package-version }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: deploy-tool
+          path: tool
+      - name: Make the tool executable
+        run: chmod +x tool/xtask
+      - name: Gate on the settings of the apt repository and on the signed index, a job without them does nothing and ends green
+        id: gate
+        env:
+          READ_ENABLED: ${{ needs.testing-apt-read.outputs.enabled }}
+          INDEX_SIGNED: ${{ needs.testing-apt-index.outputs.signed }}
+          APT_PUBLISH_ROLE_ARN: ${{ vars.APT_PUBLISH_ROLE_ARN }}
+          APT_BUCKET: ${{ vars.APT_BUCKET }}
+          APT_DISTRIBUTION_ID: ${{ vars.APT_DISTRIBUTION_ID }}
+          APT_HOSTNAME: ${{ vars.APT_HOSTNAME }}
+        run: tool/xtask channels gate --label testing-apt-write --output "$GITHUB_OUTPUT" --require "READ_ENABLED=$READ_ENABLED" --require "INDEX_SIGNED=$INDEX_SIGNED" --setting "APT_PUBLISH_ROLE_ARN=$APT_PUBLISH_ROLE_ARN" --setting "APT_BUCKET=$APT_BUCKET" --setting "APT_DISTRIBUTION_ID=$APT_DISTRIBUTION_ID" --setting "APT_HOSTNAME=$APT_HOSTNAME"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        with:
+          name: apt-next
+          path: ${{ runner.temp }}/apt-next
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        with:
+          name: release-assets
+          path: dist
+      - name: The files are exactly the assets of this run, and match SHA256SUMS
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        working-directory: dist
+        run: sha256sum --check --strict SHA256SUMS
+      - name: The amd64 .deb is the one artifacts.yml attested, from main at this commit (from its bundle)
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: gh attestation verify "dist/kbf-native-$COMMIT-linux-x86_64.deb" --bundle "dist/kbf-native-$COMMIT-linux-x86_64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT" --deny-self-hosted-runners
+      - name: The arm64 .deb is the one artifacts.yml attested, from main at this commit (from its bundle)
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: gh attestation verify "dist/kbf-native-$COMMIT-linux-arm64.deb" --bundle "dist/kbf-native-$COMMIT-linux-arm64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT" --deny-self-hosted-runners
+      - name: Assume the apt publish role through OIDC
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          ROLE_ARN: ${{ vars.APT_PUBLISH_ROLE_ARN }}
+        run: tool/xtask channels assume --role-arn "$ROLE_ARN" --session-name "kbf-testing-apt-write-$GITHUB_RUN_ID" --region us-east-1 --env-file "$GITHUB_ENV" --token-url "$ACTIONS_ID_TOKEN_REQUEST_URL"
+      - name: Upload the .debs once each, then write the signed index with If-Match on the ETags that were read, then invalidate /apt/dists/*
+        id: put
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          APT_BUCKET: ${{ vars.APT_BUCKET }}
+          APT_DISTRIBUTION_ID: ${{ vars.APT_DISTRIBUTION_ID }}
+          APT_HOSTNAME: ${{ vars.APT_HOSTNAME }}
+        run: tool/xtask channels apt write --suite testing --bucket "$APT_BUCKET" --distribution-id "$APT_DISTRIBUTION_ID" --hostname "$APT_HOSTNAME" --next "$RUNNER_TEMP/apt-next" --debs dist --commit "$COMMIT" --version "$PACKAGE_VERSION" --output "$GITHUB_OUTPUT"
+
+  # Attempt 2: the write of attempt 1 lost the race for the index.
+
+  testing-apt-read-2:
+    needs: [plan, testing-apt-write, deploy-tool]
+    if: ${{ !cancelled() && !failure() && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' && needs.testing-apt-write.outputs.conflict == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: apt-publish
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      enabled: ${{ steps.gate.outputs.enabled }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: deploy-tool
+          path: tool
+      - name: Make the tool executable
+        run: chmod +x tool/xtask
+      - name: Gate on the settings of the apt repository, a job without them does nothing and ends green
+        id: gate
+        env:
+          APT_PUBLISH_ROLE_ARN: ${{ vars.APT_PUBLISH_ROLE_ARN }}
+          APT_BUCKET: ${{ vars.APT_BUCKET }}
+          APT_DISTRIBUTION_ID: ${{ vars.APT_DISTRIBUTION_ID }}
+          APT_HOSTNAME: ${{ vars.APT_HOSTNAME }}
+        run: tool/xtask channels gate --label testing-apt-read-2 --output "$GITHUB_OUTPUT" --setting "APT_PUBLISH_ROLE_ARN=$APT_PUBLISH_ROLE_ARN" --setting "APT_BUCKET=$APT_BUCKET" --setting "APT_DISTRIBUTION_ID=$APT_DISTRIBUTION_ID" --setting "APT_HOSTNAME=$APT_HOSTNAME"
+      - name: Assume the apt publish role through OIDC
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          ROLE_ARN: ${{ vars.APT_PUBLISH_ROLE_ARN }}
+        run: tool/xtask channels assume --role-arn "$ROLE_ARN" --session-name "kbf-testing-apt-read-2-$GITHUB_RUN_ID" --region us-east-1 --env-file "$GITHUB_ENV" --token-url "$ACTIONS_ID_TOKEN_REQUEST_URL"
+      - name: Read the current index and the ETag of each object from S3, never through the CDN, which caches the index
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          APT_BUCKET: ${{ vars.APT_BUCKET }}
+        run: tool/xtask channels apt read --suite testing --bucket "$APT_BUCKET" --out "$RUNNER_TEMP/apt-current"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        with:
+          name: apt-current-2
+          path: ${{ runner.temp }}/apt-current
+          if-no-files-found: error
+          retention-days: 1
+
+  testing-apt-index-2:
+    needs: [plan, verify, testing-apt-read-2, deploy-tool]
+    if: ${{ !cancelled() && !failure() && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' && needs.testing-apt-read-2.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: apt-signing
+    permissions:
+      contents: read
+    outputs:
+      enabled: ${{ steps.gate.outputs.enabled }}
+      signed: ${{ steps.sign.outputs.signed }}
+    env:
+      PACKAGE_VERSION: ${{ needs.verify.outputs.package-version }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: deploy-tool
+          path: tool
+      - name: Make the tool executable
+        run: chmod +x tool/xtask
+      - name: Gate on the signing key and on the read, a job without them does nothing and ends green
+        id: gate
+        env:
+          READ_ENABLED: ${{ needs.testing-apt-read-2.outputs.enabled }}
+          APT_GPG_FINGERPRINT: ${{ vars.APT_GPG_FINGERPRINT }}
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+          APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
+        run: tool/xtask channels gate --label testing-apt-index-2 --output "$GITHUB_OUTPUT" --require "READ_ENABLED=$READ_ENABLED" --setting "APT_GPG_FINGERPRINT=$APT_GPG_FINGERPRINT" --secret APT_GPG_PRIVATE_KEY --secret APT_GPG_PASSPHRASE
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        with:
+          name: apt-current-2
+          path: ${{ runner.temp }}/apt-current
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        with:
+          name: release-assets
+          path: dist
+      - name: The files are exactly the assets of this run, and match SHA256SUMS
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        working-directory: dist
+        run: sha256sum --check --strict SHA256SUMS
+      - name: The amd64 .deb is the one artifacts.yml attested, from main at this commit (from its bundle)
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: gh attestation verify "dist/kbf-native-$COMMIT-linux-x86_64.deb" --bundle "dist/kbf-native-$COMMIT-linux-x86_64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT" --deny-self-hosted-runners
+      - name: The arm64 .deb is the one artifacts.yml attested, from main at this commit (from its bundle)
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: gh attestation verify "dist/kbf-native-$COMMIT-linux-arm64.deb" --bundle "dist/kbf-native-$COMMIT-linux-arm64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT" --deny-self-hosted-runners
+      - name: Merge the .debs into the index that was read, the entries of every other product are kept
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: tool/xtask channels apt index --suite testing --current "$RUNNER_TEMP/apt-current" --out "$RUNNER_TEMP/apt-next" --debs dist --commit "$COMMIT" --version "$PACKAGE_VERSION" --origin "$OWNER" --label "$OWNER" --description "$OWNER packages"
+      - name: Sign Release with the signing subkey, InRelease and Release.gpg, then remove the key
+        id: sign
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          APT_GPG_FINGERPRINT: ${{ vars.APT_GPG_FINGERPRINT }}
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+          APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
+        run: tool/xtask channels apt sign --dir "$RUNNER_TEMP/apt-next/dists/testing" --work "$RUNNER_TEMP/apt-sign" --fingerprint "$APT_GPG_FINGERPRINT" --key-env APT_GPG_PRIVATE_KEY --passphrase-env APT_GPG_PASSPHRASE --output "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        with:
+          name: apt-next-2
+          path: |
+            ${{ runner.temp }}/apt-next/dists
+            ${{ runner.temp }}/apt-next/etags.txt
+          if-no-files-found: error
+          retention-days: 1
+
+  testing-apt-write-2:
+    needs: [plan, verify, testing-apt-read-2, testing-apt-index-2, deploy-tool]
+    if: ${{ !cancelled() && !failure() && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' && needs.testing-apt-read-2.result == 'success' && needs.testing-apt-index-2.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: apt-publish
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      conflict: ${{ steps.put.outputs.conflict }}
+    env:
+      PACKAGE_VERSION: ${{ needs.verify.outputs.package-version }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: deploy-tool
+          path: tool
+      - name: Make the tool executable
+        run: chmod +x tool/xtask
+      - name: Gate on the settings of the apt repository and on the signed index, a job without them does nothing and ends green
+        id: gate
+        env:
+          READ_ENABLED: ${{ needs.testing-apt-read-2.outputs.enabled }}
+          INDEX_SIGNED: ${{ needs.testing-apt-index-2.outputs.signed }}
+          APT_PUBLISH_ROLE_ARN: ${{ vars.APT_PUBLISH_ROLE_ARN }}
+          APT_BUCKET: ${{ vars.APT_BUCKET }}
+          APT_DISTRIBUTION_ID: ${{ vars.APT_DISTRIBUTION_ID }}
+          APT_HOSTNAME: ${{ vars.APT_HOSTNAME }}
+        run: tool/xtask channels gate --label testing-apt-write-2 --output "$GITHUB_OUTPUT" --require "READ_ENABLED=$READ_ENABLED" --require "INDEX_SIGNED=$INDEX_SIGNED" --setting "APT_PUBLISH_ROLE_ARN=$APT_PUBLISH_ROLE_ARN" --setting "APT_BUCKET=$APT_BUCKET" --setting "APT_DISTRIBUTION_ID=$APT_DISTRIBUTION_ID" --setting "APT_HOSTNAME=$APT_HOSTNAME"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        with:
+          name: apt-next-2
+          path: ${{ runner.temp }}/apt-next
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        with:
+          name: release-assets
+          path: dist
+      - name: The files are exactly the assets of this run, and match SHA256SUMS
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        working-directory: dist
+        run: sha256sum --check --strict SHA256SUMS
+      - name: The amd64 .deb is the one artifacts.yml attested, from main at this commit (from its bundle)
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: gh attestation verify "dist/kbf-native-$COMMIT-linux-x86_64.deb" --bundle "dist/kbf-native-$COMMIT-linux-x86_64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT" --deny-self-hosted-runners
+      - name: The arm64 .deb is the one artifacts.yml attested, from main at this commit (from its bundle)
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: gh attestation verify "dist/kbf-native-$COMMIT-linux-arm64.deb" --bundle "dist/kbf-native-$COMMIT-linux-arm64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT" --deny-self-hosted-runners
+      - name: Assume the apt publish role through OIDC
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          ROLE_ARN: ${{ vars.APT_PUBLISH_ROLE_ARN }}
+        run: tool/xtask channels assume --role-arn "$ROLE_ARN" --session-name "kbf-testing-apt-write-2-$GITHUB_RUN_ID" --region us-east-1 --env-file "$GITHUB_ENV" --token-url "$ACTIONS_ID_TOKEN_REQUEST_URL"
+      - name: Upload the .debs once each, then write the signed index with If-Match on the ETags that were read, then invalidate /apt/dists/*
+        id: put
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          APT_BUCKET: ${{ vars.APT_BUCKET }}
+          APT_DISTRIBUTION_ID: ${{ vars.APT_DISTRIBUTION_ID }}
+          APT_HOSTNAME: ${{ vars.APT_HOSTNAME }}
+        run: tool/xtask channels apt write --suite testing --bucket "$APT_BUCKET" --distribution-id "$APT_DISTRIBUTION_ID" --hostname "$APT_HOSTNAME" --next "$RUNNER_TEMP/apt-next" --debs dist --commit "$COMMIT" --version "$PACKAGE_VERSION" --output "$GITHUB_OUTPUT"
+
+  # Attempt 3: the write of attempt 2 lost the race for the index.
+
+  testing-apt-read-3:
+    needs: [plan, testing-apt-write-2, deploy-tool]
+    if: ${{ !cancelled() && !failure() && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' && needs.testing-apt-write-2.outputs.conflict == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: apt-publish
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      enabled: ${{ steps.gate.outputs.enabled }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: deploy-tool
+          path: tool
+      - name: Make the tool executable
+        run: chmod +x tool/xtask
+      - name: Gate on the settings of the apt repository, a job without them does nothing and ends green
+        id: gate
+        env:
+          APT_PUBLISH_ROLE_ARN: ${{ vars.APT_PUBLISH_ROLE_ARN }}
+          APT_BUCKET: ${{ vars.APT_BUCKET }}
+          APT_DISTRIBUTION_ID: ${{ vars.APT_DISTRIBUTION_ID }}
+          APT_HOSTNAME: ${{ vars.APT_HOSTNAME }}
+        run: tool/xtask channels gate --label testing-apt-read-3 --output "$GITHUB_OUTPUT" --setting "APT_PUBLISH_ROLE_ARN=$APT_PUBLISH_ROLE_ARN" --setting "APT_BUCKET=$APT_BUCKET" --setting "APT_DISTRIBUTION_ID=$APT_DISTRIBUTION_ID" --setting "APT_HOSTNAME=$APT_HOSTNAME"
+      - name: Assume the apt publish role through OIDC
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          ROLE_ARN: ${{ vars.APT_PUBLISH_ROLE_ARN }}
+        run: tool/xtask channels assume --role-arn "$ROLE_ARN" --session-name "kbf-testing-apt-read-3-$GITHUB_RUN_ID" --region us-east-1 --env-file "$GITHUB_ENV" --token-url "$ACTIONS_ID_TOKEN_REQUEST_URL"
+      - name: Read the current index and the ETag of each object from S3, never through the CDN, which caches the index
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          APT_BUCKET: ${{ vars.APT_BUCKET }}
+        run: tool/xtask channels apt read --suite testing --bucket "$APT_BUCKET" --out "$RUNNER_TEMP/apt-current"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        with:
+          name: apt-current-3
+          path: ${{ runner.temp }}/apt-current
+          if-no-files-found: error
+          retention-days: 1
+
+  testing-apt-index-3:
+    needs: [plan, verify, testing-apt-read-3, deploy-tool]
+    if: ${{ !cancelled() && !failure() && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' && needs.testing-apt-read-3.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: apt-signing
+    permissions:
+      contents: read
+    outputs:
+      enabled: ${{ steps.gate.outputs.enabled }}
+      signed: ${{ steps.sign.outputs.signed }}
+    env:
+      PACKAGE_VERSION: ${{ needs.verify.outputs.package-version }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: deploy-tool
+          path: tool
+      - name: Make the tool executable
+        run: chmod +x tool/xtask
+      - name: Gate on the signing key and on the read, a job without them does nothing and ends green
+        id: gate
+        env:
+          READ_ENABLED: ${{ needs.testing-apt-read-3.outputs.enabled }}
+          APT_GPG_FINGERPRINT: ${{ vars.APT_GPG_FINGERPRINT }}
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+          APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
+        run: tool/xtask channels gate --label testing-apt-index-3 --output "$GITHUB_OUTPUT" --require "READ_ENABLED=$READ_ENABLED" --setting "APT_GPG_FINGERPRINT=$APT_GPG_FINGERPRINT" --secret APT_GPG_PRIVATE_KEY --secret APT_GPG_PASSPHRASE
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        with:
+          name: apt-current-3
+          path: ${{ runner.temp }}/apt-current
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        with:
+          name: release-assets
+          path: dist
+      - name: The files are exactly the assets of this run, and match SHA256SUMS
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        working-directory: dist
+        run: sha256sum --check --strict SHA256SUMS
+      - name: The amd64 .deb is the one artifacts.yml attested, from main at this commit (from its bundle)
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: gh attestation verify "dist/kbf-native-$COMMIT-linux-x86_64.deb" --bundle "dist/kbf-native-$COMMIT-linux-x86_64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT" --deny-self-hosted-runners
+      - name: The arm64 .deb is the one artifacts.yml attested, from main at this commit (from its bundle)
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: gh attestation verify "dist/kbf-native-$COMMIT-linux-arm64.deb" --bundle "dist/kbf-native-$COMMIT-linux-arm64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT" --deny-self-hosted-runners
+      - name: Merge the .debs into the index that was read, the entries of every other product are kept
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: tool/xtask channels apt index --suite testing --current "$RUNNER_TEMP/apt-current" --out "$RUNNER_TEMP/apt-next" --debs dist --commit "$COMMIT" --version "$PACKAGE_VERSION" --origin "$OWNER" --label "$OWNER" --description "$OWNER packages"
+      - name: Sign Release with the signing subkey, InRelease and Release.gpg, then remove the key
+        id: sign
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          APT_GPG_FINGERPRINT: ${{ vars.APT_GPG_FINGERPRINT }}
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+          APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
+        run: tool/xtask channels apt sign --dir "$RUNNER_TEMP/apt-next/dists/testing" --work "$RUNNER_TEMP/apt-sign" --fingerprint "$APT_GPG_FINGERPRINT" --key-env APT_GPG_PRIVATE_KEY --passphrase-env APT_GPG_PASSPHRASE --output "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        with:
+          name: apt-next-3
+          path: |
+            ${{ runner.temp }}/apt-next/dists
+            ${{ runner.temp }}/apt-next/etags.txt
+          if-no-files-found: error
+          retention-days: 1
+
+  testing-apt-write-3:
+    needs: [plan, verify, testing-apt-read-3, testing-apt-index-3, deploy-tool]
+    if: ${{ !cancelled() && !failure() && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' && needs.testing-apt-read-3.result == 'success' && needs.testing-apt-index-3.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: apt-publish
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      conflict: ${{ steps.put.outputs.conflict }}
+    env:
+      PACKAGE_VERSION: ${{ needs.verify.outputs.package-version }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: deploy-tool
+          path: tool
+      - name: Make the tool executable
+        run: chmod +x tool/xtask
+      - name: Gate on the settings of the apt repository and on the signed index, a job without them does nothing and ends green
+        id: gate
+        env:
+          READ_ENABLED: ${{ needs.testing-apt-read-3.outputs.enabled }}
+          INDEX_SIGNED: ${{ needs.testing-apt-index-3.outputs.signed }}
+          APT_PUBLISH_ROLE_ARN: ${{ vars.APT_PUBLISH_ROLE_ARN }}
+          APT_BUCKET: ${{ vars.APT_BUCKET }}
+          APT_DISTRIBUTION_ID: ${{ vars.APT_DISTRIBUTION_ID }}
+          APT_HOSTNAME: ${{ vars.APT_HOSTNAME }}
+        run: tool/xtask channels gate --label testing-apt-write-3 --output "$GITHUB_OUTPUT" --require "READ_ENABLED=$READ_ENABLED" --require "INDEX_SIGNED=$INDEX_SIGNED" --setting "APT_PUBLISH_ROLE_ARN=$APT_PUBLISH_ROLE_ARN" --setting "APT_BUCKET=$APT_BUCKET" --setting "APT_DISTRIBUTION_ID=$APT_DISTRIBUTION_ID" --setting "APT_HOSTNAME=$APT_HOSTNAME"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        with:
+          name: apt-next-3
+          path: ${{ runner.temp }}/apt-next
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        with:
+          name: release-assets
+          path: dist
+      - name: The files are exactly the assets of this run, and match SHA256SUMS
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        working-directory: dist
+        run: sha256sum --check --strict SHA256SUMS
+      - name: The amd64 .deb is the one artifacts.yml attested, from main at this commit (from its bundle)
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: gh attestation verify "dist/kbf-native-$COMMIT-linux-x86_64.deb" --bundle "dist/kbf-native-$COMMIT-linux-x86_64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT" --deny-self-hosted-runners
+      - name: The arm64 .deb is the one artifacts.yml attested, from main at this commit (from its bundle)
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: gh attestation verify "dist/kbf-native-$COMMIT-linux-arm64.deb" --bundle "dist/kbf-native-$COMMIT-linux-arm64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT" --deny-self-hosted-runners
+      - name: Assume the apt publish role through OIDC
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          ROLE_ARN: ${{ vars.APT_PUBLISH_ROLE_ARN }}
+        run: tool/xtask channels assume --role-arn "$ROLE_ARN" --session-name "kbf-testing-apt-write-3-$GITHUB_RUN_ID" --region us-east-1 --env-file "$GITHUB_ENV" --token-url "$ACTIONS_ID_TOKEN_REQUEST_URL"
+      - name: Upload the .debs once each, then write the signed index with If-Match on the ETags that were read, then invalidate /apt/dists/*
+        id: put
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          APT_BUCKET: ${{ vars.APT_BUCKET }}
+          APT_DISTRIBUTION_ID: ${{ vars.APT_DISTRIBUTION_ID }}
+          APT_HOSTNAME: ${{ vars.APT_HOSTNAME }}
+        run: tool/xtask channels apt write --suite testing --bucket "$APT_BUCKET" --distribution-id "$APT_DISTRIBUTION_ID" --hostname "$APT_HOSTNAME" --next "$RUNNER_TEMP/apt-next" --debs dist --commit "$COMMIT" --version "$PACKAGE_VERSION" --last --output "$GITHUB_OUTPUT"
+
+  # INSTALL CHECK (release time only; a failure stops the promotion before anything is made public
+  # to the hosts). check-apt-amd64 and check-apt-arm64: a clean Ubuntu container, pinned by digest,
+  # on a hosted runner of its architecture, adds packages.komira.ai with the published keyring and
+  # the suite `testing`, installs kbf=<version>, and holds the installed system to what the package
+  # promises (`xtask channels check-apt`). The two are separate jobs because this repository's
+  # workflow lint refuses an expression in `runs-on`. The xtask binary built on the runner, which
+  # holds no token, is mounted into the container, which has nothing else of this repository. They
+  # run only when a write of testing landed.
+  check-apt-amd64:
+    needs: [plan, verify, testing-apt-write, testing-apt-write-2, testing-apt-write-3]
+    if: ${{ !cancelled() && !failure() && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' && (needs.testing-apt-write.outputs.conflict == 'false' || needs.testing-apt-write-2.outputs.conflict == 'false' || needs.testing-apt-write-3.outputs.conflict == 'false') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      PACKAGE_VERSION: ${{ needs.verify.outputs.package-version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+      - run: rustup toolchain install
+      - run: cargo build -p xtask --locked
+      - name: Install kbf from the suite testing in a clean Ubuntu container
+        run: docker run --rm --volume "$PWD/target/debug/xtask:/usr/local/bin/xtask:ro" ubuntu@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852 xtask channels check-apt --arch amd64 --version "$PACKAGE_VERSION" --commit "$COMMIT"
+
+  check-apt-arm64:
+    needs: [plan, verify, testing-apt-write, testing-apt-write-2, testing-apt-write-3]
+    if: ${{ !cancelled() && !failure() && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' && (needs.testing-apt-write.outputs.conflict == 'false' || needs.testing-apt-write-2.outputs.conflict == 'false' || needs.testing-apt-write-3.outputs.conflict == 'false') }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      PACKAGE_VERSION: ${{ needs.verify.outputs.package-version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+      - run: rustup toolchain install
+      - run: cargo build -p xtask --locked
+      - name: Install kbf from the suite testing in a clean Ubuntu container
+        run: docker run --rm --volume "$PWD/target/debug/xtask:/usr/local/bin/xtask:ro" ubuntu@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852 xtask channels check-apt --arch arm64 --version "$PACKAGE_VERSION" --commit "$COMMIT"
+
+  # PROMOTION, the apt repository: the same three jobs for the suite `stable`, after both install
+  # checks succeeded (a failed or skipped check promotes nothing). The read job reads the index of
+  # testing and of stable; the index job lists the entries of this release that testing holds in
+  # the index of stable (`channels apt promote`: held to the digests of SHA256SUMS, every other
+  # product's entries kept, an older version or other bytes at the same version refused); the
+  # write job writes the index with If-Match (`apt write --no-pool`: the packages are in the pool
+  # already, none is uploaded). They run only when testing-apt-read had its settings.
+
+  stable-apt-read:
+    needs: [plan, check-apt-amd64, check-apt-arm64, testing-apt-read, deploy-tool]
+    if: ${{ !cancelled() && !failure() && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' && needs.check-apt-amd64.result == 'success' && needs.check-apt-arm64.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: apt-publish
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      enabled: ${{ steps.gate.outputs.enabled }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: deploy-tool
+          path: tool
+      - name: Make the tool executable
+        run: chmod +x tool/xtask
+      - name: Gate on the settings of the apt repository, a job without them does nothing and ends green
+        id: gate
+        env:
+          TESTING_ENABLED: ${{ needs.testing-apt-read.outputs.enabled }}
+          APT_PUBLISH_ROLE_ARN: ${{ vars.APT_PUBLISH_ROLE_ARN }}
+          APT_BUCKET: ${{ vars.APT_BUCKET }}
+          APT_DISTRIBUTION_ID: ${{ vars.APT_DISTRIBUTION_ID }}
+          APT_HOSTNAME: ${{ vars.APT_HOSTNAME }}
+        run: tool/xtask channels gate --label stable-apt-read --output "$GITHUB_OUTPUT" --require "TESTING_ENABLED=$TESTING_ENABLED" --setting "APT_PUBLISH_ROLE_ARN=$APT_PUBLISH_ROLE_ARN" --setting "APT_BUCKET=$APT_BUCKET" --setting "APT_DISTRIBUTION_ID=$APT_DISTRIBUTION_ID" --setting "APT_HOSTNAME=$APT_HOSTNAME"
+      - name: Assume the apt publish role through OIDC
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          ROLE_ARN: ${{ vars.APT_PUBLISH_ROLE_ARN }}
+        run: tool/xtask channels assume --role-arn "$ROLE_ARN" --session-name "kbf-stable-apt-read-$GITHUB_RUN_ID" --region us-east-1 --env-file "$GITHUB_ENV" --token-url "$ACTIONS_ID_TOKEN_REQUEST_URL"
+      - name: Read the index of testing, what is promoted, with the ETag of each object, from S3
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          APT_BUCKET: ${{ vars.APT_BUCKET }}
+        run: tool/xtask channels apt read --suite testing --bucket "$APT_BUCKET" --out "$RUNNER_TEMP/apt-read/testing"
+      - name: Read the index of stable, what it is merged into, with the ETag of each object, from S3
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          APT_BUCKET: ${{ vars.APT_BUCKET }}
+        run: tool/xtask channels apt read --suite stable --bucket "$APT_BUCKET" --out "$RUNNER_TEMP/apt-read/stable"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        with:
+          name: apt-read
+          path: ${{ runner.temp }}/apt-read
+          if-no-files-found: error
+          retention-days: 1
+
+  stable-apt-index:
+    needs: [plan, verify, check-apt-amd64, check-apt-arm64, stable-apt-read, testing-apt-index, deploy-tool]
+    if: ${{ !cancelled() && !failure() && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' && needs.check-apt-amd64.result == 'success' && needs.check-apt-arm64.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: apt-signing
+    permissions:
+      contents: read
+    outputs:
+      enabled: ${{ steps.gate.outputs.enabled }}
+      signed: ${{ steps.sign.outputs.signed }}
+    env:
+      PACKAGE_VERSION: ${{ needs.verify.outputs.package-version }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: deploy-tool
+          path: tool
+      - name: Make the tool executable
+        run: chmod +x tool/xtask
+      - name: Gate on the signing key and on the read, a job without them does nothing and ends green
+        id: gate
+        env:
+          READ_ENABLED: ${{ needs.stable-apt-read.outputs.enabled }}
+          APT_GPG_FINGERPRINT: ${{ vars.APT_GPG_FINGERPRINT }}
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+          APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
+        run: tool/xtask channels gate --label stable-apt-index --output "$GITHUB_OUTPUT" --require "READ_ENABLED=$READ_ENABLED" --setting "APT_GPG_FINGERPRINT=$APT_GPG_FINGERPRINT" --secret APT_GPG_PRIVATE_KEY --secret APT_GPG_PASSPHRASE
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        with:
+          name: apt-read
+          path: ${{ runner.temp }}/apt-read
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        with:
+          name: release-assets
+          path: dist
+      - name: The files are exactly the assets of this run, and match SHA256SUMS
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        working-directory: dist
+        run: sha256sum --check --strict SHA256SUMS
+      - name: The amd64 .deb is the one artifacts.yml attested, from main at this commit (from its bundle)
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: gh attestation verify "dist/kbf-native-$COMMIT-linux-x86_64.deb" --bundle "dist/kbf-native-$COMMIT-linux-x86_64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT" --deny-self-hosted-runners
+      - name: The arm64 .deb is the one artifacts.yml attested, from main at this commit (from its bundle)
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: gh attestation verify "dist/kbf-native-$COMMIT-linux-arm64.deb" --bundle "dist/kbf-native-$COMMIT-linux-arm64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT" --deny-self-hosted-runners
+      - name: Promote the entries of this release that testing lists into the index of stable, held to the digests of SHA256SUMS, the entries of every other product are kept
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: tool/xtask channels apt promote --testing "$RUNNER_TEMP/apt-read/testing" --stable "$RUNNER_TEMP/apt-read/stable" --out "$RUNNER_TEMP/apt-next" --version "$PACKAGE_VERSION" --sums dist/SHA256SUMS --commit "$COMMIT" --origin "$OWNER" --label "$OWNER" --description "$OWNER packages"
+      - name: Sign Release with the signing subkey, InRelease and Release.gpg, then remove the key
+        id: sign
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          APT_GPG_FINGERPRINT: ${{ vars.APT_GPG_FINGERPRINT }}
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+          APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
+        run: tool/xtask channels apt sign --dir "$RUNNER_TEMP/apt-next/dists/stable" --work "$RUNNER_TEMP/apt-sign" --fingerprint "$APT_GPG_FINGERPRINT" --key-env APT_GPG_PRIVATE_KEY --passphrase-env APT_GPG_PASSPHRASE --output "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        with:
+          name: apt-promoted
+          path: |
+            ${{ runner.temp }}/apt-next/dists
+            ${{ runner.temp }}/apt-next/etags.txt
+          if-no-files-found: error
+          retention-days: 1
+
+  stable-apt-write:
+    needs: [plan, check-apt-amd64, check-apt-arm64, stable-apt-read, stable-apt-index, testing-apt-write, deploy-tool]
+    if: ${{ !cancelled() && !failure() && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' && needs.check-apt-amd64.result == 'success' && needs.check-apt-arm64.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: apt-publish
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      conflict: ${{ steps.put.outputs.conflict }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: deploy-tool
+          path: tool
+      - name: Make the tool executable
+        run: chmod +x tool/xtask
+      - name: Gate on the settings of the apt repository and on the signed index, a job without them does nothing and ends green
+        id: gate
+        env:
+          READ_ENABLED: ${{ needs.stable-apt-read.outputs.enabled }}
+          INDEX_SIGNED: ${{ needs.stable-apt-index.outputs.signed }}
+          APT_PUBLISH_ROLE_ARN: ${{ vars.APT_PUBLISH_ROLE_ARN }}
+          APT_BUCKET: ${{ vars.APT_BUCKET }}
+          APT_DISTRIBUTION_ID: ${{ vars.APT_DISTRIBUTION_ID }}
+          APT_HOSTNAME: ${{ vars.APT_HOSTNAME }}
+        run: tool/xtask channels gate --label stable-apt-write --output "$GITHUB_OUTPUT" --require "READ_ENABLED=$READ_ENABLED" --require "INDEX_SIGNED=$INDEX_SIGNED" --setting "APT_PUBLISH_ROLE_ARN=$APT_PUBLISH_ROLE_ARN" --setting "APT_BUCKET=$APT_BUCKET" --setting "APT_DISTRIBUTION_ID=$APT_DISTRIBUTION_ID" --setting "APT_HOSTNAME=$APT_HOSTNAME"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        with:
+          name: apt-promoted
+          path: ${{ runner.temp }}/apt-next
+      - name: Assume the apt publish role through OIDC
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          ROLE_ARN: ${{ vars.APT_PUBLISH_ROLE_ARN }}
+        run: tool/xtask channels assume --role-arn "$ROLE_ARN" --session-name "kbf-stable-apt-write-$GITHUB_RUN_ID" --region us-east-1 --env-file "$GITHUB_ENV" --token-url "$ACTIONS_ID_TOKEN_REQUEST_URL"
+      - name: Write the signed index of stable with If-Match on the ETags that were read, the packages are in the pool already, then invalidate /apt/dists/*
+        id: put
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          APT_BUCKET: ${{ vars.APT_BUCKET }}
+          APT_DISTRIBUTION_ID: ${{ vars.APT_DISTRIBUTION_ID }}
+          APT_HOSTNAME: ${{ vars.APT_HOSTNAME }}
+        run: tool/xtask channels apt write --suite stable --bucket "$APT_BUCKET" --distribution-id "$APT_DISTRIBUTION_ID" --hostname "$APT_HOSTNAME" --next "$RUNNER_TEMP/apt-next" --no-pool --output "$GITHUB_OUTPUT"
+
+  # Attempt 2: the write of attempt 1 lost the race for the index.
+
+  stable-apt-read-2:
+    needs: [plan, stable-apt-write, deploy-tool]
+    if: ${{ !cancelled() && !failure() && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' && needs.stable-apt-write.outputs.conflict == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: apt-publish
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      enabled: ${{ steps.gate.outputs.enabled }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: deploy-tool
+          path: tool
+      - name: Make the tool executable
+        run: chmod +x tool/xtask
+      - name: Gate on the settings of the apt repository, a job without them does nothing and ends green
+        id: gate
+        env:
+          APT_PUBLISH_ROLE_ARN: ${{ vars.APT_PUBLISH_ROLE_ARN }}
+          APT_BUCKET: ${{ vars.APT_BUCKET }}
+          APT_DISTRIBUTION_ID: ${{ vars.APT_DISTRIBUTION_ID }}
+          APT_HOSTNAME: ${{ vars.APT_HOSTNAME }}
+        run: tool/xtask channels gate --label stable-apt-read-2 --output "$GITHUB_OUTPUT" --setting "APT_PUBLISH_ROLE_ARN=$APT_PUBLISH_ROLE_ARN" --setting "APT_BUCKET=$APT_BUCKET" --setting "APT_DISTRIBUTION_ID=$APT_DISTRIBUTION_ID" --setting "APT_HOSTNAME=$APT_HOSTNAME"
+      - name: Assume the apt publish role through OIDC
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          ROLE_ARN: ${{ vars.APT_PUBLISH_ROLE_ARN }}
+        run: tool/xtask channels assume --role-arn "$ROLE_ARN" --session-name "kbf-stable-apt-read-2-$GITHUB_RUN_ID" --region us-east-1 --env-file "$GITHUB_ENV" --token-url "$ACTIONS_ID_TOKEN_REQUEST_URL"
+      - name: Read the index of testing, what is promoted, with the ETag of each object, from S3
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          APT_BUCKET: ${{ vars.APT_BUCKET }}
+        run: tool/xtask channels apt read --suite testing --bucket "$APT_BUCKET" --out "$RUNNER_TEMP/apt-read/testing"
+      - name: Read the index of stable, what it is merged into, with the ETag of each object, from S3
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          APT_BUCKET: ${{ vars.APT_BUCKET }}
+        run: tool/xtask channels apt read --suite stable --bucket "$APT_BUCKET" --out "$RUNNER_TEMP/apt-read/stable"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        with:
+          name: apt-read-2
+          path: ${{ runner.temp }}/apt-read
+          if-no-files-found: error
+          retention-days: 1
+
+  stable-apt-index-2:
+    needs: [plan, verify, stable-apt-read-2, deploy-tool]
+    if: ${{ !cancelled() && !failure() && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' && needs.stable-apt-read-2.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: apt-signing
+    permissions:
+      contents: read
+    outputs:
+      enabled: ${{ steps.gate.outputs.enabled }}
+      signed: ${{ steps.sign.outputs.signed }}
+    env:
+      PACKAGE_VERSION: ${{ needs.verify.outputs.package-version }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: deploy-tool
+          path: tool
+      - name: Make the tool executable
+        run: chmod +x tool/xtask
+      - name: Gate on the signing key and on the read, a job without them does nothing and ends green
+        id: gate
+        env:
+          READ_ENABLED: ${{ needs.stable-apt-read-2.outputs.enabled }}
+          APT_GPG_FINGERPRINT: ${{ vars.APT_GPG_FINGERPRINT }}
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+          APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
+        run: tool/xtask channels gate --label stable-apt-index-2 --output "$GITHUB_OUTPUT" --require "READ_ENABLED=$READ_ENABLED" --setting "APT_GPG_FINGERPRINT=$APT_GPG_FINGERPRINT" --secret APT_GPG_PRIVATE_KEY --secret APT_GPG_PASSPHRASE
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        with:
+          name: apt-read-2
+          path: ${{ runner.temp }}/apt-read
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        with:
+          name: release-assets
+          path: dist
+      - name: The files are exactly the assets of this run, and match SHA256SUMS
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        working-directory: dist
+        run: sha256sum --check --strict SHA256SUMS
+      - name: The amd64 .deb is the one artifacts.yml attested, from main at this commit (from its bundle)
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: gh attestation verify "dist/kbf-native-$COMMIT-linux-x86_64.deb" --bundle "dist/kbf-native-$COMMIT-linux-x86_64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT" --deny-self-hosted-runners
+      - name: The arm64 .deb is the one artifacts.yml attested, from main at this commit (from its bundle)
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: gh attestation verify "dist/kbf-native-$COMMIT-linux-arm64.deb" --bundle "dist/kbf-native-$COMMIT-linux-arm64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT" --deny-self-hosted-runners
+      - name: Promote the entries of this release that testing lists into the index of stable, held to the digests of SHA256SUMS, the entries of every other product are kept
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: tool/xtask channels apt promote --testing "$RUNNER_TEMP/apt-read/testing" --stable "$RUNNER_TEMP/apt-read/stable" --out "$RUNNER_TEMP/apt-next" --version "$PACKAGE_VERSION" --sums dist/SHA256SUMS --commit "$COMMIT" --origin "$OWNER" --label "$OWNER" --description "$OWNER packages"
+      - name: Sign Release with the signing subkey, InRelease and Release.gpg, then remove the key
+        id: sign
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          APT_GPG_FINGERPRINT: ${{ vars.APT_GPG_FINGERPRINT }}
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+          APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
+        run: tool/xtask channels apt sign --dir "$RUNNER_TEMP/apt-next/dists/stable" --work "$RUNNER_TEMP/apt-sign" --fingerprint "$APT_GPG_FINGERPRINT" --key-env APT_GPG_PRIVATE_KEY --passphrase-env APT_GPG_PASSPHRASE --output "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        with:
+          name: apt-promoted-2
+          path: |
+            ${{ runner.temp }}/apt-next/dists
+            ${{ runner.temp }}/apt-next/etags.txt
+          if-no-files-found: error
+          retention-days: 1
+
+  stable-apt-write-2:
+    needs: [plan, stable-apt-read-2, stable-apt-index-2, deploy-tool]
+    if: ${{ !cancelled() && !failure() && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' && needs.stable-apt-read-2.result == 'success' && needs.stable-apt-index-2.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: apt-publish
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      conflict: ${{ steps.put.outputs.conflict }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: deploy-tool
+          path: tool
+      - name: Make the tool executable
+        run: chmod +x tool/xtask
+      - name: Gate on the settings of the apt repository and on the signed index, a job without them does nothing and ends green
+        id: gate
+        env:
+          READ_ENABLED: ${{ needs.stable-apt-read-2.outputs.enabled }}
+          INDEX_SIGNED: ${{ needs.stable-apt-index-2.outputs.signed }}
+          APT_PUBLISH_ROLE_ARN: ${{ vars.APT_PUBLISH_ROLE_ARN }}
+          APT_BUCKET: ${{ vars.APT_BUCKET }}
+          APT_DISTRIBUTION_ID: ${{ vars.APT_DISTRIBUTION_ID }}
+          APT_HOSTNAME: ${{ vars.APT_HOSTNAME }}
+        run: tool/xtask channels gate --label stable-apt-write-2 --output "$GITHUB_OUTPUT" --require "READ_ENABLED=$READ_ENABLED" --require "INDEX_SIGNED=$INDEX_SIGNED" --setting "APT_PUBLISH_ROLE_ARN=$APT_PUBLISH_ROLE_ARN" --setting "APT_BUCKET=$APT_BUCKET" --setting "APT_DISTRIBUTION_ID=$APT_DISTRIBUTION_ID" --setting "APT_HOSTNAME=$APT_HOSTNAME"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        with:
+          name: apt-promoted-2
+          path: ${{ runner.temp }}/apt-next
+      - name: Assume the apt publish role through OIDC
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          ROLE_ARN: ${{ vars.APT_PUBLISH_ROLE_ARN }}
+        run: tool/xtask channels assume --role-arn "$ROLE_ARN" --session-name "kbf-stable-apt-write-2-$GITHUB_RUN_ID" --region us-east-1 --env-file "$GITHUB_ENV" --token-url "$ACTIONS_ID_TOKEN_REQUEST_URL"
+      - name: Write the signed index of stable with If-Match on the ETags that were read, the packages are in the pool already, then invalidate /apt/dists/*
+        id: put
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          APT_BUCKET: ${{ vars.APT_BUCKET }}
+          APT_DISTRIBUTION_ID: ${{ vars.APT_DISTRIBUTION_ID }}
+          APT_HOSTNAME: ${{ vars.APT_HOSTNAME }}
+        run: tool/xtask channels apt write --suite stable --bucket "$APT_BUCKET" --distribution-id "$APT_DISTRIBUTION_ID" --hostname "$APT_HOSTNAME" --next "$RUNNER_TEMP/apt-next" --no-pool --output "$GITHUB_OUTPUT"
+
+  # Attempt 3: the write of attempt 2 lost the race for the index.
+
+  stable-apt-read-3:
+    needs: [plan, stable-apt-write-2, deploy-tool]
+    if: ${{ !cancelled() && !failure() && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' && needs.stable-apt-write-2.outputs.conflict == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: apt-publish
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      enabled: ${{ steps.gate.outputs.enabled }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: deploy-tool
+          path: tool
+      - name: Make the tool executable
+        run: chmod +x tool/xtask
+      - name: Gate on the settings of the apt repository, a job without them does nothing and ends green
+        id: gate
+        env:
+          APT_PUBLISH_ROLE_ARN: ${{ vars.APT_PUBLISH_ROLE_ARN }}
+          APT_BUCKET: ${{ vars.APT_BUCKET }}
+          APT_DISTRIBUTION_ID: ${{ vars.APT_DISTRIBUTION_ID }}
+          APT_HOSTNAME: ${{ vars.APT_HOSTNAME }}
+        run: tool/xtask channels gate --label stable-apt-read-3 --output "$GITHUB_OUTPUT" --setting "APT_PUBLISH_ROLE_ARN=$APT_PUBLISH_ROLE_ARN" --setting "APT_BUCKET=$APT_BUCKET" --setting "APT_DISTRIBUTION_ID=$APT_DISTRIBUTION_ID" --setting "APT_HOSTNAME=$APT_HOSTNAME"
+      - name: Assume the apt publish role through OIDC
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          ROLE_ARN: ${{ vars.APT_PUBLISH_ROLE_ARN }}
+        run: tool/xtask channels assume --role-arn "$ROLE_ARN" --session-name "kbf-stable-apt-read-3-$GITHUB_RUN_ID" --region us-east-1 --env-file "$GITHUB_ENV" --token-url "$ACTIONS_ID_TOKEN_REQUEST_URL"
+      - name: Read the index of testing, what is promoted, with the ETag of each object, from S3
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          APT_BUCKET: ${{ vars.APT_BUCKET }}
+        run: tool/xtask channels apt read --suite testing --bucket "$APT_BUCKET" --out "$RUNNER_TEMP/apt-read/testing"
+      - name: Read the index of stable, what it is merged into, with the ETag of each object, from S3
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          APT_BUCKET: ${{ vars.APT_BUCKET }}
+        run: tool/xtask channels apt read --suite stable --bucket "$APT_BUCKET" --out "$RUNNER_TEMP/apt-read/stable"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        with:
+          name: apt-read-3
+          path: ${{ runner.temp }}/apt-read
+          if-no-files-found: error
+          retention-days: 1
+
+  stable-apt-index-3:
+    needs: [plan, verify, stable-apt-read-3, deploy-tool]
+    if: ${{ !cancelled() && !failure() && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' && needs.stable-apt-read-3.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: apt-signing
+    permissions:
+      contents: read
+    outputs:
+      enabled: ${{ steps.gate.outputs.enabled }}
+      signed: ${{ steps.sign.outputs.signed }}
+    env:
+      PACKAGE_VERSION: ${{ needs.verify.outputs.package-version }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: deploy-tool
+          path: tool
+      - name: Make the tool executable
+        run: chmod +x tool/xtask
+      - name: Gate on the signing key and on the read, a job without them does nothing and ends green
+        id: gate
+        env:
+          READ_ENABLED: ${{ needs.stable-apt-read-3.outputs.enabled }}
+          APT_GPG_FINGERPRINT: ${{ vars.APT_GPG_FINGERPRINT }}
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+          APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
+        run: tool/xtask channels gate --label stable-apt-index-3 --output "$GITHUB_OUTPUT" --require "READ_ENABLED=$READ_ENABLED" --setting "APT_GPG_FINGERPRINT=$APT_GPG_FINGERPRINT" --secret APT_GPG_PRIVATE_KEY --secret APT_GPG_PASSPHRASE
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        with:
+          name: apt-read-3
+          path: ${{ runner.temp }}/apt-read
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        with:
+          name: release-assets
+          path: dist
+      - name: The files are exactly the assets of this run, and match SHA256SUMS
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        working-directory: dist
+        run: sha256sum --check --strict SHA256SUMS
+      - name: The amd64 .deb is the one artifacts.yml attested, from main at this commit (from its bundle)
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: gh attestation verify "dist/kbf-native-$COMMIT-linux-x86_64.deb" --bundle "dist/kbf-native-$COMMIT-linux-x86_64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT" --deny-self-hosted-runners
+      - name: The arm64 .deb is the one artifacts.yml attested, from main at this commit (from its bundle)
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: gh attestation verify "dist/kbf-native-$COMMIT-linux-arm64.deb" --bundle "dist/kbf-native-$COMMIT-linux-arm64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT" --deny-self-hosted-runners
+      - name: Promote the entries of this release that testing lists into the index of stable, held to the digests of SHA256SUMS, the entries of every other product are kept
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: tool/xtask channels apt promote --testing "$RUNNER_TEMP/apt-read/testing" --stable "$RUNNER_TEMP/apt-read/stable" --out "$RUNNER_TEMP/apt-next" --version "$PACKAGE_VERSION" --sums dist/SHA256SUMS --commit "$COMMIT" --origin "$OWNER" --label "$OWNER" --description "$OWNER packages"
+      - name: Sign Release with the signing subkey, InRelease and Release.gpg, then remove the key
+        id: sign
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          APT_GPG_FINGERPRINT: ${{ vars.APT_GPG_FINGERPRINT }}
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+          APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
+        run: tool/xtask channels apt sign --dir "$RUNNER_TEMP/apt-next/dists/stable" --work "$RUNNER_TEMP/apt-sign" --fingerprint "$APT_GPG_FINGERPRINT" --key-env APT_GPG_PRIVATE_KEY --passphrase-env APT_GPG_PASSPHRASE --output "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        with:
+          name: apt-promoted-3
+          path: |
+            ${{ runner.temp }}/apt-next/dists
+            ${{ runner.temp }}/apt-next/etags.txt
+          if-no-files-found: error
+          retention-days: 1
+
+  stable-apt-write-3:
+    needs: [plan, stable-apt-read-3, stable-apt-index-3, deploy-tool]
+    if: ${{ !cancelled() && !failure() && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' && needs.stable-apt-read-3.result == 'success' && needs.stable-apt-index-3.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: apt-publish
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      conflict: ${{ steps.put.outputs.conflict }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: deploy-tool
+          path: tool
+      - name: Make the tool executable
+        run: chmod +x tool/xtask
+      - name: Gate on the settings of the apt repository and on the signed index, a job without them does nothing and ends green
+        id: gate
+        env:
+          READ_ENABLED: ${{ needs.stable-apt-read-3.outputs.enabled }}
+          INDEX_SIGNED: ${{ needs.stable-apt-index-3.outputs.signed }}
+          APT_PUBLISH_ROLE_ARN: ${{ vars.APT_PUBLISH_ROLE_ARN }}
+          APT_BUCKET: ${{ vars.APT_BUCKET }}
+          APT_DISTRIBUTION_ID: ${{ vars.APT_DISTRIBUTION_ID }}
+          APT_HOSTNAME: ${{ vars.APT_HOSTNAME }}
+        run: tool/xtask channels gate --label stable-apt-write-3 --output "$GITHUB_OUTPUT" --require "READ_ENABLED=$READ_ENABLED" --require "INDEX_SIGNED=$INDEX_SIGNED" --setting "APT_PUBLISH_ROLE_ARN=$APT_PUBLISH_ROLE_ARN" --setting "APT_BUCKET=$APT_BUCKET" --setting "APT_DISTRIBUTION_ID=$APT_DISTRIBUTION_ID" --setting "APT_HOSTNAME=$APT_HOSTNAME"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        with:
+          name: apt-promoted-3
+          path: ${{ runner.temp }}/apt-next
+      - name: Assume the apt publish role through OIDC
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          ROLE_ARN: ${{ vars.APT_PUBLISH_ROLE_ARN }}
+        run: tool/xtask channels assume --role-arn "$ROLE_ARN" --session-name "kbf-stable-apt-write-3-$GITHUB_RUN_ID" --region us-east-1 --env-file "$GITHUB_ENV" --token-url "$ACTIONS_ID_TOKEN_REQUEST_URL"
+      - name: Write the signed index of stable with If-Match on the ETags that were read, the packages are in the pool already, then invalidate /apt/dists/*
+        id: put
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          APT_BUCKET: ${{ vars.APT_BUCKET }}
+          APT_DISTRIBUTION_ID: ${{ vars.APT_DISTRIBUTION_ID }}
+          APT_HOSTNAME: ${{ vars.APT_HOSTNAME }}
+        run: tool/xtask channels apt write --suite stable --bucket "$APT_BUCKET" --distribution-id "$APT_DISTRIBUTION_ID" --hostname "$APT_HOSTNAME" --next "$RUNNER_TEMP/apt-next" --no-pool --last --output "$GITHUB_OUTPUT"

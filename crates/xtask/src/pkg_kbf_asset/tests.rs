@@ -120,6 +120,8 @@ struct Fix {
     extra: Vec<(String, u32, Vec<u8>)>,
     /// The links of the data tarball (path, target).
     links: Vec<(String, String)>,
+    /// The native package: no host agent files, no links.
+    native: bool,
 }
 
 impl Fix {
@@ -140,6 +142,17 @@ impl Fix {
             drop: None,
             extra: Vec::new(),
             links: agent_links(),
+            native: false,
+        }
+    }
+
+    /// The native package at `version`: the files of a good deb less the host agent.
+    fn native(version: &'static str) -> Fix {
+        Fix {
+            version,
+            links: Vec::new(),
+            native: true,
+            ..Fix::new()
         }
     }
 
@@ -169,7 +182,12 @@ impl Fix {
         let control_tgz = tgz(&[("control", 0o644, control.as_bytes())]);
         let binary = "usr/bin/kbf".to_owned();
         let mut files = vec![(binary, self.kbf_mode, self.kbf.as_slice())];
-        for unit in KBF_UNITS.into_iter().chain([SLICE]).chain(AGENT_UNITS) {
+        let agent: &[&str] = if self.native { &[] } else { &AGENT_UNITS };
+        for unit in KBF_UNITS
+            .into_iter()
+            .chain([SLICE])
+            .chain(agent.iter().copied())
+        {
             files.push((in_units(unit), self.unit_mode, unit.as_bytes()));
         }
         for (path, text) in [
@@ -178,6 +196,9 @@ impl Fix {
             ("usr/lib/tmpfiles.d/kbf.conf", "d /x"),
             ("etc/needrestart/conf.d/kbf.conf", "# n"),
         ] {
+            if self.native && path.ends_with("kbf-updater.conf") {
+                continue;
+            }
             files.push((path.to_owned(), self.unit_mode, text.as_bytes()));
         }
         files.push((
@@ -227,6 +248,8 @@ fn check(platform: Platform, tarball: &Path) -> Check<'_> {
         kbf_tarball: tarball,
         expect_ref: MAIN,
         gh: None,
+        native: false,
+        native_version: None,
     }
 }
 
@@ -744,7 +767,152 @@ fn a_commit_that_is_not_one_a_mac_and_an_absent_tarball_are_errors_not_findings(
     let err = problems(&fix.deb(), &absent).expect_err("no tarball");
     assert!(!matches!(err, Error::Refused(_)), "{err:?}");
     assert_eq!(
-        file_name(COMMIT, Platform::LinuxArm64),
+        file_name(COMMIT, Platform::LinuxArm64, false),
         format!("kbf-{COMMIT}-linux-arm64.deb")
+    );
+}
+
+/// The native checks over the deb of `fix`, with the version `want` the `kbf` names.
+fn native_found(name: &str, fix: &Fix, want: Option<&str>) -> Vec<String> {
+    let (_, deb, tarball) = world(name, fix, &Fix::new().kbf, Platform::LinuxX86_64);
+    let c = Check {
+        native: true,
+        native_version: want,
+        ..check(Platform::LinuxX86_64, &tarball)
+    };
+    problems(&std::fs::read(&deb).expect("deb"), &c).expect("problems")
+}
+
+/// Asserts that the native package (the files of the kbf deb without the host agent, at a version
+/// of three numbers) is accepted as `kbf-native-<commit>-<platform>.deb` for both platforms, with
+/// its digest in the sums file, and that the asset verb run again on the asset itself verifies.
+#[test]
+fn the_native_package_is_accepted_as_the_native_asset() {
+    for (platform, arch) in [
+        (Platform::LinuxX86_64, "amd64"),
+        (Platform::LinuxArm64, "arm64"),
+    ] {
+        let mut fix = Fix::native("0.1.7472");
+        fix.arch = arch;
+        let (dir, deb, tarball) = world("native-good", &fix, &fix.kbf, platform);
+        let out = dir.join("dist");
+        let c = Check {
+            native: true,
+            native_version: Some("0.1.7472"),
+            ..check(platform, &tarball)
+        };
+        let printed = asset(&deb, COMMIT, &Mode::Add(&out), &c).expect("asset");
+        let name = format!("kbf-native-{COMMIT}-{}.deb", platform.name());
+        let bytes = std::fs::read(&deb).expect("deb");
+        assert_eq!(std::fs::read(out.join(&name)).expect("asset"), bytes);
+        let line = format!("{}  {name}\n", Sha256::of(&bytes));
+        let sums = out.join(format!("SHA256SUMS.{}", platform.name()));
+        assert_eq!(std::fs::read_to_string(sums).expect("sums"), line);
+        assert_eq!(
+            printed,
+            vec![format!("packaged {name}:"), line.trim_end().to_owned()]
+        );
+        let printed = asset(&out.join(&name), COMMIT, &Mode::VerifyOnly, &c).expect("verify");
+        assert_eq!(
+            printed,
+            vec![format!(
+                "{name}: a native {} package of the kbf in {}, trusting {MAIN}",
+                platform.name(),
+                tarball.display()
+            )]
+        );
+    }
+    assert_eq!(
+        file_name(COMMIT, Platform::LinuxArm64, true),
+        format!("kbf-native-{COMMIT}-linux-arm64.deb")
+    );
+}
+
+/// Asserts that a native package that holds the host agent (the units, the account, the links)
+/// is refused file by file, and that the kbf deb with no host agent is refused as the kbf deb.
+#[test]
+fn the_native_package_holds_no_host_agent_and_the_kbf_deb_must() {
+    let mut fix = Fix::new();
+    fix.version = "0.1.7472";
+    let got = native_found("native-agent", &fix, Some("0.1.7472"));
+    let mut want: Vec<String> = AGENT_UNITS
+        .iter()
+        .flat_map(|u| {
+            [
+                format!("holds {}, which the kbf package does not ship", in_units(u)),
+                format!(
+                    "holds the link usr/lib/systemd/system/multi-user.target.wants/{u} -> ../{u}, which the kbf package does not ship"
+                ),
+            ]
+        })
+        .chain(["holds usr/lib/sysusers.d/kbf-updater.conf, which the kbf package does not ship".to_owned()])
+        .collect();
+    want.sort();
+    let mut got = got;
+    got.sort();
+    assert_eq!(got, want);
+    let got = found("kbf-deb-without-agent", &Fix::native(VERSION));
+    assert!(
+        got.iter()
+            .any(|p| p.starts_with("holds no usr/lib/systemd/system/kbf-host-local.service")),
+        "{got:?}"
+    );
+    assert!(
+        got.iter().any(|p| p.starts_with("holds no link ")),
+        "{got:?}"
+    );
+}
+
+/// Asserts that the native package's `Version` must be three numbers (a `+commit`, a `~` or a
+/// revision is refused) and, when the kbf is given, that kbf's native version.
+#[test]
+fn the_native_version_must_be_three_numbers_and_the_kbfs() {
+    assert_eq!(
+        native_found("native-v-ok", &Fix::native("0.1.7472"), None),
+        Vec::<String>::new()
+    );
+    for bad in [
+        "0.1.0+0123456789ab",
+        "0.1",
+        "0.1.7~rc1",
+        "0.1.7-1",
+        "0.1.x",
+        "0..1",
+        "",
+    ] {
+        let got = native_found("native-v-bad", &Fix::native(bad), None);
+        assert_eq!(
+            got,
+            [format!(
+                "control says Version {bad:?}, not <major>.<minor>.<seq> (three numbers, no `+`, `~` or revision)"
+            )],
+            "{bad}"
+        );
+    }
+    let got = native_found("native-v-other", &Fix::native("0.1.7472"), Some("0.1.7473"));
+    assert_eq!(
+        got,
+        [
+            "control says Version \"0.1.7472\", not \"0.1.7473\", the native version of the kbf it carries"
+        ]
+    );
+    let fix = Fix::native("0.1.7472");
+    let (_, _, tarball) = world("native-v-none", &fix, &fix.kbf, Platform::LinuxX86_64);
+    // A control file with no Version line at all (the ar is rebuilt without it).
+    let control = tgz(&[("control", 0o644, b"Package: kbf\nArchitecture: amd64\n")]);
+    let data = tgz(&[]);
+    let nothing = ar(&[
+        ("debian-binary", b"2.0\n"),
+        ("control.tar.gz", &control),
+        ("data.tar.gz", &data),
+    ]);
+    let c = Check {
+        native: true,
+        ..check(Platform::LinuxX86_64, &tarball)
+    };
+    let got = problems(&nothing, &c).expect("problems");
+    assert!(
+        got.contains(&"control says Version \"(none)\", not <major>.<minor>.<seq> (three numbers, no `+`, `~` or revision)".to_owned()),
+        "{got:?}"
     );
 }

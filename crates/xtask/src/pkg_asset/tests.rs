@@ -339,6 +339,62 @@ fn the_version_is_what_the_program_says_after_its_name_and_nothing_else() {
     }
 }
 
+/// Asserts the native version is `<major>.<minor>.<seq>`: the workspace version's first two
+/// numbers and the build's commit count, and that a version of any other shape is refused.
+#[test]
+fn the_native_version_is_major_minor_and_the_commit_count() {
+    assert_eq!(native_version("0.1.0", 7472).expect("v"), "0.1.7472");
+    assert_eq!(native_version("2.10.3", 0).expect("v"), "2.10.0");
+    assert_eq!(native_version("01.2.3", 5).expect("v"), "1.2.5");
+    for bad in [
+        "",
+        "0.1",
+        "0.1.7.rc",
+        "0.1.x",
+        "0..1",
+        "-1.2.3",
+        "1.2.+3",
+        "0.1.0+abc",
+        "0.1.0-rc1",
+        "99999999999999999999.1.0",
+    ] {
+        let err = native_version(bad, 1).expect_err(bad);
+        assert_eq!(
+            err.to_string(),
+            format!("version {bad:?} is not three dot-separated decimal numbers"),
+            "{bad}"
+        );
+    }
+}
+
+/// Asserts the native version is read from the `version` and `seq` of `--version --json`, and
+/// that output that is not a JSON object, lacks either field or has them of the wrong type is
+/// refused with what is wrong.
+#[test]
+fn the_native_version_is_read_from_the_identity_json() {
+    let ok = r#"{"version":"0.1.0","commit":"0123456789ab","seq":7472,"profile":"release"}"#;
+    assert_eq!(native_version_in(ok).expect("v"), "0.1.7472");
+    for (json, says) in [
+        ("not json", "not a JSON object: not json"),
+        ("[1]", "no string field \"version\": [1]"),
+        (r#"{"seq":1}"#, "no string field \"version\""),
+        (r#"{"version":1,"seq":1}"#, "no string field \"version\""),
+        (r#"{"version":"0.1.0"}"#, "no number field \"seq\""),
+        (
+            r#"{"version":"0.1.0","seq":"7"}"#,
+            "no number field \"seq\"",
+        ),
+        (r#"{"version":"0.1.0","seq":-1}"#, "no number field \"seq\""),
+        (
+            r#"{"version":"0.1","seq":1}"#,
+            "version \"0.1\" is not three dot-separated decimal numbers",
+        ),
+    ] {
+        let err = native_version_in(json).expect_err(json).to_string();
+        assert!(err.contains(says), "{json}: {err}");
+    }
+}
+
 /// An `ar` header of 60 bytes with `size` as its size field and `end` as its terminator.
 fn raw_ar(size: &str, end: &str) -> Vec<u8> {
     let mut out = b"!<arch>\n".to_vec();
@@ -470,6 +526,10 @@ fn a_program_that_does_not_run_and_a_truncated_header_are_errors_not_findings() 
     // for a refusal of the package (or a panic).
     let dir = scratch("absent");
     assert!(binary_version(&dir.join("none")).is_err());
+    assert!(binary_native_version(&dir.join("none")).is_err());
+    // A program that exits with failure names no version, whatever it printed.
+    let err = binary_native_version(Path::new("/usr/bin/false")).expect_err("false");
+    assert_eq!(err.to_string(), "/usr/bin/false --version --json failed");
     let empty = dir.join("empty");
     std::fs::create_dir(&empty).expect("dir");
     assert!(sole(&empty, "deb").is_err());

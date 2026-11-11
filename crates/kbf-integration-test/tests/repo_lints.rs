@@ -85,6 +85,7 @@ mod beta_pins;
 mod beta_succeeds;
 mod coverage_wiring;
 mod gamma_cicd_doc;
+mod hostkeeper_desired;
 mod interpreters;
 mod kbf_spawns;
 mod macos_pr;

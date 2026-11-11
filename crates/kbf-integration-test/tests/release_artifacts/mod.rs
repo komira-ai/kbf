@@ -719,6 +719,7 @@ fn the_docs_describe_the_release_set() {
     for platform in PACKAGES {
         for file in [
             format!("`kbf-<commit>-{platform}.deb`"),
+            format!("`kbf-native-<commit>-{platform}.deb`"),
             format!("`kbf-frontend-image-<commit>-{platform}.oci.tar`"),
             format!("`kbf-coordinator-image-<commit>-{platform}.oci.tar`"),
             format!("`kbf-task-image-<commit>-{platform}.oci.tar`"),
@@ -782,20 +783,6 @@ mod rules {
     /// build it, as the Linux jobs have them.
     fn kbf_build_steps() -> String {
         "      - name: Config\n        run: cargo xtask pkg-config --kbf \"target/$TARGET/release/kbf\" --units u --trust t --sysusers s --tmpfiles f --platform p --version 0.0.0+ci --out target/pkg\n      - name: Build kbf\n        run: cargo xtask pkg-build --nfpm n --config target/pkg/nfpm.yaml --out target/pkg/out\n".to_owned()
-    }
-
-    /// The step that makes the `kbf` deb of `platform` an asset.
-    fn kbf_asset_step(platform: &str) -> String {
-        format!(
-            "      - name: Kbf asset\n        run: cargo xtask pkg-kbf-asset --package target/pkg/out --platform {platform} --commit \"$GITHUB_SHA\" --kbf-tarball \"dist/kbf-$GITHUB_SHA-{platform}.tar.gz\" --expect-ref \"$PKG_SOURCE_REF\" --gh \"$RUNNER_TEMP/tools/gh\" --out dist\n"
-        )
-    }
-
-    /// The verify job's check of the signed `kbf` deb of `platform`.
-    fn verify_kbf_package_step(platform: &str) -> String {
-        format!(
-            "      - name: Kbf package {platform}\n        run: cargo xtask pkg-kbf-asset --verify-only --package \"dist/kbf-$GITHUB_SHA-{platform}.deb\" --platform {platform} --commit \"$GITHUB_SHA\" --kbf-tarball \"dist/kbf-$GITHUB_SHA-{platform}.tar.gz\" --expect-ref \"$GITHUB_REF\"\n"
-        )
     }
 
     /// The steps that build the frontend image of `platform` from the job's kbf tarball, twice,
@@ -988,6 +975,7 @@ mod rules {
                 w.push_str(&kbf_build_steps());
                 w.push_str(&package_steps());
                 w.push_str(&kbf_asset_step(platform));
+                w.push_str(&native_steps(platform));
                 w.push_str(&image_steps(platform));
                 w.push_str(&coordinator_steps(platform));
                 w.push_str(&task_steps(platform));
@@ -1010,6 +998,7 @@ mod rules {
             if platform == "linux" {
                 for p in PACKAGES {
                     w.push_str(&verify_kbf_package_step(p));
+                    w.push_str(&verify_native_step(p));
                     w.push_str(&verify_image_step(p));
                     w.push_str(&verify_coordinator_step(p));
                     w.push_str(&verify_task_step(p));
@@ -1906,9 +1895,14 @@ mod rules {
         }
     }
 
+    mod deb_steps;
     mod image_sbom_tests;
     mod images_tests;
     mod kbf_package_tests;
+    use deb_steps::{
+        kbf_asset_step, native_asset_step, native_config_and_build, native_steps,
+        verify_kbf_package_step, verify_native_step,
+    };
 }
 
 mod facts;

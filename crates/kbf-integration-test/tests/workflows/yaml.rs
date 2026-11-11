@@ -116,8 +116,29 @@ fn refuse_tag(tag: Option<&Tag>, span: Span) -> Result<(), String> {
     }
 }
 
-/// Parses `text` as exactly one YAML document.
+thread_local! {
+    /// The last text parsed and its tree: a lint reads one text many times over.
+    static LAST: std::cell::RefCell<Option<(String, Result<Node, String>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Parses `text` as exactly one YAML document. The last text parsed on this thread is kept, so
+/// reading it again costs a copy of the tree, not a parse.
 pub fn load(text: &str) -> Result<Node, String> {
+    if let Some(found) = LAST.with(|l| {
+        l.borrow()
+            .as_ref()
+            .filter(|(t, _)| t == text)
+            .map(|(_, r)| r.clone())
+    }) {
+        return found;
+    }
+    let parsed = parse(text);
+    LAST.with(|l| *l.borrow_mut() = Some((text.to_owned(), parsed.clone())));
+    parsed
+}
+
+fn parse(text: &str) -> Result<Node, String> {
     let mut anchors: BTreeMap<usize, Node> = BTreeMap::new();
     let mut stack: Vec<Open> = Vec::new();
     let mut docs: Vec<Node> = Vec::new();
