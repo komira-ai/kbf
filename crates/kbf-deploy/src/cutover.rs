@@ -51,10 +51,11 @@ pub(crate) const KEYS: [&str; 8] = [
 ];
 
 /// The keys of `--executor js-agent` the switch does not set and the file must already hold.
-const KEPT: [&str; 3] = [
+const KEPT: [&str; 4] = [
     "executor-frontend-id",
     "executor-base-image",
     "executor-kbf-image",
+    "executor-base-tree",
 ];
 
 /// The job service and the virtual workers: the flags `plan` and `apply` share.

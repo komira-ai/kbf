@@ -32,7 +32,8 @@ The switch sets exactly these keys and leaves every other line of the file as it
 | `executor-host-slots` | the actions each virtual worker runs at once (default 8) |
 
 The rest of what `js-agent` needs must be in the file already, and the switch does not write
-it: `executor-frontend-id`, `executor-base-image`, `executor-kbf-image`, the secret delivery
+it: `executor-frontend-id`, `executor-base-image`, `executor-kbf-image`, `executor-base-tree`
+(the directory of the release's base tree bundles, below), the secret delivery
 (`executor-secret-delivery = "files"`, or `executor-insecure-argv-secrets = true` for the
 default `argv`), the packs (`--pack-store-endpoint`), the task runs and the job-facing read
 listener. `plan` names the `[executor]` keys that are missing, and `apply` checks the whole
@@ -61,6 +62,65 @@ each part is set up:
    placed. The check does not need one (an empty list passes), but every job a frontend submits
    waits in the queue until one is there. Each agent also needs the egress below, or no job of
    kbf's is placed on it.
+
+## The kbf base tree
+
+A job's root file system is a tree in the object store, built over the kbf base tree of the
+release the frontend runs: the base image flattened, with that release's `kbf-task` as
+`/.kbf-tools/kbf-task`. The release builds it as a bundle for each Linux platform; the frontend
+publishes it itself, at its start, and no workflow or operator writes the store for it
+([the design](../design/actions-as-jobs.md), 3.3).
+
+**What must be in place before a frontend is switched:**
+
+- the directory `executor-base-tree` names holds the release's `SHA256SUMS` and the bundles
+  `kbf-base-tree-<commit>-linux-x86_64.tree.tar` and `kbf-base-tree-<commit>-linux-arm64.tree.tar`
+  of the commit the frontend's binary was built from, installed with that release. The
+  switch does not write the key: `plan` names it as missing, and `apply`'s `kbf --check` and the
+  first start refuse a file without it;
+- the frontend's pack store credentials (`--pack-store-credentials-file`) may write below
+  `cas/l/` of the packs bucket, create-only. The frontend already writes there (a large blob a task
+  reads is copied to it), so a frontend that runs today needs nothing more.
+
+**What the start does.** Under `--executor js-agent`, after the pack store's create-only check and
+before the executor is spawned, the frontend reads the bundle of `linux-` and `executor-arch`
+(`x86_64` or `arm64`) and checks it against `SHA256SUMS`. It writes each object the store does not
+hold to `cas/l/<sha256>` (one length check each; an object already there is held, and a key that
+another writer takes meanwhile is held too), the root manifest last, and logs one line:
+`published the kbf base tree` with the root digest, the numbers written and held, and the tree's
+entries and depth. A second release on the same base image writes three objects: its `kbf-task`,
+its `.kbf-tools` manifest and its root manifest. Under `--executor kbf-daemon` nothing is read or
+written, so the key may stay in the file for the rollback.
+
+**How it fails**, each time by name, with `--executor-base-tree:` first on the line the frontend
+exits with, and before any job is submitted:
+
+| the start says | what to do |
+|---|---|
+| the bundle `kbf-base-tree-<commit>-linux-<arch>.tree.tar` is missing | the release has no bundle for `executor-arch`, or the package that installed it is not this binary's: reinstall the release |
+| `<SHA256SUMS>` does not list it, lists it twice, has a line that is not `<sha256>  <name>`, or is missing | the directory is not a release's: reinstall |
+| its SHA-256 is not the listed one | the file changed after the release was made: reinstall |
+| the bundle is of another commit or platform, or is not a bundle | the same |
+| the store holds `<key>` at another length | an object of `cas/l/` that is not the content its key names: look at that key, and do not delete it by hand without knowing who wrote it |
+| the store failed the length check or the write of `<key>` | the cause is the store's: the pack store flags and credentials |
+| this build does not know its commit | a binary built without git (`kbf --version --json` has no `commit_full`) has no bundle to name |
+| the root holds a name an action tree keeps (`work`, `.kbf`, `.kbf-run`) | the release's base image is wrong: the release build refuses it, so this is not a bundle of a release |
+| the state store failed `job-tree/<root>` | the cause is the state store's |
+
+Objects written before a failure stay in the store: they are named by their content and nothing
+names them.
+
+**The record.** With `--state-store`, the start then writes the row `job-tree/<root sha256 in
+hex>`, `{"release":"<commit>","first_published_ms":<milliseconds since the Unix epoch>}`, create-only:
+the first publish of a tree stays the first, whichever release publishes it again. A frontend
+without a state store writes no row. A release that does not know the family never reads it (no
+scan of the state store has `job-tree/` in its prefix), so a rollback to an older release loses
+nothing.
+
+**Backing out republishes nothing and deletes nothing.** `kbf-deploy job-service back-out` returns
+the frontend to `kbf-daemon`, which does not read the key and the bundles. The objects under
+`cas/l/` and the `job-tree/` rows stay: nothing collects `cas/l/` yet, and a later cutover to a
+release republishes its own tree, finding most objects held.
 
 ## The farm agents' egress
 
@@ -263,6 +323,7 @@ kept from the file (the executor needs them):
   executor-frontend-id = "fe-a"
   executor-base-image = "registry.example/kbf-base@sha256:bbbb...bbbb"
   executor-kbf-image = "registry.example/kbf@sha256:aaaa...aaaa"
+  executor-base-tree = "/opt/kbf/base-tree"
   executor-secret-delivery = "files"
 back-out: the flags of the mode it runs now:
   --executor=kbf-daemon (the default: the file has no key)

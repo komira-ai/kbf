@@ -61,6 +61,7 @@ const INSECURE: &str = "executor_insecure_argv_secrets";
 const DELIVERY: &str = "executor_secret_delivery";
 const BASE_IMAGE: &str = "executor_base_image";
 const KBF_IMAGE: &str = "executor_kbf_image";
+const BASE_TREE: &str = "executor_base_tree";
 const MARGIN: &str = "executor_run_margin_secs";
 const MAX_RUN: &str = "executor_max_run_secs";
 const DEFAULT_TIMEOUT: &str = "executor_default_timeout_secs";
@@ -69,7 +70,7 @@ const NETWORK: &str = "executor_network";
 const OPEN_NETWORK: &str = "executor_allow_open_network";
 
 /// The flags a `js-agent` executor cannot do without, in the order their absence is named.
-const REQUIRED: [(&str, &str); 8] = [
+const REQUIRED: [(&str, &str); 9] = [
     (JOB_URL, "--executor-job-url"),
     (TOKEN_FILE, "--executor-job-token-file"),
     (FRONTEND, "--executor-frontend-id"),
@@ -78,6 +79,7 @@ const REQUIRED: [(&str, &str); 8] = [
     (MEMORY_GIB, "--executor-host-memory-gib"),
     (BASE_IMAGE, "--executor-base-image"),
     (KBF_IMAGE, "--executor-kbf-image"),
+    (BASE_TREE, "--executor-base-tree"),
 ];
 
 fn text(id: &'static str, long: &'static str, value_name: &'static str, help: &'static str) -> Arg {
@@ -130,7 +132,8 @@ pub(super) fn args() -> Vec<Arg> {
                  (`--executor-job-url`, `--executor-job-token-file`, and \
                  `--executor-job-ca-file` for https), the virtual workers' \
                  (`--executor-hosts`, `--executor-host-cpus`, `--executor-host-memory-gib`), \
-                 `--executor-frontend-id`, the packs (`--pack-store-endpoint`) and the secret \
+                 `--executor-frontend-id`, the release's base tree bundles \
+                 (`--executor-base-tree`), the packs (`--pack-store-endpoint`) and the secret \
                  delivery (`--executor-secret-delivery`, with \
                  `--executor-insecure-argv-secrets` for its default `argv`). The executor runs \
                  on exactly one frontend: a second frontend that has jobs on the same job \
@@ -291,6 +294,22 @@ pub(super) fn args() -> Vec<Arg> {
              the job's arguments are the tool's flags and the action runs inside this image. \
              Must be another image than the base. Needed with `--executor js-agent`",
         ),
+        Arg::new(BASE_TREE)
+            .long("executor-base-tree")
+            .value_name("DIR")
+            .value_parser(clap::value_parser!(PathBuf))
+            .help(
+                "The directory holding the release's `SHA256SUMS` and its \
+                 `kbf-base-tree-<commit>-linux-<arch>.tree.tar` bundles, one per platform (the \
+                 release installs them beside the frontend). At its start the frontend checks \
+                 the bundle of `--executor-arch` against `SHA256SUMS` and writes the objects of \
+                 the kbf base tree that the pack store lacks to `cas/l/`, create-only, so the \
+                 pack store credentials must be allowed to write there; it then records the \
+                 tree as `job-tree/<digest>` in `--state-store` if there is one. A bundle that \
+                 is missing, not listed or not the listed bytes, or a write that fails, fails \
+                 the start, naming this flag. Needed with `--executor js-agent`; with \
+                 `--executor kbf-daemon` nothing is read or written",
+            ),
         number(
             MARGIN,
             "executor-run-margin-secs",
@@ -367,6 +386,9 @@ pub struct JsAgentFlags {
     pub base_image: ImageRef,
     /// `--executor-kbf-image`, by digest.
     pub kbf_image: ImageRef,
+    /// `--executor-base-tree`: the directory of the release's `SHA256SUMS` and base tree
+    /// bundles.
+    pub base_tree: PathBuf,
 }
 
 /// What `--executor` says: the daemons, or jobs of a job service.
@@ -526,6 +548,7 @@ fn js_agent_flags(m: &ArgMatches) -> Result<JsAgentFlags, String> {
         ca_file,
         base_image,
         kbf_image,
+        base_tree: m.get_one::<PathBuf>(BASE_TREE).cloned().unwrap_or_default(),
     })
 }
 

@@ -11,11 +11,14 @@ use std::sync::Arc;
 use js_proto::v1::{ExecMode, JobSpec, JobState, ListJobsRequest, Shape};
 use kbf_front::PackKeyMint;
 use kbf_job_client::fake::{Call, FakeJobServer, Machine, TOKEN};
-use kbf_objstore::s3::fake::FakeS3;
+use kbf_objstore::s3::fake::{Failure, FakeS3};
+use kbf_state::fake::{Fake, Flaw};
+use kbf_state::{ManualClock, Store as _};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
 use tokio::sync::oneshot;
 
+use super::base_tree::tests::bundle_dir;
 use super::pack_tests::{flags_of, index, pack_flags, scrape};
 use super::{FrontendFlags, FrontendHandle, Prepared, boxed};
 use crate::executor::{PrepareError, PreparedRun, RunPrepare, RunSource};
@@ -119,9 +122,13 @@ fn flags(dir: &Path, s3: &FakeS3, fake: &FakeJobServer, executor: &[&str]) -> Fr
     let token = dir.join("job-token");
     std::fs::write(&token, TOKEN).expect("written");
     std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).expect("mode");
+    let base_tree = dir.join("base-tree");
+    std::fs::create_dir_all(&base_tree).expect("a directory");
+    bundle_dir(&base_tree, crate::BUILD_COMMIT_FULL, &["linux-x86_64"]);
     let mut more = pack_flags(s3.endpoint(), dir);
     more.extend(beside_flags(dir));
     more.extend([
+        format!("--executor-base-tree={}", base_tree.display()),
         format!("--executor-job-url={}", fake.origin()),
         format!("--executor-job-token-file={}", token.display()),
         "--executor-frontend-id=front-1".to_owned(),
@@ -140,14 +147,46 @@ fn started(
     flags: &FrontendFlags,
     source: Option<RunSource>,
 ) -> Result<(FrontendHandle, oneshot::Sender<()>), Box<dyn Error>> {
+    started_over(flags, source, None)
+}
+
+/// [`started`] over the state store `state`, if any.
+fn started_over(
+    flags: &FrontendFlags,
+    source: Option<RunSource>,
+    state: Option<crate::StateStore>,
+) -> Result<(FrontendHandle, oneshot::Sender<()>), Box<dyn Error>> {
     let (stop, stopped) = oneshot::channel::<()>();
     let shutdown = boxed(move || {
         Ok(async move {
             let _ = stopped.await;
         })
     });
-    let handle = Prepared::new(flags)?.start(None, Some(index()), shutdown, source)?;
+    let handle = Prepared::new(flags)?.start(state, Some(index()), shutdown, source)?;
     Ok((handle, stop))
+}
+
+/// A state store in this process, and the handle the frontend is started over.
+fn state_store() -> (Arc<Fake>, crate::StateStore) {
+    let fake = Arc::new(Fake::with_flaw(
+        Arc::new(ManualClock::default()),
+        Flaw::None,
+    ));
+    let state = crate::StateStore {
+        store: fake.clone(),
+        epoch: crate::farm::EpochPolicy::Keep,
+        members: crate::members::MembershipConfig::default(),
+        history: None,
+    };
+    (fake, state)
+}
+
+/// The keys of the pack store under `cas/l/`.
+fn large_keys(s3: &FakeS3) -> Vec<String> {
+    let all = s3.keys();
+    all.into_iter()
+        .filter(|k| k.starts_with("cas/l/"))
+        .collect()
 }
 
 /// The whole answer of `GET path` on the operator listener at `api`, or `None` when the
@@ -209,6 +248,8 @@ async fn a_frontend_that_runs_on_daemons_never_contacts_the_job_service() {
         stop.send(()).expect("stopped");
         served.await.expect("joined").expect("served");
         assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+        // The flag's directory exists and holds the release's bundle: nothing is read from it.
+        assert!(s3.keys().is_empty(), "{:?}", s3.keys());
     }
 }
 
@@ -368,5 +409,140 @@ async fn a_frontend_that_cannot_build_its_executor_does_not_start() {
         .expect("refused")
         .to_string();
     assert!(why.contains("--executor-job-token-file"), "{why}");
+    assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+}
+
+/// Asserts that a `js-agent` frontend writes the release's base tree to the pack store and the
+/// `job-tree/<root>` row to its state store while it starts to serve, before its executor runs:
+/// nothing is written when the frontend is started, every object of the bundle is under `cas/l/`
+/// by the time the executor has registered its worker, and the row names this build's commit and a
+/// publish time. Catches: a tree published after the executor took jobs, or never, and a record
+/// that is missing or names another release.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_js_agent_frontend_publishes_the_base_tree_and_records_it_before_it_serves() {
+    let s3 = FakeS3::start().await;
+    let dir = scratch_dir("executor-base-tree");
+    let fake = job_server(&["host-1"]).await;
+    let flags = flags(
+        dir.path(),
+        &s3,
+        &fake,
+        &["--executor=js-agent", "--executor-insecure-argv-secrets"],
+    );
+    let bundled = bundle_dir(
+        &dir.path().join("base-tree"),
+        crate::BUILD_COMMIT_FULL,
+        &["linux-x86_64"],
+    );
+    let (store, state) = state_store();
+    let (handle, stop) = started_over(&flags, Some(source()), Some(state)).expect("starts");
+    let api = handle.api.expect("the operator API");
+    assert!(
+        large_keys(&s3).is_empty(),
+        "nothing is written by the start"
+    );
+    assert!(store.scan_prefix("job-tree/").expect("a scan").is_empty());
+    let served = tokio::spawn(handle.serve());
+
+    registered(api, "js:front-1-0").await;
+
+    let held = large_keys(&s3);
+    for object in &bundled.objects {
+        assert!(
+            held.contains(&format!("cas/l/{object}")),
+            "{object} in {held:?}"
+        );
+    }
+    let row = store
+        .get(&format!("job-tree/{}", bundled.root))
+        .expect("a read")
+        .expect("the row");
+    let row: serde_json::Value = serde_json::from_slice(&row.value).expect("JSON");
+    assert_eq!(row["release"], crate::BUILD_COMMIT_FULL);
+    assert!(
+        row["first_published_ms"].as_u64().is_some_and(|ms| ms > 0),
+        "{row}"
+    );
+    stop.send(()).expect("stopped");
+    served.await.expect("joined").expect("served");
+}
+
+/// Asserts that an `--executor-arch` the release has no bundle for fails the start naming
+/// `--executor-base-tree` and the bundle it looked for, before the executor asked the job service
+/// anything, and writes no object and no row. Catches: an arm64 farm started over an x86 bundle,
+/// or one that starts with no base tree.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_missing_bundle_for_the_configured_arch_fails_the_start_naming_the_flag() {
+    let s3 = FakeS3::start().await;
+    let dir = scratch_dir("executor-base-tree-arch");
+    let fake = job_server(&["host-1"]).await;
+    let flags = flags(
+        dir.path(),
+        &s3,
+        &fake,
+        &[
+            "--executor=js-agent",
+            "--executor-insecure-argv-secrets",
+            "--executor-arch=arm64",
+        ],
+    );
+    let (store, state) = state_store();
+    let (handle, _stop) = started_over(&flags, Some(source()), Some(state)).expect("starts");
+
+    let served = handle.serve().await;
+
+    let said = served.expect_err("refused").to_string();
+    assert!(said.starts_with("--executor-base-tree: "), "{said}");
+    let wanted = kbf_tree_bundle::file_name(crate::BUILD_COMMIT_FULL, "linux-arm64");
+    assert!(said.contains(&wanted), "{said}");
+    assert!(large_keys(&s3).is_empty());
+    assert!(store.scan_prefix("job-tree/").expect("a scan").is_empty());
+    assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+}
+
+/// Asserts that a publish the store fails fails the start naming the flag and the key, and the
+/// executor is never started: once with an object of the tree already in the store at another
+/// length, once with the store failing the first length check. Catches: a frontend that serves
+/// over a base tree it could not write, and a failure named by no key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_publish_that_fails_fails_the_start() {
+    let s3 = FakeS3::start().await;
+    let dir = scratch_dir("executor-base-tree-store");
+    let fake = job_server(&["host-1"]).await;
+    let js = ["--executor=js-agent", "--executor-insecure-argv-secrets"];
+    let flags = flags(dir.path(), &s3, &fake, &js);
+    let bundled = bundle_dir(
+        &dir.path().join("base-tree"),
+        crate::BUILD_COMMIT_FULL,
+        &["linux-x86_64"],
+    );
+    let (store, state) = state_store();
+    let taken = format!("cas/l/{}", bundled.root);
+    let objects = s3.store(kbf_objstore::Capabilities {
+        conditional_put: true,
+        object_lock: false,
+    });
+    let key = kbf_objstore::ObjectKey::new(taken.clone()).expect("a key");
+    kbf_objstore::ObjectStore::put_new(&objects, &key, bytes::Bytes::from_static(b"x"), None)
+        .await
+        .expect("a stray object");
+    let (handle, _stop) = started_over(&flags, Some(source()), Some(state)).expect("starts");
+
+    let said = handle.serve().await.expect_err("refused").to_string();
+
+    assert!(said.starts_with("--executor-base-tree: "), "{said}");
+    assert!(said.contains(&taken), "{said}");
+    assert!(store.scan_prefix("job-tree/").expect("a scan").is_empty());
+    assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+
+    let dir = scratch_dir("executor-base-tree-head");
+    let flags = self::flags(dir.path(), &s3, &fake, &js);
+    s3.fail(Failure::Head(1));
+    let (handle, _stop) = started(&flags, Some(source())).expect("starts");
+
+    let said = handle.serve().await.expect_err("refused").to_string();
+
+    assert!(said.starts_with("--executor-base-tree: "), "{said}");
+    assert!(said.contains("length check"), "{said}");
     assert!(fake.calls().is_empty(), "{:?}", fake.calls());
 }

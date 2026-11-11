@@ -152,6 +152,7 @@ async fn an_action_runs_end_to_end_through_the_flags_and_the_frontends_own_seams
         "--executor-insecure-argv-secrets".to_owned(),
         format!("--executor-base-image={IMAGE}"),
         format!("--executor-kbf-image={KBF_IMAGE}"),
+        "--executor-base-tree=/nowhere/base-tree".to_owned(),
         "--executor-allow-plain-http-put".to_owned(),
         "--executor-work-dir=/scratch".to_owned(),
     ];

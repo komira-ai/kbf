@@ -64,6 +64,7 @@
 mod action_cache;
 pub mod action_tree;
 mod backend;
+pub mod base_publish;
 mod bytestream;
 mod cache;
 mod capabilities;
