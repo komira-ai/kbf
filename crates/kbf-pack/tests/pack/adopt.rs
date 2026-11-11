@@ -894,7 +894,7 @@ fn each_failure_says_what_failed() {
     };
     let checkpoint = AdoptError::Checkpoint(io::Error::other("full"));
     let mismatch = AdoptError::ResumeMismatch;
-    let bad_key = AdoptError::ResumeKey(KeyError::Empty);
+    let bad_key = AdoptError::ResumeKey(KeyError::Empty.into());
 
     says(listing, "listing the source store: ");
     says(index, "pack index: ");

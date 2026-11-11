@@ -1,7 +1,7 @@
 //! The object keys of packs: `cas/d/<node>/<boot>/<seq>` for a daemon's packs and
 //! `cas/f/<frontend>/<boot>/<seq>` for a frontend's.
 
-use kbf_objstore::{KeyError, ObjectKey};
+use kbf_objstore::{KbfKeyError, ObjectKey, kbf_key};
 
 use crate::error::PackError;
 
@@ -80,8 +80,8 @@ impl PackKeys {
         format!("{}/{}", self.kind.letter(), self.name)
     }
 
-    fn make(&self, last: &str) -> Result<ObjectKey, KeyError> {
+    fn make(&self, last: &str) -> Result<ObjectKey, KbfKeyError> {
         let letter = self.kind.letter();
-        ObjectKey::new(format!("cas/{letter}/{}/{}/{last}", self.name, self.boot))
+        kbf_key(format!("cas/{letter}/{}/{}/{last}", self.name, self.boot))
     }
 }

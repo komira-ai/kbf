@@ -41,8 +41,9 @@
 //! [`Limits::reads_in_flight`] places (at most half of them, as above), and an ok blob is hashed against its digest here: bytes that
 //! are not the blob's are `store_unavailable`, never an ok frame.
 //!
-//! `GET /locate` answers where the blobs of the grant's Action are, as JSON lines, for the task
-//! to fetch from the stores itself: see the `locate` module.
+//! `GET /locate` answers where the blobs of the grant's Action are kept, as JSON lines. It names
+//! no store and no grant, so the task reads every blob from this listener: see the `locate`
+//! module.
 //!
 //! An answer carries a reason code in its body and no other detail: `missing_token`,
 //! `invalid_token`, `expired`, `revoked`, `no_scope`, `out_of_scope`, `too_large`,
@@ -73,16 +74,10 @@ mod idle;
 mod latency;
 mod locate;
 mod source;
-mod store_grants;
 mod walk;
 
 pub use self::locate::{HEADS_IN_FLIGHT, LOCATE_PATH, MAX_LOCATE_LINE_BYTES, Span, large_key};
 pub use self::source::BlobSource;
-pub use self::store_grants::{
-    BODY_BYTES_PER_GRANT, GRANT_LIFETIME, KEYS_PER_GRANT, StoreGrants, check_store_bucket,
-    check_store_url,
-};
-pub use tierstore::server::{AccessKey, GrantError as StoreGrantError};
 
 pub use self::walk::MAX_SCOPE_BLOB_BYTES;
 use self::walk::{Budget, ScopeError, walk};
@@ -216,7 +211,7 @@ pub struct Reply {
 
 impl std::fmt::Debug for Reply {
     /// Shows the status, the size of the body and the stream (its size, never its bytes), and not
-    /// the body: a `/locate` body carries bearer tokens.
+    /// the body: a body may be a blob's bytes or a whole `/locate` table.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Reply")
             .field("status", &self.status)
@@ -415,8 +410,6 @@ pub struct JobRead {
     bytes: Arc<Counter>,
     ended_early: Arc<EndedEarly>,
     backfill: Option<LargeBackfill>,
-    /// What `GET /locate` signs store read grants with; none, and it says nothing of grants.
-    store_grants: Option<StoreGrants>,
     latency: latency::Latency,
 }
 
@@ -438,7 +431,6 @@ impl JobRead {
             bytes: Arc::default(),
             ended_early: Arc::default(),
             backfill: None,
-            store_grants: None,
             latency: latency::Latency::new(),
         }
     }
@@ -447,14 +439,6 @@ impl JobRead {
     #[must_use]
     pub fn with_stopwatch(mut self, clock: Stopwatch) -> Self {
         self.latency = self.latency.with_clock(clock);
-        self
-    }
-
-    /// This read, handing out store read grants with the table of `GET /locate` (see the
-    /// `locate` module); `None` hands out none, and the table is the listener-only one.
-    #[must_use]
-    pub fn with_store_grants(mut self, grants: Option<StoreGrants>) -> Self {
-        self.store_grants = grants;
         self
     }
 

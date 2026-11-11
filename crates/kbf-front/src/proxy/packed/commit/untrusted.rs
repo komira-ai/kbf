@@ -34,7 +34,7 @@
 
 use std::sync::Arc;
 
-use kbf_objstore::{ByteRange, ObjectKey};
+use kbf_objstore::{ByteRange, ObjectKey, kbf_key};
 use kbf_pack_index::{NewPack, PackBlob, Recorded};
 use kbf_segments::layout::{TRAILER_LEN, footer_len};
 use kbf_segments::{Footer, MAX_SEGMENT_BYTES, SegmentError};
@@ -96,7 +96,7 @@ impl IssuedPackKey {
             return Err(CommitError::Invalid(message));
         }
         let key = format!("cas/b/{build}/{nonce}");
-        let object = ObjectKey::new(key.clone());
+        let object = kbf_key(key.clone());
         let object = object.map_err(|error| CommitError::Invalid(error.to_string()))?;
         Ok(Self {
             build: build.to_owned(),

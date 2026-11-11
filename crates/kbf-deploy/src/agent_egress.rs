@@ -6,10 +6,9 @@
 //! A task reaches, by the frontend's settings:
 //!
 //! - the tier store's proxy, `task-put-endpoint`: every pack and large object is PUT there;
-//! - the job-facing read listener, `task-read-url`: the inputs are read there;
-//! - with `executor-locate = true` and a `job-store-url`, that store too: the task reads
-//!   inputs straight from it (without the url, its locate answers carry no grant and it reads
-//!   from the listener alone).
+//! - the job-facing read listener, `task-read-url`: the inputs are read there, with
+//!   `executor-locate` or without it (the frontend signs no store read grants since tierstore
+//!   v0.3.29 removed them, so a locating task reads from the listener too).
 //!
 //! The verb prints `--egress=allow-list` and one `--egress-allow=IPV4:PORT` per destination,
 //! each once, in that order. The agent's ceiling `allow-list` admits the jobs kbf submits; its
@@ -36,10 +35,6 @@ use clap::Args;
 const PUT_KEY: &str = "task-put-endpoint";
 /// The key of the job-facing read listener, where a task reads its inputs.
 const READ_KEY: &str = "task-read-url";
-/// The key of the switch that has a task read inputs straight from the store.
-const LOCATE_KEY: &str = "executor-locate";
-/// The key of the store a locating task reads from.
-const STORE_KEY: &str = "job-store-url";
 
 /// The arguments of `kbf-deploy job-service agent-egress`.
 #[derive(Args)]
@@ -226,7 +221,7 @@ pub(crate) fn render(text: &str, file: &Path) -> Result<String, EgressError> {
             file: file.clone(),
             cause: e.message().to_owned(),
         })?;
-    let mut wanted = vec![
+    let wanted = vec![
         (
             PUT_KEY,
             url_of(&doc, PUT_KEY, "a task PUTs its packs there", &file)?,
@@ -236,20 +231,6 @@ pub(crate) fn render(text: &str, file: &Path) -> Result<String, EgressError> {
             url_of(&doc, READ_KEY, "a task reads its inputs there", &file)?,
         ),
     ];
-    let locate = match find(&doc, LOCATE_KEY, &file)? {
-        None => false,
-        Some(value) => value.as_bool().ok_or(EgressError::Type {
-            file: file.clone(),
-            key: LOCATE_KEY,
-            wanted: "true or false",
-        })?,
-    };
-    // A locating task reads from the store only when the frontend names one; without
-    // `job-store-url` its locate answers carry no grant and it reads from the listener.
-    if locate && find(&doc, STORE_KEY, &file)?.is_some() {
-        let why = "a locating task reads its inputs there";
-        wanted.push((STORE_KEY, url_of(&doc, STORE_KEY, why, &file)?));
-    }
     // One line per endpoint, in the order above; a later key that names one already listed
     // is added to its comment.
     let mut lines: Vec<(Endpoint, Vec<String>)> = Vec::new();

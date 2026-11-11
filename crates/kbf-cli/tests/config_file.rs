@@ -336,6 +336,34 @@ fn a_label_key_is_refused_with_its_replacement() {
     }
 }
 
+/// Catches a removed `--job-store-*` key (the store read grants, which tierstore v0.3.29
+/// removed) read again as a setting, or refused like any unknown key without saying that it was
+/// removed and why: each of the three in `[job-read]` exits 2 naming its flag and the release.
+#[test]
+fn a_removed_store_grant_key_is_refused_naming_the_tierstore_release() {
+    let dir = scratch("store-grant-key");
+    for (key, value) in [
+        ("job-store-grant-key-file", "/etc/kbf/store-grant.key"),
+        ("job-store-url", "https://store.farm.test:9000"),
+        ("job-store-bucket", "tiers"),
+    ] {
+        let body = format!("{FRONTEND_FILE}\n[job-read]\n{key} = \"{value}\"\n");
+        let path = file(&dir, &body, 0o600);
+        let err =
+            kbf_cli::parse_with(argv(&["kbf", "frontend"], Some(&path)), None).expect_err(key);
+        assert_eq!(err.exit_code(), 2, "{key}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&format!(
+                "invalid value '{value}' for '--{key} <VALUE>': the flag was removed: tierstore \
+                 v0.3.29 removed the store read grants it configured, so `GET /locate` hands out \
+                 none and a task reads every blob from the job listener; delete the flag"
+            )),
+            "{key}: {msg}"
+        );
+    }
+}
+
 /// Catches a repeatable flag read as one value, and a switch read as a value: `server`
 /// (given once per frontend on the command line) is an array in the file, and a switch is
 /// `true` to turn it on and `false` to leave it off, refused for anything else.

@@ -15,7 +15,7 @@ use bytes::Bytes;
 use futures::future::BoxFuture;
 use kbf_front::digest_to_proto;
 use kbf_front::grants::{GrantKey, Grants, MIN_SECRET_LEN};
-use kbf_front::job_read::{BlobSource, JobRead, LOCATE_PATH, Limits, Reply, Span, StoreGrants};
+use kbf_front::job_read::{BlobSource, JobRead, LOCATE_PATH, Limits, Reply, Span};
 use kbf_proto::reapi::{Action, Directory, DirectoryNode, FileNode};
 use kbf_storage::{ReadStream, StorageError};
 use kbf_types::Digest;
@@ -253,11 +253,6 @@ pub struct Rig {
 }
 
 pub fn rig(source: Source, limits: Limits) -> Rig {
-    rig_granting(source, limits, None)
-}
-
-/// A rig whose locate hands out store grants made by `store`, if there is one.
-pub fn rig_granting(source: Source, limits: Limits, store: Option<StoreGrants>) -> Rig {
     let key = GrantKey::from_secret(&[1; MIN_SECRET_LEN]).expect("a long enough secret");
     let clock = Arc::new(AtomicU64::new(100));
     let ticks = Arc::clone(&clock);
@@ -266,7 +261,7 @@ pub fn rig_granting(source: Source, limits: Limits, store: Option<StoreGrants>) 
         Arc::new(move || ticks.load(Ordering::SeqCst)),
     ));
     let source = Arc::new(source);
-    let read = JobRead::new(source.clone(), Arc::clone(&grants), limits).with_store_grants(store);
+    let read = JobRead::new(source.clone(), Arc::clone(&grants), limits);
     Rig {
         source,
         read,

@@ -95,14 +95,13 @@ says `task-put-endpoint = "http://192.0.2.10:9000"` and
 --egress-allow=192.0.2.20:8444
 ```
 
-With `executor-locate = true` and a `job-store-url`, a task also reads straight from that store,
-and a third `--egress-allow` names it (without the url a locating task reads from the listener
-alone, and no third line is printed). An endpoint named by two keys is printed once. Put the lines in
+A task reads no store directly, with `executor-locate` or without it (the frontend hands out no store
+read grants: tierstore v0.3.29 removed them), so a `job-store-url` left in the file adds no line. An endpoint named by two keys is printed once. Put the lines in
 the flags file of every farm agent (the jobscheduler's
 [farm node runbook](https://github.com/komira-ai/jobscheduler/blob/main/docs/runbooks/farm-node-enroll.md)
 gives the file's rules). The agent reads the file when it starts, so restart it as that runbook
 says. When the frontend's
-`task-put-endpoint`, `task-read-url` or `job-store-url` changes, render the lines again and replace
+`task-put-endpoint` or `task-read-url` changes, render the lines again and replace
 them on every agent.
 
 **Refused** (exit 2, nothing printed; the message names the file and the key):
