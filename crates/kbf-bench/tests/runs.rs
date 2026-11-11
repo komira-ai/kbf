@@ -272,7 +272,7 @@ async fn every_call_without_a_node_certificate_fails() {
     )
     .expect("tree");
     let mut target = server.worker_target();
-    (target.cert, target.key) = (None, None);
+    (target.tls.cert, target.tls.key) = (None, None);
     let mut find = options(Method::Bytestream);
     find.find_missing = true;
     let runs = [

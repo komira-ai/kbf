@@ -3,6 +3,8 @@
 
 #![allow(dead_code)]
 
+pub mod front;
+
 use std::future::pending;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -10,7 +12,7 @@ use std::sync::Arc;
 
 use clap::Parser as _;
 use futures::{StreamExt as _, stream};
-use kbf_bench::connect::Target;
+use kbf_bench::connect::{Target, Tls};
 use kbf_bench::tree::Tree;
 use kbf_front::Cache;
 use kbf_proto::google::bytestream::ReadRequest;
@@ -107,10 +109,12 @@ impl Server {
     pub fn worker_target(&self) -> Target {
         Target {
             cas: format!("https://{}", self.worker),
-            ca_cert: Some(self.file("ca.pem")),
-            cert: Some(self.file("node.pem")),
-            key: Some(self.file("node.key")),
-            tls_server_name: Some("localhost".to_owned()),
+            tls: Tls {
+                ca_cert: Some(self.file("ca.pem")),
+                cert: Some(self.file("node.pem")),
+                key: Some(self.file("node.key")),
+                tls_server_name: Some("localhost".to_owned()),
+            },
         }
     }
 
@@ -160,9 +164,6 @@ impl Server {
 pub fn plain(addr: SocketAddr) -> Target {
     Target {
         cas: format!("http://{addr}"),
-        ca_cert: None,
-        cert: None,
-        key: None,
-        tls_server_name: None,
+        tls: Tls::default(),
     }
 }

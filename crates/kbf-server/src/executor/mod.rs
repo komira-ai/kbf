@@ -63,7 +63,7 @@ use host::HostWorker;
 use pool::{Adopted, Adoption};
 use submit::{FRONTEND_LABEL, INSTANCE_LABEL};
 
-pub use config::{Config, ConfigError, DEFAULT_OUTPUT_DISK, DISK_MARGIN, Network};
+pub use config::{Config, ConfigError, Network};
 pub use driver::Running;
 pub use front::{Front, FrontParts, PrepareError, PreparedRun, RunPrepare, RunSource};
 pub use metrics::Metrics;
