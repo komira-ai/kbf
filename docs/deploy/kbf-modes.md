@@ -131,10 +131,10 @@ the job's arguments are the tool's flags and nothing is mounted into the contain
 cores and memory the farm booked (the memory as the hard cap a daemon would set, 1.5 times the
 booking plus 512 MiB), a host of `os=linux` and `--executor-arch` (default `x86_64`) that runs
 containers, and a wall limit of the action's timeout plus the run margin. It books no disk: the
-job carries no `disk_bytes`, so the job service places it on a host whatever scratch disk that host
-reports, and the job writes to its host's scratch with no quota. The kbf image is built from the base environment the actions'
-Commands see (`--executor-base-image`); both are named by digest, and the host pulls the kbf
-image. An action's `container-image` platform property names the base: an action that names
+job carries no `disk_bytes`, so the job service places it on a host whatever scratch disk that
+host reports, and the job writes to its host's scratch with no quota. The kbf image is built from
+the base environment the actions' Commands see (`--executor-base-image`); both are named by
+digest, and the host pulls the kbf image. An action's `container-image` platform property names the base: an action that names
 another image is refused as invalid (the message names both), one that names none gets the base,
 and a tag is refused. It needs both image flags, and the job service (`--executor-job-url`,
 `https://`, or `http://` to loopback only; `--executor-job-token-file`, mode 0600 or 0400;
