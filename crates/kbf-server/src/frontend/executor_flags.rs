@@ -300,8 +300,8 @@ pub(super) fn args() -> Vec<Arg> {
             .value_parser(clap::value_parser!(PathBuf))
             .help(
                 "The directory holding the release's `SHA256SUMS` and its \
-                 `kbf-base-tree-<commit>-linux-<arch>.tree.tar` bundles, one per platform (the \
-                 release installs them beside the frontend). At its start the frontend checks \
+                 `kbf-base-tree-<commit>-linux-<arch>.tree.tar` bundles, one per platform, \
+                 copied from the release's assets. At its start the frontend checks \
                  the bundle of `--executor-arch` against `SHA256SUMS` and writes the objects of \
                  the kbf base tree that the pack store lacks to `cas/l/`, create-only, so the \
                  pack store credentials must be allowed to write there; it then records the \

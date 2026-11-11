@@ -75,7 +75,8 @@ publishes it itself, at its start, and no workflow or operator writes the store 
 
 - the directory `executor-base-tree` names holds the release's `SHA256SUMS` and the bundles
   `kbf-base-tree-<commit>-linux-x86_64.tree.tar` and `kbf-base-tree-<commit>-linux-arm64.tree.tar`
-  of the commit the frontend's binary was built from, installed with that release. The
+  of the commit the frontend's binary was built from, copied from that release's assets (no package
+  installs them, so the directory is updated with each upgrade of the frontend). The
   switch does not write the key: `plan` names it as missing, and `apply`'s `kbf --check` and the
   first start refuse a file without it;
 - the frontend's pack store credentials (`--pack-store-credentials-file`) may write below
@@ -97,9 +98,9 @@ exits with, and before any job is submitted:
 
 | the start says | what to do |
 |---|---|
-| the bundle `kbf-base-tree-<commit>-linux-<arch>.tree.tar` is missing | the release has no bundle for `executor-arch`, or the package that installed it is not this binary's: reinstall the release |
-| `<SHA256SUMS>` does not list it, lists it twice, has a line that is not `<sha256>  <name>`, or is missing | the directory is not a release's: reinstall |
-| its SHA-256 is not the listed one | the file changed after the release was made: reinstall |
+| the bundle `kbf-base-tree-<commit>-linux-<arch>.tree.tar` is missing | the release has no bundle for `executor-arch`, or the directory holds another release's files: copy this release's bundles and `SHA256SUMS` there |
+| `<SHA256SUMS>` does not list it, lists it twice, has a line that is not `<sha256>  <name>`, or is missing | the directory is not a release's: copy the release's files again |
+| its SHA-256 is not the listed one | the file changed after the release was made: copy it again |
 | the bundle is of another commit or platform, or is not a bundle | the same |
 | the store holds `<key>` at another length | an object of `cas/l/` that is not the content its key names: look at that key, and do not delete it by hand without knowing who wrote it |
 | the store failed the length check or the write of `<key>` | the cause is the store's: the pack store flags and credentials |

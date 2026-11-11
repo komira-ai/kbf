@@ -266,8 +266,8 @@ open network without its opt-in) is refused at start, exit status 2.
 
 **The kbf base tree: `--executor-base-tree <DIR>`.** Needed with `--executor js-agent`, a
 directory that holds the release's `SHA256SUMS` and its base tree bundles,
-`kbf-base-tree-<commit>-linux-<arch>.tree.tar`, one per Linux platform (the release installs
-them beside the frontend). Before it serves, and so before the executor is spawned and any job
+`kbf-base-tree-<commit>-linux-<arch>.tree.tar`, one per Linux platform, as the release publishes
+them (no package installs them: the operator puts them there with each frontend upgrade). Before it serves, and so before the executor is spawned and any job
 names a tree, the frontend takes the bundle of its own commit and of `linux-` and
 `--executor-arch`, checks it against `SHA256SUMS` (listed once, and the file's SHA-256 is the
 listed one), and writes every object of the tree that the pack store does not hold to
