@@ -166,7 +166,11 @@ action is submitted twice. A farm `Cancel` is a cancel of the job. How a job end
 farm's failure classes as the table in `crates/kbf-server/src/executor/outcome.rs` says: a job
 stopped at its wall limit is the action's own timeout, one stopped for memory is rerun with more,
 a lost job is the host's fault and rerun elsewhere, and a submit the service refuses because no
-host could ever run it ends the action as invalid. A whole-machine action
+host could ever run it ends the action as invalid. A job's pack is read, and its outputs
+promoted, only from a clean result: the job and its result both say succeeded, the result's
+reason is the job's exit and its exit code is 0. Any other ending, a result that leaves out its
+exit code included, leaves the pack unread however complete it is, and the farm runs the action
+again (or answers it, as the table says). A whole-machine action
 (`kbf-lease=whole_machine`) is one job too: each virtual worker lists the `container` and
 `native-whole-machine` drivers, so the farm places it on a worker it books whole, and the job
 needs the whole host and nothing beside it (no cores, memory or disk of its own: the host's are
