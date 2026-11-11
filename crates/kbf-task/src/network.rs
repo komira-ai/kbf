@@ -35,9 +35,11 @@
 //! # The second layer: a network namespace
 //!
 //! Before the filter, the child gives itself a user and network namespace of its own with the
-//! same user and group id inside as outside, and raises `lo` in it (`netns`, below). The
-//! Command then has a namespace with one interface and no route. Which filter follows depends
-//! on whether every one of those steps succeeded:
+//! same user and group id inside as outside, and raises `lo` in it ([`crate::child`]; the same
+//! `unshare` makes the mount and PID namespaces of the sandbox, [`crate::sandbox`], whose steps
+//! follow). The Command then has a namespace with one interface and no route. Which filter
+//! follows depends on whether every one of the network namespace's steps succeeded (a failed
+//! step of the sandbox's mounts, which come after, leaves it whole):
 //!
 //! - **All succeeded** (`netns (loopback only) + seccomp`): the filter also lets `AF_INET` and
 //!   `AF_INET6` sockets be made, so the Command can use `127.0.0.1` (a test that starts a server
@@ -51,14 +53,15 @@
 //!   path. The step is `unshare`, `setgroups`, `uid_map`, `gid_map` or `loopback`. A step that
 //!   fails does not fail the run.
 //!
-//! A Command that runs as root (effective uid 0) gets no namespace: one that maps only its own
-//! id would make `chown` to another user, `setuid`, `setgid` and `setgroups` fail for it, and
-//! `tar`, `dpkg` and `apt` do those. It runs under the strict filter, and the line says
-//! `seccomp only, no inet (netns: skipped for uid 0)`. Between the writes to its own `/proc`
-//! files and its `exec` the child is non-dumpable again.
+//! A Command that runs as root (effective uid 0) gets no user or network namespace: a user
+//! namespace that maps only its own id would make `chown` to another user, `setuid`, `setgid`
+//! and `setgroups` fail for it, and `tar`, `dpkg` and `apt` do those. (It gets the sandbox's
+//! mount and PID namespaces, which need no user namespace for root.) It runs under the strict
+//! filter, and the line says `seccomp only, no inet (netns: skipped for uid 0)`. Between the
+//! writes to its own `/proc` files and its `exec` the child is non-dumpable again.
 //!
 //! Both filters are built before the fork; the child picks one after the steps. It reports the
-//! outcome on a pipe it writes just before the `exec`, and the tool writes one line per run
+//! outcome on a pipe it writes before the `exec`, and the tool writes one line per run
 //! ([`layers_notice`]): `kbf-task: action <digest>: network: netns (loopback only) + seccomp`,
 //! `network: seccomp only, no inet (netns: <step> <errno>)` or `network: open
 //! (kbf-network=allow)`.
@@ -120,6 +123,7 @@ use kbf_types::Digest;
 use tokio::process::Command as Process;
 
 use crate::run::RunError;
+use crate::sandbox::{Layout, Sandbox};
 
 /// The platform property that lets one action's Command use the network.
 pub const PROPERTY: &str = "kbf-network";
@@ -247,7 +251,7 @@ pub fn layers_notice(action: &Digest, layers: &Layers) -> String {
 pub fn protect_this_process() -> std::io::Result<()> {
     #[cfg(target_os = "linux")]
     {
-        netns::set_dumpable(0)?;
+        crate::child::set_dumpable(false)?;
     }
     Ok(())
 }
@@ -255,43 +259,59 @@ pub fn protect_this_process() -> std::io::Result<()> {
 /// What `confine` set up, to be read once the process has been started.
 pub struct Confinement {
     #[cfg(target_os = "linux")]
-    report: Option<netns::Report>,
+    report: crate::child::Report,
     #[cfg(not(target_os = "linux"))]
     denied: bool,
 }
 
 impl Confinement {
-    /// The layers that confine the process that was started. Call it after a successful spawn:
-    /// the child has by then written its report and executed the Command.
+    /// The layers that confine the process that was started, how its sandbox came out, and the
+    /// `errno` of a Command the relay could not start (none when it started). Call it after a
+    /// successful spawn, once every handle of the process's builder has been dropped (a write
+    /// end of the report pipe is in it).
     #[must_use]
     #[cfg(target_os = "linux")]
-    pub fn layers(self) -> Layers {
-        self.report.map_or(Layers::Open, netns::Report::read)
+    pub fn read(self) -> (Layers, Sandbox, Option<i32>) {
+        let (layers, sandbox, start) = self.report.read();
+        let refused = match start {
+            crate::child::Start::Started => None,
+            crate::child::Start::NotStarted(errno) => Some(errno),
+        };
+        (layers, sandbox, refused)
     }
 
     /// The layers that confine the process that was started: the `sandbox-exec` profile on macOS
-    /// for a denied Command, none on another system.
+    /// for a denied Command, none on another system. There is no sandbox.
     #[must_use]
     #[cfg(not(target_os = "linux"))]
-    pub fn layers(self) -> Layers {
-        match (self.denied, cfg!(target_os = "macos")) {
+    pub fn read(self) -> (Layers, Sandbox, Option<i32>) {
+        let layers = match (self.denied, cfg!(target_os = "macos")) {
             (false, _) => Layers::Open,
             (true, true) => Layers::Seatbelt,
             (true, false) => Layers::Unavailable,
-        }
+        };
+        (layers, Sandbox::Unavailable, None)
     }
 }
 
-/// Applies `network` to the process about to be started. This is the one place a confinement
-/// layer is added. On Linux, in the child before the `exec`: a network namespace of its own
-/// ([`netns`]), then the seccomp filter, which is last because the namespace steps need an
-/// `AF_INET` socket. See the module documentation.
+/// Applies `network`, and the sandbox's `layout` ([`crate::sandbox`]), to the process about to
+/// be started. This is the one place a confinement layer is added. On Linux, in the child before
+/// the `exec`: the namespaces of its own and the sandbox's mounts ([`crate::child`]), then, for a
+/// Command denied the network, the seccomp filter, which is last because the namespace steps need
+/// an `AF_INET` socket. With `relayed` (the program `process` starts is this binary's relay,
+/// [`crate::relay`]), the `unshare` also makes a PID namespace, and the relay gets the report
+/// pipe as its standard input. See the module documentation.
 ///
 /// # Errors
 /// [`RunError::Io`] when the pipe the child reports on cannot be made.
 #[cfg(target_os = "linux")]
-pub fn confine(process: &mut Process, network: Network) -> Result<Confinement, RunError> {
-    confine_with(process, network, netns::make_pipe)
+pub fn confine(
+    process: &mut Process,
+    network: Network,
+    layout: Layout,
+    relayed: bool,
+) -> Result<Confinement, RunError> {
+    confine_with(process, network, layout, relayed, crate::child::make_pipe)
 }
 
 /// [`confine`] with the pipe maker a parameter, so a failing one can be tried.
@@ -299,12 +319,44 @@ pub fn confine(process: &mut Process, network: Network) -> Result<Confinement, R
 fn confine_with(
     process: &mut Process,
     network: Network,
+    layout: Layout,
+    relayed: bool,
     pipe: fn() -> std::io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)>,
 ) -> Result<Confinement, RunError> {
-    match network {
-        Network::Allowed => Ok(Confinement { report: None }),
-        Network::Denied => deny_sockets(process, pipe),
+    let filters = (network == Network::Denied).then(|| Filters {
+        strict: seccomp::filter(false),
+        in_netns: seccomp::filter(true),
+    });
+    let uid = rustix::process::geteuid().as_raw();
+    let gid = rustix::process::getegid().as_raw();
+    let (mut plan, report, stdin) = crate::child::plan(
+        uid,
+        gid,
+        filters.is_some(),
+        relayed,
+        layout.into_steps(),
+        pipe,
+    )
+    .map_err(|source| RunError::Io {
+        path: "the confinement report pipe".into(),
+        source,
+    })?;
+    // SAFETY: the hook runs between fork and exec in the child and makes only system calls on
+    // memory built before the fork (`child_setup`): no allocation, no lock, no panic.
+    unsafe {
+        process.pre_exec(move || child_setup(&mut plan, filters.as_ref()));
     }
+    if let Some(stdin) = stdin {
+        process.stdin(std::process::Stdio::from(stdin));
+    }
+    Ok(Confinement { report })
+}
+
+/// The two seccomp programs, built before the fork; the child installs one.
+#[cfg(target_os = "linux")]
+struct Filters {
+    strict: Vec<libc::sock_filter>,
+    in_netns: Vec<libc::sock_filter>,
 }
 
 /// What the system's `confine` does where there is no seccomp filter. On macOS the confine is the
@@ -319,7 +371,12 @@ fn confine_with(
 /// [`RunError::NoConfine`] for [`Network::Denied`], on macOS when `process` is not `sandbox-exec`,
 /// elsewhere unless the feature is on.
 #[cfg(not(target_os = "linux"))]
-pub fn confine(process: &mut Process, network: Network) -> Result<Confinement, RunError> {
+pub fn confine(
+    process: &mut Process,
+    network: Network,
+    _layout: Layout,
+    _relayed: bool,
+) -> Result<Confinement, RunError> {
     let denied = network == Network::Denied;
     if cfg!(target_os = "macos") {
         let sandboxed = process.as_std().get_program() == kbf_seatbelt::SANDBOX_EXEC;
@@ -463,342 +520,33 @@ pub(crate) fn without_confine(
 pub(crate) const UNCONFINED_WARNING: &str = "kbf-task: this system cannot deny the Command the network; it runs with it (unconfined-for-tests)";
 
 /// The filter that lets `AF_INET` through is for a Command that is certainly in a namespace of
-/// its own: every step must have succeeded. Any other outcome, a skip for root included, gets
-/// the strict one.
+/// its own: every step of it must have succeeded (`netns_made`). Any other outcome, root
+/// included, gets the strict one.
 #[cfg(target_os = "linux")]
 fn pick<'a>(
-    outcome: (u8, u8),
+    netns_made: bool,
     strict: &'a [libc::sock_filter],
     in_netns: &'a [libc::sock_filter],
 ) -> &'a [libc::sock_filter] {
-    if outcome == (netns::OK, 0) {
-        in_netns
-    } else {
-        strict
-    }
+    if netns_made { in_netns } else { strict }
 }
 
-/// Everything the child does between `fork` and `exec`, in order: the namespace steps, the
-/// filter that follows from how they went, and the report to the parent. Only system calls on
-/// memory made before the fork. An error is the errno of a filter that could not be installed,
-/// which stops the Command from starting.
+/// Everything the child does between `fork` and `exec`, in order: the namespace and mount
+/// steps, the filter that follows from how they went (none for a Command allowed the network),
+/// and the report to the parent. Only system calls on memory made before the fork. An error is
+/// the errno of a filter that could not be installed, which stops the Command from starting.
 #[cfg(target_os = "linux")]
-fn child_setup(
-    plan: &netns::Plan,
-    strict: &[libc::sock_filter],
-    in_netns: &[libc::sock_filter],
-) -> std::io::Result<()> {
+fn child_setup(plan: &mut crate::child::Plan, filters: Option<&Filters>) -> std::io::Result<()> {
     let outcome = plan.apply();
-    seccomp::install(pick(outcome, strict, in_netns))?;
+    if let Some(filters) = filters {
+        seccomp::install(pick(
+            plan.netns_made(outcome),
+            &filters.strict,
+            &filters.in_netns,
+        ))?;
+    }
     plan.tell(outcome);
     Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn deny_sockets(
-    process: &mut Process,
-    pipe: fn() -> std::io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)>,
-) -> Result<Confinement, RunError> {
-    let strict = seccomp::filter(false);
-    let in_netns = seccomp::filter(true);
-    // SAFETY: no arguments.
-    let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
-    let (plan, report) = netns::plan(uid, gid, pipe).map_err(|source| RunError::Io {
-        path: "the network report pipe".into(),
-        source,
-    })?;
-    // SAFETY: the hook runs between fork and exec in the child and makes only system calls on
-    // memory built before the fork (`child_setup`): no allocation, no lock, no panic.
-    unsafe {
-        process.pre_exec(move || child_setup(&plan, &strict, &in_netns));
-    }
-    Ok(Confinement {
-        report: Some(report),
-    })
-}
-
-/// The second layer: a user and network namespace of the Command's own.
-///
-/// The child unshares `CLONE_NEWUSER | CLONE_NEWNET` (the user namespace is what lets an
-/// unprivileged process make the network one), maps its own user and group id to themselves (so
-/// the Command is the same user and owns the same files), and raises `lo`, the one interface
-/// the new namespace has. The Command then has no route anywhere. This needs the host to allow
-/// unprivileged user namespaces to hold their capabilities: a host that restricts them with
-/// AppArmor (`apparmor_restrict_unprivileged_userns`) gives a namespace without them, `lo`
-/// cannot be raised, and the step fails with `EPERM`. A step that fails is reported and does
-/// not fail the run: the seccomp filter is the guarantee, this is defence in depth, for example
-/// against a socket handed to the Command over a Unix socket.
-#[cfg(target_os = "linux")]
-mod netns {
-    use std::ffi::CString;
-    use std::io::{self, Read as _};
-    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
-
-    use super::Layers;
-
-    pub const OK: u8 = 0;
-    pub const SKIPPED_FOR_ROOT: u8 = 6;
-    /// The step numbers the child reports, with the names the log gives them.
-    const STEPS: [(u8, &str); 6] = [
-        (1, "unshare"),
-        (2, "setgroups"),
-        (3, "uid_map"),
-        (4, "gid_map"),
-        (5, "loopback"),
-        (7, "dumpable"),
-    ];
-
-    /// A system call result as an error: `-1` is the `errno` the call left.
-    pub fn cvt(result: libc::c_long) -> io::Result<libc::c_long> {
-        if result < 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(result)
-        }
-    }
-
-    /// The code a step's error is reported as: its `errno`, at most 255.
-    pub fn code(error: &io::Error) -> u8 {
-        u8::try_from(error.raw_os_error().unwrap_or(0)).unwrap_or(u8::MAX)
-    }
-
-    /// `PR_SET_DUMPABLE`.
-    ///
-    /// # Errors
-    /// The `prctl` failed.
-    pub fn set_dumpable(value: libc::c_ulong) -> io::Result<()> {
-        // SAFETY: prctl with integer arguments only.
-        cvt(libc::c_long::from(unsafe {
-            libc::prctl(libc::PR_SET_DUMPABLE, value, 0, 0, 0)
-        }))
-        .map(drop)
-    }
-
-    /// One thing the child does to its own process.
-    #[derive(Debug, PartialEq, Eq)]
-    pub enum Step {
-        Dumpable(libc::c_ulong),
-        Unshare,
-        /// The bytes written, in one `write`, to the file at the path.
-        Write(CString, Vec<u8>),
-        Loopback,
-    }
-
-    /// What the child needs, made before the fork.
-    pub struct Plan {
-        skip: bool,
-        steps: Vec<(u8, Step)>,
-        write_end: i32,
-    }
-
-    /// The parent's end of the pipe the child reports on.
-    pub struct Report {
-        read: OwnedFd,
-        // Held so that the child's copy is the only one once the parent lets this go.
-        write: OwnedFd,
-    }
-
-    /// Whether the namespace layer is left out for a Command run as `euid`: root, for which a
-    /// namespace that maps only its own id (`0 0 1`) breaks `chown` to another user, `setuid`,
-    /// `setgid` and `setgroups`, which `tar`, `dpkg` and `apt` do.
-    pub fn skips_namespace(euid: u32) -> bool {
-        euid == 0
-    }
-
-    /// A pipe whose two ends close on `exec`.
-    ///
-    /// # Errors
-    /// The `pipe2` failed.
-    pub fn make_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
-        let mut fds = [0 as libc::c_int; 2];
-        // SAFETY: `fds` has room for the two descriptors.
-        cvt(libc::c_long::from(unsafe {
-            libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC)
-        }))?;
-        // SAFETY: pipe2 made both descriptors and nothing else owns them.
-        Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
-    }
-
-    /// The plan for a Command run as `uid` and `gid` (the effective ids, read once before the
-    /// fork), and the pipe it reports on, made by `pipe`.
-    ///
-    /// # Errors
-    /// `pipe` failed.
-    pub fn plan(
-        uid: u32,
-        gid: u32,
-        pipe: fn() -> io::Result<(OwnedFd, OwnedFd)>,
-    ) -> io::Result<(Plan, Report)> {
-        let (read, write) = pipe()?;
-        let path = |p: &str| CString::new(p).expect("a path without NUL");
-        let skip = skips_namespace(uid);
-        let plan = Plan {
-            skip,
-            // A skipped plan has nothing to do.
-            steps: if skip {
-                Vec::new()
-            } else {
-                vec![
-                    (7, Step::Dumpable(1)),
-                    (1, Step::Unshare),
-                    (
-                        2,
-                        Step::Write(path("/proc/self/setgroups"), b"deny".to_vec()),
-                    ),
-                    (
-                        3,
-                        Step::Write(
-                            path("/proc/self/uid_map"),
-                            format!("{uid} {uid} 1").into_bytes(),
-                        ),
-                    ),
-                    (
-                        4,
-                        Step::Write(
-                            path("/proc/self/gid_map"),
-                            format!("{gid} {gid} 1").into_bytes(),
-                        ),
-                    ),
-                    // The `/proc/self` writes are done: back to non-dumpable before anything else.
-                    (7, Step::Dumpable(0)),
-                    (5, Step::Loopback),
-                ]
-            },
-            write_end: write.as_raw_fd(),
-        };
-        Ok((plan, Report { read, write }))
-    }
-
-    impl Plan {
-        /// Whether the plan leaves the namespace layer out.
-        pub fn skips(&self) -> bool {
-            self.skip
-        }
-
-        /// The steps, each with the number it is reported by, in the order they run.
-        pub fn steps(&self) -> &[(u8, Step)] {
-            &self.steps
-        }
-    }
-
-    impl Report {
-        /// What the child said, once it has executed.
-        pub fn read(self) -> Layers {
-            drop(self.write);
-            let mut said = [0u8; 2];
-            let mut read = std::fs::File::from(self.read);
-            if read.read_exact(&mut said).is_err() {
-                return Layers::Unreported;
-            }
-            match said[0] {
-                OK => Layers::SeccompAndNetns,
-                SKIPPED_FOR_ROOT => Layers::SeccompOnlyForRoot,
-                n => STEPS.iter().find(|(number, _)| *number == n).map_or(
-                    Layers::Unreported,
-                    |(_, step)| Layers::SeccompOnly {
-                        step,
-                        errno: i32::from(said[1]),
-                    },
-                ),
-            }
-        }
-    }
-
-    impl Plan {
-        /// Runs the steps in the child; returns the number of the step that failed and its
-        /// errno, or `(OK, 0)`, or `(SKIPPED_FOR_ROOT, 0)` with nothing done. Only system calls
-        /// on memory made before the fork. The child is left non-dumpable.
-        pub fn apply(&self) -> (u8, u8) {
-            if self.skips() {
-                return (SKIPPED_FOR_ROOT, 0);
-            }
-            let outcome = run_steps(self.steps());
-            // Whatever happened, the child is not dumpable from here to its `exec`.
-            let _ = set_dumpable(0);
-            outcome
-        }
-
-        /// Writes the outcome of `apply` to the parent. A failed write is not an error of the
-        /// run: the parent then reports that the child did not say.
-        pub fn tell(&self, outcome: (u8, u8)) {
-            let bytes = [outcome.0, outcome.1];
-            // SAFETY: `bytes` is two readable bytes.
-            unsafe { libc::write(self.write_end, bytes.as_ptr().cast(), 2) };
-        }
-    }
-
-    /// Runs `steps` in order up to the first that fails.
-    pub fn run_steps(steps: &[(u8, Step)]) -> (u8, u8) {
-        for (number, step) in steps {
-            if let Err(error) = run_step(step) {
-                return (*number, code(&error));
-            }
-        }
-        (OK, 0)
-    }
-
-    pub fn run_step(step: &Step) -> io::Result<()> {
-        match step {
-            Step::Dumpable(value) => set_dumpable(*value),
-            // SAFETY: integer argument only.
-            Step::Unshare => cvt(libc::c_long::from(unsafe {
-                libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET)
-            }))
-            .map(drop),
-            Step::Write(path, line) => write_file(path, line),
-            Step::Loopback => raise_loopback(),
-        }
-    }
-
-    /// Writes `line` to the file at `path` in one `write`, as the kernel's map files need.
-    pub fn write_file(path: &CString, line: &[u8]) -> io::Result<()> {
-        // SAFETY: `path` is a NUL-terminated string.
-        let fd = cvt(libc::c_long::from(unsafe {
-            libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC)
-        }))?;
-        let fd = libc::c_int::try_from(fd).expect("a descriptor");
-        // SAFETY: `line` is readable for its length.
-        let done =
-            cvt(unsafe { libc::write(fd, line.as_ptr().cast(), line.len()) } as libc::c_long);
-        // SAFETY: `fd` was opened above.
-        unsafe { libc::close(fd) };
-        done.map(drop)
-    }
-
-    /// Sets `IFF_UP | IFF_RUNNING` on `lo` of the namespace the process is in.
-    pub fn raise_loopback() -> io::Result<()> {
-        // SAFETY: integer arguments only.
-        let fd = cvt(libc::c_long::from(unsafe {
-            libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0)
-        }))?;
-        let fd = libc::c_int::try_from(fd).expect("a descriptor");
-        let result = set_loopback_flags(fd);
-        // SAFETY: `fd` was opened above.
-        unsafe { libc::close(fd) };
-        result
-    }
-
-    fn set_loopback_flags(fd: libc::c_int) -> io::Result<()> {
-        // SAFETY: an all-zero `ifreq` is valid.
-        let mut request: libc::ifreq = unsafe { std::mem::zeroed() };
-        request.ifr_name[0] = b'l' as libc::c_char;
-        request.ifr_name[1] = b'o' as libc::c_char;
-        // The `SIOC*` constants are `c_ulong`, `ioctl`'s request is `c_ulong` on glibc but `c_int`
-        // on musl (the release builds), so each request is cast to `libc::Ioctl` (0x89xx fits both).
-        // SAFETY: `request` is an `ifreq`, as both requests take.
-        cvt(libc::c_long::from(unsafe {
-            libc::ioctl(fd, libc::SIOCGIFFLAGS as libc::Ioctl, &raw mut request)
-        }))?;
-        // SAFETY: the kernel filled the flags member of the union.
-        unsafe {
-            request.ifr_ifru.ifru_flags |= (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
-        }
-        // SAFETY: as above.
-        cvt(libc::c_long::from(unsafe {
-            libc::ioctl(fd, libc::SIOCSIFFLAGS as libc::Ioctl, &raw mut request)
-        }))
-        .map(drop)
-    }
 }
 
 #[cfg(target_os = "linux")]
@@ -807,7 +555,7 @@ mod seccomp {
 
     use libc::sock_filter;
 
-    use super::netns::cvt;
+    use crate::child::cvt;
 
     #[cfg(target_arch = "x86_64")]
     const AUDIT_ARCH: u32 = 0xC000_003E;

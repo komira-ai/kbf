@@ -54,3 +54,34 @@ fn a_missing_credential_file_is_a_setup_failure_exit_code() {
     let text = String::from_utf8(out.stderr).expect("utf-8");
     assert!(text.starts_with("kbf-task: "), "{text}");
 }
+
+/// Catches: `main` not handing its two hidden modes to the relay, or a mode reporting nothing:
+/// `--sandbox-init` starts its Command and writes the start report on its standard input, the
+/// relay with no PID namespace pending executes the Command itself, and a malformed mode exits 2.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_binary_runs_the_relay_and_the_first_process() {
+    use std::io::Read as _;
+    let run = |args: &[&str]| {
+        let (read, write) = rustix::pipe::pipe().expect("pipe");
+        let status = Command::new(env!("CARGO_BIN_EXE_kbf-task"))
+            .args(args)
+            .stdin(std::process::Stdio::from(write))
+            .status()
+            .expect("kbf-task runs");
+        let mut said = Vec::new();
+        std::fs::File::from(read)
+            .read_to_end(&mut said)
+            .expect("the report");
+        (status.code(), said)
+    };
+    assert_eq!(
+        run(&["--sandbox-init", "--", "/usr/bin/false"]),
+        (Some(1), vec![0, 0])
+    );
+    assert_eq!(
+        run(&["--sandbox-relay", "--group", "1", "--", "/usr/bin/true"]),
+        (Some(0), Vec::new())
+    );
+    assert_eq!(run(&["--sandbox-init"]), (Some(2), Vec::new()));
+}
