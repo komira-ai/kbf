@@ -19,6 +19,7 @@ pub struct E {
     link: Vec<u8>,
     pax: Vec<(String, String)>,
     bad_mode: bool,
+    raw_link: bool,
 }
 
 impl E {
@@ -31,6 +32,7 @@ impl E {
             link: Vec::new(),
             pax: Vec::new(),
             bad_mode: false,
+            raw_link: false,
         }
     }
 
@@ -83,6 +85,13 @@ impl E {
     /// The same entry with a link target of raw bytes.
     pub fn linking(mut self, target: &[u8]) -> E {
         self.link = target.to_vec();
+        self
+    }
+
+    /// The same entry with its link target in the header byte for byte, as an image's tar may
+    /// have it (`set_link_name` drops a `.` component and a trailing `/`).
+    pub fn raw(mut self) -> E {
+        self.raw_link = true;
         self
     }
 
@@ -139,7 +148,9 @@ pub fn layer(entries: &[E]) -> Vec<u8> {
             tar.append(&h, body.as_slice()).expect("pax");
         }
         let mut h = header(&e.path, e.kind, e.mode, e.body.len());
-        if !e.link.is_empty() {
+        if e.raw_link {
+            h.as_old_mut().linkname[..e.link.len()].copy_from_slice(&e.link);
+        } else if !e.link.is_empty() {
             h.set_link_name(OsStr::from_bytes(&e.link)).expect("link");
         }
         if e.bad_mode {
@@ -307,4 +318,34 @@ pub fn top_level(tree: &Tree) -> BTreeMap<String, String> {
             _ => None,
         })
         .collect()
+}
+
+/// The paths of the tree in the bundle `bytes`, as tierstore's flattener reads its manifests.
+pub fn bundle_paths(bytes: &[u8]) -> std::collections::BTreeSet<String> {
+    let mut root = None;
+    let mut objects = std::collections::BTreeMap::new();
+    kbf_tree_bundle::read(bytes, |item| {
+        match item {
+            kbf_tree_bundle::Item::Facts(facts) => root = Some(facts.root),
+            kbf_tree_bundle::Item::Object { sha256, bytes } => {
+                objects.insert(sha256, bytes);
+            }
+        }
+        Ok::<(), String>(())
+    })
+    .expect("a bundle");
+    let root = tierstore::TreeDigest::from_hex(&root.expect("facts")).expect("root");
+    let flat = tierstore::flatten(&root, |d: &tierstore::TreeDigest| {
+        objects.get(&d.to_string()).cloned().ok_or("missing")
+    })
+    .expect("flattens");
+    let mut paths: Vec<String> = Vec::new();
+    for e in &flat {
+        let path = match e.parent {
+            None => String::new(),
+            Some(parent) => format!("{}/{}", paths[parent as usize], e.name),
+        };
+        paths.push(path);
+    }
+    paths.into_iter().collect()
 }

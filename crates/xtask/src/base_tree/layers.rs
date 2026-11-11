@@ -24,10 +24,14 @@
 //! component; a link (symbolic or hard) with no target or a target that is not UTF-8; and a
 //! hard link whose target has a `..` component or is not a regular file the tree holds. A
 //! symbolic link's target is kept as the image has it, absolute or with `..`: in a job the tree
-//! is the container's root, so the kernel resolves it inside the tree. The set-uid,
-//! set-gid and sticky bits are not refused, of a file or a directory: a tree has one owner, so
-//! they grant nothing there, and dropping them only narrows access. They are dropped like the
-//! other mode bits, and the path is listed as normalised with the mode it had.
+//! is the container's root, so the kernel resolves it inside the tree. The set-gid and sticky
+//! bits of a directory are not refused: a tree has one owner, so they grant nothing there, and
+//! dropping them only narrows access. They are dropped like the other mode bits, and the path is
+//! listed as normalised with the mode it had. A set-uid or set-gid file is not normalised: the
+//! packages that bring one are left out ([`trim`], with the list of `super::removed`), and one
+//! still there is refused ([`Rootfs::set_id_files`]).
+
+mod trim;
 
 use std::collections::BTreeMap;
 use std::io::{self, Read};

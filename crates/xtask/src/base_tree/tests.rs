@@ -2,7 +2,9 @@
 //! path and kind, how modes are normalised, and the bundle that is written.
 
 mod bundle;
+mod pinned;
 mod support;
+mod trim;
 
 use std::collections::BTreeMap;
 
@@ -21,7 +23,7 @@ fn scratch(name: &str) -> TestDir {
 /// The tree of `layers` as the layers of a base, with a `kbf-task` of the bytes `kbf-task`.
 fn built(layers: &[Vec<u8>]) -> Tree {
     let img = image(layers, &[], false);
-    match tree_of(&img.bytes, &img.base, b"kbf-task".to_vec()) {
+    match tree_of(&img.bytes, &img.base, &[], &[], b"kbf-task".to_vec()) {
         Ok(tree) => tree,
         Err(e) => panic!("refused: {e:?}"),
     }
@@ -30,7 +32,7 @@ fn built(layers: &[Vec<u8>]) -> Tree {
 /// The problems the tree of `layers` is refused with.
 fn refused(layers: &[Vec<u8>]) -> Vec<String> {
     let img = image(layers, &[], false);
-    match tree_of(&img.bytes, &img.base, b"kbf-task".to_vec()) {
+    match tree_of(&img.bytes, &img.base, &[], &[], b"kbf-task".to_vec()) {
         Err(Error::Refused(problems)) => problems,
         Err(e) => panic!("failed, not refused: {e:?}"),
         Ok(_) => panic!("accepted"),
@@ -125,7 +127,7 @@ fn layers_are_applied_in_order_with_whiteouts_and_replacements() {
     let layers = [one, two];
     assert_eq!(listing(&built(&layers)), expected);
     let gz = image(&layers, &[], true);
-    let tree = tree_of(&gz.bytes, &gz.base, b"kbf-task".to_vec()).expect("gzip layers");
+    let tree = tree_of(&gz.bytes, &gz.base, &[], &[], b"kbf-task".to_vec()).expect("gzip layers");
     assert_eq!(listing(&tree), expected);
 }
 
@@ -452,45 +454,6 @@ fn modes_are_normalised_and_every_change_is_listed_by_path() {
     }
 }
 
-/// Asserts a set-uid file, a set-gid file, one that is both, a set-uid file with no execute bit
-/// and a hard link to a set-uid file are each taken, with the bits dropped like the other mode
-/// bits, and listed with the mode they had; the base's set-uid programs (`su`, `passwd`) are such
-/// files. Catches: a set-uid or set-gid bit kept in the tree, a file whose bits were dropped left
-/// out of the facts, and a release refused for a base that holds one.
-#[test]
-fn set_uid_and_set_gid_files_are_normalised_and_listed() {
-    let tree = built(&[layer(&[
-        E::file("usr/bin/su", 0o4755, b"su"),
-        E::file("usr/bin/chage", 0o2755, b"chage"),
-        E::file("usr/bin/both", 0o6755, b"both"),
-        E::file("usr/bin/odd", 0o4644, b"odd"),
-        E::hardlink("usr/bin/su2", 0o4755, "usr/bin/su"),
-    ])]);
-    assert_eq!(
-        tree.normalised,
-        [
-            norm("/usr/bin/both", "6755", "0755"),
-            norm("/usr/bin/chage", "2755", "0755"),
-            norm("/usr/bin/odd", "4644", "0644"),
-            norm("/usr/bin/su", "4755", "0755"),
-            norm("/usr/bin/su2", "4755", "0755"),
-        ]
-    );
-    let seen = listing(&tree);
-    for (path, exec) in [
-        ("/usr/bin/su", true),
-        ("/usr/bin/chage", true),
-        ("/usr/bin/both", true),
-        ("/usr/bin/odd", false),
-        ("/usr/bin/su2", true),
-    ] {
-        let Some(Seen::File { exec: got, .. }) = seen.get(path) else {
-            panic!("{path} is not a file");
-        };
-        assert_eq!(*got, exec, "{path}");
-    }
-}
-
 /// Asserts a hard link becomes a second file entry with the target's bytes and mode, whether the
 /// target is in a lower layer or earlier in the same layer and however the path is spelled, that
 /// both paths are listed when the mode is normalised, and that the bundle holds the bytes once.
@@ -541,7 +504,14 @@ fn kbf_tools_holds_exactly_the_given_kbf_task_and_the_top_layer_is_not_read() {
         E::special("dev/null", tar::EntryType::Char),
     ])];
     let img = image(&base, &top, false);
-    let tree = tree_of(&img.bytes, &img.base, b"the release's kbf-task".to_vec()).expect("tree");
+    let tree = tree_of(
+        &img.bytes,
+        &img.base,
+        &[],
+        &[],
+        b"the release's kbf-task".to_vec(),
+    )
+    .expect("tree");
     let seen = listing(&tree);
     let tools: Vec<(String, Seen)> = seen
         .iter()
@@ -579,7 +549,8 @@ fn the_same_base_gives_the_same_subtrees_and_another_root_for_another_kbf_task()
         layer(&[E::file("usr/lib/libc", 0o644, b"libc")]),
     ];
     let img = image(&layers, &[], false);
-    let make = |binary: &[u8]| tree_of(&img.bytes, &img.base, binary.to_vec()).expect("tree");
+    let make =
+        |binary: &[u8]| tree_of(&img.bytes, &img.base, &[], &[], binary.to_vec()).expect("tree");
     let (one, two, again) = (make(b"release 1"), make(b"release 2"), make(b"release 1"));
     let (a, b) = (top_level(&one), top_level(&two));
     assert_eq!(a.keys().collect::<Vec<_>>(), b.keys().collect::<Vec<_>>());
@@ -610,11 +581,16 @@ fn an_image_whose_layers_are_not_the_bases_is_refused() {
         layer(&[E::file("c", 0o644, b"c")]),
     );
     let digest = |l: &[u8]| format!("sha256:{}", Sha256::of(l));
-    let tree_of_img =
-        |image: &Img, base: &Img| match tree_of(&image.bytes, &base.base, b"k".to_vec()) {
-            Err(Error::Refused(problems)) => problems,
-            _ => panic!("not refused"),
-        };
+    let tree_of_img = |image: &Img, base: &Img| match tree_of(
+        &image.bytes,
+        &base.base,
+        &[],
+        &[],
+        b"k".to_vec(),
+    ) {
+        Err(Error::Refused(problems)) => problems,
+        _ => panic!("not refused"),
+    };
     let ab = image(&[a.clone(), b.clone()], &[], false);
     let abc = image(&[a.clone(), b.clone(), c.clone()], &[], false);
     assert_eq!(
@@ -639,7 +615,7 @@ fn an_image_whose_layers_are_not_the_bases_is_refused() {
         ]
     );
     // More layers than the base's are fine: the layers above it are ignored.
-    assert!(tree_of(&abc.bytes, &ab.base, b"k".to_vec()).is_ok());
+    assert!(tree_of(&abc.bytes, &ab.base, &[], &[], b"k".to_vec()).is_ok());
 
     let nothing = image(&[], &[], false);
     let empty_tar = Img {

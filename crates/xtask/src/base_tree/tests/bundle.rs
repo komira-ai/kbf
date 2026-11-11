@@ -95,7 +95,7 @@ fn the_entries_and_depth_of_the_tree_are_tierstores() {
 fn the_bundle_holds_the_facts_the_files_and_the_manifests_and_is_listed() {
     for platform in [Platform::LinuxX86_64, Platform::LinuxArm64] {
         let w = world("bundle", &small_base(), b"kbf-task bytes", platform);
-        let printed = run_with(&w.args, &w.base).expect("run");
+        let printed = run_with(&w.args, &w.base, &[], &[]).expect("run");
         let name = format!("kbf-base-tree-{COMMIT}-{}.tree.tar", platform.name());
         let bundle = std::fs::read(w.out.join(&name)).expect("bundle");
 
@@ -182,14 +182,14 @@ fn the_bundle_holds_the_facts_the_files_and_the_manifests_and_is_listed() {
 #[test]
 fn a_bundle_already_listed_or_already_there_is_refused_and_left_alone() {
     let w = world("listed", &small_base(), b"k", Platform::LinuxX86_64);
-    run_with(&w.args, &w.base).expect("first run");
+    run_with(&w.args, &w.base, &[], &[]).expect("first run");
     let name = format!("kbf-base-tree-{COMMIT}-linux-x86_64.tree.tar");
     let sums = w.out.join("SHA256SUMS.linux-x86_64");
     let (bundle, listed) = (
         std::fs::read(w.out.join(&name)).expect("bundle"),
         std::fs::read(&sums).expect("sums"),
     );
-    let Err(Error::Failed(why)) = run_with(&w.args, &w.base) else {
+    let Err(Error::Failed(why)) = run_with(&w.args, &w.base, &[], &[]) else {
         panic!("a second run was not refused");
     };
     assert_eq!(why, format!("{} already lists {name}", sums.display()));
@@ -202,7 +202,7 @@ fn a_bundle_already_listed_or_already_there_is_refused_and_left_alone() {
         .out
         .join(format!("kbf-base-tree-{COMMIT}-linux-arm64.tree.tar"));
     std::fs::write(&there, b"something else").expect("file");
-    let Err(Error::Spawn { what, .. }) = run_with(&other.args, &other.base) else {
+    let Err(Error::Spawn { what, .. }) = run_with(&other.args, &other.base, &[], &[]) else {
         panic!("an existing file was not refused");
     };
     assert_eq!(what, format!("create {}", there.display()));
@@ -218,7 +218,7 @@ fn a_refused_image_writes_and_lists_nothing() {
     let mut layers = small_base();
     layers.push(layer(&[E::special("dev/null", tar::EntryType::Char)]));
     let w = world("refused", &layers, b"k", Platform::LinuxX86_64);
-    let Err(Error::Refused(problems)) = run_with(&w.args, &w.base) else {
+    let Err(Error::Refused(problems)) = run_with(&w.args, &w.base, &[], &[]) else {
         panic!("not refused");
     };
     assert_eq!(problems, ["/dev/null: a character device"]);
@@ -228,17 +228,17 @@ fn a_refused_image_writes_and_lists_nothing() {
         commit: "abc123".to_owned(),
         ..clone_args(&w.args)
     };
-    assert!(run_with(&short, &w.base).is_err());
+    assert!(run_with(&short, &w.base, &[], &[]).is_err());
     short.commit = COMMIT.to_owned();
     short.image = w.dir.join("no-image");
     assert!(matches!(
-        run_with(&short, &w.base),
+        run_with(&short, &w.base, &[], &[]),
         Err(Error::Spawn { .. })
     ));
     short.image = w.args.image.clone();
     short.binary = w.dir.join("no-binary");
     assert!(matches!(
-        run_with(&short, &w.base),
+        run_with(&short, &w.base, &[], &[]),
         Err(Error::Spawn { .. })
     ));
     assert!(!w.out.exists());
@@ -298,7 +298,7 @@ fn the_verb_is_for_linux_and_checks_the_image_against_the_pinned_base() {
 fn a_bundle_that_is_not_what_was_written_is_refused_and_removed() {
     let w = world("readback", &small_base(), b"k", Platform::LinuxX86_64);
     let img = std::fs::read(&w.args.image).expect("image");
-    let tree = tree_of(&img, &w.base, b"k".to_vec()).expect("tree");
+    let tree = tree_of(&img, &w.base, &[], &[], b"k".to_vec()).expect("tree");
     let facts = facts_of(COMMIT, Platform::LinuxX86_64, &tree);
     let path = w.dir.join("bundle.tree.tar");
     let file = std::fs::File::create_new(&path).expect("file");
