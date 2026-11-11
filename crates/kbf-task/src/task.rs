@@ -4,7 +4,9 @@
 //! [`execute`] reads the Action, its Command and its input tree through a [`BlobSource`], runs the
 //! Command, collects its outputs, builds the manifest and the pack, and stores the pack through a
 //! [`PackSink`]. The source and the sink are parameters so the whole order runs in tests without a
-//! network; [`main_with`] supplies the real ones, built from the flags.
+//! network; [`main_with`] supplies the real ones, built from the flags. A tree job (`--tree`) has
+//! no source: [`crate::tree`] reads the Action, the Command and the input root from the job's
+//! root, and the rest of the order is the same.
 //!
 //! # Exit codes
 //!
@@ -15,8 +17,8 @@
 //! |------|---------|
 //! | 0 | the action ran (whatever its exit code, a timeout included) and its pack was stored |
 //! | 2 | the flags are wrong (clap) |
-//! | 10 | fetch: the Action, the Command or an input could not be read or checked, or laid out |
-//! | 11 | run-start: the Command could not be started (bad paths, no program, a `kbf-network` property other than `allow`), or the run's `private/` home, tmp and cache directories, or the directories of its sandbox (`crate::sandbox`), could not be made or opened |
+//! | 10 | fetch: the Action, the Command or an input could not be read or checked, or laid out; in a tree job, `.kbf/action` or `.kbf/command` could not be read, is not the blob its digest names (the Action's is `--action`) or does not decode, or `work` is not a directory |
+//! | 11 | run-start: the Command could not be started (bad paths, no program, a `kbf-network` property other than `allow`), or the run's `private/` home, tmp and cache directories, or the directories of its sandbox (`crate::sandbox`), could not be made or opened; in a tree job, also its run directory `.kbf-run` (an existing one is refused) |
 //! | 12 | pack: the outputs could not be collected, did not fit the run's packs and large objects (`output-too-large`), changed after they were hashed (`output-changed`), or made a manifest or pack the frontend would refuse (`invalid-manifest`, `invalid-pack`) |
 //! | 13 | put: a pack or large object could not be stored (refused, key already taken, still no room after the retries of a 503, unreachable), or a large object's bytes changed while it was sent (the stored object is an orphan) |
 //! | 14 | setup: `--lease` is not a build id, a credential or root certificate is unusable, a credential given as a flag value without `--insecure-argv-secrets`, or the runtime did not start |
@@ -29,7 +31,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::{ArgGroup, Parser};
-use kbf_proto::reapi::{self, Action, Command};
+use kbf_proto::reapi::{self, Action};
 use kbf_segments::sha256;
 use kbf_task_pack::{
     LargeEntry, MAX_LARGE, MAX_PACKS, OutputDirectory, OutputFile, OutputSymlink, TaskManifest,
@@ -38,9 +40,8 @@ use kbf_task_pack::{
 use kbf_types::Digest;
 
 use crate::digest;
-use crate::fetch::{
-    BlobSource, FetchError, HttpBlobSource, LocatedSource, fetch_message, materialize, native_roots,
-};
+use crate::fetch::{BlobSource, FetchError, HttpBlobSource, LocatedSource, native_roots};
+use crate::inputs::{Inputs, fetch_inputs};
 use crate::network;
 use crate::outputs::{Blobs, OutputLimits, collect_outputs};
 use crate::pack::{MAX_LARGE_BYTES, PackError, build, build_extra};
@@ -117,7 +118,7 @@ pub const EXIT_NO_CONFINE: u8 = 15;
     name = "kbf-task",
     version = concat!(env!("CARGO_PKG_VERSION"), "+", env!("KBF_BUILD_COMMIT")),
     group(ArgGroup::new("pack_url_source").required(true).args(["pack_url_file", "pack_url", "put_urls_file", "put_urls"])),
-    group(ArgGroup::new("grant_token_source").required(true).args(["grant_token_file", "grant_token"]))
+    group(ArgGroup::new("grant_token_source").args(["grant_token_file", "grant_token"]))
 )]
 pub struct Cli {
     /// A file holding the presigned URL the pack is PUT to, once. The URL is a credential, so by
@@ -145,9 +146,30 @@ pub struct Cli {
     /// `--insecure-argv-secrets`.
     #[arg(long)]
     pub put_urls: Option<String>,
-    /// The base URL of the read grant: blobs are read from `<base>/<hex>/<size>`.
-    #[arg(long)]
-    pub grant_url: String,
+    /// The base URL of the read grant: blobs are read from `<base>/<hex>/<size>`. Required, with
+    /// `--grant-token-file` or `--grant-token`, unless `--tree` is given.
+    #[arg(
+        long,
+        required_unless_present = "tree",
+        requires = "grant_token_source"
+    )]
+    pub grant_url: Option<String>,
+    /// Run a tree job whose root file system is the action's tree, rooted at `ROOT` (`--tree`
+    /// alone: `/`): no read grant and no fetch; the Action and Command are read from
+    /// `<ROOT>/.kbf`, the inputs are `<ROOT>/work` and the run directory is `<ROOT>/.kbf-run`
+    /// (see the `tree` module). The grant and fetch flags and `--work-dir` are refused with it.
+    #[arg(
+        long,
+        value_name = "ROOT",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "/",
+        conflicts_with_all = [
+            "grant_url", "grant_token_file", "grant_token", "fetch_concurrency", "fetch_batch",
+            "allow_plain_http_grant", "locate", "work_dir",
+        ]
+    )]
+    pub tree: Option<PathBuf>,
     /// The most requests to the read grant in flight at once while the input tree is fetched, 1 to
     /// 256. The tree is read breadth-first: each level's Directory messages together, then every
     /// distinct file blob, each streamed to disk.
@@ -431,12 +453,16 @@ pub async fn execute(
     source: &dyn BlobSource,
     sink: &dyn PackSink,
 ) -> Result<TaskManifest, Failure> {
-    let limits = Limits {
+    execute_with(cli, source, sink, &sink_limits(sink)).await
+}
+
+/// The real placement limits, with the slots `sink` was issued.
+pub(crate) fn sink_limits(sink: &dyn PackSink) -> Limits {
+    Limits {
         packs: sink.pack_slots(),
         large: sink.large_slots(),
         ..Limits::real()
-    };
-    execute_with(cli, source, sink, &limits).await
+    }
 }
 
 /// [`execute`] within `limits`: the placement limits are a parameter so a test can use small packs.
@@ -448,38 +474,44 @@ pub(crate) async fn execute_with(
     sink: &dyn PackSink,
     limits: &Limits,
 ) -> Result<TaskManifest, Failure> {
+    check_slots(limits)?;
+    let inputs = fetch_inputs(cli, source)?;
+    complete(cli, inputs, sink, limits).await
+}
+
+/// Refuses a sink or limits with more pack or large slots than a manifest can name (8 of each),
+/// before anything is read.
+pub(crate) fn check_slots(limits: &Limits) -> Result<(), Failure> {
     if limits.packs > usize::from(MAX_PACKS) || limits.large > usize::from(MAX_LARGE) {
         return Err(Failure::Setup(format!(
             "{} pack slots and {} large slots; a manifest names at most {MAX_PACKS} and {MAX_LARGE}",
             limits.packs, limits.large
         )));
     }
-    let fetching = Instant::now();
-    let action_digest = digest::to_reapi(&cli.action);
-    let action: Action = fetch_message(source, &action_digest)?;
-    let command: Command =
-        fetch_message(source, &named("command", action.command_digest.as_ref())?)?;
-    // Read before the inputs are fetched: a refused property costs no download.
-    let network = network::from_platform(&action, &command)?;
-    if network == network::Network::Allowed {
-        eprintln!("{}", network::allowed_notice(&cli.action));
-    }
-    let input_root = named("input root", action.input_root_digest.as_ref())?;
-    let root = cli.work_dir.join("in");
-    materialize(
-        source,
-        &input_root,
-        &root,
-        usize::from(cli.fetch_concurrency),
-    )?;
-    let fetch_ms = millis(fetching.elapsed());
-    if let Some(report) = source.report() {
-        eprintln!("kbf-task: {report}");
-    }
+    Ok(())
+}
 
-    let stdout = cli.work_dir.join("stdout");
-    let stderr = cli.work_dir.join("stderr");
-    let private = cli.work_dir.join("private");
+/// Everything after the inputs: run the Command, collect its outputs, build the manifest and
+/// store it with the outputs through `sink`.
+pub(crate) async fn complete(
+    cli: &Cli,
+    inputs: Inputs,
+    sink: &dyn PackSink,
+    limits: &Limits,
+) -> Result<TaskManifest, Failure> {
+    let Inputs {
+        action,
+        command,
+        network,
+        root,
+        run_dir,
+        hidden,
+        fetch_ms,
+        stats,
+    } = inputs;
+    let stdout = run_dir.join("stdout");
+    let stderr = run_dir.join("stderr");
+    let private = run_dir.join("private");
     let unreadable = credential_files(cli);
     let ran = run(
         &command,
@@ -491,7 +523,7 @@ pub(crate) async fn execute_with(
             deadline: deadline(&action, Duration::from_millis(cli.deadline_ms)),
             network,
             unreadable: &unreadable,
-            hidden: &sandbox::hidden_for(&cli.work_dir),
+            hidden: &hidden,
             relay: cli.relay.as_deref(),
         },
     )
@@ -539,7 +571,7 @@ pub(crate) async fn execute_with(
         },
         packs: 1,
         large: Vec::new(),
-        inputs: None,
+        inputs: stats,
         objects: None,
     };
     for file in &result.output_files {
@@ -625,7 +657,10 @@ fn store_outputs(
 }
 
 /// The digest an Action field names, or a fetch failure saying which field is missing.
-fn named(what: &str, digest: Option<&reapi::Digest>) -> Result<reapi::Digest, FetchError> {
+pub(crate) fn named(
+    what: &str,
+    digest: Option<&reapi::Digest>,
+) -> Result<reapi::Digest, FetchError> {
     digest
         .cloned()
         .ok_or_else(|| FetchError::Invalid(format!("the Action names no {what}")))
@@ -654,13 +689,13 @@ fn deadline(action: &Action, cap: Duration) -> Duration {
 }
 
 /// A duration in whole milliseconds, saturating.
-fn millis(d: Duration) -> u64 {
+pub(crate) fn millis(d: Duration) -> u64 {
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Refuses a credential given as a flag value unless `--insecure-argv-secrets` allows it. The
 /// message names the flags, never their values.
-fn check_argv_secrets(cli: &Cli) -> Result<(), Failure> {
+pub(crate) fn check_argv_secrets(cli: &Cli) -> Result<(), Failure> {
     let used = [
         ("--pack-url", cli.pack_url.is_some()),
         ("--put-urls", cli.put_urls.is_some()),
@@ -677,15 +712,14 @@ fn check_argv_secrets(cli: &Cli) -> Result<(), Failure> {
 
 /// Refuses a lease the frontend would refuse in a manifest ([`check_build`]), before anything is
 /// fetched: the Command would run for nothing, and its pack would be refused after the PUT.
-fn check_lease(cli: &Cli) -> Result<(), Failure> {
+pub(crate) fn check_lease(cli: &Cli) -> Result<(), Failure> {
     check_build(&cli.lease).map_err(|e| Failure::Setup(format!("--lease: {e}")))
 }
 
 /// Refuses an `http` grant URL unless `--allow-plain-http-grant` was given, before anything is
 /// requested. The message names the flag, not the URL, whose query may be a credential.
 fn check_grant_scheme(cli: &Cli) -> Result<(), Failure> {
-    let plain = cli
-        .grant_url
+    let plain = grant_url(cli)
         .get(..7)
         .is_some_and(|scheme| scheme.eq_ignore_ascii_case("http://"));
     if plain && !cli.allow_plain_http_grant {
@@ -721,7 +755,7 @@ fn credential(what: &str, file: Option<&Path>, flag: Option<&str>) -> Result<Str
 
 /// The URLs the run PUTs to: the key set of `--put-urls-file`/`--put-urls`, else the single pack
 /// URL of the v1 flags as a key set of one pack and no large object.
-fn put_urls(cli: &Cli) -> Result<PutUrls, Failure> {
+pub(crate) fn put_urls(cli: &Cli) -> Result<PutUrls, Failure> {
     let set = PutUrls::from_sources(cli.put_urls_file.as_deref(), cli.put_urls.as_deref())
         .map_err(|e| Failure::Setup(format!("the v2 key set: {e}")))?;
     match set {
@@ -738,7 +772,7 @@ fn put_urls(cli: &Cli) -> Result<PutUrls, Failure> {
 }
 
 /// The host's roots and the DER certificates `--root-der` names.
-fn trusted_roots(cli: &Cli) -> Result<Vec<Vec<u8>>, Failure> {
+pub(crate) fn trusted_roots(cli: &Cli) -> Result<Vec<Vec<u8>>, Failure> {
     let mut roots = native_roots();
     for path in &cli.root_der {
         roots.push(
@@ -746,6 +780,27 @@ fn trusted_roots(cli: &Cli) -> Result<Vec<Vec<u8>>, Failure> {
         );
     }
     Ok(roots)
+}
+
+/// The read grant's URL; empty only in a tree job, which reads no grant (clap requires the flag
+/// without `--tree`).
+fn grant_url(cli: &Cli) -> &str {
+    cli.grant_url.as_deref().unwrap_or_default()
+}
+
+/// The real sink: the PUTs to `urls`, over TLS with `roots` (and plain `http` too with
+/// `--allow-plain-http-put`).
+pub(crate) fn http_sink(cli: &Cli, urls: PutUrls, roots: &[Vec<u8>]) -> HttpSink {
+    HttpSink {
+        agent: if cli.allow_plain_http_put {
+            agent_with_plain_http(tls_config(roots))
+        } else {
+            agent(Some(tls_config(roots)))
+        },
+        urls,
+        sleeper: Arc::new(ThreadSleeper),
+        jitter: Arc::new(RandomJitter),
+    }
 }
 
 /// The trusted roots and the real source and sink the flags name.
@@ -767,18 +822,9 @@ fn connect_with_roots(cli: &Cli) -> Result<(HttpBlobSource, HttpSink, Vec<Vec<u8
     let roots = trusted_roots(cli)?;
     let urls = put_urls(cli)?;
     let source =
-        HttpBlobSource::new_with(&cli.grant_url, &token, &roots, cli.allow_plain_http_grant)?
+        HttpBlobSource::new_with(grant_url(cli), &token, &roots, cli.allow_plain_http_grant)?
             .with_batch(cli.fetch_batch);
-    let sink = HttpSink {
-        agent: if cli.allow_plain_http_put {
-            agent_with_plain_http(tls_config(&roots))
-        } else {
-            agent(Some(tls_config(&roots)))
-        },
-        urls,
-        sleeper: Arc::new(ThreadSleeper),
-        jitter: Arc::new(RandomJitter),
-    };
+    let sink = http_sink(cli, urls, &roots);
     Ok((source, sink, roots))
 }
 
@@ -800,8 +846,13 @@ fn connect_located(cli: &Cli) -> Result<(Box<dyn BlobSource>, HttpSink), Failure
 
 /// Runs the task the flags describe against the real grant and the real presigned URL, and turns
 /// the outcome into the process exit code (see the module documentation). A failure is written to
-/// standard error; no message holds the token or the presigned URL's query.
+/// standard error; no message holds the token or the presigned URL's query. With `--tree` there is
+/// no grant: the run reads its tree ([`crate::tree`]) and stores through the same sink.
 pub async fn main_with(cli: &Cli) -> ExitCode {
+    if let Some(root) = cli.tree.as_deref() {
+        let sink = crate::tree::connect(cli).map(|sink| -> Box<dyn PackSink> { Box::new(sink) });
+        return crate::tree::finish(cli, root, sink).await;
+    }
     let connected = connect_located(cli).map(|(source, sink)| {
         let sink: Box<dyn PackSink> = Box::new(sink);
         (source, sink)
@@ -819,6 +870,11 @@ async fn finish(cli: &Cli, connected: Result<Connected, Failure>) -> ExitCode {
         Ok((source, sink)) => execute(cli, source.as_ref(), sink.as_ref()).await,
         Err(failure) => Err(failure),
     };
+    exit_code(outcome)
+}
+
+/// The exit code of a run's outcome; a failure is written to standard error first.
+pub(crate) fn exit_code(outcome: Result<TaskManifest, Failure>) -> ExitCode {
     match outcome {
         Ok(_) => ExitCode::SUCCESS,
         Err(failure) => {

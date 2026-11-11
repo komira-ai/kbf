@@ -5,6 +5,7 @@ use crate::outputs::collect_outputs;
 use crate::pack::MAX_LARGE_BYTES;
 use crate::task::recording_sink::Put;
 use crate::task::recording_sink::flip_first_byte;
+use kbf_proto::reapi::Command;
 use kbf_segments::crc32c;
 use kbf_segments::layout::footer_len;
 use kbf_task_pack::{LargeEntry, MAX_RECORD_BYTES, read_manifest_with, write_pack};
