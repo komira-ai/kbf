@@ -1,16 +1,19 @@
 //! The `kbf-bench` command line, and the run it describes.
 
+use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::bench::{self, Method, Options};
-use crate::connect::{self, ConnectError, Target};
+use crate::connect::{self, ConnectError, Target, Tls};
+use crate::noop::{self, Arm, NoopError, Plan, Summary};
+use crate::program::Arch;
 use crate::report::Report;
 use crate::tree::{self, Shape, TreeError};
 
-/// Times blob uploads to (and reads from) a kbf-server's CAS.
+/// Times blob uploads to (and reads from) a kbf-server's CAS, and no-op actions.
 #[derive(Debug, Parser)]
 #[command(name = "kbf-bench", version)]
 pub struct Cli {
@@ -36,6 +39,51 @@ pub enum Command {
         #[command(flatten)]
         run: RunArgs,
     },
+    /// Times Executes of actions that do nothing, from sending each to its done
+    /// operation, against one or more frontends (the arms), one at a time and then many
+    /// at once, and writes one JSON line per run.
+    Noop(NoopArgs),
+}
+
+/// The flags of `noop`.
+#[derive(Debug, clap::Args)]
+pub struct NoopArgs {
+    /// An arm: a name for the records and its frontend's REAPI listener (`https://`, or
+    /// `http://` when it serves plain text), as `NAME=URL`. Give it once per arm; the
+    /// arms' blocks alternate in the order given.
+    #[arg(long = "arm", required = true, value_parser = parse_arm)]
+    pub arms: Vec<(String, String)>,
+    /// The TLS flags, the same for every arm.
+    #[command(flatten)]
+    pub tls: Tls,
+    /// The REAPI instance name of every request.
+    #[arg(long, default_value = "")]
+    pub instance_name: String,
+    /// A platform property of the action, as `NAME=VALUE`; repeat for more.
+    #[arg(long = "platform", value_parser = parse_property)]
+    pub platform: Vec<(String, String)>,
+    /// The machine `./noop` is written for; the one kbf-bench runs on when left out.
+    #[arg(long, value_enum)]
+    pub arch: Option<Arch>,
+    /// In every action's environment, so a new seed makes new actions; from the clock
+    /// when left out. The table names it.
+    #[arg(long)]
+    pub seed: Option<u64>,
+    /// Runs per arm one at a time.
+    #[arg(long, default_value_t = 300)]
+    pub serial_runs: u64,
+    /// Runs per arm after those, `--in-flight` at a time.
+    #[arg(long, default_value_t = 300)]
+    pub parallel_runs: u64,
+    /// The Executes open at once in the parallel runs, over all arms together.
+    #[arg(long, default_value_t = 64, value_parser = clap::value_parser!(u64).range(1..))]
+    pub in_flight: u64,
+    /// Runs per arm in a block: the arms' blocks alternate.
+    #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u64).range(1..))]
+    pub block: u64,
+    /// The file the runs are written to, one JSON line each.
+    #[arg(long)]
+    pub jsonl: PathBuf,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -109,6 +157,22 @@ pub enum CliError {
     Tree(#[from] TreeError),
     #[error(transparent)]
     Connect(#[from] ConnectError),
+    #[error("--arm {0}: given twice")]
+    TwiceNamed(String),
+    #[error("--arm {arm}: {source}")]
+    Arm {
+        arm: String,
+        #[source]
+        source: ConnectError,
+    },
+    #[error(transparent)]
+    Noop(#[from] NoopError),
+    #[error("--jsonl {path}: {source}")]
+    Jsonl {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("--json {path}: {source}")]
     Json {
         path: PathBuf,
@@ -146,17 +210,122 @@ pub fn parse_size(text: &str) -> Result<u64, String> {
     })
 }
 
-/// Builds the tree, makes the run `cli` describes and writes its JSON; returns the
-/// report, complete or not.
+/// `NAME=URL`: a name of letters, digits, `-` and `_`, and a URL.
+///
+/// # Errors
+/// No `=`, an empty or other name, or an empty URL.
+pub fn parse_arm(text: &str) -> Result<(String, String), String> {
+    let pair = text.split_once('=').filter(|(name, url)| {
+        let named = name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() | (b == b'-') | (b == b'_'));
+        named & !name.is_empty() & !url.is_empty()
+    });
+    pair.map(|(name, url)| (name.to_owned(), url.to_owned()))
+        .ok_or_else(|| format!("{text:?} is not NAME=URL (a name of letters, digits, - and _)"))
+}
+
+/// `NAME=VALUE`, a platform property: a name that is not empty, and any value.
+///
+/// # Errors
+/// No `=`, or an empty name.
+pub fn parse_property(text: &str) -> Result<(String, String), String> {
+    let pair = text.split_once('=').filter(|(name, _)| !name.is_empty());
+    pair.map(|(name, value)| (name.to_owned(), value.to_owned()))
+        .ok_or_else(|| format!("{text:?} is not NAME=VALUE"))
+}
+
+/// What a run of `kbf-bench` ended with.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Finished {
+    /// `upload` or `read`.
+    Blobs(Report),
+    Noop(Summary),
+}
+
+impl Finished {
+    /// Everything planned succeeded.
+    #[must_use]
+    pub fn complete(&self) -> bool {
+        match self {
+            Self::Blobs(report) => report.complete(),
+            Self::Noop(summary) => summary.complete(),
+        }
+    }
+
+    /// The table for a terminal.
+    #[must_use]
+    pub fn table(&self) -> String {
+        match self {
+            Self::Blobs(report) => report.table(),
+            Self::Noop(summary) => summary.table(),
+        }
+    }
+}
+
+/// Makes the run `cli` describes; returns what it ended with, complete or not.
+///
+/// # Errors
+/// As [`blobs`] and [`noop`].
+pub async fn run(cli: &Cli) -> Result<Finished, CliError> {
+    match &cli.command {
+        Command::Upload { run, find_missing } => blobs(run, *find_missing == OnOff::On, true).await,
+        Command::Read { run } => blobs(run, false, false).await,
+        Command::Noop(args) => noop(args).await.map(Finished::Noop),
+    }
+}
+
+/// Connects to every arm and runs the benchmark `args` describes, writing its records to
+/// `--jsonl`.
+///
+/// # Errors
+/// An arm named twice; an arm's connection cannot be set up; the `--jsonl` file cannot
+/// be made or written; an arm refused the actions' blobs.
+pub async fn noop(args: &NoopArgs) -> Result<Summary, CliError> {
+    let mut arms: Vec<Arm> = Vec::new();
+    for (name, url) in &args.arms {
+        if arms.iter().any(|arm| arm.name == *name) {
+            return Err(CliError::TwiceNamed(name.clone()));
+        }
+        let channel =
+            connect::channel_to(url.clone(), &args.tls).map_err(|source| CliError::Arm {
+                arm: name.clone(),
+                source,
+            })?;
+        arms.push(Arm {
+            name: name.clone(),
+            channel,
+        });
+    }
+    let plan = Plan {
+        instance_name: args.instance_name.clone(),
+        platform: args.platform.clone(),
+        arch: args
+            .arch
+            .or_else(|| Arch::from_name(std::env::consts::ARCH))
+            .ok_or(CliError::Usage(
+                "./noop is written for x86_64 and aarch64 only: name one with --arch",
+            ))?,
+        seed: args.seed.unwrap_or_else(clock_seed),
+        serial_runs: args.serial_runs,
+        parallel_runs: args.parallel_runs,
+        in_flight: args.in_flight as usize,
+        block: args.block,
+    };
+    let file = std::fs::File::create(&args.jsonl).map_err(|source| CliError::Jsonl {
+        path: args.jsonl.clone(),
+        source,
+    })?;
+    Ok(noop::run(&plan, &arms, &mut BufWriter::new(file)).await?)
+}
+
+/// Builds the tree, makes the `upload` (or `read`) `args` describes and writes its JSON;
+/// returns the report, complete or not.
 ///
 /// # Errors
 /// `read` without `--seed`; the tree cannot be made; the connection cannot be set up;
 /// the JSON cannot be written.
-pub async fn run(cli: &Cli) -> Result<Report, CliError> {
-    let (args, find_missing, upload) = match &cli.command {
-        Command::Upload { run, find_missing } => (run, *find_missing == OnOff::On, true),
-        Command::Read { run } => (run, false, false),
-    };
+async fn blobs(args: &RunArgs, find_missing: bool, upload: bool) -> Result<Finished, CliError> {
     let seed = match (args.tree.seed, upload) {
         (Some(seed), _) => seed,
         (None, true) => clock_seed(),
@@ -199,7 +368,7 @@ pub async fn run(cli: &Cli) -> Result<Report, CliError> {
             source,
         })?;
     }
-    Ok(report)
+    Ok(Finished::Blobs(report))
 }
 
 /// Nanoseconds since 1970: another seed every run.
