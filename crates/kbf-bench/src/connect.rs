@@ -19,6 +19,13 @@ pub struct Target {
     /// plain text).
     #[arg(long)]
     pub cas: String,
+    #[command(flatten)]
+    pub tls: Tls,
+}
+
+/// The daemon's TLS flags: how to check the server, and how to present a client.
+#[derive(Clone, Debug, Default, clap::Args)]
+pub struct Tls {
     /// PEM file of the CA certificates that sign the server's certificate (`https://`
     /// only; required there).
     #[arg(long)]
@@ -53,10 +60,18 @@ pub enum ConnectError {
 /// A URL that is neither `http://` nor `https://`; TLS flags with `http://`; `https://`
 /// without `--ca-cert`; a TLS file that cannot be read or parsed; a URL tonic refuses.
 pub fn channel(target: &Target) -> Result<Channel, ConnectError> {
-    let url = target.cas.clone();
+    channel_to(target.cas.clone(), &target.tls)
+}
+
+/// A channel to `url` with the TLS flags `flags`, as [`channel`] makes it: the one
+/// connection of a `noop` arm too.
+///
+/// # Errors
+/// As [`channel`].
+pub fn channel_to(url: String, flags: &Tls) -> Result<Channel, ConnectError> {
     let plain = url.starts_with("http://");
     let tls_flags =
-        target.ca_cert.is_some() | target.cert.is_some() | target.tls_server_name.is_some();
+        flags.ca_cert.is_some() | flags.cert.is_some() | flags.tls_server_name.is_some();
     if plain & tls_flags {
         return Err(ConnectError::Usage(
             url,
@@ -79,18 +94,18 @@ pub fn channel(target: &Target) -> Result<Channel, ConnectError> {
             "must be an http:// or https:// URL",
         ));
     }
-    let Some(ca_cert) = target.ca_cert.clone() else {
+    let Some(ca_cert) = flags.ca_cert.clone() else {
         return Err(ConnectError::Usage(url, "an https:// URL needs --ca-cert"));
     };
-    let tls = match (&target.cert, &target.key) {
+    let tls = match (&flags.cert, &flags.key) {
         (Some(cert), Some(key)) => TlsFiles {
             ca_cert,
             cert: cert.clone(),
             key: key.clone(),
-            server_name: target.tls_server_name.clone(),
+            server_name: flags.tls_server_name.clone(),
         }
         .load()?,
-        _ => server_only(ca_cert, target.tls_server_name.clone())?,
+        _ => server_only(ca_cert, flags.tls_server_name.clone())?,
     };
     let endpoint = endpoint
         .tls_config(tls)
