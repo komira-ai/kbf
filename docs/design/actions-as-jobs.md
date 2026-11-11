@@ -187,9 +187,11 @@ image's own change.
    set of subtrees, shared by digest across kbf releases.
 2. **Flattened to what a tree can hold.** A tree has one owner and modes 0644 and 0755 only (ts 6.1, D10). The step
    normalises what only narrows access (a file becomes 0755 if any execute bit is set, else 0644; a directory 0755; the
-   owner is dropped, so `/etc/shadow` 0640 becomes 0644, which is why the base holds no secret), lists every normalised
+   owner is dropped, so `/etc/shadow` 0640 becomes 0644, which is why the base holds no secret; the set-uid, set-gid
+   and sticky bits are dropped too, so `/usr/bin/su` 4755 becomes 0755: a tree has one owner, so they grant nothing
+   there), lists every normalised
    path in the bundle's facts with the tree's entry count and depth (which every action tree counts with its own,
-   4.6), and refuses, by name, what changes behaviour or what tierstore would refuse: a set-uid or set-gid file, a
+   4.6), and refuses, by name, what changes behaviour or what tierstore would refuse: a
    device node, a FIFO or socket, an extended attribute, a name with tierstore's `.wh.` prefix left after the
    whiteouts are applied, a path of the four reserved ones (`/work`, `/.kbf`, `/.kbf-run`, `/.kbf-tools`) in the
    image, and a base that alone passes one of tierstore's limits (4.6). A refused base fails the release build, not a
@@ -704,8 +706,8 @@ passed-through port and the spec echo, and a fake of tierstore's `hydrate` and `
 - a create-only PUT that finds the key: success; one that fails: `why=store`.
 
 **Base tree bundle and publishing** (`cargo xtask base-tree`, the frontend's start): a base image with each refused kind
-(set-uid, set-gid, a device, a FIFO, a socket, an extended attribute, a reserved path) fails the build by name; modes
-0600, 0640, 0700, 0750 and 1777 are normalised to 0644 or 0755 and listed in the facts; whiteouts across layers are
+(a device, a FIFO, a socket, an extended attribute, a reserved path) fails the build by name; modes
+0600, 0640, 0700, 0750, 1777 and the set-uid and set-gid 4755, 2755 and 6755 are normalised to 0644 or 0755 and listed in the facts; whiteouts across layers are
 applied; a hard link becomes two entries; `/.kbf-tools` holds exactly the release's `kbf-task`, mode 0755; the
 same pinned base gives the same manifest digest for every top-level directory but `/.kbf-tools` from two releases
 with different `kbf-task` builds, and a different root digest; the facts' entry count and depth equal the tree's; the

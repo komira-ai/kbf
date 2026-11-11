@@ -216,12 +216,12 @@ fn a_bundle_already_listed_or_already_there_is_refused_and_left_alone() {
 #[test]
 fn a_refused_image_writes_and_lists_nothing() {
     let mut layers = small_base();
-    layers.push(layer(&[E::file("usr/bin/su", 0o4755, b"su")]));
+    layers.push(layer(&[E::special("dev/null", tar::EntryType::Char)]));
     let w = world("refused", &layers, b"k", Platform::LinuxX86_64);
     let Err(Error::Refused(problems)) = run_with(&w.args, &w.base) else {
         panic!("not refused");
     };
-    assert_eq!(problems, ["/usr/bin/su: a set-uid file (mode 4755)"]);
+    assert_eq!(problems, ["/dev/null: a character device"]);
     assert!(!w.out.exists());
 
     let mut short = Args {

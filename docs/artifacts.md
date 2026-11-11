@@ -723,13 +723,13 @@ it, in the `linux-*` jobs after the task image is an asset, from that same image
    in `SHA256SUMS.<platform>`; a bundle that is already listed is refused.
 
 A tree has one owner and the modes 0644 and 0755 only. A file becomes 0755 if any execute bit is set and else 0644, a
-directory 0755, and the owner is dropped; every file or directory whose mode (the 12 permission bits) was another is listed in `normalised` with its
+directory 0755, and the owner is dropped, with the set-uid, set-gid and sticky bits (a tree has one owner, so they grant
+nothing there; `/usr/bin/su` 4755 becomes 0755); every file or directory whose mode (the 12 permission bits) was another is listed in `normalised` with its
 path from the root, the mode it had and the one it has (`{"path": "/etc/shadow", "from": "0640", "to": "0644"}`), sorted by path.
 So `/etc/shadow` of the base is world-readable in the tree, which is why the base holds no secret. What changes behaviour
 or what tierstore refuses is refused by path and kind, all problems at once, and nothing is written (a refused base fails the
 release build, not a deployment):
 
-- a set-uid or set-gid regular file (the bits of a directory are normalised, not refused: a tree has no owner for them to mean anything);
 - a character device, a block device, a FIFO, and any other type of tar entry (a tar cannot hold a socket, and a type this reader does not know is
   refused, not skipped);
 - an extended attribute (a PAX record `SCHILY.xattr.*` or `LIBARCHIVE.xattr.*`);

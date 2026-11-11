@@ -176,7 +176,7 @@ fn an_opaque_directory_and_a_whiteout_leave_what_their_own_layer_adds() {
 
 /// Asserts each kind a tree cannot hold is refused by its path and kind, with no other problem
 /// for it, and that the problems of every entry of every layer are listed together, in order:
-/// a set-uid file, a set-gid file, one that is both, a character device, a block device, a FIFO,
+/// a character device, a block device, a FIFO,
 /// a tar entry of another type, an extended attribute of either PAX family, a name that is not
 /// UTF-8 and a path with `..`.
 /// Catches: a kind let into the tree (the release would then change what runs), a refusal that
@@ -185,21 +185,6 @@ fn an_opaque_directory_and_a_whiteout_leave_what_their_own_layer_adds() {
 #[test]
 fn each_kind_a_tree_cannot_hold_is_refused_by_path_and_kind() {
     let cases: Vec<(E, Vec<String>)> = vec![
-        (
-            E::file("usr/bin/su", 0o4755, b"x"),
-            vec!["/usr/bin/su: a set-uid file (mode 4755)".to_owned()],
-        ),
-        (
-            E::file("usr/bin/wall", 0o2755, b"x"),
-            vec!["/usr/bin/wall: a set-gid file (mode 2755)".to_owned()],
-        ),
-        (
-            E::file("usr/bin/both", 0o6755, b"x"),
-            vec![
-                "/usr/bin/both: a set-uid file (mode 6755)".to_owned(),
-                "/usr/bin/both: a set-gid file (mode 6755)".to_owned(),
-            ],
-        ),
         (
             E::special("dev/null", tar::EntryType::Char),
             vec!["/dev/null: a character device".to_owned()],
@@ -239,7 +224,7 @@ fn each_kind_a_tree_cannot_hold_is_refused_by_path_and_kind() {
     }
 
     let first = layer(&[
-        E::file("a/su", 0o4755, b"x"),
+        E::special("a/sda", tar::EntryType::Block),
         E::file("a/fine", 0o644, b"x"),
         E::special("a/pipe", tar::EntryType::Fifo),
     ]);
@@ -247,7 +232,7 @@ fn each_kind_a_tree_cannot_hold_is_refused_by_path_and_kind() {
     assert_eq!(
         refused(&[first, second]),
         [
-            "/a/su: a set-uid file (mode 4755)".to_owned(),
+            "/a/sda: a block device".to_owned(),
             "/a/pipe: a FIFO".to_owned(),
             "/b/null: a character device".to_owned(),
         ]
@@ -459,6 +444,45 @@ fn modes_are_normalised_and_every_change_is_listed_by_path() {
         ("/bin/x", true),
         ("/bin/w", true),
         ("/bin/run", true),
+    ] {
+        let Some(Seen::File { exec: got, .. }) = seen.get(path) else {
+            panic!("{path} is not a file");
+        };
+        assert_eq!(*got, exec, "{path}");
+    }
+}
+
+/// Asserts a set-uid file, a set-gid file, one that is both, a set-uid file with no execute bit
+/// and a hard link to a set-uid file are each taken, with the bits dropped like the other mode
+/// bits, and listed with the mode they had; the base's set-uid programs (`su`, `passwd`) are such
+/// files. Catches: a set-uid or set-gid bit kept in the tree, a file whose bits were dropped left
+/// out of the facts, and a release refused for a base that holds one.
+#[test]
+fn set_uid_and_set_gid_files_are_normalised_and_listed() {
+    let tree = built(&[layer(&[
+        E::file("usr/bin/su", 0o4755, b"su"),
+        E::file("usr/bin/chage", 0o2755, b"chage"),
+        E::file("usr/bin/both", 0o6755, b"both"),
+        E::file("usr/bin/odd", 0o4644, b"odd"),
+        E::hardlink("usr/bin/su2", 0o4755, "usr/bin/su"),
+    ])]);
+    assert_eq!(
+        tree.normalised,
+        [
+            norm("/usr/bin/both", "6755", "0755"),
+            norm("/usr/bin/chage", "2755", "0755"),
+            norm("/usr/bin/odd", "4644", "0644"),
+            norm("/usr/bin/su", "4755", "0755"),
+            norm("/usr/bin/su2", "4755", "0755"),
+        ]
+    );
+    let seen = listing(&tree);
+    for (path, exec) in [
+        ("/usr/bin/su", true),
+        ("/usr/bin/chage", true),
+        ("/usr/bin/both", true),
+        ("/usr/bin/odd", false),
+        ("/usr/bin/su2", true),
     ] {
         let Some(Seen::File { exec: got, .. }) = seen.get(path) else {
             panic!("{path} is not a file");

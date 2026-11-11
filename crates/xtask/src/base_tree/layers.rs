@@ -17,13 +17,13 @@
 //! - a hard link becomes a separate file entry with the bytes and the mode of its target, which
 //!   must be a regular file the tree holds at that moment.
 //!
-//! Refused (each as `<path>: <kind>`): a set-uid or set-gid regular file; a character or block
-//! device; a FIFO; any other entry type (a tar cannot hold a socket, and a type this reader does
+//! Refused (each as `<path>: <kind>`): a character or block device; a FIFO; any other entry type (a tar cannot hold a socket, and a type this reader does
 //! not know is refused rather than skipped); an extended attribute (a PAX record
 //! `SCHILY.xattr.*` or `LIBARCHIVE.xattr.*`); a path at or below one of [`RESERVED`]; a name or
-//! link target that is not UTF-8, is empty (a link's) or has a `..` component. The set-uid and
-//! set-gid bits of a directory are not refused: a tree has no owner, so they mean nothing, and the
-//! directory is listed as normalised with its mode.
+//! link target that is not UTF-8, is empty (a link's) or has a `..` component. The set-uid,
+//! set-gid and sticky bits are not refused, of a file or a directory: a tree has one owner, so
+//! they grant nothing there, and dropping them only narrows access. They are dropped like the
+//! other mode bits, and the path is listed as normalised with the mode it had.
 
 use std::collections::BTreeMap;
 use std::io::{self, Read};
@@ -287,12 +287,6 @@ fn parse<R: Read>(
         tar::EntryType::Regular => match whiteout(&path.name, size) {
             Some(whiteout) => Some(whiteout),
             None => {
-                if mode & 0o4000 != 0 {
-                    found.push(format!("{at}: a set-uid file (mode {mode:04o})"));
-                }
-                if mode & 0o2000 != 0 {
-                    found.push(format!("{at}: a set-gid file (mode {mode:04o})"));
-                }
                 let mut bytes = Vec::new();
                 entry.read_to_end(&mut bytes)?;
                 Some(Kind::File {
