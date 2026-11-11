@@ -17,7 +17,9 @@
 //! the Command's `stdout`, `stderr` and `private/` (its `HOME`, `TMPDIR` and caches) are there,
 //! outside `work`, so nothing written there is an output. Then the run is today's: the working
 //! directory and the parent of every output path are made under `work` before the Command
-//! starts, the Command runs in the same confinement, its outputs are collected from `work`, and
+//! starts, the Command runs in the same confinement and sandbox ([`crate::sandbox`]), which here
+//! hides the job's grants (`/run/js-files`) and `.kbf-run` (its `private/` bound again) rather
+//! than the parent of `--work-dir`, its outputs are collected from `work`, and
 //! the manifest and outputs are stored through the same sink. The manifest's advisory `inputs`
 //! is `{"from":"tree"}` with every number 0 (nothing was fetched), which makes it version 2.
 //!
@@ -25,7 +27,7 @@
 //! directory that cannot be made is exit 11, as the private directories are.
 
 use std::os::unix::fs::DirBuilderExt as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
@@ -34,11 +36,12 @@ use kbf_task_pack::{InputStats, InputsFrom, TaskManifest};
 
 use crate::digest;
 use crate::fetch::{FetchError, file_message};
+use crate::inputs::{Inputs, network_of};
 use crate::run::RunError;
+use crate::sandbox::GRANTS_DIR;
 use crate::task::{
-    Cli, Failure, HttpSink, Inputs, PackSink, check_argv_secrets, check_lease, check_slots,
-    complete, exit_code, http_sink, millis, named, network_of, put_urls, sink_limits,
-    trusted_roots,
+    Cli, Failure, HttpSink, PackSink, check_argv_secrets, check_lease, check_slots, complete,
+    exit_code, http_sink, millis, named, put_urls, sink_limits, trusted_roots,
 };
 
 /// The Action's file, under the tree's root.
@@ -103,6 +106,9 @@ fn read(cli: &Cli, root: &Path) -> Result<Inputs, Failure> {
         command,
         network,
         root: work,
+        // The job's grants and the task's run directory, out of the Command's sight (its
+        // `private/` is bound again by the sandbox).
+        hidden: vec![PathBuf::from(GRANTS_DIR), run_dir.clone()],
         run_dir,
         fetch_ms: millis(reading.elapsed()),
         stats: Some(input_stats()),

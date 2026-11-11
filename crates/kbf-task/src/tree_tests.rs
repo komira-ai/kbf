@@ -731,3 +731,18 @@ async fn a_tree_job_whose_setup_fails_exits_14_before_the_tree_is_read() {
         ExitCode::from(EXIT_SETUP)
     );
 }
+
+/// Asserts what a tree job hands the sandbox to hide from its Command: the job's grants and the
+/// task's run directory `.kbf-run` (its streams; `private/` is bound again), and not `work`, the
+/// input root the Command runs in; nothing of today's `--work-dir`.
+#[test]
+fn a_tree_job_hides_the_grants_and_its_run_directory() {
+    let (dir, digest) = copy_tree("hidden");
+    let inputs = read(&tree_cli(&dir, &digest), &dir).expect("read");
+    assert_eq!(
+        inputs.hidden,
+        [PathBuf::from(GRANTS_DIR), dir.join(RUN_DIR)]
+    );
+    assert_eq!(inputs.root, dir.join("work"));
+    assert_eq!(inputs.run_dir, dir.join(RUN_DIR));
+}

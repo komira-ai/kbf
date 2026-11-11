@@ -473,8 +473,12 @@ kbf-task: action <digest>: network: seccomp only, no inet (netns: <step> <errno>
 kbf-task: action <digest>: platform property kbf-network=allow: the Command runs with the network
 ```
 
-where the step is `unshare`, `setgroups`, `uid_map`, `gid_map` or `loopback`. A Command that
-runs as root (uid 0) gets no namespace, because a namespace that maps only its own id would
+where the step is `unshare`, `setgroups`, `uid_map`, `gid_map` or `loopback`. The same `unshare`
+also makes the Command's mount and PID namespaces, whatever this property says, and a second line
+says how they came out: `kbf-task: action <digest>: sandbox: mount and pid namespaces`, or
+`sandbox: incomplete (<step> <errno>)` (what the Command sees in them is in
+[kbf-modes.md](deploy/kbf-modes.md), "What an action's Command sees in its job"). A Command that
+runs as root (uid 0) gets no user or network namespace, because a user namespace that maps only its own id would
 make `chown` to another user, `setuid` and `setgroups` fail for it (`tar`, `dpkg`, `apt`); it
 runs under the strict filter, and the line says `network: seccomp only, no inet (netns:
 skipped for uid 0)`.

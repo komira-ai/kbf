@@ -18,7 +18,7 @@
 //! | 0 | the action ran (whatever its exit code, a timeout included) and its pack was stored |
 //! | 2 | the flags are wrong (clap) |
 //! | 10 | fetch: the Action, the Command or an input could not be read or checked, or laid out; in a tree job, `.kbf/action` or `.kbf/command` could not be read, is not the blob its digest names (the Action's is `--action`) or does not decode, or `work` is not a directory |
-//! | 11 | run-start: the Command could not be started (bad paths, no program, a `kbf-network` property other than `allow`), or the run's `private/` home, tmp and cache directories could not be made; in a tree job, also its run directory `.kbf-run` (an existing one is refused) |
+//! | 11 | run-start: the Command could not be started (bad paths, no program, a `kbf-network` property other than `allow`), or the run's `private/` home, tmp and cache directories, or the directories of its sandbox (`crate::sandbox`), could not be made or opened; in a tree job, also its run directory `.kbf-run` (an existing one is refused) |
 //! | 12 | pack: the outputs could not be collected, did not fit the run's packs and large objects (`output-too-large`), changed after they were hashed (`output-changed`), or made a manifest or pack the frontend would refuse (`invalid-manifest`, `invalid-pack`) |
 //! | 13 | put: a pack or large object could not be stored (refused, key already taken, still no room after the retries of a 503, unreachable), or a large object's bytes changed while it was sent (the stored object is an orphan) |
 //! | 14 | setup: `--lease` is not a build id, a credential or root certificate is unusable, a credential given as a flag value without `--insecure-argv-secrets`, or the runtime did not start |
@@ -31,18 +31,17 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::{ArgGroup, Parser};
-use kbf_proto::reapi::{self, Action, Command};
+use kbf_proto::reapi::{self, Action};
 use kbf_segments::sha256;
 use kbf_task_pack::{
-    InputStats, LargeEntry, MAX_LARGE, MAX_PACKS, OutputDirectory, OutputFile, OutputSymlink,
-    TaskManifest, Timing, Usage, check_build,
+    LargeEntry, MAX_LARGE, MAX_PACKS, OutputDirectory, OutputFile, OutputSymlink, TaskManifest,
+    Timing, Usage, check_build,
 };
 use kbf_types::Digest;
 
 use crate::digest;
-use crate::fetch::{
-    BlobSource, FetchError, HttpBlobSource, LocatedSource, fetch_message, materialize, native_roots,
-};
+use crate::fetch::{BlobSource, FetchError, HttpBlobSource, LocatedSource, native_roots};
+use crate::inputs::{Inputs, fetch_inputs};
 use crate::network;
 use crate::outputs::{Blobs, OutputLimits, collect_outputs};
 use crate::pack::{MAX_LARGE_BYTES, PackError, build, build_extra};
@@ -53,6 +52,7 @@ use crate::put::{
 };
 use crate::put_urls::PutUrls;
 use crate::run::{Run, RunError, output_paths, run};
+use crate::sandbox;
 
 /// Exit code: an input could not be read, checked or laid out.
 pub const EXIT_FETCH: u8 = 10;
@@ -113,7 +113,7 @@ pub const EXIT_NO_CONFINE: u8 = 15;
 /// connection that broke after it was made is retried the same way. Every other answer is final
 /// (429, 500, 502 and 504 deliberately not retried), and a 412 means the key exists (a
 /// re-attempt of the task gets a new key).
-#[derive(Parser)]
+#[derive(Clone, Parser)]
 #[command(
     name = "kbf-task",
     version = concat!(env!("CARGO_PKG_VERSION"), "+", env!("KBF_BUILD_COMMIT")),
@@ -224,7 +224,9 @@ pub struct Cli {
     /// Command's `HOME`, `TMPDIR`, `XDG_CACHE_HOME` and `CLANG_MODULE_CACHE_PATH` name directories
     /// under `private/` here, made new for the run (an existing `private` is refused) with mode 0700, beside `in/` and so never collected as outputs: a job's
     /// image root is read-only and its `/tmp` is small and `noexec`. A variable the Command sets
-    /// itself keeps its value.
+    /// itself keeps its value. On Linux the parent of this directory (`/scratch`) and
+    /// `/run/js-files` are hidden from the Command, all but `in/` and `private/`, and `/tmp`,
+    /// `/var/tmp`, `/run` and `/root` are directories under `private/` (`crate::sandbox`).
     #[arg(long, default_value = "/scratch/work")]
     pub work_dir: PathBuf,
     /// The longest the Command may run, in milliseconds: the Action's timeout when it sets a
@@ -237,6 +239,12 @@ pub struct Cli {
     /// The limits on what the action may leave.
     #[command(flatten)]
     pub limits: OutputLimits,
+    /// Not a flag: the binary whose relay starts the Command in a PID namespace of its own
+    /// ([`crate::run::Run::relay`]). The binary's own start sets it to
+    /// its own path ([`run_cli_with`]); a task run in another process (a test)
+    /// has none, and its Command gets no PID namespace.
+    #[arg(skip)]
+    pub relay: Option<PathBuf>,
 }
 
 /// Why a task did not complete; each class has its own exit code.
@@ -471,25 +479,6 @@ pub(crate) async fn execute_with(
     complete(cli, inputs, sink, limits).await
 }
 
-/// What a run starts from, however its inputs reached it.
-pub(crate) struct Inputs {
-    /// The Action, checked against `--action` and decoded.
-    pub(crate) action: Action,
-    /// Its Command, checked against the Action's `command_digest` and decoded.
-    pub(crate) command: Command,
-    /// Whether the Command may use the network.
-    pub(crate) network: network::Network,
-    /// The input root, laid out: the Command's paths are relative to it, and the outputs are
-    /// collected from it.
-    pub(crate) root: PathBuf,
-    /// The run's own directory, outside `root`: its `stdout`, `stderr` and `private/`.
-    pub(crate) run_dir: PathBuf,
-    /// How long reading the inputs took, in milliseconds (`timing.fetch_ms`).
-    pub(crate) fetch_ms: u64,
-    /// The manifest's advisory `inputs`, if the run says.
-    pub(crate) stats: Option<InputStats>,
-}
-
 /// Refuses a sink or limits with more pack or large slots than a manifest can name (8 of each),
 /// before anything is read.
 pub(crate) fn check_slots(limits: &Limits) -> Result<(), Failure> {
@@ -500,53 +489,6 @@ pub(crate) fn check_slots(limits: &Limits) -> Result<(), Failure> {
         )));
     }
     Ok(())
-}
-
-/// The network the Command gets, from the Action's and the Command's platform properties, with
-/// the line that says so when the action asked for it.
-pub(crate) fn network_of(
-    cli: &Cli,
-    action: &Action,
-    command: &Command,
-) -> Result<network::Network, Failure> {
-    let network = network::from_platform(action, command)?;
-    if network == network::Network::Allowed {
-        eprintln!("{}", network::allowed_notice(&cli.action));
-    }
-    Ok(network)
-}
-
-/// Today's job: the Action, its Command and the input tree read through `source`, the tree laid
-/// out under `<work-dir>/in`, and the run's directory `<work-dir>` itself.
-fn fetch_inputs(cli: &Cli, source: &dyn BlobSource) -> Result<Inputs, Failure> {
-    let fetching = Instant::now();
-    let action_digest = digest::to_reapi(&cli.action);
-    let action: Action = fetch_message(source, &action_digest)?;
-    let command: Command =
-        fetch_message(source, &named("command", action.command_digest.as_ref())?)?;
-    // Read before the inputs are fetched: a refused property costs no download.
-    let network = network_of(cli, &action, &command)?;
-    let input_root = named("input root", action.input_root_digest.as_ref())?;
-    let root = cli.work_dir.join("in");
-    materialize(
-        source,
-        &input_root,
-        &root,
-        usize::from(cli.fetch_concurrency),
-    )?;
-    let fetch_ms = millis(fetching.elapsed());
-    if let Some(report) = source.report() {
-        eprintln!("kbf-task: {report}");
-    }
-    Ok(Inputs {
-        action,
-        command,
-        network,
-        root,
-        run_dir: cli.work_dir.clone(),
-        fetch_ms,
-        stats: None,
-    })
 }
 
 /// Everything after the inputs: run the Command, collect its outputs, build the manifest and
@@ -563,6 +505,7 @@ pub(crate) async fn complete(
         network,
         root,
         run_dir,
+        hidden,
         fetch_ms,
         stats,
     } = inputs;
@@ -580,9 +523,15 @@ pub(crate) async fn complete(
             deadline: deadline(&action, Duration::from_millis(cli.deadline_ms)),
             network,
             unreadable: &unreadable,
+            hidden: &hidden,
+            relay: cli.relay.as_deref(),
         },
     )
     .await?;
+    // None only where no sandbox is built (not Linux).
+    sandbox::notice(&cli.action, &ran.sandbox)
+        .into_iter()
+        .for_each(|line| eprintln!("{line}"));
     if network != network::Network::Allowed {
         eprintln!("{}", network::layers_notice(&cli.action, &ran.layers));
     }
@@ -940,12 +889,28 @@ pub(crate) fn exit_code(outcome: Result<TaskManifest, Failure>) -> ExitCode {
 /// rather than run with the Command able to take its sockets.
 pub fn run_cli_with(protection: std::io::Result<()>, cli: &Cli) -> ExitCode {
     match protection {
-        Ok(()) => run_cli(cli),
+        Ok(()) => run_cli(&relayed(cli)),
         Err(e) => {
             eprintln!("kbf-task: cannot make this process non-dumpable: {e}");
             ExitCode::from(EXIT_SETUP)
         }
     }
+}
+
+/// `cli` with this binary as the relay of its Command ([`Cli::relay`]), named by the path it
+/// was started by: the child that executes the relay, once it has made its user namespace, was
+/// refused `/proc/self/exe` itself (`EACCES`) on the hosts this was tried on.
+#[cfg(target_os = "linux")]
+fn relayed(cli: &Cli) -> Cli {
+    let mut cli = cli.clone();
+    cli.relay = std::env::current_exe().ok();
+    cli
+}
+
+/// No relay on this system: `cli` itself.
+#[cfg(not(target_os = "linux"))]
+fn relayed(cli: &Cli) -> Cli {
+    cli.clone()
 }
 
 /// Runs the task the flags describe on a fresh single-threaded runtime and returns the exit code;

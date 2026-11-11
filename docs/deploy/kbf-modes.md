@@ -126,7 +126,13 @@ as a job of the job scheduler's job service instead. The frontend registers `--e
 virtual workers with its farm, `js:<frontend id>-<n>`, each of `--executor-host-cpus` cores,
 `--executor-host-memory-gib` GiB and `--executor-host-slots` actions at once: that is how many
 actions of which size the farm may have in flight, and the job service decides which host runs
-each job. A job is the kbf image (`--executor-kbf-image`), whose `ENTRYPOINT` is the task tool:
+each job. The nodes' daemons stay connected meanwhile, but the farm places nothing on a Linux
+one: a daemon whose node report says `os=linux` is registered with no driver, so it gets no
+lease of any kind, and its session row lists no driver, so no other frontend of the state store
+counts it either. It is not a cordon and writes no `cordon/` row: an operator's uncordon does not
+lift it, a lease the daemon already held (taken up after the restart into `js-agent`) stays its
+own, and a frontend restarted under `kbf-daemon` places the Linux daemons again with nothing to
+undo. A Mac daemon, or one that reports any other `os`, is placed as before. A job is the kbf image (`--executor-kbf-image`), whose `ENTRYPOINT` is the task tool:
 the job's arguments are the tool's flags and nothing is mounted into the container. It needs the
 cores and memory the farm booked (the memory as the hard cap a daemon would set, 1.5 times the
 booking plus 512 MiB), a host of `os=linux` and `--executor-arch` (default `x86_64`) that runs
@@ -179,6 +185,31 @@ job the job service could not ready a host for (`exclusive-not-ready`) is an inf
 failure, and the farm runs the action again. A worker that has not had a heartbeat acknowledged by the farm, or an
 answer from the job service while it holds a job, for the fence time cancels all its jobs and
 falls silent until the farm has requeued them.
+
+**What an action's Command sees in its job.** The task tool starts the Command in mount and PID
+namespaces of its own (`crates/kbf-task/src/sandbox.rs`), made by the same `unshare` as its user
+and network namespaces. The job's files at `/run/js-files` (the read token and the write URLs of
+`--executor-secret-delivery files`) and the parent of the tool's work directory (`/scratch`, which
+holds the input root, the run's `private/` directory and the captured stdout and stderr) are
+covered by an empty read-only tmpfs, with the input root and `private/` bound again at their own
+paths, so the Command's working directory and its `HOME`, `TMPDIR` and cache variables still name
+them. `/tmp`, `/var/tmp`, `/run` and `/root` are the run's own `private/tmp`, `private/var-tmp`,
+`private/run` and `private/home`: on the job's scratch disk and executable, where the job's own
+`/tmp` is a 64 MiB `noexec` tmpfs. The Command is the second process of its PID namespace (the
+tool starts it through two processes of its own binary, `kbf-task --sandbox-relay` outside the
+namespace and `--sandbox-init` as its first process), and
+every process it started is ended when it ends, before its outputs are read, whether or not it
+left its process group. It holds no capability and runs under `no_new_privs`, also when it is
+allowed the network (`kbf-network=allow`), so a set-id program or a file capability gives it none,
+and it cannot take a cover off. The namespace keeps the job's `/proc`. A Command that runs as root
+gets the mount and PID namespaces without a user namespace, and could unmount the covers; the
+kbf image runs as a user other than root. The outputs are then read with `openat2`, refusing any
+symlink, magic link or `..` in any component. Each action's job log has the line
+`kbf-task: action <digest>: sandbox: mount and pid namespaces`, or `sandbox: incomplete (<step>
+<errno>)` where the host refused a step (a host that does not let an unprivileged user namespace
+keep its capabilities, AppArmor's `apparmor_restrict_unprivileged_userns`, refuses `setgroups` or
+`uid_map`): the steps before it hold, the action still runs, and what it would have hidden is
+visible to it. `kbf-task --probe-confinement` prints the same as `probe sandbox:`.
 
 The executor runs on exactly one frontend: it looks for another frontend's live jobs on the job
 service before its first pass and every 40 s after, and a frontend that finds some older than its

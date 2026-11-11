@@ -63,6 +63,11 @@ const ALLOWED: &[(&str, usize, &str)] = &[
         "product code: the farm-version verb's download directory, removed after the run whatever its result",
     ),
     (
+        "crates/xtask/src/release/image_digest.rs",
+        1,
+        "product code: the image-digest verb's download directory, removed after the run whatever its result",
+    ),
+    (
         "crates/xtask/src/release/fetch_previous.rs",
         1,
         "product code: the fetch-previous verb's scratch, removed after the run whatever its result",

@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use kbf_proto::reapi::command::EnvironmentVariable;
-use kbf_proto::reapi::{Digest, Directory, DirectoryNode, FileNode, SymlinkNode};
+use kbf_proto::reapi::{Command, Digest, Directory, DirectoryNode, FileNode, SymlinkNode};
 use kbf_segments::{SegmentReader, sha256};
 use kbf_task_pack::{EMPTY_DIGEST, read_manifest};
 use kbf_testkit::dir::TestDir;

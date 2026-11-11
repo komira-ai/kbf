@@ -12,14 +12,25 @@
 //! Unless the action asked for it (`kbf-network=allow`, [`network`]), the program and everything it
 //! starts can make no socket but a Unix one.
 //!
-//! The program leads its own process group. When the deadline passes the whole group is killed
-//! with SIGKILL and reaped, and the run is reported as timed out with exit code 137. A process a
-//! signal ended reports 128 plus the signal number, as the daemon does.
+//! On Linux the program runs in mount and PID namespaces of its own ([`sandbox`]): the directories
+//! of [`Run::hidden`] are covered, the run's own directories are bound at `/tmp`, `/var/tmp`, `/run`
+//! and `/root`, and every process it started is ended when it ends. One line per action says how
+//! that came out.
+//!
+//! The process this tool starts leads its own process group, and is the program where no PID
+//! namespace was made. In a PID namespace that process is a relay, which moves to this tool's own
+//! group once it has made the namespace's first process; that process and the Command stay in the
+//! group the relay made. When the deadline passes that group is killed with SIGKILL and reaped
+//! (in a PID namespace, the kill of its first process ends every process in it), and the run is
+//! reported as timed out with exit code 137. The group is also killed when the run is dropped
+//! before it ends. A process a signal ended reports 128 plus the signal
+//! number, as the daemon does.
 //!
 //! CPU time and peak memory come from `getrusage(RUSAGE_CHILDREN)`: the difference in CPU time
 //! over the run, and the largest resident set of any child this process has reaped. They cover
-//! the program and every descendant it waited for, and are exact only while this tool runs one
-//! Command at a time, which it does.
+//! the program and every descendant it waited for (in a PID namespace, every process of it, a
+//! timed-out run's included), and are exact only while this tool runs one Command at a time,
+//! which it does.
 
 use std::ffi::OsString;
 use std::io::ErrorKind;
@@ -34,6 +45,7 @@ use tokio::process::Command as Process;
 
 use crate::fetch;
 use crate::network::{self, Layers, Network};
+use crate::sandbox::{self, Sandbox};
 
 /// The exit code reported for a run the deadline ended: 128 plus SIGKILL.
 pub const TIMED_OUT_EXIT_CODE: i32 = 128 + 9;
@@ -84,6 +96,8 @@ pub struct Ran {
     pub peak_rss_bytes: u64,
     /// The layers that kept the Command off the network ([`network`]).
     pub layers: Layers,
+    /// How the Command's mount and PID namespaces came out ([`sandbox`]).
+    pub sandbox: Sandbox,
 }
 
 /// Where a Command runs and where its output streams go.
@@ -104,13 +118,23 @@ pub struct Run<'a> {
     pub network: Network,
     /// Files holding a credential or a presigned URL this tool was given (the grant token file,
     /// the PUT URL files). On macOS the Command's sandbox profile denies reading each; on Linux
-    /// the Command's own filesystem does not hold them and the list is not used.
+    /// the list is not used: the directory the job's host writes them to is one of `hidden`.
     pub unreadable: &'a [PathBuf],
+    /// Directories the Command must not see (Linux): each that exists is covered by an empty
+    /// read-only tmpfs in its mount namespace ([`sandbox`]); `root` and `private` stay visible at
+    /// their paths when one of these holds them. A task passes [`sandbox::hidden_for`] its work
+    /// directory.
+    pub hidden: &'a [PathBuf],
+    /// This tool's binary, to start the Command through its relay ([`crate::relay`]) in a PID
+    /// namespace of its own (Linux): the tool passes its own path (`std::env::current_exe`). `None`
+    /// makes no PID namespace, and the Command is started as it is.
+    pub relay: Option<&'a Path>,
 }
 
 /// Runs `command` under `run.root`.
 ///
 /// # Errors
+/// [`RunError::Io`] or [`RunError::Invalid`] also for the sandbox's directories ([`sandbox::layout`]).
 /// [`RunError::Invalid`]: no arguments, a working directory or output path that is not relative
 /// and plain, or one the input root made something other than a directory (a symlink or a file).
 /// [`RunError::Io`]: a directory (the run's private ones included) or an output stream file could
@@ -148,9 +172,11 @@ pub async fn run(command: &Command, run: &Run<'_>) -> Result<Ran, RunError> {
         run.network,
         run.unreadable,
     )?;
-    let mut process = Process::new(&launch.program);
+    let layout = sandbox::layout(run.hidden, run.private, run.root, &work_dir)?;
+    let (started, relayed) = relayed(launch.clone(), run.relay);
+    let mut process = Process::new(&started.program);
     process
-        .args(&launch.args)
+        .args(&started.args)
         .current_dir(&work_dir)
         .env_clear()
         .envs(private)
@@ -165,19 +191,31 @@ pub async fn run(command: &Command, run: &Run<'_>) -> Result<Ran, RunError> {
         .stderr(stderr)
         .process_group(0)
         .kill_on_drop(true);
-    let confinement = network::confine(&mut process, run.network)?;
+    let confinement = network::confine(&mut process, run.network, layout, relayed)?;
 
     let cpu_before = children_usage().cpu_us;
-    let started = Instant::now();
+    let clock = Instant::now();
     let started_as = launch.name(&program);
     let spawn_error = |source| RunError::Spawn {
         program: started_as.clone(),
         source,
     };
-    let mut child = process.spawn().map_err(spawn_error)?;
-    let layers = confinement.layers();
-    // Taken before the wait: the pid is also the id of the group the child leads.
+    let mut child = process.spawn().map_err(|source| RunError::Spawn {
+        program: started.name(&program),
+        source,
+    })?;
+    // Taken before the wait: the pid is also the id of the group the child leads. The group is
+    // killed however this function is left, a dropped future included: `kill_on_drop` ends the
+    // child alone, which in a PID namespace is the relay, and the processes it made may not yet
+    // be set to die with it.
     let group = child.id();
+    let mut ends_group = GroupKill(group);
+    // The builder holds write ends of the report pipe; the report is read to its end.
+    drop(process);
+    let (layers, sandbox, refused) = confinement.read();
+    if let Some(errno) = refused {
+        return Err(spawn_error(std::io::Error::from_raw_os_error(errno)));
+    }
     let waited = tokio::time::timeout(run.deadline, child.wait()).await;
     let (status, timed_out) = if let Ok(status) = waited {
         (status, false)
@@ -186,9 +224,9 @@ pub async fn run(command: &Command, run: &Run<'_>) -> Result<Ran, RunError> {
         (child.wait().await, true)
     };
     // Whatever the program left running in its group is ended with it.
-    kill_group(group);
+    ends_group.now();
     let status = status.map_err(spawn_error)?;
-    let wall_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let wall_ms = u64::try_from(clock.elapsed().as_millis()).unwrap_or(u64::MAX);
     let usage = children_usage();
     let exit_code = if timed_out {
         TIMED_OUT_EXIT_CODE
@@ -204,13 +242,40 @@ pub async fn run(command: &Command, run: &Run<'_>) -> Result<Ran, RunError> {
         cpu_us: usage.cpu_us.saturating_sub(cpu_before),
         peak_rss_bytes: usage.peak_rss_bytes,
         layers,
+        sandbox,
     })
 }
 
-/// The directories made under the run's private directory, parents first.
-const PRIVATE_DIRS: [&str; 5] = [
+/// What to start for `launch` through `relay`: the relay's arguments for it (Linux, `relay`
+/// given), and whether they are those; else `launch` itself.
+#[cfg(target_os = "linux")]
+fn relayed(launch: network::Launch, relay: Option<&Path>) -> (network::Launch, bool) {
+    match relay {
+        Some(relay) => {
+            let userns = !rustix::process::geteuid().is_root();
+            let group = rustix::process::getpgrp();
+            let args = crate::relay::argv(group, userns, &launch.program, &launch.args);
+            let program = relay.to_owned();
+            (network::Launch { program, args }, true)
+        }
+        None => (launch, false),
+    }
+}
+
+/// No relay on this system: `launch` itself.
+#[cfg(not(target_os = "linux"))]
+fn relayed(launch: network::Launch, _relay: Option<&Path>) -> (network::Launch, bool) {
+    (launch, false)
+}
+
+/// The directories made under the run's private directory, parents first. `var-tmp` and `run`
+/// are bound at `/var/tmp` and `/run` in the Command's mount namespace (Linux, [`sandbox::BOUND`]),
+/// as `tmp` and `home` are at `/tmp` and `/root`.
+const PRIVATE_DIRS: [&str; 7] = [
     "home",
     "tmp",
+    "var-tmp",
+    "run",
     "cache",
     "cache/clang",
     "cache/clang/ModuleCache",
@@ -319,6 +384,21 @@ fn kill_group(group: Option<u32>) {
     }
 }
 
+/// Kills the group [`kill_group`] names when told to, or when dropped if it was not.
+struct GroupKill(Option<u32>);
+
+impl GroupKill {
+    fn now(&mut self) {
+        kill_group(self.0.take());
+    }
+}
+
+impl Drop for GroupKill {
+    fn drop(&mut self) {
+        kill_group(self.0.take());
+    }
+}
+
 struct ChildrenUsage {
     cpu_us: u64,
     peak_rss_bytes: u64,
@@ -391,6 +471,8 @@ mod tests {
                     deadline,
                     network: NETWORK,
                     unreadable: &[],
+                    hidden: &[],
+                    relay: None,
                 },
             )
             .await
@@ -812,6 +894,8 @@ mod tests {
                 deadline: LONG,
                 network: NETWORK,
                 unreadable: &[],
+                hidden: &[],
+                relay: None,
             },
         )
         .await

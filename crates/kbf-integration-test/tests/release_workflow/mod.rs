@@ -12,9 +12,10 @@
 //! - **The graph.** The jobs [`JOBS`], in that order, each with exactly the `needs`, token
 //!   scopes, `if:` and `environment` of [`RULES`]; the jobs that write need `plan` and `verify`,
 //!   directly or through another. Only `publish` holds a write scope (`contents`), `id-token` is
-//!   held by `gamma` alone ([`ID_TOKEN`]), and the jobs that tag, publish, bump or run the gamma stage
+//!   held by `gamma` and `deploy` alone ([`ID_TOKEN`]), and the jobs that tag, publish, bump or run the gamma stage
 //!   only under [`RELEASE_IF`]: a successful pipeline run for a push to `main` of code that is
-//!   not a change to the pipeline.
+//!   not a change to the pipeline. The frontend's deploy runs under the same condition with
+//!   its endpoint set ([`deploy`]).
 //! - **Never cancelled, never queued behind a skipped run.** The concurrency group is `release`
 //!   for a successful pipeline run and the run's own for any other (a cancelled or red pipeline
 //!   run starts this workflow too, to skip it, and must not replace a release waiting in the
@@ -60,6 +61,7 @@
 //!   defect planted in this file reads red from this test too.
 
 use super::workflows;
+mod deploy;
 mod restore;
 
 /// The job that holds the write scope and creates the GitHub release.
@@ -113,7 +115,7 @@ const TS_WITH: [(&str, &str); 3] = [
 ];
 
 /// The jobs, in file order.
-const JOBS: [&str; 9] = [
+const JOBS: [&str; 11] = [
     "plan",
     "verify",
     "tag",
@@ -122,6 +124,8 @@ const JOBS: [&str; 9] = [
     "bump",
     REHEARSE,
     REHEARSE_AGENT,
+    deploy::DIGEST,
+    deploy::DEPLOY,
     GAMMA,
 ];
 
@@ -162,8 +166,9 @@ pub const RELEASE_IF: &str = "${{ github.event.workflow_run.conclusion == 'succe
 pub const PLAN_IF: &str = "${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository }}";
 
 /// The jobs that may hold `id-token: write`: the gamma stage, which presents the token to the
-/// farm's update coordinator and signs nothing.
-const ID_TOKEN: &[&str] = &[GAMMA];
+/// farm's update coordinator, and the frontend's deploy, whose called workflow presents it to
+/// docker-swarm-updater ([`deploy`]); neither signs anything.
+const ID_TOKEN: &[&str] = &[GAMMA, deploy::DEPLOY];
 
 /// The `(job, scope)` pairs that may be `write`.
 const WRITERS: &[(&str, &str)] = &[(PUBLISH, "contents")];
@@ -256,7 +261,7 @@ const APP_TOKEN: &str = "actions/create-github-app-token@";
 /// The jobs that write must (transitively) need these.
 const GATING: &[&str] = &["plan", "verify"];
 /// The jobs that write, or hold a token that can.
-const WRITING: &[&str] = &["tag", "notes", PUBLISH, "bump", GAMMA];
+const WRITING: &[&str] = &["tag", "notes", PUBLISH, "bump", GAMMA, deploy::DEPLOY];
 
 /// The group and the no-cancel of the one release at a time. A pipeline run that did not
 /// succeed starts this workflow too (every job skips); its group is its own, so it never
@@ -385,6 +390,7 @@ pub fn problems(release: &str) -> Result<Vec<String>, String> {
     bump_job(release, &mut out)?;
     rehearse_job(release, &mut out)?;
     gamma_job(release, &mut out)?;
+    deploy::problems(release, &mut out)?;
     // The shared rules, as the workflow lint reads them (pins, runners, permissions).
     out.extend(
         workflows::scan(release, &workflows::Repo::default())
@@ -468,7 +474,7 @@ fn closure(release: &str, job: &str) -> Result<Vec<String>, String> {
 }
 
 fn graph(release: &str, out: &mut Vec<String>) -> Result<(), String> {
-    for rule in &RULES {
+    for rule in RULES.iter().chain(&deploy::RULES) {
         let job = rule.job;
         let needs = workflows::job_needs(release, job)?;
         if sorted(needs.clone()) != sorted(rule.needs.iter().copied()) {
@@ -544,6 +550,9 @@ fn halting(release: &str, out: &mut Vec<String>) -> Result<(), String> {
         }
     }
     for job in JOBS {
+        if deploy::calls(release, job)? {
+            continue;
+        }
         let steps = workflows::job_steps(release, job)?;
         for (at, step) in steps.iter().enumerate() {
             let previous = step
@@ -636,6 +645,9 @@ fn secrets(release: &str, out: &mut Vec<String>) -> Result<(), String> {
 /// Every checkout is of the commit the pipeline run built, with no credentials left behind.
 fn checkouts(release: &str, out: &mut Vec<String>) -> Result<(), String> {
     for job in JOBS {
+        if deploy::calls(release, job)? {
+            continue;
+        }
         let steps = workflows::job_steps(release, job)?;
         let mut seen = 0;
         for step in steps.iter().filter(|s| uses(s, "actions/checkout@")) {
@@ -784,7 +796,10 @@ fn context(release: &str, out: &mut Vec<String>) -> Result<(), String> {
 /// another run, and each of the pipeline run that started this one: every later job takes the
 /// files `verify` checked.
 fn downloads_of_this_run(release: &str, out: &mut Vec<String>) -> Result<(), String> {
-    for rule in &RULES {
+    for rule in RULES.iter().chain(&deploy::RULES) {
+        if deploy::calls(release, rule.job)? {
+            continue;
+        }
         let steps = workflows::job_steps(release, rule.job)?;
         let reads_other_run = ["plan", "verify"].contains(&rule.job);
         for d in steps
@@ -1267,6 +1282,9 @@ fn tailnet_join(
     out: &mut Vec<String>,
 ) -> Result<(), String> {
     for job in JOBS.iter().filter(|j| **j != GAMMA) {
+        if deploy::calls(release, job)? {
+            continue;
+        }
         if workflows::job_steps(release, job)?
             .iter()
             .any(|s| uses(s, TS_ACTION))
