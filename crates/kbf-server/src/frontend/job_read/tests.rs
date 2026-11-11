@@ -106,7 +106,6 @@ fn flags(files: &Files, listen: &str) -> JobReadFlags {
         reads_in_flight: 32,
         read_budget_bytes: Limits::default().read_budget_bytes,
         read_idle_secs: Limits::default().held_idle.as_secs(),
-        store: None,
     }
 }
 

@@ -70,7 +70,7 @@ use std::time::Duration;
 use kbf_mapsync::MapHolder;
 use kbf_objstore::probe::{ProbeStep, probe};
 use kbf_objstore::s3::{Credentials, S3Store};
-use kbf_objstore::{KeyPrefix, ObjectStore};
+use kbf_objstore::{ObjectStore, kbf_prefix};
 use kbf_proto::kbf::enroll::v1::{GetStoreConfigResponse, StoreConfig};
 use kbf_proto::kbf::map::v1::ApplyStatus;
 use tonic::{Code, Status};
@@ -390,7 +390,7 @@ async fn registered_store(
     nonce: &str,
 ) -> Result<S3Store, Unusable> {
     let uri = registered_uri(flag, config);
-    let root = KeyPrefix::new(uri.prefix.clone()).map_err(|_| Unusable::Config)?;
+    let root = kbf_prefix(uri.prefix.clone()).map_err(|_| Unusable::Config)?;
     let credentials = Credentials::new(&config.access_key_id, config.secret_access_key.clone());
     let store = s3_store_keyed(&uri, credentials).map_err(|_| Unusable::Config)?;
     probe(&store, &root, nonce).await.map_err(Unusable::Probe)?;

@@ -456,8 +456,10 @@ tierstore, one stream per blob:
   object of that digest is success), writes it through to its upstream before it answers (local-cache mode,
   write-through, O14), keeps the bytes in the node's cache under their digest, and answers `{"sha256", "size", "key"}`.
   The task never computes a digest before it sends, so each output is read once (B16).
-- **The write grant** is minted per lease by the frontend, as it mints tierstore read grants today
-  (`job_read/store_grants.rs`, `mint_grant`) [code]: a token scoped to the job's prefix `cas/j/<build>/<nonce>/`
+- **The write grant** comes from tierstore: the frontend mints it per lease with the code of the tierstore release
+  that has `put-ca` and write grants (item 14 waits on that release; section 13). kbf mints no tierstore grant
+  today: tierstore v0.3.29 removed the read grant and its `mint_grant`, and kbf dropped its store read grants
+  with the pin of item 9 [code]. It is a token scoped to the job's prefix `cas/j/<build>/<nonce>/`
   (MAC'd with `--task-secret-file`, as the `cas/b/` keys are), allowing create-only writes of content-addressed objects
   below it and of one named object, `commit`; no read, no list, no delete; expiring with the wall limit plus
   `--task-url-slack-secs`. It travels as a job file (`/run/js-files`), out of the Command's sight. A job can write only
@@ -572,7 +574,7 @@ Then, one pull request each (section 11, item 22 and after):
 | Deleted | Why it can go |
 |---|---|
 | `kbf-task`'s fetch, locate and batch code (`fetch.rs`, `locate.rs`, `batch.rs` and their tests), its fetch flags and the read-grant files | nothing is fetched by a job |
-| the frontend's job-facing read listener (`--job-listen`, `job_read*`), its read grants and store grants, and the large-object backfill tee that rides on it | nothing reads through it |
+| the frontend's job-facing read listener (`--job-listen`, `job_read*`), its read grants, and the large-object backfill tee that rides on it | nothing reads through it |
 | the kbf OCI image (`pkg_image_asset`'s task image, `packaging/container/kbf-task/Dockerfile`; the pinned `base-<platform>.manifest.json` stays, the input of `cargo xtask base-tree`) and `--executor-kbf-image`, `--executor-base-image`, `--executor-locate`, `executor-trees` | the kbf base tree replaces the image; trees are the only job |
 | `kbf-task`'s pack writer and presigned PUTs (`pack.rs`, `plan.rs`, `put.rs`, `put_urls.rs`), the frontend's presign key and `cas/b/` key minting, and the `cas/b/` ingest (`untrusted/task.rs`) | outputs go through 5.2 |
 | the resubmit as today's job (D9) and the `why` reasons | there is nothing to fall back to |
@@ -864,7 +866,10 @@ documents named with it.
 7. **The executor switch** (8.1), after the no-op report of arm B.
 8. **kbf-task-pack: the manifest readers skip unknown members** (B8), and read `from` and the version that lists
    outputs by digest.
-9. **tierstore pin** to a release with `tree_manifest` (a test dependency of items 10 and 11).
+9. **tierstore pin** to a release with `tree_manifest` (a test dependency of items 10 and 11). Every such release
+   lacks the read grant (removed in tierstore v0.3.29), so the frontend's store read grants and their three
+   `--job-store-*` flags go with it; `GET /locate` then names no store, and a task reads its inputs from the
+   listener.
 10. **kbf-front: the manifest writer**: `collect_closure` keeping `Directory` messages, the lookups in chunks, the
     `cas/l/` writes of unlocated blobs, the manifests, the action tree's root over a given base tree's root manifest
     (4.1) with the limits counted with the base's facts, the memo, `node_properties`; no caller yet.

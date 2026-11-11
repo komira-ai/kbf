@@ -117,6 +117,37 @@ async fn a_present_large_blob_is_a_key_and_the_others_are_absent() {
     assert_eq!(rig.source.heads_of(&a.files[3]), 0);
 }
 
+/// Catches: a store header line or a `g` (a store grant's index) in the answer. The frontend signs
+/// no store grants, so every line is one digest with its place and nothing else, and the body has
+/// exactly one line per digest of the scope: kbf-task reads such a table from the listener.
+#[tokio::test]
+async fn the_table_carries_no_store_header_and_no_grant() {
+    let source = Source::default();
+    let a = build(&source, "a", &[vec![7; 2000], b"small".to_vec()]);
+    source.large.lock().unwrap().insert(a.files[0], 2000);
+    pack(&source, &a.files[1], span("cas/f/w/1", 3, 5));
+    let rig = rig(source, small());
+    let reply = rig.locate(&rig.token(a.action)).await;
+    let table = table(&reply);
+
+    let text = std::str::from_utf8(&reply.body).expect("utf-8");
+    assert_eq!(text.lines().count(), a.scope().len());
+    assert_eq!(
+        table[&a.files[0].to_string()],
+        serde_json::json!({"digest": a.files[0].to_string(),
+            "large": {"key": large_key(&a.files[0]), "size": 2000}})
+    );
+    assert_eq!(
+        table[&a.files[1].to_string()],
+        serde_json::json!({"digest": a.files[1].to_string(),
+            "pack": {"key": "cas/f/w/1", "offset": 3, "length": 5}})
+    );
+    assert_eq!(
+        table[&a.action.to_string()],
+        serde_json::json!({"digest": a.action.to_string(), "absent": true})
+    );
+}
+
 /// Catches: the empty blob sent to the index or answered as stored: it is `absent` and not asked
 /// for.
 #[tokio::test]

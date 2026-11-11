@@ -55,7 +55,7 @@ use std::time::Duration;
 use futures::TryStreamExt as _;
 use kbf_objstore::footers::{FooterRead, FooterReads, SegmentFooter, SkipReason, read_footers};
 use kbf_objstore::{
-    ByteRange, KeyError, KeyPrefix, ListToken, ObjectKey, ObjectStore, ObjectStoreError,
+    ByteRange, KbfKeyError, KeyPrefix, ListToken, ObjectKey, ObjectStore, ObjectStoreError, kbf_key,
 };
 use kbf_pack_index::{BlobDigest, MAX_BATCH, NewPack, PackBlob, PackIndex, PackIndexError};
 use kbf_segments::IndexEntry;
@@ -211,7 +211,7 @@ pub enum AdoptError {
     ResumeMismatch,
     /// The last key of the checkpoint is not an object key.
     #[error("the last key of the checkpoint: {0}")]
-    ResumeKey(#[from] KeyError),
+    ResumeKey(#[from] KbfKeyError),
 }
 
 /// How [`Adopter::run`] reads, paces and records.
@@ -567,7 +567,7 @@ fn resume_point(
         return Err(AdoptError::ResumeMismatch);
     }
     let from = match &before.last_key {
-        Some(key) => Some(ListToken::after(&ObjectKey::new(key.as_str())?)),
+        Some(key) => Some(ListToken::after(&kbf_key(key.as_str())?)),
         None => None,
     };
     *report = AdoptReport {

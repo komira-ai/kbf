@@ -488,7 +488,7 @@ mod tests {
             assert!(matches!(refused, Err(BenchError::Request(_))), "{bad}");
         }
         assert!(matches!(
-            get.get("a//b", None).await,
+            get.get("a/../b", None).await,
             Err(BenchError::Key(_))
         ));
         let portless = StreamGet::new(

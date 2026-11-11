@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use kbf_meta::TierId;
-use kbf_objstore::{Floor, KeyError};
+use kbf_objstore::{Floor, KbfKeyError};
 use kbf_threads::disk::FreeSpace;
 use percent_encoding::percent_decode_str;
 
@@ -161,14 +161,14 @@ pub enum StoreUriError {
     /// A key given twice.
     #[error("s3 URI query {0:?} is given twice")]
     Repeated(&'static str),
-    /// The prefix is not a valid key prefix.
+    /// The prefix is not one kbf names (`kbf_objstore::kbf_prefix`).
     #[error("s3 URI prefix {prefix:?}: {source}")]
     Prefix {
         /// The refused prefix.
         prefix: String,
         /// Why.
         #[source]
-        source: KeyError,
+        source: KbfKeyError,
     },
 }
 
@@ -252,7 +252,7 @@ impl S3Uri {
             p if p.ends_with('/') => p.to_owned(),
             p => format!("{p}/"),
         };
-        kbf_objstore::KeyPrefix::new(prefix.clone()).map_err(|source| StoreUriError::Prefix {
+        kbf_objstore::kbf_prefix(prefix.clone()).map_err(|source| StoreUriError::Prefix {
             prefix: prefix.clone(),
             source,
         })?;
@@ -615,7 +615,7 @@ mod tests {
     /// Catches what an S3 URI must refuse: no bucket, no endpoint (the one setting
     /// with no default), an unknown query key (a typo that would silently do nothing),
     /// a repeated key, a rate of 0 or not a number, a boolean that is neither, an empty
-    /// endpoint, a prefix the store refuses (spaces), and a fragment.
+    /// endpoint, a prefix kbf's key rule refuses (spaces), and a fragment.
     #[test]
     fn a_bad_s3_uri_is_refused_naming_the_problem() {
         let refused = |text: &str| uri(text).expect_err(text);

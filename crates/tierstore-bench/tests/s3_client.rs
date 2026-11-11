@@ -128,7 +128,10 @@ async fn a_malformed_request_is_refused_before_it_is_sent_or_logged() {
     )
     .unwrap();
     let body = Bytes::from_static(b"x");
-    assert!(matches!(s3.put("a b", body).await, Err(BenchError::Key(_))));
+    assert!(matches!(
+        s3.put("a/./b", body).await,
+        Err(BenchError::Key(_))
+    ));
     assert!(matches!(s3.head("../x").await, Err(BenchError::Key(_))));
     assert!(matches!(s3.delete("").await, Err(BenchError::Key(_))));
     assert!(matches!(
@@ -136,11 +139,11 @@ async fn a_malformed_request_is_refused_before_it_is_sent_or_logged() {
         Err(BenchError::Request(_))
     ));
     assert!(matches!(
-        s3.get_range("a b", 0, 1).await,
+        s3.get_range("a/../b", 0, 1).await,
         Err(BenchError::Key(_))
     ));
     assert!(matches!(
-        s3.list_page("a b/", None, 10).await,
+        s3.list_page(&"p".repeat(1025), None, 10).await,
         Err(BenchError::Key(_))
     ));
     assert!(matches!(
@@ -320,7 +323,7 @@ async fn a_multipart_put_refuses_bad_input_and_stops_when_its_log_does() {
     let log = Arc::new(RequestLog::to_writer(std::io::sink()));
     let s3 = client(fake.endpoint(), log.clone());
     assert!(matches!(
-        s3.put_multipart("a b", multipart_body()).await,
+        s3.put_multipart("a/../b", multipart_body()).await,
         Err(BenchError::Key(_))
     ));
     assert!(matches!(
@@ -368,7 +371,7 @@ async fn unfinished_uploads_under_a_prefix_are_aborted_page_by_page() {
     assert_eq!(s3.abort_uploads("keep/").await.unwrap(), 0);
     assert_eq!(fake.incomplete_uploads(), 0);
     assert!(matches!(
-        s3.abort_uploads("a b/").await,
+        s3.abort_uploads(&"p".repeat(1025)).await,
         Err(BenchError::Key(_))
     ));
 }

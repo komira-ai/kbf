@@ -158,21 +158,63 @@ async fn a_listing_resumed_after_a_key_lists_only_the_rest_over_a_file_store() {
     drop(store);
 }
 
-/// Catches: a prefix or key with a character outside kbf's alphabet (here, non-ASCII)
-/// reaching a store, where S3 and a local store would encode or compare it differently.
+/// Catches: a key or prefix refused that S3 takes, or taken that the client cannot send. Keys
+/// follow S3's rules (any UTF-8 text of 1 to 1024 bytes, non-ASCII included) and the client's
+/// one narrower rule: an empty key, a key of 1025 bytes and a `.` or `..` segment are refused; a
+/// prefix of 1025 bytes is refused and a non-ASCII one is taken.
 #[test]
-fn a_prefix_or_key_outside_the_alphabet_is_refused() {
-    assert!(matches!(
-        KeyPrefix::new("caf\u{e9}/"),
-        Err(KeyError::Character { ch: '\u{e9}', .. })
-    ));
-    assert!(matches!(
-        ObjectKey::new("p/\u{1f600}"),
-        Err(KeyError::Character {
-            ch: '\u{1f600}',
-            ..
-        })
-    ));
+fn keys_and_prefixes_follow_s3s_rules() {
+    assert_eq!(ObjectKey::new("").map(|_| ()), Err(KeyError::Empty));
+    assert_eq!(
+        ObjectKey::new("k".repeat(1025)).map(|_| ()),
+        Err(KeyError::TooLong(1025))
+    );
+    assert_eq!(
+        ObjectKey::new("k".repeat(1024)).map(|k| k.as_str().len()),
+        Ok(1024)
+    );
+    for dotted in ["a/../b", "a/./b", "..", "a/.."] {
+        assert_eq!(
+            ObjectKey::new(dotted).map(|_| ()),
+            Err(KeyError::Segment(dotted.to_owned())),
+            "{dotted}"
+        );
+    }
+    for taken in ["caf\u{e9}/k", "p/\u{1f600}", "a b+c%d", "a..b/.c"] {
+        assert_eq!(
+            ObjectKey::new(taken).map(|k| k.as_str().to_owned()),
+            Ok(taken.to_owned())
+        );
+    }
+    assert_eq!(
+        KeyPrefix::new("p".repeat(1025)).map(|_| ()),
+        Err(KeyError::TooLong(1025))
+    );
+    assert_eq!(
+        KeyPrefix::new("caf\u{e9}/").map(|p| p.as_str().to_owned()),
+        Ok("caf\u{e9}/".to_owned())
+    );
+}
+
+/// Catches: a `file://` store that cannot hold a non-ASCII key, gives another key back, or lists
+/// such keys in an order other than S3's (the bytes of their UTF-8): written in another order,
+/// they list as `cafe`, `caf\u{e9}`, `caf\u{1f600}`.
+#[tokio::test]
+async fn a_file_store_keeps_and_lists_non_ascii_keys_in_byte_order() {
+    let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "kbf-objstore-listing-utf8");
+    let store = FsStore::open(&dir, Floor::Bytes(1)).expect("open");
+    let names = ["n/caf\u{1f600}", "n/cafe", "n/caf\u{e9}"];
+    for name in names {
+        store
+            .put_new(&key(name), Bytes::from_static(b"x"), None)
+            .await
+            .expect("put");
+    }
+    assert_eq!(
+        listed(&store, &prefix("n/caf"), None, 1).await,
+        ["n/cafe", "n/caf\u{e9}", "n/caf\u{1f600}"]
+    );
+    drop(store);
 }
 
 /// A store that answers `list` from a script of pages, counting the calls.

@@ -48,49 +48,20 @@ fn a_frontend_with_a_proxy_and_a_read_listener_allows_exactly_those_two() {
     assert_eq!(render_text(FRONTEND).unwrap(), want);
 }
 
-/// With `executor-locate = true` the store of `job-store-url` is the third destination, after
-/// the two; with it off (or absent) that store is not allowed even when the file names it.
-/// Catches: a locating task with no route to its store, or a route to a store the task never
-/// dials.
+/// A store named by the removed `job-store-url`, with `executor-locate` on or off, is no
+/// destination: the frontend signs no store read grants, so a task never dials it.
+/// Catches: a route left open to a store no task reads from.
 #[test]
-fn the_store_is_allowed_only_when_the_task_locates() {
+fn a_store_url_left_in_the_file_is_not_allowed() {
     let with_store =
         format!("{FRONTEND}\n[job-read]\njob-store-url = \"http://192.0.2.30:9100\"\n");
-    let locating = with_store.replace(
-        "executor = \"js-agent\"\n",
-        "executor = \"js-agent\"\nexecutor-locate = true\n",
-    );
-    assert_eq!(
-        render_text(&locating).unwrap(),
-        format!(
-            "{HEAD}# task-put-endpoint = http://192.0.2.10:9000\n\
-             --egress-allow=192.0.2.10:9000\n\
-             # task-read-url = https://192.0.2.20:8444\n\
-             --egress-allow=192.0.2.20:8444\n\
-             # job-store-url = http://192.0.2.30:9100\n\
-             --egress-allow=192.0.2.30:9100\n"
-        )
-    );
-    let off = with_store.replace(
-        "executor = \"js-agent\"\n",
-        "executor = \"js-agent\"\nexecutor-locate = false\n",
-    );
-    assert_eq!(render_text(&off), render_text(FRONTEND));
-    assert_eq!(render_text(&with_store), render_text(FRONTEND));
-    // Locating with no store named: its tasks read from the listener, so the two stand alone.
-    let no_store = FRONTEND.replace(
-        "executor = \"js-agent\"\n",
-        "executor = \"js-agent\"\nexecutor-locate = true\n",
-    );
-    assert_eq!(render_text(&no_store), render_text(FRONTEND));
-    // A named store is checked as the other two are.
-    let bad_store = locating.replace("192.0.2.30", "store.example");
-    assert!(
-        render_text(&bad_store)
-            .unwrap_err()
-            .to_string()
-            .starts_with("--config /etc/kbf/kbf.toml: `job-store-url` = \"http://store.example:9100\": the host is not an IPv4 address"),
-    );
+    for locate in ["", "executor-locate = true\n", "executor-locate = false\n"] {
+        let text = with_store.replace(
+            "executor = \"js-agent\"\n",
+            &format!("executor = \"js-agent\"\n{locate}"),
+        );
+        assert_eq!(render_text(&text), render_text(FRONTEND), "{locate}");
+    }
 }
 
 /// Two keys naming one address and port give one line whose comment names both.
@@ -216,15 +187,6 @@ fn a_file_the_frontend_would_refuse_is_refused() {
     assert_eq!(
         render_text(&number).unwrap_err().to_string(),
         "--config /etc/kbf/kbf.toml: `task-read-url` is not a string"
-    );
-
-    let word = FRONTEND.replace(
-        "executor = \"js-agent\"\n",
-        "executor = \"js-agent\"\nexecutor-locate = \"yes\"\n",
-    );
-    assert_eq!(
-        render_text(&word).unwrap_err().to_string(),
-        "--config /etc/kbf/kbf.toml: `executor-locate` is not true or false"
     );
 
     let twice = format!("{FRONTEND}\n[listener]\ntask-read-url = \"https://192.0.2.21:8444\"\n");
