@@ -1506,6 +1506,7 @@ dependencies = [
  "kbf-installer",
  "kbf-node",
  "kbf-pack-index",
+ "kbf-package-hook",
  "kbf-peer",
  "kbf-proto",
  "kbf-server",
@@ -2382,6 +2383,17 @@ dependencies = [
  "postgres",
  "sha2 0.11.0",
  "thiserror",
+]
+
+[[package]]
+name = "kbf-package-hook"
+version = "0.1.0"
+dependencies = [
+ "kbf-testkit",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "update-hook",
 ]
 
 [[package]]
@@ -5365,6 +5377,7 @@ dependencies = [
  "kbf-gate",
  "kbf-host",
  "kbf-installer",
+ "kbf-package-hook",
  "kbf-testkit",
  "kbf-types",
  "lzma-rs",
