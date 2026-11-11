@@ -4,6 +4,12 @@
 //! digest, a client gone mid-way, no room on a write tier), each leaving no multipart
 //! upload incomplete.
 //!
+//! The store's client sends an object of known length up to its `single_put_max` (5 GiB by
+//! default) as one streamed PUT. The loopback S3 service reads a PUT's body whole, which would
+//! count against the bound below although kbf never holds it, so the store here is tuned to the
+//! multipart threshold of one part (`multipart`): every large object is a multipart upload, and
+//! what the allocator sees is kbf's side and a part.
+//!
 //! A counting global allocator records the most bytes live at once during each step,
 //! beyond those live when it started. The blobs are zeros: the tier's files keep runs of
 //! zeros as holes ([`SparseFs`]) and the loopback S3 service counts them rather than
@@ -30,7 +36,7 @@ use kbf_front::{
 };
 use kbf_meta::{Retention, ServerId};
 use kbf_objstore::s3::fake::FakeS3;
-use kbf_objstore::s3::{PART_BYTES, S3Store};
+use kbf_objstore::s3::{PART_BYTES, S3Store, S3Tuning};
 use kbf_objstore::{Capabilities, KeyPrefix};
 use kbf_proto::google::bytestream::byte_stream_client::ByteStreamClient;
 use kbf_proto::google::bytestream::byte_stream_server::ByteStream as _;
@@ -246,14 +252,26 @@ fn scratch(name: &str) -> PathBuf {
 
 type LargeCache = Cache<MemoryMetaLog, S3Store>;
 
+/// The store's settings here: anything over one part ([`PART_BYTES`]) is a multipart upload,
+/// as every large object was before the client sent one of known length as one PUT.
+fn multipart() -> S3Tuning {
+    S3Tuning {
+        single_put_max: PART_BYTES,
+        ..S3Tuning::default()
+    }
+}
+
 /// A cache over the loopback S3 service `s3`, with a write tier in `dir` of `budget`
 /// bytes.
 async fn cache(s3: &FakeS3, dir: &Path, budget: u64) -> Arc<LargeCache> {
     let meta = MemoryMetaLog::new(Retention::default());
-    let store = s3.store(Capabilities {
-        conditional_put: true,
-        object_lock: false,
-    });
+    let store = s3.store_tuned(
+        Capabilities {
+            conditional_put: true,
+            object_lock: false,
+        },
+        multipart(),
+    );
     let cache = Cache::open(meta, store, KeyPrefix::default())
         .await
         .expect("open");
@@ -268,10 +286,13 @@ async fn cache(s3: &FakeS3, dir: &Path, budget: u64) -> Arc<LargeCache> {
 /// A cache over the loopback S3 service `s3` with no write tier.
 async fn cold_cache(s3: &FakeS3) -> Arc<LargeCache> {
     let meta = MemoryMetaLog::new(Retention::default());
-    let store = s3.store(Capabilities {
-        conditional_put: true,
-        object_lock: false,
-    });
+    let store = s3.store_tuned(
+        Capabilities {
+            conditional_put: true,
+            object_lock: false,
+        },
+        multipart(),
+    );
     let cache = Cache::open(meta, store, KeyPrefix::default())
         .await
         .expect("open");

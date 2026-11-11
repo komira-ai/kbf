@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use kbf_objstore::{KeyError, ObjectStoreError};
+use kbf_objstore::{KbfKeyError, ObjectStoreError};
 use kbf_pack_index::{BlobDigest, PackIndexError};
 
 /// Why writing blobs into packs failed.
@@ -22,7 +22,7 @@ pub enum PackError {
     Name(String),
     /// The key scheme does not make object keys.
     #[error("the pack key scheme: {0}")]
-    Key(#[from] KeyError),
+    Key(#[from] KbfKeyError),
     /// The bytes given for a blob do not hash to the digest given with them.
     #[error("the bytes given for blob {claimed:?} hash to another digest")]
     DigestMismatch {
@@ -65,7 +65,7 @@ pub enum PackError {
 pub enum ReadError {
     /// The index names a pack by a string that is not an object key.
     #[error("the pack key of an index row: {0}")]
-    Key(#[from] KeyError),
+    Key(#[from] KbfKeyError),
     /// The index failed.
     #[error(transparent)]
     Index(#[from] PackIndexError),

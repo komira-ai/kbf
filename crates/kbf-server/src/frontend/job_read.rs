@@ -52,7 +52,6 @@ use kbf_front::Packs;
 use kbf_front::grants::{GrantKey, Grants, KeyError};
 use kbf_front::job_read::{
     BATCH_PATH, BlobSource, JobRead, LOCATE_PATH, Limits, MAX_BATCH_REQUEST_BYTES, Reply,
-    StoreGrants,
 };
 use kbf_front::large_backfill::LargeBackfill;
 use kbf_tls::{Alpn, Conn, TlsError, TlsFiles, TlsSource};
@@ -107,18 +106,6 @@ pub struct JobTls {
     pub key: PathBuf,
 }
 
-/// The store a task reads with the grants of `GET /locate`: the three `--job-store-*` flags,
-/// which come together.
-#[derive(Clone, Debug)]
-pub struct StoreGrantFlags {
-    /// `--job-store-grant-key-file`: the key the grants are signed with, the tier store's own.
-    pub key_file: PathBuf,
-    /// `--job-store-url`: the base URL a task reads the store at.
-    pub url: String,
-    /// `--job-store-bucket`: the bucket the grants are for.
-    pub bucket: String,
-}
-
 /// The job-facing read's flags: the listen address, the transport and the grant secret, or
 /// none; the last four have defaults.
 #[derive(Clone, Debug)]
@@ -137,12 +124,10 @@ pub struct JobReadFlags {
     pub read_budget_bytes: u64,
     /// `--job-read-idle-secs`: how long a held response may go with no chunk taken.
     pub read_idle_secs: u64,
-    /// `--job-store-grant-key-file` and its two companions; `None` gives `GET /locate` no
-    /// grants to hand out.
-    pub store: Option<StoreGrantFlags>,
 }
 
-/// The nine flags of the listener and the three of its store grants.
+/// The nine flags of the listener and the three removed flags of its store grants, which only
+/// refuse (`store_grant`).
 pub(super) fn args() -> [Arg; 12] {
     let [key, url, bucket] = store_grant::args();
     [
@@ -293,7 +278,6 @@ pub(super) fn from_matches(m: &ArgMatches) -> Option<JobReadFlags> {
         reads_in_flight: *m.get_one::<u32>(READS).expect("clap gives it a default"),
         read_budget_bytes: *m.get_one::<u64>(BUDGET).expect("clap gives it a default"),
         read_idle_secs: *m.get_one::<u64>(IDLE).expect("clap gives it a default"),
-        store: store_grant::from_matches(m),
     })
 }
 
@@ -306,26 +290,6 @@ pub enum JobReadError {
     /// The grant secret is too short.
     #[error("--job-grant-secret-file: {0}")]
     Key(#[from] KeyError),
-    /// The grant key's file cannot be used.
-    #[error("--job-store-grant-key-file {path}: {why}")]
-    StoreKey {
-        /// The file.
-        path: PathBuf,
-        /// What is wrong with it.
-        why: String,
-    },
-    /// The store URL cannot be a store's.
-    #[error("--job-store-url: {why}")]
-    StoreUrl {
-        /// What is wrong with it.
-        why: String,
-    },
-    /// The bucket name cannot be granted.
-    #[error("--job-store-bucket: {reason}")]
-    StoreBucket {
-        /// What tierstore says.
-        reason: String,
-    },
     /// The certificate file cannot be read.
     #[error("--job-tls-cert {path}: {source}")]
     Read {
@@ -362,8 +326,6 @@ pub(super) struct Prepared {
     limits: Limits,
     /// The copy of large blobs to tierstore, when there are packs to take it from.
     backfill: Option<LargeBackfill>,
-    /// What `GET /locate` signs store read grants with; none without the `--job-store-*` flags.
-    store: Option<StoreGrants>,
 }
 
 /// The waits that bound a client of the listener.
@@ -413,7 +375,6 @@ impl Prepared {
             .as_ref()
             .map(|tls| tls_source(tls, flags.listen, reload))
             .transpose()?;
-        let store = flags.store.as_ref().map(store_grant::grants).transpose()?;
         let socket = Socket::bind(flags.listen, binder)?;
         let limits = Limits {
             reads_in_flight: usize::try_from(flags.reads_in_flight).unwrap_or(usize::MAX),
@@ -428,7 +389,6 @@ impl Prepared {
             grants,
             limits,
             backfill: None,
-            store,
         })
     }
 
@@ -465,11 +425,8 @@ impl Prepared {
                  grants and blobs are sent unencrypted"
             );
         }
-        let read = Arc::new(
-            JobRead::new(source, self.grants, self.limits)
-                .with_backfill(self.backfill)
-                .with_store_grants(self.store),
-        );
+        let read =
+            Arc::new(JobRead::new(source, self.grants, self.limits).with_backfill(self.backfill));
         let (incoming, latch) = self.socket.grpc(self.tls.clone())?;
         let task = accept(
             incoming,

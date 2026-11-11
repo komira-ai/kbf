@@ -36,7 +36,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use kbf_objstore::{ByteRange, ObjectKey, ObjectStoreError};
+use kbf_objstore::{ByteRange, ObjectKey, ObjectStoreError, kbf_key};
 use kbf_pack::blob_digest;
 use kbf_pack_index::{BlobDigest, NewPack, PackBlob, PackIndexError, Recorded};
 use kbf_segments::RecordHasher;
@@ -274,7 +274,7 @@ fn named(pack: &NewPack) -> Result<ObjectKey, CommitError> {
     if key.matches('/').count() != 4 {
         return Err(misnamed(key, &under));
     }
-    let made = ObjectKey::new(key.clone());
+    let made = kbf_key(key.clone());
     made.map_err(|error| CommitError::Invalid(error.to_string()))
 }
 

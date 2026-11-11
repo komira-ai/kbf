@@ -14,6 +14,7 @@
 pub mod conformance;
 pub mod footers;
 mod fs_store;
+mod kbf_keys;
 mod memory;
 pub mod probe;
 mod released;
@@ -22,6 +23,7 @@ pub use fs_store::{
     Floor, FsStore, FsStoreError, Room, Scanned, ShardScan, SpaceSource, objects_source,
     statvfs_source,
 };
+pub use kbf_keys::{KbfKeyError, kbf_key, kbf_prefix};
 pub use kbf_threads::disk::Space;
 pub use memory::MemoryStore;
 pub use objstore_s3::{

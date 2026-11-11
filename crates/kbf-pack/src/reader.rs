@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use bytes::Bytes;
 use futures::StreamExt;
 use futures::stream;
-use kbf_objstore::{ByteRange, ObjectKey, ObjectStore, ObjectStoreError};
+use kbf_objstore::{ByteRange, ObjectKey, ObjectStore, ObjectStoreError, kbf_key};
 use kbf_pack_index::{BlobDigest, MAX_BATCH, PackIndex, PackIndexError};
 
 use crate::blocking::offload;
@@ -224,7 +224,7 @@ impl<S: ObjectStore> Reader<S> {
         }
         let mut spans = Vec::new();
         for (key, members) in by_pack {
-            let pack = ObjectKey::new(key)?;
+            let pack = kbf_key(key)?;
             spans.extend(coalesce(&pack, members, self.config.gap));
         }
         Ok(spans)

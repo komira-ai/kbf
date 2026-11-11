@@ -44,4 +44,10 @@ unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # The scheduler libraries (`js-*` crates) and tierstore (`tierstore`, `objstore-s3`), pinned by
 # revision in the workspace Cargo.toml.
-allow-git = ["https://github.com/komira-ai/jobscheduler", "https://github.com/komira-ai/tierstore"]
+allow-git = [
+    "https://github.com/komira-ai/jobscheduler",
+    "https://github.com/komira-ai/tierstore",
+    # The FUSE and NFS libraries of `tierstore fs`, at the revisions the tierstore pin names.
+    "https://github.com/komira-ai/fuser",
+    "https://github.com/komira-ai/nfsserve",
+]
