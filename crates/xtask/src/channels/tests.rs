@@ -141,7 +141,8 @@ fn the_verbs_are_dispatched_with_their_flags() {
 
     let gate = run(Verb::Gate {
         label: "a-job".to_owned(),
-        settings: vec!["XTASK_CHANNELS_TEST_NEVER_SET".to_owned()],
+        settings: vec!["XTASK_CHANNELS_TEST_NEVER_SET=".to_owned()],
+        secrets: Vec::new(),
         requires: Vec::new(),
         output: Some(out.clone()),
     })

@@ -6,15 +6,15 @@
 //! | all set | `true` | runs |
 //! | some set | `false` | red, naming the missing ones |
 //!
-//! `--setting NAME` and `--require NAME` name environment variables, which the verb reads
-//! itself: a workflow step passes the variables, a secret among them, in its `env` and no value
-//! ever reaches a command line, a shell expansion or the log. A setting is set when its variable
-//! is not empty; the value is never printed.
+//! `--setting NAME=VALUE` is configuration, passed on the command line: it is set when `VALUE` is
+//! not empty. `--secret NAME` is secret material (a signing key, a passphrase), which must not
+//! be on a command line: the verb reads the environment variable `NAME` itself, only to test
+//! whether it is not empty. No value is ever printed, only names.
 //!
 //! A job that follows another (the apt index after the apt read) names what it needs from it
-//! with `--require NAME`, `NAME` holding the earlier job's output: unless every one is exactly
-//! `true` the job is off, green, and its own settings are not judged (the earlier job said it is
-//! off, and says why).
+//! with `--require NAME=VALUE`, `VALUE` holding the earlier job's output: unless every one is
+//! exactly `true` the job is off, green, and its own settings are not judged (the earlier job said
+//! it is off, and says why).
 //!
 //! The third row is a half-made setting, a typo in a variable name among them: it must not leave
 //! a channel silently off.
@@ -34,8 +34,7 @@ pub fn process_env(name: &str) -> Option<String> {
     std::env::var(name).ok()
 }
 
-/// Is `name` an environment variable name of the form the gate takes (upper case letters, digits
-/// and `_`)?
+/// Is `name` a name of the form the gate takes (upper case letters, digits and `_`)?
 fn check_name(flag: &str, name: &str) -> Result<(), Error> {
     let ok = !name.is_empty()
         && name
@@ -50,15 +49,27 @@ fn check_name(flag: &str, name: &str) -> Result<(), Error> {
     }
 }
 
+/// Splits a `NAME=VALUE` argument of `flag`; the value is not echoed when the form is wrong.
+fn split_pair<'a>(flag: &str, arg: &'a str) -> Result<(&'a str, &'a str), Error> {
+    let (name, value) = arg
+        .split_once('=')
+        .ok_or_else(|| Error::Usage(format!("{flag} is not NAME=VALUE (a name, `=`, a value)")))?;
+    check_name(flag, name)?;
+    Ok((name, value))
+}
+
 /// The `gate` verb: the lines to print.
 ///
+/// `settings` and `requires` are `NAME=VALUE` arguments, `secrets` names of environment variables.
+///
 /// # Errors
-/// A label or name that is not of its form, a name given twice, no setting and no requirement,
-/// or some but not all of the settings set.
+/// A label or name that is not of its form, a name given twice, no setting, secret or
+/// requirement, or some but not all of the settings and secrets set.
 pub fn gate(
     env: Env,
     label: &str,
     settings: &[String],
+    secrets: &[String],
     requires: &[String],
     output: Option<&Path>,
 ) -> Result<Vec<String>, Error> {
@@ -67,29 +78,47 @@ pub fn gate(
             "--label {label:?} is not a plain name"
         )));
     }
-    if settings.is_empty() && requires.is_empty() {
+    if settings.is_empty() && secrets.is_empty() && requires.is_empty() {
         return Err(Error::Usage(
-            "give at least one --setting or --require".to_owned(),
+            "give at least one --setting, --secret or --require".to_owned(),
         ));
     }
+    let mut seen: Vec<&str> = Vec::new();
     let mut unmet = Vec::new();
-    for name in requires {
-        check_name("--require", name)?;
-        if env(name).as_deref() != Some("true") {
-            unmet.push(name.as_str());
+    for arg in requires {
+        let (name, value) = split_pair("--require", arg)?;
+        if seen.contains(&name) {
+            return Err(Error::Usage(format!("--require {name} is given twice")));
+        }
+        seen.push(name);
+        if value != "true" {
+            unmet.push(name);
         }
     }
     let mut set = Vec::new();
     let mut unset = Vec::new();
-    for name in settings {
-        check_name("--setting", name)?;
-        if set.contains(&name.as_str()) || unset.contains(&name.as_str()) {
+    for arg in settings {
+        let (name, value) = split_pair("--setting", arg)?;
+        if seen.contains(&name) {
             return Err(Error::Usage(format!("--setting {name} is given twice")));
         }
-        if env(name).is_some_and(|value| !value.is_empty()) {
-            set.push(name.as_str());
+        seen.push(name);
+        if value.is_empty() {
+            unset.push(name);
         } else {
-            unset.push(name.as_str());
+            set.push(name);
+        }
+    }
+    for name in secrets {
+        check_name("--secret", name)?;
+        if seen.contains(&name.as_str()) {
+            return Err(Error::Usage(format!("--secret {name} is given twice")));
+        }
+        seen.push(name);
+        if env(name).is_some_and(|value| !value.is_empty()) {
+            set.push(name);
+        } else {
+            unset.push(name);
         }
     }
     let enabled = unset.is_empty() && unmet.is_empty();

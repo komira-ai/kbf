@@ -2,9 +2,10 @@
 //! `https://packages.komira.ai/apt`, and the check that it installs. `.github/workflows/release.yml`
 //! runs these verbs in its `testing-apt-*`, `check-apt` and `stable-apt-*` jobs.
 //!
-//! - `channels gate --label <job> [--setting NAME]... [--require NAME]... [--output <file>]`
-//!   ([`gate`]): whether a job has the settings it needs, the variables read from the
-//!   environment by the verb itself (a value is never printed). None set: `enabled=false` and a
+//! - `channels gate --label <job> [--setting NAME=VALUE]... [--secret NAME]... [--require
+//!   NAME=VALUE]... [--output <file>]` ([`gate`]): whether a job has the settings it needs; a
+//!   setting's value is on the command line, a secret's is read from the environment by the verb
+//!   itself (only names are ever printed). None set: `enabled=false` and a
 //!   notice, the job ends green and writes nothing. All set: `enabled=true`. Some set: red,
 //!   naming the missing ones.
 //! - `channels assume --role-arn <arn> --session-name <name> --region <r> --env-file <file>
@@ -132,12 +133,16 @@ pub enum Verb {
         /// The job, as the notice names it.
         #[arg(long)]
         label: String,
-        /// The name of one environment variable the job needs; only whether it is empty is
-        /// read, and no value is printed.
+        /// One setting the job needs, as `NAME=VALUE`; an empty value is unset. No value is
+        /// printed.
         #[arg(long = "setting")]
         settings: Vec<String>,
-        /// The name of an environment variable that holds an earlier job's output: unless every
-        /// one is `true` the job is off and green, and its settings are not judged.
+        /// The name of an environment variable holding secret material the job needs; only
+        /// whether it is empty is read, and no value is printed.
+        #[arg(long = "secret")]
+        secrets: Vec<String>,
+        /// An earlier job's output, as `NAME=VALUE`: unless every `VALUE` is `true` the job is
+        /// off and green, and its settings are not judged.
         #[arg(long = "require")]
         requires: Vec<String>,
         /// Append `enabled=true` or `enabled=false` to this file (`GITHUB_OUTPUT`).
@@ -213,12 +218,14 @@ pub fn run(verb: Verb) -> Result<Vec<String>, Error> {
         Verb::Gate {
             label,
             settings,
+            secrets,
             requires,
             output,
         } => gate::gate(
             &gate::process_env,
             &label,
             &settings,
+            &secrets,
             &requires,
             output.as_deref(),
         ),

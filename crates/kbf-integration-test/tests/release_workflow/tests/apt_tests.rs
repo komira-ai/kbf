@@ -185,6 +185,75 @@ fn a_write_checks_the_files_and_the_attestations_before_it_writes() {
 }
 
 #[test]
+fn every_attestation_check_denies_self_hosted_runners() {
+    // Catches: an attestation check, in any job that has one, that accepts a signer that ran on
+    // a self-hosted runner: the flag missing from either .deb's check.
+    let mut checked = 0;
+    for job in apt::jobs() {
+        for needle in [ATTEST_ARM, ATTEST_AMD] {
+            let mut present = false;
+            let found = with_steps(&job, |steps| {
+                if let Some(attest) = steps.iter().position(|s| s.contains(needle)) {
+                    present = true;
+                    steps[attest] = steps[attest].replace(" --deny-self-hosted-runners", "");
+                }
+            });
+            if present {
+                checked += 1;
+                red(&found, "the attestation check of the");
+            }
+        }
+    }
+    assert_eq!(checked, 18, "the attestation checks of the apt jobs");
+}
+
+#[test]
+fn the_gate_names_a_secret_and_never_passes_it_as_a_setting() {
+    // Catches: the signing key or its passphrase given to the gate as `--setting NAME=VALUE`
+    // (a value on a command line), and a non-secret read from the environment as a `--secret`.
+    red(
+        &plant(
+            "testing-apt-index",
+            "--secret APT_GPG_PRIVATE_KEY",
+            "--setting \"APT_GPG_PRIVATE_KEY=$APT_GPG_PRIVATE_KEY\"",
+        ),
+        "the gate on the settings",
+    );
+    red(
+        &plant(
+            "stable-apt-index-2",
+            "--secret APT_GPG_PASSPHRASE",
+            "--setting \"APT_GPG_PASSPHRASE=$APT_GPG_PASSPHRASE\"",
+        ),
+        "the gate on the settings",
+    );
+    red(
+        &plant(
+            "testing-apt-read",
+            "--setting \"APT_BUCKET=$APT_BUCKET\"",
+            "--secret APT_BUCKET",
+        ),
+        "the gate on the settings",
+    );
+    red(
+        &plant(
+            "testing-apt-index-3",
+            "--setting \"APT_GPG_FINGERPRINT=$APT_GPG_FINGERPRINT\"",
+            "--secret APT_GPG_FINGERPRINT",
+        ),
+        "the gate on the settings",
+    );
+    red(
+        &plant(
+            "testing-apt-write",
+            "--require \"INDEX_SIGNED=$INDEX_SIGNED\"",
+            "--require INDEX_SIGNED",
+        ),
+        "the gate on the settings",
+    );
+}
+
+#[test]
 fn every_apt_job_starts_with_the_tool_and_the_gate() {
     // Catches: a job without its gate (it would run without its settings), a gate with other
     // settings or requirements, a step after the gate that is not under its output, and a tool
@@ -203,13 +272,17 @@ fn every_apt_job_starts_with_the_tool_and_the_gate() {
     red(
         &plant(
             "testing-apt-write",
-            "--require READ_ENABLED --require INDEX_SIGNED",
-            "--require READ_ENABLED",
+            "--require \"READ_ENABLED=$READ_ENABLED\" --require \"INDEX_SIGNED=$INDEX_SIGNED\"",
+            "--require \"READ_ENABLED=$READ_ENABLED\"",
         ),
         "the gate on the settings",
     );
     red(
-        &plant("testing-apt-read", " --setting APT_HOSTNAME", ""),
+        &plant(
+            "testing-apt-read",
+            " --setting \"APT_HOSTNAME=$APT_HOSTNAME\"",
+            "",
+        ),
         "the gate on the settings",
     );
     red(

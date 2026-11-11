@@ -649,7 +649,7 @@ jobs:
           APT_BUCKET: ${{ vars.APT_BUCKET }}
           APT_DISTRIBUTION_ID: ${{ vars.APT_DISTRIBUTION_ID }}
           APT_HOSTNAME: ${{ vars.APT_HOSTNAME }}
-        run: tool/xtask channels gate --label testing-apt-read --output "$GITHUB_OUTPUT" --setting APT_PUBLISH_ROLE_ARN --setting APT_BUCKET --setting APT_DISTRIBUTION_ID --setting APT_HOSTNAME
+        run: tool/xtask channels gate --label testing-apt-read --output "$GITHUB_OUTPUT" --setting "APT_PUBLISH_ROLE_ARN=$APT_PUBLISH_ROLE_ARN" --setting "APT_BUCKET=$APT_BUCKET" --setting "APT_DISTRIBUTION_ID=$APT_DISTRIBUTION_ID" --setting "APT_HOSTNAME=$APT_HOSTNAME"
       - name: Assume the apt publish role through OIDC
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
@@ -695,7 +695,7 @@ jobs:
           APT_GPG_FINGERPRINT: ${{ vars.APT_GPG_FINGERPRINT }}
           APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
           APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
-        run: tool/xtask channels gate --label testing-apt-index --output "$GITHUB_OUTPUT" --require READ_ENABLED --setting APT_GPG_FINGERPRINT --setting APT_GPG_PRIVATE_KEY --setting APT_GPG_PASSPHRASE
+        run: tool/xtask channels gate --label testing-apt-index --output "$GITHUB_OUTPUT" --require "READ_ENABLED=$READ_ENABLED" --setting "APT_GPG_FINGERPRINT=$APT_GPG_FINGERPRINT" --secret APT_GPG_PRIVATE_KEY --secret APT_GPG_PASSPHRASE
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         with:
@@ -715,13 +715,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-        run: gh attestation verify "dist/kbf-native-$COMMIT-linux-x86_64.deb" --bundle "dist/kbf-native-$COMMIT-linux-x86_64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT"
+        run: gh attestation verify "dist/kbf-native-$COMMIT-linux-x86_64.deb" --bundle "dist/kbf-native-$COMMIT-linux-x86_64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT" --deny-self-hosted-runners
       - name: The arm64 .deb is the one artifacts.yml attested, from main at this commit (from its bundle)
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-        run: gh attestation verify "dist/kbf-native-$COMMIT-linux-arm64.deb" --bundle "dist/kbf-native-$COMMIT-linux-arm64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT"
+        run: gh attestation verify "dist/kbf-native-$COMMIT-linux-arm64.deb" --bundle "dist/kbf-native-$COMMIT-linux-arm64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT" --deny-self-hosted-runners
       - name: Merge the .debs into the index that was read, the entries of every other product are kept
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
@@ -774,7 +774,7 @@ jobs:
           APT_BUCKET: ${{ vars.APT_BUCKET }}
           APT_DISTRIBUTION_ID: ${{ vars.APT_DISTRIBUTION_ID }}
           APT_HOSTNAME: ${{ vars.APT_HOSTNAME }}
-        run: tool/xtask channels gate --label testing-apt-write --output "$GITHUB_OUTPUT" --require READ_ENABLED --require INDEX_SIGNED --setting APT_PUBLISH_ROLE_ARN --setting APT_BUCKET --setting APT_DISTRIBUTION_ID --setting APT_HOSTNAME
+        run: tool/xtask channels gate --label testing-apt-write --output "$GITHUB_OUTPUT" --require "READ_ENABLED=$READ_ENABLED" --require "INDEX_SIGNED=$INDEX_SIGNED" --setting "APT_PUBLISH_ROLE_ARN=$APT_PUBLISH_ROLE_ARN" --setting "APT_BUCKET=$APT_BUCKET" --setting "APT_DISTRIBUTION_ID=$APT_DISTRIBUTION_ID" --setting "APT_HOSTNAME=$APT_HOSTNAME"
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         with:
@@ -794,13 +794,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-        run: gh attestation verify "dist/kbf-native-$COMMIT-linux-x86_64.deb" --bundle "dist/kbf-native-$COMMIT-linux-x86_64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT"
+        run: gh attestation verify "dist/kbf-native-$COMMIT-linux-x86_64.deb" --bundle "dist/kbf-native-$COMMIT-linux-x86_64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT" --deny-self-hosted-runners
       - name: The arm64 .deb is the one artifacts.yml attested, from main at this commit (from its bundle)
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-        run: gh attestation verify "dist/kbf-native-$COMMIT-linux-arm64.deb" --bundle "dist/kbf-native-$COMMIT-linux-arm64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT"
+        run: gh attestation verify "dist/kbf-native-$COMMIT-linux-arm64.deb" --bundle "dist/kbf-native-$COMMIT-linux-arm64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT" --deny-self-hosted-runners
       - name: Assume the apt publish role through OIDC
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
@@ -842,7 +842,7 @@ jobs:
           APT_BUCKET: ${{ vars.APT_BUCKET }}
           APT_DISTRIBUTION_ID: ${{ vars.APT_DISTRIBUTION_ID }}
           APT_HOSTNAME: ${{ vars.APT_HOSTNAME }}
-        run: tool/xtask channels gate --label testing-apt-read-2 --output "$GITHUB_OUTPUT" --setting APT_PUBLISH_ROLE_ARN --setting APT_BUCKET --setting APT_DISTRIBUTION_ID --setting APT_HOSTNAME
+        run: tool/xtask channels gate --label testing-apt-read-2 --output "$GITHUB_OUTPUT" --setting "APT_PUBLISH_ROLE_ARN=$APT_PUBLISH_ROLE_ARN" --setting "APT_BUCKET=$APT_BUCKET" --setting "APT_DISTRIBUTION_ID=$APT_DISTRIBUTION_ID" --setting "APT_HOSTNAME=$APT_HOSTNAME"
       - name: Assume the apt publish role through OIDC
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
@@ -888,7 +888,7 @@ jobs:
           APT_GPG_FINGERPRINT: ${{ vars.APT_GPG_FINGERPRINT }}
           APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
           APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
-        run: tool/xtask channels gate --label testing-apt-index-2 --output "$GITHUB_OUTPUT" --require READ_ENABLED --setting APT_GPG_FINGERPRINT --setting APT_GPG_PRIVATE_KEY --setting APT_GPG_PASSPHRASE
+        run: tool/xtask channels gate --label testing-apt-index-2 --output "$GITHUB_OUTPUT" --require "READ_ENABLED=$READ_ENABLED" --setting "APT_GPG_FINGERPRINT=$APT_GPG_FINGERPRINT" --secret APT_GPG_PRIVATE_KEY --secret APT_GPG_PASSPHRASE
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         with:
@@ -908,13 +908,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-        run: gh attestation verify "dist/kbf-native-$COMMIT-linux-x86_64.deb" --bundle "dist/kbf-native-$COMMIT-linux-x86_64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT"
+        run: gh attestation verify "dist/kbf-native-$COMMIT-linux-x86_64.deb" --bundle "dist/kbf-native-$COMMIT-linux-x86_64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT" --deny-self-hosted-runners
       - name: The arm64 .deb is the one artifacts.yml attested, from main at this commit (from its bundle)
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-        run: gh attestation verify "dist/kbf-native-$COMMIT-linux-arm64.deb" --bundle "dist/kbf-native-$COMMIT-linux-arm64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT"
+        run: gh attestation verify "dist/kbf-native-$COMMIT-linux-arm64.deb" --bundle "dist/kbf-native-$COMMIT-linux-arm64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT" --deny-self-hosted-runners
       - name: Merge the .debs into the index that was read, the entries of every other product are kept
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
@@ -967,7 +967,7 @@ jobs:
           APT_BUCKET: ${{ vars.APT_BUCKET }}
           APT_DISTRIBUTION_ID: ${{ vars.APT_DISTRIBUTION_ID }}
           APT_HOSTNAME: ${{ vars.APT_HOSTNAME }}
-        run: tool/xtask channels gate --label testing-apt-write-2 --output "$GITHUB_OUTPUT" --require READ_ENABLED --require INDEX_SIGNED --setting APT_PUBLISH_ROLE_ARN --setting APT_BUCKET --setting APT_DISTRIBUTION_ID --setting APT_HOSTNAME
+        run: tool/xtask channels gate --label testing-apt-write-2 --output "$GITHUB_OUTPUT" --require "READ_ENABLED=$READ_ENABLED" --require "INDEX_SIGNED=$INDEX_SIGNED" --setting "APT_PUBLISH_ROLE_ARN=$APT_PUBLISH_ROLE_ARN" --setting "APT_BUCKET=$APT_BUCKET" --setting "APT_DISTRIBUTION_ID=$APT_DISTRIBUTION_ID" --setting "APT_HOSTNAME=$APT_HOSTNAME"
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         with:
@@ -987,13 +987,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-        run: gh attestation verify "dist/kbf-native-$COMMIT-linux-x86_64.deb" --bundle "dist/kbf-native-$COMMIT-linux-x86_64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT"
+        run: gh attestation verify "dist/kbf-native-$COMMIT-linux-x86_64.deb" --bundle "dist/kbf-native-$COMMIT-linux-x86_64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT" --deny-self-hosted-runners
       - name: The arm64 .deb is the one artifacts.yml attested, from main at this commit (from its bundle)
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-        run: gh attestation verify "dist/kbf-native-$COMMIT-linux-arm64.deb" --bundle "dist/kbf-native-$COMMIT-linux-arm64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT"
+        run: gh attestation verify "dist/kbf-native-$COMMIT-linux-arm64.deb" --bundle "dist/kbf-native-$COMMIT-linux-arm64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT" --deny-self-hosted-runners
       - name: Assume the apt publish role through OIDC
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
@@ -1035,7 +1035,7 @@ jobs:
           APT_BUCKET: ${{ vars.APT_BUCKET }}
           APT_DISTRIBUTION_ID: ${{ vars.APT_DISTRIBUTION_ID }}
           APT_HOSTNAME: ${{ vars.APT_HOSTNAME }}
-        run: tool/xtask channels gate --label testing-apt-read-3 --output "$GITHUB_OUTPUT" --setting APT_PUBLISH_ROLE_ARN --setting APT_BUCKET --setting APT_DISTRIBUTION_ID --setting APT_HOSTNAME
+        run: tool/xtask channels gate --label testing-apt-read-3 --output "$GITHUB_OUTPUT" --setting "APT_PUBLISH_ROLE_ARN=$APT_PUBLISH_ROLE_ARN" --setting "APT_BUCKET=$APT_BUCKET" --setting "APT_DISTRIBUTION_ID=$APT_DISTRIBUTION_ID" --setting "APT_HOSTNAME=$APT_HOSTNAME"
       - name: Assume the apt publish role through OIDC
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
@@ -1081,7 +1081,7 @@ jobs:
           APT_GPG_FINGERPRINT: ${{ vars.APT_GPG_FINGERPRINT }}
           APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
           APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
-        run: tool/xtask channels gate --label testing-apt-index-3 --output "$GITHUB_OUTPUT" --require READ_ENABLED --setting APT_GPG_FINGERPRINT --setting APT_GPG_PRIVATE_KEY --setting APT_GPG_PASSPHRASE
+        run: tool/xtask channels gate --label testing-apt-index-3 --output "$GITHUB_OUTPUT" --require "READ_ENABLED=$READ_ENABLED" --setting "APT_GPG_FINGERPRINT=$APT_GPG_FINGERPRINT" --secret APT_GPG_PRIVATE_KEY --secret APT_GPG_PASSPHRASE
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         with:
@@ -1101,13 +1101,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-        run: gh attestation verify "dist/kbf-native-$COMMIT-linux-x86_64.deb" --bundle "dist/kbf-native-$COMMIT-linux-x86_64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT"
+        run: gh attestation verify "dist/kbf-native-$COMMIT-linux-x86_64.deb" --bundle "dist/kbf-native-$COMMIT-linux-x86_64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT" --deny-self-hosted-runners
       - name: The arm64 .deb is the one artifacts.yml attested, from main at this commit (from its bundle)
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-        run: gh attestation verify "dist/kbf-native-$COMMIT-linux-arm64.deb" --bundle "dist/kbf-native-$COMMIT-linux-arm64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT"
+        run: gh attestation verify "dist/kbf-native-$COMMIT-linux-arm64.deb" --bundle "dist/kbf-native-$COMMIT-linux-arm64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT" --deny-self-hosted-runners
       - name: Merge the .debs into the index that was read, the entries of every other product are kept
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
@@ -1160,7 +1160,7 @@ jobs:
           APT_BUCKET: ${{ vars.APT_BUCKET }}
           APT_DISTRIBUTION_ID: ${{ vars.APT_DISTRIBUTION_ID }}
           APT_HOSTNAME: ${{ vars.APT_HOSTNAME }}
-        run: tool/xtask channels gate --label testing-apt-write-3 --output "$GITHUB_OUTPUT" --require READ_ENABLED --require INDEX_SIGNED --setting APT_PUBLISH_ROLE_ARN --setting APT_BUCKET --setting APT_DISTRIBUTION_ID --setting APT_HOSTNAME
+        run: tool/xtask channels gate --label testing-apt-write-3 --output "$GITHUB_OUTPUT" --require "READ_ENABLED=$READ_ENABLED" --require "INDEX_SIGNED=$INDEX_SIGNED" --setting "APT_PUBLISH_ROLE_ARN=$APT_PUBLISH_ROLE_ARN" --setting "APT_BUCKET=$APT_BUCKET" --setting "APT_DISTRIBUTION_ID=$APT_DISTRIBUTION_ID" --setting "APT_HOSTNAME=$APT_HOSTNAME"
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         with:
@@ -1180,13 +1180,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-        run: gh attestation verify "dist/kbf-native-$COMMIT-linux-x86_64.deb" --bundle "dist/kbf-native-$COMMIT-linux-x86_64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT"
+        run: gh attestation verify "dist/kbf-native-$COMMIT-linux-x86_64.deb" --bundle "dist/kbf-native-$COMMIT-linux-x86_64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT" --deny-self-hosted-runners
       - name: The arm64 .deb is the one artifacts.yml attested, from main at this commit (from its bundle)
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-        run: gh attestation verify "dist/kbf-native-$COMMIT-linux-arm64.deb" --bundle "dist/kbf-native-$COMMIT-linux-arm64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT"
+        run: gh attestation verify "dist/kbf-native-$COMMIT-linux-arm64.deb" --bundle "dist/kbf-native-$COMMIT-linux-arm64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT" --deny-self-hosted-runners
       - name: Assume the apt publish role through OIDC
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
@@ -1281,7 +1281,7 @@ jobs:
           APT_BUCKET: ${{ vars.APT_BUCKET }}
           APT_DISTRIBUTION_ID: ${{ vars.APT_DISTRIBUTION_ID }}
           APT_HOSTNAME: ${{ vars.APT_HOSTNAME }}
-        run: tool/xtask channels gate --label stable-apt-read --output "$GITHUB_OUTPUT" --require TESTING_ENABLED --setting APT_PUBLISH_ROLE_ARN --setting APT_BUCKET --setting APT_DISTRIBUTION_ID --setting APT_HOSTNAME
+        run: tool/xtask channels gate --label stable-apt-read --output "$GITHUB_OUTPUT" --require "TESTING_ENABLED=$TESTING_ENABLED" --setting "APT_PUBLISH_ROLE_ARN=$APT_PUBLISH_ROLE_ARN" --setting "APT_BUCKET=$APT_BUCKET" --setting "APT_DISTRIBUTION_ID=$APT_DISTRIBUTION_ID" --setting "APT_HOSTNAME=$APT_HOSTNAME"
       - name: Assume the apt publish role through OIDC
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
@@ -1332,7 +1332,7 @@ jobs:
           APT_GPG_FINGERPRINT: ${{ vars.APT_GPG_FINGERPRINT }}
           APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
           APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
-        run: tool/xtask channels gate --label stable-apt-index --output "$GITHUB_OUTPUT" --require READ_ENABLED --setting APT_GPG_FINGERPRINT --setting APT_GPG_PRIVATE_KEY --setting APT_GPG_PASSPHRASE
+        run: tool/xtask channels gate --label stable-apt-index --output "$GITHUB_OUTPUT" --require "READ_ENABLED=$READ_ENABLED" --setting "APT_GPG_FINGERPRINT=$APT_GPG_FINGERPRINT" --secret APT_GPG_PRIVATE_KEY --secret APT_GPG_PASSPHRASE
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         with:
@@ -1352,13 +1352,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-        run: gh attestation verify "dist/kbf-native-$COMMIT-linux-x86_64.deb" --bundle "dist/kbf-native-$COMMIT-linux-x86_64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT"
+        run: gh attestation verify "dist/kbf-native-$COMMIT-linux-x86_64.deb" --bundle "dist/kbf-native-$COMMIT-linux-x86_64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT" --deny-self-hosted-runners
       - name: The arm64 .deb is the one artifacts.yml attested, from main at this commit (from its bundle)
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-        run: gh attestation verify "dist/kbf-native-$COMMIT-linux-arm64.deb" --bundle "dist/kbf-native-$COMMIT-linux-arm64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT"
+        run: gh attestation verify "dist/kbf-native-$COMMIT-linux-arm64.deb" --bundle "dist/kbf-native-$COMMIT-linux-arm64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT" --deny-self-hosted-runners
       - name: Promote the entries of this release that testing lists into the index of stable, held to the digests of SHA256SUMS, the entries of every other product are kept
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
@@ -1409,7 +1409,7 @@ jobs:
           APT_BUCKET: ${{ vars.APT_BUCKET }}
           APT_DISTRIBUTION_ID: ${{ vars.APT_DISTRIBUTION_ID }}
           APT_HOSTNAME: ${{ vars.APT_HOSTNAME }}
-        run: tool/xtask channels gate --label stable-apt-write --output "$GITHUB_OUTPUT" --require READ_ENABLED --require INDEX_SIGNED --setting APT_PUBLISH_ROLE_ARN --setting APT_BUCKET --setting APT_DISTRIBUTION_ID --setting APT_HOSTNAME
+        run: tool/xtask channels gate --label stable-apt-write --output "$GITHUB_OUTPUT" --require "READ_ENABLED=$READ_ENABLED" --require "INDEX_SIGNED=$INDEX_SIGNED" --setting "APT_PUBLISH_ROLE_ARN=$APT_PUBLISH_ROLE_ARN" --setting "APT_BUCKET=$APT_BUCKET" --setting "APT_DISTRIBUTION_ID=$APT_DISTRIBUTION_ID" --setting "APT_HOSTNAME=$APT_HOSTNAME"
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         with:
@@ -1456,7 +1456,7 @@ jobs:
           APT_BUCKET: ${{ vars.APT_BUCKET }}
           APT_DISTRIBUTION_ID: ${{ vars.APT_DISTRIBUTION_ID }}
           APT_HOSTNAME: ${{ vars.APT_HOSTNAME }}
-        run: tool/xtask channels gate --label stable-apt-read-2 --output "$GITHUB_OUTPUT" --setting APT_PUBLISH_ROLE_ARN --setting APT_BUCKET --setting APT_DISTRIBUTION_ID --setting APT_HOSTNAME
+        run: tool/xtask channels gate --label stable-apt-read-2 --output "$GITHUB_OUTPUT" --setting "APT_PUBLISH_ROLE_ARN=$APT_PUBLISH_ROLE_ARN" --setting "APT_BUCKET=$APT_BUCKET" --setting "APT_DISTRIBUTION_ID=$APT_DISTRIBUTION_ID" --setting "APT_HOSTNAME=$APT_HOSTNAME"
       - name: Assume the apt publish role through OIDC
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
@@ -1507,7 +1507,7 @@ jobs:
           APT_GPG_FINGERPRINT: ${{ vars.APT_GPG_FINGERPRINT }}
           APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
           APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
-        run: tool/xtask channels gate --label stable-apt-index-2 --output "$GITHUB_OUTPUT" --require READ_ENABLED --setting APT_GPG_FINGERPRINT --setting APT_GPG_PRIVATE_KEY --setting APT_GPG_PASSPHRASE
+        run: tool/xtask channels gate --label stable-apt-index-2 --output "$GITHUB_OUTPUT" --require "READ_ENABLED=$READ_ENABLED" --setting "APT_GPG_FINGERPRINT=$APT_GPG_FINGERPRINT" --secret APT_GPG_PRIVATE_KEY --secret APT_GPG_PASSPHRASE
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         with:
@@ -1527,13 +1527,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-        run: gh attestation verify "dist/kbf-native-$COMMIT-linux-x86_64.deb" --bundle "dist/kbf-native-$COMMIT-linux-x86_64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT"
+        run: gh attestation verify "dist/kbf-native-$COMMIT-linux-x86_64.deb" --bundle "dist/kbf-native-$COMMIT-linux-x86_64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT" --deny-self-hosted-runners
       - name: The arm64 .deb is the one artifacts.yml attested, from main at this commit (from its bundle)
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-        run: gh attestation verify "dist/kbf-native-$COMMIT-linux-arm64.deb" --bundle "dist/kbf-native-$COMMIT-linux-arm64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT"
+        run: gh attestation verify "dist/kbf-native-$COMMIT-linux-arm64.deb" --bundle "dist/kbf-native-$COMMIT-linux-arm64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT" --deny-self-hosted-runners
       - name: Promote the entries of this release that testing lists into the index of stable, held to the digests of SHA256SUMS, the entries of every other product are kept
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
@@ -1584,7 +1584,7 @@ jobs:
           APT_BUCKET: ${{ vars.APT_BUCKET }}
           APT_DISTRIBUTION_ID: ${{ vars.APT_DISTRIBUTION_ID }}
           APT_HOSTNAME: ${{ vars.APT_HOSTNAME }}
-        run: tool/xtask channels gate --label stable-apt-write-2 --output "$GITHUB_OUTPUT" --require READ_ENABLED --require INDEX_SIGNED --setting APT_PUBLISH_ROLE_ARN --setting APT_BUCKET --setting APT_DISTRIBUTION_ID --setting APT_HOSTNAME
+        run: tool/xtask channels gate --label stable-apt-write-2 --output "$GITHUB_OUTPUT" --require "READ_ENABLED=$READ_ENABLED" --require "INDEX_SIGNED=$INDEX_SIGNED" --setting "APT_PUBLISH_ROLE_ARN=$APT_PUBLISH_ROLE_ARN" --setting "APT_BUCKET=$APT_BUCKET" --setting "APT_DISTRIBUTION_ID=$APT_DISTRIBUTION_ID" --setting "APT_HOSTNAME=$APT_HOSTNAME"
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         with:
@@ -1631,7 +1631,7 @@ jobs:
           APT_BUCKET: ${{ vars.APT_BUCKET }}
           APT_DISTRIBUTION_ID: ${{ vars.APT_DISTRIBUTION_ID }}
           APT_HOSTNAME: ${{ vars.APT_HOSTNAME }}
-        run: tool/xtask channels gate --label stable-apt-read-3 --output "$GITHUB_OUTPUT" --setting APT_PUBLISH_ROLE_ARN --setting APT_BUCKET --setting APT_DISTRIBUTION_ID --setting APT_HOSTNAME
+        run: tool/xtask channels gate --label stable-apt-read-3 --output "$GITHUB_OUTPUT" --setting "APT_PUBLISH_ROLE_ARN=$APT_PUBLISH_ROLE_ARN" --setting "APT_BUCKET=$APT_BUCKET" --setting "APT_DISTRIBUTION_ID=$APT_DISTRIBUTION_ID" --setting "APT_HOSTNAME=$APT_HOSTNAME"
       - name: Assume the apt publish role through OIDC
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
@@ -1682,7 +1682,7 @@ jobs:
           APT_GPG_FINGERPRINT: ${{ vars.APT_GPG_FINGERPRINT }}
           APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
           APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
-        run: tool/xtask channels gate --label stable-apt-index-3 --output "$GITHUB_OUTPUT" --require READ_ENABLED --setting APT_GPG_FINGERPRINT --setting APT_GPG_PRIVATE_KEY --setting APT_GPG_PASSPHRASE
+        run: tool/xtask channels gate --label stable-apt-index-3 --output "$GITHUB_OUTPUT" --require "READ_ENABLED=$READ_ENABLED" --setting "APT_GPG_FINGERPRINT=$APT_GPG_FINGERPRINT" --secret APT_GPG_PRIVATE_KEY --secret APT_GPG_PASSPHRASE
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         with:
@@ -1702,13 +1702,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-        run: gh attestation verify "dist/kbf-native-$COMMIT-linux-x86_64.deb" --bundle "dist/kbf-native-$COMMIT-linux-x86_64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT"
+        run: gh attestation verify "dist/kbf-native-$COMMIT-linux-x86_64.deb" --bundle "dist/kbf-native-$COMMIT-linux-x86_64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT" --deny-self-hosted-runners
       - name: The arm64 .deb is the one artifacts.yml attested, from main at this commit (from its bundle)
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-        run: gh attestation verify "dist/kbf-native-$COMMIT-linux-arm64.deb" --bundle "dist/kbf-native-$COMMIT-linux-arm64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT"
+        run: gh attestation verify "dist/kbf-native-$COMMIT-linux-arm64.deb" --bundle "dist/kbf-native-$COMMIT-linux-arm64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT" --deny-self-hosted-runners
       - name: Promote the entries of this release that testing lists into the index of stable, held to the digests of SHA256SUMS, the entries of every other product are kept
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
@@ -1759,7 +1759,7 @@ jobs:
           APT_BUCKET: ${{ vars.APT_BUCKET }}
           APT_DISTRIBUTION_ID: ${{ vars.APT_DISTRIBUTION_ID }}
           APT_HOSTNAME: ${{ vars.APT_HOSTNAME }}
-        run: tool/xtask channels gate --label stable-apt-write-3 --output "$GITHUB_OUTPUT" --require READ_ENABLED --require INDEX_SIGNED --setting APT_PUBLISH_ROLE_ARN --setting APT_BUCKET --setting APT_DISTRIBUTION_ID --setting APT_HOSTNAME
+        run: tool/xtask channels gate --label stable-apt-write-3 --output "$GITHUB_OUTPUT" --require "READ_ENABLED=$READ_ENABLED" --require "INDEX_SIGNED=$INDEX_SIGNED" --setting "APT_PUBLISH_ROLE_ARN=$APT_PUBLISH_ROLE_ARN" --setting "APT_BUCKET=$APT_BUCKET" --setting "APT_DISTRIBUTION_ID=$APT_DISTRIBUTION_ID" --setting "APT_HOSTNAME=$APT_HOSTNAME"
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         with:

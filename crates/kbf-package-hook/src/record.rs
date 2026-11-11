@@ -113,7 +113,8 @@ impl Store {
         }
     }
 
-    /// Makes the directory if it is not there, readable by its owner alone.
+    /// Makes the directory if it is not there, with the mode the process umask gives (the record
+    /// holds no secret).
     ///
     /// # Errors
     /// The directory cannot be made.

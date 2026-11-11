@@ -45,7 +45,9 @@
 //!   repository, whose `./<dir>` this lint never read);
 //! - it lacks a top-level `permissions: {}`, so jobs start with no token rights;
 //! - any key or value names `self-hosted` or `pull_request_target`, whatever key it
-//!   sits under (a second line of defence behind the structural checks).
+//!   sits under (a second line of defence behind the structural checks); the one flag
+//!   `--deny-self-hosted-runners` of `gh attestation verify` is not such a name, and is read
+//!   as nothing.
 //!
 //! Every tracked `action.yml` or `action.yaml` (any directory, any case) is linted by
 //! [`scan_action`] with the same step, local-path and whole-document rules: its
@@ -463,6 +465,10 @@ fn run(text: &str, repo: &Repo, check: impl FnOnce(&mut Lint<'_>, &Node)) -> Vec
     lint.out
 }
 
+/// The flag of `gh attestation verify` that refuses a signer that ran on a self-hosted runner:
+/// the only text that holds the word `self-hosted` and keeps runners off, so it is not refused.
+const DENY_SELF_HOSTED_FLAG: &str = "--deny-self-hosted-runners";
+
 struct Lint<'a> {
     text: &'a str,
     repo: &'a Repo,
@@ -480,7 +486,7 @@ impl Lint<'_> {
     fn every_node(&mut self, node: &Node) {
         match &node.value {
             Value::Scalar { text, .. } => {
-                let lower = text.to_ascii_lowercase();
+                let lower = text.to_ascii_lowercase().replace(DENY_SELF_HOSTED_FLAG, "");
                 for word in ["self-hosted", "pull_request_target"] {
                     if lower.contains(word) {
                         self.refuse(node, format_args!("a key or value names {word}"));

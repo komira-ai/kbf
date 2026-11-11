@@ -40,7 +40,7 @@ fn code(out: &Output) -> Option<i32> {
 fn gate(args: &[&str], vars: &[(&str, &str)]) -> Output {
     let mut cmd = Command::new(XTASK);
     cmd.args(["channels", "gate"]).args(args);
-    for name in ["GATE_A", "GATE_B", "GATE_READ"] {
+    for name in ["GATE_A", "GATE_B", "GATE_READ", "GATE_SECRET"] {
         cmd.env_remove(name);
     }
     for (name, value) in vars {
@@ -61,18 +61,20 @@ fn a_gate_with_no_setting_set_is_green_and_says_so_on_stdout() {
             "--label",
             "testing-apt-read",
             "--setting",
-            "GATE_A",
+            "GATE_A=",
             "--setting",
-            "GATE_B",
+            "GATE_B=",
+            "--secret",
+            "GATE_SECRET",
             "--output",
             output.to_str().expect("path"),
         ],
-        &[("GATE_A", "")],
+        &[("GATE_SECRET", "")],
     );
     assert_eq!(code(&out), Some(0), "{out:?}");
     assert_eq!(
         text(&out.stdout),
-        "::notice title=The testing-apt-read job is off::None of its settings (GATE_A, GATE_B) is set, so it writes nothing and ends green.\n"
+        "::notice title=The testing-apt-read job is off::None of its settings (GATE_A, GATE_B, GATE_SECRET) is set, so it writes nothing and ends green.\n"
     );
     assert_eq!(text(&out.stderr), "");
     assert_eq!(
@@ -91,17 +93,20 @@ fn a_gate_with_every_setting_set_is_enabled_and_never_prints_a_value() {
             "--label",
             "j",
             "--setting",
-            "GATE_A",
+            "GATE_A=a-setting-value",
+            "--secret",
+            "GATE_SECRET",
             "--require",
-            "GATE_READ",
+            "GATE_READ=true",
             "--output",
             output.to_str().expect("path"),
         ],
-        &[("GATE_A", "secret-value"), ("GATE_READ", "true")],
+        &[("GATE_SECRET", "secret-value")],
     );
     assert_eq!(code(&out), Some(0), "{out:?}");
     assert_eq!(text(&out.stdout), "j: all its settings are set\n");
     assert_eq!(text(&out.stderr), "");
+    assert!(!format!("{out:?}").contains("secret-value"));
     assert_eq!(
         std::fs::read_to_string(&output).expect("output"),
         "enabled=true\n"
@@ -116,11 +121,11 @@ fn a_gate_whose_required_output_is_not_true_is_off_and_green() {
             "--label",
             "j",
             "--setting",
-            "GATE_A",
+            "GATE_A=x",
             "--require",
-            "GATE_READ",
+            "GATE_READ=false",
         ],
-        &[("GATE_READ", "false")],
+        &[],
     );
     assert_eq!(code(&out), Some(0), "{out:?}");
     assert_eq!(
@@ -133,8 +138,15 @@ fn a_gate_whose_required_output_is_not_true_is_off_and_green() {
 fn a_gate_with_some_settings_set_is_a_failure_naming_the_missing_ones() {
     // Catches: a half-made configuration left silently off, and a value in the message.
     let out = gate(
-        &["--label", "j", "--setting", "GATE_A", "--setting", "GATE_B"],
-        &[("GATE_A", "hunter2")],
+        &[
+            "--label",
+            "j",
+            "--setting",
+            "GATE_A=hunter2",
+            "--secret",
+            "GATE_B",
+        ],
+        &[],
     );
     assert_eq!(code(&out), Some(1), "{out:?}");
     assert_eq!(text(&out.stdout), "");
@@ -145,19 +157,43 @@ fn a_gate_with_some_settings_set_is_a_failure_naming_the_missing_ones() {
 }
 
 #[test]
-fn a_setting_that_is_not_a_variable_name_is_a_usage_error_with_status_2() {
-    // Catches: a usage error of a channels verb exiting 1 like a failure, and a `NAME=VALUE`
-    // (a value on the command line) taken for a name.
-    for setting in ["no-equals", "A=1"] {
-        let out = channels(&["gate", "--label", "j", "--setting", setting]);
+fn a_gate_flag_that_is_not_of_its_form_is_a_usage_error_with_status_2() {
+    // Catches: a usage error of a channels verb exiting 1 like a failure, a setting without a
+    // value taken for a name, and a value echoed in the message.
+    for (flag, arg, message) in [
+        (
+            "--setting",
+            "no-equals",
+            "xtask: --setting is not NAME=VALUE (a name, `=`, a value)\n",
+        ),
+        (
+            "--setting",
+            "a=1",
+            "xtask: --setting name \"a\" is not upper case letters, digits and `_`\n",
+        ),
+        (
+            "--require",
+            "READ",
+            "xtask: --require is not NAME=VALUE (a name, `=`, a value)\n",
+        ),
+        (
+            "--secret",
+            "a=1",
+            "xtask: --secret name \"a=1\" is not upper case letters, digits and `_`\n",
+        ),
+    ] {
+        let out = channels(&["gate", "--label", "j", flag, arg]);
         assert_eq!(code(&out), Some(2), "{out:?}");
-        assert_eq!(
-            text(&out.stderr),
-            format!(
-                "xtask: --setting name {setting:?} is not upper case letters, digits and `_`\n"
-            )
-        );
+        assert_eq!(text(&out.stderr), message);
     }
+}
+
+#[test]
+fn a_gate_name_given_twice_is_a_usage_error_with_status_2() {
+    // Catches: a setting and a secret of one name, the second silently shadowing the first.
+    let out = channels(&["gate", "--label", "j", "--setting", "A=1", "--secret", "A"]);
+    assert_eq!(code(&out), Some(2), "{out:?}");
+    assert_eq!(text(&out.stderr), "xtask: --secret A is given twice\n");
 }
 
 #[test]

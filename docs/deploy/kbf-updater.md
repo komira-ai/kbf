@@ -979,8 +979,8 @@ to `--service NAME --version TEXT`.
 
 ### The proof
 
-After `deploy-farm` the job builds a small Buck2 project against the farm it has just
-deployed (`cargo xtask prove-farm`; the project is `crates/kbf-integration-test/gamma/buck2`,
+The job builds a small Buck2 project against the farm (today only when `KBF_SETS_DESIRED` is
+`true`; it no longer deploys first) (`cargo xtask prove-farm`; the project is `crates/kbf-integration-test/gamma/buck2`,
 four `/bin/sh -c` actions that depend on each other). The Buck2 is the pinned one the beta
 smoke uses. The verb writes the project's `.buckconfig.local` from the four `FARM_*` variables:
 the REAPI address for the engine, the action cache and the CAS, TLS, the instance name, and an

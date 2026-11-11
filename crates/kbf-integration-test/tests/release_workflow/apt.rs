@@ -15,12 +15,12 @@
 //!   which the token-less `deploy-tool` job built, and runs it.
 //! - **The steps.** Each read, index and write job is exactly the steps of [`expected`], in that
 //!   order: the download of the tool and `chmod`, the gate (`tool/xtask channels gate`, called
-//!   with the settings and the earlier jobs it needs), and then, each under exactly [`GATE_IF`], the
+//!   with the settings, the secrets and the earlier jobs it needs), and then, each under exactly [`GATE_IF`], the
 //!   rest. So a job without its settings ends green and does nothing, and a file the job uses was
 //!   checked first: before an index, promotion or write that takes files from `release-assets`
 //!   the job checks `SHA256SUMS` and each native .deb against its bundle (signer workflow
-//!   `artifacts.yml`, `refs/heads/main`, this commit; the flag that denies self-hosted runners is
-//!   not given, since the workflow lint refuses that word anywhere in a workflow).
+//!   `artifacts.yml`, `refs/heads/main`, this commit, and `--deny-self-hosted-runners`: the
+//!   workflow lint reads that one flag as nothing, and refuses the word anywhere else).
 //! - **The keys.** `APT_GPG_*` and every `secrets.` appear only in the index jobs, and there only
 //!   in the gate and the sign step; no index job names the role or assumes it.
 //! - **The version.** `verify` outputs `package-version` from the step that reads it from the two
@@ -314,11 +314,11 @@ const PUBLISH_SETTINGS: [&str; 4] = [
     "APT_HOSTNAME",
 ];
 
-const KEY_SETTINGS: [&str; 3] = [
-    "APT_GPG_FINGERPRINT",
-    "APT_GPG_PRIVATE_KEY",
-    "APT_GPG_PASSPHRASE",
-];
+/// The signing key's settings that are not secret material: the fingerprint is a variable.
+const KEY_SETTINGS: [&str; 1] = ["APT_GPG_FINGERPRINT"];
+
+/// The signing key's secret material, which the gate reads from the environment itself.
+const KEY_SECRETS: [&str; 2] = ["APT_GPG_PRIVATE_KEY", "APT_GPG_PASSPHRASE"];
 
 fn var(name: &str) -> String {
     format!("${{{{ vars.{name} }}}}")
@@ -328,11 +328,15 @@ fn secret(name: &str) -> String {
     format!("${{{{ secrets.{name} }}}}")
 }
 
-fn flags(requires: &[&str], settings: &[&str]) -> String {
+/// The gate's flags: a requirement and a setting carry their value from the step's `env`, expanded
+/// by the shell inside one double-quoted argument; a secret is named only, and the verb reads it
+/// from the environment.
+fn flags(requires: &[&str], settings: &[&str], secrets: &[&str]) -> String {
     requires
         .iter()
-        .map(|r| format!("--require {r}"))
-        .chain(settings.iter().map(|s| format!("--setting {s}")))
+        .map(|r| format!("--require \"{r}=${r}\""))
+        .chain(settings.iter().map(|s| format!("--setting \"{s}=${s}\"")))
+        .chain(secrets.iter().map(|s| format!("--secret {s}")))
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -343,6 +347,7 @@ fn gate(spec: Spec) -> Expect {
     let mut env: Vec<(String, String)> = Vec::new();
     let mut requires: Vec<&str> = Vec::new();
     let mut settings: Vec<&str> = Vec::new();
+    let mut secrets: Vec<&str> = Vec::new();
     let output = |job: String, key: &str| format!("${{{{ needs.{job}.outputs.{key} }}}}");
     match spec.kind {
         Kind::Read => {
@@ -362,6 +367,7 @@ fn gate(spec: Spec) -> Expect {
                 output(spec.of(Kind::Read), "enabled"),
             ));
             settings.extend(KEY_SETTINGS);
+            secrets.extend(KEY_SECRETS);
         }
         Kind::Write => {
             requires.extend(["READ_ENABLED", "INDEX_SIGNED"]);
@@ -377,12 +383,10 @@ fn gate(spec: Spec) -> Expect {
         }
     }
     for s in &settings {
-        let value = if *s == "APT_GPG_PRIVATE_KEY" || *s == "APT_GPG_PASSPHRASE" {
-            secret(s)
-        } else {
-            var(s)
-        };
-        env.push(((*s).to_owned(), value));
+        env.push(((*s).to_owned(), var(s)));
+    }
+    for s in &secrets {
+        env.push(((*s).to_owned(), secret(s)));
     }
     env.sort();
     Expect {
@@ -390,7 +394,7 @@ fn gate(spec: Spec) -> Expect {
         want: Want::Run {
             run: format!(
                 "tool/xtask channels gate --label {name} --output \"$GITHUB_OUTPUT\" {}",
-                flags(&requires, &settings)
+                flags(&requires, &settings, &secrets)
             ),
             env,
             dir: None,
@@ -434,7 +438,7 @@ fn files_checked() -> Vec<Expect> {
         all.push(under_gate(run_with(
             &format!("the attestation check of the {arch} .deb, the one artifacts.yml attested from main at this commit (from its bundle)"),
             format!(
-                "gh attestation verify \"{file}\" --bundle \"{file}.sigstore.json\" --repo \"$REPO\" --signer-workflow \"$REPO/.github/workflows/artifacts.yml\" --source-ref refs/heads/main --source-digest \"$COMMIT\""
+                "gh attestation verify \"{file}\" --bundle \"{file}.sigstore.json\" --repo \"$REPO\" --signer-workflow \"$REPO/.github/workflows/artifacts.yml\" --source-ref refs/heads/main --source-digest \"$COMMIT\" --deny-self-hosted-runners"
             ),
             &[
                 ("GH_TOKEN", "${{ github.token }}"),

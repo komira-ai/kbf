@@ -9,7 +9,7 @@ hands the node over with kbf's update hook, `kbf package-hook`.
 
 What this page does not cover:
 
-- **The frontend.** It is deployed as a container (komira-ai/docker-swarm-updater), not by this path.
+- **The frontend.** It is deployed as a container, not by this path.
 - **Macs.** No macOS package is published to a channel; a Mac keeps the path it has.
 - **MinIO.** The object store is not part of the `kbf` package. It stays as its own installation put it.
 - **kbf-updater.** The agent, the root helper and the coordinator stay in this repository, and `rehearse`

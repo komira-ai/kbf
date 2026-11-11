@@ -297,7 +297,7 @@ and a host that trusts one asks for that branch with `--source-ref`; an asset at
 only takes the files of the pipeline run of a push to `main`, so a file built from any other branch is
 never released.
 
-Only the `attest-*` jobs (`attest-linux`, `attest-darwin-arm64`) hold `id-token: write` and `attestations: write` (the release workflow's `gamma` job holds `id-token: write` alone, to present it to the update coordinator, and signs nothing; see [Releases](#releases)), and only
+Only the `attest-*` jobs (`attest-linux`, `attest-darwin-arm64`) hold `id-token: write` and `attestations: write` (in the release workflow, `gamma` holds `id-token: write` for its network join and the apt read and write jobs for the cloud role they assume, and none of them signs anything; see [Releases](#releases)), and only
 under the exact `if:` that limits it to a push to `main` (the
 `verify-*` jobs run under the same one). The workflow lint
 (`crates/kbf-integration-test/tests/workflows`) refuses those scopes in any other job, and in one
@@ -904,7 +904,7 @@ commit. (The notes are written after the tag, because they read it.)
 
 `crates/kbf-integration-test/tests/release_workflow` holds the file to all of this (and `pipeline_workflow` holds the pipeline it follows to its order, its cancel and its triggers): the events
 (the completion of a `pipeline` run for `main` only), the job graph and the scopes, `if:` and environment of each job, the halt on
-red, a checkout of the commit the pipeline built alone, the release bot's key read in `tag` and `bump` only, `id-token: write` in `gamma` only (the coordinator's address and the farm's `FARM_*` settings are read from repository variables there and nowhere else),
+red, a checkout of the commit the pipeline built alone, the release bot's key read in `tag` and `bump` only, `id-token: write` in `gamma` and the apt read and write jobs only (the farm's `FARM_*` settings are read from repository variables in `gamma` and nowhere else),
 the data that flows from job to job, pinned actions and an empty top-level `permissions`. The
 job list is pinned, `publish` among them (`gamma.yml`, which followed the workflow, is deleted). On every
 pull request into `main`, CI asks GitHub the same on-`main` question for the pull request's base
