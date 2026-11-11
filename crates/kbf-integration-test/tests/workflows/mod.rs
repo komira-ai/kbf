@@ -30,8 +30,11 @@
 //!   only in a job whose `if:` is exactly [`ISSUES_MAIN_ONLY`] (the advisories workflow
 //!   keeps one issue; no pull request run holds a token that can write issues);
 //! - a job calls a reusable workflow that is not one of this repository's linted
-//!   workflow files (its runners are not in a file this lint read), but for exactly the
-//!   pinned calls of [`called::CALLABLE`], each with its version comment;
+//!   workflow files (its runners are not in a file this lint read), but for exactly the two
+//!   calls AGENTS.md's B10 names, each pinned by a full commit SHA with its version comment:
+//!   docker-swarm-updater's `deploy.yml` from the release's `deploy` job ([`called::CALLABLE`])
+//!   and hostkeeper's `set-desired.yml` from `hostkeeper-desired.yml`'s `set-desired` job
+//!   ([`hostkeeper`]);
 //! - a step's `uses:` is not pinned to a full 40-character commit SHA followed on the
 //!   same line by a version comment, written as a plain (unquoted) scalar so the
 //!   comment's place is exact;
@@ -174,8 +177,8 @@ const SIGNING_PUSH_ONLY: &str =
 const SIGNING_STAGE_ONLY: &str = "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && inputs.stage == 'sign' }}";
 
 /// The one signing scope a job may also set to `write` under [`RELEASE_PUSH_ONLY`] or
-/// [`called::DEPLOY_ONLY`]: the OIDC token, which the release workflow's gamma stage presents to
-/// the farm's update coordinator and its frontend deploy to docker-swarm-updater. It signs
+/// [`called::DEPLOY_ONLY`]: the OIDC token, which the release workflow's gamma stage uses for its
+/// network join and its frontend deploy presents to docker-swarm-updater. It signs
 /// nothing (`attestations` stays under [`SIGNING_PUSH_ONLY`]), and the workflow lint of
 /// `release.yml` holds the two jobs that have it to exactly their scopes.
 const DEPLOY_SCOPE: &str = "id-token";
