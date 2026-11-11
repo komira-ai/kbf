@@ -160,25 +160,6 @@ fn the_empty_digest_is_the_sha256_of_nothing() {
     assert_eq!(EMPTY_DIGEST, sha256(b""));
 }
 
-/// Asserts that a field the contract does not name is skipped, in the timing (`put_ms`) and at
-/// the top level (a list, `entries`): each manifest reads as the one without it and writes back
-/// without it.
-#[test]
-fn a_manifest_with_an_unknown_field_reads_as_the_one_without_it() {
-    for name in [
-        "valid/unknown_field_put_ms.json",
-        "valid/unknown_top_level_field.json",
-    ] {
-        let parsed = parse_fixture(name).expect(name);
-        assert_eq!(parsed, base(), "{name}");
-        assert_eq!(
-            parsed.to_json().expect(name),
-            fixture("valid/minimal.json"),
-            "{name}"
-        );
-    }
-}
-
 /// Asserts that a key given twice is refused, not resolved to one of its values.
 #[test]
 fn a_duplicate_key_is_refused() {
@@ -505,7 +486,7 @@ pub(crate) const BIG_1: &str =
     "1111111111111111111111111111111111111111111111111111111111111111/138847232";
 const BIG_2: &str = "2222222222222222222222222222222222222222222222222222222222222222/114300000";
 
-fn parse_v2(name: &str) -> Result<TaskManifest, ManifestError> {
+pub(crate) fn parse_v2(name: &str) -> Result<TaskManifest, ManifestError> {
     TaskManifest::parse_with(&fixture(name), LARGE_MAX)
 }
 
@@ -844,24 +825,6 @@ fn a_manifest_without_inputs_stays_v1() {
         ..base()
     };
     assert_eq!(with.version(), MANIFEST_VERSION_2);
-}
-
-/// Asserts that an unknown field inside `inputs` and inside `bytes_by_source` is skipped: each
-/// manifest reads as the one without it and writes back as `inputs_all_fields.json`.
-#[test]
-fn an_unknown_field_inside_inputs_is_skipped() {
-    for name in [
-        "valid_v2/inputs_unknown_field.json",
-        "valid_v2/inputs_unknown_source_field.json",
-    ] {
-        let parsed = parse_v2(name).expect(name);
-        assert_eq!(parsed.inputs, Some(all_inputs()), "{name}");
-        assert_eq!(
-            parsed.to_json().expect(name),
-            fixture("valid_v2/inputs_all_fields.json"),
-            "{name}"
-        );
-    }
 }
 
 /// Asserts that an `inputs` number over `i64::MAX` is refused with its field name, in `inputs`

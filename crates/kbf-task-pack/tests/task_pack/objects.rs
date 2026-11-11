@@ -148,14 +148,8 @@ fn the_fields_of_version_3_are_exact() {
         };
         assert!(matched, "{name}: {err}");
         // The pack readers refuse the same file for the same reason.
-        let err = TaskManifest::parse_with(&fixture(name), LARGE_MAX).expect_err(name);
-        assert!(
-            matches!(
-                err,
-                ManifestError::MissingField { .. } | ManifestError::UnexpectedField { .. }
-            ),
-            "{name}: {err}"
-        );
+        let again = TaskManifest::parse_with(&fixture(name), LARGE_MAX).expect_err(name);
+        assert_eq!(again.to_string(), err.to_string(), "{name}");
     }
     assert!(matches!(
         refusal_v3("invalid_v3/objects_not_a_list.json"),

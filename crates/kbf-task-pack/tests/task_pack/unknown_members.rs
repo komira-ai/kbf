@@ -4,7 +4,9 @@
 
 use kbf_task_pack::{InputStats, InputsFrom, ManifestError, TaskManifest};
 
-use crate::task_manifest::{LARGE_MAX, all_inputs, base, file, fixture, golden, parse_fixture};
+use crate::task_manifest::{
+    LARGE_MAX, all_inputs, base, file, fixture, golden, parse_fixture, parse_v2,
+};
 
 /// Asserts that a manifest with an unknown member in every object it has (the top level, a
 /// file, a directory, a symlink, `timing` and `usage`), the values a number, a string, `null`,
@@ -128,4 +130,41 @@ fn a_known_member_out_of_its_version_is_still_refused() {
         TaskManifest::parse(mistyped.as_bytes()),
         Err(ManifestError::Json(_))
     ));
+}
+
+/// Asserts that a field the contract does not name is skipped, in the timing (`put_ms`) and at
+/// the top level (a list, `entries`): each manifest reads as the one without it and writes back
+/// without it.
+#[test]
+fn a_manifest_with_an_unknown_field_reads_as_the_one_without_it() {
+    for name in [
+        "valid/unknown_field_put_ms.json",
+        "valid/unknown_top_level_field.json",
+    ] {
+        let parsed = parse_fixture(name).expect(name);
+        assert_eq!(parsed, base(), "{name}");
+        assert_eq!(
+            parsed.to_json().expect(name),
+            fixture("valid/minimal.json"),
+            "{name}"
+        );
+    }
+}
+
+/// Asserts that an unknown field inside `inputs` and inside `bytes_by_source` is skipped: each
+/// manifest reads as the one without it and writes back as `inputs_all_fields.json`.
+#[test]
+fn an_unknown_field_inside_inputs_is_skipped() {
+    for name in [
+        "valid_v2/inputs_unknown_field.json",
+        "valid_v2/inputs_unknown_source_field.json",
+    ] {
+        let parsed = parse_v2(name).expect(name);
+        assert_eq!(parsed.inputs, Some(all_inputs()), "{name}");
+        assert_eq!(
+            parsed.to_json().expect(name),
+            fixture("valid_v2/inputs_all_fields.json"),
+            "{name}"
+        );
+    }
 }
