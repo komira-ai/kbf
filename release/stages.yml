@@ -57,9 +57,10 @@ stages:
     result: beta-result.json
     events: [workflow_call]
   # release.yml plans, verifies, tags with the release bot, publishes, bumps the internal
-  # repository, and then its `gamma` job sets the release as the farm's desired version on the
-  # update coordinator, waits for the farm to converge, and proves the farm with a remote-only
-  # Buck2 build (`cargo xtask prove-farm`). All of it is one run, in the stage below. It is
+  # repository, publishes the release's native .debs to the apt repository (suite testing, an
+  # install check on each architecture, then suite stable), and its `gamma` job proves the farm
+  # with a remote-only Buck2 build (`cargo xtask prove-farm`) when the farm's nodes are deployed
+  # by hostkeeper. All of it is one run, in the stage below. It is
   # started by the completion of a successful pipeline run (`workflow_run`), the one workflow
   # that is, so that the release is a run of its own that no push cancels once it has started.
   # gamma.yml is deleted, and the 24 hour bake and its verdict run outside Actions.
@@ -68,6 +69,16 @@ stages:
     after: [beta, suite]
     result: release.json
     events: [workflow_run]
+  # hostkeeper-desired.yml sets the release as the desired version of kbf on hostkeeper's
+  # coordinator, which deploys the farm's Linux nodes from the suite stable. It follows a run of
+  # release.yml (`workflow_run`) and can be started by hand for a released version
+  # (`workflow_dispatch`), and does nothing unless the repository variable KBF_SETS_DESIRED is
+  # `true`.
+  - name: deploy
+    runs: actions
+    after: [prod]
+    result: desired version set
+    events: [workflow_run, workflow_dispatch]
 jobs:
   - job: pipeline.yml#ci
     stage: ci
@@ -154,9 +165,66 @@ jobs:
     stage: prod
   - job: release.yml#rehearse-agent
     stage: prod
-  # Presents the run's OIDC token to the farm's update coordinator and signs nothing: the row is
-  # `signing: true` because the job holds `id-token: write`, which only a signing row may.
+  # Presents the run's OIDC token to the tailnet's identity federation and signs nothing: the row
+  # is `signing: true` because the job holds `id-token: write`, which only a signing row may.
   - job: release.yml#gamma
+    stage: prod
+    signing: true
+  - job: release.yml#deploy-tool
+    stage: prod
+  # The apt reads and writes present the run's OIDC token to the cloud provider for a role and sign
+  # nothing: `signing: true` for the same reason. The index jobs hold the signing key of the apt
+  # repository, not a token.
+  - job: release.yml#testing-apt-read
+    stage: prod
+    signing: true
+  - job: release.yml#testing-apt-index
+    stage: prod
+  - job: release.yml#testing-apt-write
+    stage: prod
+    signing: true
+  - job: release.yml#testing-apt-read-2
+    stage: prod
+    signing: true
+  - job: release.yml#testing-apt-index-2
+    stage: prod
+  - job: release.yml#testing-apt-write-2
+    stage: prod
+    signing: true
+  - job: release.yml#testing-apt-read-3
+    stage: prod
+    signing: true
+  - job: release.yml#testing-apt-index-3
+    stage: prod
+  - job: release.yml#testing-apt-write-3
+    stage: prod
+    signing: true
+  - job: release.yml#check-apt-amd64
+    stage: prod
+  - job: release.yml#check-apt-arm64
+    stage: prod
+  - job: release.yml#stable-apt-read
+    stage: prod
+    signing: true
+  - job: release.yml#stable-apt-index
+    stage: prod
+  - job: release.yml#stable-apt-write
+    stage: prod
+    signing: true
+  - job: release.yml#stable-apt-read-2
+    stage: prod
+    signing: true
+  - job: release.yml#stable-apt-index-2
+    stage: prod
+  - job: release.yml#stable-apt-write-2
+    stage: prod
+    signing: true
+  - job: release.yml#stable-apt-read-3
+    stage: prod
+    signing: true
+  - job: release.yml#stable-apt-index-3
+    stage: prod
+  - job: release.yml#stable-apt-write-3
     stage: prod
     signing: true
   # Reads the published release only: the frontend image's digest and the addresses the deploy
@@ -168,4 +236,10 @@ jobs:
   # `id-token: write`, which only a signing row may.
   - job: release.yml#deploy
     stage: prod
+    signing: true
+  - job: hostkeeper-desired.yml#check
+    stage: deploy
+  # Calls hostkeeper's reusable workflow with the run's OIDC token; signs nothing.
+  - job: hostkeeper-desired.yml#set-desired
+    stage: deploy
     signing: true

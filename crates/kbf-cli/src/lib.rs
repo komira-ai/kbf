@@ -309,6 +309,12 @@ pub fn config_template(mode: &str) -> Option<String> {
 /// flags of the declaration before the step. Like `kbf cluster`, it is not a mode.
 pub const UPDATE_HOOK: &str = "update-hook";
 
+/// The word after `kbf` that runs one step of the update hook of the native kbf package
+/// (`kbf package-hook <step>`, `kbf_package_hook`): hostkeeper's apt installer runs it as
+/// `/usr/bin/kbf package-hook <step> [<staged release>] --params <file>`. Like `kbf cluster`, it
+/// is not a mode.
+pub const PACKAGE_HOOK: &str = "package-hook";
+
 /// The word after `kbf` that calls the operator API ([`cluster`]) instead of starting a
 /// mode. It is not in [`names::MODES`], so the mode list stays exact.
 pub const CLUSTER: &str = "cluster";
@@ -882,6 +888,9 @@ pub fn main() -> ExitCode {
     }
     if args.get(1).is_some_and(|word| word == UPDATE_HOOK) {
         return kbf_updater::agent::hook::main(args.into_iter().skip(2).collect());
+    }
+    if args.get(1).is_some_and(|word| word == PACKAGE_HOOK) {
+        return kbf_package_hook::main(args.into_iter().skip(2).collect());
     }
     if args.get(1).is_some_and(|word| word == CLUSTER) {
         return match parse_cluster(&args) {

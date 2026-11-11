@@ -37,7 +37,7 @@ the package tests) runs in `beta.yml` on every push and never on a pull request;
 
 23 tarballs, each with its SBOM and (once the push is attested) its provenance bundle
 ([below](#provenance-bundles-verifying-a-tarball-offline)), two Debian packages of `kbf`
-([below](#the-kbf-package-deb)), one frontend, one update coordinator and one task runner container image per
+([below](#the-kbf-package-deb)), two native Debian packages of `kbf` ([below](#the-native-kbf-package)), one frontend, one update coordinator and one task runner container image per
 Linux architecture ([below](#the-frontend-and-coordinator-images-oci)) and one macOS package of `kbf-installer`
 ([below](#the-kbf-installer-package-pkg-macos)), built by one job per platform:
 
@@ -106,6 +106,8 @@ The packages are the two Linux jobs' debs (one each) and container images (three
 |---|---|---|
 | `kbf-<commit>-linux-x86_64.deb` | the `linux-x86_64` job (`ubuntu-24.04`, nfpm for amd64) | the `kbf` of the tarball of the same name at `/usr/bin/kbf`, the unit of every mode, `kbf.slice`, the users and directories they run with, the trust directory (the pinned `gh` for amd64, the Sigstore trusted root, `installer.conf`), and the host agent's two units, enabled, with the agent's account; it replaces the old `kbf-installer` |
 | `kbf-<commit>-linux-arm64.deb` | the `linux-arm64` job (`ubuntu-24.04-arm`, nfpm for arm64) | the same for arm64 |
+| `kbf-native-<commit>-linux-x86_64.deb` | the `linux-x86_64` job (`ubuntu-24.04`, nfpm for amd64) | the files of the `kbf` deb above without the host agent (no `kbf-host-local.service`, no `kbf-updater-agent.service`, no links that enable them, no agent account), as package `kbf` at the version `<major>.<minor>.<seq>` that `kbf --version --json` names (for example `0.1.7472`); [below](#the-native-kbf-package) |
+| `kbf-native-<commit>-linux-arm64.deb` | the `linux-arm64` job (`ubuntu-24.04-arm`, nfpm for arm64) | the same for arm64 |
 | `kbf-frontend-image-<commit>-linux-x86_64.oci.tar` | the `linux-x86_64` job (`ubuntu-24.04`, BuildKit) | an OCI image of the `kbf` of the tarball of the same name, which runs `kbf --mode=frontend` as a user that is not root |
 | `kbf-frontend-image-<commit>-linux-arm64.oci.tar` | the `linux-arm64` job | the same for arm64 |
 | `kbf-coordinator-image-<commit>-linux-x86_64.oci.tar` | the `linux-x86_64` job (`ubuntu-24.04`, BuildKit) | an OCI image of the `kbf-coordinator` the job built, which runs it as a user that is not root |
@@ -295,7 +297,7 @@ and a host that trusts one asks for that branch with `--source-ref`; an asset at
 only takes the files of the pipeline run of a push to `main`, so a file built from any other branch is
 never released.
 
-Only the `attest-*` jobs (`attest-linux`, `attest-darwin-arm64`) hold `id-token: write` and `attestations: write` (the release workflow's `gamma` job holds `id-token: write` alone, to present it to the update coordinator, and its `deploy` job holds it alone too, for the docker-swarm-updater workflow it calls; neither signs anything; see [Releases](#releases)), and only
+Only the `attest-*` jobs (`attest-linux`, `attest-darwin-arm64`) hold `id-token: write` and `attestations: write` (in the release workflow, `gamma` holds `id-token: write` for its network join, the apt read and write jobs for the cloud role they assume, and `deploy` for the docker-swarm-updater workflow it calls, and none of them signs anything; see [Releases](#releases)), and only
 under the exact `if:` that limits it to a push to `main` (the
 `verify-*` jobs run under the same one). The workflow lint
 (`crates/kbf-integration-test/tests/workflows`) refuses those scopes in any other job, and in one
@@ -473,6 +475,21 @@ has the SBOM of its tarball, and the `gh` it carries has none here. The verify j
 offline with the installer's flags, and runs `cargo xtask pkg-kbf-asset --verify-only` on the
 signed file with `--expect-ref "$GITHUB_REF"`, so the package that was attested is the one whose
 contents were checked.
+
+### The native `kbf` package
+
+The same two jobs also build `kbf-native-<commit>-<platform>.deb`, the package that hostkeeper
+installs and updates from the apt repository (`packages.komira.ai`). `cargo xtask pkg-config
+--no-host-agent --native-version-of <kbf>` writes its configuration into `target/pkg/native`,
+`pkg-build` builds it twice, and `cargo xtask pkg-kbf-asset --native --native-version-of <kbf>`
+makes it the asset and lists it in `SHA256SUMS`. It is held to the checks above (its `kbf` is the
+tarball's, the same files and modes, the trust directory, no `Depends`) with these differences: it
+holds no host agent file and no link, and its `Version` is exactly `<major>.<minor>.<seq>`, the
+workspace version's first two numbers and the build's commit count from `kbf --version --json`
+(the apt repository takes no `+`, `~` or revision), equal to the version of the `kbf` it carries.
+It is attested like the other deb, with its own bundle
+`kbf-native-<commit>-<platform>.deb.sigstore.json`, and the verify job runs
+`cargo xtask pkg-kbf-asset --verify-only --native` on the signed file.
 
 To install one, verify it first, then `dpkg -i` (every flag is the installer's: `GhCheck::args`
 in `crates/kbf-installer/src/attest.rs`; a host that has no pinned `gh` yet uses the operator's own):
@@ -828,9 +845,7 @@ can create one. The jobs, each with the least token it needs:
 | `notes` | checks the tag (`release verify`), the identity of this release and of the one before it, and writes the notes | read |
 | `publish` | creates the release with those files and notes (`release publish`) | `contents: write`; environment `release` |
 | `bump` | opens the pull request in the internal repository that moves its submodule to the release (`release bump-internal`) | `contents: read`; environment `release` |
-| `gamma` | after `publish`, derives the version its hosts report (`<version>+g<commit>`, from the release's version facts: `release farm-version`), sets it as the desired version on the farm's update coordinator and waits for the farm to converge (`deploy-farm`); passes with a notice when the repository variable `KBF_COORDINATOR_URL` is unset. Then builds a small Buck2 project against the farm, remote only, and fails unless some action ran remotely and none locally (`prove-farm`); passes with a notice when `FARM_ADDRESS` is unset ([deploy/kbf-updater.md](deploy/kbf-updater.md#turn-on-the-gamma-stage)) | `contents: read`, `id-token: write`; environment `release` |
-| `deploy-digest` | only while the repository variable `CP_DEPLOY_ENDPOINT` is set, after `publish`: the manifest digest of the release's linux-x86_64 frontend image (which must be the file `SHA256SUMS` lists) and the release's addresses of the image and its bundle (`release image-digest`) | `contents: read` |
-| `deploy` | only while `CP_DEPLOY_ENDPOINT` is set, after `gamma`: calls docker-swarm-updater's deploy workflow, pinned by commit, to deploy that image to the frontend's Docker Swarm service and wait for it to converge ([deploy/swarm-frontend.md](deploy/swarm-frontend.md)) | `id-token: write`; the called job runs in environment `controlplane` |
+Only the `attest-*` jobs (`attest-linux`, `attest-darwin-arm64`) hold `id-token: write` and `attestations: write` (in the release workflow, `gamma` holds `id-token: write` for its network join, the apt read and write jobs for the cloud role they assume, and `deploy` for the docker-swarm-updater workflow it calls, and none of them signs anything; see [Releases](#releases)), and only
 
 Every job after `plan` runs only when `plan` says the push ships code and does not change the
 pipeline (`.github/`, `infra/`, `crates/xtask/` and the like): a push of docs only releases
@@ -839,7 +854,7 @@ that does not. `tag`, `notes`, `publish`, `bump` and `gamma` also repeat the con
 workflow (conclusion `success`, event `push`, branch `main`, this repository). The pipeline run is never cancelled
 and the newest waiting push queues behind it; `plan` measures from the highest release tag that is an ancestor of the
 commit, so the code of a push that was replaced while waiting is released with the next one. No job runs after a red one (no `always()`, no
-`continue-on-error`). `release tag` and `release publish` both refuse a commit that is behind the
+`continue-on-error`; the apt jobs that follow an attempt that may be skipped use `!cancelled() && !failure()`). `release tag` and `release publish` both refuse a commit that is behind the
 highest release tag, so a re-run of an old run releases nothing; re-run the failed jobs only.
 `verify`, with read-only scopes, fails the run (and nothing is tagged) when:
 
@@ -885,7 +900,7 @@ commit. (The notes are written after the tag, because they read it.)
 
 `crates/kbf-integration-test/tests/release_workflow` holds the file to all of this (and `pipeline_workflow` holds the pipeline it follows to its order, its cancel and its triggers): the events
 (the completion of a `pipeline` run for `main` only), the job graph and the scopes, `if:` and environment of each job, the halt on
-red, a checkout of the commit the pipeline built alone, the release bot's key read in `tag` and `bump` only, `id-token: write` in `gamma` and `deploy` only (the coordinator's address and the farm's `FARM_*` settings are read from repository variables in `gamma` and nowhere else, the `CP_DEPLOY_*` ones in `deploy-digest` and `deploy` alone), the one reusable workflow `deploy` calls and its inputs,
+Only the `attest-*` jobs (`attest-linux`, `attest-darwin-arm64`) hold `id-token: write` and `attestations: write` (in the release workflow, `gamma` holds `id-token: write` for its network join, the apt read and write jobs for the cloud role they assume, and `deploy` for the docker-swarm-updater workflow it calls, and none of them signs anything; see [Releases](#releases)), and only
 the data that flows from job to job, pinned actions and an empty top-level `permissions`. The
 job list is pinned, `publish` among them (`gamma.yml`, which followed the workflow, is deleted). On every
 pull request into `main`, CI asks GitHub the same on-`main` question for the pull request's base

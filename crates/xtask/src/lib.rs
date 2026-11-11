@@ -4,6 +4,9 @@
 //! - `build-commit check <binary> <commit>`, `build-commit check-asset <tarball>
 //!   <commit>` and `build-commit stamps <commit>` ([`build_commit`]): kbf-server names the
 //!   commit it was built from, and `kbf` does in the tarball that ships.
+//! - `channels gate|assume|apt|check-apt ...` ([`channels`]): the release's native .deb published to the apt
+//!   repository at `packages.komira.ai` (suite `testing`, then `stable`), the check that it installs, and the gates
+//!   and AWS credentials of the release jobs that do it.
 //! - `advisories --repo <owner>/<repo> [--commit <sha>]` ([`advisories`]): `cargo deny check
 //!   advisories`, kept in one GitHub issue (opened, updated, or commented on and closed when
 //!   none remain) instead of failing a pull request. Exit 0 whatever it found; 1 when
@@ -104,7 +107,7 @@
 //!   attestations` and `release check` hold a directory to one bundle per tarball,
 //!   each that tarball's (its one subject is the tarball's digest); `verify-assets
 //!   attestations` also has `gh` verify each tarball against its bundle.
-//! - `release {locate,main-control,check,verify,notes,plan,identity,farm-version,image-digest,previous,fetch-previous,publish,bump-internal}` ([`release`]): a GitHub release of
+//! - `release {locate,main-control,check,verify,notes,plan,identity,farm-version,image-digest,previous,fetch-previous,publish,bump-internal,desired}` ([`release`]): a GitHub release of
 //!   the files the artifacts stage of a push run of the pipeline on `main` built and attested for a
 //!   commit on `main`, checked again and never rebuilt; a re-run adds nothing twice and
 //!   replaces nothing.
@@ -147,6 +150,7 @@ pub mod advisories;
 pub mod budget;
 pub mod build_commit;
 pub mod bundles;
+pub mod channels;
 pub mod crun_tests;
 pub mod darwin;
 pub mod deploy_farm;
@@ -203,6 +207,10 @@ pub enum Error {
     Fetch(#[from] fetch::Error),
     #[error(transparent)]
     Entitlements(#[from] entitlements::Error),
+    /// A channels verb (the apt repository, its install check) failed. A usage error of one is
+    /// [`Error::Usage`], through the conversion in [`channels`].
+    #[error(transparent)]
+    Channels(channels::Error),
     /// Flags that do not fit together (exit status 2, like a clap error).
     #[error("{0}")]
     Usage(String),
@@ -234,6 +242,12 @@ enum Verb {
     /// kbf-server's `--version` names the commit it was built from.
     #[command(subcommand)]
     BuildCommit(BuildCommit),
+    /// The release's native deb in the apt repository (`channels apt ...`), its install check and the
+    /// gates and credentials of the jobs that do it.
+    Channels {
+        #[command(subcommand)]
+        verb: channels::Verb,
+    },
     /// Keep the advisories `cargo deny` reports in one GitHub issue.
     Advisories(advisories::Args),
     /// Wait until the sibling jobs of a split job have uploaded their artifacts.
@@ -439,37 +453,7 @@ enum Verb {
     /// `kbf`, it replaces and breaks the old kbf-installer, and it holds the units of the
     /// modes, the slice, the sysusers and tmpfiles files and a trust directory that trusts
     /// the branch it is attested for, and nothing else.
-    PkgKbfAsset {
-        /// The deb nfpm built, or the directory holding the one (with `--verify-only`: the
-        /// asset itself).
-        #[arg(long)]
-        package: PathBuf,
-        /// The platform it was built for (`linux-x86_64`, `linux-arm64`).
-        #[arg(long, value_enum)]
-        platform: package::Platform,
-        /// The commit it was built from (`$GITHUB_SHA`).
-        #[arg(long)]
-        commit: String,
-        /// The `kbf-<commit>-<platform>.tar.gz` whose `kbf` the deb must hold.
-        #[arg(long)]
-        kbf_tarball: PathBuf,
-        /// The branch the deb must trust, and is attested for (`$GITHUB_REF`).
-        #[arg(long)]
-        expect_ref: String,
-        /// The pinned `gh` the deb's must be byte for byte (optional with --verify-only).
-        #[arg(long)]
-        gh: Option<PathBuf>,
-        /// The directory the asset and its line of `SHA256SUMS.<platform>` go in.
-        #[arg(
-            long,
-            required_unless_present = "verify_only",
-            conflicts_with = "verify_only"
-        )]
-        out: Option<PathBuf>,
-        /// Only check `--package`, which must be named as the asset; write nothing.
-        #[arg(long)]
-        verify_only: bool,
-    },
+    PkgKbfAsset(pkg_kbf_asset::AssetArgs),
     /// The frontend, coordinator or task OCI image tarball as a release asset, refused unless its
     /// program is the attested `kbf` (or the built `kbf-coordinator` or `kbf-task`), its entrypoint is the
     /// service's, it runs as a user that is not root and it is built for the platform.
@@ -870,6 +854,10 @@ enum ReleaseVerb {
     /// Create the annotated release tag at `--sha` through the GitHub API: create-only,
     /// after the stale-run guards; a tag that exists is reused only when it is the same.
     Tag(release::tag::TagArgs),
+    /// The release the farm's hostkeeper is told to run: the choice of the release, then its
+    /// `.deb`s held to `SHA256SUMS` and to the stable apt suite. Writes `set`, `package-version`
+    /// and `targets` to `--output`.
+    Desired(release::desired::DesiredArgs),
     /// Write the Beta record a release tag carries as its message (audit only).
     VerdictWrite(release::verdict_write::WriteArgs),
     /// Run the `kbf` just built with `--version --json` and keep what it printed as the
@@ -1143,6 +1131,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             sudo: &sudo,
             root: &root,
         }),
+        Verb::Channels { verb } => Ok(channels::run(verb)?),
         Verb::Advisories(args) => advisories::run(&args, &root, &cargo_program()),
         Verb::WaitArtifacts(args) => wait_artifacts::run(&args, &root, &cargo_program()),
         Verb::ProfilesComplete(args) => profiles_complete::run(&args),
@@ -1254,29 +1243,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             source_ref,
             out,
         } => pkg_trust::write(&gh, &trusted_root, &source_ref, &out),
-        Verb::PkgKbfAsset {
-            package,
-            platform,
-            commit,
-            kbf_tarball,
-            expect_ref,
-            gh,
-            out,
-            verify_only,
-        } => pkg_kbf_asset::asset(
-            &pkg_asset::sole(&package, "deb")?,
-            &commit,
-            &match (&out, verify_only) {
-                (Some(out), false) => pkg_asset::Mode::Add(out),
-                _ => pkg_asset::Mode::VerifyOnly,
-            },
-            &pkg_kbf_asset::Check {
-                platform,
-                kbf_tarball: &kbf_tarball,
-                expect_ref: &expect_ref,
-                gh: gh.as_deref(),
-            },
-        ),
+        Verb::PkgKbfAsset(args) => pkg_kbf_asset::run(&args),
         Verb::PkgImageAsset {
             image,
             service,
@@ -1512,6 +1479,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
         Verb::Release(ReleaseVerb::BumpInternal(args)) => release::bump::run(&args),
         Verb::Release(ReleaseVerb::Tag(args)) => release::tag::run(&args),
         Verb::Release(ReleaseVerb::VersionFacts(args)) => version_facts::run(&args),
+        Verb::Release(ReleaseVerb::Desired(args)) => release::desired::run(&args),
         Verb::Release(ReleaseVerb::FarmVersion(args)) => release::farm_version::run(&args),
         Verb::Release(ReleaseVerb::ImageDigest(args)) => release::image_digest::run(&args),
         Verb::Release(ReleaseVerb::VerdictWrite(args)) => release::verdict_write::run(&args),

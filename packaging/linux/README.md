@@ -101,6 +101,17 @@ ignored and logged as retired).
 Never Podman, never Envoy (a test pins it): nothing in the package depends on, installs or checks
 Envoy, and kbf runs none.
 
+## The native package
+
+The release also has `kbf-native-<commit>-<platform>.deb`: the package above without the host
+agent (no `kbf-host-local.service`, no `kbf-updater-agent.service`, no links in `multi-user.target.wants`,
+no `kbf-updater.conf`), at the version `<major>.<minor>.<seq>` of the `kbf` it carries, which hostkeeper installs
+from the apt repository. `cargo xtask pkg-config --no-host-agent --native-version-of <kbf>`
+writes its configuration (without `--host-agent`; one of the two flags is required, and
+`--version` and `--version-of` conflict with `--native-version-of`), and `cargo xtask pkg-kbf-asset --native`
+makes it the asset. Everything else is the same list of files; see
+[docs/artifacts.md](../../docs/artifacts.md#the-native-kbf-package).
+
 ## Installing starts nothing and enables only the host agent
 
 The package has no maintainer script (`xtask pkg-install-test` fails on one or on a dependency, in both formats; the

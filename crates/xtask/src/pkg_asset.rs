@@ -70,6 +70,54 @@ fn version_of(ok: bool, stdout: &str, name: &str) -> Option<String> {
     }
 }
 
+/// The Debian version of the native package: `<major>.<minor>.<seq>` of the workspace
+/// `version` (`0.1.0`) and the build's commit count `seq`, exactly three numbers as the shared
+/// apt repository requires and growing along `main` with `seq`.
+///
+/// # Errors
+/// `version` is not three dot-separated decimal numbers.
+pub fn native_version(version: &str, seq: u64) -> Result<String, Error> {
+    // The rule is the hook's (`kbf-package-hook`), which compares the installed `kbf` with the
+    // version set: one definition for the package and its check.
+    kbf_package_hook::native_version(version, seq).map_err(|e| Error::Failed(e.to_string()))
+}
+
+/// The native package version ([`native_version`]) the `--version --json` output `json` of a
+/// `kbf` names: its string `version` and number `seq`.
+///
+/// # Errors
+/// `json` is not a JSON object with both, or its `version` is refused by [`native_version`].
+pub fn native_version_in(json: &str) -> Result<String, Error> {
+    let bad = |why: &str| Error::Failed(format!("--version --json: {why}: {}", json.trim()));
+    let value: serde_json::Value =
+        serde_json::from_str(json).map_err(|_| bad("not a JSON object"))?;
+    let version = value
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| bad("no string field \"version\""))?;
+    let seq = value
+        .get("seq")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| bad("no number field \"seq\""))?;
+    native_version(version, seq)
+}
+
+/// The native package version of `binary`, from its `--version --json`
+/// ([`native_version_in`]).
+///
+/// # Errors
+/// The binary does not run or exits with failure, or [`native_version_in`].
+pub fn binary_native_version(binary: &Path) -> Result<String, Error> {
+    let out = pkg_linux::spawn(std::process::Command::new(binary).args(["--version", "--json"]))?;
+    if !out.ok {
+        return Err(Error::Failed(format!(
+            "{} --version --json failed",
+            binary.display()
+        )));
+    }
+    native_version_in(&out.stdout)
+}
+
 /// The `Architecture` a deb for `platform` carries.
 fn architecture(platform: Platform) -> &'static str {
     match platform {

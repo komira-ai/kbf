@@ -75,22 +75,26 @@ const DIGEST_RUNS: [&str; 3] = [
 const CALL_KEYS_REFUSED: [&str; 5] = ["secrets", "strategy", "env", "runs-on", "steps"];
 
 /// The rules of the two jobs in the graph.
-pub const RULES: [Rule; 2] = [
+pub fn rules() -> Vec<Rule> {
+    vec![
+        rule(DIGEST, &["plan", PUBLISH], &[("contents", "read")]),
+        rule(DEPLOY, &["plan", GAMMA, DIGEST], &[("id-token", "write")]),
+    ]
+}
+
+/// One rule: both jobs run under [`DEPLOY_IF`] and in no environment.
+fn rule(job: &str, needs: &[&str], permissions: &[(&str, &str)]) -> Rule {
     Rule {
-        job: DIGEST,
-        needs: &["plan", PUBLISH],
-        permissions: &[("contents", "read")],
-        condition: Some(DEPLOY_IF),
+        job: job.to_owned(),
+        needs: needs.iter().map(|n| (*n).to_owned()).collect(),
+        permissions: permissions
+            .iter()
+            .map(|(s, l)| ((*s).to_owned(), (*l).to_owned()))
+            .collect(),
+        condition: Some(DEPLOY_IF.to_owned()),
         environment: None,
-    },
-    Rule {
-        job: DEPLOY,
-        needs: &["plan", GAMMA, DIGEST],
-        permissions: &[("id-token", "write")],
-        condition: Some(DEPLOY_IF),
-        environment: None,
-    },
-];
+    }
+}
 
 /// Whether `job` calls a reusable workflow (and so has no steps of its own).
 pub fn calls(release: &str, job: &str) -> Result<bool, String> {

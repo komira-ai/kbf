@@ -1,0 +1,32 @@
+Package: buildrules
+Version: 1.2.3
+Architecture: amd64
+Maintainer: buildrules authors <buildrules@users.noreply.github.com>
+Installed-Size: 1
+Section: devel
+Priority: optional
+Homepage: https://buildrules.dev
+Filename: pool/main/b/buildrules/buildrules_1.2.3_amd64.deb
+Size: 1074
+SHA256: efa32c01a876d9b935e098a79ca858753b42cde10e4db19220f15f4d0fa9020e
+Description: hermetic Buck2 rules and toolchains
+ Builds, tests and releases a repository with pinned toolchains.
+ .
+ A static binary: it needs nothing else installed.
+
+Package: buildrules
+Version: 1.2.2
+Architecture: amd64
+Maintainer: buildrules authors <buildrules@users.noreply.github.com>
+Installed-Size: 1
+Section: devel
+Priority: optional
+Homepage: https://buildrules.dev
+Filename: pool/main/b/buildrules/buildrules_1.2.2_amd64.deb
+Size: 1074
+SHA256: 126cd262bdd3f5a79e978effff71f4c05f6aee111a923129cdee350796e44068
+Description: hermetic Buck2 rules and toolchains
+ Builds, tests and releases a repository with pinned toolchains.
+ .
+ A static binary: it needs nothing else installed.
+

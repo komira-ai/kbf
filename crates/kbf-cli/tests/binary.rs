@@ -542,6 +542,46 @@ fn frontend_stays_a_mode_and_handover_is_not_a_command() {
     assert!(!err.contains("handover"), "{err}");
 }
 
+/// `kbf package-hook` is the update hook of the native package, not a mode: a command line the
+/// package manager would never give ends with exit 1 and the contract's last line, a step on a
+/// params file that names a unit and a record directory reaches the hook's own steps (a `verify`
+/// with no update prepared is refused as `not_prepared`, and the record directory is made), and
+/// neither starts a mode or runs systemctl.
+///
+/// Catches: the word falling through to the mode parser (exit 2, no last line), which hostkeeper
+/// reads as a hook that died.
+#[test]
+fn package_hook_answers_with_the_contracts_last_line() {
+    let (code, out, _) = run(&[kbf_cli::PACKAGE_HOOK]);
+    assert_eq!(code, Some(1));
+    let last = out.lines().last().expect("a last line");
+    assert!(last.contains("\"reason\":\"bad_arguments\""), "{out}");
+    assert!(last.starts_with('{') && last.ends_with('}'), "{out}");
+
+    let dir = scratch("package-hook");
+    let state = dir.join("state");
+    let params = dir.join("params.toml");
+    std::fs::write(
+        &params,
+        format!(
+            "unit = \"kbf-storage-and-daemon.service\"\nmode = \"storage-and-daemon\"\n\
+             state_dir = \"{}\"\n\"updater.target_version\" = \"0.1.7\"\n",
+            state.display()
+        ),
+    )
+    .expect("params");
+    let (code, out, _) = run(&[
+        kbf_cli::PACKAGE_HOOK,
+        "verify",
+        "--params",
+        &params.display().to_string(),
+    ]);
+    assert_eq!(code, Some(1));
+    let last = out.lines().last().expect("a last line");
+    assert!(last.contains("\"reason\":\"not_prepared\""), "{out}");
+    assert!(state.is_dir());
+}
+
 /// `kbf update-hook` is the update hook of the kbf service, not a mode: a command line the
 /// updater would never give ends with exit 1 and the contract's last line, and a step on a
 /// record directory that is not there ends the same way and says which. Neither starts a mode

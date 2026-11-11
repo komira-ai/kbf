@@ -18,6 +18,8 @@
 //!   pkg-macos-asset` lists ([`attested_assets::packaged_macos_pkgs`]) are held to the same
 //!   two rules, as `dist/kbf-<commit>-<platform>.deb` and `dist/kbf-installer-<commit>-<platform>.pkg`
 //!   and their `.deb.sigstore.json` (`.pkg.sigstore.json`).
+//!   So is the native `kbf` deb that `cargo xtask pkg-kbf-asset --native` lists
+//!   ([`attested_assets::packaged_native_debs`]), as `dist/kbf-native-<commit>-<platform>.deb`.
 //!   So are the frontend, coordinator and task images that `cargo xtask pkg-image-asset` lists
 //!   ([`attested_assets::packaged_images`]), as `dist/kbf-<service>-image-<commit>-<platform>.oci.tar`
 //!   and its `.oci.tar.sigstore.json`.
@@ -119,6 +121,10 @@ pub fn gaps(artifacts: &str, release: &str, listed: &[&str]) -> Result<Vec<Strin
     let mut packages: Vec<(&str, String, &str)> = Vec::new();
     for platform in attested_assets::packaged_kbf_debs(artifacts)? {
         packages.push(("kbf", platform, "deb"));
+    }
+    // The native deb is held to the same rules, as `dist/kbf-native-<commit>-<platform>.deb`.
+    for platform in attested_assets::packaged_native_debs(artifacts)? {
+        packages.push(("kbf-native", platform, "deb"));
     }
     for platform in attested_assets::packaged_macos_pkgs(artifacts)? {
         packages.push(("kbf-installer", platform, "pkg"));

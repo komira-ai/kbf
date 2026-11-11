@@ -410,11 +410,137 @@ fn pkg_config_takes_the_version_from_the_binary_or_from_the_flag_and_not_both() 
     let neither = run(&[], "neither");
     assert_eq!(neither.status.code(), Some(2), "{}", text(&neither.stderr));
     assert!(
-        text(&neither.stderr).contains("--version or --version-of"),
+        text(&neither.stderr).contains("--version, --version-of or --native-version-of"),
         "{}",
         text(&neither.stderr)
     );
     assert!(!dir.join("neither").exists());
+}
+
+/// Asserts that `pkg-config --no-host-agent` writes a configuration without the host agent's
+/// units, links and account, that it cannot be given with `--host-agent`, and that
+/// `--native-version-of` takes `<major>.<minor>.<seq>` from the binary's `--version --json`, is
+/// refused beside the other version flags, and refuses a binary whose identity has no `seq`.
+#[test]
+fn pkg_config_makes_the_native_package_without_the_host_agent_at_the_native_version() {
+    let dir = scratch("config-native");
+    copy_inputs(&dir);
+    let named = dir.join("named");
+    std::fs::create_dir(&named).expect("dir");
+    let kbf = named.join("kbf");
+    std::fs::hard_link(env!("CARGO_BIN_EXE_xtask-fake"), &kbf).expect("link the fake");
+    std::fs::write(named.join("kbf.stamp"), "0123456789ab").expect("stamp");
+    std::fs::write(
+        named.join("kbf.json"),
+        "{\"version\":\"0.1.0\",\"commit\":\"0123456789ab\",\"seq\":7472,\"profile\":\"release\"}\n",
+    )
+    .expect("json");
+    let base = config_args(&dir, &dir.join("agent"));
+    let at = base.iter().position(|a| a == "--host-agent").expect("flag");
+    let run = |extra: &[&str], out: &str| {
+        let mut args: Vec<String> = base
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != at && *i != at + 1)
+            .map(|(_, a)| a.clone())
+            .collect();
+        let o = args.iter().position(|a| a == "--out").expect("--out");
+        args[o + 1] = s(&dir.join(out)).to_owned();
+        args.extend(extra.iter().map(|a| (*a).to_owned()));
+        xtask_with(&args)
+    };
+    let ok = run(
+        &["--no-host-agent", "--native-version-of", s(&kbf)],
+        "native",
+    );
+    assert_eq!(ok.status.code(), Some(0), "{}", text(&ok.stderr));
+    let yaml = std::fs::read_to_string(dir.join("native/nfpm.yaml")).expect("yaml");
+    assert!(yaml.contains("version: \"0.1.7472\""), "{yaml}");
+    assert!(!yaml.contains("kbf-host-local"), "{yaml}");
+    assert!(!yaml.contains("kbf-updater"), "{yaml}");
+    assert!(!yaml.contains("wants"), "{yaml}");
+    assert!(yaml.contains("kbf-storage-and-daemon.service"), "{yaml}");
+    let both = run(
+        &[
+            "--no-host-agent",
+            "--host-agent",
+            s(&dir.join("host-agent")),
+        ],
+        "both-agent",
+    );
+    assert_eq!(both.status.code(), Some(2), "{}", text(&both.stderr));
+    let neither = run(&["--version", "1.0.0"], "neither-agent");
+    assert_eq!(neither.status.code(), Some(2), "{}", text(&neither.stderr));
+    for other in [["--version", "1.0.0"], ["--version-of", s(&kbf)]] {
+        let o = run(
+            &[
+                "--no-host-agent",
+                "--native-version-of",
+                s(&kbf),
+                other[0],
+                other[1],
+            ],
+            "two-versions",
+        );
+        assert_eq!(o.status.code(), Some(2), "{}", text(&o.stderr));
+    }
+    assert!(!dir.join("two-versions").exists());
+    // The stub prints no JSON identity: no source of a version.
+    let stub = run(
+        &[
+            "--no-host-agent",
+            "--native-version-of",
+            s(&dir.join("kbf")),
+        ],
+        "stub-native",
+    );
+    assert_eq!(stub.status.code(), Some(1), "{}", text(&stub.stderr));
+    assert!(
+        text(&stub.stderr).contains("--version --json: not a JSON object"),
+        "{}",
+        text(&stub.stderr)
+    );
+    assert!(!dir.join("stub-native").exists());
+    std::fs::write(named.join("kbf.json"), "{\"version\":\"0.1.0\"}\n").expect("json");
+    let noseq = run(
+        &["--no-host-agent", "--native-version-of", s(&kbf)],
+        "no-seq",
+    );
+    assert_eq!(noseq.status.code(), Some(1), "{}", text(&noseq.stderr));
+    assert!(
+        text(&noseq.stderr).contains("no number field"),
+        "{}",
+        text(&noseq.stderr)
+    );
+}
+
+/// Asserts that `pkg-kbf-asset --native-version-of` without `--native` is a usage error that names
+/// the missing flag, so a native version is never checked against the other asset's deb.
+#[test]
+fn pkg_kbf_asset_takes_a_native_version_only_with_native() {
+    let dir = scratch("asset-native-flags");
+    let out = xtask(&[
+        "pkg-kbf-asset",
+        "--package",
+        s(&dir),
+        "--platform",
+        "linux-x86_64",
+        "--commit",
+        "0123456789abcdef0123456789abcdef01234567",
+        "--kbf-tarball",
+        s(&dir.join("t.tar.gz")),
+        "--expect-ref",
+        "refs/heads/main",
+        "--native-version-of",
+        s(&dir.join("kbf")),
+        "--verify-only",
+    ]);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("--native"),
+        "{}",
+        text(&out.stderr)
+    );
 }
 
 #[test]

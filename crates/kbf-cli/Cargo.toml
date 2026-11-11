@@ -69,6 +69,9 @@ kbf-setup.workspace = true
 # `kbf update-hook <step>` (src/lib.rs): the hook the generic updater runs for the kbf service,
 # today's update of a host split at the five steps of the hook contract.
 kbf-updater.workspace = true
+# `kbf package-hook <step>` (src/lib.rs): the update hook of the native kbf package, which the
+# host's package manager runs around an update of the `kbf` deb.
+kbf-package-hook.workspace = true
 # The identity `kbf --version --json` prints (src/version.rs), and the bodies of
 # `kbf cluster` (src/cluster.rs).
 serde_json.workspace = true

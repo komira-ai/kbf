@@ -44,9 +44,13 @@ fn packaged_kbf(line: &str) -> Option<&str> {
     flag(&words, "--binary").filter(|b| base(b) == "kbf")
 }
 
-/// The `--kbf` of a line that writes the package configuration.
+/// The `--kbf` of a line that writes the `kbf` deb's package configuration (not the native
+/// package's, `--no-host-agent`, which [`native_build`] holds to its own rules).
 fn configured_kbf(line: &str) -> Option<&str> {
     let words = args(line, "cargo xtask pkg-config ")?;
+    if words.contains(&"--no-host-agent") {
+        return None;
+    }
     flag(&words, "--kbf")
 }
 
@@ -69,17 +73,173 @@ pub fn rules(workflow: &str, out: &mut Vec<String>) -> Result<(), String> {
             ));
         }
     }
+    let native = attested_assets::packaged_native_debs(workflow)?;
+    for platform in PACKAGES {
+        let n = native.iter().filter(|p| *p == platform).count();
+        if n != 1 {
+            out.push(format!(
+                "the native kbf package for {platform} is made an asset by {n} `cargo xtask pkg-kbf-asset --native` lines, not exactly one"
+            ));
+        }
+    }
+    for platform in &native {
+        if !PACKAGES.contains(&platform.as_str()) {
+            out.push(format!(
+                "`cargo xtask pkg-kbf-asset --native --platform {platform}` makes a package that is not in `PACKAGES`: add it there and to docs/artifacts.md"
+            ));
+        }
+    }
     for platform in PACKAGES {
         build_job(workflow, platform, out)?;
+        native_build(workflow, platform, out)?;
     }
-    verify_job(workflow, out)
+    for line in workflow.lines().map(str::trim) {
+        if line.starts_with("run: rm -rf ") && line != CLEANUP {
+            out.push(format!(
+                "the cleanup step is `{line}`, not `{CLEANUP}`: the native package is built under target/pkg/native, which that removal already covers"
+            ));
+        }
+    }
+    verify_job(workflow, out)?;
+    native_verify(workflow, out)
+}
+
+/// The only recursive removal of the workflow's build directories.
+const CLEANUP: &str = "run: rm -rf target/pkg target/pkg-trust";
+
+/// Where `pkg-config --no-host-agent` writes the native package's configuration, and `pkg-build`
+/// its packages.
+const NATIVE_CONFIG: &str = "target/pkg/native/nfpm.yaml";
+const NATIVE_BUILT: &str = "target/pkg/native/out";
+
+/// What is wrong with how the job `platform` makes the native deb an asset: the configuration
+/// written without the host agent from the job's `kbf` and at the version that `kbf` names
+/// (`--native-version-of`), then built, then made an asset (`pkg-kbf-asset --native`) for this
+/// job's commit, platform and kbf tarball, each in a step that cannot be skipped.
+fn native_build(workflow: &str, platform: &str, out: &mut Vec<String>) -> Result<(), String> {
+    let steps = workflows::job_steps(workflow, platform)?;
+    let asset = first(&steps, 0, |l| {
+        args(l, VERB).is_some_and(|a| !a.contains(&"--verify-only") && a.contains(&"--native"))
+    });
+    let Some((asset_at, asset_step)) = asset else {
+        return Ok(());
+    };
+    let words = lines(asset_step)
+        .find_map(|l| args(l, VERB))
+        .unwrap_or_default();
+    let who = format!("the native kbf package of `{platform}`");
+    if asset_step.conditional {
+        out.push(format!(
+            "{who} is made an asset under `if:` or `continue-on-error:`"
+        ));
+    }
+    let tarball = format!("dist/kbf-$GITHUB_SHA-{platform}.tar.gz");
+    for (name, want) in [
+        ("--commit", "$GITHUB_SHA"),
+        ("--platform", platform),
+        ("--kbf-tarball", tarball.as_str()),
+        ("--package", NATIVE_BUILT),
+        ("--expect-ref", "$PKG_SOURCE_REF"),
+        ("--out", "dist"),
+    ] {
+        if flag(&words, name) != Some(want) {
+            out.push(format!(
+                "`cargo xtask pkg-kbf-asset --native` in `{platform}` has {name} {:?}, not `{want}`",
+                flag(&words, name).unwrap_or("(none)")
+            ));
+        }
+    }
+    if flag(&words, "--gh").is_none() {
+        out.push(format!(
+            "`cargo xtask pkg-kbf-asset --native` in `{platform}` is not given the pinned gh (`--gh`) to compare the package's with"
+        ));
+    }
+    // The kbf whose native version the deb must carry is the one the job packages.
+    let shipped = first(&steps, 0, |l| packaged_kbf(l).is_some())
+        .and_then(|(_, s)| lines(s).find_map(packaged_kbf));
+    if flag(&words, "--native-version-of") != shipped {
+        out.push(format!(
+            "`cargo xtask pkg-kbf-asset --native` in `{platform}` has --native-version-of {:?}, not {shipped:?}, the kbf it packages",
+            flag(&words, "--native-version-of")
+        ));
+    }
+    let before =
+        |found: Option<(usize, &workflows::Step)>, what: &str, out: &mut Vec<String>| match found {
+            Some((at, step)) if at < asset_at && !step.conditional => {}
+            Some((at, _)) if at < asset_at => out.push(format!(
+                "{who}: {what} is under `if:` or `continue-on-error:`"
+            )),
+            _ => out.push(format!(
+                "{who} is made an asset without {what} in a step before"
+            )),
+        };
+    let configured = first(&steps, 0, |l| {
+        args(l, "cargo xtask pkg-config ").is_some_and(|a| {
+            flag(&a, "--out") == Some("target/pkg/native")
+                && a.contains(&"--no-host-agent")
+                && !a.contains(&"--host-agent")
+                && flag(&a, "--native-version-of") == shipped
+                && flag(&a, "--kbf") == shipped
+                && flag(&a, "--platform") == Some(platform)
+        })
+    });
+    before(
+        configured,
+        "`cargo xtask pkg-config --no-host-agent --native-version-of` of the job's kbf into `target/pkg/native`",
+        out,
+    );
+    let built = first(&steps, 0, |l| {
+        args(l, "cargo xtask pkg-build ").is_some_and(|a| {
+            flag(&a, "--config") == Some(NATIVE_CONFIG) && flag(&a, "--out") == Some(NATIVE_BUILT)
+        })
+    });
+    before(
+        built,
+        "`cargo xtask pkg-build` of the native configuration",
+        out,
+    );
+    Ok(())
+}
+
+/// What is wrong with the verify job's check of each signed native deb: it runs
+/// `pkg-kbf-asset --verify-only --native` on `dist/kbf-native-$GITHUB_SHA-<platform>.deb` with the
+/// platform's tarball, the commit and `--expect-ref "$GITHUB_REF"`, in an unconditional step after
+/// the attestation check.
+fn native_verify(workflow: &str, out: &mut Vec<String>) -> Result<(), String> {
+    let verify = workflows::job_steps(workflow, "verify-linux")?;
+    let verified_at = first(&verify, 0, |l| {
+        args(l, "cargo xtask verify-assets attestations ").is_some()
+    })
+    .map_or(usize::MAX, |(at, _)| at);
+    for platform in PACKAGES {
+        let deb = format!("dist/kbf-native-$GITHUB_SHA-{platform}.deb");
+        let tarball = format!("dist/kbf-$GITHUB_SHA-{platform}.tar.gz");
+        let found = first(&verify, 0, |l| {
+            args(l, VERB).is_some_and(|a| {
+                a.contains(&"--verify-only")
+                    && a.contains(&"--native")
+                    && flag(&a, "--package") == Some(deb.as_str())
+                    && flag(&a, "--kbf-tarball") == Some(tarball.as_str())
+                    && flag(&a, "--platform") == Some(platform)
+                    && flag(&a, "--commit") == Some("$GITHUB_SHA")
+                    && flag(&a, "--expect-ref") == Some("$GITHUB_REF")
+            })
+        });
+        let checked = found.is_some_and(|(at, step)| at > verified_at && !step.conditional);
+        if !checked {
+            out.push(format!(
+                "`verify-linux` does not run `cargo xtask pkg-kbf-asset --verify-only --native` on `{deb}` (with `--expect-ref \"$GITHUB_REF\"`) in an unconditional step after the attestation check, so the native kbf package that was signed is not the one checked"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// What is wrong with the job `platform`'s steps around the line that makes the deb an asset.
 fn build_job(workflow: &str, platform: &str, out: &mut Vec<String>) -> Result<(), String> {
     let steps = workflows::job_steps(workflow, platform)?;
     let asset = first(&steps, 0, |l| {
-        args(l, VERB).is_some_and(|a| !a.contains(&"--verify-only"))
+        args(l, VERB).is_some_and(|a| !a.contains(&"--verify-only") && !a.contains(&"--native"))
     });
     let Some((asset_at, asset_step)) = asset else {
         return Ok(());

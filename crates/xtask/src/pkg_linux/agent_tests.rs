@@ -101,9 +101,35 @@ fn the_plan_refuses_a_host_agent_directory_that_lacks_a_file() {
     let t = Tree::new("refuse-agent-absent");
     let absent = t.dir.join("absent-host-agent");
     let mut inputs = t.inputs();
-    inputs.host_agent = &absent;
+    inputs.host_agent = Some(&absent);
     assert_eq!(
         refused(kbf_plan(&inputs)),
         format!("{} cannot be read as a directory", absent.display())
     );
+}
+
+/// Asserts that a plan without the host agent (the native package) holds exactly the files of the
+/// plan with it, less the agent's two units, their two links and the agent's account file, and
+/// nothing is the deb's alone.
+#[test]
+fn the_plan_without_the_host_agent_lacks_its_units_links_and_account() {
+    let t = Tree::new("no-agent");
+    let with = kbf_plan(&t.inputs()).expect("plan");
+    let mut inputs = t.inputs();
+    inputs.host_agent = None;
+    let without = kbf_plan(&inputs).expect("plan");
+    let agent: Vec<String> = AGENT_UNITS
+        .iter()
+        .flat_map(|u| [format!("{UNIT_DIR}/{u}"), format!("{WANTS_DIR}/{u}")])
+        .chain([AGENT_SYSUSERS_PATH.to_owned()])
+        .collect();
+    let expected: Vec<&str> = with
+        .iter()
+        .map(|e| e.dst.as_str())
+        .filter(|d| !agent.iter().any(|a| a == d))
+        .collect();
+    let got: Vec<&str> = without.iter().map(|e| e.dst.as_str()).collect();
+    assert_eq!(got, expected);
+    assert_eq!(with.len() - without.len(), 5);
+    assert!(without.iter().all(|e| !e.deb_only));
 }

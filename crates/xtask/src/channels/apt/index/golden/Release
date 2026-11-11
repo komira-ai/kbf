@@ -1,0 +1,14 @@
+Origin: buildrules
+Label: buildrules
+Suite: stable
+Codename: stable
+Date: Mon, 21 Sep 2026 14:13:20 UTC
+Architectures: amd64 arm64
+Components: main
+Description: buildrules packages
+Acquire-By-Hash: yes
+SHA256:
+ 1894a4aa1c831a170dde4c96451d180cbe18fd9c7ebca76e1b545ab820534e4c 1044 main/binary-amd64/Packages
+ 9481762d5e6f1d8ad61ab8c9ba17c2bc67612660aed53bd77dbda89e7890aa9f 423 main/binary-amd64/Packages.gz
+ 065f6f0cd473c940fb5f21eb4e90ac8dcf08b43501652e0be9c194e3ae69fbc8 522 main/binary-arm64/Packages
+ 26700cd37ff093dee473d566440327d6d976887c6fce74066371524596ae6ebd 357 main/binary-arm64/Packages.gz
