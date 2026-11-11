@@ -341,7 +341,7 @@ With `--tree`, `kbf-task`:
 3. runs the Command in the sandbox of 4.4, under the action's timeout;
 4. collects the outputs from `/work` and hands them to the node's tierstore (5.2), and records `"from": "tree"` in the manifest's
    advisory `inputs` statistics (`kbf-task-pack` `InputStats`; the reader that knows `from` ships one release before the
-   writer, because `InputStats` refuses an unknown member, D13).
+   writer, because `InputStats` refused an unknown member before item 8, D13).
 
 ### 4.4 The Command's sandbox
 

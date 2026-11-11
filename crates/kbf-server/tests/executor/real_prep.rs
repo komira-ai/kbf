@@ -432,6 +432,7 @@ async fn an_action_runs_and_ingests_over_the_real_run_preparation() {
         packs: 1,
         large: vec![],
         inputs: None,
+        objects: None,
     };
     let pack = write_pack(&manifest, &[]).expect("a pack");
     world

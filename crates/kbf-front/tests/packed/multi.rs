@@ -312,6 +312,7 @@ impl Multi {
                 .map(|&(slot, digest)| LargeEntry { slot, digest })
                 .collect(),
             inputs: None,
+            objects: None,
         }
     }
 

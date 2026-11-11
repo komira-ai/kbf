@@ -21,7 +21,10 @@
 //! ```
 //!
 //! with every field required except `stdout` and `stderr`, which are left out when the stream
-//! is empty. An unknown field, a duplicate key and uppercase hex are refused.
+//! is empty. A duplicate key and uppercase hex are refused. A member the reader does not know,
+//! at the top level or inside any object of the manifest, is skipped, so a manifest a later
+//! release writes with a new optional member reads here as it would without it; the writer
+//! never writes one, and reading a manifest and writing it again drops it.
 //!
 //! Version 2 is for a run that wrote several packs or large objects (a blob over
 //! [`MAX_RECORD_BYTES`] is a raw object of its own). It adds two required fields after `usage`,
@@ -31,11 +34,11 @@
 //!  ,"packs":2,"large":[{"slot":0,"digest":"<hex>/<size>"}]
 //! ```
 //!
-//! and may add an advisory `"inputs":{..}` ([`InputStats`]) after them, which only version 2
-//! may carry: a manifest with `inputs` is written as version 2, since a version 1 reader
-//! refuses a field it does not know. Version 2 is required exactly when `packs` is above 1, `large`
-//! is not empty or `inputs` is present: a body of either version that disagrees is refused, so a
-//! manifest has one spelling.
+//! and may add an advisory `"inputs":{..}` ([`InputStats`]) after them, which version 1 may not
+//! carry: a manifest with `inputs` is written as version 2, since a version 1 reader of the
+//! releases before this one refuses a field it does not know. Version 2 is required exactly when
+//! `packs` is above 1, `large` is not empty or `inputs` is present: a body of either version that
+//! disagrees is refused, so a manifest has one spelling.
 //!
 //! `packs` is how many of packs `0..` were written (1 to [`MAX_PACKS`]); `large` names the
 //! large objects by slot (unique, below [`MAX_LARGE`]), each of a size above
@@ -43,14 +46,34 @@
 //! names is in exactly one place, a pack record or one large object; which pack holds it is for
 //! ingest to check. A manifest of one pack and no large object is written as version 1, so the
 //! bytes of a small run do not change.
+//!
+//! Version 3 is for a run that wrote no pack: the task stored each blob as an object of its
+//! own, under its digest, and the manifest is an object of its own too. It has the fields of
+//! version 1, no `packs` and no `large`, a required list of those objects after `usage`, and
+//! may carry `inputs` after it:
+//!
+//! ```json
+//!  ,"objects":["<hex>/<size>"],"inputs":{..}
+//! ```
+//!
+//! Each object is listed once and none is the empty blob (implicit in every store); every digest
+//! an output names (except the empty one) is listed; an object no output names is allowed (the
+//! blobs inside an output directory's `Tree`). There is no size cap on an object. A version 3
+//! manifest is read by [`TaskManifest::parse_objects`] and written by
+//! [`TaskManifest::objects_json`] only: the pack forms refuse it ([`ManifestError::ByDigest`]),
+//! so no consumer of packs takes it for one, and [`TaskManifest::parse_objects`] refuses the
+//! versions of packs ([`ManifestError::NotByDigest`]).
 
 use std::collections::BTreeSet;
+
+mod wire;
 
 use kbf_types::{Digest, DigestFunction, ParseDigestError};
 use serde::{Deserialize, Serialize};
 
 use crate::task_key::{MAX_LARGE, MAX_PACKS, TaskKeyError, check_build};
 use crate::task_pack::MAX_RECORD_BYTES;
+use wire::Wire;
 
 /// The first manifest version: one pack, no large object. Written whenever the manifest names
 /// nothing more.
@@ -58,6 +81,10 @@ pub const MANIFEST_VERSION: u32 = 1;
 
 /// The second manifest version: adds `packs` and `large`.
 pub const MANIFEST_VERSION_2: u32 = 2;
+
+/// The third manifest version: no pack; every blob the run stored is an object under its
+/// digest, listed in `objects`.
+pub const MANIFEST_VERSION_3: u32 = 3;
 
 /// The largest manifest record: a larger one is refused before it is read.
 pub const MAX_MANIFEST_BYTES: u64 = 4 << 20;
@@ -106,19 +133,57 @@ pub enum ManifestError {
         /// The length given.
         len: u64,
     },
-    /// The bytes are not the wire form: not JSON, a field of the wrong type, an unknown
-    /// field, a duplicate key or a missing field.
+    /// The bytes are not the wire form: not JSON, a field of the wrong type, a duplicate key or
+    /// a missing field. (A member the reader does not know is skipped, not refused.) Also a
+    /// manifest that cannot be written: one whose `inputs.from` is [`InputsFrom::Unknown`].
     #[error("the manifest is not valid: {0}")]
     Json(#[from] serde_json::Error),
-    /// The version is neither [`MANIFEST_VERSION`] nor [`MANIFEST_VERSION_2`].
-    #[error("manifest version {0}, this build reads {MANIFEST_VERSION} and {MANIFEST_VERSION_2}")]
+    /// The version is not [`MANIFEST_VERSION`], [`MANIFEST_VERSION_2`] or [`MANIFEST_VERSION_3`].
+    #[error(
+        "manifest version {0}, this build reads {MANIFEST_VERSION}, {MANIFEST_VERSION_2} and {MANIFEST_VERSION_3}"
+    )]
     Version(u32),
-    /// A version 1 manifest holds a field only version 2 has.
-    #[error("manifest version {MANIFEST_VERSION} has no field {0:?}")]
-    UnexpectedField(&'static str),
-    /// A version 2 manifest lacks a field it requires.
-    #[error("manifest version {MANIFEST_VERSION_2} requires the field {0:?}")]
-    MissingField(&'static str),
+    /// A manifest holds a field another version has and its version has not: `packs`, `large`
+    /// or `inputs` in version 1, `objects` in versions 1 and 2, `packs` or `large` in version 3.
+    #[error("manifest version {version} has no field {field:?}")]
+    UnexpectedField {
+        /// The manifest's version.
+        version: u32,
+        /// The field.
+        field: &'static str,
+    },
+    /// A manifest lacks a field its version requires: `packs` or `large` in version 2,
+    /// `objects` in version 3.
+    #[error("manifest version {version} requires the field {field:?}")]
+    MissingField {
+        /// The manifest's version.
+        version: u32,
+        /// The field.
+        field: &'static str,
+    },
+    /// A version 3 manifest given to a reader or writer of packs, or a manifest with `objects`
+    /// whose `packs` is not 0 or whose `large` is not empty: a run of objects has no pack.
+    #[error("a manifest of objects by digest (version {MANIFEST_VERSION_3}) has no pack")]
+    ByDigest,
+    /// A manifest of packs (the version given) given to [`TaskManifest::parse_objects`] or
+    /// [`TaskManifest::objects_json`].
+    #[error("manifest version {0} names packs; this reader takes version {MANIFEST_VERSION_3}")]
+    NotByDigest(u32),
+    /// A version 3 manifest lists the empty blob as an object: it is implicit in every store and
+    /// never stored.
+    #[error("objects[{0}] is the empty blob, which is never stored")]
+    EmptyObject(usize),
+    /// A version 3 manifest lists one object twice.
+    #[error("the object {0} is listed twice")]
+    DuplicateObject(Digest),
+    /// An output of a version 3 manifest names a digest its `objects` does not list.
+    #[error("{field} names {digest}, which objects does not list")]
+    ObjectMissing {
+        /// The output's field, with the position of a list entry.
+        field: String,
+        /// The digest given.
+        digest: Digest,
+    },
     /// A version 2 body that has one pack, no large object and no `inputs`: that manifest is
     /// spelled as version 1.
     #[error(
@@ -268,7 +333,7 @@ impl LargeEntry {
 
 /// Where the bytes of a task's inputs came from.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
+#[serde(default)]
 pub struct SourceBytes {
     /// From the read listener, one blob per request.
     pub listener_get: u64,
@@ -280,13 +345,29 @@ pub struct SourceBytes {
     pub tierstore_direct: u64,
 }
 
-/// What a task measured while fetching its inputs. A field the writer leaves out is 0.
+/// How a task's input root reached it: `"from"` in `inputs`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputsFrom {
+    /// The task fetched the inputs into its scratch directory (today's job).
+    Fetch,
+    /// The inputs were the job's layered root of tierstore trees (a tree job).
+    Tree,
+    /// A value a later release writes and this one does not know. Read so the manifest is not
+    /// refused for it, and so a consumer can count it; never written (writing it is
+    /// [`ManifestError::Json`]).
+    #[serde(other, skip_serializing)]
+    Unknown,
+}
+
+/// What a task measured while fetching its inputs. A number the writer leaves out is 0, and a
+/// member the reader does not know is skipped.
 ///
 /// ADVISORY, NEVER TRUSTED: the task writes it and ingest only carries it into metrics. It
 /// decides nothing: not what is stored, not the action result, not whether the run is accepted
 /// (beyond each number fitting an `i64`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
+#[serde(default)]
 pub struct InputStats {
     /// Blobs fetched.
     pub blobs: u64,
@@ -316,6 +397,10 @@ pub struct InputStats {
     pub request_p99_ms: u64,
     /// Bytes by where they came from.
     pub bytes_by_source: SourceBytes,
+    /// How the input root reached the task, if it says: left out by the writers before tree
+    /// jobs, and written only when set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from: Option<InputsFrom>,
 }
 
 impl InputStats {
@@ -397,11 +482,15 @@ pub struct TaskManifest {
     /// Resource use.
     pub usage: Usage,
     /// How many of packs `0..` were written: 1 to [`MAX_PACKS`]. Pack 0 holds the manifest.
+    /// 0 for a manifest of objects (version 3), which wrote no pack.
     pub packs: u8,
-    /// The large objects, by slot. Empty for a version 1 manifest.
+    /// The large objects, by slot. Empty for versions 1 and 3.
     pub large: Vec<LargeEntry>,
     /// What the task measured fetching its inputs, if it says. Advisory: see [`InputStats`].
     pub inputs: Option<InputStats>,
+    /// The objects the run stored, each under its digest, for a run that wrote no pack (version
+    /// 3); `None` for a manifest of packs (versions 1 and 2).
+    pub objects: Option<Vec<Digest>>,
 }
 
 impl TaskManifest {
@@ -422,37 +511,63 @@ impl TaskManifest {
     /// bytes. A `large_max` of 0 accepts none, as [`TaskManifest::parse`] does.
     ///
     /// # Errors
-    /// Those of [`TaskManifest::parse`], and [`ManifestError::UnexpectedField`] or
-    /// [`ManifestError::MissingField`] for the fields of the version.
+    /// Those of [`TaskManifest::parse`], [`ManifestError::UnexpectedField`] or
+    /// [`ManifestError::MissingField`] for the fields of the version, and
+    /// [`ManifestError::ByDigest`] for a valid version 3 manifest, which names no pack.
     pub fn parse_with(bytes: &[u8], large_max: u64) -> Result<Self, ManifestError> {
+        let manifest = Self::read(bytes, large_max)?;
+        if manifest.objects.is_some() {
+            return Err(ManifestError::ByDigest);
+        }
+        Ok(manifest)
+    }
+
+    /// Reads the manifest `bytes` of a run that wrote no pack: version 3 only.
+    ///
+    /// # Errors
+    /// Those of [`TaskManifest::parse_with`] but [`ManifestError::ByDigest`], the refusals of
+    /// [`TaskManifest::validate_objects`], and [`ManifestError::NotByDigest`] for a valid
+    /// manifest of packs.
+    pub fn parse_objects(bytes: &[u8]) -> Result<Self, ManifestError> {
+        let manifest = Self::read(bytes, 0)?;
+        if manifest.objects.is_none() {
+            return Err(ManifestError::NotByDigest(manifest.version()));
+        }
+        Ok(manifest)
+    }
+
+    /// Reads a manifest of any version this build knows and checks it by the rules of its
+    /// version.
+    fn read(bytes: &[u8], large_max: u64) -> Result<Self, ManifestError> {
         check_len(bytes.len() as u64)?;
         let wire: Wire = serde_json::from_slice(bytes)?;
-        let wire_version = wire.version;
-        match wire.version {
-            MANIFEST_VERSION => {
-                if wire.packs.is_some() {
-                    return Err(ManifestError::UnexpectedField("packs"));
-                }
-                if wire.large.is_some() {
-                    return Err(ManifestError::UnexpectedField("large"));
-                }
-                if wire.inputs.is_some() {
-                    return Err(ManifestError::UnexpectedField("inputs"));
-                }
-            }
-            MANIFEST_VERSION_2 => {
-                if wire.packs.is_none() {
-                    return Err(ManifestError::MissingField("packs"));
-                }
-                if wire.large.is_none() {
-                    return Err(ManifestError::MissingField("large"));
-                }
-            }
+        let version = wire.version;
+        // The fields that are not in every version: which this version may carry, and which it
+        // must.
+        let (allowed, required): (&[&str], &[&str]) = match version {
+            MANIFEST_VERSION => (&[], &[]),
+            MANIFEST_VERSION_2 => (&["packs", "large", "inputs"], &["packs", "large"]),
+            MANIFEST_VERSION_3 => (&["objects", "inputs"], &["objects"]),
             other => return Err(ManifestError::Version(other)),
+        };
+        for (field, present) in [
+            ("packs", wire.packs.is_some()),
+            ("large", wire.large.is_some()),
+            ("inputs", wire.inputs.is_some()),
+            ("objects", wire.objects.is_some()),
+        ] {
+            if present && !allowed.contains(&field) {
+                return Err(ManifestError::UnexpectedField { version, field });
+            }
+            if !present && required.contains(&field) {
+                return Err(ManifestError::MissingField { version, field });
+            }
         }
         let manifest = wire.into_manifest()?;
-        manifest.validate_with(large_max)?;
-        if wire_version == MANIFEST_VERSION_2 && manifest.version() == MANIFEST_VERSION {
+        manifest.validate_any(large_max)?;
+        // A version 1 or 3 body is always its own version; a version 2 body may need nothing
+        // of version 2.
+        if manifest.version() != version {
             return Err(ManifestError::NotV2);
         }
         Ok(manifest)
@@ -475,6 +590,21 @@ impl TaskManifest {
     /// Those of [`TaskManifest::to_json`], checked against `large_max`.
     pub fn to_json_with(&self, large_max: u64) -> Result<Vec<u8>, ManifestError> {
         self.validate_with(large_max)?;
+        self.write()
+    }
+
+    /// The canonical JSON of a manifest of objects (version 3), as [`TaskManifest::to_json`]
+    /// writes one of packs.
+    ///
+    /// # Errors
+    /// The refusals of [`TaskManifest::validate_objects`], and [`ManifestError::TooLarge`] when
+    /// the JSON would pass [`MAX_MANIFEST_BYTES`].
+    pub fn objects_json(&self) -> Result<Vec<u8>, ManifestError> {
+        self.validate_objects()?;
+        self.write()
+    }
+
+    fn write(&self) -> Result<Vec<u8>, ManifestError> {
         let json = serde_json::to_vec(&Wire::from_manifest(self))?;
         check_len(json.len() as u64)?;
         Ok(json)
@@ -506,11 +636,35 @@ impl TaskManifest {
     /// bytes, and also: `packs` is 1 to [`MAX_PACKS`]; large slots are below [`MAX_LARGE`] and
     /// unique; large digests are unique; each large size is over [`MAX_RECORD_BYTES`] and at most
     /// `large_max`; each large digest is named by an output. Which pack holds each other digest
-    /// is not checked here.
+    /// is not checked here. A manifest of objects is refused: it has no pack.
     ///
     /// # Errors
-    /// The first rule that fails, the large rules after those of [`TaskManifest::validate`].
+    /// [`ManifestError::ByDigest`] when `objects` is set; then the first rule that fails, the
+    /// large rules after those of [`TaskManifest::validate`].
     pub fn validate_with(&self, large_max: u64) -> Result<(), ManifestError> {
+        if self.objects.is_some() {
+            return Err(ManifestError::ByDigest);
+        }
+        self.validate_any(large_max)
+    }
+
+    /// The rules of a manifest of objects (version 3): those of [`TaskManifest::validate`] for
+    /// the fields of version 1 and `inputs`, and also: `packs` is 0 and `large` is empty; no
+    /// object is the empty blob or listed twice; every digest an output names but the empty one
+    /// is an object.
+    ///
+    /// # Errors
+    /// [`ManifestError::NotByDigest`] when `objects` is `None`; then the first rule that fails,
+    /// the rules of the objects last.
+    pub fn validate_objects(&self) -> Result<(), ManifestError> {
+        if self.objects.is_none() {
+            return Err(ManifestError::NotByDigest(self.version()));
+        }
+        self.validate_any(0)
+    }
+
+    /// The rules of the manifest's own version.
+    fn validate_any(&self, large_max: u64) -> Result<(), ManifestError> {
         check_build(&self.lease)?;
         check_digest("action", &self.action)?;
         for (field, stream) in [("stdout", &self.stdout), ("stderr", &self.stderr)] {
@@ -551,7 +705,42 @@ impl TaskManifest {
                 return Err(ManifestError::Advisory { field, value });
             }
         }
-        self.check_packs_and_large(large_max)
+        match &self.objects {
+            None => self.check_packs_and_large(large_max),
+            Some(objects) => self.check_objects(objects),
+        }
+    }
+
+    fn check_objects(&self, objects: &[Digest]) -> Result<(), ManifestError> {
+        if self.packs != 0 || !self.large.is_empty() {
+            return Err(ManifestError::ByDigest);
+        }
+        let mut listed = BTreeSet::new();
+        for (i, object) in objects.iter().enumerate() {
+            check_digest(&format!("objects[{i}]"), object)?;
+            if object.size_bytes == 0 {
+                return Err(ManifestError::EmptyObject(i));
+            }
+            if !listed.insert(*object) {
+                return Err(ManifestError::DuplicateObject(*object));
+            }
+        }
+        let files = self.output_files.iter().enumerate();
+        let trees = self.output_directories.iter().enumerate();
+        let named = [
+            ("stdout".to_owned(), self.stdout),
+            ("stderr".to_owned(), self.stderr),
+        ]
+        .into_iter()
+        .chain(files.map(|(i, f)| (format!("output_files[{i}].digest"), Some(f.digest))))
+        .chain(trees.map(|(i, d)| (format!("output_directories[{i}].tree"), Some(d.tree))));
+        for (field, digest) in named {
+            let Some(digest) = digest else { continue };
+            if digest.size_bytes != 0 && !listed.contains(&digest) {
+                return Err(ManifestError::ObjectMissing { field, digest });
+            }
+        }
+        Ok(())
     }
 
     fn check_packs_and_large(&self, large_max: u64) -> Result<(), ManifestError> {
@@ -589,7 +778,9 @@ impl TaskManifest {
     /// The manifest version this manifest is written as.
     #[must_use]
     pub fn version(&self) -> u32 {
-        if self.packs == 1 && self.large.is_empty() && self.inputs.is_none() {
+        if self.objects.is_some() {
+            MANIFEST_VERSION_3
+        } else if self.packs == 1 && self.large.is_empty() && self.inputs.is_none() {
             MANIFEST_VERSION
         } else {
             MANIFEST_VERSION_2
@@ -657,195 +848,4 @@ fn check_path(seen: &mut BTreeSet<String>, path: &str) -> Result<(), ManifestErr
         return Err(ManifestError::DuplicatePath(path.to_owned()));
     }
     Ok(())
-}
-
-fn digest_of(field: String, text: &str) -> Result<Digest, ManifestError> {
-    Digest::parse(DigestFunction::Sha256, text)
-        .map_err(|source| ManifestError::Digest { field, source })
-}
-
-// The wire form. Private: the typed manifest above is the API, so a caller cannot build a
-// manifest the reader would disagree with about spelling.
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Wire {
-    version: u32,
-    lease: String,
-    action: String,
-    exit_code: i32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    stdout: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    stderr: Option<String>,
-    output_files: Vec<WireFile>,
-    output_directories: Vec<WireDirectory>,
-    output_symlinks: Vec<WireSymlink>,
-    timing: WireTiming,
-    usage: WireUsage,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    packs: Option<u8>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    large: Option<Vec<WireLarge>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    inputs: Option<InputStats>,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WireLarge {
-    slot: u8,
-    digest: String,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WireFile {
-    path: String,
-    digest: String,
-    is_executable: bool,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WireDirectory {
-    path: String,
-    tree: String,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WireSymlink {
-    path: String,
-    target: String,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WireTiming {
-    fetch_ms: u64,
-    run_ms: u64,
-    pack_ms: u64,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WireUsage {
-    cpu_usage_us: u64,
-    memory_peak_bytes: u64,
-}
-
-impl Wire {
-    fn from_manifest(m: &TaskManifest) -> Self {
-        Self {
-            version: m.version(),
-            lease: m.lease.clone(),
-            action: m.action.to_string(),
-            exit_code: m.exit_code,
-            stdout: m.stdout.map(|d| d.to_string()),
-            stderr: m.stderr.map(|d| d.to_string()),
-            output_files: m
-                .output_files
-                .iter()
-                .map(|f| WireFile {
-                    path: f.path.clone(),
-                    digest: f.digest.to_string(),
-                    is_executable: f.is_executable,
-                })
-                .collect(),
-            output_directories: m
-                .output_directories
-                .iter()
-                .map(|d| WireDirectory {
-                    path: d.path.clone(),
-                    tree: d.tree.to_string(),
-                })
-                .collect(),
-            output_symlinks: m
-                .output_symlinks
-                .iter()
-                .map(|l| WireSymlink {
-                    path: l.path.clone(),
-                    target: l.target.clone(),
-                })
-                .collect(),
-            timing: WireTiming {
-                fetch_ms: m.timing.fetch_ms,
-                run_ms: m.timing.run_ms,
-                pack_ms: m.timing.pack_ms,
-            },
-            usage: WireUsage {
-                cpu_usage_us: m.usage.cpu_usage_us,
-                memory_peak_bytes: m.usage.memory_peak_bytes,
-            },
-            packs: (m.version() == MANIFEST_VERSION_2).then_some(m.packs),
-            large: (m.version() == MANIFEST_VERSION_2).then(|| {
-                m.large
-                    .iter()
-                    .map(|l| WireLarge {
-                        slot: l.slot,
-                        digest: l.digest.to_string(),
-                    })
-                    .collect()
-            }),
-            inputs: m.inputs,
-        }
-    }
-
-    fn into_manifest(self) -> Result<TaskManifest, ManifestError> {
-        let stream = |field: &str, text: Option<String>| {
-            text.map(|t| digest_of(field.to_owned(), &t)).transpose()
-        };
-        let mut output_files = Vec::with_capacity(self.output_files.len());
-        for (i, f) in self.output_files.into_iter().enumerate() {
-            output_files.push(OutputFile {
-                digest: digest_of(format!("output_files[{i}].digest"), &f.digest)?,
-                path: f.path,
-                is_executable: f.is_executable,
-            });
-        }
-        let mut output_directories = Vec::with_capacity(self.output_directories.len());
-        for (i, d) in self.output_directories.into_iter().enumerate() {
-            output_directories.push(OutputDirectory {
-                tree: digest_of(format!("output_directories[{i}].tree"), &d.tree)?,
-                path: d.path,
-            });
-        }
-        let mut large = Vec::new();
-        for (i, l) in self.large.into_iter().flatten().enumerate() {
-            large.push(LargeEntry {
-                digest: digest_of(format!("large[{i}].digest"), &l.digest)?,
-                slot: l.slot,
-            });
-        }
-        Ok(TaskManifest {
-            action: digest_of("action".to_owned(), &self.action)?,
-            lease: self.lease,
-            exit_code: self.exit_code,
-            stdout: stream("stdout", self.stdout)?,
-            stderr: stream("stderr", self.stderr)?,
-            output_files,
-            output_directories,
-            output_symlinks: self
-                .output_symlinks
-                .into_iter()
-                .map(|l| OutputSymlink {
-                    path: l.path,
-                    target: l.target,
-                })
-                .collect(),
-            timing: Timing {
-                fetch_ms: self.timing.fetch_ms,
-                run_ms: self.timing.run_ms,
-                pack_ms: self.timing.pack_ms,
-            },
-            usage: Usage {
-                cpu_usage_us: self.usage.cpu_usage_us,
-                memory_peak_bytes: self.usage.memory_peak_bytes,
-            },
-            packs: self.packs.unwrap_or(1),
-            large,
-            inputs: self.inputs,
-        })
-    }
 }
