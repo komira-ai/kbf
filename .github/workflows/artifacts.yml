@@ -525,9 +525,9 @@ jobs:
       # The kbf base tree (docs/artifacts.md, "The kbf base tree bundle"): the task image's base layers
       # flattened into one tierstore tree with the built kbf-task added as /.kbf-tools/kbf-task, as one
       # asset holding the tree's manifests, its files and its facts. `base-tree` refuses an image that holds
-      # what a tree cannot hold (a set-uid file, a device, an extended attribute, a reserved path) and lists
-      # the bundle in SHA256SUMS.linux-x86_64; the attest job signs it with the rest of SHA256SUMS, as it signs
-      # the facts files.
+      # what a tree cannot hold (a device, an extended attribute, a reserved path), drops set-uid and set-gid
+      # bits as it normalises modes, and lists the bundle in SHA256SUMS.linux-x86_64; the attest job signs it with
+      # the rest of SHA256SUMS, as it signs the facts files.
       - name: The kbf base tree is the task image's base and the built kbf-task, and is an asset
         run: cargo xtask base-tree --image target/task-image-out/1.oci.tar --platform linux-x86_64 --commit "$GITHUB_SHA" --binary "target/$STATIC_TARGET/release/kbf-task" --out dist
       # The task image's CycloneDX SBOM, read from the image the release ships (its layers: the Ubuntu base's
@@ -761,9 +761,9 @@ jobs:
       # The kbf base tree (docs/artifacts.md, "The kbf base tree bundle"): the task image's base layers
       # flattened into one tierstore tree with the built kbf-task added as /.kbf-tools/kbf-task, as one
       # asset holding the tree's manifests, its files and its facts. `base-tree` refuses an image that holds
-      # what a tree cannot hold (a set-uid file, a device, an extended attribute, a reserved path) and lists
-      # the bundle in SHA256SUMS.linux-arm64; the attest job signs it with the rest of SHA256SUMS, as it signs
-      # the facts files.
+      # what a tree cannot hold (a device, an extended attribute, a reserved path), drops set-uid and set-gid
+      # bits as it normalises modes, and lists the bundle in SHA256SUMS.linux-arm64; the attest job signs it with
+      # the rest of SHA256SUMS, as it signs the facts files.
       - name: The kbf base tree is the task image's base and the built kbf-task, and is an asset
         run: cargo xtask base-tree --image target/task-image-out/1.oci.tar --platform linux-arm64 --commit "$GITHUB_SHA" --binary "target/$STATIC_TARGET/release/kbf-task" --out dist
       # The task image's CycloneDX SBOM, read from the image the release ships (its layers: the Ubuntu base's

@@ -734,8 +734,10 @@ release build, not a deployment):
   refused, not skipped);
 - an extended attribute (a PAX record `SCHILY.xattr.*` or `LIBARCHIVE.xattr.*`);
 - a path at or below `/work`, `/.kbf`, `/.kbf-run` or `/.kbf-tools`, which each action tree and `kbf-task` make themselves;
-- a name or link target that is not UTF-8, a link with no target, a path with a `..`, and a hard link to anything but a
-  regular file the layers hold at that point;
+- a path that is not UTF-8 or has a `..`, a link (symbolic or hard) with no target or a target that is not UTF-8, and a
+  hard link whose target has a `..` or is anything but a regular file the layers hold at that point (a symbolic link's
+  target is kept as the image has it, absolute or with `..`: in a job the tree is the container's root, so it resolves
+  inside the tree);
 - a name with tierstore's `.wh.` prefix left after the whiteouts are applied (a directory, a symlink or a file with bytes named
   `.wh.x` is not a whiteout) and a base that alone passes one of tierstore's limits (2^24 - 1 entries, a manifest over
   64 MiB, depth over 4096), by tierstore's own message.

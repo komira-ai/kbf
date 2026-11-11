@@ -17,10 +17,14 @@
 //! - a hard link becomes a separate file entry with the bytes and the mode of its target, which
 //!   must be a regular file the tree holds at that moment.
 //!
-//! Refused (each as `<path>: <kind>`): a character or block device; a FIFO; any other entry type (a tar cannot hold a socket, and a type this reader does
-//! not know is refused rather than skipped); an extended attribute (a PAX record
-//! `SCHILY.xattr.*` or `LIBARCHIVE.xattr.*`); a path at or below one of [`RESERVED`]; a name or
-//! link target that is not UTF-8, is empty (a link's) or has a `..` component. The set-uid,
+//! Refused (each as `<path>: <kind>`): a character or block device; a FIFO; any other entry
+//! type (a tar cannot hold a socket, and a type this reader does not know is refused rather
+//! than skipped); an extended attribute (a PAX record `SCHILY.xattr.*` or `LIBARCHIVE.xattr.*`);
+//! a path at or below one of [`RESERVED`]; an entry's path that is not UTF-8 or has a `..`
+//! component; a link (symbolic or hard) with no target or a target that is not UTF-8; and a
+//! hard link whose target has a `..` component or is not a regular file the tree holds. A
+//! symbolic link's target is kept as the image has it, absolute or with `..`: in a job the tree
+//! is the container's root, so the kernel resolves it inside the tree. The set-uid,
 //! set-gid and sticky bits are not refused, of a file or a directory: a tree has one owner, so
 //! they grant nothing there, and dropping them only narrows access. They are dropped like the
 //! other mode bits, and the path is listed as normalised with the mode it had.
