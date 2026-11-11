@@ -49,7 +49,7 @@ const BASE: &str =
 const KBF: &str =
     "registry.test/kbf@sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
 
-const JS: [&str; 11] = [
+const JS: [&str; 12] = [
     "--executor=js-agent",
     "--executor-job-url=http://127.0.0.1:7",
     "--executor-job-token-file=/etc/token",
@@ -59,6 +59,7 @@ const JS: [&str; 11] = [
     "--executor-host-memory-gib=32",
     "--executor-base-image=registry.test/base@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
     "--executor-kbf-image=registry.test/kbf@sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+    "--executor-base-tree=/opt/kbf/base-tree",
     "--executor-insecure-argv-secrets",
     // The tier store of the task flags is `http://`, as it is until it serves TLS.
     "--executor-allow-plain-http-put",
@@ -134,10 +135,11 @@ fn js_agent_names_each_flag_it_needs() {
         "--executor-host-memory-gib",
         "--executor-base-image",
         "--executor-kbf-image",
+        "--executor-base-tree",
     ] {
         assert!(why.contains(flag), "{flag} in {why}");
     }
-    for (at, flag) in JS.iter().enumerate().skip(1).take(8) {
+    for (at, flag) in JS.iter().enumerate().skip(1).take(9) {
         let name = name(flag);
         let mut all = JS.to_vec();
         all.remove(at);
@@ -364,6 +366,29 @@ fn settings_that_break_a_rule_of_the_executor_are_refused() {
     assert!(why.contains("frontend id"), "{why}");
 }
 
+/// Asserts that `--executor-base-tree` is the directory the executor's flags carry, as given and
+/// not looked at (nothing is read before the start), that it is the one path flag of the
+/// executor with a `DIR` value name, and that `--executor kbf-daemon` takes any value of it
+/// without reading it. Catches: a path that is made absolute or checked at parse time, so a
+/// unit whose directory the release's installer makes after the config is read would not parse.
+#[test]
+fn the_base_tree_flag_is_the_directory_of_the_bundles_and_unread_with_daemons() {
+    let flags = js_with(&["--executor-base-tree=relative/base-tree"]).expect("flags");
+    let js = flags.executor.js.expect("js-agent");
+    assert_eq!(js.base_tree, std::path::PathBuf::from("relative/base-tree"));
+    let flags = js_with(&[]).expect("flags");
+    let js = flags.executor.js.expect("js-agent");
+    assert_eq!(js.base_tree, std::path::PathBuf::from("/opt/kbf/base-tree"));
+    let help = crate::frontend::command().render_long_help().to_string();
+    assert!(help.contains("--executor-base-tree <DIR>"), "{help}");
+
+    let mut all = JS.to_vec();
+    all[0] = "--executor=kbf-daemon";
+    all[9] = "--executor-base-tree=/does/not/exist";
+    let flags = parsed(argv(&all)).expect("flags");
+    assert!(flags.executor.js.is_none());
+}
+
 fn flags_of(url: &str, token: &Path, ca: Option<&Path>) -> JsAgentFlags {
     let config = Config::new("front-1", 1, 2_000, 16 << 30);
     JsAgentFlags {
@@ -373,6 +398,7 @@ fn flags_of(url: &str, token: &Path, ca: Option<&Path>) -> JsAgentFlags {
         ca_file: ca.map(Path::to_path_buf),
         base_image: ImageRef::parse(&format!("docker://{BASE}")).expect("an image"),
         kbf_image: ImageRef::parse(&format!("docker://{KBF}")).expect("an image"),
+        base_tree: "/opt/kbf/base-tree".into(),
     }
 }
 
@@ -553,6 +579,7 @@ fn old_lease_flags_are_refused_and_job_flags_are_required() {
             "--executor-host-memory-gib",
             "--executor-base-image",
             "--executor-kbf-image",
+            "--executor-base-tree",
         ]
     );
     let why = parsed(argv(&["--executor=js-agent"])).expect_err("refused");

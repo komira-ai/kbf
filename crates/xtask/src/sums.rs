@@ -35,9 +35,9 @@
 //!   like a tarball except that it has no SBOM attestation: build provenance and its own
 //!   bundle, except a task image that has its SBOM listed ([`crate::pkg_image_sbom`]): it also has an SBOM
 //!   attestation, whose subject is the image tarball. The version facts of a `kbf`
-//!   ([`crate::version_facts`]) and the facts of the task
-//!   image ([`crate::pkg_image_asset::facts_text`]) are verified like an
-//!   SBOM: build provenance, and nothing else.
+//!   ([`crate::version_facts`]), the facts of the task
+//!   image ([`crate::pkg_image_asset::facts_text`]) and the kbf base tree bundle of a Linux platform
+//!   ([`crate::base_tree`]) are verified like an SBOM: build provenance, and nothing else.
 //!   First, before `gh` is run, `<dir>` holds exactly one bundle per listed tarball and
 //!   no other, each the bundle of that tarball ([`bundles::pairing`]). Every tarball
 //!   also verifies against its own bundle, as a host's installer does it (`--bundle`,
@@ -59,6 +59,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::Error;
+use crate::base_tree;
 use crate::build_commit::full_commit;
 use crate::bundles;
 use crate::fetch::Sha256;
@@ -634,14 +635,15 @@ pub fn verify_attestations(dir: &Path, a: &Attestations) -> Result<Vec<String>, 
         } else if l.name.ends_with(".cdx.json")
             || l.name.ends_with(version_facts::SUFFIX)
             || l.name.ends_with(pkg_image_asset::FACTS_SUFFIX)
+            || base_tree::is_bundle(&l.name)
         {
-            // An SBOM, the version facts of a `kbf` and the facts of an image have build
-            // provenance only.
+            // An SBOM, the version facts of a `kbf`, the facts of an image and a base tree bundle
+            // have build provenance only.
             a.require(&file, workflow, None)?;
             printed.push(format!("verified: {} (provenance)", l.name));
         } else {
             return Err(Error::Failed(format!(
-                "{SUMS} lists {}, neither a tarball, a package, an SBOM nor facts",
+                "{SUMS} lists {}, neither a tarball, a package, an SBOM, facts nor a base tree bundle",
                 l.name
             )));
         }

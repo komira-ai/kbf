@@ -1,0 +1,32 @@
+[package]
+name = "kbf-tree-bundle"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# The kbf base tree's bundle (docs/design/actions-as-jobs.md, 3.3): a tree of files as
+# tierstore's manifests ([`tree`]), and the release asset that carries its objects and facts
+# ([`bundle`]). `cargo xtask base-tree` writes it and the frontend reads it, through this one
+# definition. crates/kbf-integration-test/tests/layering.rs keeps it a leaf: no async stack and
+# no other kbf crate, so xtask can link it.
+[dependencies]
+# The digests of objects and of the bundle's entries, as text.
+hex.workspace = true
+# The facts are JSON, and so is every manifest.
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+# The bundle is a tar of its facts and its objects.
+tar.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+# tierstore's own manifest reader and flattener: every manifest the tree makes is read back by
+# it, so the writer here and the reader on the nodes cannot drift.
+tierstore.workspace = true
+
+[lints]
+workspace = true

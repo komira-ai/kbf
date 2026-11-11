@@ -38,7 +38,8 @@ the package tests) runs in `beta.yml` on every push and never on a pull request;
 23 tarballs, each with its SBOM and (once the push is attested) its provenance bundle
 ([below](#provenance-bundles-verifying-a-tarball-offline)), two Debian packages of `kbf`
 ([below](#the-kbf-package-deb)), two native Debian packages of `kbf` ([below](#the-native-kbf-package)), one frontend, one update coordinator and one task runner container image per
-Linux architecture ([below](#the-frontend-and-coordinator-images-oci)) and one macOS package of `kbf-installer`
+Linux architecture ([below](#the-frontend-and-coordinator-images-oci)), one kbf base tree bundle per Linux architecture
+([below](#the-kbf-base-tree-bundle)) and one macOS package of `kbf-installer`
 ([below](#the-kbf-installer-package-pkg-macos)), built by one job per platform:
 
 | Asset | Runner | Target |
@@ -102,7 +103,7 @@ Linux tarballs and its packaging (the example unit and the flags to fill in) are
 [komira-ai/tierstore](https://github.com/komira-ai/tierstore). The host updater does not update it: the farm places it,
 taking the tarball from that repository's release and checking it against that repository's release signer.
 
-The packages are the two Linux jobs' debs (one each) and container images (three each, and the facts and the SBOM of the task image), and the macOS job's `.pkg`:
+The packages are the two Linux jobs' debs (one each), container images (three each, and the facts and the SBOM of the task image) and kbf base tree bundle (one each), and the macOS job's `.pkg`:
 
 | Asset | Built by | Holds |
 |---|---|---|
@@ -120,6 +121,8 @@ The packages are the two Linux jobs' debs (one each) and container images (three
 | `kbf-task-image-<commit>-linux-arm64.facts.json` | the `linux-arm64` job | the same for arm64 |
 | `kbf-task-image-<commit>-linux-x86_64.cdx.json` | the `linux-x86_64` job (`pkg-image-sbom`, syft) | the CycloneDX SBOM of the task image, read from its layers: the packages of the Ubuntu base and the `kbf-task`; the SBOM of the `kbf-task` tarball describes the binary alone |
 | `kbf-task-image-<commit>-linux-arm64.cdx.json` | the `linux-arm64` job | the same for arm64 |
+| `kbf-base-tree-<commit>-linux-x86_64.tree.tar` | the `linux-x86_64` job (`cargo xtask base-tree`) | the kbf base tree of the farm's Linux actions, as tierstore manifests and objects: the base layers of the task image flattened, with the `kbf-task` the job built as `/.kbf-tools/kbf-task`, and the tree's facts; [below](#the-kbf-base-tree-bundle) |
+| `kbf-base-tree-<commit>-linux-arm64.tree.tar` | the `linux-arm64` job | the same for arm64, from the arm64 base |
 | `kbf-installer-<commit>-darwin-arm64.pkg` | the `darwin-arm64` job (`macos-15`, `cargo xtask pkg build`) | the `kbf-installer` of the tarball of the same name, its LaunchDaemon property list, the pinned darwin `gh` and a trust directory |
 
 The set above is pinned: `crates/kbf-integration-test/tests/release_artifacts` fails a pull request
@@ -689,6 +692,68 @@ gh attestation verify kbf-frontend-image-<commit>-linux-x86_64.oci.tar \
 coordinator's `kbf-coordinator --version`) and checks that the binary in it names the commit (and,
 for `kbf`, a release build).
 
+## The kbf base tree bundle
+
+The farm runs an action in a root file system that is one read-only tree of the object store, so the release builds
+that tree for each Linux platform: the kbf base tree
+([actions-as-jobs.md](design/actions-as-jobs.md), 3.3). The asset is
+`kbf-base-tree-<commit>-linux-x86_64.tree.tar` and `kbf-base-tree-<commit>-linux-arm64.tree.tar`, a plain tar in
+the format of `kbf_tree_bundle::bundle` (`crates/kbf-tree-bundle`):
+
+- `facts.json` first: `commit`, `platform`, `root` (the SHA-256 of the root manifest, the tree's name), `entries` (the
+  entries below the root, across all its directories, as tierstore counts them), `depth` (the most names on a path
+  from the root) and `normalised` (below). A reader ignores a member it does not know;
+- then every object once as `objects/<sha256>`, the SHA-256 of its bytes in lowercase hex: first each file's bytes, in
+  the order of the tree, then each directory's manifest (tierstore's `tree_manifest` version 1), each after the
+  manifests it names and the root's last, so that an object is published after everything it names. Every entry is a
+  regular file of mode 0644, owner 0 and time 0: the same tree gives the same bytes.
+
+`cargo xtask base-tree --image <task image> --platform <platform> --commit <sha> --binary <kbf-task> --out dist` makes
+it, in the `linux-*` jobs after the task image is an asset, from that same image and the `kbf-task` the job built:
+
+1. The image's layers must begin with those of the pinned base (`packaging/container/kbf-task/base-<platform>.manifest.json`),
+   in order; those layers, each checked against its digest, are the base, and the layers above them (the image's own
+   `kbf-task` layer) are not read.
+2. The base layers are applied in order onto one tree. A regular file of size 0 named `.wh.<name>` removes `<name>` from the
+   layers below, and one named `.wh..wh..opq` removes everything the lower layers put in its directory, before what its own layer
+   adds, whatever the order of the tar. A later entry replaces an earlier one at the same path (a directory over a
+   directory keeps what it holds). A hard link becomes a separate file with the bytes and the mode of its target.
+3. `--binary` is added as the executable `/.kbf-tools/kbf-task` (mode 0755), and nothing else is in `/.kbf-tools`.
+4. The tree is written as tierstore manifests (the names and limits tierstore's reader enforces are enforced here first),
+   and the bundle to `<out>/kbf-base-tree-<commit>-<platform>.tree.tar`, a file that must not exist. It is read back as the
+   frontend reads it (each object hashed to its name, the facts and the order held to what was written) and only then listed
+   in `SHA256SUMS.<platform>`; a bundle that is already listed is refused.
+
+A tree has one owner and the modes 0644 and 0755 only. A file becomes 0755 if any execute bit is set and else 0644, a
+directory 0755, and the owner is dropped, with the set-uid, set-gid and sticky bits (a tree has one owner, so they grant
+nothing there; `/usr/bin/su` 4755 becomes 0755); every file or directory whose mode (the 12 permission bits) was another is listed in `normalised` with its
+path from the root, the mode it had and the one it has (`{"path": "/etc/shadow", "from": "0640", "to": "0644"}`), sorted by path.
+So `/etc/shadow` of the base is world-readable in the tree, which is why the base holds no secret. What changes behaviour
+or what tierstore refuses is refused by path and kind, all problems at once, and nothing is written (a refused base fails the
+release build, not a deployment):
+
+- a character device, a block device, a FIFO, and any other type of tar entry (a tar cannot hold a socket, and a type this reader does not know is
+  refused, not skipped);
+- an extended attribute (a PAX record `SCHILY.xattr.*` or `LIBARCHIVE.xattr.*`);
+- a path at or below `/work`, `/.kbf`, `/.kbf-run` or `/.kbf-tools`, which each action tree and `kbf-task` make themselves;
+- a path that is not UTF-8 or has a `..`, a link (symbolic or hard) with no target or a target that is not UTF-8, and a
+  hard link whose target has a `..` or is anything but a regular file the layers hold at that point (a symbolic link's
+  target is kept as the image has it, absolute or with `..`: in a job the tree is the container's root, so it resolves
+  inside the tree);
+- a name with tierstore's `.wh.` prefix left after the whiteouts are applied (a directory, a symlink or a file with bytes named
+  `.wh.x` is not a whiteout) and a base that alone passes one of tierstore's limits (2^24 - 1 entries, a manifest over
+  64 MiB, depth over 4096), by tierstore's own message.
+
+The bundle is a release asset like the others: listed in `SHA256SUMS`, so it has build provenance (it is one subject of the
+attestation of `SHA256SUMS`, and `verify-assets attestations` checks it with the SBOMs and the facts), and, like the facts,
+no bundle of its own and no SBOM attestation. `verify-assets sums` and `release check` take
+`kbf-base-tree-<commit>-<platform>.tree.tar` for a Linux platform and the commit of the release, and no other name that ends
+`.tree.tar`. The root digest changes with every release (its `/.kbf-tools` does); the manifest of every other top-level
+directory is a function of the pinned base alone, so it is the same digest in every release on that pin.
+
+The frontend publishes the bundle of its release at its start under `--executor js-agent`, as
+[job-service-cutover.md](deploy/job-service-cutover.md) says; nothing in the release workflow writes the object store.
+
 ## The kbf-installer package (pkg, macOS)
 
 A Mac gets `kbf-installer` the same way, as one file that holds everything it needs to verify a
@@ -824,9 +889,10 @@ A release is the files the `artifacts` stage of the pipeline run of a push to `m
 attached unchanged to a GitHub release
 ([`.github/workflows/release.yml`](../.github/workflows/release.yml)). Nothing is
 rebuilt. Its assets are every tarball and SBOM in the table above, for that commit, the
-`kbf-<commit>-<platform>.version.json` of each platform, their
-`SHA256SUMS`, and the provenance bundle of each tarball, `<tarball>.sigstore.json`, beside
-it.
+`kbf-<commit>-<platform>.version.json` of each platform, the packages, images, task image facts and base tree
+bundles of the Linux platforms, their
+`SHA256SUMS`, and the provenance bundle of each tarball, package and image, `<asset>.sigstore.json`, beside
+it (the facts and the base tree bundles have none: the attestation of `SHA256SUMS` covers them).
 
 One run of `release.yml` cuts a release; nobody tags. A push to `main` runs one sequential pipeline
 (`pipeline.yml`, [design](design/kbf-cicd.md), section 8.0): `ci` and `beta` (the source tests) together, `artifacts` (the builds) beside them, `artifacts-sign` (the attestations) after `ci` and `artifacts`, and `smoke`, which installs and
@@ -868,7 +934,8 @@ highest release tag, so a re-run of an old run releases nothing; re-run the fail
   commit);
 - a file does not match `SHA256SUMS` (`sha256sum --check --strict`), a file is not
   listed in it, a `kbf` tarball's `kbf-<commit>-<platform>.version.json` is not listed,
-  or a listed file is not `<binary>-<commit>-<platform>` (or that version file);
+  or a listed file is not `<binary>-<commit>-<platform>` (or that version file, the task image's facts,
+  or `kbf-base-tree-<commit>-<platform>.tree.tar` for a Linux platform);
 - a tarball has no bundle, or a bundle file belongs to no listed tarball, is not exactly
   one bundle of at most 256 KiB, or does not have its tarball's digest as its one subject
   (`cargo xtask release check`);

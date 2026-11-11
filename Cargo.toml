@@ -270,6 +270,7 @@ kbf-state = { path = "crates/kbf-state" }
 kbf-storage = { path = "crates/kbf-storage" }
 kbf-store = { path = "crates/kbf-store" }
 kbf-task-pack = { path = "crates/kbf-task-pack" }
+kbf-tree-bundle = { path = "crates/kbf-tree-bundle" }
 kbf-testkit = { path = "crates/kbf-testkit" }
 kbf-threads = { path = "crates/kbf-threads" }
 kbf-oidc = { path = "crates/kbf-oidc" }

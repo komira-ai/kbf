@@ -63,7 +63,8 @@
 //! runs (below, with the `--job-*` listener its read grants point at): `--executor js-agent` is
 //! refused when the flags are parsed without them, and where its settings disagree with them
 //! (`executor_bind` lists the checks). By default, `--executor kbf-daemon`, nothing is built and
-//! no job service is contacted.
+//! no job service is contacted. The start of `FrontendHandle::serve` first publishes the release's
+//! kbf base tree to the packs' store from `--executor-base-tree` (`base_tree`).
 //!
 //! **Task runs** are prepared only if `--task-secret-file` is given (`task_flags` has the flags
 //! and what they need): the started frontend then carries a [`kbf_front::prepare_run::RunPrep`]
@@ -588,6 +589,8 @@ pub struct FrontendHandle {
     janitor_sweeps: Option<tokio::sync::watch::Receiver<u64>>,
     /// The executor `--executor js-agent` builds, stepped while the frontend serves.
     executor: Option<Executor>,
+    /// The publishing of the kbf base tree, under `--executor js-agent`.
+    base_tree: Option<base_tree::Start>,
 }
 
 impl FrontendHandle {
@@ -661,11 +664,14 @@ impl FrontendHandle {
     ///
     /// # Errors
     /// A listener fails while serving; or the pack store does not refuse to replace an object
-    /// (or cannot be written to), which is checked before anything is served.
+    /// (or cannot be written to), or, with `--executor js-agent`, the kbf base tree of this release
+    /// cannot be published (`base_tree`): both are checked before anything is served.
     pub async fn serve(self) -> Result<(), ServeError> {
         if let Some(packs) = &self.packs {
             packs.check_create_only().await.map_err(ServeError::Packs)?;
         }
+        // Held until the frontend stops: the executor's trees are written over it.
+        let _base_tree = base_tree::publish_all(self.base_tree).await?;
         let tasks = self
             .background
             .into_iter()
@@ -963,6 +969,9 @@ impl<'a> Prepared<'a> {
         log_state(durable, farm.term(), farm.lease_epoch());
         let source = source.or_else(|| run_prep.as_ref().map(RunSource::of));
         let executor = executor_of(flags, &farm, packs.as_ref(), &backend, source)?;
+        let base_tree = (flags.executor.js.as_ref())
+            .zip(packs.clone())
+            .map(|(js, packs)| base_tree::Start::new(js, packs, state_store.clone()));
 
         let (mut worker_server, peers, worker_tls) = worker_peers(
             keepalive(
@@ -1299,6 +1308,7 @@ impl<'a> Prepared<'a> {
             intake_polls,
             janitor_sweeps,
             executor: executor.map(|built| built.executor),
+            base_tree,
         })
     }
 }
@@ -1505,6 +1515,7 @@ fn serve(flags: &FrontendFlags) -> Result<(), Box<dyn Error>> {
     })
 }
 
+mod base_tree;
 mod drain_flags;
 mod executor_bind;
 mod executor_flags;

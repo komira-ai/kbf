@@ -86,6 +86,10 @@
 //!   release asset `kbf-<service>-image-<commit>-<platform>.oci.tar`, refused unless its program
 //!   is the attested `kbf` (frontend) or the built `kbf-coordinator` or `kbf-task`, it runs as a user that is
 //!   not root with the service's entrypoint, and it is built for the platform.
+//! - `base-tree` ([`base_tree`]): the kbf base tree, the task image's base layers flattened with
+//!   the built `kbf-task` as `/.kbf-tools/kbf-task`, as the release asset
+//!   `kbf-base-tree-<commit>-<platform>.tree.tar`: tierstore manifests and objects with their
+//!   facts, refused by path and kind for what a tree cannot hold.
 //! - `pkg-image-sbom` ([`pkg_image_sbom`]): the CycloneDX SBOM of the task image, read from its
 //!   layers with the pinned syft, as the release asset `kbf-task-image-<commit>-<platform>.cdx.json`
 //!   beside the image; with the same bytes for the same image.
@@ -150,6 +154,7 @@ use std::process::{Command, ExitCode};
 use clap::{Parser, Subcommand};
 
 pub mod advisories;
+pub mod base_tree;
 pub mod budget;
 pub mod build_commit;
 pub mod bundles;
@@ -497,6 +502,9 @@ enum Verb {
         #[arg(long)]
         verify_only: bool,
     },
+    /// The kbf base tree (the task image's base layers flattened, plus the built `kbf-task`) as a
+    /// release asset, `kbf-base-tree-<commit>-<platform>.tree.tar`.
+    BaseTree(base_tree::Args),
     /// The CycloneDX SBOM of the task OCI image, read from its layers (the base's packages too), as
     /// a release asset beside the image; or, with `--verify-only`, a check that the one beside the
     /// signed image is the image's.
@@ -1285,6 +1293,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
                 },
             )
         }
+        Verb::BaseTree(args) => base_tree::run(&args),
         Verb::PkgImageSbom {
             image,
             service,

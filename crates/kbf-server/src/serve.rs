@@ -229,6 +229,9 @@ pub enum ServeError {
     /// The executor stopped by itself.
     #[error("--executor js-agent: {0}")]
     Executor(String),
+    /// The kbf base tree of this release could not be published at the start.
+    #[error("--executor-base-tree: {0}")]
+    BaseTree(String),
 }
 
 /// A server that is listening: the addresses it bound, and the future that serves

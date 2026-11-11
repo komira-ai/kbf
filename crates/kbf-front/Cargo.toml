@@ -39,6 +39,8 @@ kbf-storage.workspace = true
 kbf-store.workspace = true
 kbf-tier.workspace = true
 kbf-tls.workspace = true
+# The base tree's bundle, which the frontend reads and publishes at its start (`base_publish`).
+kbf-tree-bundle.workspace = true
 kbf-types.workspace = true
 prost.workspace = true
 prost-types.workspace = true
@@ -67,6 +69,9 @@ protox.workspace = true
 # certificates, the switch that cuts a node off, and the TLS server the nodes serve with.
 kbf-testkit.workspace = true
 rcgen.workspace = true
+# The bundles the base tree publishing tests make that are not the tree's (a tar whose first entry
+# is not the facts, one with an object that is not its name's).
+tar.workspace = true
 tonic = { workspace = true, features = ["tls-ring"] }
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "test-util", "time"] }
 tracing-subscriber.workspace = true

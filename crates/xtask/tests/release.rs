@@ -1793,6 +1793,45 @@ fn check_names_both_the_facts_and_the_sbom_a_task_image_lacks() {
 }
 
 #[test]
+fn check_takes_only_the_base_tree_bundle_of_a_linux_platform_for_the_commit() {
+    // Catches: `kbf-base-tree-...tree.tar` refused as "not an asset of <commit>" (the release of
+    // the first main push that lists it fails); a bundle for the Mac, of another commit, or under
+    // another name accepted; and a provenance bundle expected for it (it has none: the sums'
+    // attestation covers it, so one beside it is a stray).
+    let root = scratch("check-base-tree");
+    let listed = dist(&root, COMMIT);
+    for platform in ["linux-x86_64", "linux-arm64"] {
+        add_deb(
+            &listed,
+            &format!("kbf-base-tree-{COMMIT}-{platform}.tree.tar"),
+            false,
+        );
+    }
+    let (code, _, err) = check(&listed, COMMIT);
+    assert_eq!(code, Some(0), "{err}");
+    for bad in [
+        format!("kbf-base-tree-{COMMIT}-darwin-arm64.tree.tar"),
+        format!("kbf-base-tree-{OTHER}-linux-arm64.tree.tar"),
+        format!("kbf-base-tree-{COMMIT}-linux-arm64.tar"),
+        format!("kbf-tree-{COMMIT}-linux-arm64.tree.tar"),
+    ] {
+        let root = scratch("check-bad-base-tree");
+        let d = dist_with(&root, &bad);
+        let (code, out, err) = check(&d, COMMIT);
+        assert_eq!(code, Some(1), "{bad}: {out}");
+        assert_eq!(err, format!("xtask: {bad}: not an asset of {COMMIT}\n"));
+    }
+    let stray = format!("kbf-base-tree-{COMMIT}-linux-arm64.tree.tar.sigstore.json");
+    std::fs::write(listed.join(&stray), bundle_text(&sha_of(&stray))).expect("stray");
+    let (code, out, err) = check(&listed, COMMIT);
+    assert_eq!(code, Some(1), "{out}");
+    assert_eq!(
+        err,
+        format!("xtask: {stray}: not the bundle of a listed tarball\n")
+    );
+}
+
+#[test]
 fn check_takes_only_the_facts_of_the_task_image_for_the_commit() {
     // Catches: any file ending `.facts.json` taken as an asset: facts of a frontend image, of
     // the Mac, or under another binary's name; and facts (with their image) of another commit.

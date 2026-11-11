@@ -40,6 +40,8 @@ kbf-installer.workspace = true
 # The native package's version rule and the update hook's manifest constants (`release desired`,
 # `pkg-config --native-version-of`, `channels check-apt`): the hook's own definitions.
 kbf-package-hook.workspace = true
+# `base-tree`: the kbf base tree as tierstore manifests and its release asset (a leaf crate).
+kbf-tree-bundle.workspace = true
 # The platforms a release is built for and the tarballs a host of each needs
 # (`release check`): the one list the installer's bundle reader is checked against.
 kbf-types.workspace = true
@@ -67,6 +69,9 @@ zip.workspace = true
 kbf-host.workspace = true
 # A scratch directory a test owns and removes (the unit tests).
 kbf-testkit.workspace = true
+# tierstore's own manifest reader and flattener: the tests count the entries and depth of the
+# manifests `base-tree` writes with it, so that the facts are the nodes' count.
+tierstore.workspace = true
 rcgen.workspace = true
 # The caller's umask, for the install.sh test.
 rustix = { workspace = true, features = ["fs", "process", "system"] }
