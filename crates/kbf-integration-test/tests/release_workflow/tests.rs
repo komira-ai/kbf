@@ -1836,4 +1836,5 @@ fn the_rehearsal_names_the_token_file_in_the_channel_the_helper_reads() {
         "{path}: still says the channel names no token"
     );
 }
+mod deploy_tests;
 mod restore_tests;

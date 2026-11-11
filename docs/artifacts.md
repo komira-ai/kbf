@@ -295,7 +295,7 @@ and a host that trusts one asks for that branch with `--source-ref`; an asset at
 only takes the files of the pipeline run of a push to `main`, so a file built from any other branch is
 never released.
 
-Only the `attest-*` jobs (`attest-linux`, `attest-darwin-arm64`) hold `id-token: write` and `attestations: write` (the release workflow's `gamma` job holds `id-token: write` alone, to present it to the update coordinator, and signs nothing; see [Releases](#releases)), and only
+Only the `attest-*` jobs (`attest-linux`, `attest-darwin-arm64`) hold `id-token: write` and `attestations: write` (the release workflow's `gamma` job holds `id-token: write` alone, to present it to the update coordinator, and its `deploy` job holds it alone too, for the docker-swarm-updater workflow it calls; neither signs anything; see [Releases](#releases)), and only
 under the exact `if:` that limits it to a push to `main` (the
 `verify-*` jobs run under the same one). The workflow lint
 (`crates/kbf-integration-test/tests/workflows`) refuses those scopes in any other job, and in one
@@ -829,6 +829,8 @@ can create one. The jobs, each with the least token it needs:
 | `publish` | creates the release with those files and notes (`release publish`) | `contents: write`; environment `release` |
 | `bump` | opens the pull request in the internal repository that moves its submodule to the release (`release bump-internal`) | `contents: read`; environment `release` |
 | `gamma` | after `publish`, derives the version its hosts report (`<version>+g<commit>`, from the release's version facts: `release farm-version`), sets it as the desired version on the farm's update coordinator and waits for the farm to converge (`deploy-farm`); passes with a notice when the repository variable `KBF_COORDINATOR_URL` is unset. Then builds a small Buck2 project against the farm, remote only, and fails unless some action ran remotely and none locally (`prove-farm`); passes with a notice when `FARM_ADDRESS` is unset ([deploy/kbf-updater.md](deploy/kbf-updater.md#turn-on-the-gamma-stage)) | `contents: read`, `id-token: write`; environment `release` |
+| `deploy-digest` | only while the repository variable `CP_DEPLOY_ENDPOINT` is set, after `publish`: the manifest digest of the release's linux-x86_64 frontend image (which must be the file `SHA256SUMS` lists) and the release's addresses of the image and its bundle (`release image-digest`) | `contents: read` |
+| `deploy` | only while `CP_DEPLOY_ENDPOINT` is set, after `gamma`: calls docker-swarm-updater's deploy workflow, pinned by commit, to deploy that image to the frontend's Docker Swarm service and wait for it to converge ([deploy/swarm-frontend.md](deploy/swarm-frontend.md)) | `id-token: write`; the called job runs in environment `controlplane` |
 
 Every job after `plan` runs only when `plan` says the push ships code and does not change the
 pipeline (`.github/`, `infra/`, `crates/xtask/` and the like): a push of docs only releases
@@ -883,7 +885,7 @@ commit. (The notes are written after the tag, because they read it.)
 
 `crates/kbf-integration-test/tests/release_workflow` holds the file to all of this (and `pipeline_workflow` holds the pipeline it follows to its order, its cancel and its triggers): the events
 (the completion of a `pipeline` run for `main` only), the job graph and the scopes, `if:` and environment of each job, the halt on
-red, a checkout of the commit the pipeline built alone, the release bot's key read in `tag` and `bump` only, `id-token: write` in `gamma` only (the coordinator's address and the farm's `FARM_*` settings are read from repository variables there and nowhere else),
+red, a checkout of the commit the pipeline built alone, the release bot's key read in `tag` and `bump` only, `id-token: write` in `gamma` and `deploy` only (the coordinator's address and the farm's `FARM_*` settings are read from repository variables in `gamma` and nowhere else, the `CP_DEPLOY_*` ones in `deploy-digest` and `deploy` alone), the one reusable workflow `deploy` calls and its inputs,
 the data that flows from job to job, pinned actions and an empty top-level `permissions`. The
 job list is pinned, `publish` among them (`gamma.yml`, which followed the workflow, is deleted). On every
 pull request into `main`, CI asks GitHub the same on-`main` question for the pull request's base

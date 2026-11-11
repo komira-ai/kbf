@@ -20,8 +20,8 @@
 //!   which may be `write` only in a job whose `if:` is exactly [`SIGNING_PUSH_ONLY`] or exactly
 //!   [`SIGNING_STAGE_ONLY`] (the same push to main, and the called artifacts workflow's `sign`
 //!   stage; a caller job has no `inputs`, so it keeps [`SIGNING_PUSH_ONLY`]) (`id-token`
-//!   also in a job whose `if:` is exactly [`RELEASE_PUSH_ONLY`], for the release's deploy step,
-//!   [`DEPLOY_SCOPE`]), and
+//!   also in a job whose `if:` is exactly [`RELEASE_PUSH_ONLY`] or [`called::DEPLOY_ONLY`], for
+//!   the release's deploy steps, [`DEPLOY_SCOPE`]), and
 //!   `contents` ([`RELEASE_SCOPES`]), which may be `write` only in a job whose `if:` is
 //!   exactly [`RELEASE_PUSH_ONLY`]. So no pull request or merge-queue run holds a
 //!   token that can sign an attestation, every attestation this repository signs names
@@ -30,7 +30,8 @@
 //!   only in a job whose `if:` is exactly [`ISSUES_MAIN_ONLY`] (the advisories workflow
 //!   keeps one issue; no pull request run holds a token that can write issues);
 //! - a job calls a reusable workflow that is not one of this repository's linted
-//!   workflow files (its runners are not in a file this lint read);
+//!   workflow files (its runners are not in a file this lint read), but for exactly the
+//!   pinned calls of [`called::CALLABLE`], each with its version comment;
 //! - a step's `uses:` is not pinned to a full 40-character commit SHA followed on the
 //!   same line by a version comment, written as a plain (unquoted) scalar so the
 //!   comment's place is exact;
@@ -82,6 +83,7 @@
 //! and action files before it merges. This lint keeps those files from asking for
 //! anything else, so that review has less to catch.
 
+mod called;
 #[cfg(test)]
 mod stages;
 mod workflow_run;
@@ -167,10 +169,11 @@ const SIGNING_PUSH_ONLY: &str =
 /// merge-queue run does not have: its `inputs` context is empty).
 const SIGNING_STAGE_ONLY: &str = "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && inputs.stage == 'sign' }}";
 
-/// The one signing scope a job may also set to `write` under [`RELEASE_PUSH_ONLY`]: the OIDC
-/// token, which the release workflow's deploy step presents to the farm's update coordinator.
-/// It signs nothing (`attestations` stays under [`SIGNING_PUSH_ONLY`]), and the workflow lint of
-/// `release.yml` holds the one job that has it to `contents: read` beside it.
+/// The one signing scope a job may also set to `write` under [`RELEASE_PUSH_ONLY`] or
+/// [`called::DEPLOY_ONLY`]: the OIDC token, which the release workflow's gamma stage presents to
+/// the farm's update coordinator and its frontend deploy to docker-swarm-updater. It signs
+/// nothing (`attestations` stays under [`SIGNING_PUSH_ONLY`]), and the workflow lint of
+/// `release.yml` holds the two jobs that have it to exactly their scopes.
 const DEPLOY_SCOPE: &str = "id-token";
 
 /// Token scopes a job may set to `write` when it runs only for a push to `main` that releases:
@@ -614,10 +617,11 @@ impl Lint<'_> {
         };
         if let Some(called) = get(job_map, "uses") {
             match called.as_str().and_then(|w| w.strip_prefix("./")) {
-                None => self.refuse(
-                    called,
-                    "a reusable workflow outside this repository runs where this lint cannot see",
-                ),
+                None => {
+                    if let Some(why) = called::refusal(self.text, called) {
+                        self.refuse(called, why);
+                    }
+                }
                 Some(path) if self.repo.workflows.iter().any(|w| w == path) => {}
                 Some(path) => self.refuse(
                     called,
@@ -705,7 +709,11 @@ impl Lint<'_> {
             if granted == "read" || granted == "none" {
                 continue;
             }
-            if name == DEPLOY_SCOPE && granted == "write" && condition == Some(RELEASE_PUSH_ONLY) {
+            let deploy = [RELEASE_PUSH_ONLY, called::DEPLOY_ONLY];
+            if name == DEPLOY_SCOPE
+                && granted == "write"
+                && condition.is_some_and(|c| deploy.contains(&c))
+            {
                 continue;
             }
             let gate: &[&str] = if SIGNING_SCOPES.contains(&name) {

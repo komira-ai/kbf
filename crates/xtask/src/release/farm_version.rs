@@ -92,7 +92,7 @@ pub fn derive(bytes: &[u8], name: &str, sums_text: &str, commit: &str) -> Result
 }
 
 /// `path` as text, refused over `cap` bytes.
-fn read_capped(path: &Path, cap: usize) -> Result<Vec<u8>, Error> {
+pub(super) fn read_capped(path: &Path, cap: usize) -> Result<Vec<u8>, Error> {
     let shown = path.display();
     let length = std::fs::metadata(path)
         .map_err(Error::spawn(format!("read {shown}")))?
