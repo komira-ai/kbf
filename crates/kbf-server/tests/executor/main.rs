@@ -15,6 +15,7 @@ mod jobs;
 mod keys;
 mod phases;
 mod pool;
+mod promotion;
 mod real_prep;
 mod recovery;
 mod rig;
