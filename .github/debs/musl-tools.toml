@@ -1,0 +1,44 @@
+# The packages of `musl-tools` (the `musl-gcc` that ring's C code needs for the static musl
+# targets), for the jobs that build or check `kbf-task` for them: ci.yml's `lint` and the
+# linux-x86_64 and linux-arm64 jobs of artifacts.yml. `cargo xtask debs`
+# (crates/xtask/src/debs.rs) reads this file; each job restores the packages from the actions
+# cache under a key made of this file's hash, fetches them from the mirrors below in order only
+# when the cache missed, checks every file against its SHA-256 either way, and installs them
+# with `dpkg --install`. A normal run so needs neither the Ubuntu archive nor `apt-get update`.
+#
+# Each entry is a package of Ubuntu 24.04's release pocket (`noble`), whose files stay in the
+# archive's pool for as long as the release is supported, taken from that pocket's `Packages`
+# index (universe, the architecture's `binary-*`). The packages the runner image already has
+# (gcc for musl-dev) are not pinned: dpkg refuses the install, by name, if the image ever lacks
+# one.
+#
+# `mirrors` are tried in order: Canonical's archive, then two mirrors run by others, so that an
+# outage of Canonical's names leaves a job whose cache missed a way to its packages.
+#
+# To move a pin, take the version, path and SHA-256 from the `Packages` index, never from a file
+# you downloaded yourself; the cache key changes with this file.
+
+[amd64]
+mirrors = [
+  "https://archive.ubuntu.com/ubuntu",
+  "https://mirrors.edge.kernel.org/ubuntu",
+  "https://mirrors.mit.edu/ubuntu",
+]
+debs = [
+  { package = "musl", version = "1.2.4-2", path = "pool/universe/m/musl/musl_1.2.4-2_amd64.deb", sha256 = "9f0883c20b4b746e05e947bafd99cb933f5494ffaaa6fcd360cbe1fbcf264883" },
+  { package = "musl-dev", version = "1.2.4-2", path = "pool/universe/m/musl/musl-dev_1.2.4-2_amd64.deb", sha256 = "4b451ecb6a0f8469883058cf22a807f3bd9cc16d115cc08b7efc35fe8eb44db2" },
+  { package = "musl-tools", version = "1.2.4-2", path = "pool/universe/m/musl/musl-tools_1.2.4-2_amd64.deb", sha256 = "46c01d212d3eb3a1322693089037f0a5c92383a089d39c392db3c86c19ffb229" },
+]
+
+# mirrors.edge.kernel.org carries no ubuntu-ports, so Arm's other two are MIT's and Berkeley's.
+[arm64]
+mirrors = [
+  "https://ports.ubuntu.com/ubuntu-ports",
+  "https://mirrors.mit.edu/ubuntu-ports",
+  "https://mirrors.ocf.berkeley.edu/ubuntu-ports",
+]
+debs = [
+  { package = "musl", version = "1.2.4-2", path = "pool/universe/m/musl/musl_1.2.4-2_arm64.deb", sha256 = "79a04df7e8f54c74720ad474c04966204c03370654f4a43bec2968e80821e39f" },
+  { package = "musl-dev", version = "1.2.4-2", path = "pool/universe/m/musl/musl-dev_1.2.4-2_arm64.deb", sha256 = "56e4fa8e6fcd2825ca9e262e8807d2038d4a0e91274bd51fce1653b219f5ae92" },
+  { package = "musl-tools", version = "1.2.4-2", path = "pool/universe/m/musl/musl-tools_1.2.4-2_arm64.deb", sha256 = "0ecd1f97fd8cf6727d492c6a7515e44a5a905f5af123fc90f35f954cabc50d60" },
+]

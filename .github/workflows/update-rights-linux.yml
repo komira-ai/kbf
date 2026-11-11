@@ -5,8 +5,8 @@
 # (crates/update-rights/tests/boot_root.rs), and the root part of the updater, the
 # `kbf-updater root` binary, runs a declared hook through the step runner and systemd
 # (crates/kbf-updater/tests/root_part_root.rs). A GitHub-hosted Ubuntu runner has systemd and
-# passwordless sudo; nothing here runs on any other machine. nft and polkit are installed first:
-# a probe that finds one missing fails by name instead of passing.
+# passwordless sudo; nothing here runs on any other machine. The image's nft and polkit are
+# checked first: a probe that finds one missing fails by name instead of passing.
 #
 # Every raw result is uploaded as an artifact (`gh run download`).
 # It runs on a pull request that touches the crate, by hand, and on a push to main.
@@ -51,7 +51,9 @@ jobs:
           persist-credentials: false
       - run: rustup toolchain install
       - run: systemctl --version
-      - run: sudo apt-get install -y --no-install-recommends nftables polkitd
+      # The runner image has nft and polkit; this reads its package database only (no apt, no
+      # network) and fails naming a package the image lacks.
+      - run: dpkg-query --show nftables polkitd
       # The tests, as root: systemd-run of system units, accounts, nft and polkit.
       - run: cargo xtask sudo-test -p update-rights --test rights_root -- --nocapture --test-threads=1
         timeout-minutes: 15

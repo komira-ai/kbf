@@ -43,6 +43,9 @@
 //! - `fetch --url <url> --sha256 <hex> --out <path> [--extract <format> [--member <path>]]`
 //!   ([`fetch`]): a pinned tool, downloaded over HTTPS and refused unless its SHA-256
 //!   matches, before anything is unpacked or written.
+//! - `debs --pins <file> --dir <dir>` ([`debs`]): the Debian packages a CI job installs with `dpkg`, pinned by
+//!   version and SHA-256 in `.github/debs/`: those the actions cache restored into `--dir` when they match, the rest
+//!   downloaded from the pinned mirrors in turn, in bounded rounds, and refused unless the SHA-256 matches.
 //! - `fetch-attested-tool --url <url> --sha256 <hex> --archive <path> --member <path> --out <path> --gh
 //!   <program> --repo <owner/repo> --signer-workflow <path> --source-ref <ref> --source-digest <sha>`
 //!   ([`fetch_attested`]): a pinned release archive, refused unless its SHA-256 matches and `gh attestation
@@ -158,6 +161,7 @@ pub mod bundles;
 pub mod channels;
 pub mod crun_tests;
 pub mod darwin;
+pub mod debs;
 pub mod deploy_farm;
 pub mod entitlements;
 pub mod fetch;
@@ -210,6 +214,8 @@ pub enum Error {
     Refused(Vec<String>),
     #[error(transparent)]
     Fetch(#[from] fetch::Error),
+    #[error(transparent)]
+    Debs(#[from] debs::Error),
     #[error(transparent)]
     Entitlements(#[from] entitlements::Error),
     /// A channels verb (the apt repository, its install check) failed. A usage error of one is
@@ -268,6 +274,8 @@ enum Verb {
     ProveFarm(prove_farm::Args),
     /// Check that the runner's disk has the room the coverage run needs.
     RunnerDisk(runner_disk::Args),
+    /// Make a directory hold exactly the pinned Debian packages of this host's architecture.
+    Debs(debs::Args),
     /// Refuse a binary that has a dynamic loader (`PT_INTERP`) or a needed shared library
     /// (`DT_NEEDED`).
     StaticElf(static_elf::Args),
@@ -1147,6 +1155,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
         Verb::DeployFarm(command) => deploy_farm::run_command(&command),
         Verb::ProveFarm(args) => prove_farm::run(&args),
         Verb::RunnerDisk(args) => runner_disk::run(&args),
+        Verb::Debs(args) => Ok(debs::run(&args)?),
         Verb::StaticElf(args) => static_elf::run(&args),
         Verb::PipelineWatch(args) => pipeline_watch::run(&args),
         Verb::PipelineRerun(args) => pipeline_rerun::run(&args),

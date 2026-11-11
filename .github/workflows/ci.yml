@@ -190,12 +190,30 @@ jobs:
       # glibc and `c_int` on musl), so a glibc-only type compiled on the pull request and broke
       # the release build after the merge. The same musl C compiler as the release job, for ring's
       # build script; `cargo check` does not link. The Arm target has the same libc types.
-      - name: Refresh the package lists for the musl C compiler
+      # musl-tools is pinned by version and SHA-256 in .github/debs/musl-tools.toml: restored
+      # from the actions cache, or fetched from the pinned mirrors (Canonical's and two others)
+      # when the cache missed, checked either way, and installed with dpkg. No apt-get, so an
+      # outage of the Ubuntu archive does not stop the job.
+      - name: Restore the musl-tools packages
         if: ${{ !cancelled() }}
-        run: sudo apt-get update
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: musl-debs
+        with:
+          path: ${{ runner.temp }}/debs/musl-tools
+          key: debs-musl-tools-${{ runner.arch }}-${{ hashFiles('.github/debs/musl-tools.toml') }}
+      - name: Fetch the pinned musl-tools packages
+        if: ${{ !cancelled() }}
+        id: musl-debs-fetch
+        run: cargo xtask debs --pins .github/debs/musl-tools.toml --dir "$RUNNER_TEMP/debs/musl-tools"
+      - name: Save the musl-tools packages
+        if: ${{ !cancelled() && steps.musl-debs-fetch.outcome == 'success' && steps.musl-debs.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/debs/musl-tools
+          key: ${{ steps.musl-debs.outputs.cache-primary-key }}
       - name: Install the musl C compiler ring's build uses for the static target
         if: ${{ !cancelled() }}
-        run: sudo apt-get install --yes --no-install-recommends musl-tools
+        run: sudo dpkg --install --recursive "$RUNNER_TEMP/debs/musl-tools"
       - run: rustup target add x86_64-unknown-linux-musl
         if: ${{ !cancelled() }}
       - name: Check for x86_64-unknown-linux-musl the binary the release builds for the static target
