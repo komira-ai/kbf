@@ -181,6 +181,17 @@ async fn a_failed_run_exits_1_and_the_defaults_are_the_gates() {
         600
     );
     assert!(!table.contains(" seed 0,"), "{table}");
+    let host = kbf_bench::program::Arch::from_name(arch).expect("a machine kbf-bench writes for");
+    let ran = shared.ran.lock().expect("ran").clone();
+    assert!(
+        ran.iter()
+            .all(|r| r.program == kbf_bench::program::noop(host))
+    );
+    assert!(ran.iter().all(|r| r.request.instance_name.is_empty()));
+    assert!(
+        ran.iter().all(|r| r.action.platform.is_none()),
+        "no --platform, no platform"
+    );
 }
 
 /// Catches a run that cannot start exiting other than 2, or without its cause named: an

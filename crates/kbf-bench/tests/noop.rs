@@ -305,12 +305,17 @@ async fn serial_runs_never_overlap_and_the_parallel_window_spans_the_arms() {
     assert_eq!(summary.rows.len(), 2, "no row for a phase of no runs");
 }
 
+fn ms(ms: u64) -> Duration {
+    Duration::from_millis(ms)
+}
+
 fn at(seconds: i64, nanos: i32) -> Option<Timestamp> {
     Some(Timestamp { seconds, nanos })
 }
 
-/// Catches the time measured from anything but the send to the done operation (the first
-/// update, the stream's opening), and a phase of the result's metadata read from the wrong
+/// Catches the time measured from anything but the send to the done operation (the
+/// answer to the call, the first update, which the fake sends 100 ms and 1 s after the
+/// call, or the done operation's own arrival), and a phase of the result's metadata read from the wrong
 /// two stamps, made up when a stamp is missing, negative when they are out of order, or
 /// wrong across a second's boundary; the task's claim not told from a daemon's stamps.
 #[tokio::test(start_paused = true)]
@@ -345,8 +350,8 @@ async fn a_run_records_execute_to_done_and_the_phases_its_result_carries() {
     let shared = Arc::new(Shared::default());
     let a = front::start("a", &shared, Upload::Keep, move |ran| {
         match ran.env[3].as_str() {
-            "0" => Reply::DoneAfter(stamped.clone(), Duration::from_millis(250)),
-            _ => Reply::DoneAfter(reversed.clone(), Duration::from_millis(1_500)),
+            "0" => Reply::DoneAfter(stamped.clone(), ms(100), ms(150)),
+            _ => Reply::DoneAfter(reversed.clone(), ms(1_000), ms(500)),
         }
     });
     let (summary, records, lines) = bench(&plan(2, 0, 1, 1), &[arm("a", a)]).await;

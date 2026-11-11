@@ -63,7 +63,7 @@ pub const ENV: &str = "KBF_BENCH_NOOP";
 pub const PROGRAM: &str = "noop";
 
 /// The most blobs one BatchUpdateBlobs call carries (every blob is a few hundred bytes).
-pub const UPLOAD_BLOBS: usize = 500;
+const UPLOAD_BLOBS: usize = 500;
 
 /// One frontend the runs are sent to.
 #[derive(Clone, Debug)]
@@ -142,8 +142,9 @@ pub struct Record {
     pub exit_code: Option<i32>,
     /// The result's worker, when there is a result.
     pub worker: Option<String>,
-    /// The phase times below are a task's claim (`kbf_proto::task_claim`), not a
-    /// daemon's measurement.
+    /// `input_fetch_ms`, `execution_ms` and `output_upload_ms` are a task's claim
+    /// (`kbf_proto::task_claim`), not a daemon's measurement; `queued_ms` and
+    /// `worker_ms` are the frontend's own times either way.
     pub claimed: bool,
     /// `queued_timestamp` to `worker_start_timestamp`.
     pub queued_ms: Option<f64>,

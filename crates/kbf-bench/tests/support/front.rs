@@ -37,9 +37,9 @@ use tonic::{Request, Response, Status, Streaming};
 pub enum Reply {
     /// A first update, then the done operation carrying this response.
     Done(ExecuteResponse),
-    /// The done operation carrying this response, `after` the first update on the
-    /// runtime's clock.
-    DoneAfter(ExecuteResponse, Duration),
+    /// The call answered `before` the first update, and the done operation carrying
+    /// this response `after` it, on the runtime's clock.
+    DoneAfter(ExecuteResponse, Duration, Duration),
     /// The call refused.
     Refuse(Status),
     /// A first update, then the stream fails.
@@ -231,7 +231,8 @@ impl Execution for Fake {
         let first = || Ok(update(&name));
         let updates: Updates = match (self.script)(&ran) {
             Reply::Done(r) => stream::iter([first(), Ok(done(&name, response(&r)))]).boxed(),
-            Reply::DoneAfter(r, after) => {
+            Reply::DoneAfter(r, before, after) => {
+                tokio::time::sleep(before).await;
                 let last = done(&name, response(&r));
                 stream::iter([first()])
                     .chain(tokio::time::sleep(after).map(|()| Ok(last)).into_stream())
