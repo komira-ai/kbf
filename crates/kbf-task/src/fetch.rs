@@ -363,6 +363,31 @@ pub fn fetch_message<M: Message + Default>(
     decode_message(&bytes, digest)
 }
 
+/// Reads the message blob `digest` names from the file `path` (a file of a tree job's root, not a
+/// download), checks it as a fetched blob is checked (the size bound first, then the length and
+/// SHA-256 as it streams: a longer file is refused at the first byte past the size) and decodes
+/// it as `M`. A mismatch names `path`.
+///
+/// # Errors
+/// The digest names more than [`MAX_MESSAGE_BYTES`] or the bytes do not decode
+/// ([`FetchError::Invalid`]), the file cannot be opened or read ([`FetchError::Io`]), or its
+/// bytes are not the blob ([`FetchError::Mismatch`]).
+pub fn file_message<M: Message + Default>(path: &Path, digest: &Digest) -> Result<M, FetchError> {
+    let bytes = message_bytes(digest, &mut |out| {
+        let mut file = std::fs::File::open(path).map_err(io(path))?;
+        std::io::copy(&mut file, out).map_err(io(path))?;
+        Ok(())
+    })
+    .map_err(|error| match error {
+        FetchError::Mismatch { digest, why } => FetchError::Mismatch {
+            digest,
+            why: format!("{why}, as read from {}", path.display()),
+        },
+        other => other,
+    })?;
+    decode_message(&bytes, digest)
+}
+
 /// `bytes`, a verified blob `digest` names, decoded as `M`.
 fn decode_message<M: Message + Default>(bytes: &[u8], digest: &Digest) -> Result<M, FetchError> {
     M::decode(bytes).map_err(|e| undecodable(digest, &e))

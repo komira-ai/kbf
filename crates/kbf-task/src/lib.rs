@@ -60,6 +60,17 @@
 //!    the store gets after the URL expired is refused (403), which is final, so the task fails
 //!    (exit 13) and nothing is stored.
 //!
+//! # A tree job
+//!
+//! With `--tree` the job's root file system is the action's tree, which the frontend wrote, so
+//! step 1 reads no grant and fetches nothing ([`tree`]): the Action is read from `/.kbf/action`
+//! and checked against `--action` (so a job never runs another action's tree), the Command from
+//! `/.kbf/command` and checked against the Action, and the input root is `/work`, where the
+//! Command runs and its outputs are collected; the task's own run directory, with its stdout,
+//! stderr and `private/`, is `/.kbf-run`, made new. Steps 2 to 5 are the same. The manifest's
+//! advisory `inputs` says `"from":"tree"`, so it is version 2; today's job writes no `inputs`
+//! and its manifest is unchanged.
+//!
 //! `js-agent` returns nothing but an exit code, so the manifest travels inside the pack, and the exit
 //! code says only whether the farm did its part: 0 when the action ran and its pack was stored
 //! (whatever the action's own exit code, which is in the manifest), nonzero when fetching, packing or
@@ -131,6 +142,7 @@ pub mod put;
 pub mod put_urls;
 pub mod run;
 pub mod task;
+pub mod tree;
 
 #[cfg(test)]
 pub(crate) mod fake_http;
