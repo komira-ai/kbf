@@ -93,8 +93,9 @@ fn the_manifest_params_are_required_and_checked() {
     let host = host();
     let state = dir.join("state");
     let file = dir.join("params.toml");
-    let cases: [(&str, &str, bool); 7] = [
+    let cases: [(&str, &str, bool); 8] = [
         ("kbf.service", "storage-and-daemon", true),
+        ("kbf.service", "storage2", true),
         ("-kbf.service", "storage-and-daemon", false),
         ("kbf service", "storage-and-daemon", false),
         ("../x.service", "storage-and-daemon", false),

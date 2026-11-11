@@ -476,6 +476,23 @@ fn rollback_of_a_first_install_stops_the_unit() {
     assert_eq!(rig.host.calls(), ["state"]);
 }
 
+/// On a first install the rollback stops the unit even when it was running before the update
+/// (started by hand from files the package now owns): it never restarts a unit for an install
+/// that has no previous package to run.
+#[test]
+fn rollback_of_a_first_install_stops_a_unit_that_was_running() {
+    let rig = Rig::new(UnitState::Active);
+    rig.write(true);
+    rig.ok("prepare");
+    let record = rig.record().expect("a record");
+    assert!(record.was_active && record.first_install);
+    rig.ok("cutover");
+    rig.host.clear_calls();
+    rig.ok("rollback");
+    assert_eq!(*rig.host.state.borrow(), UnitState::Inactive);
+    assert_eq!(rig.host.calls(), ["state", "stop"]);
+}
+
 /// A unit that was stopped before the update stays stopped after its rollback.
 #[test]
 fn rollback_leaves_a_unit_stopped_that_was_stopped_before() {
@@ -557,6 +574,21 @@ fn cleanup_does_not_finish_a_rolled_back_update() {
         .save(&other)
         .expect("save");
     rig.ok("cleanup");
+    assert!(rig.record().is_some());
+}
+
+/// An update whose `verify` passed and which was rolled back afterwards (a later step failed)
+/// is not cleaned up: `cleanup` refuses and the record stays.
+#[test]
+fn cleanup_refuses_an_update_rolled_back_after_verify() {
+    let rig = Rig::new(UnitState::Active);
+    rig.ok("prepare");
+    rig.ok("cutover");
+    rig.ok("verify");
+    rig.ok("rollback");
+    let record = rig.record().expect("a record");
+    assert!(record.verified && record.rolled_back);
+    rig.fails("cleanup", "not_verified", Class::Release);
     assert!(rig.record().is_some());
 }
 
