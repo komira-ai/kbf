@@ -33,16 +33,18 @@ pub(crate) fn digest(text: &str) -> Digest {
 
 const LEASE: &str = "0000000000000001000000000000002a";
 const ACTION: &str = "33d8589de117bdf22bdc10c48a5908a4bbd88481d54cf7c0c358905e72b79abb/18";
-const A_O: &str = "4b2cb5acb6856c5130b9bf553b2d0ff59552ea5e028f0b4e391b0581db48b71c/17";
-const TOOL: &str = "81e6db07b4376d9a120a55c66f8812633f7733c2699a07cecac0bd363a9ce426/35";
-const STDOUT: &str = "bd6c3301ad961288669682494372379ffe35526bf49c5f4bf3d85eba4bd220ae/14";
-const STDERR: &str = "e5cde090a13f5b74917873ea155e00f8407867c992ab09c2102df7aa50c7d43a/25";
-const TREE: &str = "793526f079189e7aaf35fa52cfdda4139699c8cd80832e8f404e1290b236a848/77";
+pub(crate) const A_O: &str = "4b2cb5acb6856c5130b9bf553b2d0ff59552ea5e028f0b4e391b0581db48b71c/17";
+pub(crate) const TOOL: &str = "81e6db07b4376d9a120a55c66f8812633f7733c2699a07cecac0bd363a9ce426/35";
+pub(crate) const STDOUT: &str =
+    "bd6c3301ad961288669682494372379ffe35526bf49c5f4bf3d85eba4bd220ae/14";
+pub(crate) const STDERR: &str =
+    "e5cde090a13f5b74917873ea155e00f8407867c992ab09c2102df7aa50c7d43a/25";
+pub(crate) const TREE: &str = "793526f079189e7aaf35fa52cfdda4139699c8cd80832e8f404e1290b236a848/77";
 
 /// Sets one timing or usage number.
 type Setter = fn(&mut TaskManifest, u64);
 
-fn base() -> TaskManifest {
+pub(crate) fn base() -> TaskManifest {
     TaskManifest {
         lease: LEASE.to_owned(),
         action: digest(ACTION),
@@ -64,10 +66,11 @@ fn base() -> TaskManifest {
         packs: 1,
         large: Vec::new(),
         inputs: None,
+        objects: None,
     }
 }
 
-fn file(path: &str, text: &str, is_executable: bool) -> OutputFile {
+pub(crate) fn file(path: &str, text: &str, is_executable: bool) -> OutputFile {
     OutputFile {
         path: path.to_owned(),
         digest: digest(text),
@@ -101,7 +104,7 @@ pub(crate) fn golden() -> TaskManifest {
     }
 }
 
-fn parse_fixture(name: &str) -> Result<TaskManifest, ManifestError> {
+pub(crate) fn parse_fixture(name: &str) -> Result<TaskManifest, ManifestError> {
     TaskManifest::parse(&fixture(name))
 }
 
@@ -157,22 +160,6 @@ fn the_empty_digest_is_the_sha256_of_nothing() {
     assert_eq!(EMPTY_DIGEST, sha256(b""));
 }
 
-/// Asserts that a field the contract does not name is refused, in the manifest and in the
-/// timing (`put_ms`: the upload cannot be timed by a record written before it), and a list of
-/// entries (the pack's footer is that list).
-#[test]
-fn a_manifest_with_an_unknown_field_is_refused() {
-    for name in [
-        "invalid/unknown_field_put_ms.json",
-        "invalid/unknown_top_level_field.json",
-    ] {
-        let ManifestError::Json(e) = refusal(name) else {
-            panic!("{name}: not a Json refusal");
-        };
-        assert!(e.to_string().contains("unknown field"), "{name}: {e}");
-    }
-}
-
 /// Asserts that a key given twice is refused, not resolved to one of its values.
 #[test]
 fn a_duplicate_key_is_refused() {
@@ -197,17 +184,27 @@ fn a_missing_or_mistyped_field_or_a_truncated_document_is_refused() {
     }
 }
 
-/// Asserts that a version other than 1 and 2 is refused with the version it names, and that
-/// version 2 without the fields it requires is not read as version 1.
+/// Asserts that a version other than 1, 2 and 3 is refused with the version it names, and that
+/// version 2 or 3 without the fields it requires is not read as version 1.
 #[test]
 fn a_manifest_of_another_version_is_refused() {
     assert!(matches!(
-        refusal("invalid/version_3.json"),
-        ManifestError::Version(3)
+        refusal("invalid/version_4.json"),
+        ManifestError::Version(4)
     ));
     assert!(matches!(
         refusal("invalid/version_2.json"),
-        ManifestError::MissingField("packs")
+        ManifestError::MissingField {
+            version: 2,
+            field: "packs"
+        }
+    ));
+    assert!(matches!(
+        refusal("invalid_v3/missing_objects.json"),
+        ManifestError::MissingField {
+            version: 3,
+            field: "objects"
+        }
     ));
 }
 
@@ -483,12 +480,13 @@ fn the_output_digests_skip_the_empty_file_and_the_action() {
 // Version 2: several packs and large objects.
 
 /// The large cap of the farm: 512 MiB.
-const LARGE_MAX: u64 = 536_870_912;
+pub(crate) const LARGE_MAX: u64 = 536_870_912;
 
-const BIG_1: &str = "1111111111111111111111111111111111111111111111111111111111111111/138847232";
+pub(crate) const BIG_1: &str =
+    "1111111111111111111111111111111111111111111111111111111111111111/138847232";
 const BIG_2: &str = "2222222222222222222222222222222222222222222222222222222222222222/114300000";
 
-fn parse_v2(name: &str) -> Result<TaskManifest, ManifestError> {
+pub(crate) fn parse_v2(name: &str) -> Result<TaskManifest, ManifestError> {
     TaskManifest::parse_with(&fixture(name), LARGE_MAX)
 }
 
@@ -683,18 +681,26 @@ fn a_large_object_no_output_names_is_refused() {
 }
 
 /// Asserts the fields of each version: an unknown field (top level or in a large entry) is
-/// refused, a slot that is not a number is a JSON error, version 1 may not carry `packs` or
-/// `large`, and version 2 must carry both.
+/// skipped, the manifest reading as the one without it, a slot that is not a number is a JSON
+/// error, version 1 may not carry `packs` or `large`, and version 2 must carry both.
 #[test]
 fn the_fields_of_each_version_are_exact() {
-    for name in [
-        "invalid_v2/unknown_field.json",
-        "invalid_v2/unknown_large_field.json",
-    ] {
-        let ManifestError::Json(e) = refusal_v2(name) else {
-            panic!("{name}: not a Json refusal");
-        };
-        assert!(e.to_string().contains("unknown field"), "{name}: {e}");
+    let cases = [
+        (
+            "valid_v2/unknown_field.json",
+            TaskManifest { packs: 2, ..base() },
+        ),
+        (
+            "valid_v2/unknown_large_field.json",
+            TaskManifest {
+                output_files: vec![file("bin/mojo", BIG_1, true)],
+                large: vec![large(0, BIG_1)],
+                ..base()
+            },
+        ),
+    ];
+    for (name, expected) in cases {
+        assert_eq!(parse_v2(name).expect(name), expected, "{name}");
     }
     assert!(matches!(
         refusal_v2("invalid_v2/large_slot_not_a_number.json"),
@@ -702,19 +708,31 @@ fn the_fields_of_each_version_are_exact() {
     ));
     assert!(matches!(
         refusal_v2("invalid_v2/v1_with_packs.json"),
-        ManifestError::UnexpectedField("packs")
+        ManifestError::UnexpectedField {
+            version: 1,
+            field: "packs"
+        }
     ));
     assert!(matches!(
         refusal_v2("invalid_v2/v1_with_large.json"),
-        ManifestError::UnexpectedField("large")
+        ManifestError::UnexpectedField {
+            version: 1,
+            field: "large"
+        }
     ));
     assert!(matches!(
         refusal_v2("invalid_v2/missing_packs.json"),
-        ManifestError::MissingField("packs")
+        ManifestError::MissingField {
+            version: 2,
+            field: "packs"
+        }
     ));
     assert!(matches!(
         refusal_v2("invalid_v2/missing_large.json"),
-        ManifestError::MissingField("large")
+        ManifestError::MissingField {
+            version: 2,
+            field: "large"
+        }
     ));
 }
 
@@ -735,7 +753,7 @@ fn a_bad_large_digest_names_its_position() {
 
 // The advisory `inputs` object.
 
-fn all_inputs() -> InputStats {
+pub(crate) fn all_inputs() -> InputStats {
     InputStats {
         blobs: 19_312,
         files: 19_000,
@@ -756,6 +774,7 @@ fn all_inputs() -> InputStats {
             cache_hit: 3,
             tierstore_direct: 4,
         },
+        from: None,
     }
 }
 
@@ -808,20 +827,6 @@ fn a_manifest_without_inputs_stays_v1() {
     assert_eq!(with.version(), MANIFEST_VERSION_2);
 }
 
-/// Asserts that an unknown field is refused inside `inputs` and inside `bytes_by_source`.
-#[test]
-fn an_unknown_field_inside_inputs_is_refused() {
-    for name in [
-        "invalid_v2/inputs_unknown_field.json",
-        "invalid_v2/inputs_unknown_source_field.json",
-    ] {
-        let ManifestError::Json(e) = refusal_v2(name) else {
-            panic!("{name}: not a Json refusal");
-        };
-        assert!(e.to_string().contains("unknown field"), "{name}: {e}");
-    }
-}
-
 /// Asserts that an `inputs` number over `i64::MAX` is refused with its field name, in `inputs`
 /// and in `bytes_by_source`, and that `i64::MAX` itself is allowed.
 #[test]
@@ -863,7 +868,10 @@ fn an_inputs_number_beyond_i64_is_refused() {
 fn a_v1_manifest_with_inputs_is_refused() {
     assert!(matches!(
         refusal_v2("invalid_v2/v1_with_inputs.json"),
-        ManifestError::UnexpectedField("inputs")
+        ManifestError::UnexpectedField {
+            version: 1,
+            field: "inputs"
+        }
     ));
 }
 

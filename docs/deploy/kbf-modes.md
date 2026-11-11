@@ -126,7 +126,13 @@ as a job of the job scheduler's job service instead. The frontend registers `--e
 virtual workers with its farm, `js:<frontend id>-<n>`, each of `--executor-host-cpus` cores,
 `--executor-host-memory-gib` GiB and `--executor-host-slots` actions at once: that is how many
 actions of which size the farm may have in flight, and the job service decides which host runs
-each job. A job is the kbf image (`--executor-kbf-image`), whose `ENTRYPOINT` is the task tool:
+each job. The nodes' daemons stay connected meanwhile, but the farm places nothing on a Linux
+one: a daemon whose node report says `os=linux` is registered with no driver, so it gets no
+lease of any kind, and its session row lists no driver, so no other frontend of the state store
+counts it either. It is not a cordon and writes no `cordon/` row: an operator's uncordon does not
+lift it, a lease the daemon already held (taken up after the restart into `js-agent`) stays its
+own, and a frontend restarted under `kbf-daemon` places the Linux daemons again with nothing to
+undo. A Mac daemon, or one that reports any other `os`, is placed as before. A job is the kbf image (`--executor-kbf-image`), whose `ENTRYPOINT` is the task tool:
 the job's arguments are the tool's flags and nothing is mounted into the container. It needs the
 cores and memory the farm booked (the memory as the hard cap a daemon would set, 1.5 times the
 booking plus 512 MiB), a host of `os=linux` and `--executor-arch` (default `x86_64`) that runs

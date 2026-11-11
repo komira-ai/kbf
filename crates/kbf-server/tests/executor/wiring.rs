@@ -298,6 +298,7 @@ async fn an_action_runs_end_to_end_through_the_flags_and_the_frontends_own_seams
         packs: 1,
         large: vec![],
         inputs: None,
+        objects: None,
     };
     let pack = write_pack(&manifest, &[]).expect("a pack");
     let object = ObjectKey::new(pack_key).expect("an object key");
