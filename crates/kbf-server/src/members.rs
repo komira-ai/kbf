@@ -129,6 +129,7 @@ use crate::worker::named_protocol;
 
 mod denials;
 pub use denials::Denial;
+use denials::DeniedSnapshot;
 mod assign;
 mod blocked;
 mod facts;
@@ -504,10 +505,10 @@ pub struct Members {
     oldest: u32,
     /// Automatic promotion of joiners ([`Members::with_handoff`]); `None`: by an operator only.
     handoff: Option<Handoff>,
-    /// The `deny/` rows the newest refresh that could read them found, and when (on the
+    /// The `deny/` rows the newest read of them found, and when that read began (on the
     /// process clock): what the worker listener checks callers against without a store
     /// read of its own ([`Members::denied_snapshot`]).
-    denied_seen: Mutex<Option<(Arc<Vec<DenyEntry>>, tokio::time::Instant)>>,
+    denied_seen: Mutex<Option<DeniedSnapshot>>,
 }
 
 impl Members {
@@ -605,10 +606,10 @@ impl Members {
         }))
     }
 
-    /// The deny list as the newest [`Members::refresh`] that could read the `deny/` rows
-    /// found it, and when that was: no store read. `None` before the first such refresh. A
-    /// refresh that fails to read the rows (the store failing, or a corrupt `deny/` row)
-    /// leaves the earlier snapshot, which therefore only ages.
+    /// The deny list as the newest read of the `deny/` rows found it ([`Members::refresh`],
+    /// or `Members::refresh_denied` every beat), and when that read began: no store read.
+    /// `None` before the first. A read that fails (the store failing, or a corrupt `deny/`
+    /// row) leaves the earlier snapshot, which therefore only ages.
     #[must_use]
     pub fn denied_snapshot(&self) -> Option<(Arc<Vec<DenyEntry>>, tokio::time::Instant)> {
         self.denied_seen
@@ -1229,12 +1230,9 @@ impl Members {
             let marks = self.read_marks(current.as_ref())?;
             // A deny written after this read is in the next refresh's map (the sweeper's,
             // within a beat): a row that is not there yet cannot be a precondition.
+            let began = tokio::time::Instant::now();
             let denied = self.denied()?;
-            *self
-                .denied_seen
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner) =
-                Some((Arc::new(denied.clone()), tokio::time::Instant::now()));
+            self.note_denied(denied.clone(), began);
             let floor = next_floor(current.as_ref(), self.oldest);
             let Some(plan) = plan(
                 current.as_ref(),

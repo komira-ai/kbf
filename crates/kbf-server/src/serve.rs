@@ -33,7 +33,7 @@ use crate::blobs::{WorkerBlobs, WorkerCas, WorkerSegments};
 use crate::drain::Drain;
 use crate::farm::{Farm, StateError};
 use crate::grpc_health::{HealthService, WATCH_INTERVAL};
-use crate::health::Readiness;
+use crate::health::{Checks, Readiness};
 use crate::http_blobs::ReadBudget;
 use crate::identity::{DenyList, Peers};
 use crate::listen::Binder;
@@ -473,9 +473,9 @@ pub(crate) fn members_of(
         Some(handoff) => members.with_handoff(handoff),
         None => members,
     });
-    // One refresh before any listener serves, so the worker listener has the deny rows from
-    // its first call and a restart does not bounce every daemon until the sweeper's first
-    // beat. A failure is loud and the start goes on: the sweeper tries again every beat.
+    // One refresh at once, so the map and the deny rows are read before the farm's state is
+    // restored. The rows are read again just before the listeners serve (`deny_rows::denying`).
+    // A failure is loud and the start goes on: the sweeper tries again every beat.
     if let Err(error) = members.refresh() {
         tracing::error!(
             %error,
@@ -549,15 +549,17 @@ fn admitted(peers: &Peers) -> (Admission, Option<DenyList>) {
     }
 }
 
-/// Expires members while the server runs. Never completes; with no state store there
-/// are none, and it waits forever. A function of its own and not generic, so the tests
-/// measure one copy of these lines and not the best of the server's instantiations.
+/// Expires members while the server runs ([`crate::members_rpc::sweep`]), and beside it
+/// reads the deny rows every beat ([`crate::deny_rows::refreshing`]), so a sweep held up by a
+/// write does not age them. Never completes; with no state store there are none, and it
+/// waits forever. A function of its own and not generic, so the tests measure one copy of
+/// these lines and not the best of the server's instantiations.
 ///
 /// Builds the future and does not await it here: a function that awaits a future that
 /// never completes has a closing line no test can reach.
 pub(crate) fn sweeping(members: Option<Arc<Members>>) -> Pin<Box<dyn Future<Output = ()> + Send>> {
     match members {
-        Some(members) => Box::pin(crate::members_rpc::sweep(members)),
+        Some(members) => crate::deny_rows::beside_sweep(members),
         None => Box::pin(std::future::pending()),
     }
 }
@@ -846,7 +848,7 @@ where
         proxy.as_ref(),
     );
     // The rows a revocation writes, beside the file: a revoked daemon is refused here.
-    let peers = peers.with_denied_rows(members.clone());
+    let peers = crate::deny_rows::denying(peers, members.as_ref());
     let tls_sources: Vec<TlsSource> = listeners
         .reapi_tls
         .iter()
@@ -867,8 +869,8 @@ where
     let (closer, closing) = kbf_front::closing();
     let (drain, goaway) = Drain::new(closer, Arc::clone(&readiness));
     let drain = Arc::new(drain);
-    let checks =
-        crate::health::cache_checks(Arc::clone(&cache), Arc::clone(&readiness), probe_timeout);
+    let checks = Checks::of_cache(Arc::clone(&cache), Arc::clone(&readiness), probe_timeout);
+    let checks = Arc::new(crate::deny_rows::probing(checks, &peers));
     let reads = crate::ui_mount::Reads {
         cache: Arc::clone(&cache),
         recorder: recorder.clone(),

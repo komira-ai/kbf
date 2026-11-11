@@ -10,7 +10,8 @@
 //! long way off:
 //!
 //! - the membership sweeper, every beat (a third of the member ttl): `map`, `member/` and
-//!   last `deny/`.
+//!   last `deny/`;
+//! - beside it, the read of the deny rows alone, every beat: `deny/`.
 //!
 //! The server reads `update/desired` by itself no more: only a handler does.
 //!
@@ -26,7 +27,8 @@ use std::time::Duration;
 use crate::hooked::Hooked;
 
 /// The counts of the reads of `update/desired` and of `deny/`: the last of the sweeper's
-/// refresh is the one of `deny/`. A test names the numbers it waits for.
+/// refresh is the one of `deny/`, and the deny rows' own beat reads only `deny/`. A test names
+/// the numbers it waits for.
 pub struct Looks {
     desired: Arc<AtomicUsize>,
     deny: Arc<AtomicUsize>,

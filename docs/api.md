@@ -1098,8 +1098,12 @@ a revoked node's `Hello`, and its `Heartbeat`, `Result`, `NodeStatus`, `MapReque
 `UpdateStatus` on an open stream, its REAPI worker calls and its blob calls are refused
 `PERMISSION_DENIED`, and its open stream ends at its next message (a heartbeat at the latest).
 The revoke refreshes that copy before it answers, so the worker listener and storage follow at
-once, and the membership sweeper refreshes it every beat (a third of `ttl`), so a row written
-by another frontend is seen within one sweep.
+once, and the membership sweeper reads the rows again every beat (a third of `ttl`), so a row
+written by another frontend is seen within one sweep. That read is a read of the rows alone, apart
+from the sweeper's writes (the map's update and the reap of expired rows): every write of the
+state store waits its turn behind the writes of every frontend of the store, and a frontend that
+is starting can hold that turn for a while, so a read that waited behind them would age the copy
+on the frontends that are not restarting.
 
 **When the rows cannot be read.** A refresh that fails (the store down for a moment) leaves the
 last copy in use for three sweeps (`DENY_SNAPSHOT_SWEEPS` beats): callers it denied stay denied
@@ -1111,9 +1115,12 @@ and the log says `membership refresh` failed. Repair: read the key from the log 
 `deny/` rows in the state store, delete the bad row (or re-add the entry with
 `POST /v1/denied`, after deleting it), and the next sweep readmits everyone not denied. If the refresh that follows a revoke fails, the failure is logged and the revoke still
 answers; the worker listener then enforces it from the next successful sweep, within one beat.
-A deny written by another frontend is seen within one sweep. A frontend refreshes once before
-it serves, so a restart does not refuse daemons until the first sweep; if that refresh fails
-it logs an error and starts, and the rule above applies.
+A deny written by another frontend is seen within one sweep. A frontend reads the rows just
+before it serves (after the slow steps of its start, such as restoring the farm's state), so a
+restart does not refuse daemons until the first sweep; if that read fails it logs an error and
+starts, and the rule above applies. While the copy cannot be used (before that first read, or
+when it is older than three sweeps) `/readyz` fails its `deny_rows` check, and a frontend under
+systemd does not send `READY=1`.
 A revoked node no longer keeps working until its certificate expires. Taking its rows off the
 deny list (`DELETE /v1/denied?entry=...`, one call per entry the revoke listed) readmits the
 node, but a revoked node's id is burned for enrollment. Behind `--proxy-auth-file` only the
@@ -1474,6 +1481,7 @@ otherwise; the body lists each failing check and why:
 | `stopping` | the server has received SIGTERM or SIGINT, or `POST /v1/frontend/drain` has begun a drain, or `POST /v1/frontend/retire` has retired the frontend. It answers `503` from that moment, and for the rest of the drain; open Execute streams are kept until their action is done, and only the shutdown timeout (`--shutdown-timeout-secs`) or a second signal ends them (`--drain-deadline`, on a frontend over a state store, only reports); the one exception is a stream whose operation was never started, that no worker on this frontend can run and that no other frontend can take, which ends `UNAVAILABLE` when the drain begins |
 | `leader` | the server does not hold the scheduler role. A single server runs every role and always holds it; the check is there for a replicated control log, whose followers fail it. **Planned**: a second readiness path, without this check, for the servers that may serve reads ([deployment-topology.md](design/deployment-topology.md#build-clients-one-name-routed-by-method)) |
 | `store` | the object store does not answer a one-byte read of the key `<prefix>readyz-probe` within `--readyz-store-timeout-ms` (default 2000; it bounds the gRPC health service's probe too), or answers with an error. The probe only reads: no poll writes, deletes or lists. Nothing writes that key, so "not found" is the expected answer and passes, as does the object's bytes or a range past its end |
+| `deny_rows` | only where the worker listener checks callers against the state store's deny rows (worker mTLS or `--proxy-auth-file`, with `--state-store`): the listener's copy of the rows cannot be used, because no read has found them since the start or the newest is older than three sweeps (`DENY_SNAPSHOT_SWEEPS` beats), so the listener refuses every call `UNAVAILABLE` ("When the rows cannot be read", in the enrollment section above). It reads no store |
 
 `version` and `commit` are those of `GET /v1/nodes`' `server` field. Each `/readyz`
 makes one read of the store, so poll it at the interval the front needs, not faster.

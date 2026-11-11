@@ -924,13 +924,13 @@ impl<'a> Prepared<'a> {
         )?;
         let janitor_metrics = janitor.as_ref().map(Janitor::metrics);
         let janitor_sweeps = janitor_metrics.as_ref().map(|metrics| metrics.finished());
-        let checks = Arc::new(checks(
+        let checks = checks(
             Arc::clone(&readiness),
             storage.clone(),
             routed.clone(),
             state_store.clone(),
             timeout,
-        ));
+        );
         let backend = match &routed {
             Some(routed) => Backend::routed_over(Arc::clone(routed), storage, packs.clone()),
             None => Backend::remote_over(storage, packs.clone()),
@@ -972,8 +972,10 @@ impl<'a> Prepared<'a> {
             listeners.worker_tls,
             proxy.as_ref(),
         );
-        // The rows a revocation writes, beside the file: a revoked daemon is refused here.
-        let peers = peers.with_denied_rows(members.clone());
+        // The rows a revocation writes, beside the file: a revoked daemon is refused here,
+        // read again now that the slow steps of the start are done; `/readyz` waits for them.
+        let peers = crate::deny_rows::denying(peers, members.as_ref());
+        let checks = Arc::new(crate::deny_rows::probing(checks, &peers));
         let mut tls_sources: Vec<TlsSource> = listeners
             .reapi_tls
             .iter()

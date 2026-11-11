@@ -49,10 +49,13 @@
 //! rows at every check as well ([`Peers::with_denied_rows`]), and refuses what either the
 //! file or the rows name, with the same matchers. The rows are the membership's in-memory
 //! snapshot (no store read per check), as fresh as its newest refresh: a revoke and
-//! `POST /v1/denied` refresh before they answer, and the sweeper every beat. A refresh that
+//! `POST /v1/denied` refresh before they answer, a start reads them again just before its
+//! listeners serve, and beside the sweeper a read of the rows alone runs every beat
+//! (`Members::refresh_denied`, `crate::deny_rows`), which waits on no write of the sweeper's
+//! (the map's compare-and-set, the reap) and so on no transaction of another frontend. A refresh that
 //! fails keeps the earlier snapshot in use for [`DENY_SNAPSHOT_SWEEPS`] beats; after that, or
 //! before any refresh has read the rows, every check is refused UNAVAILABLE (fail closed), as
-//! an unusable file does. A corrupt `deny/` row makes every refresh fail, so it ends in that
+//! an unusable file does, and the frontend's `/readyz` fails its `deny_rows` check. A corrupt `deny/` row makes every refresh fail, so it ends in that
 //! state until the row is repaired (see `docs/api.md`). A revoked daemon's stream therefore
 //! ends at its next message, and its blob calls are refused from the next call.
 //! Both are compared with a certificate through the one reader,
@@ -205,7 +208,7 @@ pub enum Peers {
 }
 
 /// How many membership sweeps old the deny list a refresh last read may be and still be
-/// used. The sweeper refreshes every beat ([`crate::members_rpc::sweep`]), so a refresh or
+/// used. The sweeper reads the rows every beat (`crate::serve::sweeping`), so a refresh or
 /// two that fail (a store hiccup) change nothing, and one that keeps failing (the store
 /// down, or a corrupt `deny/` row) refuses every caller after this many.
 pub const DENY_SNAPSHOT_SWEEPS: u32 = 3;
@@ -213,7 +216,7 @@ pub const DENY_SNAPSHOT_SWEEPS: u32 = 3;
 /// The `deny/` rows of the state store as the membership's newest refresh read them
 /// ([`Members::denied_snapshot`]): checked from memory at every call, never by a store read
 /// of its own. A revoke and `POST /v1/denied` refresh before they answer, and the sweeper
-/// refreshes every beat.
+/// reads the rows every beat (`Members::refresh_denied`).
 #[derive(Clone)]
 pub struct DeniedRows {
     members: Arc<Members>,
@@ -236,20 +239,31 @@ impl DeniedRows {
     /// [`DENY_SNAPSHOT_SWEEPS`] beats: nobody is admitted on a list that may be out of date.
     /// The text is fixed: the store's own error is not for a node.
     fn current(&self) -> Result<Denied, Status> {
-        let unusable = |why: &str| {
-            tracing::error!(
-                why,
-                "the deny rows refuse every check until a refresh reads them"
-            );
-            Status::unavailable("the server's denied nodes could not be read")
-        };
+        self.usable()
+            .map(|rows| Denied::from_entries(rows.as_ref().clone()))
+            .map_err(|why| {
+                tracing::error!(
+                    why,
+                    "the deny rows refuse every check until a refresh reads them"
+                );
+                Status::unavailable("the server's denied nodes could not be read")
+            })
+    }
+
+    /// The rows of the newest refresh that read them, if a check may use them: the one rule
+    /// of [`DeniedRows::current`] and of the frontend's `deny_rows` readiness check.
+    ///
+    /// # Errors
+    /// Why not: no refresh has read them yet, or the newest is older than
+    /// [`DENY_SNAPSHOT_SWEEPS`] beats.
+    pub(crate) fn usable(&self) -> Result<Arc<Vec<DenyEntry>>, &'static str> {
         let Some((rows, at)) = self.members.denied_snapshot() else {
-            return Err(unusable("no refresh has read them yet"));
+            return Err("no refresh has read them yet");
         };
         if at.elapsed() > self.max_age {
-            return Err(unusable("the newest refresh that read them is too old"));
+            return Err("the newest refresh that read them is too old");
         }
-        Ok(Denied::from_entries(rows.as_ref().clone()))
+        Ok(rows)
     }
 }
 
@@ -271,6 +285,14 @@ impl Peers {
                 denied_rows: Some(DeniedRows::new(members)),
             },
             (peers, _) => peers,
+        }
+    }
+
+    /// The `deny/` rows these peers check every caller against, if they check them.
+    pub(crate) fn denied_rows(&self) -> Option<&DeniedRows> {
+        match self {
+            Self::Certified { denied_rows, .. } => denied_rows.as_ref(),
+            Self::Unauthenticated => None,
         }
     }
 

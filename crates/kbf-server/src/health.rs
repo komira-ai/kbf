@@ -37,7 +37,9 @@
 //!
 //! The checks beyond the flags are [`Probe`]s, each with a name and a bounded wait: the
 //! server's is its object store, a frontend's ([`crate::frontend`]) are its storage
-//! node, its state store and the storage map.
+//! node, its state store and the storage map. Where the worker listener checks callers
+//! against the state store's deny rows, either has one more, `deny_rows`: the listener's copy
+//! of them is one it may use (`crate::deny_rows`).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -152,7 +154,7 @@ impl Readiness {
 #[derive(Serialize)]
 pub struct Failing {
     /// `stopping`, `leader`, `no_worker` (`/readyz/reapi` only), or the name of a probe (`store`; a frontend's `storage`,
-    /// `state_store` and `map`).
+    /// `state_store` and `map`; `deny_rows` where the worker listener checks the deny rows).
     pub check: &'static str,
     /// Why it fails.
     pub reason: String,

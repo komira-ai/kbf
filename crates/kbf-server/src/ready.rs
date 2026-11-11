@@ -18,7 +18,7 @@ const LOOK: Duration = Duration::from_millis(100);
 const NOT_AWAITED: &[&str] = &["storage"];
 
 /// What a frontend does once it serves: wait for its other probes (the state store, the
-/// map) to pass, not the storage node ([`NOT_AWAITED`]), then send `READY=1` to the service
+/// map, the deny rows) to pass, not the storage node ([`NOT_AWAITED`]), then send `READY=1` to the service
 /// manager.
 pub(crate) struct Ready {
     pub checks: Arc<Checks>,
