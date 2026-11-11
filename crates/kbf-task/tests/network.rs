@@ -61,6 +61,8 @@ async fn probe_run(name: &str, network: Network, args: &[&str]) -> (Ran, String)
             deadline: Duration::from_secs(60),
             network,
             unreadable: &[],
+            hidden: &[],
+            relay: None,
         },
     )
     .await
@@ -504,7 +506,7 @@ async fn under(name: &str, deny: &str, protect: &str, args: &[&str]) -> (TestDir
     let dir = scratch(name);
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_run_under"))
         .arg(dir.join("work"))
-        .args([deny, protect, probe()])
+        .args([deny, protect, env!("CARGO_BIN_EXE_kbf-task"), probe()])
         .args(args)
         .output()
         .expect("run_under starts");
@@ -540,7 +542,7 @@ async fn a_filter_that_cannot_be_installed_fails_the_run_and_the_command_never_r
 
 /// Catches: a namespace step that fails failing the run, or the Command then running without the
 /// filter: with `unshare` refused the Command still runs, under the filter alone, and the
-/// layers say so.
+/// layers and the sandbox say so.
 #[tokio::test]
 async fn a_namespace_that_cannot_be_made_leaves_the_filter_and_says_so() {
     let marker_dir = scratch("unshare-marker");
@@ -554,7 +556,7 @@ async fn a_namespace_that_cannot_be_made_leaves_the_filter_and_says_so() {
     .await;
     assert_eq!(
         text,
-        "layers=seccomp only, no inet (netns: unshare 1)\nexit=0\n"
+        "layers=seccomp only, no inet (netns: unshare 1)\nsandbox=incomplete (unshare 1)\nexit=0\n"
     );
     assert!(marker.exists());
     for (n, mode) in ["inet", "inet6", "tcp-loopback", "netlink"]
@@ -567,6 +569,46 @@ async fn a_namespace_that_cannot_be_made_leaves_the_filter_and_says_so() {
             "{mode}: {text}"
         );
     }
+}
+
+/// Catches: a refused mount failing the run, or taking the network namespace with it: with
+/// `mount` refused by an outer filter the Command still runs, and the sandbox line names the
+/// step the host refused. Where the namespace steps succeed (or, for root, are not made) that is
+/// the first mount step, `private`, and the network layer is whole; where the host refuses one of
+/// them first (an unprivileged user namespace without its capabilities), that step is named.
+#[tokio::test]
+async fn a_refused_mount_leaves_the_run_and_the_network_layer_and_says_so() {
+    let marker_dir = scratch("mount-marker");
+    let marker = marker_dir.join("marker");
+    let (_, text) = under(
+        "mount",
+        "mount",
+        "no",
+        &["touch", marker.to_str().expect("utf-8")],
+    )
+    .await;
+    assert!(text.ends_with("exit=0\n"), "{text}");
+    assert!(marker.exists(), "the Command did not run: {text}");
+    // Root makes no user namespace, so its first refused step is the mount too.
+    let namespaces_made = text.starts_with("layers=netns (loopback only) + seccomp\n")
+        || text.starts_with("layers=seccomp only, no inet (netns: skipped for uid 0)\n");
+    if namespaces_made {
+        assert!(text.contains("sandbox=incomplete (private 1)\n"), "{text}");
+    } else {
+        eprintln!("this host refuses a namespace step first: {text}");
+        assert!(text.contains("sandbox=incomplete ("), "{text}");
+        assert!(!text.contains("sandbox=incomplete (private"), "{text}");
+    }
+}
+
+/// Catches: a Command a signal ended reported as anything but 128 plus the signal where the run
+/// made no PID namespace, so the signal reaches the tool as itself rather than as an exit code
+/// of the namespace's first process.
+#[tokio::test]
+async fn without_a_namespace_a_signal_is_reported_as_128_plus_its_number() {
+    let (_, text) = under("unshare-signal", "unshare", "no", &["signal"]).await;
+    assert!(text.contains("sandbox=incomplete (unshare 1)\n"), "{text}");
+    assert!(text.ends_with("exit=143\n"), "{text}");
 }
 
 /// Catches: the tool being open to the Command that runs beside it as the same user: the process

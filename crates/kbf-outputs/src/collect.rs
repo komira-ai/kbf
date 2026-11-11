@@ -5,7 +5,11 @@
 //! directory, or any directory on an output's path, with a symlink to a host path
 //! (`rm -rf d; ln -s /host/dir d`, output `d/key.pem`). So no output is read by path.
 //! The root is opened once, and every component below it, the working directory's
-//! included, is opened relative to its parent's descriptor with `O_NOFOLLOW`. A
+//! included, is opened relative to its parent's descriptor with `O_NOFOLLOW`, and on
+//! Linux with `openat2` and `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS |
+//! RESOLVE_NO_MAGICLINKS`, so the kernel itself refuses a symlink, a magic link or a
+//! way out of the parent, `..` included ([`open_in`]; where the kernel has no `openat2` or a
+//! system call filter refuses it, `openat` alone). A
 //! component on the way that is absent, a file or a symlink means the action did not
 //! create the output there, and the output is left out. The last component is examined
 //! with `AT_SYMLINK_NOFOLLOW`: a symlink is recorded as one, never dereferenced, and a
@@ -247,12 +251,50 @@ async fn blocking<T: Send + 'static>(
         .map_err(io)
 }
 
+/// Opens `name` (one component) in `dir` with `flags`, which hold `O_NOFOLLOW`: by
+/// `openat2` refusing any symlink, any magic link and any way out of `dir` (Linux 5.6 and
+/// later), or by `openat` where that call does not exist or is refused (`ENOSYS`: an older
+/// kernel or a system other than Linux; `ENOSYS` or `EPERM`: a system call filter that does not
+/// know it; neither is an answer `openat2` gives to an open of a name), where
+/// `O_NOFOLLOW` on the one component refuses a symlink just the same.
+fn open_in(dir: &OwnedFd, name: &OsStr, flags: OFlags) -> rustix::io::Result<OwnedFd> {
+    open_with(beneath, dir, name, flags)
+}
+
+/// [`open_in`] with the first way to open a parameter, so the fallback can be tried.
+fn open_with(
+    first: fn(&OwnedFd, &OsStr, OFlags) -> rustix::io::Result<OwnedFd>,
+    dir: &OwnedFd,
+    name: &OsStr,
+    flags: OFlags,
+) -> rustix::io::Result<OwnedFd> {
+    match first(dir, name, flags) {
+        // EPERM: a container's system call filter older than the call refuses it so.
+        Err(Errno::NOSYS | Errno::PERM) => rustix::fs::openat(dir, name, flags, Mode::empty()),
+        done => done,
+    }
+}
+
+/// `openat2` with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS`.
+#[cfg(target_os = "linux")]
+fn beneath(dir: &OwnedFd, name: &OsStr, flags: OFlags) -> rustix::io::Result<OwnedFd> {
+    use rustix::fs::ResolveFlags;
+    let resolve = ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS;
+    rustix::fs::openat2(dir, name, flags, Mode::empty(), resolve)
+}
+
+/// No `openat2` on this system: [`open_with`] falls back to `openat`.
+#[cfg(not(target_os = "linux"))]
+fn beneath(_dir: &OwnedFd, _name: &OsStr, _flags: OFlags) -> rustix::io::Result<OwnedFd> {
+    Err(Errno::NOSYS)
+}
+
 /// Opens each of `parts` below `start` as a directory. `None` when one is absent, a
 /// file or a symlink.
 fn descend(start: &OwnedFd, parts: &[String]) -> std::io::Result<Option<OwnedFd>> {
     let mut here = start.as_fd().try_clone_to_owned()?;
     for part in parts {
-        here = match rustix::fs::openat(&here, part.as_str(), DIRECTORY, Mode::empty()) {
+        here = match open_in(&here, OsStr::new(part), DIRECTORY) {
             Ok(fd) => fd,
             // ELOOP: a symlink stands there; ENOTDIR: a file (or, on some kernels, a
             // symlink under O_DIRECTORY).
@@ -277,7 +319,7 @@ fn examine(dir: &OwnedFd, name: &OsStr) -> std::io::Result<Option<Kind>> {
 /// checked again on the open descriptor: an entry that stopped being a regular file
 /// after it was examined is an error, never read.
 fn read_file(dir: &OwnedFd, name: &OsStr, max: u64) -> std::io::Result<Option<(Blob, bool)>> {
-    let fd = rustix::fs::openat(dir, name, FILE, Mode::empty())?;
+    let fd = open_in(dir, name, FILE)?;
     let Kind::File { executable } = kind(&rustix::fs::fstat(&fd)?) else {
         return Err(std::io::Error::other(
             "is no longer a regular file once opened",
@@ -376,14 +418,14 @@ fn open_listed(
     name: &OsStr,
     max: u64,
 ) -> std::io::Result<(OwnedFd, Identity, Vec<Entry>)> {
-    let fd = rustix::fs::openat(dir, name, DIRECTORY, Mode::empty())?;
+    let fd = open_in(dir, name, DIRECTORY)?;
     let id = identity(&fd)?;
     let entries = list(&fd, max)?;
     Ok((fd, id, entries))
 }
 
 /// Opens the parent of `dir` through its `..`, refusing any directory but `expected`:
-/// the walk goes back only where it came from.
+/// the walk goes back only where it came from. (Not [`open_in`], which refuses `..`.)
 fn back_to_parent(dir: &OwnedFd, expected: Identity) -> std::io::Result<OwnedFd> {
     let fd = rustix::fs::openat(dir, "..", DIRECTORY, Mode::empty())?;
     if identity(&fd)? != expected {
@@ -803,6 +845,60 @@ mod tests {
         assert!(
             why.to_string().contains("parent directory was replaced"),
             "{why}"
+        );
+    }
+
+    /// Catches a component opened in a way that follows a symlink or climbs out of its
+    /// directory: a symlink in its place is refused (as a directory and as a file), and on
+    /// Linux, where the kernel resolves beneath the directory, so is `..`.
+    #[test]
+    fn a_component_is_opened_beneath_its_directory_without_a_symlink() {
+        let dir = scratch("beneath");
+        std::fs::create_dir(dir.join("sub")).expect("mkdir");
+        std::fs::write(dir.join("file"), b"x").expect("write");
+        std::os::unix::fs::symlink("sub", dir.join("link")).expect("symlink");
+        std::os::unix::fs::symlink("file", dir.join("file-link")).expect("symlink");
+        let fd = open(&dir);
+        assert!(open_in(&fd, OsStr::new("sub"), DIRECTORY).is_ok());
+        assert!(open_in(&fd, OsStr::new("file"), FILE).is_ok());
+        let why = open_in(&fd, OsStr::new("link"), DIRECTORY).expect_err("a symlink");
+        assert!(matches!(why, Errno::LOOP | Errno::NOTDIR), "{why}");
+        let why = open_in(&fd, OsStr::new("file-link"), FILE).expect_err("a symlink");
+        assert_eq!(why, Errno::LOOP);
+        let sub = open_in(&fd, OsStr::new("sub"), DIRECTORY).expect("sub");
+        let up = open_in(&sub, OsStr::new(".."), DIRECTORY);
+        if cfg!(target_os = "linux") {
+            assert_eq!(up.expect_err("out of the directory"), Errno::XDEV);
+        } else {
+            assert!(up.is_ok());
+        }
+    }
+
+    /// Catches the walk failing where the kernel has no `openat2` or a system call filter
+    /// refuses it (`ENOSYS`, `EPERM`), or falling back for any other error: those two open with
+    /// `openat`, which still refuses a symlink; any other error is the error.
+    #[test]
+    fn without_openat2_a_component_is_opened_with_openat_and_o_nofollow() {
+        let dir = scratch("fallback");
+        std::fs::write(dir.join("file"), b"x").expect("write");
+        std::os::unix::fs::symlink("file", dir.join("link")).expect("symlink");
+        let fd = open(&dir);
+        let missing = |_: &OwnedFd, _: &OsStr, _: OFlags| Err(Errno::NOSYS);
+        let filtered = |_: &OwnedFd, _: &OsStr, _: OFlags| Err(Errno::PERM);
+        let refused = |_: &OwnedFd, _: &OsStr, _: OFlags| Err(Errno::ACCESS);
+        assert!(open_with(missing, &fd, OsStr::new("file"), FILE).is_ok());
+        assert!(open_with(filtered, &fd, OsStr::new("file"), FILE).is_ok());
+        assert_eq!(
+            open_with(filtered, &fd, OsStr::new("link"), FILE).expect_err("a symlink"),
+            Errno::LOOP
+        );
+        assert_eq!(
+            open_with(missing, &fd, OsStr::new("link"), FILE).expect_err("a symlink"),
+            Errno::LOOP
+        );
+        assert_eq!(
+            open_with(refused, &fd, OsStr::new("file"), FILE).expect_err("refused"),
+            Errno::ACCESS
         );
     }
 

@@ -33,13 +33,13 @@
 //! | `probe loopback:` | `ok` when a TCP bind, connect and accept on `127.0.0.1` worked; `FAIL` with the errno; `n/a` when the namespace path did not run |
 //! | `probe inet_unreachable:` | `ok ENETUNREACH (101) (netns)` when a connect to `192.0.2.1` (RFC 5737) failed that way; on the fallback, `ok EPERM (1) (strict filter)`; `FAIL` for any other result, a connect that worked included |
 //! | `probe netlink:`, `probe packet:`, `probe io_uring:` | `ok EPERM (1)` when `socket(AF_NETLINK)`, `socket(AF_PACKET)` or `io_uring_setup` was refused with the errno the filter answers (`EPERM`); `FAIL` when the call worked, or was refused with another errno (`refused, not by the filter: <errno>`). `packet` proves the filter only when the Command holds `CAP_NET_RAW` (bit 13 of its `cap_eff`): without it the kernel refuses `AF_PACKET` with `EPERM` anyway, and the line is `ok EPERM (1) (no CAP_NET_RAW: not a filter proof)`. `io_uring` proves it only when `/proc/sys/kernel/io_uring_disabled` is not 1 or 2; otherwise `ok <errno> (io_uring_disabled=<n>: not a filter proof)`. A line that is not a proof never fails on the errno (a call that worked still fails) |
-//! | `probe secret_path:` | `ok readable`, `ok not readable (<errno>)`, `FAIL` when the path does not exist (the question is unanswered), `n/a` without `--probe-secret-path`. Neither answer fails the probe: the design accepts a readable path |
+//! | `probe secret_path:` | `ok readable`, `ok not readable (<errno>)`, `ok not readable (ENOENT (2): hidden from the Command)` when the probe sees the path and the Command does not (its sandbox covers it), `FAIL` when the path does not exist for the probe either (the question is unanswered), `n/a` without `--probe-secret-path`. Neither answer fails the probe: the design accepts a readable path |
+//! | `probe sandbox:` | `ok` with the text of the sandbox line `kbf-task` prints for an action (`mount and pid namespaces`, or `incomplete (<step> <errno>)`), `n/a absent` when the Command did not start ([`crate::sandbox`]) |
 //! | `probe apparmor_restrict_unprivileged_userns:`, `probe max_user_namespaces:`, `probe io_uring_disabled:` | `ok <value>` of `/proc/sys/kernel/apparmor_restrict_unprivileged_userns`, `/proc/sys/user/max_user_namespaces` and `/proc/sys/kernel/io_uring_disabled`, or `n/a absent` |
 //! | `probe euid:`, `probe uid_map:`, `probe gid_map:`, `probe cap_eff:` | the probe process itself (the container's user): effective uid, the maps (entries joined with `;`) and the effective capability mask |
 //! | `probe child_uid_map:`, `probe child_gid_map:`, `probe child_cap_eff:` | the same, read by the Command inside the namespace the confinement made |
 //!
-//! The lines from `apparmor_restrict_unprivileged_userns` on are facts: they are `ok` or `n/a`
-//! and never fail the probe.
+//! The lines from `sandbox` on are facts: they are `ok` or `n/a` and never fail the probe.
 //!
 //! # The verdict
 //!
@@ -93,6 +93,7 @@ const REQUIRED: [&str; 6] = [
 ///
 /// Built with clap's builder, not its derive: the code the derive expands to has branches no
 /// test of this crate reaches (the coverage gate counts them), and there are four flags.
+#[derive(Clone)]
 pub struct ProbeCli {
     /// Run the probe.
     pub probe_confinement: bool,
@@ -102,6 +103,9 @@ pub struct ProbeCli {
     pub probe_secret_path: Option<PathBuf>,
     /// Where the scratch directory is made; the system temporary directory by default.
     pub probe_work_dir: Option<PathBuf>,
+    /// Not a flag: the binary whose relay starts the Command, as an action's
+    /// ([`crate::task::Cli::relay`]); set by the binary's own start ([`run_cli_with`]).
+    pub relay: Option<PathBuf>,
 }
 
 impl ProbeCli {
@@ -161,6 +165,7 @@ impl ProbeCli {
             probe_confinement_child: found.get_flag("probe_confinement_child"),
             probe_secret_path: found.get_one::<PathBuf>("probe_secret_path").cloned(),
             probe_work_dir: found.get_one::<PathBuf>("probe_work_dir").cloned(),
+            relay: None,
         }
     }
 }
@@ -392,6 +397,17 @@ fn secret(path: Option<&Path>, seen: Option<&String>) -> Check {
         (None, ..) => Check::new("secret_path", Status::Na, "no --probe-secret-path"),
         (Some(_), None, _) => missing("secret_path"),
         (Some(_), Some("readable"), _) => Check::new("secret_path", Status::Ok, "readable"),
+        (Some(path), _, Some(errno)) if is_absent(errno) && path.symlink_metadata().is_ok() => {
+            // There for the probe, absent for the Command: its sandbox hides it.
+            Check::new(
+                "secret_path",
+                Status::Ok,
+                format!(
+                    "not readable ({}: hidden from the Command)",
+                    errno_name(errno)
+                ),
+            )
+        }
         (Some(_), _, Some(errno)) => Check::new(
             "secret_path",
             choose(is_absent(errno), Status::Ok, Status::Fail),
@@ -597,6 +613,7 @@ async fn run_confined(
     argv: Vec<String>,
     deadline: Duration,
     secret_path: Option<&Path>,
+    relay: Option<&Path>,
 ) -> Vec<Check> {
     let command = Command {
         arguments: argv,
@@ -613,6 +630,9 @@ async fn run_confined(
             deadline,
             network: Network::Denied,
             unreadable: &[],
+            // An action's Command does not see the job's grants; nor does the probe's.
+            hidden: &[PathBuf::from(crate::sandbox::GRANTS_DIR)],
+            relay,
         },
     )
     .await;
@@ -637,6 +657,7 @@ fn after_run(ran: Result<Ran, RunError>, stdout: &str, secret_path: Option<&Path
                 .then(|| "timed out".to_owned())
                 .map_or(Ok(ran.exit_code), Err);
             let mut checks = evaluate(&ran.layers, ended, &observed, secret_path);
+            checks.push(fact("sandbox", Some(ran.sandbox.to_string())));
             checks.extend(facts(&observed));
             checks
         }
@@ -652,6 +673,7 @@ fn evaluate_failed(error: String, secret_path: Option<&Path>) -> Vec<Check> {
         &BTreeMap::new(),
         secret_path,
     );
+    checks.push(fact("sandbox", None));
     checks.extend(facts(&BTreeMap::new()));
     checks
 }
@@ -677,6 +699,7 @@ pub fn run_probe(cli: &ProbeCli) -> ExitCode {
                     child_argv(secret_path),
                     Duration::from_secs(60),
                     secret_path,
+                    cli.relay.as_deref(),
                 ));
                 // Best effort: a leftover directory in a job's scratch is harmless.
                 let _ = std::fs::remove_dir_all(&dir);
@@ -701,8 +724,23 @@ pub fn run_cli_with(protection: std::io::Result<()>, cli: &ProbeCli) -> ExitCode
             eprintln!("kbf-task: cannot make this process non-dumpable: {e}");
             ExitCode::from(crate::task::EXIT_SETUP)
         },
-        |()| sides[usize::from(cli.probe_confinement_child)](cli),
+        |()| sides[usize::from(cli.probe_confinement_child)](&relayed(cli)),
     )
+}
+
+/// `cli` with this binary as the relay of the probe's Command, as a task's
+/// ([`crate::task::Cli::relay`]).
+#[cfg(target_os = "linux")]
+fn relayed(cli: &ProbeCli) -> ProbeCli {
+    let mut cli = cli.clone();
+    cli.relay = std::env::current_exe().ok();
+    cli
+}
+
+/// No relay on this system: `cli` itself.
+#[cfg(not(target_os = "linux"))]
+fn relayed(cli: &ProbeCli) -> ProbeCli {
+    cli.clone()
 }
 
 // The tests feed Linux errno numbers (ENETUNREACH is 101) and Linux observations to the checks, so

@@ -238,6 +238,71 @@ fn the_secret_path_check_reports_readable_or_not_and_never_fails_on_either() {
     assert_eq!(with(Some("odd")).0, "probe secret_path: FAIL odd");
 }
 
+/// Catches: a path the Command's sandbox hides (there for the probe, absent for the Command)
+/// being called unanswered, or an absent one called hidden.
+#[test]
+fn a_secret_path_the_sandbox_hides_is_not_readable() {
+    let dir = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "kbf-task-probe-hidden");
+    let there = dir.join("grant-token");
+    std::fs::write(&there, b"x").expect("write");
+    let check = |path: &Path, seen: &str| {
+        let mut observed = good();
+        observed.insert("secret".to_owned(), seen.to_owned());
+        let checks = evaluate(&Layers::SeccompAndNetns, Ok(0), &observed, Some(path));
+        (by_name(&checks, "secret_path").line(), passes(&checks))
+    };
+    assert_eq!(
+        check(&there, "errno 2"),
+        (
+            "probe secret_path: ok not readable (ENOENT (2): hidden from the Command)".to_owned(),
+            true
+        )
+    );
+    // A directory on the way that is a file for the Command: hidden the same way.
+    assert!(
+        check(&there, "errno 20")
+            .0
+            .contains("hidden from the Command")
+    );
+    assert!(
+        check(&dir.join("absent"), "errno 2")
+            .0
+            .contains("unanswered")
+    );
+    // Not an absence: read as before, wherever the path is.
+    assert_eq!(
+        check(&there, "errno 13").0,
+        "probe secret_path: ok not readable (EACCES (13))"
+    );
+}
+
+/// Catches: the probe not saying how the Command's sandbox came out, or that line failing the
+/// probe: it is the run's own report, as a fact.
+#[test]
+fn the_probe_says_how_the_sandbox_came_out() {
+    for sandbox in [
+        crate::sandbox::Sandbox::Made,
+        crate::sandbox::Sandbox::Incomplete {
+            step: "setgroups",
+            errno: 13,
+        },
+    ] {
+        let ran = Ran {
+            exit_code: 0,
+            timed_out: false,
+            wall_ms: 0,
+            cpu_us: 0,
+            peak_rss_bytes: 0,
+            layers: Layers::SeccompAndNetns,
+            sandbox: sandbox.clone(),
+        };
+        let checks = after_run(Ok(ran), "", None);
+        let line = by_name(&checks, "sandbox");
+        assert_eq!(line.line(), format!("probe sandbox: ok {sandbox}"));
+        assert_eq!(line.status, Status::Ok);
+    }
+}
+
 /// Catches: observation lines being parsed from anything but `observe <name> <value>`, so a
 /// Command that prints other text could not forge or break a check.
 #[test]
@@ -319,6 +384,11 @@ fn a_command_that_did_not_run_is_a_fail_with_its_error() {
         "probe child: FAIL cannot make x"
     );
     assert!(by_name(&checks, "layers").status == Status::Fail);
+    // Nothing ran, so the sandbox is not known; a fact, which fails nothing.
+    assert_eq!(
+        by_name(&checks, "sandbox").line(),
+        "probe sandbox: n/a absent"
+    );
     assert!(!passes(&checks));
 }
 
@@ -385,7 +455,7 @@ mod confined {
         let dir = TestDir::under(std::env::temp_dir(), &format!("kbf-task-probe-unit-{name}"));
         std::fs::create_dir(dir.join("root")).expect("root");
         let argv = argv.iter().map(|a| (*a).to_owned()).collect();
-        run_confined(&dir, argv, deadline, None).await
+        run_confined(&dir, argv, deadline, None, None).await
     }
 
     /// Catches: a Command that cannot start passing, or its error being lost.

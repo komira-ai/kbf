@@ -42,6 +42,10 @@ thiserror.workspace = true
 ureq.workspace = true
 tokio = { workspace = true, features = ["rt", "fs", "process", "time", "io-util"] }
 
+# The Command's namespaces and mounts (src/child.rs), through rustix's safe calls.
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { workspace = true, features = ["fs", "mount", "pipe", "process", "thread"] }
+
 [dev-dependencies]
 kbf-testkit.workspace = true
 prost-types.workspace = true
