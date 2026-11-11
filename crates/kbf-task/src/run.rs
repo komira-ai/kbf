@@ -17,10 +17,13 @@
 //! and `/root`, and every process it started is ended when it ends. One line per action says how
 //! that came out.
 //!
-//! The process this tool starts leads its own process group, and so does the program where no PID
-//! namespace was made. When the deadline passes the whole group is killed with SIGKILL and reaped
+//! The process this tool starts leads its own process group, and is the program where no PID
+//! namespace was made. In a PID namespace that process is a relay, which moves to this tool's own
+//! group once it has made the namespace's first process; that process and the Command stay in the
+//! group the relay made. When the deadline passes that group is killed with SIGKILL and reaped
 //! (in a PID namespace, the kill of its first process ends every process in it), and the run is
-//! reported as timed out with exit code 137. A process a signal ended reports 128 plus the signal
+//! reported as timed out with exit code 137. The group is also killed when the run is dropped
+//! before it ends. A process a signal ended reports 128 plus the signal
 //! number, as the daemon does.
 //!
 //! CPU time and peak memory come from `getrusage(RUSAGE_CHILDREN)`: the difference in CPU time
@@ -194,8 +197,12 @@ pub async fn run(command: &Command, run: &Run<'_>) -> Result<Ran, RunError> {
     };
     let mut child = process.spawn().map_err(spawn_error)?;
     let (layers, sandbox) = confinement.read();
-    // Taken before the wait: the pid is also the id of the group the child leads.
+    // Taken before the wait: the pid is also the id of the group the child leads. The group is
+    // killed however this function is left, a dropped future included: `kill_on_drop` ends the
+    // child alone, which in a PID namespace is the relay, and the processes it made may not yet
+    // be set to die with it.
     let group = child.id();
+    let mut ends_group = GroupKill(group);
     let waited = tokio::time::timeout(run.deadline, child.wait()).await;
     let (status, timed_out) = if let Ok(status) = waited {
         (status, false)
@@ -204,7 +211,7 @@ pub async fn run(command: &Command, run: &Run<'_>) -> Result<Ran, RunError> {
         (child.wait().await, true)
     };
     // Whatever the program left running in its group is ended with it.
-    kill_group(group);
+    ends_group.now();
     let status = status.map_err(spawn_error)?;
     let wall_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let usage = children_usage();
@@ -339,6 +346,21 @@ fn kill_group(group: Option<u32>) {
         // SAFETY: `kill` takes plain integers. A group that no longer exists makes it fail
         // with ESRCH, which is what a kill of finished work should do: nothing.
         unsafe { libc::kill(-pid, libc::SIGKILL) };
+    }
+}
+
+/// Kills the group [`kill_group`] names when told to, or when dropped if it was not.
+struct GroupKill(Option<u32>);
+
+impl GroupKill {
+    fn now(&mut self) {
+        kill_group(self.0.take());
+    }
+}
+
+impl Drop for GroupKill {
+    fn drop(&mut self) {
+        kill_group(self.0.take());
     }
 }
 

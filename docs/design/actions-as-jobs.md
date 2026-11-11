@@ -81,7 +81,8 @@ Settled by the owner and not reopened here:
   file is held (`crates/kbf-front/src/prepare_run/closure.rs`, `collect_closure`); it keeps only the digests.
 - `kbf-task` reads the Action, the Command and the inputs through a read grant (or by pack span with `--locate`),
   lays the inputs out under `/scratch/work/in`, runs the Command in its own user and network namespace (loopback only),
-  collects outputs (`kbf-outputs`, `O_NOFOLLOW` at every component), packs and PUTs them. Exit 0 means the action ran
+  collects outputs (`kbf-outputs`, `O_NOFOLLOW` at every component), packs and PUTs them. (Since build item 4, also in
+  mount and PID namespaces of its own, 4.4, with the walk by `openat2`.) Exit 0 means the action ran
   (its own exit code and a timeout are in the manifest); 10 to 15 are the farm's failures.
 - kbf#2287 lists what the real job service at the pin lacks: `Job.start_failure_detail` is always empty; label values
   must be lower case; a job that books disk is placed only on hosts reporting `disk-gib`; a client token sees only its

@@ -570,6 +570,33 @@ async fn a_namespace_that_cannot_be_made_leaves_the_filter_and_says_so() {
     }
 }
 
+/// Catches: a refused mount failing the run, or taking the network namespace with it: with
+/// `mount` refused by an outer filter the Command still runs, and the sandbox line names the
+/// step the host refused. Where the namespace steps succeed that is the first mount step,
+/// `private`, and the network layer is whole; where the host refuses one of them first (an
+/// unprivileged user namespace without its capabilities), that step is named.
+#[tokio::test]
+async fn a_refused_mount_leaves_the_run_and_the_network_layer_and_says_so() {
+    let marker_dir = scratch("mount-marker");
+    let marker = marker_dir.join("marker");
+    let (_, text) = under(
+        "mount",
+        "mount",
+        "no",
+        &["touch", marker.to_str().expect("utf-8")],
+    )
+    .await;
+    assert!(text.ends_with("exit=0\n"), "{text}");
+    assert!(marker.exists(), "the Command did not run: {text}");
+    if text.starts_with("layers=netns (loopback only) + seccomp\n") {
+        assert!(text.contains("sandbox=incomplete (private 1)\n"), "{text}");
+    } else {
+        eprintln!("this host refuses a namespace step first: {text}");
+        assert!(text.contains("sandbox=incomplete ("), "{text}");
+        assert!(!text.contains("sandbox=incomplete (private"), "{text}");
+    }
+}
+
 /// Catches: a Command a signal ended reported as anything but 128 plus the signal where the run
 /// made no PID namespace, so the signal reaches the tool as itself rather than as an exit code
 /// of the namespace's first process.

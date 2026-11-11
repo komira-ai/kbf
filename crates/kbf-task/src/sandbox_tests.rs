@@ -267,6 +267,33 @@ mod linux {
         assert_eq!(held, 3);
     }
 
+    /// Catches two system paths that are one directory (`/var/tmp` a symlink to `/tmp`) both
+    /// being bound, the second hiding the first, which is the directory `TMPDIR` names: the
+    /// first is bound, the second left out.
+    #[test]
+    fn a_target_that_is_another_targets_real_path_is_bound_once() {
+        let dir = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "kbf-task-layout-twice");
+        let base = std::fs::canonicalize(&*dir).unwrap();
+        let (private, target) = (base.join("private"), base.join("target"));
+        for d in [&private, &target] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let bound = [
+            ("tmp", target.to_str().unwrap()),
+            ("var-tmp", link.to_str().unwrap()),
+        ];
+        let (got, _) = shapes(layout_with(&bound, &[], &private, &private, &private).unwrap());
+        assert!(got.contains(&Shape::Hold(private.join("tmp"))), "{got:?}");
+        assert!(
+            !got.contains(&Shape::Hold(private.join("var-tmp"))),
+            "{got:?}"
+        );
+        let binds: Vec<&Shape> = got.iter().filter(|s| matches!(s, Shape::Bind(_))).collect();
+        assert_eq!(binds, [&Shape::Bind(target.clone())]);
+    }
+
     /// Catches a layout made for a run whose directories do not exist, or that names a path the
     /// child cannot carry: each is refused before anything starts.
     #[test]

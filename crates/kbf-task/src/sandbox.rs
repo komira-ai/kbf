@@ -56,7 +56,8 @@
 //! hold and none after it is made, and the line the tool writes says which failed:
 //! `kbf-task: action <digest>: sandbox: incomplete (<step> <errno>)` ([`Sandbox`]). A host that
 //! does not let an unprivileged user namespace keep its capabilities (AppArmor's
-//! `apparmor_restrict_unprivileged_userns`) fails at `uid_map` or at `private` with `EPERM`; the
+//! `apparmor_restrict_unprivileged_userns`) fails at `setgroups` or `uid_map` (`EACCES` or `EPERM`,
+//! as the host answers), or at `private` with `EPERM`; the
 //! PID namespace is then made (when the `unshare` itself succeeded) and the mounts are not. When
 //! the `unshare` fails, the Command runs as it would without this module.
 //!
@@ -149,7 +150,7 @@ pub struct Layout {
 #[cfg(target_os = "linux")]
 impl Layout {
     /// The steps.
-    pub fn into_steps(self) -> Vec<(u8, crate::child::Step)> {
+    pub(crate) fn into_steps(self) -> Vec<(u8, crate::child::Step)> {
         self.steps
     }
 }
@@ -178,7 +179,7 @@ pub fn layout(
 /// name targets of its own.
 #[cfg(target_os = "linux")]
 fn layout_with(
-    bound: &[(&str, &str)],
+    bound_targets: &[(&str, &str)],
     hidden: &[PathBuf],
     private: &Path,
     root: &Path,
@@ -193,10 +194,16 @@ fn layout_with(
         .filter_map(|dir| real_dir(dir))
         .filter(|dir| dir != Path::new("/"))
         .collect();
-    let bound: Vec<(&str, PathBuf)> = bound
-        .iter()
-        .filter_map(|(sub, target)| real_dir(Path::new(target)).map(|target| (*sub, target)))
-        .collect();
+    // A target that is another's real path (`/var/tmp` a symlink to `/tmp`) is bound once, by
+    // the first: a second bind would hide the directory `TMPDIR` names.
+    let mut bound: Vec<(&str, PathBuf)> = Vec::new();
+    for (sub, target) in bound_targets {
+        if let Some(target) = real_dir(Path::new(target))
+            && !bound.iter().any(|(_, seen)| *seen == target)
+        {
+            bound.push((sub, target));
+        }
+    }
     let targets: Vec<PathBuf> = bound.iter().map(|(_, target)| target.clone()).collect();
     let private = real(private)?;
     let keeps = [real(root)?, private.clone()];

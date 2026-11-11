@@ -130,7 +130,7 @@ async fn the_command_cannot_see_the_hidden_directories() {
             .run(network, &["ls", rig.scratch.to_str().expect("utf-8")])
             .await;
         if !made(&ran, "the_command_cannot_see_the_hidden_directories") {
-            return;
+            continue;
         }
         assert_eq!(ran.exit_code, 0);
         assert_eq!(out, "in\nprivate\n", "{network:?}");
@@ -169,7 +169,7 @@ async fn the_command_writes_and_runs_a_program_from_tmp_var_tmp_run_and_root() {
             &ran,
             "the_command_writes_and_runs_a_program_from_tmp_var_tmp_run_and_root",
         ) {
-            return;
+            continue;
         }
         assert_eq!(ran.exit_code, 0, "{target}");
         let private = rig.private().join(sub);
@@ -201,25 +201,42 @@ async fn a_process_the_command_leaves_is_gone_when_the_run_returns() {
             ],
         )
         .await;
+    // Ended when this test ends, whichever way, unless it is known to be gone.
+    let mut left = Leftover(
+        std::fs::read_to_string(&pidfile)
+            .ok()
+            .and_then(|pid| pid.trim().parse().ok()),
+    );
     assert_eq!(ran.exit_code, 0);
+    assert!(
+        left.0.is_some(),
+        "the process the Command left wrote no pid"
+    );
     let (_, pid) = rig.run(Network::Denied, &["pid"]).await;
     let file = std::fs::File::open(&lock).expect("lock");
     // SAFETY: integer arguments only.
     let free = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
     if pid.trim() == "2" {
         assert!(free, "a process of the action outlived it");
+        // Gone: its pid may already be another process's.
+        left.0 = None;
     } else {
         eprintln!(
             "skipped: this host made no PID namespace ({:?}); the process is ended here",
             ran.sandbox
         );
-        let left: libc::pid_t = std::fs::read_to_string(&pidfile)
-            .expect("pid")
-            .trim()
-            .parse()
-            .expect("a pid");
-        // SAFETY: integer arguments only; the process is the one the Command left.
-        unsafe { libc::kill(left, libc::SIGKILL) };
+    }
+}
+
+/// A process a Command left, killed when dropped.
+struct Leftover(Option<libc::pid_t>);
+
+impl Drop for Leftover {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0 {
+            // SAFETY: integer arguments only; the process is the one the Command left.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
     }
 }
 
@@ -244,7 +261,8 @@ async fn a_command_in_a_user_namespace_has_no_new_privs_even_with_the_network() 
     }
 }
 
-/// The checks above, failing where the sandbox is not made. Run it where it is expected (root,
+/// The checks above (the hidden directory and grant, a program run from `/tmp`, the PID
+/// namespace, `no_new_privs`), failing where the sandbox is not made. Run it where it is expected (root,
 /// or a host that lets an unprivileged user namespace keep its capabilities):
 ///
 /// `cargo test -p kbf-task --test sandbox -- --ignored sandbox_is_made_strict`
@@ -260,6 +278,19 @@ async fn sandbox_is_made_strict() {
         .await;
     assert_eq!(ran.sandbox, Sandbox::Made);
     assert_eq!(out, "in\nprivate\n");
+    let grant = rig.scratch.join("grant");
+    let (ran, _) = rig
+        .run(Network::Denied, &["read", grant.to_str().expect("utf-8")])
+        .await;
+    assert_eq!(ran.exit_code, libc::ENOENT);
+    let (ran, _) = rig.run(Network::Denied, &["exec-from", "/tmp"]).await;
+    assert_eq!(ran.exit_code, 0);
+    assert!(rig.private().join("tmp/ran").exists());
     let (_, pid) = rig.run(Network::Denied, &["pid"]).await;
     assert_eq!(pid, "2\n");
+    // SAFETY: no arguments.
+    if unsafe { libc::geteuid() } != 0 {
+        let (_, nnp) = rig.run(Network::Allowed, &["nnp"]).await;
+        assert_eq!(nnp, "1\n");
+    }
 }

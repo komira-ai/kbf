@@ -8,8 +8,8 @@
 //! included, is opened relative to its parent's descriptor with `O_NOFOLLOW`, and on
 //! Linux with `openat2` and `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS |
 //! RESOLVE_NO_MAGICLINKS`, so the kernel itself refuses a symlink, a magic link or a
-//! way out of the parent, `..` included ([`open_in`]; where the kernel has no `openat2`,
-//! `openat` alone). A
+//! way out of the parent, `..` included ([`open_in`]; where the kernel has no `openat2` or a
+//! system call filter refuses it, `openat` alone). A
 //! component on the way that is absent, a file or a symlink means the action did not
 //! create the output there, and the output is left out. The last component is examined
 //! with `AT_SYMLINK_NOFOLLOW`: a symlink is recorded as one, never dereferenced, and a
@@ -253,8 +253,9 @@ async fn blocking<T: Send + 'static>(
 
 /// Opens `name` (one component) in `dir` with `flags`, which hold `O_NOFOLLOW`: by
 /// `openat2` refusing any symlink, any magic link and any way out of `dir` (Linux 5.6 and
-/// later), or by `openat` where that call does not exist (`ENOSYS`: an older kernel, a
-/// system call filter that does not allow it, a system other than Linux), where
+/// later), or by `openat` where that call does not exist or is refused (`ENOSYS`: an older
+/// kernel or a system other than Linux; `ENOSYS` or `EPERM`: a system call filter that does not
+/// know it; neither is an answer `openat2` gives to an open of a name), where
 /// `O_NOFOLLOW` on the one component refuses a symlink just the same.
 fn open_in(dir: &OwnedFd, name: &OsStr, flags: OFlags) -> rustix::io::Result<OwnedFd> {
     open_with(beneath, dir, name, flags)
@@ -268,7 +269,8 @@ fn open_with(
     flags: OFlags,
 ) -> rustix::io::Result<OwnedFd> {
     match first(dir, name, flags) {
-        Err(Errno::NOSYS) => rustix::fs::openat(dir, name, flags, Mode::empty()),
+        // EPERM: a container's system call filter older than the call refuses it so.
+        Err(Errno::NOSYS | Errno::PERM) => rustix::fs::openat(dir, name, flags, Mode::empty()),
         done => done,
     }
 }
@@ -872,8 +874,8 @@ mod tests {
         }
     }
 
-    /// Catches the walk failing where the kernel has no `openat2` (or a system call filter
-    /// refuses it with `ENOSYS`), or falling back for any other error: `ENOSYS` opens with
+    /// Catches the walk failing where the kernel has no `openat2` or a system call filter
+    /// refuses it (`ENOSYS`, `EPERM`), or falling back for any other error: those two open with
     /// `openat`, which still refuses a symlink; any other error is the error.
     #[test]
     fn without_openat2_a_component_is_opened_with_openat_and_o_nofollow() {
@@ -882,8 +884,14 @@ mod tests {
         std::os::unix::fs::symlink("file", dir.join("link")).expect("symlink");
         let fd = open(&dir);
         let missing = |_: &OwnedFd, _: &OsStr, _: OFlags| Err(Errno::NOSYS);
+        let filtered = |_: &OwnedFd, _: &OsStr, _: OFlags| Err(Errno::PERM);
         let refused = |_: &OwnedFd, _: &OsStr, _: OFlags| Err(Errno::ACCESS);
         assert!(open_with(missing, &fd, OsStr::new("file"), FILE).is_ok());
+        assert!(open_with(filtered, &fd, OsStr::new("file"), FILE).is_ok());
+        assert_eq!(
+            open_with(filtered, &fd, OsStr::new("link"), FILE).expect_err("a symlink"),
+            Errno::LOOP
+        );
         assert_eq!(
             open_with(missing, &fd, OsStr::new("link"), FILE).expect_err("a symlink"),
             Errno::LOOP
