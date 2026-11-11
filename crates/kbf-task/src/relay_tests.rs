@@ -235,7 +235,42 @@ fn a_pending_pid_namespace_is_seen_only_after_the_unshare() {
             200
         }
     });
+    if code == 200 {
+        eprintln!("skipped: this host refuses the unshare of a user and PID namespace");
+    }
     assert!(code == 0 || code == 200, "{code}");
+}
+
+/// Catches the relay staying in the Command's process group, where a `kill 0` of the Command's
+/// or the deadline's kill of that group would end it before it has reaped the namespace: once it
+/// has started the first process it is in the group it was given, and the first process (here a
+/// program that ends at once) was started in its own group first.
+#[test]
+fn the_relay_moves_to_the_tools_group_after_starting_the_first_process() {
+    let tool = rustix::process::getpgrp();
+    let command = os(&["/usr/bin/true"]);
+    let code = in_child(|| {
+        // A group of its own, as the tool's child is.
+        rustix::process::setpgid(None, None).unwrap();
+        let own = rustix::process::getpgrp();
+        if !unshare_user_and_pid() {
+            return 200;
+        }
+        let mode = Mode {
+            relay: true,
+            group: Some(tool),
+            userns: false,
+            command: &command,
+        };
+        let code = relay(Pipe::new().write_end(), Path::new("/usr/bin/false"), &mode);
+        let moved = rustix::process::getpgrp() == tool && own != tool;
+        i32::from(code != 1) | i32::from(!moved) << 1
+    });
+    if code == 200 {
+        eprintln!("skipped: this host refuses the unshare of a user and PID namespace");
+        return;
+    }
+    assert_eq!(code, 0);
 }
 
 /// Catches the first process not reporting a start, not passing the Command's exit up, starting

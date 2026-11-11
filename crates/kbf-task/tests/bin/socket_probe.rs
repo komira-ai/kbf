@@ -20,8 +20,10 @@
 //! id, `nnp` its `no_new_privs`, and `signal` ends it with `SIGTERM`; `linger <lock> <pidfile>` starts a copy of this program in a
 //! process group of its own that takes an exclusive `flock` of `<lock>`, writes its process id as
 //! the job sees it (from `/proc/self`) to `<pidfile>`, says so, and then waits for ever; `linger`
-//! exits 0 once it has said so; `holds <own> <lock> <pidfile>` takes an exclusive `flock` of
-//! `<own>` and runs `hold <lock> <pidfile>` as its child (in its own process group) and waits.
+//! exits 0 once it has said so; `holds <own> <lock> <fifo>` takes an exclusive `flock` of
+//! `<own>`, opens `<fifo>` for writing and keeps it open, and runs `hold <lock> <fifo>` as its
+//! child (in its own process group, so the group's kill reaches it) and waits; `caps` prints its
+//! effective, permitted and inheritable capability sets.
 
 use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::process::ExitStatusExt as _;
@@ -81,6 +83,17 @@ fn probe(args: &[&str]) -> u8 {
         ["linger", lock, pidfile] => linger(lock, pidfile),
         #[cfg(target_os = "linux")]
         ["hold", lock, pidfile] => hold(lock, pidfile),
+        #[cfg(target_os = "linux")]
+        ["caps"] => {
+            let caps = rustix::thread::capabilities(None).expect("capget");
+            println!(
+                "{:x} {:x} {:x}",
+                caps.effective.bits(),
+                caps.permitted.bits(),
+                caps.inheritable.bits()
+            );
+            0
+        }
         #[cfg(target_os = "linux")]
         ["holds", own, lock, pidfile] => holds(own, lock, pidfile),
         ["ifaces"] => ifaces(),
@@ -291,8 +304,9 @@ fn linger(lock: &str, pidfile: &str) -> u8 {
     u8::from(!matches!(said, Some(Ok(_))) || line != "held\n")
 }
 
-/// Takes an exclusive `flock` of `own`, then runs `hold <lock> <pidfile>` as a child in its own
-/// process group and waits for it: a Command and a descendant that both hold a lock.
+/// Takes an exclusive `flock` of `own`, opens `fifo` for writing (kept open until it dies), then
+/// runs `hold <lock> <fifo>` as a child in the same process group and waits for it: a Command
+/// and a descendant that both hold a lock and the FIFO.
 #[cfg(target_os = "linux")]
 fn holds(own: &str, lock: &str, pidfile: &str) -> u8 {
     let Ok(file) = std::fs::File::create(own) else {
@@ -301,6 +315,9 @@ fn holds(own: &str, lock: &str, pidfile: &str) -> u8 {
     if rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive).is_err() {
         return UNKNOWN_MODE;
     }
+    let Ok(_held_open) = std::fs::OpenOptions::new().write(true).open(pidfile) else {
+        return UNKNOWN_MODE;
+    };
     child(&["hold", lock, pidfile])
 }
 
@@ -317,7 +334,19 @@ fn hold(lock: &str, pidfile: &str) -> u8 {
     let Ok(me) = std::fs::read_link("/proc/self") else {
         return UNKNOWN_MODE;
     };
-    if std::fs::write(pidfile, me.to_string_lossy().as_bytes()).is_err() {
+    // Kept open until this process dies: a FIFO's reader sees the end then.
+    let opened = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(pidfile);
+    let Ok(mut written) = opened else {
+        return UNKNOWN_MODE;
+    };
+    if written
+        .write_all(format!("{}\n", me.to_string_lossy()).as_bytes())
+        .is_err()
+    {
         return UNKNOWN_MODE;
     }
     let mut out = std::io::stdout();

@@ -81,9 +81,8 @@ pub fn argv(group: Pid, userns: bool, program: &Path, args: &[OsString]) -> Vec<
 /// the program name) name, its start report on standard input, and returns its exit code.
 #[must_use]
 pub fn main_with(args: &[OsString]) -> ExitCode {
-    // Read while the process is still dumpable: a non-dumpable one may not follow its own
-    // `/proc/self/exe`.
-    let this = std::env::current_exe().unwrap_or_default();
+    // The first process is this binary, started by the path it was started by.
+    let this = std::env::current_exe().unwrap_or_else(|_| "/proc/self/exe".into());
     let stdin = io::stdin();
     let code = run_mode(&stdin.as_fd(), &this, args);
     ExitCode::from(u8::try_from(code).unwrap_or(u8::MAX))

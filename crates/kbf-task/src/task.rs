@@ -840,9 +840,9 @@ pub fn run_cli_with(protection: std::io::Result<()>, cli: &Cli) -> ExitCode {
     }
 }
 
-/// `cli` with this binary as the relay of its Command ([`Cli::relay`]). The path is resolved
-/// now: the child that executes it is no longer dumpable, and a non-dumpable process may not
-/// follow its own `/proc/self/exe`.
+/// `cli` with this binary as the relay of its Command ([`Cli::relay`]), named by the path it
+/// was started by: the child that executes the relay, once it has made its user namespace, was
+/// refused `/proc/self/exe` itself (`EACCES`) on the hosts this was tried on.
 #[cfg(target_os = "linux")]
 fn relayed(cli: &Cli) -> Cli {
     let mut cli = cli.clone();

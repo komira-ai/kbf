@@ -9,6 +9,7 @@
 
 #![cfg(target_os = "linux")]
 
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -274,25 +275,47 @@ async fn dropped_run(relayed: bool) {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     // Boxed, so that dropping it below drops the run itself.
     let mut run = Box::pin(rig.run(Network::Denied, &args));
-    // Blocks until the descendant has its lock and opens the FIFO to write its id.
+    // The Command and the descendant each hold the FIFO open for writing until they die; the
+    // descendant writes its id on it once it holds its lock.
     let read = fifo.clone();
-    let reader = tokio::task::spawn_blocking(move || std::fs::read_to_string(read));
-    let pid = tokio::select! {
-        _ = &mut run => panic!("the run ended by itself"),
-        pid = reader => pid.expect("reader").expect("the descendant's id"),
+    let reader = tokio::task::spawn_blocking(move || {
+        use std::io::BufRead as _;
+        let mut fifo = std::io::BufReader::new(std::fs::File::open(read)?);
+        let mut line = String::new();
+        fifo.read_line(&mut line)?;
+        Ok::<_, std::io::Error>((fifo, line))
+    });
+    let (mut fifo_end, pid) = tokio::select! {
+        _ = &mut run => {
+            // Let the reader's open return, so the test fails rather than waits.
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&fifo);
+            panic!("the run ended by itself");
+        }
+        read = reader => read.expect("reader").expect("the descendant's id"),
     };
     let mut left = Leftover(pid.trim().parse().ok());
     // The run is dropped while its Command and the descendant still run.
     drop(run);
+    // The end of the FIFO: both have died.
+    let rest = tokio::task::spawn_blocking(move || {
+        let mut rest = String::new();
+        std::io::Read::read_to_string(&mut fifo_end, &mut rest).map(|_| rest)
+    })
+    .await
+    .expect("reader")
+    .expect("the end of the FIFO");
+    assert_eq!(rest, "", "relayed: {relayed}");
     for held in [own, lock] {
-        // Returns once the process holding the lock has died.
-        let taken = tokio::task::spawn_blocking(move || {
-            let file = std::fs::File::open(&held).expect("lock");
-            rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive).is_ok()
-        })
-        .await
-        .expect("locker");
-        assert!(taken, "relayed: {relayed}");
+        let file = std::fs::File::open(&held).expect("lock");
+        let free = rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive);
+        assert!(
+            free.is_ok(),
+            "{} still held; relayed: {relayed}",
+            held.display()
+        );
     }
     // Gone: its pid may already be another process's.
     left.0 = None;
@@ -344,8 +367,8 @@ impl Drop for Leftover {
     }
 }
 
-/// Catches: a Command in the sandbox's user namespace without `no_new_privs`, where a file
-/// capability would give it a capability there (enough to take a cover off). A Command allowed
+/// Catches: a Command in the sandbox's user namespace without `no_new_privs` or with a
+/// capability, where it, or a file capability, would hold one there (enough to take a cover off). A Command allowed
 /// the network has no seccomp filter, so this is the only place it gets it.
 #[tokio::test]
 async fn a_command_in_a_user_namespace_has_no_new_privs_even_with_the_network() {
@@ -358,6 +381,9 @@ async fn a_command_in_a_user_namespace_has_no_new_privs_even_with_the_network() 
     let (_, pid) = rig.run(Network::Allowed, &["pid"]).await;
     if pid.trim() == "2" {
         assert_eq!(nnp, "1\n", "{:?}", ran.sandbox);
+        // And no capability in any set, though it is the user namespace's own user.
+        let (_, caps) = rig.run(Network::Allowed, &["caps"]).await;
+        assert_eq!(caps, "0 0 0\n");
     } else {
         eprintln!("skipped: this host made no namespace ({:?})", ran.sandbox);
         assert_eq!(nnp, "0\n");
