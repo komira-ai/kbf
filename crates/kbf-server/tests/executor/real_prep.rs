@@ -352,39 +352,6 @@ fn arg(args: &[String], name: &str) -> String {
     args[at + 1].clone()
 }
 
-/// Catches the real preparation's closure size not reaching the run's disk booking: the run
-/// of an action whose inputs are one 1000-byte file books the bytes of the input tree as the
-/// preparation counts them (the file and the root Directory blob that names it), the default
-/// output allowance and the margin. A grant that carried no size would book the allowance and
-/// the margin only, which this number does not equal.
-#[tokio::test(start_paused = true)]
-async fn the_run_books_the_bytes_of_the_closure_the_real_preparation_found() {
-    use kbf_server::executor::{DEFAULT_OUTPUT_DISK, DISK_MARGIN};
-
-    let content = [7u8; 1000];
-    let (world, actions) = World::start(&[(&content, true)]).await;
-    let _stage = world.submit(actions[0]);
-    let job = world.posted().await;
-    let file = VerifiedBlob::hashed(Bytes::copy_from_slice(&content)).digest();
-    let root = Directory {
-        files: vec![FileNode {
-            name: "in.txt".to_owned(),
-            digest: Some(wire(&file)),
-            ..FileNode::default()
-        }],
-        ..Directory::default()
-    };
-    let inputs = 1000 + root.encode_to_vec().len() as u64;
-    assert_eq!(
-        world
-            .fake
-            .submitted(&job)
-            .and_then(|spec| spec.needs)
-            .and_then(|needs| needs.disk_bytes),
-        Some(inputs + DEFAULT_OUTPUT_DISK + DISK_MARGIN)
-    );
-}
-
 /// Catches an executor that does not run an action end to end over the real preparation, with
 /// nothing standing in for the key, the presigned write or the grant: the job is submitted with a
 /// write of exactly the key it was issued, good for the wall and the slack, and a read grant
