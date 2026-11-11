@@ -58,7 +58,7 @@ fn base(stanzas: &[&str], extra: Vec<E>) -> Vec<u8> {
         E::file(
             "var/lib/dpkg/alternatives/pager",
             0o644,
-            b"auto\n/usr/bin/pager\npager.1.gz\n/usr/share/man/man1/pager.1.gz\n\n/bin/more\n50\n/usr/share/man/man1/more.1.gz\n\n",
+            b"auto\n/usr/bin/pager\npager.1.gz\n/usr/share/man/man1/pager.1.gz\npager.de.1.gz\n/usr/share/man/de/man1/pager.1.gz\n\n/bin/more\n50\n/usr/share/man/man1/more.1.gz\n/usr/share/man/de/man1/more.1.gz\n\n",
         ),
         E::file(
             "var/lib/dpkg/alternatives/shell",
@@ -114,7 +114,8 @@ fn refused_without(layers: &[Vec<u8>], removed: &[&str]) -> Vec<String> {
 /// have it), each directory it alone lists once nothing is left in it, its control files with
 /// and without an architecture, its stanza of the status file and its diversions, and the
 /// alternative whose one choice it brought, with the links of that alternative and of its
-/// follower (whose `/etc/alternatives` link already pointed at nothing); and that it keeps a
+/// followers (one whose `/etc/alternatives` link already pointed at nothing, one whose links the
+/// image never had); and that it keeps a
 /// directory a kept package also lists, a directory still holding a file no package lists, a
 /// listed path that is not there or is below a regular file, another alternative, and everything
 /// of the kept package, byte for byte. The tree is then accepted: the set-uid and set-gid files
@@ -461,7 +462,7 @@ fn a_link_no_package_lists_into_a_removed_package_goes_with_it() {
 /// goes and the package's file list still names it, so a set-uid file of a package the tree keeps
 /// does not refuse the tree; and that a path to exclude is refused by name when it is not
 /// absolute, when no kept package lists it (a removed package's does not count), when it is not
-/// in the base, and when it is a directory.
+/// in the base, and when it is a directory. A path is left out with no package left out too.
 /// Catches: a set-uid program kept because its package must stay, a package's list rewritten as
 /// if it were removed, and an exclusion that does nothing because the path is misspelled or a
 /// later base no longer has it.
@@ -480,6 +481,19 @@ fn a_path_of_a_kept_package_is_left_out_as_dpkg_excludes_it() {
         [
             "/usr/bin/setid: a set-uid file (mode 4755); the kbf base tree holds none: leave out the package that brings it"
         ]
+    );
+    // With no package left out, the exclusion still applies: only `gone`'s files are refused.
+    let set_id = |path: &str, kind: &str, mode: &str| {
+        format!(
+            "{path}: a {kind} file (mode {mode}); the kbf base tree holds none: leave out the package that brings it"
+        )
+    };
+    assert_eq!(
+        excluding(&layers, &[], &["/usr/bin/setid"]).err(),
+        Some(vec![
+            set_id("/usr/bin/chage", "set-gid", "2755"),
+            set_id("/usr/bin/su", "set-uid", "4755"),
+        ])
     );
     let tree = excluding(&layers, &["gone"], &["/usr/bin/setid"]).expect("accepted");
     let seen = listing(&tree);
