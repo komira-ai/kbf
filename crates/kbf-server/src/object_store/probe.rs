@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use kbf_objstore::s3::{Credentials, S3Config, S3ConfigError, S3Store};
-use kbf_objstore::{ByteRange, Capabilities, KeyPrefix, ObjectKey, ObjectStore, ObjectStoreError};
+use kbf_objstore::{ByteRange, Capabilities, ObjectKey, ObjectStore, ObjectStoreError, kbf_prefix};
 use kbf_types::object_store_api::{Secret, Verified};
 use tokio::runtime::Handle;
 
@@ -90,7 +90,7 @@ pub fn check_origin(endpoint: &str, bucket: &str, prefix: &str) -> Result<(), Or
     {
         return Err(OriginFault::Tls);
     }
-    KeyPrefix::new(prefix).map_err(|_| OriginFault::Prefix)?;
+    kbf_prefix(prefix).map_err(|_| OriginFault::Prefix)?;
     match store(&ProbeTarget {
         endpoint,
         region: "",
@@ -160,11 +160,11 @@ impl S3Probe {
     fn key(&self, prefix: &str) -> Option<ObjectKey> {
         let mut bytes = [0u8; 8];
         self.random.fill(&mut bytes).ok()?;
-        let dir = KeyPrefix::new(prefix).ok()?;
+        let dir = kbf_prefix(prefix).ok()?;
         let dir = if dir.as_str().is_empty() || dir.as_str().ends_with('/') {
             dir
         } else {
-            KeyPrefix::new(format!("{}/", dir.as_str())).ok()?
+            kbf_prefix(format!("{}/", dir.as_str())).ok()?
         };
         dir.key(&format!(".kbf-probe/{}", hex::encode(bytes))).ok()
     }

@@ -7,7 +7,7 @@ use std::time::Duration;
 use clap::{Parser, ValueEnum};
 use kbf_objstore::footers::FooterReads;
 use kbf_objstore::s3::{S3Config, S3ConfigError, S3Store};
-use kbf_objstore::{Capabilities, KeyPrefix};
+use kbf_objstore::{Capabilities, KeyPrefix, kbf_prefix};
 use kbf_pack::{AdoptConfig, AdoptMode};
 use kbf_state::postgres::PostgresConfig;
 
@@ -241,7 +241,7 @@ impl Args {
         if !matches!(text.chars().next_back(), None | Some('/')) {
             return Err(Error::refused(PREFIX_SLASH));
         }
-        KeyPrefix::new(text).map_err(|error| Error::refused(format!("--source-prefix: {error}")))
+        kbf_prefix(text).map_err(|error| Error::refused(format!("--source-prefix: {error}")))
     }
 
     fn index_config(&self) -> Result<PostgresConfig, Error> {

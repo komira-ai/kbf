@@ -243,13 +243,11 @@ pub(super) fn args() -> Vec<Arg> {
         switch(
             LOCATE,
             "executor-locate",
-            "Has the task tool ask the read listener where each input is kept (`GET /locate`) \
-             and read it straight from that store, with the read grants the answer carries, \
-             and from the listener any input whose direct read fails; every byte is still \
-             checked against its digest. Off by default: the task reads every input through \
-             the listener. With no grants in the answer it reads from the listener as without \
-             the flag. An `http://` store needs `--executor-allow-plain-http-grant`. Used \
-             only with `--executor js-agent`, and refused with `--executor kbf-daemon`",
+            "Has the task tool ask the read listener where each input is kept (`GET /locate`). \
+             The answer names no store and no grant (tierstore v0.3.29 removed the store read \
+             grants), so the task still reads every input through the listener, as without the \
+             flag; every byte is checked against its digest. Off by default. Used only with \
+             `--executor js-agent`, and refused with `--executor kbf-daemon`",
         ),
         switch(
             INSECURE,

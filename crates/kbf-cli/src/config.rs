@@ -253,6 +253,8 @@ const GROUPS: &[(&str, &[&str])] = &[
             "job-read-budget-bytes",
             "job-read-idle-secs",
             "job-reads-in-flight",
+            // Removed with the store read grants (tierstore v0.3.29): the keys stay so that a
+            // file that still sets one is refused naming its flag, not as an unknown key.
             "job-store-bucket",
             "job-store-grant-key-file",
             "job-store-url",
