@@ -20,8 +20,9 @@ pub const CALLABLE: &[&str] = &[
 
 /// The one `if:` besides `RELEASE_PUSH_ONLY` under which a job may hold `id-token: write` (and
 /// no other scope for writing): the same successful pipeline run for a push to `main` that
-/// releases code, while the repository variable `CP_DEPLOY_ENDPOINT` is not empty.
-pub const DEPLOY_ONLY: &str = "${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' && vars.CP_DEPLOY_ENDPOINT != '' }}";
+/// releases code, while the repository variables `CP_DEPLOY_ENDPOINT` and
+/// `CP_DEPLOY_TAILSCALE_TAGS` are not empty.
+pub const DEPLOY_ONLY: &str = "${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' && vars.CP_DEPLOY_ENDPOINT != '' && vars.CP_DEPLOY_TAILSCALE_TAGS != '' }}";
 
 /// Why the job-level `uses:` node `called` (in the workflow `text`), which does not start with
 /// `./`, is refused; `None` when it is a call this lint allows.

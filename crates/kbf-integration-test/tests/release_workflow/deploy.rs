@@ -2,9 +2,10 @@
 //! `.github/workflows/release.yml`.
 //!
 //! - **When.** Both run under [`DEPLOY_IF`] alone: the release condition of every writing job
-//!   and the repository variable `CP_DEPLOY_ENDPOINT` not empty, so a repository that sets no
-//!   endpoint (a fork, or before the deploy front exists) skips both and the release ends as
-//!   it did without them. `deploy-digest` needs `plan` and `publish`; `deploy` needs `plan`,
+//!   and the repository variables `CP_DEPLOY_ENDPOINT` and `CP_DEPLOY_TAILSCALE_TAGS` not
+//!   empty, so a repository that sets no endpoint (a fork, or before the deploy front exists)
+//!   or no tailnet tag skips both and the release ends as it did without them; the call never
+//!   asks for an empty tag. `deploy-digest` needs `plan` and `publish`; `deploy` needs `plan`,
 //!   `gamma` (the frontend takes a release only after the farm has) and `deploy-digest`.
 //! - **`deploy-digest`** holds `contents: read` alone and runs exactly [`DIGEST_RUNS`]: the
 //!   toolchain, the build of xtask, and `release image-digest` for this repository, the planned
@@ -14,13 +15,13 @@
 //! - **`deploy`** calls exactly [`CALLED`] (docker-swarm-updater's deploy workflow at a full
 //!   commit; the workflow lint holds the version comment) with exactly the inputs [`WITH`]:
 //!   the service `kbf-frontend`, the released commit, the digest job's three outputs, the
-//!   endpoint, audience and Tailscale client of the `CP_DEPLOY_*` repository variables, the
-//!   environment `controlplane`, a wait of 240 minutes and the tailnet tag `tag:cp-deploy`.
+//!   endpoint, audience, Tailscale client and tailnet tags of the `CP_DEPLOY_*` repository
+//!   variables, the environment `controlplane` and a wait of 240 minutes.
 //!   It holds `id-token: write` alone (the graph's rule) and passes no secret, no matrix and no
 //!   `env:`: the called workflow asks GitHub for an OIDC token per request, which is all it is
 //!   given.
-//! - **Who reads `CP_DEPLOY_*`.** Only these two jobs: the endpoint in their `if:`, the rest in
-//!   `deploy`'s inputs.
+//! - **Who reads `CP_DEPLOY_*`.** Only these two jobs: the endpoint and the tailnet tags in
+//!   their `if:`, the rest in `deploy`'s inputs.
 
 use super::{GAMMA, PUBLISH, Rule, env_is, flag_is, job_text, lines, output_is, run_of, workflows};
 
@@ -29,8 +30,9 @@ pub const DIGEST: &str = "deploy-digest";
 /// The job that calls docker-swarm-updater's deploy workflow.
 pub const DEPLOY: &str = "deploy";
 
-/// The `if:` of both jobs: [`super::RELEASE_IF`] and the deploy front's address set.
-pub const DEPLOY_IF: &str = "${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' && vars.CP_DEPLOY_ENDPOINT != '' }}";
+/// The `if:` of both jobs: [`super::RELEASE_IF`], the deploy front's address set and the
+/// tailnet tags set.
+pub const DEPLOY_IF: &str = "${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' && vars.CP_DEPLOY_ENDPOINT != '' && vars.CP_DEPLOY_TAILSCALE_TAGS != '' }}";
 
 /// The reusable workflow `deploy` calls: docker-swarm-updater's deploy workflow at v0.1.3.
 pub const CALLED: &str = "komira-ai/docker-swarm-updater/.github/workflows/deploy.yml@c1fcc47610e2886d4d9e561be3c0c76f0452d1f6";
@@ -57,7 +59,7 @@ pub const WITH: [(&str, &str); 12] = [
         "tailscale-audience",
         "${{ vars.CP_DEPLOY_TAILSCALE_AUDIENCE }}",
     ),
-    ("tailscale-tags", "tag:cp-deploy"),
+    ("tailscale-tags", "${{ vars.CP_DEPLOY_TAILSCALE_TAGS }}"),
 ];
 
 /// The verb of `deploy-digest`.

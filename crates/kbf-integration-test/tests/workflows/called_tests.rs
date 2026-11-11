@@ -109,8 +109,8 @@ fn the_pinned_call_without_a_readable_version_comment_or_as_no_string_is_refused
 fn the_deploy_condition_allows_the_oidc_token_and_nothing_else() {
     // Catches: the deploy condition taken as a gate for more than the one scope (`contents`,
     // `attestations` or `actions` for writing), and a loosened or altered deploy condition
-    // (the endpoint test turned round, another variable, the release part dropped) still
-    // granting the token.
+    // (the endpoint test turned round, another variable, the tailnet tags test dropped or
+    // turned round, the release part dropped) still granting the token.
     let uses = format!("{} # v0.1.3", CALLABLE[0]);
     for scope in ["contents", "attestations", "actions"] {
         refused(
@@ -119,8 +119,13 @@ fn the_deploy_condition_allows_the_oidc_token_and_nothing_else() {
         );
     }
     let loosened = [
-        DEPLOY_ONLY.replace("!= '' }}", "== '' }}"),
+        DEPLOY_ONLY.replace("CP_DEPLOY_ENDPOINT != ''", "CP_DEPLOY_ENDPOINT == ''"),
         DEPLOY_ONLY.replace("CP_DEPLOY_ENDPOINT", "CP_DEPLOY_AUDIENCE"),
+        DEPLOY_ONLY.replace(" && vars.CP_DEPLOY_TAILSCALE_TAGS != ''", ""),
+        DEPLOY_ONLY.replace(
+            "CP_DEPLOY_TAILSCALE_TAGS != ''",
+            "CP_DEPLOY_TAILSCALE_TAGS == ''",
+        ),
         DEPLOY_ONLY.replace(" && needs.plan.outputs.pipeline != 'true'", ""),
         "${{ vars.CP_DEPLOY_ENDPOINT != '' }}".to_owned(),
     ];
