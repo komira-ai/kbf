@@ -47,6 +47,8 @@ fn apt_in_any_command_of_a_run_line_is_refused() {
         "true || apt-get update",
         "true; apt-get update",
         "yes | apt-get install nftables",
+        "sudo -u root apt-get install nftables",
+        "sudo -E -u root env A=1 apt-get update",
     ] {
         let found = changed_to("update-rights-linux.yml", QUERY, line);
         has(&found, "update-rights-linux.yml: root: step 4: runs apt");
@@ -269,6 +271,14 @@ fn an_orphan_pins_file_a_missing_one_and_an_unreadable_workflow_are_refused() {
     let (_, found) = scan(&[("x.yml".to_owned(), "jobs: [".to_owned())]);
     assert_eq!(found.len(), 1, "{found:?}");
     assert!(found[0].starts_with("x.yml: "), "{found:?}");
+    // A job with no steps list that calls no reusable workflow is reported; one that calls
+    // one is not.
+    let (_, found) = scan(&[(
+        "x.yml".to_owned(),
+        "jobs:\n  j:\n    runs-on: ubuntu-24.04\n  k:\n    uses: ./.github/workflows/ci.yml\n"
+            .to_owned(),
+    )]);
+    assert_eq!(found, ["x.yml: j: the job `j` has no steps list"]);
 }
 
 /// Asserts the command splitting the apt rule reads by: chains and pipes split, `sudo` and
@@ -287,4 +297,9 @@ fn commands_are_read_after_sudo_env_and_assignments() {
         commands("=x apt-get"),
         [vec!["=x".to_owned(), "apt-get".to_owned()]]
     );
+    assert_eq!(
+        commands("sudo -u root apt-get update"),
+        [vec!["apt-get".to_owned(), "update".to_owned()]]
+    );
+    assert_eq!(commands("sudo -u"), [Vec::<String>::new()]);
 }

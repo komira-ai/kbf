@@ -29,8 +29,11 @@
 //! installs is the pinned packages. The workflow lint (`workflows`) holds the actions to their
 //! commit pins; the interpreter lint holds each `run:` to one command.
 //!
-//! What it misses: a package installed by a program a step runs (the step's own command line
-//! is all it reads), and an `apt-get` spelt through a variable or a script file.
+//! What it misses: a package installed by a program a step runs or an image a step builds (the
+//! step's own command line is all it reads: the deb install test's container,
+//! `packaging/linux/test/ubuntu/Dockerfile`, runs apt inside it), an `apt-get` spelt through a
+//! variable, a path (`/usr/bin/apt-get`), a wrapper (`command`, `exec`) or a script file, a
+//! host named in another letter case or outside a `run:`, and composite actions.
 
 use super::workflows::{self, Step};
 
@@ -80,16 +83,24 @@ fn commands(line: &str) -> Vec<Vec<String>> {
     line.split(';')
         .map(|part| {
             let mut words = words(part);
-            while words.first().is_some_and(|w| {
-                w == "sudo"
+            while let Some(w) = words.first() {
+                // `sudo`'s options that take the next word as their value.
+                let takes_value =
+                    ["-u", "-g", "-h", "-p", "-C", "-D", "-R", "-T"].contains(&w.as_str());
+                let dropped = w == "sudo"
                     || w == "env"
                     || w.starts_with('-')
                     || w.split_once('=').is_some_and(|(name, _)| {
                         !name.is_empty()
                             && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-                    })
-            }) {
+                    });
+                if !dropped {
+                    break;
+                }
                 words.remove(0);
+                if takes_value && !words.is_empty() {
+                    words.remove(0);
+                }
             }
             words
         })
@@ -128,8 +139,12 @@ pub fn scan(workflows: &[(String, String)]) -> (Vec<Site>, Vec<String>) {
         for job in jobs {
             let steps = match workflows::job_steps(text, &job) {
                 Ok(steps) => steps,
-                // A job that calls a reusable workflow has no steps of its own.
-                Err(_) => continue,
+                // A job that calls a reusable workflow (`uses:`) has no steps of its own.
+                Err(_) if workflows::job_uses(text, &job).ok().flatten().is_some() => continue,
+                Err(e) => {
+                    problems.push(format!("{file}: {job}: {e}"));
+                    continue;
+                }
             };
             let mut installs = Vec::new();
             for (i, step) in steps.iter().enumerate() {
