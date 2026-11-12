@@ -5,8 +5,8 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hmac::{Hmac, KeyInit, Mac};
-use kbf_front::{IssuedPackKey, MIN_SECRET_BYTES, MintError, PackKeyMint};
-use kbf_pack::{MAX_LARGE, MAX_PACKS, Slot, mac_input_v1, minute_of};
+use kbf_front::{IssuedPackKey, IssuedPutDir, MIN_SECRET_BYTES, MintError, PackKeyMint};
+use kbf_pack::{MAX_LARGE, MAX_PACKS, Slot, mac_input_put_dir, mac_input_v1, minute_of};
 use kbf_types::Digest;
 use sha2::Sha256;
 
@@ -214,4 +214,125 @@ fn a_key_set_is_the_packs_then_the_large_objects() {
             .expect_err("refused");
         assert_eq!(refused, MintError::SetSize { packs, large });
     }
+}
+
+/// The 40 hex digits of a nonce of `mac`'s first 16 bytes and `minute`.
+fn nonce_hex(mac: &[u8], minute: u32) -> String {
+    let mac: String = mac[..16].iter().map(|byte| format!("{byte:02x}")).collect();
+    format!("{mac}{minute:08x}")
+}
+
+/// The minute of [`now`].
+fn minute() -> u32 {
+    let secs = now()
+        .duration_since(UNIX_EPOCH)
+        .expect("after the epoch")
+        .as_secs();
+    minute_of(secs).expect("in range")
+}
+
+/// Asserts that a put directory is `cas/b/<lease>/<40 hex digits>`, minted deterministically,
+/// each input changing it, and that it and every key in it verify for its action and minute and
+/// for no other action or secret.
+#[test]
+fn a_minted_put_dir_and_its_keys_verify() {
+    let dir = mint().mint_put_dir(LEASE, &action(), now()).expect("a dir");
+    let nonce = dir
+        .dir()
+        .strip_prefix(&format!("cas/b/{LEASE}/"))
+        .expect("under the lease");
+    assert_eq!(nonce.len(), 40, "{nonce}");
+    assert!(
+        nonce
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    );
+    let again = mint().mint_put_dir(LEASE, &action(), now()).expect("a dir");
+    assert_eq!(dir, again);
+    let other_secret = PackKeyMint::new(&[9; 32]).expect("a mint");
+    let changed = [
+        mint().mint_put_dir("another", &action(), now()),
+        mint().mint_put_dir(LEASE, &blob("other").0, now()),
+        mint().mint_put_dir(LEASE, &action(), now() + Duration::from_secs(60)),
+        other_secret.mint_put_dir(LEASE, &action(), now()),
+    ];
+    for other in changed {
+        assert_ne!(other.expect("a dir").dir(), dir.dir());
+    }
+    let minute_start = UNIX_EPOCH + Duration::from_secs(u64::from(minute()) * 60);
+    assert_eq!(mint().verify_put_dir(&dir, &action()), Ok(minute_start));
+    let set = dir.key_set();
+    for key in set.packs().iter().chain(set.large()) {
+        assert_eq!(
+            mint().verify(key, &action()),
+            Ok(minute_start),
+            "{}",
+            key.key()
+        );
+    }
+    assert!(matches!(
+        mint().verify_put_dir(&dir, &blob("other").0),
+        Err(MintError::NotMinted(_))
+    ));
+    assert!(matches!(
+        other_secret.verify_put_dir(&dir, &action()),
+        Err(MintError::NotMinted(_))
+    ));
+}
+
+/// Asserts that a put directory's MAC is not one a slotted key carries: a directory whose nonce
+/// is the v1 MAC of slot 0 (the same lease, action and minute, no slot) does not verify, and a
+/// put directory's nonce given a slot (`-0`) does not verify as a slotted key.
+#[test]
+fn a_put_dir_mac_is_not_a_slotted_keys() {
+    let keyed = |message: &[u8]| {
+        let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(SECRET).expect("a key");
+        mac.update(message);
+        mac.finalize().into_bytes().to_vec()
+    };
+    let v1 = keyed(&mac_input_v1(LEASE, &action(), minute()).expect("input"));
+    let dir = IssuedPutDir::new(LEASE, &nonce_hex(&v1, minute())).expect("a dir");
+    assert!(matches!(
+        mint().verify_put_dir(&dir, &action()),
+        Err(MintError::NotMinted(_))
+    ));
+    let put_dir = keyed(&mac_input_put_dir(LEASE, &action(), minute()).expect("input"));
+    let ours = IssuedPutDir::new(LEASE, &nonce_hex(&put_dir, minute())).expect("a dir");
+    assert!(mint().verify_put_dir(&ours, &action()).is_ok());
+    let slotted = format!("{}-0", nonce_hex(&put_dir, minute()));
+    let slotted = IssuedPackKey::new(LEASE, &slotted).expect("a key");
+    assert!(matches!(
+        mint().verify(&slotted, &action()),
+        Err(MintError::NotMinted(_))
+    ));
+}
+
+/// Asserts that a put directory with an empty or slashed lease or nonce, or one too long for the
+/// names in it to be object keys, is refused to make, and that one whose nonce is not 40 hex
+/// digits does not verify.
+#[test]
+fn a_put_dir_of_a_bad_part_is_refused() {
+    for (lease, nonce) in [("", "ab"), (LEASE, ""), ("a/b", "ab"), (LEASE, "a/b")] {
+        assert!(
+            IssuedPutDir::new(lease, nonce).is_err(),
+            "{lease:?} {nonce:?}"
+        );
+    }
+    // A nonce long enough that the directory is an object key and `<dir>/pack7` is not.
+    let edge = (1..2048).map(|n| "a".repeat(n)).find(|nonce| {
+        IssuedPackKey::new(LEASE, nonce).is_ok() && IssuedPutDir::new(LEASE, nonce).is_err()
+    });
+    assert!(
+        edge.is_some(),
+        "a key too long for its directory's names is refused"
+    );
+    let short = IssuedPutDir::new(LEASE, "abc").expect("a dir");
+    assert!(matches!(
+        mint().verify_put_dir(&short, &action()),
+        Err(MintError::NotMinted(_))
+    ));
+    assert_eq!(
+        short.key(Slot::Large(3)).expect("a slot").key(),
+        format!("cas/b/{LEASE}/abc/L3")
+    );
 }

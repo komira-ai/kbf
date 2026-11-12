@@ -332,8 +332,12 @@ impl State {
         }
         let rules = [
             (
-                pinned(&spec.image),
-                "the image is not pinned by digest (NAME@sha256:HEX)",
+                pinned(&spec.image) || (spec.image.is_empty() && !spec.layers.is_empty()),
+                "the image is not pinned by digest (NAME@sha256:HEX), or is empty without a layer",
+            ),
+            (
+                !spec.image.is_empty() || spec.command.starts_with('/'),
+                "a job with no image runs no absolute command",
             ),
             (
                 files_named(&spec.files),
@@ -493,6 +497,7 @@ impl State {
             truncated: record.truncated,
             times: Some(record.times),
             usage: None,
+            input_failure: None,
         })
     }
 

@@ -83,6 +83,7 @@ pub(super) fn check(js: &mut JsAgentFlags, beside: &Beside<'_>) -> Result<Vec<St
     let mut warnings = Vec::new();
 
     let config = &mut js.config;
+    config.task_out = task.out.clone();
     config.presign_ceiling = MAX_EXPIRY.saturating_sub(task.url_slack);
     let longest = config.max_run + config.run_margin;
     if longest > config.presign_ceiling {

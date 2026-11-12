@@ -242,6 +242,31 @@ async fn a_pack_with_other_bytes_is_never_served() {
     assert_eq!(rig.packs.metrics().digest_mismatches.get(), 1);
 }
 
+/// Asserts that a record that is not its digest costs the pack location: the read that saw it
+/// is UNAVAILABLE and counts one dropped location, the index then has no row, and the next
+/// read of the digest is a fallback to the node, not a second mismatch.
+#[tokio::test]
+async fn a_damaged_record_drops_its_location_and_the_next_read_falls_back() {
+    let (rig, fake) = rig_over_fake(PackSettings::default()).await;
+    let (digest, bytes) = blob("the bytes this digest names, again");
+    rig.store
+        .seed("cas/f/fe1/bad/0001", &vec![b'X'; bytes.len()])
+        .await;
+    row(&rig, "cas/f/fe1/bad/0001", bytes.len() as u64, &digest);
+
+    let first = read_range(&rig.front, name(&digest), 0, 0).await;
+    let located = rig.index.locate(&[index_form(&digest)]).expect("locate");
+    let _next = read_range(&rig.front, name(&digest), 0, 0).await;
+
+    assert_eq!(first.expect_err("not served").code(), Code::Unavailable);
+    assert_eq!(located, [None]);
+    let metrics = rig.packs.metrics();
+    assert_eq!(metrics.locations_dropped.get(), 1);
+    assert_eq!(metrics.digest_mismatches.get(), 1);
+    assert_eq!(metrics.fallbacks.get(), 1);
+    assert_eq!(fake.calls.load(SeqCst), 1);
+}
+
 /// Asserts what stays on the node: a Write of a blob over the packs' bound, a Write and a Read
 /// of a compressed blob, and a Read of a blob over the bound whose row the index has: each is
 /// answered by the node, and no pack is written.
@@ -439,5 +464,6 @@ async fn the_counters_are_rendered() {
         assert!(text.contains(line), "{line:?} missing from\n{text}");
     }
     assert!(text.contains("# TYPE kbf_pack_digest_mismatches_total counter"));
+    assert!(text.contains("kbf_pack_locations_dropped_total 0\n"));
     assert!(text.contains("# TYPE kbf_pack_inflight_bytes gauge"));
 }

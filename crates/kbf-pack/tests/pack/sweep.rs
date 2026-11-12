@@ -375,6 +375,55 @@ async fn an_old_large_object_is_swept_and_a_young_one_kept() {
     assert_eq!((report.deleted, report.young), (1, 1));
 }
 
+fn put_dir_key(minute: u32, slot: Slot) -> String {
+    TaskPackKey::in_put_dir("lease1", [0xab; 16], minute, slot)
+        .expect("a key")
+        .to_string()
+}
+
+/// Asserts that the age of an object of a put directory (`.../<nonce>/pack`, `/pack<k>`,
+/// `/L<i>`) is read from the minute of its nonce, as a slotted key's is, and that a name in a
+/// directory that is not one of a run's objects (a `.part` file among them) says none.
+#[test]
+fn the_age_of_a_put_dir_object_is_read_from_its_nonce() {
+    let at = |minute: u32| SystemTime::UNIX_EPOCH + Duration::from_secs(u64::from(minute) * 60);
+    for slot in [Slot::Pack(0), Slot::Pack(7), Slot::Large(0), Slot::Large(7)] {
+        let key = put_dir_key(29_833_335, slot);
+        assert_eq!(task_key_age(&key), Some(at(29_833_335)), "{key}");
+    }
+    let pack = put_dir_key(1, Slot::Pack(0));
+    assert!(pack.ends_with("00000001/pack"), "{pack}");
+    for name in ["pack.part", "pack0", "readme", "L0/x"] {
+        let key = pack.replace("/pack", &format!("/{name}"));
+        assert_eq!(task_key_age(&key), None, "{key}");
+    }
+}
+
+/// Asserts that a sweep gated by `task_key_age` deletes the old orphan objects of a put
+/// directory and keeps a young one, as it does slotted keys.
+#[tokio::test]
+async fn an_old_put_dir_object_is_swept_and_a_young_one_kept() {
+    let rig = Rig::new();
+    let old = u32::try_from(OLD).expect("fits");
+    let old_pack = put_dir_key(old, Slot::Pack(0));
+    let old_large = put_dir_key(old, Slot::Large(3));
+    let young = put_dir_key(u32::try_from(YOUNG).expect("fits"), Slot::Pack(1));
+    for key in [&old_pack, &old_large, &young] {
+        rig.store.seed(key, b"bytes").await;
+    }
+    let gates = SweepGates {
+        age_of: Box::new(task_key_age),
+        is_leader: Box::new(|| true),
+        verifying: Box::new(|_| false),
+        claim: Box::new(|_| Some(Box::new(()))),
+    };
+    let report = sweeper(&rig, gates).sweep(now()).await.unwrap();
+    assert!(!rig.store.holds(&old_pack).await);
+    assert!(!rig.store.holds(&old_large).await);
+    assert!(rig.store.holds(&young).await);
+    assert_eq!((report.deleted, report.young), (2, 1));
+}
+
 /// Asserts that an old key under `cas/l/` (content-bound large objects), `cas/f/<writer>/`
 /// (frontend packs) or `cas/d/` (daemon packs) is never listed, so never aged or deleted,
 /// while the old task pack and large keys under `cas/b/` beside them are.

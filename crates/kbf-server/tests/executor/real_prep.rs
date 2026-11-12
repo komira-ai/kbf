@@ -546,3 +546,67 @@ async fn a_failed_jobs_output_quoting_the_arguments_never_reaches_the_log() {
         assert!(!said.contains(secret), "{secret} in {said}");
     }
 }
+
+/// Asserts that the real preparation, asked through the executor's seam for a run that commits
+/// into a put directory, gives the lease's directory under the frontend's mint (verified for
+/// the action), good for the wall and the slack, and the closure of the action's input root
+/// with its `Directory` kept; and that an action whose input is not held is the caller's.
+#[tokio::test]
+async fn the_real_preparation_gives_a_put_dir_and_the_kept_closure() {
+    use kbf_server::executor::{PrepareError, RunPrepare};
+
+    let node = Arc::new(Cache::memory());
+    let held = store_action(&node, b"an input", true).await;
+    let missing = store_action(&node, b"an input nobody stored", false).await;
+    let dir = kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), "kbf-server-put-dir");
+    let secret = dir.path().join("secret");
+    private(&secret, &[SECRET, b"\n".as_slice()].concat());
+    let presign = dir.path().join("presign.json");
+    private(
+        &presign,
+        br#"{"access_key_id": "AKIAFAKE", "secret_access_key": "fake-secret-key"}"#,
+    );
+    let argv = [
+        "frontend".to_owned(),
+        "--storage=http://127.0.0.1:1".to_owned(),
+        format!("--task-secret-file={}", secret.display()),
+        "--task-put-endpoint=http://127.0.0.1:9300".to_owned(),
+        format!("--task-put-bucket={BUCKET}"),
+        format!("--task-put-credentials-file={}", presign.display()),
+        "--task-read-url=https://127.0.0.1:9400".to_owned(),
+        "--task-out-mode=put-dir".to_owned(),
+        "--task-out-root=/mnt/ts/put".to_owned(),
+    ];
+    let matches = frontend::command()
+        .try_get_matches_from(argv)
+        .expect("flags");
+    let flags = frontend::parse(&matches).expect("a frontend's flags");
+    let storage = Arc::new(CacheStorage::new(
+        Arc::clone(&node),
+        SegmentsConfig::DEFAULT,
+    ));
+    let backend = Backend::remote_over(storage, None);
+    let prep = flags
+        .task
+        .expect("task flags")
+        .open(backend)
+        .expect("the run preparation opens");
+    let now = UNIX_EPOCH + Duration::from_secs(1_790_000_040);
+    let wall = Duration::from_secs(600);
+
+    // The seam's method, not `RunPrep`'s own of the same name.
+    let run = RunPrepare::prepare_put_dir(&prep, "7-3", &held, now, wall)
+        .await
+        .expect("prepared");
+
+    let nonce = run.dir.strip_prefix("cas/b/7-3/").expect("the lease's");
+    let issued = kbf_front::IssuedPutDir::new("7-3", nonce).expect("a dir");
+    assert_eq!(prep.mint().verify_put_dir(&issued, &held), Ok(now));
+    assert_eq!(run.not_after, 1_790_000_040 + 600 + 600);
+    assert_eq!(run.kept.directory_count(), 1);
+    let refused = RunPrepare::prepare_put_dir(&prep, "7-3", &missing, now, wall).await;
+    assert!(
+        matches!(refused, Err(PrepareError::Refused(_))),
+        "{refused:?}"
+    );
+}

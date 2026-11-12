@@ -57,6 +57,7 @@ pub struct FaultyStore {
     pass_gets: AtomicU32,
     pass_lists: AtomicU32,
     fail_lists: AtomicU32,
+    garble_gets: AtomicU32,
     vanishing: Mutex<Option<String>>,
     ranges: Mutex<Vec<(String, u64, u64)>>,
 }
@@ -87,9 +88,15 @@ impl FaultyStore {
             pass_gets: AtomicU32::new(0),
             pass_lists: AtomicU32::new(0),
             fail_lists: AtomicU32::new(0),
+            garble_gets: AtomicU32::new(0),
             vanishing: Mutex::new(None),
             ranges: Mutex::new(Vec::new()),
         }
+    }
+
+    /// The next `n` reads answer the bytes asked for with their first byte flipped.
+    pub fn garble_gets(&self, n: u32) {
+        self.garble_gets.store(n, Ordering::SeqCst);
     }
 
     /// The next `n` writes fail before they store anything.
@@ -219,7 +226,15 @@ impl ObjectStore for FaultyStore {
         if doomed.as_deref() == Some(key.as_str()) {
             self.inner.delete(key).await?;
         }
-        self.inner.get_range(key, range).await
+        let bytes = self.inner.get_range(key, range).await?;
+        if fires(&self.garble_gets) {
+            let mut garbled = bytes.to_vec();
+            if let Some(first) = garbled.first_mut() {
+                *first ^= 0xff;
+            }
+            return Ok(Bytes::from(garbled));
+        }
+        Ok(bytes)
     }
 
     async fn may_hold(&self, key: &ObjectKey) -> Result<bool, ObjectStoreError> {
@@ -268,6 +283,7 @@ pub struct FlakyIndex {
     fail_locate: AtomicU32,
     fail_touch: AtomicU32,
     fail_unreferenced: AtomicU32,
+    fail_drop: AtomicU32,
     held: Mutex<Vec<bool>>,
     finds: Mutex<Vec<usize>>,
     locates: Mutex<Vec<usize>>,
@@ -286,6 +302,7 @@ impl FlakyIndex {
             fail_locate: AtomicU32::new(0),
             fail_touch: AtomicU32::new(0),
             fail_unreferenced: AtomicU32::new(0),
+            fail_drop: AtomicU32::new(0),
             held: Mutex::new(Vec::new()),
             finds: Mutex::new(Vec::new()),
             locates: Mutex::new(Vec::new()),
@@ -326,6 +343,11 @@ impl FlakyIndex {
     /// The next `n` questions of which keys are unreferenced fail.
     pub fn fail_unreferenced(&self, n: u32) {
         self.fail_unreferenced.store(n, Ordering::SeqCst);
+    }
+
+    /// The next `n` drops of a location are refused as unsupported.
+    pub fn fail_drop(&self, n: u32) {
+        self.fail_drop.store(n, Ordering::SeqCst);
     }
 
     /// For each record, whether the store held the pack when it was recorded.
@@ -406,6 +428,13 @@ impl PackIndex for FlakyIndex {
             return Err(PackIndexError::NotMigrated);
         }
         self.inner.unreferenced_keys(keys)
+    }
+
+    fn drop_location(&self, digest: &BlobDigest, pack_key: &str) -> Result<bool, PackIndexError> {
+        if fires(&self.fail_drop) {
+            return Err(PackIndexError::Unsupported);
+        }
+        self.inner.drop_location(digest, pack_key)
     }
 }
 

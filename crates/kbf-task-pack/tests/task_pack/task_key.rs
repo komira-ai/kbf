@@ -1,5 +1,5 @@
-//! The key of a task pack, `cas/b/<build>/<nonce>-<slot>`: its shape, its minute, and the
-//! message its MAC covers.
+//! The slotted key of a task pack, `cas/b/<build>/<nonce>-<slot>`: its shape, its minute, and
+//! the message its MAC covers. The put directory's layout is `put_dir_key`'s.
 
 use kbf_task_pack::{
     MAC_LEN, MAX_BUILD_BYTES, MAX_LARGE, MAX_PACKS, Slot, TaskKeyError, TaskPackKey, check_build,
@@ -105,7 +105,9 @@ fn a_slot_past_the_run_is_refused_to_make() {
 }
 
 /// Asserts that no build and no nonce can hold a `/`: a build with one is refused to make, and a
-/// key with an extra one does not parse, so a key cannot leave `cas/b/<build>/`.
+/// key with an extra one does not parse (a `/` in front of a slotted nonce makes the nonce's
+/// first part the nonce of a put directory, which is not 40 hex digits; two more are no key's
+/// shape), so a key cannot leave `cas/b/<build>/`.
 #[test]
 fn the_key_has_no_slash_in_build_or_nonce() {
     assert_eq!(
@@ -114,13 +116,18 @@ fn the_key_has_no_slash_in_build_or_nonce() {
     );
     let nonce = format!("{MAC_HEX}{MINUTE_HEX}-0");
     let in_build = format!("cas/b/a/b/{nonce}");
-    assert!(matches!(
+    assert_eq!(
         TaskPackKey::parse(&in_build),
-        Err(TaskKeyError::NotAPackKey(_))
-    ));
+        Err(TaskKeyError::Nonce("b".to_owned()))
+    );
     let in_nonce = format!("cas/b/{BUILD}/x/{nonce}");
-    assert!(matches!(
+    assert_eq!(
         TaskPackKey::parse(&in_nonce),
+        Err(TaskKeyError::Nonce("x".to_owned()))
+    );
+    let deeper = format!("cas/b/{BUILD}/x/y/{nonce}");
+    assert!(matches!(
+        TaskPackKey::parse(&deeper),
         Err(TaskKeyError::NotAPackKey(_))
     ));
 }

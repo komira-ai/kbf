@@ -60,11 +60,12 @@ pub use self::meter::{Direction, Meter, Method};
 pub use self::owners::{Owner, Owners};
 pub use self::packed::{
     Claim, Claimed, Clock, CommitError, DEFAULT_INFLIGHT_BYTES, DEFAULT_UPLOAD_IDLE_TIMEOUT, Held,
-    Ingested, IssuedKeySet, IssuedPackKey, LargeWriteThrough, MAX_COMMIT_BLOBS,
+    Ingested, IssuedKeySet, IssuedPackKey, IssuedPutDir, LargeWriteThrough, MAX_COMMIT_BLOBS,
     MAX_PACKED_BLOB_BYTES, MAX_UNTRUSTED_BLOB_BYTES, MAX_UNTRUSTED_LARGE_BYTES,
     MAX_UNTRUSTED_MANIFEST_BYTES, MAX_UNTRUSTED_PACK_BYTES, MAX_UNTRUSTED_READ_BYTES,
     MAX_UPLOAD_IDLE_TIMEOUT, MIN_SECRET_BYTES, MintError, PackKeyMint, PackMetrics, PackSettings,
-    PackStore, Packs, RejectReason, StoreError, UntrustedLimits, VerifyingKeys, ingest, ingest_set,
+    PackStore, Packs, RejectReason, StoreError, UntrustedLimits, VerifyingKeys, ingest,
+    ingest_put_dir, ingest_set,
 };
 use self::{ac::ProxyActionCache, bytestream::RawByteStream, cas::ProxyCas};
 use crate::MAX_MESSAGE_BYTES;

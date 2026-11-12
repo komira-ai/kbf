@@ -124,6 +124,7 @@ fn start(dir: &Path, packs: Packs, state: Option<Arc<dyn Store>>) -> Start {
         platform: "linux-x86_64".to_owned(),
         packs,
         state,
+        slot: Arc::new(std::sync::OnceLock::new()),
     }
 }
 
@@ -285,4 +286,23 @@ async fn a_state_store_that_fails_the_record_fails_the_start() {
             job_tree::key(&root)
         )
     );
+}
+
+/// Asserts that a publish sets the base it published in the executor's slot, and that a
+/// failed publish leaves the slot empty: the executor writes no action tree over a base that
+/// was not published.
+#[tokio::test]
+async fn the_published_base_is_set_for_the_executor_and_a_failed_one_is_not() {
+    let dir = scratch_dir("base-tree-slot");
+    bundle_dir(&dir, COMMIT, &["linux-x86_64"]);
+    let (packs, _) = packs();
+    let ready = start(&dir, packs.clone(), None);
+    let slot = Arc::clone(&ready.slot);
+    let published = ready.publish_as(COMMIT, now).await.expect("published");
+    assert_eq!(slot.get(), Some(&published.base));
+
+    let failed = start(&dir, packs, None);
+    let empty = Arc::clone(&failed.slot);
+    assert!(failed.publish_as("another-commit", now).await.is_err());
+    assert!(empty.get().is_none());
 }

@@ -188,3 +188,31 @@ fn stage_and_commit_needs_a_tree_and_no_url_and_out_dir_needs_it() {
     ];
     assert_eq!(without_tree(&grant).kind(), ClapKind::ArgumentConflict);
 }
+
+/// Asserts that the command line `kbf-server`'s executor gives a put-directory job (its
+/// `put_dir_argv`: `--tree` with no value, then `--stage-and-commit`, `--out-dir /out`, the
+/// action, the lease and the deadline, as separate words) parses to a tree run at `/` that
+/// commits into `/out`.
+#[test]
+fn the_executors_put_dir_command_line_parses() {
+    let action = format!("{}/12", "ab".repeat(32));
+    let argv = [
+        "kbf-task",
+        "--tree",
+        "--stage-and-commit",
+        "--out-dir",
+        "/out",
+        "--action",
+        &action,
+        "--lease",
+        "7-3",
+        "--deadline-ms",
+        "90000",
+    ];
+    let cli = Cli::try_parse_from(argv).expect("flags");
+    assert_eq!(cli.tree.as_deref(), Some(Path::new("/")));
+    assert!(cli.stage_and_commit);
+    assert_eq!(cli.out_dir(), Path::new("/out"));
+    assert_eq!(cli.lease, "7-3");
+    assert_eq!(cli.deadline_ms, 90_000);
+}

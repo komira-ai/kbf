@@ -64,10 +64,10 @@ mod verifying;
 pub(in crate::proxy) use self::bytestream::{applies, read as read_stream, write as write_stream};
 pub(in crate::proxy) use self::cas::{Served, find_missing, read_blob, read_many, store_batch};
 pub use self::commit::{
-    CommitError, Ingested, IssuedKeySet, IssuedPackKey, MAX_COMMIT_BLOBS, MAX_UNTRUSTED_BLOB_BYTES,
-    MAX_UNTRUSTED_LARGE_BYTES, MAX_UNTRUSTED_MANIFEST_BYTES, MAX_UNTRUSTED_PACK_BYTES,
-    MAX_UNTRUSTED_READ_BYTES, MIN_SECRET_BYTES, MintError, PackKeyMint, RejectReason, StoreError,
-    UntrustedLimits, ingest, ingest_set,
+    CommitError, Ingested, IssuedKeySet, IssuedPackKey, IssuedPutDir, MAX_COMMIT_BLOBS,
+    MAX_UNTRUSTED_BLOB_BYTES, MAX_UNTRUSTED_LARGE_BYTES, MAX_UNTRUSTED_MANIFEST_BYTES,
+    MAX_UNTRUSTED_PACK_BYTES, MAX_UNTRUSTED_READ_BYTES, MIN_SECRET_BYTES, MintError, PackKeyMint,
+    RejectReason, StoreError, UntrustedLimits, ingest, ingest_put_dir, ingest_set,
 };
 pub(in crate::proxy) use self::hit::held;
 pub use self::metrics::{LargeWriteThrough, PackMetrics};

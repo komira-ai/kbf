@@ -36,6 +36,7 @@
 //! | failed to start no-capacity | `infra` | `UNAVAILABLE`: rerun, as the farm's own retry policy says |
 //! | failed to start start-timeout | `infra` | `UNAVAILABLE`: rerun, as the farm's own retry policy says |
 //! | failed to start exclusive-not-ready | `infra` | `UNAVAILABLE`: rerun, as the farm's own retry policy says |
+//! | failed to start input-unavailable | `infra` | `UNAVAILABLE`: a host path the job named could not be read on its host, rerun |
 //! | failed to start host-unsafe | `infra` | `UNAVAILABLE`: rerun, as the farm's own retry policy says |
 //! | failed to start egress-unchecked | `infra` | `UNAVAILABLE`: the host's agent could not check the limits of the job's network (`--executor-network`), rerun |
 //! | failed to start, any other code or detail | `infra` | `UNAVAILABLE`: rerun |
@@ -186,6 +187,9 @@ fn failed_to_start(job: &Job) -> Verdict {
         StartFailureCode::StartTimeout => infra(job, "the job failed to start: start-timeout"),
         StartFailureCode::ExclusiveNotReady => {
             infra(job, "the job failed to start: exclusive-not-ready")
+        }
+        StartFailureCode::InputUnavailable => {
+            infra(job, "the job failed to start: input-unavailable")
         }
         StartFailureCode::AgentRefused => match agent_code(&job.start_failure_detail) {
             QUOTA_UNAVAILABLE => {

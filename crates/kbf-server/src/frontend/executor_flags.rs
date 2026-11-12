@@ -30,17 +30,19 @@
 use std::error::Error;
 use std::path::PathBuf;
 use std::str::FromStr as _;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use clap::{Arg, ArgAction, ArgMatches};
+use kbf_front::action_tree::BaseTree;
 use kbf_front::{Backend, Packs};
 use kbf_job_client::{Client, Origin, Token};
 use kbf_types::ImageRef;
 
 use crate::Farm;
 use crate::executor::{
-    Config, Delivery, Deps, Executor, ExecutorKind, Front, FrontParts, Metrics, Network, RunSource,
+    Config, Delivery, Deps, Executor, ExecutorKind, Front, FrontParts, Metrics, Network,
+    PutDirParts, RunSource, TaskOut,
 };
 
 const KIND: &str = "executor";
@@ -389,6 +391,9 @@ pub struct JsAgentFlags {
     /// `--executor-base-tree`: the directory of the release's `SHA256SUMS` and base tree
     /// bundles.
     pub base_tree: PathBuf,
+    /// Where the base tree published from [`JsAgentFlags::base_tree`] is set when the frontend
+    /// starts: what the executor writes its action trees over (`--task-out-mode put-dir`).
+    pub published: Arc<OnceLock<BaseTree>>,
 }
 
 /// What `--executor` says: the daemons, or jobs of a job service.
@@ -549,6 +554,7 @@ fn js_agent_flags(m: &ArgMatches) -> Result<JsAgentFlags, String> {
         base_image,
         kbf_image,
         base_tree: m.get_one::<PathBuf>(BASE_TREE).cloned().unwrap_or_default(),
+        published: Arc::default(),
     })
 }
 
@@ -582,9 +588,18 @@ fn image(m: &ArgMatches, id: &str, long: &str) -> Result<ImageRef, String> {
 
 impl JsAgentFlags {
     /// The executor's seams over the frontend's own `packs`, CAS `backend` (built over the same
-    /// packs) and `source` of keys, writes and grants.
+    /// packs) and `source` of keys, writes and grants; with `--task-out-mode put-dir`, writing
+    /// each run's action tree over the base tree [`JsAgentFlags::published`] holds.
     #[must_use]
     pub fn front(&self, packs: Packs, backend: Backend, source: RunSource) -> Front {
+        let put_dir = match self.config.task_out {
+            TaskOut::PutDir(_) => Some(PutDirParts::new(
+                &packs,
+                &backend,
+                Arc::clone(&self.published),
+            )),
+            TaskOut::Presigned => None,
+        };
         Front::new(FrontParts {
             packs,
             backend,
@@ -592,6 +607,7 @@ impl JsAgentFlags {
             prepare: source.prepare,
             base_image: self.base_image.clone(),
             kbf_image: self.kbf_image.clone(),
+            put_dir,
         })
     }
 
@@ -644,3 +660,7 @@ impl JsAgentFlags {
 #[cfg(test)]
 #[path = "executor_flags_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "executor_flags_front_tests.rs"]
+mod front_tests;

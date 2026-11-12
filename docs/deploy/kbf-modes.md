@@ -432,6 +432,26 @@ and readable by it alone; the pack-key mint and the grant key are made from it, 
 job-facing listener must verify grants with the same secret. No secret is a flag. Left out, no
 secret file is read and the frontend serves exactly as before.
 
+**Where a task's outputs go** (`--task-out-mode`, default `presigned`; the `[task-runs]` table).
+`presigned` is the runs above. `put-dir` (docs/design/jobs-on-jobscheduler-and-tierstore.md) needs
+`--task-out-root`, the tier store's put directory on every host (`<mp>/put`, an absolute path; the
+action trees are under `<mp>/trees` beside it), and the switch and its companions as above (the mint
+is the secret's; the presigned writes and the grant are not used). For each run the frontend
+collects the input closure, writes the action tree over the published kbf base tree, and mints one
+put directory, `cas/b/<lease>/<nonce>` (its nonce a MAC over the lease, the action and the minute).
+The job has no image: its root is the one read-only layer `<mp>/trees/<digest>`, it runs
+`/.kbf-tools/kbf-task --tree --stage-and-commit --out-dir /out`, the directory
+`<mp>/put/cas/b/<lease>/<nonce>` is mounted read-write and `no_exec` at `/out`, and it has no
+network, no file and no secret, whatever `--executor-network` says. The host's agent must list
+`<mp>/put` as a `--mount-root` (read-write) and `<mp>/trees` as a mount root. The task commits
+`pack`, `pack1` to `pack7` and `L0` to `L7` there; the ingest reads `pack`'s footer and manifest,
+the other packs' footers and each large object's length, refuses an output path the Command does
+not declare, streams each large object into the CAS, and records each pack's footer in the pack
+index without reading its records (the first location recorded for a digest is kept, and a read
+of a record that does not hash to its digest drops that location). An input root that holds
+`.kbf-out` at its top is refused, and a `whole_machine` action cannot run in this mode (the job
+service gives a whole-host job no mount).
+
 **The `cas/b/` janitor** (off by default; the `[task-runs]` table of `kbf.toml`). The packs and
 large objects tasks write under `cas/b/` are not all kept: a refused run, a run that failed after
 its write, the unused keys of a key set, and a large object the ingest has already copied into the

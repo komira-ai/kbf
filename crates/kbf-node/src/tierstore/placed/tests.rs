@@ -49,3 +49,34 @@ fn forgetting_a_place_not_kept_changes_nothing() {
     placed.forget(&digest(1));
     assert_eq!((placed.len(), placed.kept().order.len()), (0, 0));
 }
+
+/// Asserts that dropping a location through `Placed` evicts the kept place for the digest and
+/// removes the inner index's row only when it points into the named pack, so the next `locate`
+/// asks the inner index and finds none.
+#[test]
+fn dropping_a_location_forgets_the_kept_place_and_the_row() {
+    let inner =
+        kbf_pack_index::memory::MemoryPackIndex::new(Arc::new(kbf_state::ManualClock::default()));
+    let held = digest(4);
+    let pack = NewPack {
+        key: "cas/d/n/b/1".to_owned(),
+        writer: "n".to_owned(),
+        size: 20,
+        blobs: vec![kbf_pack_index::PackBlob {
+            digest: held,
+            offset: 0,
+        }],
+    };
+    inner.record_pack(&pack).unwrap();
+    let placed = Placed::new(Arc::new(inner));
+    assert!(placed.locate(&[held]).unwrap()[0].is_some());
+    assert_eq!(placed.len(), 1);
+
+    assert!(!placed.drop_location(&held, "cas/d/n/b/other").unwrap());
+    assert_eq!(placed.len(), 0);
+    assert!(placed.locate(&[held]).unwrap()[0].is_some());
+    assert!(placed.drop_location(&held, "cas/d/n/b/1").unwrap());
+
+    assert_eq!(placed.len(), 0);
+    assert_eq!(placed.locate(&[held]).unwrap(), [None]);
+}

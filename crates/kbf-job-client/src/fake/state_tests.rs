@@ -680,3 +680,36 @@ fn a_cancelled_job_has_the_intent_only_until_it_ends() {
         (JobState::Cancelled, false)
     );
 }
+
+/// Asserts the rule for a job whose root is its layers, as the service has it: no image is
+/// taken with a layer and an absolute command, and refused (`INVALID_ARGUMENT`, nothing
+/// recorded) with no layer or with a relative or empty command.
+#[test]
+fn a_job_with_no_image_needs_a_layer_and_an_absolute_command() {
+    let tree = js_proto::v1::Layer {
+        source: Some(js_proto::v1::layer::Source::HostPath(
+            "/mnt/ts/trees/abc".to_owned(),
+        )),
+    };
+    let imageless = |name: &str, command: &str, layers: Vec<js_proto::v1::Layer>| JobSpec {
+        image: String::new(),
+        command: command.to_owned(),
+        layers,
+        ..spec(name)
+    };
+    let mut state = state();
+    for bad in [
+        imageless("no-layer", "/bin/tool", Vec::new()),
+        imageless("relative", "bin/tool", vec![tree.clone()]),
+        imageless("empty", "", vec![tree.clone()]),
+    ] {
+        let status = state.submit(bad.clone()).unwrap_err();
+        assert_eq!(status.code(), Code::InvalidArgument, "{bad:?}");
+        assert!(refusal_of(&status).is_none(), "{bad:?}");
+        assert!(state.jobs().is_empty(), "{bad:?}");
+    }
+    let taken = state
+        .submit(imageless("layered", "/bin/tool", vec![tree]))
+        .expect("taken");
+    assert_eq!(taken.spec.expect("the spec").image, "");
+}

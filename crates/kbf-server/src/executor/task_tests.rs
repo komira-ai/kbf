@@ -3,7 +3,7 @@ use std::time::Duration;
 use kbf_proto::reapi::Digest;
 use kbf_types::LeaseId;
 
-use super::{Delivery, PackKey, Secret, TaskArgs, build_id};
+use super::{Delivery, PackKey, Secret, TaskArgs, build_id, put_dir_argv};
 
 fn args<'a>(action: &'a Digest, grant: &'a Secret, url: &'a Secret, plain: bool) -> TaskArgs<'a> {
     TaskArgs {
@@ -331,4 +331,30 @@ fn argv_delivery_is_unchanged() {
         ]
     );
     assert!(task.files(Delivery::InsecureArgv).is_empty());
+}
+
+/// Asserts the task tool's command line for a run that commits into a put directory: the tree
+/// at `/`, the commit into `/out`, the action, the lease's build id and the deadline, and
+/// nothing that names a url, a grant or a secret.
+#[test]
+fn a_put_dir_run_is_told_the_tree_and_out_and_no_secret() {
+    let argv = put_dir_argv(&digest(), LeaseId::new(7, 3), Duration::from_secs(90));
+    let want = [
+        "--tree",
+        "--stage-and-commit",
+        "--out-dir",
+        "/out",
+        "--action",
+        &format!("{}/12", "ab".repeat(32)),
+        "--lease",
+        "7-3",
+        "--deadline-ms",
+        "90000",
+    ];
+    assert_eq!(argv, want);
+    assert!(
+        !argv
+            .iter()
+            .any(|arg| arg.contains("url") || arg.contains("grant"))
+    );
 }

@@ -75,9 +75,12 @@ async fn lookups(
     let lookup = |error: kbf_storage::StorageError| NoTree::Lookup {
         why: error.to_string(),
     };
-    let asks = blobs
+    // Collected, so the future holds the asks and not the closure that made them: a future
+    // that holds a closure over a borrowed chunk cannot be proved `Send` for every lifetime.
+    let asks: Vec<_> = blobs
         .chunks(LOCATE_CHUNK)
-        .map(|chunk| async move { Ok((chunk, source.locate_packed(chunk).await?)) });
+        .map(|chunk| async move { Ok((chunk, source.locate_packed(chunk).await?)) })
+        .collect();
     let answers: Vec<_> = stream::iter(asks)
         .buffered(ASKS_IN_FLIGHT)
         .try_collect()

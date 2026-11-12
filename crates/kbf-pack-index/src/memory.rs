@@ -194,6 +194,20 @@ impl PackIndex for MemoryPackIndex {
         let unknown = keys.iter().filter(|k| !state.packs.contains_key(*k));
         Ok(unknown.cloned().collect())
     }
+
+    fn drop_location(&self, digest: &BlobDigest, pack_key: &str) -> Result<bool, PackIndexError> {
+        let mut guard = self.lock();
+        let state = &mut *guard;
+        let points_here = state.blobs.get(digest).is_some_and(|b| b.pack == pack_key);
+        if !points_here {
+            return Ok(false);
+        }
+        state.blobs.remove(digest);
+        // A row points only into a pack that is recorded, so the pack is there.
+        let pack = state.packs.get_mut(pack_key).into_iter();
+        pack.for_each(|row| row.info.live_blobs = row.info.live_blobs.saturating_sub(1));
+        Ok(true)
+    }
 }
 
 /// Opens memory indexes for the conformance suite.

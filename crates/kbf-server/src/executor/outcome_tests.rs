@@ -188,6 +188,13 @@ fn cases() -> Vec<(&'static str, Case)> {
             ),
         ),
         (
+            "failed to start input-unavailable",
+            judged(
+                failed_to_start(StartFailureCode::InputUnavailable),
+                none.clone(),
+            ),
+        ),
+        (
             "failed to start host-unsafe",
             judged(refused_to_start("host-unsafe"), none.clone()),
         ),

@@ -59,6 +59,10 @@ pub struct PackMetrics {
     pub read_errors: Counter,
     /// Reads of a blob whose pack held other bytes than its digest: never served.
     pub digest_mismatches: Counter,
+    /// Pack locations dropped from the index because the pack held other bytes than the digest
+    /// (each also a [`PackMetrics::digest_mismatches`]): the next read of that blob finds no
+    /// row and goes to the storage nodes.
+    pub locations_dropped: Counter,
     /// Uploads that had to wait for room, because the uploads in flight held all of
     /// `--pack-inflight-bytes`.
     pub upload_waits: Counter,
@@ -80,6 +84,11 @@ pub struct PackMetrics {
     pub(super) untrusted_rejects: [Counter; UNTRUSTED_REASONS.len()],
     /// Packs a task wrote that `ingest` turned into a result.
     pub(super) ingests: Counter,
+    /// Of [`PackMetrics::ingests`], the runs a task committed into a put directory
+    /// (`ingest_put_dir`).
+    pub(super) ingest_put_dirs: Counter,
+    /// Packs of a put directory recorded in the index from their footer alone.
+    pub(super) put_dir_records: Counter,
     /// Packs `ingest` refused, by [`RejectReason`] in the order of its variants.
     pub(super) ingest_rejects: [Counter; RejectReason::ALL.len()],
     /// Ingests that the store, the index or the action cache could not answer.
@@ -154,6 +163,18 @@ impl PackMetrics {
     #[must_use]
     pub fn ingests(&self) -> u64 {
         self.ingests.get()
+    }
+
+    /// Of [`PackMetrics::ingests`], the runs a task committed into a put directory.
+    #[must_use]
+    pub fn ingest_put_dirs(&self) -> u64 {
+        self.ingest_put_dirs.get()
+    }
+
+    /// Packs of a put directory recorded in the index from their footer alone.
+    #[must_use]
+    pub fn put_dir_records(&self) -> u64 {
+        self.put_dir_records.get()
     }
 
     /// The packs `ingest` refused for `reason`.
@@ -270,6 +291,11 @@ impl PackMetrics {
                 &self.digest_mismatches,
             ),
             (
+                "kbf_pack_locations_dropped_total",
+                "Pack locations dropped from the index after a read found other bytes than the digest",
+                &self.locations_dropped,
+            ),
+            (
                 "kbf_pack_upload_waits_total",
                 "Uploads that waited for room: the uploads in flight held all the bytes allowed",
                 &self.upload_waits,
@@ -331,6 +357,18 @@ impl PackMetrics {
             "Packs a task wrote that were ingested into an action result: the action ran, \
              whether or not it was cached",
             self.ingests.get(),
+        );
+        families.counter(
+            "kbf_pack_ingest_put_dirs_total",
+            "Of those, the runs a task committed into a put directory, ingested from pack 0's \
+             manifest and the footers",
+            self.ingest_put_dirs.get(),
+        );
+        families.counter(
+            "kbf_pack_put_dir_records_total",
+            "Packs a task committed into a put directory that were recorded in the pack index \
+             from their footer, no record read",
+            self.put_dir_records.get(),
         );
         families.head(
             "kbf_pack_ingest_rejects_total",

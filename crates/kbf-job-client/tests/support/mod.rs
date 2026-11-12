@@ -123,6 +123,10 @@ pub fn full_spec(contents: &str) -> JobSpec {
         }],
         priority: 7,
         labels: map(&[("team", "build"), ("kind", "test")]),
+        // The fields this pin added, empty: the goldens are of a spec without them.
+        host_ports: Vec::new(),
+        layers: Vec::new(),
+        mounts: Vec::new(),
     }
 }
 
@@ -167,6 +171,7 @@ pub fn full_result() -> JobResult {
             disk_bytes: Some(1 << 30),
             gpus: 1,
         }),
+        input_failure: None,
     }
 }
 

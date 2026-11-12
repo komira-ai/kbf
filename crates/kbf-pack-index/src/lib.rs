@@ -17,15 +17,25 @@
 //!   [`PackIndexError::Conflict`] and changes nothing. The contents compared are the writer,
 //!   the size, the number of blobs and the blobs the first record made rows for, each at its
 //!   offset; a blob that already had a row in another pack then is not compared. A retry is
-//!   recognised while the rows the first record made still point at the pack: a change that
-//!   moves or removes them must say how a later record of the key is answered.
+//!   recognised while the rows the first record made still point at the pack. A row removed
+//!   by [`PackIndex::drop_location`] also takes one off the pack's `live_blobs`, so the
+//!   rows left are the ones the pack counts and a later record of the identical pack under
+//!   the same key is still `created: false`, not [`PackIndexError::Conflict`]; the dropped
+//!   blob is not given a row again by it (the key is recorded), only by a record of another
+//!   pack that holds it. A pack all of whose rows are dropped has no row pointing at it, so
+//!   [`PackIndex::dead_packs`] lists it once its grace has passed.
 //! - **The first location of a blob is kept.** A blob already indexed in another pack keeps
 //!   that location; the later pack holds a copy that no row points at.
 //! - **Digest and key batches are bounded.** A call that takes digests or keys names at most
 //!   [`MAX_BATCH`] of them; the blob list of a pack is bounded by the pack, not by the index.
+//! - **A location can be dropped.** A reader that fetched bytes that are not a blob's digest
+//!   asks the index to drop that blob's row, but only while it still points into the pack
+//!   the bytes came from; a row that points at another pack is kept. A dropped blob has no
+//!   row until a pack that holds it is recorded: the first location wins again.
 //! - **Reads are queries.** [`PackIndex::locate`], [`PackIndex::find_missing`],
 //!   [`PackIndex::dead_packs`] and [`PackIndex::unreferenced_keys`] write nothing, and
-//!   [`PackIndex::touch`] writes `last_touch_us` and nothing else.
+//!   [`PackIndex::touch`] writes `last_touch_us` and nothing else. Blob rows are inserted by
+//!   a record and removed only by [`PackIndex::drop_location`].
 
 use std::time::Duration;
 
@@ -229,6 +239,25 @@ pub trait PackIndex: Send + Sync {
     /// [`PackIndexError::TooMany`] for more than [`MAX_BATCH`] keys;
     /// [`PackIndexError::Store`] when the store fails.
     fn unreferenced_keys(&self, keys: &[String]) -> Result<Vec<String>, PackIndexError>;
+
+    /// Removes the row of `digest` only if it points into the pack recorded under
+    /// `pack_key`, and takes one off that pack's `live_blobs`. Returns whether a row was
+    /// removed: `false` when the digest has no row or its row points at another pack.
+    ///
+    /// A reader calls it when the bytes it fetched for the digest from that pack are not the
+    /// digest. Afterwards [`PackIndex::locate`] answers `None` for the digest until a pack
+    /// that holds it is recorded.
+    ///
+    /// The default answers [`PackIndexError::Unsupported`], for an index reached through a
+    /// service that takes no such call.
+    ///
+    /// # Errors
+    /// [`PackIndexError::Unsupported`] or [`PackIndexError::Refused`] from an index that does
+    /// not take or allow the call; [`PackIndexError::Store`] when the store fails.
+    fn drop_location(&self, digest: &BlobDigest, pack_key: &str) -> Result<bool, PackIndexError> {
+        let _ = (digest, pack_key);
+        Err(PackIndexError::Unsupported)
+    }
 }
 
 #[cfg(any(test, feature = "test-support", feature = "postgres"))]

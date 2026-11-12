@@ -52,10 +52,10 @@ pub fn build_id(lease: LeaseId) -> String {
     format!("{}-{}", lease.term, lease.seq)
 }
 
-/// The one object key a task may write: `cas/b/<build>/<nonce>-<slot>`, issued by the
-/// frontend's ingest ([`Ingest::mint`](crate::executor::Ingest::mint)) for one farm lease of
-/// one action and verified by the same ingest when the pack is read. The executor does not
-/// look inside it.
+/// The one object key a task may write, `cas/b/<build>/<nonce>-<slot>`, or the put directory it
+/// commits its objects into, `cas/b/<build>/<nonce>`: issued by the frontend's ingest
+/// ([`Ingest::mint`](crate::executor::Ingest::mint)) for one farm lease of one action and
+/// verified by the same ingest when the run is read. The executor does not look inside it.
 ///
 /// A farm lease is one job: its id is made from the lease ([`job_id`](crate::executor::job_id)),
 /// a submit whose answer was lost is sent again with the same id and makes no second job, and
@@ -172,6 +172,26 @@ impl TaskArgs<'_> {
         }
         argv
     }
+}
+
+/// The flags of the task tool for the run of `action` on `lease` that commits into a put
+/// directory: the inputs are the tree at `/` (`--tree`), the outputs are committed into
+/// [`OUT_TARGET`](crate::executor::OUT_TARGET) (`--stage-and-commit`, `--out-dir`), and the action
+/// may run for `deadline`. No url, no grant and no secret: the job has no network.
+#[must_use]
+pub fn put_dir_argv(action: &Digest, lease: LeaseId, deadline: Duration) -> Vec<String> {
+    vec![
+        "--tree".to_owned(),
+        "--stage-and-commit".to_owned(),
+        "--out-dir".to_owned(),
+        crate::executor::OUT_TARGET.to_owned(),
+        "--action".to_owned(),
+        format!("{}/{}", action.hash, action.size_bytes),
+        "--lease".to_owned(),
+        build_id(lease),
+        "--deadline-ms".to_owned(),
+        deadline.as_millis().to_string(),
+    ]
 }
 
 impl TaskArgs<'_> {

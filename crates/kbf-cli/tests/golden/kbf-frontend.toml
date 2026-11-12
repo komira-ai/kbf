@@ -333,10 +333,14 @@ task-janitor-page-size = 500
 # task-large-credentials-file = "PATH"
 # The most bytes of one large object, above 67108864 (64 MiB, the most a pack record holds): the cap a task and the ingest of its run hold an object to. Used only with `--task-large-credentials-file`
 task-large-max-bytes = 536870912
-# The large-object keys each run gets, 0 to 8 (`cas/b/<lease>/<nonce>-L<i>`): an output blob over 64 MiB is written whole to one of them. A ceiling, as for `--task-max-packs`. Without `--task-large-credentials-file` no run gets one, whatever this says. Used only with `--task-secret-file`
+# The large-object keys each run of presigned writes gets, 0 to 8 (`cas/b/<lease>/<nonce>-L<i>`): an output blob over 64 MiB is written whole to one of them. A ceiling, as for `--task-max-packs`. Without `--task-large-credentials-file` no run gets one, whatever this says. Used only with `--task-secret-file`
 task-max-large = 8
-# The pack keys each run gets, 1 to 8 (`cas/b/<lease>/<nonce>-<k>`): a ceiling, not a prediction, since the sizes of a run's outputs are not known before it runs; a key a task does not write is never used. Used only with `--task-secret-file`
+# The pack keys each run of presigned writes gets, 1 to 8 (`cas/b/<lease>/<nonce>-<k>`): a ceiling, not a prediction, since the sizes of a run's outputs are not known before it runs; a key a task does not write is never used. Used only with `--task-secret-file`
 task-max-packs = 8
+# Where a task's outputs go. `presigned`: a presigned write of each pack and large object to the tier store, the inputs read through a read grant. `put-dir`: the task commits them as files into a put directory under `--task-out-root`, mounted at /out, which the host's tier store uploads; the inputs are the action tree under the trees directory beside it, the job's root, and the job has no network. Used only with `--task-secret-file` and `--executor js-agent`
+task-out-mode = "presigned"
+# With `--task-out-mode put-dir`: the tier store's put directory on every host (`<mp>/put`, an absolute path), which the host's agent lists as a read-write mount root; each run's directory is `<mp>/put/cas/b/<lease>/<nonce>`, and its action tree `<mp>/trees/<digest>`
+# task-out-root = "PATH"
 # The bucket of `--task-put-endpoint` a task's pack is written to, under the key `cas/b/<lease>/<nonce>-0`
 # task-put-bucket = "BUCKET"
 # A file with the presign-only key of the tier store, as JSON `{"access_key_id": "...", "secret_access_key": "..."}`, owned by this user and readable by it alone (mode 0600 or 0400). The key signs a `PUT` of one object under its prefix and does nothing else; its ceiling (`max_expires_secs` of the store's `--presign-key-file`) must be at least 14400, and the store's `--presign-max-expires` too
