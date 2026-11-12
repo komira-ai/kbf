@@ -376,6 +376,15 @@ impl Ingest for Front {
         action: &Digest,
         limits: &UntrustedLimits,
     ) -> Ingested {
+        // The key is read first: a key that is not one issued is the wrong key, whatever the
+        // action's digest.
+        let key = match &self.parts.put_dir {
+            Some(_) => put_dir_of(key).map(Issued::PutDir),
+            None => issued_of(key).map(Issued::Key),
+        };
+        let Some(key) = key else {
+            return Ingested::Reject(RejectReason::WrongKey);
+        };
         let action = match cas_digest(action) {
             Ok(action) => action,
             Err(why) => return Ingested::Unavailable(why),
@@ -387,16 +396,14 @@ impl Ingest for Front {
         };
         let (packs, backend, mint) = (&self.parts.packs, &self.parts.backend, &self.parts.mint);
         let build = build_id(lease);
-        let done = if self.parts.put_dir.is_some() {
-            let Some(dir) = put_dir_of(key) else {
-                return Ingested::Reject(RejectReason::WrongKey);
-            };
-            kbf_front::ingest_put_dir(packs, backend, mint, &build, &dir, &action, &limits).await
-        } else {
-            let Some(issued) = issued_of(key) else {
-                return Ingested::Reject(RejectReason::WrongKey);
-            };
-            kbf_front::ingest(packs, backend, mint, &build, &issued, &action, &limits).await
+        let done = match key {
+            Issued::PutDir(dir) => {
+                kbf_front::ingest_put_dir(packs, backend, mint, &build, &dir, &action, &limits)
+                    .await
+            }
+            Issued::Key(key) => {
+                kbf_front::ingest(packs, backend, mint, &build, &key, &action, &limits).await
+            }
         };
         match done {
             kbf_front::Ingested::Ran { result, cached } => Ingested::Ran { result, cached },
@@ -404,6 +411,12 @@ impl Ingest for Front {
             kbf_front::Ingested::Unavailable(why) => Ingested::Unavailable(why.to_string()),
         }
     }
+}
+
+/// What the frontend issued a run: a key, or a put directory.
+enum Issued {
+    Key(IssuedPackKey),
+    PutDir(IssuedPutDir),
 }
 
 /// The key the frontend issued, from its text `cas/b/<build>/<nonce>`.
@@ -429,6 +442,12 @@ impl Front {
         now: SystemTime,
         wall: Duration,
     ) -> Result<PackKey, MintError> {
+        // Before anything is read or minted: without the base no tree can be written.
+        let Some(base) = put_dir.base.get() else {
+            return Err(MintError::Unavailable(
+                "the kbf base tree is not published: no action tree can be written".to_owned(),
+            ));
+        };
         let prepared = self
             .parts
             .prepare
@@ -441,11 +460,6 @@ impl Front {
                 "the put directory's keys end before the run's wall time does".to_owned(),
             ));
         }
-        let Some(base) = put_dir.base.get() else {
-            return Err(MintError::Unavailable(
-                "the kbf base tree is not published: no action tree can be written".to_owned(),
-            ));
-        };
         let tree = put_dir.writer.write(&prepared.kept, base).await;
         let tree = tree.map_err(|no| {
             let why = format!("no action tree: {no}");

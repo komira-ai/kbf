@@ -307,8 +307,9 @@ fn a_put_dir_mac_is_not_a_slotted_keys() {
     ));
 }
 
-/// Asserts that a put directory with an empty or slashed lease or nonce is refused to make, and
-/// that one whose nonce is not 40 hex digits does not verify.
+/// Asserts that a put directory with an empty or slashed lease or nonce, or one too long for the
+/// names in it to be object keys, is refused to make, and that one whose nonce is not 40 hex
+/// digits does not verify.
 #[test]
 fn a_put_dir_of_a_bad_part_is_refused() {
     for (lease, nonce) in [("", "ab"), (LEASE, ""), ("a/b", "ab"), (LEASE, "a/b")] {
@@ -317,13 +318,21 @@ fn a_put_dir_of_a_bad_part_is_refused() {
             "{lease:?} {nonce:?}"
         );
     }
+    // A nonce long enough that the directory is an object key and `<dir>/pack7` is not.
+    let edge = (1..2048).map(|n| "a".repeat(n)).find(|nonce| {
+        IssuedPackKey::new(LEASE, nonce).is_ok() && IssuedPutDir::new(LEASE, nonce).is_err()
+    });
+    assert!(
+        edge.is_some(),
+        "a key too long for its directory's names is refused"
+    );
     let short = IssuedPutDir::new(LEASE, "abc").expect("a dir");
     assert!(matches!(
         mint().verify_put_dir(&short, &action()),
         Err(MintError::NotMinted(_))
     ));
     assert_eq!(
-        short.key(Slot::Large(3)).key(),
+        short.key(Slot::Large(3)).expect("a slot").key(),
         format!("cas/b/{LEASE}/abc/L3")
     );
 }

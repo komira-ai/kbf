@@ -222,7 +222,7 @@ impl PackKeyMint {
         dir: &IssuedPutDir,
         action: &Digest,
     ) -> Result<SystemTime, MintError> {
-        self.verify(&dir.key(Slot::Pack(0)), action)
+        self.verify(dir.pack(), action)
     }
 
     fn truncated(&self, message: &[u8]) -> [u8; MAC_LEN] {

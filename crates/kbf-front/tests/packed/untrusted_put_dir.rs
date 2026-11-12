@@ -71,13 +71,17 @@ impl PutDir {
     /// The farm with an Action whose Command is `command`, stored unless `None` (a Command the
     /// store does not hold).
     async fn with_command(command: Option<Bytes>, named: Digest) -> Self {
-        let rig = Rig::new().await;
         let action = reapi::Action {
             command_digest: Some(wire(&named)),
             input_root_digest: Some(wire(&blob("the inputs").0)),
             ..reapi::Action::default()
         };
-        let action_bytes = Bytes::from(action.encode_to_vec());
+        Self::with_action(Bytes::from(action.encode_to_vec()), command, named).await
+    }
+
+    /// The farm with the Action `action_bytes`, and `command` stored as `named` unless `None`.
+    async fn with_action(action_bytes: Bytes, command: Option<Bytes>, named: Digest) -> Self {
+        let rig = Rig::new().await;
         let action = sha256(&action_bytes);
         let mut blobs = vec![(action, action_bytes)];
         if let Some(command) = command {
@@ -120,7 +124,11 @@ impl PutDir {
     }
 
     fn key(&self, slot: Slot) -> String {
-        self.dir.key(slot).key().to_owned()
+        self.dir
+            .key(slot)
+            .expect("a slot of a run")
+            .key()
+            .to_owned()
     }
 
     async fn put(&self, slot: Slot, bytes: &[u8]) {
@@ -518,4 +526,49 @@ impl PutDir {
             Err(status) => status.code(),
         }
     }
+}
+
+/// Asserts that an Action that does not decode, or names no Command, is a `BadManifest`: the
+/// outputs cannot be checked against what it declares.
+#[tokio::test]
+async fn an_action_whose_command_cannot_be_found_is_a_bad_manifest() {
+    let command = command_bytes(&DECLARED, false);
+    let named = sha256(&command);
+    let nameless = reapi::Action {
+        input_root_digest: Some(wire(&blob("the inputs").0)),
+        ..reapi::Action::default()
+    };
+    for action in [
+        Bytes::from_static(b"\xff\xff not an action"),
+        Bytes::from(nameless.encode_to_vec()),
+    ] {
+        let farm = PutDir::with_action(action, Some(command.clone()), named).await;
+        let (_, zero, one) = farm.two_packs();
+        farm.put(Slot::Pack(0), &zero).await;
+        farm.put(Slot::Pack(1), &one).await;
+        farm.refused(farm.run().await, RejectReason::BadManifest);
+    }
+}
+
+/// Asserts that a pack index that fails the record leaves the run `Unavailable`, with nothing
+/// counted as recorded and nothing cached; the same directory is ingested once the index
+/// answers.
+#[tokio::test]
+async fn an_index_that_fails_the_record_leaves_the_run_unavailable() {
+    let farm = PutDir::new().await;
+    let (manifest, zero, one) = farm.two_packs();
+    farm.put(Slot::Pack(0), &zero).await;
+    farm.put(Slot::Pack(1), &one).await;
+    farm.rig.index.fail_record(1);
+
+    let got = farm.run().await;
+
+    assert!(matches!(got, Ingested::Unavailable(_)), "{got:?}");
+    assert_eq!(farm.rig.packs.metrics().put_dir_records(), 0);
+    assert_eq!(farm.cached_code().await, Code::NotFound);
+    let want = Ingested::Ran {
+        result: Box::new(result_of(&manifest)),
+        cached: true,
+    };
+    assert_eq!(farm.run().await, want);
 }

@@ -507,8 +507,9 @@ async fn a_large_cap_at_a_pack_record_does_not_open() {
 
 /// Asserts the output mode: presigned writes by default (and the default needs nothing without
 /// the switch), a put directory under `--task-out-root` with `--task-out-mode put-dir`; a mode
-/// without its root, a root without its mode, a root that is no absolute path in normal form,
-/// a mode that is neither, and a root without the switch are refused, each by name.
+/// without its root (with the switch or without), a root without its mode, a root that is no
+/// absolute path in normal form, a mode that is neither, and a root without the switch are
+/// refused.
 #[test]
 fn the_output_mode_is_presigned_or_a_put_dir_under_its_root() {
     assert_eq!(
@@ -527,10 +528,16 @@ fn the_output_mode_is_presigned_or_a_put_dir_under_its_root() {
         TaskOut::PutDir(roots)
     );
     let refusal = |more: &[&str]| set(more).expect_err("refused").to_string();
-    let no_root = refusal(&["--task-out-mode=put-dir"]);
-    assert!(
-        no_root.contains("--task-out-mode put-dir needs --task-out-root"),
-        "{no_root}"
+    assert_eq!(
+        set(&["--task-out-mode=put-dir"])
+            .expect_err("refused")
+            .kind(),
+        ErrorKind::MissingRequiredArgument
+    );
+    assert_eq!(
+        refused(&["--task-out-mode=put-dir"]),
+        ErrorKind::MissingRequiredArgument,
+        "put-dir needs its root, and the root the switch"
     );
     let no_mode = refusal(&["--task-out-root=/mnt/ts/put"]);
     assert!(no_mode.contains("--task-out-root is only for"), "{no_mode}");

@@ -71,6 +71,12 @@ const FIND_PACK: &str = concat!(
     "FROM pack WHERE key = $1"
 );
 
+/// [`FIND_PACK`], holding the pack's row against an update until the transaction ends.
+const FIND_PACK_SHARED: &str = concat!(
+    "SELECT pack_id, key, writer, size, created_us, blob_count, live_blobs ",
+    "FROM pack WHERE key = $1 FOR SHARE"
+);
+
 /// `$1` hashes, `$2` sizes, `$3` offsets, `$4` a pack's id: how many of the blobs have a row
 /// in that pack at that offset.
 const MATCHED: &str = concat!(
@@ -303,7 +309,9 @@ impl PostgresPackIndex {
         pack: &NewPack,
         rows: &Rows,
     ) -> Result<Recorded, PackIndexError> {
-        let held = client.query_one(FIND_PACK, &[&pack.key]);
+        // The pack's row is locked until the transaction ends: a drop of one of its locations,
+        // which locks the row first, cannot change the count between this read and `MATCHED`.
+        let held = client.query_one(FIND_PACK_SHARED, &[&pack.key]);
         let held = held.map_err(failed)?;
         let pack_id: i64 = held.get(0);
         let info = pack_info(&held, 1);

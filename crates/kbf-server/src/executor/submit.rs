@@ -197,9 +197,12 @@ pub(super) async fn prepare(
         })?;
         let key = minted(ctx, lease, action, wall).await?;
         let tree = ctx.deps.inputs.tree(lease).await?;
-        let spec = put_dir_spec(
-            ctx, roots, &key, &tree, lease, action, timeout, wall, booking,
-        );
+        let job = PutDirJob {
+            roots,
+            dir: &key,
+            tree: &tree,
+        };
+        let spec = put_dir_spec(ctx, &job, lease, action, timeout, wall, booking);
         let grants = Grants::of(&spec, []);
         return Ok(Arc::new(Prepared { spec, key, grants }));
     }
@@ -285,15 +288,19 @@ fn labels(ctx: &Ctx<'_>) -> BTreeMap<String, String> {
     .collect()
 }
 
-/// The job of `lease`'s run that commits into the put directory `dir` and reads the action
-/// tree `tree` (its digest in hex), both under `roots`: the tree is the root, the tool of the
-/// base tree runs, the directory is at `/out`, and nothing else is given.
-#[allow(clippy::too_many_arguments)] // Each is one part of the job, from the one prepare.
+/// Where a put-directory job reads and writes: the roots, the run's put directory
+/// (`cas/b/<lease>/<nonce>`) and its action tree (the digest, in hex).
+struct PutDirJob<'a> {
+    roots: &'a PutDirRoots,
+    dir: &'a PackKey,
+    tree: &'a str,
+}
+
+/// The job of `lease`'s run of `job`: the tree is the root, the tool of the base tree runs, the
+/// directory is at `/out`, and nothing else is given.
 fn put_dir_spec(
     ctx: &Ctx<'_>,
-    roots: &PutDirRoots,
-    dir: &PackKey,
-    tree: &str,
+    job: &PutDirJob<'_>,
     lease: LeaseId,
     action: &Digest,
     timeout: Duration,
@@ -314,8 +321,8 @@ fn put_dir_spec(
         network: NetworkLevel::None.into(),
         ports: Vec::new(),
         host_ports: Vec::new(),
-        layers: vec![roots.layer(tree)],
-        mounts: vec![roots.mount(dir.as_str())],
+        layers: vec![job.roots.layer(job.tree)],
+        mounts: vec![job.roots.mount(job.dir.as_str())],
         files: Vec::new(),
         priority: 0,
         labels: labels(ctx),

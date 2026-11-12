@@ -205,7 +205,9 @@ async fn a_preparation_that_cannot_give_a_dir_refuses_the_run() {
     assert!(matches!(got, Err(MintError::Refused(_))), "{got:?}");
 
     let presigned_only = Rig::over(Prepared::new(), Prepared::new(), |packs, backend| {
-        Some(PutDirParts::new(packs, backend, Arc::new(OnceLock::new())))
+        let published = Arc::new(OnceLock::new());
+        published.set(base()).expect("set once");
+        Some(PutDirParts::new(packs, backend, published))
     });
     let action = action_with_input(&presigned_only, "input").await;
     let got = presigned_only.front.mint(lease(), &action, WALL).await;
@@ -218,7 +220,8 @@ async fn a_preparation_that_cannot_give_a_dir_refuses_the_run() {
 }
 
 /// Asserts that a pack committed as `pack` in the run's directory is ingested into the action's
-/// result, and that a key that is no put directory is refused as the wrong key.
+/// result, that a key that is no put directory is refused as the wrong key (whatever the
+/// action's digest), and that a bad digest of the action with the right key is unavailable.
 #[tokio::test]
 async fn a_pack_committed_in_the_dir_becomes_the_result() {
     let rig = rig();
@@ -232,6 +235,25 @@ async fn a_pack_committed_in_the_dir_becomes_the_result() {
         matches!(done, Ingested::Ran { cached: true, .. }),
         "{done:?}"
     );
+
+    // The key is judged before the action: a bad digest does not hide a wrong key.
+    let bad_action = Digest {
+        hash: "not hex".to_owned(),
+        size_bytes: -1,
+    };
+    let got = rig
+        .front
+        .ingest(lease(), &PackKey::new("cas/b/7-3"), &bad_action, &limits())
+        .await;
+    assert!(
+        matches!(got, Ingested::Reject(RejectReason::WrongKey)),
+        "{got:?}"
+    );
+    let got = rig
+        .front
+        .ingest(lease(), &key, &bad_action, &limits())
+        .await;
+    assert!(matches!(got, Ingested::Unavailable(_)), "{got:?}");
 
     for bad in ["cas/b/7-3", "elsewhere/7-3/abc"] {
         let got = rig

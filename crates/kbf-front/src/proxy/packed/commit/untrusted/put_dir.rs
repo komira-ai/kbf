@@ -21,10 +21,15 @@
 //! - **Large objects** are as in [`super::ingest_set`]: each is streamed once through SHA-256
 //!   into the CAS, since a blob over the record cap is never read from a pack location.
 //!
-//! What the lighter proof gives up: a record whose bytes are not its digest is recorded at its
-//! offset all the same. The first read of it hashes it (as every read from a pack does) and
-//! the reader drops that location, so a lying pack costs its own action's outputs and one
-//! failed read, and never moves a digest that another pack recorded first (design, section 7).
+//! What the lighter proof gives up (design, section 7 and open question 1): a record whose bytes
+//! are not its digest is recorded at its offset all the same. The first read of it hashes it
+//! (as every read from a pack does), reads it again, and drops that location, so a lying pack
+//! costs its own action's outputs and one failed read, and never moves a digest that another
+//! pack recorded first. Until that read, the index answers the digest as held; and a pack
+//! recorded after the lying one keeps no row for the digest (the first location is kept), so
+//! once the lie is dropped the digest has no location until a pack that holds it is recorded
+//! again. An action-cache entry written for the lying run names its outputs as they were
+//! claimed: a reader that fails to find one runs the action again.
 
 use kbf_pack::TaskManifest;
 use kbf_pack_index::{NewPack, Recorded};
@@ -59,7 +64,7 @@ pub async fn ingest_put_dir(
         backend,
         mint,
         lease,
-        keys: &keys,
+        keys,
         action,
         limits,
         proof: Proof::Manifest,

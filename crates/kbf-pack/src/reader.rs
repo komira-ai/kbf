@@ -146,12 +146,12 @@ impl<S: ObjectStore> Reader<S> {
                     fresh.push((digest, blob.clone()));
                 }
                 if fetch == (Fetch::Damaged { dropped: false }) {
-                    damaged.push((digest, span.pack.to_string()));
+                    damaged.push((digest, span.pack.clone(), offset));
                 }
                 found.insert(digest, fetch);
             }
         }
-        self.drop_damaged(damaged, &mut found).await;
+        self.drop_damaged(damaged, &mut found, &mut fresh).await;
         self.fill_cache(fresh).await;
         self.note(&found).await;
         let answer = digests
@@ -270,15 +270,41 @@ impl<S: ObjectStore> Reader<S> {
         }
     }
 
-    /// Drops the location of each blob whose bytes were not its digest from the index, and
-    /// marks the blob's [`Fetch::Damaged`] with whether it went. A drop that fails or is
-    /// unsupported is logged and leaves the answer as it was.
+    /// Reads each blob whose bytes were not its digest once more, alone, and drops its location
+    /// from the index only if the second read is damaged too: a garbled answer of the store is
+    /// not taken for a pack that holds other bytes. A second read that has the digest's bytes
+    /// is the blob's answer ([`Fetch::Found`], and cached); one the store no longer has is
+    /// [`Fetch::Lost`] and drops nothing. A damaged blob's [`Fetch::Damaged`] says whether its
+    /// location went; a drop that fails or is unsupported is logged and leaves it as it was.
     async fn drop_damaged(
         &self,
-        damaged: Vec<(BlobDigest, String)>,
+        damaged: Vec<(BlobDigest, ObjectKey, u64)>,
         found: &mut BTreeMap<BlobDigest, Fetch>,
+        fresh: &mut Vec<(BlobDigest, Bytes)>,
     ) {
-        for (digest, pack) in damaged {
+        for (digest, pack, offset) in damaged {
+            let again = Span {
+                pack,
+                start: offset,
+                end: offset + digest.size,
+                members: vec![(digest, offset)],
+            };
+            let second = match self.fetch(&again).await {
+                Ok(Some(bytes)) => finish(&digest, bytes),
+                Ok(None) => Fetch::Lost,
+                Err(error) => {
+                    tracing::warn!(%error, pack = %again.pack, "could not read a damaged blob again");
+                    continue;
+                }
+            };
+            if let Fetch::Found(bytes) = &second {
+                fresh.push((digest, bytes.clone()));
+            }
+            if second != (Fetch::Damaged { dropped: false }) {
+                found.insert(digest, second);
+                continue;
+            }
+            let pack = again.pack.to_string();
             let index = Arc::clone(&self.index);
             let key = pack.clone();
             let dropped = offload(move || index.drop_location(&digest, &key)).await;

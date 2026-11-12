@@ -68,9 +68,12 @@
 //! - Whether the paths are the Command's declared outputs (the executor knows the Command).
 //! - A replaced object (the store's create-only write is the guard).
 //!
-//! [`super::ingest_put_dir`] runs the same steps over the objects of a put directory with a
-//! lighter proof ([`Proof::Manifest`]): it also checks the outputs against the Command, and it
-//! skips step 7 and the hashing of step 9 (see `put_dir`).
+//! **A put directory.** [`super::ingest_put_dir`] runs the same steps over the objects of a put
+//! directory with a lighter proof ([`Proof::Manifest`]), and what is said above of the proof
+//! holds for [`ingest_set`] only: it checks the outputs against the Command (what is not decided
+//! here is decided there), it skips step 7, and at step 9 it records each pack's footer without
+//! reading a record. The digests of its result are then the manifest's and the footers' claims,
+//! hashed by the first read of each, not before the result is written (see `put_dir`).
 //!
 //! The `backend` must be built over the same [`Packs`] as `packs`
 //! (`Backend::remote_over(node, Some(packs))`): the Action it reads to decide on caching may be a
@@ -682,8 +685,9 @@ const fn shaped(shape: &ShapeError) -> RejectReason {
     }
 }
 
-/// The manifest of the pack for [`Packs::commit_untrusted_pack`], as the footer says. Nothing
-/// the footer says is believed: the commit hashes every record and checks the layout again.
+/// The manifest of the pack as the footer says, for [`Packs::commit_untrusted_pack`] (which
+/// believes nothing of it: it hashes every record and checks the layout again) or, under
+/// [`Proof::Manifest`], for `Packs::record_put_dir_pack` (which records it as it is).
 fn new_pack(key: &IssuedPackKey, footer: &Footer, size: u64) -> NewPack {
     let blob = |entry: &IndexEntry| PackBlob {
         digest: BlobDigest {
@@ -701,8 +705,8 @@ fn new_pack(key: &IssuedPackKey, footer: &Footer, size: u64) -> NewPack {
 }
 
 /// The result the manifest describes, sorted by path as REAPI asks. It carries the manifest's
-/// digests, which the pack's records have been hashed to, and the task's claimed timing as
-/// execution metadata ([`claimed`]), anchored at `end`.
+/// digests (which, under [`Proof::EveryByte`], the pack's records have been hashed to) and the
+/// task's claimed timing as execution metadata ([`claimed`]), anchored at `end`.
 fn rebuilt(manifest: &TaskManifest, end: SystemTime) -> ActionResult {
     let wire = digest_to_proto;
     let mut result = ActionResult {

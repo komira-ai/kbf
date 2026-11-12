@@ -462,12 +462,12 @@ fn top(children: Vec<Child>) -> Result<Manifest, NoTree> {
 /// Refuses an input root that holds a name of [`RESERVED_INPUT_NAMES`] at its top. A root the
 /// closure did not keep is left to the plan, which refuses it by name.
 fn reserved_input(kept: &KeptClosure) -> Result<(), NoTree> {
-    let Some(root) = kept.directory(kept.root()) else {
-        return Ok(());
-    };
-    let names = (root.files.iter().map(|(name, _, _)| name))
-        .chain(root.directories.iter().map(|(name, _)| name))
-        .chain(root.symlinks.iter().map(|(name, _)| name));
+    let root = kept.directory(kept.root()).into_iter();
+    let names = root.flat_map(|root| {
+        (root.files.iter().map(|(name, _, _)| name))
+            .chain(root.directories.iter().map(|(name, _)| name))
+            .chain(root.symlinks.iter().map(|(name, _)| name))
+    });
     match names
         .into_iter()
         .find(|name| RESERVED_INPUT_NAMES.contains(&name.as_str()))

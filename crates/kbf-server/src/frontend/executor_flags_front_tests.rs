@@ -45,6 +45,16 @@ impl RunPrepare for Presigned {
     }
 }
 
+/// A base tree of one symlink.
+fn base() -> kbf_front::action_tree::BaseTree {
+    let root = br#"{"v":1,"children":[{"name":"bin","kind":"symlink","target":"usr/bin"}]}"#;
+    let facts = kbf_front::action_tree::BaseFacts {
+        entries: 1,
+        depth: 1,
+    };
+    kbf_front::action_tree::BaseTree::new(root, facts).expect("a base")
+}
+
 fn flags(out: TaskOut) -> JsAgentFlags {
     let mut config = Config::new("front-1", 1, 2_000, 16 << 30);
     config.task_out = out;
@@ -94,15 +104,24 @@ async fn minted(flags: &JsAgentFlags) -> (Result<String, MintError>, usize) {
 }
 
 /// Asserts that a front of presigned writes prepares a presigned run, and that a front of put
-/// directories asks its preparation for a put directory instead (which a preparation of
-/// presigned runs only refuses), never for a presigned run.
+/// directories writes over the base its flags publish: none before it is set, and then it asks
+/// its preparation for a put directory (which a preparation of presigned runs only refuses),
+/// never for a presigned run.
 #[tokio::test]
 async fn the_front_mints_by_the_output_mode() {
     let (key, asked) = minted(&flags(TaskOut::Presigned)).await;
     assert_eq!((key, asked), (Ok("cas/b/7-3/aa-0".to_owned()), 1));
 
     let roots = PutDirRoots::new("/mnt/ts/put").expect("roots");
-    let (key, asked) = minted(&flags(TaskOut::PutDir(roots))).await;
+    let put_dir = flags(TaskOut::PutDir(roots));
+    let (key, asked) = minted(&put_dir).await;
+    assert!(
+        matches!(&key, Err(MintError::Unavailable(why)) if why.contains("base tree")),
+        "{key:?}"
+    );
+    assert_eq!(asked, 0);
+    put_dir.published.set(base()).expect("set once");
+    let (key, asked) = minted(&put_dir).await;
     assert_eq!(
         key,
         Err(MintError::Refused(

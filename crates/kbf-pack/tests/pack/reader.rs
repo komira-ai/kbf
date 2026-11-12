@@ -401,6 +401,55 @@ async fn a_damaged_record_drops_its_location() {
     assert_eq!(second, [Fetch::Missing]);
 }
 
+/// Asserts that a record the store answers garbled once is read again before its location is
+/// dropped: the second read has the digest's bytes, so the blob is found, its row stays, and
+/// the next read finds it where it was.
+#[tokio::test]
+async fn a_record_garbled_once_is_read_again_and_its_location_kept() {
+    let genuine = blob("0123456789");
+    let rig = Rig::new();
+    rig.store.seed("cas/x/honest", b"0123456789").await;
+    rig.index
+        .record_pack(&row("cas/x/honest", 10, &genuine, 0))
+        .unwrap();
+    rig.store.garble_gets(1);
+    let reader = rig.reader(None, ReaderConfig::default());
+
+    let first = reader.read(&[genuine.digest]).await.unwrap();
+
+    assert_eq!(
+        first,
+        [Fetch::Found(bytes::Bytes::from_static(b"0123456789"))]
+    );
+    let located = rig.index.locate(&[genuine.digest]).unwrap();
+    assert_eq!(
+        located[0].as_ref().map(|at| at.pack_key.as_str()),
+        Some("cas/x/honest")
+    );
+    let reads = rig.store.ranges().len();
+    assert_eq!(reads, 2, "the record was read twice");
+}
+
+/// Asserts that a damaged record whose second read the store fails keeps its location: nothing
+/// is dropped on a read that did not see the bytes, and the answer stays `Damaged`.
+#[tokio::test]
+async fn a_damaged_record_whose_second_read_fails_keeps_its_location() {
+    let genuine = blob("0123456789");
+    let rig = Rig::new();
+    rig.store.seed("cas/x/honest", b"0123456789").await;
+    rig.index
+        .record_pack(&row("cas/x/honest", 10, &genuine, 0))
+        .unwrap();
+    rig.store.garble_gets(1);
+    rig.store.fail_gets_after(1, 1);
+    let reader = rig.reader(None, ReaderConfig::default());
+
+    let first = reader.read(&[genuine.digest]).await.unwrap();
+
+    assert_eq!(first, [Fetch::Damaged { dropped: false }]);
+    assert!(rig.index.locate(&[genuine.digest]).unwrap()[0].is_some());
+}
+
 /// Asserts that a drop the index does not take leaves the read's answer `Damaged` (not
 /// dropped) and the row where it was, so the next read finds the damage again.
 #[tokio::test]

@@ -121,21 +121,6 @@ impl IssuedPackKey {
     }
 }
 
-impl IssuedPackKey {
-    /// The key of the object `slot` in the put directory `dir`: `<dir>/<name>`.
-    fn in_put_dir(dir: &IssuedPutDir, slot: Slot) -> Self {
-        let key = format!("{}/{}", dir.dir, slot.object_name());
-        // `dir` was checked to be an object key's prefix, and a name holds only letters and
-        // digits, so the key is an object key; kept whole by the fallback all the same.
-        let object = kbf_key(key.clone()).unwrap_or_else(|_| dir.object.clone());
-        Self {
-            build: dir.build.clone(),
-            key,
-            object,
-        }
-    }
-}
-
 /// The put directory the frontend issued for one run of one build: `cas/b/<build>/<nonce>`.
 /// The task commits its objects as files in it, each the object `<dir>/<name>` (`pack`,
 /// `pack<k>`, `L<i>`, [`Slot::object_name`]); [`super::ingest_put_dir`] reads exactly those
@@ -144,7 +129,10 @@ impl IssuedPackKey {
 pub struct IssuedPutDir {
     build: String,
     dir: String,
-    object: ObjectKey,
+    /// The key of `pack`, which holds the manifest.
+    pack: IssuedPackKey,
+    /// The key of every object the directory can hold: packs by slot, then large objects.
+    keys: IssuedKeySet,
 }
 
 impl IssuedPutDir {
@@ -154,15 +142,24 @@ impl IssuedPutDir {
     /// [`CommitError::Invalid`]: `build` or `nonce` is empty or holds a `/`, or a key in the
     /// directory is not an object key.
     pub fn new(build: &str, nonce: &str) -> Result<Self, CommitError> {
-        let pack = IssuedPackKey::new(build, nonce)?;
-        // Every key of the directory is `<dir>/<name>`: the longest name is checked here, the
-        // others are no longer.
-        let longest = format!("{}/{}", pack.key, Slot::Pack(MAX_PACKS - 1).object_name());
-        kbf_key(longest).map_err(|error| CommitError::Invalid(error.to_string()))?;
+        let dir = IssuedPackKey::new(build, nonce)?;
+        let key = |slot: Slot| {
+            let key = format!("{}/{}", dir.key, slot.object_name());
+            let object = kbf_key(key.clone());
+            let object = object.map_err(|error| CommitError::Invalid(error.to_string()))?;
+            Ok::<_, CommitError>(IssuedPackKey {
+                build: dir.build.clone(),
+                key,
+                object,
+            })
+        };
+        let packs: Result<Vec<_>, _> = (0..MAX_PACKS).map(|k| key(Slot::Pack(k))).collect();
+        let large: Result<Vec<_>, _> = (0..MAX_LARGE).map(|i| key(Slot::Large(i))).collect();
         Ok(Self {
-            build: pack.build,
-            dir: pack.key,
-            object: pack.object,
+            pack: key(Slot::Pack(0))?,
+            keys: IssuedKeySet::new(packs?, large?),
+            build: dir.build,
+            dir: dir.key,
         })
     }
 
@@ -178,19 +175,26 @@ impl IssuedPutDir {
         &self.build
     }
 
-    /// The key of the object `slot` in the directory.
+    /// The key of `pack`, pack 0, which holds the run's manifest.
     #[must_use]
-    pub fn key(&self, slot: Slot) -> IssuedPackKey {
-        IssuedPackKey::in_put_dir(self, slot)
+    pub fn pack(&self) -> &IssuedPackKey {
+        &self.pack
+    }
+
+    /// The key of the object `slot` in the directory; `None` for a slot a run does not have.
+    #[must_use]
+    pub fn key(&self, slot: Slot) -> Option<&IssuedPackKey> {
+        match slot {
+            Slot::Pack(k) => self.keys.packs().get(usize::from(k)),
+            Slot::Large(i) => self.keys.large().get(usize::from(i)),
+        }
     }
 
     /// The keys of every object a run may commit in the directory, as a key set: packs `pack`
     /// to `pack<MAX_PACKS-1>` and large objects `L0` to `L<MAX_LARGE-1>`.
     #[must_use]
-    pub fn key_set(&self) -> IssuedKeySet {
-        let packs = (0..MAX_PACKS).map(|k| self.key(Slot::Pack(k))).collect();
-        let large = (0..MAX_LARGE).map(|i| self.key(Slot::Large(i))).collect();
-        IssuedKeySet::new(packs, large)
+    pub fn key_set(&self) -> &IssuedKeySet {
+        &self.keys
     }
 }
 

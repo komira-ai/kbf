@@ -96,7 +96,7 @@ const MAX_SECS: u64 = kbf_front::prepare_run::MAX_EXPIRY.as_secs();
 /// The most bytes a secret file or a credentials file may hold.
 const MAX_FILE_BYTES: usize = 4096;
 
-/// The fourteen flags.
+/// The sixteen flags.
 pub(super) fn args() -> [Arg; 16] {
     [
         Arg::new(SECRET)
@@ -269,13 +269,16 @@ pub(super) fn args() -> [Arg; 16] {
             .value_name("MODE")
             .value_parser([PRESIGNED, PUT_DIR])
             .default_value(PRESIGNED)
+            // The root names the switch, so a put directory is never asked for without it.
+            .requires_if(PUT_DIR, OUT_ROOT)
             .help(
                 "Where a task's outputs go. `presigned`: a presigned write of each pack and \
                  large object to the tier store, the inputs read through a read grant. \
                  `put-dir`: the task commits them as files into a put directory under \
                  `--task-out-root`, mounted at /out, which the host's tier store uploads; the \
                  inputs are the action tree under the trees directory beside it, the job's \
-                 root, and the job has no network. Used only with `--task-secret-file`",
+                 root, and the job has no network. Used only with `--task-secret-file` and \
+                 `--executor js-agent`",
             ),
         Arg::new(OUT_ROOT)
             .long("task-out-root")
@@ -385,20 +388,16 @@ pub(super) fn from_matches(m: &ArgMatches) -> Result<Option<TaskFlags>, String> 
 fn out_of(m: &ArgMatches) -> Result<TaskOut, String> {
     let root = m.get_one::<String>(OUT_ROOT);
     let put_dir = m.get_one::<String>(OUT_MODE).map(String::as_str) == Some(PUT_DIR);
-    match (put_dir, root) {
-        (true, Some(root)) => PutDirRoots::new(root)
+    // clap gives `put-dir` its root (`requires_if`): with no root the mode is `presigned`.
+    match root {
+        Some(root) if put_dir => PutDirRoots::new(root)
             .map(TaskOut::PutDir)
             .map_err(|error| format!("--task-out-root: {error}")),
-        (true, None) => Err(
-            "--task-out-mode put-dir needs --task-out-root: the put directory of the tier \
-             store on every host"
-                .to_owned(),
-        ),
-        (false, Some(_)) => Err(
+        Some(_) => Err(
             "--task-out-root is only for --task-out-mode put-dir: drop it, or give the mode"
                 .to_owned(),
         ),
-        (false, None) => Ok(TaskOut::Presigned),
+        None => Ok(TaskOut::Presigned),
     }
 }
 

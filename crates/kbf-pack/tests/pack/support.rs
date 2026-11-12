@@ -57,6 +57,7 @@ pub struct FaultyStore {
     pass_gets: AtomicU32,
     pass_lists: AtomicU32,
     fail_lists: AtomicU32,
+    garble_gets: AtomicU32,
     vanishing: Mutex<Option<String>>,
     ranges: Mutex<Vec<(String, u64, u64)>>,
 }
@@ -87,9 +88,15 @@ impl FaultyStore {
             pass_gets: AtomicU32::new(0),
             pass_lists: AtomicU32::new(0),
             fail_lists: AtomicU32::new(0),
+            garble_gets: AtomicU32::new(0),
             vanishing: Mutex::new(None),
             ranges: Mutex::new(Vec::new()),
         }
+    }
+
+    /// The next `n` reads answer the bytes asked for with their first byte flipped.
+    pub fn garble_gets(&self, n: u32) {
+        self.garble_gets.store(n, Ordering::SeqCst);
     }
 
     /// The next `n` writes fail before they store anything.
@@ -219,7 +226,15 @@ impl ObjectStore for FaultyStore {
         if doomed.as_deref() == Some(key.as_str()) {
             self.inner.delete(key).await?;
         }
-        self.inner.get_range(key, range).await
+        let bytes = self.inner.get_range(key, range).await?;
+        if fires(&self.garble_gets) {
+            let mut garbled = bytes.to_vec();
+            if let Some(first) = garbled.first_mut() {
+                *first ^= 0xff;
+            }
+            return Ok(Bytes::from(garbled));
+        }
+        Ok(bytes)
     }
 
     async fn may_hold(&self, key: &ObjectKey) -> Result<bool, ObjectStoreError> {

@@ -337,7 +337,7 @@ task-large-max-bytes = 536870912
 task-max-large = 8
 # The pack keys each run of presigned writes gets, 1 to 8 (`cas/b/<lease>/<nonce>-<k>`): a ceiling, not a prediction, since the sizes of a run's outputs are not known before it runs; a key a task does not write is never used. Used only with `--task-secret-file`
 task-max-packs = 8
-# Where a task's outputs go. `presigned`: a presigned write of each pack and large object to the tier store, the inputs read through a read grant. `put-dir`: the task commits them as files into a put directory under `--task-out-root`, mounted at /out, which the host's tier store uploads; the inputs are the action tree under the trees directory beside it, the job's root, and the job has no network. Used only with `--task-secret-file`
+# Where a task's outputs go. `presigned`: a presigned write of each pack and large object to the tier store, the inputs read through a read grant. `put-dir`: the task commits them as files into a put directory under `--task-out-root`, mounted at /out, which the host's tier store uploads; the inputs are the action tree under the trees directory beside it, the job's root, and the job has no network. Used only with `--task-secret-file` and `--executor js-agent`
 task-out-mode = "presigned"
 # With `--task-out-mode put-dir`: the tier store's put directory on every host (`<mp>/put`, an absolute path), which the host's agent lists as a read-write mount root; each run's directory is `<mp>/put/cas/b/<lease>/<nonce>`, and its action tree `<mp>/trees/<digest>`
 # task-out-root = "PATH"
