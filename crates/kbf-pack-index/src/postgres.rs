@@ -17,7 +17,8 @@
 //! question "does any blob point at this pack" and the blobs of a pack are asked of it, and
 //! it is not on `last_touch_us`, so a touch stays a heap-only update on the `blob` page
 //! (the table's fillfactor leaves the room). A pack is dead when no `blob` row points at it,
-//! read from the rows and not from `live_blobs`, which is the count the record left.
+//! read from the rows and not from `live_blobs`, which is the count the record left less the
+//! rows `drop_location` removed.
 //!
 //! Without the flag nothing opens this index and no row of either table is read or written.
 
@@ -121,6 +122,18 @@ const DEAD: &str = concat!(
 const UNREFERENCED: &str = concat!(
     "SELECT k.key FROM UNNEST($1::text[]) WITH ORDINALITY AS k(key, ord) ",
     "WHERE NOT EXISTS (SELECT 1 FROM pack p WHERE p.key = k.key) ORDER BY k.ord"
+);
+
+/// `$1` hash, `$2` size, `$3` pack key: deletes the blob's row if it points into that pack,
+/// and takes the rows removed off the pack's `live_blobs`, so that `MATCHED` and the count
+/// stay equal. The pack row is locked first, so two drops and a record of the key agree.
+const DROP: &str = concat!(
+    "WITH p AS (SELECT pack_id FROM pack WHERE key = $3 FOR NO KEY UPDATE), ",
+    "d AS (DELETE FROM blob b USING p ",
+    "WHERE b.pack_id = p.pack_id AND b.hash = $1 AND b.size = $2 RETURNING 1), ",
+    "u AS (UPDATE pack SET live_blobs = live_blobs - (SELECT count(*) FROM d)::integer ",
+    "FROM p WHERE pack.pack_id = p.pack_id AND EXISTS (SELECT 1 FROM d)) ",
+    "SELECT count(*) FROM d"
 );
 
 /// A failed client call as the index reports it.
@@ -405,5 +418,15 @@ impl PackIndex for PostgresPackIndex {
         let found = session.conn().query(UNREFERENCED, &[&keys]);
         let found = found.map_err(failed)?;
         Ok(found.iter().map(|row| row.get(0)).collect())
+    }
+
+    fn drop_location(&self, digest: &BlobDigest, pack_key: &str) -> Result<bool, PackIndexError> {
+        let hash = digest.hash.to_vec();
+        let size = big(digest.size);
+        let mut session = self.session()?;
+        let args: [&(dyn ToSql + Sync); 3] = [&hash, &size, &pack_key];
+        let removed = session.conn().query_one(DROP, &args).map_err(failed)?;
+        let removed: i64 = removed.get(0);
+        Ok(removed > 0)
     }
 }

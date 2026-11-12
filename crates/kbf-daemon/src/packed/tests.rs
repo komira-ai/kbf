@@ -298,9 +298,10 @@ async fn a_lost_pack_fails_the_read_unavailable() {
     assert_eq!(rig.cas.stats().lost, 2);
 }
 
-/// Asserts that bytes in a pack that are not the digest are never served: `get` and `read_to`
-/// fail `Corrupt`, naming the blob, without asking the plane underneath, and each is counted as
-/// damaged.
+/// Asserts that bytes in a pack that are not the digest are never served: `get` fails
+/// `Corrupt`, naming the blob, without asking the plane underneath, and is counted as damaged;
+/// the reader dropped that location from the index, so the next read (`read_to`) finds no row
+/// and goes to the plane underneath as for any blob the index lacks, writing nothing.
 #[tokio::test]
 async fn damaged_bytes_in_a_pack_fail_the_read_corrupt() {
     let rig = Rig::new();
@@ -309,13 +310,16 @@ async fn damaged_bytes_in_a_pack_fail_the_read_corrupt() {
         label(&digest),
         "another digest, read from its pack".to_owned(),
     );
-    assert_eq!(rig.cas.get(&digest).await, Err(refused.clone()));
+    assert_eq!(rig.cas.get(&digest).await, Err(refused));
+    assert!(rig.held.calls().is_empty());
     let dir = TestDir::under(std::env::temp_dir(), "packed-cas-damaged");
     let mut file = open(&dir, "blob").await;
-    assert_eq!(rig.cas.read_to(&digest, &mut file).await, Err(refused));
+    let next = rig.cas.read_to(&digest, &mut file).await;
+    assert_eq!(next, Err(CasError::Missing(label(&digest))));
     assert!(std::fs::read(dir.join("blob")).expect("read").is_empty());
-    assert!(rig.held.calls().is_empty());
-    assert_eq!(rig.cas.stats().damaged, 2);
+    assert_eq!(rig.held.calls(), ["read_to"]);
+    let stats = rig.cas.stats();
+    assert_eq!((stats.damaged, stats.elsewhere), (1, 1));
 }
 
 /// Asserts that a plane made with `falling_back` reads a blob whose pack is gone from the plane
@@ -344,7 +348,8 @@ async fn falling_back_a_lost_pack_is_read_from_the_plane_underneath() {
 
 /// Asserts that a plane made with `falling_back` never serves bytes of a pack that are not the
 /// digest: `get` and `read_to` answer the plane underneath's true bytes, nothing of the pack's
-/// is written into the file, and each read is counted as damaged.
+/// is written into the file; the first read is counted as damaged and drops the location, so
+/// the second finds no row and is the plane's as for any blob the index lacks.
 /// Catches a damaged cached copy that is served, or that fails the read.
 #[tokio::test]
 async fn falling_back_damaged_bytes_are_read_from_the_plane_underneath() {
@@ -358,10 +363,10 @@ async fn falling_back_damaged_bytes_are_read_from_the_plane_underneath() {
     assert_eq!(std::fs::read(dir.join("blob")).expect("read back"), b"true");
     assert_eq!(rig.held.calls(), ["get", "read_to"]);
     let stats = rig.cas.stats();
-    assert_eq!((stats.fallback_damaged, stats.damaged), (2, 0));
+    assert_eq!((stats.fallback_damaged, stats.damaged), (1, 0));
     assert_eq!(
         (stats.served, stats.elsewhere, stats.fallback_lost),
-        (0, 0, 0)
+        (0, 1, 0)
     );
 }
 

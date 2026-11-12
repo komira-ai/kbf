@@ -4,7 +4,8 @@
 //! is, groups the blobs by pack, and reads each pack with as few ranged requests as it can:
 //! blobs that lie close together in a pack (within [`ReaderConfig::gap`] bytes) are one
 //! range. Every blob is hashed before it is handed out, and a blob whose bytes are not its
-//! digest is refused ([`Fetch::Damaged`]), never returned and never cached. Blobs served are
+//! digest is refused ([`Fetch::Damaged`]), never returned and never cached, and its location
+//! is dropped from the index ([`PackIndex::drop_location`]). Blobs served are
 //! noted, and the index is told in batches ([`Reader::flush_touches`]) so that retention
 //! sees them as in use.
 
@@ -38,8 +39,14 @@ pub enum Fetch {
     /// The index has a row, and the store does not have the bytes it points at: the pack is
     /// gone or shorter than the row says.
     Lost,
-    /// The store gave bytes that are not the digest. They are not returned.
-    Damaged,
+    /// The store gave bytes that are not the digest. They are not returned. The reader
+    /// dropped the digest's location in that pack from the index, so that the next read of
+    /// the digest finds no row ([`Fetch::Missing`]) unless another pack holds it.
+    Damaged {
+        /// Whether the index dropped the location. `false` when the index refused or failed
+        /// the drop (logged), or when the row already pointed elsewhere.
+        dropped: bool,
+    },
 }
 
 /// How the reader groups requests and notes use.
@@ -127,6 +134,7 @@ impl<S: ObjectStore> Reader<S> {
         let rest = self.answer_from_cache(wanted, &mut found).await;
         let spans = self.plan(&rest, &mut found).await?;
         let mut fresh = Vec::new();
+        let mut damaged = Vec::new();
         for (span, got) in self.fetch_all(spans).await {
             let bytes = got?;
             for (digest, offset) in span.members {
@@ -137,9 +145,13 @@ impl<S: ObjectStore> Reader<S> {
                 if let Fetch::Found(blob) = &fetch {
                     fresh.push((digest, blob.clone()));
                 }
+                if fetch == (Fetch::Damaged { dropped: false }) {
+                    damaged.push((digest, span.pack.to_string()));
+                }
                 found.insert(digest, fetch);
             }
         }
+        self.drop_damaged(damaged, &mut found).await;
         self.fill_cache(fresh).await;
         self.note(&found).await;
         let answer = digests
@@ -258,6 +270,29 @@ impl<S: ObjectStore> Reader<S> {
         }
     }
 
+    /// Drops the location of each blob whose bytes were not its digest from the index, and
+    /// marks the blob's [`Fetch::Damaged`] with whether it went. A drop that fails or is
+    /// unsupported is logged and leaves the answer as it was.
+    async fn drop_damaged(
+        &self,
+        damaged: Vec<(BlobDigest, String)>,
+        found: &mut BTreeMap<BlobDigest, Fetch>,
+    ) {
+        for (digest, pack) in damaged {
+            let index = Arc::clone(&self.index);
+            let key = pack.clone();
+            let dropped = offload(move || index.drop_location(&digest, &key)).await;
+            match dropped {
+                Ok(dropped) => {
+                    found.insert(digest, Fetch::Damaged { dropped });
+                }
+                Err(error) => {
+                    tracing::warn!(%error, %pack, "could not drop the location of a damaged blob from the pack index");
+                }
+            }
+        }
+    }
+
     /// Puts what the store gave in the cache. A cache that fails is logged and goes on.
     async fn fill_cache(&self, fresh: Vec<(BlobDigest, Bytes)>) {
         let Some(cache) = &self.cache else { return };
@@ -326,12 +361,12 @@ fn carve(digest: &BlobDigest, whole: &Bytes, from: u64) -> Fetch {
     finish(digest, blob)
 }
 
-/// The blob if its bytes are the digest, else [`Fetch::Damaged`].
+/// The blob if its bytes are the digest, else [`Fetch::Damaged`] (not yet dropped).
 fn finish(digest: &BlobDigest, bytes: Bytes) -> Fetch {
     if verifies(digest, &bytes) {
         Fetch::Found(bytes)
     } else {
-        Fetch::Damaged
+        Fetch::Damaged { dropped: false }
     }
 }
 

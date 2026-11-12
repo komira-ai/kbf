@@ -268,6 +268,7 @@ pub struct FlakyIndex {
     fail_locate: AtomicU32,
     fail_touch: AtomicU32,
     fail_unreferenced: AtomicU32,
+    fail_drop: AtomicU32,
     held: Mutex<Vec<bool>>,
     finds: Mutex<Vec<usize>>,
     locates: Mutex<Vec<usize>>,
@@ -286,6 +287,7 @@ impl FlakyIndex {
             fail_locate: AtomicU32::new(0),
             fail_touch: AtomicU32::new(0),
             fail_unreferenced: AtomicU32::new(0),
+            fail_drop: AtomicU32::new(0),
             held: Mutex::new(Vec::new()),
             finds: Mutex::new(Vec::new()),
             locates: Mutex::new(Vec::new()),
@@ -326,6 +328,11 @@ impl FlakyIndex {
     /// The next `n` questions of which keys are unreferenced fail.
     pub fn fail_unreferenced(&self, n: u32) {
         self.fail_unreferenced.store(n, Ordering::SeqCst);
+    }
+
+    /// The next `n` drops of a location are refused as unsupported.
+    pub fn fail_drop(&self, n: u32) {
+        self.fail_drop.store(n, Ordering::SeqCst);
     }
 
     /// For each record, whether the store held the pack when it was recorded.
@@ -406,6 +413,13 @@ impl PackIndex for FlakyIndex {
             return Err(PackIndexError::NotMigrated);
         }
         self.inner.unreferenced_keys(keys)
+    }
+
+    fn drop_location(&self, digest: &BlobDigest, pack_key: &str) -> Result<bool, PackIndexError> {
+        if fires(&self.fail_drop) {
+            return Err(PackIndexError::Unsupported);
+        }
+        self.inner.drop_location(digest, pack_key)
     }
 }
 

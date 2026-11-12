@@ -1729,6 +1729,7 @@ blobs clients upload are kept in packs, and these counters follow; without the f
 | `kbf_pack_read_lost_total` | counter | reads of a blob the index has and whose pack the store lacks, answered by the storage nodes (alert on any) |
 | `kbf_pack_read_errors_total` | counter | reads that failed because the pack index or the pack store could not answer |
 | `kbf_pack_digest_mismatches_total` | counter | reads of a blob whose pack held other bytes than its digest: never served, UNAVAILABLE (alert on any) |
+| `kbf_pack_locations_dropped_total` | counter | pack locations dropped from the index after a read found other bytes than the digest (each also counted in `kbf_pack_digest_mismatches_total`): the read that saw it is UNAVAILABLE, and the next read of that digest finds no pack location and falls back as for any blob the index lacks |
 | `kbf_pack_inflight_bytes`, `kbf_pack_inflight_peak_bytes` | gauge | bytes the uploads into packs have taken of `--pack-inflight-bytes` now, and the most at once since the start (never above the flag) |
 | `kbf_pack_upload_waits_total` | counter | uploads that found `--pack-inflight-bytes` spent and waited their turn: a burst slowed down, none failed. Rising steadily means the bound is below what clients send |
 | `kbf_pack_upload_refusals_total` | counter | uploads refused RESOURCE_EXHAUSTED because their blobs alone are over `--pack-inflight-bytes` |

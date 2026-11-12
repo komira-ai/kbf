@@ -459,7 +459,7 @@ impl<C: Cas> PackedCas<C> {
                 let why = "the pack that holds it is gone or shorter than the index says";
                 Found::Refused(CasError::Unavailable(label(digest), why.to_owned()))
             }
-            Fetch::Damaged => {
+            Fetch::Damaged { .. } => {
                 let (count, said) = match self.bad {
                     BadPack::Fail => (&self.counts.damaged, ""),
                     BadPack::ReadElsewhere => (

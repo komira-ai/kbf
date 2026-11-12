@@ -59,6 +59,10 @@ pub struct PackMetrics {
     pub read_errors: Counter,
     /// Reads of a blob whose pack held other bytes than its digest: never served.
     pub digest_mismatches: Counter,
+    /// Pack locations dropped from the index because the pack held other bytes than the digest
+    /// (each also a [`PackMetrics::digest_mismatches`]): the next read of that blob finds no
+    /// row and goes to the storage nodes.
+    pub locations_dropped: Counter,
     /// Uploads that had to wait for room, because the uploads in flight held all of
     /// `--pack-inflight-bytes`.
     pub upload_waits: Counter,
@@ -285,6 +289,11 @@ impl PackMetrics {
                 "kbf_pack_digest_mismatches_total",
                 "Reads of a blob whose pack held other bytes than its digest, never served",
                 &self.digest_mismatches,
+            ),
+            (
+                "kbf_pack_locations_dropped_total",
+                "Pack locations dropped from the index after a read found other bytes than the digest",
+                &self.locations_dropped,
             ),
             (
                 "kbf_pack_upload_waits_total",

@@ -193,7 +193,7 @@ async fn bytes_that_are_not_the_digest_are_damaged() {
 
     let got = reader.read(&asked).await.unwrap();
 
-    assert_eq!(got, [Fetch::Damaged, found(&good)]);
+    assert_eq!(got, [Fetch::Damaged { dropped: true }, found(&good)]);
     assert_eq!(cache.entries(), 1);
     assert!(cache.get(&genuine.digest).is_none());
     assert_eq!(reader.flush_touches().await.unwrap(), 1);
@@ -378,4 +378,45 @@ async fn a_failed_flush_reports_the_index_error() {
 
     assert_eq!(error, PackIndexError::NotMigrated);
     assert_eq!(reader.flush_touches().await.unwrap(), 0);
+}
+
+/// Asserts that a record whose bytes are not its digest has its location dropped from the
+/// index: the first read is `Damaged` and says it dropped, the index then has no row for the
+/// digest, and a second read answers `Missing` rather than `Damaged`.
+#[tokio::test]
+async fn a_damaged_record_drops_its_location() {
+    let genuine = blob("0123456789");
+    let rig = Rig::new();
+    rig.store.seed("cas/x/forged", b"ABCDEFGHIJ").await;
+    rig.index
+        .record_pack(&row("cas/x/forged", 10, &genuine, 0))
+        .unwrap();
+    let reader = rig.reader(None, ReaderConfig::default());
+
+    let first = reader.read(&[genuine.digest]).await.unwrap();
+    let second = reader.read(&[genuine.digest]).await.unwrap();
+
+    assert_eq!(first, [Fetch::Damaged { dropped: true }]);
+    assert_eq!(rig.index.locate(&[genuine.digest]).unwrap(), [None]);
+    assert_eq!(second, [Fetch::Missing]);
+}
+
+/// Asserts that a drop the index does not take leaves the read's answer `Damaged` (not
+/// dropped) and the row where it was, so the next read finds the damage again.
+#[tokio::test]
+async fn a_drop_the_index_refuses_leaves_the_row() {
+    let genuine = blob("0123456789");
+    let rig = Rig::new();
+    rig.store.seed("cas/x/forged", b"ABCDEFGHIJ").await;
+    rig.index
+        .record_pack(&row("cas/x/forged", 10, &genuine, 0))
+        .unwrap();
+    rig.index.fail_drop(1);
+    let reader = rig.reader(None, ReaderConfig::default());
+
+    let first = reader.read(&[genuine.digest]).await.unwrap();
+    let second = reader.read(&[genuine.digest]).await.unwrap();
+
+    assert_eq!(first, [Fetch::Damaged { dropped: false }]);
+    assert_eq!(second, [Fetch::Damaged { dropped: true }]);
 }
