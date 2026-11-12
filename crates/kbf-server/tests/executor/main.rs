@@ -16,6 +16,7 @@ mod keys;
 mod phases;
 mod pool;
 mod promotion;
+mod put_dir;
 mod real_prep;
 mod recovery;
 mod rig;

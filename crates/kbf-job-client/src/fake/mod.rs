@@ -12,8 +12,10 @@
 //!   ([`add_offer`](FakeJobServer::add_offer)) could ever run is refused `no-capable-host`
 //!   and nothing is recorded; a wall limit that is missing or 0 is `wall-time-not-positive`,
 //!   one above the ceiling ([`set_wall_ceiling`](FakeJobServer::set_wall_ceiling))
-//!   `wall-time-above-ceiling`. An id the service would not take, or an image not pinned by
-//!   digest, is `INVALID_ARGUMENT` without a refusal.
+//!   `wall-time-above-ceiling`. An id the service would not take, an image not pinned by
+//!   digest, or no image without a layer or with a command that is not an absolute path (the
+//!   service's rule for a job whose root is its layers), is `INVALID_ARGUMENT` without a
+//!   refusal.
 //! - **States are the test's to move**, one step at a time: [`place`](FakeJobServer::place),
 //!   [`starting`](FakeJobServer::starting), [`run`](FakeJobServer::run),
 //!   [`finish`](FakeJobServer::finish), [`fail_to_start`](FakeJobServer::fail_to_start),

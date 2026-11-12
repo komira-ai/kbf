@@ -31,6 +31,8 @@ fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 pub struct FakeInputs {
     pub facts: Mutex<Result<ActionFacts, InputsError>>,
     pub grant: Mutex<Result<ReadGrant, InputsError>>,
+    /// The action tree of a put-directory run.
+    pub tree: Mutex<Result<String, InputsError>>,
     pub looked_up: Mutex<Vec<String>>,
     /// While set, the read of an action waits for `release` (a slow CAS).
     pub hold: std::sync::atomic::AtomicBool,
@@ -48,6 +50,7 @@ impl FakeInputs {
                 url: "https://grant.test:9400".to_owned(),
                 token: Secret::new("read-token-0001"),
             })),
+            tree: Mutex::new(Ok(TREE.to_owned())),
             looked_up: Mutex::new(Vec::new()),
             hold: std::sync::atomic::AtomicBool::new(false),
             release: tokio::sync::Notify::new(),
@@ -73,7 +76,14 @@ impl Inputs for FakeInputs {
     ) -> Result<ReadGrant, InputsError> {
         locked(&self.grant).clone()
     }
+
+    async fn tree(&self, _lease: kbf_types::LeaseId) -> Result<String, InputsError> {
+        locked(&self.tree).clone()
+    }
 }
+
+/// The action tree the fake inputs give a put-directory run.
+pub const TREE: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
 /// One url the store minted.
 #[derive(Clone, Debug)]
