@@ -63,19 +63,19 @@ use crate::task::{Failure, millis};
 const COPY_BYTES: usize = 1 << 20;
 
 /// The pauses before the second and later attempts of a commit `rename`.
-pub const PAUSES: [Duration; 3] = [
+pub(crate) const PAUSES: [Duration; 3] = [
     Duration::from_millis(100),
     Duration::from_secs(1),
     Duration::from_secs(5),
 ];
 
 /// The most attempts of one commit `rename`.
-pub const COMMIT_ATTEMPTS: usize = PAUSES.len() + 1;
+pub(crate) const COMMIT_ATTEMPTS: usize = PAUSES.len() + 1;
 
 /// The name of pack `slot`: `pack` for pack 0, which holds the manifest, `pack<slot>` for the
 /// others.
 #[must_use]
-pub fn pack_name(slot: usize) -> String {
+pub(crate) fn pack_name(slot: usize) -> String {
     match slot {
         0 => "pack".to_owned(),
         _ => format!("pack{slot}"),
@@ -84,19 +84,19 @@ pub fn pack_name(slot: usize) -> String {
 
 /// The name of large object `slot`: `L<slot>`.
 #[must_use]
-pub fn large_name(slot: usize) -> String {
+pub(crate) fn large_name(slot: usize) -> String {
     format!("L{slot}")
 }
 
 /// The name an object is written under: `<name>.part`.
 #[must_use]
-pub fn part_name(name: &str) -> String {
+pub(crate) fn part_name(name: &str) -> String {
     format!("{name}.part")
 }
 
 /// The name that tells the store the digest to expect: `<name>.sha256-<hex>.part`.
 #[must_use]
-pub fn digest_part_name(name: &str, digest: &Digest) -> String {
+pub(crate) fn digest_part_name(name: &str, digest: &Digest) -> String {
     format!("{name}.sha256-{}.part", hex::encode(digest.hash))
 }
 

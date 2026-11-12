@@ -73,6 +73,20 @@ fn manifest(bytes: &[&[u8]]) -> TaskManifest {
     }
 }
 
+/// A large blob and four small ones, with limits of three records a pack: `L0`, `pack1` and
+/// `pack`.
+fn three_objects() -> (Vec<u8>, Limits) {
+    let big = vec![5u8; usize::try_from(MAX_RECORD_BYTES).expect("fits") + 1];
+    let limits = Limits {
+        pack_records: 3,
+        ..Limits::real()
+    };
+    (big, limits)
+}
+
+/// The four small blobs of [`three_objects`].
+const SMALL: [&[u8]; 4] = [b"one", b"two", b"three", b"four"];
+
 /// The fake store: every rename it is asked for, by file name, and the errnos it answers.
 #[derive(Clone, Default)]
 struct Store {
@@ -212,6 +226,15 @@ fn the_committed_manifest_carries_the_phase_timings() {
     assert!(timing.write_ms.is_some());
     assert!(timing.commit_ms.is_some());
     assert_eq!((timing.fetch_ms, timing.run_ms), (1, 2));
+    // `pack_ms` is rewritten to cover the four phases; a relation, not a duration.
+    let phases = [
+        timing.walk_ms,
+        timing.hash_ms,
+        timing.write_ms,
+        timing.commit_ms,
+    ];
+    let sum: u64 = phases.iter().flatten().sum();
+    assert!(timing.pack_ms >= sum, "{timing:?}");
 }
 
 /// Asserts the order and contents of a run of two packs and a large object: the large object is
@@ -325,33 +348,39 @@ fn a_busy_failed_or_interrupted_commit_is_tried_again_after_each_pause() {
     assert!(renames[1..].iter().all(|r| *r == renames[1]), "{renames:?}");
 }
 
-/// Asserts that a commit that keeps failing with `EIO` stops after the last attempt: exit 13, a
-/// line naming attempt 4 of 4 and the store's deadline, every pause taken, and no `.part` file
-/// left.
+/// Asserts that a commit that keeps failing with `EIO`, or keeps finding the file open
+/// (`EBUSY`), stops after the last attempt: exit 13, a line naming attempt 4 of 4 and what the
+/// store means by the errno, every pause taken, and no `.part` file left.
 #[test]
 fn a_commit_that_keeps_failing_stops_after_the_last_attempt() {
-    let dir = scratch("gave-up");
-    let out = out_dir(&dir);
-    let (sink, store) = served(&out);
-    store.refuse("pack", &[libc::EIO; COMMIT_ATTEMPTS]);
-    let failure = sink
-        .store(
-            &mut manifest(&[b"x"]),
-            &Blobs::from_bytes(&[b"x"]),
-            &Limits::real(),
-        )
-        .expect_err("gave up");
-    assert_eq!(failure.exit_code(), EXIT_PUT);
-    assert_eq!(
-        failure.to_string(),
-        format!(
-            "put: pack: the commit failed on attempt 4 of 4: {}; the store did not take it before its deadline",
-            io::Error::from_raw_os_error(libc::EIO)
-        )
-    );
-    assert_eq!(store.commits(), ["pack"; COMMIT_ATTEMPTS]);
-    assert_eq!(store.pauses(), PAUSES);
-    assert!(names(&out).is_empty(), "{:?}", names(&out));
+    let cases = [
+        (libc::EIO, "the store did not take it before its deadline"),
+        (libc::EBUSY, "the store still sees the file open"),
+    ];
+    for (errno, meaning) in cases {
+        let dir = scratch(&format!("gave-up-{errno}"));
+        let out = out_dir(&dir);
+        let (sink, store) = served(&out);
+        store.refuse("pack", &[errno; COMMIT_ATTEMPTS]);
+        let failure = sink
+            .store(
+                &mut manifest(&[b"x"]),
+                &Blobs::from_bytes(&[b"x"]),
+                &Limits::real(),
+            )
+            .expect_err("gave up");
+        assert_eq!(failure.exit_code(), EXIT_PUT);
+        assert_eq!(
+            failure.to_string(),
+            format!(
+                "put: pack: the commit failed on attempt 4 of 4: {}; {meaning}",
+                io::Error::from_raw_os_error(errno)
+            )
+        );
+        assert_eq!(store.commits(), ["pack"; COMMIT_ATTEMPTS]);
+        assert_eq!(store.pauses(), PAUSES);
+        assert!(names(&out).is_empty(), "{errno}: {:?}", names(&out));
+    }
 }
 
 /// Asserts that a run whose last commit fails keeps the objects it committed before it (they are
@@ -485,6 +514,106 @@ fn a_refused_write_is_exit_13_and_removes_the_part_file() {
     }
 }
 
+/// A file whose writes are taken and whose flush is refused with `ENOSPC`, as a stage that
+/// reports a full disk only when the buffered bytes reach it.
+struct FullAtFlush {
+    file: File,
+}
+
+impl Write for FullAtFlush {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.file.write(bytes)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Err(io::Error::from_raw_os_error(libc::ENOSPC))
+    }
+}
+
+/// Asserts that a full disk the put directory reports only at the flush is exit 13 too, nothing
+/// is renamed and no `.part` file is left: a pack smaller than the write buffer, and a large
+/// object.
+#[test]
+fn a_refused_flush_is_exit_13_and_nothing_is_committed() {
+    let (big, _) = three_objects();
+    let cases: [(&str, &[u8]); 2] = [("pack", b"small"), ("L0", &big)];
+    for (name, blob) in cases {
+        let dir = scratch(&format!("flush-{name}"));
+        let out = out_dir(&dir);
+        let (sink, store) = served(&out);
+        let sink = sink.with_create(|path| {
+            let file = File::create_new(path)?;
+            Ok(Box::new(FullAtFlush { file }))
+        });
+        let failure = sink
+            .store(
+                &mut manifest(&[blob]),
+                &Blobs::from_bytes(&[blob]),
+                &Limits::real(),
+            )
+            .expect_err("refused");
+        assert_eq!(failure.exit_code(), EXIT_PUT);
+        assert_eq!(
+            failure.to_string(),
+            format!(
+                "put: {name}: cannot write it to the put directory: {}",
+                io::Error::from_raw_os_error(libc::ENOSPC)
+            )
+        );
+        assert!(store.renames.borrow().is_empty(), "{name}");
+        assert!(names(&out).is_empty(), "{name}: {:?}", names(&out));
+    }
+}
+
+/// A case of a run that fails part way: its name, the commit refused, the `.part` whose writes
+/// are refused, and the names that stay.
+type PartWay = (
+    &'static str,
+    Option<&'static str>,
+    Option<&'static str>,
+    &'static [&'static str],
+);
+
+/// Asserts the clean-up of a run of three objects (`L0`, `pack1`, `pack`) that fails part way:
+/// every `.part` file it wrote and did not commit is removed, whichever object failed, and only
+/// what it committed stays. The cases: the write of `pack1` refused (`L0.part` written before
+/// it), the commit of `L0` refused (`pack1.part` written and waiting), and the commit of `pack1`
+/// refused (`L0` committed before it).
+#[test]
+fn a_run_that_fails_part_way_removes_every_part_file_and_keeps_what_it_committed() {
+    let (big, limits) = three_objects();
+    let all: Vec<&[u8]> = SMALL.iter().copied().chain([big.as_slice()]).collect();
+    // (case, the commit refused or none, the `.part` whose writes are refused or none, what stays)
+    let cases: [PartWay; 3] = [
+        ("write-pack1", None, Some("pack1.part"), &[]),
+        ("commit-l0", Some("L0"), None, &[]),
+        ("commit-pack1", Some("pack1"), None, &["L0"]),
+    ];
+    for (case, commit, write, stays) in cases {
+        let dir = scratch(&format!("part-way-{case}"));
+        let out = out_dir(&dir);
+        let (mut sink, store) = served(&out);
+        if let Some(name) = commit {
+            store.refuse(name, &[libc::EEXIST]);
+        }
+        if let Some(part) = write {
+            sink = sink.with_create(move |path| {
+                let file = File::create_new(path)?;
+                if path.ends_with(part) {
+                    Ok(Box::new(Full { _file: file }))
+                } else {
+                    Ok(Box::new(file))
+                }
+            });
+        }
+        let failure = sink
+            .store(&mut manifest(&all), &Blobs::from_bytes(&all), &limits)
+            .expect_err(case);
+        assert_eq!(failure.exit_code(), EXIT_PUT, "{case}");
+        assert_eq!(names(&out), stays, "{case}");
+    }
+}
+
 /// Outputs collected from files under `dir`: `big` (held open, being over one chunk) and `small`.
 async fn file_blobs(dir: &Path, big: &[u8]) -> (TaskManifest, Blobs) {
     let work = dir.join("work");
@@ -514,19 +643,21 @@ async fn file_blobs(dir: &Path, big: &[u8]) -> (TaskManifest, Blobs) {
 /// Asserts that an output whose bytes change after they were hashed is exit 12
 /// (`output-changed`), whenever the change is seen, and leaves no `.part` file: changed before
 /// the run is stored (seen while its checksum is taken, before anything is written), changed
-/// while pack 0 is being written (seen by the pack's write), and a large object changed before
-/// it is written (seen once it is written).
+/// while pack 0 is being written (seen by the pack's write), and a large object changed, or cut
+/// to one byte, before it is written (seen once it is written).
 #[tokio::test]
 async fn an_output_changed_after_it_was_hashed_is_exit_12() {
     let chunk = vec![7u8; kbf_outputs::CHUNK_BYTES + 1];
     let big = vec![8u8; usize::try_from(MAX_RECORD_BYTES).expect("fits") + 1];
-    // (case, the big output, the `.part` file whose create changes it; none: changed before).
-    let cases: [(&str, &[u8], Option<&str>); 3] = [
-        ("before", &chunk, None),
-        ("pack", &chunk, Some("pack.part")),
-        ("large", &big, Some("L0.part")),
+    // (case, the big output, the `.part` file whose create changes it, none: changed before;
+    // whether it is cut short rather than changed in place).
+    let cases: [(&str, &[u8], Option<&str>, bool); 4] = [
+        ("before", &chunk, None, false),
+        ("pack", &chunk, Some("pack.part"), false),
+        ("large", &big, Some("L0.part"), false),
+        ("large-cut", &big, Some("L0.part"), true),
     ];
-    for (case, bytes, when) in cases {
+    for (case, bytes, when, cut) in cases {
         let dir = scratch(&format!("changed-{case}"));
         let out = out_dir(&dir);
         let (mut manifest, blobs) = file_blobs(&dir, bytes).await;
@@ -540,7 +671,9 @@ async fn an_output_changed_after_it_was_hashed_is_exit_12() {
             Some(at) => {
                 let at = at.to_owned();
                 sink.with_create(move |part| {
-                    if part.ends_with(&at) {
+                    if part.ends_with(&at) && cut {
+                        File::options().write(true).open(&path)?.set_len(1)?;
+                    } else if part.ends_with(&at) {
                         flip_first_byte(&path);
                     }
                     Ok(Box::new(File::create_new(part)?))

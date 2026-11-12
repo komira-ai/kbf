@@ -147,6 +147,8 @@ fn every_valid_fixture_manifest_builds_and_reads_back() {
             "empty_output_file",
             "failed_action",
             "minimal",
+            "timing_phases",
+            "timing_some_phases",
             "unknown_field_put_ms",
             "unknown_members_everywhere",
             "unknown_top_level_field"
