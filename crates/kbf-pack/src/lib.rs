@@ -28,7 +28,7 @@
 //!   store client, and are re-exported here. They are the shared, pure contract of a pack written
 //!   by a task that has no store credential: one pack whose record at offset 0 is a JSON manifest,
 //!   under a key the frontend minted. The task that writes one and the frontend that ingests it use
-//!   these, so the two cannot drift. They do no I/O and hold no secret.
+//!   these, so the two cannot drift. They hold no secret and do no I/O of their own.
 //!
 //! Pack keys are `cas/d/<node>/<boot>/<seq>` for a daemon and `cas/f/<frontend>/<boot>/<seq>`
 //! for a frontend ([`PackKeys`]); the sequence number is sixteen hex digits, so a listing of
@@ -55,13 +55,13 @@ pub use cache::ReadCache;
 pub use digest::blob_digest;
 pub use error::{CacheError, PackError, ReadError};
 pub use kbf_task_pack::{
-    EMPTY_DIGEST, InputStats, InputsFrom, LargeEntry, MAC_LEN, MANIFEST_VERSION,
-    MANIFEST_VERSION_2, MANIFEST_VERSION_3, MAX_BUILD_BYTES, MAX_LARGE, MAX_MANIFEST_BYTES,
-    MAX_PACK_BYTES, MAX_PACK_RECORDS, MAX_PACKS, MAX_PATH_BYTES, MAX_RECORD_BYTES, ManifestError,
-    OutputDirectory, OutputFile, OutputSymlink, PathError, ShapeError, Slot, SourceBytes,
-    TaskKeyError, TaskManifest, TaskPackError, TaskPackKey, Timing, Usage, WritePackError,
-    check_build, check_records, check_shape, mac_input, mac_input_v1, minute_of, read_manifest,
-    read_manifest_with, write_pack, write_pack_with,
+    BlobMeta, EMPTY_DIGEST, InputStats, InputsFrom, LargeEntry, LayoutError, LayoutWriteError,
+    MAC_LEN, MANIFEST_VERSION, MANIFEST_VERSION_2, MANIFEST_VERSION_3, MAX_BUILD_BYTES, MAX_LARGE,
+    MAX_MANIFEST_BYTES, MAX_PACK_BYTES, MAX_PACK_RECORDS, MAX_PACKS, MAX_PATH_BYTES,
+    MAX_RECORD_BYTES, ManifestError, OutputDirectory, OutputFile, OutputSymlink, PackLayout,
+    PathError, ShapeError, Slot, SourceBytes, TaskKeyError, TaskManifest, TaskPackError,
+    TaskPackKey, Timing, Usage, WritePackError, check_build, check_records, check_shape, mac_input,
+    mac_input_v1, minute_of, read_manifest, read_manifest_with, write_pack, write_pack_with,
 };
 pub use keys::{PackKeys, WriterKind};
 pub use packer::{
