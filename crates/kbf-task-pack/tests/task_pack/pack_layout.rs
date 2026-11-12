@@ -4,7 +4,7 @@
 //! write with its own error.
 
 use std::collections::BTreeMap;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 
 use kbf_segments::{SegmentWriter, layout::footer_len, sha256};
 use kbf_task_pack::{
@@ -265,8 +265,9 @@ fn write_with<R: Read>(
     Ok(out)
 }
 
-/// Asserts that a source shorter than its record, one of the right length with other bytes, and
-/// a meta whose CRC-32C is not the bytes' are each refused as changed, naming the record.
+/// Asserts that a source shorter than its record, one of the right length with other bytes, a
+/// meta whose CRC-32C is not the bytes', and a meta whose CRC-32C is the bytes' but whose digest
+/// is not are each refused as changed, naming the record.
 #[test]
 fn a_source_without_its_records_bytes_is_refused_as_changed() {
     let (layout, a, b) = two();
@@ -289,6 +290,20 @@ fn a_source_without_its_records_bytes_is_refused_as_changed() {
     let layout = PackLayout::plan(&[BlobMeta::of(&a), wrong_crc]).expect("fits");
     let err = write_with(&layout, &a, &b, || Ok(io::Cursor::new(a.clone()))).expect_err("crc");
     assert!(matches!(err, LayoutWriteError::Changed { digest } if digest == sha256(&b)));
+
+    // A meta whose CRC-32C and size are the source's but whose digest is another blob's.
+    let mut other = a.clone();
+    other[0] ^= 1;
+    let forged = BlobMeta {
+        digest: sha256(&other),
+        ..BlobMeta::of(&a)
+    };
+    let layout = PackLayout::plan(&[forged]).expect("fits");
+    let mut out = Vec::new();
+    let err = layout
+        .write_to(&mut out, |_| Ok(a.as_slice()))
+        .expect_err("digest");
+    assert!(matches!(err, LayoutWriteError::Changed { digest } if digest == sha256(&other)));
 }
 
 /// Asserts that a source longer than its record gives exactly the record's bytes: what is read is
@@ -371,29 +386,72 @@ fn a_source_that_fails_to_open_or_read_names_the_record() {
     );
 }
 
-/// Asserts that a sink that is full stops the write, whether it fills inside a record or at the
-/// footer.
+/// A sink that refuses its `fail_at`-th write (counting from 1) and takes every other.
+struct RefusesOne {
+    fail_at: usize,
+    writes: usize,
+    bytes: Vec<u8>,
+}
+
+impl Write for RefusesOne {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.writes += 1;
+        if self.writes == self.fail_at {
+            return Err(io::Error::other("no room"));
+        }
+        self.bytes.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Asserts that a sink that refuses one write stops the write there, with the sink's error:
+/// refused inside the first record, the second record is never opened; refused at the footer,
+/// after both records went out, the error is still returned. The sink takes every write after
+/// the refused one, so a write that went on past the error would succeed and fail the test.
 #[test]
 fn a_sink_that_refuses_a_write_stops_it() {
     let (layout, a, b) = two();
-    let records = a.len() + b.len();
-    for room in [1000, records] {
-        let mut space = vec![0u8; room];
-        let mut sink: &mut [u8] = &mut space;
-        let err = layout
-            .write_to(&mut sink, |d| {
-                Ok(if *d == sha256(&a) {
-                    a.as_slice()
-                } else {
-                    b.as_slice()
-                })
+    let run = |fail_at: usize| {
+        let mut sink = RefusesOne {
+            fail_at,
+            writes: 0,
+            bytes: Vec::new(),
+        };
+        let mut opened = Vec::new();
+        let result = layout.write_to(&mut sink, |d| {
+            opened.push(*d);
+            Ok(if *d == sha256(&a) {
+                a.as_slice()
+            } else {
+                b.as_slice()
             })
-            .expect_err("full");
-        assert!(
-            matches!(&err, LayoutWriteError::Sink(e) if e.kind() == io::ErrorKind::WriteZero),
-            "room {room}: {err:?}"
-        );
-    }
+        });
+        (result, opened, sink.writes)
+    };
+    let (whole, opened, writes) = run(0);
+    whole.expect("a sink that refuses nothing takes the pack");
+    assert_eq!(opened, vec![sha256(&a), sha256(&b)]);
+
+    let (in_record, opened, _) = run(1);
+    let err = in_record.expect_err("refused in the first record");
+    assert!(
+        matches!(&err, LayoutWriteError::Sink(e) if e.to_string() == "no room"),
+        "{err:?}"
+    );
+    assert_eq!(opened, vec![sha256(&a)], "the write stopped in record a");
+
+    // The footer is the last write of a whole pack.
+    let (at_footer, opened, _) = run(writes);
+    let err = at_footer.expect_err("refused at the footer");
+    assert!(
+        matches!(&err, LayoutWriteError::Sink(e) if e.to_string() == "no room"),
+        "{err:?}"
+    );
+    assert_eq!(opened, vec![sha256(&a), sha256(&b)]);
 }
 
 /// Asserts the text of every refusal, which names the cap, the size or the record.
