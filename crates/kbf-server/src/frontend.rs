@@ -911,7 +911,8 @@ impl<'a> Prepared<'a> {
         } = self;
         let args = &flags.server;
         let state = crate::start::with_members(state, args.members());
-        let state = crate::history::with_history(state, &args.history)?;
+        // A `file://` directory a stopping frontend still holds is waited for.
+        let state = crate::history::with_history_waiting(state, &args.history)?;
         let (state, history) = crate::history::take(state);
         let members = members_of(state.as_ref(), flags.handoff);
         let map = map_of(None, members.as_ref())?;
@@ -1478,7 +1479,8 @@ fn start_line(
 
 /// `kbf frontend`: the logs, a runtime the thread flags size, the start line on stdout,
 /// and serving until SIGINT or SIGTERM. Exit 2 for a start the frontend refuses, 1 for a state store that stayed unreachable
-/// for `--state-store-wait-secs`.
+/// for `--state-store-wait-secs`, 0 for a SIGINT or SIGTERM while the start waited for a
+/// `--history-objects` directory another process held (`crate::history::lock_wait`).
 #[must_use]
 pub fn run(flags: &FrontendFlags) -> ExitCode {
     crate::log_file::init(&flags.server);
@@ -1493,10 +1495,13 @@ pub fn run(flags: &FrontendFlags) -> ExitCode {
 
 /// The exit code of a start that failed: 1 for a state store still not reachable when
 /// `--state-store-wait-secs` ran out (a start that was not refused, so a unit that
-/// prevents a restart on exit 2 retries it), 2 for every refusal.
+/// prevents a restart on exit 2 retries it), 0 for a start stopped by a signal while it
+/// waited for its history directory (a stop, not a failure), 2 for every refusal.
 fn exit_of(e: &(dyn Error + 'static)) -> ExitCode {
     if e.is::<state_wait::NotReached>() {
         ExitCode::from(1)
+    } else if e.is::<crate::history::StoppedWaiting>() {
+        ExitCode::SUCCESS
     } else {
         ExitCode::from(2)
     }

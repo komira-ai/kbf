@@ -152,9 +152,15 @@ units carry `RestartPreventExitStatus=2` and `RestartSec=5`, so exit 2 stays dow
   system call that failed because the device was busy, read-only or full, and a
   registration whose boot the node's metadata log has set already (`StaleWriter`, below: only a node that did not report its history, or one past the clamp).
   A frontend or daemon that fails to start is not covered: `frontend` and `kbf-server`
-  exit 2 for every start error, and the daemon half's own codes are unchanged. The one
-  exception is the `frontend` mode's state store, below: a Postgres that stays down for
-  all of `--state-store-wait-secs` exits 1.
+  exit 2 for every start error, and the daemon half's own codes are unchanged. The
+  exceptions are the `frontend` mode's state store, below: a Postgres that stays down for
+  all of `--state-store-wait-secs` exits 1; and its `file://` `--history-objects`
+  directory: a frontend whose directory another process still holds (its `LOCK`) does not
+  exit but waits for it, trying again after 250 ms and then after twice as long each time up
+  to 5 s, with no deadline, and logs every attempt; a SIGINT or SIGTERM during the wait
+  stops it with exit 0. Every other failure to open the directory exits 2 as before. A
+  unit's stop ends before its next start, so under systemd the holder is another process
+  on the same directory, and the unit's `TimeoutStartSec=` ends the wait.
 
 **A new or restored state store, and the nodes' boots.** The frontend hands each node its
 member id and a boot counter from the store (`boot/<id>`, one more at every registration);
