@@ -38,6 +38,7 @@ fn manifest() -> TaskManifest {
             fetch_ms: 1,
             run_ms: 2,
             pack_ms: 3,
+            ..Timing::default()
         },
         usage: Usage {
             cpu_usage_us: 5,

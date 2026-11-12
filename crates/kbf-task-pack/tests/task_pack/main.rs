@@ -5,4 +5,5 @@ mod pack_layout;
 mod task_key;
 mod task_manifest;
 mod task_pack;
+mod timing_phases;
 mod unknown_members;

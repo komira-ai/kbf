@@ -746,3 +746,6 @@ fn a_tree_job_hides_the_grants_and_its_run_directory() {
     assert_eq!(inputs.root, dir.join("work"));
     assert_eq!(inputs.run_dir, dir.join(RUN_DIR));
 }
+
+#[path = "tree_out_dir_tests.rs"]
+mod out_dir;

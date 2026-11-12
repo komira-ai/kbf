@@ -79,6 +79,16 @@
 //! advisory `inputs` says `"from":"tree"`, so it is version 2; today's job writes no `inputs`
 //! and its manifest is unchanged.
 //!
+//! # The put directory
+//!
+//! With `--stage-and-commit` (a tree job only) step 5 stores nothing over the network and reads
+//! no URL: the packs and large objects are streamed as files into `--out-dir` (`/out` by
+//! default), never held whole, and each is committed by two renames, `<name>.part` to
+//! `<name>.sha256-<hex>.part` and that to `<name>`, the large objects first and `pack`, which
+//! holds the manifest, last ([`out_dir`]). The manifest then also carries the phase timings
+//! `walk_ms`, `hash_ms`, `write_ms` and `commit_ms`. The exit code is 0 only when every commit
+//! `rename` returned 0, whatever the Command's own exit code; a failed write or commit is exit 13.
+//!
 //! `js-agent` returns nothing but an exit code, so the manifest travels inside the pack, and the exit
 //! code says only whether the farm did its part: 0 when the action ran and its pack was stored
 //! (whatever the action's own exit code, which is in the manifest), nonzero when fetching, packing or
@@ -147,8 +157,10 @@ pub mod digest;
 pub mod fetch;
 mod inputs;
 pub mod network;
+pub mod out_dir;
 pub mod outputs;
 pub mod pack;
+mod place;
 pub mod plan;
 pub mod probe;
 pub mod put;

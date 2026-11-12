@@ -317,7 +317,9 @@ task said and none the frontend's own measurement: the instants, and the gaps be
 server's `worker_start` and `worker_completed`, are not (the delay from the task's end to the
 frontend's read lands before `input_fetch_start`). A claim is fine for a measurement and never for a
 decision: nothing reads it to decide, and the live estimator learns from the lease's usage block, not
-from these times. A step the task reports as 0 ms has no timestamps.
+from these times. A step the task reports as 0 ms has no timestamps. A task that writes into a put
+directory (`kbf-task --stage-and-commit`) also writes the phase timings `walk_ms`, `hash_ms`,
+`write_ms` and `commit_ms` in the manifest's `timing`; ingest does not carry them.
 
 One definition of per-action overhead serves both arms, on the same server-stamped span:
 `overhead = (worker_completed - worker_start) - (execution_completed - execution_start)`. Report the

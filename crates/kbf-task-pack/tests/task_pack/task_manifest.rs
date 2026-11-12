@@ -58,6 +58,7 @@ pub(crate) fn base() -> TaskManifest {
             fetch_ms: 12,
             run_ms: 3456,
             pack_ms: 7,
+            ..Timing::default()
         },
         usage: Usage {
             cpu_usage_us: 3_300_000,

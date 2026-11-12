@@ -21,7 +21,10 @@
 //! ```
 //!
 //! with every field required except `stdout` and `stderr`, which are left out when the stream
-//! is empty. A duplicate key and uppercase hex are refused. A member the reader does not know,
+//! is empty, and the phase timings `walk_ms`, `hash_ms`, `write_ms` and `commit_ms`, which
+//! `timing` may carry after `pack_ms`, in that order, each left out when not measured
+//! ([`Timing`]). They are optional in every version and change no version: a reader of the
+//! releases before them skips them as members it does not know. A duplicate key and uppercase hex are refused. A member the reader does not know,
 //! at the top level or inside any object of the manifest, is skipped, so a manifest a later
 //! release writes with a new optional member reads here as it would without it; the writer
 //! never writes one, and reading a manifest and writing it again drops it.
@@ -436,6 +439,11 @@ impl InputStats {
 }
 
 /// How long the task's steps took, in milliseconds. Advisory.
+///
+/// The four phases are written by a task that writes its objects into a put directory
+/// (`kbf-task --stage-and-commit`), and each is left out when `None`, so a task that does not
+/// measure them writes the bytes it wrote before. They cover only what happened before the
+/// manifest was written: pack 0 holds the manifest, so its own write and commit are in none.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Timing {
     /// Fetching the inputs.
@@ -444,6 +452,14 @@ pub struct Timing {
     pub run_ms: u64,
     /// Collecting the outputs and writing the pack.
     pub pack_ms: u64,
+    /// Walking the declared outputs and hashing them as they were read.
+    pub walk_ms: Option<u64>,
+    /// Placing the blobs, checksumming the records and laying out the packs.
+    pub hash_ms: Option<u64>,
+    /// Writing the large objects and packs `1..`.
+    pub write_ms: Option<u64>,
+    /// Committing the large objects and packs `1..`.
+    pub commit_ms: Option<u64>,
 }
 
 /// What the command used. Advisory.
@@ -613,8 +629,8 @@ impl TaskManifest {
     /// Checks every rule that is not the JSON's own: the lease is a build id; a digest of size 0
     /// is [`EMPTY_DIGEST`]; `stdout` and `stderr` are not empty; paths are relative, without
     /// `..`, NUL or empty, at most [`MAX_PATH_BYTES`], and unique across files, directories and
-    /// symlinks; targets are not empty, NUL-free and at most [`MAX_PATH_BYTES`]; timing and
-    /// usage fit an `i64`.
+    /// symlinks; targets are not empty, NUL-free and at most [`MAX_PATH_BYTES`]; timing (each
+    /// phase that is present) and usage fit an `i64`.
     ///
     /// # Errors
     /// The first rule that fails, in the order of the fields.
@@ -695,6 +711,10 @@ impl TaskManifest {
             ("timing.fetch_ms", self.timing.fetch_ms),
             ("timing.run_ms", self.timing.run_ms),
             ("timing.pack_ms", self.timing.pack_ms),
+            ("timing.walk_ms", self.timing.walk_ms.unwrap_or(0)),
+            ("timing.hash_ms", self.timing.hash_ms.unwrap_or(0)),
+            ("timing.write_ms", self.timing.write_ms.unwrap_or(0)),
+            ("timing.commit_ms", self.timing.commit_ms.unwrap_or(0)),
             ("usage.cpu_usage_us", self.usage.cpu_usage_us),
             ("usage.memory_peak_bytes", self.usage.memory_peak_bytes),
         ]
