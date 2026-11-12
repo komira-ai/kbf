@@ -157,6 +157,17 @@ struct Rig {
 
 impl Rig {
     fn new() -> Self {
+        let prepared = Prepared::new();
+        Self::over(prepared.clone(), prepared, |_, _| None)
+    }
+
+    /// The rig whose preparation is `prepare`, with the put-directory parts `put_dir` makes of
+    /// the packs and the CAS.
+    fn over(
+        prepared: Arc<Prepared>,
+        prepare: Arc<dyn RunPrepare>,
+        put_dir: impl FnOnce(&Packs, &Backend) -> Option<PutDirParts>,
+    ) -> Self {
         CLOCK.with(|c| c.set(NOW));
         let store = Arc::new(Flaky {
             inner: MemoryStore::new(Capabilities {
@@ -176,15 +187,16 @@ impl Rig {
             SegmentsConfig::DEFAULT,
         ));
         let backend = Backend::remote_over(node, Some(packs.clone()));
-        let prepared = Prepared::new();
+        let put_dir = put_dir(&packs, &backend);
         let front = Front::with_clock(
             FrontParts {
                 packs,
                 backend,
                 mint: PackKeyMint::new(SECRET).expect("a mint"),
-                prepare: prepared.clone(),
+                prepare,
                 base_image: ImageRef::parse(IMAGE).expect("an image"),
                 kbf_image: ImageRef::parse(&format!("docker://{KBF_IMAGE}")).expect("an image"),
+                put_dir,
             },
             clock,
         );
@@ -896,3 +908,6 @@ async fn a_tree_that_only_the_pack_holds_is_read_through_the_same_packs() {
     assert_eq!(result.output_directories.len(), 1);
     assert!(cached, "the result was not cached");
 }
+
+#[path = "front_put_dir_tests.rs"]
+mod put_dir;

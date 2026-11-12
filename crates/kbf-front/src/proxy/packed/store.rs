@@ -529,10 +529,15 @@ impl Packs {
                 );
                 Ok(None)
             }
-            Fetch::Damaged => {
+            Fetch::Damaged { dropped } => {
+                // This read is refused. When the reader dropped the location, the index no
+                // longer has a row for the digest, so the next read of it finds no pack and
+                // falls back as for any blob the index lacks.
                 self.metrics.digest_mismatches.add(1);
+                self.metrics.locations_dropped.add(u64::from(dropped));
                 tracing::error!(
                     %digest,
+                    dropped,
                     "a pack holds other bytes than the digest names: not served"
                 );
                 let message = format!("blob {digest} is in a pack as other bytes than its digest");

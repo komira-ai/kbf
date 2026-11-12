@@ -2,7 +2,7 @@
 //! its limits at its boundary and one past it, counted over the whole action tree with the
 //! base's facts. Each is `why=unrepresentable`, by name, and writes nothing.
 
-use kbf_front::action_tree::{BaseTreeError, RESERVED_NAMES};
+use kbf_front::action_tree::{BaseTreeError, RESERVED_INPUT_NAMES, RESERVED_NAMES};
 use kbf_proto::reapi::NodeProperties;
 use tierstore::{MAX_DEPTH, MAX_ENTRIES, MAX_MANIFEST_BYTES, TreeError};
 
@@ -310,6 +310,50 @@ async fn the_manifest_size_limit_is_kept_to_the_byte() {
     );
     assert_eq!(answer.unwrap_err().why(), "unrepresentable");
     assert!(rig.farm.puts().is_empty());
+}
+
+/// Catches: an input root whose top holds `.kbf-out` (as a file, a directory or a symlink)
+/// given a tree, where a task's put directory may be mounted; or the name refused below the top,
+/// where it mounts nothing. A refused root writes nothing.
+#[tokio::test]
+async fn an_input_root_holding_kbf_out_is_refused_by_name() {
+    assert_eq!(RESERVED_INPUT_NAMES, [".kbf-out"]);
+    let rig = Rig::new().await;
+    let blob = rig.farm.cas("out").await;
+    let empty = rig.store(&directory(vec![], vec![], vec![])).await;
+    let roots = [
+        directory(vec![file(".kbf-out", &blob, false)], vec![], vec![]),
+        directory(vec![], vec![subdir(".kbf-out", &empty)], vec![]),
+        directory(vec![], vec![], vec![link(".kbf-out", "elsewhere")]),
+    ];
+    for message in roots {
+        let root = rig.store(&message).await;
+        let refused = rig.write(&root).await.expect_err("refused");
+        assert_eq!(
+            refused,
+            NoTree::ReservedInput {
+                name: ".kbf-out".to_owned()
+            }
+        );
+        assert_eq!(refused.why(), "unrepresentable");
+        assert!(rig.farm.puts().is_empty(), "{:?}", rig.farm.puts());
+    }
+    let nested = rig
+        .store(&directory(
+            vec![],
+            vec![subdir(
+                "sub",
+                &rig.store(&directory(
+                    vec![file(".kbf-out", &blob, false)],
+                    vec![],
+                    vec![],
+                ))
+                .await,
+            )],
+            vec![],
+        ))
+        .await;
+    rig.write(&nested).await.expect("a tree");
 }
 
 /// Catches: a base tree that holds a name each action tree adds (or `kbf-task`'s run

@@ -36,7 +36,8 @@
 //! clock and no longer than its subdirectories' entries; [`TreeWriter::forget`] drops an input
 //! root's entries.
 //!
-//! Nothing calls the writer yet: the executor's tree jobs do (the design's build item 17).
+//! The executor's runs that commit into a put directory call it (`--task-out-mode put-dir`),
+//! each run's action tree written over the published base tree before the job is submitted.
 
 mod base;
 mod encode;
@@ -67,6 +68,11 @@ pub const MEMO_ENTRIES: usize = 100_000;
 
 /// How long a memo entry is good for, at most.
 pub const MEMO_TTL: Duration = Duration::from_secs(600);
+
+/// The names an Action's input root may not hold at its top: `.kbf-out`, where a task that
+/// commits into a put directory finds the directory on a host whose job mounts go below the
+/// input root (docs/design/jobs-on-jobscheduler-and-tierstore.md, section 6).
+pub const RESERVED_INPUT_NAMES: [&str; 1] = [".kbf-out"];
 
 /// The entries an action tree adds to the base's and the input root's: `work`, `.kbf`, and
 /// `.kbf`'s `action` and `command`.
@@ -151,6 +157,12 @@ pub enum NoTree {
         /// What the store said.
         why: String,
     },
+    /// The input root holds a name of [`RESERVED_INPUT_NAMES`] at its top.
+    #[error("the input root holds {name:?}, a name the task keeps for its outputs")]
+    ReservedInput {
+        /// The name.
+        name: String,
+    },
     /// The closure did not keep a `Directory` of the tree.
     #[error("the closure kept no Directory {directory}")]
     NotKept {
@@ -168,7 +180,8 @@ impl NoTree {
             | Self::Refused { .. }
             | Self::RootRefused { .. }
             | Self::TooManyEntries { .. }
-            | Self::TooDeep { .. } => "unrepresentable",
+            | Self::TooDeep { .. }
+            | Self::ReservedInput { .. } => "unrepresentable",
             Self::Lookup { .. }
             | Self::Deadline
             | Self::WrongLength { .. }
@@ -241,6 +254,7 @@ impl TreeWriter {
     /// manifests written before a failure stay: each is content-bound, and nothing names them
     /// until a tree is returned.
     pub async fn write(&self, kept: &KeptClosure, base: &BaseTree) -> Result<ActionTree, NoTree> {
+        reserved_input(kept)?;
         let now = (self.clock)();
         let plan = self.plan(kept, now)?;
         let measures = measure(&plan, now);
@@ -296,8 +310,12 @@ impl TreeWriter {
         let root = top(children)?;
         place::write_whole(&*self.source, &*self.store, unlocated).await?;
         let store = &*self.store;
-        stream::iter(&built)
+        // Collected, as `place`'s asks are, so the future can be proved `Send`.
+        let writes: Vec<_> = built
+            .iter()
             .map(|manifest| place::write_manifest(store, &manifest.digest, manifest.bytes.clone()))
+            .collect();
+        stream::iter(writes)
             .buffered(place::WRITES_IN_FLIGHT)
             .try_collect::<()>()
             .await?;
@@ -439,4 +457,22 @@ fn directory_manifest(
 /// The manifest of `.kbf` or of the action tree's root.
 fn top(children: Vec<Child>) -> Result<Manifest, NoTree> {
     encode::manifest(children).map_err(|error| NoTree::RootRefused { error })
+}
+
+/// Refuses an input root that holds a name of [`RESERVED_INPUT_NAMES`] at its top. A root the
+/// closure did not keep is left to the plan, which refuses it by name.
+fn reserved_input(kept: &KeptClosure) -> Result<(), NoTree> {
+    let root = kept.directory(kept.root()).into_iter();
+    let names = root.flat_map(|root| {
+        (root.files.iter().map(|(name, _, _)| name))
+            .chain(root.directories.iter().map(|(name, _)| name))
+            .chain(root.symlinks.iter().map(|(name, _)| name))
+    });
+    match names
+        .into_iter()
+        .find(|name| RESERVED_INPUT_NAMES.contains(&name.as_str()))
+    {
+        Some(name) => Err(NoTree::ReservedInput { name: name.clone() }),
+        None => Ok(()),
+    }
 }

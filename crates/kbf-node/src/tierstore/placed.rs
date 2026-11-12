@@ -142,6 +142,11 @@ impl PackIndex for Placed {
     fn unreferenced_keys(&self, keys: &[String]) -> Result<Vec<String>, PackIndexError> {
         self.inner.unreferenced_keys(keys)
     }
+
+    fn drop_location(&self, digest: &BlobDigest, pack_key: &str) -> Result<bool, PackIndexError> {
+        self.forget(digest);
+        self.inner.drop_location(digest, pack_key)
+    }
 }
 
 /// The reader of the packs through the tierstore, forgetting the kept place of each blob whose
@@ -166,7 +171,7 @@ impl<S: ObjectStore> PackReads for TierReads<S> {
         Box::pin(async move {
             let fetched = self.reader.read(digests).await?;
             for (digest, fetch) in digests.iter().zip(&fetched) {
-                if matches!(fetch, Fetch::Lost | Fetch::Damaged) {
+                if matches!(fetch, Fetch::Lost | Fetch::Damaged { .. }) {
                     self.placed.forget(digest);
                 }
             }

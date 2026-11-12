@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use super::super::{FrontendFlags, command, parse};
 use super::*;
+use crate::executor::{PutDirRoots, TaskOut};
 
 /// A frontend that runs placed actions on hosts, with everything it needs and nothing it can
 /// do without. The tier store and the read listener are at IP addresses, the store `http://`
@@ -373,4 +374,18 @@ fn a_plain_job_listener_is_accepted_beside_the_daemon_executor() {
     .expect("accepted");
     assert!(flags.executor.js.is_none());
     assert!(flags.job_read.expect("the listener").tls.is_none());
+}
+
+/// Asserts that the task flags' output mode reaches the executor's settings: presigned writes
+/// by default, and a put directory under `--task-out-root` with `--task-out-mode put-dir`.
+#[test]
+fn the_output_mode_of_the_task_flags_is_the_executors() {
+    let config = |more: &[&str]| {
+        let flags = parsed(argv(&[], more)).expect("parses");
+        flags.executor.js.expect("js-agent").config.task_out
+    };
+    assert_eq!(config(&[]), TaskOut::Presigned);
+    let put_dir = config(&["--task-out-mode=put-dir", "--task-out-root=/mnt/ts/put"]);
+    let roots = PutDirRoots::new("/mnt/ts/put").expect("roots");
+    assert_eq!(put_dir, TaskOut::PutDir(roots));
 }

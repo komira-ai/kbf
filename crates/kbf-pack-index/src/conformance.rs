@@ -1,4 +1,4 @@
-//! The conformance suite for [`PackIndex`], P1 to P10, generic over a [`PackBackend`] factory
+//! The conformance suite for [`PackIndex`], P1 to P11, generic over a [`PackBackend`] factory
 //! so the in-memory index and the Postgres one run the same clauses. A backend's own tests
 //! call [`run_all`] or one clause with their factory.
 //!
@@ -29,7 +29,7 @@ pub trait PackBackend {
     fn reconnect(&self, index: &Self::Index) -> Self::Index;
 }
 
-/// Runs P1 to P10 against `backend`.
+/// Runs P1 to P11 against `backend`.
 pub fn run_all<B: PackBackend>(backend: &B) {
     p1_record_and_locate(backend);
     p2_record_is_idempotent(backend);
@@ -41,6 +41,7 @@ pub fn run_all<B: PackBackend>(backend: &B) {
     p8_concurrent_records_all_succeed(backend);
     p9_a_pack_that_cannot_exist_is_refused(backend);
     p10_concurrent_records_of_one_pack_agree(backend);
+    p11_a_location_can_be_dropped(backend);
 }
 
 const KEY: &str = "cas/d/n1/1/1";
@@ -691,5 +692,85 @@ pub fn p10_concurrent_records_of_one_pack_agree<B: PackBackend>(backend: &B) {
         "P10 concurrent: each blob has one row, in the pack, at its offset",
         locate(&index, &all),
         want,
+    );
+}
+
+fn dropped(index: &dyn PackIndex, digest: &BlobDigest, key: &str) -> bool {
+    index.drop_location(digest, key).expect("drop_location")
+}
+
+/// P11: a location is dropped only from the pack it points into. Dropping a blob from its own
+/// pack removes the row (`locate` answers `None`, `find_missing` lists it) and takes one off
+/// the pack's live count; naming another pack, or a digest with no row, drops nothing; a
+/// record of another pack that holds the blob then gives it a row there; and recording the
+/// identical original pack again is answered `created: false`, not a conflict.
+pub fn p11_a_location_can_be_dropped<B: PackBackend>(backend: &B) {
+    let index = backend.open_index(Arc::new(ManualClock::default()));
+    let first = packed(KEY, "n1", &[(1, 10), (2, 20)]);
+    let second = packed(OTHER, "n2", &[(2, 20), (3, 30)]);
+    record(&index, &first);
+    record(&index, &second);
+    let one = digest(1, 10);
+    let two = digest(2, 20);
+    yes(
+        "P11 other pack: a drop that names a pack the row does not point into keeps the row",
+        !dropped(&index, &two, OTHER),
+    );
+    yes(
+        "P11 unknown: a digest with no row drops nothing",
+        !dropped(&index, &digest(9, 9), KEY),
+    );
+    yes(
+        "P11 unknown pack: a pack key nobody recorded drops nothing",
+        !dropped(&index, &one, "cas/none"),
+    );
+    same(
+        "P11 kept: the refused drops left both rows",
+        locate(&index, &[one, two]),
+        vec![loc(KEY, 0, 10, 0), loc(KEY, 10, 20, 0)],
+    );
+    yes(
+        "P11 own pack: a drop that names the pack the row points into removes it",
+        dropped(&index, &two, KEY),
+    );
+    yes(
+        "P11 twice: a second drop finds no row",
+        !dropped(&index, &two, KEY),
+    );
+    same(
+        "P11 locate: a dropped blob has no location",
+        locate(&index, &[one, two]),
+        vec![loc(KEY, 0, 10, 0), None],
+    );
+    same(
+        "P11 missing: a dropped blob is listed as missing",
+        missing(&index, &[one, two]),
+        vec![two],
+    );
+    same(
+        "P11 live: the pack counts one row fewer, its blob count unchanged",
+        info(&index, KEY),
+        info_of(KEY, "n1", first.size, (0, 2, 1)),
+    );
+    same(
+        "P11 again: the identical pack recorded again is not a conflict",
+        record(&index, &first),
+        existing(1),
+    );
+    same(
+        "P11 still dropped: that record did not give the dropped blob a row",
+        locate(&index, &[two]),
+        vec![None],
+    );
+    let third = packed(THIRD, "n3", &[(2, 20), (4, 40)]);
+    same(
+        "P11 first again: a record of another pack that holds the blob gives it a row there",
+        record(&index, &third),
+        created(2),
+    );
+    same(
+        "P11 relocated: the blob is located in the pack recorded after the drop",
+        locate(&index, &[two]),
+        vec![loc(THIRD, 0, 20, 0)],
     );
 }

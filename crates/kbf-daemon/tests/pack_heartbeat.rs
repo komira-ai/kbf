@@ -36,7 +36,7 @@ impl PackReads for Scripted {
             1 => Ok(vec![Fetch::Found(Bytes::from_static(b"abc"))]),
             2 => Ok(vec![Fetch::Missing]),
             3 => Ok(vec![Fetch::Lost]),
-            4 => Ok(vec![Fetch::Damaged]),
+            4 => Ok(vec![Fetch::Damaged { dropped: false }]),
             _ => Err(ReadError::Index(PackIndexError::NotMigrated)),
         };
         Box::pin(std::future::ready(answer))

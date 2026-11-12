@@ -10,6 +10,7 @@ use kbf_sched::fence::{LEADER_LEASE_MARGIN, LEASE_GRACE, SELF_FENCE, START_GRACE
 use ring::rand::{SecureRandom, SystemRandom};
 
 use crate::config::MAX_HEARTBEAT_INTERVAL_MS;
+use crate::executor::out::TaskOut;
 use crate::executor::task::Delivery;
 use crate::worker::PROTOCOL_VERSION;
 
@@ -141,6 +142,9 @@ pub struct Config {
     /// (`--executor-allow-open-network`). [`Config::validate`] refuses
     /// [`Network::Open`] without it, and it without [`Network::Open`].
     pub allow_open_network: bool,
+    /// Where a task's outputs go (`--task-out-mode`, `--task-out-root`). A job of a put
+    /// directory has no network, whatever [`Config::network`] says.
+    pub task_out: TaskOut,
 }
 
 /// Why a [`Config`] is refused.
@@ -235,6 +239,7 @@ impl Config {
             presign_ceiling: PRESIGN_LIMIT,
             network: Network::AllowList,
             allow_open_network: false,
+            task_out: TaskOut::Presigned,
         }
     }
 

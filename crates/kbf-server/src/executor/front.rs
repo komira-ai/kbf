@@ -14,6 +14,11 @@
 //!   preparation's: it signs for one store endpoint and the signer limits the object. A run
 //!   that cannot be prepared is the caller's ([`MintError::Refused`]) unless the store could
 //!   not be read ([`MintError::Unavailable`]): see [`RunPrep`]'s [`PrepareFault`].
+//! - **A put directory** (`--task-out-mode put-dir`, [`FrontParts::put_dir`]): the preparation
+//!   mints the run's put directory and collects its closure ([`RunPrepare::prepare_put_dir`]),
+//!   and [`Ingest::mint`] writes the action tree over the published base tree ([`TreeWriter`])
+//!   and parks its digest, which [`Inputs::tree`] hands out once. No write is signed and no
+//!   grant issued. The ingest is [`kbf_front::ingest_put_dir`] of the directory.
 //! - **The action's facts** are read from the Action and the Command in the CAS: the
 //!   `container-image` platform property, which names the BASE environment the Command sees and
 //!   must be, by digest, the base the executor serves (an action that names none uses it); and
@@ -22,11 +27,12 @@
 //!   launched and no entrypoint is looked for.
 
 use std::collections::BTreeMap;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use kbf_front::prepare_run::{PrepareError as RunPrepError, PrepareFault, RunPrep};
-use kbf_front::{Backend, IssuedPackKey, PackKeyMint, Packs};
+use kbf_front::action_tree::{BaseTree, TreeWriter};
+use kbf_front::prepare_run::{KeptClosure, PrepareError as RunPrepError, PrepareFault, RunPrep};
+use kbf_front::{Backend, IssuedPackKey, IssuedPutDir, PackKeyMint, Packs};
 use kbf_proto::reapi::{self, Action, Command, Digest};
 use kbf_types::{DigestFunction, ImageRef, LeaseId};
 use std::sync::Arc;
@@ -79,6 +85,37 @@ pub trait RunPrepare: Send + Sync {
         now: SystemTime,
         wall: Duration,
     ) -> Result<PreparedRun, PrepareError>;
+
+    /// The run of `action` on `lease`, started at `now`, which may take `wall`, that commits
+    /// into a put directory: the directory and the closure its action tree is written from.
+    ///
+    /// # Errors
+    /// [`PrepareError`]; by default [`PrepareError::Refused`], for a preparation that makes no
+    /// put directory.
+    async fn prepare_put_dir(
+        &self,
+        lease: &str,
+        action: &kbf_types::Digest,
+        now: SystemTime,
+        wall: Duration,
+    ) -> Result<PreparedPutDir, PrepareError> {
+        let _ = (lease, action, now, wall);
+        Err(PrepareError::Refused(
+            "this preparation makes no put directory".to_owned(),
+        ))
+    }
+}
+
+/// What the frontend's run preparation gives a run that commits into a put directory
+/// (`PutDirRun` of `kbf_front::prepare_run`).
+#[derive(Debug)]
+pub struct PreparedPutDir {
+    /// The put directory, `cas/b/<build>/<nonce>`.
+    pub dir: String,
+    /// The input closure, every `Directory` kept.
+    pub kept: KeptClosure,
+    /// The Unix second the directory's keys stop being good for the run at.
+    pub not_after: u64,
 }
 
 impl From<PrepareError> for MintError {
@@ -114,6 +151,23 @@ impl RunPrepare for RunPrep {
             grant_url: run.read_grant.url,
             grant_token: Secret::new(run.read_grant.token.expose()),
             not_after: run.read_grant.not_after,
+        })
+    }
+
+    async fn prepare_put_dir(
+        &self,
+        lease: &str,
+        action: &kbf_types::Digest,
+        now: SystemTime,
+        wall: Duration,
+    ) -> Result<PreparedPutDir, PrepareError> {
+        let run = RunPrep::prepare_put_dir(self, lease, action, now, wall)
+            .await
+            .map_err(prepare_error)?;
+        Ok(PreparedPutDir {
+            dir: run.dir.dir().to_owned(),
+            kept: run.kept,
+            not_after: run.not_after,
         })
     }
 }
@@ -163,8 +217,32 @@ pub struct FrontParts {
     /// `container-image` may name (an action that names none gets it).
     pub base_image: ImageRef,
     /// The kbf image, pinned by digest, built from [`FrontParts::base_image`]: the image every
-    /// run is launched from.
+    /// run of presigned writes is launched from.
     pub kbf_image: ImageRef,
+    /// With `--task-out-mode put-dir`, how the action trees are written; `None` for presigned
+    /// writes.
+    pub put_dir: Option<PutDirParts>,
+}
+
+/// What a frontend whose tasks commit into put directories writes their action trees with.
+pub struct PutDirParts {
+    /// The writer of the action trees, over the frontend's CAS and packs.
+    pub writer: TreeWriter,
+    /// The kbf base tree every action tree is written over: set when the frontend has published
+    /// it, before the executor is started.
+    pub base: Arc<OnceLock<BaseTree>>,
+}
+
+impl PutDirParts {
+    /// The parts over `packs` and `backend`, writing over the base tree `base` will hold.
+    #[must_use]
+    pub fn new(packs: &Packs, backend: &Backend, base: Arc<OnceLock<BaseTree>>) -> Self {
+        let clock: kbf_front::Clock = Arc::new(SystemTime::now);
+        Self {
+            writer: TreeWriter::new(Arc::new(backend.clone()), Arc::new(packs.clone()), clock),
+            base,
+        }
+    }
 }
 
 /// What [`Front`] holds of one run between the three steps.
@@ -172,8 +250,17 @@ struct Parked {
     key: String,
     put_url: Option<Secret>,
     grant: Option<ReadGrant>,
+    /// The digest of the action tree of a put-directory run, in hex.
+    tree: Option<String>,
     /// When the write and the grant stop working: the entry is dropped after.
     not_after: u64,
+}
+
+impl Parked {
+    /// Whether something of the run is still to be handed out.
+    fn holds_any(&self) -> bool {
+        self.put_url.is_some() || self.grant.is_some() || self.tree.is_some()
+    }
 }
 
 /// The executor's seams over the frontend.
@@ -247,6 +334,9 @@ impl Ingest for Front {
     ) -> Result<PackKey, MintError> {
         let action = cas_digest(action).map_err(MintError::Refused)?;
         let now = (self.now)();
+        if let Some(put_dir) = &self.parts.put_dir {
+            return self.mint_put_dir(put_dir, lease, &action, now, wall).await;
+        }
         let prepared = self
             .parts
             .prepare
@@ -272,6 +362,7 @@ impl Ingest for Front {
                     url: prepared.grant_url,
                     token: prepared.grant_token,
                 }),
+                tree: None,
                 not_after: prepared.not_after,
             },
         );
@@ -285,7 +376,13 @@ impl Ingest for Front {
         action: &Digest,
         limits: &UntrustedLimits,
     ) -> Ingested {
-        let Some(issued) = issued_of(key) else {
+        // The key is read first: a key that is not one issued is the wrong key, whatever the
+        // action's digest.
+        let key = match &self.parts.put_dir {
+            Some(_) => put_dir_of(key).map(Issued::PutDir),
+            None => issued_of(key).map(Issued::Key),
+        };
+        let Some(key) = key else {
             return Ingested::Reject(RejectReason::WrongKey);
         };
         let action = match cas_digest(action) {
@@ -297,16 +394,17 @@ impl Ingest for Front {
             max_blob_bytes: limits.max_blob_bytes,
             ..kbf_front::UntrustedLimits::default()
         };
-        let done = kbf_front::ingest(
-            &self.parts.packs,
-            &self.parts.backend,
-            &self.parts.mint,
-            &build_id(lease),
-            &issued,
-            &action,
-            &limits,
-        )
-        .await;
+        let (packs, backend, mint) = (&self.parts.packs, &self.parts.backend, &self.parts.mint);
+        let build = build_id(lease);
+        let done = match key {
+            Issued::PutDir(dir) => {
+                kbf_front::ingest_put_dir(packs, backend, mint, &build, &dir, &action, &limits)
+                    .await
+            }
+            Issued::Key(key) => {
+                kbf_front::ingest(packs, backend, mint, &build, &key, &action, &limits).await
+            }
+        };
         match done {
             kbf_front::Ingested::Ran { result, cached } => Ingested::Ran { result, cached },
             kbf_front::Ingested::Reject(why) => Ingested::Reject(reason(why)),
@@ -315,10 +413,75 @@ impl Ingest for Front {
     }
 }
 
+/// What the frontend issued a run: a key, or a put directory.
+enum Issued {
+    Key(IssuedPackKey),
+    PutDir(IssuedPutDir),
+}
+
 /// The key the frontend issued, from its text `cas/b/<build>/<nonce>`.
 fn issued_of(key: &PackKey) -> Option<IssuedPackKey> {
     let (build, nonce) = key.as_str().strip_prefix("cas/b/")?.split_once('/')?;
     IssuedPackKey::new(build, nonce).ok()
+}
+
+/// The put directory the frontend issued, from its text `cas/b/<build>/<nonce>`.
+fn put_dir_of(key: &PackKey) -> Option<IssuedPutDir> {
+    let (build, nonce) = key.as_str().strip_prefix("cas/b/")?.split_once('/')?;
+    IssuedPutDir::new(build, nonce).ok()
+}
+
+impl Front {
+    /// [`Ingest::mint`] of a run that commits into a put directory: the directory, and the
+    /// action tree written over the base tree and parked for [`Inputs::tree`].
+    async fn mint_put_dir(
+        &self,
+        put_dir: &PutDirParts,
+        lease: LeaseId,
+        action: &kbf_types::Digest,
+        now: SystemTime,
+        wall: Duration,
+    ) -> Result<PackKey, MintError> {
+        // Before anything is read or minted: without the base no tree can be written.
+        let Some(base) = put_dir.base.get() else {
+            return Err(MintError::Unavailable(
+                "the kbf base tree is not published: no action tree can be written".to_owned(),
+            ));
+        };
+        let prepared = self
+            .parts
+            .prepare
+            .prepare_put_dir(&build_id(lease), action, now, wall)
+            .await
+            .map_err(MintError::from)?;
+        let needed = seconds(now).saturating_add(wall.as_secs());
+        if prepared.not_after < needed {
+            return Err(MintError::Refused(
+                "the put directory's keys end before the run's wall time does".to_owned(),
+            ));
+        }
+        let tree = put_dir.writer.write(&prepared.kept, base).await;
+        let tree = tree.map_err(|no| {
+            let why = format!("no action tree: {no}");
+            match no.why() {
+                "store" => MintError::Unavailable(why),
+                _ => MintError::Refused(why),
+            }
+        })?;
+        let mut parked = self.parked();
+        parked.retain(|_, run| run.not_after >= seconds(now));
+        parked.insert(
+            lease,
+            Parked {
+                key: prepared.dir.clone(),
+                put_url: None,
+                grant: None,
+                tree: Some(tree.digest().to_string()),
+                not_after: prepared.not_after,
+            },
+        );
+        Ok(PackKey::new(prepared.dir))
+    }
 }
 
 fn reason(why: kbf_front::RejectReason) -> RejectReason {
@@ -349,7 +512,7 @@ impl Presign for Front {
             .values_mut()
             .find(|run| run.key == key.as_str())
             .and_then(|run| run.put_url.take());
-        parked.retain(|_, run| run.put_url.is_some() || run.grant.is_some());
+        parked.retain(|_, run| run.holds_any());
         url.ok_or_else(|| PresignError::Refused(format!("no write was prepared for {key}")))
     }
 }
@@ -388,8 +551,15 @@ impl Inputs for Front {
     ) -> Result<ReadGrant, InputsError> {
         let mut parked = self.parked();
         let grant = parked.get_mut(&lease).and_then(|run| run.grant.take());
-        parked.retain(|_, run| run.put_url.is_some() || run.grant.is_some());
+        parked.retain(|_, run| run.holds_any());
         grant.ok_or_else(|| InputsError::Unavailable(format!("no grant was prepared for {lease}")))
+    }
+
+    async fn tree(&self, lease: LeaseId) -> Result<String, InputsError> {
+        let mut parked = self.parked();
+        let tree = parked.get_mut(&lease).and_then(|run| run.tree.take());
+        parked.retain(|_, run| run.holds_any());
+        tree.ok_or_else(|| InputsError::Unavailable(format!("no tree was written for {lease}")))
     }
 }
 
