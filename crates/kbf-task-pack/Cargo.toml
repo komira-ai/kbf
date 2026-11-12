@@ -17,6 +17,8 @@ kbf-types.workspace = true
 # The manifest of a task pack is JSON.
 serde.workspace = true
 serde_json.workspace = true
+# The digest of a whole pack, hashed as `PackLayout::write_to` writes it.
+sha2.workspace = true
 thiserror.workspace = true
 
 [lints]

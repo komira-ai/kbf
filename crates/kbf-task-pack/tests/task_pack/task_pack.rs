@@ -29,7 +29,7 @@ fn tree() -> Vec<u8> {
 
 /// The blobs of the golden pack in the order they were written after the manifest: the offsets
 /// in the fixture follow it.
-fn golden_blobs() -> Vec<Vec<u8>> {
+pub(crate) fn golden_blobs() -> Vec<Vec<u8>> {
     vec![
         A_O.to_vec(),
         TOOL.to_vec(),
