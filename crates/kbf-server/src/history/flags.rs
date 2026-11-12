@@ -1,5 +1,6 @@
 //! `--history-objects` and `--history-index-root`: where build history is kept.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use kbf_history::{HistoryRoot, IndexRoot};
@@ -87,6 +88,17 @@ impl HistoryFlags {
         state: Option<&StateStore>,
         env: &dyn Fn(&str) -> Option<String>,
     ) -> Result<Option<History>, HistoryError> {
+        self.open_by(state, env, &mut |dir| FsStore::open(dir, Floor::KeepFree))
+    }
+
+    /// [`HistoryFlags::open_with`], opening a `file://` directory with `file` (the
+    /// frontend's waits while another process holds it: [`super::lock_wait`]).
+    pub(super) fn open_by(
+        &self,
+        state: Option<&StateStore>,
+        env: &dyn Fn(&str) -> Option<String>,
+        file: &mut dyn FnMut(&Path) -> Result<FsStore, FsStoreError>,
+    ) -> Result<Option<History>, HistoryError> {
         let Some(uri) = &self.history_objects else {
             return Ok(None);
         };
@@ -98,7 +110,7 @@ impl HistoryFlags {
         let options = Options::default();
         match uri {
             StoreUri::File(dir) => {
-                let objects = FsStore::open(dir, Floor::KeepFree)?;
+                let objects = file(dir)?;
                 let root = HistoryRoot::under(&KeyPrefix::new(FILE_PREFIX_ROOT)?)?;
                 Ok(Some(over(objects, root, store, index_root, options)))
             }
@@ -113,7 +125,7 @@ impl HistoryFlags {
 }
 
 /// The process environment, where an `s3://` store's key pair is read from.
-fn process_env(name: &str) -> Option<String> {
+pub(super) fn process_env(name: &str) -> Option<String> {
     std::env::var(name).ok()
 }
 

@@ -327,7 +327,7 @@ mod tests {
         }
         let work = work_with_base("matrix-tags");
         let sys = FakeSystem::new();
-        let shares = prepare(&ctx(&sys, &work), "vm");
+        let shares = prepare(&ctx(&sys, &work), "vm-tags");
         let tags: std::collections::BTreeSet<_> = shares.iter().map(|s| s.tag.clone()).collect();
         assert_eq!(tags.len(), shares.len());
         for t in &tags {
@@ -344,7 +344,7 @@ mod tests {
         let work = work_with_base("matrix-prepare");
         let sys = FakeSystem::new();
         let c = ctx(&sys, &work);
-        let shares = prepare(&c, "vm");
+        let shares = prepare(&c, "vm-prepare");
         let by = |n: &str| shares.iter().find(|s| s.name == n).expect("share");
         for (name, mode) in [
             ("base", 0o777),
@@ -397,7 +397,7 @@ mod tests {
         // A root run makes the other-owner directory and gives it away; a non-root test
         // process cannot chown, and then the share is skipped with the chown error.
         sys.uid.set(0);
-        let again = prepare(&c, "vm");
+        let again = prepare(&c, "vm-prepare");
         let other = again
             .iter()
             .find(|s| s.name == "other-owner")
@@ -422,7 +422,7 @@ mod tests {
     fn the_manifest_lists_what_is_attached_and_is_written_into_the_share() {
         let work = work_with_base("matrix-manifest");
         let sys = FakeSystem::new();
-        let shares = prepare(&ctx(&sys, &work), "vm");
+        let shares = prepare(&ctx(&sys, &work), "vm-manifest");
         let m = manifest(&shares);
         let rows = m.as_array().expect("rows");
         assert_eq!(
@@ -460,7 +460,7 @@ mod tests {
     fn the_host_listing_shows_what_landed_and_who_owns_the_directory() {
         let work = work_with_base("matrix-list");
         let sys = FakeSystem::new();
-        let shares = prepare(&ctx(&sys, &work), "vm");
+        let shares = prepare(&ctx(&sys, &work), "vm-list");
         let base = shares.iter().find(|s| s.name == "base").expect("base");
         std::fs::write(base.dir.join("landed"), "abc").expect("file");
         let rows = host_listing(&shares);
@@ -499,7 +499,7 @@ mod tests {
         let work = work_with_base("matrix-keep");
         let sys = FakeSystem::new();
         let c = ctx(&sys, &work);
-        let shares = prepare(&c, "vm");
+        let shares = prepare(&c, "vm-keep");
         remove(&c, &shares, true);
         assert!(
             shares

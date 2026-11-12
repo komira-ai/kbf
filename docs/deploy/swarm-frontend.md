@@ -24,6 +24,23 @@ is unset or empty: both jobs are skipped and the release ends as it does without
 needs `gamma`, so a release whose gamma stage failed is not deployed (re-run the failed jobs once
 the farm takes it). A failed `deploy` makes the release run red; the release stays published.
 
+## The old and the new task of one slot
+
+A frontend stops by draining: it waits for its open work, however long that takes, and only
+then exits. Swarm does not wait that long before it starts the slot's next task, even with
+`order: stop-first` and a long `stop_grace_period`: it starts the new task once the old one has
+stopped or one minute after it told the old one to stop, whichever comes first (the grace
+period only puts off the kill). So a drain longer than a minute overlaps the new task, and both
+name the slot's `file://` history directory, which the old process holds (`LOCK`) until it
+exits. The new frontend waits for it: it logs `the history directory is still locked, waiting
+to try again` at every attempt, opens the directory once the old process has exited, and only
+then serves and passes its health check. A stop signal during the wait (a rollback, for one)
+ends it with exit 0. Every other start error still exits 2 at once.
+
+What still bounds the overlap is the service's health check: a new task that has not passed it
+by the end of its `start_period` and retries is replaced, and that counts as a failed update. A
+`start_period` shorter than the longest drain the frontends see makes such an update roll back.
+
 ## Turn it on
 
 There is no required reviewer: a release that passed the pipeline deploys without an operator

@@ -252,3 +252,19 @@ fn the_flag_has_its_default_and_bounds() {
         assert!(window(&[flag.as_str()]).is_err(), "{bad}");
     }
 }
+
+/// A start that a signal stopped while it waited for its history directory exits 0, as a
+/// stop does, not 2: a frontend told to stop during an update's overlap is not a refused
+/// start. Catches the stop mapped to the refusal it replaced.
+#[test]
+fn a_stop_while_the_history_directory_was_held_exits_zero() {
+    let err: Box<dyn std::error::Error> = Box::new(crate::history::StoppedWaiting {
+        path: "/var/lib/kbf-server/history/LOCK".into(),
+        attempts: 3,
+        waited: ms(750),
+    });
+    assert_eq!(
+        format!("{:?}", exit_of(err.as_ref())),
+        format!("{:?}", std::process::ExitCode::SUCCESS)
+    );
+}
