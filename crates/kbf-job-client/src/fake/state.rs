@@ -493,6 +493,7 @@ impl State {
             truncated: record.truncated,
             times: Some(record.times),
             usage: None,
+            input_failure: None,
         })
     }
 

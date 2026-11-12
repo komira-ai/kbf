@@ -236,6 +236,9 @@ pub(super) async fn prepare(
         // Never left unspecified, which the service reads as none.
         network: ctx.cfg.network.level().into(),
         ports: Vec::new(),
+        host_ports: Vec::new(),
+        layers: Vec::new(),
+        mounts: Vec::new(),
         files: args.files(ctx.cfg.delivery),
         priority: 0,
         labels: [
