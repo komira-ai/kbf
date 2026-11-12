@@ -23,6 +23,10 @@
 //! the manifest and outputs are stored through the same sink. The manifest's advisory `inputs`
 //! is `{"from":"tree"}` with every number 0 (nothing was fetched), which makes it version 2.
 //!
+//! With `--stage-and-commit` there is no sink: the packs and large objects are written into the
+//! put directory `--out-dir` and committed there ([`crate::out_dir`]), which the sandbox also
+//! hides from the Command. `--out-dir` must be a directory before anything is read (exit 14).
+//!
 //! A failure to read the Action, the Command or `work` is exit 10, as a fetch failure is; a run
 //! directory that cannot be made is exit 11, as the private directories are.
 
@@ -37,11 +41,13 @@ use kbf_task_pack::{InputStats, InputsFrom, TaskManifest};
 use crate::digest;
 use crate::fetch::{FetchError, file_message};
 use crate::inputs::{Inputs, network_of};
+use crate::out_dir::OutDir;
+use crate::plan::Limits;
 use crate::run::RunError;
 use crate::sandbox::GRANTS_DIR;
 use crate::task::{
-    Cli, Failure, HttpSink, PackSink, check_argv_secrets, check_lease, check_slots, complete,
-    exit_code, http_sink, millis, named, put_urls, sink_limits, trusted_roots,
+    Cli, Failure, HttpSink, PackSink, check_argv_secrets, check_lease, check_slots, collected,
+    complete, exit_code, http_sink, millis, named, put_urls, sink_limits, trusted_roots,
 };
 
 /// The Action's file, under the tree's root.
@@ -101,14 +107,19 @@ fn read(cli: &Cli, root: &Path) -> Result<Inputs, Failure> {
                 format!("cannot make the run directory (an existing one is refused): {e}"),
             ),
         })?;
+    // The job's grants and the task's run directory, out of the Command's sight (its `private/`
+    // is bound again by the sandbox); and the put directory, which only the task writes, once
+    // the Command has ended.
+    let mut hidden = vec![PathBuf::from(GRANTS_DIR), run_dir.clone()];
+    if cli.stage_and_commit {
+        hidden.push(cli.out_dir().to_owned());
+    }
     Ok(Inputs {
         action,
         command,
         network,
         root: work,
-        // The job's grants and the task's run directory, out of the Command's sight (its
-        // `private/` is bound again by the sandbox).
-        hidden: vec![PathBuf::from(GRANTS_DIR), run_dir.clone()],
+        hidden,
         run_dir,
         fetch_ms: millis(reading.elapsed()),
         stats: Some(input_stats()),
@@ -139,6 +150,38 @@ pub(crate) fn connect(cli: &Cli) -> Result<HttpSink, Failure> {
     let roots = trusted_roots(cli)?;
     let urls = put_urls(cli)?;
     Ok(http_sink(cli, urls, &roots))
+}
+
+/// Runs the tree job `cli` names over the tree at `root`, within `limits`, writing its packs and
+/// large objects into the put directory `out` ([`crate::out_dir`]) instead of a sink, and
+/// returns the manifest that was committed. With `--stage-and-commit` the put directory
+/// `--out-dir` is hidden from the Command with the grants and the run directory.
+///
+/// # Errors
+/// A [`Failure`], whose [`Failure::exit_code`] names the step that failed.
+pub async fn execute_out_dir(
+    cli: &Cli,
+    root: &Path,
+    out: &OutDir,
+    limits: &Limits,
+) -> Result<TaskManifest, Failure> {
+    check_slots(limits)?;
+    let inputs = read(cli, root)?;
+    let (mut manifest, blobs) = collected(cli, inputs, limits).await?;
+    out.store(&mut manifest, &blobs, limits)?;
+    Ok(manifest)
+}
+
+/// The end of [`crate::task::main_with`] for a tree job with `--stage-and-commit`: checks the
+/// lease and that `--out-dir` is a directory before anything runs, runs the job with a run's real
+/// slots ([`Limits::real`]) and turns the outcome into the exit code.
+pub(crate) async fn finish_out_dir(cli: &Cli, root: &Path) -> ExitCode {
+    let out = check_lease(cli).and_then(|()| OutDir::open(cli.out_dir()));
+    let outcome = match out {
+        Ok(out) => execute_out_dir(cli, root, &out, &Limits::real()).await,
+        Err(failure) => Err(failure),
+    };
+    exit_code(outcome)
 }
 
 /// The end of [`crate::task::main_with`] for a tree job rooted at `root`: runs it over `sink` (what [`connect`] made,

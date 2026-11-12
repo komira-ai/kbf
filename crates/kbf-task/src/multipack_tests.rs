@@ -3,6 +3,8 @@
 use super::*;
 use crate::outputs::collect_outputs;
 use crate::pack::MAX_LARGE_BYTES;
+use crate::place::MANIFEST_SLACK;
+use crate::plan::plan;
 use crate::task::recording_sink::Put;
 use crate::task::recording_sink::flip_first_byte;
 use kbf_proto::reapi::Command;

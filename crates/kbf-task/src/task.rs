@@ -20,8 +20,8 @@
 //! | 10 | fetch: the Action, the Command or an input could not be read or checked, or laid out; in a tree job, `.kbf/action` or `.kbf/command` could not be read, is not the blob its digest names (the Action's is `--action`) or does not decode, or `work` is not a directory |
 //! | 11 | run-start: the Command could not be started (bad paths, no program, a `kbf-network` property other than `allow`), or the run's `private/` home, tmp and cache directories, or the directories of its sandbox (`crate::sandbox`), could not be made or opened; in a tree job, also its run directory `.kbf-run` (an existing one is refused) |
 //! | 12 | pack: the outputs could not be collected, did not fit the run's packs and large objects (`output-too-large`), changed after they were hashed (`output-changed`), or made a manifest or pack the frontend would refuse (`invalid-manifest`, `invalid-pack`) |
-//! | 13 | put: a pack or large object could not be stored (refused, key already taken, still no room after the retries of a 503, unreachable), or a large object's bytes changed while it was sent (the stored object is an orphan) |
-//! | 14 | setup: `--lease` is not a build id, a credential or root certificate is unusable, a credential given as a flag value without `--insecure-argv-secrets`, or the runtime did not start |
+//! | 13 | put: a pack or large object could not be stored (refused, key already taken, still no room after the retries of a 503, unreachable), or a large object's bytes changed while it was sent (the stored object is an orphan); with `--stage-and-commit`, an object could not be written to the put directory or its commit `rename` failed |
+//! | 14 | setup: `--lease` is not a build id, `--out-dir` is not a directory, a credential or root certificate is unusable, a credential given as a flag value without `--insecure-argv-secrets`, or the runtime did not start |
 //! | 15 | no confine: the Command is to be denied the network and this system cannot deny it (neither Linux nor macOS); nothing was run |
 
 use std::borrow::Cow;
@@ -34,8 +34,8 @@ use clap::{ArgGroup, Parser};
 use kbf_proto::reapi::{self, Action};
 use kbf_segments::sha256;
 use kbf_task_pack::{
-    LargeEntry, MAX_LARGE, MAX_PACKS, OutputDirectory, OutputFile, OutputSymlink, TaskManifest,
-    Timing, Usage, check_build,
+    MAX_LARGE, MAX_PACKS, OutputDirectory, OutputFile, OutputSymlink, TaskManifest, Timing, Usage,
+    check_build,
 };
 use kbf_types::Digest;
 
@@ -44,8 +44,9 @@ use crate::fetch::{BlobSource, FetchError, HttpBlobSource, LocatedSource, native
 use crate::inputs::{Inputs, fetch_inputs};
 use crate::network;
 use crate::outputs::{Blobs, OutputLimits, collect_outputs};
-use crate::pack::{MAX_LARGE_BYTES, PackError, build, build_extra};
-use crate::plan::{Limits, plan};
+use crate::pack::{PackError, build, build_extra};
+use crate::place::{manifest_reserve, output_cap, place};
+use crate::plan::Limits;
 use crate::put::{
     Jitter, PutError, RandomJitter, Sleeper, ThreadSleeper, agent, agent_with_plain_http, put,
     put_reader, put_retrying, tls_config,
@@ -117,7 +118,7 @@ pub const EXIT_NO_CONFINE: u8 = 15;
 #[command(
     name = "kbf-task",
     version = concat!(env!("CARGO_PKG_VERSION"), "+", env!("KBF_BUILD_COMMIT")),
-    group(ArgGroup::new("pack_url_source").required(true).args(["pack_url_file", "pack_url", "put_urls_file", "put_urls"])),
+    group(ArgGroup::new("pack_url_source").required(true).args(["pack_url_file", "pack_url", "put_urls_file", "put_urls", "stage_and_commit"])),
     group(ArgGroup::new("grant_token_source").args(["grant_token_file", "grant_token"]))
 )]
 pub struct Cli {
@@ -146,6 +147,22 @@ pub struct Cli {
     /// `--insecure-argv-secrets`.
     #[arg(long)]
     pub put_urls: Option<String>,
+    /// Write the packs and large objects into the put directory `--out-dir` instead of PUTting
+    /// them: each is written as `<name>.part`, renamed to `<name>.sha256-<hex>.part`, then
+    /// committed by renaming it to `<name>` (`pack`, `pack1`.., `L0`..), pack last (see
+    /// `crate::out_dir`). Only with `--tree` (it is refused with `--grant-url`, which a run
+    /// without `--tree` needs); no URL is read.
+    #[arg(long, conflicts_with_all = ["grant_url", "allow_plain_http_put"])]
+    pub stage_and_commit: bool,
+    /// The put directory of `--stage-and-commit` (default `/out`); it must be a directory when
+    /// the task starts. Refused with the URL flags, which a run without `--stage-and-commit`
+    /// must give.
+    #[arg(
+        long,
+        value_name = "DIR",
+        conflicts_with_all = ["pack_url_file", "pack_url", "put_urls_file", "put_urls"]
+    )]
+    pub out_dir: Option<PathBuf>,
     /// The base URL of the read grant: blobs are read from `<base>/<hex>/<size>`. Required, with
     /// `--grant-token-file` or `--grant-token`, unless `--tree` is given.
     #[arg(
@@ -247,6 +264,14 @@ pub struct Cli {
     pub relay: Option<PathBuf>,
 }
 
+impl Cli {
+    /// The put directory of `--stage-and-commit`: `--out-dir`, or `/out`.
+    #[must_use]
+    pub fn out_dir(&self) -> &Path {
+        self.out_dir.as_deref().unwrap_or(Path::new("/out"))
+    }
+}
+
 /// Why a task did not complete; each class has its own exit code.
 #[derive(Debug, thiserror::Error)]
 pub enum Failure {
@@ -275,6 +300,9 @@ pub enum Failure {
     /// The pack could not be stored.
     #[error("put: {0}")]
     Put(#[from] PutError),
+    /// An object could not be written to or committed in the put directory.
+    #[error("put: {0}")]
+    OutDir(#[from] crate::out_dir::OutDirError),
 }
 
 impl Failure {
@@ -289,7 +317,7 @@ impl Failure {
             Failure::Outputs(_) | Failure::Result(_) | Failure::Read(_) | Failure::Pack(_) => {
                 EXIT_PACK
             }
-            Failure::Put(_) => EXIT_PUT,
+            Failure::Put(_) | Failure::OutDir(_) => EXIT_PUT,
         }
     }
 }
@@ -389,30 +417,6 @@ impl PackSink for HttpSink {
     }
 }
 
-/// What the manifest of a run with several large objects can take beyond a manifest without:
-/// the `packs` field and up to [`MAX_LARGE`](kbf_task_pack::MAX_LARGE) entries of about 110 bytes each.
-const MANIFEST_SLACK: u64 = 2048;
-
-/// The bytes pack 0 keeps for the manifest. A run of one pack and no large object writes the
-/// manifest it already has, so the reserve is exactly its JSON length and a v1 run that fills
-/// the pack to the byte still fits. With more packs or a large object the manifest gains the
-/// `packs` field and entries, so [`MANIFEST_SLACK`] is added.
-fn manifest_reserve(manifest: &TaskManifest, limits: &Limits) -> Result<u64, PackError> {
-    let json = manifest.to_json_with(MAX_LARGE_BYTES)?.len() as u64;
-    Ok(if limits.packs == 1 && limits.large == 0 {
-        json
-    } else {
-        json + MANIFEST_SLACK
-    })
-}
-
-/// The bytes of outputs the recorder may hold: what the run's packs and large objects can.
-fn output_cap(limits: &Limits) -> u64 {
-    let packs = (limits.packs as u64).saturating_mul(limits.pack_bytes);
-    let large = (limits.large as u64).saturating_mul(limits.large_bytes);
-    packs.saturating_add(large)
-}
-
 /// One of packs 1.., built from the recorded blobs `digests`.
 fn extra_pack(blobs: &Blobs, digests: &[Digest]) -> Result<Vec<u8>, Failure> {
     let held = held(blobs, digests)?;
@@ -499,6 +503,19 @@ pub(crate) async fn complete(
     sink: &dyn PackSink,
     limits: &Limits,
 ) -> Result<TaskManifest, Failure> {
+    let (mut manifest, blobs) = collected(cli, inputs, limits).await?;
+    store_outputs(&mut manifest, &blobs, limits, sink)?;
+    Ok(manifest)
+}
+
+/// Runs the Command and collects its outputs, within what `limits` can store: the manifest
+/// (`pack_ms` the time the outputs took to collect, one pack and no large object yet) and the
+/// blobs, for a sink to place and store.
+pub(crate) async fn collected(
+    cli: &Cli,
+    inputs: Inputs,
+    limits: &Limits,
+) -> Result<(TaskManifest, Blobs), Failure> {
     let Inputs {
         action,
         command,
@@ -564,6 +581,7 @@ pub(crate) async fn complete(
             fetch_ms,
             run_ms: ran.wall_ms,
             pack_ms,
+            ..Timing::default()
         },
         usage: Usage {
             cpu_usage_us: ran.cpu_us,
@@ -593,8 +611,7 @@ pub(crate) async fn complete(
             target: link.target.clone(),
         });
     }
-    store_outputs(&mut manifest, &outputs.blobs, limits, sink)?;
-    Ok(manifest)
+    Ok((manifest, outputs.blobs))
 }
 
 /// Plans `blobs` into the slots `limits` allows, sets `manifest.packs` and `manifest.large`, and
@@ -617,27 +634,8 @@ fn store_outputs(
     limits: &Limits,
     sink: &dyn PackSink,
 ) -> Result<(), Failure> {
-    // Plan before anything is built or stored: pack 0 keeps room for the manifest as it will be
-    // written, with its `packs` and `large` fields.
     let reserve = manifest_reserve(manifest, limits)?;
-    let sizes = blobs
-        .digests()
-        .map(|d| digest_of(Some(&d)).map(|d| (d, d.size_bytes)))
-        .collect::<Result<Vec<_>, _>>()?;
-    let planned = plan(&sizes, reserve, limits).map_err(PackError::from)?;
-    // At most `limits.packs`, which `execute_with` keeps within MAX_PACKS; a count that did not
-    // fit a byte would be refused by the manifest's own check.
-    manifest.packs = u8::try_from(planned.packs.len()).unwrap_or(u8::MAX);
-    manifest.large = planned
-        .large
-        .iter()
-        .zip(0..)
-        .map(|(digest, slot)| LargeEntry {
-            slot,
-            digest: *digest,
-        })
-        .collect();
-
+    let planned = place(manifest, blobs, reserve, limits)?;
     let pack_0 = {
         let held = held(blobs, &planned.packs[0])?;
         let views: Vec<&[u8]> = held.iter().map(|bytes| bytes.as_ref()).collect();
@@ -667,7 +665,7 @@ pub(crate) fn named(
 }
 
 /// A result's digest as the manifest writes it.
-fn digest_of(digest: Option<&reapi::Digest>) -> Result<Digest, Failure> {
+pub(crate) fn digest_of(digest: Option<&reapi::Digest>) -> Result<Digest, Failure> {
     let digest = digest.ok_or_else(|| Failure::Result("a digest is absent".to_owned()))?;
     digest::from_reapi(digest).map_err(|e| Failure::Result(e.to_string()))
 }
@@ -847,9 +845,13 @@ fn connect_located(cli: &Cli) -> Result<(Box<dyn BlobSource>, HttpSink), Failure
 /// Runs the task the flags describe against the real grant and the real presigned URL, and turns
 /// the outcome into the process exit code (see the module documentation). A failure is written to
 /// standard error; no message holds the token or the presigned URL's query. With `--tree` there is
-/// no grant: the run reads its tree ([`crate::tree`]) and stores through the same sink.
+/// no grant: the run reads its tree ([`crate::tree`]) and stores through the same sink, or, with
+/// `--stage-and-commit`, into the put directory `--out-dir` ([`crate::out_dir`]).
 pub async fn main_with(cli: &Cli) -> ExitCode {
     if let Some(root) = cli.tree.as_deref() {
+        if cli.stage_and_commit {
+            return crate::tree::finish_out_dir(cli, root).await;
+        }
         let sink = crate::tree::connect(cli).map(|sink| -> Box<dyn PackSink> { Box::new(sink) });
         return crate::tree::finish(cli, root, sink).await;
     }

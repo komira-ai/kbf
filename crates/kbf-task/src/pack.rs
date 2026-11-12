@@ -19,8 +19,8 @@ use std::fmt;
 
 use kbf_segments::SegmentWriter;
 use kbf_task_pack::{
-    MAX_PACK_RECORDS, MAX_RECORD_BYTES, ManifestError, ShapeError, TaskManifest, TaskPackError,
-    WritePackError, read_manifest_with, write_pack_with,
+    LayoutError, MAX_PACK_RECORDS, MAX_RECORD_BYTES, ManifestError, ShapeError, TaskManifest,
+    TaskPackError, WritePackError, read_manifest_with, write_pack_with,
 };
 
 use crate::plan::PlanError;
@@ -99,6 +99,21 @@ impl From<PlanError> for PackError {
         let detail = match e {
             PlanError::TooLarge(_) => OUTPUT_TOO_LARGE,
             PlanError::SizeMismatch { .. } => INVALID_MANIFEST,
+        };
+        Self {
+            detail,
+            message: e.to_string(),
+        }
+    }
+}
+
+impl From<LayoutError> for PackError {
+    fn from(e: LayoutError) -> Self {
+        let detail = match e {
+            LayoutError::NoRecords => INVALID_PACK,
+            LayoutError::RecordTooLarge { .. }
+            | LayoutError::TooManyRecords { .. }
+            | LayoutError::TooLarge { .. } => OUTPUT_TOO_LARGE,
         };
         Self {
             detail,
