@@ -25,8 +25,8 @@
 //!   ends with the one step that does: `cargo xtask pipeline-watch`, which cancels the run as soon
 //!   as a job has failed.
 //! - **Each check once.** The four called workflows have a `workflow_call` trigger and no
-//!   `push` trigger; `ci.yml` and `artifacts.yml` keep `pull_request` and `merge_group`;
-//!   `beta.yml` and `smoke.yml` have `workflow_call` alone. The jobs that call them are the
+//!   `push` trigger; `ci.yml` keeps `pull_request` and `merge_group`;
+//!   `artifacts.yml`, `beta.yml` and `smoke.yml` have `workflow_call` alone. The jobs that call them are the
 //!   pipeline's alone: one job each, but for `artifacts.yml`, which `artifacts` (stage build) and
 //!   `artifacts-sign` (stage sign) call, so a push to main runs each check once.
 //! - **Smoke tests the artifacts of the same run; beta needs none.** `smoke.yml` downloads the
@@ -393,13 +393,13 @@ fn called(files: &Files, out: &mut Vec<String>) -> Result<(), String> {
         if has(&events, "push") {
             out.push(format!("{file} has a `push` trigger: a push to main would run it beside the pipeline, and each check must run once"));
         }
-        let pull_requests = !matches!(file, "beta.yml" | "smoke.yml");
+        let pull_requests = file == "ci.yml";
         for event in ["pull_request", "merge_group"] {
             if pull_requests && !has(&events, event) {
                 out.push(format!("{file} does not run on `{event}`: the pull-request gate and the merge queue keep running it"));
             }
             if !pull_requests && has(&events, event) {
-                out.push(format!("{file} runs on `{event}`: beta runs after the artifacts of a push to main, and nowhere else"));
+                out.push(format!("{file} runs on `{event}`: only ci.yml runs on a pull request or in the merge queue (the Linux x86_64 tests); the rest run in the pipeline of a push to main"));
             }
         }
         if let Some((group, _)) = workflows::concurrency(text)?
@@ -480,7 +480,7 @@ fn artifacts_stages(artifacts: &str, out: &mut Vec<String>) -> Result<(), String
             }
         } else if !condition.as_deref().is_some_and(excludes_sign_stage) {
             out.push(format!(
-                "the job `{job}` of artifacts.yml has `if: {shown}`, not `${{{{ (<condition>) && {NOT_SIGN_STAGE} }}}}`: the sign call would run it again"
+                "the job `{job}` of artifacts.yml has `if: {shown}`, not `${{{{ {NOT_SIGN_STAGE} }}}}`: the sign call would run it again"
             ));
         }
     }
@@ -494,11 +494,14 @@ fn artifacts_stages(artifacts: &str, out: &mut Vec<String>) -> Result<(), String
     Ok(())
 }
 
-/// Whether `condition` is exactly `${{ (<condition>) && inputs.stage != 'sign' }}`, the
+/// Whether `condition` is exactly `${{ inputs.stage != 'sign' }}`, or `${{ (<condition>) && inputs.stage != 'sign' }}` with the
 /// parenthesis closing at the end of `<condition>`: `x || inputs.stage != 'sign'`, or
 /// `(a) || (b) && inputs.stage != 'sign'` (where `&&` binds first), would still let the sign
 /// call run the job.
 fn excludes_sign_stage(condition: &str) -> bool {
+    if condition == format!("${{{{ {NOT_SIGN_STAGE} }}}}") {
+        return true;
+    }
     let tail = format!(" && {NOT_SIGN_STAGE} }}}}");
     let Some(inner) = condition
         .strip_prefix("${{ ")

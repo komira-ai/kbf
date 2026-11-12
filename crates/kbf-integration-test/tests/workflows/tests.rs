@@ -48,7 +48,7 @@ fn a_clean_workflow_passes() {
         "    runs-on: ubuntu-24.04-arm\n    steps:\n      - uses: actions/b@{SHA} # v1.2.3\n        with:\n          save-if: ${{{{ github.ref == 'refs/heads/main' }}}}\n      - uses: ./local\n      - name: 'a # not a comment'\n        run: |\n          echo causes  # runs-on: big-box is script text\n    # never pull_request_target, never self-hosted\n"
     )));
     clean(
-        "on:\n  pull_request:\n  push:\n    branches: [main]\npermissions: {}\njobs:\n  a:\n    runs-on: [ubuntu-latest]\n  b:\n    runs-on: {labels: [macos-15]}\n  c:\n    uses: ./.github/workflows/c.yml\n",
+        "on:\n  workflow_call:\n  push:\n    branches: [main]\npermissions: {}\njobs:\n  a:\n    runs-on: [ubuntu-latest]\n  b:\n    runs-on: {labels: [macos-15]}\n  c:\n    uses: ./.github/workflows/c.yml\n",
     );
 }
 
@@ -1118,5 +1118,70 @@ fn actions_write_is_also_allowed_for_the_first_attempt_of_a_failed_pipeline_run_
                 .any(|m| m.contains(&format!("`{scope}: write` is allowed only"))),
             "{body}\n-> {found:?}"
         );
+    }
+}
+
+/// A workflow with the trigger `on` and one job on the runner `runner`.
+fn on_runner(on: &str, runner: &str) -> String {
+    format!("on: {on}\npermissions: {{}}\njobs:\n  a:\n    runs-on: {runner}\n")
+}
+
+#[test]
+fn a_pull_request_workflow_on_a_non_x86_64_linux_runner_is_refused() {
+    // Catches: a job on macOS, Windows or Linux Arm in a workflow that a pull request or a merge
+    // queue entry starts, in every spelling of the trigger and of the runner.
+    for on in [
+        "pull_request",
+        "[push, pull_request]",
+        "merge_group",
+        "{pull_request: {paths: [x]}, push: {branches: [main]}}",
+        "\n  - merge_group",
+    ] {
+        for runner in [
+            "macos-15",
+            "macos-26",
+            "macos-latest",
+            "macos-15-intel",
+            "ubuntu-24.04-arm",
+            "ubuntu-22.04-arm",
+            "windows-latest",
+            "windows-11-arm",
+            "[macos-15]",
+            "{labels: macos-15}",
+        ] {
+            refused_text(
+                &on_runner(on, runner),
+                "runs on Linux x86_64 hosted runners only",
+            );
+        }
+    }
+}
+
+#[test]
+fn a_pull_request_workflow_on_linux_x86_64_runners_passes() {
+    // Catches: a rule that refuses the Linux x86_64 runners the pull-request checks run on.
+    for runner in [
+        "ubuntu-latest",
+        "ubuntu-24.04",
+        "ubuntu-22.04",
+        "ubuntu-slim",
+        "[ubuntu-26.04]",
+    ] {
+        clean(&on_runner("[pull_request, merge_group]", runner));
+    }
+}
+
+#[test]
+fn a_workflow_without_a_pull_request_trigger_may_name_any_hosted_runner() {
+    // Catches: a rule that applies to the stage workflows (`workflow_call`, `push`,
+    // `workflow_dispatch`), where macOS and Arm run as the beta stage.
+    for on in [
+        "workflow_call",
+        "[push, workflow_dispatch]",
+        "{push: {branches: [main]}}",
+    ] {
+        for runner in ["macos-26", "ubuntu-24.04-arm", "windows-latest"] {
+            clean(&on_runner(on, runner));
+        }
     }
 }
