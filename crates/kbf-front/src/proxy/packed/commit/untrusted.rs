@@ -35,6 +35,7 @@
 use std::sync::Arc;
 
 use kbf_objstore::{ByteRange, ObjectKey, kbf_key};
+use kbf_pack::{MAX_LARGE, MAX_PACKS, Slot};
 use kbf_pack_index::{NewPack, PackBlob, Recorded};
 use kbf_segments::layout::{TRAILER_LEN, footer_len};
 use kbf_segments::{Footer, MAX_SEGMENT_BYTES, SegmentError};
@@ -45,10 +46,12 @@ use crate::proxy::packed::metrics::Reason;
 mod large;
 mod metadata;
 mod mint;
+mod put_dir;
 mod set;
 mod task;
 
 pub use self::mint::{MIN_SECRET_BYTES, MintError, PackKeyMint};
+pub use self::put_dir::ingest_put_dir;
 pub use self::set::IssuedKeySet;
 pub use self::task::{Ingested, RejectReason, StoreError, ingest, ingest_set};
 
@@ -115,6 +118,79 @@ impl IssuedPackKey {
     #[must_use]
     pub fn build(&self) -> &str {
         &self.build
+    }
+}
+
+impl IssuedPackKey {
+    /// The key of the object `slot` in the put directory `dir`: `<dir>/<name>`.
+    fn in_put_dir(dir: &IssuedPutDir, slot: Slot) -> Self {
+        let key = format!("{}/{}", dir.dir, slot.object_name());
+        // `dir` was checked to be an object key's prefix, and a name holds only letters and
+        // digits, so the key is an object key; kept whole by the fallback all the same.
+        let object = kbf_key(key.clone()).unwrap_or_else(|_| dir.object.clone());
+        Self {
+            build: dir.build.clone(),
+            key,
+            object,
+        }
+    }
+}
+
+/// The put directory the frontend issued for one run of one build: `cas/b/<build>/<nonce>`.
+/// The task commits its objects as files in it, each the object `<dir>/<name>` (`pack`,
+/// `pack<k>`, `L<i>`, [`Slot::object_name`]); [`super::ingest_put_dir`] reads exactly those
+/// keys and no other.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IssuedPutDir {
+    build: String,
+    dir: String,
+    object: ObjectKey,
+}
+
+impl IssuedPutDir {
+    /// The directory `cas/b/<build>/<nonce>`.
+    ///
+    /// # Errors
+    /// [`CommitError::Invalid`]: `build` or `nonce` is empty or holds a `/`, or a key in the
+    /// directory is not an object key.
+    pub fn new(build: &str, nonce: &str) -> Result<Self, CommitError> {
+        let pack = IssuedPackKey::new(build, nonce)?;
+        // Every key of the directory is `<dir>/<name>`: the longest name is checked here, the
+        // others are no longer.
+        let longest = format!("{}/{}", pack.key, Slot::Pack(MAX_PACKS - 1).object_name());
+        kbf_key(longest).map_err(|error| CommitError::Invalid(error.to_string()))?;
+        Ok(Self {
+            build: pack.build,
+            dir: pack.key,
+            object: pack.object,
+        })
+    }
+
+    /// The directory, `cas/b/<build>/<nonce>`, with no `/` at its end.
+    #[must_use]
+    pub fn dir(&self) -> &str {
+        &self.dir
+    }
+
+    /// The build the directory was issued to.
+    #[must_use]
+    pub fn build(&self) -> &str {
+        &self.build
+    }
+
+    /// The key of the object `slot` in the directory.
+    #[must_use]
+    pub fn key(&self, slot: Slot) -> IssuedPackKey {
+        IssuedPackKey::in_put_dir(self, slot)
+    }
+
+    /// The keys of every object a run may commit in the directory, as a key set: packs `pack`
+    /// to `pack<MAX_PACKS-1>` and large objects `L0` to `L<MAX_LARGE-1>`.
+    #[must_use]
+    pub fn key_set(&self) -> IssuedKeySet {
+        let packs = (0..MAX_PACKS).map(|k| self.key(Slot::Pack(k))).collect();
+        let large = (0..MAX_LARGE).map(|i| self.key(Slot::Large(i))).collect();
+        IssuedKeySet::new(packs, large)
     }
 }
 

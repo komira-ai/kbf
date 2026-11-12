@@ -19,8 +19,8 @@ mod task_pack;
 
 pub use pack_layout::{BlobMeta, LayoutError, LayoutWriteError, PackLayout};
 pub use task_key::{
-    MAC_LEN, MAX_BUILD_BYTES, MAX_LARGE, MAX_PACKS, Slot, TaskKeyError, TaskPackKey, check_build,
-    mac_input, mac_input_v1, minute_of,
+    KeyLayout, MAC_LEN, MAX_BUILD_BYTES, MAX_LARGE, MAX_PACKS, Slot, TaskKeyError, TaskPackKey,
+    check_build, mac_input, mac_input_put_dir, mac_input_v1, minute_of,
 };
 pub use task_manifest::{
     EMPTY_DIGEST, InputStats, InputsFrom, LargeEntry, MANIFEST_VERSION, MANIFEST_VERSION_2,

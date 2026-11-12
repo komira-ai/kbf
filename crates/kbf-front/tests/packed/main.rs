@@ -25,6 +25,7 @@ mod support;
 mod untrusted;
 mod untrusted_mint;
 mod untrusted_multi;
+mod untrusted_put_dir;
 mod untrusted_task;
 mod untrusted_timing;
 mod untrusted_verifying;

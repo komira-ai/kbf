@@ -11,6 +11,12 @@
 //! action or another frontend's secret) does not verify, and [`super::ingest`] refuses it before
 //! it asks the store for a byte.
 //!
+//! A run that writes into a put directory is minted one directory instead,
+//! `cas/b/<lease>/<nonce>` ([`PackKeyMint::mint_put_dir`]): the nonce's MAC is over the lease, the
+//! action and the minute and no slot ([`kbf_pack::mac_input_put_dir`], a domain tag of its own),
+//! and each object of the run is a name in it (`pack`, `pack<k>`, `L<i>`). [`PackKeyMint::verify`]
+//! knows a key's layout from its text and checks the MAC of that layout.
+//!
 //! The secret is bytes the caller loads from a file named by a flag, as the server loads its other
 //! secrets; this module never reads a file or the environment, and never prints the secret.
 
@@ -19,14 +25,14 @@ use std::time::{Duration, SystemTime};
 
 use hmac::{Hmac, KeyInit, Mac};
 use kbf_pack::{
-    MAC_LEN, MAX_LARGE, MAX_PACKS, Slot, TaskKeyError, TaskPackKey, mac_input, mac_input_v1,
-    minute_of,
+    KeyLayout, MAC_LEN, MAX_LARGE, MAX_PACKS, Slot, TaskKeyError, TaskPackKey, mac_input,
+    mac_input_put_dir, mac_input_v1, minute_of,
 };
 use kbf_types::Digest;
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
 
-use super::{CommitError, IssuedPackKey};
+use super::{CommitError, IssuedPackKey, IssuedPutDir};
 
 /// The fewest bytes of secret a [`PackKeyMint`] takes: the length of the MAC's own output, below
 /// which the key is weaker than the tag it makes.
@@ -101,16 +107,30 @@ impl PackKeyMint {
         now: SystemTime,
         slot: Slot,
     ) -> Result<IssuedPackKey, MintError> {
-        let since = now.duration_since(SystemTime::UNIX_EPOCH);
-        let minute = minute_of(since.map_err(|_| MintError::Clock)?.as_secs())?;
+        let minute = minute_at(now)?;
         let mac = self.tag(lease, action, minute, slot)?;
-        let mut nonce = String::new();
-        for byte in mac {
-            // Writing to a String does not fail.
-            let _ = write!(nonce, "{byte:02x}");
-        }
-        let _ = write!(nonce, "{minute:08x}-{slot}");
+        let mut nonce = nonce_of(&mac, minute);
+        let _ = write!(nonce, "-{slot}");
         IssuedPackKey::new(lease, &nonce).map_err(MintError::Issued)
+    }
+
+    /// The put directory of the lease `lease` and the action `action`, minted at `now`:
+    /// `cas/b/<lease>/<nonce>`, its nonce's MAC over the lease, the action and the minute
+    /// ([`kbf_pack::mac_input_put_dir`]).
+    ///
+    /// # Errors
+    /// [`MintError::Clock`] before the epoch; [`MintError::Key`] for a lease that cannot be a
+    /// build id or a time past the last minute a key can name; [`MintError::Issued`] if the
+    /// directory's keys are not object keys.
+    pub fn mint_put_dir(
+        &self,
+        lease: &str,
+        action: &Digest,
+        now: SystemTime,
+    ) -> Result<IssuedPutDir, MintError> {
+        let minute = minute_at(now)?;
+        let mac = self.truncated(&mac_input_put_dir(lease, action, minute)?);
+        IssuedPutDir::new(lease, &nonce_of(&mac, minute)).map_err(MintError::Issued)
     }
 
     /// The keys of a run's whole set, minted at one time: `packs` pack keys, slots `0..packs`,
@@ -140,8 +160,10 @@ impl PackKeyMint {
 
     /// Checks that `key` was minted by this frontend, under this secret, for `action`, and says
     /// when: the start of the minute it was minted in. The MAC is compared in constant time. A
-    /// key verifies when its MAC is the v2 one for its own slot; a key of slot 0 also verifies
-    /// when its MAC is the v1 one (minted before the slot was covered), and no other slot does.
+    /// slotted key verifies when its MAC is the v2 one for its own slot; a key of slot 0 also
+    /// verifies when its MAC is the v1 one (minted before the slot was covered), and no other
+    /// slot does. A key of a put directory verifies when its MAC is the put directory's, whatever
+    /// its name.
     ///
     /// # Errors
     /// [`MintError::NotMinted`] for a key that is not of a task pack's form or whose MAC is not
@@ -150,10 +172,18 @@ impl PackKeyMint {
         let not_minted = || MintError::NotMinted(key.key().to_owned());
         let parsed = TaskPackKey::parse(key.key()).map_err(|_| not_minted())?;
         let (build, minute, slot) = (parsed.build(), parsed.minute(), parsed.slot());
-        let mut matches = self.tag(build, action, minute, slot)?.ct_eq(parsed.mac());
-        if slot == Slot::Pack(0) {
-            matches |= self.tag_v1(build, action, minute)?.ct_eq(parsed.mac());
-        }
+        let matches = match parsed.layout() {
+            KeyLayout::Slotted => {
+                let mut matches = self.tag(build, action, minute, slot)?.ct_eq(parsed.mac());
+                if slot == Slot::Pack(0) {
+                    matches |= self.tag_v1(build, action, minute)?.ct_eq(parsed.mac());
+                }
+                matches
+            }
+            KeyLayout::PutDir => self
+                .truncated(&mac_input_put_dir(build, action, minute)?)
+                .ct_eq(parsed.mac()),
+        };
         if !bool::from(matches) {
             return Err(not_minted());
         }
@@ -181,10 +211,41 @@ impl PackKeyMint {
         Ok(self.truncated(&mac_input_v1(lease, action, minute)?))
     }
 
+    /// Checks that `dir` was minted by this frontend for `action`, as [`PackKeyMint::verify`] does
+    /// for the key of its pack 0, and says when.
+    ///
+    /// # Errors
+    /// [`MintError::NotMinted`] for a directory that is not of a put directory's form or whose
+    /// MAC is not the one this mint computes for its lease, `action` and minute.
+    pub fn verify_put_dir(
+        &self,
+        dir: &IssuedPutDir,
+        action: &Digest,
+    ) -> Result<SystemTime, MintError> {
+        self.verify(&dir.key(Slot::Pack(0)), action)
+    }
+
     fn truncated(&self, message: &[u8]) -> [u8; MAC_LEN] {
         let mut mac = self.keyed.clone();
         mac.update(message);
         let full = mac.finalize().into_bytes();
         std::array::from_fn(|at| full[at])
     }
+}
+
+/// The minute `now` falls in.
+fn minute_at(now: SystemTime) -> Result<u32, MintError> {
+    let since = now.duration_since(SystemTime::UNIX_EPOCH);
+    Ok(minute_of(since.map_err(|_| MintError::Clock)?.as_secs())?)
+}
+
+/// The 40 hex digits of a nonce: the MAC, then the minute.
+fn nonce_of(mac: &[u8; MAC_LEN], minute: u32) -> String {
+    let mut nonce = String::with_capacity(2 * MAC_LEN + 8);
+    for byte in mac {
+        // Writing to a String does not fail.
+        let _ = write!(nonce, "{byte:02x}");
+    }
+    let _ = write!(nonce, "{minute:08x}");
+    nonce
 }
