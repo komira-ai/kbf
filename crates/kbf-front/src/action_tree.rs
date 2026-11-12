@@ -36,7 +36,8 @@
 //! clock and no longer than its subdirectories' entries; [`TreeWriter::forget`] drops an input
 //! root's entries.
 //!
-//! Nothing calls the writer yet: the executor's tree jobs do (the design's build item 17).
+//! The executor's runs that commit into a put directory call it (`--task-out-mode put-dir`),
+//! each run's action tree written over the published base tree before the job is submitted.
 
 mod base;
 mod encode;
@@ -309,8 +310,12 @@ impl TreeWriter {
         let root = top(children)?;
         place::write_whole(&*self.source, &*self.store, unlocated).await?;
         let store = &*self.store;
-        stream::iter(&built)
+        // Collected, as `place`'s asks are, so the future can be proved `Send`.
+        let writes: Vec<_> = built
+            .iter()
             .map(|manifest| place::write_manifest(store, &manifest.digest, manifest.bytes.clone()))
+            .collect();
+        stream::iter(writes)
             .buffered(place::WRITES_IN_FLIGHT)
             .try_collect::<()>()
             .await?;

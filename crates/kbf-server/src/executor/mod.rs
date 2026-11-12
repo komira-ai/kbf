@@ -36,6 +36,7 @@ mod driver;
 mod front;
 mod host;
 mod metrics;
+mod out;
 mod outcome;
 mod output;
 mod phases;
@@ -65,8 +66,12 @@ use submit::{FRONTEND_LABEL, INSTANCE_LABEL};
 
 pub use config::{Config, ConfigError, Network};
 pub use driver::Running;
-pub use front::{Front, FrontParts, PrepareError, PreparedRun, RunPrepare, RunSource};
+pub use front::{
+    Front, FrontParts, PrepareError, PreparedPutDir, PreparedRun, PutDirParts, RunPrepare,
+    RunSource,
+};
 pub use metrics::Metrics;
+pub use out::{MAX_ROOT_BYTES, OUT_TARGET, PutDirRoots, RootError, TASK_IN_TREE, TaskOut};
 pub use submit::job_id;
 pub use task::{Delivery, PackKey, Secret, TaskArgs, build_id};
 pub use traits::{

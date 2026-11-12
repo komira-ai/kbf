@@ -195,6 +195,17 @@ pub trait Inputs: Send + Sync {
         action: &Digest,
         expires: Duration,
     ) -> Result<ReadGrant, InputsError>;
+
+    /// The action tree [`Ingest::mint`] wrote for the run of `lease` that commits into a put
+    /// directory: its root manifest's digest, 64 lowercase hex digits. Handed out once.
+    ///
+    /// # Errors
+    /// [`InputsError`]; by default [`InputsError::Unavailable`], for inputs that write no tree.
+    async fn tree(&self, lease: LeaseId) -> Result<String, InputsError> {
+        Err(InputsError::Unavailable(format!(
+            "no input tree was written for {lease}"
+        )))
+    }
 }
 
 #[cfg(test)]

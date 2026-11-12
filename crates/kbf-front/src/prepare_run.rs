@@ -35,6 +35,14 @@
 //! configured budget, and returns the closure it found ([`RunInputs::closure`]) for the
 //! executor's accounting.
 //!
+//! **A put directory.** [`RunPrep::prepare_put_dir`] prepares a run that commits its outputs
+//! into a put directory on the job's host and reads its inputs from a read-only tree instead:
+//! it collects the closure keeping every `Directory` ([`collect_closure_keeping`], what the
+//! action tree's writer builds the tree from), and mints the directory
+//! ([`PackKeyMint::mint_put_dir`]). No write is signed and no grant is issued: the job has no
+//! network. The wall, the slack and their ceiling are as above, and say until when the
+//! directory's keys are good.
+//!
 //! **Secrets.** The key of the mint, the key of the grants and the signing key of the write
 //! are values the caller loads from files named by flags (`kbf-server`'s `task_flags`); no
 //! type here prints one, and the URL and the token are redacted from [`RunInputs`]'s `Debug`.
@@ -58,7 +66,7 @@ pub use tierstore::server::AccessKey;
 
 use crate::backend::Backend;
 use crate::grants::{ClaimsError, GrantKey, Grants, Token};
-use crate::proxy::{IssuedPackKey, MintError, PackKeyMint};
+use crate::proxy::{IssuedPackKey, IssuedPutDir, MintError, PackKeyMint};
 
 /// The longest a presigned write and a read grant are good for: 4 hours, the ceiling of the
 /// presigning key (`max_expires_secs` of its `--presign-key-file`, and the tier store's
@@ -573,6 +581,48 @@ impl RunPrep {
                 not_after,
             },
             closure,
+        })
+    }
+}
+
+/// What [`RunPrep::prepare_put_dir`] gives the run of a put directory.
+#[derive(Debug)]
+pub struct PutDirRun {
+    /// The put directory the task commits its objects into: the run's keys.
+    pub dir: IssuedPutDir,
+    /// The input closure, every `Directory` of it kept: what the action tree is written from.
+    pub kept: KeptClosure,
+    /// The Unix second after which the directory's keys are not good for the run: its start,
+    /// its wall and the slack.
+    pub not_after: u64,
+}
+
+impl RunPrep {
+    /// The run of `action` on the lease `lease`, started at `now`, which may take `wall`, that
+    /// commits into a put directory (the module docs).
+    ///
+    /// # Errors
+    /// [`PrepareError`]: the lease is not a build id, the wall and slack are over
+    /// [`MAX_EXPIRY`], `now` is before the epoch, the inputs are missing or over budget, or the
+    /// directory cannot be minted.
+    pub async fn prepare_put_dir(
+        &self,
+        lease: &str,
+        action: &Digest,
+        now: SystemTime,
+        wall: Duration,
+    ) -> Result<PutDirRun, PrepareError> {
+        check_build(lease)?;
+        let expires_secs = expiry_secs(wall, self.slack)?;
+        let since = now
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| PrepareError::Clock)?;
+        let kept = collect_closure_keeping(&self.backend, action, self.limits).await?;
+        let dir = self.mint.mint_put_dir(lease, action, now)?;
+        Ok(PutDirRun {
+            dir,
+            kept,
+            not_after: since.as_secs().saturating_add(expires_secs),
         })
     }
 }

@@ -15,6 +15,13 @@
 //! `--task-max-packs`, `--task-max-large`, `--task-large-max-bytes`) need
 //! nothing, since the config template writes every flag with a default as a live line.
 //!
+//! `--task-out-mode` says where a task's outputs go: `presigned` (the default), the writes
+//! above; or `put-dir`, a put directory on the job's host under `--task-out-root` (`<mp>/put`,
+//! the action trees under `<mp>/trees` beside it), where the task commits its objects and from
+//! which the node's tier store uploads them (docs/design/jobs-on-jobscheduler-and-tierstore.md).
+//! A put-directory run still needs the flags above: the switch and its four companions are
+//! required, the mint is the secret's, and the writes and the grant are left unused.
+//!
 //! The secrets are files and never flags, as a command line is world-readable. The secret file
 //! holds one secret of at least 32 bytes (surrounding white space is dropped), owned by the
 //! server's user and readable by it alone: the mint of the pack keys and the key of the read
@@ -38,6 +45,7 @@ use kbf_front::prepare_run::{
 use kbf_front::{Backend, MintError, PackKeyMint};
 use zeroize::Zeroizing;
 
+use crate::executor::{PutDirRoots, TaskOut};
 use crate::token::{TokenFileError, read_owner_only};
 
 const SECRET: &str = "task_secret_file";
@@ -54,6 +62,10 @@ const MAX_PACKS: &str = "task_max_packs";
 const MAX_LARGE: &str = "task_max_large";
 const LARGE_CREDENTIALS: &str = "task_large_credentials_file";
 const LARGE_MAX_BYTES: &str = "task_large_max_bytes";
+const OUT_MODE: &str = "task_out_mode";
+const OUT_ROOT: &str = "task_out_root";
+const PRESIGNED: &str = "presigned";
+const PUT_DIR: &str = "put-dir";
 const PUT_FLAG: &str = "--task-put-credentials-file";
 const LARGE_FLAG: &str = "--task-large-credentials-file";
 
@@ -85,7 +97,7 @@ const MAX_SECS: u64 = kbf_front::prepare_run::MAX_EXPIRY.as_secs();
 const MAX_FILE_BYTES: usize = 4096;
 
 /// The fourteen flags.
-pub(super) fn args() -> [Arg; 14] {
+pub(super) fn args() -> [Arg; 16] {
     [
         Arg::new(SECRET)
             .long("task-secret-file")
@@ -209,7 +221,8 @@ pub(super) fn args() -> [Arg; 14] {
             // kbf_pack::MAX_PACKS, as above.
             .default_value("8")
             .help(
-                "The pack keys each run gets, 1 to 8 (`cas/b/<lease>/<nonce>-<k>`): a ceiling, \
+                "The pack keys each run of presigned writes gets, 1 to 8 \
+                 (`cas/b/<lease>/<nonce>-<k>`): a ceiling, \
                  not a prediction, since the sizes of a run's outputs are not known before it \
                  runs; a key a task does not write is never used. Used only with \
                  `--task-secret-file`",
@@ -221,7 +234,8 @@ pub(super) fn args() -> [Arg; 14] {
             // kbf_pack::MAX_LARGE, as above.
             .default_value("8")
             .help(
-                "The large-object keys each run gets, 0 to 8 (`cas/b/<lease>/<nonce>-L<i>`): an \
+                "The large-object keys each run of presigned writes gets, 0 to 8 \
+                 (`cas/b/<lease>/<nonce>-L<i>`): an \
                  output blob over 64 MiB is written whole to one of them. A ceiling, as for \
                  `--task-max-packs`. Without `--task-large-credentials-file` no run gets one, \
                  whatever this says. Used only with `--task-secret-file`",
@@ -249,6 +263,30 @@ pub(super) fn args() -> [Arg; 14] {
                 "The most bytes of one large object, above 67108864 (64 MiB, the most a pack \
                  record holds): the cap a task and the ingest of its run hold an object to. \
                  Used only with `--task-large-credentials-file`",
+            ),
+        Arg::new(OUT_MODE)
+            .long("task-out-mode")
+            .value_name("MODE")
+            .value_parser([PRESIGNED, PUT_DIR])
+            .default_value(PRESIGNED)
+            .help(
+                "Where a task's outputs go. `presigned`: a presigned write of each pack and \
+                 large object to the tier store, the inputs read through a read grant. \
+                 `put-dir`: the task commits them as files into a put directory under \
+                 `--task-out-root`, mounted at /out, which the host's tier store uploads; the \
+                 inputs are the action tree under the trees directory beside it, the job's \
+                 root, and the job has no network. Used only with `--task-secret-file`",
+            ),
+        Arg::new(OUT_ROOT)
+            .long("task-out-root")
+            .value_name("PATH")
+            .value_parser(clap::value_parser!(String))
+            .requires(SECRET)
+            .help(
+                "With `--task-out-mode put-dir`: the tier store's put directory on every host \
+                 (`<mp>/put`, an absolute path), which the host's agent lists as a read-write \
+                 mount root; each run's directory is `<mp>/put/cas/b/<lease>/<nonce>`, and its \
+                 action tree `<mp>/trees/<digest>`",
             ),
     ]
 }
@@ -287,6 +325,8 @@ pub struct TaskFlags {
     pub large_credentials_file: Option<PathBuf>,
     /// `--task-large-max-bytes`.
     pub large_max_bytes: u64,
+    /// `--task-out-mode` and `--task-out-root`.
+    pub out: TaskOut,
 }
 
 /// The setting the flags in `m` make: `None` unless `--task-secret-file` is given.
@@ -337,7 +377,29 @@ pub(super) fn from_matches(m: &ArgMatches) -> Result<Option<TaskFlags>, String> 
             .get_one::<u64>(LARGE_MAX_BYTES)
             .copied()
             .unwrap_or_default(),
+        out: out_of(m)?,
     }))
+}
+
+/// Where the outputs go, from `--task-out-mode` and `--task-out-root`.
+fn out_of(m: &ArgMatches) -> Result<TaskOut, String> {
+    let root = m.get_one::<String>(OUT_ROOT);
+    let put_dir = m.get_one::<String>(OUT_MODE).map(String::as_str) == Some(PUT_DIR);
+    match (put_dir, root) {
+        (true, Some(root)) => PutDirRoots::new(root)
+            .map(TaskOut::PutDir)
+            .map_err(|error| format!("--task-out-root: {error}")),
+        (true, None) => Err(
+            "--task-out-mode put-dir needs --task-out-root: the put directory of the tier \
+             store on every host"
+                .to_owned(),
+        ),
+        (false, Some(_)) => Err(
+            "--task-out-root is only for --task-out-mode put-dir: drop it, or give the mode"
+                .to_owned(),
+        ),
+        (false, None) => Ok(TaskOut::Presigned),
+    }
 }
 
 /// Why the runs cannot be prepared. No message carries a secret.

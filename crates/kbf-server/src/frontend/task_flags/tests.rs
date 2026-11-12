@@ -250,6 +250,7 @@ fn flags(dir: &Path) -> TaskFlags {
         max_large: 8,
         large_credentials_file: Some(file(dir, "large.json", LARGE_KEYS, 0o600)),
         large_max_bytes: 536_870_912,
+        out: crate::executor::TaskOut::Presigned,
     }
 }
 
@@ -502,4 +503,48 @@ async fn a_large_cap_at_a_pack_record_does_not_open() {
     set.large_max_bytes = 64 << 20;
     let error = set.open(backend).expect_err("refused");
     assert!(matches!(error, TaskFlagError::Config(_)), "{error}");
+}
+
+/// Asserts the output mode: presigned writes by default (and the default needs nothing without
+/// the switch), a put directory under `--task-out-root` with `--task-out-mode put-dir`; a mode
+/// without its root, a root without its mode, a root that is no absolute path in normal form,
+/// a mode that is neither, and a root without the switch are refused, each by name.
+#[test]
+fn the_output_mode_is_presigned_or_a_put_dir_under_its_root() {
+    assert_eq!(
+        parsed(&["--task-out-mode=presigned"]).expect("parses").task,
+        None
+    );
+    let set = |more: &[&str]| {
+        let mut flags = TASK.to_vec();
+        flags.extend_from_slice(more);
+        parsed(&flags).map(|parsed| parsed.task.expect("task flags").out)
+    };
+    assert_eq!(set(&[]).expect("parses"), TaskOut::Presigned);
+    let roots = PutDirRoots::new("/mnt/ts/put").expect("roots");
+    assert_eq!(
+        set(&["--task-out-mode=put-dir", "--task-out-root=/mnt/ts/put"]).expect("parses"),
+        TaskOut::PutDir(roots)
+    );
+    let refusal = |more: &[&str]| set(more).expect_err("refused").to_string();
+    let no_root = refusal(&["--task-out-mode=put-dir"]);
+    assert!(
+        no_root.contains("--task-out-mode put-dir needs --task-out-root"),
+        "{no_root}"
+    );
+    let no_mode = refusal(&["--task-out-root=/mnt/ts/put"]);
+    assert!(no_mode.contains("--task-out-root is only for"), "{no_mode}");
+    let relative = refusal(&["--task-out-mode=put-dir", "--task-out-root=mnt/put"]);
+    assert!(
+        relative.contains("--task-out-root: \"mnt/put\" is not an absolute path"),
+        "{relative}"
+    );
+    assert_eq!(
+        set(&["--task-out-mode=s3"]).expect_err("refused").kind(),
+        ErrorKind::InvalidValue
+    );
+    assert_eq!(
+        refused(&["--task-out-root=/mnt/ts/put"]),
+        ErrorKind::MissingRequiredArgument
+    );
 }
