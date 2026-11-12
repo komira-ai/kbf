@@ -16,6 +16,11 @@
 //! builds, the code the segment writer's footer comes from too. So the readers
 //! ([`read_manifest`], [`check_shape`], [`check_records`]) read a pack written either way.
 //!
+//! [`PackLayout::plan_digests`] lays a pack out from the records' digests alone, for a writer that
+//! has not read its outputs since it hashed them: each record's CRC-32C is then taken from its
+//! bytes as [`PackLayout::write_to`] writes them, and the footer is built from those once the
+//! last record is out. The bytes are the same as a layout planned with the CRC-32Cs known.
+//!
 //! A pack 0 passes its manifest record (the bytes of [`TaskManifest::to_json_with`]) first; the
 //! other packs of a run pass blobs only.
 //!
@@ -67,8 +72,11 @@ pub struct PackLayout {
     records: Vec<IndexEntry>,
     /// The length of the records, which is where the footer starts.
     records_len: u64,
-    /// The footer's bytes.
+    /// The footer's bytes, when the records' CRC-32Cs were given; empty when they are learnt
+    /// as the records are written ([`PackLayout::plan_digests`]).
     footer: Vec<u8>,
+    /// Whether the records' CRC-32Cs were given, and are checked as the records are written.
+    crcs_given: bool,
 }
 
 /// Why records cannot be laid out as one task pack.
@@ -111,7 +119,8 @@ pub enum LayoutWriteError {
         source: io::Error,
     },
     /// The source of a record ended before the record's size, or its bytes are not those of the
-    /// record's digest and CRC-32C: the blob changed after it was hashed.
+    /// record's digest (and of its CRC-32C, when the layout was given one): the blob changed
+    /// after it was hashed.
     #[error("the source of the record {digest} no longer has its bytes")]
     Changed {
         /// The record's digest.
@@ -173,7 +182,27 @@ impl PackLayout {
             records,
             records_len,
             footer,
+            crcs_given: true,
         })
+    }
+
+    /// [`PackLayout::plan`] from the records' digests alone: the same records, offsets and caps,
+    /// each record's CRC-32C taken from its bytes when [`PackLayout::write_to`] writes it, and
+    /// the footer built from those after the last record. Nothing is read to plan.
+    ///
+    /// # Errors
+    /// Those of [`PackLayout::plan`].
+    pub fn plan_digests(digests: &[Digest]) -> Result<Self, LayoutError> {
+        let metas: Vec<BlobMeta> = (digests.iter())
+            .map(|digest| BlobMeta {
+                digest: *digest,
+                crc32c: 0,
+            })
+            .collect();
+        let mut layout = Self::plan(&metas)?;
+        layout.footer = Vec::new();
+        layout.crcs_given = false;
+        Ok(layout)
     }
 
     /// Writes the pack to `out`: for each record in offset order, the bytes `open` gives for its
@@ -182,8 +211,11 @@ impl PackLayout {
     /// that size are not read. `out` is not flushed.
     ///
     /// Each record is checked as it goes out: a source that ends early, or whose bytes are not
-    /// those of the record's digest and CRC-32C, stops the write after that record's bytes. A
-    /// source that answers [`io::ErrorKind::Interrupted`] is read again.
+    /// those of the record's digest (and of its CRC-32C, when the layout was planned with one),
+    /// stops the write after that record's bytes. A source that answers
+    /// [`io::ErrorKind::Interrupted`] is read again. A layout of
+    /// [`PackLayout::plan_digests`] takes each record's CRC-32C from the bytes written, and builds
+    /// the footer from them.
     ///
     /// Returns the SHA-256 digest of every byte written, the whole object.
     ///
@@ -213,6 +245,7 @@ impl PackLayout {
     ) -> Result<Digest, LayoutWriteError> {
         let mut object = Sha256::new();
         let mut buf = vec![0u8; COPY_BYTES];
+        let mut written = Vec::with_capacity(self.records.len());
         for entry in &self.records {
             let digest = entry.digest;
             let source = |source| LayoutWriteError::Source { digest, source };
@@ -230,17 +263,24 @@ impl PackLayout {
                 object.update(bytes);
                 out.write_all(bytes).map_err(LayoutWriteError::Sink)?;
             }
-            if record.finish() != (digest, entry.crc32c) {
+            let (read, crc32c) = record.finish();
+            if read != digest || (self.crcs_given && crc32c != entry.crc32c) {
                 return Err(LayoutWriteError::Changed { digest });
             }
+            written.push(IndexEntry { crc32c, ..*entry });
         }
-        object.update(&self.footer);
-        out.write_all(&self.footer)
-            .map_err(LayoutWriteError::Sink)?;
+        let footer = if self.crcs_given {
+            self.footer.clone()
+        } else {
+            written.sort_by_key(|e| e.digest);
+            encode_footer(self.records_len, &written)
+        };
+        object.update(&footer);
+        out.write_all(&footer).map_err(LayoutWriteError::Sink)?;
         Ok(Digest::new(
             DigestFunction::Sha256,
             object.finalize().into(),
-            self.records_len + self.footer.len() as u64,
+            self.records_len + footer.len() as u64,
         ))
     }
 }

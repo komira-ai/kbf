@@ -2,6 +2,7 @@
 
 mod objects;
 mod pack_layout;
+mod pack_layout_digests;
 mod task_key;
 mod task_manifest;
 mod task_pack;

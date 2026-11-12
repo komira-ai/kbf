@@ -642,7 +642,7 @@ async fn file_blobs(dir: &Path, big: &[u8]) -> (TaskManifest, Blobs) {
 
 /// Asserts that an output whose bytes change after they were hashed is exit 12
 /// (`output-changed`), whenever the change is seen, and leaves no `.part` file: changed before
-/// the run is stored (seen while its checksum is taken, before anything is written), changed
+/// the run is stored (seen by the write of its pack, its only read), changed
 /// while pack 0 is being written (seen by the pack's write), and a large object changed, or cut
 /// to one byte, before it is written (seen once it is written).
 #[tokio::test]
@@ -691,6 +691,51 @@ async fn an_output_changed_after_it_was_hashed_is_exit_12() {
         assert!(store.commits().is_empty(), "{case}");
         assert!(names(&out).is_empty(), "{case}: {:?}", names(&out));
     }
+}
+
+/// Asserts that the store reads each packed output once, as it writes it: an output changed
+/// before the run is stored is first seen by the write of its pack, so `pack.part` was created
+/// before the run failed, and no other read (a checksum pass) came first. The record's CRC-32C
+/// in the footer comes from that same read: a run that is not changed commits a pack whose
+/// footer holds the blob's CRC-32C.
+#[tokio::test]
+async fn each_packed_output_is_read_once_by_its_write() {
+    let chunk = vec![7u8; kbf_outputs::CHUNK_BYTES + 1];
+    let dir = scratch("read-once");
+    let out = out_dir(&dir);
+    let (mut manifest, blobs) = file_blobs(&dir, &chunk).await;
+    flip_first_byte(&dir.join("work/big"));
+    let created = Rc::new(RefCell::new(Vec::new()));
+    let seen = Rc::clone(&created);
+    let (sink, store) = served(&out);
+    let sink = sink.with_create(move |part| {
+        let name = part.file_name().expect("name").to_string_lossy();
+        seen.borrow_mut().push(name.into_owned());
+        Ok(Box::new(File::create_new(part)?))
+    });
+    let failure = sink
+        .store(&mut manifest, &blobs, &Limits::real())
+        .expect_err("changed");
+    let Failure::Pack(e) = &failure else {
+        panic!("{failure}")
+    };
+    assert_eq!(e.detail, OUTPUT_CHANGED);
+    assert_eq!(*created.borrow(), ["pack.part"]);
+    assert!(store.commits().is_empty());
+    assert!(names(&out).is_empty(), "{:?}", names(&out));
+
+    let dir = scratch("read-once-crc");
+    let out = out_dir(&dir);
+    let (mut manifest, blobs) = file_blobs(&dir, &chunk).await;
+    let (sink, _store) = served(&out);
+    sink.store(&mut manifest, &blobs, &Limits::real())
+        .expect("store");
+    let pack = std::fs::read(out.join("pack")).expect("pack");
+    let reader = SegmentReader::open(&pack).expect("segment");
+    let entry = (reader.footer().entries().iter())
+        .find(|e| e.digest == sha256(&chunk))
+        .expect("the blob's record");
+    assert_eq!(entry.crc32c, kbf_segments::crc32c(&chunk));
 }
 
 /// Asserts that outputs that do not fit the run's slots are refused (exit 12,

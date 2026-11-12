@@ -12,15 +12,16 @@
 //!
 //! 1. walk (`walk_ms`): the outputs were already walked and hashed when they were collected
 //!    ([`crate::task::collected`]); this is that time.
-//! 2. hash (`hash_ms`): the blobs are placed in slots ([`crate::place::place`]) and every blob a
-//!    pack holds is read once for its CRC-32C and checked against its digest, so each pack's
-//!    layout ([`PackLayout::plan`]) is known. Pack 0 is laid out with the manifest as wide as it
-//!    can be written, so every cap and every rule of the manifest is checked here, before a byte is
-//!    written: a run that would be refused fails (exit 12) with the directory untouched.
+//! 2. hash (`hash_ms`): the blobs are placed in slots ([`crate::place::place`]) and each pack is
+//!    laid out from its blobs' digests alone ([`PackLayout::plan_digests`]): no output is read.
+//!    Pack 0 is laid out with the manifest as wide as it can be written, so every cap and every
+//!    rule of the manifest is checked here, before a byte is written: a run that would be refused
+//!    fails (exit 12) with the directory untouched.
 //! 3. write (`write_ms`): each large object, then packs `N-1` down to 1, is written as
 //!    `<name>.part`, created new (`O_EXCL`), sequentially, a large object from the file it was
-//!    recorded from and a pack by [`PackLayout::write_to`]; the object's SHA-256 is computed as
-//!    its bytes go out, and a blob whose bytes are no longer its digest's fails the run (exit 12,
+//!    recorded from and a pack by [`PackLayout::write_to`]. Each output is read once here, and
+//!    that one read is checked against its digest, gives each record's CRC-32C for the footer and
+//!    the object's SHA-256; a blob whose bytes are no longer its digest's fails the run (exit 12,
 //!    `output-changed`).
 //! 4. commit (`commit_ms`): each of them, in the same order, is renamed to
 //!    `<name>.sha256-<hex>.part`, which tells the store the digest to expect, and then committed
@@ -48,8 +49,7 @@ use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use kbf_segments::RecordHasher;
-use kbf_task_pack::{BlobMeta, LayoutWriteError, PackLayout, TaskManifest};
+use kbf_task_pack::{LayoutWriteError, PackLayout, TaskManifest};
 use kbf_types::Digest;
 
 use crate::digest;
@@ -273,16 +273,12 @@ impl OutDir {
         // Hash: everything that can refuse the run, before a byte is written.
         let reserve = manifest_reserve(&widest(manifest), limits)?;
         let planned = place(manifest, blobs, reserve, limits)?;
-        let mut layouts = Vec::with_capacity(planned.packs.len());
-        for digests in &planned.packs {
-            layouts.push(metas(blobs, digests)?);
-        }
         let widest_json = widest(manifest)
             .to_json_with(MAX_LARGE_BYTES)
             .map_err(PackError::from)?;
-        layout(&widest_json, &layouts[0])?;
-        let extra = (layouts[1..].iter())
-            .map(|metas| PackLayout::plan(metas).map_err(PackError::from))
+        layout(&widest_json, &planned.packs[0])?;
+        let extra = (planned.packs[1..].iter())
+            .map(|digests| PackLayout::plan_digests(digests).map_err(PackError::from))
             .collect::<Result<Vec<_>, _>>()?;
         let hash_ms = millis(started.elapsed());
 
@@ -320,7 +316,7 @@ impl OutDir {
         let json = manifest
             .to_json_with(MAX_LARGE_BYTES)
             .map_err(PackError::from)?;
-        let pack_0 = layout(&json, &layouts[0])?;
+        let pack_0 = layout(&json, &planned.packs[0])?;
         let name = pack_name(0);
         let digest = stage.pack(&name, &pack_0, blobs, Some(&json))?;
         stage.commit(&name, &digest)
@@ -340,39 +336,12 @@ fn widest(manifest: &TaskManifest) -> TaskManifest {
     widest
 }
 
-/// The layout of pack 0: the manifest `json` as its first record, then the blobs of `metas`.
-fn layout(json: &[u8], metas: &[BlobMeta]) -> Result<PackLayout, PackError> {
-    let records: Vec<BlobMeta> = std::iter::once(BlobMeta::of(json))
-        .chain(metas.iter().copied())
+/// The layout of pack 0: the manifest `json` as its first record, then the blobs of `digests`.
+fn layout(json: &[u8], digests: &[Digest]) -> Result<PackLayout, PackError> {
+    let records: Vec<Digest> = std::iter::once(kbf_segments::sha256(json))
+        .chain(digests.iter().copied())
         .collect();
-    Ok(PackLayout::plan(&records)?)
-}
-
-/// The meta of each recorded blob of `digests`: each is read once, for its CRC-32C, and checked
-/// against its digest (detail `output-changed` if its bytes are no longer the digest's).
-fn metas(blobs: &Blobs, digests: &[Digest]) -> Result<Vec<BlobMeta>, Failure> {
-    let mut metas = Vec::with_capacity(digests.len());
-    let mut buf = vec![0; COPY_BYTES];
-    for digest in digests {
-        let mut reader = blobs.reader(&digest::to_reapi(digest))?;
-        let mut hasher = RecordHasher::new();
-        loop {
-            let n = reader.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            hasher.update(&buf[..n]);
-        }
-        let (read, crc32c) = hasher.finish();
-        if read != *digest {
-            return Err(PackError::changed(digest).into());
-        }
-        metas.push(BlobMeta {
-            digest: *digest,
-            crc32c,
-        });
-    }
-    Ok(metas)
+    Ok(PackLayout::plan_digests(&records)?)
 }
 
 /// The `.part` files of one run that are not committed yet; they are removed when it is

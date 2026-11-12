@@ -454,7 +454,7 @@ pub struct Timing {
     pub pack_ms: u64,
     /// Walking the declared outputs and hashing them as they were read.
     pub walk_ms: Option<u64>,
-    /// Placing the blobs, checksumming the records and laying out the packs.
+    /// Placing the blobs and laying out the packs from their digests.
     pub hash_ms: Option<u64>,
     /// Writing the large objects and packs `1..`.
     pub write_ms: Option<u64>,
