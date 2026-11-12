@@ -1,5 +1,13 @@
 # Every build action is a jobscheduler job on Linux, its root file system one tierstore tree over the kbf base tree
 
+Superseded in part by [jobs-on-jobscheduler-and-tierstore.md](jobs-on-jobscheduler-and-tierstore.md), together with
+the places that repeat these parts (sections 0, 6, 9 and 10.1):
+
+- **`put-ca`** (5.2, D17, 13, items 14 and 15): outputs are packed by `kbf-task` and committed through tierstore's put directory instead.
+- **Write grants** (5.2, 13, the `files` row of 3.4): the job holds no grant; tierstore uploads with its own identity, under create-only keys.
+- **`executor-node-store-port`** (8.3, and the passed-through tierstore port of 3.4, 3.6, D18): the job has no network and no tierstore port.
+- **kbf storage on the Linux nodes** (7.1 step 1, item 20): a node's store is tierstore, an object-store proxy.
+
 Status: **DESIGN, for the owner's review; nothing here is built and no code changes with this document**, so no
 existing document is stale yet; section 11 names the documents each build item updates. Linux only; macOS is section
 14, one open question and no more. This revision follows the owner's decisions of 2026-11-10 (section 1, O7 to
