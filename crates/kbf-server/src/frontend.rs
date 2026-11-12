@@ -1512,6 +1512,8 @@ fn serve(flags: &FrontendFlags) -> Result<(), Box<dyn Error>> {
     sizes.log();
     sizes.runtime()?.block_on(async {
         let (first, second) = interruptions()?;
+        // From here a stop also ends the start's wait for a held history directory.
+        crate::history::watch_stops_from_here();
         let mut frontend = start_frontend(flags, move || Ok(first))?;
         frontend.escalation = Some(second);
         println!("{}", frontend.start_line());

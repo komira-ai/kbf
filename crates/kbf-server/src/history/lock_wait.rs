@@ -14,9 +14,14 @@
 //! directory is the result at once, as before.
 //!
 //! A SIGINT or SIGTERM during the wait ends it: the start fails with [`StoppedWaiting`],
-//! which the frontend exits 0 on, as a stop. The signals are watched from the first
-//! pause on, and only inside a Tokio runtime (every server's start runs in one); outside
-//! one the wait only sleeps.
+//! which the frontend exits 0 on, as a stop. A Tokio signal listener sees only the
+//! signals that come after it is made, so `kbf frontend` makes the watch
+//! ([`watch_stops_from_here`]) as soon as it has installed its own handlers, before its
+//! start, and a stop sent at any point of the start (the state store's wait included)
+//! ends this wait at its first pause. A start that did not make one early (an
+//! in-process start) makes its own before the first attempt. The signals are watched
+//! only inside a Tokio runtime (every server's start runs in one); outside one the wait
+//! only sleeps.
 //!
 //! Only the frontend waits. A storage node or `all-in-one` whose history directory is
 //! held exits 75 ("not ready", `crate::start_exit`), and its unit starts it again.
@@ -25,6 +30,7 @@ use std::error::Error;
 use std::fmt;
 use std::fs::TryLockError;
 use std::path::PathBuf;
+use std::sync::{Mutex, PoisonError};
 use std::task::{Context, Waker};
 use std::time::Duration;
 
@@ -52,11 +58,13 @@ pub(crate) fn with_history_waiting(
     state: Option<StateStore>,
     flags: &HistoryFlags,
 ) -> Result<Option<StateStore>, Box<dyn Error>> {
-    let mut stop: Option<Stop> = None;
     let mut stopped = None;
     let history = flags.open_by(state.as_ref(), &process_env, &mut |dir| {
+        // Before the first attempt: a signal that comes after it, before the first
+        // pause, is seen.
+        let mut stop = early().unwrap_or_else(Stop::watch);
         let mut attempt = || FsStore::open(dir, Floor::KeepFree);
-        let mut pause = |wait| stop.get_or_insert_with(Stop::watch).pause(wait);
+        let mut pause = |wait| stop.pause(wait);
         open_within(&mut attempt, &mut pause).map_err(|ended| match ended {
             Ended::Failed(e) => e,
             Ended::Stopped(why, last) => {
@@ -70,6 +78,23 @@ pub(crate) fn with_history_waiting(
     }
     let history = history?;
     Ok(state.map(|state| StateStore { history, ..state }))
+}
+
+/// The watch [`watch_stops_from_here`] made, until a wait takes it. Process-wide, as the
+/// signals are: only `kbf frontend`'s `serve` sets it, once, on the thread that then
+/// runs the start.
+static EARLY: Mutex<Option<Stop>> = Mutex::new(None);
+
+/// Starts watching for SIGINT and SIGTERM now, for the history wait of the start that
+/// follows: `kbf frontend` calls it right after installing its handlers.
+pub(crate) fn watch_stops_from_here() {
+    let stop = Stop::watch();
+    *EARLY.lock().unwrap_or_else(PoisonError::into_inner) = Some(stop);
+}
+
+/// The watch [`watch_stops_from_here`] made, if any; it is taken.
+fn early() -> Option<Stop> {
+    EARLY.lock().unwrap_or_else(PoisonError::into_inner).take()
 }
 
 /// A stop signal came while the history directory was still locked by another process.
@@ -180,7 +205,7 @@ pub(super) fn open_within(
     }
 }
 
-/// The SIGINT and SIGTERM a pause looks for, registered at the first pause.
+/// The SIGINT and SIGTERM a pause looks for, from [`Stop::watch`] on.
 pub(super) struct Stop {
     /// `None` outside a Tokio runtime, or when a handler could not be installed.
     signals: Option<(Signal, Signal)>,

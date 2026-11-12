@@ -172,11 +172,17 @@ fn a_second_frontend_waits_for_the_history_directory_and_starts_once_the_first_s
     assert!(second.exit().success());
 }
 
-/// A frontend waiting for a held history directory stops on SIGTERM and on SIGINT alike,
-/// with exit 0, without a start line, and says why on stderr; the first frontend goes on
-/// serving and holding the directory. Catches a wait that a stop does not end (Swarm's
-/// stop of the waiting task, a rollback for one, would wait out the stop grace period),
-/// and a stop that exits 2 as a refused start.
+/// A frontend whose history directory is held stops on a SIGTERM or SIGINT sent before
+/// its wait has paused once, with exit 0, without a start line, and says why on stderr;
+/// the first frontend goes on serving and holding the directory. The SIGTERM is sent
+/// once the start has logged where its history is, before the directory is tried at all;
+/// the SIGINT once the first attempt has found it locked, before the first pause. Each
+/// line is written after the frontend's handlers are installed, so the signal never meets
+/// the default action. Catches a wait that a stop does not end (the wait has no deadline:
+/// Swarm's stop of the waiting task, a rollback for one, would wait out the stop grace
+/// period), and a stop that exits 2 as a refused start. (That the watch is made before the
+/// start, so that no signal the handlers take is missed, is not something a test can force
+/// from outside: a signal reaches a listener through the runtime's driver thread.)
 #[test]
 fn a_frontend_waiting_for_the_history_directory_stops_on_sigterm_and_sigint() {
     let scratch = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "frontend-history-lock-stop");
@@ -185,9 +191,16 @@ fn a_frontend_waiting_for_the_history_directory_stops_on_sigterm_and_sigint() {
     assert!(first.start_line().starts_with("kbf-frontend "));
     let lock = history.join("LOCK");
 
-    for (n, signal) in [Signal::TERM, Signal::INT].into_iter().enumerate() {
+    let before = [
+        (Signal::TERM, "history: objects in file://"),
+        (
+            Signal::INT,
+            "the history directory is locked by another process",
+        ),
+    ];
+    for (n, (signal, line)) in before.into_iter().enumerate() {
         let mut second = Front::spawn(&scratch.join(format!("second-{n}")), &history);
-        second.wait_for(WAITING);
+        second.wait_for(line);
         second.signal(signal);
         let status = second.exit();
         assert_eq!(status.code(), Some(0), "{signal:?}: {status}");
