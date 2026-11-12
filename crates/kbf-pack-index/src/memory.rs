@@ -203,9 +203,9 @@ impl PackIndex for MemoryPackIndex {
             return Ok(false);
         }
         state.blobs.remove(digest);
-        if let Some(row) = state.packs.get_mut(pack_key) {
-            row.info.live_blobs = row.info.live_blobs.saturating_sub(1);
-        }
+        // A row points only into a pack that is recorded, so the pack is there.
+        let pack = state.packs.get_mut(pack_key).into_iter();
+        pack.for_each(|row| row.info.live_blobs = row.info.live_blobs.saturating_sub(1));
         Ok(true)
     }
 }

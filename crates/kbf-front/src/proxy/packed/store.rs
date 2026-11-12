@@ -534,9 +534,7 @@ impl Packs {
                 // longer has a row for the digest, so the next read of it finds no pack and
                 // falls back as for any blob the index lacks.
                 self.metrics.digest_mismatches.add(1);
-                if dropped {
-                    self.metrics.locations_dropped.add(1);
-                }
+                self.metrics.locations_dropped.add(u64::from(dropped));
                 tracing::error!(
                     %digest,
                     dropped,
