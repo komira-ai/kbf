@@ -19,7 +19,7 @@ use tokio::net::TcpStream;
 use tokio::sync::oneshot;
 
 use super::base_tree::tests::bundle_dir;
-use super::pack_tests::{flags_of, index, pack_flags, scrape};
+use super::pack_tests::{flags_over, index, pack_flags, scrape};
 use super::{FrontendFlags, FrontendHandle, Prepared, boxed};
 use crate::executor::{PrepareError, PreparedRun, RunPrepare, RunSource};
 use crate::serve::ServeError;
@@ -28,7 +28,7 @@ use crate::test_dir::scratch_dir;
 const SECRET: &[u8] = b"0123456789abcdef0123456789abcdef";
 
 /// A preparation that is never asked: no action is placed in these tests.
-struct Idle;
+pub(super) struct Idle;
 
 #[tonic::async_trait]
 impl RunPrepare for Idle {
@@ -43,7 +43,7 @@ impl RunPrepare for Idle {
     }
 }
 
-fn source() -> RunSource {
+pub(super) fn source() -> RunSource {
     RunSource {
         mint: PackKeyMint::new(SECRET).expect("a mint"),
         prepare: Arc::new(Idle),
@@ -52,7 +52,7 @@ fn source() -> RunSource {
 
 /// A job service with the hosts `hosts`, each a machine that fits every job the executor
 /// submits.
-async fn job_server(hosts: &[&str]) -> FakeJobServer {
+pub(super) async fn job_server(hosts: &[&str]) -> FakeJobServer {
     let fake = FakeJobServer::start().await.expect("a job service");
     for host in hosts {
         fake.add_host(host, machine());
@@ -61,7 +61,7 @@ async fn job_server(hosts: &[&str]) -> FakeJobServer {
 }
 
 /// A Linux host of 16 cores, 64 GiB and 1 TiB of disk, running containers.
-fn machine() -> Machine {
+pub(super) fn machine() -> Machine {
     Machine {
         shape: Shape {
             cpu_millis: 16_000,
@@ -119,6 +119,34 @@ fn beside_flags(dir: &Path) -> Vec<String> {
 /// The flags of a frontend with packs on the S3 service at `endpoint`, and the executor flags
 /// `executor`, which name the job service `fake`.
 fn flags(dir: &Path, s3: &FakeS3, fake: &FakeJobServer, executor: &[&str]) -> FrontendFlags {
+    flags_with(
+        Some("--storage=http://127.0.0.1:1"),
+        dir,
+        s3,
+        fake,
+        executor,
+    )
+}
+
+/// [`flags`] with the `--storage` flag `storage` (none: a frontend with no storage node).
+pub(super) fn flags_with(
+    storage: Option<&str>,
+    dir: &Path,
+    s3: &FakeS3,
+    fake: &FakeJobServer,
+    executor: &[&str],
+) -> FrontendFlags {
+    flags_over(storage, &flag_list(dir, s3, fake, executor))
+}
+
+/// The flags after the listeners and the state store of a frontend with packs on `s3` and the
+/// executor flags `executor`, which name the job service `fake`.
+pub(super) fn flag_list(
+    dir: &Path,
+    s3: &FakeS3,
+    fake: &FakeJobServer,
+    executor: &[&str],
+) -> Vec<String> {
     let token = dir.join("job-token");
     std::fs::write(&token, TOKEN).expect("written");
     std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).expect("mode");
@@ -139,7 +167,7 @@ fn flags(dir: &Path, s3: &FakeS3, fake: &FakeJobServer, executor: &[&str]) -> Fr
         "--executor-kbf-image=registry.test/kbf@sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210".to_owned(),
     ]);
     more.extend(executor.iter().map(ToString::to_string));
-    flags_of(&more)
+    more
 }
 
 /// Starts the frontend `flags` describe, which stops when `stop` is sent to.
@@ -167,7 +195,7 @@ fn started_over(
 }
 
 /// A state store in this process, and the handle the frontend is started over.
-fn state_store() -> (Arc<Fake>, crate::StateStore) {
+pub(super) fn state_store() -> (Arc<Fake>, crate::StateStore) {
     let fake = Arc::new(Fake::with_flaw(
         Arc::new(ManualClock::default()),
         Flaw::None,
@@ -191,7 +219,7 @@ fn large_keys(s3: &FakeS3) -> Vec<String> {
 
 /// The whole answer of `GET path` on the operator listener at `api`, or `None` when the
 /// listener refused, reset or closed the connection before it answered.
-async fn try_get(api: std::net::SocketAddr, path: &str) -> Option<String> {
+pub(super) async fn try_get(api: std::net::SocketAddr, path: &str) -> Option<String> {
     let mut stream = TcpStream::connect(api).await.ok()?;
     let request = format!("GET {path} HTTP/1.1\r\nHost: kbf\r\nConnection: close\r\n\r\n");
     stream.write_all(request.as_bytes()).await.ok()?;
@@ -203,7 +231,7 @@ async fn try_get(api: std::net::SocketAddr, path: &str) -> Option<String> {
 /// Waits until the farm lists the worker `worker`, as a registered node. A connection the
 /// listener drops (a frontend that is stopping closes it) is not an answer, and is asked
 /// again: whether the frontend stops is for its `serve` to say, not for this poll.
-async fn registered(api: std::net::SocketAddr, worker: &str) -> String {
+pub(super) async fn registered(api: std::net::SocketAddr, worker: &str) -> String {
     loop {
         if let Some(nodes) = try_get(api, "/v1/nodes").await
             && nodes.contains(worker)
@@ -215,7 +243,7 @@ async fn registered(api: std::net::SocketAddr, worker: &str) -> String {
 }
 
 /// The calls the job service has handled, by method.
-fn methods(fake: &FakeJobServer) -> Vec<&'static str> {
+pub(super) fn methods(fake: &FakeJobServer) -> Vec<&'static str> {
     fake.calls()
         .iter()
         .map(|call| match call {

@@ -199,7 +199,15 @@ fn a_mode_from_the_file_takes_flags_too() {
         panic!("not the frontend: {:?}", parsed.invocation);
     };
     assert_eq!(flags.server.listen.to_string(), "127.0.0.1:9981");
-    assert_eq!(flags.storage.uri().to_string(), "http://127.0.0.1:1/");
+    assert_eq!(
+        flags
+            .storage
+            .as_ref()
+            .expect("a storage node")
+            .uri()
+            .to_string(),
+        "http://127.0.0.1:1/"
+    );
 }
 
 /// Catches `check_settings` accepting a name that is no mode (it would check nothing and

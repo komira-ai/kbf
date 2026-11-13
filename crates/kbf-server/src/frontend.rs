@@ -5,6 +5,19 @@
 //! ByteStream passed through without holding a blob), and Execute and the scheduler
 //! read and write the node through [`kbf_front::Backend::routed`] (the action cache,
 //! the Action and Command blobs, the input check, the action-cache write of a result).
+//! With no `--storage` there is no node at all (the next paragraph).
+//!
+//! **No storage node** (`--storage` left out). The frontend then keeps what the node kept:
+//! blobs in packs in the object store of `--pack-store-endpoint` (a blob over the pack bound as
+//! the object `cas/l/<sha256>`), recorded in the pack index, and the action cache as the
+//! `action_result` table beside it, in the Postgres state store ([`kbf_front::Stored`],
+//! [`kbf_front::Backend::stored`]; [`kbf_front::routes_stored`] serves the client's calls).
+//! [`parse`] refuses the start unless it has `--executor js-agent` (a daemon's blob traffic
+//! is a node's, so `--executor kbf-daemon` is refused by name), `--pack-index` and the pack
+//! store flags, and refuses the three TLS flags toward a node. Nothing is dialed: no storage
+//! channel, no storage map, no storage health route. `/readyz` and the health service
+//! (`stored::stored_checks`) ask the state store and the job service (the executor's one read of a
+//! job that does not exist) and no store of blobs.
 //!
 //! **Storage is routed by the map.** With a state store the frontend keeps the members
 //! and so the map, and with the TLS flags it can dial each member: every storage call it
@@ -20,8 +33,8 @@
 //! **The flags** are `kbf-server`'s own for what a frontend serves (the listeners, their
 //! TLS, the REAPI policy, the scheduler's pacing, the operator API, `--state-store`, the
 //! logs and the thread pools: [`ALLOWED`] and the thread flags), and its own for how it
-//! reaches storage: `--storage` (required) and, together, `--storage-client-cert`,
-//! `--storage-client-key` and `--storage-ca`. Every other flag of `kbf-server` is
+//! reaches storage: `--storage` (optional: see above) and, together and only with it,
+//! `--storage-client-cert`, `--storage-client-key` and `--storage-ca`. Every other flag of `kbf-server` is
 //! refused by name ([`parse`]), computed from [`Args`] as `kbf storage` does it: the
 //! local stores, the write tier, the segment uploads and the input-tree cache are a
 //! storage node's, and a flag added to [`Args`] that is not listed here is refused with
@@ -77,7 +90,7 @@
 //! under `cas/b/` that nothing recorded and are older than the grace, on an interval, through the
 //! tier store's GC key, and counts what it did (`kbf_cas_b_janitor_*` on `GET /metrics`).
 //!
-//! **Readiness** (`GET /readyz`, `grpc.health.v1`) fails when the storage node does not
+//! **Readiness** (`GET /readyz`, `grpc.health.v1`) of a frontend with a `--storage` node fails when the storage node does not
 //! answer an action-cache lookup within `--readyz-store-timeout-ms`, when the state store (if
 //! configured) does not answer a read, and when the storage map is not loaded (always
 //! loaded today: [`crate::health::MapProbe`]). The storage check asks the `--storage`
@@ -119,7 +132,7 @@ use std::time::Duration;
 
 use axum::http::header::CONTENT_TYPE;
 use axum::routing::get;
-use clap::{Arg, ArgMatches, Command, FromArgMatches as _};
+use clap::{ArgMatches, FromArgMatches as _};
 use futures::FutureExt as _;
 use futures::future::{AbortHandle, Abortable, BoxFuture};
 use kbf_auth::AuthenticateLayer;
@@ -129,6 +142,7 @@ use kbf_front::{
     RequestMetadataLayer, Routed,
 };
 use kbf_pack_index::PackIndex;
+use kbf_pack_index::action::ActionStore;
 use kbf_proto::grpc::health::v1::health_server::HealthServer;
 use kbf_proto::worker::worker_server::WorkerServer;
 use kbf_route::{DEFAULT_HOLD, Hold, TlsNodes};
@@ -139,7 +153,9 @@ use kbf_tls::TlsSource;
 use tonic::service::Routes;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity, Server};
 
+pub use self::command::command;
 pub use self::executor_flags::{ExecutorFlags, JsAgentFlags};
+use self::executor_open::executor_of;
 pub use self::janitor::{Janitor, JanitorFlagError, JanitorFlags, JanitorMetrics};
 pub use self::job_read::{JobReadError, JobReadFlags, JobTls};
 pub use self::pack_flags::{PackFlagError, PackFlags};
@@ -166,6 +182,7 @@ use crate::serve::{
 };
 use crate::stand::{QUIESCE_WAIT, Stand};
 use crate::start::{Escalation, escalating, interruptions};
+use crate::state_store::Indexes;
 use crate::stop::Stop;
 use crate::store_config::acks::Acks;
 use crate::worker::WorkerService;
@@ -250,8 +267,10 @@ pub struct FrontendFlags {
     /// The flags of `kbf-server` the frontend takes; every other field of it is its
     /// default and unused.
     pub server: Args,
-    /// The storage node `--storage` names, checked against the TLS flags.
-    pub storage: Endpoint,
+    /// The storage node `--storage` names, checked against the TLS flags. `None` without the
+    /// flag: the frontend then keeps its blobs in packs and its action cache in the state
+    /// store, with no storage node ([`parse`] has the rules).
+    pub storage: Option<Endpoint>,
     /// The client certificate, its key and the CA the node's certificate chains to, all
     /// three or none.
     pub tls: Option<[PathBuf; 3]>,
@@ -298,87 +317,15 @@ pub fn refused_flags() -> std::collections::BTreeSet<String> {
     crate::flag_set::refused_names(ALLOWED)
 }
 
-/// The command line of `kbf frontend`: [`Args`]'s, those it takes shown and the rest
-/// hidden (so [`parse`] can refuse them by name), `--storage` required, and the three
-/// flags toward storage.
-#[must_use]
-pub fn command() -> Command {
-    let path =
-        |id: &'static str, long: &'static str, requires: [&'static str; 2], help: &'static str| {
-            Arg::new(id)
-                .long(long)
-                .value_name("PATH")
-                .value_parser(clap::value_parser!(PathBuf))
-                .requires_all(requires)
-                .help(help)
-        };
-    crate::flag_set::command(
-        "frontend",
-        "The REAPI front end: schedules actions on daemons and proxies blobs to storage.",
-        ALLOWED,
-    )
-    .mut_arg("storage", |a| a.required(true))
-    .arg(path(
-        TLS[0],
-        "storage-client-cert",
-        [TLS[1], TLS[2]],
-        "The frontend's certificate toward the storage node (PEM); it must name the role \
-         `frontend` (a URI subjectAltName urn:kbf:role:frontend).",
-    ))
-    .arg(path(
-        TLS[1],
-        "storage-client-key",
-        [TLS[0], TLS[2]],
-        "The private key of --storage-client-cert (PEM).",
-    ))
-    .arg(path(
-        TLS[2],
-        "storage-ca",
-        [TLS[0], TLS[1]],
-        "The CA the storage node's certificate chains to; the node must present a \
-         certificate for the host in the --storage URL.",
-    ))
-    .args(crate::enroll::flags::args())
-    .args(handoff::args())
-    .args(drain_flags::args())
-    .args(state_wait::args())
-    .args(pack_flags::args())
-    .args(job_read::args())
-    .args(task_flags::args())
-    .args(janitor::args())
-    .args(executor_flags::args())
-    .arg(
-        Arg::new(SECRETS_DIR)
-            .long("object-store-secrets-dir")
-            .value_name("DIR")
-            .value_parser(clap::value_parser!(PathBuf))
-            .requires_all(["api_listen", "api_token_file", "state_store"])
-            .help(
-                "Turns on the object-store registration routes of the operator API \
-                 (/v1/object-stores, docs/api.md) and names the directory where the secret \
-                 key of each registered connection is kept, one file of mode 0600 each, in a \
-                 directory made 0700. The directory must be readable by every frontend \
-                 child that serves at once and left out of any backup of the host. The \
-                 registration itself (endpoints, buckets, the audit log) is kept in the \
-                 state store. Without it those routes answer 404.",
-            ),
-    )
-    .args(retired_args())
-}
-
-/// The arguments of [`RetiredHandoverFlags`], hidden from `--help`, to add to the command.
-fn retired_args() -> Vec<Arg> {
-    let retired = <RetiredHandoverFlags as clap::Args>::augment_args(Command::new("retired"));
-    retired.get_arguments().cloned().collect()
-}
-
 /// The flags `m`, matched by [`command`], make.
 ///
 /// # Errors
 /// A flag of `kbf-server` that a frontend does not take was given (the error names it:
 /// a frontend holds no local store and takes no write, segment or cache flag); `--storage`
 /// is not a URL, is `https://` without the three TLS flags, has them and is not `https://`,
-/// or is plain text to a host that is not loopback.
+/// or is plain text to a host that is not loopback; or there is no `--storage` and the frontend
+/// does not have what takes its place (`--executor js-agent`, `--pack-index`,
+/// `--pack-store-endpoint`).
 pub fn parse(m: &ArgMatches) -> Result<FrontendFlags, clap::Error> {
     let refuse = |why: String| command().error(clap::error::ErrorKind::ArgumentConflict, why);
     if let Some(flag) = crate::flag_set::refused(m, ALLOWED) {
@@ -397,17 +344,17 @@ pub fn parse(m: &ArgMatches) -> Result<FrontendFlags, clap::Error> {
     let mut executor = executor_flags::from_matches(m).map_err(refuse)?;
     let packs = pack_flags::from_matches(m);
     let job_read = job_read::from_matches(m);
-    let storage = server
-        .storage()
-        .map_err(|e| refuse(e.to_string()))?
-        .expect("clap requires --storage");
+    let storage = server.storage().map_err(|e| refuse(e.to_string()))?;
     let paths: Vec<PathBuf> = TLS
         .iter()
         .filter_map(|id| m.get_one::<PathBuf>(id).cloned())
         .collect();
     // clap makes the three come together.
     let tls = <[PathBuf; 3]>::try_from(paths).ok();
-    transport(&storage, tls.is_some()).map_err(refuse)?;
+    match &storage {
+        Some(storage) => transport(storage, tls.is_some()).map_err(refuse)?,
+        None => stored::without_storage(&server, &executor, packs.as_ref()).map_err(refuse)?,
+    }
     let task = task_flags::from_matches(m).map_err(refuse)?;
     let janitor = janitor::from_matches(m);
     janitor::check(janitor.as_ref(), packs.as_ref()).map_err(refuse)?;
@@ -485,22 +432,33 @@ impl FrontendFlags {
 
     /// The connection to the storage node: lazy, with the client identity and the CA
     /// when the TLS flags are given, the node's certificate checked against the host of
-    /// the URL.
+    /// the URL. `None` without `--storage`.
     ///
     /// # Errors
     /// A TLS file cannot be read, or the transport refuses the configuration.
-    pub fn storage_endpoint(&self) -> Result<Endpoint, ConfigError> {
+    pub fn storage_endpoint(&self) -> Result<Option<Endpoint>, ConfigError> {
+        let Some(storage) = &self.storage else {
+            return Ok(None);
+        };
         let Some((ca, identity)) = self.storage_identity()? else {
-            return Ok(self.storage.clone());
+            return Ok(Some(storage.clone()));
         };
         let tls = ClientTlsConfig::new().ca_certificate(ca).identity(identity);
-        self.storage
+        storage
             .clone()
             .tls_config(tls)
+            .map(Some)
             .map_err(|source| ConfigError::Storage {
-                url: self.storage.uri().to_string(),
+                url: storage.uri().to_string(),
                 source,
             })
+    }
+
+    /// The text of `--storage` for the start line and the logs: the URL, or `none`.
+    fn storage_text(&self) -> String {
+        self.storage
+            .as_ref()
+            .map_or_else(|| "none".to_owned(), |storage| storage.uri().to_string())
     }
 }
 
@@ -800,8 +758,12 @@ fn bind_frontend(
         .as_ref()
         .map(|uri| state_wait::open(uri, flags.state_store_wait))
         .transpose()?;
-    let pack_index = flags.server.open_pack_index()?;
-    prepared.start(state, pack_index, shutdown, source)
+    let indexes = flags.server.open_indexes()?;
+    let (pack_index, actions) = match indexes {
+        Some(Indexes { packs, actions }) => (Some(packs), Some(actions)),
+        None => (None, None),
+    };
+    prepared.start_over(state, pack_index, actions, shutdown, source)
 }
 
 /// A frontend's start up to the state store: everything the flags decide that needs no
@@ -812,7 +774,8 @@ struct Prepared<'a> {
     proxy: Option<crate::serve::Behind>,
     policy: kbf_auth::Policy,
     api: Option<crate::serve::Api>,
-    channel: tonic::transport::Channel,
+    /// The lazy connection to the storage node; `None` without `--storage`.
+    channel: Option<tonic::transport::Channel>,
     sockets: Bound,
     /// The enroll listener bound and its CA open, if `--enroll-listen` is given.
     enroll: Option<enroll_start::Prepared>,
@@ -857,7 +820,9 @@ impl<'a> Prepared<'a> {
         let proxy = args.proxy()?;
         let policy = args.reapi_auth_policy()?;
         let api = args.api()?;
-        let channel = flags.storage_endpoint()?.connect_lazy();
+        let channel = flags
+            .storage_endpoint()?
+            .map(|endpoint| endpoint.connect_lazy());
         let binder = Binder::new();
         let enroll = flags
             .enroll
@@ -889,12 +854,26 @@ impl<'a> Prepared<'a> {
         })
     }
 
-    /// Opens everything over `state` and serves on the listeners bound. The `pack_index`
-    /// (`--pack-index`) is opened already; the handle carries it.
+    /// [`Self::start_over`] with no action cache: for a frontend that has a storage node.
+    #[cfg(test)]
     fn start(
         self,
         state: Option<crate::StateStore>,
         pack_index: Option<Arc<dyn PackIndex>>,
+        shutdown: Shutdown,
+        source: Option<RunSource>,
+    ) -> Result<FrontendHandle, Box<dyn Error>> {
+        self.start_over(state, pack_index, None, shutdown, source)
+    }
+
+    /// Opens everything over `state` and serves on the listeners bound. The `pack_index`
+    /// (`--pack-index`) is opened already, and `actions` is the action cache table of the same
+    /// handle; the handle carries the pack index. A frontend without `--storage` needs both.
+    fn start_over(
+        self,
+        state: Option<crate::StateStore>,
+        pack_index: Option<Arc<dyn PackIndex>>,
+        actions: Option<Arc<dyn ActionStore>>,
         shutdown: Shutdown,
         source: Option<RunSource>,
     ) -> Result<FrontendHandle, Box<dyn Error>> {
@@ -918,10 +897,18 @@ impl<'a> Prepared<'a> {
         let map = map_of(None, members.as_ref())?;
         let readiness = Arc::new(Readiness::default());
         let timeout = listeners.store_probe_timeout;
-        let storage = Arc::new(RemoteStorage::new(channel.clone(), 0));
         let state_store = store_of(state.as_ref());
-        let routed = routed_of(members.as_ref(), flags, &storage)?;
-        let packs = pack_flags::open(flags.packs.as_ref(), pack_index.as_ref())?;
+        let packs = match &channel {
+            Some(_) => pack_flags::open(flags.packs.as_ref(), pack_index.as_ref())?,
+            None => pack_flags::open_without_node(flags.packs.as_ref(), pack_index.as_ref())?,
+        };
+        // With no storage node the packs, the pack index and the action cache are the whole of
+        // the blob plane, and the Postgres state store is the one thing behind it.
+        let plane = stored::Plane::of(channel, packs.as_ref(), actions)?;
+        let routed = match &plane {
+            stored::Plane::Node { storage, .. } => routed_of(members.as_ref(), flags, storage)?,
+            stored::Plane::Stored(_) => None,
+        };
         let janitor = janitor::open(
             flags.janitor.as_ref(),
             flags.packs.as_ref(),
@@ -931,16 +918,14 @@ impl<'a> Prepared<'a> {
         )?;
         let janitor_metrics = janitor.as_ref().map(Janitor::metrics);
         let janitor_sweeps = janitor_metrics.as_ref().map(|metrics| metrics.finished());
-        let checks = checks(
-            Arc::clone(&readiness),
-            storage.clone(),
-            routed.clone(),
-            state_store.clone(),
-            timeout,
-        );
-        let backend = match &routed {
-            Some(routed) => Backend::routed_over(Arc::clone(routed), storage, packs.clone()),
-            None => Backend::remote_over(storage, packs.clone()),
+        let backend = match (&plane, &routed) {
+            (stored::Plane::Stored(stored), _) => Backend::stored(Arc::clone(stored)),
+            (stored::Plane::Node { storage, .. }, Some(routed)) => {
+                Backend::routed_over(Arc::clone(routed), storage.clone(), packs.clone())
+            }
+            (stored::Plane::Node { storage, .. }, None) => {
+                Backend::remote_over(storage.clone(), packs.clone())
+            }
         };
         let run_prep = task_flags::open(flags.task.as_ref(), &backend)?;
         // A failed run's logs are read from the storage node, under a budget of this
@@ -969,7 +954,22 @@ impl<'a> Prepared<'a> {
         let farm = Arc::new(farm.with_state(state)?);
         log_state(durable, farm.term(), farm.lease_epoch());
         let source = source.or_else(|| run_prep.as_ref().map(RunSource::of));
-        let executor = executor_of(flags, &farm, packs.as_ref(), &backend, source)?;
+        let executor = executor_of(flags, &farm, packs.as_ref(), &backend, source, timeout)?;
+        let checks = match &plane {
+            stored::Plane::Node { storage, .. } => checks(
+                Arc::clone(&readiness),
+                storage.clone(),
+                routed.clone(),
+                state_store.clone(),
+                timeout,
+            ),
+            stored::Plane::Stored(_) => stored::stored_checks(
+                Arc::clone(&readiness),
+                state_store.clone(),
+                executor.as_ref().map(|built| Arc::clone(&built.probe)),
+                timeout,
+            ),
+        };
         let base_tree = (flags.executor.js.as_ref())
             .zip(packs.clone())
             .map(|(js, packs)| base_tree::Start::new(js, packs, state_store.clone()));
@@ -1141,19 +1141,32 @@ impl<'a> Prepared<'a> {
 
         let (ticker, progress) = kbf_front::progress(listeners.streams.progress_interval);
         let authorizers = Arc::new(policy.authorizers);
-        let bootstrap = Owner::new(&flags.storage.uri().to_string(), channel);
-        let proxy = Proxy::new(proxy_owners(routed, bootstrap), Arc::clone(&authorizers));
-        let proxy = proxy.with_packs(packs.clone());
         let streams = kbf_front::OpenStreams { closing, progress };
-        let reapi_routes = kbf_front::routes_proxied(
-            &proxy,
-            backend,
-            Arc::clone(&farm),
-            streams,
-            authorizers,
-            &recorder,
-            defaults,
-        );
+        let reapi_routes = match plane {
+            stored::Plane::Stored(stored) => kbf_front::routes_stored(
+                &stored,
+                backend,
+                Arc::clone(&farm),
+                streams,
+                authorizers,
+                &recorder,
+                defaults,
+            ),
+            stored::Plane::Node { channel, .. } => {
+                let bootstrap = Owner::new(&flags.storage_text(), channel);
+                let proxy = Proxy::new(proxy_owners(routed, bootstrap), Arc::clone(&authorizers));
+                let proxy = proxy.with_packs(packs.clone());
+                kbf_front::routes_proxied(
+                    &proxy,
+                    backend,
+                    Arc::clone(&farm),
+                    streams,
+                    authorizers,
+                    &recorder,
+                    defaults,
+                )
+            }
+        };
         let reapi_routes = Routes::from(
             reapi_routes
                 .into_axum_router()
@@ -1296,7 +1309,7 @@ impl<'a> Prepared<'a> {
                 worker_addr,
                 api_addr,
                 enroll_addr,
-                &flags.storage.uri().to_string(),
+                &flags.storage_text(),
                 &plain,
             ),
             serving: Box::pin(serving),
@@ -1352,42 +1365,6 @@ fn open_object_stores(
         api: Arc::new(api),
         delivery,
     })
-}
-
-/// A built executor, and the counts it keeps.
-struct ExecutorParts {
-    executor: Executor,
-    metrics: Arc<ExecutorMetrics>,
-}
-
-/// The executor `--executor js-agent` describes, over `farm`, with the metrics it counts into;
-/// none for `kbf-daemon`, which builds nothing and contacts no job service. The seams are the
-/// frontend's own: the ingest of the packs, the CAS `backend` over the same packs, and the
-/// `source` of the keys, writes and grants.
-///
-/// # Errors
-/// `--executor js-agent` without the packs or without a `source` (the frontend makes one from
-/// the run preparation `--task-secret-file` opens, which the parse of the flags requires), or
-/// as [`JsAgentFlags::build`].
-fn executor_of(
-    flags: &FrontendFlags,
-    farm: &Arc<Farm>,
-    packs: Option<&Packs>,
-    backend: &Backend,
-    source: Option<RunSource>,
-) -> Result<Option<ExecutorParts>, Box<dyn Error>> {
-    let Some(js) = &flags.executor.js else {
-        return Ok(None);
-    };
-    let packs = packs.ok_or("--executor js-agent needs --pack-store-endpoint")?;
-    let source = source.ok_or(
-        "--executor js-agent: this frontend was started without the preparation of task runs \
-         (the key mint, the presigned write and the read grant): give --task-secret-file",
-    )?;
-    let front = js.front(packs.clone(), backend.clone(), source);
-    let metrics = Arc::new(ExecutorMetrics::default());
-    let executor = js.build(Arc::clone(farm), Arc::new(front), Arc::clone(&metrics))?;
-    Ok(Some(ExecutorParts { executor, metrics }))
 }
 
 /// The store `/readyz` probes: the open state store's, if there is one.
@@ -1525,14 +1502,17 @@ fn serve(flags: &FrontendFlags) -> Result<(), Box<dyn Error>> {
 }
 
 mod base_tree;
+mod command;
 mod drain_flags;
 mod executor_bind;
 mod executor_flags;
+mod executor_open;
 mod handoff;
 mod janitor;
 mod job_read;
 mod pack_flags;
 mod state_wait;
+mod stored;
 mod task_flags;
 
 #[cfg(test)]
@@ -1541,5 +1521,7 @@ mod executor_tests;
 mod pack_tests;
 #[cfg(test)]
 mod state_wait_tests;
+#[cfg(test)]
+mod stored_tests;
 #[cfg(test)]
 mod tests;

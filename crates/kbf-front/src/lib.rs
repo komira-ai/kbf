@@ -361,6 +361,57 @@ pub fn routes_proxied<D>(
 where
     D: Dispatch,
 {
+    execution_routes(
+        proxy.routes(),
+        backend,
+        dispatch,
+        streams,
+        authorizers,
+        recorder,
+        defaults,
+    )
+}
+
+/// [`routes_proxied`] with the client's CAS, ByteStream and action-cache calls answered by
+/// `stored` ([`Stored`]: the packs, the pack index and the action table of the state store, no
+/// storage node), and `Execution` over `backend`, which is the plane of the same `stored`
+/// ([`Backend::stored`]).
+pub fn routes_stored<D>(
+    stored: &Arc<Stored>,
+    backend: impl Into<Backend>,
+    dispatch: Arc<D>,
+    streams: OpenStreams,
+    authorizers: Arc<Authorizers>,
+    recorder: &Recorder,
+    defaults: Defaults,
+) -> Routes
+where
+    D: Dispatch,
+{
+    execution_routes(
+        stored.routes(&authorizers),
+        backend,
+        dispatch,
+        streams,
+        authorizers,
+        recorder,
+        defaults,
+    )
+}
+
+/// `base` (the storage calls) with `Capabilities`, `Execution` and `Operations` added.
+fn execution_routes<D>(
+    base: Routes,
+    backend: impl Into<Backend>,
+    dispatch: Arc<D>,
+    streams: OpenStreams,
+    authorizers: Arc<Authorizers>,
+    recorder: &Recorder,
+    defaults: Defaults,
+) -> Routes
+where
+    D: Dispatch,
+{
     let OpenStreams { closing, progress } = streams;
     let operations = OperationsService::new(Arc::clone(&dispatch), Arc::clone(&authorizers));
     let service =
@@ -375,9 +426,7 @@ where
         .max_decoding_message_size(MAX_MESSAGE_BYTES)
         .max_encoding_message_size(MAX_MESSAGE_BYTES);
     let capabilities = CapabilitiesService::new(true, authorizers);
-    proxy
-        .routes()
-        .add_service(CapabilitiesServer::new(capabilities))
+    base.add_service(CapabilitiesServer::new(capabilities))
         .add_service(execution)
         .add_service(OperationsServer::new(operations))
 }

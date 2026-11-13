@@ -72,8 +72,8 @@ async fn ready_waits_for_the_probes_then_tells_the_manager() {
     }
 }
 
-/// Catches: the frontend waiting on the `storage` probe for `READY=1`: with only the
-/// storage probe failing it is sent; with another probe (the state store) failing it is
+/// Catches: the frontend waiting on the `storage` or the `executor` probe for `READY=1`: with
+/// only those probes failing it is sent; with another probe (the state store) failing it is
 /// not, until it passes. Catches: `run` asks `failing` (every probe) again.
 #[tokio::test]
 async fn ready_does_not_wait_for_storage_but_waits_for_the_rest() {
@@ -87,6 +87,13 @@ async fn ready_does_not_wait_for_storage_but_waits_for_the_rest() {
         Checks::new(Arc::new(Readiness::default()))
             .probing(
                 "storage",
+                Arc::new(Dependency {
+                    up: Arc::new(AtomicBool::new(false)),
+                    asked: Arc::new(AtomicUsize::new(0)),
+                }),
+            )
+            .probing(
+                "executor",
                 Arc::new(Dependency {
                     up: Arc::new(AtomicBool::new(false)),
                     asked: Arc::new(AtomicUsize::new(0)),
