@@ -44,25 +44,25 @@ pub fn run_all<B: PackBackend>(backend: &B) {
     p11_a_location_can_be_dropped(backend);
 }
 
-const KEY: &str = "cas/d/n1/1/1";
-const OTHER: &str = "cas/f/fe1/1/1";
-const THIRD: &str = "cas/f/fe2/1/1";
+pub(crate) const KEY: &str = "cas/d/n1/1/1";
+pub(crate) const OTHER: &str = "cas/f/fe1/1/1";
+pub(crate) const THIRD: &str = "cas/f/fe2/1/1";
 
 /// The length of a pack's footer: the bytes after its last blob.
 const FOOTER: u64 = 16;
 
 #[track_caller]
-fn same<T: PartialEq + Debug>(why: &str, got: T, want: T) {
+pub(crate) fn same<T: PartialEq + Debug>(why: &str, got: T, want: T) {
     assert_eq!(got, want, "{why}");
 }
 
 #[track_caller]
-fn yes(why: &str, condition: bool) {
+pub(crate) fn yes(why: &str, condition: bool) {
     assert!(condition, "{why}");
 }
 
 /// The digest of blob number `n`, `size` bytes long. Distinct numbers are distinct hashes.
-fn digest(n: u32, size: u64) -> BlobDigest {
+pub(crate) fn digest(n: u32, size: u64) -> BlobDigest {
     let mut hash = [0_u8; 32];
     hash[..4].copy_from_slice(&n.to_be_bytes());
     BlobDigest { hash, size }
@@ -86,7 +86,7 @@ fn blob(n: u32, size: u64, offset: u64) -> PackBlob {
 
 /// A pack named `key` written by `writer`, of `blobs` (number and size) laid end to end and
 /// a footer.
-fn packed(key: &str, writer: &str, blobs: &[(u32, u64)]) -> NewPack {
+pub(crate) fn packed(key: &str, writer: &str, blobs: &[(u32, u64)]) -> NewPack {
     let mut offset = 0;
     let mut laid = Vec::new();
     for &(n, size) in blobs {
@@ -101,14 +101,14 @@ fn packed(key: &str, writer: &str, blobs: &[(u32, u64)]) -> NewPack {
     }
 }
 
-fn created(indexed: u32) -> Recorded {
+pub(crate) fn created(indexed: u32) -> Recorded {
     Recorded {
         created: true,
         indexed,
     }
 }
 
-fn existing(indexed: u32) -> Recorded {
+pub(crate) fn existing(indexed: u32) -> Recorded {
     Recorded {
         created: false,
         indexed,
@@ -144,11 +144,11 @@ fn info_of(key: &str, writer: &str, size: u64, recorded: (i64, u32, u32)) -> Opt
     })
 }
 
-fn at(clock: &ManualClock) -> i64 {
+pub(crate) fn at(clock: &ManualClock) -> i64 {
     micros_of(clock.now())
 }
 
-fn record(index: &dyn PackIndex, pack: &NewPack) -> Recorded {
+pub(crate) fn record(index: &dyn PackIndex, pack: &NewPack) -> Recorded {
     index.record_pack(pack).expect("recorded")
 }
 
@@ -156,11 +156,11 @@ fn refused(index: &dyn PackIndex, pack: &NewPack) -> PackIndexError {
     index.record_pack(pack).expect_err("a refusal")
 }
 
-fn info(index: &dyn PackIndex, key: &str) -> Option<PackInfo> {
+pub(crate) fn info(index: &dyn PackIndex, key: &str) -> Option<PackInfo> {
     index.pack(key).expect("read")
 }
 
-fn locate(index: &dyn PackIndex, digests: &[BlobDigest]) -> Vec<Option<Location>> {
+pub(crate) fn locate(index: &dyn PackIndex, digests: &[BlobDigest]) -> Vec<Option<Location>> {
     index.locate(digests).expect("located")
 }
 

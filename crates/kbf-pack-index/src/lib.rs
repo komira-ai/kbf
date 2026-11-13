@@ -6,6 +6,10 @@
 //! store, never before, so that a row only ever points at a pack that exists; the index
 //! cannot check it.
 //!
+//! The same index holds the action cache, one row per action digest with the encoded result
+//! inline, written in the transaction that records the packs of the action's outputs: see
+//! [`action`].
+//!
 //! [`PackIndex`] is the typed view; `postgres::PostgresPackIndex` (feature `postgres`) keeps
 //! it in tables of the Postgres state store (migration 2, [`schema`]) that are outside the key/value and feed tables
 //! and outside the commit head, so recording blobs never takes the lock that state
@@ -43,6 +47,9 @@ use kbf_state::StoreError;
 #[cfg(any(test, feature = "test-support", feature = "postgres"))]
 use kbf_state::StoreTime;
 
+pub mod action;
+#[cfg(any(test, feature = "test-support"))]
+pub mod action_conformance;
 #[cfg(any(test, feature = "test-support"))]
 pub mod conformance;
 #[cfg(any(test, feature = "test-support"))]

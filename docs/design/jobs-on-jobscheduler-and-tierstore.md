@@ -195,6 +195,19 @@ Requirement for job-rootfs build item 8 (an end-to-end run on one Linux node, a 
   - A new `ingest_put_dir` replaces `ingest_set`: it reads footer and record 0 only.
   - Pack-index rule: first recorded location for a digest wins, as the index already does
     (`crates/kbf-pack-index/src/lib.rs`). New: a failed hash-verified fill drops that location.
+- kbf-pack-index, the action cache (owner decision, 2026-11-13: no kbf storage node holds it):
+  - `ActionStore` (`crates/kbf-pack-index/src/action.rs`): `get_action(action digest)` and
+    `put_action(action digest, encoded ActionResult, packs)`. A put replaces (last writer wins) and records the
+    packs of the action's outputs in the same transaction, all or nothing, so a result is never readable while a
+    blob it names has no recorded pack. The store holds the encoded bytes and does not read them. A result of no bytes
+    is valid. The bound is 1 MiB (`MAX_RESULT_BYTES`), as `MAX_BATCH` bounds a batch.
+  - Postgres: migration 3, `action_cache` (`migrations/0003_action_cache.sql`), one new table `action_result`, one row
+    per action digest with the result inline, no foreign key, outside the commit head. A database at migration 2
+    keeps working for the pack index, and the action calls on it say `NotMigrated`. A cold cache is a valid cache:
+    nothing is imported from the old storage nodes. Memory: `MemoryPackIndex` implements the same trait. Both run the
+    conformance suite `action_conformance` (A1 to A9).
+  - Not in this change: callers (the frontend's action-cache reads and writes), retention of rows, and a row's
+    touch time.
 
 ## 4. Per-action overhead budget (estimates, ms)
 

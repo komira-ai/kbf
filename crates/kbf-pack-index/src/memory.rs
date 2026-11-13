@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use crate::conformance::PackBackend;
 use crate::{
-    BlobDigest, Location, NewPack, PackIndex, PackIndexError, PackInfo, Recorded, check_batch,
-    count, micros, micros_of,
+    BlobDigest, Location, NewPack, PackBlob, PackIndex, PackIndexError, PackInfo, Recorded,
+    check_batch, count, micros, micros_of,
 };
 use kbf_state::{Clock, ManualClock};
 
@@ -23,19 +23,25 @@ pub struct MemoryPackIndex {
     clock: Arc<dyn Clock>,
 }
 
-#[derive(Default)]
+mod action;
+
+#[derive(Clone, Default)]
 struct State {
     /// The id of the last pack recorded: packs are listed in the order they were recorded.
     last_id: u64,
     packs: BTreeMap<String, PackRow>,
     blobs: BTreeMap<BlobDigest, BlobRow>,
+    /// The action cache: the encoded result and when it was written.
+    actions: BTreeMap<BlobDigest, (Vec<u8>, i64)>,
 }
 
+#[derive(Clone)]
 struct PackRow {
     id: u64,
     info: PackInfo,
 }
 
+#[derive(Clone)]
 struct BlobRow {
     pack: String,
     offset: u64,
@@ -66,72 +72,81 @@ impl MemoryPackIndex {
     }
 }
 
+/// `record_pack` on the index's state, for `pack` whose blobs `checked` returned.
+fn record_in(
+    state: &mut State,
+    pack: &NewPack,
+    blobs: &[PackBlob],
+    now: i64,
+) -> Result<Recorded, PackIndexError> {
+    if let Some(row) = state.packs.get(&pack.key) {
+        // The blobs this record names that the index holds in this pack, at the offset
+        // named: for a pack recorded with these contents, all it pointed at. A blob the
+        // index held in another pack when the pack was recorded is not compared.
+        let mut matched = 0_u32;
+        for blob in blobs {
+            let held = state.blobs.get(&blob.digest);
+            let here = held.map(|b| (b.pack.as_str(), b.offset));
+            if here == Some((pack.key.as_str(), blob.offset)) {
+                matched += 1;
+            }
+        }
+        let info = &row.info;
+        let blob_count = count(blobs.len());
+        let declared = (
+            info.writer.as_str(),
+            info.size,
+            info.blob_count,
+            info.live_blobs,
+        );
+        let offered = (pack.writer.as_str(), pack.size, blob_count, matched);
+        if declared != offered {
+            return Err(PackIndexError::Conflict {
+                key: pack.key.clone(),
+            });
+        }
+        return Ok(Recorded {
+            created: false,
+            indexed: info.live_blobs,
+        });
+    }
+    state.last_id += 1;
+    let mut indexed = 0_u32;
+    for blob in blobs {
+        if let Entry::Vacant(slot) = state.blobs.entry(blob.digest) {
+            slot.insert(BlobRow {
+                pack: pack.key.clone(),
+                offset: blob.offset,
+                last_touch_us: now,
+            });
+            indexed += 1;
+        }
+    }
+    let info = PackInfo {
+        key: pack.key.clone(),
+        writer: pack.writer.clone(),
+        size: pack.size,
+        created_us: now,
+        blob_count: count(blobs.len()),
+        live_blobs: indexed,
+    };
+    let row = PackRow {
+        id: state.last_id,
+        info,
+    };
+    state.packs.insert(pack.key.clone(), row);
+    Ok(Recorded {
+        created: true,
+        indexed,
+    })
+}
+
 impl PackIndex for MemoryPackIndex {
     fn record_pack(&self, pack: &NewPack) -> Result<Recorded, PackIndexError> {
         let blobs = pack.checked()?;
         let now = micros_of(self.clock.now());
         let mut guard = self.lock();
-        let state = &mut *guard;
-        if let Some(row) = state.packs.get(&pack.key) {
-            // The blobs this record names that the index holds in this pack, at the offset
-            // named: for a pack recorded with these contents, all it pointed at. A blob the
-            // index held in another pack when the pack was recorded is not compared.
-            let mut matched = 0_u32;
-            for blob in &blobs {
-                let held = state.blobs.get(&blob.digest);
-                let here = held.map(|b| (b.pack.as_str(), b.offset));
-                if here == Some((pack.key.as_str(), blob.offset)) {
-                    matched += 1;
-                }
-            }
-            let info = &row.info;
-            let blob_count = count(blobs.len());
-            let declared = (
-                info.writer.as_str(),
-                info.size,
-                info.blob_count,
-                info.live_blobs,
-            );
-            let offered = (pack.writer.as_str(), pack.size, blob_count, matched);
-            if declared != offered {
-                return Err(PackIndexError::Conflict {
-                    key: pack.key.clone(),
-                });
-            }
-            return Ok(Recorded {
-                created: false,
-                indexed: info.live_blobs,
-            });
-        }
-        state.last_id += 1;
-        let mut indexed = 0_u32;
-        for blob in &blobs {
-            if let Entry::Vacant(slot) = state.blobs.entry(blob.digest) {
-                slot.insert(BlobRow {
-                    pack: pack.key.clone(),
-                    offset: blob.offset,
-                    last_touch_us: now,
-                });
-                indexed += 1;
-            }
-        }
-        let info = PackInfo {
-            key: pack.key.clone(),
-            writer: pack.writer.clone(),
-            size: pack.size,
-            created_us: now,
-            blob_count: count(blobs.len()),
-            live_blobs: indexed,
-        };
-        let row = PackRow {
-            id: state.last_id,
-            info,
-        };
-        state.packs.insert(pack.key.clone(), row);
-        Ok(Recorded {
-            created: true,
-            indexed,
-        })
+        record_in(&mut guard, pack, &blobs, now)
     }
 
     fn pack(&self, key: &str) -> Result<Option<PackInfo>, PackIndexError> {

@@ -43,7 +43,7 @@ fn a_database_the_old_runner_migrated() -> (TestDatabase, PostgresConfig) {
 }
 
 /// Asserts that the runner over the set this crate extends recognises the old runner's rows:
-/// it runs nothing and says the schema is at 2, the rows (their names, kinds and times) are as
+/// up to migration 2 it runs nothing and says the schema is at 2, the rows (their names, kinds and times) are as
 /// they were, the unit's boot step leaves the database alone, and both the pack index and the
 /// state store open on it. Catches: a changed number, name or file that makes the migration
 /// look new (it would run again and fail on the existing tables), and an extension that
@@ -54,12 +54,12 @@ fn a_database_the_old_runner_migrated_is_up_to_date() {
     let mut client = Client::connect(&db.url(), NoTls).expect("connects");
     let before = recorded(&mut client);
     assert_eq!(before.len(), 2);
-    let out = state_schema::apply(&config, &schema::embedded(), schema::latest()).expect("applies");
+    let out = state_schema::apply(&config, &schema::embedded(), schema::VERSION).expect("applies");
     assert_eq!((out.from, out.to), (Some(2), 2));
     assert!(out.ran.is_empty(), "{out:?}");
     assert_eq!(recorded(&mut client), before);
     let said = schema::boot_step(config.clone())
-        .migrate_to(schema::latest())
+        .migrate_to(schema::VERSION)
         .expect("the unit may start");
     assert_eq!(said, "the schema is at version 2, nothing to apply");
     assert_eq!(recorded(&mut client), before);
@@ -76,7 +76,7 @@ fn a_database_at_migration_one_is_brought_to_two_with_the_old_rows() {
     let db = TestDatabase::empty();
     let config = PostgresConfig::parse(&db.url()).expect("parses");
     state_schema::apply(&config, &state_schema::embedded(), 1).expect("migration 1");
-    let out = state_schema::apply(&config, &schema::embedded(), schema::latest()).expect("applies");
+    let out = state_schema::apply(&config, &schema::embedded(), schema::VERSION).expect("applies");
     assert_eq!((out.from, out.to, out.ran), (Some(1), 2, vec![2]));
     let mut client = Client::connect(&db.url(), NoTls).expect("connects");
     let names: Vec<(i32, String, String)> = recorded(&mut client)
@@ -89,4 +89,26 @@ fn a_database_at_migration_one_is_brought_to_two_with_the_old_rows() {
         .map(|(v, n, k)| (*v, (*n).to_owned(), (*k).to_owned()))
         .collect();
     assert_eq!(names, want);
+}
+
+/// Asserts that a database the old runner migrated is brought to the release's latest by
+/// running the action cache's migration alone: the earlier rows are untouched, and the new
+/// row is the one a fresh database records.
+#[test]
+fn a_database_the_old_runner_migrated_takes_the_action_cache_migration_alone() {
+    let (db, config) = a_database_the_old_runner_migrated();
+    let mut client = Client::connect(&db.url(), NoTls).expect("connects");
+    let before = recorded(&mut client);
+    let out = state_schema::apply(&config, &schema::embedded(), schema::latest()).expect("applies");
+    assert_eq!(
+        (out.from, out.to, out.ran),
+        (Some(2), schema::latest(), vec![3])
+    );
+    let after = recorded(&mut client);
+    assert_eq!(after[..2], before[..]);
+    let names: Vec<(i32, &str, &str)> = after
+        .iter()
+        .map(|(v, n, k, _)| (*v, n.as_str(), k.as_str()))
+        .collect();
+    assert_eq!(names[2..], [(3, "action_cache", "expand")]);
 }
