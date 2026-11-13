@@ -621,12 +621,7 @@ impl Ingest<'_> {
         if !cacheable {
             return Ok(false);
         }
-        let prepared = self.backend.prepare_action_result(result).await;
-        let record = prepared.map_err(|error| unavailable(&format!("the result: {error}")))?;
-        let committed = self
-            .backend
-            .commit_action_record(*self.action, record)
-            .await;
+        let committed = self.backend.put_action_result(*self.action, result).await;
         committed.map_err(|error| unavailable(&format!("the action cache: {error}")))?;
         Ok(true)
     }

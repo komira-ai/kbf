@@ -206,8 +206,29 @@ Requirement for job-rootfs build item 8 (an end-to-end run on one Linux node, a 
     keeps working for the pack index, and the action calls on it say `NotMigrated`. A cold cache is a valid cache:
     nothing is imported from the old storage nodes. Memory: `MemoryPackIndex` implements the same trait. Both run the
     conformance suite `action_conformance` (A1 to A9).
-  - Not in this change: callers (the frontend's action-cache reads and writes), retention of rows, and a row's
-    touch time.
+  - Not in the store: retention of rows, and a row's touch time.
+- kbf-front, a frontend with no storage node (`Stored`, `Backend::stored`; `crates/kbf-front/src/proxy/stored/`,
+  `src/backend/stored.rs`, `src/proxy/packed/large.rs`). What the storage node did, the frontend does with the pack
+  index, the packs' object store (tierstore) and the action table, and it dials nothing:
+  - Held is the pack index, whatever the size. FindMissingBlobs asks it alone; there is no node to ask for the rest.
+  - A blob a client uploads within the packs' bound (`Packs::max_blob_bytes`) is received whole, hashed and packed as
+    today. A larger one (ByteStream `Write`, and a large output a job hands `Backend::put_streamed`) is streamed to the
+    object `cas/l/<sha256>` as it arrives, hashed on the way and given to the put one piece behind so the store never
+    has its last byte before the digest checked, then recorded in the pack index as a pack of one blob at offset 0.
+    An existing object of the right length is only recorded (the key is content-bound and create-only), one of another
+    length is never replaced and fails the write. The row is recorded after the object, so it never names an object
+    that is not there.
+  - Reads are ranged reads of the object the index names: a blob within the bound whole (BatchReadBlobs, `Read`),
+    any blob in windows (`Read`; a whole-blob read is hashed on the way with its last window held until the digest
+    checked, and a mismatch drops the row). `Backend::read_blob` of a large blob is refused (it is read as a stream).
+  - Compressed ByteStream (`compressed-blobs/`) is INVALID_ARGUMENT on every call until it is needed.
+    `QueryWriteStatus` says a held blob is complete at its size, and for an upload in flight in this process the
+    bytes that have arrived; a write still starts at offset 0.
+  - The action cache is `ActionStore`: a lookup decodes the row and is a hit only while every blob its result names is
+    in the index (the closure is worked out again on every hit, as for packs today); a write checks the same and stores
+    the encoded result in the row (`Backend::put_action_result`; there is no result blob). A prepared `ActionRecord`
+    is not committed on this plane, so a kbf-daemon's result path (which prepares then commits) does not work on it.
+  - Not in this change: the frontend's flags and `/readyz` (the next PR), the removal of `--storage`, and GetTree.
 
 ## 4. Per-action overhead budget (estimates, ms)
 
