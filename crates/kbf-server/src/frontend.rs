@@ -132,7 +132,7 @@ use std::time::Duration;
 
 use axum::http::header::CONTENT_TYPE;
 use axum::routing::get;
-use clap::{Arg, ArgMatches, Command, FromArgMatches as _};
+use clap::{ArgMatches, FromArgMatches as _};
 use futures::FutureExt as _;
 use futures::future::{AbortHandle, Abortable, BoxFuture};
 use kbf_auth::AuthenticateLayer;
@@ -153,7 +153,9 @@ use kbf_tls::TlsSource;
 use tonic::service::Routes;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity, Server};
 
+pub use self::command::command;
 pub use self::executor_flags::{ExecutorFlags, JsAgentFlags};
+use self::executor_open::executor_of;
 pub use self::janitor::{Janitor, JanitorFlagError, JanitorFlags, JanitorMetrics};
 pub use self::job_read::{JobReadError, JobReadFlags, JobTls};
 pub use self::pack_flags::{PackFlagError, PackFlags};
@@ -313,101 +315,6 @@ pub struct FrontendFlags {
 #[must_use]
 pub fn refused_flags() -> std::collections::BTreeSet<String> {
     crate::flag_set::refused_names(ALLOWED)
-}
-
-/// The command line of `kbf frontend`: [`Args`]'s, those it takes shown and the rest
-/// hidden (so [`parse`] can refuse them by name), `--storage` optional, and the three
-/// flags toward storage (which need it).
-#[must_use]
-pub fn command() -> Command {
-    let path =
-        |id: &'static str, long: &'static str, requires: [&'static str; 2], help: &'static str| {
-            Arg::new(id)
-                .long(long)
-                .value_name("PATH")
-                .value_parser(clap::value_parser!(PathBuf))
-                .requires_all(requires)
-                .help(help)
-        };
-    crate::flag_set::command(
-        "frontend",
-        "The REAPI front end: schedules actions on daemons or as jobs, and keeps blobs on a \
-         storage node (--storage) or in packs (--pack-store-endpoint, with no --storage).",
-        ALLOWED,
-    )
-    .mut_arg("storage", |a| {
-        a.help(
-            "The storage node the frontend proxies blobs to, as `http://host:port` or \
-             `https://host:port` with the three flags below. Left out, the frontend has no \
-             storage node: it needs `--executor js-agent`, `--pack-index` and \
-             `--pack-store-endpoint` (and its companions); client uploads are kept in packs \
-             (and, over the pack bound, as `cas/l/` objects) in that object store, the action \
-             cache is the `action_result` table of the Postgres state store, and `/readyz` asks \
-             the state store and the job service and nothing else. Needs the installer's \
-             action-cache migration",
-        )
-    })
-    .arg(
-        path(
-            TLS[0],
-            "storage-client-cert",
-            [TLS[1], TLS[2]],
-            "The frontend's certificate toward the storage node (PEM); it must name the role \
-         `frontend` (a URI subjectAltName urn:kbf:role:frontend). Needs --storage.",
-        )
-        .requires("storage"),
-    )
-    .arg(
-        path(
-            TLS[1],
-            "storage-client-key",
-            [TLS[0], TLS[2]],
-            "The private key of --storage-client-cert (PEM). Needs --storage.",
-        )
-        .requires("storage"),
-    )
-    .arg(
-        path(
-            TLS[2],
-            "storage-ca",
-            [TLS[0], TLS[1]],
-            "The CA the storage node's certificate chains to; the node must present a \
-         certificate for the host in the --storage URL. Needs --storage.",
-        )
-        .requires("storage"),
-    )
-    .args(crate::enroll::flags::args())
-    .args(handoff::args())
-    .args(drain_flags::args())
-    .args(state_wait::args())
-    .args(pack_flags::args())
-    .args(job_read::args())
-    .args(task_flags::args())
-    .args(janitor::args())
-    .args(executor_flags::args())
-    .arg(
-        Arg::new(SECRETS_DIR)
-            .long("object-store-secrets-dir")
-            .value_name("DIR")
-            .value_parser(clap::value_parser!(PathBuf))
-            .requires_all(["api_listen", "api_token_file", "state_store"])
-            .help(
-                "Turns on the object-store registration routes of the operator API \
-                 (/v1/object-stores, docs/api.md) and names the directory where the secret \
-                 key of each registered connection is kept, one file of mode 0600 each, in a \
-                 directory made 0700. The directory must be readable by every frontend \
-                 child that serves at once and left out of any backup of the host. The \
-                 registration itself (endpoints, buckets, the audit log) is kept in the \
-                 state store. Without it those routes answer 404.",
-            ),
-    )
-    .args(retired_args())
-}
-
-/// The arguments of [`RetiredHandoverFlags`], hidden from `--help`, to add to the command.
-fn retired_args() -> Vec<Arg> {
-    let retired = <RetiredHandoverFlags as clap::Args>::augment_args(Command::new("retired"));
-    retired.get_arguments().cloned().collect()
 }
 
 /// The flags `m`, matched by [`command`], make.
@@ -1460,50 +1367,6 @@ fn open_object_stores(
     })
 }
 
-/// A built executor, and the counts it keeps.
-struct ExecutorParts {
-    executor: Executor,
-    metrics: Arc<ExecutorMetrics>,
-    /// The job service as `/readyz` asks about it, for a frontend with no storage node.
-    probe: Arc<dyn crate::health::Probe>,
-}
-
-/// The executor `--executor js-agent` describes, over `farm`, with the metrics it counts into;
-/// none for `kbf-daemon`, which builds nothing and contacts no job service. The seams are the
-/// frontend's own: the ingest of the packs, the CAS `backend` over the same packs, and the
-/// `source` of the keys, writes and grants.
-///
-/// # Errors
-/// `--executor js-agent` without the packs or without a `source` (the frontend makes one from
-/// the run preparation `--task-secret-file` opens, which the parse of the flags requires), or
-/// as [`JsAgentFlags::build`].
-fn executor_of(
-    flags: &FrontendFlags,
-    farm: &Arc<Farm>,
-    packs: Option<&Packs>,
-    backend: &Backend,
-    source: Option<RunSource>,
-    timeout: Duration,
-) -> Result<Option<ExecutorParts>, Box<dyn Error>> {
-    let Some(js) = &flags.executor.js else {
-        return Ok(None);
-    };
-    let packs = packs.ok_or("--executor js-agent needs --pack-store-endpoint")?;
-    let source = source.ok_or(
-        "--executor js-agent: this frontend was started without the preparation of task runs \
-         (the key mint, the presigned write and the read grant): give --task-secret-file",
-    )?;
-    let front = js.front(packs.clone(), backend.clone(), source);
-    let metrics = Arc::new(ExecutorMetrics::default());
-    let executor = js.build(Arc::clone(farm), Arc::new(front), Arc::clone(&metrics))?;
-    let probe: Arc<dyn crate::health::Probe> = Arc::new(executor.probe(timeout));
-    Ok(Some(ExecutorParts {
-        executor,
-        metrics,
-        probe,
-    }))
-}
-
 /// The store `/readyz` probes: the open state store's, if there is one.
 fn store_of(state: Option<&crate::StateStore>) -> Option<Arc<dyn kbf_state::Store>> {
     state.map(|state| Arc::clone(&state.store))
@@ -1639,9 +1502,11 @@ fn serve(flags: &FrontendFlags) -> Result<(), Box<dyn Error>> {
 }
 
 mod base_tree;
+mod command;
 mod drain_flags;
 mod executor_bind;
 mod executor_flags;
+mod executor_open;
 mod handoff;
 mod janitor;
 mod job_read;
