@@ -72,21 +72,16 @@ pub trait ActionStore: PackIndex {
     ) -> Result<ActionPut, PackIndexError>;
 }
 
-/// `Err(Invalid)` for a result the store does not hold.
-#[cfg(any(test, feature = "test-support", feature = "postgres"))]
-pub(crate) fn check_result(result: &[u8]) -> Result<(), PackIndexError> {
-    if result.len() > MAX_RESULT_BYTES {
-        return Err(PackIndexError::Invalid(
-            "the action result is longer than an action row holds",
-        ));
-    }
-    Ok(())
-}
-
 /// The packs in the order a put records them: by key, so that two puts that name the same
 /// packs take their rows in the same order and never wait on each other in a cycle. Each is
 /// paired with its place in the call, which the answer is put back in.
-#[cfg(any(test, feature = "test-support", feature = "postgres"))]
+#[cfg_attr(
+    not(any(test, feature = "test-support", feature = "postgres")),
+    allow(
+        dead_code,
+        reason = "only the stores that record packs call it, and a build without one has none"
+    )
+)]
 pub(crate) fn in_key_order(packs: &[NewPack]) -> Vec<(usize, &NewPack)> {
     let mut order: Vec<(usize, &NewPack)> = packs.iter().enumerate().collect();
     order.sort_by(|a, b| a.1.key.cmp(&b.1.key));
