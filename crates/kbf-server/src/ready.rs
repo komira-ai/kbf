@@ -10,15 +10,16 @@ use crate::notify;
 /// How often the probes are asked again while one fails.
 const LOOK: Duration = Duration::from_millis(100);
 
-/// The probe `READY=1` does not wait for. At a cold power-up the `--storage` node may come
-/// up after the frontend; a frontend that waited would be killed at `TimeoutStartSec` and
-/// restart with a new epoch, in a loop. `/readyz` still fails on it (Envoy sends nothing
-/// to a frontend whose storage is away, and the frontend reports it in `/readyz`'s
-/// detail, health and logs), but the process is up, so the manager is told.
-const NOT_AWAITED: &[&str] = &["storage"];
+/// The probes `READY=1` does not wait for. At a cold power-up the `--storage` node, or the job
+/// service the executor of a frontend with no storage node asks (`executor`), may come up after
+/// the frontend; a frontend that waited would be killed at `TimeoutStartSec` and restart with a
+/// new epoch, in a loop. `/readyz` still fails on them (Envoy sends nothing to a frontend whose
+/// storage or job service is away, and the frontend reports it in `/readyz`'s detail, health and
+/// logs), but the process is up, so the manager is told.
+const NOT_AWAITED: &[&str] = &["storage", "executor"];
 
 /// What a frontend does once it serves: wait for its other probes (the state store, the
-/// map, the deny rows) to pass, not the storage node ([`NOT_AWAITED`]), then send `READY=1` to the service
+/// map, the deny rows) to pass, not the storage node or the job service ([`NOT_AWAITED`]), then send `READY=1` to the service
 /// manager.
 pub(crate) struct Ready {
     pub checks: Arc<Checks>,
