@@ -215,6 +215,34 @@ fn a_commit_the_server_refuses_leaves_neither_the_row_nor_the_packs() {
     assert!(put.packs[0].created);
 }
 
+/// Asserts that a statement the action table refuses for a reason other than a missing table
+/// is the store failing, not `NotMigrated` (which tells an operator to run the installer, and
+/// would be the wrong advice here), for a read and for a put, and that the put records none of
+/// its packs.
+#[test]
+fn a_table_that_fails_a_statement_is_a_store_failure_not_a_missing_migration() {
+    let backend = backend();
+    let config = backend.fresh_config();
+    let index = PostgresPackIndex::open(&config).expect("opens");
+    let schema = config.schema();
+    let mut admin = Client::connect(&url(), NoTls).expect("connects");
+    admin
+        .batch_execute(&format!(
+            "ALTER TABLE {schema}.action_result RENAME COLUMN result TO renamed"
+        ))
+        .expect("a table that lacks the column the statements name");
+    let read = index.get_action(&action(1));
+    assert!(matches!(read, Err(PackIndexError::Store(_))), "{read:?}");
+    let pack = one_blob("cas/d/n1/1/1", 1);
+    let put = index.put_action(&action(1), b"r", std::slice::from_ref(&pack));
+    assert!(matches!(put, Err(PackIndexError::Store(_))), "{put:?}");
+    assert_eq!(
+        index.pack(&pack.key),
+        Ok(None),
+        "the put's pack is not kept"
+    );
+}
+
 /// Asserts that a schema at migration 2 (the pack tables, no action table) still opens for the
 /// pack index and records packs, that the action calls on it are `NotMigrated` with the line
 /// that says what to run, that a put records none of its packs and creates nothing, and that
