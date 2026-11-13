@@ -141,6 +141,33 @@ async fn a_large_upload_that_breaks_the_rules_stores_nothing() {
     assert_eq!(missing(&rig, &[digest]).await.expect("asked"), vec![digest]);
 }
 
+/// Asserts that a large upload with messages that carry no data between its pieces (a client
+/// that flushes an empty message) is stored whole: the empty messages add nothing to the blob and
+/// do not count against it.
+#[tokio::test]
+async fn a_large_upload_with_empty_messages_between_its_pieces_is_stored_whole() {
+    let rig = Rig::new().await;
+    let (digest, bytes) = blob_len(5000, 6);
+    let name = upload_name(&digest);
+    let message = |name: &str, offset: i64, finish: bool, data: &[u8]| WriteRequest {
+        resource_name: name.to_owned(),
+        write_offset: offset,
+        finish_write: finish,
+        data: data.to_vec(),
+    };
+    let messages = vec![
+        message(&name, 0, false, &[]),
+        message("", 0, false, &bytes[..2000]),
+        message("", 2000, false, &[]),
+        message("", 2000, true, &bytes[2000..]),
+    ];
+
+    let size = write(&rig, messages).await;
+
+    assert_eq!(size.expect("written"), 5000);
+    assert_eq!(rig.store.held(&large_key(&digest)).await, Some(bytes));
+}
+
 /// Asserts that a large upload that goes silent is ended DEADLINE_EXCEEDED, and stores nothing.
 #[tokio::test(start_paused = true)]
 async fn a_large_upload_that_goes_silent_is_ended_deadline_exceeded() {
