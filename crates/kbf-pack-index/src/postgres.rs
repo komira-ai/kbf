@@ -35,6 +35,7 @@ use crate::{
     check_batch, count, micros, micros_of,
 };
 
+mod action;
 #[cfg(any(test, feature = "test-support"))]
 mod backend;
 #[cfg(any(test, feature = "test-support"))]

@@ -1,8 +1,9 @@
 //! The pack index's migration, and the set of migrations a kbf release runs: the state
 //! store's own ([`kbf_state::postgres::schema::embedded`]) followed by this crate's.
 //!
-//! The migration is number 2, named `pack_index`, an `expand` step; the database records those
-//! three and nothing else of it, so they never change. Its file is the one the state store
+//! The pack index's migration is number 2, named `pack_index`, an `expand` step; the database
+//! records those three and nothing else of it, so they never change. The action cache's table
+//! is number 3, `action_cache`, also `expand` (see [`ACTION_CACHE_VERSION`]). Its file is the one the state store
 //! shipped before the pack index moved here, byte for byte, and a database that applied it
 //! then is up to date now: the runner finds the row and skips it (`tests/postgres_schema.rs`).
 //!
@@ -30,6 +31,15 @@ pub const STATE_STORE_UPTO: u32 = 1;
 /// The name recorded in `schema_version`.
 pub const NAME: &str = "pack_index";
 
+/// The action cache's migration's number.
+pub const ACTION_CACHE_VERSION: u32 = 3;
+
+/// The action cache's migration's name in `schema_version`.
+pub const ACTION_CACHE_NAME: &str = "action_cache";
+
+/// The action cache's migration's file: one new table, `action_result`.
+pub const ACTION_CACHE_SQL: &str = include_str!("../migrations/0003_action_cache.sql");
+
 /// The migration's file.
 pub const SQL: &str = include_str!("../migrations/0002_pack_index.sql");
 
@@ -42,8 +52,18 @@ pub fn migration() -> Migration {
     Migration::new(VERSION, NAME, SQL).expect("the pack index migration lints")
 }
 
+/// The action cache's migration.
+///
+/// # Panics
+/// When the file fails its own lint (a test refuses that, so a release never ships one).
+#[must_use]
+pub fn action_cache_migration() -> Migration {
+    Migration::new(ACTION_CACHE_VERSION, ACTION_CACHE_NAME, ACTION_CACHE_SQL)
+        .expect("the action cache migration lints")
+}
+
 /// The migrations a kbf release embeds, in order: the state store's up to
-/// [`STATE_STORE_UPTO`], then this crate's.
+/// [`STATE_STORE_UPTO`], then this crate's two.
 ///
 /// # Panics
 /// When [`migration`] does not continue the numbering of the state store's (a test refuses
@@ -54,13 +74,14 @@ pub fn embedded() -> Vec<Migration> {
         .into_iter()
         .filter(|m| m.version() <= STATE_STORE_UPTO)
         .collect();
-    schema::extend(state, [migration()]).expect("the migrations are numbered")
+    schema::extend(state, [migration(), action_cache_migration()])
+        .expect("the migrations are numbered")
 }
 
 /// The newest schema version a kbf release embeds.
 #[must_use]
 pub fn latest() -> u32 {
-    VERSION
+    ACTION_CACHE_VERSION
 }
 
 /// The schema step a kbf release runs before its unit starts (`kbf boot-check`).
