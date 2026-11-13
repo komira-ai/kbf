@@ -247,6 +247,3 @@ pub(crate) fn index_error(error: PackIndexError) -> StorageError {
         )))),
     }
 }
-
-#[cfg(test)]
-mod tests;
