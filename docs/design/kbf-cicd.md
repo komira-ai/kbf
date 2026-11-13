@@ -642,7 +642,9 @@ would never be made. **The residual risks, stated:** (1) the run that started th
 commit, and one that no longer holds the artifacts (they expire after 90 days); (2) a release job a person cancels, or that
 fails, is re-run from the run's page (failed jobs only), and `release tag` and `release publish` are idempotent, so a
 half-made release is completed, not repeated; (3) a commit that changes the pipeline does not release itself, and the
-next commit that does not releases both.
+next commit that does not releases both. Until then the newest release is the one before, however many code commits the pipeline commit follows;
+when no such commit is queued, a small docs-only commit is the way to release (the plan counts `docs/` as not code but measures the code
+range from the last tag).
 
 The workflow lints hold all of it (`crates/kbf-integration-test/tests/pipeline_workflow`, `release_workflow` and
 `workflows`): the order of the stages and their `needs`, the triggers of the called workflows, the single call of each,
