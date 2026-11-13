@@ -166,6 +166,49 @@ fn no_buck2_fetch_step_overrides_the_pins_with_an_env_of_its_own() {
     assert!(fetch_step_overrides("jobs: [").is_err());
 }
 
+/// Every job of `text` with a `--release` command before its `actions/cache/save` step: a
+/// release profile build adds a second set of artifacts to `target`, which the cache save then
+/// has to write (it filled the runner's disk). An error when the text does not parse.
+fn release_before_cache_save(text: &str) -> Result<Vec<String>, String> {
+    let mut found = Vec::new();
+    for job in workflows::job_names(text)? {
+        if workflows::job_uses(text, &job)?.is_some() {
+            continue;
+        }
+        let mut release = false;
+        for step in workflows::job_steps(text, &job)? {
+            if step.run.as_deref().is_some_and(|r| r.contains("--release")) {
+                release = true;
+            }
+            let saves = step
+                .uses
+                .as_deref()
+                .is_some_and(|u| u.starts_with("actions/cache/save@"));
+            if saves && release {
+                found.push(format!(
+                    "{BETA}: job {job} builds --release before it saves the cache"
+                ));
+            }
+        }
+    }
+    Ok(found)
+}
+
+#[test]
+fn no_job_builds_a_release_profile_before_it_saves_the_cargo_cache() {
+    // Catches: a `--release` step placed before the cache save of a job, which grows `target`
+    // past the runner's disk while the cache is written.
+    let root = super::repo_root();
+    let text = std::fs::read_to_string(root.join(BETA)).expect(BETA);
+    assert_eq!(release_before_cache_save(&text), Ok(Vec::new()), "{BETA}");
+    let planted = "on: push\npermissions: {}\njobs:\n  t:\n    runs-on: ubuntu-24.04\n    steps:\n      - run: cargo test --release\n      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0\n";
+    let found = release_before_cache_save(planted).expect("parses");
+    assert_eq!(found.len(), 1, "{found:?}");
+    let after = "on: push\npermissions: {}\njobs:\n  t:\n    runs-on: ubuntu-24.04\n    steps:\n      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0\n      - run: cargo test --release\n";
+    assert_eq!(release_before_cache_save(after), Ok(Vec::new()));
+    assert!(release_before_cache_save("jobs: [").is_err());
+}
+
 #[test]
 fn the_gamma_job_fetches_the_buck2_of_the_beta_smoke() {
     // Catches: a Buck2 bump in beta.yml that leaves the release's proof on the old bytes,
