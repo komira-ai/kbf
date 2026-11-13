@@ -152,7 +152,12 @@ fn each_packaged_mode_unit_starts_its_own_mode_on_the_kbf_toml_setup_writes() {
             Invocation::Frontend(flags) => {
                 assert_eq!(mode.name, "frontend");
                 assert_eq!(
-                    flags.storage.uri().to_string(),
+                    flags
+                        .storage
+                        .as_ref()
+                        .expect("a storage node")
+                        .uri()
+                        .to_string(),
                     "https://storage.example:8983/"
                 );
                 let tls = flags.tls.expect("mutual TLS toward storage");

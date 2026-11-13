@@ -230,8 +230,15 @@ fn a_frontend_refuses_every_flag_that_is_a_storage_nodes() {
             "{e}"
         );
     }
-    let missing = flags(&[]).expect_err("--storage is required");
-    assert!(missing.to_string().contains("--storage"), "{missing}");
+    // With no --storage a frontend has no node: it needs the executor, the pack index and the
+    // pack store in its place, and is refused naming the first it lacks.
+    let missing = flags(&[]).expect_err("no storage node and no executor");
+    assert!(
+        missing
+            .to_string()
+            .contains("no --storage needs --executor js-agent"),
+        "{missing}"
+    );
     let help = frontend::command().render_long_help().to_string();
     for shown in [
         "--storage",

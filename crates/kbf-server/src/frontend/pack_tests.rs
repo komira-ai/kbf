@@ -36,21 +36,33 @@ use crate::test_dir::scratch_dir;
 /// The flags of a frontend on loopback ports, with a Postgres state store that is only parsed
 /// (the index is handed to the start) and `--pack-index`, and `more`.
 pub(super) fn flags_of(more: &[String]) -> FrontendFlags {
-    let mut argv: Vec<String> = [
-        "frontend",
-        "--storage=http://127.0.0.1:1",
-        "--listen=127.0.0.1:0",
-        "--worker-listen=127.0.0.1:0",
-        "--api-listen=127.0.0.1:0",
-        "--state-store=postgres:///kbf?host=/run/postgresql",
-        "--pack-index",
-    ]
-    .iter()
-    .map(ToString::to_string)
-    .collect();
-    argv.extend(more.iter().cloned());
-    let matches = command().try_get_matches_from(argv).expect("flags");
+    flags_over(Some("--storage=http://127.0.0.1:1"), more)
+}
+
+/// [`flags_of`] with the `--storage` flag `storage` (none: a frontend with no storage node).
+pub(super) fn flags_over(storage: Option<&str>, more: &[String]) -> FrontendFlags {
+    let matches = command()
+        .try_get_matches_from(argv_over(storage, more))
+        .expect("flags");
     parse(&matches).expect("a frontend's flags")
+}
+
+/// The command line [`flags_over`] parses.
+pub(super) fn argv_over(storage: Option<&str>, more: &[String]) -> Vec<String> {
+    let mut argv: Vec<String> = ["frontend"]
+        .into_iter()
+        .chain(storage)
+        .chain([
+            "--listen=127.0.0.1:0",
+            "--worker-listen=127.0.0.1:0",
+            "--api-listen=127.0.0.1:0",
+            "--state-store=postgres:///kbf?host=/run/postgresql",
+            "--pack-index",
+        ])
+        .map(ToString::to_string)
+        .collect();
+    argv.extend(more.iter().cloned());
+    argv
 }
 
 /// The pack flags for the S3 service at `endpoint`, with a credentials file in `dir`.

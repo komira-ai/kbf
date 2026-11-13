@@ -286,3 +286,64 @@ async fn the_calls_that_are_not_served_are_unimplemented() {
         assert_eq!(refused.expect("refused").code(), Code::Unimplemented);
     }
 }
+
+/// Asserts that a `Stored` made over packs that are already open writes its packs from the
+/// counter of the packs it was given: a blob put through a clone of them and one uploaded through
+/// the frontend land under two keys, not one that the second would find taken, and both blobs are
+/// held by the one index.
+#[tokio::test]
+async fn stored_over_open_packs_shares_their_pack_keys() {
+    use std::sync::Arc;
+
+    use kbf_auth::Authorizers;
+    use kbf_front::{PackSettings, Packs, Stored};
+    use kbf_pack::{PackKeys, WriterKind};
+    use kbf_pack_index::PackIndex;
+    use kbf_pack_index::action::ActionStore;
+
+    use crate::harness;
+    use crate::rig::{Index, SMALL};
+    use crate::support::Spy;
+
+    let store = Arc::new(Spy::new());
+    let index = Arc::new(Index::new());
+    let keys = PackKeys::new(WriterKind::Frontend, "fe1", "boot1").expect("keys");
+    let settings = PackSettings {
+        max_blob_bytes: SMALL,
+        ..PackSettings::default()
+    };
+    let for_packs: Arc<dyn PackIndex> = index.clone();
+    let packs = Packs::new(Arc::clone(&store), for_packs, keys, settings).expect("packs");
+    let actions: Arc<dyn ActionStore> = index.clone();
+    let stored = Arc::new(Stored::over(packs.clone(), actions));
+    let front = harness::serve(stored.routes(&Arc::new(Authorizers::allow_all()))).await;
+    let (beside, beside_bytes) = blob_of(b"put beside the frontend");
+    let (through, through_bytes) = blob_of(b"uploaded through it");
+
+    packs
+        .put(vec![(beside, beside_bytes)])
+        .await
+        .expect("put through the packs");
+    let response = ContentAddressableStorageClient::new(front)
+        .batch_update_blobs(BatchUpdateBlobsRequest {
+            requests: vec![item(&through, &through_bytes)],
+            ..BatchUpdateBlobsRequest::default()
+        })
+        .await
+        .expect("answered");
+    assert_eq!(
+        response.into_inner().responses[0]
+            .status
+            .as_ref()
+            .map(|s| s.code),
+        Some(OK)
+    );
+
+    assert_eq!(store.keys().await.len(), 2);
+    let held = stored
+        .packs()
+        .missing(&[beside, through])
+        .await
+        .expect("asked");
+    assert!(held.is_empty(), "{held:?}");
+}

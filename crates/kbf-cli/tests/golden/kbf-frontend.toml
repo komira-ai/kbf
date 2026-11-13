@@ -287,13 +287,13 @@ whole-node-max-reserve-attempts = 2
 whole-node-reserve-backoff-secs = 300
 
 [storage-client]
-# Proxy mode (`docs/design/architecture-v2.md`, section 7): the URL of a storage node (`kbf storage`), such as `http://127.0.0.1:8990`. The REAPI listener then answers a client's CAS, ByteStream and action-cache calls from that node, passing ByteStream through without holding a blob. The local stores are still opened: Execution and the worker listener use them (`kbf frontend` is this mode without them: Execution reads the node too). Plain text (`http://`) only here; `kbf frontend` takes the flags of the mutual TLS to the node. Without it, the server answers those calls itself
+# The storage node the frontend proxies blobs to, as `http://host:port` or `https://host:port` with the three flags below. Left out, the frontend has no storage node: it needs `--executor js-agent`, `--pack-index` and `--pack-store-endpoint` (and its companions); client uploads are kept in packs (and, over the pack bound, as `cas/l/` objects) in that object store, the action cache is the `action_result` table of the Postgres state store, and `/readyz` asks the state store and the job service and nothing else. Needs the installer's action-cache migration
 # storage = "URL"
-# The CA the storage node's certificate chains to; the node must present a certificate for the host in the --storage URL.
+# The CA the storage node's certificate chains to; the node must present a certificate for the host in the --storage URL. Needs --storage.
 # storage-ca = "PATH"
-# The frontend's certificate toward the storage node (PEM); it must name the role `frontend` (a URI subjectAltName urn:kbf:role:frontend).
+# The frontend's certificate toward the storage node (PEM); it must name the role `frontend` (a URI subjectAltName urn:kbf:role:frontend). Needs --storage.
 # storage-client-cert = "PATH"
-# The private key of --storage-client-cert (PEM).
+# The private key of --storage-client-cert (PEM). Needs --storage.
 # storage-client-key = "PATH"
 
 [storage-node]

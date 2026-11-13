@@ -32,7 +32,8 @@ Linux only, container driver only: any other `--driver` is refused, and so is `-
 
 **`frontend`.** It serves REAPI (Execute, the scheduler, operations) and the worker
 listener's work streams, and it routes each cache call to a storage node. It holds no blobs
-and refuses every flag of a store. `--storage` is required: the URL of one storage node.
+and refuses every flag of a store. `--storage` is the URL of one storage node, and is required
+unless the frontend runs with no storage node at all ([below](#a-frontend-with-no-storage-node)).
 `--state-store` is required too, a Postgres URL (a `sqlite://` one still starts in this
 release; see "Growing from one host to many"): a frontend given none, by the flag or by `state-store` in `kbf.toml`, exits 2 naming the flag
 before it listens on anything, and `kbf --mode=frontend --check` exits 2 the same way. A
@@ -656,6 +657,40 @@ and the daemon routes each blob by the frontend's map: a blob this node owns goe
 any other goes over mutual TLS to its owner. Without `--frontend` the node is the whole
 farm. With `--frontend`, `--pack-read` makes the daemon half read blobs from the packs first
 (see "Packs" above).
+
+### A frontend with no storage node
+
+A frontend started with no `--storage` has no storage node and dials none. It needs three
+things in place of one: `--executor js-agent` (the actions run as jobs of the job service, so no
+daemon reads or writes a blob on a node), `--pack-index` (the Postgres state store holds the
+index of the blobs and the action cache) and `--pack-store-endpoint` with its bucket and
+credentials file (the object store, tierstore, that holds the packs). A start without any of the
+three, or with `--executor kbf-daemon` (the default), is refused naming the flag. The three
+`--storage-client-*` flags need `--storage` and are refused without it.
+
+What it does itself, with those three:
+
+- **Blobs.** A blob a client uploads (BatchUpdateBlobs, ByteStream `Write`) is packed when it is
+  within the pack bound, and is stored as the object `cas/l/<sha256>` and recorded in the pack
+  index when it is larger. Reads are ranged reads of the object the index names. FindMissingBlobs
+  asks the index and nothing else. A compressed ByteStream name is refused INVALID_ARGUMENT.
+- **The action cache** is the `action_result` table of the state store: one row per action digest,
+  the encoded `ActionResult` inline. A client never writes it; the frontend writes a job's result
+  into it in the transaction that records the packs of its outputs. The table is made by the
+  installer's migration 3 (`kbf-installer`), which must have run before the frontend starts: a
+  frontend over a database at migration 2 starts and fails each action-cache call `NotMigrated`.
+  A cache that is empty at the start is a valid cache; nothing is imported from storage nodes.
+- **Readiness.** `GET /readyz` and `grpc.health.v1` fail when the state store does not answer a
+  read and when the job service does not answer a read of a job (`executor` in the failing
+  list). Nothing probes the object store or any storage node: an object store that is down is
+  found by the call that needs it, which fails UNAVAILABLE.
+- **Not served:** the worker listener's blob traffic for daemons (there are none in this mode),
+  GetTree, SplitBlob, SpliceBlob and the chunk-mapping calls.
+
+The flags of such a frontend are the `[scheduler]` and `[executor]` keys of its `kbf.toml`, the
+same as any frontend's, less `storage`: see
+[jobs-on-jobscheduler-and-tierstore.md](../design/jobs-on-jobscheduler-and-tierstore.md).
+Neither the rows of `action_result` nor the `cas/l/` objects have a collector yet.
 
 ### The one-port proxy
 

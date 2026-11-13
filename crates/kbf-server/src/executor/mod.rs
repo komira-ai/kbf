@@ -41,6 +41,7 @@ mod outcome;
 mod output;
 mod phases;
 mod pool;
+mod probe;
 mod runs;
 mod submit;
 mod task;
@@ -198,6 +199,13 @@ impl Executor {
     #[must_use]
     pub fn workers(&self) -> Vec<WorkerInfo> {
         self.workers.iter().map(HostWorker::info).collect()
+    }
+
+    /// The job service as a readiness check asks about it: one read of a job no one made, which
+    /// the service answers whether it has it or not, bounded by `limit`.
+    #[must_use]
+    pub fn probe(&self, limit: Duration) -> probe::ServiceProbe {
+        probe::ServiceProbe::new(self.deps.client.clone(), limit)
     }
 
     /// How often the caller steps the executor.

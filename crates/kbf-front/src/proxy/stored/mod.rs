@@ -87,11 +87,20 @@ impl Stored {
     ) -> Result<Self, PackError> {
         let index: Arc<dyn PackIndex> = actions.clone();
         let packs = Packs::new(store, index, keys, settings)?;
-        Ok(Self {
+        Ok(Self::over(packs, actions))
+    }
+
+    /// `packs` (already open, so that whatever else holds a clone of it writes keys from the
+    /// same counter) and the action cache `actions`, which must be the pack index `packs` records
+    /// in: the same handle, so that a result and the blobs it names are found through the same
+    /// rows.
+    #[must_use]
+    pub fn over(packs: Packs, actions: Arc<dyn ActionStore>) -> Self {
+        Self {
             packs,
             actions,
             uploads: Arc::default(),
-        })
+        }
     }
 
     /// The packs: the blobs, the large objects and the reads of them.

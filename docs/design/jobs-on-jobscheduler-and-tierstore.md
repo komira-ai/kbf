@@ -1,6 +1,8 @@
 # kbf jobs on jobscheduler and tierstore: read-only trees in, write-through objects out
 
-Status: **DESIGN, for the owner's review. Nothing here is built.** Every number in section 4 is an estimate from docs,
+Status: **DESIGN, for the owner's review. Partly built:** the action cache table and the kbf frontend with no storage
+node (section 3, the two kbf entries that say so) are in the code. The rest of this document is design, and the state of
+its other parts was not re-checked against the code when this line was changed. Every number in section 4 is an estimate from docs,
 to be replaced by the benchmark gate. It supersedes four parts of [actions-as-jobs.md](actions-as-jobs.md): the output
 call `put-ca` (its 5.2), the tierstore write grants (5.2, 13), the loopback port key `executor-node-store-port` and the
 passed-through tierstore port (3.4, 3.6, 8.3), and the Linux nodes keeping kbf's own storage (`kbf storage`, 7.1 and
@@ -228,7 +230,16 @@ Requirement for job-rootfs build item 8 (an end-to-end run on one Linux node, a 
     in the index (the closure is worked out again on every hit, as for packs today); a write checks the same and stores
     the encoded result in the row (`Backend::put_action_result`; there is no result blob). A prepared `ActionRecord`
     is not committed on this plane, so a kbf-daemon's result path (which prepares then commits) does not work on it.
-  - Not in this change: the frontend's flags and `/readyz` (the next PR), the removal of `--storage`, and GetTree.
+  - The flags and readiness of such a frontend (`kbf frontend`, `crates/kbf-server/src/frontend.rs`): `--storage` is
+    optional. Without it the frontend needs `--executor js-agent`, `--pack-index` and `--pack-store-endpoint` (with
+    its bucket and credentials file), and is refused naming the flag when one is missing; `--executor kbf-daemon`
+    without `--storage` is refused, because a daemon's blob traffic is a storage node's. The three `--storage-client-*`
+    flags need `--storage`. `/readyz` and `grpc.health.v1` ask the Postgres state store and the job service (one read
+    of a job that does not exist, `executor` in the failing list) and nothing else: no probe of tierstore, the pack
+    bucket or a node, and no storage map. `--storage` and the daemon executor are untouched where a storage node
+    exists; nothing is removed.
+  - Not in this change: GetTree, retention of `action_result` rows and `cas/l/` objects, and the daemon executor on
+    this plane.
 
 ## 4. Per-action overhead budget (estimates, ms)
 

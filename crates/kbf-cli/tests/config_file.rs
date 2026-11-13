@@ -69,9 +69,22 @@ fn a_mode_takes_every_setting_from_the_file_alone() {
     assert!(!parsed.check);
     let flags = frontend(&parsed.invocation);
     assert_eq!(flags.server.listen.to_string(), "127.0.0.1:9980");
-    assert_eq!(flags.storage.uri().to_string(), "http://127.0.0.1:1/");
+    assert_eq!(
+        flags
+            .storage
+            .as_ref()
+            .expect("a storage node")
+            .uri()
+            .to_string(),
+        "http://127.0.0.1:1/"
+    );
     let err = kbf_cli::parse_with(argv(&["kbf", "frontend"], None), None).expect_err("no storage");
-    assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument, "{err}");
+    assert_eq!(err.kind(), ErrorKind::ArgumentConflict, "{err}");
+    assert!(
+        err.to_string()
+            .contains("no --storage needs --executor js-agent"),
+        "{err}"
+    );
 }
 
 /// Catches `no-memory-climb` missing from the file's keys (the file cannot turn the
@@ -114,7 +127,12 @@ fn the_default_path_is_read_when_it_exists_and_skipped_when_it_does_not() {
     )
     .expect("no file, the flags are enough");
     assert_eq!(
-        frontend(&parsed.invocation).storage.uri().to_string(),
+        frontend(&parsed.invocation)
+            .storage
+            .as_ref()
+            .expect("a storage node")
+            .uri()
+            .to_string(),
         "http://127.0.0.1:2/"
     );
 }
@@ -155,7 +173,12 @@ fn a_flag_on_the_command_line_overrides_its_key() {
     let flags = frontend(&parsed.invocation);
     assert_eq!(flags.server.listen.to_string(), "127.0.0.1:9981");
     assert_eq!(
-        flags.storage.uri().to_string(),
+        flags
+            .storage
+            .as_ref()
+            .expect("a storage node")
+            .uri()
+            .to_string(),
         "http://127.0.0.1:1/",
         "the file still supplies the rest"
     );
