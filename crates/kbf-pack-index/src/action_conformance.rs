@@ -180,12 +180,16 @@ where
     );
     yes(
         "A5 a pack of the put was not recorded",
-        info(&index, KEY).is_some() && info(&index, OTHER).is_some(),
+        [info(&index, KEY), info(&index, OTHER)]
+            .iter()
+            .flatten()
+            .count()
+            == 2,
     );
     let found = locate(&index, &[digest(1, 10), digest(2, 20), digest(3, 30)]);
     yes(
         "A5 a blob of a pack of the put has no row",
-        found.iter().all(Option::is_some),
+        found.iter().flatten().count() == found.len(),
     );
     same(
         "A5 the first location of a shared blob was not kept: the pack whose key sorts first \

@@ -19,7 +19,7 @@ use postgres::error::SqlState;
 use postgres::types::ToSql;
 
 use super::{PostgresPackIndex, Rows, big, failed};
-use crate::action::{ActionEntry, ActionPut, ActionStore, check_result, in_key_order};
+use crate::action::{ActionEntry, ActionPut, ActionStore, MAX_RESULT_BYTES, in_key_order};
 use crate::{BlobDigest, NewPack, PackIndexError, Recorded};
 
 /// `$1` hash, `$2` size: the row's result and the time it was written.
@@ -89,7 +89,11 @@ impl ActionStore for PostgresPackIndex {
         result: &[u8],
         packs: &[NewPack],
     ) -> Result<ActionPut, PackIndexError> {
-        check_result(result)?;
+        if result.len() > MAX_RESULT_BYTES {
+            return Err(PackIndexError::Invalid(
+                "the action result is longer than an action row holds",
+            ));
+        }
         let mut checked = Vec::with_capacity(packs.len());
         for (place, pack) in in_key_order(packs) {
             let rows = Rows::of(&pack.checked()?);

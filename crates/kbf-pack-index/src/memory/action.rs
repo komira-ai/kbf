@@ -2,7 +2,7 @@
 //! lock, so a put is atomic as the Postgres transaction is.
 
 use super::{MemoryPackIndex, record_in};
-use crate::action::{ActionEntry, ActionPut, ActionStore, check_result, in_key_order};
+use crate::action::{ActionEntry, ActionPut, ActionStore, MAX_RESULT_BYTES, in_key_order};
 use crate::{BlobDigest, NewPack, PackIndexError, Recorded, micros_of};
 
 impl ActionStore for MemoryPackIndex {
@@ -21,7 +21,11 @@ impl ActionStore for MemoryPackIndex {
         result: &[u8],
         packs: &[NewPack],
     ) -> Result<ActionPut, PackIndexError> {
-        check_result(result)?;
+        if result.len() > MAX_RESULT_BYTES {
+            return Err(PackIndexError::Invalid(
+                "the action result is longer than an action row holds",
+            ));
+        }
         let mut checked = Vec::with_capacity(packs.len());
         for (place, pack) in in_key_order(packs) {
             checked.push((place, pack, pack.checked()?));
