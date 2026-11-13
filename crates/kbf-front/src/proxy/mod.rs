@@ -37,6 +37,10 @@
 //! of the storage nodes as without packs (the docs of the `packed` module say what is and is
 //! not packed).
 //!
+//! **No storage node.** [`Stored`] serves the same three services with no node to proxy to: the
+//! pack index is the whole of what is held, large blobs are objects `cas/l/<sha256>` the frontend
+//! writes and records itself, and the action cache is a table of the state store (`stored`).
+//!
 //! **Not here yet:** GetTree.
 
 mod ac;
@@ -47,6 +51,7 @@ mod meter;
 mod name;
 mod owners;
 mod packed;
+mod stored;
 
 use std::sync::Arc;
 
@@ -60,13 +65,15 @@ pub use self::meter::{Direction, Meter, Method};
 pub use self::owners::{Owner, Owners};
 pub use self::packed::{
     Claim, Claimed, Clock, CommitError, DEFAULT_INFLIGHT_BYTES, DEFAULT_UPLOAD_IDLE_TIMEOUT, Held,
-    Ingested, IssuedKeySet, IssuedPackKey, IssuedPutDir, LargeWriteThrough, MAX_COMMIT_BLOBS,
-    MAX_PACKED_BLOB_BYTES, MAX_UNTRUSTED_BLOB_BYTES, MAX_UNTRUSTED_LARGE_BYTES,
+    Ingested, IssuedKeySet, IssuedPackKey, IssuedPutDir, LargeRead, LargeWriteThrough,
+    MAX_COMMIT_BLOBS, MAX_PACKED_BLOB_BYTES, MAX_UNTRUSTED_BLOB_BYTES, MAX_UNTRUSTED_LARGE_BYTES,
     MAX_UNTRUSTED_MANIFEST_BYTES, MAX_UNTRUSTED_PACK_BYTES, MAX_UNTRUSTED_READ_BYTES,
     MAX_UPLOAD_IDLE_TIMEOUT, MIN_SECRET_BYTES, MintError, PackKeyMint, PackMetrics, PackSettings,
-    PackStore, Packs, RejectReason, StoreError, UntrustedLimits, VerifyingKeys, ingest,
-    ingest_put_dir, ingest_set,
+    PackStore, Packs, Pieces, RejectReason, StoreError, UntrustedLimits, VerifyingKeys, ingest,
+    ingest_put_dir, ingest_set, large_key,
 };
+pub(crate) use self::stored::Absent;
+pub use self::stored::Stored;
 use self::{ac::ProxyActionCache, bytestream::RawByteStream, cas::ProxyCas};
 use crate::MAX_MESSAGE_BYTES;
 

@@ -172,6 +172,8 @@ pub struct Packs {
     store_metrics: Arc<crate::store_metrics::StoreMetrics>,
     pub(super) verifying: Arc<VerifyingKeys>,
     clock: Clock,
+    /// The writer the packs are recorded under, which a large object is recorded under too.
+    pub(super) writer: String,
 }
 
 impl fmt::Debug for Packs {
@@ -198,6 +200,7 @@ impl Packs {
             pack_bytes: settings.pack_bytes,
             ..PackerConfig::default()
         };
+        let writer = keys.writer();
         let packer = Packer::new(store.clone(), index.clone(), keys.clone(), config)?;
         let reader = Reader::new(
             Arc::clone(&store),
@@ -222,6 +225,7 @@ impl Packs {
             store_metrics: Arc::new(crate::store_metrics::StoreMetrics::packs()),
             verifying: Arc::default(),
             clock: Arc::new(SystemTime::now),
+            writer,
         })
     }
 
@@ -281,7 +285,7 @@ impl Packs {
     ///
     /// # Errors
     /// RESOURCE_EXHAUSTED when `bytes` is over all of the room.
-    pub(super) async fn reserve(&self, bytes: u64) -> Result<Room, Status> {
+    pub(in crate::proxy) async fn reserve(&self, bytes: u64) -> Result<Room, Status> {
         self.budget.reserve(bytes).await
     }
 
@@ -400,7 +404,7 @@ impl Packs {
     ///
     /// # Errors
     /// As [`Packs::put`], but for RESOURCE_EXHAUSTED.
-    pub(super) async fn put_in(
+    pub(in crate::proxy) async fn put_in(
         &self,
         blobs: Vec<(Digest, Bytes)>,
         room: Room,
@@ -555,7 +559,7 @@ impl Packs {
 }
 
 /// The index's form of a digest.
-fn to_index(digest: &Digest) -> BlobDigest {
+pub(super) fn to_index(digest: &Digest) -> BlobDigest {
     BlobDigest {
         hash: digest.hash,
         size: digest.size_bytes,
@@ -569,7 +573,7 @@ pub(super) fn from_index(digest: &BlobDigest) -> Digest {
 
 /// UNAVAILABLE for an index that could not say which blobs it has, and a warning that it
 /// could not.
-fn index_failed(error: PackIndexError) -> Status {
+pub(super) fn index_failed(error: PackIndexError) -> Status {
     tracing::warn!(%error, "the pack index could not say which blobs it has");
     Status::unavailable(format!("pack index: {error}"))
 }
