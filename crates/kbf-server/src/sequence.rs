@@ -26,7 +26,11 @@
 //!    end of the load balancer wait, and do not wait: nothing here could ever run them. Every other stream waits, as Buck2
 //!    does not recover one that ends, including the stream of an operation that waits only
 //!    for the nodes this drain cordoned itself (step 3): the other frontends take it. The
-//!    operations stay queued for the other frontends. An execution that runs on a node of
+//!    operations stay queued for the other frontends. Under `--executor js-agent` a job that is
+//!    still queued on the job service when the intake closes (no host took it) is cancelled and
+//!    its lease given up, since nothing has run and a queue that no host serves would hold the
+//!    drain for ever: its operation is queued again and its stream ends as that of any
+//!    operation that never started ([`crate::executor::Executor`]). An execution that runs on a node of
 //!    this frontend finishes here: its result is taken, and its caller is answered. An execution
 //!    whose operation another frontend took is followed in the state store.
 //! 5. It stands down as a retire does ([`Stand::release`]: the farm is fenced, the worker

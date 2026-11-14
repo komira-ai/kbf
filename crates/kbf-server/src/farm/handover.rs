@@ -110,6 +110,22 @@ impl Farm {
         self.lock().engine.closed = true;
     }
 
+    /// Whether a drain has closed this farm's intake ([`Farm::close_intake`]).
+    #[must_use]
+    pub fn intake_closed(&self) -> bool {
+        self.lock().engine.closed
+    }
+
+    /// Notes that the executor withdrew `lease` because its job was still queued on the job
+    /// service when the drain closed the intake, and is about to report it given up: the job
+    /// never reached a host, so nothing of the operation ran. Once the scheduler gives the
+    /// lease up the operation is requeued (the next frontend takes it from the state store)
+    /// and its streams here are ended by the drain, as those of any operation that never
+    /// started, instead of holding the drain for a job that nothing will place.
+    pub fn unplaced(&self, lease: kbf_types::LeaseId) {
+        self.lock().engine.unplaced.insert(lease);
+    }
+
     /// Whether the state store has refused a write of this farm because a newer writer
     /// holds it.
     #[must_use]

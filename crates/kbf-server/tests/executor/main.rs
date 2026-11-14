@@ -9,6 +9,7 @@
 //! best-covered instantiation.
 
 mod classes;
+mod drain;
 mod driver;
 mod files;
 mod jobs;
