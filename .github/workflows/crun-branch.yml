@@ -47,7 +47,7 @@ jobs:
         run: |
           cargo xtask sudo-test -p kbf-integration-test --test executor_real_service_integration -- --test-threads=1 --nocapture > t.log 2>&1 || true
           grep -E "test result|start-failed" t.log | sort | uniq -c | cut -c1-250
-          sudo dmesg | grep -E 'DENIED|ALLOWED|AUDIT' | cut -c1-400 | tail -30
+          sudo dmesg | grep -E 'apparmor="(DENIED|ALLOWED|AUDIT)"' | cut -c1-400 | tail -30
           sudo journalctl -k --no-pager | grep -c DENIED || true
           mount | grep -E " (/|/home|/run|/tmp) "; findmnt -o TARGET,OPTIONS -T target/tmp
           sudo aa-status | head -8; ls -l target/tmp | head
