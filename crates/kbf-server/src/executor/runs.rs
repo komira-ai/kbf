@@ -36,7 +36,9 @@ use tokio::time::Instant;
 use crate::executor::api::{answered, not_found, note};
 use crate::executor::host::HostWorker;
 use crate::executor::metrics::{IngestEnd, Metrics, RunEnd};
-use crate::executor::outcome::{Settled, Verdict, forgotten, judge, ran, refused, result_of};
+use crate::executor::outcome::{
+    Settled, Verdict, drained, forgotten, judge, ran, refused, result_of,
+};
 use crate::executor::output::{Grants, Output, Tail};
 use crate::executor::phases::{Mark, Timeline};
 use crate::executor::submit::{Booking, Prepared, prepare};
@@ -388,6 +390,24 @@ impl HostWorker {
         }
     }
 
+    /// Cancels the job of a running task that is still queued on the job service when the
+    /// drain has closed the intake, and settles the task as infrastructure, so the farm gives
+    /// the lease up. A cancel the service has not answered is tried again on the next pass.
+    async fn withdraw_unplaced(&mut self, ctx: &Ctx<'_>, now: Instant, lease: LeaseId, id: &str) {
+        let answer = ctx.api().cancel_job(id).await;
+        self.heard(ctx, &answer);
+        note("cancelling a queued job at a drain", &answer);
+        if !answered(&answer) {
+            return;
+        }
+        if answer.is_ok() {
+            ctx.deps.metrics.job_cancelled();
+        }
+        tracing::info!(worker = %self.id, %lease, job = %id, "draining: the job is still queued on the job service, withdrawn");
+        ctx.deps.farm.unplaced(lease);
+        self.settle_with(lease, &drained(), now, &ctx.deps.metrics);
+    }
+
     /// Reads one running task's job, and its result once it has ended; the output of one that
     /// did not end well goes with its `Result` ([`output`](super::output)).
     async fn read(
@@ -416,6 +436,14 @@ impl HostWorker {
             self.saw_silence(ctx, lease, &job.host_id);
         }
         let live = match job.state() {
+            // A drain has closed the intake and the job service has not placed this job on a
+            // host: nothing of it ran, and nothing here may wait on a queue that may never
+            // move. It is withdrawn and the lease given up (the next frontend runs the
+            // operation).
+            JobState::Queued if ctx.deps.farm.intake_closed() => {
+                self.withdraw_unplaced(ctx, now, lease, id).await;
+                return;
+            }
             JobState::Queued | JobState::Placed | JobState::Starting => true,
             JobState::Running => {
                 self.stamp(lease, Mark::Running, now, ctx);

@@ -217,6 +217,11 @@ pub(super) fn forgotten() -> Settled {
     Settled::Lost(Lost::DaemonRestarted)
 }
 
+/// A job withdrawn at a drain while it was still queued on the job service: nothing ran.
+pub(super) fn drained() -> Settled {
+    Settled::Infra("the frontend is draining and the job had not been placed on a host".to_owned())
+}
+
 /// What a submit that failed with `error` comes to; `None` when nothing is decided, because
 /// nothing was sent or the answer was lost, and the same submit is sent again.
 pub(super) fn refused(error: &Error) -> Option<Refused> {
