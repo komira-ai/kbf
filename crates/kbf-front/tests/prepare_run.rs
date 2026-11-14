@@ -31,6 +31,8 @@ mod faults;
 mod keyset;
 #[path = "prepare_run/put_dir.rs"]
 mod put_dir;
+#[path = "prepare_run/put_dir_only.rs"]
+mod put_dir_only;
 #[path = "prepare_run/start.rs"]
 mod start;
 

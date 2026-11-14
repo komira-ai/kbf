@@ -124,10 +124,10 @@ which is refused with `kbf-daemon` and must be removed in the same edit). Stoppi
 cancels its jobs; a frontend that is killed (a stop timeout, SIGKILL) leaves them, and they run to
 their wall limit unless a later `js-agent` start cancels them. `js-agent` runs each placed action
 as a job of the job scheduler's job service instead. The frontend registers `--executor-hosts`
-virtual workers with its farm, `js:<frontend id>-<n>`, each of `--executor-host-cpus` cores,
-`--executor-host-memory-gib` GiB and `--executor-host-slots` actions at once: that is how many
-actions of which size the farm may have in flight, and the job service decides which host runs
-each job. The nodes' daemons stay connected meanwhile, but the farm places nothing on a Linux
+virtual workers with its farm (default 4), `js:<frontend id>-<n>`, each of `--executor-host-cpus`
+cores (default 32), `--executor-host-memory-gib` GiB (default 128) and `--executor-host-slots`
+actions at once: that is how many actions of which size the farm may have in flight, a ceiling
+this frontend admits and not the hardware, and the job service decides which host runs each job. The nodes' daemons stay connected meanwhile, but the farm places nothing on a Linux
 one: a daemon whose node report says `os=linux` is registered with no driver, so it gets no
 lease of any kind, and its session row lists no driver, so no other frontend of the state store
 counts it either. It is not a cordon and writes no `cordon/` row: an operator's uncordon does not
@@ -436,8 +436,11 @@ secret file is read and the frontend serves exactly as before.
 **Where a task's outputs go** (`--task-out-mode`, default `presigned`; the `[task-runs]` table).
 `presigned` is the runs above. `put-dir` (docs/design/jobs-on-jobscheduler-and-tierstore.md) needs
 `--task-out-root`, the tier store's put directory on every host (`<mp>/put`, an absolute path; the
-action trees are under `<mp>/trees` beside it), and the switch and its companions as above (the mint
-is the secret's; the presigned writes and the grant are not used). For each run the frontend
+action trees are under `<mp>/trees` beside it), and `--task-secret-file` (the mint is the secret's).
+The presigned writes and the grant are not used, so the tier store's write endpoint, bucket and
+credentials, the read url and the read listener are not needed: `--task-put-endpoint`,
+`--task-put-bucket`, `--task-put-credentials-file` and `--task-read-url` come all or none (given,
+they are checked as before), and `--job-listen` is not required. For each run the frontend
 collects the input closure, writes the action tree over the published kbf base tree, and mints one
 put directory, `cas/b/<lease>/<nonce>` (its nonce a MAC over the lease, the action and the minute).
 The job has no image: its root is the one read-only layer `<mp>/trees/<digest>`, it runs

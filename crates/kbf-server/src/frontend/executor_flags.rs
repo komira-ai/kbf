@@ -71,14 +71,25 @@ const CALL_TIMEOUT: &str = "executor_call_timeout_secs";
 const NETWORK: &str = "executor_network";
 const OPEN_NETWORK: &str = "executor_allow_open_network";
 
+/// The virtual workers when `--executor-hosts` is left out. Clap takes the default as the
+/// literal in the flag; the default-flags test checks it against this number.
+#[cfg(test)]
+const DEFAULT_HOSTS: usize = 4;
+
+/// The cores of a virtual worker when `--executor-host-cpus` is left out (test-only, as above).
+#[cfg(test)]
+const DEFAULT_HOST_CPUS: u64 = 32;
+
+/// The GiB of a virtual worker when `--executor-host-memory-gib` is left out (test-only, as
+/// above).
+#[cfg(test)]
+const DEFAULT_HOST_MEMORY_GIB: u64 = 128;
+
 /// The flags a `js-agent` executor cannot do without, in the order their absence is named.
-const REQUIRED: [(&str, &str); 9] = [
+const REQUIRED: [(&str, &str); 6] = [
     (JOB_URL, "--executor-job-url"),
     (TOKEN_FILE, "--executor-job-token-file"),
     (FRONTEND, "--executor-frontend-id"),
-    (HOSTS, "--executor-hosts"),
-    (CPUS, "--executor-host-cpus"),
-    (MEMORY_GIB, "--executor-host-memory-gib"),
     (BASE_IMAGE, "--executor-base-image"),
     (KBF_IMAGE, "--executor-kbf-image"),
     (BASE_TREE, "--executor-base-tree"),
@@ -132,12 +143,13 @@ pub(super) fn args() -> Vec<Arg> {
                  image (`--executor-kbf-image`, built from `--executor-base-image`), whose \
                  task tool runs the action inside it; it needs the job service's flags \
                  (`--executor-job-url`, `--executor-job-token-file`, and \
-                 `--executor-job-ca-file` for https), the virtual workers' \
-                 (`--executor-hosts`, `--executor-host-cpus`, `--executor-host-memory-gib`), \
+                 `--executor-job-ca-file` for https), \
                  `--executor-frontend-id`, the release's base tree bundles \
                  (`--executor-base-tree`), the packs (`--pack-store-endpoint`) and the secret \
                  delivery (`--executor-secret-delivery`, with \
-                 `--executor-insecure-argv-secrets` for its default `argv`). The executor runs \
+                 `--executor-insecure-argv-secrets` for its default `argv`); the virtual \
+                 workers' shape (`--executor-hosts`, `--executor-host-cpus`, \
+                 `--executor-host-memory-gib`) has defaults. The executor runs \
                  on exactly one frontend: a second frontend that has jobs on the same job \
                  service stops. A restart of the frontend fails the builds in flight. \
                  Switching back to `kbf-daemon` cancels the jobs when the frontend is stopped, \
@@ -181,27 +193,36 @@ pub(super) fn args() -> Vec<Arg> {
             .long("executor-hosts")
             .value_name("WORKERS")
             .value_parser(clap::value_parser!(usize))
+            // DEFAULT_HOSTS, as above.
+            .default_value("4")
             .help(
                 "How many virtual workers the farm places actions on, each of the shape below: \
-                 how many actions of which size the farm may have in flight as jobs. The job \
-                 service decides which host runs each job. Used only with `--executor js-agent`",
+                 how many actions of which size the farm may have in flight as jobs. A ceiling \
+                 on what this frontend admits, not the hardware: the job service decides which \
+                 host runs each job and holds the real capacity, so set it lower only to cap \
+                 this frontend. Used only with `--executor js-agent`",
             ),
         Arg::new(CPUS)
             .long("executor-host-cpus")
             .value_name("CORES")
             .value_parser(clap::value_parser!(u64).range(1..))
+            // DEFAULT_HOST_CPUS, as above.
+            .default_value("32")
             .help(
                 "The CPU cores of a virtual worker: the most the farm books on it at once. At \
-                 least 1. Used only with `--executor js-agent`",
+                 least 1. A ceiling, as for `--executor-hosts`. Used only with `--executor \
+                 js-agent`",
             ),
         Arg::new(MEMORY_GIB)
             .long("executor-host-memory-gib")
             .value_name("GIB")
             .value_parser(clap::value_parser!(u64).range(1..))
+            // DEFAULT_HOST_MEMORY_GIB, as above.
+            .default_value("128")
             .help(
                 "The memory, in GiB, of a virtual worker. Each job needs 1.5 times its booking \
                  plus 512 MiB, and the bookings of a worker add up to what is left after that. \
-                 Used only with `--executor js-agent`",
+                 A ceiling, as for `--executor-hosts`. Used only with `--executor js-agent`",
             ),
         Arg::new(SLOTS)
             .long("executor-host-slots")

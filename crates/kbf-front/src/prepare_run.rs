@@ -41,7 +41,10 @@
 //! action tree's writer builds the tree from), and mints the directory
 //! ([`PackKeyMint::mint_put_dir`]). No write is signed and no grant is issued: the job has no
 //! network. The wall, the slack and their ceiling are as above, and say until when the
-//! directory's keys are good.
+//! directory's keys are good. [`PutDirPrep`] is that preparation alone: it needs the mint, the
+//! slack and the closure budget, and none of the write target, the credentials or the read
+//! listener's URL and key, so a frontend whose runs all commit into put directories is set up
+//! without them.
 //!
 //! **Secrets.** The key of the mint, the key of the grants and the signing key of the write
 //! are values the caller loads from files named by flags (`kbf-server`'s `task_flags`); no
@@ -612,19 +615,119 @@ impl RunPrep {
         now: SystemTime,
         wall: Duration,
     ) -> Result<PutDirRun, PrepareError> {
-        check_build(lease)?;
-        let expires_secs = expiry_secs(wall, self.slack)?;
-        let since = now
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| PrepareError::Clock)?;
-        let kept = collect_closure_keeping(&self.backend, action, self.limits).await?;
-        let dir = self.mint.mint_put_dir(lease, action, now)?;
-        Ok(PutDirRun {
-            dir,
-            kept,
-            not_after: since.as_secs().saturating_add(expires_secs),
-        })
+        put_dir_run(
+            &self.backend,
+            &self.mint,
+            self.limits,
+            self.slack,
+            &RunAt {
+                lease,
+                action,
+                now,
+                wall,
+            },
+        )
+        .await
     }
+}
+
+/// A preparer of put-directory runs alone: what [`RunPrep::prepare_put_dir`] needs, without
+/// the tier store's write endpoint, its credentials or the read listener's URL and key, none of
+/// which a run that commits into a put directory uses (the job has no network). Built from the
+/// mint (the secret the executor's [`crate::ingest_put_dir`] verifies with), the slack and the
+/// closure budget.
+#[derive(Debug)]
+pub struct PutDirPrep {
+    backend: Backend,
+    mint: PackKeyMint,
+    slack: Duration,
+    limits: ClosureLimits,
+}
+
+impl PutDirPrep {
+    /// A preparer that reads the store through `backend`, mints with `mint`, and keeps each
+    /// directory's keys good for the run's wall plus `slack`.
+    ///
+    /// Nothing is checked here: a wall and slack over [`MAX_EXPIRY`] are refused per run, by
+    /// [`PutDirPrep::prepare_put_dir`].
+    #[must_use]
+    pub fn new(
+        backend: Backend,
+        mint: PackKeyMint,
+        slack: Duration,
+        limits: ClosureLimits,
+    ) -> Self {
+        Self {
+            backend,
+            mint,
+            slack,
+            limits,
+        }
+    }
+
+    /// The mint that signs this preparer's directories: the one [`crate::ingest_put_dir`] must
+    /// verify a run's directory with. It can mint as well as verify, so only the frontend's own
+    /// code holds it.
+    #[must_use]
+    pub fn mint(&self) -> &PackKeyMint {
+        &self.mint
+    }
+
+    /// As [`RunPrep::prepare_put_dir`].
+    ///
+    /// # Errors
+    /// [`PrepareError`], as there.
+    pub async fn prepare_put_dir(
+        &self,
+        lease: &str,
+        action: &Digest,
+        now: SystemTime,
+        wall: Duration,
+    ) -> Result<PutDirRun, PrepareError> {
+        put_dir_run(
+            &self.backend,
+            &self.mint,
+            self.limits,
+            self.slack,
+            &RunAt {
+                lease,
+                action,
+                now,
+                wall,
+            },
+        )
+        .await
+    }
+}
+
+/// The run a put directory is prepared for.
+struct RunAt<'a> {
+    lease: &'a str,
+    action: &'a Digest,
+    now: SystemTime,
+    wall: Duration,
+}
+
+async fn put_dir_run(
+    backend: &Backend,
+    mint: &PackKeyMint,
+    limits: ClosureLimits,
+    slack: Duration,
+    run: &RunAt<'_>,
+) -> Result<PutDirRun, PrepareError> {
+    check_build(run.lease)?;
+    let expires_secs = expiry_secs(run.wall, slack)?;
+    let since = run
+        .now
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| PrepareError::Clock)?;
+    let kept = collect_closure_keeping(backend, run.action, limits).await?;
+    let dir = mint.mint_put_dir(run.lease, run.action, run.now)?;
+    Ok(PutDirRun {
+        dir,
+        kept,
+        not_after: since.as_secs().saturating_add(expires_secs),
+    })
 }
 
 fn put_endpoint(put: &PutTarget, why: &'static str) -> ConfigError {

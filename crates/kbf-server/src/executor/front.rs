@@ -31,7 +31,9 @@ use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use kbf_front::action_tree::{BaseTree, TreeWriter};
-use kbf_front::prepare_run::{KeptClosure, PrepareError as RunPrepError, PrepareFault, RunPrep};
+use kbf_front::prepare_run::{
+    KeptClosure, PrepareError as RunPrepError, PrepareFault, PutDirPrep, PutDirRun, RunPrep,
+};
 use kbf_front::{Backend, IssuedPackKey, IssuedPutDir, PackKeyMint, Packs};
 use kbf_proto::reapi::{self, Action, Command, Digest};
 use kbf_types::{DigestFunction, ImageRef, LeaseId};
@@ -161,14 +163,50 @@ impl RunPrepare for RunPrep {
         now: SystemTime,
         wall: Duration,
     ) -> Result<PreparedPutDir, PrepareError> {
-        let run = RunPrep::prepare_put_dir(self, lease, action, now, wall)
+        RunPrep::prepare_put_dir(self, lease, action, now, wall)
             .await
-            .map_err(prepare_error)?;
-        Ok(PreparedPutDir {
-            dir: run.dir.dir().to_owned(),
-            kept: run.kept,
-            not_after: run.not_after,
-        })
+            .map(prepared_put_dir)
+            .map_err(prepare_error)
+    }
+}
+
+/// The preparation of a frontend whose runs all commit into put directories
+/// ([`PutDirPrep`]): it makes the directory and the closure, and no key, write or grant, so a
+/// run that asks for those is refused.
+#[tonic::async_trait]
+impl RunPrepare for PutDirPrep {
+    async fn prepare_run(
+        &self,
+        _lease: &str,
+        _action: &kbf_types::Digest,
+        _now: SystemTime,
+        _wall: Duration,
+    ) -> Result<PreparedRun, PrepareError> {
+        Err(PrepareError::Refused(
+            "this preparation makes no presigned write: runs commit into put directories"
+                .to_owned(),
+        ))
+    }
+
+    async fn prepare_put_dir(
+        &self,
+        lease: &str,
+        action: &kbf_types::Digest,
+        now: SystemTime,
+        wall: Duration,
+    ) -> Result<PreparedPutDir, PrepareError> {
+        PutDirPrep::prepare_put_dir(self, lease, action, now, wall)
+            .await
+            .map(prepared_put_dir)
+            .map_err(prepare_error)
+    }
+}
+
+fn prepared_put_dir(run: PutDirRun) -> PreparedPutDir {
+    PreparedPutDir {
+        dir: run.dir.dir().to_owned(),
+        kept: run.kept,
+        not_after: run.not_after,
     }
 }
 
@@ -196,6 +234,16 @@ impl RunSource {
     /// verifies the keys that were issued.
     #[must_use]
     pub fn of(prep: &Arc<RunPrep>) -> Self {
+        Self {
+            mint: prep.mint().clone(),
+            prepare: prep.clone(),
+        }
+    }
+
+    /// The source over `prep`, which makes put directories alone: its own mint, so the ingest
+    /// verifies the directories that were issued.
+    #[must_use]
+    pub fn of_put_dir(prep: &Arc<PutDirPrep>) -> Self {
         Self {
             mint: prep.mint().clone(),
             prepare: prep.clone(),

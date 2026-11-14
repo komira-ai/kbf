@@ -169,6 +169,7 @@ fn a_plain_put_endpoint_needs_the_plain_http_opt_in() {
     let js = flags.executor.js.as_mut().expect("js-agent");
     let beside = Beside {
         task: flags.task.as_ref(),
+        put_dir: flags.put_dir.as_ref(),
         job_read: flags.job_read.as_ref(),
         packs: flags.packs.as_ref(),
     };
@@ -218,6 +219,7 @@ fn a_plain_read_url_needs_the_plain_http_grant_opt_in() {
     let js = https.executor.js.as_mut().expect("js-agent");
     let beside = Beside {
         task: https.task.as_ref(),
+        put_dir: https.put_dir.as_ref(),
         job_read: https.job_read.as_ref(),
         packs: https.packs.as_ref(),
     };
@@ -388,4 +390,115 @@ fn the_output_mode_of_the_task_flags_is_the_executors() {
     let put_dir = config(&["--task-out-mode=put-dir", "--task-out-root=/mnt/ts/put"]);
     let roots = PutDirRoots::new("/mnt/ts/put").expect("roots");
     assert_eq!(put_dir, TaskOut::PutDir(roots));
+}
+
+/// What a frontend whose runs commit into put directories leaves out of [`BASE`]: the tier
+/// store's write endpoint, bucket and credentials, the read url, the read listener, the plain
+/// write opt-in and the workers' shape.
+const PUT_DIR_WITHOUT: [&str; 12] = [
+    "--task-put-endpoint",
+    "--task-put-bucket",
+    "--task-put-credentials-file",
+    "--task-read-url",
+    "--job-listen",
+    "--job-tls-cert",
+    "--job-tls-key",
+    "--job-grant-secret-file",
+    "--executor-allow-plain-http-put",
+    "--executor-hosts",
+    "--executor-host-cpus",
+    "--executor-host-memory-gib",
+];
+
+const PUT_DIR: [&str; 2] = ["--task-out-mode=put-dir", "--task-out-root=/mnt/ts/put"];
+
+/// Asserts that with `--task-out-mode put-dir` the secret file is all a frontend needs of the
+/// task flags: no write endpoint, bucket, credentials, read url or read listener, and no
+/// shape of workers. The executor still gets the put directory's roots and the ceiling of the
+/// default slack, and the frontend flags say they are for put directories alone.
+#[test]
+fn a_put_dir_frontend_needs_only_the_secret_file_of_the_task_flags() {
+    let flags = parsed(argv(&PUT_DIR_WITHOUT, &PUT_DIR)).expect("accepted");
+    assert_eq!(flags.task, None);
+    assert_eq!(flags.job_read.map(|_| ()), None);
+    let put_dir = flags.put_dir.expect("put-dir flags");
+    let roots = PutDirRoots::new("/mnt/ts/put").expect("roots");
+    assert_eq!(put_dir.roots, roots);
+    assert_eq!(put_dir.url_slack, Duration::from_secs(600));
+    let config = flags.executor.js.expect("js-agent").config;
+    assert_eq!(config.task_out, TaskOut::PutDir(roots));
+    assert_eq!(config.presign_ceiling, Duration::from_secs(14_400 - 600));
+}
+
+/// Asserts that the longest run must still fit the ceiling of a directory's keys, named as for
+/// presigned writes, without the task flags that serve them.
+#[test]
+fn a_put_dir_frontend_holds_the_longest_run_to_the_keys_ceiling() {
+    let mut more = PUT_DIR.to_vec();
+    more.extend(["--executor-max-run-secs=13801", "--task-url-slack-secs=600"]);
+    let why = refused(&PUT_DIR_WITHOUT, &more);
+    assert!(
+        why.contains("--executor js-agent: --executor-max-run-secs plus")
+            && why.contains("--task-url-slack-secs (600 s)"),
+        "{why}"
+    );
+    let mut fits = PUT_DIR.to_vec();
+    fits.extend(["--executor-max-run-secs=13000", "--task-url-slack-secs=600"]);
+    parsed(argv(&PUT_DIR_WITHOUT, &fits)).expect("fits");
+}
+
+/// Asserts that a put-dir frontend that does give the write flags is checked as before, and
+/// needs no read listener: all four given, the flags are a [`TaskFlags`] and no put-dir flags,
+/// and `--job-listen` is not required; a presigned frontend still needs it.
+#[test]
+fn a_put_dir_frontend_with_the_write_flags_needs_no_read_listener() {
+    let no_listener = [
+        "--job-listen",
+        "--job-tls-cert",
+        "--job-tls-key",
+        "--job-grant-secret-file",
+    ];
+    let flags = parsed(argv(&no_listener, &PUT_DIR)).expect("accepted");
+    assert!(flags.task.is_some() && flags.put_dir.is_none());
+    assert_eq!(flags.job_read.map(|_| ()), None);
+    let why = refused(&no_listener, &[]);
+    assert!(why.contains("needs --job-listen"), "{why}");
+}
+
+/// Asserts that a read listener that is given is still checked against the read url under
+/// put-dir with the write flags: a plain read url to a TLS listener is refused as for presigned
+/// runs.
+#[test]
+fn a_put_dir_frontend_with_a_listener_still_checks_its_scheme() {
+    let mut more = PUT_DIR.to_vec();
+    more.extend([
+        "--task-read-url=http://192.0.2.6:9400",
+        "--executor-allow-plain-http-grant",
+    ]);
+    let why = refused(&[], &more);
+    assert!(why.contains("--task-read-url is http:// but"), "{why}");
+}
+
+/// Asserts that the write flags come all or none under put-dir (a partly given set is named,
+/// not ignored), and all four come under `presigned`, each naming the way out.
+#[test]
+fn the_write_flags_come_all_or_none() {
+    let mut partial = PUT_DIR_WITHOUT.to_vec();
+    partial.retain(|flag| *flag != "--task-put-endpoint");
+    let why = refused(&partial, &PUT_DIR);
+    assert!(
+        why.contains(
+            "--task-secret-file needs --task-put-bucket, --task-put-credentials-file, \
+             --task-read-url (with --task-out-mode put-dir, give all four or none of them)"
+        ),
+        "{why}"
+    );
+    let why = refused(&["--task-put-bucket", "--task-read-url"], &[]);
+    assert!(
+        why.contains(
+            "--task-secret-file needs --task-put-bucket, --task-read-url (or --task-out-mode \
+             put-dir, which needs none of them)"
+        ),
+        "{why}"
+    );
 }
