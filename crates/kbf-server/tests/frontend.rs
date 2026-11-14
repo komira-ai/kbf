@@ -144,7 +144,11 @@ impl Front {
             })
         })
         .expect("starts");
-        let (reapi, worker, api) = (handle.reapi, handle.worker, handle.api);
+        let (reapi, worker, api) = (
+            handle.reapi,
+            handle.worker.expect("a worker listener"),
+            handle.api,
+        );
         tokio::spawn(handle.serve());
         Self {
             reapi,
@@ -476,7 +480,7 @@ async fn a_stopping_frontend_is_not_serving() {
         "kbf-frontend {} reapi={} worker={} api={} storage=http://{}/",
         kbf_server::SERVER_VERSION,
         handle.reapi,
-        handle.worker,
+        handle.worker.expect("a worker listener"),
         handle.api.unwrap(),
         node.addr
     );
@@ -1421,7 +1425,7 @@ async fn an_open_execute_survives_stop_until_its_action_is_done() {
         },
     )
     .expect("starts");
-    let (reapi, worker) = (handle.reapi, handle.worker);
+    let (reapi, worker) = (handle.reapi, handle.worker.expect("a worker listener"));
     let served = tokio::spawn(handle.serve());
     let client = Client::connect(reapi, worker).await;
     let mut daemon = client.daemon("node-a", 4, 8).await;
@@ -1575,7 +1579,11 @@ async fn the_drain_endpoint_and_a_close_reach_a_frontend() {
         },
     )
     .expect("starts");
-    let (reapi, worker, api) = (handle.reapi, handle.worker, handle.api.expect("an API"));
+    let (reapi, worker, api) = (
+        handle.reapi,
+        handle.worker.expect("a worker listener"),
+        handle.api.expect("an API"),
+    );
     let drain = handle.drain();
     let served = tokio::spawn(handle.serve());
     let client = Client::connect(reapi, worker).await;
@@ -1670,7 +1678,10 @@ async fn a_frontend_with_a_state_store_shows_the_storage_health() {
     let flag = format!("--state-store=sqlite://{}", dir.join("state.db").display());
     let f = flags(&["--storage=http://127.0.0.1:1", &flag]).expect("parses");
     let handle = start_frontend(&f, || Ok(pending::<()>())).expect("starts");
-    let (api, worker) = (handle.api.expect("the operator API"), handle.worker);
+    let (api, worker) = (
+        handle.api.expect("the operator API"),
+        handle.worker.expect("a worker listener"),
+    );
     let served = tokio::spawn(handle.serve());
 
     let (code, body) = get(api, "/v1/storage").await;

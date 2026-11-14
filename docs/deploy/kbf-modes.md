@@ -30,8 +30,10 @@ through calls into the server half, not over the network. The daemon's control p
 remote daemon's: it dials the server half's worker listener on loopback over mutual TLS.
 Linux only, container driver only: any other `--driver` is refused, and so is `--cas`.
 
-**`frontend`.** It serves REAPI (Execute, the scheduler, operations) and the worker
-listener's work streams, and it routes each cache call to a storage node. It holds no blobs
+**`frontend`.** It serves REAPI (Execute, the scheduler, operations) and, when `--worker-listen` is
+given, the worker listener's work streams. Daemons and storage nodes connect to that listener, so a
+frontend that has either gives the flag; a frontend with neither (`--executor js-agent` and no storage
+node) binds no worker port. It routes each cache call to a storage node. It holds no blobs
 and refuses every flag of a store. `--storage` is the URL of one storage node, and is required
 unless the frontend runs with no storage node at all ([below](#a-frontend-with-no-storage-node)).
 `--state-store` is required too, a Postgres URL (a `sqlite://` one still starts in this
@@ -730,7 +732,7 @@ host; a farm sets routable addresses.
 | listener | flag | default | modes |
 |---|---|---|---|
 | REAPI | `--listen` | `127.0.0.1:8980` | `frontend`, `all-in-one` |
-| worker listener | `--worker-listen` | `127.0.0.1:8981` | `frontend`, `all-in-one` |
+| worker listener | `--worker-listen` | `all-in-one`: `127.0.0.1:8981`; `frontend`: off unless given (a frontend with no daemons and no storage nodes serves none; give it to serve daemons or storage nodes) | `frontend`, `all-in-one` |
 | operator API | `--api-listen` | off unless given | `frontend`, `all-in-one` |
 | enrollment | `--enroll-listen` | off unless given | `frontend` |
 | job-facing read | `--job-listen` | off unless given | `frontend` |
