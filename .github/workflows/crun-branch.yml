@@ -45,5 +45,11 @@ jobs:
           cargo xtask fetch-pinned-js --pin kbf-js-version.toml --program js-lease-server --target x86_64-unknown-linux-musl --gh "$(command -v gh)" --dir target/tmp/js
       - name: test
         run: |
-          cargo xtask sudo-test -p kbf-integration-test --test executor_real_service_integration -- --test-threads=1 --nocapture 2>&1 | tail -60
-          sudo dmesg | grep -i -E "apparmor|denied" | tail -20 || true
+          cargo xtask sudo-test -p kbf-integration-test --test executor_real_service_integration -- --test-threads=1 --nocapture > t.log 2>&1 || true
+          grep -E "test result|start-failed" t.log | sort | uniq -c | cut -c1-250
+          sudo dmesg | grep -E 'DENIED|ALLOWED|AUDIT' | cut -c1-400 | tail -30
+          sudo journalctl -k --no-pager | grep -c DENIED || true
+          mount | grep -E " (/|/home|/run|/tmp) "; findmnt -o TARGET,OPTIONS -T target/tmp
+          sudo aa-status | head -8; ls -l target/tmp | head
+          ls -l /sys/kernel/security/apparmor/features/domain 2>&1 | head -5
+          /usr/bin/crun --version | head -1
