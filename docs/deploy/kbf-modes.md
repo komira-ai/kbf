@@ -267,10 +267,13 @@ is an infrastructure failure, and the farm runs the action again. A setting that
 executor's safety rests on (the fence time against the scheduler's grace and the start window, an
 open network without its opt-in) is refused at start, exit status 2.
 
-**The kbf base tree: `--executor-base-tree <DIR>`.** Needed with `--executor js-agent`, a
-directory that holds the release's `SHA256SUMS` and its base tree bundles,
-`kbf-base-tree-<commit>-linux-<arch>.tree.tar`, one per Linux platform, as the release publishes
-them (no package installs them: the operator puts them there with each frontend upgrade). Before it serves, and so before the executor is spawned and any job
+**The kbf base tree: `--executor-base-tree <DIR>`.** Needed with `--executor js-agent`: the
+frontend's cache of the base tree bundle of its release, a directory **the frontend's user may
+write** (uid 65532 in the container image). The release's `SHA256SUMS` and its bundle for
+`--executor-arch`, `kbf-base-tree-<commit>-linux-<arch>.tree.tar`, are kept in `<DIR>/<commit>/`.
+Nothing installs them and no operator copies them: when `<DIR>` has them neither there nor loose
+(the layout every earlier release asked for, which still works as it was), the frontend fetches
+them from the release it was built from, as below. Before it serves, and so before the executor is spawned and any job
 names a tree, the frontend takes the bundle of its own commit and of `linux-` and
 `--executor-arch`, checks it against `SHA256SUMS` (listed once, and the file's SHA-256 is the
 listed one), and writes every object of the tree that the pack store does not hold to
@@ -287,6 +290,28 @@ that fails, or a build that does not know its commit, fails the start with a lin
 `--executor-base-tree:` and names the file or the key. Nothing is read or written under
 `--executor kbf-daemon`, whatever the flag says, so the flag may stay in the unit for the
 rollback. See [job-service-cutover.md](job-service-cutover.md), "The kbf base tree".
+
+**The fetch of the bundle: `--executor-base-tree-url`, `--executor-base-tree-keep`,
+`--executor-base-tree-timeout-secs`.** `--executor-base-tree-url` is a list of releases in the
+shape of GitHub's `GET /repos/<owner>/<repo>/releases` (an array; each release has `assets`, each
+with `name` and `browser_download_url`); the default is
+`https://api.github.com/repos/komira-ai/kbf/releases`, kbf's own releases. The frontend reads it
+a page at a time (`?per_page=100&page=N`) until a release lists both the bundle's file name, which
+holds the commit it was built from, and `SHA256SUMS`; it downloads those two files (redirects
+followed, https only, except plain http to a loopback address) into `<DIR>/.fetch-<commit>/`,
+hashes the bundle against the digest that `SHA256SUMS` lists, and only then renames the directory
+to `<DIR>/<commit>/`. A download that stops or is not the listed bytes is removed and fails the
+start; a partial file is never where anything reads. Once `<DIR>/<commit>/` exists, a start
+fetches nothing. After a fetch the cache keeps the running release and the
+`--executor-base-tree-keep` (default 1) newest other releases, for a rollback of the frontend,
+and removes the rest and any download a stopped start left; it never touches files loose in
+`<DIR>` or names that are not a commit. `--executor-base-tree-url=""` fetches nothing: the files
+are expected in `<DIR>` as before, and a missing one is named by the publish.
+`--executor-base-tree-timeout-secs` (default 60) is how long a connect, a response head or the
+gap between two chunks of a body may take. The frontend needs a route to the URL's host (and to
+the host the release's assets are served from) at its start when the cache lacks its release,
+and only then; a host with no route out sets `--executor-base-tree-url=""` and stages the files
+by hand.
 
 **Switching a running frontend onto the job service, and back.** The executor-to-job-service
 mode is `executor = "js-agent"` with the job service's keys (`executor-job-url`,

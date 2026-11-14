@@ -1518,6 +1518,7 @@ fn serve(flags: &FrontendFlags) -> Result<(), Box<dyn Error>> {
     })
 }
 
+mod base_fetch;
 mod base_tree;
 mod command;
 mod drain_flags;

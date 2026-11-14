@@ -399,6 +399,9 @@ fn flags_of(url: &str, token: &Path, ca: Option<&Path>) -> JsAgentFlags {
         base_image: ImageRef::parse(&format!("docker://{BASE}")).expect("an image"),
         kbf_image: ImageRef::parse(&format!("docker://{KBF}")).expect("an image"),
         base_tree: "/opt/kbf/base-tree".into(),
+        base_tree_url: String::new(),
+        base_tree_keep: 1,
+        base_tree_timeout: std::time::Duration::from_secs(60),
         published: std::sync::Arc::default(),
     }
 }

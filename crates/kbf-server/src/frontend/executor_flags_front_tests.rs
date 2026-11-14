@@ -67,6 +67,9 @@ fn flags(out: TaskOut) -> JsAgentFlags {
         base_image: ImageRef::parse(&image).expect("an image"),
         kbf_image: ImageRef::parse(&image).expect("an image"),
         base_tree: "/opt/kbf/base-tree".into(),
+        base_tree_url: String::new(),
+        base_tree_keep: 1,
+        base_tree_timeout: std::time::Duration::from_secs(60),
         published: Arc::default(),
     }
 }

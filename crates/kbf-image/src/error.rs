@@ -15,7 +15,7 @@ pub enum Error {
     #[error("{what}: {why}")]
     Transport { what: String, why: String },
     /// A request was answered with a status that is not success.
-    #[error("{url}: the registry answered {status}")]
+    #[error("{url}: the server answered {status}")]
     Status { url: String, status: u16 },
     /// The registry's authentication challenge could not be answered.
     #[error("registry authentication: {0}")]

@@ -24,7 +24,7 @@ use crate::test_log::capture;
 
 const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 
-fn sha(bytes: &[u8]) -> String {
+pub(in crate::frontend) fn sha(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
@@ -36,7 +36,7 @@ pub(in crate::frontend) struct Bundled {
 
 /// The bundle of `commit` for `platform`, a tree of `/etc/passwd`, `/usr/bin/tool` and
 /// `/.kbf-tools/kbf-task`: its bytes and what is in it.
-fn bundle(commit: &str, platform: &str) -> (Vec<u8>, Bundled) {
+pub(in crate::frontend) fn bundle(commit: &str, platform: &str) -> (Vec<u8>, Bundled) {
     let files: [&[u8]; 3] = [b"root:x:0:0::/root:/bin/nologin\n", b"tool\n", b"kbf-task"];
     let mut etc = Dir::new();
     etc.insert("passwd", Node::file(files[0], false));
@@ -120,7 +120,12 @@ fn now() -> SystemTime {
 
 fn start(dir: &Path, packs: Packs, state: Option<Arc<dyn Store>>) -> Start {
     Start {
-        dir: dir.to_owned(),
+        cache: super::super::base_fetch::Cache {
+            dir: dir.to_owned(),
+            url: String::new(),
+            keep: 1,
+            timeout: Duration::from_secs(5),
+        },
         platform: "linux-x86_64".to_owned(),
         packs,
         state,
@@ -305,4 +310,70 @@ async fn the_published_base_is_set_for_the_executor_and_a_failed_one_is_not() {
     let empty = Arc::clone(&failed.slot);
     assert!(failed.publish_as("another-commit", now).await.is_err());
     assert!(empty.get().is_none());
+}
+
+/// Asserts that a start whose cache directory is empty fetches the release it is, publishes the
+/// tree of the fetched bundle exactly as one staged by hand, and logs that the bundle is ready;
+/// and that a start over a cache of another release's files (a release that is not the one this
+/// binary is) fetches this release beside it. Catches: a start that still demands the
+/// operator's copy of the release.
+#[tokio::test]
+async fn an_empty_cache_is_filled_from_the_release_and_the_tree_published() {
+    let dir = scratch_dir("base-tree-fetch");
+    let fake = crate::frontend::base_fetch::tests::Fake::start().await;
+    fake.release(COMMIT);
+    let (first_packs, objects) = packs();
+    let lines = capture();
+    let mut ready = start(&dir, first_packs, None);
+    ready.cache.url = fake.url("/releases");
+    let root = bundle(COMMIT, "linux-x86_64").1.root;
+
+    let published = ready.publish_as(COMMIT, now).await.expect("published");
+
+    assert_eq!(published.root.hash_hex(), root);
+    assert!(published.written > 0);
+    assert!(
+        objects
+            .len(&key_of(&root))
+            .await
+            .expect("a length")
+            .is_some()
+    );
+    assert!(dir.path().join(COMMIT).join("SHA256SUMS").is_file());
+    let text = lines.text();
+    assert!(text.contains("the kbf base tree bundle is ready"), "{text}");
+    assert!(text.contains("fetched the kbf base tree bundle"), "{text}");
+
+    let beside = scratch_dir("base-tree-fetch-beside");
+    let other = "9".repeat(40);
+    bundle_dir(&beside, &other, &["linux-x86_64"]);
+    let (more, _) = packs();
+    let mut ready = start(&beside, more, None);
+    ready.cache.url = fake.url("/releases");
+    ready.publish_as(COMMIT, now).await.expect("this release");
+    assert!(beside.path().join(COMMIT).is_dir());
+    assert!(
+        beside.path().join("SHA256SUMS").is_file(),
+        "the loose files stay"
+    );
+}
+
+/// Asserts that a start whose release cannot be fetched fails naming `--executor-base-tree` and
+/// the page, with the slot empty. Catches: a start that goes on without a base tree.
+#[tokio::test]
+async fn a_release_that_cannot_be_fetched_fails_the_start_naming_the_flag() {
+    let dir = scratch_dir("base-tree-fetch-refused");
+    let fake = crate::frontend::base_fetch::tests::Fake::start().await;
+    fake.list(&[]);
+    let (packs, _) = packs();
+    let mut ready = start(&dir, packs, None);
+    ready.cache.url = fake.url("/releases");
+    let slot = Arc::clone(&ready.slot);
+
+    let error = ready.publish_as(COMMIT, now).await.expect_err("refused");
+
+    let text = error.to_string();
+    assert!(text.starts_with("--executor-base-tree: "), "{text}");
+    assert!(text.contains("no release lists both"), "{text}");
+    assert!(slot.get().is_none());
 }

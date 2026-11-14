@@ -2559,6 +2559,7 @@ dependencies = [
  "kbf-estimator",
  "kbf-front",
  "kbf-history",
+ "kbf-image",
  "kbf-invocation",
  "kbf-job-client",
  "kbf-log",

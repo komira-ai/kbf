@@ -11,7 +11,7 @@ use crate::executor::{PutDirRoots, TaskOut};
 /// A frontend that runs placed actions on hosts, with everything it needs and nothing it can
 /// do without. The tier store and the read listener are at IP addresses, the store `http://`
 /// as it is today.
-const BASE: [&str; 28] = [
+const BASE: [&str; 29] = [
     "frontend",
     "--storage=http://127.0.0.1:1",
     "--state-store=postgres:///kbf?host=/run/postgresql",
@@ -38,6 +38,7 @@ const BASE: [&str; 28] = [
     "--executor-base-image=registry.test/base@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
     "--executor-kbf-image=registry.test/kbf@sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
     "--executor-base-tree=/nowhere/base-tree",
+    "--executor-base-tree-url=",
     "--executor-insecure-argv-secrets",
     "--executor-allow-plain-http-put",
 ];
