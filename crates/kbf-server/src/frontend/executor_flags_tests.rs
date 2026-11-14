@@ -130,16 +130,28 @@ fn js_agent_names_each_flag_it_needs() {
         "--executor-job-url",
         "--executor-job-token-file",
         "--executor-frontend-id",
-        "--executor-hosts",
-        "--executor-host-cpus",
-        "--executor-host-memory-gib",
         "--executor-base-image",
         "--executor-kbf-image",
         "--executor-base-tree",
     ] {
         assert!(why.contains(flag), "{flag} in {why}");
     }
+    for flag in [
+        "--executor-hosts",
+        "--executor-host-cpus",
+        "--executor-host-memory-gib",
+    ] {
+        assert!(!why.contains(flag), "{flag} is not needed: {why}");
+    }
+    let shape = [
+        "--executor-hosts",
+        "--executor-host-cpus",
+        "--executor-host-memory-gib",
+    ];
     for (at, flag) in JS.iter().enumerate().skip(1).take(9) {
+        if shape.contains(&name(flag)) {
+            continue;
+        }
         let name = name(flag);
         let mut all = JS.to_vec();
         all.remove(at);
@@ -165,6 +177,33 @@ fn js_agent_needs_the_secrets_opt_in_and_the_packs() {
     bare.retain(|flag| !flag.starts_with("--state-store"));
     let why = parsed(bare).expect_err("refused");
     assert!(why.contains("--pack-store-endpoint"), "{why}");
+}
+
+/// Catches the virtual workers' shape being required: left out, the executor gets the
+/// ceilings the flags default to (the constants), and giving them lowers each ceiling.
+#[test]
+fn the_workers_shape_defaults_to_generous_ceilings() {
+    let mut all = JS.to_vec();
+    all.retain(|flag| {
+        ![
+            "--executor-hosts",
+            "--executor-host-cpus",
+            "--executor-host-memory-gib",
+        ]
+        .contains(&name(flag))
+    });
+    let flags = parsed(argv(&all)).expect("flags");
+    let config = flags.executor.js.expect("js-agent").config;
+    assert_eq!(config.hosts, DEFAULT_HOSTS);
+    assert_eq!(config.cpu_millis, DEFAULT_HOST_CPUS * 1_000);
+    assert_eq!(config.memory_bytes, DEFAULT_HOST_MEMORY_GIB << 30);
+    let flags = js_with(&[]).expect("flags");
+    let config = flags.executor.js.expect("js-agent").config;
+    assert_eq!(
+        (config.hosts, config.cpu_millis, config.memory_bytes),
+        (2, 8_000, 32 << 30),
+        "a given shape lowers the ceilings"
+    );
 }
 
 /// Catches settings that do not become the executor's: the shape is in cores and GiB, the two
@@ -578,9 +617,6 @@ fn old_lease_flags_are_refused_and_job_flags_are_required() {
             "--executor-job-url",
             "--executor-job-token-file",
             "--executor-frontend-id",
-            "--executor-hosts",
-            "--executor-host-cpus",
-            "--executor-host-memory-gib",
             "--executor-base-image",
             "--executor-kbf-image",
             "--executor-base-tree",

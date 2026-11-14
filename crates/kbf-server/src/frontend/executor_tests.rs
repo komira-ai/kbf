@@ -396,6 +396,49 @@ async fn a_frontend_stops_when_another_frontend_has_jobs() {
     );
 }
 
+/// Asserts that a frontend given only `--task-secret-file` and `--task-out-mode put-dir` starts
+/// its executor over a preparation of put directories alone, which is the frontend's own (no
+/// test source), and holds no preparation of presigned writes; and that the secret file is
+/// still read at the start: a short one stops it, naming the flag. No read listener is given.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_put_dir_frontend_starts_over_its_own_put_dir_preparation() {
+    let s3 = FakeS3::start().await;
+    let dir = scratch_dir("executor-put-dir-only");
+    let fake = job_server(&["host-1"]).await;
+    let mut list = flag_list(
+        dir.path(),
+        &s3,
+        &fake,
+        &["--executor=js-agent", "--executor-insecure-argv-secrets"],
+    );
+    list.retain(|flag| {
+        ![
+            "--task-put-endpoint",
+            "--task-put-bucket",
+            "--task-put-credentials-file",
+            "--task-read-url",
+            "--job-",
+            "--executor-allow-plain-http-put",
+        ]
+        .iter()
+        .any(|name| flag.starts_with(name))
+    });
+    list.extend([
+        "--task-out-mode=put-dir".to_owned(),
+        "--task-out-root=/mnt/ts/put".to_owned(),
+    ]);
+    let flags = flags_over(Some("--storage=http://127.0.0.1:1"), &list);
+    assert!(flags.task.is_none() && flags.put_dir.is_some());
+    let (handle, _stop) = started(&flags, None).expect("starts over its own preparation");
+    assert!(handle.put_dir_prep().is_some());
+    assert!(handle.run_prep().is_none());
+    drop(handle);
+
+    std::fs::write(dir.path().join("task.secret"), b"too short\n").expect("written");
+    let why = started(&flags, None).err().expect("refused").to_string();
+    assert!(why.contains("--task-secret-file"), "{why}");
+}
+
 /// Catches a frontend that starts an executor it cannot run: `js-agent` without the
 /// preparation of runs, with its pack flags removed after they were parsed, or with a job
 /// service token file that others can read or that is missing, is refused at the start, before

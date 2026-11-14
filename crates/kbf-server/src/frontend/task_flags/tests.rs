@@ -555,3 +555,188 @@ fn the_output_mode_is_presigned_or_a_put_dir_under_its_root() {
         ErrorKind::MissingRequiredArgument
     );
 }
+
+/// The two flags a put-directory frontend is given.
+const PUT_DIR_ONLY: [&str; 3] = [
+    "--task-secret-file=/etc/kbf/task.secret",
+    "--task-out-mode=put-dir",
+    "--task-out-root=/mnt/ts/put",
+];
+
+/// Asserts that the secret file with `--task-out-mode put-dir` and its root is enough: the flags
+/// make the put-directory setting and no presigned one, with the defaults the budget and slack
+/// flags have, and the flags that were given do change it.
+#[test]
+fn a_put_dir_needs_only_the_secret_file_and_the_root() {
+    let parsed = parsed(&PUT_DIR_ONLY).expect("parses");
+    assert_eq!(parsed.task, None);
+    let set = parsed.put_dir.expect("put-dir flags");
+    assert_eq!(set.secret_file, PathBuf::from("/etc/kbf/task.secret"));
+    assert_eq!(set.roots, PutDirRoots::new("/mnt/ts/put").expect("roots"));
+    assert_eq!(set.url_slack, Duration::from_secs(DEFAULT_URL_SLACK_SECS));
+    assert_eq!(set.max_digests, ClosureLimits::DEFAULT.max_digests);
+    assert_eq!(set.max_bytes, ClosureLimits::DEFAULT.max_bytes);
+    let mut given = PUT_DIR_ONLY.to_vec();
+    given.extend([
+        "--task-url-slack-secs=5",
+        "--task-closure-max-digests=10",
+        "--task-closure-max-bytes=1024",
+    ]);
+    let set = super::super::parse(
+        &frontend::command()
+            .try_get_matches_from(BASE.iter().chain(&given).copied())
+            .expect("matches"),
+    )
+    .expect("parses")
+    .put_dir
+    .expect("put-dir flags");
+    assert_eq!(set.url_slack, Duration::from_secs(5));
+    assert_eq!((set.max_digests, set.max_bytes), (10, 1024));
+}
+
+/// Asserts that none of the put-directory setting is made when it is not asked for: no secret
+/// file, the presigned mode, or the write flags given in full (then they are the task flags, as
+/// before).
+#[test]
+fn the_put_dir_setting_is_made_only_for_a_put_dir_without_the_write_flags() {
+    assert_eq!(parsed(&[]).expect("parses").put_dir, None);
+    assert_eq!(parsed(&TASK).expect("parses").put_dir, None);
+    let mut full = TASK.to_vec();
+    full.extend(["--task-out-mode=put-dir", "--task-out-root=/mnt/ts/put"]);
+    let parsed = parsed(&full).expect("parses");
+    assert_eq!(parsed.put_dir, None);
+    assert!(parsed.task.is_some());
+    // The presigned mode with the root given and none of the write flags is refused for the
+    // root first.
+    let error = parsed_err(&[
+        "--task-secret-file=/etc/kbf/task.secret",
+        "--task-out-root=/mnt/ts/put",
+    ]);
+    assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument, "{error}");
+}
+
+fn parsed_err(more: &[&str]) -> clap::Error {
+    parsed(more).expect_err("refused")
+}
+
+/// Asserts that a root that is no absolute path in normal form is refused for a put-directory
+/// frontend as it is for one with the write flags, naming the flag.
+#[test]
+fn a_put_dir_root_must_be_an_absolute_path() {
+    let error = parsed_err(&[
+        "--task-secret-file=/etc/kbf/task.secret",
+        "--task-out-mode=put-dir",
+        "--task-out-root=mnt/put",
+    ]);
+    assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
+    assert!(
+        error
+            .to_string()
+            .contains("--task-out-root: \"mnt/put\" is not an absolute path"),
+        "{error}"
+    );
+}
+
+fn put_dir_flags(dir: &Path) -> PutDirFlags {
+    PutDirFlags {
+        secret_file: file(dir, "task.secret", &format!("{SECRET}\n"), 0o600),
+        roots: PutDirRoots::new("/mnt/ts/put").expect("roots"),
+        url_slack: Duration::from_secs(DEFAULT_URL_SLACK_SECS),
+        max_digests: ClosureLimits::DEFAULT.max_digests,
+        max_bytes: ClosureLimits::DEFAULT.max_bytes,
+    }
+}
+
+/// Asserts that the flags open a preparer of put directories alone, with the mint of the secret
+/// (it verifies the directory the preparer gives), and that no preparer is built without the
+/// flags; a secret file that is missing, readable by others or under 32 bytes is refused.
+#[tokio::test]
+async fn the_put_dir_flags_open_a_preparer_of_put_dirs() {
+    let dir = scratch_dir("task-put-dir-open");
+    let (backend, action) = farm().await;
+    assert!(
+        super::open_put_dir(None, &backend)
+            .expect("opens")
+            .is_none()
+    );
+    let set = put_dir_flags(dir.path());
+    let prep = super::open_put_dir(Some(&set), &backend)
+        .expect("opens")
+        .expect("a preparer");
+    let now = UNIX_EPOCH + Duration::from_secs(1_790_000_040);
+    let run = prep
+        .prepare_put_dir(LEASE, &action, now, Duration::from_secs(60))
+        .await
+        .expect("run");
+    let mint = PackKeyMint::new(SECRET.as_bytes()).expect("a mint");
+    assert_eq!(mint.verify_put_dir(&run.dir, &action), Ok(now));
+    assert_eq!(run.not_after, 1_790_000_040 + 60 + DEFAULT_URL_SLACK_SECS);
+
+    let mut broken = put_dir_flags(dir.path());
+    broken.secret_file = dir.path().join("none");
+    assert!(super::open_put_dir(Some(&broken), &backend).is_err());
+    broken.secret_file = file(dir.path(), "wide.secret", SECRET, 0o640);
+    let said = broken
+        .open(backend.clone())
+        .expect_err("refused")
+        .to_string();
+    assert!(
+        said.contains("wide.secret") && said.contains("0640"),
+        "{said}"
+    );
+    broken.secret_file = file(dir.path(), "short.secret", "too short\n", 0o600);
+    let said = broken.open(backend).expect_err("refused").to_string();
+    assert!(said.contains("--task-secret-file"), "{said}");
+}
+
+/// Asserts that the preparation of put directories alone, as the executor asks for it
+/// ([`crate::executor::RunPrepare`]), gives the directory and the closure the mint of the secret
+/// verifies, refuses a run of presigned writes, and refuses a lease that is no build id as the
+/// caller's.
+#[tokio::test]
+async fn the_put_dir_preparation_makes_directories_and_no_writes() {
+    use crate::executor::{PrepareError, RunPrepare};
+
+    let dir = scratch_dir("task-put-dir-seam");
+    let (backend, action) = farm().await;
+    let prep = put_dir_flags(dir.path()).open(backend).expect("opened");
+    let now = UNIX_EPOCH + Duration::from_secs(1_790_000_040);
+    let wall = Duration::from_secs(60);
+    let run = RunPrepare::prepare_put_dir(&prep, LEASE, &action, now, wall)
+        .await
+        .expect("prepared");
+    assert!(
+        run.dir.starts_with(&format!("cas/b/{LEASE}/")),
+        "{}",
+        run.dir
+    );
+    assert_eq!(run.not_after, 1_790_000_040 + 60 + DEFAULT_URL_SLACK_SECS);
+    let Err(refused) = RunPrepare::prepare_run(&prep, LEASE, &action, now, wall).await else {
+        panic!("a run of writes is refused");
+    };
+    assert_eq!(
+        refused,
+        PrepareError::Refused(
+            "this preparation makes no presigned write: runs commit into put directories"
+                .to_owned()
+        )
+    );
+    let bad = RunPrepare::prepare_put_dir(&prep, "a.b", &action, now, wall)
+        .await
+        .expect_err("refused");
+    assert!(matches!(bad, PrepareError::Refused(_)), "{bad:?}");
+    let source = crate::executor::RunSource::of_put_dir(&Arc::new(prep));
+    assert!(
+        source
+            .mint
+            .verify_put_dir(
+                &kbf_front::IssuedPutDir::new(
+                    LEASE,
+                    &run.dir[run.dir.rfind('/').expect("a nonce") + 1..]
+                )
+                .expect("a dir"),
+                &action
+            )
+            .is_ok()
+    );
+}

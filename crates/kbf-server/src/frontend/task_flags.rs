@@ -19,8 +19,12 @@
 //! above; or `put-dir`, a put directory on the job's host under `--task-out-root` (`<mp>/put`,
 //! the action trees under `<mp>/trees` beside it), where the task commits its objects and from
 //! which the node's tier store uploads them (docs/design/jobs-on-jobscheduler-and-tierstore.md).
-//! A put-directory run still needs the flags above: the switch and its four companions are
-//! required, the mint is the secret's, and the writes and the grant are left unused.
+//! A put-directory run needs only the switch (the mint is the secret's) and the root: the four
+//! companions, the tier store's write endpoint, bucket and credentials and the read url, serve
+//! the writes and the grant, which a put-directory run leaves unused, so they are not required
+//! (`--task-secret-file` with `--task-out-mode put-dir` and none of the four makes a
+//! [`PutDirFlags`]; given, they are checked as before, [`TaskFlags`]). The mode `presigned`
+//! still needs all four.
 //!
 //! The secrets are files and never flags, as a command line is world-readable. The secret file
 //! holds one secret of at least 32 bytes (surrounding white space is dropped), owned by the
@@ -39,8 +43,8 @@ use std::time::Duration;
 use clap::{Arg, ArgMatches};
 use kbf_front::grants::{GrantKey, KeyError};
 use kbf_front::prepare_run::{
-    AccessKey, ClosureLimits, ConfigError, LargeTarget, PutTarget, RunPrep, RunPrepConfig,
-    check_read_url_allowing,
+    AccessKey, ClosureLimits, ConfigError, LargeTarget, PutDirPrep, PutTarget, RunPrep,
+    RunPrepConfig, check_read_url_allowing,
 };
 use kbf_front::{Backend, MintError, PackKeyMint};
 use zeroize::Zeroizing;
@@ -103,7 +107,7 @@ pub(super) fn args() -> [Arg; 16] {
             .long("task-secret-file")
             .value_name("PATH")
             .value_parser(clap::value_parser!(PathBuf))
-            .requires_all([PUT_ENDPOINT, PUT_BUCKET, PUT_CREDENTIALS, READ_URL])
+            // The four come with the switch, except under `put-dir`: `missing_presign_flags`.
             .help(
                 "Turns on the preparation of the runs of a host executor: for each run the \
                  frontend makes the keys the task may write, a presigned write of each to the \
@@ -113,8 +117,9 @@ pub(super) fn args() -> [Arg; 16] {
                  the read-grant key are made from it, and it is the secret the job-facing \
                  listener verifies grants with. The secret is never a flag: a command line is \
                  world-readable. Needs `--task-put-endpoint`, `--task-put-bucket`, \
-                 `--task-put-credentials-file` and `--task-read-url`. Left out, no run is \
-                 prepared",
+                 `--task-put-credentials-file` and `--task-read-url`, unless \
+                 `--task-out-mode put-dir`, where it is all a run needs (the mint's secret). \
+                 Left out, no run is prepared",
             ),
         Arg::new(PUT_ENDPOINT)
             .long("task-put-endpoint")
@@ -277,7 +282,8 @@ pub(super) fn args() -> [Arg; 16] {
                  `put-dir`: the task commits them as files into a put directory under \
                  `--task-out-root`, mounted at /out, which the host's tier store uploads; the \
                  inputs are the action tree under the trees directory beside it, the job's \
-                 root, and the job has no network. Used only with `--task-secret-file` and \
+                 root, and the job has no network; no tier store write endpoint, bucket, \
+                 credentials or read url is needed. Used only with `--task-secret-file` and \
                  `--executor js-agent`",
             ),
         Arg::new(OUT_ROOT)
@@ -340,7 +346,11 @@ pub(super) fn from_matches(m: &ArgMatches) -> Result<Option<TaskFlags>, String> 
     let Some(secret_file) = m.get_one::<PathBuf>(SECRET) else {
         return Ok(None);
     };
-    // clap makes the four others come with the switch; the rest have a default.
+    if put_dir_alone(m) {
+        return Ok(None);
+    }
+    // `missing_presign_flags` made the four others come with the switch; the rest have a
+    // default.
     let text = |id: &str| m.get_one::<String>(id).cloned().unwrap_or_default();
     let secs = |id: &str| Duration::from_secs(m.get_one::<u64>(id).copied().unwrap_or_default());
     let read_url = text(READ_URL);
@@ -384,10 +394,128 @@ pub(super) fn from_matches(m: &ArgMatches) -> Result<Option<TaskFlags>, String> 
     }))
 }
 
+/// The four flags a presigned run needs beside `--task-secret-file`, by argument id and name.
+const PRESIGN: [(&str, &str); 4] = [
+    (PUT_ENDPOINT, "--task-put-endpoint"),
+    (PUT_BUCKET, "--task-put-bucket"),
+    (PUT_CREDENTIALS, "--task-put-credentials-file"),
+    (READ_URL, "--task-read-url"),
+];
+
+/// Whether `--task-out-mode put-dir` was given.
+fn is_put_dir(m: &ArgMatches) -> bool {
+    m.get_one::<String>(OUT_MODE).map(String::as_str) == Some(PUT_DIR)
+}
+
+/// Whether the switch is given with `--task-out-mode put-dir` and none of the four flags a
+/// presigned run needs: the writes and the grant are not used, so nothing but the secret is.
+fn put_dir_alone(m: &ArgMatches) -> bool {
+    is_put_dir(m) && PRESIGN.iter().all(|(id, _)| !m.contains_id(id))
+}
+
+/// What `--task-secret-file` still needs, if it is given: the four flags of a presigned run
+/// (all of them, or with `--task-out-mode put-dir`, none or all), named, as the refusal of a
+/// missing required argument. `None` when the flags are complete or the switch is not given.
+pub(super) fn missing_presign_flags(m: &ArgMatches) -> Option<String> {
+    m.get_one::<PathBuf>(SECRET)?;
+    if put_dir_alone(m) {
+        return None;
+    }
+    let missing: Vec<&str> = PRESIGN
+        .iter()
+        .filter(|(id, _)| !m.contains_id(id))
+        .map(|(_, long)| *long)
+        .collect();
+    if missing.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "--task-secret-file needs {}{}",
+        missing.join(", "),
+        if is_put_dir(m) {
+            " (with --task-out-mode put-dir, give all four or none of them)"
+        } else {
+            " (or --task-out-mode put-dir, which needs none of them)"
+        }
+    ))
+}
+
+/// What the task flags say for a frontend whose runs all commit into put directories: given by
+/// `--task-secret-file` with `--task-out-mode put-dir` and none of the flags of a presigned
+/// run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PutDirFlags {
+    /// `--task-secret-file`.
+    pub secret_file: PathBuf,
+    /// `--task-out-root`.
+    pub roots: PutDirRoots,
+    /// `--task-url-slack-secs`: the time past a run's wall that its directory's keys stay good.
+    pub url_slack: Duration,
+    /// `--task-closure-max-digests`.
+    pub max_digests: usize,
+    /// `--task-closure-max-bytes`.
+    pub max_bytes: u64,
+}
+
+/// The setting the flags in `m` make for put-directory runs alone: `None` unless
+/// `--task-secret-file` is given with `--task-out-mode put-dir` and none of the four flags of a
+/// presigned run.
+///
+/// # Errors
+/// `--task-out-root` is not an absolute path in normal form.
+pub(super) fn put_dir_from_matches(m: &ArgMatches) -> Result<Option<PutDirFlags>, String> {
+    let (Some(secret_file), Some(root)) =
+        (m.get_one::<PathBuf>(SECRET), m.get_one::<String>(OUT_ROOT))
+    else {
+        return Ok(None);
+    };
+    if !put_dir_alone(m) {
+        return Ok(None);
+    }
+    let digests = m.get_one::<u32>(MAX_DIGESTS).copied().unwrap_or_default();
+    Ok(Some(PutDirFlags {
+        secret_file: secret_file.clone(),
+        roots: PutDirRoots::new(root).map_err(|error| format!("--task-out-root: {error}"))?,
+        url_slack: Duration::from_secs(m.get_one::<u64>(URL_SLACK).copied().unwrap_or_default()),
+        max_digests: usize::try_from(digests).unwrap_or(usize::MAX),
+        max_bytes: m.get_one::<u64>(MAX_BYTES).copied().unwrap_or_default(),
+    }))
+}
+
+impl PutDirFlags {
+    /// The preparer these flags describe, reading the store through `backend`: the secret file
+    /// is read and the mint made. Nothing is sent.
+    ///
+    /// # Errors
+    /// [`TaskFlagError`]: the file is missing, not owned by this user or readable by others, or
+    /// the secret is under 32 bytes.
+    pub fn open(&self, backend: Backend) -> Result<PutDirPrep, TaskFlagError> {
+        let secret = Zeroizing::new(read_owner_only(&self.secret_file, MAX_FILE_BYTES)?);
+        let mint = PackKeyMint::new(secret.trim_ascii())?;
+        let limits = ClosureLimits {
+            max_digests: self.max_digests,
+            max_bytes: self.max_bytes,
+        };
+        Ok(PutDirPrep::new(backend, mint, self.url_slack, limits))
+    }
+}
+
+/// The put-directory preparer the flags ask for, if they ask for one, over `backend`.
+///
+/// # Errors
+/// As [`PutDirFlags::open`].
+pub(super) fn open_put_dir(
+    flags: Option<&PutDirFlags>,
+    backend: &Backend,
+) -> Result<Option<Arc<PutDirPrep>>, Box<dyn Error>> {
+    let prepared = flags.map(|flags| flags.open(backend.clone()));
+    Ok(prepared.transpose()?.map(Arc::new))
+}
+
 /// Where the outputs go, from `--task-out-mode` and `--task-out-root`.
 fn out_of(m: &ArgMatches) -> Result<TaskOut, String> {
     let root = m.get_one::<String>(OUT_ROOT);
-    let put_dir = m.get_one::<String>(OUT_MODE).map(String::as_str) == Some(PUT_DIR);
+    let put_dir = is_put_dir(m);
     // clap gives `put-dir` its root (`requires_if`): with no root the mode is `presigned`.
     match root {
         Some(root) if put_dir => PutDirRoots::new(root)

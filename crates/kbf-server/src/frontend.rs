@@ -136,7 +136,7 @@ use clap::{ArgMatches, FromArgMatches as _};
 use futures::FutureExt as _;
 use futures::future::{AbortHandle, Abortable, BoxFuture};
 use kbf_auth::AuthenticateLayer;
-use kbf_front::prepare_run::RunPrep;
+use kbf_front::prepare_run::{PutDirPrep, RunPrep};
 use kbf_front::{
     Backend, MAX_MESSAGE_BYTES, Owner, Owners, Packs, Proxy, RECORDER_CHANNEL, Recorder,
     RequestMetadataLayer, Routed,
@@ -159,7 +159,7 @@ use self::executor_open::executor_of;
 pub use self::janitor::{Janitor, JanitorFlagError, JanitorFlags, JanitorMetrics};
 pub use self::job_read::{JobReadError, JobReadFlags, JobTls};
 pub use self::pack_flags::{PackFlagError, PackFlags};
-pub use self::task_flags::{TaskFlagError, TaskFlags};
+pub use self::task_flags::{PutDirFlags, TaskFlagError, TaskFlags};
 use crate::drain::Drain;
 use crate::enroll::flags::EnrollFlags;
 use crate::enroll::start as enroll_start;
@@ -305,6 +305,10 @@ pub struct FrontendFlags {
     /// executor (the key, the presigned write and the read grant of each). `None` without the
     /// switch, where no run is prepared.
     pub task: Option<TaskFlags>,
+    /// `--task-secret-file` with `--task-out-mode put-dir` and none of the flags of a presigned
+    /// run: the frontend prepares put-directory runs alone. `None` otherwise, and then at most
+    /// one of this and `task` is set.
+    pub put_dir: Option<PutDirFlags>,
     /// `--task-janitor-key-file` and its companions: the sweep of the task packs under `cas/b/`
     /// that nothing recorded. `None` without the key file, where nothing is swept.
     pub janitor: Option<JanitorFlags>,
@@ -355,12 +359,17 @@ pub fn parse(m: &ArgMatches) -> Result<FrontendFlags, clap::Error> {
         Some(storage) => transport(storage, tls.is_some()).map_err(refuse)?,
         None => stored::without_storage(&server, &executor, packs.as_ref()).map_err(refuse)?,
     }
+    if let Some(why) = task_flags::missing_presign_flags(m) {
+        return Err(command().error(clap::error::ErrorKind::MissingRequiredArgument, why));
+    }
     let task = task_flags::from_matches(m).map_err(refuse)?;
+    let put_dir = task_flags::put_dir_from_matches(m).map_err(refuse)?;
     let janitor = janitor::from_matches(m);
     janitor::check(janitor.as_ref(), packs.as_ref()).map_err(refuse)?;
     if let Some(js) = executor.js.as_mut() {
         let beside = executor_bind::Beside {
             task: task.as_ref(),
+            put_dir: put_dir.as_ref(),
             job_read: job_read.as_ref(),
             packs: packs.as_ref(),
         };
@@ -382,6 +391,7 @@ pub fn parse(m: &ArgMatches) -> Result<FrontendFlags, clap::Error> {
         executor,
         job_read,
         task,
+        put_dir,
         janitor,
     })
 }
@@ -540,6 +550,9 @@ pub struct FrontendHandle {
     packs: Option<Packs>,
     /// The preparer of runs `--task-secret-file` describes, if the flag was given.
     run_prep: Option<Arc<RunPrep>>,
+    /// The preparer of put-directory runs alone `--task-secret-file` with
+    /// `--task-out-mode put-dir` describes, when none of the flags of a presigned run is given.
+    put_dir_prep: Option<Arc<PutDirPrep>>,
     /// The count of intake polls the farm has run to the end ([`Farm::intake_polls`]).
     intake_polls: tokio::sync::watch::Receiver<u64>,
     /// The count of sweeps the janitor of `cas/b/` has finished, if `--task-janitor-key-file`
@@ -582,6 +595,13 @@ impl FrontendHandle {
     #[must_use]
     pub fn run_prep(&self) -> Option<Arc<RunPrep>> {
         self.run_prep.clone()
+    }
+
+    /// The preparer of put-directory runs alone, when `--task-secret-file` is given with
+    /// `--task-out-mode put-dir` and none of the flags of a presigned run; `None` otherwise.
+    #[must_use]
+    pub fn put_dir_prep(&self) -> Option<Arc<PutDirPrep>> {
+        self.put_dir_prep.clone()
     }
 
     /// The frontend's drain ([`Drain`]): `POST /v1/frontend/drain` begins it, and the
@@ -930,6 +950,7 @@ impl<'a> Prepared<'a> {
             }
         };
         let run_prep = task_flags::open(flags.task.as_ref(), &backend)?;
+        let put_dir_prep = task_flags::open_put_dir(flags.put_dir.as_ref(), &backend)?;
         // A failed run's logs are read from the storage node, under a budget of this
         // frontend's own: it serves no blob route to share one with.
         let history = history.map(|history| {
@@ -955,7 +976,9 @@ impl<'a> Prepared<'a> {
         crate::serve::log_exclusive(listeners.exclusive_actions);
         let farm = Arc::new(farm.with_state(state)?);
         log_state(durable, farm.term(), farm.lease_epoch());
-        let source = source.or_else(|| run_prep.as_ref().map(RunSource::of));
+        let source = source
+            .or_else(|| run_prep.as_ref().map(RunSource::of))
+            .or_else(|| put_dir_prep.as_ref().map(RunSource::of_put_dir));
         let executor = executor_of(flags, &farm, packs.as_ref(), &backend, source, timeout)?;
         let checks = match &plane {
             stored::Plane::Node { storage, .. } => checks(
@@ -1337,6 +1360,7 @@ impl<'a> Prepared<'a> {
             pack_index,
             packs,
             run_prep,
+            put_dir_prep,
             intake_polls,
             janitor_sweeps,
             executor: executor.map(|built| built.executor),
