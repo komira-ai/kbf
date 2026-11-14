@@ -263,6 +263,34 @@ async fn welcome_says_commit(worker: SocketAddr) -> bool {
     }
 }
 
+/// Asserts that a frontend started with no `--worker-listen` has no worker address, says none in
+/// its start line, and still serves its REAPI listener, which accepts a connection. Catches: a
+/// start that needs the worker listener to serve, and one that names a worker address it does
+/// not have.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_frontend_with_no_worker_listener_still_serves_its_reapi_listener() {
+    let mut argv = argv_over(Some("--storage=http://127.0.0.1:1"), &[]);
+    argv.retain(|flag| !flag.starts_with("--worker-listen"));
+    let matches = command().try_get_matches_from(argv).expect("flags");
+    let flags = parse(&matches).expect("a frontend's flags");
+    let handle = started(&flags, Some(index())).expect("starts");
+    assert!(handle.worker.is_none());
+    assert!(
+        !handle.start_line().contains("worker="),
+        "{}",
+        handle.start_line()
+    );
+    let reapi = handle.reapi;
+    let serving = tokio::spawn(handle.serve());
+
+    tokio::net::TcpStream::connect(reapi)
+        .await
+        .expect("the REAPI listener accepts");
+    assert!(!serving.is_finished());
+
+    serving.abort();
+}
+
 /// Asserts that a frontend tells its daemons in `Welcome` that it takes `CommitPack` when it has
 /// the pack index and the pack store, and does not when it has the index alone: it could not read
 /// a pack to check it.
@@ -273,7 +301,10 @@ async fn welcome_says_a_frontend_takes_commits_only_with_the_pack_store() {
     let with = flags_of(&pack_flags(s3.endpoint(), dir.path()));
     let with = started(&with, Some(index())).expect("starts");
     let without = started(&flags_of(&[]), Some(index())).expect("starts");
-    let (with_addr, without_addr) = (with.worker, without.worker);
+    let (with_addr, without_addr) = (
+        with.worker.expect("a worker"),
+        without.worker.expect("a worker"),
+    );
     let served = [tokio::spawn(with.serve()), tokio::spawn(without.serve())];
 
     assert!(welcome_says_commit(with_addr).await);
@@ -389,7 +420,10 @@ impl Daemon {
 async fn a_frontend_exports_the_pack_reads_its_daemons_report() {
     let flags = flags_of(&[]);
     let handle = started(&flags, Some(index())).expect("starts");
-    let (worker, api) = (handle.worker, handle.api.expect("the operator API"));
+    let (worker, api) = (
+        handle.worker.expect("a worker listener"),
+        handle.api.expect("the operator API"),
+    );
     let served = tokio::spawn(handle.serve());
     let text = scrape(api).await;
     assert!(!text.contains("kbf_pack_daemon_"), "{text}");
@@ -450,7 +484,10 @@ async fn a_frontend_exports_the_pack_reads_its_daemons_report() {
 async fn a_frontend_exports_the_input_cache_counts_its_daemons_report() {
     let flags = flags_of(&[]);
     let handle = started(&flags, Some(index())).expect("starts");
-    let (worker, api) = (handle.worker, handle.api.expect("the operator API"));
+    let (worker, api) = (
+        handle.worker.expect("a worker listener"),
+        handle.api.expect("the operator API"),
+    );
     let served = tokio::spawn(handle.serve());
     let text = scrape(api).await;
     assert!(!text.contains("kbf_node_input_cache_"), "{text}");
@@ -563,7 +600,10 @@ async fn a_frontend_exports_the_scheduler_core_it_runs() {
 async fn a_frontend_exports_the_pack_writes_its_daemons_report() {
     let flags = flags_of(&[]);
     let handle = started(&flags, Some(index())).expect("starts");
-    let (worker, api) = (handle.worker, handle.api.expect("the operator API"));
+    let (worker, api) = (
+        handle.worker.expect("a worker listener"),
+        handle.api.expect("the operator API"),
+    );
     let served = tokio::spawn(handle.serve());
     let text = scrape(api).await;
     assert!(!text.contains("kbf_pack_daemon_"), "{text}");

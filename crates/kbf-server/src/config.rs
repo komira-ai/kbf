@@ -29,6 +29,11 @@ use crate::stores::{S3Uri, StoreFlags, StoreUri, Stores, StoresError};
 use crate::token::{ApiToken, TokenFileError};
 use crate::worker::HostFloor;
 
+/// Where the worker listener is when `--worker-listen` is not given, in every mode but
+/// `kbf frontend` (which then has none).
+pub const DEFAULT_WORKER_LISTEN: SocketAddr =
+    SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 8981);
+
 /// The default of `--tls-reload-interval-secs`.
 const DEFAULT_TLS_RELOAD_SECS: u64 = 30;
 
@@ -205,9 +210,11 @@ pub struct Args {
     pub storage: Option<String>,
     /// The `kbf.worker.v1` listener. Without mutual TLS (`--worker-tls-cert`,
     /// `--worker-tls-key`, `--worker-client-ca`) it serves plain text, on any address;
-    /// off loopback the start line carries a warning.
-    #[arg(long, default_value = "127.0.0.1:8981")]
-    pub worker_listen: SocketAddr,
+    /// off loopback the start line carries a warning. `kbf frontend` binds it only when it is
+    /// given (a frontend with no daemons and no storage nodes serves none); every other mode
+    /// binds 127.0.0.1:8981 when it is not.
+    #[arg(long)]
+    pub worker_listen: Option<SocketAddr>,
     /// The operator API listener (HTTP/JSON under `/v1`). Off unless given. Reads are
     /// open to whoever reaches it: bind it where only operators do.
     #[arg(long)]
@@ -1011,7 +1018,7 @@ impl Args {
         Ok(Listeners {
             reapi: self.listen,
             reapi_tls,
-            worker: self.worker_listen,
+            worker: self.worker_listen.unwrap_or(DEFAULT_WORKER_LISTEN),
             worker_tls,
             heartbeat_interval: Duration::from_millis(self.heartbeat_interval_ms),
             hello_wait: Duration::from_secs(10),
@@ -1081,7 +1088,10 @@ impl Args {
     #[must_use]
     pub fn plain_text_off_loopback(&self) -> Vec<&'static str> {
         let reapi = self.reapi_tls_cert.is_none() && !loopback_only(self.listen.ip());
-        let worker = self.worker_tls_cert.is_none() && !loopback_only(self.worker_listen.ip());
+        let worker = self.worker_tls_cert.is_none()
+            && self
+                .worker_listen
+                .is_some_and(|addr| !loopback_only(addr.ip()));
         [("reapi", reapi), ("worker", worker)]
             .into_iter()
             .filter_map(|(name, plain)| plain.then_some(name))

@@ -314,7 +314,7 @@ async fn an_api_bind_retries_an_unavailable_address() {
 fn the_frontends_listeners_bind_through_one_shared_budget() {
     let (binder, slept, _) = flaky(Duration::from_secs(2), 3);
     let addr = |port: u16| -> SocketAddr { format!("192.0.2.10:{port}").parse().expect("address") };
-    let error = crate::frontend::Bound::bind(addr(1), addr(2), Some(addr(3)), &binder)
+    let error = crate::frontend::Bound::bind(addr(1), Some(addr(2)), Some(addr(3)), &binder)
         .err()
         .expect("the second listener runs out of budget");
     assert!(error.to_string().contains("192.0.2.10:2"), "{error}");

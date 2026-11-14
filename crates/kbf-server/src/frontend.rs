@@ -514,8 +514,8 @@ fn proxy_owners(routed: Option<Arc<Routed>>, bootstrap: Owner) -> Owners {
 pub struct FrontendHandle {
     /// Where the REAPI listener is.
     pub reapi: SocketAddr,
-    /// Where the worker listener is.
-    pub worker: SocketAddr,
+    /// Where the worker listener is, if there is one (`--worker-listen`).
+    pub worker: Option<SocketAddr>,
     /// Where the operator API listener is, if there is one.
     pub api: Option<SocketAddr>,
     /// Where the enroll listener is, if there is one.
@@ -600,7 +600,7 @@ impl FrontendHandle {
     }
 
     /// The line the frontend prints once it is bound:
-    /// `kbf-frontend <version> reapi=<addr> worker=<addr>[ api=<addr>] storage=<url>`.
+    /// `kbf-frontend <version> reapi=<addr>[ worker=<addr>][ api=<addr>] storage=<url>` (`worker=` only with `--worker-listen`).
     #[must_use]
     pub fn start_line(&self) -> &str {
         &self.start_line
@@ -787,7 +787,7 @@ struct Prepared<'a> {
 /// The three listening sockets.
 pub(crate) struct Bound {
     reapi: Socket,
-    worker: Socket,
+    worker: Option<Socket>,
     api: Option<Socket>,
 }
 
@@ -797,13 +797,15 @@ impl Bound {
     /// unit's start timeout whatever number of addresses wait for a late interface.
     pub(crate) fn bind(
         reapi: SocketAddr,
-        worker: SocketAddr,
+        worker: Option<SocketAddr>,
         api: Option<SocketAddr>,
         binder: &Binder,
     ) -> Result<Self, ServeError> {
         Ok(Self {
             reapi: Socket::bind(reapi, binder)?,
-            worker: Socket::bind(worker, binder)?,
+            worker: worker
+                .map(|worker| Socket::bind(worker, binder))
+                .transpose()?,
             api: api.map(|api| Socket::bind(api, binder)).transpose()?,
         })
     }
@@ -837,7 +839,7 @@ impl<'a> Prepared<'a> {
             .transpose()?;
         let sockets = Bound::bind(
             listeners.reapi,
-            listeners.worker,
+            args.worker_listen,
             api.as_ref().map(|api| api.listen),
             &binder,
         )?;
@@ -1004,14 +1006,19 @@ impl<'a> Prepared<'a> {
             worker,
             api: api_socket,
         } = sockets;
-        let (reapi_addr, worker_addr) = (reapi.local, worker.local);
+        let (reapi_addr, worker_addr) = (reapi.local, worker.as_ref().map(|socket| socket.local));
         let api_addr = api_socket.as_ref().map(|socket| socket.local);
         // Both listeners are closed the moment the drain begins and the worker listener
         // is stopped, whatever the transport is doing then.
         let (reapi_incoming, reapi_latch) = reapi.grpc(listeners.reapi_tls)?;
         drain.begins().closes(reapi_latch);
-        let (worker_incoming, worker_latch) = worker.grpc(worker_tls)?;
-        worker_stop.closes(worker_latch);
+        let worker_incoming = worker
+            .map(|socket| socket.grpc(worker_tls))
+            .transpose()?
+            .map(|(incoming, latch)| {
+                worker_stop.closes(latch);
+                incoming
+            });
         let api_listeners = api_socket.map(Socket::http_pair).transpose()?;
         let token = api.and_then(|api| api.token);
         // The enroll listener (which is closed the moment the drain begins, like the
@@ -1225,13 +1232,22 @@ impl<'a> Prepared<'a> {
                 served
             };
             let worker_stopped = worker_stop.fired();
-            let worker_serve = worker_server
-                .add_routes(node_calls)
-                .add_service(worker_service)
-                .add_optional_service(membership)
-                .add_optional_service(cold_store)
-                .add_optional_service(locate)
-                .serve_with_incoming_shutdown(worker_incoming, worker_stopped);
+            // Without `--worker-listen` there is no worker listener and nothing here ends.
+            let worker_serve = async move {
+                match worker_incoming {
+                    Some(incoming) => {
+                        worker_server
+                            .add_routes(node_calls)
+                            .add_service(worker_service)
+                            .add_optional_service(membership)
+                            .add_optional_service(cold_store)
+                            .add_optional_service(locate)
+                            .serve_with_incoming_shutdown(incoming, worker_stopped)
+                            .await
+                    }
+                    None => std::future::pending().await,
+                }
+            };
             // Told when the REAPI listener is done (see `serve::stop_api`).
             let (api_stop_when_done, api_stopped) = tokio::sync::oneshot::channel::<()>();
             let api_serve = serve_api_goaway(
@@ -1436,12 +1452,13 @@ fn metrics_route(
 /// The start line, with one warning naming the listeners in `plain` when there are any.
 fn start_line(
     reapi: SocketAddr,
-    worker: SocketAddr,
+    worker: Option<SocketAddr>,
     api: Option<SocketAddr>,
     enroll: Option<SocketAddr>,
     storage: &str,
     plain: &[&str],
 ) -> String {
+    let worker = worker.map(|a| format!(" worker={a}")).unwrap_or_default();
     let api = api.map(|a| format!(" api={a}")).unwrap_or_default();
     let enroll = enroll.map(|a| format!(" enroll={a}")).unwrap_or_default();
     let warning = if plain.is_empty() {
@@ -1450,7 +1467,7 @@ fn start_line(
         format!(" warning=plaintext-off-loopback:{}", plain.join(","))
     };
     format!(
-        "kbf-frontend {SERVER_VERSION} reapi={reapi} worker={worker}{api}{enroll} storage={storage}{warning}"
+        "kbf-frontend {SERVER_VERSION} reapi={reapi}{worker}{api}{enroll} storage={storage}{warning}"
     )
 }
 

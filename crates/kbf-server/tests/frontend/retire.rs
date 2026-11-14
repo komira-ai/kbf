@@ -164,7 +164,11 @@ impl Member {
             })
         })
         .expect("starts");
-        let (reapi, worker, api) = (handle.reapi, handle.worker, handle.api);
+        let (reapi, worker, api) = (
+            handle.reapi,
+            handle.worker.expect("a worker listener"),
+            handle.api,
+        );
         let (drain, polls) = (handle.drain(), handle.intake_polls());
         let (finish, ended) = watch::channel(false);
         let serving = async move {

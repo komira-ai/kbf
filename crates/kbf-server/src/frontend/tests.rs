@@ -95,7 +95,7 @@ fn the_retired_handover_flags_are_read_and_change_nothing() {
     assert!(plain.retired.warnings().is_empty());
     let old = parsed(&RETIRED).expect("the retired flags parse");
     assert_eq!(old.server.listen.port(), 18980);
-    assert_eq!(old.server.worker_listen.port(), 18981);
+    assert_eq!(old.server.worker_listen.map(|a| a.port()), Some(18981));
     assert_eq!(old.server.api_listen, plain.server.api_listen);
     assert_eq!(old.retired.warnings().len(), RETIRED.len());
     assert_eq!(old.retired.instance.as_deref(), Some("b"));
@@ -148,6 +148,44 @@ async fn an_operator_api_address_in_use_fails_the_start() {
     );
 }
 
+/// Asserts that a frontend given no `--worker-listen` binds no worker listener (the REAPI and
+/// the operator API are bound, and the flag reads as absent), and that one given it still binds
+/// it where the flag says: the start line then carries `worker=<addr>` and without it carries
+/// none. Catches: a worker listener bound on 127.0.0.1:8981 by default, which a frontend with no
+/// storage nodes and no daemons has no use for, and a start line that names a listener that
+/// is not there.
+#[tokio::test]
+async fn a_frontend_binds_a_worker_listener_only_when_asked() {
+    let flags = |worker: Option<&str>| {
+        let mut argv = vec![
+            "frontend".to_owned(),
+            "--storage=http://127.0.0.1:1".to_owned(),
+            "--listen=127.0.0.1:0".to_owned(),
+            "--api-listen=127.0.0.1:0".to_owned(),
+        ];
+        argv.extend(worker.map(|addr| format!("--worker-listen={addr}")));
+        let matches = super::command().try_get_matches_from(argv).expect("flags");
+        super::parse(&matches).expect("a frontend's flags")
+    };
+
+    let without = flags(None);
+    assert_eq!(without.server.worker_listen, None);
+    let prepared = super::Prepared::new(&without).expect("binds");
+    assert!(prepared.sockets.worker.is_none());
+    assert!(prepared.sockets.api.is_some());
+    assert_ne!(prepared.sockets.reapi.local.port(), 0);
+
+    let asked = flags(Some("127.0.0.1:0"));
+    let with = super::Prepared::new(&asked).expect("binds");
+    assert!(with.sockets.worker.is_some());
+
+    let reapi: std::net::SocketAddr = "127.0.0.1:1".parse().expect("address");
+    let worker: std::net::SocketAddr = "127.0.0.1:2".parse().expect("address");
+    let line = |worker| super::start_line(reapi, worker, None, None, "none", &[]);
+    assert!(line(Some(worker)).contains(" reapi=127.0.0.1:1 worker=127.0.0.1:2 "));
+    assert!(!line(None).contains("worker="), "{}", line(None));
+}
+
 /// Catches: a frontend that does not bind the three listeners it was asked for, or binds
 /// the operator API's on the REAPI's or worker's port. The unit-test build of `Prepared::new`
 /// otherwise only ever sees its failure, so the success path (and the coverage of it in this
@@ -167,7 +205,13 @@ async fn a_frontend_binds_its_three_listeners_on_their_own_ports() {
     let api = prepared.sockets.api.as_ref().expect("the API is bound");
     let ports = [
         prepared.sockets.reapi.local.port(),
-        prepared.sockets.worker.local.port(),
+        prepared
+            .sockets
+            .worker
+            .as_ref()
+            .expect("the worker listener is bound")
+            .local
+            .port(),
         api.local.port(),
     ];
     assert!(ports.iter().all(|port| *port != 0), "{ports:?}");
