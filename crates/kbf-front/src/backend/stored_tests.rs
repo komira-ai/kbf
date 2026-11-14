@@ -75,11 +75,12 @@ async fn the_walk_of_an_input_tree_reads_the_packs_and_reports_what_is_absent() 
 }
 
 /// Asserts that a tree whose root Directory is not held is reported absent as a whole: the root
-/// is the one absent blob, as over any other store.
+/// is the one absent blob, as over any other store. (The root names a file: a Directory that
+/// names nothing encodes to no bytes, which is the empty blob, and every store holds that.)
 #[tokio::test]
 async fn the_walk_of_a_tree_whose_root_is_not_held_reports_the_root_absent() {
     let backend = Backend::stored(stored());
-    let root = dir(&[], &[]);
+    let root = dir(&[blob("a file of the root").0], &[]);
 
     let walked = backend.walk_inputs(root.0).await;
 
