@@ -1,7 +1,7 @@
 //! The darwin `kbf-task` bundle in the pinned release set (docs/artifacts.md, "The macOS `kbf-task`
 //! bundle"): `kbf-task-bundle-<commit>-darwin-arm64.tar.gz`, a tarball of the OCI image layout
-//! `js-bundle pack` writes for the signed `kbf-task`, and its SBOM. No pull request run attests it,
-//! and the darwin job runs only for a labelled one, so the steps that make it are held to one
+//! `js-bundle pack` writes for the signed `kbf-task`, and its SBOM. No pull request builds it
+//! (artifacts.yml runs in the release pipeline only), so the steps that make it are held to one
 //! shape here. [`rules`] reads the workflow and names a darwin job that does not, each unconditional
 //! and in this order:
 //!

@@ -12,26 +12,25 @@ SHA-256 check are **planned** and not built yet
 ([mac-node-provisioning.md](design/mac-node-provisioning.md) sections 4.1 and 4.2).
 Sections below that describe them say so.
 
-A pull request builds none of this unless it carries the label `needs-artifacts`; adding
-the label to an open pull request starts the build. Pushes and the merge queue always
-build.
+A pull request and a merge queue entry build none of this: `artifacts.yml` has no trigger of its
+own, and only the pipeline of a push to `main` calls it (below). The darwin-arm64 and linux-arm64
+builds are platforms other than Linux x86_64, which run only in the release pipeline.
 
-## Pull request labels
+## Pull request checks
 
 A pull request runs `ci.yml` (the checks `lint` and `test`, which gates the coverage of the fast set
-run in the `test-shard` matrix beside it) and `macos-pr.yml`, whose `macos-test` and `macos-device` run, on a
-hosted `macos-15`, the macOS crates' tests and every step of `beta.yml`'s `native-macos`. The full suite, the after-merge macOS jobs and the
-packages run on a push to `main` (`beta.yml`). One label opts a pull request in to more, to spare the small
-macOS runner pool. Adding it to an open pull request starts a run.
-
-| Label | Effect |
-|---|---|
-| `needs-artifacts` | `artifacts.yml` builds, packages and sums the files for the pull request (without the label a pull request builds nothing; nothing is attested from a pull request, and the push to `main` builds and attests every file) |
-
-`artifacts.yml` runs on the `labeled` event so that the label starts something. Any label
-added to a pull request therefore starts a whole `artifacts` run, which replaces the pull
-request's earlier run: add labels together, before the run you want to keep. The `native-macos` job (which also runs
-the package tests) runs in `beta.yml` on every push and never on a pull request; that is pinned by `crates/kbf-integration-test/tests/release_artifacts`.
+run in the `test-shard` matrix beside it) and nothing else that every pull request starts: every job
+of a workflow that a pull request or a merge queue entry starts runs on a Linux x86_64 hosted
+runner (`ubuntu-*`, not `-arm`, not `macos-*`, not `windows-*`), because those are the runners
+there are enough of. The workflow lint (`crates/kbf-integration-test/tests/workflows`) refuses any
+other runner label in such a workflow. Every other platform is the beta stage of the release
+pipeline: `beta.yml` (called by `pipeline.yml` on a push to `main`) runs the Arm tests
+(`test-arm`, `crun-arm`) and the macOS jobs (`native-macos`, which also runs the package tests
+and the task runner's tests under the macOS confine, `host-install-mac`, `mac-provision` and
+`vmm-probe`), and `passed` needs all of it, so the files of a platform are released only from a
+pipeline in which that platform's tests passed. `ci.yml` checks on Linux that the Mac crates
+compile for `aarch64-apple-darwin`, so a macOS-only compile error is red on the pull request. No
+label opts a pull request in to a Mac or Arm run.
 
 ## What is built
 
@@ -96,7 +95,7 @@ interpreter and no needed library. The task image
 carries the same file. It writes its pack with `kbf-task-pack` (`crates/kbf-task-pack`), the task pack types
 the frontend ingests with, a crate of pure Rust that does not link the pack index or the object store client.
 
-A Mac gets `kbf-task` only as [the bundle below](#the-macos-kbf-task-bundle); there is no bare `kbf-task` tarball, binary asset or image for a Mac. `kbf-task` has a macOS confine: it runs the Command alone under `/usr/bin/sandbox-exec`, with a profile (`crates/kbf-seatbelt`, also used by the Mac daemon's driver) that denies every network operation but to loopback and Unix sockets for a Command denied the network, and denies reading, writing, renaming and linking each file holding a credential or presigned URL it was given (the grant token file, the pack URL file, the PUT URLs file), and renaming the directories above it, for any Command. It does not limit other writes, nor `mach-lookup` of helper daemons, does not stop DNS (any Unix socket is allowed, and the system resolver is reached through one), and a connect to the node's own non-loopback address was allowed under the denial on the macOS runner. A system that is neither Linux nor macOS has no confine, and `kbf-task` refuses a Command denied the network there (exit 15). The `task-macos` job of `ci.yml` runs `cargo test -p kbf-task` on a hosted Mac, without the test-only feature, after the merge; a pull request runs the same tests in `macos-pr.yml`'s `macos-test`. A repository lint (`crates/kbf-integration-test/tests/no_darwin_task.rs`) allows exactly the bundle and refuses: a bare `kbf-task` asset, package line or image for a Mac (any name but `kbf-task-bundle-<commit>-darwin-arm64`), a `cargo build`, `b` or `install` for a Mac target that would produce `kbf-task`, a Mac runner job that names it other than in a `cargo test`, `check` or `clippy` line, or builds the whole workspace without `--exclude kbf-task`, in any job but the bundle job (`darwin-arm64` of `artifacts.yml`), the bundle made (`cargo xtask package-task-bundle`) by any other job, and any workflow that names the test-only feature `unconfined-for-tests`; a `cargo check`, `clippy` or `test` of it for a Mac target, which ships nothing, is allowed. The backstop is the pin of the release set (the asset table here and the workflow must agree: `crates/kbf-integration-test/tests/release_artifacts`); the lint's text match of workflow jobs is a tripwire.
+A Mac gets `kbf-task` only as [the bundle below](#the-macos-kbf-task-bundle); there is no bare `kbf-task` tarball, binary asset or image for a Mac. `kbf-task` has a macOS confine: it runs the Command alone under `/usr/bin/sandbox-exec`, with a profile (`crates/kbf-seatbelt`, also used by the Mac daemon's driver) that denies every network operation but to loopback and Unix sockets for a Command denied the network, and denies reading, writing, renaming and linking each file holding a credential or presigned URL it was given (the grant token file, the pack URL file, the PUT URLs file), and renaming the directories above it, for any Command. It does not limit other writes, nor `mach-lookup` of helper daemons, does not stop DNS (any Unix socket is allowed, and the system resolver is reached through one), and a connect to the node's own non-loopback address was allowed under the denial on the macOS runner. A system that is neither Linux nor macOS has no confine, and `kbf-task` refuses a Command denied the network there (exit 15). The `native-macos` job of `beta.yml` runs `cargo test -p kbf-task` on a hosted Mac, without the test-only feature, in the beta stage of the pipeline after the merge; no pull request runs a Mac. A repository lint (`crates/kbf-integration-test/tests/no_darwin_task.rs`) allows exactly the bundle and refuses: a bare `kbf-task` asset, package line or image for a Mac (any name but `kbf-task-bundle-<commit>-darwin-arm64`), a `cargo build`, `b` or `install` for a Mac target that would produce `kbf-task`, a Mac runner job that names it other than in a `cargo test`, `check` or `clippy` line, or builds the whole workspace without `--exclude kbf-task`, in any job but the bundle job (`darwin-arm64` of `artifacts.yml`), the bundle made (`cargo xtask package-task-bundle`) by any other job, and any workflow that names the test-only feature `unconfined-for-tests`; a `cargo check`, `clippy` or `test` of it for a Mac target, which ships nothing, is allowed. The backstop is the pin of the release set (the asset table here and the workflow must agree: `crates/kbf-integration-test/tests/release_artifacts`); the lint's text match of workflow jobs is a tripwire.
 
 `tierstore` (the hot and cold S3 object store proxy) is no longer built or released by this repository: its source, its
 Linux tarballs and its packaging (the example unit and the flags to fill in) are in

@@ -13,6 +13,10 @@
 //!   (`${{ }}`, so a matrix too), a custom label (even one that starts like a hosted
 //!   label, such as `ubuntu-gpu`) or a second label could select a non-hosted runner,
 //!   so each is refused because the lint cannot tell where it lands;
+//! - the workflow runs on `pull_request` or `merge_group` and a job's `runs-on` is a hosted label
+//!   other than a Linux x86_64 one ([`PR_RUNNER_LABELS`]): a macOS, Windows or Arm runner. The
+//!   per-pull-request checks are the Linux x86_64 tests; every other platform runs as a beta stage
+//!   of the release pipeline (`beta.yml`, a `workflow_call` workflow);
 //! - a job's `permissions` grants anything but `read` or `none`, except `actions` ([`ACTIONS_SCOPES`]: the
 //!   pipeline's watch job cancels its own run, and the rerun of its failed jobs), which may be `write` only in a job whose `if:` is exactly
 //!   [`SIGNING_PUSH_ONLY`] or exactly [`RERUN_ONLY`], and the two scopes
@@ -140,6 +144,18 @@ const HOSTED_LABELS: &[&str] = &[
     "macos-14",
     "macos-26-intel",
     "macos-15-intel",
+];
+
+/// The runner labels a job of a workflow that runs on `pull_request` or `merge_group` may name:
+/// the Linux x86_64 hosted runners. Every other platform (macOS, Linux arm64, Windows) is tested
+/// in a beta stage of the release pipeline (`beta.yml`, which only `workflow_call`s), never on a
+/// pull request.
+const PR_RUNNER_LABELS: &[&str] = &[
+    "ubuntu-slim",
+    "ubuntu-latest",
+    "ubuntu-26.04",
+    "ubuntu-24.04",
+    "ubuntu-22.04",
 ];
 
 /// The keys GitHub reads at the top of an action file.
@@ -465,6 +481,7 @@ fn run(text: &str, repo: &Repo, check: impl FnOnce(&mut Lint<'_>, &Node)) -> Vec
         repo,
         out: Vec::new(),
         hostkeeper: hostkeeper::is_named(&root),
+        pr_triggered: false,
     };
     lint.every_node(&root);
     check(&mut lint, &root);
@@ -481,6 +498,9 @@ struct Lint<'a> {
     out: Vec<String>,
     /// Whether the workflow is the one that sets hostkeeper's desired version ([`hostkeeper`]).
     hostkeeper: bool,
+    /// Whether the workflow runs on `pull_request` or `merge_group`: every job of it then runs
+    /// on a Linux x86_64 hosted runner ([`PR_RUNNER_LABELS`]).
+    pr_triggered: bool,
 }
 
 impl Lint<'_> {
@@ -537,7 +557,10 @@ impl Lint<'_> {
                 .push("line 0: no top-level `permissions: {}`".to_owned()),
         }
         match get(top, "on") {
-            Some(on) => self.triggers(on),
+            Some(on) => {
+                self.pr_triggered = names_pr_event(on);
+                self.triggers(on);
+            }
             None => self.out.push("line 0: no `on:` triggers".to_owned()),
         }
         match get(top, "jobs") {
@@ -762,6 +785,16 @@ impl Lint<'_> {
                 label,
                 format_args!("runs-on from an expression cannot be evaluated, got `{v}`"),
             ),
+            Some(v)
+                if self.pr_triggered && !PR_RUNNER_LABELS.contains(&v) && is_hosted_label(v) =>
+            {
+                self.refuse(
+                    label,
+                    format_args!(
+                        "a workflow that runs on `pull_request` or `merge_group` runs on Linux x86_64 hosted runners only, got `{v}`; other platforms are a beta stage of the pipeline (beta.yml)"
+                    ),
+                );
+            }
             Some(v) if is_hosted_label(v) => {}
             Some(v) => self.refuse(
                 label,
@@ -892,6 +925,19 @@ fn is_lower_hex(s: &str, len: usize) -> bool {
 
 pub fn is_hosted_label(v: &str) -> bool {
     HOSTED_LABELS.contains(&v)
+}
+
+/// Whether the `on:` node names `pull_request` or `merge_group` (a string, a list or a mapping).
+fn names_pr_event(on: &Node) -> bool {
+    let is_pr = |n: &Node| {
+        n.as_str()
+            .is_some_and(|n| matches!(n.trim(), "pull_request" | "merge_group"))
+    };
+    match &on.value {
+        Value::Scalar { .. } => is_pr(on),
+        Value::Seq(items) => items.iter().any(is_pr),
+        Value::Map(entries) => entries.iter().any(|(k, _)| is_pr(k)),
+    }
 }
 
 /// Whether the remote action `owner/repository[/path][@ref]` is one the repository's

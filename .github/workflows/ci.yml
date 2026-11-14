@@ -1,12 +1,13 @@
 # The pull-request gate: the required checks `lint` and `test`; `test` is the coverage gate, and the
-# tests it measures run beside it in the matrix job `test-shard`. `task-macos` runs after the merge
-# and in the merge queue; every pull request runs the macOS tests in macos-pr.yml. GitHub-hosted
+# tests it measures run beside it in the matrix job `test-shard`. Every job runs on a Linux x86_64
+# hosted runner: a pull request and a merge queue entry run the Linux x86_64 tests and nothing on
+# macOS or Arm (the workflow lint refuses another runner here), and the other platforms' tests are
+# the beta stage of the pipeline (beta.yml). GitHub-hosted
 # runners only; the repository lints in crates/kbf-integration-test/tests/repo_lints.rs hold every
 # workflow to that, to commit-SHA pinned actions from the set the repository's Actions policy
 # allows (actions/* and tailscale/github-action), and to a top-level `permissions: {}`.
 #
-# A pull request runs this, and macos-pr.yml (the macOS tests and the root and device steps of
-# beta.yml's `native-macos`). The rest of the suite (the slow tests, the Arm run, the
+# A pull request runs this alone. The rest of the suite (the slow tests, the Arm run, the
 # jobs that need a service, root, crun or a Mac, the packages and the beta smoke) runs on a
 # push to main, in beta.yml. On a push to main this workflow is the first stage of the one
 # pipeline (pipeline.yml calls it, `workflow_call`), so the merged result meets the same gate
@@ -112,17 +113,17 @@ jobs:
         if: ${{ !cancelled() }}
       - run: rustup target add aarch64-apple-darwin
         if: ${{ !cancelled() }}
-      # The targets the macOS jobs of every workflow compile (beta.yml's native-macos,
-      # artifacts.yml's darwin-arm64, mac-provision.yml, host-install-mac.yml, vmm-probe.yml), as
+      # The targets the macOS jobs compile (beta.yml's native-macos, host-install-mac,
+      # mac-provision and vmm-probe, artifacts.yml's darwin-arm64), as
       # they name them: a crate's other test targets (kbf-cli's harness tests, for one) are
       # Linux-only and never built on a Mac. Linking and doc tests are not checked: `cargo check`
       # compiles each crate and stops. The cc crate's own flags include
       # `--target=arm64-apple-macosx`, which Zig refuses (its compiler-family probe runs the
       # program without `cc`, so it takes Zig for clang); without them (CRATE_CC_NO_DEFAULTS) Zig
       # gets its own `-target` and each build script's flags.
-      # The crates a Mac job tests whole: every test target, and the libraries' unit tests
-      # (macos-pr.yml's `macos-test` tests these on every pull request; the repository lint
-      # `macos_pr` requires each crate it tests whole to be here).
+      # The crates a Mac job tests whole: every test target, and the libraries' unit tests. No
+      # pull request runs a Mac, so this check on Linux is what makes a macOS-only compile error
+      # red on the pull request instead of in the beta stage after the merge.
       - name: Check for aarch64-apple-darwin the tests of the crates the Mac jobs test whole
         if: ${{ !cancelled() }}
         env:
@@ -609,42 +610,6 @@ jobs:
       # this run's workspace coverage artifacts.
       - if: ${{ github.event_name == 'push' && steps.cargo-cache.outputs.cache-hit != 'true' }}
         run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov clean --workspace
-      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: ${{ github.event_name == 'push' && steps.cargo-cache.outputs.cache-hit != 'true' }}
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
-
-  # The task runner's tests on a hosted Mac, without its test-only feature: they run the Command
-  # under the macOS confine for real (a denied Command's connect is refused, a credential file is
-  # unreadable, an allowed Command runs). Tests only: no binary of it is built for release here.
-  # After the merge (the pipeline's call) and in the merge queue only: a pull request runs the
-  # same tests in macos-pr.yml's `macos-test`, so it does not run them twice.
-  task-macos:
-    if: ${{ github.event_name != 'pull_request' }}
-    runs-on: macos-latest
-    timeout-minutes: 45
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - run: rustup toolchain install
-      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        id: cargo-cache
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
-          restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
-      - run: sw_vers
-      - run: cargo test -p kbf-task --locked --no-fail-fast
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: ${{ github.event_name == 'push' && steps.cargo-cache.outputs.cache-hit != 'true' }}
         with:
