@@ -27,4 +27,23 @@ jobs:
         with:
           persist-credentials: false
       - run: rustup toolchain install
-      - run: cargo xtask crun-tests
+      - name: diag
+        run: |
+          grep -m1 -i version /proc/version; uname -r; cat /etc/image* 2>/dev/null | head -3; echo ImageVersion=$ImageVersion
+          sysctl kernel.apparmor_restrict_unprivileged_userns kernel.unprivileged_userns_clone user.max_user_namespaces || true
+          cat /sys/module/apparmor/parameters/enabled; sudo aa-status 2>&1 | head -30
+          ls -ld /home/runner /home/runner/work /home/runner/work/kbf/kbf; findmnt -T "$PWD" ; id; ls -l /usr/bin/crun /etc/apparmor.d | head -40; grep runner /etc/subuid /etc/subgid
+          ls /sys/kernel/security/apparmor/features 2>&1 | head
+      - run: rustup toolchain install
+      - run: cargo build -p xtask --locked
+      - run: cargo test -p kbf-integration-test --test executor_real_service_integration --locked --no-run
+      - name: fetch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cargo xtask fetch-pinned-js --pin kbf-js-version.toml --program js-agent --target x86_64-unknown-linux-musl --gh "$(command -v gh)" --dir target/tmp/js
+          cargo xtask fetch-pinned-js --pin kbf-js-version.toml --program js-lease-server --target x86_64-unknown-linux-musl --gh "$(command -v gh)" --dir target/tmp/js
+      - name: test
+        run: |
+          cargo xtask sudo-test -p kbf-integration-test --test executor_real_service_integration -- --test-threads=1 --nocapture 2>&1 | tail -60
+          sudo dmesg | grep -i -E "apparmor|denied" | tail -20 || true
