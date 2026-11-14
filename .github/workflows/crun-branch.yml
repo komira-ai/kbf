@@ -45,6 +45,7 @@ jobs:
           cargo xtask fetch-pinned-js --pin kbf-js-version.toml --program js-lease-server --target x86_64-unknown-linux-musl --gh "$(command -v gh)" --dir target/tmp/js
       - name: test
         run: |
+          grep " /run " /proc/mounts; sudo mount -o remount,exec /run; grep " /run " /proc/mounts
           cargo xtask sudo-test -p kbf-integration-test --test executor_real_service_integration -- --test-threads=1 --nocapture > t.log 2>&1 || true
           grep -E "test result|start-failed" t.log | sort | uniq -c | cut -c1-250
           sudo dmesg | grep -E 'apparmor="(DENIED|ALLOWED|AUDIT)"' | cut -c1-400 | tail -30
