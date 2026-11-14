@@ -22,6 +22,7 @@ use tonic::Status;
 use super::metrics::PackMetrics;
 use super::room::{Budget, DEFAULT_INFLIGHT_BYTES, Room};
 use super::verifying::VerifyingKeys;
+use crate::cache::is_empty_blob;
 use crate::large_backfill::LargeStore;
 
 /// The largest blob a frontend puts in a pack or serves from one by default: 64 MiB, the
@@ -321,14 +322,17 @@ impl Packs {
         checked.map_err(|error| error.to_string())
     }
 
-    /// The digests among `asked` that the index has no row for, in the order asked.
+    /// The digests among `asked` that the index has no row for, in the order asked. The empty
+    /// blob is never among them and is not asked of the index: it has no bytes to pack, and a
+    /// client may rely on every store holding it without ever uploading it (Buck2 does not).
     ///
     /// # Errors
     /// UNAVAILABLE when the index fails.
     pub async fn missing(&self, asked: &[Digest]) -> Result<Vec<Digest>, Status> {
         let mut absent = Vec::new();
-        for chunk in asked.chunks(MAX_BATCH) {
-            let wanted: Vec<BlobDigest> = chunk.iter().map(to_index).collect();
+        let unheld: Vec<&Digest> = asked.iter().filter(|d| !is_empty_blob(d)).collect();
+        for chunk in unheld.chunks(MAX_BATCH) {
+            let wanted: Vec<BlobDigest> = chunk.iter().copied().map(to_index).collect();
             let index = Arc::clone(&self.index);
             let lacking = offload(move || index.find_missing(&wanted)).await;
             absent.extend(lacking.map_err(index_failed)?.iter().map(from_index));
@@ -437,17 +441,23 @@ impl Packs {
     /// The blobs `digests` from their packs, one answer each in the order asked, as
     /// [`Packs::read`] answers. The blobs within [`Packs::max_blob_bytes`] are read together,
     /// so that the index is asked once for the batch and blobs that lie close together in a
-    /// pack are one request; a larger blob is `Ok(None)` and is not asked for. When the index
-    /// or the store fails, each blob that was asked for is that failure.
+    /// pack are one request; a larger blob is `Ok(None)` and is not asked for. The empty blob is
+    /// served with no bytes without asking the index or the store ([`Packs::missing`] holds it
+    /// too). When the index or the store fails, each blob that was asked for is that failure.
     pub async fn read_many(&self, digests: &[Digest]) -> Vec<Result<Option<Bytes>, Status>> {
-        let inside: Vec<&Digest> = digests.iter().filter(|d| self.fits(d)).collect();
+        let inside: Vec<&Digest> = digests
+            .iter()
+            .filter(|d| self.fits(d) && !is_empty_blob(d))
+            .collect();
         let asked: Vec<BlobDigest> = inside.iter().copied().map(to_index).collect();
         let read = self.store.read(&asked).await;
         let mut served = self.served(&inside, read).into_iter();
         digests
             .iter()
             .map(|digest| {
-                if self.fits(digest) {
+                if is_empty_blob(digest) {
+                    Ok(Some(Bytes::new()))
+                } else if self.fits(digest) {
                     served.next().unwrap_or(Ok(None))
                 } else {
                     Ok(None)

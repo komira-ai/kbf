@@ -23,5 +23,6 @@ mod backend;
 mod bytestream;
 mod cas;
 mod denied;
+mod empty_blob;
 mod large;
 mod rig;
