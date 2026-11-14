@@ -484,6 +484,33 @@ fn plain_text_off_loopback_checks_each_listener_through_loopback_only() {
     }
 }
 
+/// Asserts that `--worker-listen` is optional on the arguments: left out it is `None` (which
+/// `kbf frontend` reads as no worker listener) and the listeners every other mode serves are
+/// on 127.0.0.1:8981 as they always were, with nothing plain off loopback to warn of; given, it
+/// is the address, in the listeners too. Catches: a default that comes back to the argument
+/// (the frontend would bind a listener nobody asked for), and one that leaves the other modes
+/// with no worker address.
+#[test]
+fn the_worker_listener_is_optional_and_defaults_to_loopback_for_the_other_modes() {
+    let left_out = Args::parse_from(["kbf-server"]);
+    assert_eq!(left_out.worker_listen, None);
+    let listeners = left_out.listeners().expect("listeners");
+    assert_eq!(listeners.worker, "127.0.0.1:8981".parse().expect("address"));
+    assert!(left_out.plain_text_off_loopback().is_empty());
+
+    let given = Args::parse_from(["kbf-server", "--worker-listen=192.0.2.10:9981"]);
+    assert_eq!(
+        given.worker_listen,
+        Some("192.0.2.10:9981".parse().expect("address"))
+    );
+    let listeners = given.listeners().expect("listeners");
+    assert_eq!(
+        listeners.worker,
+        "192.0.2.10:9981".parse().expect("address")
+    );
+    assert_eq!(given.plain_text_off_loopback(), ["worker"]);
+}
+
 /// The retired `--releases-dir` is read by nothing: a path that could never be made (here
 /// under a regular file) does not stop the operator API, and one that does not exist is not
 /// created.

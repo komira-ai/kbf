@@ -37,7 +37,10 @@ fn each_flag_reaches_its_half_once() {
         "--data-dir=/var/kbf",
     ])
     .expect("flags");
-    assert_eq!(flags.server.worker_listen.to_string(), "127.0.0.1:9981");
+    assert_eq!(
+        flags.server.worker_listen,
+        Some("127.0.0.1:9981".parse().unwrap())
+    );
     assert_eq!(flags.server.listen.to_string(), "127.0.0.1:9980");
     assert_eq!(flags.server.threads, kbf_threads::PoolArgs::default());
     let daemon = format!("{:?}", flags.daemon);

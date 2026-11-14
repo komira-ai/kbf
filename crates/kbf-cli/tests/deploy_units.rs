@@ -170,7 +170,10 @@ fn each_packaged_mode_unit_starts_its_own_mode_on_the_kbf_toml_setup_writes() {
                     ]
                 );
                 assert_eq!(flags.server.listen.to_string(), "0.0.0.0:8980");
-                assert_eq!(flags.server.worker_listen.to_string(), "0.0.0.0:8981");
+                assert_eq!(
+                    flags.server.worker_listen,
+                    Some("0.0.0.0:8981".parse().unwrap())
+                );
                 assert_eq!(
                     flags.server.api_listen.map(|a| a.to_string()).as_deref(),
                     Some("127.0.0.1:8982")

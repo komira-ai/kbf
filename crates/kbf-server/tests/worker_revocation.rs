@@ -149,7 +149,7 @@ impl Farm {
         let farm = Self {
             api: handle.api.expect("the operator API"),
             enroll: handle.enroll.expect("the enroll listener"),
-            worker: handle.worker,
+            worker: handle.worker.expect("a worker listener"),
             server_ca: ca.pem(),
             dir,
             _stop: stop,

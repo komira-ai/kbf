@@ -751,7 +751,7 @@ async fn a_storage_node_registers_with_a_frontend_and_is_in_its_map() {
         })
     })
     .expect("starts");
-    let worker = handle.worker;
+    let worker = handle.worker.expect("a worker listener");
     let serving = tokio::spawn(handle.serve());
 
     let url = format!("--frontend=http://{worker}");
