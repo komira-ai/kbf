@@ -73,10 +73,14 @@ publishes it itself, at its start, and no workflow or operator writes the store 
 
 **What must be in place before a frontend is switched:**
 
-- the directory `executor-base-tree` names holds the release's `SHA256SUMS` and the bundles
-  `kbf-base-tree-<commit>-linux-x86_64.tree.tar` and `kbf-base-tree-<commit>-linux-arm64.tree.tar`
-  of the commit the frontend's binary was built from, copied from that release's assets (no package
-  installs them, so the directory is updated with each upgrade of the frontend). The
+- the directory `executor-base-tree` is the frontend's cache and is **writable by the user the
+  frontend runs as** (uid 65532 in the container image: a read-only bind makes the first fetch fail).
+  Nothing has to be in it: the frontend fetches the release's `SHA256SUMS` and the bundle of its
+  `executor-arch` by the commit its binary was built from (`executor-base-tree-url`, kbf's own
+  releases by default), checks the bundle against the listed digest and keeps both in
+  `<dir>/<commit>/`, with the newest earlier release for a rollback (`executor-base-tree-keep`). A
+  directory staged by hand as earlier releases asked (the files loose in it) is used as it is. A
+  host with no route to the URL sets `executor-base-tree-url = ""` and stages the files. The
   switch does not write the key: `plan` names it as missing, and `apply`'s `kbf --check` and the
   first start refuse a file without it;
 - the frontend's pack store credentials (`--pack-store-credentials-file`) may write below
@@ -84,8 +88,8 @@ publishes it itself, at its start, and no workflow or operator writes the store 
   reads is copied to it), so a frontend that runs today needs nothing more.
 
 **What the start does.** Under `--executor js-agent`, after the pack store's create-only check and
-before the executor is spawned, the frontend reads the bundle of `linux-` and `executor-arch`
-(`x86_64` or `arm64`) and checks it against `SHA256SUMS`. It writes each object the store does not
+before the executor is spawned, the frontend takes the bundle of `linux-` and `executor-arch`
+(`x86_64` or `arm64`) from its cache, fetching it as above when the cache lacks it, and checks it against `SHA256SUMS`. It writes each object the store does not
 hold to `cas/l/<sha256>` (one length check each; an object already there is held, and a key that
 another writer takes meanwhile is held too), the root manifest last, and logs one line:
 `published the kbf base tree` with the root digest, the numbers written and held, and the tree's
@@ -98,7 +102,9 @@ exits with, and before any job is submitted:
 
 | the start says | what to do |
 |---|---|
-| the bundle `kbf-base-tree-<commit>-linux-<arch>.tree.tar` is missing | the release has no bundle for `executor-arch`, or the directory holds another release's files: copy this release's bundles and `SHA256SUMS` there |
+| the bundle `kbf-base-tree-<commit>-linux-<arch>.tree.tar` is missing (`executor-base-tree-url` empty) | the directory holds no bundle for `executor-arch` or holds another release's files: copy this release's bundles and `SHA256SUMS` there, or give the URL |
+| `<url>: ...` (a download), `no release lists both <bundle> and SHA256SUMS`, `not a list of releases`, or `<dir>...: Permission denied` | the fetch failed: the URL and the route to it and to the release's asset host, a release that is not on that list (a build that was never released), or a cache directory the frontend's user cannot write |
+| `the downloaded release files are refused: ... its SHA-256 is ..., but ... lists ...` | the download is not the listed bytes: nothing is kept, and the next start fetches again |
 | `<SHA256SUMS>` does not list it, lists it twice, has a line that is not `<sha256>  <name>`, or is missing | the directory is not a release's: copy the release's files again |
 | its SHA-256 is not the listed one | the file changed after the release was made: copy it again |
 | the bundle is of another commit or platform, or is not a bundle | the same |

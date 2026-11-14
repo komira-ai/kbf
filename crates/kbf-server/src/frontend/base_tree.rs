@@ -1,7 +1,8 @@
 //! The frontend's start publishing the kbf base tree (docs/design/actions-as-jobs.md, 3.3):
 //! under `--executor js-agent`, before the executor is spawned and so before any job names a
-//! tree, [`Start::publish`] reads the release's bundle for the executor's `--executor-arch` from
-//! `--executor-base-tree` ([`kbf_front::base_publish`]), writes the objects the pack store lacks
+//! tree, [`Start::publish`] reads the release's bundle for the executor's `--executor-arch` from the
+//! cache `--executor-base-tree` names, which fetches it by its release's digest when it lacks it
+//! ([`super::base_fetch`]), then publishes it ([`kbf_front::base_publish`]): it writes the objects the pack store lacks
 //! to `cas/l/`, and, with a state store, records the tree as `job-tree/<digest>`
 //! ([`crate::job_tree`]).
 //!
@@ -15,7 +16,6 @@
 //! ([`BaseTree`]) is set in the slot the executor writes its action trees over
 //! (`--task-out-mode put-dir`) before the executor is started.
 
-use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::time::SystemTime;
 
@@ -25,12 +25,13 @@ use kbf_front::base_publish::{Published, publish};
 use kbf_state::Store;
 
 use super::JsAgentFlags;
+use super::base_fetch::Cache;
 use crate::job_tree::{self, Recorded};
 use crate::serve::ServeError;
 
 /// What the publish needs, taken from the flags when the frontend is started.
 pub(super) struct Start {
-    dir: PathBuf,
+    cache: Cache,
     platform: String,
     packs: Packs,
     state: Option<Arc<dyn Store>>,
@@ -43,7 +44,12 @@ impl Start {
     /// published base in `js`'s slot for the executor ([`JsAgentFlags::published`]).
     pub(super) fn new(js: &JsAgentFlags, packs: Packs, state: Option<Arc<dyn Store>>) -> Self {
         Self {
-            dir: js.base_tree.clone(),
+            cache: Cache {
+                dir: js.base_tree.clone(),
+                url: js.base_tree_url.clone(),
+                keep: js.base_tree_keep,
+                timeout: js.base_tree_timeout,
+            },
             platform: format!("linux-{}", js.config.arch),
             packs,
             state,
@@ -65,7 +71,13 @@ impl Start {
     ) -> Result<Published, ServeError> {
         let refused = |why: &dyn std::fmt::Display| ServeError::BaseTree(why.to_string());
         let packs = Arc::new(self.packs);
-        let published = publish(&self.dir, commit, &self.platform, packs)
+        let (dir, origin) = self
+            .cache
+            .ensure(commit, &self.platform)
+            .await
+            .map_err(|why| refused(&why))?;
+        tracing::info!(dir = %dir.display(), ?origin, "the kbf base tree bundle is ready");
+        let published = publish(&dir, commit, &self.platform, packs)
             .await
             .map_err(|why| refused(&why))?;
         let root = published.root.hash_hex();

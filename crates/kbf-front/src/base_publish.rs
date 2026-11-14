@@ -254,6 +254,34 @@ pub async fn publish(
     written
 }
 
+/// The name of the bundle of `commit` for `platform` in a release's directory.
+#[must_use]
+pub fn bundle_name(commit: &str, platform: &str) -> String {
+    file_name(commit, platform)
+}
+
+/// Whether `dir` holds what [`publish`] reads for `commit` and `platform`: a sums file that
+/// lists the bundle once, and a file of the bundle's name. Nothing is hashed (a cheap look, for
+/// a cache's hit; [`publish`] hashes the bundle before it reads it).
+#[must_use]
+pub fn is_staged(dir: &Path, commit: &str, platform: &str) -> bool {
+    let name = file_name(commit, platform);
+    listed_digest(&dir.join(SUMS), &name).is_ok() && dir.join(name).is_file()
+}
+
+/// Checks the bundle of `commit` for `platform` in `dir` against the sums file there: listed
+/// once and hashing to the listed digest. Blocks while it hashes.
+///
+/// # Errors
+/// A [`PublishError`]: the sums file or the bundle is missing, the sums file does not list the
+/// bundle or lists other bytes.
+pub fn verify(dir: &Path, commit: &str, platform: &str) -> Result<(), PublishError> {
+    let name = file_name(commit, platform);
+    let sums = dir.join(SUMS);
+    let listed = listed_digest(&sums, &name)?;
+    checked_file(&dir.join(name), &sums, &listed).map(drop)
+}
+
 /// Runs `work`, which blocks, on the runtime's blocking pool.
 async fn blocking<T: Send + 'static>(
     work: impl FnOnce() -> Result<T, PublishError> + Send + 'static,

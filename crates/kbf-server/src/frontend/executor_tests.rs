@@ -157,6 +157,8 @@ pub(super) fn flag_list(
     more.extend(beside_flags(dir));
     more.extend([
         format!("--executor-base-tree={}", base_tree.display()),
+        // No fetch: a test never dials a release page.
+        "--executor-base-tree-url=".to_owned(),
         format!("--executor-job-url={}", fake.origin()),
         format!("--executor-job-token-file={}", token.display()),
         "--executor-frontend-id=front-1".to_owned(),

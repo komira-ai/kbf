@@ -64,6 +64,12 @@ const DELIVERY: &str = "executor_secret_delivery";
 const BASE_IMAGE: &str = "executor_base_image";
 const KBF_IMAGE: &str = "executor_kbf_image";
 const BASE_TREE: &str = "executor_base_tree";
+const BASE_TREE_URL: &str = "executor_base_tree_url";
+const BASE_TREE_KEEP: &str = "executor_base_tree_keep";
+const BASE_TREE_TIMEOUT: &str = "executor_base_tree_timeout_secs";
+/// The default of `--executor-base-tree-url`: the releases of kbf's own repository.
+pub(super) const DEFAULT_BASE_TREE_URL: &str =
+    "https://api.github.com/repos/komira-ai/kbf/releases";
 const MARGIN: &str = "executor_run_margin_secs";
 const MAX_RUN: &str = "executor_max_run_secs";
 const DEFAULT_TIMEOUT: &str = "executor_default_timeout_secs";
@@ -301,17 +307,53 @@ pub(super) fn args() -> Vec<Arg> {
             .value_name("DIR")
             .value_parser(clap::value_parser!(PathBuf))
             .help(
-                "The directory holding the release's `SHA256SUMS` and its \
-                 `kbf-base-tree-<commit>-linux-<arch>.tree.tar` bundles, one per platform, \
-                 copied from the release's assets. At its start the frontend checks \
-                 the bundle of `--executor-arch` against `SHA256SUMS` and writes the objects of \
-                 the kbf base tree that the pack store lacks to `cas/l/`, create-only, so the \
-                 pack store credentials must be allowed to write there; it then records the \
-                 tree as `job-tree/<digest>` in `--state-store` if there is one. A bundle that \
-                 is missing, not listed or not the listed bytes, or a write that fails, fails \
-                 the start, naming this flag. Needed with `--executor js-agent`; with \
-                 `--executor kbf-daemon` nothing is read or written",
+                "The frontend's cache of the release's kbf base tree: a directory the frontend \
+                 may write (the user the frontend runs as). The release's `SHA256SUMS` and its \
+                 `kbf-base-tree-<commit>-linux-<arch>.tree.tar` bundle of `--executor-arch` are \
+                 kept in `<DIR>/<commit>/`; when `<DIR>` holds neither that nor the same two \
+                 files loose (copied by hand, as an earlier release asked), the frontend \
+                 fetches them from the release (`--executor-base-tree-url`), checks the bundle \
+                 against the release's `SHA256SUMS` and only then puts them in the cache, \
+                 keeping the newest older releases for a rollback \
+                 (`--executor-base-tree-keep`). It then writes the objects of the kbf base tree \
+                 that the pack store lacks to `cas/l/`, create-only, so the pack store \
+                 credentials must be allowed to write there, and records the tree as \
+                 `job-tree/<digest>` in `--state-store` if there is one. A bundle that cannot be \
+                 had, is not listed or not the listed bytes, or a write that fails, fails the \
+                 start, naming this flag. Needed with `--executor js-agent`; with \
+                 `--executor kbf-daemon` nothing is read, fetched or written",
             ),
+        text(
+            BASE_TREE_URL,
+            "executor-base-tree-url",
+            "URL",
+            "Where the release's base tree files are looked up when `--executor-base-tree` \
+             lacks them: a list of releases in the shape of GitHub's `GET \
+             /repos/<owner>/<repo>/releases` (an array, each release with `assets` of `name` \
+             and `browser_download_url`), read a page at a time (`?per_page=100&page=N`) until a \
+             release lists the bundle and the `SHA256SUMS`. https, or http on loopback. Empty \
+             fetches nothing: the files must then be in `--executor-base-tree` already. Used \
+             only with `--executor js-agent`",
+        )
+        .default_value(DEFAULT_BASE_TREE_URL),
+        Arg::new(BASE_TREE_KEEP)
+            .long("executor-base-tree-keep")
+            .value_name("RELEASES")
+            .value_parser(clap::value_parser!(usize))
+            .default_value("1")
+            .help(
+                "How many releases besides the running one stay in the `--executor-base-tree` \
+                 cache after a fetch, for a rollback of the frontend: the newest fetched. 0 \
+                 keeps none. Used only with `--executor js-agent`",
+            ),
+        number(
+            BASE_TREE_TIMEOUT,
+            "executor-base-tree-timeout-secs",
+            "How long the fetch of the base tree files waits, in seconds, for a connection, for \
+             the head of an answer and between two chunks of a body (a stall, not the whole \
+             download). Used only with `--executor js-agent`",
+            "60",
+        ),
         number(
             MARGIN,
             "executor-run-margin-secs",
@@ -391,6 +433,13 @@ pub struct JsAgentFlags {
     /// `--executor-base-tree`: the directory of the release's `SHA256SUMS` and base tree
     /// bundles.
     pub base_tree: PathBuf,
+    /// `--executor-base-tree-url`: the releases list the bundle is fetched from; empty fetches
+    /// nothing.
+    pub base_tree_url: String,
+    /// `--executor-base-tree-keep`: the older releases the cache keeps.
+    pub base_tree_keep: usize,
+    /// `--executor-base-tree-timeout-secs`.
+    pub base_tree_timeout: Duration,
     /// Where the base tree published from [`JsAgentFlags::base_tree`] is set when the frontend
     /// starts: what the executor writes its action trees over (`--task-out-mode put-dir`).
     pub published: Arc<OnceLock<BaseTree>>,
@@ -554,6 +603,12 @@ fn js_agent_flags(m: &ArgMatches) -> Result<JsAgentFlags, String> {
         base_image,
         kbf_image,
         base_tree: m.get_one::<PathBuf>(BASE_TREE).cloned().unwrap_or_default(),
+        base_tree_url: one(BASE_TREE_URL),
+        base_tree_keep: m
+            .get_one::<usize>(BASE_TREE_KEEP)
+            .copied()
+            .unwrap_or_default(),
+        base_tree_timeout: secs(BASE_TREE_TIMEOUT),
         published: Arc::default(),
     })
 }

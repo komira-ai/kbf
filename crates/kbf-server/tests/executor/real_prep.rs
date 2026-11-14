@@ -162,6 +162,7 @@ impl World {
             format!("--executor-base-image={IMAGE}"),
             format!("--executor-kbf-image={KBF_IMAGE}"),
             "--executor-base-tree=/nowhere/base-tree".to_owned(),
+            "--executor-base-tree-url=".to_owned(),
             "--executor-allow-plain-http-put".to_owned(),
         ];
         let matches = frontend::command()
