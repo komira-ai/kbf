@@ -12,17 +12,22 @@
 //!    releases list the URL gives (GitHub's `GET /repos/<owner>/<repo>/releases` shape: an array
 //!    of releases, each with `assets` of `name` and `browser_download_url`) by the bundle's
 //!    file name, which holds the commit. The release's `SHA256SUMS` and the bundle are downloaded
-//!    to `<cache>/.fetch-<commit>/`, the bundle is hashed against the sums file there
+//!    to `<cache>/.fetch-<commit>-<instance>/`, a directory of this process alone (two frontends
+//!    of one host share the cache), the bundle is hashed against the sums file there
 //!    ([`kbf_front::base_publish::verify`]), and only then is the directory renamed to
 //!    `<cache>/<commit>/`. A download that stops, or hashes to another digest, is removed with
-//!    its directory, so a partial file is never in a place anything reads.
+//!    its directory, so a partial file is never in a place anything reads. When another process
+//!    renamed its own verified download to `<cache>/<commit>/` first, that directory is the
+//!    release: this process keeps it as it is and removes its own download.
 //!
 //! After a fetch the cache keeps this release and the `--executor-base-tree-keep` newest others
-//! (a rollback to one of them fetches nothing) and removes the rest; a failure to remove is
-//! logged, not an error. The digest the bundle is checked against is the one `SHA256SUMS` of
-//! the same release lists, over https from the release's own page: the same file an operator
-//! used to copy by hand.
+//! (a rollback to one of them fetches nothing) and removes the rest, and the downloads of a
+//! stopped start once they are a day old (a younger one may be another process's, filling);
+//! a failure to remove is logged, not an error. The digest the bundle is checked against is the
+//! one `SHA256SUMS` of the same release lists, over https from the release's own page: the same
+//! file an operator used to copy by hand.
 
+use std::hash::{BuildHasher, RandomState};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -39,6 +44,10 @@ const PER_PAGE: u32 = 100;
 
 /// The prefix of the directory a download is made in.
 const STAGING: &str = ".fetch-";
+
+/// How old a download directory is before [`prune`] takes it for one a stopped start left: a
+/// live download of another process is younger.
+const STALE_STAGING: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Where a bundle came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -88,6 +97,8 @@ pub(super) struct Cache {
     pub(super) keep: usize,
     /// `--executor-base-tree-timeout-secs`: each connect, response head and body stall.
     pub(super) timeout: Duration,
+    /// This process's id in the names of its download directories ([`new_instance`]).
+    pub(super) instance: String,
 }
 
 impl Cache {
@@ -121,7 +132,7 @@ impl Cache {
     /// the directory to `<cache>/<commit>/`.
     async fn fetch(&self, commit: &str, platform: &str, name: &str) -> Result<(), FetchError> {
         let (bundle_url, sums_url) = self.locate(name).await?;
-        let staging = self.dir.join(format!("{STAGING}{commit}"));
+        let staging = self.dir.join(format!("{STAGING}{commit}-{}", self.instance));
         let release = self.dir.join(commit);
         let downloaded = self
             .download(&staging, &[(&sums_url, SUMS), (&bundle_url, name)])
@@ -135,11 +146,15 @@ impl Cache {
             let _ = tokio::fs::remove_dir_all(&staging).await;
             return Err(why);
         }
-        // A directory in the way is a release that failed its own check.
-        clear(&release).await?;
-        tokio::fs::rename(&staging, &release)
-            .await
-            .map_err(io(&release))?;
+        if !self.place(&staging, &release, commit, platform).await? {
+            tracing::info!(
+                commit,
+                platform,
+                dir = %release.display(),
+                "another process put the kbf base tree bundle into the cache first; using it"
+            );
+            return Ok(());
+        }
         tracing::info!(
             commit,
             platform,
@@ -149,9 +164,43 @@ impl Cache {
         Ok(())
     }
 
+    /// Renames the checked `staging` to `release`. Gives `false` when `release` already held the
+    /// files, whoever put them there (another process that finished first): that directory is
+    /// kept as it is and `staging` is removed. A `release` that does not hold them is a failed
+    /// one and is replaced.
+    async fn place(
+        &self,
+        staging: &Path,
+        release: &Path,
+        commit: &str,
+        platform: &str,
+    ) -> Result<bool, FetchError> {
+        let mut failed = None;
+        for _ in 0..2 {
+            // A rename onto a directory that holds files fails, so a release another process
+            // finished is never replaced, and none is cleared before this has failed.
+            match tokio::fs::rename(staging, release).await {
+                Ok(()) => return Ok(true),
+                Err(e) => failed = Some(e),
+            }
+            if base_publish::is_staged(release, commit, platform) {
+                failed = None;
+                break;
+            }
+            // What is in the way is a release that failed its own check.
+            clear(release).await?;
+        }
+        if let Some(e) = failed {
+            return Err(io(release)(e));
+        }
+        let _ = tokio::fs::remove_dir_all(staging).await;
+        Ok(false)
+    }
+
     /// Makes `staging` new and downloads each `(url, file name)` into it.
     async fn download(&self, staging: &Path, files: &[(&str, &str)]) -> Result<(), FetchError> {
-        // What an earlier start that stopped left.
+        // What an earlier start of this process's name left (an id is drawn at every start, so
+        // this is only a name that was drawn twice).
         clear(staging).await?;
         tokio::fs::create_dir_all(staging)
             .await
@@ -223,7 +272,10 @@ impl Cache {
     async fn prune(&self, commit: &str) {
         let dir = self.dir.clone();
         let (keep, commit) = (self.keep, commit.to_owned());
-        let pruned = tokio::task::spawn_blocking(move || prune(&dir, &commit, keep)).await;
+        let pruned = tokio::task::spawn_blocking(move || {
+            prune(&dir, &commit, keep, SystemTime::now(), STALE_STAGING)
+        })
+        .await;
         match pruned {
             Ok(Ok(removed)) => {
                 for path in removed {
@@ -236,6 +288,13 @@ impl Cache {
             Err(stopped) => tracing::warn!(%stopped, "the base tree cache was not pruned"),
         }
     }
+}
+
+/// A new process's instance id: 128 random bits as 32 hex digits, from two hashers the standard
+/// library keys from the operating system's random source (as `kbf-daemon`'s instance id is).
+pub(super) fn new_instance() -> String {
+    let half = || RandomState::new().hash_one(std::process::id());
+    format!("{:016x}{:016x}", half(), half())
 }
 
 /// The error of a failed file operation on `path`.
@@ -280,11 +339,18 @@ fn is_commit(text: &str) -> bool {
 }
 
 /// Removes from `dir` the commit directories but `commit` and the `keep` newest others (by the
-/// time each was last changed), and the downloads of [`STAGING`]. Gives what it removed.
+/// time each was last changed), and the downloads of [`STAGING`] last changed `stale` or more
+/// before `now`: a younger one may be another process's, filling. Gives what it removed.
 ///
 /// # Errors
 /// The first path that could not be read or removed, with what failed.
-fn prune(dir: &Path, commit: &str, keep: usize) -> Result<Vec<PathBuf>, String> {
+fn prune(
+    dir: &Path,
+    commit: &str,
+    keep: usize,
+    now: SystemTime,
+    stale: Duration,
+) -> Result<Vec<PathBuf>, String> {
     let failed = |path: &Path, e: io::Error| format!("{}: {e}", path.display());
     let mut others: Vec<(SystemTime, PathBuf)> = Vec::new();
     let mut removable: Vec<PathBuf> = Vec::new();
@@ -293,7 +359,12 @@ fn prune(dir: &Path, commit: &str, keep: usize) -> Result<Vec<PathBuf>, String> 
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
         if name.starts_with(STAGING) {
-            removable.push(path);
+            let changed = std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .map_err(|e| failed(&path, e))?;
+            if now.duration_since(changed).is_ok_and(|age| age >= stale) {
+                removable.push(path);
+            }
         } else if name != commit && is_commit(&name) && path.is_dir() {
             let changed = std::fs::metadata(&path)
                 .and_then(|m| m.modified())
