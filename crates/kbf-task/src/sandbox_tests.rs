@@ -267,6 +267,47 @@ mod linux {
         assert_eq!(held, 3);
     }
 
+    /// Catches a tree job's covers reaching what its Command and the relay run from. A tree job
+    /// (`--tree=/`, the input root `/work`) hides the grants, the task's run directory and the put
+    /// directory, and nothing above or around `work` or `.kbf-tools` (the relay, this binary): the
+    /// tree here is a directory with the same names, so the covers are exactly those three, none
+    /// is `/`, an ancestor of the program or of the relay, and the program's directory is not
+    /// bound over.
+    #[test]
+    fn a_tree_jobs_covers_leave_the_program_and_the_relay_visible() {
+        let dir = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "kbf-task-layout-tree");
+        let tree = std::fs::canonicalize(&*dir).unwrap();
+        let program_dir = tree.join("work/buck-out/v2/art/komira/h/tools/__busybox__");
+        let relay_dir = tree.join(".kbf-tools");
+        let (grants, run_dir, out) = (
+            tree.join("run/js-files"),
+            tree.join(".kbf-run"),
+            tree.join("out"),
+        );
+        let private = run_dir.join("private");
+        for d in [&program_dir, &relay_dir, &grants, &private, &out] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let work = tree.join("work");
+        let hidden = [grants.clone(), run_dir.clone(), out.clone()];
+        let (got, _) = shapes(layout(&hidden, &private, &work, &work).unwrap());
+        let covers: Vec<&PathBuf> = got
+            .iter()
+            .filter_map(|shape| match shape {
+                Shape::Cover(dir) => Some(dir),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(covers, [&grants, &run_dir, &out]);
+        for cover in covers {
+            assert_ne!(cover, Path::new("/"));
+            for visible in [&program_dir, &relay_dir.join("kbf-task")] {
+                assert!(!visible.starts_with(cover), "{cover:?} hides {visible:?}");
+            }
+        }
+        assert_eq!(got.last(), Some(&Shape::Chdir(work)));
+    }
+
     /// Catches two system paths that are one directory (`/var/tmp` a symlink to `/tmp`) both
     /// being bound, the second hiding the first, which is the directory `TMPDIR` names: the
     /// first is bound, the second left out.
