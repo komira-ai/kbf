@@ -15,7 +15,7 @@ use super::engine::{Adapter, Engine};
 use super::side::Side;
 use crate::action_usage::Measured;
 use crate::learned::{
-    Attempt, BATCH, Row, Skip, Unset, basis_of_os, hint_of, key_of, kill_run, run_of,
+    Attempt, Samples, Skip, Unset, basis_of_os, hint_of, key_of, kill_run, run_of,
 };
 use crate::machine::Platform;
 use crate::run_record;
@@ -207,10 +207,11 @@ impl Engine {
         });
     }
 
-    /// Writes `rows`, size summaries, on a best-effort basis: a store that refuses them is
-    /// logged and their keys are written again from their newest summary at a later tick.
-    /// It never marks the store unreachable and never changes what the scheduler wrote.
-    pub(super) fn write_estimates(&mut self, a: &mut dyn Adapter, rows: &[Row]) {
+    /// Adds `rows`, the runs the size summaries are owed, to the stored summaries on a
+    /// best-effort basis: a store that refuses them is logged and the runs are offered
+    /// again at a later tick. It never marks the store unreachable and never changes what
+    /// the scheduler wrote.
+    pub(super) fn write_estimates(&mut self, a: &mut dyn Adapter, rows: &[Samples]) {
         let Some(durable) = self
             .durable
             .as_ref()
@@ -222,14 +223,14 @@ impl Engine {
             return;
         }
         let mut refused = Vec::new();
-        for chunk in rows.chunks(BATCH) {
-            if let Err(error) = durable.put_estimates(chunk) {
+        for samples in rows {
+            if let Err(error) = durable.add_samples(samples) {
                 // A newer writer holds the store: nothing more is written, nor kept.
                 if durable.superseded_by(&error) {
                     return;
                 }
                 tracing::warn!(%error, "size summaries were not written");
-                refused.extend_from_slice(chunk);
+                refused.push(samples.clone());
             }
         }
         a.estimates_refused(&refused);

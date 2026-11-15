@@ -62,6 +62,7 @@ pub(super) trait Ext: Send + Sync {
     fn estimates(&self, store: &dyn Store) -> Result<Vec<Row>, StateError>;
 
     /// `txn`, and the put of the size summaries `rows`.
+    #[cfg(test)]
     fn put_estimates(&self, txn: Txn, rows: &[Row]) -> Txn;
 
     /// The size summary rows idle past the estimator's stale days on `today`, to delete, and
@@ -150,6 +151,7 @@ impl Ext for KbfRows {
         Ok(rows)
     }
 
+    #[cfg(test)]
     fn put_estimates(&self, mut txn: Txn, rows: &[Row]) -> Txn {
         for (key, summary) in rows {
             txn = txn.put(estimate::row_key(key), estimate::encode(summary), Cond::Any);

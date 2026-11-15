@@ -2117,7 +2117,7 @@ fn a_store_that_refuses_the_size_rows_still_settles_the_requeue() {
 fn a_fenced_farm_writes_no_size_rows_and_a_refused_batch_is_kept_for_later() {
     let store = Flaky::new();
     let (farm, key) = farm_with_a_kill(&store);
-    let row = (key.clone(), size_row(&key, today()));
+    let row = super::merge_tests::size_samples(&key);
     farm.lock().fenced = true;
     farm.lock().write_estimates(std::slice::from_ref(&row));
     farm.lock().flush_learned();
@@ -2470,7 +2470,7 @@ fn a_refused_sweep_batch_does_not_stop_the_others() {
 fn a_fenced_refusal_of_size_rows_ends_the_writing() {
     let store = Flaky::new();
     let (farm, key) = farm_with_a_kill(&store);
-    let row = (key.clone(), size_row(&key, today()));
+    let row = super::merge_tests::size_samples(&key);
     store.fence_est.store(true, Ordering::SeqCst);
     farm.lock().write_estimates(std::slice::from_ref(&row));
     assert_eq!(store.est_writes.load(Ordering::SeqCst), 1);

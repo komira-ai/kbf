@@ -943,7 +943,7 @@ impl State {
         self.engine.settle_requeues(&mut self.side, given_up);
     }
 
-    fn write_estimates(&mut self, rows: &[crate::learned::Row]) {
+    fn write_estimates(&mut self, rows: &[crate::learned::Samples]) {
         self.engine.write_estimates(&mut self.side, rows);
     }
 

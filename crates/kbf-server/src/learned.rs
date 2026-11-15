@@ -40,12 +40,16 @@
 //! The summaries live in memory and in the state store, one `est/` row per key (a version
 //! byte, then the estimator's own checksummed row). They are never part of a requeue's
 //! transaction: an error of the estimator's rows must not change what the scheduler
-//! does. A summary an own-limit kill changed is written right after the requeue (or the
-//! final failure) commits, on a best-effort basis: a refused write is logged, never
-//! retried into the requeue, and the key is written again with its newest summary by the
-//! write-behind; only a crash in that window loses the kill's floor. The rest is written
-//! behind: dirty keys are batched every few seconds, and an hourly sweep, a few hundred
-//! rows at a tick, drops the rows (and the samples) the estimator calls stale. Time is the farm's: the day of a result is the wall time the
+//! does. The store's rows are not written from memory: the runs seen since a key was last
+//! written are kept ([`Sample`]), and a write reads the stored rows, applies those runs to
+//! them and writes the result with the version read, reading again when another writer got
+//! there first, so two frontends' samples of one key both survive. The runs an own-limit
+//! kill adds are written right after the requeue (or the final failure) commits, on a
+//! best-effort basis: a refused write is logged, never retried into the requeue, and its
+//! runs are offered again by the write-behind; only a crash in that window loses the kill's
+//! floor. The rest is written behind: keys with runs owed are batched every few seconds,
+//! and an hourly sweep, a few hundred rows at a tick, drops the rows (and the samples) the
+//! estimator calls stale. Time is the farm's: the day of a result is the wall time the
 //! farm was built at plus its [`FarmTime`], never a clock read here, and it never runs
 //! backward.
 //!
@@ -90,12 +94,20 @@ pub enum LearnedSizes {
 const DAY_MS: u64 = 86_400_000;
 /// Rows written at once.
 pub(crate) const BATCH: usize = 256;
-/// How long dirty keys wait before they are written.
+/// How long keys with runs owed wait before they are written.
 const FLUSH_EVERY_MS: u64 = 5_000;
 /// How often the stale rows are swept.
 const SWEEP_EVERY_MS: u64 = 3_600_000;
+/// Runs held per key for a store that does not take them; the oldest go first.
+const PENDING_CAP: usize = 1_024;
 /// Leases whose booking is remembered; the oldest go first.
 const STARTED_CAP: usize = 65_536;
+
+/// Drops the oldest of `runs` past [`PENDING_CAP`].
+fn cap(runs: &mut Vec<Sample>) {
+    let extra = runs.len().saturating_sub(PENDING_CAP);
+    runs.drain(..extra);
+}
 
 /// One attempt, as the estimator takes it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -132,6 +144,24 @@ pub enum Skip {
 /// A summary's row, as the state store keeps it.
 pub type Row = (Key, Vec<u8>);
 
+/// One finished run the store's summaries have not been shown yet: the run, the day it is
+/// counted on and the bounds it was judged against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Sample {
+    /// The run.
+    pub run: Run,
+    /// The day the run is counted on.
+    pub day: Day,
+    /// The bounds the run was observed under.
+    pub bounds: Bounds,
+}
+
+/// The runs of one attempt key, oldest first, that the stored summaries of the key and of
+/// its level 2 are owed. The store applies them to the rows it holds
+/// ([`crate::farm`] `Durable::add_samples`), so a row another frontend wrote keeps its
+/// samples.
+pub type Samples = (Key, Vec<Sample>);
+
 /// The learned-sizes state of a farm.
 #[derive(Debug)]
 pub struct Learned {
@@ -142,7 +172,8 @@ pub struct Learned {
     now: FarmTime,
     started: BTreeMap<LeaseId, Started>,
     staged: BTreeMap<LeaseId, Attempt>,
-    dirty: BTreeSet<Key>,
+    /// The runs each key's stored summaries are owed, until a write carrying them commits.
+    pending: BTreeMap<Key, Vec<Sample>>,
     tally: [[u64; 4]; 3],
     skipped: BTreeMap<Skip, u64>,
     calls: u64,
@@ -177,7 +208,7 @@ impl Learned {
             now: FarmTime::default(),
             started: BTreeMap::new(),
             staged: BTreeMap::new(),
-            dirty: BTreeSet::new(),
+            pending: BTreeMap::new(),
             tally: [[0; 4]; 3],
             skipped: BTreeMap::new(),
             calls: 0,
@@ -353,7 +384,7 @@ impl Learned {
     /// The scheduler gave up `lease` after an own-limit kill and will book `raised` next:
     /// the staged attempt is observed with that, and the rows of the summaries it changed
     /// are returned, for the caller to write after the requeue is settled.
-    pub fn requeued(&mut self, lease: LeaseId, raised: u64, bounds: &Bounds) -> Vec<Row> {
+    pub fn requeued(&mut self, lease: LeaseId, raised: u64, bounds: &Bounds) -> Vec<Samples> {
         self.forget(lease);
         // A kill is no run to compare: the operation's prediction waits for its next one.
         self.unstage_prediction(lease);
@@ -362,8 +393,7 @@ impl Learned {
         };
         attempt.run.raised_memory_bytes = Some(raised);
         self.observe_keyed(&attempt, bounds);
-        let touched = BTreeSet::from([attempt.key.clone(), attempt.key.l2()]);
-        self.rows_of(touched)
+        self.samples_of(BTreeSet::from([attempt.key.clone()]))
     }
 
     /// The scheduler has answered the report of `lease`: if it took it, the staged
@@ -371,7 +401,7 @@ impl Learned {
     ///
     /// Returns the rows of the summaries an own-limit kill changed (a kill that ended the
     /// operation, with no requeue), for the caller to write at once.
-    pub fn finish(&mut self, lease: LeaseId, taken: bool, bounds: &Bounds) -> Vec<Row> {
+    pub fn finish(&mut self, lease: LeaseId, taken: bool, bounds: &Bounds) -> Vec<Samples> {
         self.forget(lease);
         let compared = self.unstage_prediction(lease).filter(|_| taken);
         let attempt = self.staged.remove(&lease).filter(|_| taken);
@@ -387,7 +417,7 @@ impl Learned {
         if attempt.run.outcome != RunOutcome::OwnLimitKill {
             return Vec::new();
         }
-        self.rows_of(BTreeSet::from([attempt.key.clone(), attempt.key.l2()]))
+        self.samples_of(BTreeSet::from([attempt.key.clone()]))
     }
 
     /// [`Learned::observe`], noting the key floors its decay lowered.
@@ -419,8 +449,13 @@ impl Learned {
         let seen = self
             .summaries
             .observe(&attempt.key, &attempt.run, day, bounds);
-        self.dirty.insert(attempt.key.l2());
-        self.dirty.insert(attempt.key.clone());
+        let owed = self.pending.entry(attempt.key.clone()).or_default();
+        owed.push(Sample {
+            run: attempt.run,
+            day,
+            bounds: *bounds,
+        });
+        cap(owed);
         let landed = seen.memory.ok().map(|()| bucket(&estimate, &attempt.run));
         if let Some((level, bucket)) = landed {
             self.tally[level as usize][bucket as usize] += 1;
@@ -469,50 +504,48 @@ impl Learned {
         self.tally[level as usize][bucket as usize]
     }
 
-    /// The rows of `keys` as the summaries are now, which are no longer dirty.
-    pub fn take_rows(&mut self, keys: BTreeSet<Key>) -> Vec<Row> {
-        self.rows_of(keys)
+    /// The runs `keys` are owed, which are no longer pending.
+    fn samples_of(&mut self, keys: BTreeSet<Key>) -> Vec<Samples> {
+        keys.into_iter()
+            .filter_map(|key| self.pending.remove(&key).map(|runs| (key, runs)))
+            .collect()
     }
 
-    fn rows_of(&mut self, keys: BTreeSet<Key>) -> Vec<Row> {
-        let mut rows = Vec::new();
-        for key in keys {
-            self.dirty.remove(&key);
-            if let Some(summary) = self.summaries.get(&key) {
-                rows.push((key, summary.encode()));
-            }
-        }
-        rows
-    }
-
-    /// The batch to write behind, if one is due: the dirty keys wait [`FLUSH_EVERY_MS`],
+    /// The batch to write behind, if one is due: the keys with runs owed wait [`FLUSH_EVERY_MS`],
     /// or a full batch does not. The caller puts the keys back with
     /// [`Learned::unwritten`] if the store refuses.
-    pub fn due(&mut self) -> Vec<Row> {
+    pub fn due(&mut self) -> Vec<Samples> {
         self.batch(false)
     }
 
     /// [`Learned::due`] without the wait: the batch whatever the time since the last one.
-    pub fn due_now(&mut self) -> Vec<Row> {
+    pub fn due_now(&mut self) -> Vec<Samples> {
         self.batch(true)
     }
 
-    fn batch(&mut self, now: bool) -> Vec<Row> {
+    fn batch(&mut self, now: bool) -> Vec<Samples> {
         let waited = self
             .now
             .as_millis()
             .saturating_sub(self.flushed.as_millis());
-        if self.off() || (!now && waited < FLUSH_EVERY_MS && self.dirty.len() < BATCH) {
+        if self.off() || (!now && waited < FLUSH_EVERY_MS && self.pending.len() < BATCH) {
             return Vec::new();
         }
         self.flushed = self.now;
-        let batch = self.dirty.iter().take(BATCH).cloned().collect();
-        self.rows_of(batch)
+        let batch = self.pending.keys().take(BATCH).cloned().collect();
+        self.samples_of(batch)
     }
 
-    /// The store did not take `rows`: their keys are written again next time.
-    pub fn unwritten(&mut self, rows: &[Row]) {
-        self.dirty.extend(rows.iter().map(|(key, _)| key.clone()));
+    /// The store did not take `owed`: its runs are offered again next time, before any
+    /// that came since.
+    pub fn unwritten(&mut self, owed: &[Samples]) {
+        for (key, runs) in owed {
+            let held = self.pending.entry(key.clone()).or_default();
+            let mut all = runs.clone();
+            all.append(held);
+            *held = all;
+            cap(held);
+        }
     }
 
     /// The day to sweep stale rows of the store for, if a sweep is due (an hour after the

@@ -26,7 +26,7 @@ use kbf_types::{
 use super::ambient::Ambient;
 use super::durable::intake::Intake;
 use super::durable::{Durable, StoredOperation};
-use crate::learned::Row;
+use crate::learned::Samples;
 
 /// How many committed records the farm holds for a state store that refuses them.
 pub(super) const HELD_CAP: usize = 4096;
@@ -45,7 +45,7 @@ pub(in crate::farm) struct View<'a> {
 /// once the requeues are, and the key floors the estimator's decay lowered.
 pub(in crate::farm) struct LearnedRequeue {
     /// The size summaries an own-limit kill changed.
-    pub rows: Vec<Row>,
+    pub rows: Vec<Samples>,
     /// The key floors lowered as `(key, floor before the decay, floor asked)`; `None`
     /// when the learned sizes were not consulted for a lowering at all.
     pub lowered: Option<Vec<(u64, u64, u64)>>,
@@ -55,7 +55,7 @@ pub(in crate::farm) struct LearnedRequeue {
 /// hook neither blocks nor calls back into the engine: it sends on a channel, changes a
 /// map, writes a log line. Besides ids and the scheduler's types, the signatures still name
 /// kbf types: `Stage` (which the engine also builds, in `stage_for`), `Finished`, the learned
-/// `Row`, `StoredOperation` and the estimator's `Key`, and the engine holds `Durable`. Each
+/// `Samples`, `StoredOperation` and the estimator's `Key`, and the engine holds `Durable`. Each
 /// becomes a type the engine owns or the consumer supplies before the engine can be shared.
 pub(in crate::farm) trait Adapter {
     /// Every node the farm has heard from, in node-id order.
@@ -91,7 +91,7 @@ pub(in crate::farm) trait Adapter {
     /// The estimator key the learned sizes name `key` by, if they do.
     fn summary_key(&self, key: u64) -> Option<kbf_estimator::Key>;
     /// Summaries the state store refused, to be written again later.
-    fn estimates_refused(&mut self, refused: &[Row]);
+    fn estimates_refused(&mut self, refused: &[Samples]);
     /// Whether the learned sizes read size keys.
     fn size_keys(&self) -> bool;
 

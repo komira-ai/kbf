@@ -429,6 +429,7 @@ mod ext;
 mod fate;
 mod floor;
 mod inflight;
+mod merge;
 pub(super) mod intake;
 mod leases;
 pub(crate) mod named;
@@ -874,7 +875,8 @@ impl Durable {
         self.ext.estimates(&*self.store)
     }
 
-    /// Writes `rows`, size summaries, in one transaction.
+    /// Writes `rows`, size summaries, in one transaction, whatever the store holds.
+    #[cfg(test)]
     pub(super) fn put_estimates(&self, rows: &[Row]) -> Result<(), StateError> {
         self.commit(self.ext.put_estimates(Txn::new(), rows))
     }
@@ -1870,6 +1872,8 @@ mod job_tree_tests;
 mod leases_tests;
 #[cfg(test)]
 mod named_tests;
+#[cfg(test)]
+mod merge_tests;
 #[cfg(test)]
 mod owner_tests;
 #[cfg(test)]

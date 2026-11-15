@@ -23,7 +23,7 @@ use super::failed_actions::{Class, FailedActions};
 use super::handover::show;
 use super::{Detail, Outbound, START_VALIDITY_MS, StreamId, finished_of, refused_as, wire_lease};
 use crate::action_usage::Subject;
-use crate::learned::{Learned, Row};
+use crate::learned::{Learned, Samples};
 use crate::machine::{Booked, FarmMachine, Platform, Sent, Waiter, stored_name};
 use crate::run_record::Recording;
 use crate::stamp::Stamp;
@@ -402,7 +402,7 @@ impl Adapter for Side {
         self.learned.summary_key(key)
     }
 
-    fn estimates_refused(&mut self, refused: &[Row]) {
+    fn estimates_refused(&mut self, refused: &[Samples]) {
         self.learned.unwritten(refused);
     }
 

@@ -471,6 +471,15 @@ fn the_estimate_line_says_what_would_be_booked_and_what_is() {
     assert!(text.ends_with("floor_mib=16384"), "{text}");
 }
 
+/// The rows the store would hold for what `learned` has seen.
+fn stored_rows(learned: &Learned) -> Vec<Row> {
+    let keys = learned.pending.keys().flat_map(|k| [k.l2(), k.clone()]);
+    let keys: BTreeSet<Key> = keys.collect();
+    keys.into_iter()
+        .filter_map(|k| learned.summaries().get(&k).map(|s| (k, s.encode())))
+        .collect()
+}
+
 /// Catches: `off` asking, teaching, keeping or writing anything: a restored row taken
 /// up, a lease's booking remembered, an attempt staged, a batch due or a sweep due.
 #[test]
@@ -479,7 +488,7 @@ fn off_does_nothing_with_anything() {
     for _ in 0..3 {
         on.observe(&success(MIB), &bounds());
     }
-    let rows = on.rows_of(on.dirty.clone());
+    let rows = stored_rows(&on);
     let mut off = Learned::new(LearnedSizes::Off, 4 * GIB, EPOCH);
     assert!(off.off());
     off.restore(&rows);
@@ -498,7 +507,7 @@ fn off_does_nothing_with_anything() {
 #[test]
 fn shadow_takes_up_what_the_store_held() {
     let mut first = seeded();
-    let mut rows = first.rows_of(first.dirty.clone());
+    let mut rows = stored_rows(&first);
     let other = key_of("other", &linux(), Basis::Cgroup, &subject(None)).expect("a key");
     rows.insert(0, (other.clone(), vec![1, 2, 3]));
     let mut second = shadow();
@@ -567,11 +576,11 @@ fn a_report_the_scheduler_did_not_take_teaches_nothing() {
     assert_eq!(learned.calls(), 1);
 }
 
-/// Catches: the rows of a kill's requeue holding another key's summary (every dirty key
-/// rides one transaction), the rows of the keys a kill changed left to the write-behind,
-/// and the kill's raised booking lost (the floor must be above the booking it died at).
+/// Catches: the runs of a kill's requeue holding another key's runs (every key owed runs
+/// rides one write), the kill's own run left to the write-behind, and the kill's raised
+/// booking lost (the floor must be above the booking it died at).
 #[test]
-fn a_kills_requeue_carries_the_two_summaries_it_changed_and_no_others() {
+fn a_kills_requeue_carries_the_run_it_added_and_no_others() {
     let mut learned = shadow();
     let other = key_of("other", &linux(), Basis::Cgroup, &subject(None)).expect("a key");
     learned.observe(
@@ -587,7 +596,9 @@ fn a_kills_requeue_carries_the_two_summaries_it_changed_and_no_others() {
     learned.stage(lease(1), Some(hit));
     let rows = learned.requeued(lease(1), 16 * GIB, &bounds());
     let keys: Vec<&Key> = rows.iter().map(|(k, _)| k).collect();
-    assert_eq!(keys, [&key(), &with_cfg]);
+    assert_eq!(keys, [&with_cfg]);
+    assert_eq!(rows[0].1.len(), 1);
+    assert_eq!(rows[0].1[0].run.raised_memory_bytes, Some(16 * GIB));
     let floor = learned.summaries().key_floor(&with_cfg, &bounds());
     assert!(floor >= 16 * GIB, "floor {floor}");
     // The other key is still waiting for the write-behind.
@@ -946,3 +957,5 @@ fn a_run_without_a_usage_block_is_never_a_sample() {
     assert!(run_of(ok(), None, GIB).is_none());
     assert!(run_of(Outcome::Failed(Failure::OutOfMemory), None, GIB).is_none());
 }
+
+mod pending;
