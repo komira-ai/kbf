@@ -506,7 +506,7 @@ fn off_does_nothing_with_anything() {
 /// at every deploy), and a row that does not decode stopping the others.
 #[test]
 fn shadow_takes_up_what_the_store_held() {
-    let mut first = seeded();
+    let first = seeded();
     let mut rows = stored_rows(&first);
     let other = key_of("other", &linux(), Basis::Cgroup, &subject(None)).expect("a key");
     rows.insert(0, (other.clone(), vec![1, 2, 3]));
