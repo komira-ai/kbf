@@ -42,6 +42,7 @@ mod output;
 mod phases;
 mod pool;
 mod probe;
+pub mod rows;
 mod runs;
 mod submit;
 mod task;
