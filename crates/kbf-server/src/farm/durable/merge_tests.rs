@@ -251,7 +251,10 @@ fn a_store_that_cannot_be_read_or_refuses_the_write_is_an_error() {
     let key = key(None);
     store.down.store(true, Ordering::SeqCst);
     let error = a.add_samples(&samples(&key, &[100])).expect_err("down");
-    assert!(matches!(error, StateError::Store(StoreError::Failed(_))), "{error:?}");
+    assert!(
+        matches!(error, StateError::Store(StoreError::Failed(_))),
+        "{error:?}"
+    );
     store.down.store(false, Ordering::SeqCst);
     store.fence.store(true, Ordering::SeqCst);
     let error = a.add_samples(&samples(&key, &[100])).expect_err("fenced");

@@ -429,9 +429,9 @@ mod ext;
 mod fate;
 mod floor;
 mod inflight;
-mod merge;
 pub(super) mod intake;
 mod leases;
+mod merge;
 pub(crate) mod named;
 mod opkey;
 mod opwall;
@@ -1871,9 +1871,9 @@ mod job_tree_tests;
 #[cfg(test)]
 mod leases_tests;
 #[cfg(test)]
-mod named_tests;
-#[cfg(test)]
 mod merge_tests;
+#[cfg(test)]
+mod named_tests;
 #[cfg(test)]
 mod owner_tests;
 #[cfg(test)]

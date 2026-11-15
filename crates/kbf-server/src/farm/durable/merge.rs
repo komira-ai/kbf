@@ -32,9 +32,10 @@ impl Durable {
                     Some(row) => {
                         // A row that cannot be read is replaced, as it was when the rows
                         // were written from memory: the key starts again from these runs.
-                        let readable = estimate::decode(&name, &row.value).is_some_and(
-                            |(_, summary)| held.insert_encoded(level, &summary).is_ok(),
-                        );
+                        let readable =
+                            estimate::decode(&name, &row.value).is_some_and(|(_, summary)| {
+                                held.insert_encoded(level, &summary).is_ok()
+                            });
                         if !readable {
                             tracing::warn!(%name, "a size summary row cannot be read: replaced");
                         }
