@@ -73,7 +73,10 @@ fn no_scan_prefix_of_any_family_is_a_prefix_of_exec() {
         sources(&root.join(name).join("src"), &mut files);
     }
     let mut families = Vec::new();
-    for file in files.iter().filter(|f| !f.ends_with("kbf-server/src/executor/rows.rs")) {
+    for file in files
+        .iter()
+        .filter(|f| !f.ends_with("kbf-server/src/executor/rows.rs"))
+    {
         let text = fs::read_to_string(file).expect("source");
         families.extend(string_constants(&text));
     }
@@ -88,13 +91,19 @@ fn no_scan_prefix_of_any_family_is_a_prefix_of_exec() {
         .iter()
         .filter(|family| !family.is_empty() && ROOT.starts_with(family.as_str()))
         .collect();
-    assert!(reaching.is_empty(), "a scan prefix reaches exec/: {reaching:?}");
+    assert!(
+        reaching.is_empty(),
+        "a scan prefix reaches exec/: {reaching:?}"
+    );
 }
 
 #[test]
 fn the_row_families_lie_under_the_root() {
     for prefix in [FRONTEND_PREFIX, WORKER_PREFIX, JOB_PREFIX] {
-        assert!(prefix.starts_with(ROOT) && prefix.ends_with('/'), "{prefix}");
+        assert!(
+            prefix.starts_with(ROOT) && prefix.ends_with('/'),
+            "{prefix}"
+        );
     }
     assert_eq!(ROOT, "exec/");
 }

@@ -37,8 +37,8 @@ use kbf_server::executor::rows::{
     ExecRows, Held, JobRow, Live, Liveness, RowsError, Shape, WorkerRow, frontend_key, worker_key,
 };
 use kbf_state::{
-    Change, Changes, Commit, CommitStats, Cond, Conflict, Op, Revision, ScanPage, ScanRange,
-    Store, StoreError, StoreTime, Txn, Version, Versioned,
+    Change, Changes, Commit, CommitStats, Cond, Conflict, Op, Revision, ScanPage, ScanRange, Store,
+    StoreError, StoreTime, Txn, Version, Versioned,
 };
 
 /// The most claims of the worker one search allows, the first row included.
@@ -207,7 +207,9 @@ fn without_checks(txn: &Txn, prefix: &str, cond: fn(Cond) -> bool) -> Txn {
                 ttl: Some(ttl),
                 cond,
             } => out.put_ttl(key, value, ttl, cond),
-            Op::Put { key, value, cond, .. } => out.put(key, value, cond),
+            Op::Put {
+                key, value, cond, ..
+            } => out.put(key, value, cond),
             Op::Delete { key, cond } => out.delete(key, cond),
             Op::Next { counter } => out.next(counter),
         };
@@ -386,7 +388,10 @@ impl World {
                 (Some(_), true) => 1,
                 (Some(_), false) => 2,
             };
-            let live = self.store.value(&frontend_key(&instance(i)).expect("key")).is_some();
+            let live = self
+                .store
+                .value(&frontend_key(&instance(i)).expect("key"))
+                .is_some();
             key.extend([
                 u8::from(fe.up),
                 held,
@@ -482,29 +487,29 @@ impl Search {
         let holds = w.holds_row(i);
 
         // The row insert before the submit.
-        if let Some(held) = &fe.held {
-            if fe.task == Task::None
-                && !w.job_row_present()
-                && !w.done
-                && w.result == Outcome::None
-            {
-                let (store, wrote) = self.on_fork(w, |rows| match self.guards {
-                    Guards::NoWorkerCheck => {
-                        let txn = ExecRows::insert_job_txn(held, JOB, &job_row())?;
-                        rows.commit(without_checks(&txn, "exec/w/", is_version)).map(drop)
-                    }
-                    _ => rows.insert_job(held, JOB, &job_row()).map(drop),
-                });
-                match wrote {
-                    Ok(()) => {
-                        let mut next = w.clone();
-                        next.store = store;
-                        next.bad |= !holds;
-                        next.fes[i].task = Task::Prep;
-                        out.push((name("insert_job"), next));
-                    }
-                    Err(_) => out.push((name("lost"), w.lost(i))),
+        if let Some(held) = &fe.held
+            && fe.task == Task::None
+            && !w.job_row_present()
+            && !w.done
+            && w.result == Outcome::None
+        {
+            let (store, wrote) = self.on_fork(w, |rows| match self.guards {
+                Guards::NoWorkerCheck => {
+                    let txn = ExecRows::insert_job_txn(held, JOB, &job_row())?;
+                    rows.commit(without_checks(&txn, "exec/w/", is_version))
+                        .map(drop)
                 }
+                _ => rows.insert_job(held, JOB, &job_row()).map(drop),
+            });
+            match wrote {
+                Ok(()) => {
+                    let mut next = w.clone();
+                    next.store = store;
+                    next.bad |= !holds;
+                    next.fes[i].task = Task::Prep;
+                    out.push((name("insert_job"), next));
+                }
+                Err(_) => out.push((name("lost"), w.lost(i))),
             }
         }
         // The submit to the job service (idempotent by job id).
@@ -577,8 +582,7 @@ impl Search {
         }
         // A hard stop hands the worker back, cancelling nothing.
         if let (Some(held), true) = (&fe.held, holds) {
-            let (store, released) =
-                self.on_fork(w, |rows| rows.release(held, &worker_row(&me)));
+            let (store, released) = self.on_fork(w, |rows| rows.release(held, &worker_row(&me)));
             if released.is_ok() {
                 let mut next = w.clone();
                 next.store = store;
@@ -626,7 +630,8 @@ impl Search {
         let (store, deleted) = self.on_fork(w, |rows| match self.guards {
             Guards::NoWorkerCheck => {
                 let txn = ExecRows::delete_job_txn(held, JOB)?;
-                rows.commit(without_checks(&txn, "exec/w/", is_version)).map(drop)
+                rows.commit(without_checks(&txn, "exec/w/", is_version))
+                    .map(drop)
             }
             _ => rows.delete_job(held, JOB),
         });
@@ -795,7 +800,11 @@ fn run(n: usize, fenced: bool, guards: Guards) -> Report {
 }
 
 fn assert_sound(report: &Report) {
-    assert!(report.states > 1_000, "the search ended early: {} states", report.states);
+    assert!(
+        report.states > 1_000,
+        "the search ended early: {} states",
+        report.states
+    );
     assert_eq!(report.violations, 0, "a property broke: {:?}", report.trace);
     assert_eq!(report.stuck, 0, "{} states reach no result", report.stuck);
 }
@@ -832,7 +841,10 @@ fn every_interleaving_reaches_a_result_at_three_frontends_when_a_holder_stalls()
 #[test]
 fn a_claim_that_does_not_check_the_owners_liveness_row_lets_two_frontends_act() {
     let report = run(2, true, Guards::NoOwnerCheck);
-    assert!(report.violations > 0, "the search did not see two frontends act");
+    assert!(
+        report.violations > 0,
+        "the search did not see two frontends act"
+    );
     assert_eq!(report.trace, ["claim(1)"]);
 }
 
