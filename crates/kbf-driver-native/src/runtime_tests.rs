@@ -307,3 +307,40 @@ async fn a_busy_program_is_retried() {
     assert!(!record.exists(), "a failed spawn leaves no run record");
     std::fs::remove_file(&program).expect("remove");
 }
+
+/// Catches a note added to an action's stderr that pushes the stderr past the stdio limit
+/// (all of it would then be dropped), or a stderr that cannot be appended to failing the
+/// lease: a note that fits is appended; one that does not fit leaves the stderr as it was;
+/// a stderr that is a directory is left alone, and the note stays in the node's log.
+#[test]
+fn a_note_is_added_to_stderr_only_where_it_fits_and_can_be_written() {
+    let scratch = std::env::current_exe()
+        .expect("test binary")
+        .parent()
+        .expect("deps")
+        .join("kbf-driver-native-unit")
+        .join(format!("stderr-note-{}", std::process::id()));
+    let _ = kbf_outputs::remove_tree(&scratch);
+    std::fs::create_dir_all(&scratch).expect("mkdir");
+    let keep = |_: &Path| Ok(());
+    let mut config = NativeConfig::new(scratch.join("root"));
+    config.outputs.max_stdio_bytes = 4;
+    let runtime = NativeRuntime::with_remover(config, Arc::new(NoCas), &keep).expect("runtime");
+    let lease = LeaseId::new(5, 1);
+    let dir = scratch.join("lease");
+    std::fs::create_dir_all(&dir).expect("lease dir");
+    std::fs::write(dir.join("stderr"), b"x").expect("stderr");
+    runtime.add_to_stderr(lease, &dir, "ab", "a note");
+    assert_eq!(std::fs::read(dir.join("stderr")).expect("read"), b"xab");
+    runtime.add_to_stderr(lease, &dir, "cd", "a note");
+    assert_eq!(std::fs::read(dir.join("stderr")).expect("read"), b"xab");
+
+    let mut config = NativeConfig::new(scratch.join("root"));
+    config.outputs.max_stdio_bytes = 1 << 30;
+    let runtime = NativeRuntime::with_remover(config, Arc::new(NoCas), &keep).expect("runtime");
+    let odd = scratch.join("odd");
+    std::fs::create_dir_all(odd.join("stderr")).expect("stderr as a directory");
+    runtime.add_to_stderr(lease, &odd, "ab", "a note");
+    assert!(odd.join("stderr").is_dir(), "left alone");
+    kbf_outputs::remove_tree(&scratch).expect("clean");
+}

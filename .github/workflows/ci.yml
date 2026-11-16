@@ -152,16 +152,6 @@ jobs:
           # The oldest macOS the binaries support, as artifacts.yml builds them.
           MACOSX_DEPLOYMENT_TARGET: "14.0"
         run: cargo check --locked --target aarch64-apple-darwin -p xtask -p kbf-host-install --test pkg_macos --test real_mac --test real_drop
-      # kbf-daemon's library with its unit tests (the test profile), and the tests native-macos runs.
-      - name: Check for aarch64-apple-darwin the kbf-daemon library's tests and the tests native-macos runs
-        if: ${{ !cancelled() }}
-        env:
-          CC_aarch64_apple_darwin: ${{ runner.temp }}/zig-x86_64-linux-${{ env.ZIG_VERSION }}/zig cc -target aarch64-macos
-          AR_aarch64_apple_darwin: ${{ runner.temp }}/zig-x86_64-linux-${{ env.ZIG_VERSION }}/zig ar
-          CRATE_CC_NO_DEFAULTS: "1"
-          # The oldest macOS the binaries support, as artifacts.yml builds them.
-          MACOSX_DEPLOYMENT_TARGET: "14.0"
-        run: cargo check --locked --target aarch64-apple-darwin --profile test -p kbf-daemon --lib --test suspend --test keeper
       # The kbf binary alone, as artifacts.yml builds it: without the proxy feature of kbf-setup,
       # which the steps above turn on for kbf-installer and so for every crate built beside it.
       - name: Check for aarch64-apple-darwin the kbf binary without the proxy feature

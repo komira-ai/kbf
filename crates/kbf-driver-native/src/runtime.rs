@@ -327,12 +327,11 @@ impl<C: Cas> NativeRuntime<C> {
     /// at the end of the action's stderr: its own hermeticity failure, which does not
     /// change its exit code.
     fn report_ignored_sigterm(&self, lease: LeaseId, dir: &Path, ignored: &[Survivor]) {
-        let Some(note) = grace::note(ignored) else {
+        // Both are `None` for no survivor, and both are `Some` otherwise.
+        let (Some(note), Some(brief)) = (grace::note(ignored), grace::brief(ignored)) else {
             return;
         };
-        if let Some(brief) = grace::brief(ignored) {
-            tracing::warn!(%lease, "{brief}");
-        }
+        tracing::warn!(%lease, "{brief}");
         self.add_to_stderr(lease, dir, &note, "the processes that outlasted SIGTERM");
     }
 

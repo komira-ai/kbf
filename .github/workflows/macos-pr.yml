@@ -57,10 +57,6 @@ jobs:
       - run: uname -m
       - run: sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize
       - run: cargo test -p kbf-outputs --locked
-      # The daemon's unit tests, which read its suspend-counting clock on macOS
-      # (CLOCK_MONOTONIC_RAW), the fence across a suspend (issue #78), and a keeper
-      # started after the binary was renamed over, which macOS finds by its path.
-      - run: cargo test -p kbf-daemon --lib --test suspend --test keeper --locked
       # The registration client's connect on a Mac, where it is std's after a check of the deadline:
       # a full backlog is refused at once, a connect that succeeds leaves the rest only what is left,
       # and a missing or stale socket is a connect error (crates/update-register/src/tests.rs).

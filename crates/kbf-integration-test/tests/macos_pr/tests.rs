@@ -406,12 +406,12 @@ fn a_step_of_the_after_merge_mac_jobs_that_no_pull_request_runs_is_refused() {
     );
     let found = changed_to(
         MACOS_PR,
-        "      - run: cargo test -p kbf-daemon --lib --test suspend --test keeper --locked\n",
+        "      - run: cargo test -p kbf-outputs --locked\n",
         "",
     );
     has(
         &found,
-        "beta.yml#native-macos runs `cargo test -p kbf-daemon --lib --test suspend --test keeper --locked` and no step of macos-pr.yml's macOS jobs is that step",
+        "beta.yml#native-macos runs `cargo test -p kbf-outputs --locked` and no step of macos-pr.yml's macOS jobs is that step",
     );
     let found = changed_to(
         MACOS_PR,
