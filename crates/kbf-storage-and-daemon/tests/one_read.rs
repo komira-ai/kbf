@@ -40,14 +40,16 @@ fn scratch(name: &str) -> TestDir {
 }
 
 /// The plane over a server started in this runtime on the stores under `dir`, with a
-/// write tier (`tier`) or without one, at the cold store's default free-space floor.
+/// write tier (`tier`) or without one, and a cold store free-space floor of one byte: the
+/// default floor is 5% of the disk, and a runner's free space falls under it while the
+/// coverage build and the large-file tests beside this one fill the disk.
 async fn plane(dir: &Path, tier: bool) -> Arc<LocalDataPlane> {
-    plane_with_floor(dir, tier, None).await
+    plane_with_floor(dir, tier, 1).await
 }
 
 /// [`plane`], with the cold store's free-space floor `floor` bytes (the server's
-/// test-only `--cold-store-floor-bytes`) in place of 5% of its disk, at least 1 GiB.
-async fn plane_with_floor(dir: &Path, tier: bool, floor: Option<u64>) -> Arc<LocalDataPlane> {
+/// test-only `--cold-store-floor-bytes`).
+async fn plane_with_floor(dir: &Path, tier: bool, floor: u64) -> Arc<LocalDataPlane> {
     let n = STARTED.fetch_add(1, Ordering::SeqCst);
     let mut argv = vec![
         "kbf-server".to_owned(),
@@ -57,10 +59,8 @@ async fn plane_with_floor(dir: &Path, tier: bool, floor: Option<u64>) -> Arc<Loc
             "--cold-store=file://{}",
             dir.join(format!("cold-{n}")).display()
         ),
+        format!("--cold-store-floor-bytes={floor}"),
     ];
-    if let Some(floor) = floor {
-        argv.push(format!("--cold-store-floor-bytes={floor}"));
-    }
     if tier {
         argv.push(format!(
             "--hot-store=file://{}",
@@ -261,7 +261,7 @@ async fn a_blob_over_5_gib_is_not_refused_for_its_size() {
     let dir = scratch("over-5-gib");
     // A floor of 64 MiB, not 5% of the disk: the store then needs the blob's 5 GiB and
     // the floor free, not the 7 GB or more a large disk's default asks on top of it.
-    let plane = plane_with_floor(&dir.join("server"), true, Some(64 << 20)).await;
+    let plane = plane_with_floor(&dir.join("server"), true, 64 << 20).await;
     let digest = kbf_types::Digest::new(kbf_types::DigestFunction::Sha256, [7; 32], (5 << 30) + 1);
     let record = Record {
         digest,
@@ -284,7 +284,7 @@ async fn collect_small_file(
     floor: u64,
 ) -> Result<(), kbf_driver_container::tree::TreeError> {
     let dir = scratch(name);
-    let plane = plane_with_floor(&dir.join("server"), false, Some(floor)).await;
+    let plane = plane_with_floor(&dir.join("server"), false, floor).await;
     let upper = dir.join("upper");
     let out = upper.join("out");
     std::fs::create_dir_all(&out).expect("mkdir");
