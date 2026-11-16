@@ -55,7 +55,7 @@ use rustix::io::Errno;
 use sha2::{Digest as _, Sha256};
 
 use crate::limits::{Exceeded, OutputLimits};
-use crate::store::{CHUNK_BYTES, Store, StoreError, digest_of};
+use crate::store::{CHUNK_BYTES, Store, StoreError, Tee, digest_of};
 use crate::uploads::Uploads;
 
 /// Why the outputs could not be read.
@@ -193,13 +193,16 @@ enum Blob {
     Bytes(Vec<u8>),
     /// Larger: the open file, at its start, and what its bytes hash to.
     File(std::fs::File, Digest),
+    /// Larger, and its bytes went to the store's [`Tee`] as they were hashed: nothing is left
+    /// to store but the digest.
+    Spooled(Digest),
 }
 
 impl Blob {
     fn size(&self) -> u64 {
         match self {
             Self::Bytes(bytes) => bytes.len() as u64,
-            Self::File(_, digest) => digest.size_bytes.unsigned_abs(),
+            Self::File(_, digest) | Self::Spooled(digest) => digest.size_bytes.unsigned_abs(),
         }
     }
 
@@ -212,7 +215,7 @@ impl Blob {
     ) -> Digest {
         let digest = match &self {
             Self::Bytes(bytes) => digest_of(bytes),
-            Self::File(_, digest) => digest.clone(),
+            Self::File(_, digest) | Self::Spooled(digest) => digest.clone(),
         };
         let shown = shown.to_owned();
         let upload = async move { self.store(store, &shown).await.map(drop) };
@@ -224,6 +227,7 @@ impl Blob {
         let stored = match self {
             Self::Bytes(bytes) => store.put(bytes).await,
             Self::File(file, digest) => store.put_file(file, digest).await,
+            Self::Spooled(digest) => Ok(digest),
         };
         stored.map_err(|source| OutputsError::Store {
             path: shown.to_owned(),
@@ -318,7 +322,12 @@ fn examine(dir: &OwnedFd, name: &OsStr) -> std::io::Result<Option<Kind>> {
 /// when it holds more than `max` bytes (at most `max + 1` are read). The type is
 /// checked again on the open descriptor: an entry that stopped being a regular file
 /// after it was examined is an error, never read.
-fn read_file(dir: &OwnedFd, name: &OsStr, max: u64) -> std::io::Result<Option<(Blob, bool)>> {
+fn read_file(
+    dir: &OwnedFd,
+    name: &OsStr,
+    max: u64,
+    tee: Option<&dyn Tee>,
+) -> std::io::Result<Option<(Blob, bool)>> {
     let fd = open_in(dir, name, FILE)?;
     let Kind::File { executable } = kind(&rustix::fs::fstat(&fd)?) else {
         return Err(std::io::Error::other(
@@ -337,7 +346,16 @@ fn read_file(dir: &OwnedFd, name: &OsStr, max: u64) -> std::io::Result<Option<(B
     if head.len() < CHUNK_BYTES {
         return Ok(Some((Blob::Bytes(head), executable)));
     }
-    // A full first chunk: hash the rest in chunks, then store the file from its start.
+    // A full first chunk: hash the rest in chunks. With a tee each chunk goes to it as it is
+    // hashed, and the file is read once; without, the file is stored from its start.
+    let mut spool = match tee {
+        Some(tee) => {
+            let mut open = tee.open()?;
+            open.write(&head)?;
+            Some(open)
+        }
+        None => None,
+    };
     let mut hasher = Sha256::new();
     hasher.update(&head);
     let mut size = head.len() as u64;
@@ -355,12 +373,19 @@ fn read_file(dir: &OwnedFd, name: &OsStr, max: u64) -> std::io::Result<Option<(B
             return Ok(None);
         }
         hasher.update(&chunk);
+        if let Some(open) = &mut spool {
+            open.write(&chunk)?;
+        }
     }
-    file.rewind()?;
     let digest = Digest {
         hash: hex::encode(hasher.finalize()),
         size_bytes: i64::try_from(size).map_err(std::io::Error::other)?,
     };
+    if let Some(open) = spool {
+        open.end(&digest)?;
+        return Ok(Some((Blob::Spooled(digest), executable)));
+    }
+    file.rewind()?;
     Ok(Some((Blob::File(file, digest), executable)))
 }
 
@@ -520,8 +545,11 @@ async fn record<'a, S: Store>(
             Some(Kind::File { .. }) => {
                 budget.entries(1, &shown)?;
                 let max = budget.bytes_left();
-                let read =
-                    blocking(&shown, move || read_file(&parent, name.as_os_str(), max)).await?;
+                let tee = store.tee();
+                let read = blocking(&shown, move || {
+                    read_file(&parent, name.as_os_str(), max, tee.as_deref())
+                })
+                .await?;
                 let (blob, executable) = budget.file(read, &shown)?;
                 result.output_files.push(OutputFile {
                     path: path.clone(),
@@ -547,9 +575,9 @@ async fn record<'a, S: Store>(
                     root: Some(root),
                     children,
                 };
-                let tree_digest = Blob::Bytes(tree.encode_to_vec())
-                    .queue(&mut uploads, store, &shown)
-                    .await;
+                let tree = tree.encode_to_vec();
+                store.keep_tree(&tree);
+                let tree_digest = Blob::Bytes(tree).queue(&mut uploads, store, &shown).await;
                 result.output_directories.push(OutputDirectory {
                     path: path.clone(),
                     tree_digest: Some(tree_digest),
@@ -612,9 +640,10 @@ pub async fn store_file(store: &impl Store, path: &Path, max: u64) -> Result<Dig
             )));
         }
     };
+    let tee = store.tee();
     let read = blocking(path, move || {
         let dir = rustix::fs::openat(CWD, &dir, DIRECTORY, Mode::empty())?;
-        read_file(&dir, &name, max)
+        read_file(&dir, &name, max, tee.as_deref())
     })
     .await?;
     let (blob, _) = read.ok_or_else(|| limit(path, Exceeded::Stdio, max))?;
@@ -701,8 +730,11 @@ async fn walk<'a>(
             Kind::Other => {}
             Kind::File { .. } => {
                 let max = budget.bytes_left();
-                let read =
-                    blocking(&path, move || read_file(&dir, os_name.as_os_str(), max)).await?;
+                let tee = store.tee();
+                let read = blocking(&path, move || {
+                    read_file(&dir, os_name.as_os_str(), max, tee.as_deref())
+                })
+                .await?;
                 let (blob, executable) = budget.file(read, &path)?;
                 let digest = blob.queue(uploads, store, &path).await;
                 let top = stack.last_mut().unwrap_or(&mut root);
@@ -773,7 +805,7 @@ mod tests {
             .status()
             .expect("mkfifo");
         assert!(made.success());
-        let why = read_file(&fd, OsStr::new("fifo"), u64::MAX).expect_err("a FIFO");
+        let why = read_file(&fd, OsStr::new("fifo"), u64::MAX, None).expect_err("a FIFO");
         assert!(
             why.to_string().contains("no longer a regular file"),
             "{why}"
@@ -788,7 +820,7 @@ mod tests {
         let dir = scratch("bytes");
         let fd = open(&dir);
         std::fs::write(dir.join("small"), b"bytes").expect("write");
-        let read = |name: &str, max| read_file(&fd, OsStr::new(name), max).expect("read");
+        let read = |name: &str, max| read_file(&fd, OsStr::new(name), max, None).expect("read");
         let (blob, executable) = read("small", 5).expect("within the bound");
         assert!(!executable);
         let (bytes, file) = blob.into_parts();
@@ -826,8 +858,55 @@ mod tests {
             match self {
                 Self::Bytes(bytes) => (Some(bytes), None),
                 Self::File(file, digest) => (None, Some((file, digest))),
+                Self::Spooled(_) => unreachable!("these tests read without a tee"),
             }
         }
+    }
+
+    /// A tee that keeps the bytes it is given, for a unit test of the one-pass read.
+    struct Keep(std::sync::Arc<std::sync::Mutex<(Vec<u8>, Option<Digest>)>>);
+
+    impl Tee for Keep {
+        fn open(&self) -> std::io::Result<Box<dyn crate::TeeFile>> {
+            Ok(Box::new(Keep(std::sync::Arc::clone(&self.0))))
+        }
+    }
+
+    impl crate::TeeFile for Keep {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+            self.0.lock().expect("lock").0.extend_from_slice(bytes);
+            Ok(())
+        }
+
+        fn end(self: Box<Self>, digest: &Digest) -> std::io::Result<()> {
+            self.0.lock().expect("lock").1 = Some(digest.clone());
+            Ok(())
+        }
+    }
+
+    /// A file read with a tee is read once: its bytes go to the tee as they are hashed, a file
+    /// handed over is not made, and one past the bound still stops the read.
+    #[test]
+    fn a_large_file_read_with_a_tee_goes_to_it_whole() {
+        let dir = scratch("tee-read");
+        let fd = open(&dir);
+        let large: Vec<u8> = (0..(2 * CHUNK_BYTES + 7))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        std::fs::write(dir.join("large"), &large).expect("write");
+        let kept = std::sync::Arc::new(std::sync::Mutex::new((Vec::new(), None)));
+        let keep = Keep(std::sync::Arc::clone(&kept));
+        let read = |max| read_file(&fd, OsStr::new("large"), max, Some(&keep)).expect("read");
+        let (blob, _) = read(u64::MAX).expect("within the bound");
+        assert_eq!(
+            format!("{blob:?}"),
+            format!("{:?}", Blob::Spooled(digest_of(&large)))
+        );
+        let kept = kept.lock().expect("lock");
+        assert_eq!(kept.0, large);
+        assert_eq!(kept.1, Some(digest_of(&large)));
+        drop(kept);
+        assert!(read(large.len() as u64 - 1).is_none());
     }
 
     /// Catches the walk going back up into a directory other than the one it came

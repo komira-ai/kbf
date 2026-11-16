@@ -1,7 +1,8 @@
 //! The janitor's sweep of orphans under `cas/b/`.
 //!
-//! A task writes its packs (`-<k>`) and large objects (`-L<i>`) to `cas/b/<build>/<nonce>-<slot>`
-//! through presigned writes. When the
+//! A task writes its packs and large objects to `cas/b/<build>/<nonce>-<slot>` (`-<k>`, `-L<i>`)
+//! through presigned writes, or commits them as `cas/b/<build>/<nonce>/<name>` (`pack`,
+//! `pack<k>`, `L<i>`) into a put directory ([`kbf_task_pack::KeyLayout`]). When the
 //! pack is rejected, or the run fails after the write, nothing records it and nothing reads it:
 //! it is an orphan. [`Sweeper::sweep`] lists the prefix and deletes the orphans that are older
 //! than the grace period. Every delete is gated four ways: by the prefix (the listing is asked
@@ -70,7 +71,7 @@ impl Default for SweepConfig {
 }
 
 /// The age a task pack key says: the start of the minute it was minted in, whatever its slot
-/// (`-<k>` or `-L<i>`). `None` for a key that is not a task pack key. This is the usual
+/// and layout (`-<k>`, `-L<i>`, `/pack`, `/pack<k>` or `/L<i>`). `None` for a key that is not a task pack key. This is the usual
 /// [`SweepGates::age_of`].
 #[must_use]
 pub fn task_key_age(key: &str) -> Option<SystemTime> {

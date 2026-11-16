@@ -152,9 +152,15 @@ units carry `RestartPreventExitStatus=2` and `RestartSec=5`, so exit 2 stays dow
   system call that failed because the device was busy, read-only or full, and a
   registration whose boot the node's metadata log has set already (`StaleWriter`, below: only a node that did not report its history, or one past the clamp).
   A frontend or daemon that fails to start is not covered: `frontend` and `kbf-server`
-  exit 2 for every start error, and the daemon half's own codes are unchanged. The one
-  exception is the `frontend` mode's state store, below: a Postgres that stays down for
-  all of `--state-store-wait-secs` exits 1.
+  exit 2 for every start error, and the daemon half's own codes are unchanged. The
+  exceptions are the `frontend` mode's state store, below: a Postgres that stays down for
+  all of `--state-store-wait-secs` exits 1; and its `file://` `--history-objects`
+  directory: a frontend whose directory another process still holds (its `LOCK`) does not
+  exit but waits for it, trying again after 250 ms and then after twice as long each time up
+  to 5 s, with no deadline, and logs every attempt; a SIGINT or SIGTERM during the wait
+  stops it with exit 0. Every other failure to open the directory exits 2 as before. A
+  unit's stop ends before its next start, so under systemd the holder is another process
+  on the same directory, and the unit's `TimeoutStartSec=` ends the wait.
 
 **A new or restored state store, and the nodes' boots.** The frontend hands each node its
 member id and a boot counter from the store (`boot/<id>`, one more at every registration);
@@ -321,6 +327,13 @@ it out on its own health check and its connections' GOAWAY (the order and each p
    when it passes with executions open, the frontend logs a WARN with their count and sets
    `deadline_passed` in `GET /v1/frontend/drain`, and goes on waiting with the process up and
    every stream open, whether a stop signal or `POST /v1/frontend/drain` began the drain.
+   Under `--executor js-agent`, a job still queued on the job service when step 3 closes the
+   intake (no host took it) is cancelled and its lease given up, its operation queued again
+   for the next frontend: nothing of it ran, and the queue may never move (every host out of
+   service). Its stream is kept while a daemon session of another frontend could run the
+   operation (that frontend takes it from the state store and answers it), and ended
+   `UNAVAILABLE` when none could, which fails that action (Buck2 never re-attaches). A job a
+   host has placed, or is running, is waited for.
 5. The worker streams that are left end `UNAVAILABLE` (daemons dial another frontend through
    the load balancer, which keeps their leases), and the process exits 0. Only a forced stop
    (below) leaves client streams open at this step, and ends them `UNAVAILABLE`. It is not undone: what starts in its place is a new process.

@@ -36,7 +36,9 @@ use tokio::time::Instant;
 use crate::executor::api::{answered, not_found, note};
 use crate::executor::host::HostWorker;
 use crate::executor::metrics::{IngestEnd, Metrics, RunEnd};
-use crate::executor::outcome::{Settled, Verdict, forgotten, judge, ran, refused, result_of};
+use crate::executor::outcome::{
+    Settled, Verdict, drained, forgotten, judge, ran, refused, result_of,
+};
 use crate::executor::output::{Grants, Output, Tail};
 use crate::executor::phases::{Mark, Timeline};
 use crate::executor::submit::{Booking, Prepared, prepare};
@@ -52,6 +54,9 @@ pub(super) struct Task {
     pub(super) timeline: Timeline,
     /// The silence of the host holding its job was seen and counted.
     silence_seen: bool,
+    /// The preparation of its job, while it runs on its own task. Dropped with the task, it is
+    /// not stopped: see [`HostWorker::preparing`].
+    preparing: Option<JoinHandle<Result<Arc<Prepared>, Settled>>>,
 }
 
 pub(super) enum Stage {
@@ -72,6 +77,9 @@ pub(super) struct Waiting {
     /// Until when the `Start` may be acted on; `None` for one that names a heartbeat the
     /// worker did not send.
     deadline: Option<Instant>,
+    /// When the heartbeat the `Start` names was sent; `None` for one the worker did not send.
+    /// The drop warning gives its age.
+    beat: Option<Instant>,
     /// A share of a host, or the whole host for a `whole_machine` lease.
     booking: Booking,
     /// The job, kept from the first try: a read of the CAS, a url and a grant are not made
@@ -122,16 +130,58 @@ impl Task {
     }
 }
 
+/// Where the preparation of a task's job stands.
+enum Preparing {
+    Ready(Arc<Prepared>),
+    /// Not done yet: the next pass asks again.
+    Pending,
+    Failed(Settled),
+}
+
 /// What came of trying to submit a task.
 enum Submitted {
     /// Not now: try again while the `Start` is valid.
     Wait(Waiting),
     Running(Running),
     Settled(Settled),
-    /// The `Start`'s window ended while the task was being prepared or its submit was not
-    /// answered: dropped, as one that arrived late is, after the job that may exist is
+    /// The `Start`'s window ended while the task's submit was not answered, or as the job
+    /// was prepared: dropped, as one that arrived late is, after the job that may exist is
     /// cancelled.
-    Late(Option<String>),
+    Late(Option<String>, Dropped),
+}
+
+/// Where a `Start` stood when its window ended, which the warning of its drop records: the
+/// drops of a farm differ in cause (a worker given more `Start`s than it prepares at once, a
+/// preparation slower than the window, a submit that waited), and the remedies differ too.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DroppedAt {
+    /// Its preparation never began: it waited for a place under `prepare_concurrency`.
+    NotBegun,
+    /// Its preparation was still running.
+    Preparing,
+    /// Its preparation ended, but not before the window did.
+    PreparedLate,
+    /// Its job was prepared and its submit sent, but not answered inside the window.
+    SubmitUnanswered,
+}
+
+impl DroppedAt {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::NotBegun => "not_begun",
+            Self::Preparing => "preparing",
+            Self::PreparedLate => "prepared_late",
+            Self::SubmitUnanswered => "submit_unanswered",
+        }
+    }
+}
+
+/// What the warning of a dropped `Start` records beyond the lease.
+struct Dropped {
+    stage: DroppedAt,
+    /// The age, in milliseconds, of the heartbeat the `Start` names when it was dropped, or
+    /// `none` for one the worker did not send.
+    beat_age_ms: String,
 }
 
 impl HostWorker {
@@ -142,8 +192,10 @@ impl HostWorker {
     pub(super) fn accept(&mut self, start: &Start) {
         let lease = start.lease_id.unwrap_or_default();
         let window = Duration::from_millis(start.valid_for_ms).min(START_VALIDITY);
+        let beat = self.sent_at(start.heartbeat_seq);
         let waiting = Waiting {
-            deadline: self.sent_at(start.heartbeat_seq).map(|sent| sent + window),
+            deadline: beat.map(|sent| sent + window),
+            beat,
             booking: Booking::of(start),
             prepared: None,
             sent: false,
@@ -158,6 +210,7 @@ impl HostWorker {
                 stage: Stage::Waiting(waiting),
                 timeline: Timeline::default(),
                 silence_seen: false,
+                preparing: None,
             });
     }
 
@@ -202,6 +255,11 @@ impl HostWorker {
 
     /// Submits every waiting task the job service will take.
     pub(super) async fn launch(&mut self, ctx: &Ctx<'_>, now: Instant) {
+        // Once for the pass, not once for each task: the preparations begun on earlier passes
+        // get the runtime before they are looked at.
+        // Once for the pass, not once for each task: the preparations begun on earlier passes
+        // get the runtime before they are looked at.
+        tokio::task::yield_now().await;
         let waiting: Vec<_> = self
             .tasks
             .iter()
@@ -219,12 +277,17 @@ impl HostWorker {
                 break;
             }
             let Some(deadline) = w.deadline.filter(|deadline| at < *deadline) else {
-                tracing::warn!(worker = %self.id, %lease, "a Start outside its window is dropped");
+                let Dropped { stage, beat_age_ms } = self.dropped(lease, &w, false, at);
+                tracing::warn!(worker = %self.id, %lease, stage = %stage.label(), %beat_age_ms, "a Start outside its window is dropped");
                 self.late(ctx, lease, w.sent_job());
                 continue;
             };
+            // Only so many preparations run at once on a worker: the rest of its `Start`s wait,
+            // so the ones that began finish inside their window instead of all of them
+            // finishing after it. A task already preparing is never held back.
+            let begin = self.preparing_now() < ctx.cfg.prepare_concurrency;
             self.stamp(lease, Mark::Seen, at, ctx);
-            match self.submit(ctx, lease, &action, w, deadline).await {
+            match self.submit(ctx, lease, &action, w, deadline, begin).await {
                 Submitted::Wait(w) => self.set_stage(lease, Stage::Waiting(w)),
                 Submitted::Running(running) => {
                     self.stamp(lease, Mark::Posted, ctx.now(), ctx);
@@ -233,12 +296,44 @@ impl HostWorker {
                 Submitted::Settled(settled) => {
                     self.settle_with(lease, &settled, now, &ctx.deps.metrics);
                 }
-                Submitted::Late(job) => {
-                    tracing::warn!(worker = %self.id, %lease, "a Start ran out of its window before its job was submitted and is dropped");
+                Submitted::Late(job, Dropped { stage, beat_age_ms }) => {
+                    tracing::warn!(worker = %self.id, %lease, stage = %stage.label(), %beat_age_ms, "a Start ran out of its window before its job was submitted and is dropped");
                     self.late(ctx, lease, job);
                 }
             }
         }
+    }
+
+    /// Where `lease`'s `Start` stood at `at`, when its window ended: `ready` if its job had
+    /// just been prepared.
+    fn dropped(&self, lease: LeaseId, w: &Waiting, ready: bool, at: Instant) -> Dropped {
+        let preparing = self
+            .tasks
+            .get(&lease)
+            .is_some_and(|task| task.preparing.is_some());
+        let stage = if w.prepared.is_some() {
+            DroppedAt::SubmitUnanswered
+        } else if ready {
+            DroppedAt::PreparedLate
+        } else if preparing {
+            DroppedAt::Preparing
+        } else {
+            DroppedAt::NotBegun
+        };
+        let beat_age_ms = w.beat.map_or_else(
+            || "none".to_owned(),
+            |beat| at.saturating_duration_since(beat).as_millis().to_string(),
+        );
+        Dropped { stage, beat_age_ms }
+    }
+
+    /// How many of the worker's preparations are running now.
+    fn preparing_now(&self) -> usize {
+        self.tasks
+            .values()
+            .filter_map(|task| task.preparing.as_ref())
+            .filter(|handle| !handle.is_finished())
+            .count()
     }
 
     /// Drops a `Start` whose window ended: at once if no job of it may exist, else once the
@@ -274,6 +369,62 @@ impl HostWorker {
         });
     }
 
+    /// The preparation of `lease`'s job: begun on its own task if it has none, and waited for
+    /// for one poll at most. One that ends after the window is judged late by the caller.
+    ///
+    /// A preparation that outlasts the window is not stopped with it: it goes on, bounded by
+    /// [`Config::prepare_limit`], so the input tree it publishes is there, and the memo of the
+    /// writer holds it, when the farm runs the action again.
+    async fn preparing(
+        &mut self,
+        ctx: &Ctx<'_>,
+        lease: LeaseId,
+        action: &Digest,
+        booking: Booking,
+        begin: bool,
+    ) -> Preparing {
+        let begun = self
+            .tasks
+            .get_mut(&lease)
+            .and_then(|task| task.preparing.take());
+        let waits = begun.is_none();
+        let mut handle = match begun {
+            Some(handle) => handle,
+            None if !begin => return Preparing::Pending,
+            None => {
+                let (preparer, action) = (ctx.preparer(), action.clone());
+                let limit = preparer.cfg.prepare_limit;
+                tokio::spawn(async move {
+                    let preparing = prepare(&preparer, lease, &action, booking);
+                    tokio::time::timeout(limit, preparing)
+                        .await
+                        .unwrap_or_else(|_| {
+                            Err(Settled::Infra(format!(
+                                "the inputs of the run were not ready within {limit:?}"
+                            )))
+                        })
+                })
+            }
+        };
+        // One just begun is given a poll to finish; one begun on an earlier pass is only
+        // looked at: a pass that waited a poll for each of a worker's tasks held its intake,
+        // its reads and its heartbeat for as many polls as it had tasks.
+        let wait = if waits { ctx.cfg.poll } else { Duration::ZERO };
+        match tokio::time::timeout(wait, &mut handle).await {
+            Err(_) => {
+                self.tasks
+                    .entry(lease)
+                    .and_modify(|task| task.preparing = Some(handle));
+                Preparing::Pending
+            }
+            Ok(Ok(Ok(prepared))) => Preparing::Ready(prepared),
+            Ok(Ok(Err(settled))) => Preparing::Failed(settled),
+            Ok(Err(error)) => Preparing::Failed(Settled::Infra(format!(
+                "the preparation of the run ended without an answer: {error}"
+            ))),
+        }
+    }
+
     async fn submit(
         &mut self,
         ctx: &Ctx<'_>,
@@ -281,29 +432,30 @@ impl HostWorker {
         action: &Digest,
         w: Waiting,
         deadline: Instant,
+        begin: bool,
     ) -> Submitted {
         // What preparing reads (the CAS, the store, the grant service) is not the job
-        // service's and is not bounded by it: it is bounded by the window, which it cannot
-        // outlast and have the submit still be good.
+        // service's, and it can take longer than the window: a tree of many files is
+        // published into the store first. It runs on a task of its own, so the pass waits for
+        // it one poll at most and goes on to the other workers:
+        // one slow preparation must not hold the heartbeats and the starts of the rest.
         let prepared = match &w.prepared {
             Some(prepared) => Arc::clone(prepared),
-            None => {
-                let preparing = prepare(ctx, lease, action, w.booking);
-                match tokio::time::timeout_at(deadline, preparing).await {
-                    Ok(Ok(prepared)) => {
-                        self.stamp(lease, Mark::Prepared, ctx.now(), ctx);
-                        prepared
-                    }
-                    Ok(Err(settled)) => return Submitted::Settled(settled),
-                    Err(_) => return Submitted::Late(None),
+            None => match self.preparing(ctx, lease, action, w.booking, begin).await {
+                Preparing::Ready(prepared) => {
+                    self.stamp(lease, Mark::Prepared, ctx.now(), ctx);
+                    prepared
                 }
-            }
+                Preparing::Pending => return Submitted::Wait(w),
+                Preparing::Failed(settled) => return Submitted::Settled(settled),
+            },
         };
         // The CAS read, the url and the grant each took as long as the store took: the window
         // is judged by the clock now, the last moment before the submit.
         let now = ctx.now();
         if now >= deadline {
-            return Submitted::Late(w.sent_job());
+            let dropped = self.dropped(lease, &w, true, now);
+            return Submitted::Late(w.sent_job(), dropped);
         }
         if w.sent {
             ctx.deps.metrics.job_resubmitted();
@@ -388,6 +540,24 @@ impl HostWorker {
         }
     }
 
+    /// Cancels the job of a running task that is still queued on the job service when the
+    /// drain has closed the intake, and settles the task as infrastructure, so the farm gives
+    /// the lease up. A cancel the service has not answered is tried again on the next pass.
+    async fn withdraw_unplaced(&mut self, ctx: &Ctx<'_>, now: Instant, lease: LeaseId, id: &str) {
+        let answer = ctx.api().cancel_job(id).await;
+        self.heard(ctx, &answer);
+        note("cancelling a queued job at a drain", &answer);
+        if !answered(&answer) {
+            return;
+        }
+        if answer.is_ok() {
+            ctx.deps.metrics.job_cancelled();
+        }
+        tracing::info!(worker = %self.id, %lease, job = %id, "draining: the job is still queued on the job service, withdrawn");
+        ctx.deps.farm.unplaced(lease);
+        self.settle_with(lease, &drained(), now, &ctx.deps.metrics);
+    }
+
     /// Reads one running task's job, and its result once it has ended; the output of one that
     /// did not end well goes with its `Result` ([`output`](super::output)).
     async fn read(
@@ -416,6 +586,14 @@ impl HostWorker {
             self.saw_silence(ctx, lease, &job.host_id);
         }
         let live = match job.state() {
+            // A drain has closed the intake and the job service has not placed this job on a
+            // host: nothing of it ran, and nothing here may wait on a queue that may never
+            // move. It is withdrawn and the lease given up (the next frontend runs the
+            // operation).
+            JobState::Queued if ctx.deps.farm.intake_closed() => {
+                self.withdraw_unplaced(ctx, now, lease, id).await;
+                return;
+            }
             JobState::Queued | JobState::Placed | JobState::Starting => true,
             JobState::Running => {
                 self.stamp(lease, Mark::Running, now, ctx);
@@ -452,8 +630,8 @@ impl HostWorker {
     }
 
     /// The output of job `id`, which did not end well: the tails of its `result` if they hold
-    /// any, else one `GetLogs`; redacted of `grants` and cut to the cap. Only the lengths are
-    /// logged.
+    /// any, else one `GetLogs`; redacted of `grants` and cut to the cap. The lengths are logged,
+    /// and the end of the standard error, redacted, as a second line at WARN.
     async fn output(
         &mut self,
         ctx: &Ctx<'_>,
@@ -483,6 +661,17 @@ impl HostWorker {
             unread = output.note.is_some(),
             "the output of a job that did not end well goes with its result"
         );
+        if let Some(excerpt) = output.stderr_excerpt(ctx.cfg.failed_stderr_log_bytes) {
+            // Debug-formatted, so a line break in the job's text cannot start a log line.
+            tracing::warn!(
+                worker = %self.id,
+                %lease,
+                job = id,
+                stderr = ?excerpt,
+                cut = excerpt.len() < output.stderr.trim().len(),
+                "the end of the standard error of a job that did not end well"
+            );
+        }
         output
     }
 
@@ -521,6 +710,9 @@ impl HostWorker {
         let limits = UntrustedLimits {
             max_pack_bytes: ctx.cfg.max_pack_bytes,
             max_blob_bytes: ctx.cfg.max_blob_bytes,
+            max_object_entries: ctx.cfg.max_object_entries,
+            max_object_manifest_bytes: ctx.cfg.max_object_manifest_bytes,
+            object_bytes_per_entry: ctx.cfg.object_bytes_per_entry,
         };
         let handle =
             tokio::spawn(async move { ingest.ingest(lease, &key, &action, &limits).await });

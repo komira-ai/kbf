@@ -1,9 +1,11 @@
-//! [`Backend`]: what Execute and the scheduler need of the store, and nothing more. Three
+//! [`Backend`]: what Execute and the scheduler need of the store, and nothing more. Four
 //! implementations: a [`Cache`] in this process (what `kbf-server` and `kbf all-in-one`
 //! have always run), a [`Storage`] reached over gRPC (`kbf frontend` without members,
 //! which holds no blobs of its own: `docs/design/architecture-v2.md`, sections 2 and 7),
-//! and the storage nodes of a map ([`Backend::routed`], `kbf frontend` with members),
-//! which is the second until the map has two members.
+//! the storage nodes of a map ([`Backend::routed`], `kbf frontend` with members),
+//! which is the second until the map has two members, and no node at all
+//! ([`Backend::stored`]: the packs, the pack index and the action cache table of the state
+//! store; `stored` has the rules).
 //!
 //! The calls are the ones the scheduler side makes: the action-cache lookup before a
 //! run, the Action and Command blobs, the check that every input is held, and the two
@@ -37,6 +39,7 @@
 
 mod closed;
 mod layered;
+mod stored;
 
 use std::fmt;
 use std::sync::Arc;
@@ -59,7 +62,7 @@ use crate::input_tree::Walked;
 use crate::input_walk::{Blobs, Trees, walk};
 use crate::meta_log::{Leadership, MetaLog};
 use crate::metrics::CacheMetrics;
-use crate::proxy::Packs;
+use crate::proxy::{Packs, Stored};
 use crate::routed::Routed;
 
 /// The store behind Execute and the scheduler. Cheap to clone.
@@ -87,6 +90,12 @@ trait Plane: Send + Sync {
     }
     /// The packs a plane keeps its client uploads in, if it has any.
     fn packs(&self) -> Option<&Packs>;
+    /// Whether [`Plane::put_streamed`] of a large blob writes the object `cas/l/<sha256>` in the
+    /// packs' object store itself (a plane with no storage node does), so that a second write of
+    /// that key beside it is a duplicate of it.
+    fn writes_large_object_itself(&self) -> bool {
+        false
+    }
     fn action_result<'a>(
         &'a self,
         action: &'a Digest,
@@ -100,6 +109,30 @@ trait Plane: Send + Sync {
         action: Digest,
         record: ActionRecord,
     ) -> BoxFuture<'_, Answer<()>>;
+    /// The second half for a result the first half checked: `record` is what
+    /// [`Plane::prepare_action_result`] answered for `result`. A store that keeps the record
+    /// and the result apart commits the record; one that keeps the result in the row of the
+    /// action (no storage node) writes `result`, which is why it is handed it.
+    fn commit_prepared<'a>(
+        &'a self,
+        action: Digest,
+        record: ActionRecord,
+        _result: &'a ActionResult,
+    ) -> BoxFuture<'a, Answer<()>> {
+        self.commit_action_record(action, record)
+    }
+    /// A result written whole: the two halves of the action-cache write, as a store that
+    /// can do them apart does them.
+    fn put_action_result<'a>(
+        &'a self,
+        action: &'a Digest,
+        result: &'a ActionResult,
+    ) -> BoxFuture<'a, Answer<()>> {
+        Box::pin(async move {
+            let record = self.prepare_action_result(result).await?;
+            self.commit_action_record(*action, record).await
+        })
+    }
     fn walk_inputs(&self, root: Digest) -> BoxFuture<'_, Answer<Walked>>;
     fn put_streamed<'a>(
         &'a self,
@@ -155,6 +188,14 @@ impl Backend {
             trees: Trees::default(),
             packs,
         }))
+    }
+
+    /// A store with no storage node behind it: [`Stored`], the packs, the pack index and the
+    /// action cache table of the state store. What Execute reads and writes is theirs
+    /// (`backend::stored` has the rules).
+    #[must_use]
+    pub fn stored(stored: Arc<Stored>) -> Self {
+        Self(Arc::new(self::stored::StoredPlane::new(stored)))
     }
 
     /// The digests among `digests` the store does not hold ([`Storage::find_missing`]).
@@ -253,8 +294,47 @@ impl Backend {
         self.0.commit_action_record(action, record).await
     }
 
+    /// The second half for a result the first half checked ([`Backend::prepare_action_result`]
+    /// answered `record` for `result`): the entry of `action` is written without the check
+    /// being made again. A store with no storage node holds the result in the row of the
+    /// action, so it is the one that needs `result` and takes the write only this way.
+    ///
+    /// # Errors
+    /// As [`Backend::commit_action_record`] answers; a `record` that is not the one of `result`
+    /// is [`StorageError::Invalid`] where the result is the row.
+    pub async fn commit_prepared(
+        &self,
+        action: Digest,
+        record: ActionRecord,
+        result: &ActionResult,
+    ) -> Result<(), StorageError> {
+        self.0.commit_prepared(action, record, result).await
+    }
+
+    /// Writes `result` as the action-cache entry of `action`: both halves of the write, the
+    /// check of the closure and the commit, for a caller that has no use for the record
+    /// between them. A store with no storage node takes the write only this way.
+    ///
+    /// # Errors
+    /// As [`Backend::prepare_action_result`] and [`Backend::commit_action_record`] answer.
+    pub async fn put_action_result(
+        &self,
+        action: Digest,
+        result: &ActionResult,
+    ) -> Result<(), StorageError> {
+        self.0.put_action_result(&action, result).await
+    }
+
     pub(crate) async fn walk_inputs(&self, root: Digest) -> Result<Walked, StorageError> {
         self.0.walk_inputs(root).await
+    }
+
+    /// Whether [`Backend::put_streamed`] writes a large blob to `cas/l/<sha256>` in the packs'
+    /// object store itself, which is the case for a frontend with no storage node. The ingest
+    /// then writes no second copy of the key beside it.
+    #[must_use]
+    pub fn writes_large_object_itself(&self) -> bool {
+        self.0.writes_large_object_itself()
     }
 
     /// Stores the blob `digest` from the pieces `open` gives, a piece at a time and never held

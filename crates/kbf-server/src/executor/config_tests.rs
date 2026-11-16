@@ -27,6 +27,17 @@ fn the_defaults_are_valid_once_the_operator_allows_argv_secrets() {
     assert_eq!(base().validate(), Ok(()));
 }
 
+/// Catches the heartbeat interval returning to 5 s: a `Start` names the newest heartbeat the
+/// farm took and is valid for 14 s from it, so each second of that heartbeat's age is a second
+/// less for the preparation and the submit. The default is 1 s, and the config holding it is
+/// valid.
+#[test]
+fn the_default_heartbeat_interval_is_one_second() {
+    let config = base();
+    assert_eq!(config.heartbeat, Duration::from_secs(1));
+    assert_eq!(config.validate(), Ok(()));
+}
+
 /// Catches a fence time that lets a silent worker's runs outlive the scheduler's grace
 /// (the farm requeues the action after G while the first copy still runs): T plus the
 /// scheduler's margin plus one step must stay under G, for the default T and for no bigger.

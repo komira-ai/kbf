@@ -174,6 +174,29 @@ fn a_role_runs_the_kbf_the_topology_names_for_it_else_the_default() {
     }
 }
 
+/// Asserts that the nodes of the rehearsal's farm and of the beta farm are started with a cold
+/// store that keeps no free bytes of the disk, so the free space of the host (a runner that
+/// has filled up with build output) does not decide whether a node can flush and stop.
+/// Catches: a node on a disk with less free than 5% of it refusing every flush, then not
+/// stopping within its grace and being killed, in a test that has nothing to do with the disk.
+#[test]
+fn a_farm_node_keeps_no_free_bytes_of_the_hosts_disk() {
+    for (name, topology) in [
+        ("rehearsal", Topology::rehearsal(3)),
+        ("beta", Topology::beta()),
+    ] {
+        assert!(
+            topology
+                .limits
+                .node
+                .contains(&"--cold-store-floor-bytes=0".to_owned()),
+            "{name}: {:?}",
+            topology.limits.node
+        );
+        assert!(topology.limits.frontend.is_empty(), "{name}");
+    }
+}
+
 #[test]
 fn a_kill_is_not_taken_for_a_crash() {
     // Catches: a killed role failing `wait` (the kill tests could never wait again), and

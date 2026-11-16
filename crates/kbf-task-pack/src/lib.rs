@@ -4,19 +4,22 @@
 //! A task pack is one object whose record at offset 0 is a JSON manifest ([`TaskManifest`]), under
 //! a key the frontend minted ([`TaskPackKey`]), followed by the blobs the manifest names. The
 //! task that writes one ([`write_pack`]) and the frontend that ingests it ([`read_manifest`],
-//! [`check_shape`]) use these, so the two cannot drift. They do no I/O and hold no secret.
+//! [`check_shape`]) use these, so the two cannot drift. They hold no secret, and do no I/O of
+//! their own. (A put-directory task no longer writes packs: it writes the one-pass object of
+//! [`one_pass`]; the frontend still reads a pack a release before it wrote.)
 //!
 //! This crate is a leaf on purpose: it depends on the segment layout and the digest type only,
 //! so a static task binary can link it without the pack index, the object store client or their
 //! dependencies. `kbf-pack` re-exports every name below.
 
+pub mod one_pass;
 mod task_key;
 mod task_manifest;
 mod task_pack;
 
 pub use task_key::{
-    MAC_LEN, MAX_BUILD_BYTES, MAX_LARGE, MAX_PACKS, Slot, TaskKeyError, TaskPackKey, check_build,
-    mac_input, mac_input_v1, minute_of,
+    KeyLayout, MAC_LEN, MAX_BUILD_BYTES, MAX_LARGE, MAX_PACKS, Slot, TaskKeyError, TaskPackKey,
+    check_build, mac_input, mac_input_put_dir, mac_input_v1, minute_of,
 };
 pub use task_manifest::{
     EMPTY_DIGEST, InputStats, InputsFrom, LargeEntry, MANIFEST_VERSION, MANIFEST_VERSION_2,

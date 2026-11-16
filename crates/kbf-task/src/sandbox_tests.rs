@@ -55,6 +55,13 @@ fn the_line_names_the_action_and_the_sandbox() {
         ))
     );
     assert_eq!(line(Sandbox::Unavailable), None);
+    // A job's Command is said nothing of: nothing is made and nothing is unusual.
+    assert_eq!(line(Sandbox::Job), None);
+    assert_eq!(Sandbox::Job.to_string(), "none (the job is the sandbox)");
+    assert_eq!(
+        crate::network::Layers::Job.to_string(),
+        "none (the job is the sandbox)"
+    );
     assert_eq!(Sandbox::Unavailable.to_string(), "none (Linux only)");
 }
 

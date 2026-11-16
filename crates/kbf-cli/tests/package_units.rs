@@ -152,6 +152,9 @@ fn each_package_unit_command_line_parses_with_kbfs_own_parser() {
             match kbf_cli::parse_from(argv) {
                 Ok(_) => {}
                 Err(e) if e.kind() == clap::error::ErrorKind::MissingRequiredArgument => {}
+                // No `storage` key in the file or on the line: a frontend with no storage node,
+                // which the unit's own file completes.
+                Err(e) if e.to_string().contains("no --storage needs") => {}
                 Err(e) => panic!("{mode} {line:?}: {e}"),
             }
         }

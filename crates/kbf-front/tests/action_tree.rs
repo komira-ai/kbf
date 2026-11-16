@@ -9,7 +9,7 @@
 //! the real node. Time is a test clock; a lookup that hangs ends at the writer's deadline on
 //! tokio's paused clock, and no test reads the wall clock or waits.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -17,7 +17,7 @@ use bytes::Bytes;
 use futures::StreamExt as _;
 use futures::future::BoxFuture;
 use futures::stream;
-use kbf_front::action_tree::{ActionTree, BaseFacts, BaseTree, NoTree, TreeWriter};
+use kbf_front::action_tree::{ActionTree, BaseFacts, BaseTree, NoTree, PutRetry, TreeWriter};
 use kbf_front::job_read::{BlobSource, Span};
 use kbf_front::large_backfill::LargeStore;
 use kbf_front::prepare_run::{ClosureLimits, KeptClosure, collect_closure_keeping};
@@ -40,6 +40,8 @@ mod kept;
 mod limits;
 #[path = "action_tree/memo.rs"]
 mod memo;
+#[path = "action_tree/retry.rs"]
+mod retry;
 #[path = "action_tree/store.rs"]
 mod store;
 
@@ -70,6 +72,10 @@ struct Faults {
     read_broken: Option<Digest>,
     /// A key whose write the store refuses.
     put: Option<String>,
+    /// The answers the next writes of a key give instead of storing, in order.
+    script: BTreeMap<String, VecDeque<ObjectStoreError>>,
+    /// The answers the next writes of any key give instead of storing, in order.
+    any: VecDeque<ObjectStoreError>,
 }
 
 #[derive(Default)]
@@ -405,6 +411,18 @@ impl LargeStore for Farm {
             if refused {
                 return Err(ObjectStoreError::Unsupported("writes to this key"));
             }
+            let scripted = {
+                let mut state = self.state();
+                let keyed = state
+                    .faults
+                    .script
+                    .get_mut(&name)
+                    .and_then(VecDeque::pop_front);
+                keyed.or_else(|| state.faults.any.pop_front())
+            };
+            if let Some(answer) = scripted {
+                return Err(answer);
+            }
             let mut got = Vec::new();
             while let Some(piece) = body.next().await {
                 match piece {
@@ -554,6 +572,11 @@ impl Rig {
 
     /// A rig whose memo holds at most `entries`, or the writer's own bound.
     async fn with_memo(entries: Option<usize>) -> Self {
+        Self::with_memo_retry(entries, None).await
+    }
+
+    /// A rig whose writer repeats its writes by `retry`, if given.
+    async fn with_memo_retry(entries: Option<usize>, retry: Option<PutRetry>) -> Self {
         let farm = Farm::new();
         let clock = Arc::new(Mutex::new(UNIX_EPOCH + Duration::from_secs(START_SECS)));
         let now = Arc::clone(&clock);
@@ -564,6 +587,10 @@ impl Rig {
         let writer = match entries {
             Some(entries) => TreeWriter::with_memo_entries(source, store, clock_fn, entries),
             None => TreeWriter::new(source, store, clock_fn),
+        };
+        let writer = match retry {
+            Some(retry) => writer.with_put_retry(retry),
+            None => writer,
         };
         let base = Base::publish(&farm);
         let command = reapi::Command {

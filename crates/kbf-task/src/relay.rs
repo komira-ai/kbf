@@ -28,10 +28,13 @@
 //!
 //! Both get, as their standard input, the write end of the pipe the tool reads the child's
 //! report on ([`crate::child::Report`]). Whichever starts the Command writes two bytes there:
-//! [`STARTED`] and 0 once it has started, or [`NOT_STARTED`] and the `errno` when it could not
-//! (the tool then fails the run start, exit 11, as for any program that cannot be started). A
-//! Command the relay executes itself gets standard input closed by the `exec`, so its successful
-//! start is the end of the pipe.
+//! [`STARTED`] and 0 once it has started, or, when it could not, a code naming the stage that
+//! failed and the `errno`: [`NOT_STARTED`] (the Command itself), [`INIT_NOT_STARTED`] (the relay
+//! could not start the first process) or [`INIT_SETUP_FAILED`] (the first process could not make
+//! itself ready). The tool then fails the run start, exit 11, as for any program that cannot be
+//! started, and names the stage in the error ([`crate::run::Stage`]); a relay the tool could not
+//! execute at all is the stage `Relay`. A Command the relay executes itself gets standard input
+//! closed by the `exec`, so its successful start is the end of the pipe.
 
 use std::ffi::{OsStr, OsString};
 use std::io;
@@ -51,6 +54,12 @@ pub const INIT: &str = "--sandbox-init";
 pub const STARTED: u8 = 0;
 /// The start report: the Command could not be started; the `errno` follows.
 pub const NOT_STARTED: u8 = 1;
+/// The start report: the relay could not start the first process of the PID namespace (this
+/// binary, [`INIT`]); the `errno` follows.
+pub const INIT_NOT_STARTED: u8 = 2;
+/// The start report: the first process could not make itself ready to start the Command (its
+/// death signal, non-dumpable, capabilities); the `errno` follows.
+pub const INIT_SETUP_FAILED: u8 = 3;
 
 /// The exit code of a relay or first process that could not start the Command (the tool has the
 /// reason from the start report).
@@ -155,7 +164,7 @@ pub fn relay(report: &impl AsFd, init_program: &Path, mode: &Mode<'_>) -> i32 {
     if !pid_namespace_pending() {
         // `exec` returns only when it failed.
         let error = Command::new(program).args(args).stdin(Stdio::null()).exec();
-        return not_started(report, &error);
+        return not_started(report, NOT_STARTED, &error);
     }
     let mut first = Command::new(init_program);
     first.arg(INIT);
@@ -165,7 +174,7 @@ pub fn relay(report: &impl AsFd, init_program: &Path, mode: &Mode<'_>) -> i32 {
     let started = first.arg("--").args(mode.command).spawn();
     let mut first = match started {
         Ok(first) => first,
-        Err(error) => return not_started(report, &error),
+        Err(error) => return not_started(report, INIT_NOT_STARTED, &error),
     };
     // A failure leaves it in the Command's group, where the deadline's kill ends it too, before
     // it reaps the rest; nothing else changes.
@@ -175,22 +184,36 @@ pub fn relay(report: &impl AsFd, init_program: &Path, mode: &Mode<'_>) -> i32 {
 
 /// The namespace's first process: see the module documentation.
 pub fn init(report: &impl AsFd, mode: &Mode<'_>) -> i32 {
+    init_with(report, mode, prepare)
+}
+
+/// [`init`] with its setup a parameter, so a failing one can be tried.
+fn init_with(report: &impl AsFd, mode: &Mode<'_>, setup: fn(&Mode<'_>) -> io::Result<()>) -> i32 {
+    if let Err(error) = setup(mode) {
+        return not_started(report, INIT_SETUP_FAILED, &error);
+    }
     match start(mode) {
         Ok(command) => {
             tell(report, STARTED, 0);
             wait_until(Pid::from_child(&command), true)
         }
-        Err(error) => not_started(report, &error),
+        Err(error) => not_started(report, NOT_STARTED, &error),
     }
 }
 
-/// The first process's setup, then the Command started with its input closed.
-fn start(mode: &Mode<'_>) -> io::Result<std::process::Child> {
+/// The first process's setup, before it starts the Command: it dies with the relay, is
+/// non-dumpable, and (in a user namespace of the Command's own) holds no capability.
+fn prepare(mode: &Mode<'_>) -> io::Result<()> {
     rustix::process::set_parent_process_death_signal(Some(Signal::KILL))?;
     crate::child::set_dumpable(false)?;
     if mode.userns {
         drop_capabilities()?;
     }
+    Ok(())
+}
+
+/// The Command started with its input closed.
+fn start(mode: &Mode<'_>) -> io::Result<std::process::Child> {
     let [program, args @ ..] = mode.command else {
         return Err(io::Error::from_raw_os_error(libc::EINVAL));
     };
@@ -206,10 +229,10 @@ fn tell(report: &impl AsFd, what: u8, errno: u8) {
     let _ = rustix::io::write(report, &[what, errno]);
 }
 
-/// Reports that the Command could not be started, for `error`, and returns the exit code that
-/// says so.
-fn not_started(report: &impl AsFd, error: &io::Error) -> i32 {
-    tell(report, NOT_STARTED, crate::child::code(error));
+/// Reports that the start `what` ([`NOT_STARTED`], [`INIT_NOT_STARTED`] or [`INIT_SETUP_FAILED`])
+/// failed with `error`, and returns the exit code that says so.
+fn not_started(report: &impl AsFd, what: u8, error: &io::Error) -> i32 {
+    tell(report, what, crate::child::code(error));
     CANNOT_START
 }
 

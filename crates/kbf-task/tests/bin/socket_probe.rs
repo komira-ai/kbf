@@ -23,7 +23,11 @@
 //! exits 0 once it has said so; `holds <own> <lock> <fifo>` takes an exclusive `flock` of
 //! `<own>`, opens `<fifo>` for writing and keeps it open, and runs `hold <lock> <fifo>` as its
 //! child (in its own process group, so the group's kill reaches it) and waits; `caps` prints its
-//! effective, permitted and inheritable capability sets.
+//! effective, permitted and inheritable capability sets. `orphan <lock> <pidfile>` (`tests/job_reap.rs`)
+//! starts `leave` with a pipe for its standard input, reads from it the id of a process it left
+//! behind (written to `<pidfile>` too), lets that process end by closing the pipe, and waits until
+//! `/proc` has no entry for it (a process nobody reaped is still listed, as a zombie): then it
+//! exits with 42. It waits for as long as it takes: a failing case is one that never ends.
 
 use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::process::ExitStatusExt as _;
@@ -80,7 +84,14 @@ fn probe(args: &[&str]) -> u8 {
             );
             0
         }
-        ["linger", lock, pidfile] => linger(lock, pidfile),
+        #[cfg(target_os = "linux")]
+        ["orphan", _lock, pidfile] => orphan(pidfile),
+        #[cfg(target_os = "linux")]
+        ["leave"] => leave(),
+        #[cfg(target_os = "linux")]
+        ["wait-for-end"] => wait_for_end(),
+        ["linger", lock, pidfile] => linger(lock, pidfile, true),
+        ["linger-in-group", lock, pidfile] => linger(lock, pidfile, false),
         #[cfg(target_os = "linux")]
         ["hold", lock, pidfile] => hold(lock, pidfile),
         #[cfg(target_os = "linux")]
@@ -281,19 +292,80 @@ fn exec_from(dir: &str) -> u8 {
     }
 }
 
+/// The Command of `tests/job_reap.rs`: starts `leave` (its standard input a pipe it holds), reads
+/// the id of the process `leave` left behind, waits for `leave`, then closes the pipe: the left
+/// process, orphaned by then, ends. Exits with 42 once `/proc` no longer lists it, so something
+/// reaped it while this ran.
+#[cfg(target_os = "linux")]
+fn orphan(pidfile: &str) -> u8 {
+    use std::io::BufRead as _;
+    let Ok(me) = std::env::current_exe() else {
+        return UNKNOWN_MODE;
+    };
+    let started = Command::new(me)
+        .arg("leave")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn();
+    let Ok(mut leave) = started else {
+        return UNKNOWN_MODE;
+    };
+    let mut line = String::new();
+    let said = leave
+        .stdout
+        .take()
+        .map(|out| std::io::BufReader::new(out).read_line(&mut line));
+    let pid = line.trim().parse::<u32>();
+    let (Some(Ok(_)), Ok(pid), Ok(_)) = (said, pid, leave.wait()) else {
+        return UNKNOWN_MODE;
+    };
+    if std::fs::write(pidfile, format!("{pid}\n")).is_err() {
+        return UNKNOWN_MODE;
+    }
+    // Closing the pipe is the left process's cue to end; its parent is gone, so it is this task's.
+    drop(leave.stdin.take());
+    while std::path::Path::new(&format!("/proc/{pid}")).exists() {
+        std::thread::yield_now();
+    }
+    42
+}
+
+/// Starts `wait-for-end` (it inherits the standard input), prints its id and exits at once,
+/// leaving it an orphan.
+#[cfg(target_os = "linux")]
+fn leave() -> u8 {
+    let Ok(me) = std::env::current_exe() else {
+        return UNKNOWN_MODE;
+    };
+    let Ok(left) = Command::new(me).arg("wait-for-end").spawn() else {
+        return UNKNOWN_MODE;
+    };
+    println!("{}", left.id());
+    0
+}
+
+/// Reads its standard input to the end, then exits.
+#[cfg(target_os = "linux")]
+fn wait_for_end() -> u8 {
+    use std::io::Read as _;
+    let _ = std::io::stdin().read_to_end(&mut Vec::new());
+    0
+}
+
 /// Starts `hold` in a process group of its own and returns once it holds the lock.
-fn linger(lock: &str, pidfile: &str) -> u8 {
+fn linger(lock: &str, pidfile: &str, own_group: bool) -> u8 {
     use std::io::BufRead as _;
     use std::os::unix::process::CommandExt as _;
     let Ok(me) = std::env::current_exe() else {
         return UNKNOWN_MODE;
     };
-    let Ok(mut held) = Command::new(me)
-        .args(["hold", lock, pidfile])
-        .stdout(std::process::Stdio::piped())
-        .process_group(0)
-        .spawn()
-    else {
+    let mut held = Command::new(me);
+    held.args(["hold", lock, pidfile])
+        .stdout(std::process::Stdio::piped());
+    if own_group {
+        held.process_group(0);
+    }
+    let Ok(mut held) = held.spawn() else {
         return UNKNOWN_MODE;
     };
     let mut line = String::new();

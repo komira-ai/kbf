@@ -12,7 +12,12 @@
 //! Unless the action asked for it (`kbf-network=allow`, [`network`]), the program and everything it
 //! starts can make no socket but a Unix one.
 //!
-//! On Linux the program runs in mount and PID namespaces of its own ([`sandbox`]): the directories
+//! In a job ([`Run::job`], the tree job of `--tree`) none of what follows is made: the job is the
+//! sandbox (its own user namespace, no network, a layered root), so the program is started
+//! directly, with no filter, no namespace, no relay and no covers, and only its process cleanup is kept
+//! ([`Job`]). That is the owner's decision of 2026-11-15 (`docs/design/actions-as-jobs.md`, 4.4).
+//!
+//! Otherwise, on Linux the program runs in mount and PID namespaces of its own ([`sandbox`]): the directories
 //! of [`Run::hidden`] are covered, the run's own directories are bound at `/tmp`, `/var/tmp`, `/run`
 //! and `/root`, and every process it started is ended when it ends. One line per action says how
 //! that came out.
@@ -43,7 +48,7 @@ use kbf_proto::reapi::Command;
 use tokio::fs;
 use tokio::process::Command as Process;
 
-use crate::fetch;
+use crate::message;
 use crate::network::{self, Layers, Network};
 use crate::sandbox::{self, Sandbox};
 
@@ -73,11 +78,37 @@ pub enum RunError {
     #[error("cannot confine the Command: {0}")]
     Confine(String),
     /// The program could not be started.
-    #[error("cannot start {program}: {source}")]
+    #[error("cannot start {stage} {program}: {source}")]
     Spawn {
+        stage: Stage,
         program: PathBuf,
         source: std::io::Error,
     },
+}
+
+/// The process that could not start what it was to, as the start report names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stage {
+    /// The tool could not execute the relay (this binary).
+    Relay,
+    /// The relay could not start the namespace's first process (this binary again).
+    Init,
+    /// The first process could not make itself ready to start the Command.
+    InitSetup,
+    /// The Command could not be started, by the first process or, with no PID namespace, by
+    /// the relay.
+    Command,
+}
+
+impl std::fmt::Display for Stage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Stage::Relay => "the relay",
+            Stage::Init => "the sandbox's first process",
+            Stage::InitSetup => "the sandbox's first process (its setup)",
+            Stage::Command => "the Command",
+        })
+    }
 }
 
 /// How a run ended.
@@ -116,9 +147,9 @@ pub struct Run<'a> {
     /// Whether the program may use the network; [`Network::Denied`] unless the action asked
     /// ([`network::from_platform`]).
     pub network: Network,
-    /// Files holding a credential or a presigned URL this tool was given (the grant token file,
-    /// the PUT URL files). On macOS the Command's sandbox profile denies reading each; on Linux
-    /// the list is not used: the directory the job's host writes them to is one of `hidden`.
+    /// Files holding a credential this tool was given. On macOS the Command's sandbox profile
+    /// denies reading each; on Linux the list is not used: the directory the job's host writes
+    /// them to is one of `hidden`. The task tool, which is given none, passes none.
     pub unreadable: &'a [PathBuf],
     /// Directories the Command must not see (Linux): each that exists is covered by an empty
     /// read-only tmpfs in its mount namespace ([`sandbox`]); `root` and `private` stay visible at
@@ -129,6 +160,22 @@ pub struct Run<'a> {
     /// namespace of its own (Linux): the tool passes its own path (`std::env::current_exe`). `None`
     /// makes no PID namespace, and the Command is started as it is.
     pub relay: Option<&'a Path>,
+    /// Run as a job's Command: started directly, with no network filter, namespace, covers or
+    /// relay (`unreadable`, `hidden` and `relay` are not used), and only the cleanup of [`Job`]
+    /// kept. `None` is the sandbox of this module.
+    pub job: Option<Job>,
+}
+
+/// How a job's Command is cleaned up after. In both the Command leads its own process group, which
+/// is killed with SIGKILL when the deadline passes and once the Command has exited.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Job {
+    /// The group alone: a process that left it (`setsid`) is not ended.
+    Group,
+    /// Also, on Linux, this process becomes the subreaper of its descendants, and every process
+    /// left once the Command has ended is killed and reaped, whichever group it is in. For a
+    /// process that runs one Command at a time and owns its children: it reaps any child.
+    Subreaper,
 }
 
 /// Runs `command` under `run.root`.
@@ -166,6 +213,17 @@ pub async fn run(command: &Command, run: &Run<'_>) -> Result<Ran, RunError> {
     } else {
         PathBuf::from(program)
     };
+    if let Some(job) = run.job {
+        let process = process_of(
+            &program,
+            &command.arguments[1..],
+            &work_dir,
+            command,
+            private,
+            (stdout, stderr),
+        );
+        return run_job(job, process, &program, run.deadline).await;
+    }
     let launch = network::launch(
         &program,
         &command.arguments[1..],
@@ -174,36 +232,37 @@ pub async fn run(command: &Command, run: &Run<'_>) -> Result<Ran, RunError> {
     )?;
     let layout = sandbox::layout(run.hidden, run.private, run.root, &work_dir)?;
     let (started, relayed) = relayed(launch.clone(), run.relay);
-    let mut process = Process::new(&started.program);
-    process
-        .args(&started.args)
-        .current_dir(&work_dir)
-        .env_clear()
-        .envs(private)
-        .envs(
-            command
-                .environment_variables
-                .iter()
-                .map(|v| (&v.name, &v.value)),
-        )
-        .stdin(Stdio::null())
-        .stdout(stdout)
-        .stderr(stderr)
-        .process_group(0)
-        .kill_on_drop(true);
+    let mut process = process_of(
+        &started.program,
+        &started.args,
+        &work_dir,
+        command,
+        private,
+        (stdout, stderr),
+    );
     let confinement = network::confine(&mut process, run.network, layout, relayed)?;
 
     let cpu_before = children_usage().cpu_us;
     let clock = Instant::now();
+    // What an error names: the Command by its path, the relay and the first process (this
+    // binary, which the relay starts again) by the relay's.
     let started_as = launch.name(&program);
-    let spawn_error = |source| RunError::Spawn {
-        program: started_as.clone(),
+    let spawn_error = |stage, source| RunError::Spawn {
+        stage,
+        program: match stage {
+            Stage::Command => started_as.clone(),
+            Stage::Relay | Stage::Init | Stage::InitSetup => started.program.clone(),
+        },
         source,
     };
-    let mut child = process.spawn().map_err(|source| RunError::Spawn {
-        program: started.name(&program),
-        source,
-    })?;
+    let first = if relayed {
+        Stage::Relay
+    } else {
+        Stage::Command
+    };
+    let mut child = process
+        .spawn()
+        .map_err(|source| spawn_error(first, source))?;
     // Taken before the wait: the pid is also the id of the group the child leads. The group is
     // killed however this function is left, a dropped future included: `kill_on_drop` ends the
     // child alone, which in a PID namespace is the relay, and the processes it made may not yet
@@ -213,28 +272,16 @@ pub async fn run(command: &Command, run: &Run<'_>) -> Result<Ran, RunError> {
     // The builder holds write ends of the report pipe; the report is read to its end.
     drop(process);
     let (layers, sandbox, refused) = confinement.read();
-    if let Some(errno) = refused {
-        return Err(spawn_error(std::io::Error::from_raw_os_error(errno)));
+    if let Some((stage, errno)) = refused {
+        return Err(spawn_error(stage, std::io::Error::from_raw_os_error(errno)));
     }
-    let waited = tokio::time::timeout(run.deadline, child.wait()).await;
-    let (status, timed_out) = if let Ok(status) = waited {
-        (status, false)
-    } else {
-        kill_group(group);
-        (child.wait().await, true)
-    };
+    let (status, timed_out) = wait_ending(&mut child, group, run.deadline).await;
     // Whatever the program left running in its group is ended with it.
     ends_group.now();
-    let status = status.map_err(spawn_error)?;
+    let status = status.map_err(|source| spawn_error(Stage::Command, source))?;
     let wall_ms = u64::try_from(clock.elapsed().as_millis()).unwrap_or(u64::MAX);
     let usage = children_usage();
-    let exit_code = if timed_out {
-        TIMED_OUT_EXIT_CODE
-    } else {
-        status
-            .code()
-            .unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
-    };
+    let exit_code = exit_code_of(status, timed_out);
     Ok(Ran {
         exit_code,
         timed_out,
@@ -244,6 +291,207 @@ pub async fn run(command: &Command, run: &Run<'_>) -> Result<Ran, RunError> {
         layers,
         sandbox,
     })
+}
+
+/// The process that starts `program` with `args` in `work_dir`: the environment cleared, then the
+/// run's own variables and the Command's; no standard input; the streams `out` (standard output
+/// and error); leading a process group of its own; killed when dropped.
+fn process_of(
+    program: &Path,
+    args: &[impl AsRef<std::ffi::OsStr>],
+    work_dir: &Path,
+    command: &Command,
+    private: Vec<(&'static str, OsString)>,
+    out: (Stdio, Stdio),
+) -> Process {
+    let mut process = Process::new(program);
+    process
+        .args(args)
+        .current_dir(work_dir)
+        .env_clear()
+        .envs(private)
+        .envs(
+            command
+                .environment_variables
+                .iter()
+                .map(|v| (&v.name, &v.value)),
+        )
+        .stdin(Stdio::null())
+        .stdout(out.0)
+        .stderr(out.1)
+        .process_group(0)
+        .kill_on_drop(true);
+    process
+}
+
+/// Waits for `child` until `deadline`, then kills its group (`group`, taken before the wait) and
+/// waits again; and whether the deadline passed.
+async fn wait_ending(
+    child: &mut tokio::process::Child,
+    group: Option<u32>,
+    deadline: Duration,
+) -> (std::io::Result<std::process::ExitStatus>, bool) {
+    if let Ok(status) = tokio::time::timeout(deadline, child.wait()).await {
+        (status, false)
+    } else {
+        kill_group(group);
+        (child.wait().await, true)
+    }
+}
+
+/// The exit code a run reports: [`TIMED_OUT_EXIT_CODE`] for a deadline, else the program's, or
+/// 128 plus the signal that ended it.
+fn exit_code_of(status: std::process::ExitStatus, timed_out: bool) -> i32 {
+    if timed_out {
+        TIMED_OUT_EXIT_CODE
+    } else {
+        status
+            .code()
+            .unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
+    }
+}
+
+/// Runs the Command of a job directly ([`Run::job`]): no filter, namespace, covers or relay.
+async fn run_job(
+    job: Job,
+    mut process: Process,
+    program: &Path,
+    deadline: Duration,
+) -> Result<Ran, RunError> {
+    let spawn_error = |source| RunError::Spawn {
+        stage: Stage::Command,
+        program: program.to_owned(),
+        source,
+    };
+    if job == Job::Subreaper {
+        become_subreaper().map_err(spawn_error)?;
+    }
+    let cpu_before = children_usage().cpu_us;
+    let clock = Instant::now();
+    let chld = watch_children(job).map_err(spawn_error)?;
+    let mut child = process.spawn().map_err(spawn_error)?;
+    let group = child.id();
+    let mut ends_group = GroupKill(group);
+    drop(process);
+    // While the Command runs, what its processes leave is reaped as it ends, not at the end.
+    let reaper = start_reaper(chld, group);
+    let (status, timed_out) = wait_ending(&mut child, group, deadline).await;
+    if let Some(reaper) = reaper {
+        reaper.abort();
+    }
+    ends_group.now();
+    if job == Job::Subreaper {
+        reap_descendants();
+    }
+    let status = status.map_err(spawn_error)?;
+    let wall_ms = u64::try_from(clock.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let usage = children_usage();
+    Ok(Ran {
+        exit_code: exit_code_of(status, timed_out),
+        timed_out,
+        wall_ms,
+        cpu_us: usage.cpu_us.saturating_sub(cpu_before),
+        peak_rss_bytes: usage.peak_rss_bytes,
+        layers: network::Layers::Job,
+        sandbox: Sandbox::Job,
+    })
+}
+
+/// Makes this process the subreaper of its descendants: a process whose parent ends is handed to
+/// this one, which can then end and reap it ([`reap_descendants`]).
+#[cfg(target_os = "linux")]
+fn become_subreaper() -> std::io::Result<()> {
+    rustix::process::set_child_subreaper(Some(rustix::process::getpid()))?;
+    Ok(())
+}
+
+/// The `SIGCHLD` listener of a [`Job::Subreaper`] run (Linux), made before the Command starts.
+#[cfg(target_os = "linux")]
+fn watch_children(job: Job) -> std::io::Result<Option<tokio::signal::unix::Signal>> {
+    (job == Job::Subreaper)
+        .then(crate::orphans::listen)
+        .transpose()
+}
+
+/// Starts reaping the children but `command` as they end (Linux), if `chld` is a listener.
+#[cfg(target_os = "linux")]
+fn start_reaper(
+    chld: Option<tokio::signal::unix::Signal>,
+    command: Option<u32>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    chld.map(|chld| crate::orphans::reap_others(chld, command))
+}
+
+/// No subreaper elsewhere: nothing to reap while the Command runs.
+#[cfg(not(target_os = "linux"))]
+fn watch_children(_: Job) -> std::io::Result<Option<tokio::signal::unix::Signal>> {
+    Ok(None)
+}
+
+/// No subreaper elsewhere: nothing to reap while the Command runs.
+#[cfg(not(target_os = "linux"))]
+fn start_reaper(
+    _: Option<tokio::signal::unix::Signal>,
+    _: Option<u32>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    None
+}
+
+/// Linux only: no subreaper elsewhere, so the group kill alone is kept.
+#[cfg(not(target_os = "linux"))]
+fn become_subreaper() -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Kills and reaps every child of this process (the Command's leftovers, handed to it as their
+/// parents ended), until it has none.
+#[cfg(target_os = "linux")]
+fn reap_descendants() {
+    use rustix::io::retry_on_intr;
+    use rustix::process::{Signal, WaitOptions, kill_process, wait};
+    loop {
+        let children = own_children();
+        if children.is_empty() {
+            break;
+        }
+        for pid in children {
+            // A child that is gone already makes the kill fail, which is fine.
+            let _ = kill_process(pid, Signal::KILL);
+        }
+        // Waits for any child to end (not `waitpid(None, ..)`, which is the caller's own group),
+        // and the next look finds what the ones just reaped had handed over: a process whose
+        // parent ends is handed to this one before that parent can be reaped. The result is
+        // not read: the look decides.
+        let _ = retry_on_intr(|| wait(WaitOptions::empty()));
+    }
+}
+
+/// No subreaper elsewhere.
+#[cfg(not(target_os = "linux"))]
+fn reap_descendants() {}
+
+/// The pids of the processes whose parent is this one, from `/proc`.
+#[cfg(target_os = "linux")]
+pub(crate) fn own_children() -> Vec<rustix::process::Pid> {
+    let me = std::process::id();
+    // Unreadable: no child is seen, and the wait that follows ends the loop or not as the
+    // children say.
+    std::fs::read_dir("/proc")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let pid: i32 = entry.file_name().to_str()?.parse().ok()?;
+            let stat = std::fs::read_to_string(entry.path().join("stat")).ok()?;
+            // `pid (comm) state ppid ...`: comm may hold spaces and parentheses, so the fields
+            // are those after the last `)`.
+            let after = stat.rsplit_once(')')?.1;
+            let ppid: u32 = after.split_whitespace().nth(1)?.parse().ok()?;
+            (ppid == me)
+                .then(|| rustix::process::Pid::from_raw(pid))
+                .flatten()
+        })
+        .collect()
 }
 
 /// What to start for `launch` through `relay`: the relay's arguments for it (Linux, `relay`
@@ -330,9 +578,9 @@ pub(crate) fn output_paths(command: &Command) -> Vec<&String> {
 }
 
 /// A path the Command names must be empty (the directory itself) or relative, of non-empty
-/// components other than `.` and `..`: the rule of [`fetch::check_relative`].
+/// components other than `.` and `..`: the rule of [`message::check_relative`].
 fn check_relative(what: &str, path: &str) -> Result<(), RunError> {
-    fetch::check_relative(what, path).map_err(|e| RunError::Invalid(e.to_string()))
+    message::check_relative(what, path).map_err(|e| RunError::Invalid(e.to_string()))
 }
 
 /// Creates `base/relative` and each directory on the way that does not exist yet. A component
@@ -417,11 +665,13 @@ fn children_usage() -> ChildrenUsage {
     };
     ChildrenUsage {
         cpu_us: micros(usage.ru_utime) + micros(usage.ru_stime),
-        // Linux reports the peak resident set in KiB, macOS in bytes.
-        peak_rss_bytes: u64::try_from(usage.ru_maxrss).unwrap_or(0)
-            * if cfg!(target_os = "macos") { 1 } else { 1024 },
+        peak_rss_bytes: u64::try_from(usage.ru_maxrss).unwrap_or(0) * MAXRSS_UNIT,
     }
 }
+
+/// The bytes of one unit of `ru_maxrss`: Linux reports the peak resident set in KiB, macOS in
+/// bytes. A constant, so that the system this is not built for is no branch no test can take.
+const MAXRSS_UNIT: u64 = if cfg!(target_os = "macos") { 1 } else { 1024 };
 
 #[cfg(test)]
 mod tests {
@@ -473,6 +723,29 @@ mod tests {
                     unreadable: &[],
                     hidden: &[],
                     relay: None,
+                    job: None,
+                },
+            )
+            .await
+        }
+
+        /// [`Rig::run`] as a job's Command. The relay and the hidden directory are given, to show
+        /// that a job uses neither.
+        async fn run_job(&self, command: &Command, deadline: Duration) -> Result<Ran, RunError> {
+            let root = self.root();
+            run(
+                command,
+                &Run {
+                    root: &root,
+                    private: &self.private(),
+                    stdout: &self.stdout,
+                    stderr: &self.stderr,
+                    deadline,
+                    network: NETWORK,
+                    unreadable: &[],
+                    hidden: std::slice::from_ref(&root),
+                    relay: Some(Path::new("/no/such/kbf-task")),
+                    job: Some(Job::Group),
                 },
             )
             .await
@@ -787,6 +1060,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_job_runs_the_program_by_its_path_under_the_work_directory() {
+        let rig = Rig::new("job-path");
+        let bin = rig.root().join("work/bin");
+        std::fs::create_dir_all(&bin).expect("bin");
+        std::fs::copy("/bin/pwd", bin.join("pwd")).expect("tool");
+        let mut command = program(&["./bin/pwd"]);
+        command.working_directory = "work".into();
+        let ran = rig.run_job(&command, LONG).await.expect("ran");
+        assert_eq!(ran.exit_code, 0);
+        // The program names its directory as the system does (macOS's temporary directory is
+        // reached through a symlink).
+        let work = std::fs::canonicalize(rig.root().join("work")).expect("work");
+        assert_eq!(rig.out(), format!("{}\n", work.display()));
+    }
+
+    /// A job's Command is run with no layer made on any system: the run says so, though a relay
+    /// and a hidden directory are given (a job uses neither).
+    #[tokio::test]
+    async fn a_job_makes_no_layer_and_no_relay() {
+        let rig = Rig::new("job-layers");
+        let ran = rig
+            .run_job(&program(&["/usr/bin/true"]), LONG)
+            .await
+            .expect("ran");
+        assert_eq!(ran.exit_code, 0);
+        assert_eq!(ran.layers, Layers::Job);
+        assert_eq!(ran.sandbox, Sandbox::Job);
+    }
+
+    /// On Linux: the Command is in the namespaces of the task, none of its own.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_job_makes_no_namespace() {
+        let rig = Rig::new("job-namespaces");
+        let links = ["user", "net", "mnt", "pid"].map(|ns| format!("/proc/self/ns/{ns}"));
+        let mut argv = vec!["/bin/readlink"];
+        argv.extend(links.iter().map(String::as_str));
+        let ran = rig.run_job(&program(&argv), LONG).await.expect("ran");
+        let ours: String = links
+            .iter()
+            .map(|link| format!("{}\n", std::fs::read_link(link).expect("link").display()))
+            .collect();
+        assert_eq!(rig.out(), ours);
+        assert_eq!(ran.layers, Layers::Job);
+    }
+
+    #[tokio::test]
+    async fn a_job_does_not_cover_the_input_root() {
+        let rig = Rig::new("job-no-cover");
+        std::fs::write(rig.root().join("marker"), "seen").expect("marker");
+        let mut command = program(&["/bin/cat", "marker"]);
+        command.working_directory = String::new();
+        rig.run_job(&command, LONG).await.expect("ran");
+        assert_eq!(rig.out(), "seen");
+    }
+
+    #[tokio::test]
+    async fn a_job_deadline_kills_the_process_group() {
+        let rig = Rig::new("job-deadline");
+        let command = program(&[
+            "/usr/bin/find",
+            ".",
+            "-maxdepth",
+            "0",
+            "-exec",
+            "/bin/sleep",
+            "600.4242",
+            ";",
+        ]);
+        let ran = rig.run_job(&command, Duration::ZERO).await.expect("ran");
+        assert!(ran.timed_out);
+        assert_eq!(ran.exit_code, TIMED_OUT_EXIT_CODE);
+    }
+
+    #[tokio::test]
+    async fn a_job_program_that_cannot_start_is_a_command_start_error() {
+        let rig = Rig::new("job-missing");
+        let error = rig
+            .run_job(&program(&["/no/such/program"]), LONG)
+            .await
+            .expect_err("not started");
+        assert!(
+            matches!(
+                &error,
+                RunError::Spawn {
+                    stage: Stage::Command,
+                    ..
+                }
+            ),
+            "{error}"
+        );
+        assert!(error.to_string().contains("/no/such/program"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_job_reports_the_exit_code_and_the_signal() {
+        let rig = Rig::new("job-codes");
+        assert_eq!(
+            rig.run_job(&program(&["/usr/bin/false"]), LONG)
+                .await
+                .expect("ran")
+                .exit_code,
+            1
+        );
+        let rig = Rig::new("job-signal");
+        let ran = rig
+            .run_job(&program(&["/bin/kill", "-TERM", "0"]), LONG)
+            .await
+            .expect("ran");
+        assert_eq!(ran.exit_code, 128 + 15);
+    }
+
+    #[tokio::test]
     async fn usage_is_reported() {
         let rig = Rig::new("usage");
         let ran = rig
@@ -896,6 +1282,7 @@ mod tests {
                 unreadable: &[],
                 hidden: &[],
                 relay: None,
+                job: None,
             },
         )
         .await
@@ -914,13 +1301,78 @@ mod tests {
             ..Command::default()
         };
         let result = rig.run(&command, LONG).await;
-        if cfg!(target_os = "macos") {
+        #[cfg(target_os = "macos")]
+        {
             let ran = result.expect("sandbox-exec ran");
             assert_ne!(ran.exit_code, 0);
             assert!(rig.err().contains("no-such-program"), "{}", rig.err());
-        } else {
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
             let error = result.expect_err("refused");
             assert!(matches!(error, RunError::Spawn { .. }), "{error}");
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "cannot start the Command {}: No such file or directory (os error 2)",
+                    rig.root().join("./no-such-program").display()
+                )
+            );
         }
+    }
+
+    /// Catches a stage of a refused start that says nothing, or the words of two stages swapped:
+    /// each names the process that could not start what it was to.
+    #[test]
+    fn each_stage_of_a_refused_start_names_its_process() {
+        let said: Vec<String> = [Stage::Relay, Stage::Init, Stage::InitSetup, Stage::Command]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            said,
+            [
+                "the relay",
+                "the sandbox's first process",
+                "the sandbox's first process (its setup)",
+                "the Command",
+            ]
+        );
+    }
+
+    /// Catches the start of a missing relay being reported as the Command's own: with a relay
+    /// given, the first process the tool starts is the relay, and the error names that stage.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_relay_that_cannot_be_started_is_named_as_the_relay() {
+        let rig = Rig::new("relay-missing");
+        let root = rig.root();
+        let error = run(
+            &program(&["true"]),
+            &Run {
+                root: &root,
+                private: &rig.private(),
+                stdout: &rig.stdout,
+                stderr: &rig.stderr,
+                deadline: LONG,
+                network: NETWORK,
+                unreadable: &[],
+                hidden: &[],
+                relay: Some(Path::new("/no/such/kbf-task")),
+                job: None,
+            },
+        )
+        .await
+        .expect_err("a relay that does not exist was started");
+        assert!(
+            matches!(
+                error,
+                RunError::Spawn {
+                    stage: Stage::Relay,
+                    ..
+                }
+            ),
+            "{error}"
+        );
     }
 }

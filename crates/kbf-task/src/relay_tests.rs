@@ -208,7 +208,11 @@ fn with_a_pid_namespace_the_relay_starts_the_first_process_and_passes_its_exit_u
     assert_eq!(case("/usr/bin/false", true), (1, Vec::new()));
     let (code, said) = case("/no/such/init", false);
     assert_eq!(code, CANNOT_START);
-    assert_eq!(said, [NOT_STARTED, u8::try_from(libc::ENOENT).unwrap()]);
+    assert_eq!(
+        said,
+        [INIT_NOT_STARTED, u8::try_from(libc::ENOENT).unwrap()],
+        "a first process that cannot be executed is not reported as the Command"
+    );
 }
 
 /// Catches a pending PID namespace read wrongly from the two links: one not shown yet (no first
@@ -292,6 +296,23 @@ fn the_first_process_starts_the_command_reports_it_and_passes_its_exit_up() {
     assert_eq!(
         pipe.said(),
         [NOT_STARTED, u8::try_from(libc::ENOENT).unwrap()]
+    );
+}
+
+/// Catches a first process whose own setup fails being reported as a Command that did not start:
+/// the report names the setup, with its errno, and no Command is started.
+#[test]
+fn a_first_process_whose_setup_fails_reports_the_setup_not_the_command() {
+    fn refuse(_: &Mode<'_>) -> io::Result<()> {
+        Err(io::Error::from_raw_os_error(libc::EPERM))
+    }
+    let pipe = Pipe::new();
+    let command = os(&["/usr/bin/true"]);
+    let code = in_child(|| init_with(pipe.write_end(), &mode(false, true, &command), refuse));
+    assert_eq!(code, CANNOT_START);
+    assert_eq!(
+        pipe.said(),
+        [INIT_SETUP_FAILED, u8::try_from(libc::EPERM).unwrap()]
     );
 }
 

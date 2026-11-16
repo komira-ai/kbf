@@ -358,3 +358,22 @@ fn a_failed_read_is_a_short_note_that_never_quotes_the_service() {
         );
     }
 }
+
+/// Catches the log excerpt cutting a character in two, keeping the head instead of the end,
+/// keeping what a stream's white space adds, or showing something where there is nothing:
+/// the end of the stream on a character boundary, trimmed; none at a cap of 0 or for white
+/// space alone.
+#[test]
+fn the_stderr_excerpt_is_the_end_trimmed_on_a_character_boundary() {
+    let output = |stderr: &str| Output {
+        stderr: stderr.to_owned(),
+        ..Output::default()
+    };
+    assert_eq!(output("one\ntwo\nthree\n").stderr_excerpt(6), Some("three"));
+    assert_eq!(output("short\n").stderr_excerpt(512), Some("short"));
+    // "é" is two bytes: a cap that lands inside it starts after it.
+    assert_eq!(output("aéb").stderr_excerpt(2), Some("b"));
+    assert_eq!(output("anything").stderr_excerpt(0), None);
+    assert_eq!(output(" \n\t").stderr_excerpt(512), None);
+    assert_eq!(output("").stderr_excerpt(512), None);
+}

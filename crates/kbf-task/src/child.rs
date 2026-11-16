@@ -32,6 +32,7 @@ use rustix::mount::{MountFlags, MountPropagationFlags};
 use rustix::process::DumpableBehavior;
 
 use crate::network::Layers;
+use crate::run::Stage;
 use crate::sandbox::Sandbox;
 
 /// No step failed.
@@ -175,8 +176,8 @@ pub struct Report {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Start {
     Started,
-    /// It could not be started, with this `errno`.
-    NotStarted(i32),
+    /// It could not be started: the stage that failed, with this `errno`.
+    NotStarted(Stage, i32),
 }
 
 /// How the steps went, in the child.
@@ -329,11 +330,13 @@ impl Report {
 
 /// The start a start report means.
 pub fn started(report: [u8; 2]) -> Start {
-    if report[0] == crate::relay::NOT_STARTED {
-        Start::NotStarted(i32::from(report[1]))
-    } else {
-        Start::Started
-    }
+    let stage = match report[0] {
+        crate::relay::NOT_STARTED => Stage::Command,
+        crate::relay::INIT_NOT_STARTED => Stage::Init,
+        crate::relay::INIT_SETUP_FAILED => Stage::InitSetup,
+        _ => return Start::Started,
+    };
+    Start::NotStarted(stage, i32::from(report[1]))
 }
 
 /// The network layers a report means, for a Command `denied` the network or not and run as

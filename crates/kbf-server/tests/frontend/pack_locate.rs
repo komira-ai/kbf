@@ -76,7 +76,10 @@ fn start(flags: &FrontendFlags) -> Packed {
         })
     })
     .expect("starts");
-    let (worker, index) = (handle.worker, handle.pack_index());
+    let (worker, index) = (
+        handle.worker.expect("a worker listener"),
+        handle.pack_index(),
+    );
     tokio::spawn(handle.serve());
     Packed {
         worker,

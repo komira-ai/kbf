@@ -573,6 +573,10 @@ impl PackIndex for Index {
         self.inner.dead_packs(grace, limit)
     }
 
+    fn drop_location(&self, digest: &BlobDigest, pack_key: &str) -> Result<bool, PackIndexError> {
+        self.inner.drop_location(digest, pack_key)
+    }
+
     fn unreferenced_keys(&self, keys: &[String]) -> Result<Vec<String>, PackIndexError> {
         let answer = self.inner.unreferenced_keys(keys);
         let hook = self

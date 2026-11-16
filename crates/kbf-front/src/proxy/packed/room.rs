@@ -95,7 +95,7 @@ impl Budget {
 
 /// Bytes of the budget, given back when this is dropped.
 #[derive(Debug)]
-pub(super) struct Room {
+pub(in crate::proxy) struct Room {
     metrics: Arc<PackMetrics>,
     bytes: u64,
     // Dropped after the count is lowered (below), so that the count never passes the cap.

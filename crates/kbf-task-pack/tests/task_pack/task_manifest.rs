@@ -58,6 +58,7 @@ pub(crate) fn base() -> TaskManifest {
             fetch_ms: 12,
             run_ms: 3456,
             pack_ms: 7,
+            ..Timing::default()
         },
         usage: Usage {
             cpu_usage_us: 3_300_000,
@@ -669,14 +670,17 @@ fn a_large_size_is_over_the_record_cap_and_at_most_the_given_cap() {
     assert!(sized(LARGE_MAX + 1).validate_with(LARGE_MAX + 1).is_ok());
 }
 
-/// Asserts that a large entry no output names is refused: it would be streamed into the store
-/// for nothing.
+/// Asserts that a large entry no output names is accepted: it is a file inside an output
+/// directory's tree (`zig_unpack`'s 172 MB file), which the manifest cannot see. A reader that
+/// holds the tree checks the digest is in it.
 #[test]
-fn a_large_object_no_output_names_is_refused() {
-    let err = refusal_v2("invalid_v2/large_unnamed.json");
+fn a_large_object_no_output_names_is_accepted() {
+    let manifest = parse_v2("valid_v2/large_in_a_tree.json").expect("accepted");
+    assert_eq!(manifest.large.len(), 1);
     assert!(
-        matches!(err, ManifestError::LargeUnnamed { slot: 0, digest: d } if d == digest(BIG_1)),
-        "{err}"
+        manifest
+            .output_digests()
+            .all(|d| d != manifest.large[0].digest)
     );
 }
 

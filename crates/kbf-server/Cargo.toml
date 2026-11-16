@@ -31,6 +31,8 @@ kbf-auth.workspace = true
 kbf-ca.workspace = true
 kbf-front.workspace = true
 kbf-history.workspace = true
+# The release's base tree bundle, fetched by digest into the local cache (`src/frontend/base_fetch.rs`).
+kbf-image.workspace = true
 kbf-invocation.workspace = true
 # The host executor's client of the job service (src/executor).
 kbf-job-client.workspace = true

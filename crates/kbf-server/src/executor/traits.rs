@@ -22,6 +22,12 @@ pub struct UntrustedLimits {
     pub max_pack_bytes: u64,
     /// The most bytes one blob in it holds.
     pub max_blob_bytes: u64,
+    /// The most records of a one-pass object.
+    pub max_object_entries: usize,
+    /// The most bytes of a one-pass object's manifest.
+    pub max_object_manifest_bytes: u64,
+    /// The bytes of a one-pass object's tail each record may account for.
+    pub object_bytes_per_entry: u64,
 }
 
 /// Why a pack was refused. Every reason is the farm's to run again with a new key.
@@ -195,6 +201,17 @@ pub trait Inputs: Send + Sync {
         action: &Digest,
         expires: Duration,
     ) -> Result<ReadGrant, InputsError>;
+
+    /// The action tree [`Ingest::mint`] wrote for the run of `lease` that commits into a put
+    /// directory: its root manifest's digest, 64 lowercase hex digits. Handed out once.
+    ///
+    /// # Errors
+    /// [`InputsError`]; by default [`InputsError::Unavailable`], for inputs that write no tree.
+    async fn tree(&self, lease: LeaseId) -> Result<String, InputsError> {
+        Err(InputsError::Unavailable(format!(
+            "no input tree was written for {lease}"
+        )))
+    }
 }
 
 #[cfg(test)]

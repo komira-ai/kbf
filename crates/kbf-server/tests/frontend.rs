@@ -68,6 +68,8 @@ pub fn flags(more: &[&str]) -> Result<FrontendFlags, clap::Error> {
         ("--listen", "127.0.0.1:0"),
         ("--worker-listen", "127.0.0.1:0"),
         ("--api-listen", "127.0.0.1:0"),
+        // A change in a dependency shows in `/readyz` within a tick of the test's.
+        ("--readyz-probe-interval-ms", "50"),
     ] {
         if !more
             .iter()
@@ -144,7 +146,11 @@ impl Front {
             })
         })
         .expect("starts");
-        let (reapi, worker, api) = (handle.reapi, handle.worker, handle.api);
+        let (reapi, worker, api) = (
+            handle.reapi,
+            handle.worker.expect("a worker listener"),
+            handle.api,
+        );
         tokio::spawn(handle.serve());
         Self {
             reapi,
@@ -157,6 +163,19 @@ impl Front {
     async fn client(&self) -> Client {
         Client::connect(self.reapi, self.worker).await
     }
+}
+
+/// `GET /readyz` until it answers `code`: the probes are asked in the background, so a change
+/// in a dependency shows in a later answer.
+async fn readyz_until(api: SocketAddr, code: u16) -> Value {
+    for _ in 0..500 {
+        let (got, body) = get(api, "/readyz").await;
+        if got == code {
+            return body;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("/readyz never answered {code}");
 }
 
 async fn get(api: SocketAddr, path: &str) -> (u16, Value) {
@@ -230,8 +249,15 @@ fn a_frontend_refuses_every_flag_that_is_a_storage_nodes() {
             "{e}"
         );
     }
-    let missing = flags(&[]).expect_err("--storage is required");
-    assert!(missing.to_string().contains("--storage"), "{missing}");
+    // With no --storage a frontend has no node: it needs the executor, the pack index and the
+    // pack store in its place, and is refused naming the first it lacks.
+    let missing = flags(&[]).expect_err("no storage node and no executor");
+    assert!(
+        missing
+            .to_string()
+            .contains("no --storage needs --executor js-agent"),
+        "{missing}"
+    );
     let help = frontend::command().render_long_help().to_string();
     for shown in [
         "--storage",
@@ -407,8 +433,7 @@ async fn readyz_follows_the_storage_node() {
     assert_eq!(ask(&mut health).await, serving(ServingStatus::Serving));
 
     node.stop().await;
-    let (code, body) = get(front.api, "/readyz").await;
-    assert_eq!(code, 503, "{body}");
+    let body = readyz_until(front.api, 503).await;
     assert_eq!(failing(&body), ["storage"], "{body}");
     assert!(
         body["failing"][0]["reason"]
@@ -469,7 +494,7 @@ async fn a_stopping_frontend_is_not_serving() {
         "kbf-frontend {} reapi={} worker={} api={} storage=http://{}/",
         kbf_server::SERVER_VERSION,
         handle.reapi,
-        handle.worker,
+        handle.worker.expect("a worker listener"),
         handle.api.unwrap(),
         node.addr
     );
@@ -1414,7 +1439,7 @@ async fn an_open_execute_survives_stop_until_its_action_is_done() {
         },
     )
     .expect("starts");
-    let (reapi, worker) = (handle.reapi, handle.worker);
+    let (reapi, worker) = (handle.reapi, handle.worker.expect("a worker listener"));
     let served = tokio::spawn(handle.serve());
     let client = Client::connect(reapi, worker).await;
     let mut daemon = client.daemon("node-a", 4, 8).await;
@@ -1568,7 +1593,11 @@ async fn the_drain_endpoint_and_a_close_reach_a_frontend() {
         },
     )
     .expect("starts");
-    let (reapi, worker, api) = (handle.reapi, handle.worker, handle.api.expect("an API"));
+    let (reapi, worker, api) = (
+        handle.reapi,
+        handle.worker.expect("a worker listener"),
+        handle.api.expect("an API"),
+    );
     let drain = handle.drain();
     let served = tokio::spawn(handle.serve());
     let client = Client::connect(reapi, worker).await;
@@ -1663,7 +1692,10 @@ async fn a_frontend_with_a_state_store_shows_the_storage_health() {
     let flag = format!("--state-store=sqlite://{}", dir.join("state.db").display());
     let f = flags(&["--storage=http://127.0.0.1:1", &flag]).expect("parses");
     let handle = start_frontend(&f, || Ok(pending::<()>())).expect("starts");
-    let (api, worker) = (handle.api.expect("the operator API"), handle.worker);
+    let (api, worker) = (
+        handle.api.expect("the operator API"),
+        handle.worker.expect("a worker listener"),
+    );
     let served = tokio::spawn(handle.serve());
 
     let (code, body) = get(api, "/v1/storage").await;

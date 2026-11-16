@@ -9,7 +9,8 @@
 //! restricts unprivileged user namespaces) an AppArmor profile that names its `crun`. So a
 //! [`Node`] is two directories: one under `CARGO_TARGET_TMPDIR` (the stand-in links, their
 //! directory, the state root, the join token) and one under `/run` (the scratch root, the image
-//! store beside it, and the run-files root, which must be on a tmpfs); both are removed when
+//! store beside it, and the run-files root, which must be on a tmpfs; the node mounts a tmpfs there
+//! that allows programs to run, for a host that mounts `/run` `noexec`); both are removed when
 //! the node drops. The agent is started by `systemd-run --scope -p Delegate=yes` in a scope of
 //! its own, which it delegates to itself, and the scope's processes are killed when the agent
 //! drops. The profile, when the kernel needs one, names the stand-in `crun` only, and is
@@ -158,6 +159,11 @@ pub struct Node {
 impl Drop for Node {
     fn drop(&mut self) {
         self.accepting.abort();
+        // Lazy: the agent's processes may not have left the directory yet.
+        let _ = Command::new("/usr/bin/umount")
+            .arg("-l")
+            .arg(self._run.path())
+            .output();
         if let Some(profile) = &self.profile {
             let _ = Command::new("/usr/sbin/apparmor_parser")
                 .arg("-R")
@@ -180,6 +186,21 @@ impl Node {
             .unwrap_or_else(|| name.to_owned());
         mkdir(test.path(), 0o755);
         mkdir(run.path(), 0o755);
+        // The agent runs programs from under this directory, and a host may mount `/run`
+        // `noexec` (the hosted ubuntu-24.04 image 20261111.127.1 does: every job then fails
+        // with "start crun: Permission denied"), so the directory is a tmpfs of its own that
+        // allows them; `Drop for Node` unmounts it.
+        must(
+            "/usr/bin/mount",
+            &[
+                "-t".as_ref(),
+                "tmpfs".as_ref(),
+                "-o".as_ref(),
+                "exec,nosuid,nodev,mode=755".as_ref(),
+                "tmpfs".as_ref(),
+                run.path().as_os_str(),
+            ],
+        );
 
         let bin = mkdir(&test.path().join("bin"), 0o755);
         let stand_in_exe = Path::new(env!("CARGO_BIN_EXE_kbf-js-stand-in"));

@@ -186,6 +186,9 @@ pub fn allowed_notice(action: &Digest) -> String {
 pub enum Layers {
     /// The action asked for the network ([`PROPERTY`]): neither layer.
     Open,
+    /// A job's Command ([`crate::run::Run::job`]): none of these layers is made; the job is the
+    /// sandbox.
+    Job,
     /// This system has neither layer (neither Linux nor macOS); only the test feature gets here.
     Unavailable,
     /// macOS: the Command runs under a `sandbox-exec` profile that denies every network operation
@@ -213,6 +216,7 @@ impl std::fmt::Display for Layers {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Layers::Open => write!(f, "open ({PROPERTY}={ALLOW})"),
+            Layers::Job => write!(f, "none (the job is the sandbox)"),
             Layers::Unavailable => write!(f, "none (this system has no filter)"),
             Layers::Seatbelt => write!(
                 f,
@@ -266,16 +270,16 @@ pub struct Confinement {
 
 impl Confinement {
     /// The layers that confine the process that was started, how its sandbox came out, and the
-    /// `errno` of a Command the relay could not start (none when it started). Call it after a
+    /// stage and `errno` of a start the relay or the first process could not make (none when it started). Call it after a
     /// successful spawn, once every handle of the process's builder has been dropped (a write
     /// end of the report pipe is in it).
     #[must_use]
     #[cfg(target_os = "linux")]
-    pub fn read(self) -> (Layers, Sandbox, Option<i32>) {
+    pub fn read(self) -> (Layers, Sandbox, Option<(crate::run::Stage, i32)>) {
         let (layers, sandbox, start) = self.report.read();
         let refused = match start {
             crate::child::Start::Started => None,
-            crate::child::Start::NotStarted(errno) => Some(errno),
+            crate::child::Start::NotStarted(stage, errno) => Some((stage, errno)),
         };
         (layers, sandbox, refused)
     }
@@ -284,7 +288,7 @@ impl Confinement {
     /// for a denied Command, none on another system. There is no sandbox.
     #[must_use]
     #[cfg(not(target_os = "linux"))]
-    pub fn read(self) -> (Layers, Sandbox, Option<i32>) {
+    pub fn read(self) -> (Layers, Sandbox, Option<(crate::run::Stage, i32)>) {
         let layers = match (self.denied, cfg!(target_os = "macos")) {
             (false, _) => Layers::Open,
             (true, true) => Layers::Seatbelt,

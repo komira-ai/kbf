@@ -36,6 +36,7 @@
 //! | failed to start no-capacity | `infra` | `UNAVAILABLE`: rerun, as the farm's own retry policy says |
 //! | failed to start start-timeout | `infra` | `UNAVAILABLE`: rerun, as the farm's own retry policy says |
 //! | failed to start exclusive-not-ready | `infra` | `UNAVAILABLE`: rerun, as the farm's own retry policy says |
+//! | failed to start input-unavailable | `infra` | `UNAVAILABLE`: a host path the job named could not be read on its host, rerun |
 //! | failed to start host-unsafe | `infra` | `UNAVAILABLE`: rerun, as the farm's own retry policy says |
 //! | failed to start egress-unchecked | `infra` | `UNAVAILABLE`: the host's agent could not check the limits of the job's network (`--executor-network`), rerun |
 //! | failed to start, any other code or detail | `infra` | `UNAVAILABLE`: rerun |
@@ -187,6 +188,9 @@ fn failed_to_start(job: &Job) -> Verdict {
         StartFailureCode::ExclusiveNotReady => {
             infra(job, "the job failed to start: exclusive-not-ready")
         }
+        StartFailureCode::InputUnavailable => {
+            infra(job, "the job failed to start: input-unavailable")
+        }
         StartFailureCode::AgentRefused => match agent_code(&job.start_failure_detail) {
             QUOTA_UNAVAILABLE => {
                 tracing::warn!(job = %job.id, "the host refused the start: its scratch quota is out of order");
@@ -211,6 +215,11 @@ fn failed_to_start(job: &Job) -> Verdict {
 /// The ending of a job the service no longer knows, after it was seen.
 pub(super) fn forgotten() -> Settled {
     Settled::Lost(Lost::DaemonRestarted)
+}
+
+/// A job withdrawn at a drain while it was still queued on the job service: nothing ran.
+pub(super) fn drained() -> Settled {
+    Settled::Infra("the frontend is draining and the job had not been placed on a host".to_owned())
 }
 
 /// What a submit that failed with `error` comes to; `None` when nothing is decided, because

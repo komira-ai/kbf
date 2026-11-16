@@ -76,6 +76,8 @@ fn locked(pass: &Mutex<Pass>) -> MutexGuard<'_, Pass> {
 pub(super) struct Large<'a> {
     packs: &'a Packs,
     object: ObjectKey,
+    /// Where the blob starts in the object: 0 for an object of its own.
+    base: u64,
     digest: Digest,
     pass: Arc<Mutex<Pass>>,
 }
@@ -83,9 +85,17 @@ pub(super) struct Large<'a> {
 impl<'a> Large<'a> {
     /// The object under `key`, which the manifest says is the blob `digest`.
     pub(super) fn new(packs: &'a Packs, key: &IssuedPackKey, digest: Digest) -> Self {
+        Self::at(packs, key, 0, digest)
+    }
+
+    /// The blob `digest` that lies at `base` in the object under `key`, a one-pass object that
+    /// holds other blobs too. [`Large::check_length`] is not for it: the index of the object was
+    /// checked to hold the blob inside it.
+    pub(super) fn at(packs: &'a Packs, key: &IssuedPackKey, base: u64, digest: Digest) -> Self {
         Self {
             packs,
             object: key.object.clone(),
+            base,
             digest,
             pass: Arc::default(),
         }
@@ -115,7 +125,11 @@ impl<'a> Large<'a> {
     /// and nothing is kept under its digest; `Incomplete` if the object is gone; `Unavailable` if
     /// the object store or the CAS failed.
     pub(super) async fn store(&self, backend: &Backend) -> Step<()> {
-        let open = || self.open();
+        // A backend that writes `cas/l/<sha256>` itself (a frontend with no storage node) is that
+        // write: a second PUT of the key beside it, fed from the same read, is a duplicate that
+        // the first PUT's body waits on.
+        let through = !backend.writes_large_object_itself();
+        let open = || self.open(through);
         let stored = backend.put_streamed(&self.digest, &open).await;
         let wrote = locked(&self.pass).wrote.take();
         if let Some(mut wrote) = wrote {
@@ -135,6 +149,9 @@ impl<'a> Large<'a> {
             }
             (Some(Ended::Read(_)), _) => Err(RejectReason::HashMismatch.into()),
             (Some(Ended::Stopped(stop)), _) => Err(stop),
+            // The CAS held the blob already (the index has it, or its object is there whole) and
+            // read nothing: there is nothing to check and nothing to copy.
+            (None, Ok(())) => Ok(()),
             (None, stored) => Err(unavailable(&format!(
                 "the CAS took no bytes of {}: {stored:?}",
                 self.object
@@ -142,9 +159,10 @@ impl<'a> Large<'a> {
         }
     }
 
-    /// The pieces of the object from its first byte. Starts the pass over.
-    fn open(&self) -> PieceStream {
-        let (tee, wrote) = self.copy().unzip();
+    /// The pieces of the object from its first byte. Starts the pass over, with the write-through
+    /// if `through`.
+    fn open(&self, through: bool) -> PieceStream {
+        let (tee, wrote) = through.then(|| self.copy()).flatten().unzip();
         *locked(&self.pass) = Pass {
             wrote,
             ..Pass::default()
@@ -152,6 +170,7 @@ impl<'a> Large<'a> {
         let reading = Reading {
             packs: self.packs.clone(),
             object: self.object.clone(),
+            base: self.base,
             digest: self.digest,
             at: 0,
             pass: Arc::clone(&self.pass),
@@ -220,6 +239,7 @@ impl<'a> Large<'a> {
 struct Reading {
     packs: Packs,
     object: ObjectKey,
+    base: u64,
     digest: Digest,
     at: u64,
     pass: Arc<Mutex<Pass>>,
@@ -246,7 +266,7 @@ impl Reading {
             return Ok(None);
         }
         let want = WINDOW_BYTES.min(size - self.at);
-        let range = ByteRange::new(self.at, want).expect("a window has bytes");
+        let range = ByteRange::new(self.base + self.at, want).expect("a window has bytes");
         match self.packs.fetch(&self.object, range).await {
             Ok(bytes) if bytes.len() as u64 == want => {
                 locked(&self.pass).hasher.update(&bytes);

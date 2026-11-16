@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use js_proto::v1::{ExecMode, Job, JobSpec, JobState, Shape};
-use kbf_front::{Cache, Described, Dispatch, Finished, Stage, Submission};
+use kbf_front::{Backend, Cache, Described, Dispatch, Finished, Stage, Submission};
 use kbf_job_client::Client;
 use kbf_job_client::fake::{Call, FakeJobServer, Machine};
 use kbf_proto::reapi::{ActionResult, Digest};
@@ -31,6 +31,8 @@ fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 pub struct FakeInputs {
     pub facts: Mutex<Result<ActionFacts, InputsError>>,
     pub grant: Mutex<Result<ReadGrant, InputsError>>,
+    /// The action tree of a put-directory run.
+    pub tree: Mutex<Result<String, InputsError>>,
     pub looked_up: Mutex<Vec<String>>,
     /// While set, the read of an action waits for `release` (a slow CAS).
     pub hold: std::sync::atomic::AtomicBool,
@@ -48,6 +50,7 @@ impl FakeInputs {
                 url: "https://grant.test:9400".to_owned(),
                 token: Secret::new("read-token-0001"),
             })),
+            tree: Mutex::new(Ok(TREE.to_owned())),
             looked_up: Mutex::new(Vec::new()),
             hold: std::sync::atomic::AtomicBool::new(false),
             release: tokio::sync::Notify::new(),
@@ -73,7 +76,14 @@ impl Inputs for FakeInputs {
     ) -> Result<ReadGrant, InputsError> {
         locked(&self.grant).clone()
     }
+
+    async fn tree(&self, _lease: kbf_types::LeaseId) -> Result<String, InputsError> {
+        locked(&self.tree).clone()
+    }
 }
+
+/// The action tree the fake inputs give a put-directory run.
+pub const TREE: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
 /// One url the store minted.
 #[derive(Clone, Debug)]
@@ -329,6 +339,44 @@ impl Rig {
         gib: u64,
         adjust: impl FnOnce(&mut Config),
     ) -> Self {
+        Self::over(
+            hosts,
+            workers,
+            gib,
+            Arc::new(Cache::memory()).into(),
+            adjust,
+        )
+        .await
+    }
+
+    /// A frontend with no storage node: its cache is the packs and the state store alone.
+    pub fn no_storage_node() -> Arc<kbf_front::Stored> {
+        use kbf_objstore::{Capabilities, MemoryStore};
+        use kbf_pack::{PackKeys, WriterKind};
+        use kbf_pack_index::action::ActionStore;
+        use kbf_pack_index::memory::MemoryPackIndex;
+        let create_only = Capabilities {
+            conditional_put: true,
+            object_lock: false,
+        };
+        let store = Arc::new(MemoryStore::new(create_only));
+        let actions: Arc<dyn ActionStore> = Arc::new(MemoryPackIndex::new(Arc::new(
+            kbf_state::ManualClock::default(),
+        )));
+        let keys = PackKeys::new(WriterKind::Frontend, "fe1", "boot1").expect("keys");
+        let stored =
+            kbf_front::Stored::new(store, actions, keys, kbf_front::PackSettings::default());
+        Arc::new(stored.expect("stored"))
+    }
+
+    /// As [`Rig::shaped`], over the cache `cache`.
+    pub async fn over(
+        hosts: &[&str],
+        workers: usize,
+        gib: u64,
+        cache: Backend,
+        adjust: impl FnOnce(&mut Config),
+    ) -> Self {
         let _ = tracing_subscriber::fmt()
             .with_test_writer()
             .with_max_level(tracing::Level::INFO)
@@ -344,7 +392,7 @@ impl Rig {
         cfg.insecure_argv_secrets = true;
         adjust(&mut cfg);
         let farm = Arc::new(Farm::new(
-            Arc::new(Cache::memory()),
+            cache.clone(),
             kbf_sched::UNSERVABLE_WAIT,
             kbf_sched::FINISHED_RETENTION,
         ));

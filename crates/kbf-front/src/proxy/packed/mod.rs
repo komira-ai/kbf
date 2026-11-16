@@ -44,6 +44,9 @@
 //! **FindMissingBlobs** asks the index and then, for the digests it lacks, the storage nodes,
 //! so a blob held by either counts as present.
 //!
+//! **Without storage nodes** a blob over [`Packs::max_blob_bytes`] is an object of its own, which
+//! the frontend writes and records in the index itself (`large`).
+//!
 //! **Not packed:** `QueryWriteStatus` (a blob is reported as the storage node reports it), a
 //! ByteStream `Read` of a compressed blob, and blobs over [`Packs::max_blob_bytes`].
 //!
@@ -56,6 +59,7 @@ mod bytestream;
 mod cas;
 mod commit;
 mod hit;
+mod large;
 mod metrics;
 mod room;
 mod store;
@@ -64,12 +68,14 @@ mod verifying;
 pub(in crate::proxy) use self::bytestream::{applies, read as read_stream, write as write_stream};
 pub(in crate::proxy) use self::cas::{Served, find_missing, read_blob, read_many, store_batch};
 pub use self::commit::{
-    CommitError, Ingested, IssuedKeySet, IssuedPackKey, MAX_COMMIT_BLOBS, MAX_UNTRUSTED_BLOB_BYTES,
-    MAX_UNTRUSTED_LARGE_BYTES, MAX_UNTRUSTED_MANIFEST_BYTES, MAX_UNTRUSTED_PACK_BYTES,
-    MAX_UNTRUSTED_READ_BYTES, MIN_SECRET_BYTES, MintError, PackKeyMint, RejectReason, StoreError,
-    UntrustedLimits, ingest, ingest_set,
+    CommitError, Ingested, IssuedKeySet, IssuedPackKey, IssuedPutDir, MAX_COMMIT_BLOBS,
+    MAX_UNTRUSTED_BLOB_BYTES, MAX_UNTRUSTED_LARGE_BYTES, MAX_UNTRUSTED_MANIFEST_BYTES,
+    MAX_UNTRUSTED_PACK_BYTES, MAX_UNTRUSTED_READ_BYTES, MIN_SECRET_BYTES, MintError, PackKeyMint,
+    RejectReason, StoreError, UntrustedLimits, ingest, ingest_put_dir, ingest_put_dir_with,
+    ingest_set,
 };
 pub(in crate::proxy) use self::hit::held;
+pub use self::large::{LargeRead, Pieces, large_key};
 pub use self::metrics::{LargeWriteThrough, PackMetrics};
 pub use self::room::DEFAULT_INFLIGHT_BYTES;
 pub use self::store::{

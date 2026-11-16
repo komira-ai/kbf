@@ -36,12 +36,14 @@
 //! clock and no longer than its subdirectories' entries; [`TreeWriter::forget`] drops an input
 //! root's entries.
 //!
-//! Nothing calls the writer yet: the executor's tree jobs do (the design's build item 17).
+//! The executor's runs that commit into a put directory call it (`--task-out-mode put-dir`),
+//! each run's action tree written over the published base tree before the job is submitted.
 
 mod base;
 mod encode;
 mod memo;
 mod place;
+mod retry;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -53,6 +55,7 @@ use tierstore::{MAX_DEPTH, MAX_ENTRIES, TreeDigest, TreeError};
 
 pub use self::base::{BaseFacts, BaseTree, BaseTreeError, RESERVED_NAMES};
 pub use self::place::{HEADS_IN_FLIGHT, LOCATE_CHUNK, LOOKUP_DEADLINE};
+pub use self::retry::{DEFAULT_TOTAL, FIRST_WAIT, LONGEST_WAIT, PutRetry, Sleeper};
 
 use self::encode::{Child, Manifest};
 use self::memo::{Measure, Memo, Remembered};
@@ -67,6 +70,11 @@ pub const MEMO_ENTRIES: usize = 100_000;
 
 /// How long a memo entry is good for, at most.
 pub const MEMO_TTL: Duration = Duration::from_secs(600);
+
+/// The names an Action's input root may not hold at its top: `.kbf-out`, where a task that
+/// commits into a put directory finds the directory on a host whose job mounts go below the
+/// input root (docs/design/jobs-on-jobscheduler-and-tierstore.md, section 6).
+pub const RESERVED_INPUT_NAMES: [&str; 1] = [".kbf-out"];
 
 /// The entries an action tree adds to the base's and the input root's: `work`, `.kbf`, and
 /// `.kbf`'s `action` and `command`.
@@ -151,6 +159,12 @@ pub enum NoTree {
         /// What the store said.
         why: String,
     },
+    /// The input root holds a name of [`RESERVED_INPUT_NAMES`] at its top.
+    #[error("the input root holds {name:?}, a name the task keeps for its outputs")]
+    ReservedInput {
+        /// The name.
+        name: String,
+    },
     /// The closure did not keep a `Directory` of the tree.
     #[error("the closure kept no Directory {directory}")]
     NotKept {
@@ -168,7 +182,8 @@ impl NoTree {
             | Self::Refused { .. }
             | Self::RootRefused { .. }
             | Self::TooManyEntries { .. }
-            | Self::TooDeep { .. } => "unrepresentable",
+            | Self::TooDeep { .. }
+            | Self::ReservedInput { .. } => "unrepresentable",
             Self::Lookup { .. }
             | Self::Deadline
             | Self::WrongLength { .. }
@@ -199,6 +214,7 @@ pub struct TreeWriter {
     source: Arc<dyn BlobSource>,
     store: Arc<dyn LargeStore>,
     clock: Clock,
+    retry: PutRetry,
     memo: Mutex<Memo>,
 }
 
@@ -230,8 +246,16 @@ impl TreeWriter {
             source,
             store,
             clock,
+            retry: PutRetry::default(),
             memo: Mutex::new(Memo::new(entries)),
         }
+    }
+
+    /// This writer, repeating a write the store answered 503 or a dead connection by `retry`.
+    #[must_use]
+    pub fn with_put_retry(mut self, retry: PutRetry) -> Self {
+        self.retry = retry;
+        self
     }
 
     /// Writes the action tree of `kept` over `base`.
@@ -241,6 +265,7 @@ impl TreeWriter {
     /// manifests written before a failure stay: each is content-bound, and nothing names them
     /// until a tree is returned.
     pub async fn write(&self, kept: &KeptClosure, base: &BaseTree) -> Result<ActionTree, NoTree> {
+        reserved_input(kept)?;
         let now = (self.clock)();
         let plan = self.plan(kept, now)?;
         let measures = measure(&plan, now);
@@ -294,17 +319,87 @@ impl TreeWriter {
         children.push(encode::dir("work", &manifests[kept.root()]));
         children.push(encode::dir(".kbf", &kbf.digest));
         let root = top(children)?;
-        place::write_whole(&*self.source, &*self.store, unlocated).await?;
+        place::write_whole(&*self.source, &*self.store, &self.retry, unlocated).await?;
         let store = &*self.store;
-        stream::iter(&built)
-            .map(|manifest| place::write_manifest(store, &manifest.digest, manifest.bytes.clone()))
+        // Collected, as `place`'s asks are, so the future can be proved `Send`.
+        let writes: Vec<_> = built
+            .iter()
+            .map(|manifest| {
+                place::write_manifest(store, &self.retry, &manifest.digest, manifest.bytes.clone())
+            })
+            .collect();
+        stream::iter(writes)
             .buffered(place::WRITES_IN_FLIGHT)
             .try_collect::<()>()
             .await?;
         self.remember(&plan, &measures, &manifests);
-        place::write_manifest(store, &kbf.digest, kbf.bytes).await?;
-        place::write_manifest(store, &root.digest, root.bytes).await?;
+        place::write_manifest(store, &self.retry, &kbf.digest, kbf.bytes).await?;
+        place::write_manifest(store, &self.retry, &root.digest, root.bytes).await?;
         Ok(ActionTree { digest: root.tree })
+    }
+
+    /// Publishes the tierstore manifests of an output directory a task wrote, from the facts of
+    /// its one-pass object: `directories` are the tree's `Directory` messages as the frontend
+    /// derived them (`root` the output directory's), and `spans` says where each record's bytes start in the
+    /// object `key` (every non-empty file of the directories is one). Each manifest is built as [`TreeWriter::write`] builds it,
+    /// with `source` the span of that object, stored with a create-only write and remembered, so
+    /// that a later input root holding an equal subtree finds it in the memo and writes only what
+    /// is new. Returns the manifest of `root`.
+    ///
+    /// # Errors
+    /// [`NoTree`]: what tierstore refuses or cannot represent, or a store that failed.
+    pub(crate) async fn publish_output(
+        &self,
+        root: &Digest,
+        directories: &BTreeMap<Digest, KeptDirectory>,
+        key: &str,
+        spans: &BTreeMap<Digest, u64>,
+    ) -> Result<Digest, NoTree> {
+        let now = (self.clock)();
+        let plan = self.plan_of(root, &|digest| directories.get(digest), now)?;
+        let measures = measure(&plan, now);
+        // The limits of a whole action tree are applied when one is written ([`TreeWriter::write`]),
+        // which counts this directory again with the base's.
+        // Every file of the directories is a record of the object: the ingest checks the index's
+        // digests against the object's before it publishes.
+        let places: BTreeMap<Digest, Place> = (spans.iter())
+            .map(|(digest, offset)| {
+                let place = Place::Packed {
+                    key: key.to_owned(),
+                    offset: *offset,
+                };
+                (*digest, place)
+            })
+            .collect();
+        let mut manifests: BTreeMap<Digest, Digest> = plan
+            .hits
+            .iter()
+            .map(|(d, hit)| (*d, hit.manifest))
+            .collect();
+        let mut built = Vec::with_capacity(plan.order.len());
+        for (digest, directory) in &plan.order {
+            let manifest = directory_manifest(directory, &places, &manifests).map_err(|error| {
+                NoTree::Refused {
+                    directory: *digest,
+                    error,
+                }
+            })?;
+            manifests.insert(*digest, manifest.digest);
+            built.push(manifest);
+        }
+        let store = &*self.store;
+        let writes: Vec<_> = built
+            .iter()
+            .map(|manifest| {
+                place::write_manifest(store, &self.retry, &manifest.digest, manifest.bytes.clone())
+            })
+            .collect();
+        stream::iter(writes)
+            .buffered(place::WRITES_IN_FLIGHT)
+            .try_collect::<()>()
+            .await?;
+        self.remember(&plan, &measures, &manifests);
+        Ok(manifests[root])
     }
 
     /// Drops the memo's entries of the input root `root`: its own, and every entry the memo
@@ -322,11 +417,21 @@ impl TreeWriter {
     /// The directories of `kept`'s tree to build, children first, each once, and the memo's
     /// hits, whose subtrees are not walked.
     fn plan<'a>(&self, kept: &'a KeptClosure, now: SystemTime) -> Result<Plan<'a>, NoTree> {
+        self.plan_of(kept.root(), &|digest| kept.directory(digest), now)
+    }
+
+    /// [`TreeWriter::plan`] for the directory `root` of any set of directories `lookup` finds.
+    fn plan_of<'a>(
+        &self,
+        root: &Digest,
+        lookup: &dyn Fn(&Digest) -> Option<&'a KeptDirectory>,
+        now: SystemTime,
+    ) -> Result<Plan<'a>, NoTree> {
         let mut memo = self.lock();
         let mut order = Vec::new();
         let mut hits = BTreeMap::new();
         let mut seen = BTreeSet::new();
-        let mut stack: Vec<(Digest, Option<&KeptDirectory>)> = vec![(*kept.root(), None)];
+        let mut stack: Vec<(Digest, Option<&KeptDirectory>)> = vec![(*root, None)];
         while let Some((digest, expanded)) = stack.pop() {
             if let Some(directory) = expanded {
                 // Every subdirectory of it was popped, and built or found, before this.
@@ -340,9 +445,7 @@ impl TreeWriter {
                 hits.insert(digest, hit);
                 continue;
             }
-            let directory = kept
-                .directory(&digest)
-                .ok_or(NoTree::NotKept { directory: digest })?;
+            let directory = lookup(&digest).ok_or(NoTree::NotKept { directory: digest })?;
             if let Some(node) = &directory.properties {
                 return Err(NoTree::NodeProperties {
                     directory: digest,
@@ -439,4 +542,22 @@ fn directory_manifest(
 /// The manifest of `.kbf` or of the action tree's root.
 fn top(children: Vec<Child>) -> Result<Manifest, NoTree> {
     encode::manifest(children).map_err(|error| NoTree::RootRefused { error })
+}
+
+/// Refuses an input root that holds a name of [`RESERVED_INPUT_NAMES`] at its top. A root the
+/// closure did not keep is left to the plan, which refuses it by name.
+fn reserved_input(kept: &KeptClosure) -> Result<(), NoTree> {
+    let root = kept.directory(kept.root()).into_iter();
+    let names = root.flat_map(|root| {
+        (root.files.iter().map(|(name, _, _)| name))
+            .chain(root.directories.iter().map(|(name, _)| name))
+            .chain(root.symlinks.iter().map(|(name, _)| name))
+    });
+    match names
+        .into_iter()
+        .find(|name| RESERVED_INPUT_NAMES.contains(&name.as_str()))
+    {
+        Some(name) => Err(NoTree::ReservedInput { name: name.clone() }),
+        None => Ok(()),
+    }
 }

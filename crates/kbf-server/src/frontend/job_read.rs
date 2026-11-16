@@ -253,11 +253,6 @@ pub(super) fn args() -> [Arg; 12] {
     ]
 }
 
-/// Whether `m` has a job listener that serves TLS: `--job-listen` without `--job-plain-http`.
-pub(super) fn serves_tls(m: &ArgMatches) -> bool {
-    m.contains_id(LISTEN) && !m.get_flag(PLAIN)
-}
-
 /// The flags `m` makes, or `None` without `--job-listen` (clap makes the secret and one of
 /// the certificate and `--job-plain-http` come with it).
 pub(super) fn from_matches(m: &ArgMatches) -> Option<JobReadFlags> {

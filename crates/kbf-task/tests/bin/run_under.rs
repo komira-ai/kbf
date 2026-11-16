@@ -72,6 +72,7 @@ mod linux {
                 unreadable: &[],
                 hidden: &[],
                 relay: (relay != "-").then(|| Path::new(relay.as_str())),
+                job: None,
             },
         ));
         match result {

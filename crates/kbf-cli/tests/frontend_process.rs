@@ -191,14 +191,26 @@ fn the_frontend_process_is_ready_with_its_node_and_stops_on_sigterm() {
     let state = format!("--state-store=sqlite://{}", state.display());
     let mut front = frontend(
         &node.field("storage="),
-        &["--readyz-store-timeout-ms=500", &state],
+        &[
+            "--readyz-store-timeout-ms=500",
+            "--readyz-probe-interval-ms=50",
+            &state,
+        ],
     );
     let api = front.field("api=");
     assert_eq!(get(&api, "/healthz").0, 200);
     let (code, body) = get(&api, "/readyz");
     assert_eq!(code, 200, "{body}");
     assert!(node.stop().is_some_and(|status| status.success()));
-    let (code, body) = get(&api, "/readyz");
+    // The probes are asked in the background: the stop shows in a later answer.
+    let (mut code, mut body) = get(&api, "/readyz");
+    for _ in 0..500 {
+        if code == 503 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        (code, body) = get(&api, "/readyz");
+    }
     assert_eq!(code, 503, "{body}");
     assert!(body.contains("\"check\":\"storage\""), "{body}");
     assert_eq!(get(&api, "/healthz").0, 200);

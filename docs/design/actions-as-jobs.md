@@ -1,5 +1,13 @@
 # Every build action is a jobscheduler job on Linux, its root file system one tierstore tree over the kbf base tree
 
+Superseded in part by [jobs-on-jobscheduler-and-tierstore.md](jobs-on-jobscheduler-and-tierstore.md), together with
+the places that repeat these parts (sections 0, 6, 9 and 10.1):
+
+- **`put-ca`** (5.2, D17, 13, items 14 and 15): outputs are packed by `kbf-task` and committed through tierstore's put directory instead.
+- **Write grants** (5.2, 13, the `files` row of 3.4): the job holds no grant; tierstore uploads with its own identity, under create-only keys.
+- **`executor-node-store-port`** (8.3, and the passed-through tierstore port of 3.4, 3.6, D18): the job has no network and no tierstore port.
+- **kbf storage on the Linux nodes** (7.1 step 1, item 20): a node's store is tierstore, an object-store proxy.
+
 Status: **DESIGN, for the owner's review; nothing here is built and no code changes with this document**, so no
 existing document is stale yet; section 11 names the documents each build item updates. Linux only; macOS is section
 14, one open question and no more. This revision follows the owner's decisions of 2026-11-10 (section 1, O7 to
@@ -88,7 +96,7 @@ Settled by the owner and not reopened here:
 - `kbf-task` reads the Action, the Command and the inputs through a read grant (or by pack span with `--locate`),
   lays the inputs out under `/scratch/work/in`, runs the Command in its own user and network namespace (loopback only),
   collects outputs (`kbf-outputs`, `O_NOFOLLOW` at every component), packs and PUTs them. (Since build item 4, also in
-  mount and PID namespaces of its own, 4.4, with the walk by `openat2`.) Exit 0 means the action ran
+  mount and PID namespaces of its own, 4.4, with the walk by `openat2`; a tree job makes none, 4.4.) Exit 0 means the action ran
   (its own exit code and a timeout are in the manifest); 10 to 15 are the farm's failures.
 - kbf#2287 lists what the real job service at the pin lacks: `Job.start_failure_detail` is always empty; label values
   must be lower case; a job that books disk is placed only on hosts reporting `disk-gib`; a client token sees only its
@@ -156,11 +164,15 @@ user owns the base tree's `/tmp`, `/var/tmp` and `/run` and its writes there cop
 
 ### 3.2 The action's view
 
-`/work` is the exec root and the Command's working directory is below it, as REAPI says. The Command runs in a
-sandbox `kbf-task` makes (4.4): its own user, network, mount and PID namespaces. The job's grants (`/run/js-files`) and
-`kbf-task`'s run directory (`/.kbf-run`, its stdout and stderr) are out of its sight. It can read, but not change in
-the tree, `/.kbf-tools/kbf-task` and its own Action and Command under `/.kbf`; none of them is a secret. It sees the
-base image's files, its inputs, and nothing of the node: the user namespace maps it to the action user and nothing else.
+`/work` is the exec root and the Command's working directory is below it, as REAPI says. The Command runs
+directly in the job (4.4): the job is its sandbox, with the job's user namespace, no network and the layered root, and
+`kbf-task` makes none of its own. It can read, but not change in the tree, `/.kbf-tools/kbf-task` and its own Action
+and Command under `/.kbf`; none of them is a secret. `kbf-task`'s run directory (`/.kbf-run`, its stdout and stderr) and
+the put directory (`/out`) are visible to it, and the put directory is writable, as it is the job's own output path; the
+job's grants (`/run/js-files`) hold nothing in a put-dir job (no URL, no grant, no secret, `files` is empty). It sees
+the base image's files, its inputs, and nothing of the node: the job's user namespace maps it to the action user and
+nothing else. It runs as the same user as `kbf-task`, in the same PID namespace, so it can signal it; `kbf-task`
+refuses `ptrace` and reads of its memory (`protect_this_process`).
 
 ### 3.3 The kbf base tree
 
@@ -349,26 +361,42 @@ With `--tree`, `kbf-task`:
    job never runs another action's tree), and decodes both; there is no read grant and no fetch;
 2. before the Command starts, makes the parent directory of every output path and the working directory under `/work`
    (in the upper layer), as REAPI asks of the worker;
-3. runs the Command in the sandbox of 4.4, under the action's timeout;
+3. runs the Command directly in the job (4.4: the job is the sandbox), under the action's timeout;
 4. collects the outputs from `/work` and hands them to the node's tierstore (5.2), and records `"from": "tree"` in the manifest's
    advisory `inputs` statistics (`kbf-task-pack` `InputStats`; the reader that knows `from` ships one release before the
    writer, because `InputStats` refused an unknown member before item 8, D13).
 
 ### 4.4 The Command's sandbox
 
-[proposed, D7] In every job, tree or not, `kbf-task` starts the Command in its own mount and PID namespaces, beside
-the user and network namespaces it already makes (`network.rs`, `CLONE_NEWUSER | CLONE_NEWNET`) [code]:
+[decided, D7; owner, 2026-11-15: "I don't think we need that anymore because kbf is already running in a sandbox."]
+**The job is the sandbox; `kbf-task` keeps only process cleanup.** In a tree job (`--tree`) `kbf-task` makes no user,
+network, mount or PID namespace, no seccomp network filter, no cover and no relay or init re-exec: it starts the
+action's Command directly, in its working directory with its environment, as a child of its own (`std`/`tokio`
+`Command`, `crates/kbf-task/src/run.rs`, `Job`). What the job already is stands in for them: its own user namespace,
+network `None` (put-dir jobs submit `NetworkLevel::None`), and a layered root with `/work` as the exec root. The
+nested sandbox had also made every farm build action fail at its start (`cannot start /work/buck-out/.../busybox: No
+such file or directory`, from the relay, the init re-exec or the covers of the parent of the work directory).
 
-- `/run/js-files` (the job's grants) is covered by an empty read-only tmpfs, and so is `kbf-task`'s own run directory
-  (`/.kbf-run` in a tree job, in the upper; under `/scratch` in today's job); in today's job, `/scratch` is covered the same way after `private/` is bound at
-  `/tmp`, `/var/tmp`, `/run` and `/root`, so those are disk-backed there too instead of the job's 64 MiB `noexec`
-  tmpfs (`js-contain` `TMPFS`) [code];
-- the PID namespace ends every process the Command started when it exits, so nothing of the action is running while
-  its outputs are read (which `kbf-outputs` requires);
-- the output walk opens each component with `openat2` and `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS |
-  RESOLVE_NO_MAGICLINKS` on Linux (today it opens each relative to its parent with `O_NOFOLLOW`,
-  `crates/kbf-outputs/src/collect.rs`) [code], so the kernel refuses a path out of `/work`, a `..` included, in an upper
-  layer the action wrote.
+What `kbf-task` keeps is the guarantee `kbf-outputs` needs, that nothing the Command started is running while its
+outputs are read:
+
+- the Command leads its own process group; when it exits, or when the action's timeout passes (the group is killed
+  with SIGKILL and the run reports exit code 137, as before), the group is killed with SIGKILL and reaped;
+- `kbf-task` is also the subreaper of its descendants (`PR_SET_CHILD_SUBREAPER`; no privilege or capability is
+  needed): while the Command runs, every child that is not the Command is reaped as it ends (as an init would, so a
+  killed orphan is not left a zombie in its group); once the Command has ended, every child it holds, a process that
+  left the group with `setsid` included, is killed and reaped, until it has none. The Command's own status is
+  never waited for by the reaping: it is collected as before.
+
+What a job's Command sees: see 3.2. The job log has no sandbox or network line for it (nothing is made, so nothing is
+unusual). Today's job (grant mode, no `--tree`: the legacy daemon's) keeps the sandbox it had: its own
+user, network, mount and PID namespaces, with `/run/js-files` and `/scratch` covered, `private/` bound at `/tmp`,
+`/var/tmp`, `/run` and `/root`, and a PID namespace through the relay (the `sandbox` module).
+
+The output walk opens each component with `openat2` and `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS |
+RESOLVE_NO_MAGICLINKS` on Linux (today it opens each relative to its parent with `O_NOFOLLOW`,
+`crates/kbf-outputs/src/collect.rs`) [code], so the kernel refuses a path out of `/work`, a `..` included, in an upper
+layer the action wrote.
 
 The frontend's MAC key (`--task-secret-file`) is never in a job.
 
@@ -510,6 +538,9 @@ create-only PUT per key, and the ingest of `ingest_set` (`crates/kbf-front/src/p
 `proxy/packed/commit/untrusted/task.rs`) [code], with the same promotion rule. Once 5.2 works (the trees switch on, its
 writes counted in section 10 with no ingest refusals it did not explain), the packs go with today's job (7.2): the
 task's pack writer and PUTs, the presign key, and the `cas/b/` ingest.
+
+The put-directory writer's own shape (one object per action, written in one pass, manifest and index at the end) is
+[one-pass-task-object.md](one-pass-task-object.md).
 
 ## 6. Failures and retries
 
@@ -937,9 +968,11 @@ layered root and the host-port pass-through of section 13 (jobscheduler's own de
   index, not through the read listener's capped `/locate`.
 - **D6. Every blob is made locatable before submit** (written to `cas/l/` if it has no location), so where a blob
   lives never refuses a tree.
-- **D7. The Command runs in its own mount and PID namespaces** in every job: the grants out of sight, no process left
-  while outputs are read, the output walk resolved beneath `/work` by the kernel; in today's job also disk-backed
-  `/tmp`, `/var/tmp` and `/run`.
+- **D7. The job is the sandbox; `kbf-task` keeps only process cleanup** (owner, 2026-11-15): in a tree job the Command
+  is started directly, with no namespace, filter, cover or relay of its own, in a process group that is killed, and
+  with `kbf-task` as the subreaper that kills and reaps what is left, so no process is running while outputs are read;
+  the output walk is resolved beneath `/work` by the kernel. Today's job keeps its own sandbox (4.4). Supersedes the
+  mount and PID namespaces of an earlier D7.
 - **D8. `hydrate` is sent to the node's tierstore when kbf first sees the job's host, and `release` after the job
   ends** (4.5): the node is not known at submit, the call is never waited for, and `release` is where kbf learns the
   failures jobscheduler cannot see.

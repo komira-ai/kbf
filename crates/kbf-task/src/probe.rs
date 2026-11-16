@@ -633,6 +633,7 @@ async fn run_confined(
             // An action's Command does not see the job's grants; nor does the probe's.
             hidden: &[PathBuf::from(crate::sandbox::GRANTS_DIR)],
             relay,
+            job: None,
         },
     )
     .await;

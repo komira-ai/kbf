@@ -3,6 +3,7 @@
 
 use kbf_front::{Finished, Stage};
 use kbf_meta::ActionRecord;
+use kbf_proto::reapi::ActionResult;
 use kbf_proto::worker::{
     self, ResultAck, ResultAckReason as Reason, ServerMessage, server_message,
 };
@@ -28,7 +29,7 @@ use crate::run_record;
 /// first, if any.
 pub(super) struct Settled {
     pub(super) finished: Finished,
-    write: Option<(Digest, ActionRecord)>,
+    write: Option<(Digest, ActionRecord, ActionResult)>,
     stages: Vec<watch::Sender<Stage>>,
     /// The acknowledgement a `Result` was owed until this finish was written, and the
     /// stream to send it on (`Engine::owed`).
@@ -214,8 +215,8 @@ impl Farm {
 
     /// Writes the action-cache entry, if any, then answers the callers.
     pub(super) async fn deliver(&self, settled: Settled) {
-        if let Some((action, record)) = settled.write
-            && let Err(e) = self.cache.commit_action_record(action, record).await
+        if let Some((action, record, result)) = settled.write
+            && let Err(e) = self.cache.commit_prepared(action, record, &result).await
         {
             tracing::error!(%action, error = %e, "action-cache write of an accepted result failed");
         }
@@ -407,7 +408,7 @@ impl State {
                 let write = waiters
                     .first()
                     .filter(|_| cacheable)
-                    .map(|w| (w.key.action, record));
+                    .map(|w| (w.key.action, record, result));
                 (stored, write)
             }
             _ => (None, None),

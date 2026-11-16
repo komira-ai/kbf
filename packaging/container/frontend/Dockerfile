@@ -24,7 +24,7 @@
 FROM gcr.io/distroless/cc-debian13:nonroot@sha256:3ee00291cf386ec52a552e6a858d555debd74776eb4bfa53fa3df2cd6677515e
 COPY --chmod=0755 kbf /usr/bin/kbf
 USER 65532:65532
-# REAPI (--listen), the worker listener (--worker-listen) and the operator API (--api-listen)
+# REAPI (--listen), the worker listener (--worker-listen, off unless given) and the operator API (--api-listen)
 # by default (docs/deploy/kbf-modes.md). The listen addresses are kbf.toml's.
 EXPOSE 8980 8981 8982
 ENTRYPOINT ["/usr/bin/kbf", "--mode=frontend"]

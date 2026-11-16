@@ -5,10 +5,11 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use kbf_outputs::{
-    CHUNK_BYTES, Exceeded, OutputLimits, OutputsError, Store, StoreError, collect, digest_of,
+    CHUNK_BYTES, Exceeded, OutputLimits, OutputsError, Store, StoreError, Tee, TeeFile, collect,
+    digest_of,
 };
 use kbf_proto::reapi::{ActionResult, Digest, Directory, Tree};
 use prost::Message;
@@ -21,6 +22,8 @@ struct MemoryStore {
     files: Mutex<usize>,
     puts: Mutex<usize>,
     refuse: bool,
+    /// Where a file larger than one chunk goes as it is hashed, when set.
+    spool: Option<Arc<Spool>>,
 }
 
 impl MemoryStore {
@@ -64,6 +67,10 @@ impl Store for MemoryStore {
 
     fn in_flight(&self) -> usize {
         64
+    }
+
+    fn tee(&self) -> Option<Arc<dyn Tee>> {
+        self.spool.clone().map(|spool| spool as Arc<dyn Tee>)
     }
 }
 
@@ -613,4 +620,184 @@ async fn every_directory_a_directory_output_names_is_stored() {
         8
     );
     assert!(absent.is_empty(), "named but not stored: {absent:?}");
+}
+
+// ---- a store with a tee ----
+
+/// What the tee saw: each ended file's bytes by digest, and the files begun and abandoned.
+#[derive(Default)]
+struct Seen {
+    ended: BTreeMap<String, Vec<u8>>,
+    opened: usize,
+}
+
+/// Where the tee fails, if anywhere.
+#[derive(Clone, Copy, PartialEq)]
+enum Fault {
+    None,
+    Open,
+    Write,
+    /// The second write fails: the first chunk after the head.
+    WriteLater,
+    End,
+}
+
+/// The tee of a [`MemoryStore`]: what it saw, and where it fails.
+struct Spool {
+    seen: Arc<Mutex<Seen>>,
+    fault: Fault,
+}
+
+struct One {
+    seen: Arc<Mutex<Seen>>,
+    bytes: Vec<u8>,
+    fault: Fault,
+    writes: usize,
+}
+
+impl Tee for Spool {
+    fn open(&self) -> std::io::Result<Box<dyn TeeFile>> {
+        if self.fault == Fault::Open {
+            return Err(std::io::Error::other("no room to open"));
+        }
+        self.seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .opened += 1;
+        Ok(Box::new(One {
+            seen: Arc::clone(&self.seen),
+            bytes: Vec::new(),
+            fault: self.fault,
+            writes: 0,
+        }))
+    }
+}
+
+impl TeeFile for One {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.writes += 1;
+        let refused = match self.fault {
+            Fault::Write => true,
+            Fault::WriteLater => self.writes == 2,
+            _ => false,
+        };
+        if refused {
+            return Err(std::io::Error::other("no room to write"));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    fn end(self: Box<Self>, digest: &Digest) -> std::io::Result<()> {
+        if self.fault == Fault::End {
+            return Err(std::io::Error::other("no room to end"));
+        }
+        self.seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .ended
+            .insert(digest.hash.clone(), self.bytes);
+        Ok(())
+    }
+}
+
+/// A store that tees large files, with its tee's fault, and what the tee sees.
+fn teed(fault: Fault) -> (MemoryStore, Arc<Mutex<Seen>>) {
+    let seen = Arc::new(Mutex::new(Seen::default()));
+    let spool = Arc::new(Spool {
+        seen: Arc::clone(&seen),
+        fault,
+    });
+    let store = MemoryStore {
+        spool: Some(spool),
+        ..MemoryStore::default()
+    };
+    (store, seen)
+}
+
+/// A file of more than one chunk, which differs with `seed`.
+fn large(seed: u8) -> Vec<u8> {
+    (0..(CHUNK_BYTES * 2 + 7))
+        .map(|i| (i % 251) as u8 ^ seed)
+        .collect()
+}
+
+#[tokio::test]
+async fn a_large_file_goes_to_the_tee_whole_and_is_not_put_as_a_file() {
+    let root = scratch("tee-whole");
+    let (one, two) = (large(1), large(2));
+    std::fs::create_dir(root.join("dir")).expect("mkdir");
+    std::fs::write(root.join("big"), &one).expect("write");
+    std::fs::write(root.join("dir/big"), &two).expect("write");
+    std::fs::write(root.join("dir/small"), b"small").expect("write");
+    let (store, seen) = teed(Fault::None);
+    let result = run(&store, &root, "", &["big", "dir"], OutputLimits::DEFAULT)
+        .await
+        .expect("collect");
+    assert_eq!(result.output_files[0].digest, Some(digest_of(&one)));
+    let seen = seen.lock().unwrap_or_else(PoisonError::into_inner);
+    assert_eq!(seen.ended[&digest_of(&one).hash], one);
+    assert_eq!(seen.ended[&digest_of(&two).hash], two);
+    assert_eq!(seen.ended.len(), 2, "the small file did not go to the tee");
+    assert_eq!(seen.opened, 2);
+    assert_eq!(
+        *store.files.lock().unwrap_or_else(PoisonError::into_inner),
+        0
+    );
+    assert_eq!(store.get(&digest_of(b"small")), b"small");
+}
+
+#[tokio::test]
+async fn store_file_tees_a_large_log() {
+    let dir = scratch("tee-log");
+    let log = large(3);
+    std::fs::write(dir.join("log"), &log).expect("write");
+    let (store, seen) = teed(Fault::None);
+    let digest = kbf_outputs::store_file(&store, &dir.join("log"), u64::MAX)
+        .await
+        .expect("stored");
+    assert_eq!(digest, digest_of(&log));
+    let seen = seen.lock().unwrap_or_else(PoisonError::into_inner);
+    assert_eq!(seen.ended[&digest.hash], log);
+    assert_eq!(
+        *store.files.lock().unwrap_or_else(PoisonError::into_inner),
+        0
+    );
+}
+
+#[tokio::test]
+async fn a_tee_that_fails_fails_the_collection() {
+    for fault in [Fault::Open, Fault::Write, Fault::WriteLater, Fault::End] {
+        let root = scratch("tee-fault");
+        std::fs::write(root.join("big"), large(4)).expect("write");
+        let (store, _) = teed(fault);
+        let why = run(&store, &root, "", &["big"], OutputLimits::DEFAULT)
+            .await
+            .expect_err("the tee failed");
+        assert!(matches!(why, OutputsError::Io { .. }), "{why}");
+    }
+}
+
+#[tokio::test]
+async fn a_file_past_the_byte_limit_fails_even_after_it_was_teed() {
+    let root = scratch("tee-limit");
+    std::fs::write(root.join("big"), large(5)).expect("write");
+    let (store, _) = teed(Fault::None);
+    let limits = OutputLimits {
+        max_bytes: CHUNK_BYTES as u64 + 10,
+        ..OutputLimits::DEFAULT
+    };
+    let why = run(&store, &root, "", &["big"], limits)
+        .await
+        .expect_err("over the limit");
+    assert!(
+        matches!(
+            why,
+            OutputsError::Limit {
+                what: Exceeded::Bytes,
+                ..
+            }
+        ),
+        "{why}"
+    );
 }

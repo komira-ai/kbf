@@ -33,5 +33,5 @@ mod uploads;
 pub use collect::{OutputsError, collect, store_file};
 pub use limits::{Exceeded, OutputLimits};
 pub use remove::{remove_tree, remove_tree_at};
-pub use store::{CHUNK_BYTES, Store, StoreError, digest_of};
+pub use store::{CHUNK_BYTES, Store, StoreError, Tee, TeeFile, digest_of};
 pub use uploads::Uploads;

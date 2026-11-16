@@ -321,3 +321,41 @@ async fn a_write_through_that_never_finishes_is_given_up_and_counted_failed() {
     assert_eq!(count(&farm, LargeWriteThrough::Ok), 0);
     assert!(farm.rig.store.held(&key_of(digest)).await.is_none());
 }
+
+/// Asserts that a frontend with no storage node writes `cas/l/<sha256>` once: its CAS write is the
+/// write of the key, so the ingest starts no second write of it beside the first (two PUTs of
+/// one create-only key, the second fed from the first's read, stalled one another against the
+/// store's idle timeout). The object holds exactly the bytes, the ingest is cached, and the
+/// write-through counts nothing.
+#[tokio::test]
+async fn a_frontend_with_no_storage_node_writes_the_large_key_once() {
+    let farm = farm_with_large().await.without_storage_node();
+    let (bytes, digest) = large();
+
+    let got = farm.run().await;
+
+    assert!(matches!(got, Ingested::Ran { cached: true, .. }), "{got:?}");
+    assert_eq!(farm.rig.store.stream_puts(), 1, "one write of the key");
+    for how in LargeWriteThrough::ALL {
+        assert_eq!(count(&farm, how), 0, "{how:?}");
+    }
+    let held = farm.rig.store.held(&key_of(digest)).await;
+    assert_eq!(held.as_ref(), Some(bytes));
+}
+
+/// Asserts that a large object the CAS already holds whole (its key is there at the right
+/// length, so the CAS write reads nothing) is an ingest that succeeds and caches, not an
+/// `Unavailable` for a CAS that took no bytes.
+#[tokio::test]
+async fn a_large_object_the_cas_already_holds_is_ingested() {
+    let farm = farm_with_large().await.without_storage_node();
+    let (bytes, digest) = large();
+    farm.rig.store.seed(&key_of(digest), bytes).await;
+
+    let got = farm.run().await;
+
+    assert!(matches!(got, Ingested::Ran { cached: true, .. }), "{got:?}");
+    assert_eq!(farm.rig.store.stream_puts(), 0, "nothing was written");
+    let held = farm.rig.store.held(&key_of(digest)).await;
+    assert_eq!(held.as_ref(), Some(bytes));
+}

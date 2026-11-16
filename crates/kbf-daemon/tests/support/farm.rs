@@ -136,7 +136,7 @@ pub fn front(pki: &Pki, dir: &Path) -> Front {
         })
     })
     .expect("starts");
-    let worker = handle.worker;
+    let worker = handle.worker.expect("a worker listener");
     tokio::spawn(handle.serve());
     Front {
         worker,

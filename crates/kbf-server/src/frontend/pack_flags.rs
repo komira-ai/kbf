@@ -361,6 +361,22 @@ pub(super) fn open(
     }
 }
 
+/// [`open`] for a frontend with no storage node: the packs are the blob plane, so there is no
+/// daemon that cannot read a blob only they hold, and nothing to warn about.
+///
+/// # Errors
+/// As [`open`].
+pub(super) fn open_without_node(
+    flags: Option<&PackFlags>,
+    index: Option<&Arc<dyn PackIndex>>,
+) -> Result<Option<Packs>, Box<dyn Error>> {
+    match (flags, index) {
+        (None, _) => Ok(None),
+        (Some(_), None) => Err("--pack-store-endpoint needs --pack-index".into()),
+        (Some(flags), Some(index)) => Ok(Some(flags.open(Arc::clone(index))?)),
+    }
+}
+
 /// The key pair in the file at `path`, read as every key file of the server is
 /// ([`crate::key_file::read_key_pair`]): a regular file, not a link, owned by the server's
 /// user, mode 0600 or 0400.

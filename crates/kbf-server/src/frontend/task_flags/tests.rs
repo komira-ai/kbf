@@ -1,6 +1,7 @@
 //! The task flags: what they need, what they make, and what opening them checks.
 
 use std::os::unix::fs::PermissionsExt as _;
+use std::path::Path;
 use std::time::UNIX_EPOCH;
 
 use bytes::Bytes;
@@ -23,20 +24,14 @@ const BASE: [&str; 5] = [
     "--api-listen=127.0.0.1:0",
 ];
 
-/// The five flags the switch needs.
-const TASK: [&str; 5] = [
+/// The two flags a put-directory frontend is given.
+const PUT_DIR_ONLY: [&str; 2] = [
     "--task-secret-file=/etc/kbf/task.secret",
-    "--task-put-endpoint=http://127.0.0.1:9000",
-    "--task-put-bucket=tiers",
-    "--task-put-credentials-file=/etc/kbf/presign.json",
-    "--task-read-url=https://127.0.0.1:8443",
+    "--task-out-root=/mnt/ts/put",
 ];
 
-const LARGE_KEYS: &str = r#"{"access_key_id": "large-presign", "secret_access_key": "hunter3"}"#;
 const LEASE: &str = "00000000000000010000000000000002";
 const SECRET: &str = "0123456789abcdef0123456789abcdef";
-const KEYS: &str = r#"{"access_key_id": "pack-presign", "secret_access_key": "hunter2",
-    "ceiling": {"prefix": "cas/b/", "max_expires_secs": 14400, "max_object_bytes": 134217728}}"#;
 
 /// The flags of a frontend given `more` after the base.
 fn parsed(more: &[&str]) -> Result<FrontendFlags, clap::Error> {
@@ -49,179 +44,193 @@ fn refused(more: &[&str]) -> ErrorKind {
     parsed(more).expect_err("refused").kind()
 }
 
+/// The put-directory flags `more` after the secret and the root make.
+fn put_dir(more: &[&str]) -> PutDirFlags {
+    let mut flags = PUT_DIR_ONLY.to_vec();
+    flags.extend_from_slice(more);
+    parsed(&flags)
+        .expect("parses")
+        .put_dir
+        .expect("put-dir flags")
+}
+
 /// Asserts that no run is prepared without `--task-secret-file`, and that the flags that have a
 /// default, which the config template writes as live lines, change nothing and need nothing
 /// when it is left out.
 #[test]
 fn the_task_flags_are_off_unless_the_secret_file_is_given() {
-    assert_eq!(parsed(&[]).expect("parses").task, None);
+    assert_eq!(parsed(&[]).expect("parses").put_dir, None);
     let companions = [
-        "--task-put-region=eu-west-1",
-        "--task-run-wall-secs=60",
+        "--task-out-format=one-pass",
         "--task-url-slack-secs=5",
+        "--task-put-retry-secs=90",
         "--task-closure-max-digests=10",
         "--task-closure-max-bytes=1024",
-        "--task-max-packs=2",
-        "--task-max-large=2",
-        "--task-large-max-bytes=100000000",
+        "--task-max-object-entries=7",
+        "--task-max-object-manifest-bytes=8",
+        "--task-object-bytes-per-entry=9",
     ];
-    assert_eq!(parsed(&companions).expect("parses").task, None);
-    assert_eq!(
-        refused(&["--task-large-credentials-file=/etc/kbf/large.json"]),
-        ErrorKind::MissingRequiredArgument,
-        "the large credentials need the switch"
-    );
+    assert_eq!(parsed(&companions).expect("parses").put_dir, None);
 }
 
 /// Asserts what each flag needs, so that the preparation is never half configured: the switch
-/// needs the endpoint, the bucket, the credentials file and the read URL, and each of those
-/// needs the switch.
+/// needs the root, the root needs the switch, and the mode `put-dir` needs the root.
 #[test]
 fn the_flags_need_each_other() {
     let missing = ErrorKind::MissingRequiredArgument;
-    for (left_out, flag) in TASK.iter().enumerate() {
-        let given: Vec<&str> = TASK
-            .iter()
-            .enumerate()
-            .filter(|(at, _)| *at != left_out)
-            .map(|(_, flag)| *flag)
-            .collect();
-        assert_eq!(refused(&given), missing, "without {flag}");
-    }
+    assert_eq!(
+        refused(&[PUT_DIR_ONLY[0]]),
+        missing,
+        "the secret needs the root"
+    );
+    assert_eq!(
+        refused(&[PUT_DIR_ONLY[1]]),
+        missing,
+        "the root needs the secret"
+    );
+    assert_eq!(
+        refused(&["--task-out-mode=put-dir"]),
+        missing,
+        "put-dir needs its root"
+    );
 }
 
 /// Asserts that the flags make the setting they say, and that the defaults are the frontend's:
-/// region `us-east-1`, a wall of 2 hours and a slack of 10 minutes, half a million digests and
-/// 32 GiB.
+/// a slack of 10 minutes, half a million digests and 32 GiB, and the limits of an object.
 #[test]
 fn the_flags_make_the_setting_and_the_defaults_are_the_constants() {
-    let set = parsed(&TASK).expect("parses").task.expect("task flags");
+    let set = put_dir(&[]);
     assert_eq!(set.secret_file, PathBuf::from("/etc/kbf/task.secret"));
-    assert_eq!(set.put_endpoint, "http://127.0.0.1:9000");
-    assert_eq!(set.put_bucket, "tiers");
-    assert_eq!(
-        set.put_credentials_file,
-        PathBuf::from("/etc/kbf/presign.json")
-    );
-    assert_eq!(set.read_url, "https://127.0.0.1:8443");
-    assert_eq!(set.put_region, DEFAULT_REGION);
-    assert_eq!(set.run_wall, Duration::from_secs(DEFAULT_RUN_WALL_SECS));
+    assert_eq!(set.roots, PutDirRoots::new("/mnt/ts/put").expect("roots"));
     assert_eq!(set.url_slack, Duration::from_secs(DEFAULT_URL_SLACK_SECS));
+    assert_eq!(set.put_retry, Duration::from_secs(DEFAULT_PUT_RETRY_SECS));
     assert_eq!(set.max_digests, ClosureLimits::DEFAULT.max_digests);
     assert_eq!(set.max_bytes, ClosureLimits::DEFAULT.max_bytes);
-    assert_eq!(set.max_packs, 8);
-    assert_eq!(set.max_large, 8);
-    assert_eq!(set.large_credentials_file, None);
-    assert_eq!(set.large_max_bytes, 536_870_912);
-    assert_eq!(set.large_max_bytes, DEFAULT_LARGE_MAX_BYTES);
+    assert_eq!(set.max_object_entries, 1 << 20);
+    assert_eq!(set.max_object_manifest_bytes, 4 << 20);
+    assert_eq!(set.object_bytes_per_entry, 1024);
 
-    let mut every = TASK.to_vec();
-    every.extend([
-        "--task-put-region=eu-west-1",
-        "--task-run-wall-secs=3600",
+    let set = put_dir(&[
         "--task-url-slack-secs=0",
+        "--task-put-retry-secs=0",
         "--task-closure-max-digests=1000",
         "--task-closure-max-bytes=1048576",
-        "--task-max-packs=3",
-        "--task-max-large=0",
-        "--task-large-credentials-file=/etc/kbf/large.json",
-        "--task-large-max-bytes=67108865",
+        "--task-max-object-entries=7",
+        "--task-max-object-manifest-bytes=8",
+        "--task-object-bytes-per-entry=9",
     ]);
-    let set = parsed(&every).expect("parses").task.expect("task flags");
-    assert_eq!(set.put_region, "eu-west-1");
-    assert_eq!(set.run_wall, Duration::from_secs(3_600));
     assert_eq!(set.url_slack, Duration::ZERO);
+    assert_eq!(set.put_retry, Duration::ZERO);
     assert_eq!(set.max_digests, 1_000);
     assert_eq!(set.max_bytes, 1 << 20);
-    assert_eq!(set.max_packs, 3);
-    assert_eq!(set.max_large, 0);
-    assert_eq!(
-        set.large_credentials_file,
-        Some(PathBuf::from("/etc/kbf/large.json"))
-    );
-    assert_eq!(set.large_max_bytes, 64 * 1024 * 1024 + 1);
+    assert_eq!(set.max_object_entries, 7);
+    assert_eq!(set.max_object_manifest_bytes, 8);
+    assert_eq!(set.object_bytes_per_entry, 9);
 }
 
-/// Asserts the bounds of the key-set flags: 1 to 8 packs, 0 to 8 large objects, and a large cap
-/// above the 64 MiB a pack record may hold (a blob at the cap is a record, not a large object).
-#[test]
-fn the_key_set_flags_are_bounded() {
-    for bad in [
-        "--task-max-packs=0",
-        "--task-max-packs=9",
-        "--task-max-large=9",
-        "--task-large-max-bytes=0",
-        "--task-large-max-bytes=67108864",
-        "--task-large-max-bytes=1024",
-    ] {
-        let mut given = TASK.to_vec();
-        given.push(bad);
-        assert_eq!(refused(&given), ErrorKind::ValueValidation, "{bad}");
-    }
-    let mut edges = TASK.to_vec();
-    edges.extend([
-        "--task-max-packs=1",
-        "--task-max-large=8",
-        "--task-large-max-bytes=67108865",
-    ]);
-    let set = parsed(&edges).expect("parses").task.expect("task flags");
-    assert_eq!((set.max_packs, set.max_large), (1, 8));
-    let mut edges = TASK.to_vec();
-    edges.extend(["--task-max-packs=8", "--task-max-large=0"]);
-    let set = parsed(&edges).expect("parses").task.expect("task flags");
-    assert_eq!((set.max_packs, set.max_large), (8, 0));
-}
-
-/// Asserts the bounds of the numeric flags: the wall is 1 to 14400 seconds, the slack 0 to 14400,
-/// and the budgets at least 1.
+/// Asserts the bounds of the numeric flags: the slack is 0 to 14400 seconds, and the budgets and
+/// limits at least 1.
 #[test]
 fn the_numeric_flags_are_bounded() {
     for bad in [
-        "--task-run-wall-secs=0",
-        "--task-run-wall-secs=14401",
         "--task-url-slack-secs=14401",
         "--task-closure-max-digests=0",
         "--task-closure-max-bytes=0",
+        "--task-max-object-entries=0",
+        "--task-max-object-manifest-bytes=0",
+        "--task-object-bytes-per-entry=0",
     ] {
-        let mut given = TASK.to_vec();
+        let mut given = PUT_DIR_ONLY.to_vec();
         given.push(bad);
         assert_eq!(refused(&given), ErrorKind::ValueValidation, "{bad}");
     }
-    let mut most = TASK.to_vec();
-    most.extend(["--task-run-wall-secs=14400", "--task-url-slack-secs=14400"]);
-    let set = parsed(&most).expect("parses").task.expect("task flags");
-    assert_eq!(set.run_wall, Duration::from_secs(14_400));
+    let most = put_dir(&["--task-url-slack-secs=14400"]);
+    assert_eq!(most.url_slack, Duration::from_secs(14_400));
 }
 
-/// Asserts that a read URL that is not `https://host[:port]` is refused when the flags are
-/// parsed, which is at start, with the flag named.
+/// Asserts that the flags of the mode that was removed are refused, as a flag and as a `kbf.toml`
+/// key, with the flag named and the reason: the write endpoint, the bucket, the credentials, the
+/// read URL, the key-set sizes.
 #[test]
-fn a_read_url_that_is_not_https_is_refused_at_start() {
-    for url in [
-        "http://127.0.0.1:8443",
-        "https://127.0.0.1:8443/jobs",
-        "127.0.0.1:8443",
-        "https://",
-    ] {
-        let mut given = TASK[..4].to_vec();
-        let flag = format!("--task-read-url={url}");
+fn the_flags_of_the_presigned_mode_are_refused_naming_the_release() {
+    for gone in super::REMOVED {
+        let flag = format!("--{gone}=x");
+        let mut given = PUT_DIR_ONLY.to_vec();
         given.push(&flag);
         let error = parsed(&given).expect_err("refused");
-        assert_eq!(error.kind(), ErrorKind::ArgumentConflict, "{url}");
-        assert!(error.to_string().contains("--task-read-url"), "{url}");
+        assert_eq!(error.kind(), ErrorKind::ValueValidation, "{gone}");
+        let said = error.to_string();
+        assert!(
+            said.contains(&format!("invalid value 'x' for '--{gone} <VALUE>': the flag was removed in this release (kbf-server 0.")),
+            "{said}"
+        );
+        assert!(said.contains("delete the flag"), "{said}");
     }
 }
 
-/// Asserts that `--executor-allow-plain-http-grant` opens nothing for a frontend that runs
-/// placed actions on daemons: the opt-in is for `--executor js-agent`, and an `http://` read url
-/// stays refused at start without it.
+/// Asserts the output mode: a put directory under `--task-out-root` is the only mode, and the
+/// default; `presigned`, which was removed, is refused with a message that says so and names the
+/// build, whatever else is given; a mode without its root, a root without its mode or the switch,
+/// a root that is no absolute path in normal form and a mode that is neither are refused.
 #[test]
-fn the_plain_http_grant_opt_in_is_for_the_host_executor() {
-    let mut given = TASK[..4].to_vec();
-    given.push("--task-read-url=http://127.0.0.1:8443");
-    given.push("--executor-allow-plain-http-grant");
-    let error = parsed(&given).expect_err("refused");
-    assert!(error.to_string().contains("--task-read-url"), "{error}");
+fn the_output_mode_is_a_put_dir_under_its_root_and_presigned_is_refused() {
+    let roots = PutDirRoots::new("/mnt/ts/put").expect("roots");
+    assert_eq!(put_dir(&[]).roots, roots);
+    assert_eq!(put_dir(&["--task-out-mode=put-dir"]).roots, roots);
+
+    for given in [
+        vec!["--task-out-mode=presigned"],
+        vec![
+            "--task-out-mode=presigned",
+            "--task-secret-file=/etc/kbf/task.secret",
+            "--task-out-root=/mnt/ts/put",
+        ],
+    ] {
+        let error = parsed(&given).expect_err("refused");
+        assert_eq!(error.kind(), ErrorKind::ArgumentConflict, "{given:?}");
+        let said = error.to_string();
+        assert!(
+            said.contains("--task-out-mode presigned was removed in this release (kbf-server 0."),
+            "{said}"
+        );
+        assert!(said.contains("--task-out-mode put-dir"), "{said}");
+        assert!(said.contains("--task-put-endpoint"), "{said}");
+    }
+
+    let relative = parsed(&[
+        "--task-secret-file=/etc/kbf/task.secret",
+        "--task-out-mode=put-dir",
+        "--task-out-root=mnt/put",
+    ])
+    .expect_err("refused");
+    assert_eq!(relative.kind(), ErrorKind::ArgumentConflict);
+    assert!(
+        relative
+            .to_string()
+            .contains("--task-out-root: \"mnt/put\" is not an absolute path"),
+        "{relative}"
+    );
+    assert_eq!(refused(&["--task-out-mode=s3"]), ErrorKind::InvalidValue);
+}
+
+/// Asserts `--task-out-format`: `one-pass` is the one value, given or not; `packs`, the value of
+/// the releases before, is refused.
+#[test]
+fn the_out_format_is_one_pass_and_packs_is_refused() {
+    for more in [&[][..], &["--task-out-format=one-pass"]] {
+        let mut flags = PUT_DIR_ONLY.to_vec();
+        flags.extend_from_slice(more);
+        assert!(
+            parsed(&flags).expect("parses").put_dir.is_some(),
+            "{more:?}"
+        );
+    }
+    let mut flags = PUT_DIR_ONLY.to_vec();
+    flags.push("--task-out-format=packs");
+    assert_eq!(
+        parsed(&flags).expect_err("packs is gone").kind(),
+        ErrorKind::InvalidValue
+    );
 }
 
 /// The file called `name` in `dir` of this text and mode.
@@ -230,27 +239,6 @@ fn file(dir: &Path, name: &str, text: &str, mode: u32) -> PathBuf {
     std::fs::write(&path, text).expect("written");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("mode set");
     path
-}
-
-/// Task flags over the files in `dir`: a private secret and a private credentials file.
-fn flags(dir: &Path) -> TaskFlags {
-    TaskFlags {
-        secret_file: file(dir, "task.secret", &format!("{SECRET}\n"), 0o600),
-        put_endpoint: "http://127.0.0.1:9000".to_owned(),
-        put_bucket: "tiers".to_owned(),
-        put_region: DEFAULT_REGION.to_owned(),
-        put_credentials_file: file(dir, "presign.json", KEYS, 0o600),
-        read_url: "https://127.0.0.1:8443".to_owned(),
-        allow_plain_http_grant: false,
-        run_wall: Duration::from_secs(DEFAULT_RUN_WALL_SECS),
-        url_slack: Duration::from_secs(DEFAULT_URL_SLACK_SECS),
-        max_digests: ClosureLimits::DEFAULT.max_digests,
-        max_bytes: ClosureLimits::DEFAULT.max_bytes,
-        max_packs: 8,
-        max_large: 8,
-        large_credentials_file: Some(file(dir, "large.json", LARGE_KEYS, 0o600)),
-        large_max_bytes: 536_870_912,
-    }
 }
 
 /// A store with an Action of an empty input root and a Command, and the Action's digest.
@@ -280,226 +268,114 @@ async fn farm() -> (Backend, kbf_types::Digest) {
     (Backend::remote(store), action)
 }
 
-/// Asserts that the flags open a preparer that prepares a run: the key is the one a mint of the
-/// secret verifies, the write is for the endpoint and bucket, and the grant is for the read URL.
-/// The secret file may end in a newline and the credentials file may carry the store's ceiling.
+fn put_dir_flags(dir: &Path) -> PutDirFlags {
+    PutDirFlags {
+        secret_file: file(dir, "task.secret", &format!("{SECRET}\n"), 0o600),
+        roots: PutDirRoots::new("/mnt/ts/put").expect("roots"),
+        url_slack: Duration::from_secs(DEFAULT_URL_SLACK_SECS),
+        put_retry: Duration::from_secs(DEFAULT_PUT_RETRY_SECS),
+        max_digests: ClosureLimits::DEFAULT.max_digests,
+        max_object_entries: 1 << 20,
+        max_object_manifest_bytes: 4 << 20,
+        object_bytes_per_entry: 1024,
+        max_bytes: ClosureLimits::DEFAULT.max_bytes,
+    }
+}
+
+/// Asserts that the flags open a preparer of put directories, with the mint of the secret (it
+/// verifies the directory the preparer gives), and that no preparer is built without the flags; a
+/// secret file that is missing, readable by others or under 32 bytes is refused.
 #[tokio::test]
-async fn the_flags_open_a_preparer_that_prepares_a_run() {
-    let dir = scratch_dir("task-open");
+async fn the_put_dir_flags_open_a_preparer_of_put_dirs() {
+    let dir = scratch_dir("task-put-dir-open");
     let (backend, action) = farm().await;
-    let prep = flags(dir.path()).open(backend).expect("opened");
-    let now = UNIX_EPOCH + Duration::from_secs(1_790_000_040);
-    let inputs = prep.prepare_run(LEASE, &action, now).await.expect("run");
-    let mint = PackKeyMint::new(SECRET.as_bytes()).expect("a mint");
-    assert!(mint.verify(&inputs.key, &action).is_ok());
-    let prefix = format!("http://127.0.0.1:9000/tiers/{}?", inputs.key.key());
     assert!(
-        inputs.put_url.starts_with(&prefix),
-        "the write is for the key"
+        super::open_put_dir(None, &backend)
+            .expect("opens")
+            .is_none()
     );
-    assert_eq!(inputs.read_grant.url, "https://127.0.0.1:8443");
-    assert_eq!(inputs.read_grant.not_after, 1_790_000_040 + 7_200 + 600);
-}
-
-/// Asserts that no preparer is built without the switch, and that one is built with it.
-#[tokio::test]
-async fn a_preparer_is_built_only_when_the_switch_is_given() {
-    let dir = scratch_dir("task-switch");
-    let (backend, _) = farm().await;
-    assert!(super::open(None, &backend).expect("opens").is_none());
-    let set = flags(dir.path());
-    assert!(super::open(Some(&set), &backend).expect("opens").is_some());
-    let mut broken = flags(dir.path());
-    broken.secret_file = dir.path().join("none");
-    assert!(super::open(Some(&broken), &backend).is_err());
-}
-
-/// Asserts that a secret file others can read, a file that is not there and a secret under 32
-/// bytes are refused with the file named or the length given and no part of the secret in the
-/// text.
-#[tokio::test]
-async fn the_secret_comes_from_a_private_file_of_enough_bytes() {
-    let dir = scratch_dir("task-secret");
-    let (backend, _) = farm().await;
-    let mut set = flags(dir.path());
-    set.secret_file = file(dir.path(), "wide.secret", SECRET, 0o640);
-    let said = set.open(backend.clone()).expect_err("refused").to_string();
-    assert!(said.contains("wide.secret"), "{said}");
-    assert!(said.contains("0640"), "{said}");
-    assert!(!said.contains(SECRET), "{said}");
-
-    set.secret_file = dir.path().join("none.secret");
-    let said = set.open(backend.clone()).expect_err("refused").to_string();
-    assert!(said.contains("none.secret"), "{said}");
-
-    let short = "0123456789abcdef0123456789abcde";
-    set.secret_file = file(dir.path(), "short.secret", short, 0o600);
-    let error = set.open(backend).expect_err("refused");
-    assert!(matches!(error, TaskFlagError::GrantKey(_)), "{error}");
-    assert!(!error.to_string().contains(short), "{error}");
-}
-
-/// Asserts that a credentials file others can read, a file that is not there, a file that is not
-/// the key and a key with an empty part are refused with the file named and no part of the
-/// secret in the text.
-#[tokio::test]
-async fn the_credentials_come_from_a_private_file_of_a_key() {
-    let dir = scratch_dir("task-credentials");
-    let (backend, _) = farm().await;
-    let mut set = flags(dir.path());
-    let cases = [
-        ("wide.json", KEYS, 0o640, "mode 0640"),
-        ("junk.json", "hunter2 is not JSON", 0o600, "not JSON"),
-        (
-            "blank-id.json",
-            r#"{"access_key_id": "", "secret_access_key": "hunter2"}"#,
-            0o600,
-            "both not empty",
-        ),
-        (
-            "blank-secret.json",
-            r#"{"access_key_id": "pack-presign", "secret_access_key": ""}"#,
-            0o600,
-            "both not empty",
-        ),
-        (
-            "one-part.json",
-            r#"{"access_key_id": "pack-presign"}"#,
-            0o600,
-            "not JSON",
-        ),
-    ];
-    for (name, text, mode, expected) in cases {
-        set.put_credentials_file = file(dir.path(), name, text, mode);
-        let said = set.open(backend.clone()).expect_err("refused").to_string();
-        assert!(said.contains(name), "{said}");
-        assert!(said.contains(expected), "{name}: {said}");
-        assert!(!said.contains("hunter2"), "{said}");
-    }
-    set.put_credentials_file = dir.path().join("none.json");
-    let said = set.open(backend).expect_err("refused").to_string();
-    assert!(said.contains("none.json"), "{said}");
-}
-
-/// Asserts what the preparer refuses at start that the flags alone cannot say: a wall and a slack
-/// that pass the 4 hour ceiling of a presigned write, an endpoint that is not a URL and an empty
-/// bucket.
-#[tokio::test]
-async fn the_preparer_refuses_what_the_flags_cannot_check_alone() {
-    let dir = scratch_dir("task-config");
-    let (backend, _) = farm().await;
-    let mut long = flags(dir.path());
-    long.run_wall = Duration::from_secs(14_400);
-    long.url_slack = Duration::from_secs(1);
-    let error = long.open(backend.clone()).expect_err("refused");
-    assert!(matches!(error, TaskFlagError::Config(_)), "{error}");
-    assert!(error.to_string().contains("14401"), "{error}");
-
-    let mut endpoint = flags(dir.path());
-    endpoint.put_endpoint = "127.0.0.1:9000".to_owned();
-    assert!(endpoint.open(backend.clone()).is_err());
-
-    let mut bucket = flags(dir.path());
-    bucket.put_bucket = String::new();
-    assert!(bucket.open(backend).is_err());
-}
-
-/// The URL's access key id: the first part of its credential scope.
-fn access_key_id(url: &str) -> String {
-    let (_, query) = url.split_once('?').expect("a query");
-    let pair = query
-        .split('&')
-        .find(|pair| pair.starts_with("X-Amz-Credential="));
-    let scope = pair
-        .expect("a credential")
-        .trim_start_matches("X-Amz-Credential=");
-    scope.split("%2F").next().expect("an id").to_owned()
-}
-
-/// Asserts that the flags open a preparer whose runs get as many pack grants and large grants as
-/// `--task-max-packs` and `--task-max-large` say, the large ones signed with the large
-/// credentials file and the pack ones with the pack credentials file.
-#[tokio::test]
-async fn the_flags_open_a_preparer_that_gives_each_run_a_key_set() {
-    let dir = scratch_dir("task-key-set");
-    let (backend, action) = farm().await;
-    let mut set = flags(dir.path());
-    set.max_packs = 3;
-    set.max_large = 2;
-    let prep = set.open(backend).expect("opened");
-    assert_eq!(prep.large_max_bytes(), Some(536_870_912));
+    let set = put_dir_flags(dir.path());
+    let prep = super::open_put_dir(Some(&set), &backend)
+        .expect("opens")
+        .expect("a preparer");
     let now = UNIX_EPOCH + Duration::from_secs(1_790_000_040);
-    let inputs = prep.prepare_run(LEASE, &action, now).await.expect("run");
-    assert_eq!(inputs.packs.len(), 3);
-    assert_eq!(inputs.large.len(), 2);
+    let run = prep
+        .prepare_put_dir(LEASE, &action, now, Duration::from_secs(60))
+        .await
+        .expect("run");
     let mint = PackKeyMint::new(SECRET.as_bytes()).expect("a mint");
-    for key in inputs.keys() {
-        assert!(mint.verify(&key, &action).is_ok(), "{}", key.key());
-    }
-    for grant in &inputs.packs {
-        assert_eq!(access_key_id(&grant.put_url), "pack-presign");
-    }
-    for grant in &inputs.large {
-        assert_eq!(access_key_id(&grant.put_url), "large-presign");
-    }
+    assert_eq!(mint.verify_put_dir(&run.dir, &action), Ok(now));
+    assert_eq!(run.not_after, 1_790_000_040 + 60 + DEFAULT_URL_SLACK_SECS);
+
+    let mut broken = put_dir_flags(dir.path());
+    broken.secret_file = dir.path().join("none");
+    assert!(super::open_put_dir(Some(&broken), &backend).is_err());
+    broken.secret_file = file(dir.path(), "wide.secret", SECRET, 0o640);
+    let said = broken
+        .open(backend.clone())
+        .expect_err("refused")
+        .to_string();
+    assert!(
+        said.contains("wide.secret") && said.contains("0640"),
+        "{said}"
+    );
+    assert!(!said.contains(SECRET), "{said}");
+    let short = "too short\n";
+    broken.secret_file = file(dir.path(), "short.secret", short, 0o600);
+    let error = broken.open(backend).expect_err("refused");
+    assert!(matches!(error, TaskFlagError::Mint(_)), "{error}");
+    assert!(error.to_string().contains("--task-secret-file"), "{error}");
+    assert!(!error.to_string().contains("too short"), "{error}");
 }
 
-/// Asserts that without `--task-large-credentials-file` no run gets a large key, whatever
-/// `--task-max-large` says, and the packs are as many as asked.
+/// Asserts that the preparation of put directories, as the executor asks for it
+/// ([`crate::executor::RunPrepare`]), gives the directory and the closure the mint of the secret
+/// verifies, refuses a run of presigned writes, and refuses a lease that is no build id as the
+/// caller's.
 #[tokio::test]
-async fn without_the_large_credentials_file_a_run_has_no_large_keys() {
-    let dir = scratch_dir("task-no-large");
+async fn the_put_dir_preparation_makes_directories() {
+    use crate::executor::{PrepareError, RunPrepare};
+
+    let dir = scratch_dir("task-put-dir-seam");
     let (backend, action) = farm().await;
-    let mut set = flags(dir.path());
-    set.large_credentials_file = None;
-    set.max_large = 8;
-    let prep = set.open(backend).expect("opened");
-    assert_eq!(prep.large_max_bytes(), None);
+    let prep = put_dir_flags(dir.path()).open(backend).expect("opened");
     let now = UNIX_EPOCH + Duration::from_secs(1_790_000_040);
-    let inputs = prep.prepare_run(LEASE, &action, now).await.expect("run");
-    assert_eq!(inputs.packs.len(), 8);
-    assert!(inputs.large.is_empty());
-}
-
-/// Asserts that a large credentials file others can read, a file that is not there and a file
-/// that is not a key are refused with the flag and the file named and no part of the secret in
-/// the text.
-#[tokio::test]
-async fn the_large_credentials_come_from_a_private_file_of_a_key() {
-    let dir = scratch_dir("task-large-credentials");
-    let (backend, _) = farm().await;
-    let mut set = flags(dir.path());
-    let cases = [
-        ("wide-large.json", LARGE_KEYS, 0o640, "mode 0640"),
-        ("junk-large.json", "hunter3 is not JSON", 0o600, "not JSON"),
-        (
-            "blank-large.json",
-            r#"{"access_key_id": "large-presign", "secret_access_key": ""}"#,
-            0o600,
-            "both not empty",
-        ),
-    ];
-    for (name, text, mode, expected) in cases {
-        set.large_credentials_file = Some(file(dir.path(), name, text, mode));
-        let said = set.open(backend.clone()).expect_err("refused").to_string();
-        assert!(said.contains("--task-large-credentials-file"), "{said}");
-        assert!(said.contains(name), "{said}");
-        assert!(said.contains(expected), "{name}: {said}");
-        assert!(!said.contains("hunter3"), "{said}");
-    }
-    set.large_credentials_file = Some(dir.path().join("none-large.json"));
-    let said = set.open(backend).expect_err("refused").to_string();
-    assert!(said.contains("none-large.json"), "{said}");
-}
-
-/// Asserts that the preparer's own checks of the key set are reached from the flags: a large cap
-/// at or under a pack record's, which the flag refuses too, does not open.
-#[tokio::test]
-async fn a_large_cap_at_a_pack_record_does_not_open() {
-    let dir = scratch_dir("task-large-cap");
-    let (backend, _) = farm().await;
-    let mut set = flags(dir.path());
-    set.large_max_bytes = 64 << 20;
-    let error = set.open(backend).expect_err("refused");
-    assert!(matches!(error, TaskFlagError::Config(_)), "{error}");
+    let wall = Duration::from_secs(60);
+    let run = RunPrepare::prepare_put_dir(&prep, LEASE, &action, now, wall)
+        .await
+        .expect("prepared");
+    assert!(
+        run.dir.starts_with(&format!("cas/b/{LEASE}/")),
+        "{}",
+        run.dir
+    );
+    assert_eq!(run.not_after, 1_790_000_040 + 60 + DEFAULT_URL_SLACK_SECS);
+    let Err(refused) = RunPrepare::prepare_run(&prep, LEASE, &action, now, wall).await else {
+        panic!("a run of writes is refused");
+    };
+    assert_eq!(
+        refused,
+        PrepareError::Refused(
+            "this preparation makes no presigned write: runs commit into put directories"
+                .to_owned()
+        )
+    );
+    let bad = RunPrepare::prepare_put_dir(&prep, "a.b", &action, now, wall)
+        .await
+        .expect_err("refused");
+    assert!(matches!(bad, PrepareError::Refused(_)), "{bad:?}");
+    let source = crate::executor::RunSource::of_put_dir(&Arc::new(prep));
+    assert!(
+        source
+            .mint
+            .verify_put_dir(
+                &kbf_front::IssuedPutDir::new(
+                    LEASE,
+                    &run.dir[run.dir.rfind('/').expect("a nonce") + 1..]
+                )
+                .expect("a dir"),
+                &action
+            )
+            .is_ok()
+    );
 }

@@ -713,7 +713,7 @@ fn arg_of(harness: &Harness, id: &str, flag: &str) -> String {
 
 /// Catches a failed job's output not reaching its result, or reaching the log: the tails
 /// `GetResult` answered go with the result as its stdout and stderr, beside the unchanged
-/// reason, the log holds their lengths only, and no `GetLogs` is made for output already in
+/// reason, the log holds their lengths (and the end of the standard error, not the standard output), and no `GetLogs` is made for output already in
 /// hand.
 #[tokio::test(start_paused = true)]
 async fn a_failed_job_s_output_goes_with_its_result() {
@@ -736,10 +736,9 @@ async fn a_failed_job_s_output_goes_with_its_result() {
         text.contains("stdout_bytes=10 stderr_bytes=17 truncated=false unread=false"),
         "{text}"
     );
-    assert!(
-        !text.contains("compiling") && !text.contains("disk full"),
-        "{text}"
-    );
+    // The standard output stays out of the log; the end of the standard error is in it (see
+    // `runs_excerpt_tests`).
+    assert!(!text.contains("compiling"), "{text}");
     let result = reported(&worker, LeaseId::new(1, 1));
     assert_eq!(
         status_of(result),
@@ -916,5 +915,7 @@ async fn a_job_that_ended_well_makes_no_call_for_its_output() {
     assert_eq!((result_calls(&calls), logs_calls(&calls)), (1, 0));
 }
 
+#[path = "runs_excerpt_tests.rs"]
+mod excerpt;
 #[path = "runs_submit_tests.rs"]
 mod submit;

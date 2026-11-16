@@ -8,6 +8,8 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+# The CRC-32 of a ZIP entry (the one-pass object).
+crc32fast.workspace = true
 # Hex of the MAC in a key.
 hex.workspace = true
 # The segment layout of a task pack: the footer, the writer and the reader of its records.
@@ -17,7 +19,15 @@ kbf-types.workspace = true
 # The manifest of a task pack is JSON.
 serde.workspace = true
 serde_json.workspace = true
+# The digest of a whole pack, hashed as `PackLayout::write_to` writes it.
+sha2.workspace = true
 thiserror.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+# A pure-Rust ZIP reader, to check the one-pass object is a ZIP any reader takes.
+zip.workspace = true
+# The zip crate's backend; the object itself is never compressed.
+flate2.workspace = true

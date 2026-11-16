@@ -20,10 +20,7 @@ fn argv(more: &[&str]) -> Vec<String> {
         "--pack-store-credentials-file=/nowhere",
         // What `--executor js-agent` prepares its runs with, which the parse requires.
         "--task-secret-file=/nowhere/secret",
-        "--task-put-endpoint=http://127.0.0.1:9",
-        "--task-put-bucket=packs",
-        "--task-put-credentials-file=/nowhere/presign.json",
-        "--task-read-url=https://127.0.0.1:9400",
+        "--task-out-root=/mnt/ts/put",
         "--job-listen=127.0.0.1:9400",
         "--job-tls-cert=/nowhere/job.pem",
         "--job-tls-key=/nowhere/job.key",
@@ -61,7 +58,7 @@ const JS: [&str; 12] = [
     "--executor-kbf-image=registry.test/kbf@sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
     "--executor-base-tree=/opt/kbf/base-tree",
     "--executor-insecure-argv-secrets",
-    // The tier store of the task flags is `http://`, as it is until it serves TLS.
+    // Still a setting of the executor, though no flag gives it the mode that reads it.
     "--executor-allow-plain-http-put",
 ];
 
@@ -130,16 +127,28 @@ fn js_agent_names_each_flag_it_needs() {
         "--executor-job-url",
         "--executor-job-token-file",
         "--executor-frontend-id",
-        "--executor-hosts",
-        "--executor-host-cpus",
-        "--executor-host-memory-gib",
         "--executor-base-image",
         "--executor-kbf-image",
         "--executor-base-tree",
     ] {
         assert!(why.contains(flag), "{flag} in {why}");
     }
+    for flag in [
+        "--executor-hosts",
+        "--executor-host-cpus",
+        "--executor-host-memory-gib",
+    ] {
+        assert!(!why.contains(flag), "{flag} is not needed: {why}");
+    }
+    let shape = [
+        "--executor-hosts",
+        "--executor-host-cpus",
+        "--executor-host-memory-gib",
+    ];
     for (at, flag) in JS.iter().enumerate().skip(1).take(9) {
+        if shape.contains(&name(flag)) {
+            continue;
+        }
         let name = name(flag);
         let mut all = JS.to_vec();
         all.remove(at);
@@ -167,6 +176,33 @@ fn js_agent_needs_the_secrets_opt_in_and_the_packs() {
     assert!(why.contains("--pack-store-endpoint"), "{why}");
 }
 
+/// Catches the virtual workers' shape being required: left out, the executor gets the
+/// ceilings the flags default to (the constants), and giving them lowers each ceiling.
+#[test]
+fn the_workers_shape_defaults_to_generous_ceilings() {
+    let mut all = JS.to_vec();
+    all.retain(|flag| {
+        ![
+            "--executor-hosts",
+            "--executor-host-cpus",
+            "--executor-host-memory-gib",
+        ]
+        .contains(&name(flag))
+    });
+    let flags = parsed(argv(&all)).expect("flags");
+    let config = flags.executor.js.expect("js-agent").config;
+    assert_eq!(config.hosts, DEFAULT_HOSTS);
+    assert_eq!(config.cpu_millis, DEFAULT_HOST_CPUS * 1_000);
+    assert_eq!(config.memory_bytes, DEFAULT_HOST_MEMORY_GIB << 30);
+    let flags = js_with(&[]).expect("flags");
+    let config = flags.executor.js.expect("js-agent").config;
+    assert_eq!(
+        (config.hosts, config.cpu_millis, config.memory_bytes),
+        (2, 8_000, 32 << 30),
+        "a given shape lowers the ceilings"
+    );
+}
+
 /// Catches settings that do not become the executor's: the shape is in cores and GiB, the two
 /// images are the ones given by digest, and everything else is what was given.
 #[test]
@@ -181,6 +217,10 @@ fn js_agent_settings_become_the_executors_config() {
         "--executor-max-run-secs=1800",
         "--executor-default-timeout-secs=900",
         "--executor-call-timeout-secs=3",
+        "--executor-poll-ms=250",
+        "--executor-prepare-limit-secs=45",
+        "--executor-prepare-concurrency=3",
+        "--executor-failed-stderr-log-bytes=2048",
     ])
     .expect("flags");
     let js = flags.executor.js.expect("js-agent");
@@ -205,6 +245,10 @@ fn js_agent_settings_become_the_executors_config() {
     assert_eq!(config.max_run, Duration::from_secs(1800));
     assert_eq!(config.default_timeout, Duration::from_secs(900));
     assert_eq!(config.call_timeout, Duration::from_secs(3));
+    assert_eq!(config.poll, Duration::from_millis(250));
+    assert_eq!(config.prepare_limit, Duration::from_secs(45));
+    assert_eq!(config.prepare_concurrency, 3);
+    assert_eq!(config.failed_stderr_log_bytes, 2048);
 }
 
 /// Catches `--executor-locate` not becoming the executor's setting, or being on by default: it
@@ -232,12 +276,11 @@ fn locate_with_kbf_daemon_is_refused_at_start() {
 /// as text in the flags and are the config's.
 #[test]
 fn the_defaults_are_the_executors_own() {
-    let mut all: Vec<&str> = JS
+    let all: Vec<&str> = JS
         .iter()
         .copied()
         .filter(|flag| *flag != "--executor-allow-plain-http-put")
         .collect();
-    all.push("--task-put-endpoint=https://127.0.0.1:9");
     let flags = parsed(argv(&all)).expect("flags");
     let config = flags.executor.js.expect("js-agent").config;
     let own = Config::new("front-1", 2, 8_000, 32 << 30);
@@ -251,6 +294,9 @@ fn the_defaults_are_the_executors_own() {
     assert_eq!(config.max_run, own.max_run);
     assert_eq!(config.default_timeout, own.default_timeout);
     assert_eq!(config.call_timeout, own.call_timeout);
+    assert_eq!(config.prepare_limit, own.prepare_limit);
+    assert_eq!(config.prepare_concurrency, own.prepare_concurrency);
+    assert_eq!(config.failed_stderr_log_bytes, own.failed_stderr_log_bytes);
     assert_eq!(own.delivery, config.delivery);
     assert_eq!(config.network, own.network);
     assert_eq!(config.allow_open_network, own.allow_open_network);
@@ -399,6 +445,11 @@ fn flags_of(url: &str, token: &Path, ca: Option<&Path>) -> JsAgentFlags {
         base_image: ImageRef::parse(&format!("docker://{BASE}")).expect("an image"),
         kbf_image: ImageRef::parse(&format!("docker://{KBF}")).expect("an image"),
         base_tree: "/opt/kbf/base-tree".into(),
+        base_tree_url: String::new(),
+        base_tree_keep: 1,
+        base_tree_timeout: std::time::Duration::from_secs(60),
+        published: std::sync::Arc::default(),
+        put_retry: std::time::Duration::from_secs(60),
     }
 }
 
@@ -574,9 +625,6 @@ fn old_lease_flags_are_refused_and_job_flags_are_required() {
             "--executor-job-url",
             "--executor-job-token-file",
             "--executor-frontend-id",
-            "--executor-hosts",
-            "--executor-host-cpus",
-            "--executor-host-memory-gib",
             "--executor-base-image",
             "--executor-kbf-image",
             "--executor-base-tree",
@@ -683,4 +731,46 @@ fn the_job_network_is_logged_at_start() {
         "{line}"
     );
     assert!(!text.contains("WARN"), "{text}");
+}
+
+/// Catches a log excerpt that cannot be bounded or turned off, or one allowed past the output a
+/// result holds: `--executor-failed-stderr-log-bytes` takes 0 (none) to 8192 and refuses more.
+#[test]
+fn the_stderr_log_bytes_take_zero_to_the_output_cap() {
+    for ok in ["0", "8192"] {
+        let flag = format!("--executor-failed-stderr-log-bytes={ok}");
+        js_with(&[flag.as_str()]).expect("taken");
+    }
+    let why = js_with(&["--executor-failed-stderr-log-bytes=8193"]).expect_err("refused");
+    assert!(why.contains("--executor-failed-stderr-log-bytes"), "{why}");
+}
+
+/// Asserts that a js-agent executor given no `--executor-poll-ms` polls every 1000 ms.
+#[test]
+fn the_poll_interval_defaults_to_one_second() {
+    let config = js_with(&[])
+        .expect("flags")
+        .executor
+        .js
+        .expect("js-agent")
+        .config;
+    assert_eq!(config.poll, Duration::from_millis(1000));
+}
+
+/// Asserts that `--executor-poll-ms` outside 100 to 10000 is refused, and the ends are taken.
+#[test]
+fn the_poll_interval_outside_its_range_is_refused() {
+    for bad in [
+        "--executor-poll-ms=0",
+        "--executor-poll-ms=99",
+        "--executor-poll-ms=10001",
+    ] {
+        let why = refused(&[bad]);
+        assert!(why.contains("executor-poll-ms"), "{bad}: {why}");
+    }
+    let low = js_with(&["--executor-poll-ms=100"]).expect("low end");
+    assert_eq!(
+        low.executor.js.expect("js-agent").config.poll,
+        Duration::from_millis(100)
+    );
 }

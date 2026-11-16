@@ -70,6 +70,14 @@ struct WireTiming {
     fetch_ms: u64,
     run_ms: u64,
     pack_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    walk_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hash_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    write_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    commit_ms: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -116,6 +124,10 @@ impl Wire {
                 fetch_ms: m.timing.fetch_ms,
                 run_ms: m.timing.run_ms,
                 pack_ms: m.timing.pack_ms,
+                walk_ms: m.timing.walk_ms,
+                hash_ms: m.timing.hash_ms,
+                write_ms: m.timing.write_ms,
+                commit_ms: m.timing.commit_ms,
             },
             usage: WireUsage {
                 cpu_usage_us: m.usage.cpu_usage_us,
@@ -190,6 +202,10 @@ impl Wire {
                 fetch_ms: self.timing.fetch_ms,
                 run_ms: self.timing.run_ms,
                 pack_ms: self.timing.pack_ms,
+                walk_ms: self.timing.walk_ms,
+                hash_ms: self.timing.hash_ms,
+                write_ms: self.timing.write_ms,
+                commit_ms: self.timing.commit_ms,
             },
             usage: Usage {
                 cpu_usage_us: self.usage.cpu_usage_us,

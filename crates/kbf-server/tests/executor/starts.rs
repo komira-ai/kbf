@@ -266,29 +266,29 @@ async fn a_cas_that_never_answers_is_given_the_window_and_no_more() {
 }
 
 /// Catches a pass that starts every waiting task however long the first ones take: the
-/// heartbeats and the fence come after them. Once the pass budget is spent no more is begun,
-/// and the tasks left are taken in the next pass, still inside their windows.
+/// heartbeats and the fence come after them. The first task's submit is not answered, which
+/// holds the pass for the call's whole bound, longer than the pass budget; once the budget is
+/// spent no more is begun, and the task left is taken in the next pass, still inside its window.
 #[tokio::test(start_paused = true)]
 async fn a_pass_begins_no_task_once_its_budget_is_spent() {
-    use std::sync::atomic::Ordering;
-    let mut rig = Rig::start(&[HOST], 1, |_| {}).await;
+    let mut rig = Rig::start(&[HOST], 1, |cfg| cfg.pass_budget = Duration::from_secs(3)).await;
     rig.pump().await;
     let (_a, _b) = (rig.submit(1), rig.submit(2));
     rig.farm.tick().await;
     settle().await;
-    rig.inputs.hold.store(true, Ordering::SeqCst);
-    let (exec, fake, inputs) = (&mut rig.exec, &rig.fake, &rig.inputs);
-    let slow = async {
-        settle().await;
-        tokio::time::advance(Duration::from_secs(11)).await;
-        fake.advance(Duration::from_secs(11));
-        inputs.hold.store(false, Ordering::SeqCst);
-        inputs.release.notify_one();
-    };
-    tokio::join!(exec.step(), slow);
-    assert_eq!(rig.jobs().len(), 1, "the second task began past the budget");
-    rig.exec.step().await;
-    assert_eq!(rig.jobs().len(), 2, "the second task was not taken up");
+    rig.fake.inject_on("SubmitJob", Fault::Hang);
+    rig.step_through(Duration::from_secs(6)).await;
+    assert_eq!(
+        submits(&rig.fake.calls()).len(),
+        1,
+        "the second task began past the budget"
+    );
+    rig.step_through(Duration::from_secs(6)).await;
+    assert_eq!(
+        submits(&rig.fake.calls()).len(),
+        3,
+        "the second task was not taken up"
+    );
 }
 
 /// Catches an action the executor cannot run being passed to the job service or rerun: an

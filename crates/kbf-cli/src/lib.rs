@@ -18,8 +18,9 @@
 //!   every other flag of `kbf-server` (and so any state-store flag: a storage node
 //!   reaches the state store only through a frontend).
 //! - `frontend`: the REAPI front end ([`kbf_server::frontend`]). Takes `kbf-server`'s
-//!   listener, scheduler, state-store and log flags, requires `--storage` and takes the
-//!   flags of its mutual TLS to the storage node; refuses every other flag of
+//!   listener, scheduler, state-store and log flags, takes `--storage` (left out, the frontend
+//!   has no storage node and needs `--executor js-agent`, `--pack-index` and the pack store
+//!   flags instead) and the flags of its mutual TLS to the storage node; refuses every other flag of
 //!   `kbf-server` (a frontend holds no stores). It needs a state store too: [`preflight`]
 //!   refuses a start with no `--state-store` (or `state-store` key), `--check` included.
 //! - `storage-and-daemon`: the storage node and the daemon in one process, the

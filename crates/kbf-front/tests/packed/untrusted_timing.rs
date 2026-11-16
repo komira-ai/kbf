@@ -54,6 +54,7 @@ async fn rebuilt_carries_the_manifests_durations_as_a_claim() {
         fetch_ms: 120,
         run_ms: 3_400,
         pack_ms: 56,
+        ..Timing::default()
     };
     let (got, stored) = ingested(timing).await;
 
@@ -100,6 +101,7 @@ async fn a_phase_the_task_did_not_time_is_absent_not_zero_width() {
         fetch_ms: 0,
         run_ms: 500,
         pack_ms: 0,
+        ..Timing::default()
     };
     let (got, _) = ingested(timing).await;
 
@@ -122,6 +124,7 @@ async fn the_largest_claim_a_manifest_holds_does_not_overflow() {
         fetch_ms: most,
         run_ms: most,
         pack_ms: most,
+        ..Timing::default()
     };
     let (got, _) = ingested(timing).await;
 

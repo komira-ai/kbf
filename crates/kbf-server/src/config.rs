@@ -29,6 +29,11 @@ use crate::stores::{S3Uri, StoreFlags, StoreUri, Stores, StoresError};
 use crate::token::{ApiToken, TokenFileError};
 use crate::worker::HostFloor;
 
+/// Where the worker listener is when `--worker-listen` is not given, in every mode but
+/// `kbf frontend` (which then has none).
+pub const DEFAULT_WORKER_LISTEN: SocketAddr =
+    SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 8981);
+
 /// The default of `--tls-reload-interval-secs`.
 const DEFAULT_TLS_RELOAD_SECS: u64 = 30;
 
@@ -205,9 +210,11 @@ pub struct Args {
     pub storage: Option<String>,
     /// The `kbf.worker.v1` listener. Without mutual TLS (`--worker-tls-cert`,
     /// `--worker-tls-key`, `--worker-client-ca`) it serves plain text, on any address;
-    /// off loopback the start line carries a warning.
-    #[arg(long, default_value = "127.0.0.1:8981")]
-    pub worker_listen: SocketAddr,
+    /// off loopback the start line carries a warning. `kbf frontend` binds it only when it is
+    /// given (a frontend with no daemons and no storage nodes serves none); every other mode
+    /// binds 127.0.0.1:8981 when it is not.
+    #[arg(long)]
+    pub worker_listen: Option<SocketAddr>,
     /// The operator API listener (HTTP/JSON under `/v1`). Off unless given. Reads are
     /// open to whoever reaches it: bind it where only operators do.
     #[arg(long)]
@@ -237,6 +244,17 @@ pub struct Args {
         value_parser = clap::value_parser!(u64).range(1..=60_000)
     )]
     pub readyz_store_timeout_ms: u64,
+    /// How often, in milliseconds, a frontend asks each of the dependencies behind `GET
+    /// /readyz` (the storage node, the state store, the storage map) again, in the
+    /// background. `GET /readyz` and the REAPI listener's `grpc.health.v1` service answer from
+    /// the last answers at once and wait for no probe; a probe that has not answered within
+    /// `--readyz-store-timeout-ms` counts as failed.
+    #[arg(
+        long,
+        default_value_t = crate::health::PROBE_INTERVAL.as_millis() as u64,
+        value_parser = clap::value_parser!(u64).range(1..=3_600_000)
+    )]
+    pub readyz_probe_interval_ms: u64,
     /// PEM certificate of the worker listener. With `--worker-tls-key` and
     /// `--worker-client-ca` it serves mutual TLS; without all three, plain text.
     #[arg(long, requires_all = ["worker_tls_key", "worker_client_ca"])]
@@ -719,7 +737,7 @@ pub struct Args {
         requires = "state_store"
     )]
     pub member_dwell_secs: u64,
-    /// Build history: `--history-objects` and `--history-index-root`.
+    /// Build history: `--history-objects`, `--history-credentials-file` and `--history-index-root`.
     #[command(flatten)]
     pub history: crate::history::HistoryFlags,
     /// The retired release poller's and release store's flags: accepted, hidden, ignored.
@@ -1011,7 +1029,7 @@ impl Args {
         Ok(Listeners {
             reapi: self.listen,
             reapi_tls,
-            worker: self.worker_listen,
+            worker: self.worker_listen.unwrap_or(DEFAULT_WORKER_LISTEN),
             worker_tls,
             heartbeat_interval: Duration::from_millis(self.heartbeat_interval_ms),
             hello_wait: Duration::from_secs(10),
@@ -1081,7 +1099,10 @@ impl Args {
     #[must_use]
     pub fn plain_text_off_loopback(&self) -> Vec<&'static str> {
         let reapi = self.reapi_tls_cert.is_none() && !loopback_only(self.listen.ip());
-        let worker = self.worker_tls_cert.is_none() && !loopback_only(self.worker_listen.ip());
+        let worker = self.worker_tls_cert.is_none()
+            && self
+                .worker_listen
+                .is_some_and(|addr| !loopback_only(addr.ip()));
         [("reapi", reapi), ("worker", worker)]
             .into_iter()
             .filter_map(|(name, plain)| plain.then_some(name))

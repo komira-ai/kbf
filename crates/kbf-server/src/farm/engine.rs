@@ -193,6 +193,16 @@ pub(in crate::farm) struct Engine {
     /// it takes in no queued work of the other frontends and places none on its nodes, and
     /// goes on with what it holds.
     pub(in crate::farm) closed: bool,
+    /// The leases the executor withdrew at a drain because their jobs were still queued on
+    /// the job service ([`Farm::unplaced`](super::Farm::unplaced)): until the scheduler gives
+    /// each up, when its operation moves to `withdrawn`.
+    pub(in crate::farm) unplaced: BTreeSet<LeaseId>,
+    /// The operations whose lease was withdrawn at a drain with its job never placed on a
+    /// host: nothing of them ran, so a drain ends their streams as it ends those of any
+    /// operation that never started and that nothing here can run, unless a daemon session of
+    /// another frontend could run it, which keeps them ([`Engine::stage_for`]).
+    /// The operation stays queued in the state store for the next frontend.
+    pub(in crate::farm) withdrawn: BTreeSet<OperationId>,
     /// For each operation this farm's callers wait on ([`Farm::follow`](super::Farm::follow))
     /// that the last looks found neither unfinished nor ended, how many looks in a row. Only
     /// logged: no look count ends a caller's wait.
@@ -232,6 +242,8 @@ impl Engine {
             unclaimed: BTreeMap::new(),
             fenced: false,
             closed: false,
+            unplaced: BTreeSet::new(),
+            withdrawn: BTreeSet::new(),
             untraced_kept: BTreeMap::new(),
             unwritten_floors: Vec::new(),
             intake: Intake::default(),
@@ -348,6 +360,10 @@ impl Engine {
                 worker: node,
                 reason,
             } = requeue;
+            if self.unplaced.remove(&lease) {
+                self.ever_started.remove(&operation);
+                self.withdrawn.insert(operation);
+            }
             let farm_runs = self.sched.farm_runs(operation).map_or(0, <[_]>::len);
             let operation = a.name(&self.view(), operation);
             // One line: the coverage of a logged field counts only where it is logged.
@@ -371,6 +387,8 @@ impl Engine {
         self.answered
             .retain(|_, operation| sched.state(*operation).is_some());
         self.ever_started
+            .retain(|operation| sched.state(*operation).is_some());
+        self.withdrawn
             .retain(|operation| sched.state(*operation).is_some());
     }
 
@@ -434,14 +452,20 @@ impl Engine {
     ///   the intake closed, so it is queued for the other frontends like any queued work.
     /// - `Waiting`: a drain ends its streams. It never started, no daemon session of
     ///   another frontend could run it, and it is held by an operator's cordon (alone, or
-    ///   beside the drain's) or by no worker at all.
+    ///   beside the drain's) or by no worker at all; or its lease was withdrawn at the drain
+    ///   with its job never placed on a host (`withdrawn`) and no daemon session of another
+    ///   frontend could run it, whatever holds it now. A withdrawn operation another frontend
+    ///   could run is `WaitingKept`: Buck2 never re-attaches an ended stream, so ending it would
+    ///   fail an action the other frontend runs.
     fn stage_for(&self, operation: OperationId, why: &str) -> Stage {
         let cordoned = self.sched.cordoned_could(operation);
         let only_drain = !cordoned.is_empty()
             && cordoned
                 .iter()
                 .all(|worker| self.drain_held.contains(worker));
-        if self.ever_started.contains(&operation) || self.runnable_elsewhere(operation) {
+        if self.withdrawn.contains(&operation) && !self.runnable_elsewhere(operation) {
+            Stage::Waiting(why.to_owned())
+        } else if self.ever_started.contains(&operation) || self.runnable_elsewhere(operation) {
             Stage::WaitingKept(why.to_owned())
         } else if only_drain {
             Stage::Queued

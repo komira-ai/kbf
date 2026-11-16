@@ -22,6 +22,7 @@ use tonic::Status;
 use super::metrics::PackMetrics;
 use super::room::{Budget, DEFAULT_INFLIGHT_BYTES, Room};
 use super::verifying::VerifyingKeys;
+use crate::cache::is_empty_blob;
 use crate::large_backfill::LargeStore;
 
 /// The largest blob a frontend puts in a pack or serves from one by default: 64 MiB, the
@@ -172,6 +173,8 @@ pub struct Packs {
     store_metrics: Arc<crate::store_metrics::StoreMetrics>,
     pub(super) verifying: Arc<VerifyingKeys>,
     clock: Clock,
+    /// The writer the packs are recorded under, which a large object is recorded under too.
+    pub(super) writer: String,
 }
 
 impl fmt::Debug for Packs {
@@ -198,6 +201,7 @@ impl Packs {
             pack_bytes: settings.pack_bytes,
             ..PackerConfig::default()
         };
+        let writer = keys.writer();
         let packer = Packer::new(store.clone(), index.clone(), keys.clone(), config)?;
         let reader = Reader::new(
             Arc::clone(&store),
@@ -222,6 +226,7 @@ impl Packs {
             store_metrics: Arc::new(crate::store_metrics::StoreMetrics::packs()),
             verifying: Arc::default(),
             clock: Arc::new(SystemTime::now),
+            writer,
         })
     }
 
@@ -281,7 +286,7 @@ impl Packs {
     ///
     /// # Errors
     /// RESOURCE_EXHAUSTED when `bytes` is over all of the room.
-    pub(super) async fn reserve(&self, bytes: u64) -> Result<Room, Status> {
+    pub(in crate::proxy) async fn reserve(&self, bytes: u64) -> Result<Room, Status> {
         self.budget.reserve(bytes).await
     }
 
@@ -317,14 +322,17 @@ impl Packs {
         checked.map_err(|error| error.to_string())
     }
 
-    /// The digests among `asked` that the index has no row for, in the order asked.
+    /// The digests among `asked` that the index has no row for, in the order asked. The empty
+    /// blob is never among them and is not asked of the index: it has no bytes to pack, and a
+    /// client may rely on every store holding it without ever uploading it (Buck2 does not).
     ///
     /// # Errors
     /// UNAVAILABLE when the index fails.
     pub async fn missing(&self, asked: &[Digest]) -> Result<Vec<Digest>, Status> {
         let mut absent = Vec::new();
-        for chunk in asked.chunks(MAX_BATCH) {
-            let wanted: Vec<BlobDigest> = chunk.iter().map(to_index).collect();
+        let unheld: Vec<&Digest> = asked.iter().filter(|d| !is_empty_blob(d)).collect();
+        for chunk in unheld.chunks(MAX_BATCH) {
+            let wanted: Vec<BlobDigest> = chunk.iter().copied().map(to_index).collect();
             let index = Arc::clone(&self.index);
             let lacking = offload(move || index.find_missing(&wanted)).await;
             absent.extend(lacking.map_err(index_failed)?.iter().map(from_index));
@@ -400,7 +408,7 @@ impl Packs {
     ///
     /// # Errors
     /// As [`Packs::put`], but for RESOURCE_EXHAUSTED.
-    pub(super) async fn put_in(
+    pub(in crate::proxy) async fn put_in(
         &self,
         blobs: Vec<(Digest, Bytes)>,
         room: Room,
@@ -433,17 +441,23 @@ impl Packs {
     /// The blobs `digests` from their packs, one answer each in the order asked, as
     /// [`Packs::read`] answers. The blobs within [`Packs::max_blob_bytes`] are read together,
     /// so that the index is asked once for the batch and blobs that lie close together in a
-    /// pack are one request; a larger blob is `Ok(None)` and is not asked for. When the index
-    /// or the store fails, each blob that was asked for is that failure.
+    /// pack are one request; a larger blob is `Ok(None)` and is not asked for. The empty blob is
+    /// served with no bytes without asking the index or the store ([`Packs::missing`] holds it
+    /// too). When the index or the store fails, each blob that was asked for is that failure.
     pub async fn read_many(&self, digests: &[Digest]) -> Vec<Result<Option<Bytes>, Status>> {
-        let inside: Vec<&Digest> = digests.iter().filter(|d| self.fits(d)).collect();
+        let inside: Vec<&Digest> = digests
+            .iter()
+            .filter(|d| self.fits(d) && !is_empty_blob(d))
+            .collect();
         let asked: Vec<BlobDigest> = inside.iter().copied().map(to_index).collect();
         let read = self.store.read(&asked).await;
         let mut served = self.served(&inside, read).into_iter();
         digests
             .iter()
             .map(|digest| {
-                if self.fits(digest) {
+                if is_empty_blob(digest) {
+                    Ok(Some(Bytes::new()))
+                } else if self.fits(digest) {
                     served.next().unwrap_or(Ok(None))
                 } else {
                     Ok(None)
@@ -529,10 +543,15 @@ impl Packs {
                 );
                 Ok(None)
             }
-            Fetch::Damaged => {
+            Fetch::Damaged { dropped } => {
+                // This read is refused. When the reader dropped the location, the index no
+                // longer has a row for the digest, so the next read of it finds no pack and
+                // falls back as for any blob the index lacks.
                 self.metrics.digest_mismatches.add(1);
+                self.metrics.locations_dropped.add(u64::from(dropped));
                 tracing::error!(
                     %digest,
+                    dropped,
                     "a pack holds other bytes than the digest names: not served"
                 );
                 let message = format!("blob {digest} is in a pack as other bytes than its digest");
@@ -550,7 +569,7 @@ impl Packs {
 }
 
 /// The index's form of a digest.
-fn to_index(digest: &Digest) -> BlobDigest {
+pub(super) fn to_index(digest: &Digest) -> BlobDigest {
     BlobDigest {
         hash: digest.hash,
         size: digest.size_bytes,
@@ -564,7 +583,7 @@ pub(super) fn from_index(digest: &BlobDigest) -> Digest {
 
 /// UNAVAILABLE for an index that could not say which blobs it has, and a warning that it
 /// could not.
-fn index_failed(error: PackIndexError) -> Status {
+pub(super) fn index_failed(error: PackIndexError) -> Status {
     tracing::warn!(%error, "the pack index could not say which blobs it has");
     Status::unavailable(format!("pack index: {error}"))
 }

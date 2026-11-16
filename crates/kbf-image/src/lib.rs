@@ -21,6 +21,7 @@
 //! Limits bound what a wrong pin or a hostile registry can make a node write
 //! ([`Limits`]). Only anonymous pulls are supported.
 
+mod download;
 mod error;
 mod http;
 pub mod manifest;
@@ -28,6 +29,7 @@ mod reference;
 mod registry;
 pub mod unpack;
 
+pub use download::Downloader;
 pub use error::{Error, UnpackError};
 pub use manifest::{Compression, Layer, Manifest};
 pub use reference::Location;

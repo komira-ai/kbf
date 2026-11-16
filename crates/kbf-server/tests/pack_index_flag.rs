@@ -145,6 +145,62 @@ async fn a_frontend_carries_the_pack_index_when_the_flag_is_given() {
     assert_eq!(first.offset, 0);
 }
 
+/// Asserts that `open_indexes` gives the frontend with no storage node one Postgres handle in two
+/// views: nothing without the flag, and with it the pack index and the action cache table, so
+/// that a put of an action and of the pack of its output is one transaction (a pack the index
+/// refuses leaves no row) and the pack is found through the pack view afterwards.
+#[test]
+fn the_indexes_are_one_handle_with_the_action_cache_beside_the_pack_index() {
+    let Some(db) = Database::new(test_database) else {
+        return;
+    };
+    let off = flags(&db.url(), false).server.open_indexes();
+    assert!(off.expect("opens").is_none());
+    let both = flags(&db.url(), true)
+        .server
+        .open_indexes()
+        .expect("opens")
+        .expect("the indexes are open");
+    let action = BlobDigest {
+        hash: [9; 32],
+        size: 3,
+    };
+    let result = b"an encoded result";
+
+    let put = both
+        .actions
+        .put_action(&action, result, &[pack("cas/f/fe1/2/1")])
+        .expect("put");
+    assert!(!put.replaced);
+    let found = both
+        .actions
+        .get_action(&action)
+        .expect("get")
+        .expect("a row");
+    assert_eq!(found.result, result);
+    let located = both
+        .packs
+        .locate(&[pack("x").blobs[0].digest])
+        .expect("located");
+    assert_eq!(
+        located[0].as_ref().expect("a row").pack_key,
+        "cas/f/fe1/2/1"
+    );
+
+    let refused = NewPack {
+        size: 0,
+        ..pack("cas/f/fe1/2/2")
+    };
+    let other = BlobDigest {
+        hash: [8; 32],
+        size: 3,
+    };
+    both.actions
+        .put_action(&other, result, &[refused])
+        .expect_err("a pack that cannot exist is refused");
+    assert!(both.actions.get_action(&other).expect("get").is_none());
+}
+
 /// Asserts that a start with the flag on a schema that has no pack tables is refused with the
 /// flag named and the installer command in the line, while a start without the flag on the
 /// same schema works.

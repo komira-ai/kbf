@@ -31,6 +31,7 @@
 
 mod driver;
 mod flags;
+mod lock_wait;
 mod reads;
 mod stats;
 mod tails;
@@ -39,6 +40,7 @@ pub(crate) mod tap;
 pub use driver::{History, Options, STEP_EVERY, over};
 pub(crate) use driver::{finish, spawn};
 pub use flags::{HistoryError, HistoryFlags, with_history};
+pub(crate) use lock_wait::{StoppedWaiting, watch_stops_from_here, with_history_waiting};
 pub use reads::HistoryReads;
 #[cfg(test)]
 pub(crate) use reads::Shared;

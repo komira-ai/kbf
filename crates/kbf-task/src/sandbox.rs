@@ -104,6 +104,9 @@ pub enum Sandbox {
     },
     /// The child did not report.
     Unreported,
+    /// A job's Command ([`Run::job`](crate::run::Run)): no namespace and no cover is made; the
+    /// job is the sandbox.
+    Job,
     /// There is no sandbox on this system (it is built for Linux only).
     Unavailable,
 }
@@ -114,16 +117,18 @@ impl std::fmt::Display for Sandbox {
             Sandbox::Made => write!(f, "mount and pid namespaces"),
             Sandbox::Incomplete { step, errno } => write!(f, "incomplete ({step} {errno})"),
             Sandbox::Unreported => write!(f, "unknown (no report from the child)"),
+            Sandbox::Job => write!(f, "none (the job is the sandbox)"),
             Sandbox::Unavailable => write!(f, "none (Linux only)"),
         }
     }
 }
 
 /// The line written to standard error once the Command has been started, naming how its
-/// sandbox came out; none where there is no sandbox ([`Sandbox::Unavailable`]).
+/// sandbox came out; none where there is no sandbox ([`Sandbox::Unavailable`]) and none in a job
+/// ([`Sandbox::Job`]), where nothing is made and nothing is unusual.
 #[must_use]
 pub fn notice(action: &Digest, sandbox: &Sandbox) -> Option<String> {
-    (*sandbox != Sandbox::Unavailable)
+    (!matches!(sandbox, Sandbox::Unavailable | Sandbox::Job))
         .then(|| format!("kbf-task: action {action}: sandbox: {sandbox}"))
 }
 

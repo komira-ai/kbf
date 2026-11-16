@@ -57,6 +57,8 @@ tracing.workspace = true
 
 [dev-dependencies]
 kbf-front = { workspace = true, features = ["testkit"] }
+# The real output collection, whose Trees `output_index` must derive digest for digest.
+kbf-outputs.workspace = true
 # The loopback S3 service (`s3::fake`) the large-blob tests flush to.
 kbf-objstore = { workspace = true, features = ["testkit"] }
 # The in-memory pack index the pack tests record packs in.

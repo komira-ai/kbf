@@ -1480,11 +1480,22 @@ otherwise; the body lists each failing check and why:
 |---|---|
 | `stopping` | the server has received SIGTERM or SIGINT, or `POST /v1/frontend/drain` has begun a drain, or `POST /v1/frontend/retire` has retired the frontend. It answers `503` from that moment, and for the rest of the drain; open Execute streams are kept until their action is done, and only the shutdown timeout (`--shutdown-timeout-secs`) or a second signal ends them (`--drain-deadline`, on a frontend over a state store, only reports); the one exception is a stream whose operation was never started, that no worker on this frontend can run and that no other frontend can take, which ends `UNAVAILABLE` when the drain begins |
 | `leader` | the server does not hold the scheduler role. A single server runs every role and always holds it; the check is there for a replicated control log, whose followers fail it. **Planned**: a second readiness path, without this check, for the servers that may serve reads ([deployment-topology.md](design/deployment-topology.md#build-clients-one-name-routed-by-method)) |
-| `store` | the object store does not answer a one-byte read of the key `<prefix>readyz-probe` within `--readyz-store-timeout-ms` (default 2000; it bounds the gRPC health service's probe too), or answers with an error. The probe only reads: no poll writes, deletes or lists. Nothing writes that key, so "not found" is the expected answer and passes, as does the object's bytes or a range past its end |
+| `store` | the object store does not answer a one-byte read of the key `<prefix>readyz-probe` within `--readyz-store-timeout-ms` (default 2000; it bounds the gRPC health service's probe too), or answers with an error. A frontend has no such check: its probes are `storage`, `state_store` and `map` (above). The probe only reads: no poll writes, deletes or lists. Nothing writes that key, so "not found" is the expected answer and passes, as does the object's bytes or a range past its end |
 | `deny_rows` | only where the worker listener checks callers against the state store's deny rows (worker mTLS or `--proxy-auth-file`, with `--state-store`): the listener's copy of the rows cannot be used, because no read has found them since the start or the newest is older than three sweeps (`DENY_SNAPSHOT_SWEEPS` beats), so the listener refuses every call `UNAVAILABLE` ("When the rows cannot be read", in the enrollment section above). It reads no store |
 
-`version` and `commit` are those of `GET /v1/nodes`' `server` field. Each `/readyz`
-makes one read of the store, so poll it at the interval the front needs, not faster.
+`version` and `commit` are those of `GET /v1/nodes`' `server` field.
+
+A frontend answers `/readyz` from the last answers of its probes (`storage`, `state_store`,
+`map`, `executor`, `deny_rows`), without waiting for any of them. Each probe is asked again in
+the background every `--readyz-probe-interval-ms` (default 1000), within its own timeout
+(`--readyz-store-timeout-ms`, default 2000): a probe that has not answered by then counts as
+failed, with the wait named in its reason, and a probe that hangs delays no other. Every probe
+is asked once before the frontend serves, so the first `/readyz` has an answer. A change in a
+dependency therefore shows in `/readyz` within the interval plus the time the probe takes
+(at most the timeout), and polling `/readyz` makes no read of any store, so poll it as often
+as the front needs. `stopping` (a drain or a stop signal), `leader` and a retire are flags,
+not probes: they are read at each request and change the answer at once. `kbf-server` itself
+(not a frontend) has no background asks: each `/readyz` makes one read of the store.
 
 **`GET /readyz/reapi`**: the readiness a load balancer asks for the REAPI cluster. It is
 `/readyz` with one more check, and has the same body, status codes and (no) token. A
@@ -1558,9 +1569,9 @@ whole), `build.bazel.remote.execution.v2.Capabilities`,
 
 | Method | Answer |
 |---|---|
-| `Check` | the status, after one store probe (as one `/readyz`). Another service name is `NOT_FOUND` |
-| `List` | every name above with the status, after one store probe |
-| `Watch` | the status at once, then each time it changes. It evaluates again as soon as a stop signal arrives or the scheduler role changes, and probes the store every 5 s. Once the server is stopping it sends `NOT_SERVING` (if that was not its last message) and ends the stream `UNAVAILABLE`, so an open Watch does not hold up the drain. Another service name is sent `SERVICE_UNKNOWN`, and the stream stays open until the server stops |
+| `Check` | the status, from the same answers as `/readyz` (a frontend: the last answers of its probes; `kbf-server`: after one store probe). Another service name is `NOT_FOUND` |
+| `List` | every name above with the status, as `Check` |
+| `Watch` | the status at once, then each time it changes. It evaluates again as soon as a stop signal arrives or the scheduler role changes, and evaluates the checks every 5 s (a frontend reads the last answers of its probes; `kbf-server` probes the store). Once the server is stopping it sends `NOT_SERVING` (if that was not its last message) and ends the stream `UNAVAILABLE`, so an open Watch does not hold up the drain. Another service name is sent `SERVICE_UNKNOWN`, and the stream stays open until the server stops |
 
 On SIGTERM or SIGINT the status turns `NOT_SERVING` before the REAPI streams are
 ended and the listener stops accepting. After that the listener takes no new calls,
@@ -1570,7 +1581,7 @@ proxy marks the server down.
 The REAPI authentication policy (`--reapi-auth-policy`, [reapi-auth.md](reapi-auth.md))
 does not run on these calls: a health check needs no credentials, whatever the policy.
 Every other call on the listener, a path it does not serve included, still runs it.
-The store probe waits at most `--readyz-store-timeout-ms`, like `/readyz`'s.
+A probe waits at most `--readyz-store-timeout-ms`, like `/readyz`'s, and a frontend asks it every `--readyz-probe-interval-ms` in the background.
 
 **Planned:** with several servers, the answers follow the two readiness paths, ready
 to serve reads and leader; which service name reports which is not chosen
@@ -1729,6 +1740,7 @@ blobs clients upload are kept in packs, and these counters follow; without the f
 | `kbf_pack_read_lost_total` | counter | reads of a blob the index has and whose pack the store lacks, answered by the storage nodes (alert on any) |
 | `kbf_pack_read_errors_total` | counter | reads that failed because the pack index or the pack store could not answer |
 | `kbf_pack_digest_mismatches_total` | counter | reads of a blob whose pack held other bytes than its digest: never served, UNAVAILABLE (alert on any) |
+| `kbf_pack_locations_dropped_total` | counter | pack locations dropped from the index after a read found other bytes than the digest (each also counted in `kbf_pack_digest_mismatches_total`): the read that saw it is UNAVAILABLE, and the next read of that digest finds no pack location and falls back as for any blob the index lacks |
 | `kbf_pack_inflight_bytes`, `kbf_pack_inflight_peak_bytes` | gauge | bytes the uploads into packs have taken of `--pack-inflight-bytes` now, and the most at once since the start (never above the flag) |
 | `kbf_pack_upload_waits_total` | counter | uploads that found `--pack-inflight-bytes` spent and waited their turn: a burst slowed down, none failed. Rising steadily means the bound is below what clients send |
 | `kbf_pack_upload_refusals_total` | counter | uploads refused RESOURCE_EXHAUSTED because their blobs alone are over `--pack-inflight-bytes` |
@@ -1737,7 +1749,9 @@ blobs clients upload are kept in packs, and these counters follow; without the f
 | `kbf_pack_commit_rejects_total` | counter | commits of a pack refused with nothing recorded, from a daemon or, for a build's pack, any refusal counted in `kbf_pack_untrusted_commit_rejects_total`. For a daemon: the writer was not the caller, the name or the list of blobs was not one a daemon may commit, the pack was not in the store, a sampled blob was not its digest (`--pack-commit-sample`; alert on any), or the pack was recorded before with other contents. A store or an index that failed is UNAVAILABLE to the daemon and is not counted |
 | `kbf_pack_untrusted_commits_total` | counter | packs a build wrote through a presigned write that the frontend read, hashed to the last byte and recorded in the pack index (a replay of a commit already recorded is not counted again) |
 | `kbf_pack_untrusted_commit_rejects_total` | counter | commits of such a pack refused with nothing recorded, labelled `reason`: `forbidden` (the key was not the one issued), `shape` (the manifest cannot be a pack's: a cap, an order, a gap, an overlap or a record of no bytes), `footer` (the footer is not the manifest), `mismatch` (a record is not its digest or CRC), `missing` (the pack is not in the store as long as said) or `conflict` (the key was recorded with other contents). A store or an index that failed is not counted. Each refusal also moves `kbf_pack_commit_rejects_total` |
-| `kbf_pack_ingests_total` | counter | packs a task wrote through a presigned write that `ingest` turned into an action result: the action ran (any exit code), whether or not the result was written to the action cache |
+| `kbf_pack_ingests_total` | counter | runs of a task that `ingest` (presigned writes) or `ingest_put_dir` (a put directory) turned into an action result: the action ran (any exit code), whether or not the result was written to the action cache |
+| `kbf_pack_ingest_put_dirs_total` | counter | of `kbf_pack_ingests_total`, the runs a task committed into a put directory, ingested from pack 0's footer and manifest and the other packs' footers |
+| `kbf_pack_put_dir_records_total` | counter | packs of a put directory recorded in the pack index from their footer, no record read; the first location recorded for a digest is kept |
 | `kbf_pack_ingest_rejects_total` | counter | packs `ingest` refused, labelled `reason`: `missing` (no object under the key of pack 0), `wrong_key` (a key was not minted for this lease and action or is not in the place its slot names, the manifest is for another lease or action, or a key was recorded with another pack), `too_large` (the pack, its record count, a record or the manifest record is over its cap), `malformed` (a damaged footer or trailer, records out of order, overlapping, with a gap, one of no bytes, or a digest in two places), `hash_mismatch` (a record is not its digest, or a large object is not the blob its digest names: another length, or bytes that do not hash to it), `bad_manifest` (the record at offset 0 is not a valid manifest, it names more packs or other large slots than the keys issued, or an output tree is not a `Tree`) or `incomplete` (a pack beyond the first or a large object is not in the store, or a digest the manifest or a tree names is in no pack and no large object) |
 | `kbf_pack_ingest_unavailable_total` | counter | ingests the object store, the pack index or the action cache could not answer; the pack is not judged and the lease is run again |
 | `kbf_pack_ingest_packs_total` | counter | packs of the runs `ingest` turned into an action result (a run of one pack counts 1): divided by `kbf_pack_ingests_total`, the packs per run |

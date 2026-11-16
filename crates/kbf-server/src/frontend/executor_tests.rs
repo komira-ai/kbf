@@ -19,7 +19,7 @@ use tokio::net::TcpStream;
 use tokio::sync::oneshot;
 
 use super::base_tree::tests::bundle_dir;
-use super::pack_tests::{flags_of, index, pack_flags, scrape};
+use super::pack_tests::{flags_over, index, pack_flags, scrape};
 use super::{FrontendFlags, FrontendHandle, Prepared, boxed};
 use crate::executor::{PrepareError, PreparedRun, RunPrepare, RunSource};
 use crate::serve::ServeError;
@@ -28,7 +28,7 @@ use crate::test_dir::scratch_dir;
 const SECRET: &[u8] = b"0123456789abcdef0123456789abcdef";
 
 /// A preparation that is never asked: no action is placed in these tests.
-struct Idle;
+pub(super) struct Idle;
 
 #[tonic::async_trait]
 impl RunPrepare for Idle {
@@ -43,7 +43,7 @@ impl RunPrepare for Idle {
     }
 }
 
-fn source() -> RunSource {
+pub(super) fn source() -> RunSource {
     RunSource {
         mint: PackKeyMint::new(SECRET).expect("a mint"),
         prepare: Arc::new(Idle),
@@ -52,7 +52,7 @@ fn source() -> RunSource {
 
 /// A job service with the hosts `hosts`, each a machine that fits every job the executor
 /// submits.
-async fn job_server(hosts: &[&str]) -> FakeJobServer {
+pub(super) async fn job_server(hosts: &[&str]) -> FakeJobServer {
     let fake = FakeJobServer::start().await.expect("a job service");
     for host in hosts {
         fake.add_host(host, machine());
@@ -61,7 +61,7 @@ async fn job_server(hosts: &[&str]) -> FakeJobServer {
 }
 
 /// A Linux host of 16 cores, 64 GiB and 1 TiB of disk, running containers.
-fn machine() -> Machine {
+pub(super) fn machine() -> Machine {
     Machine {
         shape: Shape {
             cpu_millis: 16_000,
@@ -90,10 +90,6 @@ fn beside_flags(dir: &Path) -> Vec<String> {
         "task.secret",
         b"0123456789abcdef0123456789abcdef-the-farm\n",
     );
-    let presign = private(
-        "presign.json",
-        br#"{"access_key_id": "k", "secret_access_key": "s"}"#,
-    );
     let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("params");
     params.subject_alt_names = vec![rcgen::SanType::IpAddress(
         std::net::Ipv4Addr::LOCALHOST.into(),
@@ -104,21 +100,45 @@ fn beside_flags(dir: &Path) -> Vec<String> {
     let key = private("job.key", key.serialize_pem().as_bytes());
     vec![
         format!("--task-secret-file={secret}"),
-        "--task-put-endpoint=http://127.0.0.1:9".to_owned(),
-        "--task-put-bucket=kbf-fake".to_owned(),
-        format!("--task-put-credentials-file={presign}"),
-        "--task-read-url=https://127.0.0.1:9400".to_owned(),
+        "--task-out-root=/mnt/ts/put".to_owned(),
         "--job-listen=127.0.0.1:0".to_owned(),
         format!("--job-tls-cert={cert}"),
         format!("--job-tls-key={key}"),
         format!("--job-grant-secret-file={secret}"),
-        "--executor-allow-plain-http-put".to_owned(),
     ]
 }
 
 /// The flags of a frontend with packs on the S3 service at `endpoint`, and the executor flags
 /// `executor`, which name the job service `fake`.
 fn flags(dir: &Path, s3: &FakeS3, fake: &FakeJobServer, executor: &[&str]) -> FrontendFlags {
+    flags_with(
+        Some("--storage=http://127.0.0.1:1"),
+        dir,
+        s3,
+        fake,
+        executor,
+    )
+}
+
+/// [`flags`] with the `--storage` flag `storage` (none: a frontend with no storage node).
+pub(super) fn flags_with(
+    storage: Option<&str>,
+    dir: &Path,
+    s3: &FakeS3,
+    fake: &FakeJobServer,
+    executor: &[&str],
+) -> FrontendFlags {
+    flags_over(storage, &flag_list(dir, s3, fake, executor))
+}
+
+/// The flags after the listeners and the state store of a frontend with packs on `s3` and the
+/// executor flags `executor`, which name the job service `fake`.
+pub(super) fn flag_list(
+    dir: &Path,
+    s3: &FakeS3,
+    fake: &FakeJobServer,
+    executor: &[&str],
+) -> Vec<String> {
     let token = dir.join("job-token");
     std::fs::write(&token, TOKEN).expect("written");
     std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).expect("mode");
@@ -129,17 +149,21 @@ fn flags(dir: &Path, s3: &FakeS3, fake: &FakeJobServer, executor: &[&str]) -> Fr
     more.extend(beside_flags(dir));
     more.extend([
         format!("--executor-base-tree={}", base_tree.display()),
+        // No fetch: a test never dials a release page.
+        "--executor-base-tree-url=".to_owned(),
         format!("--executor-job-url={}", fake.origin()),
         format!("--executor-job-token-file={}", token.display()),
         "--executor-frontend-id=front-1".to_owned(),
         "--executor-hosts=1".to_owned(),
+        // A change in the job service shows in `/readyz` within a tick of the test's.
+        "--readyz-probe-interval-ms=20".to_owned(),
         "--executor-host-cpus=2".to_owned(),
         "--executor-host-memory-gib=16".to_owned(),
         "--executor-base-image=registry.test/base@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
         "--executor-kbf-image=registry.test/kbf@sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210".to_owned(),
     ]);
     more.extend(executor.iter().map(ToString::to_string));
-    flags_of(&more)
+    more
 }
 
 /// Starts the frontend `flags` describe, which stops when `stop` is sent to.
@@ -167,7 +191,7 @@ fn started_over(
 }
 
 /// A state store in this process, and the handle the frontend is started over.
-fn state_store() -> (Arc<Fake>, crate::StateStore) {
+pub(super) fn state_store() -> (Arc<Fake>, crate::StateStore) {
     let fake = Arc::new(Fake::with_flaw(
         Arc::new(ManualClock::default()),
         Flaw::None,
@@ -191,7 +215,7 @@ fn large_keys(s3: &FakeS3) -> Vec<String> {
 
 /// The whole answer of `GET path` on the operator listener at `api`, or `None` when the
 /// listener refused, reset or closed the connection before it answered.
-async fn try_get(api: std::net::SocketAddr, path: &str) -> Option<String> {
+pub(super) async fn try_get(api: std::net::SocketAddr, path: &str) -> Option<String> {
     let mut stream = TcpStream::connect(api).await.ok()?;
     let request = format!("GET {path} HTTP/1.1\r\nHost: kbf\r\nConnection: close\r\n\r\n");
     stream.write_all(request.as_bytes()).await.ok()?;
@@ -203,7 +227,7 @@ async fn try_get(api: std::net::SocketAddr, path: &str) -> Option<String> {
 /// Waits until the farm lists the worker `worker`, as a registered node. A connection the
 /// listener drops (a frontend that is stopping closes it) is not an answer, and is asked
 /// again: whether the frontend stops is for its `serve` to say, not for this poll.
-async fn registered(api: std::net::SocketAddr, worker: &str) -> String {
+pub(super) async fn registered(api: std::net::SocketAddr, worker: &str) -> String {
     loop {
         if let Some(nodes) = try_get(api, "/v1/nodes").await
             && nodes.contains(worker)
@@ -215,7 +239,7 @@ async fn registered(api: std::net::SocketAddr, worker: &str) -> String {
 }
 
 /// The calls the job service has handled, by method.
-fn methods(fake: &FakeJobServer) -> Vec<&'static str> {
+pub(super) fn methods(fake: &FakeJobServer) -> Vec<&'static str> {
     fake.calls()
         .iter()
         .map(|call| match call {
@@ -366,6 +390,33 @@ async fn a_frontend_stops_when_another_frontend_has_jobs() {
     );
 }
 
+/// Asserts that a frontend given only `--task-secret-file` and `--task-out-root` starts its
+/// executor over a preparation of put directories, which is the frontend's own (no test source);
+/// and that the secret file is still read at the start: a short one stops it, naming the flag. No
+/// read listener is given.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_put_dir_frontend_starts_over_its_own_put_dir_preparation() {
+    let s3 = FakeS3::start().await;
+    let dir = scratch_dir("executor-put-dir-only");
+    let fake = job_server(&["host-1"]).await;
+    let mut list = flag_list(
+        dir.path(),
+        &s3,
+        &fake,
+        &["--executor=js-agent", "--executor-insecure-argv-secrets"],
+    );
+    list.retain(|flag| !flag.starts_with("--job-"));
+    let flags = flags_over(Some("--storage=http://127.0.0.1:1"), &list);
+    assert!(flags.put_dir.is_some() && flags.job_read.is_none());
+    let (handle, _stop) = started(&flags, None).expect("starts over its own preparation");
+    assert!(handle.put_dir_prep().is_some());
+    drop(handle);
+
+    std::fs::write(dir.path().join("task.secret"), b"too short\n").expect("written");
+    let why = started(&flags, None).err().expect("refused").to_string();
+    assert!(why.contains("--task-secret-file"), "{why}");
+}
+
 /// Catches a frontend that starts an executor it cannot run: `js-agent` without the
 /// preparation of runs, with its pack flags removed after they were parsed, or with a job
 /// service token file that others can read or that is missing, is refused at the start, before
@@ -379,7 +430,7 @@ async fn a_frontend_that_cannot_build_its_executor_does_not_start() {
 
     let good = flags(dir.path(), &s3, &fake, &js);
     let mut no_task = good.clone();
-    no_task.task = None;
+    no_task.put_dir = None;
     let why = started(&no_task, None).err().expect("refused").to_string();
     assert!(why.contains("preparation of task runs"), "{why}");
     assert!(why.contains("--task-secret-file"), "{why}");

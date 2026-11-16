@@ -36,10 +36,12 @@ mod driver;
 mod front;
 mod host;
 mod metrics;
+mod out;
 mod outcome;
 mod output;
 mod phases;
 mod pool;
+mod probe;
 mod runs;
 mod submit;
 mod task;
@@ -65,8 +67,12 @@ use submit::{FRONTEND_LABEL, INSTANCE_LABEL};
 
 pub use config::{Config, ConfigError, Network};
 pub use driver::Running;
-pub use front::{Front, FrontParts, PrepareError, PreparedRun, RunPrepare, RunSource};
+pub use front::{
+    Front, FrontParts, PrepareError, PreparedPutDir, PreparedRun, PutDirParts, RunPrepare,
+    RunSource,
+};
 pub use metrics::Metrics;
+pub use out::{MAX_ROOT_BYTES, OUT_TARGET, PutDirRoots, RootError, TASK_IN_TREE, TaskOut};
 pub use submit::job_id;
 pub use task::{Delivery, PackKey, Secret, TaskArgs, build_id};
 pub use traits::{
@@ -193,6 +199,13 @@ impl Executor {
     #[must_use]
     pub fn workers(&self) -> Vec<WorkerInfo> {
         self.workers.iter().map(HostWorker::info).collect()
+    }
+
+    /// The job service as a readiness check asks about it: one read of a job no one made, which
+    /// the service answers whether it has it or not, bounded by `limit`.
+    #[must_use]
+    pub fn probe(&self, limit: Duration) -> probe::ServiceProbe {
+        probe::ServiceProbe::new(self.deps.client.clone(), limit)
     }
 
     /// How often the caller steps the executor.

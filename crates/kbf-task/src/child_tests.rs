@@ -505,7 +505,11 @@ fn the_relays_start_report_is_read_after_the_childs() {
     );
     assert_eq!(
         read(Some([crate::relay::NOT_STARTED, 2])),
-        (made.0.clone(), made.1.clone(), Start::NotStarted(2))
+        (
+            made.0.clone(),
+            made.1.clone(),
+            Start::NotStarted(Stage::Command, 2)
+        )
     );
     assert_eq!(read(None), (made.0, made.1, Start::Started));
     // A child that never reported: no start report is waited for either.
@@ -529,7 +533,15 @@ fn a_start_report_is_a_start_unless_it_says_otherwise() {
     assert_eq!(started([crate::relay::STARTED, 0]), Start::Started);
     assert_eq!(
         started([crate::relay::NOT_STARTED, 13]),
-        Start::NotStarted(13)
+        Start::NotStarted(Stage::Command, 13)
+    );
+    assert_eq!(
+        started([crate::relay::INIT_NOT_STARTED, 2]),
+        Start::NotStarted(Stage::Init, 2)
+    );
+    assert_eq!(
+        started([crate::relay::INIT_SETUP_FAILED, 1]),
+        Start::NotStarted(Stage::InitSetup, 1)
     );
     assert_eq!(started([7, 7]), Start::Started);
 }

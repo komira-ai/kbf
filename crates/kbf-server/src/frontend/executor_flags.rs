@@ -30,17 +30,19 @@
 use std::error::Error;
 use std::path::PathBuf;
 use std::str::FromStr as _;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use clap::{Arg, ArgAction, ArgMatches};
+use kbf_front::action_tree::{BaseTree, DEFAULT_TOTAL, PutRetry};
 use kbf_front::{Backend, Packs};
 use kbf_job_client::{Client, Origin, Token};
 use kbf_types::ImageRef;
 
 use crate::Farm;
 use crate::executor::{
-    Config, Delivery, Deps, Executor, ExecutorKind, Front, FrontParts, Metrics, Network, RunSource,
+    Config, Delivery, Deps, Executor, ExecutorKind, Front, FrontParts, Metrics, Network,
+    PutDirParts, RunSource, TaskOut,
 };
 
 const KIND: &str = "executor";
@@ -62,21 +64,42 @@ const DELIVERY: &str = "executor_secret_delivery";
 const BASE_IMAGE: &str = "executor_base_image";
 const KBF_IMAGE: &str = "executor_kbf_image";
 const BASE_TREE: &str = "executor_base_tree";
+const BASE_TREE_URL: &str = "executor_base_tree_url";
+const BASE_TREE_KEEP: &str = "executor_base_tree_keep";
+const BASE_TREE_TIMEOUT: &str = "executor_base_tree_timeout_secs";
+/// The default of `--executor-base-tree-url`: the releases of kbf's own repository.
+pub(super) const DEFAULT_BASE_TREE_URL: &str =
+    "https://api.github.com/repos/komira-ai/kbf/releases";
 const MARGIN: &str = "executor_run_margin_secs";
+const FAILED_STDERR_LOG: &str = "executor_failed_stderr_log_bytes";
 const MAX_RUN: &str = "executor_max_run_secs";
 const DEFAULT_TIMEOUT: &str = "executor_default_timeout_secs";
 const CALL_TIMEOUT: &str = "executor_call_timeout_secs";
+const POLL: &str = "executor_poll_ms";
+const PREPARE_LIMIT: &str = "executor_prepare_limit_secs";
+const PREPARE_CONCURRENCY: &str = "executor_prepare_concurrency";
 const NETWORK: &str = "executor_network";
 const OPEN_NETWORK: &str = "executor_allow_open_network";
 
+/// The virtual workers when `--executor-hosts` is left out. Clap takes the default as the
+/// literal in the flag; the default-flags test checks it against this number.
+#[cfg(test)]
+const DEFAULT_HOSTS: usize = 4;
+
+/// The cores of a virtual worker when `--executor-host-cpus` is left out (test-only, as above).
+#[cfg(test)]
+const DEFAULT_HOST_CPUS: u64 = 32;
+
+/// The GiB of a virtual worker when `--executor-host-memory-gib` is left out (test-only, as
+/// above).
+#[cfg(test)]
+const DEFAULT_HOST_MEMORY_GIB: u64 = 128;
+
 /// The flags a `js-agent` executor cannot do without, in the order their absence is named.
-const REQUIRED: [(&str, &str); 9] = [
+const REQUIRED: [(&str, &str); 6] = [
     (JOB_URL, "--executor-job-url"),
     (TOKEN_FILE, "--executor-job-token-file"),
     (FRONTEND, "--executor-frontend-id"),
-    (HOSTS, "--executor-hosts"),
-    (CPUS, "--executor-host-cpus"),
-    (MEMORY_GIB, "--executor-host-memory-gib"),
     (BASE_IMAGE, "--executor-base-image"),
     (KBF_IMAGE, "--executor-kbf-image"),
     (BASE_TREE, "--executor-base-tree"),
@@ -130,12 +153,13 @@ pub(super) fn args() -> Vec<Arg> {
                  image (`--executor-kbf-image`, built from `--executor-base-image`), whose \
                  task tool runs the action inside it; it needs the job service's flags \
                  (`--executor-job-url`, `--executor-job-token-file`, and \
-                 `--executor-job-ca-file` for https), the virtual workers' \
-                 (`--executor-hosts`, `--executor-host-cpus`, `--executor-host-memory-gib`), \
+                 `--executor-job-ca-file` for https), \
                  `--executor-frontend-id`, the release's base tree bundles \
                  (`--executor-base-tree`), the packs (`--pack-store-endpoint`) and the secret \
                  delivery (`--executor-secret-delivery`, with \
-                 `--executor-insecure-argv-secrets` for its default `argv`). The executor runs \
+                 `--executor-insecure-argv-secrets` for its default `argv`); the virtual \
+                 workers' shape (`--executor-hosts`, `--executor-host-cpus`, \
+                 `--executor-host-memory-gib`) has defaults. The executor runs \
                  on exactly one frontend: a second frontend that has jobs on the same job \
                  service stops. A restart of the frontend fails the builds in flight. \
                  Switching back to `kbf-daemon` cancels the jobs when the frontend is stopped, \
@@ -179,27 +203,36 @@ pub(super) fn args() -> Vec<Arg> {
             .long("executor-hosts")
             .value_name("WORKERS")
             .value_parser(clap::value_parser!(usize))
+            // DEFAULT_HOSTS, as above.
+            .default_value("4")
             .help(
                 "How many virtual workers the farm places actions on, each of the shape below: \
-                 how many actions of which size the farm may have in flight as jobs. The job \
-                 service decides which host runs each job. Used only with `--executor js-agent`",
+                 how many actions of which size the farm may have in flight as jobs. A ceiling \
+                 on what this frontend admits, not the hardware: the job service decides which \
+                 host runs each job and holds the real capacity, so set it lower only to cap \
+                 this frontend. Used only with `--executor js-agent`",
             ),
         Arg::new(CPUS)
             .long("executor-host-cpus")
             .value_name("CORES")
             .value_parser(clap::value_parser!(u64).range(1..))
+            // DEFAULT_HOST_CPUS, as above.
+            .default_value("32")
             .help(
                 "The CPU cores of a virtual worker: the most the farm books on it at once. At \
-                 least 1. Used only with `--executor js-agent`",
+                 least 1. A ceiling, as for `--executor-hosts`. Used only with `--executor \
+                 js-agent`",
             ),
         Arg::new(MEMORY_GIB)
             .long("executor-host-memory-gib")
             .value_name("GIB")
             .value_parser(clap::value_parser!(u64).range(1..))
+            // DEFAULT_HOST_MEMORY_GIB, as above.
+            .default_value("128")
             .help(
                 "The memory, in GiB, of a virtual worker. Each job needs 1.5 times its booking \
                  plus 512 MiB, and the bookings of a worker add up to what is left after that. \
-                 Used only with `--executor js-agent`",
+                 A ceiling, as for `--executor-hosts`. Used only with `--executor js-agent`",
             ),
         Arg::new(SLOTS)
             .long("executor-host-slots")
@@ -299,17 +332,53 @@ pub(super) fn args() -> Vec<Arg> {
             .value_name("DIR")
             .value_parser(clap::value_parser!(PathBuf))
             .help(
-                "The directory holding the release's `SHA256SUMS` and its \
-                 `kbf-base-tree-<commit>-linux-<arch>.tree.tar` bundles, one per platform, \
-                 copied from the release's assets. At its start the frontend checks \
-                 the bundle of `--executor-arch` against `SHA256SUMS` and writes the objects of \
-                 the kbf base tree that the pack store lacks to `cas/l/`, create-only, so the \
-                 pack store credentials must be allowed to write there; it then records the \
-                 tree as `job-tree/<digest>` in `--state-store` if there is one. A bundle that \
-                 is missing, not listed or not the listed bytes, or a write that fails, fails \
-                 the start, naming this flag. Needed with `--executor js-agent`; with \
-                 `--executor kbf-daemon` nothing is read or written",
+                "The frontend's cache of the release's kbf base tree: a directory the frontend \
+                 may write (the user the frontend runs as). The release's `SHA256SUMS` and its \
+                 `kbf-base-tree-<commit>-linux-<arch>.tree.tar` bundle of `--executor-arch` are \
+                 kept in `<DIR>/<commit>/`; when `<DIR>` holds neither that nor the same two \
+                 files loose (copied by hand, as an earlier release asked), the frontend \
+                 fetches them from the release (`--executor-base-tree-url`), checks the bundle \
+                 against the release's `SHA256SUMS` and only then puts them in the cache, \
+                 keeping the newest older releases for a rollback \
+                 (`--executor-base-tree-keep`). It then writes the objects of the kbf base tree \
+                 that the pack store lacks to `cas/l/`, create-only, so the pack store \
+                 credentials must be allowed to write there, and records the tree as \
+                 `job-tree/<digest>` in `--state-store` if there is one. A bundle that cannot be \
+                 had, is not listed or not the listed bytes, or a write that fails, fails the \
+                 start, naming this flag. Needed with `--executor js-agent`; with \
+                 `--executor kbf-daemon` nothing is read, fetched or written",
             ),
+        text(
+            BASE_TREE_URL,
+            "executor-base-tree-url",
+            "URL",
+            "Where the release's base tree files are looked up when `--executor-base-tree` \
+             lacks them: a list of releases in the shape of GitHub's `GET \
+             /repos/<owner>/<repo>/releases` (an array, each release with `assets` of `name` \
+             and `browser_download_url`), read a page at a time (`?per_page=100&page=N`) until a \
+             release lists the bundle and the `SHA256SUMS`. https, or http on loopback. Empty \
+             fetches nothing: the files must then be in `--executor-base-tree` already. Used \
+             only with `--executor js-agent`",
+        )
+        .default_value(DEFAULT_BASE_TREE_URL),
+        Arg::new(BASE_TREE_KEEP)
+            .long("executor-base-tree-keep")
+            .value_name("RELEASES")
+            .value_parser(clap::value_parser!(usize))
+            .default_value("1")
+            .help(
+                "How many releases besides the running one stay in the `--executor-base-tree` \
+                 cache after a fetch, for a rollback of the frontend: the newest fetched. 0 \
+                 keeps none. Used only with `--executor js-agent`",
+            ),
+        number(
+            BASE_TREE_TIMEOUT,
+            "executor-base-tree-timeout-secs",
+            "How long the fetch of the base tree files waits, in seconds, for a connection, for \
+             the head of an answer and between two chunks of a body (a stall, not the whole \
+             download). Used only with `--executor js-agent`",
+            "60",
+        ),
         number(
             MARGIN,
             "executor-run-margin-secs",
@@ -319,6 +388,17 @@ pub(super) fn args() -> Vec<Arg> {
              timeout. Used only with `--executor js-agent`",
             "300",
         ),
+        Arg::new(FAILED_STDERR_LOG)
+            .long("executor-failed-stderr-log-bytes")
+            .value_name("BYTES")
+            .value_parser(clap::value_parser!(u64).range(0..=8192))
+            .default_value("512")
+            .help(
+                "The most bytes of a failed job's standard error the frontend writes to its \
+                 log, at WARN, with the job's secrets redacted: the end of the stream. 0 writes \
+                 none. The whole output (up to 8 KiB with standard output) goes with the result \
+                 either way. Used only with `--executor js-agent`",
+            ),
         number(
             MAX_RUN,
             "executor-max-run-secs",
@@ -340,6 +420,38 @@ pub(super) fn args() -> Vec<Arg> {
              seconds. Under the fence time. Used only with `--executor js-agent`",
             "5",
         ),
+        Arg::new(POLL)
+            .long("executor-poll-ms")
+            .value_name("MILLISECONDS")
+            .value_parser(clap::value_parser!(u64).range(100..=10_000))
+            .default_value("1000")
+            .help(
+                "How often the executor polls the job service for its jobs, in milliseconds: \
+                 100 to 10000. Together with the fence time it must stay under the scheduler's \
+                 re-dispatch grace, which is checked at start. Used only with `--executor \
+                 js-agent`",
+            ),
+        number(
+            PREPARE_LIMIT,
+            "executor-prepare-limit-secs",
+            "How long the inputs of one run (its action, its input tree published into the \
+             store, its keys) may take to prepare, in seconds. The `Start`'s own window ends \
+             only the submit, not the preparation, which goes on until this limit so the tree \
+             it publishes is there for the run the farm starts next. Used only with \
+             `--executor js-agent`",
+            "300",
+        ),
+        Arg::new(PREPARE_CONCURRENCY)
+            .long("executor-prepare-concurrency")
+            .value_name("COUNT")
+            .value_parser(clap::value_parser!(u64).range(1..))
+            .default_value("4")
+            .help(
+                "How many runs of one virtual worker prepare their inputs at once. The farm \
+                 gives a worker a full set of `Start`s at one instant, and preparing them all \
+                 together slows each until none is ready inside its window; the ones past this \
+                 wait their turn. Used only with `--executor js-agent`",
+            ),
         Arg::new(NETWORK)
             .long("executor-network")
             .value_name("LEVEL")
@@ -365,12 +477,6 @@ pub(super) fn args() -> Vec<Arg> {
     ]
 }
 
-/// Whether the flags say a read grant may be served over plain http: `--executor js-agent` with
-/// `--executor-allow-plain-http-grant`. With daemons nothing reads the flag, so it opens nothing.
-pub(super) fn plain_http_grant(m: &ArgMatches) -> bool {
-    m.get_one::<String>(KIND).is_some_and(|k| k == "js-agent") && m.get_flag(PLAIN_GRANT)
-}
-
 /// What `--executor js-agent` and its companions say.
 #[derive(Clone, Debug)]
 pub struct JsAgentFlags {
@@ -389,6 +495,19 @@ pub struct JsAgentFlags {
     /// `--executor-base-tree`: the directory of the release's `SHA256SUMS` and base tree
     /// bundles.
     pub base_tree: PathBuf,
+    /// `--executor-base-tree-url`: the releases list the bundle is fetched from; empty fetches
+    /// nothing.
+    pub base_tree_url: String,
+    /// `--executor-base-tree-keep`: the older releases the cache keeps.
+    pub base_tree_keep: usize,
+    /// `--executor-base-tree-timeout-secs`.
+    pub base_tree_timeout: Duration,
+    /// Where the base tree published from [`JsAgentFlags::base_tree`] is set when the frontend
+    /// starts: what the executor writes its action trees over (`--task-out-mode put-dir`).
+    pub published: Arc<OnceLock<BaseTree>>,
+    /// `--task-put-retry-secs`: how long the waits for a 503 of the store add up to when the
+    /// executor writes an action tree. Set by the task flags; the default until then.
+    pub put_retry: Duration,
 }
 
 /// What `--executor` says: the daemons, or jobs of a job service.
@@ -533,9 +652,14 @@ fn js_agent_flags(m: &ArgMatches) -> Result<JsAgentFlags, String> {
     config.insecure_argv_secrets = m.get_flag(INSECURE);
     config.delivery = delivery(m);
     config.run_margin = secs(MARGIN);
+    config.failed_stderr_log_bytes = usize::try_from(count(FAILED_STDERR_LOG))
+        .map_err(|e| format!("--executor-failed-stderr-log-bytes: {e}"))?;
     config.max_run = secs(MAX_RUN);
     config.default_timeout = secs(DEFAULT_TIMEOUT);
     config.call_timeout = secs(CALL_TIMEOUT);
+    config.poll = Duration::from_millis(count(POLL));
+    config.prepare_limit = secs(PREPARE_LIMIT);
+    config.prepare_concurrency = usize::try_from(count(PREPARE_CONCURRENCY)).unwrap_or(usize::MAX);
     config.network = network(m);
     config.allow_open_network = m.get_flag(OPEN_NETWORK);
     Ok(JsAgentFlags {
@@ -549,6 +673,14 @@ fn js_agent_flags(m: &ArgMatches) -> Result<JsAgentFlags, String> {
         base_image,
         kbf_image,
         base_tree: m.get_one::<PathBuf>(BASE_TREE).cloned().unwrap_or_default(),
+        base_tree_url: one(BASE_TREE_URL),
+        base_tree_keep: m
+            .get_one::<usize>(BASE_TREE_KEEP)
+            .copied()
+            .unwrap_or_default(),
+        base_tree_timeout: secs(BASE_TREE_TIMEOUT),
+        published: Arc::default(),
+        put_retry: DEFAULT_TOTAL,
     })
 }
 
@@ -582,9 +714,17 @@ fn image(m: &ArgMatches, id: &str, long: &str) -> Result<ImageRef, String> {
 
 impl JsAgentFlags {
     /// The executor's seams over the frontend's own `packs`, CAS `backend` (built over the same
-    /// packs) and `source` of keys, writes and grants.
+    /// packs) and `source` of keys, writes and grants; with `--task-out-mode put-dir`, writing
+    /// each run's action tree over the base tree [`JsAgentFlags::published`] holds.
     #[must_use]
     pub fn front(&self, packs: Packs, backend: Backend, source: RunSource) -> Front {
+        let put_dir = match self.config.task_out {
+            TaskOut::PutDir(_) => Some(
+                PutDirParts::new(&packs, &backend, Arc::clone(&self.published))
+                    .with_put_retry(PutRetry::new(self.put_retry)),
+            ),
+            TaskOut::Presigned => None,
+        };
         Front::new(FrontParts {
             packs,
             backend,
@@ -592,6 +732,7 @@ impl JsAgentFlags {
             prepare: source.prepare,
             base_image: self.base_image.clone(),
             kbf_image: self.kbf_image.clone(),
+            put_dir,
         })
     }
 
@@ -644,3 +785,7 @@ impl JsAgentFlags {
 #[cfg(test)]
 #[path = "executor_flags_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "executor_flags_front_tests.rs"]
+mod front_tests;

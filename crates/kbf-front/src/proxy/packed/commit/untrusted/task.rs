@@ -68,6 +68,13 @@
 //! - Whether the paths are the Command's declared outputs (the executor knows the Command).
 //! - A replaced object (the store's create-only write is the guard).
 //!
+//! **A put directory.** [`super::ingest_put_dir`] runs the same steps over the objects of a put
+//! directory with a lighter proof ([`Proof::Manifest`]), and what is said above of the proof
+//! holds for [`ingest_set`] only: it checks the outputs against the Command (what is not decided
+//! here is decided there), it skips step 7, and at step 9 it records each pack's footer without
+//! reading a record. The digests of its result are then the manifest's and the footers' claims,
+//! hashed by the first read of each, not before the result is written (see `put_dir`).
+//!
 //! The `backend` must be built over the same [`Packs`] as `packs`
 //! (`Backend::remote_over(node, Some(packs))`): the Action it reads to decide on caching may be a
 //! blob a frontend keeps in a pack, which a backend over other packs, or none, does not find (the
@@ -92,6 +99,7 @@ use prost::Message as _;
 
 use super::large::Large;
 use super::metadata::claimed;
+use super::one_pass;
 use super::{CommitError, IssuedKeySet, IssuedPackKey, PackKeyMint, Packs, UntrustedLimits};
 use crate::backend::Backend;
 use crate::closure;
@@ -268,7 +276,14 @@ pub async fn ingest_set(
         keys,
         action,
         limits,
+        proof: Proof::EveryByte,
+        publish: None,
     };
+    ended(packs, done).await
+}
+
+/// Runs `done` and counts its ending.
+pub(super) async fn ended(packs: &Packs, done: Ingest<'_>) -> Ingested {
     let metrics = &packs.metrics;
     match done.run().await {
         Ok(ran) => {
@@ -291,23 +306,38 @@ pub async fn ingest_set(
     }
 }
 
+/// How much of the run an ingest reads before it records the packs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Proof {
+    /// Every record of every pack is hashed ([`Packs::commit_untrusted_pack`]) and every output
+    /// tree is read: the run of presigned writes.
+    EveryByte,
+    /// Pack 0's footer and manifest and the other packs' footers only, and the outputs checked
+    /// against the Command: the run of a put directory.
+    Manifest,
+}
+
 /// The inputs of one ingest.
-struct Ingest<'a> {
-    packs: &'a Packs,
-    backend: &'a Backend,
-    mint: &'a PackKeyMint,
-    lease: &'a str,
-    keys: &'a IssuedKeySet,
-    action: &'a Digest,
-    limits: &'a UntrustedLimits,
+pub(super) struct Ingest<'a> {
+    pub(super) packs: &'a Packs,
+    pub(super) backend: &'a Backend,
+    pub(super) mint: &'a PackKeyMint,
+    pub(super) lease: &'a str,
+    pub(super) keys: &'a IssuedKeySet,
+    pub(super) action: &'a Digest,
+    pub(super) limits: &'a UntrustedLimits,
+    pub(super) proof: Proof,
+    /// Where a one-pass object's output directories are published as tierstore manifests, if the
+    /// frontend writes action trees.
+    pub(super) publish: Option<&'a crate::action_tree::TreeWriter>,
 }
 
 /// What an ingest made of a run that ran.
-struct Ran {
-    result: ActionResult,
-    cached: bool,
-    packs: u64,
-    large_bytes: u64,
+pub(super) struct Ran {
+    pub(super) result: ActionResult,
+    pub(super) cached: bool,
+    pub(super) packs: u64,
+    pub(super) large_bytes: u64,
 }
 
 /// One pack of the run as far as its footer shows: its key, its length and its records.
@@ -340,10 +370,32 @@ impl Ingest<'_> {
             .hold(names)
             .map_err(|_| Stop::from(RejectReason::Claimed))?;
         let first = self.verified()?;
-        let size = self.length(&first.object).await?;
-        let (footer, entry) = self.footer(&first.object, size, true).await?;
+        let (size, known) = match self.proof {
+            Proof::EveryByte => (
+                self.length(&first.object, self.limits.max_pack_bytes)
+                    .await?,
+                None,
+            ),
+            // A put directory's pack 0 may be a one-pass object, which has no length cap: its
+            // end says which it is before any cap is applied.
+            Proof::Manifest => {
+                let size = self.length(&first.object, u64::MAX).await?;
+                let end = self.end_of(&first.object, size).await?;
+                if one_pass::is_one_pass(&end) {
+                    return self.one_pass(first, size, &end).await;
+                }
+                if size > self.limits.max_pack_bytes {
+                    return Err(RejectReason::TooLarge.into());
+                }
+                (size, Some(end))
+            }
+        };
+        let (footer, entry) = self.footer(&first.object, size, true, known).await?;
         let manifest = self.manifest(&first.object, &entry).await?;
         self.issued(&manifest)?;
+        if self.proof == Proof::Manifest {
+            self.declared(&manifest).await?;
+        }
         let mut laid = vec![Laid {
             key: first,
             size,
@@ -370,14 +422,23 @@ impl Ingest<'_> {
         {
             return Err(RejectReason::Incomplete.into());
         }
-        self.trees_held(&laid, &manifest, &places).await?;
+        if self.proof == Proof::EveryByte {
+            self.trees_held(&laid, &manifest, &places).await?;
+        }
         for large in &larges {
             large.store(self.backend).await?;
         }
         for pack in laid.iter().rev() {
             let new = new_pack(pack.key, &pack.footer, pack.size);
-            let recorded = self.packs.commit_untrusted_pack(pack.key, new, self.limits);
-            recorded.await?;
+            match self.proof {
+                Proof::EveryByte => {
+                    let recorded = self.packs.commit_untrusted_pack(pack.key, new, self.limits);
+                    recorded.await?;
+                }
+                Proof::Manifest => {
+                    self.packs.record_put_dir_pack(pack.key, new).await?;
+                }
+            }
         }
         let result = rebuilt(&manifest, self.packs.now());
         let cached = self.cached(&result, manifest.exit_code).await?;
@@ -429,7 +490,7 @@ impl Ingest<'_> {
 
     /// Checks that the manifest names no more packs than the set has keys for and no large slot
     /// the set has no key for.
-    fn issued(&self, manifest: &TaskManifest) -> Step<()> {
+    pub(super) fn issued(&self, manifest: &TaskManifest) -> Step<()> {
         if usize::from(manifest.packs) > self.keys.packs().len() {
             return Err(RejectReason::BadManifest.into());
         }
@@ -444,25 +505,31 @@ impl Ingest<'_> {
         Ok(())
     }
 
+    /// The last bytes of the object, as many as a one-pass trailer (fewer for a shorter object).
+    async fn end_of(&self, object: &ObjectKey, size: u64) -> Step<bytes::Bytes> {
+        let len = size.min(one_pass::TAIL_LEN as u64);
+        self.read(object, size - len, len).await
+    }
+
     /// A pack beyond the first, read as far as its footer: an object that is not there is
     /// `Incomplete`.
     async fn second<'k>(&self, key: &'k IssuedPackKey) -> Step<Laid<'k>> {
         let laid = async {
-            let size = self.length(&key.object).await?;
-            let (footer, _) = self.footer(&key.object, size, false).await?;
+            let size = self.length(&key.object, self.limits.max_pack_bytes).await?;
+            let (footer, _) = self.footer(&key.object, size, false, None).await?;
             Ok::<_, Stop>(Laid { key, size, footer })
         };
         laid.await.map_err(Stop::absent_is_incomplete)
     }
 
     /// The length of the object, if it is there and under the cap.
-    async fn length(&self, object: &ObjectKey) -> Step<u64> {
+    pub(super) async fn length(&self, object: &ObjectKey, cap: u64) -> Step<u64> {
         let size = match self.packs.store.len(object).await {
             Ok(Some(size)) => size,
             Ok(None) => return Err(RejectReason::Missing.into()),
             Err(error) => return Err(unavailable(&format!("the length of {object}: {error}"))),
         };
-        if size > self.limits.max_pack_bytes {
+        if size > cap {
             return Err(RejectReason::TooLarge.into());
         }
         if size < TRAILER_LEN as u64 {
@@ -478,9 +545,14 @@ impl Ingest<'_> {
         object: &ObjectKey,
         size: u64,
         manifest: bool,
+        known: Option<bytes::Bytes>,
     ) -> Step<(Footer, IndexEntry)> {
         let trailer = TRAILER_LEN as u64;
-        let tail = self.read(object, size - trailer, trailer).await?;
+        let tail = match known {
+            // The end of the object, read already: its last `TRAILER_LEN` bytes.
+            Some(end) => end.slice(end.len() - TRAILER_LEN..),
+            None => self.read(object, size - trailer, trailer).await?,
+        };
         let wanted = Footer::len_from_trailer(&tail).map_err(|_| RejectReason::Malformed)?;
         if wanted > footer_len(self.limits.max_blobs as u64) {
             return Err(RejectReason::TooLarge.into());
@@ -560,34 +632,54 @@ impl Ingest<'_> {
         if files.iter().any(|digest| !places.contains_key(digest)) {
             return Err(RejectReason::Incomplete.into());
         }
+        // A large object is an output's, or a file of an output directory's tree (the manifest
+        // cannot see inside a tree, so it does not check this): one that is neither would be
+        // streamed into the store for nothing.
+        let inside: BTreeSet<Digest> = files.iter().copied().collect();
+        let named: BTreeSet<Digest> = manifest.output_digests().collect();
+        if manifest
+            .large
+            .iter()
+            .any(|large| !named.contains(&large.digest) && !inside.contains(&large.digest))
+        {
+            return Err(RejectReason::BadManifest.into());
+        }
         Ok(())
+    }
+
+    /// The Action, decoded, or `None` for one that does not decode.
+    pub(super) async fn action(&self) -> Step<Option<reapi::Action>> {
+        let blob = self.backend.read_blob(self.action).await;
+        let blob = blob.map_err(|error| unavailable(&format!("the Action: {error}")))?;
+        Ok(reapi::Action::decode(blob).ok())
     }
 
     /// Writes `result` to the action cache if the action exited 0 and may be cached; whether it
     /// did.
-    async fn cached(&self, result: &ActionResult, exit_code: i32) -> Step<bool> {
+    pub(super) async fn cached(&self, result: &ActionResult, exit_code: i32) -> Step<bool> {
         if exit_code != 0 {
             return Ok(false);
         }
-        let blob = self.backend.read_blob(self.action).await;
-        let blob = blob.map_err(|error| unavailable(&format!("the Action: {error}")))?;
         // An Action that does not decode is not cached: the frontend cannot say it may be.
-        let cacheable = reapi::Action::decode(blob).is_ok_and(|action| !action.do_not_cache);
+        let cacheable = self
+            .action()
+            .await?
+            .is_some_and(|action| !action.do_not_cache);
         if !cacheable {
             return Ok(false);
         }
-        let prepared = self.backend.prepare_action_result(result).await;
-        let record = prepared.map_err(|error| unavailable(&format!("the result: {error}")))?;
-        let committed = self
-            .backend
-            .commit_action_record(*self.action, record)
-            .await;
+        let committed = self.backend.put_action_result(*self.action, result).await;
         committed.map_err(|error| unavailable(&format!("the action cache: {error}")))?;
         Ok(true)
     }
 
     /// The bytes `[offset, offset + len)` of the object.
-    async fn read(&self, object: &ObjectKey, offset: u64, len: u64) -> Step<bytes::Bytes> {
+    pub(super) async fn read(
+        &self,
+        object: &ObjectKey,
+        offset: u64,
+        len: u64,
+    ) -> Step<bytes::Bytes> {
         let range = ByteRange::new(offset, len).ok_or(RejectReason::Malformed)?;
         Ok(self.packs.fetch(object, range).await?)
     }
@@ -635,8 +727,9 @@ const fn shaped(shape: &ShapeError) -> RejectReason {
     }
 }
 
-/// The manifest of the pack for [`Packs::commit_untrusted_pack`], as the footer says. Nothing
-/// the footer says is believed: the commit hashes every record and checks the layout again.
+/// The manifest of the pack as the footer says, for [`Packs::commit_untrusted_pack`] (which
+/// believes nothing of it: it hashes every record and checks the layout again) or, under
+/// [`Proof::Manifest`], for `Packs::record_put_dir_pack` (which records it as it is).
 fn new_pack(key: &IssuedPackKey, footer: &Footer, size: u64) -> NewPack {
     let blob = |entry: &IndexEntry| PackBlob {
         digest: BlobDigest {
@@ -654,9 +747,9 @@ fn new_pack(key: &IssuedPackKey, footer: &Footer, size: u64) -> NewPack {
 }
 
 /// The result the manifest describes, sorted by path as REAPI asks. It carries the manifest's
-/// digests, which the pack's records have been hashed to, and the task's claimed timing as
-/// execution metadata ([`claimed`]), anchored at `end`.
-fn rebuilt(manifest: &TaskManifest, end: SystemTime) -> ActionResult {
+/// digests (which, under [`Proof::EveryByte`], the pack's records have been hashed to) and the
+/// task's claimed timing as execution metadata ([`claimed`]), anchored at `end`.
+pub(super) fn rebuilt(manifest: &TaskManifest, end: SystemTime) -> ActionResult {
     let wire = digest_to_proto;
     let mut result = ActionResult {
         output_files: manifest

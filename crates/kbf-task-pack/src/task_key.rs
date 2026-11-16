@@ -1,12 +1,21 @@
-//! The key of a task pack: `cas/b/<build>/<nonce>-<slot>`, the slot being `<k>` for pack `k` or
-//! `L<i>` for large object `i` ([`Slot`]).
+//! The key of a task pack or large object, in one of two layouts ([`KeyLayout`]):
 //!
-//! The frontend mints one key per lease attempt and hands the task a presigned write for it;
-//! the task never picks a key. The nonce is 32 hex digits of a MAC (the frontend's HMAC over
-//! the lease, the action and the mint minute, truncated to 16 bytes) followed by the mint
-//! minute in 8 hex digits, so the janitor reads a pack's age from its key alone. This module
-//! is the shape of that key and the message the MAC covers; the secret, the HMAC and the
-//! comparison against a presented key belong to the frontend that mints.
+//! - **Slotted**, `cas/b/<build>/<nonce>-<slot>`, the slot being `<k>` for pack `k` or `L<i>`
+//!   for large object `i` ([`Slot`]): one key per object, each with a presigned write. The
+//!   nonce is 32 hex digits of a MAC (the frontend's HMAC over the lease, the action, the mint
+//!   minute and the slot, truncated to 16 bytes, [`mac_input`]) followed by the mint minute in
+//!   8 hex digits.
+//! - **Put directory**, `cas/b/<build>/<nonce>/<name>`, the name being `pack` for pack 0,
+//!   `pack<k>` for pack `k` and `L<i>` for large object `i` ([`Slot::object_name`]): the task
+//!   writes files into the put directory `cas/b/<build>/<nonce>/` and each committed file is the
+//!   object of that key. The nonce is the same 40 hex digits, but its MAC covers no slot
+//!   ([`mac_input_put_dir`]): one MAC names the attempt's directory, and the name in it says the
+//!   slot.
+//!
+//! The task never picks a key or a directory. The janitor reads an object's age from the
+//! minute in its key alone, in either layout. This module is the shape of a key and the message
+//! the MAC covers; the secret, the HMAC and the comparison against a presented key belong to
+//! the frontend that mints.
 
 use std::fmt;
 
@@ -21,6 +30,13 @@ const MAC_DOMAIN: &[u8] = b"kbf-task-pack/v2";
 /// The domain tag of the first MAC, which did not cover the slot: only slot 0 was ever minted
 /// under it, so it verifies for [`Slot::Pack`]`(0)` and nothing else.
 const MAC_DOMAIN_V1: &[u8] = b"kbf-task-pack/v1";
+
+/// The domain tag of the MAC of a put directory, which covers no slot. A tag of its own, so a
+/// put directory's nonce is never one a slotted key of slot 0 carries (`kbf-task-pack/v1`).
+const MAC_DOMAIN_PUT_DIR: &[u8] = b"kbf-task-pack/put-dir/v1";
+
+/// The name of pack 0 in a put directory.
+const PACK_NAME: &str = "pack";
 
 /// The most packs one run may write: slots `0..MAX_PACKS`.
 pub const MAX_PACKS: u8 = 8;
@@ -49,13 +65,18 @@ pub enum TaskKeyError {
     /// The string is not `cas/b/<build>/<nonce>` with no further `/`.
     #[error("{0:?} is not of the form cas/b/<build>/<nonce>")]
     NotAPackKey(String),
-    /// The nonce is not 40 lowercase hex digits followed by `-` and a slot.
-    #[error("the nonce {0:?} is not <32 hex MAC><8 hex minute>-<slot>")]
+    /// The nonce is not 40 lowercase hex digits followed by `-` and a slot (slotted), or not 40
+    /// lowercase hex digits (put directory).
+    #[error("the nonce {0:?} is not <32 hex MAC><8 hex minute>, then -<slot> or /<name>")]
     Nonce(String),
     /// The slot is not `<k>` or `L<i>` with a canonical decimal (no sign, no leading zeros) below
     /// [`MAX_PACKS`] or [`MAX_LARGE`].
     #[error("the slot {0:?} is not <k> (k < {MAX_PACKS}) or L<i> (i < {MAX_LARGE})")]
     Slot(String),
+    /// The object name in a put directory is not `pack`, `pack<k>` (`0 < k <` [`MAX_PACKS`]) or
+    /// `L<i>` (`i <` [`MAX_LARGE`]), each index a canonical decimal.
+    #[error("the name {0:?} is not pack, pack<k> (0 < k < {MAX_PACKS}) or L<i> (i < {MAX_LARGE})")]
+    Name(String),
     /// A [`Slot`] value outside the slots a run has.
     #[error("the slot {0} is outside the {MAX_PACKS} pack and {MAX_LARGE} large slots of a run")]
     SlotRange(Slot),
@@ -114,6 +135,41 @@ impl Slot {
         }
     }
 
+    /// The name of this slot's object in a put directory: `pack` for pack 0, `pack<k>` for pack
+    /// `k` and `L<i>` for large object `i`, the names `kbf-task` commits.
+    #[must_use]
+    pub fn object_name(self) -> String {
+        match self {
+            Self::Pack(0) => PACK_NAME.to_owned(),
+            Self::Pack(k) => format!("{PACK_NAME}{k}"),
+            Self::Large(i) => format!("L{i}"),
+        }
+    }
+
+    /// Parses an object name of a put directory, the inverse of [`Slot::object_name`].
+    ///
+    /// # Errors
+    /// [`TaskKeyError::Name`] for any other text: `pack0`, a sign, a leading zero, an index out
+    /// of range, a bare `<k>`.
+    pub fn from_object_name(name: &str) -> Result<Self, TaskKeyError> {
+        let bad = || TaskKeyError::Name(name.to_owned());
+        if name == PACK_NAME {
+            return Ok(Self::Pack(0));
+        }
+        let slot = if let Some(index) = name.strip_prefix(PACK_NAME) {
+            match Self::parse(index).map_err(|_| bad())? {
+                // `pack0` would be a second spelling of `pack`.
+                Self::Pack(0) | Self::Large(_) => return Err(bad()),
+                pack => pack,
+            }
+        } else if name.starts_with('L') {
+            Self::parse(name).map_err(|_| bad())?
+        } else {
+            return Err(bad());
+        };
+        Ok(slot)
+    }
+
     /// The bytes the v2 MAC covers for this slot: a kind byte (0 pack, 1 large) and the index.
     const fn mac_bytes(self) -> [u8; 2] {
         match self {
@@ -132,20 +188,31 @@ impl fmt::Display for Slot {
     }
 }
 
+/// How a key spells its slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum KeyLayout {
+    /// `cas/b/<build>/<nonce>-<slot>`: a key per object, its MAC over the slot.
+    Slotted,
+    /// `cas/b/<build>/<nonce>/<name>`: an object of a put directory, its MAC over the directory.
+    PutDir,
+}
+
 /// A parsed task pack key.
 ///
 /// The text form ([`fmt::Display`] and [`TaskPackKey::parse`]) is canonical: lowercase hex, a
-/// slot without leading zeros, so one key has one spelling.
+/// slot without leading zeros, so one key has one spelling in each layout.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TaskPackKey {
     build: String,
     mac: [u8; MAC_LEN],
     minute: u32,
     slot: Slot,
+    layout: KeyLayout,
 }
 
 impl TaskPackKey {
-    /// A key for `build` with the given MAC, mint minute (minutes since the Unix epoch) and slot.
+    /// A slotted key for `build` with the given MAC, mint minute (minutes since the Unix epoch)
+    /// and slot.
     ///
     /// # Errors
     /// The refusal of [`check_build`], and [`TaskKeyError::SlotRange`] for a slot a run does not
@@ -156,6 +223,30 @@ impl TaskPackKey {
         minute: u32,
         slot: Slot,
     ) -> Result<Self, TaskKeyError> {
+        Self::laid_out(build, mac, minute, slot, KeyLayout::Slotted)
+    }
+
+    /// The key of the object `slot` in the put directory of `build` whose nonce is `mac` and
+    /// `minute`: `cas/b/<build>/<nonce>/<name>`.
+    ///
+    /// # Errors
+    /// As [`TaskPackKey::new`].
+    pub fn in_put_dir(
+        build: &str,
+        mac: [u8; MAC_LEN],
+        minute: u32,
+        slot: Slot,
+    ) -> Result<Self, TaskKeyError> {
+        Self::laid_out(build, mac, minute, slot, KeyLayout::PutDir)
+    }
+
+    fn laid_out(
+        build: &str,
+        mac: [u8; MAC_LEN],
+        minute: u32,
+        slot: Slot,
+        layout: KeyLayout,
+    ) -> Result<Self, TaskKeyError> {
         check_build(build)?;
         if !slot.in_range() {
             return Err(TaskKeyError::SlotRange(slot));
@@ -165,36 +256,60 @@ impl TaskPackKey {
             mac,
             minute,
             slot,
+            layout,
         })
     }
 
-    /// Parses `cas/b/<build>/<nonce>-<slot>`.
+    /// Parses `cas/b/<build>/<nonce>-<slot>` or `cas/b/<build>/<nonce>/<name>`.
     ///
     /// # Errors
-    /// [`TaskKeyError::NotAPackKey`] for another shape (another prefix, a missing or extra
-    /// `/`), the refusal of [`check_build`] for the build, [`TaskKeyError::Nonce`] for a nonce
-    /// that is not 40 lowercase hex digits then `-`, [`TaskKeyError::Slot`] for a slot that is
-    /// not `<k>` or `L<i>` in canonical form and in range.
+    /// [`TaskKeyError::NotAPackKey`] for another shape (another prefix, a missing `/`, or more
+    /// than one after the nonce), the refusal of [`check_build`] for the build,
+    /// [`TaskKeyError::Nonce`] for a nonce that is not 40 lowercase hex digits (then `-` in the
+    /// slotted layout), [`TaskKeyError::Slot`] for a slot that is not `<k>` or `L<i>` in
+    /// canonical form and in range, [`TaskKeyError::Name`] for a name that is not one of
+    /// [`Slot::object_name`]'s.
     pub fn parse(key: &str) -> Result<Self, TaskKeyError> {
         let not_a_key = || TaskKeyError::NotAPackKey(key.to_owned());
         let rest = key.strip_prefix(PREFIX).ok_or_else(not_a_key)?;
         let (build, nonce) = rest.split_once('/').ok_or_else(not_a_key)?;
-        if nonce.contains('/') {
-            return Err(not_a_key());
-        }
+        let (nonce, name) = match nonce.split_once('/') {
+            Some((_, name)) if name.contains('/') => return Err(not_a_key()),
+            Some((nonce, name)) => (nonce, Some(name)),
+            None => (nonce, None),
+        };
         check_build(build)?;
         let bad_nonce = || TaskKeyError::Nonce(nonce.to_owned());
-        let (digits, slot) = nonce.split_once('-').ok_or_else(bad_nonce)?;
-        if digits.len() != 2 * MAC_LEN + 8 || !is_lower_hex(digits) {
-            return Err(bad_nonce());
+        let (digits, slot, layout) = match name {
+            Some(name) => (nonce, Slot::from_object_name(name), KeyLayout::PutDir),
+            None => {
+                let (digits, slot) = nonce.split_once('-').ok_or_else(bad_nonce)?;
+                (digits, Slot::parse(slot), KeyLayout::Slotted)
+            }
+        };
+        let (mac, minute) = nonce_parts(digits).ok_or_else(bad_nonce)?;
+        Self::laid_out(build, mac, minute, slot?, layout)
+    }
+
+    /// How the key spells its slot.
+    #[must_use]
+    pub const fn layout(&self) -> KeyLayout {
+        self.layout
+    }
+
+    /// The put directory the key is an object of, `cas/b/<build>/<nonce>` (no `/` at its
+    /// end); `None` for a slotted key.
+    #[must_use]
+    pub fn put_dir(&self) -> Option<String> {
+        match self.layout {
+            KeyLayout::PutDir => Some(format!(
+                "{PREFIX}{}/{}{:08x}",
+                self.build,
+                hex::encode(self.mac),
+                self.minute
+            )),
+            KeyLayout::Slotted => None,
         }
-        let (mac_hex, minute_hex) = digits.split_at(2 * MAC_LEN);
-        // Both halves are lowercase hex of the right length (checked above), so these cannot fail.
-        let mac = std::array::from_fn(|i| {
-            u8::from_str_radix(&mac_hex[2 * i..2 * i + 2], 16).unwrap_or_default()
-        });
-        let minute = u32::from_str_radix(minute_hex, 16).unwrap_or_default();
-        Self::new(build, mac, minute, Slot::parse(slot)?)
     }
 
     /// The build id: the lease the frontend issued.
@@ -230,15 +345,30 @@ impl TaskPackKey {
 
 impl fmt::Display for TaskPackKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{PREFIX}{}/{}{:08x}-{}",
-            self.build,
-            hex::encode(self.mac),
-            self.minute,
-            self.slot
-        )
+        let (build, mac, minute) = (&self.build, hex::encode(self.mac), self.minute);
+        match self.layout {
+            KeyLayout::Slotted => write!(f, "{PREFIX}{build}/{mac}{minute:08x}-{}", self.slot),
+            KeyLayout::PutDir => write!(
+                f,
+                "{PREFIX}{build}/{mac}{minute:08x}/{}",
+                self.slot.object_name()
+            ),
+        }
     }
+}
+
+/// The MAC and the minute of a nonce's 40 lowercase hex digits; `None` for any other text.
+fn nonce_parts(digits: &str) -> Option<([u8; MAC_LEN], u32)> {
+    if digits.len() != 2 * MAC_LEN + 8 || !is_lower_hex(digits) {
+        return None;
+    }
+    let (mac_hex, minute_hex) = digits.split_at(2 * MAC_LEN);
+    // Both halves are lowercase hex of the right length (checked above), so these cannot fail.
+    let mac = std::array::from_fn(|i| {
+        u8::from_str_radix(&mac_hex[2 * i..2 * i + 2], 16).unwrap_or_default()
+    });
+    let minute = u32::from_str_radix(minute_hex, 16).unwrap_or_default();
+    Some((mac, minute))
 }
 
 /// Whether `build` may be the middle part of a key: 1 to [`MAX_BUILD_BYTES`] characters of
@@ -302,6 +432,21 @@ pub fn mac_input(
 /// The refusal of [`check_build`].
 pub fn mac_input_v1(build: &str, action: &Digest, minute: u32) -> Result<Vec<u8>, TaskKeyError> {
     message(MAC_DOMAIN_V1, build, action, minute)
+}
+
+/// The message the MAC of a put directory's nonce covers: [`mac_input_v1`]'s fields under the
+/// domain tag `kbf-task-pack/put-dir/v1`, and no slot. Every object of the directory carries
+/// the same nonce; the name after it says which object it is, and the directory is the
+/// attempt's alone.
+///
+/// # Errors
+/// The refusal of [`check_build`].
+pub fn mac_input_put_dir(
+    build: &str,
+    action: &Digest,
+    minute: u32,
+) -> Result<Vec<u8>, TaskKeyError> {
+    message(MAC_DOMAIN_PUT_DIR, build, action, minute)
 }
 
 fn message(

@@ -317,6 +317,15 @@ pub enum PackIndexFlagError {
     Open(#[from] PackIndexError),
 }
 
+/// The pack index and the action cache of one Postgres state store: two views of one handle.
+#[derive(Clone)]
+pub struct Indexes {
+    /// The pack index.
+    pub packs: Arc<dyn PackIndex>,
+    /// The action cache table, written in the transaction of the packs of its outputs.
+    pub actions: Arc<dyn kbf_pack_index::action::ActionStore>,
+}
+
 impl crate::Args {
     /// The state store `--state-store` names, opened, or `None` when the flag is not
     /// given (the scheduler's state is then in memory).
@@ -357,6 +366,25 @@ impl crate::Args {
         };
         let index = PostgresPackIndex::open(&url.config)?;
         Ok(Some(Arc::new(index)))
+    }
+
+    /// [`Self::open_pack_index`] seen as both of what the Postgres index is: the pack index and
+    /// the action cache table beside it (`kbf_pack_index::action`), one handle and one pool, so
+    /// that a result and the packs of its outputs are written in one transaction. A server that
+    /// has not run the installer's migration of the action table opens it as it opens the pack
+    /// index, and the action calls fail `NotMigrated`.
+    ///
+    /// # Errors
+    /// As [`Self::open_pack_index`].
+    pub fn open_indexes(&self) -> Result<Option<Indexes>, PackIndexFlagError> {
+        let Some(url) = self.pack_index_url()? else {
+            return Ok(None);
+        };
+        let index = Arc::new(PostgresPackIndex::open(&url.config)?);
+        Ok(Some(Indexes {
+            packs: Arc::clone(&index) as Arc<dyn PackIndex>,
+            actions: index,
+        }))
     }
 }
 

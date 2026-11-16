@@ -84,6 +84,7 @@ pub mod large_backfill;
 mod meta_log;
 pub mod metrics;
 mod operations;
+mod output_index;
 pub mod prepare_run;
 mod proxy;
 mod qos_header;
@@ -142,12 +143,13 @@ pub use crate::meta_log::{Leadership, MemoryMetaLog, MetaLog, MetaLogError};
 pub use crate::operations::OperationsService;
 pub use crate::proxy::{
     Claim, Claimed, Clock, CommitError, DEFAULT_INFLIGHT_BYTES, DEFAULT_UPLOAD_IDLE_TIMEOUT,
-    Direction, Held, Ingested, IssuedKeySet, IssuedPackKey, LargeWriteThrough, MAX_COMMIT_BLOBS,
-    MAX_PACKED_BLOB_BYTES, MAX_UNTRUSTED_BLOB_BYTES, MAX_UNTRUSTED_LARGE_BYTES,
-    MAX_UNTRUSTED_MANIFEST_BYTES, MAX_UNTRUSTED_PACK_BYTES, MAX_UNTRUSTED_READ_BYTES,
-    MAX_UPLOAD_IDLE_TIMEOUT, MIN_SECRET_BYTES, Meter, Method, MintError, Owner, Owners,
-    PackKeyMint, PackMetrics, PackSettings, PackStore, Packs, Proxy, RejectReason, StoreError,
-    UntrustedLimits, VerifyingKeys, ingest, ingest_set,
+    Direction, Held, Ingested, IssuedKeySet, IssuedPackKey, IssuedPutDir, LargeRead,
+    LargeWriteThrough, MAX_COMMIT_BLOBS, MAX_PACKED_BLOB_BYTES, MAX_UNTRUSTED_BLOB_BYTES,
+    MAX_UNTRUSTED_LARGE_BYTES, MAX_UNTRUSTED_MANIFEST_BYTES, MAX_UNTRUSTED_PACK_BYTES,
+    MAX_UNTRUSTED_READ_BYTES, MAX_UPLOAD_IDLE_TIMEOUT, MIN_SECRET_BYTES, Meter, Method, MintError,
+    Owner, Owners, PackKeyMint, PackMetrics, PackSettings, PackStore, Packs, Pieces, Proxy,
+    RejectReason, StoreError, Stored, UntrustedLimits, VerifyingKeys, ingest, ingest_put_dir,
+    ingest_put_dir_with, ingest_set, large_key,
 };
 pub use crate::qos_header::{BadQosAllow, QOS_HEADER, QosAllow};
 pub use crate::recorder::{
@@ -360,6 +362,57 @@ pub fn routes_proxied<D>(
 where
     D: Dispatch,
 {
+    execution_routes(
+        proxy.routes(),
+        backend,
+        dispatch,
+        streams,
+        authorizers,
+        recorder,
+        defaults,
+    )
+}
+
+/// [`routes_proxied`] with the client's CAS, ByteStream and action-cache calls answered by
+/// `stored` ([`Stored`]: the packs, the pack index and the action table of the state store, no
+/// storage node), and `Execution` over `backend`, which is the plane of the same `stored`
+/// ([`Backend::stored`]).
+pub fn routes_stored<D>(
+    stored: &Arc<Stored>,
+    backend: impl Into<Backend>,
+    dispatch: Arc<D>,
+    streams: OpenStreams,
+    authorizers: Arc<Authorizers>,
+    recorder: &Recorder,
+    defaults: Defaults,
+) -> Routes
+where
+    D: Dispatch,
+{
+    execution_routes(
+        stored.routes(&authorizers),
+        backend,
+        dispatch,
+        streams,
+        authorizers,
+        recorder,
+        defaults,
+    )
+}
+
+/// `base` (the storage calls) with `Capabilities`, `Execution` and `Operations` added.
+fn execution_routes<D>(
+    base: Routes,
+    backend: impl Into<Backend>,
+    dispatch: Arc<D>,
+    streams: OpenStreams,
+    authorizers: Arc<Authorizers>,
+    recorder: &Recorder,
+    defaults: Defaults,
+) -> Routes
+where
+    D: Dispatch,
+{
     let OpenStreams { closing, progress } = streams;
     let operations = OperationsService::new(Arc::clone(&dispatch), Arc::clone(&authorizers));
     let service =
@@ -374,9 +427,7 @@ where
         .max_decoding_message_size(MAX_MESSAGE_BYTES)
         .max_encoding_message_size(MAX_MESSAGE_BYTES);
     let capabilities = CapabilitiesService::new(true, authorizers);
-    proxy
-        .routes()
-        .add_service(CapabilitiesServer::new(capabilities))
+    base.add_service(CapabilitiesServer::new(capabilities))
         .add_service(execution)
         .add_service(OperationsServer::new(operations))
 }

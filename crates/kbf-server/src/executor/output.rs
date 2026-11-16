@@ -19,8 +19,10 @@
 //! `Result`'s status, its metadata holding `stdout`, `stderr` and `truncated` (`true` when the
 //! service or this cap dropped any of the output), and `note` when the output could not be
 //! read. The status's code and message are what they were: the farm reads only those, logs
-//! the message, and ignores a detail it does not look for. The text is never logged here:
-//! only its lengths are.
+//! the message, and ignores a detail it does not look for. The log line of the output holds
+//! lengths only; the end of the redacted standard error, at most
+//! [`Config::failed_stderr_log_bytes`](super::Config::failed_stderr_log_bytes) bytes of it, is
+//! a second line, at WARN ([`Output::stderr_excerpt`]). Standard output is never logged.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -209,6 +211,16 @@ impl Output {
             )),
             ..Self::default()
         }
+    }
+
+    /// The end of the redacted standard error for the log: its last `cap` bytes or fewer,
+    /// starting on a character boundary, without the white space at its ends; `None` when
+    /// `cap` is 0 or the stream holds only white space. The text is the attached one, so the
+    /// grants are already out of it.
+    pub(super) fn stderr_excerpt(&self, cap: usize) -> Option<&str> {
+        let (text, _) = ending(&self.stderr, cap);
+        let text = text.trim();
+        (!text.is_empty()).then_some(text)
     }
 
     /// Whether there is nothing to attach: no text and no note.

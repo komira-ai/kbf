@@ -189,7 +189,7 @@ async fn prepared(
         deps: &deps,
         twin: &harness.twin,
     };
-    prepare(&ctx, LeaseId::new(7, 8), &action(), booking).await
+    prepare(&ctx.preparer(), LeaseId::new(7, 8), &action(), booking).await
 }
 
 /// Catches the job's wall limit being a lease's or the executor's longest run instead of the

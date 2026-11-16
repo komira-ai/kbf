@@ -426,6 +426,41 @@ async fn a_tree_that_is_a_large_object_is_incomplete_and_the_object_unread() {
     assert!(farm.rig.store.ranges().iter().all(|(k, _, _)| k != key));
 }
 
+/// Asserts that a large object that is a file of an output directory's tree, which no output
+/// names itself, is stored and the run cached: the farm's `zig_unpack` has a file of 172 MB in a
+/// directory output.
+#[tokio::test]
+async fn a_large_object_inside_an_output_directory_is_stored_and_the_run_cached() {
+    let farm = Multi::new().await;
+    let (manifest, zero, digest) = farm.large_in_tree(true);
+    farm.put(farm.pack_key(0), &zero).await;
+    farm.put(farm.large_key(0), &large().0).await;
+
+    let got = farm.run().await;
+
+    let want = Ingested::Ran {
+        result: Box::new(result_of(&manifest)),
+        cached: true,
+    };
+    assert_eq!(got, want);
+    assert_eq!(streamed_by_node(&farm.rig, &digest).await, digest);
+}
+
+/// Asserts that a large object that no output names and no output directory's tree holds is a
+/// `BadManifest`, and nothing is stored or cached: it would be streamed in for nothing.
+#[tokio::test]
+async fn a_large_object_no_output_and_no_tree_names_is_a_bad_manifest() {
+    let farm = Multi::new().await;
+    let (_, zero, _) = farm.large_in_tree(false);
+    farm.put(farm.pack_key(0), &zero).await;
+    farm.put(farm.large_key(0), &large().0).await;
+
+    let got = farm.run().await;
+
+    farm.rejected(got, RejectReason::BadManifest).await;
+    farm.nothing_indexed();
+}
+
 /// Asserts that the large cap is the limits': a manifest that names a large object over
 /// `max_large_bytes`, or any when it is 0, is a `BadManifest`, and no large object is asked about.
 #[tokio::test]

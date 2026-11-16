@@ -17,6 +17,7 @@ use kbf_pack_index::conformance::{
     p4_first_location_is_kept, p5_batches_of_a_thousand, p6_touch_changes_only_the_touch_time,
     p7_dead_packs_and_unreferenced_keys, p8_concurrent_records_all_succeed,
     p9_a_pack_that_cannot_exist_is_refused, p10_concurrent_records_of_one_pack_agree,
+    p11_a_location_can_be_dropped,
 };
 use kbf_pack_index::postgres::{PostgresPackBackend, PostgresPackIndex};
 use kbf_pack_index::schema::{self as pack_schema, test_database};
@@ -155,6 +156,16 @@ fn p9_an_impossible_pack_is_refused() {
 #[test]
 fn p10_two_connections_record_the_same_pack_at_once() {
     p10_concurrent_records_of_one_pack_agree(&backend());
+}
+
+/// Asserts the drop of a location against Postgres: a drop that names another pack, an unknown
+/// digest or an unknown pack keeps the row; one of the row's own pack removes it, so locate
+/// answers none and find_missing lists it, and takes one off the pack's live blobs; the
+/// identical pack recorded again is `created: false` and does not index the digest again; and
+/// another pack that holds the digest then gets its row.
+#[test]
+fn p11_a_location_is_dropped_only_from_its_own_pack() {
+    p11_a_location_can_be_dropped(&backend());
 }
 
 // ---- Postgres's own parts ----------------------------------------------------------------

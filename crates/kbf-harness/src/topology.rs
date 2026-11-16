@@ -77,6 +77,12 @@ pub struct Limits {
 }
 
 impl Limits {
+    /// What a farm of a test's disk must not leave to the disk: the free bytes a storage node's
+    /// cold store keeps, in place of 5% of the filesystem. A runner whose disk has filled with
+    /// build output holds less free than that, and its node then refuses every flush, hangs in
+    /// its stop and is killed.
+    pub const COLD_STORE_FLOOR: &'static str = "--cold-store-floor-bytes=0";
+
     /// No limits: the unit's flags and the binaries' defaults.
     #[must_use]
     pub fn none() -> Self {
@@ -91,6 +97,7 @@ impl Limits {
         Self {
             frontend: Vec::new(),
             node: vec![
+                Self::COLD_STORE_FLOOR.to_owned(),
                 format!("--hot-store-max-bytes={}", 256 << 20),
                 format!("--write-bytes-in-flight={}", 128 << 20),
             ],
@@ -122,7 +129,8 @@ pub struct Topology {
 
 impl Topology {
     /// The rehearsal's: `storage_nodes` storage-and-daemon nodes and a daemon, the
-    /// stand-in container driver, no limits.
+    /// stand-in container driver, and a cold store that keeps no free space of the
+    /// disk it is on ([`Limits::COLD_STORE_FLOOR`]).
     #[must_use]
     pub fn rehearsal(storage_nodes: usize) -> Self {
         Self {
@@ -130,7 +138,10 @@ impl Topology {
             node_mode: NodeMode::StorageAndDaemon,
             daemons: 1,
             driver: Driver::StandInContainer,
-            limits: Limits::none(),
+            limits: Limits {
+                node: vec![Limits::COLD_STORE_FLOOR.to_owned()],
+                ..Limits::none()
+            },
             overrides: Vec::new(),
             binaries: Vec::new(),
             interrupt: Interrupt::new(),
