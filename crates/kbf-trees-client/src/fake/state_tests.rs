@@ -79,6 +79,32 @@ fn the_digest_covers_names_kinds_and_contents_but_not_sources() {
     let mut renamed = all.clone();
     renamed[0].path = "b".to_owned();
     assert_ne!(state.digest(&renamed), base);
+    let mut changed = Vec::new();
+    let mut moded = all.clone();
+    if let Some(entry::Kind::File(f)) = &mut moded[0].kind {
+        f.mode = Some(0o755);
+    }
+    changed.push(moded);
+    let mut dir_mode = all.clone();
+    dir_mode[1] = kind("d", entry::Kind::Dir(Dir { mode: Some(0o700) }));
+    changed.push(dir_mode);
+    let mut target = all.clone();
+    target[2] = kind(
+        "l",
+        entry::Kind::Symlink(Symlink {
+            target: "b".to_owned(),
+        }),
+    );
+    changed.push(target);
+    let mut other_child = all.clone();
+    other_child[3] = kind("t", entry::Kind::Tree(ChildTree { tree: vec![2; 32] }));
+    changed.push(other_child);
+    let mut kinded = all.clone();
+    kinded[4] = kind("x", entry::Kind::Dir(Dir { mode: None }));
+    changed.push(kinded);
+    for entries in changed {
+        assert_ne!(state.digest(&entries), base, "{entries:?}");
+    }
     state.set_salt(b"another builder");
     assert_ne!(state.digest(&all), base);
 }
@@ -241,8 +267,13 @@ fn a_listing_pages_through_a_directory() {
     );
     assert_eq!(root.next, "");
     let first = list("sub", "", 2);
-    let names: Vec<&str> = first.children.iter().map(|c| c.name.as_str()).collect();
-    assert_eq!((names, first.next.as_str()), (vec!["c", "e"], "e"));
+    let kinds: Vec<(&str, i32, u32)> = first
+        .children
+        .iter()
+        .map(|c| (c.name.as_str(), c.kind, c.mode))
+        .collect();
+    assert_eq!(kinds, [("c", dir_kind, 0o755), ("e", dir_kind, 0o755)]);
+    assert_eq!(first.next, "e");
     let rest = list("sub", "e", 2);
     let kinds: Vec<(&str, i32)> = rest
         .children
@@ -252,7 +283,12 @@ fn a_listing_pages_through_a_directory() {
     assert_eq!(kinds, [("l", link_kind), ("x", file_kind)]);
     assert_eq!(rest.next, "x");
     let last = list("sub", "x", 2);
-    assert_eq!(last.children.len(), 1);
+    let kinds: Vec<(&str, i32, u32)> = last
+        .children
+        .iter()
+        .map(|c| (c.name.as_str(), c.kind, c.mode))
+        .collect();
+    assert_eq!(kinds, [("y", dir_kind, 0o755)]);
     assert_eq!(last.next, "");
 }
 
@@ -274,4 +310,96 @@ fn a_filling_placement_has_nothing_filled() {
     let answer = state.placement(&read).unwrap();
     assert_eq!(answer.state(), PlacementState::Filling);
     assert_eq!((answer.total_bytes, answer.filled_bytes), (5, 0));
+}
+
+fn create_with(
+    state: &mut State,
+    entries: Vec<Entry>,
+    at: Vec<Location>,
+    prefetch: Prefetch,
+) -> Result<CreateTreeResponse, Status> {
+    state.create(CreateTreeRequest {
+        entries,
+        at,
+        prefetch: prefetch.into(),
+        ..CreateTreeRequest::default()
+    })
+}
+
+/// Asserts a bad source fails only a create that waits for its fills: a `background` create
+/// keeps its placement `FAILED` with each bad entry and its reason in `failures`, and a `none`
+/// create reads no source and is `LAZY`.
+#[test]
+fn a_bad_source_fails_a_wait_create_and_marks_a_background_placement() {
+    let mut state = State::new();
+    let whole_key = format!("cas/l/{}", hex::encode([7_u8; 32]));
+    state.mark(&whole_key, Some(Source::Missing));
+    let entries = vec![file("a", 1), file("b", 1)];
+    let waited = create_with(
+        &mut state,
+        entries.clone(),
+        vec![fs("jobs/w")],
+        Prefetch::Wait,
+    );
+    assert_eq!(
+        waited.unwrap_err().message(),
+        format!("source missing: {whole_key}")
+    );
+    let made = create_with(
+        &mut state,
+        entries.clone(),
+        vec![fs("jobs/b")],
+        Prefetch::Background,
+    )
+    .unwrap();
+    assert_eq!(made.state(), PlacementState::Failed);
+    let read = GetPlacementRequest {
+        placement: made.placement,
+        list: None,
+    };
+    let failures: Vec<(String, String)> = state
+        .placement(&read)
+        .unwrap()
+        .failures
+        .into_iter()
+        .map(|f| (f.path, f.code))
+        .collect();
+    let missing = "source missing".to_owned();
+    assert_eq!(
+        failures,
+        [("a".to_owned(), missing.clone()), ("b".to_owned(), missing)]
+    );
+    let lazy = create_with(&mut state, entries, vec![fs("jobs/n")], Prefetch::None).unwrap();
+    assert_eq!(lazy.state(), PlacementState::Lazy);
+}
+
+/// Asserts the order of the node's checks: a taken location is refused before the cache, and
+/// the cache before a bad source.
+#[test]
+fn the_locations_then_the_cache_then_the_sources_are_checked() {
+    let mut state = State::new();
+    create_with(
+        &mut state,
+        vec![file("a", 1)],
+        vec![fs("jobs/j")],
+        Prefetch::None,
+    )
+    .unwrap();
+    state.set_pin_limit(1);
+    state.mark(
+        &format!("cas/l/{}", hex::encode([7_u8; 32])),
+        Some(Source::Short),
+    );
+    let big = vec![file("big", 2)];
+    let taken = create_with(&mut state, big.clone(), vec![fs("jobs/j")], Prefetch::Wait);
+    assert_eq!(taken.unwrap_err().message(), "location taken: jobs/j");
+    let full = create_with(&mut state, big.clone(), vec![fs("jobs/k")], Prefetch::Wait);
+    assert_eq!(full.unwrap_err().message(), "tree too large for the cache");
+    let short = create_with(
+        &mut state,
+        vec![file("s", 1)],
+        vec![fs("jobs/k")],
+        Prefetch::Wait,
+    );
+    assert_eq!(short.unwrap_err().message(), "short: s");
 }

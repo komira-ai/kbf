@@ -53,7 +53,7 @@ async fn every_call_is_signed_and_the_secret_is_never_sent() {
 }
 
 /// Asserts a call signed with a wrong secret, in another region, or at a time more than 15
-/// minutes from the node's is refused `unauthenticated` with the node's reason, a definite
+/// minutes from the node's is refused `unauthenticated` with the fake's reason, a definite
 /// refusal; one 14 minutes early passes. Catches a signing that only works on a node whose
 /// clock is the client's.
 #[tokio::test]

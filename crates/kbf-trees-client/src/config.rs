@@ -195,8 +195,11 @@ impl Config {
     /// The default for the TCP connect and the TLS handshake together.
     pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-    /// The default bound of one call: above the node's own wait for a create's fills, so its
-    /// answer comes first.
+    /// The default bound of one call, the design's `--executor-trees-call-timeout-secs`. It is
+    /// above the 20 s wait deadline the design asks of tierstore for a `wait` create, so that
+    /// the node's answer comes first once tierstore has it; tierstore v0.3.111 waits up to its
+    /// `trees.create_timeout` (120 s by default), so until then a cold `wait` create can end
+    /// at this client's deadline, as `Transport` (the node may have acted), and is repeated.
     pub const CALL_TIMEOUT: Duration = Duration::from_secs(40);
 
     /// Calls to `node`, signed with `key` in the scope of `region` (the node's

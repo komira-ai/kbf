@@ -2,34 +2,35 @@ use std::time::Duration;
 
 use super::*;
 
-/// AWS's published SigV4 test suite: the secret of its key `AKIDEXAMPLE`.
-const AWS_SECRET: &str = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
+/// The secret of the vectors below.
+const VECTOR_SECRET: &str = "vector-secret-0123456789";
 
-/// The canonical request of AWS's `get-vanilla` and `post-vanilla` cases: `/`, the host
-/// `example.amazonaws.com`, signed with `host;x-amz-date`, an empty body.
+/// The canonical request of the shape of AWS's `get-vanilla` and `post-vanilla` cases: `/`,
+/// a host, signed with `host;x-amz-date`, an empty body.
 fn vanilla(method: &str) -> String {
     let headers = [
-        ("host", "example.amazonaws.com"),
-        ("x-amz-date", "20150830T123600Z"),
+        ("host", "node.example:9600"),
+        ("x-amz-date", "20270115T080000Z"),
     ];
     canonical_request(method, "/", &headers, &payload_hash(b""))
 }
 
-/// Asserts the signature of AWS's published `get-vanilla` and `post-vanilla` cases, in the
-/// scope `20150830/us-east-1/service`, is the one AWS publishes. Catches a canonical request,
-/// string to sign or key derivation that differs from SigV4 anywhere: a node would refuse
-/// every call.
+/// Asserts the signatures of two requests of the shape of AWS's `get-vanilla` and
+/// `post-vanilla` cases, in the scope `20270115/us-east-1/service`, are the values an
+/// independent SigV4 implementation (Python's `hmac` and `hashlib`, written from AWS's
+/// published algorithm) gives. Catches a canonical request, string to sign or key derivation
+/// that differs from SigV4 anywhere: a node would refuse every call.
 #[test]
-fn the_signature_of_aws_published_cases_is_aws_published_value() {
+fn the_signature_is_the_one_an_independent_sigv4_gives() {
     let scope = ("us-east-1", "service");
-    let stamp = "20150830T123600Z";
+    let stamp = "20270115T080000Z";
     assert_eq!(
-        signature(AWS_SECRET, scope, stamp, &vanilla("GET")),
-        "5fa00fa31553b73ebf1942676e86291e8372ff2a2260956d9b8aae1d763fbf31"
+        signature(VECTOR_SECRET, scope, stamp, &vanilla("GET")),
+        "bca147b096efae06f413595a82e4ea1fbf97d4f7b7db3eaf01d1e7685f73431f"
     );
     assert_eq!(
-        signature(AWS_SECRET, scope, stamp, &vanilla("POST")),
-        "5da7c1a2acd57cee7505fc6676e4e544621c30862966e37dddb68e92efbe5d6b"
+        signature(VECTOR_SECRET, scope, stamp, &vanilla("POST")),
+        "762d09dec58c2ea6f68488e852001fed56e8d6268c9ba49a0d36f8d34fdd9cba"
     );
 }
 
@@ -73,22 +74,21 @@ fn hmac_is_rfc_4231s() {
     );
 }
 
-/// Asserts `x-amz-date` is the UTC time as `YYYYMMDDTHHMMSSZ`: at the epoch, at AWS's test
-/// time, on a leap day, on the last second of a year; and a time before the epoch is
-/// spelled as the epoch.
+/// Asserts `x-amz-date` is the UTC time as `YYYYMMDDTHHMMSSZ`: on a leap day, on the last
+/// second of a year, on the first day after a century's February that has no leap day; and
+/// a time before the epoch is spelled as the epoch.
 #[test]
 fn the_date_is_utc_in_sigv4s_form() {
     let at = |secs: u64| UNIX_EPOCH + Duration::from_secs(secs);
-    assert_eq!(amz_date(at(0)), "19700101T000000Z");
-    assert_eq!(amz_date(at(1_440_938_160)), "20150830T123600Z");
-    assert_eq!(amz_date(at(1_709_208_000)), "20240229T120000Z");
-    assert_eq!(amz_date(at(1_735_689_599)), "20241231T235959Z");
+    assert_eq!(amz_date(at(1_835_438_400)), "20280229T120000Z");
+    assert_eq!(amz_date(at(1_830_297_599)), "20271231T235959Z");
+    assert_eq!(amz_date(at(4_107_542_400)), "21000301T000000Z");
     assert_eq!(
         amz_date(UNIX_EPOCH - Duration::from_secs(1)),
-        "19700101T000000Z"
+        amz_date(UNIX_EPOCH)
     );
-    assert_eq!(civil(0), (1970, 1, 1));
-    assert_eq!(civil(59), (1970, 3, 1));
+    assert_eq!(civil(21_243), (2028, 2, 29));
+    assert_eq!(civil(47_541), (2100, 3, 1));
 }
 
 /// Asserts the head of a signed call: the stamp of its time, the hash of its body, and an

@@ -234,7 +234,8 @@ impl<'a> Authorization<'a> {
 }
 
 /// Whether the call's head is signed with the fake's key, in its region, at a time within
-/// [`SKEW`] of `now`, over the body it carries; why not, as the node words it.
+/// [`SKEW`] of `now`, over the body it carries; why not, in the fake's words
+/// (the node words its reasons otherwise).
 fn verify(
     parts: &http::request::Parts,
     body: &[u8],

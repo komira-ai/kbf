@@ -10,7 +10,9 @@
 //!   `x-amz-date`, is more than 15 minutes from the fake's clock
 //!   ([`set_clock`](FakeTreesServer::set_clock)), has a signature that does not match, or
 //!   carries a body whose SHA-256 is not the signed one, is `UNAUTHENTICATED`
-//!   (`unauthenticated: <why>`) and is not logged. The key is [`KEY_ID`] and [`SECRET`] in
+//!   (`unauthenticated: <why>`, in the fake's words: the node words its reasons otherwise, so
+//!   code above this crate matches the reason and the code, never the text) and is not
+//!   logged. The key is [`KEY_ID`] and [`SECRET`] in
 //!   [`REGION`]; every head the fake received is kept ([`heads`](FakeTreesServer::heads)).
 //! - **A create is idempotent by the tree and its locations.** The same tree at the same
 //!   locations answers the placement made first, `created: false`, with its lease renewed;
@@ -26,8 +28,11 @@
 //!   node's builder ([`set_digest_salt`](FakeTreesServer::set_digest_salt)). A request that
 //!   carries a digest of its own other than the fake's is `tree digest mismatch`.
 //! - **Sources the test marks** ([`mark_source`](FakeTreesServer::mark_source), by object
-//!   key: `from.key`, or `cas/l/<sha256 in hex>` for a whole object) answer `source missing`
-//!   naming the key, or `short` or `mismatch` naming the entry.
+//!   key: `from.key`, or `cas/l/<sha256 in hex>` for a whole object) are read only by a
+//!   create that fills, after its locations and the cache are checked: a `wait` create fails
+//!   whole with `source missing` naming the key, or `short` or `mismatch` naming the entry; a
+//!   `background` create keeps its placement `FAILED`, each bad entry in its `failures`; a
+//!   `none` create reads no source.
 //! - **The cache**: a `wait` create of more file bytes than
 //!   [`set_pin_limit`](FakeTreesServer::set_pin_limit) is `tree too large for the cache`
 //!   (`RESOURCE_EXHAUSTED`); the same tree with `background` is placed.

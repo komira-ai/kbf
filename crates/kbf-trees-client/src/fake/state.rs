@@ -5,8 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use sha2::{Digest as _, Sha256};
 use tierstore_trees_api::v1::{
-    CreateTreeRequest, CreateTreeResponse, DirEntry, Entry, EntryKind, GetPlacementRequest,
-    GetPlacementResponse, Location, PlacementState, Prefetch, entry,
+    CreateTreeRequest, CreateTreeResponse, DirEntry, Entry, EntryKind, Failure,
+    GetPlacementRequest, GetPlacementResponse, Location, PlacementState, Prefetch, entry,
 };
 use tonic::Status;
 
@@ -58,6 +58,8 @@ struct Placement {
     state: PlacementState,
     created_ms: u64,
     expires_ms: u64,
+    /// The entries whose sources a `background` create could not read.
+    failures: Vec<Failure>,
 }
 
 /// The node.
@@ -156,7 +158,10 @@ impl State {
     }
 
     /// `CreateTree`, by the node's rules, in their order: the request alone, the children,
-    /// the client's digest, the sources, the cache, the locations.
+    /// the client's digest, the locations, the cache (a `wait` create only), and the sources,
+    /// which only a create that fills reads: a `wait` create fails whole on the first bad one,
+    /// a `background` create keeps its placement `FAILED` with the failures in it, and a
+    /// `none` create reads none.
     pub(super) fn create(
         &mut self,
         request: CreateTreeRequest,
@@ -178,18 +183,25 @@ impl State {
         if claimed.is_some_and(|claimed| claimed != tree.as_bytes()) {
             return Err(refused(Reason::DigestMismatch, None));
         }
-        self.check_sources(&entries)?;
-        let (files, bytes) = sizes(&entries);
         let prefetch = match prefetch {
             Prefetch::Unspecified => Prefetch::Wait,
             other => other,
         };
+        let found = self.placed_at(&request.at, tree)?;
+        let (files, bytes) = sizes(&entries);
         if prefetch == Prefetch::Wait && bytes > self.pin_limit {
             return Err(refused(Reason::TooLargeForCache, None));
         }
+        let bad = match prefetch {
+            Prefetch::None => Vec::new(),
+            _ => self.bad_sources(&entries),
+        };
+        if let (Prefetch::Wait, Some((refusal, _))) = (prefetch, bad.first()) {
+            return Err(refusal.clone());
+        }
+        let failures: Vec<Failure> = bad.into_iter().map(|(_, failure)| failure).collect();
         let ttl_ms = u64::from(request.ttl_secs.unwrap_or(DEFAULT_TTL_SECS)) * 1000;
         let expires_ms = self.now_ms + ttl_ms;
-        let found = self.placed_at(&request.at, tree)?;
         let created = found.is_none();
         let id = match found {
             Some(id) => id,
@@ -209,7 +221,8 @@ impl State {
         );
         let state = match prefetch {
             Prefetch::None => PlacementState::Lazy,
-            Prefetch::Background => PlacementState::Filling,
+            Prefetch::Background if failures.is_empty() => PlacementState::Filling,
+            Prefetch::Background => PlacementState::Failed,
             _ => PlacementState::Ready,
         };
         let placement = self.placements.entry(id.clone()).or_insert(Placement {
@@ -218,6 +231,7 @@ impl State {
             state,
             created_ms: self.now_ms,
             expires_ms,
+            failures,
         });
         placement.expires_ms = expires_ms;
         let filled = if placement.state == PlacementState::Ready {
@@ -255,8 +269,11 @@ impl State {
         Ok(None)
     }
 
-    /// Each file's source as the test marked it: the first that is not whole.
-    fn check_sources(&self, entries: &[Entry]) -> Result<(), Status> {
+    /// Each file whose source the test marked, in path order: the refusal a `wait` create
+    /// answers for it (`source missing` naming the key, `short` or `mismatch` naming the
+    /// entry), and the failure a `background` placement records.
+    fn bad_sources(&self, entries: &[Entry]) -> Vec<(Status, Failure)> {
+        let mut bad = Vec::new();
         for entry in entries {
             let Some(entry::Kind::File(file)) = &entry.kind else {
                 continue;
@@ -265,14 +282,19 @@ impl State {
                 Some(from) => from.key.clone(),
                 None => format!("cas/l/{}", hex::encode(&file.sha256)),
             };
-            match self.sources.get(&key) {
-                Some(Source::Missing) => return Err(refused(Reason::SourceMissing, Some(&key))),
-                Some(Source::Short) => return Err(refused(Reason::Short, Some(&entry.path))),
-                Some(Source::Lying) => return Err(refused(Reason::Mismatch, Some(&entry.path))),
-                None => {}
-            }
+            let (reason, about) = match self.sources.get(&key) {
+                Some(Source::Missing) => (Reason::SourceMissing, key),
+                Some(Source::Short) => (Reason::Short, entry.path.clone()),
+                Some(Source::Lying) => (Reason::Mismatch, entry.path.clone()),
+                None => continue,
+            };
+            let failure = Failure {
+                path: entry.path.clone(),
+                code: reason.name().to_owned(),
+            };
+            bad.push((refused(reason, Some(&about)), failure));
         }
-        Ok(())
+        bad
     }
 
     /// `GetPlacement`, with one page of a directory's children when `list` is set.
@@ -300,6 +322,7 @@ impl State {
             filled_bytes: filled,
             created_ms: placement.created_ms,
             expires_ms: placement.expires_ms,
+            failures: placement.failures.clone(),
             ..GetPlacementResponse::default()
         };
         if let Some(list) = &request.list {

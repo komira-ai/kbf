@@ -5,7 +5,8 @@
 //! secret signs and is never sent.
 //!
 //! The functions here are the whole of SigV4 the client needs; the fake checks a call with the
-//! same canonical request. They are held to AWS's published test vectors in the tests.
+//! same canonical request. The tests hold them to the values an
+//! independent SigV4 implementation gives, and HMAC to RFC 4231's vectors.
 
 use std::fmt::Write as _;
 use std::time::{SystemTime, UNIX_EPOCH};
