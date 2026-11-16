@@ -132,7 +132,9 @@ impl Cache {
     /// the directory to `<cache>/<commit>/`.
     async fn fetch(&self, commit: &str, platform: &str, name: &str) -> Result<(), FetchError> {
         let (bundle_url, sums_url) = self.locate(name).await?;
-        let staging = self.dir.join(format!("{STAGING}{commit}-{}", self.instance));
+        let staging = self
+            .dir
+            .join(format!("{STAGING}{commit}-{}", self.instance));
         let release = self.dir.join(commit);
         let downloaded = self
             .download(&staging, &[(&sums_url, SUMS), (&bundle_url, name)])

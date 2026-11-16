@@ -207,7 +207,10 @@ fn set_changed(path: &Path, at: SystemTime) {
 
 /// Makes `path` look a long time unchanged.
 fn old(path: &Path) {
-    set_changed(path, SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000));
+    set_changed(
+        path,
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+    );
 }
 
 fn bundle_file(commit: &str) -> String {
@@ -556,12 +559,15 @@ fn prune_leaves_another_process_staging_directory_of_today() {
 
     let removed = prune(dir.path(), COMMIT, 1, now, day).expect("pruned");
 
-    assert_eq!(removed, [aged.clone()]);
+    assert_eq!(removed, std::slice::from_ref(&aged));
     assert!(young.is_dir());
     assert!(!aged.exists());
     // A download changed after `now` (a clock that stepped back) is not old.
     set_changed(&young, now + day);
-    assert_eq!(prune(dir.path(), COMMIT, 1, now, day).expect("pruned"), Vec::<std::path::PathBuf>::new());
+    assert_eq!(
+        prune(dir.path(), COMMIT, 1, now, day).expect("pruned"),
+        Vec::<std::path::PathBuf>::new()
+    );
     assert!(young.is_dir());
 }
 
@@ -597,7 +603,11 @@ async fn two_ensures_of_one_commit_leave_one_valid_directory() {
         (a.expect("the first"), b.expect("the second"))
     };
     let release = async {
-        arrived.acquire_many(2).await.expect("both arrived").forget();
+        arrived
+            .acquire_many(2)
+            .await
+            .expect("both arrived")
+            .forget();
         open.add_permits(2);
     };
 
@@ -605,7 +615,9 @@ async fn two_ensures_of_one_commit_leave_one_valid_directory() {
 
     assert_eq!(held_a, dir.path().join(COMMIT));
     assert_eq!(held_b, held_a);
-    assert!(kbf_front::base_publish::is_staged(&held_a, COMMIT, PLATFORM));
+    assert!(kbf_front::base_publish::is_staged(
+        &held_a, COMMIT, PLATFORM
+    ));
     kbf_front::base_publish::verify(&held_a, COMMIT, PLATFORM).expect("a verified tree");
     let left: Vec<_> = std::fs::read_dir(dir.path())
         .expect("a dir")
@@ -649,7 +661,10 @@ async fn a_finished_release_directory_is_never_cleared_by_another_fetch() {
     let (loser, ()) = tokio::join!(fetching, winner);
 
     let (held, origin) = loser.expect("adopts the winner's tree");
-    assert_eq!((held.as_path(), origin), (dir.path().join(COMMIT).as_path(), Origin::Fetched));
+    assert_eq!(
+        (held.as_path(), origin),
+        (dir.path().join(COMMIT).as_path(), Origin::Fetched)
+    );
     assert_eq!(
         std::fs::read(held.join("winner")).expect("the winner's file"),
         b"mine"
@@ -688,7 +703,9 @@ async fn placing_over_a_finished_release_adopts_it_and_a_missing_download_is_ref
 
     assert!(!placed.expect("adopted"));
     assert!(!download.exists());
-    assert!(kbf_front::base_publish::is_staged(&release, COMMIT, PLATFORM));
+    assert!(kbf_front::base_publish::is_staged(
+        &release, COMMIT, PLATFORM
+    ));
 
     let nowhere = dir.path().join("nowhere");
     let missing = cache
