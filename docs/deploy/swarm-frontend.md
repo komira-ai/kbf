@@ -41,6 +41,17 @@ What still bounds the overlap is the service's health check: a new task that has
 by the end of its `start_period` and retries is replaced, and that counts as a failed update. A
 `start_period` shorter than the longest drain the frontends see makes such an update roll back.
 
+With an `s3://` `--history-objects` (`conditional-put=true`, the key pair in
+`--history-credentials-file`) there is no `LOCK` and no wait: the old and the new task write the
+one store at once, each under its own writer id
+([frontends-behind-a-load-balancer.md](frontends-behind-a-load-balancer.md#what-the-frontends-share)),
+and the new task serves as soon as it has started. When a frontend stops, after its drain, its
+history writer closes every build it recorded and writes until nothing is left or its stores stop
+taking writes, for at most five seconds, so a rolling update leaves the old task's builds closed.
+History is not all an update with `order: start-first` needs: the old and the new frontend must
+also share the executor's jobs, which is the subject of
+[docs/design/n-frontends.md](../design/n-frontends.md) (section 9 gives the order of the steps).
+
 ## Turn it on
 
 There is no required reviewer: a release that passed the pipeline deploys without an operator
