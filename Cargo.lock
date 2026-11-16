@@ -2906,6 +2906,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-trees-client"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "hex",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "kbf-trees-client",
+ "prost",
+ "rcgen",
+ "rustls",
+ "sha2 0.11.0",
+ "thiserror",
+ "tierstore-trees-api",
+ "tokio",
+ "tokio-rustls",
+ "tonic",
+ "tonic-prost",
+]
+
+[[package]]
 name = "kbf-types"
 version = "0.1.0"
 dependencies = [
