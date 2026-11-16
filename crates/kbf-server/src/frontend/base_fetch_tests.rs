@@ -13,7 +13,7 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 
-use super::{Cache, FetchError, Origin, STAGING, prune};
+use super::{Cache, FetchError, Origin, REPLACED, STAGING, prune};
 use crate::frontend::base_tree::tests::{bundle, sha};
 use crate::test_dir::scratch_dir;
 
@@ -704,4 +704,70 @@ async fn placing_over_a_finished_release_adopts_it_and_a_missing_download_is_ref
         .expect_err("nothing to rename");
     assert!(matches!(missing, FetchError::Io { .. }), "{missing}");
     assert!(missing.to_string().contains("nowhere"), "{missing}");
+}
+
+/// Asserts that placing a download over a release directory that fails its check renames that
+/// directory aside, renames the download in and leaves nothing aside, and that an aside path
+/// that cannot be cleared refuses the placement naming that path and leaves the release alone.
+/// Catches: a broken release removed in place under the path another process reads, and an
+/// aside directory left in the cache.
+#[tokio::test]
+async fn placing_over_a_broken_release_moves_it_aside_and_leaves_nothing_aside() {
+    let dir = scratch_dir("base-fetch-place-broken");
+    let fake = Fake::start().await;
+    let cache = cache(dir.path(), &fake);
+    let release = dir.path().join(COMMIT);
+    std::fs::create_dir(&release).expect("a release");
+    std::fs::write(release.join("SHA256SUMS"), "not sums").expect("junk");
+    let download = staging(dir.path(), "one");
+    std::fs::create_dir(&download).expect("a download");
+    crate::frontend::base_tree::tests::bundle_dir(&download, COMMIT, &[PLATFORM]);
+    let aside = staging(dir.path(), &format!("one{REPLACED}"));
+
+    let placed = cache.place(&download, &release, COMMIT, PLATFORM).await;
+
+    assert!(placed.expect("placed"));
+    assert!(kbf_front::base_publish::is_staged(
+        &release, COMMIT, PLATFORM
+    ));
+    assert!(!download.exists());
+    assert!(!aside.exists());
+
+    std::fs::remove_dir_all(&release).expect("removed");
+    std::fs::create_dir(&release).expect("a release");
+    std::fs::write(release.join("SHA256SUMS"), "not sums").expect("junk");
+    std::fs::create_dir(&download).expect("a download");
+    std::fs::write(&aside, "a file").expect("an aside file");
+
+    let refused = cache
+        .place(&download, &release, COMMIT, PLATFORM)
+        .await
+        .expect_err("an aside path that is a file");
+
+    assert!(matches!(refused, FetchError::Io { .. }), "{refused}");
+    assert!(refused.to_string().contains(REPLACED), "{refused}");
+    assert_eq!(
+        std::fs::read(release.join("SHA256SUMS")).expect("the release is kept"),
+        b"not sums"
+    );
+}
+
+/// Asserts that a prune passes over a download entry that is gone by the time it is read (here
+/// a link to nothing) and still removes what it should. Catches: a prune that stops at another
+/// process's download renamed into place between the listing and the read.
+#[test]
+fn prune_passes_over_a_download_that_is_gone() {
+    let dir = scratch_dir("base-fetch-prune-gone");
+    let day = Duration::from_secs(86_400);
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+    let gone = staging(dir.path(), "gone");
+    std::os::unix::fs::symlink(dir.path().join("nothing"), &gone).expect("a link");
+    let aged = staging(dir.path(), "dead");
+    std::fs::create_dir(&aged).expect("a download");
+    set_changed(&aged, now - day);
+
+    let removed = prune(dir.path(), COMMIT, 1, now, day).expect("pruned");
+
+    assert_eq!(removed, std::slice::from_ref(&aged));
+    assert!(!aged.exists());
 }

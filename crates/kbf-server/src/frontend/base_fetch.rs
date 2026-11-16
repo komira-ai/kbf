@@ -44,6 +44,10 @@ const PER_PAGE: u32 = 100;
 /// The prefix of the directory a download is made in.
 const STAGING: &str = ".fetch-";
 
+/// The suffix of the name a release that failed its check is renamed to before it is removed:
+/// a download directory's name, so a removal that stopped is pruned like a download.
+const REPLACED: &str = "-replaced";
+
 /// How old a download directory is before [`prune`] takes it for one a stopped start left: a
 /// live download of another process is younger.
 const STALE_STAGING: Duration = Duration::from_secs(24 * 60 * 60);
@@ -128,8 +132,8 @@ impl Cache {
         Ok((release, Origin::Fetched))
     }
 
-    /// Downloads the release's files into `<cache>/.fetch-<commit>/`, checks them and renames
-    /// the directory to `<cache>/<commit>/`.
+    /// Downloads the release's files into `<cache>/.fetch-<commit>-<instance>/`, checks them and
+    /// renames the directory to `<cache>/<commit>/` ([`Cache::place`]).
     async fn fetch(&self, commit: &str, platform: &str, name: &str) -> Result<(), FetchError> {
         let (bundle_url, sums_url) = self.locate(name).await?;
         let staging = self
@@ -169,7 +173,10 @@ impl Cache {
     /// Renames the checked `staging` to `release`. Gives `false` when `release` already held the
     /// files, whoever put them there (another process that finished first): that directory is
     /// kept as it is and `staging` is removed. A `release` that does not hold them is a failed
-    /// one and is replaced.
+    /// one: it is renamed aside (to `staging`'s name with [`REPLACED`]), `staging` is renamed in,
+    /// and the aside directory is removed. Nothing is removed under `release`'s own path, so a
+    /// release another process renamed in after the check is only ever swapped, in two renames,
+    /// for this one's, which holds the same checked bytes.
     async fn place(
         &self,
         staging: &Path,
@@ -177,12 +184,18 @@ impl Cache {
         commit: &str,
         platform: &str,
     ) -> Result<bool, FetchError> {
+        let mut aside = staging.as_os_str().to_owned();
+        aside.push(REPLACED);
+        let aside = PathBuf::from(aside);
         let mut failed = None;
         for _ in 0..2 {
             // A rename onto a directory that holds files fails, so a release another process
-            // finished is never replaced, and none is cleared before this has failed.
+            // finished is never replaced, and none is moved before this has failed.
             match tokio::fs::rename(staging, release).await {
-                Ok(()) => return Ok(true),
+                Ok(()) => {
+                    let _ = tokio::fs::remove_dir_all(&aside).await;
+                    return Ok(true);
+                }
                 Err(e) => failed = Some(e),
             }
             if base_publish::is_staged(release, commit, platform) {
@@ -190,8 +203,13 @@ impl Cache {
                 break;
             }
             // What is in the way is a release that failed its own check.
-            clear(release).await?;
+            clear(&aside).await?;
+            match tokio::fs::rename(release, &aside).await {
+                Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(io(release)(e)),
+                _ => {}
+            }
         }
+        let _ = tokio::fs::remove_dir_all(&aside).await;
         if let Some(e) = failed {
             return Err(io(release)(e));
         }
@@ -354,9 +372,11 @@ fn prune(
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
         if name.starts_with(STAGING) {
-            let changed = std::fs::metadata(&path)
-                .and_then(|m| m.modified())
-                .map_err(|e| failed(&path, e))?;
+            let changed = match std::fs::metadata(&path).and_then(|m| m.modified()) {
+                // Another process renamed its download into place since the listing.
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                changed => changed.map_err(|e| failed(&path, e))?,
+            };
             if now.duration_since(changed).is_ok_and(|age| age >= stale) {
                 removable.push(path);
             }

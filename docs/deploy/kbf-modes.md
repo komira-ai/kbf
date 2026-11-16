@@ -285,13 +285,17 @@ with `name` and `browser_download_url`); the default is
 `https://api.github.com/repos/komira-ai/kbf/releases`, kbf's own releases. The frontend reads it
 a page at a time (`?per_page=100&page=N`) until a release lists both the bundle's file name, which
 holds the commit it was built from, and `SHA256SUMS`; it downloads those two files (redirects
-followed, https only, except plain http to a loopback address) into `<DIR>/.fetch-<commit>/`,
-hashes the bundle against the digest that `SHA256SUMS` lists, and only then renames the directory
-to `<DIR>/<commit>/`. A download that stops or is not the listed bytes is removed and fails the
-start; a partial file is never where anything reads. Once `<DIR>/<commit>/` exists, a start
-fetches nothing. After a fetch the cache keeps the running release and the
-`--executor-base-tree-keep` (default 1) newest other releases, for a rollback of the frontend,
-and removes the rest and any download a stopped start left; it never touches files loose in
+followed, https only, except plain http to a loopback address) into
+`<DIR>/.fetch-<commit>-<instance>/`, a directory of this process alone (its executor instance
+id), hashes the bundle against the digest that `SHA256SUMS` lists, and only then renames the
+directory to `<DIR>/<commit>/`. A download that stops or is not the listed bytes is removed and
+fails the start; a partial file is never where anything reads. Once `<DIR>/<commit>/` exists, a
+start fetches nothing. Two frontends that share `<DIR>` may fetch one commit at once: the one
+that renames second keeps the other's checked release and removes its own download. After a
+fetch the cache keeps the running release and the `--executor-base-tree-keep` (default 1) newest
+other releases, for a rollback of the frontend, and removes the rest and the downloads of a
+stopped start once they are a day old (a younger one may be another frontend's, filling); it
+never touches files loose in
 `<DIR>` or names that are not a commit. `--executor-base-tree-url=""` fetches nothing: the files
 are expected in `<DIR>` as before, and a missing one is named by the publish.
 `--executor-base-tree-timeout-secs` (default 60) is how long a connect, a response head or the
