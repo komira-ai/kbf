@@ -35,6 +35,10 @@
 //! The REAPI listener answers the same readiness over `grpc.health.v1` ([`Checks`] is
 //! the one evaluation both use; see [`crate::grpc_health`]).
 //!
+//! A frontend's probes are asked in the background ([`Checks::in_background`], `background`):
+//! `/readyz` then reads the last answers and never waits on a dependency, and a check fails
+//! after `--readyz-fail-after` failed probes in a row.
+//!
 //! The checks beyond the flags are [`Probe`]s, each with a name and a bounded wait: the
 //! server's is its object store, a frontend's ([`crate::frontend`]) are its storage
 //! node, its state store and the storage map. Where the worker listener checks callers
@@ -58,10 +62,14 @@ use kbf_storage::Storage;
 use kbf_types::{Digest, DigestFunction};
 use serde::Serialize;
 
+pub use background::{FAIL_AFTER, PROBE_INTERVAL, Prober};
+
 use crate::api::JSON;
 use crate::farm::Farm;
 use crate::members::Members;
 use crate::{BUILD_COMMIT, SERVER_VERSION};
+
+mod background;
 
 /// The name, under the cache's key prefix, of the key the store probe reads. Nothing
 /// writes it.
@@ -188,6 +196,9 @@ pub trait Probe: Send + Sync {
 pub struct Checks {
     readiness: Arc<Readiness>,
     probes: Vec<(&'static str, Arc<dyn Probe>)>,
+    /// The probes added before [`Checks::in_background`], asked in the background; they come
+    /// before `probes` in the answer.
+    background: Option<Arc<Prober>>,
 }
 
 impl Checks {
@@ -197,7 +208,26 @@ impl Checks {
         Self {
             readiness,
             probes: Vec::new(),
+            background: None,
         }
+    }
+
+    /// These checks with the probes added so far asked in the background ([`Prober`]): a
+    /// check fails after `fail_after` failed probes in a row, and [`Checks::failing`] reads the
+    /// last answers instead of asking. The caller runs [`Checks::prober`]'s [`Prober::run`].
+    /// Probes added after this call are asked at every [`Checks::failing`], as before: those
+    /// that read memory, not a dependency, belong there.
+    #[must_use]
+    pub fn in_background(mut self, fail_after: u32) -> Self {
+        let probes = std::mem::take(&mut self.probes);
+        self.background = Some(Arc::new(Prober::new(probes, fail_after)));
+        self
+    }
+
+    /// The background prober, when [`Checks::in_background`] made one.
+    #[must_use]
+    pub fn prober(&self) -> Option<Arc<Prober>> {
+        self.background.clone()
     }
 
     /// These checks, and `probe` under the name `check`.
@@ -228,7 +258,8 @@ impl Checks {
     }
 
     /// The checks that fail now, in the order the route lists them; empty when the
-    /// server is ready. Asks each probe once.
+    /// server is ready. Asks each probe once, or, with the probes in the background, reads
+    /// their last answers.
     pub async fn failing(&self) -> Vec<Failing> {
         self.failing_except(&[]).await
     }
@@ -252,6 +283,9 @@ impl Checks {
         }
         if self.readiness.is_handed_over() {
             return failing;
+        }
+        if let Some(prober) = &self.background {
+            failing.extend(prober.failing(skip));
         }
         for (check, probe) in &self.probes {
             if skip.contains(check) {

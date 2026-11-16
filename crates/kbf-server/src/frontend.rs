@@ -167,7 +167,7 @@ use crate::executor::{Executor, Metrics as ExecutorMetrics, RunSource, Running};
 use crate::farm::Farm;
 use crate::front_maps::FrontMaps;
 use crate::grpc_health::{HealthService, WATCH_INTERVAL};
-use crate::health::{Checks, MapProbe, Readiness, StateProbe, StorageProbe};
+use crate::health::{Checks, MapProbe, Prober, Readiness, StateProbe, StorageProbe};
 use crate::listen::{Binder, Socket};
 use crate::members::{Handoff, Members};
 use crate::object_store::delivery::{Delivery, RegistrySource, Reports};
@@ -201,6 +201,8 @@ pub const ALLOWED: &[&str] = &[
     "api_token_file",
     "releases_dir",
     "readyz_store_timeout_ms",
+    "readyz_probe_interval_ms",
+    "readyz_fail_after",
     "worker_tls_cert",
     "worker_tls_key",
     "worker_client_ca",
@@ -651,6 +653,11 @@ impl FrontendHandle {
         }
         // Held until the frontend stops: the executor's trees are written over it.
         let _base_tree = base_tree::publish_all(self.base_tree).await?;
+        // The first answers of the readiness probes, before the listeners serve: `/readyz` is
+        // not `not probed yet` for the first interval of a frontend whose dependencies are up.
+        if let Some(prober) = self.ready.checks.prober() {
+            prober.round().await;
+        }
         let tasks = self
             .background
             .into_iter()
@@ -1011,7 +1018,13 @@ impl<'a> Prepared<'a> {
         // The rows a revocation writes, beside the file: a revoked daemon is refused here,
         // read again now that the slow steps of the start are done; `/readyz` waits for them.
         let peers = crate::deny_rows::denying(peers, members.as_ref());
-        let checks = Arc::new(crate::deny_rows::probing(checks, &peers));
+        // The probes of the storage, the state store and the map are asked in the background
+        // (`/readyz` reads their last answers); the deny rows are read from memory, so they are
+        // asked at each `/readyz`.
+        let checks = Arc::new(crate::deny_rows::probing(
+            checks.in_background(args.readyz_fail_after),
+            &peers,
+        ));
         let mut tls_sources: Vec<TlsSource> = listeners
             .reapi_tls
             .iter()
@@ -1127,6 +1140,7 @@ impl<'a> Prepared<'a> {
                 job_read: job_stats,
                 executor: executor.as_ref().map(|built| Arc::clone(&built.metrics)),
                 janitor: janitor_metrics,
+                readiness: checks.prober(),
             },
             Arc::clone(&farm),
         ));
@@ -1234,6 +1248,12 @@ impl<'a> Prepared<'a> {
         background.extend(enroll_renewal);
         background.extend(job_task);
         background.extend(janitor.map(|janitor| janitor.run().boxed()));
+        let probe_interval = Duration::from_millis(args.readyz_probe_interval_ms);
+        background.extend(
+            checks
+                .prober()
+                .map(|prober| prober.run(probe_interval).boxed()),
+        );
 
         let intake_polls = farm.intake_polls();
         let shutdown = shutdown()?;
@@ -1424,6 +1444,8 @@ struct Counters {
     executor: Option<Arc<ExecutorMetrics>>,
     /// The janitor of `cas/b/`.
     janitor: Option<Arc<JanitorMetrics>>,
+    /// The readiness probes asked in the background.
+    readiness: Option<Arc<Prober>>,
 }
 
 /// `GET /metrics`: what the service counts, in the Prometheus text format, history's
@@ -1444,6 +1466,7 @@ fn metrics_route(
         job_read,
         executor,
         janitor,
+        readiness,
     } = counters;
     let tls = Arc::new(tls);
     let render = move || {
@@ -1452,6 +1475,7 @@ fn metrics_route(
         let executor = executor.clone();
         let job_read = job_read.clone();
         let janitor = janitor.clone();
+        let readiness = readiness.clone();
         async move {
             let mut text = backend.render_metrics();
             if let Some(history) = history {
@@ -1465,6 +1489,9 @@ fn metrics_route(
             }
             if let Some(janitor) = janitor {
                 janitor.render(&mut text);
+            }
+            if let Some(readiness) = readiness {
+                readiness.render(&mut text);
             }
             crate::metrics::scrape_health(&mut text, members.as_ref()).await;
             kbf_tls::render_metrics(tls.iter(), &mut text);

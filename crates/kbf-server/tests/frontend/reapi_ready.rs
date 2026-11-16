@@ -75,15 +75,20 @@ async fn reapi_readiness_needs_a_connected_worker() {
 /// frontend whose storage node is gone is still 503, naming `storage` and not `no_worker`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reapi_readiness_keeps_the_checks_of_readyz() {
-    let (mut node, front) = ready_front(&["--readyz-store-timeout-ms=500"]).await;
+    let (mut node, front) = ready_front(&[
+        "--readyz-store-timeout-ms=500",
+        "--readyz-fail-after=1",
+        "--readyz-probe-interval-ms=20",
+    ])
+    .await;
     let _daemon = FakeDaemon::connect(front.worker, hello("node-a", 4, 8))
         .await
         .expect("registered");
     assert_eq!(get(front.api, "/readyz/reapi").await.0, 200);
 
     node.stop().await;
-    let (code, body) = get(front.api, "/readyz/reapi").await;
-    assert_eq!(code, 503, "{body}");
+    // The probes are asked in the background: the change shows within a few intervals.
+    let body = reapi_until(front.api, 503).await;
     assert_eq!(failing(&body), ["storage"], "{body}");
 }
 

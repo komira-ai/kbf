@@ -1483,8 +1483,20 @@ otherwise; the body lists each failing check and why:
 | `store` | the object store does not answer a one-byte read of the key `<prefix>readyz-probe` within `--readyz-store-timeout-ms` (default 2000; it bounds the gRPC health service's probe too), or answers with an error. The probe only reads: no poll writes, deletes or lists. Nothing writes that key, so "not found" is the expected answer and passes, as does the object's bytes or a range past its end |
 | `deny_rows` | only where the worker listener checks callers against the state store's deny rows (worker mTLS or `--proxy-auth-file`, with `--state-store`): the listener's copy of the rows cannot be used, because no read has found them since the start or the newest is older than three sweeps (`DENY_SNAPSHOT_SWEEPS` beats), so the listener refuses every call `UNAVAILABLE` ("When the rows cannot be read", in the enrollment section above). It reads no store |
 
-`version` and `commit` are those of `GET /v1/nodes`' `server` field. Each `/readyz`
-makes one read of the store, so poll it at the interval the front needs, not faster.
+`version` and `commit` are those of `GET /v1/nodes`' `server` field. On `kbf-server` each
+`/readyz` makes one read of the store, so poll it at the interval the front needs, not faster.
+
+A frontend (`kbf frontend`) answers `/readyz` and the gRPC health service from the last
+answers of its probes (`storage`, `state_store`, `map`, `executor`), which it asks in the
+background, all at the same time and each every `--readyz-probe-interval-ms` (default 1000)
+after its last answer: an answer costs a lookup, whatever a dependency is doing, so a front's
+health check never times out on a slow store. A check fails after `--readyz-fail-after`
+probes (default 3) have failed in a row, and passes at the first probe that passes; until a
+probe has passed, or that many have failed, it fails with the reason `not probed yet`. The
+first probes are asked before the listeners serve. `deny_rows` is read from memory and is asked at
+each `/readyz`. Every change of a check between failing and passing is logged (`readiness: the
+check fails`, with the check and the reason; `readiness: the check passes`) and counted in
+`kbf_readyz_transitions_total{check,to}`.
 
 **`GET /readyz/reapi`**: the readiness a load balancer asks for the REAPI cluster. It is
 `/readyz` with one more check, and has the same body, status codes and (no) token. A
@@ -1726,6 +1738,7 @@ blobs clients upload are kept in packs, and these counters follow; without the f
 | `kbf_pack_find_missing_asked_total`, `kbf_pack_find_missing_found_total` | counter | digests put to the pack index by FindMissingBlobs, by Execute's check of an action's inputs and by the check of an action result's blobs (written, or hit), and the ones it had (the rest go on to the storage nodes) |
 | `kbf_pack_reads_total`, `kbf_pack_read_bytes_total` | counter | blobs served from a pack (a client's read or Execute's own), and their bytes |
 | `kbf_pack_read_fallbacks_total` | counter | reads of a blob the pack index lacks, answered by the storage nodes: a blob uploaded before packs were on. Falling to 0 over time is how a farm sees that nothing is left on the nodes to find |
+| `kbf_readyz_transitions_total{check,to}` | counter | a frontend's readiness checks: the times each went to failing (`to="failing"`; also from `not probed yet`) or to passing (`to="ready"`, the first pass included). A check that flaps shows here, with its reason in the log |
 | `kbf_pack_read_lost_total` | counter | reads of a blob the index has and whose pack the store lacks, answered by the storage nodes (alert on any) |
 | `kbf_pack_read_errors_total` | counter | reads that failed because the pack index or the pack store could not answer |
 | `kbf_pack_digest_mismatches_total` | counter | reads of a blob whose pack held other bytes than its digest: never served, UNAVAILABLE (alert on any) |

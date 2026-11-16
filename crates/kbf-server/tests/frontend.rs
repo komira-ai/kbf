@@ -163,6 +163,22 @@ impl Front {
     }
 }
 
+/// [`get`] of `path` until it answers `code`: a frontend asks its readiness probes in the
+/// background, so a change in a dependency shows within an interval or two.
+async fn get_until(api: SocketAddr, path: &str, code: u16) -> (u16, Value) {
+    loop {
+        let got = get(api, path).await;
+        if got.0 == code {
+            return got;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// The flags that make a frontend's readiness probes fail a check at the first failed probe
+/// and ask again every 20 ms.
+const QUICK_PROBES: [&str; 2] = ["--readyz-fail-after=1", "--readyz-probe-interval-ms=20"];
+
 async fn get(api: SocketAddr, path: &str) -> (u16, Value) {
     let mut stream = TcpStream::connect(api).await.expect("connect to the API");
     let request = format!("GET {path} HTTP/1.1\r\nHost: kbf\r\nConnection: close\r\n\r\n");
@@ -391,8 +407,9 @@ async fn execute_reads_and_writes_the_storage_node() {
 async fn readyz_follows_the_storage_node() {
     let mut node = Node::start().await;
     let url = format!("--storage=http://{}", node.addr);
-    let front =
-        Front::start(&flags(&[&url, "--readyz-store-timeout-ms=500"]).expect("flags")).await;
+    let mut more = vec![url.as_str(), "--readyz-store-timeout-ms=500"];
+    more.extend(QUICK_PROBES);
+    let front = Front::start(&flags(&more).expect("flags")).await;
     let mut health = HealthClient::new(
         Channel::from_shared(format!("http://{}", front.reapi))
             .unwrap()
@@ -418,7 +435,7 @@ async fn readyz_follows_the_storage_node() {
     assert_eq!(ask(&mut health).await, serving(ServingStatus::Serving));
 
     node.stop().await;
-    let (code, body) = get(front.api, "/readyz").await;
+    let (code, body) = get_until(front.api, "/readyz", 503).await;
     assert_eq!(code, 503, "{body}");
     assert_eq!(failing(&body), ["storage"], "{body}");
     assert!(
@@ -446,8 +463,9 @@ async fn a_storage_node_that_never_answers_is_not_ready() {
         }
     });
     let url = format!("--storage=http://{addr}");
-    let front =
-        Front::start(&flags(&[&url, "--readyz-store-timeout-ms=200"]).expect("flags")).await;
+    let mut more = vec![url.as_str(), "--readyz-store-timeout-ms=200"];
+    more.extend(QUICK_PROBES);
+    let front = Front::start(&flags(&more).expect("flags")).await;
     let started = std::time::Instant::now();
     let (code, body) = get(front.api, "/readyz").await;
     assert_eq!(code, 503, "{body}");
@@ -1035,6 +1053,7 @@ async fn tls_node(pki: &Pki, names: &[&str], dir: &str) -> SocketAddr {
 async fn tls_front(port: u16, client: &[String]) -> Front {
     let url = format!("--storage=https://localhost:{port}");
     let mut more = vec![url.as_str(), "--readyz-store-timeout-ms=2000"];
+    more.extend(QUICK_PROBES);
     more.extend(client.iter().map(String::as_str));
     Front::start(&flags(&more).expect("flags")).await
 }
