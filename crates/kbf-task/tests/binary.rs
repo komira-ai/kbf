@@ -103,3 +103,75 @@ fn the_binary_runs_the_relay_and_the_first_process() {
     );
     assert_eq!(run(&["--sandbox-init"]), (Some(2), Vec::new()));
 }
+
+/// Catches: the binary not running `--materialize-work` against the current directory with relative
+/// paths: started with its working directory a scratch `exec/` whose `.kbf-tree` and `.kbf-out` are
+/// symlinks to the tree and the put directory, it copies the tree's `work` into `exec/work`, runs the
+/// Command there, exits 0 and commits `pack` into the put directory. Linux only, like the other
+/// tests that run a Command through the binary.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_binary_materializes_the_tree_into_its_working_directory_and_commits_pack() {
+    use kbf_proto::reapi::{Action, Command as Cmd};
+    use prost::Message as _;
+    use sha2::{Digest as _, Sha256};
+
+    let base =
+        kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "kbf-task-binary-materialize");
+    let (tree, put, exec) = (base.join("tree"), base.join("put"), base.join("exec"));
+    for dir in [&tree, &put, &exec] {
+        std::fs::create_dir(dir).expect("dir");
+    }
+    std::fs::create_dir_all(tree.join(".kbf")).expect(".kbf");
+    std::fs::create_dir(tree.join("work")).expect("work");
+    std::fs::write(tree.join("work/data"), b"hi\n").expect("data");
+    let digest = |bytes: &[u8]| kbf_proto::reapi::Digest {
+        hash: hex::encode(Sha256::digest(bytes)),
+        size_bytes: i64::try_from(bytes.len()).expect("size"),
+    };
+    let command = Cmd {
+        arguments: ["cp", "data", "out"].map(str::to_owned).to_vec(),
+        output_paths: vec!["out".to_owned()],
+        ..Default::default()
+    }
+    .encode_to_vec();
+    let action = Action {
+        command_digest: Some(digest(&command)),
+        input_root_digest: Some(digest(b"input root")),
+        ..Default::default()
+    }
+    .encode_to_vec();
+    std::fs::write(tree.join(".kbf/command"), &command).expect("command");
+    std::fs::write(tree.join(".kbf/action"), &action).expect("action");
+    std::os::unix::fs::symlink(&tree, exec.join(".kbf-tree")).expect("tree mount");
+    std::os::unix::fs::symlink(&put, exec.join(".kbf-out")).expect("put mount");
+    let id = digest(&action);
+
+    let out = Command::new(env!("CARGO_BIN_EXE_kbf-task"))
+        .current_dir(&exec)
+        .args([
+            "--materialize-work=.kbf-tree",
+            "--stage-and-commit",
+            "--out-dir",
+            ".kbf-out",
+            "--action",
+            &format!("{}/{}", id.hash, id.size_bytes),
+            "--lease",
+            "lease-1",
+            "--deadline-ms",
+            "60000",
+            "--object-format",
+            "one-pass",
+        ])
+        .output()
+        .expect("kbf-task runs");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    assert_eq!(std::fs::read(exec.join("work/out")).expect("out"), b"hi\n");
+    assert!(put.join("pack").is_file());
+    assert_eq!(
+        std::fs::read(tree.join("work/data")).expect("data"),
+        b"hi\n"
+    );
+    assert!(!tree.join("work/out").exists());
+}

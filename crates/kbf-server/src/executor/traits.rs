@@ -13,6 +13,7 @@ use std::time::Duration;
 use kbf_proto::reapi::{ActionResult, Digest};
 use kbf_types::LeaseId;
 
+use crate::executor::mac::System;
 use crate::executor::task::{PackKey, Secret};
 
 /// The bounds the frontend holds a pack an untrusted task wrote to.
@@ -161,6 +162,9 @@ pub struct ActionFacts {
     pub image: String,
     /// The action's timeout; `None` when it names none, and the executor applies its own.
     pub timeout: Option<Duration>,
+    /// The system the action's platform asks for: a Linux host, or a Mac
+    /// ([`crate::executor::mac`]).
+    pub system: System,
 }
 
 /// What a task reads its inputs with.

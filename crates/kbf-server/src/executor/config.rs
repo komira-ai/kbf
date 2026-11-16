@@ -10,6 +10,7 @@ use kbf_sched::fence::{LEADER_LEASE_MARGIN, LEASE_GRACE, SELF_FENCE, START_GRACE
 use ring::rand::{SecureRandom, SystemRandom};
 
 use crate::config::MAX_HEARTBEAT_INTERVAL_MS;
+use crate::executor::mac::{MAC_ARCH, MAC_DRIVER, MAC_OS, MacPool, MacPoolError, WorkerOs};
 use crate::executor::out::TaskOut;
 use crate::executor::task::Delivery;
 use crate::worker::PROTOCOL_VERSION;
@@ -175,6 +176,9 @@ pub struct Config {
     /// Where a task's outputs go (`--task-out-mode`, `--task-out-root`). A job of a put
     /// directory has no network, whatever [`Config::network`] says.
     pub task_out: TaskOut,
+    /// The Macs (`--executor-mac-*`): `None`, the default, registers no Mac worker, and the farm
+    /// places no Mac action on this executor ([`crate::executor::mac`]).
+    pub mac: Option<MacPool>,
 }
 
 /// Why a [`Config`] is refused.
@@ -235,6 +239,9 @@ pub enum ConfigError {
     /// later change of one flag.
     #[error("--executor-allow-open-network is only for --executor-network open: drop it")]
     OpenNetworkUnused,
+    /// The pool of Macs is not one.
+    #[error("{0}")]
+    Mac(#[from] MacPoolError),
 }
 
 impl Config {
@@ -276,6 +283,7 @@ impl Config {
             network: Network::AllowList,
             allow_open_network: false,
             task_out: TaskOut::Presigned,
+            mac: None,
         }
     }
 
@@ -372,10 +380,14 @@ impl Config {
                 ConfigError::OpenNetworkUnused,
             ),
         ];
-        checks
+        let first = checks
             .into_iter()
-            .find_map(|(ok, error)| (!ok).then_some(error))
-            .map_or(Ok(()), Err)
+            .find_map(|(ok, error)| (!ok).then_some(error));
+        match (first, &self.mac) {
+            (Some(error), _) => Err(error),
+            (None, Some(mac)) => Ok(mac.validate()?),
+            (None, None) => Ok(()),
+        }
     }
 
     /// What a job asks of its host beside resources: the system and the architecture the
@@ -421,27 +433,40 @@ impl Config {
         timeout + self.run_margin
     }
 
-    /// The `Hello` of a virtual worker: what a real node of the shape would report, and no
-    /// more. Its drivers are [`DRIVERS`]: `action` and `whole_machine` leases are placed on it,
-    /// a VM lease is not.
-    pub(super) fn hello(&self, node: &str, instance: &str, predecessor: &str) -> Hello {
+    /// The `Hello` of a virtual worker of `os`: what a real node of the shape would report, and
+    /// no more. A Linux worker's drivers are [`DRIVERS`]: `action` and `whole_machine` leases
+    /// are placed on it, a VM lease is not. A Mac worker reports `os=macos`, `arch=arm64` and the
+    /// one driver `native`: only `action` leases are placed on it.
+    pub(super) fn hello(
+        &self,
+        os: WorkerOs,
+        node: &str,
+        instance: &str,
+        predecessor: &str,
+    ) -> Hello {
         let entry = |key: &str, value: String| Capability {
             key: key.to_owned(),
             value,
         };
+        let (arch, drivers, system): (&str, &[&str], &str) = match os {
+            WorkerOs::Linux => (&self.arch, &DRIVERS, "linux"),
+            WorkerOs::Mac => (MAC_ARCH, &[MAC_DRIVER], MAC_OS),
+        };
+        let mut capabilities = vec![
+            entry("action_slots", self.slots.to_string()),
+            entry("arch", arch.to_owned()),
+            entry("cpus", (self.cpu_millis / 1_000).to_string()),
+        ];
+        capabilities.extend(drivers.iter().map(|d| entry("drivers", (*d).to_owned())));
+        capabilities.extend([
+            entry("mem_gib", self.booked_memory_gib().to_string()),
+            entry("os", system.to_owned()),
+        ]);
         Hello {
             protocol_version: PROTOCOL_VERSION,
             node_id: node.to_owned(),
             daemon_version: "kbf-server executor".to_owned(),
-            capabilities: vec![
-                entry("action_slots", self.slots.to_string()),
-                entry("arch", self.arch.clone()),
-                entry("cpus", (self.cpu_millis / 1_000).to_string()),
-                entry("drivers", DRIVERS[0].to_owned()),
-                entry("drivers", DRIVERS[1].to_owned()),
-                entry("mem_gib", self.booked_memory_gib().to_string()),
-                entry("os", "linux".to_owned()),
-            ],
+            capabilities,
             instance_id: instance.to_owned(),
             predecessor_instance_id: predecessor.to_owned(),
             ..Hello::default()

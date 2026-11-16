@@ -199,7 +199,7 @@ fn one_pass_cli(root: &Path, action: &Digest, out: &Path) -> Cli {
 
 /// The manifest and the entries of the one-pass object `object`, each record checked against
 /// its entry's CRC and digest.
-pub(super) fn read_one_pass(object: &[u8]) -> (TaskManifest, Vec<kbf_task_pack::one_pass::Entry>) {
+pub(crate) fn read_one_pass(object: &[u8]) -> (TaskManifest, Vec<kbf_task_pack::one_pass::Entry>) {
     let (manifest, entries, _) = read_one_pass_files(object);
     (manifest, entries)
 }

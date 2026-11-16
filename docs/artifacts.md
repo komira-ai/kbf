@@ -834,7 +834,7 @@ sudo installer -pkg kbf-installer-<commit>-darwin-arm64.pkg -target /
 
 ## The macOS kbf-task bundle
 
-The bundle is built and released, and no executor job runs it today: `kbf-task` is a tree job only (`--tree --stage-and-commit --out-dir`, a put directory), `kbf-server`'s executor asks every job for a host of `os=linux` in a container (`Config::constraints` in `crates/kbf-server/src/executor/config.rs`), and the Mac side of a put-directory job (`--materialize-work`, a put directory at `/work/.kbf-out`; `docs/design/jobs-on-jobscheduler-and-tierstore.md`, section 6) is designed and not built, so the farm places no task on a Mac until it is. It is placed by digest, not as a layer of the toolchain bundle. The `darwin-arm64` job makes that bundle, and no other job does:
+The bundle is built and released, and it is the image of a Mac job: `kbf-server`'s executor sends an action that asks for macOS to a Mac worker (`--executor-mac-hosts`, none by default) and submits it with this bundle's manifest digest as the job's image (`--executor-mac-task-bundle`), its entrypoint `kbf-task` run as `--materialize-work=.kbf-tree --stage-and-commit --out-dir .kbf-out` (`crates/kbf-server/src/executor/mac.rs`, `crates/kbf-task/src/materialize.rs`; `docs/design/actions-as-jobs.md`, section 14). No Mac runs one yet: the job service at kbf's pin takes no native job start from the job API and no mount on a Mac (section 14 says what it lacks). It is placed by digest, not as a layer of the toolchain bundle. The `darwin-arm64` job makes that bundle, and no other job does:
 
 | Asset | What it is |
 |---|---|

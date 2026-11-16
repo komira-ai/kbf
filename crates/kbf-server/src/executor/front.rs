@@ -24,7 +24,9 @@
 //!   must be, by digest, the base the executor serves (an action that names none uses it); and
 //!   the timeout. The image a run is launched from is the kbf image, built from that base and
 //!   set by the operator: it keeps its `ENTRYPOINT` (the task tool), so no action's image is
-//!   launched and no entrypoint is looked for.
+//!   launched and no entrypoint is looked for. The platform's system is read too (`OSFamily`
+//!   or `os`, and a Mac's `os_version`), as the farm reads it: a Mac action becomes a Mac job
+//!   ([`crate::executor::mac`]).
 
 use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
@@ -39,6 +41,7 @@ use kbf_proto::reapi::{self, Action, Command, Digest};
 use kbf_types::{DigestFunction, ImageRef, LeaseId};
 use std::sync::Arc;
 
+use crate::executor::mac::System;
 use crate::executor::task::{PackKey, Secret, build_id};
 use crate::executor::traits::{
     ActionFacts, Ingest, Ingested, Inputs, InputsError, MintError, Presign, PresignError,
@@ -539,15 +542,12 @@ impl Inputs for Front {
             .ok_or_else(|| InputsError::Invalid("the action names no command".to_owned()))?;
         let command = cas_digest(command).map_err(InputsError::Invalid)?;
         let command: Command = self.read("command", &command).await?;
-        check_base(
-            &action,
-            &command,
-            &self.parts.base_image,
-            &self.parts.kbf_image,
-        )?;
+        let platform = platform_of(&action, &command);
+        check_base(platform, &self.parts.base_image, &self.parts.kbf_image)?;
         Ok(ActionFacts {
             image: self.parts.kbf_image.to_string(),
             timeout: timeout_of(&action)?,
+            system: System::of(platform).map_err(InputsError::Invalid)?,
         })
     }
 
@@ -575,14 +575,11 @@ impl Inputs for Front {
 /// serves. The property is read from the Action's platform or else the Command's; one that
 /// names none means the base. Only the manifest digest is compared: two spellings of one digest
 /// are one image. The refusal names both images, and the kbf image the run would use.
-#[allow(deprecated)]
 fn check_base(
-    action: &Action,
-    command: &Command,
+    platform: Option<&reapi::Platform>,
     base: &ImageRef,
     kbf: &ImageRef,
 ) -> Result<(), InputsError> {
-    let platform: Option<&reapi::Platform> = action.platform.as_ref().or(command.platform.as_ref());
     let named = platform
         .and_then(|p| p.properties.iter().find(|p| p.name == IMAGE_PROPERTY))
         .map(|p| p.value.as_str());
@@ -598,6 +595,20 @@ fn check_base(
              it): name the served base, or none"
         ))),
     }
+}
+
+/// The platform of `action` if it names any property, or else of its `command`: as the farm
+/// reads it (`kbf-front`'s `execution.rs`), so the system the executor runs an action on is the
+/// one the farm placed it for.
+// The Command's platform is deprecated in REAPI 2.2 in favour of the Action's, and clients that
+// predate it still send only the Command's: both are read, the Action's first.
+#[allow(deprecated)]
+fn platform_of<'a>(action: &'a Action, command: &'a Command) -> Option<&'a reapi::Platform> {
+    action
+        .platform
+        .as_ref()
+        .filter(|p| !p.properties.is_empty())
+        .or(command.platform.as_ref())
 }
 
 /// The action's timeout; none if it names none or zero.

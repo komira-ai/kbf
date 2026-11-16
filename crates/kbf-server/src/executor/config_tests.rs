@@ -263,7 +263,12 @@ fn a_run_is_capped_as_the_container_driver_caps_it() {
 /// cap, or that carries the wrong capacity.
 #[test]
 fn the_hello_reports_a_container_and_whole_machine_host_and_nothing_else() {
-    let hello = base().hello("js:node1", "inst", "pred");
+    let hello = base().hello(
+        crate::executor::mac::WorkerOs::Linux,
+        "js:node1",
+        "inst",
+        "pred",
+    );
     let entries: Vec<(&str, &str)> = hello
         .capabilities
         .iter()
@@ -373,3 +378,80 @@ fn each_config_gets_an_instance_id_of_its_own() {
     assert_ne!(one.instance, two.instance);
     assert!(one.instance.chars().all(|c| c.is_ascii_hexdigit()));
 }
+
+/// Asserts the Hello of a Mac worker: `os=macos`, `arch=arm64` whatever the Linux arch, and
+/// the one driver `native`, so the farm places a Mac action on it and no `whole_machine` lease;
+/// and that the farm reads it and finds a Mac action's request met and a Linux one's not.
+/// Catches a Mac worker that reports Linux, or that offers a whole machine.
+#[test]
+fn a_mac_workers_hello_reports_a_native_arm64_mac() {
+    let cfg = Config {
+        arch: "x86_64".to_owned(),
+        ..base()
+    };
+    let hello = cfg.hello(
+        crate::executor::mac::WorkerOs::Mac,
+        "js-mac:node1-0",
+        "inst",
+        "",
+    );
+    let entries: Vec<(&str, &str)> = hello
+        .capabilities
+        .iter()
+        .map(|c| (c.key.as_str(), c.value.as_str()))
+        .collect();
+    assert_eq!(
+        entries,
+        [
+            ("action_slots", "8"),
+            ("arch", "arm64"),
+            ("cpus", "16"),
+            ("drivers", "native"),
+            ("mem_gib", "40"),
+            ("os", "macos"),
+        ]
+    );
+    let reported = crate::worker::reported(&hello, crate::worker::HostFloor::DEFAULT)
+        .expect("the farm reads the hello");
+    let mac = kbf_caps::Request::from_platform([("OSFamily", "macos")]).expect("mac");
+    let linux = kbf_caps::Request::from_platform([("OSFamily", "linux")]).expect("linux");
+    assert!(mac.matches(&reported.caps), "a Mac action is placed on it");
+    assert!(!linux.matches(&reported.caps), "a Linux action is not");
+    assert_eq!(reported.caps.drivers, ["native".to_owned()].into());
+}
+
+/// Asserts a config with a pool of Macs is checked by the pool's rules too, after its own:
+/// a valid pool passes, an invalid one is refused naming it, and a config broken elsewhere is
+/// refused for that first.
+#[test]
+fn a_pool_of_macs_is_checked_with_the_config() {
+    let mac = crate::executor::MacPool {
+        hosts: 1,
+        bundle: BUNDLE.to_owned(),
+        os_version: 26,
+        roots: None,
+    };
+    let with = |mac| Config {
+        mac: Some(mac),
+        ..base()
+    };
+    assert_eq!(with(mac.clone()).validate(), Ok(()));
+    let none = crate::executor::MacPool {
+        hosts: 0,
+        ..mac.clone()
+    };
+    assert_eq!(
+        with(none).validate(),
+        Err(ConfigError::Mac(crate::executor::MacPoolError::NoHosts))
+    );
+    let broken = Config {
+        hosts: 0,
+        ..with(mac)
+    };
+    assert_eq!(broken.validate(), Err(ConfigError::NoHosts));
+    assert_eq!(base().mac, None);
+}
+
+/// The macOS `kbf-task` bundle of a release, by its manifest digest.
+const BUNDLE: &str =
+    "kbf-task@sha256:9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a";

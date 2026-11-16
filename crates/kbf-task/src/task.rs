@@ -1,8 +1,9 @@
 //! The task tool's driver: the flags, the order of the steps, and the exit code of each way they
 //! can fail.
 //!
-//! [`main_with`] runs a tree job ([`crate::tree`]): the Action, the Command and the input root
-//! are read from the job's root, the Command runs there, its outputs are collected into the run's
+//! [`main_with`] runs a tree job ([`crate::tree`]) or, with `--materialize-work`, a materialized
+//! job ([`crate::materialize`]): the Action, the Command and the input root
+//! are read from the job's root (or the mounted tree), the Command runs there, its outputs are collected into the run's
 //! one object as they are read ([`collected`]), and the object is committed into the put
 //! directory ([`crate::out_dir`]).
 //!
@@ -15,7 +16,7 @@
 //! |------|---------|
 //! | 0 | the action ran (whatever its exit code, a timeout included) and its object was committed |
 //! | 2 | the flags are wrong (clap) |
-//! | 10 | `.kbf/action` or `.kbf/command` could not be read, is not the blob its digest names (the Action's is `--action`) or does not decode, or `work` is not a directory |
+//! | 10 | `.kbf/action` or `.kbf/command` could not be read, is not the blob its digest names (the Action's is `--action`) or does not decode, or `work` is not a directory; with `--materialize-work`, also `work` could not be copied into the job (it exists, or a file in the tree cannot be read or is not a regular file, directory or symlink) |
 //! | 11 | run-start: the Command could not be started (bad paths, no program, a `kbf-network` property other than `allow`), or the run's `private/` home, tmp and cache directories, or its run directory `.kbf-run` (an existing one is refused), could not be made or opened |
 //! | 12 | pack: the outputs could not be collected, or made a manifest or object the frontend would refuse (`invalid-manifest`, `invalid-pack`, `output-too-large`) |
 //! | 13 | put: an object could not be written to the put directory or its commit `rename` failed |
@@ -60,8 +61,11 @@ pub const EXIT_NO_CONFINE: u8 = 15;
 /// `kbf-task`: runs one build action inside a job and commits its one object into the put
 /// directory.
 ///
-/// A tree job is the only kind: the job's root file system is the action's tree, which the
-/// frontend wrote, and the job has no network, so the tool reads no grant and sends nothing. A
+/// There are two kinds of job, and exactly one of `--tree` and `--materialize-work` is given.
+/// In a tree job the job's root file system is the action's tree, which the frontend wrote; in a
+/// materialized job (a Mac, which has no root file system to replace) the tree is mounted
+/// read-only and its `work` is copied into the current directory. Either way the job has no
+/// network, so the tool reads no grant and sends nothing. A
 /// frontend of an earlier release that sends the flags of the presigned mode (`--grant-url`,
 /// `--pack-url-file` and the others) is refused by the flag parser (exit 2).
 ///
@@ -85,9 +89,21 @@ pub struct Cli {
         num_args = 0..=1,
         require_equals = true,
         default_missing_value = "/",
-        required = true,
+        required_unless_present = "materialize_work",
     )]
     pub tree: Option<PathBuf>,
+    /// Run the materialized job: the Action and Command are read from `<TREE>/.kbf`, the tree's
+    /// `<TREE>/work` is copied (cloned where the file system can) into `./work`, which is the
+    /// input root, and the run directory is `./.kbf-run`, with `.` the current directory (see the
+    /// `materialize` module). The tree is never written. Not with `--tree`; the tree must follow
+    /// `=`.
+    #[arg(
+        long,
+        value_name = "TREE",
+        require_equals = true,
+        conflicts_with = "tree"
+    )]
+    pub materialize_work: Option<PathBuf>,
     /// Write the run's object into the put directory `--out-dir`: it is written as
     /// `pack.part`, renamed to `pack.sha256-<hex>.part`, then committed by renaming it to `pack`
     /// (see `crate::out_dir`). It is the only way to store an object, so the flag is required.
@@ -316,7 +332,10 @@ pub(crate) use crate::task_util::{deadline, digest_of, millis, named, stdio};
 /// Runs the task the flags describe and turns the outcome into the process exit code (see the
 /// module documentation). A failure is written to standard error.
 pub async fn main_with(cli: &Cli) -> ExitCode {
-    crate::tree::finish_out_dir(cli, cli.root()).await
+    match cli.materialize_work.as_deref() {
+        Some(tree) => crate::materialize::finish(cli, tree, Path::new(".")).await,
+        None => crate::tree::finish_out_dir(cli, cli.root()).await,
+    }
 }
 
 /// The exit code of a run's outcome; a failure is written to standard error first.

@@ -45,6 +45,7 @@ impl FakeInputs {
             facts: Mutex::new(Ok(ActionFacts {
                 image: IMAGE.to_owned(),
                 timeout: Some(Duration::from_secs(60)),
+                system: kbf_server::executor::System::Linux,
             })),
             grant: Mutex::new(Ok(ReadGrant {
                 url: "https://grant.test:9400".to_owned(),
@@ -498,6 +499,12 @@ impl Rig {
 
     /// Submits the action of `tag` as a lease of `kind`.
     pub fn submit_kind(&self, tag: u8, kind: LeaseKind) -> Caller {
+        self.submit_needing(tag, kind, kbf_caps::Request::default())
+    }
+
+    /// Submits the action of `tag` as a lease of `kind` that the farm places only on a worker
+    /// that meets `needs`.
+    pub fn submit_needing(&self, tag: u8, kind: LeaseKind, needs: kbf_caps::Request) -> Caller {
         let request = Request {
             key: ActionKey {
                 instance: "main".to_owned(),
@@ -511,7 +518,7 @@ impl Rig {
             do_not_cache: false,
             whole_worker: false,
             pin: None,
-            needs: kbf_caps::Request::default(),
+            needs,
         };
         let ticket = self
             .farm

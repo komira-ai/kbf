@@ -142,6 +142,7 @@ impl Inputs for Timed {
         Ok(ActionFacts {
             image: format!("registry.test/app@sha256:{DIGEST}"),
             timeout: self.0,
+            system: crate::executor::System::Linux,
         })
     }
 
@@ -189,7 +190,14 @@ async fn prepared(
         deps: &deps,
         twin: &harness.twin,
     };
-    prepare(&ctx.preparer(), LeaseId::new(7, 8), &action(), booking).await
+    prepare(
+        &ctx.preparer(),
+        crate::executor::mac::WorkerOs::Linux,
+        LeaseId::new(7, 8),
+        &action(),
+        booking,
+    )
+    .await
 }
 
 /// Catches the job's wall limit being a lease's or the executor's longest run instead of the

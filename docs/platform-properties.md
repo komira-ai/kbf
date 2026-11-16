@@ -499,7 +499,9 @@ clause. The line for a denied Command is `kbf-task: action <digest>: network: sa
 open, so DNS lookups still go out through the system's resolver, and a connect to the node's own
 non-loopback address was allowed under the denial on the macOS runner. The profile does not limit
 other writes, helper daemons reached by `mach-lookup` and other services on the node stay reachable, and a credential given as a flag value (`--insecure-argv-secrets`) stays in this tool's
-argv. No macOS `kbf-task` is released yet. On a system that is neither Linux nor macOS there is
+argv. The macOS `kbf-task` is released only as the bundle a Mac job runs
+([artifacts.md](artifacts.md#the-macos-kbf-task-bundle)), and runs the Command directly there: the
+agent's sandbox is its sandbox, and this profile is not applied. On a system that is neither Linux nor macOS there is
 no confine, and a Command denied the network is refused there (exit 15).
 
 ## `network`

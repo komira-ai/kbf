@@ -774,3 +774,81 @@ fn the_poll_interval_outside_its_range_is_refused() {
         Duration::from_millis(100)
     );
 }
+
+/// Asserts the Macs' flags: none by default; `--executor-mac-hosts` with
+/// `--executor-mac-task-bundle` becomes the pool, the least macOS 26 unless `--executor-mac-os-version` says otherwise and
+/// the roots `--task-out-root`'s unless `--executor-mac-task-out-root` names others; and each
+/// refusal names its flag: hosts with no bundle, a bundle or Mac root with no hosts, a bundle
+/// not pinned by digest, a root that is not one, and a least macOS of 0.
+#[test]
+fn the_mac_flags_become_the_pool_of_macs() {
+    let mac = |more: &[&str]| {
+        let flags = js_with(more).expect("flags");
+        flags.executor.js.expect("js-agent").config.mac
+    };
+    assert_eq!(mac(&[]), None);
+    let task = format!("--executor-mac-task-bundle={BUNDLE}");
+    let task = task.as_str();
+    assert_eq!(
+        mac(&["--executor-mac-hosts=2", task]),
+        Some(MacPool {
+            hosts: 2,
+            bundle: BUNDLE.to_owned(),
+            os_version: DEFAULT_MAC_OS_VERSION,
+            roots: None,
+        })
+    );
+    let own = mac(&[
+        "--executor-mac-hosts=1",
+        task,
+        "--executor-mac-os-version=27",
+        "--executor-mac-task-out-root=/Volumes/ts/put",
+    ])
+    .expect("a pool");
+    assert_eq!(own.os_version, 27);
+    assert_eq!(
+        own.roots,
+        Some(PutDirRoots::new("/Volumes/ts/put").expect("roots"))
+    );
+    let first = |why: String| why.lines().next().unwrap_or_default().to_owned();
+    assert_eq!(
+        first(refused(&["--executor-mac-hosts=1"])),
+        "error: --executor-mac-hosts needs --executor-mac-task-bundle, the release's kbf-task \
+         bundle for the Macs"
+    );
+    for stray in [task, "--executor-mac-task-out-root=/Volumes/ts/put"] {
+        assert_eq!(
+            first(refused(&[stray])),
+            "error: --executor-mac-task-bundle and --executor-mac-task-out-root are for \
+             --executor-mac-hosts: with no Mac worker they would do nothing",
+            "{stray}"
+        );
+    }
+    assert_eq!(
+        first(refused(&[
+            "--executor-mac-hosts=1",
+            "--executor-mac-task-bundle=kbf-task"
+        ])),
+        "error: --executor js-agent: the Macs' task bundle \"kbf-task\" is not pinned by an \
+         @sha256 digest (NAME@sha256:HEX)"
+    );
+    let root = refused(&[
+        "--executor-mac-hosts=1",
+        task,
+        "--executor-mac-task-out-root=put",
+    ]);
+    assert!(
+        first(root.clone()).starts_with("error: --executor-mac-task-out-root: "),
+        "{root}"
+    );
+    let zero = refused(&[
+        "--executor-mac-hosts=1",
+        task,
+        "--executor-mac-os-version=0",
+    ]);
+    assert!(zero.contains("--executor-mac-os-version"), "{zero}");
+}
+
+/// The macOS `kbf-task` bundle of a release, by its manifest digest.
+const BUNDLE: &str =
+    "kbf-task@sha256:9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a";

@@ -4,7 +4,9 @@
 //! # How it sits in the server
 //!
 //! The scheduler core knows nothing of this. The executor registers virtual workers, `js:<frontend>-<n>`,
-//! each a node of the declared shape whose drivers are `container` and `native-whole-machine`,
+//! each a node of the declared shape whose drivers are `container` and `native-whole-machine`
+//! (and, with `--executor-mac-hosts`, Mac workers `js-mac:<frontend>-<n>` whose one driver is
+//! `native`, [`mac`]),
 //! and takes the messages the farm sends a daemon on the channel it owns the receiving end of.
 //! A `Start` is submitted to the job service as a job of the kbf image, whose entrypoint is the
 //! task tool (a `whole_machine` lease's as a job that needs the whole host), under an id
@@ -35,6 +37,7 @@ mod config;
 mod driver;
 mod front;
 mod host;
+mod mac;
 mod metrics;
 mod out;
 mod outcome;
@@ -70,6 +73,9 @@ pub use driver::Running;
 pub use front::{
     Front, FrontParts, PrepareError, PreparedPutDir, PreparedRun, PutDirParts, RunPrepare,
     RunSource,
+};
+pub use mac::{
+    DEFAULT_MAC_OS_VERSION, MAC_OS, MAC_OUT_TARGET, MacPool, MacPoolError, System, TREE_TARGET,
 };
 pub use metrics::Metrics;
 pub use out::{MAX_ROOT_BYTES, OUT_TARGET, PutDirRoots, RootError, TASK_IN_TREE, TaskOut};

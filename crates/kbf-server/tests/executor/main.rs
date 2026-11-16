@@ -14,6 +14,7 @@ mod driver;
 mod files;
 mod jobs;
 mod keys;
+mod mac;
 mod phases;
 mod pool;
 mod promotion;

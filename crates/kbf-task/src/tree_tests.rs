@@ -16,12 +16,12 @@ use crate::message::label;
 use crate::task::{EXIT_FETCH, EXIT_RUN};
 
 /// A fresh scratch directory standing in for a job's root.
-fn scratch(name: &str) -> TestDir {
+pub(crate) fn scratch(name: &str) -> TestDir {
     TestDir::under(std::env::temp_dir(), &format!("kbf-task-tree-{name}"))
 }
 
 /// A Command of `argv` in `working_directory`, declaring `outputs`, with a `PATH`.
-fn command(argv: &[&str], working_directory: &str, outputs: &[&str]) -> reapi::Command {
+pub(crate) fn command(argv: &[&str], working_directory: &str, outputs: &[&str]) -> reapi::Command {
     reapi::Command {
         arguments: argv.iter().map(|a| (*a).to_owned()).collect(),
         environment_variables: vec![EnvironmentVariable {
@@ -672,4 +672,4 @@ fn a_tree_job_hides_nothing_from_its_command() {
 }
 
 #[path = "tree_out_dir_tests.rs"]
-mod out_dir;
+pub(crate) mod out_dir;

@@ -135,7 +135,15 @@ lease of any kind, and its session row lists no driver, so no other frontend of 
 counts it either. It is not a cordon and writes no `cordon/` row: an operator's uncordon does not
 lift it, a lease the daemon already held (taken up after the restart into `js-agent`) stays its
 own, and a frontend restarted under `kbf-daemon` places the Linux daemons again with nothing to
-undo. A Mac daemon, or one that reports any other `os`, is placed as before. A job is the kbf image (`--executor-kbf-image`), whose `ENTRYPOINT` is the task tool:
+undo. A Mac daemon, or one that reports any other `os`, is placed as before. The Macs of the
+job service are virtual workers of their own, `js-mac:<frontend>-<n>`, with
+`--executor-mac-hosts` (0 by default: none, and no macOS action is placed on the executor),
+`--executor-mac-task-bundle` (the release's `kbf-task` bundle by its manifest digest, the image
+of a Mac job), `--executor-mac-os-version` (the least macOS the Macs run, 26 by default; an
+action's `os_version` above it is refused) and `--executor-mac-task-out-root` (the tier store's
+put directory on the Macs, `--task-out-root` by default); a macOS action becomes a job of a
+Mac's native runtime (docs/design/actions-as-jobs.md, section 14), which the job service at
+kbf's pin cannot run yet. A Linux job is the kbf image (`--executor-kbf-image`), whose `ENTRYPOINT` is the task tool:
 the job's arguments are the tool's flags and nothing is mounted into the container. It needs the
 cores and memory the farm booked (the memory as the hard cap a daemon would set, 1.5 times the
 booking plus 512 MiB), a host of `os=linux` and `--executor-arch` (default `x86_64`) that runs

@@ -11,7 +11,7 @@
 //! node report and status are kept, and a lease it held already (taken up from the state
 //! store after the restart into the executor) stays its own. A Mac daemon, and a daemon that
 //! reports any other `os` or none, is placed as before; the executor's virtual workers, which
-//! report `os=linux`, register and resend their reports through [`Farm::register_virtual`]
+//! report `os=linux` (its Mac workers `os=macos`), register and resend their reports through [`Farm::register_virtual`]
 //! and [`Farm::resize_virtual`], which this filter does not touch.
 //!
 //! It is not a cordon: nothing is written to the state store but the session row every

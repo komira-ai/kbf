@@ -311,14 +311,17 @@ What this design adds to an action with about 5 outputs and about 200 KB, compar
 
 - One design. The same fs core serves NFSv3 on loopback (nfsserve). The mount carries `trees/` and `put/`; the server
   enforces read-only on `trees/`.
-- Inputs (C9 of tierstore's `docs/design/virtual-build-fs.md`): kbf-task builds `/work` as real directories with one
-  symlink per input file into a read-only mount of the tree. The tree is mounted below `/work` because the Mac agent,
-  as designed (jobscheduler `docs/design/job-rootfs.md`, 5.1), allows mounts only at or below `/work`. A read-only or
-  read-write mount exactly at `/work` is refused (`mount-target-unsupported-here`). Cost is about 40 us per file. An
-  action that opens an input for writing fails; that limit already exists.
-- Outputs: the host path `<mp>/put/cas/b/<build>/<nonce>` is mounted at `/work/.kbf-out` as a symlink in `exec/` with
-  a Seatbelt write grant. `process-exec` is denied because the mount sets `no_exec`, as on Linux (job-rootfs 5.2 and
-  5.4; designed, not built). The path name `.kbf-out` is reserved and checked.
+- Inputs (built in kbf, `kbf-task --materialize-work`, `crates/kbf-task/src/materialize.rs`): the tree is mounted
+  read-only at `/work/.kbf-tree`, which the Mac agent, as designed (jobscheduler `docs/design/job-rootfs.md`, 5.2),
+  makes `exec/.kbf-tree`, and kbf-task copies its `work` into `exec/work`: `std::fs::copy`, an APFS clone where the
+  source and `exec/` share a volume and a byte copy otherwise. This replaces the earlier design of one symlink per
+  input file into the tree: every copy is private, so an action may open an input for writing and an output may name
+  an input path. The cost is the copy of the input tree, not about 40 us per file.
+- Outputs: the host path `<mp>/put/cas/b/<build>/<nonce>` is mounted at `/work/.kbf-out` (`exec/.kbf-out`, as the
+  agent makes a mount, with a Seatbelt write grant) and kbf-task commits into it (`--out-dir .kbf-out`).
+  `process-exec` is denied because the mount sets `no_exec`, as on Linux (job-rootfs 5.2 and 5.4; designed in
+  jobscheduler, not built there). Both names are beside `exec/work`, not in the input root, so no input name is
+  reserved for them.
 - NFS has no open handle count. The commit therefore requires the expected digest in the source name. kbf-task always
   supplies it. A short or unflushed file fails with EBADMSG instead of being published.
 - Unmeasured: whether close(2) flushes writes synchronously, whether a killed process's writes are flushed, and

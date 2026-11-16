@@ -1,5 +1,6 @@
 //! A tree job (`--tree`): the job's root file system is the action's tree, so the task fetches
-//! nothing and holds no read grant. It is the only kind of job.
+//! nothing and holds no read grant. The other kind of job, `--materialize-work`, is
+//! [`crate::materialize`]; it shares this module's reading of the Action and the Command.
 //!
 //! The frontend writes one tree per action, and the job's root is that tree, read-only, under a
 //! writable scratch layer. Under the root (`--tree`'s value, `/` in a job) the task finds:
@@ -28,7 +29,7 @@
 //! directory that cannot be made is exit 11, as the private directories are.
 
 use std::os::unix::fs::DirBuilderExt as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
@@ -61,11 +62,13 @@ pub fn input_stats() -> InputStats {
     }
 }
 
-/// Reads the Action and the Command from the tree under `root`, checks the input root, and makes
-/// the run directory: in this order, so a refused Action, Command or network property leaves
-/// nothing behind.
-fn read(cli: &Cli, root: &Path) -> Result<Inputs, Failure> {
-    let reading = Instant::now();
+/// Reads the Action and the Command from the tree under `root`, checks the network property, and
+/// requires the Action to name an input root: the part of a read every kind of job shares, which
+/// leaves nothing behind.
+pub(crate) fn read_tree(
+    cli: &Cli,
+    root: &Path,
+) -> Result<(Action, Command, crate::network::Network), Failure> {
     let action: Action = file_message(&root.join(ACTION_FILE), &digest::to_reapi(&cli.action))?;
     let command: Command = file_message(
         &root.join(COMMAND_FILE),
@@ -74,8 +77,11 @@ fn read(cli: &Cli, root: &Path) -> Result<Inputs, Failure> {
     let network = network_of(cli, &action, &command)?;
     // The tree's `work` is the input root; the Action must still name one, as REAPI requires.
     named("input root", action.input_root_digest.as_ref())?;
-    let work = root.join(INPUT_ROOT);
-    input_root(&work)?;
+    Ok((action, command, network))
+}
+
+/// Makes the run directory `<root>/.kbf-run`, mode 0700; an existing one is refused.
+pub(crate) fn make_run_dir(root: &Path) -> Result<PathBuf, RunError> {
     let run_dir = root.join(RUN_DIR);
     std::fs::DirBuilder::new()
         .mode(0o700)
@@ -87,6 +93,18 @@ fn read(cli: &Cli, root: &Path) -> Result<Inputs, Failure> {
                 format!("cannot make the run directory (an existing one is refused): {e}"),
             ),
         })?;
+    Ok(run_dir)
+}
+
+/// Reads the Action and the Command from the tree under `root`, checks the input root, and makes
+/// the run directory: in this order, so a refused Action, Command or network property leaves
+/// nothing behind.
+fn read(cli: &Cli, root: &Path) -> Result<Inputs, Failure> {
+    let reading = Instant::now();
+    let (action, command, network) = read_tree(cli, root)?;
+    let work = root.join(INPUT_ROOT);
+    input_root(&work)?;
+    let run_dir = make_run_dir(root)?;
     Ok(Inputs {
         action,
         command,
@@ -102,7 +120,7 @@ fn read(cli: &Cli, root: &Path) -> Result<Inputs, Failure> {
 
 /// Refuses an input root that is not a directory: a file or a symlink (not followed), or one
 /// that cannot be looked at (missing).
-fn input_root(work: &Path) -> Result<(), FetchError> {
+pub(crate) fn input_root(work: &Path) -> Result<(), FetchError> {
     match std::fs::symlink_metadata(work) {
         Ok(meta) if meta.is_dir() => Ok(()),
         Ok(_) => Err(FetchError::Invalid(format!(
@@ -147,4 +165,4 @@ pub(crate) async fn finish_out_dir(cli: &Cli, root: &Path) -> ExitCode {
 
 #[cfg(test)]
 #[path = "tree_tests.rs"]
-mod tests;
+pub(crate) mod tests;

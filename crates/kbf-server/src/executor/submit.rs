@@ -18,6 +18,14 @@
 //! no network, no files and no secret. A `whole_machine` lease cannot be one: the job service
 //! gives a whole-host job no layer and no mount, so it is refused as the caller's.
 //!
+//! An action whose platform asks for a Mac is a Mac job ([`crate::executor::mac`]): the
+//! release's `kbf-task` bundle, the tree and the put directory mounted under `/work`, no layer, of
+//! a Mac in the native runtime. It is refused as the caller's on an executor with no Macs, and
+//! as for Linux for a `whole_machine` lease.
+//!
+//! An action whose platform asks for another system than the worker it was placed on stands
+//! for is refused as the caller's ([`same_system`]).
+//!
 //! A [`JobSpec`] holds the secrets: it is sent and kept, never logged or put in an error.
 
 use std::collections::BTreeMap;
@@ -31,6 +39,7 @@ use kbf_types::LeaseId;
 use ring::digest::{SHA256, digest};
 
 use crate::executor::config::Config;
+use crate::executor::mac::{MacJob, System, WorkerOs, check_version, mac_argv, mac_spec};
 use crate::executor::out::{PutDirRoots, TASK_IN_TREE, TaskOut};
 use crate::executor::outcome::Settled;
 use crate::executor::output::Grants;
@@ -197,20 +206,25 @@ impl Ctx<'_> {
     }
 }
 
-/// The job of `lease`, which runs `action` with `booking`, with its pack key.
+/// The job of `lease`, which runs `action` with `booking` on a worker of `on`, with its pack key.
 pub(super) async fn prepare(
     ctx: &Preparer,
+    on: WorkerOs,
     lease: LeaseId,
     action: &Digest,
     booking: Booking,
 ) -> Result<Arc<Prepared>, Settled> {
     let facts = ctx.inputs.action(action).await?;
+    same_system(on, facts.system)?;
     let timeout = facts.timeout.unwrap_or(ctx.cfg.default_timeout);
     require(timeout <= ctx.cfg.max_run, || {
         format!("the action's timeout {timeout:?} is over the executor's limit")
     })?;
     let image = pinned(&facts.image)?;
     let wall = ctx.cfg.wall(timeout);
+    if let System::Macos { os_version } = facts.system {
+        return prepare_mac(ctx, lease, action, booking, (timeout, wall), os_version).await;
+    }
     if let TaskOut::PutDir(roots) = &ctx.cfg.task_out {
         require(booking != Booking::WholeHost, || {
             "a whole_machine action cannot commit into a put directory: the job service gives \
@@ -281,6 +295,70 @@ pub(super) async fn prepare(
         labels: labels(ctx),
     };
     let grants = Grants::of(&spec, [pack.expose(), grant.token.expose()]);
+    Ok(Arc::new(Prepared { spec, key, grants }))
+}
+
+/// Refuses an action placed on a worker of another system than its platform asks for: an action
+/// that names no system matches a Mac worker too when the frontend completes no platform
+/// (`--default-platform none`), and it would hold a Mac's slot to run on Linux.
+fn same_system(on: WorkerOs, system: System) -> Result<(), Settled> {
+    match (on, system) {
+        (WorkerOs::Mac, System::Linux) => Err(Settled::Invalid(
+            "the farm placed the action on a Mac worker, and its platform asks for no macOS: \
+             name the system (OSFamily)"
+                .to_owned(),
+        )),
+        (WorkerOs::Linux, System::Macos { .. }) => Err(Settled::Invalid(
+            "the farm placed the action on a Linux worker, and its platform asks for macOS"
+                .to_owned(),
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// The Mac job of `lease`, which runs `action` with `booking` for `times` (the timeout and the
+/// wall limit): refused as the caller's when this executor has no Macs, when the action asks
+/// for a newer macOS than they run, when it is a `whole_machine` lease, or when its outputs do
+/// not go into a put directory.
+async fn prepare_mac(
+    ctx: &Preparer,
+    lease: LeaseId,
+    action: &Digest,
+    booking: Booking,
+    (timeout, wall): (Duration, Duration),
+    os_version: Option<u32>,
+) -> Result<Arc<Prepared>, Settled> {
+    let Some(pool) = &ctx.cfg.mac else {
+        return Err(Settled::Invalid(
+            "the action asks for a Mac, and this executor has none (--executor-mac-hosts)"
+                .to_owned(),
+        ));
+    };
+    check_version(os_version, pool).map_err(Settled::Invalid)?;
+    require(booking != Booking::WholeHost, || {
+        "a whole_machine action cannot run on a Mac of the job service: it commits into a put \
+         directory, and a whole-host job has no mount"
+            .to_owned()
+    })?;
+    let TaskOut::PutDir(linux) = &ctx.cfg.task_out else {
+        return Err(Settled::Invalid(
+            "a Mac action commits into a put directory: give --task-out-root".to_owned(),
+        ));
+    };
+    let key = minted(ctx, lease, action, wall).await?;
+    let tree = ctx.inputs.tree(lease).await?;
+    let spec = mac_spec(MacJob {
+        job_id: job_id(&ctx.cfg.frontend, lease, 0),
+        pool,
+        roots: pool.roots(linux),
+        dir: key.as_str(),
+        tree: &tree,
+        args: mac_argv(action, lease, timeout),
+        needs: booking.needs(),
+        wall_seconds: wall_seconds(wall),
+        labels: labels(ctx),
+    });
+    let grants = Grants::of(&spec, []);
     Ok(Arc::new(Prepared { spec, key, grants }))
 }
 
@@ -357,3 +435,7 @@ mod tests;
 #[cfg(test)]
 #[path = "submit_put_dir_tests.rs"]
 mod put_dir_tests;
+
+#[cfg(test)]
+#[path = "submit_mac_tests.rs"]
+mod mac_tests;

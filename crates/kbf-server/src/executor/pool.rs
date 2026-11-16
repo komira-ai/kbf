@@ -1,11 +1,13 @@
 //! The pool of virtual workers, and what a restarted frontend does with the jobs an earlier
 //! process left.
 //!
-//! The executor registers [`Config::hosts`] virtual workers once it has taken up the earlier
-//! jobs ([`adopt_jobs`]), each of the declared shape, and keeps them for as long as it runs:
+//! The executor registers [`Config::hosts`] virtual workers, and the Macs' beside them
+//! ([`Config::mac`]), once it has taken up the earlier jobs ([`adopt_jobs`]), each of the
+//! declared shape, and keeps them for as long as it runs:
 //! the farm places on workers, and the job service decides where each job runs.
 //!
 //! [`Config::hosts`]: super::Config::hosts
+//! [`Config::mac`]: super::Config::mac
 
 use std::collections::BTreeSet;
 
@@ -14,6 +16,7 @@ use tokio::time::Instant;
 
 use crate::executor::api::{answered, note};
 use crate::executor::host::HostWorker;
+use crate::executor::mac::WorkerOs;
 use crate::executor::submit::{FRONTEND_LABEL, INSTANCE_LABEL};
 use crate::executor::{Ctx, twin_message};
 
@@ -37,11 +40,12 @@ pub(super) fn live_jobs(labels: &[(&str, &str)]) -> ListJobsRequest {
     }
 }
 
-/// The workers of this executor, registered with the farm.
+/// The workers of this executor, registered with the farm: the Linux ones, then the Macs'.
 pub(super) fn workers(ctx: &Ctx<'_>, now: Instant) -> Vec<HostWorker> {
-    (0..ctx.cfg.hosts)
-        .map(|n| HostWorker::start(ctx, n, now))
-        .collect()
+    let macs = ctx.cfg.mac.as_ref().map_or(0, |mac| mac.hosts);
+    let linux = (0..ctx.cfg.hosts).map(|n| HostWorker::start(ctx, n, now));
+    let mac = (0..macs).map(|n| HostWorker::start_of(ctx, WorkerOs::Mac, n, now));
+    linux.chain(mac).collect()
 }
 
 /// Whether the jobs an earlier process left under this frontend's id have been taken up.

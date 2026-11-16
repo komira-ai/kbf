@@ -392,10 +392,10 @@ impl HostWorker {
             Some(handle) => handle,
             None if !begin => return Preparing::Pending,
             None => {
-                let (preparer, action) = (ctx.preparer(), action.clone());
+                let (preparer, action, on) = (ctx.preparer(), action.clone(), self.os());
                 let limit = preparer.cfg.prepare_limit;
                 tokio::spawn(async move {
-                    let preparing = prepare(&preparer, lease, &action, booking);
+                    let preparing = prepare(&preparer, on, lease, &action, booking);
                     tokio::time::timeout(limit, preparing)
                         .await
                         .unwrap_or_else(|_| {
