@@ -112,7 +112,15 @@ it, with the server's role authorized by address.
 **One object store.** The cold store is the storage nodes' (`--cold-store`). The
 frontends do not open it for blobs. If you run with build history, `--history-objects`
 (`s3://bucket/prefix?...`, [api.md](../api.md)) is an object store a frontend writes to;
-give every frontend the same one.
+give every frontend the same one, with `conditional-put=true` in its URI and its key pair in
+`--history-credentials-file`. A key limited to `<prefix>history/`, with no delete, is enough:
+the writer only creates objects there and reads them back. Without `conditional-put=true`
+kbf sends a plain `PUT`; a store that refuses to replace an object answers a retried chunk
+with `412`, and the writer counts that as a failed write and tries the chunk again at every
+step. Several frontends write one store at once: each history writer has an id of its own
+(the time of its start in microseconds), every object key carries it, and the index rows
+the writers share are written only if they still hold what the writer read. A `file://`
+directory cannot be shared: its `LOCK` lets one process in ([single-host.md](single-host.md)).
 
 **The same certificates' names, not the same keys.** Every frontend serves the REAPI and
 worker listeners under the farm's one DNS name (the load balancer's), so the certificate

@@ -71,8 +71,10 @@ fn civil_from_days(days: u64) -> (u32, u32, u32) {
 /// The largest year whose `yyyymmdd` fits a `u32`.
 const MAX_YEAR: u64 = 429_495;
 
-/// Which history writer wrote an object: the server epoch on a v1 frontend. Every
-/// writer writes only keys that carry its id, so no two writers share an object.
+/// Which history writer wrote an object: a frontend's writer takes the time of its
+/// start in microseconds, so each start has an id of its own, and the old and the new
+/// frontend of a rolling update have two. Every writer writes only keys that carry its
+/// id, so no two writers share an object.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct WriterId(pub u64);
 

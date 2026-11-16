@@ -25,7 +25,7 @@
 //!   offered once the copy is written (or has failed: a failed copy loses the log, never
 //!   the run). If the run's invocation was closed meanwhile (the recorder went idle on it
 //!   while its tails were read) it is closed again, so a late run does not leave it open.
-//! - **A stop waits a little.** [`Tails::quiesce`] lets the writer's last step see the
+//! - **A stop waits a little.** [`Tails::quiesce`] lets the writer's stop flush see the
 //!   runs still in the pool.
 //!
 //! Not redacted: no redaction machinery exists yet (ui-data.md Q8), so the tails and the
