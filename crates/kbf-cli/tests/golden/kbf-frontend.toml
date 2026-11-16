@@ -47,7 +47,7 @@ executor-allow-open-network = false
 executor-allow-plain-http-grant = false
 # Lets the task write its pack to an `http://` url, until the store serves TLS. The reads stay https unless `--executor-allow-plain-http-grant` says otherwise. Used only with `--executor js-agent`
 executor-allow-plain-http-put = false
-# The CPU architecture of the hosts. Every job asks for a host of `os=linux`, this `arch` and containers, and the virtual workers report them to the farm. Used only with `--executor js-agent`
+# The CPU architecture of the Linux hosts. Every job of a Linux action asks for a host of `os=linux`, this `arch` and containers, and the virtual workers report them to the farm (the Macs' are `arm64`, `--executor-mac-hosts`). Used only with `--executor js-agent`
 executor-arch = "x86_64"
 # The base environment the Command of an action sees, pinned by digest as `<repository>@sha256:<64 hex digits>` (a leading `docker://` is optional). It is the one image an action's `container-image` platform property may name: an action that names another is refused as invalid, one that names none gets this. A tag is refused. Needed with `--executor js-agent`
 # executor-base-image = "IMAGE"
@@ -87,6 +87,14 @@ executor-insecure-argv-secrets = false
 # executor-kbf-image = "IMAGE"
 # Has the task tool ask the read listener where each input is kept (`GET /locate`). The answer names no store and no grant (tierstore v0.3.29 removed the store read grants), so the task still reads every input through the listener, as without the flag; every byte is checked against its digest. Off by default. Used only with `--executor js-agent`, and refused with `--executor kbf-daemon`
 executor-locate = false
+# How many virtual workers stand for the job service's Macs, each of the shape of `--executor-host-*`, reporting `os=macos` and `arch=arm64`: the farm places an action whose platform asks for macOS on them, and each becomes a job of a Mac's native runtime that runs `--executor-mac-task-bundle`. 0, the default, registers none, and the farm places no macOS action on this executor. Needs `--executor-mac-task-bundle`. Used only with `--executor js-agent`
+executor-mac-hosts = 0
+# The least major macOS every Mac of the job service runs. An action's `os_version` is the least it takes (`26` means 26 or newer), and one that asks for a newer macOS than this is refused, naming both: the job service cannot be asked for a version. Used only with `--executor-mac-hosts`
+executor-mac-os-version = 26
+# The release's macOS `kbf-task` bundle, by its manifest digest (the one entry of the `index.json` of `kbf-task-bundle-<commit>-darwin-arm64.tar.gz`): the image of a Mac job, whose entrypoint `kbf-task` runs. Needed with `--executor-mac-hosts`, refused without it
+# executor-mac-task-bundle = "NAME@sha256:HEX"
+# The tier store's put directory on the Macs, if it is not `--task-out-root`: a Mac job mounts its put directory under it and its action tree from the `trees` directory beside it. Used only with `--executor-mac-hosts`, refused without it
+# executor-mac-task-out-root = "PATH"
 # The longest action timeout the executor runs, in seconds; an action that asks for more is refused. Used only with `--executor js-agent`
 executor-max-run-secs = 3000
 # The network every job is given on its host. `allow-list`, the default, is the endpoints the host's agent is set up to allow and nothing else: the task reaches the read listener and the pack store only once each agent allows them, and a host whose agent cannot check those limits refuses the job (`egress-unchecked`), which the farm runs again. `none` is no route out: every action fails, as the task can reach neither. `open` is any address but those the agent always denies, and needs `--executor-allow-open-network`. Used only with `--executor js-agent`
