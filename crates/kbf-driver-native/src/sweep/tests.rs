@@ -97,7 +97,7 @@ fn a_directory_that_cannot_be_moved_aside_stays() {
 /// would have written.
 fn action(steps: &str) -> (std::process::Child, Record) {
     use std::os::unix::process::CommandExt as _;
-    let child = std::process::Command::new(crate::xcode::tests::act())
+    let child = std::process::Command::new(crate::act())
         .args(steps.split(' '))
         .stdout(std::process::Stdio::piped())
         .process_group(0)
@@ -678,22 +678,6 @@ fn a_quarantine_of_another_user_is_not_held() {
     };
     assert!(hold(Path::new("/"), &remove).is_none(), "root's held");
     assert_eq!(*asked.borrow(), [PathBuf::from("/")]);
-}
-
-/// Catches the macOS boot id read from anything but the boot session UUID (the boot
-/// time, which can move within a boot): it has the UUID's shape.
-#[cfg(target_os = "macos")]
-#[test]
-fn the_macos_boot_id_is_the_session_uuid() {
-    let id = crate::record::boot_id().expect("boot id");
-    assert_eq!(id.len(), 36, "{id}");
-    for (i, c) in id.char_indices() {
-        if [8, 13, 18, 23].contains(&i) {
-            assert_eq!(c, '-', "{id}");
-        } else {
-            assert!(c.is_ascii_hexdigit(), "{id}");
-        }
-    }
 }
 
 /// Catches a pid that exited between the snapshot and the check taken for another

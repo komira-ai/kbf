@@ -291,8 +291,7 @@ fn memory_kill_keeps_its_wire_numbers() {
     );
 }
 
-/// Catches a renumbered `Start.device_id`: the design names field 8
-/// (`docs/design/ios-devices.md#54-booking`), and a daemon and a server built from
+/// Catches a renumbered `Start.device_id`: field 8 is `device_id`, and a daemon and a server built from
 /// different revisions would read the device from another field, or not at all, and
 /// run a device test against no device. Also catches a device id sent when none was
 /// booked (an empty id is not on the wire, so an older daemon sees the Start it knew).

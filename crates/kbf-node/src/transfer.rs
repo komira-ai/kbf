@@ -266,7 +266,6 @@ mod tests {
                 "--node-id=n1".to_owned(),
                 "--driver=native".to_owned(),
                 format!("--data-dir={}", dir.display()),
-                format!("--xcode-apps={}", dir.join("Applications").display()),
             ])
             .expect("flags")
         };
@@ -324,7 +323,6 @@ mod tests {
             "--node-id=n1".to_owned(),
             "--driver=native".to_owned(),
             format!("--data-dir={}", dir.display()),
-            format!("--xcode-apps={}", dir.join("Applications").display()),
         ])
         .expect("flags");
         let argv = [

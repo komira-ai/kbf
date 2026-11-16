@@ -30,12 +30,6 @@ crc32c = "0.6.8"
 # The CRC-32 of the worker input cache's index snapshot (kbf-daemon). Already in the
 # tree through flate2.
 crc32fast = "1.5.2"
-# macOS only (kbf-mac-session): CFData for the caller's audit token.
-core-foundation = "0.10.1"
-# The Mac's check of the MDM gate's admin grants (kbf-mac-session: pure Rust, so the
-# helper is checked for the macOS target on any host, which ring's C build does not
-# allow).
-ed25519-dalek = { version = "2.2.0", default-features = false, features = ["std"] }
 # gzip for the tar.gz archives kbf-deploy installs (`mdm install`) and `cargo xtask
 # fetch` unpacks, and the deflate behind zip (below); the pure-Rust backend, no C zlib.
 flate2 = { version = "1.1.10", default-features = false, features = ["rust_backend"] }
@@ -102,19 +96,6 @@ tierstore = { git = "https://github.com/komira-ai/tierstore", rev = "309ad2d71b7
 # revision; members take its `client` feature, and kbf-trees-client's fake the `server` one.
 tierstore-trees-api = { git = "https://github.com/komira-ai/tierstore", rev = "309ad2d71b745f1827f9292976411e25e8b991e9" } # v0.3.111
 md-5 = "0.11.0"
-# macOS only (kbf-mac-session): OpenDirectory, for the per-lease users.
-objc2 = "0.6.5"
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std"] }
-objc2-open-directory = { version = "0.3.2", default-features = false, features = ["std"] }
-# macOS only (kbf-driver-native's tests): Metal, to run a compute kernel as a pool user.
-# Licence: Zlib OR Apache-2.0 OR MIT, on deny.toml's allow list.
-objc2-metal = { version = "0.3.2", default-features = false, features = ["std"] }
-# macOS only (kbf-vmm): Virtualization.framework, with the block and dispatch crates its
-# completion handlers and queues use. Licences: objc2 family Zlib OR Apache-2.0 OR MIT,
-# block2 and dispatch2 MIT OR Apache-2.0 OR Zlib; all on deny.toml's allow list.
-block2 = "0.6.2"
-dispatch2 = { version = "0.3.1", default-features = false, features = ["std", "objc2"] }
-objc2-virtualization = { version = "0.3.2", features = ["block2", "dispatch2", "bitflags"] }
 # Typed OCI runtime configuration (`config.json`) for the container driver's crun
 # backend. The 0.7 line is the one `runc` (below) uses, so the tree holds one copy.
 oci-spec = "0.7.1"
@@ -165,9 +146,6 @@ rusqlite = { version = "0.41.0", default-features = false, features = ["bundled"
 # the effective uid, to check who owns the operator API token file (kbf-server).
 rustix = "1.1.5"
 saphyr-parser = "0.1.0"
-# macOS only (kbf-mac-session): the caller's code signature against a pinned
-# requirement (SecCodeCopyGuestWithAttributes, SecCodeCheckValidity).
-security-framework = { version = "3.7.0", default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 # The fixed-key hash behind the storage map's rendezvous scores (kbf-map): SipHash-2-4 with a
@@ -228,12 +206,10 @@ kbf-daemon = { path = "crates/kbf-daemon" }
 kbf-deploy = { path = "crates/kbf-deploy" }
 kbf-driver-container = { path = "crates/kbf-driver-container" }
 kbf-driver-native = { path = "crates/kbf-driver-native" }
-kbf-driver-vm = { path = "crates/kbf-driver-vm" }
 kbf-enroll-registry = { path = "crates/kbf-enroll-registry" }
 kbf-enroll = { path = "crates/kbf-enroll" }
 kbf-estimator = { path = "crates/kbf-estimator" }
 kbf-front = { path = "crates/kbf-front" }
-kbf-guest = { path = "crates/kbf-guest" }
 kbf-gate = { path = "crates/kbf-gate" }
 kbf-harness = { path = "crates/kbf-harness" }
 kbf-history = { path = "crates/kbf-history" }
@@ -246,7 +222,6 @@ kbf-job-client = { path = "crates/kbf-job-client" }
 kbf-log = { path = "crates/kbf-log" }
 kbf-map = { path = "crates/kbf-map" }
 kbf-mapsync = { path = "crates/kbf-mapsync" }
-kbf-mac-session = { path = "crates/kbf-mac-session" }
 kbf-meta = { path = "crates/kbf-meta" }
 kbf-node = { path = "crates/kbf-node" }
 kbf-objstore = { path = "crates/kbf-objstore" }
@@ -282,7 +257,6 @@ kbf-tls = { path = "crates/kbf-tls" }
 kbf-tier = { path = "crates/kbf-tier" }
 kbf-transfer = { path = "crates/kbf-transfer" }
 kbf-types = { path = "crates/kbf-types" }
-kbf-vmm = { path = "crates/kbf-vmm" }
 kbf-ui = { path = "crates/kbf-ui" }
 kbf-unitfile = { path = "crates/kbf-unitfile" }
 kbf-update = { path = "crates/kbf-update" }

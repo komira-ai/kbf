@@ -595,8 +595,8 @@ and 21):
    the storage half is the same code, so the store keeps serving). From then the executor's rollback is the previous
    release and units, not a line (8.4).
 2. **Then the code**, once no unit selects `--driver container`: `crates/kbf-driver-container` (11,704 non-test lines of
-   `src`), the daemon's container wiring, Linux input cache and shared-tree code in `kbf-daemon` and `kbf-node` (Macs
-   keep the `native` driver and the clone cache), and the placement filter of 8.2.
+   `src`), the daemon's container wiring, Linux input cache and shared-tree code in `kbf-daemon` and `kbf-node` (the
+   `native` driver stays, as plain processes on Linux), and the placement filter of 8.2.
 
 ### 7.2 The copy to scratch (O11)
 
@@ -625,7 +625,7 @@ After the removal an action whose input root cannot be a tree is refused by name
 is a farm fault and rerun, like a lost host today. A job's network is `none` plus the passed-through node tierstore port.
 
 What stays: the farm, the executor, `kbf-job-client`, `kbf-task` (tree mode), `kbf-task-pack`, `prepare_run`, the
-ingest, the worker listener and `kbf-daemon` for the Macs.
+ingest and the worker listener.
 
 ## 8. The flip on the six Linux nodes
 
@@ -656,7 +656,7 @@ drain of the restart waits for the jobs in flight (B15).
 ### 8.2 The Linux daemons during the window
 
 The daemons keep running beside `js-agent` until the nodes move (7.1), so the rollback is one line. While
-`--executor js-agent` is set, the farm's placement skips every Linux daemon worker; Mac daemons are placed as before
+`--executor js-agent` is set, the farm's placement skips every Linux daemon worker, and a Mac daemon is given no lease under any executor (14)
 [proposed, D11]. It is a filter computed at placement from the running setting, not a cordon (a stored row only the
 operator lifts, `farm/cordon_owner.rs`), so the rollback's restart leaves nothing behind.
 
@@ -1060,8 +1060,9 @@ kbf relies on the manifest format of ts 6.1 as merged, `cas/l/<sha256>` for mani
 
 ## 14. macOS, and other open points
 
-**macOS** runs as jobs too, built in kbf and waiting on jobscheduler. The Macs no longer run `kbf-daemon` (the
-farm would still place a macOS action on a Mac daemon that registered, as before); they run js-agent, whose macOS
+**macOS** runs as jobs too, built in kbf and waiting on jobscheduler. The Macs run no `kbf-daemon`, and the farm
+gives a daemon that reports `os=macos` no lease under any executor
+(`crates/kbf-server/src/farm/linux_daemons.rs`); they run js-agent, whose macOS
 native runtime runs a job as a user of its pool under its `sandbox-exec` profile, in the run
 directory `exec/` (the job's `/work`). macOS has no overlayfs and no bind mounts, so 3.1 does not carry over: the task
 copies the inputs out of the tree instead of running on it.
@@ -1085,8 +1086,13 @@ copies the inputs out of the tree instead of running on it.
   Mac (its `docs/design/job-rootfs.md` item 7; a job with mounts asks for `layered-rootfs`, which no Mac reports),
   and serve the tierstore trees and put directories on the Macs. Until then no Mac runs a kbf action, as none runs
   a daemon (komira-ai/jobscheduler#888 lists the four items).
-- **The `kbf-daemon` Mac path** (the native driver, the Mac session and VM crates) is removed once a Mac has run
-  these jobs; removing it first would leave macOS actions with no runner.
+- **The `kbf-daemon` Mac path is removed.** The Mac daemon driver (`native` and `native-whole-machine` on a Mac, Xcode,
+  simulator, iOS device and VM leases on a daemon), the Mac session and lease-user pool, the Mac provisioning tool and the
+  VM crates are deleted, and `kbf-daemon` itself stays for the Linux daemons (`--executor kbf-daemon`, and the
+  `native` driver as plain processes on Linux for the beta smoke farm). A macOS action has one runner, the job
+  above. Kept: the executor's Mac path, `kbf-task` and its bundle, the wire and proto fields of the removed path (a
+  reader still reads old data), and the Mac side of the host install (`kbf-host-install`, `kbf-installer`, the
+  package), which install `kbf` on a Mac host and are a separate change.
 
 **Other open points:**
 

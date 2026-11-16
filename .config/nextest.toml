@@ -8,18 +8,11 @@
 # (crates/xtask/tests/install_sh.rs, `RELEASE`); concurrent processes would build it over
 # each other.
 install-sh-fixture = { max-threads = 1 }
-# `scratch()` numbers its directories by a counter of the process, so two tests that share a
-# name share a directory (crates/kbf-mac-provision/tests/support/mod.rs).
-mac-provision-scratch = { max-threads = 1 }
 
 # Named overrides go before any override that matches more.
 [[profile.default.overrides]]
 filter = 'package(xtask) & binary(install_sh)'
 test-group = 'install-sh-fixture'
-
-[[profile.default.overrides]]
-filter = 'package(kbf-mac-provision)'
-test-group = 'mac-provision-scratch'
 
 # Hang guards. A test holds no timeout or deadline of its own: a test that waits for ever is
 # ended here, by nextest's slow-timeout with terminate-after (the test is killed and fails once
@@ -124,7 +117,6 @@ not (
   | (binary_id(=kbf-driver-container::memory) & (test(=a_2_gib_file_is_hashed_and_read_back_in_bounded_memory) | test(=a_2_gib_output_goes_to_an_intake_in_bounded_memory) | test(=a_stdout_past_its_limit_is_refused_in_bounded_memory)))
   | (binary_id(=kbf-driver-container::restart) & test(=no_round_of_kill_and_restart_races_the_removal))
   | (binary_id(=kbf-driver-container::walk_cost) & test(=a_tree_of_fifteen_thousand_files_is_walked_in_bounded_time))
-  | (binary_id(=kbf-driver-native) & (test(=xcode::tests::every_installed_xcode_is_reported_with_its_state) | test(=xcode::tests::every_xcode_that_answers_is_found) | test(=xcode::tests::warm_looks_up_every_tool_for_every_xcode_sandboxed)))
   | (binary_id(=kbf-front::large_blobs) & (test(=a_blob_over_5_gib_round_trips_through_the_tier_a_multipart_flush_and_a_read) | test(=a_large_bytestream_read_holds_a_window_not_the_blob) | test(=a_large_bytestream_write_holds_a_part_not_the_blob) | test(=a_large_flush_holds_a_part_not_the_block) | test(=a_large_write_with_a_tier_lands_on_the_tier_first)))
   | (binary_id(=kbf-front::proxy) & test(=the_proxy_imposes_no_size_cap))
   | (binary_id(=kbf-front::write_group) & test(=fifteen_thousand_concurrent_writes_fill_segments_in_turn))

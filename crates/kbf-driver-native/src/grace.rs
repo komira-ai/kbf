@@ -1,22 +1,18 @@
 //! Ending an action's processes politely before the kill.
 //!
-//! A process that is killed with SIGKILL runs nothing on its way out. On macOS that
-//! matters for one kind of leftover: POSIX shared memory and semaphore names cannot be
-//! listed there, so nothing can remove the ones a killed workload made. Python's
-//! `multiprocessing` makes them through a resource tracker process, which unlinks every
-//! name it was told about once its workload has gone (the pipe from the workload
-//! closes). Killed together with the workload, the tracker unlinks nothing and the names
-//! stay until the machine restarts. With SIGTERM first, a workload that ends on it
-//! closes the pipe and the tracker has the grace to do its work; a workload that ignores
-//! SIGTERM keeps the pipe open, and both are killed when the grace ends.
+//! A process that is killed with SIGKILL runs nothing on its way out. Python's
+//! `multiprocessing` makes POSIX shared memory and semaphore names through a resource
+//! tracker process, which unlinks every name it was told about once its workload has
+//! gone (the pipe from the workload closes). Killed together with the workload, the
+//! tracker unlinks nothing and the names stay. With SIGTERM first, a workload that ends
+//! on it closes the pipe and the tracker has the grace to do its work; a workload that
+//! ignores SIGTERM keeps the pipe open, and both are killed when the grace ends.
 //!
-//! So both places that end a lease's processes, the end of the lease
-//! ([`crate::procs`]' process tree and the slot user's processes) and the slot's clean,
-//! send SIGTERM first and give the processes up to a grace period to end
-//! (`--native-term-grace-ms`, [`crate::NativeConfig::term_grace`]), and only then
-//! SIGKILL whatever is left. A grace of zero is SIGKILL at once. [`term_first`] is that
-//! first half, with the signals, the process table and the clock passed in, so that it
-//! runs under test on every platform.
+//! So the end of a lease ([`crate::procs`]' process tree) sends SIGTERM first and gives
+//! the processes up to a grace period to end (`--native-term-grace-ms`,
+//! [`crate::NativeConfig::term_grace`]), and only then SIGKILLs whatever is left. A grace
+//! of zero is SIGKILL at once. [`term_first`] is that first half, with the signals, the
+//! process table and the clock passed in, so that it runs under test on every platform.
 //!
 //! A process that is still alive when the grace ends outlasted SIGTERM (it ignored it, or
 //! it was started after it was sent), and is named in the lease's stderr ([`note`]) as
@@ -27,11 +23,6 @@
 //! unchanged, and is at most [`MAX_GRACE`]. It is outside the action's timeout and the
 //! memory watch: both have ended the action before it starts and neither runs during it,
 //! so the longest an ending takes is the grace (60 s at most) plus `kill_wait`.
-//!
-//! What this cannot see: shared memory made without a tracker (Python's
-//! `SharedMemory(track=False)`, or C code calling `shm_open` and exiting without
-//! `shm_unlink`) is not removed by anything on macOS, and it is not reported either:
-//! the system offers no way to list the names, so there is nothing to compare.
 
 use std::time::Duration;
 
@@ -117,32 +108,6 @@ pub(crate) fn lenient(round: Result<Vec<Survivor>, String>, what: &str) -> Vec<S
         tracing::warn!("{what}: SIGTERM first did not complete ({why}); killing now");
         Vec::new()
     })
-}
-
-/// What `list` reads for the SIGTERM round, or `T::default()` without calling it when
-/// `grace` is zero: [`term_first`] looks at nothing then, so the read would be wasted.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub(crate) fn for_round<T: Default>(grace: Duration, list: impl FnOnce() -> T) -> T {
-    if grace.is_zero() {
-        T::default()
-    } else {
-        list()
-    }
-}
-
-/// The SIGTERM round `round` ([`lenient`]), then `kill` (given the survivors), which runs whatever the round
-/// gave. Returns the survivors with what `kill` returned.
-///
-/// # Errors
-/// `kill` failed.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub(crate) fn then_kill<K>(
-    round: Result<Vec<Survivor>, String>,
-    what: &str,
-    kill: impl FnOnce(&[Survivor]) -> Result<K, String>,
-) -> Result<(Vec<Survivor>, K), String> {
-    let survivors = lenient(round, what);
-    kill(&survivors).map(|killed| (survivors, killed))
 }
 
 /// `text` with control characters shown as escapes, so that an argument cannot add a

@@ -200,10 +200,7 @@ guaranteed:
   process dies, the native driver's actions included, and the containers' processes
   too when their cgroups are in the unit's delegated subtree, as under the units the
   deploy guides give ([linux-build-host.md](../deploy/linux-build-host.md#the-units),
-  [storage-node.md](../deploy/storage-node.md)), which keep that default. launchd, when a job exits, kills only the job's own process group
-  (`AbandonProcessGroup` false, the default; true stops even that), and has no
-  setting that reaches an action leading a group of its own, so on a Mac the shipped
-  plist's `KeepAlive` restart is the line after the keeper.
+  [storage-node.md](../deploy/storage-node.md)), which keep that default.
 - **Container: a `crun run` that outlasts the keeper's 30 seconds** of kills, and
   puts the container's process in the lease after the last one.
 - **Native: a process that left the group** (`setsid`): the keeper does not reach it,
@@ -215,7 +212,7 @@ guaranteed:
   new leader has exited while its group lives on: the record cannot tell that group
   from the action's.
 - **Native: the run records.** They are trusted because only the daemon can write
-  `runs/`. On macOS the sandbox ensures it. On Linux there is no sandbox until each
+  `runs/`. On Linux there is no sandbox until each
   lease runs as its own user, so an action, which runs as the daemon's user, can write
   a well-formed record there naming a group of that user, with its pid and start time
   (both readable in `/proc`), and the next start then SIGKILLs that group and every
@@ -261,12 +258,12 @@ its exit code. Its errors map to the `Result` status the server sees:
 | `Failed(why)` | `INTERNAL`: the farm's failure |
 | `Lost(why, message)` | `UNAVAILABLE` with `Result.lost` (daemon restarted, or fenced): the farm lost the run, which the server runs again |
 
-Five runtimes exist. The `kbf-daemon` binary (crate `kbf-node`) offers all but
+Four runtimes exist. The `kbf-daemon` binary (crate `kbf-node`) offers all but
 `LocalRuntime`, picked by `--driver`, which may be given more than once: one runtime per
 driver, each driver once, the node's own (native or container) set up first, then the
 others in the order given. Two that serve the same kind refuse to start (`container`,
-`native` and `fake` all serve `action`); a Mac runs `--driver native --driver
-native-whole-machine`.
+`native` and `fake` all serve `action`). The Macs run no `kbf-daemon`: a macOS action runs as a
+js-agent job ([actions-as-jobs.md](actions-as-jobs.md) section 14).
 
 - **`ContainerRuntime`** (`kbf-driver-container`, driver `container`, Linux only): the
   runtime for Linux farm nodes, below. The binary requires `--data-dir` and `--cas`, and
@@ -299,24 +296,8 @@ native-whole-machine`.
   [docs/deploy/linux-build-host.md](../deploy/linux-build-host.md) has the systemd
   units and the host's swap and memory headroom.
 - **`NativeRuntime`** (`kbf-driver-native`, driver `native`): each action as plain
-  processes on the node, for Macs. The macOS end state (a root daemon, a reused pool of
-  unprivileged lease users cleaned between leases, one long-lived GUI user for
-  whole-machine leases) is in [macos-end-state.md](macos-end-state.md) (**planned**).
-- **`WholeMachineRuntime`** (`kbf-driver-native`, driver `native-whole-machine`, macOS
-  only): each `whole_machine` lease as a throwaway user in that user's GUI session,
-  through the root helper `kbf-mac-session`
-  ([fleet-updates.md](fleet-updates.md#101-no-gpu-in-vms)). The binary requires
-  `--data-dir` (its files go in `<scratch>/whole-machine`) and `--cas`, and refuses to
-  start when nothing serves `--mac-session-socket`. It hands the daemon its phase
-  (`Daemon::with_phase`), which every `Hello` carries
-  ([worker-protocol.md](worker-protocol.md#node-phases)): the session switch restarts
-  the daemon, and the runtime takes the lease up again from its on-disk record when the
-  server sends the `Start` again. `--daemon-user` names the daemon's own user, which the
-  lease directory's access control entries keep able to read and remove what the lease
-  user writes.
-- **`VmDriver`** (`kbf-driver-vm`, driver `vm`): each `vm` lease in a macOS VM of its
-  own ([macos-vms.md](macos-vms.md#what-main-has)). Not offered by `--driver` yet; on
-  `main` it runs over a fake host only.
+  processes on the node, on Linux (the beta smoke farm runs it). It enforces no network
+  isolation and reports `network_isolation` `none`.
 - **`FakeRuntime`** (driver `fake`): runs nothing and returns an empty result, for
   bring-up. It serves `action`; `FakeRuntime::serving` makes one serve another kind
   under another driver name, so a daemon with several runtimes can be tested with fakes.
@@ -647,9 +628,9 @@ makes `actions/kbf-lease-<term>-<seq>` and puts the container under it.
   or the last lease ends, the next `Hello` says serving. Leases that run are not
   touched. It cannot deadlock: it pauses only while a lease runs, and every lease
   ends, so a node whose stall comes from outside (another process on the box) still
-  takes one lease at a time. Where the file cannot be read (macOS, a kernel without
+  takes one lease at a time. Where the file cannot be read (a kernel without
   pressure stall information) the daemon logs that the backstop is off and never
-  pauses. A runtime's own phase (a session switch, a quarantine) comes first. It does
+  pauses. A runtime's own phase comes first. It does
   not replace the `actions/` limit: that kills, this only stops adding load.
 - **CPU** is compressible: `cpu.weight` = booked millicores / 10, clamped to 1..10000
   (one core is the kernel's default weight of 100). The driver never sets `cpu.max`,
@@ -861,7 +842,7 @@ current) has no line: that is how a **cancelled** lease ends. Its usage is in th
 daemon's `lease phases:` line, which joins on `lease=` to the server's `lease granted`
 line, and that line names the `key` too. A report without a `ResourceUsage` has no line.
 
-On a node without lease cgroups (macOS) the CPU and memory fields come from the
+On a node without lease cgroups (the native driver) the CPU and memory fields come from the
 `ResourceUsage` footprint block instead: `cpu_usage_us` is the action's user plus system
 CPU time (shown only when both are known), `cpu_user_us` and `cpu_system_us` those two,
 and `mem_peak` the peak physical footprint, which is not a cgroup's `memory.peak`; the

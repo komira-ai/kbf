@@ -1,8 +1,5 @@
-//! The native drivers for `kbf-daemon`: [`NativeRuntime`] runs each `action` lease as
-//! plain processes on the node, for Macs (where there are no containers), and
-//! [`whole_machine::WholeMachineRuntime`] each `whole_machine` lease as its own user in
-//! that user's GUI session, through `kbf-mac-session`; both behind the daemon's
-//! `Runtime` trait. The rest of this page is about `NativeRuntime`.
+//! The native driver for `kbf-daemon`: [`NativeRuntime`] runs each `action` lease as
+//! plain processes on the node, on Linux, behind the daemon's `Runtime` trait.
 //!
 //! What one lease gets:
 //! - a fresh lease directory under the configured scratch root, the input root written
@@ -13,37 +10,17 @@
 //! - its `arguments` run with those variables and the Command's environment (which wins
 //!   where both name a variable) and nothing else, stdin from `/dev/null`, stdout and
 //!   stderr captured to files, as the leader of a new process group;
-//! - on macOS, a `sandbox-exec` sandbox around every action ([`network`]): no file
-//!   written outside the lease directory and `/dev` but the few names macOS tools
-//!   write in the daemon user's temporary folder whatever `TMPDIR` says (Foundation's
-//!   temporary items, `xcrun`'s cache, Swift Build's scratch directory:
-//!   [`user_folders`], whose leftovers but Swift Build's are swept),
-//!   no user preference written through
-//!   `cfprefsd` (`defaults write`), no work handed to launchd
-//!   (`open`, `launchctl submit`/`load`/`bootstrap`), and no network when the
-//!   action's `network` platform property is `off` or `none` (absent means on);
-//!   elsewhere nothing is enforced,
-//!   and the node reports which in its `network_isolation` capability;
-//! - on macOS, for an action that failed under the sandbox, the sandbox's refusals of its
-//!   processes, read from the unified log and added to the end of its stderr and to the
-//!   node's log, capped ([`denials`]): otherwise a refused write is only `EPERM`;
-//! - the Xcode its `xcode` platform property names, as `DEVELOPER_DIR` ([`xcode`]: the
-//!   driver advertises every ready Xcode build, reports every installed Xcode with why
-//!   one is not ready and how to fix it, and asks again every few minutes,
-//!   [`xcode_watch`]);
-//! - a simulator of its own when its `simulator` platform property asks for one
-//!   ([`simulator`]): made in the default device set under the lease's name when the
-//!   lease starts, named by `KBF_SIMULATOR_UDID`, and shut down and deleted when it
-//!   ends, whatever the outcome (at the next start, if the daemon was killed);
+//! - no sandbox: the action runs as the daemon's user with the node's network whatever
+//!   its `network` platform property says (a value that property does not define is
+//!   still refused), and the node reports that in its `network_isolation` capability
+//!   ([`network`]);
 //! - a memory watch: every poll, the physical footprint of all the action's processes
 //!   together ([`procs`]); past the lease's limit, the whole tree is killed and the
 //!   lease ends RESOURCE_EXHAUSTED ([`kbf_daemon::RuntimeError::OutOfMemory`]);
 //! - an end that asks first: SIGTERM to every process of the lease, up to
 //!   [`NativeConfig::term_grace`] for them to go, then SIGKILL ([`grace`]); the grace is
 //!   outside the timeout and the memory watch, and at most 60 s; a process that
-//!   ignored SIGTERM is named in the lease's stderr. Shared memory a workload made with no
-//!   tracker process to remove it cannot be detected or cleaned on macOS, and is not
-//!   reported;
+//!   ignored SIGTERM is named in the lease's stderr;
 //! - a wall-clock timeout, and the daemon's kill, each ending the whole process tree;
 //!   a timeout still stores what the action wrote to stdout and stderr
 //!   ([`kbf_daemon::RuntimeError::TimedOut`]);
@@ -54,13 +31,12 @@
 //!   level; depth, entry, byte and stdio limits; files of more than a chunk streamed
 //!   to the CAS ([`kbf_daemon::Cas::put_chunks`]); names that are not UTF-8 refused;
 //! - the lease directory removed afterwards (`kbf_outputs::remove_tree`: iterative,
-//!   by descriptor, giving back permissions the action took away and, on macOS,
-//!   clearing the immutable and append-only flags and the ACLs it set); a lease directory
+//!   by descriptor, giving back permissions the action took away); a lease directory
 //!   that stays fails the lease, so a dirty node is loud. A run the daemon drops is
 //!   cleaned by `Drop`.
 //!
-//! The container driver's own output walk is public too, but does not build on macOS;
-//! moving it onto `kbf-outputs` is a follow-up.
+//! A macOS action does not run here: the farm sends it to a `js-agent` job on the Mac
+//! (`docs/design/actions-as-jobs.md`, section 14).
 //!
 //! Before an action's program runs, its run record (the leader's pid, start time and
 //! boot) is written under `runs/` in the scratch root (`record`): the child waits
@@ -75,92 +51,43 @@
 //! Until then, each action's keeper (`keeper`), a member of its group, kills the group
 //! when the daemon dies, restarted or not.
 //!
-//! **A root daemon with a lease-user pool** (macOS, `--pool-users`; [`slots`],
-//! docs/design/macos-end-state.md step 3) runs every action as a pool user of its own
-//! instead, one per slot, through `launchctl asuser` and the `as-user` drop: the
-//! sandbox lets it write its slot user's real home and `/var/folders` entry too, and no
-//! longer denies preference writes, `open` or launchd jobs; its memory, its end, its
-//! keeper and the start-up are each "every process of the slot's uid"
-//! ([`kbf_daemon::uid`]), so the process-tree gaps below do not apply to it. A root
-//! daemon without a pool refuses to start. Between two leases the slot is cleaned
-//! ([`slots::clean`]): its launchd domain, home, folders, keychains, preferences,
-//! crontab, `at` jobs, disk images, IPC objects and crash reports, in one pass, checked
-//! after; a slot whose clean fails is dirty (not offered, the node reports one slot
-//! fewer) and is cleaned again before it is offered. What the pool does not do yet: make simulators
-//! in the slot user's device set (a lease that asks for one fails).
-//!
 //! Known gaps, all of them closed only by running each lease as its own user:
 //! - **Processes that leave the tree.** A process that calls `setsid` and is orphaned
-//!   between two polls is not seen ([`procs`]), so it outlives the lease. Work handed
-//!   to launchd would run outside the tree and the sandbox: every action is
-//!   sandboxed, so launchd refuses it a job and the profile denies it `open`
-//!   ([`network::BASE_PROFILE`]). Not covered: other mach and XPC services, Apple
-//!   Events among them (`osascript` asking Terminal or Finder to run something), and
-//!   anything else the daemon's user can schedule (a `LaunchAgents` plist run at its
-//!   next login, `at`, `cron`, a loopback service). The services that reach an iOS
-//!   device are refused ([`network::NO_DEVICE_RULES`]).
+//!   between two polls is not seen ([`procs`]), so it outlives the lease.
 //! - **The daemon's own files.** Actions run as the daemon's user, so they can read
-//!   what it can, the node's TLS private key (`--key`) included. On macOS the
-//!   profile keeps their file writes inside their own lease directory: the ways
-//!   `tests/sandbox.rs` tries on the macOS runner (create, append, unlink, rename,
-//!   chmod, mkdir, extended attributes, `/tmp`, a hard link to a file outside the lease
-//!   or in another lease, a preference write) are all refused, so none of them changes
-//!   other leases' directories, the scratch root, `quarantine/` or the daemon's
-//!   configuration. A service that writes on an action's behalf by another route
-//!   than those is not covered (the mach and XPC gap above). On Linux (no sandbox)
-//!   they can, and an action that locks the
-//!   scratch root or `quarantine/` (`chmod 555`) makes every later lease on the node
-//!   fail until an operator unlocks it.
-//! - **The user's temporary folder.** The names there the sandbox opens to every lease
-//!   ([`user_folders`]) are shared: a lease can see and change the temporary files
-//!   another lease has open there (a running build's Swift Build scratch directory
-//!   among them), and rewrite `xcrun`'s cache, which the next lease's
-//!   compiler shims read to find their tools.
+//!   and write what it can, the node's TLS private key (`--key`) included. An action
+//!   that locks the scratch root or `quarantine/` (`chmod 555`) makes every later lease
+//!   on the node fail until an operator unlocks it.
 //! - **The signal race.** [`procs::kill_all`] signals pids from a snapshot; one
 //!   recycled in between is a process of the daemon's user killed by mistake.
 //! - **The run records.** The start-up sweep trusts `runs/` because only the daemon
-//!   writes it: on macOS the sandbox keeps actions out of it. On Linux an action, which
-//!   runs as the daemon's user, can write a well-formed record there (pids and start
-//!   times are readable in `/proc`), and the next start SIGKILLs every process of that
-//!   user in the group it names or below it. That holds for a group the daemon may not
-//!   signal too: another user's group is left alone, but the walk goes on below it and
-//!   kills the daemon's user's processes there. Only a record naming the daemon's own
-//!   group or its parent's is dropped without its group being walked. What is not a
-//!   regular file of the daemon's user that only it may write is set aside unread, and
-//!   neither another user's processes nor those the daemon never signals
-//!   ([`procs::Guards`]) are counted as survivors, so a forged entry cannot stop or hang
-//!   a start.
-//! - **Network "off" is not airtight**: Unix sockets stay open, the system resolver's
-//!   among them, so DNS lookups still leave the node and can carry data ([`network`]).
+//!   writes it, but an action, which runs as the daemon's user, can write a well-formed
+//!   record there (pids and start times are readable in `/proc`), and the next start
+//!   SIGKILLs every process of that user in the group it names or below it. That holds
+//!   for a group the daemon may not signal too: another user's group is left alone, but
+//!   the walk goes on below it and kills the daemon's user's processes there. Only a
+//!   record naming the daemon's own group or its parent's is dropped without its group
+//!   being walked. What is not a regular file of the daemon's user that only it may
+//!   write is set aside unread, and neither another user's processes nor those the
+//!   daemon never signals ([`procs::Guards`]) are counted as survivors, so a forged
+//!   entry cannot stop or hang a start.
 //!
 //! Not yet: a per-lease user (which would make "every process of the action" exact,
 //! keep actions out of each other's files and the daemon's key, and close the gaps
-//! above), CPU limits, and network isolation on Linux.
+//! above), CPU limits, and network isolation.
 
-#[cfg(any(target_os = "macos", test))]
-mod bounded;
 mod cas;
 mod config;
-pub mod denials;
 pub mod grace;
 pub mod home;
 mod keeper;
 pub mod leader;
-pub mod mounts;
 pub mod network;
-mod pace;
 pub mod procs;
 mod program;
 mod record;
 mod runtime;
-pub mod simulator;
-pub mod slots;
 mod sweep;
-pub mod usage;
-pub mod user_folders;
-pub mod whole_machine;
-pub mod xcode;
-pub mod xcode_watch;
 
 // The keepers this crate's unit tests start come from the test binary.
 #[cfg(test)]
@@ -195,14 +122,20 @@ pub(crate) fn act_link(dir: &std::path::Path) -> std::path::PathBuf {
     std::fs::rename(&made, &link).expect("place the link");
     link
 }
-// So do the act steps and the fake Xcode tools they run (src/xcode_tests.rs).
+
+/// A link to this test binary named `kbf-act`, made once: run through it, the binary
+/// runs kbf-testkit's act steps (`kbf_testkit::act`) instead of the tests.
+#[cfg(test)]
+pub(crate) fn act() -> std::path::PathBuf {
+    static LINK: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    LINK.get_or_init(|| act_link(&unit_root().join("act")))
+        .clone()
+}
+// So do the act steps the unit tests run.
 #[cfg(test)]
 kbf_testkit::act_test_hook!();
-// And the `as-user` mode an action of a lease-user pool starts through.
-#[cfg(test)]
-as_user_test_hook!();
 
 pub use cas::CasStore;
 pub use config::{DEFAULT_TERM_GRACE, MemoryPolicy, NativeConfig};
 pub use record::{Record, boot_id};
-pub use runtime::{DRIVER, KIND, NativeRuntime, SURVEY_DIR, WARM_UP_DIR};
+pub use runtime::{DRIVER, KIND, NativeRuntime};

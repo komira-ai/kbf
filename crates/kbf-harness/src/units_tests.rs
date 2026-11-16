@@ -94,7 +94,7 @@ fn every_mode_has_its_settings_and_each_key_has_its_table() {
     assert_eq!(daemon["data-dir"], ("daemon", false));
     // A commented key (no default) is a key, and a switch is a live `= false` line.
     assert_eq!(daemon["image"], ("daemon", false));
-    assert_eq!(daemon["require-metal-toolchain"], ("macos", true));
+    assert_eq!(daemon["no-input-cache"], ("daemon", true));
     assert_eq!(keys(Mode::Frontend)["handover-socket"], ("handover", false));
     // The help text of a setting is not a key.
     assert!(!daemon.contains_key("#"));
@@ -252,19 +252,15 @@ fn remove_of_a_flag_the_mode_does_not_take_panics() {
 fn a_switch_is_given_without_a_value_and_a_value_flag_with_one() {
     // Catches: `--switch=true` written as a string (kbf refuses a switch that is not a
     // boolean), or a value flag written as a switch.
-    let on = unit(Mode::Daemon).set(&["--require-metal-toolchain".to_owned()]);
-    assert!(has(&on, "--require-metal-toolchain"));
-    assert!(
-        on.toml().contains("require-metal-toolchain = true"),
-        "{}",
-        on.toml()
-    );
+    let on = unit(Mode::Daemon).set(&["--no-input-cache".to_owned()]);
+    assert!(has(&on, "--no-input-cache"));
+    assert!(on.toml().contains("no-input-cache = true"), "{}", on.toml());
 }
 
 #[test]
-#[should_panic(expected = "--require-metal-toolchain is a switch")]
+#[should_panic(expected = "--no-input-cache is a switch")]
 fn a_switch_with_a_value_panics() {
-    let _ = unit(Mode::Daemon).set(&["--require-metal-toolchain=true".to_owned()]);
+    let _ = unit(Mode::Daemon).set(&["--no-input-cache=true".to_owned()]);
 }
 
 #[test]

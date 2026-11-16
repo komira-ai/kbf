@@ -5,8 +5,8 @@
 //! - **The expected list.** Every job a pull request can run on a macOS runner is one of
 //!   [`PR_MACOS_JOBS`], with its gate ([`Gate`]): macos-pr.yml's two jobs with none at all (no
 //!   `if:`, so they run, and report, on every pull request), artifacts.yml's darwin build behind
-//!   exactly its label condition ([`LABEL_IF`]), and the jobs of the three workflows that have
-//!   their own `pull_request.paths` (none of them `*` or `**`). A macOS job (any case of
+//!   exactly its label condition ([`LABEL_IF`]), and the jobs of the workflow that has
+//!   its own `pull_request.paths` (none of them `*` or `**`): host-install-mac.yml. A macOS job (any case of
 //!   `macos-`) of a workflow that runs on `pull_request` is a pull request's unless its `if:` is
 //!   exactly [`NOT_ON_A_PULL_REQUEST`] (ci.yml's `task-macos`, which runs after the merge); a job
 //!   of such a workflow that calls a local workflow with a macOS job is refused, as the lint cannot
@@ -71,11 +71,9 @@ pub enum Gate {
 }
 
 /// Every job a pull request can run on a macOS runner, `(workflow, job, gate)`.
-pub const PR_MACOS_JOBS: [(&str, &str, Gate); 6] = [
+pub const PR_MACOS_JOBS: [(&str, &str, Gate); 4] = [
     ("artifacts.yml", "darwin-arm64", Gate::Label),
     ("host-install-mac.yml", "real-mac", Gate::TriggerPaths),
-    ("mac-provision.yml", "darwin-arm64", Gate::TriggerPaths),
-    ("vmm-probe.yml", "darwin-arm64", Gate::TriggerPaths),
     (MACOS_PR, "macos-test", Gate::Always),
     (MACOS_PR, "macos-device", Gate::Always),
 ];

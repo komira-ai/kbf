@@ -1,8 +1,8 @@
 # Fast per-action sandboxes: shared read-only trees and a direct OCI runtime
 
 Status: describes what is built on `main`. Applies to the Linux container driver
-(`crates/kbf-driver-container`) and to the shared input trees in `crates/kbf-daemon/src/trees`. The
-macOS native driver uses the same trees by cloning (section 8). Anything not built is marked
+(`crates/kbf-driver-container`) and to the shared input trees in `crates/kbf-daemon/src/trees`. No
+daemon runs on a Mac (section 8). Anything not built is marked
 **Planned:** and collected in section 9. Earlier drafts of this document proposed more than was built
 (a bulk linker, a recurrence rule, `--tree-*` flags, tool bundles, measurement gates); where the code
 differs, this text follows the code.
@@ -49,7 +49,6 @@ runtime the driver has; there is no podman backend and no `--container-runtime` 
   an action's container and `true` for helper containers (`spec.rs`, `helper.rs`).
 - **Image pinned by digest** (section 6.2). The container's root is the unpacked image, read-only.
 - **Outputs are read only from the overlay's upper layer** (section 3.1).
-- **Mac stays native.** The macOS driver is not a container driver; it shares the trees (section 8).
 
 ## 3. Architecture
 
@@ -164,8 +163,7 @@ built, held until evicted, and costs a build.
 2. **Build** in `trees/.tmp-<n>` (`build::build`): the Directory tree is written with the same
    machinery as a lease's input root, `make_directories` for the directories and symlinks and
    `write_files_as` for the files, which are hard links to the cache's entries (so a tree's files are
-   the cache's inodes, owned by the daemon user and mode 0444 or 0555). Files are not copied. On
-   macOS they are clones left read-only.
+   the cache's inodes, owned by the daemon user and mode 0444 or 0555). Files are not copied.
 3. **Check** (`build::verify`) before the tree is named: the same names of the same kinds as the
    Directory messages, each file's size and executable bit, no group or other write bit, each symlink's
    target; directories are set to 0755. File contents are not re-hashed here: the cache hashes its
@@ -318,13 +316,7 @@ that names a missing one refuses to start. The node also needs `newuidmap` and `
 
 ## 8. macOS
 
-`Delivery::Clone`: macOS has no bind or overlay mounts. The store's trees are built from clones of the
-cache's entries (read-only, as the cache's own), and an action's copy of a tree is **one `clonefile`**
-of the tree's directory into its input root. The clone is the lease's own (copy-on-write, its own
-inodes, moded like the other inputs), so an action may write it and the tree stays as it was; the store
-lies outside every lease directory, where the sandbox lets nothing be written. A volume that refuses the
-clone (`ENOTSUP`, `EXDEV`) gets the tree's files one by one and the refusal is logged once per node.
-The native driver on Linux never uses the cache or the trees.
+No kbf daemon runs on a Mac: a macOS action is a job of the job service's Macs ([actions-as-jobs.md](actions-as-jobs.md), section 14), and nothing here applies to it.
 
 ## 9. Planned, and what is not measured
 

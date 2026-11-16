@@ -3,20 +3,13 @@
 //! (`docs/design/capabilities.md#the-node-report`).
 //!
 //! Detection reads the text the kernel publishes and hands it to `kbf-caps`, which
-//! owns the parsing. On Linux and on macOS (Apple silicon) it reports `arch`, `os`,
-//! every `isa_level` the CPU reaches, every `cpu.features` flag, `cpus`, `mem_gib`,
-//! `page_size`, `gpu`, and the `drivers` the daemon was started with; on macOS
-//! `cpu.model` too. A Linux node reads `/proc`, and counts its GPUs among the PCI
-//! functions in sysfs (0 when there are none, or no PCI bus). A Mac asks `sysctl` for
-//! `hw.optional` (the text `kbf-caps` parses), `hw.ncpu`, `hw.memsize`, `hw.pagesize`,
-//! `machdep.cpu.brand_string` and `kern.hv_vmm_present`. Its one GPU is a slot the
-//! scheduler books (`gpu` 1, so one GPU lease runs on the Mac at a time) with the
-//! entries `gpu.kind` (`native`), `gpu.cores` (the `gpu-core-count` of the IOKit
-//! registry, which `ioreg` prints; `sysctl` has no GPU core count) and
-//! `gpu.metal_family` (from the chip's name). A Mac that is a guest
-//! (`kern.hv_vmm_present` is 1) reports `gpu` 0 and no GPU entries: a paravirtual
-//! GPU is not the hardware. [`NodeReport::with_entries`] adds what the command line and
-//! the driver add: driver capabilities.
+//! owns the parsing. On Linux it reports `arch`, `os`, every `isa_level` the CPU
+//! reaches, every `cpu.features` flag, `cpus`, `mem_gib`, `page_size`, `gpu`, and the
+//! `drivers` the daemon was started with. A Linux node reads `/proc`, and counts its GPUs
+//! among the PCI functions in sysfs (0 when there are none, or no PCI bus).
+//! [`NodeReport::with_entries`] adds what the command line and the driver add: driver
+//! capabilities. A macOS action runs as a js-agent job, not under this daemon
+//! (`docs/design/actions-as-jobs.md`, section 14).
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -36,7 +29,7 @@ pub enum DetectError {
         #[source]
         source: std::io::Error,
     },
-    /// `/proc/cpuinfo` or `sysctl hw.optional` could not be parsed.
+    /// `/proc/cpuinfo` could not be parsed.
     #[error("parse the CPU description: {0}")]
     Cpu(#[from] kbf_caps::ParseError),
     /// A PCI function's sysfs entry could not be read.
@@ -175,23 +168,8 @@ fn detect_here(drivers: &[&str]) -> Result<NodeReport, DetectError> {
     linux_report(&cpuinfo, &meminfo, &smaps, gpus, drivers)
 }
 
-/// This Mac's report.
-#[cfg(target_os = "macos")]
-fn detect_here(drivers: &[&str]) -> Result<NodeReport, DetectError> {
-    let optional = sysctl(&["hw.optional"])?;
-    let numbers = sysctl(&[
-        "-n",
-        "hw.ncpu",
-        "hw.memsize",
-        "hw.pagesize",
-        "machdep.cpu.brand_string",
-        "kern.hv_vmm_present",
-    ])?;
-    macos_report(&optional, &numbers, &ioreg(), drivers)
-}
-
 /// No detection here yet.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(target_os = "linux"))]
 fn detect_here(_drivers: &[&str]) -> Result<NodeReport, DetectError> {
     Err(DetectError::UnsupportedOs(std::env::consts::OS))
 }
@@ -199,110 +177,6 @@ fn detect_here(_drivers: &[&str]) -> Result<NodeReport, DetectError> {
 #[cfg(target_os = "linux")]
 fn read(path: &'static str) -> Result<String, DetectError> {
     std::fs::read_to_string(path).map_err(|source| DetectError::Read { path, source })
-}
-
-/// Where macOS keeps `sysctl`.
-const SYSCTL: &str = "/usr/sbin/sysctl";
-
-/// Where macOS keeps `ioreg`.
-#[cfg(target_os = "macos")]
-const IOREG: &str = "/usr/sbin/ioreg";
-
-/// The standard output of `sysctl` with `args`.
-#[cfg(any(target_os = "macos", test))]
-fn sysctl(args: &[&str]) -> Result<String, DetectError> {
-    run(SYSCTL, args)
-}
-
-/// The standard output of the program at `program` (`/usr/sbin/<name>`) with `args`.
-#[cfg(any(target_os = "macos", test))]
-fn run(program: &'static str, args: &[&str]) -> Result<String, DetectError> {
-    let failed = |source: std::io::Error| DetectError::Read {
-        path: program,
-        source,
-    };
-    let out = std::process::Command::new(program)
-        .args(args)
-        .output()
-        .map_err(failed)?;
-    if !out.status.success() {
-        let name = program.rsplit('/').next().unwrap_or(program);
-        return Err(failed(std::io::Error::other(format!(
-            "{name} {} exited with {}: {}",
-            args.join(" "),
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim()
-        ))));
-    }
-    String::from_utf8(out.stdout).map_err(|e| failed(std::io::Error::other(e)))
-}
-
-/// The IOKit registry's entry for the GPU, as `ioreg` prints it: what
-/// `gpu.cores` is read from. Empty where `ioreg` fails or lists no GPU; the report then
-/// has no core count, and the node still starts.
-#[cfg(target_os = "macos")]
-fn ioreg() -> String {
-    run(IOREG, &["-r", "-d", "1", "-c", "AGXAccelerator"]).unwrap_or_else(|e| {
-        tracing::warn!(error = %e, "ioreg failed: gpu.cores is not reported");
-        String::new()
-    })
-}
-
-/// The report of an Apple silicon Mac from `sysctl hw.optional` (`optional`),
-/// `sysctl -n hw.ncpu hw.memsize hw.pagesize machdep.cpu.brand_string
-/// kern.hv_vmm_present` (`numbers`, one value per line in that order; a missing last
-/// line is a Mac on the hardware) and `ioreg -r -d 1 -c AGXAccelerator` (`ioreg`).
-pub fn macos_report(
-    optional: &str,
-    numbers: &str,
-    ioreg: &str,
-    drivers: &[&str],
-) -> Result<NodeReport, DetectError> {
-    let cpu = CpuCaps::from_macos_sysctl(optional)?;
-    let mut lines = numbers.lines().map(str::trim);
-    let mut number = |what: &'static str| {
-        lines
-            .next()
-            .and_then(|line| line.parse::<u64>().ok())
-            .filter(|&n| n > 0)
-            .ok_or(DetectError::Missing { path: SYSCTL, what })
-    };
-    let cpus = number("hw.ncpu")?;
-    let mem_bytes = number("hw.memsize")?;
-    let page_size = number("hw.pagesize")?;
-    let model = lines
-        .next()
-        .filter(|line| !line.is_empty())
-        .ok_or(DetectError::Missing {
-            path: SYSCTL,
-            what: "machdep.cpu.brand_string",
-        })?;
-    let guest = lines.next() == Some("1");
-    // One GPU, booked whole, when the daemon runs on the hardware; none in a guest. The
-    // text parsed above, so counting its GPUs cannot fail here.
-    let gpus = if guest {
-        0
-    } else {
-        kbf_caps::gpus_from_macos_sysctl(optional).unwrap_or(0)
-    };
-    let mut entries = common_entries(
-        &cpu,
-        "macos",
-        cpus,
-        mem_bytes >> 30,
-        page_size,
-        gpus,
-        drivers,
-    );
-    entries.push(("cpu.model".into(), model.into()));
-    if gpus > 0 {
-        entries.push(("gpu.kind".into(), kbf_caps::GPU_KIND_NATIVE.into()));
-        let cores = kbf_caps::gpu_cores_from_macos_ioreg(ioreg);
-        entries.extend(cores.map(|n| ("gpu.cores".into(), n.to_string())));
-        let family = kbf_caps::metal_family_of_apple_chip(model);
-        entries.extend(family.map(|n| ("gpu.metal_family".into(), n.to_string())));
-    }
-    Ok(NodeReport::new(entries))
 }
 
 /// The entries every node reports.
@@ -528,213 +402,40 @@ mod tests {
         );
     }
 
-    const M3_ULTRA: &str = include_str!("../../kbf-caps/tests/fixtures/apple_m3_ultra.sysctl");
-    const M3_IOREG: &str = include_str!("../../kbf-caps/tests/fixtures/apple_m3_ultra.ioreg");
-    const MAC_NUMBERS: &str = "32\n274877906944\n16384\nApple M3 Ultra\n0\n";
-
-    /// Catches: a Mac report that drops a feature, names the OS or architecture other
-    /// than the matcher's keys spell them, reads memory in the wrong unit, loses the
-    /// CPU model, or books no GPU (the scheduler would never send GPU work to the Mac);
-    /// and one that accepts `sysctl` output missing a value instead of refusing to
-    /// start.
-    #[test]
-    fn a_mac_reports_its_features_counts_and_model() {
-        let r = macos_report(M3_ULTRA, MAC_NUMBERS, M3_IOREG, &["native"]).expect("report");
-        let cpu = CpuCaps::from_macos_sysctl(M3_ULTRA).expect("fixture parses");
-        let want: Vec<&str> = cpu.features().iter().map(String::as_str).collect();
-        assert!(want.contains(&"aes"), "fixture sanity");
-        assert_eq!(values(&r, "cpu.features"), want);
-        assert_eq!(values(&r, "arch"), ["arm64"]);
-        assert_eq!(values(&r, "os"), ["macos"]);
-        assert_eq!(values(&r, "cpus"), ["32"]);
-        assert_eq!(values(&r, "mem_gib"), ["256"]);
-        assert_eq!(values(&r, "page_size"), ["16384"]);
-        assert_eq!(values(&r, "cpu.model"), ["Apple M3 Ultra"]);
-        assert_eq!(values(&r, "drivers"), ["native"]);
-        assert_eq!(values(&r, "gpu"), ["1"]);
-        assert_eq!(values(&r, "gpu.kind"), ["native"]);
-        assert_eq!(values(&r, "gpu.cores"), ["80"]);
-        assert_eq!(values(&r, "gpu.metal_family"), ["9"]);
-        assert!(!values(&r, "isa_level").is_empty());
-        for (numbers, what) in [
-            ("", "hw.ncpu"),
-            ("x\n", "hw.ncpu"),
-            ("8\n0\n", "hw.memsize"),
-            ("8\n1024\n", "hw.pagesize"),
-            ("8\n1024\n16384\n", "machdep.cpu.brand_string"),
-            ("8\n1024\n16384\n\n", "machdep.cpu.brand_string"),
-        ] {
-            // Compared as text: a pattern guard would be a branch the coverage ratchet
-            // counts and no run takes.
-            let error = macos_report(M3_ULTRA, numbers, M3_IOREG, &[]).expect_err(numbers);
-            assert_eq!(
-                error.to_string(),
-                format!("{SYSCTL} has no {what}"),
-                "{numbers:?}"
-            );
-        }
-        assert!(matches!(
-            macos_report("hw.optional.arm64: 0\n", MAC_NUMBERS, M3_IOREG, &[]),
-            Err(DetectError::Cpu(_))
-        ));
-    }
-
     /// Catches: a report the scheduler reads differently from what build tools ask
-    /// for, so Mac actions (`OSFamily=Darwin`, `ISA=arm-a64`, as Bazel and Buck2 send
-    /// them) never find the Mac, or Linux actions land on it. The server reads `Hello`
-    /// with `NodeCaps::from_report` over these same entries; a report it refuses (an
-    /// arch spelling it does not know, a repeated single-valued entry) fails here too.
+    /// for, so Linux actions (`OSFamily=Linux`, `ISA=x86-64`) never find the node, or
+    /// Darwin actions land on it. The server reads `Hello` with `NodeCaps::from_report`
+    /// over these same entries; a report it refuses (an arch spelling it does not know, a
+    /// repeated single-valued entry) fails here too.
     #[test]
     fn reports_satisfy_the_platforms_build_tools_send() {
         use kbf_caps::{NodeCaps, Request};
-        let caps = |r: &NodeReport| {
-            let entries = r.capabilities().iter();
-            NodeCaps::from_report(entries.map(|c| (c.key.as_str(), c.value.as_str())))
-                .expect("the server reads the report")
-        };
-        let mac =
-            caps(&macos_report(M3_ULTRA, MAC_NUMBERS, M3_IOREG, &["native"]).expect("report"));
-        let linux = caps(&linux_report(SKYLAKE, MEMINFO, SMAPS, 0, &["fake"]).expect("report"));
+        let entries = linux_report(SKYLAKE, MEMINFO, SMAPS, 0, &["fake"]).expect("report");
+        let linux = NodeCaps::from_report(
+            entries
+                .capabilities()
+                .iter()
+                .map(|c| (c.key.as_str(), c.value.as_str())),
+        )
+        .expect("the server reads the report");
         let wants = |props: &[(&str, &str)]| {
             Request::from_platform(props.iter().copied()).expect("a platform kbf serves")
         };
         for props in [
-            &[("OSFamily", "Darwin")][..],
-            &[("OSFamily", "macos")],
-            &[("osfamily", "darwin")],
-            &[("OSFamily", "Darwin"), ("ISA", "arm-a64")],
-            &[("Arch", "arm64"), ("cpu.model", "Apple M3 Ultra")],
-        ] {
-            let want = wants(props);
-            assert!(want.matches(&mac), "the Mac does not satisfy {props:?}");
-            assert!(!want.matches(&linux), "Linux satisfies {props:?}");
-        }
-        for props in [
             &[("OSFamily", "Linux")][..],
             &[("OSFamily", "linux"), ("ISA", "x86-64")],
         ] {
-            let want = wants(props);
-            assert!(want.matches(&linux), "Linux does not satisfy {props:?}");
-            assert!(!want.matches(&mac), "the Mac satisfies {props:?}");
+            assert!(
+                wants(props).matches(&linux),
+                "Linux does not satisfy {props:?}"
+            );
         }
-    }
-
-    /// Catches: a Mac that advertises its GPU when it cannot be offered, or lacks the
-    /// entries a request for a native GPU reads: a guest (`kern.hv_vmm_present` 1) taken
-    /// for the hardware (its paravirtual GPU would be booked as the real one); a missing
-    /// last `sysctl` line taken for a guest; a core count or Metal family invented when
-    /// `ioreg` printed nothing or the chip is not in the table (the entry is left out,
-    /// and the Mac still books its GPU); and `gpu.kind` reported without a GPU.
-    #[test]
-    fn a_mac_books_its_gpu_only_on_the_hardware() {
-        let with = |numbers: &str, ioreg: &str| {
-            let r = macos_report(M3_ULTRA, numbers, ioreg, &[]).expect("report");
-            let keys: Vec<(String, Vec<String>)> =
-                ["gpu", "gpu.kind", "gpu.cores", "gpu.metal_family"]
-                    .iter()
-                    .map(|k| {
-                        (
-                            (*k).to_owned(),
-                            values(&r, k).iter().map(|v| (*v).to_owned()).collect(),
-                        )
-                    })
-                    .collect();
-            keys
-        };
-        let entry = |k: &str, v: &[&str]| {
-            (
-                k.to_owned(),
-                v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(),
-            )
-        };
-        let guest = "32\n274877906944\n16384\nApple M3 Ultra\n1\n";
-        assert_eq!(
-            with(guest, M3_IOREG),
-            [
-                entry("gpu", &["0"]),
-                entry("gpu.kind", &[]),
-                entry("gpu.cores", &[]),
-                entry("gpu.metal_family", &[])
-            ]
-        );
-        let bare = "32\n274877906944\n16384\nApple M3 Ultra\n";
-        assert_eq!(
-            with(bare, M3_IOREG),
-            with(MAC_NUMBERS, M3_IOREG),
-            "no last line: hardware"
-        );
-        assert_eq!(
-            with(MAC_NUMBERS, ""),
-            [
-                entry("gpu", &["1"]),
-                entry("gpu.kind", &["native"]),
-                entry("gpu.cores", &[]),
-                entry("gpu.metal_family", &["9"])
-            ]
-        );
-        let future = "32\n274877906944\n16384\nApple M9 Ultra\n0\n";
-        assert_eq!(
-            with(future, M3_IOREG),
-            [
-                entry("gpu", &["1"]),
-                entry("gpu.kind", &["native"]),
-                entry("gpu.cores", &["80"]),
-                entry("gpu.metal_family", &[])
-            ]
-        );
-    }
-
-    /// Catches: the Mac's GPU entries unreadable by the server (`gpu` not a whole number,
-    /// a repeated single-valued entry), or `gpu` not booked by placement: the server
-    /// reads `Hello` with `NodeCaps::from_report`, and a Mac must come out with one GPU
-    /// and `gpu.kind` native, and satisfy a request for `gpu.kind=native` that a Linux
-    /// node with GPUs does not.
-    #[test]
-    fn the_server_reads_a_macs_gpu_entries() {
-        use kbf_caps::{Consumable, NodeCaps, Request};
-        let read = |r: &NodeReport| {
-            let entries = r.capabilities().iter();
-            NodeCaps::from_report(entries.map(|c| (c.key.as_str(), c.value.as_str())))
-                .expect("the server reads the report")
-        };
-        let mac =
-            read(&macos_report(M3_ULTRA, MAC_NUMBERS, M3_IOREG, &["native"]).expect("report"));
-        assert_eq!(mac.consumables.get(&Consumable::Gpus), Some(&1));
-        let linux =
-            read(&linux_report(SKYLAKE, MEMINFO, SMAPS, 4, &["container"]).expect("report"));
-        let native = Request::parse([("gpu.kind", "native")]).expect("request");
-        assert!(native.matches(&mac));
-        assert!(!native.matches(&linux));
-    }
-
-    /// Catches, on a Mac (the hosted runner is a guest, a farm Mac is not): a `sysctl` or
-    /// `ioreg` name this macOS does not have (detection would fail, or a GPU go
-    /// unreported), and a GPU report that disagrees with where the daemon runs: one GPU
-    /// with its kind and core count on the hardware, none in a guest.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn this_mac_reports_its_gpu_by_where_it_runs() {
-        let r = NodeReport::detect(&[]).expect("detect");
-        let vmm = sysctl(&["-n", "kern.hv_vmm_present"]).expect("kern.hv_vmm_present");
-        let hardware = usize::from(vmm.trim() == "0");
-        println!("GPU-REPORT vmm={} ioreg={:?}", vmm.trim(), ioreg());
-        assert_eq!(values(&r, "gpu"), [["0"], ["1"]][hardware]);
-        assert_eq!(values(&r, "gpu.kind").len(), hardware);
-        assert_eq!(values(&r, "gpu.cores").len(), hardware);
-        assert_eq!(values(&r, "gpu.metal_family").len(), hardware);
-    }
-
-    /// Catches: a `sysctl` failure (a missing key, a missing program) taken for
-    /// output, and output lost. Linux has `/usr/sbin/sysctl` too, with other keys.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn sysctl_output_and_failure() {
-        assert_eq!(sysctl(&["-n", "kernel.ostype"]).expect("ostype"), "Linux\n");
-        let error = sysctl(&["hw.optional"]).expect_err("no such key on Linux");
-        assert!(
-            error.to_string().contains("sysctl hw.optional exited"),
-            "{error}"
-        );
+        for props in [
+            &[("OSFamily", "Darwin")][..],
+            &[("OSFamily", "Darwin"), ("ISA", "arm-a64")],
+        ] {
+            assert!(!wants(props).matches(&linux), "Linux satisfies {props:?}");
+        }
     }
 
     /// Catches: driver capabilities dropped, or replacing the detected

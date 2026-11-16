@@ -249,7 +249,7 @@ pub enum UsageBasis {
     MacFootprint,
 }
 
-/// `kbf.worker.v1.FootprintUsage`: what the macOS native driver measured. A field that
+/// `kbf.worker.v1.FootprintUsage`: what the macOS native driver measured (the driver is removed; the message stays so old data reads). A field that
 /// is `None` was not readable: absent is not zero.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[allow(missing_docs)]

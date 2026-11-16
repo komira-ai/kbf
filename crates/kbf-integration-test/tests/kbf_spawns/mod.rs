@@ -41,7 +41,6 @@ pub const ALLOWANCE: &[&str] = &[
     "crates/kbf-cli/tests/frontend_process.rs",
     "crates/kbf-cli/tests/help_golden.rs",
     "crates/kbf-cli/tests/helpers.rs",
-    "crates/kbf-cli/tests/macos_daemon.rs",
     "crates/kbf-cli/tests/node_process.rs",
     "crates/kbf-cli/tests/preflight.rs",
     "crates/kbf-cli/tests/rehearsal_in_a_box.rs",

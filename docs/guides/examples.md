@@ -259,7 +259,7 @@ Write `N` in plain digits with no sign or leading zero: `+4` and `04` are refuse
 because each would book the same as `4` under a different action digest. Either key may be
 given alone. The scheduler places the action only where that much is free.
 
-The booking is also the action's memory limit. The native driver on a Mac kills an action
+The booking is also the action's memory limit. The native driver (plain processes on Linux) kills an action
 whose processes together hold more than 150% of the booked memory plus 512 MiB: 12.5 GiB
 for `kbf-book-mem-gib=8`. The container driver sets a hard cap from the booking.
 

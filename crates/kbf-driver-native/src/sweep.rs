@@ -24,8 +24,7 @@
 //! without following a link, and its records are listed, read, removed and moved through
 //! that descriptor, so a swap of `runs` for a link during the sweep is never followed); a record is read
 //! without blocking and at most [`MAX_RECORD_BYTES`] of it, and none of this stops the
-//! start. Only the daemon writes `runs/` on macOS (the sandbox keeps actions out of
-//! it); on Linux an action of the same user can write a well-formed record there,
+//! start. An action of the same user can write a well-formed record there,
 //! naming any group, and the next start then kills every process of that user in it
 //! or below it (see the crate documentation's known gaps).
 //!
@@ -110,8 +109,6 @@ pub(crate) fn sweep(
     end_recorded(scratch, wait, table, &mut aside)?;
     if let Some(dir) = &aside.dir {
         for name in names.unwrap_or_default() {
-            // A volume a system service mounted below the entry (issue #178) goes first.
-            crate::mounts::unmount_logged(&aside.path.join(&name));
             if let Err(why) = kbf_outputs::remove_tree_at(dir, &name) {
                 tracing::error!(dir = %aside.path.display(), entry = ?name, "a quarantined entry still cannot be removed: {why}");
             }

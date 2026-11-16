@@ -378,7 +378,6 @@ const GROUPS: &[(&str, &[&str])] = &[
             "async-threads",
             "blocking-threads",
             "cpu-threads",
-            "daemon-user",
             "data-dir",
             "data-max-bytes",
             "drain-deadline-secs",
@@ -428,17 +427,6 @@ const GROUPS: &[(&str, &[&str])] = &[
             "memory-poll-ms",
             "memory-pressure-pause-percent",
             "no-memory-climb",
-        ],
-    ),
-    (
-        "macos",
-        &[
-            "mac-session-socket",
-            "pool-first-uid",
-            "pool-users",
-            "require-metal-toolchain",
-            "xcode-apps",
-            "xcode-recheck-secs",
         ],
     ),
     (

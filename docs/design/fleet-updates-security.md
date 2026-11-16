@@ -25,9 +25,8 @@ without a file name refer to [fleet-updates.md](fleet-updates.md); numbers prefi
 
 | Actor | Can reach | Trusted for |
 |---|---|---|
-| An action (any lease) | its sandbox, the network it was given; on a bare-metal Mac the rack network, since macOS has no network namespace | nothing |
-| A privileged Mac lease (`kbf-mac-admin=true`) | root on that Mac, by design | nothing; the Mac is treated as lost afterwards (S8) |
-| `kbf-daemon` | the worker stream, the helpers' sockets | running leases; not for installing software |
+| An action (any lease) | its sandbox, the network it was given; a Mac job's sandbox is its agent's | nothing |
+| `kbf-daemon` | the worker stream, the helper's socket | running leases; not for installing software |
 | `kbf-server` | every daemon's stream, the gate, the CAS | choosing *when* and *where*; never *what* |
 | CI (GitHub Actions) | the signing keys through a short-lived identity (S2) | building and signing sets from reviewed changes |
 | The MDM host (NanoHUB and `kbf-mdm-gate`) | APNs, every Mac's bootstrap token | the Mac fleet; the root of trust for Macs |
@@ -44,12 +43,6 @@ without a file name refer to [fleet-updates.md](fleet-updates.md); numbers prefi
   alert the server cannot suppress. It **cannot erase** a Mac: every erase needs an
   operator's hardware-key signature (M4). It can relay, delay or drop a signed
   request, never make or redirect one.
-- Obtain a privileged-lease grant only for a Mac an operator has already signed an
-  erase for, with a signed purpose naming that lease (S8, M4.2): each gives root on
-  one Mac, alerts natively, and ends in that erase, which the gate runs itself, so
-  the server cannot keep the root by never asking.
-  Without the grant check in `kbf-mac-session`, a compromised server or daemon could
-  create an administrator lease user, and so get root, on every Mac at once.
 - Deny service: cordon, drain or hold every node, or withhold operators' erase
   requests so quarantined Macs stay out. That costs availability, not integrity, and
   every write is audited.
@@ -67,7 +60,7 @@ without a file name refer to [fleet-updates.md](fleet-updates.md); numbers prefi
 - **CI and the main branch.** A compromised CI, or a malicious change that is
   reviewed and merged, can sign a set that gives root on every node of a pool. The
   key that signs automatically covers only unprivileged `kbf-daemon` (S2.2); anything
-  that runs as root, the two helpers included, needs the platform key and an
+  that runs as root, the helper included, needs the platform key and an
   operator's approval. With the KMS custody of S2.1 and the canary and soak (4.2)
   that narrows the risk to a compromised approval or a malicious reviewed change; it
   does not remove it. A compromised component key gives code execution as the daemon's
@@ -79,10 +72,6 @@ without a file name refer to [fleet-updates.md](fleet-updates.md); numbers prefi
   outside any rollout (7.2).
 - **A server that skips `Update`** and asks the gate to enforce directly can reboot a
   Mac mid-lease. The gate's caps (S5.2) bound it to one Mac per pool at a time.
-- **A VM guest escape** lands as the uid of the VM host process. `macos-vms.md`
-  section 6 (open PR [#85](https://github.com/komira-ai/kbf/pull/85))
-  states that `kbf-vmm` runs as a dedicated non-admin uid outside the helpers' group,
-  started through `kbf-mac-session run` or its own launchd user, never as `_kbf` (S4.3).
 - **Linux join credentials have no hardware attestation.** A Linux node's identity
   rests on the operator's provisioning job (S6); TPM-based attestation is a later
   option, not designed here.
@@ -113,7 +102,7 @@ without a file name refer to [fleet-updates.md](fleet-updates.md); numbers prefi
 | Key | Signs | Who triggers it |
 |---|---|---|
 | component key | sets that change only `kbf-daemon` (and any later unprivileged kbf part) | every green, attested `main` build, automatically |
-| platform key | sets that change anything that runs as root or below: `kbf-updater`, `kbf-mac-session`, the OS, Xcode, the Metal toolchain, VM images, probes, the profile, firmware | a reviewed change, through the protected GitHub environment, after an operator's approval |
+| platform key | sets that change anything that runs as root or below: `kbf-updater`, the OS, Xcode, the Metal toolchain, probes, the profile, firmware | a reviewed change, through the protected GitHub environment, after an operator's approval |
 
 `kbf-updater` checks that every artifact a set changes is covered by the key that
 signed it: a component-key set that names a new OS build is refused.
@@ -170,11 +159,10 @@ Rollback is never a flag: it is a newer set naming old artifacts (4.3).
 Client-defined probes (6.1) are Mac-only. Their commands and expected values come only
 from the set `kbf-updater` verified and installed, which it writes to a root-owned,
 read-only file; the daemon reads that file and never takes a probe from the server or
-from a set the server forwards. A probe runs as a lease-range user through
-`kbf-mac-session run` (S4.2), never as the daemon's own user, so it cannot reach the
-helpers.
+from a set the server forwards. A probe never runs as the daemon's own user, so it cannot reach the
+helper.
 
-## S4. The root helpers
+## S4. The root helper
 
 ### S4.1 `kbf-updater`
 
@@ -182,299 +170,38 @@ A LaunchDaemon on Macs, a systemd unit on Linux, running as root. Three verbs:
 `status`; `stage <set>` (fetch and verify, change nothing installed); `apply <set>`
 (install, and reboot if the set says the step needs it). There is no `rollback` and no
 bare `reboot` verb, so **`kbf-updater`** never reboots a node without a signed set that
-requires it. (On Macs, `kbf-mac-session` also restarts the node for session switches
-and after a dirty scan; S4.2 limits those.) It keeps a state file (last applied set,
+requires it. It keeps a state file (last applied set,
 in-progress step), so a crash mid-apply resumes or reports, never guesses.
-
-When an apply changes something the leak scan watches (a new Xcode in
-`/Applications`, a new profile), the updater always hands the new expected items to
-`kbf-mac-session` through a root-only file before it finishes, and before any reboot,
-so the boot scan of the next boot already expects them. The daemon cannot trigger
-that hand-over.
 
 ### S4.2 `kbf-mac-session`
 
-Mac-only, LaunchDaemon, Full Disk Access granted by an MDM profile at provisioning.
-Fixed verbs,
-every argument restricted to the lease uid range (default 600-699 **[A]**):
-
-| Verb | Does |
-|---|---|
-| `user-create <lease> [grant]` | create `kbf-lease-<lease id>` (a name never reused): random password, no secure token, non-admin. An administrator only with a grant the helper verifies itself (S8) |
-| `run <lease> <fd-passed argv>` | start the action's process tree as that user; the daemon passes the argument vector and the stdio and lease-directory descriptors over the socket |
-| `session-login <lease>` | set auto-login to that user, then a userspace restart (or a full reboot) |
-| `session-idle` | clear auto-login, then the same restart: the Mac rests at the login window |
-| `kill-uid <uid>` | `launchctl bootout gui/<uid>` and `user/<uid>`, then kill every remaining process of a uid in the lease range |
-| `user-delete <lease>` | delete the user and sweep its state (below); refused while `kill-uid` still finds a process of that uid |
-| `scan` | the leak scan (10.2) against the stored baseline; returns the diff |
-| `baseline` | record the scan baseline; accepted only after a boot that followed an apply or an erase and before the first lease user of that boot |
-| `reboot-dirty` | reboot; accepted only when the helper's own last `scan` came back dirty |
-
-- **Sweep on delete.** A uid is reused once the range wraps, so `user-delete` removes
-  everything keyed by that uid or name that survives deleting the home: crontab
-  (`/usr/lib/cron/tabs`), `at` jobs (`/var/at`), Background Task Management entries,
-  per-uid launchd overrides, pending print jobs, and files the uid owns in macOS's
-  shared user folder and the temporary folders. That Background Task Management entries
-  can be removed per uid is **[A]**. Root's walk never follows a symbolic link (other
-  lease users may be active and could plant one): it opens each entry relative to its
-  parent without following links, and removes the link, not its target.
-- **Lease files owned by another uid.** The unprivileged daemon must read a lease's
-  outputs and delete its directory although the lease user wrote them. On Macs the
-  lease directory carries an inherited ACL entry granting `_kbf` read and delete, so
-  every file the lease user creates inherits it. On Linux the files belong to the
-  container's mapped uids; the daemon reads and removes them through a helper
-  container in the setup user namespace (`crates/kbf-driver-container/src/oci/helper.rs`)
-  or an idmapped mount.
-- **Which leases get what.** Every Mac lease gets `user-create`, `run` and
-  `user-delete`. The session switch (L2) is only for whole-machine leases that need a
-  GUI session; the leak scan only for whole-machine leases.
-- **At boot**, before `kbf-daemon` may send `Hello`, the helper clears auto-login and
-  removes any leftover lease user (sweep, then a scan against a baseline that already
-  includes any items an apply handed over, S4.1), so a Mac that lost power mid-lease
-  never comes back logged in as a dead lease user.
-- **Baseline.** Qualification (4.2 step 8) records the baseline after the update's
-  reboot and before its first qualification lease.
-- It never touches a uid outside the range or the MDM's managed administrator, and it
-  cannot change installed software. `automationmodetool` runs once from the
-  provisioning profile, not through this helper.
-
-> **Built (phase P1, and P4's session switch and leak scan):** `crates/kbf-mac-session`
-> serves `user-create`, `run`, `kill-uid` and `user-delete` with the socket and caller
-> check of S4.3, `session-login`, `session-ready`, `session-idle` and the boot reset,
-> and `scan`, `baseline` and `reboot-dirty` over a minimal item set. `run` takes a
-> session target: `gui` starts the process in the lease user's GUI session
-> (`launchctl asuser <uid>` running the helper's own `as-user` mode, which drops to the
-> user's uid and gid with no supplementary groups before it executes the argument
-> vector), refused unless the intent record names the lease and launchd has its
-> `gui/<uid>` domain; `session-ready` answers whether it does. The bare-metal
-> whole-machine runtime (10.1) calls the boot reset at its start and the session switch
-> for every lease; no daemon calls the scan yet, and no node runs any of them: they need
-> FileVault off and the helper and the daemon installed as LaunchDaemons, both planned.
-> Where it settles what this section leaves open, or differs:
-> - The user is `kbf-lease-<term>-<seq>` (a hyphen for the lease id's dot). Used lease
->   ids are kept in an append-only ledger in the helper's state directory, so a name,
->   and a grant (which names one lease), is used once across reboots; a uid is free
->   again only once its lease's deletion is recorded, and allocation continues after
->   the uid handed out last.
-> - `kill-uid` takes the lease, not a uid: the uid comes from the ledger, so the daemon
->   cannot name another lease's uid, and a deleted lease (whose uid may be reused) is
->   refused. The kill is `kill(-1, SIGKILL)` from a child that took the uid, repeated
->   until `libproc` lists no live process of it by real or effective uid. Then
->   `kill-uid` removes the user's crontab and `at` jobs and kills again, so no job of
->   the user starts after it returns: such a job would start a process of the uid,
->   and launchd per-user agents (`distnoted`) with it that do not exit, and
->   `user-delete` would refuse.
-> - The grant is the gate's own, one format on both sides (`kbf-mdm`'s `grant`
->   module defines it; S5.2 states it): the five-line text `kbf-grant-v1`, `serial`,
->   `lease`, `issued`, `not-after` (UTC `YYYY-MM-DDTHH:MM:SSZ`, `not-after` exactly
->   an hour after `issued`), Ed25519 over the text by the gate's key. The helper takes
->   `grant-admin`'s `token` unchanged, `<payload>.<signature>` in unpadded base64url,
->   and verifies it strictly under the keys installed on the Mac, never a key the
->   answer names. It refuses a grant whose `not-after` the clock has passed, or which
->   lies more than 65 minutes ahead of it. A test verifies the token the gate's own
->   code signed for its test.
-> - The gate's public keys are a file named by a flag (base64, one per line; how the
->   MDM delivers it is P3's). It, the state directory and the ledger must be root's
->   and writable by no one else, and the key file is never read through a link: whoever
->   could write them could make administrators or replay a grant.
-> - The sweep covers the home folder, the crontab, `at` jobs, launchd's per-uid
->   `disabled` and `loginitems` files, the shared user folder and the temporary
->   folders. The crontab and `at` jobs go first (`kill-uid` removed them already,
->   unless something added them since), and `user-delete` looks for live processes of
->   the uid three times: before anything is removed, once those are gone (a job that
->   fired after `kill-uid` is found there), and after the whole sweep, just before
->   the record is deleted. Each look lists the uid's processes up to 50 times, 100 ms
->   apart, so a process that ends by itself is waited for; one still alive then
->   refuses the delete, and the refusal names its pid and command. A process whose
->   state cannot be read counts as live. Background Task Management entries live in
->   one system-wide database; no per-uid removal is built, so they stay **[A]**, for
->   the leak scan (P4).
-> - **Pending print jobs are not swept.** CUPS keeps a job's files in
->   `/private/var/spool/cups` owned by root, not by the user, so a sweep by owner
->   cannot find them; cancelling the departing user's jobs by name (`cancel -u`) is
->   P4's, and until then they are for the leak scan.
-> - On the hosted macOS runner a new lease user is also a member of `_lpoperator`
->   and `com.apple.sharepoint.group.1`, through nested groups. P4's leak scan should
->   record a lease user's group memberships.
-> - The password is random and never told to anyone; with no password known, an
->   administrator lease user cannot use `sudo` either. `session-login` gives the user
->   a fresh random password through OpenDirectory (never on a command line, where any
->   local user could read it) and writes only its `/etc/kcpassword` form.
-> - **The session switch as built.** `session-login <lease>` is refused unless the
->   ledger holds the lease's user live, FileVault is off (`fdesetup isactive`), and the
->   intent record names no other lease. In order, it writes the **intent record**
->   (`session-intent` in the state directory, `<term>.<seq>` and a newline, written
->   whole and `fsync`ed), sets the new password, writes `/etc/kcpassword` (mode 0600,
->   replacing whatever is at the path, never through a link), sets the login window's
->   `autoLoginUser` (`defaults write`), and last asks for a userspace restart
->   (`launchctl reboot userspace`). So whenever auto-login names a lease user, the
->   record names its lease. `session-idle` clears `autoLoginUser` and
->   `/etc/kcpassword`, then removes the record, then asks for the same restart.
->   `user-delete` is refused for the lease the record names. The restart ends the
->   connection, so the reply (`restarting`) may not arrive.
-> - **The boot reset as built** is a verb, `boot-reset [held]`: the daemon calls it
->   before its `Hello`, naming the leases the server still holds for the node, since
->   only the server knows that. The helper serves no other verb until a reset has
->   succeeded, and serves it once per start. The lease the record names keeps its
->   session (auto-login, `/etc/kcpassword` and the record) only if it is held and its
->   user is live; otherwise all three are cleared. Then every other live lease user
->   is killed and deleted as `kill-uid` and `user-delete` do. A reset that fails
->   part-way names each failure and can be repeated. It restarts nothing: a stale
->   session's processes end with `kill-uid`'s bootout of `gui/<uid>`.
-> - **The standing VM user.** A Mac provisioned for macOS guest VMs starts the helper with
->   `--vm-user <name>` (never a `kbf-lease-` name, `root` or `_kbf`; the flag is refused
->   at start otherwise). The account is made by provisioning, not by the helper, and is
->   outside the ledger, so the boot reset and `user-delete` can never reach it.
->   `session-idle` then rests the Mac at that user: it reads the user's password from
->   the root-only file `kbf-mac-provision` wrote once (`vm-user-password` in the state
->   directory: 64 lowercase hex digits, a regular file, not a link, root's, mode 0400;
->   `kbf-mac-session` duplicates that rule and `kbf-mac-provision` owns it, so the two
->   change together), writes `/etc/kcpassword` from it when that differs, sets
->   `autoLoginUser`, writes the intent record `vm` last (so a failure part-way leaves a lease's record guarding its user) and
->   restarts (FileVault must be off, as for `session-login`). A repeat while the record
->   is `vm`, `autoLoginUser` is the VM user and `gui/<uid>` exists restarts nothing, so
->   running VMs survive it. The boot reset keeps that rest when `autoLoginUser` names the
->   VM user and the record is `vm` or absent; any other session, including a `vm` record
->   over some other auto-login, is cleared as before. Only provisioning may name the
->   account: the helper does not check for an admin or human account beyond the uid
->   range, and `role-kill-uid` and `session-idle` act on whatever account is named. A
->   Mac restarted mid-lease rests at the login window until the daemon calls
->   `session-idle` after `boot-reset`. The leak scan's baseline for such a Mac must be
->   recorded while it rests at the VM user. The helper never makes or resets the VM
->   user's password (a missing or invalid file fails `session-idle`, naming the path and
->   saying to run `kbf-mac-provision apply`), so the password is set once at
->   provisioning and never rotated and the account's login keychain is never stranded
->   by a reset. What is still open, measured by E2 on a Mac: whether automatic login
->   unlocks the login keychain at all. `--vm-user` stays unset until then.
->   `session-login <lease>` still switches away from the VM user. Four verbs act for
->   the VM user: `role-run` (one program only: the helper's installed `kbf-vmm` as
->   `vm-run --spec <file>`, with the file a regular file inside the images directory
->   reached through no link, and no environment variables; the check limits where the spec
->   is, not what it says, so a caller that can rewrite it afterwards can point the VM
->   user's `kbf-vmm` at any file that user can read; it runs in the VM user's `gui/<uid>` domain, refused until
->   the domain exists and while a lease holds the session), `role-session-ready` (false
->   while a lease holds the session), `role-reap` (ends the process group a `role-run`
->   started, found again by the pid the helper reported, its start time and the boot
->   session; a recycled pid, another boot or a process that is not the VM user's is never
->   signalled) and `role-kill-uid` (ends the session with the processes). Its uid is read from the directory each time and must be an ordinary
->   uid outside the lease range. That VMs and a whole-machine lease never run together
->   on one Mac is the daemon's rule: it drains VMs before `session-login`.
-> - **The image verbs** `image-setup <bundle>` and `image-harvest <bundle> <out>` are the two
->   root-only steps of building a guest image (`kbf-vmm image setup`, which writes the guest's
->   Data volume offline, and `kbf-vmm image harvest`, a read-only attach), so the daemon runs
->   them and no one needs `sudo`. Two directories: `--staging-dir`, which the VM user owns and
->   `kbf-vmm image base --out` builds a new bundle in (and keeps clones in), and `--images-dir`,
->   which is root's, closed to group and others (the helper refuses it otherwise, sticky bit
->   or not), and holds sealed bases and harvest output. The program is `--vmm` (default the
->   kit's `current/kbf-vmm`) and the guest binary is `--guest-binary`; each must be a regular
->   file, root's and writable by no one else, and a request carries no program and no argument
->   but the paths (the wire refuses unknown fields). A path must be a name directly inside the
->   directory it belongs to, compared by component (`..`, a longer path and a lookalike sibling
->   are refused); the helper builds the path it passes on from the configured directory and
->   that name.
->   `image-setup` never takes the user's inodes. A measured Mac showed that a write descriptor
->   the user opened before root's chown, chmod and `uchg` keeps writing through all three, so
->   taking the bundle in place cannot stop a user who holds a descriptor or a mapping on its
->   disk image (and root's chown of a `uchg` file fails). The helper opens each file of the
->   staging bundle without following a link (plain files with one link only, at most 16
->   entries) and clones it (`fclonefileat`, O(1) on APFS, new inodes) into a new directory it
->   makes in the images directory: root's, 0700. It runs `kbf-vmm` on that copy (root attaches
->   a disk image the user built; that is inherent, and the copy defeats changes after the
->   copy was made, not what was in it) and seals the copy: it stays root's, directory 0750 and
->   files 0640 with the VM user's primary group, and root sets `uchg` on the files and then the
->   directory. The user's original is left alone. The VM user clones the base through its group
->   (a non-root `clonefile` of a root-owned 0640 base works, the clone keeps the flag, the user
->   can clear it only on its own copy) and `kbf-vmm`'s clone step clears `uchg` on each clone.
->   A clone of a flagged file is flagged too (measured), so every clone's user flags are cleared
->   right after it is made. A failure removes the copy, clearing `uchg` first (an immutable file
->   cannot be unlinked) and removing every entry in it, including what `kbf-vmm` wrote, so no
->   failure leaves a base in the images directory (an entry that is not a regular file is left
->   and named in the error). `image-harvest` reads a kept clone in
->   staging, whose inodes are the user's: the bundle is taken first (opened without following a
->   link, made root's and 0700 through the descriptor, the name checked again, every file made
->   root's, anything but plain single-link files refused) and given back with its owners and
->   modes; that is acceptable because harvest only reads, but a user holding a descriptor can
->   change what is read while it is read. A sealed base in the images directory is read as it
->   is (root's and closed already). The helper makes `<out>` itself (new, root's, 0700) in the
->   images directory and has `kbf-vmm` write `<out>/files`.
-> - Every program the switch and the scan run (`defaults`, `launchctl`, `fdesetup`,
->   `sfltool`) goes through the host's command runner with an empty environment, so
->   the unit tests fake each one and nothing in CI restarts: the macOS CI job runs the
->   boot reset for real over a login-window file and `kcpassword` of its own, never
->   `session-login` or `session-idle`, runs `baseline` and `scan` over the runner's
->   own folders, and sends `reboot-dirty` only after a clean scan, when it is refused.
-> - **The leak scan as built** collects a minimal set of the items of fleet-updates.md
->   10.2, each one line of text: the entries of `/Library/LaunchAgents` and
->   `/Library/LaunchDaemons` and launchd's `loginitems.<uid>.plist` files (kind, owner,
->   mode, a file's SHA-256, a link's target; links are never followed), each entry
->   `sfltool dumpbtm` prints (record uid, identifier, type, URL, executable,
->   disposition; not the UUID or generation, which change by themselves), each uid of
->   the lease range a user record has, and the auto-login state (`autoLoginUser`,
->   whether `/etc/kcpassword` exists, the intent record). `scan` reports what was added
->   to and removed from the baseline; an item that cannot be read is reported too and
->   makes the scan dirty. The other items of 10.2 are not collected yet, and the boot
->   reset does not scan yet.
-> - **The baseline window.** `baseline` is accepted only while the window file
->   (`baseline-window` in the state directory, root's) exists and names another boot
->   than this one (`kern.bootsessionuuid`), no lease user exists, and every item could
->   be read. The root tool that applies a set or erases the Mac opens it by writing the
->   boot it runs in; the first `user-create` removes it, and is refused if it cannot.
->   No tool writes it yet (`kbf-updater` does not run on Macs).
-> - **`reboot-dirty`** (`launchctl reboot system`) is accepted only when the helper's
->   last `scan` since it started came back dirty and no `user-create` came after it,
->   and once per such scan: a later clean or refused scan, a new baseline, or a new
->   lease user makes the verdict stale.
-> - `run` starts the process in the system launchd domain as the lease user, not in
->   the user's own domain (`launchctl asuser`); tools that need per-user launchd
->   services are P4's.
-> - **The caller check (S4.3) as built.** An earlier build checked the caller only
->   after reading its request, and on the hosted macOS runner a process that connected
->   and then executed the genuine client was accepted: the audit token was fetched
->   after the exec, by which time it named the genuine client. Measured on the same
->   runner (macOS 26.6.2) by the CI job's exec probe: a process's pid version does
->   change on `exec` (15240 before, 15241 after, same pid), and `LOCAL_PEERTOKEN`
->   reports the process as it is when asked, so a token fetched after the exec is the
->   new image's. The helper now identifies and checks the caller as soon as it
->   accepts, before reading anything, sends a fresh nonce the request must carry, and
->   requires the same audit token (pid and pid version) once the request has arrived.
->   The CI job plants both forms, executing after the helper's answer and writing the
->   request first, and fails if either is accepted; it prints the token's pid and pid
->   version at accept and at the request, and what `LOCAL_PEERTOKEN` reports across an
->   `exec`. The case left open is in S4.3.
-> - On macOS `kill(-1)` also signals the sender, so the helper's killer child ends by
->   `SIGKILL`; that is its normal end.
+Removed with the Mac daemon path: the Macs run no `kbf-daemon`, a macOS action runs as a js-agent job ([actions-as-jobs.md](actions-as-jobs.md) section 14), and the per-lease users, the GUI session switch and the leak scan had no other caller.
 
 ### S4.3 Who can reach a helper
 
-Both helpers listen on a Unix socket in a root-owned directory, mode 0750, group a
-**dedicated** group (`_kbf` in [mac-node-provisioning.md](mac-node-provisioning.md)), never `staff`, which every macOS user is in;
+The helper listens on a Unix socket in a root-owned directory, mode 0750, group a
+**dedicated** group, never `staff`, which every macOS user is in;
 socket mode 0660. Two controls, the first being the one that matters:
 
-1. **No action, probe or VM runs under a uid in that group.**
-   - Mac: every action and probe runs as a lease user via `run`. On `main` the native
-     driver runs actions as the daemon's own user (`crates/kbf-driver-native/src/lib.rs`),
-     so `kbf-updater` ships on Macs only with the per-lease user.
+1. **No action or probe runs under a uid in that group.**
    - Linux: a rootless container whose uid 0 mapped to the daemon's uid on the host
      would leave only the mount and pid namespaces to hide the socket. The container
      driver therefore gives every container a user namespace that maps the daemon
      user's subordinate ids and nothing of the daemon user
      (`crates/kbf-driver-container/src/oci/mod.rs`, `DaemonIds::action_mappings`), so
      no container uid or gid maps to the daemon's ([daemon.md](daemon.md), User
-     namespaces). Both helpers refuse to start on a Linux node whose daemon uses
+     namespaces). The helper refuses to start on a Linux node whose daemon uses
      `--driver native`.
-   - VMs: `kbf-vmm` (#85) runs as its own dedicated non-admin uid outside the group,
-     started through `kbf-mac-session run` or by its own launchd user, never as
-     `_kbf`.
 2. **Every connection's caller is checked.** This guards against stray binaries and
    pid reuse; it does not stop code that already runs as the daemon's uid, which is
    why control 1 comes first.
    - Linux: `SO_PEERPIDFD` gives a pidfd for the caller, so the pid cannot be reused
      between the check and the request; the uid must be the daemon's and the pidfd's
      executable must hash to the installed `kbf-daemon`. `SO_PEERPIDFD` needs Linux
-     6.5 or later; that is the kernel floor for the helpers (Ubuntu 24.04's 6.8 meets
-     it), and on an older kernel the helpers do not start. The daemon sets
+     6.5 or later; that is the kernel floor for the helper (Ubuntu 24.04's 6.8 meets
+     it), and on an older kernel the helper does not start. The daemon sets
      `PR_SET_DUMPABLE=0`, so another process of its uid cannot ptrace it.
-   - macOS: `kbf-daemon` and both helpers are signed with the hardened runtime,
+   - macOS: `kbf-daemon` and the helper are signed with the hardened runtime,
      without `get-task-allow` and with library validation, so `DYLD_INSERT_LIBRARIES`
      and debugger attachment do not work. The helper reads the caller's audit token
      (`LOCAL_PEERTOKEN`), gets the caller's code with `SecCodeCopyGuestWithAttributes`
@@ -489,19 +216,13 @@ socket mode 0660. Two controls, the first being the one that matters:
      connection, where the kernel's token does not follow the child that writes. The
      full answer is a challenge the daemon answers with a key only its own code can
      use (S6's keychain identity); until then control 1 is the defence against it.
-   - **Ad-hoc signing and Full Disk Access.** With ad-hoc signatures ([mac-node-provisioning.md](mac-node-provisioning.md)'s lean) the
-     MDM's Full Disk Access profile can only pin `kbf-mac-session`'s cdhash, so a set
-     that changes `kbf-mac-session` also needs a new profile, pushed through the gate in
-     the same rollout step; with a Developer ID signature the profile would name the
-     team and survive updates.
 
 ## S5. `kbf-mdm-gate`
 
 **Superseded.** `kbf-mdm-gate` (crates `kbf-mdm` and `kbf-mdm-api`, and `kbf-server`'s
 client of it) was never deployed and is deleted. The MDM gate is `hostkeeper-mdm-gate` in
 komira-ai/hostkeeper, linked into its coordinator (that repository's
-`docs/design/hostkeeper-mdm.md`). The admin grant's format (S5.2) is kept by
-`kbf-mac-session`'s `grant` module.
+`docs/design/hostkeeper-mdm.md`).
 
 ### S5.1 Why a gate
 
@@ -515,8 +236,8 @@ holds the API and the design says so, costs nothing to build and was rejected.
 
 - **Caller authentication.** mTLS, and only the client certificate of `kbf-server`
   (pinned by its public key) is accepted. It listens only on the interface the server
-  reaches, never on the network the Macs enroll on; lease users on bare-metal Macs
-  have the rack network, so an unauthenticated gate would be theirs to call.
+  reaches, never on the network the Macs enroll on; a Mac job has the rack network,
+  so an unauthenticated gate would be its to call.
 - **Inventory.** The gate keeps its own inventory per Mac: the serial from Apple
   Business Manager (through NanoDEP), the platform UUID from the Mac's first MDM
   enrollment, and the pool and CPU architecture (`arm64` or `x86_64`) from the
@@ -540,10 +261,10 @@ holds the API and the design says so, costs nothing to build and was rejected.
   gate's floor until it re-enrolls.
   The grant key is held only by the gate's uid on the MDM host; its public key reaches
   Macs in an MDM profile. Rotation is a new profile, and Macs accept either key during
-  the overlap. A grant is single-use: `kbf-mac-session` records used lease ids across
-  reboots. The grant's exact format follows.
+  the overlap. A grant was single-use: `kbf-mac-session` (removed) recorded used lease
+  ids across reboots. The grant's exact format follows.
 - **The admin grant.** `kbf-mdm-gate` defined it (its `grant` module, deleted with the gate);
-  `kbf-mac-session` accepts exactly this and nothing else.
+  `kbf-mac-session` (removed) accepted exactly this and nothing else.
   - *Text.* Exactly five lines, each ending in one LF (no CR, no blank line, no
     trailing whitespace), each field separated from its value by one space:
 
@@ -656,27 +377,7 @@ the allowed signers, and M4's separation collapses into one machine. Either way,
 
 ## S8. Privileged Mac leases
 
-A privileged lease (`kbf-mac-admin=true`) has an administrator lease user and so can
-reach root: it can use (not copy, S6) the node's join credential, replace the helpers, or block MDM
-traffic so an erase never arrives. Therefore:
-
-- The front admits `kbf-mac-admin` only from a client with an explicit
-  `mac-admin` permission in the server's configuration.
-- The scheduler admits a privileged lease only when the gate has erase budget left
-  and holds an operator-signed erase request for the Mac whose purpose names that
-  lease (M4.2, M4.4); the lease waits for
-  that touch before it is placed.
-- **The admin user needs a grant the helper verifies itself.** The server asks the
-  gate for `grant-admin` (S5.2), which reserves an erase; `kbf-mac-session` creates an
-  administrator only if the grant's signature verifies under the gate's public key
-  (installed by the MDM at provisioning) and it names this Mac's serial and this lease
-  id, unexpired and not used before. The daemon's or the server's word is not enough.
-- When the lease ends, the server at once revokes that node's identity and join
-  credential and quarantines it, and may ask the gate to bring the erase forward
-  (`bring-forward`, S5.2). The erase does not
-  depend on that request: the gate already scheduled it with the grant (S5.2). The
-  node is readmitted only with a fresh credential, after the gate has seen a fresh
-  enrollment of that serial; a Mac whose erase never arrives stays out and alerts.
+Removed with the Mac daemon path: a privileged lease (`kbf-mac-admin`) needed the administrator lease user of `kbf-mac-session`, which is gone. The name stays reserved ([capabilities.md](capabilities.md)).
 
 ## S9. Credentials and roles
 
@@ -704,20 +405,12 @@ Each with the planted mutant that must turn it red:
 | An action is refused at each helper's socket | socket 0666; action as the daemon's uid; caller check removed |
 | A container action's host uid is not the daemon's | drop `--userns` |
 | A caller that connects and then executes the genuine daemon is refused (macOS), whether it executes after the helper's answer or writes its request first | check the caller only after reading its request, and drop the nonce |
-| The helpers refuse to start beside `--driver native` on Linux | drop the check |
+| The helper refuses to start beside `--driver native` on Linux | drop the check |
 | A `rollout`-role request with a strategy field is refused | accept strategy from `rollout` |
 | The gate refuses an unauthenticated caller, a serial outside its inventory, a second outstanding erase or enforcement, an erase past the cap, and one below the floor | drop the outstanding-erase check |
 | The gate refuses an erase the server sends without an operator signature (more in M10) | keep an unsigned `erase` verb for the server |
 | The gate alerts on an erase even when the server sends no alert | route gate alerts through the server |
 | A node reporting a different serial than at first join is quarantined | accept the new serial |
-| A privileged lease's node is quarantined and its credential revoked at lease end | skip the revocation |
-| `user-delete` removes a planted crontab, `at` job and login item of the uid, and does not follow a planted symlink out of the shared user folder | follow links in the sweep |
-| A probe runs as a lease-range uid, from the installed set only | run probes as the daemon's user |
-| `kbf-updater` refuses a component-key set that changes `kbf-updater` or `kbf-mac-session` | let the component key cover the helpers |
-| `user-create` makes an administrator only with a valid, unused gate grant for this serial and lease | trust an admin flag from the daemon |
-| The gate erases a granted Mac with no erase request from the server | leave the erase to the server |
-| `grant-admin` is refused for a Mac with no held, operator-signed erase | grant on erase budget alone |
-| `grant-admin` for a lease is refused when the Mac's only signed request names another lease, or was an `erase-now` (more in M10) | ignore `purpose` |
+| `kbf-updater` refuses a component-key set that changes `kbf-updater` | let the component key cover the helper |
 | The gate refuses `enforce` of an expired set or one below its own pool floor | skip the gate's expiry check |
 | A second join with an already-bound serial is refused and alerts | bind identity from `NodeStatus` |
-| An apply that adds an Xcode is followed by a clean boot scan | hand over the expected items after the reboot |

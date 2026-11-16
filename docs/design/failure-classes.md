@@ -7,6 +7,8 @@ the action's own failure. Lease handling is in [daemon.md](daemon.md), outcomes 
 retries in [scheduler.md](scheduler.md#outcomes), node reports in
 [capabilities.md](capabilities.md), the simulation in [simulation.md](simulation.md).
 
+The Macs run no `kbf-daemon` now (a macOS action runs as a js-agent job, [actions-as-jobs.md](actions-as-jobs.md) section 14), and the native driver's Xcode survey is removed: what this document says of an Xcode, its licence and its fix text is the removed design, kept as history.
+
 Line numbers are on `main` at the merge of #177; paths are under `crates/`. "Proposed"
 means no code yet.
 
@@ -147,8 +149,8 @@ exit code, or a non-OK status (`kbf-proto/proto/kbf/worker/v1/worker.proto:240-2
   `kbf-driver-native/src/runtime.rs:536-541`) before anything classifies it, so a
   SIGKILL and `exit(137)` are the same value by the time the daemon sees them.
 - **Readiness**: the node report is detected once, at daemon start; re-detection is
-  planned ([capabilities.md](capabilities.md), "Planned"). On macOS an Xcode is
-  advertised if `xcodebuild -version` answers (`kbf-driver-native/src/xcode.rs:55-63`).
+  planned ([capabilities.md](capabilities.md), "Planned"). On macOS an Xcode was
+  advertised if `xcodebuild -version` answered (the removed `xcode.rs`).
 - **Alerts**: none. `kbf-alert` holds a one-line crate comment and no code.
 - **Metrics**: no metrics endpoint exists.
 
@@ -182,8 +184,7 @@ kill its action, which keeps running beside the requeued copy.
   input blob at the worker reaches it as `FAILED_PRECONDITION` with its `MISSING`
   violations (section 2), so Bazel re-uploads and executes again; the server does not
   yet re-check the CAS, count the loss as a farm fault, or alert (section 4.3).
-- The named Xcode missing on the node is `RuntimeError::Failed`; the comment at
-  `xcode.rs:190` says "the action is run elsewhere", but nothing reruns it.
+- The named Xcode missing on the node is `RuntimeError::Failed`; the comment in the removed `xcode.rs` said "the action is run elsewhere", but nothing reruns it.
 - Native over-booking OOM is `RESOURCE_EXHAUSTED`; the comment at
   `kbf-daemon/src/runtime.rs:46-49` says "the farm's to retry", but nothing does.
 - The module comment at `kbf-front/src/execution.rs:20-22` says shutdown `UNAVAILABLE`
@@ -261,7 +262,7 @@ needs more than "the file exists" names its probe:
 
 | Capability | Probe | Fix text on failure |
 |---|---|---|
-| an Xcode build | `xcodebuild -license check`, `xcrun --find clang` (as #173) | `sudo <that Xcode's developer dir>/usr/bin/xcodebuild -license accept`, or the MDM route of [mac-node-provisioning.md](mac-node-provisioning.md) |
+| an Xcode build | `xcodebuild -license check`, `xcrun --find clang` (as #173) | `sudo <that Xcode's developer dir>/usr/bin/xcodebuild -license accept`, or the MDM route |
 | Metal in that Xcode | `xcrun --find metal` | `<developer dir>/usr/bin/xcodebuild -downloadComponent MetalToolchain` (Xcode 26 and later) |
 | each SDK the node reports | `xcrun --sdk <sdk> --show-sdk-path` | install the platform in that Xcode |
 | the sandbox profile | a canary action run under the profile: writes its temp dir, runs `xcrun --find clang` | names the denied operation |

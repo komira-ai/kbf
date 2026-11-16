@@ -113,8 +113,8 @@
     <ul class="why-grid">
       <li>
         <h3>UI, Mac and iOS tests on real machines</h3>
-        <p>These tests need a logged-in macOS session, Xcode and, for iOS, a device on a cable. kbf runs actions on Mac nodes as plain processes with their process tree, memory and network watched.</p>
-        <div class="tags"><span class="tag tag-ok">Mac daemon: works today</span><span class="tag tag-planned">iOS devices: specified</span></div>
+        <p>These tests need a logged-in macOS session, Xcode and, for iOS, a device on a cable. A macOS action runs as a js-agent job.</p>
+        <div class="tags"><span class="tag tag-planned">macOS actions: js-agent jobs</span></div>
       </li>
       <li>
         <h3>Utilization you do not tune by hand</h3>
@@ -143,7 +143,7 @@
     <ul class="parts">
       <li><h3>frontend</h3><p>The one address clients, daemons and storage nodes know. Serves REAPI and schedules actions. Its state lives in a Postgres database you provide.</p></li>
       <li><h3>storage</h3><p>The content-addressable store and action cache: an SSD hot tier, flushed in the background to an object store.</p></li>
-      <li><h3>daemon</h3><p>The worker. It fetches inputs, runs each action in isolation and uploads outputs. Linux and macOS.</p></li>
+      <li><h3>daemon</h3><p>The worker. It fetches inputs, runs each action in isolation and uploads outputs. Linux.</p></li>
       <li><h3>all-in-one</h3><p>The parts in one process, for a single machine or a first try.</p></li>
     </ul>
     <p>A host takes a role with <code>--mode</code>: <code>frontend</code>, <code>storage</code>, <code>daemon</code>, <code>storage-and-daemon</code> or <code>all-in-one</code>. Read <a href="architecture.html">the architecture</a>, <a href="config.html">every setting</a> and <a href="updates.html">how a farm updates itself</a>.</p>

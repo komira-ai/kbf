@@ -156,8 +156,8 @@ refuses a table written twice, and so does `kbf` (exit 2, `duplicate key`).
 
 ## The Mac path
 
-A Mac is a node (`--mode=daemon`) and `kbf-mac-provision` is the one writer of the daemon's
-`kbf.toml` there. `setup` does not write `[daemon] update-dir` or `orders-dir` on a Mac and does
+A Mac host runs no kbf daemon ([actions-as-jobs.md](../design/actions-as-jobs.md) section 14), and
+no tool writes a daemon's `kbf.toml` there now. `setup` does not write `[daemon] update-dir` or `orders-dir` on a Mac and does
 not require them; a file that has them is left as it is. The other keys
 `setup` owns follow the rule above.
 

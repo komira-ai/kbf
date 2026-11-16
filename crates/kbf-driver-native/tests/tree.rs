@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use kbf_daemon::{Runtime, RuntimeError};
 use kbf_driver_native::MemoryPolicy;
-use kbf_proto::worker::{ResourceUsage, UsageBasis};
+use kbf_proto::worker::ResourceUsage;
 use kbf_types::LeaseId;
 use support::{
     MemoryCas, PROMPT, Spec, alive, config, no_leases, pid_in, run, runtime, scratch, work,
@@ -26,8 +26,7 @@ use support::{
 /// then exits, so the child is orphaned and reparented.
 const ESCAPER: &str = "spawn-child --pid - setsid ;; sleep 300 ; sleep 0.3 ; exit 0";
 
-/// Where a test action writes its pid: in its working directory, since the sandbox
-/// lets an action write nowhere outside its lease.
+/// Where a test action writes its pid: in its working directory.
 const PIDFILE: &str = "pid";
 
 /// The pid file of lease `1.seq` while it runs, as the test sees it.
@@ -217,144 +216,35 @@ async fn an_action_within_its_limit_runs_to_the_end() {
     }
 }
 
-const MIB: u64 = 1 << 20;
-
-/// An action that holds 208 MiB (13 chunks of 16) and burns CPU for 1.5 s: the usage a
-/// lease of it must report on macOS.
-const HEAVY: &str = "alloc 208 ; burn 1.5";
-
-/// What a lease of [`HEAVY`] reported, as the footprint block says it.
-fn assert_heavy(usage: &ResourceUsage, least_wall: Duration) {
-    assert_eq!(usage.basis(), UsageBasis::MacFootprint);
-    assert_eq!(
-        usage.cgroup, None,
-        "a footprint basis never carries a cgroup block"
-    );
-    let f = usage.footprint.expect("a footprint block");
-    let peak = f.peak_footprint_bytes.expect("a peak");
-    assert!(
-        peak >= 200 * MIB,
-        "peak {peak} is under what the action touched"
-    );
-    let user = f.cpu_user_micros.expect("user cpu");
-    assert!(user >= 500_000, "user cpu {user} us after burning 1.5 s");
-    assert!(f.cpu_system_micros.is_some());
-    let wall = f.wall_micros.expect("wall");
-    assert!(
-        wall >= u64::try_from(least_wall.as_micros()).expect("micros"),
-        "wall {wall} us"
-    );
-    // The legacy fields carry the same numbers.
-    assert_eq!(usage.peak_memory_bytes, peak);
-    assert_eq!(usage.cpu_user_micros, user);
-    eprintln!(
-        "USAGE tree peak={peak} user_us={user} system_us={:?} wall_us={wall}",
-        f.cpu_system_micros
-    );
-}
-
-/// Catches: a successful lease whose usage is not in its result metadata, a peak that
-/// is a footprint sampled at the end (the action's memory is gone by then) rather than
-/// its high-water mark, CPU time not read (zero or the time of one poll), a wall time
-/// that is not the action's, and, off macOS, a usage invented for a platform with no
-/// footprint counters. Green on a macOS runner (peak 224 MB, user CPU 1.5 s to 1.9 s
-/// for 208 MiB and a 1.5 s burn); macOS only.
+/// Catches a usage invented for the plain-process runtime, which keeps no footprint
+/// counters and no cgroup: a finished lease carries none in its result metadata, and
+/// a lease that ended in an error (here a timeout) has none for the daemon to ask for.
 #[tokio::test]
-async fn a_lease_reports_its_usage_on_macos_only() {
-    let dir = scratch("usage-success");
+async fn a_lease_reports_no_usage() {
+    let dir = scratch("usage-none");
     let cas = Arc::new(MemoryCas::default());
     let rt = runtime(config(&dir), &cas);
-    let result = run(&rt, &cas, 1, &Spec::act(HEAVY)).await.expect("ran");
+    let result = run(&rt, &cas, 1, &Spec::act("burn 0.2"))
+        .await
+        .expect("ran");
     assert_eq!(result.exit_code, 0, "{}", support::stderr(&cas, &result));
-    let usage = ResourceUsage::in_result(&result);
-    if cfg!(target_os = "macos") {
-        assert_heavy(&usage.expect("a usage"), Duration::from_millis(1400));
-    } else {
-        assert_eq!(usage, None, "no basis is invented off macOS");
-    }
+    assert_eq!(ResourceUsage::in_result(&result), None);
     assert_eq!(
         rt.failed_usage(LeaseId::new(1, 1)),
         None,
         "a result has none"
     );
-}
-
-/// Catches: a lease that ended in an error (here a timeout) reporting no usage through
-/// `failed_usage`, the usage handed out twice, one kept under another lease's id, and a
-/// wall time shorter than the run. How much of its memory and CPU the action reached
-/// before the timeout depends on how fast the runner is, so the amounts are asserted by
-/// [`a_killed_lease_tells_the_usage_of_what_it_ran`], which ends the lease only after
-/// the action says its work is done.
-/// Catches (Linux unit test of the same map): `remove` replaced by `get().cloned()`;
-/// this test itself ran green on a macOS runner.
-#[tokio::test]
-async fn a_timed_out_lease_tells_its_usage_once() {
-    let dir = scratch("usage-timeout");
-    let cas = Arc::new(MemoryCas::default());
-    let rt = runtime(config(&dir), &cas);
-    let spec = Spec::act("alloc 208 ; burn 30").timeout(Duration::from_millis(2000));
-    let outcome = run(&rt, &cas, 3, &spec).await;
+    let spec = Spec::act("burn 30").timeout(Duration::from_millis(500));
+    let outcome = run(&rt, &cas, 2, &spec).await;
     assert!(
         matches!(outcome, Err(RuntimeError::TimedOut { .. })),
         "{outcome:?}"
     );
-    assert_eq!(rt.failed_usage(LeaseId::new(1, 4)), None, "another lease's");
-    let usage = rt.failed_usage(LeaseId::new(1, 3));
-    if cfg!(target_os = "macos") {
-        let usage = usage.expect("a usage");
-        assert_eq!(usage.basis(), UsageBasis::MacFootprint);
-        let f = usage.footprint.expect("a footprint block");
-        assert_eq!(
-            usage.peak_memory_bytes,
-            f.peak_footprint_bytes.expect("a peak")
-        );
-        assert_eq!(usage.cpu_user_micros, f.cpu_user_micros.expect("user cpu"));
-        let wall = f.wall_micros.expect("wall");
-        assert!(wall >= 1_900_000, "wall {wall} us of a 2 s timeout");
-    } else {
-        assert_eq!(usage, None);
-    }
-    assert_eq!(rt.failed_usage(LeaseId::new(1, 3)), None, "taken once");
-}
-
-/// Catches: a lease that ended in an error (here a kill) reporting less than its action
-/// used: a peak under the 208 MiB it touched, or CPU time not read. The action writes
-/// `touched` in its lease once it has held the memory and burned the CPU, and only then
-/// is the lease killed, so the amounts do not depend on how fast the runner is.
-#[tokio::test]
-async fn a_killed_lease_tells_the_usage_of_what_it_ran() {
-    let dir = scratch("usage-kill");
-    let config = config(&dir);
-    let cas = Arc::new(MemoryCas::default());
-    let rt = Arc::new(runtime(config.clone(), &cas));
-    let touched = config
-        .scratch
-        .join("lease-1-5")
-        .join("root")
-        .join("touched");
-    let action = Spec::act(&format!("{HEAVY} ; write-lines touched ; sleep 300")).store(&cas);
-    let running = tokio::spawn({
-        let rt = Arc::clone(&rt);
-        async move { rt.run(work(5, action, 0)).await }
-    });
-    // A bound so that an action that never gets there fails the test instead of hanging it.
-    let give_up = tokio::time::Instant::now() + PROMPT * 3;
-    while !touched.exists() {
-        assert!(
-            tokio::time::Instant::now() < give_up,
-            "the action never touched its memory"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    rt.kill(LeaseId::new(1, 5)).await;
-    let outcome = running.await.expect("run task");
-    assert!(matches!(outcome, Err(RuntimeError::Killed)), "{outcome:?}");
-    let usage = rt.failed_usage(LeaseId::new(1, 5));
-    if cfg!(target_os = "macos") {
-        assert_heavy(&usage.expect("a usage"), Duration::from_millis(1400));
-    } else {
-        assert_eq!(usage, None);
-    }
+    assert_eq!(
+        rt.failed_usage(LeaseId::new(1, 2)),
+        None,
+        "a timeout has none"
+    );
 }
 
 /// A fresh name prefix for the shared-memory names of one test.
@@ -451,9 +341,7 @@ async fn a_process_that_ignores_sigterm_is_named_in_the_result() {
         "{stderr}"
     );
     assert!(took >= Duration::from_millis(900), "no grace: {took:?}");
-    // An unbounded grace would wait out the child's `sleep 300`. The bound leaves room for
-    // what the lease end does after the grace on a failed action: on macOS, the read of the
-    // sandbox log for the action's own denials takes several seconds.
+    // An unbounded grace would wait out the child's `sleep 300`.
     assert!(
         took < Duration::from_secs(60),
         "the grace was not bounded: {took:?}"
@@ -473,32 +361,4 @@ async fn processes_that_end_on_sigterm_are_not_reported() {
     let stderr = support::stderr(&cas, &result);
     assert_eq!(stderr, "done\n");
     assert!(!alive(pid_of(&cas, &result)));
-}
-
-/// Catches: an action's CPU taken from the polls alone. The shell runs ten children one
-/// after another, each burning 0.2 s of CPU and gone before any poll (the poll interval
-/// is an hour, so only the start and the end are read, and the end finds no child), so
-/// the CPU of the lease is the leader's reaped total: the CPU of the children it reaped.
-/// The sampled sum reads about nothing. Half the 2 s burned is asked for, since a
-/// loaded runner may give a burn less than its time. macOS only: the other platforms
-/// report no usage.
-#[cfg(target_os = "macos")]
-#[tokio::test]
-async fn the_usage_cpu_of_children_that_exited_between_polls_is_counted() {
-    let dir = scratch("usage-short-children");
-    let cas = Arc::new(MemoryCas::default());
-    let mut config = config(&dir);
-    config.poll = Duration::from_secs(3600);
-    let rt = runtime(config, &cas);
-    let act = support::act();
-    let script = format!(
-        "i=0; while [ $i -lt 10 ]; do {} burn 0.2; i=$((i+1)); done",
-        act.display()
-    );
-    let result = run(&rt, &cas, 5, &Spec::sh(&script)).await.expect("ran");
-    assert_eq!(result.exit_code, 0, "{}", support::stderr(&cas, &result));
-    let usage = ResourceUsage::in_result(&result).expect("a usage");
-    let f = usage.footprint.expect("a footprint block");
-    let cpu = f.cpu_user_micros.expect("user") + f.cpu_system_micros.expect("system");
-    assert!(cpu >= 1_000_000, "cpu {cpu} us after ten 0.2 s burns");
 }

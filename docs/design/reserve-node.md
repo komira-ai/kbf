@@ -19,7 +19,7 @@ Non-goals: setting governor or frequency (the daemon is unprivileged; the host i
 | Piece | Exists | New |
 |---|---|---|
 | `kbf-lease=whole_machine` parsed by the front, `LeaseKind::WholeMachine`, booking the worker's whole capacity | yes | none |
-| Driver for it | Mac only (`native-whole-machine`) | Linux container driver serves it on daemons that opt in |
+| Driver for it | none on a `kbf-daemon` (the executor's workers list `native-whole-machine`) | Linux container driver serves it on daemons that opt in |
 | Placement: `Servable::fit` takes the least loaded worker, ties by name (not first-fit); `Servable::reserve` holds a worker for a queued whole-machine request, recomputed every round from the queue walk | yes, in memory, stateless, uncapped, held from round one | replaced for whole-machine requests by a stored, capped, deadline-bearing hold that begins after `drain_after` (4.2) |
 | Undo of a committed grant when the daemon refuses Start (`unplace`), two per-request attempt counters (`max_reserve_attempts`, `max_replace`) | **no** (`git grep` finds neither) | new scheduler and durable-store work, its own PR (4.2) |
 | Cordon / drain (operator, updates); cordons are `cordon/<worker>` rows applied at the intake poll | yes | untouched; the hold is a separate scheduler-owned state with its own verdict |
@@ -223,7 +223,7 @@ The `ActionResult` from Execute (never cached, so never replayed); a `Reservatio
 
 ### 8.4 macOS
 
-The Mac whole-machine lease exists and is unchanged. No cpuset, cgroup, frequency control or PSI. The Mac fills what it can read (brand, load average, lease user's CPU time, other users' CPU time); verdict UNKNOWN; P/E cores noted, no governor claimed.
+The Macs run no `kbf-daemon`: a macOS action runs as a js-agent job ([actions-as-jobs.md](actions-as-jobs.md) section 14), so this design adds nothing for macOS.
 
 ## 9. Metrics and operator visibility
 

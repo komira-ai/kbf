@@ -158,19 +158,19 @@ pub fn run(t: &SudoTest<'_>) -> Result<Vec<String>, Error> {
 mod tests {
     use super::*;
 
-    /// What cargo prints for `-p kbf-guest --test as_root --no-run`, cut down: a
+    /// What cargo prints for `-p kbf-seatbelt --test as_root --no-run`, cut down: a
     /// dependency's library, the package's own library and bin (built for the test,
     /// but not test-profile), a test-profile artifact of another target, a
     /// non-test-kind artifact named like the target, a compiler message on the target,
     /// the target itself, and the closing message.
     const MESSAGES: &str = r#"{"reason":"compiler-artifact","target":{"kind":["lib"],"name":"libc"},"profile":{"test":false},"executable":null,"manifest_path":"/r/libc/Cargo.toml"}
-{"reason":"compiler-artifact","target":{"kind":["lib"],"name":"kbf_guest"},"profile":{"test":false},"executable":null,"manifest_path":"/w/crates/kbf-guest/Cargo.toml"}
-{"reason":"compiler-artifact","target":{"kind":["bin"],"name":"kbf-guest"},"profile":{"test":false},"executable":"/w/target/debug/kbf-guest","manifest_path":"/w/crates/kbf-guest/Cargo.toml"}
-{"reason":"compiler-artifact","target":{"kind":["test"],"name":"binary"},"profile":{"test":true},"executable":"/w/target/debug/deps/binary-1","manifest_path":"/w/crates/kbf-guest/Cargo.toml"}
-{"reason":"compiler-artifact","target":{"kind":["bin"],"name":"as_root"},"profile":{"test":true},"executable":"/w/target/debug/deps/as_root-bin","manifest_path":"/w/crates/kbf-guest/Cargo.toml"}
-{"reason":"compiler-message","target":{"kind":["test"],"name":"as_root"},"profile":{"test":true},"manifest_path":"/w/crates/kbf-guest/Cargo.toml"}
-{"reason":"compiler-artifact","target":{"kind":["test"],"name":"as_root"},"profile":{"test":false},"executable":"/w/target/debug/deps/as_root-notest","manifest_path":"/w/crates/kbf-guest/Cargo.toml"}
-{"reason":"compiler-artifact","target":{"kind":["test"],"name":"as_root"},"profile":{"test":true},"executable":"/w/target/debug/deps/as_root-0f1e","manifest_path":"/w/crates/kbf-guest/Cargo.toml"}
+{"reason":"compiler-artifact","target":{"kind":["lib"],"name":"kbf_seatbelt"},"profile":{"test":false},"executable":null,"manifest_path":"/w/crates/kbf-seatbelt/Cargo.toml"}
+{"reason":"compiler-artifact","target":{"kind":["bin"],"name":"kbf-seatbelt"},"profile":{"test":false},"executable":"/w/target/debug/kbf-seatbelt","manifest_path":"/w/crates/kbf-seatbelt/Cargo.toml"}
+{"reason":"compiler-artifact","target":{"kind":["test"],"name":"binary"},"profile":{"test":true},"executable":"/w/target/debug/deps/binary-1","manifest_path":"/w/crates/kbf-seatbelt/Cargo.toml"}
+{"reason":"compiler-artifact","target":{"kind":["bin"],"name":"as_root"},"profile":{"test":true},"executable":"/w/target/debug/deps/as_root-bin","manifest_path":"/w/crates/kbf-seatbelt/Cargo.toml"}
+{"reason":"compiler-message","target":{"kind":["test"],"name":"as_root"},"profile":{"test":true},"manifest_path":"/w/crates/kbf-seatbelt/Cargo.toml"}
+{"reason":"compiler-artifact","target":{"kind":["test"],"name":"as_root"},"profile":{"test":false},"executable":"/w/target/debug/deps/as_root-notest","manifest_path":"/w/crates/kbf-seatbelt/Cargo.toml"}
+{"reason":"compiler-artifact","target":{"kind":["test"],"name":"as_root"},"profile":{"test":true},"executable":"/w/target/debug/deps/as_root-0f1e","manifest_path":"/w/crates/kbf-seatbelt/Cargo.toml"}
 {"reason":"build-finished","success":true}
 "#;
 
@@ -184,7 +184,7 @@ mod tests {
             find(MESSAGES, "as_root"),
             Ok(Built {
                 executable: "/w/target/debug/deps/as_root-0f1e".into(),
-                dir: "/w/crates/kbf-guest".into(),
+                dir: "/w/crates/kbf-seatbelt".into(),
             })
         );
     }
@@ -211,13 +211,16 @@ mod tests {
     /// did not reach cargo) passed over as "no binary".
     #[test]
     fn a_line_that_is_not_json_is_refused() {
-        let e = find("   Compiling kbf-guest v0.1.0\n", "as_root").expect_err("not JSON");
+        let e = find("   Compiling kbf-seatbelt v0.1.0\n", "as_root").expect_err("not JSON");
         let text = e.to_string();
         assert!(
             text.starts_with("cargo printed a line that is not JSON ("),
             "{text}"
         );
-        assert!(text.ends_with("):    Compiling kbf-guest v0.1.0"), "{text}");
+        assert!(
+            text.ends_with("):    Compiling kbf-seatbelt v0.1.0"),
+            "{text}"
+        );
     }
 
     /// Catches an artifact with no executable, or no manifest to take the directory

@@ -50,16 +50,15 @@ Options:
           How leases run; once per runtime. The daemon runs each lease on the driver that serves its kind and refuses to start when two serve the same kind. The node's own driver (native or container) is set up first, whatever the order given
 
           Possible values:
-          - fake:                 Runs nothing; every action succeeds with an empty result. For bring-up only
-          - container:            Each action in a fresh rootless container made by `crun` (Linux)
-          - native:               Each action as plain processes on the node, for Macs
-          - native-whole-machine: Each whole-machine lease as its own user in its GUI session, through `kbf-mac-session` (macOS)
+          - fake:      Runs nothing; every action succeeds with an empty result. For bring-up only
+          - container: Each action in a fresh rootless container made by `crun` (Linux)
+          - native:    Each action as plain processes on the node (Linux)
 
       --cas <CAS>
           The server's worker listener, an `https://` URL (normally `--server`'s), that the container and native drivers read and write blobs through, over mutual TLS with this daemon's `--ca-cert`, `--cert`, `--key` and `--tls-server-name`. Plain `http://` is refused: the worker listener admits each blob call by the daemon's certificate. Every driver's blobs go through one transfer engine, over one connection, within the `--transfer-*` limits
 
       --data-dir <DIR>
-          The directory the daemon keeps everything in, on a local disk: `leases/` (lease directories, the container and native drivers), and under the container driver (and the native driver on macOS) `cache/` (the input cache, `docs/design/worker-cache.md`) and `trees/` (shared read-only input trees, `docs/design/fast-sandbox.md#4-shared-trees`). Made if missing; absolute. The cache and trees are on (unless `--no-input-cache`), sized from the filesystem: half and a quarter of its size less what it keeps free (5%, at least 1 GiB), and the cache evicts entries no running lease links to keep that much free. A directory another daemon owns, or that cannot be used, is left alone: the daemon warns and runs uncached.
+          The directory the daemon keeps everything in, on a local disk: `leases/` (lease directories, the container and native drivers), and under the container driver `cache/` (the input cache, `docs/design/worker-cache.md`) and `trees/` (shared read-only input trees, `docs/design/fast-sandbox.md#4-shared-trees`). Made if missing; absolute. The cache and trees are on (unless `--no-input-cache`), sized from the filesystem: half and a quarter of its size less what it keeps free (5%, at least 1 GiB), and the cache evicts entries no running lease links to keep that much free. A directory another daemon owns, or that cannot be used, is left alone: the daemon warns and runs uncached.
           
           Default `/var/lib/kbf`. A daemon with the fake driver alone touches no directory unless this is given.
 
@@ -67,7 +66,7 @@ Options:
           Lowers the size the cache and the trees are budgeted from (half and a quarter of it), under the filesystem's automatic one
 
       --no-input-cache
-          Switches the host input cache off: no `cache/` and no `trees/`, so every action fetches its inputs from the CAS into its own input root and no later action reuses them (no hard link or clone from either). Leaves what an earlier start put in `<data-dir>/cache` and `<data-dir>/trees` alone. Without a cache a lease reports no input statistics (`cache_hits` and the rest exist only with a cache). For measuring what the cache saves
+          Switches the host input cache off: no `cache/` and no `trees/`, so every action fetches its inputs from the CAS into its own input root and no later action reuses them (no hard link from either). Leaves what an earlier start put in `<data-dir>/cache` and `<data-dir>/trees` alone. Without a cache a lease reports no input statistics (`cache_hits` and the rest exist only with a cache). For measuring what the cache saves
 
       --output-max-depth <MAX_DEPTH>
           The deepest directory an output directory may hold, in levels below it (its own entries are level 1)
@@ -270,22 +269,9 @@ Options:
           [default: 250]
 
       --native-term-grace-ms <NATIVE_TERM_GRACE_MS>
-          How long a lease's processes are given to end after SIGTERM before they are killed, in milliseconds; 0 kills them at once (native). A workload that cleans up when asked to end, such as Python's multiprocessing resource tracker with the shared memory it made, does so in this time; one that ignores SIGTERM is named in the lease's stderr. A slot's clean uses the same value (at most its own time limit). More than 60000 is taken as 60000. The wait comes after the action's timeout and its memory watch have ended it (neither runs during it), and on top of the time given to the kill that follows. A lease past its memory limit is killed at once. Applies on every platform
+          How long a lease's processes are given to end after SIGTERM before they are killed, in milliseconds; 0 kills them at once (native). A workload that cleans up when asked to end, such as Python's multiprocessing resource tracker with the shared memory it made, does so in this time; one that ignores SIGTERM is named in the lease's stderr. More than 60000 is taken as 60000. The wait comes after the action's timeout and its memory watch have ended it (neither runs during it), and on top of the time given to the kill that follows. A lease past its memory limit is killed at once
           
           [default: 2000]
-
-      --xcode-apps <XCODE_APPS>
-          The directory searched for `Xcode*.app` (native). Each Xcode whose own `xcodebuild` answers `-version`, `-license check` and `-checkFirstLaunchStatus`, and for which `xcrun --find clang` does (each within a minute, under the actions' sandbox), is ready: it is reported as an `xcode` entry, and an action that names its build runs with it as `DEVELOPER_DIR`. One that is not is listed in the node's status with why and the command that fixes it, and logged at WARN. The daemon says Hello without waiting for its first survey, which runs in the background: until it ends, each Xcode is listed as not surveyed yet and none is reported
-          
-          [default: /Applications]
-
-      --xcode-recheck-secs <XCODE_RECHECK_SECS>
-          How often, in seconds, the Xcodes are asked again (native), so one fixed while the daemon runs becomes ready without a restart
-          
-          [default: 180]
-
-      --require-metal-toolchain
-          This node's actions use Metal (native): an Xcode whose Metal toolchain is not installed (`xcodebuild -showComponent MetalToolchain`) is not ready
 
       --image <IMAGE>
           A container image this node is pinned to, as an action names it: `docker://<repo>@sha256:<digest>`, one architecture's manifest digest (container; repeatable). At start the daemon makes sure each is in the node's image store, as the prepare step of every lease does: it fetches the image from its registry by that digest, checks every byte against a digest, and unpacks it once. It exits with status 2 if one cannot be fetched, fails a check, or names an image index. The node's status lists them (`GET /v1/nodes`, `software.container_images`). No work is placed by image yet: an action may still name another image
@@ -300,22 +286,6 @@ Options:
           The OCI runtime that runs each action's container (container): `crun`, run directly. Each action gets a fresh rootless sandbox. It needs the daemon user's subordinate ids in one range, `newuidmap` and `newgidmap` (package `uidmap`) on `PATH`, and every directory down to `--data-dir` searchable by others
           
           [default: /usr/bin/crun]
-
-      --mac-session-socket <MAC_SESSION_SOCKET>
-          The socket `kbf-mac-session` serves (native-whole-machine)
-          
-          [default: /var/run/kbf-mac-session/socket]
-
-      --daemon-user <DAEMON_USER>
-          This daemon's own user, which keeps read and remove access to what a whole-machine lease's user writes in its lease directory (native-whole-machine)
-          
-          [default: _kbf]
-
-      --pool-users <POOL_USERS>
-          How many lease users the pool has (native, macOS, a daemon run as root): every action runs as one of `kbf-pool-0` .. `kbf-pool-<N-1>`, one lease per user at a time, as kbf-mac-provision makes them (`pool_users`). Required of a root daemon, which runs no action as root; refused for any other
-
-      --pool-first-uid <POOL_FIRST_UID>
-          The uid of `kbf-pool-0`, and the group id of all the pool users (`pool_first_uid` in kbf-mac-provision's profile); at least 600
 
       --config <FILE>
           Read the mode's settings from this TOML file (default /etc/kbf/kbf.toml when it exists); a flag on the command line overrides its key

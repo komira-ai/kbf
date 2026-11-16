@@ -597,7 +597,7 @@ fn the_launchd_gate_is_the_installer_toml_setup_writes_on_a_mac() {
         gate_files(&plist).iter().collect::<Vec<_>>(),
         "setup wrote installer.toml somewhere the launchd gate does not wait"
     );
-    // The node job reads kbf.toml from the layout; on a Mac that file is kbf-mac-provision's
+    // The node job reads kbf.toml from the layout; on a Mac that file is a Mac host's own
     // (G9), so it was there before setup and setup wrote none.
     assert!(
         planted.iter().any(|p| p == Platform::MacOs.kbf_toml())
