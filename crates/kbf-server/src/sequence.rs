@@ -30,7 +30,8 @@
 //!    still queued on the job service when the intake closes (no host took it) is cancelled and
 //!    its lease given up, since nothing has run and a queue that no host serves would hold the
 //!    drain for ever: its operation is queued again and its stream ends as that of any
-//!    operation that never started ([`crate::executor::Executor`]). An execution that runs on a node of
+//!    operation that never started, or is kept and followed in the state store when a daemon
+//!    session of another frontend could run it ([`crate::executor::Executor`]). An execution that runs on a node of
 //!    this frontend finishes here: its result is taken, and its caller is answered. An execution
 //!    whose operation another frontend took is followed in the state store.
 //! 5. It stands down as a retire does ([`Stand::release`]: the farm is fenced, the worker

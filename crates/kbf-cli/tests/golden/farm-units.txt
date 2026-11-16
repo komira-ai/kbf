@@ -24,6 +24,7 @@ env XDG_RUNTIME_DIR=/run/user/1000
 --ca-cert=/farm/node-1/etc/ca.pem
 --cert=/farm/node-1/etc/node.pem
 --cgroup-root=/farm/node-1/bin/cgroup
+--cold-store-floor-bytes=0
 --cold-store=file:///farm/node-1/cold
 --data-dir=/farm/node-1/data
 --driver=container
@@ -51,6 +52,7 @@ env XDG_RUNTIME_DIR=/run/user/1000
 --ca-cert=/farm/node-2/etc/ca.pem
 --cert=/farm/node-2/etc/node.pem
 --cgroup-root=/farm/node-2/bin/cgroup
+--cold-store-floor-bytes=0
 --cold-store=file:///farm/node-2/cold
 --data-dir=/farm/node-2/data
 --driver=container
@@ -114,6 +116,7 @@ env XDG_RUNTIME_DIR=/run/user/1000
 --ca-cert=/farm/node-1/etc/ca.pem
 --cert=/farm/node-1/etc/node.pem
 --cgroup-root=/farm/node-1/bin/cgroup
+--cold-store-floor-bytes=0
 --cold-store=file:///farm/node-1/cold
 --data-dir=/farm/node-1/data
 --driver=container
@@ -143,6 +146,7 @@ env XDG_RUNTIME_DIR=/run/user/1000
 --ca-cert=/farm/node-2/etc/ca.pem
 --cert=/farm/node-2/etc/node.pem
 --cgroup-root=/farm/node-2/bin/cgroup
+--cold-store-floor-bytes=0
 --cold-store=file:///farm/node-2/cold
 --data-dir=/farm/node-2/data
 --driver=container
@@ -204,6 +208,7 @@ mode frontend
 == beta node-1
 mode storage
 --advertise-addr={host}:41010
+--cold-store-floor-bytes=0
 --cold-store=file:///farm/node-1/cold
 --frontend=https://localhost:41001
 --hot-store-max-bytes=268435456
@@ -218,6 +223,7 @@ mode storage
 == beta node-2
 mode storage
 --advertise-addr={host}:41011
+--cold-store-floor-bytes=0
 --cold-store=file:///farm/node-2/cold
 --frontend=https://localhost:41001
 --hot-store-max-bytes=268435456
@@ -232,6 +238,7 @@ mode storage
 == beta node-3
 mode storage
 --advertise-addr={host}:41012
+--cold-store-floor-bytes=0
 --cold-store=file:///farm/node-3/cold
 --frontend=https://localhost:41001
 --hot-store-max-bytes=268435456
@@ -311,6 +318,7 @@ mode storage
 == beta-shrunk node-2
 mode storage
 --advertise-addr={host}:41011
+--cold-store-floor-bytes=0
 --cold-store=file:///farm/node-2/cold
 --frontend=https://localhost:41001
 --hot-store-max-bytes=268435456
@@ -325,6 +333,7 @@ mode storage
 == beta-shrunk node-3
 mode storage
 --advertise-addr={host}:41012
+--cold-store-floor-bytes=0
 --cold-store=file:///farm/node-3/cold
 --frontend=https://localhost:41001
 --hot-store-max-bytes=268435456

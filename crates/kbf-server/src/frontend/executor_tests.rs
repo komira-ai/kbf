@@ -90,10 +90,6 @@ fn beside_flags(dir: &Path) -> Vec<String> {
         "task.secret",
         b"0123456789abcdef0123456789abcdef-the-farm\n",
     );
-    let presign = private(
-        "presign.json",
-        br#"{"access_key_id": "k", "secret_access_key": "s"}"#,
-    );
     let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("params");
     params.subject_alt_names = vec![rcgen::SanType::IpAddress(
         std::net::Ipv4Addr::LOCALHOST.into(),
@@ -104,15 +100,11 @@ fn beside_flags(dir: &Path) -> Vec<String> {
     let key = private("job.key", key.serialize_pem().as_bytes());
     vec![
         format!("--task-secret-file={secret}"),
-        "--task-put-endpoint=http://127.0.0.1:9".to_owned(),
-        "--task-put-bucket=kbf-fake".to_owned(),
-        format!("--task-put-credentials-file={presign}"),
-        "--task-read-url=https://127.0.0.1:9400".to_owned(),
+        "--task-out-root=/mnt/ts/put".to_owned(),
         "--job-listen=127.0.0.1:0".to_owned(),
         format!("--job-tls-cert={cert}"),
         format!("--job-tls-key={key}"),
         format!("--job-grant-secret-file={secret}"),
-        "--executor-allow-plain-http-put".to_owned(),
     ]
 }
 
@@ -163,6 +155,8 @@ pub(super) fn flag_list(
         format!("--executor-job-token-file={}", token.display()),
         "--executor-frontend-id=front-1".to_owned(),
         "--executor-hosts=1".to_owned(),
+        // A change in the job service shows in `/readyz` within a tick of the test's.
+        "--readyz-probe-interval-ms=20".to_owned(),
         "--executor-host-cpus=2".to_owned(),
         "--executor-host-memory-gib=16".to_owned(),
         "--executor-base-image=registry.test/base@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
@@ -396,10 +390,10 @@ async fn a_frontend_stops_when_another_frontend_has_jobs() {
     );
 }
 
-/// Asserts that a frontend given only `--task-secret-file` and `--task-out-mode put-dir` starts
-/// its executor over a preparation of put directories alone, which is the frontend's own (no
-/// test source), and holds no preparation of presigned writes; and that the secret file is
-/// still read at the start: a short one stops it, naming the flag. No read listener is given.
+/// Asserts that a frontend given only `--task-secret-file` and `--task-out-root` starts its
+/// executor over a preparation of put directories, which is the frontend's own (no test source);
+/// and that the secret file is still read at the start: a short one stops it, naming the flag. No
+/// read listener is given.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_put_dir_frontend_starts_over_its_own_put_dir_preparation() {
     let s3 = FakeS3::start().await;
@@ -411,27 +405,11 @@ async fn a_put_dir_frontend_starts_over_its_own_put_dir_preparation() {
         &fake,
         &["--executor=js-agent", "--executor-insecure-argv-secrets"],
     );
-    list.retain(|flag| {
-        ![
-            "--task-put-endpoint",
-            "--task-put-bucket",
-            "--task-put-credentials-file",
-            "--task-read-url",
-            "--job-",
-            "--executor-allow-plain-http-put",
-        ]
-        .iter()
-        .any(|name| flag.starts_with(name))
-    });
-    list.extend([
-        "--task-out-mode=put-dir".to_owned(),
-        "--task-out-root=/mnt/ts/put".to_owned(),
-    ]);
+    list.retain(|flag| !flag.starts_with("--job-"));
     let flags = flags_over(Some("--storage=http://127.0.0.1:1"), &list);
-    assert!(flags.task.is_none() && flags.put_dir.is_some());
+    assert!(flags.put_dir.is_some() && flags.job_read.is_none());
     let (handle, _stop) = started(&flags, None).expect("starts over its own preparation");
     assert!(handle.put_dir_prep().is_some());
-    assert!(handle.run_prep().is_none());
     drop(handle);
 
     std::fs::write(dir.path().join("task.secret"), b"too short\n").expect("written");
@@ -452,7 +430,7 @@ async fn a_frontend_that_cannot_build_its_executor_does_not_start() {
 
     let good = flags(dir.path(), &s3, &fake, &js);
     let mut no_task = good.clone();
-    no_task.task = None;
+    no_task.put_dir = None;
     let why = started(&no_task, None).err().expect("refused").to_string();
     assert!(why.contains("preparation of task runs"), "{why}");
     assert!(why.contains("--task-secret-file"), "{why}");

@@ -199,7 +199,8 @@ pub(in crate::farm) struct Engine {
     pub(in crate::farm) unplaced: BTreeSet<LeaseId>,
     /// The operations whose lease was withdrawn at a drain with its job never placed on a
     /// host: nothing of them ran, so a drain ends their streams as it ends those of any
-    /// operation that never started and that nothing here can run ([`Engine::stage_for`]).
+    /// operation that never started and that nothing here can run, unless a daemon session of
+    /// another frontend could run it, which keeps them ([`Engine::stage_for`]).
     /// The operation stays queued in the state store for the next frontend.
     pub(in crate::farm) withdrawn: BTreeSet<OperationId>,
     /// For each operation this farm's callers wait on ([`Farm::follow`](super::Farm::follow))
@@ -452,14 +453,17 @@ impl Engine {
     /// - `Waiting`: a drain ends its streams. It never started, no daemon session of
     ///   another frontend could run it, and it is held by an operator's cordon (alone, or
     ///   beside the drain's) or by no worker at all; or its lease was withdrawn at the drain
-    ///   with its job never placed on a host (`withdrawn`), whatever holds it now.
+    ///   with its job never placed on a host (`withdrawn`) and no daemon session of another
+    ///   frontend could run it, whatever holds it now. A withdrawn operation another frontend
+    ///   could run is `WaitingKept`: Buck2 never re-attaches an ended stream, so ending it would
+    ///   fail an action the other frontend runs.
     fn stage_for(&self, operation: OperationId, why: &str) -> Stage {
         let cordoned = self.sched.cordoned_could(operation);
         let only_drain = !cordoned.is_empty()
             && cordoned
                 .iter()
                 .all(|worker| self.drain_held.contains(worker));
-        if self.withdrawn.contains(&operation) {
+        if self.withdrawn.contains(&operation) && !self.runnable_elsewhere(operation) {
             Stage::Waiting(why.to_owned())
         } else if self.ever_started.contains(&operation) || self.runnable_elsewhere(operation) {
             Stage::WaitingKept(why.to_owned())

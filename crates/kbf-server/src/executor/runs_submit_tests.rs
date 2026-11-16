@@ -94,6 +94,10 @@ async fn prepared_before_the_end(before: Duration) -> (Harness, bool, String) {
 /// What the worker logs when it drops a `Start` whose window ended before its job was sent.
 const DROPPED: &str = "a Start ran out of its window before its job was submitted and is dropped";
 
+/// What the worker logs of a `Start` whose preparation ended at the very end of its window: the
+/// stage, and the window as the age of the heartbeat it names.
+const PREPARED_LATE: &str = "stage=prepared_late beat_age_ms=14000";
+
 /// Catches a window judged only by the timeout around the prepare: a prepare that ends at
 /// the very instant the window ends finishes inside that timeout, and its job must still
 /// not be submitted, as the `Start` is no longer valid. It is dropped, logged and counted
@@ -104,6 +108,7 @@ async fn a_task_prepared_at_the_end_of_its_window_is_not_submitted() {
     let (harness, running, log) = prepared_before_the_end(Duration::ZERO).await;
     assert!(!running, "a job was submitted for a Start past its window");
     assert!(log.contains(DROPPED), "{log}");
+    assert!(log.contains(PREPARED_LATE), "{log}");
     assert_eq!(submitted_specs(&harness).len(), 0);
     assert!(harness.fake.jobs().is_empty());
     assert_eq!(counted(&harness, "kbf_executor_late_starts_total"), 1);
@@ -299,14 +304,103 @@ async fn a_preparation_outlasting_the_window_runs_to_its_end() {
     tell_start(&messages, start(1, 1));
     step_ticking(&harness, &mut worker).await;
     tokio::time::advance(window + Duration::from_secs(1)).await;
+    let log = Log::default();
+    let guard = log.install();
     step_ticking(&harness, &mut worker).await;
+    drop(guard);
     assert!(!worker.tasks.contains_key(&lease), "the late task is kept");
+    let stage = log.field("stage");
+    assert_eq!(stage.as_deref(), Some("preparing"), "{}", log.text());
     assert_eq!(counted(&harness, "kbf_executor_late_starts_total"), 1);
     assert_eq!(gate.finished.load(Ordering::SeqCst), 0);
     gate.release.notify_one();
     gate.done.notified().await;
     assert_eq!(gate.finished.load(Ordering::SeqCst), 1);
     assert_eq!(submitted_specs(&harness).len(), 0);
+}
+
+/// Asserts that the warning of a dropped `Start` says where the `Start` stood and how old the
+/// heartbeat it names was: with room for one preparation at a time, two `Start`s whose
+/// preparation never ends are dropped past the window, the one that began as `preparing` and
+/// the one that never did as `not_begun`, each with the age of the registration heartbeat
+/// they name (the window and the second after it). Catches a drop warning that names neither,
+/// which left a farm's drops unexplained (a preparation slower than the window, or a worker
+/// given more `Start`s than it prepares at once).
+#[tokio::test(start_paused = true)]
+async fn a_dropped_start_is_logged_with_its_stage_and_the_age_of_its_heartbeat() {
+    let mut harness = Harness::new().await;
+    harness.cfg.prepare_concurrency = 1;
+    let (mut worker, messages) = harness.worker();
+    harness.deps.inputs = Arc::new(Gate::new(false));
+    let window = Duration::from_millis(start(1, 1).valid_for_ms);
+    tell_start(&messages, start(1, 1));
+    tell_start(&messages, start(1, 2));
+    step_ticking(&harness, &mut worker).await;
+    tokio::time::advance(window + Duration::from_secs(1)).await;
+    let log = Log::default();
+    let guard = log.install();
+    step_ticking(&harness, &mut worker).await;
+    drop(guard);
+    let text = log.text();
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|line| line.contains("dropped"))
+        .collect();
+    assert_eq!(lines.len(), 2, "{text}");
+    for (line, stage) in lines.iter().zip(["preparing", "not_begun"]) {
+        assert!(line.contains(&format!("stage={stage} ")), "{text}");
+        let age: u64 = line
+            .split_once("beat_age_ms=")
+            .and_then(|(_, tail)| tail.split_whitespace().next())
+            .and_then(|age| age.parse().ok())
+            .unwrap_or_else(|| panic!("no age of the heartbeat in {text}"));
+        assert!((15_000..20_000).contains(&age), "{age} in {text}");
+    }
+    assert_eq!(counted(&harness, "kbf_executor_late_starts_total"), 2);
+}
+
+/// Asserts that a `Start` whose job was prepared and whose submit the service did not answer
+/// is logged as `submit_unanswered` when its window ends. Catches a drop that blames the
+/// preparation for a submit that waited.
+#[tokio::test(start_paused = true)]
+async fn a_start_dropped_with_its_submit_unanswered_says_so() {
+    let harness = Harness::new().await;
+    let (mut worker, messages) = harness.worker();
+    harness.fake.lose_next_answer();
+    tell_start(&messages, start(1, 1));
+    step(&harness, &mut worker).await;
+    tokio::time::advance(Duration::from_secs(15)).await;
+    harness.fake.lose_next_answer();
+    let log = Log::default();
+    let guard = log.install();
+    step(&harness, &mut worker).await;
+    drop(guard);
+    let stage = log.field("stage");
+    let text = log.text();
+    assert_eq!(stage.as_deref(), Some("submit_unanswered"), "{text}");
+}
+
+/// Asserts that a `Start` that names a heartbeat the worker never sent is logged as not begun,
+/// with no age of the heartbeat (`none`): there is none to age. Catches an age of zero or a
+/// panic for a heartbeat that is not there.
+#[tokio::test(start_paused = true)]
+async fn a_start_naming_no_heartbeat_is_logged_with_no_age() {
+    let harness = Harness::new().await;
+    let (mut worker, messages) = harness.worker();
+    tell_start(
+        &messages,
+        Start {
+            heartbeat_seq: 99,
+            ..start(1, 1)
+        },
+    );
+    let log = Log::default();
+    let guard = log.install();
+    step(&harness, &mut worker).await;
+    drop(guard);
+    let (stage, age) = (log.field("stage"), log.field("beat_age_ms"));
+    assert_eq!(stage.as_deref(), Some("not_begun"), "{}", log.text());
+    assert_eq!(age.as_deref(), Some("none"), "{}", log.text());
 }
 
 /// Asserts that a preparation is bounded by `prepare_limit` (not by the window): one that does

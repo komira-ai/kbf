@@ -114,6 +114,7 @@ const GROUPS: &[(&str, &[&str])] = &[
             "placement-predictions",
             "progress-interval-secs",
             "qos-allowed",
+            "readyz-probe-interval-ms",
             "readyz-store-timeout-ms",
             "scheduler-core",
             "state-store",
@@ -135,6 +136,7 @@ const GROUPS: &[(&str, &[&str])] = &[
     (
         "history",
         &[
+            "history-credentials-file",
             "history-index-root",
             "history-objects",
             "invocation-memory",
@@ -288,6 +290,7 @@ const GROUPS: &[(&str, &[&str])] = &[
             "task-put-credentials-file",
             "task-put-endpoint",
             "task-put-region",
+            "task-put-retry-secs",
             "task-read-url",
             "task-run-wall-secs",
             "task-secret-file",

@@ -6,8 +6,8 @@
 //! stream is one (invocation, writer, UTC day). Stream ids come from blocks of
 //! [`BLOCK_SIZE`] the history writer reserves ahead of need from the `ui/streams`
 //! counter; when no block is at hand the [`Minter`] takes a fallback id from an
-//! in-process counter in a range no block uses (top bit set, then the writer's 7-bit
-//! frontend index, then 16 bits; [`Minter::for_writer`] starts each process at a point of
+//! in-process counter in a range no block uses (top bit set, then 7 bits taken from the
+//! writer id, then 16 bits; [`Minter::for_writer`] starts each process at a point of
 //! its own), so minting never waits on the state store. Fallback
 //! ids are not durable and are reused after a restart; the `ui/stream` row key carries
 //! the stream's open time, so a reused id still resolves to its own chunk.
@@ -204,9 +204,10 @@ struct MintState {
 impl Minter {
     /// A minter whose fallback ids are drawn from a point of the range that `writer`
     /// picks (its low 16 bits are the first id's low bits, the next 7 the frontend
-    /// index), so two processes over one store (the two children of a swap) do not mint
-    /// the same fallback stream id when their counter refills fail. The writer id is a
-    /// hash of the instance id, so the points are spread over the 2^23 ids of the range.
+    /// index), so two processes over one store (the old and the new frontend of a
+    /// rolling update) do not mint the same fallback stream id when their counter
+    /// refills fail. A frontend's writer id is its start time in microseconds, so the
+    /// points of two starts are spread over the 2^23 ids of the range.
     #[must_use]
     pub fn for_writer(writer: u64) -> Minter {
         let minter = Minter::new(((writer >> 16) & 0x7F) as u8);

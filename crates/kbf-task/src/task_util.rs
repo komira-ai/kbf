@@ -7,7 +7,7 @@ use kbf_proto::reapi::{self, Action};
 use kbf_types::Digest;
 
 use crate::digest;
-use crate::fetch::FetchError;
+use crate::message::FetchError;
 use crate::task::Failure;
 
 /// The digest an Action field names, or a fetch failure saying which field is missing.

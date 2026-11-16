@@ -86,9 +86,11 @@ role = "all"
 # update-dir = "DIR"
 
 [history]
+# A file with the key pair of an `s3://` `--history-objects`, JSON `{"access_key_id": "...", "secret_access_key": "..."}` in the form of `--pack-store-credentials-file`: a regular file, not a link, that this user owns, mode 0600 or 0400. When given, the environment's `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` are not read. The secret is never a flag. Needs `--history-objects`, and an `s3://` one
+# history-credentials-file = "PATH"
 # Where history's index rows live in the state store: `ui/`, or `<prefix>ui/` for a prefix that ends in `/`, so that one state store can hold several farms' history apart. Left out, it is `ui/`. Needs `--history-objects`
 # history-index-root = "ROOT"
-# Where build history is kept: an object store, `s3://bucket/prefix?endpoint=http://host:port` (the key pair is the `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` of the environment) or `file:///absolute/path` (a directory this process owns, not the cold store's). The attempts and cache hits of each invocation a client named are recorded under `<prefix>history/` after their results are sent, never before and never delaying one; the index rows go to `--state-store`, which this flag needs. A full queue, a slow object store or a slow state store drops records and counts them (`kbf_history_dropped_total` on `/metrics`), and never fails or delays a call. The writer reads and writes only keys under `history/`. Left out, nothing is recorded
+# Where build history is kept: an object store, `s3://bucket/prefix?endpoint=http://host:port` (the key pair is the one in `--history-credentials-file`, else the `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` of the environment) or `file:///absolute/path` (a directory this process owns, not the cold store's). The attempts and cache hits of each invocation a client named are recorded under `<prefix>history/` after their results are sent, never before and never delaying one; the index rows go to `--state-store`, which this flag needs. A full queue, a slow object store or a slow state store drops records and counts them (`kbf_history_dropped_total` on `/metrics`), and never fails or delays a call. The writer reads and writes only keys under `history/`. Left out, nothing is recorded
 # history-objects = "URI"
 # The memory, in bytes, the invocation records may take together (`docs/design/invocations.md`, section 3.5). At the bound, records of a minted id go first, then idle ones, least recently seen first; with only open builds left, the largest stops taking rows. Records are kept in memory only and lost on restart. Their heap was measured at up to 1.08 times this at 200 kB and above, and 1.12 at 50 kB (section 3.5)
 invocation-memory = 268435456
@@ -254,6 +256,8 @@ placement-predictions = "off"
 progress-interval-secs = 30
 # The QoS levels a call may ask for with the `x-kbf-qos` request header, as a comma list of `ci`, `batch` and `interactive` (`ci` is always allowed: it is what a call with no header, or a header naming a level not on the list, gets, and that call is never refused). The level orders the queue, most urgent first: a `batch` action waits behind every queued `ci` action. It is not part of the action digest, so it does not split the cache. A client that sends no header stays at `ci`
 qos-allowed = "ci,batch"
+# How often, in milliseconds, a frontend asks each of the dependencies behind `GET /readyz` (the storage node, the state store, the storage map) again, in the background. `GET /readyz` and the REAPI listener's `grpc.health.v1` service answer from the last answers at once and wait for no probe; a probe that has not answered within `--readyz-store-timeout-ms` counts as failed
+readyz-probe-interval-ms = 1000
 # How long, in milliseconds, `GET /readyz` on the operator API and the REAPI listener's `grpc.health.v1` service wait for the object store to answer their read-only probe before they answer not ready
 readyz-store-timeout-ms = 2000
 # Which core drives the farm's scheduling. The one value is `legacy`, the default: the driver the server has always had. `js` names a core that was removed, because scheduling runs in the job service, and is refused at start (exit status 2). The core a server runs is logged at start and exported as `kbf_scheduler_core{core}`, the one series `kbf_scheduler_core{core="legacy"} 1`

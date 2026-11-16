@@ -329,9 +329,11 @@ it out on its own health check and its connections' GOAWAY (the order and each p
    every stream open, whether a stop signal or `POST /v1/frontend/drain` began the drain.
    Under `--executor js-agent`, a job still queued on the job service when step 3 closes the
    intake (no host took it) is cancelled and its lease given up, its operation queued again
-   for the next frontend and its stream ended `UNAVAILABLE`: nothing of it ran, and the
-   queue may never move (every host out of service). A job a host has placed, or is
-   running, is waited for.
+   for the next frontend: nothing of it ran, and the queue may never move (every host out of
+   service). Its stream is kept while a daemon session of another frontend could run the
+   operation (that frontend takes it from the state store and answers it), and ended
+   `UNAVAILABLE` when none could, which fails that action (Buck2 never re-attaches). A job a
+   host has placed, or is running, is waited for.
 5. The worker streams that are left end `UNAVAILABLE` (daemons dial another frontend through
    the load balancer, which keeps their leases), and the process exits 0. Only a forced stop
    (below) leaves client streams open at this step, and ends them `UNAVAILABLE`. It is not undone: what starts in its place is a new process.

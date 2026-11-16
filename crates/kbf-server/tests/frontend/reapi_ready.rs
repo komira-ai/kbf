@@ -82,8 +82,7 @@ async fn reapi_readiness_keeps_the_checks_of_readyz() {
     assert_eq!(get(front.api, "/readyz/reapi").await.0, 200);
 
     node.stop().await;
-    let (code, body) = get(front.api, "/readyz/reapi").await;
-    assert_eq!(code, 503, "{body}");
+    let body = reapi_until(front.api, 503).await;
     assert_eq!(failing(&body), ["storage"], "{body}");
 }
 

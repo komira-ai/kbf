@@ -40,6 +40,15 @@
 //! node, its state store and the storage map. Where the worker listener checks callers
 //! against the state store's deny rows, either has one more, `deny_rows`: the listener's copy
 //! of them is one it may use (`crate::deny_rows`).
+//!
+//! A frontend answers its load balancer from the last answers of its probes
+//! ([`Checks::begin`]): each probe is asked again on its own interval
+//! (`--readyz-probe-interval-ms`), within its own timeout (`--readyz-store-timeout-ms`), and
+//! `/readyz` reads what the last ask found, so no request waits for a probe. A probe that has
+//! not answered within its timeout counts as failed. The stop signal, the scheduler role and
+//! the hand-over are flags read at each request, not probes, so a drain turns `/readyz` to 503
+//! at once. A server that has not called [`Checks::begin`] (`kbf-server` itself) asks its
+//! probes on every request.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -51,7 +60,7 @@ use axum::http::StatusCode;
 use axum::http::header::CONTENT_TYPE;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use futures::future::BoxFuture;
+use futures::future::{BoxFuture, join_all};
 use kbf_front::{Cache, MetaLog, Routed};
 use kbf_objstore::{ByteRange, ObjectStore, ObjectStoreError};
 use kbf_storage::Storage;
@@ -70,6 +79,10 @@ pub const PROBE_KEY: &str = "readyz-probe";
 /// How long the store probe waits for the store unless `--readyz-store-timeout-ms`
 /// says otherwise.
 pub const STORE_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How often a frontend asks each of its probes again unless `--readyz-probe-interval-ms`
+/// says otherwise.
+pub const PROBE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// What `/readyz` reads besides the store: whether a stop signal has come, and
 /// whether this server holds the scheduler role. Shared by the serving future, which
@@ -183,11 +196,47 @@ pub trait Probe: Send + Sync {
     fn probe(&self) -> BoxFuture<'_, Result<(), String>>;
 }
 
+/// One [`Probe`] of [`Checks`], with the answer its last ask found.
+struct Entry {
+    check: &'static str,
+    probe: Arc<dyn Probe>,
+    /// The last answer. Until the first ask of [`Checks::begin`] has finished it is a
+    /// failure, which nothing reads before then.
+    last: tokio::sync::watch::Sender<Result<(), String>>,
+}
+
+impl Entry {
+    /// Asks the probe once, waiting at most `timeout`, and keeps the answer: no answer in time
+    /// is a failure.
+    async fn refresh(&self, timeout: Duration) {
+        let answer = match tokio::time::timeout(timeout, self.probe.probe()).await {
+            Ok(answer) => answer,
+            Err(_) => Err(format!(
+                "the {} probe had no answer within {} ms",
+                self.check,
+                timeout.as_millis()
+            )),
+        };
+        drop(self.last.send_replace(answer));
+    }
+}
+
+/// Asks the probe of `entry` again every `interval`, for as long as the future is polled.
+async fn keep(entry: Arc<Entry>, interval: Duration, timeout: Duration) {
+    loop {
+        tokio::time::sleep(interval).await;
+        entry.refresh(timeout).await;
+    }
+}
+
 /// The checks of `/readyz`: the stop signal, the scheduler role and the [`Probe`]s, in
 /// that order. One evaluation for the HTTP route and the `grpc.health.v1` service.
 pub struct Checks {
     readiness: Arc<Readiness>,
-    probes: Vec<(&'static str, Arc<dyn Probe>)>,
+    probes: Vec<Arc<Entry>>,
+    /// Whether [`Checks::begin`] has run: the probes are then read from their last answers,
+    /// not asked.
+    background: AtomicBool,
 }
 
 impl Checks {
@@ -197,13 +246,20 @@ impl Checks {
         Self {
             readiness,
             probes: Vec::new(),
+            background: AtomicBool::new(false),
         }
     }
 
     /// These checks, and `probe` under the name `check`.
     #[must_use]
     pub fn probing(mut self, check: &'static str, probe: Arc<dyn Probe>) -> Self {
-        self.probes.push((check, probe));
+        self.probes.push(Arc::new(Entry {
+            check,
+            probe,
+            last: tokio::sync::watch::Sender::new(Err(
+                "the probe has not been asked yet".to_owned()
+            )),
+        }));
         self
     }
 
@@ -227,8 +283,27 @@ impl Checks {
         &self.readiness
     }
 
+    /// Asks every probe once, each within `timeout` and all at once, and from then on has
+    /// [`Checks::failing`] answer from the last answers instead of asking. Returns the
+    /// future that asks each probe again every `interval` (each on its own clock, so a probe
+    /// that hangs delays no other), which never ends: spawn it for as long as the checks are
+    /// served, and drop it to stop.
+    pub async fn begin(&self, interval: Duration, timeout: Duration) -> BoxFuture<'static, ()> {
+        join_all(self.probes.iter().map(|entry| entry.refresh(timeout))).await;
+        self.background.store(true, Ordering::SeqCst);
+        let keeping: Vec<_> = self
+            .probes
+            .iter()
+            .map(|entry| keep(Arc::clone(entry), interval, timeout))
+            .collect();
+        Box::pin(async move {
+            join_all(keeping).await;
+        })
+    }
+
     /// The checks that fail now, in the order the route lists them; empty when the
-    /// server is ready. Asks each probe once.
+    /// server is ready. Asks each probe once, or, after [`Checks::begin`], reads the last
+    /// answer of each and waits for none.
     pub async fn failing(&self) -> Vec<Failing> {
         self.failing_except(&[]).await
     }
@@ -253,12 +328,21 @@ impl Checks {
         if self.readiness.is_handed_over() {
             return failing;
         }
-        for (check, probe) in &self.probes {
-            if skip.contains(check) {
+        let background = self.background.load(Ordering::SeqCst);
+        for entry in &self.probes {
+            if skip.contains(&entry.check) {
                 continue;
             }
-            if let Err(reason) = probe.probe().await {
-                failing.push(Failing { check, reason });
+            let last = background.then(|| entry.last.borrow().clone());
+            let answer = match last {
+                Some(answer) => answer,
+                None => entry.probe.probe().await,
+            };
+            if let Err(reason) = answer {
+                failing.push(Failing {
+                    check: entry.check,
+                    reason,
+                });
             }
         }
         failing
@@ -529,3 +613,6 @@ fn json(code: StatusCode, value: &impl Serialize) -> Response {
     let body = serde_json::to_vec(value).unwrap_or_default();
     (code, [(CONTENT_TYPE, JSON)], body).into_response()
 }
+
+#[cfg(test)]
+mod tests;

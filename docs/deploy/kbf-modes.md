@@ -151,16 +151,13 @@ and a tag is refused. It needs both image flags, and the job service (`--executo
 on the frontend's jobs, by which a restarted frontend finds and cancels those an earlier process
 left, and hashed into every job id; it must be different for each frontend, so a `kbf.toml` is
 not copied to a second frontend with it), the packs (`--pack-store-endpoint`, through which the
-pack a task writes is read, hashed and turned into the action's result) and the delivery of the
-secrets, `--executor-secret-delivery`. With `argv`, the default, the presigned write url and the
-read token travel as arguments of the job, where the action can read them, and
-`--executor-insecure-argv-secrets` says the operator accepts it. With `files` each is a file of the
-job, which its host writes read-only at `/run/js-files`, and the task tool is given the paths
-(`--pack-url-file`, `--grant-token-file`): no argument holds a secret, and
-`--executor-insecure-argv-secrets` is refused with it. There is no fall back to arguments: a host
-whose agent cannot write the files refuses to start the job (`files-unsupported`) and the action
-is rerun; `invalid-file` ends the action as invalid. `files` is refused with `--executor
-kbf-daemon`, which builds no command line. The executor no longer speaks to a lease server: the
+pack a task writes is read, hashed and turned into the action's result) and nothing else for the
+output: a put-dir job (the only mode, `--task-out-mode put-dir`) carries no url, no grant and no secret, and its pack is a file
+of its put directory, which the frontend ingests. The executor's presigned path (a write url, a read token, `--executor-secret-delivery`
+`argv` or `files`) is still in the code and no flag selects it: `--executor-secret-delivery`, `--executor-insecure-argv-secrets`,
+`--executor-work-dir`, `--executor-allow-plain-http-put`, `--executor-allow-plain-http-grant` and `--executor-locate` are still
+read and checked at start (so a `kbf.toml` that sets them keeps starting) and change nothing a put-dir job is given. They are
+deleted, with that path and the test rigs built on it, in the change that follows the removal of the presigned task-out mode. The executor no longer speaks to a lease server: the
 flags `--executor-lease-url`, `--executor-lease-token-file`, `--executor-lease-ca-file`,
 `--executor-lease-ttl-secs` and `--executor-class` are gone, and a frontend started with one (or
 a `kbf.toml` that names one) fails at start naming it. `--executor-output-disk-bytes`, the scratch
@@ -200,30 +197,10 @@ the Command leaves as it ends while the Command runs, and kills and reaps every 
 included, before the outputs are read. The job log has no sandbox or
 network line for it: nothing is made, so nothing is unusual.
 
-Today's job (the grant mode, without `--tree`) keeps its sandbox. The task tool starts the Command
-in mount and PID namespaces of its own (`crates/kbf-task/src/sandbox.rs`), made by the same `unshare`
-as its user and network namespaces. The job's files at `/run/js-files` (the read token and the write
-URLs of `--executor-secret-delivery files`) and the parent of the tool's work directory (`/scratch`,
-which holds the input root, the run's `private/` directory and the captured stdout and stderr) are
-covered by an empty read-only tmpfs, with the input root and `private/` bound again at their own
-paths, so the Command's working directory and its `HOME`, `TMPDIR` and cache variables still name
-them. `/tmp`, `/var/tmp`, `/run` and `/root` are the run's own `private/tmp`, `private/var-tmp`,
-`private/run` and `private/home`: on the job's scratch disk and executable, where the job's own
-`/tmp` is a 64 MiB `noexec` tmpfs. The Command is the second process of its PID namespace (the
-tool starts it through two processes of its own binary, `kbf-task --sandbox-relay` outside the
-namespace and `--sandbox-init` as its first process), and
-every process it started is ended when it ends, before its outputs are read, whether or not it
-left its process group. It holds no capability and runs under `no_new_privs`, also when it is
-allowed the network (`kbf-network=allow`), so a set-id program or a file capability gives it none,
-and it cannot take a cover off. The namespace keeps the job's `/proc`. A Command that runs as root
-gets the mount and PID namespaces without a user namespace, and could unmount the covers; the
-kbf image runs as a user other than root. The outputs are then read with `openat2`, refusing any
-symlink, magic link or `..` in any component. Each action's job log has the line
-`kbf-task: action <digest>: sandbox: mount and pid namespaces`, or `sandbox: incomplete (<step>
-<errno>)` where the host refused a step (a host that does not let an unprivileged user namespace
-keep its capabilities, AppArmor's `apparmor_restrict_unprivileged_userns`, refuses `setgroups` or
-`uid_map`): the steps before it hold, the action still runs, and what it would have hidden is
-visible to it. `kbf-task --probe-confinement` prints the same as `probe sandbox:`.
+`kbf-task` has no other mode: it refuses `--grant-url`, `--pack-url-file`, `--put-urls-file`, `--fetch-*`, `--locate` and
+`--work-dir` (exit 2), so the mount and PID namespaces of its former grant mode, the `sandbox: ...` job log line and the covers
+of `/run/js-files` and `/scratch` no longer exist for a job. Its confinement code (`crates/kbf-task/src/sandbox.rs`) is
+reached only by `kbf-task --probe-confinement`, which prints `probe sandbox:`.
 
 The executor runs on exactly one frontend: it looks for another frontend's live jobs on the job
 service before its first pass and every 40 s after, and a frontend that finds some older than its
@@ -232,21 +209,13 @@ process that made it: a frontend that starts and finds live jobs of another proc
 id watches for a new one for the fence time and a step (40.5 s by default) before it cancels them,
 and stops if a new one appears; it cancels them if none does, as after a crash. Nothing is
 submitted meanwhile. A restart of the frontend fails the builds in flight, and stopping it cancels
-the jobs. The executor prepares each job with the frontend's **task runs** (below) and its
-job-facing read listener (`--job-listen`: the frontend's own listener, not an executor mode
-and not the jobscheduler's job service, whose lease server has a flag of the same name; moving the
-executor onto that service is [job-service-cutover.md](job-service-cutover.md)), so
-`--executor js-agent` is refused when the flags are read unless `--task-secret-file` (with the four flags it needs), `--job-listen` (with its
-companions) and `--pack-store-endpoint` are given, and unless they agree with it: the tier store
-and the read url must be IP addresses (the job network has no DNS); `--task-put-bucket` must be
-`--pack-store-bucket`, the bucket the pack is read from; an `http://` `--task-put-endpoint` needs
-`--executor-allow-plain-http-put` (with an `https://` one the flag is only warned about); an
-`http://` `--task-read-url` needs `--executor-allow-plain-http-grant` (the same, with the read
-grant: the task tool is then given `--allow-plain-http-grant`, and the read token crosses the job
-network in clear); and the longest job (`--executor-max-run-secs` plus
-`--executor-run-margin-secs`) must fit 14400 s less `--task-url-slack-secs`, the longest a
-presigned write may be good for once the slack is added. The job's wall limit is the action's
-timeout plus the margin, and `--task-run-wall-secs` is not used by the executor. A job that
+the jobs. The executor prepares each job with the frontend's **task runs** (below), so
+`--executor js-agent` is refused when the flags are read unless `--task-secret-file` (with
+`--task-out-root`) and `--pack-store-endpoint` are given, and unless they agree with it: the
+longest job (`--executor-max-run-secs` plus `--executor-run-margin-secs`) must fit 14400 s less
+`--task-url-slack-secs`, the longest the keys of a put directory may be good for once the slack is
+added. The job has no network and reads no grant, so no read listener (`--job-listen`) is needed.
+The job's wall limit is the action's timeout plus the margin. A job that
 cannot be prepared because an input blob is missing, malformed or over the closure budget ends as
 an invalid argument to its caller and is not rerun; one that cannot be prepared because the store
 cannot be read is rerun. `--executor-base-image` and `--executor-kbf-image`
@@ -254,7 +223,7 @@ cannot be read is rerun. `--executor-base-image` and `--executor-kbf-image`
 `--executor-default-image`, `--executor-images-have-no-entrypoint`, `--executor-task-tool` and
 `--executor-root-der`: a missing or tag-named image, or the same image twice, is refused when the
 flags are read. The farm's certificate authority for the task's `https` reads must be in the kbf
-image. The presigned write and the read token are never part of an error, a log line or a
+image. A secret is never part of an error, a log line or a
 metric. `GET /metrics` gains the `kbf_executor_*` families, among them the jobs submitted, those
 submitted again after a lost answer, those cancelled, those of an earlier process cancelled at
 start, and the jobs seen on a host that missed its grace. The remaining settings are
@@ -265,15 +234,9 @@ of the frontend's log, `the end of the standard error of a job that did not end 
 output goes with the result as before), `--executor-max-run-secs` and `--executor-default-timeout-secs`
 (3000), `--executor-call-timeout-secs` (5), `--executor-poll-ms` (1000, from 100 to 10000: how often the executor polls the job service), `--executor-prepare-limit-secs` (300: how long a run's input
 tree may take to publish; the `Start` window ends the submit, not the preparation), `--executor-prepare-concurrency` (4: how many of one
-worker's runs prepare at once; the rest wait their turn inside their window), `--executor-work-dir` (for the task tool),
-`--executor-allow-plain-http-put` (until the store serves TLS), and
-`--executor-allow-plain-http-grant` (a read listener without TLS, on a farm's own network; both
-plain-http flags are off by default), and `--executor-locate` (off by default: the task is given
-`--locate` and asks the listener's `GET /locate` once; the answer names no store and no grant
-(tierstore v0.3.29 removed the store read grants), so the task reads every input from the listener;
-refused with `--executor kbf-daemon`; the task image must carry kbf-task
-v0.0.44 or later, the first release that knows `--locate`: an older one refuses the flag and every
-job fails), and `--executor-network` (the network every job is given on its host: `allow-list`,
+worker's runs prepare at once; the rest wait their turn inside their window), `--executor-work-dir`, `--executor-allow-plain-http-put`, `--executor-allow-plain-http-grant` and `--executor-locate`
+(read and checked at start, with no effect on a put-dir job: they belong to the presigned path that a following change deletes;
+`--executor-locate` is still refused with `--executor kbf-daemon`), and `--executor-network` (the network every job is given on its host: `allow-list`,
 the default, the endpoints the host's agent is set up to allow and nothing else, so each agent must
 allow the read listener and the pack store before the switch; `none`, no route out, with which
 every action fails; `open`, any address but those the agent always denies, refused at start unless
@@ -439,76 +402,59 @@ logged and sent in every heartbeat the same way. The flags are refused with `--p
 daemon starts as before.
 
 **Task runs** (off by default; the `[task-runs]` table of `kbf.toml`). With `--task-secret-file`
-the frontend prepares the runs of a host executor: for each lease and Action it makes the three
-values a task needs and the executor delivers, `RunInputs` of `kbf_front::prepare_run`. They are
-the keys the task may write, N pack keys (`cas/b/<lease>/<nonce>-<k>`, `k` from 0; pack 0 holds the
-manifest and its key is the one a one-pack caller reads) and M large-object keys
-(`cas/b/<lease>/<nonce>-L<i>`), which the executor passes to `ingest` when the run ends; a presigned
-`PUT` of exactly each key to the tier store, signed with a presign-only key (the URL takes a `PUT`
-until it expires, and the store is create-only, so the first write is the only one that lands): a pack
-URL with the key of `--task-put-credentials-file`, a large-object URL with the key of
-`--task-large-credentials-file`; and a read grant, a bearer token with the base URL of the job-facing read
-listener, for the Action, its Command and every blob of its input tree (the job-facing read listener, kbf#1943, works
-the scope out again from the Action each time the token is used, so a blob removed after the run was prepared
-fails that read). The write and the grant
-are good for the run's wall limit plus a slack, `--task-run-wall-secs` (default 7200) and
-`--task-url-slack-secs` (default 600), and never for more than 4 hours (14400 seconds), the
-ceiling of a presigned write: the tier store's presigning key must allow at least that
-(`max_expires_secs` of its `--presign-key-file`, and `--presign-max-expires`), and a wall and
-slack that add up to more are refused at start. Before it signs anything the frontend reads the
-Action, its Command and the whole input tree and checks that every blob is held: a blob that is
-missing is an error, never a smaller grant, and a tree over `--task-closure-max-digests`
-(default 500000) or `--task-closure-max-bytes` (default 32 GiB) is refused. N and M are ceilings, not predictions (the sizes of a run's outputs are not known before it runs, and
-a key a task does not write is never used): `--task-max-packs` (default 8, 1 to 8) and
-`--task-max-large` (default 8, 0 to 8). An output blob over 64 MiB is a large object, written whole
-to one large key; without `--task-large-credentials-file` (same form and mode rules as
-`--task-put-credentials-file`, a key whose prefix allows objects up to `--task-large-max-bytes`) M is
-0 whatever `--task-max-large` says, and such an output fails its task. `--task-large-max-bytes`
-(default 536870912, 512 MiB) is the cap of one large object and must be above 67108864; a value at or
-under it is refused at parse time. Every URL of a run has the same expiry. The switch needs
-`--task-put-endpoint` (the tier store's proxy, `http://` or `https://host:port`),
-`--task-put-bucket`, `--task-put-region` (default `us-east-1`),
-`--task-put-credentials-file` (JSON `{"access_key_id": "...", "secret_access_key": "..."}` of
-the presign-only key, owned by the server's user, mode 0600 or 0400) and `--task-read-url`
-(`https://host:port`, no path: an `http://` URL is refused at start, as the token is a bearer
-secret, unless `--executor-allow-plain-http-grant` is given with `--executor js-agent`). The secret file holds one secret of at least 32 bytes, owned by the server's user
-and readable by it alone; the pack-key mint and the grant key are made from it, and the
-job-facing listener must verify grants with the same secret. No secret is a flag. Left out, no
-secret file is read and the frontend serves exactly as before.
-
-**Where a task's outputs go** (`--task-out-mode`, default `presigned`; the `[task-runs]` table).
-`presigned` is the runs above. `put-dir` (docs/design/jobs-on-jobscheduler-and-tierstore.md) needs
-`--task-out-root`, the tier store's put directory on every host (`<mp>/put`, an absolute path; the
-action trees are under `<mp>/trees` beside it), and `--task-secret-file` (the mint is the secret's).
-The presigned writes and the grant are not used, so the tier store's write endpoint, bucket and
-credentials, the read url and the read listener are not needed: `--task-put-endpoint`,
-`--task-put-bucket`, `--task-put-credentials-file` and `--task-read-url` come all or none (given,
-they are checked as before), and `--job-listen` is not required. For each run the frontend
-collects the input closure, writes the action tree over the published kbf base tree, and mints one
-put directory, `cas/b/<lease>/<nonce>` (its nonce a MAC over the lease, the action and the minute).
-The job has no image: its root is the one read-only layer `<mp>/trees/<digest>`, it runs
+(and `--task-out-root`, the tier store's put directory on every host, `<mp>/put`, an absolute path;
+the action trees are under `<mp>/trees` beside it) the frontend prepares the runs of a host
+executor (docs/design/jobs-on-jobscheduler-and-tierstore.md). For each lease and Action it reads
+the Action, its Command and the whole input tree and checks that every blob is held (a blob that is
+missing is an error, never a smaller tree, and a tree over `--task-closure-max-digests`, default
+500000, or `--task-closure-max-bytes`, default 32 GiB, is refused), writes the action tree over the
+published kbf base tree, and mints one put directory, `cas/b/<lease>/<nonce>` (its nonce a MAC over
+the lease, the action and the minute). The directory's keys are good for the run's wall limit plus
+`--task-url-slack-secs` (default 600), and never for more than 4 hours (14400 seconds). The job has
+no image: its root is the one read-only layer `<mp>/trees/<digest>`, it runs
 `/.kbf-tools/kbf-task --tree --stage-and-commit --out-dir /out`, the directory
 `<mp>/put/cas/b/<lease>/<nonce>` is mounted read-write and `no_exec` at `/out`, and it has no
 network, no file and no secret, whatever `--executor-network` says. The host's agent must list
-`<mp>/put` as a `--mount-root` (read-write) and `<mp>/trees` as a mount root. The task commits
-`pack`, `pack1` to `pack7` and `L0` to `L7` there; the ingest reads `pack`'s footer and manifest,
-the other packs' footers and each large object's length, refuses an output path the Command does
-not declare, streams each large object into the CAS, and records each pack's footer in the pack
-index without reading its records (the first location recorded for a digest is kept, and a read
-of a record that does not hash to its digest drops that location). An input root that holds
-`.kbf-out` at its top is refused, and a `whole_machine` action cannot run in this mode (the job
-service gives a whole-host job no mount).
+`<mp>/put` as a `--mount-root` (read-write) and `<mp>/trees` as a mount root. The task commits one
+object, `pack` (the one-pass object, `--task-out-format one-pass`, the only value); the ingest
+reads its trailer and manifest, refuses an output path the Command does not declare, streams each
+large blob into the CAS, and records the object's index in the pack index without reading its
+records (the first location recorded for a digest is kept, and a read of a record that does not
+hash to its digest drops that location). The ingest still reads the packs and large objects a
+task of an earlier release committed. The secret file holds one secret of at least 32 bytes,
+owned by the server's user and readable by it alone; the mint is made from it, and the job-facing
+listener (if one is served) must verify grants with the same secret. No secret is a flag. Left
+out, no secret file is read and the frontend serves exactly as before.
 
-`--task-out-format` (`packs`, the default, or `one-pass`; put-dir only) says what the task writes
-(docs/design/one-pass-task-object.md). `one-pass` adds `--object-format one-pass` to the task's
-flags: the task then commits `pack` alone, one object whose manifest and index are at its end,
-read once from the outputs, with no cap on its length or on a blob (a blob over the record cap is
-a record of the object, found by its index row and read by range; a frontend whose reads of a
-large blob go to the storage nodes copies it there by a ranged read, as it did the `L<i>` object).
-The ingest reads both formats from the release that adds the flag, so roll in this order: ship
-the frontends and the base tree with the task to every host, and only then set `one-pass` and
-restart the frontends; roll the key back to `packs` before the binary. The tail of a one-pass object is read in one range bounded by `--task-max-object-manifest-bytes` (default 4 MiB) plus `--task-object-bytes-per-entry` (default 1024) for each of `--task-max-object-entries` (default 1,048,576) records. The frontend also checks the object's file index against its manifest and, given its action-tree writer, publishes each output directory as a tierstore manifest whose files point into the object, so a later input root holding the same directory reuses it. A task image that does
-not know the flag refuses it, which is why `packs` never sends it.
+**Where a task's outputs go** (`--task-out-mode`, `put-dir`, the only value and the default; the
+`[task-runs]` table). The `presigned` mode of the releases before, a presigned write of each pack
+to the tier store and a read grant for the inputs, was removed: `--task-out-mode presigned` is
+refused at start, naming this release, and so is each key only it read (`task-put-endpoint`,
+`task-put-bucket`, `task-put-region`, `task-put-credentials-file`, `task-read-url`,
+`task-run-wall-secs`, `task-max-packs`, `task-max-large`, `task-large-credentials-file` and
+`task-large-max-bytes`), so a `kbf.toml` that still sets one is changed before the binary is
+(the farm's config of komira-ai/komira-internal drops them in the same change that updates the pin).
+An input root that holds `.kbf-out` at its top is refused, and a `whole_machine` action cannot run
+in this mode (the job service gives a whole-host job no mount).
+
+`--task-out-format` (`one-pass`, the only value and the default) says what the task writes (docs/design/one-pass-task-object.md). The task commits `pack`
+alone, one object whose manifest and index are at its end, read once from the outputs, with no cap
+on its length or on a blob (a blob over the record cap is a record of the object, found by its
+index row and read by range; a frontend whose reads of a large blob go to the storage nodes copies
+it there by a ranged read, as it did the `L<i>` object). The frontend always adds `--object-format
+one-pass` to the task's flags, which `kbf-task` still accepts though it has no other format. The
+`packs` value is gone: a config file that sets it is refused at start, so remove the key or set
+`one-pass`. The ingest still reads the packs and large objects an earlier release's task wrote
+(one in flight at a restart, or a stored object), and nothing already stored is touched. Every
+frontend and every task image must be this release or later; in put-dir mode the task is the base
+tree of the frontend's own build, so they move together. To go back to a task that writes packs,
+run the release before this one, with the config rolled back before the binary. The tail of a
+one-pass object is read in one range bounded by `--task-max-object-manifest-bytes` (default 4 MiB)
+plus `--task-object-bytes-per-entry` (default 1024) for each of `--task-max-object-entries`
+(default 1,048,576) records. The frontend also checks the object's file index against its
+manifest and, given its action-tree writer, publishes each output directory as a tierstore
+manifest whose files point into the object, so a later input root holding the same directory
+reuses it.
 
 **The `cas/b/` janitor** (off by default; the `[task-runs]` table of `kbf.toml`). The packs and
 large objects tasks write under `cas/b/` are not all kept: a refused run, a run that failed after
@@ -621,12 +567,7 @@ two more flags that have defaults:
   routes and the same bounds, and every request still needs a valid read grant, checked as over
   TLS; what changes is that the grant and the blobs cross the network unencrypted. Given with `--job-tls-cert` or
   `--job-tls-key` it is refused when the flags are read (which of the two to serve is not a
-  guess to make); there are no IP-name checks and no TLS reload series in this mode. The
-  executor must agree, and `--executor js-agent` refuses at the flags when it does not:
-  `--task-read-url` is `http://host:port` with `--executor-allow-plain-http-grant` (the
-  executor then gives the task tool its `--allow-plain-http-grant`), and an `https://` read url
-  goes with a TLS listener. The other two pairs, `http://` against TLS and `https://` against
-  plain, are refused, since every read would fail.
+  guess to make); there are no IP-name checks and no TLS reload series in this mode.
 - `--job-grant-secret-file`: the farm secret the grants are signed with (at least 32 bytes, mode
   0600 or 0400, owned by the server's user; surrounding whitespace is dropped). Every frontend
   of the farm, and whatever issues the grants, reads the same secret, so a grant is verified by
@@ -879,6 +820,10 @@ The cold store is the durable home of every blob: a `file://` directory on one h
 - **A fallback.** A node that has a key pair of its own (the file, or `AWS_ACCESS_KEY_ID` and
   `AWS_SECRET_ACCESS_KEY`) gives up on the frontend after four tries and starts on those. A node without them
   waits for the frontend, as it waits for the registration.
+- **History's own key pair.** `--history-credentials-file PATH` (`history-credentials-file` in
+  `[history]` of `kbf.toml`) names a file of the same form and rules as `--cold-store-credentials-file`
+  for an `s3://` `--history-objects`, so a Docker Swarm secret can feed it. Given, the `AWS_*` variables
+  are not read and a bad file is refused at start; left out, they are read as before.
 - **Who never holds a key.** A daemon holds no store and no credential. A frontend serves no
   blob itself. In `all-in-one` the cold store is a directory in the units, so there is no key.
 

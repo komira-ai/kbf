@@ -121,7 +121,9 @@ impl Farm {
     /// never reached a host, so nothing of the operation ran. Once the scheduler gives the
     /// lease up the operation is requeued (the next frontend takes it from the state store)
     /// and its streams here are ended by the drain, as those of any operation that never
-    /// started, instead of holding the drain for a job that nothing will place.
+    /// started, instead of holding the drain for a job that nothing will place, unless a daemon
+    /// session of another frontend could run it: its streams are kept and followed in the
+    /// state store, since Buck2 never re-attaches an ended stream.
     pub fn unplaced(&self, lease: kbf_types::LeaseId) {
         self.lock().engine.unplaced.insert(lease);
     }

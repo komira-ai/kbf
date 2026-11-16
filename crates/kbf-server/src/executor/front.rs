@@ -13,7 +13,7 @@
 //!   under the farm lease and handed out once. The write host and the size cap are the
 //!   preparation's: it signs for one store endpoint and the signer limits the object. A run
 //!   that cannot be prepared is the caller's ([`MintError::Refused`]) unless the store could
-//!   not be read ([`MintError::Unavailable`]): see [`RunPrep`]'s [`PrepareFault`].
+//!   not be read ([`MintError::Unavailable`]): see [`PrepareFault`].
 //! - **A put directory** (`--task-out-mode put-dir`, [`FrontParts::put_dir`]): the preparation
 //!   mints the run's put directory and collects its closure ([`RunPrepare::prepare_put_dir`]),
 //!   and [`Ingest::mint`] writes the action tree over the published base tree ([`TreeWriter`])
@@ -30,9 +30,9 @@ use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use kbf_front::action_tree::{BaseTree, TreeWriter};
+use kbf_front::action_tree::{BaseTree, PutRetry, TreeWriter};
 use kbf_front::prepare_run::{
-    KeptClosure, PrepareError as RunPrepError, PrepareFault, PutDirPrep, PutDirRun, RunPrep,
+    KeptClosure, PrepareError as RunPrepError, PrepareFault, PutDirPrep, PutDirRun,
 };
 use kbf_front::{Backend, IssuedPackKey, IssuedPutDir, PackKeyMint, Packs};
 use kbf_proto::reapi::{self, Action, Command, Digest};
@@ -129,50 +129,9 @@ impl From<PrepareError> for MintError {
     }
 }
 
-/// The frontend's real preparation, [`RunPrep`], as the executor asks for it: its own wall per
-/// run (`prepare_run_for`), the values of its [`RunInputs`](kbf_front::prepare_run::RunInputs)
-/// with the two secrets wrapped, and its refusal by whose it is to fix.
-///
-/// No error text carries the presigned url or the token: they exist only in a success.
-#[tonic::async_trait]
-impl RunPrepare for RunPrep {
-    async fn prepare_run(
-        &self,
-        lease: &str,
-        action: &kbf_types::Digest,
-        now: SystemTime,
-        wall: Duration,
-    ) -> Result<PreparedRun, PrepareError> {
-        let run = self
-            .prepare_run_for(lease, action, now, wall)
-            .await
-            .map_err(prepare_error)?;
-        Ok(PreparedRun {
-            key: run.key.key().to_owned(),
-            put_url: Secret::new(run.put_url),
-            grant_url: run.read_grant.url,
-            grant_token: Secret::new(run.read_grant.token.expose()),
-            not_after: run.read_grant.not_after,
-        })
-    }
-
-    async fn prepare_put_dir(
-        &self,
-        lease: &str,
-        action: &kbf_types::Digest,
-        now: SystemTime,
-        wall: Duration,
-    ) -> Result<PreparedPutDir, PrepareError> {
-        RunPrep::prepare_put_dir(self, lease, action, now, wall)
-            .await
-            .map(prepared_put_dir)
-            .map_err(prepare_error)
-    }
-}
-
-/// The preparation of a frontend whose runs all commit into put directories
-/// ([`PutDirPrep`]): it makes the directory and the closure, and no key, write or grant, so a
-/// run that asks for those is refused.
+/// The frontend's real preparation, [`PutDirPrep`], as the executor asks for it: it makes the
+/// directory and the closure, and no key, write or grant, so a run that asks for those is
+/// refused.
 #[tonic::async_trait]
 impl RunPrepare for PutDirPrep {
     async fn prepare_run(
@@ -220,7 +179,7 @@ fn prepare_error(error: RunPrepError) -> PrepareError {
 
 /// What the preparation of task runs is made of: the mint and the preparation, both built from
 /// the same secrets as the frontend's task flags. The frontend makes one from its
-/// [`RunPrep`] ([`RunSource::of`]); a test may start one with another preparation
+/// [`PutDirPrep`] ([`RunSource::of_put_dir`]); a test may start one with another preparation
 /// ([`crate::frontend::start_frontend_with`]).
 pub struct RunSource {
     /// The mint that issues the keys and verifies them in the ingest.
@@ -230,17 +189,7 @@ pub struct RunSource {
 }
 
 impl RunSource {
-    /// The source over `prep`: its own mint, which signs the keys it prepares, so the ingest
-    /// verifies the keys that were issued.
-    #[must_use]
-    pub fn of(prep: &Arc<RunPrep>) -> Self {
-        Self {
-            mint: prep.mint().clone(),
-            prepare: prep.clone(),
-        }
-    }
-
-    /// The source over `prep`, which makes put directories alone: its own mint, so the ingest
+    /// The source over `prep`, which makes put directories: its own mint, so the ingest
     /// verifies the directories that were issued.
     #[must_use]
     pub fn of_put_dir(prep: &Arc<PutDirPrep>) -> Self {
@@ -290,6 +239,13 @@ impl PutDirParts {
             writer: TreeWriter::new(Arc::new(backend.clone()), Arc::new(packs.clone()), clock),
             base,
         }
+    }
+
+    /// These parts writing action trees with `retry`.
+    #[must_use]
+    pub fn with_put_retry(mut self, retry: PutRetry) -> Self {
+        self.writer = self.writer.with_put_retry(retry);
+        self
     }
 }
 

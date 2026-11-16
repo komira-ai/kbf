@@ -79,6 +79,11 @@ Options:
           
           [default: 2000]
 
+      --readyz-probe-interval-ms <READYZ_PROBE_INTERVAL_MS>
+          How often, in milliseconds, a frontend asks each of the dependencies behind `GET /readyz` (the storage node, the state store, the storage map) again, in the background. `GET /readyz` and the REAPI listener's `grpc.health.v1` service answer from the last answers at once and wait for no probe; a probe that has not answered within `--readyz-store-timeout-ms` counts as failed
+          
+          [default: 1000]
+
       --worker-tls-cert <WORKER_TLS_CERT>
           PEM certificate of the worker listener. With `--worker-tls-key` and `--worker-client-ca` it serves mutual TLS; without all three, plain text
 
@@ -353,11 +358,14 @@ Options:
       --pack-index
           Opens the pack index at start: the tables in the Postgres state store that say which pack holds each blob and where. A frontend given `--pack-store-endpoint` reads and writes them; without it nothing does, and the flag only checks that the store can hold them. Needs `--state-store` as a `postgres://` URL whose schema has the pack tables (`kbf-installer setup` makes them); a `sqlite://` store is refused. Left out, no pack table is touched
 
+      --history-credentials-file <PATH>
+          A file with the key pair of an `s3://` `--history-objects`, JSON `{"access_key_id": "...", "secret_access_key": "..."}` in the form of `--pack-store-credentials-file`: a regular file, not a link, that this user owns, mode 0600 or 0400. When given, the environment's `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` are not read. The secret is never a flag. Needs `--history-objects`, and an `s3://` one
+
       --history-index-root <ROOT>
           Where history's index rows live in the state store: `ui/`, or `<prefix>ui/` for a prefix that ends in `/`, so that one state store can hold several farms' history apart. Left out, it is `ui/`. Needs `--history-objects`
 
       --history-objects <URI>
-          Where build history is kept: an object store, `s3://bucket/prefix?endpoint=http://host:port` (the key pair is the `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` of the environment) or `file:///absolute/path` (a directory this process owns, not the cold store's). The attempts and cache hits of each invocation a client named are recorded under `<prefix>history/` after their results are sent, never before and never delaying one; the index rows go to `--state-store`, which this flag needs. A full queue, a slow object store or a slow state store drops records and counts them (`kbf_history_dropped_total` on `/metrics`), and never fails or delays a call. The writer reads and writes only keys under `history/`. Left out, nothing is recorded
+          Where build history is kept: an object store, `s3://bucket/prefix?endpoint=http://host:port` (the key pair is the one in `--history-credentials-file`, else the `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` of the environment) or `file:///absolute/path` (a directory this process owns, not the cold store's). The attempts and cache hits of each invocation a client named are recorded under `<prefix>history/` after their results are sent, never before and never delaying one; the index rows go to `--state-store`, which this flag needs. A full queue, a slow object store or a slow state store drops records and counts them (`kbf_history_dropped_total` on `/metrics`), and never fails or delays a call. The writer reads and writes only keys under `history/`. Left out, nothing is recorded
 
   -h, --help
           Print help (see a summary with '-h')

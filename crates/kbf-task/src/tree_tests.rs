@@ -1,6 +1,3 @@
-use std::collections::HashMap;
-use std::io::{Read as _, Write as _};
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -9,15 +6,14 @@ use clap::error::ErrorKind as ClapKind;
 use kbf_proto::reapi::command::EnvironmentVariable;
 use kbf_proto::reapi::{self, Directory, FileNode, Platform, platform::Property};
 use kbf_segments::sha256;
-use kbf_task_pack::{MANIFEST_VERSION, MANIFEST_VERSION_2, read_manifest};
+use kbf_task_pack::{MANIFEST_VERSION, MANIFEST_VERSION_2};
 use kbf_testkit::dir::TestDir;
 use kbf_types::Digest;
 use prost::Message as _;
 
 use super::*;
-use crate::fetch::{BlobSource, label};
-use crate::task::recording_sink::Fake;
-use crate::task::{EXIT_FETCH, EXIT_RUN, EXIT_SETUP, main_with};
+use crate::message::label;
+use crate::task::{EXIT_FETCH, EXIT_RUN};
 
 /// A fresh scratch directory standing in for a job's root.
 fn scratch(name: &str) -> TestDir {
@@ -82,8 +78,7 @@ fn copy_tree(name: &str) -> (TestDir, Digest) {
     (dir, digest)
 }
 
-/// The flags of a tree job over `root` running `action`, with `extra` flags appended (a pack
-/// URL among them).
+/// The flags of a tree job over `root` running `action`, with `extra` flags appended.
 fn flags(root: &Path, action: &Digest, extra: &[&str]) -> Result<Cli, clap::Error> {
     let action = format!("--action={action}");
     let root = format!("--tree={}", root.display());
@@ -92,11 +87,10 @@ fn flags(root: &Path, action: &Digest, extra: &[&str]) -> Result<Cli, clap::Erro
     Cli::try_parse_from(args)
 }
 
-/// A pack URL file that is not there: the sinks of these tests are fakes.
-const NO_URL: &str = "--pack-url-file=/nonexistent-url";
-
+/// The flags of a tree job over `root` running `action`; the put directory is the one of
+/// [`run_tree`].
 fn tree_cli(root: &Path, action: &Digest) -> Cli {
-    flags(root, action, &[NO_URL]).expect("flags")
+    flags(root, action, &["--stage-and-commit"]).expect("flags")
 }
 
 /// The root `--tree` names in `cli`.
@@ -104,20 +98,32 @@ fn root_of(cli: &Cli) -> &Path {
     cli.tree.as_deref().expect("a tree job")
 }
 
-/// Runs the tree job `cli` names into a sink of one pack slot; the outcome and the sink.
-async fn run_tree(cli: &Cli) -> (Result<TaskManifest, Failure>, Fake) {
-    let sink = Fake::new(false);
-    let outcome = execute(cli, root_of(cli), &sink).await;
-    (outcome, sink)
+/// Runs the tree job `cli` names into a fresh put directory of its own; the outcome and the
+/// put directory.
+async fn run_tree(cli: &Cli) -> (Result<TaskManifest, Failure>, TestDir) {
+    let put = scratch("put");
+    let mut cli = cli.clone();
+    cli.out_dir = Some(put.to_path_buf());
+    let out = OutDir::open(&put).expect("the put directory");
+    let outcome = execute_out_dir(&cli, root_of(&cli), &out).await;
+    (outcome, put)
+}
+
+/// The names in `dir`.
+fn names_in(dir: &Path) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .expect("read_dir")
+        .map(|e| e.expect("entry").file_name().into_string().expect("utf-8"))
+        .collect()
 }
 
 /// The failure of a tree job that must not have run its Command or stored anything: its run
-/// directory was never made and the sink holds nothing.
+/// directory was never made and the put directory holds nothing.
 async fn refused(cli: &Cli) -> Failure {
-    let (outcome, sink) = run_tree(cli).await;
+    let (outcome, put) = run_tree(cli).await;
     let failure = outcome.expect_err("refused");
     assert!(!root_of(cli).join(RUN_DIR).exists(), "{failure}");
-    assert!(sink.tried.lock().unwrap().is_empty(), "{failure}");
+    assert!(names_in(&put).is_empty(), "{failure}");
     failure
 }
 
@@ -132,13 +138,12 @@ const TREE_INPUTS: &str = concat!(
 
 /// Asserts the whole tree job: the Action and the Command are read from `.kbf`, the Command runs
 /// in `work` over its input, its output is collected from there, the streams go to `.kbf-run`,
-/// and the stored manifest says the inputs came from the tree. Nothing is laid out under a
-/// work directory (`--work-dir` is refused with `--tree`, and its default is not touched).
+/// and the committed manifest says the inputs came from the tree.
 #[tokio::test]
 async fn a_tree_run_reads_the_action_and_command_from_kbf_and_fetches_nothing() {
     let (dir, digest) = copy_tree("e2e");
     let cli = tree_cli(&dir, &digest);
-    let (outcome, sink) = run_tree(&cli).await;
+    let (outcome, put) = run_tree(&cli).await;
     let manifest = outcome.expect("task");
 
     assert_eq!(manifest.action, digest);
@@ -152,19 +157,24 @@ async fn a_tree_run_reads_the_action_and_command_from_kbf_and_fetches_nothing() 
     assert!(dir.join(".kbf-run/stdout").is_file());
     assert!(dir.join(".kbf-run/stderr").is_file());
     assert!(dir.join(".kbf-run/private/home").is_dir());
-    let stored = sink.stored.lock().unwrap();
-    assert_eq!(stored.len(), 1);
-    assert_eq!(read_manifest(&stored[0]).expect("read"), manifest);
+    assert_eq!(names_in(&put), ["pack"]);
+    let (stored, _) = out_dir::read_one_pass(&std::fs::read(put.join("pack")).expect("pack"));
+    assert_eq!(stored.action, manifest.action);
+    assert_eq!(stored.exit_code, manifest.exit_code);
+    assert_eq!(stored.output_files, manifest.output_files);
+    assert_eq!(stored.inputs, manifest.inputs);
+    assert_eq!(stored.version(), MANIFEST_VERSION_2);
 }
 
-/// Asserts the new data against the reader of the release before this one (kbf-task-pack's
+/// Asserts the data of the writers of version 2 against the reader of this release (kbf-task-pack's
 /// manifest reader, which learnt `from` and to skip unknown members one release earlier and is
-/// not changed here): the manifest a tree job stores ends with exactly the `inputs` it means,
-/// `"from":"tree"` included, and that reader reads it back with `from` as `tree`.
+/// not changed here): the manifest of a tree job, spelled as version 2, ends with exactly the
+/// `inputs` it means, `"from":"tree"` included, and that reader reads it back with `from` as
+/// `tree`; the object a tree job commits says the same.
 #[tokio::test]
 async fn a_manifest_with_from_is_read_by_the_item_8_reader() {
     let (dir, digest) = copy_tree("from-tree");
-    let (outcome, sink) = run_tree(&tree_cli(&dir, &digest)).await;
+    let (outcome, put) = run_tree(&tree_cli(&dir, &digest)).await;
     let manifest = outcome.expect("task");
     let json = String::from_utf8(manifest.to_json().expect("json")).expect("utf-8");
     assert!(json.ends_with(TREE_INPUTS), "{json}");
@@ -172,12 +182,8 @@ async fn a_manifest_with_from_is_read_by_the_item_8_reader() {
 
     let read = TaskManifest::parse(json.as_bytes()).expect("parse");
     assert_eq!(read.inputs.and_then(|i| i.from), Some(InputsFrom::Tree));
-    let stored = sink.stored.lock().unwrap();
-    let from_pack = read_manifest(&stored[0]).expect("read the pack");
-    assert_eq!(
-        from_pack.inputs.and_then(|i| i.from),
-        Some(InputsFrom::Tree)
-    );
+    let (stored, _) = out_dir::read_one_pass(&std::fs::read(put.join("pack")).expect("pack"));
+    assert_eq!(stored.inputs.and_then(|i| i.from), Some(InputsFrom::Tree));
 }
 
 /// Asserts the old data against this release: a manifest with no `inputs` (what today's job
@@ -186,7 +192,7 @@ async fn a_manifest_with_from_is_read_by_the_item_8_reader() {
 #[tokio::test]
 async fn a_manifest_without_from_is_read_by_this_release() {
     let (dir, digest) = copy_tree("no-from");
-    let (outcome, _sink) = run_tree(&tree_cli(&dir, &digest)).await;
+    let (outcome, _put) = run_tree(&tree_cli(&dir, &digest)).await;
     let mut manifest = outcome.expect("task");
 
     manifest.inputs = None;
@@ -203,55 +209,6 @@ async fn a_manifest_without_from_is_read_by_this_release() {
     assert!(!v2.contains("\"from\""), "{v2}");
     let read = TaskManifest::parse(v2.as_bytes()).expect("parse v2");
     assert_eq!(read.inputs.map(|i| (i.blobs, i.from)), Some((3, None)));
-}
-
-/// Blobs held in memory by digest: a read grant for today's job.
-#[derive(Default)]
-struct Mem(HashMap<String, Vec<u8>>);
-
-impl Mem {
-    fn add(&mut self, bytes: Vec<u8>) {
-        self.0
-            .insert(label(&digest::to_reapi(&sha256(&bytes))), bytes);
-    }
-}
-
-impl BlobSource for Mem {
-    fn get(&self, digest: &reapi::Digest) -> Result<Vec<u8>, FetchError> {
-        // Every blob the test's fetch asks for is held.
-        Ok(self.0[&label(digest)].clone())
-    }
-}
-
-/// Asserts that today's job is unchanged by tree jobs: the same action fetched through a grant
-/// writes no `inputs` and its manifest stays version 1, the bytes the frontend read before.
-#[tokio::test]
-async fn todays_job_writes_no_inputs_and_stays_version_1() {
-    let command = command(COPY, "", &["out"]);
-    let action = action_of(&command);
-    let mut mem = Mem::default();
-    mem.add(b"hi\n".to_vec());
-    mem.add(input_root().encode_to_vec());
-    mem.add(command.encode_to_vec());
-    mem.add(action.encode_to_vec());
-    let dir = scratch("todays");
-    let action = sha256(&action.encode_to_vec()).to_string();
-    let cli = Cli::try_parse_from([
-        "kbf-task",
-        "--pack-url-file=/nonexistent-url",
-        "--grant-url=https://grant.example",
-        "--grant-token-file=/nonexistent",
-        "--lease=lease-1",
-        &format!("--action={action}"),
-        &format!("--work-dir={}", dir.display()),
-    ])
-    .expect("flags");
-    let manifest = crate::task::execute(&cli, &mem, &Fake::new(false))
-        .await
-        .expect("task");
-    assert_eq!(manifest.inputs, None);
-    assert_eq!(manifest.version(), MANIFEST_VERSION);
-    assert_eq!(manifest.output_files[0].digest, sha256(b"hi\n"));
 }
 
 /// Asserts that a job never runs another action's tree: an `.kbf/action` that is not the Action
@@ -384,7 +341,7 @@ async fn an_action_that_does_not_decode_is_exit_10() {
 async fn an_action_over_the_message_bound_is_refused_before_it_is_read() {
     let (dir, digest) = copy_tree("too-large");
     std::fs::remove_file(dir.join(ACTION_FILE)).expect("remove");
-    let bound = u64::try_from(crate::fetch::MAX_MESSAGE_BYTES).expect("bound");
+    let bound = u64::try_from(crate::message::MAX_MESSAGE_BYTES).expect("bound");
     let over = Digest::new(digest.function, digest.hash, bound + 1);
     let failure = refused(&tree_cli(&dir, &over)).await;
     assert!(
@@ -481,10 +438,8 @@ async fn an_existing_run_directory_is_refused_as_a_run_start() {
     let command = command(&["touch", "ran"], "", &[]);
     let digest = lay_out(&dir, &action_of(&command), &command);
     std::fs::create_dir(dir.join(RUN_DIR)).expect("run dir");
-    let sink = Fake::new(false);
-    let failure = execute(&tree_cli(&dir, &digest), &dir, &sink)
-        .await
-        .expect_err("refused");
+    let (outcome, put) = run_tree(&tree_cli(&dir, &digest)).await;
+    let failure = outcome.expect_err("refused");
     assert_eq!(failure.exit_code(), EXIT_RUN);
     assert!(
         failure
@@ -493,7 +448,7 @@ async fn an_existing_run_directory_is_refused_as_a_run_start() {
         "{failure}"
     );
     assert!(!dir.join("work/ran").exists());
-    assert!(sink.tried.lock().unwrap().is_empty());
+    assert!(names_in(&put).is_empty());
 }
 
 /// Asserts that a refused network property fails the run start (exit 11) before the run
@@ -517,6 +472,27 @@ async fn a_refused_network_property_is_a_run_start_before_the_run_directory() {
     assert!(!dir.join("work/ran").exists());
 }
 
+/// Asserts that a Command that asks for the network (`kbf-network=allow`) is run like any other in
+/// a tree job: the job is its sandbox, so the property changes nothing the task does.
+#[tokio::test]
+async fn a_command_that_asks_for_the_network_runs_in_the_job_as_any_other() {
+    let dir = scratch("network-allowed");
+    let command = command(&["touch", "ran"], "", &[]);
+    let action = reapi::Action {
+        platform: Some(Platform {
+            properties: vec![Property {
+                name: crate::network::PROPERTY.to_owned(),
+                value: "allow".to_owned(),
+            }],
+        }),
+        ..action_of(&command)
+    };
+    let digest = lay_out(&dir, &action, &command);
+    let (outcome, _put) = run_tree(&tree_cli(&dir, &digest)).await;
+    assert_eq!(outcome.expect("task").exit_code, 0);
+    assert!(dir.join("work/ran").is_file());
+}
+
 /// Asserts that the working directory and the parent of every output path are made under `work`
 /// before the Command starts: `touch` makes no directory, so it succeeds only if they exist, and
 /// its output is collected relative to the working directory.
@@ -525,7 +501,7 @@ async fn the_working_directory_and_output_parents_exist_before_the_command_start
     let dir = scratch("parents");
     let command = command(&["touch", "o/p/f"], "w/x", &["o/p/f"]);
     let digest = lay_out(&dir, &action_of(&command), &command);
-    let (outcome, _sink) = run_tree(&tree_cli(&dir, &digest)).await;
+    let (outcome, _put) = run_tree(&tree_cli(&dir, &digest)).await;
     let manifest = outcome.expect("task");
     assert_eq!(manifest.exit_code, 0);
     assert_eq!(manifest.output_files.len(), 1);
@@ -541,7 +517,7 @@ async fn the_streams_and_home_are_in_the_run_directory_and_not_outputs() {
     let dir = scratch("run-dir");
     let command = command(&["env"], "", &[]);
     let digest = lay_out(&dir, &action_of(&command), &command);
-    let (outcome, _sink) = run_tree(&tree_cli(&dir, &digest)).await;
+    let (outcome, _put) = run_tree(&tree_cli(&dir, &digest)).await;
     let manifest = outcome.expect("task");
     assert_eq!(manifest.exit_code, 0);
     let stdout = std::fs::read(dir.join(".kbf-run/stdout")).expect("stdout");
@@ -574,7 +550,7 @@ async fn a_tree_job_starts_its_command_in_the_tasks_own_namespaces() {
     argv.extend(links.iter().map(String::as_str));
     let command = command(&argv, "", &[]);
     let digest = lay_out(&dir, &action_of(&command), &command);
-    let (outcome, _sink) = run_tree(&tree_cli(&dir, &digest)).await;
+    let (outcome, _put) = run_tree(&tree_cli(&dir, &digest)).await;
     assert_eq!(outcome.expect("task").exit_code, 0);
     let ours: String = links
         .iter()
@@ -593,7 +569,7 @@ async fn a_tree_jobs_command_sees_the_tree_root_with_nothing_covered() {
     let dir = scratch("uncovered");
     let command = command(&["ls", "-A", ".."], "", &[]);
     let digest = lay_out(&dir, &action_of(&command), &command);
-    let (outcome, _sink) = run_tree(&tree_cli(&dir, &digest)).await;
+    let (outcome, _put) = run_tree(&tree_cli(&dir, &digest)).await;
     assert_eq!(outcome.expect("task").exit_code, 0);
     assert_eq!(
         std::fs::read_to_string(dir.join(".kbf-run/stdout")).expect("stdout"),
@@ -601,105 +577,78 @@ async fn a_tree_jobs_command_sees_the_tree_root_with_nothing_covered() {
     );
 }
 
-/// Asserts that a directory output holding a file over the record cap packs, validates and is
-/// stored: the file goes to a large slot though no output names its digest (the directory's tree
-/// does). The farm's `zig_unpack` is such an action (a 172 MB file in a directory output); it
-/// failed with `invalid-manifest: large slot 0 holds ..., which no output names`.
-#[tokio::test]
-async fn a_directory_output_with_a_file_over_the_record_cap_packs_and_validates() {
-    let dir = scratch("big-in-dir");
-    let command = command(&["true"], "", &["d"]);
-    let digest = lay_out(&dir, &action_of(&command), &command);
-    std::fs::create_dir(dir.join("work/d")).expect("d");
-    let big = std::fs::File::create(dir.join("work/d/big")).expect("big");
-    let size = kbf_task_pack::MAX_RECORD_BYTES + 1;
-    big.set_len(size).expect("sparse");
-    let sink = Fake::with_slots(1, 1);
-    let cli = tree_cli(&dir, &digest);
-    let manifest = execute(&cli, root_of(&cli), &sink).await.expect("task");
-    assert_eq!(manifest.exit_code, 0);
-    assert_eq!(manifest.output_directories.len(), 1);
-    assert_eq!(manifest.large.len(), 1);
-    assert_eq!(manifest.large[0].size(), size);
-    let puts = sink.puts.lock().unwrap();
-    assert!(
-        puts.iter().any(
-            |put| matches!(put, crate::task::recording_sink::Put::Large { len, .. } if *len == size)
-        ),
-        "{puts:?}"
-    );
-}
-
 /// Asserts how the Command is run: a tree job starts it directly (its group is ended, and with
-/// the subreaper set by the binary's own start every process it left); one without `--tree` keeps
-/// the sandbox.
+/// the subreaper set by the binary's own start every process it left).
 #[test]
-fn a_tree_job_runs_its_command_directly_and_one_without_a_tree_in_the_sandbox() {
+fn a_tree_job_runs_its_command_directly() {
     let (dir, digest) = copy_tree("job-of");
     let mut cli = tree_cli(&dir, &digest);
-    assert_eq!(crate::task::job_of(&cli), Some(crate::run::Job::Group));
+    assert_eq!(crate::task::job_of(&cli), crate::run::Job::Group);
     cli.subreaper = true;
-    assert_eq!(crate::task::job_of(&cli), Some(crate::run::Job::Subreaper));
-    cli.tree = None;
-    assert_eq!(crate::task::job_of(&cli), None);
+    assert_eq!(crate::task::job_of(&cli), crate::run::Job::Subreaper);
 }
 
-/// Asserts that a sink with more pack slots than a manifest can name is a setup failure before
-/// the tree is read.
-#[tokio::test]
-async fn too_many_slots_are_a_setup_failure_before_the_tree_is_read() {
-    let (dir, digest) = copy_tree("slots");
-    let sink = Fake::with_slots(usize::from(kbf_task_pack::MAX_PACKS) + 1, 0);
-    let failure = execute(&tree_cli(&dir, &digest), &dir, &sink)
-        .await
-        .expect_err("slots");
-    assert_eq!(failure.exit_code(), EXIT_SETUP);
-    assert!(!dir.join(RUN_DIR).exists());
-}
-
-/// Asserts the flags of a tree job: `--tree` takes its root after `=` and is `/` alone; no read
-/// grant is needed; every flag of the grant and of fetching, and `--work-dir`, is refused with
-/// `--tree` (their defaults are not); without `--tree` the grant URL and its token are still
-/// required.
+/// Asserts the flags of a tree job: `--tree` takes its root after `=` and is `/` alone, and a
+/// tree job and `--stage-and-commit` are required; the flags of the presigned mode of the
+/// releases before (the read grant, the fetch, the PUT of a pack, the work directory) are
+/// refused.
 #[test]
-fn a_tree_job_needs_no_grant_and_refuses_the_fetch_flags() {
+fn a_tree_job_takes_its_root_and_refuses_the_flags_of_the_presigned_mode() {
     let action = sha256(b"a");
-    let tree = flags(Path::new("/t"), &action, &[NO_URL]).expect("tree flags");
+    let tree = flags(Path::new("/t"), &action, &["--stage-and-commit"]).expect("tree flags");
     assert_eq!(tree.tree, Some(PathBuf::from("/t")));
-    assert_eq!(tree.grant_url, None);
+    assert_eq!(tree.root(), Path::new("/t"));
+    assert!(tree.stage_and_commit);
     let action = format!("--action={action}");
-    let bare =
-        Cli::try_parse_from(["kbf-task", "--tree", NO_URL, "--lease=l", &action]).expect("bare");
-    assert_eq!(bare.tree, Some(PathBuf::from("/")));
+    let bare = Cli::try_parse_from([
+        "kbf-task",
+        "--tree",
+        "--stage-and-commit",
+        "--lease=l",
+        &action,
+    ])
+    .expect("bare");
+    assert_eq!(bare.root(), Path::new("/"));
 
     for flag in [
         "--grant-url=https://g",
         "--grant-token-file=t",
         "--grant-token=t",
+        "--pack-url-file=u",
+        "--pack-url=u",
+        "--put-urls-file=u",
+        "--put-urls=u",
         "--fetch-concurrency=4",
         "--fetch-batch",
         "--allow-plain-http-grant",
+        "--allow-plain-http-put",
+        "--insecure-argv-secrets",
         "--locate",
         "--work-dir=/w",
+        "--root-der=r",
     ] {
-        let error = flags(Path::new("/t"), &sha256(b"a"), &[NO_URL, flag])
-            .err()
-            .expect(flag);
-        assert_eq!(error.kind(), ClapKind::ArgumentConflict, "{flag}");
+        let error = flags(
+            Path::new("/t"),
+            &sha256(b"a"),
+            &["--stage-and-commit", flag],
+        )
+        .err()
+        .expect(flag);
+        assert_eq!(error.kind(), ClapKind::UnknownArgument, "{flag}");
     }
 
     for (args, kind) in [
         (
-            vec![NO_URL, "--lease=l", &action],
+            vec!["--stage-and-commit", "--lease=l", &action],
             ClapKind::MissingRequiredArgument,
         ),
         (
-            vec![NO_URL, "--lease=l", &action, "--grant-url=g"],
+            vec!["--tree", "--lease=l", &action],
             ClapKind::MissingRequiredArgument,
         ),
         // The root must follow `=`: a separate word is not taken for it.
         (
-            vec![NO_URL, "--lease=l", &action, "--tree", "/t"],
+            vec!["--stage-and-commit", "--lease=l", &action, "--tree", "/t"],
             ClapKind::UnknownArgument,
         ),
     ] {
@@ -708,109 +657,6 @@ fn a_tree_job_needs_no_grant_and_refuses_the_fetch_flags() {
             .expect("refused");
         assert_eq!(error.kind(), kind, "{args:?}");
     }
-    let today = Cli::try_parse_from([
-        "kbf-task",
-        NO_URL,
-        "--lease=l",
-        &action,
-        "--grant-url=g",
-        "--grant-token-file=t",
-    ])
-    .expect("today's job");
-    assert_eq!(today.tree, None);
-}
-
-/// A store on loopback that takes one PUT, answers 201 and hands back its body.
-fn store() -> (String, std::thread::JoinHandle<Vec<u8>>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let url = format!("http://{}/pack", listener.local_addr().expect("addr"));
-    let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept");
-        let mut got = Vec::new();
-        let mut chunk = [0_u8; 4096];
-        while !got.windows(4).any(|w| w == b"\r\n\r\n") {
-            let n = stream.read(&mut chunk).expect("read");
-            assert_ne!(n, 0, "the request ended early");
-            got.extend_from_slice(&chunk[..n]);
-        }
-        let end = got
-            .windows(4)
-            .position(|w| w == b"\r\n\r\n")
-            .expect("the end of the head");
-        let len = String::from_utf8_lossy(&got[..end])
-            .to_ascii_lowercase()
-            .lines()
-            .find_map(|l| l.strip_prefix("content-length:").map(str::to_owned))
-            .expect("a content length")
-            .trim()
-            .parse::<usize>()
-            .expect("a length");
-        let head = end + 4;
-        while got.len() < head + len {
-            let n = stream.read(&mut chunk).expect("read");
-            assert_ne!(n, 0, "the body ended early");
-            got.extend_from_slice(&chunk[..n]);
-        }
-        stream
-            .write_all(b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-            .expect("reply");
-        got.split_off(head)
-    });
-    (url, server)
-}
-
-/// Asserts that the real entry point runs a tree job with no grant: it PUTs the pack to the
-/// presigned URL and exits 0, and the pack's manifest says the inputs came from the tree.
-#[tokio::test(flavor = "multi_thread")]
-async fn main_with_runs_a_tree_job_and_puts_its_pack() {
-    let (dir, digest) = copy_tree("main");
-    let (url, server) = store();
-    let url_file = dir.join("pack-url");
-    std::fs::write(&url_file, &url).expect("url file");
-    let url_flag = format!("--pack-url-file={}", url_file.display());
-    let cli = flags(&dir, &digest, &[&url_flag, "--allow-plain-http-put"]).expect("flags");
-    assert_eq!(main_with(&cli).await, ExitCode::SUCCESS);
-    let body = server.join().expect("store");
-    let manifest = read_manifest(&body).expect("the stored pack");
-    assert_eq!(manifest.inputs, Some(input_stats()));
-    assert_eq!(manifest.output_files[0].digest, sha256(b"hi\n"));
-}
-
-/// Asserts that the setup of a tree job fails before the tree is read, each as exit 14: a lease
-/// the frontend would refuse, a credential in argv without the opt-in, an unreadable root
-/// certificate, a pack URL file that is not there.
-#[tokio::test]
-async fn a_tree_job_whose_setup_fails_exits_14_before_the_tree_is_read() {
-    let (dir, digest) = copy_tree("setup");
-    let root = format!("--tree={}", dir.display());
-    let action = format!("--action={digest}");
-    // Paths in the test's own directory that are not there, read as the setup reads them.
-    let no_url = format!("--pack-url-file={}", dir.join("absent-url").display());
-    let no_der = format!("--root-der={}", dir.join("absent.der").display());
-    let url_file = dir.join("pack-url");
-    std::fs::write(&url_file, "https://store.example/p").expect("url file");
-    let url = format!("--pack-url-file={}", url_file.display());
-    for case in [
-        vec![url.as_str(), "--lease=not a build id"],
-        vec!["--pack-url=https://store.example/p", "--lease=lease-1"],
-        vec![url.as_str(), "--lease=lease-1", no_der.as_str()],
-        vec![no_url.as_str(), "--lease=lease-1"],
-    ] {
-        let mut args = vec!["kbf-task", &root, &action];
-        args.extend_from_slice(&case);
-        let cli = Cli::try_parse_from(args).expect("flags");
-        assert_eq!(
-            main_with(&cli).await,
-            ExitCode::from(EXIT_SETUP),
-            "{case:?}"
-        );
-        assert!(!dir.join(RUN_DIR).exists(), "{case:?}");
-    }
-    let failed = Err(Failure::Setup("no".to_owned()));
-    assert_eq!(
-        finish(&tree_cli(&dir, &digest), &dir, failed).await,
-        ExitCode::from(EXIT_SETUP)
-    );
 }
 
 /// Asserts that a tree job hands nothing to hide: the job is the sandbox (owner decision of

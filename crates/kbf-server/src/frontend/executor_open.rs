@@ -42,7 +42,7 @@ pub(super) fn executor_of(
     let packs = packs.ok_or("--executor js-agent needs --pack-store-endpoint")?;
     let source = source.ok_or(
         "--executor js-agent: this frontend was started without the preparation of task runs \
-         (the key mint, the presigned write and the read grant): give --task-secret-file",
+         (the key mint and the put directory of each run): give --task-secret-file",
     )?;
     let front = js.front(packs.clone(), backend.clone(), source);
     let metrics = Arc::new(ExecutorMetrics::default());

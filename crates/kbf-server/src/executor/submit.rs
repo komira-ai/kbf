@@ -333,7 +333,7 @@ fn put_dir_spec(
         // No image: the action tree is the whole root, the base tree in it.
         image: String::new(),
         command: TASK_IN_TREE.to_owned(),
-        args: put_dir_argv(action, lease, timeout, job.roots.format()),
+        args: put_dir_argv(action, lease, timeout),
         env: BTreeMap::new(),
         needs: Some(booking.needs()),
         constraints: Some(ctx.cfg.constraints()),

@@ -575,9 +575,9 @@ async fn record<'a, S: Store>(
                     root: Some(root),
                     children,
                 };
-                let tree_digest = Blob::Bytes(tree.encode_to_vec())
-                    .queue(&mut uploads, store, &shown)
-                    .await;
+                let tree = tree.encode_to_vec();
+                store.keep_tree(&tree);
+                let tree_digest = Blob::Bytes(tree).queue(&mut uploads, store, &shown).await;
                 result.output_directories.push(OutputDirectory {
                     path: path.clone(),
                     tree_digest: Some(tree_digest),

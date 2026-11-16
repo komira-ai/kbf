@@ -31,6 +31,12 @@ pub(super) const DRIVERS: [&str; 2] = ["container", "native-whole-machine"];
 /// wall limit under that.
 pub const PRESIGN_LIMIT: Duration = Duration::from_secs(4 * 3600);
 
+/// The default heartbeat interval. A `Start` names the newest heartbeat the farm took and is
+/// valid for [`START_VALIDITY`] from it, so the age of that heartbeat when the `Start` arrives
+/// is time out of the window the preparation and the submit have: at 5 s it was up to 5 s of
+/// 14, and many grants were dropped as late; at 1 s it is up to 1 s.
+const HEARTBEAT: Duration = Duration::from_secs(1);
+
 /// What the container driver adds to 1.5 times a booking for the hard memory cap of a run
 /// (`kbf-driver-container`, `cgroup.rs`). A job needs the memory it is sent and its host caps
 /// it there, so the executor sends the same number and an out-of-memory job is the same event
@@ -103,7 +109,7 @@ pub struct Config {
     /// with the grants of the job redacted: the end of the stream. `0` writes none; the
     /// whole attached output stays with the result either way.
     pub failed_stderr_log_bytes: usize,
-    /// The heartbeat interval the workers' `Welcome` names.
+    /// The heartbeat interval the workers' `Welcome` names: [`HEARTBEAT`] by default.
     pub heartbeat: Duration,
     /// How often the caller steps the executor.
     pub poll: Duration,
@@ -248,7 +254,7 @@ impl Config {
             run_margin: Duration::from_secs(300),
             default_timeout: Duration::from_secs(3000),
             failed_stderr_log_bytes: FAILED_STDERR_LOG_BYTES,
-            heartbeat: Duration::from_secs(5),
+            heartbeat: HEARTBEAT,
             poll: Duration::from_millis(1000),
             call_timeout: Duration::from_secs(5),
             pass_budget: Duration::from_secs(10),

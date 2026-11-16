@@ -140,9 +140,11 @@ await-takeover = false
 # instance = "a|b"
 
 [history]
+# A file with the key pair of an `s3://` `--history-objects`, JSON `{"access_key_id": "...", "secret_access_key": "..."}` in the form of `--pack-store-credentials-file`: a regular file, not a link, that this user owns, mode 0600 or 0400. When given, the environment's `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` are not read. The secret is never a flag. Needs `--history-objects`, and an `s3://` one
+# history-credentials-file = "PATH"
 # Where history's index rows live in the state store: `ui/`, or `<prefix>ui/` for a prefix that ends in `/`, so that one state store can hold several farms' history apart. Left out, it is `ui/`. Needs `--history-objects`
 # history-index-root = "ROOT"
-# Where build history is kept: an object store, `s3://bucket/prefix?endpoint=http://host:port` (the key pair is the `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` of the environment) or `file:///absolute/path` (a directory this process owns, not the cold store's). The attempts and cache hits of each invocation a client named are recorded under `<prefix>history/` after their results are sent, never before and never delaying one; the index rows go to `--state-store`, which this flag needs. A full queue, a slow object store or a slow state store drops records and counts them (`kbf_history_dropped_total` on `/metrics`), and never fails or delays a call. The writer reads and writes only keys under `history/`. Left out, nothing is recorded
+# Where build history is kept: an object store, `s3://bucket/prefix?endpoint=http://host:port` (the key pair is the one in `--history-credentials-file`, else the `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` of the environment) or `file:///absolute/path` (a directory this process owns, not the cold store's). The attempts and cache hits of each invocation a client named are recorded under `<prefix>history/` after their results are sent, never before and never delaying one; the index rows go to `--state-store`, which this flag needs. A full queue, a slow object store or a slow state store drops records and counts them (`kbf_history_dropped_total` on `/metrics`), and never fails or delays a call. The writer reads and writes only keys under `history/`. Left out, nothing is recorded
 # history-objects = "URI"
 # The memory, in bytes, the invocation records may take together (`docs/design/invocations.md`, section 3.5). At the bound, records of a minted id go first, then idle ones, least recently seen first; with only open builds left, the largest stops taking rows. Records are kept in memory only and lost on restart. Their heap was measured at up to 1.08 times this at 200 kB and above, and 1.12 at 50 kB (section 3.5)
 invocation-memory = 268435456
@@ -267,6 +269,8 @@ placement-predictions = "off"
 progress-interval-secs = 30
 # The QoS levels a call may ask for with the `x-kbf-qos` request header, as a comma list of `ci`, `batch` and `interactive` (`ci` is always allowed: it is what a call with no header, or a header naming a level not on the list, gets, and that call is never refused). The level orders the queue, most urgent first: a `batch` action waits behind every queued `ci` action. It is not part of the action digest, so it does not split the cache. A client that sends no header stays at `ci`
 qos-allowed = "ci,batch"
+# How often, in milliseconds, a frontend asks each of the dependencies behind `GET /readyz` (the storage node, the state store, the storage map) again, in the background. `GET /readyz` and the REAPI listener's `grpc.health.v1` service answer from the last answers at once and wait for no probe; a probe that has not answered within `--readyz-store-timeout-ms` counts as failed
+readyz-probe-interval-ms = 1000
 # How long, in milliseconds, `GET /readyz` on the operator API and the REAPI listener's `grpc.health.v1` service wait for the object store to answer their read-only probe before they answer not ready
 readyz-store-timeout-ms = 2000
 # Which core drives the farm's scheduling. The one value is `legacy`, the default: the driver the server has always had. `js` names a core that was removed, because scheduling runs in the job service, and is refused at start (exit status 2). The core a server runs is logged at start and exported as `kbf_scheduler_core{core}`, the one series `kbf_scheduler_core{core="legacy"} 1`
@@ -343,41 +347,53 @@ task-janitor-interval-secs = 900
 task-janitor-page-pause-ms = 1000
 # The keys of `cas/b/` the janitor lists at a time, 1 to 1000, and so the keys it checks against the pack index in one question. Used only with `--task-janitor-key-file`
 task-janitor-page-size = 500
-# A file with the presign-only key that signs a task's writes of large objects, of the same form and with the same owner and mode rules as `--task-put-credentials-file`: a key of the tier store whose prefix allows objects up to `--task-large-max-bytes`, with a ceiling of at least 14400 seconds. Left out, no run gets a large-object key and an output over 64 MiB fails its task
-# task-large-credentials-file = "PATH"
-# The most bytes of one large object, above 67108864 (64 MiB, the most a pack record holds): the cap a task and the ingest of its run hold an object to. Used only with `--task-large-credentials-file`
-task-large-max-bytes = 536870912
-# The large-object keys each run of presigned writes gets, 0 to 8 (`cas/b/<lease>/<nonce>-L<i>`): an output blob over 64 MiB is written whole to one of them. A ceiling, as for `--task-max-packs`. Without `--task-large-credentials-file` no run gets one, whatever this says. Used only with `--task-secret-file`
-task-max-large = 8
-# With `--task-out-mode put-dir` and `--task-out-format one-pass`: the most records one object of a run may index. A larger index is refused as too large before it is read, so this bounds what the frontend reads to trust an object (52 bytes a record)
+# Removed with `--task-out-mode presigned`. Any value is refused at start
+# (not in --help)
+# task-large-credentials-file = "VALUE"
+# Removed with `--task-out-mode presigned`. Any value is refused at start
+# (not in --help)
+# task-large-max-bytes = "VALUE"
+# Removed with `--task-out-mode presigned`. Any value is refused at start
+# (not in --help)
+# task-max-large = "VALUE"
+# The most records one object of a run may index. A larger index is refused as too large before it is read, so this bounds what the frontend reads to trust an object (52 bytes a record)
 task-max-object-entries = 1048576
-# With `--task-out-format one-pass`: the most bytes of an object's manifest, and the base of the most its tail (manifest, file index and central directory) may be: the base plus `--task-object-bytes-per-entry` for each of `--task-max-object-entries`. A larger one is refused as too large before it is read
+# The most bytes of an object's manifest, and the base of the most its tail (manifest, file index and central directory) may be: the base plus `--task-object-bytes-per-entry` for each of `--task-max-object-entries`. A larger one is refused as too large before it is read
 task-max-object-manifest-bytes = 4194304
-# The pack keys each run of presigned writes gets, 1 to 8 (`cas/b/<lease>/<nonce>-<k>`): a ceiling, not a prediction, since the sizes of a run's outputs are not known before it runs; a key a task does not write is never used. Used only with `--task-secret-file`
-task-max-packs = 8
-# With `--task-out-format one-pass`: the bytes of an object's tail each record may account for, its central directory entry (about 130 bytes) and its line of the file index, which names a path. See `--task-max-object-manifest-bytes`
+# Removed with `--task-out-mode presigned`. Any value is refused at start
+# (not in --help)
+# task-max-packs = "VALUE"
+# The bytes of an object's tail each record may account for, its central directory entry (about 130 bytes) and its line of the file index, which names a path. See `--task-max-object-manifest-bytes`
 task-object-bytes-per-entry = 1024
-# With `--task-out-mode put-dir`: what the task writes. `packs`: packs and large objects planned from the digests, as every release before the one-pass object does. `one-pass`: one object per action, written while the outputs are read, its manifest and index at the end (docs/design/one-pass-task-object.md). This frontend reads both; set `one-pass` only once every frontend and every task image is this release or later, since a task image that does not know it is refused its flag. Refused with `--task-out-mode presigned`
-task-out-format = "packs"
-# Where a task's outputs go. `presigned`: a presigned write of each pack and large object to the tier store, the inputs read through a read grant. `put-dir`: the task commits them as files into a put directory under `--task-out-root`, mounted at /out, which the host's tier store uploads; the inputs are the action tree under the trees directory beside it, the job's root, and the job has no network; no tier store write endpoint, bucket, credentials or read url is needed. Used only with `--task-secret-file` and `--executor js-agent`
-task-out-mode = "presigned"
-# With `--task-out-mode put-dir`: the tier store's put directory on every host (`<mp>/put`, an absolute path), which the host's agent lists as a read-write mount root; each run's directory is `<mp>/put/cas/b/<lease>/<nonce>`, and its action tree `<mp>/trees/<digest>`
+# What the task writes. `one-pass`, the only value and the default: one object per action, written while the outputs are read, its manifest and index at the end (docs/design/one-pass-task-object.md). The flag is still accepted so that a configuration that names it starts; the `packs` value of the releases before is gone, and this frontend still reads the packs those wrote. Every task image must be this release or later
+task-out-format = "one-pass"
+# Where a task's outputs go. `put-dir`, the only mode and the default: the task commits them as files into a put directory under `--task-out-root`, mounted at /out, which the host's tier store uploads; the inputs are the action tree under the trees directory beside it, the job's root, and the job has no network. `presigned` was removed: it is refused, with the flags to drop. Used only with `--task-secret-file` and `--executor js-agent`
+task-out-mode = "put-dir"
+# The tier store's put directory on every host (`<mp>/put`, an absolute path), which the host's agent lists as a read-write mount root; each run's directory is `<mp>/put/cas/b/<lease>/<nonce>`, and its action tree `<mp>/trees/<digest>`
 # task-out-root = "PATH"
-# The bucket of `--task-put-endpoint` a task's pack is written to, under the key `cas/b/<lease>/<nonce>-0`
-# task-put-bucket = "BUCKET"
-# A file with the presign-only key of the tier store, as JSON `{"access_key_id": "...", "secret_access_key": "..."}`, owned by this user and readable by it alone (mode 0600 or 0400). The key signs a `PUT` of one object under its prefix and does nothing else; its ceiling (`max_expires_secs` of the store's `--presign-key-file`) must be at least 14400, and the store's `--presign-max-expires` too
-# task-put-credentials-file = "PATH"
-# The tier store's proxy, as `http://host:port` or `https://host:port`: the host a task's presigned write is signed for, and where it sends the pack. Used only with `--task-secret-file`
-# task-put-endpoint = "URL"
-# The region the presigned writes to `--task-put-endpoint` are signed for
-task-put-region = "us-east-1"
-# The base URL a task reads its inputs from: the job-facing read listener, as `https://host:port` with no path (a grant's token is a bearer secret and crosses only a TLS connection; `http://` is refused at start). A blob is `GET <url>/<hash>/<size>`
-# task-read-url = "URL"
-# The run wall limit a run is prepared for, in seconds, at least 1 and at most 14400: a task's presigned write and read grant are good for this plus `--task-url-slack-secs`. Used only with `--task-secret-file`
-task-run-wall-secs = 7200
-# Turns on the preparation of the runs of a host executor: for each run the frontend makes the keys the task may write, a presigned write of each to the tier store, and a read grant for the task's inputs. The file holds one secret of at least 32 bytes (surrounding white space is dropped), owned by this user and readable by it alone (mode 0600 or 0400): the pack-key mint and the read-grant key are made from it, and it is the secret the job-facing listener verifies grants with. The secret is never a flag: a command line is world-readable. Needs `--task-put-endpoint`, `--task-put-bucket`, `--task-put-credentials-file` and `--task-read-url`, unless `--task-out-mode put-dir`, where it is all a run needs (the mint's secret). Left out, no run is prepared
+# Removed with `--task-out-mode presigned`. Any value is refused at start
+# (not in --help)
+# task-put-bucket = "VALUE"
+# Removed with `--task-out-mode presigned`. Any value is refused at start
+# (not in --help)
+# task-put-credentials-file = "VALUE"
+# Removed with `--task-out-mode presigned`. Any value is refused at start
+# (not in --help)
+# task-put-endpoint = "VALUE"
+# Removed with `--task-out-mode presigned`. Any value is refused at start
+# (not in --help)
+# task-put-region = "VALUE"
+# The most seconds the waits add up to before a create-only write of an action tree to the tier store (`cas/l/<sha256>`) gives up on a 503 ("retry later", which the store answers while it registers: 10 to 40 s), so the lease fails only after this long. A write whose connection turns out to be dead is made once more at once, whatever this says. 0 never waits for a 503. Used only with `--task-secret-file` and `--task-out-mode put-dir`
+task-put-retry-secs = 60
+# Removed with `--task-out-mode presigned`. Any value is refused at start
+# (not in --help)
+# task-read-url = "VALUE"
+# Removed with `--task-out-mode presigned`. Any value is refused at start
+# (not in --help)
+# task-run-wall-secs = "VALUE"
+# Turns on the preparation of the runs of a host executor: for each run the frontend makes the put directory the task commits its object into, and the input closure its action tree is written from. The file holds one secret of at least 32 bytes (surrounding white space is dropped), owned by this user and readable by it alone (mode 0600 or 0400): the mint of the put directories is made from it, and it is the secret the job-facing listener verifies grants with. The secret is never a flag: a command line is world-readable. Needs `--task-out-root`. Left out, no run is prepared
 # task-secret-file = "PATH"
-# The time past the run wall, in seconds, that a task's presigned write and read grant stay good: the time a task takes to start and to put its pack, which includes the retries of a put the store refuses with 503: about 165 seconds from the first attempt to the last by default (up to 60 s of the task's own waits, and up to 15 s at the store before each refusal). The wall and the slack together must not pass 14400, the ceiling of a presigned write, or the frontend does not start. Used only with `--task-secret-file`
+# The time past a run's wall, in seconds, that the keys of its put directory stay good: the time a task takes to start and to commit its object. The wall and the slack together must not pass 14400, the longest a key may be good for, or the frontend does not start. Used only with `--task-secret-file`
 task-url-slack-secs = 600
 
 [tls]

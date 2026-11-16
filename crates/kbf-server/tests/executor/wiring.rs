@@ -23,7 +23,7 @@ use kbf_proto::reapi::{Action, Command, Platform};
 use kbf_sched::Request;
 use kbf_server::Farm;
 use kbf_server::executor::{
-    Metrics, PrepareError, PreparedRun, RunPrepare, RunSource, Running, Secret,
+    Metrics, PrepareError, PreparedRun, RunPrepare, RunSource, Running, Secret, TaskOut,
 };
 use kbf_server::frontend;
 use kbf_state::ManualClock;
@@ -131,16 +131,9 @@ async fn an_action_runs_end_to_end_through_the_flags_and_the_frontends_own_seams
         "--pack-store-bucket=packs".to_owned(),
         "--pack-store-credentials-file=/nowhere".to_owned(),
         // What the flags need beside the executor: only parsed here, the test prepares its own
-        // runs (`real_prep.rs` opens the real ones).
+        // runs.
         "--task-secret-file=/nowhere/secret".to_owned(),
-        "--task-put-endpoint=http://127.0.0.1:9300".to_owned(),
-        "--task-put-bucket=packs".to_owned(),
-        "--task-put-credentials-file=/nowhere/presign.json".to_owned(),
-        "--task-read-url=https://127.0.0.1:9400".to_owned(),
-        "--job-listen=127.0.0.1:9400".to_owned(),
-        "--job-tls-cert=/nowhere/job.pem".to_owned(),
-        "--job-tls-key=/nowhere/job.key".to_owned(),
-        "--job-grant-secret-file=/nowhere/secret".to_owned(),
+        "--task-out-root=/mnt/ts/put".to_owned(),
         "--executor=js-agent".to_owned(),
         format!("--executor-job-url={}", fake.origin()),
         format!("--executor-job-token-file={}", token.display()),
@@ -161,7 +154,10 @@ async fn an_action_runs_end_to_end_through_the_flags_and_the_frontends_own_seams
         .try_get_matches_from(argv)
         .expect("flags");
     let flags = frontend::parse(&matches).expect("a frontend's flags");
-    let js = flags.executor.js.expect("js-agent");
+    let mut js = flags.executor.js.expect("js-agent");
+    // No flag gives the executor the mode this test runs any more (the frontend refuses
+    // `--task-out-mode presigned`): its settings are set here, over what the flags made.
+    js.config.task_out = TaskOut::Presigned;
 
     // The frontend's seams: packs over an object store, the CAS of a node, the key mint.
     let objects = Arc::new(MemoryStore::new(Capabilities {

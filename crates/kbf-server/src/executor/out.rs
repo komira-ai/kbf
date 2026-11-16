@@ -57,25 +57,11 @@ pub enum RootError {
     TooLong(String),
 }
 
-/// What a put-directory task writes (`--task-out-format`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum OutFormat {
-    /// Packs and large objects, planned from the digests: what every release before the
-    /// one-pass object writes, and the default.
-    #[default]
-    Packs,
-    /// One object per action, written in one pass (docs/design/one-pass-task-object.md). The
-    /// frontend reads both; set this only once every frontend and every task image does.
-    OnePass,
-}
-
-/// The host directories of a put-directory job (the put root and the trees beside it) and the
-/// format its task is told to write.
+/// The host directories of a put-directory job: the put root and the trees beside it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PutDirRoots {
     put: String,
     trees: String,
-    format: OutFormat,
 }
 
 impl PutDirRoots {
@@ -103,20 +89,7 @@ impl PutDirRoots {
         Ok(Self {
             put: put.to_owned(),
             trees: format!("{parent}/trees"),
-            format: OutFormat::default(),
         })
-    }
-
-    /// These roots, for a task told to write `format`.
-    #[must_use]
-    pub fn with_format(self, format: OutFormat) -> Self {
-        Self { format, ..self }
-    }
-
-    /// What the task is told to write.
-    #[must_use]
-    pub const fn format(&self) -> OutFormat {
-        self.format
     }
 
     /// The put root, `<mp>/put`.

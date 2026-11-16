@@ -20,10 +20,7 @@ fn argv(more: &[&str]) -> Vec<String> {
         "--pack-store-credentials-file=/nowhere",
         // What `--executor js-agent` prepares its runs with, which the parse requires.
         "--task-secret-file=/nowhere/secret",
-        "--task-put-endpoint=http://127.0.0.1:9",
-        "--task-put-bucket=packs",
-        "--task-put-credentials-file=/nowhere/presign.json",
-        "--task-read-url=https://127.0.0.1:9400",
+        "--task-out-root=/mnt/ts/put",
         "--job-listen=127.0.0.1:9400",
         "--job-tls-cert=/nowhere/job.pem",
         "--job-tls-key=/nowhere/job.key",
@@ -61,7 +58,7 @@ const JS: [&str; 12] = [
     "--executor-kbf-image=registry.test/kbf@sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
     "--executor-base-tree=/opt/kbf/base-tree",
     "--executor-insecure-argv-secrets",
-    // The tier store of the task flags is `http://`, as it is until it serves TLS.
+    // Still a setting of the executor, though no flag gives it the mode that reads it.
     "--executor-allow-plain-http-put",
 ];
 
@@ -279,12 +276,11 @@ fn locate_with_kbf_daemon_is_refused_at_start() {
 /// as text in the flags and are the config's.
 #[test]
 fn the_defaults_are_the_executors_own() {
-    let mut all: Vec<&str> = JS
+    let all: Vec<&str> = JS
         .iter()
         .copied()
         .filter(|flag| *flag != "--executor-allow-plain-http-put")
         .collect();
-    all.push("--task-put-endpoint=https://127.0.0.1:9");
     let flags = parsed(argv(&all)).expect("flags");
     let config = flags.executor.js.expect("js-agent").config;
     let own = Config::new("front-1", 2, 8_000, 32 << 30);
@@ -453,6 +449,7 @@ fn flags_of(url: &str, token: &Path, ca: Option<&Path>) -> JsAgentFlags {
         base_tree_keep: 1,
         base_tree_timeout: std::time::Duration::from_secs(60),
         published: std::sync::Arc::default(),
+        put_retry: std::time::Duration::from_secs(60),
     }
 }
 

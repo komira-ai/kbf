@@ -1,0 +1,54 @@
+[package]
+name = "kbf-trees-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+# `fake`: `fake::FakeTreesServer`, a tierstore trees interface in the process, on loopback,
+# that keeps tierstore's rules, for other crates' tests (and this one's, through the
+# dev-dependency on itself). It serves the generated `TreesService` (the `server` half of
+# tierstore-trees-api) over hyper's HTTP/2 server, which tonic already builds into the tree.
+fake = [
+    "dep:hyper",
+    "hyper/http2",
+    "hyper/server",
+    "hyper-util/service",
+    "tierstore-trees-api/server",
+    "tokio/macros",
+    "tokio/sync",
+]
+
+# A typed gRPC client of a build node's tierstore trees interface (`tierstore.trees.v1.
+# TreesService`, the messages tierstore-trees-api generates at the workspace's one tierstore
+# revision), for the frontend's executor. Each call is signed as tierstore asks: SigV4 over
+# the gRPC path and the hash of the whole body, with the key's secret never sent. The
+# connection is tonic's channel over a connector of this crate: TCP, then TLS with
+# tokio-rustls pinned to one CA.
+[dependencies]
+bytes.workspace = true
+hex.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper = { workspace = true, optional = true }
+hyper-util = { workspace = true, features = ["tokio"] }
+prost.workspace = true
+rustls.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tierstore-trees-api = { workspace = true, features = ["client"] }
+tokio = { workspace = true, features = ["net", "rt", "time"] }
+tokio-rustls.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
+
+[dev-dependencies]
+kbf-trees-client = { workspace = true, features = ["fake"] }
+rcgen.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+
+[lints]
+workspace = true

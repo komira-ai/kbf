@@ -1,5 +1,6 @@
-//! The history writer's task: a step every [`STEP_EVERY`], and one last bounded step,
-//! with every open invocation closed, when the server stops.
+//! The history writer's task: a step every [`STEP_EVERY`], and, when the server stops,
+//! every open invocation closed and steps until nothing is left to write ([`flush`]),
+//! all within [`FINAL_STEP`].
 
 use std::future::Future;
 use std::pin::Pin;
@@ -27,10 +28,15 @@ use crate::http_blobs::ReadBudget;
 /// transactions at the two a second the writer's own bound allows.
 pub const STEP_EVERY: Duration = Duration::from_millis(500);
 
-/// How long the last step, at a stop, may take before the task is given up.
+/// How long the stop's flush, at a stop, may take before the task is given up.
 const FINAL_STEP: Duration = Duration::from_secs(5);
 
-/// How long a stop waits for the failed runs still in the tail pool before the last step.
+/// Stalled steps (a write failed, or nothing changed) the stop's flush takes with no
+/// headway between them before it gives up: the stores are not taking the writes, and
+/// what is left is lost as a running writer's would be when its stores fail.
+const STALLED_STEPS: usize = 3;
+
+/// How long a stop waits for the failed runs still in the tail pool before the flush.
 /// Inside [`FINAL_STEP`]: a pool that does not drain leaves its runs to be lost, not the
 /// stop to hang.
 const TAILS_STOP: Duration = Duration::from_secs(2);
@@ -250,11 +256,77 @@ async fn run<O: ObjectStore>(
         publish(&writer);
     }
     // Failed runs still in the tail pool are given a moment to reach the queue, then
-    // every invocation offered a record is closed, so the step flushes its chunk.
+    // every invocation offered a record is closed, so the flush writes its chunk.
     let _ = tokio::time::timeout(TAILS_STOP, tap.quiesce()).await;
     tap.close_all();
-    writer.step(now_ms()).await;
+    flush(&mut writer, &now_ms).await;
     publish(&writer);
+}
+
+/// What the stop's flush watches of a writer: what it still has to write (index rows
+/// waiting, objects whose rows wait to be restored, chunks cut and not written, catalog
+/// and status rows owed, and the invocations it holds, each let go only once it is
+/// closed and its chunk and header are written), and how many of its writes failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Left {
+    owed: [usize; 5],
+    failed: u64,
+}
+
+impl Left {
+    fn of<O: ObjectStore>(writer: &Writer<O>) -> Left {
+        let drops = writer.drops();
+        Left {
+            owed: [
+                writer.pending_rows(),
+                writer.kept_objects(),
+                writer.unwritten_chunks(),
+                writer.index_owed(),
+                writer.open_invocations(),
+            ],
+            failed: drops.put + drops.index,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.owed.iter().all(|n| *n == 0)
+    }
+}
+
+/// The stop's flush: steps `writer` until it owes nothing, or until [`STALLED_STEPS`]
+/// steps have stalled with no headway between them. A step makes headway when any of
+/// the counts of [`Left`] falls below the least it has been; it stalls when a write of
+/// it failed or it changed nothing. A step that only moves work along (a stored header
+/// read becomes a row to write) does neither. One step sends at most
+/// [`kbf_history::Limits::txns_per_step`] index transactions, so a single last step
+/// would leave the rows of every invocation past the first batch unwritten, and their
+/// headers open, at every stop of a rolling update. Each step yields, so the stop's
+/// bound ([`FINAL_STEP`]) can always end it. Returns the steps taken.
+async fn flush<O: ObjectStore>(writer: &mut Writer<O>, now_ms: &(dyn Fn() -> u64 + Sync)) -> usize {
+    let (mut before, mut least) = (Left::of(writer), [usize::MAX; 5]);
+    let (mut stalled, mut steps) = (0, 0);
+    loop {
+        writer.step(now_ms()).await;
+        steps += 1;
+        let after = Left::of(writer);
+        if after.is_empty() {
+            return steps;
+        }
+        let headway = after.owed.iter().zip(&least).any(|(now, low)| now < low);
+        for (low, now) in least.iter_mut().zip(after.owed) {
+            *low = (*low).min(now);
+        }
+        if headway {
+            stalled = 0;
+        } else if after.failed > before.failed || after == before {
+            stalled += 1;
+            if stalled == STALLED_STEPS {
+                return steps;
+            }
+        }
+        before = after;
+        tokio::task::yield_now().await;
+    }
 }
 
 /// A spawned task, aborted when this is dropped.
@@ -294,8 +366,8 @@ pub(crate) fn spawn(history: Option<History>) -> Option<Running> {
     })
 }
 
-/// Stops `running` as a server's stop does: its writer takes one last step with every
-/// open invocation closed, for at most [`FINAL_STEP`].
+/// Stops `running` as a server's stop does: its writer closes every open invocation and
+/// flushes ([`flush`]), for at most [`FINAL_STEP`].
 pub(crate) async fn finish(running: Option<Running>) {
     let Some(Running {
         mut handle,

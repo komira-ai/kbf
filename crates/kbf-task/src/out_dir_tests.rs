@@ -7,17 +7,13 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fs::File;
 use std::rc::Rc;
 
-use kbf_segments::{SegmentReader, sha256};
-use kbf_task_pack::{
-    LayoutError, MAX_RECORD_BYTES, OutputFile, Timing, Usage, read_manifest_with, write_pack_with,
-};
+use kbf_segments::sha256;
+use kbf_task_pack::{OutputFile, Timing, Usage};
 use kbf_testkit::dir::TestDir;
 
 use super::*;
-use crate::outputs::{OutputLimits, collect_outputs};
-use crate::pack::{INVALID_PACK, OUTPUT_CHANGED, OUTPUT_TOO_LARGE};
-use crate::task::recording_sink::flip_first_byte;
-use crate::task::{EXIT_PACK, EXIT_PUT, EXIT_SETUP};
+use crate::digest::to_reapi;
+use crate::task::{EXIT_PUT, EXIT_SETUP};
 
 /// A fresh scratch directory for one test, removed when the test ends.
 fn scratch(name: &str) -> TestDir {
@@ -72,20 +68,6 @@ fn manifest(bytes: &[&[u8]]) -> TaskManifest {
         objects: None,
     }
 }
-
-/// A large blob and four small ones, with limits of three records a pack: `L0`, `pack1` and
-/// `pack`.
-fn three_objects() -> (Vec<u8>, Limits) {
-    let big = vec![5u8; usize::try_from(MAX_RECORD_BYTES).expect("fits") + 1];
-    let limits = Limits {
-        pack_records: 3,
-        ..Limits::real()
-    };
-    (big, limits)
-}
-
-/// The four small blobs of [`three_objects`].
-const SMALL: [&[u8]; 4] = [b"one", b"two", b"three", b"four"];
 
 /// The fake store: every rename it is asked for, by file name, and the errnos it answers.
 #[derive(Clone, Default)]
@@ -170,128 +152,47 @@ fn committed(out: &Path, store: &Store, name: &str) -> Vec<u8> {
     bytes
 }
 
-/// The digests of the records of `pack`, in offset order.
-fn records(pack: &[u8]) -> Vec<Digest> {
-    let reader = SegmentReader::open(pack).expect("segment");
-    let mut entries = reader.footer().entries().to_vec();
-    entries.sort_by_key(|e| e.offset);
-    entries.iter().map(|e| e.digest).collect()
+/// The run's one object holding `bytes`, put through `sink` as a run does: the object created, the
+/// blob put, the manifest ended and the object committed. Returns the manifest it ended with.
+async fn store_one(sink: &OutDir, bytes: &[u8]) -> Result<TaskManifest, Failure> {
+    let object = sink.object()?;
+    // A put the file refuses fails the run as a write to the put directory (exit 13).
+    (object.spool())
+        .put(&to_reapi(&sha256(bytes)), bytes.to_vec())
+        .await
+        .map_err(write_error(OBJECT_NAME))?;
+    let mut manifest = manifest(&[bytes]);
+    object.finish(&mut manifest).await?;
+    Ok(manifest)
 }
 
-/// Asserts the whole of a run of one pack: the directory ends holding `pack` alone, committed by
-/// the digest rename then the commit rename; its bytes are those of the in-memory writer for the
-/// same manifest and blobs; the manifest read back is the one returned, the Command's exit code
-/// 3 in it.
-#[test]
-fn a_run_of_one_pack_commits_pack_alone_byte_equal_to_the_in_memory_writer() {
-    let dir = scratch("one-pack");
+/// Asserts the whole of a run: the directory ends holding `pack` alone, committed by the digest
+/// rename then the commit rename; its bytes are the one-pass object, which holds the blob; the
+/// manifest returned is the one the object ends with, the Command's exit code 3 in it.
+#[tokio::test]
+async fn a_run_commits_pack_alone_by_the_digest_rename_then_the_commit_rename() {
+    let dir = scratch("one");
     let out = out_dir(&dir);
     let (sink, store) = served(&out);
-    let (alpha, beta): (&[u8], &[u8]) = (b"alpha", b"beta");
-    let blobs = Blobs::from_bytes(&[alpha, beta]);
-    let mut manifest = manifest(&[alpha, beta]);
-    sink.store(&mut manifest, &blobs, &Limits::real())
-        .expect("store");
-
+    let manifest = store_one(&sink, b"payload").await.expect("stored");
+    assert_eq!(manifest.exit_code, 3);
+    assert_eq!(manifest.timing.walk_ms, Some(7));
     assert_eq!(names(&out), ["pack"]);
-    let pack = committed(&out, &store, "pack");
+    let object = committed(&out, &store, "pack");
+    assert!(
+        object.windows(7).any(|w| w == b"payload"),
+        "the object holds the blob"
+    );
     assert_eq!(store.commits(), ["pack"]);
-    let read = read_manifest_with(&pack, MAX_LARGE_BYTES).expect("read");
-    assert_eq!(read, manifest);
-    assert_eq!((read.exit_code, read.packs), (3, 1));
-    let mut sorted = [alpha, beta];
-    sorted.sort_by_key(|b| sha256(b));
-    let expected = write_pack_with(&manifest, &sorted, MAX_LARGE_BYTES).expect("in memory");
-    assert_eq!(pack, expected);
     assert!(store.pauses().is_empty());
 }
 
-/// Asserts that the committed manifest carries the four phase timings, and today's three: `walk`
-/// is the collect time the run measured (`pack_ms` on entry), the others are present (their
-/// values are not asserted), and `fetch_ms` and `run_ms` are unchanged.
-#[test]
-fn the_committed_manifest_carries_the_phase_timings() {
-    let dir = scratch("phases");
-    let out = out_dir(&dir);
-    let (sink, store) = served(&out);
-    let blobs = Blobs::from_bytes(&[b"x"]);
-    let mut manifest = manifest(&[b"x"]);
-    sink.store(&mut manifest, &blobs, &Limits::real())
-        .expect("store");
-    let timing = read_manifest_with(&committed(&out, &store, "pack"), MAX_LARGE_BYTES)
-        .expect("read")
-        .timing;
-    assert_eq!(timing.walk_ms, Some(7));
-    assert!(timing.hash_ms.is_some());
-    assert!(timing.write_ms.is_some());
-    assert!(timing.commit_ms.is_some());
-    assert_eq!((timing.fetch_ms, timing.run_ms), (1, 2));
-    // `pack_ms` is rewritten to cover the four phases; a relation, not a duration.
-    let phases = [
-        timing.walk_ms,
-        timing.hash_ms,
-        timing.write_ms,
-        timing.commit_ms,
-    ];
-    let sum: u64 = phases.iter().flatten().sum();
-    assert!(timing.pack_ms >= sum, "{timing:?}");
-}
-
-/// Asserts the order and contents of a run of two packs and a large object: the large object is
-/// written and committed first as `L0` with the blob's bytes, then `pack1`, then `pack` last; the
-/// manifest says two packs and the large slot; the two packs hold the small blobs, each once,
-/// and pack 1 has no manifest.
-#[test]
-fn a_large_object_then_pack1_then_pack_are_committed_in_that_order() {
-    let dir = scratch("two-packs-and-large");
-    let out = out_dir(&dir);
-    let (sink, store) = served(&out);
-    let big = vec![5u8; usize::try_from(MAX_RECORD_BYTES).expect("fits") + 1];
-    let small: [&[u8]; 4] = [b"one", b"two", b"three", b"four"];
-    let all: Vec<&[u8]> = small.iter().copied().chain([big.as_slice()]).collect();
-    let blobs = Blobs::from_bytes(&all);
-    let mut manifest = manifest(&all);
-    // Three records a pack: the manifest and four blobs need two.
-    let limits = Limits {
-        pack_records: 3,
-        ..Limits::real()
-    };
-    sink.store(&mut manifest, &blobs, &limits).expect("store");
-
-    assert_eq!(store.commits(), ["L0", "pack1", "pack"]);
-    assert_eq!(names(&out), ["L0", "pack", "pack1"]);
-    assert_eq!(committed(&out, &store, "L0"), big);
-    let pack = committed(&out, &store, "pack");
-    let pack1 = committed(&out, &store, "pack1");
-    let read = read_manifest_with(&pack, MAX_LARGE_BYTES).expect("read");
-    assert_eq!(read, manifest);
-    assert_eq!(read.packs, 2);
-    assert_eq!(read.large.len(), 1);
-    assert_eq!(
-        (read.large[0].slot, read.large[0].digest),
-        (0, sha256(&big))
-    );
-    let json = sha256(&manifest.to_json_with(MAX_LARGE_BYTES).expect("json"));
-    let in_pack = records(&pack);
-    assert_eq!(in_pack[0], json);
-    let mut held: Vec<Digest> = in_pack[1..]
-        .iter()
-        .chain(&records(&pack1))
-        .copied()
-        .collect();
-    held.sort();
-    let mut expected: Vec<Digest> = small.iter().map(|b| sha256(b)).collect();
-    expected.sort();
-    assert_eq!(held, expected);
-    assert!(!records(&pack1).contains(&json));
-}
-
-/// Asserts that a commit the store refuses for good fails the run with exit 13 and a line naming
-/// the object, the attempt, the errno and what the store means by it, with exact text, is not
-/// tried again, and leaves no `.part` file: one case per errno of the store's mapping that is
-/// final, and one it does not name.
-#[test]
-fn a_refused_commit_is_exit_13_with_its_errno_and_leaves_no_part_file() {
+/// Asserts that a commit the store refuses for good is exit 13 with the object, the attempt, the
+/// errno and what the store means by it, with exact text, is not tried again, and leaves no
+/// `.part` file: one case per errno of the store's mapping that is final, and one it does not
+/// name.
+#[tokio::test]
+async fn a_refused_commit_is_exit_13_with_its_errno_and_leaves_no_part_file() {
     let cases = [
         (libc::EEXIST, "; the key holds another object"),
         (
@@ -306,13 +207,7 @@ fn a_refused_commit_is_exit_13_with_its_errno_and_leaves_no_part_file() {
         let out = out_dir(&dir);
         let (sink, store) = served(&out);
         store.refuse("pack", &[errno]);
-        let failure = sink
-            .store(
-                &mut manifest(&[b"x"]),
-                &Blobs::from_bytes(&[b"x"]),
-                &Limits::real(),
-            )
-            .expect_err("refused");
+        let failure = store_one(&sink, b"x").await.expect_err("refused");
         assert_eq!(failure.exit_code(), EXIT_PUT);
         assert_eq!(
             failure.to_string(),
@@ -329,18 +224,15 @@ fn a_refused_commit_is_exit_13_with_its_errno_and_leaves_no_part_file() {
 
 /// Asserts that a commit answered `EBUSY`, `EIO` or `EINTR` is tried again, the same rename,
 /// after each pause in turn, and the run succeeds when the store then takes it.
-#[test]
-fn a_busy_failed_or_interrupted_commit_is_tried_again_after_each_pause() {
+#[tokio::test]
+async fn a_busy_failed_or_interrupted_commit_is_tried_again_after_each_pause() {
     let dir = scratch("retried");
     let out = out_dir(&dir);
     let (sink, store) = served(&out);
     store.refuse("pack", &[libc::EBUSY, libc::EIO, libc::EINTR]);
-    sink.store(
-        &mut manifest(&[b"x"]),
-        &Blobs::from_bytes(&[b"x"]),
-        &Limits::real(),
-    )
-    .expect("taken on the fourth attempt");
+    store_one(&sink, b"x")
+        .await
+        .expect("taken on the fourth attempt");
     assert_eq!(store.commits(), ["pack"; 4]);
     assert_eq!(store.pauses(), PAUSES);
     assert_eq!(names(&out), ["pack"]);
@@ -351,8 +243,8 @@ fn a_busy_failed_or_interrupted_commit_is_tried_again_after_each_pause() {
 /// Asserts that a commit that keeps failing with `EIO`, or keeps finding the file open
 /// (`EBUSY`), stops after the last attempt: exit 13, a line naming attempt 4 of 4 and what the
 /// store means by the errno, every pause taken, and no `.part` file left.
-#[test]
-fn a_commit_that_keeps_failing_stops_after_the_last_attempt() {
+#[tokio::test]
+async fn a_commit_that_keeps_failing_stops_after_the_last_attempt() {
     let cases = [
         (libc::EIO, "the store did not take it before its deadline"),
         (libc::EBUSY, "the store still sees the file open"),
@@ -362,13 +254,7 @@ fn a_commit_that_keeps_failing_stops_after_the_last_attempt() {
         let out = out_dir(&dir);
         let (sink, store) = served(&out);
         store.refuse("pack", &[errno; COMMIT_ATTEMPTS]);
-        let failure = sink
-            .store(
-                &mut manifest(&[b"x"]),
-                &Blobs::from_bytes(&[b"x"]),
-                &Limits::real(),
-            )
-            .expect_err("gave up");
+        let failure = store_one(&sink, b"x").await.expect_err("gave up");
         assert_eq!(failure.exit_code(), EXIT_PUT);
         assert_eq!(
             failure.to_string(),
@@ -383,42 +269,15 @@ fn a_commit_that_keeps_failing_stops_after_the_last_attempt() {
     }
 }
 
-/// Asserts that a run whose last commit fails keeps the objects it committed before it (they are
-/// the store's now) and removes the `.part` file of the one that failed.
-#[test]
-fn a_failed_commit_keeps_the_objects_committed_before_it() {
-    let dir = scratch("kept");
-    let out = out_dir(&dir);
-    let (sink, store) = served(&out);
-    store.refuse("pack", &[libc::EEXIST]);
-    let small: [&[u8]; 4] = [b"one", b"two", b"three", b"four"];
-    let limits = Limits {
-        pack_records: 3,
-        ..Limits::real()
-    };
-    let failure = sink
-        .store(&mut manifest(&small), &Blobs::from_bytes(&small), &limits)
-        .expect_err("refused");
-    assert_eq!(failure.exit_code(), EXIT_PUT);
-    assert_eq!(store.commits(), ["pack1", "pack"]);
-    assert_eq!(names(&out), ["pack1"]);
-}
-
 /// Asserts that a digest rename the store refuses is exit 13 with its line, no commit is asked
 /// for, and the `.part` file is removed.
-#[test]
-fn a_refused_digest_rename_is_exit_13_and_removes_the_part_file() {
+#[tokio::test]
+async fn a_refused_digest_rename_is_exit_13_and_removes_the_part_file() {
     let dir = scratch("digest-rename");
     let out = out_dir(&dir);
     let (sink, store) = served(&out);
     store.refuse("pack.sha256", &[libc::EPERM]);
-    let failure = sink
-        .store(
-            &mut manifest(&[b"x"]),
-            &Blobs::from_bytes(&[b"x"]),
-            &Limits::real(),
-        )
-        .expect_err("refused");
+    let failure = store_one(&sink, b"x").await.expect_err("refused");
     assert_eq!(failure.exit_code(), EXIT_PUT);
     assert_eq!(
         failure.to_string(),
@@ -433,19 +292,13 @@ fn a_refused_digest_rename_is_exit_13_and_removes_the_part_file() {
 
 /// Asserts that a `.part` name already in the directory is refused (the file is created new,
 /// never opened again), exit 13 with its line, and the file that was there is left as it was.
-#[test]
-fn a_part_name_already_there_is_refused_and_left_alone() {
+#[tokio::test]
+async fn a_part_name_already_there_is_refused_and_left_alone() {
     let dir = scratch("taken");
     let out = out_dir(&dir);
     std::fs::write(out.join("pack.part"), b"theirs").expect("theirs");
     let (sink, store) = served(&out);
-    let failure = sink
-        .store(
-            &mut manifest(&[b"x"]),
-            &Blobs::from_bytes(&[b"x"]),
-            &Limits::real(),
-        )
-        .expect_err("refused");
+    let failure = store_one(&sink, b"x").await.expect_err("refused");
     assert_eq!(failure.exit_code(), EXIT_PUT);
     assert_eq!(
         failure.to_string(),
@@ -479,39 +332,28 @@ impl Write for Full {
 }
 
 /// Asserts that a write the put directory refuses is exit 13 with a line naming the object, and
-/// its `.part` file is removed: a large object (streamed from its blob) and a pack bigger than
-/// the write buffer (refused while the pack is written).
-#[test]
-fn a_refused_write_is_exit_13_and_removes_the_part_file() {
-    let big = vec![5u8; usize::try_from(MAX_RECORD_BYTES).expect("fits") + 1];
+/// its `.part` file is removed: a blob bigger than the write buffer.
+#[tokio::test]
+async fn a_refused_write_is_exit_13_and_removes_the_part_file() {
     let two_mib = vec![6u8; 2 << 20];
-    let cases: [(&str, &[u8]); 2] = [("L0", &big), ("pack", &two_mib)];
-    for (name, blob) in cases {
-        let dir = scratch(&format!("full-{name}"));
-        let out = out_dir(&dir);
-        let (sink, store) = served(&out);
-        let sink = sink.with_create(|path| {
-            let file = File::create_new(path)?;
-            Ok(Box::new(Full { _file: file }))
-        });
-        let failure = sink
-            .store(
-                &mut manifest(&[blob]),
-                &Blobs::from_bytes(&[blob]),
-                &Limits::real(),
-            )
-            .expect_err("refused");
-        assert_eq!(failure.exit_code(), EXIT_PUT);
-        assert_eq!(
-            failure.to_string(),
-            format!(
-                "put: {name}: cannot write it to the put directory: {}",
-                io::Error::from_raw_os_error(libc::ENOSPC)
-            )
-        );
-        assert!(store.renames.borrow().is_empty());
-        assert!(names(&out).is_empty(), "{name}: {:?}", names(&out));
-    }
+    let dir = scratch("full-pack");
+    let out = out_dir(&dir);
+    let (sink, store) = served(&out);
+    let sink = sink.with_create(|path| {
+        let file = File::create_new(path)?;
+        Ok(Box::new(Full { _file: file }))
+    });
+    let failure = store_one(&sink, &two_mib).await.expect_err("refused");
+    assert_eq!(failure.exit_code(), EXIT_PUT);
+    assert_eq!(
+        failure.to_string(),
+        format!(
+            "put: pack: cannot write it to the put directory: {}",
+            io::Error::from_raw_os_error(libc::ENOSPC)
+        )
+    );
+    assert!(store.renames.borrow().is_empty());
+    assert!(names(&out).is_empty(), "{:?}", names(&out));
 }
 
 /// A file whose writes are taken and whose flush is refused with `ENOSPC`, as a stage that
@@ -531,252 +373,27 @@ impl Write for FullAtFlush {
 }
 
 /// Asserts that a full disk the put directory reports only at the flush is exit 13 too, nothing
-/// is renamed and no `.part` file is left: a pack smaller than the write buffer, and a large
-/// object.
-#[test]
-fn a_refused_flush_is_exit_13_and_nothing_is_committed() {
-    let (big, _) = three_objects();
-    let cases: [(&str, &[u8]); 2] = [("pack", b"small"), ("L0", &big)];
-    for (name, blob) in cases {
-        let dir = scratch(&format!("flush-{name}"));
-        let out = out_dir(&dir);
-        let (sink, store) = served(&out);
-        let sink = sink.with_create(|path| {
-            let file = File::create_new(path)?;
-            Ok(Box::new(FullAtFlush { file }))
-        });
-        let failure = sink
-            .store(
-                &mut manifest(&[blob]),
-                &Blobs::from_bytes(&[blob]),
-                &Limits::real(),
-            )
-            .expect_err("refused");
-        assert_eq!(failure.exit_code(), EXIT_PUT);
-        assert_eq!(
-            failure.to_string(),
-            format!(
-                "put: {name}: cannot write it to the put directory: {}",
-                io::Error::from_raw_os_error(libc::ENOSPC)
-            )
-        );
-        assert!(store.renames.borrow().is_empty(), "{name}");
-        assert!(names(&out).is_empty(), "{name}: {:?}", names(&out));
-    }
-}
-
-/// A case of a run that fails part way: its name, the commit refused, the `.part` whose writes
-/// are refused, and the names that stay.
-type PartWay = (
-    &'static str,
-    Option<&'static str>,
-    Option<&'static str>,
-    &'static [&'static str],
-);
-
-/// Asserts the clean-up of a run of three objects (`L0`, `pack1`, `pack`) that fails part way:
-/// every `.part` file it wrote and did not commit is removed, whichever object failed, and only
-/// what it committed stays. The cases: the write of `pack1` refused (`L0.part` written before
-/// it), the commit of `L0` refused (`pack1.part` written and waiting), and the commit of `pack1`
-/// refused (`L0` committed before it).
-#[test]
-fn a_run_that_fails_part_way_removes_every_part_file_and_keeps_what_it_committed() {
-    let (big, limits) = three_objects();
-    let all: Vec<&[u8]> = SMALL.iter().copied().chain([big.as_slice()]).collect();
-    // (case, the commit refused or none, the `.part` whose writes are refused or none, what stays)
-    let cases: [PartWay; 3] = [
-        ("write-pack1", None, Some("pack1.part"), &[]),
-        ("commit-l0", Some("L0"), None, &[]),
-        ("commit-pack1", Some("pack1"), None, &["L0"]),
-    ];
-    for (case, commit, write, stays) in cases {
-        let dir = scratch(&format!("part-way-{case}"));
-        let out = out_dir(&dir);
-        let (mut sink, store) = served(&out);
-        if let Some(name) = commit {
-            store.refuse(name, &[libc::EEXIST]);
-        }
-        if let Some(part) = write {
-            sink = sink.with_create(move |path| {
-                let file = File::create_new(path)?;
-                if path.ends_with(part) {
-                    Ok(Box::new(Full { _file: file }))
-                } else {
-                    Ok(Box::new(file))
-                }
-            });
-        }
-        let failure = sink
-            .store(&mut manifest(&all), &Blobs::from_bytes(&all), &limits)
-            .expect_err(case);
-        assert_eq!(failure.exit_code(), EXIT_PUT, "{case}");
-        assert_eq!(names(&out), stays, "{case}");
-    }
-}
-
-/// Outputs collected from files under `dir`: `big` (held open, being over one chunk) and `small`.
-async fn file_blobs(dir: &Path, big: &[u8]) -> (TaskManifest, Blobs) {
-    let work = dir.join("work");
-    std::fs::create_dir(&work).expect("work");
-    std::fs::write(work.join("big"), big).expect("big");
-    std::fs::write(work.join("small"), b"small").expect("small");
-    std::fs::write(dir.join("stdout"), b"").expect("stdout");
-    std::fs::write(dir.join("stderr"), b"").expect("stderr");
-    let paths = ["big".to_owned(), "small".to_owned()];
-    let collected = collect_outputs(
-        &work,
-        "",
-        &paths,
-        &dir.join("stdout"),
-        &dir.join("stderr"),
-        OutputLimits::default(),
-        u64::MAX,
-    )
-    .await
-    .expect("collect");
-    let mut manifest = manifest(&[big, b"small"]);
-    manifest.output_files[0].path = "big".to_owned();
-    manifest.output_files[1].path = "small".to_owned();
-    (manifest, collected.blobs)
-}
-
-/// Asserts that an output whose bytes change after they were hashed is exit 12
-/// (`output-changed`), whenever the change is seen, and leaves no `.part` file: changed before
-/// the run is stored (seen by the write of its pack, its only read), changed
-/// while pack 0 is being written (seen by the pack's write), and a large object changed, or cut
-/// to one byte, before it is written (seen once it is written).
+/// is renamed and no `.part` file is left.
 #[tokio::test]
-async fn an_output_changed_after_it_was_hashed_is_exit_12() {
-    let chunk = vec![7u8; kbf_outputs::CHUNK_BYTES + 1];
-    let big = vec![8u8; usize::try_from(MAX_RECORD_BYTES).expect("fits") + 1];
-    // (case, the big output, the `.part` file whose create changes it, none: changed before;
-    // whether it is cut short rather than changed in place).
-    let cases: [(&str, &[u8], Option<&str>, bool); 4] = [
-        ("before", &chunk, None, false),
-        ("pack", &chunk, Some("pack.part"), false),
-        ("large", &big, Some("L0.part"), false),
-        ("large-cut", &big, Some("L0.part"), true),
-    ];
-    for (case, bytes, when, cut) in cases {
-        let dir = scratch(&format!("changed-{case}"));
-        let out = out_dir(&dir);
-        let (mut manifest, blobs) = file_blobs(&dir, bytes).await;
-        let path = dir.join("work/big");
-        let (sink, store) = served(&out);
-        let sink = match when {
-            None => {
-                flip_first_byte(&path);
-                sink
-            }
-            Some(at) => {
-                let at = at.to_owned();
-                sink.with_create(move |part| {
-                    if part.ends_with(&at) && cut {
-                        File::options().write(true).open(&path)?.set_len(1)?;
-                    } else if part.ends_with(&at) {
-                        flip_first_byte(&path);
-                    }
-                    Ok(Box::new(File::create_new(part)?))
-                })
-            }
-        };
-        let failure = sink
-            .store(&mut manifest, &blobs, &Limits::real())
-            .expect_err("changed");
-        assert_eq!(failure.exit_code(), EXIT_PACK, "{case}");
-        let Failure::Pack(e) = &failure else {
-            panic!("{case}: {failure}")
-        };
-        assert_eq!(e.detail, OUTPUT_CHANGED, "{case}");
-        assert!(store.commits().is_empty(), "{case}");
-        assert!(names(&out).is_empty(), "{case}: {:?}", names(&out));
-    }
-}
-
-/// Asserts that the store reads each packed output once, as it writes it: an output changed
-/// before the run is stored is first seen by the write of its pack, so `pack.part` was created
-/// before the run failed, and no other read (a checksum pass) came first. The record's CRC-32C
-/// in the footer comes from that same read: a run that is not changed commits a pack whose
-/// footer holds the blob's CRC-32C.
-#[tokio::test]
-async fn each_packed_output_is_read_once_by_its_write() {
-    let chunk = vec![7u8; kbf_outputs::CHUNK_BYTES + 1];
-    let dir = scratch("read-once");
+async fn a_refused_flush_is_exit_13_and_nothing_is_committed() {
+    let dir = scratch("flush-pack");
     let out = out_dir(&dir);
-    let (mut manifest, blobs) = file_blobs(&dir, &chunk).await;
-    flip_first_byte(&dir.join("work/big"));
-    let created = Rc::new(RefCell::new(Vec::new()));
-    let seen = Rc::clone(&created);
     let (sink, store) = served(&out);
-    let sink = sink.with_create(move |part| {
-        let name = part.file_name().expect("name").to_string_lossy();
-        seen.borrow_mut().push(name.into_owned());
-        Ok(Box::new(File::create_new(part)?))
+    let sink = sink.with_create(|path| {
+        let file = File::create_new(path)?;
+        Ok(Box::new(FullAtFlush { file }))
     });
-    let failure = sink
-        .store(&mut manifest, &blobs, &Limits::real())
-        .expect_err("changed");
-    let Failure::Pack(e) = &failure else {
-        panic!("{failure}")
-    };
-    assert_eq!(e.detail, OUTPUT_CHANGED);
-    assert_eq!(*created.borrow(), ["pack.part"]);
-    assert!(store.commits().is_empty());
+    let failure = store_one(&sink, b"small").await.expect_err("refused");
+    assert_eq!(failure.exit_code(), EXIT_PUT);
+    assert_eq!(
+        failure.to_string(),
+        format!(
+            "put: pack: cannot write it to the put directory: {}",
+            io::Error::from_raw_os_error(libc::ENOSPC)
+        )
+    );
+    assert!(store.renames.borrow().is_empty());
     assert!(names(&out).is_empty(), "{:?}", names(&out));
-
-    let dir = scratch("read-once-crc");
-    let out = out_dir(&dir);
-    let (mut manifest, blobs) = file_blobs(&dir, &chunk).await;
-    let (sink, _store) = served(&out);
-    sink.store(&mut manifest, &blobs, &Limits::real())
-        .expect("store");
-    let pack = std::fs::read(out.join("pack")).expect("pack");
-    let reader = SegmentReader::open(&pack).expect("segment");
-    let entry = (reader.footer().entries().iter())
-        .find(|e| e.digest == sha256(&chunk))
-        .expect("the blob's record");
-    assert_eq!(entry.crc32c, kbf_segments::crc32c(&chunk));
-}
-
-/// Asserts that outputs that do not fit the run's slots are refused (exit 12,
-/// `output-too-large`) before anything is written: nothing is created or renamed.
-#[test]
-fn outputs_that_do_not_fit_are_refused_before_anything_is_written() {
-    let dir = scratch("too-large");
-    let out = out_dir(&dir);
-    let (sink, store) = served(&out);
-    let small: [&[u8]; 4] = [b"one", b"two", b"three", b"four"];
-    let limits = Limits {
-        pack_records: 3,
-        packs: 1,
-        ..Limits::real()
-    };
-    let failure = sink
-        .store(&mut manifest(&small), &Blobs::from_bytes(&small), &limits)
-        .expect_err("too large");
-    let Failure::Pack(e) = &failure else {
-        panic!("{failure}")
-    };
-    assert_eq!(e.detail, OUTPUT_TOO_LARGE);
-    assert!(names(&out).is_empty());
-    assert!(store.renames.borrow().is_empty());
-}
-
-/// Asserts that a manifest the frontend would refuse (a lease that is not a build id) is
-/// refused before anything is written.
-#[test]
-fn a_manifest_that_would_be_refused_is_refused_before_anything_is_written() {
-    let dir = scratch("bad-manifest");
-    let out = out_dir(&dir);
-    let (sink, store) = served(&out);
-    let mut manifest = manifest(&[b"x"]);
-    manifest.lease = "not/a/build".to_owned();
-    let failure = sink
-        .store(&mut manifest, &Blobs::from_bytes(&[b"x"]), &Limits::real())
-        .expect_err("refused");
-    assert_eq!(failure.exit_code(), EXIT_PACK);
-    assert!(names(&out).is_empty());
-    assert!(store.renames.borrow().is_empty());
 }
 
 /// Asserts that `--out-dir` must be a directory when the task starts: a file and a missing path
@@ -809,34 +426,14 @@ fn the_out_dir_must_be_a_directory() {
     assert_eq!(OutDir::open(&link).expect("followed").path(), link);
 }
 
-/// Asserts the names of the slots and of their files, as the frontend mints them.
+/// Asserts the names of the object and of its files, as the frontend mints them.
 #[test]
-fn the_names_are_the_slots() {
-    assert_eq!(pack_name(0), "pack");
-    assert_eq!(pack_name(7), "pack7");
-    assert_eq!(large_name(0), "L0");
-    assert_eq!(part_name("L3"), "L3.part");
+fn the_names_are_the_objects() {
+    assert_eq!(OBJECT_NAME, "pack");
+    assert_eq!(part_name("pack"), "pack.part");
     let digest = sha256(b"x");
     assert_eq!(
         digest_part_name("pack", &digest),
         format!("pack.sha256-{}.part", hex::encode(digest.hash))
     );
-}
-
-/// Asserts how a layout refusal reads as a pack refusal: a cap passed is `output-too-large`, a
-/// pack of no record is `invalid-pack`, each with the layout's own text.
-#[test]
-fn a_layout_refusal_is_a_pack_refusal_with_its_detail() {
-    let cases = [
-        (LayoutError::NoRecords, INVALID_PACK),
-        (LayoutError::RecordTooLarge { size: 1 }, OUTPUT_TOO_LARGE),
-        (LayoutError::TooManyRecords { count: 1 }, OUTPUT_TOO_LARGE),
-        (LayoutError::TooLarge { len: 1 }, OUTPUT_TOO_LARGE),
-    ];
-    for (layout, detail) in cases {
-        let text = layout.to_string();
-        let pack = PackError::from(layout);
-        assert_eq!(pack.detail, detail);
-        assert_eq!(pack.to_string(), format!("{detail}: {text}"));
-    }
 }

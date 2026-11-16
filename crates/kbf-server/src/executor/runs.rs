@@ -77,6 +77,9 @@ pub(super) struct Waiting {
     /// Until when the `Start` may be acted on; `None` for one that names a heartbeat the
     /// worker did not send.
     deadline: Option<Instant>,
+    /// When the heartbeat the `Start` names was sent; `None` for one the worker did not send.
+    /// The drop warning gives its age.
+    beat: Option<Instant>,
     /// A share of a host, or the whole host for a `whole_machine` lease.
     booking: Booking,
     /// The job, kept from the first try: a read of the CAS, a url and a grant are not made
@@ -144,7 +147,41 @@ enum Submitted {
     /// The `Start`'s window ended while the task's submit was not answered, or as the job
     /// was prepared: dropped, as one that arrived late is, after the job that may exist is
     /// cancelled.
-    Late(Option<String>),
+    Late(Option<String>, Dropped),
+}
+
+/// Where a `Start` stood when its window ended, which the warning of its drop records: the
+/// drops of a farm differ in cause (a worker given more `Start`s than it prepares at once, a
+/// preparation slower than the window, a submit that waited), and the remedies differ too.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DroppedAt {
+    /// Its preparation never began: it waited for a place under `prepare_concurrency`.
+    NotBegun,
+    /// Its preparation was still running.
+    Preparing,
+    /// Its preparation ended, but not before the window did.
+    PreparedLate,
+    /// Its job was prepared and its submit sent, but not answered inside the window.
+    SubmitUnanswered,
+}
+
+impl DroppedAt {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::NotBegun => "not_begun",
+            Self::Preparing => "preparing",
+            Self::PreparedLate => "prepared_late",
+            Self::SubmitUnanswered => "submit_unanswered",
+        }
+    }
+}
+
+/// What the warning of a dropped `Start` records beyond the lease.
+struct Dropped {
+    stage: DroppedAt,
+    /// The age, in milliseconds, of the heartbeat the `Start` names when it was dropped, or
+    /// `none` for one the worker did not send.
+    beat_age_ms: String,
 }
 
 impl HostWorker {
@@ -155,8 +192,10 @@ impl HostWorker {
     pub(super) fn accept(&mut self, start: &Start) {
         let lease = start.lease_id.unwrap_or_default();
         let window = Duration::from_millis(start.valid_for_ms).min(START_VALIDITY);
+        let beat = self.sent_at(start.heartbeat_seq);
         let waiting = Waiting {
-            deadline: self.sent_at(start.heartbeat_seq).map(|sent| sent + window),
+            deadline: beat.map(|sent| sent + window),
+            beat,
             booking: Booking::of(start),
             prepared: None,
             sent: false,
@@ -238,7 +277,8 @@ impl HostWorker {
                 break;
             }
             let Some(deadline) = w.deadline.filter(|deadline| at < *deadline) else {
-                tracing::warn!(worker = %self.id, %lease, "a Start outside its window is dropped");
+                let Dropped { stage, beat_age_ms } = self.dropped(lease, &w, false, at);
+                tracing::warn!(worker = %self.id, %lease, stage = %stage.label(), %beat_age_ms, "a Start outside its window is dropped");
                 self.late(ctx, lease, w.sent_job());
                 continue;
             };
@@ -256,12 +296,35 @@ impl HostWorker {
                 Submitted::Settled(settled) => {
                     self.settle_with(lease, &settled, now, &ctx.deps.metrics);
                 }
-                Submitted::Late(job) => {
-                    tracing::warn!(worker = %self.id, %lease, "a Start ran out of its window before its job was submitted and is dropped");
+                Submitted::Late(job, Dropped { stage, beat_age_ms }) => {
+                    tracing::warn!(worker = %self.id, %lease, stage = %stage.label(), %beat_age_ms, "a Start ran out of its window before its job was submitted and is dropped");
                     self.late(ctx, lease, job);
                 }
             }
         }
+    }
+
+    /// Where `lease`'s `Start` stood at `at`, when its window ended: `ready` if its job had
+    /// just been prepared.
+    fn dropped(&self, lease: LeaseId, w: &Waiting, ready: bool, at: Instant) -> Dropped {
+        let preparing = self
+            .tasks
+            .get(&lease)
+            .is_some_and(|task| task.preparing.is_some());
+        let stage = if w.prepared.is_some() {
+            DroppedAt::SubmitUnanswered
+        } else if ready {
+            DroppedAt::PreparedLate
+        } else if preparing {
+            DroppedAt::Preparing
+        } else {
+            DroppedAt::NotBegun
+        };
+        let beat_age_ms = w.beat.map_or_else(
+            || "none".to_owned(),
+            |beat| at.saturating_duration_since(beat).as_millis().to_string(),
+        );
+        Dropped { stage, beat_age_ms }
     }
 
     /// How many of the worker's preparations are running now.
@@ -391,7 +454,8 @@ impl HostWorker {
         // is judged by the clock now, the last moment before the submit.
         let now = ctx.now();
         if now >= deadline {
-            return Submitted::Late(w.sent_job());
+            let dropped = self.dropped(lease, &w, true, now);
+            return Submitted::Late(w.sent_job(), dropped);
         }
         if w.sent {
             ctx.deps.metrics.job_resubmitted();

@@ -71,6 +71,7 @@ fn flags(out: TaskOut) -> JsAgentFlags {
         base_tree_keep: 1,
         base_tree_timeout: std::time::Duration::from_secs(60),
         published: Arc::default(),
+        put_retry: std::time::Duration::from_secs(60),
     }
 }
 

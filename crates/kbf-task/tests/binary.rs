@@ -29,10 +29,32 @@ fn the_version_names_the_commit_it_was_built_from() {
 }
 
 /// Catches: the binary's `main` not handing the parsed flags to the task and returning the
-/// task's exit code: a token file that does not exist is a setup failure, exit code 14, before
-/// anything is fetched or written.
+/// task's exit code: a put directory that does not exist is a setup failure, exit code 14, before
+/// anything is read or run.
 #[test]
-fn a_missing_credential_file_is_a_setup_failure_exit_code() {
+fn a_missing_put_directory_is_a_setup_failure_exit_code() {
+    let out = Command::new(env!("CARGO_BIN_EXE_kbf-task"))
+        .args([
+            "--tree=/nonexistent-root",
+            "--stage-and-commit",
+            "--out-dir=/nonexistent-out",
+            "--lease",
+            "lease-1",
+            "--action",
+            &format!("{}/0", "0".repeat(64)),
+        ])
+        .output()
+        .expect("kbf-task runs");
+    assert_eq!(out.status.code(), Some(14));
+    let text = String::from_utf8(out.stderr).expect("utf-8");
+    assert!(text.starts_with("kbf-task: "), "{text}");
+}
+
+/// Catches: the flags of the presigned mode of the releases before being taken for flags of this
+/// one: a frontend that still sends them is refused by the flag parser (exit code 2), and the
+/// Command never starts.
+#[test]
+fn the_flags_of_the_presigned_mode_are_refused_with_exit_code_2() {
     let out = Command::new(env!("CARGO_BIN_EXE_kbf-task"))
         .args([
             "--pack-url-file",
@@ -45,14 +67,10 @@ fn a_missing_credential_file_is_a_setup_failure_exit_code() {
             "lease-1",
             "--action",
             &format!("{}/0", "0".repeat(64)),
-            "--work-dir",
-            "/nonexistent-work",
         ])
         .output()
         .expect("kbf-task runs");
-    assert_eq!(out.status.code(), Some(14));
-    let text = String::from_utf8(out.stderr).expect("utf-8");
-    assert!(text.starts_with("kbf-task: "), "{text}");
+    assert_eq!(out.status.code(), Some(2));
 }
 
 /// Catches: `main` not handing its two hidden modes to the relay, or a mode reporting nothing:

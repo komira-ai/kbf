@@ -15,6 +15,7 @@
 //! refused is remembered ([`Spool::write_failure`]) so the run fails as a put (exit 13), not as
 //! an unreadable output.
 
+use std::collections::HashMap;
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex as StdMutex, PoisonError};
@@ -29,17 +30,17 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::digest;
 use crate::files;
-use crate::out_dir::{OutDirError, pack_name};
-use crate::outputs::{OutputLimits, Outputs, collect_spooled};
+use crate::out_dir::{OBJECT_NAME, OutDirError};
+use crate::outputs::{OutputLimits, collect_spooled};
 use crate::task::Failure;
 
-/// What `--stage-and-commit` writes (`--object-format`).
+/// What the task writes (`--object-format`): the one-pass object, always. The flag is still
+/// accepted, so that a frontend that sends it (every one since the one-pass object) and one that
+/// does not both work; the packs format it once chose between is gone.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum ObjectFormat {
-    /// Packs and large objects, planned from the digests: the format before one-pass.
-    #[default]
-    Packs,
     /// One object, written while the outputs are read.
+    #[default]
     OnePass,
 }
 
@@ -72,7 +73,7 @@ pub(crate) async fn collect(
     paths: (&Path, &str, &[String]),
     logs: (&Path, &Path),
     limits: OutputLimits,
-) -> Result<Outputs, Failure> {
+) -> Result<reapi::ActionResult, Failure> {
     let (root, working_directory, outputs) = paths;
     let collecting = collect_spooled(
         root,
@@ -85,7 +86,7 @@ pub(crate) async fn collect(
     );
     match (collecting.await, spool.write_failure()) {
         (Err(_), Some(source)) => Err(OutDirError::Write {
-            name: pack_name(0),
+            name: OBJECT_NAME.to_owned(),
             source,
         }
         .into()),
@@ -93,32 +94,23 @@ pub(crate) async fn collect(
     }
 }
 
-/// Reads `len` bytes at an offset of what the object's file holds so far.
-pub type Reader = Box<dyn Fn(u64, u64) -> io::Result<Vec<u8>> + Send + Sync>;
-
-/// A reader of a file that cannot be read back, for tests of what does not need it.
-#[cfg(test)]
-pub(crate) fn unreadable() -> Reader {
-    Box::new(|_, _| Err(io::Error::other("this test file is not read back")))
-}
-
 /// The object being written.
 pub struct Spool {
     writer: Arc<Mutex<Writer>>,
     failure: Remembered,
-    reader: Arc<Reader>,
+    trees: Arc<StdMutex<HashMap<Digest, Vec<u8>>>>,
 }
 
 impl Spool {
-    /// A spool writing to `file`, which is empty, and reading back what it wrote through
-    /// `reader` (the Trees of the output directories, for their files).
+    /// A spool writing to `file`, which is empty. The file is only written, never read back: a
+    /// put directory opens a staged file once, for the create that wrote it.
     #[must_use]
-    pub fn new(file: Box<dyn Write + Send>, reader: Reader) -> Arc<Self> {
+    pub fn new(file: Box<dyn Write + Send>) -> Arc<Self> {
         let sink = BufWriter::with_capacity(BUFFER_BYTES, file);
         Arc::new(Self {
             writer: Arc::new(Mutex::new(ObjectWriter::new(sink))),
             failure: Remembered::default(),
-            reader: Arc::new(reader),
+            trees: Arc::default(),
         })
     }
 
@@ -147,6 +139,15 @@ impl Spool {
         done.map_err(io::Error::other)?
     }
 
+    /// Keeps `bytes`, an output directory's Tree, for [`Spool::files`], which reads the Trees
+    /// from here and not from the object's file. The Tree is written to the object by
+    /// [`Spool::put`] as any blob is; this is the collector's own copy of a record it just made.
+    pub fn keep_tree(&self, bytes: &[u8]) {
+        let digest = kbf_segments::sha256(bytes);
+        let mut trees = self.trees.lock().unwrap_or_else(PoisonError::into_inner);
+        trees.entry(digest).or_insert_with(|| bytes.to_vec());
+    }
+
     /// The first digest `manifest` names that the object does not hold, if any. The empty blob is
     /// implicit and never named by `output_digests`.
     pub async fn missing(&self, manifest: &TaskManifest) -> Option<Digest> {
@@ -157,15 +158,15 @@ impl Spool {
     }
 
     /// The files of the output directories `manifest` names ([`crate::files`]): each Tree
-    /// is read back from the object (it is a small record the task wrote, not an output), and
-    /// each file's offset is where the object has it.
+    /// is the one [`Spool::keep_tree`] kept (the object's file is not read back), and each
+    /// file's offset is where the object has it.
     ///
     /// # Errors
-    /// A Tree that cannot be read or is not a tree of records of the object, or the file refused
+    /// A Tree that was not kept or is not a tree of records of the object, or the file refused
     /// the flush.
     pub async fn files(&self, manifest: &TaskManifest) -> io::Result<Vec<u8>> {
         let manifest = manifest.clone();
-        let (writer, reader) = (Arc::clone(&self.writer), Arc::clone(&self.reader));
+        let (writer, kept) = (Arc::clone(&self.writer), Arc::clone(&self.trees));
         let trees: Vec<(String, Digest)> = (manifest.output_directories.iter())
             .map(|dir| (dir.path.clone(), dir.tree))
             .collect();
@@ -175,10 +176,13 @@ impl Spool {
             writer.sink().flush().map_err(|e| record(&failure, e))?;
             let mut dirs = Vec::new();
             for (path, tree) in trees {
-                let at = writer
-                    .offset_of(&tree)
-                    .ok_or_else(|| io::Error::other(format!("the Tree {tree} is not a record")))?;
-                let bytes = reader(at, tree.size_bytes)?;
+                if writer.offset_of(&tree).is_none() {
+                    return Err(io::Error::other(format!("the Tree {tree} is not a record")));
+                }
+                let kept = kept.lock().unwrap_or_else(PoisonError::into_inner);
+                let bytes = kept
+                    .get(&tree)
+                    .ok_or_else(|| io::Error::other(format!("the Tree {tree} was not kept")))?;
                 dirs.push((
                     path,
                     reapi::Tree::decode(bytes.as_slice()).map_err(io::Error::other)?,

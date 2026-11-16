@@ -33,6 +33,10 @@ pub trait Store: Sync {
     /// it, so a walk holds that many open files, not the tree's.
     fn in_flight(&self) -> usize;
 
+    /// Told the bytes of an output directory's Tree just before [`Store::put`] stores them, for
+    /// a store that cannot read back what it wrote. The default keeps nothing.
+    fn keep_tree(&self, _bytes: &[u8]) {}
+
     /// Where the bytes of a file larger than [`CHUNK_BYTES`] go while they are read and
     /// hashed, if this store takes them so: the file is then read once, and
     /// [`Store::put_file`] is not called for it. `None` (the default) is the store that is

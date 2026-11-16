@@ -8,6 +8,9 @@ call `put-ca` (its 5.2), the tierstore write grants (5.2, 13), the loopback port
 passed-through tierstore port (3.4, 3.6, 8.3), and the Linux nodes keeping kbf's own storage (`kbf storage`, 7.1 and
 item 20); the top of that document says so. Section 11 lists the pieces that belong to tierstore and jobscheduler.
 
+Where a job's input tree is created on its host through tierstore's trees API, instead of manifests written to a store, is the design
+[trees-for-action-inputs.md](trees-for-action-inputs.md) (not built).
+
 Written against kbf `main` at `fa42f0fda`, jobscheduler `main` at `e7350fb5` (kbf's pin is `0c104a1d`, section 3),
 and tierstore `main` at `341792ce`. A path in parentheses is where a statement was checked; a path of another
 repository is named with that repository.

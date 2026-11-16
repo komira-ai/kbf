@@ -96,8 +96,11 @@ js-whole = { git = "https://github.com/komira-ai/jobscheduler", rev = "60b75be83
 # tierstore and objstore-s3 moved to the tierstore repository (https://github.com/komira-ai/tierstore).
 # Both are taken from it at this one revision. The revision is raised by a pull request of
 # its own that runs the whole CI, never along with other changes.
-objstore-s3 = { git = "https://github.com/komira-ai/tierstore", rev = "aa00f82099d20f61f7dde966776b30edd0278141" } # v0.3.91
-tierstore = { git = "https://github.com/komira-ai/tierstore", rev = "aa00f82099d20f61f7dde966776b30edd0278141" } # v0.3.91
+objstore-s3 = { git = "https://github.com/komira-ai/tierstore", rev = "309ad2d71b745f1827f9292976411e25e8b991e9" } # v0.3.111
+tierstore = { git = "https://github.com/komira-ai/tierstore", rev = "309ad2d71b745f1827f9292976411e25e8b991e9" } # v0.3.111
+# The trees API's wire contract (TreesService: its proto and generated stubs), at the same
+# revision; members take its `client` feature, and kbf-trees-client's fake the `server` one.
+tierstore-trees-api = { git = "https://github.com/komira-ai/tierstore", rev = "309ad2d71b745f1827f9292976411e25e8b991e9" } # v0.3.111
 md-5 = "0.11.0"
 # macOS only (kbf-mac-session): OpenDirectory, for the per-lease users.
 objc2 = "0.6.5"
@@ -271,6 +274,7 @@ kbf-storage = { path = "crates/kbf-storage" }
 kbf-store = { path = "crates/kbf-store" }
 kbf-task-pack = { path = "crates/kbf-task-pack" }
 kbf-tree-bundle = { path = "crates/kbf-tree-bundle" }
+kbf-trees-client = { path = "crates/kbf-trees-client" }
 kbf-testkit = { path = "crates/kbf-testkit" }
 kbf-threads = { path = "crates/kbf-threads" }
 kbf-oidc = { path = "crates/kbf-oidc" }
