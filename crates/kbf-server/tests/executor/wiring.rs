@@ -191,7 +191,12 @@ async fn an_action_runs_end_to_end_through_the_flags_and_the_frontends_own_seams
     ));
     let metrics = Arc::new(Metrics::default());
     let executor = js
-        .build(Arc::clone(&farm), Arc::new(front), Arc::clone(&metrics))
+        .build(
+            Arc::clone(&farm),
+            Arc::new(front),
+            Arc::clone(&metrics),
+            None,
+        )
         .expect("an executor");
     let running = Running::spawn(executor);
 

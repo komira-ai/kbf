@@ -3,9 +3,11 @@
 //!
 //! The executor is stepped every [`Executor::poll`], a pass run to its end. Before the first
 //! pass, and every [`Executor::rival_check`] after, it asks the job service whether another
-//! frontend has live jobs: the executor runs on exactly one frontend, and a second one stops,
-//! its jobs cancelled, and says so ([`Running::failed`]). On [`Running::stop`] the farm is told
-//! each worker takes no more work and every job is cancelled ([`Executor::shutdown`]).
+//! frontend has live jobs: with single ownership the executor runs on exactly one frontend, and
+//! a second one stops, its jobs cancelled, and says so ([`Running::failed`]); with shared
+//! ownership there is no rival, and nothing is asked. On [`Running::stop`] the farm is told each
+//! worker takes no more work and every job is cancelled, or, with shared ownership, each worker
+//! is handed back with its jobs running ([`Executor::shutdown`]).
 
 use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;

@@ -202,7 +202,24 @@ network line for it: nothing is made, so nothing is unusual.
 of `/run/js-files` and `/scratch` no longer exist for a job. Its confinement code (`crates/kbf-task/src/sandbox.rs`) is
 reached only by `kbf-task --probe-confinement`, which prints `probe sandbox:`.
 
-The executor runs on exactly one frontend: it looks for another frontend's live jobs on the job
+`--executor-ownership` says who owns the jobs: `single`, the default, is what the next paragraph
+describes, and `shared` lets several frontends of one `--executor-frontend-id` run beside each
+other over one `--state-store`. With `shared` the frontend starts only if `--state-store` is
+given. Each process names its workers `js:<frontend id>.<the first 8 characters of its
+instance>-<n>`, keeps a liveness row in the state store that `--executor-live-secs` (default
+45) lets live after its last renewal, and writes the row of a worker before the farm hears of
+it and the row of a job before it submits the job. The liveness time must be at least the fence
+time (40 s) plus 5 s, and a smaller one is refused at start; `single` does not read it. A
+`shared` frontend does not look for another frontend's jobs, does not cancel an earlier
+process's jobs at start, and when it fences or stops it cancels no job: a worker's row is
+deleted if it has no job row and otherwise left with no owner, and the liveness row is deleted.
+It cancels a job only when the farm cancels the lease or a withdrawal reaches it, the farm
+ending a worker's stream included; the row of such a job is deleted once its cancel is
+answered. This release
+writes the rows and does not yet read another process's rows, so no frontend takes over the
+jobs of one that has gone.
+
+The executor runs on exactly one frontend with `single`: it looks for another frontend's live jobs on the job
 service before its first pass and every 40 s after, and a frontend that finds some older than its
 own (or finds some before it has any) stops with an error naming it. Each job also carries the
 process that made it: a frontend that starts and finds live jobs of another process under its own

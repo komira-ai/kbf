@@ -22,7 +22,8 @@ pub(super) struct ExecutorParts {
 /// The executor `--executor js-agent` describes, over `farm`, with the metrics it counts into;
 /// none for `kbf-daemon`, which builds nothing and contacts no job service. The seams are the
 /// frontend's own: the ingest of the packs, the CAS `backend` over the same packs, and the
-/// `source` of the keys, writes and grants.
+/// `source` of the keys, writes and grants. The rows of `--executor-ownership shared` are kept
+/// in `store`, the frontend's state store.
 ///
 /// # Errors
 /// `--executor js-agent` without the packs or without a `source` (the frontend makes one from
@@ -31,22 +32,30 @@ pub(super) struct ExecutorParts {
 pub(super) fn executor_of(
     flags: &FrontendFlags,
     farm: &Arc<Farm>,
-    packs: Option<&Packs>,
+    packs: &Option<Packs>,
     backend: &Backend,
     source: Option<RunSource>,
     timeout: Duration,
+    store: Option<Arc<dyn kbf_state::Store>>,
 ) -> Result<Option<ExecutorParts>, Box<dyn Error>> {
     let Some(js) = &flags.executor.js else {
         return Ok(None);
     };
-    let packs = packs.ok_or("--executor js-agent needs --pack-store-endpoint")?;
+    let packs = packs
+        .as_ref()
+        .ok_or("--executor js-agent needs --pack-store-endpoint")?;
     let source = source.ok_or(
         "--executor js-agent: this frontend was started without the preparation of task runs \
          (the key mint and the put directory of each run): give --task-secret-file",
     )?;
     let front = js.front(packs.clone(), backend.clone(), source);
     let metrics = Arc::new(ExecutorMetrics::default());
-    let executor = js.build(Arc::clone(farm), Arc::new(front), Arc::clone(&metrics))?;
+    let executor = js.build(
+        Arc::clone(farm),
+        Arc::new(front),
+        Arc::clone(&metrics),
+        store,
+    )?;
     let probe: Arc<dyn crate::health::Probe> = Arc::new(executor.probe(timeout));
     Ok(Some(ExecutorParts {
         executor,

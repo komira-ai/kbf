@@ -242,6 +242,7 @@ impl Rig {
             presign: Arc::new(FakePresign),
             inputs: inputs.clone(),
             metrics: Arc::clone(metrics),
+            store: None,
         };
         Executor::new(cfg.clone(), deps).expect("a valid config")
     }

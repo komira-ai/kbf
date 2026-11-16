@@ -10,10 +10,12 @@
 //! (the rollback is the one flag). `--executor-insecure-argv-secrets` too: it is ignored with a
 //! warning, since nothing reads it there, and refusing it would make the rollback a second edit.
 //!
-//! The executor runs on exactly one frontend. There is no flag that says a frontend is one of
-//! several: any frontends that open the same state store are, so the executor itself looks for
+//! With `--executor-ownership single`, the default, the executor runs on exactly one frontend:
+//! any frontends that open the same state store are several, so the executor itself looks for
 //! another frontend's jobs on the job service and stops if it finds one
-//! ([`crate::executor::Running`]).
+//! ([`crate::executor::Running`]). With `--executor-ownership shared` any number of frontends
+//! of one `--executor-frontend-id` serve beside each other, each keeping the rows of its jobs in
+//! the `--state-store` ([`crate::executor::Ownership`]).
 //!
 //! The executor speaks to a job service only. The flags of the lease server it once leased
 //! hosts from (`--executor-lease-url`, `--executor-lease-token-file`,
@@ -41,7 +43,7 @@ use kbf_types::ImageRef;
 
 use crate::Farm;
 use crate::executor::{
-    Config, Delivery, Deps, Executor, ExecutorKind, Front, FrontParts, Metrics, Network,
+    Config, Delivery, Deps, Executor, ExecutorKind, Front, FrontParts, Metrics, Network, Ownership,
     PutDirParts, RunSource, TaskOut,
 };
 
@@ -80,6 +82,8 @@ const PREPARE_LIMIT: &str = "executor_prepare_limit_secs";
 const PREPARE_CONCURRENCY: &str = "executor_prepare_concurrency";
 const NETWORK: &str = "executor_network";
 const OPEN_NETWORK: &str = "executor_allow_open_network";
+const OWNERSHIP: &str = "executor_ownership";
+const LIVE: &str = "executor_live_secs";
 
 /// The virtual workers when `--executor-hosts` is left out. Clap takes the default as the
 /// literal in the flag; the default-flags test checks it against this number.
@@ -474,6 +478,30 @@ pub(super) fn args() -> Vec<Arg> {
              refused with any other `--executor-network`. Off by default. Used only with \
              `--executor js-agent`",
         ),
+        Arg::new(OWNERSHIP)
+            .long("executor-ownership")
+            .value_name("MODE")
+            .value_parser(["single", "shared"])
+            .default_value("single")
+            .help(
+                "Who owns the jobs. `single`, the default, runs the executor on exactly one \
+                 frontend per `--executor-frontend-id`: it stops if another frontend has jobs, \
+                 cancels at start the jobs an earlier process left, and cancels its jobs when it \
+                 ends. `shared` lets any number of frontends of one `--executor-frontend-id` \
+                 serve beside each other over one `--state-store`: each keeps the rows of its \
+                 jobs there, and cancels a job only when the farm withdraws it (a lease or the \
+                 worker's whole stream), never at start \
+                 or at its end. `shared` needs `--state-store`. \
+                 Used only with `--executor js-agent`",
+            ),
+        number(
+            LIVE,
+            "executor-live-secs",
+            "How long the liveness row of a frontend lives after its last renewal, on the state \
+             store's clock, with `--executor-ownership shared`: at least the fence time (40 s) \
+             and 5 s. Used only with `--executor js-agent`",
+            "45",
+        ),
     ]
 }
 
@@ -586,10 +614,10 @@ pub(super) fn from_matches(m: &ArgMatches) -> Result<ExecutorFlags, String> {
                 .to_owned(),
         );
     }
+    // The settings are judged together ([`Config::validate`]) once the flags beside these have
+    // set what follows from them, the outputs' put directory among them (`executor_bind`): a
+    // judgement here would see the default outputs, which shared ownership refuses.
     let js = js_agent_flags(m)?;
-    js.config
-        .validate()
-        .map_err(|e| format!("--executor js-agent: {e}"))?;
     // The network every action's command will have, logged at start: an open one, which the
     // operator asked for twice, as a warning.
     match js.config.network {
@@ -662,6 +690,11 @@ fn js_agent_flags(m: &ArgMatches) -> Result<JsAgentFlags, String> {
     config.prepare_concurrency = usize::try_from(count(PREPARE_CONCURRENCY)).unwrap_or(usize::MAX);
     config.network = network(m);
     config.allow_open_network = m.get_flag(OPEN_NETWORK);
+    config.ownership = match m.get_one::<String>(OWNERSHIP).map(String::as_str) {
+        Some("shared") => Ownership::Shared,
+        _ => Ownership::Single,
+    };
+    config.live = secs(LIVE);
     Ok(JsAgentFlags {
         config,
         job_url,
@@ -759,15 +792,17 @@ impl JsAgentFlags {
     }
 
     /// The executor these flags describe, over `farm` and the seams `front`, counting into
-    /// `metrics`. The job service is not contacted until it is stepped.
+    /// `metrics`, keeping the rows of `--executor-ownership shared` in `store`. The job service
+    /// is not contacted until it is stepped.
     ///
     /// # Errors
-    /// As [`JsAgentFlags::client`].
+    /// As [`JsAgentFlags::client`], and `--executor-ownership shared` with no `store`.
     pub fn build(
         &self,
         farm: Arc<Farm>,
         front: Arc<Front>,
         metrics: Arc<Metrics>,
+        store: Option<Arc<dyn kbf_state::Store>>,
     ) -> Result<Executor, Box<dyn Error>> {
         let deps = Deps {
             farm,
@@ -776,6 +811,7 @@ impl JsAgentFlags {
             presign: front.clone(),
             inputs: front,
             metrics,
+            store,
         };
         // The flags were checked when they were parsed.
         Ok(Executor::new(self.config.clone(), deps)?)

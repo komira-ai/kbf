@@ -17,9 +17,10 @@
 //! again finds its task and changes nothing. The job id ([`job_id`](super::job_id)) is the
 //! second: a submit whose answer was lost is sent again with the same id and the same job,
 //! which the task keeps, and the service answers from the job the first made. A process that
-//! restarts loses its tasks with its farm; the jobs it left are cancelled by the next one
-//! (`pool::adopt_jobs`), and a job built again under the same id would differ (a new key and
-//! url) and be refused as a conflict, never run twice.
+//! restarts loses its tasks with its farm; with single ownership the jobs it left are cancelled
+//! by the next one (`pool::adopt_jobs`), and with shared ownership they run on, each named by
+//! the `exec/` row written before its submit (`share.rs`). A job built again under the same id
+//! would differ (a new key and url) and be refused as a conflict, never run twice.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,6 +42,7 @@ use crate::executor::outcome::{
 };
 use crate::executor::output::{Grants, Output, Tail};
 use crate::executor::phases::{Mark, Timeline};
+use crate::executor::share::Rowed;
 use crate::executor::submit::{Booking, Prepared, prepare};
 use crate::executor::task::PackKey;
 use crate::executor::traits::{Ingested, UntrustedLimits};
@@ -57,6 +59,9 @@ pub(super) struct Task {
     /// The preparation of its job, while it runs on its own task. Dropped with the task, it is
     /// not stopped: see [`HostWorker::preparing`].
     preparing: Option<JoinHandle<Result<Arc<Prepared>, Settled>>>,
+    /// The id of the job whose `exec/` row was written, with shared ownership: the row is
+    /// deleted once nothing is owed for the lease.
+    pub(super) row: Option<String>,
 }
 
 pub(super) enum Stage {
@@ -148,6 +153,8 @@ enum Submitted {
     /// was prepared: dropped, as one that arrived late is, after the job that may exist is
     /// cancelled.
     Late(Option<String>, Dropped),
+    /// Another process holds the worker now (shared ownership): dropped, nothing submitted.
+    Lost,
 }
 
 /// Where a `Start` stood when its window ended, which the warning of its drop records: the
@@ -211,6 +218,7 @@ impl HostWorker {
                 timeline: Timeline::default(),
                 silence_seen: false,
                 preparing: None,
+                row: None,
             });
     }
 
@@ -232,8 +240,13 @@ impl HostWorker {
         self.drop_task(lease);
     }
 
+    /// Drops a task nothing is owed for any more: its row, if it has one, is deleted on the
+    /// pass's [`HostWorker::flush_rows`].
     fn drop_task(&mut self, lease: LeaseId) {
-        self.tasks.remove(&lease).iter().for_each(Task::abort);
+        if let Some(task) = self.tasks.remove(&lease) {
+            task.abort();
+            self.unrow.extend(task.row);
+        }
     }
 
     /// The leases a heartbeat lists: those running, and those whose result the farm has
@@ -296,6 +309,7 @@ impl HostWorker {
                 Submitted::Settled(settled) => {
                     self.settle_with(lease, &settled, now, &ctx.deps.metrics);
                 }
+                Submitted::Lost => self.drop_task(lease),
                 Submitted::Late(job, Dropped { stage, beat_age_ms }) => {
                     tracing::warn!(worker = %self.id, %lease, stage = %stage.label(), %beat_age_ms, "a Start ran out of its window before its job was submitted and is dropped");
                     self.late(ctx, lease, job);
@@ -457,6 +471,19 @@ impl HostWorker {
             let dropped = self.dropped(lease, &w, true, now);
             return Submitted::Late(w.sent_job(), dropped);
         }
+        // With shared ownership the row goes in before the job: a process that ends after the
+        // submit leaves a row that names the job.
+        let key = prepared.key.to_string();
+        match self.write_row(ctx, lease, action, &prepared.spec.job_id, &key) {
+            Rowed::Written => {}
+            Rowed::Retry => {
+                return Submitted::Wait(Waiting {
+                    prepared: Some(prepared),
+                    ..w
+                });
+            }
+            Rowed::Lost => return Submitted::Lost,
+        }
         if w.sent {
             ctx.deps.metrics.job_resubmitted();
         }
@@ -481,7 +508,9 @@ impl HostWorker {
                     })
                 }
                 Some(refusal) => {
-                    if refusal.twin {
+                    // A group shares the id with shared ownership: a job id taken is not
+                    // another process under this frontend's id.
+                    if refusal.twin && !ctx.cfg.shared() {
                         ctx.twin.flag(twin_message(&ctx.cfg.frontend));
                     }
                     Submitted::Settled(refusal.settled)
@@ -748,16 +777,19 @@ impl HostWorker {
 
     /// Cancels every job the worker may have, once each, as far as the service can be
     /// reached: a cancel that is not answered is not sent again, and its job runs to its
-    /// wall limit.
-    pub(super) async fn cancel_all(&self, ctx: &Ctx<'_>) {
+    /// wall limit. Returns the jobs whose cancel the service answered.
+    pub(super) async fn cancel_all(&self, ctx: &Ctx<'_>) -> Vec<String> {
         let jobs: Vec<String> = self.tasks.values().filter_map(Task::job).collect();
+        let mut answered = Vec::new();
         for job in jobs {
             let answer = ctx.api().cancel_job(&job).await;
             note("cancelling a job", &answer);
             if answer.is_ok() {
                 ctx.deps.metrics.job_cancelled();
+                answered.push(job);
             }
         }
+        answered
     }
 }
 

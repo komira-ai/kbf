@@ -68,6 +68,7 @@ async fn prepared(
         cfg: &harness.cfg,
         deps: &deps,
         twin: &harness.twin,
+        share: None,
     };
     prepare(&ctx.preparer(), LeaseId::new(7, 8), &action(), booking).await
 }
