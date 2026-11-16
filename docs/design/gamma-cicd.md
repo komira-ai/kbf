@@ -85,14 +85,14 @@ listed in order in section 4.
 
 | workflow | jobs | what it gates |
 |---|---|---|
-| `ci.yml` | `lint`, `test-shard`, `test` | the merge: formatting, clippy, the repository lints, `cargo deny`, the fast tests in shards, and 99% line and branch coverage per crate. It also runs `cargo xtask release main-control`, a lint of the release workflow's main-only rule, not a release run. Its `task-macos` runs after the merge and in the merge queue only. |
-| `macos-pr.yml` | `macos-test`, `macos-device` | every pull request and merge queue entry: the macOS crates' tests and every step of `beta.yml`'s `native-macos`, on `macos-15`. It holds the run's read-only token, no secret and no write scope, and publishes nothing. |
+| `ci.yml` | `lint`, `test-shard`, `test` | the merge: formatting, clippy, the repository lints, `cargo deny`, the fast tests in shards, and 99% line and branch coverage per crate. It also runs `cargo xtask release main-control`, a lint of the release workflow's main-only rule, not a release run. Every job runs on a Linux x86_64 hosted runner. |
 | `update-rehearsal.yml` | `rehearse`, `rehearse-agent`, `rehearse-tierstore` | a change to the helper, installer, coordinator, updater, OIDC or CA crates, to `deploy-farm` or `release farm-version`, to `packaging/host-agent/linux`, or to the workflow itself (path filter). It updates a host on a runner from the previous release. It holds the run's read-only token, no write scope and no secret, and publishes nothing. |
 | `host-install-linux.yml` | `real-linux` | a change to the helper or to `packaging/host-agent/linux` (path filter): the helper's unit and drop-in tests as root under real systemd. It holds `contents: read` only. The release does not need it. |
-| `artifacts.yml` | the build and sums jobs | only with the label `needs-artifacts`: a build check that attests nothing. |
 
-`beta.yml` and `smoke.yml` have no trigger of their own (`workflow_call` only), so a pull
-request never runs them. `update-rehearsal.yml` and `host-install-linux.yml` also run on a
+Every workflow that a pull request or a merge queue entry starts runs on Linux x86_64 hosted
+runners only (the workflow lint refuses any other runner there); the other platforms are the beta
+stage of the pipeline. `artifacts.yml`, `beta.yml` and `smoke.yml` have no trigger of their own
+(`workflow_call` only), so a pull request never runs them. `update-rehearsal.yml` and `host-install-linux.yml` also run on a
 push to `main` that touches their paths, and both can be started by hand
 (`workflow_dispatch`). They test; neither publishes, tags or holds a write scope, and no
 release waits for either.
@@ -100,7 +100,7 @@ release waits for either.
 ### 2.2 On a push to `main`: `pipeline.yml`
 
 The pipeline's jobs are `ci` (`ci.yml` again, on the merged commit), `beta` (`beta.yml`:
-the full test run with slow tests, Arm, Postgres, the object stores, crun, the Mac jobs,
+the full test run with slow tests, every platform but Linux x86_64 (Arm, and the Mac jobs `native-macos`, `host-install-mac`, `mac-provision` and `vmm-probe`), Postgres, the object stores, crun,
 the Linux packages, the cross-version and mixed-version cells, and `kbf-job-client` against
 the pinned jobscheduler release), `artifacts` (stage
 `build`: the seed build, plain `cargo build --locked --release` on GitHub-hosted runners),

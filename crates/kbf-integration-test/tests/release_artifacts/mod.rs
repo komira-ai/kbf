@@ -47,7 +47,7 @@
 //!   asset (`cargo xtask pkg-kbf-asset`, [`PACKAGES`]), and no other job does; no Linux job
 //!   packages `kbf-installer`. In that job `pkg-trust` and `pkg-kbf-asset` both take the
 //!   branch the package trusts and is attested for from the job's `PKG_SOURCE_REF`
-//!   ([`PKG_SOURCE_REF_EXPR`]: the pushed branch on a push), never a literal ref (a package
+//!   ([`PKG_SOURCE_REF_EXPR`]: the pushed branch), never a literal ref (a package
 //!   built on `main` that trusted another branch would have a host believe that branch's
 //!   releases); `pkg-install-test` and `pkg-upgrade-test` run before `pkg-kbf-asset`, and
 //!   `pkg-kbf-asset` checks the deb against the tarball `build-commit check-asset` already
@@ -133,7 +133,7 @@ pub const MAC_PACKAGE: &str = "darwin-arm64";
 /// expression it is set to: on a push the pushed branch (what the attest job signs for),
 /// on a pull request, which signs nothing, the branch it is aimed at.
 pub const PKG_SOURCE_REF: &str = "PKG_SOURCE_REF";
-pub const PKG_SOURCE_REF_EXPR: &str = "${{ github.event_name == 'pull_request' && format('refs/heads/{0}', github.base_ref) || github.ref }}";
+pub const PKG_SOURCE_REF_EXPR: &str = "${{ github.ref }}";
 
 /// The jobs that build on one platform, named by it, and the signing and verifying jobs.
 const BUILD_JOBS: &[&str] = &["darwin-arm64", "linux-x86_64", "linux-arm64"];
@@ -195,24 +195,7 @@ pub fn problems(workflow: &str) -> Result<Vec<String>, String> {
     base_tree::rules(workflow, &mut out)?;
     mac_package(workflow, &mut out)?;
     darwin(workflow, &mut out)?;
-    pull_request_gate(workflow, &mut out)?;
     Ok(out)
-}
-
-/// A pull request builds nothing unless it carries [`PR_LABEL`]: each build job's `if:`
-/// names the label, so an unlabelled pull request's run is skipped without a runner.
-const PR_LABEL: &str = "needs-artifacts";
-
-fn pull_request_gate(workflow: &str, out: &mut Vec<String>) -> Result<(), String> {
-    for job in BUILD_JOBS {
-        let condition = workflows::job_condition(workflow, job)?.unwrap_or_default();
-        if !condition.contains(&format!("labels.*.name, '{PR_LABEL}'")) {
-            out.push(format!(
-                "the build job `{job}` does not run on a pull request only with the label `{PR_LABEL}`: its `if:` is `{condition}`"
-            ));
-        }
-    }
-    Ok(())
 }
 
 /// The jobs of beta.yml that run on a Mac. A pull request never runs them (the macOS pool is
@@ -262,9 +245,14 @@ fn release_set(workflow: &str, out: &mut Vec<String>) -> Result<(), String> {
 
 fn signing(workflow: &str, out: &mut Vec<String>) -> Result<(), String> {
     let events = workflows::events(workflow)?;
-    for event in ["pull_request", "merge_group", "workflow_call"] {
-        if !events.iter().any(|e| e == event) {
-            out.push(format!("the workflow does not run on `{event}`"));
+    if !events.iter().any(|e| e == "workflow_call") {
+        out.push("the workflow does not run on `workflow_call`".to_owned());
+    }
+    for event in ["pull_request", "merge_group"] {
+        if events.iter().any(|e| e == event) {
+            out.push(format!(
+                "the workflow runs on `{event}`: its darwin-arm64 and linux-arm64 builds are platforms other than Linux x86_64, which run in the release pipeline only"
+            ));
         }
     }
     if events.iter().any(|e| e == "push") {
@@ -912,11 +900,11 @@ mod rules {
     /// A workflow of the shape the rules read, meeting every one.
     fn good() -> String {
         let mut w = String::from(
-            "on:\n  pull_request:\n  merge_group:\n  workflow_call:\npermissions: {}\nenv:\n  GH_SHA256_AARCH64_DARWIN: abababababababababababababababababababababababababababababababab\n  SYFT_SHA256_X86_64_LINUX: cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd\n  SYFT_SHA256_AARCH64_LINUX: efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef\njobs:\n",
+            "on:\n  workflow_call:\npermissions: {}\nenv:\n  GH_SHA256_AARCH64_DARWIN: abababababababababababababababababababababababababababababababab\n  SYFT_SHA256_X86_64_LINUX: cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd\n  SYFT_SHA256_AARCH64_LINUX: efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef\njobs:\n",
         );
         for job in BUILD_JOBS {
             w.push_str(&format!(
-                "  {job}:\n    if: ${{{{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, '{PR_LABEL}') }}}}\n    runs-on: ubuntu-24.04\n"
+                "  {job}:\n    if: ${{{{ inputs.stage != 'sign' }}}}\n    runs-on: ubuntu-24.04\n"
             ));
             if PACKAGES.contains(job) || *job == MAC_PACKAGE {
                 w.push_str(&format!(
@@ -1099,25 +1087,17 @@ mod rules {
     }
 
     #[test]
-    fn a_build_job_runs_on_a_pull_request_only_with_the_label() {
-        // Catches: a build job left without the label condition, so every pull request
-        // queues a runner for it (the load this gate removes).
-        let w = good();
-        let line = format!(
-            "    if: ${{{{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, '{PR_LABEL}') }}}}\n"
-        );
-        assert!(w.contains(&line), "the fixture's condition");
-        let parts: Vec<&str> = w.split(&line).collect();
-        assert_eq!(parts.len(), 4, "three build jobs");
-        for (k, job) in BUILD_JOBS.iter().enumerate() {
-            let mut planted = String::new();
-            for (i, part) in parts.iter().enumerate() {
-                planted.push_str(part);
-                if i < 3 && i != k {
-                    planted.push_str(&line);
-                }
-            }
-            names(&planted, &[&format!("the build job `{job}` does not run")]);
+    fn a_pull_request_or_merge_queue_trigger_is_refused() {
+        // Catches: artifacts.yml gaining `pull_request` or `merge_group` again, which would
+        // start the darwin-arm64 and linux-arm64 builds outside the release pipeline.
+        for event in ["pull_request", "merge_group"] {
+            names(
+                &broken(
+                    "  workflow_call:\n",
+                    &format!("  {event}:\n  workflow_call:\n"),
+                ),
+                &[&format!("the workflow runs on `{event}`")],
+            );
         }
     }
 
@@ -1170,10 +1150,6 @@ mod rules {
         names(
             &broken("  workflow_call:\n", ""),
             &["does not run on `workflow_call`"],
-        );
-        names(
-            &broken("  merge_group:\n", ""),
-            &["does not run on `merge_group`"],
         );
     }
 
@@ -1584,7 +1560,7 @@ mod rules {
             ],
         );
         for to in [
-            "${{ github.ref }}",
+            "${{ github.base_ref }}",
             "refs/heads/main",
             "${{ github.event_name == 'pull_request' && 'refs/heads/main' || github.ref }}",
         ] {

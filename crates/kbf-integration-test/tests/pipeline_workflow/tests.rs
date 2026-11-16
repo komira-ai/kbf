@@ -315,22 +315,22 @@ fn only_the_sign_stage_runs_the_signing_jobs_and_it_runs_nothing_else() {
     red(
         &plant(
             "artifacts.yml",
-            "  sums-linux:\n    needs: [linux-x86_64, linux-arm64]\n    if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'needs-artifacts')) && inputs.stage != 'sign' }}\n",
-            "  sums-linux:\n    needs: [linux-x86_64, linux-arm64]\n    if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'needs-artifacts') }}\n",
+            "  sums-linux:\n    needs: [linux-x86_64, linux-arm64]\n    if: ${{ inputs.stage != 'sign' }}\n",
+            "  sums-linux:\n    needs: [linux-x86_64, linux-arm64]\n    if: ${{ github.event_name != 'pull_request' }}\n",
         ),
         "the job `sums-linux` of artifacts.yml has `if:",
     );
     red(
         &plant(
             "artifacts.yml",
-            "  sums:\n    needs: [darwin-arm64, linux-x86_64, linux-arm64]\n    if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'needs-artifacts')) && inputs.stage != 'sign' }}\n",
+            "  sums:\n    needs: [darwin-arm64, linux-x86_64, linux-arm64]\n    if: ${{ inputs.stage != 'sign' }}\n",
             "  sums:\n    needs: [darwin-arm64, linux-x86_64, linux-arm64]\n",
         ),
         "the job `sums` of artifacts.yml has `if: (none)`",
     );
     // The exclusion must apply to the whole condition: an `||` beside it, or a group that closes
     // before the end, still lets the sign call run the job.
-    let good = "  sums:\n    needs: [darwin-arm64, linux-x86_64, linux-arm64]\n    if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'needs-artifacts')) && inputs.stage != 'sign' }}\n";
+    let good = "  sums:\n    needs: [darwin-arm64, linux-x86_64, linux-arm64]\n    if: ${{ inputs.stage != 'sign' }}\n";
     for loose in [
         "${{ github.event_name != 'pull_request' || inputs.stage != 'sign' }}",
         "${{ (github.event_name != 'pull_request') || (github.ref != '') && inputs.stage != 'sign' }}",
@@ -534,9 +534,9 @@ fn the_watch_cancels_the_run_from_its_last_step_alone_and_only_for_a_push_to_mai
 
 #[test]
 fn the_called_workflows_still_run_on_pull_requests() {
-    // Catches: the pull-request gate or the merge queue losing ci.yml or artifacts.yml when
-    // their push trigger moved into the pipeline, a called workflow that cannot be called,
-    // and beta (which tests a push to main's artifacts) gaining a pull-request trigger.
+    // Catches: the pull-request gate or the merge queue losing ci.yml when its push trigger moved
+    // into the pipeline, a called workflow that cannot be called, and artifacts.yml, beta.yml or
+    // smoke.yml (the platforms other than Linux x86_64 run in them) gaining a pull-request trigger.
     red(
         &plant("ci.yml", "  pull_request:\n", ""),
         "ci.yml does not run on `pull_request`",
@@ -548,14 +548,18 @@ fn the_called_workflows_still_run_on_pull_requests() {
     red(
         &plant(
             "artifacts.yml",
-            "  pull_request:\n    # `labeled`: adding `needs-artifacts` to an open pull request starts the build.\n    types: [opened, synchronize, reopened, labeled]\n",
-            "",
+            "\non:\n  workflow_call:\n",
+            "\non:\n  pull_request:\n  workflow_call:\n",
         ),
-        "artifacts.yml does not run on `pull_request`",
+        "artifacts.yml runs on `pull_request`",
     );
     red(
-        &plant("artifacts.yml", "  merge_group:\n", ""),
-        "artifacts.yml does not run on `merge_group`",
+        &plant(
+            "artifacts.yml",
+            "\non:\n  workflow_call:\n",
+            "\non:\n  merge_group:\n  workflow_call:\n",
+        ),
+        "artifacts.yml runs on `merge_group`",
     );
     for file in ["ci.yml", "artifacts.yml"] {
         red(

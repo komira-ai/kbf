@@ -52,10 +52,8 @@
 //!   pipeline cancelling a running predecessor or holding anything that releases, or the release
 //!   not following the pipeline's success in a group that never cancels (modules
 //!   `pipeline_workflow` and `release_workflow`);
-//! - a pull request taking a macOS runner outside the expected jobs or without their gate, a
-//!   pull request's macOS job holding a secret, an environment, an OIDC token or a write scope,
-//!   and `.github/workflows/macos-pr.yml` drifting from its shape (every pull request, no
-//!   condition) or from the steps of beta.yml's `native-macos` (module `macos_pr`);
+//! - a workflow that a pull request or a merge queue entry starts naming a runner that is not a
+//!   Linux x86_64 hosted one (module `workflows`; the other platforms are beta.yml's jobs);
 //! - the job table of docs/design/gamma-cicd.md naming a job `.github/workflows/release.yml`
 //!   does not have, or omitting one it has (module `gamma_cicd_doc`);
 //! - the beta smoke workflow's Buck2 pin and its actions' commits drifting from
@@ -90,7 +88,6 @@ mod gamma_cicd_doc;
 mod hostkeeper_desired;
 mod interpreters;
 mod kbf_spawns;
-mod macos_pr;
 mod pinned_debs;
 mod pipeline_workflow;
 mod release_artifacts;

@@ -1,8 +1,8 @@
 # Real output of the tools the Mac install reads
 
 Each file is the unedited output of a tool on a GitHub-hosted macOS runner (macOS 15.7, arm64),
-captured by `tests/real_mac.rs` in the `host-install-mac` workflow
-(`.github/workflows/host-install-mac.yml`) and downloaded from the run's artifact
+captured by `tests/real_mac.rs` in the `host-install-mac` job of `.github/workflows/beta.yml`
+(formerly the workflow `host-install-mac.yml`) and downloaded from the run's artifact
 `host-install-mac-raw-output`. The first run to capture all of them is
 https://github.com/komira-ai/kbf/actions/runs/39952603959. The throwaway job labels carry the
 test process's id (`com.example.kbf-real-mac-test.<scenario>.<pid>`); nothing else was changed.

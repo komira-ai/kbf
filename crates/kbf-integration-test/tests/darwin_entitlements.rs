@@ -411,8 +411,8 @@ fn only_kbf_vmm_depends_on_the_virtualization_bindings_and_its_workflow_signs_it
         }
     }
     assert_eq!(users, ["kbf-vmm"]);
-    let wf = std::fs::read_to_string(repo_root().join(".github/workflows/vmm-probe.yml"))
-        .expect("workflow");
+    let wf =
+        std::fs::read_to_string(repo_root().join(".github/workflows/beta.yml")).expect("workflow");
     assert!(wf.contains(r#"cargo xtask sign-darwin "target/$TARGET/release/kbf-vmm""#));
     assert!(wf.contains("upload-artifact"));
 }

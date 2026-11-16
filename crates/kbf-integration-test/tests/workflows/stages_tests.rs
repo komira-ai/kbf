@@ -110,6 +110,30 @@ fn a_pull_request_trigger_on_the_release_workflow_is_refused() {
 }
 
 #[test]
+fn a_pull_request_or_merge_queue_trigger_on_the_platform_stages_is_refused() {
+    // Catches: beta.yml (the stage that tests every platform but Linux x86_64) or artifacts.yml
+    // (which builds the darwin-arm64 and linux-arm64 files) gaining `pull_request` or
+    // `merge_group`, which no stage allows for them: the other platforms are tested after the
+    // merge, in the pipeline, never on a pull request. Control: the real text.
+    let (stages, workflows) = real();
+    for file in ["beta.yml", "artifacts.yml"] {
+        for event in ["pull_request", "merge_group"] {
+            let bad = planted(&workflows, file, |t| {
+                t.replacen(
+                    "on:\n  workflow_call:",
+                    &format!("on:\n  {event}:\n  workflow_call:"),
+                    1,
+                )
+            });
+            refused(
+                &check(&stages, &bad),
+                &format!("{file}: the trigger `{event}` is allowed by no stage"),
+            );
+        }
+    }
+}
+
+#[test]
 fn id_token_in_a_non_signing_job_is_refused() {
     // Catches: a push-only job that is not an attest job gaining `id-token: write`
     // (here verify-linux, also in a stage workflow), and the same in a workflow the

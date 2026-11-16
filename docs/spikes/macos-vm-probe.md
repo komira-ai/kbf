@@ -12,14 +12,14 @@ exit code.
 
 ## Getting the binary
 
-The `vmm-probe` workflow builds `kbf-vmm` and `kbf-guest` for darwin-arm64 from a commit,
+The `vmm-probe` job of `beta.yml` (run by the pipeline of every push to `main`) builds `kbf-vmm` and `kbf-guest` for darwin-arm64 from a commit,
 signs both with `cargo xtask sign-darwin` (ad hoc, hardened runtime; `kbf-vmm` alone gets
 `com.apple.security.virtualization`, from `tools/ci/darwin-entitlements.txt`), and keeps
 them as the artifact `vmm-probe-darwin-arm64` for 30 days. It is not attested; check the
 SHA-256 in the job summary.
 
 ```sh
-RUN=$(gh run list -R komira-ai/kbf --workflow vmm-probe.yml --branch <branch> --limit 1 --json databaseId -q '.[0].databaseId')
+RUN=$(gh run list -R komira-ai/kbf --workflow pipeline.yml --branch main --limit 1 --json databaseId -q '.[0].databaseId')
 gh run download "$RUN" -R komira-ai/kbf -n vmm-probe-darwin-arm64 -D vmm
 shasum -a 256 vmm/*.tar.gz            # compare with the job summary
 tar -xzf vmm/kbf-vmm-*.tar.gz -C vmm && tar -xzf vmm/kbf-guest-*.tar.gz -C vmm
