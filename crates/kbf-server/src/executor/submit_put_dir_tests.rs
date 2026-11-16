@@ -11,8 +11,7 @@ use super::{Booking, FRONTEND_LABEL, INSTANCE_LABEL, Settled, job_id, prepare};
 use crate::executor::test_support::{GIB, Harness};
 use crate::executor::traits::InputsError;
 use crate::executor::{
-    ActionFacts, Ctx, Deps, Inputs, OUT_TARGET, OutFormat, PutDirRoots, ReadGrant, TASK_IN_TREE,
-    TaskOut,
+    ActionFacts, Ctx, Deps, Inputs, OUT_TARGET, PutDirRoots, ReadGrant, TASK_IN_TREE, TaskOut,
 };
 
 const TREE: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
@@ -58,19 +57,8 @@ async fn prepared(
     inputs: Option<Arc<dyn Inputs>>,
     booking: Booking,
 ) -> Result<Arc<super::Prepared>, Settled> {
-    prepared_for(inputs, booking, OutFormat::Packs).await
-}
-
-/// [`prepared`] for a task told to write `format`.
-async fn prepared_for(
-    inputs: Option<Arc<dyn Inputs>>,
-    booking: Booking,
-    format: OutFormat,
-) -> Result<Arc<super::Prepared>, Settled> {
     let mut harness = Harness::new().await;
-    let roots = PutDirRoots::new("/mnt/ts/put")
-        .expect("roots")
-        .with_format(format);
+    let roots = PutDirRoots::new("/mnt/ts/put").expect("roots");
     harness.cfg.task_out = TaskOut::PutDir(roots);
     let deps = Deps {
         inputs: inputs.unwrap_or_else(|| Arc::clone(&harness.deps.inputs)),
@@ -112,33 +100,18 @@ async fn a_put_dir_job_is_the_tree_the_tool_and_the_dir_at_out() {
     assert!(spec.files.is_empty() && spec.ports.is_empty() && spec.host_ports.is_empty());
     assert!(spec.env.is_empty());
     let deadline = Duration::from_secs(20).as_millis().to_string();
-    let want = crate::executor::task::put_dir_argv(
-        &action(),
-        LeaseId::new(7, 8),
-        Duration::from_secs(20),
-        OutFormat::Packs,
-    );
+    let want =
+        crate::executor::task::put_dir_argv(&action(), LeaseId::new(7, 8), Duration::from_secs(20));
     assert_eq!(spec.args, want);
-    assert!(!spec.args.iter().any(|arg| arg == "--object-format"));
+    assert_eq!(
+        spec.args[spec.args.len() - 2..],
+        ["--object-format", "one-pass"]
+    );
     assert!(spec.args.contains(&deadline));
     assert_eq!(spec.wall_limit_seconds, Some(20 + 300));
     assert_eq!(spec.labels[FRONTEND_LABEL], "front");
     assert!(spec.labels.contains_key(INSTANCE_LABEL));
     assert_eq!(spec.needs.as_ref().map(|n| n.whole_host), Some(false));
-}
-
-/// Asserts that a frontend set to `one-pass` tells the task of its jobs to write one object, as
-/// the job's last two words, and that the rest of the job is the same.
-#[tokio::test(start_paused = true)]
-async fn a_one_pass_frontend_tells_its_tasks_to_write_one_object() {
-    let packs = prepared(Some(Arc::new(Treed)), SHARE).await.expect("packs");
-    let one = prepared_for(Some(Arc::new(Treed)), SHARE, OutFormat::OnePass)
-        .await
-        .expect("one pass");
-    let words = packs.spec.args.len();
-    assert_eq!(one.spec.args[..words], packs.spec.args[..]);
-    assert_eq!(one.spec.args[words..], ["--object-format", "one-pass"]);
-    assert_eq!(one.spec.mounts, packs.spec.mounts);
 }
 
 /// Asserts that a whole-machine lease is refused as the caller's before a key is minted: the

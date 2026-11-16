@@ -72,9 +72,7 @@ pub use front::{
     RunSource,
 };
 pub use metrics::Metrics;
-pub use out::{
-    MAX_ROOT_BYTES, OUT_TARGET, OutFormat, PutDirRoots, RootError, TASK_IN_TREE, TaskOut,
-};
+pub use out::{MAX_ROOT_BYTES, OUT_TARGET, PutDirRoots, RootError, TASK_IN_TREE, TaskOut};
 pub use submit::job_id;
 pub use task::{Delivery, PackKey, Secret, TaskArgs, build_id};
 pub use traits::{

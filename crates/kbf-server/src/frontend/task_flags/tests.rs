@@ -559,55 +559,40 @@ fn the_output_mode_is_presigned_or_a_put_dir_under_its_root() {
     );
 }
 
-/// Asserts `--task-out-format`: `one-pass` by default and when given, `packs` reaching the roots
-/// of the put-directory setting both ways the flags make it (with the presigned flags and
-/// without), a value that is neither refused, and any format ignored with the presigned mode.
+/// Asserts `--task-out-format`: `one-pass` is the one value, given or not, in a put-directory
+/// setting both ways the flags make it (with the presigned flags and without); `packs`, the
+/// value of the releases before, is refused; and the format is ignored with the presigned mode.
 #[test]
-fn the_out_format_is_one_pass_unless_packs_is_asked_for() {
-    let put_dir = |more: &[&str]| {
+fn the_out_format_is_one_pass_and_packs_is_refused() {
+    for more in [&[][..], &["--task-out-format=one-pass"]] {
         let mut flags = PUT_DIR_ONLY.to_vec();
         flags.extend_from_slice(more);
-        parsed(&flags)
-            .expect("parses")
-            .put_dir
-            .expect("put-dir")
-            .roots
-    };
-    assert_eq!(put_dir(&[]).format(), OutFormat::OnePass);
-    assert_eq!(
-        put_dir(&["--task-out-format=packs"]).format(),
-        OutFormat::Packs
-    );
-    assert_eq!(
-        put_dir(&["--task-out-format=one-pass"]).format(),
-        OutFormat::OnePass
-    );
+        assert!(
+            parsed(&flags).expect("parses").put_dir.is_some(),
+            "{more:?}"
+        );
 
-    let task = |more: &[&str]| {
         let mut flags = TASK.to_vec();
         flags.extend_from_slice(&["--task-out-mode=put-dir", "--task-out-root=/mnt/ts/put"]);
         flags.extend_from_slice(more);
-        match parsed(&flags)
+        let out = parsed(&flags)
             .expect("parses")
             .task
             .expect("task flags")
-            .out
-        {
-            TaskOut::PutDir(roots) => roots.format(),
-            TaskOut::Presigned => panic!("a put directory was asked for"),
-        }
-    };
-    assert_eq!(task(&[]), OutFormat::OnePass);
-    assert_eq!(task(&["--task-out-format=packs"]), OutFormat::Packs);
-    assert_eq!(task(&["--task-out-format=one-pass"]), OutFormat::OnePass);
+            .out;
+        assert!(matches!(out, TaskOut::PutDir(_)), "{more:?}");
+    }
 
-    // The presigned mode has no put directory to write: the format is ignored there, whatever
-    // it says, so the default and a config file naming it do not stop a presigned frontend.
-    for more in [
-        &[][..],
-        &["--task-out-format=packs"],
-        &["--task-out-format=one-pass"],
-    ] {
+    let mut flags = PUT_DIR_ONLY.to_vec();
+    flags.push("--task-out-format=packs");
+    assert_eq!(
+        parsed(&flags).expect_err("packs is gone").kind(),
+        ErrorKind::InvalidValue
+    );
+
+    // The presigned mode has no put directory to write: the format is ignored there, so the
+    // default and a config file naming it do not stop a presigned frontend.
+    for more in [&[][..], &["--task-out-format=one-pass"]] {
         let mut flags = TASK.to_vec();
         flags.extend_from_slice(more);
         let out = parsed(&flags)

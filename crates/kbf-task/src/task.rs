@@ -165,12 +165,11 @@ pub struct Cli {
         conflicts_with_all = ["pack_url_file", "pack_url", "put_urls_file", "put_urls"]
     )]
     pub out_dir: Option<PathBuf>,
-    /// The shape of what `--stage-and-commit` writes: `packs` (the default, as when the flag is
-    /// left out) the pack and large objects planned from the digests, or `one-pass` the single
-    /// object `pack` written while the outputs are read, its manifest and index at the end
-    /// (`crate::spool`, docs/design/one-pass-task-object.md). The frontend that reads the
-    /// objects must know the one-pass format before a task is told to write it. Refused with the
-    /// URL flags, one of which a run without `--stage-and-commit` must give.
+    /// The shape of what `--stage-and-commit` writes: `one-pass`, the single object `pack`
+    /// written while the outputs are read, its manifest and index at the end (`crate::spool`,
+    /// docs/design/one-pass-task-object.md). It is the only shape, with or without the flag,
+    /// which is accepted so that a frontend may send it. Refused with the URL flags, one of which
+    /// a run without `--stage-and-commit` must give.
     #[arg(
         long,
         value_enum,

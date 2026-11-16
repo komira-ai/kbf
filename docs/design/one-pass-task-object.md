@@ -214,17 +214,18 @@ the first read that hashes it. Nothing about that changes.
 Additive: a new object kind under the same key, a new flag, no field of any shipped format changes.
 
 - **Reader first.** The frontend reads both formats from the release that adds this. It does not need telling which.
-- **Writer gated by the frontend.** `--task-out-format` (config key `task-out-format`) is `one-pass` (default, once
-  this was rolled out) or `packs` (deprecated, removed in a later release). Only when it is `one-pass` does the executor add
-  `--object-format one-pass` to the task's arguments; with `packs` the arguments are byte for byte the old ones, so an
-  old `kbf-task` never sees a flag it does not know.
-- **Rollout.** (1) Ship the release to every frontend and the base tree that holds `kbf-task`. (2) When every frontend and
-  every task image is that release, set `task-out-format = "one-pass"` and restart the frontends (from the release that makes it the default this is
-  the default and the key only pins it). Rollback: set it back to `packs`; objects already written stay readable by the new frontend, and a frontend rolled back to a release before
-  this one refuses a one-pass object, so roll the config back before the binary.
+- **Writer gated by the frontend.** `--task-out-format` (config key `task-out-format`) was `packs` before the
+  one-pass release and `one-pass` after it (default); the packs writer is now removed. The key is still accepted with its
+  one value, so a config that pins `one-pass` starts, and the executor still adds `--object-format one-pass` to the
+  task's arguments, which `kbf-task` still accepts (it has no other format), so a frontend of the release before and one
+  of this release both work with this task. A config that sets `packs` is refused at start.
+- **Rollout.** (1) Ship the release to every frontend and the base tree that holds `kbf-task`. (2) The default is
+  `one-pass` since that release; the packs writer was removed one release after it. Rollback: roll the config back
+  before the binary; objects already written stay readable by the new frontend, and a frontend rolled back to a release
+  before the one-pass object refuses a one-pass object. The ingest still reads packs and large objects (a run of the old
+  task in flight, stored objects), so no data refused.
 - **The test** that runs the previous release on new data and the reverse: `one_pass_and_packs_ingest_side_by_side` (frontend
-  reads an old pack and a one-pass object in the same farm) and the task test `without_the_one_pass_format_the_pack_is_the_one_of_before`, which with no flag reads the pack the
-  previous writer wrote.
+  reads an old pack and a one-pass object in the same farm).
 
 ## 7. Failure modes
 

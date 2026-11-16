@@ -82,12 +82,13 @@
 //! # The put directory
 //!
 //! With `--stage-and-commit` (a tree job only) step 5 stores nothing over the network and reads
-//! no URL: the packs and large objects are streamed as files into `--out-dir` (`/out` by
-//! default), never held whole, and each is committed by two renames, `<name>.part` to
-//! `<name>.sha256-<hex>.part` and that to `<name>`, the large objects first and `pack`, which
-//! holds the manifest, last ([`out_dir`]). The manifest then also carries the phase timings
-//! `walk_ms`, `hash_ms`, `write_ms` and `commit_ms`. The exit code is 0 only when every commit
+//! no URL: the run's one object, `pack`, is streamed as a file into `--out-dir` (`/out` by
+//! default) while the outputs are read, never held whole, and committed by two renames,
+//! `pack.part` to `pack.sha256-<hex>.part` and that to `pack` ([`out_dir`]; the object's format is
+//! in [`spool`] and docs/design/one-pass-task-object.md). The exit code is 0 only when the commit
 //! `rename` returned 0, whatever the Command's own exit code; a failed write or commit is exit 13.
+//! The packs and large objects a put-directory run wrote before the one-pass object are no longer
+//! written; the frontend still reads them.
 //!
 //! `js-agent` returns nothing but an exit code, so the manifest travels inside the pack, and the exit
 //! code says only whether the farm did its part: 0 when the action ran and its pack was stored

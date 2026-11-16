@@ -19,8 +19,6 @@ use js_proto::v1::JobFile;
 use kbf_proto::reapi::Digest;
 use kbf_types::LeaseId;
 
-use crate::executor::OutFormat;
-
 /// A value that must not reach a log or an error: a presigned url, a bearer token.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Secret(String);
@@ -179,18 +177,13 @@ impl TaskArgs<'_> {
 /// The flags of the task tool for the run of `action` on `lease` that commits into a put
 /// directory: the inputs are the tree at `/` (`--tree`), the outputs are committed into
 /// [`OUT_TARGET`](crate::executor::OUT_TARGET) (`--stage-and-commit`, `--out-dir`), and the action
-/// may run for `deadline`. With [`OutFormat::OnePass`] the task is also told to write one object
-/// (`--object-format one-pass`); with [`OutFormat::Packs`] the words are those of the releases
-/// before the flag, so a task that does not know it never sees it. No url, no grant and no
-/// secret: the job has no network.
+/// may run for `deadline`. The task is also told to write one object (`--object-format one-pass`),
+/// the only format it writes: a task of a release that still has two formats needs the words, and
+/// one that has only this one accepts them. No url, no grant and no secret: the job has no
+/// network.
 #[must_use]
-pub fn put_dir_argv(
-    action: &Digest,
-    lease: LeaseId,
-    deadline: Duration,
-    format: OutFormat,
-) -> Vec<String> {
-    let mut argv = vec![
+pub fn put_dir_argv(action: &Digest, lease: LeaseId, deadline: Duration) -> Vec<String> {
+    vec![
         "--tree".to_owned(),
         "--stage-and-commit".to_owned(),
         "--out-dir".to_owned(),
@@ -201,11 +194,9 @@ pub fn put_dir_argv(
         build_id(lease),
         "--deadline-ms".to_owned(),
         deadline.as_millis().to_string(),
-    ];
-    if format == OutFormat::OnePass {
-        argv.extend(["--object-format".to_owned(), "one-pass".to_owned()]);
-    }
-    argv
+        "--object-format".to_owned(),
+        "one-pass".to_owned(),
+    ]
 }
 
 impl TaskArgs<'_> {

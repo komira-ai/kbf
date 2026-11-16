@@ -1,69 +1,42 @@
-//! The put directory (`--stage-and-commit`): the run's packs and large objects are written as
-//! files into `--out-dir` and committed by `rename`, instead of PUT to presigned URLs.
+//! The put directory (`--stage-and-commit`): the run's one object is written as a file into
+//! `--out-dir` and committed by `rename`, instead of PUT to presigned URLs.
 //!
 //! In a job the directory is a mount of tierstore's put directory: a file written there and
 //! renamed to a name without `.part` becomes an object under the key prefix the frontend chose,
 //! and the `rename` returns only once the store has it. kbf-task does not know the key or the
-//! store; it knows the names, which are the run's slots: pack 0 is `pack`, pack `s` is
-//! `pack<s>` and large object `i` is `L<i>`.
+//! store; it knows the name, `pack`.
 //!
-//! [`OutDir::store`] runs in these phases, each timed into the manifest's `timing`
-//! ([`kbf_task_pack::Timing`]):
+//! [`OutDir::object`] creates `pack.part`, new (`O_EXCL`), and returns the [`ObjectRun`] the
+//! outputs are written through as they are collected, read once, in one pass (the object's format
+//! is in [`crate::spool`], and in docs/design/one-pass-task-object.md). [`ObjectRun::finish`] ends
+//! it with the manifest and commits it: the file is renamed to `pack.sha256-<hex>.part`, which
+//! tells the store the digest to expect, and then committed by renaming that to `pack`.
 //!
-//! 1. walk (`walk_ms`): the outputs were already walked and hashed when they were collected
-//!    ([`crate::task::collected`]); this is that time.
-//! 2. hash (`hash_ms`): the blobs are placed in slots ([`crate::place::place`]) and each pack is
-//!    laid out from its blobs' digests alone ([`PackLayout::plan_digests`]): no output is read.
-//!    Pack 0 is laid out with the manifest as wide as it can be written, so every cap and every
-//!    rule of the manifest is checked here, before a byte is written: a run that would be refused
-//!    fails (exit 12) with the directory untouched.
-//! 3. write (`write_ms`): each large object, then packs `N-1` down to 1, is written as
-//!    `<name>.part`, created new (`O_EXCL`), sequentially, a large object from the file it was
-//!    recorded from and a pack by [`PackLayout::write_to`]. Each output is read once here, and
-//!    that one read is checked against its digest, gives each record's CRC-32C for the footer and
-//!    the object's SHA-256; a blob whose bytes are no longer its digest's fails the run (exit 12,
-//!    `output-changed`).
-//! 4. commit (`commit_ms`): each of them, in the same order, is renamed to
-//!    `<name>.sha256-<hex>.part`, which tells the store the digest to expect, and then committed
-//!    by renaming that to `<name>`.
-//!
-//! Then the manifest is written with those times (and `pack_ms`, the four together), and pack 0,
-//! the manifest its first record, is written and committed the same way, last. So pack 0's own
-//! write and commit are in no timing, and pack 0 exists only once every other object does.
-//!
-//! The run's exit code is 0 only when every commit `rename` returned 0 (the Command's own exit
+//! The run's exit code is 0 only when the commit `rename` returned 0 (the Command's own exit
 //! code is in the manifest). A commit that fails with `EBUSY` (the store still sees the file
 //! open), `EIO` (the store did not take it before its deadline) or `EINTR` is tried again, up to
 //! [`COMMIT_ATTEMPTS`] times in all, after the pauses of [`PAUSES`]; any other answer, or the last
 //! attempt's, fails the run (exit 13) with the errno and what the store means by it (`EEXIST`:
 //! the key holds other bytes; `EBADMSG`: the bytes are not the digest's; `EFBIG`: too large for
-//! the store). A file that cannot be created or written is exit 13 too. Once a run fails, every
-//! `.part` file it made and did not commit is removed; an object it committed stays, an orphan
-//! no pack 0 names.
+//! the store). A file that cannot be created or written is exit 13 too. Once a run fails, its
+//! `.part` file is removed.
 //!
 //! The file is not synced and its close is not checked: the commit `rename` is the only point
 //! the store acts on, and it refuses bytes that are not the digest the name gives.
 
 use std::fs::OpenOptions;
-use std::io::{self, BufWriter, Read, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use std::sync::Arc;
 
-use kbf_task_pack::{LayoutWriteError, PackLayout, TaskManifest};
+use kbf_task_pack::TaskManifest;
 use kbf_types::Digest;
 
-use crate::digest;
-use crate::outputs::Blobs;
 use crate::pack::{MAX_LARGE_BYTES, PackError};
-use crate::place::{manifest_reserve, place};
-use crate::plan::Limits;
 use crate::spool::Spool;
-use crate::task::{Failure, millis};
-
-/// The bytes read from a blob, and buffered for the file, at one time.
-const COPY_BYTES: usize = 1 << 20;
+use crate::task::Failure;
 
 /// The pauses before the second and later attempts of a commit `rename`.
 pub(crate) const PAUSES: [Duration; 3] = [
@@ -75,21 +48,8 @@ pub(crate) const PAUSES: [Duration; 3] = [
 /// The most attempts of one commit `rename`.
 pub(crate) const COMMIT_ATTEMPTS: usize = PAUSES.len() + 1;
 
-/// The name of pack `slot`: `pack` for pack 0, which holds the manifest, `pack<slot>` for the
-/// others.
-#[must_use]
-pub(crate) fn pack_name(slot: usize) -> String {
-    match slot {
-        0 => "pack".to_owned(),
-        _ => format!("pack{slot}"),
-    }
-}
-
-/// The name of large object `slot`: `L<slot>`.
-#[must_use]
-pub(crate) fn large_name(slot: usize) -> String {
-    format!("L{slot}")
-}
+/// The name of the run's one object.
+pub(crate) const OBJECT_NAME: &str = "pack";
 
 /// The name an object is written under: `<name>.part`.
 #[must_use]
@@ -263,10 +223,10 @@ impl OutDir {
     /// [`OutDirError::Create`] (exit 13).
     pub fn object(&self) -> Result<ObjectRun<'_>, Failure> {
         let mut stage = Stage::new(self);
-        let name = pack_name(0);
-        let part = self.dir.join(part_name(&name));
+        let name = OBJECT_NAME;
+        let part = self.dir.join(part_name(name));
         let file = (self.create)(&part).map_err(|source| OutDirError::Create {
-            name: name.clone(),
+            name: name.to_owned(),
             source,
         })?;
         let read = part.clone();
@@ -278,76 +238,6 @@ impl OutDir {
                 Box::new(move |offset, len| read_at(&read, offset, len)),
             ),
         })
-    }
-
-    /// Places `blobs` into the slots `limits` allows, writes and commits every large object and
-    /// pack, pack 0 last, and sets the manifest's `packs`, `large` and phase timings, as the
-    /// module documentation says. `manifest.timing.pack_ms` is, on entry, the time the outputs
-    /// took to collect.
-    ///
-    /// # Errors
-    /// A [`Failure`]: a pack refusal (exit 12) before anything is written, a blob that changed
-    /// (exit 12), or an [`OutDirError`] (exit 13). Every `.part` file written and not committed
-    /// is removed.
-    pub fn store(
-        &self,
-        manifest: &mut TaskManifest,
-        blobs: &Blobs,
-        limits: &Limits,
-    ) -> Result<(), Failure> {
-        let started = Instant::now();
-        let walk_ms = manifest.timing.pack_ms;
-
-        // Hash: everything that can refuse the run, before a byte is written.
-        let reserve = manifest_reserve(&widest(manifest), limits)?;
-        let planned = place(manifest, blobs, reserve, limits)?;
-        let widest_json = widest(manifest)
-            .to_json_with(MAX_LARGE_BYTES)
-            .map_err(PackError::from)?;
-        layout(&widest_json, &planned.packs[0])?;
-        let extra = (planned.packs[1..].iter())
-            .map(|digests| PackLayout::plan_digests(digests).map_err(PackError::from))
-            .collect::<Result<Vec<_>, _>>()?;
-        let hash_ms = millis(started.elapsed());
-
-        // Write: the large objects, then packs N-1 down to 1.
-        let writing = Instant::now();
-        let mut stage = Stage::new(self);
-        let mut written = Vec::new();
-        for (slot, digest) in planned.large.iter().enumerate() {
-            let name = large_name(slot);
-            stage.large(&name, blobs, digest)?;
-            written.push((name, *digest));
-        }
-        for (slot, pack) in extra.iter().enumerate().rev() {
-            let name = pack_name(slot + 1);
-            let digest = stage.pack(&name, pack, blobs, None)?;
-            written.push((name, digest));
-        }
-        let write_ms = millis(writing.elapsed());
-
-        // Commit, in the same order.
-        let committing = Instant::now();
-        for (name, digest) in &written {
-            stage.commit(name, digest)?;
-        }
-        let commit_ms = millis(committing.elapsed());
-
-        let timing = &mut manifest.timing;
-        timing.walk_ms = Some(walk_ms);
-        timing.hash_ms = Some(hash_ms);
-        timing.write_ms = Some(write_ms);
-        timing.commit_ms = Some(commit_ms);
-        timing.pack_ms = walk_ms.saturating_add(millis(started.elapsed()));
-
-        // Pack 0 last: the manifest, then its blobs.
-        let json = manifest
-            .to_json_with(MAX_LARGE_BYTES)
-            .map_err(PackError::from)?;
-        let pack_0 = layout(&json, &planned.packs[0])?;
-        let name = pack_name(0);
-        let digest = stage.pack(&name, &pack_0, blobs, Some(&json))?;
-        stage.commit(&name, &digest)
     }
 }
 
@@ -374,12 +264,12 @@ impl ObjectRun<'_> {
     /// (exit 13). The `.part` file is removed.
     pub async fn finish(self, manifest: &mut TaskManifest) -> Result<(), Failure> {
         let Self { mut stage, spool } = self;
-        let name = pack_name(0);
+        let name = OBJECT_NAME;
         if let Some(digest) = spool.missing(manifest).await {
             return Err(PackError::missing(&digest).into());
         }
         manifest.timing.walk_ms = Some(manifest.timing.pack_ms);
-        let files = spool.files(manifest).await.map_err(write_error(&name))?;
+        let files = spool.files(manifest).await.map_err(write_error(name))?;
         let json = manifest
             .to_json_with(MAX_LARGE_BYTES)
             .map_err(PackError::from)?;
@@ -387,8 +277,8 @@ impl ObjectRun<'_> {
         let written = ended
             .map_err(io::Error::other)
             .and_then(|done| done)
-            .map_err(write_error(&name))?;
-        stage.commit(&name, &written.object)
+            .map_err(write_error(name))?;
+        stage.commit(name, &written.object)
     }
 }
 
@@ -398,27 +288,6 @@ fn read_at(path: &Path, offset: u64, len: u64) -> io::Result<Vec<u8>> {
     let mut bytes = vec![0; usize::try_from(len).map_err(io::Error::other)?];
     std::fs::File::open(path)?.read_exact_at(&mut bytes, offset)?;
     Ok(bytes)
-}
-
-/// `manifest` with every timing at the widest it can be written (`i64::MAX`), so its JSON is
-/// at least as long as the manifest's with any times this run measures.
-fn widest(manifest: &TaskManifest) -> TaskManifest {
-    let most = i64::MAX.unsigned_abs();
-    let mut widest = manifest.clone();
-    widest.timing.pack_ms = most;
-    widest.timing.walk_ms = Some(most);
-    widest.timing.hash_ms = Some(most);
-    widest.timing.write_ms = Some(most);
-    widest.timing.commit_ms = Some(most);
-    widest
-}
-
-/// The layout of pack 0: the manifest `json` as its first record, then the blobs of `digests`.
-fn layout(json: &[u8], digests: &[Digest]) -> Result<PackLayout, PackError> {
-    let records: Vec<Digest> = std::iter::once(kbf_segments::sha256(json))
-        .chain(digests.iter().copied())
-        .collect();
-    Ok(PackLayout::plan_digests(&records)?)
 }
 
 /// The `.part` files of one run that are not committed yet; they are removed when it is
@@ -434,58 +303,6 @@ impl<'a> Stage<'a> {
             out,
             parts: Vec::new(),
         }
-    }
-
-    /// Creates `<name>.part`, new, and records it, for the caller to write.
-    fn create(&mut self, name: &str) -> Result<BufWriter<Box<dyn Write>>, OutDirError> {
-        let path = self.out.dir.join(part_name(name));
-        let file = (self.out.create)(&path).map_err(|source| OutDirError::Create {
-            name: name.to_owned(),
-            source,
-        })?;
-        self.parts.push(path);
-        Ok(BufWriter::with_capacity(COPY_BYTES, file))
-    }
-
-    /// Writes the recorded blob `digest` as large object `name`, streamed from where it was
-    /// recorded, and checks its bytes are the digest's. A read of the blob that fails is a
-    /// failed write, as a large object's is on the presigned path.
-    fn large(&mut self, name: &str, blobs: &Blobs, digest: &Digest) -> Result<(), Failure> {
-        let mut file = self.create(name)?;
-        let blob = digest::to_reapi(digest);
-        let mut reader = blobs.reader(&blob)?;
-        let len = io::copy(&mut reader, &mut file).map_err(write_error(name))?;
-        file.flush().map_err(write_error(name))?;
-        if len != digest.size_bytes || !reader.matches(&blob) {
-            return Err(PackError::changed(digest).into());
-        }
-        Ok(())
-    }
-
-    /// Writes the pack `layout` as `name`: each record from the recorded blob of its digest, or,
-    /// for the manifest's record, from `manifest`. Returns the digest of the whole pack.
-    fn pack(
-        &mut self,
-        name: &str,
-        layout: &PackLayout,
-        blobs: &Blobs,
-        manifest: Option<&[u8]>,
-    ) -> Result<Digest, Failure> {
-        let mut file = self.create(name)?;
-        let manifest = manifest.map(|json| (kbf_segments::sha256(json), json));
-        let written = layout.write_to(&mut file, |digest| -> io::Result<Box<dyn Read + '_>> {
-            match manifest {
-                Some((record, json)) if record == *digest => Ok(Box::new(json)),
-                _ => Ok(Box::new(blobs.reader(&digest::to_reapi(digest))?)),
-            }
-        });
-        let digest = written.map_err(|e| match e {
-            LayoutWriteError::Changed { digest } => Failure::from(PackError::changed(&digest)),
-            e @ LayoutWriteError::Source { .. } => Failure::Read(io::Error::other(e)),
-            LayoutWriteError::Sink(source) => write_error(name)(source).into(),
-        })?;
-        file.flush().map_err(write_error(name))?;
-        Ok(digest)
     }
 
     /// Renames `<name>.part` to the name of `digest`, then commits it as `name`, trying a commit

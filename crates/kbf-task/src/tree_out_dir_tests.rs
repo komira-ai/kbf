@@ -1,8 +1,6 @@
 //! A tree job with `--stage-and-commit`: the flags, the whole run into a plain directory as the
 //! put directory, and the exit code.
 
-use kbf_task_pack::read_manifest_with;
-
 use super::*;
 use crate::out_dir::OutDir;
 use crate::pack::MAX_LARGE_BYTES;
@@ -40,9 +38,9 @@ fn names(dir: &Path) -> Vec<String> {
 }
 
 /// Asserts the whole run through the binary's entry point: the Command runs over the tree, the
-/// task exits 0, and the put directory holds `pack` alone, whose manifest names the Command's
-/// output and its exit code, says the inputs came from the tree, and carries the four phase
-/// timings (present; their values are not asserted).
+/// task exits 0, and the put directory holds `pack` alone, one object whose manifest names the
+/// Command's output and its exit code, says the inputs came from the tree, and carries the
+/// walk time (the hash, write and commit times are not measured: one pass has no phases).
 #[tokio::test]
 async fn a_tree_job_commits_pack_into_the_put_directory_and_exits_0() {
     let (dir, digest) = copy_tree("out-dir-e2e");
@@ -52,25 +50,25 @@ async fn a_tree_job_commits_pack_into_the_put_directory_and_exits_0() {
         ExitCode::SUCCESS
     );
     assert_eq!(names(&out), ["pack"]);
-    let pack = std::fs::read(out.join("pack")).expect("pack");
-    let manifest = read_manifest_with(&pack, MAX_LARGE_BYTES).expect("read");
+    let object = std::fs::read(out.join("pack")).expect("pack");
+    let (manifest, entries) = read_one_pass(&object);
     assert_eq!(manifest.action, digest);
     assert_eq!(manifest.exit_code, 0);
     assert_eq!(manifest.output_files[0].path, "out");
     assert_eq!(manifest.output_files[0].digest, sha256(b"hi\n"));
     assert_eq!(manifest.inputs, Some(input_stats()));
     let timing = manifest.timing;
-    let phases = [
-        timing.walk_ms,
-        timing.hash_ms,
-        timing.write_ms,
-        timing.commit_ms,
-    ];
-    assert!(phases.iter().all(Option::is_some), "{timing:?}");
-    let reader = kbf_segments::SegmentReader::open(&pack).expect("segment");
+    assert_eq!(timing.walk_ms, Some(timing.pack_ms), "{timing:?}");
     assert_eq!(
-        reader.get(&sha256(b"hi\n")).expect("get"),
-        Some(&b"hi\n"[..])
+        (timing.hash_ms, timing.write_ms, timing.commit_ms),
+        (None, None, None)
+    );
+    let entry = (entries.iter())
+        .find(|e| e.digest == sha256(b"hi\n"))
+        .expect("the output's record");
+    assert_eq!(
+        &object[entry.range().start as usize..entry.range().end as usize],
+        b"hi\n"
     );
 }
 
@@ -78,7 +76,7 @@ async fn a_tree_job_commits_pack_into_the_put_directory_and_exits_0() {
 /// still a run whose pack was committed, so the task exits 0 and the Command's code and its
 /// standard error are in the manifest.
 #[tokio::test]
-async fn a_failing_command_whose_pack_is_committed_exits_0_with_its_code_in_the_manifest() {
+async fn a_failing_command_whose_object_is_committed_exits_0_with_its_code_in_the_manifest() {
     let dir = scratch("out-dir-failing");
     let command = command(&["dd", "if=missing", "of=out", "status=none"], "", &["out"]);
     let digest = lay_out(&dir, &action_of(&command), &command);
@@ -87,8 +85,8 @@ async fn a_failing_command_whose_pack_is_committed_exits_0_with_its_code_in_the_
         main_with(&out_cli(&dir, &digest, &out)).await,
         ExitCode::SUCCESS
     );
-    let pack = std::fs::read(out.join("pack")).expect("pack");
-    let manifest = read_manifest_with(&pack, MAX_LARGE_BYTES).expect("read");
+    let object = std::fs::read(out.join("pack")).expect("pack");
+    let (manifest, _) = read_one_pass(&object);
     assert_eq!(manifest.exit_code, 1);
     assert!(manifest.stderr.is_some());
     assert!(manifest.output_files.is_empty());
@@ -287,29 +285,27 @@ async fn a_one_pass_run_commits_one_object_with_the_manifest_and_index_at_the_en
     );
 }
 
-/// Asserts that the default, and `--object-format packs`, still write the pack of before: the
-/// segment whose record 0 is the manifest.
+/// Asserts that with no `--object-format` the object is the one-pass object, the same as with
+/// `--object-format=one-pass`: a trailer, a manifest and an index at its end.
 #[tokio::test]
-async fn without_the_one_pass_format_the_pack_is_the_one_of_before() {
-    for (name, extra) in [("default", None), ("packs", Some("--object-format=packs"))] {
-        let (dir, digest) = copy_tree(&format!("one-pass-off-{name}"));
+async fn without_the_object_format_flag_the_object_is_the_one_pass_object() {
+    for (name, with_flag) in [("default", false), ("flag", true)] {
+        let (dir, digest) = copy_tree(&format!("one-pass-default-{name}"));
         let out = put_dir(&dir);
-        let cli = match extra {
-            None => out_cli(&dir, &digest, &out),
-            Some(extra) => {
-                let flag = out_flags(&out);
-                flags(&dir, &digest, &[&flag[0], &flag[1], extra]).expect("flags")
-            }
+        let cli = if with_flag {
+            one_pass_cli(&dir, &digest, &out)
+        } else {
+            out_cli(&dir, &digest, &out)
         };
         assert_eq!(main_with(&cli).await, ExitCode::SUCCESS);
-        let pack = std::fs::read(out.join("pack")).expect("pack");
-        let manifest = read_manifest_with(&pack, MAX_LARGE_BYTES).expect("a segment pack");
+        let object = std::fs::read(out.join("pack")).expect("pack");
+        let (manifest, _) = read_one_pass(&object);
         assert_eq!(manifest.output_files[0].digest, sha256(b"hi\n"), "{name}");
     }
 }
 
-/// Asserts that `--object-format` is refused without `--stage-and-commit`, and that its values
-/// are the two formats.
+/// Asserts that `--object-format` is refused without `--stage-and-commit`, and that `one-pass`
+/// is its only value: `packs`, which an earlier release took, is refused like any other.
 #[test]
 fn the_object_format_flag_needs_the_put_directory() {
     let action = format!("--action={}/12", "ab".repeat(32));
@@ -319,7 +315,7 @@ fn the_object_format_flag_needs_the_put_directory() {
     let error = Cli::try_parse_from(args).err().expect("refused");
     assert_eq!(error.kind(), ClapKind::ArgumentConflict);
     let mut args = base.to_vec();
-    args.extend(["--stage-and-commit", "--object-format=tar"]);
+    args.extend(["--stage-and-commit", "--object-format=packs"]);
     let error = Cli::try_parse_from(args).err().expect("refused");
     assert_eq!(error.kind(), ClapKind::InvalidValue);
 }

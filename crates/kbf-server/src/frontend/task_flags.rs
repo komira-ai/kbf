@@ -49,7 +49,7 @@ use kbf_front::prepare_run::{
 use kbf_front::{Backend, MintError, PackKeyMint};
 use zeroize::Zeroizing;
 
-use crate::executor::{OutFormat, PutDirRoots, TaskOut};
+use crate::executor::{PutDirRoots, TaskOut};
 use crate::token::{TokenFileError, read_owner_only};
 
 const SECRET: &str = "task_secret_file";
@@ -74,7 +74,6 @@ const MAX_OBJECT_MANIFEST: &str = "task_max_object_manifest_bytes";
 const OBJECT_PER_ENTRY: &str = "task_object_bytes_per_entry";
 const ONE_PASS: &str = "one-pass";
 const PRESIGNED: &str = "presigned";
-const PACKS: &str = "packs";
 const PUT_DIR: &str = "put-dir";
 const PUT_FLAG: &str = "--task-put-credentials-file";
 const LARGE_FLAG: &str = "--task-large-credentials-file";
@@ -342,18 +341,17 @@ pub(super) fn args() -> [Arg; 20] {
         Arg::new(OUT_FORMAT)
             .long("task-out-format")
             .value_name("FORMAT")
-            .value_parser([PACKS, ONE_PASS])
+            .value_parser([ONE_PASS])
             .default_value(ONE_PASS)
             .help(
-                "With `--task-out-mode put-dir`: what the task writes. `one-pass`, the \
-                 default: one object per action, written while the outputs are read, its \
-                 manifest and index at the end (docs/design/one-pass-task-object.md). \
-                 `packs`: packs and large objects planned from the digests, as every release \
-                 before the one-pass object does; deprecated, and removed in a later release. \
-                 This frontend reads both. A task image of a release before the one-pass \
-                 object refuses the flag this sends, so every frontend and every task image \
-                 must be this release or later, or set `packs`. Ignored with `--task-out-mode \
-                 presigned`, which writes no put directory",
+                "With `--task-out-mode put-dir`: what the task writes. `one-pass`, the only \
+                 value and the default: one object per action, written while the outputs are \
+                 read, its manifest and index at the end \
+                 (docs/design/one-pass-task-object.md). The flag is still accepted so that a \
+                 configuration that names it starts; the `packs` value of the releases before is \
+                 gone, and this frontend still reads the packs those wrote. Every task image \
+                 must be this release or later. Ignored with `--task-out-mode presigned`, \
+                 which writes no put directory",
             ),
     ]
 }
@@ -554,9 +552,7 @@ pub(super) fn put_dir_from_matches(m: &ArgMatches) -> Result<Option<PutDirFlags>
     let digests = m.get_one::<u32>(MAX_DIGESTS).copied().unwrap_or_default();
     Ok(Some(PutDirFlags {
         secret_file: secret_file.clone(),
-        roots: PutDirRoots::new(root)
-            .map(|roots| roots.with_format(format_of(m)))
-            .map_err(|error| format!("--task-out-root: {error}"))?,
+        roots: PutDirRoots::new(root).map_err(|error| format!("--task-out-root: {error}"))?,
         url_slack: Duration::from_secs(m.get_one::<u64>(URL_SLACK).copied().unwrap_or_default()),
         max_digests: usize::try_from(digests).unwrap_or(usize::MAX),
         max_object_entries: entries_of(m),
@@ -609,7 +605,7 @@ fn out_of(m: &ArgMatches) -> Result<TaskOut, String> {
     // clap gives `put-dir` its root (`requires_if`): with no root the mode is `presigned`.
     match root {
         Some(root) if put_dir => PutDirRoots::new(root)
-            .map(|roots| TaskOut::PutDir(roots.with_format(format_of(m))))
+            .map(TaskOut::PutDir)
             .map_err(|error| format!("--task-out-root: {error}")),
         Some(_) => Err(
             "--task-out-root is only for --task-out-mode put-dir: drop it, or give the mode"
@@ -626,14 +622,6 @@ fn entries_of(m: &ArgMatches) -> usize {
         .copied()
         .unwrap_or_default();
     usize::try_from(entries).unwrap_or(usize::MAX)
-}
-
-/// What `--task-out-format` says.
-fn format_of(m: &ArgMatches) -> OutFormat {
-    match m.get_one::<String>(OUT_FORMAT).map(String::as_str) {
-        Some(PACKS) => OutFormat::Packs,
-        _ => OutFormat::OnePass,
-    }
 }
 
 /// Why the runs cannot be prepared. No message carries a secret.
