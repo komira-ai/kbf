@@ -223,15 +223,13 @@ impl Engine {
             return;
         }
         let mut refused = Vec::new();
-        for samples in rows {
-            if let Err(error) = durable.add_samples(samples) {
-                // A newer writer holds the store: nothing more is written, nor kept.
-                if durable.superseded_by(&error) {
-                    return;
-                }
-                tracing::warn!(%error, "size summaries were not written");
-                refused.push(samples.clone());
+        if let Err((from, error)) = durable.add_samples(rows) {
+            // A newer writer holds the store: nothing more is written, nor kept.
+            if durable.superseded_by(&error) {
+                return;
             }
+            tracing::warn!(%error, "size summaries were not written");
+            refused.extend_from_slice(&rows[from..]);
         }
         a.estimates_refused(&refused);
     }
