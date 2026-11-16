@@ -34,7 +34,6 @@ clap.workspace = true
 # `kbf-cell cross-version`'s probe stream (a Hello of its own, as a fake daemon sends it).
 futures.workspace = true
 kbf-unitfile.workspace = true
-kbf-daemon.workspace = true
 # The tests under `tests/` that call into the installer library: `package_trust` (settings,
 # layout, archive) and `package_installer_verbs` (cli, layout, setup plan).
 kbf-installer.workspace = true

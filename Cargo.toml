@@ -196,16 +196,12 @@ zeroize = "1.9.1"
 zip = { version = "9.0.1", default-features = false, features = ["deflate-flate2"] }
 
 kbf-alert = { path = "crates/kbf-alert" }
-kbf-storage-and-daemon = { path = "crates/kbf-storage-and-daemon" }
 kbf-auth = { path = "crates/kbf-auth" }
 kbf-ca = { path = "crates/kbf-ca" }
 kbf-caps = { path = "crates/kbf-caps" }
 kbf-cas-conformance = { path = "crates/kbf-cas-conformance" }
 kbf-cli = { path = "crates/kbf-cli" }
-kbf-daemon = { path = "crates/kbf-daemon" }
 kbf-deploy = { path = "crates/kbf-deploy" }
-kbf-driver-container = { path = "crates/kbf-driver-container" }
-kbf-driver-native = { path = "crates/kbf-driver-native" }
 kbf-enroll-registry = { path = "crates/kbf-enroll-registry" }
 kbf-enroll = { path = "crates/kbf-enroll" }
 kbf-estimator = { path = "crates/kbf-estimator" }
@@ -223,7 +219,6 @@ kbf-log = { path = "crates/kbf-log" }
 kbf-map = { path = "crates/kbf-map" }
 kbf-mapsync = { path = "crates/kbf-mapsync" }
 kbf-meta = { path = "crates/kbf-meta" }
-kbf-node = { path = "crates/kbf-node" }
 kbf-objstore = { path = "crates/kbf-objstore" }
 kbf-outputs = { path = "crates/kbf-outputs" }
 kbf-pack = { path = "crates/kbf-pack" }

@@ -16,16 +16,6 @@ publish.workspace = true
 name = "kbf"
 path = "src/main.rs"
 
-# The container driver's stand-in `crun`, which runs each action as a plain process,
-# for tests/all_in_one.rs, tests/storage_and_daemon.rs and tests/rehearsal_in_a_box.rs:
-# the program the driver's own tests run, built here because a test can run only its own
-# package's binaries, under a name of its own so a workspace build does not write two
-# binaries to one path. Not shipped.
-[[bin]]
-name = "kbf-cli-fake-crun"
-path = "../kbf-driver-container/tests/bin/fake_crun.rs"
-test = false
-
 # A program that exits at once, in place of `kbf`, for tests/beta_b0.rs (a farm that cannot
 # start). Not shipped.
 [[bin]]
@@ -35,8 +25,6 @@ test = false
 
 [dependencies]
 clap.workspace = true
-kbf-storage-and-daemon.workspace = true
-kbf-node.workspace = true
 kbf-server.workspace = true
 # The startup self-checks (src/preflight): the role a certificate names, and a
 # certificate's chain, extended key usage and names, read as the farm's issuer made them.
@@ -89,7 +77,6 @@ kbf-storage.workspace = true
 kbf-transfer.workspace = true
 # The protocol the daemon half speaks, which `kbf --version --json` reports as the
 # server's (src/tests.rs pins them equal).
-kbf-daemon.workspace = true
 # tests/installer_reads_version.rs: the installer parses what this binary prints.
 kbf-installer.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
@@ -128,7 +115,6 @@ kbf-front.workspace = true
 # The container driver builds on Linux only, and so does the one test that reads its
 # image store layout.
 [target.'cfg(target_os = "linux")'.dev-dependencies]
-kbf-driver-container.workspace = true
 # The farm of real `kbf` processes the rehearsal (tests/rehearsal_in_a_box.rs) drives, and
 # the stand-in `podman`'s store (tests/support, through kbf-storage-and-daemon's node.rs).
 kbf-harness.workspace = true
