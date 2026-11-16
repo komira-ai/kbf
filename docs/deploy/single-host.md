@@ -86,8 +86,10 @@ image tag as a job ([containers.md](containers.md#the-frontend)).
   file store takes an exclusive lock on `LOCK` in that directory when it opens
   (`crates/kbf-objstore/src/fs_store.rs:294-304`), so a second frontend pointed at the same
   directory never opens it while the first runs: it waits for the lock, logging every attempt,
-  with no deadline (`crates/kbf-server/src/history/lock_wait.rs`), and does not serve. Give each frontend its own directory, or an object store that
-  several processes may share.
+  with no deadline (`crates/kbf-server/src/history/lock_wait.rs`), and does not serve. Give each frontend its own directory, or one `s3://`
+  store for all of them, as
+  [frontends-behind-a-load-balancer.md](frontends-behind-a-load-balancer.md#what-the-frontends-share)
+  describes.
 - **65532-owned copies of the certificates, keys and the operator token** that `kbf.toml`
   names. The operator token (`api-token-file`) is also what the update drain presents. A token
   file must be owned by the server's user and be mode 0600 or 0400

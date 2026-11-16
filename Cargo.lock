@@ -2906,6 +2906,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-trees-client"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "hex",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "kbf-trees-client",
+ "prost",
+ "rcgen",
+ "rustls",
+ "sha2 0.11.0",
+ "thiserror",
+ "tierstore-trees-api",
+ "tokio",
+ "tokio-rustls",
+ "tonic",
+ "tonic-prost",
+]
+
+[[package]]
 name = "kbf-types"
 version = "0.1.0"
 dependencies = [
@@ -3493,7 +3516,7 @@ dependencies = [
 [[package]]
 name = "objstore-s3"
 version = "0.1.0"
-source = "git+https://github.com/komira-ai/tierstore?rev=aa00f82099d20f61f7dde966776b30edd0278141#aa00f82099d20f61f7dde966776b30edd0278141"
+source = "git+https://github.com/komira-ai/tierstore?rev=309ad2d71b745f1827f9292976411e25e8b991e9#309ad2d71b745f1827f9292976411e25e8b991e9"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -4635,7 +4658,7 @@ dependencies = [
 [[package]]
 name = "tierstore"
 version = "0.3.0"
-source = "git+https://github.com/komira-ai/tierstore?rev=aa00f82099d20f61f7dde966776b30edd0278141#aa00f82099d20f61f7dde966776b30edd0278141"
+source = "git+https://github.com/komira-ai/tierstore?rev=309ad2d71b745f1827f9292976411e25e8b991e9#309ad2d71b745f1827f9292976411e25e8b991e9"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -4664,9 +4687,11 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "thiserror",
+ "tierstore-trees-api",
  "tokio",
  "tokio-rustls",
  "toml",
+ "tonic",
  "tracing",
  "x509-parser",
 ]
@@ -4692,6 +4717,18 @@ dependencies = [
  "sha2 0.11.0",
  "thiserror",
  "tokio",
+]
+
+[[package]]
+name = "tierstore-trees-api"
+version = "0.1.0"
+source = "git+https://github.com/komira-ai/tierstore?rev=309ad2d71b745f1827f9292976411e25e8b991e9#309ad2d71b745f1827f9292976411e25e8b991e9"
+dependencies = [
+ "prost",
+ "protox 0.10.0",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
 ]
 
 [[package]]

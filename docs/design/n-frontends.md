@@ -48,7 +48,8 @@ executor's, but N frontends need them (section 6):
 
 - The history is `file://`, locked by `flock` for the life of the process (`kbf-objstore/src/fs_store.rs`); the new task cannot open
   the slot's history directory until the old one exits (`history/lock_wait.rs` retries the open). `--history-objects=s3://…`
-  takes its key pair only from the process environment (`history/flags.rs` `process_env`), and a Swarm secret is a file.
+  took its key pair only from the process environment (`history/flags.rs` `process_env`), and a Swarm secret is a file; PR 2
+  added `--history-credentials-file`.
 - The base-tree cache directory `/var/lib/kbf-frontend/base-tree` is shared by the two tasks and its fetch is not safe for two
   processes (`frontend/base_fetch.rs`, section 6.3).
 - The learned-size rows (`est/`) are written with `Cond::Any` from each process's memory (`farm/durable/ext.rs` `put_estimates`),
@@ -369,9 +370,10 @@ Test: two `Cache::ensure` of one commit run together succeed and leave one valid
 What kbf history needs of its object store [F, `kbf-history/src/writer.rs`, `flog.rs`; tierstore `packaging/README.md`, "An
 append-only history"]: create-only single `PUT` with `If-None-Match: *` for a chunk (`put_new`; a retry that finds the key already
 there is success, `AlreadyExists`), and ranged `GET`. No list, no delete, no overwrite, no multipart. A chunk key carries the
-writer id (`WriterId::from_instance`, per process), so two frontends never write one key. The index rows (`ui/…`) are in Postgres:
-per-writer rows, inserts, and the shape and status rows, which are read-modify-write with `Cond::Version` in `derived.rs` (the
-"only the generation holder writes them" text in `kbf-history/src/kinds.rs` is stale and is corrected in PR 2: P10).
+writer id (the process's start time in microseconds, `history/driver.rs` `Options::default`), so two frontends never write
+one key. The index rows (`ui/…`) are in Postgres:
+per-writer rows, inserts, and the shape and status rows, which are read-modify-write with `Cond::Version` in `derived.rs` (`kbf-history/src/kinds.rs`
+says so; it said "only the generation holder writes them" until this was written down).
 
 tierstore supports this: its S3 front answers a create-only put of a present key `412 PreconditionFailed` and keeps the old body
 (`docs/design/put-without-lock.md`, I5, in the tierstore repository), and its README gives the history key:
