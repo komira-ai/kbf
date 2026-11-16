@@ -18,7 +18,7 @@ use support::{Cell, FakeDaemon, Job, PROMPT, done, hello, hello_on, output, ran,
 use tokio::time::timeout;
 use tonic::{Code, Streaming};
 
-const MAC: &[(&str, &str)] = &[("arch", "arm64"), ("os", "macos")];
+const ARM: &[(&str, &str)] = &[("arch", "arm64"), ("os", "linux")];
 
 /// The reason in a queued operation's metadata, if it carries one.
 fn waiting_reason(op: &Operation) -> Option<String> {
@@ -46,37 +46,37 @@ async fn next(ops: &mut Streaming<Operation>) -> Operation {
         .expect("an update")
 }
 
-/// Catches: placement that ignores the platform. The Mac registers first, sorts first
-/// by name and holds nothing, so placement without matching would give it the Linux
-/// action, and the Linux daemon the Mac action.
+/// Catches: placement that ignores the platform. The arm64 node registers first, sorts first
+/// by name and holds nothing, so placement without matching would give it the x86-64
+/// action, and the x86-64 daemon the arm64 action.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn each_action_runs_on_a_daemon_of_its_platform() {
     let cell = Cell::start().await;
-    let mut mac = FakeDaemon::connect(cell.worker_addr, hello_on("node-a", 4, 8, MAC))
+    let mut arm = FakeDaemon::connect(cell.worker_addr, hello_on("node-a", 4, 8, ARM))
         .await
         .expect("registered");
     let mut linux = cell.daemon("node-b", 4, 8).await;
 
-    let linux_job = Job::new("linux", &[("OSFamily", "linux")]);
-    let mac_job = Job::new("mac", &[("OSFamily", "Darwin"), ("ISA", "arm-a64")]);
+    let linux_job = Job::new("x86", &[("OSFamily", "linux"), ("ISA", "x86-64")]);
+    let arm_job = Job::new("arm", &[("OSFamily", "linux"), ("ISA", "arm-a64")]);
     cell.upload(&linux_job.blobs()).await;
-    cell.upload(&mac_job.blobs()).await;
+    cell.upload(&arm_job.blobs()).await;
 
     let mut linux_ops = cell.execute(&linux_job.action).await;
     let start = linux.start().await;
     assert_eq!(start.action_digest.as_ref(), Some(&linux_job.action.proto));
-    mac.no_work().await;
-    let built = output(&cell, "on linux", 0).await;
+    arm.no_work().await;
+    let built = output(&cell, "on x86", 0).await;
     assert!(linux.report(ran(start.lease_id, &built)).await.accepted);
     done(&mut linux_ops).await;
 
-    let mut mac_ops = cell.execute(&mac_job.action).await;
-    let start = mac.start().await;
-    assert_eq!(start.action_digest.as_ref(), Some(&mac_job.action.proto));
+    let mut arm_ops = cell.execute(&arm_job.action).await;
+    let start = arm.start().await;
+    assert_eq!(start.action_digest.as_ref(), Some(&arm_job.action.proto));
     linux.no_work().await;
-    let built = output(&cell, "on the mac", 0).await;
-    assert!(mac.report(ran(start.lease_id, &built)).await.accepted);
-    done(&mut mac_ops).await;
+    let built = output(&cell, "on arm", 0).await;
+    assert!(arm.report(ran(start.lease_id, &built)).await.accepted);
+    done(&mut arm_ops).await;
 }
 
 /// The unservable wait the refusal test runs with.
@@ -136,7 +136,7 @@ async fn an_action_no_daemon_can_run_waits_with_a_reason_then_is_refused() {
 async fn a_daemon_that_can_run_it_ends_the_wait() {
     let cell = Cell::start().await;
     let _linux = cell.daemon("node-b", 4, 8).await;
-    let job = Job::new("for the mac", &[("OSFamily", "darwin")]);
+    let job = Job::new("for arm", &[("OSFamily", "linux"), ("ISA", "arm-a64")]);
     cell.upload(&job.blobs()).await;
 
     let mut ops = cell.execute(&job.action).await;
@@ -147,10 +147,10 @@ async fn a_daemon_that_can_run_it_ends_the_wait() {
         "a joiner not told why"
     );
 
-    let mut mac = FakeDaemon::connect(cell.worker_addr, hello_on("node-m", 4, 8, MAC))
+    let mut arm = FakeDaemon::connect(cell.worker_addr, hello_on("node-m", 4, 8, ARM))
         .await
         .expect("registered");
-    let start = mac.start().await;
+    let start = arm.start().await;
     for stream in [&mut ops, &mut joined] {
         let mut op = next(stream).await;
         while stage(&op) == ExecStage::Queued as i32 {
@@ -159,8 +159,8 @@ async fn a_daemon_that_can_run_it_ends_the_wait() {
         }
         assert_eq!(stage(&op), ExecStage::Executing as i32);
     }
-    let built = output(&cell, "on the mac", 0).await;
-    assert!(mac.report(ran(start.lease_id, &built)).await.accepted);
+    let built = output(&cell, "on arm", 0).await;
+    assert!(arm.report(ran(start.lease_id, &built)).await.accepted);
     done(&mut ops).await;
     done(&mut joined).await;
 }
@@ -180,29 +180,29 @@ async fn the_hello_carries_what_placement_matches() {
     assert_eq!(refused.code(), Code::InvalidArgument);
     assert!(refused.message().contains("arch"), "{}", refused.message());
 
-    let mut mac = FakeDaemon::connect(cell.worker_addr, hello_on("node-m", 4, 8, MAC))
+    let mut arm = FakeDaemon::connect(cell.worker_addr, hello_on("node-m", 4, 8, ARM))
         .await
         .expect("registered");
-    let job = Job::new("pool", &[("os_image", "macos-15")]);
+    let job = Job::new("pool", &[("os_image", "image-a")]);
     cell.upload(&job.blobs()).await;
     let mut ops = cell.execute(&job.action).await;
-    mac.no_work().await;
+    arm.no_work().await;
 
     // A garbled resend is ignored; the node keeps its report.
-    let garbled = hello_on("node-m", 4, 8, &[("arch", "sparc"), ("os", "macos")]);
-    mac.send(daemon_message::Message::Hello(garbled));
-    mac.no_work().await;
+    let garbled = hello_on("node-m", 4, 8, &[("arch", "sparc"), ("os", "linux")]);
+    arm.send(daemon_message::Message::Hello(garbled));
+    arm.no_work().await;
 
     let imaged = hello_on(
         "node-m",
         4,
         8,
-        &[("arch", "arm64"), ("os", "macos"), ("os_image", "macos-15")],
+        &[("arch", "arm64"), ("os", "linux"), ("os_image", "image-a")],
     );
-    mac.send(daemon_message::Message::Hello(imaged));
-    let start = mac.start().await;
+    arm.send(daemon_message::Message::Hello(imaged));
+    let start = arm.start().await;
     let built = output(&cell, "pooled", 0).await;
-    assert!(mac.report(ran(start.lease_id, &built)).await.accepted);
+    assert!(arm.report(ran(start.lease_id, &built)).await.accepted);
     done(&mut ops).await;
 }
 
@@ -239,52 +239,50 @@ async fn run_on(cell: &Cell, job: &Job, daemon: &mut FakeDaemon, others: &mut [&
 }
 
 /// Catches (the live incident: an action whose platform was only `pool=mojo-bench` was
-/// leased to a Mac): an action that names no OS and no architecture given to the Mac
-/// because it registered first and sorts first. The Mac is `mac-a`, ahead of the Linux
-/// node by name, and the platform has no OS key (one property kbf does not read, and
-/// none at all), so only the default can keep both off the Mac.
+/// leased to a node of another platform): an action that names no OS and no architecture
+/// given to the arm64 node because it registered first and sorts first. The arm64 node is
+/// `arm-a`, ahead of the x86-64 node by name, and the platform has no OS key (one property
+/// kbf does not read, and none at all), so only the default can keep it off the arm64 node.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_action_naming_no_os_is_not_leased_to_a_mac() {
+async fn an_action_naming_no_os_is_not_leased_to_an_arm_node() {
     let cell = Cell::start_with_default_platform(kbf_front::DefaultPlatform::LINUX_X86_64).await;
-    let mut mac = FakeDaemon::connect(cell.worker_addr, hello_on("mac-a", 4, 8, MAC))
+    let mut arm = FakeDaemon::connect(cell.worker_addr, hello_on("arm-a", 4, 8, ARM))
         .await
         .expect("registered");
     let mut linux = cell.daemon("node-b", 4, 8).await;
 
     let pool = Job::new("pool only", &[("pool", "mojo-bench")]);
-    run_on(&cell, &pool, &mut linux, &mut [&mut mac]).await;
+    run_on(&cell, &pool, &mut linux, &mut [&mut arm]).await;
     let empty = Job::new("empty platform", &[]);
-    run_on(&cell, &empty, &mut linux, &mut [&mut mac]).await;
+    run_on(&cell, &empty, &mut linux, &mut [&mut arm]).await;
 }
 
-/// Catches: the default taking an action that names a Mac OS or a Mac architecture to
-/// Linux, so that `OSFamily=Darwin` alone, or `ISA=arm-a64` alone, is not built on the
-/// Mac it asked for. Each names half of a platform and is never defaulted.
+/// Catches: the default taking an action that names an architecture to the default one, so
+/// that `ISA=arm-a64` alone is not built on the arm64 node it asked for. It names half of a
+/// platform and is never defaulted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn half_a_mac_platform_still_goes_to_the_mac() {
+async fn half_a_platform_still_goes_to_the_node_it_names() {
     let cell = Cell::start_with_default_platform(kbf_front::DefaultPlatform::LINUX_X86_64).await;
     let mut linux = cell.daemon("node-a", 4, 8).await;
-    let mut mac = FakeDaemon::connect(cell.worker_addr, hello_on("node-b", 4, 8, MAC))
+    let mut arm = FakeDaemon::connect(cell.worker_addr, hello_on("node-b", 4, 8, ARM))
         .await
         .expect("registered");
 
-    let os = Job::new("darwin alone", &[("OSFamily", "Darwin")]);
-    run_on(&cell, &os, &mut mac, &mut [&mut linux]).await;
     let isa = Job::new("arm alone", &[("ISA", "arm-a64")]);
-    run_on(&cell, &isa, &mut mac, &mut [&mut linux]).await;
+    run_on(&cell, &isa, &mut arm, &mut [&mut linux]).await;
 }
 
 /// Catches: `--default-platform none` ignored (or the flag's value ignored for the
 /// built-in): with it off an action that names no OS is given to the first node by
-/// name, the Mac, as before the flag.
+/// name, the arm64 node, as before the flag.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn default_platform_none_leaves_placement_to_the_first_fit() {
     let cell = Cell::start_with_default_platform(kbf_front::DefaultPlatform::NONE).await;
-    let mut mac = FakeDaemon::connect(cell.worker_addr, hello_on("mac-a", 4, 8, MAC))
+    let mut arm = FakeDaemon::connect(cell.worker_addr, hello_on("arm-a", 4, 8, ARM))
         .await
         .expect("registered");
     let mut linux = cell.daemon("node-b", 4, 8).await;
 
     let pool = Job::new("pool only", &[("pool", "mojo-bench")]);
-    run_on(&cell, &pool, &mut mac, &mut [&mut linux]).await;
+    run_on(&cell, &pool, &mut arm, &mut [&mut linux]).await;
 }
