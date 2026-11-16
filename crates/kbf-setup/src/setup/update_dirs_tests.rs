@@ -67,7 +67,7 @@ fn the_modes_whose_daemon_takes_orders_get_the_installers_directories() {
 
 /// Catches the keys and the spool `setup` makes drifting apart: on Linux the directory the
 /// orders key names is the one made for the service user (0700). A Mac's state directory differs
-/// (`/var/db/kbf-installer`), and there the keys are `kbf-mac-provision`'s: setup leaves the
+/// (`/var/db/kbf-installer`), and there the keys are the Mac host's own: setup leaves the
 /// file as it was and still makes the same spool.
 ///
 /// Catches: the spool made 0755.
@@ -91,7 +91,7 @@ fn the_orders_key_names_the_directory_setup_makes() {
     );
 }
 
-/// A Mac's `kbf.toml` has no `[daemon]` update keys (`kbf-mac-provision` renders none), and
+/// A Mac's `kbf.toml` has no `[daemon]` update keys (none are rendered there), and
 /// `setup` neither requires them nor writes them: the file is accepted and kept byte for byte,
 /// and one that still has the keys from an earlier provisioning is kept too. With no file at
 /// all, `setup` writes its own keys and no update key.

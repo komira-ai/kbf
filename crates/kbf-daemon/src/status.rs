@@ -5,8 +5,7 @@
 //! Status routes no work, so it is not part of the node report and does not change the
 //! report hash. A Linux node reads `/etc/os-release` (or `/usr/lib/os-release`, its
 //! fallback) for `NAME`, `VERSION_ID` and `BUILD_ID`, and `/proc/sys/kernel/osrelease`
-//! for the kernel release. A Mac asks `sw_vers` for its product name, version and
-//! build. The Xcode builds are the node report's `xcode` entries: whatever discovered
+//! for the kernel release. The Xcode builds are the node report's `xcode` entries: whatever discovered
 //! them (the native driver) is the one source, so status and placement never disagree.
 //! Every installed Xcode, ready or not, with why one is not and how to fix it, comes
 //! from the driver too ([`DriverReport`], issue #164). A field that cannot be read is
@@ -133,54 +132,13 @@ fn unquote(value: &str) -> String {
     out
 }
 
-/// A Mac's software from `sw_vers` output (`ProductName:\tmacOS` and so on, one per
-/// line). The kernel is left empty: Darwin's release says nothing an operator acts on.
-#[must_use]
-pub fn macos_software(sw_vers: &str) -> Software {
-    let field = |key: &str| {
-        sw_vers
-            .lines()
-            .find_map(|line| line.strip_prefix(key)?.strip_prefix(':'))
-            .map(|v| v.trim().to_owned())
-            .unwrap_or_default()
-    };
-    Software {
-        os_name: field("ProductName"),
-        os_version: field("ProductVersion"),
-        os_build: field("BuildVersion"),
-        kernel: String::new(),
-    }
-}
-
-/// Where macOS keeps `sw_vers`.
-pub const SW_VERS: &str = "/usr/bin/sw_vers";
-
-/// The standard output of `program`, or `None` (logged) if it cannot be run or fails.
-#[cfg(any(target_os = "macos", test))]
-fn output_of(program: &str) -> Option<String> {
-    let out = std::process::Command::new(program)
-        .output()
-        .map_err(|e| tracing::warn!(program, "cannot run: {e}"))
-        .ok()?;
-    if !out.status.success() {
-        tracing::warn!(program, status = %out.status, "failed");
-        return None;
-    }
-    Some(String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
 #[cfg(target_os = "linux")]
 fn detect_here() -> Software {
     let os_release = OS_RELEASE.map(Path::new);
     linux_software(&os_release, Path::new(KERNEL_RELEASE))
 }
 
-#[cfg(target_os = "macos")]
-fn detect_here() -> Software {
-    output_of(SW_VERS).map_or_else(Software::default, |out| macos_software(&out))
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(target_os = "linux"))]
 fn detect_here() -> Software {
     Software::default()
 }
@@ -226,30 +184,6 @@ mod tests {
         assert_eq!(os_release_field("K=\"a\\\"", "K").as_deref(), Some("a\\"));
     }
 
-    /// Catches: a field read from the wrong line, and the value kept with its tab.
-    #[test]
-    fn sw_vers_output_is_parsed() {
-        let out = "ProductName:\t\tmacOS\nProductVersion:\t\t15.1\nBuildVersion:\t\t24B83\n";
-        assert_eq!(
-            macos_software(out),
-            Software {
-                os_name: "macOS".to_owned(),
-                os_version: "15.1".to_owned(),
-                os_build: "24B83".to_owned(),
-                kernel: String::new(),
-            }
-        );
-        assert_eq!(macos_software(""), Software::default());
-    }
-
-    /// Catches: a failed or missing program taken as empty output instead of unknown.
-    #[test]
-    fn output_of_reports_only_success() {
-        assert_eq!(output_of("/bin/echo").as_deref(), Some("\n"));
-        assert_eq!(output_of("/bin/false"), None);
-        assert_eq!(output_of("/nonexistent/sw_vers"), None);
-    }
-
     /// Catches: Xcode builds taken from another key, or status built from the report's
     /// hash-relevant entries in a way that changes the report.
     #[test]
@@ -261,7 +195,10 @@ mod tests {
             ("xcode.nope", "nope"),
         ]);
         let before = report.clone();
-        let software = macos_software("ProductName: macOS\n");
+        let software = Software {
+            os_name: "macOS".to_owned(),
+            ..Software::default()
+        };
         let status = software.status(&report);
         assert_eq!(status.xcode_builds, ["15F31d", "16C5032a"]);
         assert_eq!(status.os_name, "macOS");

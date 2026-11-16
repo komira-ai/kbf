@@ -36,10 +36,7 @@ libc.workspace = true
 prost.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-rustls.workspace = true
-rustls-native-certs.workspace = true
 thiserror.workspace = true
-ureq.workspace = true
 tokio = { workspace = true, features = ["rt", "fs", "process", "time", "io-util", "signal", "sync"] }
 
 # The Command's namespaces and mounts (src/child.rs), through rustix's safe calls.
@@ -49,9 +46,6 @@ rustix = { workspace = true, features = ["fs", "mount", "pipe", "process", "thre
 [dev-dependencies]
 kbf-testkit.workspace = true
 prost-types.workspace = true
-# `tests/put_back_pressure.rs`: the real PUT client against a real tierstore front whose put
-# slots are all taken. A dev-dependency only: no build of the tool has it.
-tierstore = { workspace = true, features = ["server"] }
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync"] }
 
 [features]

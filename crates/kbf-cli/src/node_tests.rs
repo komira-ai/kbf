@@ -114,7 +114,7 @@ fn a_daemon_only_node_runs_kbf_daemon_with_the_frontends_endpoints() {
         &config,
         &node,
         &c.store,
-        Driver::Native,
+        Driver::Container,
         want(names::DAEMON),
     )
     .expect("a plan");
@@ -123,7 +123,7 @@ fn a_daemon_only_node_runs_kbf_daemon_with_the_frontends_endpoints() {
         [
             "kbf".to_owned(),
             "--mode=daemon".to_owned(),
-            "--driver=native".to_owned(),
+            "--driver=container".to_owned(),
             "--server=https://farm.example:8981".to_owned(),
             "--cas=https://farm.example:8981".to_owned(),
             format!("--ca-cert={}", pki(&c, "ca.pem")),

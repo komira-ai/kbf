@@ -24,8 +24,6 @@ fn the_daemon_takes_no_store_credential_or_environment_variable() {
     const REVIEWED_DAEMON_FLAGS: &[&str] = &[
         // The node identity's private key.
         "key",
-        // The socket `kbf-mac-session` serves: a macOS login session, not a cloud one.
-        "mac-session-socket",
     ];
     /// The flags of `--pack-read` (`kbf_node`'s `pack_read`): the object store the daemon
     /// reads packs from and writes them to, and the files of its key pairs, never a key itself.

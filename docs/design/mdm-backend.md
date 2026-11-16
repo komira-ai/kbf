@@ -66,12 +66,12 @@ only ever speaks the gate's protocol.
   startup reconciliation (4.1) only ever withdraws `kbf.` declarations.
 - **The profile allowlist.** A profile is installed only if its SHA-256 is named by a
   signed set the gate has verified (the platform key, S2.2), such as the Full Disk
-  Access profile that pins `kbf-mac-session`'s cdhash (S4.3), or listed in a
+  Access profile (S4.3), or listed in a
   root-owned allowlist file on the gate's host. The server cannot send profile bytes:
   it names a digest, and the gate installs bytes it already holds.
 - **The server's complete set of gate verbs** is: `status`, `enforce` and
   `withdraw`, `profile`, `grant-admin` (S5.2, S8; the gate defines the admin grant's
-  exact format, which `kbf-mac-session` verifies: S5.2 "The admin grant"), and two
+  exact format: S5.2 "The admin grant"), and two
   erase verbs that carry no
   authority of their own: `erase <signed request>`, a relay for a request the server
   cannot create (M4.2), and `bring-forward <serial> <lease id>`, which only runs an
@@ -361,9 +361,7 @@ There is no separate configuration-management tool.
 - **Linux:** `kbf-updater` with signed sets is the only thing that changes a node
   (5.1, 8). Configuration files are artifacts in the set, or part of the bootc image;
   nothing is edited in place on a node.
-- **macOS:** `kbf-updater` re-runs the idempotent provisioning profile
-  (`kbf-mac-provision apply`,
-  [mac-node-provisioning.md](mac-node-provisioning.md)) from a signed set, and MDM does what only MDM can:
+- **macOS:** MDM does what only MDM can:
   macOS updates, privacy (Full Disk Access) profiles, the managed administrator,
   bootstrap tokens, erase, Lights Out Management.
 - **What it shares with a tool like Ansible:** a declared state, idempotent steps,

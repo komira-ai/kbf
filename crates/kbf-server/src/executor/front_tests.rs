@@ -436,6 +436,7 @@ async fn an_action_runs_from_the_kbf_image_by_digest_and_has_its_timeout() {
         ActionFacts {
             image: KBF_IMAGE.to_owned(),
             timeout: Some(Duration::from_secs(90)),
+            system: crate::executor::System::Linux,
         }
     );
 }
@@ -920,3 +921,51 @@ async fn a_tree_that_only_the_pack_holds_is_read_through_the_same_packs() {
 
 #[path = "front_put_dir_tests.rs"]
 mod put_dir;
+
+fn props(pairs: &[(&str, &str)]) -> Platform {
+    let property = |(name, value): &(&str, &str)| Property {
+        name: (*name).to_owned(),
+        value: (*value).to_owned(),
+    };
+    Platform {
+        properties: pairs.iter().map(property).collect(),
+    }
+}
+
+/// Asserts the action's system is read where the farm reads it: an Action's macOS platform, a
+/// Command's behind an Action platform that names nothing (the farm skips an empty one), and a
+/// Linux Action's over a Command's macOS; and that a platform the farm refuses is invalid.
+/// Catches a Mac action the farm placed on a Mac worker that the executor runs on Linux.
+#[tokio::test]
+#[allow(deprecated)] // The Command's platform, which older clients send.
+async fn the_actions_system_is_read_as_the_farm_reads_it() {
+    let rig = Rig::new();
+    let mac = System::Macos {
+        os_version: Some(26),
+    };
+    let named = props(&[("OSFamily", "macos"), ("os_version", "26")]);
+    let cases = [
+        (Some(named.clone()), None, mac),
+        (Some(Platform::default()), Some(named.clone()), mac),
+        (
+            Some(props(&[("OSFamily", "linux")])),
+            Some(named),
+            System::Linux,
+        ),
+    ];
+    for (on_action, on_command, want) in cases {
+        let digest = rig
+            .action(
+                |action| action.platform = on_action.clone(),
+                |command| command.platform = on_command.clone(),
+            )
+            .await;
+        let facts = rig.front.action(&digest).await.expect("facts");
+        assert_eq!(facts.system, want, "{on_action:?} {on_command:?}");
+    }
+    let bad = rig
+        .action(|a| a.platform = Some(props(&[("os", "windows")])), |_| {})
+        .await;
+    let refused = rig.front.action(&bad).await.expect_err("refused");
+    assert!(matches!(&refused, InputsError::Invalid(why) if why.contains("windows")));
+}

@@ -291,7 +291,7 @@ never by elapsed time.
 | 5 | H2 the agent's pin | M7 | H1, C1 | komira-ai/kbf#2243 |
 | 6 | G6 agent and helper units in the package (done) | M3 | komira-ai/kbf#2236 | komira-ai/kbf#2244 |
 | 7 | G7 the coordinator updated by the updater | M2 | G6, [host-updates.md](host-updates.md) step 6a | komira-ai/kbf#2245 |
-| 8 | G8 a Mac takes update orders | M8 | the Mac lease users ([macos-end-state.md](macos-end-state.md), steps 3 and 4) | komira-ai/kbf#2246 |
+| 8 | G8 a Mac takes update orders | M8 | the Mac host install (the Macs run no kbf daemon: [actions-as-jobs.md](actions-as-jobs.md) section 14) | komira-ai/kbf#2246 |
 
 G1 and G2 come first because they close the gap of section 2.5. H1, C1 and H2 are the
 forced rollback, in that order: a forced order on a host ends in H1's `activate`, and the

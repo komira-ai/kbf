@@ -98,8 +98,6 @@ jobs:
           if-no-files-found: warn
       # nextest does not run doc tests.
       - run: cargo test --workspace --doc --locked
-      # kbf-guest started as root through sudo must refuse (crates/kbf-guest/tests/as_root.rs).
-      - run: cargo xtask sudo-test -p kbf-guest --test as_root
       # kbf-server's --version names this commit, and the CI-only override stamps two
       # other commits from the same checkout (crates/kbf-server/build.rs,
       # crates/xtask/src/build_commit.rs).
@@ -424,24 +422,18 @@ jobs:
             target
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
-  # The native driver on a real Mac (Apple silicon). The process-tree kill, memory
-  # kill, output, cleanup and network tests run against libproc and sandbox-exec
-  # here (the Linux jobs run the same tests against /proc, where the network is not
-  # enforced); the daemon binary is built and started with each driver, which
-  # detects the node through sysctl.
+  # What still runs on a real Mac (Apple silicon) after the merge: the host installer and
+  # setup library, the registration client's connect, the daemon library's clock and keeper
+  # tests, the pinned gh against a real attestation, and the `.pkg` and Homebrew cask.
+  # A macOS action itself runs as a js-agent job (docs/design/actions-as-jobs.md section 14),
+  # not through a daemon, so no daemon driver is tested here.
   #
-  # 85 minutes: a passing run took about 41 (run 39670620620) and the next, with the slot
-  # clean's mutants added and slower test steps on the same runner type, passed every test
-  # step up to the last and was cancelled at 45 (run 39688515489). The slot assertion and the
-  # package steps were jobs of their own (about 4 and 3.5 minutes of tests) and are steps here,
-  # so one runner is taken for them instead of three. Recent passing runs took 51 to 71 minutes
-  # before the fold; 71 plus those 8 is 79, so 95 leaves room for a slow runner.
   # macos-26, named: macos-latest moves to the next major release when GitHub moves it, and
   # the macOS a job proves should change in a commit. The label still takes macOS 26 point
   # releases (26.6.2 to 26.7.2 changed sshd -T's output), which `sw_vers` below prints.
   native-macos:
     runs-on: macos-26
-    timeout-minutes: 95
+    timeout-minutes: 60
     permissions:
       contents: read
     env:
@@ -465,30 +457,7 @@ jobs:
       - run: sw_vers
       - run: uname -m
       - run: sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize
-      - run: cargo build -p kbf-node --bin kbf-daemon --locked
-      # kbf-testkit has no tests of its own now (it re-exports js-testkit, whose database tests
-      # run in the jobscheduler repository's CI).
-      - run: 'cargo test -p kbf-outputs -p kbf-driver-native -p kbf-node --locked'
-      # `kbf daemon --driver native` started with the words the Mac's launchd unit
-      # writes, against a fake front, and the helpers it re-runs itself as (each action's
-      # keeper, the lease-user pool's `as-user` step) through the `kbf` binary
-      # (crates/kbf-cli/tests/macos_daemon.rs).
-      - run: cargo test -p kbf-cli --test macos_daemon --locked
-      # A lease's own simulator, made, booted and deleted for real under the actions'
-      # sandbox; one a killed daemon left deleted at the next start; and xcodebuild
-      # finding a device of the default set but not one of another set
-      # (crates/kbf-driver-native/tests/lease/simulator.rs).
-      - run: cargo test -p kbf-driver-native --test lease --locked -- --ignored --nocapture simulator::real
-      # The daemon's unit tests, which read its suspend-counting clock on macOS
-      # (CLOCK_MONOTONIC_RAW), the fence across a suspend (issue #78), and a keeper
-      # started after the binary was renamed over, which macOS finds by its path.
-      - run: cargo test -p kbf-daemon --lib --test suspend --test keeper --test cache_clone --test trees_clone --locked
-      # The root helper for per-lease users: its unit tests, then the helper itself run
-      # as root (passwordless sudo) with real users, launchd, libproc, the sweep, the
-      # leak scan and the caller check by code signature, signed as `cargo xtask
-      # sign-darwin` signs it (crates/kbf-mac-session/tests/as_root.rs;
-      # docs/design/fleet-updates-security.md S4.2, S4.3, S10).
-      - run: cargo test -p kbf-mac-session --locked
+      - run: cargo test -p kbf-outputs --locked
       # The registration client's connect on a Mac, where it is std's after a check of the deadline:
       # a full backlog is refused at once, a connect that succeeds leaves the rest only what is left,
       # and a missing or stale socket is a connect error (crates/update-register/src/tests.rs).
@@ -510,60 +479,6 @@ jobs:
         run: cargo test -p kbf-installer --test real_gh --locked -- --ignored --test-threads=1
         env:
           KBF_TEST_GH: ${{ runner.temp }}/tools/gh
-      - run: cargo xtask sudo-test -p kbf-mac-session --test as_root -- --test-threads=1 --nocapture
-      # The native driver's lease-user pool as root, with throwaway users from uid 690:
-      # actions as pool users through `launchctl asuser`, the kill by uid, the keeper's,
-      # parallel leases (crates/kbf-driver-native/tests/slots.rs); then the clean of a
-      # slot between two leases in one pass, its deadline, and a failed clean leaving the
-      # user dirty (tests/slot_clean.rs). One test at a time: they make users at free uids.
-      - run: cargo xtask sudo-test -p kbf-driver-native --test slots -- --test-threads=1 --nocapture
-      - run: cargo xtask sudo-test -p kbf-driver-native --test slot_clean -- --test-threads=1 --nocapture
-      # The profile canaries (tests/slot_canary.rs): as a pool user under the generated
-      # profile, a write outside the allowed paths and a hard link of a root-owned file are
-      # refused, and a profile without `(deny file-write*)` fails them.
-      - run: cargo xtask sudo-test -p kbf-driver-native --test slot_canary -- --test-threads=1 --nocapture
-      # What an action as a pool user reaches of another slot (files, loopback TCP, Unix
-      # sockets, the process table), measured and printed, not asserted, with and without
-      # the sandbox (crates/kbf-driver-native/tests/slot_reach.rs).
-      - run: cargo xtask sudo-test -p kbf-driver-native --test slot_reach -- --test-threads=1 --nocapture
-      # SIGTERM before SIGKILL when a pool lease or a slot clean ends the user's processes: a
-      # workload's resource tracker unlinks its POSIX shared memory and semaphores, which a
-      # Mac cannot list afterwards; a process that ignores SIGTERM is named in the lease's
-      # stderr (crates/kbf-driver-native/tests/slot_term.rs).
-      - run: cargo xtask sudo-test -p kbf-driver-native --test slot_term -- --test-threads=1 --nocapture
-      # The GPU under the slot profile (crates/kbf-driver-native/tests/slot_gpu.rs): a pool user
-      # finds a Metal device, compiles a kernel at run time and runs it on the GPU, and each
-      # deny that takes the GPU away (`iokit-open`, the Metal compiler service) fails the
-      # probe at its step. This runner is a virtual machine with a paravirtual GPU, not a
-      # farm Mac: a pass shows the profile leaves the Metal path open, not a real GPU's
-      # speed or family.
-      - run: cargo xtask sudo-test -p kbf-driver-native --test slot_gpu -- --test-threads=1 --nocapture
-      # What this runner can do for the Mac legs of the isolation suites (T018, M0; a spike that
-      # asserts nothing about isolation): two pool users made with dscl, the real `kbf daemon
-      # --driver native --pool-users 2` as root behind a fake front, one action per question
-      # (`launchctl asuser`, the `user/<uid>` domain, `security`, `pbcopy`, `defaults`, the lease
-      # directory), each fact a `SPIKE` line in this log (crates/kbf-daemon-test/tests/mac_pool_spike).
-      # The daemon is the `kbf` binary built beside the test.
-      - run: cargo build -p kbf-cli --bin kbf --locked
-      - run: cargo xtask sudo-test -p kbf-daemon-test --test mac_pool_spike -- --test-threads=1 --nocapture
-      # The per-binary entitlement allow list (tools/ci/darwin-entitlements.txt): the
-      # kbf-vmm stub signed by `cargo xtask sign-darwin` with the virtualization
-      # entitlement, kbf with none, both accepted by `darwin-asset`, and every
-      # wrong signature refused (crates/kbf-vmm/tests/signing.rs;
-      # docs/design/macos-vm-guests.md section 7).
-      - run: cargo test -p kbf-vmm --test signing --locked -- --ignored
-      # The guest agent's tests, then the agent under launchd: Aqua from a LaunchAgent
-      # in this runner's GUI session, System from a LaunchDaemon (the control), and
-      # its refusal to run as root (crates/kbf-guest/tests/as_root.rs).
-      - run: cargo test -p kbf-guest --locked
-      - run: cargo xtask sudo-test -p kbf-guest --test as_root
-      # The assertion that a pool user holds nothing a lease left (crates/kbf-driver-native/
-      # tests/slot_assert.rs): the baseline recorded at the start, and each probe seeing the
-      # state planted for it (a process, a launchd job, a semaphore, an attached image, a file
-      # in the home, a file in /private/tmp, a cron job) and green again after the clean. One
-      # test at a time: they make users at free uids.
-      - run: cargo xtask sudo-test -p kbf-driver-native --test slot_assert -- --test-threads=1 --nocapture
-        if: ${{ !cancelled() }}
       # kbf-installer on a Mac as a user gets it (contract docs/design/kbf-installer.md section
       # 7): the `.pkg` built by `cargo xtask pkg build` (a stub stands in for the binary until
       # kbf-installer builds), opened by pkgutil and lsbom, installed by Installer and checked
@@ -583,11 +498,6 @@ jobs:
         if: ${{ !cancelled() }}
         env:
           MACOSX_DEPLOYMENT_TARGET: "14.0"
-      # kbf-mac-provision on this VM, as root: what a hosted VM can prove (the header of
-      # crates/kbf-mac-provision/tests/as_root.rs lists what it applies, asserts and
-      # only reads). Last, because it changes this runner's settings.
-      - run: cargo xtask sudo-test -p kbf-mac-provision --test as_root -- --test-threads=1 --nocapture
-        if: ${{ !cancelled() }}
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
         with:

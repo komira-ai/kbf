@@ -48,7 +48,7 @@ use kbf_proto::reapi::Command;
 use tokio::fs;
 use tokio::process::Command as Process;
 
-use crate::fetch;
+use crate::message;
 use crate::network::{self, Layers, Network};
 use crate::sandbox::{self, Sandbox};
 
@@ -147,9 +147,9 @@ pub struct Run<'a> {
     /// Whether the program may use the network; [`Network::Denied`] unless the action asked
     /// ([`network::from_platform`]).
     pub network: Network,
-    /// Files holding a credential or a presigned URL this tool was given (the grant token file,
-    /// the PUT URL files). On macOS the Command's sandbox profile denies reading each; on Linux
-    /// the list is not used: the directory the job's host writes them to is one of `hidden`.
+    /// Files holding a credential this tool was given. On macOS the Command's sandbox profile
+    /// denies reading each; on Linux the list is not used: the directory the job's host writes
+    /// them to is one of `hidden`. The task tool, which is given none, passes none.
     pub unreadable: &'a [PathBuf],
     /// Directories the Command must not see (Linux): each that exists is covered by an empty
     /// read-only tmpfs in its mount namespace ([`sandbox`]); `root` and `private` stay visible at
@@ -578,9 +578,9 @@ pub(crate) fn output_paths(command: &Command) -> Vec<&String> {
 }
 
 /// A path the Command names must be empty (the directory itself) or relative, of non-empty
-/// components other than `.` and `..`: the rule of [`fetch::check_relative`].
+/// components other than `.` and `..`: the rule of [`message::check_relative`].
 fn check_relative(what: &str, path: &str) -> Result<(), RunError> {
-    fetch::check_relative(what, path).map_err(|e| RunError::Invalid(e.to_string()))
+    message::check_relative(what, path).map_err(|e| RunError::Invalid(e.to_string()))
 }
 
 /// Creates `base/relative` and each directory on the way that does not exist yet. A component
@@ -665,11 +665,13 @@ fn children_usage() -> ChildrenUsage {
     };
     ChildrenUsage {
         cpu_us: micros(usage.ru_utime) + micros(usage.ru_stime),
-        // Linux reports the peak resident set in KiB, macOS in bytes.
-        peak_rss_bytes: u64::try_from(usage.ru_maxrss).unwrap_or(0)
-            * if cfg!(target_os = "macos") { 1 } else { 1024 },
+        peak_rss_bytes: u64::try_from(usage.ru_maxrss).unwrap_or(0) * MAXRSS_UNIT,
     }
 }
+
+/// The bytes of one unit of `ru_maxrss`: Linux reports the peak resident set in KiB, macOS in
+/// bytes. A constant, so that the system this is not built for is no branch no test can take.
+const MAXRSS_UNIT: u64 = if cfg!(target_os = "macos") { 1 } else { 1024 };
 
 #[cfg(test)]
 mod tests {
@@ -1299,11 +1301,14 @@ mod tests {
             ..Command::default()
         };
         let result = rig.run(&command, LONG).await;
-        if cfg!(target_os = "macos") {
+        #[cfg(target_os = "macos")]
+        {
             let ran = result.expect("sandbox-exec ran");
             assert_ne!(ran.exit_code, 0);
             assert!(rig.err().contains("no-such-program"), "{}", rig.err());
-        } else {
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
             let error = result.expect_err("refused");
             assert!(matches!(error, RunError::Spawn { .. }), "{error}");
             assert_eq!(
@@ -1314,5 +1319,60 @@ mod tests {
                 )
             );
         }
+    }
+
+    /// Catches a stage of a refused start that says nothing, or the words of two stages swapped:
+    /// each names the process that could not start what it was to.
+    #[test]
+    fn each_stage_of_a_refused_start_names_its_process() {
+        let said: Vec<String> = [Stage::Relay, Stage::Init, Stage::InitSetup, Stage::Command]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            said,
+            [
+                "the relay",
+                "the sandbox's first process",
+                "the sandbox's first process (its setup)",
+                "the Command",
+            ]
+        );
+    }
+
+    /// Catches the start of a missing relay being reported as the Command's own: with a relay
+    /// given, the first process the tool starts is the relay, and the error names that stage.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_relay_that_cannot_be_started_is_named_as_the_relay() {
+        let rig = Rig::new("relay-missing");
+        let root = rig.root();
+        let error = run(
+            &program(&["true"]),
+            &Run {
+                root: &root,
+                private: &rig.private(),
+                stdout: &rig.stdout,
+                stderr: &rig.stderr,
+                deadline: LONG,
+                network: NETWORK,
+                unreadable: &[],
+                hidden: &[],
+                relay: Some(Path::new("/no/such/kbf-task")),
+                job: None,
+            },
+        )
+        .await
+        .expect_err("a relay that does not exist was started");
+        assert!(
+            matches!(
+                error,
+                RunError::Spawn {
+                    stage: Stage::Relay,
+                    ..
+                }
+            ),
+            "{error}"
+        );
     }
 }

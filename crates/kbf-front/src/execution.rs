@@ -1073,7 +1073,7 @@ fn gpus(platform: &Platform) -> Result<u64, Status> {
 }
 
 /// The GPUs to book for a request that asks for `gpus`. A Mac has one GPU, a slot it
-/// reports as `gpu` 1 (`docs/design/macos-vms.md` section 8): an `action` lease on
+/// reports as `gpu` 1: an `action` lease on
 /// macOS that asks for it books it, so one GPU lease runs on a Mac at a time while the
 /// Mac's other work shares the rest; a `whole_machine` lease on macOS books none on top,
 /// because it has the whole Mac, its GPU included; a `vm` lease is refused. Any other
@@ -1188,8 +1188,7 @@ fn needs(platform: &Platform) -> Result<kbf_caps::Request, Status> {
 }
 
 /// INVALID_ARGUMENT for an iOS device (`ios.device=1`) on a lease kind other than
-/// `action`: a device lease runs beside other work on its Mac
-/// (`docs/design/ios-devices.md`, section 5.3), never as the whole machine.
+/// `action`: a device lease runs beside other work on its Mac, never as the whole machine.
 fn device_kind(kind: LeaseKind, needs: &kbf_caps::Request) -> Result<(), Status> {
     if needs.wants_device() && kind != LeaseKind::Action {
         return Err(Status::invalid_argument(format!(

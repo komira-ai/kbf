@@ -2,12 +2,6 @@
 //! own environment, outputs and captured output back, the lease directory gone.
 
 mod support;
-// In this binary, not one of its own: the driver's generic code is counted by its best single
-// instantiation, one per test binary, so the simulator paths must run where the rest does.
-#[path = "lease/cache.rs"]
-mod cache;
-#[path = "lease/simulator.rs"]
-mod simulator;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -132,54 +126,6 @@ async fn each_lease_has_its_own_home_tmp_and_cache() {
         stdout(&cas, &result),
         "/the/commands/home\n/the/commands/tmp\n"
     );
-}
-
-/// Catches: an action that names an Xcode run without its `DEVELOPER_DIR`, or with the
-/// Command's own instead (the scheduler matched the build the property names), a
-/// build the node lacks run anyway with no Xcode or another one, and the node's Xcodes
-/// missing from what the driver reports.
-#[tokio::test]
-async fn an_action_that_names_an_xcode_runs_with_it() {
-    let dir = scratch("xcode");
-    let mut config = config(&dir);
-    config.xcodes = [
-        ("16C5032a", "/Apps/Xcode_16.2.app/Contents/Developer"),
-        ("16E140", "/Apps/Xcode_16.3.app/Contents/Developer"),
-    ]
-    .into_iter()
-    .map(|(build, path)| (build.to_owned(), std::path::PathBuf::from(path)))
-    .collect();
-    let cas = Arc::new(MemoryCas::default());
-    let rt = runtime(config.clone(), &cas);
-    let reported = rt.capabilities();
-    for build in ["16C5032a", "16E140"] {
-        assert!(
-            reported.contains(&("xcode".to_owned(), build.to_owned())),
-            "{reported:?}"
-        );
-    }
-    let echo = Spec::act("env DEVELOPER_DIR unset").env("DEVELOPER_DIR", "/own");
-    let named = echo.clone().property("XCode", "16E140");
-    let result = run(&rt, &cas, 1, &named).await.expect("ran");
-    assert_eq!(
-        stdout(&cas, &result),
-        "/Apps/Xcode_16.3.app/Contents/Developer\n"
-    );
-    let result = run(&rt, &cas, 2, &echo).await.expect("ran");
-    assert_eq!(
-        stdout(&cas, &result),
-        "/own\n",
-        "no xcode: the Command's own"
-    );
-    let lacking = echo.property("xcode", "15F31d");
-    let error = run(&rt, &cas, 3, &lacking)
-        .await
-        .expect_err("a build it lacks");
-    assert!(
-        matches!(&error, RuntimeError::Failed(why) if why.contains("15F31d")),
-        "{error:?}"
-    );
-    assert!(no_leases(&config), "the lease directories are removed");
 }
 
 /// Catches: a malformed action run anyway or reported as the farm's failure, and a
@@ -345,53 +291,6 @@ async fn the_lease_directory_goes_whatever_the_action_left() {
     assert!(no_leases(&config));
 }
 
-/// Catches the reviewer's brick on a Mac: an action that marks its output immutable
-/// (`chflags uchg`, which needs no privilege) leaving a lease directory that will not
-/// go, and the same directory, left by a crashed daemon, stopping the next start.
-#[cfg(target_os = "macos")]
-#[tokio::test]
-async fn what_an_action_made_immutable_does_not_stay() {
-    let dir = scratch("uchg");
-    let config = config(&dir);
-    let cas = Arc::new(MemoryCas::default());
-    let rt = runtime(config.clone(), &cas);
-    let script = "mkdir -p out/d && touch out/x out/d/y && chflags uchg out/x out/d/y out/d out";
-    let result = run(&rt, &cas, 1, &Spec::sh(script)).await.expect("ran");
-    assert_eq!(result.exit_code, 0, "{}", stderr(&cas, &result));
-    assert!(no_leases(&config));
-
-    let left = config.scratch.join("lease-9-9");
-    std::fs::create_dir_all(left.join("root/out")).expect("mkdir");
-    std::fs::write(left.join("root/out/x"), b"x").expect("write");
-    let status = std::process::Command::new("/usr/bin/chflags")
-        .args(["uchg"])
-        .arg(left.join("root/out/x"))
-        .arg(left.join("root/out"))
-        .arg(&left)
-        .status()
-        .expect("chflags");
-    assert!(status.success());
-    let _restarted = runtime(config.clone(), &cas);
-    assert!(no_leases(&config), "removed at start, not moved aside");
-}
-
-/// Catches the ACL route to the same brick on a Mac: an action that denies everyone,
-/// itself included, deletion of an output and of its directory's entries (which no
-/// permission bit undoes) leaving a lease directory that will not go.
-#[cfg(target_os = "macos")]
-#[tokio::test]
-async fn what_an_action_locked_with_an_acl_does_not_stay() {
-    let dir = scratch("acl");
-    let config = config(&dir);
-    let cas = Arc::new(MemoryCas::default());
-    let rt = runtime(config.clone(), &cas);
-    let script = "mkdir out && touch out/x && chmod +a 'everyone deny delete' out/x \
-        && chmod +a 'everyone deny delete_child' out && ! rm -f out/x";
-    let result = run(&rt, &cas, 1, &Spec::sh(script)).await.expect("ran");
-    assert_eq!(result.exit_code, 0, "{}", stderr(&cas, &result));
-    assert!(no_leases(&config));
-}
-
 /// Catches: lease directories a crashed daemon left not removed at start (the node
 /// would fill up), or files beside them removed.
 #[tokio::test]
@@ -409,7 +308,7 @@ async fn leftovers_are_removed_at_start() {
         rt.capabilities(),
         [(
             network::CAPABILITY.to_owned(),
-            config.isolation.name().to_owned()
+            network::ISOLATION.to_owned()
         )]
     );
     std::fs::write(dir.join("file"), b"x").expect("write");
@@ -442,39 +341,15 @@ async fn a_kill_during_the_fetch_stops_the_lease() {
     assert!(no_leases(&config));
 }
 
-/// Catches, on macOS, an action that can take write permission from the scratch root
-/// (every later lease on the node would then fail its clean): the sandbox refuses the
-/// chmod, and the lease ends clean.
-#[cfg(target_os = "macos")]
-#[tokio::test]
-async fn a_sandboxed_action_cannot_lock_the_scratch_root() {
-    let dir = scratch("lock-root");
-    let config = config(&dir);
-    assert!(matches!(config.isolation, network::Isolation::Sandbox(_)));
-    let cas = Arc::new(MemoryCas::default());
-    let rt = runtime(config.clone(), &cas);
-    let spec = Spec::act("chmod 555 ../..");
-    let result = run(&rt, &cas, 1, &spec).await.expect("ran, and cleaned");
-    // The act step fails (exit 1) when the chmod is refused.
-    assert_eq!(result.exit_code, 1, "the chmod went through");
-    assert!(
-        stderr(&cas, &result).contains("chmod ../.."),
-        "refused elsewhere"
-    );
-    assert!(no_leases(&config), "the lease directory is removed");
-}
-
 /// Catches a lease directory that could not be removed reported as success (a node
 /// filling up unseen), and a failed clean hiding the action's own outcome. The action
 /// takes write permission from the scratch root, so its lease directory cannot be
-/// unlinked from it. It runs unsandboxed: on macOS the sandbox refuses that chmod
-/// (`a_sandboxed_action_cannot_lock_the_scratch_root`).
+/// unlinked from it..
 #[tokio::test]
 async fn a_lease_directory_that_stays_fails_the_lease() {
     use std::os::unix::fs::PermissionsExt;
     let dir = scratch("clean-fails");
-    let mut config = config(&dir);
-    config.isolation = network::Isolation::None;
+    let config = config(&dir);
     let cas = Arc::new(MemoryCas::default());
     let rt = runtime(config.clone(), &cas);
     let reopen = || {

@@ -44,10 +44,9 @@ async fn each_daemon_that_starts_claims_the_scratch_directory() {
     let dir = scratch("instance-claim");
     tls_files(&dir);
     let cli = cli(&dir, &["--driver=fake".to_owned()]);
-    let xcrun = dir.join("no-xcrun");
-    let (first, _) = node(&cli, || native_config(&cli), &xcrun).expect("started");
+    let (first, _) = node(&cli, || native_config(&cli)).expect("started");
     assert_eq!(claimed(&dir), claim_of(first.instance_id()));
-    let (second, _) = node(&cli, || native_config(&cli), &xcrun).expect("started");
+    let (second, _) = node(&cli, || native_config(&cli)).expect("started");
     assert_ne!(second.instance_id(), first.instance_id());
     assert_eq!(claimed(&dir), claim_of(second.instance_id()));
 }
@@ -56,34 +55,29 @@ async fn each_daemon_that_starts_claims_the_scratch_directory() {
 /// a daemon that fails to start after its first driver's sweep would leave its own id,
 /// and the next daemon would name a process that never ran a lease as the one whose
 /// runs it killed, while the runs of the one before are taken as alive. The failing
-/// driver here is the whole-machine one, after the native one: off macOS it is refused,
-/// on macOS it finds no helper.
+/// driver here is the fake one, after the native one: both serve the `action` kind, so it is
+/// refused once the native runtime's sweep has run.
 #[tokio::test]
 async fn a_daemon_that_does_not_start_keeps_the_claim_it_found() {
     let dir = scratch("instance-kept");
     tls_files(&dir);
     std::fs::create_dir_all(dir.join("leases")).expect("scratch");
     std::fs::write(dir.join("leases/daemon-instance"), "the-one-before\n").expect("claim");
-    let flag = |name: &str, path: &Path| format!("--{name}={}", path.display());
     let cli = cli(
         &dir,
         &[
             "--cas=https://127.0.0.1:1".to_owned(),
-            flag("xcode-apps", &dir.join("Applications")),
-            flag("mac-session-socket", &dir.join("no-helper")),
             "--driver=native".to_owned(),
-            "--driver=native-whole-machine".to_owned(),
+            "--driver=fake".to_owned(),
         ],
     );
     let config = native_config(&cli).expect("the native configuration");
-    let error = native_with(&cli, config, &dir.join("no-xcrun"))
-        .err()
-        .expect("started");
-    assert!(error.to_string().contains("whole-machine"), "{error}");
+    let error = native_with(&cli, config).err().expect("started");
+    assert!(
+        error.to_string().contains("both serve lease kind"),
+        "{error}"
+    );
     assert_eq!(claimed(&dir).as_deref(), Some("the-one-before\n"));
-    // The native runtime's Xcode survey may still be writing under it: not removed
-    // here (the next run of this test binary's pid would).
-    drop(dir);
 }
 
 /// Catches a claim that cannot be read stopping the start (a stray directory would take
@@ -95,7 +89,7 @@ async fn a_daemon_whose_claim_cannot_be_read_starts_naming_none() {
     tls_files(&dir);
     std::fs::create_dir_all(dir.join("leases/daemon-instance")).expect("in the way");
     let cli = cli(&dir, &["--driver=fake".to_owned()]);
-    let started = node(&cli, || native_config(&cli), &dir.join("no-xcrun"));
+    let started = node(&cli, || native_config(&cli));
     assert!(started.is_ok(), "the start failed on its claim");
     assert!(dir.join("leases/daemon-instance").is_dir());
 }

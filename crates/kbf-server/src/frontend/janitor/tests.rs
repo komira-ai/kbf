@@ -566,12 +566,9 @@ const BASE: [&str; 5] = [
 ];
 
 /// The flags the task switch needs.
-const TASK: [&str; 5] = [
+const TASK: [&str; 2] = [
     "--task-secret-file=/etc/kbf/task.secret",
-    "--task-put-endpoint=http://127.0.0.1:9000",
-    "--task-put-bucket=tiers",
-    "--task-put-credentials-file=/etc/kbf/presign.json",
-    "--task-read-url=https://127.0.0.1:8443",
+    "--task-out-root=/mnt/ts/put",
 ];
 
 /// The flags the packs need.
@@ -897,15 +894,11 @@ async fn a_frontend_with_the_janitor_flags_sweeps_the_store_as_it_serves() {
         "0123456789abcdef0123456789abcdef",
         0o600,
     );
-    let presign = file(dir.path(), "presign.json", GC_KEY, 0o600);
     let gc = file(dir.path(), "gc.json", GC_KEY, 0o600);
     let mut more = pack_flags(s3.endpoint(), dir.path());
     more.extend([
         format!("--task-secret-file={}", secret.display()),
-        "--task-put-endpoint=http://127.0.0.1:9".to_owned(),
-        "--task-put-bucket=kbf-fake".to_owned(),
-        format!("--task-put-credentials-file={}", presign.display()),
-        "--task-read-url=https://127.0.0.1:8443".to_owned(),
+        "--task-out-root=/mnt/ts/put".to_owned(),
         format!("--task-janitor-key-file={}", gc.display()),
         "--task-janitor-interval-secs=1".to_owned(),
     ]);

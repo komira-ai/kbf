@@ -8,9 +8,9 @@ the places that repeat these parts (sections 0, 6, 9 and 10.1):
 - **`executor-node-store-port`** (8.3, and the passed-through tierstore port of 3.4, 3.6, D18): the job has no network and no tierstore port.
 - **kbf storage on the Linux nodes** (7.1 step 1, item 20): a node's store is tierstore, an object-store proxy.
 
-Status: **DESIGN, for the owner's review; nothing here is built and no code changes with this document**, so no
-existing document is stale yet; section 11 names the documents each build item updates. Linux only; macOS is section
-14, one open question and no more. This revision follows the owner's decisions of 2026-11-10 (section 1, O7 to
+Status: **DESIGN, for the owner's review; the Linux part of this document is not built** (the macOS part of section
+14 is built in kbf), so no existing Linux document is stale yet; section 11 names the documents each build item updates. Linux, but for macOS, which is
+section 14. This revision follows the owner's decisions of 2026-11-10 (section 1, O7 to
 O15), which replace the first revision's job shape: the job's whole root file system, the base image included, is
 a tierstore tree that jobscheduler mounts as an ordinary host directory, the download of inputs is temporary,
 and the tierstore calls specific to kbf are `hydrate` and `release`, beside `put-ca` for outputs. It is amended by
@@ -49,11 +49,11 @@ temporary fallback; section 7.2 designs its removal.
 
 **What does not change.** The REAPI surface (Execute, WaitExecution, the action cache, the CAS), the answers clients
 get (section 6), the action-cache rule (exit 0 and not `do_not_cache`), the frontend's in-flight deduplication, the
-memory ladder and the farm's rerun budgets, the Macs (still `kbf-daemon`), and the storage half of the Linux nodes.
+memory ladder and the farm's rerun budgets, and the storage half of the Linux nodes. The Macs are section 14.
 
 Contents: 1 rulings; 2 where things stand; 3 the job; 4 inputs; 5 outputs; 6 failures and retries; 7 what is deleted;
 8 the flip; 9 tests; 10 numbers and the gate; 11 build items; 12 decisions; 13 what this asks of jobscheduler and
-tierstore; 14 macOS later and other open points.
+tierstore; 14 macOS and other open points.
 
 ## 1. The rulings this starts from
 
@@ -595,8 +595,8 @@ and 21):
    the storage half is the same code, so the store keeps serving). From then the executor's rollback is the previous
    release and units, not a line (8.4).
 2. **Then the code**, once no unit selects `--driver container`: `crates/kbf-driver-container` (11,704 non-test lines of
-   `src`), the daemon's container wiring, Linux input cache and shared-tree code in `kbf-daemon` and `kbf-node` (Macs
-   keep the `native` driver and the clone cache), and the placement filter of 8.2.
+   `src`), the daemon's container wiring, Linux input cache and shared-tree code in `kbf-daemon` and `kbf-node` (the
+   `native` driver stays, as plain processes on Linux), and the placement filter of 8.2.
 
 ### 7.2 The copy to scratch (O11)
 
@@ -625,7 +625,7 @@ After the removal an action whose input root cannot be a tree is refused by name
 is a farm fault and rerun, like a lost host today. A job's network is `none` plus the passed-through node tierstore port.
 
 What stays: the farm, the executor, `kbf-job-client`, `kbf-task` (tree mode), `kbf-task-pack`, `prepare_run`, the
-ingest, the worker listener and `kbf-daemon` for the Macs.
+ingest and the worker listener.
 
 ## 8. The flip on the six Linux nodes
 
@@ -656,7 +656,7 @@ drain of the restart waits for the jobs in flight (B15).
 ### 8.2 The Linux daemons during the window
 
 The daemons keep running beside `js-agent` until the nodes move (7.1), so the rollback is one line. While
-`--executor js-agent` is set, the farm's placement skips every Linux daemon worker; Mac daemons are placed as before
+`--executor js-agent` is set, the farm's placement skips every Linux daemon worker, and a Mac daemon is given no lease under any executor (14)
 [proposed, D11]. It is a filter computed at placement from the running setting, not a cordon (a stored row only the
 operator lifts, `farm/cordon_owner.rs`), so the rollback's restart leaves nothing behind.
 
@@ -1058,14 +1058,41 @@ None of these is kbf code; each is a change for its own repository and design.
 kbf relies on the manifest format of ts 6.1 as merged, `cas/l/<sha256>` for manifests and whole objects, and ranged
 `source`s into kbf's packs and whole-object `source`s into `cas/j/`.
 
-## 14. macOS later, and other open points
+## 14. macOS, and other open points
 
-**macOS** is out of scope for now (the Macs are in device-management enrollment; they keep `kbf-daemon` with the
-native driver, and the frontend keeps the worker listener). One open question: macOS has no overlayfs, so the shape of
-3.1 does not carry over. tierstore itself would have to serve each job a writable view, its lower layer the tree and
-its upper a local APFS directory, through its macOS mount (the NFSv3 frontend serves read-only trees today, and the
-core's views were dropped, ts 12 item 11). Whether tierstore builds that, and how a Seatbelt-confined job is pointed at
-it, is for a macOS design.
+**macOS** runs as jobs too, built in kbf and waiting on jobscheduler. The Macs run no `kbf-daemon`, and the farm
+gives a daemon that reports `os=macos` no lease under any executor
+(`crates/kbf-server/src/farm/linux_daemons.rs`); they run js-agent, whose macOS
+native runtime runs a job as a user of its pool under its `sandbox-exec` profile, in the run
+directory `exec/` (the job's `/work`). macOS has no overlayfs and no bind mounts, so 3.1 does not carry over: the task
+copies the inputs out of the tree instead of running on it.
+
+- **Routing** (`crates/kbf-server/src/executor/mac.rs`). An action whose platform asks for macOS, as the farm reads
+  it (`OSFamily` `macos`/`darwin`/`macosx`/`osx`, or `os=macos`), is placed only on the executor's Mac workers,
+  `js-mac:<frontend>-<n>` (`--executor-mac-hosts`, 0 by default, so nothing changes until it is set), which report
+  `os=macos`, `arch=arm64` and the one driver `native`. `os_version=26` means 26 or newer: the job service has no
+  version constraint, so the executor refuses an action that asks for more than `--executor-mac-os-version` (26).
+- **The job**: the release's `kbf-task` bundle by its darwin manifest digest as the image
+  (`--executor-mac-task-bundle`; its entrypoint runs), no layer, `os=macos`, `arch=arm64`, `exec=sandbox-exec`, no
+  network; the action tree read-only at `/work/.kbf-tree` and the put directory read-write at `/work/.kbf-out`, both
+  `no_exec`, which a Mac's agent makes `exec/.kbf-tree` and `exec/.kbf-out`.
+- **The task** (`kbf-task --materialize-work=.kbf-tree`, `crates/kbf-task/src/materialize.rs`): reads `.kbf/action`
+  and `.kbf/command` from the tree as a tree job does, copies `work` into `exec/work` (`std::fs::copy`: an APFS clone
+  where the source and `exec/` share a volume, a byte copy otherwise; every copy private, so an output may name an
+  input), runs the Command there, and commits its one object into `exec/.kbf-out` (`--out-dir .kbf-out`) as 5.2
+  says. The Command is started directly: the agent's sandbox is its sandbox, and no `sandbox-exec` is nested.
+- **What jobscheduler must still do** before a Mac runs one (none of it is in kbf's pin or its `main`): take a native
+  start from the job API (the server's job start has no `run`, and a Mac agent reports no `per-job`), take mounts on a
+  Mac (its `docs/design/job-rootfs.md` item 7; a job with mounts asks for `layered-rootfs`, which no Mac reports),
+  and serve the tierstore trees and put directories on the Macs. Until then no Mac runs a kbf action, as none runs
+  a daemon (komira-ai/jobscheduler#888 lists the four items).
+- **The `kbf-daemon` Mac path is removed.** The Mac daemon driver (`native` and `native-whole-machine` on a Mac, Xcode,
+  simulator, iOS device and VM leases on a daemon), the Mac session and lease-user pool, the Mac provisioning tool and the
+  VM crates are deleted, and `kbf-daemon` itself stays for the Linux daemons (`--executor kbf-daemon`, and the
+  `native` driver as plain processes on Linux for the beta smoke farm). A macOS action has one runner, the job
+  above. Kept: the executor's Mac path, `kbf-task` and its bundle, the wire and proto fields of the removed path (a
+  reader still reads old data), and the Mac side of the host install (`kbf-host-install`, `kbf-installer`, the
+  package), which install `kbf` on a Mac host and are a separate change.
 
 **Other open points:**
 

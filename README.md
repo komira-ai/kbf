@@ -12,9 +12,9 @@ kbf is written in Rust. Its programs are named `kbf-*`:
   content-addressable storage, and schedules actions onto workers.
 - `kbf-daemon`: the worker. It runs on each build machine, fetches inputs,
   runs actions in isolation, and uploads outputs. A Linux node runs each action
-  in a rootless container (`--driver container`); a Mac runs it as plain
-  processes (`--driver native`), with its process tree, memory and network
-  watched by the daemon.
+  in a rootless container (`--driver container`); `--driver native` runs it
+  as plain processes on Linux. The Macs run no `kbf-daemon`: a macOS action
+  runs as a js-agent job (`docs/design/actions-as-jobs.md`, section 14).
 
 `kbf` is a new binary with the modes `frontend`, `storage`, `daemon`, `storage-and-daemon`,
 chosen with `kbf --mode=<mode>` (or `mode = "..."` in `/etc/kbf/kbf.toml`);

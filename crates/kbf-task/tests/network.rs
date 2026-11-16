@@ -6,22 +6,14 @@
 
 #![cfg(target_os = "linux")]
 
-use std::collections::HashMap;
-use std::path::Path;
-use std::sync::Mutex;
 use std::time::Duration;
 
 use clap::Parser as _;
-use kbf_proto::reapi::{Action, Command, Digest, Directory, Platform, platform::Property};
-use kbf_segments::sha256;
-use kbf_task::digest::to_reapi;
-use kbf_task::fetch::{BlobSource, FetchError, label};
+use kbf_proto::reapi::Command;
 use kbf_task::network::{Layers, Network};
 use kbf_task::run::{Ran, Run, run};
-use kbf_task::task::{Cli, EXIT_RUN, Failure, PackSink, execute};
-use kbf_task_pack::read_manifest;
+use kbf_task::task::{Cli, EXIT_RUN};
 use kbf_testkit::dir::TestDir;
-use prost::Message as _;
 
 const EPERM: i32 = 1;
 /// A process the filter kills with `SIGSYS` (31) is reported as 128 plus the signal.
@@ -209,187 +201,6 @@ async fn an_allowed_command_and_its_children_can_make_internet_sockets() {
             0,
             "{args:?}"
         );
-    }
-}
-
-/// Blobs in memory by digest, and a sink that keeps the packs.
-#[derive(Default)]
-struct Mem(HashMap<String, Vec<u8>>);
-
-impl Mem {
-    fn add(&mut self, bytes: Vec<u8>) -> Digest {
-        let digest = to_reapi(&sha256(&bytes));
-        self.0.insert(label(&digest), bytes);
-        digest
-    }
-}
-
-impl BlobSource for Mem {
-    fn get(&self, digest: &Digest) -> Result<Vec<u8>, FetchError> {
-        self.0
-            .get(&label(digest))
-            .cloned()
-            .ok_or_else(|| FetchError::Source {
-                digest: label(digest),
-                why: "absent".to_owned(),
-            })
-    }
-}
-
-#[derive(Default)]
-struct Kept(Mutex<Vec<Vec<u8>>>);
-
-impl PackSink for Kept {
-    fn pack_slots(&self) -> usize {
-        1
-    }
-
-    fn large_slots(&self) -> usize {
-        0
-    }
-
-    fn store_pack(&self, _slot: usize, body: &[u8]) -> Result<(), kbf_task::put::PutError> {
-        self.0.lock().expect("lock").push(body.to_vec());
-        Ok(())
-    }
-
-    fn store_large(
-        &self,
-        _slot: usize,
-        _blobs: &kbf_task::outputs::Blobs,
-        _digest: &kbf_types::Digest,
-    ) -> Result<(), kbf_task::put::PutError> {
-        Ok(())
-    }
-}
-
-fn properties(pairs: &[(&str, &str)]) -> Platform {
-    Platform {
-        properties: pairs
-            .iter()
-            .map(|(name, value)| Property {
-                name: (*name).to_owned(),
-                value: (*value).to_owned(),
-            })
-            .collect(),
-    }
-}
-
-/// An Action running the probe with `args`, its platform `platform` (on the Action) or, when
-/// `on_command`, on the Command.
-#[allow(deprecated)] // `Command::platform`
-fn action(mem: &mut Mem, args: &[&str], platform: Option<Platform>, on_command: bool) -> Digest {
-    let root = mem.add(Directory::default().encode_to_vec());
-    let mut command = command(args);
-    let mut action_platform = None;
-    if on_command {
-        command.platform = platform;
-    } else {
-        action_platform = platform;
-    }
-    let command = mem.add(command.encode_to_vec());
-    mem.add(
-        Action {
-            command_digest: Some(command),
-            input_root_digest: Some(root),
-            platform: action_platform,
-            ..Action::default()
-        }
-        .encode_to_vec(),
-    )
-}
-
-fn cli(work: &Path, action: &Digest) -> Cli {
-    Cli::try_parse_from([
-        "kbf-task",
-        "--pack-url-file",
-        "/nonexistent-url",
-        "--grant-url",
-        "https://grant.example",
-        "--grant-token-file",
-        "/nonexistent",
-        "--lease",
-        "lease-1",
-        "--action",
-        &format!("{}/{}", action.hash, action.size_bytes),
-        "--work-dir",
-        work.to_str().expect("utf-8"),
-    ])
-    .expect("flags")
-}
-
-/// The exit code the manifest of the one pack `execute` stored holds.
-async fn manifest_exit(
-    name: &str,
-    args: &[&str],
-    platform: Option<Platform>,
-    on_command: bool,
-) -> i32 {
-    let mut mem = Mem::default();
-    let digest = action(&mut mem, args, platform, on_command);
-    let dir = scratch(name);
-    let sink = Kept::default();
-    execute(&cli(&dir, &digest), &mem, &sink)
-        .await
-        .expect("task");
-    let stored = sink.0.lock().expect("lock");
-    assert_eq!(stored.len(), 1);
-    read_manifest(&stored[0]).expect("manifest").exit_code
-}
-
-/// Catches: the property not reaching the filter decision through the whole task. `netlink` is
-/// refused in every denied mode; `inet` is refused by the strict filter and made in a namespace
-/// of the Command's own, so its expected code follows the layer that applied (where the namespace
-/// applies, `inet` alone cannot tell an allowed action from a denied one; the strict mode does). With `kbf-network=allow` (on the Action, on the Command when the Action has
-/// none, and in any case of the name) the Command has no filter: `inet` is made.
-#[tokio::test]
-async fn the_task_runs_the_command_open_only_for_the_allow_property() {
-    let allow = || Some(properties(&[("kbf-network", "allow")]));
-    let shouted = || Some(properties(&[("KBF-Network", "allow")]));
-    let other = || Some(properties(&[("Pool", "big")]));
-    let denied_inet = inet_exit(&layers_here().await);
-    for (name, platform, on_command, open) in [
-        ("t-none", None, false, false),
-        ("t-other", other(), false, false),
-        ("t-act", allow(), false, true),
-        ("t-cmd", allow(), true, true),
-        ("t-case", shouted(), false, true),
-    ] {
-        let netlink = manifest_exit(name, &["netlink"], platform.clone(), on_command).await;
-        let inet = manifest_exit(name, &["inet"], platform, on_command).await;
-        if open {
-            assert_eq!(inet, 0, "{name}");
-        } else {
-            assert_eq!(netlink, EPERM, "{name}");
-            assert_eq!(inet, denied_inet, "{name}");
-        }
-    }
-}
-
-/// Catches: a value the property does not take (including `Allow`, `true`, `1` and the empty
-/// string), or the property twice, running the Command. The action fails as a run-start
-/// (exit 11) and nothing is stored.
-#[tokio::test]
-async fn any_other_value_or_a_repeat_is_refused_as_a_run_start() {
-    let cases = [
-        vec![("kbf-network", "Allow")],
-        vec![("kbf-network", "true")],
-        vec![("kbf-network", "")],
-        vec![("kbf-network", "deny")],
-        vec![("kbf-network", "allow"), ("KBF-NETWORK", "allow")],
-    ];
-    for (n, pairs) in cases.iter().enumerate() {
-        let mut mem = Mem::default();
-        let digest = action(&mut mem, &["inet"], Some(properties(pairs)), false);
-        let dir = scratch(&format!("refuse{n}"));
-        let sink = Kept::default();
-        let failure = execute(&cli(&dir, &digest), &mem, &sink)
-            .await
-            .expect_err("refused");
-        assert!(matches!(failure, Failure::Run(_)), "{pairs:?}: {failure}");
-        assert_eq!(failure.exit_code(), EXIT_RUN, "{pairs:?}");
-        assert!(failure.to_string().contains("kbf-network"), "{failure}");
-        assert!(sink.0.lock().expect("lock").is_empty());
     }
 }
 
@@ -637,7 +448,7 @@ async fn the_tool_is_non_dumpable_so_the_command_cannot_take_its_sockets() {
 
 /// Catches: `main` not making the tool non-dumpable before it does anything else (the Command it
 /// starts runs as the same user and could otherwise take its sockets). The real binary is
-/// started with a credential file that is a FIFO, so it stops at the first read of it, which
+/// started over a tree whose Action file is a FIFO, so it stops at the first read of it, which
 /// is after `main`'s first instruction; opening the FIFO for writing returns exactly then. Its
 /// `/proc/<pid>/status` is then root's, not ours. As root that comparison says nothing, so the
 /// case ends there.
@@ -651,34 +462,29 @@ fn the_binary_makes_itself_non_dumpable_before_reading_anything() {
         return;
     }
     let dir = scratch("binary-dumpable");
-    let fifo = dir.join("token");
+    std::fs::create_dir_all(dir.join("root/.kbf")).expect("root");
+    std::fs::create_dir(dir.join("out")).expect("out");
+    let fifo = dir.join("root/.kbf/action");
     let path = std::ffi::CString::new(fifo.to_str().expect("utf-8")).expect("no NUL");
     // SAFETY: `path` is NUL-terminated.
     assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_kbf-task"))
-        .args([
-            "--pack-url-file",
-            "/nonexistent-url",
-            "--grant-url",
-            "https://grant.example",
-            "--grant-token-file",
-        ])
-        .arg(&fifo)
+        .arg(format!("--tree={}", dir.join("root").display()))
+        .arg("--stage-and-commit")
+        .arg(format!("--out-dir={}", dir.join("out").display()))
         .args([
             "--lease",
             "lease-1",
             "--action",
             &format!("{}/0", "0".repeat(64)),
-            "--work-dir",
         ])
-        .arg(dir.join("work"))
         .spawn()
         .expect("kbf-task starts");
     // Returns when the binary opens the FIFO to read the token.
     let writer = std::fs::OpenOptions::new()
         .write(true)
         .open(&fifo)
-        .expect("the binary reads the token file");
+        .expect("the binary reads the Action file");
     let owner = std::fs::metadata(format!("/proc/{}/status", child.id()))
         .expect("status")
         .uid();
@@ -686,20 +492,22 @@ fn the_binary_makes_itself_non_dumpable_before_reading_anything() {
     let status = child.wait().expect("exit");
     // SAFETY: no arguments.
     assert_ne!(owner, unsafe { libc::geteuid() }, "the binary is dumpable");
-    // The empty token is a setup failure.
-    assert_eq!(status.code(), Some(14));
+    // An empty Action is not the blob its digest names: a fetch failure.
+    assert_eq!(status.code(), Some(10));
 }
 
 /// Catches: a tool that could not make itself non-dumpable going on to run the Command, which
 /// could then take its sockets. It stops with the setup exit code before anything is read.
 #[test]
 fn a_tool_that_cannot_protect_itself_stops_with_the_setup_exit_code() {
-    let dir = scratch("unprotected");
-    let digest = Digest {
-        hash: "0".repeat(64),
-        size_bytes: 0,
-    };
-    let cli = cli(&dir, &digest);
+    let cli = Cli::try_parse_from([
+        "kbf-task",
+        "--tree",
+        "--stage-and-commit",
+        "--lease=lease-1",
+        &format!("--action={}/0", "0".repeat(64)),
+    ])
+    .expect("flags");
     let refused = kbf_task::task::run_cli_with(Err(std::io::Error::other("no")), &cli);
     assert_eq!(
         format!("{refused:?}"),

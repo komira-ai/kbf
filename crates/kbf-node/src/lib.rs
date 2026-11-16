@@ -5,19 +5,17 @@
 //!
 //! Configuration is by flags only (`kbf-daemon --help`). `--driver` picks how leases
 //! run: `fake` (nothing runs; for bring-up), `container` (rootless containers made by `crun`; Linux) or
-//! `native` (plain processes; for Macs), and for `whole_machine` leases on a Mac
-//! `native-whole-machine` (each lease as its own user in its GUI session, through
-//! `kbf-mac-session`; see `whole_machine`). Given more than once, the daemon has one
+//! `native` (plain processes; Linux). Given more than once, the daemon has one
 //! runtime per driver (the node's own, native or container, set up first) and runs
 //! each Start on the one that serves its lease kind; it refuses to start when two
 //! serve the same kind. The two real drivers read and write blobs over mutual TLS
 //! through the server's worker listener named by `--cas` (normally the same address
 //! as `--server`), with the daemon's own certificate, and make lease directories
-//! under `<--data-dir>/leases`. A Mac in komira's pool runs, for example:
+//! under `<--data-dir>/leases`. A Linux node running plain processes runs, for example:
 //!
 //! ```text
 //! kbf-daemon --driver native --server https://kbf-server:8981 --cas https://kbf-server:8981 \
-//!   --ca-cert ca.pem --cert node.pem --key node.key --node-id mac-studio-1 \
+//!   --ca-cert ca.pem --cert node.pem --key node.key --node-id worker-1 \
 //!   --data-dir /var/kbf
 //! ```
 //!
@@ -32,7 +30,7 @@
 //!
 //! Everything the daemon keeps on disk is under one directory, `--data-dir` (default
 //! `/var/lib/kbf`; `data_dir`): `leases/`, and under the container driver and the
-//! native driver on macOS the input cache it links (container) or clones (native) each
+//! container driver the input cache it links each
 //! lease's input files from, and the shared input trees. Their budgets
 //! come from the filesystem, not from flags; `--data-max-bytes` only lowers them, and
 //! `--no-input-cache` switches the cache and the trees off.
@@ -47,26 +45,22 @@
 //! With `--tierstore-endpoint` (off by default; `tierstore`) `kbf daemon` reads the same packs
 //! through a tierstore on loopback first, and every blob it does not serve where it always was.
 //!
-//! The log goes to stderr, in color only when stderr is a terminal: under launchd or
-//! systemd it is a file or a journal, where escape codes are noise (issue #170). The
-//! daemon does not rotate it; the service manager that owns stderr does. systemd's
-//! journal rotates by its own size limits; launchd's `StandardErrorPath` file is
-//! emptied by `kbf-mac-provision` at each restart and upgrade (see
-//! `docs/design/mac-node-provisioning.md`, section 5.7).
+//! The log goes to stderr, in color only when stderr is a terminal: under systemd
+//! it is a journal, where escape codes are noise (issue #170). The daemon does not
+//! rotate it; the service manager that owns stderr does, by its own size limits.
 
 use std::future::Future;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
 pub use kbf_daemon::LocalMember;
 use kbf_daemon::{
-    Args, Capacity, DAEMON_VERSION, Daemon, DaemonConfig, DriverWatch, FakeRuntime, FarmCas,
-    Liveness, MapHolder, NodeReport, Runtime, Runtimes,
+    Args, Capacity, DAEMON_VERSION, Daemon, DaemonConfig, FakeRuntime, FarmCas, Liveness,
+    MapHolder, NodeReport, Runtime, Runtimes,
 };
-use kbf_driver_native::slots::Pool;
-use kbf_driver_native::{MemoryPolicy, NativeConfig, NativeRuntime, xcode, xcode_watch};
+use kbf_driver_native::{MemoryPolicy, NativeConfig, NativeRuntime};
 use kbf_outputs::OutputLimits;
 use kbf_threads::disk::Statvfs;
 use kbf_transfer::Cas;
@@ -221,32 +215,12 @@ pub struct Cli {
     /// killed, in milliseconds; 0 kills them at once (native). A workload that cleans up
     /// when asked to end, such as Python's multiprocessing resource tracker with the
     /// shared memory it made, does so in this time; one that ignores SIGTERM is named in
-    /// the lease's stderr. A slot's clean uses the same value (at most its own time
-    /// limit). More than 60000 is taken as 60000. The wait comes after the action's
+    /// the lease's stderr. More than 60000 is taken as 60000. The wait comes after the action's
     /// timeout and its memory watch have ended it (neither runs during it), and on top
     /// of the time given to the kill that follows. A lease past its memory limit is
-    /// killed at once. Applies on every platform.
+    /// killed at once.
     #[arg(long, default_value_t = 2000)]
     native_term_grace_ms: u64,
-    /// The directory searched for `Xcode*.app` (native). Each Xcode whose own
-    /// `xcodebuild` answers `-version`, `-license check` and `-checkFirstLaunchStatus`,
-    /// and for which `xcrun --find clang` does (each within a minute, under the
-    /// actions' sandbox), is ready: it is reported as an `xcode` entry, and an action
-    /// that names its build runs with it as `DEVELOPER_DIR`. One that is not is listed
-    /// in the node's status with why and the command that fixes it, and logged at WARN.
-    /// The daemon says Hello without waiting for its first survey, which runs in the
-    /// background: until it ends, each Xcode is listed as not surveyed yet and none is
-    /// reported.
-    #[arg(long, default_value = xcode::APPLICATIONS)]
-    xcode_apps: PathBuf,
-    /// How often, in seconds, the Xcodes are asked again (native), so one fixed while
-    /// the daemon runs becomes ready without a restart.
-    #[arg(long, default_value_t = xcode_watch::EVERY.as_secs())]
-    xcode_recheck_secs: u64,
-    /// This node's actions use Metal (native): an Xcode whose Metal toolchain is not
-    /// installed (`xcodebuild -showComponent MetalToolchain`) is not ready.
-    #[arg(long)]
-    require_metal_toolchain: bool,
     /// A container image this node is pinned to, as an action names it:
     /// `docker://<repo>@sha256:<digest>`, one architecture's manifest digest
     /// (container; repeatable). At start the daemon makes sure each is in the node's
@@ -282,23 +256,6 @@ pub struct Cli {
     /// driver's startup check reads instead of `/etc`'s. For tests of that check only.
     #[arg(long, hide = true)]
     id_files: Option<PathBuf>,
-    /// The socket `kbf-mac-session` serves (native-whole-machine).
-    #[arg(long, default_value = "/var/run/kbf-mac-session/socket")]
-    mac_session_socket: PathBuf,
-    /// This daemon's own user, which keeps read and remove access to what a
-    /// whole-machine lease's user writes in its lease directory (native-whole-machine).
-    #[arg(long, default_value = "_kbf")]
-    daemon_user: String,
-    /// How many lease users the pool has (native, macOS, a daemon run as root): every
-    /// action runs as one of `kbf-pool-0` .. `kbf-pool-<N-1>`, one lease per user at a
-    /// time, as kbf-mac-provision makes them (`pool_users`). Required of a root daemon,
-    /// which runs no action as root; refused for any other.
-    #[arg(long, requires = "pool_first_uid", value_parser = clap::value_parser!(u32).range(1..=100))]
-    pool_users: Option<u32>,
-    /// The uid of `kbf-pool-0`, and the group id of all the pool users (`pool_first_uid`
-    /// in kbf-mac-provision's profile); at least 600.
-    #[arg(long, requires = "pool_users")]
-    pool_first_uid: Option<u32>,
 }
 
 /// The modes whose daemon reads blobs in-process ([`start_with`]).
@@ -311,11 +268,8 @@ enum Driver {
     Fake,
     /// Each action in a fresh rootless container made by `crun` (Linux).
     Container,
-    /// Each action as plain processes on the node, for Macs.
+    /// Each action as plain processes on the node (Linux).
     Native,
-    /// Each whole-machine lease as its own user in its GUI session, through
-    /// `kbf-mac-session` (macOS).
-    NativeWholeMachine,
 }
 
 /// What stops the daemon from starting.
@@ -378,7 +332,7 @@ fn refused(e: &Error) -> bool {
 }
 
 /// Runs the helper this process was started as, if it was: each run's keeper, the
-/// lease-user pool's `as-user` step or the container driver's `__chown-dirs`, all of
+/// container driver's `__chown-dirs`, both of
 /// which are this binary re-run with a first argument the daemon's flags never take. A
 /// binary calls it first thing, before parsing [`Cli`], and exits with the code when
 /// it returns one.
@@ -387,12 +341,6 @@ pub fn dispatch_helpers() -> Option<ExitCode> {
     // Each run's keeper (`kbf-keeper __keeper ...`) is this binary, dispatched before
     // the flags are parsed, so a keeper never reads the daemon's command line.
     if let Some(code) = kbf_daemon::keeper::dispatch() {
-        return Some(code);
-    }
-    // So is the `as-user` step an action of the lease-user pool starts through
-    // (`launchctl asuser <uid> kbf __as-user ...`).
-    #[cfg(target_os = "macos")]
-    if let Some(code) = kbf_driver_native::slots::dispatch() {
         return Some(code);
     }
     // So is the container driver's `__chown-dirs` helper, which it runs in a helper
@@ -510,11 +458,9 @@ fn start_over<C: Cas>(
     let daemon = {
         // The CAS channel is made lazily, which needs the runtime's context.
         let _context = tokio.enter();
-        let xcrun = Path::new(xcode::XCRUN);
         let (daemon, _) = node_over(
             cli,
             || native_config(cli),
-            xcrun,
             maps,
             Box::new(move |cli| plane(cli, liveness)),
         )?;
@@ -661,10 +607,8 @@ struct Node<C> {
     runtimes: Option<Runtimes>,
     /// What leases may use (the container driver's `actions/` cgroup).
     capacity: Capacity,
-    /// The native driver's Xcode reports.
+    /// What the native driver reports to the daemon.
     reports: Option<Reports>,
-    /// The whole-machine runtime's phase.
-    phase: Option<tokio::sync::watch::Receiver<kbf_types::NodePhase>>,
     /// The data plane every runtime shares, made by the first that needs it.
     plane: Plane<C>,
 }
@@ -685,7 +629,6 @@ impl<C: Cas> Node<C> {
             runtimes: None,
             capacity: Capacity::default(),
             reports: None,
-            phase: None,
             plane: Plane::Unmade(plane),
         }
     }
@@ -713,13 +656,11 @@ impl<C: Cas> Node<C> {
 
 /// The daemon with a runtime for each of [`drivers`], set up in that order, every one
 /// moving blobs through the one data plane `plane` makes; the native driver with the
-/// configuration `native` makes and the `xcrun` it surveys with and
-/// warms (a test names its own user folders and sandbox, and an `xcrun` of its own).
-/// Also returns what the native driver's Xcode watch sends the daemon, for a test to
-/// follow. Its node report is the detected entries and a `drivers` entry
+/// configuration `native` makes. Also returns what the native driver reports to the
+/// daemon, for a test to follow. Its node report is the detected entries and a `drivers` entry
 /// per runtime (which `Daemon::new` adds), its `cpus` and `mem_gib` no more than the
 /// container driver allows; the native driver adds its own with
-/// `Daemon::with_driver_report`. Its status lists every `--image`, which only the
+/// `Daemon::with_driver_report` (how it keeps the network off). Its status lists every `--image`, which only the
 /// container driver runs: without it, `--image` fails the start. With a real driver, once
 /// every runtime is built, it claims the lease directory and names the claim it found
 /// as its predecessor (`instance`). With `maps`, the daemon keeps the storage map its
@@ -727,7 +668,6 @@ impl<C: Cas> Node<C> {
 fn node_over<C: Cas>(
     cli: &Cli,
     native: impl Fn() -> Result<NativeConfig, Error>,
-    xcrun: &Path,
     maps: Option<Arc<MapHolder>>,
     plane: MakePlane<C>,
 ) -> Result<(Daemon, Option<Reports>), Error> {
@@ -749,22 +689,13 @@ fn node_over<C: Cas>(
         match driver {
             Driver::Fake => node.add(Arc::new(FakeRuntime::new(Duration::ZERO)))?,
             Driver::Native => {
-                #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
-                let mut config = native()?;
-                // Its leases' inputs are clones of the data directory's cache and trees
-                // on macOS; elsewhere the plan makes neither.
-                #[cfg(target_os = "macos")]
-                if let Some(plan) = plan.as_ref().filter(|plan| plan.cached) {
-                    config.cache = data_dir::native_cache(plan);
-                    config.trees = data_dir::native_trees(plan, config.cache.as_ref());
-                }
+                let config = native()?;
                 let cas = node.plane(cli)?;
-                let (runtime, reports) = native_runtime(cli, config, xcrun, cas)?;
+                let (runtime, reports) = native_runtime(config, cas)?;
                 node.add(runtime)?;
                 node.reports = Some(reports);
             }
             Driver::Container => container::add(cli, &mut node, &plan)?,
-            Driver::NativeWholeMachine => whole_machine::add(cli, &mut node)?,
         }
     }
     let runtimes = node.runtimes.ok_or("no --driver given")?;
@@ -774,14 +705,8 @@ fn node_over<C: Cas>(
     node.capacity.cpus = Some(node.capacity.cpus.map_or(leases, |cpus| cpus.min(leases)));
     // `Daemon::new` adds every runtime's driver.
     let report = offered(NodeReport::detect(&[])?, node.capacity);
-    // A node without the whole-machine runtime is always serving: a phase that never
-    // changes.
-    let phase = node
-        .phase
-        .unwrap_or_else(|| tokio::sync::watch::channel(kbf_types::NodePhase::Serving).1);
     let daemon = Daemon::new(DaemonConfig::from_args(&cli.daemon), runtimes, report)?
-        .with_container_images(cli.images.iter().cloned())
-        .with_phase(phase);
+        .with_container_images(cli.images.iter().cloned());
     // One line, not a match: this function has an instance per data plane, and an arm
     // each instance never takes would be a line the coverage ratchet counts as missed.
     let daemon = maps.into_iter().fold(daemon, Daemon::with_map);
@@ -801,87 +726,33 @@ fn node_over<C: Cas>(
 fn node(
     cli: &Cli,
     native: impl Fn() -> Result<NativeConfig, Error>,
-    xcrun: &Path,
 ) -> Result<(Daemon, Option<Reports>), Error> {
-    node_over(cli, native, xcrun, None, Box::new(remote))
+    node_over(cli, native, None, Box::new(remote))
 }
 
 /// [`node`] with the native driver alone, its configuration `config`.
 #[cfg(test)]
-fn native_with(cli: &Cli, config: NativeConfig, xcrun: &Path) -> Result<(Daemon, Reports), Error> {
-    let (daemon, reports) = node(cli, || Ok(config.clone()), xcrun)?;
+fn native_with(cli: &Cli, config: NativeConfig) -> Result<(Daemon, Reports), Error> {
+    let (daemon, reports) = node(cli, || Ok(config.clone()))?;
     Ok((daemon, reports.ok_or("no native driver")?))
 }
 
-/// The native driver with `config`, the `xcrun` it surveys with and warms, and the
-/// process's data plane `cas`. It
-/// surveys the Xcodes in `--xcode-apps` in the background, at once and again every
-/// `--xcode-recheck-secs`, and returns each changed survey for the daemon
-/// (`Daemon::with_driver_report`): without it the node reports no Xcode, ready or
-/// not. It does not wait for the first survey: until that ends, the daemon reports
-/// every Xcode found as not surveyed yet, and none as ready.
+/// The native driver with `config` and the process's data plane `cas`, and what it
+/// reports to the daemon (`Daemon::with_driver_report`): how it keeps the network off.
 fn native_runtime<C: Cas>(
-    cli: &Cli,
-    mut config: NativeConfig,
-    xcrun: &Path,
+    config: NativeConfig,
     cas: Arc<C>,
 ) -> Result<(Arc<NativeRuntime<C>>, Reports), Error> {
-    // The simulators of the leases that ask for one are made with the same `xcrun`.
-    config.xcrun = xcrun.to_owned();
-    let runtime = NativeRuntime::new(config, cas)?;
-    let runtime = Arc::new(runtime);
-    let watched = Arc::clone(&runtime);
-    let (mut probe, every) = xcode_watch_args(cli);
-    probe.xcrun = xcrun.to_owned();
-    // Every question runs as an action does: xcrun reads and fills its cache, which
-    // leases can write, only under the sandbox.
-    probe.sandbox = Some(runtime.sandbox(kbf_driver_native::SURVEY_DIR));
-    let warm = xcrun.to_owned();
-    let warmed = std::sync::Once::new();
-    let apply = move |xcodes: &[xcode::Xcode]| {
-        let report = watched.apply_xcodes(xcodes);
-        // Once the first survey is applied, in the background and sandboxed as an
-        // action: xcrun fills its cache for the node's own Xcode and the ready ones
-        // while the node serves; each later survey warms the Xcodes it makes ready.
-        // Not before: the warm-up's lookups would make the survey's miss.
-        if xcodes.iter().all(|x| x.state != xcode::State::NotSurveyed) {
-            warmed.call_once(|| {
-                let _ = watched.warm_xcrun(&warm, xcode::ANSWER_WITHIN);
-            });
-        }
-        report
-    };
-    let (_driver, reports, xcodes) = watch_parts(&runtime)?;
-    // Returns at once: the survey runs on the watch's thread.
-    let _ = xcode_watch::watch(
-        xcodes,
-        cli.xcode_apps.clone(),
-        probe,
-        every,
-        Box::new(apply),
-    );
+    let runtime = Arc::new(NativeRuntime::new(config, cas)?);
+    // The one report the driver has: nothing changes it, so the sender is not kept.
+    let (_, reports) = tokio::sync::watch::channel(kbf_daemon::DriverReport {
+        entries: runtime.capabilities(),
+        xcodes: Vec::new(),
+    });
     Ok((runtime, reports))
 }
 
-/// The native driver's driver watch, with a part per source so none overwrites another's
-/// entries: the slots' (the number of slots that can run a lease reaches the daemon
-/// whenever it changes, whether or not a survey does) wired to `runtime` before the
-/// Xcodes', whose part is returned for the survey.
-fn watch_parts<C: Cas>(
-    runtime: &NativeRuntime<C>,
-) -> Result<(DriverWatch, Reports, kbf_daemon::DriverPart), Error> {
-    let (driver, reports) = DriverWatch::new();
-    let slots = driver
-        .part(kbf_driver_native::slots::SOURCE)
-        .ok_or("the slots part of the driver watch is taken")?;
-    runtime.report_slots_through(slots);
-    let xcodes = driver
-        .part(xcode_watch::SOURCE)
-        .ok_or("the Xcode part of the driver watch is taken")?;
-    Ok((driver, reports, xcodes))
-}
-
-/// What the native driver's surveys send the daemon, merged.
+/// What the native driver reports to the daemon.
 type Reports = tokio::sync::watch::Receiver<kbf_daemon::DriverReport>;
 
 /// The data directory, resolved and made, for a daemon that runs a driver that keeps
@@ -893,9 +764,8 @@ fn data_dir(cli: &Cli) -> Result<Option<data_dir::Plan>, Error> {
     if !cli.drivers.iter().any(real) && cli.data.data_dir.is_none() {
         return Ok(None);
     }
-    // The drivers that link or clone leases' inputs from the cache.
-    let cached = cli.drivers.contains(&Driver::Container)
-        || (cfg!(target_os = "macos") && cli.drivers.contains(&Driver::Native));
+    // The drivers that link leases' inputs from the cache.
+    let cached = cli.drivers.contains(&Driver::Container);
     let plan = data_dir::Plan::new(&cli.data, cached, &Statvfs)?.with_open_leases(leases_open(cli));
     plan.create()?;
     for line in plan.describe() {
@@ -905,12 +775,10 @@ fn data_dir(cli: &Cli) -> Result<Option<data_dir::Plan>, Error> {
 }
 
 /// Whether `<--data-dir>/leases` must be searchable by others (0711, not the daemon's
-/// 0700): the container ids of the container driver are not the daemon's, and neither
-/// are the pool users of the native driver (`--pool-users`), each of which must reach
-/// its own lease directory through it. A native daemon run as its own user keeps 0700.
+/// 0700): the container ids of the container driver are not the daemon's. A native
+/// daemon runs as its own user and keeps 0700.
 fn leases_open(cli: &Cli) -> bool {
     cli.drivers.contains(&Driver::Container)
-        || (cli.pool_users.is_some() && cli.drivers.contains(&Driver::Native))
 }
 
 /// The lease directory root, `<--data-dir>/leases`, which the real drivers require.
@@ -938,17 +806,7 @@ fn native_config(cli: &Cli) -> Result<NativeConfig, Error> {
     config.poll = Duration::from_millis(cli.memory_poll_ms.max(1));
     config.term_grace =
         Duration::from_millis(cli.native_term_grace_ms).min(kbf_driver_native::grace::MAX_GRACE);
-    config.pool = (cli.pool_users.zip(cli.pool_first_uid))
-        .map(|(count, first)| Pool::provisioned(count, first))
-        .transpose()?;
     Ok(config)
-}
-
-/// How the native driver asks its Xcodes (the system's tools, and the Metal toolchain
-/// if required), and how often it asks again (at least every second).
-fn xcode_watch_args(cli: &Cli) -> (xcode::Probe, Duration) {
-    let probe = xcode::Probe::system(cli.require_metal_toolchain);
-    (probe, Duration::from_secs(cli.xcode_recheck_secs.max(1)))
 }
 
 #[cfg(target_os = "linux")]
@@ -969,7 +827,6 @@ mod retired;
 mod run;
 mod tierstore;
 mod transfer;
-mod whole_machine;
 
 #[cfg(test)]
 mod deploy_doc_tests;
@@ -977,8 +834,6 @@ mod deploy_doc_tests;
 mod exit_tests;
 #[cfg(test)]
 mod instance_tests;
-#[cfg(test)]
-mod startup_tests;
 
 #[cfg(test)]
 mod signal_tests;

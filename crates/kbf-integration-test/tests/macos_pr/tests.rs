@@ -150,15 +150,15 @@ fn a_listed_job_that_lost_its_gate_is_refused() {
         &found,
         "artifacts.yml#darwin-arm64 would run on a Mac for every pull request: its gate (Label) is gone",
     );
-    // A paths filter that matches every path.
+    // A paths filter that matches every path, and one that is gone.
     let found = changed_to(
-        "vmm-probe.yml",
-        "  pull_request:\n    paths:\n      - crates/kbf-vmm/**\n",
-        "  pull_request:\n    paths:\n      - '**'\n      - crates/kbf-vmm/**\n",
+        "host-install-mac.yml",
+        "  pull_request:\n    paths:\n      - crates/kbf-host-install/**\n",
+        "  pull_request:\n    paths:\n      - '**'\n      - crates/kbf-host-install/**\n",
     );
     has(
         &found,
-        "vmm-probe.yml#darwin-arm64 would run on a Mac for every pull request: its gate (TriggerPaths) is gone",
+        "host-install-mac.yml#real-mac would run on a Mac for every pull request: its gate (TriggerPaths) is gone",
     );
     let found = changed_to(
         "host-install-mac.yml",
@@ -176,26 +176,26 @@ fn a_listed_job_that_is_gone_or_off_a_mac_is_stale() {
     // Catches: a list that keeps a row for a job moved to Linux or renamed, so the next macOS job
     // given its name would pass unexamined.
     let found = changed_to(
-        "vmm-probe.yml",
+        "host-install-mac.yml",
         "    runs-on: macos-15",
         "    runs-on: ubuntu-latest",
     );
     has(
         &found,
-        "vmm-probe.yml#darwin-arm64 is listed as a pull request's macOS job, and is no job on a Mac: drop it from the list",
+        "host-install-mac.yml#real-mac is listed as a pull request's macOS job, and is no job on a Mac: drop it from the list",
     );
     let found = changed_to(
-        "vmm-probe.yml",
-        "  darwin-arm64:\n",
-        "  darwin-arm64-renamed:\n",
+        "host-install-mac.yml",
+        "  real-mac:\n",
+        "  real-mac-renamed:\n",
     );
     has(
         &found,
-        "vmm-probe.yml#darwin-arm64 is listed as a pull request's macOS job, and is no job on a Mac: drop it from the list",
+        "host-install-mac.yml#real-mac is listed as a pull request's macOS job, and is no job on a Mac: drop it from the list",
     );
     has_part(
         &found,
-        "vmm-probe.yml#darwin-arm64-renamed runs on a Mac for a pull request",
+        "host-install-mac.yml#real-mac-renamed runs on a Mac for a pull request",
     );
 }
 
@@ -296,13 +296,13 @@ fn a_pull_request_macos_job_with_an_environment_oidc_or_a_write_scope_is_refused
         );
     }
     let found = changed_to(
-        "mac-provision.yml",
+        "host-install-mac.yml",
         "    permissions:\n      contents: read\n",
         "    permissions:\n      contents: write\n",
     );
     has(
         &found,
-        "mac-provision.yml#darwin-arm64 sets `contents: write`; a pull request's macOS job may only read",
+        "host-install-mac.yml#real-mac sets `contents: write`; a pull request's macOS job may only read",
     );
 }
 
@@ -397,8 +397,8 @@ fn a_step_of_the_after_merge_mac_jobs_that_no_pull_request_runs_is_refused() {
     // its `if:`) and not here, a step dropped here, and a job env the device steps need.
     let found = changed_to(
         "beta.yml",
-        "      - run: cargo test -p kbf-guest --locked\n",
-        "      - run: cargo test -p kbf-guest --locked\n      - run: cargo test -p kbf-new --locked\n",
+        "      - run: cargo test -p kbf-outputs --locked\n",
+        "      - run: cargo test -p kbf-outputs --locked\n      - run: cargo test -p kbf-new --locked\n",
     );
     has(
         &found,
@@ -406,21 +406,21 @@ fn a_step_of_the_after_merge_mac_jobs_that_no_pull_request_runs_is_refused() {
     );
     let found = changed_to(
         MACOS_PR,
-        "      - run: cargo xtask sudo-test -p kbf-driver-native --test slot_gpu -- --test-threads=1 --nocapture\n",
+        "      - run: cargo test -p kbf-outputs --locked\n",
         "",
     );
     has(
         &found,
-        "beta.yml#native-macos runs `cargo xtask sudo-test -p kbf-driver-native --test slot_gpu -- --test-threads=1 --nocapture` and no step of macos-pr.yml's macOS jobs is that step",
+        "beta.yml#native-macos runs `cargo test -p kbf-outputs --locked` and no step of macos-pr.yml's macOS jobs is that step",
     );
     let found = changed_to(
         MACOS_PR,
-        "      - run: cargo xtask sudo-test -p kbf-mac-provision --test as_root -- --test-threads=1 --nocapture\n        if: ${{ !cancelled() }}\n",
-        "      - run: cargo xtask sudo-test -p kbf-mac-provision --test as_root -- --test-threads=1 --nocapture\n",
+        "      - run: cargo test -p xtask --test pkg_macos --locked -- --ignored homebrew\n        if: ${{ !cancelled() }}\n",
+        "      - run: cargo test -p xtask --test pkg_macos --locked -- --ignored homebrew\n",
     );
     has_part(
         &found,
-        "beta.yml#native-macos runs `cargo xtask sudo-test -p kbf-mac-provision --test as_root",
+        "beta.yml#native-macos runs `cargo test -p xtask --test pkg_macos --locked -- --ignored homebrew",
     );
     let found = changed_to(
         "beta.yml",

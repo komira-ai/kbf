@@ -55,6 +55,7 @@ fn state() -> StateStore {
 fn flags(dir: &Path) -> HistoryFlags {
     HistoryFlags {
         history_objects: Some(StoreUri::File(dir.to_path_buf())),
+        history_credentials_file: None,
         history_index_root: None,
     }
 }

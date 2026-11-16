@@ -1480,11 +1480,22 @@ otherwise; the body lists each failing check and why:
 |---|---|
 | `stopping` | the server has received SIGTERM or SIGINT, or `POST /v1/frontend/drain` has begun a drain, or `POST /v1/frontend/retire` has retired the frontend. It answers `503` from that moment, and for the rest of the drain; open Execute streams are kept until their action is done, and only the shutdown timeout (`--shutdown-timeout-secs`) or a second signal ends them (`--drain-deadline`, on a frontend over a state store, only reports); the one exception is a stream whose operation was never started, that no worker on this frontend can run and that no other frontend can take, which ends `UNAVAILABLE` when the drain begins |
 | `leader` | the server does not hold the scheduler role. A single server runs every role and always holds it; the check is there for a replicated control log, whose followers fail it. **Planned**: a second readiness path, without this check, for the servers that may serve reads ([deployment-topology.md](design/deployment-topology.md#build-clients-one-name-routed-by-method)) |
-| `store` | the object store does not answer a one-byte read of the key `<prefix>readyz-probe` within `--readyz-store-timeout-ms` (default 2000; it bounds the gRPC health service's probe too), or answers with an error. The probe only reads: no poll writes, deletes or lists. Nothing writes that key, so "not found" is the expected answer and passes, as does the object's bytes or a range past its end |
+| `store` | the object store does not answer a one-byte read of the key `<prefix>readyz-probe` within `--readyz-store-timeout-ms` (default 2000; it bounds the gRPC health service's probe too), or answers with an error. A frontend has no such check: its probes are `storage`, `state_store` and `map` (above). The probe only reads: no poll writes, deletes or lists. Nothing writes that key, so "not found" is the expected answer and passes, as does the object's bytes or a range past its end |
 | `deny_rows` | only where the worker listener checks callers against the state store's deny rows (worker mTLS or `--proxy-auth-file`, with `--state-store`): the listener's copy of the rows cannot be used, because no read has found them since the start or the newest is older than three sweeps (`DENY_SNAPSHOT_SWEEPS` beats), so the listener refuses every call `UNAVAILABLE` ("When the rows cannot be read", in the enrollment section above). It reads no store |
 
-`version` and `commit` are those of `GET /v1/nodes`' `server` field. Each `/readyz`
-makes one read of the store, so poll it at the interval the front needs, not faster.
+`version` and `commit` are those of `GET /v1/nodes`' `server` field.
+
+A frontend answers `/readyz` from the last answers of its probes (`storage`, `state_store`,
+`map`, `executor`, `deny_rows`), without waiting for any of them. Each probe is asked again in
+the background every `--readyz-probe-interval-ms` (default 1000), within its own timeout
+(`--readyz-store-timeout-ms`, default 2000): a probe that has not answered by then counts as
+failed, with the wait named in its reason, and a probe that hangs delays no other. Every probe
+is asked once before the frontend serves, so the first `/readyz` has an answer. A change in a
+dependency therefore shows in `/readyz` within the interval plus the time the probe takes
+(at most the timeout), and polling `/readyz` makes no read of any store, so poll it as often
+as the front needs. `stopping` (a drain or a stop signal), `leader` and a retire are flags,
+not probes: they are read at each request and change the answer at once. `kbf-server` itself
+(not a frontend) has no background asks: each `/readyz` makes one read of the store.
 
 **`GET /readyz/reapi`**: the readiness a load balancer asks for the REAPI cluster. It is
 `/readyz` with one more check, and has the same body, status codes and (no) token. A
@@ -1558,9 +1569,9 @@ whole), `build.bazel.remote.execution.v2.Capabilities`,
 
 | Method | Answer |
 |---|---|
-| `Check` | the status, after one store probe (as one `/readyz`). Another service name is `NOT_FOUND` |
-| `List` | every name above with the status, after one store probe |
-| `Watch` | the status at once, then each time it changes. It evaluates again as soon as a stop signal arrives or the scheduler role changes, and probes the store every 5 s. Once the server is stopping it sends `NOT_SERVING` (if that was not its last message) and ends the stream `UNAVAILABLE`, so an open Watch does not hold up the drain. Another service name is sent `SERVICE_UNKNOWN`, and the stream stays open until the server stops |
+| `Check` | the status, from the same answers as `/readyz` (a frontend: the last answers of its probes; `kbf-server`: after one store probe). Another service name is `NOT_FOUND` |
+| `List` | every name above with the status, as `Check` |
+| `Watch` | the status at once, then each time it changes. It evaluates again as soon as a stop signal arrives or the scheduler role changes, and evaluates the checks every 5 s (a frontend reads the last answers of its probes; `kbf-server` probes the store). Once the server is stopping it sends `NOT_SERVING` (if that was not its last message) and ends the stream `UNAVAILABLE`, so an open Watch does not hold up the drain. Another service name is sent `SERVICE_UNKNOWN`, and the stream stays open until the server stops |
 
 On SIGTERM or SIGINT the status turns `NOT_SERVING` before the REAPI streams are
 ended and the listener stops accepting. After that the listener takes no new calls,
@@ -1570,7 +1581,7 @@ proxy marks the server down.
 The REAPI authentication policy (`--reapi-auth-policy`, [reapi-auth.md](reapi-auth.md))
 does not run on these calls: a health check needs no credentials, whatever the policy.
 Every other call on the listener, a path it does not serve included, still runs it.
-The store probe waits at most `--readyz-store-timeout-ms`, like `/readyz`'s.
+A probe waits at most `--readyz-store-timeout-ms`, like `/readyz`'s, and a frontend asks it every `--readyz-probe-interval-ms` in the background.
 
 **Planned:** with several servers, the answers follow the two readiness paths, ready
 to serve reads and leader; which service name reports which is not chosen

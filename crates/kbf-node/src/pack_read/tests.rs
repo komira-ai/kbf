@@ -63,7 +63,6 @@ fn daemon(dir: &Path, more: &[String]) -> Cli {
         "--driver=native".to_owned(),
         "--cas=https://127.0.0.1:1".to_owned(),
         flag("data-dir", dir),
-        flag("xcode-apps", &dir.join("Applications")),
     ];
     argv.extend_from_slice(more);
     Cli::try_parse_from(argv).expect("flags")

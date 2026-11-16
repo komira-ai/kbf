@@ -11,8 +11,10 @@
 //!   two writers is one row;
 //! - **a shared row**: every writer reads and writes it, by counter or by
 //!   read-modify-write (the stream counter, the shape and status rows and the by-status
-//!   index). Two writers racing on one would lose an update, so only the generation
-//!   holder writes them, behind the fence.
+//!   index). Each write holds with any number of writers: the counter is advanced inside
+//!   its transaction, a shape row is created only if absent, and a status row and its
+//!   by-status entry are written in one transaction conditional on the version read, and
+//!   read again after a conflict ([`crate::derived`]).
 
 use crate::keys::{IndexRoot, InvKey, WriterId};
 
@@ -47,7 +49,9 @@ pub enum Ownership {
     Writer(WriterId),
     /// Any writer: an insert under a key no other writer is given, or with an empty value.
     Insert,
-    /// Only the generation holder, behind the fence.
+    /// Any writer, by a counter advanced in the transaction or by a write conditional on
+    /// the version it read (or on the key's absence); a lost race is read again, never
+    /// overwritten.
     Fenced,
 }
 

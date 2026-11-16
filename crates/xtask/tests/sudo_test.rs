@@ -8,7 +8,7 @@ use std::process::Command;
 
 const XTASK: &str = env!("CARGO_BIN_EXE_xtask");
 const FAKE: &str = env!("CARGO_BIN_EXE_xtask-fake");
-const BUILD: &str = "test --locked --no-run --message-format=json -p kbf-guest --test as_root";
+const BUILD: &str = "test --locked --no-run --message-format=json -p kbf-seatbelt --test as_root";
 
 /// One run's directories: the repository root cargo runs in, and the fake sudo's.
 struct Run {
@@ -21,7 +21,7 @@ struct Run {
 impl Run {
     /// An empty root for one test, a fake sudo, and the messages the fake cargo prints:
     /// the target's test binary (`<root>/target/debug/deps/as_root-0f1e`, from the
-    /// package at `<root>/crates/kbf-guest`) after `before`.
+    /// package at `<root>/crates/kbf-seatbelt`) after `before`.
     fn new(name: &str, before: &str) -> Run {
         let own = TestDir::under(
             Path::new(env!("CARGO_TARGET_TMPDIR")).join("xtask-sudo-test"),
@@ -32,7 +32,7 @@ impl Run {
         std::fs::create_dir_all(&bin).expect("scratch");
         let sudo = bin.join("sudo");
         std::fs::hard_link(FAKE, &sudo).expect("link the fake as sudo");
-        let package = root.join("crates/kbf-guest");
+        let package = root.join("crates/kbf-seatbelt");
         std::fs::create_dir_all(&package).expect("package directory");
         let artifact = format!(
             r#"{{"reason":"compiler-artifact","target":{{"kind":["test"],"name":"as_root"}},"profile":{{"test":true}},"executable":"{}","manifest_path":"{}"}}"#,
@@ -48,12 +48,12 @@ impl Run {
         }
     }
 
-    /// `sudo-test -p kbf-guest --test as_root` with `extra` arguments, with the fake
+    /// `sudo-test -p kbf-seatbelt --test as_root` with `extra` arguments, with the fake
     /// as `cargo` and planting `defect` (or none): exit code and stderr.
     fn xtask(&self, cargo: &Path, defect: Option<&str>, extra: &[&str]) -> (Option<i32>, String) {
         let mut cmd = Command::new(XTASK);
         cmd.arg("--root").arg(&self.root);
-        cmd.args(["sudo-test", "-p", "kbf-guest", "--test", "as_root"]);
+        cmd.args(["sudo-test", "-p", "kbf-seatbelt", "--test", "as_root"]);
         cmd.args(extra).env("CARGO", cargo);
         match defect {
             Some(d) => cmd.env("XTASK_FAKE_DEFECT", d),
@@ -81,7 +81,7 @@ impl Run {
     fn ran(&self, args: &str) -> String {
         format!(
             "{}: -n {} --ignored{args}\n",
-            self.root.join("crates/kbf-guest").display(),
+            self.root.join("crates/kbf-seatbelt").display(),
             self.root.join("target/debug/deps/as_root-0f1e").display()
         )
     }
@@ -95,7 +95,7 @@ impl Run {
 /// the artifact is the package's bin, which is built for the test too.
 #[test]
 fn the_target_s_binary_runs_as_root_with_ignored_and_the_test_args() {
-    let decoy = r#"{"reason":"compiler-artifact","target":{"kind":["bin"],"name":"kbf-guest"},"profile":{"test":false},"executable":"/w/kbf-guest","manifest_path":"/w/Cargo.toml"}"#;
+    let decoy = r#"{"reason":"compiler-artifact","target":{"kind":["bin"],"name":"kbf-seatbelt"},"profile":{"test":false},"executable":"/w/kbf-seatbelt","manifest_path":"/w/Cargo.toml"}"#;
     let run = Run::new("passes", &format!("{decoy}\n"));
     let (code, err) = run.xtask(
         Path::new(FAKE),
@@ -123,7 +123,7 @@ fn tests_that_fail_as_root_fail_the_verb() {
     assert_eq!(run.sudo_args(), run.ran(""));
     assert!(
         err.ends_with(&format!(
-            "xtask: the ignored tests of -p kbf-guest --test as_root failed as root ({}): \
+            "xtask: the ignored tests of -p kbf-seatbelt --test as_root failed as root ({}): \
              exit status: 101\n",
             run.root.join("target/debug/deps/as_root-0f1e").display()
         )),
@@ -142,7 +142,7 @@ fn a_failed_build_runs_nothing_as_root() {
     assert_eq!(run.sudo_args(), "");
     assert!(
         err.ends_with(
-            "xtask: cargo test --no-run -p kbf-guest --test as_root failed: exit status: 101\n"
+            "xtask: cargo test --no-run -p kbf-seatbelt --test as_root failed: exit status: 101\n"
         ),
         "{err}"
     );

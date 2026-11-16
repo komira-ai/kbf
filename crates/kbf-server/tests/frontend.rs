@@ -68,6 +68,8 @@ pub fn flags(more: &[&str]) -> Result<FrontendFlags, clap::Error> {
         ("--listen", "127.0.0.1:0"),
         ("--worker-listen", "127.0.0.1:0"),
         ("--api-listen", "127.0.0.1:0"),
+        // A change in a dependency shows in `/readyz` within a tick of the test's.
+        ("--readyz-probe-interval-ms", "50"),
     ] {
         if !more
             .iter()
@@ -161,6 +163,19 @@ impl Front {
     async fn client(&self) -> Client {
         Client::connect(self.reapi, self.worker).await
     }
+}
+
+/// `GET /readyz` until it answers `code`: the probes are asked in the background, so a change
+/// in a dependency shows in a later answer.
+async fn readyz_until(api: SocketAddr, code: u16) -> Value {
+    for _ in 0..500 {
+        let (got, body) = get(api, "/readyz").await;
+        if got == code {
+            return body;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("/readyz never answered {code}");
 }
 
 async fn get(api: SocketAddr, path: &str) -> (u16, Value) {
@@ -418,8 +433,7 @@ async fn readyz_follows_the_storage_node() {
     assert_eq!(ask(&mut health).await, serving(ServingStatus::Serving));
 
     node.stop().await;
-    let (code, body) = get(front.api, "/readyz").await;
-    assert_eq!(code, 503, "{body}");
+    let body = readyz_until(front.api, 503).await;
     assert_eq!(failing(&body), ["storage"], "{body}");
     assert!(
         body["failing"][0]["reason"]

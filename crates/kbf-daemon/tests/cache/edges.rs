@@ -721,3 +721,37 @@ async fn an_entry_deleted_from_outside_is_fetched_again_and_evicted_cleanly() {
     assert_eq!(cas.reads_of(&digest(&[1; 100])), 2);
     stop(cache, &gates);
 }
+
+/// Catches the lease counts telling hard links from copies wrongly (`InputStats.links` is
+/// hard links to an entry, `copies` the names that are their own inode): in hard-link mode
+/// two names of one blob are links to one inode, and an output's private name is a copy
+/// with an inode of its own.
+#[tokio::test]
+async fn in_hard_link_mode_the_shared_names_are_links_and_the_private_name_a_copy() {
+    let dir = scratch("cache-links");
+    let gates = Gates::new();
+    let mut config = config(&dir, GIB, Arc::clone(&gates), &FakeClock::at(1000));
+    config.link_mode = Some(kbf_daemon::cache::LinkMode::Hardlink);
+    config.link = Arc::new(|from: &Path, to: &Path| std::fs::hard_link(from, to));
+    let cache = Cache::open(config).expect("open");
+    assert_eq!(cache.link_mode(), kbf_daemon::cache::LinkMode::Hardlink);
+    let cas = CountingCas::default();
+    let root = cas.tree(&[
+        file("a", b"bytes", false),
+        file("b", b"bytes", false),
+        file("out/c", b"bytes", false),
+    ]);
+    let at = crate::support::cache_kit::lease_dir(&dir, "one");
+    let stats = kbf_daemon::tree::materialize_cached(&cas, &cache, &root, &at, &["out".to_owned()])
+        .await
+        .expect("written");
+    assert_eq!((stats.links, stats.copies), (2, 1));
+    let ino = |name: &str| {
+        std::fs::symlink_metadata(at.join(name))
+            .expect("meta")
+            .ino()
+    };
+    assert_eq!(ino("a"), ino("b"));
+    assert_ne!(ino("a"), ino("out/c"));
+    stop(cache, &gates);
+}

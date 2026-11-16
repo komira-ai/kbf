@@ -1,5 +1,4 @@
-//! The per-binary entitlement allow list ([`ALLOWLIST`]; docs/design/macos-vm-guests.md
-//! section 7): the entitlements `sign-darwin` signs each macOS binary with, and the
+//! The per-binary entitlement allow list ([`ALLOWLIST`]): the entitlements `sign-darwin` signs each macOS binary with, and the
 //! comparison `sign-darwin` and `darwin-asset` make of a signature against it.
 //!
 //! The list has one line per binary that gets any entitlement: its file name, then its

@@ -381,8 +381,8 @@ Retention: the running, the previous and one more directory. Only `kbf-installer
 
 `kbf-installer` runs as a root unit with no listening socket (the former `kbf-helper` is folded into it). Its service
 loop has two commands, with no free-form arguments (its flags name the unit and the directories; nothing in an order
-record is a path, a URL, a command or a unit; the platform is the host's own, read by the installer). **On macOS `kbf --mode=daemon`
-runs as root (macos-end-state.md), so there a compromise of `kbf` is a compromise of root; the order spool and the fetch child
+record is a path, a URL, a command or a unit; the platform is the host's own, read by the installer). **On macOS the
+host's `kbf` runs as root, so there a compromise of `kbf` is a compromise of root; the order spool and the fetch child
 do not change that, and this section's separation of `kbf` from root holds on Linux only.** The probe and the fetch child below
 still run unprivileged there, so a fault in them is not root.
 
@@ -410,7 +410,7 @@ expected facts are the claim that 7.2 step 5 checks the binary against *before* 
 lowercase hex, a component set that is not exactly what the host's platform needs, a size over the cap (7.1), a pending trial,
 or a host with a live lease. The installer observes leases itself and reads nothing the daemon or `kbf` writes: **on Linux** it
 observes the lease processes' cgroup (membership of the systemd scope or unit that runs actions); **on macOS** it observes the
-launchd job and the processes by uid (the lease users). The record's claim is never used.
+launchd job and the processes by uid. The record's claim is never used.
 
 **Generation and floor.** The (epoch, id) rule orders orders but cannot tell an old order from a replay of one. The installer
 therefore also compares **(epoch, generation) lexicographically**, mirroring the order rule: a higher epoch wins whatever its generation,
@@ -481,7 +481,7 @@ other source is ever contacted: an order or an offer cannot redirect a fetch, an
 frontend can only serve bytes from the source, which 7.2 refuses). A missing `release_source` means `frontend`.
 
 **Which user.** A dedicated system user and group `kbf-fetch`, created by the package (sysusers; `_kbf-fetch` on macOS,
-created by setup with the lease users), with no home, shell `nologin`, no supplementary groups and no file of its own. It is
+created by setup), with no home, shell `nologin`, no supplementary groups and no file of its own. It is
 not `kbf`: the `kbf` process holds the cold-store credential, the node key and writes the order spool, and a bug in a TLS or HTTP
 parser should not reach them.
 

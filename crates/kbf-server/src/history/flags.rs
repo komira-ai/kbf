@@ -1,6 +1,6 @@
-//! `--history-objects` and `--history-index-root`: where build history is kept.
+//! `--history-objects`, `--history-credentials-file` and `--history-index-root`: where build history is kept.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use kbf_history::{HistoryRoot, IndexRoot};
@@ -8,7 +8,8 @@ use kbf_objstore::{Floor, FsStore, FsStoreError, KeyError, KeyPrefix};
 
 use super::driver::{History, Options, over};
 use crate::StateStore;
-use crate::config::{ConfigError, s3_store};
+use crate::config::{ConfigError, s3_store, s3_store_keyed};
+use crate::key_file::read_key_pair;
 use crate::stores::{FILE_PREFIX_ROOT, StoreUri};
 
 /// Display order of the history flags: after every other flag of the server and of the
@@ -24,9 +25,17 @@ const AFTER_ALL: usize = 900;
 // its command line may not name it.
 #[derive(Clone, Debug, Default, clap::Args)]
 pub struct HistoryFlags {
-    /// Where build history is kept: an object store, `s3://bucket/prefix?endpoint=http://host:port` (the key pair is the `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` of the environment) or `file:///absolute/path` (a directory this process owns, not the cold store's). The attempts and cache hits of each invocation a client named are recorded under `<prefix>history/` after their results are sent, never before and never delaying one; the index rows go to `--state-store`, which this flag needs. A full queue, a slow object store or a slow state store drops records and counts them (`kbf_history_dropped_total` on `/metrics`), and never fails or delays a call. The writer reads and writes only keys under `history/`. Left out, nothing is recorded
+    /// Where build history is kept: an object store, `s3://bucket/prefix?endpoint=http://host:port` (the key pair is the one in `--history-credentials-file`, else the `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` of the environment) or `file:///absolute/path` (a directory this process owns, not the cold store's). The attempts and cache hits of each invocation a client named are recorded under `<prefix>history/` after their results are sent, never before and never delaying one; the index rows go to `--state-store`, which this flag needs. A full queue, a slow object store or a slow state store drops records and counts them (`kbf_history_dropped_total` on `/metrics`), and never fails or delays a call. The writer reads and writes only keys under `history/`. Left out, nothing is recorded
     #[arg(long, value_name = "URI", display_order = AFTER_ALL)]
     pub history_objects: Option<StoreUri>,
+    /// A file with the key pair of an `s3://` `--history-objects`, JSON `{"access_key_id": "...", "secret_access_key": "..."}` in the form of `--pack-store-credentials-file`: a regular file, not a link, that this user owns, mode 0600 or 0400. When given, the environment's `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` are not read. The secret is never a flag. Needs `--history-objects`, and an `s3://` one
+    #[arg(
+        long,
+        value_name = "PATH",
+        requires = "history_objects",
+        display_order = AFTER_ALL
+    )]
+    pub history_credentials_file: Option<PathBuf>,
     /// Where history's index rows live in the state store: `ui/`, or `<prefix>ui/` for a prefix that ends in `/`, so that one state store can hold several farms' history apart. Left out, it is `ui/`. Needs `--history-objects`
     #[arg(
         long,
@@ -55,6 +64,17 @@ pub enum HistoryError {
     /// The `s3://` store could not be configured.
     #[error("--history-objects: {0}")]
     Store(#[from] ConfigError),
+    /// `--history-credentials-file` with a `file://` store: a directory has no keys.
+    #[error("--history-credentials-file: a `file://` --history-objects has no keys to read")]
+    KeyFileOnFileStore,
+    /// The key file was refused (not owner-only, a link, not a key pair). Holds no byte of it.
+    #[error("--history-credentials-file {}: {why}", path.display())]
+    KeyFile {
+        /// The file.
+        path: PathBuf,
+        /// What is wrong with it.
+        why: String,
+    },
     /// The store's key prefix is not one history can live under.
     #[error("--history-objects: {0}")]
     Prefix(#[from] KeyError),
@@ -78,8 +98,8 @@ impl HistoryFlags {
         self.open_with(state, &process_env)
     }
 
-    /// [`HistoryFlags::open`], reading an `s3://` store's key pair through `env` (the
-    /// process environment, for the server).
+    /// [`HistoryFlags::open`], reading an `s3://` store's key pair from
+    /// `--history-credentials-file`, else through `env` (the process environment, for the server).
     ///
     /// # Errors
     /// As [`HistoryFlags::open`].
@@ -109,6 +129,9 @@ impl HistoryFlags {
         tracing::info!("history: objects in {place}, index {rows}");
         let options = Options::default();
         match uri {
+            StoreUri::File(_) if self.history_credentials_file.is_some() => {
+                Err(HistoryError::KeyFileOnFileStore)
+            }
             StoreUri::File(dir) => {
                 let objects = file(dir)?;
                 let root = HistoryRoot::under(&KeyPrefix::new(FILE_PREFIX_ROOT)?)?;
@@ -116,7 +139,16 @@ impl HistoryFlags {
             }
             StoreUri::Registered => Err(HistoryError::Registered),
             StoreUri::S3(s3) => {
-                let objects = s3_store(s3, env)?;
+                let objects = match &self.history_credentials_file {
+                    Some(path) => {
+                        let keys = read_key_pair(path).map_err(|error| HistoryError::KeyFile {
+                            path: path.clone(),
+                            why: error.to_string(),
+                        })?;
+                        s3_store_keyed(s3, keys)?
+                    }
+                    None => s3_store(s3, env)?,
+                };
                 let root = HistoryRoot::under(&KeyPrefix::new(s3.prefix.clone())?)?;
                 Ok(Some(over(objects, root, store, index_root, options)))
             }
@@ -150,3 +182,7 @@ pub fn with_history(
     let history = flags.open_with(state.as_ref(), &process_env)?;
     Ok(state.map(|state| StateStore { history, ..state }))
 }
+
+#[cfg(test)]
+#[path = "flags_tests.rs"]
+mod tests;

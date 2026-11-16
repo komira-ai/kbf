@@ -1,6 +1,9 @@
 # Installing kbf on a macOS host
 
-A Mac runs kbf as a node: `kbf --mode=daemon`, run by launchd. The root tool that sets the host up
+A Mac host runs no kbf daemon: a macOS action runs as a js-agent job
+([actions-as-jobs.md](../design/actions-as-jobs.md) section 14). What this page describes is the
+host install, which stays for now (the Mac side of the installer is a separate change from the
+removal of the Mac daemon path). The root tool that sets the host up
 and updates it is `kbf-installer`, the same binary as on Linux, and it reaches a Mac as a flat
 `.pkg`. This page covers a new Mac, a Mac that the older Mac kit installed, and what the operator
 still does by hand. A Mac is a node only: `setup` refuses every mode but `--mode=daemon`.
@@ -64,16 +67,9 @@ restarts to ten seconds and writes to `/Library/Logs/kbf-installer/kbf-installer
 ## A new Mac
 
 1. **Install the package** as above.
-2. **Provision the host.** `kbf-mac-provision apply --profile FILE` (as root; the binary is the release asset
-   `kbf-mac-provision-<commit>-darwin-arm64.tar.gz`, one member, verified like every tarball in
-   [../artifacts.md](../artifacts.md); the `mac-provision-darwin-arm64` artifact of the `mac-provision`
-   workflow holds a signed build of any commit, for a change not yet released) fixes the host
-   settings and renders the worker profile: it writes `/usr/local/etc/kbf/kbf.toml` and the daemon
-   job's plist, and starts the job. It is the one writer of the daemon's `kbf.toml` on
-   a Mac. The `kbf.toml` it renders has no `update-dir` or `orders-dir`; a file that still has them
-   from an earlier run is accepted and left as it is. Use the label `com.komira.kbf-daemon` for the daemon job
-   (`launchd_label` in the profile), because that is the label `setup` and the installer's job look
-   for.
+2. **Provision the host.** The Mac provisioning tool (`kbf-mac-provision`) that wrote the daemon's `kbf.toml` and
+   job plist is removed, so the host settings and the daemon job's plist are the operator's. Use the label
+   `com.komira.kbf-daemon` for the daemon job, because that is the label `setup` and the installer's job look for.
 3. **Run `setup`** as root:
 
    ```text
@@ -128,8 +124,7 @@ kbf-proxy packages (package-update design, `design.md` section 12), then run `se
 ## What is still by hand
 
 - Installing the package, and verifying its checksum and attestation first.
-- Running `kbf-mac-provision` with a profile, and everything in it that is check-only: the
-  administrator account, FileVault, macOS and Xcode installs, the APFS volume for the lease users.
+- The host settings: the administrator account, FileVault, macOS and Xcode installs, and the daemon job's plist.
 - Creating the enrollment token on the frontend and putting the token file on the Mac.
 - Placing and recording the first release (above).
 - Updating: a Mac takes no update order yet. `kbf-installer run` activates a release only after it

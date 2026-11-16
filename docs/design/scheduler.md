@@ -537,7 +537,7 @@ What the code does today:
 - Each request carries its lease kind (`kbf-lease`: `action` or `whole_machine`). A
   worker is feasible for it only if its node report lists a driver that serves the
   kind (`container`, `native`, `fake` or `local` for `action`, `native-whole-machine` for
-  `whole_machine`; see [capabilities.md](capabilities.md#driver-entries)).
+  `whole_machine`, which the executor's workers list; see [capabilities.md](capabilities.md#driver-entries)).
 - A placement round walks the queue in order and gives each operation to the least
   loaded live, feasible worker whose capabilities satisfy its platform and that has
   room for it: the one with the least booked as a share of its capacity (the larger of
@@ -606,7 +606,7 @@ What the code does today:
   leases are shown not to reach each other's devices). It books the first such device
   by id with its CPU and memory, and its `Start` names it (`device_id`). A worker
   whose report lists no device is never given one, so a daemon that predates devices
-  is not. See [ios-devices.md](ios-devices.md#54-booking).
+  is not. No daemon reports a device now, so no such request is placed.
 - At most `PLACEMENT_ROUND` = 256 grants are made per round (one log flush per round).
 - A booking (and its device) is released when the operation finishes or its lease is
   given up; a new registration or report of the worker does not release it.

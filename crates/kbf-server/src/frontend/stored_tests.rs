@@ -208,6 +208,19 @@ async fn a_frontend_with_no_storage_serves_blobs_and_the_action_cache_with_no_no
     served.await.expect("joined").expect("served");
 }
 
+/// `GET /readyz` on the operator API at `api` until the answer starts with `status_line`: the
+/// probes are asked in the background, so a change in a dependency shows in a later answer.
+async fn readyz_until(api: std::net::SocketAddr, status_line: &str) -> String {
+    for _ in 0..1_000 {
+        let answer = try_get(api, "/readyz").await;
+        if let Some(text) = answer.filter(|text| text.starts_with(status_line)) {
+            return text;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("/readyz never answered {status_line}");
+}
+
 /// Asserts `/readyz` of a frontend with no storage node asks the state store and the job
 /// service: it passes with both, and fails naming `executor` when the job service answers a read
 /// with a status that says it will not serve the frontend, and again passes once it answers.
@@ -225,18 +238,21 @@ async fn readiness_of_a_frontend_with_no_storage_follows_the_state_store_and_the
     let ready = try_get(api, "/readyz").await.expect("answered");
     assert!(ready.starts_with("HTTP/1.1 200"), "{ready}");
 
-    fake.inject_on(
-        "GetJob",
-        Fault::Status {
-            code: Code::Unavailable,
-            message: "down".to_owned(),
-        },
-    );
-    let down = try_get(api, "/readyz").await.expect("answered");
-    assert!(down.starts_with("HTTP/1.1 503"), "{down}");
+    // One fault breaks one call, and the probe asks in the background: enough of them that the
+    // failure stays on show for a long while, and ends when they are used up.
+    for _ in 0..50 {
+        fake.inject_on(
+            "GetJob",
+            Fault::Status {
+                code: Code::Unavailable,
+                message: "down".to_owned(),
+            },
+        );
+    }
+    let down = readyz_until(api, "HTTP/1.1 503").await;
     assert!(down.contains("executor"), "{down}");
 
-    let again = try_get(api, "/readyz").await.expect("answered");
+    let again = readyz_until(api, "HTTP/1.1 200").await;
     assert!(again.starts_with("HTTP/1.1 200"), "{again}");
     stop.send(()).expect("stopped");
     served.await.expect("joined").expect("served");

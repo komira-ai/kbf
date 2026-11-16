@@ -121,13 +121,12 @@ rcgen = { workspace = true, features = ["x509-parser"] }
 sha2.workspace = true
 time.workspace = true
 x509-parser = { workspace = true, features = ["verify"] }
-# The fake front `kbf daemon` says Hello to on macOS (tests/macos_daemon.rs, which
-# includes kbf-node's tests/front/mod.rs): its async streams and the CAS it serves.
+# The fake front the tests of `kbf daemon` say Hello to: its async streams and the CAS it serves.
 futures.workspace = true
 kbf-front.workspace = true
 
 # The container driver builds on Linux only, and so does the one test that reads its
-# image store layout; the macOS tests of this package (tests/macos_daemon.rs) build without it.
+# image store layout.
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 kbf-driver-container.workspace = true
 # The farm of real `kbf` processes the rehearsal (tests/rehearsal_in_a_box.rs) drives, and

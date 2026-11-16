@@ -53,6 +53,7 @@ impl Inputs for Easy {
         Ok(ActionFacts {
             image: format!("registry.test/app@sha256:{}", "ab".repeat(32)),
             timeout: Some(Duration::from_secs(20)),
+            system: crate::executor::System::Linux,
         })
     }
 
@@ -211,6 +212,13 @@ impl Log {
     pub(super) fn text(&self) -> String {
         let bytes = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// The value of the field `name` of the first log line that has it, up to the next space.
+    pub(super) fn field(&self, name: &str) -> Option<String> {
+        let text = self.text();
+        let tail = text.split_once(&format!("{name}="))?.1;
+        Some(tail.split_whitespace().next()?.to_owned())
     }
 
     /// Runs `f` with everything it logs written here.

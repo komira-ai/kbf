@@ -69,7 +69,7 @@ fn has(words: &[String], field: &str) -> bool {
 }
 
 const LINUX: &[(&str, &str)] = &[("arch", "x86_64"), ("os", "linux")];
-const MAC: &[(&str, &str)] = &[("arch", "arm64"), ("os", "macos")];
+const ARM: &[(&str, &str)] = &[("arch", "arm64"), ("os", "linux")];
 
 /// Runs a job asking `platform` on a node `name` with `caps`; returns after its grant.
 async fn granted(cell: &Cell, name: &str, caps: &[(&str, &str)], platform: &[(&str, &str)]) {
@@ -83,7 +83,7 @@ async fn granted(cell: &Cell, name: &str, caps: &[(&str, &str)], platform: &[(&s
 }
 
 /// Catches: a `lease granted` line that does not say which OS family and ISA the action
-/// asked for (an audit could not tell a Linux action leased to a Mac), one that logs the
+/// asked for (an audit could not tell an x86-64 action leased to an arm64 node), one that logs the
 /// request's raw property text, or one that writes a value for an action that named
 /// none (`-`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -99,9 +99,9 @@ async fn a_granted_lease_names_the_os_family_and_isa_the_action_asked_for() {
     .await;
     granted(
         &Cell::start().await,
-        "audit-mac",
-        MAC,
-        &[("OSFamily", "Darwin")],
+        "audit-arm",
+        ARM,
+        &[("ISA", "arm-a64")],
     )
     .await;
     granted(&Cell::start().await, "audit-none", LINUX, &[]).await;
@@ -109,9 +109,9 @@ async fn a_granted_lease_names_the_os_family_and_isa_the_action_asked_for() {
     let linux = the_line("lease granted", "audit-linux");
     assert!(has(&linux, "os_family=linux"), "{linux:?}");
     assert!(has(&linux, "isa=x86_64"), "{linux:?}");
-    let mac = the_line("lease granted", "audit-mac");
-    assert!(has(&mac, "os_family=macos"), "{mac:?}");
-    assert!(has(&mac, "isa=-"), "{mac:?}");
+    let arm = the_line("lease granted", "audit-arm");
+    assert!(has(&arm, "os_family=-"), "{arm:?}");
+    assert!(has(&arm, "isa=arm64"), "{arm:?}");
     let none = the_line("lease granted", "audit-none");
     assert!(has(&none, "os_family=-"), "{none:?}");
     assert!(has(&none, "isa=-"), "{none:?}");

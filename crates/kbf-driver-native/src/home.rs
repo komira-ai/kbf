@@ -12,15 +12,11 @@
 //! So a tool that writes under `~`, the temporary directory or a per-user cache
 //! (`clang` and `swiftc` keep their module caches there) writes inside the lease, and
 //! the lease's removal takes it away: nothing one action leaves there is seen by the
-//! next. `CFFIXED_USER_HOME` is what moves a Foundation tool's `~` (`xcodebuild` and
-//! SwiftPM write their caches in `~/Library/Caches/org.swift.swiftpm`, which they find
-//! through the user database; issue #179). A system service may then mount a volume
-//! below that home for `xcodebuild` (the Metal toolchain, issue #178); the lease's
-//! removal unmounts it first ([`crate::mounts`]). A variable the Command sets itself is the
-//! Command's: these are set first and the Command's environment after them.
+//! next. `CFFIXED_USER_HOME` is what moves a Foundation tool's `~`. A variable the
+//! Command sets itself is the Command's: these are set first and the Command's
+//! environment after them.
 //!
-//! Public so that a test can give a program the lease's variables without the daemon
-//! (`tests/xcuitest_sandbox.rs`).
+//! Public so that a test can give a program the lease's variables without the daemon.
 
 use std::ffi::OsString;
 use std::path::Path;

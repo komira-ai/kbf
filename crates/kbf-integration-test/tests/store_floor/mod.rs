@@ -9,10 +9,13 @@
 //! `*tests.rs`) in any crate: a file whose code names `--cold-store` and a `file://{..}`
 //! URI built from a directory must name `cold-store-floor-bytes` or `Floor::Bytes` at least as often as it has
 //! `--cold-store=file://{..}` rigs (a rig that passes its URI as a separate `"--cold-store"`
-//! argument counts once per file).
+//! argument counts once per file). A floor mention on the first line of an `if` or `else`
+//! block does not count: that rig sets its floor only sometimes.
 //!
 //! What it catches: a new test rig that builds a cold store directory and never sets a
-//! floor. What it misses: a floor mention that is not on a rig while another rig lacks one, harness code
+//! floor, or sets it only under a condition. What it misses: a floor mention that is not on a
+//! rig while another rig lacks one, a condition written some other way (a `match` arm, a
+//! later line of the block), harness code
 //! outside test files (`kbf-integration-test/src`, `kbf-harness/src`, which build the
 //! cells' and units' flags), and a file that builds its flags some other way (`--config`,
 //! a variable URI scheme).
@@ -75,9 +78,24 @@ fn rigs_and_floors(text: &str) -> (usize, usize) {
         return (0, 0);
     }
     let inline = code.matches("--cold-store=file://{").count();
-    let floors =
-        code.matches("cold-store-floor-bytes").count() + code.matches("Floor::Bytes").count();
+    let mut floors = 0;
+    let mut previous = "";
+    for line in code.lines().filter(|l| !l.trim().is_empty()) {
+        if !opens_a_condition(previous) {
+            floors += line.matches("cold-store-floor-bytes").count()
+                + line.matches("Floor::Bytes").count();
+        }
+        previous = line;
+    }
     (inline.max(1), floors)
+}
+
+/// Whether a code line opens the block of an `if` or an `else`: a floor set on the next
+/// line is set only sometimes, so the rig it belongs to may run at the default floor.
+fn opens_a_condition(line: &str) -> bool {
+    let line = line.trim();
+    line.ends_with('{')
+        && (line.starts_with("if ") || line.starts_with("} else") || line.starts_with("else"))
 }
 
 /// Whether the file has more cold store rigs than floor mentions.
@@ -169,6 +187,29 @@ fn the_scan_finds_a_rig_without_a_floor() {
         problems(&file(path, &format!("{floor}; {separate}")), &[]),
         Vec::<String>::new(),
         "a separate argument with one floor"
+    );
+    let optional = "let mut argv = vec![format!(\"--cold-store=file://{}\", d)];\n\
+                    if let Some(floor) = floor {\n    \
+                    argv.push(format!(\"--cold-store-floor-bytes={floor}\"));\n}";
+    assert_eq!(
+        problems(&file(path, optional), &[]).len(),
+        1,
+        "a floor set only when one is given"
+    );
+    let otherwise = "let argv = if x {\n    vec![]\n} else {\n    \
+                     vec![\"--cold-store-floor-bytes=1\"]\n};\n\
+                     format!(\"--cold-store=file://{}\", d)";
+    assert_eq!(
+        problems(&file(path, otherwise), &[]).len(),
+        1,
+        "a floor set only in an else block"
+    );
+    let after_if = "if x {\n    y();\n}\nargv.push(\"--cold-store-floor-bytes=1\");\n\
+                    format!(\"--cold-store=file://{}\", d)";
+    assert_eq!(
+        problems(&file(path, after_if), &[]),
+        Vec::<String>::new(),
+        "a floor on the line after a closed if block counts"
     );
     for (p, text) in [
         (

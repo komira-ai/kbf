@@ -1,71 +1,47 @@
 //! The flags that let the frontend prepare the runs of a host executor: `--task-secret-file`
-//! and its companions, and the [`RunPrep`] they open over the frontend's [`Backend`].
+//! and its companions, and the [`PutDirPrep`] they open over the frontend's [`Backend`].
 //!
-//! A [`RunPrep`] (`kbf_front::prepare_run`) hands the executor, for each run, the keys a task
-//! may write (`--task-max-packs` pack keys, and `--task-max-large` large-object keys when
-//! `--task-large-credentials-file` is given), a presigned write of each to the tier store, and
-//! a read grant for the task's
-//! inputs. These flags give it the secrets and the places it needs. All are off unless
-//! `--task-secret-file` is given, and then a frontend serves exactly as it did: nothing is
-//! read from the files until the frontend starts, and nothing is sent anywhere. The switch
-//! needs `--task-put-endpoint`, `--task-put-bucket`, `--task-put-credentials-file` and
-//! `--task-read-url`, which clap enforces (so does the file of `kbf.toml`, which becomes
-//! flags). The companions that have a default (`--task-put-region`, `--task-run-wall-secs`,
-//! `--task-url-slack-secs`, `--task-closure-max-digests`, `--task-closure-max-bytes`,
-//! `--task-max-packs`, `--task-max-large`, `--task-large-max-bytes`) need
-//! nothing, since the config template writes every flag with a default as a live line.
+//! A [`PutDirPrep`] (`kbf_front::prepare_run`) hands the executor, for each run, the put
+//! directory a task commits its object into and the closure its action tree is written from
+//! (docs/design/jobs-on-jobscheduler-and-tierstore.md). All are off unless `--task-secret-file`
+//! is given, and then a frontend serves exactly as it did: nothing is read from the files until
+//! the frontend starts, and nothing is sent anywhere. The switch needs `--task-out-root`, which
+//! clap enforces (so does the file of `kbf.toml`, which becomes flags). The companions that have
+//! a default (`--task-url-slack-secs`, `--task-closure-max-digests`, `--task-closure-max-bytes`
+//! and the limits of an object) need nothing, since the config template writes every flag with a
+//! default as a live line.
 //!
-//! `--task-out-mode` says where a task's outputs go: `presigned` (the default), the writes
-//! above; or `put-dir`, a put directory on the job's host under `--task-out-root` (`<mp>/put`,
-//! the action trees under `<mp>/trees` beside it), where the task commits its objects and from
-//! which the node's tier store uploads them (docs/design/jobs-on-jobscheduler-and-tierstore.md).
-//! A put-directory run needs only the switch (the mint is the secret's) and the root: the four
-//! companions, the tier store's write endpoint, bucket and credentials and the read url, serve
-//! the writes and the grant, which a put-directory run leaves unused, so they are not required
-//! (`--task-secret-file` with `--task-out-mode put-dir` and none of the four makes a
-//! [`PutDirFlags`]; given, they are checked as before, [`TaskFlags`]). The mode `presigned`
-//! still needs all four.
+//! `--task-out-mode` says where a task's outputs go, and `put-dir` is the only place: a put
+//! directory on the job's host under `--task-out-root` (`<mp>/put`, the action trees under
+//! `<mp>/trees` beside it), where the task commits its object and from which the node's tier
+//! store uploads it. The mode `presigned`, a presigned write of each pack to the tier store, was
+//! removed; the flag still takes the word, so that a configuration that names it is refused with
+//! a message that says what changed and not with a bare unknown value.
 //!
-//! The secrets are files and never flags, as a command line is world-readable. The secret file
+//! The secret is a file and never a flag, as a command line is world-readable. The secret file
 //! holds one secret of at least 32 bytes (surrounding white space is dropped), owned by the
-//! server's user and readable by it alone: the mint of the pack keys and the key of the read
-//! grants are both made from it, each under a domain of its own, and it is the secret the
-//! job-facing listener verifies grants with. The credentials file is the JSON of a presign-only
-//! key of the tier store, `{"access_key_id": "...", "secret_access_key": "..."}` (a
-//! `--presign-key-file` of the tier store works too: its ceiling is read by the store and
-//! ignored here), with the same owner and mode rules.
+//! server's user and readable by it alone: the mint of the put directories is made from it, and
+//! it is the secret the job-facing listener verifies grants with.
 
 use std::error::Error;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use clap::builder::ValueParser;
 use clap::{Arg, ArgMatches};
-use kbf_front::grants::{GrantKey, KeyError};
-use kbf_front::prepare_run::{
-    AccessKey, ClosureLimits, ConfigError, LargeTarget, PutDirPrep, PutTarget, RunPrep,
-    RunPrepConfig, check_read_url_allowing,
-};
+use kbf_front::prepare_run::{ClosureLimits, PutDirPrep};
 use kbf_front::{Backend, MintError, PackKeyMint};
 use zeroize::Zeroizing;
 
-use crate::executor::{OutFormat, PutDirRoots, TaskOut};
+use crate::executor::PutDirRoots;
 use crate::token::{TokenFileError, read_owner_only};
 
 const SECRET: &str = "task_secret_file";
-const PUT_ENDPOINT: &str = "task_put_endpoint";
-const PUT_BUCKET: &str = "task_put_bucket";
-const PUT_REGION: &str = "task_put_region";
-const PUT_CREDENTIALS: &str = "task_put_credentials_file";
-const READ_URL: &str = "task_read_url";
-const RUN_WALL: &str = "task_run_wall_secs";
+const PUT_RETRY: &str = "task_put_retry_secs";
 const URL_SLACK: &str = "task_url_slack_secs";
 const MAX_DIGESTS: &str = "task_closure_max_digests";
 const MAX_BYTES: &str = "task_closure_max_bytes";
-const MAX_PACKS: &str = "task_max_packs";
-const MAX_LARGE: &str = "task_max_large";
-const LARGE_CREDENTIALS: &str = "task_large_credentials_file";
-const LARGE_MAX_BYTES: &str = "task_large_max_bytes";
 const OUT_MODE: &str = "task_out_mode";
 const OUT_ROOT: &str = "task_out_root";
 const OUT_FORMAT: &str = "task_out_format";
@@ -74,134 +50,125 @@ const MAX_OBJECT_MANIFEST: &str = "task_max_object_manifest_bytes";
 const OBJECT_PER_ENTRY: &str = "task_object_bytes_per_entry";
 const ONE_PASS: &str = "one-pass";
 const PRESIGNED: &str = "presigned";
-const PACKS: &str = "packs";
 const PUT_DIR: &str = "put-dir";
-const PUT_FLAG: &str = "--task-put-credentials-file";
-const LARGE_FLAG: &str = "--task-large-credentials-file";
 
-/// The signing region when `--task-put-region` is left out: the one S3-compatible stores accept
-/// unless they are configured to another.
-const DEFAULT_REGION: &str = "us-east-1";
-
-/// The run wall when `--task-run-wall-secs` is left out: 2 hours. Clap takes the default as
-/// the literal below; this is the number the default-flags test checks it against.
-#[cfg(test)]
-const DEFAULT_RUN_WALL_SECS: u64 = 7_200;
-
-/// The slack when `--task-url-slack-secs` is left out: 10 minutes (test-only, as above).
+/// The slack when `--task-url-slack-secs` is left out: 10 minutes. Clap takes the default as the
+/// literal below; this is the number the default-flags test checks it against.
 #[cfg(test)]
 const DEFAULT_URL_SLACK_SECS: u64 = 600;
 
-/// The cap of a large object when `--task-large-max-bytes` is left out: 512 MiB.
+/// The total wait for a 503 when `--task-put-retry-secs` is left out: 60 seconds (test-only, as
+/// above).
 #[cfg(test)]
-const DEFAULT_LARGE_MAX_BYTES: u64 = 536_870_912;
+const DEFAULT_PUT_RETRY_SECS: u64 = 60;
 
-/// The most bytes a pack record holds, which a large object must exceed.
-const RECORD_BYTES: u64 = kbf_pack::MAX_RECORD_BYTES;
-
-/// The longest wall or slack a flag takes, in seconds: the 4 hour ceiling of a presigned write
-/// ([`kbf_front::prepare_run::MAX_EXPIRY`]).
+/// The longest slack a flag takes, in seconds: the 4 hour ceiling of the keys of a put
+/// directory ([`kbf_front::prepare_run::MAX_EXPIRY`]).
 const MAX_SECS: u64 = kbf_front::prepare_run::MAX_EXPIRY.as_secs();
 
-/// The most bytes a secret file or a credentials file may hold.
+/// The most bytes a secret file may hold.
 const MAX_FILE_BYTES: usize = 4096;
 
-/// The twenty flags.
-pub(super) fn args() -> [Arg; 20] {
+/// What `--task-out-mode presigned` is told: the build that refuses it is the release that
+/// removed it.
+const PRESIGNED_REMOVED: &str = concat!(
+    "--task-out-mode presigned was removed in this release (kbf-server ",
+    env!("CARGO_PKG_VERSION"),
+    "+",
+    env!("KBF_BUILD_COMMIT"),
+    "): a task's outputs go into a put directory only. Give --task-out-mode put-dir (the \
+     default) with --task-out-root, and drop --task-put-endpoint, --task-put-bucket, \
+     --task-put-region, --task-put-credentials-file, --task-read-url, --task-run-wall-secs, \
+     --task-max-packs, --task-max-large, --task-large-credentials-file and \
+     --task-large-max-bytes, which only that mode used",
+);
+
+/// The flags of the mode that was removed, by long name: they only refuse.
+const REMOVED: [&str; 10] = [
+    "task-put-endpoint",
+    "task-put-bucket",
+    "task-put-region",
+    "task-put-credentials-file",
+    "task-read-url",
+    "task-run-wall-secs",
+    "task-max-packs",
+    "task-max-large",
+    "task-large-credentials-file",
+    "task-large-max-bytes",
+];
+
+/// What a start that gives one of the removed flags is told, after clap's `invalid value ... for
+/// '--<flag> <VALUE>'`, which names the flag.
+const REMOVED_WHY: &str = concat!(
+    "the flag was removed in this release (kbf-server ",
+    env!("CARGO_PKG_VERSION"),
+    "+",
+    env!("KBF_BUILD_COMMIT"),
+    ") with `--task-out-mode presigned`, the only mode that read it: a task's outputs go into a \
+     put directory (`--task-out-root`); delete the flag",
+);
+
+/// The removed flags, each refusing any value with [`REMOVED_WHY`], hidden from `--help`.
+fn removed() -> impl Iterator<Item = Arg> {
+    REMOVED.into_iter().map(|long| {
+        Arg::new(long)
+            .long(long)
+            .hide(true)
+            .value_name("VALUE")
+            .help("Removed with `--task-out-mode presigned`. Any value is refused at start")
+            .value_parser(ValueParser::new(refuse))
+    })
+}
+
+/// The parser of a removed flag: it takes no value.
+fn refuse(_: &str) -> Result<String, &'static str> {
+    Err(REMOVED_WHY)
+}
+
+/// The eleven flags of the put directory and the ten removed ones.
+pub(super) fn args() -> Vec<Arg> {
+    live().into_iter().chain(removed()).collect()
+}
+
+/// The eleven flags that are read.
+fn live() -> [Arg; 11] {
     [
         Arg::new(SECRET)
             .long("task-secret-file")
             .value_name("PATH")
             .value_parser(clap::value_parser!(PathBuf))
-            // The four come with the switch, except under `put-dir`: `missing_presign_flags`.
+            .requires(OUT_ROOT)
             .help(
                 "Turns on the preparation of the runs of a host executor: for each run the \
-                 frontend makes the keys the task may write, a presigned write of each to the \
-                 tier store, and a read grant for the task's inputs. The file holds one \
-                 secret of at least 32 bytes (surrounding white space is dropped), owned by \
-                 this user and readable by it alone (mode 0600 or 0400): the pack-key mint and \
-                 the read-grant key are made from it, and it is the secret the job-facing \
-                 listener verifies grants with. The secret is never a flag: a command line is \
-                 world-readable. Needs `--task-put-endpoint`, `--task-put-bucket`, \
-                 `--task-put-credentials-file` and `--task-read-url`, unless \
-                 `--task-out-mode put-dir`, where it is all a run needs (the mint's secret). \
-                 Left out, no run is prepared",
+                 frontend makes the put directory the task commits its object into, and the \
+                 input closure its action tree is written from. The file holds one secret of \
+                 at least 32 bytes (surrounding white space is dropped), owned by this user \
+                 and readable by it alone (mode 0600 or 0400): the mint of the put \
+                 directories is made from it, and it is the secret the job-facing listener \
+                 verifies grants with. The secret is never a flag: a command line is \
+                 world-readable. Needs `--task-out-root`. Left out, no run is prepared",
             ),
-        Arg::new(PUT_ENDPOINT)
-            .long("task-put-endpoint")
-            .value_name("URL")
-            .value_parser(clap::value_parser!(String))
-            .requires(SECRET)
-            .help(
-                "The tier store's proxy, as `http://host:port` or `https://host:port`: the \
-                 host a task's presigned write is signed for, and where it sends the pack. \
-                 Used only with `--task-secret-file`",
-            ),
-        Arg::new(PUT_BUCKET)
-            .long("task-put-bucket")
-            .value_name("BUCKET")
-            .value_parser(clap::value_parser!(String))
-            .requires(SECRET)
-            .help(
-                "The bucket of `--task-put-endpoint` a task's pack is written to, under the \
-                 key `cas/b/<lease>/<nonce>-0`",
-            ),
-        Arg::new(PUT_REGION)
-            .long("task-put-region")
-            .value_name("REGION")
-            .value_parser(clap::value_parser!(String))
-            .default_value(DEFAULT_REGION)
-            .help("The region the presigned writes to `--task-put-endpoint` are signed for"),
-        Arg::new(PUT_CREDENTIALS)
-            .long("task-put-credentials-file")
-            .value_name("PATH")
-            .value_parser(clap::value_parser!(PathBuf))
-            .requires(SECRET)
-            .help(
-                "A file with the presign-only key of the tier store, as JSON \
-                 `{\"access_key_id\": \"...\", \"secret_access_key\": \"...\"}`, owned by this \
-                 user and readable by it alone (mode 0600 or 0400). The key signs a `PUT` of one \
-                 object under its prefix and does nothing else; its ceiling (`max_expires_secs` \
-                 of the store's `--presign-key-file`) must be at least 14400, and the store's \
-                 `--presign-max-expires` too",
-            ),
-        Arg::new(READ_URL)
-            .long("task-read-url")
-            .value_name("URL")
-            .value_parser(clap::value_parser!(String))
-            .requires(SECRET)
-            .help(
-                "The base URL a task reads its inputs from: the job-facing read listener, as \
-                 `https://host:port` with no path (a grant's token is a bearer secret and \
-                 crosses only a TLS connection; `http://` is refused at start). A blob is \
-                 `GET <url>/<hash>/<size>`",
-            ),
-        Arg::new(RUN_WALL)
-            .long("task-run-wall-secs")
+        Arg::new(PUT_RETRY)
+            .long("task-put-retry-secs")
             .value_name("SECONDS")
-            .value_parser(clap::value_parser!(u64).range(1..=MAX_SECS))
-            // DEFAULT_RUN_WALL_SECS, which clap cannot take as a computed string; the
-            // default-flags test parses it back and compares it with the constant.
-            .default_value("7200")
+            .value_parser(clap::value_parser!(u64).range(0..=MAX_SECS))
+            // DEFAULT_PUT_RETRY_SECS, as above.
+            .default_value("60")
             .help(
-                "The run wall limit a run is prepared for, in seconds, at least 1 and at most \
-                 14400: a task's presigned write and read grant are good for this plus \
-                 `--task-url-slack-secs`. Used only with `--task-secret-file`",
+                "The most seconds the waits add up to before a create-only write of an action tree to the tier store (`cas/l/<sha256>`) gives up on a 503 (\"retry later\", which the store answers while it registers: 10 to 40 s), so the lease fails only after this long. A write whose connection turns out to be dead is made once more at once, whatever this says. 0 never waits for a 503. Used only with `--task-secret-file` and `--task-out-mode put-dir`",
             ),
         Arg::new(URL_SLACK)
             .long("task-url-slack-secs")
             .value_name("SECONDS")
             .value_parser(clap::value_parser!(u64).range(0..=MAX_SECS))
-            // DEFAULT_URL_SLACK_SECS, as above.
+            // DEFAULT_URL_SLACK_SECS, which clap cannot take as a computed string; the
+            // default-flags test parses it back and compares it with the constant.
             .default_value("600")
             .help(
-                "The time past the run wall, in seconds, that a task's presigned write and read \
-                 grant stay good: the time a task takes to start and to put its pack, which \
-                 includes the retries of a put the store refuses with 503: about 165 seconds \
-                 from the first attempt to the last by default (up to 60 s of the task's own \
-                 waits, and up to 15 s at the store before each refusal). The wall and the \
-                 slack together must not pass 14400, the ceiling of a presigned write, \
-                 or the frontend does not start. Used only with `--task-secret-file`",
+                "The time past a run's wall, in seconds, that the keys of its put directory \
+                 stay good: the time a task takes to start and to commit its object. The wall \
+                 and the slack together must not pass 14400, the longest a key may be good \
+                 for, or the frontend does not start. Used only with `--task-secret-file`",
             ),
         Arg::new(MAX_DIGESTS)
             .long("task-closure-max-digests")
@@ -225,72 +192,20 @@ pub(super) fn args() -> [Arg; 20] {
                  have (each distinct blob once): a run whose tree has more is refused. Used only \
                  with `--task-secret-file`",
             ),
-        Arg::new(MAX_PACKS)
-            .long("task-max-packs")
-            .value_name("PACKS")
-            .value_parser(clap::value_parser!(u8).range(1..=i64::from(kbf_pack::MAX_PACKS)))
-            // kbf_pack::MAX_PACKS, as above.
-            .default_value("8")
-            .help(
-                "The pack keys each run of presigned writes gets, 1 to 8 \
-                 (`cas/b/<lease>/<nonce>-<k>`): a ceiling, \
-                 not a prediction, since the sizes of a run's outputs are not known before it \
-                 runs; a key a task does not write is never used. Used only with \
-                 `--task-secret-file`",
-            ),
-        Arg::new(MAX_LARGE)
-            .long("task-max-large")
-            .value_name("OBJECTS")
-            .value_parser(clap::value_parser!(u8).range(0..=i64::from(kbf_pack::MAX_LARGE)))
-            // kbf_pack::MAX_LARGE, as above.
-            .default_value("8")
-            .help(
-                "The large-object keys each run of presigned writes gets, 0 to 8 \
-                 (`cas/b/<lease>/<nonce>-L<i>`): an \
-                 output blob over 64 MiB is written whole to one of them. A ceiling, as for \
-                 `--task-max-packs`. Without `--task-large-credentials-file` no run gets one, \
-                 whatever this says. Used only with `--task-secret-file`",
-            ),
-        Arg::new(LARGE_CREDENTIALS)
-            .long("task-large-credentials-file")
-            .value_name("PATH")
-            .value_parser(clap::value_parser!(PathBuf))
-            .requires(SECRET)
-            .help(
-                "A file with the presign-only key that signs a task's writes of large objects, \
-                 of the same form and with the same owner and mode rules as \
-                 `--task-put-credentials-file`: a key of the tier store whose prefix allows \
-                 objects up to `--task-large-max-bytes`, with a ceiling of at least 14400 \
-                 seconds. Left out, no run gets a large-object key and an output over 64 MiB \
-                 fails its task",
-            ),
-        Arg::new(LARGE_MAX_BYTES)
-            .long("task-large-max-bytes")
-            .value_name("BYTES")
-            .value_parser(clap::value_parser!(u64).range((RECORD_BYTES + 1)..))
-            // DEFAULT_LARGE_MAX_BYTES, as above.
-            .default_value("536870912")
-            .help(
-                "The most bytes of one large object, above 67108864 (64 MiB, the most a pack \
-                 record holds): the cap a task and the ingest of its run hold an object to. \
-                 Used only with `--task-large-credentials-file`",
-            ),
         Arg::new(OUT_MODE)
             .long("task-out-mode")
             .value_name("MODE")
             .value_parser([PRESIGNED, PUT_DIR])
-            .default_value(PRESIGNED)
+            .default_value(PUT_DIR)
             // The root names the switch, so a put directory is never asked for without it.
             .requires_if(PUT_DIR, OUT_ROOT)
             .help(
-                "Where a task's outputs go. `presigned`: a presigned write of each pack and \
-                 large object to the tier store, the inputs read through a read grant. \
-                 `put-dir`: the task commits them as files into a put directory under \
-                 `--task-out-root`, mounted at /out, which the host's tier store uploads; the \
-                 inputs are the action tree under the trees directory beside it, the job's \
-                 root, and the job has no network; no tier store write endpoint, bucket, \
-                 credentials or read url is needed. Used only with `--task-secret-file` and \
-                 `--executor js-agent`",
+                "Where a task's outputs go. `put-dir`, the only mode and the default: the task \
+                 commits them as files into a put directory under `--task-out-root`, mounted \
+                 at /out, which the host's tier store uploads; the inputs are the action tree \
+                 under the trees directory beside it, the job's root, and the job has no \
+                 network. `presigned` was removed: it is refused, with the flags to drop. Used \
+                 only with `--task-secret-file` and `--executor js-agent`",
             ),
         Arg::new(OUT_ROOT)
             .long("task-out-root")
@@ -298,10 +213,9 @@ pub(super) fn args() -> [Arg; 20] {
             .value_parser(clap::value_parser!(String))
             .requires(SECRET)
             .help(
-                "With `--task-out-mode put-dir`: the tier store's put directory on every host \
-                 (`<mp>/put`, an absolute path), which the host's agent lists as a read-write \
-                 mount root; each run's directory is `<mp>/put/cas/b/<lease>/<nonce>`, and its \
-                 action tree `<mp>/trees/<digest>`",
+                "The tier store's put directory on every host (`<mp>/put`, an absolute path), \
+                 which the host's agent lists as a read-write mount root; each run's directory \
+                 is `<mp>/put/cas/b/<lease>/<nonce>`, and its action tree `<mp>/trees/<digest>`",
             ),
         Arg::new(MAX_OBJECT_ENTRIES)
             .long("task-max-object-entries")
@@ -310,10 +224,9 @@ pub(super) fn args() -> [Arg; 20] {
             // kbf_front::MAX_UNTRUSTED_OBJECT_ENTRIES, as above.
             .default_value("1048576")
             .help(
-                "With `--task-out-mode put-dir` and `--task-out-format one-pass`: the most \
-                 records one object of a run may index. A larger index is refused as too large \
-                 before it is read, so this bounds what the frontend reads to trust an object \
-                 (52 bytes a record)",
+                "The most records one object of a run may index. A larger index is refused as \
+                 too large before it is read, so this bounds what the frontend reads to trust \
+                 an object (52 bytes a record)",
             ),
         Arg::new(MAX_OBJECT_MANIFEST)
             .long("task-max-object-manifest-bytes")
@@ -322,11 +235,10 @@ pub(super) fn args() -> [Arg; 20] {
             // kbf_front::MAX_UNTRUSTED_MANIFEST_BYTES, as above.
             .default_value("4194304")
             .help(
-                "With `--task-out-format one-pass`: the most bytes of an object's manifest, and \
-                 the base of the most its tail (manifest, file index and central directory) may \
-                 be: the base plus `--task-object-bytes-per-entry` for each of \
-                 `--task-max-object-entries`. A larger one is refused as too large before it is \
-                 read",
+                "The most bytes of an object's manifest, and the base of the most its tail \
+                 (manifest, file index and central directory) may be: the base plus \
+                 `--task-object-bytes-per-entry` for each of `--task-max-object-entries`. A \
+                 larger one is refused as too large before it is read",
             ),
         Arg::new(OBJECT_PER_ENTRY)
             .long("task-object-bytes-per-entry")
@@ -335,186 +247,28 @@ pub(super) fn args() -> [Arg; 20] {
             // kbf_front::MAX_UNTRUSTED_BYTES_PER_ENTRY, as above.
             .default_value("1024")
             .help(
-                "With `--task-out-format one-pass`: the bytes of an object's tail each record \
-                 may account for, its central directory entry (about 130 bytes) and its line of \
-                 the file index, which names a path. See `--task-max-object-manifest-bytes`",
+                "The bytes of an object's tail each record may account for, its central \
+                 directory entry (about 130 bytes) and its line of the file index, which names \
+                 a path. See `--task-max-object-manifest-bytes`",
             ),
         Arg::new(OUT_FORMAT)
             .long("task-out-format")
             .value_name("FORMAT")
-            .value_parser([PACKS, ONE_PASS])
-            .default_value(PACKS)
+            .value_parser([ONE_PASS])
+            .default_value(ONE_PASS)
             .help(
-                "With `--task-out-mode put-dir`: what the task writes. `packs`: packs and \
-                 large objects planned from the digests, as every release before the one-pass \
-                 object does. `one-pass`: one object per action, written while the outputs \
-                 are read, its manifest and index at the end \
-                 (docs/design/one-pass-task-object.md). This frontend reads both; set \
-                 `one-pass` only once every frontend and every task image is this release \
-                 or later, since a task image that does not know it is refused its flag. \
-                 Refused with `--task-out-mode presigned`",
+                "What the task writes. `one-pass`, the only value and the default: one object \
+                 per action, written while the outputs are read, its manifest and index at the \
+                 end (docs/design/one-pass-task-object.md). The flag is still accepted so that \
+                 a configuration that names it starts; the `packs` value of the releases \
+                 before is gone, and this frontend still reads the packs those wrote. Every \
+                 task image must be this release or later",
             ),
     ]
 }
 
-/// What the task flags say, when `--task-secret-file` is given.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TaskFlags {
-    /// `--task-secret-file`.
-    pub secret_file: PathBuf,
-    /// `--task-put-endpoint`.
-    pub put_endpoint: String,
-    /// `--task-put-bucket`.
-    pub put_bucket: String,
-    /// `--task-put-region`.
-    pub put_region: String,
-    /// `--task-put-credentials-file`.
-    pub put_credentials_file: PathBuf,
-    /// `--task-read-url`.
-    pub read_url: String,
-    /// `--executor-allow-plain-http-grant` with `--executor js-agent`: the read url may be
-    /// `http://`.
-    pub allow_plain_http_grant: bool,
-    /// `--task-run-wall-secs`.
-    pub run_wall: Duration,
-    /// `--task-url-slack-secs`.
-    pub url_slack: Duration,
-    /// `--task-closure-max-digests`.
-    pub max_digests: usize,
-    /// `--task-max-object-entries`.
-    pub max_object_entries: usize,
-    /// `--task-max-object-manifest-bytes`.
-    pub max_object_manifest_bytes: u64,
-    /// `--task-object-bytes-per-entry`.
-    pub object_bytes_per_entry: u64,
-    /// `--task-closure-max-bytes`.
-    pub max_bytes: u64,
-    /// `--task-max-packs`.
-    pub max_packs: u8,
-    /// `--task-max-large`.
-    pub max_large: u8,
-    /// `--task-large-credentials-file`.
-    pub large_credentials_file: Option<PathBuf>,
-    /// `--task-large-max-bytes`.
-    pub large_max_bytes: u64,
-    /// `--task-out-mode` and `--task-out-root`.
-    pub out: TaskOut,
-}
-
-/// The setting the flags in `m` make: `None` unless `--task-secret-file` is given.
-///
-/// # Errors
-/// `--task-read-url` is not `https://host[:port]`.
-pub(super) fn from_matches(m: &ArgMatches) -> Result<Option<TaskFlags>, String> {
-    let Some(secret_file) = m.get_one::<PathBuf>(SECRET) else {
-        return Ok(None);
-    };
-    if put_dir_alone(m) {
-        return Ok(None);
-    }
-    // `missing_presign_flags` made the four others come with the switch; the rest have a
-    // default.
-    let text = |id: &str| m.get_one::<String>(id).cloned().unwrap_or_default();
-    let secs = |id: &str| Duration::from_secs(m.get_one::<u64>(id).copied().unwrap_or_default());
-    let read_url = text(READ_URL);
-    let plain = super::executor_flags::plain_http_grant(m);
-    check_read_url_allowing(&read_url, plain).map_err(|error| {
-        let hint = if !read_url.starts_with("http://") {
-            ""
-        } else if super::job_read::serves_tls(m) {
-            // The flag alone would pass this check and fail the next, on the listener's scheme.
-            " (--job-listen serves TLS: use an https:// url, or serve it with --job-plain-http \
-             and give --executor-allow-plain-http-grant)"
-        } else {
-            " (--executor-allow-plain-http-grant with --executor js-agent accepts it)"
-        };
-        format!("--task-read-url: {error}{hint}")
-    })?;
-    let digests = m.get_one::<u32>(MAX_DIGESTS).copied().unwrap_or_default();
-    Ok(Some(TaskFlags {
-        secret_file: secret_file.clone(),
-        put_endpoint: text(PUT_ENDPOINT),
-        put_bucket: text(PUT_BUCKET),
-        put_region: text(PUT_REGION),
-        put_credentials_file: m
-            .get_one::<PathBuf>(PUT_CREDENTIALS)
-            .cloned()
-            .unwrap_or_default(),
-        read_url,
-        allow_plain_http_grant: plain,
-        run_wall: secs(RUN_WALL),
-        url_slack: secs(URL_SLACK),
-        max_digests: usize::try_from(digests).unwrap_or(usize::MAX),
-        max_object_entries: entries_of(m),
-        max_object_manifest_bytes: m
-            .get_one::<u64>(MAX_OBJECT_MANIFEST)
-            .copied()
-            .unwrap_or_default(),
-        object_bytes_per_entry: m
-            .get_one::<u64>(OBJECT_PER_ENTRY)
-            .copied()
-            .unwrap_or_default(),
-        max_bytes: m.get_one::<u64>(MAX_BYTES).copied().unwrap_or_default(),
-        max_packs: m.get_one::<u8>(MAX_PACKS).copied().unwrap_or_default(),
-        max_large: m.get_one::<u8>(MAX_LARGE).copied().unwrap_or_default(),
-        large_credentials_file: m.get_one::<PathBuf>(LARGE_CREDENTIALS).cloned(),
-        large_max_bytes: m
-            .get_one::<u64>(LARGE_MAX_BYTES)
-            .copied()
-            .unwrap_or_default(),
-        out: out_of(m)?,
-    }))
-}
-
-/// The four flags a presigned run needs beside `--task-secret-file`, by argument id and name.
-const PRESIGN: [(&str, &str); 4] = [
-    (PUT_ENDPOINT, "--task-put-endpoint"),
-    (PUT_BUCKET, "--task-put-bucket"),
-    (PUT_CREDENTIALS, "--task-put-credentials-file"),
-    (READ_URL, "--task-read-url"),
-];
-
-/// Whether `--task-out-mode put-dir` was given.
-fn is_put_dir(m: &ArgMatches) -> bool {
-    m.get_one::<String>(OUT_MODE).map(String::as_str) == Some(PUT_DIR)
-}
-
-/// Whether the switch is given with `--task-out-mode put-dir` and none of the four flags a
-/// presigned run needs: the writes and the grant are not used, so nothing but the secret is.
-fn put_dir_alone(m: &ArgMatches) -> bool {
-    is_put_dir(m) && PRESIGN.iter().all(|(id, _)| !m.contains_id(id))
-}
-
-/// What `--task-secret-file` still needs, if it is given: the four flags of a presigned run
-/// (all of them, or with `--task-out-mode put-dir`, none or all), named, as the refusal of a
-/// missing required argument. `None` when the flags are complete or the switch is not given.
-pub(super) fn missing_presign_flags(m: &ArgMatches) -> Option<String> {
-    m.get_one::<PathBuf>(SECRET)?;
-    if put_dir_alone(m) {
-        return None;
-    }
-    let missing: Vec<&str> = PRESIGN
-        .iter()
-        .filter(|(id, _)| !m.contains_id(id))
-        .map(|(_, long)| *long)
-        .collect();
-    if missing.is_empty() {
-        return None;
-    }
-    Some(format!(
-        "--task-secret-file needs {}{}",
-        missing.join(", "),
-        if is_put_dir(m) {
-            " (with --task-out-mode put-dir, give all four or none of them)"
-        } else {
-            " (or --task-out-mode put-dir, which needs none of them)"
-        }
-    ))
-}
-
-/// What the task flags say for a frontend whose runs all commit into put directories: given by
-/// `--task-secret-file` with `--task-out-mode put-dir` and none of the flags of a presigned
-/// run.
+/// What the task flags say for a frontend whose runs commit into put directories: given by
+/// `--task-secret-file` with `--task-out-root`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PutDirFlags {
     /// `--task-secret-file`.
@@ -523,6 +277,8 @@ pub struct PutDirFlags {
     pub roots: PutDirRoots,
     /// `--task-url-slack-secs`: the time past a run's wall that its directory's keys stay good.
     pub url_slack: Duration,
+    /// `--task-put-retry-secs`.
+    pub put_retry: Duration,
     /// `--task-closure-max-digests`.
     pub max_digests: usize,
     /// `--task-max-object-entries`.
@@ -535,28 +291,27 @@ pub struct PutDirFlags {
     pub max_bytes: u64,
 }
 
-/// The setting the flags in `m` make for put-directory runs alone: `None` unless
-/// `--task-secret-file` is given with `--task-out-mode put-dir` and none of the four flags of a
-/// presigned run.
+/// The setting the flags in `m` make: `None` unless `--task-secret-file` is given (clap makes it
+/// come with `--task-out-root`).
 ///
 /// # Errors
-/// `--task-out-root` is not an absolute path in normal form.
-pub(super) fn put_dir_from_matches(m: &ArgMatches) -> Result<Option<PutDirFlags>, String> {
+/// `--task-out-mode presigned`, which was removed, or `--task-out-root` is not an absolute path
+/// in normal form.
+pub(super) fn from_matches(m: &ArgMatches) -> Result<Option<PutDirFlags>, String> {
+    if m.get_one::<String>(OUT_MODE).map(String::as_str) == Some(PRESIGNED) {
+        return Err(PRESIGNED_REMOVED.to_owned());
+    }
     let (Some(secret_file), Some(root)) =
         (m.get_one::<PathBuf>(SECRET), m.get_one::<String>(OUT_ROOT))
     else {
         return Ok(None);
     };
-    if !put_dir_alone(m) {
-        return Ok(None);
-    }
     let digests = m.get_one::<u32>(MAX_DIGESTS).copied().unwrap_or_default();
     Ok(Some(PutDirFlags {
         secret_file: secret_file.clone(),
-        roots: PutDirRoots::new(root)
-            .map(|roots| roots.with_format(format_of(m)))
-            .map_err(|error| format!("--task-out-root: {error}"))?,
+        roots: PutDirRoots::new(root).map_err(|error| format!("--task-out-root: {error}"))?,
         url_slack: Duration::from_secs(m.get_one::<u64>(URL_SLACK).copied().unwrap_or_default()),
+        put_retry: Duration::from_secs(m.get_one::<u64>(PUT_RETRY).copied().unwrap_or_default()),
         max_digests: usize::try_from(digests).unwrap_or(usize::MAX),
         max_object_entries: entries_of(m),
         max_object_manifest_bytes: m
@@ -601,28 +356,6 @@ pub(super) fn open_put_dir(
     Ok(prepared.transpose()?.map(Arc::new))
 }
 
-/// Where the outputs go, from `--task-out-mode` and `--task-out-root`.
-fn out_of(m: &ArgMatches) -> Result<TaskOut, String> {
-    let root = m.get_one::<String>(OUT_ROOT);
-    let put_dir = is_put_dir(m);
-    // clap gives `put-dir` its root (`requires_if`): with no root the mode is `presigned`.
-    match root {
-        Some(root) if put_dir => PutDirRoots::new(root)
-            .map(|roots| TaskOut::PutDir(roots.with_format(format_of(m))))
-            .map_err(|error| format!("--task-out-root: {error}")),
-        None if format_of(m) == OutFormat::OnePass => Err(
-            "--task-out-format one-pass is only for --task-out-mode put-dir: drop it, or give \
-             the mode"
-                .to_owned(),
-        ),
-        Some(_) => Err(
-            "--task-out-root is only for --task-out-mode put-dir: drop it, or give the mode"
-                .to_owned(),
-        ),
-        None => Ok(TaskOut::Presigned),
-    }
-}
-
 /// What `--task-max-object-entries` says.
 fn entries_of(m: &ArgMatches) -> usize {
     let entries = m
@@ -632,125 +365,15 @@ fn entries_of(m: &ArgMatches) -> usize {
     usize::try_from(entries).unwrap_or(usize::MAX)
 }
 
-/// What `--task-out-format` says.
-fn format_of(m: &ArgMatches) -> OutFormat {
-    match m.get_one::<String>(OUT_FORMAT).map(String::as_str) {
-        Some(ONE_PASS) => OutFormat::OnePass,
-        _ => OutFormat::Packs,
-    }
-}
-
 /// Why the runs cannot be prepared. No message carries a secret.
 #[derive(Debug, thiserror::Error)]
 pub enum TaskFlagError {
     /// The secret file cannot be used.
     #[error("--task-secret-file: {0}")]
     Secret(#[from] TokenFileError),
-    /// The secret is too short for a grant key.
-    #[error("--task-secret-file: {0}")]
-    GrantKey(#[from] KeyError),
-    /// The secret is too short for the mint of the pack keys.
+    /// The secret is too short for the mint of the put directories.
     #[error("--task-secret-file: {0}")]
     Mint(#[from] MintError),
-    /// The credentials file cannot be used.
-    #[error("{flag} {path}: {why}")]
-    Credentials {
-        /// The flag that names the file.
-        flag: &'static str,
-        /// The file.
-        path: String,
-        /// What is wrong with it.
-        why: String,
-    },
-    /// The preparer cannot be set up from the flags.
-    #[error(transparent)]
-    Config(#[from] ConfigError),
-}
-
-impl TaskFlags {
-    /// The preparer these flags describe, reading the store through `backend`: the files are
-    /// read, the mint and the keys made, the URLs and the expiry checked. Nothing is sent.
-    ///
-    /// # Errors
-    /// [`TaskFlagError`]: a file is missing, not owned by this user or readable by others, the
-    /// secret is under 32 bytes, the credentials are not the JSON of a key, or the preparer
-    /// refuses the URLs, the bucket, the region or the expiry.
-    pub fn open(&self, backend: Backend) -> Result<RunPrep, TaskFlagError> {
-        let secret = Zeroizing::new(read_owner_only(&self.secret_file, MAX_FILE_BYTES)?);
-        let secret = secret.trim_ascii();
-        let grant_key = GrantKey::from_secret(secret)?;
-        let mint = PackKeyMint::new(secret)?;
-        let key = read_credentials(PUT_FLAG, &self.put_credentials_file)?;
-        // No large credentials, no large keys, whatever `--task-max-large` says.
-        let large = match &self.large_credentials_file {
-            Some(path) => Some(LargeTarget {
-                key: read_credentials(LARGE_FLAG, path)?,
-                max_objects: self.max_large,
-                max_bytes: self.large_max_bytes,
-            }),
-            None => None,
-        };
-        let config = RunPrepConfig {
-            mint,
-            grant_key,
-            put: PutTarget {
-                endpoint: self.put_endpoint.clone(),
-                region: self.put_region.clone(),
-                bucket: self.put_bucket.clone(),
-                key,
-            },
-            max_packs: self.max_packs,
-            large,
-            read_url: self.read_url.clone(),
-            allow_plain_read_url: self.allow_plain_http_grant,
-            run_wall: self.run_wall,
-            slack: self.url_slack,
-            limits: ClosureLimits {
-                max_digests: self.max_digests,
-                max_bytes: self.max_bytes,
-            },
-        };
-        Ok(RunPrep::new(backend, config)?)
-    }
-}
-
-/// The preparer the flags ask for, if they ask for one, over `backend`.
-///
-/// # Errors
-/// As [`TaskFlags::open`].
-pub(super) fn open(
-    flags: Option<&TaskFlags>,
-    backend: &Backend,
-) -> Result<Option<Arc<RunPrep>>, Box<dyn Error>> {
-    let prepared = flags.map(|flags| flags.open(backend.clone()));
-    Ok(prepared.transpose()?.map(Arc::new))
-}
-
-/// What a credentials file that is not JSON of a key is told.
-const NOT_KEY: &str = "not JSON with access_key_id and secret_access_key, both not empty";
-
-/// What the credentials file holds: the key, and whatever else a `--presign-key-file` of the
-/// tier store says (its ceiling), which is not read here.
-#[derive(serde::Deserialize)]
-struct Keys {
-    access_key_id: String,
-    secret_access_key: String,
-}
-
-/// The key in the file at `path`, named by `flag`, which only its owner may be able to read.
-fn read_credentials(flag: &'static str, path: &Path) -> Result<AccessKey, TaskFlagError> {
-    let bad = |why: String| TaskFlagError::Credentials {
-        flag,
-        path: path.display().to_string(),
-        why,
-    };
-    let bytes = read_owner_only(path, MAX_FILE_BYTES).map_err(|error| bad(error.to_string()))?;
-    let bytes = Zeroizing::new(bytes);
-    let keys = serde_json::from_slice::<Keys>(&bytes).map_err(|_| bad(NOT_KEY.to_owned()))?;
-    if keys.access_key_id.is_empty() || keys.secret_access_key.is_empty() {
-        return Err(bad(NOT_KEY.to_owned()));
-    }
-    Ok(AccessKey::new(&keys.access_key_id, &keys.secret_access_key))
 }
 
 #[cfg(test)]

@@ -75,8 +75,8 @@ prost.workspace = true
 rcgen.workspace = true
 # A layer tar for the `__unpack-layers` helper test (tests/binary/cache.rs).
 tar.workspace = true
-# What the unit tests give the daemon to run: kbf-testkit's act verbs and its fake
-# xcrun, xcodebuild and sandbox-exec, through links to the test binary.
+# What the unit tests give the daemon to run: kbf-testkit's act verbs, through links to the
+# test binary.
 kbf-testkit.workspace = true
 tokio = { workspace = true, features = ["net", "io-util", "test-util", "time"] }
 

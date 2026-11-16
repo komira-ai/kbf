@@ -26,6 +26,7 @@ use kbf_types::Digest;
 use sha2::{Digest as _, Sha256};
 
 use super::NoTree;
+use super::retry::{Failed, PutRetry, retrying};
 use crate::job_read::BlobSource;
 use crate::large_backfill::{LargeStore, large_key};
 
@@ -132,10 +133,11 @@ async fn lookups(
 pub(super) async fn write_whole(
     source: &dyn BlobSource,
     store: &dyn LargeStore,
+    retry: &PutRetry,
     blobs: Vec<Digest>,
 ) -> Result<(), NoTree> {
     stream::iter(blobs)
-        .map(|digest| write_blob(source, store, digest))
+        .map(|digest| write_blob(source, store, retry, digest))
         .buffered(WRITES_IN_FLIGHT)
         .try_collect()
         .await
@@ -144,32 +146,36 @@ pub(super) async fn write_whole(
 async fn write_blob(
     source: &dyn BlobSource,
     store: &dyn LargeStore,
+    retry: &PutRetry,
     digest: Digest,
 ) -> Result<(), NoTree> {
-    let read = source
-        .read_stream(&digest)
-        .await
-        .map_err(|error| NoTree::Read {
-            digest,
-            why: error.to_string(),
-        })?;
-    let failure = Arc::new(Mutex::new(None));
-    let body = Checked {
-        inner: read,
-        hasher: Sha256::new(),
-        held: None,
-        digest,
-        ended: false,
-        failure: Arc::clone(&failure),
-    }
-    .into_body();
     let key = large_key(&digest);
-    put(store, &key, digest.size_bytes, body)
-        .await
-        .map_err(|error| {
-            let mut failure = failure.lock().unwrap_or_else(PoisonError::into_inner);
-            failure.take().unwrap_or(error)
-        })
+    // An attempt reads the blob again: a body is gone once a write has taken it.
+    retrying(retry, &key, || async {
+        let read = source.read_stream(&digest).await.map_err(|error| {
+            Failed::Other(NoTree::Read {
+                digest,
+                why: error.to_string(),
+            })
+        })?;
+        let failure = Arc::new(Mutex::new(None));
+        let body = Checked {
+            inner: read,
+            hasher: Sha256::new(),
+            held: None,
+            digest,
+            ended: false,
+            failure: Arc::clone(&failure),
+        }
+        .into_body();
+        put(store, &key, digest.size_bytes, body)
+            .await
+            .map_err(|error| {
+                let mut failure = failure.lock().unwrap_or_else(PoisonError::into_inner);
+                failure.take().map_or(Failed::Store(error), Failed::Other)
+            })
+    })
+    .await
 }
 
 /// Writes `bytes` to `cas/l/<sha256 of bytes>` (`manifest`), create-only.
@@ -178,11 +184,18 @@ async fn write_blob(
 /// [`NoTree::Put`]: the store refused it.
 pub(super) async fn write_manifest(
     store: &dyn LargeStore,
+    retry: &PutRetry,
     manifest: &Digest,
     bytes: Bytes,
 ) -> Result<(), NoTree> {
-    let body = stream::once(async move { Ok(bytes) }).boxed();
-    put(store, &large_key(manifest), manifest.size_bytes, body).await
+    let key = large_key(manifest);
+    retrying(retry, &key, || async {
+        let body = stream::once(std::future::ready(Ok(bytes.clone()))).boxed();
+        put(store, &key, manifest.size_bytes, body)
+            .await
+            .map_err(Failed::Store)
+    })
+    .await
 }
 
 /// One create-only write; an existing key is success.
@@ -191,13 +204,10 @@ async fn put(
     key: &ObjectKey,
     length: u64,
     body: BodyStream,
-) -> Result<(), NoTree> {
+) -> Result<(), ObjectStoreError> {
     match store.put(key, length, body).await {
-        Ok(()) | Err(ObjectStoreError::AlreadyExists(_)) => Ok(()),
-        Err(error) => Err(NoTree::Put {
-            key: key.to_string(),
-            why: error.to_string(),
-        }),
+        Err(ObjectStoreError::AlreadyExists(_)) => Ok(()),
+        other => other,
     }
 }
 

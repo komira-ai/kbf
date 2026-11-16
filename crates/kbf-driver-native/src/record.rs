@@ -9,8 +9,7 @@
 //!
 //! A record is the file `<scratch>/runs/lease-<term>-<seq>` holding one line: the
 //! leader's pid (which is the group id) and its start time ([`Record`]). It is kept
-//! outside the lease directory, which the action may write (the one place the sandbox
-//! lets it write on macOS).
+//! outside the lease directory, which the action may write.
 //!
 //! [`Gate::spawn`] writes the record before the program runs. The child, between fork
 //! and exec, sends its pid to the daemon and waits; the daemon reads the child's start
@@ -81,8 +80,8 @@ impl Record {
     }
 }
 
-/// This boot of the machine: the kernel's boot id on Linux, the boot session UUID on
-/// macOS. A record of another boot names a process that is gone.
+/// This boot of the machine: the kernel's boot id. A record of another boot names a
+/// process that is gone.
 ///
 /// # Errors
 /// The kernel would not say.
@@ -91,40 +90,23 @@ pub fn boot_id() -> io::Result<String> {
     boot_text(&std::fs::read("/proc/sys/kernel/random/boot_id")?)
 }
 
-/// This boot of the machine: the kernel's boot id on Linux, the boot session UUID on
-/// macOS (`kern.bootsessionuuid`). Not the boot time (`kern.boottime`), which can move
-/// within one boot when the clock is set or the machine wakes: a record of this boot
-/// would then read as an earlier one's, and its action would be left running. A record
-/// of another boot names a process that is gone.
+/// Where there is no boot id to read (the native runtime runs on Linux only).
 ///
 /// # Errors
-/// The kernel would not say.
-#[cfg(target_os = "macos")]
+/// Always: the platform is not supported.
+#[cfg(not(target_os = "linux"))]
 pub fn boot_id() -> io::Result<String> {
-    // A UUID string and its NUL take 37 bytes.
-    let mut id = [0_u8; 64];
-    let mut size = id.len();
-    // SAFETY: a C string name, and a writable buffer of `size` bytes, which the call
-    // fills with a NUL-terminated string and whose length it writes back.
-    let done = unsafe {
-        libc::sysctlbyname(
-            c"kern.bootsessionuuid".as_ptr(),
-            id.as_mut_ptr().cast(),
-            &raw mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if done != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    boot_text(id.get(..size).unwrap_or(&id))
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "the native driver runs on Linux only",
+    ))
 }
 
 /// The boot id the kernel wrote into `bytes`: up to the first NUL, trimmed.
 ///
 /// # Errors
 /// It is not one non-empty word of UTF-8 (a record holds it between spaces).
+#[cfg(any(target_os = "linux", test))]
 fn boot_text(bytes: &[u8]) -> io::Result<String> {
     let text = bytes.split(|&b| b == 0).next().unwrap_or_default();
     let text = std::str::from_utf8(text).map_err(io::Error::other)?.trim();
@@ -222,9 +204,6 @@ struct Gated {
 pub enum KeeperFor {
     /// A member of the action's process group, which it kills.
     Group,
-    /// A keeper of its own that ends every process of the uid the action runs as.
-    #[cfg(target_os = "macos")]
-    Uid(u32),
 }
 
 impl KeeperFor {
@@ -232,8 +211,6 @@ impl KeeperFor {
     fn start(self, pid: i32) -> io::Result<Keeper> {
         match self {
             Self::Group => Keeper::join(pid),
-            #[cfg(target_os = "macos")]
-            Self::Uid(uid) => Keeper::for_uid(uid),
         }
     }
 }
@@ -554,14 +531,14 @@ mod tests {
     #[test]
     fn a_boot_id_is_one_word() {
         assert_eq!(boot_text(b"3f2a-77\n").expect("linux"), "3f2a-77");
-        assert_eq!(boot_text(b"AB-CD\0\0junk").expect("macos"), "AB-CD");
+        assert_eq!(boot_text(b"AB-CD\0\0junk").expect("padded"), "AB-CD");
         for bad in [&b""[..], b"\0AB-CD", b" \n", b"a b", b"\xff"] {
             assert!(boot_text(bad).is_err(), "{bad:?}");
         }
     }
 
     /// Catches a boot id that is empty or changes between two reads in one process (on
-    /// macOS, the real `kern.bootsessionuuid` call; on Linux, `/proc`), and one that a
+    /// Linux, `/proc`), and one that a
     /// record does not carry back.
     #[test]
     fn this_boot_reads_the_same_twice() {
@@ -634,7 +611,7 @@ mod tests {
             "CARGO_MANIFEST_DIR",
             "clean",
         ];
-        let program = crate::xcode::tests::act();
+        let program = crate::act();
         let program = program.as_path();
         let mut command = Command::new(program);
         command.stdout(std::process::Stdio::piped());
@@ -769,11 +746,7 @@ mod tests {
         let record = dir.join("lease-1-3");
         let script = dir.join("busy-program");
         // Its interpreter is the act steps' link: run, it echoes its own path.
-        std::fs::write(
-            &script,
-            format!("#!{} echo\n", crate::xcode::tests::act().display()),
-        )
-        .expect("write");
+        std::fs::write(&script, format!("#!{} echo\n", crate::act().display())).expect("write");
         std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
             .expect("chmod");
         let held = std::fs::OpenOptions::new()

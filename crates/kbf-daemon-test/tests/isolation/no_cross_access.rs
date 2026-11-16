@@ -10,7 +10,7 @@
 //! environment) are the `#[ignore]`d tier-R tests at the end, which fail loudly on the
 //! stand-in. Cross-action protection on a Linux node is "B cannot name A's files" (a mount
 //! namespace per lease), not "B is another user": all actions are the same container uid
-//! (daemon.md "User namespaces"); a Mac leg is per-uid (`Isolation::PerUid`).
+//! (daemon.md "User namespaces").
 //!
 //! Why B only runs after A here: the stand-in keeps ONE record of the last action
 //! (`pid`, `root`, `upper`, `owner`) for the whole node, so two leases in flight would

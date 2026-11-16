@@ -15,7 +15,7 @@ use kbf_proto::worker::{Start, server_message};
 use support::{Cell, FakeDaemon, Job, QUIET, hello_on, output, ran};
 use tonic::Streaming;
 
-const MAC: &[(&str, &str)] = &[("arch", "arm64"), ("os", "macos")];
+const ARM: &[(&str, &str)] = &[("arch", "arm64"), ("os", "linux")];
 
 /// A booking: the platform-property entries that size an action.
 type Size = &'static [(&'static str, &'static str)];
@@ -166,26 +166,32 @@ async fn a_node_with_less_memory_free_gets_fewer_leases() {
     );
 }
 
-/// Catches: a platform filter applied after the spread. The Mac is named first and holds
-/// nothing, so it is the least booked of the three; Linux work still goes to the two
-/// Linux nodes, which split it, and the Mac's own work goes to the Mac and no Linux node.
+/// Catches: a platform filter applied after the spread. The arm64 node is named first and
+/// holds nothing, so it is the least booked of the three; x86-64 work still goes to the two
+/// x86-64 nodes, which split it, and the arm64 work goes to the arm64 node and no x86-64 node.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_platform_is_matched_before_the_spread() {
     let cell = Cell::start().await;
-    let mut mac = FakeDaemon::connect(cell.worker_addr, hello_on("node-a", 4, 8, MAC))
+    let mut arm = FakeDaemon::connect(cell.worker_addr, hello_on("node-a", 4, 8, ARM))
         .await
         .expect("registered");
     let mut linux_b = cell.daemon("node-b", 4, 8).await;
     let mut linux_c = cell.daemon("node-c", 4, 8).await;
 
-    let _linux = hold(&cell, "linux", &[("OSFamily", "linux")], &[DEFAULT; 4]).await;
+    let _linux = hold(
+        &cell,
+        "linux",
+        &[("OSFamily", "linux"), ("ISA", "x86-64")],
+        &[DEFAULT; 4],
+    )
+    .await;
     assert_eq!(starts(&mut linux_b).await.len(), 2);
     assert_eq!(starts(&mut linux_c).await.len(), 2);
-    mac.no_work().await;
+    arm.no_work().await;
 
-    let darwin = [("OSFamily", "Darwin"), ("ISA", "arm-a64")];
-    let _mac_job = hold(&cell, "mac", &darwin, &[DEFAULT]).await;
-    assert_eq!(starts(&mut mac).await.len(), 1);
+    let arm_platform = [("OSFamily", "linux"), ("ISA", "arm-a64")];
+    let _arm_job = hold(&cell, "arm", &arm_platform, &[DEFAULT]).await;
+    assert_eq!(starts(&mut arm).await.len(), 1);
     linux_b.no_work().await;
     linux_c.no_work().await;
 }

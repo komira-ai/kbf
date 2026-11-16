@@ -43,6 +43,7 @@ mod base;
 mod encode;
 mod memo;
 mod place;
+mod retry;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -54,6 +55,7 @@ use tierstore::{MAX_DEPTH, MAX_ENTRIES, TreeDigest, TreeError};
 
 pub use self::base::{BaseFacts, BaseTree, BaseTreeError, RESERVED_NAMES};
 pub use self::place::{HEADS_IN_FLIGHT, LOCATE_CHUNK, LOOKUP_DEADLINE};
+pub use self::retry::{DEFAULT_TOTAL, FIRST_WAIT, LONGEST_WAIT, PutRetry, Sleeper};
 
 use self::encode::{Child, Manifest};
 use self::memo::{Measure, Memo, Remembered};
@@ -212,6 +214,7 @@ pub struct TreeWriter {
     source: Arc<dyn BlobSource>,
     store: Arc<dyn LargeStore>,
     clock: Clock,
+    retry: PutRetry,
     memo: Mutex<Memo>,
 }
 
@@ -243,8 +246,16 @@ impl TreeWriter {
             source,
             store,
             clock,
+            retry: PutRetry::default(),
             memo: Mutex::new(Memo::new(entries)),
         }
+    }
+
+    /// This writer, repeating a write the store answered 503 or a dead connection by `retry`.
+    #[must_use]
+    pub fn with_put_retry(mut self, retry: PutRetry) -> Self {
+        self.retry = retry;
+        self
     }
 
     /// Writes the action tree of `kept` over `base`.
@@ -308,20 +319,22 @@ impl TreeWriter {
         children.push(encode::dir("work", &manifests[kept.root()]));
         children.push(encode::dir(".kbf", &kbf.digest));
         let root = top(children)?;
-        place::write_whole(&*self.source, &*self.store, unlocated).await?;
+        place::write_whole(&*self.source, &*self.store, &self.retry, unlocated).await?;
         let store = &*self.store;
         // Collected, as `place`'s asks are, so the future can be proved `Send`.
         let writes: Vec<_> = built
             .iter()
-            .map(|manifest| place::write_manifest(store, &manifest.digest, manifest.bytes.clone()))
+            .map(|manifest| {
+                place::write_manifest(store, &self.retry, &manifest.digest, manifest.bytes.clone())
+            })
             .collect();
         stream::iter(writes)
             .buffered(place::WRITES_IN_FLIGHT)
             .try_collect::<()>()
             .await?;
         self.remember(&plan, &measures, &manifests);
-        place::write_manifest(store, &kbf.digest, kbf.bytes).await?;
-        place::write_manifest(store, &root.digest, root.bytes).await?;
+        place::write_manifest(store, &self.retry, &kbf.digest, kbf.bytes).await?;
+        place::write_manifest(store, &self.retry, &root.digest, root.bytes).await?;
         Ok(ActionTree { digest: root.tree })
     }
 
@@ -377,7 +390,9 @@ impl TreeWriter {
         let store = &*self.store;
         let writes: Vec<_> = built
             .iter()
-            .map(|manifest| place::write_manifest(store, &manifest.digest, manifest.bytes.clone()))
+            .map(|manifest| {
+                place::write_manifest(store, &self.retry, &manifest.digest, manifest.bytes.clone())
+            })
             .collect();
         stream::iter(writes)
             .buffered(place::WRITES_IN_FLIGHT)

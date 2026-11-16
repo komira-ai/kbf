@@ -89,10 +89,15 @@
 //! - the manifest holding a package of the job scheduler's server (`js-server-core`, `js-store`),
 //!   reached by any workspace crate through a normal, dev or build edge, or a package named
 //!   `kbf-lease-client` (in `scheduler_server_crates`).
+//! - the tierstore trees client (`kbf-trees-client`, in `trees_client_layer`) reaching a kbf
+//!   crate or a tierstore crate other than `tierstore-trees-api`, or being depended on by any
+//!   crate of this workspace (no user yet); and a crate of the tierstore repository at a second
+//!   revision, or `tierstore`, `objstore-s3` or `tierstore-trees-api` taken from elsewhere.
 
 mod job_client_layer;
 mod scheduler_server_crates;
 mod step_runner_layer;
+mod trees_client_layer;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::process::Command;
 

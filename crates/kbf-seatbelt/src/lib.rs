@@ -1,9 +1,9 @@
-//! The text of the macOS Seatbelt profiles that `sandbox-exec` applies, shared by the Mac daemon's
-//! native driver (`kbf-driver-native`) and the task runner (`kbf-task`).
+//! The text of the macOS Seatbelt profiles that `sandbox-exec` applies, used by the task runner
+//! (`kbf-task`).
 //!
 //! Nothing here calls the system: every function builds or checks text from plain values, so the
 //! rules are tested on Linux. What a profile does when `sandbox-exec` applies it is shown by the
-//! tests that run on a Mac (`crates/kbf-driver-native/tests/`, `crates/kbf-task/tests/seatbelt.rs`).
+//! tests that run on a Mac (`crates/kbf-task/tests/seatbelt.rs`).
 //!
 //! # What the rules here do not cover
 //!
@@ -12,7 +12,7 @@
 //!   behalf is reachable: the plainest is the system resolver (`mDNSResponder`), so DNS lookups
 //!   still go out and a name a process looks up can carry data off the node.
 //! - A connect to the node's own non-loopback address is still allowed under these rules (seen on
-//!   the macOS runner by `kbf-driver-native/tests/network.rs`), so a service listening on the
+//!   the macOS runner by `kbf-task`'s tests), so a service listening on the
 //!   node's LAN address is reachable.
 //! - A file deny ([`Profile::deny_read`]) names the file by its path, as the sandbox compares
 //!   paths, so the caller passes the real path (no symlink in it; a path that does not exist cannot
@@ -65,14 +65,13 @@ pub const DENY_NETWORK_RULES: &str = deny_network_rules!();
 /// the rest of the prefix: RemoteXPC, the tunnel CoreDevice talks to a device through),
 /// and no connect to `usbmuxd`'s socket, which the sandbox names by its real path
 /// (`/var/run` is a link to `/private/var/run`; a rule on the link's path matches
-/// nothing). `kbf-driver-native/tests/devices.rs` shows each refused on the macOS runner, and
+/// nothing). `kbf-task`'s tests show each refused on the macOS runner, and
 /// reached without the sandbox, `remotepairingd`, `.coredevice` and `.control` among them; the
-/// driver's tests check that each mach rule is a `global-name-prefix` covering every
+/// tests check that each mach rule is a `global-name-prefix` covering every
 /// name listed here. Their place in the profile does
 /// not decide: with the `usbmuxd` rule before the network rules' allow for every
-/// Unix socket (a defect), the runner still refused the connect. A lease that books a
-/// device is to get a profile without these (`docs/design/ios-devices.md`, section
-/// 6.1); none does yet.
+/// Unix socket (a defect), the runner still refused the connect. No job books a
+/// device, so every profile carries them.
 pub const NO_DEVICE_RULES: &str = "(deny mach-lookup (global-name-prefix \"com.apple.CoreDevice.\"))\n\
 (deny mach-lookup (global-name-prefix \"com.apple.remoted\"))\n\
 (deny network-outbound (literal \"/private/var/run/usbmuxd\"))\n";
@@ -140,8 +139,7 @@ impl Profile {
     /// `file-write-unlink` deny for each directory above it, so the directory cannot be renamed
     /// away with the file in it. The denies are last: a later rule wins.
     ///
-    /// Writes are not limited by this profile (the driver's profiles limit them to a lease
-    /// directory; this one does not), so a process may write wherever its user can.
+    /// Writes are not limited by this profile, so a process may write wherever its user can.
     ///
     /// # Errors
     /// [`PathError`] for a path that is not absolute, or that [`quoted`] refuses.

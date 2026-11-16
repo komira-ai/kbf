@@ -209,28 +209,24 @@ anything the attestation does not cover.
 
 ## 7. macOS
 
-Macs are nodes only. Listener passing, Envoy and the loopback gate are Linux designs, and a Mac
+A Mac host runs no kbf daemon. Listener passing, Envoy and the loopback gate are Linux designs, and a Mac
 hosting a frontend is unsupported [U].
 
-- `kbf --mode=daemon` runs as root in a system LaunchDaemon [V, macos-end-state.md]. Actions run as a pool of
-  unprivileged lease users (`kbf-pool-0` onward) created through OpenDirectory. A pkg payload cannot create them,
-  so `kbf-installer setup` creates them, as root, after the config validates. The pkg also does not bootstrap
-  the plist; setup does.
+- A Mac host runs no kbf daemon: a macOS action runs as a js-agent job
+  ([actions-as-jobs.md](actions-as-jobs.md) section 14). What this section says of the Mac host's
+  installer and pkg is the host install, which stays; the Mac side of `kbf-host-install`, the installer's Mac host
+  setup and the pkg are a separate change from the removal of the Mac daemon path.
 - The pkg is signed (notarized). Its payload is `kbf-installer`, the plist, root-owned directories and trust
-  files; not the lease users, not the token.
+  files; not the token.
 - **Signing is load-bearing.** A TCC grant is keyed to the signing identity, so every release the installer
   activates must be signed with the farm identity or Full Disk Access is lost on each update. The installer
   verifies the signature and preserves it; the cask must not re-sign.
 - Tokens reach a Mac by file push, never inside the pkg.
-- `mac-node-provisioning.md` still describes a hidden role user and `/usr/local/kbf`. The two documents
-  disagree until that one is corrected; kbf-installer.md, this document and macos-end-state.md win.
 
 ## 8. The binary end state and the order of work
 
 One `kbf` binary with five modes, selected by `--mode`. These stay separate processes, because the technical need is real:
-`kbf-installer` (root, and must not be the process it updates), `kbf-guest` (runs inside the guest),
-`kbf-vmm` (its own entitlement; ship only when it does something), `kbf-mac-session` (macOS GUI session,
-shrinking per macos-end-state.md), and `kbf-mdm-gate` (keeps a credential away from the frontend; a mode of
+`kbf-installer` (root, and must not be the process it updates), and `kbf-mdm-gate` (keeps a credential away from the frontend; a mode of
 `kbf` on the MDM host is the alternative, a decision of its own). The hidden re-exec modes `__keeper`,
 `__as-user` and `__chown-dirs` stay inside `kbf`. Test-only binaries (the fake container runtimes, the
 fake systemctl, `kbf-keeper-swap`) are never shipped.
@@ -254,7 +250,7 @@ Order:
 4. Grow `kbf-installer`: setup, the release fetch, the service loop. Build the package from it (deb,
    tarball, then the Mac pkg).
 5. Move the test farm onto it one host at a time; each host needs the owner's go.
-6. Mac nodes run `kbf --mode=daemon` (decision 2 below), then delete the `kbf-daemon` and `kbf-server` binaries.
+6. Delete the `kbf-daemon` and `kbf-server` binaries (the Macs run no daemon: a macOS action is a js-agent job).
 7. Remove the handover verb and `kbf-deploy` piece by piece.
 
 ## 9. Open decisions
@@ -266,8 +262,7 @@ Order:
    token once to a root-only file and prints the file's path, never the secret; it creates none once any
    operator token exists. Open: an authenticated remote mode (token and TLS on a separate
    operator listener) with its own threat model, before any remote client is built.
-2. **The darwin component rename.** Decided: the darwin release component is `kbf`, and the Mac runs
-   `kbf --mode=daemon`; `kbf-mac-provision` moves to the same layout. The rename is one coordinated change with the
+2. **The darwin component rename.** Decided: the darwin release component is `kbf`. The rename is one coordinated change with the
    signing allow-list (`tools/ci/darwin-entitlements.txt`, `sign-darwin`) and an explicit contract version bump,
    before the `kbf-daemon` binary is deleted.
 3. **How a frontend host gets Envoy.** Decided: host preparation installs it (frontend and all-in-one hosts
@@ -284,6 +279,6 @@ providers; cross-version Envoy upgrades; a managed build service; Postgres and s
 Debian: `dh_installsystemd`, `deb-systemd-helper(1p)`, `policy-rc.d`, Debian Policy 9.1.2 and 10.7.3, FHS 3.0
 section 5.8, `debsums(1)`. systemd: `systemd.unit(5)`, `systemd.service(5)`, `systemd.exec(5)`,
 `sysusers.d(5)`, `tmpfiles.d(5)`; cited from memory, not fetched. Repo: `kbf-installer.md`, `docs/api.md`, `daemon.md`, `pull-updates.md`,
-`split-mode-updates.md`, `frontend-proxy.md`, `macos-end-state.md`, `mac-node-provisioning.md`,
+`split-mode-updates.md`, `frontend-proxy.md`,
 `../deploy/host-releases.md`, `../deploy/linux-build-host.md`; the kbf crates on `feature/pull-updates` and
 `startup/self-checks`.
