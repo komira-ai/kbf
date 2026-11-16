@@ -102,7 +102,8 @@ These need no change; the new design stands on them. Test names are the ones to 
 `--executor-frontend-id` today names one frontend. It becomes the name of the **group**: every frontend of one farm uses one value
 (the default `kbf`), it is the `kbf-frontend` label of every job and the input of the job id hash, and it is no longer unique.
 What is unique is the **process**: the `instance` id the executor already draws at start (`config.rs` `instance_id`), kept as the
-`kbf-instance` label. Virtual workers are named by the process: `js:<group>.<instance, first 8 hex>-<n>`. Two live frontends
+`kbf-instance` label. Virtual workers are named by the process: `js:<group>.<instance, first 8 hex>-<n>` (as built, the Macs' workers of
+`--executor-mac-hosts` likewise: `js-mac:<group>.<instance, first 8 hex>-<n>`, each with its row, arch `arm64`). Two live frontends
 therefore never register one worker id, and no code asks whether another frontend exists: `rival`, `Twin` and the cancel-on-start of
 `adopt_jobs` are removed in `shared` mode (section 7, key `executor-ownership`). The per-slot `kbf.toml` of komira-internal is no longer
 needed; neither is a per-slot `pack-writer` (pack keys carry the process's start id: `cas/f/<writer>/<start>/<sequence>`,

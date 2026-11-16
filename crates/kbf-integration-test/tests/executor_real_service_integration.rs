@@ -90,6 +90,7 @@ impl Inputs for FakeInputs {
         Ok(ActionFacts {
             image: image(),
             timeout: Some(timeout.unwrap_or(Duration::from_secs(60))),
+            system: kbf_server::executor::System::Linux,
         })
     }
 

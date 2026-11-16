@@ -230,12 +230,12 @@ async fn linux_daemons_get_no_lease_while_the_executor_runs() {
     }
 }
 
-/// Catches a filter that takes more than the Linux daemons, or fewer: under the executor, an
-/// action for macOS is placed on the Mac daemon, and five for Linux fill the virtual worker's
-/// four cores and the fifth waits, while the Linux daemon beside them, with room for four
-/// more, is given none.
+/// Catches a filter that takes more than the Linux daemons, or fewer: under the executor, five
+/// actions for Linux fill the virtual worker's four cores and the fifth waits, while the Linux
+/// daemon beside them, with room for four more, is given none; and an action for macOS is not
+/// placed on the Mac daemon but on the executor's Mac worker once one registers.
 #[tokio::test(start_paused = true)]
-async fn a_mac_daemon_is_placed_beside_the_virtual_workers() {
+async fn a_mac_action_goes_to_the_executors_mac_worker_and_never_to_a_mac_daemon() {
     let farm = farm(ExecutorKind::JsAgent);
     let (_, mut mac) = daemon(&farm, "mac-a", report("macos", &["native"]));
     let (_, mut linux) = daemon(&farm, "linux-a", report("linux", &LINUX_DRIVERS));
@@ -247,14 +247,41 @@ async fn a_mac_daemon_is_placed_beside_the_virtual_workers() {
         .collect();
     farm.tick().await;
 
-    assert_eq!(holder(&farm, for_mac), Some(WorkerId::new("mac-a")));
+    assert_eq!(holder(&farm, for_mac), None, "placed on the Mac daemon");
     let holders: Vec<Option<WorkerId>> = for_linux.iter().map(|op| holder(&farm, *op)).collect();
     let fe = Some(WorkerId::new("js:fe-0"));
     assert_eq!(holders, [fe.clone(), fe.clone(), fe.clone(), fe, None]);
     assert_eq!(
         (starts(&mut mac), starts(&mut placed), starts(&mut linux)),
-        (1, 4, 0)
+        (0, 4, 0)
     );
+
+    let (outbound, mut mac_worker) = mpsc::unbounded_channel();
+    let worker = WorkerId::new("js-mac:fe-0");
+    farm.register_virtual(
+        &worker,
+        DaemonInstance::new("js-mac:fe-0"),
+        DaemonInstance::new(""),
+        report("macos", &["native"]),
+        outbound,
+        ServerMessage::default(),
+    );
+    farm.tick().await;
+    assert_eq!(holder(&farm, for_mac), Some(worker));
+    assert_eq!((starts(&mut mac_worker), starts(&mut mac)), (1, 0));
+}
+
+/// Catches a Mac daemon given a lease under the default executor: the Macs run no daemon, and
+/// one that connects is registered with no driver, so a macOS action waits as one no live
+/// worker can run.
+#[tokio::test(start_paused = true)]
+async fn a_mac_daemon_gets_no_lease_under_the_daemon_executor_either() {
+    let farm = farm(ExecutorKind::KbfDaemon);
+    let (_, mut mac) = daemon(&farm, "mac-a", report("macos", &["native"]));
+    let operation = submit(&farm, request(1, LeaseKind::Action, "macos"));
+    farm.tick().await;
+    assert_eq!(holder(&farm, operation), None);
+    assert_eq!(starts(&mut mac), 0);
 }
 
 /// Catches the filter taking the executor's own workers: a virtual worker that resends its

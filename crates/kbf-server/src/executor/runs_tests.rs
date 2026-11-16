@@ -362,7 +362,12 @@ async fn a_job_conflict_on_resubmit_is_infra_and_flags_a_twin() {
 #[tokio::test(start_paused = true)]
 async fn a_whole_machine_action_submits_a_whole_host_job() {
     let harness = Harness::new().await;
-    let hello = harness.cfg.hello("js:front-0", "inst", "");
+    let hello = harness.cfg.hello(
+        crate::executor::mac::WorkerOs::Linux,
+        "js:front-0",
+        "inst",
+        "",
+    );
     let drivers: Vec<&str> = hello
         .capabilities
         .iter()

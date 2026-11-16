@@ -255,14 +255,14 @@ async fn a_restart_past_the_budget_answers_the_client() {
 
 const MAC: &[(&str, &str)] = &[
     ("arch", "arm64"),
-    ("os", "macos"),
+    ("os", "linux"),
     ("drivers", "native"),
     ("drivers", "native-whole-machine"),
 ];
 
-const WHOLE: &[(&str, &str)] = &[("OSFamily", "macos"), ("kbf-lease", "whole_machine")];
+const WHOLE: &[(&str, &str)] = &[("OSFamily", "linux"), ("kbf-lease", "whole_machine")];
 
-/// The Mac's Hello from daemon process `instance`, naming `predecessor`, in `phase`.
+/// The whole-machine node's Hello from daemon process `instance`, naming `predecessor`, in `phase`.
 fn mac(instance: &str, predecessor: &str, phase: Phase, lease: Option<LeaseId>) -> Hello {
     Hello {
         instance_id: instance.to_owned(),

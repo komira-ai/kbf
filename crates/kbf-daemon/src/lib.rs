@@ -16,8 +16,7 @@
 //!   the daemon never stops trying.
 //! - [`report`]: the node report and its hash.
 //! - [`reach`]: the start-up check that the storage members answer a connect.
-//! - [`status`]: the node's software status (OS, kernel, daemon, Xcodes).
-//! - [`driver_watch`]: the driver's report channel, one part per source that feeds it.
+//! - [`status`]: the node's software status (OS, kernel, daemon).
 //! - [`cpu_pool`]: [`CpuPool`], the threads (`--cpu-threads`) for work that keeps a core
 //!   busy, such as hashing outputs.
 //! - [`runtime`]: the runtime trait and [`FakeRuntime`], which runs nothing.
@@ -38,8 +37,6 @@
 //! - [`usage`]: what an action used, measured by the kernel, and where it is carried.
 //! - [`keeper`]: the keeper mode of the `kbf-daemon` binary, the process each run gets
 //!   that ends the run when the daemon dies; the drivers start it.
-//! - `uid` (macOS): every process of one uid, listed and killed; the native driver's
-//!   exact kill of an action it runs as a pool user, and its keeper's.
 //! - [`LocalRuntime`]: **tests only**, runs actions as plain child processes.
 //! - [`Daemon`]: the session loop, with the contact clock and lease manager inside.
 //! - [`LeaseCore`] (`core`): the lease state the session loop drives (leases, contact,
@@ -66,7 +63,6 @@ mod core;
 pub mod cpu_pool;
 mod daemon;
 mod drain;
-pub mod driver_watch;
 mod extras;
 mod kbf_extras;
 pub mod keeper;
@@ -92,8 +88,6 @@ pub mod status;
 pub mod tree;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod trees;
-#[cfg(target_os = "macos")]
-pub mod uid;
 #[cfg(target_os = "linux")]
 pub mod usage;
 mod welcome;
@@ -114,7 +108,6 @@ pub use config::{
 pub use contact::{Acked, Contact};
 pub use cpu_pool::CpuPool;
 pub use daemon::{Daemon, PROTOCOL_VERSION, SessionError};
-pub use driver_watch::{DriverPart, DriverWatch};
 pub use extras::{ExtraWake, NoExtras, SessionExtras};
 pub use kbf_extras::KbfExtras;
 pub use kbf_mapsync::MapHolder;

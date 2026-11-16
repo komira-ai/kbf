@@ -32,6 +32,7 @@ impl Inputs for Treed {
         Ok(ActionFacts {
             image: format!("registry.test/kbf@sha256:{}", "ab".repeat(32)),
             timeout: Some(Duration::from_secs(20)),
+            system: crate::executor::System::Linux,
         })
     }
 
@@ -70,7 +71,14 @@ async fn prepared(
         twin: &harness.twin,
         share: None,
     };
-    prepare(&ctx.preparer(), LeaseId::new(7, 8), &action(), booking).await
+    prepare(
+        &ctx.preparer(),
+        crate::executor::mac::WorkerOs::Linux,
+        LeaseId::new(7, 8),
+        &action(),
+        booking,
+    )
+    .await
 }
 
 const SHARE: Booking = Booking::Share {

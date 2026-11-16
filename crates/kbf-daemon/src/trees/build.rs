@@ -33,7 +33,7 @@ pub(super) async fn build(
     let loaded = load(cas, in_flight, digest, known, &|_, _| false, max).await?;
     let walked =
         make_directories(cas, in_flight, digest, tmp, &loaded, &Default::default()).await?;
-    let stats = crate::cache::lease::write_files_as(cas, cache, walked.files, &[], true).await?;
+    let stats = crate::cache::lease::write_files(cas, cache, walked.files, &[]).await?;
     let summary = check(loaded, digest.clone(), tmp.to_owned()).await?;
     Ok((summary, stats))
 }

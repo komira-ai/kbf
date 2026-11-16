@@ -31,19 +31,13 @@ async fn two_drivers_serving_one_kind_refuse_to_start() {
             "--node-id=mac-1".to_owned(),
             "--cas=https://127.0.0.1:1".to_owned(),
             flag("data-dir", &dir),
-            flag("xcode-apps", &dir.join("Applications")),
         ];
         let drivers = drivers.iter().map(|d| format!("--driver={d}"));
         Cli::try_parse_from(flags.into_iter().chain(drivers)).expect("flags")
     };
     let both = cli(&["fake", "native"]);
-    let native = || {
-        let mut config = native_config(&both)?;
-        // Not the runner's own (on macOS): the start sweeps them.
-        config.user_folders = None;
-        Ok(config)
-    };
-    let why = node(&both, native, &dir.join("no-xcrun"))
+    let native = || native_config(&both);
+    let why = node(&both, native)
         .err()
         .expect("two drivers serve action")
         .to_string();
@@ -53,7 +47,7 @@ async fn two_drivers_serving_one_kind_refuse_to_start() {
          have one driver on a node"
     );
     let fakes = cli(&["fake", "fake"]);
-    let (daemon, reports) = node(&fakes, native, Path::new("none")).expect("one fake runtime");
+    let (daemon, reports) = node(&fakes, native).expect("one fake runtime");
     assert!(reports.is_none());
     drop(daemon);
     kbf_outputs::remove_tree(&dir).expect("clean");
@@ -119,7 +113,6 @@ fn the_storage_liveness_flags_reach_the_plane_and_its_nodes() {
         "--driver=native".to_owned(),
         "--cas=https://127.0.0.1:1".to_owned(),
         flag("data-dir", &dir),
-        flag("xcode-apps", &dir.join("Applications")),
     ];
     flags.extend(LIVENESS_FLAGS.map(str::to_owned));
     let cli = Cli::try_parse_from(flags).expect("flags");
@@ -187,7 +180,6 @@ fn start_over_logs_the_retired_flag_warning() {
             "--driver=native".to_owned(),
             "--cas=https://127.0.0.1:1".to_owned(),
             flag("data-dir", &dir),
-            flag("xcode-apps", &dir.join("Applications")),
         ];
         all.extend(extra);
         Cli::try_parse_from(all).expect("flags")
@@ -232,7 +224,6 @@ fn the_retired_update_flags_are_accepted_with_or_without_a_map() {
         "--driver=native".to_owned(),
         "--cas=https://127.0.0.1:1".to_owned(),
         flag("data-dir", &dir),
-        flag("xcode-apps", &dir.join("Applications")),
     ];
     let mut asked = base.clone();
     asked.push(flag("update-dir", &dir.join("update")));
@@ -289,7 +280,6 @@ fn serving_ends_with_an_error_when_no_storage_member_answers() {
         "--driver=native".to_owned(),
         "--cas=https://127.0.0.1:1".to_owned(),
         flag("data-dir", &dir),
-        flag("xcode-apps", &dir.join("Applications")),
     ])
     .expect("flags");
     let map_at = |addr: String| {
@@ -380,7 +370,6 @@ fn a_daemon_beside_another_half_drains_on_a_signal_and_stops_when_the_other_does
         "--driver=native".to_owned(),
         "--cas=https://127.0.0.1:1".to_owned(),
         flag("data-dir", &dir),
-        flag("xcode-apps", &dir.join("Applications")),
     ])
     .expect("flags");
     let ends = |signalled: bool| {

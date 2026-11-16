@@ -87,7 +87,6 @@ pub const SHIPPED_BINARIES: &[(&str, &str)] = &[
     ("kbf-installer", "kbf-installer"),
     ("kbf-host-install", "kbf-host-install"),
     ("kbf-updater", "kbf-updater"),
-    ("kbf-mac-provision", "kbf-mac-provision"),
     ("kbf-signer", "kbf-signer"),
     ("kbf-task", "kbf-task"),
     ("kbf-coordinator", "kbf-coordinator"),

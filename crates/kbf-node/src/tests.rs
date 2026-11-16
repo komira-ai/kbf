@@ -1,26 +1,9 @@
-use clap::Parser;
-use kbf_daemon::DriverReport;
-use kbf_proto::worker::XcodeState;
+use std::path::Path;
 
 use super::*;
+use clap::Parser;
 
 mod more;
-
-/// The first report the watch sends with no Xcode left not surveyed, waited for up
-/// to a minute.
-pub(crate) async fn surveyed(reports: &mut Reports) -> DriverReport {
-    let pending = |r: &DriverReport| {
-        r.xcodes
-            .iter()
-            .any(|x| x.state() == XcodeState::NotSurveyed)
-    };
-    let surveyed = reports.wait_for(|r| !pending(r));
-    tokio::time::timeout(Duration::from_secs(60), surveyed)
-        .await
-        .expect("the first survey ends in time")
-        .expect("the watch runs")
-        .clone()
-}
 
 /// A CAS no test here reaches.
 #[derive(Debug)]
@@ -48,17 +31,19 @@ impl Cas for NoCas {
     }
 }
 
-/// Catches a driver watch whose slots' part is not wired to the runtime (the number of
-/// slots that can run a lease would again wait for an Xcode survey to change): both
-/// parts are taken by the wiring, the slots' first, so another taker finds neither.
+/// Catches a native driver that tells the daemon nothing: the node report must carry how
+/// the driver keeps the network off (`network_isolation`), which `Daemon::with_driver_report`
+/// takes from the channel the wiring returns.
 #[test]
-fn the_slots_part_and_the_xcodes_part_are_both_taken_by_the_wiring() {
-    let dir = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "kbf-node-watch-parts");
-    let runtime =
-        NativeRuntime::new(NativeConfig::new(dir.to_path_buf()), Arc::new(NoCas)).expect("runtime");
-    let (driver, _reports, _xcodes) = watch_parts(&runtime).expect("the parts");
-    assert!(driver.part(kbf_driver_native::slots::SOURCE).is_none());
-    assert!(driver.part(xcode_watch::SOURCE).is_none());
+fn the_native_driver_reports_how_it_keeps_the_network_off() {
+    let dir = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "kbf-node-reports");
+    let (runtime, reports) =
+        native_runtime(NativeConfig::new(dir.to_path_buf()), Arc::new(NoCas)).expect("runtime");
+    assert_eq!(
+        reports.borrow().entries,
+        [("network_isolation".to_owned(), "none".to_owned())]
+    );
+    assert!(reports.borrow().xcodes.is_empty());
     drop(runtime);
 }
 
@@ -111,9 +96,8 @@ fn the_drain_deadline_is_absent_by_default_and_has_no_cap() {
 }
 
 /// Catches: native flags that do not reach the driver's configuration (the
-/// memory limit, poll and output limits, where Xcodes are looked for, how often
-/// they are asked again, whether the Metal toolchain is required), a re-check
-/// every 0 s (a busy loop), and a relative or missing scratch directory accepted.
+/// memory limit, poll, grace and output limits), a poll of 0 ms (a busy loop), and a
+/// relative or missing scratch directory accepted.
 #[test]
 fn native_flags_reach_the_configuration() {
     let cli = parse(&[
@@ -125,7 +109,6 @@ fn native_flags_reach_the_configuration() {
         "--native-term-grace-ms=750",
         "--output-max-bytes=99",
         "--output-upload-deadline-secs=7",
-        "--xcode-apps=/var/kbf/apps",
     ])
     .expect("flags");
     assert_eq!(cli.drivers, [Driver::Native]);
@@ -136,27 +119,11 @@ fn native_flags_reach_the_configuration() {
     assert_eq!(config.term_grace, Duration::from_millis(750));
     assert_eq!(config.outputs.max_bytes, 99);
     assert_eq!(config.upload_deadline, Duration::from_secs(7));
-    assert_eq!(cli.xcode_apps, PathBuf::from("/var/kbf/apps"));
-    assert_eq!(
-        xcode_watch_args(&cli),
-        (xcode::Probe::system(false), xcode_watch::EVERY)
-    );
-    let metal = parse(&[
-        "--driver=native",
-        "--require-metal-toolchain",
-        "--xcode-recheck-secs=0",
-    ])
-    .expect("flags");
-    assert_eq!(
-        xcode_watch_args(&metal),
-        (xcode::Probe::system(true), Duration::from_secs(1))
-    );
     let defaults = parse(&["--driver=native", "--data-dir=/s"]).expect("flags");
     assert_eq!(
         native_config(&defaults).expect("config").memory,
         MemoryPolicy::DEFAULT
     );
-    assert_eq!(defaults.xcode_apps, PathBuf::from("/Applications"));
     assert_eq!(
         native_config(&defaults).expect("config").term_grace,
         kbf_driver_native::DEFAULT_TERM_GRACE
@@ -189,7 +156,6 @@ fn native_flags_reach_the_configuration() {
         PathBuf::from("/var/lib/kbf/leases"),
         "the default data directory"
     );
-    assert_eq!(native_config(&defaults).expect("config").pool, None);
 }
 
 /// Catches: a default other than 10 percent, a value that does not reach the
@@ -255,43 +221,13 @@ async fn the_backstop_is_attached_only_where_the_kernel_reports_pressure() {
     assert!(memory_stall(&off).is_none());
 }
 
-/// Catches pool flags that do not reach the driver (a root daemon would refuse to
-/// start, or run every action as one user), a pool of other users than
-/// kbf-mac-provision makes, one flag without the other taken, and a pool at root's
-/// uid accepted.
+/// Catches a native daemon whose `leases` is searchable by others (the container driver's
+/// ids are not the daemon's; a native daemon runs as its own user and keeps 0700), and a
+/// container daemon whose `leases` is closed.
 #[test]
-fn the_pool_flags_reach_the_configuration() {
-    let pooled = |extra: &[&str]| {
-        let flags = [&["--driver=native", "--data-dir=/s"][..], extra].concat();
-        parse(&flags)
-    };
-    let cli = pooled(&["--pool-users=2", "--pool-first-uid=700"]).expect("flags");
-    let pool = native_config(&cli).expect("config").pool.expect("a pool");
-    assert_eq!(Some(pool), Pool::provisioned(2, 700).ok());
-    for one in ["--pool-users=2", "--pool-first-uid=700"] {
-        assert!(pooled(&[one]).is_err(), "{one} alone");
-    }
-    for count in ["0", "101"] {
-        assert!(pooled(&[&format!("--pool-users={count}"), "--pool-first-uid=700"]).is_err());
-    }
-    let root = pooled(&["--pool-users=1", "--pool-first-uid=0"]).expect("flags");
-    let refused = native_config(&root).expect_err("a pool at uid 0");
-    assert!(refused.to_string().contains("root"), "{refused}");
-}
-
-/// Catches a native daemon with a lease-user pool that makes `leases` 0700, which a
-/// pool user cannot search: its first lease fails with "working directory:
-/// Permission denied" (measured on a Mac with `--pool-users`). Starts the data
-/// directory the way the daemon does: with a pool `leases` is
-/// `kbf_driver_native::slots::LEASES_ROOT_MODE` (0711: searched, not listed, by the
-/// slot users), and a leftover 0700 one from a start without the pool is opened;
-/// without a pool the daemon's own user alone keeps it (0700); the container driver
-/// keeps its 0711; the fake driver with a pool flag and no native driver does not
-/// open it.
-#[test]
-fn leases_are_searchable_by_the_pool_users_of_a_native_daemon_only() {
+fn leases_are_searchable_by_others_for_the_container_driver_only() {
     use std::os::unix::fs::PermissionsExt as _;
-    let base = tests::scratch("leases-pool-mode");
+    let base = tests::scratch("leases-mode");
     let mode = |dir: &Path| {
         std::fs::metadata(dir.join("leases"))
             .expect("leases")
@@ -299,32 +235,22 @@ fn leases_are_searchable_by_the_pool_users_of_a_native_daemon_only() {
             .mode()
             & 0o777
     };
-    let start = |name: &str, extra: &[&str]| {
+    let start = |driver: &str, name: &str| {
         let dir = base.join(name);
-        let data = format!("--data-dir={}", dir.display());
-        let flags = [&["--driver=native", data.as_str()][..], extra].concat();
-        let cli = parse(&flags).expect("flags");
+        let flags = [
+            format!("--driver={driver}"),
+            format!("--data-dir={}", dir.display()),
+        ];
+        let cli = parse(&[flags[0].as_str(), flags[1].as_str()]).expect("flags");
         data_dir(&cli).expect("started").expect("a data dir");
-        dir
+        (cli, dir)
     };
-    let pool = ["--pool-users=2", "--pool-first-uid=700"];
-    let pooled = start("pooled", &pool);
-    assert_eq!(mode(&pooled), kbf_driver_native::slots::LEASES_ROOT_MODE);
-    assert_eq!(mode(&pooled), 0o711, "traverse, no list, no write");
-    let alone = start("alone", &[]);
-    assert_eq!(mode(&alone), 0o700, "a daemon without a pool");
-    // The same data directory started again, now with a pool.
-    let again = start("alone", &pool);
-    assert_eq!(again, alone);
-    assert_eq!(mode(&alone), 0o711, "an existing 0700 is opened for a pool");
-    let flags = [format!("--data-dir={}", base.join("oci").display())];
-    let oci = parse(&["--driver=container", flags[0].as_str()]).expect("flags");
+    let (native, alone) = start("native", "alone");
+    assert_eq!(mode(&alone), 0o700, "a native daemon");
+    assert!(!leases_open(&native));
+    let (oci, open) = start("container", "oci");
     assert!(leases_open(&oci), "the container driver");
-    let no_native = parse(&["--driver=fake", flags[0].as_str(), pool[0], pool[1]]).expect("flags");
-    assert!(
-        !leases_open(&no_native),
-        "a pool flag without the native driver"
-    );
+    assert_eq!(mode(&open), 0o711, "traverse, no list, no write");
 }
 
 /// Catches an upload deadline that defaults to anything but
@@ -453,18 +379,9 @@ fn swap_kill_flags_reach_the_configuration() {
     assert!(parse(&["--driver=container", "--lease-swap-poll-ms=0"]).is_err());
 }
 
-// This test binary answers as kbf-testkit's `kbf-act`, or as its fake `xcrun`,
-// `xcodebuild` or `sandbox-exec`, when run through a link of that name: the
-// programs the tests here (and src/startup_tests.rs) give the daemon to run.
+// This test binary answers as kbf-testkit's `kbf-act` when run through a link of that name:
+// the programs the tests here (and src/startup_tests.rs) give the daemon to run.
 kbf_testkit::act_test_hook!();
-
-/// Makes `path` a link to this test binary, which answers as the fake its base name
-/// names, with `rules` beside it (see `kbf_testkit::fake`).
-pub(crate) fn fake(path: &Path, rules: &str) {
-    std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
-    kbf_testkit::act::link_self(path).expect("link");
-    std::fs::write(format!("{}.rules", path.display()), rules).expect("rules");
-}
 
 /// A fresh directory for one test, under the test binary's directory.
 pub(crate) fn scratch(name: &str) -> PathBuf {
@@ -494,225 +411,4 @@ pub(crate) fn tls_files(dir: &Path) {
     std::fs::write(dir.join("ca.pem"), ca.pem()).expect("write");
     std::fs::write(dir.join("node.pem"), cert.pem()).expect("write");
     std::fs::write(dir.join("node.key"), key.serialize_pem()).expect("write");
-}
-
-/// Catches: the native driver's Xcode survey not handed to the daemon (issue #164),
-/// so the node's `NodeStatus` lists no Xcode at all, ready or not, and its Hello
-/// advertises none: the silent removal an Xcode that is not ready must never get.
-/// The Xcode here is an empty app, which no `xcodebuild` accepts (on Linux there is
-/// none), so the survey lists it as not ready, with why.
-#[tokio::test]
-async fn the_native_daemon_reports_every_installed_xcode() {
-    let dir = scratch("native");
-    tls_files(&dir);
-    let apps = dir.join("Applications");
-    let app = apps.join("Xcode_1.app");
-    std::fs::create_dir_all(app.join("Contents/Developer")).expect("app");
-    let flag = |name: &str, path: &Path| format!("--{name}={}", path.display());
-    let cli = Cli::try_parse_from([
-        "kbf-daemon".to_owned(),
-        "--server=https://127.0.0.1:1".to_owned(),
-        flag("ca-cert", &dir.join("ca.pem")),
-        flag("cert", &dir.join("node.pem")),
-        flag("key", &dir.join("node.key")),
-        "--node-id=mac-1".to_owned(),
-        "--driver=native".to_owned(),
-        "--cas=https://127.0.0.1:1".to_owned(),
-        flag("data-dir", &dir),
-        flag("xcode-apps", &apps),
-    ])
-    .expect("flags");
-    let mut config = native_config(&cli).expect("config");
-    // Not the runner's own (on macOS): the start sweeps them.
-    config.user_folders = None;
-    let (daemon, mut reports) =
-        native_with(&cli, config, &dir.join("no-xcrun")).expect("the native daemon");
-    // Not surveyed yet, or already surveyed (this one fails at once): either way
-    // listed. The gated tests (xcode_watch, startup_tests) hold the survey.
-    let listed = daemon.node_status().xcodes;
-    assert_eq!(listed.len(), 1, "{listed:?}");
-    assert_eq!(listed[0].app, app.display().to_string());
-    let xcodes = surveyed(&mut reports).await.xcodes;
-    assert_eq!(xcodes.len(), 1, "{xcodes:?}");
-    assert_eq!(xcodes[0].app, app.display().to_string());
-    assert_eq!(xcodes[0].state(), XcodeState::Failed);
-    assert!(!xcodes[0].reason.is_empty(), "{xcodes:?}");
-    drop((daemon, reports));
-    kbf_outputs::remove_tree(&dir).expect("clean");
-}
-
-/// Catches (decision on issue #164): the native daemon removing `xcrun`'s cache
-/// before its first survey. Every `xcrun` lookup of the survey then has nothing
-/// cached and takes seconds, while no Xcode is ready: on the macOS runner (15
-/// `Xcode*.app`) that survey took over 30 s, against about 7 s with the cache kept. The survey runs under the sandbox, so
-/// what a lease wrote there reaches only sandboxed tools. The Xcode's own
-/// `xcodebuild` is a fake that answers build `CACHE` while the cache is there, and
-/// fails once it is gone.
-#[tokio::test]
-async fn the_first_survey_finds_the_xcrun_cache_kept() {
-    let dir = scratch("forget");
-    tls_files(&dir);
-    let (temp, cache) = (dir.join("T"), dir.join("C"));
-    std::fs::create_dir_all(&temp).expect("T");
-    std::fs::create_dir_all(&cache).expect("C");
-    std::fs::write(temp.join("xcrun_db"), b"a lease's").expect("cache");
-    let apps = dir.join("Applications");
-    let program = apps
-        .join("Xcode_1.app/Contents/Developer")
-        .join(xcode::XCODEBUILD);
-    fake(
-        &program,
-        &format!(
-            "*\t-\twait-for {}/xcrun_db 0 ; echo Build version CACHE\n",
-            temp.display()
-        ),
-    );
-    // On macOS the survey runs under the real sandbox, which lets it write only in
-    // its lease directory and under /dev: the fake's log of its runs (beside it,
-    // see kbf_testkit::fake) goes to /dev/null.
-    std::os::unix::fs::symlink("/dev/null", format!("{}.log", program.display()))
-        .expect("log link");
-    let flag = |name: &str, path: &Path| format!("--{name}={}", path.display());
-    let cli = Cli::try_parse_from([
-        "kbf-daemon".to_owned(),
-        "--server=https://127.0.0.1:1".to_owned(),
-        flag("ca-cert", &dir.join("ca.pem")),
-        flag("cert", &dir.join("node.pem")),
-        flag("key", &dir.join("node.key")),
-        "--node-id=mac-1".to_owned(),
-        "--driver=native".to_owned(),
-        "--cas=https://127.0.0.1:1".to_owned(),
-        flag("data-dir", &dir),
-        flag("xcode-apps", &apps),
-    ])
-    .expect("flags");
-    let mut config = native_config(&cli).expect("config");
-    config.user_folders = kbf_driver_native::user_folders::UserFolders::new(temp.clone(), cache);
-    let (daemon, mut reports) =
-        native_with(&cli, config, &dir.join("no-xcrun")).expect("the native daemon");
-    let xcodes = surveyed(&mut reports).await.xcodes;
-    assert_eq!(xcodes.len(), 1, "{xcodes:?}");
-    assert_eq!(xcodes[0].build, "CACHE", "{xcodes:?}");
-    assert!(
-        temp.join("xcrun_db").exists(),
-        "the start removed the cache"
-    );
-    drop((daemon, reports));
-    kbf_outputs::remove_tree(&dir).expect("clean");
-}
-
-/// Catches (decision on issue #164): the native daemon's survey of its Xcodes
-/// asking a question outside the actions' sandbox, `xcrun`'s lookup above all (it
-/// reads and fills a cache leases can write), or with an `xcrun` other than the one
-/// the daemon warms. The sandbox program is a fake that marks what it runs (its
-/// `-D KBF_LEASE=<dir>` in the command's environment); the Xcode's `xcodebuild` and
-/// the `xcrun` are fakes that log each run and the mark, empty when unmarked. The
-/// warm-up of the Xcode the survey finds ready runs too, also
-/// sandboxed; the test waits for it to end. Also catches the warm-up not run, or
-/// run before the survey's questions are answered (its lookups would make the
-/// survey's miss): the fake `xcodebuild` answers after half a second, so a warm-up
-/// started with the daemon logs before it.
-#[tokio::test]
-async fn the_daemons_survey_runs_under_the_sandbox() {
-    let dir = scratch("sandboxed");
-    tls_files(&dir);
-    let log = dir.join("ran");
-    let sandbox_exec = dir.join("sandbox-exec");
-    fake(&sandbox_exec, "");
-    // `<tool> <the sandbox's lease directory, empty when unsandboxed> <arguments>`.
-    let logged = |tool: &str| format!("append {} {tool} ${{KBF_LEASE}} $*", log.display());
-    let apps = dir.join("Applications");
-    let xcodebuild = apps
-        .join("Xcode_1.app/Contents/Developer")
-        .join(xcode::XCODEBUILD);
-    fake(
-        &xcodebuild,
-        &format!(
-            "*\t-\tsleep 0.5 ; {} ; echo Build version 1A1\n",
-            logged("xcodebuild")
-        ),
-    );
-    let xcrun = dir.join("bin/xcrun");
-    fake(
-        &xcrun,
-        &format!("*\t-\t{} ; echo /x/clang\n", logged("xcrun")),
-    );
-    let flag = |name: &str, path: &Path| format!("--{name}={}", path.display());
-    let cli = Cli::try_parse_from([
-        "kbf-daemon".to_owned(),
-        "--server=https://127.0.0.1:1".to_owned(),
-        flag("ca-cert", &dir.join("ca.pem")),
-        flag("cert", &dir.join("node.pem")),
-        flag("key", &dir.join("node.key")),
-        "--node-id=mac-1".to_owned(),
-        "--driver=native".to_owned(),
-        "--cas=https://127.0.0.1:1".to_owned(),
-        flag("data-dir", &dir),
-        flag("xcode-apps", &apps),
-    ])
-    .expect("flags");
-    let mut config = native_config(&cli).expect("config");
-    // Not the runner's own (on macOS): the start sweeps them.
-    config.user_folders = None;
-    config.isolation = kbf_driver_native::network::Isolation::Sandbox(sandbox_exec);
-    let (daemon, mut reports) = native_with(&cli, config, &xcrun).expect("the native daemon");
-    let xcodes = surveyed(&mut reports).await.xcodes;
-    assert_eq!(xcodes.len(), 1, "{xcodes:?}");
-    assert_eq!(xcodes[0].state(), XcodeState::Ready, "{xcodes:?}");
-    let leases = std::fs::canonicalize(dir.join("leases")).expect("real");
-    let survey = leases.join(kbf_driver_native::SURVEY_DIR);
-    assert!(!survey.exists(), "the survey's directory stays");
-    // The warm-up removes its directory when it ends: waited for up to 20 s
-    // (without a branch of this test's own, which coverage would count).
-    let warm = leases.join("lease-warm-up");
-    (0..1000)
-        .take_while(|_| warm.exists())
-        .for_each(|_| std::thread::sleep(Duration::from_millis(20)));
-    let ran = std::fs::read_to_string(&log).expect("ran");
-    let at = |lease: &Path, what: &str| format!("{} {what}", lease.display());
-    let warmed = format!("xcrun {}", at(&warm, ""));
-    let asked = at(&survey, "");
-    assert!(
-        ran.lines().any(|l| l.starts_with(&warmed)),
-        "no warm-up: {ran}"
-    );
-    let asked_first = ran
-        .lines()
-        .take_while(|l| !l.starts_with(&warmed))
-        .filter(|l| l.contains(&asked))
-        .count();
-    assert_eq!(
-        asked_first, 4,
-        "the warm-up ran before the survey's answers: {ran}"
-    );
-    // The survey's questions, asked at once, come before the warm-up's lookups.
-    let mut surveyed: Vec<String> = ran
-        .lines()
-        .filter(|l| l.starts_with("xcodebuild ") || l.ends_with(" --find clang"))
-        .take(4)
-        .map(str::to_owned)
-        .collect();
-    surveyed.sort();
-    assert_eq!(
-        surveyed,
-        [
-            format!("xcodebuild {}", at(&survey, "-checkFirstLaunchStatus")),
-            format!("xcodebuild {}", at(&survey, "-license check")),
-            format!("xcodebuild {}", at(&survey, "-version")),
-            format!("xcrun {}", at(&survey, "--find clang")),
-        ],
-        "{ran}"
-    );
-    assert!(
-        ran.lines()
-            .all(|l| l.starts_with("xcodebuild ") || l.starts_with("xcrun ")),
-        "{ran}"
-    );
-    let unsandboxed: Vec<&str> = ran
-        .lines()
-        .filter(|l| !l.contains(&*leases.to_string_lossy()))
-        .collect();
-    assert_eq!(unsandboxed, Vec::<&str>::new(), "{ran}");
-    drop((daemon, reports));
-    kbf_outputs::remove_tree(&dir).expect("clean");
 }

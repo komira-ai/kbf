@@ -43,8 +43,8 @@ use kbf_types::ImageRef;
 
 use crate::Farm;
 use crate::executor::{
-    Config, Delivery, Deps, Executor, ExecutorKind, Front, FrontParts, Metrics, Network, Ownership,
-    PutDirParts, RunSource, TaskOut,
+    Config, DEFAULT_MAC_OS_VERSION, Delivery, Deps, Executor, ExecutorKind, Front, FrontParts,
+    MacPool, Metrics, Network, Ownership, PutDirParts, PutDirRoots, RunSource, TaskOut,
 };
 
 const KIND: &str = "executor";
@@ -84,6 +84,10 @@ const NETWORK: &str = "executor_network";
 const OPEN_NETWORK: &str = "executor_allow_open_network";
 const OWNERSHIP: &str = "executor_ownership";
 const LIVE: &str = "executor_live_secs";
+const MAC_HOSTS: &str = "executor_mac_hosts";
+const MAC_BUNDLE: &str = "executor_mac_task_bundle";
+const MAC_OS_VERSION: &str = "executor_mac_os_version";
+const MAC_OUT_ROOT: &str = "executor_mac_task_out_root";
 
 /// The virtual workers when `--executor-hosts` is left out. Clap takes the default as the
 /// literal in the flag; the default-flags test checks it against this number.
@@ -178,9 +182,12 @@ pub(super) fn args() -> Vec<Arg> {
             "The name of this frontend on the job service: the value of the `kbf-frontend` \
              label on its jobs, by which a restarted frontend finds and cancels the ones an \
              earlier process left, hashed into every job id, and the name of its virtual \
-             workers (`js:<ID>-<n>`). 1 to 63 of letters, digits, `-`, `_` and `.`. It must be \
-             different for each frontend (not copied with the config). Used only with \
-             `--executor js-agent`",
+             workers (`js:<ID>-<n>`, and `js-mac:<ID>-<n>` for the Macs; with \
+             `--executor-ownership shared`, `<ID>.<the first 8 characters of the process's \
+             instance>` in place of `<ID>`). 1 to 63 of letters, digits, `-`, `_` and `.`. It \
+             must be different for each frontend (not copied with the config), except that \
+             the frontends of one `--executor-ownership shared` group give the same one. Used \
+             only with `--executor js-agent`",
         ),
         text(
             JOB_URL,
@@ -253,9 +260,10 @@ pub(super) fn args() -> Vec<Arg> {
             .value_parser(["x86_64", "arm64"])
             .default_value("x86_64")
             .help(
-                "The CPU architecture of the hosts. Every job asks for a host of `os=linux`, \
-                 this `arch` and containers, and the virtual workers report them to the farm. \
-                 Used only with `--executor js-agent`",
+                "The CPU architecture of the Linux hosts. Every job of a Linux action asks for \
+                 a host of `os=linux`, this `arch` and containers, and the virtual workers \
+                 report them to the farm (the Macs' are `arm64`, `--executor-mac-hosts`). Used \
+                 only with `--executor js-agent`",
             ),
         text(
             WORK_DIR,
@@ -502,6 +510,48 @@ pub(super) fn args() -> Vec<Arg> {
              and 5 s. Used only with `--executor js-agent`",
             "45",
         ),
+        Arg::new(MAC_HOSTS)
+            .long("executor-mac-hosts")
+            .value_name("WORKERS")
+            .value_parser(clap::value_parser!(usize))
+            .default_value("0")
+            .help(
+                "How many virtual workers stand for the job service's Macs, each of the shape \
+                 of `--executor-host-*`, reporting `os=macos` and `arch=arm64`: the farm places \
+                 an action whose platform asks for macOS on them, and each becomes a job of a \
+                 Mac's native runtime that runs `--executor-mac-task-bundle`. 0, the default, \
+                 registers none, and the farm places no macOS action on this executor. Needs \
+                 `--executor-mac-task-bundle`. Used only with `--executor js-agent`",
+            ),
+        text(
+            MAC_BUNDLE,
+            "executor-mac-task-bundle",
+            "NAME@sha256:HEX",
+            "The release's macOS `kbf-task` bundle, by its manifest digest (the one entry of \
+             the `index.json` of `kbf-task-bundle-<commit>-darwin-arm64.tar.gz`): the image of \
+             a Mac job, whose entrypoint `kbf-task` runs. Needed with `--executor-mac-hosts`, \
+             refused without it",
+        ),
+        Arg::new(MAC_OS_VERSION)
+            .long("executor-mac-os-version")
+            .value_name("MAJOR")
+            .value_parser(clap::value_parser!(u32).range(1..))
+            // DEFAULT_MAC_OS_VERSION.
+            .default_value("26")
+            .help(
+                "The least major macOS every Mac of the job service runs. An action's \
+                 `os_version` is the least it takes (`26` means 26 or newer), and one that asks \
+                 for a newer macOS than this is refused, naming both: the job service cannot be \
+                 asked for a version. Used only with `--executor-mac-hosts`",
+            ),
+        text(
+            MAC_OUT_ROOT,
+            "executor-mac-task-out-root",
+            "PATH",
+            "The tier store's put directory on the Macs, if it is not `--task-out-root`: a Mac \
+             job mounts its put directory under it and its action tree from the `trees` \
+             directory beside it. Used only with `--executor-mac-hosts`, refused without it",
+        ),
     ]
 }
 
@@ -695,6 +745,7 @@ fn js_agent_flags(m: &ArgMatches) -> Result<JsAgentFlags, String> {
         _ => Ownership::Single,
     };
     config.live = secs(LIVE);
+    config.mac = mac_pool(m)?;
     Ok(JsAgentFlags {
         config,
         job_url,
@@ -715,6 +766,44 @@ fn js_agent_flags(m: &ArgMatches) -> Result<JsAgentFlags, String> {
         published: Arc::default(),
         put_retry: DEFAULT_TOTAL,
     })
+}
+
+/// The Macs `--executor-mac-*` declare: none without `--executor-mac-hosts`, which needs
+/// `--executor-mac-task-bundle`.
+fn mac_pool(m: &ArgMatches) -> Result<Option<MacPool>, String> {
+    let hosts = m.get_one::<usize>(MAC_HOSTS).copied().unwrap_or_default();
+    let bundle = m.get_one::<String>(MAC_BUNDLE).cloned();
+    let out_root = m.get_one::<String>(MAC_OUT_ROOT);
+    if hosts == 0 {
+        return match (bundle.is_some(), out_root.is_some()) {
+            (false, false) => Ok(None),
+            _ => Err(
+                "--executor-mac-task-bundle and --executor-mac-task-out-root are for \
+                 --executor-mac-hosts: with no Mac worker they would do nothing"
+                    .to_owned(),
+            ),
+        };
+    }
+    let Some(bundle) = bundle else {
+        return Err(
+            "--executor-mac-hosts needs --executor-mac-task-bundle, the release's kbf-task \
+             bundle for the Macs"
+                .to_owned(),
+        );
+    };
+    let roots = out_root
+        .map(|root| PutDirRoots::new(root))
+        .transpose()
+        .map_err(|e| format!("--executor-mac-task-out-root: {e}"))?;
+    Ok(Some(MacPool {
+        hosts,
+        bundle,
+        os_version: m
+            .get_one::<u32>(MAC_OS_VERSION)
+            .copied()
+            .unwrap_or(DEFAULT_MAC_OS_VERSION),
+        roots,
+    }))
 }
 
 /// The delivery `--executor-secret-delivery` names.

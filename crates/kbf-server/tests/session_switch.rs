@@ -1,5 +1,5 @@
 //! Node phases over the worker stream (`docs/design/worker-protocol.md#node-phases`):
-//! a Mac daemon that switches its GUI session for a whole-machine lease says so in a
+//! a daemon that switches its session for a whole-machine lease says so in a
 //! resent `Hello`, restarts with the userspace restart, and comes back as another
 //! process naming the lease again; a node whose cleanup failed says it is quarantined.
 //! The scheduler's timing (the switch grace) is `kbf-sched`'s tests; these check what
@@ -12,17 +12,17 @@ use support::{Cell, FakeDaemon, Job, done, hello_on, output, ran};
 
 const MAC: &[(&str, &str)] = &[
     ("arch", "arm64"),
-    ("os", "macos"),
+    ("os", "linux"),
     ("drivers", "native"),
     ("drivers", "native-whole-machine"),
 ];
 
-/// An action that books a few cores, so the Mac has room for a second.
+/// An action that books a few cores, so the node has room for a second.
 const PLAIN: &[(&str, &str)] = &[];
 
-const WHOLE: &[(&str, &str)] = &[("OSFamily", "macos"), ("kbf-lease", "whole_machine")];
+const WHOLE: &[(&str, &str)] = &[("OSFamily", "linux"), ("kbf-lease", "whole_machine")];
 
-/// The Mac's `Hello` from daemon process `instance`, in `phase`.
+/// The whole-machine node's `Hello` from daemon process `instance`, in `phase`.
 fn mac(instance: &str, phase: Option<NodePhase>) -> Hello {
     Hello {
         instance_id: instance.to_owned(),

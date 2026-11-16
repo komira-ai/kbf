@@ -564,6 +564,58 @@ async fn nothing_is_opened_before_the_liveness_row_is_written() {
     assert_eq!(txns(&harness), written, "opened again");
 }
 
+/// Catches the Macs' workers opened without a row, under a name another process of the group
+/// could take, or with the Linux arch: with one Linux worker and two Macs, the Linux one is
+/// opened first and the Macs after it, each named by the instance under `js-mac:`, each with
+/// its row (owned by this process, its farm instance, arch `arm64`), and a pass after that
+/// opens no more.
+#[tokio::test(start_paused = true)]
+async fn the_macs_are_opened_after_the_linux_workers_each_with_its_row() {
+    use crate::executor::mac::WorkerOs;
+    let mut harness = Harness::shared().await;
+    harness.cfg.hosts = 1;
+    harness.cfg.mac = Some(crate::executor::MacPool {
+        hosts: 2,
+        bundle: format!("kbf-task@sha256:{}", "ab".repeat(32)),
+        os_version: 26,
+        roots: None,
+    });
+    harness.renew(&[], false);
+    let mut workers = Vec::new();
+    harness.open(&mut workers);
+    let opened: Vec<_> = workers
+        .iter()
+        .map(|w| (w.info().worker.to_string(), w.os()))
+        .collect();
+    assert_eq!(
+        opened,
+        [
+            ("js:front.inst0001-0".to_owned(), WorkerOs::Linux),
+            ("js-mac:front.inst0001-0".to_owned(), WorkerOs::Mac),
+            ("js-mac:front.inst0001-1".to_owned(), WorkerOs::Mac),
+        ]
+    );
+    let entries = harness.rig().rows().workers().expect("workers");
+    let mac = entries
+        .iter()
+        .find(|e| e.worker == "js-mac:front.inst0001-1")
+        .expect("the row of the second Mac");
+    assert_eq!(mac.row.owner_instance, INSTANCE);
+    assert_eq!(
+        mac.row.farm_instance,
+        HostWorker::farm_instance(&harness.ctx(), "js-mac:front.inst0001-1", 0)
+    );
+    assert_eq!(mac.row.shape.arch, "arm64");
+    let linux = entries
+        .iter()
+        .find(|e| e.worker == "js:front.inst0001-0")
+        .expect("the row of the Linux worker");
+    assert_eq!(linux.row.shape.arch, harness.cfg.arch);
+    assert_eq!(entries.len(), 3);
+    harness.open(&mut workers);
+    assert_eq!(workers.len(), 3);
+}
+
 /// Catches a failed row write that loses the workers after it or registers the one it could not
 /// record: with the row of the second worker held by another process, the first is opened, the
 /// second is not registered, and a later pass opens the rest once the row is free.

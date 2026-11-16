@@ -574,7 +574,7 @@ pub fn after_release(
         token_file: v.token_file.as_ref().map(|_| paths::enroll_token(platform)),
         api_token_file: serves_api(v.mode).then_some(paths::api_token(platform)),
         state_store: v.database.as_deref(),
-        // A Mac's `kbf.toml` is kbf-mac-provision's, which renders no update keys.
+        // A Mac's `kbf.toml` is its host's own, which has no update keys.
         update: (takes_orders(v.mode) && platform != Platform::MacOs).then_some(UpdateDirs {
             update_dir: &update_dir,
             orders_dir: &orders_dir,

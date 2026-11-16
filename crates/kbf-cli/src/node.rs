@@ -82,25 +82,17 @@ pub struct Start {
     pub check: bool,
 }
 
-/// How the daemon half runs its leases on this platform.
+/// How the daemon half runs its leases on this platform. The only driver a node started
+/// by `kbf` has is the container driver (Linux): a macOS action runs as a `js-agent` job
+/// on the Mac (`docs/design/actions-as-jobs.md`, section 14), not in a daemon.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Driver {
     /// Containers: Linux.
     Container,
-    /// Processes in pool users: macOS.
-    Native,
 }
 
 impl Driver {
     /// The driver of the machine this is built for.
-    #[cfg(target_os = "macos")]
-    #[must_use]
-    pub const fn host() -> Self {
-        Self::Native
-    }
-
-    /// The driver of the machine this is built for.
-    #[cfg(not(target_os = "macos"))]
     #[must_use]
     pub const fn host() -> Self {
         Self::Container
@@ -109,7 +101,6 @@ impl Driver {
     const fn name(self) -> &'static str {
         match self {
             Self::Container => "container",
-            Self::Native => "native",
         }
     }
 }

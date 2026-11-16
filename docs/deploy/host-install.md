@@ -265,9 +265,7 @@ Nothing here is a Homebrew formula or a `kbf-installer` order.
 /Library/LaunchDaemons/com.komira.kbf-daemon.plist    the daemon's job, run as _kbf
 ```
 
-The error-log path is the `StandardErrorPath` of the kit's daemon plist. The `/Library/Logs/kbf`
-paths of `kbf-mac-provision` belong to that tool's own layout; this program does not read them
-and this document does not describe them.
+The error-log path is the `StandardErrorPath` of the kit's daemon plist.
 
 `<version>` is the version text of a build, `0.1.<seq>+g<12 hex digits>-<run>`. Its 12 digits
 pick the one tarball `kbf-<40 hex digits>-darwin-arm64.tar.gz` whose commit starts with them:

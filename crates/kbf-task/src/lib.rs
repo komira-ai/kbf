@@ -1,10 +1,12 @@
 //! One build action, run as a job of `js-agent`: the task tool inside the job's container.
 //!
-//! The job's root file system is the action's tree, which the frontend wrote, and the job has no
-//! network. The tool then
+//! On Linux the job's root file system is the action's tree, which the frontend wrote (`--tree`), and
+//! the job has no network. On a Mac the job runs natively in its `exec/` directory, the tree is
+//! mounted read-only beside it, and `--materialize-work` copies the tree's `work` into the
+//! directory first ([`materialize`]). The tool then
 //! 1. reads the Action and its Command from the tree, checking each against its digest
 //!    ([`message`], [`tree`]), and finds the input root there: nothing is fetched and no read
-//!    grant is held;
+//!    grant is held (in the Mac job the input root is a private copy of the tree's `work`);
 //! 2. runs the Command there ([`run`]): its argv, environment and working directory, stdout and
 //!    stderr to files, under a deadline. The environment is the Command's own, preceded by `HOME`,
 //!    `TMPDIR`, `XDG_CACHE_HOME` and `CLANG_MODULE_CACHE_PATH`, which name fresh directories
@@ -57,6 +59,7 @@ pub(crate) mod child;
 pub mod digest;
 pub mod files;
 mod inputs;
+pub mod materialize;
 pub mod message;
 pub mod network;
 #[cfg(target_os = "linux")]

@@ -10,6 +10,7 @@ use kbf_sched::fence::{LEADER_LEASE_MARGIN, LEASE_GRACE, SELF_FENCE, START_GRACE
 use ring::rand::{SecureRandom, SystemRandom};
 
 use crate::config::MAX_HEARTBEAT_INTERVAL_MS;
+use crate::executor::mac::{MAC_ARCH, MAC_DRIVER, MAC_OS, MacPool, MacPoolError, WorkerOs};
 use crate::executor::out::TaskOut;
 use crate::executor::task::Delivery;
 use crate::worker::PROTOCOL_VERSION;
@@ -201,6 +202,9 @@ pub struct Config {
     /// [`Config::fence_after`] and [`LEADER_LEASE_MARGIN`], so the process has stopped acting
     /// before its row can expire.
     pub live: Duration,
+    /// The Macs (`--executor-mac-*`): `None`, the default, registers no Mac worker, and the farm
+    /// places no Mac action on this executor ([`crate::executor::mac`]).
+    pub mac: Option<MacPool>,
 }
 
 /// Why a [`Config`] is refused.
@@ -278,6 +282,9 @@ pub enum ConfigError {
     /// Shared ownership with no state store to keep the rows in.
     #[error("--executor-ownership shared needs --state-store: the rows of the jobs are kept there")]
     SharedStore,
+    /// The pool of Macs is not one.
+    #[error("{0}")]
+    Mac(#[from] MacPoolError),
 }
 
 impl Config {
@@ -321,6 +328,7 @@ impl Config {
             task_out: TaskOut::Presigned,
             ownership: Ownership::Single,
             live: SELF_FENCE + LEADER_LEASE_MARGIN,
+            mac: None,
         }
     }
 
@@ -425,10 +433,14 @@ impl Config {
                 ConfigError::SharedPresigned,
             ),
         ];
-        checks
+        let first = checks
             .into_iter()
-            .find_map(|(ok, error)| (!ok).then_some(error))
-            .map_or(Ok(()), Err)
+            .find_map(|(ok, error)| (!ok).then_some(error));
+        match (first, &self.mac) {
+            (Some(error), _) => Err(error),
+            (None, Some(mac)) => Ok(mac.validate()?),
+            (None, None) => Ok(()),
+        }
     }
 
     /// Whether the jobs are owned by the group ([`Ownership::Shared`]).
@@ -437,16 +449,26 @@ impl Config {
         self.ownership == Ownership::Shared
     }
 
-    /// The id of the `n`th virtual worker: `js:<frontend>-<n>` for one frontend per id, and
-    /// `js:<frontend>.<the first 8 characters of the instance>-<n>` when the group shares the
-    /// id, so two live processes never register one worker.
+    /// The id of the `n`th Linux virtual worker: `js:<frontend>-<n>` for one frontend per id,
+    /// and `js:<frontend>.<the first 8 characters of the instance>-<n>` when the group shares
+    /// the id, so two live processes never register one worker.
     #[must_use]
     pub fn worker_name(&self, n: usize) -> String {
+        self.worker_of(WorkerOs::Linux, n)
+    }
+
+    /// The id of the `n`th virtual worker for `os`: [`Config::worker_name`] for Linux, and the
+    /// same under the prefix `js-mac:` for the Macs, so no frontend id makes one the other's.
+    pub(super) fn worker_of(&self, os: WorkerOs, n: usize) -> String {
+        let kind = match os {
+            WorkerOs::Linux => "js",
+            WorkerOs::Mac => "js-mac",
+        };
         match self.ownership {
-            Ownership::Single => format!("js:{}-{n}", self.frontend),
+            Ownership::Single => format!("{kind}:{}-{n}", self.frontend),
             Ownership::Shared => {
                 let short: String = self.instance.chars().take(8).collect();
-                format!("js:{}.{short}-{n}", self.frontend)
+                format!("{kind}:{}.{short}-{n}", self.frontend)
             }
         }
     }
@@ -494,27 +516,40 @@ impl Config {
         timeout + self.run_margin
     }
 
-    /// The `Hello` of a virtual worker: what a real node of the shape would report, and no
-    /// more. Its drivers are [`DRIVERS`]: `action` and `whole_machine` leases are placed on it,
-    /// a VM lease is not.
-    pub(super) fn hello(&self, node: &str, instance: &str, predecessor: &str) -> Hello {
+    /// The `Hello` of a virtual worker of `os`: what a real node of the shape would report, and
+    /// no more. A Linux worker's drivers are [`DRIVERS`]: `action` and `whole_machine` leases
+    /// are placed on it, a VM lease is not. A Mac worker reports `os=macos`, `arch=arm64` and the
+    /// one driver `native`: only `action` leases are placed on it.
+    pub(super) fn hello(
+        &self,
+        os: WorkerOs,
+        node: &str,
+        instance: &str,
+        predecessor: &str,
+    ) -> Hello {
         let entry = |key: &str, value: String| Capability {
             key: key.to_owned(),
             value,
         };
+        let (arch, drivers, system): (&str, &[&str], &str) = match os {
+            WorkerOs::Linux => (&self.arch, &DRIVERS, "linux"),
+            WorkerOs::Mac => (MAC_ARCH, &[MAC_DRIVER], MAC_OS),
+        };
+        let mut capabilities = vec![
+            entry("action_slots", self.slots.to_string()),
+            entry("arch", arch.to_owned()),
+            entry("cpus", (self.cpu_millis / 1_000).to_string()),
+        ];
+        capabilities.extend(drivers.iter().map(|d| entry("drivers", (*d).to_owned())));
+        capabilities.extend([
+            entry("mem_gib", self.booked_memory_gib().to_string()),
+            entry("os", system.to_owned()),
+        ]);
         Hello {
             protocol_version: PROTOCOL_VERSION,
             node_id: node.to_owned(),
             daemon_version: "kbf-server executor".to_owned(),
-            capabilities: vec![
-                entry("action_slots", self.slots.to_string()),
-                entry("arch", self.arch.clone()),
-                entry("cpus", (self.cpu_millis / 1_000).to_string()),
-                entry("drivers", DRIVERS[0].to_owned()),
-                entry("drivers", DRIVERS[1].to_owned()),
-                entry("mem_gib", self.booked_memory_gib().to_string()),
-                entry("os", "linux".to_owned()),
-            ],
+            capabilities,
             instance_id: instance.to_owned(),
             predecessor_instance_id: predecessor.to_owned(),
             ..Hello::default()

@@ -47,7 +47,7 @@ daemon                                  server
   | Hello (version, node_id, report) -->|  checks; registers the node (new session)
   |<---------- Welcome (interval, epoch)|  drops leases of another epoch
   | Result (each unacknowledged one) -->|  resent before the first Heartbeat
-  | NodeStatus (OS, kernel, Xcodes) --->|  kept as the node's newest
+  | NodeStatus (OS, kernel) -------->|  kept as the node's newest
   | Heartbeat (seq, hash, running) ---->|
   |<------------------ HeartbeatAck(seq)|
   |<------------------------ LeaseOffer |  placed, not committed: run nothing
@@ -166,17 +166,19 @@ the session goes on.
 `Hello.phase` (`NodePhase { phase, lease_id, reason }`) says what the node is doing
 besides running leases (`docs/design/fleet-updates.md` section 3.3). It is absent, or
 `PHASE_SERVING`, on a node that takes leases, and the daemon resends `Hello` whenever
-it changes. The whole-machine runtime on a Mac
-(`kbf_driver_native::whole_machine`) sets the session phases and the quarantine; the
-daemon takes them through `Daemon::with_phase`. The daemon itself says
+it changes. A runtime can set a phase, which the daemon takes through `Daemon::with_phase`;
+the Mac whole-machine runtime that set `PHASE_PREPARING`, `PHASE_RESTORING` and
+`PHASE_QUARANTINED` is removed (a macOS action runs as a js-agent job, and the Macs run no
+`kbf-daemon`: [actions-as-jobs.md](actions-as-jobs.md) section 14), and the values stay in the
+wire format for a reader of older data. The daemon itself says
 `PHASE_MEMORY_PRESSURE` (`Daemon::with_memory_backstop`) when no runtime phase is
 in force:
 
 | Phase | Meaning | `lease_id` / `reason` |
 |---|---|---|
-| `PHASE_PREPARING` | switching the Mac's GUI session to the user of a whole-machine lease it holds (`session-login`: auto-login, then a userspace restart, which ends the daemon too), then running its action there | the lease |
-| `PHASE_RESTORING` | switching back after that lease's action ended (`session-idle`, the same restart), and cleaning up; the lease's `Result` is sent once that is done. A daemon restarted while the action ran (a crash or an update, not a switch) says this too: it killed the lease user's processes before its `Hello`, and the lease's `Result` says it was lost (`LOST_DAEMON_RESTARTED`); the node never runs the action again itself, and the server runs it again as a farm fault | the lease |
-| `PHASE_QUARANTINED` | a cleanup failed; the node takes no lease until an operator repairs it | why |
+| `PHASE_PREPARING` | not set by any runtime now (the Mac session switch is removed) | the lease |
+| `PHASE_RESTORING` | not set by any runtime now | the lease |
+| `PHASE_QUARANTINED` | the node takes no lease until an operator repairs it; not set by any runtime now | why |
 | `PHASE_MEMORY_PRESSURE` | the node holds a lease and its memory stall time (`/proc/pressure/memory`, the `some` line's `avg10`) is above the daemon's `--memory-pressure-pause-percent` (default 10); it takes no new lease until the pressure falls, and runs the ones it holds. Sent by any daemon on any driver, but only while a lease runs: with none the node serves, whatever the pressure, so a node paused by pressure that others cause is never left idle for good | |
 
 The server takes the phase of every `Hello`, the stream's first included, before it
@@ -497,7 +499,7 @@ fetching inputs on an offer is **planned**.
 | `memory_bytes` | memory booked for the lease; 0 means not booked. A run after a memory kill books the raised amount ([scheduler.md](scheduler.md#memory-kills)) |
 | `heartbeat_seq` | the newest heartbeat of this stream the server had taken when it sent the `Start`; 0 before the first, which names the stream's `Hello` |
 | `valid_for_ms` | how long after sending that heartbeat (or `Hello`) the daemon may still act on the `Start`: 14 000; 0 means no bound |
-| `device_id` | field 8: the iOS device booked for the lease, by the `id` its `ios.device` `Hello` entry names; empty when the action asked for none. Sent only to a daemon whose `Hello` lists that device ([ios-devices.md](ios-devices.md#54-booking)). Today's daemons ignore it (none reports a device) |
+| `device_id` | field 8: the iOS device booked for the lease, by the `id` its `ios.device` `Hello` entry names; empty when the action asked for none. Sent only to a daemon whose `Hello` lists that device; no daemon reports a device, so none receives it |
 
 The daemon handles a `Start` as follows:
 
@@ -714,15 +716,13 @@ action cache with the result.
 ### `NodeStatus`
 
 What software the node runs, for operators: the OS name, version and build, the
-kernel release (Linux), the `kbf-daemon` version, the ready Xcode builds (Mac), and
-every installed Xcode with its state, why it is not ready and the command that fixes
-it (`xcodes`, Mac; issue #164), and the container images the daemon was pinned to
+kernel release (Linux), the `kbf-daemon` version, and the container images the daemon was pinned to
 and checked present at start (`container_images`, container driver: see
 [daemon.md](daemon.md#the-container-driver)). It routes no work, so it is not part of the node report and does not change
 `report_hash` (see [fleet-updates.md](fleet-updates.md) section 3.1). The daemon reads
-`sw_vers` on a Mac and `os-release` and the kernel release on Linux; the Xcode builds
-are the node report's `xcode` entries, from the driver that discovers them, and
-`xcodes` comes from the same driver. A field it cannot read is empty.
+`os-release` and the kernel release. The wire message also has `xcode_builds` and `xcodes`
+fields, which no daemon fills now (the Macs run no `kbf-daemon`); a server still reads them, and a reader skips what it does
+not know. A field it cannot read is empty.
 
 The daemon sends `NodeStatus` on every stream after the resent `Result`s and before
 the first `Heartbeat`. The server keeps the newest one per node, from the node's
@@ -730,15 +730,11 @@ current stream only (one from a replaced stream is ignored, and one the deny lis
 refuses ends the stream, see [above](#node-identity-and-the-deny-list)), in memory, and lists it
 in the operator API's `GET /v1/nodes` ([api.md](../api.md)). A server that predates
 the message ignores it as an empty message; a daemon that predates it is listed
-without software, and a server that predates `xcodes` or `container_images` ignores it.
+without software, and a server that predates `container_images` ignores it.
 
-When the driver's report changes mid-session (today: the native driver's first
-survey of its Xcodes ended, which the daemon does not wait for before `Hello`, so its
-first `Hello` advertises no Xcode and its first `NodeStatus` lists each as
-`XCODE_STATE_NOT_SURVEYED`; or a later survey, every few minutes, found one became
-ready or stopped being so), the daemon resends
+When the driver's report changes mid-session, the daemon resends
 its `Hello` on the stream if the node report changed (the server takes a resent
-`Hello` as the node's new report, so placement sees the new `xcode` entries), and then
+`Hello` as the node's new report), and then
 sends `NodeStatus` again. Re-detecting the other software mid-session is **planned**
 (fleet-updates.md section 3.1, re-detection).
 
@@ -796,8 +792,6 @@ daemon restarts and server restarts:
 - A message for "started", so the scheduler can tell a running lease from one still
   being prepared.
 - Prefetching an offered lease's inputs.
-- `NodeStatus.devices`: every iOS device the node knows, with its state and fix, and
-  the daemon's use of `Start.device_id` ([ios-devices.md](ios-devices.md#54-booking)).
 - Drain and resource-change messages.
 - With several servers ([deployment-topology.md](deployment-topology.md)): the daemon
   is given the servers as one DNS name with a record per server, or as a list of

@@ -447,26 +447,14 @@ fn a_repeatable_flag_is_an_array_and_a_switch_is_a_boolean() {
         text.contains(r#"["https://127.0.0.1:1", "https://farm.example:1"]"#),
         "{text}"
     );
-    // `require-metal-toolchain` is a switch of the daemon.
+    // `no-input-cache` is a switch of the daemon.
     for (value, on) in [("true", true), ("false", false)] {
-        let path = file(
-            &dir,
-            &format!("{node}\n[macos]\nrequire-metal-toolchain = {value}\n"),
-            0o600,
-        );
+        let path = file(&dir, &format!("{node}no-input-cache = {value}\n"), 0o600);
         let parsed = kbf_cli::parse_with(argv(&["kbf", "daemon"], Some(&path)), None).expect(value);
         let text = format!("{:?}", parsed.invocation);
-        assert_eq!(
-            text.contains("require_metal_toolchain: true"),
-            on,
-            "{value}: {text}"
-        );
+        assert_eq!(text.contains("no_input_cache: true"), on, "{value}: {text}");
     }
-    let path = file(
-        &dir,
-        &format!("{node}\n[macos]\nrequire-metal-toolchain = \"yes\"\n"),
-        0o600,
-    );
+    let path = file(&dir, &format!("{node}no-input-cache = \"yes\"\n"), 0o600);
     let err =
         kbf_cli::parse_with(argv(&["kbf", "daemon"], Some(&path)), None).expect_err("not a bool");
     assert!(err.to_string().contains("takes true or false"), "{err}");

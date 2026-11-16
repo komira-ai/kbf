@@ -87,8 +87,7 @@ operation it calls `Servable::fit` (`crates/js-sched/src/servable.rs`).
   - `Blocked::ColdCap` (only the cold-start cap refused) takes no hold.
   - A VM lease is never given `blocked` (the `vm_by_load` branch of `fit` only filters
     candidates), so a VM waits behind actions; `Worker::has_room` says "nothing reserves a
-    node for a queued VM". `macos-vms.md` (reservation for VM leases) describes it as
-    planned.
+    node for a queued VM". No daemon runs a VM now.
   - **The hold picks by load ratio, not by remaining time, and admits no backfill.**
     `hold_for_head` takes the worker with the smallest binding ratio (sticky within a
     tenth), not the one that empties first, and every worker in `reserved` is closed to
@@ -635,7 +634,7 @@ unchanged beyond 4.11); both engines keep their marks in memory only (2.4).
 6. **Cold start: the declared bound, refused above the ceiling (recommended).** A fallback,
    replaced per key by history. Unknown is refused for backfill, never infinite.
 7. **VM leases (recommended).** A VM refused for room is a large request: give it the same
-   hold, so the VM reservation planned in `macos-vms.md` is not built. If that is not a
+   hold, so no VM reservation is built (the macOS VM driver is removed). If that is not a
    small widening of the same call, leave it for its own issue.
 8. **Start time for a partial request (recommended: EASY-style).** Define the start as the
    earliest time free capacity holds the demand (3.1.1) for every kind, rather than

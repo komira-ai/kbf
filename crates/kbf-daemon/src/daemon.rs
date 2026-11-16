@@ -39,11 +39,8 @@
 //! so a runtime that keeps a lease across its own restart (the whole-machine runtime
 //! does) cleans up after one the server no longer holds.
 //!
-//! A driver whose report changes while the daemon runs (the native driver re-checks its
-//! Xcodes, issue #164) hands the daemon a [`DriverReport`] channel
-//! ([`Daemon::with_driver_report`]); a driver with more than one survey sends each
-//! through its own part of one [`crate::DriverWatch`], which merges them, so no survey
-//! overwrites another's. Its entries join the report the daemon was started
+//! A driver whose report changes while the daemon runs hands the daemon a
+//! [`DriverReport`] channel ([`Daemon::with_driver_report`]). Its entries join the report the daemon was started
 //! with, and its Xcodes go into `NodeStatus`. Each change is taken when it arrives: when
 //! the report changed, the Hello is resent on the stream (the server then places by the
 //! new report, issue #25), and `NodeStatus` is sent again either way. A change while no

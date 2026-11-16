@@ -135,7 +135,15 @@ lease of any kind, and its session row lists no driver, so no other frontend of 
 counts it either. It is not a cordon and writes no `cordon/` row: an operator's uncordon does not
 lift it, a lease the daemon already held (taken up after the restart into `js-agent`) stays its
 own, and a frontend restarted under `kbf-daemon` places the Linux daemons again with nothing to
-undo. A Mac daemon, or one that reports any other `os`, is placed as before. A job is the kbf image (`--executor-kbf-image`), whose `ENTRYPOINT` is the task tool:
+undo. A daemon that reports any other `os` is placed as before. The Macs of the
+job service are virtual workers of their own, `js-mac:<frontend>-<n>`, with
+`--executor-mac-hosts` (0 by default: none, and no macOS action is placed on the executor),
+`--executor-mac-task-bundle` (the release's `kbf-task` bundle by its manifest digest, the image
+of a Mac job), `--executor-mac-os-version` (the least macOS the Macs run, 26 by default; an
+action's `os_version` above it is refused) and `--executor-mac-task-out-root` (the tier store's
+put directory on the Macs, `--task-out-root` by default); a macOS action becomes a job of a
+Mac's native runtime (docs/design/actions-as-jobs.md, section 14), which the job service at
+kbf's pin cannot run yet. A Linux job is the kbf image (`--executor-kbf-image`), whose `ENTRYPOINT` is the task tool:
 the job's arguments are the tool's flags and nothing is mounted into the container. It needs the
 cores and memory the farm booked (the memory as the hard cap a daemon would set, 1.5 times the
 booking plus 512 MiB), a host of `os=linux` and `--executor-arch` (default `x86_64`) that runs
@@ -150,7 +158,8 @@ and a tag is refused. It needs both image flags, and the job service (`--executo
 `--executor-job-ca-file` for an `https` URL), `--executor-frontend-id` (the `kbf-frontend` label
 on the frontend's jobs, by which a restarted frontend finds and cancels those an earlier process
 left, and hashed into every job id; it must be different for each frontend, so a `kbf.toml` is
-not copied to a second frontend with it), the packs (`--pack-store-endpoint`, through which the
+not copied to a second frontend with it, except that the frontends of one
+`--executor-ownership shared` group give the same one), the packs (`--pack-store-endpoint`, through which the
 pack a task writes is read, hashed and turned into the action's result) and nothing else for the
 output: a put-dir job (the only mode, `--task-out-mode put-dir`) carries no url, no grant and no secret, and its pack is a file
 of its put directory, which the frontend ingests. The executor's presigned path (a write url, a read token, `--executor-secret-delivery`
@@ -206,7 +215,7 @@ reached only by `kbf-task --probe-confinement`, which prints `probe sandbox:`.
 describes, and `shared` lets several frontends of one `--executor-frontend-id` run beside each
 other over one `--state-store`. With `shared` the frontend starts only if `--state-store` is
 given. Each process names its workers `js:<frontend id>.<the first 8 characters of its
-instance>-<n>`, keeps a liveness row in the state store that `--executor-live-secs` (default
+instance>-<n>` (its Macs `js-mac:<frontend id>.<the same 8 characters>-<n>`), keeps a liveness row in the state store that `--executor-live-secs` (default
 45) lets live after its last renewal, and writes the row of a worker before the farm hears of
 it and the row of a job before it submits the job. The liveness time must be at least the fence
 time (40 s) plus 5 s, and a smaller one is refused at start; `single` does not read it. A
@@ -663,7 +672,7 @@ it, and takes the storage map from it.
 
 **`daemon`.** The build node. `--server` (required, repeatable) names the frontend's
 worker listener. It holds no store and no credential. `--driver` is required: `container`
-on Linux, `native` on a Mac.
+or `native`, on Linux.
 
 **`storage-and-daemon`.** The `storage` and `daemon` flags in one command line, in one
 process: the daemon half reads and writes the node's own storage through calls, with
@@ -893,12 +902,9 @@ disks and CPUs, and `daemon` on hosts that only build.
   restart, or `--state active`, undoes it. `GET /v1/storage` shows `"planned_down": true`.
 - **A draining member.** `--state draining` takes a member out of the write path without
   taking it `down`; it is read first. The state of every member is in `GET /v1/members`.
-- **Macs.** A Mac is a node only: `daemon` with the `native` driver, enrolled like any other
-  node. Macs build what Linux cannot (Xcode, iOS), and hold none of the farm's blobs; `all-in-one` and
-  `storage-and-daemon` refuse any driver but `container`, so a Mac is never one of those. A Mac
-  may read the packs through a tierstore on its own loopback (`--tierstore-endpoint`, above). Its
-  `kbf.toml` is rendered by `kbf-mac-provision`. See
-  [kbf-installer-setup.md](kbf-installer-setup.md) for the verbs.
+- **Macs.** A Mac host runs no kbf daemon: a macOS action runs as a js-agent job
+  ([actions-as-jobs.md](../design/actions-as-jobs.md) section 14), and the Mac host install is in
+  [kbf-installer-setup.md](kbf-installer-setup.md).
 - **A frontend is one process; several may share a store.** Frontends over one Postgres
   store share it and none fences another (see
   [state-store-cutover.md](state-store-cutover.md)); a SQLite file is held by one process, so

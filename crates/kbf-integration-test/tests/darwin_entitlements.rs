@@ -4,8 +4,9 @@
 //! refusals of a missing or malformed list, and the comparison of a signature's
 //! entitlements, as `codesign` prints them, with the list.
 //!
-//! The signing itself needs `codesign` and runs on the hosted macOS job
-//! (`crates/kbf-vmm/tests/signing.rs`); docs/design/macos-vm-guests.md section 7.
+//! No shipped binary gets an entitlement, so the committed list names none; the parser and the
+//! comparison still run against lists of their own here, so a binary that is given one later
+//! meets the same checks.
 
 use std::path::{Path, PathBuf};
 
@@ -20,10 +21,12 @@ fn repo_root() -> PathBuf {
 }
 
 const VZ: &str = "com.apple.security.virtualization";
+/// A list that gives one binary an entitlement, for the cases that need a listed binary.
+const SAMPLE_LIST: &str = "kbf-sample com.apple.security.virtualization";
 const GTA: &str = "com.apple.security.get-task-allow";
 
-/// The plist the committed list gives `kbf-vmm`, byte for byte.
-const VMM_PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+/// The plist [`SAMPLE_LIST`] gives `kbf-sample`, byte for byte.
+const SAMPLE_PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -34,11 +37,23 @@ const VMM_PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 "#;
 
 /// What `codesign --display --entitlements - --xml` prints for a binary signed with
-/// [`VMM_PLIST`] on the hosted macOS 15 runners: one line, an `https` doctype.
-const VMM_SIGNED: &str = r#"<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>com.apple.security.virtualization</key><true/></dict></plist>"#;
+/// [`SAMPLE_PLIST`] on the hosted macOS 15 runners: one line, an `https` doctype.
+const SAMPLE_SIGNED: &str = r#"<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>com.apple.security.virtualization</key><true/></dict></plist>"#;
 
 fn committed() -> AllowList {
     AllowList::read(&repo_root().join(ALLOWLIST)).expect("the committed allow list")
+}
+
+fn sample() -> AllowList {
+    AllowList::parse(SAMPLE_LIST, Path::new("x")).expect("parse")
+}
+
+/// The lines of an allow list's text, its comments and blanks aside.
+fn lines_of(text: &str) -> Vec<&str> {
+    text.lines()
+        .map(|l| l.split('#').next().unwrap_or_default().trim())
+        .filter(|l| !l.is_empty())
+        .collect()
 }
 
 fn keys(names: &[&str]) -> Vec<String> {
@@ -56,54 +71,51 @@ fn entry(key: &str) -> String {
     format!("<key>{key}</key><true/>")
 }
 
-/// Catches an entitlement given to any binary, or kbf-vmm's set changed, without this
-/// test changing in the same review: the list's lines, comments and blanks aside, are
-/// exactly kbf-vmm with `com.apple.security.virtualization`, and the list parses to
-/// that alone.
+/// Catches an entitlement given to any binary without this test changing in the same review:
+/// the committed list, its comments and blanks aside, is empty, and parses to a list that gives
+/// no name an entitlement. The negative case: the same check on a list with one line sees it.
 #[test]
-fn the_committed_list_gives_kbf_vmm_the_virtualization_entitlement_only() {
+fn the_committed_list_gives_no_binary_an_entitlement() {
     let text = std::fs::read_to_string(repo_root().join(ALLOWLIST)).expect(ALLOWLIST);
-    let lines: Vec<&str> = text
-        .lines()
-        .map(|l| l.split('#').next().unwrap_or_default().trim())
-        .filter(|l| !l.is_empty())
-        .collect();
-    assert_eq!(lines, ["kbf-vmm com.apple.security.virtualization"]);
+    assert_eq!(lines_of(&text), Vec::<&str>::new());
     assert_eq!(
         committed(),
-        AllowList::parse("kbf-vmm com.apple.security.virtualization", Path::new("x"))
-            .expect("parse")
+        AllowList::parse("", Path::new("x")).expect("parse")
     );
-    assert_eq!(committed().entitlements("kbf-vmm"), [VZ]);
+    assert_eq!(lines_of(SAMPLE_LIST), [SAMPLE_LIST]);
+    assert_eq!(sample().entitlements("kbf-sample"), [VZ]);
+    assert_ne!(sample(), committed());
 }
 
 /// Catches a renderer whose plist is not the one the signer applies (wrong key, a value
-/// other than true, a malformed document) for the one listed binary.
+/// other than true, a malformed document) for a listed binary.
 #[test]
-fn kbf_vmm_gets_the_virtualization_plist() {
-    assert_eq!(committed().plist("kbf-vmm").as_deref(), Some(VMM_PLIST));
+fn a_listed_binary_gets_the_virtualization_plist() {
+    assert_eq!(sample().plist("kbf-sample").as_deref(), Some(SAMPLE_PLIST));
 }
 
 /// Catches a lookup that ignores the binary's name, or matches a prefix or a part of
-/// it: every other name, the shipped binaries and near-misses of `kbf-vmm` included,
-/// gets no plist at all (so `sign-darwin` signs it with no entitlements).
+/// it: every other name, the shipped binaries and near-misses of `kbf-sample` included,
+/// gets no plist at all (so `sign-darwin` signs it with no entitlements), and so does every
+/// name in the committed list.
 #[test]
 fn every_other_binary_gets_none() {
-    let list = committed();
     for name in [
         "kbf",
         "kbf-daemon",
-        "kbf-mac-session",
-        "kbf-guest",
         "kbf-server",
-        "kbf-vm",
-        "kbf-vmm2",
-        "vmm",
-        "KBF-VMM",
+        "kbf-task",
+        "kbf-installer",
+        "kbf-sample2",
+        "sample",
+        "KBF-SAMPLE",
     ] {
-        assert_eq!(list.plist(name), None, "{name}");
-        assert!(list.entitlements(name).is_empty(), "{name}");
+        for list in [sample(), committed()] {
+            assert_eq!(list.plist(name), None, "{name}");
+            assert!(list.entitlements(name).is_empty(), "{name}");
+        }
     }
+    assert_eq!(committed().plist("kbf-sample"), None);
 }
 
 /// Catches a list that fails open: with the file missing, or a directory in its place,
@@ -138,52 +150,52 @@ fn a_malformed_list_is_refused() {
     let owned = |s: &str| s.to_owned();
     let cases = [
         (
-            "kbf-vmm a.b\nkbf-vmm c.d\n",
+            "kbf-sample a.b\nkbf-sample c.d\n",
             4,
-            Defect::ListedTwice(owned("kbf-vmm")),
-            "kbf-vmm is listed twice",
+            Defect::ListedTwice(owned("kbf-sample")),
+            "kbf-sample is listed twice",
         ),
         (
-            "kbf-vmm a.b c.d a.b\n",
+            "kbf-sample a.b c.d a.b\n",
             3,
-            Defect::Repeats(owned("kbf-vmm")),
-            "kbf-vmm repeats an entitlement",
+            Defect::Repeats(owned("kbf-sample")),
+            "kbf-sample repeats an entitlement",
         ),
         (
-            "kbf-vmm\n",
+            "kbf-sample\n",
             3,
-            Defect::NoEntitlement(owned("kbf-vmm")),
-            "kbf-vmm lists no entitlement (leave a binary that gets none out)",
+            Defect::NoEntitlement(owned("kbf-sample")),
+            "kbf-sample lists no entitlement (leave a binary that gets none out)",
         ),
         (
-            "kbf-vmm # a.b\n",
+            "kbf-sample # a.b\n",
             3,
-            Defect::NoEntitlement(owned("kbf-vmm")),
-            "kbf-vmm lists no entitlement (leave a binary that gets none out)",
+            Defect::NoEntitlement(owned("kbf-sample")),
+            "kbf-sample lists no entitlement (leave a binary that gets none out)",
         ),
         (
-            "kbf-vmm a<b\n",
+            "kbf-sample a<b\n",
             3,
             Defect::NotAnEntitlement(owned("a<b")),
             "'a<b' is not an entitlement name",
         ),
         (
-            "kbf-vmm a.b .c\n",
+            "kbf-sample a.b .c\n",
             3,
             Defect::NotAnEntitlement(owned(".c")),
             "'.c' is not an entitlement name",
         ),
         (
-            "-kbf-vmm a.b\n",
+            "-kbf-sample a.b\n",
             3,
-            Defect::NotABinaryName(owned("-kbf-vmm")),
-            "'-kbf-vmm' is not a binary name",
+            Defect::NotABinaryName(owned("-kbf-sample")),
+            "'-kbf-sample' is not a binary name",
         ),
         (
-            "kbf/vmm a.b\n",
+            "kbf/sample a.b\n",
             3,
-            Defect::NotABinaryName(owned("kbf/vmm")),
-            "'kbf/vmm' is not a binary name",
+            Defect::NotABinaryName(owned("kbf/sample")),
+            "'kbf/sample' is not a binary name",
         ),
     ];
     let path = Path::new("list.txt");
@@ -219,7 +231,7 @@ fn a_line_renders_its_own_keys_sorted() {
     assert_eq!(list.entitlements("kbf_b"), ["m.m"]);
     assert_eq!(
         render(&keys(&["a.a", "z.z"])),
-        VMM_PLIST.replace(
+        SAMPLE_PLIST.replace(
             "\t<key>com.apple.security.virtualization</key>\n\t<true/>\n",
             "\t<key>a.a</key>\n\t<true/>\n\t<key>z.z</key>\n\t<true/>\n"
         )
@@ -229,19 +241,19 @@ fn a_line_renders_its_own_keys_sorted() {
 /// The signature cases of the hosted macOS test, on the text `codesign` prints: each
 /// row is a binary name, what its signature carries, and the refusal it must get (or
 /// none). Catches a check that lets any entitlement through for an unlisted binary
-/// (a lookup that ignores the name finds kbf-vmm's set for kbf), a subset
+/// (a lookup that ignores the name finds kbf-sample's set for kbf), a subset
 /// compare that accepts one more key (get-task-allow among them), a check that treats
 /// "no entitlements" as always fine, a compare of the count only, and one that takes
 /// an empty dictionary in an unlisted binary's signature for no entitlements (the
 /// signature must carry none at all).
 #[test]
 fn a_signature_is_compared_with_the_list() {
-    let list = committed();
+    let list = sample();
     let vz = entry(VZ);
     let gta = entry(GTA);
     let refused_other = |signed: &[&str]| {
         Err(Error::Other {
-            name: "kbf-vmm".to_owned(),
+            name: "kbf-sample".to_owned(),
             want: keys(&[VZ]),
             signed: keys(signed),
         })
@@ -249,10 +261,10 @@ fn a_signature_is_compared_with_the_list() {
     let empty_dict = signed("").replace("<dict></dict>", "<dict/>");
     let cases: [(&str, String, Result<String, Error>); 8] = [
         (
-            "kbf-vmm",
-            VMM_SIGNED.to_owned(),
+            "kbf-sample",
+            SAMPLE_SIGNED.to_owned(),
             Ok(format!(
-                "entitlements of kbf-vmm: exactly {VZ}, as the allow list says"
+                "entitlements of kbf-sample: exactly {VZ}, as the allow list says"
             )),
         ),
         (
@@ -277,27 +289,27 @@ fn a_signature_is_compared_with_the_list() {
             }),
         ),
         (
-            "kbf-mac-session",
+            "kbf-task",
             signed(&gta),
             Err(Error::UnlistedCarries {
-                name: "kbf-mac-session".to_owned(),
+                name: "kbf-task".to_owned(),
                 signed: signed(&gta),
             }),
         ),
         (
-            "kbf-vmm",
+            "kbf-sample",
             signed(&format!("{vz}{gta}")),
             refused_other(&[GTA, VZ]),
         ),
         (
-            "kbf-vmm",
+            "kbf-sample",
             "\n".to_owned(),
             Err(Error::ListedCarriesNone {
-                name: "kbf-vmm".to_owned(),
+                name: "kbf-sample".to_owned(),
                 want: keys(&[VZ]),
             }),
         ),
-        ("kbf-vmm", signed(&gta), refused_other(&[GTA])),
+        ("kbf-sample", signed(&gta), refused_other(&[GTA])),
     ];
     for (name, text, want) in cases {
         assert_eq!(compare(&list, name, &text), want, "{name}: {text:?}");
@@ -308,10 +320,13 @@ fn a_signature_is_compared_with_the_list() {
             "gives kbf no entitlements",
         ),
         (
-            compare(&list, "kbf-vmm", &signed(&gta)),
+            compare(&list, "kbf-sample", &signed(&gta)),
             "other entitlements than the allow list gives it",
         ),
-        (compare(&list, "kbf-vmm", ""), "its signature carries none"),
+        (
+            compare(&list, "kbf-sample", ""),
+            "its signature carries none",
+        ),
     ];
     for (got, fragment) in messages {
         let message = got.expect_err(fragment).to_string();
@@ -324,12 +339,12 @@ fn a_signature_is_compared_with_the_list() {
 /// reader does not understand.
 #[test]
 fn a_value_other_than_true_is_refused() {
-    let list = committed();
+    let list = sample();
     let not_true = signed(&format!("<key>{VZ}</key><false/>"));
     assert_eq!(
-        compare(&list, "kbf-vmm", &not_true),
+        compare(&list, "kbf-sample", &not_true),
         Err(Error::NotTrueValues {
-            name: "kbf-vmm".to_owned(),
+            name: "kbf-sample".to_owned(),
             signed: not_true.clone(),
         })
     );
@@ -341,8 +356,8 @@ fn a_value_other_than_true_is_refused() {
 /// an empty dictionary.
 #[test]
 fn the_signed_plist_reader_accepts_one_shape_only() {
-    assert_eq!(signed_keys(VMM_SIGNED), Some(keys(&[VZ])));
-    assert_eq!(signed_keys(VMM_PLIST), Some(keys(&[VZ])));
+    assert_eq!(signed_keys(SAMPLE_SIGNED), Some(keys(&[VZ])));
+    assert_eq!(signed_keys(SAMPLE_PLIST), Some(keys(&[VZ])));
     assert_eq!(
         signed_keys(&signed(&format!("{} {}", entry("z.z"), entry("a.a")))),
         Some(keys(&["a.a", "z.z"]))
@@ -379,29 +394,38 @@ fn the_signed_plist_reader_accepts_one_shape_only() {
         signed(&format!("{vz}{vz}")),
         // The plist not closed, or something after it.
         format!("<plist version=\"1.0\"><dict>{vz}</dict>"),
-        format!("{VMM_SIGNED}<plist/>"),
+        format!("{SAMPLE_SIGNED}<plist/>"),
     ];
     for xml in broken {
         assert_eq!(signed_keys(&xml), None, "{xml:?}");
     }
 }
 
-/// Catches Virtualization.framework reaching a crate whose binary is signed without the
-/// virtualization entitlement (it would fail at its first call on a Mac), or a second
-/// crate holding the framework bindings, and the workflow signing path for the probe
-/// binary losing kbf-vmm: only `kbf-vmm` depends on `objc2-virtualization`, and the
-/// workflow that builds it for download signs it with `sign-darwin`.
+/// Whether a manifest's text names the Virtualization.framework bindings, which a binary
+/// reaches only with the virtualization entitlement.
+fn names_virtualization(manifest: &str) -> bool {
+    manifest.contains("objc2-virtualization")
+}
+
+/// Catches Virtualization.framework reaching a crate: no binary is signed with the
+/// virtualization entitlement, so one that called the framework would fail at its first call on a
+/// Mac. No crate manifest depends on the bindings; the negative case is a manifest that does.
 #[test]
-fn only_kbf_vmm_depends_on_the_virtualization_bindings_and_its_workflow_signs_it() {
+fn no_crate_depends_on_the_virtualization_bindings() {
+    assert!(names_virtualization(
+        "[dependencies]\nobjc2-virtualization.workspace = true\n"
+    ));
+    assert!(!names_virtualization(
+        "[dependencies]\nlibc.workspace = true\n"
+    ));
     let crates = repo_root().join("crates");
     let mut users = Vec::new();
     for entry in std::fs::read_dir(&crates).expect("crates") {
         let dir = entry.expect("entry").path();
-        let manifest = dir.join("Cargo.toml");
-        let Ok(text) = std::fs::read_to_string(&manifest) else {
+        let Ok(text) = std::fs::read_to_string(dir.join("Cargo.toml")) else {
             continue;
         };
-        if text.contains("objc2-virtualization") {
+        if names_virtualization(&text) {
             users.push(
                 dir.file_name()
                     .expect("name")
@@ -410,9 +434,7 @@ fn only_kbf_vmm_depends_on_the_virtualization_bindings_and_its_workflow_signs_it
             );
         }
     }
-    assert_eq!(users, ["kbf-vmm"]);
-    let wf = std::fs::read_to_string(repo_root().join(".github/workflows/vmm-probe.yml"))
-        .expect("workflow");
-    assert!(wf.contains(r#"cargo xtask sign-darwin "target/$TARGET/release/kbf-vmm""#));
-    assert!(wf.contains("upload-artifact"));
+    assert_eq!(users, Vec::<String>::new());
+    let root = std::fs::read_to_string(repo_root().join("Cargo.toml")).expect("root manifest");
+    assert!(!names_virtualization(&root));
 }

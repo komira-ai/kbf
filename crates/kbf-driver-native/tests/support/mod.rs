@@ -6,13 +6,6 @@
 kbf_daemon::keeper_test_hook!();
 // So do the actions of [`Spec::act`]: this test binary run as kbf-testkit's `kbf-act`.
 kbf_testkit::act_test_hook!();
-// And the `as-user` step of an action run as a lease-user pool's slot user
-// (`tests/slots.rs`).
-kbf_driver_native::as_user_test_hook!();
-
-#[cfg(target_os = "macos")]
-pub mod pool;
-pub mod slot_rows;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -35,17 +28,8 @@ use prost::Message;
 pub const PROMPT: Duration = Duration::from_secs(10);
 
 /// What a run may take on top of its bound for the SIGTERM grace its end gives the
-/// processes (the default, two seconds), and for the clean of a slot, which gives the
-/// same grace again.
+/// processes (the default, two seconds).
 pub const GRACE_ALLOWANCE: Duration = Duration::from_secs(10);
-
-/// What a run may take on top of that when its slot has to be cleaned first (a slot set
-/// aside at slot-ready, or left dirty by a failed clean, is cleaned again before the lease
-/// is given it): the clean ends the user's processes with the same grace, then the
-/// assertion reads the user against its baseline, and the hand-out runs the slot-ready
-/// check and the profile canaries. A clean of a real user takes several seconds with the
-/// grace, and the recovery thread's first pass waits as long again as its backoff.
-pub const CLEAN_ALLOWANCE: Duration = Duration::from_secs(30);
 
 /// A CAS in memory; `delay` holds every `get` back (to kill a lease mid-fetch).
 #[derive(Debug, Default)]
@@ -150,13 +134,6 @@ pub struct Spec {
 }
 
 impl Spec {
-    /// `sh -c <script>`: for the macOS tests of what a user's own shell command, and
-    /// the system tools it runs, may do under the sandbox.
-    #[cfg(target_os = "macos")]
-    pub fn sh(script: &str) -> Self {
-        Self::argv(&["/bin/sh", "-c", script])
-    }
-
     /// The act steps `steps`, split at spaces (see `kbf_testkit::act`).
     pub fn act(steps: &str) -> Self {
         let act = act();
@@ -271,12 +248,9 @@ fn directory_of(cas: &MemoryCas, inputs: &[(String, Vec<u8>)]) -> Directory {
 }
 
 /// A scratch directory a test owns: a [`TestDir`] that, when the test passed, is first
-/// removed the way the driver removes a lease directory: what a system service mounted
-/// below it is unmounted, then the tree is removed (it opens a directory a test closed,
-/// and does not recurse once per level). A plain tree removal fails on a volume mounted
-/// below the directory: `EROFS` for a read-only one, such as a Metal toolchain image the
-/// system may mount below the `HOME` of a bare `xcrun metal`. Declare it before anything
-/// that runs in it, so those are gone first.
+/// removed the way the driver removes a lease directory (`kbf_outputs::remove_tree`: it
+/// opens a directory a test closed, and does not recurse once per level). Declare it
+/// before anything that runs in it.
 #[derive(Debug)]
 pub struct Scratch(TestDir);
 
@@ -299,7 +273,7 @@ impl Drop for Scratch {
         // After a panic the `TestDir` keeps or removes the directory: a second panic
         // while unwinding would abort the process.
         if !std::thread::panicking() && std::fs::symlink_metadata(self.0.path()).is_ok() {
-            kbf_driver_native::mounts::remove_lease_dir(self.0.path()).expect("remove scratch");
+            kbf_outputs::remove_tree(self.0.path()).expect("remove scratch");
         }
     }
 }
@@ -409,57 +383,13 @@ pub fn no_leases(config: &NativeConfig) -> bool {
     let runs = config.scratch.join("runs");
     // The output spools' directory: its files are unlinked as soon as they are made.
     let spool = config.scratch.join("spool");
-    // The directory a start's simulator sweep runs `simctl` in, kept once made.
-    let sweep = config.scratch.join("simulator-sweep");
     let others = std::fs::read_dir(&config.scratch)
         .expect("scratch root")
         .filter(|entry| {
-            entry.as_ref().map_or(true, |e| {
-                e.path() != runs && e.path() != spool && e.path() != sweep
-            })
+            entry
+                .as_ref()
+                .map_or(true, |e| e.path() != runs && e.path() != spool)
         })
         .count();
     others == 0 && empty(&runs) && empty(&spool)
-}
-
-/// `getconf <name>` as the test's user (the driver's user) sees it, every link
-/// resolved: on macOS, `DARWIN_USER_TEMP_DIR` is the folder Foundation and `xcrun`
-/// write in whatever `TMPDIR` says.
-pub fn user_folder(name: &str) -> PathBuf {
-    let out = std::process::Command::new("/usr/bin/getconf")
-        .arg(name)
-        .output()
-        .expect("getconf");
-    assert!(out.status.success(), "getconf {name}");
-    let path = String::from_utf8(out.stdout).expect("UTF-8");
-    std::fs::canonicalize(path.trim()).expect("the folder exists")
-}
-
-/// The file writes the macOS sandbox refused in the last ten minutes, one line per
-/// operation and path, from the unified log: what a sandboxed tool that failed
-/// wanted to write. For failure messages only; a note instead where the log cannot
-/// be read.
-pub fn sandbox_denials() -> String {
-    let out = std::process::Command::new("/usr/bin/log")
-        .args([
-            "show",
-            "--last",
-            "10m",
-            "--style",
-            "compact",
-            "--predicate",
-            "eventMessage CONTAINS \"deny(1) file-write\"",
-        ])
-        .output();
-    let Ok(out) = out else {
-        return "sandbox denials: the log cannot be read".to_owned();
-    };
-    let mut lines: Vec<String> = String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|line| line.split_once("deny(1) "))
-        .map(|(_, rest)| rest.to_owned())
-        .collect();
-    lines.sort();
-    lines.dedup();
-    format!("sandbox denials:\n{}", lines.join("\n"))
 }

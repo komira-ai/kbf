@@ -80,7 +80,7 @@ An action that names no OS, no architecture and no ISA level (an empty platform,
 with only properties kbf does not read, such as `pool`) is placed by
 `--default-platform` (`linux/x86_64` by default), so it is never handed to a Mac that
 merely sorts first. The default is not applied to an action that names `OSFamily` or
-`ISA` alone, or asks for `xcode`, an iOS device or a VM image, which only a Mac reports.
+`ISA` alone, or asks for `xcode`, an iOS device or a VM image.
 `--default-platform none` applies none. It changes placement only: the action digest and
 the cache key are the client's. Each application is logged with the action digest, at
 most once in ten seconds.
@@ -97,18 +97,8 @@ A worker reports how many GPUs it has in the `gpu` entry of its node report; a r
 without one has none. The daemon counts them on Linux from the PCI functions in
 `/sys/bus/pci/devices`: each NVIDIA or AMD VGA-compatible or 3D controller is one
 GPU. A server's management-controller VGA function and integrated graphics do not
-count. An Apple silicon Mac has one GPU, shared by the whole host, and reports it as
-one slot: `gpu` 1, with `gpu.kind` `native`, its `gpu.cores` and its `gpu.metal_family`
-(the N of the highest `MTLGPUFamilyAppleN` its chip supports; see
-[capabilities.md](design/capabilities.md#the-node-report)). So on macOS
-(`OSFamily=darwin`, or any spelling that names macOS) `gpu=1` books the Mac's GPU slot:
-one GPU action runs on a Mac at a time, and the Mac's CPUs and memory still serve other
-work beside it. The GPU is shared hardware, not a partition: leases that book no GPU
-can still use it, and the tests that do are for one tenant. `gpu` of 2 or more on
-macOS is refused (a Mac has one). A `whole_machine` lease on macOS books no GPU on top:
-the lease has the whole Mac. A Mac whose daemon runs in a virtual machine reports no GPU
-at all, and neither does a Mac whose daemon predates the entry, so a GPU action waits
-for a Mac that does.
+count. The `gpu` entry is a `kbf-daemon` node's; a macOS action runs as a js-agent job
+([actions-as-jobs.md](design/actions-as-jobs.md) section 14) and books no GPU slot.
 
 In Bazel:
 
@@ -120,16 +110,6 @@ cc_test(
 )
 ```
 
-On a Mac:
-
-```starlark
-py_test(
-    name = "mlx_test",
-    exec_properties = {"OSFamily": "darwin", "gpu": "1"},
-    ...
-)
-```
-
 ## `kbf-lease`
 
 An `action` lease (the default) books cores and GPUs of a worker and asks for memory: one core and 4 GiB (the first rung of
@@ -137,25 +117,14 @@ the memory ladder), or what
 `kbf-book-cpus` and `kbf-book-mem-gib` name, plus its `gpu` GPUs. A `whole_machine`
 lease books every core, byte of memory and GPU of its worker, and runs there alone.
 
-A lease goes only to a worker whose daemon runs a driver for its kind: `container`,
+A lease goes only to a worker whose node report lists a driver for its kind: `container`,
 `native` or `fake` (or the test-only `local`) for `action`, `native-whole-machine` for
 `whole_machine` (see
-[capabilities.md](design/capabilities.md#driver-entries)). Only a Mac whose daemon runs
-`kbf-mac-session` runs `native-whole-machine`: there each lease runs as a throwaway
-user in that user's GUI session, and the Mac is cleaned before the lease reports
-([fleet-updates.md](design/fleet-updates.md#101-no-gpu-in-vms)). On a farm without such
-a Mac a `whole_machine` action waits with the reason and then fails, as described under
-[Where an action runs](#where-an-action-runs). A GPU test that needs the Mac to itself (a
-performance run, or an app installed in the GUI session) is a `whole_machine` lease;
-one that needs only the GPU asks for `gpu=1` (see [`gpu`](#gpu)):
-
-```starlark
-py_test(
-    name = "app_with_local_model_test",
-    exec_properties = {"OSFamily": "darwin", "kbf-lease": "whole_machine", "gpu": "1"},
-    ...
-)
-```
+[capabilities.md](design/capabilities.md#driver-entries)). No `kbf-daemon` runs
+`native-whole-machine` (a Mac runs no `kbf-daemon`; the executor's workers list it), so on a
+farm without such a worker a `whole_machine` action waits with the reason and then fails, as
+described under [Where an action runs](#where-an-action-runs). A macOS action runs as a
+js-agent job ([actions-as-jobs.md](design/actions-as-jobs.md) section 14).
 
 A `whole_machine` lease waits for a worker that holds no lease. While it waits it holds
 one worker that could run it, and work queued after it at the same or a lower QoS is
@@ -200,7 +169,7 @@ an ordinary `action`, climbing the memory ladder, with no claim on a worker. A r
 needs exactly one action per worker (a benchmark) must not restart the server, and
 a restart during one invalidates it. The setting works on both scheduler cores.
 
-The booking also sets the memory the action may use. The native driver (Macs) kills an
+The booking also sets the memory the action may use. The native driver (plain processes on Linux) kills an
 action whose processes together hold more than 150% of its booked memory plus 512 MiB:
 6.5 GiB for the default booking, 12.5 GiB for `kbf-book-mem-gib=8`. A large `swiftc` or
 `ld` step that dies at 2 GiB needs a larger booking. The container driver gives the
@@ -241,194 +210,19 @@ action with another booking is a different action cache entry, so changing a boo
 reruns the action once. They are not the capability keys `cpus` and `mem_gib`, which
 ask for a worker whose whole machine has at least that much and book nothing.
 
-## `xcode`
+## macOS, Xcode, simulators, VMs and iOS devices
 
-On Macs, `xcode=<build>` places the action on a worker that has that Xcode build
-installed and runs it with that Xcode selected: `DEVELOPER_DIR` is set to the Xcode's
-`Contents/Developer`, so `xcrun`, `cc`, `swiftc` and `xcodebuild` are that Xcode's. The
-build is what `xcodebuild -version` prints after `Build version` (`16C5032a`), not the
-marketing version (`16.2`), so two Xcodes that share a version but differ in build
-never share a cache entry.
+A macOS action runs as a js-agent job, not on a `kbf-daemon`
+([actions-as-jobs.md](design/actions-as-jobs.md) section 14): the Macs run no
+`kbf-daemon`, so no Mac reports the `xcode`, `vm.image`, `vm.slots`, `ios.device` or
+`gpu` entries of a daemon node report, and there is no `simulator` property. The server
+still reads those report keys (the wire fields stay), so an action that names `xcode`,
+`vm.image` or `ios.device` matches no worker: it waits and then fails as described under
+[Where an action runs](#where-an-action-runs). A `vm.image` value without a digest, a
+`vm.slots`, `vm.max_cpus` or `vm.max_mem_gib` key, a value of `ios.device` other than `1`,
+an `ios.device.<attribute>` without `ios.device=1`, and `kbf-lease=vm` are refused with
+`INVALID_ARGUMENT`.
 
-A Mac may have several Xcodes installed; it serves an action that names any of them
-that is **ready**. The daemon asks each `Xcode*.app` in `/Applications` (the
-`--xcode-apps` flag), under its own `DEVELOPER_DIR` and with its own `xcodebuild`
-(the one inside the app), these questions, all at once, and reads the answers in
-this order: `xcodebuild -version` (which must print a build),
-`xcodebuild -license check`, `xcodebuild -checkFirstLaunchStatus`, `xcrun --find
-clang`, and, on a node started with `--require-metal-toolchain` (one meant for GPU
-work), whether `xcodebuild -showComponent MetalToolchain` says `Status: installed` (an
-Xcode before 26, which has no `-showComponent` and bundles Metal, passes when `xcrun
---find metal` does). Every question runs as an action does: under the actions'
-sandbox with the network off (as `network=off` runs one), in a lease directory of the daemon's own
-(`lease-survey` under `--data-dir`, removed when the survey ends), with the same
-writes allowed in the user folders ([below](#what-an-action-on-a-mac-may-write)). One
-for which every question exits 0, each within a minute, is ready and is reported as an
-`xcode` entry of its node report. An Xcode whose licence is not accepted still answers
-`-version` with exit 0, but `-license check` and every tool it runs (`xcrun`, `cc`,
-`swiftc`) exit 69, so it would fail every action placed on it.
-
-The daemon does not wait for its first survey before it says `Hello` (the survey
-can take seconds: each `xcrun` lookup the cache does not hold does, and after a reboot
-it holds none). Until that survey ends, the node's status lists each `Xcode*.app` it
-found as `not_surveyed`, and its node report advertises no Xcode, so nothing that
-names one is placed on it; when the survey ends the daemon sends its `Hello` and
-status again, with the Xcodes' states, without a restart. An Xcode not surveyed yet
-keeps whatever item its node's previous status gave it under `needs_attention` (a
-restarted daemon's broken Xcode stays listed, and is neither logged as resolved nor
-raised again by the survey that finds it unchanged); one with no previous item has
-none.
-
-An Xcode that is not ready is **not hidden**: the node's status lists every installed
-Xcode with its state (`license_not_accepted`, `first_launch_not_run`,
-`metal_toolchain_missing`, `failed`), the question it failed with its answer, and the
-command that fixes it (for example `sudo
-/Applications/Xcode_16.2.app/Contents/Developer/usr/bin/xcodebuild -license accept`),
-and `GET /v1/nodes` lists it under the node's `needs_attention`
-([api.md](api.md#get-v1nodes)). The daemon (once per start) and the server each log
-it at `WARN` once when it appears, and again only when its build, state or fix
-changes: a reason that
-changes alone (`xcodebuild` starts its NSLog lines with the time and its pid) is not
-logged again, and is not by itself a change the daemon sends.
-The daemon asks again every three minutes (`--xcode-recheck-secs`), so an Xcode fixed
-while the daemon runs is advertised within minutes, without a restart, and one that
-stops being ready (an update whose new licence is not accepted) stops being advertised.
-
-A hung question is killed, so it cannot keep an Xcode not surveyed for long. An answer counts
-only once the program has exited and closed its output: one that exits but leaves a
-child holding its output open is not ready when the minute is up. Each Xcode is asked
-once (an app that links to another, such as `Xcode.app`, is listed with that one's
-answers), on a thread of its own, and its questions at once, so a hung Xcode delays
-the end of the survey (and the other Xcodes' readiness) by
-up to a minute (two with `--require-metal-toolchain`, whose `xcrun --find metal` is
-asked only after `-showComponent`), and the other Xcodes add nothing to that but
-for their `xcrun` lookups, which run one at a time (each rewrites `xcrun`'s whole
-cache, so two at once lose each other's entries and the next lookups take seconds;
-one that hangs delays the others').
-An action that names no
-`xcode` runs with the Mac's default Xcode (`xcode-select`), or with the
-`DEVELOPER_DIR` its own environment sets; one that names an `xcode` gets that Xcode
-whatever its environment says.
-
-```starlark
-# Bazel: a platform for actions built with one Xcode
-platform(
-    name = "macos_arm64_xcode_16_2",
-    exec_properties = {"OSFamily": "Darwin", "ISA": "arm-a64", "xcode": "16C5032a"},
-)
-```
-
-## `simulator`
-
-On Macs, `simulator=<device type>,<runtime>` gives the action a simulator of its own:
-the native driver makes a new device for the lease before the action runs and deletes
-it when the lease ends. Without it, every simulator an action uses is one the daemon
-user's leases share, so two leases' UI tests can use the same device at once and one
-can leave it dirty for the next. The name is read in any case; the value is exact.
-
-| Part | Values |
-|---|---|
-| `<device type>` | a `simctl` device type, by identifier (`com.apple.CoreSimulator.SimDeviceType.iPhone-16`) or by name (`iPhone 16`) |
-| `<runtime>` | a `simctl` runtime identifier (`com.apple.CoreSimulator.SimRuntime.iOS-18-4`) |
-
-Both are required, separated by one comma; any other value is refused with
-`INVALID_ARGUMENT`. The value is passed to `xcrun simctl create` unchanged, so what
-`xcrun simctl list devicetypes` and `xcrun simctl list runtimes` print are the values
-that work.
-
-- **At start**, after the inputs are written, the driver runs `xcrun simctl create
-  kbf-lease-<term>-<seq> <device type> <runtime>`, under the actions' sandbox with the
-  network off and with the Xcode the action's `xcode` property names. The device is
-  in the daemon user's default device set (`~/Library/Developer/CoreSimulator/Devices`):
-  `xcodebuild -destination` finds only the devices of that set, not one made in a set
-  elsewhere with `simctl --set` (the native-macos job checks both). If the command
-  fails (a runtime the Mac does not have, a device type the runtime does not
-  support) or does not answer within two minutes, the lease fails with `simctl`'s
-  reason and the action does not run.
-- **The action** finds the device's UDID in `KBF_SIMULATOR_UDID` (it wins over the
-  Command's environment). The driver boots the device and waits until Xcode lists it
-  before the action runs (Xcode's list of devices can change with a boot, and a
-  device that is not listed makes `xcodebuild test -destination` fail after 30 s), so
-  the action finds it booted: `bootstatus -b` returns at once, and `simctl boot` of a
-  booted device fails. A device that does not boot or is not listed in time fails the
-  lease with the reason, and the action does not run:
-
-  ```sh
-  xcrun simctl bootstatus "$KBF_SIMULATOR_UDID" -b
-  xcodebuild test -project App.xcodeproj -scheme App -destination "id=$KBF_SIMULATOR_UDID"
-  ```
-
-- **At the end**, whatever the outcome (exit, failure, timeout, kill, a run the daemon
-  drops), before the lease directory is removed: the device the create printed, and
-  any other device named for the lease (one a create cut short made late), is shut
-  down and deleted, each by its UDID, with the Mac's default Xcode. The daemon keeps
-  the UDID itself, so nothing the action writes in its lease directory changes what is
-  deleted. A delete that fails fails the lease, as a lease directory that cannot be
-  removed does. A daemon that was killed during such a lease deletes, at its next
-  start, every device whose name starts `kbf-lease-`: give no device of your own such
-  a name on a farm Mac.
-
-**Not isolated.** A booted simulator's processes run under `CoreSimulatorService`,
-outside the actions' sandbox and its `network=off` rule, and the action can reach every
-device of the default set with `simctl`, not only its own. The property gives a lease
-a clean device of its own; it does not confine what the action does with simulators.
-
-The scheduler does not read `simulator`: name `OSFamily=darwin` too, or the action
-may be placed on a Linux worker, whose driver does not read it either. A Mac that does
-not have the runtime fails the lease. Hosts set up by `kbf-mac-provision` have no
-simulator runtimes ([macos-vms.md](design/macos-vms.md)), so there the property works
-only once runtimes are installed.
-
-```starlark
-# Bazel: a test that drives an iOS app on its own simulator
-sh_test(
-    name = "app_ui_test",
-    srcs = ["app_ui_test.sh"],
-    exec_properties = {
-        "OSFamily": "Darwin",
-        "simulator": "com.apple.CoreSimulator.SimDeviceType.iPhone-16,com.apple.CoreSimulator.SimRuntime.iOS-18-4",
-    },
-    ...
-)
-```
-
-## `vm.image` and the VM report keys
-
-macOS VM leases (`kbf-lease=vm`, [macos-vms.md](design/macos-vms.md)) are **planned**:
-no driver runs a VM and no daemon reports a VM entry. What the server already reads:
-
-| Property | Values | Effect |
-|---|---|---|
-| `vm.image` | `<name>@sha256:<64 lowercase hex digits>` | Matched by membership on the digest: the action runs only on a worker whose report lists an image with that digest, under any name. A value without a digest is refused with `INVALID_ARGUMENT`. |
-| `vm.slots`, `vm.max_cpus`, `vm.max_mem_gib` | none | Report-only: an action that names one, in any case, is refused with `INVALID_ARGUMENT`. |
-
-The digest is the image's recipe digest, which names the image's pinned inputs, not the
-bytes of one node's build ([macos-vm-guests.md](design/macos-vm-guests.md#5-image-identity)).
-Because no daemon reports `vm.image` yet, an action that names one matches no worker:
-it waits and then fails as described under [Where an action runs](#where-an-action-runs).
-`kbf-lease=vm` is still refused as an unknown lease kind.
-
-## `ios.device`
-
-The server matches and books devices; **no daemon reports a device yet**, so an action
-that names `ios.device=1` waits and then fails as described under
-[Where an action runs](#where-an-action-runs). The design is in
-[ios-devices.md](design/ios-devices.md):
-
-| Property | Values | Effect |
-|---|---|---|
-| `ios.device` | `1` | Books one USB-attached iPhone or iPad on a Mac for the lease alone, named in the lease's `Start`. **Planned:** the action finds its UDID in `KBF_IOS_DEVICE_ID`. |
-| `ios.device.class` | `iPhone`, `iPad` | Exact. |
-| `ios.device.product_type` | a model identifier (`iPhone17,3`) | Exact. |
-| `ios.device.os_version` | an iOS version | Exact. |
-| `ios.device.os_build` | an iOS build | Exact. |
-
-One device must satisfy every `ios.device.*` key: an iPhone on iOS 18.6 and an iPad on
-iOS 26.0 do not together serve `ios.device.class=iPhone` with
-`ios.device.os_version=26.0`. Refused with `INVALID_ARGUMENT`: a value other than `1`,
-an attribute key without `ios.device=1`, an `ios.device.<attribute>` not in the table,
-`ios.device` with an OS other than macOS, and `ios.device` with `kbf-lease=vm` or
-`whole_machine`. Names are read in any case.
 
 ## `kbf-network`
 
@@ -484,99 +278,18 @@ runs under the strict filter, and the line says `network: seccomp only, no inet 
 skipped for uid 0)`.
 `kbf-task` also makes itself non-dumpable (`PR_SET_DUMPABLE` 0) before it opens a socket, so
 the Command, which runs as the same user, cannot `ptrace` it, take its sockets with
-`pidfd_getfd` or read its memory through `/proc`. This property does not reach the Mac driver, which has its own
-[`network`](#network) property.
-
+`pidfd_getfd` or read its memory through `/proc`.
 On macOS `kbf-task` has no seccomp filter or namespace. It runs the Command alone under
-`/usr/bin/sandbox-exec`, with the profile of `crates/kbf-seatbelt` (the rules the Mac driver's
-`network=off` profile uses): everything is allowed except handing work to `launchd` and writing a
-preference, a Command denied the network gets the `network=off` denial of the table below
-(loopback and Unix sockets only), and for every Command reading the files this tool holds a
+`/usr/bin/sandbox-exec`, with the profile of `crates/kbf-seatbelt`: everything is allowed except handing work to `launchd` and writing a
+preference, a Command denied the network gets a denial of every network operation but loopback and Unix sockets, and for every Command reading the files this tool holds a
 credential or presigned URL in is denied, as are writing it and renaming or removing the
 directories above it (`--grant-token-file`, `--pack-url-file`, `--put-urls-file`). A Command with `kbf-network=allow` gets the profile without the network
 clause. The line for a denied Command is `kbf-task: action <digest>: network: sandbox-exec profile
-(no network but loopback and unix sockets)`. The limits are the driver's: any Unix socket stays
+(no network but loopback and unix sockets)`. The limits are the profile's: any Unix socket stays
 open, so DNS lookups still go out through the system's resolver, and a connect to the node's own
 non-loopback address was allowed under the denial on the macOS runner. The profile does not limit
 other writes, helper daemons reached by `mach-lookup` and other services on the node stay reachable, and a credential given as a flag value (`--insecure-argv-secrets`) stays in this tool's
-argv. No macOS `kbf-task` is released yet. On a system that is neither Linux nor macOS there is
+argv. The macOS `kbf-task` is released only as the bundle a Mac job runs
+([artifacts.md](artifacts.md#the-macos-kbf-task-bundle)), and runs the Command directly there: the
+agent's sandbox is its sandbox, and this profile is not applied. On a system that is neither Linux nor macOS there is
 no confine, and a Command denied the network is refused there (exit 15).
-
-## `network`
-
-On a Mac (the native driver), an action has the network, the internet and the LAN,
-unless it turns it off:
-
-| `network` | The action gets |
-|---|---|
-| absent, `on`, `standard` | the network (the default): the sandbox's only network rule denies the `usbmuxd` socket, which reaches an iOS device |
-| `off`, `none` | loopback, Unix sockets and the node's own non-loopback address: every other connect is refused with `EPERM` by the sandbox (`crates/kbf-driver-native/src/network.rs`) |
-
-Any other value is refused with `INVALID_ARGUMENT`. Unix sockets stay open with
-`network=off`, so DNS lookups still go out through the system's resolver; a connect to
-the node's own LAN address is allowed too, so a service listening on it is reachable. A node
-without `sandbox-exec` cannot turn the network off and says so in its
-`network_isolation` capability (`none`). Linux container actions have no network
-([ARCHITECTURE.md](../ARCHITECTURE.md)), whatever the property says.
-
-## What an action on a Mac may write
-
-The native driver runs every action on a Mac under `sandbox-exec` with a profile that
-denies every file write outside the action's lease directory and `/dev`. The lease
-directory holds the input root (the working directory and outputs), and the action's
-own home, temporary and cache directories, named by `HOME`, `CFFIXED_USER_HOME`
-(where Foundation's tools, `swift build` and `xcodebuild` among them, take `~` from),
-`TMPDIR`, `XDG_CACHE_HOME` and `CLANG_MODULE_CACHE_PATH`; all of it is removed when the
-lease ends. Four kinds of write in the daemon user's temporary and cache folders
-(`getconf DARWIN_USER_TEMP_DIR` and `DARWIN_USER_CACHE_DIR`, under `/var/folders`) are
-allowed too, because macOS tools make them there whatever `TMPDIR` says: Foundation's atomic saves (inside
-`TemporaryItems`, which `swift build` and `xcodebuild` need; the daemon makes that
-folder, and an action cannot remove, rename or replace it), `xcrun`'s cache
-(`xcrun_db`, behind `cc`, `clang` and `swiftc`), and Swift Build's scratch directory
-(`swbuild.tmp.<random>` and what is in it, which `xcodebuild` needs to build an app),
-and the module cache of the Metal compiler (`C/clang/ModuleCache/`, which `xcrun metal`
-uses whatever `CLANG_MODULE_CACHE_PATH` says; the daemon makes the folder).
-The daemon sweeps the first two's leftovers once their last change is an hour from now,
-before or after, never through a symlink; it leaves `swbuild.tmp.*` alone, since a
-long build's can be older than that. Until each lease runs as its own user, leases on one Mac share those names:
-one lease can see another's temporary files there and rewrite the `xcrun` cache the
-next lease reads. The daemon runs no developer tool outside the sandbox while it
-serves: it asks the Xcodes ([above](#xcode)) under the actions' sandbox, where
-`xcrun` reads and fills that cache as an action's would, and runs each Xcode's own
-`xcodebuild` rather than the `/usr/bin` one. It leaves the cache in place at start:
-without it every lookup of the first survey takes seconds, and no Xcode is ready
-until that survey ends. It warms the cache under the actions' sandbox too, once its first survey ends for
-the node's own Xcode and the ready ones, and later for each Xcode that becomes ready.
-A tool that writes anywhere else (`/tmp`, a path
-under the daemon user's real home, the rest of `/var/folders`) fails, so a build rule
-points such a tool into the lease: `swiftc -module-cache-path`,
-`xcodebuild -derivedDataPath`. `xcodebuild` and SwiftPM find `~` through the user
-database, not `HOME`, so the lease sets `CFFIXED_USER_HOME` to its home too: their
-caches (`~/Library/Caches/org.swift.swiftpm`, issue #179) are then the lease's own.
-`xcodebuild` then has a system service mount the Metal toolchain below that home
-(`Library/Developer/DVTDownloads/MetalToolchain/mounts`), read-only and root-owned, and
-the daemon unmounts every volume at or below a lease directory before it removes the
-directory, at the lease's end and at the next start (issue #178); a mount it cannot
-unmount fails the lease as any directory it cannot remove does. The Metal compiler's
-module cache is shared by the leases of one daemon user (a `.pcm` file one lease
-leaves is read by the next, until each lease has its own user).
-Apple's
-tools that nest a sandbox of their own need it turned off, since macOS refuses a
-sandbox inside a sandbox (`swiftc -disable-sandbox`, `swift build --disable-sandbox`);
-the outer profile still keeps their writes inside the lease.
-
-The same profile keeps every action away from the services that reach an iOS device
-plugged into the Mac: it refuses the lookup of any CoreDevice or `remoted` mach
-service and a connect to `usbmuxd`'s socket, so `xcrun devicectl` fails (its
-connection to `CoreDeviceService` is invalidated) and no tool talks to a device
-through `usbmuxd`. No lease books a device yet
-([design/ios-devices.md](design/ios-devices.md#61-what-the-sandbox-must-allow)).
-
-It also refuses opening an application through Launch Services (`open`, the sandbox's
-`lsopen`): Launch Services starts the application outside the sandbox and outside the
-lease's process tree, so it could write anywhere the daemon's user can, use the
-network and outlive the lease, and an action can open an application it linked in its
-own lease. `xcodebuild` starts a macOS UI-test runner that way, so macOS UI tests fail
-under the native driver (error -54, "The sandbox profile of this process is missing
-"(allow lsopen)""). iOS UI tests on a simulator do not need it
-([spikes/macos-p0.md](spikes/macos-p0.md#xcuitest-under-the-native-drivers-sandbox)).

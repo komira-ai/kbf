@@ -1,7 +1,8 @@
 //! A virtual worker: the daemon the job service stands behind.
 //!
-//! The farm sees an ordinary worker, `js:<frontend>-<n>` (`js:<frontend>.<instance>-<n>` with
-//! shared ownership), that registers, takes `Start`s,
+//! The farm sees an ordinary worker, `js:<frontend>-<n>` (or, for the Macs,
+//! `js-mac:<frontend>-<n>`, [`crate::executor::mac`]; `js:<frontend>.<instance>-<n>` and
+//! `js-mac:<frontend>.<instance>-<n>` with shared ownership), that registers, takes `Start`s,
 //! lists what it runs in its heartbeats and reports results. Nothing of the farm knows
 //! otherwise but its registration: the worker owns the receiving end of the `Outbound` channel
 //! the farm sends a daemon's messages on, and calls the farm's own `register_virtual` and
@@ -21,9 +22,10 @@
 //! - `Welcome.pack_commit` and `placement_load`: nothing here commits a pack through
 //!   `CommitPack`. No load is reported: a job's host is the service's, and the farm places a
 //!   worker with no load reading by booking alone.
-//! - `Start.device_id`, `job` and `fence`: the node report names the `container` and
-//!   `native-whole-machine` drivers ([`DRIVERS`](super::config::DRIVERS)) and no device, so the
-//!   farm places `action` and `whole_machine` leases on it, never a device or a `job`; the
+//! - `Start.device_id`, `job` and `fence`: a Linux worker's node report names the `container`
+//!   and `native-whole-machine` drivers ([`DRIVERS`](super::config::DRIVERS)), a Mac worker's
+//!   only `native`, and neither a device, so the farm places `action` leases on both and
+//!   `whole_machine` leases on a Linux one, never a device or a `job`; the
 //!   worker fences every job it submits, as a daemon does that is told nothing else.
 //!   `Start.kind` is read: a `whole_machine` lease is submitted as a job that needs the whole
 //!   host, any other as one that needs the share the farm booked.
@@ -84,6 +86,7 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 use crate::executor::api::answered;
+use crate::executor::mac::WorkerOs;
 use crate::executor::runs::Task;
 use crate::executor::share::Own;
 use crate::executor::{Ctx, WorkerInfo};
@@ -102,6 +105,8 @@ type Inbox = mpsc::UnboundedReceiver<Result<ServerMessage, tonic::Status>>;
 /// One virtual worker of the farm, and the tasks it was told to run.
 pub(super) struct HostWorker {
     pub(super) id: WorkerId,
+    /// The hosts it stands for: what it reports to the farm.
+    os: WorkerOs,
     instance: String,
     generation: u32,
     stream: StreamId,
@@ -142,12 +147,19 @@ impl HostWorker {
         format!("kbf-executor/{id}/{}/{generation}", ctx.cfg.instance)
     }
 
-    /// Registers the `n`th virtual worker of this frontend.
+    /// Registers the `n`th Linux virtual worker of this frontend.
     pub(super) fn start(ctx: &Ctx<'_>, n: usize, now: Instant) -> Self {
-        let id = WorkerId::new(ctx.cfg.worker_name(n));
-        let (stream, instance, reported, inbox) = register(ctx, &id, 0, "");
+        Self::start_of(ctx, WorkerOs::Linux, n, now)
+    }
+
+    /// Registers the `n`th virtual worker of this frontend for `os`, named by
+    /// [`Config::worker_of`](super::Config::worker_of).
+    pub(super) fn start_of(ctx: &Ctx<'_>, os: WorkerOs, n: usize, now: Instant) -> Self {
+        let id = WorkerId::new(ctx.cfg.worker_of(os, n));
+        let (stream, instance, reported, inbox) = register(ctx, os, &id, 0, "");
         Self {
             id,
+            os,
             instance,
             generation: 0,
             stream,
@@ -171,6 +183,11 @@ impl HostWorker {
     #[cfg(test)]
     pub(super) fn replace_inbox(&mut self, inbox: Inbox) {
         self.inbox = inbox;
+    }
+
+    /// The hosts the worker stands for.
+    pub(super) fn os(&self) -> WorkerOs {
+        self.os
     }
 
     pub(super) fn info(&self) -> WorkerInfo {
@@ -278,7 +295,7 @@ impl HostWorker {
         self.generation += 1;
         let predecessor = std::mem::take(&mut self.instance);
         let (stream, instance, reported, inbox) =
-            register(ctx, &self.id, self.generation, &predecessor);
+            register(ctx, self.os, &self.id, self.generation, &predecessor);
         self.stream = stream;
         self.instance = instance;
         self.reported = reported;
@@ -382,12 +399,13 @@ impl HostWorker {
 /// server answers it with, and the stream the farm's messages come back on.
 fn register(
     ctx: &Ctx<'_>,
+    os: WorkerOs,
     id: &WorkerId,
     generation: u32,
     predecessor: &str,
 ) -> (StreamId, String, Reported, Inbox) {
     let instance = HostWorker::farm_instance(ctx, &id.to_string(), generation);
-    let hello = ctx.cfg.hello(&id.to_string(), &instance, predecessor);
+    let hello = ctx.cfg.hello(os, &id.to_string(), &instance, predecessor);
     let mut reported =
         reported(&hello, HostFloor::DEFAULT).expect("a validated config makes a valid Hello");
     reported.protocol = Some(PROTOCOL_VERSION);

@@ -6,13 +6,13 @@
 //! id is never taken for it), when it descends from a process that belongs, or when it
 //! was seen belonging earlier and is still the same process (pid and start time): a
 //! process that leaves the group (`setsid`) and is orphaned (its parent exits, so it
-//! is reparented to `launchd` or `init`) is still the action's once a poll has seen it.
+//! is reparented to `init`) is still the action's once a poll has seen it.
 //! One that does both between two polls is not seen; a per-lease user would close
 //! that gap, and is a follow-up.
 //!
 //! The pure part, [`Tracker`] and the text parsers, is tested on every platform. The
-//! process table and per-process memory come from `/proc` on Linux and from `libproc`
-//! on macOS ([`snapshot`], [`rusage`]).
+//! process table and per-process memory come from `/proc` (the native runtime runs on
+//! Linux only; [`snapshot`], [`footprint`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -157,7 +157,7 @@ pub fn parse_linux_stat(text: &str) -> Option<Proc> {
 /// The memory a Linux process holds that it alone pays for, from its
 /// `/proc/<pid>/status`: anonymous and shared-memory pages resident, plus what is
 /// swapped out (`RssAnon + RssShmem + VmSwap`), in bytes. The nearest Linux measure
-/// to macOS's physical footprint. `None` without those lines (a kernel thread, a
+/// to a physical footprint. `None` without those lines (a kernel thread, a
 /// zombie).
 #[must_use]
 pub fn parse_linux_status(text: &str) -> Option<u64> {
@@ -172,68 +172,19 @@ pub fn parse_linux_status(text: &str) -> Option<u64> {
     Some(total * 1024)
 }
 
-/// The arguments of a process as one line, from the NUL-separated `/proc/<pid>/cmdline`
-/// (or the argument strings after the path in a macOS `KERN_PROCARGS2` block): the
-/// strings joined by a space, lossily decoded.
+/// The arguments of a process as one line, from the NUL-separated `/proc/<pid>/cmdline`:
+/// the strings joined by a space, lossily decoded.
 #[must_use]
 pub fn join_args(raw: &[u8]) -> String {
     let raw = raw.strip_suffix(&[0]).unwrap_or(raw);
     String::from_utf8_lossy(raw).replace('\0', " ")
 }
 
-/// The program name and the arguments from a macOS `KERN_PROCARGS2` block: an `int`
-/// argument count, the executable path and its NUL padding, then `argc` argument
-/// strings (the environment follows them and is not read). `None` for a block too
-/// short to hold the count.
-#[must_use]
-pub fn parse_procargs2(raw: &[u8]) -> Option<(String, String)> {
-    let argc = u32::from_ne_bytes(raw.get(..4)?.try_into().ok()?) as usize;
-    let rest = &raw[4..];
-    let path_end = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
-    let path = String::from_utf8_lossy(&rest[..path_end]);
-    let name = path.rsplit('/').next().unwrap_or_default().to_owned();
-    let after = &rest[path_end..];
-    let first = after.iter().position(|&b| b != 0).unwrap_or(after.len());
-    let args: Vec<String> = (after[first..].split(|&b| b == 0).take(argc))
-        .map(|arg| String::from_utf8_lossy(arg).into_owned())
-        .collect();
-    Some((name, args.join(" ")))
-}
-
-/// What one read of a process gives: its footprint now, and, where the platform keeps
-/// them, the counters of its whole life ([`crate::usage`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Rusage {
-    /// Physical footprint now, in bytes.
-    pub footprint: u64,
-    /// High-water mark and CPU time of the process so far: macOS only.
-    pub lifetime: Option<crate::usage::Lifetime>,
-}
-
-/// The folders of the macOS system volume that hold the helpers the system starts as a
-/// user (`diskimages-helper` for an attached disk image, for one).
-pub const SYSTEM_FOLDERS: [&str; 3] = ["/System/", "/usr/libexec/", "/usr/sbin/"];
-
-/// Whether `path`, the executable of a process, is a system binary: under
-/// [`SYSTEM_FOLDERS`]. Such a process is the system's, not the action's, and does not
-/// end on SIGTERM; it is left out of the SIGTERM wait and the survivor report (the
-/// SIGKILL still takes it). An action cannot make its own binary look like one: those
-/// folders are on the sealed, read-only system volume, which no user (root included)
-/// can write to, and a path is compared as `proc_pidpath` gives it, never as an
-/// argument the action chose.
-#[must_use]
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub fn is_system_binary(path: &str) -> bool {
-    SYSTEM_FOLDERS.iter().any(|folder| path.starts_with(folder))
-}
-
-pub use platform::{command_of, process, rusage, snapshot};
-#[cfg(target_os = "macos")]
-pub use platform::{executable_of, timebase};
+pub use platform::{command_of, footprint, process, snapshot};
 
 #[cfg(target_os = "linux")]
 mod platform {
-    use super::{Proc, Rusage, parse_linux_stat, parse_linux_status};
+    use super::{Proc, parse_linux_stat, parse_linux_status};
 
     /// Every process in `/proc` that could be read. One that exits while the table
     /// is read is left out.
@@ -276,193 +227,46 @@ mod platform {
         Some((name.trim_end().to_owned(), super::join_args(&args)))
     }
 
-    /// What `pid` holds, in bytes; `None` once it is gone. No lifetime counters: the
-    /// driver reports usage on macOS only.
+    /// What `pid` holds, in bytes; `None` once it is gone.
     #[must_use]
-    pub fn rusage(pid: i32) -> Option<Rusage> {
+    pub fn footprint(pid: i32) -> Option<u64> {
         std::fs::read_to_string(format!("/proc/{pid}/status"))
             .ok()
             .as_deref()
             .and_then(parse_linux_status)
-            .map(|footprint| Rusage {
-                footprint,
-                lifetime: None,
-            })
     }
 }
 
-#[cfg(target_os = "macos")]
+/// Where the process table cannot be read (the native runtime runs on Linux only): no
+/// process is listed, so the runtime refuses to start ([`crate::record::boot_id`]).
+#[cfg(not(target_os = "linux"))]
 mod platform {
-    use super::{Proc, Rusage};
-    use crate::usage::Lifetime;
+    use super::Proc;
 
-    /// `pbi_status` of a process that has exited and waits to be reaped.
-    const SZOMB: u32 = 5;
-
-    /// Every process `libproc` lists whose BSD info could be read. One that exits
-    /// while the table is read is left out.
+    /// The process table, which is not readable here.
+    ///
+    /// # Errors
+    /// Always: the platform has no `/proc`.
     pub fn snapshot() -> std::io::Result<Vec<Proc>> {
-        // Room for more pids than the kernel reports, so a few new ones still fit.
-        // SAFETY: a null buffer asks only for the count.
-        let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
-        if count < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let mut pids = vec![0 as libc::pid_t; count.unsigned_abs() as usize + 64];
-        let bytes =
-            i32::try_from(std::mem::size_of_val(pids.as_slice())).map_err(std::io::Error::other)?;
-        // SAFETY: the buffer holds `bytes` bytes of pids and outlives the call.
-        let n = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
-        if n < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        pids.truncate(n.unsigned_abs() as usize);
-        Ok(pids.into_iter().filter_map(process).collect())
+        Err(std::io::ErrorKind::Unsupported.into())
     }
 
-    /// Process `pid`, as a snapshot would show it; `None` once it is gone.
+    /// Process `pid`: never found.
     #[must_use]
-    pub fn process(pid: libc::pid_t) -> Option<Proc> {
-        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
-        let size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
-        // SAFETY: `info` is a writable proc_bsdinfo of `size` bytes; the call writes
-        // at most that many and returns how many it wrote.
-        let wrote = unsafe {
-            libc::proc_pidinfo(
-                pid,
-                libc::PROC_PIDTBSDINFO,
-                0,
-                info.as_mut_ptr().cast(),
-                size,
-            )
-        };
-        if wrote != size {
-            return None;
-        }
-        // SAFETY: the call filled the whole struct (checked above).
-        let info = unsafe { info.assume_init() };
-        Some(Proc {
-            pid,
-            ppid: i32::try_from(info.pbi_ppid).ok()?,
-            pgid: i32::try_from(info.pbi_pgid).ok()?,
-            start: info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec,
-            zombie: info.pbi_status == SZOMB,
-        })
+    pub fn process(_pid: i32) -> Option<Proc> {
+        None
     }
 
-    /// The path of the executable `pid` runs (`proc_pidpath`); `None` once it is gone.
+    /// The name and arguments of `pid`: never found.
     #[must_use]
-    pub fn executable_of(pid: i32) -> Option<String> {
-        let mut path = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
-        let size = u32::try_from(path.len()).ok()?;
-        // FFI-BOUNDARY: `path` is this frame's; proc_pidpath writes at most `size` bytes
-        // into it and keeps no pointer past the call.
-        // SAFETY: `path` holds `size` writable bytes; the pointer outlives the call.
-        let len = unsafe { libc::proc_pidpath(pid, path.as_mut_ptr().cast(), size) };
-        let len = usize::try_from(len).ok().filter(|len| *len > 0)?;
-        path.truncate(len);
-        String::from_utf8(path).ok()
+    pub fn command_of(_pid: i32) -> Option<(String, String)> {
+        None
     }
 
-    /// The name and the arguments (one line) of `pid` (`KERN_PROCARGS2`); `None` once it
-    /// is gone or when the kernel does not show them to this user.
+    /// What `pid` holds: never found.
     #[must_use]
-    pub fn command_of(pid: i32) -> Option<(String, String)> {
-        let mut limit: libc::c_int = 0;
-        let mut size = std::mem::size_of::<libc::c_int>();
-        let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
-        // SAFETY: `limit` is a writable int of `size` bytes, the length KERN_ARGMAX
-        // answers with; the pointers outlive the call.
-        let done = unsafe {
-            libc::sysctl(
-                mib.as_mut_ptr(),
-                2,
-                (&raw mut limit).cast(),
-                &raw mut size,
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-        if done != 0 || limit <= 0 {
-            return None;
-        }
-        let mut buffer = vec![0u8; usize::try_from(limit).ok()?];
-        let mut size = buffer.len();
-        let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
-        // SAFETY: `buffer` holds `size` writable bytes, which the call shortens to what it
-        // wrote; the pointers outlive the call.
-        let done = unsafe {
-            libc::sysctl(
-                mib.as_mut_ptr(),
-                3,
-                buffer.as_mut_ptr().cast(),
-                &raw mut size,
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-        if done != 0 {
-            return None;
-        }
-        buffer.truncate(size);
-        super::parse_procargs2(&buffer)
-    }
-
-    /// The physical footprint of `pid` (what Activity Monitor calls its memory), in
-    /// bytes, with its lifetime high-water mark and CPU time; `None` once it is gone.
-    #[must_use]
-    pub fn rusage(pid: i32) -> Option<Rusage> {
-        let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::zeroed();
-        // FFI-BOUNDARY: `info` is this stack frame's; proc_pid_rusage writes the
-        // RUSAGE_INFO_V4 struct (<libproc.h>, <sys/resource.h>; `libc` declares the
-        // same layout as `rusage_info_v4`) into it and keeps no pointer past the call.
-        // SAFETY: `info` is a writable rusage_info_v4, the struct RUSAGE_INFO_V4 fills;
-        // the pointer outlives the call.
-        let done =
-            unsafe { libc::proc_pid_rusage(pid, libc::RUSAGE_INFO_V4, info.as_mut_ptr().cast()) };
-        if done != 0 {
-            return None;
-        }
-        // SAFETY: the call succeeded, so it filled the struct.
-        let info = unsafe { info.assume_init() };
-        Some(Rusage {
-            footprint: info.ri_phys_footprint,
-            lifetime: Some(Lifetime {
-                max_footprint: info.ri_lifetime_max_phys_footprint,
-                user_ticks: info.ri_user_time,
-                system_ticks: info.ri_system_time,
-                child_user_ticks: info.ri_child_user_time,
-                child_system_ticks: info.ri_child_system_time,
-                ppid: process(pid).map_or(0, |p| p.ppid),
-            }),
-        })
-    }
-
-    /// The machine's mach timebase, `(numer, denom)`: a tick of mach absolute time is
-    /// `numer / denom` nanoseconds. `(1, 1)` if the kernel refuses (it does not).
-    #[must_use]
-    pub fn timebase() -> (u32, u32) {
-        /// `struct mach_timebase_info` of <mach/mach_time.h>: two `uint32_t`. Declared
-        /// here because `libc` marks its copy deprecated.
-        #[repr(C)]
-        struct Timebase {
-            numer: u32,
-            denom: u32,
-        }
-        unsafe extern "C" {
-            // <mach/mach_time.h>: fills `info`, returns KERN_SUCCESS (0).
-            fn mach_timebase_info(info: *mut Timebase) -> libc::c_int;
-        }
-        let mut info = Timebase { numer: 0, denom: 0 };
-        // FFI-BOUNDARY: `info` is this frame's; the call fills it and keeps no pointer.
-        // SAFETY: `info` is a writable struct of the layout the declaration above gives
-        // (two u32, as in <mach/mach_time.h>).
-        let done = unsafe { mach_timebase_info(&raw mut info) };
-        if done == 0 && info.denom != 0 {
-            (info.numer, info.denom)
-        } else {
-            (1, 1)
-        }
+    pub fn footprint(_pid: i32) -> Option<u64> {
+        None
     }
 }
 
@@ -473,8 +277,8 @@ mod platform {
 /// later by number. A member that exits in between and whose pid the kernel hands to
 /// a new process of the same user gets that process killed instead; the daemon's user
 /// only, since `kill` cannot reach another user's processes. Closing it needs a
-/// handle that cannot be recycled (`pidfd_send_signal` on Linux; macOS has none for
-/// arbitrary processes) or a per-lease user whose every process may be killed. The
+/// handle that cannot be recycled (`pidfd_send_signal`) or a per-lease user whose every
+/// process may be killed. The
 /// window is the time between the snapshot and the signal.
 ///
 /// Whatever a tracker or a run record claims, the daemon never signals a group id of 1
@@ -564,35 +368,6 @@ mod tests {
             pgid,
             start,
             zombie: false,
-        }
-    }
-
-    /// Catches a system helper counted as the action's (it ignores SIGTERM: every lease
-    /// that attached a disk image would wait the whole grace and name
-    /// `diskimages-helper`), and a path that only looks like a system folder (a sibling
-    /// folder, a relative path, a lease's own directory) taken for one.
-    #[test]
-    fn a_binary_under_the_system_folders_is_the_systems() {
-        for system in [
-            "/System/Library/PrivateFrameworks/DiskImages.framework/Resources/diskimages-helper",
-            "/usr/libexec/xpcproxy",
-            "/usr/sbin/cfprefsd",
-        ] {
-            assert!(is_system_binary(system), "{system}");
-        }
-        for other in [
-            "",
-            "/usr/bin/tar",
-            "/usr/local/libexec/tool",
-            "/usr/libexec",
-            "/System",
-            "/Systems/x",
-            "/usr/sbinx/tool",
-            "usr/sbin/tool",
-            "/private/var/folders/x/System/tool",
-            "/private/var/slot/System/tool",
-        ] {
-            assert!(!is_system_binary(other), "{other}");
         }
     }
 
@@ -767,26 +542,6 @@ mod tests {
         assert_eq!(join_args(b"a\xffb\0"), "a\u{fffd}b");
     }
 
-    /// Catches: the path's NUL padding read as arguments, more arguments than the count
-    /// (the environment follows them), the name taken from the wrong end of the path,
-    /// and a block too short for its count read anyway.
-    #[test]
-    fn a_procargs_block_gives_the_name_and_the_counted_arguments() {
-        let mut block = 2_u32.to_ne_bytes().to_vec();
-        block.extend_from_slice(b"/usr/bin/foo\0\0\0foo\0bar baz\0HOME=/x\0");
-        assert_eq!(
-            parse_procargs2(&block),
-            Some(("foo".to_owned(), "foo bar baz".to_owned()))
-        );
-        assert_eq!(parse_procargs2(&[1, 0]), None);
-        let mut bare = 0_u32.to_ne_bytes().to_vec();
-        bare.extend_from_slice(b"/bin/x");
-        assert_eq!(
-            parse_procargs2(&bare),
-            Some(("x".to_owned(), String::new()))
-        );
-    }
-
     /// Catches: a command read of the wrong process, one that is empty for a live
     /// process, and one invented for a pid that does not exist.
     #[test]
@@ -830,7 +585,7 @@ mod tests {
         // SAFETY: getppid takes nothing and cannot fail.
         assert_eq!(mine.ppid, unsafe { libc::getppid() });
         assert!(!mine.zombie);
-        assert!(rusage(me).expect("footprint").footprint > 0);
-        assert_eq!(rusage(-5), None);
+        assert!(footprint(me).expect("footprint") > 0);
+        assert_eq!(footprint(-5), None);
     }
 }

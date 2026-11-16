@@ -9,8 +9,9 @@
 //!   [`Config::live`] on the store's clock. The workers' fence counts the store's silence too
 //!   ([`Share::renewed`]): a process that has not renewed for the fence time stops acting
 //!   before its row can expire.
-//! - Its workers are its own (`js:<group>.<instance>-<n>`, [`Config::worker_name`]), each
-//!   with a row written before the farm hears of it ([`Share::open`]).
+//! - Its workers are its own (`js:<group>.<instance>-<n>`, and `js-mac:<group>.<instance>-<n>`
+//!   for the Macs, [`Config::worker_of`]), each with a row written before the farm hears of
+//!   it ([`Share::open`]).
 //! - A job's row is written before its submit ([`HostWorker::write_row`]) and deleted once the
 //!   farm acknowledged its result, or once nothing is owed for the lease any more
 //!   ([`HostWorker::flush_rows`]).
@@ -26,7 +27,7 @@
 //!
 //! [`Ownership::Single`]: super::config::Ownership::Single
 //! [`Config::live`]: super::Config::live
-//! [`Config::worker_name`]: super::Config::worker_name
+//! [`Config::worker_of`]: super::Config::worker_of
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -37,6 +38,7 @@ use kbf_types::LeaseId;
 use tokio::time::Instant;
 
 use crate::executor::host::HostWorker;
+use crate::executor::mac::{MAC_ARCH, WorkerOs};
 use crate::executor::rows::{
     ExecRows, Held, JobRow, Live, Liveness, RowsError, Shape, WorkerEntry, WorkerRow,
 };
@@ -127,24 +129,30 @@ impl Share {
         }
     }
 
-    /// Opens the virtual workers this process does not have yet, in order: each one's row is
+    /// Opens the virtual workers this process does not have yet, in the order the farm sees
+    /// them without shared ownership (the Linux ones, then the Macs'): each one's row is
     /// written before the farm hears of it. Nothing is opened before the liveness row is
     /// written, and a row the store does not take leaves the rest for a later pass.
     pub(super) fn open(&self, ctx: &Ctx<'_>, workers: &mut Vec<HostWorker>, now: Instant) {
         if self.live.is_none() {
             return;
         }
-        while workers.len() < ctx.cfg.hosts {
-            let n = workers.len();
-            let name = ctx.cfg.worker_name(n);
+        let linux = ctx.cfg.hosts;
+        let macs = ctx.cfg.mac.as_ref().map_or(0, |mac| mac.hosts);
+        while workers.len() < linux + macs {
+            let (os, n) = match workers.len() {
+                k if k < linux => (WorkerOs::Linux, k),
+                k => (WorkerOs::Mac, k - linux),
+            };
+            let name = ctx.cfg.worker_of(os, n);
             let row = WorkerRow {
                 owner_instance: self.instance.clone(),
                 farm_instance: HostWorker::farm_instance(ctx, &name, 0),
-                shape: shape_of(ctx.cfg),
+                shape: shape_of(ctx.cfg, os),
             };
             match self.rows.create_worker(&name, &row) {
                 Ok(held) => {
-                    let mut worker = HostWorker::start(ctx, n, now);
+                    let mut worker = HostWorker::start_of(ctx, os, n, now);
                     worker.own = Some(Own { held, row });
                     workers.push(worker);
                 }
@@ -189,13 +197,18 @@ impl Share {
     }
 }
 
-/// The shape a worker of `cfg` is registered with: kept in its row.
-fn shape_of(cfg: &Config) -> Shape {
+/// The shape a worker of `cfg` for `os` is registered with: kept in its row. A Mac has the
+/// shape of a Linux worker and the Macs' one architecture.
+fn shape_of(cfg: &Config, os: WorkerOs) -> Shape {
+    let arch = match os {
+        WorkerOs::Linux => cfg.arch.clone(),
+        WorkerOs::Mac => MAC_ARCH.to_owned(),
+    };
     Shape {
         cpu_millis: cfg.cpu_millis,
         memory_bytes: cfg.memory_bytes,
         slots: cfg.slots,
-        arch: cfg.arch.clone(),
+        arch,
     }
 }
 
