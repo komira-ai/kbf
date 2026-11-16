@@ -673,16 +673,6 @@ async fn a_finished_release_directory_is_never_cleared_by_another_fetch() {
     assert!(staging(dir.path(), "other").is_dir());
 }
 
-/// Asserts that every start draws its own instance id: 32 hex digits, never twice the same.
-/// Catches: two frontends of one host that share a download directory name.
-#[test]
-fn each_start_draws_its_own_instance_id() {
-    let (a, b) = (super::new_instance(), super::new_instance());
-    assert_eq!(a.len(), 32);
-    assert!(a.bytes().all(|c| c.is_ascii_hexdigit()), "{a}");
-    assert_ne!(a, b);
-}
-
 /// Asserts that placing a download over a release directory that holds the files keeps that
 /// directory and removes the download, and that a download that is not there to rename is
 /// refused naming the release path. Catches: a placement that replaces a finished release, and

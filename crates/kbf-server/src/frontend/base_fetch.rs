@@ -27,7 +27,6 @@
 //! one `SHA256SUMS` of the same release lists, over https from the release's own page: the same
 //! file an operator used to copy by hand.
 
-use std::hash::{BuildHasher, RandomState};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -97,7 +96,8 @@ pub(super) struct Cache {
     pub(super) keep: usize,
     /// `--executor-base-tree-timeout-secs`: each connect, response head and body stall.
     pub(super) timeout: Duration,
-    /// This process's id in the names of its download directories ([`new_instance`]).
+    /// This process's id in the names of its download directories: the executor's instance id,
+    /// drawn at every start.
     pub(super) instance: String,
 }
 
@@ -290,13 +290,6 @@ impl Cache {
             Err(stopped) => tracing::warn!(%stopped, "the base tree cache was not pruned"),
         }
     }
-}
-
-/// A new process's instance id: 128 random bits as 32 hex digits, from two hashers the standard
-/// library keys from the operating system's random source (as `kbf-daemon`'s instance id is).
-pub(super) fn new_instance() -> String {
-    let half = || RandomState::new().hash_one(std::process::id());
-    format!("{:016x}{:016x}", half(), half())
 }
 
 /// The error of a failed file operation on `path`.
