@@ -105,7 +105,7 @@ pub(super) fn entries_of(flattened: &[TreeEntry]) -> Vec<Entry> {
                 span: source.as_ref().map(|s| (Arc::clone(&s.key), s.offset)),
             },
             EntryKind::Symlink { target } => Kind::Symlink {
-                target: target.clone(),
+                target: target.to_string(),
             },
         };
         entries.push(Entry { path, kind });
@@ -152,10 +152,9 @@ impl TreeWriter {
             if let Kind::File {
                 sha256, size, span, ..
             } = &mut entry.kind
+                && let Some(Place::Packed { key, offset }) = places.get(&blob(sha256, *size))
             {
-                if let Some(Place::Packed { key, offset }) = places.get(&blob(sha256, *size)) {
-                    *span = Some((Arc::from(key.as_str()), *offset));
-                }
+                *span = Some((Arc::from(key.as_str()), *offset));
             }
         }
         let (key, bytes) = encode(&entries)?;

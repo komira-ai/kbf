@@ -934,3 +934,44 @@ fn the_mac_flags_become_the_pool_of_macs() {
 /// The macOS `kbf-task` bundle of a release, by its manifest digest.
 const BUNDLE: &str =
     "kbf-task@sha256:9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a";
+
+/// Asserts the default of `--executor-input-tree`: with no flag, with or without a put
+/// directory, the config's tree is `InputTree::Manifests`. Catches: a default that turns the
+/// tree list on.
+#[test]
+fn input_tree_defaults_to_manifests() {
+    for flags in [js_with(&[]), js_with(&PUT_DIR)] {
+        let config = flags.expect("flags").executor.js.expect("js-agent").config;
+        assert_eq!(config.input_tree, InputTree::Manifests);
+    }
+}
+
+/// Asserts that `--executor-input-tree provider` with a put directory becomes
+/// `InputTree::Provider` in the executor's config, and `manifests` named outright is the
+/// default. Catches: the flag parsed and then dropped before the executor's config.
+#[test]
+fn input_tree_provider_becomes_the_config() {
+    for (mode, want) in [
+        ("provider", InputTree::Provider),
+        ("manifests", InputTree::Manifests),
+    ] {
+        let tree = format!("--executor-input-tree={mode}");
+        let flags = js_with(&[PUT_DIR[0], PUT_DIR[1], &tree]).expect("flags");
+        let config = flags.executor.js.expect("js-agent").config;
+        assert_eq!(config.input_tree, want, "{mode}");
+    }
+}
+
+/// Asserts that a value other than `manifests` or `provider` is refused at parse naming the
+/// flag and both values. Catches: a mode clap lets through, taken for the default.
+#[test]
+fn an_unknown_input_tree_is_refused() {
+    for mode in ["--executor-input-tree=tree-list", "--executor-input-tree="] {
+        let why = refused(&[mode]);
+        assert!(why.contains("--executor-input-tree"), "{mode}: {why}");
+        assert!(
+            why.contains("manifests") && why.contains("provider"),
+            "{why}"
+        );
+    }
+}

@@ -75,11 +75,24 @@ fn base() -> BaseTree {
     .expect("a base")
 }
 
+/// [`base`] with every entry below its root listed, as a tree list needs it: it holds no
+/// directory, so no manifest is fetched.
+fn listed_base() -> BaseTree {
+    base()
+        .listed(|_| Err::<Vec<u8>, String>("no manifest below the root".to_owned()))
+        .expect("a listed base")
+}
+
 /// A rig in put-directory mode over `prepare`; the base tree published when `published`.
 fn rig_with(prepare: Arc<DirPrep>, published: bool) -> Rig {
+    rig_over(prepare, published.then(base))
+}
+
+/// A rig in put-directory mode over `prepare` with `base` published, when there is one.
+fn rig_over(prepare: Arc<DirPrep>, base: Option<BaseTree>) -> Rig {
     let slot = Arc::new(OnceLock::new());
-    if published {
-        slot.set(base()).expect("set once");
+    if let Some(base) = base {
+        slot.set(base).expect("set once");
     }
     let dirs = Arc::clone(&prepare);
     Rig::over(Prepared::new(), prepare, move |packs, backend| {
@@ -291,4 +304,124 @@ async fn a_pack_committed_in_the_dir_becomes_the_result() {
             "{bad}: {got:?}"
         );
     }
+}
+
+/// Asserts that a run minted with `InputTree::Provider` over a listed base tree parks a key
+/// that `Inputs::tree` hands out once: `cas/l/` and 64 lowercase hex digits, an object the store
+/// holds whose bytes parse as a tree list that names the base tree's symlink, `work/input` and
+/// `.kbf/action`, and whose key is the one tierstore names the list by. Catches: a provider run
+/// that parks a manifest digest, a key of a list that was never stored, and a list that leaves
+/// out the input root or the action.
+#[tokio::test]
+async fn a_provider_run_gets_the_key_of_a_stored_tree_list_once() {
+    let rig = rig_over(DirPrep::new(None, 7_200), Some(listed_base()));
+    let action = action_with_input(&rig, "input").await;
+    rig.front
+        .mint(lease(), &action, WALL, InputTree::Provider)
+        .await
+        .expect("a dir");
+
+    let key = rig.front.tree(lease()).await.expect("a tree");
+    let hex = key.strip_prefix("cas/l/").expect("a tree list's key");
+    assert!(
+        hex.len() == 64 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+        "{key}"
+    );
+    assert!(matches!(
+        rig.front.tree(lease()).await,
+        Err(InputsError::Unavailable(_))
+    ));
+
+    let object = ObjectKey::new(key.clone()).expect("a key");
+    let len = rig
+        .store
+        .len(&object)
+        .await
+        .expect("asked")
+        .expect("the store holds the list");
+    let bytes = rig
+        .store
+        .get_range(&object, ByteRange::new(0, len).expect("a range"))
+        .await
+        .expect("read");
+    // The tierstore tree-list API: adjust to the pinned crate.
+    let list = tierstore::tree_list::parse_tree_list(&bytes, &tierstore::TreeDigest::of(&bytes))
+        .expect("a tree list");
+    assert_eq!(tierstore::tree_list::tree_list_key(&bytes), key);
+    let paths: Vec<&str> = list.entries.iter().map(|e| e.path.as_str()).collect();
+    for want in [
+        "bin",
+        "work",
+        "work/input",
+        ".kbf",
+        ".kbf/action",
+        ".kbf/command",
+    ] {
+        assert!(paths.contains(&want), "{want} in {paths:?}");
+    }
+    let bin = list
+        .entries
+        .iter()
+        .find(|e| e.path == "bin")
+        .expect("the base tree's link");
+    assert!(
+        matches!(&bin.kind, tierstore::tree_list::ListKind::Symlink { target } if target == "usr/bin"),
+        "{bin:?}"
+    );
+}
+
+/// Asserts that over a base tree that is not listed a provider mint is `Unavailable` with the
+/// exact message that the base tree is not listed, parks nothing (the run has no tree), and
+/// that a manifests mint of the same run over the same base still works and parks a digest, not
+/// a list key. Catches: a provider run that falls back to manifests unannounced, a refusal
+/// that is the caller's instead of the farm's to retry, and a manifests run broken by an unlisted
+/// base.
+#[tokio::test]
+async fn a_provider_run_over_an_unlisted_base_is_unavailable_and_manifests_still_work() {
+    let rig = rig();
+    let action = action_with_input(&rig, "input").await;
+    let refused = rig
+        .front
+        .mint(lease(), &action, WALL, InputTree::Provider)
+        .await;
+    assert_eq!(
+        refused,
+        Err(MintError::Unavailable(
+            "no action tree: the kbf base tree is not listed: no tree list can be written"
+                .to_owned()
+        ))
+    );
+    assert!(matches!(
+        rig.front.tree(lease()).await,
+        Err(InputsError::Unavailable(_))
+    ));
+
+    rig.front
+        .mint(lease(), &action, WALL, InputTree::Manifests)
+        .await
+        .expect("a dir");
+    let tree = rig.front.tree(lease()).await.expect("a tree");
+    assert_eq!(tree.len(), 64, "{tree}");
+    assert!(!tree.starts_with("cas/l/"), "{tree}");
+}
+
+/// Asserts that a provider mint of a run whose input is a reserved name is refused as the
+/// caller's, as a manifests mint is, and parks nothing. Catches: the reserved-name check
+/// skipped on the tree-list path.
+#[tokio::test]
+async fn a_provider_run_with_a_reserved_input_name_is_refused() {
+    let rig = rig_over(DirPrep::new(None, 7_200), Some(listed_base()));
+    let reserved = action_with_input(&rig, ".kbf-out").await;
+    let refused = rig
+        .front
+        .mint(lease(), &reserved, WALL, InputTree::Provider)
+        .await;
+    assert!(
+        matches!(&refused, Err(MintError::Refused(why)) if why.contains(".kbf-out")),
+        "{refused:?}"
+    );
+    assert!(matches!(
+        rig.front.tree(lease()).await,
+        Err(InputsError::Unavailable(_))
+    ));
 }

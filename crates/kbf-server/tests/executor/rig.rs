@@ -15,8 +15,8 @@ use kbf_sched::Request;
 use kbf_server::Farm;
 use kbf_server::executor::rows::ExecRows;
 use kbf_server::executor::{
-    ActionFacts, Config, Deps, Executor, Ingest, Ingested, Inputs, InputsError, Metrics, MintError,
-    Ownership, PackKey, Presign, PresignError, PutDirRoots, ReadGrant, Secret, TaskOut,
+    ActionFacts, Config, Deps, Executor, Ingest, Ingested, InputTree, Inputs, InputsError, Metrics,
+    MintError, Ownership, PackKey, Presign, PresignError, PutDirRoots, ReadGrant, Secret, TaskOut,
     UntrustedLimits, build_id,
 };
 use kbf_state::fake::{Fake, Flaw};
@@ -209,6 +209,7 @@ impl Ingest for FakeIngest {
         lease: kbf_types::LeaseId,
         _action: &Digest,
         _wall: Duration,
+        _tree: InputTree,
     ) -> Result<PackKey, MintError> {
         match locked(&self.mint_fails).take() {
             Some(why) => Err(why),

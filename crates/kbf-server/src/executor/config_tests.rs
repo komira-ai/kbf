@@ -4,7 +4,9 @@ use kbf_sched::fence::{LEADER_LEASE_MARGIN, LEASE_GRACE, START_GRACE, START_VALI
 
 use js_proto::v1::ExecMode;
 
-use super::{Config, ConfigError, Delivery, HARD_CAP_PAD, Ownership, PRESIGN_LIMIT, TaskOut};
+use super::{
+    Config, ConfigError, Delivery, HARD_CAP_PAD, InputTree, Ownership, PRESIGN_LIMIT, TaskOut,
+};
 use crate::config::MAX_HEARTBEAT_INTERVAL_MS;
 use crate::executor::PutDirRoots;
 
@@ -644,3 +646,50 @@ fn a_pool_of_macs_is_checked_with_the_config() {
 /// The macOS `kbf-task` bundle of a release, by its manifest digest.
 const BUNDLE: &str =
     "kbf-task@sha256:9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a";
+
+/// Asserts the default of `--executor-input-tree`: `Config::new` and `InputTree::default()` are
+/// `Manifests`, and the default config is valid with either task-out mode. Catches: a default
+/// that turns the tree list on for every frontend that never asked for it.
+#[test]
+fn the_default_input_tree_is_manifests() {
+    assert_eq!(base().input_tree, InputTree::Manifests);
+    assert_eq!(InputTree::default(), InputTree::Manifests);
+    let put_dir = Config {
+        task_out: TaskOut::PutDir(PutDirRoots::new("/mnt/ts/put").expect("roots")),
+        ..base()
+    };
+    assert_eq!(put_dir.input_tree, InputTree::Manifests);
+    assert_eq!(put_dir.validate(), Ok(()));
+}
+
+/// Asserts that the provider with presigned task outputs is refused as
+/// `ConfigError::ProviderPresigned` with its exact message naming both flags, that the same
+/// config with a put directory validates, and that presigned outputs with the manifests still
+/// validate. Catches: a provider tree accepted where no job reads its root from a tree, and a
+/// refusal that does not say which flag to change.
+#[test]
+fn the_provider_input_tree_needs_put_dir_outputs() {
+    let presigned = Config {
+        task_out: TaskOut::Presigned,
+        input_tree: InputTree::Provider,
+        ..base()
+    };
+    assert_eq!(presigned.validate(), Err(ConfigError::ProviderPresigned));
+    assert_eq!(
+        ConfigError::ProviderPresigned.to_string(),
+        "--executor-input-tree provider needs --task-out-mode put-dir: only a put-directory \
+         job reads its root from a tree"
+    );
+    let put_dir = Config {
+        task_out: TaskOut::PutDir(PutDirRoots::new("/mnt/ts/put").expect("roots")),
+        input_tree: InputTree::Provider,
+        ..base()
+    };
+    assert_eq!(put_dir.validate(), Ok(()));
+    let manifests = Config {
+        task_out: TaskOut::Presigned,
+        input_tree: InputTree::Manifests,
+        ..base()
+    };
+    assert_eq!(manifests.validate(), Ok(()));
+}
