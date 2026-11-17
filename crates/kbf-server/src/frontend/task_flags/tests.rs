@@ -439,3 +439,93 @@ async fn the_directory_cache_dir_is_opened_with_the_preparer_and_a_bad_one_fails
     );
     assert!(!said.contains(SECRET), "{said}");
 }
+
+/// A store holding an Action whose input root is one Directory of one file, and the digests of
+/// the Action and of that Directory.
+async fn farm_with_a_tree() -> (Backend, kbf_types::Digest, kbf_types::Digest) {
+    let store: Arc<dyn Storage> = Arc::new(CacheStorage::new(
+        Arc::new(Cache::memory()),
+        SegmentsConfig::DEFAULT,
+    ));
+    let put = |message: Vec<u8>| {
+        let store = Arc::clone(&store);
+        async move { store.put(Bytes::from(message)).await.expect("stored") }
+    };
+    let command = reapi::Command {
+        arguments: vec!["true".to_owned()],
+        ..reapi::Command::default()
+    };
+    let command = put(command.encode_to_vec()).await;
+    let file = put(b"an input".to_vec()).await;
+    let root = reapi::Directory {
+        files: vec![reapi::FileNode {
+            name: "input".to_owned(),
+            digest: Some(kbf_front::digest_to_proto(&file)),
+            ..reapi::FileNode::default()
+        }],
+        ..reapi::Directory::default()
+    };
+    let root = put(root.encode_to_vec()).await;
+    let action = reapi::Action {
+        command_digest: Some(kbf_front::digest_to_proto(&command)),
+        input_root_digest: Some(kbf_front::digest_to_proto(&root)),
+        ..reapi::Action::default()
+    };
+    let action = put(action.encode_to_vec()).await;
+    (Backend::remote(store), action, root)
+}
+
+/// Asserts that the two cache flags, given on the command line, reach the preparation: a run
+/// prepared through the flags as parsed keeps its input root's Directory in the directory
+/// `--task-directory-cache-dir` names, and parsed flags naming a directory that cannot be made
+/// (a path under a regular file) fail the start naming that flag.
+#[tokio::test]
+async fn the_parsed_cache_flags_keep_the_directories_of_a_run_on_the_disk() {
+    use crate::executor::RunPrepare;
+
+    let dir = scratch_dir("task-directory-cache-parsed");
+    let secret = file(dir.path(), "task.secret", &format!("{SECRET}\n"), 0o600);
+    let cache = dir.path().join("directories");
+    let given = |cache: &Path| {
+        let args = [
+            format!("--task-secret-file={}", secret.display()),
+            "--task-out-root=/mnt/ts/put".to_owned(),
+            format!("--task-directory-cache-dir={}", cache.display()),
+            "--task-directory-cache-bytes=1048576".to_owned(),
+        ];
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        parsed(&args)
+            .expect("parses")
+            .put_dir
+            .expect("put-dir flags")
+    };
+    let flags = given(&cache);
+    assert_eq!(flags.directory_cache, Some((cache.clone(), 1 << 20)));
+    let (backend, action, root) = farm_with_a_tree().await;
+    let prep = flags.open(backend.clone()).expect("opened");
+    let now = UNIX_EPOCH + Duration::from_secs(1_790_000_040);
+    let run = RunPrepare::prepare_put_dir(&prep, LEASE, &action, now, Duration::from_secs(60))
+        .await
+        .expect("prepared");
+    assert_eq!(run.kept.directory_count(), 1);
+    let kept: Vec<String> = std::fs::read_dir(&cache)
+        .expect("the cache directory")
+        .map(|entry| {
+            entry
+                .expect("an entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    assert_eq!(kept, [format!("{}-{}", root.hash_hex(), root.size_bytes)]);
+
+    let plain = file(dir.path(), "plain", "not a directory", 0o600);
+    let error = given(&plain.join("directories"))
+        .open(backend)
+        .expect_err("refused");
+    assert!(
+        error.to_string().starts_with("--task-directory-cache-dir "),
+        "{error}"
+    );
+}

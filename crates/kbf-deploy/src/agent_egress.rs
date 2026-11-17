@@ -5,8 +5,9 @@
 //! A put-dir job commits its object into its put directory and reads its inputs from its
 //! mounted tree, so it reaches no address: the frontend's settings name none, and the verb
 //! prints the ceiling `--egress=allow-list` with no `--egress-allow` line. A destination is
-//! never added, and `open` is never printed. The frontend's `kbf.toml` is read so that a file
-//! that is not the frontend's is refused here rather than on an agent.
+//! never added, and `open` is never printed. The frontend's `kbf.toml` is read and parsed as
+//! TOML: a file that cannot be read, or is not TOML, is refused naming the file. Its keys are
+//! not read, so nothing else about the file is checked.
 //!
 //! It only reads the file and prints; it changes nothing. Exit 0 printed; 2 refused
 //! (`REFUSED: ...` on stderr, nothing on stdout).

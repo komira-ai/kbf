@@ -211,6 +211,20 @@ fn each_unsafe_setting_is_refused_by_name() {
             },
             ConfigError::Bounds,
         ),
+        (
+            Config {
+                prepare_limit: Duration::ZERO,
+                ..base()
+            },
+            ConfigError::Bounds,
+        ),
+        (
+            Config {
+                prepare_concurrency: 0,
+                ..base()
+            },
+            ConfigError::Bounds,
+        ),
     ];
     for (config, want) in rows {
         assert_eq!(config.validate(), Err(want.clone()), "{want}");
