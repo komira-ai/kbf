@@ -1,0 +1,83 @@
+# The source suite of a push to main, beside the pipeline and not a part of it.
+#
+# beta.yml (the whole nextest run with its slow tests, the Arm run, Postgres, S3 stores, the
+# mixed-version farm, the pinned jobscheduler release, macOS, the Linux packages) takes about an
+# hour. It is called here, as the job `beta`, and not from pipeline.yml: the release follows the
+# pipeline's success (release.yml), so a suite in the pipeline would hold every release back by
+# that hour. Here it never gates a release and is never gated by one: a push to main starts both
+# workflows at once, and a red job of this run does not stop the release of the commit.
+#
+# What a red suite does instead is keep the RELEASE-RED issue. `release-red` runs after `beta`
+# whatever its result, on main only (the one condition the workflow lint lets hold `issues:
+# write`), and `cargo xtask release-red` reads this run's jobs: it opens the one issue labelled
+# `main-red` when a job failed, adds a comment for each later red run, and comments and closes
+# the issue when a run is green. The xtask is built before any step holds the token, and the
+# step that keeps the issue is the last (tests/suites_workflow).
+#
+# Queueing. One run of this workflow per ref at a time, never cancelled by a push (a push that
+# arrives meanwhile waits in the group, and GitHub keeps only the newest waiting run), so a suite
+# that has started always reports.
+name: suites
+
+on:
+  push:
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: suites-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # beta.yml has no trigger of its own (`workflow_call` alone): a push to main runs it here and
+  # nowhere else. It is granted what its jobs ask for, `attestations: read` for the
+  # mixed-version job's `gh attestation verify`.
+  beta:
+    uses: ./.github/workflows/beta.yml
+    permissions:
+      contents: read
+      attestations: read
+
+  # Keeps the RELEASE-RED issue from the result of this run, red or green.
+  release-red:
+    needs: [beta]
+    if: ${{ always() && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      # Lists this run's jobs.
+      actions: read
+      # Reads the annotations of the first failing job (the issue's `Log` lines).
+      checks: read
+      # Opens, comments on and closes the one `main-red` issue.
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: cargo-cache
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
+      # Built before any step holds the token, so no build script runs beside it.
+      - run: cargo build -p xtask --locked
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+      - name: Keep the RELEASE-RED issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: cargo xtask release-red --repo "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID"

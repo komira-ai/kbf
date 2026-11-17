@@ -34,8 +34,8 @@ the nodes, which pull it. The deploy is itself a test (no build failed because a
 verdict (gamma verdict TBD, on a generic monitoring library) then comes from the operator's real usage over the metrics
 the gamma farm emits during a 24 hour **bake** (section 7); nothing produces that verdict today.
 
-**prod** is the existing attested-artifact release (tag, files, notes), cut from a push to `main` whose one pipeline run (`ci`, the `beta` source tests,
-`artifacts`, `artifacts-sign` and the `smoke` on those artifacts) succeeded, and gated on the checks of the files (sections 8.0 and 8.1); no verdict document gates it. **Rollback** is the updater walking back through the same mechanism it walked forward with: the
+**prod** is the existing attested-artifact release (tag, files, notes), cut from a push to `main` whose one pipeline run (`ci`, `artifacts`,
+`artifacts-sign` and the `smoke` on those artifacts) succeeded, and gated on the checks of the files (sections 8.0 and 8.1); no verdict document gates it. **Rollback** is the updater walking back through the same mechanism it walked forward with: the
 desired commit is set to the older release under a higher generation.
 
 ```
@@ -193,21 +193,25 @@ Two layers, because "on every merge" and "a merge must not wait an hour" pull ap
   `merge_group` build's output, then smoke's own build. Smoke is unattested and says so in its result document.
   `merge_group` runs repository code from the queue ref with no fork code, so the root-level helpers are acceptable there.
 - **Full, after the merge** (`push` to main): rolling update of every role under a running build,
-  kill-a-node, the Envoy swap, the all-in-one variant, N/N-1, on the attested bytes. It is part of the one
-  pipeline of section 8.0: `smoke.yml`, called after the sign call of `artifacts.yml` in the same run, reads the attested files from
-  that run's artifacts and needs no `workflow_run` for the order. Built today: the smoke job runs the `kbf` of the
+  kill-a-node, the Envoy swap, the all-in-one variant, N/N-1, on the attested bytes. The smoke is part of the one
+  pipeline of section 8.0: `smoke.yml`, called beside the sign call of `artifacts.yml` in the same run (it needs the build call, not the
+  sign call), reads the build call's files from that run's artifacts and needs no `workflow_run` for the order. The jobs of `beta.yml`
+  are not part of the pipeline: `suites.yml` calls `beta.yml` on every push to `main`, beside the pipeline, and a red beta never gates a
+  release. Built today: the smoke job runs the `kbf` of the
   linux-x86_64 tarball of that run (checked against `SHA256SUMS` and for the commit); the jobs of `beta.yml` test the
-  commit's source, build what they run and start beside `ci`; the scenarios that need the attested bytes are the later work named here. A red full run does not revert anything; it **blocks the
-  commit from being offered to gamma** (the offer needs its beta-result attestation) and opens an issue automatically.
+  commit's source and build what they run; the scenarios that need the attested bytes are the later work named here. A red full run does not revert anything and does not
+  hold the release back (the release follows the pipeline alone, and fixes go forward); it opens or updates one issue automatically: the one labelled `main-red`, titled
+  `RELEASE-RED: kbf <first failing job>` (`cargo xtask release-red`, run by the `release-red` job of `suites.yml`). A later red run adds a comment to it, and the next green run comments
+  `Fixed: ...` and closes it.
   A scenario becomes a required part of the full run on the day its blocking pull requests merge (section 4.5), not before,
   because a fail-closed gate on an absent metric is red by construction.
 
 Neither runs on `pull_request`: they start a farm with root-level helpers and attest results, and a pull request from a
 fork must not run either. The lint of section 2.1 enforces the absence.
 
-A pipeline that has started is never cancelled (section 8.0, beta included); the pushes that arrive meanwhile wait, and only
-the newest waiting one runs. A commit that never ran its beta has no result, which is "not run", never "passed". The offer
-takes the newest commit with a green beta, so skipped commits cost nothing.
+A pipeline that has started is never cancelled (section 8.0), and neither is a `suites` run; the pushes that arrive meanwhile wait, and only
+the newest waiting one runs. A commit that never ran its beta has no result, which is "not run", never "passed"; its code is
+tested by the next run, whose `Culprits` (the `main-red` issue) name every commit since the last green one.
 
 ### 4.2 Runner shape: does a whole farm fit on a hosted runner
 
@@ -553,18 +557,22 @@ fails its gate, never passes it, and a producer failure is never a pass.
 A push to `main` runs one pipeline, `pipeline.yml`:
 
 ```
- push to main -+-> ci ------------------------------------------+
-               +-> beta (source tests, beta.yml) ---------------+-> passed -> release
-               +-> artifacts (build) -> artifacts-sign -> smoke -+      (release.yml)
-               |                        (also needs ci)
+ push to main -+-> ci ---------------------------------------------+
+  (pipeline)   +-> artifacts (build) -+-> artifacts-sign (needs ci) +-> passed -> release
+               |                      +-> smoke ------------------- +      (release.yml)
                +-> watch (cancels the run when a job fails)
+
+ push to main --> suites: beta (beta.yml) -> release-red (the main-red issue)
 ```
+
+`suites.yml` is a second workflow of the same push. It calls `beta.yml` (the source tests, the farm scenarios, `native-macos`) and, after it, runs
+`release-red`. Nothing in it gates the release.
 
 - **Builds start with ci; signing waits for it.** `artifacts.yml` is called twice. `artifacts` (input `stage: build`) needs
   nothing, so the four builds (12 to 15 minutes each, plus the wait for a macOS runner) start with `ci` instead of after
   it, and signs nothing (its call is granted the signing scopes only because GitHub checks a called workflow's job permissions against its caller's grant statically, skipped jobs included; every job that signs is skipped in this call, which the pipeline lint requires). `artifacts-sign` (`stage: sign`) needs `ci` and `artifacts` and runs only the `attest-*`
   and `verify-*` jobs, which read the files the build call uploaded to the same run; a commit that fails `ci` is built but
-  never signed. The build call's files wait in the run's artifact store while the `beta` jobs run repository code, so
+  never signed. The build call's files wait in the run's artifact store while `smoke` and `ci` run repository code, so
   the build call's `sums-*` jobs output the SHA-256 of the `SHA256SUMS` they upload (`sums assemble --digest-output`), the
   pipeline passes those digests to `artifacts-sign`, and each `attest-*` job, before it signs anything, checks the sums it
   downloaded against its digest and every listed file against the sums (two `sha256sum --check --strict` commands under the
@@ -576,7 +584,7 @@ A push to `main` runs one pipeline, `pipeline.yml`:
   build and sums jobs run as before and the attest and verify jobs never do.
 - **Each check runs once.** `ci.yml`, `artifacts.yml`, `beta.yml` and `smoke.yml` have a `workflow_call` trigger and no `push`
   trigger of their own. `ci.yml` and `artifacts.yml` keep `pull_request` and `merge_group`, so the pull-request gate and the
-  merge queue are unchanged; `beta.yml` and `smoke.yml` have `workflow_call` alone (they never ran for a pull request). In a called workflow
+  merge queue are unchanged; `beta.yml` and `smoke.yml` have `workflow_call` alone (they never ran for a pull request); `beta.yml` is called by `suites.yml`, the others by `pipeline.yml`. In a called workflow
   `github.event_name` and `github.ref` are the caller's, so the jobs that attest still read as a push to `main`.
 - **The pull request checks the static target.** The release builds `kbf-task` for `x86_64-unknown-linux-musl` and
   `aarch64-unknown-linux-musl` (`artifacts.yml`), where libc's type aliases differ from glibc's (`libc::Ioctl` is `c_int`, not
@@ -584,16 +592,19 @@ A push to `main` runs one pipeline, `pipeline.yml`:
   the actions cache or the pinned mirrors through `cargo xtask debs`, never `apt-get`) and the musl target, as `artifacts.yml` does, and runs
   `cargo check --locked --target x86_64-unknown-linux-musl -p kbf-task --bin kbf-task`, so a glibc-only type is red on the pull
   request and not on the release build after the merge. `kbf-task` is the only binary the release builds for a musl target.
-- **Smoke tests the files that will be released.** `smoke` runs after `artifacts-sign` in the same run and downloads that run's
+- **Smoke tests the files that will be released.** `smoke` needs `artifacts` (the build call), so it runs beside `artifacts-sign` in the same run, and downloads that run's
   `assets-*` and `sha256sums` artifacts (no run id), checks them with `verify-assets sums`, checks the tarball's `kbf` with `build-commit check-asset` (this commit, a
   release build), and the smoke farm runs the `kbf` out of the linux-x86_64 tarball. The release then publishes those same files (`release.yml` downloads them from the same
-  pipeline run and checks them again). Only the smoke reads the run's artifacts, so only it waits for `artifacts-sign`; every job of
-  `beta.yml` tests the commit's source and builds what it runs, so it starts beside `ci` (the suite is the longest part
-  of the pipeline, about an hour, and no longer waits behind two stages that it does not read). The lint refuses a
+  pipeline run and checks them again). Only the smoke reads the run's artifacts, so it waits for the build and not for the signing; every job of
+  `beta.yml` tests the commit's source and builds what it runs, so it is not part of the pipeline at all: `suites.yml` calls it on every push to `main`, beside the
+  pipeline, and the release does not wait for it (the suite is the longest part of a push's checks, about an hour). The lint refuses a
   `download-artifact` in `beta.yml`.
+- **A red beta opens an issue and gates nothing.** The `release-red` job of `suites.yml` runs after `beta` (always, on `main`) and runs `cargo xtask release-red`,
+  with a token that can write issues, built before the step that holds it. It keeps one open issue labelled `main-red`, titled `RELEASE-RED: kbf <first failing job>`;
+  its body lines are `Run:`, `Head:`, `Last green:`, `Culprits:`, `Failing:` (one line per failing job, up to five) and `Log:` (up to two). A later red run adds a comment with the same lines;
+  a green run comments `Fixed: <workflow> is green at <sha> (<run url>)` and closes the issue. The group of `suites` is `suites-<ref>` and never cancels a run.
 - **A red or cancelled stage stops the rest, and a red job stops the run.** `artifacts-sign` needs `ci` and `artifacts`, and `smoke` needs
-  `artifacts-sign`; none can be skipped, and the workflow has no `always()` or `continue-on-error`. `passed` needs every
-  stage and does nothing else, so the run succeeds, and the release follows, only when every job of every stage passed. GitHub
+  `artifacts`; none can be skipped, and the workflow has no `always()` or `continue-on-error`. `passed` needs `ci`, `artifacts`, `artifacts-sign` and `smoke` and does nothing else, so the run succeeds, and the release follows, only when every job of every stage passed. GitHub
   cancels the rest of a run for a failed job only inside a matrix, so `watch` (`cargo xtask pipeline-watch`) polls the
   run's jobs and cancels the run as soon as one has failed or timed out; the run then ends cancelled and starts no
   release, and the failed job keeps its own conclusion. It ends when `passed` has completed, ends with a notice when it
@@ -618,7 +629,7 @@ A push to `main` runs one pipeline, `pipeline.yml`:
   or failed run ships in the next release). Nothing that releases is a job of this run: it holds no tag, no
   release, no push to another repository, no environment and no secret. The only write scopes it grants are the signing
   scopes of the two `artifacts.yml` calls (only the sign call runs a job that uses them) and `actions: write` of the `watch` job (to cancel this run), both under the exact `if:`
-  of a push to `main` (the `beta` call grants `attestations: read`
+  of a push to `main` (the `beta` call, in `suites.yml`, grants `attestations: read`
   for its `mixed-version` and `js-real-service` jobs); a called workflow gets at most what the caller grants, and GitHub refuses the whole
   workflow at startup when one asks for more, so the workflow lint compares every job of each called workflow with its
   caller's grant. No stage call passes `secrets:`.
@@ -635,7 +646,7 @@ group, a newer pending one replacing an older). The pipeline is never cancelled,
 `release plan` measures from the highest release tag that is an ancestor of the commit (the newest `v*` release tag, not
 the tag of the commit being re-run), not from the one push: code from a push that was replaced while it waited, or that
 queued behind a running pipeline, is always in the next release, and a docs-only push after code changes still releases that
-code. With no release tag yet, the first release is everything. **Releases therefore happen at least once per pipeline
+code. A commit that the highest release tag is already after (a run that completes late, behind a newer release) is superseded: the plan is a green no-op with `code` false, so the newest release is the only one deployed and the older run does not go red. With no release tag yet, the first release is everything. **Releases therefore happen at least once per pipeline
 length**: as long as a pipeline can finish, the commit it finishes on releases everything since the last release. `code`
 and `site` are classified over that whole range; `pipeline` is the commit's own change (its diff over its first parent),
 because a range keeps a pipeline file until a release clears it, and a release that waits for no pipeline file in the range
@@ -652,18 +663,18 @@ The workflow lints hold all of it (`crates/kbf-integration-test/tests/pipeline_w
 `workflows`): the order of the stages and their `needs`, the triggers of the called workflows, the single call of each,
 the concurrency of the pipeline (never cancelled) and the absence of a write in it, the scopes granted to each stage, the shape of the one
 `workflow_run` trigger the repository allows (`workflows: [pipeline]`, `types: [completed]`, `branches: [main]`, in
-`release.yml` alone), the group of the release, and that beta reads the artifacts of its own run.
+`release.yml` alone), the group of the release, and that beta reads no artifacts of a run.
 
 ### 8.1 Prod: publish
 
 Prod is `release.yml`, extended. **[F]** today: started by the success of a `pipeline` run for a push to `main` (section 8.0);
-the `verify` job checks the sums and every attestation of that run's files; the `publish` job, the only one with `contents: write`, attaches the
+the `verify` job checks the sums and every attestation of that run's files (the per-file `gh attestation` checks run in parallel); the `publish` job, the only one with `contents: write`, attaches the
 already-built files and is idempotent, in the `release` environment. The tag check
 and the notes (items 1 to 3) are built. There is no hand-started dry run: a failed job is re-run from the run's page.
 
 The additions:
 
-1. **No verdict gates the release (a maintainers' ruling).** Release gating is the successful `pipeline` run (`ci`, `beta`, `artifacts`, `artifacts-sign` and `smoke`; `artifacts-sign` needs `ci` and `artifacts`) that started the release, and `release verify` in the `notes` job: the attestations and the release set, and the tag (annotated,
+1. **No verdict gates the release (a maintainers' ruling).** Release gating is the successful `pipeline` run (`ci`, `artifacts`, `artifacts-sign` and `smoke`; `artifacts-sign` needs `ci` and `artifacts`, `smoke` needs `artifacts`) that started the release, and `release verify` in the `notes` job: the attestations and the release set, and the tag (annotated,
    on main, naming this commit). This is a release-process check in GitHub; it is **not host-update trust** (hosts never read
    the tag, and verify only the artifact attestation). Nothing judges a verdict document: the annotated tag's message carries
    the **Beta record** `release verdict-write` wrote (commit, set hash, tag, the pipeline run), as an audit record. A tag with no
@@ -768,7 +779,8 @@ does not skip the check: the beta is red ("not run" is not "passed").
   same 90 days as the builds.
 - **Gamma halts, it does not push through.** A halted deploy leaves a state the run can name, resumable from the host's phase
   (T13), never started from the top. A failure of the verdict's producer (Planned, section 7) is never a pass.
-- **A broken main**: a red full beta means no later commit is offered until a later commit has a green one.
+- **A broken main**: a red full beta keeps the `main-red` issue open until a later run is green; it stops no release, so the
+  fix (or a revert) ships as soon as its own pipeline passes.
 - **Result documents.** One per stage, one shape (`stage`, `commit`, `set_hash`, `run_id`, `attempt`, `status`, `gates[]` with
   `name`, `measured`, `threshold`, `verdict`, `started`, `finished`), written RUNNING first and FINISHED on every exit, as kci
   does. Beta also posts a job summary (gate table, time per scenario, update timeline) and keeps a per-commit history file in

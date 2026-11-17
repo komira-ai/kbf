@@ -2,14 +2,15 @@
 //!
 //! It records that the gates of one commit passed: the commit, the set the files in `<dir>`
 //! hash to ([`set_hash_of`]), the tag the release is planned to get, and the one pipeline run
-//! whose three stages (`ci`, `artifacts`, `beta`) passed it, each as a green gate and the run
-//! named in the note. It judges nothing itself: the release runs only when that pipeline run
+//! whose stages passed it: `ci`, `artifacts` and `smoke` each as a green gate, and the run
+//! named in the note with its stages (`ci`, `artifacts`, `artifacts-sign`, `smoke`). The source
+//! suite (beta.yml) is not one: it runs in suites.yml and gates no release. It judges nothing itself: the release runs only when that pipeline run
 //! succeeded. The record is an audit record: `release verify` does not read it, and the
 //! release notes only show it.
 //!
 //! The stage is [`STAGE`], Beta. It records no bake and no load: a bake belongs to the
-//! gamma farm check, which is not a stage of this record. The beta smoke ran the attested
-//! `kbf` of the run's own files; the note says so.
+//! gamma farm check, which is not a stage of this record. The smoke ran the `kbf` of the
+//! run's own files, beside their signing; the note says so.
 
 use std::path::PathBuf;
 
@@ -41,7 +42,7 @@ pub struct WriteArgs {
     /// The attempt of this run (on Actions, `GITHUB_RUN_ATTEMPT`).
     #[arg(long, default_value_t = 1)]
     pub attempt: u32,
-    /// The pipeline run (ci, artifacts, beta) that passed for the commit.
+    /// The pipeline run (ci, artifacts, artifacts-sign, smoke) that passed for the commit.
     #[arg(long)]
     pub pipeline_run: u64,
     /// What makes the release not reversible, one line (repeat for more).
@@ -89,14 +90,14 @@ pub fn build(a: &WriteArgs, now: u64) -> Result<ResultDoc, Error> {
     );
     doc.gates = vec![
         green_gate("ci", at),
-        green_gate("beta", at),
         green_gate("artifacts", at),
+        green_gate("smoke", at),
     ];
     doc.status = doc.status_from_gates();
     doc.finished = Some(at);
     doc.tag = Some(a.tag.clone());
     doc.note = Some(format!(
-        "gate run: pipeline {} (ci, artifacts, beta); beta smoke on the attested kbf",
+        "gate run: pipeline {} (ci, artifacts, artifacts-sign, smoke); smoke on the run's own kbf",
         a.pipeline_run
     ));
     doc.not_reversible = a.not_reversible.clone();

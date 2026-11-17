@@ -323,12 +323,11 @@ fn a_bumped_base_does_not_reuse_the_old_base_tag() {
 }
 
 #[test]
-fn a_commit_behind_or_beside_the_highest_tag_is_superseded() {
-    // Catches: the ancestor check accepting `behind` (the commit is an ancestor of a
-    // newer release: an old run), `diverged`, or a compare GitHub cannot answer.
+fn a_commit_beside_the_highest_tag_or_one_github_cannot_compare_is_refused() {
+    // Catches: the ancestor check accepting `diverged`, or a compare GitHub cannot answer.
     let fx = fx("superseded", "0.0\n");
     let sha = fx.commit(&[("src/a.rs", Some("a"))]);
-    for status in ["behind", "diverged", "weird"] {
+    for status in ["diverged", "weird"] {
         fx.github(&["v0.0.4"], &[], &[("v0.0.4", &sha, status)]);
         let (code, out, err) = fx.plan(&sha, &[]);
         assert_eq!(code, Some(1), "{status}: {out}");
@@ -345,6 +344,67 @@ fn a_commit_behind_or_beside_the_highest_tag_is_superseded() {
     let (code, _, err) = fx.plan(&sha, &[]);
     assert_eq!(code, Some(1));
     assert!(err.contains("compare says nothing"), "{err}");
+}
+
+#[test]
+fn a_commit_behind_the_highest_tag_is_a_green_no_op() {
+    // Catches: an older run that finished late going red (or releasing): a commit the
+    // highest tag is a descendant of plans code=false, site=false, pipeline=false, with the
+    // exact lines in the output file and a line naming the superseding tag.
+    let fx = fx("behind", "0.0\n");
+    let sha = fx.commit(&[("crates/a/src/lib.rs", Some("a"))]);
+    fx.github(&["v0.0.4", "v0.0.2"], &[], &[("v0.0.4", &sha, "behind")]);
+    let file = fx.root.join("github-output");
+    std::fs::write(&file, "earlier=line\n").expect("output");
+    let (code, out, err) = fx.plan(&sha, &["--output", file.to_str().expect("utf-8")]);
+    assert_eq!(code, Some(0), "{err}");
+    let keys = "version=0.0.4\ntag=v0.0.4\nreused=false\ncode=false\nsite=false\npipeline=false\n";
+    assert_eq!(
+        out,
+        format!(
+            "superseded: {sha} is behind the release v0.0.4: nothing is released for it\n{keys}"
+        )
+    );
+    assert_eq!(
+        std::fs::read_to_string(&file).expect("output"),
+        format!("earlier=line\n{keys}")
+    );
+    // Catches: a superseded plan that needs `--output`: without it the same lines are
+    // printed and the run is still green.
+    let (code, alone, err) = fx.plan(&sha, &[]);
+    assert_eq!(code, Some(0), "{err}");
+    assert_eq!(alone, out);
+}
+
+#[test]
+fn a_commit_behind_a_release_of_a_higher_base_is_a_green_no_op_too() {
+    // Catches: a late run from before a VERSION bump refused by the base rule (VERSION 0.0
+    // below the release 0.1.2) instead of planned as nothing: Rule S is decided first.
+    let fx = fx("behind-bump", "0.0\n");
+    let sha = fx.commit(&[("crates/a/src/lib.rs", Some("a"))]);
+    fx.github(&["v0.1.2", "v0.0.4"], &[], &[("v0.1.2", &sha, "behind")]);
+    let (code, out, err) = fx.plan(&sha, &[]);
+    assert_eq!(code, Some(0), "{err}");
+    assert_eq!(
+        out,
+        format!(
+            "superseded: {sha} is behind the release v0.1.2: nothing is released for it\n\
+             version=0.1.2\ntag=v0.1.2\nreused=false\ncode=false\nsite=false\npipeline=false\n"
+        )
+    );
+}
+
+#[test]
+fn a_superseded_plan_whose_output_cannot_be_written_fails_the_run() {
+    // Catches: a no-op plan that swallows a failed write of its outputs, which would leave
+    // the workflow's jobs reading nothing.
+    let fx = fx("behind-bad-output", "0.0\n");
+    let sha = fx.commit(&[("src/a.rs", Some("a"))]);
+    fx.github(&["v0.0.4"], &[], &[("v0.0.4", &sha, "behind")]);
+    let missing = fx.root.join("no-such-dir/out");
+    let (code, _, err) = fx.plan(&sha, &["--output", missing.to_str().expect("utf-8")]);
+    assert_eq!(code, Some(1));
+    assert!(err.contains("append to"), "{err}");
 }
 
 #[test]

@@ -675,10 +675,11 @@ fn the_release_is_built_by_plain_cargo_on_hosted_runners() {
         release: &read(".github/workflows/release.yml"),
         called: called(&root, &pipeline),
     };
-    assert!(
-        w.called.len() >= 3,
-        "the pipeline calls ci, beta and smoke: {:?}",
-        w.called.iter().map(|(p, _)| p).collect::<Vec<_>>()
+    let called: Vec<&str> = w.called.iter().map(|(p, _)| p.as_str()).collect();
+    assert_eq!(
+        called,
+        [".github/workflows/ci.yml", ".github/workflows/smoke.yml"],
+        "the pipeline calls ci and smoke, besides artifacts.yml"
     );
     let found = problems(&w).expect("the workflows are read");
     assert!(found.is_empty(), "{}", found.join("\n"));

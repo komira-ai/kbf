@@ -57,6 +57,7 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::Error;
 use crate::base_tree;
@@ -573,6 +574,110 @@ impl Attestations<'_> {
     }
 }
 
+/// The most threads `check_lines` runs at once. Each check is a `gh attestation verify`
+/// round trip to GitHub, so the lines are checked a few at a time rather than one after
+/// the other, without hammering the API.
+const VERIFY_WORKERS: usize = 8;
+
+/// The checks of every line of the sums: the lines to print, in the order of the sums. The
+/// first line is checked alone, so its `gh` fetches and caches the trusted metadata the
+/// others then read (concurrent first calls would race to write it); the rest run on at
+/// most `VERIFY_WORKERS` threads. A failure is the error of the first failing line in sums
+/// order, whichever check finished first.
+fn check_lines(
+    dir: &Path,
+    lines: &[Line],
+    a: &Attestations,
+    workflow: &str,
+) -> Result<Vec<String>, Error> {
+    let (first, rest) = lines.split_at(lines.len().min(1));
+    let mut printed = first
+        .iter()
+        .map(|l| check_line(dir, lines, l, a, workflow))
+        .collect::<Result<Vec<String>, Error>>()?;
+    let others = in_order(rest.len(), VERIFY_WORKERS, |at| {
+        check_line(dir, lines, &rest[at], a, workflow)
+    });
+    printed.extend(others.into_iter().collect::<Result<Vec<String>, Error>>()?);
+    Ok(printed)
+}
+
+/// `f(0)` to `f(count - 1)` on at most `workers` threads: the results in that order,
+/// whatever order the calls finish in. A panic of `f` is raised again here.
+fn in_order<T: Send>(count: usize, workers: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
+    let next = AtomicUsize::new(0);
+    let (sent, received) = std::sync::mpsc::channel();
+    // The scope joins every worker before it returns, and re-raises a worker's panic.
+    std::thread::scope(|scope| {
+        for _ in 0..workers.min(count) {
+            let (sent, next, f) = (sent.clone(), &next, &f);
+            scope.spawn(move || {
+                let mut at = next.fetch_add(1, Ordering::Relaxed);
+                while at < count {
+                    // The receiver outlives the scope, so the send cannot fail.
+                    let _ = sent.send((at, f(at)));
+                    at = next.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+        }
+    });
+    drop(sent);
+    let mut results: Vec<(usize, T)> = received.into_iter().collect();
+    results.sort_by_key(|(at, _)| *at);
+    results.into_iter().map(|(_, result)| result).collect()
+}
+
+/// The checks of one line of the sums, in order, and the line to print for it.
+fn check_line(
+    dir: &Path,
+    lines: &[Line],
+    l: &Line,
+    a: &Attestations,
+    workflow: &str,
+) -> Result<String, Error> {
+    let file = dir.join(&l.name);
+    if l.name.ends_with(".tar.gz") {
+        a.require(&file, workflow, None)?;
+        a.require(&file, workflow, Some(SBOM_PREDICATE))?;
+        a.require_bundle(dir, &l.name, workflow)?;
+        Ok(format!("verified: {} (provenance, SBOM, bundle)", l.name))
+    } else if bundles::is_package(&l.name) {
+        // A package has build provenance and its own bundle, and no SBOM attestation
+        // (docs/artifacts.md): what it holds is the tarball's binary, which has one. The
+        // exception is an image the release lists an SBOM of (the task image): the attest
+        // job signs an SBOM attestation with the image as its subject, so one is required
+        // exactly when the sums list that SBOM (`verify-assets sums` holds the listing to
+        // the image: the previous release, which has none, is read as it was made).
+        a.require(&file, workflow, None)?;
+        let sbom = pkg_image_asset::sbom_of(&l.name)
+            .is_some_and(|sbom| lines.iter().any(|m| m.name == sbom));
+        if sbom {
+            a.require(&file, workflow, Some(SBOM_PREDICATE))?;
+        }
+        a.require_bundle(dir, &l.name, workflow)?;
+        let kinds = if sbom {
+            "provenance, SBOM, bundle"
+        } else {
+            "provenance, bundle"
+        };
+        Ok(format!("verified: {} ({kinds})", l.name))
+    } else if l.name.ends_with(".cdx.json")
+        || l.name.ends_with(version_facts::SUFFIX)
+        || l.name.ends_with(pkg_image_asset::FACTS_SUFFIX)
+        || base_tree::is_bundle(&l.name)
+    {
+        // An SBOM, the version facts of a `kbf`, the facts of an image and a base tree bundle
+        // have build provenance only.
+        a.require(&file, workflow, None)?;
+        Ok(format!("verified: {} (provenance)", l.name))
+    } else {
+        Err(Error::Failed(format!(
+            "{SUMS} lists {}, neither a tarball, a package, an SBOM, facts nor a base tree bundle",
+            l.name
+        )))
+    }
+}
+
 /// The `verify-assets attestations` verb: the lines to print.
 pub fn verify_attestations(dir: &Path, a: &Attestations) -> Result<Vec<String>, Error> {
     let workflow = a
@@ -604,50 +709,7 @@ pub fn verify_attestations(dir: &Path, a: &Attestations) -> Result<Vec<String>, 
     if !unpaired.is_empty() {
         return Err(Error::Refused(unpaired));
     }
-    let mut printed = Vec::new();
-    for l in &lines {
-        let file = dir.join(&l.name);
-        if l.name.ends_with(".tar.gz") {
-            a.require(&file, workflow, None)?;
-            a.require(&file, workflow, Some(SBOM_PREDICATE))?;
-            a.require_bundle(dir, &l.name, workflow)?;
-            printed.push(format!("verified: {} (provenance, SBOM, bundle)", l.name));
-        } else if bundles::is_package(&l.name) {
-            // A package has build provenance and its own bundle, and no SBOM attestation
-            // (docs/artifacts.md): what it holds is the tarball's binary, which has one. The
-            // exception is an image the release lists an SBOM of (the task image): the attest
-            // job signs an SBOM attestation with the image as its subject, so one is required
-            // exactly when the sums list that SBOM (`verify-assets sums` holds the listing to
-            // the image: the previous release, which has none, is read as it was made).
-            a.require(&file, workflow, None)?;
-            let sbom = pkg_image_asset::sbom_of(&l.name)
-                .is_some_and(|sbom| lines.iter().any(|m| m.name == sbom));
-            if sbom {
-                a.require(&file, workflow, Some(SBOM_PREDICATE))?;
-            }
-            a.require_bundle(dir, &l.name, workflow)?;
-            let kinds = if sbom {
-                "provenance, SBOM, bundle"
-            } else {
-                "provenance, bundle"
-            };
-            printed.push(format!("verified: {} ({kinds})", l.name));
-        } else if l.name.ends_with(".cdx.json")
-            || l.name.ends_with(version_facts::SUFFIX)
-            || l.name.ends_with(pkg_image_asset::FACTS_SUFFIX)
-            || base_tree::is_bundle(&l.name)
-        {
-            // An SBOM, the version facts of a `kbf`, the facts of an image and a base tree bundle
-            // have build provenance only.
-            a.require(&file, workflow, None)?;
-            printed.push(format!("verified: {} (provenance)", l.name));
-        } else {
-            return Err(Error::Failed(format!(
-                "{SUMS} lists {}, neither a tarball, a package, an SBOM, facts nor a base tree bundle",
-                l.name
-            )));
-        }
-    }
+    let mut printed = check_lines(dir, &lines, a, workflow)?;
     let (first, flipped) = flipped_tarball(dir, &lines)?;
     let other = format!("{}/{OTHER_WORKFLOW}", a.repo);
     if a.verifies(&dir.join(&first.name), &other, None)? {

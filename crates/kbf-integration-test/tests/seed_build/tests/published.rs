@@ -133,14 +133,14 @@ fn a_release_that_no_longer_needs_the_seed_jobs_is_refused() {
         ),
         (
             PASSED,
-            "needs: [ci, beta, artifacts, artifacts-sign, smoke]",
-            "needs: [ci, beta, artifacts-sign, smoke]",
+            "needs: [ci, artifacts, artifacts-sign, smoke]",
+            "needs: [ci, artifacts-sign, smoke]",
             "the job `passed` of pipeline.yml does not need `artifacts`",
         ),
         (
             PASSED,
-            "needs: [ci, beta, artifacts, artifacts-sign, smoke]",
-            "needs: [ci, beta, artifacts, smoke]",
+            "needs: [ci, artifacts, artifacts-sign, smoke]",
+            "needs: [ci, artifacts, smoke]",
             "the job `passed` of pipeline.yml does not need `artifacts-sign`",
         ),
         (

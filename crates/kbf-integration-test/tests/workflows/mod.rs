@@ -28,7 +28,9 @@
 //!   `refs/heads/main`, and only the successful pipeline run of a push to `main` of code (never of the pipeline itself) runs a job that can create a release
 //!   (or push to the repository), and `issues` ([`ISSUE_SCOPES`]), which may be `write`
 //!   only in a job whose `if:` is exactly [`ISSUES_MAIN_ONLY`] (the advisories workflow
-//!   keeps one issue; no pull request run holds a token that can write issues);
+//!   keeps one issue) or exactly [`ISSUES_RELEASE_RED`] (the `release-red` job of `suites.yml`,
+//!   which keeps the RELEASE-RED issue after the source suite, red or green); no pull request run
+//!   holds a token that can write issues;
 //! - a job calls a reusable workflow that is not one of this repository's linted
 //!   workflow files (its runners are not in a file this lint read), but for exactly the two
 //!   calls AGENTS.md's B10 names, each pinned by a full commit SHA with its version comment:
@@ -211,6 +213,11 @@ const RERUN_ONLY: &str = "${{ (github.event.workflow_run.conclusion == 'failure'
 /// whose ref is `main` (a scheduled run, a push to `main`, a manual run of `main`). A pull
 /// request run's ref is `refs/pull/<n>/merge`, never this.
 const ISSUES_MAIN_ONLY: &str = "${{ github.ref == 'refs/heads/main' }}";
+
+/// The one other `if:` spelling under which a job may hold [`ISSUE_SCOPES`] for writing: the
+/// `release-red` job of `suites.yml`, which runs whether or not the suite it needs passed
+/// (`always()`) and only for `main`'s ref. `always()` alone is refused, as is any other ref test.
+const ISSUES_RELEASE_RED: &str = "${{ always() && github.ref == 'refs/heads/main' }}";
 
 /// Triggers that run with the base repository's secrets and token on behalf of code
 /// or events from outside it. (`workflow_run` is the same, and is refused by
@@ -703,7 +710,7 @@ impl Lint<'_> {
     /// for [`SIGNING_SCOPES`] set to `write` in a job whose `if:` (`condition`) is
     /// exactly [`SIGNING_PUSH_ONLY`], [`RELEASE_SCOPES`] set to `write` in one whose
     /// `if:` is exactly [`RELEASE_PUSH_ONLY`], [`ISSUE_SCOPES`] in one whose `if:`
-    /// is exactly [`ISSUES_MAIN_ONLY`]. Scope names and levels are compared
+    /// is exactly [`ISSUES_MAIN_ONLY`] or [`ISSUES_RELEASE_RED`]. Scope names and levels are compared
     /// exactly, so another spelling is refused (the safe side).
     fn job_permissions(&mut self, key: &Node, p: &Node, condition: Option<&str>) {
         let Value::Map(scopes) = &p.value else {
@@ -729,7 +736,7 @@ impl Lint<'_> {
             } else if ACTIONS_SCOPES.contains(&name) {
                 &[SIGNING_PUSH_ONLY, RERUN_ONLY]
             } else if ISSUE_SCOPES.contains(&name) {
-                &[ISSUES_MAIN_ONLY]
+                &[ISSUES_MAIN_ONLY, ISSUES_RELEASE_RED]
             } else {
                 &[]
             };
@@ -916,5 +923,8 @@ fn is_sha_pinned(v: &str) -> bool {
     }
 }
 
+#[cfg(test)]
+#[path = "release_red_tests.rs"]
+mod release_red_tests;
 #[cfg(test)]
 mod tests;

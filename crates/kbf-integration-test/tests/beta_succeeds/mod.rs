@@ -1,7 +1,9 @@
 //! `beta.yml` succeeds only when every job did, and every job's success means its work
-//! passed. `cargo xtask release gates` trusts beta's run conclusion for that: `kbf-beta`
-//! exits 0 only on a PASSED verdict (`crates/kbf-harness/src/cli.rs`, `b0.rs`), so a run
-//! that concluded `success` is a PASSED beta by construction. Three things would break
+//! passed. beta runs as the job `beta` of `suites.yml`, beside the pipeline and never gating
+//! the release, and `cargo xtask release-red` (the job `release-red` of `suites.yml`) trusts that
+//! run's job conclusions to keep the RELEASE-RED issue: a run whose jobs concluded `success` is a
+//! passed beta by construction, as `kbf-beta` exits 0 only on a PASSED verdict
+//! (`crates/kbf-harness/src/cli.rs`, `b0.rs`). Three things would break
 //! that without a red step, and this lint refuses each in `beta.yml`:
 //!
 //! - any `continue-on-error`, at a job or a step: a failing job or step would leave the run green;
@@ -15,10 +17,11 @@
 
 use super::workflows;
 
-/// The workflow whose conclusion `release gates` reads.
+/// The workflow whose jobs `release-red` reads (called by `suites.yml`).
 const BETA: &str = ".github/workflows/beta.yml";
 
-/// The other workflow whose jobs the release gate reads: the beta smoke, which tests the run's artifacts.
+/// The other workflow held to the same rules: the smoke, called by the pipeline, whose success the
+/// release follows.
 const SMOKE: &str = ".github/workflows/smoke.yml";
 
 /// The only `if:` a step of `beta.yml` may carry.
@@ -61,7 +64,7 @@ fn problems(file: &str, text: &str) -> Result<Vec<String>, String> {
 #[test]
 fn a_green_beta_run_is_a_passed_beta() {
     // Catches: a `continue-on-error` or a skippable job added to beta.yml, which would let
-    // `release gates` judge a beta green that did not pass.
+    // `release-red` judge a beta green that did not pass.
     let root = super::repo_root();
     for file in [BETA, SMOKE] {
         let text = std::fs::read_to_string(root.join(file)).expect(file);

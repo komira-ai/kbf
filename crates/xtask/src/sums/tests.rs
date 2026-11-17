@@ -444,3 +444,43 @@ fn assemble_appends_the_digest_of_the_sums_it_wrote_to_the_output_file() {
     assemble(&dir, None, None, None).expect("assemble");
     assert!(!dir.join("output").exists());
 }
+
+#[test]
+fn in_order_returns_results_by_index_whatever_order_they_finish_in() {
+    // Catches: results collected in the order the calls finish (or the first error to
+    // finish reported) instead of the order of the sums. Item 0 cannot finish until item 1
+    // has, so with two workers item 1 always finishes first.
+    let (done_1, wait_1) = std::sync::mpsc::channel::<()>();
+    let wait_1 = std::sync::Mutex::new(wait_1);
+    let got = in_order(2, 2, |at| {
+        if at == 0 {
+            wait_1
+                .lock()
+                .expect("lock")
+                .recv()
+                .expect("item 1 finished");
+        } else {
+            done_1.send(()).expect("item 0 waits");
+        }
+        Err::<(), usize>(at)
+    });
+    assert_eq!(got, vec![Err(0), Err(1)]);
+    assert_eq!(got.into_iter().collect::<Result<Vec<()>, usize>>(), Err(0));
+}
+
+#[test]
+fn in_order_calls_every_index_once_with_more_items_than_workers() {
+    // Catches: an index skipped or called twice when the workers share the items, and a
+    // pool of more threads than items.
+    let calls = std::sync::Mutex::new(Vec::new());
+    let got = in_order(20, 3, |at| {
+        calls.lock().expect("lock").push(at);
+        at * 10
+    });
+    assert_eq!(got, (0..20).map(|at| at * 10).collect::<Vec<_>>());
+    let mut calls = calls.into_inner().expect("lock");
+    calls.sort_unstable();
+    assert_eq!(calls, (0..20).collect::<Vec<_>>());
+    assert_eq!(in_order(1, 8, |at| at), vec![0]);
+    assert_eq!(in_order(0, 8, |at| at), Vec::<usize>::new());
+}

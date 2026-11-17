@@ -119,6 +119,41 @@ pub enum Standing {
     Ahead(Version),
 }
 
+/// The refusal of a commit that is not at or after the highest release tag `tag`.
+fn not_after(tag: &str, sha: &str, status: &str) -> Error {
+    Error::Refused(vec![format!(
+        "superseded: the highest release tag is {tag} and {sha} is not at or after it \
+         (compare says {status}): a re-run of an older run must not tag, publish or deploy"
+    )])
+}
+
+/// A commit's place against the highest release tag, as `release plan` reads it.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Placed {
+    /// At or after the highest tag, or no tag exists.
+    Stands(Standing),
+    /// An ancestor of the highest tag (GitHub's compare says `behind`): a newer commit was
+    /// released already.
+    Behind(Version),
+}
+
+/// Rule S as `release plan` applies it: [`Placed::Behind`] is an answer, not a refusal
+/// (the run is an old one that finished late). A tag that diverged from `sha`, an
+/// unknown commit or a compare that fails still refuses.
+pub fn placed(gh: &Path, repo: &str, sha: &str) -> Result<Placed, Error> {
+    let Some(top) = tag_versions(gh, repo)?.into_iter().max() else {
+        return Ok(Placed::Stands(Standing::Untagged));
+    };
+    let tag = top.tag();
+    let compared = api(gh, &format!("repos/{repo}/compare/{tag}...{sha}"))?;
+    match compared.as_ref().and_then(|v| v["status"].as_str()) {
+        Some("identical") => Ok(Placed::Stands(Standing::Is(top))),
+        Some("ahead") => Ok(Placed::Stands(Standing::Ahead(top))),
+        Some("behind") => Ok(Placed::Behind(top)),
+        status => Err(not_after(&tag, sha, status.unwrap_or("nothing"))),
+    }
+}
+
 /// Rule S: the highest release tag of `repo` must name `sha` or an ancestor of it
 /// (GitHub's compare of `<tag>...<sha>` is `identical` or `ahead`). `behind` is no
 /// answer to accept: it means a newer release exists, which is what this guard is for.
@@ -127,18 +162,8 @@ pub enum Standing {
 /// Run it before the first write of `release tag`, `release publish` and a site
 /// deployment, so a re-run of an old run does nothing.
 pub fn superseded(gh: &Path, repo: &str, sha: &str) -> Result<Standing, Error> {
-    let Some(top) = tag_versions(gh, repo)?.into_iter().max() else {
-        return Ok(Standing::Untagged);
-    };
-    let tag = top.tag();
-    let compared = api(gh, &format!("repos/{repo}/compare/{tag}...{sha}"))?;
-    match compared.as_ref().and_then(|v| v["status"].as_str()) {
-        Some("identical") => Ok(Standing::Is(top)),
-        Some("ahead") => Ok(Standing::Ahead(top)),
-        status => Err(Error::Refused(vec![format!(
-            "superseded: the highest release tag is {tag} and {sha} is not at or after it \
-             (compare says {}): a re-run of an older run must not tag, publish or deploy",
-            status.unwrap_or("nothing")
-        )])),
+    match placed(gh, repo, sha)? {
+        Placed::Stands(standing) => Ok(standing),
+        Placed::Behind(top) => Err(not_after(&top.tag(), sha, "behind")),
     }
 }

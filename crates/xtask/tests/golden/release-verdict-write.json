@@ -25,7 +25,7 @@
       "finished": 5000
     },
     {
-      "name": "beta",
+      "name": "artifacts",
       "measured": 1.0,
       "threshold": {
         "at_least": 1.0
@@ -35,7 +35,7 @@
       "finished": 5000
     },
     {
-      "name": "artifacts",
+      "name": "smoke",
       "measured": 1.0,
       "threshold": {
         "at_least": 1.0
@@ -45,7 +45,7 @@
       "finished": 5000
     }
   ],
-  "note": "gate run: pipeline 111 (ci, artifacts, beta); beta smoke on the attested kbf",
+  "note": "gate run: pipeline 111 (ci, artifacts, artifacts-sign, smoke); smoke on the run's own kbf",
   "tag": "v0.3.7",
   "not_reversible": [
     "meta-log format"
