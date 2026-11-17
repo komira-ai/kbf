@@ -72,8 +72,9 @@ on the migrated schema.
 **Packs** (off by default; the `[packs]` table of `kbf.toml`). With
 `--pack-store-endpoint` (an `http://host:port` S3-compatible object store; given more than once,
 or as an array in `kbf.toml`, it is one store reached through each endpoint in turn, such as the
-tierstores of the farm's nodes in front of one bucket, and a request that could not connect is
-sent to the next),
+tierstores of the farm's nodes in front of one bucket; a request that could not connect is sent
+to the next, at most three endpoints for one request, and one that may have reached a store is
+never sent to another endpoint),
 `--pack-store-bucket` and `--pack-store-credentials-file` (JSON
 `{"access_key_id": "...", "secret_access_key": "..."}`, mode 0600 or 0400; the secret is never
 a flag), and `--pack-index`, the frontend keeps the blobs clients upload in packs: many blobs
@@ -598,7 +599,7 @@ What it does itself, with those three:
   level of Directories from the `directory` table of the state store (installer migration 4) with
   one query, and reads only the Directories without a row from their packs, recording them as
   rows; see `docs/design/metadata-in-postgres.md`. A database at migration 3 starts and every
-  walk reads the blobs.
+  walk reads the blobs, logging a warning for each failed read and record of the rows.
 - **Readiness.** `GET /readyz` and `grpc.health.v1` fail when the state store does not answer a
   read and when the job service does not answer a read of a job (`executor` in the failing
   list). Nothing probes the object store or any storage node: an object store that is down is

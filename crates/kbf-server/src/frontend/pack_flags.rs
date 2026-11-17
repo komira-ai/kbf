@@ -81,8 +81,9 @@ pub(super) fn args() -> [Arg; 10] {
                  bytes from its pack. Give it more than once (in kbf.toml, an array) for one \
                  store reached through several endpoints, such as the tierstores of the farm's \
                  nodes in front of one bucket: each request goes to the next endpoint in turn, \
-                 and one that could not connect is sent to the next (a request that may have \
-                 reached a store is not sent again); an endpoint given twice is refused. A blob \
+                 and one that could not connect is sent to the next, at most three endpoints \
+                 for one request (a request that may have reached a store is not sent to \
+                 another endpoint); an endpoint given twice is refused. A blob \
                  the index lacks is read from the storage nodes as before, and a blob over 64 \
                  MiB and any compressed blob still go to them. At start the frontend checks \
                  that the store refuses to replace an object and does not serve if it does \

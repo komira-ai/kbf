@@ -1,7 +1,7 @@
 # Tree metadata in Postgres; the frontend runs no tierstore
 
-Status: DECIDED (direction); steps 1 to 3 of section 6 are built by the change that adds this document, step 4 is an
-operator step. Claims are tagged **[code]** (true at this change, with the file or function), **[built here]** (added by
+Status: DECIDED (direction); step 1 of section 6 (the `directory` table, the walk over it and a pack store reached through
+several endpoints) is built by the change that adds this document; steps 2 to 4 are operator steps. Claims are tagged **[code]** (true at this change, with the file or function), **[built here]** (added by
 this change) or **[proposed]**.
 
 ## 1. The decision
@@ -28,8 +28,9 @@ graph engine.
 | Bytes: packs `cas/f/<writer>/<boot>/<seq>`, large blobs and tree lists `cas/l/<sha256>`, put dirs `cas/b/...` | the bucket behind the tierstores | objects | **[code]** |
 
 The blob location is not read from pack footers. A footer (`crates/kbf-segments/src/layout.rs`) lists each blob's
-digest, offset and CRC; kbf reads one only when it ingests a pack a task wrote (`ingest_put_dir`) and in the one-off
-adoption tool (`kbf-pack-adopt`). The read path is an index query and then a ranged GET of the pack
+digest, offset and CRC; kbf reads footers when it ingests a pack a task wrote (`ingest_put_dir`), in the one-off
+adoption tool (`kbf-pack-adopt`) and in the storage members' cache paths (`kbf-front/src/cache`: index rebuild, flush),
+never on the blob read path. The read path is an index query and then a ranged GET of the pack
 (`crates/kbf-pack/src/reader.rs`) **[code]**. So there are no footer reads on the hot path to delete.
 
 ### 2.1 The `directory` table
@@ -74,8 +75,8 @@ show the working set is in the hundreds of thousands of objects, not billions.
 
 ### 2.3 Garbage collection
 
-Nothing deletes a pack today: `PackIndex::dead_packs` has no caller outside tests, and only the `cas/b/` janitor
-deletes objects **[code]**. When pack collection is built **[proposed]**, it deletes `blob` rows untouched for the grace
+Nothing deletes a recorded pack today: `PackIndex::dead_packs` has no caller outside tests; the objects deleted are the
+key of a failed PUT attempt (`Packer::discard`) and orphans under `cas/b/` (the janitor) **[code]**. When pack collection is built **[proposed]**, it deletes `blob` rows untouched for the grace
 period, then the objects of packs no row points at (`dead_packs`), and deletes the `directory` row of a digest in the
 same transaction as that digest's `blob` row. A `directory` row whose blob was collected is still a correct answer for
 its digest, so the order of the two deletes is not a correctness question, only one of size. Until then `directory`
@@ -96,10 +97,11 @@ The rows never decide the answer. A failed read of the rows is logged and the le
 record is logged and the walk goes on; an index that keeps no rows answers every digest as having none. A row whose
 bytes do not decode is refused as its blob would be (`tests/stored/directories.rs`).
 
-The in-memory and NVMe cache of the prepare path (the frontend's local cache of Directories and trees) sits above
-this: cache, then rows, then blobs. Target **[proposed]**: a walk of a tree whose Directories all have rows costs one
-query per level on the local Postgres socket, so a tree 20 levels deep is about 20 round trips, tens of milliseconds,
-plus the existing FindMissing of the files (`require_held`), and no object store request for any Directory.
+The order today is rows, then blobs (with the packs' optional on-disk `ReadCache` beneath the blob read). A local
+in-memory or NVMe cache of Directories and trees on the frontend **[proposed]** would sit above the rows: cache, then
+rows, then blobs. Target **[proposed]**: a walk of a tree whose Directories all have rows costs one query per level on
+the local Postgres socket, so a tree 20 levels deep is about 20 round trips, tens of milliseconds, plus the existing
+FindMissing of the files (`require_held`), and no object store request for any Directory.
 
 No recursive CTE: one query per level keeps each query a plain primary-key lookup, lets the application apply the
 closure limits (`ClosureLimits`) before it reads the next level, and needs no per-entry rows (section 2.1).
@@ -113,11 +115,12 @@ blobs; moving it onto the rows is the same change at its one seam and is left ou
 PUT, and only after the store acknowledges it is the pack recorded in `pack` and `blob` (`Packer::commit`): a row never
 points at an object that is not stored. One logical step, two systems, ordered so each failure is safe:
 
-- the PUT fails: it is retried under a new key (3 attempts); the upload answers UNAVAILABLE and the client sends it
-  again;
-- the PUT succeeds and the record fails: it is retried; when every attempt fails the upload answers UNAVAILABLE and the
-  stored pack is an object no row points at, which collection removes (section 2.3);
-- a lost PUT reply on a retry answers "already exists" (create-only), which counts as stored.
+- the PUT fails: the key is deleted best effort and the pack is written again under a new key (3 attempts); when all
+  fail the upload answers UNAVAILABLE and the client sends it again. A PUT whose reply was lost is a failed attempt too:
+  its object stays under the old key, which no row names;
+- the PUT succeeds and the record fails: the record is retried for the same key; when every attempt fails the upload
+  answers UNAVAILABLE and the stored pack is an object no row points at;
+- objects no row points at stay until pack collection is built (section 2.3, **[proposed]**).
 
 **Directory rows** are written by the walk (section 3), not at upload: an uploaded blob does not say whether it is a
 Directory, and decoding every upload as one would record rows for blobs that are not Directories.
@@ -125,7 +128,8 @@ Directory, and decoding every upload as one would record rows for blobs that are
 **Through the farm's tierstores [built here].** `--pack-store-endpoint` may be given more than once (an array in
 `kbf.toml`). The frontend builds one S3 client over all of them (`S3Store::new_rotating` of `objstore-s3`): each request
 goes to the next endpoint in turn, and a request that could not connect (refused, no route, connect timeout) is sent to
-the next; a request that may have reached a store is never sent again by the client. The janitor of `cas/b/` uses the
+the next, trying at most three endpoints for one request (`ENDPOINT_ATTEMPTS`); a request that may have reached a store is
+never sent to another endpoint (a read may still be retried, `READ_RETRIES`). The janitor of `cas/b/` uses the
 same endpoints. This is safe because every node's tierstore writes through to the same bucket before it acknowledges a
 PUT, with no hot tier (`docs/design/storage-after-kbf-daemon.md` section 2, "Visibility"), so a pack written through one
 node is read through any other.
@@ -146,7 +150,7 @@ change, so the order is direct:
 
 1. **Release with migration 4 [built here].** `kbf boot-check` applies it before the frontend starts. It only adds a
    table, so the release before it runs on the new schema and never reads the table, and the new release on a database
-   still at migration 3 starts and walks from the blobs.
+   still at migration 3 starts and walks from the blobs, logging a warning for each failed read and record of the rows.
 2. **Prove the frontend host's tierstore holds nothing the bucket lacks [proposed, operator].** It has run without a
    hot tier since the hot tier was turned off; the objects that were only in its hot tier must be in the bucket before
    step 4. A listing of the hot tier compared with the bucket is the check.
