@@ -50,8 +50,8 @@ fn status(root: &Path) -> serde_json::Value {
 
 /// Catches a helper that cannot do one pass of its own: it writes a world-readable
 /// status.json and exits 0 (here as a non-root user, so with the installer's refusal); with an
-/// order it cannot carry out (this root has no installer.toml for the fetch), the pass ends and
-/// the refusal is the node's to read, not a crash.
+/// order it cannot carry out (the host's fetcher refuses it: no fetch user, or no installer.toml
+/// on this root), the pass ends and the refusal is the node's to read, not a crash.
 ///
 /// Catches: `fetcher::NotWired` left in `build_helper` (the refusal says there is no fetcher,
 /// not that the installer.toml is missing).
@@ -94,8 +94,10 @@ fn one_pass_reports_the_host_and_a_refused_order() {
         .mode();
     assert_eq!(mode & 0o777, 0o644, "the node reads it as the service user");
 
-    // An activation: the binary builds the host's fetcher, and this scratch root has no
-    // installer.toml, so the fetch is refused with that reason and the pass ends.
+    // An activation: the binary builds the host's fetcher, which refuses it and the pass ends.
+    // The fetcher looks the fetch user up in the host's account database first: a host
+    // with no `kbf-fetch` account refuses for that, and one with it goes on to this scratch
+    // root, which has no installer.toml. Either is the real fetcher's refusal.
     let record = kbf_update::OrderRecord {
         order_id: 2,
         epoch: 1,
@@ -131,10 +133,13 @@ fn one_pass_reports_the_host_and_a_refused_order() {
     );
     assert_eq!(status(&root)["state"], "refused");
     let why = status(&root)["refusal"].as_str().expect("text").to_owned();
+    let no_user = why.contains("the fetch user: there is no user \"kbf-fetch\"");
+    let no_config = why.contains("installer.toml is not trusted: it is missing");
     assert!(
-        why.contains("installer.toml is not trusted: it is missing"),
+        why.starts_with("order 2: ") && (no_user || no_config),
         "the order's own refusal now: {why}"
     );
+    assert!(!why.contains("no release fetcher wired in"), "{why}");
 }
 
 /// Catches the start check that does not count: with a release on trial, the unit's
