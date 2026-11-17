@@ -2,11 +2,11 @@
 //!
 //! On Linux the job's root file system is the action's tree, which the frontend wrote (`--tree`), and
 //! the job has no network. On a Mac the job runs natively in its `exec/` directory, the tree is
-//! mounted read-only beside it, and `--materialize-work` copies the tree's `work` into the
+//! mounted read-only beside it, and `--materialize-work` copies the tree's `kbf-work` into the
 //! directory first ([`materialize`]). The tool then
 //! 1. reads the Action and its Command from the tree, checking each against its digest
 //!    ([`message`], [`tree`]), and finds the input root there: nothing is fetched and no read
-//!    grant is held (in the Mac job the input root is a private copy of the tree's `work`);
+//!    grant is held (in the Mac job the input root is a private copy of the tree's `kbf-work`);
 //! 2. runs the Command there ([`run`]): its argv, environment and working directory, stdout and
 //!    stderr to files, under a deadline. The environment is the Command's own, preceded by `HOME`,
 //!    `TMPDIR`, `XDG_CACHE_HOME` and `CLANG_MODULE_CACHE_PATH`, which name fresh directories

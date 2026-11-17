@@ -136,11 +136,11 @@ async fn a_packed_file_is_listed_with_its_span_size_mode_and_hash() {
     let listing = list(&rig, &root).await.expect("a list");
     let got = read(&rig, &listing);
     assert_eq!(
-        got.get("work/a.c"),
+        got.get("kbf-work/a.c"),
         Some(&file_line("0644", 9, "cas/f/w/p0@17", &plain.hash_hex()))
     );
     assert_eq!(
-        got.get("work/run.sh"),
+        got.get("kbf-work/run.sh"),
         Some(&file_line("0755", 9, "cas/f/w/p0@40", &exec.hash_hex()))
     );
     assert_eq!(rig.farm.puts(), [listing.key().to_owned()]);
@@ -186,7 +186,7 @@ async fn a_whole_object_file_is_listed_at_its_key_and_not_written_again() {
     let listing = list(&rig, &root).await.expect("a list");
     let key = whole_key(&big.hash_hex());
     assert_eq!(
-        read(&rig, &listing).get("work/f0"),
+        read(&rig, &listing).get("kbf-work/f0"),
         Some(&file_line("0644", 14, &format!("{key}@0"), &big.hash_hex()))
     );
     assert_eq!(rig.farm.puts(), [listing.key().to_owned()]);
@@ -205,7 +205,7 @@ async fn an_unlocated_blob_is_written_whole_before_the_list_names_it() {
     assert_eq!(rig.farm.object(&key), Some(bytes));
     assert_eq!(rig.farm.puts(), [key.clone(), listing.key().to_owned()]);
     assert_eq!(
-        read(&rig, &listing).get("work/f0"),
+        read(&rig, &listing).get("kbf-work/f0"),
         Some(&file_line(
             "0644",
             blob.size_bytes,
@@ -225,7 +225,7 @@ async fn an_empty_file_has_size_zero_and_no_source() {
     let root = root_of(&rig, &[empty]).await;
     let listing = list(&rig, &root).await.expect("a list");
     assert_eq!(
-        read(&rig, &listing).get("work/f0"),
+        read(&rig, &listing).get("kbf-work/f0"),
         Some(&file_line("0644", 0, "-", "-"))
     );
     assert_eq!(rig.farm.puts(), [listing.key().to_owned()]);
@@ -247,9 +247,15 @@ async fn a_symlink_and_an_empty_subdirectory_are_listed_and_every_directory_is_0
         .await;
     let listing = list(&rig, &root).await.expect("a list");
     let got = read(&rig, &listing);
-    assert_eq!(got.get("work/l").map(String::as_str), Some("symlink a.c"));
-    assert_eq!(got.get("work/hollow").map(String::as_str), Some("dir 0755"));
-    assert!(!got.keys().any(|path| path.starts_with("work/hollow/")));
+    assert_eq!(
+        got.get("kbf-work/l").map(String::as_str),
+        Some("symlink a.c")
+    );
+    assert_eq!(
+        got.get("kbf-work/hollow").map(String::as_str),
+        Some("dir 0755")
+    );
+    assert!(!got.keys().any(|path| path.starts_with("kbf-work/hollow/")));
     let dirs: Vec<&str> = got
         .iter()
         .filter(|(_, text)| text.starts_with("dir "))
@@ -257,7 +263,7 @@ async fn a_symlink_and_an_empty_subdirectory_are_listed_and_every_directory_is_0
         .collect();
     assert_eq!(
         dirs,
-        [".kbf", ".kbf-tools", "usr", "work", "work/hollow"],
+        [".kbf", ".kbf-tools", "kbf-work", "kbf-work/hollow", "usr"],
         "every directory is listed"
     );
     assert!(
@@ -267,8 +273,8 @@ async fn a_symlink_and_an_empty_subdirectory_are_listed_and_every_directory_is_0
     );
 }
 
-/// Catches: an empty input root that lists entries below `work`, or drops the base, `work`
-/// or `.kbf`: the list is exactly the base's six entries, `work`, `.kbf`, `.kbf/action` and
+/// Catches: an empty input root that lists entries below `kbf-work`, or drops the base,
+/// `kbf-work` or `.kbf`: the list is exactly the base's six entries, `kbf-work`, `.kbf`, `.kbf/action` and
 /// `.kbf/command`.
 #[tokio::test]
 async fn an_empty_input_root_lists_work_with_nothing_below_it() {
@@ -278,12 +284,12 @@ async fn an_empty_input_root_lists_work_with_nothing_below_it() {
     let got = read(&rig, &listing);
     let mut expected: BTreeSet<String> = BASE_PATHS.iter().map(|p| (*p).to_owned()).collect();
     expected.extend(
-        ["work", ".kbf", ".kbf/action", ".kbf/command"]
+        ["kbf-work", ".kbf", ".kbf/action", ".kbf/command"]
             .iter()
             .map(|p| (*p).to_owned()),
     );
     assert_eq!(got.keys().cloned().collect::<BTreeSet<_>>(), expected);
-    assert_eq!(got.get("work").map(String::as_str), Some("dir 0755"));
+    assert_eq!(got.get("kbf-work").map(String::as_str), Some("dir 0755"));
 }
 
 /// Catches: the base tree's entries missing, at the wrong paths, or stripped of their source:
@@ -371,7 +377,7 @@ async fn a_directory_at_two_paths_is_listed_at_both() {
     let listing = list(&rig, &root).await.expect("a list");
     let got = read(&rig, &listing);
     let line = file_line("0644", 9, "cas/f/w/p1@0", &x.hash_hex());
-    for dir in ["work/a", "work/b"] {
+    for dir in ["kbf-work/a", "kbf-work/b"] {
         assert_eq!(got.get(dir).map(String::as_str), Some("dir 0755"), "{dir}");
         assert_eq!(got.get(&format!("{dir}/x.h")), Some(&line), "{dir}/x.h");
     }
@@ -593,7 +599,13 @@ async fn an_empty_file_beside_an_empty_directory_are_both_listed() {
         .await;
     let listing = list(&rig, &root).await.expect("a list");
     let got = read(&rig, &listing);
-    assert_eq!(got.get("work/blank"), Some(&file_line("0644", 0, "-", "-")));
-    assert_eq!(got.get("work/hollow").map(String::as_str), Some("dir 0755"));
-    assert!(!got.keys().any(|path| path.starts_with("work/hollow/")));
+    assert_eq!(
+        got.get("kbf-work/blank"),
+        Some(&file_line("0644", 0, "-", "-"))
+    );
+    assert_eq!(
+        got.get("kbf-work/hollow").map(String::as_str),
+        Some("dir 0755")
+    );
+    assert!(!got.keys().any(|path| path.starts_with("kbf-work/hollow/")));
 }

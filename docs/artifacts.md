@@ -734,7 +734,7 @@ release build, not a deployment):
 - a character device, a block device, a FIFO, and any other type of tar entry (a tar cannot hold a socket, and a type this reader does not know is
   refused, not skipped);
 - an extended attribute (a PAX record `SCHILY.xattr.*` or `LIBARCHIVE.xattr.*`);
-- a path at or below `/work`, `/.kbf`, `/.kbf-run` or `/.kbf-tools`, which each action tree and `kbf-task` make themselves;
+- a path at or below `/kbf-work`, `/work` (the input root of older action trees), `/.kbf`, `/.kbf-run` or `/.kbf-tools`, which each action tree and `kbf-task` make themselves;
 - a path that is not UTF-8 or has a `..`, a link (symbolic or hard) with no target or a target that is not UTF-8, and a
   hard link whose target has a `..` or is anything but a regular file the layers hold at that point (a symbolic link's
   target is kept as the image has it, absolute or with `..`: in a job the tree is the container's root, so it resolves

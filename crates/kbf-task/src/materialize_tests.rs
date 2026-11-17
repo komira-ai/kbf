@@ -24,12 +24,12 @@ struct Job {
     action: Digest,
 }
 
-/// Lays out the tree `.kbf/action`, `.kbf/command` and an empty `work` for `command`, beside an
+/// Lays out the tree `.kbf/action`, `.kbf/command` and an empty `kbf-work` for `command`, beside an
 /// empty job root and an empty put directory.
 fn job(name: &str, command: &reapi::Command) -> Job {
     let tree = scratch(&format!("mat-{name}-tree"));
     std::fs::create_dir_all(tree.join(".kbf")).expect(".kbf");
-    std::fs::create_dir(tree.join("work")).expect("work");
+    std::fs::create_dir(tree.join("kbf-work")).expect("kbf-work");
     let action = reapi::Action {
         command_digest: Some(digest::to_reapi(&sha256(&command.encode_to_vec()))),
         input_root_digest: Some(digest::to_reapi(&sha256(b"input root"))),
@@ -76,7 +76,7 @@ impl Job {
 
     /// Asserts that nothing was made in the job root and nothing was committed.
     fn assert_untouched(&self) {
-        assert!(!self.root.join("work").exists());
+        assert!(!self.root.join("kbf-work").exists());
         assert!(!self.root.join(RUN_DIR).exists());
         assert_eq!(std::fs::read_dir(&*self.put).expect("put").count(), 0);
     }
@@ -107,7 +107,7 @@ async fn the_tree_is_materialized_and_its_run_committed_with_the_copy_counted() 
         "happy",
         &command(&["cp", "link", "out.txt"], "", &["out.txt"]),
     );
-    let work = job.tree.join("work");
+    let work = job.tree.join("kbf-work");
     std::fs::create_dir_all(work.join("a/c")).expect("dirs");
     std::fs::write(work.join("a/b.txt"), b"B\n").expect("file");
     std::fs::set_permissions(work.join("a/b.txt"), std::fs::Permissions::from_mode(0o600))
@@ -133,7 +133,7 @@ async fn the_tree_is_materialized_and_its_run_committed_with_the_copy_counted() 
             ..InputStats::default()
         })
     );
-    let copy = job.root.join("work");
+    let copy = job.root.join("kbf-work");
     assert_eq!(std::fs::read(copy.join("a/b.txt")).expect("b"), b"B\n");
     assert!(copy.join("a/c").is_dir());
     assert_eq!(mode_of(&copy.join("a/b.txt")), 0o644);
@@ -159,9 +159,9 @@ async fn the_tree_is_materialized_and_its_run_committed_with_the_copy_counted() 
 #[tokio::test]
 async fn a_command_may_overwrite_an_input_without_touching_the_tree() {
     let job = job("private", &command(&["cp", "other", "data"], "", &["data"]));
-    let source = job.tree.join("work/data");
+    let source = job.tree.join("kbf-work/data");
     std::fs::write(&source, b"original\n").expect("data");
-    std::fs::write(job.tree.join("work/other"), b"changed\n").expect("other");
+    std::fs::write(job.tree.join("kbf-work/other"), b"changed\n").expect("other");
     std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o444)).expect("mode");
 
     let manifest = job.run().await.expect("task");
@@ -170,7 +170,7 @@ async fn a_command_may_overwrite_an_input_without_touching_the_tree() {
     assert_eq!(std::fs::read(&source).expect("source"), b"original\n");
     assert_eq!(mode_of(&source), 0o444);
     assert_eq!(
-        std::fs::read(job.root.join("work/data")).expect("copy"),
+        std::fs::read(job.root.join("kbf-work/data")).expect("copy"),
         b"changed\n"
     );
 }
@@ -180,7 +180,7 @@ async fn a_command_may_overwrite_an_input_without_touching_the_tree() {
 #[tokio::test]
 async fn a_tree_that_is_a_symlink_is_followed_but_nothing_under_it_is() {
     let job = job("mount", &command(&["true"], "", &[]));
-    std::os::unix::fs::symlink("/nonexistent", job.tree.join("work/dangling")).expect("link");
+    std::os::unix::fs::symlink("/nonexistent", job.tree.join("kbf-work/dangling")).expect("link");
     let mount = scratch("mat-mount-link");
     std::os::unix::fs::symlink(&*job.tree, mount.join("tree")).expect("mount");
 
@@ -190,7 +190,7 @@ async fn a_tree_that_is_a_symlink_is_followed_but_nothing_under_it_is() {
         .expect("task");
 
     assert!(
-        std::fs::symlink_metadata(job.root.join("work/dangling"))
+        std::fs::symlink_metadata(job.root.join("kbf-work/dangling"))
             .expect("link")
             .is_symlink()
     );
@@ -201,12 +201,12 @@ async fn a_tree_that_is_a_symlink_is_followed_but_nothing_under_it_is() {
 #[tokio::test]
 async fn an_existing_work_directory_is_refused_exit_10_and_nothing_runs() {
     let job = job("exists", &command(&["true"], "", &[]));
-    std::fs::create_dir(job.root.join("work")).expect("work");
+    std::fs::create_dir(job.root.join("kbf-work")).expect("work");
     let failure = job.refused(EXIT_FETCH).await;
     assert!(
         failure
             .to_string()
-            .contains(&job.root.join("work").display().to_string()),
+            .contains(&job.root.join("kbf-work").display().to_string()),
         "{failure}"
     );
     assert!(!job.root.join(RUN_DIR).exists());
@@ -218,8 +218,9 @@ async fn an_existing_work_directory_is_refused_exit_10_and_nothing_runs() {
 #[tokio::test]
 async fn a_socket_in_the_tree_is_refused_exit_10_naming_its_path() {
     let job = job("socket", &command(&["true"], "", &[]));
-    std::fs::create_dir(job.tree.join("work/d")).expect("d");
-    let _socket = std::os::unix::net::UnixListener::bind(job.tree.join("work/d/s")).expect("bind");
+    std::fs::create_dir(job.tree.join("kbf-work/d")).expect("d");
+    let _socket =
+        std::os::unix::net::UnixListener::bind(job.tree.join("kbf-work/d/s")).expect("bind");
     let failure = job.refused(EXIT_FETCH).await;
     assert_eq!(
         failure.to_string(),
@@ -235,7 +236,7 @@ async fn a_socket_in_the_tree_is_refused_exit_10_naming_its_path() {
 async fn an_unreadable_file_or_directory_in_the_tree_is_exit_10_naming_it() {
     for (name, is_dir) in [("file", false), ("dir", true)] {
         let job = job(&format!("unreadable-{name}"), &command(&["true"], "", &[]));
-        let path = job.tree.join("work/locked");
+        let path = job.tree.join("kbf-work/locked");
         if is_dir {
             std::fs::create_dir(&path).expect("dir");
         } else {
@@ -291,14 +292,14 @@ async fn a_refused_tree_is_exit_10_and_leaves_the_job_root_untouched() {
     missing.assert_untouched();
 
     let file = job("work-file", &sh);
-    std::fs::remove_dir(file.tree.join("work")).expect("remove");
-    std::fs::write(file.tree.join("work"), b"").expect("file");
+    std::fs::remove_dir(file.tree.join("kbf-work")).expect("remove");
+    std::fs::write(file.tree.join("kbf-work"), b"").expect("file");
     file.refused(EXIT_FETCH).await;
     file.assert_untouched();
 
     let link = job("work-link", &sh);
-    std::fs::remove_dir(link.tree.join("work")).expect("remove");
-    std::os::unix::fs::symlink(".kbf", link.tree.join("work")).expect("link");
+    std::fs::remove_dir(link.tree.join("kbf-work")).expect("remove");
+    std::os::unix::fs::symlink(".kbf", link.tree.join("kbf-work")).expect("link");
     link.refused(EXIT_FETCH).await;
     link.assert_untouched();
 
@@ -343,7 +344,7 @@ async fn a_bad_put_directory_or_lease_is_exit_14_before_anything_is_read() {
     cli.out_dir = Some(root.to_path_buf());
     cli.lease = "not/a/build".to_owned();
     assert_eq!(finish(&cli, tree, &root).await, ExitCode::from(EXIT_SETUP));
-    assert!(!root.join("work").exists());
+    assert!(!root.join("kbf-work").exists());
 }
 
 /// Proves the exit code of a run through `finish`: 0 when the object is committed, and 10 for a
@@ -366,7 +367,7 @@ async fn finish_exits_0_for_a_committed_run_and_10_for_an_unreadable_tree() {
         ExitCode::SUCCESS,
         "a second run in a fresh job root"
     );
-    std::fs::remove_dir_all(job.tree.join("work")).expect("remove");
+    std::fs::remove_dir_all(job.tree.join("kbf-work")).expect("remove");
     let again = scratch("mat-finish-again");
     assert_eq!(
         finish(&cli, &job.tree, &again).await,
@@ -432,4 +433,33 @@ fn the_mac_jobs_command_line_parses() {
     assert_eq!(cli.tree, None);
     assert_eq!(cli.out_dir(), Path::new(".kbf-out"));
     assert_eq!(cli.deadline_ms, 90_000);
+}
+
+/// Proves that a tree an older frontend wrote, its input root at `work` and no `kbf-work`, is
+/// copied into `<root>/work` and run there, and that nothing named `kbf-work` is made; and that a
+/// tree holding both names is copied from `kbf-work` alone.
+/// Catches: a Mac task that refuses the trees older frontends wrote, copies them under another
+/// name, or prefers the older name when both are there.
+#[tokio::test]
+async fn an_older_trees_work_is_copied_under_its_own_name_and_kbf_work_wins_over_it() {
+    let older = job("older-work", &command(&["cp", "data", "out"], "", &["out"]));
+    std::fs::remove_dir(older.tree.join("kbf-work")).expect("remove");
+    std::fs::create_dir(older.tree.join("work")).expect("work");
+    std::fs::write(older.tree.join("work/data"), b"older\n").expect("data");
+    let manifest = older.run().await.expect("task");
+    assert_eq!(manifest.output_files[0].digest, sha256(b"older\n"));
+    assert_eq!(
+        std::fs::read(older.root.join("work/out")).expect("out"),
+        b"older\n"
+    );
+    assert!(!older.root.join("kbf-work").exists());
+
+    let both = job("both-names", &command(&["cp", "data", "out"], "", &["out"]));
+    std::fs::write(both.tree.join("kbf-work/data"), b"new\n").expect("data");
+    std::fs::create_dir(both.tree.join("work")).expect("work");
+    std::fs::write(both.tree.join("work/data"), b"older\n").expect("older data");
+    let manifest = both.run().await.expect("task");
+    assert_eq!(manifest.output_files[0].digest, sha256(b"new\n"));
+    assert!(both.root.join("kbf-work/out").is_file());
+    assert!(!both.root.join("work").exists());
 }

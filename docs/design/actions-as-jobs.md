@@ -40,7 +40,7 @@ run's scratch directory as the writable upper layer, and below it one read-only 
 `tierstore fs` mount, which jobscheduler mounts as it would any host directory: the **action tree**, a tierstore tree
 read lazily. Its root names, by digest, the top-level directories of the **kbf base tree** (the farm's one bare-bones
 base image and `/.kbf-tools/kbf-task`, one tree per kbf release, held in tierstore), and beside them the action's
-input root at `/work` and its Action and Command under `/.kbf`. Nothing is pulled, unpacked or copied before the
+input root at `/kbf-work` and its Action and Command under `/.kbf`. Nothing is pulled, unpacked or copied before the
 action starts; only the files the action opens are fetched, the base's files once per node for every job, and kbf
 asks the node's tierstore to **hydrate** the tree as soon as it sees the job placed, so caches warm while the
 container is made.
@@ -78,7 +78,7 @@ Settled by the owner and not reopened here:
 | O13 | **kbf publishes the farm's base image into the object store itself**, as a tierstore tree (the image's layers flattened into one tree), written once per base-image version, for example by kbf's release; the job names it by digest (2026-11-10). Amended by O16: the tree is the kbf base tree, one per kbf release, whose subtrees from the image stay the same digests while the image does; the job names the action tree, whose root names the base's subtrees. | 3.3 |
 | O15 | **jobscheduler never treats tierstore specially.** It builds a job's root file system as a container engine does: ordered lower layers from host paths (on the farm, directories under the `tierstore fs` mount) or an OCI image from a registry on 127.0.0.1, a scratch upper, bind mounts, and host ports passed through into the job (jobscheduler's generic layered root file system design). The only tierstore piece specific to kbf's inputs is **hydrate** (with its `release`): kbf sees the job being created and asks the node's tierstore to warm the base and input trees (one action tree naming both, since O16). Outputs go to the node's tierstore through a passed-through host port. kbf drops `JobSpec.trees`, `JS_TREES_UNATTACHED` and tree attach (2026-11-10). | 3, 4.5, 5.2 |
 | O14 | **Outputs are written straight into tierstore if possible**; otherwise `kbf-task` hands them to the node's tierstore (local-cache mode, write-through, 2026-10-30) through a node-local endpoint, content-addressed, into the job's fenced prefix, and kbf-task's own packs and presigned PUTs are removed once that works; promotion stays server-side, after a clean result (2026-11-10). | 5 |
-| O16 | **One kbf base tree rather than a base tree and a tools tree** (2026-11-11): the base image flattened together with `/.kbf-tools/kbf-task`, one tree per kbf release, built and published by kbf's release; each action's job names one tree, whose root references the base tree's top-level manifests by digest beside `/work` and `/.kbf`, so the job's root is one read-only layer and a scratch upper. | 3.1, 3.3, 3.4, 4.1, 4.5 |
+| O16 | **One kbf base tree rather than a base tree and a tools tree** (2026-11-11): the base image flattened together with `/.kbf-tools/kbf-task`, one tree per kbf release, built and published by kbf's release; each action's job names one tree, whose root references the base tree's top-level manifests by digest beside `/kbf-work` (`/work` before the exec root needed 8 bytes) and `/.kbf`, so the job's root is one read-only layer and a scratch upper. | 3.1, 3.3, 3.4, 4.1, 4.5 |
 
 ## 2. Where things stand
 
@@ -128,14 +128,14 @@ from one host directory under the node's `tierstore fs` mount, `<mount>/trees/<d
 | Layer | What it is | Paths it supplies |
 |---|---|---|
 | upper (writable) | the run's scratch directory on the node's scratch volume, as the `/work` upper is today | every write of the run: outputs, copy-ups, whiteouts, the Command's temporary files |
-| lower (read-only) | the **action tree**, one per action (4.1) | everything the action reads: `/work` (the input root), `/.kbf/action` and `/.kbf/command` (the Action and Command blobs), and, named by digest from the kbf base tree (3.3), `/.kbf-tools/kbf-task`, `/etc`, `/usr` and the mount points |
+| lower (read-only) | the **action tree**, one per action (4.1) | everything the action reads: `/kbf-work` (the input root), `/.kbf/action` and `/.kbf/command` (the Action and Command blobs), and, named by digest from the kbf base tree (3.3), `/.kbf-tools/kbf-task`, `/etc`, `/usr` and the mount points |
 
 **The action tree's root** is a manifest of its own per action (4.1): every entry of the kbf base tree's root manifest
 as it is (a top-level directory by its manifest's digest, a top-level symlink by its target, a top-level file by its
-blob), and beside them two entries the base tree never holds, `work` (the input root's manifest) and `.kbf` (the
+blob), and beside them two entries the base tree never holds, `kbf-work` (the input root's manifest) and `.kbf` (the
 Action and Command). There is no layer order to keep and nothing for one layer to shadow: names meet only in that one
-root manifest, which the frontend writes, and the base tree is refused when it is built if it holds `work`, `.kbf`
-or `.kbf-run` (3.3).
+root manifest, which the frontend writes, and the base tree is refused when it is built if it holds `kbf-work`, `.kbf`
+or `.kbf-run`, or `work`, the input root of the trees older frontends wrote (3.3).
 
 **Shared by digest, cached once.** The root manifest and `.kbf` are the only parts new per action (a few KB: one
 entry per top-level name of the base, and two more), written once per action. Below it every directory is named by its manifest's digest, so `/usr` in every action's tree on a node
@@ -166,7 +166,10 @@ user owns the base tree's `/tmp`, `/var/tmp` and `/run` and its writes there cop
 
 ### 3.2 The action's view
 
-`/work` is the exec root and the Command's working directory is below it, as REAPI says. The Command runs
+`/kbf-work` is the exec root and the Command's working directory is below it, as REAPI says. Its path is 9 bytes: a
+tool that rewrites the exec root in place in what an action wrote (a debug-info relocation of a coverage build) needs
+one of at least 8 bytes, which `/work`, the root before it, was not. `kbf-task` still runs a tree an older frontend
+wrote, whose input root is `work` and which has no `kbf-work`, in `/work`. The Command runs
 directly in the job (4.4): the job is its sandbox, with the job's user namespace, no network and the layered root, and
 `kbf-task` makes none of its own. It can read, but not change in the tree, `/.kbf-tools/kbf-task` and its own Action
 and Command under `/.kbf`; none of them is a secret. `kbf-task`'s run directory (`/.kbf-run`, its stdout and stderr) and
@@ -184,7 +187,7 @@ binary, as it is today) and nothing else. It is how `kbf-task` gets into the bar
 from the node nor a layer of its own. The image's contents are chosen in its own build, as bare as hermetic builds
 allow (hermetic actions bring their toolchains as inputs); this design requires only that the base tree holds the
 mount-point directories above, `/tmp`, `/var/tmp` and `/run` as directories, the action user in `/etc/passwd` and
-`/etc/group`, and none of `/work`, `/.kbf` (the names each action tree adds, 4.1) and `/.kbf-run` (`kbf-task`'s run
+`/etc/group`, and none of `/kbf-work` and `/work`, `/.kbf` (the names each action tree adds or added, 4.1) and `/.kbf-run` (`kbf-task`'s run
 directory, 4.4). The image is today's
 pinned base (`base-<platform>.manifest.json`), flattened with modes normalised and with the packages no action needs
 left out (below, item 2): the account, login and PAM tools, `mount`, the ext2/3/4 tools, what installs packages, the
@@ -215,7 +218,7 @@ init-script helpers, the libraries only those use, and util-linux's `su`, so the
    path in the bundle's facts with the tree's entry count and depth (which every action tree counts with its own,
    4.6), and refuses, by name, what changes behaviour or what tierstore would refuse: a
    device node, a FIFO or socket, an extended attribute, a name with tierstore's `.wh.` prefix left after the
-   whiteouts are applied, a path of the four reserved ones (`/work`, `/.kbf`, `/.kbf-run`, `/.kbf-tools`) in the
+   whiteouts are applied, a path of the five reserved ones (`/kbf-work`, `/work`, `/.kbf`, `/.kbf-run`, `/.kbf-tools`) in the
    image, and a base that alone passes one of tierstore's limits (4.6). A refused base fails the release build, not a
    deployment.
 3. **Published by the frontend.** "Published by the release" means by the release's own frontend, at its start: the
@@ -328,7 +331,7 @@ changes nothing an action sees today.
 
 **The action tree** is one more manifest on top, its root (3.1): every child of the running release's base tree's root
 manifest (3.3), copied as it is, so `usr`, `etc` and `.kbf-tools` are directory children naming the base's own
-manifests by digest and size, and beside them `work` (the input root's manifest) and `.kbf` (a manifest of two files,
+manifests by digest and size, and beside them `kbf-work` (the input root's manifest) and `.kbf` (a manifest of two files,
 `action` and `command`, mode 0644, whose sha256 are the Action's and the Command's digests and which are made
 locatable like any input blob, D6), all sorted bytewise by name. The
 base's subtrees are not read, copied or rewritten: the root names them, and they are already in the store (published
@@ -367,10 +370,10 @@ With `--tree`, `kbf-task`:
 
 1. reads `/.kbf/action` and `/.kbf/command`, hashes the Action and checks it is the digest of its `--action` flag (so a
    job never runs another action's tree), and decodes both; there is no read grant and no fetch;
-2. before the Command starts, makes the parent directory of every output path and the working directory under `/work`
+2. before the Command starts, makes the parent directory of every output path and the working directory under `/kbf-work`
    (in the upper layer), as REAPI asks of the worker;
 3. runs the Command directly in the job (4.4: the job is the sandbox), under the action's timeout;
-4. collects the outputs from `/work` and hands them to the node's tierstore (5.2), and records `"from": "tree"` in the manifest's
+4. collects the outputs from `/kbf-work` and hands them to the node's tierstore (5.2), and records `"from": "tree"` in the manifest's
    advisory `inputs` statistics (`kbf-task-pack` `InputStats`; the reader that knows `from` ships one release before the
    writer, because `InputStats` refused an unknown member before item 8, D13).
 
@@ -381,7 +384,7 @@ With `--tree`, `kbf-task`:
 network, mount or PID namespace, no seccomp network filter, no cover and no relay or init re-exec: it starts the
 action's Command directly, in its working directory with its environment, as a child of its own (`std`/`tokio`
 `Command`, `crates/kbf-task/src/run.rs`, `Job`). What the job already is stands in for them: its own user namespace,
-network `None` (put-dir jobs submit `NetworkLevel::None`), and a layered root with `/work` as the exec root. The
+network `None` (put-dir jobs submit `NetworkLevel::None`), and a layered root with `/kbf-work` as the exec root. The
 nested sandbox had also made every farm build action fail at its start (`cannot start /work/buck-out/.../busybox: No
 such file or directory`, from the relay, the init re-exec or the covers of the parent of the work directory).
 
@@ -403,7 +406,7 @@ user, network, mount and PID namespaces, with `/run/js-files` and `/scratch` cov
 
 The output walk opens each component with `openat2` and `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS |
 RESOLVE_NO_MAGICLINKS` on Linux (today it opens each relative to its parent with `O_NOFOLLOW`,
-`crates/kbf-outputs/src/collect.rs`) [code], so the kernel refuses a path out of `/work`, a `..` included, in an upper
+`crates/kbf-outputs/src/collect.rs`) [code], so the kernel refuses a path out of `/kbf-work`, a `..` included, in an upper
 layer the action wrote.
 
 The frontend's MAC key (`--task-secret-file`) is never in a job.
@@ -457,7 +460,7 @@ job when [proposed, D9]:
 | `off` | `executor-trees` is off (8.3) |
 | `whole_host` | a `whole_machine` lease (D12) |
 | `store` | the index or tierstore did not answer within the writer's deadline, or a PUT failed |
-| `unrepresentable` | a name tierstore refuses (`.wh.` prefix), `node_properties` (4.1), or a tierstore limit passed (2^24 - 1 entries, a manifest over 64 MiB, depth over 4096), counted over the whole action tree: entries are the base's (from the bundle's facts, 3.3), the input root's and four (`work`, `.kbf` and its two files); depth is the larger of the base's and one more than the input root's |
+| `unrepresentable` | a name tierstore refuses (`.wh.` prefix), `node_properties` (4.1), or a tierstore limit passed (2^24 - 1 entries, a manifest over 64 MiB, depth over 4096), counted over the whole action tree: entries are the base's (from the bundle's facts, 3.3), the input root's and four (`kbf-work`, `.kbf` and its two files); depth is the larger of the base's and one more than the input root's |
 | `refused` | the resubmit, once, of a tree job whose submit or start was refused (section 6) |
 
 Each is counted (`kbf_executor_inputs_total{from="fetch",why}` beside `{from="tree"}`). These are states that change
@@ -477,12 +480,12 @@ instead of a host directory (jobscheduler's `docs/design/mount-providers.md`, ko
 
 - **The object** is tierstore's *tree list* (`tierstore::TreeList`, the format tierstore owns and documents: JSON Lines, a header line, then one line per entry sorted by path): every
   entry of the action tree at its path below the root. The base tree's entries come from its manifests, flattened once
-  when the frontend publishes the bundle (3.3; `BaseTree::listed`); then `work` and every entry of the input root
+  when the frontend publishes the bundle (3.3; `BaseTree::listed`); then `kbf-work` and every entry of the input root
   below it, and `.kbf` with `action` and `command`, as in 4.1. A file names its size and mode (0755 if REAPI marks
   it executable, else 0644) and, if it has bytes, the object they are in (the pack span the index gives, else the
   whole object `cas/l/<sha256>`, which is written first if it is missing, as in 4.1) and its SHA-256, which the
   provider checks each fill against; a file of no bytes names neither. Every directory is listed, mode 0755, so an empty one is made too; an
-  empty input root is `work` with nothing below it. The list is read back by tierstore's own reader before it is
+  empty input root is `kbf-work` with nothing below it. The list is read back by tierstore's own reader before it is
   stored, and stored with one create-only write at `cas/l/<sha256 of its bytes>`: a retry or another run with the
   same inputs finds it there and writes nothing.
 - **The layer** is `{provider: "tierstore", ref: <that key>}`. jobscheduler places the job only on a host whose agent
@@ -506,7 +509,7 @@ yet, for reasons of tierstore's and of REAPI's [proposed, D16]:
 
 - **Not as the overlay's upper.** overlayfs cannot use a FUSE mount as its upper directory, so the upper stays the run's
   local scratch.
-- **Not as writable tierstore directories bound at the output paths inside `/work`.** `tierstore fs` is read-only by
+- **Not as writable tierstore directories bound at the output paths inside `/kbf-work`.** `tierstore fs` is read-only by
   decision (ts C4 = A; the writable views were dropped, ts 12 item 11), so there is nothing writable to bind. And if
   there were, it would break what REAPI lets an action do:
   - an output file is a file, and a bind's target is fixed: tools that write a temporary file and `rename(2)` it onto
@@ -521,7 +524,7 @@ So (a) waits for a writable tierstore that keeps those semantics; nothing in thi
 ### 5.2 The first cut: the task hands each output to the node's tierstore
 
 [proposed, D17] After the Command exits and its namespaces are gone (4.4), `kbf-task` walks the outputs (`kbf-outputs`,
-`openat2` beneath `/work`) and hands each file, each output `Tree` and `Directory`, and stdout and stderr to the node's
+`openat2` beneath `/kbf-work`) and hands each file, each output `Tree` and `Directory`, and stdout and stderr to the node's
 tierstore, one stream per blob:
 
 - **The call** (section 13): `POST /_tierstore/v1/put-ca`, sent to `127.0.0.1:<port>` inside the job, which
@@ -766,7 +769,7 @@ passed-through port and the spec echo, and a fake of tierstore's `hydrate` and `
 - golden manifests (a file, an executable, an empty file, a large object, a symlink, a nested directory, the action
   tree's root), byte for byte;
 - `the_action_tree_root_names_the_base_children_by_digest`: the root holds every child of the base tree's root
-  manifest unchanged (a directory, a top-level symlink, a top-level file), beside `work` and `.kbf`, sorted bytewise;
+  manifest unchanged (a directory, a top-level symlink, a top-level file), beside `kbf-work` and `.kbf`, sorted bytewise;
   no manifest of the base is read or written in `prepare`;
 - every manifest parsed and flattened by tierstore's own `tree_manifest::parse_manifest` and `flatten` (a test
   dependency at kbf's tierstore pin), so writer and reader cannot drift;
@@ -817,7 +820,7 @@ the task sends to the passed-through port and to nothing else.
 - the sandbox, in the CI job that already runs its namespace tests: the Command cannot see `/run/js-files` or the
   task's run directory; in today's job it writes and runs a program from `/tmp`, `/var/tmp` and `/run`, with the bytes
   under `private/`; a background process it leaves is gone before outputs are read; an output that is a symlink out of
-  `/work`, a directory renamed to one, and a `..` are each refused by the walk;
+  `/kbf-work`, a directory renamed to one, and a `..` are each refused by the walk;
 - `InputStats.from` written; B8 pair: `a_manifest_with_from_is_read_by_the_item_8_reader` (the previous release on new
   data, since item 8 is the previous release of item 12) and `a_manifest_without_from_is_read_by_this_release`; and
   `an_unknown_member_is_skipped` in `kbf-task-pack`.
@@ -844,7 +847,7 @@ with a pack of the tree deleted between `hydrate` and the first open (`release` 
 **Conformance**: a pinned Buck2 build of the farm's usual targets, through `kbf-harness`'s B0 scenario against a
 frontend in each arm of section 10, gated on B0's gates (zero failed builds and actions, `kbf_cache_lost_blobs == 0`);
 each action's outputs compared with the daemon arm's action-cache entry for the same action digest, and actions that
-differ only by an embedded exec-root path (`/kbf/root` under the daemon, `/work` in a job) listed by name, not failed.
+differ only by an embedded exec-root path (`/kbf/root` under the daemon, `/kbf-work` in a job) listed by name, not failed.
 
 **Why this list is complete for the failure and boundary cases.** It takes each new row of section 6 (each refusal at
 submit and at start, each failure `release` can report with each exit, `stall_ms` on both sides of its bound, an
@@ -992,7 +995,7 @@ layered root and the host-port pass-through of section 13 (jobscheduler's own de
 - **D1. The second executor becomes the only Linux path**: it is built, tested against the real service, and carries
   O2 and O3.
 - **D2. The root is one overlay over one tree per action** (3.1, O16): the action tree is the only lower layer and
-  the scratch the upper; its root names the kbf base tree's top-level directories by digest beside `/work` and
+  the scratch the upper; its root names the kbf base tree's top-level directories by digest beside `/kbf-work` and
   `/.kbf`, so there is no layer order to keep, and the base is still shared by digest and cached once per node by
   blob.
 - **D3. kbf's release flattens the pinned base image and its own `kbf-task` into one kbf base tree bundle, and the
@@ -1007,7 +1010,7 @@ layered root and the host-port pass-through of section 13 (jobscheduler's own de
 - **D7. The job is the sandbox; `kbf-task` keeps only process cleanup** (owner, 2026-11-15): in a tree job the Command
   is started directly, with no namespace, filter, cover or relay of its own, in a process group that is killed, and
   with `kbf-task` as the subreaper that kills and reaps what is left, so no process is running while outputs are read;
-  the output walk is resolved beneath `/work` by the kernel. Today's job keeps its own sandbox (4.4). Supersedes the
+  the output walk is resolved beneath `/kbf-work` by the kernel. Today's job keeps its own sandbox (4.4). Supersedes the
   mount and PID namespaces of an earlier D7.
 - **D8. `hydrate` is sent to the node's tierstore when kbf first sees the job's host, and `release` after the job
   ends** (4.5): the node is not known at submit, the call is never waited for, and `release` is where kbf learns the
@@ -1113,7 +1116,7 @@ copies the inputs out of the tree instead of running on it.
   network; the action tree read-only at `/work/.kbf-tree` and the put directory read-write at `/work/.kbf-out`, both
   `no_exec`, which a Mac's agent makes `exec/.kbf-tree` and `exec/.kbf-out`.
 - **The task** (`kbf-task --materialize-work=.kbf-tree`, `crates/kbf-task/src/materialize.rs`): reads `.kbf/action`
-  and `.kbf/command` from the tree as a tree job does, copies `work` into `exec/work` (`std::fs::copy`: an APFS clone
+  and `.kbf/command` from the tree as a tree job does, copies `kbf-work` into `exec/kbf-work` (`std::fs::copy`: an APFS clone
   where the source and `exec/` share a volume, a byte copy otherwise; every copy private, so an output may name an
   input), runs the Command there, and commits its one object into `exec/.kbf-out` (`--out-dir .kbf-out`) as 5.2
   says. The Command is started directly: the agent's sandbox is its sandbox, and no `sandbox-exec` is nested.

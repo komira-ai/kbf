@@ -4,7 +4,7 @@
 //! The task commits its objects into it as files, and the node's tier store makes each an
 //! object of the store when its rename returns. The job is submitted with:
 //!
-//! - **One layer**, the read-only action tree: the job's root, with `work` (`/work`), `.kbf`
+//! - **One layer**, the read-only action tree: the job's root, with `kbf-work` (`/kbf-work`), `.kbf`
 //!   (`/.kbf`) and the base tree's `/.kbf-tools/kbf-task` ([`TASK_IN_TREE`]), the program the
 //!   job runs. No image. The layer is the host directory `<mp>/trees/<digest>` of the tree's
 //!   manifests ([`PutDirRoots::layer`]), or, with `--executor-input-tree provider`, tierstore's

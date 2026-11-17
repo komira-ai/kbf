@@ -34,7 +34,7 @@ pub(crate) fn command(argv: &[&str], working_directory: &str, outputs: &[&str]) 
     }
 }
 
-/// The input root the trees of these tests hold under `work`: one file `data`, `hi\n`.
+/// The input root the trees of these tests hold under `kbf-work`: one file `data`, `hi\n`.
 fn input_root() -> Directory {
     Directory {
         files: vec![FileNode {
@@ -56,11 +56,11 @@ fn action_of(command: &reapi::Command) -> reapi::Action {
 }
 
 /// Lays out a job's root under `root` as the frontend's tree holds it: `.kbf/action`,
-/// `.kbf/command` and `work/data`. Returns the Action's digest.
+/// `.kbf/command` and `kbf-work/data`. Returns the Action's digest.
 fn lay_out(root: &Path, action: &reapi::Action, command: &reapi::Command) -> Digest {
     std::fs::create_dir_all(root.join(".kbf")).expect(".kbf");
-    std::fs::create_dir_all(root.join("work")).expect("work");
-    std::fs::write(root.join("work/data"), b"hi\n").expect("data");
+    std::fs::create_dir_all(root.join("kbf-work")).expect("kbf-work");
+    std::fs::write(root.join("kbf-work/data"), b"hi\n").expect("data");
     let action = action.encode_to_vec();
     std::fs::write(root.join(ACTION_FILE), &action).expect("action");
     std::fs::write(root.join(COMMAND_FILE), command.encode_to_vec()).expect("command");
@@ -137,7 +137,7 @@ const TREE_INPUTS: &str = concat!(
 );
 
 /// Asserts the whole tree job: the Action and the Command are read from `.kbf`, the Command runs
-/// in `work` over its input, its output is collected from there, the streams go to `.kbf-run`,
+/// in `kbf-work` over its input, its output is collected from there, the streams go to `.kbf-run`,
 /// and the committed manifest says the inputs came from the tree.
 #[tokio::test]
 async fn a_tree_run_reads_the_action_and_command_from_kbf_and_fetches_nothing() {
@@ -153,7 +153,10 @@ async fn a_tree_run_reads_the_action_and_command_from_kbf_and_fetches_nothing() 
     assert_eq!(manifest.output_files[0].digest, sha256(b"hi\n"));
     assert_eq!(manifest.inputs, Some(input_stats()));
     assert_eq!(manifest.version(), MANIFEST_VERSION_2);
-    assert_eq!(std::fs::read(dir.join("work/out")).expect("out"), b"hi\n");
+    assert_eq!(
+        std::fs::read(dir.join("kbf-work/out")).expect("out"),
+        b"hi\n"
+    );
     assert!(dir.join(".kbf-run/stdout").is_file());
     assert!(dir.join(".kbf-run/stderr").is_file());
     assert!(dir.join(".kbf-run/private/home").is_dir());
@@ -259,7 +262,7 @@ async fn an_action_whose_digest_is_not_the_flags_is_exit_10_with_its_line() {
                 dir.join(ACTION_FILE).display()
             )
         );
-        assert!(!dir.join("work/out").exists());
+        assert!(!dir.join("kbf-work/out").exists());
     }
 }
 
@@ -384,16 +387,17 @@ async fn an_action_without_a_command_or_an_input_root_is_exit_10() {
     }
 }
 
-/// A tree under `name` whose `work` is removed; its root, its Action's digest and where `work`
-/// was.
+/// A tree under `name` whose `kbf-work` is removed; its root, its Action's digest and where
+/// `kbf-work` was.
 fn without_work(name: &str) -> (TestDir, Digest, PathBuf) {
     let (dir, digest) = copy_tree(name);
-    let work = dir.join("work");
+    let work = dir.join("kbf-work");
     std::fs::remove_dir_all(&work).expect("remove");
     (dir, digest, work)
 }
 
-/// Asserts that a tree with no `work` is exit 10 naming it, and nothing runs.
+/// Asserts that a tree with no `kbf-work` (and no older `work`) is exit 10 naming `kbf-work`,
+/// and nothing runs.
 #[tokio::test]
 async fn a_missing_input_root_is_exit_10_naming_it() {
     let (dir, digest, work) = without_work("work-missing");
@@ -405,7 +409,7 @@ async fn a_missing_input_root_is_exit_10_naming_it() {
     );
 }
 
-/// Asserts that a `work` that is a file, or a symlink to a directory (not followed), is exit 10
+/// Asserts that a `kbf-work` that is a file, or a symlink to a directory (not followed), is exit 10
 /// with its line, and nothing runs.
 #[tokio::test]
 async fn an_input_root_that_is_a_file_or_a_symlink_is_exit_10() {
@@ -447,7 +451,7 @@ async fn an_existing_run_directory_is_refused_as_a_run_start() {
             .contains("cannot make the run directory (an existing one is refused)"),
         "{failure}"
     );
-    assert!(!dir.join("work/ran").exists());
+    assert!(!dir.join("kbf-work/ran").exists());
     assert!(names_in(&put).is_empty());
 }
 
@@ -469,7 +473,7 @@ async fn a_refused_network_property_is_a_run_start_before_the_run_directory() {
     let digest = lay_out(&dir, &action, &command);
     let failure = refused(&tree_cli(&dir, &digest)).await;
     assert_eq!(failure.exit_code(), EXIT_RUN);
-    assert!(!dir.join("work/ran").exists());
+    assert!(!dir.join("kbf-work/ran").exists());
 }
 
 /// Asserts that a Command that asks for the network (`kbf-network=allow`) is run like any other in
@@ -490,11 +494,11 @@ async fn a_command_that_asks_for_the_network_runs_in_the_job_as_any_other() {
     let digest = lay_out(&dir, &action, &command);
     let (outcome, _put) = run_tree(&tree_cli(&dir, &digest)).await;
     assert_eq!(outcome.expect("task").exit_code, 0);
-    assert!(dir.join("work/ran").is_file());
+    assert!(dir.join("kbf-work/ran").is_file());
 }
 
-/// Asserts that the working directory and the parent of every output path are made under `work`
-/// before the Command starts: `touch` makes no directory, so it succeeds only if they exist, and
+/// Asserts that the working directory and the parent of every output path are made under
+/// `kbf-work` before the Command starts: `touch` makes no directory, so it succeeds only if they exist, and
 /// its output is collected relative to the working directory.
 #[tokio::test]
 async fn the_working_directory_and_output_parents_exist_before_the_command_starts() {
@@ -506,12 +510,12 @@ async fn the_working_directory_and_output_parents_exist_before_the_command_start
     assert_eq!(manifest.exit_code, 0);
     assert_eq!(manifest.output_files.len(), 1);
     assert_eq!(manifest.output_files[0].path, "o/p/f");
-    assert!(dir.join("work/w/x/o/p/f").is_file());
+    assert!(dir.join("kbf-work/w/x/o/p/f").is_file());
 }
 
-/// Asserts that the run's streams and its private directories are in `.kbf-run`, beside `work`
-/// and not in it: the Command's `HOME` and `TMPDIR` name directories there, its standard output
-/// is there, and `work` holds nothing new.
+/// Asserts that the run's streams and its private directories are in `.kbf-run`, beside
+/// `kbf-work` and not in it: the Command's `HOME` and `TMPDIR` name directories there, its standard output
+/// is there, and `kbf-work` holds nothing new.
 #[tokio::test]
 async fn the_streams_and_home_are_in_the_run_directory_and_not_outputs() {
     let dir = scratch("run-dir");
@@ -531,7 +535,7 @@ async fn the_streams_and_home_are_in_the_run_directory_and_not_outputs() {
         assert!(printed.lines().any(|l| l == line), "{line} in {printed}");
     }
     assert!(private.join("home").is_dir());
-    let work: Vec<_> = std::fs::read_dir(dir.join("work"))
+    let work: Vec<_> = std::fs::read_dir(dir.join("kbf-work"))
         .expect("work")
         .map(|e| e.expect("entry").file_name())
         .collect();
@@ -562,8 +566,8 @@ async fn a_tree_job_starts_its_command_in_the_tasks_own_namespaces() {
     );
 }
 
-/// Asserts that a tree job's Command sees the tree's root (`work/..`) as it is: `.kbf`, the
-/// task's `.kbf-run` and `work`, with nothing covered.
+/// Asserts that a tree job's Command sees the tree's root (`kbf-work/..`) as it is: `.kbf`, the
+/// task's `.kbf-run` and `kbf-work`, with nothing covered.
 #[tokio::test]
 async fn a_tree_jobs_command_sees_the_tree_root_with_nothing_covered() {
     let dir = scratch("uncovered");
@@ -573,7 +577,7 @@ async fn a_tree_jobs_command_sees_the_tree_root_with_nothing_covered() {
     assert_eq!(outcome.expect("task").exit_code, 0);
     assert_eq!(
         std::fs::read_to_string(dir.join(".kbf-run/stdout")).expect("stdout"),
-        ".kbf\n.kbf-run\nwork\n"
+        ".kbf\n.kbf-run\nkbf-work\n"
     );
 }
 
@@ -660,15 +664,80 @@ fn a_tree_job_takes_its_root_and_refuses_the_flags_of_the_presigned_mode() {
 }
 
 /// Asserts that a tree job hands nothing to hide: the job is the sandbox (owner decision of
-/// 2026-11-15), so the Command runs in `work` with the grants, the run directory and, with
+/// 2026-11-15), so the Command runs in `kbf-work` with the grants, the run directory and, with
 /// `--stage-and-commit`, the put directory all as the job has them.
 #[test]
 fn a_tree_job_hides_nothing_from_its_command() {
     let (dir, digest) = copy_tree("hidden");
     let inputs = read(&tree_cli(&dir, &digest), &dir).expect("read");
     assert!(inputs.hidden.is_empty());
-    assert_eq!(inputs.root, dir.join("work"));
+    assert_eq!(inputs.root, dir.join("kbf-work"));
     assert_eq!(inputs.run_dir, dir.join(RUN_DIR));
+}
+
+/// Asserts that the input root is `/kbf-work` in a job (`--tree` alone, root `/`): a path of 9
+/// bytes, at least the 8 a tool that rewrites the exec root in place needs (a debug-info
+/// relocation of a coverage build), where `/work` was 5.
+/// Catches: the input root put back at `/work`, or at any path under 8 bytes.
+#[test]
+fn the_input_root_in_a_job_is_kbf_work_of_at_least_8_bytes() {
+    let in_job = Path::new("/").join(INPUT_ROOT);
+    assert_eq!(in_job, Path::new("/kbf-work"));
+    assert!(in_job.as_os_str().len() >= 8, "{}", in_job.display());
+    assert_eq!(input_root_name(Path::new("/nonexistent-root")), INPUT_ROOT);
+}
+
+/// Asserts that a tree an older frontend wrote, its input root at `work` and no `kbf-work`, is
+/// run in `work`, its output collected from there, and nothing named `kbf-work` is made.
+/// Catches: a task that refuses the trees older frontends wrote, or runs them in another root.
+#[tokio::test]
+async fn a_tree_with_only_the_older_work_runs_in_work() {
+    let (dir, digest) = copy_tree("older-work");
+    std::fs::rename(dir.join(INPUT_ROOT), dir.join(OLDER_INPUT_ROOT)).expect("rename");
+    let inputs = read(&tree_cli(&dir, &digest), &dir).expect("read");
+    assert_eq!(inputs.root, dir.join("work"));
+    std::fs::remove_dir(dir.join(RUN_DIR)).expect("the read's run directory");
+    let (outcome, _put) = run_tree(&tree_cli(&dir, &digest)).await;
+    let manifest = outcome.expect("task");
+    assert_eq!(manifest.exit_code, 0);
+    assert_eq!(manifest.output_files[0].digest, sha256(b"hi\n"));
+    assert_eq!(std::fs::read(dir.join("work/out")).expect("out"), b"hi\n");
+    assert!(!dir.join(INPUT_ROOT).exists());
+}
+
+/// Asserts that a tree holding both `kbf-work` and `work` runs in `kbf-work`, and that `work`
+/// is neither read nor written.
+/// Catches: the older name preferred, or both read.
+#[tokio::test]
+async fn a_tree_with_both_names_runs_in_kbf_work() {
+    let (dir, digest) = copy_tree("both-names");
+    std::fs::create_dir(dir.join(OLDER_INPUT_ROOT)).expect("work");
+    std::fs::write(dir.join("work/data"), b"older\n").expect("older data");
+    let (outcome, _put) = run_tree(&tree_cli(&dir, &digest)).await;
+    let manifest = outcome.expect("task");
+    assert_eq!(manifest.output_files[0].digest, sha256(b"hi\n"));
+    assert!(dir.join("kbf-work/out").is_file());
+    assert!(!dir.join("work/out").exists());
+}
+
+/// Asserts that a tree with no `kbf-work` whose older `work` is a file is exit 10 naming
+/// `work`: the older name is taken when it is there, and then checked as `kbf-work` is.
+/// Catches: a `work` that is not a directory run, or refused under the other name.
+#[tokio::test]
+async fn an_older_work_that_is_a_file_is_exit_10_naming_it() {
+    let (dir, digest, _) = without_work("older-work-file");
+    let older = dir.join(OLDER_INPUT_ROOT);
+    std::fs::write(&older, b"not a directory").expect("file");
+    let failure = refused(&tree_cli(&dir, &digest)).await;
+    assert_eq!(failure.exit_code(), EXIT_FETCH);
+    assert_eq!(
+        failure.to_string(),
+        format!(
+            "fetch: {}: the tree's input root is not a directory",
+            older.display()
+        )
+    );
+    assert!(!dir.join(RUN_DIR).exists());
 }
 
 #[path = "tree_out_dir_tests.rs"]

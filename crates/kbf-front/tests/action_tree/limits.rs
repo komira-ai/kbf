@@ -361,7 +361,7 @@ async fn an_input_root_holding_kbf_out_is_refused_by_name() {
 /// taken as a base.
 #[test]
 fn a_base_holding_a_reserved_name_or_unreadable_is_refused() {
-    assert_eq!(RESERVED_NAMES, ["work", ".kbf", ".kbf-run"]);
+    assert_eq!(RESERVED_NAMES, ["kbf-work", ".kbf", ".kbf-run", "work"]);
     for name in RESERVED_NAMES {
         let root =
             format!(r#"{{"v":1,"children":[{{"name":"{name}","kind":"symlink","target":"t"}}]}}"#);
