@@ -78,7 +78,7 @@ use pool::{Adopted, Adoption};
 use share::Share;
 use submit::{FRONTEND_LABEL, INSTANCE_LABEL};
 
-pub use config::{Config, ConfigError, Network, Ownership};
+pub use config::{Config, ConfigError, InputTree, Network, Ownership};
 pub use driver::Running;
 pub use front::{
     Front, FrontParts, PrepareError, PreparedPutDir, PreparedRun, PutDirParts, RunPrepare,

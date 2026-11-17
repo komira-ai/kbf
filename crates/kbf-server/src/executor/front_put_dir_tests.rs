@@ -121,7 +121,11 @@ const WALL: Duration = Duration::from_secs(3_600);
 async fn a_run_gets_its_dir_and_its_tree_once_and_no_write_or_grant() {
     let rig = rig();
     let action = action_with_input(&rig, "input").await;
-    let key = rig.front.mint(lease(), &action, WALL).await.expect("a dir");
+    let key = rig
+        .front
+        .mint(lease(), &action, WALL, InputTree::Manifests)
+        .await
+        .expect("a dir");
     let nonce = key
         .as_str()
         .strip_prefix("cas/b/7-3/")
@@ -154,7 +158,10 @@ async fn a_run_gets_its_dir_and_its_tree_once_and_no_write_or_grant() {
 async fn before_the_base_tree_is_published_a_run_is_unavailable() {
     let rig = rig_with(DirPrep::new(None, 7_200), false);
     let action = action_with_input(&rig, "input").await;
-    let refused = rig.front.mint(lease(), &action, WALL).await;
+    let refused = rig
+        .front
+        .mint(lease(), &action, WALL, InputTree::Manifests)
+        .await;
     assert!(
         matches!(&refused, Err(MintError::Unavailable(why)) if why.contains("base tree")),
         "{refused:?}"
@@ -168,7 +175,10 @@ async fn before_the_base_tree_is_published_a_run_is_unavailable() {
 async fn a_tree_that_cannot_be_written_is_refused_or_unavailable() {
     let rig = rig();
     let reserved = action_with_input(&rig, ".kbf-out").await;
-    let refused = rig.front.mint(lease(), &reserved, WALL).await;
+    let refused = rig
+        .front
+        .mint(lease(), &reserved, WALL, InputTree::Manifests)
+        .await;
     assert!(
         matches!(&refused, Err(MintError::Refused(why)) if why.contains(".kbf-out")),
         "{refused:?}"
@@ -176,7 +186,10 @@ async fn a_tree_that_cannot_be_written_is_refused_or_unavailable() {
 
     let action = action_with_input(&rig, "input").await;
     rig.store.fail_reads.store(true, Ordering::SeqCst);
-    let down = rig.front.mint(lease(), &action, WALL).await;
+    let down = rig
+        .front
+        .mint(lease(), &action, WALL, InputTree::Manifests)
+        .await;
     assert!(matches!(down, Err(MintError::Unavailable(_))), "{down:?}");
 }
 
@@ -191,7 +204,10 @@ async fn a_preparation_that_cannot_give_a_dir_refuses_the_run() {
     ] {
         let rig = rig_with(DirPrep::new(Some(refuse), 7_200), true);
         let action = action_with_input(&rig, "input").await;
-        let got = rig.front.mint(lease(), &action, WALL).await;
+        let got = rig
+            .front
+            .mint(lease(), &action, WALL, InputTree::Manifests)
+            .await;
         assert_eq!(
             matches!(got, Err(MintError::Unavailable(_))),
             unavailable,
@@ -201,7 +217,10 @@ async fn a_preparation_that_cannot_give_a_dir_refuses_the_run() {
     }
     let short = rig_with(DirPrep::new(None, WALL.as_secs() - 1), true);
     let action = action_with_input(&short, "input").await;
-    let got = short.front.mint(lease(), &action, WALL).await;
+    let got = short
+        .front
+        .mint(lease(), &action, WALL, InputTree::Manifests)
+        .await;
     assert!(matches!(got, Err(MintError::Refused(_))), "{got:?}");
 
     let presigned_only = Rig::over(Prepared::new(), Prepared::new(), |packs, backend| {
@@ -210,7 +229,10 @@ async fn a_preparation_that_cannot_give_a_dir_refuses_the_run() {
         Some(PutDirParts::new(packs, backend, published))
     });
     let action = action_with_input(&presigned_only, "input").await;
-    let got = presigned_only.front.mint(lease(), &action, WALL).await;
+    let got = presigned_only
+        .front
+        .mint(lease(), &action, WALL, InputTree::Manifests)
+        .await;
     assert_eq!(
         got,
         Err(MintError::Refused(
@@ -226,7 +248,11 @@ async fn a_preparation_that_cannot_give_a_dir_refuses_the_run() {
 async fn a_pack_committed_in_the_dir_becomes_the_result() {
     let rig = rig();
     let action = action_with_input(&rig, "input").await;
-    let key = rig.front.mint(lease(), &action, WALL).await.expect("a dir");
+    let key = rig
+        .front
+        .mint(lease(), &action, WALL, InputTree::Manifests)
+        .await
+        .expect("a dir");
     let pack = write_pack(&manifest_of("7-3", &action), &[]).expect("a pack");
     put_pack(&rig, &PackKey::new(format!("{key}/pack")), pack).await;
 

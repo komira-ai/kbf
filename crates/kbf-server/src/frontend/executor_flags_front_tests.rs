@@ -14,7 +14,7 @@ use kbf_types::LeaseId;
 
 use super::*;
 use crate::executor::{
-    Ingest as _, MintError, PrepareError, PreparedRun, PutDirRoots, RunPrepare, Secret,
+    Ingest as _, InputTree, MintError, PrepareError, PreparedRun, PutDirRoots, RunPrepare, Secret,
 };
 
 const SECRET: &[u8] = b"0123456789abcdef0123456789abcdef";
@@ -107,7 +107,12 @@ async fn minted(flags: &JsAgentFlags) -> (Result<String, MintError>, usize) {
         size_bytes: 3,
     };
     let key = front
-        .mint(LeaseId::new(7, 3), &action, Duration::from_secs(60))
+        .mint(
+            LeaseId::new(7, 3),
+            &action,
+            Duration::from_secs(60),
+            InputTree::Manifests,
+        )
         .await;
     let asked = *prepare.asked.lock().expect("a count");
     (key.map(|key| key.as_str().to_owned()), asked)

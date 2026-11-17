@@ -188,12 +188,24 @@ pub(super) async fn write_manifest(
     manifest: &Digest,
     bytes: Bytes,
 ) -> Result<(), NoTree> {
-    let key = large_key(manifest);
-    retrying(retry, &key, || async {
+    write_object(store, retry, &large_key(manifest), bytes).await
+}
+
+/// Writes `bytes` to `key`, create-only: an existing key is success, since every key this
+/// writer writes is named by its content.
+///
+/// # Errors
+/// [`NoTree::Put`]: the store refused it.
+pub(super) async fn write_object(
+    store: &dyn LargeStore,
+    retry: &PutRetry,
+    key: &ObjectKey,
+    bytes: Bytes,
+) -> Result<(), NoTree> {
+    let length = bytes.len() as u64;
+    retrying(retry, key, || async {
         let body = stream::once(std::future::ready(Ok(bytes.clone()))).boxed();
-        put(store, &key, manifest.size_bytes, body)
-            .await
-            .map_err(Failed::Store)
+        put(store, key, length, body).await.map_err(Failed::Store)
     })
     .await
 }

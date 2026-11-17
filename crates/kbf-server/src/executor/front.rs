@@ -41,6 +41,7 @@ use kbf_proto::reapi::{self, Action, Command, Digest};
 use kbf_types::{DigestFunction, ImageRef, LeaseId};
 use std::sync::Arc;
 
+use crate::executor::config::InputTree;
 use crate::executor::mac::System;
 use crate::executor::task::{PackKey, Secret, build_id};
 use crate::executor::traits::{
@@ -257,7 +258,7 @@ struct Parked {
     key: String,
     put_url: Option<Secret>,
     grant: Option<ReadGrant>,
-    /// The digest of the action tree of a put-directory run, in hex.
+    /// The action tree of a put-directory run: its digest in hex, or its tree list's key.
     tree: Option<String>,
     /// When the write and the grant stop working: the entry is dropped after.
     not_after: u64,
@@ -338,11 +339,12 @@ impl Ingest for Front {
         lease: LeaseId,
         action: &Digest,
         wall: Duration,
+        tree: InputTree,
     ) -> Result<PackKey, MintError> {
         let action = cas_digest(action).map_err(MintError::Refused)?;
         let now = (self.now)();
         if let Some(put_dir) = &self.parts.put_dir {
-            return self.mint_put_dir(put_dir, lease, &action, now, wall).await;
+            return (self.mint_put_dir(put_dir, lease, &action, (now, wall), tree)).await;
         }
         let prepared = self
             .parts
@@ -444,14 +446,15 @@ fn put_dir_of(key: &PackKey) -> Option<IssuedPutDir> {
 
 impl Front {
     /// [`Ingest::mint`] of a run that commits into a put directory: the directory, and the
-    /// action tree written over the base tree and parked for [`Inputs::tree`].
+    /// action tree written over the base tree as `form` says (its manifests, or its flat
+    /// manifest) and parked for [`Inputs::tree`].
     async fn mint_put_dir(
         &self,
         put_dir: &PutDirParts,
         lease: LeaseId,
         action: &kbf_types::Digest,
-        now: SystemTime,
-        wall: Duration,
+        (now, wall): (SystemTime, Duration),
+        form: InputTree,
     ) -> Result<PackKey, MintError> {
         // Before anything is read or minted: without the base no tree can be written.
         let Some(base) = put_dir.base.get() else {
@@ -471,7 +474,14 @@ impl Front {
                 "the put directory's keys end before the run's wall time does".to_owned(),
             ));
         }
-        let tree = put_dir.writer.write(&prepared.kept, base).await;
+        let writer = &put_dir.writer;
+        let tree = match form {
+            InputTree::Manifests => {
+                (writer.write(&prepared.kept, base).await).map(|tree| tree.digest().to_string())
+            }
+            InputTree::Provider => (writer.write_listing(&prepared.kept, base).await)
+                .map(|listing| listing.key().to_owned()),
+        };
         let tree = tree.map_err(|no| {
             let why = format!("no action tree: {no}");
             match no.why() {
@@ -487,7 +497,7 @@ impl Front {
                 key: prepared.dir.clone(),
                 put_url: None,
                 grant: None,
-                tree: Some(tree.digest().to_string()),
+                tree: Some(tree),
                 not_after: prepared.not_after,
             },
         );

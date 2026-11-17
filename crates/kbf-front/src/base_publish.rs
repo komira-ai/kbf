@@ -9,8 +9,8 @@
 //!    the file's SHA-256 is the listed one. The file is hashed as a stream on a blocking
 //!    thread, never held;
 //! 2. **reads it** on a blocking thread, one object at a time, handing each over a channel of
-//!    one place: an object being read, one waiting and one being written are all of it that is in
-//!    memory. Every object is checked against its name as it is read. The facts must be of the
+//!    one place: an object being read, one waiting and one being written are all of its files
+//!    that are in memory. Every object is checked against its name as it is read. The facts must be of the
 //!    asked commit and platform;
 //! 3. **writes each object the store lacks** to `cas/l/<sha256>` ([`large_key`]), in the
 //!    bundle's order, which has every object after the ones it names and the root manifest
@@ -22,7 +22,12 @@
 //!    written, so a root tierstore cannot read or that holds a name an action tree keeps
 //!    ([`BaseTreeError::Reserved`]) is never written, and a bundle with no such object is
 //!    refused. The tree is named by the root alone, so none of the objects written before it
-//!    is reachable from anything.
+//!    is reachable from anything;
+//! 5. **lists the tree** ([`BaseTree::listed`]): every object that begins as a tree manifest
+//!    does (`{"v":1,`) is kept while the bundle is read, and the tree is flattened from them once
+//!    the root is read, for the tree lists of jobs (`--executor-input-tree provider`). Only
+//!    the manifests are kept, never a file's bytes, and they are dropped once the tree is
+//!    listed; a tree that cannot be listed from them is refused before its root is written.
 //!
 //! A second release on the same pin writes only its `kbf-task`, its `.kbf-tools` manifest and
 //! its root: every other object costs one length check.
@@ -31,6 +36,7 @@
 //! written before a refusal stay, which is harmless: they are content-named and nothing names
 //! them.
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, BufRead as _, BufReader, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -55,13 +61,17 @@ pub const SUMS: &str = "SHA256SUMS";
 /// in memory (read, waiting, written).
 const CHANNEL: usize = 1;
 
+/// How every tree manifest begins (tierstore's `tree_manifest`, version 1): the objects kept to
+/// list the base tree from.
+const MANIFEST_HEAD: &[u8] = br#"{"v":1,"#;
+
 /// The bytes the bundle is hashed in at a time.
 const READ: usize = 1 << 16;
 
 /// What [`publish`] made.
 #[derive(Clone, Debug)]
 pub struct Published {
-    /// The base tree: its root manifest's children, and its facts.
+    /// The base tree: its root manifest's children, its facts, and every entry listed.
     pub base: BaseTree,
     /// The root manifest's digest: the base tree's name.
     pub root: Digest,
@@ -413,9 +423,13 @@ async fn write_all(
     }
     let (mut written, mut held) = (0, 0);
     let mut root = None;
+    let mut manifests: BTreeMap<String, Bytes> = BTreeMap::new();
     while let Some(Item::Object { sha256, bytes }) = items.recv().await {
         let digest = Digest::new(DigestFunction::Sha256, hash_of(&sha256), bytes.len() as u64);
         let bytes = Bytes::from(bytes);
+        if bytes.starts_with(MANIFEST_HEAD) {
+            manifests.insert(sha256.clone(), bytes.clone());
+        }
         if sha256 == facts.root {
             // Before it is written: a root that is no base tree is never named in the store.
             let facts = BaseFacts {
@@ -423,10 +437,18 @@ async fn write_all(
                 // A depth no platform's `usize` holds is one no tree passes the limits with.
                 depth: usize::try_from(facts.depth).unwrap_or(usize::MAX),
             };
-            let base = BaseTree::new(&bytes, facts).map_err(|source| PublishError::Base {
-                path: path.to_owned(),
-                source,
-            })?;
+            let base = BaseTree::new(&bytes, facts)
+                .and_then(|base| {
+                    base.listed(|manifest| match manifests.get(&manifest.to_string()) {
+                        Some(bytes) => Ok(bytes.to_vec()),
+                        None => Err("not in the bundle"),
+                    })
+                })
+                .map_err(|source| PublishError::Base {
+                    path: path.to_owned(),
+                    source,
+                })?;
+            manifests.clear();
             root = Some((base, digest));
         }
         if put_new(store, &digest, bytes).await? {
