@@ -336,6 +336,8 @@ async fn the_list_is_stored_at_the_hash_of_its_bytes_and_a_taken_key_is_success(
     let first = list(&rig, &root).await.expect("a list");
     let bytes = rig.farm.object(first.key()).expect("stored");
     assert_eq!(first.key(), format!("cas/l/{}", TreeDigest::of(&bytes)));
+    // The key is the one tierstore's provider names the list by.
+    assert_eq!(first.key(), tierstore::tree_list::tree_list_key(&bytes));
     assert!(!read(&rig, &first).is_empty());
     rig.farm.clear_records();
     let second = list(&rig, &root).await.expect("a list again");

@@ -23,7 +23,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use kbf_objstore::ObjectKey;
 use kbf_types::{Digest, DigestFunction};
-use tierstore::tree_list::{ListEntry, ListKind, TreeList, parse_tree_list, tree_list_key};
+use tierstore::tree_list::{ListEntry, ListKind, TreeList, parse_tree_list};
 use tierstore::{BlobSource, EntryKind, Mode, TreeDigest, TreeEntry};
 
 use super::place::{self, Place};
@@ -279,11 +279,11 @@ fn encode(entries: &[Entry]) -> Result<(ObjectKey, Vec<u8>), NoTree> {
         entries: entries.collect(),
     }
     .encode();
-    let key = tree_list_key(&bytes);
-    let refused = |why: String| NoTree::ListingRefused { why };
-    parse_tree_list(&bytes, &TreeDigest::of(&bytes)).map_err(|error| refused(error.to_string()))?;
-    let key = ObjectKey::new(key.clone())
-        .map_err(|error| refused(format!("{key} is no object key: {error}")))?;
+    parse_tree_list(&bytes, &TreeDigest::of(&bytes)).map_err(|error| NoTree::ListingRefused {
+        why: error.to_string(),
+    })?;
+    // tierstore names a tree list `cas/l/<sha256 of its bytes>` (`tree_list_key`).
+    let key = large_key(&kbf_segments::sha256(&bytes));
     Ok((key, bytes))
 }
 

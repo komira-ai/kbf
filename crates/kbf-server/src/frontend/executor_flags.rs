@@ -18,8 +18,8 @@
 //! the `--state-store` ([`crate::executor::Ownership`]).
 //!
 //! `--executor-input-tree` chooses what a Linux put-directory job's root is read from: the
-//! action tree's manifests under tierstore's trees (`manifests`, the default), or one flat
-//! manifest that tierstore's mount provider makes the tree from (`provider`,
+//! action tree's manifests under tierstore's trees (`manifests`, the default), or one tierstore
+//! tree list that tierstore's mount provider makes the tree from (`provider`,
 //! [`crate::executor::InputTree`]).
 //!
 //! The executor speaks to a job service only. The flags of the lease server it once leased

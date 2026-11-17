@@ -446,8 +446,8 @@ fn put_dir_of(key: &PackKey) -> Option<IssuedPutDir> {
 
 impl Front {
     /// [`Ingest::mint`] of a run that commits into a put directory: the directory, and the
-    /// action tree written over the base tree as `form` says (its manifests, or its flat
-    /// manifest) and parked for [`Inputs::tree`].
+    /// action tree written over the base tree as `form` says (its manifests, or its tree
+    /// list) and parked for [`Inputs::tree`].
     async fn mint_put_dir(
         &self,
         put_dir: &PutDirParts,

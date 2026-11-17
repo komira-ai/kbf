@@ -300,7 +300,7 @@ async fn run(
     dir: &Path,
     store: &Arc<Bucket>,
 ) -> Result<kbf_front::base_publish::Published, PublishError> {
-    publish(dir, COMMIT, PLATFORM, store.clone()).await
+    publish(dir, COMMIT, PLATFORM, store.clone(), true).await
 }
 
 /// Asserts that a first publish writes every object of the bundle to `cas/l/<sha256>` with its
@@ -678,7 +678,7 @@ async fn an_empty_commit_is_refused() {
     install(&dir, &release);
     let store = Arc::new(Bucket::default());
 
-    let error = publish(&dir, "", PLATFORM, store.clone())
+    let error = publish(&dir, "", PLATFORM, store.clone(), true)
         .await
         .expect_err("refused");
 
@@ -927,4 +927,45 @@ async fn a_file_that_starts_like_a_manifest_does_not_break_publishing() {
     assert_eq!(store.object(&release.task).as_deref(), Some(&like[..]));
     assert!(published.base.is_listed());
     assert_eq!(published.base, listed_base(&release));
+}
+
+/// Asserts that a publish not asked to list (the manifests' path, `--executor-input-tree
+/// manifests`) hands back the unlisted base of the root, exactly as before tree lists, and
+/// publishes even a bundle whose tree cannot be listed (it lacks the `.kbf-tools` manifest).
+/// Catches: the default path refusing a bundle or keeping manifests for a listing it never
+/// uses.
+#[tokio::test]
+async fn a_publish_not_asked_to_list_leaves_the_base_unlisted() {
+    let dir = scratch("base-publish-not-listed");
+    let release = standard(b"kbf-task");
+    install(&dir, &release);
+    let store = Arc::new(Bucket::default());
+
+    let published = publish(&dir, COMMIT, PLATFORM, store.clone(), false)
+        .await
+        .expect("published");
+
+    let root = &release.built.manifests.last().expect("a root").1;
+    let facts = BaseFacts {
+        entries: release.built.entries,
+        depth: release.built.depth,
+    };
+    assert!(!published.base.is_listed());
+    assert_eq!(published.base, BaseTree::new(root, facts).expect("a base"));
+
+    let lacking = scratch("base-publish-not-listed-lacking");
+    let mut writer = Writer::new(Vec::new(), &release.facts).expect("a bundle");
+    for (hex, bytes) in &release.objects {
+        if *hex != release.tools {
+            writer.object(bytes).expect("written");
+        }
+    }
+    let bytes = writer.finish().expect("finished");
+    install_as(&lacking, &file_name(COMMIT, PLATFORM), &bytes, &bytes);
+    let other = Arc::new(Bucket::default());
+    let published = publish(&lacking, COMMIT, PLATFORM, other.clone(), false)
+        .await
+        .expect("published unlisted");
+    assert!(!published.base.is_listed());
+    assert!(other.object(&release.built.root).is_some());
 }

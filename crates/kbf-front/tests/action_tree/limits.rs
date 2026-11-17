@@ -470,6 +470,26 @@ fn every_refusal_says_what_and_why() {
             format!("the closure kept no Directory {digest}"),
             "store",
         ),
+        (
+            NoTree::ListingRefused {
+                why: "a path twice".to_owned(),
+            },
+            "the tree list of the tree is one tierstore refuses: a path twice".to_owned(),
+            "unrepresentable",
+        ),
+        (
+            NoTree::ListTooLong {
+                entries: 11,
+                limit: 10,
+            },
+            "the tree list has 11 entries or more, over the 10 it may have".to_owned(),
+            "unrepresentable",
+        ),
+        (
+            NoTree::BaseNotListed,
+            "the kbf base tree is not listed: no tree list can be written".to_owned(),
+            "store",
+        ),
     ];
     for (no, message, why) in cases {
         assert_eq!(text(&no), (message, why));
@@ -483,5 +503,10 @@ fn every_refusal_says_what_and_why() {
     assert_eq!(
         base.to_string(),
         "the base tree's root manifest: unsupported manifest version"
+    );
+    let base = BaseTreeError::Listing(TreeError::UnsupportedVersion);
+    assert_eq!(
+        base.to_string(),
+        "the base tree could not be listed: unsupported manifest version"
     );
 }

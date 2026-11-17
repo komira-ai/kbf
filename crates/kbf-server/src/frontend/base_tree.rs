@@ -26,6 +26,7 @@ use kbf_state::Store;
 
 use super::JsAgentFlags;
 use super::base_fetch::Cache;
+use crate::executor::InputTree;
 use crate::job_tree::{self, Recorded};
 use crate::serve::ServeError;
 
@@ -37,6 +38,9 @@ pub(super) struct Start {
     state: Option<Arc<dyn Store>>,
     /// Where the published base is set for the executor.
     slot: Arc<OnceLock<BaseTree>>,
+    /// Whether the base is listed: the executor writes tree lists
+    /// (`--executor-input-tree provider`).
+    list: bool,
 }
 
 impl Start {
@@ -55,6 +59,7 @@ impl Start {
             packs,
             state,
             slot: Arc::clone(&js.published),
+            list: js.config.input_tree == InputTree::Provider,
         }
     }
 
@@ -78,7 +83,7 @@ impl Start {
             .await
             .map_err(|why| refused(&why))?;
         tracing::info!(dir = %dir.display(), ?origin, "the kbf base tree bundle is ready");
-        let published = publish(&dir, commit, &self.platform, packs)
+        let published = publish(&dir, commit, &self.platform, packs, self.list)
             .await
             .map_err(|why| refused(&why))?;
         let root = published.root.hash_hex();
