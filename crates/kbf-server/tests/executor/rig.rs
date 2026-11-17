@@ -176,6 +176,8 @@ pub struct FakeIngest {
     pub calls: Mutex<Vec<(kbf_types::LeaseId, String, UntrustedLimits)>>,
     /// How many keys were minted: each key is new.
     pub minted: AtomicU64,
+    /// The form of input tree each mint was asked to write, in order.
+    pub forms: Mutex<Vec<InputTree>>,
 }
 
 impl FakeIngest {
@@ -188,6 +190,7 @@ impl FakeIngest {
             mint_fails: Mutex::new(None),
             calls: Mutex::new(Vec::new()),
             minted: AtomicU64::new(0),
+            forms: Mutex::new(Vec::new()),
         }
     }
 
@@ -209,8 +212,9 @@ impl Ingest for FakeIngest {
         lease: kbf_types::LeaseId,
         _action: &Digest,
         _wall: Duration,
-        _tree: InputTree,
+        tree: InputTree,
     ) -> Result<PackKey, MintError> {
+        locked(&self.forms).push(tree);
         match locked(&self.mint_fails).take() {
             Some(why) => Err(why),
             None => Ok(PackKey::new(format!(
