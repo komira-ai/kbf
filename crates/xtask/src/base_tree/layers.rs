@@ -39,9 +39,10 @@ use std::rc::Rc;
 
 use kbf_tree_bundle::{Dir, Node, Normalised};
 
-/// The top-level names the kbf tree makes itself (`/work` and `/.kbf` of each action tree,
-/// `/.kbf-run` of `kbf-task`, `/.kbf-tools` of the base tree): an image holds none of them.
-pub(super) const RESERVED: [&str; 4] = ["work", ".kbf", ".kbf-run", ".kbf-tools"];
+/// The top-level names the kbf tree makes itself (`/kbf-work` and `/.kbf` of each action tree,
+/// `/.kbf-run` of `kbf-task`, `/.kbf-tools` of the base tree, and `/work`, the input root of the
+/// trees older frontends wrote, which `kbf-task` still reads): an image holds none of them.
+pub(super) const RESERVED: [&str; 5] = ["kbf-work", "work", ".kbf", ".kbf-run", ".kbf-tools"];
 
 /// The directory the release's `kbf-task` is added in, and its name there.
 const TOOLS: &str = ".kbf-tools";
@@ -273,7 +274,7 @@ fn parse<R: Read>(
     let mut found = Vec::new();
     if RESERVED.contains(&path.top()) {
         found.push(format!(
-            "{at}: a path the kbf tree makes itself (/work, /.kbf, /.kbf-run and /.kbf-tools are not in an image)"
+            "{at}: a path the kbf tree makes itself (/kbf-work, /work, /.kbf, /.kbf-run and /.kbf-tools are not in an image)"
         ));
     }
     if let Some(records) = entry.pax_extensions()? {

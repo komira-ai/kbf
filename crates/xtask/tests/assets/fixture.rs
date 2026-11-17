@@ -69,6 +69,22 @@ pub(crate) fn flags(signer: &str) -> String {
     flags_from(signer, "refs/heads/main")
 }
 
+/// What `verify-assets attestations` prints when the fake gh refused `path` the attestation
+/// `what` (`build provenance`, or the SBOM predicate), signed by `artifacts.yml` from main:
+/// the file, the signer and, after them, what gh said.
+pub(crate) fn refused(path: &str, what: &str) -> String {
+    let predicate = if what == "build provenance" {
+        String::new()
+    } else {
+        format!(" --predicate-type {what}")
+    };
+    format!(
+        "xtask: {path}: no {what} attestation signed by {WORKFLOW} verifies; gh said: \
+         xtask-fake: no attestation of {path} verifies with {}{predicate}\n",
+        flags(WORKFLOW)
+    )
+}
+
 /// The flags a host's installer verifies a tarball with against its bundle, signed by
 /// `artifacts.yml` from the branch `source_ref` for `commit` (the `--bundle` and
 /// `--custom-trusted-root` words name files and are not part of it).
@@ -330,6 +346,15 @@ impl Release {
             .map(|l| format!("{l}\n"))
             .collect();
         std::fs::write(store, kept).expect("store");
+    }
+
+    /// Makes the fake gh refuse the next check of the file `name` alone, however it is
+    /// attested (a refusal of a file whose attestation is there).
+    pub(crate) fn refuse_once(&self, name: &str) {
+        let sha = hex::encode(sha2::Sha256::digest(
+            std::fs::read(self.dist.join(name)).expect("the file"),
+        ));
+        std::fs::write(self.gh.with_file_name(format!("refuse-once-{sha}")), "").expect("marker");
     }
 
     pub(crate) fn verify(

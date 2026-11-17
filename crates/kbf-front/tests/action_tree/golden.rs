@@ -52,7 +52,7 @@ impl Standard {
 /// always written, `source` only for a span, none for a whole object or an empty file, a
 /// directory named by its manifest's digest and length, children sorted), a `.kbf` that does
 /// not name the Action and the Command, and a root that does not hold the base's children as
-/// they are beside `work` and `.kbf`.
+/// they are beside `kbf-work` and `.kbf`.
 #[tokio::test]
 async fn manifests_are_written_byte_for_byte() {
     let rig = Rig::new().await;
@@ -105,8 +105,8 @@ async fn manifests_are_written_byte_for_byte() {
             r#"{{"name":".kbf-tools","kind":"dir","sha256":"{tools}","size":{tools_len}}},"#,
             r#"{{"name":"README","kind":"file","sha256":"{file}","size":5,"exec":false,"source":{{"key":"cas/f/base/p0","offset":3}}}},"#,
             r#"{{"name":"bin","kind":"symlink","target":"usr/bin"}},"#,
-            r#"{{"name":"usr","kind":"dir","sha256":"{usr}","size":{usr_len}}},"#,
-            r#"{{"name":"work","kind":"dir","sha256":"{work}","size":{work_len}}}"#,
+            r#"{{"name":"kbf-work","kind":"dir","sha256":"{work}","size":{work_len}}},"#,
+            r#"{{"name":"usr","kind":"dir","sha256":"{usr}","size":{usr_len}}}"#,
             r#"]}}"#
         ),
         kbf = kbf_hex,
@@ -127,7 +127,7 @@ async fn manifests_are_written_byte_for_byte() {
     // The same inputs give the same tree, to the byte.
     assert_eq!(
         written.digest().to_string(),
-        "8d421df90814641d465b20afaa087e4cba46274aa5f44948abc4170daf0b2a0f"
+        "39f26008c2d597060e75d329b09a2270a5c30df6d8ca6c33b6b7fbebc096a2cf"
     );
 }
 
@@ -172,16 +172,16 @@ async fn every_manifest_is_read_by_tierstores_reader() {
         (Some(4), "kbf-task", "file exec=true source=-"),
         (Some(0), "README", "file exec=false source=cas/f/base/p0@3"),
         (Some(0), "bin", "symlink usr/bin"),
+        (Some(0), "kbf-work", "dir"),
+        (Some(8), "a.c", "file exec=false source=cas/f/w/p0@17"),
+        (Some(8), "big.bin", "file exec=false source=-"),
+        (Some(8), "empty", "file exec=false source=-"),
+        (Some(8), "link", "symlink a.c"),
+        (Some(8), "run.sh", "file exec=true source=cas/f/w/p0@40"),
+        (Some(8), "sub", "dir"),
+        (Some(14), "x.h", "file exec=false source=cas/f/w/p1@0"),
         (Some(0), "usr", "dir"),
-        (Some(8), "cc", "file exec=true source=-"),
-        (Some(0), "work", "dir"),
-        (Some(10), "a.c", "file exec=false source=cas/f/w/p0@17"),
-        (Some(10), "big.bin", "file exec=false source=-"),
-        (Some(10), "empty", "file exec=false source=-"),
-        (Some(10), "link", "symlink a.c"),
-        (Some(10), "run.sh", "file exec=true source=cas/f/w/p0@40"),
-        (Some(10), "sub", "dir"),
-        (Some(16), "x.h", "file exec=false source=cas/f/w/p1@0"),
+        (Some(16), "cc", "file exec=true source=-"),
     ];
     let expected: Vec<(Option<u32>, String, String)> = expected
         .into_iter()
@@ -207,8 +207,13 @@ async fn the_action_tree_root_names_the_base_children_by_digest() {
         .strip_prefix(r#"{"v":1,"children":["#)
         .and_then(|rest| rest.strip_suffix("]}"))
         .expect("a manifest");
+    // `kbf-work` sorts among the base's children (after `bin`, before `usr`): without it, they
+    // are in a row.
+    let at = root.find(r#"{"name":"kbf-work","#).expect("kbf-work");
+    let end = at + root[at..].find("},").expect("the end of kbf-work") + 2;
+    let without_work = format!("{}{}", &root[..at], &root[end..]);
     assert!(
-        root.contains(base_children),
+        without_work.contains(base_children),
         "the base's children, as they are, in a row: {root}"
     );
     let base_root = TreeDigest::of(&rig.base.root).to_string();
@@ -246,8 +251,8 @@ async fn children_are_sorted_bytewise_across_the_three_node_lists() {
     let entries = rig.farm.flatten(&written).expect("a tree");
     let work = entries
         .iter()
-        .find(|entry| entry.parent == Some(0) && &*entry.name == "work")
-        .expect("work");
+        .find(|entry| entry.parent == Some(0) && &*entry.name == "kbf-work")
+        .expect("kbf-work");
     let names: Vec<&str> = entries
         .iter()
         .filter(|entry| entry.parent == Some(work.index))
@@ -279,7 +284,7 @@ async fn names_and_targets_are_read_back_as_given() {
     )));
 }
 
-/// The boundary of an empty input root: `work` is an empty directory, and the tree is read.
+/// The boundary of an empty input root: `kbf-work` is an empty directory, and the tree is read.
 #[tokio::test]
 async fn an_empty_input_root_is_an_empty_work() {
     let rig = Rig::new().await;
@@ -297,7 +302,7 @@ async fn an_empty_input_root_is_an_empty_work() {
 
 /// Catches: an input root holding an empty file and an empty subdirectory (both the empty
 /// blob, `e3b0c442.../0`) refused as a closure that kept no Directory, or written without one
-/// of them: `work` holds the empty file and the empty directory, and tierstore's reader reads
+/// of them: `kbf-work` holds the empty file and the empty directory, and tierstore's reader reads
 /// the tree.
 #[tokio::test]
 async fn an_empty_file_beside_an_empty_subdirectory_are_both_in_work() {
@@ -317,7 +322,7 @@ async fn an_empty_file_beside_an_empty_subdirectory_are_both_in_work() {
         .expect("the reader takes the tree");
     let work: Vec<(String, String)> = shape(&entries)
         .into_iter()
-        .filter(|(parent, _, _)| *parent == Some(10))
+        .filter(|(parent, _, _)| *parent == Some(8))
         .map(|(_, name, kind)| (name, kind))
         .collect();
     assert_eq!(

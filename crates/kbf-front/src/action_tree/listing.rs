@@ -3,7 +3,7 @@
 //!
 //! [`TreeWriter::write_listing`] lists the action tree [`TreeWriter::write`] would write as
 //! manifests as one tierstore tree list, version 2 (the `TSTREE` layout, [`super::tstree`]):
-//! every entry of the base tree ([`BaseTree::listed`]), `work` and every entry of the input root
+//! every entry of the base tree ([`BaseTree::listed`]), `kbf-work` ([`INPUT_ROOT`]) and every entry of the input root
 //! below it, and `.kbf` with `action` and `command`. A file with bytes names the object they are
 //! in (a span of a pack, or the whole object `cas/l/<sha256>`) and its SHA-256, which the
 //! provider checks the bytes against; a file of no bytes names no object and has the SHA-256 of
@@ -38,7 +38,7 @@ use super::place::{self, Place};
 use super::tstree::{
     self, Child, DIR_MODE, EMPTY_SHA256, ENTRY_BYTES, HEADER_LEN, Item, RANGE_MERGE_GAP,
 };
-use super::{BaseTree, NoTree, TreeWriter, reserved_input};
+use super::{BaseTree, INPUT_ROOT, NoTree, TreeWriter, reserved_input};
 use crate::large_backfill::large_key;
 use crate::prepare_run::{KeptClosure, KeptDirectory};
 
@@ -152,7 +152,7 @@ impl Listed {
 /// A directory of the action tree, as the list's layout asks for its children.
 #[derive(Clone, Copy)]
 enum At<'a> {
-    /// The root: the base root's children, `work` and `.kbf`.
+    /// The root: the base root's children, `kbf-work` and `.kbf`.
     Root,
     /// A directory of the base tree, by its index.
     Base(u32),
@@ -203,7 +203,7 @@ impl TreeWriter {
             return Err(NoTree::BaseNotListed);
         };
         let survey = survey(kept)?;
-        // `work`, `.kbf` and `.kbf`'s two files.
+        // `kbf-work`, `.kbf` and `.kbf`'s two files.
         let entries = (listed.len().saturating_add(4)).saturating_add(survey.entries);
         let limit = self.list_entries.min(FITTING_ENTRIES);
         if entries > limit {
@@ -314,7 +314,7 @@ impl<'a> Layout<'a> {
             At::Root => {
                 let mut children: Vec<Child<'a, At<'a>>> = self.listed.children_of(0).collect();
                 let work = self.directories[self.root];
-                children.push(dir("work", At::Input(work)));
+                children.push(dir(INPUT_ROOT, At::Input(work)));
                 children.push(dir(".kbf", At::Kbf));
                 children
             }

@@ -384,7 +384,7 @@ async fn a_tree_that_only_the_pack_holds_is_read_through_the_same_packs() {
 
 /// Asserts that a run minted with `InputTree::Provider` over a listed base tree parks a key
 /// that `Inputs::tree` hands out once: `cas/l/` and 64 lowercase hex digits, an object the store
-/// holds whose bytes tierstore's version 2 reader opens and builds to a tree that names the base tree's symlink, `work/input` and
+/// holds whose bytes tierstore's version 2 reader opens and builds to a tree that names the base tree's symlink, `kbf-work/input` and
 /// `.kbf/action`, and whose key is the one tierstore names the list by. Catches: a provider run
 /// that parks a manifest digest, a key of a list that was never stored, and a list that leaves
 /// out the input root or the action.
@@ -446,8 +446,8 @@ async fn a_provider_run_gets_the_key_of_a_stored_tree_list_once() {
     }
     for want in [
         "bin",
-        "work",
-        "work/input",
+        "kbf-work",
+        "kbf-work/input",
         ".kbf",
         ".kbf/action",
         ".kbf/command",

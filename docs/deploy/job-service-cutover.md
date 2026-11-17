@@ -110,7 +110,7 @@ exits with, and before any job is submitted:
 | the store holds `<key>` at another length | an object of `cas/l/` that is not the content its key names: look at that key, and do not delete it by hand without knowing who wrote it |
 | the store failed the length check or the write of `<key>` | the cause is the store's: the pack store flags and credentials |
 | this build does not know its commit | a binary built without git (`kbf --version --json` has no `commit_full`) has no bundle to name |
-| the root holds a name an action tree keeps (`work`, `.kbf`, `.kbf-run`) | the release's base image is wrong: the release build refuses it, so this is not a bundle of a release |
+| the root holds a name an action tree keeps (`kbf-work`, `.kbf`, `.kbf-run`, `work`) | the release's base image is wrong: the release build refuses it, so this is not a bundle of a release |
 | the state store failed `job-tree/<root>` | the cause is the state store's |
 
 Objects written before a failure stay in the store: they are named by their content and nothing

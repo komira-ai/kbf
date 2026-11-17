@@ -108,7 +108,10 @@ async fn a_refused_commit_is_exit_13_though_the_command_succeeded() {
         .await
         .expect_err("refused");
     assert_eq!(failure.exit_code(), EXIT_PUT);
-    assert_eq!(std::fs::read(dir.join("work/out")).expect("ran"), b"hi\n");
+    assert_eq!(
+        std::fs::read(dir.join("kbf-work/out")).expect("ran"),
+        b"hi\n"
+    );
     assert!(names(&out).is_empty(), "{:?}", names(&out));
 }
 
@@ -309,15 +312,15 @@ async fn a_directory_of_equal_files_is_one_entry_per_blob_and_dead_bytes_for_a_r
     let command = command(&["cp", "-R", "src", "d"], "", &["d"]);
     let digest = lay_out(&dir, &action_of(&command), &command);
     // The Command copies this directory: two equal large files and two equal small ones.
-    std::fs::create_dir(dir.join("work/src")).expect("src");
+    std::fs::create_dir(dir.join("kbf-work/src")).expect("src");
     for (name, bytes) in [
         ("big", vec![0u8; 3_145_728]),
         ("copy", vec![0u8; 3_145_728]),
     ] {
-        std::fs::write(dir.join("work/src").join(name), bytes).expect("large");
+        std::fs::write(dir.join("kbf-work/src").join(name), bytes).expect("large");
     }
     for name in ["a", "b"] {
-        std::fs::write(dir.join("work/src").join(name), b"a\n").expect("small");
+        std::fs::write(dir.join("kbf-work/src").join(name), b"a\n").expect("small");
     }
     let out = put_dir(&dir);
     assert_eq!(
@@ -485,9 +488,9 @@ async fn a_one_pass_run_with_an_output_directory_never_reads_the_staged_file_bac
     let dir = scratch("one-pass-no-readback");
     let command = command(&["cp", "-R", "src", "d"], "", &["d"]);
     let digest = lay_out(&dir, &action_of(&command), &command);
-    std::fs::create_dir(dir.join("work/src")).expect("src");
-    std::fs::write(dir.join("work/src/a"), b"a\n").expect("a");
-    std::fs::write(dir.join("work/src/b"), b"bb\n").expect("b");
+    std::fs::create_dir(dir.join("kbf-work/src")).expect("src");
+    std::fs::write(dir.join("kbf-work/src/a"), b"a\n").expect("a");
+    std::fs::write(dir.join("kbf-work/src/b"), b"bb\n").expect("b");
     let out = put_dir(&dir);
     let held = Held::default();
     let object = held.clone();

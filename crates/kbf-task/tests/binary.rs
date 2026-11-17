@@ -106,9 +106,9 @@ fn the_binary_runs_the_relay_and_the_first_process() {
 
 /// Catches: the binary not running `--materialize-work` against the current directory with relative
 /// paths: started with its working directory a scratch `exec/` whose `.kbf-tree` and `.kbf-out` are
-/// symlinks to the tree and the put directory, it copies the tree's `work` into `exec/work`, runs the
-/// Command there, exits 0 and commits `pack` into the put directory. Linux only, like the other
-/// tests that run a Command through the binary.
+/// symlinks to the tree and the put directory, it copies the tree's `kbf-work` into
+/// `exec/kbf-work`, runs the Command there, exits 0 and commits `pack` into the put directory.
+/// Linux only, like the other tests that run a Command through the binary.
 #[cfg(target_os = "linux")]
 #[test]
 fn the_binary_materializes_the_tree_into_its_working_directory_and_commits_pack() {
@@ -123,8 +123,8 @@ fn the_binary_materializes_the_tree_into_its_working_directory_and_commits_pack(
         std::fs::create_dir(dir).expect("dir");
     }
     std::fs::create_dir_all(tree.join(".kbf")).expect(".kbf");
-    std::fs::create_dir(tree.join("work")).expect("work");
-    std::fs::write(tree.join("work/data"), b"hi\n").expect("data");
+    std::fs::create_dir(tree.join("kbf-work")).expect("work");
+    std::fs::write(tree.join("kbf-work/data"), b"hi\n").expect("data");
     let digest = |bytes: &[u8]| kbf_proto::reapi::Digest {
         hash: hex::encode(Sha256::digest(bytes)),
         size_bytes: i64::try_from(bytes.len()).expect("size"),
@@ -167,11 +167,14 @@ fn the_binary_materializes_the_tree_into_its_working_directory_and_commits_pack(
         .expect("kbf-task runs");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(0), "{stderr}");
-    assert_eq!(std::fs::read(exec.join("work/out")).expect("out"), b"hi\n");
-    assert!(put.join("pack").is_file());
     assert_eq!(
-        std::fs::read(tree.join("work/data")).expect("data"),
+        std::fs::read(exec.join("kbf-work/out")).expect("out"),
         b"hi\n"
     );
-    assert!(!tree.join("work/out").exists());
+    assert!(put.join("pack").is_file());
+    assert_eq!(
+        std::fs::read(tree.join("kbf-work/data")).expect("data"),
+        b"hi\n"
+    );
+    assert!(!tree.join("kbf-work/out").exists());
 }

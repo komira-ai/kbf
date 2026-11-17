@@ -81,7 +81,7 @@ pub const EXIT_NO_CONFINE: u8 = 15;
 pub struct Cli {
     /// Run the tree job whose root file system is the action's tree, rooted at `ROOT`
     /// (`--tree` alone: `/`): the Action and Command are read from `<ROOT>/.kbf`, the inputs are
-    /// `<ROOT>/work` and the run directory is `<ROOT>/.kbf-run` (see the `tree` module). The
+    /// `<ROOT>/kbf-work` and the run directory is `<ROOT>/.kbf-run` (see the `tree` module). The
     /// root must follow `=`.
     #[arg(
         long,
@@ -93,7 +93,7 @@ pub struct Cli {
     )]
     pub tree: Option<PathBuf>,
     /// Run the materialized job: the Action and Command are read from `<TREE>/.kbf`, the tree's
-    /// `<TREE>/work` is copied (cloned where the file system can) into `./work`, which is the
+    /// `<TREE>/kbf-work` is copied (cloned where the file system can) into `./kbf-work`, which is the
     /// input root, and the run directory is `./.kbf-run`, with `.` the current directory (see the
     /// `materialize` module). The tree is never written. Not with `--tree`; the tree must follow
     /// `=`.

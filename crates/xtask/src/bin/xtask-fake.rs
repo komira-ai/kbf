@@ -47,6 +47,9 @@
 //!   the line `<SHA-256 of the file> <flags>`: the store of attestations, each the file
 //!   it covers and the exact flags it verifies under. A file it verifies is answered on stdout
 //!   with the file `gh-stdout` next to it, when there is one (what `--format json` prints).
+//!   When `refuse-once-<SHA-256 of the file>` is next to it, the call removes that file and
+//!   refuses, whatever the store holds: a refusal of an attested file, for the next call
+//!   on it alone (the removal is one atomic step, so calls run at once cannot both see it).
 //! - Run as `gh attestation verify <file> --bundle <bundle> [--custom-trusted-root
 //!   <root>] <flags>`, it verifies the file when the JSON object in `<bundle>` lists, in
 //!   `fakeAttestations`, the line `<SHA-256 of the file> <flags>` (the flags without the
@@ -372,6 +375,10 @@ fn gh(argv0: &str, args: &[String]) -> ExitCode {
     let sha256 = hex::encode(sha2::Sha256::digest(std::fs::read(file).expect("the file")));
     if let Some(at) = args.iter().position(|a| a == "--bundle") {
         return verify_bundle(dir, &sha256, file, &args[at + 1], &args[3..]);
+    }
+    if std::fs::remove_file(dir.join(format!("refuse-once-{sha256}"))).is_ok() {
+        eprintln!("xtask-fake: {file} refused this once");
+        return ExitCode::FAILURE;
     }
     let flags = args[3..].join(" ");
     let store = std::fs::read_to_string(dir.join("attested")).unwrap_or_default();

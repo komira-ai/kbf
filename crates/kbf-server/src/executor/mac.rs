@@ -30,7 +30,7 @@
 //! - **Two mounts**, each at `/work/<name>`, which a Mac's agent makes `exec/<name>`: the action
 //!   tree `<mp>/trees/<digest>` read-only at [`TREE_TARGET`], and the put directory
 //!   `<mp>/put/cas/b/<run>/<nonce>` read-write at [`MAC_OUT_TARGET`]. Both `no_exec`: the
-//!   task copies the inputs out of the tree into `exec/work` (APFS clones where the volume
+//!   task copies the inputs out of the tree into `exec/kbf-work` (APFS clones where the volume
 //!   allows), runs the Command there, and commits its one object into the put directory, as a
 //!   Linux job does. `<mp>` is the Macs' own (`--executor-mac-task-out-root`, by default
 //!   `--task-out-root`).

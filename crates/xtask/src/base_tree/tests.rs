@@ -66,7 +66,7 @@ fn norm(path: &str, from: &str, to: &str) -> Normalised {
 /// The message of a path a tree makes itself.
 fn reserved(path: &str) -> String {
     format!(
-        "{path}: a path the kbf tree makes itself (/work, /.kbf, /.kbf-run and /.kbf-tools are not in an image)"
+        "{path}: a path the kbf tree makes itself (/kbf-work, /work, /.kbf, /.kbf-run and /.kbf-tools are not in an image)"
     )
 }
 
@@ -245,7 +245,7 @@ fn each_kind_a_tree_cannot_hold_is_refused_by_path_and_kind() {
 /// sticky bit, and a name that only looks like a reserved one are accepted, the directory listed
 /// as normalised.
 /// Catches: a refusal of every PAX record, of a directory only because it has the bit a tree
-/// drops, or of `/workspace` for starting like `/work`.
+/// drops, or of `/workspace` or `/kbf-workspace` for starting like `/work` or `/kbf-work`.
 #[test]
 fn what_looks_like_a_refused_kind_but_is_not_is_accepted() {
     let tree = built(&[layer(&[
@@ -253,19 +253,24 @@ fn what_looks_like_a_refused_kind_but_is_not_is_accepted() {
         E::dir("var/mail/", 0o2775),
         E::dir("workspace/", 0o755),
         E::dir(".kbf-other/", 0o755),
+        E::dir("kbf-workspace/", 0o755),
     ])]);
     assert!(listing(&tree).contains_key("/workspace"));
+    assert!(listing(&tree).contains_key("/kbf-workspace"));
     assert!(listing(&tree).contains_key("/.kbf-other"));
     assert_eq!(tree.normalised, [norm("/var/mail", "2775", "0755")]);
 }
 
-/// Asserts the four paths the kbf tree makes itself are refused whether the image names them as
+/// Asserts the five paths the kbf tree makes itself are refused whether the image names them as
 /// a file or a directory, at or below the path, under any spelling of the root (`./`, `/`, none).
-/// Catches: an image whose `/work`, `/.kbf`, `/.kbf-run` or `/.kbf-tools` collides with what the
-/// action tree or `kbf-task` adds, and a spelling of the path that slips past the check.
+/// Catches: an image whose `/kbf-work`, `/work` (the older trees' input root), `/.kbf`,
+/// `/.kbf-run` or `/.kbf-tools` collides with what the action tree or `kbf-task` adds, and a
+/// spelling of the path that slips past the check.
 #[test]
 fn a_path_the_kbf_tree_makes_itself_is_refused_at_and_below_it() {
     for path in [
+        "kbf-work",
+        "kbf-work/x",
         "work",
         "work/x",
         ".kbf",

@@ -10,22 +10,23 @@
 //!   never runs another action's tree; the Command against the Action's `command_digest`. Each
 //!   is held in memory, at most [`MAX_MESSAGE_BYTES`](crate::message::MAX_MESSAGE_BYTES), and a
 //!   file longer than its digest says is refused at the first byte past the size;
-//! - `work`: the input root, the Command's exec root. Its files are not hashed again: the tree is
+//! - `kbf-work` ([`INPUT_ROOT`]; `work` in a tree an older frontend wrote): the input root, the
+//!   Command's exec root, `/kbf-work` in a job. Its files are not hashed again: the tree is
 //!   the frontend's, written from the input root it checked, under keys that are the manifests'
 //!   own SHA-256.
 //!
 //! The task makes `.kbf-run`, its own run directory, beside them (an existing one is refused):
 //! the Command's `stdout`, `stderr` and `private/` (its `HOME`, `TMPDIR` and caches) are there,
-//! outside `work`, so nothing written there is an output. Then the working
-//! directory and the parent of every output path are made under `work` before the Command
+//! outside `kbf-work`, so nothing written there is an output. Then the working
+//! directory and the parent of every output path are made under `kbf-work` before the Command
 //! starts, the Command is started directly in the job, which is its sandbox (no namespace, filter,
-//! cover or relay of the task's: [`crate::run::Job`]), its outputs are collected from `work`, and
+//! cover or relay of the task's: [`crate::run::Job`]), its outputs are collected from `kbf-work`, and
 //! the run's one object is written into the put directory `--out-dir` and committed there
 //! ([`crate::out_dir`]), which the Command can see (the job's own output path). `--out-dir` must
 //! be a directory before anything is read (exit 14). The manifest's advisory `inputs` is
 //! `{"from":"tree"}` with every number 0 (nothing was fetched), which makes it version 2.
 //!
-//! A failure to read the Action, the Command or `work` is exit 10, as a fetch failure is; a run
+//! A failure to read the Action, the Command or `kbf-work` is exit 10, as a fetch failure is; a run
 //! directory that cannot be made is exit 11, as the private directories are.
 
 use std::os::unix::fs::DirBuilderExt as _;
@@ -47,8 +48,12 @@ use crate::task::{Cli, Failure, check_lease, collected, exit_code, millis, named
 pub const ACTION_FILE: &str = ".kbf/action";
 /// The Command's file, under the tree's root.
 pub const COMMAND_FILE: &str = ".kbf/command";
-/// The input root, under the tree's root.
-pub const INPUT_ROOT: &str = "work";
+/// The input root, under the tree's root: `/kbf-work` in a job, the Command's exec root. Its
+/// path is 9 bytes, so a tool that rewrites the exec root in place for a path of at least 8
+/// bytes (a debug-info relocation of a coverage build) can, where it could not with `/work`.
+pub const INPUT_ROOT: &str = "kbf-work";
+/// The input root of a tree an older frontend wrote, read when the tree has no [`INPUT_ROOT`].
+pub(crate) const OLDER_INPUT_ROOT: &str = "work";
 /// The task's run directory, made under the tree's root.
 pub const RUN_DIR: &str = ".kbf-run";
 
@@ -75,9 +80,22 @@ pub(crate) fn read_tree(
         &named("command", action.command_digest.as_ref())?,
     )?;
     let network = network_of(cli, &action, &command)?;
-    // The tree's `work` is the input root; the Action must still name one, as REAPI requires.
+    // The tree's `kbf-work` is the input root; the Action must still name one, as REAPI requires.
     named("input root", action.input_root_digest.as_ref())?;
     Ok((action, command, network))
+}
+
+/// The name of the input root of the tree under `tree`: [`INPUT_ROOT`], or [`OLDER_INPUT_ROOT`]
+/// when the tree has no entry of the first name and has one of the second (a tree an older
+/// frontend wrote). With neither, [`INPUT_ROOT`], which [`input_root`] then refuses by name.
+#[must_use]
+pub(crate) fn input_root_name(tree: &Path) -> &'static str {
+    let has = |name: &str| std::fs::symlink_metadata(tree.join(name)).is_ok();
+    if !has(INPUT_ROOT) && has(OLDER_INPUT_ROOT) {
+        OLDER_INPUT_ROOT
+    } else {
+        INPUT_ROOT
+    }
 }
 
 /// Makes the run directory `<root>/.kbf-run`, mode 0700; an existing one is refused.
@@ -102,7 +120,7 @@ pub(crate) fn make_run_dir(root: &Path) -> Result<PathBuf, RunError> {
 fn read(cli: &Cli, root: &Path) -> Result<Inputs, Failure> {
     let reading = Instant::now();
     let (action, command, network) = read_tree(cli, root)?;
-    let work = root.join(INPUT_ROOT);
+    let work = root.join(input_root_name(root));
     input_root(&work)?;
     let run_dir = make_run_dir(root)?;
     Ok(Inputs {
