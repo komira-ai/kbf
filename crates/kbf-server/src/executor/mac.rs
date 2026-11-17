@@ -78,9 +78,11 @@ pub const DEFAULT_MAC_OS_VERSION: u32 = 26;
 /// The hosts a virtual worker stands for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum WorkerOs {
-    /// The job service's Linux hosts: `js:<frontend>-<n>`.
+    /// The job service's Linux hosts: `js:<frontend>-<n>` (with shared ownership,
+    /// `js:<frontend>.<instance>-<n>`, [`Config::worker_of`](super::Config::worker_of)).
     Linux,
-    /// Its Macs: `js-mac:<frontend>-<n>`.
+    /// Its Macs: `js-mac:<frontend>-<n>` (with shared ownership,
+    /// `js-mac:<frontend>.<instance>-<n>`).
     Mac,
 }
 

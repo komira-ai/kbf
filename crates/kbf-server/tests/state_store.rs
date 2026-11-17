@@ -42,6 +42,8 @@ mod budgets;
 mod conditional;
 #[path = "state_store/cordon_owner.rs"]
 mod cordon_owner;
+#[path = "state_store/exec_rows.rs"]
+mod exec_rows;
 #[path = "state_store/fate.rs"]
 mod fate;
 #[path = "state_store/floors.rs"]

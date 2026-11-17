@@ -11,8 +11,9 @@ use std::time::{Duration, SystemTime};
 use kbf_front::base_publish::PublishError;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 
-use super::{Cache, FetchError, Origin, STAGING, prune};
+use super::{Cache, FetchError, Origin, REPLACED, STAGING, prune};
 use crate::frontend::base_tree::tests::{bundle, sha};
 use crate::test_dir::scratch_dir;
 
@@ -30,6 +31,13 @@ pub(in crate::frontend) enum Reply {
     Cut { declared: usize, sent: Vec<u8> },
     /// 302 to this path of the same server.
     Redirect(String),
+    /// 200 and this body, once `open` has a permit to give; `arrived` is given one when the
+    /// request is in, so a test holds a download part way and decides when it goes on.
+    Gate {
+        body: Vec<u8>,
+        arrived: Arc<Semaphore>,
+        open: Arc<Semaphore>,
+    },
 }
 
 /// A release page in this process: the paths it answers and the paths it was asked for.
@@ -71,7 +79,17 @@ impl Fake {
                     let text = String::from_utf8_lossy(&head).into_owned();
                     let target = text.split_whitespace().nth(1).unwrap_or("/").to_owned();
                     asked.lock().expect("asked").push(target.clone());
-                    let reply = routes.lock().expect("routes").get(&target).cloned();
+                    let mut reply = routes.lock().expect("routes").get(&target).cloned();
+                    if let Some(Reply::Gate {
+                        body,
+                        arrived,
+                        open,
+                    }) = reply
+                    {
+                        arrived.add_permits(1);
+                        open.acquire().await.expect("an open gate").forget();
+                        reply = Some(Reply::Body(body));
+                    }
                     let _ = stream.write_all(&answer(reply)).await;
                     let _ = stream.shutdown().await;
                 });
@@ -157,6 +175,7 @@ fn answer(reply: Option<Reply>) -> Vec<u8> {
     };
     match reply {
         Some(Reply::Body(body)) => [head("200 OK", body.len(), ""), body].concat(),
+        Some(Reply::Gate { body, .. }) => [head("200 OK", body.len(), ""), body].concat(),
         Some(Reply::Cut { declared, sent }) => [head("200 OK", declared, ""), sent].concat(),
         Some(Reply::Redirect(to)) => head("302 Found", 0, &format!("Location: {to}\r\n")),
         Some(Reply::Status(code)) => head(&format!("{code} Answer"), 0, ""),
@@ -170,7 +189,28 @@ fn cache(dir: &Path, fake: &Fake) -> Cache {
         url: fake.url("/releases"),
         keep: 1,
         timeout: Duration::from_secs(5),
+        instance: "one".to_owned(),
     }
+}
+
+/// The directory a download of `instance` is made in.
+fn staging(dir: &Path, instance: &str) -> std::path::PathBuf {
+    dir.join(format!("{STAGING}{COMMIT}-{instance}"))
+}
+
+/// Sets the time `path` was last changed.
+fn set_changed(path: &Path, at: SystemTime) {
+    std::fs::File::open(path)
+        .and_then(|dir| dir.set_modified(at))
+        .expect("a time");
+}
+
+/// Makes `path` look a long time unchanged.
+fn old(path: &Path) {
+    set_changed(
+        path,
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+    );
 }
 
 fn bundle_file(commit: &str) -> String {
@@ -200,7 +240,7 @@ async fn a_missing_release_is_fetched_once_and_then_held() {
         bundle(COMMIT, PLATFORM).0
     );
     assert!(held.join("SHA256SUMS").is_file());
-    assert!(!dir.path().join(format!("{STAGING}{COMMIT}")).exists());
+    assert!(!staging(dir.path(), "one").exists());
     let asked = fake.asked();
     assert_eq!(
         asked,
@@ -316,10 +356,10 @@ async fn a_partial_download_is_never_used() {
 
     assert!(matches!(cut, FetchError::Download { .. }), "{cut}");
     assert!(!dir.path().join(COMMIT).exists());
-    assert!(!dir.path().join(format!("{STAGING}{COMMIT}")).exists());
+    assert!(!staging(dir.path(), "one").exists());
 
     // A download a stopped start left behind is replaced, not read.
-    let leftover = dir.path().join(format!("{STAGING}{COMMIT}"));
+    let leftover = staging(dir.path(), "one");
     std::fs::create_dir(&leftover).expect("a leftover");
     std::fs::write(leftover.join("SHA256SUMS"), "junk").expect("junk");
     fake.serve("/bundle", Reply::Body(whole));
@@ -413,12 +453,11 @@ async fn a_fetch_keeps_the_previous_release_and_removes_the_older_ones() {
         let path = dir.path().join(commit);
         std::fs::create_dir(&path).expect("a release");
         std::fs::write(path.join("SHA256SUMS"), commit).expect("a file");
-        let at = base + Duration::from_secs(index as u64 * 10);
-        std::fs::File::open(&path)
-            .and_then(|dir| dir.set_modified(at))
-            .expect("a time");
+        set_changed(&path, base + Duration::from_secs(index as u64 * 10));
     }
-    std::fs::create_dir(dir.path().join(format!("{STAGING}{}", "4".repeat(40)))).expect("stale");
+    let stale = dir.path().join(format!("{STAGING}{}-gone", "4".repeat(40)));
+    std::fs::create_dir(&stale).expect("stale");
+    old(&stale);
     std::fs::create_dir(dir.path().join("notes")).expect("an unrelated directory");
     std::fs::write(dir.path().join("SHA256SUMS"), "loose").expect("a loose file");
 
@@ -452,13 +491,14 @@ async fn a_fetch_keeps_the_previous_release_and_removes_the_older_ones() {
 #[test]
 fn a_prune_names_what_it_cannot_read_and_keep_zero_keeps_no_other() {
     let dir = scratch_dir("base-fetch-prune-direct");
-    let failed = prune(&dir.path().join("absent"), COMMIT, 1).expect_err("no directory");
+    let (now, day) = (SystemTime::now(), Duration::from_secs(86_400));
+    let failed = prune(&dir.path().join("absent"), COMMIT, 1, now, day).expect_err("no directory");
     assert!(failed.contains("absent"), "{failed}");
 
     let other = "5".repeat(40);
     std::fs::create_dir(dir.path().join(&other)).expect("a release");
     std::fs::create_dir(dir.path().join(COMMIT)).expect("this release");
-    let removed = prune(dir.path(), COMMIT, 0).expect("pruned");
+    let removed = prune(dir.path(), COMMIT, 0, now, day).expect("pruned");
     assert_eq!(removed, [dir.path().join(&other)]);
     assert!(dir.path().join(COMMIT).is_dir());
 }
@@ -484,7 +524,7 @@ async fn files_that_cannot_be_made_are_named_and_a_broken_release_is_replaced() 
 
     let stuck = scratch.path().join("stuck");
     std::fs::create_dir(&stuck).expect("a directory");
-    std::fs::write(stuck.join(format!("{STAGING}{COMMIT}")), "x").expect("a leftover file");
+    std::fs::write(staging(&stuck, "one"), "x").expect("a leftover file");
     let blocked = cache(&stuck, &fake)
         .ensure(COMMIT, PLATFORM)
         .await
@@ -500,4 +540,234 @@ async fn files_that_cannot_be_made_are_named_and_a_broken_release_is_replaced() 
         .expect("replaced");
     assert_eq!(origin, Origin::Fetched);
     assert!(kbf_front::base_publish::is_staged(&held, COMMIT, PLATFORM));
+}
+
+/// Asserts that a prune removes a download directory a day old or older and leaves one younger
+/// than that, which may be another process's, filling. Catches: a prune that deletes the
+/// download another frontend of the host is part way through.
+#[test]
+fn prune_leaves_another_process_staging_directory_of_today() {
+    let dir = scratch_dir("base-fetch-prune-today");
+    let day = Duration::from_secs(86_400);
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+    let young = staging(dir.path(), "other");
+    let aged = staging(dir.path(), "dead");
+    std::fs::create_dir(&young).expect("a download");
+    std::fs::create_dir(&aged).expect("a download");
+    set_changed(&young, now - day + Duration::from_secs(1));
+    set_changed(&aged, now - day);
+
+    let removed = prune(dir.path(), COMMIT, 1, now, day).expect("pruned");
+
+    assert_eq!(removed, std::slice::from_ref(&aged));
+    assert!(young.is_dir());
+    assert!(!aged.exists());
+    // A download changed after `now` (a clock that stepped back) is not old.
+    set_changed(&young, now + day);
+    assert_eq!(
+        prune(dir.path(), COMMIT, 1, now, day).expect("pruned"),
+        Vec::<std::path::PathBuf>::new()
+    );
+    assert!(young.is_dir());
+}
+
+/// Asserts that two caches of one directory, each its own process, fetching one commit at
+/// once, both answer a directory that passes the check, that exactly one directory is left
+/// under the commit and no download directory stays. The downloads are held until both are in,
+/// so they overlap. Catches: two fetches sharing one download directory and clearing each
+/// other's.
+#[tokio::test]
+async fn two_ensures_of_one_commit_leave_one_valid_directory() {
+    let dir = scratch_dir("base-fetch-two");
+    let fake = Fake::start().await;
+    fake.release(COMMIT);
+    let (arrived, open) = (Arc::new(Semaphore::new(0)), Arc::new(Semaphore::new(0)));
+    fake.serve(
+        "/bundle",
+        Reply::Gate {
+            body: bundle(COMMIT, PLATFORM).0,
+            arrived: Arc::clone(&arrived),
+            open: Arc::clone(&open),
+        },
+    );
+    let first = cache(dir.path(), &fake);
+    let second = Cache {
+        instance: "two".to_owned(),
+        ..cache(dir.path(), &fake)
+    };
+    let both = async {
+        let (a, b) = tokio::join!(
+            first.ensure(COMMIT, PLATFORM),
+            second.ensure(COMMIT, PLATFORM)
+        );
+        (a.expect("the first"), b.expect("the second"))
+    };
+    let release = async {
+        arrived
+            .acquire_many(2)
+            .await
+            .expect("both arrived")
+            .forget();
+        open.add_permits(2);
+    };
+
+    let (((held_a, _), (held_b, _)), ()) = tokio::join!(both, release);
+
+    assert_eq!(held_a, dir.path().join(COMMIT));
+    assert_eq!(held_b, held_a);
+    assert!(kbf_front::base_publish::is_staged(
+        &held_a, COMMIT, PLATFORM
+    ));
+    kbf_front::base_publish::verify(&held_a, COMMIT, PLATFORM).expect("a verified tree");
+    let left: Vec<_> = std::fs::read_dir(dir.path())
+        .expect("a dir")
+        .map(|e| e.expect("an entry").file_name())
+        .collect();
+    assert_eq!(left, [std::ffi::OsString::from(COMMIT)]);
+}
+
+/// Asserts that a fetch that finishes after another process has put the release in place keeps
+/// that directory as it is (a file only the other process wrote is still in it), answers it
+/// as fetched, removes its own download, and does not touch the other process's download
+/// directory. Catches: a fetch that clears a finished release directory another process is
+/// reading.
+#[tokio::test]
+async fn a_finished_release_directory_is_never_cleared_by_another_fetch() {
+    let dir = scratch_dir("base-fetch-adopt");
+    let fake = Fake::start().await;
+    fake.release(COMMIT);
+    let (arrived, open) = (Arc::new(Semaphore::new(0)), Arc::new(Semaphore::new(0)));
+    fake.serve(
+        "/bundle",
+        Reply::Gate {
+            body: bundle(COMMIT, PLATFORM).0,
+            arrived: Arc::clone(&arrived),
+            open: Arc::clone(&open),
+        },
+    );
+    let cache = cache(dir.path(), &fake);
+    let fetching = cache.ensure(COMMIT, PLATFORM);
+    let winner = async {
+        arrived.acquire().await.expect("arrived").forget();
+        let release = dir.path().join(COMMIT);
+        std::fs::create_dir(&release).expect("the winner's release");
+        crate::frontend::base_tree::tests::bundle_dir(&release, COMMIT, &[PLATFORM]);
+        std::fs::write(release.join("winner"), "mine").expect("a mark");
+        let other = staging(dir.path(), "other");
+        std::fs::create_dir(&other).expect("the winner's download");
+        open.add_permits(1);
+    };
+
+    let (loser, ()) = tokio::join!(fetching, winner);
+
+    let (held, origin) = loser.expect("adopts the winner's tree");
+    assert_eq!(
+        (held.as_path(), origin),
+        (dir.path().join(COMMIT).as_path(), Origin::Fetched)
+    );
+    assert_eq!(
+        std::fs::read(held.join("winner")).expect("the winner's file"),
+        b"mine"
+    );
+    assert!(!staging(dir.path(), "one").exists());
+    assert!(staging(dir.path(), "other").is_dir());
+}
+
+/// Asserts that placing a download over a release directory that holds the files keeps that
+/// directory and removes the download, and that a download that is not there to rename is
+/// refused naming the release path. Catches: a placement that replaces a finished release, and
+/// one that reports success with nothing placed.
+#[tokio::test]
+async fn placing_over_a_finished_release_adopts_it_and_a_missing_download_is_refused() {
+    let dir = scratch_dir("base-fetch-place");
+    let fake = Fake::start().await;
+    let cache = cache(dir.path(), &fake);
+    let release = dir.path().join(COMMIT);
+    std::fs::create_dir(&release).expect("a release");
+    crate::frontend::base_tree::tests::bundle_dir(&release, COMMIT, &[PLATFORM]);
+    let download = staging(dir.path(), "one");
+    std::fs::create_dir(&download).expect("a download");
+    std::fs::write(download.join("file"), "x").expect("a file");
+
+    let placed = cache.place(&download, &release, COMMIT, PLATFORM).await;
+
+    assert!(!placed.expect("adopted"));
+    assert!(!download.exists());
+    assert!(kbf_front::base_publish::is_staged(
+        &release, COMMIT, PLATFORM
+    ));
+
+    let nowhere = dir.path().join("nowhere");
+    let missing = cache
+        .place(&download, &nowhere, COMMIT, PLATFORM)
+        .await
+        .expect_err("nothing to rename");
+    assert!(matches!(missing, FetchError::Io { .. }), "{missing}");
+    assert!(missing.to_string().contains("nowhere"), "{missing}");
+}
+
+/// Asserts that placing a download over a release directory that fails its check renames that
+/// directory aside, renames the download in and leaves nothing aside, and that an aside path
+/// that cannot be cleared refuses the placement naming that path and leaves the release alone.
+/// Catches: a broken release removed in place under the path another process reads, and an
+/// aside directory left in the cache.
+#[tokio::test]
+async fn placing_over_a_broken_release_moves_it_aside_and_leaves_nothing_aside() {
+    let dir = scratch_dir("base-fetch-place-broken");
+    let fake = Fake::start().await;
+    let cache = cache(dir.path(), &fake);
+    let release = dir.path().join(COMMIT);
+    std::fs::create_dir(&release).expect("a release");
+    std::fs::write(release.join("SHA256SUMS"), "not sums").expect("junk");
+    let download = staging(dir.path(), "one");
+    std::fs::create_dir(&download).expect("a download");
+    crate::frontend::base_tree::tests::bundle_dir(&download, COMMIT, &[PLATFORM]);
+    let aside = staging(dir.path(), &format!("one{REPLACED}"));
+
+    let placed = cache.place(&download, &release, COMMIT, PLATFORM).await;
+
+    assert!(placed.expect("placed"));
+    assert!(kbf_front::base_publish::is_staged(
+        &release, COMMIT, PLATFORM
+    ));
+    assert!(!download.exists());
+    assert!(!aside.exists());
+
+    std::fs::remove_dir_all(&release).expect("removed");
+    std::fs::create_dir(&release).expect("a release");
+    std::fs::write(release.join("SHA256SUMS"), "not sums").expect("junk");
+    std::fs::create_dir(&download).expect("a download");
+    std::fs::write(&aside, "a file").expect("an aside file");
+
+    let refused = cache
+        .place(&download, &release, COMMIT, PLATFORM)
+        .await
+        .expect_err("an aside path that is a file");
+
+    assert!(matches!(refused, FetchError::Io { .. }), "{refused}");
+    assert!(refused.to_string().contains(REPLACED), "{refused}");
+    assert_eq!(
+        std::fs::read(release.join("SHA256SUMS")).expect("the release is kept"),
+        b"not sums"
+    );
+}
+
+/// Asserts that a prune passes over a download entry that is gone by the time it is read (here
+/// a link to nothing) and still removes what it should. Catches: a prune that stops at another
+/// process's download renamed into place between the listing and the read.
+#[test]
+fn prune_passes_over_a_download_that_is_gone() {
+    let dir = scratch_dir("base-fetch-prune-gone");
+    let day = Duration::from_secs(86_400);
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+    let gone = staging(dir.path(), "gone");
+    std::os::unix::fs::symlink(dir.path().join("nothing"), &gone).expect("a link");
+    let aged = staging(dir.path(), "dead");
+    std::fs::create_dir(&aged).expect("a download");
+    set_changed(&aged, now - day);
+
+    let removed = prune(dir.path(), COMMIT, 1, now, day).expect("pruned");
+
+    assert_eq!(removed, std::slice::from_ref(&aged));
+    assert!(!aged.exists());
 }

@@ -455,6 +455,39 @@ async fn an_action_with_no_inputs_reads_its_command() {
     assert_eq!(rig.fake.reads_of(&empty), 0);
 }
 
+/// Catches: a subdirectory left out of the scope because a file the walk reached first has its
+/// digest (a file whose bytes are that Directory message), so the files below it are refused
+/// as out of scope. The file is listed beside the subdirectory, files being folded in first.
+#[tokio::test]
+async fn a_subdirectory_whose_digest_a_file_has_is_walked() {
+    let mut blobs = HashMap::new();
+    let command = put(&mut blobs, b"a command");
+    let below = put(&mut blobs, b"a file below the subdirectory");
+    let inner = Directory {
+        files: vec![file("below", &below)],
+        ..Directory::default()
+    };
+    let inner = put(&mut blobs, &inner.encode_to_vec());
+    let root = Directory {
+        files: vec![file("m", &inner)],
+        directories: vec![subdirectory("d", &inner)],
+        ..Directory::default()
+    };
+    let root = put(&mut blobs, &root.encode_to_vec());
+    let action = Action {
+        command_digest: Some(digest_to_proto(&command)),
+        input_root_digest: Some(digest_to_proto(&root)),
+        ..Action::default()
+    };
+    let action = put(&mut blobs, &action.encode_to_vec());
+    let rig = rig(blobs, None, Limits::default());
+    let token = rig.token(action);
+    for digest in [inner, below] {
+        let reply = rig.get(&path(&digest), Some(&token)).await;
+        assert_eq!(reply.status, StatusCode::OK, "{digest}: {}", text(&reply));
+    }
+}
+
 /// Catches: the Action and its tree being read again for every request of a task that fetches
 /// thousands of inputs.
 #[tokio::test]

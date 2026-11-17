@@ -141,10 +141,16 @@ action's `os_version` above it is refused) and `--executor-mac-task-out-root` (t
 put directory on the Macs, `--task-out-root` by default); a macOS action becomes a job of a
 Mac's native runtime (docs/design/actions-as-jobs.md, section 14), which the job service at
 kbf's pin cannot run yet. A Linux job is the kbf image (`--executor-kbf-image`), whose `ENTRYPOINT` is the task tool:
-the job's arguments are the tool's flags and nothing is mounted into the container. It needs the
-cores and memory the farm booked (the memory as a hard cap of 1.5 times the
-booking plus 512 MiB), a host of `os=linux` and `--executor-arch` (default `x86_64`) that runs
-containers, and a wall limit of the action's timeout plus the run margin. It books no disk: the
+the job's arguments are the tool's flags and nothing is mounted into the container. It names no
+cores and no memory: it carries a `size-class` label, the action's build target and whether it is
+a test run (`root//crates/kbf-server:kbf-server` built is `root.crates.kbf-server.kbf-server.build`,
+its test run `….test`; an action whose output paths name no target is `shape.` and its shape key),
+and the job service books it what the past runs of that class used, or, for a class with too few
+runs, its cold size (jobscheduler's `docs/design/sizing.md`, section 7.7). A Mac job still names
+the cores and memory the farm booked (the memory as a hard cap of 1.5 times the booking plus
+512 MiB), with the same label. A job needs a host of `os=linux` and
+`--executor-arch` (default `x86_64`) that runs containers, and a wall limit of the action's
+timeout plus the run margin. It books no disk: the
 job carries no `disk_bytes`, so the job service places it on a host whatever scratch disk that
 host reports, and the job writes to its host's scratch with no quota. The kbf image is built from
 the base environment the actions' Commands see (`--executor-base-image`); both are named by
@@ -155,7 +161,8 @@ and a tag is refused. It needs both image flags, and the job service (`--executo
 `--executor-job-ca-file` for an `https` URL), `--executor-frontend-id` (the `kbf-frontend` label
 on the frontend's jobs, by which a restarted frontend finds and cancels those an earlier process
 left, and hashed into every job id; it must be different for each frontend, so a `kbf.toml` is
-not copied to a second frontend with it), the packs (`--pack-store-endpoint`, through which the
+not copied to a second frontend with it, except that the frontends of one
+`--executor-ownership shared` group give the same one), the packs (`--pack-store-endpoint`, through which the
 pack a task writes is read, hashed and turned into the action's result) and nothing else for the
 output: a put-dir job (the only mode, `--task-out-mode put-dir`) carries no url, no grant and no secret, and its pack is a file
 of its put directory, which the frontend ingests. The executor's presigned path (a write url, a read token, `--executor-secret-delivery`
@@ -207,7 +214,24 @@ network line for it: nothing is made, so nothing is unusual.
 of `/run/js-files` and `/scratch` no longer exist for a job. Its confinement code (`crates/kbf-task/src/sandbox.rs`) is
 reached only by `kbf-task --probe-confinement`, which prints `probe sandbox:`.
 
-The executor runs on exactly one frontend: it looks for another frontend's live jobs on the job
+`--executor-ownership` says who owns the jobs: `single`, the default, is what the next paragraph
+describes, and `shared` lets several frontends of one `--executor-frontend-id` run beside each
+other over one `--state-store`. With `shared` the frontend starts only if `--state-store` is
+given. Each process names its workers `js:<frontend id>.<the first 8 characters of its
+instance>-<n>` (its Macs `js-mac:<frontend id>.<the same 8 characters>-<n>`), keeps a liveness row in the state store that `--executor-live-secs` (default
+45) lets live after its last renewal, and writes the row of a worker before the farm hears of
+it and the row of a job before it submits the job. The liveness time must be at least the fence
+time (40 s) plus 5 s, and a smaller one is refused at start; `single` does not read it. A
+`shared` frontend does not look for another frontend's jobs, does not cancel an earlier
+process's jobs at start, and when it fences or stops it cancels no job: a worker's row is
+deleted if it has no job row and otherwise left with no owner, and the liveness row is deleted.
+It cancels a job only when the farm cancels the lease or a withdrawal reaches it, the farm
+ending a worker's stream included; the row of such a job is deleted once its cancel is
+answered. This release
+writes the rows and does not yet read another process's rows, so no frontend takes over the
+jobs of one that has gone.
+
+The executor runs on exactly one frontend with `single`: it looks for another frontend's live jobs on the job
 service before its first pass and every 40 s after, and a frontend that finds some older than its
 own (or finds some before it has any) stops with an error naming it. Each job also carries the
 process that made it: a frontend that starts and finds live jobs of another process under its own
@@ -280,13 +304,17 @@ with `name` and `browser_download_url`); the default is
 `https://api.github.com/repos/komira-ai/kbf/releases`, kbf's own releases. The frontend reads it
 a page at a time (`?per_page=100&page=N`) until a release lists both the bundle's file name, which
 holds the commit it was built from, and `SHA256SUMS`; it downloads those two files (redirects
-followed, https only, except plain http to a loopback address) into `<DIR>/.fetch-<commit>/`,
-hashes the bundle against the digest that `SHA256SUMS` lists, and only then renames the directory
-to `<DIR>/<commit>/`. A download that stops or is not the listed bytes is removed and fails the
-start; a partial file is never where anything reads. Once `<DIR>/<commit>/` exists, a start
-fetches nothing. After a fetch the cache keeps the running release and the
-`--executor-base-tree-keep` (default 1) newest other releases, for a rollback of the frontend,
-and removes the rest and any download a stopped start left; it never touches files loose in
+followed, https only, except plain http to a loopback address) into
+`<DIR>/.fetch-<commit>-<instance>/`, a directory of this process alone (its executor instance
+id), hashes the bundle against the digest that `SHA256SUMS` lists, and only then renames the
+directory to `<DIR>/<commit>/`. A download that stops or is not the listed bytes is removed and
+fails the start; a partial file is never where anything reads. Once `<DIR>/<commit>/` exists, a
+start fetches nothing. Two frontends that share `<DIR>` may fetch one commit at once: the one
+that renames second keeps the other's checked release and removes its own download. After a
+fetch the cache keeps the running release and the `--executor-base-tree-keep` (default 1) newest
+other releases, for a rollback of the frontend, and removes the rest and the downloads of a
+stopped start once they are a day old (a younger one may be another frontend's, filling); it
+never touches files loose in
 `<DIR>` or names that are not a commit. `--executor-base-tree-url=""` fetches nothing: the files
 are expected in `<DIR>` as before, and a missing one is named by the publish.
 `--executor-base-tree-timeout-secs` (default 60) is how long a connect, a response head or the

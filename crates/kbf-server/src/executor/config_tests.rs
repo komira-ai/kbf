@@ -4,8 +4,9 @@ use kbf_sched::fence::{LEADER_LEASE_MARGIN, LEASE_GRACE, START_GRACE, START_VALI
 
 use js_proto::v1::ExecMode;
 
-use super::{Config, ConfigError, Delivery, HARD_CAP_PAD, PRESIGN_LIMIT};
+use super::{Config, ConfigError, Delivery, HARD_CAP_PAD, Ownership, PRESIGN_LIMIT, TaskOut};
 use crate::config::MAX_HEARTBEAT_INTERVAL_MS;
+use crate::executor::PutDirRoots;
 
 const GIB: u64 = 1 << 30;
 
@@ -379,6 +380,194 @@ fn each_config_gets_an_instance_id_of_its_own() {
     assert!(one.instance.chars().all(|c| c.is_ascii_hexdigit()));
 }
 
+/// A config of shared ownership that is valid: output through put directories, which shared
+/// ownership needs, and the default liveness time.
+fn shared() -> Config {
+    Config {
+        ownership: Ownership::Shared,
+        task_out: TaskOut::PutDir(PutDirRoots::new("/mnt/ts/put").expect("roots")),
+        ..base()
+    }
+}
+
+/// Catches a default that turns on shared ownership, or a liveness time that is not the 45 s
+/// the flag documents (the default fence time and the scheduler's margin): a config from
+/// `Config::new` is single, is not `shared()`, and keeps its liveness row for fence + margin.
+#[test]
+fn the_defaults_are_single_ownership_and_a_live_time_of_the_fence_plus_the_margin() {
+    let config = base();
+    assert_eq!(config.ownership, Ownership::Single);
+    assert_eq!(Ownership::default(), Ownership::Single);
+    assert!(!config.shared());
+    assert_eq!(config.live, Duration::from_secs(45));
+    assert_eq!(config.live, config.fence_after + LEADER_LEASE_MARGIN);
+    assert!(shared().shared());
+    assert_eq!(shared().validate(), Ok(()));
+}
+
+/// Catches shared ownership accepted with presigned task outputs, where a job's write url is
+/// in no row and no other frontend could finish the job: shared with the presigned mode is
+/// refused with a message that names both flags, the same config with put directories is
+/// valid, and single ownership still takes presigned outputs.
+#[test]
+fn shared_with_presigned_is_refused() {
+    let presigned = Config {
+        task_out: TaskOut::Presigned,
+        ..shared()
+    };
+    assert_eq!(presigned.validate(), Err(ConfigError::SharedPresigned));
+    assert_eq!(
+        ConfigError::SharedPresigned.to_string(),
+        "--executor-ownership shared needs --task-out-mode put-dir: a presigned job's URL is \
+         in no row, so no other frontend could finish it"
+    );
+    assert_eq!(shared().validate(), Ok(()));
+    let single = Config {
+        task_out: TaskOut::Presigned,
+        ..base()
+    };
+    assert_eq!(single.validate(), Ok(()));
+}
+
+/// Catches a liveness time under which a row may expire while its process still acts, and an
+/// off-by-one at the edge: the time must be at least the fence time plus the scheduler's
+/// margin, so for the default fence exactly 45 s is valid and a second less is refused, and
+/// the edge moves with the fence time.
+#[test]
+fn live_secs_below_fence_plus_margin_is_refused() {
+    let with = |fence_after: Duration, live: Duration| Config {
+        fence_after,
+        live,
+        ..shared()
+    };
+    let fence = base().fence_after;
+    assert_eq!(fence, Duration::from_secs(40));
+    let edge = fence + LEADER_LEASE_MARGIN;
+    assert_eq!(with(fence, edge).validate(), Ok(()));
+    assert_eq!(
+        with(fence, edge - Duration::from_secs(1)).validate(),
+        Err(ConfigError::Live)
+    );
+    assert_eq!(
+        with(fence, Duration::ZERO).validate(),
+        Err(ConfigError::Live)
+    );
+    assert_eq!(with(fence, edge * 4).validate(), Ok(()));
+    let short = Duration::from_secs(30);
+    assert_eq!(with(short, short + LEADER_LEASE_MARGIN).validate(), Ok(()));
+    assert_eq!(
+        with(short, short + LEADER_LEASE_MARGIN - Duration::from_secs(1)).validate(),
+        Err(ConfigError::Live)
+    );
+}
+
+/// Catches a liveness time judged where nothing uses it: with single ownership no liveness
+/// row is written, so a time under the fence time, or zero, is valid.
+#[test]
+fn single_ownership_does_not_judge_the_live_time() {
+    for live in [Duration::ZERO, Duration::from_secs(1)] {
+        let config = Config { live, ..base() };
+        assert_eq!(config.validate(), Ok(()), "{live:?}");
+    }
+}
+
+/// Catches the wrong refusal when a shared config breaks the liveness rule and the output
+/// rule together: the liveness time is reported first, and the output mode once it is fixed.
+#[test]
+fn a_shared_config_with_both_faults_names_the_live_time_first() {
+    let both = Config {
+        live: Duration::from_secs(1),
+        task_out: TaskOut::Presigned,
+        ..shared()
+    };
+    assert_eq!(both.validate(), Err(ConfigError::Live));
+    let fixed = Config {
+        live: Duration::from_secs(45),
+        ..both
+    };
+    assert_eq!(fixed.validate(), Err(ConfigError::SharedPresigned));
+}
+
+/// Catches a worker name that two live processes of one frontend id could both register: a
+/// single frontend names its workers `js:<frontend>-<n>`, a shared one adds the first 8
+/// characters of its instance, so two instances give different names, and an instance
+/// shorter than 8 characters is used whole.
+#[test]
+fn worker_names_carry_the_instance_only_in_shared_mode() {
+    let single = Config {
+        instance: "0123456789abcdef".to_owned(),
+        ..base()
+    };
+    assert_eq!(single.worker_name(0), "js:front-1-0");
+    assert_eq!(single.worker_name(7), "js:front-1-7");
+    let one = Config {
+        instance: "0123456789abcdef".to_owned(),
+        ..shared()
+    };
+    assert_eq!(one.worker_name(0), "js:front-1.01234567-0");
+    assert_eq!(one.worker_name(3), "js:front-1.01234567-3");
+    let two = Config {
+        instance: "fedcba9876543210".to_owned(),
+        ..shared()
+    };
+    assert_eq!(two.worker_name(0), "js:front-1.fedcba98-0");
+    assert_ne!(one.worker_name(0), two.worker_name(0));
+    let short = Config {
+        instance: "abc".to_owned(),
+        ..shared()
+    };
+    assert_eq!(short.worker_name(1), "js:front-1.abc-1");
+    let exact = Config {
+        instance: "01234567".to_owned(),
+        ..shared()
+    };
+    assert_eq!(exact.worker_name(1), "js:front-1.01234567-1");
+}
+
+/// Catches a Mac worker name that two live processes of one group could both register, or
+/// that one frontend id could make a Linux name: the Macs' workers are `js-mac:` where the
+/// Linux ones are `js:`, and carry the first 8 characters of the instance only with shared
+/// ownership, as the Linux ones do.
+#[test]
+fn mac_worker_names_carry_the_instance_only_in_shared_mode() {
+    use crate::executor::mac::WorkerOs;
+    let single = Config {
+        instance: "0123456789abcdef".to_owned(),
+        ..base()
+    };
+    assert_eq!(single.worker_of(WorkerOs::Mac, 0), "js-mac:front-1-0");
+    assert_eq!(single.worker_of(WorkerOs::Linux, 2), single.worker_name(2));
+    let one = Config {
+        instance: "0123456789abcdef".to_owned(),
+        ..shared()
+    };
+    assert_eq!(one.worker_of(WorkerOs::Mac, 1), "js-mac:front-1.01234567-1");
+    assert_eq!(one.worker_of(WorkerOs::Linux, 1), "js:front-1.01234567-1");
+    let two = Config {
+        instance: "fedcba9876543210".to_owned(),
+        ..shared()
+    };
+    assert_ne!(
+        one.worker_of(WorkerOs::Mac, 0),
+        two.worker_of(WorkerOs::Mac, 0)
+    );
+}
+
+/// Catches an operator message that names the wrong flag or drops the number: the text of
+/// the liveness and the state-store refusals, whole.
+#[test]
+fn the_messages_of_the_shared_refusals_name_the_flags() {
+    assert_eq!(
+        ConfigError::Live.to_string(),
+        "--executor-live-secs must be at least the fence time plus 5 s with \
+         --executor-ownership shared"
+    );
+    assert_eq!(LEADER_LEASE_MARGIN.as_secs(), 5);
+    assert_eq!(
+        ConfigError::SharedStore.to_string(),
+        "--executor-ownership shared needs --state-store: the rows of the jobs are kept there"
+    );
+}
 /// Asserts the Hello of a Mac worker: `os=macos`, `arch=arm64` whatever the Linux arch, and
 /// the one driver `native`, so the farm places a Mac action on it and no `whole_machine` lease;
 /// and that the farm reads it and finds a Mac action's request met and a Linux one's not.

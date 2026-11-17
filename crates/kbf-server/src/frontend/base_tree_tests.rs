@@ -125,6 +125,7 @@ fn start(dir: &Path, packs: Packs, state: Option<Arc<dyn Store>>) -> Start {
             url: String::new(),
             keep: 1,
             timeout: Duration::from_secs(5),
+            instance: "test".to_owned(),
         },
         platform: "linux-x86_64".to_owned(),
         packs,
@@ -376,4 +377,33 @@ async fn a_release_that_cannot_be_fetched_fails_the_start_naming_the_flag() {
     assert!(text.starts_with("--executor-base-tree: "), "{text}");
     assert!(text.contains("no release lists both"), "{text}");
     assert!(slot.get().is_none());
+}
+
+/// Asserts that a start's base-tree cache names its downloads with the executor's instance id,
+/// the one id of the process (two configs draw two ids: `each_config_gets_an_instance_id_of_its_own`).
+/// Catches: two frontends of one host that download one commit into one directory.
+#[test]
+fn a_start_downloads_under_the_executors_instance_id() {
+    let mut config = crate::executor::Config::new("front-1", 1, 2_000, 16 << 30);
+    config.instance = "fe-a".to_owned();
+    let image = format!("docker://registry.test/app@sha256:{}", "ab".repeat(32));
+    let image = kbf_types::ImageRef::parse(&image).expect("an image");
+    let js = super::super::JsAgentFlags {
+        config,
+        job_url: String::new(),
+        token_file: "/nowhere/token".into(),
+        ca_file: None,
+        base_image: image.clone(),
+        kbf_image: image,
+        base_tree: "/nowhere/base-tree".into(),
+        base_tree_url: String::new(),
+        base_tree_keep: 1,
+        base_tree_timeout: Duration::from_secs(5),
+        published: Arc::default(),
+        put_retry: Duration::from_secs(5),
+    };
+
+    let start = Start::new(&js, packs().0, None);
+
+    assert_eq!(start.cache.instance, "fe-a");
 }

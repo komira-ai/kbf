@@ -105,6 +105,9 @@ pub(super) async fn walk(
     let command = proto(decoded.command_digest.as_ref())?;
     let root = proto(decoded.input_root_digest.as_ref())?;
     let mut seen = HashSet::from([root]);
+    // The Directories queued to be read, apart from `seen`: a file may have a Directory's
+    // digest, and a Directory a file reached first is still walked.
+    let mut queued = HashSet::from([root]);
     let mut level = vec![root];
     while !level.is_empty() {
         let mut next = Vec::new();
@@ -116,7 +119,8 @@ pub(super) async fn walk(
         while let Some((files, directories)) = entries.try_next().await? {
             seen.extend(files);
             for digest in directories {
-                if seen.insert(digest) {
+                seen.insert(digest);
+                if queued.insert(digest) {
                     next.push(digest);
                 }
             }

@@ -49,6 +49,7 @@ impl Start {
                 url: js.base_tree_url.clone(),
                 keep: js.base_tree_keep,
                 timeout: js.base_tree_timeout,
+                instance: js.config.instance.clone(),
             },
             platform: format!("linux-{}", js.config.arch),
             packs,

@@ -75,8 +75,8 @@ fn flags(out: TaskOut) -> JsAgentFlags {
     }
 }
 
-/// The key a front of `flags` mints for lease 7.3, and how many presigned runs it asked for.
-async fn minted(flags: &JsAgentFlags) -> (Result<String, MintError>, usize) {
+/// The packs and the backend over them that a front is made of.
+fn packs_and_backend() -> (Packs, Backend) {
     let objects = Arc::new(MemoryStore::new(Capabilities {
         conditional_put: true,
         object_lock: false,
@@ -90,6 +90,12 @@ async fn minted(flags: &JsAgentFlags) -> (Result<String, MintError>, usize) {
         SegmentsConfig::DEFAULT,
     ));
     let backend = Backend::remote_over(node, Some(packs.clone()));
+    (packs, backend)
+}
+
+/// The key a front of `flags` mints for lease 7.3, and how many presigned runs it asked for.
+async fn minted(flags: &JsAgentFlags) -> (Result<String, MintError>, usize) {
+    let (packs, backend) = packs_and_backend();
     let prepare = Arc::new(Presigned::default());
     let source = RunSource {
         mint: PackKeyMint::new(SECRET).expect("a mint"),
@@ -133,4 +139,56 @@ async fn the_front_mints_by_the_output_mode() {
         ))
     );
     assert_eq!(asked, 0);
+}
+
+/// What `flags.build` makes over `store`, with a token file and a plain job url of its own.
+fn built(
+    mut flags: JsAgentFlags,
+    store: Option<Arc<dyn kbf_state::Store>>,
+) -> Result<crate::executor::Executor, Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = crate::test_dir::scratch_dir("executor-store");
+    let token = dir.path().join("token");
+    std::fs::write(&token, "a-token-of-printable-bytes-0123456789\n").expect("written");
+    std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).expect("mode");
+    flags.config.insecure_argv_secrets = true;
+    flags.token_file = token;
+    flags.job_url = "http://127.0.0.1:7".to_owned();
+    let (packs, backend) = packs_and_backend();
+    let source = RunSource {
+        mint: PackKeyMint::new(SECRET).expect("a mint"),
+        prepare: Arc::new(Presigned::default()),
+    };
+    let front = flags.front(packs, backend, source);
+    let farm = Arc::new(crate::Farm::new(
+        Arc::new(Cache::memory()),
+        kbf_sched::UNSERVABLE_WAIT,
+        kbf_sched::FINISHED_RETENTION,
+    ));
+    flags.build(farm, Arc::new(front), Arc::new(Metrics::default()), store)
+}
+
+/// Catches a frontend that starts with shared ownership and nowhere to keep the rows: the
+/// build refuses with the message that names both flags, while single ownership builds with
+/// no store (the rows are not kept), and shared ownership builds over a store.
+#[tokio::test]
+async fn shared_ownership_without_a_state_store_is_refused_at_the_build() {
+    let roots = PutDirRoots::new("/mnt/ts/put").expect("roots");
+    let shared = || {
+        let mut flags = flags(TaskOut::PutDir(roots.clone()));
+        flags.config.ownership = Ownership::Shared;
+        flags
+    };
+    let why = built(shared(), None).err().expect("refused").to_string();
+    assert_eq!(
+        why,
+        "--executor-ownership shared needs --state-store: the rows of the jobs are kept there"
+    );
+    let store: Arc<dyn kbf_state::Store> = Arc::new(kbf_state::fake::Fake::with_flaw(
+        Arc::new(ManualClock::default()),
+        kbf_state::fake::Flaw::None,
+    ));
+    assert!(built(shared(), Some(Arc::clone(&store))).is_ok());
+    assert!(built(flags(TaskOut::Presigned), None).is_ok());
+    assert!(built(flags(TaskOut::Presigned), Some(store)).is_ok());
 }

@@ -19,7 +19,7 @@ use tonic::Code;
 use super::{Stage, counted, reported, status_of, step, submitted_specs, tell_start};
 use crate::executor::Secret;
 use crate::executor::host::HostWorker;
-use crate::executor::test_support::{GIB, Harness, Log, start};
+use crate::executor::test_support::{Harness, Log, built_class, start};
 use crate::executor::traits::{ActionFacts, Inputs, InputsError, ReadGrant};
 
 /// An action read that ends at `until`, on the test's held clock: the prepare of a task
@@ -39,6 +39,7 @@ impl Inputs for ReadUntil {
             image: format!("registry.test/app@sha256:{}", "ab".repeat(32)),
             timeout: Some(Duration::from_secs(20)),
             system: crate::executor::System::Linux,
+            size_class: built_class(),
         })
     }
 
@@ -162,20 +163,15 @@ async fn a_submit_lost_twice_is_still_a_job_that_was_sent() {
 }
 
 /// Catches a refusal that is the caller's taken for a twin, or retried: a `Start` no host of
-/// the service could ever hold (more memory than its one host has) is refused
+/// the service could ever hold (an architecture its one host is not) is refused
 /// `no-capable-host` at its one submit, settled as the caller's, and the frontend is not
 /// flagged.
 #[tokio::test(start_paused = true)]
 async fn a_start_no_host_can_hold_is_refused_once_and_flags_no_twin() {
-    let harness = Harness::new().await;
+    let mut harness = Harness::new().await;
+    harness.cfg.arch = "aarch64".to_owned();
     let (mut worker, messages) = harness.worker();
-    tell_start(
-        &messages,
-        Start {
-            memory_bytes: 128 * GIB,
-            ..start(1, 1)
-        },
-    );
+    tell_start(&messages, start(1, 1));
     step(&harness, &mut worker).await;
     let (code, message) = status_of(reported(&worker, LeaseId::new(1, 1)));
     assert_eq!(
@@ -242,6 +238,7 @@ impl Inputs for Arc<Gate> {
             image: format!("registry.test/app@sha256:{}", "ab".repeat(32)),
             timeout: Some(Duration::from_secs(20)),
             system: crate::executor::System::Linux,
+            size_class: built_class(),
         })
     }
 

@@ -250,13 +250,13 @@ init-script helpers, the libraries only those use, and util-linux's `su`, so the
 | `command` | `/.kbf-tools/kbf-task`, the whole program; there is no image entrypoint | empty: the image's entrypoint |
 | `args` | the task's flags, with `--tree` | the task's flags |
 | `env` | empty | the same |
-| `needs` | `cpu_millis`, `memory_bytes` (the hard cap a daemon would set); no `disk_bytes` (D4) | the same |
+| `needs` | `cpu_millis` and `memory_bytes` 0, sized by the job service from the `size-class` label's history (3.5); no `disk_bytes` (D4) | the same |
 | `constraints` | `os=linux`, the configured `arch`, contained | the same |
 | `wall_limit_seconds` | the action's timeout plus the run margin | the same |
 | `network` | `none` (3.6) | the operator's level, default allow-list |
 | host ports passed through | one: the node's tierstore loopback port, at the same port on the job's loopback (5.2) | none |
 | `files` | the output write grant (5.2; no read grant: nothing is read over the network) | the read grant and the PUT URLs |
-| `labels` | `kbf-frontend`, `kbf-instance` | the same |
+| `labels` | `kbf-frontend`, `kbf-instance`, `size-class` (3.5) | the same |
 
 **The tree is fixed in the prepared spec.** It is built once, in the executor's `prepare`, from the base tree of the
 running release, and kept in the lease's `Prepared` spec. A submit sent again after a lost answer sends that spec
@@ -267,7 +267,13 @@ start is a question for jobscheduler (section 13).
 
 ### 3.5 Resources
 
-`cpu_millis` and `memory_bytes` are the farm's booking, as today. `disk_bytes` is dropped (D4): O4, and while kbf books
+`cpu_millis` and `memory_bytes` are 0: the job service books each job what the past runs of its class used
+(jobscheduler's `docs/design/sizing.md`, section 7.7). The class, the job's `size-class` label, is the action's build
+target, read from its own `buck-out` paths, and its kind, a test run or a build: `<target> build` or `<target> test`
+written as a label value (`crates/kbf-server/src/executor/size_class.rs`), or `shape.<key>` for an action whose paths
+name no target. A `whole_machine` job books a whole host and carries no class. A Mac job names the farm's booking (the
+hard cap a daemon would set) beside its class: the cold size of a class is taken from the largest host the job service
+knows. `disk_bytes` is dropped (D4): O4, and while kbf books
 it js-sched places a kbf job only on a host reporting `disk-gib` (kbf#2287 item 3). A tree's bytes are in tierstore's
 cache under its own budget; only the run's writes land on the scratch volume.
 
@@ -638,7 +644,7 @@ Preconditions, checked once:
 1. **`js-lease-server`** at a release kbf works with (lower-case labels or the frontend id made lower case at its
    source, one client token across frontends, the body limit; kbf#2287 items 2, 4, 5); servers before clients.
 2. **`js-agent`** on all six nodes as the `.deb` from the apt repository, set by hostkeeper
-   (komira-ai/jobscheduler#841), `--runtime crun`, `uidmap` installed, its flags file holding the egress lines
+   (komira-ai/jobscheduler#841), running crun (a Linux build's only runtime), `uidmap` installed, its flags file holding the egress lines
    `kbf-deploy job-service agent-egress` prints, joined to the farm pool.
 3. The pool books no disk, and kbf no longer asks for it (item 2).
 4. The `cas/b/` janitor is on, on the leader; secrets go as files.

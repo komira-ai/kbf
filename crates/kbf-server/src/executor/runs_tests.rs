@@ -357,8 +357,8 @@ async fn a_job_conflict_on_resubmit_is_infra_and_flags_a_twin() {
 /// job that needs the whole host and nothing beside it (the CPU and memory the `Start` carries
 /// are the worker's whole capacity, not a host's), and is otherwise the job a container
 /// action's `Start` makes: the same image, command, environment, constraints, network, wall
-/// limit and labels, and as many arguments (theirs name each its own lease). The task follows
-/// the job as any other's.
+/// limit and labels, but for the size class, which the whole host never carries, and as many
+/// arguments (theirs name each its own lease). The task follows the job as any other's.
 #[tokio::test(start_paused = true)]
 async fn a_whole_machine_action_submits_a_whole_host_job() {
     let harness = Harness::new().await;
@@ -412,9 +412,21 @@ async fn a_whole_machine_action_submits_a_whole_host_job() {
         })
     );
     assert!(shared.needs.as_ref().is_some_and(|needs| !needs.whole_host));
+    // The whole host is never sized, so it carries no class; the share carries its own.
+    assert_eq!(whole.labels.get("size-class"), None);
+    assert_eq!(
+        shared.labels.get("size-class").map(String::as_str),
+        Some("root.pkg.t.build")
+    );
     let without_needs = |spec: &JobSpec| JobSpec {
         job_id: String::new(),
         needs: None,
+        labels: spec
+            .labels
+            .iter()
+            .filter(|(key, _)| *key != "size-class")
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
         // The arguments and files name the lease, the grant and the pack url, which are the
         // lease's own: they are compared without the lease's values.
         args: Vec::new(),

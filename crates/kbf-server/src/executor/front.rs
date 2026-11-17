@@ -36,12 +36,14 @@ use kbf_front::action_tree::{BaseTree, PutRetry, TreeWriter};
 use kbf_front::prepare_run::{
     KeptClosure, PrepareError as RunPrepError, PrepareFault, PutDirPrep, PutDirRun,
 };
-use kbf_front::{Backend, IssuedPackKey, IssuedPutDir, PackKeyMint, Packs};
+use kbf_front::{Backend, Described, IssuedPackKey, IssuedPutDir, PackKeyMint, Packs};
 use kbf_proto::reapi::{self, Action, Command, Digest};
 use kbf_types::{DigestFunction, ImageRef, LeaseId};
 use std::sync::Arc;
 
+use crate::action_usage::Shape;
 use crate::executor::mac::System;
+use crate::executor::size_class::SizeClass;
 use crate::executor::task::{PackKey, Secret, build_id};
 use crate::executor::traits::{
     ActionFacts, Ingest, Ingested, Inputs, InputsError, MintError, Presign, PresignError,
@@ -544,10 +546,16 @@ impl Inputs for Front {
         let command: Command = self.read("command", &command).await?;
         let platform = platform_of(&action, &command);
         check_base(platform, &self.parts.base_image, &self.parts.kbf_image)?;
+        let timeout = timeout_of(&action)?;
+        let system = System::of(platform).map_err(InputsError::Invalid)?;
+        // The target and kind of the action, read from its argv and output paths.
+        let described = Described::of(command);
+        let shape = Shape::of(&described.arguments, &described.outputs);
         Ok(ActionFacts {
             image: self.parts.kbf_image.to_string(),
-            timeout: timeout_of(&action)?,
-            system: System::of(platform).map_err(InputsError::Invalid)?,
+            timeout,
+            system,
+            size_class: SizeClass::of_action(&shape),
         })
     }
 

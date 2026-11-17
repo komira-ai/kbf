@@ -70,6 +70,7 @@ async fn building_an_executor_asks_the_job_service_for_nothing() {
         presign: rig.presign.clone(),
         inputs: rig.inputs.clone(),
         metrics: Arc::default(),
+        store: None,
     };
     let none = Config {
         hosts: 0,
