@@ -12,7 +12,9 @@
 //!   blobs, than [`ClosureLimits`] allows, before the Directories under the digest that went
 //!   over are read.
 //! - **Each digest once.** A Directory that several parents name (a Merkle tree repeats them)
-//!   is read when first reached and never again; a file named twice is one digest.
+//!   is read when first reached and never again; a file named twice is one digest. A Directory
+//!   whose digest a file also has (the empty file and the empty Directory are one blob) is
+//!   still read: the closure counts the digest once.
 //! - **Deterministic.** The closure is a sorted set, and the error of two failures is the
 //!   one of the Directory read first in level order (the reads of a level are issued
 //!   together and answered in order), so the same store gives the same answer.
@@ -327,6 +329,10 @@ async fn collect(
         bytes: 0,
     };
     seen.add(root)?;
+    // The Directories queued to be read, apart from `seen`: a file may have a Directory's
+    // digest (the empty file is the empty Directory, `e3b0c442.../0`), and a Directory a file
+    // reached first is still read and kept.
+    let mut queued = BTreeSet::from([root]);
     let mut kept = BTreeMap::new();
     let mut files = Vec::new();
     let mut level = vec![root];
@@ -352,7 +358,8 @@ async fn collect(
             }
             for node in &directory.directories {
                 let child = named_in(&parent, "a subdirectory", node.digest.as_ref())?;
-                if seen.add(child)? {
+                seen.add(child)?;
+                if queued.insert(child) {
                     level.push(child);
                 }
                 if keep {

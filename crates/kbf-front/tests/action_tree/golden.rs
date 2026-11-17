@@ -294,3 +294,39 @@ async fn an_empty_input_root_is_an_empty_work() {
     let entries = rig.farm.flatten(&written).expect("a tree");
     assert_eq!(entries.len() as u64 - 1, Base::FACTS.entries + 4);
 }
+
+/// Catches: an input root holding an empty file and an empty subdirectory (both the empty
+/// blob, `e3b0c442.../0`) refused as a closure that kept no Directory, or written without one
+/// of them: `work` holds the empty file and the empty directory, and tierstore's reader reads
+/// the tree.
+#[tokio::test]
+async fn an_empty_file_beside_an_empty_subdirectory_are_both_in_work() {
+    let rig = Rig::new().await;
+    let empty = kbf_segments::sha256(&[]);
+    let root = rig
+        .store(&directory(
+            vec![file("e", &empty, false)],
+            vec![subdir("d", &empty)],
+            vec![],
+        ))
+        .await;
+    let written = rig.write(&root).await.expect("a tree");
+    let entries = rig
+        .farm
+        .flatten(&written)
+        .expect("the reader takes the tree");
+    let work: Vec<(String, String)> = shape(&entries)
+        .into_iter()
+        .filter(|(parent, _, _)| *parent == Some(10))
+        .map(|(_, name, kind)| (name, kind))
+        .collect();
+    assert_eq!(
+        work,
+        [
+            ("d".to_owned(), "dir".to_owned()),
+            ("e".to_owned(), "file exec=false source=-".to_owned()),
+        ]
+    );
+    // The base's six, the input root's two, and the four the action tree adds.
+    assert_eq!(entries.len() as u64 - 1, Base::FACTS.entries + 2 + 4);
+}
