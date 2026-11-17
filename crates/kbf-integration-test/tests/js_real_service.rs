@@ -298,6 +298,11 @@ async fn the_relay_loses_the_first_answer_after_the_call_applied() {
     assert!(relay.dropped());
     assert!(matches!(lost, Error::Transport(_)), "{lost:?}");
     assert_eq!(fake.jobs().len(), 1, "the lost submit was applied");
+    // The relay closed the connection the lost answer was on. A call on the same client can
+    // still be put on it before the client has seen it close (`Cancelled`, connection closed),
+    // so the repeat goes out from a client of its own, on a new connection, as a caller that
+    // reconnects does.
+    let through = RealJobServer::client_at(&relay.origin(), kbf_job_client::fake::TOKEN);
     let again = through.submit_job(spec("relay-1")).await.unwrap();
     assert_eq!(fake.jobs(), [again]);
 }
@@ -325,6 +330,11 @@ async fn a_held_relay_loses_only_the_answer_after_it_is_armed() {
     assert!(relay.dropped());
     assert!(matches!(lost, Error::Transport(_)), "{lost:?}");
     assert_eq!(fake.jobs().len(), 2, "the lost submit was applied");
+    // The relay closed the connection the lost answer was on. A call on the same client can
+    // still be put on it before the client has seen it close (`Cancelled`, connection closed),
+    // so the repeat goes out from a client of its own, on a new connection, as a caller that
+    // reconnects does.
+    let through = RealJobServer::client_at(&relay.origin(), kbf_job_client::fake::TOKEN);
     let again = through.submit_job(spec("held-2")).await.unwrap();
     let after = through.submit_job(spec("held-3")).await.unwrap();
     let ids: Vec<String> = fake.jobs().into_iter().map(|job| job.id).collect();
