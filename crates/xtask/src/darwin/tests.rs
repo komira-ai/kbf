@@ -2,8 +2,8 @@ use super::*;
 
 /// `codesign --display --verbose=4` of an ad-hoc signed binary with the hardened
 /// runtime, as macOS 15 prints it (abridged to the lines read).
-const INFO: &str = "Executable=/x/kbf-daemon
-Identifier=kbf_daemon-55554944b7a1
+const INFO: &str = "Executable=/x/kbf-deploy
+Identifier=kbf_deploy-55554944b7a1
 Format=Mach-O thin (arm64)
 CodeDirectory v=20500 size=96143 flags=0x10002(adhoc,runtime) hashes=3000+7 location=embedded
 Hash type=sha256 size=32
@@ -39,7 +39,7 @@ fn the_cdhash_and_minos_are_read_from_their_lines() {
         Some("0123456789abcdef0123456789abcdef01234567")
     );
     assert_eq!(cdhash("Signature=adhoc\n"), None);
-    let build = "/x/kbf-daemon:\nLoad command 10\n      cmd LC_BUILD_VERSION\n  \
+    let build = "/x/kbf-deploy:\nLoad command 10\n      cmd LC_BUILD_VERSION\n  \
                  platform MACOS\n    minos 14.0\n      sdk 15.5\n";
     assert_eq!(minos(build), Some("14.0"));
     assert_eq!(minos("      sdk 15.5\n"), None);
@@ -79,7 +79,7 @@ fn sip_counts_as_enabled_only_when_csrutil_says_so() {
 
 #[test]
 fn the_summary_names_the_entitlements_or_none() {
-    // Catches: a summary that leaves the entitlements blank for kbf-daemon, or names
+    // Catches: a summary that leaves the entitlements blank for kbf-deploy, or names
     // only the first of several.
     assert_eq!(granted(&[]), "none");
     assert_eq!(granted(&["a.b".to_owned(), "c.d".to_owned()]), "a.b c.d");
@@ -94,8 +94,8 @@ fn another_host_is_told_the_verbs_need_macos() {
     );
 }
 
-/// The bytes the test tarballs hold as `kbf-daemon`.
-const BINARY: &[u8] = b"kbf-daemon's bytes";
+/// The bytes the test tarballs hold as `kbf-deploy`.
+const BINARY: &[u8] = b"kbf-deploy's bytes";
 
 /// A ustar header as `package` writes it, for `name` of `kind` holding `size` bytes.
 fn header(name: &str, kind: tar::EntryType, size: usize) -> tar::Header {
@@ -145,8 +145,8 @@ fn darwin_asset_takes_only_the_one_entry_package_writes() {
     // that is not the one `package` writes (the refusal dropped, so a tarball with
     // more in it, or a link in place of the binary, would ship once its binary
     // passed), and a binary looked up by another name or outside the tarball's top.
-    let at = Path::new("dist/kbf-daemon-darwin-arm64.tar.gz");
-    let n = "kbf-daemon";
+    let at = Path::new("dist/kbf-deploy-darwin-arm64.tar.gz");
+    let n = "kbf-deploy";
     let regular = || header(n, tar::EntryType::Regular, BINARY.len());
     let refused = |problems: &[&str]| {
         Err(crate::Error::Refused(
@@ -189,10 +189,10 @@ fn darwin_asset_takes_only_the_one_entry_package_writes() {
         ("one good entry", n, whole.clone(), Ok(BINARY.to_vec())),
         (
             "a path for a name",
-            "bin/kbf-daemon",
+            "bin/kbf-deploy",
             whole.clone(),
             Err(crate::Error::Failed(
-                "\"bin/kbf-daemon\" is not a file name".to_owned(),
+                "\"bin/kbf-deploy\" is not a file name".to_owned(),
             )),
         ),
         (
@@ -220,7 +220,7 @@ fn darwin_asset_takes_only_the_one_entry_package_writes() {
                     BINARY,
                 ),
             ]),
-            refused(&["README: the name is not \"kbf-daemon\"", "2 entries, not 1"]),
+            refused(&["README: the name is not \"kbf-deploy\"", "2 entries, not 1"]),
         ),
         (
             "a directory entry",
@@ -230,7 +230,7 @@ fn darwin_asset_takes_only_the_one_entry_package_writes() {
                 (regular(), BINARY),
             ]),
             refused(&[
-                "bin/: the name is not \"kbf-daemon\"",
+                "bin/: the name is not \"kbf-deploy\"",
                 "bin/: the type is Directory, not a regular file",
                 "bin/: the content is not the binary's bytes",
                 "2 entries, not 1",
@@ -240,13 +240,13 @@ fn darwin_asset_takes_only_the_one_entry_package_writes() {
             "a symlink",
             n,
             tgz_of(vec![(symlink, b"")]),
-            refused(&["kbf-daemon: the type is Symlink, not a regular file"]),
+            refused(&["kbf-deploy: the type is Symlink, not a regular file"]),
         ),
         (
             "a hard link",
             n,
             tgz_of(vec![(hard_link, b"")]),
-            refused(&["kbf-daemon: the type is Link, not a regular file"]),
+            refused(&["kbf-deploy: the type is Link, not a regular file"]),
         ),
         (
             "two entries",

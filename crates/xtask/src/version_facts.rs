@@ -79,7 +79,7 @@ pub fn name(commit: &str, platform: Platform) -> String {
 }
 
 /// The facts file that goes with `asset`, when `asset` is a `kbf` tarball
-/// (`kbf-<commit>-<platform>.tar.gz`; the tarballs of `kbf-daemon` and the others start the
+/// (`kbf-<commit>-<platform>.tar.gz`; the tarballs of `kbf-deploy` and the others start the
 /// same way and have none).
 pub fn facts_of(asset: &str) -> Option<String> {
     let stem = asset.strip_suffix(".tar.gz")?;

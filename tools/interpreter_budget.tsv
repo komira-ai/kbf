@@ -26,16 +26,8 @@ packaging/install.sh	the curl|sh entry of kbf-installer, the one shell file the 
 # needs the interpreter, or that it names one only as data. Module
 # crates/kbf-integration-test/tests/interpreters/rust.rs says what the scan reads.
 [test-interpreters]
-crates/kbf-daemon/tests/support/memory.rs	Spec::user_shell: the tests of how the daemon ends a user's own /bin/sh -c command and the background job it starts (`&`, `wait`); every other action runs kbf-testkit act
 crates/kbf-deploy/src/pilot/server_tests.rs	data: a #!/bin/sh file planted where the server binary goes, refused as not an ELF executable; nothing runs it
-crates/kbf-driver-container/src/program.rs	data: sh as another program's name in the crun lookup-report test; nothing runs it
-crates/kbf-driver-container/tests/support/mod.rs	Spec::new: the real-crun tests' action is sh -c inside the test image (busybox), which holds no kbf binary
-crates/kbf-driver-container/tests/support/real.rs	sh(): the same action naming the image's /bin/sh by path, since the action's environment has no PATH
-crates/kbf-driver-container/tests/tree.rs	data: #!/bin/sh bytes as an executable file's content in the tree write and collect tests; nothing runs them
-crates/kbf-driver-native/src/program.rs	data: sh as the program the REAPI PATH lookup resolves; resolved, never run
-crates/kbf-integration-test/tests/cell.rs	the M1 cell test's uploaded action is /bin/sh -c writing out.txt, as a REAPI client's command would be
 crates/kbf-integration-test/tests/interpreters/mod.rs	data: the lint's own lists of interpreter names and extensions
 crates/kbf-integration-test/tests/interpreters/rust.rs	data: the lint's own shell names and osascript
 crates/kbf-integration-test/tests/interpreters/tests.rs	data: the lint's tests' tables of interpreter names, paths and #! lines
 crates/kbf-integration-test/tests/repo_lints.rs	data: the #! files planted in the budget lint's trees
-crates/kbf-node/tests/front/mod.rs	Front::user_shell: the tests of how the daemon ends a user's /bin/sh -c command and its background job (`$$`, `$!` name the processes), sent through the front

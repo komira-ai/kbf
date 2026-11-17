@@ -31,7 +31,7 @@ StartLimitIntervalSec=0
 # simple, not notify: the verb never sends READY=1, so a notify unit would never finish
 # starting. The socket is already held, so a client that arrives meanwhile waits in the backlog.
 Type=simple
-# Not the daemon's user: it runs as kbf-server, the user of the frontends it balances over (as
+# Not the user builds run as (kbf): it runs as kbf-server, the user of the frontends it balances over (as
 # kbf-frontend.service does), so that they can read the identity secret it writes under
 # /run/kbf-proxy.
 User=kbf-server

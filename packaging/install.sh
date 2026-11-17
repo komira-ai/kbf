@@ -12,8 +12,8 @@
 # --help             print this usage and exit 0
 #
 # Envoy is not installed here and is not in the payload: a frontend host installs Envoy
-# (a version in the range the release notes name) from its own package first; storage and
-# daemon hosts do not need it.
+# (a version in the range the release notes name) from its own package first; storage
+# hosts do not need it.
 #
 # The payload (`cargo xtask installer-tarball`) is the Debian package's file list, made
 # from the same Rust list: usr/bin/kbf-installer, usr/lib/systemd/system/kbf-*.service and
@@ -23,7 +23,7 @@
 # no kbf release (`kbf-installer record-release` records the first one). After placing, the
 # script makes the users and directories from those two files (systemd-sysusers and
 # systemd-tmpfiles, on those files only); a host without systemd is refused before
-# anything is placed. macOS has no payload: nodes there get the .pkg.
+# anything is placed. macOS has no payload: no kbf runs on a Mac.
 #
 # SHA256SUMS comes from the same place as the payload, so the check catches a damaged or
 # mixed-up download, not a hostile server: use an https URL, and verify the release's
@@ -84,7 +84,7 @@ if [ -z "${platform+x}" ]; then
   case $host in
     Linux-x86_64) platform=linux-x86_64 ;;
     Linux-aarch64 | Linux-arm64) platform=linux-arm64 ;;
-    Darwin-*) die "macOS has no payload here: install the .pkg or the cask" ;;
+    Darwin-*) die "macOS has no payload here: no kbf runs on a Mac" ;;
     *) die "unsupported platform $host (linux-x86_64 and linux-arm64 are built)" ;;
   esac
 fi

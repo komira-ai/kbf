@@ -118,15 +118,15 @@ struct Release {
 }
 
 impl Release {
-    /// Packages kbf-daemon for every platform and kbf-server for Linux, then
+    /// Packages kbf-deploy for every platform and kbf-server for Linux, then
     /// assembles SHA256SUMS, each through the CLI as the workflow runs it.
     fn build(name: &str) -> Release {
         Release::build_with(
             name,
             &[
-                ("darwin-arm64", &["kbf-daemon"][..]),
-                ("linux-x86_64", &["kbf-daemon", "kbf-server"][..]),
-                ("linux-arm64", &["kbf-daemon", "kbf-server"][..]),
+                ("darwin-arm64", &["kbf-deploy"][..]),
+                ("linux-x86_64", &["kbf-deploy", "kbf-server"][..]),
+                ("linux-arm64", &["kbf-deploy", "kbf-server"][..]),
             ],
         )
     }
@@ -383,12 +383,12 @@ impl Release {
 }
 
 fn first_tarball() -> String {
-    format!("kbf-daemon-{COMMIT}-darwin-arm64.tar.gz")
+    format!("kbf-deploy-{COMMIT}-darwin-arm64.tar.gz")
 }
 
 /// The second tarball in `SHA256SUMS` order, the one the cross-bundle control uses.
 fn second_tarball() -> String {
-    format!("kbf-daemon-{COMMIT}-linux-arm64.tar.gz")
+    format!("kbf-deploy-{COMMIT}-linux-arm64.tar.gz")
 }
 
 /// `commit` with its last digit changed, as `verify-assets` makes the control commit.
@@ -415,7 +415,7 @@ fn the_release_path_packages_sums_and_verifies_every_asset() {
     assert_eq!(lines.len(), 11, "{out}");
     assert_eq!(
         lines[0],
-        format!("verified: kbf-daemon-{COMMIT}-darwin-arm64.cdx.json (provenance)")
+        format!("verified: kbf-deploy-{COMMIT}-darwin-arm64.cdx.json (provenance)")
     );
     assert_eq!(
         lines[1],
@@ -696,9 +696,9 @@ fn a_kbf_tarball_without_its_version_facts_fails_the_sums_check() {
     // lost the step would publish a platform with nothing for a reader of the platform's facts), and the
     // message not naming the tarball and the file missing. The second half is the control:
     // with the facts listed and present the same set passes, so the refusal was for them
-    // and for nothing else, and `kbf-daemon`'s tarball (no facts) is not named. Catches:
+    // and for nothing else, and `kbf-deploy`'s tarball (no facts) is not named. Catches:
     // the pairing taken out of `verify_sums`.
-    let names: &[&str] = &["kbf", "kbf-daemon"];
+    let names: &[&str] = &["kbf", "kbf-deploy"];
     let r = Release::build_with("facts-missing", &[("linux-x86_64", names)]);
     let tarball = format!("kbf-{COMMIT}-linux-x86_64.tar.gz");
     let facts = format!("kbf-{COMMIT}-linux-x86_64.version.json");
@@ -722,7 +722,7 @@ fn version_facts_without_their_kbf_tarball_fail_the_sums_check() {
     // a binary that ships), and a message that does not name both files. The control is
     // the pairing of the test above, with the tarball listed. Catches: the reverse pairing
     // taken out of `verify_sums`.
-    let names: &[&str] = &["kbf-daemon"];
+    let names: &[&str] = &["kbf-deploy"];
     let r = Release::build_with("facts-orphan", &[("linux-x86_64", names)]);
     let facts = r.add_facts("linux-x86_64");
     let (code, out, err) = xtask(&["verify-assets", "sums", s(&r.dist)], &r.tmp, None);
@@ -740,7 +740,7 @@ fn version_facts_are_verified_for_build_provenance_and_nothing_else() {
     // a package nor an SBOM; facts held to what only a tarball has (an SBOM attestation, a
     // bundle: neither exists, and the release check names a bundle of anything else); and
     // facts whose provenance is not checked, or whose missing attestation is passed over.
-    let names: &[&str] = &["kbf", "kbf-daemon"];
+    let names: &[&str] = &["kbf", "kbf-deploy"];
     let r = Release::build_with("facts-attested", &[("linux-x86_64", names)]);
     let facts = r.add_facts("linux-x86_64");
     r.attest(None);
@@ -771,7 +771,7 @@ fn a_task_image_does_not_go_without_its_facts_or_the_facts_without_the_image() {
     // Catches: a release set that lists the task image without the facts that carry the digests
     // of its manifest and base (the attestation would not cover them), and facts left in a set
     // with no image they state anything of. The control is the set with both listed.
-    let names: &[&str] = &["kbf-daemon"];
+    let names: &[&str] = &["kbf-deploy"];
     let r = Release::build_with("image-facts", &[("linux-x86_64", names)]);
     let image = format!("kbf-task-image-{COMMIT}-linux-x86_64.oci.tar");
     let facts = format!("kbf-task-image-{COMMIT}-linux-x86_64.facts.json");
@@ -809,7 +809,7 @@ fn a_task_image_does_not_go_without_its_sbom_or_the_sbom_without_the_image() {
     // describes, the SBOM of the `kbf-task` binary (`kbf-task-<commit>-<platform>.cdx.json`)
     // mistaken for the image's, and a pairing that is checked for one platform only. The control
     // is the set with both listed.
-    let names: &[&str] = &["kbf-daemon"];
+    let names: &[&str] = &["kbf-deploy"];
     let r = Release::build_with("image-sbom", &[("linux-x86_64", names)]);
     let image = format!("kbf-task-image-{COMMIT}-linux-x86_64.oci.tar");
     let facts = format!("kbf-task-image-{COMMIT}-linux-x86_64.facts.json");
@@ -849,7 +849,7 @@ fn the_task_image_is_verified_with_an_sbom_attestation_and_its_sbom_with_provena
     // image's SBOM attestation required of an image that has no SBOM listed (the previous release);
     // the image's bundle dropped because it now has an SBOM attestation too; and the SBOM file
     // refused as neither a tarball, a package nor facts.
-    let names: &[&str] = &["kbf", "kbf-daemon"];
+    let names: &[&str] = &["kbf", "kbf-deploy"];
     let r = Release::build_with("image-sbom-attested", &[("linux-x86_64", names)]);
     let image = format!("kbf-task-image-{COMMIT}-linux-x86_64.oci.tar");
     let facts = format!("kbf-task-image-{COMMIT}-linux-x86_64.facts.json");
@@ -907,7 +907,7 @@ fn a_task_image_with_no_sbom_listed_is_verified_as_before() {
     // Catches: the SBOM attestation required of a task image whose SBOM the set does not list (the
     // previous release, made before the image had one, is read by `release fetch-previous`, which
     // verifies its attestations): provenance and the bundle only.
-    let names: &[&str] = &["kbf", "kbf-daemon"];
+    let names: &[&str] = &["kbf", "kbf-deploy"];
     let r = Release::build_with("image-no-sbom", &[("linux-x86_64", names)]);
     let image = format!("kbf-task-image-{COMMIT}-linux-x86_64.oci.tar");
     let facts = format!("kbf-task-image-{COMMIT}-linux-x86_64.facts.json");
@@ -929,7 +929,7 @@ fn the_facts_of_the_task_image_are_verified_for_build_provenance_and_nothing_els
     // neither a tarball, a package nor an SBOM; facts held to what only a tarball has (an SBOM
     // attestation, a bundle: neither exists); and facts whose provenance is not checked, or
     // whose missing attestation is passed over.
-    let names: &[&str] = &["kbf", "kbf-daemon"];
+    let names: &[&str] = &["kbf", "kbf-deploy"];
     let r = Release::build_with("image-facts-attested", &[("linux-x86_64", names)]);
     let facts = format!("kbf-task-image-{COMMIT}-linux-x86_64.facts.json");
     r.add_listed(&facts, "the facts of the task image\n");
@@ -959,7 +959,7 @@ fn the_base_tree_bundle_is_verified_for_build_provenance_and_nothing_else() {
     // SBOM attestation, a bundle of its own: neither exists); and one whose provenance is not
     // checked, or whose missing attestation is passed over. A name that only ends `.tree.tar`
     // is refused as it was.
-    let names: &[&str] = &["kbf", "kbf-daemon"];
+    let names: &[&str] = &["kbf", "kbf-deploy"];
     let r = Release::build_with("base-tree-attested", &[("linux-x86_64", names)]);
     let bundle = format!("kbf-base-tree-{COMMIT}-linux-x86_64.tree.tar");
     r.add_listed(&bundle, "the kbf base tree\n");
@@ -1251,10 +1251,10 @@ fn a_bundle_verifier_that_ignores_the_commit_or_the_tarball_is_caught_by_the_con
     );
 
     // One tarball: no other bundle to try, so the flipped copy is the control.
-    let one = [("linux-x86_64", &["kbf-daemon"][..])];
+    let one = [("linux-x86_64", &["kbf-deploy"][..])];
     let r = Release::build_with("bundle-flipped", &one);
     r.attest(None);
-    let tarball = format!("kbf-daemon-{COMMIT}-linux-x86_64.tar.gz");
+    let tarball = format!("kbf-deploy-{COMMIT}-linux-x86_64.tar.gz");
     let (code, out, err) = r.verify(WORKFLOW, None);
     assert_eq!(code, Some(0), "{err}: {out}");
     // The tarball itself and the two controls that use its bundle.

@@ -200,10 +200,7 @@ fn a_package_missing_any_of_its_files_is_named() {
             "usr/lib/sysusers.d/kbf.conf",
             "usr/lib/tmpfiles.d/kbf.conf",
             "etc/needrestart/conf.d/kbf.conf",
-            "usr/lib/systemd/system/kbf-all-in-one.service",
-            "usr/lib/systemd/system/kbf-daemon.service",
             "usr/lib/systemd/system/kbf-frontend.service",
-            "usr/lib/systemd/system/kbf-storage-and-daemon.service",
             "usr/lib/systemd/system/kbf-storage.service",
             "usr/lib/systemd/system/kbf.slice",
             "usr/share/kbf/trust/gh",
@@ -221,8 +218,8 @@ fn a_unit_that_the_install_enabled_or_a_process_it_started_is_named() {
     let dir = scratch("apt-enabled");
     let mut machine = Machine::new(&dir);
     machine.enable = vec![
-        "etc/systemd/system/multi-user.target.wants/kbf-storage-and-daemon.service",
-        "etc/systemd/system/kbf-daemon.service",
+        "etc/systemd/system/multi-user.target.wants/kbf-frontend.service",
+        "etc/systemd/system/kbf-storage.service",
         "usr/lib/systemd/system/multi-user.target.wants/kbf-storage.service",
     ];
     machine.running = true;
@@ -231,8 +228,8 @@ fn a_unit_that_the_install_enabled_or_a_process_it_started_is_named() {
     };
     assert_eq!(problems.len(), 4, "{problems:?}");
     for (problem, tail) in problems.iter().zip([
-        "etc/systemd/system/kbf-daemon.service",
-        "etc/systemd/system/multi-user.target.wants/kbf-storage-and-daemon.service",
+        "etc/systemd/system/kbf-storage.service",
+        "etc/systemd/system/multi-user.target.wants/kbf-frontend.service",
         "usr/lib/systemd/system/multi-user.target.wants/kbf-storage.service",
     ]) {
         assert!(problem.starts_with("a unit is enabled: "), "{problems:?}");

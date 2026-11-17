@@ -4,14 +4,11 @@
 # - `macos-test` runs the tests of the macOS crates as an ordinary user: the steps of beta.yml's
 #   `native-macos` that need no root, the task runner's tests (ci.yml's `task-macos` runs them
 #   after the merge), and the other crates whose tests pass on a Mac (the sandbox profile writer,
-#   the update types). Not the whole workspace: its Linux-only test targets do not build on a Mac,
-#   and the tests of the launchd adapters, the step runner and the updater fail there today
-#   (komira-ai/kbf#2283).
-# - `macos-device` runs the rest of `native-macos`: the pinned gh against a real attestation, and
-#   the `.pkg` through Installer as root and the Homebrew cask.
+#   the update types).
+# - `macos-device` runs the rest of `native-macos`: the pinned gh against a real attestation.
 #
-# A macOS action itself runs as a js-agent job (docs/design/actions-as-jobs.md section 14); there
-# is no Mac daemon, so no job here tests one.
+# A macOS action itself runs as a js-agent job (docs/design/actions-as-jobs.md section 14); no
+# kbf runs on a Mac, so no job here tests a kbf program, a package or an installer.
 #
 # Both run unconditionally (no paths filter, no `if:`), so each is a check that can be required:
 # it reports on every pull request and merge queue entry. The repository lint `macos_pr`
@@ -61,23 +58,10 @@ jobs:
       # a full backlog is refused at once, a connect that succeeds leaves the rest only what is left,
       # and a missing or stale socket is a connect error (crates/update-register/src/tests.rs).
       - run: cargo test -p update-register --locked -- --exact tests::a_listener_whose_backlog_is_full_is_refused_at_once tests::the_deadline_left_after_the_connect_is_all_that_follows_gets tests::a_socket_left_by_a_listener_that_is_gone_is_refused tests::a_missing_socket_names_its_path tests::a_deadline_already_passed_does_not_connect
-      # The host installer's layout, offline attestation check and stage, compiled and run
-      # on the platform they name (crates/kbf-installer, docs/deploy/host-releases.md).
-      # Not the tests that need a Postgres server (a hosted Mac has none, and they fail, not
-      # skip, without one; the Linux jobs run them): those in a module named `database` (skipped
-      # by `::database::`), the `provisioned` module of database_tests.rs, and the three
-      # tests of that file and the one of setup/more_tests.rs that use `TestDatabase`.
-      - run: 'cargo test -p kbf-installer --locked -- --skip ::database:: --skip database::tests::provisioned:: --skip database::tests::setup_creates_the_schema_once --skip database::tests::the_update_step_migrates --skip database::tests::the_bounded_step_gives_up --skip setup_creates_the_schema_over_a_real_server'
-      # The same for the setup library (crates/kbf-setup), which holds the `database` module and
-      # setup/more_tests.rs.
-      - run: 'cargo test -p kbf-setup --features proxy --locked -- --skip database::tests::provisioned:: --skip database::tests::setup_creates_the_schema_once --skip database::tests::the_update_step_migrates --skip database::tests::the_bounded_step_gives_up --skip setup_creates_the_schema_over_a_real_server'
       # The task runner's tests without its test-only feature: they run the Command under the
       # macOS confine for real (ci.yml's `task-macos`, which runs them after the merge).
       - run: cargo test -p kbf-task --locked --no-fail-fast
-      # The crates no Mac job tested before whose tests pass on a Mac: the sandbox profile writer
-      # and the update types. kbf-host, kbf-host-install, kbf-step-runner, kbf-updater and
-      # update-hook are not here yet: their tests fail or hang on a Mac (komira-ai/kbf#2283);
-      # ci.yml's Linux check of them for aarch64-apple-darwin holds that they compile.
+      # The crates whose tests pass on a Mac: the sandbox profile writer and the update types.
       - run: cargo test --locked --no-fail-fast -p kbf-seatbelt -p kbf-update
 
   macos-device:
@@ -103,14 +87,3 @@ jobs:
         run: cargo test -p kbf-installer --test real_gh --locked -- --ignored --test-threads=1
         env:
           KBF_TEST_GH: ${{ runner.temp }}/tools/gh
-      # kbf-installer's `.pkg` through Installer and its Homebrew cask
-      # (crates/xtask/tests/pkg_macos.rs): the package as root, then the cask as this user.
-      - run: cargo xtask sudo-test -p xtask --test pkg_macos -- installer
-        if: ${{ !cancelled() }}
-        env:
-          # The oldest macOS the binaries support (the test signs with `--minos 14.0`).
-          MACOSX_DEPLOYMENT_TARGET: "14.0"
-      - run: cargo test -p xtask --test pkg_macos --locked -- --ignored homebrew
-        if: ${{ !cancelled() }}
-        env:
-          MACOSX_DEPLOYMENT_TARGET: "14.0"

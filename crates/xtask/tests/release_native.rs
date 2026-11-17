@@ -54,7 +54,7 @@ fn make_dist(root: &Path, commit: &str, native_name: impl Fn(&str, &str) -> Stri
     let mut sums = String::new();
     for platform in PLATFORMS {
         for name in [
-            format!("kbf-daemon-{commit}-{platform}.tar.gz"),
+            format!("kbf-deploy-{commit}-{platform}.tar.gz"),
             format!("kbf-{commit}-{platform}.deb"),
             native_name(commit, platform),
         ] {

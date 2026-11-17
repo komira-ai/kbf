@@ -54,7 +54,7 @@ pub fn is_bundle(name: &str) -> bool {
 }
 
 /// Whether the asset `name` is a package: a deb of a Linux job (`kbf-installer` or `kbf`), the
-/// frontend image of one (an OCI image tarball) or the `.pkg` of the macOS one.
+/// frontend image of one (an OCI image tarball) or the `.pkg` of the macOS job of an older release.
 pub fn is_package(name: &str) -> bool {
     name.ends_with(".deb")
         || name.ends_with(".pkg")
@@ -62,7 +62,7 @@ pub fn is_package(name: &str) -> bool {
 }
 
 /// Whether the asset `name` has a provenance bundle: a tarball, or a package (a
-/// `kbf-installer` or `kbf` deb, or the `.pkg`), but not an SBOM, which is a subject of the
+/// `kbf-installer` or `kbf` deb, or an older release's `.pkg`), but not an SBOM, which is a subject of the
 /// sums' attestation only.
 pub fn needs_bundle(name: &str) -> bool {
     name.ends_with(".tar.gz") || is_package(name)

@@ -410,7 +410,7 @@ mod tests {
         // Catches: a check that matches the stamp anywhere in the line, or accepts another
         // binary's name or a package version that is not x.y.z[-pre].
         for v in [
-            "kbf-daemon 0.1.0+0123456789ab",
+            "kbf-signer 0.1.0+0123456789ab",
             "kbf-server0.1.0+0123456789ab",
             "xkbf-server 0.1.0+0123456789ab",
             "kbf-server 0.1+0123456789ab",
@@ -457,8 +457,8 @@ mod tests {
                 "kbf-deploy",
             ),
             (
-                format!("dist/kbf-daemon-{COMMIT}-linux-arm64.tar.gz"),
-                "kbf-daemon",
+                format!("dist/kbf-signer-{COMMIT}-linux-arm64.tar.gz"),
+                "kbf-signer",
             ),
             (
                 format!("./dist/kbf-server-{COMMIT}-linux-x86_64.tar.gz"),

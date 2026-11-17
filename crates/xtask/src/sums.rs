@@ -31,7 +31,7 @@
 //!   error), on a GitHub-hosted runner, and every tarball has an SBOM attestation from
 //!   the same workflow: the `gh attestation verify` commands docs/artifacts.md gives.
 //!   A `.deb` or `.pkg` (the `kbf-installer` package, [`crate::pkg_asset`], the `kbf` package,
-//!   [`crate::pkg_kbf_asset`], and [`crate::pkg_macos_asset`]) is listed and verified
+//!   [`crate::pkg_kbf_asset`], and the Mac `.pkg` that older releases list) is listed and verified
 //!   like a tarball except that it has no SBOM attestation: build provenance and its own
 //!   bundle, except a task image that has its SBOM listed ([`crate::pkg_image_sbom`]): it also has an SBOM
 //!   attestation, whose subject is the image tarball. The version facts of a `kbf`

@@ -9,15 +9,13 @@ writes.
 | file | what |
 |---|---|
 | `linux/kbf-host-local-frontend.service`, `linux/host-install-frontend.toml` | the same socket for a host whose frontend is a container (`--frontend-container`), and an example of its `/etc/kbf/host-install-frontend.toml`; use this unit or the next, not both |
-| `linux/kbf-host-local.service` | in the `kbf` deb, enabled: `kbf-host-install --serve --layout deb`, as root: the local socket (`/run/kbf-host-install/local.sock`, mode 0600, owned by `kbf-updater`) that installs the attested package on trial, restarts `kbf-daemon.service`, and goes back by itself at the deadline (`docs/deploy/host-install.md`, "On a Linux daemon host that runs the package"). A host laid out by hand places this file itself without `--layout deb`, with a `--restart-unit` for each unit it runs; it moves to the package once with `kbf-host-install --migrate-to-package` (`docs/deploy/native-package-migration.md`) |
+| `linux/kbf-host-local.service` | in the `kbf` deb, enabled: `kbf-host-install --serve --layout deb`, as root: the local socket (`/run/kbf-host-install/local.sock`, mode 0600, owned by `kbf-updater`) that installs the attested package on trial, restarts `kbf-storage.service`, and goes back by itself at the deadline (`docs/deploy/host-install.md`, "On a Linux storage host that runs the package"). A host laid out by hand places this file itself without `--layout deb`, with a `--restart-unit` for each unit it runs; it moves to the package once with `kbf-host-install --migrate-to-package` (`docs/deploy/native-package-migration.md`) |
 | `linux/kbf-updater-agent.service` | in the `kbf` deb, enabled: `kbf-updater agent`, as `kbf-updater`: the heartbeat to the coordinator and the host's A/B through that socket |
 | `linux/kbf-updater.conf` | in the `kbf` deb, as `/usr/lib/sysusers.d/kbf-updater.conf`: the sysusers.d entry of the `kbf-updater` account (no login, no home), and of the group `updater-register` whose members may register with the root part |
 | `linux/kbf-updater-root.service` | `kbf-updater root`, as root: the root part of the generic host updater (below) |
 | `linux/kbf-updater-root.conf` | the tmpfiles.d entry of `/run/updater`, the directory of the registration socket: root's, group `updater-register`, mode 0750 |
 | `linux/updater.d/kbf.toml`, `linux/install-declaration.txt` | the declaration of the kbf hook, and the commands that install it as `/etc/updater.d/kbf.toml`, root-owned, mode 0644 |
 | `enroll-example.txt` | the enrollment command, as the tests read it |
-| `macos/com.komira.kbf-host-install-local.plist` | the same socket on a Mac, as root, in `/var/db/kbf-host-install` |
-| `macos/com.komira.kbf-updater-agent.plist` | the agent on a Mac, as `_kbf-updater` |
 
 The values in the files are examples (`coordinator.farm.example`, `frontend.farm.example`, the
 state directory): a host that runs the package gives the farm's in a drop-in (below); one laid out
@@ -31,7 +29,7 @@ is not root.
 The `kbf` deb installs `kbf-host-local.service` and `kbf-updater-agent.service` to
 `/usr/lib/systemd/system` and enables both with its own links in
 `/usr/lib/systemd/system/multi-user.target.wants/`, with no script (`packaging/linux/README.md`).
-Both are gated on their programs, which no package carries. A new Linux daemon host is then:
+Both are gated on their programs, which no package carries. A new Linux storage host is then:
 
 1. **The package**: `apt-get install ./kbf-<commit>-linux-<arch>.deb` (or `dpkg --install`), of the
    release the farm runs.
@@ -51,7 +49,7 @@ Both are gated on their programs, which no package carries. A new Linux daemon h
    ```
 
    The helper's channels are `/etc/kbf/host-install-releases.toml`, as for any Linux host
-   (`docs/deploy/host-install.md`, "On Linux"). The shipped helper restarts `kbf-daemon.service`:
+   (`docs/deploy/host-install.md`, "On Linux"). The shipped helper restarts `kbf-storage.service`:
    a host whose kbf runs under another mode unit gives the helper's whole line in a drop-in of
    `kbf-host-local.service` the same way, with its own `--restart-unit`.
 4. **Boot**, or run what a boot runs: `systemd-sysusers` (the `kbf-updater` account), then
@@ -76,9 +74,8 @@ copy both units to `/etc/systemd/system` on such hosts and `systemctl enable` th
 
 A host gets its updater certificate from the farm CA with a one-time token. On the frontend,
 the operator makes the token for this host (`POST /v1/enroll/tokens`, `docs/api.md`) with
-`"roles": ["updater"]`, the host's `node_id` and its `host_role` (`storage`, `daemon` or
-`mac-daemon`); it is good for one use. On the host, as the agent's account (`kbf-updater`, or
-`_kbf-updater` on a Mac), with the token in a file of that account's, mode 0600:
+`"roles": ["updater"]`, the host's `node_id` and its `host_role` (`storage`; the roles
+`daemon` and `mac-daemon` of earlier releases are still read); it is good for one use. On the host, as the agent's account (`kbf-updater`), with the token in a file of that account's, mode 0600:
 
 ```sh
 install -d -o kbf-updater -m 0700 /var/lib/kbf-updater
@@ -107,11 +104,9 @@ command, which `crates/kbf-updater/tests/agent_packaging.rs` checks against the 
   so give `--cordon-dir /var/lib/kbf-updater` (the unit's `StateDirectory`) or a directory named
   in `ReadWritePaths=`. The agent checks it at start and refuses to start with one it cannot
   write.)
-- **A configuration for the helper's channels**: on Linux `/etc/kbf/host-install-releases.toml`,
-  on a Mac the existing `host-install.toml`. See `docs/deploy/host-install.md`, "The local socket".
+- **A configuration for the helper's channels**: `/etc/kbf/host-install-releases.toml`. See `docs/deploy/host-install.md`, "The local socket".
 - **No operator token, as shipped.** The drain of the node, its undrain and its status (a storage
-  host's: its own storage health) are calls to the frontend's worker listener (`--frontend`, the
-  address daemons dial) made over mutual TLS with the host's own certificate. The frontend
+  host's: its own storage health) are calls to the frontend's worker listener (`--frontend`) made over mutual TLS with the host's own certificate. The frontend
   serves exactly those four, for the node in the certificate and no other, and nothing else from
   an updater's certificate; no token is involved (`docs/design/updates.md`, "Trust"). The
   worker listener must offer `http/1.1` beside `h2`, which `--worker-tls-*` does. An operator who

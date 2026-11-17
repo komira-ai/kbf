@@ -40,7 +40,7 @@ fn the_helper_names_exactly_one_layout_deb_as_a_whole_word() {
             [format!(
                 "kbf-host-local.service does not install the package (exactly one --layout deb): \
                  \"ExecStart=/usr/libexec/kbf/kbf-host-install --serve {layout} --restart-unit \
-                 kbf-daemon.service\""
+                 kbf-storage.service\""
             )],
             "{defect:?}"
         );

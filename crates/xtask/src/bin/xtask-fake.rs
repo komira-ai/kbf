@@ -1,7 +1,7 @@
 //! `xtask-fake`: what this crate's tests run in place of `cargo`, of a built
 //! `kbf-server`, of `gh` and of `sudo`, so `build-commit stamps` is tested
 //! without building the server, `verify-assets attestations` without GitHub, and
-//! `sudo-test` and `crun-tests` without root or systemd.
+//! `sudo-test` without root or systemd.
 //!
 //! - Run under any name but `kbf-server`, `gh`, `sudo`, `syft`, `uname`, `id`, `systemd-sysusers` or
 //!   `systemd-tmpfiles`, it is cargo: it
@@ -34,11 +34,9 @@
 //!   more files beside it do: `kbf.env` (when it exists, the fake overwrites it with `ran` and one `NAME=value`
 //!   line per variable it was given) and `kbf.mode` (`fail`: print the answer, then exit 1;
 //!   `hang`: never answer, for two minutes).
-//! - Run as `kbf-installer`, it is the STUB of the real kbf-installer, which the package
-//!   build and its macOS install test ship until the real tool is built there (one path
-//!   change in `crates/xtask/tests/pkg_macos.rs`): it prints `kbf-installer-stub` and
-//!   its arguments on stdout and on stderr, and exits 0, so `--version` passes the
-//!   signing check and a job that runs it leaves its arguments in its log.
+//! - Run as `kbf-installer`, it is the STUB of the real kbf-installer: it prints
+//!   `kbf-installer-stub` and its arguments on stdout and on stderr, and exits 0, so a job
+//!   that runs it leaves its arguments in its log.
 //!   With `XTASK_FAKE_INSTALLER_VERSION=<stamp>` and the one argument `--version` it
 //!   prints `kbf-installer 0.1.0+<stamp>` instead.
 //! - Run as `rustc`, it fails (a toolchain that is not there).

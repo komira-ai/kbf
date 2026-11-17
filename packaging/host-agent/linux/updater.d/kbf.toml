@@ -30,7 +30,7 @@ capabilities = ["CAP_DAC_OVERRIDE"]
 read_paths   = ["/run/kbf-host-install", "/var/lib/kbf-updater"]
 write_paths  = []
 # The unit the helper restarts on the hook's `cutover` (its --restart-unit).
-units        = ["kbf-daemon.service"]
+units        = ["kbf-storage.service"]
 address_families = ["AF_UNIX", "AF_INET", "AF_INET6"]
 environment  = { }
 

@@ -2,7 +2,7 @@
 
 - `install.sh`: the curl|sh entry of `kbf-installer`
   (docs/design/kbf-installer.md section 9 P11, docs/design/distribution.md section 2).
-  It detects the platform (`linux-x86_64`, `linux-arm64`; a Mac gets the `.pkg`),
+  It detects the platform (`linux-x86_64`, `linux-arm64`; no kbf runs on a Mac),
   downloads `SHA256SUMS` and the `kbf-installer-payload-<commit>-<platform>.tar.gz` it
   lists from a release URL, refuses unless the tarball's sha256 is the listed one and
   every entry is a regular file at a path the package owns, then places the files under
@@ -40,7 +40,7 @@
   one no other verifier accepts (not the frontend proxy's), so a token minted for another
   service cannot set the desired state. An updater certificate is not revocable: a stolen
   one acts only as its own node, but it can hold its role's update slot or report a dead host
-  healthy, and an old version reported by any daemon, storage or Mac host holds back the
+  healthy, and an old version reported by any storage host holds back the
   frontends. Replace the farm CA or let the certificate expire to end it.
 - `host-agent/`: the files of a host's update agent (`host-agent/README.md`). The `kbf` deb ships
   and enables the helper's and the agent's units and the agent's account from `host-agent/linux`

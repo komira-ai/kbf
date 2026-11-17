@@ -146,13 +146,7 @@ fn pkg_config_writes_the_kbf_package() {
     assert!(!yaml.contains("breaks"), "{yaml}");
     let listing = std::fs::read_to_string(dir.join("out/listing.txt")).expect("listing");
     assert!(listing.contains(" 0755 /usr/bin/kbf "), "{listing}");
-    for unit in [
-        "all-in-one",
-        "daemon",
-        "frontend",
-        "storage",
-        "storage-and-daemon",
-    ] {
+    for unit in ["frontend", "storage"] {
         let path = format!(" /usr/lib/systemd/system/kbf-{unit}.service ");
         assert!(listing.contains(&path), "{path} in {listing}");
     }
@@ -168,7 +162,6 @@ fn pkg_config_writes_the_kbf_package() {
         assert!(listing.contains(path), "{path} in {listing}");
     }
     assert!(!listing.contains("kbf-installer"), "{listing}");
-    assert!(!listing.contains("kbf-node.service"), "{listing}");
     for line in [
         "link 0777 /usr/lib/systemd/system/multi-user.target.wants/kbf-host-local.service ../kbf-host-local.service deb",
         "link 0777 /usr/lib/systemd/system/multi-user.target.wants/kbf-updater-agent.service ../kbf-updater-agent.service deb",
@@ -190,7 +183,7 @@ fn pkg_config_writes_the_kbf_package() {
         );
     }
     assert_eq!(listing.lines().filter(|l| l.ends_with(" deb")).count(), 5);
-    assert_eq!(listing.lines().count(), 20, "{listing}");
+    assert_eq!(listing.lines().count(), 17, "{listing}");
 }
 
 /// Asserts that `pkg-config` without `--host-agent` is a usage error that names it and writes
@@ -310,7 +303,7 @@ fn pkg_build_and_pkg_install_test_report_a_program_that_fails() {
         "--image-dir",
         s(&image),
         "--gate",
-        "kbf-node.service=/etc/kbf/kbf.toml",
+        "kbf-storage.service=/etc/kbf/kbf.toml",
         "--docker",
         FALSE,
     ]);
@@ -459,7 +452,7 @@ fn pkg_config_makes_the_native_package_without_the_host_agent_at_the_native_vers
     assert!(!yaml.contains("kbf-host-local"), "{yaml}");
     assert!(!yaml.contains("kbf-updater"), "{yaml}");
     assert!(!yaml.contains("wants"), "{yaml}");
-    assert!(yaml.contains("kbf-storage-and-daemon.service"), "{yaml}");
+    assert!(yaml.contains("kbf-storage.service"), "{yaml}");
     let both = run(
         &[
             "--no-host-agent",
@@ -659,10 +652,7 @@ fn kbf_deb_of(kbf: &[u8], source_ref: &str) -> Vec<u8> {
     let conf = format!("SOURCE_REFS={source_ref}\n");
     let mut files: Vec<(&str, u32, &[u8])> = vec![("usr/bin/kbf", 0o755, kbf)];
     for unit in [
-        "usr/lib/systemd/system/kbf-all-in-one.service",
-        "usr/lib/systemd/system/kbf-daemon.service",
         "usr/lib/systemd/system/kbf-frontend.service",
-        "usr/lib/systemd/system/kbf-storage-and-daemon.service",
         "usr/lib/systemd/system/kbf-storage.service",
         "usr/lib/systemd/system/kbf.slice",
         "usr/lib/systemd/system/kbf-host-local.service",

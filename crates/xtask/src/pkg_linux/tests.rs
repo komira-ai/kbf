@@ -86,7 +86,7 @@ fn packaging() -> PathBuf {
 fn real_inputs(root: &Path) -> Inputs<'_> {
     let at = |rel: &str| -> &'static Path { Box::leak(root.join(rel).into_boxed_path()) };
     Inputs {
-        kbf: at("units/kbf-daemon.service"),
+        kbf: at("units/kbf-storage.service"),
         units: at("units"),
         trust: at("testdata/trust"),
         sysusers: at("sysusers.d/kbf-installer.conf"),
@@ -130,14 +130,8 @@ fn the_plan_is_the_contract_paths_with_their_modes() {
     let want: Vec<Seen> = vec![
         file("/etc/needrestart/conf.d/kbf.conf", 0o644),
         file("/usr/bin/kbf", 0o755),
-        file("/usr/lib/systemd/system/kbf-all-in-one.service", 0o644),
-        file("/usr/lib/systemd/system/kbf-daemon.service", 0o644),
         file("/usr/lib/systemd/system/kbf-frontend.service", 0o644),
         agent("/usr/lib/systemd/system/kbf-host-local.service"),
-        file(
-            "/usr/lib/systemd/system/kbf-storage-and-daemon.service",
-            0o644,
-        ),
         file("/usr/lib/systemd/system/kbf-storage.service", 0o644),
         agent("/usr/lib/systemd/system/kbf-updater-agent.service"),
         file("/usr/lib/systemd/system/kbf.slice", 0o644),
@@ -192,10 +186,10 @@ fn the_plan_refuses_what_the_package_does_not_ship() {
         (
             "a missing mode unit",
             |t| {
-                std::fs::remove_file(t.dir.join("units/kbf-daemon.service")).expect("rm");
+                std::fs::remove_file(t.dir.join("units/kbf-frontend.service")).expect("rm");
                 t.inputs()
             },
-            "unit file kbf-daemon.service is missing",
+            "unit file kbf-frontend.service is missing",
         ),
         (
             "a missing slice",
@@ -289,7 +283,7 @@ fn the_plan_refuses_what_the_package_does_not_ship() {
         assert!(text.contains(says), "{what}: {text}");
     }
     let t = Tree::new("collects");
-    std::fs::remove_file(t.dir.join("units/kbf-daemon.service")).expect("rm");
+    std::fs::remove_file(t.dir.join("units/kbf-frontend.service")).expect("rm");
     std::fs::remove_file(t.dir.join("units/kbf-storage.service")).expect("rm");
     std::fs::remove_file(t.dir.join("trust/gh")).expect("rm");
     std::fs::remove_file(t.dir.join("host-agent/kbf-updater-agent.service")).expect("rm");
@@ -484,12 +478,12 @@ fn write_config_writes_both_files_and_says_so() {
 #[test]
 fn write_config_refuses_a_missing_mode_unit_and_writes_nothing() {
     let t = Tree::new("write-no-mode-unit");
-    std::fs::remove_file(t.dir.join("units/kbf-daemon.service")).expect("rm");
+    std::fs::remove_file(t.dir.join("units/kbf-frontend.service")).expect("rm");
     let out = t.dir.join("out");
     let err = write_config(&t.inputs(), &out).expect_err("a unit is missing");
     let text = err.to_string();
     assert!(
-        text.contains("unit file kbf-daemon.service is missing"),
+        text.contains("unit file kbf-frontend.service is missing"),
         "{text}"
     );
     assert!(!out.exists());

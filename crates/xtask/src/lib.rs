@@ -97,15 +97,6 @@
 //!   carries, in the one form a deb and an rpm put in the same order, and the most a package
 //!   that carries a kbf release may weigh. `pkg-config` and `pkg-kbf-asset` take them up with
 //!   the release.
-//! - `pkg-macos-asset` and `pkg-macos-install-test` ([`pkg_macos_asset`],
-//!   [`pkg_macos_install`]): the Mac `.pkg` as the release asset
-//!   `kbf-installer-<commit>-darwin-arm64.pkg`, refused unless it holds the attested
-//!   binary, the pinned `gh`, a trusted root and trusts the branch it is attested for; and
-//!   its install as root on a Mac, every file checked and nothing started.
-//! - `pkg build --binary <path> --launchd-plist <path> [--trust <path>]... --version <v>
-//!   --out <dir>` and `pkg cask` ([`pkg`]): kbf-installer for a Mac, a `.pkg` that is
-//!   the same bytes on every host and installs a root-owned tree and a LaunchDaemon that
-//!   is not loaded, and the Homebrew cask for it (no formula: contract section 7).
 //! - `sums assemble <dir>` and `verify-assets {sums,attestations} <dir>` ([`sums`]): the
 //!   one `SHA256SUMS` over every platform's assets, and the checks the attest job and
 //!   a deployment make of it, each with a control that must fail.
@@ -136,9 +127,6 @@
 //!   when the disk of `<path>` has less free space than the coverage run needs.
 //! - `static-elf <binary>` ([`static_elf`]): exit 1 unless the ELF64 binary is statically
 //!   linked: no `PT_INTERP` program header and no `DT_NEEDED` entry.
-//! - `crun-tests [--sudo <path>]` ([`crun_tests`]): the container driver's real-`crun`
-//!   tests on a hosted Linux runner, each test target in its own `Delegate=yes` system
-//!   unit.
 //! - `sudo-test -p <package> --test <name> [--sudo <path>] [-- <test args>]`
 //!   ([`sudo_test`]): one integration test target built as this user, then its
 //!   `#[ignore]` tests run as root through `sudo -n`.
@@ -159,7 +147,6 @@ pub mod budget;
 pub mod build_commit;
 pub mod bundles;
 pub mod channels;
-pub mod crun_tests;
 pub mod darwin;
 pub mod debs;
 pub mod deploy_farm;
@@ -172,16 +159,12 @@ pub mod merge_profiles;
 pub mod package;
 pub mod pipeline_rerun;
 pub mod pipeline_watch;
-pub mod pkg;
 pub mod pkg_asset;
 pub mod pkg_image_asset;
 pub mod pkg_image_sbom;
 pub mod pkg_install;
 pub mod pkg_kbf_asset;
 pub mod pkg_linux;
-pub mod pkg_macos_asset;
-#[cfg(target_os = "macos")]
-pub mod pkg_macos_install;
 pub mod pkg_size;
 pub mod pkg_trust;
 pub mod pkg_upgrade;
@@ -592,50 +575,6 @@ enum Verb {
         #[arg(long, default_value = "docker")]
         docker: PathBuf,
     },
-    /// The kbf-installer `.pkg` as a release asset, refused unless it holds the attested
-    /// binary, the pinned gh, a trusted root and trusts the branch it is attested for.
-    PkgMacosAsset {
-        /// The `.pkg` `pkg build` wrote, or the directory holding the one (with
-        /// `--verify-only`: the asset itself).
-        #[arg(long)]
-        package: PathBuf,
-        /// The commit it was built from (`$GITHUB_SHA`).
-        #[arg(long)]
-        commit: String,
-        /// The `kbf-installer-<commit>-darwin-arm64.tar.gz` whose binary the package must hold.
-        #[arg(long)]
-        binary_tarball: PathBuf,
-        /// The branch the package must trust, and is attested for (`$GITHUB_REF`).
-        #[arg(long)]
-        expect_ref: String,
-        /// The pinned `gh` the package's must be byte for byte (optional with --verify-only).
-        #[arg(long)]
-        gh: Option<PathBuf>,
-        /// The directory the asset and its line of `SHA256SUMS.darwin-arm64` go in.
-        #[arg(
-            long,
-            required_unless_present = "verify_only",
-            conflicts_with = "verify_only"
-        )]
-        out: Option<PathBuf>,
-        /// Only check `--package`, which must be named as the asset; write nothing.
-        #[arg(long)]
-        verify_only: bool,
-    },
-    /// Install the `.pkg` on this Mac as root and check what it placed and that nothing
-    /// started (macOS only).
-    PkgMacosInstallTest {
-        /// The `.pkg`, or the directory holding the one.
-        #[arg(long)]
-        package: PathBuf,
-        /// A command to run after the install and what its output must contain:
-        /// `<program> <argument>..::<text>` (the command exits 0).
-        #[arg(long)]
-        probe: Vec<pkg_install::Probe>,
-    },
-    /// kbf-installer for a Mac: its `.pkg`, and the Homebrew cask.
-    #[command(subcommand)]
-    Pkg(PkgVerb),
     /// Sign a macOS binary in place, ad hoc with the hardened runtime and the
     /// entitlements the allow list gives its file name, and check it (macOS only).
     SignDarwin {
@@ -659,13 +598,6 @@ enum Verb {
     /// A GitHub release of a `main` commit's attested assets, never rebuilt.
     #[command(subcommand)]
     Release(ReleaseVerb),
-    /// Run the container driver's real-crun tests on a hosted Linux runner, each
-    /// test target in its own Delegate=yes system unit as this user.
-    CrunTests {
-        /// The sudo program; it is run with `-n`, so it never prompts.
-        #[arg(long, default_value = "sudo")]
-        sudo: PathBuf,
-    },
     /// Build one integration test target, then run its ignored tests as root.
     SudoTest {
         /// The package the target is in.
@@ -680,47 +612,6 @@ enum Verb {
         /// Arguments for the test binary (after `--`), such as a test name.
         #[arg(last = true)]
         args: Vec<String>,
-    },
-}
-
-#[derive(Subcommand)]
-enum PkgVerb {
-    /// Write `kbf-installer-<version>-macos-arm64.pkg` in `--out`.
-    Build {
-        /// The kbf-installer binary, signed ad hoc.
-        #[arg(long)]
-        binary: PathBuf,
-        /// The LaunchDaemon property list; refused unless the job is gated on the
-        /// configuration file.
-        #[arg(long)]
-        launchd_plist: PathBuf,
-        /// A trust file to install in /usr/local/kbf-installer/trust (repeatable).
-        #[arg(long)]
-        trust: Vec<PathBuf>,
-        /// The release's version: letters, digits and `. _ + -`.
-        /// (One of the two is required; the verb says so, exit 2.)
-        #[arg(long, conflicts_with = "version_of")]
-        version: Option<String>,
-        /// Take the version from this binary's `--version` (`<version>+<12 of the commit>`).
-        #[arg(long)]
-        version_of: Option<PathBuf>,
-        /// The directory the package goes in; created when missing.
-        #[arg(long)]
-        out: PathBuf,
-    },
-    /// Write the Homebrew cask that installs a package `pkg build` wrote.
-    Cask {
-        /// The package, named as `pkg build` names it.
-        #[arg(long)]
-        pkg: PathBuf,
-        #[arg(long)]
-        version: String,
-        /// Where Homebrew downloads the package from (https:// or file:///).
-        #[arg(long)]
-        url: String,
-        /// The cask file to write; it must not exist.
-        #[arg(long)]
-        out: PathBuf,
     },
 }
 
@@ -1142,11 +1033,6 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             test: &test,
             args: &args,
         }),
-        Verb::CrunTests { sudo } => crun_tests::run(&crun_tests::CrunTests {
-            cargo: &cargo_program(),
-            sudo: &sudo,
-            root: &root,
-        }),
         Verb::Channels { verb } => Ok(channels::run(verb)?),
         Verb::Advisories(args) => advisories::run(&args, &root, &cargo_program()),
         Verb::WaitArtifacts(args) => wait_artifacts::run(&args, &root, &cargo_program()),
@@ -1319,33 +1205,6 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             }
             _ => pkg_image_sbom::verify(&image, service, &commit, platform),
         },
-        Verb::PkgMacosAsset {
-            package,
-            commit,
-            binary_tarball,
-            expect_ref,
-            gh,
-            out,
-            verify_only,
-        } => pkg_macos_asset::asset(
-            &pkg_asset::sole(&package, "pkg")?,
-            &commit,
-            &match (&out, verify_only) {
-                (Some(out), false) => pkg_asset::Mode::Add(out),
-                _ => pkg_asset::Mode::VerifyOnly,
-            },
-            &pkg_macos_asset::Check {
-                binary_tarball: &binary_tarball,
-                expect_ref: &expect_ref,
-                gh: gh.as_deref(),
-            },
-        ),
-        #[cfg(target_os = "macos")]
-        Verb::PkgMacosInstallTest { package, probe } => {
-            pkg_macos_install::run_test(&pkg_asset::sole(&package, "pkg")?, &probe)
-        }
-        #[cfg(not(target_os = "macos"))]
-        Verb::PkgMacosInstallTest { .. } => Err(darwin::needs_macos("pkg-macos-install-test")),
         Verb::PkgInstallTest {
             name,
             package,
@@ -1392,33 +1251,6 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
                 container: &format!("kbf-pkg-upgrade-{}", std::process::id()),
             },
         ),
-        Verb::Pkg(PkgVerb::Build {
-            binary,
-            launchd_plist,
-            trust,
-            version,
-            version_of,
-            out,
-        }) => {
-            let version = match (version, version_of) {
-                (Some(version), _) => version,
-                (None, Some(of)) => pkg_asset::binary_version(&of)?,
-                (None, None) => return Err(Error::Usage("--version or --version-of".to_owned())),
-            };
-            pkg::build(&pkg::Build {
-                binary: &binary,
-                plist: &launchd_plist,
-                trust: &trust,
-                version: &version,
-                out: &out,
-            })
-        }
-        Verb::Pkg(PkgVerb::Cask {
-            pkg,
-            version,
-            url,
-            out,
-        }) => pkg::cask(&pkg, &version, &url, &out),
         #[cfg(target_os = "macos")]
         Verb::SignDarwin {
             binary,

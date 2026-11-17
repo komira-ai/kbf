@@ -375,7 +375,7 @@ fn check_json_reports_a_json_form_that_fails_or_is_not_an_object() {
 #[test]
 fn check_without_json_does_not_run_the_json_form() {
     // Catches: the identity check made implicit for every binary, so the kbf-server and
-    // kbf-daemon checks (which print no JSON) would fail: here a `kbf` whose JSON is
+    // kbf-deploy checks (which print no JSON) would fail: here a `kbf` whose JSON is
     // wrong still passes a plain check.
     let (bin, _own) = kbf("json-not-asked", &HEAD[..12], "garbage");
     let out = xtask(Path::new("."), &["build-commit", "check"])
@@ -427,12 +427,8 @@ fn the_darwin_verbs_fail_off_macos() {
     for (args, verb) in [
         (&["sign-darwin", "x", "--minos", "14.0"][..], "sign-darwin"),
         (
-            &["darwin-asset", "x.tar.gz", "kbf-daemon"][..],
+            &["darwin-asset", "x.tar.gz", "kbf-deploy"][..],
             "darwin-asset",
-        ),
-        (
-            &["pkg-macos-install-test", "--package", "x"][..],
-            "pkg-macos-install-test",
         ),
     ] {
         let (code, out, err) = outcome(Command::new(XTASK).args(args).output().expect("run"));

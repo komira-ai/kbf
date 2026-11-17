@@ -416,23 +416,23 @@ fn a_package_whose_agent_units_are_not_enabled_is_refused() {
     let mut fix = Fix::new();
     for (p, target) in &mut fix.links {
         if p == unlinked {
-            *target = "../kbf-daemon.service".to_owned();
+            *target = "../kbf-storage.service".to_owned();
         }
     }
     assert_eq!(
         found("misdirected", &fix),
         [format!(
-            "{unlinked} points to \"../kbf-daemon.service\", not \"../kbf-updater-agent.service\""
+            "{unlinked} points to \"../kbf-storage.service\", not \"../kbf-updater-agent.service\""
         )]
     );
     let mut fix = Fix::new();
-    let extra = "usr/lib/systemd/system/multi-user.target.wants/kbf-daemon.service";
+    let extra = "usr/lib/systemd/system/multi-user.target.wants/kbf-storage.service";
     fix.links
-        .push((extra.to_owned(), "../kbf-daemon.service".to_owned()));
+        .push((extra.to_owned(), "../kbf-storage.service".to_owned()));
     assert_eq!(
         found("extra-link", &fix),
         [format!(
-            "holds the link {extra} -> ../kbf-daemon.service, which the kbf package does not ship"
+            "holds the link {extra} -> ../kbf-storage.service, which the kbf package does not ship"
         )]
     );
 }
@@ -445,9 +445,10 @@ fn a_package_whose_agent_units_are_not_enabled_is_refused() {
 #[test]
 fn a_package_that_holds_a_path_twice_is_refused() {
     let link = "usr/lib/systemd/system/multi-user.target.wants/kbf-updater-agent.service";
-    let wrong = (link.to_owned(), "../kbf-daemon.service".to_owned());
-    let points =
-        format!("{link} points to \"../kbf-daemon.service\", not \"../kbf-updater-agent.service\"");
+    let wrong = (link.to_owned(), "../kbf-storage.service".to_owned());
+    let points = format!(
+        "{link} points to \"../kbf-storage.service\", not \"../kbf-updater-agent.service\""
+    );
     for wrong_first in [false, true] {
         let mut fix = Fix::new();
         if wrong_first {

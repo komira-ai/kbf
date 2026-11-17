@@ -537,7 +537,7 @@ fn dist(root: &Path, commit: &str) -> PathBuf {
     let mut sums = String::new();
     for platform in ["darwin-arm64", "linux-arm64", "linux-x86_64"] {
         for ext in ["cdx.json", "tar.gz"] {
-            let name = format!("kbf-daemon-{commit}-{platform}.{ext}");
+            let name = format!("kbf-deploy-{commit}-{platform}.{ext}");
             let bytes = format!("{name} bytes");
             std::fs::write(dist.join(&name), &bytes).expect("asset");
             let sha = sha_of(&bytes);
@@ -576,7 +576,7 @@ fn check_passes_the_assets_of_the_commit() {
 
 /// The tarball of the platform `platform` in [`dist`].
 fn tarball(commit: &str, platform: &str) -> String {
-    format!("kbf-daemon-{commit}-{platform}.tar.gz")
+    format!("kbf-deploy-{commit}-{platform}.tar.gz")
 }
 
 /// The SHA-256 [`dist`] lists for the tarball of the platform `platform`.
@@ -609,9 +609,9 @@ fn check_refuses_a_bundle_no_listed_tarball_owns() {
     // both halves: none missing, none left over.
     let root = scratch("check-extra-bundle");
     let dist = dist(&root, COMMIT);
-    let sbom = format!("kbf-daemon-{COMMIT}-linux-arm64.cdx.json");
+    let sbom = format!("kbf-deploy-{COMMIT}-linux-arm64.cdx.json");
     let strays = [
-        format!("kbf-daemon-{OTHER}-linux-arm64.tar.gz.sigstore.json"),
+        format!("kbf-deploy-{OTHER}-linux-arm64.tar.gz.sigstore.json"),
         format!("{sbom}.sigstore.json"),
         ".sigstore.json".to_owned(),
         format!(
@@ -794,14 +794,14 @@ fn check_refuses_assets_of_another_commit_or_of_no_binary() {
     assert_eq!(err.lines().count(), 6, "{err}");
     assert!(
         err.contains(&format!(
-            "kbf-daemon-{OTHER}-linux-arm64.tar.gz: not an asset of {COMMIT}"
+            "kbf-deploy-{OTHER}-linux-arm64.tar.gz: not an asset of {COMMIT}"
         )),
         "{err}"
     );
     for bad in [
         format!("-{COMMIT}-linux-arm64.tar.gz"),
-        format!("kbf-daemon-{COMMIT}-windows-x86_64.tar.gz"),
-        format!("kbf-daemon-{COMMIT}-linux-arm64.zip"),
+        format!("kbf-deploy-{COMMIT}-windows-x86_64.tar.gz"),
+        format!("kbf-deploy-{COMMIT}-linux-arm64.zip"),
         "notes.txt".to_owned(),
     ] {
         let root = scratch("check-bad-name");
@@ -985,7 +985,7 @@ fn check_refuses_version_facts_that_are_not_kbfs_for_the_commit() {
     // `is_facts_of` has a test of its own for that name. Catches: the exact name replaced by
     // the suffix.
     for bad in [
-        format!("kbf-daemon-{COMMIT}-linux-arm64.version.json"),
+        format!("kbf-deploy-{COMMIT}-linux-arm64.version.json"),
         format!("kbf-{COMMIT}-windows-x86_64.version.json"),
         format!("kbf-{COMMIT}-linux-arm64.version.json.bak"),
     ] {
@@ -1003,7 +1003,7 @@ fn check_refuses_a_changed_file() {
     let root = scratch("check-changed");
     let dist = dist(&root, COMMIT);
     std::fs::write(
-        dist.join(format!("kbf-daemon-{COMMIT}-linux-arm64.tar.gz")),
+        dist.join(format!("kbf-deploy-{COMMIT}-linux-arm64.tar.gz")),
         "other",
     )
     .expect("change");
@@ -1427,7 +1427,7 @@ fn publish_refuses_a_held_asset_that_is_not_the_verified_file() {
     // either case nothing may be uploaded.
     for (name, bytes, want) in [
         (
-            format!("kbf-daemon-{COMMIT}-linux-arm64.tar.gz"),
+            format!("kbf-deploy-{COMMIT}-linux-arm64.tar.gz"),
             b"other bytes".as_slice(),
             "with other bytes than the verified file",
         ),
@@ -1887,7 +1887,7 @@ fn check_refuses_a_frontend_image_of_another_commit_arch_or_name() {
         image(OTHER, "linux-arm64"),
         image(COMMIT, "linux-riscv"),
         image(COMMIT, "darwin-arm64"),
-        format!("kbf-daemon-{COMMIT}-linux-arm64.oci.tar"),
+        format!("kbf-deploy-{COMMIT}-linux-arm64.oci.tar"),
         format!("-{COMMIT}-linux-arm64.oci.tar"),
         "kbf-frontend-image-linux-arm64.oci.tar".to_owned(),
     ] {
@@ -1906,10 +1906,11 @@ fn check_refuses_a_frontend_image_of_another_commit_arch_or_name() {
 
 #[test]
 fn check_accepts_the_macos_installer_package_of_the_commit_and_refuses_the_uncommitted_name() {
-    // Catches: a `.pkg` in SHA256SUMS refused as "not an asset of <commit>" (the release of
-    // the first main push that lists the Mac package fails), the package counted with no
-    // bundle, and `pkg build`'s own name (`kbf-installer-<version>-macos-arm64.pkg`, which
-    // names no commit) accepted as an asset.
+    // The Mac package no job builds now; releases that built one are still read (`release
+    // fetch-previous` checks the release before). Catches: a `.pkg` in SHA256SUMS refused as
+    // "not an asset of <commit>" (an older release fails its check), the package counted with
+    // no bundle, and the old builder's own name (`kbf-installer-<version>-macos-arm64.pkg`,
+    // which names no commit) accepted as an asset.
     let root = scratch("check-pkg");
     let accepted = dist(&root, COMMIT);
     add_deb(

@@ -1276,11 +1276,9 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "clap",
- "futures",
  "kbf-ca",
  "kbf-cas-conformance",
  "kbf-enroll",
- "kbf-front",
  "kbf-harness",
  "kbf-host",
  "kbf-installer",
@@ -1298,7 +1296,6 @@ dependencies = [
  "kbf-unitfile",
  "kbf-updater",
  "postgres",
- "prost",
  "rcgen",
  "rustix",
  "rustls",
@@ -1523,25 +1520,15 @@ dependencies = [
 name = "kbf-harness"
 version = "0.1.0"
 dependencies = [
- "clap",
- "flate2",
  "futures",
  "kbf-ca",
- "kbf-integration-test",
  "kbf-proto",
  "kbf-testkit",
- "kbf-transfer",
- "kbf-types",
  "kbf-unitfile",
- "libc",
- "prost",
- "prost-types",
  "rcgen",
  "rustix",
- "serde",
  "serde_json",
  "thiserror",
- "time",
  "tokio",
  "toml",
  "tonic",
@@ -1577,7 +1564,6 @@ name = "kbf-host-install"
 version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
- "flate2",
  "kbf-ca",
  "kbf-host",
  "kbf-installer",
@@ -1593,7 +1579,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "tar",
  "thiserror",
  "time",
  "toml",
@@ -1699,7 +1684,6 @@ dependencies = [
  "kbf-transfer",
  "kbf-types",
  "kbf-unitfile",
- "libc",
  "proc-macro2",
  "prost",
  "prost-types",
@@ -2305,7 +2289,6 @@ dependencies = [
  "clap",
  "kbf-testkit",
  "rustix",
- "thiserror",
  "tokio",
  "tracing",
 ]
@@ -2429,11 +2412,9 @@ dependencies = [
 name = "kbf-update"
 version = "0.1.0"
 dependencies = [
- "kbf-proto",
  "serde",
  "serde_json",
  "thiserror",
- "tokio",
  "tracing",
 ]
 

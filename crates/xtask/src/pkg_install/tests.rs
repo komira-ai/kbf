@@ -150,11 +150,15 @@ fn agent_entries() -> Vec<Entry> {
 fn entries() -> Vec<Entry> {
     vec![
         entry_file("/usr/bin/kbf", 0o755, "binary"),
-        entry_file("/usr/lib/systemd/system/kbf-node.service", 0o644, "node"),
+        entry_file(
+            "/usr/lib/systemd/system/kbf-storage.service",
+            0o644,
+            "storage",
+        ),
         entry_file("/usr/lib/systemd/system/kbf.slice", 0o644, "slice"),
         // A directory a package may own under the unit directory: it is not read for
         // accounts (it has no bytes).
-        entry_dir("/usr/lib/systemd/system/kbf-node.service.d"),
+        entry_dir("/usr/lib/systemd/system/kbf-storage.service.d"),
         entry_dir("/usr/share/kbf"),
         // A conffile: dpkg keeps it on remove and deletes it on purge.
         entry_file("/etc/needrestart/conf.d/kbf.conf", 0o644, "conffile"),
@@ -263,7 +267,7 @@ impl World {
             }
             ["systemctl", "list-unit-files", pattern, ..] => self.unit_files(pattern),
             ["systemctl", "list-units", ..] => ok(if self.is(Defect::UnitActive) {
-                "kbf-node.service loaded active running\n"
+                "kbf-storage.service loaded active running\n"
             } else {
                 ""
             }),
@@ -292,7 +296,7 @@ impl World {
                     _ => " --layout   deb",
                 };
                 ok(&format!(
-                    "[Service]\nExecStart=/usr/libexec/kbf/kbf-host-install --serve {layout} --restart-unit kbf-daemon.service\n"
+                    "[Service]\nExecStart=/usr/libexec/kbf/kbf-host-install --serve {layout} --restart-unit kbf-storage.service\n"
                 ))
             }
             ["systemctl", "cat", unit] if unit.contains("agent") => ok(&format!(
@@ -491,7 +495,7 @@ impl World {
     fn journal_start(&mut self, unit: &str) {
         // The gate: the unit's condition holds when its file exists (and, for the agent's, which
         // is gated on its program, when the file is executable).
-        let (path, program) = if unit.contains("node") {
+        let (path, program) = if unit.contains("storage") {
             ("/etc/kbf/kbf.toml", false)
         } else if unit.contains("agent") {
             (AGENT_PROGRAM, true)
@@ -555,7 +559,7 @@ impl World {
 pub(super) const AGENT_PROGRAM: &str = "/usr/libexec/kbf/kbf-updater";
 
 const GATES: [(&str, &str); 2] = [
-    ("kbf-node.service", "/etc/kbf/kbf.toml"),
+    ("kbf-storage.service", "/etc/kbf/kbf.toml"),
     ("kbf-installer.service", "/etc/kbf/installer.toml"),
 ];
 
@@ -660,13 +664,13 @@ fn the_unit_account_check_reads_unit_files_and_skips_directories() {
         let want: &[&str] = match format {
             Format::Deb => &[
                 "/usr/lib/systemd/system/kbf-host-local.service",
-                "/usr/lib/systemd/system/kbf-node.service",
+                "/usr/lib/systemd/system/kbf-storage.service",
                 "/usr/lib/systemd/system/kbf.slice",
                 "/usr/lib/systemd/system/kbf-host-local.service",
                 "/usr/lib/systemd/system/kbf-updater-agent.service",
             ],
             Format::Rpm => &[
-                "/usr/lib/systemd/system/kbf-node.service",
+                "/usr/lib/systemd/system/kbf-storage.service",
                 "/usr/lib/systemd/system/kbf.slice",
             ],
         };
@@ -695,7 +699,7 @@ fn each_defect_of_the_package_or_the_system_is_a_named_problem() {
         (
             Format::Deb,
             Defect::HelperWithoutLayout,
-            "kbf-host-local.service does not install the package (exactly one --layout deb): \"ExecStart=/usr/libexec/kbf/kbf-host-install --serve  --restart-unit kbf-daemon.service\"",
+            "kbf-host-local.service does not install the package (exactly one --layout deb): \"ExecStart=/usr/libexec/kbf/kbf-host-install --serve  --restart-unit kbf-storage.service\"",
         ),
         (
             Format::Deb,
@@ -743,12 +747,12 @@ fn each_defect_of_the_package_or_the_system_is_a_named_problem() {
         (
             Format::Deb,
             Defect::UnitEnabled,
-            "kbf-node.service is \"enabled\" after install",
+            "kbf-storage.service is \"enabled\" after install",
         ),
         (
             Format::Deb,
             Defect::UnitMissing,
-            "kbf-node.service is \"not known to systemd\"",
+            "kbf-storage.service is \"not known to systemd\"",
         ),
         (
             Format::Deb,
@@ -763,23 +767,23 @@ fn each_defect_of_the_package_or_the_system_is_a_named_problem() {
         (
             Format::Deb,
             Defect::UnitNamesMissingUser,
-            "/usr/lib/systemd/system/kbf-node.service names User=kbf-ghost, which does not exist",
+            "/usr/lib/systemd/system/kbf-storage.service names User=kbf-ghost, which does not exist",
         ),
         (
             Format::Deb,
             Defect::UnitNamesMissingGroup,
-            "/usr/lib/systemd/system/kbf-node.service names Group=kbf-ghostgroup, which does not exist",
+            "/usr/lib/systemd/system/kbf-storage.service names Group=kbf-ghostgroup, which does not exist",
         ),
         (Format::Deb, Defect::DirNotMade, "/run/kbf-installer"),
         (
             Format::Deb,
             Defect::GateIgnored,
-            "kbf-node.service without /etc/kbf/kbf.toml: its start was not skipped by its condition",
+            "kbf-storage.service without /etc/kbf/kbf.toml: its start was not skipped by its condition",
         ),
         (
             Format::Deb,
             Defect::GateNeverHolds,
-            "kbf-node.service with /etc/kbf/kbf.toml: it did not begin to start",
+            "kbf-storage.service with /etc/kbf/kbf.toml: it did not begin to start",
         ),
         (
             Format::Deb,
@@ -851,13 +855,15 @@ fn docker_that_fails_to_build_or_the_installer_that_fails_ends_the_run() {
 
 #[test]
 fn a_gate_is_unit_equals_file() {
-    let g: Gate = "kbf-node.service=/etc/kbf/kbf.toml".parse().expect("gate");
+    let g: Gate = "kbf-storage.service=/etc/kbf/kbf.toml"
+        .parse()
+        .expect("gate");
     assert_eq!(
         (g.unit.as_str(), g.path.as_str()),
-        ("kbf-node.service", "/etc/kbf/kbf.toml")
+        ("kbf-storage.service", "/etc/kbf/kbf.toml")
     );
     assert!(
-        "kbf-node.service"
+        "kbf-storage.service"
             .parse::<Gate>()
             .expect_err("no file")
             .contains("expected <unit>=<file>")

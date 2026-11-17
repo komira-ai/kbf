@@ -25,7 +25,7 @@
 //! the files it meant to write ([`check_tarball`]).
 //!
 //! The package ships no kbf runtime release (the installer fetches the first), so
-//! neither does this; the payload is Linux only (a Mac gets the `.pkg`).
+//! neither does this; the payload is Linux only (no kbf runs on a Mac).
 
 use std::io::Read;
 use std::path::Path;
@@ -183,7 +183,7 @@ pub fn installer_tarball(
     }
     if platform == Platform::DarwinArm64 {
         return Err(Error::Usage(
-            "--platform darwin-arm64: the payload is for Linux; a Mac gets the .pkg".to_owned(),
+            "--platform darwin-arm64: the payload is for Linux; no kbf runs on a Mac".to_owned(),
         ));
     }
     let files = payload(&pkg_linux::files(sources)?)?;

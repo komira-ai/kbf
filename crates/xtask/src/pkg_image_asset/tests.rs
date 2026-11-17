@@ -356,11 +356,11 @@ fn an_image_for_another_platform_user_or_entrypoint_is_refused() {
         );
     }
     let mut fix = Fix::new();
-    fix.entrypoint = vec!["/usr/bin/kbf", "--mode=daemon"];
+    fix.entrypoint = vec!["/usr/bin/kbf", "--mode=storage"];
     let got = found("entrypoint", &fix, Platform::LinuxX86_64);
     assert_eq!(got.len(), 1, "{got:?}");
     assert!(
-        got[0].starts_with("entrypoint is [\"/usr/bin/kbf\", \"--mode=daemon\"]"),
+        got[0].starts_with("entrypoint is [\"/usr/bin/kbf\", \"--mode=storage\"]"),
         "{got:?}"
     );
 }

@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime};
 use super::*;
 use kbf_testkit::dir::TestDir;
 
-const BINARY: &[u8] = b"kbf-daemon's bytes";
+const BINARY: &[u8] = b"kbf-deploy's bytes";
 const COMMIT: &str = "c0ffee0123456789c0ffee0123456789c0ffee01";
 
 /// An empty directory of its own for one test, removed when it drops.
@@ -15,11 +15,11 @@ fn scratch(name: &str) -> TestDir {
     TestDir::under(deps.join("xtask-package-unit"), name)
 }
 
-/// `dir/bin/kbf-daemon` holding `BINARY` and `dir/sbom.cdx.json`.
+/// `dir/bin/kbf-deploy` holding `BINARY` and `dir/sbom.cdx.json`.
 fn inputs(dir: &Path) -> (PathBuf, PathBuf) {
     let bin = dir.join("bin");
     std::fs::create_dir_all(&bin).expect("bin");
-    let binary = bin.join("kbf-daemon");
+    let binary = bin.join("kbf-deploy");
     std::fs::write(&binary, BINARY).expect("binary");
     let sbom = dir.join("sbom.cdx.json");
     std::fs::write(&sbom, b"{\"bomFormat\":\"CycloneDX\"}").expect("sbom");
@@ -70,13 +70,13 @@ fn the_tarball_holds_the_binary_alone_owned_by_root_mode_0755_at_time_0() {
     // binary owned by the runner's uid), owner names written (mapped by name on the
     // node), a mode other than 0755, a time other than the epoch, a second entry, or
     // bytes other than the binary's. Read from the raw header fields.
-    let tgz = tarball("kbf-daemon", BINARY).expect("tarball");
+    let tgz = tarball("kbf-deploy", BINARY).expect("tarball");
     let tar = gunzip(&tgz);
     let mut archive = tar::Archive::new(&tar[..]);
     let mut entries = archive.entries().expect("entries");
     let mut entry = entries.next().expect("one entry").expect("entry");
     let h = entry.header().clone();
-    assert_eq!(&*entry.path_bytes(), b"kbf-daemon");
+    assert_eq!(&*entry.path_bytes(), b"kbf-deploy");
     assert_eq!(h.entry_type(), tar::EntryType::Regular);
     assert_eq!(h.as_ustar().map(|u| &u.magic[..]), Some(&b"ustar\0"[..]));
     assert_eq!(h.mode().expect("mode"), 0o755);
@@ -91,7 +91,7 @@ fn the_tarball_holds_the_binary_alone_owned_by_root_mode_0755_at_time_0() {
     assert_eq!(held, BINARY);
     assert!(entries.next().is_none(), "a second entry");
     assert_eq!(
-        check_tarball(&tgz, "kbf-daemon", BINARY),
+        check_tarball(&tgz, "kbf-deploy", BINARY),
         Vec::<String>::new()
     );
 }
@@ -101,7 +101,7 @@ fn the_gzip_stream_names_no_file_and_no_time() {
     // Catches: a gzip header carrying the time it was written (so two runs of one
     // commit give different bytes and different SHA256SUMS lines) or a file name.
     // RFC 1952: bytes 4 to 7 are MTIME, bit 3 of byte 3 (FLG) is FNAME.
-    let tgz = tarball("kbf-daemon", BINARY).expect("tarball");
+    let tgz = tarball("kbf-deploy", BINARY).expect("tarball");
     assert_eq!(&tgz[..3], b"\x1f\x8b\x08");
     assert_eq!(tgz[3] & 0x08, 0, "FNAME set");
     assert_eq!(&tgz[4..8], &[0; 4], "MTIME");
@@ -125,7 +125,7 @@ fn one_binary_packages_to_the_same_bytes_whenever_and_wherever_it_is_built() {
             .expect("set mtime");
         let out = dir.join("dist");
         package(&binary, &sbom, Platform::LinuxX86_64, COMMIT, &out).expect("package");
-        let stem = format!("kbf-daemon-{COMMIT}-linux-x86_64");
+        let stem = format!("kbf-deploy-{COMMIT}-linux-x86_64");
         tgzs.push(std::fs::read(out.join(format!("{stem}.tar.gz"))).expect("tgz"));
         sums.push(std::fs::read_to_string(out.join("SHA256SUMS.linux-x86_64")).expect("sums"));
     }
@@ -146,7 +146,7 @@ fn package_writes_both_assets_and_their_sums_lines() {
     let server = dir.join("bin/kbf-server");
     std::fs::write(&server, b"server").expect("server");
     package(&server, &sbom, Platform::LinuxArm64, COMMIT, &out).expect("package");
-    let stem = format!("kbf-daemon-{COMMIT}-linux-arm64");
+    let stem = format!("kbf-deploy-{COMMIT}-linux-arm64");
     let tgz = std::fs::read(out.join(format!("{stem}.tar.gz"))).expect("tgz");
     let cdx = std::fs::read(out.join(format!("{stem}.cdx.json"))).expect("cdx");
     assert_eq!(cdx, std::fs::read(&sbom).expect("sbom"));
@@ -180,14 +180,14 @@ fn the_system_tar_extracts_exactly_the_binary() {
     use std::os::unix::fs::PermissionsExt;
     let dir = scratch("system-tar");
     let tgz_path = dir.join("a.tar.gz");
-    std::fs::write(&tgz_path, tarball("kbf-daemon", BINARY).expect("tarball")).expect("write");
+    std::fs::write(&tgz_path, tarball("kbf-deploy", BINARY).expect("tarball")).expect("write");
     let list = std::process::Command::new("tar")
         .arg("-tzf")
         .arg(&tgz_path)
         .output()
         .expect("tar -t");
     assert!(list.status.success(), "{list:?}");
-    assert_eq!(String::from_utf8_lossy(&list.stdout), "kbf-daemon\n");
+    assert_eq!(String::from_utf8_lossy(&list.stdout), "kbf-deploy\n");
     let into = dir.join("x");
     std::fs::create_dir(&into).expect("x");
     let extract = std::process::Command::new("tar")
@@ -198,11 +198,11 @@ fn the_system_tar_extracts_exactly_the_binary() {
         .status()
         .expect("tar -x");
     assert!(extract.success());
-    let file = into.join("kbf-daemon");
+    let file = into.join("kbf-deploy");
     assert_eq!(std::fs::read(&file).expect("extracted"), BINARY);
     let mode = std::fs::metadata(&file).expect("stat").permissions().mode();
     assert_eq!(mode & 0o111, 0o111, "{mode:o}");
-    // Left here, this executable `kbf-daemon` under target/ is passed to `llvm-cov
+    // Left here, this executable `kbf-deploy` under target/ is passed to `llvm-cov
     // export` as an object by cargo-llvm-cov, and the coverage report fails on it.
     std::fs::remove_file(&file).expect("remove the extracted copy");
 }
@@ -211,7 +211,7 @@ fn the_system_tar_extracts_exactly_the_binary() {
 fn check_tarball_names_each_defect_of_a_planted_tarball() {
     // Catches: the read-back check passing a tarball that is not the one written: each
     // row plants one defect and must be reported by exactly its line.
-    let n = "kbf-daemon";
+    let n = "kbf-deploy";
     let p = |what: &str| format!("{n}: {what}");
     let with = |f: fn(&mut tar::Header)| {
         let mut h = good_header(n);
@@ -254,11 +254,11 @@ fn check_tarball_names_each_defect_of_a_planted_tarball() {
         (
             "renamed",
             tgz_of(&mut [(renamed, BINARY)]),
-            vec!["kbf-server: the name is not \"kbf-daemon\"".to_owned()],
+            vec!["kbf-server: the name is not \"kbf-deploy\"".to_owned()],
         ),
         (
             "other bytes",
-            tgz_of(&mut [(good_header(n), b"kbf-daemon's BYTES")]),
+            tgz_of(&mut [(good_header(n), b"kbf-deploy's BYTES")]),
             vec![p("the content is not the binary's bytes")],
         ),
         (
@@ -286,7 +286,7 @@ fn check_tarball_names_each_defect_of_a_planted_tarball() {
 fn check_tarball_reports_unreadable_fields_and_a_corrupt_entry() {
     // Catches: a header field that does not parse taken as 0 (an owner field holding
     // garbage would pass as root), or a corrupt second header ignored.
-    let mut h = good_header("kbf-daemon");
+    let mut h = good_header("kbf-deploy");
     {
         let raw = h.as_mut_bytes();
         // ustar: mode at 100, uid 108, gid 116 (8 bytes each), mtime 136 (12).
@@ -295,8 +295,8 @@ fn check_tarball_reports_unreadable_fields_and_a_corrupt_entry() {
         }
     }
     let tgz = tgz_of(&mut [(h, BINARY)]);
-    let p = |what: &str| format!("kbf-daemon: {what} is unreadable, not");
-    let problems = check_tarball(&tgz, "kbf-daemon", BINARY);
+    let p = |what: &str| format!("kbf-deploy: {what} is unreadable, not");
+    let problems = check_tarball(&tgz, "kbf-deploy", BINARY);
     assert_eq!(problems.len(), 4, "{problems:?}");
     for (got, what) in problems
         .iter()
@@ -305,7 +305,7 @@ fn check_tarball_reports_unreadable_fields_and_a_corrupt_entry() {
         assert!(got.starts_with(&p(what)), "{got}");
     }
     // A good entry, then a header block whose checksum is wrong.
-    let mut good = good_header("kbf-daemon");
+    let mut good = good_header("kbf-deploy");
     good.set_cksum();
     let mut b = tar::Builder::new(Vec::new());
     b.append(&good, BINARY).expect("append");
@@ -313,7 +313,7 @@ fn check_tarball_reports_unreadable_fields_and_a_corrupt_entry() {
     // In place of the first of the two zero blocks that end the archive.
     let end = tar.len() - 1024;
     tar[end..end + 512].fill(b'x');
-    let problems = check_tarball(&gzip(&tar), "kbf-daemon", BINARY);
+    let problems = check_tarball(&gzip(&tar), "kbf-deploy", BINARY);
     assert_eq!(problems.len(), 1, "{problems:?}");
     assert!(problems[0].starts_with("not a tar: "), "{problems:?}");
 }
@@ -323,14 +323,14 @@ fn write_tarball_refuses_what_it_reads_back_wrong() {
     // Catches: the read-back after writing skipped, so a tarball that is not the
     // binary is packaged and summed.
     let dir = scratch("read-back");
-    let mut h = good_header("kbf-daemon");
+    let mut h = good_header("kbf-deploy");
     h.set_uid(501);
     let tgz = tgz_of(&mut [(h, BINARY)]);
     let path = dir.join("a.tar.gz");
     assert_eq!(
-        write_tarball(&path, &tgz, "kbf-daemon", BINARY),
+        write_tarball(&path, &tgz, "kbf-deploy", BINARY),
         Err(Error::Refused(vec![format!(
-            "{}: kbf-daemon: the owner is 501, not 0",
+            "{}: kbf-deploy: the owner is 501, not 0",
             path.display()
         )]))
     );
@@ -391,13 +391,13 @@ fn package_refuses_bad_inputs_and_never_overwrites() {
     assert_eq!(
         pkg(&binary, &sbom, COMMIT, &out),
         Err(Error::Failed(format!(
-            "{} already lists kbf-daemon-{COMMIT}-darwin-arm64.tar.gz",
+            "{} already lists kbf-deploy-{COMMIT}-darwin-arm64.tar.gz",
             sums.display()
         )))
     );
     // The assets are there, the sums lines are not: no overwrite.
     std::fs::remove_file(&sums).expect("rm sums");
-    let tgz = out.join(format!("kbf-daemon-{COMMIT}-darwin-arm64.tar.gz"));
+    let tgz = out.join(format!("kbf-deploy-{COMMIT}-darwin-arm64.tar.gz"));
     assert!(
         pkg(&binary, &sbom, COMMIT, &out).is_err_and(|e| e
             .to_string()
@@ -405,7 +405,7 @@ fn package_refuses_bad_inputs_and_never_overwrites() {
         "overwrote"
     );
     std::fs::remove_file(&tgz).expect("rm tgz");
-    let cdx = out.join(format!("kbf-daemon-{COMMIT}-darwin-arm64.cdx.json"));
+    let cdx = out.join(format!("kbf-deploy-{COMMIT}-darwin-arm64.cdx.json"));
     assert!(
         pkg(&binary, &sbom, COMMIT, &out).is_err_and(|e| e
             .to_string()

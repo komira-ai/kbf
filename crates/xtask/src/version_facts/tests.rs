@@ -17,16 +17,16 @@ fn the_facts_file_is_named_like_the_tarball_of_kbf() {
 
 #[test]
 fn only_a_kbf_tarball_has_facts() {
-    // Catches: facts demanded of every tarball (`kbf-daemon`'s starts with `kbf-` as well),
+    // Catches: facts demanded of every tarball (`kbf-deploy`'s starts with `kbf-` as well),
     // of a file that is no tarball, or of a name that is no commit and platform. One row
     // per way `facts_of` can say no.
     let others = [
-        format!("kbf-daemon-{COMMIT}-linux-x86_64.tar.gz"),
+        format!("kbf-deploy-{COMMIT}-linux-x86_64.tar.gz"),
         format!("kbf-installer-{COMMIT}-darwin-arm64.tar.gz"),
         format!("kbf-{COMMIT}-linux-x86_64.cdx.json"),
         format!("kbf-{COMMIT}-linux-x86_64.tar.gz.sigstore.json"),
         format!("kbf-{COMMIT}-linux-x86_64.version.json"),
-        format!("daemon-{COMMIT}-linux-x86_64.tar.gz"),
+        format!("deploy-{COMMIT}-linux-x86_64.tar.gz"),
         format!("kbfx-{COMMIT}-linux-x86_64.tar.gz"),
         format!("kbf-{COMMIT}-freebsd-x86_64.tar.gz"),
         "kbf.tar.gz".to_owned(),
@@ -50,7 +50,7 @@ fn a_facts_file_names_the_tarball_it_states_the_facts_of() {
         assert_eq!(facts_of(&tarball), Some(facts));
     }
     let others = [
-        format!("kbf-daemon-{COMMIT}-linux-x86_64.version.json"),
+        format!("kbf-deploy-{COMMIT}-linux-x86_64.version.json"),
         format!("kbf-{COMMIT}-linux-x86_64.version.json.bak"),
         format!("kbf-{COMMIT}-freebsd-x86_64.version.json"),
         format!("kbf-{COMMIT}-linux-x86_64.tar.gz"),
@@ -73,7 +73,7 @@ fn only_the_facts_of_kbf_for_the_commit_are_its_assets() {
         assert!(!is_facts_of(&name(other, platform), COMMIT));
     }
     for file in [
-        format!("kbf-daemon-{COMMIT}-linux-arm64.version.json"),
+        format!("kbf-deploy-{COMMIT}-linux-arm64.version.json"),
         format!("kbf-{COMMIT}-windows-x86_64.version.json"),
         format!("kbf-{COMMIT}-linux-arm64.version.json.bak"),
     ] {

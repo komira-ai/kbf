@@ -45,13 +45,7 @@ pub const KBF_NAME: &str = "kbf";
 pub const KBF_PATH: &str = "/usr/bin/kbf";
 /// The units of the modes `kbf` runs in, which the `kbf` package carries. (`kbf.slice`, which
 /// they run in, is the `kbf` package's too: [`SLICE`].)
-pub const KBF_UNITS: [&str; 5] = [
-    "kbf-all-in-one.service",
-    "kbf-daemon.service",
-    "kbf-frontend.service",
-    "kbf-storage-and-daemon.service",
-    "kbf-storage.service",
-];
+pub const KBF_UNITS: [&str; 2] = ["kbf-frontend.service", "kbf-storage.service"];
 /// The first version no `kbf-installer` package has: every deb that was published is
 /// `0.1.0+<commit>`. The deb of `kbf` replaces the installer packages below it, so that a later
 /// package of that name (there is none) would not be.
@@ -132,12 +126,12 @@ pub fn unit_accounts(text: &str) -> Vec<(&'static str, String)> {
 /// The `Recommends` of the deb of `kbf` (they were the installer's `Depends`). Not `Depends`: a
 /// host updates this package with a plain `dpkg --install`, which resolves nothing, so a
 /// dependency a host lacks would leave `kbf` unpacked and unconfigured and then undone. `crun`
-/// and `uidmap` are the container driver's, and its preflight names `crun` when it is missing;
+/// and `uidmap` are what a js-agent on the host runs its job containers with (`--runtime crun`);
 /// `systemd` runs the units and `ca-certificates` is what the host's downloads verify with, and
 /// any host that runs these units has them, but a recommendation cannot fail an install where a
 /// dependency can.
 pub const DEB_RECOMMENDS: [&str; 4] = ["crun", "uidmap", "systemd", "ca-certificates"];
-/// The `Suggests` of the deb: a Postgres server, for a frontend or all-in-one host that keeps
+/// The `Suggests` of the deb: a Postgres server, for a frontend host that keeps
 /// its state on the host. A suggestion, not a `Depends` or `Recommends`: node hosts keep no
 /// state in Postgres, and apt installs recommended packages by default. `setup` refuses a
 /// frontend host with no reachable server, saying what to install.

@@ -155,7 +155,7 @@ fn refused(result: Result<Vec<String>, Error>) -> Vec<String> {
 fn golden() -> String {
     let entry = |digest: &str| {
         format!(
-            "{{\"entries\":[{{\"digest\":\"{digest}\",\"installer\":\"apt\",\"manifest\":{{\"hook\":{{\"cleanupRetries\":3,\"command\":[\"/usr/bin/kbf\",\"package-hook\"],\"timeoutSecs\":{{\"cleanup\":\"120\",\"cutover\":\"600\",\"prepare\":\"0\",\"rollback\":\"900\",\"verify\":\"360\"}},\"verifyDeadlineSecs\":\"1500\"}},\"installerBounds\":{{\"activateSecs\":\"300\",\"removeSecs\":\"300\",\"stageSecs\":\"600\"}},\"minHostkeeper\":\"0.1.225\",\"package\":\"kbf\",\"params\":{{\"mode\":{{\"text\":\"storage-and-daemon\"}},\"state_dir\":{{\"text\":\"/var/lib/kbf-package-hook\"}},\"unit\":{{\"text\":\"kbf-storage-and-daemon.service\"}}}},\"run\":[\"kbf-storage-and-daemon.service\"]}},\"packageVersion\":\"0.1.7472\",\"repository\":\"komira-stable\"}}]}}"
+            "{{\"entries\":[{{\"digest\":\"{digest}\",\"installer\":\"apt\",\"manifest\":{{\"hook\":{{\"cleanupRetries\":3,\"command\":[\"/usr/bin/kbf\",\"package-hook\"],\"timeoutSecs\":{{\"cleanup\":\"120\",\"cutover\":\"600\",\"prepare\":\"0\",\"rollback\":\"900\",\"verify\":\"360\"}},\"verifyDeadlineSecs\":\"1500\"}},\"installerBounds\":{{\"activateSecs\":\"300\",\"removeSecs\":\"300\",\"stageSecs\":\"600\"}},\"minHostkeeper\":\"0.1.225\",\"package\":\"kbf\",\"params\":{{\"mode\":{{\"text\":\"storage\"}},\"state_dir\":{{\"text\":\"/var/lib/kbf-package-hook\"}},\"unit\":{{\"text\":\"kbf-storage.service\"}}}},\"run\":[\"kbf-storage.service\"]}},\"packageVersion\":\"0.1.7472\",\"repository\":\"komira-stable\"}}]}}"
         )
     };
     format!(
@@ -681,7 +681,7 @@ fn the_params_are_the_three_text_keys_the_hook_reads() {
     let keys: Vec<&str> = PARAMS.iter().map(|(key, _)| *key).collect();
     assert_eq!(keys, ["mode", "state_dir", "unit"]);
     let params = manifest::params();
-    assert_eq!(params["mode"], json!({"text": "storage-and-daemon"}));
+    assert_eq!(params["mode"], json!({"text": "storage"}));
     assert_eq!(
         params["state_dir"],
         json!({"text": "/var/lib/kbf-package-hook"})

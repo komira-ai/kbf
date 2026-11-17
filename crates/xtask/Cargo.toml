@@ -47,8 +47,8 @@ kbf-tree-bundle.workspace = true
 kbf-types.workspace = true
 lzma-rs.workspace = true
 ruzstd.workspace = true
-# The runner user's uid and gid, and `uname -m`, for `crun-tests`.
-rustix = { workspace = true, features = ["fs", "process", "system"] }
+# The free space of the runner's disk (`runner-disk`).
+rustix = { workspace = true, features = ["fs"] }
 # `debs` reads the pins files of `.github/debs/`.
 serde.workspace = true
 serde_json.workspace = true
@@ -64,8 +64,8 @@ ureq.workspace = true
 zip.workspace = true
 
 [dev-dependencies]
-# The Mac layout's paths, for `tests/pkg_macos.rs`: the gate is where `setup` writes
-# (`kbf_installer::layout`, a dependency above).
+# The Linux layout's paths, for the unit test that holds the trust directory the package installs
+# to the one the hosts read (`kbf_installer::layout`, a dependency above).
 kbf-host.workspace = true
 # A scratch directory a test owns and removes (the unit tests).
 kbf-testkit.workspace = true
@@ -74,7 +74,7 @@ kbf-testkit.workspace = true
 tierstore.workspace = true
 rcgen.workspace = true
 # The caller's umask, for the install.sh test.
-rustix = { workspace = true, features = ["fs", "process", "system"] }
+rustix = { workspace = true, features = ["fs", "process"] }
 
 [lints]
 workspace = true

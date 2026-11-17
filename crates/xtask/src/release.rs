@@ -269,9 +269,9 @@ pub fn main_control(gh: &Path, repo: &str, on: &str, off: &str) -> Result<String
 }
 
 /// Whether `name` is an asset of `commit`: `<binary>-<commit>-<platform>` and
-/// `.tar.gz`, `.cdx.json`, `.deb`, `.pkg` or `.oci.tar` (the packages; and the frontend or coordinator image,
+/// `.tar.gz`, `.cdx.json`, `.deb`, `.pkg` or `.oci.tar` (the packages, the `.pkg` being the Mac package of releases that built one, which no job builds now and which a release set that holds one still passes; and the frontend or coordinator image,
 /// [`crate::pkg_image_asset`], which exists for the Linux platforms only; nfpm's own `kbf-installer_<version>_
-/// <arch>.deb` and `pkg build`'s `kbf-installer-<version>-macos-arm64.pkg` name no commit and are
+/// <arch>.deb` and the old `.pkg` builder's `kbf-installer-<version>-macos-arm64.pkg` name no commit and are
 /// not one), the version facts of `kbf` for a platform ([`version_facts::is_facts_of`]), the facts of
 /// the task image ([`pkg_image_asset::is_facts_of`]) or the kbf base tree bundle of a Linux platform
 /// (`kbf-base-tree-<commit>-<platform>.tree.tar`, [`base_tree::is_bundle_of`]).
@@ -413,7 +413,7 @@ impl Release<'_> {
              rebuilds nothing.\n\nVerify an asset before use:\n\n```text\ngh attestation \
              verify <asset> --repo {repo} --signer-workflow \
              {repo}/.github/workflows/{ARTIFACTS_WORKFLOW} --source-ref refs/heads/{MAIN} \
-             --deny-self-hosted-runners\n```\n\nEach tarball and each package (`.deb` or `.pkg`) also has its provenance bundle, \
+             --deny-self-hosted-runners\n```\n\nEach tarball and each package (`.deb`) also has its provenance bundle, \
              `<asset>{SUFFIX}`, which verifies it with no network but a trusted root \
              (`gh attestation trusted-root > trusted_root.jsonl`):\n\n```text\ngh attestation \
              verify <asset> --bundle <asset>{SUFFIX} --custom-trusted-root trusted_root.jsonl \

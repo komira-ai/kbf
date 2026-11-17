@@ -28,8 +28,7 @@ installer-tarball`, which no release publishes, still place them under it.)
 ## What the package holds
 
 - `/usr/bin/kbf` (0755), the `kbf` the same job built, byte for byte the one in its release tarball;
-- the unit of every mode, the five files `kbf-all-in-one.service`, `kbf-daemon.service`,
-  `kbf-frontend.service`, `kbf-storage-and-daemon.service` and `kbf-storage.service`
+- the unit of every mode, the two files `kbf-frontend.service` and `kbf-storage.service`
   (`KBF_UNITS`), and `kbf.slice` (`SLICE`), in `/usr/lib/systemd/system` (0644). `cargo xtask
   pkg-config` fails when the unit directory lacks one;
 - `/usr/share/kbf/trust/`: `gh` (0755), `trusted_root.jsonl`, `installer.conf` (0644). The
@@ -40,7 +39,7 @@ installer-tarball`, which no release publishes, still place them under it.)
 - in the deb only, the host's update agent (`AGENT_UNITS` in `pkg_linux.rs`;
   [../host-agent/README.md](../host-agent/README.md), "A host that runs the package"):
   `kbf-host-local.service`, the helper's local socket, which installs the attested package
-  (`--layout deb`) and restarts `kbf-daemon.service`, and `kbf-updater-agent.service`, the agent,
+  (`--layout deb`) and restarts `kbf-storage.service`, and `kbf-updater-agent.service`, the agent,
   both 0644 in `/usr/lib/systemd/system`; a link to each in
   `/usr/lib/systemd/system/multi-user.target.wants/`, which enables it (below); and
   `/usr/lib/sysusers.d/kbf-updater.conf`, the agent's account `kbf-updater` and the group
@@ -61,9 +60,9 @@ installer-tarball`, which no release publishes, still place them under it.)
   (`kbf-host-install`, and `--migrate-to-package`), which resolves nothing, and a dependency the
   host lacks would leave `kbf` unpacked, unconfigured and undone. It recommends (deb) `crun,
   uidmap, systemd, ca-certificates`, (rpm) the same with Fedora's name for `uidmap`,
-  `shadow-utils` (`crun` and `uidmap` are the container driver's; `systemd` and `ca-certificates`
+  `shadow-utils` (`crun` and `uidmap` are what a js-agent on the host runs its job containers with; `systemd` and `ca-certificates`
   are on any host that runs the units, and a recommendation cannot fail an install), and suggests
-  `postgresql` (rpm `postgresql-server`) for a frontend or all-in-one host that keeps its state on
+  `postgresql` (rpm `postgresql-server`) for a frontend host that keeps its state on
   the host (`pkg-kbf-asset` refuses a deb with a `Depends`, `Pre-Depends`, `Breaks` or
   `Conflicts`);
 - in the deb only, `Replaces: kbf-installer (<< 0.1.1)` (`KBF_DEB_REPLACES`; every
@@ -138,14 +137,13 @@ a script.
 - **Upgrading `kbf` restarts nothing.** `apt install kbf` or `dnf upgrade kbf` replaces
   `/usr/bin/kbf`; a running process keeps the old file. An operator (or the tool that drains a
   node and installs the new package) restarts the mode unit after the install
-  (`systemctl restart kbf-daemon.service`; a stop drains: a storage node finishes the calls in
-  flight, a daemon its leases). The `kbf` package carries no script that restarts a unit, and
+  (`systemctl restart kbf-storage.service`; a stop drains: a storage node finishes the calls in
+  flight). The `kbf` package carries no script that restarts a unit, and
   no other mechanism does it yet.
 - `/etc/kbf/kbf.toml`, the file those gates test, is written by `kbf-installer setup`, not by
-  the package: for a frontend or all-in-one host from flags that name the listeners, the
-  certificates and keys (which the operator provides, owned by the unit's user) and, for a
-  frontend, the storage node, for an all-in-one host the cold store and the daemon half's
-  identity (`docs/deploy/kbf-installer-setup.md`, "The `kbf.toml` flags"). The unit's
+  the package: for a frontend host from flags that name the listeners, the
+  certificates and keys (which the operator provides, owned by the unit's user) and the
+  storage node (`docs/deploy/kbf-installer-setup.md`, "The `kbf.toml` flags"). The unit's
   `ExecStartPre=... --check` reads that file, so a file `setup` wrote is one `kbf --check` accepts.
   On a host with `/usr/bin/kbf` and no release tree, `setup` starts the unit of a node mode as it
   does for a host with a release.
@@ -178,9 +176,9 @@ Two call sites, one way to build: both go through `pkg-config` and `pkg-build`.
 ## What the units run
 
 - `kbf-installer.service` (in no package now; it stays in `units/` for `packaging/install.sh`) runs `/usr/bin/kbf-installer run`. It names no unit: `run` restarts
-  the unit `setup` enabled for the `mode` of `/etc/kbf/kbf.toml` (on a frontend or all-in-one
+  the unit `setup` enabled for the `mode` of `/etc/kbf/kbf.toml` (on a frontend
   host it also reads the state database from `/etc/kbf/installer.toml`), so one packaged unit
-  serves every mode. `--unit` and `--launchd-label` still name the service by hand. The unit has
+  serves every mode. `--unit` still names the service by hand. The unit has
   no `ExecStartPre=`: the contract's `check` is not built, and a stub would fail every start.
 - Each mode unit runs `/usr/bin/kbf --mode=<mode>`, the `kbf` package's file, after
   `kbf boot-check --mode=<mode>` (which brings the state database named by the `database` key of
@@ -191,7 +189,7 @@ Two call sites, one way to build: both go through `pkg-config` and `pkg-build`.
   as that ended. It needs a `kbf` that has the verb: upgrade the `kbf` package with the
   installer or before it.
 - `crates/kbf-integration-test/tests/package_installer_verbs.rs` parses every `kbf-installer` command line of
-  these units, and of the macOS property list, with the binary's own parser and refuses a verb that
+  these units with the binary's own parser and refuses a verb that
   is not built; it also holds every `kbf` the units exec to `/usr/bin/kbf`.
 
 ## Commands
@@ -207,7 +205,7 @@ cargo xtask pkg-config --kbf <kbf> --units packaging/linux/units \
       # <dir>/nfpm.yaml and listing.txt
 cargo xtask pkg-build --nfpm <nfpm> --config <dir>/nfpm.yaml --out <pkgs>
 cargo xtask pkg-install-test --name kbf --package <file> --format deb|rpm --listing <dir>/listing.txt \
-  --image-dir packaging/linux/test/ubuntu --gate kbf-daemon.service=/etc/kbf/kbf.toml \
+  --image-dir packaging/linux/test/ubuntu --gate kbf-storage.service=/etc/kbf/kbf.toml \
   --gate kbf-host-local.service=/usr/libexec/kbf/kbf-host-install \
   --gate kbf-updater-agent.service=/usr/libexec/kbf/kbf-updater ...
 cargo xtask pkg-upgrade-test --old-installer <kbf-installer deb> --old-kbf <kbf deb> \

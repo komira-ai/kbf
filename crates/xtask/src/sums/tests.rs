@@ -3,9 +3,9 @@ use std::path::Path;
 use super::*;
 use kbf_testkit::dir::TestDir;
 
-const A: &str = "kbf-daemon-c0ffee012345-linux-x86_64.tar.gz";
-const A_SBOM: &str = "kbf-daemon-c0ffee012345-linux-x86_64.cdx.json";
-const B: &str = "kbf-daemon-c0ffee012345-darwin-arm64.tar.gz";
+const A: &str = "kbf-deploy-c0ffee012345-linux-x86_64.tar.gz";
+const A_SBOM: &str = "kbf-deploy-c0ffee012345-linux-x86_64.cdx.json";
+const B: &str = "kbf-deploy-c0ffee012345-darwin-arm64.tar.gz";
 
 /// An empty directory of its own for one test, removed when it drops.
 fn scratch(name: &str) -> TestDir {

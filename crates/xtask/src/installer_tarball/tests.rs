@@ -58,7 +58,7 @@ fn inputs(dir: &Path) -> Inputs {
         &[
             ("kbf-installer.service", "[Unit]\n"),
             ("kbf-proxy.service", "[Unit]\n"),
-            ("kbf-daemon.service", "[Unit]\n"),
+            ("kbf-storage.service", "[Unit]\n"),
             ("kbf.slice", "[Slice]\n"),
         ],
     );

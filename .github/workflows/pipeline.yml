@@ -7,15 +7,15 @@
 #
 # ci.yml is the pull-request gate, run again on the merged result. beta.yml runs the jobs of the
 # full suite that test the commit's source and build what they run (the whole nextest run, the
-# Arm run, Postgres, S3 stores, crun, the cells, macOS, the packages); they need nothing from any
+# Arm run, Postgres, S3 stores, the mixed-version farm, macOS, the packages); they need nothing from any
 # other stage and start with ci, because they are the longest part of the pipeline (about an
 # hour). artifacts.yml is called twice. `artifacts` (stage build) builds and sums the files of the
 # commit and needs nothing, so its builds start with ci. `artifacts-sign` (stage sign) needs ci
 # and `artifacts` and attests and verifies those files (a commit that fails the gate is built but
 # never signed). Both calls are the one file, artifacts.yml, because the installers verify that
 # file as the signer of every attestation. smoke.yml, after artifacts-sign, is the one job that
-# tests THOSE files: it installs the kbf of this run's artifacts (no run id, no rebuild) and runs
-# the farm from it. The release (release.yml) publishes the same files; it starts from this
+# tests THOSE files: it assembles and checks the files of this run's artifacts (no run id, no rebuild) and
+# runs the images the stage built. The release (release.yml) publishes the same files; it starts from this
 # workflow's success and from nothing else. Each stage is a called workflow (`workflow_call`), so
 # the pull request and the merge queue keep running ci.yml and artifacts.yml as before and a push
 # to main runs each check exactly once: none of the four has a push trigger of its own. `passed`

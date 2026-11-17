@@ -10,14 +10,14 @@ Description=kbf-installer, the update service of the kbf build farm
 ConditionPathExists=/etc/kbf/installer.toml
 # It must be up before the runtime units: they run a release it may have to revert. (Not
 # kbf-proxy.service: the proxy runs no release.)
-Before=kbf-frontend.service kbf-storage.service kbf-daemon.service kbf-storage-and-daemon.service kbf-all-in-one.service
+Before=kbf-frontend.service kbf-storage.service
 
 [Service]
 Type=simple
 # No ExecStartPre=: the contract's `check` is not built yet (it exits 1, "not implemented"), and
 # a stub there would fail every start. `run` reads installer.toml itself and refuses a bad one.
 # No --unit: `run` restarts the unit of the `mode` in /etc/kbf/kbf.toml, which `setup` wrote
-# and enabled, so this one file serves every mode; on a frontend or all-in-one host it also
+# and enabled, so this one file serves every mode; on a frontend host it also
 # reads the state database's address from /etc/kbf/installer.toml.
 ExecStart=/usr/bin/kbf-installer run
 Restart=on-failure

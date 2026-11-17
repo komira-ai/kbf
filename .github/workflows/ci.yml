@@ -5,9 +5,9 @@
 # workflow to that, to commit-SHA pinned actions from the set the repository's Actions policy
 # allows (actions/* and tailscale/github-action), and to a top-level `permissions: {}`.
 #
-# A pull request runs this, and macos-pr.yml (the macOS tests, and the package and gh steps of
-# beta.yml's `native-macos`). The rest of the suite (the slow tests, the Arm run, the
-# jobs that need a service, root, crun or a Mac, the packages and the beta smoke) runs on a
+# A pull request runs this, and macos-pr.yml (the macOS tests, and the pinned gh against a real
+# attestation). The rest of the suite (the slow tests, the Arm run, the
+# jobs that need a service, root or a Mac, the packages and the beta smoke) runs on a
 # push to main, in beta.yml. On a push to main this workflow is the first stage of the one
 # pipeline (pipeline.yml calls it, `workflow_call`), so the merged result meets the same gate
 # and the Cargo cache below is saved. It no longer has a push trigger of its own: a push to
@@ -95,11 +95,10 @@ jobs:
         if: ${{ !cancelled() }}
       - run: cargo test -p kbf-setup --lib --locked no_proxy_tests
         if: ${{ !cancelled() }}
-      # The crates the Mac jobs build (beta.yml's native-macos and pkg-macos, artifacts.yml's
-      # darwin-arm64), checked for aarch64-apple-darwin on this Linux runner. A Linux-only item
+      # The crates the Mac jobs build (beta.yml's native-macos, artifacts.yml's darwin-arm64),
+      # checked for aarch64-apple-darwin on this Linux runner. A Linux-only item
       # in code macOS compiles is then red on the pull request, not on the Mac job of the push to
-      # main an hour later (a `use` of a Linux-only module in kbf-node failed native-macos on eight
-      # main pushes in a row). `cargo check` does not link, so no macOS SDK is needed; the build
+      # main an hour later. `cargo check` does not link, so no macOS SDK is needed; the build
       # scripts that compile C for the target (ring, the bundled SQLite of libsqlite3-sys) use
       # Zig's C compiler and archiver, which carry macOS's libc headers: the cc crate reads
       # `CC_<target>` and `AR_<target>` as a program and its leading arguments. Zig is the release
@@ -113,7 +112,7 @@ jobs:
       - run: rustup target add aarch64-apple-darwin
         if: ${{ !cancelled() }}
       # The targets the macOS jobs of every workflow compile (beta.yml's native-macos,
-      # artifacts.yml's darwin-arm64, host-install-mac.yml), as
+      # artifacts.yml's darwin-arm64), as
       # they name them: a crate's other test targets (kbf-cli's harness tests, for one) are
       # Linux-only and never built on a Mac. Linking and doc tests are not checked: `cargo check`
       # compiles each crate and stops. The cc crate's own flags include
@@ -131,7 +130,7 @@ jobs:
           CRATE_CC_NO_DEFAULTS: "1"
           # The oldest macOS the binaries support, as artifacts.yml builds them.
           MACOSX_DEPLOYMENT_TARGET: "14.0"
-        run: cargo check --locked --target aarch64-apple-darwin --tests --features kbf-setup/proxy -p kbf-outputs -p kbf-installer -p kbf-setup -p update-register -p kbf-host -p kbf-host-install -p kbf-seatbelt -p kbf-step-runner -p kbf-updater -p kbf-update -p update-hook
+        run: cargo check --locked --target aarch64-apple-darwin --tests -p kbf-outputs -p update-register -p kbf-seatbelt -p kbf-update
       # The binaries the Mac jobs build and run (`cargo xtask` included) and the darwin artifacts are.
       - name: Check for aarch64-apple-darwin the binaries the Mac jobs build
         if: ${{ !cancelled() }}
@@ -141,19 +140,9 @@ jobs:
           CRATE_CC_NO_DEFAULTS: "1"
           # The oldest macOS the binaries support, as artifacts.yml builds them.
           MACOSX_DEPLOYMENT_TARGET: "14.0"
-        run: cargo check --locked --target aarch64-apple-darwin --bins -p kbf-node -p kbf-cli -p kbf-deploy -p kbf-installer -p kbf-host-install -p kbf-updater -p xtask
-      # The test targets the Mac jobs name one by one.
-      - name: Check for aarch64-apple-darwin the test targets the Mac jobs name
-        if: ${{ !cancelled() }}
-        env:
-          CC_aarch64_apple_darwin: ${{ runner.temp }}/zig-x86_64-linux-${{ env.ZIG_VERSION }}/zig cc -target aarch64-macos
-          AR_aarch64_apple_darwin: ${{ runner.temp }}/zig-x86_64-linux-${{ env.ZIG_VERSION }}/zig ar
-          CRATE_CC_NO_DEFAULTS: "1"
-          # The oldest macOS the binaries support, as artifacts.yml builds them.
-          MACOSX_DEPLOYMENT_TARGET: "14.0"
-        run: cargo check --locked --target aarch64-apple-darwin -p xtask -p kbf-host-install --test pkg_macos --test real_mac --test real_drop
-      # The kbf binary alone, as artifacts.yml builds it: without the proxy feature of kbf-setup,
-      # which the steps above turn on for kbf-installer and so for every crate built beside it.
+        run: cargo check --locked --target aarch64-apple-darwin --bins -p kbf-cli -p kbf-deploy -p xtask
+      # The kbf binary alone, as artifacts.yml builds it: without a feature of kbf-setup that
+      # another crate built beside it in the step above may turn on.
       - name: Check for aarch64-apple-darwin the kbf binary without the proxy feature
         if: ${{ !cancelled() }}
         env:
@@ -263,7 +252,7 @@ jobs:
   # that; the `test` job below makes the one report of them all. The upload is the LAST step: a
   # shard that passes has uploaded, and one that fails has not, which is how `test` sees it.
   # The fast set includes the Postgres tests (a throwaway server per shard, below): no S3,
-  # crun, root or Mac test is in it.
+  # root or Mac test is in it.
   # Branch coverage (`--branch`, rustc's `-Zcoverage-options=branch`) is unstable, so these
   # jobs build with a pinned nightly; every other job stays on the toolchain in
   # rust-toolchain.toml. The nightly may warn where stable does not, so `-D warnings` is off
