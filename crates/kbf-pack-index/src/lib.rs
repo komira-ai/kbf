@@ -8,7 +8,9 @@
 //!
 //! The same index holds the action cache, one row per action digest with the encoded result
 //! inline, written in the transaction that records the packs of the action's outputs: see
-//! [`action`].
+//! [`action`]. It holds the bytes of each REAPI Directory a walk has read, too, by the
+//! Directory's digest, so a walk of an input tree reads a level with one query: see
+//! [`directory`].
 //!
 //! [`PackIndex`] is the typed view; `postgres::PostgresPackIndex` (feature `postgres`) keeps
 //! it in tables of the Postgres state store (migration 2, [`schema`]) that are outside the key/value and feed tables
@@ -44,6 +46,8 @@
 use std::time::Duration;
 
 use kbf_state::StoreError;
+
+use crate::directory::NewDirectory;
 #[cfg(any(test, feature = "test-support", feature = "postgres"))]
 use kbf_state::StoreTime;
 
@@ -52,6 +56,9 @@ pub mod action;
 pub mod action_conformance;
 #[cfg(any(test, feature = "test-support"))]
 pub mod conformance;
+pub mod directory;
+#[cfg(any(test, feature = "test-support"))]
+pub mod directory_conformance;
 #[cfg(any(test, feature = "test-support"))]
 pub mod memory;
 #[cfg(feature = "postgres")]
@@ -263,6 +270,39 @@ pub trait PackIndex: Send + Sync {
     /// not take or allow the call; [`PackIndexError::Store`] when the store fails.
     fn drop_location(&self, digest: &BlobDigest, pack_key: &str) -> Result<bool, PackIndexError> {
         let _ = (digest, pack_key);
+        Err(PackIndexError::Unsupported)
+    }
+
+    /// For each of `digests`, in order, the bytes of the Directory recorded under it, or `None`
+    /// when it has no row. Writes nothing. See [`directory`] for the rules.
+    ///
+    /// The default answers [`PackIndexError::Unsupported`], for an index that keeps no
+    /// Directory rows: the caller reads each Directory from its blob.
+    ///
+    /// # Errors
+    /// [`PackIndexError::TooMany`] for more than [`MAX_BATCH`] digests;
+    /// [`PackIndexError::NotMigrated`] when the schema has no directory table;
+    /// [`PackIndexError::Unsupported`] from an index that keeps no Directory rows;
+    /// [`PackIndexError::Store`] when the store fails.
+    fn directories(&self, digests: &[BlobDigest]) -> Result<Vec<Option<Vec<u8>>>, PackIndexError> {
+        let _ = digests;
+        Err(PackIndexError::Unsupported)
+    }
+
+    /// Records each of `directories` that has no row yet, in one transaction, and returns how
+    /// many rows it inserted. A digest that has a row keeps it (it is the same bytes).
+    ///
+    /// The default answers [`PackIndexError::Unsupported`], as [`PackIndex::directories`] does.
+    ///
+    /// # Errors
+    /// [`PackIndexError::Invalid`] when a body is not its digest or is longer than
+    /// [`directory::MAX_DIRECTORY_BYTES`], and nothing is written;
+    /// [`PackIndexError::TooMany`] for more than [`MAX_BATCH`] Directories;
+    /// [`PackIndexError::NotMigrated`] when the schema has no directory table;
+    /// [`PackIndexError::Unsupported`] from an index that keeps no Directory rows;
+    /// [`PackIndexError::Store`] when the store fails.
+    fn record_directories(&self, directories: &[NewDirectory]) -> Result<usize, PackIndexError> {
+        let _ = directories;
         Err(PackIndexError::Unsupported)
     }
 }

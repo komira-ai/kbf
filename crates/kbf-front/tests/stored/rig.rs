@@ -2,7 +2,7 @@
 //! with no storage node in front of an object store.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::SeqCst};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -10,6 +10,7 @@ use kbf_auth::Authorizers;
 use kbf_front::{Backend, PackSettings, Stored};
 use kbf_pack::{PackKeys, WriterKind};
 use kbf_pack_index::action::{ActionEntry, ActionPut, ActionStore};
+use kbf_pack_index::directory::NewDirectory;
 use kbf_pack_index::memory::MemoryPackIndex;
 use kbf_pack_index::{
     BlobDigest, Location, NewPack, PackIndex, PackIndexError, PackInfo, Recorded,
@@ -36,6 +37,9 @@ pub struct Index {
     fail_locate: AtomicU32,
     fail_get_action: AtomicU32,
     fail_put_action: AtomicU32,
+    fail_directories: AtomicU32,
+    fail_record_directories: AtomicU32,
+    keeps_no_directories: AtomicBool,
 }
 
 impl Index {
@@ -47,7 +51,26 @@ impl Index {
             fail_locate: AtomicU32::new(0),
             fail_get_action: AtomicU32::new(0),
             fail_put_action: AtomicU32::new(0),
+            fail_directories: AtomicU32::new(0),
+            fail_record_directories: AtomicU32::new(0),
+            keeps_no_directories: AtomicBool::new(false),
         }
+    }
+
+    /// From now on the index keeps no Directory rows: both Directory calls are `Unsupported`, as
+    /// an index without them answers.
+    pub fn keep_no_directories(&self) {
+        self.keeps_no_directories.store(true, SeqCst);
+    }
+
+    /// The next `n` reads of Directory rows fail.
+    pub fn fail_directories(&self, n: u32) {
+        self.fail_directories.store(n, SeqCst);
+    }
+
+    /// The next `n` records of Directory rows fail.
+    pub fn fail_record_directories(&self, n: u32) {
+        self.fail_record_directories.store(n, SeqCst);
     }
 
     /// The next `n` records fail.
@@ -122,6 +145,26 @@ impl PackIndex for Index {
 
     fn unreferenced_keys(&self, keys: &[String]) -> Result<Vec<String>, PackIndexError> {
         self.inner.unreferenced_keys(keys)
+    }
+
+    fn directories(&self, digests: &[BlobDigest]) -> Result<Vec<Option<Vec<u8>>>, PackIndexError> {
+        if self.keeps_no_directories.load(SeqCst) {
+            return Err(PackIndexError::Unsupported);
+        }
+        if fires(&self.fail_directories) {
+            return Err(PackIndexError::NotMigrated);
+        }
+        self.inner.directories(digests)
+    }
+
+    fn record_directories(&self, directories: &[NewDirectory]) -> Result<usize, PackIndexError> {
+        if self.keeps_no_directories.load(SeqCst) {
+            return Err(PackIndexError::Unsupported);
+        }
+        if fires(&self.fail_record_directories) {
+            return Err(PackIndexError::NotMigrated);
+        }
+        self.inner.record_directories(directories)
     }
 }
 

@@ -30,6 +30,7 @@ use postgres::types::ToSql;
 use kbf_state::Clock;
 use kbf_state::postgres::{Conn, ExtensionPool, Loan, PostgresConfig, store_error};
 
+use crate::directory::NewDirectory;
 use crate::{
     BlobDigest, Location, NewPack, PackBlob, PackIndex, PackIndexError, PackInfo, Recorded,
     check_batch, count, micros, micros_of,
@@ -38,6 +39,7 @@ use crate::{
 mod action;
 #[cfg(any(test, feature = "test-support"))]
 mod backend;
+mod directory;
 #[cfg(any(test, feature = "test-support"))]
 pub use backend::PostgresPackBackend;
 
@@ -437,5 +439,13 @@ impl PackIndex for PostgresPackIndex {
         let removed = session.conn().query_one(DROP, &args).map_err(failed)?;
         let removed: i64 = removed.get(0);
         Ok(removed > 0)
+    }
+
+    fn directories(&self, digests: &[BlobDigest]) -> Result<Vec<Option<Vec<u8>>>, PackIndexError> {
+        self.read_directories(digests)
+    }
+
+    fn record_directories(&self, directories: &[NewDirectory]) -> Result<usize, PackIndexError> {
+        self.insert_directories(directories)
     }
 }
