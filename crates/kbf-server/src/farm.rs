@@ -69,14 +69,10 @@ pub(crate) mod durable;
 mod engine;
 pub(crate) mod failed_actions;
 mod handover;
-mod input_cache;
 mod learning;
 mod named;
-mod node_load;
 mod node_types;
 mod nodes;
-mod pack_reads;
-mod pack_writes;
 mod phase;
 mod report;
 pub mod sched_view;
@@ -405,9 +401,6 @@ impl Farm {
             .set(state.engine.sched.whole_summary().as_ref());
         state.side.learned.publish(&metrics.estimator_shadow);
         state.side.learned.publish_predictions(&metrics.prediction);
-        metrics
-            .prediction
-            .set_cpu_limited_nodes(self.cpu_limited_nodes(state));
     }
 
     /// Writes the changed size summaries to the state store now, as the tick does once

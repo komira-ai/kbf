@@ -30,9 +30,9 @@ impl Farm {
             .await
     }
 
-    /// [`Farm::heartbeat`] carrying the node load `load` the heartbeat's reading came to
-    /// ([`Farm::note_node_load`]), which the scheduler is handed with the heartbeat, whatever
-    /// `--placement-load` says. A heartbeat of a replaced stream feeds it nothing.
+    /// [`Farm::heartbeat`] carrying the node load `load`, which the scheduler is handed with the
+    /// heartbeat, whatever `--placement-load` says. No server code reads a load from a worker
+    /// now, so the farm's own callers pass none. A heartbeat of a replaced stream feeds it nothing.
     pub async fn heartbeat_with_load(
         &self,
         worker: &WorkerId,

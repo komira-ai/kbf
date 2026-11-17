@@ -1,4 +1,4 @@
-//! `CommitPack` for a writer that is not trusted: a build that wrote one pack object through a
+//! The commit of a pack from a writer that is not trusted: a build that wrote one pack object through a
 //! presigned write.
 //!
 //! The entry is [`Packs::commit_untrusted_pack`]: it takes an [`IssuedPackKey`], which only the

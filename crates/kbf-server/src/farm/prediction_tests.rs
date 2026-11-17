@@ -9,7 +9,7 @@ use clap::Parser;
 use kbf_estimator::{Basis, Bounds, GIB, Hint, MIB, Outcome as RunOutcome, Run};
 use kbf_front::{Cache, Described, Dispatch, Submission};
 use kbf_invocation::Evidence;
-use kbf_proto::worker::{NodeLoad, ServerMessage};
+use kbf_proto::worker::ServerMessage;
 use kbf_sched::DaemonInstance;
 use kbf_state::fake::{Fake, Flaw};
 use kbf_state::{ManualClock, Store};
@@ -773,79 +773,4 @@ fn the_farm_a_server_builds_takes_the_flag_in_either_order() {
         off.lock().side.learned.predictions(),
         PlacementPredictions::Off
     );
-}
-
-/// A reading of a node whose actions cgroup has a CPU quota (`limited`), `seq` seconds in.
-fn reading(seq: u64, limited: bool) -> NodeLoad {
-    NodeLoad {
-        seq,
-        mono_usec: seq * 1_000_000,
-        actions_cpu_limited: limited,
-        ..NodeLoad::default()
-    }
-}
-
-/// Asserts the misconfiguration is surfaced: with `--placement-load on`, a node that reports
-/// a CPU quota is counted in the gauge and warned about once for each time it starts to
-/// report one, and the gauge falls when it stops; with placement load off nothing is said.
-/// Catches a quota that goes unsaid, a warning on every heartbeat, a gauge that stays up for a
-/// node that stopped, and a warning where the load is not read.
-#[tokio::test(start_paused = true)]
-async fn a_cpu_quota_under_placement_load_on_is_counted_and_warned_of_once() {
-    let log = crate::test_log::capture();
-    let cache = Arc::new(Cache::memory());
-    let farm = Farm::new(
-        cache.clone(),
-        kbf_sched::UNSERVABLE_WAIT,
-        kbf_sched::FINISHED_RETENTION,
-    )
-    .with_placement_load(PlacementLoad::On);
-    let (worker, stream) = node(&farm, "node-quota", 4, 64);
-    let said = || {
-        log.text()
-            .matches("actions cgroup has a CPU quota while --placement-load is on")
-            .count()
-    };
-    let limited_nodes = || cache.metrics().prediction.cpu_limited_nodes();
-    farm.note_node_load(&worker, stream, Some(&reading(1, false)));
-    farm.tick().await;
-    assert_eq!((limited_nodes(), said()), (0, 0));
-    farm.note_node_load(&worker, stream, Some(&reading(2, true)));
-    farm.tick().await;
-    assert_eq!((limited_nodes(), said()), (1, 1));
-    assert!(
-        log.text().contains("node-quota"),
-        "the warning names the node"
-    );
-    farm.note_node_load(&worker, stream, Some(&reading(3, true)));
-    farm.tick().await;
-    assert_eq!(
-        (limited_nodes(), said()),
-        (1, 1),
-        "once, not on each heartbeat"
-    );
-    farm.note_node_load(&worker, stream, Some(&reading(4, false)));
-    farm.tick().await;
-    assert_eq!((limited_nodes(), said()), (0, 1));
-    farm.note_node_load(&worker, stream, Some(&reading(5, true)));
-    assert_eq!(said(), 2, "a new quota is a new warning");
-    farm.tick().await;
-    assert_eq!(limited_nodes(), 1);
-    // No reading for more than three windows (of a second each): the node is not reporting
-    // a quota now.
-    tokio::time::advance(std::time::Duration::from_secs(4)).await;
-    farm.tick().await;
-    assert_eq!(limited_nodes(), 0, "a stale reading is not counted");
-
-    let quiet_cache = Arc::new(Cache::memory());
-    let off = Farm::new(
-        quiet_cache.clone(),
-        kbf_sched::UNSERVABLE_WAIT,
-        kbf_sched::FINISHED_RETENTION,
-    );
-    let (worker, stream) = node(&off, "node-off", 4, 64);
-    off.note_node_load(&worker, stream, Some(&reading(1, true)));
-    off.tick().await;
-    assert_eq!(quiet_cache.metrics().prediction.cpu_limited_nodes(), 0);
-    assert_eq!(said(), 2, "nothing is said where the load is not read");
 }

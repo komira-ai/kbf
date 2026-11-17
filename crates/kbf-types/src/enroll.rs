@@ -350,9 +350,7 @@ pub enum RoleError {
 pub enum Role {
     /// Serves blobs and the action cache.
     Storage,
-    /// The role of a worker daemon, which kbf no longer has. Still read and issued on request
-    /// (the certificate URI `urn:kbf:role:daemon` and the role bit are shipped); no kbf
-    /// process runs as one.
+    /// The removed worker daemon's role, still read and issued (`urn:kbf:role:daemon` shipped).
     Daemon,
     /// A host's updater (`docs/design/updates.md`): it dials the update coordinator and
     /// calls the frontend for its own node only. A token grants it alone, never with another

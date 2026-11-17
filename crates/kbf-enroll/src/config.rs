@@ -38,8 +38,10 @@ const HTTPS_PORT: u16 = 443;
 /// keys [`Config`] reads. The rest of a shared `kbf.toml` is the mode's flags, one table
 /// per group ([`Config::parse_shared`]); `kbf-cli` leaves these out of the flags.
 ///
-/// `daemon.data_dir` and `daemon.reserve_cpus` were the removed daemon's: they are read and
-/// ignored, so that a file written for a node that ran the daemon still starts its storage.
+/// `daemon.data_dir` and `daemon.reserve_cpus`, and the `update-dir` and `orders-dir` that
+/// `kbf-installer setup` wrote for the daemon's update client, were the removed daemon's: they
+/// are read and ignored, so that a file written for a node that ran the daemon still starts
+/// its storage.
 pub const KEYS: &[(&str, &[&str])] = &[
     ("", &["mode"]),
     ("frontend", &["url"]),
@@ -47,7 +49,10 @@ pub const KEYS: &[(&str, &[&str])] = &[
     ("node", &["id", "advertise", "zone"]),
     ("dirs", &["state"]),
     ("storage", &["hot_dir", "meta_dir"]),
-    ("daemon", &["data_dir", "reserve_cpus"]),
+    (
+        "daemon",
+        &["data_dir", "reserve_cpus", "update-dir", "orders-dir"],
+    ),
     ("tls", &["trust"]),
 ];
 
@@ -82,8 +87,8 @@ struct Raw {
     other: BTreeMap<String, toml::Value>,
 }
 
-/// `[daemon]`: the runtime's thread-count flags, and the removed daemon's two keys, which
-/// are ignored (see [`KEYS`]).
+/// `[daemon]`: the runtime's thread-count flags, and the removed daemon's keys, which are
+/// ignored (see [`KEYS`]).
 #[derive(Deserialize)]
 struct RawDaemon {
     #[serde(flatten)]

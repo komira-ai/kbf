@@ -14,8 +14,8 @@
 //!
 //! - A certificate check: nothing here is a peer; the job service's token is the credential.
 //! - The storage map: the task reads through a grant, not the map.
-//! - `note_pack_reads` and `note_pack_writes`: the task's reads and its one pack are
-//!   counted by the frontend's own ingest.
+//! - Pack read and write counts: the task's reads and its one pack are counted by the
+//!   frontend's own ingest.
 //! - `Welcome.pack_commit` and `placement_load`: nothing here commits a pack through
 //!   `CommitPack`. No load is reported: a job's host is the service's, and the farm places a
 //!   worker with no load reading by booking alone.

@@ -241,6 +241,8 @@ pack-bytes = 33554432
 # pack-cache-bytes = "BYTES"
 # A directory this process owns where the blobs read from packs are kept, one file each, checked by digest on every read; the least recently used are removed to stay within `--pack-cache-bytes`. Left out, nothing is kept
 # pack-cache-dir = "DIR"
+# Retired: no longer read, a worker's committed pack is no longer taken. Accepted and ignored for one release
+# pack-commit-sample = "BLOBS"
 # The most bytes of client uploads into packs this frontend holds in flight at once, at least 67108864 (the largest blob that is packed, so that no upload is refused for its size) and at most 4294967295. Each upload takes its blob's size as soon as its resource name has arrived, before it reads on, and gives it back when it ends; one that finds the rest taken waits its turn, so a burst of uploads is slowed down, not failed. The bound counts blob bytes, not the memory of the process: a batch upload is decoded before it waits, so the bytes it holds meanwhile are not counted, and reads are not counted. Used only with `--pack-store-endpoint`
 pack-inflight-bytes = 1073741824
 # The bucket of `--pack-store-endpoint` that holds the packs, under the keys `cas/f/<--pack-writer>/<start>/<sequence>`
@@ -263,6 +265,8 @@ default-platform = "linux/x86_64"
 exclusive-actions = false
 # How long, in seconds, a finished operation is kept after its callers are answered. Within it, WaitExecution on the operation's name streams its result (a client whose Execute stream broke gets a result the action cache does not keep, such as a failure); after it, the name is NOT_FOUND. Every operation finished within it is held in memory
 finished-retention-secs = 60
+# Retired: no longer read, the worker session was removed. Accepted and ignored for one release
+# heartbeat-interval-ms = "MILLISECONDS"
 # Opens the pack index at start: the tables in the Postgres state store that say which pack holds each blob and where. A frontend given `--pack-store-endpoint` reads and writes them; without it nothing does, and the flag only checks that the store can hold them. Needs `--state-store` as a `postgres://` URL whose schema has the pack tables (`kbf-installer setup` makes them); a `sqlite://` store is refused. Left out, no pack table is touched
 pack-index = false
 # Whether placement reads the load the nodes report. `off`, the default, books by the CPUs a lease asks for, as the server always has, and reads no load. `on` admits and ranks nodes by the load they report and the load a lease is predicted to add; a node that reports none is charged by prediction alone, and a node that has never sent a reading the server accepted is charged at least 1000 m for each lease (the node's whole CPU capacity, if that is less), so a prediction under one core changes nothing for such a node. `on` also keeps the flat memory charged to a node's leases within the node's memory; that guard counts only leases that carry a memory (a retry up the memory ladder, a VM) unless `--placement-predictions on` gives leases one
@@ -287,6 +291,10 @@ state-store-wait-secs = 300
 unservable-wait-secs = 300
 # Whether the farm learns what its leases use. Only `off`, the default, is accepted: it learns nothing and writes no row. `record` and `on` were run by the js scheduler core, which was removed because scheduling runs in the job service, and a start given one is refused (exit status 2). The mode a server runs is logged at start as `usage profiles: <mode>` and exported as the gauge `kbf_usage_profiles_mode{mode}`, 1 for the mode and 0 for the others
 usage-profiles = "off"
+# Retired: no longer read, the worker session was removed. Accepted and ignored for one release
+# vm-host-floor-cpus = "CPUS"
+# Retired: no longer read, the worker session was removed. Accepted and ignored for one release
+# vm-host-floor-mem-gib = "GIB"
 # Lets a reservation start on the last worker an older ordinary request that waits could run on. Off, the request waits for another worker, so a whole-machine request never takes the only worker such a request has
 whole-node-allow-last-capable = false
 # How long, in seconds, a whole-machine request waits before it reserves a worker; until then it takes only a worker with no lease. 0, the default, reserves at once
@@ -415,13 +423,3 @@ task-url-slack-secs = 600
 # worker-tls-cert = "WORKER_TLS_CERT"
 # PEM private key of the worker listener
 # worker-tls-key = "WORKER_TLS_KEY"
-
-[worker-session]
-# Retired: no longer read, the worker session was removed. Accepted and ignored for one release
-# heartbeat-interval-ms = "MILLISECONDS"
-# Retired: no longer read, a worker's committed pack is no longer taken. Accepted and ignored for one release
-# pack-commit-sample = "BLOBS"
-# Retired: no longer read, the worker session was removed. Accepted and ignored for one release
-# vm-host-floor-cpus = "CPUS"
-# Retired: no longer read, the worker session was removed. Accepted and ignored for one release
-# vm-host-floor-mem-gib = "GIB"

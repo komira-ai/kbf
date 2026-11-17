@@ -91,7 +91,7 @@ fn a_frontend_with_no_executor_flag_holds_no_settings() {
 }
 
 /// Catches the deleted worker executor still being accepted, or an unknown one: `--executor
-/// kbf-worker` is refused at start with a message that says kbf-worker was deleted and names
+/// kbf-daemon` is refused at start with a message that says kbf-daemon was deleted and names
 /// `--executor js-agent`, another value is refused naming the flag and the only executor, and
 /// `js-agent` still parses.
 #[test]

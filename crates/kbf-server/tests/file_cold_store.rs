@@ -170,6 +170,8 @@ fn stop(mut child: Running) {
 struct Here {
     stop: Option<oneshot::Sender<()>>,
     served: tokio::task::JoinHandle<Result<(), kbf_server::ServeError>>,
+    /// The cold store's lock file, which the stores release after serving ends.
+    lock: PathBuf,
 }
 
 /// Starts the server of `dirs` in this process; it, a client of both listeners with the
@@ -190,17 +192,26 @@ async fn started_here(dirs: &Dirs) -> (Here, Client, String) {
     let here = Here {
         stop: Some(stop),
         served,
+        lock: dirs.blobs.join("LOCK"),
     };
     (here, client, line)
 }
 
 /// Stops a server started by [`started_here`] and checks it ends without an error within
-/// `BOUND`, with its stores released.
+/// `BOUND`, then waits (within `BOUND` too) until the cold store's lock is released: in this
+/// process the stores close after serving ends, not at a process exit, so a start over the
+/// same directories waits for that as a restarted process would not have to.
 async fn stopped_here(mut here: Here) {
     drop(here.stop.take());
     let ended = tokio::time::timeout(BOUND, here.served).await;
     let served = ended.expect("the server ends in time").expect("its task");
     served.expect("served without an error");
+    let lock = std::fs::File::open(&here.lock).expect("the lock file");
+    let deadline = Instant::now() + BOUND;
+    while lock.try_lock().is_err() {
+        assert!(Instant::now() < deadline, "the cold store is still locked");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 /// Runs to exit and returns the exit code and stderr; fails the test if the server is

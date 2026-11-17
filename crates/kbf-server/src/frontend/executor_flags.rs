@@ -3,7 +3,7 @@
 //! `--executor js-agent` runs each action the farm places as a job of the job scheduler's job
 //! service ([`crate::executor`]); it is the only executor there is. Without `--executor` no
 //! executor is built, no job service is dialled and none of the companions is read: the
-//! frontend serves its cache and CAS alone. `--executor kbf-worker`, which named the deleted
+//! frontend serves its cache and CAS alone. `--executor kbf-daemon`, which named the deleted
 //! worker, is refused at start, and any other value too.
 //!
 //! The companions are the frontend's own. They are not refused without `--executor`, so a
@@ -567,7 +567,7 @@ pub struct ExecutorFlags {
 /// The setting the flags in `m` make.
 ///
 /// # Errors
-/// An `--executor` other than `js-agent` (`kbf-worker` is named as deleted). For `js-agent`, a
+/// An `--executor` other than `js-agent` (`kbf-daemon` is named as deleted). For `js-agent`, a
 /// flag it needs that is missing, a setting that breaks a rule ([`Config::validate`]), a job
 /// service URL that is not one or does not agree with the CA flag, or a base or kbf image that
 /// is not pinned by digest or is the same image twice.

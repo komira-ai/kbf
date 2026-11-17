@@ -529,6 +529,20 @@ impl Rig {
         }
     }
 
+    /// Waits until the drain reports the phase `draining`: new Execute calls are refused from
+    /// then on. `/readyz` turns 503 earlier, at the start of the load balancer's wait
+    /// (`lb_wait`), while new calls are still taken.
+    async fn draining(&self) {
+        let deadline = Instant::now() + PROMPT;
+        while self.drain().await["phase"] != "draining" {
+            assert!(
+                Instant::now() < deadline,
+                "the drain never reached `draining`"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     /// The drain status the operator API reports.
     async fn drain(&self) -> serde_json::Value {
         let (code, body) = self.get("/v1/frontend/drain").await;
@@ -715,6 +729,7 @@ async fn the_drain_endpoint_drains_the_process_and_it_exits_when_the_streams_are
     let (code, body) = rig.api("POST", "/v1/frontend/drain").await;
     assert_eq!(code, 200, "{body}");
     rig.not_ready().await;
+    rig.draining().await;
     // UNAVAILABLE from the service, or a transport error once the connection has been sent
     // GOAWAY, as the answer to the call or as the first message of its stream: either way the
     // call is not taken (the drain below still counts one open execution).

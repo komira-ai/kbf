@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kbf_proto::worker::{
-    DaemonMessage, Heartbeat, Hello, LeaseId, LeaseOffer, NodeStatus, PackReadCounts,
-    PackWriteCounts, ResultAck, ServerMessage, Start, Welcome, daemon_message, server_message,
+    DaemonMessage, Heartbeat, Hello, LeaseId, LeaseOffer, NodeStatus, ResultAck, ServerMessage,
+    Start, Welcome, daemon_message, server_message,
 };
 use kbf_sched::DaemonInstance;
 use kbf_server::HostFloor;
@@ -56,18 +56,12 @@ impl Feed {
                 }
             }
             Some(daemon_message::Message::Heartbeat(beat)) => {
-                farm.note_pack_reads(worker, stream, beat.pack_reads);
-                farm.note_pack_writes(worker, stream, beat.pack_writes);
-                farm.note_input_cache(worker, stream, beat.input_cache);
-                let load = farm.note_node_load(worker, stream, beat.node_load.as_ref());
                 let running = beat
                     .running
                     .iter()
                     .map(|l| kbf_types::LeaseId::new(l.term, l.seq))
                     .collect();
-                let acked = farm
-                    .heartbeat_with_load(worker, stream, beat.seq, running, load)
-                    .await;
+                let acked = farm.heartbeat(worker, stream, beat.seq, running).await;
                 if acked {
                     self.reply(server_message::Message::HeartbeatAck(
                         kbf_proto::worker::HeartbeatAck { seq: beat.seq },
@@ -352,39 +346,12 @@ impl FakeDaemon {
     /// Sends a heartbeat listing `running` and returns whether it was acknowledged
     /// within [`QUIET`].
     pub async fn heartbeat(&mut self, running: &[LeaseId]) -> bool {
-        let seq = self.beat(running, None);
+        let seq = self.beat(running);
         self.expect_within(QUIET, ack_of(seq)).await.is_some()
     }
 
-    /// Sends a heartbeat listing `running` and carrying the pack-read counts `pack_reads`, and
-    /// waits for its acknowledgement for as long as [`PROMPT`], a bound on failure only.
-    pub async fn beat_acked(&mut self, running: &[LeaseId], pack_reads: Option<PackReadCounts>) {
-        let seq = self.beat(running, pack_reads);
-        self.expect("HeartbeatAck", ack_of(seq)).await;
-    }
-
-    /// [`Self::beat_acked`] with the pack-write counts `pack_writes` too.
-    pub async fn beat_counted_acked(
-        &mut self,
-        pack_reads: Option<PackReadCounts>,
-        pack_writes: Option<PackWriteCounts>,
-    ) {
-        let seq = self.beat_with(&[], pack_reads, pack_writes);
-        self.expect("HeartbeatAck", ack_of(seq)).await;
-    }
-
-    /// Sends a heartbeat listing nothing and carrying the node load `load`, and waits for its
-    /// acknowledgement for as long as [`PROMPT`], a bound on failure only.
-    pub async fn beat_loaded_acked(&mut self, load: Option<kbf_proto::worker::NodeLoad>) {
-        self.beat_running_loaded_acked(&[], load).await;
-    }
-
-    /// [`Self::beat_loaded_acked`] listing `running` too.
-    pub async fn beat_running_loaded_acked(
-        &mut self,
-        running: &[LeaseId],
-        load: Option<kbf_proto::worker::NodeLoad>,
-    ) {
+    /// Sends a heartbeat with the next sequence number; the number.
+    fn beat(&mut self, running: &[LeaseId]) -> u64 {
         self.seq += 1;
         let seq = self.seq;
         self.send(daemon_message::Message::Heartbeat(Heartbeat {
@@ -393,32 +360,6 @@ impl FakeDaemon {
             running: running.to_vec(),
             pack_reads: None,
             pack_writes: None,
-            node_load: load,
-            input_cache: None,
-        }));
-        self.expect("HeartbeatAck", ack_of(seq)).await;
-    }
-
-    /// Sends a heartbeat with the next sequence number; the number.
-    fn beat(&mut self, running: &[LeaseId], pack_reads: Option<PackReadCounts>) -> u64 {
-        self.beat_with(running, pack_reads, None)
-    }
-
-    /// [`Self::beat`] carrying the pack-write counts `pack_writes` too.
-    fn beat_with(
-        &mut self,
-        running: &[LeaseId],
-        pack_reads: Option<PackReadCounts>,
-        pack_writes: Option<PackWriteCounts>,
-    ) -> u64 {
-        self.seq += 1;
-        let seq = self.seq;
-        self.send(daemon_message::Message::Heartbeat(Heartbeat {
-            seq,
-            report_hash: Vec::new(),
-            running: running.to_vec(),
-            pack_reads,
-            pack_writes,
             node_load: None,
             input_cache: None,
         }));

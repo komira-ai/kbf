@@ -337,11 +337,15 @@ fn a_typo_a_wrong_type_and_bad_toml_are_not_silently_ignored() {
 }
 
 /// Catches a file written for a node that ran the removed daemon being refused, or its
-/// `[daemon]` table letting any other key through: `data_dir` and `reserve_cpus` are read
-/// and ignored, whatever their value, and another key there is still unknown.
+/// `[daemon]` table letting any other key through: `data_dir`, `reserve_cpus`, `update-dir`
+/// and `orders-dir` are read and ignored, whatever their value, and another key there is
+/// still unknown.
 #[test]
 fn the_removed_daemons_keys_are_ignored_and_another_key_of_its_table_is_unknown() {
-    let old = format!("{MINIMAL}[daemon]\ndata_dir = \"/var/lib/kbf/data\"\nreserve_cpus = 99\n");
+    let old = format!(
+        "{MINIMAL}[daemon]\ndata_dir = \"/var/lib/kbf/data\"\nreserve_cpus = 99\n\
+         update-dir = \"/var/lib/kbf-installer\"\norders-dir = \"/var/lib/kbf-installer/orders\"\n"
+    );
     assert_eq!(ok(&old), ok(MINIMAL));
     assert_eq!(
         one(&format!(
@@ -349,7 +353,9 @@ fn the_removed_daemons_keys_are_ignored_and_another_key_of_its_table_is_unknown(
         )),
         "daemon.cpu-threads@0: unknown field `cpu-threads`"
     );
-    assert!(is_key("daemon", "data_dir") && is_key("daemon", "reserve_cpus"));
+    for key in ["data_dir", "reserve_cpus", "update-dir", "orders-dir"] {
+        assert!(is_key("daemon", key), "{key}");
+    }
     assert!(!is_own_table("daemon"));
 }
 

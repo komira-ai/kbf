@@ -105,6 +105,10 @@ const GROUPS: &[(&str, &[&str])] = &[
             "default-platform",
             "exclusive-actions",
             "finished-retention-secs",
+            // Retired with the worker session (`kbf_server::retired::RetiredWorkerFlags`),
+            // accepted and ignored for one release: the keys stay in the table an earlier
+            // release's template wrote them in, so that file is still read.
+            "heartbeat-interval-ms",
             "pack-index",
             "placement-load",
             "placement-predictions",
@@ -117,6 +121,9 @@ const GROUPS: &[(&str, &[&str])] = &[
             "state-store-wait-secs",
             "unservable-wait-secs",
             "usage-profiles",
+            // Retired with the worker session, as `heartbeat-interval-ms` above.
+            "vm-host-floor-cpus",
+            "vm-host-floor-mem-gib",
             "whole-node-allow-last-capable",
             "whole-node-drain-after-secs",
             "whole-node-drain-deadline-secs",
@@ -134,18 +141,6 @@ const GROUPS: &[(&str, &[&str])] = &[
             "history-index-root",
             "history-objects",
             "invocation-memory",
-        ],
-    ),
-    (
-        // The flags of the removed worker session, accepted and ignored for one release
-        // (`kbf_server::retired::RetiredWorkerFlags`): the keys stay so that a `kbf.toml`
-        // written before the removal is still read.
-        "worker-session",
-        &[
-            "heartbeat-interval-ms",
-            "pack-commit-sample",
-            "vm-host-floor-cpus",
-            "vm-host-floor-mem-gib",
         ],
     ),
     (
@@ -225,6 +220,8 @@ const GROUPS: &[(&str, &[&str])] = &[
             "pack-bytes",
             "pack-cache-bytes",
             "pack-cache-dir",
+            // Retired with the worker session, as `heartbeat-interval-ms` of the scheduler.
+            "pack-commit-sample",
             "pack-inflight-bytes",
             "pack-store-bucket",
             "pack-store-credentials-file",
@@ -508,7 +505,7 @@ pub fn file_args(
         // Enrollment's own keys share the file (`kbf_enroll::config::KEYS`): the top-level
         // `mode`, and the tables of `[enroll]`, `[frontend]`, `[node]`, `[dirs]` and
         // `[storage]`, which hold no flag; `[daemon]` (the runtime's thread counts, and the removed
-        // daemon's `data_dir` and `reserve_cpus`, ignored) and `[tls]` hold both.
+        // daemon's keys, ignored: `kbf_enroll::config::KEYS`) and `[tls]` hold both.
         if kbf_enroll::config::is_key("", group) {
             continue;
         }

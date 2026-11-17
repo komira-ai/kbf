@@ -110,6 +110,28 @@ fn the_file_turns_the_memory_climb_off() {
     }
 }
 
+/// Catches a `kbf.toml` written from an earlier release's template no longer starting the
+/// frontend: the four flags of the removed worker session, which that template wrote as
+/// `[scheduler] heartbeat-interval-ms`, `vm-host-floor-cpus`, `vm-host-floor-mem-gib` and
+/// `[packs] pack-commit-sample`, are still read from those tables, into the retired flags
+/// that are accepted and ignored.
+#[test]
+fn the_retired_worker_session_keys_are_read_from_the_tables_an_earlier_template_wrote() {
+    let dir = scratch("retired_worker_keys");
+    let text = format!(
+        "{FRONTEND_FILE}\n[scheduler]\nheartbeat-interval-ms = 5000\nvm-host-floor-cpus = 2\n\
+         vm-host-floor-mem-gib = 8\n\n[packs]\npack-commit-sample = 2\n"
+    );
+    let path = file(&dir, &text, 0o600);
+    let parsed =
+        kbf_cli::parse_with(argv(&["kbf", "frontend"], Some(&path)), None).expect("parses");
+    let retired = &frontend(&parsed.invocation).server.retired_worker;
+    assert_eq!(retired.heartbeat_interval_ms.as_deref(), Some("5000"));
+    assert_eq!(retired.vm_host_floor_cpus.as_deref(), Some("2"));
+    assert_eq!(retired.vm_host_floor_mem_gib.as_deref(), Some("8"));
+    assert_eq!(retired.pack_commit_sample.as_deref(), Some("2"));
+}
+
 /// Catches a default config path that is ignored, or one that is required: `parse_with`
 /// reads the default file when it exists and goes on without it when it does not.
 #[test]

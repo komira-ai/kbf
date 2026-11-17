@@ -54,15 +54,13 @@ impl Extras {
     }
 }
 
-/// Appends what a farm reports: the scheduler core gauge, the usage profiles mode, the pack
-/// workers' and input caches' counts, the scheduler's load counters and each node's load, and
-/// the failed actions. The one call every server's `/metrics` makes.
+/// Appends what a farm reports: the scheduler core gauge, the usage profiles mode, the
+/// scheduler's load counters, the farm's state store writes, and the failed actions. The one call every server's `/metrics` makes.
 pub(crate) fn render_farm(out: &mut String, farm: &Farm) {
     crate::scheduler_core::render(out);
     crate::usage_profiles::render(out, farm.usage_profiles());
-    crate::pack_daemon_metrics::render_farm(out, farm);
-    crate::input_cache_metrics::render_farm(out, farm);
-    crate::load_metrics::render_farm(out, farm);
+    crate::sched_load_metrics::render_farm(out, farm);
+    crate::farm_write_metrics::render_farm(out, farm);
     farm.failed_actions().render(out);
 }
 

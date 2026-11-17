@@ -1,4 +1,4 @@
-//! `CommitPack` for a build that wrote one pack object through a presigned write: the frontend
+//! The commit of a build that wrote one pack object through a presigned write: the frontend
 //! records it in the pack index after reading the pack back (the `untrusted` module has the
 //! rules, [`Packs::commit_untrusted_pack`] the entry).
 //!
@@ -7,7 +7,7 @@
 //! end in ([`CommitError`]), and the counts and log lines of every commit. Every refusal that is
 //! the commit's own (not a failure of the store or the index) is counted in
 //! `kbf_pack_commit_rejects_total` and logged; a recorded pack is counted in
-//! `kbf_pack_commits_total`. A commit of an untrusted pack is counted also in
+//! `kbf_pack_commits_total`. Every commit is of an untrusted pack, so it is counted also in
 //! `kbf_pack_untrusted_commits_total` and, for a refusal, in
 //! `kbf_pack_untrusted_commit_rejects_total` by `reason`. The index is written on the blocking
 //! pool.

@@ -1906,11 +1906,10 @@ fn check_refuses_a_frontend_image_of_another_commit_arch_or_name() {
 
 #[test]
 fn check_accepts_the_macos_installer_package_of_the_commit_and_refuses_the_uncommitted_name() {
-    // The Mac package no job builds now; releases that built one are still read (`release
-    // fetch-previous` checks the release before). Catches: a `.pkg` in SHA256SUMS refused as
-    // "not an asset of <commit>" (an older release fails its check), the package counted with
-    // no bundle, and the old builder's own name (`kbf-installer-<version>-macos-arm64.pkg`,
-    // which names no commit) accepted as an asset.
+    // No job builds the Mac package now, but an older release that has one is still checked.
+    // Catches: a `.pkg` in SHA256SUMS refused as "not an asset of <commit>", the package
+    // counted with no bundle, and the old builder's own name
+    // (`kbf-installer-<version>-macos-arm64.pkg`, no commit) accepted as an asset.
     let root = scratch("check-pkg");
     let accepted = dist(&root, COMMIT);
     add_deb(

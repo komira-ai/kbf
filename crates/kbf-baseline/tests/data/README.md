@@ -18,7 +18,7 @@ The buck2 is the release CI pins (`BUCK2_VERSION` 2026-10-01 in
 
 Captured by workflow runs 38245718952 (integration) and 38245719045 (ci) of
 komira-build-farm, on commit 0718a2d, which added the event logs to `crates/kbf-integration-test/m1/run.sh`
-and `crates/kbf-integration-test/m2/run.sh`. To capture again, download the `m1-cell-logs` or
-`m2-container-logs` artifact of a run and copy `buck2-<name>.json-lines.gz` and
-`buck2-<name>.log` here. The logs hold the hosted runner's paths and host name, as
+and `crates/kbf-integration-test/m2/run.sh`. The cells, their scripts and the jobs that ran
+them were deleted with kbf-daemon, so these recordings cannot be captured again here; they stay
+as fixed input of the parser's tests. The logs hold the hosted runner's paths and host name, as
 buck2 records them.

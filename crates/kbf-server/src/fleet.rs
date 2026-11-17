@@ -99,15 +99,12 @@ pub struct NodeDetail {
     pub free: ResourcesView,
     /// The leases it holds, as `term.seq`, in lease order.
     pub leases: Vec<String>,
-    /// What its worker reports of the CPU and memory its actions use. Left out when the
-    /// node has sent no reading this frontend accepted (a worker or runtime that takes
-    /// none, or a node another frontend holds).
+    /// What its worker reported of the CPU and memory its actions use. Never set now, so
+    /// always left out.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub load: Option<LoadView>,
-    /// What the node's input cache has done since its worker process started, from the
-    /// newest heartbeat that carried it. Left out when the node sent none (a worker with its
-    /// cache off or built before the counts, or a node another frontend holds): absent is
-    /// not zero.
+    /// What the node's input cache did since its worker process started. Never set now, so
+    /// always left out.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_cache: Option<InputCacheView>,
     /// Who placed the node out of placement, when it is (cordoned, draining or drained).
@@ -143,8 +140,9 @@ impl Serialize for Owner {
     }
 }
 
-/// The counts of a node's input cache (`docs/api.md`, "Input cache counts"): cumulative since
-/// its worker process started, so they start again from 0 when the worker restarts.
+/// The counts of a node's input cache: cumulative since its worker process started. Nothing
+/// reports them now, so `NodeDetail::input_cache` is never set; the type stays so that the
+/// field is still the one older readers know.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct InputCacheView {
     /// Entries written into the cache from the content store, and their bytes.
@@ -169,27 +167,9 @@ pub struct TreeCountsView {
     pub evictions: u64,
 }
 
-impl From<&kbf_proto::worker::InputCacheCounts> for InputCacheView {
-    fn from(counts: &kbf_proto::worker::InputCacheCounts) -> Self {
-        Self {
-            fills: counts.fills,
-            fill_bytes: counts.fill_bytes,
-            hits: counts.hits,
-            hit_bytes: counts.hit_bytes,
-            evictions: counts.evictions,
-            evicted_bytes: counts.evicted_bytes,
-            trees: counts.trees.as_ref().map(|trees| TreeCountsView {
-                builds: trees.builds,
-                hits: trees.hits,
-                evictions: trees.evictions,
-            }),
-        }
-    }
-}
-
-/// The load of a node's `actions/` cgroup, from the readings its heartbeats carried
-/// (`docs/api.md`, "Node load"). The scheduler is handed each accepted reading as well;
-/// whether it places by them is `--placement-load`.
+/// The load of a node's `actions/` cgroup, from the readings its heartbeats carried. Nothing
+/// reports a reading now, so `NodeDetail::load` is never set; the type stays so that the field
+/// is still the one older readers know.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct LoadView {
     /// The CPU the actions used, in thousandths of a CPU: the larger of the last two
@@ -220,8 +200,7 @@ pub struct LoadView {
 }
 
 /// What the `lease_clocks` and `minutes` lists of a node's readings have come to since its
-/// worker process began (`docs/api.md`, "Node load"), so that a dropped record, or a feed
-/// that is empty, can be seen.
+/// worker process began.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ListsView {
     /// Clock records kept, summed over the accepted readings.

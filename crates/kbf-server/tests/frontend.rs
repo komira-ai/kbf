@@ -131,8 +131,7 @@ struct Front {
     reapi: SocketAddr,
     worker: SocketAddr,
     api: SocketAddr,
-    /// The farm the frontend serves, which a fake daemon registers with.
-    farm: std::sync::Weak<kbf_server::farm::Farm>,
+    farm: std::sync::Weak<kbf_server::farm::Farm>, // What a fake daemon registers with.
     _stop: oneshot::Sender<()>,
 }
 
@@ -1441,8 +1440,7 @@ async fn an_open_execute_survives_stop_until_its_action_is_done() {
     )
     .expect("starts");
     let (reapi, worker) = (handle.reapi, handle.worker.expect("a worker listener"));
-    let farm = handle.farm.clone();
-    let served = tokio::spawn(handle.serve());
+    let (farm, served) = (handle.farm.clone(), tokio::spawn(handle.serve()));
     let client = Client::connect_to(reapi, worker, farm).await;
     let mut daemon = client.daemon("node-a", 4, 8).await;
 
@@ -1601,8 +1599,7 @@ async fn the_drain_endpoint_and_a_close_reach_a_frontend() {
         handle.api.expect("an API"),
     );
     let drain = handle.drain();
-    let farm = handle.farm.clone();
-    let served = tokio::spawn(handle.serve());
+    let (farm, served) = (handle.farm.clone(), tokio::spawn(handle.serve()));
     let client = Client::connect_to(reapi, worker, farm).await;
     let job = Job::new("drained on a frontend", &[]);
     client.upload(&job.blobs()).await;

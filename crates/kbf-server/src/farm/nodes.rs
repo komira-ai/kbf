@@ -4,10 +4,10 @@
 use kbf_sched::{Cordon, NodePhase, Scheduler};
 use kbf_types::{FarmTime, WorkerId};
 
-use super::{Farm, NodeLook, NodeUnread, State, node_load};
+use super::{Farm, NodeLook, NodeUnread, State};
 use crate::fleet::{
-    InputCacheView, LoadView, NodeDetail, NodeView, NodesView, PhaseView, PlacementView,
-    ResourcesView, needs_attention, shown_deadline,
+    NodeDetail, NodeView, NodesView, PhaseView, PlacementView, ResourcesView, needs_attention,
+    shown_deadline,
 };
 use crate::machine::FarmMachine;
 
@@ -78,14 +78,7 @@ impl Farm {
             return Ok(None);
         }
         let node = self.node(state, worker);
-        let capacity = state.engine.sched.capacity(worker).unwrap_or_default();
-        let load = node_load::shown(&state.side.node_loads, worker, &capacity, now);
-        let input_cache = state
-            .side
-            .input_caches
-            .get(worker)
-            .map(InputCacheView::from);
-        let detail = detail_of(node, &state.engine.sched, worker, load, input_cache);
+        let detail = detail_of(node, &state.engine.sched, worker);
         Ok(Some(state.engine.with_cordon_owner(detail, worker)))
     }
 
@@ -150,13 +143,7 @@ pub(super) fn node_of(
 
 /// `node`, which is `worker` as [`node_of`] lists it, with what it can run, what is left of
 /// that, its leases and the `load` its worker reported, as `GET /v1/nodes/{id}` answers.
-pub(super) fn detail_of(
-    node: NodeView,
-    sched: &Scheduler,
-    worker: &WorkerId,
-    load: Option<LoadView>,
-    input_cache: Option<InputCacheView>,
-) -> NodeDetail {
+pub(super) fn detail_of(node: NodeView, sched: &Scheduler, worker: &WorkerId) -> NodeDetail {
     let capacity = sched.capacity(worker).unwrap_or_default();
     let booked = sched.booked(worker).unwrap_or_default();
     let leases = sched
@@ -169,8 +156,8 @@ pub(super) fn detail_of(
         capacity: ResourcesView::of(capacity),
         free: ResourcesView::of(capacity.saturating_sub(booked)),
         leases,
-        load,
-        input_cache,
+        load: None,
+        input_cache: None,
         owner: None,
     }
 }

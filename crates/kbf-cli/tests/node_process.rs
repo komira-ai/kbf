@@ -339,8 +339,9 @@ async fn a_value_where_a_table_of_the_file_is_exits_2_naming_key_and_file() {
 }
 
 /// Catches a file written for a node that ran the removed daemon stopping its storage, or a
-/// key of the removed daemon being taken for a flag: `data_dir` and `reserve_cpus` in
-/// `[daemon]` are read and ignored and the file passes `--check`, the table's thread-count
+/// key of the removed daemon being taken for a flag: `data_dir`, `reserve_cpus`, and the
+/// `update-dir` and `orders-dir` that `kbf-installer setup` wrote, in `[daemon]` are read and
+/// ignored and the file passes `--check`, the table's thread-count
 /// flags (`async-threads`, `blocking-threads`, `cpu-threads`) still pass, and any other key
 /// there exits 2 naming the key and the file.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -348,7 +349,11 @@ async fn the_removed_daemons_keys_are_ignored_and_another_key_of_its_table_exits
     let run = fake::start();
     let root = scratch("process-daemon-table");
     token(&root, &run.fake.mint(1, 1).to_line());
-    for removed in ["data_dir = \"/var/lib/kbf/data\"", "reserve_cpus = 1"] {
+    for removed in [
+        "data_dir = \"/var/lib/kbf/data\"",
+        "reserve_cpus = 1",
+        "update-dir = \"/var/lib/kbf-installer\"\norders-dir = \"/var/lib/kbf-installer/orders\"",
+    ] {
         let top = format!("mode = \"storage\"\n[daemon]\n{removed}\n");
         let path = config(&root, run.enroll_addr.port(), &top);
         let out = kbf(args(&["--mode=storage", "--check"], &path)).await;

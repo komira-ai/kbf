@@ -83,18 +83,6 @@ pub(in crate::farm) struct Side {
     /// hold, shown what the state store says of it at each intake poll while a ticket holds
     /// the channel ([`State::stored_ticket`](super::State::stored_ticket)).
     pub watched: BTreeMap<OperationId, watch::Sender<Stage>>,
-    /// The pack-read counts on the newest heartbeat of each node that sent any
-    /// ([`Farm::note_pack_reads`](super::Farm::note_pack_reads)).
-    pub pack_reads: BTreeMap<WorkerId, worker::PackReadCounts>,
-    /// The pack-write counts on the newest heartbeat of each node that sent any
-    /// ([`Farm::note_pack_writes`](super::Farm::note_pack_writes)).
-    pub pack_writes: BTreeMap<WorkerId, worker::PackWriteCounts>,
-    /// The input cache counts on the newest heartbeat of each node that sent any
-    /// ([`Farm::note_input_cache`](super::Farm::note_input_cache)).
-    pub input_caches: BTreeMap<WorkerId, worker::InputCacheCounts>,
-    /// What the accepted node-load readings of each node that sent any come to
-    /// ([`Farm::note_node_load`](super::Farm::note_node_load)).
-    pub node_loads: super::node_load::NodeLoads,
     /// The operations this process settled as failed, per class
     /// (`kbf_execute_failed_actions_total`, [`Farm::failed_actions`](super::Farm::failed_actions)).
     pub failed: FailedActions,
@@ -114,10 +102,6 @@ impl Side {
             parked: BTreeMap::new(),
             learned: Learned::new(crate::learned::LearnedSizes::Off, 0, 0),
             watched: BTreeMap::new(),
-            pack_reads: BTreeMap::new(),
-            pack_writes: BTreeMap::new(),
-            input_caches: BTreeMap::new(),
-            node_loads: BTreeMap::new(),
             failed: FailedActions::default(),
         }
     }

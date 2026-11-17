@@ -192,6 +192,43 @@ async fn the_retired_handover_flags_start_and_warn_once_each() {
     }
 }
 
+/// Catches: the four retired flags of the removed worker session (a unit or a `kbf.toml`
+/// written before the removal carries them, at the values the earlier template wrote)
+/// stopping a frontend's start, or starting it in silence: each is accepted and logs one
+/// warning naming it, and a frontend given none logs none of them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_retired_worker_session_flags_start_and_warn_once_each() {
+    let log = Log::default();
+    let dispatch = tracing::Dispatch::new(
+        tracing_subscriber::fmt()
+            .with_writer(log.clone())
+            .with_ansi(false)
+            .finish(),
+    );
+    let start = |f: &frontend::FrontendFlags| {
+        tracing::dispatcher::with_default(&dispatch, || {
+            start_frontend(f, || Ok(pending::<()>())).expect("starts")
+        })
+    };
+
+    let _plain = start(&flags(&[]));
+    let gone = "the worker session was removed";
+    assert!(!log.text().contains(gone), "{}", log.text());
+    let given = [
+        "--heartbeat-interval-ms=5000",
+        "--vm-host-floor-cpus=2",
+        "--vm-host-floor-mem-gib=8",
+        "--pack-commit-sample=2",
+    ];
+    let _old = start(&flags(&given));
+    let text = log.text();
+    for flag in given {
+        let flag = flag.split('=').next().expect("a flag");
+        let line = format!("{flag} is no longer read: {gone}");
+        assert_eq!(text.matches(&line).count(), 1, "{text}");
+    }
+}
+
 /// Catches: a frontend started with the retired `--releases-dir` on a directory that holds
 /// an old release store changing it (opening it for writes, making files in it, or deleting
 /// it): the store is operator data. The directory, a nested file and its bytes are as they

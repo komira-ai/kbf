@@ -335,7 +335,9 @@ fn another_scheduler_key_makes_the_file_the_operators() {
         state_store: Some(DATABASE),
         extra: &[],
     };
-    let theirs = format!("mode = \"frontend\"\n[scheduler]\nstate-store = \"{DATABASE}\"\n");
+    let theirs = format!(
+        "mode = \"frontend\"\n[scheduler]\nstate-store = \"{DATABASE}\"\nunservable-wait-secs = 500\n"
+    );
     assert_eq!(
         decide(Some(&theirs), &ours, "/etc/kbf/kbf.toml"),
         Decision::Keep
@@ -493,7 +495,7 @@ fn an_error_about_a_file_never_repeats_the_database_url() {
         state_store: Some(DATABASE),
         extra: &[],
     };
-    let theirs = "mode = \"frontend\"\n[scheduler]\nstate-store = \"postgres:///other?host=/run/postgresql\"\n";
+    let theirs = "mode = \"frontend\"\n[scheduler]\nstate-store = \"postgres:///other?host=/run/postgresql\"\nunservable-wait-secs = 500\n";
     let Decision::Refuse(why) = decide(Some(theirs), &ours, "/etc/kbf/kbf.toml") else {
         panic!("refused");
     };
