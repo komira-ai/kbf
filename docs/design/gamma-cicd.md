@@ -60,8 +60,8 @@ listed in order in section 4.
   by hand, and there is no release dry run. A failed release job is re-run from its run's
   page.
 - **Pull requests run the pull-request gate, never a release.** `ci.yml` runs the lint,
-  the fast tests and coverage. The long source suite (`beta.yml`) and the artifact smoke
-  run on the push to `main`, as stages of the pipeline. A pull request tags nothing,
+  the fast tests and coverage. The long source suite (`beta.yml`) runs on the push to `main`, in
+  `suites.yml`, beside the pipeline; the artifact smoke is a job of the pipeline. A pull request tags nothing,
   publishes nothing and holds no OIDC token. The update rehearsals it may run
   (`update-rehearsal.yml`) update a host on a runner from the previous published release.
   They test the change, not a release.
@@ -99,15 +99,20 @@ release waits for either.
 
 ### 2.2 On a push to `main`: `pipeline.yml`
 
-The pipeline's jobs are `ci` (`ci.yml` again, on the merged commit), `beta` (`beta.yml`:
-the full test run with slow tests, Arm, Postgres, the object stores, crun, the Mac jobs,
-the Linux packages, the cross-version and mixed-version cells, and `kbf-job-client` against
-the pinned jobscheduler release), `artifacts` (stage
+The pipeline's jobs are `ci` (`ci.yml` again, on the merged commit), `artifacts` (stage
 `build`: the seed build, plain `cargo build --locked --release` on GitHub-hosted runners),
 `artifacts-sign` (stage `sign`: the attestations, after `ci` and `artifacts`), `smoke`
-(after `artifacts-sign`: the end-to-end smoke on this run's files), `watch` (cancels the
-run when any job fails) and `passed` (needs `ci`, `beta`, `artifacts`, `artifacts-sign` and
+(after `artifacts`, so beside `artifacts-sign`: the end-to-end smoke on this run's files), `watch` (cancels the
+run when any job fails) and `passed` (needs `ci`, `artifacts`, `artifacts-sign` and
 `smoke`).
+
+`beta.yml` is not in the pipeline. `suites.yml` calls it on every push to `main` (the full test run
+with slow tests, Arm, Postgres, the object stores, crun, the Mac jobs, the Linux packages, the
+cross-version and mixed-version cells, and `kbf-job-client` against the pinned jobscheduler
+release), and no release waits for it. After it, the `release-red` job runs
+`cargo xtask release-red`: a red run opens or updates the one open issue labelled `main-red`, titled
+`RELEASE-RED: kbf <first failing job>` (a later red run adds a comment; the next green run
+comments `Fixed: ...` and closes it).
 
 The `artifacts-sign` call holds `id-token: write` and `attestations: write`. The
 `artifacts` call is granted the same scopes only because GitHub checks a called workflow's
@@ -123,7 +128,8 @@ pipeline run once, only when every failed job is an artifact build or move job.
 repository. Every other job needs `plan`, and all of them but `verify` repeat the check. It has its own concurrency group, `release-main`, which never cancels. When
 `plan` finds the range since the last tag is docs only, or changes the pipeline itself,
 the jobs after `plan` are skipped and the run is green. The code ships with the next
-release.
+release. A commit that the highest release tag is already after (an older run that
+completes late) is also a green no-op, so the newest release is the only one deployed.
 
 The workflow has no secret but the release bot's GitHub App key (`RELEASE_BOT_PRIVATE_KEY`,
 with the variable `RELEASE_BOT_APP_ID`). The `release` environment is used by `tag`,

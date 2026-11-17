@@ -152,12 +152,12 @@ fn each_of_the_three_gates_is_a_green_gate_and_the_note_names_the_runs() {
     assert_eq!(fx.cli(&[]).0, Some(0));
     let doc = fx.written();
     let names: Vec<&str> = doc.gates.iter().map(|g| g.name.as_str()).collect();
-    assert_eq!(names, ["ci", "beta", "artifacts"]);
+    assert_eq!(names, ["ci", "artifacts", "smoke"]);
     assert!(doc.gates.iter().all(|g| g.verdict == Verdict::Green));
     let note = doc.note.expect("a note");
     assert_eq!(
         note,
-        "gate run: pipeline 111 (ci, artifacts, beta); beta smoke on the attested kbf"
+        "gate run: pipeline 111 (ci, artifacts, artifacts-sign, smoke); smoke on the run's own kbf"
     );
 }
 

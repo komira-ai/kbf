@@ -7,7 +7,12 @@
 //!    variable): an admin stops every later release without a code change;
 //! 2. `VERSION` at `--sha` is `MAJOR.MINOR` and one line end ([`Base::parse_file`]);
 //! 3. the base never goes backwards: no release tag has a higher base;
-//! 4. Rule S ([`superseded`]): the highest release tag names `--sha` or an ancestor of it.
+//! 4. Rule S ([`tags::placed`]): the highest release tag names `--sha` or an ancestor of it.
+//!    A tag that is a descendant of `--sha` (an older run that finished after a newer commit
+//!    was released) is not a refusal: the plan prints that the commit is superseded by the
+//!    tag and writes `code=false`, `site=false` and `pipeline=false`, so the release
+//!    workflow's jobs all skip and the run is green. A tag that diverged from `--sha` refuses.
+//!    `release tag` and `release publish` refuse a superseded commit all the same.
 //!
 //! Then the version: one above the highest `v<MAJOR>.<MINOR>.N` of the `VERSION` base
 //! among the tags and the releases (drafts too), or `1`; or, on a re-run of a commit the
@@ -39,7 +44,7 @@ use std::path::{Path, PathBuf};
 
 use super::append_output;
 use super::git::{commit_of, git, git_output, is_ancestor, release_tags};
-use super::tags::{self, Base, Standing, Version};
+use super::tags::{self, Base, Placed, Standing, Version};
 use crate::Error;
 use crate::build_commit::full_commit;
 
@@ -160,6 +165,29 @@ fn own_change(repo_dir: &Path, sha: &str) -> Result<Vec<String>, Error> {
     changed(repo_dir, &format!("{sha}^1"), sha)
 }
 
+/// The plan of a commit that the highest release tag `top` is a descendant of: it says so
+/// and releases nothing (`code`, `site` and `pipeline` false). `version` and `tag` are
+/// `top`'s, the release that stands.
+fn superseded_plan(a: &PlanArgs, top: Version) -> Result<Vec<String>, Error> {
+    let lines = vec![
+        format!(
+            "superseded: {} is behind the release {}: nothing is released for it",
+            a.sha,
+            top.tag()
+        ),
+        format!("version={top}"),
+        format!("tag={}", top.tag()),
+        "reused=false".to_owned(),
+        "code=false".to_owned(),
+        "site=false".to_owned(),
+        "pipeline=false".to_owned(),
+    ];
+    if let Some(output) = &a.output {
+        append_output(output, &lines[1..])?;
+    }
+    Ok(lines)
+}
+
 /// The `release plan` verb: the lines to print.
 pub fn run(a: &PlanArgs) -> Result<Vec<String>, Error> {
     full_commit("--sha", &a.sha)?;
@@ -169,6 +197,12 @@ pub fn run(a: &PlanArgs) -> Result<Vec<String>, Error> {
             a.freeze
         )]));
     }
+    // Rule S first: a commit a newer release is already after is planned as nothing,
+    // whatever its VERSION (a late run from before a VERSION bump is not a refusal).
+    let standing = match tags::placed(&a.gh, &a.repo, &a.sha)? {
+        Placed::Stands(standing) => standing,
+        Placed::Behind(top) => return superseded_plan(a, top),
+    };
     let file = git(&a.repo_dir, &["show", &format!("{}:VERSION", a.sha)])?;
     let Some(base) = Base::parse_file(&file) else {
         return Err(Error::Refused(vec![format!(
@@ -184,7 +218,6 @@ pub fn run(a: &PlanArgs) -> Result<Vec<String>, Error> {
             base.major, base.minor, above.major, above.minor
         )]));
     }
-    let standing = tags::superseded(&a.gh, &a.repo, &a.sha)?;
     let top = taken
         .iter()
         .filter(|v| v.base == base)

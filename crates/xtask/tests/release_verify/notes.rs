@@ -600,7 +600,7 @@ fn the_notes_of_the_record_verdict_write_writes_come_from_the_builds_not_its_lis
     );
     assert!(!notes.contains("meta-log format"), "{notes}");
     assert!(
-        notes.contains("## Beta record\n\n- gate ci: 1\n- gate beta: 1\n"),
+        notes.contains("## Beta record\n\n- gate ci: 1\n- gate artifacts: 1\n- gate smoke: 1\n"),
         "{notes}"
     );
 }

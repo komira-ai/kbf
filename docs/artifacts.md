@@ -21,7 +21,7 @@ build.
 A pull request runs `ci.yml` (the checks `lint` and `test`, which gates the coverage of the fast set
 run in the `test-shard` matrix beside it) and `macos-pr.yml`, whose `macos-test` and `macos-device` run, on a
 hosted `macos-15`, the macOS crates' tests and every step of `beta.yml`'s `native-macos`. The full suite, the after-merge macOS jobs and the
-packages run on a push to `main` (`beta.yml`). One label opts a pull request in to more, to spare the small
+packages run on a push to `main` (`beta.yml`, called by `suites.yml` beside the pipeline). One label opts a pull request in to more, to spare the small
 macOS runner pool. Adding it to an open pull request starts a run.
 
 | Label | Effect |
@@ -279,7 +279,7 @@ renamed.
 | Event | What happens |
 |---|---|
 | Pull request, merge queue | A build check: every asset is built, signed, packaged and summed, and `SHA256SUMS` is checked. Nothing is attested, so nothing is published. |
-| Push to `main` | The same, as the second stage of the one pipeline (`pipeline.yml`: `ci` and `beta` (the source tests) together, `artifacts` (the builds and sums, `stage: build`) beside them, `artifacts-sign` (the attest and verify jobs, `stage: sign`) after `ci` and `artifacts`, `smoke` on these files after `artifacts-sign`, then the release; `artifacts.yml` is called twice by it, and reads the push as its own event; the attest jobs are in that file because it is the signer identity the installers verify), then, per platform group (Linux: `sums-linux`, `attest-linux`, `verify-linux`; macOS: `sums-darwin-arm64`, `attest-darwin-arm64`, `verify-darwin-arm64`, so the Linux files are attested as soon as the Linux builds finish, however long the macOS runners queue), the `attest-*` job signs build provenance for every file in `SHA256SUMS` (`actions/attest-build-provenance`), an SBOM attestation for every tarball and for the task image (`actions/attest-sbom`) and a build provenance attestation of each tarball alone, whose bundle it saves (artifact `bundles-linux` or `bundles-darwin-arm64`), and nothing else. The `verify-*` job of the group then assembles the group's `SHA256SUMS` (artifact `sha256sums-linux` or `sha256sums-darwin-arm64`, listing only that group's files, each with the same subject as in the commit's one `SHA256SUMS`) again from the files, refuses it unless it is byte for byte the published one, checks the files against it, and verifies every attestation with the command below, for the branch that was pushed (`--source-ref "$GITHUB_REF"`), and every tarball against its bundle, offline, for the commit (`--commit "$GITHUB_SHA"`). |
+| Push to `main` | The same, as the second stage of the one pipeline (`pipeline.yml`: `ci` and `artifacts` (the builds and sums, `stage: build`) together, `artifacts-sign` (the attest and verify jobs, `stage: sign`) after `ci` and `artifacts`, `smoke` on these files after `artifacts` and beside `artifacts-sign`, then the release; `artifacts.yml` is called twice by it, and reads the push as its own event; the attest jobs are in that file because it is the signer identity the installers verify), then, per platform group (Linux: `sums-linux`, `attest-linux`, `verify-linux`; macOS: `sums-darwin-arm64`, `attest-darwin-arm64`, `verify-darwin-arm64`, so the Linux files are attested as soon as the Linux builds finish, however long the macOS runners queue), the `attest-*` job signs build provenance for every file in `SHA256SUMS` (`actions/attest-build-provenance`), an SBOM attestation for every tarball and for the task image (`actions/attest-sbom`) and a build provenance attestation of each tarball alone, whose bundle it saves (artifact `bundles-linux` or `bundles-darwin-arm64`), and nothing else. The `verify-*` job of the group then assembles the group's `SHA256SUMS` (artifact `sha256sums-linux` or `sha256sums-darwin-arm64`, listing only that group's files, each with the same subject as in the commit's one `SHA256SUMS`) again from the files, refuses it unless it is byte for byte the published one, checks the files against it, and verifies every attestation with the command below (the files are checked in parallel), for the branch that was pushed (`--source-ref "$GITHUB_REF"`), and every tarball against its bundle, offline, for the commit (`--commit "$GITHUB_SHA"`). |
 
 An attestation names the ref it was signed on, and only `refs/heads/main` signs now.
 Until main became the only integration branch, pushes to a development branch,
@@ -829,8 +829,8 @@ bundles of the Linux platforms, their
 it (the facts and the base tree bundles have none: the attestation of `SHA256SUMS` covers them).
 
 One run of `release.yml` cuts a release; nobody tags. A push to `main` runs one sequential pipeline
-(`pipeline.yml`, [design](design/kbf-cicd.md), section 8.0): `ci` and `beta` (the source tests) together, `artifacts` (the builds) beside them, `artifacts-sign` (the attestations) after `ci` and `artifacts`, and `smoke`, which installs and
-tests the `kbf` of the files `artifacts` built and attested in that same run, after `artifacts-sign`; the run fails fast (its `watch` job cancels it when a job has failed). `release.yml`
+(`pipeline.yml`, [design](design/kbf-cicd.md), section 8.0): `ci` and `artifacts` (the builds) together, `artifacts-sign` (the attestations) after `ci` and `artifacts`, and `smoke`, which installs and
+tests the `kbf` of the files `artifacts` built in that same run, after `artifacts` and beside `artifacts-sign`. The full suite (`beta.yml`) is not part of the pipeline: `suites.yml` calls it on every push to `main`, beside the pipeline, it never gates a release, and a red run opens or updates the one issue labelled `main-red` (`RELEASE-RED: kbf <job>`, `cargo xtask release-red`). The run fails fast (its `watch` job cancels it when a job has failed). `release.yml`
 is started by the completion of a pipeline run (`workflow_run`, `branches: [main]`) and acts only when that run
 succeeded for a push to `main`; it reads the files from that run's artifacts by the run's id and publishes those same
 files. It is a workflow of its own so that nothing a push does can cancel a
@@ -855,7 +855,7 @@ nothing and the run is green, and a push that changes the pipeline is released b
 that does not. `tag`, `notes`, `publish`, `bump` and `gamma` also repeat the condition on the run that started the
 workflow (conclusion `success`, event `push`, branch `main`, this repository). The pipeline run is never cancelled
 and the newest waiting push queues behind it; `plan` measures from the highest release tag that is an ancestor of the
-commit, so the code of a push that was replaced while waiting is released with the next one. No job runs after a red one (no `always()`, no
+commit, so the code of a push that was replaced while waiting is released with the next one. A commit that the highest tag is already after (a run that completes late) is a green no-op at `plan`, so the older run does not go red. No job runs after a red one (no `always()`, no
 `continue-on-error`; the apt jobs that follow an attempt that may be skipped use `!cancelled() && !failure()`). `release tag` and `release publish` both refuse a commit that is behind the
 highest release tag, so a re-run of an old run releases nothing; re-run the failed jobs only.
 `verify`, with read-only scopes, fails the run (and nothing is tagged) when:
@@ -886,7 +886,7 @@ fails and changes nothing; the files it lacks are uploaded (`cargo xtask release
 publish`).
 
 Two further verbs read the annotated `v*` tag. Its message is the Beta record (`docs/design/kbf-cicd.md`,
-section 8.1), which `release verdict-write` wrote for the pipeline run (`ci`, `artifacts` and `beta` all succeeded) that
+section 8.1), which `release verdict-write` wrote for the pipeline run (`ci`, `artifacts`, `artifacts-sign` and `smoke` all succeeded) that
 started the release, and names that run. The record is an audit record: **nothing gates on it**, and
 no step of the release workflow judges a verdict. `notes` runs both verbs, on a checkout of the whole
 history (the tag object and `origin/main` must be there): `cargo xtask release verify` refuses a

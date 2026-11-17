@@ -355,7 +355,9 @@ fn gh(argv0: &str, args: &[String]) -> ExitCode {
         .append(true)
         .open(dir.join("gh-args"))
         .expect("gh-args");
-    writeln!(log, "{}", args.join(" ")).expect("gh-args");
+    // One write for the whole line: concurrent calls must not interleave their lines.
+    log.write_all(format!("{}\n", args.join(" ")).as_bytes())
+        .expect("gh-args");
     match args[0].as_str() {
         "api" if args[1] == "-X" => return issues_write(dir, args),
         "api" if args.iter().any(|a| a == "--input") => return api_write(dir, args),
@@ -429,7 +431,9 @@ fn verify_bundle(dir: &Path, sha256: &str, file: &str, bundle: &str, rest: &[Str
     .iter()
     .map(|name| format!("{name}={}", std::env::var(name).unwrap_or_default()))
     .collect();
-    writeln!(env_log, "{}", seen.join(" ")).expect("gh-env");
+    env_log
+        .write_all(format!("{}\n", seen.join(" ")).as_bytes())
+        .expect("gh-env");
     // The flags, without the two that name files.
     let mut flags: Vec<&str> = Vec::new();
     let mut words = rest.iter();

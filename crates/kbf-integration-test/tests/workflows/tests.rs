@@ -18,7 +18,7 @@ fn scan(text: &str) -> Vec<String> {
     super::scan(text, &repo())
 }
 
-fn workflow(body: &str) -> String {
+pub(super) fn workflow(body: &str) -> String {
     format!("name: t\non: push\npermissions: {{}}\njobs:\n  a:\n{body}")
 }
 
@@ -32,11 +32,11 @@ fn refused_text(text: &str, want: &str) {
 }
 
 /// Asserts that `body`, under a job, yields at least one message containing `want`.
-fn refused(body: &str, want: &str) {
+pub(super) fn refused(body: &str, want: &str) {
     refused_text(&workflow(body), want);
 }
 
-fn clean(text: &str) {
+pub(super) fn clean(text: &str) {
     assert_eq!(scan(text), Vec::<String>::new(), "{text}");
 }
 
@@ -600,7 +600,7 @@ fn signing_scopes_are_also_allowed_in_the_sign_stage_of_a_push_to_main_and_nothi
 }
 
 /// The `if:` line under which a job may sign provenance: a push to main.
-const SIGNING_PUSH_IF: &str =
+pub(super) const SIGNING_PUSH_IF: &str =
     "    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}\n";
 
 #[test]
@@ -761,7 +761,7 @@ fn issues_write_needs_a_job_that_runs_only_on_the_main_ref() {
         assert_eq!(
             scan(&workflow(&body)),
             vec![format!(
-                "line {}: `issues: write` is allowed only in a job whose `if:` is exactly `{ISSUES_MAIN_ONLY}`",
+                "line {}: `issues: write` is allowed only in a job whose `if:` is exactly `{ISSUES_MAIN_ONLY}` or exactly `{ISSUES_RELEASE_RED}`",
                 if cond.is_empty() { 7 } else { 8 }
             )],
             "{body}"

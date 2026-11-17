@@ -45,13 +45,19 @@
 //!   `seed_build`, whose docs say why: a broken kbf is rebuilt without kbf);
 //! - a workflow, release asset list or docs/artifacts.md that ships a darwin `kbf-task` asset, package or image,
 //!   or a workflow that enables the test-only feature `unconfined-for-tests` of `kbf-task` (`no_darwin_task.rs`);
-//! - the push-to-main pipeline drifting from its shape (`ci` and `beta` together, `artifacts` after `ci`,
-//!   `smoke` on those artifacts after `artifacts`, `passed` needing all four, and the `watch` job that
+//! - the push-to-main pipeline drifting from its shape (`ci` and the `artifacts` build together, signing
+//!   after `ci` and the build, `smoke` on the built artifacts beside the signing, `passed` needing all
+//!   four, no call of the source suite `beta.yml`, and the `watch` job that
 //!   cancels the run when a job fails), a called workflow gaining a push
 //!   trigger of its own or losing its pull-request triggers, a second call of a check, the
 //!   pipeline cancelling a running predecessor or holding anything that releases, or the release
 //!   not following the pipeline's success in a group that never cancels (modules
 //!   `pipeline_workflow` and `release_workflow`);
+//! - the source suite `suites.yml` (a push to main, beside the pipeline, never gating the release)
+//!   drifting from its shape: not exactly `beta` (calling `beta.yml`) then `release-red`, a
+//!   cancelling or shared concurrency group, `release-red` not running after the suite whatever its
+//!   result and only for main, scopes beyond its three, or the token held before the last step or
+//!   before xtask is built (module `suites_workflow`);
 //! - a pull request taking a macOS runner outside the expected jobs or without their gate, a
 //!   pull request's macOS job holding a secret, an environment, an OIDC token or a write scope,
 //!   and `.github/workflows/macos-pr.yml` drifting from its shape (every pull request, no
@@ -98,6 +104,7 @@ mod release_workflow;
 mod scratch_dirs;
 mod seed_build;
 mod store_floor;
+mod suites_workflow;
 mod test_spawns;
 mod test_wording;
 mod workflows;

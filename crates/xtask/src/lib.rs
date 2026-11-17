@@ -123,6 +123,8 @@
 //!   completed, rerun its failed jobs once (first attempt only) when every failed job builds or moves
 //!   artifacts; a failed test or lint job, or an unknown one, means nothing is rerun. Exit 1 only
 //!   when GitHub refuses the rerun.
+//! - `release-red --repo <owner/repo> --run-id <id>` ([`release_red`]): keep the one `main-red`
+//!   issue of a run on `main`: open it or comment on red, close it on the newest green run.
 //! - `runner-disk --path <path> --min-free-gb <n>` ([`runner_disk`]): exit 1 naming the disk
 //!   when the disk of `<path>` has less free space than the coverage run needs.
 //! - `static-elf <binary>` ([`static_elf`]): exit 1 unless the ELF64 binary is statically
@@ -172,6 +174,7 @@ pub mod pkg_version;
 pub mod profiles_complete;
 pub mod prove_farm;
 pub mod release;
+pub mod release_red;
 pub mod runner_disk;
 pub mod static_elf;
 pub mod sudo_test;
@@ -266,6 +269,8 @@ enum Verb {
     PipelineWatch(pipeline_watch::Args),
     /// Rerun the failed jobs of a completed pipeline run once, when all of them build or move artifacts.
     PipelineRerun(pipeline_rerun::Args),
+    /// Keep one `RELEASE-RED` issue for a run on main: open it or comment when the run is red, close it when green.
+    ReleaseRed(release_red::Args),
     /// Refuse a row the budget file gains against `--base`.
     BudgetDiff {
         /// The revision to compare with (on a pull request, the base branch).
@@ -748,8 +753,8 @@ enum ReleaseVerb {
         #[arg(long)]
         output: Option<PathBuf>,
     },
-    /// What a push would release: the next version, the push's class, and the freeze and
-    /// superseded refusals. Writes nothing but `--output`.
+    /// What a push would release: the next version, the push's class, the freeze refusal,
+    /// and nothing for a commit a newer release is after. Writes nothing but `--output`.
     Plan(release::plan::PlanArgs),
     /// The release before `--sha`: the highest release tag that names a strict ancestor of it,
     /// downloaded and verified (checksums, then attestations), and its named binaries taken
@@ -1045,6 +1050,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
         Verb::StaticElf(args) => static_elf::run(&args),
         Verb::PipelineWatch(args) => pipeline_watch::run(&args),
         Verb::PipelineRerun(args) => pipeline_rerun::run(&args),
+        Verb::ReleaseRed(args) => release_red::run(&args),
         Verb::BudgetDiff { base } => Ok(vec![budget_diff(&root, &base)?]),
         Verb::SourceDateEpoch { commit, output } => {
             source_date_epoch(&root, &commit, &output).map(|line| vec![line])

@@ -4,13 +4,18 @@
 //! real files must report none, and `tests` plants a defect for each rule.
 //!
 //! - **One pipeline.** `pipeline.yml` runs on a push to `branches: [main]` and on nothing
-//!   else, with the jobs [`JOBS`]. `ci`, `beta`, `artifacts`, `artifacts-sign` and `smoke` call
-//!   `ci.yml`, `beta.yml`, `artifacts.yml`, `artifacts.yml` and `smoke.yml`. `ci`, `beta`
-//!   and `artifacts` (the builds, `with: stage: build`) need nothing and start together;
-//!   `artifacts-sign` (the attest and verify jobs, `with: stage: sign`) needs `ci` and
-//!   `artifacts`, and `smoke`, the one job that tests the artifacts, needs `artifacts-sign` (a
-//!   commit that fails the gate is built but neither signed nor smoke-tested). No stage can pass
-//!   or run after a red one, so a red or cancelled stage stops the stages after it.
+//!   else, with the jobs [`JOBS`]. `ci`, `artifacts`, `artifacts-sign` and `smoke` call
+//!   `ci.yml`, `artifacts.yml`, `artifacts.yml` and `smoke.yml`. `ci` and `artifacts` (the
+//!   builds, `with: stage: build`) need nothing and start together; `artifacts-sign` (the attest
+//!   and verify jobs, `with: stage: sign`) needs `ci` and `artifacts`, and `smoke`, the one job
+//!   that tests the artifacts, needs `artifacts` alone, so it runs beside the signing (a commit
+//!   that fails the gate is built but not signed; the smoke reads the built files, which need no
+//!   signature). No stage can pass or run after a red one, so a red or cancelled stage stops the
+//!   stages after it.
+//! - **The source suite is not in the pipeline.** `beta.yml` (about an hour of tests) is called
+//!   by the job `beta` of `suites.yml` and by nothing else; `pipeline.yml` does not call it, so
+//!   the release, which follows the pipeline's success, never waits for it (`suites_workflow`
+//!   holds `suites.yml`).
 //! - **One signer file, two calls.** The signer identity of an attestation is the workflow file,
 //!   `artifacts.yml`, and the installers verify exactly it, so the attest jobs stay there. In
 //!   `artifacts.yml` every job that holds a signing scope has exactly [`SIGNING_STAGE_IF`], every
@@ -26,14 +31,16 @@
 //!   as a job has failed.
 //! - **Each check once.** The four called workflows have a `workflow_call` trigger and no
 //!   `push` trigger; `ci.yml` and `artifacts.yml` keep `pull_request` and `merge_group`;
-//!   `beta.yml` and `smoke.yml` have `workflow_call` alone. The jobs that call them are the
-//!   pipeline's alone: one job each, but for `artifacts.yml`, which `artifacts` (stage build) and
-//!   `artifacts-sign` (stage sign) call, so a push to main runs each check once.
+//!   `beta.yml` and `smoke.yml` have `workflow_call` alone. The jobs that call them are one
+//!   each (`suites.yml#beta` for `beta.yml`, the pipeline's for the others), but for
+//!   `artifacts.yml`, which `artifacts` (stage build) and `artifacts-sign` (stage sign) call, so a
+//!   push to main runs each check once.
 //! - **Smoke tests the artifacts of the same run; beta needs none.** `smoke.yml` downloads the
 //!   `assets-*` and `sha256sums` artifacts without a `run-id` (the run it is part of), checks
 //!   them with `verify-assets sums`, then checks the `kbf` of the linux-x86_64 tarball with
 //!   `build-commit check-asset`; the job builds no `kbf` of its own. `beta.yml` downloads
-//!   no artifact, which is what lets it start beside `ci`.
+//!   no artifact: it runs in its own workflow, beside the pipeline, and no artifact of the
+//!   pipeline's run is there for it.
 //! - **A running pipeline is not cancelled by a push; a release is never cancelled.** The
 //!   pipeline's concurrency is `pipeline-${{ github.ref }}` with `cancel-in-progress: false`: the
 //!   run in progress is never cancelled by a push, and of the pushes that wait GitHub keeps the
@@ -44,8 +51,8 @@
 //!   scopes of the two calls of `artifacts.yml` (the build call has them only because a called
 //!   workflow is checked against its caller's grant statically; its signing jobs are skipped),
 //!   the `actions: read` of `ci` (its `test` job waits for the coverage shards' artifacts) and
-//!   the `actions: write` of `watch`; a called workflow gets at most
-//!   what its caller job grants.
+//!   the `actions: write` of `watch`; a called workflow gets at most what its caller job grants
+//!   (`beta.yml`'s jobs are checked against the grant of `suites.yml#beta`).
 
 use super::workflows;
 
@@ -53,9 +60,8 @@ use super::workflows;
 const NAME: &str = "pipeline";
 
 /// The jobs, in file order.
-const JOBS: [&str; 7] = [
+const JOBS: [&str; 6] = [
     "ci",
-    "beta",
     "artifacts",
     "artifacts-sign",
     "smoke",
@@ -64,13 +70,19 @@ const JOBS: [&str; 7] = [
 ];
 
 /// `(job, workflow file, the jobs it needs)`: the stages, in order.
-const STAGES: [(&str, &str, &[&str]); 5] = [
+const STAGES: [(&str, &str, &[&str]); 4] = [
     ("ci", "ci.yml", &[]),
-    ("beta", "beta.yml", &[]),
     ("artifacts", "artifacts.yml", &[]),
     ("artifacts-sign", "artifacts.yml", &["ci", "artifacts"]),
-    ("smoke", "smoke.yml", &["artifacts-sign"]),
+    ("smoke", "smoke.yml", &["artifacts"]),
 ];
+
+/// The source suite: its file, called by the job [`SUITE_JOB`] of `suites.yml` and by no job of
+/// the pipeline.
+const SUITE_FILE: &str = "beta.yml";
+
+/// The job of `suites.yml` that calls [`SUITE_FILE`].
+const SUITE_JOB: &str = "beta";
 
 /// The call of `artifacts.yml` that builds (`stage: build`): it starts with `ci` and signs
 /// nothing: every job of artifacts.yml that holds a signing scope is skipped in it
@@ -142,6 +154,7 @@ const CONTINUING: &[&str] = &["always()", "failure()", "cancelled()", "continue-
 /// The workflow files, by role.
 pub struct Files {
     pub pipeline: String,
+    pub suites: String,
     pub ci: String,
     pub artifacts: String,
     pub beta: String,
@@ -242,7 +255,7 @@ fn pipeline(files: &Files, out: &mut Vec<String>) -> Result<(), String> {
         let want_needs: Vec<String> = needs.iter().map(|n| (*n).to_owned()).collect();
         if have != want_needs {
             out.push(format!(
-                "the job `{job}` needs {have:?}, not {want_needs:?}: the builds start with ci, signing needs ci and the build call, and smoke needs the signing call"
+                "the job `{job}` needs {have:?}, not {want_needs:?}: the builds start with ci, signing needs ci and the build call, and smoke needs the build call"
             ));
         }
         let steps = workflows::job_steps(text, job);
@@ -266,6 +279,14 @@ fn pipeline(files: &Files, out: &mut Vec<String>) -> Result<(), String> {
         if with != want {
             out.push(format!(
                 "the job `{job}` passes {with:?}, not exactly {want:?}: the two calls of artifacts.yml differ by their stage, and the sign call is given the digests of the sums the build call published (its attest jobs refuse other sums)"
+            ));
+        }
+    }
+    for job in &names {
+        let uses = workflows::job_uses(text, job).ok().flatten();
+        if uses.as_deref() == Some(format!("./.github/workflows/{SUITE_FILE}").as_str()) {
+            out.push(format!(
+                "the job `{job}` of pipeline.yml calls {SUITE_FILE}: the source suite runs in suites.yml, beside the pipeline, so that the release never waits for it"
             ));
         }
     }
@@ -307,7 +328,6 @@ fn permissions(text: &str, out: &mut Vec<String>) -> Result<(), String> {
                 ("id-token", "write"),
                 ("attestations", "write"),
             ],
-            "beta" => vec![("contents", "read"), ("attestations", "read")],
             // The `test` job of ci.yml lists the run's jobs and artifacts, to wait for the shards.
             "ci" => vec![("contents", "read"), ("actions", "read")],
             WATCH => vec![("contents", "read"), ("actions", "write")],
@@ -339,22 +359,48 @@ fn level_rank(level: &str) -> u8 {
 
 /// A called workflow gets at most what its caller job grants: GitHub refuses the whole
 /// calling workflow (a startup failure, no job runs) when a job of the called one asks for
-/// more. Checks every job of each called workflow against the grant of the job that calls it.
+/// more. Checks every job of each called workflow against the grant of the job that calls it:
+/// the pipeline's stages, and `beta.yml` against the grant of `suites.yml#beta`.
 fn callee_scopes(files: &Files, out: &mut Vec<String>) -> Result<(), String> {
     for (stage, file, _) in STAGES {
         let grant = workflows::job_permission_levels(&files.pipeline, stage)?;
-        let text = files.called(file);
-        for job in workflows::job_names(text)? {
-            for (scope, level) in workflows::job_permission_levels(text, &job)? {
-                let granted = grant
-                    .iter()
-                    .find(|(s, _)| *s == scope)
-                    .map_or("none", |(_, l)| l.as_str());
-                if level_rank(&level) > level_rank(granted) {
-                    out.push(format!(
-                        "the job `{job}` of {file} asks for `{scope}: {level}`, but the job `{stage}` of pipeline.yml that calls it grants `{scope}: {granted}`: a called workflow cannot exceed its caller, and GitHub would refuse the whole pipeline at startup"
-                    ));
-                }
+        exceed(
+            files.called(file),
+            file,
+            &grant,
+            &format!("pipeline.yml#{stage}"),
+            out,
+        )?;
+    }
+    let grant = workflows::job_permission_levels(&files.suites, SUITE_JOB)?;
+    exceed(
+        &files.beta,
+        SUITE_FILE,
+        &grant,
+        &format!("suites.yml#{SUITE_JOB}"),
+        out,
+    )
+}
+
+/// Reports each scope a job of the called workflow `text` asks for beyond `grant`, the grant of
+/// the job `caller` (`file#job`).
+fn exceed(
+    text: &str,
+    file: &str,
+    grant: &[(String, String)],
+    caller: &str,
+    out: &mut Vec<String>,
+) -> Result<(), String> {
+    for job in workflows::job_names(text)? {
+        for (scope, level) in workflows::job_permission_levels(text, &job)? {
+            let granted = grant
+                .iter()
+                .find(|(s, _)| *s == scope)
+                .map_or("none", |(_, l)| l.as_str());
+            if level_rank(&level) > level_rank(granted) {
+                out.push(format!(
+                    "the job `{job}` of {file} asks for `{scope}: {level}`, but the job `{caller}` that calls it grants `{scope}: {granted}`: a called workflow cannot exceed its caller, and GitHub would refuse the whole workflow at startup"
+                ));
             }
         }
     }
@@ -382,6 +428,7 @@ fn has(events: &[String], event: &str) -> bool {
 fn called(files: &Files, out: &mut Vec<String>) -> Result<(), String> {
     let mut called_files: Vec<&str> = STAGES.iter().map(|(_, file, _)| *file).collect();
     called_files.dedup();
+    called_files.push(SUITE_FILE);
     for file in called_files {
         let text = files.called(file);
         let events = workflows::events(text)?;
@@ -399,7 +446,7 @@ fn called(files: &Files, out: &mut Vec<String>) -> Result<(), String> {
                 out.push(format!("{file} does not run on `{event}`: the pull-request gate and the merge queue keep running it"));
             }
             if !pull_requests && has(&events, event) {
-                out.push(format!("{file} runs on `{event}`: beta runs after the artifacts of a push to main, and nowhere else"));
+                out.push(format!("{file} runs on `{event}`: beta and smoke are called workflows of a push to main, and run nowhere else"));
             }
         }
         if let Some((group, _)) = workflows::concurrency(text)?
@@ -411,10 +458,12 @@ fn called(files: &Files, out: &mut Vec<String>) -> Result<(), String> {
     Ok(())
 }
 
-/// Exactly one job in the repository calls each stage workflow, and it is the pipeline's.
+/// Exactly one job in the repository calls each stage workflow: the pipeline's job for each
+/// of its own, and `suites.yml#beta` for `beta.yml`.
 fn each_check_once(files: &Files, out: &mut Vec<String>) -> Result<(), String> {
     let mut all: Vec<(&str, &str)> = vec![
         ("pipeline.yml", &files.pipeline),
+        ("suites.yml", &files.suites),
         ("ci.yml", &files.ci),
         ("artifacts.yml", &files.artifacts),
         ("beta.yml", &files.beta),
@@ -424,25 +473,28 @@ fn each_check_once(files: &Files, out: &mut Vec<String>) -> Result<(), String> {
     all.extend(files.others.iter().map(|(n, t)| (n.as_str(), t.as_str())));
     let mut files_called: Vec<&str> = STAGES.iter().map(|(_, file, _)| *file).collect();
     files_called.dedup();
+    files_called.push(SUITE_FILE);
     for file in files_called {
-        let needle = format!("uses: ./.github/workflows/{file}");
-        // The pipeline's jobs that call it: one each, except artifacts.yml, which two call.
-        let wanted: Vec<&str> = STAGES
-            .iter()
-            .filter(|(_, f, _)| *f == file)
-            .map(|(job, _, _)| *job)
-            .collect();
+        let needle = format!("./.github/workflows/{file}");
+        // The jobs that call it: the pipeline's, one each, except artifacts.yml, which two call;
+        // `suites.yml#beta` for the source suite.
+        let want: Vec<String> = if file == SUITE_FILE {
+            vec![format!("suites.yml#{SUITE_JOB}")]
+        } else {
+            STAGES
+                .iter()
+                .filter(|(_, f, _)| *f == file)
+                .map(|(job, _, _)| format!("pipeline.yml#{job}"))
+                .collect()
+        };
         let mut callers: Vec<String> = Vec::new();
         for (name, text) in &all {
             for job in workflows::job_names(text).unwrap_or_default() {
-                if workflows::job_uses(text, &job).ok().flatten().as_deref()
-                    == Some(&needle["uses: ".len()..])
-                {
+                if workflows::job_uses(text, &job).ok().flatten().as_deref() == Some(&needle) {
                     callers.push(format!("{name}#{job}"));
                 }
             }
         }
-        let want: Vec<String> = wanted.iter().map(|j| format!("pipeline.yml#{j}")).collect();
         if callers != want {
             out.push(format!(
                 "{file} is called by {callers:?}, not by {want:?} alone: a push to main must run each check once"
@@ -664,11 +716,12 @@ fn smoke_consumes_the_run(smoke: &str, out: &mut Vec<String>) -> Result<(), Stri
     Ok(())
 }
 
-/// `beta.yml` tests the commit's source and waits for nothing: it downloads no artifact of the
-/// run (a job that does belongs in `smoke.yml`, behind `artifacts`), so it can start with `ci`.
+/// `beta.yml` tests the commit's source in a run of its own (`suites.yml`), where the pipeline's
+/// artifacts are not: it downloads no artifact (a job that does belongs in `smoke.yml`, behind
+/// `artifacts`).
 fn beta_needs_nothing_of_the_run(beta: &str, out: &mut Vec<String>) {
     if code(beta).contains("download-artifact") {
-        out.push("beta.yml downloads an artifact: it starts beside `ci`, before any artifact exists; a job that tests the run's artifacts belongs in smoke.yml".to_owned());
+        out.push("beta.yml downloads an artifact: it runs in suites.yml, where the pipeline's artifacts are not; a job that tests the run's artifacts belongs in smoke.yml".to_owned());
     }
 }
 

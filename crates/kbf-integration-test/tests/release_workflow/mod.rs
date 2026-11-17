@@ -128,8 +128,8 @@ pub const VERIFY_IF: &str =
 pub const RELEASE_IF: &str = "${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}";
 
 /// The `if:` of `plan`, which every other job needs: the run that started this one succeeded (so
-/// ci, artifacts and beta all did, each needing the one before), for a push, to main, of this
-/// repository.
+/// ci, the builds, the signing and the smoke did; suites.yml is another run, not waited for),
+/// for a push, to main, of this repository.
 pub const PLAN_IF: &str = "${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository }}";
 
 /// Whether `job` may hold `id-token: write`: the gamma stage, which presents the token to the

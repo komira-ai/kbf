@@ -55,6 +55,10 @@ async fn two_frontends_over_one_store_never_give_one_operation_name_twice() {
     let (x_name, y_name) = (first_name(&mut x_ops).await, first_name(&mut y_ops).await);
 
     assert_ne!(x_name, y_name, "one name for two operations");
+    // An operation's row is written after its first update is streamed and before its job is
+    // submitted: both jobs submitted means both rows are in the store.
+    a.direct.job(&x.action, 0).await;
+    a.direct.job(&y.action, 0).await;
     assert_eq!(state.keys("exec/op/").len(), 2);
 }
 

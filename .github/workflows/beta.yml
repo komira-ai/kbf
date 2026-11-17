@@ -1,21 +1,22 @@
 # Everything the pull-request gate (ci.yml: lint, and test on the fast set) leaves out that tests
-# the commit's source, run on a push to main beside ci, as a stage of the one pipeline
-# (pipeline.yml calls this workflow, `workflow_call`, with nothing to wait for) and never on a
-# pull request: the whole nextest run with its slow tests, the Arm run, the jobs that need a
-# service or a root or a Mac (Postgres, S3 stores, the mixed-version farm, the pinned
-# jobscheduler release, macOS), and the Linux packages. The
+# the commit's source, run on a push to main as the job `beta` of suites.yml (`workflow_call`,
+# with nothing to wait for) and never on a pull request: the whole nextest run with its slow
+# tests, the Arm run, the jobs that need a service or a root or a Mac (Postgres, S3 stores, the
+# mixed-version farm, the pinned jobscheduler release, macOS), and the Linux packages. The
 # stage lint (crates/kbf-integration-test/tests/workflows/stages.rs) allows `workflow_call` only.
 #
+# This suite is not part of the pipeline (pipeline.yml) and so never gates the release: it takes
+# about an hour, and a release that waited for it would be that hour late. suites.yml runs it
+# beside the pipeline; when it is red, its `release-red` job keeps the RELEASE-RED issue
+# (`cargo xtask release-red`). pipeline_workflow refuses a call of this file from pipeline.yml.
+#
 # Every job here builds what it runs, or fetches what it runs from a release (mixed-version,
-# and js-real-service from the jobscheduler's), so none reads the artifacts of the run and
-# none waits for the artifacts stage: they are the longest part of the pipeline (about an
-# hour), and started behind ci and artifacts they added that hour to the two stages before
-# them. The one job that tests the files the artifacts
-# stage built, the beta smoke, is smoke.yml, called after artifacts. A new job that downloads
-# this run's artifacts belongs in smoke.yml; the pipeline lint (pipeline_workflow) refuses a
-# `download-artifact` of the run's `assets-*` or `sha256sums` here. The release follows the
-# pipeline's success, which needs every job of both workflows green (beta_succeeds holds both
-# files to it).
+# and js-real-service from the jobscheduler's), so none reads the artifacts of the run. The one
+# job that tests the files the artifacts stage built, the smoke, is smoke.yml, called by the
+# pipeline after artifacts. A new job that downloads the pipeline's artifacts belongs in
+# smoke.yml; the pipeline lint (pipeline_workflow) refuses a `download-artifact` of the run's
+# `assets-*` or `sha256sums` here. beta_succeeds holds this file and smoke.yml to a green run
+# meaning every job passed.
 #
 # Same hosted-runner, pinning and permission rules as ci.yml
 # (crates/kbf-integration-test/tests/repo_lints.rs). The Cargo cache is keyed on the
@@ -28,7 +29,7 @@ on:
 
 permissions: {}
 
-# No concurrency group: the pipeline's group (pipeline.yml) is the run's.
+# No concurrency group: the group of suites.yml is the run's.
 
 env:
   CARGO_TERM_COLOR: always

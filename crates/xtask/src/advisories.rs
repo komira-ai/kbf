@@ -126,7 +126,7 @@ pub struct Call {
 }
 
 impl Call {
-    fn get(path: String) -> Self {
+    pub(crate) fn get(path: String) -> Self {
         Call {
             method: Method::Get,
             path,
@@ -134,7 +134,7 @@ impl Call {
         }
     }
 
-    fn post(path: String, body: Value) -> Self {
+    pub(crate) fn post(path: String, body: Value) -> Self {
         Call {
             method: Method::Post,
             path,
@@ -142,7 +142,7 @@ impl Call {
         }
     }
 
-    fn patch(path: String, body: Value) -> Self {
+    pub(crate) fn patch(path: String, body: Value) -> Self {
         Call {
             method: Method::Patch,
             path,
@@ -254,7 +254,7 @@ pub fn run(args: &Args, root: &Path, cargo: &OsStr) -> Result<Vec<String>, Error
 
 /// `repo` is `<owner>/<repo>` in the characters GitHub allows, so it is one path segment
 /// pair of every URL built from it.
-fn check_repo(repo: &str) -> Result<(), Error> {
+pub(crate) fn check_repo(repo: &str) -> Result<(), Error> {
     let valid = |s: &str| {
         !matches!(s, "" | "." | "..")
             && s.bytes()

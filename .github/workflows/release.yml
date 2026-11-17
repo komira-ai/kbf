@@ -6,10 +6,11 @@
 #
 # The run is started by one event and nothing else: the completion of a run of the pipeline
 # (`workflow_run`), and only a pipeline run that succeeded, for a push to main of this
-# repository. The pipeline is ci, the source tests of beta.yml and the artifact builds (side by side),
-# the signing of those artifacts after ci, the smoke on the signed artifacts, and a closing job that
-# needs all of them, so a release is
-# cut only from a commit on which every job of every stage passed. No tag starts this
+# repository. The pipeline is ci and the artifact builds (side by side), the signing of those
+# artifacts after ci, the smoke on the built artifacts (beside the signing), and a closing job that
+# needs all of them, so a release is cut only from a commit on which every job of the pipeline
+# passed. The source suite (beta.yml) is not part of it: suites.yml runs it beside the pipeline,
+# it never gates a release, and its red keeps the RELEASE-RED issue. No tag starts this
 # workflow (a tag the release bot makes would start a second run, and a hand-pushed `v*` tag
 # starts nothing, since only the release bot may create one), and there is no hand-started dry
 # run: a failed release job is re-run from this run's page. The workflow lint

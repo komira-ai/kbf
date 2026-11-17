@@ -19,6 +19,7 @@ fn real() -> Files {
             .into_owned();
         let own = [
             "pipeline.yml",
+            "suites.yml",
             "ci.yml",
             "artifacts.yml",
             "beta.yml",
@@ -31,6 +32,7 @@ fn real() -> Files {
     }
     Files {
         pipeline: read("pipeline.yml"),
+        suites: read("suites.yml"),
         ci: read("ci.yml"),
         artifacts: read("artifacts.yml"),
         beta: read("beta.yml"),
@@ -45,6 +47,7 @@ fn plant(file: &str, from: &str, to: &str) -> Vec<String> {
     let mut files = real();
     let text = match file {
         "pipeline.yml" => &mut files.pipeline,
+        "suites.yml" => &mut files.suites,
         "ci.yml" => &mut files.ci,
         "artifacts.yml" => &mut files.artifacts,
         "beta.yml" => &mut files.beta,
@@ -91,12 +94,12 @@ fn the_real_pipeline_meets_every_rule() {
 }
 
 #[test]
-fn the_builds_start_with_ci_signing_needs_ci_and_the_build_and_smoke_needs_the_signing() {
+fn the_builds_start_with_ci_signing_needs_ci_and_the_build_and_smoke_needs_only_the_build() {
     // Catches: a build that waits for ci again (the 50 minutes this ordering removes), a signing
     // call that can start before ci or before the files are built (an unsigned or failed commit
-    // signed, or nothing to sign), a smoke that can start before the files are signed, a beta
-    // that waits for a stage it does not need (an hour added to the lane), a stage calling
-    // another workflow, and a stage added or reordered.
+    // signed, or nothing to sign), a smoke that can start before the files are built, or that
+    // waits for the signing again (the minutes the signing takes added to the lane), a stage
+    // calling another workflow, and a stage added or reordered.
     red(
         &plant(
             "pipeline.yml",
@@ -124,32 +127,40 @@ fn the_builds_start_with_ci_signing_needs_ci_and_the_build_and_smoke_needs_the_s
     red(
         &plant(
             "pipeline.yml",
-            "    needs: [artifacts-sign]\n",
-            "    needs: [artifacts]\n",
+            "  smoke:\n    needs: [artifacts]\n",
+            "  smoke:\n    needs: [artifacts-sign]\n",
         ),
-        "the job `smoke` needs [\"artifacts\"], not [\"artifacts-sign\"]",
+        "the job `smoke` needs [\"artifacts-sign\"], not [\"artifacts\"]",
     );
     red(
         &plant(
             "pipeline.yml",
-            "  beta:\n",
-            "  beta:\n    needs: [artifacts]\n",
+            "  smoke:\n    needs: [artifacts]\n",
+            "  smoke:\n    needs: [ci, artifacts]\n",
         ),
-        "the job `beta` needs [\"artifacts\"], not []",
+        "the job `smoke` needs [\"ci\", \"artifacts\"], not [\"artifacts\"]",
     );
     red(
         &plant(
             "pipeline.yml",
-            "uses: ./.github/workflows/beta.yml",
+            "  smoke:\n    needs: [artifacts]\n",
+            "  smoke:\n",
+        ),
+        "the job `smoke` needs [], not [\"artifacts\"]",
+    );
+    red(
+        &plant(
+            "pipeline.yml",
+            "uses: ./.github/workflows/smoke.yml",
             "uses: ./.github/workflows/ci.yml",
         ),
-        "the job `beta` calls",
+        "the job `smoke` calls",
     );
     red(
         &plant(
             "pipeline.yml",
-            "  beta:\n",
-            "  extra:\n    needs: [ci]\n    runs-on: ubuntu-24.04\n    steps: []\n\n  beta:\n",
+            "  watch:\n",
+            "  extra:\n    needs: [ci]\n    runs-on: ubuntu-24.04\n    steps: []\n\n  watch:\n",
         ),
         "the pipeline's jobs are",
     );
@@ -373,18 +384,18 @@ fn a_stage_that_can_be_skipped_or_continue_after_red_is_refused() {
     red(
         &plant(
             "pipeline.yml",
-            "  smoke:\n    needs: [artifacts-sign]\n",
-            "  smoke:\n    needs: [artifacts-sign]\n    if: ${{ github.event.before != '' }}\n",
+            "  smoke:\n    needs: [artifacts]\n",
+            "  smoke:\n    needs: [artifacts]\n    if: ${{ github.event.before != '' }}\n",
         ),
         "the job `smoke` has `if:",
     );
     red(
         &plant(
             "pipeline.yml",
-            "  beta:\n",
-            "  beta:\n    if: ${{ github.event.before != '' }}\n",
+            "  ci:\n",
+            "  ci:\n    if: ${{ github.event.before != '' }}\n",
         ),
-        "the job `beta` has `if:",
+        "the job `ci` has `if:",
     );
     red(
         &plant(
@@ -405,7 +416,7 @@ fn a_stage_that_can_be_skipped_or_continue_after_red_is_refused() {
     red(
         &plant(
             "pipeline.yml",
-            "  smoke:\n    needs: [artifacts-sign]\n",
+            "  smoke:\n    needs: [artifacts]\n",
             "  smoke:\n    needs: [artifacts]\n    continue-on-error: true\n",
         ),
         "uses `continue-on-error`",
@@ -420,16 +431,16 @@ fn the_run_is_green_only_when_every_stage_is() {
     red(
         &plant(
             "pipeline.yml",
-            "    needs: [ci, beta, artifacts, artifacts-sign, smoke]\n",
             "    needs: [ci, artifacts, artifacts-sign, smoke]\n",
+            "    needs: [ci, artifacts, artifacts-sign]\n",
         ),
         "the job `passed` needs",
     );
     red(
         &plant(
             "pipeline.yml",
-            "    needs: [ci, beta, artifacts, artifacts-sign, smoke]\n",
-            "    needs: [ci, beta, artifacts, smoke, watch]\n",
+            "    needs: [ci, artifacts, artifacts-sign, smoke]\n",
+            "    needs: [ci, artifacts, smoke, watch]\n",
         ),
         "the job `passed` needs",
     );
@@ -584,8 +595,8 @@ fn the_called_workflows_still_run_on_pull_requests() {
 #[test]
 fn a_push_to_main_runs_each_check_once() {
     // Catches: a second run of a check beside the pipeline's: a push trigger left on (or put
-    // back on) ci.yml, artifacts.yml or beta.yml, another workflow calling one of them, or the
-    // pipeline not calling one.
+    // back on) ci.yml, artifacts.yml, beta.yml or smoke.yml, another workflow calling one of
+    // them, or the pipeline (or, for beta.yml, suites.yml) not calling one.
     for file in ["ci.yml", "artifacts.yml", "beta.yml", "smoke.yml"] {
         let from = "  workflow_call:\n";
         red(
@@ -607,11 +618,19 @@ fn a_push_to_main_runs_each_check_once() {
     );
     red(
         &plant(
-            "pipeline.yml",
+            "suites.yml",
             "uses: ./.github/workflows/beta.yml",
             "uses: ./.github/workflows/ci.yml",
         ),
         "beta.yml is called by []",
+    );
+    red(
+        &plant(
+            "release.yml",
+            "\njobs:\n",
+            "\njobs:\n  again:\n    uses: ./.github/workflows/beta.yml\n",
+        ),
+        "beta.yml is called by [\"suites.yml#beta\", \"release.yml#again\"]",
     );
     red(
         &plant(
@@ -718,9 +737,9 @@ fn smoke_tests_the_artifacts_of_the_same_run_and_builds_no_kbf() {
 }
 
 #[test]
-fn beta_downloads_no_artifact_so_it_can_start_beside_ci() {
-    // Catches: a job added to beta.yml that reads the run's artifacts, which do not exist yet
-    // when beta starts beside ci: it would fail on every push.
+fn beta_downloads_no_artifact_of_the_pipeline() {
+    // Catches: a job added to beta.yml that reads the run's artifacts: beta runs in suites.yml,
+    // a run of its own that has none, so the job would fail on every push.
     red(
         &plant(
             "beta.yml",
@@ -766,13 +785,14 @@ fn a_running_pipeline_is_never_cancelled_and_neither_is_a_release() {
 
 #[test]
 fn a_called_workflow_never_asks_for_more_than_its_caller_grants() {
-    // Catches: a job of ci.yml, artifacts.yml or beta.yml with a scope (or a level) its calling
-    // job in pipeline.yml does not grant, which GitHub refuses at startup for the whole
-    // pipeline: no ci, artifacts, beta or release on a push to main. Pull-request runs cannot
-    // show it, because the pipeline has no pull-request trigger.
+    // Catches: a job of ci.yml, artifacts.yml or smoke.yml with a scope (or a level) its calling
+    // job in pipeline.yml does not grant, or a job of beta.yml with one the job `beta` of
+    // suites.yml does not grant, which GitHub refuses at startup for the whole calling workflow:
+    // no ci, artifacts, smoke or release (or no suite) on a push to main. Pull-request runs cannot
+    // show it, because neither workflow has a pull-request trigger.
     red(
         &plant(
-            "pipeline.yml",
+            "suites.yml",
             "    uses: ./.github/workflows/beta.yml\n    permissions:\n      contents: read\n      attestations: read\n",
             "    uses: ./.github/workflows/beta.yml\n    permissions:\n      contents: read\n",
         ),
@@ -797,7 +817,7 @@ fn a_called_workflow_never_asks_for_more_than_its_caller_grants() {
                 nth,
             ),
             &format!(
-                "the job `attest-linux` of artifacts.yml asks for `attestations: write`, but the job `{job}` of pipeline.yml"
+                "the job `attest-linux` of artifacts.yml asks for `attestations: write`, but the job `pipeline.yml#{job}` that calls it"
             ),
         );
     }
@@ -813,7 +833,7 @@ fn a_called_workflow_never_asks_for_more_than_its_caller_grants() {
 
 #[test]
 fn no_stage_passes_secrets_to_its_workflow() {
-    // Catches: `secrets: inherit` (or a list of secrets) on the call of ci, artifacts or beta,
+    // Catches: `secrets: inherit` (or a list of secrets) on the call of ci, artifacts or smoke,
     // which would put the release bot's key in a run a newer push cancels.
     for (call, next) in [
         ("  ci:\n    uses: ./.github/workflows/ci.yml\n", "ci"),
@@ -822,8 +842,7 @@ fn no_stage_passes_secrets_to_its_workflow() {
             "  artifacts-sign:\n    needs: [ci, artifacts]\n",
             "artifacts-sign",
         ),
-        ("  beta:\n    uses: ./.github/workflows/beta.yml\n", "beta"),
-        ("  smoke:\n    needs: [artifacts-sign]\n", "smoke"),
+        ("  smoke:\n    needs: [artifacts]\n", "smoke"),
     ] {
         red(
             &plant(
@@ -848,4 +867,23 @@ fn the_release_follows_this_pipeline() {
         &plant("release.yml", "workflows: [pipeline]", "workflows: [ci]"),
         "release.yml follows",
     );
+}
+
+#[test]
+fn the_pipeline_does_not_call_the_source_suite() {
+    // Catches: beta.yml (an hour of tests) called from the pipeline again, which would hold
+    // every release back by that hour: a job of pipeline.yml, whatever its name, that calls it.
+    for job in ["beta", "suite"] {
+        let found = plant(
+            "pipeline.yml",
+            "\njobs:\n",
+            &format!("\njobs:\n  {job}:\n    uses: ./.github/workflows/beta.yml\n"),
+        );
+        red(
+            &found,
+            &format!(
+                "the job `{job}` of pipeline.yml calls beta.yml: the source suite runs in suites.yml"
+            ),
+        );
+    }
 }
