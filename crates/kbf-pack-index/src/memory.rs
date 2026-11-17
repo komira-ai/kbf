@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use crate::conformance::PackBackend;
+use crate::directory::NewDirectory;
 use crate::{
     BlobDigest, Location, NewPack, PackBlob, PackIndex, PackIndexError, PackInfo, Recorded,
     check_batch, count, micros, micros_of,
@@ -24,6 +25,7 @@ pub struct MemoryPackIndex {
 }
 
 mod action;
+mod directory;
 
 #[derive(Clone, Default)]
 struct State {
@@ -33,6 +35,8 @@ struct State {
     blobs: BTreeMap<BlobDigest, BlobRow>,
     /// The action cache: the encoded result and when it was written.
     actions: BTreeMap<BlobDigest, (Vec<u8>, i64)>,
+    /// The Directory rows: the body of each recorded Directory.
+    directories: BTreeMap<BlobDigest, Vec<u8>>,
 }
 
 #[derive(Clone)]
@@ -222,6 +226,15 @@ impl PackIndex for MemoryPackIndex {
         let pack = state.packs.get_mut(pack_key).into_iter();
         pack.for_each(|row| row.info.live_blobs = row.info.live_blobs.saturating_sub(1));
         Ok(true)
+    }
+
+    fn directories(&self, digests: &[BlobDigest]) -> Result<Vec<Option<Vec<u8>>>, PackIndexError> {
+        directory::read(&self.lock(), digests)
+    }
+
+    fn record_directories(&self, directories: &[NewDirectory]) -> Result<usize, PackIndexError> {
+        let checked = crate::directory::checked(directories)?;
+        Ok(directory::record(&mut self.lock(), &checked))
     }
 }
 

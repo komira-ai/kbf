@@ -251,6 +251,42 @@ impl Backend {
         packs.locate(digests).await.map_err(layered::unavailable)
     }
 
+    /// The bytes of the Directory recorded under each of `digests` in the packs' index, in the
+    /// order asked, `None` for one with no row; all `None` for a store without packs. The rows
+    /// are `kbf_pack_index::directory`'s: content-addressed, so a row is the Directory's blob.
+    ///
+    /// # Errors
+    /// As the pack index answers.
+    pub async fn directories(
+        &self,
+        digests: &[Digest],
+    ) -> Result<Vec<Option<bytes::Bytes>>, StorageError> {
+        let Some(packs) = self.0.packs() else {
+            return Ok(vec![None; digests.len()]);
+        };
+        packs
+            .directories(digests)
+            .await
+            .map_err(layered::unavailable)
+    }
+
+    /// Records `directories` (each Directory's digest and the bytes read for it) as Directory
+    /// rows of the packs' index, and returns how many rows were new; nothing for a store
+    /// without packs.
+    ///
+    /// # Errors
+    /// As the pack index answers.
+    pub async fn record_directories(
+        &self,
+        directories: Vec<(Digest, bytes::Bytes)>,
+    ) -> Result<usize, StorageError> {
+        let Some(packs) = self.0.packs() else {
+            return Ok(0);
+        };
+        let recorded = packs.record_directories(directories).await;
+        recorded.map_err(layered::unavailable)
+    }
+
     /// The length of the object `key` in the object store the packs live in (a HEAD), `None` if
     /// there is none or the store has no packs.
     ///

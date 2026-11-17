@@ -846,7 +846,7 @@ async fn opening_refuses_what_cannot_work() {
 
     let flags = janitor_flags(dir.path());
     let mut broken = pack_flags.clone();
-    broken.endpoint = "not a url".to_owned();
+    broken.endpoints = vec!["not a url".to_owned()];
     let error = flags.open(&broken, &packs, index(), Arc::clone(&readiness));
     let error = error.err().expect("refused").to_string();
     assert!(error.starts_with("--pack-store-endpoint "), "{error}");

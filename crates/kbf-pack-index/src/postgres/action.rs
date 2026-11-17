@@ -37,7 +37,7 @@ const PUT_ACTION: &str = concat!(
 
 /// A failed statement on the action table: a table that is not there is a schema that is not
 /// migrated, anything else is the store failing.
-fn failed_on_table(err: postgres::Error) -> PackIndexError {
+pub(super) fn failed_on_table(err: postgres::Error) -> PackIndexError {
     if err.code() == Some(&SqlState::UNDEFINED_TABLE) {
         PackIndexError::NotMigrated
     } else {

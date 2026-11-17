@@ -196,6 +196,45 @@ async fn a_frontend_with_the_pack_flags_keeps_uploads_in_packs() {
     served.abort();
 }
 
+/// A loopback endpoint nothing listens on: a port the system handed out and then took back, so
+/// a connection to it is refused.
+fn refused_endpoint() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+    let addr = listener.local_addr().expect("its address");
+    drop(listener);
+    format!("http://{addr}")
+}
+
+/// Asserts that a frontend given two `--pack-store-endpoint`s, the first of which refuses every
+/// connection, reaches the store through the second: it passes its start check and keeps a
+/// BatchUpdateBlobs in one pack that the index records, so one endpoint of the farm's being
+/// down does not stop uploads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_frontend_with_two_pack_endpoints_reaches_the_store_through_the_live_one() {
+    let s3 = FakeS3::start().await;
+    let dir = scratch_dir("pack-two-endpoints");
+    let mut more = pack_flags(s3.endpoint(), dir.path());
+    more.insert(0, format!("--pack-store-endpoint={}", refused_endpoint()));
+    let flags = flags_of(&more);
+    assert_eq!(flags.packs.as_ref().map(|p| p.endpoints.len()), Some(2));
+    let index = index();
+    let handle = started(&flags, Some(Arc::clone(&index))).expect("starts");
+    let front = handle.reapi;
+    let served = tokio::spawn(handle.serve());
+    let blob = (kbf_segments::sha256(b"through two"), &b"through two"[..]);
+
+    assert_eq!(upload(front, &[blob]).await, [0]);
+
+    let keys = s3.keys();
+    assert_eq!(keys.len(), 1, "{keys:?}");
+    let located = index.locate(&[index_form(&blob.0)]).expect("located");
+    assert_eq!(
+        located[0].as_ref().map(|l| l.pack_key.as_str()),
+        Some(keys[0].as_str())
+    );
+    served.abort();
+}
+
 /// Asserts that a frontend given `--pack-index` and no pack store flags keeps nothing in packs:
 /// it carries no packs, an upload goes to its storage node (which is not there, so it fails
 /// UNAVAILABLE) and leaves no row, and its metrics have no pack family.

@@ -22,11 +22,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use clap::{Arg, ArgMatches};
+use clap::{Arg, ArgAction, ArgMatches};
 use kbf_front::store_metrics::{Counted, StoreMetrics};
 use kbf_front::{PackSettings, Packs};
 use kbf_objstore::Capabilities;
-use kbf_objstore::s3::{Credentials, S3Config, S3ConfigError, S3Store};
+use kbf_objstore::s3::{Credentials, S3Config, S3ConfigError, S3Store, S3Tuning};
 use kbf_pack::{CacheError, PackError, PackKeys, ReadCache, WriterKind};
 use kbf_pack_index::PackIndex;
 
@@ -71,19 +71,24 @@ pub(super) fn args() -> [Arg; 10] {
             .long("pack-store-endpoint")
             .value_name("URL")
             .value_parser(clap::value_parser!(String))
+            .action(ArgAction::Append)
             .requires_all([BUCKET, CREDENTIALS, PACK_INDEX])
             .help(
                 "Keeps the blobs clients upload in packs (many blobs in one object) in this \
                  S3-compatible object store, as `http://host:port`: a pack is written with a \
                  create-only request and recorded in the pack index before the upload is \
                  acknowledged, and a read asks the index first and fetches only the blob's \
-                 bytes from its pack. A blob the index lacks is read from the storage nodes \
-                 as before, and a blob over 64 MiB and any compressed blob still go to them. \
-                 At start the frontend checks that the store refuses to replace an object \
-                 and does not serve if it does not. Needs `--pack-index`, \
-                 `--pack-store-bucket` and `--pack-store-credentials-file`. Workers read blobs \
-                 from the storage nodes only, so a farm must not enable this before they can \
-                 read a blob that is only in a pack. Left out, no pack store is built or \
+                 bytes from its pack. Give it more than once (in kbf.toml, an array) for one \
+                 store reached through several endpoints, such as the tierstores of the farm's \
+                 nodes in front of one bucket: each request goes to the next endpoint in turn, \
+                 and one that could not connect is sent to the next, at most three endpoints \
+                 for one request (a request that may have reached a store is not sent to \
+                 another endpoint); an endpoint given twice is refused. A blob \
+                 the index lacks is read from the storage nodes as before, and a blob over 64 \
+                 MiB and any compressed blob still go to them. At start the frontend checks \
+                 that the store refuses to replace an object and does not serve if it does \
+                 not. Needs `--pack-index`, `--pack-store-bucket` and \
+                 `--pack-store-credentials-file`. Left out, no pack store is built or \
                  contacted and blobs go where they always did",
             ),
         Arg::new(BUCKET)
@@ -188,8 +193,9 @@ pub(super) fn args() -> [Arg; 10] {
 /// What the pack flags say, when `--pack-store-endpoint` is given.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PackFlags {
-    /// `--pack-store-endpoint`.
-    pub endpoint: String,
+    /// `--pack-store-endpoint`, each time it is given, in order: one store, at least one
+    /// endpoint.
+    pub endpoints: Vec<String>,
     /// `--pack-store-bucket`.
     pub bucket: String,
     /// `--pack-store-region`.
@@ -210,14 +216,14 @@ pub struct PackFlags {
 
 /// The setting the flags in `m` make: `None` unless `--pack-store-endpoint` is given.
 pub(super) fn from_matches(m: &ArgMatches) -> Option<PackFlags> {
-    let endpoint = m.get_one::<String>(ENDPOINT)?;
+    let endpoints: Vec<String> = m.get_many::<String>(ENDPOINT)?.cloned().collect();
     // clap makes the bucket and the credentials come with the endpoint, and the two flags of
     // the cache come together; the others have a default.
     let text = |id: &str| m.get_one::<String>(id).cloned().unwrap_or_default();
     let inflight = m.get_one::<u32>(INFLIGHT_BYTES).copied();
     let idle_secs = m.get_one::<u64>(UPLOAD_IDLE_TIMEOUT).copied();
     Some(PackFlags {
-        endpoint: endpoint.clone(),
+        endpoints,
         bucket: text(BUCKET),
         region: text(REGION),
         credentials_file: m
@@ -267,19 +273,11 @@ impl PackFlags {
     /// directory is refused.
     pub fn open(&self, index: Arc<dyn PackIndex>) -> Result<Packs, PackFlagError> {
         let credentials = read_credentials(&self.credentials_file)?;
-        let store = S3Store::new(S3Config {
-            endpoint: self.endpoint.clone(),
-            region: self.region.clone(),
-            bucket: self.bucket.clone(),
-            credentials,
-            capabilities: Capabilities {
-                conditional_put: true,
-                object_lock: false,
-            },
-            connect_timeout: Duration::from_secs(5),
-            request_timeout: Duration::from_secs(60),
-            min_body_rate: NonZeroU64::new(MIN_PUT_RATE),
-        })?;
+        let capabilities = Capabilities {
+            conditional_put: true,
+            object_lock: false,
+        };
+        let store = self.store(credentials, capabilities)?;
         let keys = PackKeys::new(WriterKind::Frontend, &self.writer, &boot_id())?;
         let cache = self
             .cache
@@ -299,6 +297,36 @@ impl PackFlags {
         packs
             .map(|packs| packs.with_store_metrics(counted))
             .map_err(PackFlagError::from)
+    }
+}
+
+impl PackFlags {
+    /// The S3 store of the flags' bucket, reached through every `--pack-store-endpoint` in
+    /// turn, signed with `credentials` and claiming `capabilities`. Does no I/O.
+    ///
+    /// # Errors
+    /// [`S3ConfigError`] for an endpoint or a bucket the client does not take, or an endpoint
+    /// given twice.
+    pub(super) fn store(
+        &self,
+        credentials: Credentials,
+        capabilities: Capabilities,
+    ) -> Result<S3Store, S3ConfigError> {
+        let (first, also) = self
+            .endpoints
+            .split_first()
+            .map_or((String::new(), &[][..]), |(f, a)| (f.clone(), a));
+        let config = S3Config {
+            endpoint: first,
+            region: self.region.clone(),
+            bucket: self.bucket.clone(),
+            credentials,
+            capabilities,
+            connect_timeout: Duration::from_secs(5),
+            request_timeout: Duration::from_secs(60),
+            min_body_rate: NonZeroU64::new(MIN_PUT_RATE),
+        };
+        S3Store::new_rotating(config, S3Tuning::default(), also)
     }
 }
 

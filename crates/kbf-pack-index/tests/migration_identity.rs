@@ -5,7 +5,8 @@
 #![cfg(feature = "postgres")]
 
 use kbf_pack_index::schema::{
-    self, ACTION_CACHE_NAME, ACTION_CACHE_SQL, ACTION_CACHE_VERSION, NAME, SQL, VERSION,
+    self, ACTION_CACHE_NAME, ACTION_CACHE_SQL, ACTION_CACHE_VERSION, DIRECTORY_NAME, DIRECTORY_SQL,
+    DIRECTORY_VERSION, NAME, SQL, VERSION,
 };
 use kbf_state::postgres::schema::{self as state_schema, Kind};
 use sha2::{Digest, Sha256};
@@ -56,15 +57,37 @@ fn the_action_cache_migration_is_pinned() {
     assert_eq!(migration.kind(), Kind::Expand);
 }
 
+/// The SHA-256 of `migrations/0004_directory.sql`, written out so a changed byte fails here.
+const DIRECTORY_SHA256: &str = "5bdb9745a0cd9ba312e96ff633670929c0c2f28db40c72f11556b044eee05244";
+
+/// Asserts that the Directory rows' migration is number 4, named `directory`, an expand step,
+/// and that its file is the one this test pins, which a deployed database may have run.
+/// Catches: an edit to the file (even whitespace), a renumbering and a rename.
+#[test]
+fn the_directory_migration_is_pinned() {
+    let hex: String = Sha256::digest(DIRECTORY_SQL.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(hex, DIRECTORY_SHA256, "the migration file changed");
+    let migration = schema::directory_migration();
+    assert_eq!(migration.version(), 4);
+    assert_eq!(DIRECTORY_VERSION, 4);
+    assert_eq!(migration.name(), "directory");
+    assert_eq!(DIRECTORY_NAME, "directory");
+    assert_eq!(migration.kind(), Kind::Expand);
+}
+
 /// Asserts that the set a release embeds is the state store's first migration followed by the
-/// pack index's and the action cache's, numbered 1, 2 and 3, though the state store's own set
+/// pack index's, the action cache's and the Directory rows', numbered 1 to 4, though the state store's own set
 /// goes on past the first (its migration 2, `writer_generation`, would take the number a
 /// database recorded for `pack_index`). Catches: the state store's whole set taken, which
 /// would renumber or rename what a deployed database has; a caller that took its set from the
 /// state store alone would not create the pack tables, which the tests of the callers pin by
 /// taking theirs from here.
 #[test]
-fn the_release_set_is_the_state_stores_first_then_the_pack_index_then_the_action_cache() {
+fn the_release_set_is_the_state_stores_first_then_the_pack_index_the_action_cache_and_directories()
+{
     let own = state_schema::embedded();
     let own_named: Vec<(u32, &str)> = own.iter().map(|m| (m.version(), m.name())).collect();
     assert_eq!(own_named, [(1, "state"), (2, "writer_generation")]);
@@ -73,9 +96,14 @@ fn the_release_set_is_the_state_stores_first_then_the_pack_index_then_the_action
     let named: Vec<(u32, &str)> = set.iter().map(|m| (m.version(), m.name())).collect();
     assert_eq!(
         named,
-        [(1, "state"), (2, "pack_index"), (3, "action_cache")]
+        [
+            (1, "state"),
+            (2, "pack_index"),
+            (3, "action_cache"),
+            (4, "directory")
+        ]
     );
     assert_eq!(&set[..1], &own[..1]);
-    assert_eq!(schema::latest(), 3);
+    assert_eq!(schema::latest(), 4);
     assert_eq!(state_schema::latest_of(&set), schema::latest());
 }

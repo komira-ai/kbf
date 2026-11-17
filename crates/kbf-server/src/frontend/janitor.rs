@@ -63,7 +63,6 @@
 
 use std::error::Error;
 use std::fmt::Write as _;
-use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -72,7 +71,7 @@ use std::time::{Duration, SystemTime};
 use clap::{Arg, ArgMatches};
 use futures::future::BoxFuture;
 use kbf_front::{Packs, VerifyingKeys};
-use kbf_objstore::s3::{Credentials, S3Config, S3Store};
+use kbf_objstore::s3::Credentials;
 use kbf_objstore::{Capabilities, ObjectStore, PageSize};
 use kbf_pack::{
     SWEPT_PREFIX, SweepConfig, SweepError, SweepGates, SweepReport, Sweeper, task_key_age,
@@ -580,16 +579,7 @@ impl JanitorFlags {
         readiness: Arc<Readiness>,
     ) -> Result<Janitor, JanitorFlagError> {
         let credentials = read_key(&self.key_file)?;
-        let store = S3Store::new(S3Config {
-            endpoint: store.endpoint.clone(),
-            region: store.region.clone(),
-            bucket: store.bucket.clone(),
-            credentials,
-            capabilities: Capabilities::default(),
-            connect_timeout: Duration::from_secs(5),
-            request_timeout: Duration::from_secs(60),
-            min_body_rate: NonZeroU64::new(1 << 20),
-        })?;
+        let store = store.store(credentials, Capabilities::default())?;
         let config = SweepConfig {
             grace: self.grace,
             page: self.page,

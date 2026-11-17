@@ -1,11 +1,22 @@
 //! The input closure of an Action: every digest a task must be able to read to run it.
 //!
 //! [`collect_closure`] reads the Action, then the input root `Directory` and every `Directory`
-//! under it through the frontend's own read path ([`Backend::read_blob`]), and asks the store
+//! under it, level by level, and asks the store
 //! ([`Backend::find_missing`]) whether the Command and every file the tree names are held. The
 //! answer is the set of the input root's tree (its Directory blobs and its files) beside the
 //! Action and the Command.
 //!
+//! - **Directories from their rows first.** Each level asks the Directory rows of the pack
+//!   index at once ([`Backend::directories`]) for all of its Directories that the walk's
+//!   [`DirectoryCache`] does not hold (all of them without a cache; none is asked when the
+//!   cache holds the whole level), and reads only the
+//!   ones without a row through the frontend's own read path ([`Backend::read_blob`], which
+//!   checks the bytes against the digest); those are then recorded as rows
+//!   ([`Backend::record_directories`]), so the next walk of the same tree, on any frontend over
+//!   the same database, reads none of them from the object store. A row is the Directory's own
+//!   bytes (content-addressed), so the walk is the same with rows or without. When the rows
+//!   cannot be read the level is read from the blobs, and a record that fails is logged and
+//!   the walk goes on: the rows make a walk faster and never decide its answer.
 //! - **Complete or an error.** A blob that is not held is [`ClosureError::Missing`], never a
 //!   smaller closure: a run whose inputs cannot all be read is not started.
 //! - **Bounded.** The tree is cut off as soon as it holds more digests, or more bytes of
@@ -410,11 +421,7 @@ async fn collect(
     let mut files = Vec::new();
     let mut level = vec![root];
     while !level.is_empty() {
-        let directories: Vec<(Digest, Parsed)> = stream::iter(level)
-            .map(|digest| directory(backend, cache, digest))
-            .buffered(DIRECTORIES_IN_FLIGHT)
-            .try_collect()
-            .await?;
+        let directories = read_level(backend, cache, level).await?;
         level = Vec::new();
         for (parent, parsed) in directories {
             let Parsed {
@@ -477,30 +484,94 @@ fn invalid(what: &'static str, digest: &Digest, why: &impl std::fmt::Display) ->
     }
 }
 
-/// The Directory `digest` and its parsed content: from `cache` when it holds it, else read from
-/// the store and decoded, and its blob kept on the disk half of `cache`. The empty blob is the
-/// empty Directory and is not read or kept.
+/// The Directories of one level, in order, parsed: from `cache` when it holds them, else from
+/// their rows where the pack index has them, else from their blobs, which are then recorded as
+/// rows. Only what the cache does not hold is asked of the rows, and nothing is asked when it
+/// holds the whole level.
+async fn read_level(
+    backend: &Backend,
+    cache: Option<&DirectoryCache>,
+    level: Vec<Digest>,
+) -> Result<Vec<(Digest, Parsed)>, ClosureError> {
+    // The empty Directory is never cached: it is left to `directory`, as without a cache.
+    let held: Vec<Option<KeptDirectory>> = stream::iter(&level)
+        .map(|digest| async move {
+            match is_empty_blob(digest) {
+                true => None,
+                false => remembered(cache, digest).await,
+            }
+        })
+        .buffered(DIRECTORIES_IN_FLIGHT)
+        .collect()
+        .await;
+    let misses: Vec<Digest> = (level.iter().zip(&held))
+        .filter(|(_, held)| held.is_none())
+        .map(|(digest, _)| *digest)
+        .collect();
+    let rows = match misses.is_empty() {
+        true => Vec::new(),
+        false => match backend.directories(&misses).await {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::warn!(%error, "the Directory rows could not be read: reading the blobs");
+                vec![None; misses.len()]
+            }
+        },
+    };
+    let read: Vec<(Digest, Parsed, Option<Bytes>)> = stream::iter(misses.into_iter().zip(rows))
+        .map(|(digest, row)| directory(backend, cache, digest, row))
+        .buffered(DIRECTORIES_IN_FLIGHT)
+        .try_collect()
+        .await?;
+    let fresh: Vec<(Digest, Bytes)> = read
+        .iter()
+        .filter_map(|(digest, _, blob)| Some((*digest, blob.clone()?)))
+        .collect();
+    if !fresh.is_empty()
+        && let Err(error) = backend.record_directories(fresh).await
+    {
+        tracing::warn!(%error, "the Directories read could not be recorded as rows");
+    }
+    // The digests of a level are distinct: each was queued once.
+    let mut read: BTreeMap<Digest, Parsed> = read
+        .into_iter()
+        .map(|(digest, parsed, _)| (digest, parsed))
+        .collect();
+    let whole = |kept| Parsed { kept, fault: None };
+    Ok((level.into_iter().zip(held))
+        .filter_map(|(digest, held)| match held {
+            Some(kept) => Some((digest, whole(kept))),
+            None => read.remove(&digest).map(|parsed| (digest, parsed)),
+        })
+        .collect())
+}
+
+/// The Directory `digest` parsed, from `row` (its bytes from the Directory rows) when there is
+/// one, else from its blob, which is handed back to be recorded; a Directory with no malformed
+/// digest is kept on the disk half of `cache`. The empty blob is the empty Directory, with
+/// nothing to read, keep or record.
 async fn directory(
     backend: &Backend,
     cache: Option<&DirectoryCache>,
     digest: Digest,
-) -> Result<(Digest, Parsed), ClosureError> {
-    let whole = |kept| Parsed { kept, fault: None };
+    row: Option<Bytes>,
+) -> Result<(Digest, Parsed, Option<Bytes>), ClosureError> {
     if is_empty_blob(&digest) {
-        return Ok((digest, whole(KeptDirectory::default())));
+        let kept = KeptDirectory::default();
+        return Ok((digest, Parsed { kept, fault: None }, None));
     }
-    if let Some(kept) = remembered(cache, &digest).await {
-        return Ok((digest, whole(kept)));
-    }
-    let blob = read(backend, "a Directory", &digest).await?;
-    let parsed = KeptDirectory::parse(&digest, blob.clone())?;
+    let (bytes, fresh) = match row {
+        Some(body) => (body, false),
+        None => (read(backend, "a Directory", &digest).await?, true),
+    };
+    let parsed = KeptDirectory::parse(&digest, bytes.clone())?;
     // A Directory with a malformed digest is never stored: the walk fails on it.
     if let Some(cache) = cache
         && parsed.fault.is_none()
     {
-        cache.store(&digest, &blob).await;
+        cache.store(&digest, &bytes).await;
     }
-    Ok((digest, parsed))
+    Ok((digest, parsed, fresh.then_some(bytes)))
 }
 
 /// The Directory `digest` as `cache` holds it: in memory, or as a blob on its disk that decodes

@@ -58,6 +58,7 @@
 mod bytestream;
 mod cas;
 mod commit;
+mod directories;
 mod hit;
 mod large;
 mod metrics;
