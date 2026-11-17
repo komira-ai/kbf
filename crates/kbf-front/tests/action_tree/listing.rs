@@ -576,3 +576,24 @@ async fn a_name_the_lists_reader_refuses_makes_no_list() {
         assert!(rig.farm.puts().is_empty(), "nothing is written");
     }
 }
+
+/// Catches: an input root that holds an empty file and an empty directory (one digest, the
+/// SHA-256 of no bytes, for both) listed without the directory, or refused as a directory the
+/// closure did not keep: both are listed, the file of no bytes and the directory 0755.
+#[tokio::test]
+async fn an_empty_file_beside_an_empty_directory_are_both_listed() {
+    let rig = Rig::new().await;
+    let empty = kbf_segments::sha256(&[]);
+    let root = rig
+        .store(&directory(
+            vec![file("blank", &empty, false)],
+            vec![subdir("hollow", &empty)],
+            vec![],
+        ))
+        .await;
+    let listing = list(&rig, &root).await.expect("a list");
+    let got = read(&rig, &listing);
+    assert_eq!(got.get("work/blank"), Some(&file_line("0644", 0, "-", "-")));
+    assert_eq!(got.get("work/hollow").map(String::as_str), Some("dir 0755"));
+    assert!(!got.keys().any(|path| path.starts_with("work/hollow/")));
+}
