@@ -21,15 +21,9 @@ use crate::executor::{Executor, Inner};
 /// a server whose serving future is dropped leaves its liveness row to expire.
 pub struct Running {
     stop: watch::Sender<bool>,
-    task: Option<JoinHandle<()>>,
-}
-
-impl Drop for Running {
-    fn drop(&mut self) {
-        if let Some(task) = self.task.take() {
-            task.abort();
-        }
-    }
+    task: JoinHandle<()>,
+    /// Ends the task when the handle is dropped unstopped.
+    _abort: crate::serve::AbortOnDrop,
 }
 
 impl Running {
@@ -38,19 +32,19 @@ impl Running {
     pub fn spawn(executor: &Executor) -> Self {
         let (stop, stopped) = watch::channel(false);
         let task = tokio::spawn(drive(Arc::clone(executor.inner()), stopped));
+        let abort = crate::serve::AbortOnDrop(task.abort_handle());
         Self {
             stop,
-            task: Some(task),
+            task,
+            _abort: abort,
         }
     }
 
     /// Stops the task and deletes the liveness row. Nothing is cancelled: an operation still
     /// open is taken up by another frontend of the store.
-    pub async fn stop(mut self) {
-        let _ = self.stop.send(true);
-        let Some(task) = self.task.take() else {
-            return;
-        };
+    pub async fn stop(self) {
+        let Self { stop, task, _abort } = self;
+        let _ = stop.send(true);
         if let Err(e) = task.await {
             tracing::error!(error = %e, "the executor's task ended abnormally");
         }

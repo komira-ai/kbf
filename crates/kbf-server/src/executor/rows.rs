@@ -335,16 +335,22 @@ impl Rows {
         self.commit(Txn::new().delete(key, Cond::Any))
     }
 
-    /// The row of `operation` as this process last wrote it: its version, if the row is there
-    /// and this process owns it.
-    fn owned(&self, key: &str) -> Result<Option<Version>, RowsError> {
+    /// The condition a write of the row at `key` by this process holds to: that it is still
+    /// absent, if it is, or at the version read, if this process owns it.
+    ///
+    /// # Errors
+    /// [`RowsError::Conflict`] when another process owns the row (or it is of a version this
+    /// build does not know); the store cannot be read, or the row is not what it says.
+    fn ours(&self, key: &str) -> Result<Cond, RowsError> {
         let Some(found) = self.store.get(key)? else {
-            return Ok(None);
+            return Ok(Cond::Absent);
         };
-        let row = decode(key, &found.value)?;
-        Ok(row
-            .filter(|row| row.owner == self.instance)
-            .map(|_| found.version))
+        match decode(key, &found.value)? {
+            Some(row) if row.owner == self.instance => Ok(Cond::Version(found.version)),
+            _ => Err(RowsError::Conflict {
+                key: key.to_owned(),
+            }),
+        }
     }
 
     /// Writes `row` as the row of `operation`, which this process runs: a new row, or one this
@@ -358,13 +364,7 @@ impl Rows {
             owner: self.instance.clone(),
             ..row.clone()
         };
-        let cond = match self.store.get(&key)? {
-            None => Cond::Absent,
-            Some(_) => match self.owned(&key)? {
-                Some(version) => Cond::Version(version),
-                None => return Err(RowsError::Conflict { key }),
-            },
-        };
+        let cond = self.ours(&key)?;
         self.commit(Txn::new().put(key, encode(&row), cond))
     }
 
@@ -383,12 +383,10 @@ impl Rows {
     ) -> Result<Finished, RowsError> {
         let key = op_key(operation);
         let ttl = retention.max(DONE_FLOOR);
-        let txn = match self.store.get(&key)? {
-            None => Txn::new(),
-            Some(_) => match self.owned(&key)? {
-                Some(version) => Txn::new().delete(key.clone(), Cond::Version(version)),
-                None => return Err(RowsError::Conflict { key }),
-            },
+        let txn = match self.ours(&key)? {
+            Cond::Version(version) => Txn::new().delete(key.clone(), Cond::Version(version)),
+            // No row is left: the answer is put alone.
+            _ => Txn::new(),
         };
         let txn = txn
             .put_ttl(done_key(operation), finished.to_row(), ttl, Cond::Absent)

@@ -576,19 +576,18 @@ fn claim_is_refused_when_the_owner_is_live_again_or_the_store_fails() {
     assert!(matches!(b.claim(&orphan), Err(RowsError::Store(_))));
 }
 
-/// A store that fails at the second or third read of a call fails the call, wherever in it the
-/// read is.
+/// A store that fails at any read of a call fails the call, wherever in it the read is.
 #[test]
 fn a_read_that_fails_part_way_through_a_call_fails_the_call() {
     let env = env();
     let a = env.rows("a");
     a.put_op(op(1), &row(1)).expect("row");
-    env.store.fail_nth_read(2);
+    env.store.fail_nth_read(1);
     assert!(
         matches!(a.put_op(op(1), &row(1)), Err(RowsError::Store(_))),
         "the ownership read"
     );
-    env.store.fail_nth_read(2);
+    env.store.fail_nth_read(1);
     assert!(
         matches!(
             a.finish(op(1), &action(1), &ran(0), DONE_FLOOR),
@@ -601,8 +600,8 @@ fn a_read_that_fails_part_way_through_a_call_fails_the_call() {
         .finish(op(3), &action(3), &ran(0), DONE_FLOOR)
         .expect("their answer");
     a.put_op(op(3), &row(3)).expect("row");
-    // The row, its ownership, then the answer's reads after the conflict.
-    env.store.fail_nth_read(3);
+    // The row and its ownership, then the answer's reads after the conflict.
+    env.store.fail_nth_read(2);
     assert!(
         matches!(
             a.finish(op(3), &action(3), &ran(1), DONE_FLOOR),

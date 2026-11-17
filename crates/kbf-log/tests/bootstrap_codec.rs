@@ -74,3 +74,13 @@ fn a_log_id_displays_as_16_hex_digits() {
     assert_eq!(id(u64::MAX).to_string(), "ffffffffffffffff");
     assert_eq!(id(7).get(), 7);
 }
+
+/// Catches a log id whose non-zero form is not the number it was made from: the metadata log
+/// hands it to its replicas as the id of the log.
+#[test]
+fn a_log_id_is_the_number_it_was_made_from_in_either_form() {
+    let n = std::num::NonZeroU64::new(0x5eed).expect("not zero");
+    let id = kbf_log::FarmLogId::new(n);
+    assert_eq!(id.get(), 0x5eed);
+    assert_eq!(id.non_zero(), n);
+}

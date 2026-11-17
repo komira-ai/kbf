@@ -110,3 +110,35 @@ async fn the_retire_status_of_a_server_with_no_state_store_is_a_conflict() {
     let answer = retire::status(State(bare)).await;
     assert_eq!(answer.status(), StatusCode::CONFLICT);
 }
+
+/// Asserts that `POST /v1/frontend/retire` retires the frontend once and answers a second call
+/// with the same retired status, the retire not run again.
+#[tokio::test]
+async fn a_second_retire_through_the_route_answers_the_same_status() {
+    let (api, _backend) = api_with_retire();
+    let api = Arc::new(ApiState {
+        backend: api.backend.clone(),
+        token: Some(ApiToken::for_tests("retire-token-0123456789abcdef0123")),
+        drain: Arc::clone(&api.drain),
+        retire: Arc::clone(&api.retire),
+        members: None,
+        store: None,
+    });
+    let peer = Caller::direct(std::net::SocketAddr::from(([127, 0, 0, 1], 9)));
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, JSON.parse().expect("a header value"));
+    let bearer = "Bearer retire-token-0123456789abcdef0123";
+    headers.insert(AUTHORIZATION, bearer.parse().expect("a header value"));
+    let call = || {
+        retire::begin(
+            State(Arc::clone(&api)),
+            peer.clone(),
+            headers.clone(),
+            Bytes::new(),
+        )
+    };
+    let first = json_of(call().await).await;
+    let second = json_of(call().await).await;
+    assert_eq!(first["retired"], true, "{first}");
+    assert_eq!(second, first);
+}

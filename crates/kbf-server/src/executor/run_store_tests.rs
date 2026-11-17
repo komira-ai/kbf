@@ -288,3 +288,31 @@ async fn a_follower_task_of_an_operation_no_one_follows_ends_at_its_next_look() 
     assert_eq!(rig.exec.open(), 0);
     let _ = (op_key(OperationId(5)), Code::Ok);
 }
+
+/// Catches two callers that ask together for an operation another frontend runs each starting a
+/// watch of the store (two reads every poll, two answers sent): the second is given the first's
+/// follower, and both see the one answer.
+#[tokio::test(start_paused = true)]
+async fn two_followers_of_one_operation_share_one_watch() {
+    let rig = Rig::stored().await;
+    let theirs = rig.rows("p-other");
+    let operation = OperationId(90);
+    theirs
+        .put_op(operation, &row_of(1, "job-90"))
+        .expect("their row");
+    let inner = rig.exec.inner();
+    let first = follow(inner, operation, key_of(1));
+    let second = follow(inner, operation, key_of(1));
+    assert!(inner.ops().is_followed(operation));
+    theirs
+        .finish(operation, &key_of(1), &ran(4), Duration::from_secs(600))
+        .expect("their answer");
+    rig.until("both followers are answered", || {
+        matches!(*first.borrow(), Stage::Done(_)) && matches!(*second.borrow(), Stage::Done(_))
+    })
+    .await;
+    for stage in [first, second] {
+        assert_eq!(*stage.borrow(), Stage::Done(ran(4)));
+    }
+    assert!(!inner.ops().is_followed(operation));
+}
