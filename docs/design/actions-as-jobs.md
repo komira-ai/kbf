@@ -467,13 +467,13 @@ resubmits it as today's job (section 6). kbf uses none of js TI's tree inputs (`
 tree as **one object** instead of a manifest per directory, and the job's one layer names tierstore's mount provider
 instead of a host directory (jobscheduler's `docs/design/mount-providers.md`, komira-ai/jobscheduler#896):
 
-- **The object** is tierstore's *tree list* (`tierstore::tree_list`, the format tierstore owns and documents): every
+- **The object** is tierstore's *tree list* (`tierstore::TreeList`, the format tierstore owns and documents: JSON Lines, a header line, then one line per entry sorted by path): every
   entry of the action tree at its path below the root. The base tree's entries come from its manifests, flattened once
   when the frontend publishes the bundle (3.3; `BaseTree::listed`); then `work` and every entry of the input root
-  below it, and `.kbf` with `action` and `command`, as in 4.1. A file names the object its bytes are in (the pack
-  span the index gives, else the whole object `cas/l/<sha256>`, which is written first if it is missing, as in 4.1;
-  a file of no bytes names none), its size, its mode (0755 if REAPI marks it executable, else 0644) and its SHA-256,
-  which the provider checks each fill against. Every directory is listed, mode 0755, so an empty one is made too; an
+  below it, and `.kbf` with `action` and `command`, as in 4.1. A file names its size and mode (0755 if REAPI marks
+  it executable, else 0644) and, if it has bytes, the object they are in (the pack span the index gives, else the
+  whole object `cas/l/<sha256>`, which is written first if it is missing, as in 4.1) and its SHA-256, which the
+  provider checks each fill against; a file of no bytes names neither. Every directory is listed, mode 0755, so an empty one is made too; an
   empty input root is `work` with nothing below it. The list is read back by tierstore's own reader before it is
   stored, and stored with one create-only write at `cas/l/<sha256 of its bytes>`: a retry or another run with the
   same inputs finds it there and writes nothing.

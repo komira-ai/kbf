@@ -38,7 +38,7 @@
 //!
 //! **The tree list** ([`listing`], [`TreeWriter::write_listing`]) is the same action tree as one
 //! object, tierstore's tree list: every entry at its path, the base tree's included
-//! ([`BaseTree::listed`]), a file naming its pack span or whole object and its SHA-256, stored
+//! ([`BaseTree::listed`]), a file with bytes naming its pack span or whole object and its SHA-256, stored
 //! create-only at `cas/l/<sha256 of the list>`. tierstore's mount provider makes a job's tree
 //! from it (`--executor-input-tree provider`).
 //!

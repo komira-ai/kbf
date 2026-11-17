@@ -1,19 +1,19 @@
-//! The job's root tree as one flat list of entries (docs/design/actions-as-jobs.md, 4.7): what
+//! The job's root tree as one tierstore tree list (docs/design/actions-as-jobs.md, 4.7): what
 //! a job whose layer names tierstore's mount provider is made from.
 //!
 //! [`TreeWriter::write_listing`] lists the action tree [`TreeWriter::write`] would write as
-//! manifests, as one tierstore tree list ([`tierstore::tree_list`]): every entry of the
+//! manifests, as one tierstore tree list ([`TreeList`]): every entry of the
 //! base tree ([`BaseTree::listed`]) at its path, `work` and every entry of the input root below
-//! it, and `.kbf` with `action` and `command`. A file names the object its bytes are in: a span
-//! of a pack, or the whole object `cas/l/<sha256>` (a file of no bytes names none), and always
-//! its SHA-256, which the provider checks the bytes against. Every directory is listed, so an
+//! it, and `.kbf` with `action` and `command`. A file with bytes names the object they are in (a
+//! span of a pack, or the whole object `cas/l/<sha256>`) and its SHA-256, which the provider
+//! checks the bytes against; a file of no bytes names neither. Every directory is listed, so an
 //! empty one is made too; a file's mode is 0755 if REAPI marks it executable and 0644 if not,
 //! every directory's 0755.
 //!
 //! The blobs are made locatable as for the manifests ([`super::place`]), and the list is
 //! stored with one create-only write at the key tierstore names it by, `cas/l/<sha256 of its
-//! bytes>`:
-//! a retry, or another run with the same inputs, finds it written and writes nothing. Before it
+//! bytes>` ([`tierstore::tree_list_key`]): a retry, or another run with the same inputs, finds
+//! it written and writes nothing. Before it
 //! is stored the list is read back by tierstore's own reader, so nothing is stored that the
 //! provider would refuse to read.
 
@@ -23,19 +23,21 @@ use std::sync::Arc;
 use bytes::Bytes;
 use kbf_objstore::ObjectKey;
 use kbf_types::{Digest, DigestFunction};
-use tierstore::tree_list::{ListEntry, ListKind, TreeList, parse_tree_list};
-use tierstore::{BlobSource, EntryKind, Mode, TreeDigest, TreeEntry};
+use tierstore::{
+    BlobSource, EntryKind, ListEntry, ListKind, Mode, TreeDigest, TreeEntry, TreeList,
+    parse_tree_list,
+};
 
 use super::place::{self, Place};
 use super::{BaseTree, NoTree, TreeWriter, reserved_input};
 use crate::large_backfill::large_key;
 use crate::prepare_run::KeptClosure;
 
-/// The mode of a file REAPI marks executable, and of every directory.
-const EXECUTABLE: u16 = 0o755;
+/// The mode of a file REAPI marks executable, and of every directory: 0755.
+const EXECUTABLE: Mode = Mode::DIR;
 
-/// The mode of any other file.
-const PLAIN: u16 = 0o644;
+/// The mode of any other file: 0644.
+const PLAIN: Mode = Mode::FILE;
 
 /// What an entry of a listed tree is.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -242,28 +244,25 @@ fn walk(kept: &KeptClosure, entries: &mut Vec<Entry>, limit: u64) -> Result<(), 
 fn encode(entries: &[Entry]) -> Result<(ObjectKey, Vec<u8>), NoTree> {
     let entries = entries.iter().map(|entry| {
         let kind = match &entry.kind {
-            Kind::Dir => ListKind::Dir {
-                mode: Mode::new(EXECUTABLE),
-            },
+            Kind::Dir => ListKind::Dir { mode: EXECUTABLE },
             Kind::File {
                 sha256,
                 size,
                 exec,
                 span,
             } => {
-                // Every file with bytes names its object, the whole `cas/l/<sha256>` too.
+                // Every file with bytes names its object, the whole `cas/l/<sha256>` too, and
+                // its hash; a file of no bytes names neither.
                 let source = match span {
+                    _ if *size == 0 => None,
                     Some((key, offset)) => Some((Arc::clone(key), *offset)),
-                    None if *size > 0 => {
-                        Some((Arc::from(large_key(&blob(sha256, *size)).as_str()), 0))
-                    }
-                    None => None,
+                    None => Some((Arc::from(large_key(&blob(sha256, *size)).as_str()), 0)),
                 };
                 ListKind::File {
-                    mode: Mode::new(if *exec { EXECUTABLE } else { PLAIN }),
+                    mode: if *exec { EXECUTABLE } else { PLAIN },
                     size: *size,
                     source: source.map(|(key, offset)| BlobSource { key, offset }),
-                    sha256: Some(TreeDigest::from_bytes(*sha256)),
+                    sha256: (*size > 0).then(|| TreeDigest::from_bytes(*sha256)),
                 }
             }
             Kind::Symlink { target } => ListKind::Symlink {

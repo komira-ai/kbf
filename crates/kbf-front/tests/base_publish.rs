@@ -243,7 +243,6 @@ fn tree_paths(release: &Release) -> BTreeMap<String, String> {
         .map(|(hex, bytes)| (hex.as_str(), bytes.as_slice()))
         .collect();
     let root = &release.built.manifests.last().expect("a root").1;
-    // tierstore API: `flatten(&TreeDigest, fetch) -> Result<Vec<TreeEntry>, _>`.
     let flat = flatten(&TreeDigest::of(root), |digest| {
         manifests
             .get(digest.to_string().as_str())

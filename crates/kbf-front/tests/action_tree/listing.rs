@@ -3,13 +3,10 @@
 //! every refusal and store fault, by name.
 //!
 //! A stored list is read back with tierstore's own reader and described entry by entry; no
-//! test reads the encoded bytes. The lines of the tierstore API a mismatch is possible at are
-//! marked `tierstore API`.
+//! test reads the encoded bytes.
 
 use kbf_front::action_tree::Listing;
-use tierstore::Mode;
-// tierstore API: the module path and the three names
-use tierstore::tree_list::{ListKind, TreeList, parse_tree_list};
+use tierstore::{ListKind, Mode, TreeList, parse_tree_list};
 
 use super::*;
 
@@ -44,13 +41,10 @@ async fn list(rig: &Rig, root: &Digest) -> Result<Listing, NoTree> {
 
 /// A mode as the file modes of the list are written.
 fn mode_name(mode: &Mode) -> &'static str {
-    if *mode == Mode::new(0o644) {
-        // tierstore API: Mode is comparable and Mode::new takes a u16
-        "0644"
-    } else if *mode == Mode::new(0o755) {
-        "0755"
-    } else {
-        "other"
+    match mode.bits() {
+        0o644 => "0644",
+        0o755 => "0755",
+        _ => "other",
     }
 }
 
@@ -90,7 +84,6 @@ fn describe(list: &TreeList) -> BTreeMap<String, String> {
 /// The list stored at `key`, read by tierstore's reader against the digest of its bytes.
 fn stored(rig: &Rig, key: &str) -> BTreeMap<String, String> {
     let bytes = rig.farm.object(key).expect("the list is stored");
-    // tierstore API: parse_tree_list(bytes, &TreeDigest) -> Result<TreeList, _>
     let parsed = parse_tree_list(&bytes, &TreeDigest::of(&bytes)).expect("a list the reader takes");
     describe(&parsed)
 }
@@ -222,8 +215,9 @@ async fn an_unlocated_blob_is_written_whole_before_the_list_names_it() {
     );
 }
 
-/// Catches: an empty file given a source or a wrong size: it has size 0, no source, and its
-/// hash, and no object is written for it.
+/// Catches: an empty file given a source, a hash or a wrong size: it has size 0 and names
+/// neither an object nor a hash (the tree list's rule for a file of no bytes), and no object is
+/// written for it.
 #[tokio::test]
 async fn an_empty_file_has_size_zero_and_no_source() {
     let rig = Rig::new().await;
@@ -232,7 +226,7 @@ async fn an_empty_file_has_size_zero_and_no_source() {
     let listing = list(&rig, &root).await.expect("a list");
     assert_eq!(
         read(&rig, &listing).get("work/f0"),
-        Some(&file_line("0644", 0, "-", &empty.hash_hex()))
+        Some(&file_line("0644", 0, "-", "-"))
     );
     assert_eq!(rig.farm.puts(), [listing.key().to_owned()]);
 }
@@ -337,7 +331,7 @@ async fn the_list_is_stored_at_the_hash_of_its_bytes_and_a_taken_key_is_success(
     let bytes = rig.farm.object(first.key()).expect("stored");
     assert_eq!(first.key(), format!("cas/l/{}", TreeDigest::of(&bytes)));
     // The key is the one tierstore's provider names the list by.
-    assert_eq!(first.key(), tierstore::tree_list::tree_list_key(&bytes));
+    assert_eq!(first.key(), tierstore::tree_list_key(&bytes));
     assert!(!read(&rig, &first).is_empty());
     rig.farm.clear_records();
     let second = list(&rig, &root).await.expect("a list again");

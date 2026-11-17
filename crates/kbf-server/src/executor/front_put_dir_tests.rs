@@ -345,9 +345,9 @@ async fn a_provider_run_gets_the_key_of_a_stored_tree_list_once() {
         .await
         .expect("read");
     // The tierstore tree-list API: adjust to the pinned crate.
-    let list = tierstore::tree_list::parse_tree_list(&bytes, &tierstore::TreeDigest::of(&bytes))
+    let list = tierstore::parse_tree_list(&bytes, &tierstore::TreeDigest::of(&bytes))
         .expect("a tree list");
-    assert_eq!(tierstore::tree_list::tree_list_key(&bytes), key);
+    assert_eq!(tierstore::tree_list_key(&bytes), key);
     let paths: Vec<&str> = list.entries.iter().map(|e| e.path.as_str()).collect();
     for want in [
         "bin",
@@ -365,7 +365,7 @@ async fn a_provider_run_gets_the_key_of_a_stored_tree_list_once() {
         .find(|e| e.path == "bin")
         .expect("the base tree's link");
     assert!(
-        matches!(&bin.kind, tierstore::tree_list::ListKind::Symlink { target } if target == "usr/bin"),
+        matches!(&bin.kind, tierstore::ListKind::Symlink { target } if target == "usr/bin"),
         "{bin:?}"
     );
 }
