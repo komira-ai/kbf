@@ -181,6 +181,9 @@ enum DroppedAt {
     /// Its job was prepared and its submit sent, but not answered inside the window of the
     /// submit.
     SubmitUnanswered,
+    /// Its job was prepared, but no submit of it went out inside the window of the submit (its
+    /// row was not written, or each submit was refused before the service acted).
+    SubmitNotSent,
 }
 
 impl DroppedAt {
@@ -188,6 +191,7 @@ impl DroppedAt {
         match self {
             Self::NotBegun => "not_begun",
             Self::SubmitUnanswered => "submit_unanswered",
+            Self::SubmitNotSent => "submit_not_sent",
         }
     }
 }
@@ -359,10 +363,10 @@ impl HostWorker {
 
     /// Where `w`'s `Start` stood at `at`, when it was dropped.
     fn dropped(&self, w: &Waiting, at: Instant) -> Dropped {
-        let stage = if w.taken {
-            DroppedAt::SubmitUnanswered
-        } else {
-            DroppedAt::NotBegun
+        let stage = match (w.taken, w.sent) {
+            (false, _) => DroppedAt::NotBegun,
+            (true, true) => DroppedAt::SubmitUnanswered,
+            (true, false) => DroppedAt::SubmitNotSent,
         };
         let beat_age_ms = w.beat.map_or_else(
             || "none".to_owned(),

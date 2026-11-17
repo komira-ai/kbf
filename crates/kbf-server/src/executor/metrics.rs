@@ -211,7 +211,7 @@ impl Metrics {
         let counters = [
             (
                 "kbf_executor_late_starts_total",
-                "Starts dropped because their window ended before their job was submitted",
+                "Starts dropped because their window ended before their job was submitted (first read past it, or not taken by the job service within a window of being ready)",
                 &self.late_starts,
             ),
             (

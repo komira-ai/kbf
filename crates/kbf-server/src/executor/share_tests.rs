@@ -325,7 +325,7 @@ async fn a_row_the_store_cannot_take_is_retried_before_the_submit() {
 
 /// Catches a prepared job held back for ever, listed, by a store that never takes its row: the
 /// submit has a window of its own from the moment the job was ready, and at its end the `Start`
-/// is dropped as `submit_unanswered`; nothing was submitted, so no job exists, and its lease is
+/// is dropped as `submit_not_sent`; nothing was submitted, so no job exists, and its lease is
 /// reported at once as infrastructure for the farm to run again.
 #[tokio::test(start_paused = true)]
 async fn a_job_whose_row_is_never_written_is_reported_at_the_end_of_its_submit_window() {
@@ -340,7 +340,7 @@ async fn a_job_whose_row_is_never_written_is_reported_at_the_end_of_its_submit_w
     let guard = log.install();
     step(&harness, &mut worker).await;
     drop(guard);
-    assert_eq!(log.field("stage").as_deref(), Some("submit_unanswered"));
+    assert_eq!(log.field("stage").as_deref(), Some("submit_not_sent"));
     assert!(matches!(
         worker.tasks.get(&lease()).map(|task| &task.stage),
         Some(crate::executor::runs::Stage::Reporting(_))

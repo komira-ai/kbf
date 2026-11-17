@@ -69,8 +69,6 @@
 //!   [`Config::prepare_limit`], not by the window.
 //! - The Linux workers' shape is the declared one at registration, and grows with the job
 //!   service's hosts ([`capacity`](super::capacity)).
-//!
-//! [`Config::prepare_limit`]: super::Config::prepare_limit
 //! - A fenced worker stays silent for `G`, by when the farm has requeued every lease it held,
 //!   and then registers again as a new process that names the old one its predecessor.
 //!
@@ -78,6 +76,7 @@
 //! [`Config::validate`]: super::Config::validate
 //! [`Config::call_timeout`]: super::Config::call_timeout
 //! [`Config::pass_budget`]: super::Config::pass_budget
+//! [`Config::prepare_limit`]: super::Config::prepare_limit
 
 use std::collections::{BTreeMap, VecDeque};
 use std::ops::ControlFlow;

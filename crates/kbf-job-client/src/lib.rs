@@ -2,14 +2,15 @@
 //! jobscheduler's `js-proto` crate), for the host executor.
 //!
 //! The job is the service's one public concept: the client submits one OCI image to run to
-//! completion and reads its result. This crate wraps the six job calls and nothing else:
+//! completion and reads its result. This crate wraps the six job calls and one host call:
 //! [`Client::submit_job`], [`Client::get_job`], [`Client::list_jobs`] (and
 //! [`Client::list_all_jobs`], which follows the pages), [`Client::cancel_job`],
-//! [`Client::get_result`] and [`Client::get_logs`]. It takes and returns `js-proto`'s own
+//! [`Client::get_result`] and [`Client::get_logs`], and [`Client::list_hosts`], which the
+//! executor sizes its virtual workers from. It takes and returns `js-proto`'s own
 //! messages ([`JobSpec`](js_proto::v1::JobSpec), [`Job`](js_proto::v1::Job),
 //! [`JobResult`](js_proto::v1::JobResult), ...), so there is no second copy of them to keep in
-//! step. The host, pool, provider and usage calls are not wrapped: no kbf code needs them, and
-//! operators have the service's own CLI.
+//! step. The other host calls (cordon, uncordon, taint) and the pool, provider and usage calls
+//! are not wrapped: no kbf code needs them, and operators have the service's own CLI.
 //!
 //! A job id is checked before anything is sent: 1 to 63 bytes of letters, digits, dot,
 //! underscore and dash. The caller chooses it and keeps it, because the id is what makes a
@@ -18,7 +19,7 @@
 //!
 //! The host executor of `kbf-server` (`crates/kbf-server/src/executor`) is its one caller: it
 //! submits each placed action as a job and reads its result, and the logs of a job that did
-//! not end well whose result holds no output.
+//! not end well whose result holds no output, and reads the hosts to size its workers.
 //!
 //! # Safety of the credential
 //!
