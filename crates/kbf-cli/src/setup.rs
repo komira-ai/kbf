@@ -59,8 +59,8 @@ pub struct Args {
 /// and its second [`SETUP`].
 ///
 /// # Errors
-/// What `clap` refuses: no `--mode`, a flag `setup` does not take (the proxy's among them), a
-/// word that is not a flag.
+/// What `clap` refuses: no `--mode`, a removed mode ([`crate::REMOVED`], the library's own
+/// refusal), a flag `setup` does not take (the proxy's among them), a word that is not a flag.
 pub fn parse(args: &[OsString]) -> Result<Args, clap::Error> {
     let argv = args.iter().take(1).chain(args.iter().skip(2));
     Args::try_parse_from(argv)

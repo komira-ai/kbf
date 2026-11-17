@@ -32,15 +32,14 @@ fn installer_config(dir: &TestDir, body: &str) -> String {
 fn a_mode_that_keeps_no_state_in_the_database_passes_without_an_installer_toml() {
     let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "boot-check-no-state");
     let absent = format!("--installer-config={}", dir.join("absent.toml").display());
-    for mode in ["daemon", "storage", "storage-and-daemon"] {
-        let flag = format!("--mode={mode}");
-        let (code, out, err) = boot_check(&[flag.as_str(), absent.as_str()]);
-        assert_eq!(code, Some(0), "{mode}: {err}");
-        assert!(out.is_empty(), "{mode}: {out}");
-        assert!(err.contains(NO_STATE), "{mode}: {err}");
-        let (code, _, err) = boot_check(&[flag.as_str()]);
-        assert_eq!(code, Some(0), "{mode}: {err}");
-    }
+    let mode = "storage";
+    let flag = format!("--mode={mode}");
+    let (code, out, err) = boot_check(&[flag.as_str(), absent.as_str()]);
+    assert_eq!(code, Some(0), "{mode}: {err}");
+    assert!(out.is_empty(), "{mode}: {out}");
+    assert!(err.contains(NO_STATE), "{mode}: {err}");
+    let (code, _, err) = boot_check(&[flag.as_str()]);
+    assert_eq!(code, Some(0), "{mode}: {err}");
 }
 
 /// Asserts that a frontend host whose `installer.toml` names no database passes
@@ -110,8 +109,8 @@ fn a_command_line_the_verb_does_not_take_is_a_usage_error() {
     let cases = [
         (&[][..], "--mode"),
         (&["--mode=node"][..], "node"),
-        (&["--mode=daemon", "--check"][..], "--check"),
-        (&["--mode=daemon", "--kbf=/usr/bin/kbf"][..], "--kbf"),
+        (&["--mode=storage", "--check"][..], "--check"),
+        (&["--mode=storage", "--kbf=/usr/bin/kbf"][..], "--kbf"),
     ];
     for (args, named) in cases {
         let (code, out, err) = boot_check(args);

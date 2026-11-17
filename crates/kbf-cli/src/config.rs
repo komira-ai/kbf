@@ -106,9 +106,6 @@ const GROUPS: &[(&str, &[&str])] = &[
             "exclusive-actions",
             "finished-retention-secs",
             "heartbeat-interval-ms",
-            "input-tree-cache-bytes",
-            "input-tree-cache-entries",
-            "input-tree-reads-in-flight",
             "pack-index",
             "placement-load",
             "placement-predictions",
@@ -140,8 +137,6 @@ const GROUPS: &[(&str, &[&str])] = &[
             "history-index-root",
             "history-objects",
             "invocation-memory",
-            "invocations-open",
-            "ui",
         ],
     ),
     (
@@ -170,9 +165,6 @@ const GROUPS: &[(&str, &[&str])] = &[
             "storage-ca",
             "storage-client-cert",
             "storage-client-key",
-            "storage-dial-timeout-ms",
-            "storage-ping-interval-ms",
-            "storage-ping-timeout-ms",
         ],
     ),
     (
@@ -217,10 +209,8 @@ const GROUPS: &[(&str, &[&str])] = &[
     ("log", &["log-dir", "log-files", "log-max-bytes"]),
     (
         // Blobs in packs: the frontend's (`kbf_server::frontend`'s `pack_flags`; `pack-index`,
-        // which they need, stays with the scheduler's state store) and the daemon's reads of
-        // them (`kbf_node`'s `pack_read`), from the object store or through a tierstore on
-        // loopback (`kbf_node`'s `tierstore`). The `pack-store-*` keys name the object store in
-        // both.
+        // which they need, stays with the scheduler's state store). The `pack-store-*` keys name
+        // the object store.
         "packs",
         &[
             "pack-bytes",
@@ -228,20 +218,12 @@ const GROUPS: &[(&str, &[&str])] = &[
             "pack-cache-dir",
             "pack-commit-sample",
             "pack-inflight-bytes",
-            "pack-read",
-            "pack-read-cache-bytes",
-            "pack-read-cache-dir",
             "pack-store-bucket",
             "pack-store-credentials-file",
             "pack-store-endpoint",
             "pack-store-region",
-            "pack-store-write-credentials-file",
             "pack-upload-idle-timeout",
-            "pack-write",
             "pack-writer",
-            "tierstore-bucket",
-            "tierstore-credentials-file",
-            "tierstore-endpoint",
         ],
     ),
     (
@@ -298,8 +280,8 @@ const GROUPS: &[(&str, &[&str])] = &[
         ],
     ),
     (
-        // Where the frontend runs placed actions (`kbf_server::frontend`'s `executor_flags`): the
-        // daemons of the nodes, or jobs of the job scheduler's job service.
+        // Where the frontend runs placed actions (`kbf_server::frontend`'s `executor_flags`):
+        // jobs of the job scheduler's job service.
         "executor",
         &[
             "executor",
@@ -359,101 +341,20 @@ const GROUPS: &[(&str, &[&str])] = &[
             "frontend-name",
         ],
     ),
+    ("identity", &["frontend"]),
     (
-        "identity",
-        &[
-            "ca-cert",
-            "cas",
-            "cert",
-            "frontend",
-            "key",
-            "node-id",
-            "server",
-            "tls-server-name",
-        ],
-    ),
-    (
+        // The runtime's thread counts, in the table that files written when a daemon read them
+        // already hold them in: the table keeps its name so that those files go on parsing.
         "daemon",
-        &[
-            "async-threads",
-            "blocking-threads",
-            "cpu-threads",
-            "data-dir",
-            "data-max-bytes",
-            "drain-deadline-secs",
-            "driver",
-            "image",
-            "native-term-grace-ms",
-            "no-input-cache",
-            "orders-dir",
-            "reconnect-max-ms",
-            "reconnect-ms",
-            "reserve-cpus",
-            "reserve-share",
-            "role",
-            "update-dir",
-        ],
-    ),
-    (
-        "containers",
-        &[
-            "actions-cpu-max",
-            "actions-memory-max-gib",
-            "cgroup-parent",
-            "cgroup-root",
-            "container-nofile",
-            "container-nproc",
-            "container-pids-limit",
-            "container-shm-mib",
-            "id-files",
-            "lease-placement",
-            "lease-swap-kill-mib",
-            "lease-swap-kill-percent",
-            "lease-swap-poll-ms",
-            "numa-dir",
-            "oci-runtime",
-            "psi-memory-file",
-            "self-cgroup",
-            "supervisor-memory-min-mib",
-        ],
+        &["async-threads", "blocking-threads", "cpu-threads"],
     ),
     (
         "memory",
-        &[
-            "learned-sizes",
-            "memory-headroom-mib",
-            "memory-ladder-gib",
-            "memory-limit-percent",
-            "memory-poll-ms",
-            "memory-pressure-pause-percent",
-            "no-memory-climb",
-        ],
+        &["learned-sizes", "memory-ladder-gib", "no-memory-climb"],
     ),
     (
         "outputs",
-        &[
-            "output-max-bytes",
-            "output-max-depth",
-            "output-max-entries",
-            "output-max-stdio-bytes",
-            "output-upload-deadline-secs",
-            "segment-upload-idle-secs",
-            "segment-upload-max-bytes",
-            "segment-upload-streams",
-            "segment-uploads-in-flight",
-        ],
-    ),
-    (
-        "transfer",
-        &[
-            "transfer-bytes-in-flight",
-            "transfer-chunk-bytes",
-            "transfer-find-missing-chunk",
-            "transfer-in-flight",
-            "transfer-memory-blob-bytes",
-            "transfer-retries",
-            "transfer-stream-window-bytes",
-        ],
+        &["segment-upload-idle-secs", "segment-upload-max-bytes"],
     ),
 ];
 

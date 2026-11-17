@@ -2,8 +2,7 @@
 //! writes no proxy table and enables no proxy unit, and keeps a `[proxy]` table that
 //! `installer.toml` already has: the table is read and written back in the canonical form with
 //! every key kept, so a file that is in that form is the same bytes. The proxy's own flags are
-//! refused before `setup` runs (`raw_tests.rs`), and an all-in-one host of the removed proxy
-//! layout is refused by `aio_tests.rs`. The helpers are `tests.rs`'s. Each test says the
+//! refused before `setup` runs (`raw_tests.rs`). The helpers are `tests.rs`'s. Each test says the
 //! behaviour it asserts.
 
 use super::*;

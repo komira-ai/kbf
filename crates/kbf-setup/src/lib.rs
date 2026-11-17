@@ -32,6 +32,6 @@ pub mod layout;
 pub mod setup;
 pub mod sha256_hex;
 
-/// A commit as 40 lowercase hex characters; it lives in `kbf-retain`, which the helper's Mac
-/// build takes without this crate.
+/// A commit as 40 lowercase hex characters; it lives in `kbf-retain`, which other crates take
+/// without this one.
 pub use kbf_retain::{CommitId, NotACommit};

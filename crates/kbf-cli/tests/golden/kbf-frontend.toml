@@ -3,11 +3,11 @@
 # overrides its key. A secret is the path of the file that holds it.
 
 [daemon]
-# Worker threads of the async runtime, which run every task between its waits. Default: every CPU the process may use on the server; `max(2, reserve/4)`, at most the physical cores, on the daemon
+# Worker threads of the async runtime, which run every task between its waits. Default: every CPU the process may use
 # async-threads = "N"
-# The most threads the runtime's blocking pool runs at once, for calls that wait on a disk or a process (a thread is made when a call needs one and ends when idle). Default: 512 (tokio's) for the server, 64 for the daemon
+# The most threads the runtime's blocking pool runs at once, for calls that wait on a disk or a process (a thread is made when a call needs one and ends when idle). Default: 512 (tokio's)
 # blocking-threads = "N"
-# Threads for CPU-bound work, such as hashing, which never waits and so is held to the CPUs. Default: every CPU the process may use on the server; `max(2, reserve/2)`, at most the physical cores, on the daemon
+# Threads for CPU-bound work, such as hashing, which never waits and so is held to the CPUs. Default: every CPU the process may use
 # cpu-threads = "N"
 
 [enroll-service]

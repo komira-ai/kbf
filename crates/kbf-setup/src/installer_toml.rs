@@ -18,9 +18,7 @@
 //! `frontend_config` is an absolute path. Nothing reads it since two-slot supervision was
 //! removed; it is accepted and written back so that the file of an earlier build, whose `setup`
 //! wrote it on an all-in-one host behind the proxy, still parses and round-trips. `setup` writes
-//! it no more and keeps the one a file has, and the tolerant reader takes it. It is how `setup`
-//! knows that layout: `--mode=all-in-one` is refused on a host whose file names it
-//! (`setup::plan::refuse_proxy_layout`).
+//! it no more and keeps the one a file has, and the tolerant reader takes it.
 //!
 //! [`InstallerToml::parse`] is the closed reader, for whoever decides where a release comes
 //! from (the fetcher) or rewrites the file (`setup`): it must understand all of it. A reader
@@ -190,7 +188,7 @@ pub struct InstallerToml {
     /// not read at all.
     #[cfg(feature = "proxy")]
     pub proxy: Option<ProxyConfig>,
-    /// The state database of a frontend or all-in-one host: a `postgres://` URL without a
+    /// The state database of a frontend host: a `postgres://` URL without a
     /// password (the file is world-readable). `crate::database` reads this file a second time,
     /// leniently (only this key, and it refuses a password); this field exists so that the
     /// closed reader here does not reject the key, and it has no other consumer.

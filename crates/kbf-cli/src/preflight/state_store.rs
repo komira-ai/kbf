@@ -1,8 +1,7 @@
 //! The scheduler's state store: a frontend keeps its state in a state store, Postgres from
 //! the next release, so a `kbf frontend` given no `--state-store` (and no `state-store` key
-//! in `kbf.toml`) is refused here, before anything is bound or opened. `all-in-one` is given
-//! the local Postgres by its parser when it names none, and the other modes hold no
-//! scheduler state.
+//! in `kbf.toml`) is refused here, before anything is bound or opened. The storage mode holds
+//! no scheduler state.
 
 use super::Report;
 use crate::Invocation;

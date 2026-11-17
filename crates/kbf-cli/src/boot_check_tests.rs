@@ -80,7 +80,7 @@ fn boot(rest: &[&str]) -> Vec<OsString> {
         .collect()
 }
 
-/// Asserts that a unit of the frontend or all-in-one is migrated once, to the schema this
+/// Asserts that a unit of the frontend is migrated once, to the schema this
 /// build declares as `state_schema` in `kbf --version --json`, before the check returns, and
 /// that the line returned is the step's own after the words that say where it comes from.
 #[test]
@@ -89,39 +89,34 @@ fn the_step_is_asked_once_for_the_schema_this_build_declares() {
         .as_u64()
         .expect("a number");
     assert_eq!(declared, u64::from(kbf_pack_index::schema::latest()));
-    for mode in [names::FRONTEND, names::ALL_IN_ONE] {
-        let (said, asked) = migrate(mode, Ok("migrated the schema from 6 to 7"));
-        let want = Ok("schema step: migrated the schema from 6 to 7".to_owned());
-        assert_eq!(said, want, "{mode}");
-        assert_eq!(asked, [kbf_pack_index::schema::latest()], "{mode}");
-    }
+    let (said, asked) = migrate(names::FRONTEND, Ok("migrated the schema from 6 to 7"));
+    let want = Ok("schema step: migrated the schema from 6 to 7".to_owned());
+    assert_eq!(said, want);
+    assert_eq!(asked, [kbf_pack_index::schema::latest()]);
 }
 
 /// Asserts that a step that refuses is an error, with the step's one line after the words that
 /// say where it comes from, and that the step was asked once: the unit must not start.
 #[test]
 fn a_step_that_refuses_is_an_error_and_was_asked_once() {
-    let (said, asked) = migrate(names::ALL_IN_ONE, Err("a contract step"));
+    let (said, asked) = migrate(names::FRONTEND, Err("a contract step"));
     assert_eq!(said, Err("state schema: a contract step".to_owned()));
     assert_eq!(asked.len(), 1);
 }
 
 /// Asserts that a mode that keeps no state in the database runs nothing and loads nothing:
-/// storage, daemon and storage-and-daemon pass without the `installer.toml` being read or the
-/// step being asked.
+/// the storage mode passes without the `installer.toml` being read or the step being asked.
 #[test]
 fn a_mode_that_keeps_no_state_in_the_database_runs_nothing() {
-    for mode in [names::STORAGE, names::DAEMON, names::STORAGE_AND_DAEMON] {
-        let loads = Cell::new(0);
-        let (asked, step) = fake_step(Ok("migrated"));
-        let said = migrate_before_start(mode, || {
-            loads.set(loads.get() + 1);
-            Ok(Some(step))
-        });
-        assert_eq!(said, Ok(NO_STATE.to_owned()), "{mode}");
-        assert_eq!(loads.get(), 0, "{mode}");
-        assert!(asked.borrow().is_empty(), "{mode}");
-    }
+    let loads = Cell::new(0);
+    let (asked, step) = fake_step(Ok("migrated"));
+    let said = migrate_before_start(names::STORAGE, || {
+        loads.set(loads.get() + 1);
+        Ok(Some(step))
+    });
+    assert_eq!(said, Ok(NO_STATE.to_owned()));
+    assert_eq!(loads.get(), 0);
+    assert!(asked.borrow().is_empty());
 }
 
 /// Asserts that a host whose `installer.toml` names no database passes and says why it did
@@ -132,7 +127,7 @@ fn a_host_with_no_database_passes_and_an_unusable_installer_toml_stops_the_start
     let said = migrate_before_start(names::FRONTEND, || Ok(None::<FakeStep>));
     assert_eq!(said, Ok(NO_DATABASE.to_owned()));
     let load = || Err::<Option<FakeStep>, String>("unreadable".to_owned());
-    let said = migrate_before_start(names::ALL_IN_ONE, load);
+    let said = migrate_before_start(names::FRONTEND, load);
     assert_eq!(said, Err("unreadable".to_owned()));
 }
 
@@ -226,7 +221,7 @@ fn the_verdict_is_one_line_and_exit_status_0_or_1() {
 #[test]
 fn run_passes_a_mode_with_no_state_and_refuses_a_frontend_with_no_installer_toml() {
     let args = Args {
-        mode: names::DAEMON.to_owned(),
+        mode: names::STORAGE.to_owned(),
         installer_config: PathBuf::from("/nonexistent/installer.toml"),
     };
     assert_eq!(run(&args), ExitCode::SUCCESS);
@@ -237,7 +232,7 @@ fn run_passes_a_mode_with_no_state_and_refuses_a_frontend_with_no_installer_toml
     assert_eq!(run(&args), ExitCode::FAILURE);
 }
 
-/// Asserts that the command line takes `--mode` with one of the five modes and optionally
+/// Asserts that the command line takes `--mode` with one of the two modes and optionally
 /// `--installer-config`, which defaults to `/etc/kbf/installer.toml`.
 #[test]
 fn the_command_line_takes_a_mode_and_optionally_the_installer_toml() {
@@ -252,7 +247,7 @@ fn the_command_line_takes_a_mode_and_optionally_the_installer_toml() {
     let parsed = parse(&boot(&given)).expect("parses");
     assert_eq!(parsed.mode, names::STORAGE);
     assert_eq!(parsed.installer_config, Path::new("/x/i.toml"));
-    for mode in names::MODES.iter().filter(|m| m.name != names::ALL_IN_ONE) {
+    for mode in names::MODES.iter() {
         let flag = format!("--mode={}", mode.name);
         let parsed = parse(&boot(&[flag.as_str()])).expect("a mode");
         assert_eq!(parsed.mode, mode.name);
@@ -269,20 +264,35 @@ fn a_command_line_that_is_not_a_mode_and_nothing_else_is_a_usage_error() {
     assert_eq!(refused(&["--mode"]), ErrorKind::InvalidValue);
     assert_eq!(refused(&["--mode=node"]), ErrorKind::InvalidValue);
     let unknown = ErrorKind::UnknownArgument;
-    assert_eq!(refused(&["--mode=daemon", "--check"]), unknown);
-    assert_eq!(refused(&["--mode=daemon", "frontend"]), unknown);
-    assert_eq!(refused(&["--mode=daemon", "--kbf=/usr/bin/kbf"]), unknown);
+    assert_eq!(refused(&["--mode=storage", "--check"]), unknown);
+    assert_eq!(refused(&["--mode=storage", "frontend"]), unknown);
+    assert_eq!(refused(&["--mode=storage", "--kbf=/usr/bin/kbf"]), unknown);
 }
 
-/// Asserts that the command's help names the verb as `kbf boot-check`, lists the five modes as
+/// Asserts that a unit that still asks for a removed mode is refused with the one message that
+/// says what replaces it, exit status 2 as a usage error.
+#[test]
+fn a_removed_mode_is_refused_with_the_message() {
+    for removed in names::REMOVED_MODES {
+        let flag = format!("--mode={removed}");
+        let e = parse(&boot(&[flag.as_str()])).expect_err("refused");
+        assert_eq!(e.kind(), ErrorKind::InvalidValue, "{removed}");
+        assert_eq!(e.exit_code(), 2, "{removed}");
+        assert!(e.to_string().contains(crate::REMOVED), "{removed}: {e}");
+    }
+}
+
+/// Asserts that the command's help names the verb as `kbf boot-check`, lists the two modes as
 /// the values of `--mode` and shows the default `installer.toml`.
 #[test]
 fn the_help_names_the_verb_the_modes_and_the_default_installer_toml() {
     let help = command().render_long_help().to_string();
     assert!(help.contains("kbf boot-check"), "{help}");
-    for mode in names::MODES.iter().filter(|m| m.name != names::ALL_IN_ONE) {
+    for mode in names::MODES.iter() {
         assert!(help.contains(mode.name), "{}: {help}", mode.name);
     }
-    assert!(!help.contains("all-in-one"), "{help}");
+    for removed in names::REMOVED_MODES {
+        assert!(!help.contains(removed), "{removed}: {help}");
+    }
     assert!(help.contains(DEFAULT_INSTALLER_CONFIG), "{help}");
 }

@@ -8,8 +8,8 @@
 
 use kbf_host::{Cmd, Entry, Exec, HostPath, Owner, Perms, Plan, Planner, RunUser};
 
-use super::kbf_toml::{self, Decision, Ours, UpdateDirs};
-use super::os::{DSCL, LAUNCHCTL, Os, SYSTEMCTL, View};
+use super::kbf_toml::{self, Decision, Ours};
+use super::os::{Os, SYSTEMCTL, View};
 use super::paths;
 use super::validate::{Valid, mode_name};
 use super::{SetupError, installer_settings};
@@ -17,22 +17,6 @@ use crate::cli::Mode;
 use crate::layout::{Layout, Platform};
 
 const USERADD: &str = "/usr/sbin/useradd";
-const USERMOD: &str = "/usr/sbin/usermod";
-const LOGINCTL: &str = "/usr/bin/loginctl";
-/// The subid range a new grant starts at, and its size (what `usermod` documents).
-const SUBID_FLOOR: u64 = 100_000;
-const SUBID_COUNT: u64 = 65_536;
-/// The ids setup considers for the macOS fetch account (below 500 is a system account).
-const MAC_ID_FROM: u32 = 300;
-const MAC_ID_TO: u32 = 400;
-/// The launchd labels: the installer's plist is the package's; the daemon's is the release's.
-pub const MAC_INSTALLER_LABEL: &str = "com.komira.kbf-installer";
-pub const MAC_DAEMON_LABEL: &str = "com.komira.kbf-daemon";
-/// The unit of a storage-and-daemon host: the storage and the daemon in one process.
-pub const STORAGE_AND_DAEMON_UNIT: &str = "kbf-storage-and-daemon.service";
-/// The unit of an all-in-one host, one process for everything (`kbf --mode=all-in-one`, no proxy
-/// and no sibling). `setup` enables it, and `kbf-installer run` restarts it after a swap.
-pub const ALL_IN_ONE_UNIT: &str = "kbf-all-in-one.service";
 /// The account a frontend and a storage node run as (`User=` of their units).
 const FRONTEND_USER: &str = "kbf-server";
 /// The unit of a frontend host.
@@ -78,49 +62,28 @@ pub(super) fn file(
 /// The units a mode is run by. The names are the static unit files of the package
 /// (`packaging/linux/units`); the installer's own service is separate, since it runs
 /// whatever the mode. A frontend is run by `kbf-frontend.service`: the proxy's units are not a
-/// mode's, and `setup` enables none of them. An all-in-one host is run by its one unit.
+/// mode's, and `setup` enables none of them.
 pub fn mode_units(mode: Mode) -> &'static [&'static str] {
     match mode {
         Mode::Frontend => &[FRONTEND_UNIT],
         Mode::Storage => &["kbf-storage.service"],
-        Mode::Daemon => &["kbf-daemon.service"],
-        Mode::StorageAndDaemon => &[STORAGE_AND_DAEMON_UNIT],
-        Mode::AllInOne => &[ALL_IN_ONE_UNIT],
     }
 }
 
-/// The user a mode's unit runs as on Linux (`User=` of the package's units), which is also the
-/// account that logs in to the state database. An all-in-one host runs as `kbf`, the account of
-/// the daemon half it holds.
-pub(crate) fn service_user_name(mode: Mode) -> &'static str {
-    match mode {
-        Mode::Frontend | Mode::Storage => FRONTEND_USER,
-        Mode::Daemon | Mode::StorageAndDaemon | Mode::AllInOne => "kbf",
-    }
-}
-
-/// Whether the host runs actions in containers: it then needs a subid range and lingering.
-fn runs_actions(mode: Mode) -> bool {
-    matches!(mode, Mode::Daemon | Mode::StorageAndDaemon | Mode::AllInOne)
-}
-
-/// Whether the mode's daemon takes update orders: the one `kbf` starts with a storage map. The
-/// in-process daemon of `all-in-one` refuses `--update-dir` (`kbf-node`'s `start_over`), so it
-/// is not written there.
-pub fn takes_orders(mode: Mode) -> bool {
-    matches!(mode, Mode::Daemon | Mode::StorageAndDaemon)
+/// The user a mode's unit runs as (`User=` of the package's units), which is also the account
+/// that logs in to the state database.
+pub(crate) fn service_user_name(_mode: Mode) -> &'static str {
+    FRONTEND_USER
 }
 
 /// Whether the host serves the operator API, which needs a token.
 fn serves_api(mode: Mode) -> bool {
-    matches!(mode, Mode::Frontend | Mode::AllInOne)
+    mode == Mode::Frontend
 }
 
 pub fn fetch_user(platform: Platform) -> &'static str {
-    match platform {
-        Platform::Linux => "kbf-fetch",
-        Platform::MacOs => "_kbf-fetch",
-    }
+    let Platform::Linux = platform;
+    "kbf-fetch"
 }
 
 /// What the plans share: who root and the service user are.
@@ -129,8 +92,8 @@ pub struct Ctx {
     /// The installer's tree, for its paths.
     pub layout: Layout,
     pub root: Owner,
-    /// The user the mode's unit runs as (Linux); a Mac runs the daemon as root.
-    pub service: Option<RunUser>,
+    /// The user the mode's unit runs as.
+    pub service: RunUser,
 }
 
 /// The ids of `user` as the owner of a file.
@@ -142,9 +105,9 @@ fn owner_of(user: &RunUser) -> Owner {
 }
 
 impl Ctx {
-    /// The owner of what the service user reads or writes; root when there is none.
+    /// The owner of what the service user reads or writes.
     fn service_owner(&self) -> Owner {
-        self.service.as_ref().map_or(self.root, owner_of)
+        owner_of(&self.service)
     }
 }
 
@@ -155,16 +118,7 @@ fn account(os: &dyn Os, name: &'static str) -> Result<RunUser, SetupError> {
 
 pub fn context(os: &dyn Os, mode: Mode) -> Result<Ctx, SetupError> {
     let platform = os.platform();
-    if platform == Platform::MacOs && mode != Mode::Daemon {
-        return Err(SetupError::Unsupported(format!(
-            "--mode={}: a Mac is a node only (--mode=daemon)",
-            mode_name(mode)
-        )));
-    }
-    let service = match platform {
-        Platform::Linux => Some(account(os, service_user_name(mode))?),
-        Platform::MacOs => None,
-    };
+    let service = account(os, service_user_name(mode))?;
     Ok(Ctx {
         platform,
         layout: Layout::new(kbf_host::Root::new("/")?, platform),
@@ -208,69 +162,9 @@ fn read_token(exec: &dyn Exec, file: &str) -> Result<Vec<u8>, SetupError> {
     Ok(format!("{text}\n").into_bytes())
 }
 
-/// `/etc/subuid`-style text has a range for `user` (keyed by name or uid).
-fn has_range(text: &str, user: &RunUser) -> bool {
-    text.lines().any(|line| {
-        let mut f = line.split(':');
-        let key = f.next();
-        let count = f.nth(1).and_then(|c| c.parse::<u64>().ok());
-        (key == Some(user.name.as_str()) || key == Some(user.uid.to_string().as_str()))
-            && count.is_some_and(|c| c > 0)
-    })
-}
-
-/// Where a new range may start: above every range in `text`, so it overlaps no other user's.
-fn next_range_start(text: &str) -> u64 {
-    text.lines()
-        .filter_map(|line| {
-            let mut f = line.split(':').skip(1);
-            let start = f.next()?.parse::<u64>().ok()?;
-            let count = f.next()?.parse::<u64>().ok()?;
-            Some(start.saturating_add(count))
-        })
-        .fold(SUBID_FLOOR, u64::max)
-}
-
-fn add_subids(
-    p: &mut Pl<'_, '_>,
-    user: &RunUser,
-    kind: &'static str,
-    text: &str,
-) -> Result<(), SetupError> {
-    if has_range(text, user) {
-        return Ok(());
-    }
-    let start = next_range_start(text);
-    let end = start + SUBID_COUNT - 1;
-    if end > u64::from(u32::MAX) {
-        return Err(SetupError::SubIdSpace(kind));
-    }
-    p.run(
-        Cmd::new(hp(USERMOD)?)
-            .arg(format!("--add-{kind}s"))
-            .arg(format!("{start}-{end}"))
-            .arg("--")
-            .arg(&user.name),
-    );
-    Ok(())
-}
-
-/// The lowest id in 300..400 that no user and no group on the host has.
-fn free_mac_id(users: &str, groups: &str) -> Result<u32, SetupError> {
-    let taken = |id: u32| {
-        [users, groups].iter().any(|t| {
-            t.lines()
-                .any(|l| l.split_whitespace().last() == Some(id.to_string().as_str()))
-        })
-    };
-    (MAC_ID_FROM..MAC_ID_TO)
-        .find(|id| !taken(*id))
-        .ok_or(SetupError::NoFreeId)
-}
-
 /// What an existing fetch account must be, for the confinement of the fetch child to mean
-/// what the design says (`kbf-installer.md`: the child runs as `kbf-fetch`, `_kbf-fetch` on a
-/// Mac, with no fallback to another user): a system account (not root, below the first
+/// what the design says (`kbf-installer.md`: the child runs as `kbf-fetch`, with no fallback to
+/// another user): a system account (not root, below the first
 /// ordinary id), no login shell, no home. These are the values `setup` creates it with and
 /// the package's sysusers entry makes.
 struct FetchShape {
@@ -279,18 +173,11 @@ struct FetchShape {
     shells: &'static [&'static str],
 }
 
-fn fetch_shape(platform: Platform) -> FetchShape {
-    match platform {
-        Platform::Linux => FetchShape {
-            below: 1000,
-            home: "/nonexistent",
-            shells: &["/usr/sbin/nologin", "/sbin/nologin"],
-        },
-        Platform::MacOs => FetchShape {
-            below: 500,
-            home: "/var/empty",
-            shells: &["/usr/bin/false"],
-        },
+fn fetch_shape() -> FetchShape {
+    FetchShape {
+        below: 1000,
+        home: "/nonexistent",
+        shells: &["/usr/sbin/nologin", "/sbin/nologin"],
     }
 }
 
@@ -298,7 +185,7 @@ fn fetch_shape(platform: Platform) -> FetchShape {
 /// the account and the field. Nothing is changed on the host, since a wrong account may be
 /// someone's, and the operator decides what to do with it.
 fn check_fetch_shape(os: &dyn Os, user: &RunUser) -> Result<(), SetupError> {
-    let want = fetch_shape(os.platform());
+    let want = fetch_shape();
     let shell = os.login_shell(&user.name)?;
     let mut wrong = Vec::new();
     if user.uid == 0 || user.uid >= want.below {
@@ -337,82 +224,24 @@ pub fn ensure_fetch_user(p: &mut Pl<'_, '_>, os: &dyn Os) -> Result<(), SetupErr
     let name = fetch_user(os.platform());
     match os.user(name)? {
         Some(user) => check_fetch_shape(os, &user),
-        None => create_fetch_user(p, os, name),
+        None => create_fetch_user(p, name),
     }
 }
 
-fn create_fetch_user(p: &mut Pl<'_, '_>, os: &dyn Os, name: &str) -> Result<(), SetupError> {
-    match os.platform() {
-        Platform::Linux => p.run(
-            Cmd::new(hp(USERADD)?)
-                .arg("--system")
-                .arg("--user-group")
-                .arg("--no-create-home")
-                .arg("--home-dir")
-                .arg("/nonexistent")
-                .arg("--shell")
-                .arg("/usr/sbin/nologin")
-                .arg("--")
-                .arg(name),
-        ),
-        Platform::MacOs => {
-            let id = free_mac_id(
-                &os.dscl_list("/Users UniqueID")?,
-                &os.dscl_list("/Groups PrimaryGroupID")?,
-            )?
-            .to_string();
-            let dscl = |record: &str, attr: &str, value: &str| -> Result<Cmd, SetupError> {
-                Ok(Cmd::new(hp(DSCL)?)
-                    .arg(".")
-                    .arg("-create")
-                    .arg(record)
-                    .arg(attr)
-                    .arg(value))
-            };
-            let (group, user) = (format!("/Groups/{name}"), format!("/Users/{name}"));
-            for cmd in [
-                dscl(&group, "PrimaryGroupID", &id)?,
-                dscl(&user, "UniqueID", &id)?,
-                dscl(&user, "PrimaryGroupID", &id)?,
-                dscl(&user, "UserShell", "/usr/bin/false")?,
-                dscl(&user, "NFSHomeDirectory", "/var/empty")?,
-                dscl(&user, "IsHidden", "1")?,
-            ] {
-                p.run(cmd);
-            }
-        }
-    }
+fn create_fetch_user(p: &mut Pl<'_, '_>, name: &str) -> Result<(), SetupError> {
+    p.run(
+        Cmd::new(hp(USERADD)?)
+            .arg("--system")
+            .arg("--user-group")
+            .arg("--no-create-home")
+            .arg("--home-dir")
+            .arg("/nonexistent")
+            .arg("--shell")
+            .arg("/usr/sbin/nologin")
+            .arg("--")
+            .arg(name),
+    );
     Ok(())
-}
-
-/// Refuses an all-in-one host that an earlier build set up behind the proxy's two-slot
-/// supervision: its `installer.toml` names a `frontend_config`, the file the proxy's children
-/// read, which only that setup wrote (beside `frontend.toml`, and a `kbf.toml` that is the
-/// sibling `kbf-storage-and-daemon.service`'s). That layout is not moved to the one unit of
-/// `all-in-one` or rewritten: the host is left as it is. Asked before the flags are checked and
-/// before any step is planned, so a refusal leaves the host as it was. A file that is not TOML is
-/// `installer_settings`' to name. Reads the host, changes nothing.
-pub fn refuse_proxy_layout(
-    exec: &dyn Exec,
-    mode: Mode,
-    platform: Platform,
-) -> Result<(), SetupError> {
-    if mode != Mode::AllInOne {
-        return Ok(());
-    }
-    let path = paths::installer_toml(platform);
-    let Some(text) = read_current(exec, path)? else {
-        return Ok(());
-    };
-    let named = text
-        .parse::<toml::Table>()
-        .is_ok_and(|table| table.contains_key("frontend_config"));
-    if !named {
-        return Ok(());
-    }
-    Err(SetupError::NeedsOperator(format!(
-        "{path} names a frontend_config: this host was set up by an earlier build as an all-in-one host behind the proxy's two-slot supervision (the proxy, a frontend child and kbf-storage-and-daemon.service), a layout that setup does not rewrite or move to the one unit of --mode=all-in-one; leave this host as it is, or set up another host"
-    )))
 }
 
 /// The part of the plan before the state database's schema: accounts, directories, the tokens
@@ -444,16 +273,8 @@ pub fn before_release(
     let mut p = Planner::new(&view);
 
     ensure_fetch_user(&mut p, os)?;
-    if let (Some(user), true) = (&ctx.service, runs_actions(v.mode)) {
-        add_subids(&mut p, user, "subuid", &os.subuid()?)?;
-        add_subids(&mut p, user, "subgid", &os.subgid()?)?;
-        if !os.lingers(&user.name)? {
-            p.run(Cmd::new(hp(LOGINCTL)?).arg("enable-linger").arg(&user.name));
-        }
-    }
 
-    // The installer's tree is root's; `orders/` inside it is the service user's (on a Mac the
-    // daemon is root, so it is root's).
+    // The installer's tree is root's; `orders/` inside it is the service user's.
     let (root, service) = (ctx.root, ctx.service_owner());
     dir(&mut p, paths::etc_dir(platform), 0o755, root)?;
     let state_dir = ctx.layout.state_dir().to_string();
@@ -564,21 +385,12 @@ pub fn after_release(
 
     let platform = ctx.platform;
     let kbf_toml_path = paths::kbf_toml(platform);
-    let (update_dir, orders_dir) = (
-        ctx.layout.update_dir().to_string(),
-        ctx.layout.orders_dir().to_string(),
-    );
     let ours = Ours {
         mode: mode_name(v.mode),
         frontend_url: v.frontend_url.as_deref(),
         token_file: v.token_file.as_ref().map(|_| paths::enroll_token(platform)),
         api_token_file: serves_api(v.mode).then_some(paths::api_token(platform)),
         state_store: v.database.as_deref(),
-        // A Mac's `kbf.toml` is its host's own, which has no update keys.
-        update: (takes_orders(v.mode) && platform != Platform::MacOs).then_some(UpdateDirs {
-            update_dir: &update_dir,
-            orders_dir: &orders_dir,
-        }),
         extra: &v.kbf,
     };
     let current = read_current(exec, kbf_toml_path)?;
@@ -599,7 +411,7 @@ pub fn after_release(
         &mut notes,
     )?;
 
-    notes.extend(units(&mut p, os, v, ctx, released, no_start)?);
+    notes.extend(units(&mut p, os, v, released, no_start)?);
     Ok(Outcome {
         plan: p.finish(),
         notes,
@@ -638,34 +450,25 @@ fn remove_old_backup_timer(
 
 /// What `setup` tells of the unit it enables and leaves stopped on a host that keeps its state
 /// in Postgres: starting one takes the database, the TLS files and the ports, which only the
-/// operator decides. The all-in-one host has one unit and no proxy, and it is that unit's name
-/// the note gives.
-fn not_started_note(mode: Mode) -> &'static str {
-    match mode {
-        Mode::AllInOne => {
-            "kbf-all-in-one.service is enabled, not started: start it when the database, the TLS files and the ports are ready"
-        }
-        _ => {
-            "the frontend unit is enabled, not started: start it when the database, the TLS files and the port are ready"
-        }
-    }
+/// operator decides.
+fn not_started_note() -> &'static str {
+    "the frontend unit is enabled, not started: start it when the database, the TLS files and the port are ready"
 }
 
 fn units(
     p: &mut Pl<'_, '_>,
     os: &dyn Os,
     v: &Valid,
-    ctx: &Ctx,
     released: bool,
     no_start: bool,
 ) -> Result<Vec<String>, SetupError> {
     let mut notes = Vec::new();
     // The mode's units are started when the operator did not forbid it and there is a `kbf`
-    // to start (a release is installed, or `/usr/bin/kbf` is present). The installer's own service has nothing to wait for. A unit that makes a
-    // frontend is never started here: starting one takes the state database and the public
+    // to start (a release is installed, or `/usr/bin/kbf` is present). The installer's own service has
+    // nothing to wait for. A unit that makes a frontend is never started here: starting one takes the state database and the public
     // port, which only the operator decides.
     let start_mode = if v.mode.keeps_state_in_database() {
-        notes.push(not_started_note(v.mode).to_owned());
+        notes.push(not_started_note().to_owned());
         false
     } else if no_start {
         notes.push("--no-start: units are enabled, not started".to_owned());
@@ -679,59 +482,20 @@ fn units(
     } else {
         true
     };
-    match ctx.platform {
-        Platform::MacOs => {
-            let wanted = [
-                (MAC_INSTALLER_LABEL, !no_start),
-                (MAC_DAEMON_LABEL, start_mode),
-            ];
-            for (label, now) in wanted {
-                // The installer's job may carry a launchd disable override (the rollback of
-                // an adopted Mac sets one, and the package's removal does not clear it): a
-                // job that is disabled does not load at boot, and `bootstrap` of it fails.
-                // `enable` clears the override and is harmless without one, so it is run
-                // whether or not the job is loaded (a loaded job can carry an override too),
-                // before the bootstrap, and with `--no-start` too (the job is then enabled
-                // for the next boot, as a systemd unit is).
-                let installer = label == MAC_INSTALLER_LABEL;
-                if !(now || installer) {
-                    continue;
-                }
-                let loaded = os.launchd_loaded(label)?;
-                if installer {
-                    p.run(
-                        Cmd::new(hp(LAUNCHCTL)?)
-                            .arg("enable")
-                            .arg(format!("system/{label}")),
-                    );
-                }
-                if now && !loaded {
-                    p.run(
-                        Cmd::new(hp(LAUNCHCTL)?)
-                            .arg("bootstrap")
-                            .arg("system")
-                            .arg(format!("/Library/LaunchDaemons/{label}.plist")),
-                    );
-                }
+    let backup_gone = remove_old_backup_timer(p, os, &mut notes)?;
+    // Only the unit of the mode: the `kbf` package ships no other unit (the installer's
+    // and the proxy's are not in it).
+    let wanted = mode_units(v.mode).iter().map(|u| (*u, start_mode));
+    if backup_gone {
+        p.run(Cmd::new(hp(SYSTEMCTL)?).arg("daemon-reload"));
+    }
+    for (unit, now) in wanted {
+        if !os.unit_enabled(unit)? {
+            let mut cmd = Cmd::new(hp(SYSTEMCTL)?).arg("enable");
+            if now {
+                cmd = cmd.arg("--now");
             }
-        }
-        Platform::Linux => {
-            let backup_gone = remove_old_backup_timer(p, os, &mut notes)?;
-            // Only the unit of the mode: the `kbf` package ships no other unit (the installer's
-            // and the proxy's are not in it).
-            let wanted = mode_units(v.mode).iter().map(|u| (*u, start_mode));
-            if backup_gone {
-                p.run(Cmd::new(hp(SYSTEMCTL)?).arg("daemon-reload"));
-            }
-            for (unit, now) in wanted {
-                if !os.unit_enabled(unit)? {
-                    let mut cmd = Cmd::new(hp(SYSTEMCTL)?).arg("enable");
-                    if now {
-                        cmd = cmd.arg("--now");
-                    }
-                    p.run(cmd.arg("--").arg(unit));
-                }
-            }
+            p.run(cmd.arg("--").arg(unit));
         }
     }
     Ok(notes)

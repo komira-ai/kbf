@@ -80,7 +80,7 @@ fn a_dry_run_asks_the_server_and_changes_nothing() {
         &FakeOs::linux(),
         &mut exec,
         &server,
-        &raw(Mode::AllInOne),
+        &raw(Mode::Frontend),
         dry,
     )
     .expect("dry run");
@@ -124,7 +124,7 @@ fn an_unreachable_database_stops_before_the_config_and_the_units() {
         &FakeOs::linux(),
         &mut exec,
         &nodes,
-        &raw(Mode::Daemon),
+        &raw(Mode::Storage),
         APPLY,
     )
     .expect("a node");
@@ -179,28 +179,25 @@ fn a_run_that_stopped_at_the_database_is_finished_by_running_again() {
     assert!(out.contains("\nnothing to do\n"), "{out}");
 }
 
-/// Asserts that a database flag is accepted only where it means something: the two modes that
-/// keep state in Postgres take the local default when it is left out (the database `kbf` on the
+/// Asserts that a database flag is accepted only where it means something: the mode that keeps
+/// state in Postgres takes the local default when it is left out (the database `kbf` on the
 /// local socket, as the account the mode's unit runs as, marked as defaulted) and a given URL is
-/// not marked; the other modes refuse the flag; a password (the file is world-readable), another
+/// not marked; the other mode refuses the flag; a password (the file is world-readable), another
 /// scheme, a character a TOML string would escape or an `sslmode` the URL reader refuses is
 /// refused; a URL that asks for TLS is taken; and the message never quotes the URL.
 #[test]
 fn the_database_flag_defaults_where_there_is_state_and_is_refused_with_a_password() {
-    let local = "postgres:///kbf?host=/run/postgresql&user=kbf";
-    for (mode, default) in [(Mode::Frontend, DATABASE), (Mode::AllInOne, local)] {
-        let mut r = raw(mode);
-        let given = r.validate(Platform::Linux).expect("given");
-        assert_eq!(given.database.as_deref(), Some(DATABASE));
-        assert!(!given.database_defaulted);
-        assert!(given.local_database.is_none());
-        r.database = None;
-        let left_out = r.validate(Platform::Linux).expect("the local default");
-        assert_eq!(left_out.database.as_deref(), Some(default));
-        assert!(left_out.database_defaulted);
-        assert!(left_out.local_database.is_some());
-    }
-    let mut r = raw(Mode::Daemon);
+    let mut r = raw(Mode::Frontend);
+    let given = r.validate(Platform::Linux).expect("given");
+    assert_eq!(given.database.as_deref(), Some(DATABASE));
+    assert!(!given.database_defaulted);
+    assert!(given.local_database.is_none());
+    r.database = None;
+    let left_out = r.validate(Platform::Linux).expect("the local default");
+    assert_eq!(left_out.database.as_deref(), Some(DATABASE));
+    assert!(left_out.database_defaulted);
+    assert!(left_out.local_database.is_some());
+    let mut r = raw(Mode::Storage);
     r.database = Some(DATABASE.to_owned());
     let why = r.validate(Platform::Linux).expect_err("refused").join("; ");
     assert!(why.contains("--database is for the modes"), "{why}");
@@ -243,7 +240,7 @@ fn the_database_flag_defaults_where_there_is_state_and_is_refused_with_a_passwor
 /// path is refused rather than followed.
 #[test]
 fn setup_writes_the_installer_toml_the_unit_reads() {
-    let mut r = raw(Mode::Daemon);
+    let mut r = raw(Mode::Storage);
     r.installer_config = Some("/srv/other.toml".to_owned());
     let why = r.validate(Platform::Linux).expect_err("refused").join("; ");
     assert!(why.contains("--installer-config is for run"), "{why}");
@@ -261,10 +258,7 @@ fn setup_writes_the_installer_toml_the_unit_reads() {
 #[test]
 fn a_regular_file_shadowing_the_packaged_unit_stops_setup_before_any_step() {
     let cases = [
-        (Mode::StorageAndDaemon, "kbf-storage-and-daemon.service"),
-        (Mode::Daemon, "kbf-daemon.service"),
         (Mode::Storage, "kbf-storage.service"),
-        (Mode::AllInOne, "kbf-all-in-one.service"),
         (Mode::Frontend, "kbf-frontend.service"),
     ];
     for (mode, file) in cases {
@@ -298,19 +292,19 @@ fn a_regular_file_shadowing_the_packaged_unit_stops_setup_before_any_step() {
     // Not refused: a link to the packaged unit, a file of another mode, and no file at all.
     let mut exec = host();
     exec.entries.insert(
-        hp("/etc/systemd/system/kbf-daemon.service"),
+        hp("/etc/systemd/system/kbf-storage.service"),
         Entry::Link {
-            target: "/usr/lib/systemd/system/kbf-daemon.service".into(),
+            target: "/usr/lib/systemd/system/kbf-storage.service".into(),
         },
     );
     put(
         &mut exec,
-        "/etc/systemd/system/kbf-storage.service",
+        "/etc/systemd/system/kbf-frontend.service",
         0o644,
         ROOT,
         "x",
     );
-    go(&FakeOs::linux(), &mut exec, &raw(Mode::Daemon), APPLY)
+    go(&FakeOs::linux(), &mut exec, &raw(Mode::Storage), APPLY)
         .expect("a link and another mode's file pass");
 }
 
@@ -339,7 +333,6 @@ fn another_scheduler_key_makes_the_file_the_operators() {
         token_file: None,
         api_token_file: None,
         state_store: Some(DATABASE),
-        update: None,
         extra: &[],
     };
     let theirs = format!(
@@ -426,14 +419,14 @@ fn setup_creates_the_schema_over_a_real_server() {
 }
 
 /// Catches a setup that an interruption leaves unfinishable, or whose re-run reaches a
-/// different host than a clean run: a failure planted at every single step of a clean run,
-/// in every Linux mode, must be an error, must never leave a `kbf.toml` without the files
+/// different host than a clean run: a failure injected at every single step of a clean run,
+/// in every mode, must be an error, must never leave a `kbf.toml` without the files
 /// it names, and the same command again must finish with the files a clean run leaves.
 /// This is the stated re-run rule: setup holds no state of its own, each run plans from what
 /// is on the host.
 #[test]
 fn a_failure_at_any_step_is_finished_by_running_again() {
-    for mode in [Mode::Storage, Mode::Daemon, Mode::Frontend, Mode::AllInOne] {
+    for mode in [Mode::Storage, Mode::Frontend] {
         let clean = {
             let mut exec = released(host(), Platform::Linux);
             go_ok(&FakeOs::linux(), &mut exec, &raw(mode));
@@ -483,7 +476,7 @@ fn an_error_about_a_file_never_repeats_the_database_url() {
         ROOT,
         "confirm_window_s = 900\ndatabase = postgres://kbf:hunter2@db.example/kbf\n",
     );
-    let err = go(&FakeOs::linux(), &mut exec, &raw(Mode::Daemon), APPLY).expect_err("refused");
+    let err = go(&FakeOs::linux(), &mut exec, &raw(Mode::Storage), APPLY).expect_err("refused");
     let shown = err.to_string();
     assert!(
         !shown.contains("hunter2") && !shown.contains("db.example"),
@@ -500,7 +493,6 @@ fn an_error_about_a_file_never_repeats_the_database_url() {
         token_file: None,
         api_token_file: None,
         state_store: Some(DATABASE),
-        update: None,
         extra: &[],
     };
     let theirs = "mode = \"frontend\"\n[scheduler]\nstate-store = \"postgres:///other?host=/run/postgresql\"\nheartbeat-interval-ms = 500\n";
@@ -529,7 +521,6 @@ fn an_invalid_config_file_is_refused_without_its_text() {
         token_file: None,
         api_token_file: None,
         state_store: Some(DATABASE),
-        update: None,
         extra: &[],
     };
     let theirs = "mode = \"frontend\"\n[scheduler]\nstate-store = postgres://u:PW@h/x\n";
@@ -550,142 +541,55 @@ fn an_invalid_config_file_is_refused_without_its_text() {
     );
 }
 
-/// The `<key>`s of the property list's `PathState`: the files its `KeepAlive` waits for.
-fn gate_files(plist: &str) -> Vec<String> {
-    let after = plist
-        .split("<key>PathState</key>")
-        .nth(1)
-        .expect("PathState");
-    let dict = after.split("</dict>").next().expect("a dict");
-    dict.split("<key>")
-        .skip(1)
-        .map(|k| k.split("</key>").next().expect("closed").to_owned())
-        .collect()
-}
-
-/// Catches `setup` writing `installer.toml` where the launchd job does not wait for it: the
-/// job's `KeepAlive` is gated on that file, so on a Mac that setup wrote it elsewhere
-/// (`/etc/kbf`, the Linux path) the installer job would never run and the daemon would find
-/// no `kbf.toml`. Runs the Mac plan, then compares the real plist's gate with the files the
-/// plan wrote, and checks nothing went under `/etc/kbf`.
-#[test]
-fn the_launchd_gate_is_the_installer_toml_setup_writes_on_a_mac() {
-    let mut exec = released(host(), Platform::MacOs);
-    // What the fixture host holds before setup (certificates the checks look for) is not
-    // setup's: only files setup made are compared.
-    let planted: Vec<String> = exec.entries.keys().map(ToString::to_string).collect();
-    go_ok(&FakeOs::mac(), &mut exec, &raw(Mode::Daemon));
-
-    let files: Vec<String> = exec
-        .entries
-        .iter()
-        .filter(|(_, e)| matches!(e, Entry::File { .. }))
-        .map(|(p, _)| p.to_string())
-        .filter(|p| !planted.contains(p))
-        .collect();
-    let written: Vec<&String> = files
-        .iter()
-        .filter(|p| p.ends_with("/installer.toml"))
-        .collect();
-    let plist = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../packaging/macos/com.komira.kbf-installer.plist"),
-    )
-    .expect("the packaged property list");
-    assert_eq!(
-        written,
-        gate_files(&plist).iter().collect::<Vec<_>>(),
-        "setup wrote installer.toml somewhere the launchd gate does not wait"
-    );
-    // The node job reads kbf.toml from the layout; on a Mac that file is a Mac host's own
-    // (G9), so it was there before setup and setup wrote none.
-    assert!(
-        planted.iter().any(|p| p == Platform::MacOs.kbf_toml())
-            && !files.iter().any(|p| p == Platform::MacOs.kbf_toml()),
-        "{files:?}"
-    );
-    assert!(
-        !files.iter().any(|p| p.starts_with("/etc/kbf")),
-        "a Mac keeps nothing in /etc/kbf: {files:?}"
-    );
-    // The configuration directory is made where the files go, and no Linux one is made.
-    let dirs: Vec<String> = exec
-        .entries
-        .iter()
-        .filter(|(_, e)| matches!(e, Entry::Dir { .. }))
-        .map(|(p, _)| p.to_string())
-        .collect();
-    assert!(
-        dirs.iter().any(|d| d == "/usr/local/etc/kbf"),
-        "no Mac config directory: {dirs:?}"
-    );
-    assert!(
-        !dirs.iter().any(|d| d.starts_with("/etc/kbf")),
-        "a Linux config directory on a Mac: {dirs:?}"
-    );
-}
-
-/// Catches one of the config paths left on the Linux directory on one platform (a Mac
-/// `api_token` or `config_dir` at `/etc/kbf` reaches no test that runs the daemon plan):
-/// each file sits directly in its platform's `config_dir`, which is `/etc/kbf` on Linux and
-/// `/usr/local/etc/kbf` on macOS, and the `Layout` paths are the `Platform` ones.
+/// Catches a config path outside the config directory: each file sits directly in the
+/// platform's `config_dir`, `/etc/kbf`, and the `Layout` paths are the `Platform` ones.
 ///
-/// Catches: the Mac `config_dir` and the Mac `api_token` each set to the Linux path.
+/// Catches: the `config_dir` or the `api_token` set to another directory.
 #[test]
 fn every_config_path_lies_in_its_platforms_config_dir() {
-    for (platform, dir) in [
-        (Platform::Linux, "/etc/kbf"),
-        (Platform::MacOs, "/usr/local/etc/kbf"),
+    let platform = Platform::Linux;
+    let dir = "/etc/kbf";
+    assert_eq!(platform.config_dir(), dir);
+    let layout = crate::layout::Layout::new(kbf_host::Root::new("/").expect("root"), platform);
+    assert_eq!(layout.config_dir().to_string(), dir);
+    for (file, path, held) in [
+        ("kbf.toml", platform.kbf_toml(), layout.kbf_toml()),
+        (
+            "installer.toml",
+            platform.installer_toml(),
+            layout.installer_toml(),
+        ),
+        (
+            "enroll.token",
+            platform.enroll_token(),
+            layout.enroll_token(),
+        ),
+        ("api-token", platform.api_token(), layout.api_token()),
     ] {
-        assert_eq!(platform.config_dir(), dir);
-        let layout = crate::layout::Layout::new(kbf_host::Root::new("/").expect("root"), platform);
-        assert_eq!(layout.config_dir().to_string(), dir);
-        for (file, path, held) in [
-            ("kbf.toml", platform.kbf_toml(), layout.kbf_toml()),
-            (
-                "installer.toml",
-                platform.installer_toml(),
-                layout.installer_toml(),
-            ),
-            (
-                "enroll.token",
-                platform.enroll_token(),
-                layout.enroll_token(),
-            ),
-            ("api-token", platform.api_token(), layout.api_token()),
-        ] {
-            assert_eq!(
-                std::path::Path::new(path).parent(),
-                Some(std::path::Path::new(dir)),
-                "{platform:?} {file}: {path}"
-            );
-            assert_eq!(held.to_string(), path, "{platform:?} {file}");
-        }
+        assert_eq!(
+            std::path::Path::new(path).parent(),
+            Some(std::path::Path::new(dir)),
+            "{platform:?} {file}: {path}"
+        );
+        assert_eq!(held.to_string(), path, "{platform:?} {file}");
     }
 }
 
-/// Catches `--installer-config` being pinned to the Linux path on a Mac: the only value setup
-/// accepts there is the Mac's own, and the Linux one is refused.
+/// Catches `--installer-config` accepted for a file the unit does not read: the only value
+/// setup accepts is the platform's own, and another path is refused.
 #[test]
 fn setup_accepts_only_the_platforms_installer_toml_as_installer_config() {
-    let mut r = raw(Mode::Daemon);
+    let mut r = raw(Mode::Storage);
+    r.installer_config = Some("/etc/kbf/installer.toml".to_owned());
+    r.validate(Platform::Linux)
+        .expect("the platform's own file");
     r.installer_config = Some("/usr/local/etc/kbf/installer.toml".to_owned());
-    r.validate(Platform::MacOs).expect("the Mac's own file");
     let why = r
         .validate(Platform::Linux)
         .expect_err("not Linux's")
         .join("; ");
     assert!(
         why.contains("setup writes /etc/kbf/installer.toml"),
-        "{why}"
-    );
-    r.installer_config = Some("/etc/kbf/installer.toml".to_owned());
-    let why = r
-        .validate(Platform::MacOs)
-        .expect_err("not the Mac's")
-        .join("; ");
-    assert!(
-        why.contains("setup writes /usr/local/etc/kbf/installer.toml"),
         "{why}"
     );
 }

@@ -2,9 +2,8 @@
 //! Every problem is reported, one line each, not just the first.
 //!
 //! The rules follow from which modes enroll (docs/design/kbf-installer.md section 3): the
-//! node modes `storage`, `daemon` and `storage-and-daemon` enroll with a frontend, so they
-//! need its URL and an enrollment token; the `frontend` and `all-in-one` hosts do not enroll,
-//! so they take neither. The flags that named a release source or a first release are not
+//! node mode `storage` enrolls with a frontend, so it needs its URL and an enrollment token;
+//! the `frontend` host does not enroll, so it takes neither. The flags that named a release source or a first release are not
 //! checked: they are taken and ignored ([`RetiredFlags`]).
 //!
 //! The proxy's own flags are not here: `kbf-installer setup` refuses them before it runs
@@ -31,7 +30,7 @@ pub struct Raw {
     pub retired: RetiredFlags,
     /// `--database`: the state database's URL.
     pub database: Option<String>,
-    /// The listener, certificate and storage-client flags of a frontend or all-in-one host.
+    /// The listener, certificate and storage-client flags of a frontend host.
     pub kbf: KbfFlags,
     /// `--create-local-database`.
     pub create_local_database: bool,
@@ -81,7 +80,7 @@ impl std::fmt::Debug for LocalDatabase {
 
 /// Whether the mode enrolls with a frontend: its start does, with the token.
 pub fn enrolls(mode: Mode) -> bool {
-    matches!(mode, Mode::Storage | Mode::Daemon | Mode::StorageAndDaemon)
+    mode == Mode::Storage
 }
 
 impl Raw {
@@ -283,8 +282,5 @@ pub fn mode_name(mode: Mode) -> &'static str {
     match mode {
         Mode::Frontend => "frontend",
         Mode::Storage => "storage",
-        Mode::Daemon => "daemon",
-        Mode::StorageAndDaemon => "storage-and-daemon",
-        Mode::AllInOne => "all-in-one",
     }
 }

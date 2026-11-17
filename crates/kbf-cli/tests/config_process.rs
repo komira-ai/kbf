@@ -16,8 +16,6 @@ use rcgen::{
 };
 
 const BIN: &str = env!("CARGO_BIN_EXE_kbf");
-/// The stand-in `crun` the container driver's check runs `--version` on.
-const FAKE_CRUN: &str = env!("CARGO_BIN_EXE_kbf-cli-fake-crun");
 
 fn scratch(name: &str) -> kbf_testkit::dir::TestDir {
     kbf_testkit::dir::TestDir::under(
@@ -169,23 +167,6 @@ impl Pki {
     }
 }
 
-/// The environment of a host with what the container driver looks for: a private
-/// runtime directory (`--oci-runtime` names the stand-in `crun`, in `settings`).
-fn host_env(dir: &Path) -> Vec<(String, String)> {
-    let bin = dir.join("bin");
-    std::fs::create_dir_all(&bin).expect("bin");
-    let xdg = dir.join("xdg");
-    std::fs::create_dir_all(&xdg).expect("xdg");
-    std::fs::set_permissions(&xdg, std::fs::Permissions::from_mode(0o700)).expect("mode");
-    vec![
-        (
-            "PATH".to_owned(),
-            format!("{}:/usr/bin:/bin", bin.display()),
-        ),
-        ("XDG_RUNTIME_DIR".to_owned(), xdg.display().to_string()),
-    ]
-}
-
 /// How a start fails its checks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Host {
@@ -200,35 +181,8 @@ enum Host {
 /// The settings of `mode` on a host that is `host`, under `dir`.
 fn settings(mode: &str, dir: &Path, pki: &Pki, host: Host) -> Settings {
     let p = |name: &str| dir.join(name).display().to_string();
-    let early = host == Host::Early;
-    let node = |s: &mut Settings| {
-        pki.issue(dir, "node", Row::Daemon, &["n"], early);
-        let ca = if host == Host::Missing {
-            p("no-such-ca.pem")
-        } else {
-            p("ca.pem")
-        };
-        s.extend([
-            ("driver", "container".to_owned()),
-            ("oci-runtime", FAKE_CRUN.to_owned()),
-            ("server", "https://127.0.0.1:1".to_owned()),
-            ("ca-cert", ca),
-            ("cert", p("node.pem")),
-            ("key", p("node.key")),
-            ("node-id", "n".to_owned()),
-            ("data-dir", p("data")),
-        ]);
-    };
     let mut s: Settings = Vec::new();
     match mode {
-        names::DAEMON | names::ALL_IN_ONE => node(&mut s),
-        names::STORAGE_AND_DAEMON => {
-            node(&mut s);
-            s.extend([
-                ("storage-listen", "127.0.0.1:0".to_owned()),
-                ("meta-dir", p("meta")),
-            ]);
-        }
         names::STORAGE => {
             s.push(("storage-listen", "127.0.0.1:0".to_owned()));
             match host {
@@ -278,26 +232,21 @@ fn settings(mode: &str, dir: &Path, pki: &Pki, host: Host) -> Settings {
 /// as a `kbf.toml`, which exit the same and print the same.
 #[test]
 fn check_exits_0_2_or_75_in_every_mode_and_starts_nothing() {
-    // `all-in-one` is refused before any file is read; binary.rs pins that.
-    for mode in names::MODES.iter().filter(|m| m.name != names::ALL_IN_ONE) {
+    for mode in names::MODES {
         for (host, want) in [(Host::Fine, 0), (Host::Missing, 2), (Host::Early, 75)] {
             let dir = scratch(&format!("check-{}-{host:?}", mode.name));
             let pki = Pki::new(&dir);
             let s = settings(mode.name, &dir, &pki, host);
             let mut flags = vec![mode.name.to_owned(), "--check".to_owned()];
             flags.extend(as_flags(&s));
-            let env = host_env(&dir);
-            let by_flags = run_in(&flags, &env);
+            let by_flags = run(&flags);
             let toml = dir.join("kbf.toml");
             write(&toml, &as_toml(&s), 0o600);
-            let by_file = run_in(
-                &[
-                    mode.name.to_owned(),
-                    "--check".to_owned(),
-                    format!("--config={}", toml.display()),
-                ],
-                &env,
-            );
+            let by_file = run(&[
+                mode.name.to_owned(),
+                "--check".to_owned(),
+                format!("--config={}", toml.display()),
+            ]);
             for (how, r) in [("flags", &by_flags), ("file", &by_file)] {
                 let at = format!("{} on a {host:?} host, by {how}: {}", mode.name, r.err);
                 assert_eq!(r.code, Some(want), "{at}");
@@ -348,7 +297,7 @@ fn check_refuses_what_a_start_refuses() {
     let empty = scratch("check-no-file");
     let none = empty.join("absent.toml");
     let r = run(&strings(&[
-        "daemon",
+        "storage",
         "--check",
         "--config",
         &none.display().to_string(),
@@ -360,17 +309,18 @@ fn check_refuses_what_a_start_refuses() {
         r.err
     );
     assert!(r.out.is_empty());
-    let r = run(&strings(&["daemon", "--check", "--node-id=n"]));
+    let r = run(&strings(&["frontend", "--check", "--listen=127.0.0.1:1"]));
+    assert_eq!(r.code, Some(2), "{}", r.err);
+    assert!(r.err.contains("--storage"), "{}", r.err);
+    let r = run(&strings(&[
+        "frontend",
+        "--check",
+        "--storage=http://127.0.0.1:1",
+        "--cold-store=file:///x",
+    ]));
     assert_eq!(r.code, Some(2), "{}", r.err);
     assert!(
-        r.err.contains("required arguments were not provided"),
-        "{}",
-        r.err
-    );
-    let r = run(&strings(&["daemon", "--check", "--cold-store=file:///x"]));
-    assert_eq!(r.code, Some(2), "{}", r.err);
-    assert!(
-        r.err.contains("kbf daemon refuses --cold-store"),
+        r.err.contains("kbf frontend refuses --cold-store"),
         "{}",
         r.err
     );
@@ -398,19 +348,11 @@ fn check_refuses_what_a_start_refuses() {
 #[test]
 fn check_refuses_an_unknown_flag_and_a_word_that_is_not_a_mode() {
     let dir = scratch("check-unknown-flag");
-    let data = dir.join("data");
-    let node = [
-        "--driver=container",
-        "--server=https://127.0.0.1:1",
-        "--ca-cert=/nonexistent/ca.pem",
-        "--cert=/nonexistent/node.pem",
-        "--key=/nonexistent/node.key",
-        "--node-id=n",
-    ];
-    for mode in ["daemon", "--mode=daemon"] {
+    let data = dir.join("meta");
+    for mode in ["storage", "--mode=storage"] {
         let mut words = vec![mode.to_owned(), "--check".to_owned()];
-        words.extend(node.iter().map(|f| (*f).to_owned()));
-        words.push(format!("--data-dir={}", data.display()));
+        words.push("--storage-listen=127.0.0.1:0".to_owned());
+        words.push(format!("--meta-dir={}", data.display()));
         words.push("--bogus-flag".to_owned());
         let r = run(&words);
         assert_eq!(r.code, Some(2), "{mode}: {}", r.err);
@@ -555,7 +497,7 @@ fn a_start_with_a_bad_file_exits_2_and_makes_nothing() {
     }
 }
 
-/// Catches a `kbf.toml` that `kbf-installer setup` writes and `kbf` does not accept. The five
+/// Catches a `kbf.toml` that `kbf-installer setup` writes and `kbf` does not accept. The
 /// files the setup library's tests pin (`kbf-setup/tests/golden/kbf_toml`, one per mode) are
 /// put under a scratch directory with the certificates, keys and token they name, and `kbf
 /// --mode=<mode> --config <file> --check` must exit 0 and print `ok` (a node that enrolls says it is configured and not enrolled yet): a key `kbf` does not
@@ -565,8 +507,7 @@ fn a_start_with_a_bad_file_exits_2_and_makes_nothing() {
 #[test]
 fn the_kbf_toml_that_setup_writes_passes_check_in_every_mode() {
     let goldens = Path::new(env!("CARGO_MANIFEST_DIR")).join("../kbf-setup/tests/golden/kbf_toml");
-    // `all-in-one` is refused before any file is read; binary.rs pins that.
-    for mode in names::MODES.iter().filter(|m| m.name != names::ALL_IN_ONE) {
+    for mode in names::MODES {
         let dir = scratch(&format!("installer-{}", mode.name));
         let etc = dir.join("etc");
         std::fs::create_dir_all(&etc).expect("etc");
@@ -579,7 +520,6 @@ fn the_kbf_toml_that_setup_writes_passes_check_in_every_mode() {
             &["localhost", "127.0.0.1", "farm.example"],
             false,
         );
-        pki.issue(&etc, "node", Row::Daemon, &["farm-1"], false);
         write(&etc.join("api-token"), "a-token-of-no-importance\n", 0o600);
         // A token of the right form: `--check` parses it and calls no frontend.
         let token = kbf_types::Token::new(
@@ -599,53 +539,21 @@ fn the_kbf_toml_that_setup_writes_passes_check_in_every_mode() {
         // are the operator's keys that `setup` leaves to the operator.
         let here = dir.display();
         let mut text = text;
-        if [names::DAEMON, names::STORAGE, names::STORAGE_AND_DAEMON].contains(&mode.name) {
-            text.push_str(&format!("\n[dirs]\nstate = \"{here}/state\"\n"));
-        }
-        if [names::STORAGE, names::STORAGE_AND_DAEMON].contains(&mode.name) {
+        if mode.name == names::STORAGE {
             text.push_str(&format!(
-                "\n[storage]\nhot_dir = \"{here}/hot\"\nmeta_dir = \"{here}/meta\"\n"
+                "\n[dirs]\nstate = \"{here}/state\"\n\n[storage]\nhot_dir = \"{here}/hot\"\nmeta_dir = \"{here}/meta\"\n"
             ));
-        }
-        let mut twice = None;
-        if [names::DAEMON, names::STORAGE_AND_DAEMON].contains(&mode.name) {
-            // `setup` writes a `[daemon]` table here (the update directories): the key goes into
-            // it, as the file's header says. A second table of the name is the operator's
-            // mistake, tried below.
-            let key = format!("data_dir = \"{here}/data\"\n");
-            let header = "[daemon]\n";
-            let at = text.find(header).expect("setup writes a [daemon] table") + header.len();
-            twice = Some(format!("{text}\n[daemon]\n{key}"));
-            text.insert_str(at, &key);
         }
         let file = dir.join("kbf.toml");
         write(&file, &text, 0o600);
-        if let Some(twice) = twice {
-            let second = dir.join("twice.toml");
-            write(&second, &twice, 0o600);
-            let args = vec![
-                format!("--mode={}", mode.name),
-                "--check".to_owned(),
-                format!("--config={}", second.display()),
-            ];
-            let r = run_in(&args, &host_env(&dir));
-            assert_eq!(r.code, Some(2), "{}: {}", mode.name, r.err);
-            assert!(r.err.contains("duplicate"), "{}: {}", mode.name, r.err);
-        }
-        let mut args = vec![
+        let args = vec![
             format!("--mode={}", mode.name),
             "--check".to_owned(),
             format!("--config={}", file.display()),
         ];
-        // The stand-in `crun` for the one mode that runs builds without enrolling; a daemon flag on
-        // the line of a node that enrolls would make it a node that does not.
-        if mode.name == names::ALL_IN_ONE {
-            args.push(format!("--oci-runtime={FAKE_CRUN}"));
-        }
-        let r = run_in(&args, &host_env(&dir));
+        let r = run(&args);
         assert_eq!(r.code, Some(0), "{}: {}\n{text}", mode.name, r.err);
-        let enrolls =
-            [names::DAEMON, names::STORAGE, names::STORAGE_AND_DAEMON].contains(&mode.name);
+        let enrolls = mode.name == names::STORAGE;
         // A node that enrolls says so instead of `ok`: the file is accepted, the host is not
         // enrolled yet.
         if enrolls {

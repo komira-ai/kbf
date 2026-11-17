@@ -1,5 +1,5 @@
 //! `kbf storage` as a separate process (docs/design/architecture-v2.md, section 13 P2):
-//! the REAPI conformance suite (`kbf-cas-conformance`) run by the daemon's transfer
+//! the REAPI conformance suite (`kbf-cas-conformance`) run by the transfer
 //! engine over real gRPC to a child process, and the storage client
 //! ([`kbf_storage::service::RemoteStorage`]) over the same connection. Nothing here is
 //! in-process: the store, its metadata log and its listener are the child's.
@@ -124,7 +124,7 @@ kbf_cas_conformance::tests!(Process::new());
 
 /// Catches a storage client that cannot talk to the process that serves it: blobs and
 /// the action cache over `RemoteStorage` against `kbf storage`, as the frontend will
-/// use them (the conformance suite above is the daemon's side).
+/// use them (the conformance suite above is the transfer engine's side).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_storage_client_reads_what_it_wrote_in_another_process() {
     let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "storage-client");

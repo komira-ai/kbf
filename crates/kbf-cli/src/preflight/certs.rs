@@ -26,14 +26,12 @@ impl Row {
         match self {
             Row::Frontend => PeerRole::Frontend,
             Row::Storage => PeerRole::Storage,
-            Row::Daemon => PeerRole::Daemon,
         }
     }
 
     fn ekus(self) -> &'static [&'static str] {
         match self {
             Row::Frontend | Row::Storage => &[SERVER_AUTH, CLIENT_AUTH],
-            Row::Daemon => &[CLIENT_AUTH],
         }
     }
 }
@@ -122,21 +120,6 @@ fn one(c: &CertNeed, host: &dyn Host, report: &mut Report) {
     let names = kbf_peer::names_of(&leaf)
         .map(|n| n.all())
         .unwrap_or_default();
-    if let Some(id) = &c.node_id
-        && names != [id.clone()]
-    {
-        let shown = if names.is_empty() {
-            "no DNS name or address".to_owned()
-        } else {
-            names.join(" ")
-        };
-        report.refuse(
-            format!("{flag} {at} names {shown}, not exactly the node id {id}"),
-            "the farm binds a daemon's certificate to its --node-id, the one name it speaks for",
-            format!("ask the farm's issuer for a certificate whose one DNS name is {id}"),
-        );
-    }
-
     if let Some((key_flag, key_path)) = &c.key {
         pair(c, (key_flag, key_path), &leaf, host, report);
     }

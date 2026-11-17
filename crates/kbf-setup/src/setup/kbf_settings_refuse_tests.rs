@@ -33,8 +33,7 @@ type Mutate = fn(&mut KbfFlags, &str);
 fn base(mode: Mode) -> KbfFlags {
     match mode {
         Mode::Frontend => frontend_flags(),
-        Mode::AllInOne => all_in_one_flags(),
-        _ => KbfFlags::default(),
+        Mode::Storage => KbfFlags::default(),
     }
 }
 
@@ -43,7 +42,7 @@ fn base(mode: Mode) -> KbfFlags {
 /// untouched (exit 2).
 #[test]
 fn every_invalid_setting_is_refused_by_flag_and_without_its_value() {
-    let cases: [(Mode, &str, Mutate, &str); 34] = [
+    let cases: [(Mode, &str, Mutate, &str); 16] = [
         (
             Mode::Frontend,
             "listen",
@@ -123,118 +122,10 @@ fn every_invalid_setting_is_refused_by_flag_and_without_its_value() {
             "SECRET-----BEGIN",
         ),
         (
-            Mode::Daemon,
-            "listen",
-            |k, v| k.listen = some(v),
-            "0.0.0.0:SECRET",
-        ),
-        (
             Mode::Storage,
             "reapi-tls-key",
             |k, v| k.reapi_tls_key = some(v),
             "/etc/kbf/SECRET.key",
-        ),
-        (
-            Mode::StorageAndDaemon,
-            "storage-url",
-            |k, v| k.storage_url = some(v),
-            "http://127.0.0.1:1/SECRET",
-        ),
-        (
-            Mode::AllInOne,
-            "storage-url",
-            |k, v| k.storage_url = some(v),
-            "http://127.0.0.1:8990",
-        ),
-        (
-            Mode::AllInOne,
-            "storage-client-key",
-            |k, v| k.storage_client_key = some(v),
-            "/etc/kbf/SECRET.key",
-        ),
-        (
-            Mode::Frontend,
-            "cold-store",
-            |k, v| k.cold_store = some(v),
-            "file:///var/lib/SECRET",
-        ),
-        (
-            Mode::Frontend,
-            "node-id",
-            |k, v| k.node_id = some(v),
-            "SECRET",
-        ),
-        (
-            Mode::AllInOne,
-            "cold-store",
-            |k, v| k.cold_store = some(v),
-            "s3://SECRET-bucket/prefix",
-        ),
-        (
-            Mode::AllInOne,
-            "cold-store",
-            |k, v| k.cold_store = some(v),
-            "file://SECRET/relative",
-        ),
-        (
-            Mode::AllInOne,
-            "cold-store",
-            |k, v| k.cold_store = some(v),
-            "/var/lib/SECRET",
-        ),
-        (
-            Mode::AllInOne,
-            "meta-dir",
-            |k, v| k.meta_dir = some(v),
-            "SECRET/relative",
-        ),
-        (
-            Mode::AllInOne,
-            "daemon-server",
-            |k, v| k.daemon_server = some(v),
-            "http://farm.example:8981/SECRET",
-        ),
-        (
-            Mode::AllInOne,
-            "daemon-server",
-            |k, v| k.daemon_server = some(v),
-            "https://u:SECRET@farm.example:8981",
-        ),
-        (
-            Mode::AllInOne,
-            "daemon-key",
-            |k, v| k.daemon_key = some(v),
-            "-----BEGIN-----SECRET",
-        ),
-        (
-            Mode::AllInOne,
-            "daemon-cert",
-            |k, v| k.daemon_cert = some(v),
-            "SECRET.pem",
-        ),
-        (
-            Mode::AllInOne,
-            "node-id",
-            |k, v| k.node_id = some(v),
-            "SECRET_Id",
-        ),
-        (
-            Mode::AllInOne,
-            "node-id",
-            |k, v| k.node_id = some(v),
-            "-secret",
-        ),
-        (
-            Mode::AllInOne,
-            "daemon-ca-cert",
-            |k, v| k.daemon_ca_cert = some(v),
-            "/etc/kbf/\"SECRET\".pem",
-        ),
-        (
-            Mode::AllInOne,
-            "node-id",
-            |k, v| k.node_id = some(v),
-            "farm-",
         ),
         (
             Mode::Frontend,
@@ -292,52 +183,18 @@ fn refusal_messages_name_the_mistake() {
 
 /// Catches a flag reaching a mode that must not have it: each setting of one mode, given to
 /// another, is refused with the flag, the sentence "does not take it" and the mode it is for
-/// (a frontend has no cold store, an all-in-one host proxies to no storage node and a node's
-/// listeners come from enrollment), so a Takes entry moved to the wrong mode fails here.
+/// (a node's listeners and certificates come from enrollment), so a setting moved to the wrong
+/// mode fails here.
 #[test]
 fn a_flag_of_another_mode_is_refused_naming_the_flag() {
     type Set = fn(&mut KbfFlags);
-    let cases: [(Mode, &str, Set); 15] = [
-        (Mode::AllInOne, "storage-url", |k| {
-            k.storage_url = some("http://127.0.0.1:1")
-        }),
-        (Mode::AllInOne, "storage-ca", |k| {
-            k.storage_ca = some("/etc/kbf/ca.pem")
-        }),
-        (Mode::AllInOne, "storage-client-cert", |k| {
-            k.storage_client_cert = some("/etc/kbf/worker.pem")
-        }),
-        (Mode::AllInOne, "storage-client-key", |k| {
-            k.storage_client_key = some("/etc/kbf/worker.key")
-        }),
-        (Mode::Frontend, "cold-store", |k| {
-            k.cold_store = some("file:///var/lib/kbf/cold")
-        }),
-        (Mode::Frontend, "meta-dir", |k| {
-            k.meta_dir = some("/var/lib/kbf-meta")
-        }),
-        (Mode::Frontend, "daemon-server", |k| {
-            k.daemon_server = some("https://farm.example:8981")
-        }),
-        (Mode::Frontend, "daemon-ca-cert", |k| {
-            k.daemon_ca_cert = some("/etc/kbf/ca.pem")
-        }),
-        (Mode::Frontend, "daemon-cert", |k| {
-            k.daemon_cert = some("/etc/kbf/node.pem")
-        }),
-        (Mode::Frontend, "daemon-key", |k| {
-            k.daemon_key = some("/etc/kbf/node.key")
-        }),
-        (Mode::Frontend, "node-id", |k| k.node_id = some("farm-1")),
-        (Mode::Daemon, "listen", |k| k.listen = some("0.0.0.0:8980")),
+    let cases: [(Mode, &str, Set); 3] = [
+        (Mode::Storage, "listen", |k| k.listen = some("0.0.0.0:8980")),
         (Mode::Storage, "worker-tls-cert", |k| {
             k.worker_tls_cert = some("/etc/kbf/worker.pem")
         }),
-        (Mode::StorageAndDaemon, "api-listen", |k| {
+        (Mode::Storage, "api-listen", |k| {
             k.api_listen = some("127.0.0.1:8982")
-        }),
-        (Mode::Daemon, "cold-store", |k| {
-            k.cold_store = some("file:///var/lib/kbf/cold")
         }),
     ];
     for (mode, flag, set) in cases {
@@ -392,41 +249,26 @@ fn plain_text_storage_is_for_loopback_only() {
 }
 
 /// Catches a host that cannot start being set up: each setting the mode cannot start without
-/// is required, named with the mode, and every missing one is said at once.
+/// is required, named with the mode.
 #[test]
 fn what_a_mode_cannot_start_without_is_required() {
-    type Clear = fn(&mut KbfFlags);
-    let frontend: [(&str, Clear); 1] = [("storage-url", |k| k.storage_url = None)];
-    let all: [(&str, Clear); 6] = [
-        ("cold-store", |k| k.cold_store = None),
-        ("meta-dir", |k| k.meta_dir = None),
-        ("daemon-server", |k| k.daemon_server = None),
-        ("daemon-ca-cert", |k| k.daemon_ca_cert = None),
-        ("daemon-cert", |k| k.daemon_cert = None),
-        ("daemon-key", |k| k.daemon_key = None),
-    ];
-    let mut cases: Vec<(Mode, &str, Clear)> = frontend
-        .iter()
-        .map(|(f, c)| (Mode::Frontend, *f, *c))
-        .collect();
-    cases.extend(all.iter().map(|(f, c)| (Mode::AllInOne, *f, *c)));
-    cases.push((Mode::AllInOne, "node-id", |k| k.node_id = None));
-    for (mode, flag, clear) in cases {
-        let mut flags = base(mode);
-        clear(&mut flags);
-        let (err, exec) = refused(mode, flags);
-        let want = format!("--{flag}: required for --mode=");
-        assert!(err.to_string().contains(&want), "{flag}: {err}");
-        assert_eq!(err.exit(), Exit::Usage);
-        assert!(exec.log.is_empty(), "{flag}");
-    }
-    // The seven it cannot start without, and no other: the listeners and certificates are
+    let mut flags = base(Mode::Frontend);
+    flags.storage_url = None;
+    let (err, exec) = refused(Mode::Frontend, flags);
+    assert!(
+        err.to_string()
+            .contains("--storage-url: required for --mode=frontend"),
+        "{err}"
+    );
+    assert_eq!(err.exit(), Exit::Usage);
+    assert!(exec.log.is_empty());
+    // The one it cannot start without, and no other: the listeners and certificates are
     // optional and the operator API address has its default.
-    let (err, _) = refused(Mode::AllInOne, KbfFlags::default());
+    let (err, _) = refused(Mode::Frontend, KbfFlags::default());
     let SetupError::Invalid(found) = &err else {
         panic!("{err:?}");
     };
-    assert_eq!(found.len(), 7, "{found:#?}");
+    assert_eq!(found.len(), 1, "{found:#?}");
 }
 
 /// Catches flags that only work together being accepted alone: a certificate without its
@@ -479,15 +321,14 @@ fn flags_that_come_together_are_refused_alone() {
 }
 
 /// Catches the edges of a value getting through: a path with a newline and no dashes, a path
-/// longer than 4096 bytes, an empty node id and one a byte too long, a URL with no host, an
+/// longer than 4096 bytes, a URL with no host, an
 /// empty host with a port, a port that is not a number or does not fit, and a file the host
 /// cannot look at; each is refused naming the flag, never the value.
 #[test]
 fn the_edges_of_a_value_are_refused() {
     let long_path = format!("/etc/kbf/{}", "a".repeat(5000));
-    let long_id = "a".repeat(64);
     type Set = fn(&mut KbfFlags, &str);
-    let cases: [(Mode, &str, Set, &str); 8] = [
+    let cases: [(Mode, &str, Set, &str); 6] = [
         (
             Mode::Frontend,
             "reapi-tls-cert",
@@ -499,13 +340,6 @@ fn the_edges_of_a_value_are_refused() {
             "reapi-tls-cert",
             |k, v| k.reapi_tls_cert = some(v),
             &long_path,
-        ),
-        (Mode::AllInOne, "node-id", |k, v| k.node_id = some(v), ""),
-        (
-            Mode::AllInOne,
-            "node-id",
-            |k, v| k.node_id = some(v),
-            &long_id,
         ),
         (
             Mode::Frontend,

@@ -301,7 +301,7 @@ fn the_flag_takes_the_recipe_url_and_refuses_what_it_cannot_make() {
     ));
     assert!(at_limit.validate(Platform::Linux).is_ok());
 
-    let mut r = raw(Mode::Daemon);
+    let mut r = raw(Mode::Storage);
     r.create_local_database = true;
     let why = r
         .validate(Platform::Linux)
@@ -311,7 +311,7 @@ fn the_flag_takes_the_recipe_url_and_refuses_what_it_cannot_make() {
         why.contains("--create-local-database is for the modes"),
         "{why}"
     );
-    let mut r = raw(Mode::Daemon);
+    let mut r = raw(Mode::Storage);
     r.database = Some(URL.to_owned());
     r.create_local_database = true;
     let why = r
@@ -552,7 +552,7 @@ const DRY: Options = Options {
 /// Catches the tool's own words reaching the operator, and every way the superuser cannot be
 /// reached being worded alike: a `psql` that exits non-zero (its stderr names the role, the
 /// database and the socket), one that cannot be started, a host with no `postgres` account
-/// and a Mac are each a refusal with the cause in setup's own words and none of the names.
+/// are each a refusal with the cause in setup's own words and none of the names.
 ///
 /// Catches: stderr appended to the refusal; the account check removed.
 #[test]
@@ -624,21 +624,6 @@ fn a_psql_killed_by_a_signal_is_refused_with_no_exit_code() {
         "{text}"
     );
     no_names(&text);
-}
-
-/// Catches `--create-local-database` on a Mac, which has no `postgres` account to switch to
-/// and no `/usr/bin/psql`: a usage error, before anything is asked.
-#[test]
-fn the_flag_is_for_linux() {
-    let world = Shared::default();
-    let mut exec = released(host(), Platform::MacOs);
-    let w = Rc::clone(&world);
-    exec.answer = Box::new(move |cmd| psql_answer(&w, cmd));
-    let os = FakeOs::mac();
-    let out = go_on(&os, &mut exec, &Server::fresh(), &flags(), APPLY);
-    let err = out.expect_err("refused");
-    assert_eq!(err.exit(), Exit::Usage, "{err}");
-    assert!(world.borrow().ran.is_empty());
 }
 
 /// Catches a failed creation leaking the server's words (`role "..." already exists`) and
@@ -721,11 +706,6 @@ fn each_refused_login_has_its_recipe_and_names_nothing() {
     );
     assert!(text.contains("above the first `local` line"), "{text}");
     assert!(text.contains("reload the server (not restart)"), "{text}");
-    // All-in-one runs as `kbf`, and the recipe maps that account.
-    let mut aio = raw(Mode::AllInOne);
-    aio.database = Some(URL.to_owned());
-    let (_, out) = setup_on(&Shared::default(), &server, &aio, APPLY);
-    assert!(refusal(out).contains("`kbf  kbf  <role>`"));
 }
 
 /// Catches an ident map that admits root and not the service: setup's own login works and the
@@ -959,21 +939,6 @@ fn both_schemes_give_the_same_settings_and_no_ident_map_name_is_read() {
 }
 
 // ---- what is left to the unit ----------------------------------------------------------------
-
-/// Catches the flag's own platform check being dropped: `provision` itself refuses a Mac, as
-/// a usage error and before it asks anything, whatever the plan did before it.
-///
-/// Catches: the platform check removed.
-#[test]
-fn provision_refuses_a_mac_by_itself() {
-    let world = Shared::default();
-    let mut exec = exec_on(&world);
-    let mut out = Vec::new();
-    let err = provision::provision(&FakeOs::mac(), &mut exec, &local(), true, &mut out)
-        .expect_err("refused");
-    assert_eq!(err.exit(), Exit::Usage, "{err}");
-    assert!(world.borrow().ran.is_empty());
-}
 
 /// Catches a port in the URL being dropped on the way to psql: provisioning would go to the
 /// default port while the login check uses the URL's.

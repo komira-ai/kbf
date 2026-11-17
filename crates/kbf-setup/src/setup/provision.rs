@@ -30,7 +30,6 @@ use super::os::Os;
 use super::plan::service_user_name;
 use super::validate::LocalDatabase;
 use crate::cli::Mode;
-use crate::layout::Platform;
 
 /// The Postgres client, where the distributions put it (a wrapper that picks the server's
 /// version on Debian).
@@ -332,7 +331,7 @@ pub enum Next {
 /// carries them out). [`Next::Schema`] means both were there and nothing was done.
 ///
 /// # Errors
-/// [`SetupError`]: this is not a Linux host with a `postgres` account, the server cannot be
+/// [`SetupError`]: this host has no `postgres` account, the server cannot be
 /// asked, it holds something setup will not alter, or a creation failed.
 pub fn provision(
     os: &dyn Os,
@@ -341,11 +340,6 @@ pub fn provision(
     apply: bool,
     out: &mut dyn Write,
 ) -> Result<Next, SetupError> {
-    if os.platform() != Platform::Linux {
-        return Err(SetupError::Unsupported(
-            "making the state database (--create-local-database, and the default of a host that gives no --database) is for a Linux host: it runs psql as the `postgres` account the distribution's package makes".to_owned(),
-        ));
-    }
     let Some(superuser) = os.user(SUPERUSER)? else {
         return Err(SetupError::NeedsOperator(format!(
             "setup makes the state database with psql run as the operating-system user `{SUPERUSER}`, and this host has none: install the Postgres server ({}), or create the role and database by hand and pass --database without --create-local-database ({DOCS})",

@@ -1,5 +1,5 @@
 //! The self-checks against a planted host: one fault per test, so each test names the
-//! check that would catch it. `daemon_needs` and `Fake::healthy` are a daemon that
+//! check that would catch it. `storage_needs` and `Fake::healthy` are a storage node that
 //! passes everything; a test breaks one thing and expects exactly one problem.
 
 use std::collections::BTreeMap;
@@ -9,17 +9,15 @@ use std::time::SystemTime;
 
 use rcgen::{ExtendedKeyUsagePurpose as Eku, KeyUsagePurpose, SanType};
 
-use super::host::{Kind, Lstat, Output, Stat};
+use super::host::{Kind, Lstat, Stat};
 use super::{
-    CertNeed, Class, ContainerNeed, FileNeed, Host, KeyRule, NOT_READY, Needs, REFUSED, Report,
-    Row, check,
+    CertNeed, Class, FileNeed, Host, KeyRule, NOT_READY, Needs, REFUSED, Report, Row, check,
 };
 
 pub(super) const ME: u32 = 1000;
 const CA: &str = "/etc/kbf/ca.pem";
 const CERT: &str = "/etc/kbf/node.pem";
 const KEY: &str = "/etc/kbf/node.key";
-const CRUN: &str = "/usr/bin/crun";
 
 // ---- a planted host -------------------------------------------------------------------
 
@@ -34,7 +32,6 @@ pub(super) struct Fake {
     egid: u32,
     groups: Vec<u32>,
     nofile: u64,
-    programs: BTreeMap<PathBuf, Result<(bool, String), io::ErrorKind>>,
 }
 
 impl Fake {
@@ -49,7 +46,6 @@ impl Fake {
             egid: ME,
             groups: vec![ME],
             nofile: 1 << 20,
-            programs: BTreeMap::new(),
         }
     }
 
@@ -101,20 +97,13 @@ impl Fake {
         self
     }
 
-    /// A host a daemon with the container driver passes on: its certificate files and
-    /// crun.
+    /// A host a storage node passes on: its certificate files.
     fn healthy(cert_pem: &str, key_pem: &str, ca_pem: &str) -> Self {
-        let mut f = Self::empty()
+        Self::empty()
             .file(CA, 0o644, ca_pem.as_bytes())
             .file(CERT, 0o644, cert_pem.as_bytes())
             .file(KEY, 0o600, key_pem.as_bytes())
-            .file(CRUN, 0o755, b"")
-            .var("PATH", "/usr/local/bin:/usr/bin");
-        f.programs.insert(
-            PathBuf::from(CRUN),
-            Ok((true, "crun version 1.14.1\ncommit: abc\n".to_owned())),
-        );
-        f
+            .var("PATH", "/usr/local/bin:/usr/bin")
     }
 }
 
@@ -150,10 +139,6 @@ impl Host for Fake {
         self.vars.get(name).cloned()
     }
 
-    fn var_names(&self) -> Vec<String> {
-        self.vars.keys().cloned().collect()
-    }
-
     fn euid(&self) -> u32 {
         self.euid
     }
@@ -168,17 +153,6 @@ impl Host for Fake {
 
     fn nofile(&self) -> u64 {
         self.nofile
-    }
-
-    fn run(&self, program: &Path, _: &[&str]) -> io::Result<Output> {
-        match self.programs.get(program) {
-            Some(Ok((success, stdout))) => Ok(Output {
-                success: *success,
-                stdout: stdout.clone(),
-            }),
-            Some(Err(kind)) => Err(io::Error::from(*kind)),
-            None => Err(io::Error::from(io::ErrorKind::NotFound)),
-        }
     }
 
     fn now(&self) -> SystemTime {
@@ -212,12 +186,12 @@ struct Leaf {
 }
 
 impl Leaf {
-    /// The daemon's row: role daemon, clientAuth, the one name `node-1`.
-    fn daemon() -> Self {
+    /// The storage row: role storage, serverAuth and clientAuth, the one name `node-1`.
+    fn storage() -> Self {
         Self {
-            role: Some("daemon"),
+            role: Some("storage"),
             more_roles: vec![],
-            ekus: vec![Eku::ClientAuth],
+            ekus: vec![Eku::ServerAuth, Eku::ClientAuth],
             dns: vec!["node-1"],
             validity: None,
         }
@@ -248,23 +222,11 @@ impl Leaf {
     }
 }
 
-/// The flags of a daemon that runs containers, with every file it names.
-pub(super) const DAEMON: [&str; 8] = [
-    "--server=https://front:7070",
-    "--ca-cert=/c/ca.pem",
-    "--cert=/c/node.pem",
-    "--key=/c/node.key",
-    "--node-id=node-1",
-    "--driver=container",
-    "--oci-runtime=/opt/crun",
-    "--data-dir=/var/lib/kbf",
-];
-
 /// [`needs_from`] for a start that loads the settings file `config`.
 pub(super) fn needs_from_in(args: &[&str], config: &str) -> Needs {
     let argv = std::iter::once("kbf").chain(args.iter().copied());
     super::needs_in(
-        &crate::parse_internal(argv).expect("flags parse"),
+        &crate::parse_from(argv).expect("flags parse"),
         Path::new(config),
     )
 }
@@ -272,10 +234,10 @@ pub(super) fn needs_from_in(args: &[&str], config: &str) -> Needs {
 /// The needs of `kbf` run with `args`: from the flags to the checks, as a start goes.
 pub(super) fn needs_from(args: &[&str]) -> Needs {
     let argv = std::iter::once("kbf").chain(args.iter().copied());
-    super::needs(&crate::parse_internal(argv).expect("flags parse"))
+    super::needs(&crate::parse_from(argv).expect("flags parse"))
 }
 
-// ---- the needs of a daemon ----------------------------------------------------------------
+// ---- the needs of a storage node ----------------------------------------------------------------
 
 fn file(flag: &'static str, path: &str, secret: bool) -> FileNeed {
     FileNeed {
@@ -286,36 +248,31 @@ fn file(flag: &'static str, path: &str, secret: bool) -> FileNeed {
     }
 }
 
-fn daemon_needs() -> Needs {
+fn storage_needs() -> Needs {
     Needs {
-        mode: "daemon",
+        mode: "storage",
         files: vec![
-            file("--ca-cert", CA, false),
-            file("--cert", CERT, false),
-            file("--key", KEY, true),
+            file("--storage-client-ca", CA, false),
+            file("--storage-tls-cert", CERT, false),
+            file("--storage-tls-key", KEY, true),
         ],
         certs: vec![CertNeed {
-            flag: "--cert",
+            flag: "--storage-tls-cert",
             path: PathBuf::from(CERT),
-            row: Row::Daemon,
-            key: Some(("--key", PathBuf::from(KEY))),
-            ca: Some(("--ca-cert", PathBuf::from(CA))),
-            node_id: Some("node-1".to_owned()),
+            row: Row::Storage,
+            key: Some(("--storage-tls-key", PathBuf::from(KEY))),
+            ca: Some(("--storage-client-ca", PathBuf::from(CA))),
         }],
         s3: false,
-        container: Some(ContainerNeed {
-            oci_runtime: PathBuf::from(CRUN),
-        }),
         hot_store: None,
-        cpuset: false,
         key: KeyRule::None,
     }
 }
 
 fn healthy() -> (Needs, Fake) {
     let ca = ca();
-    let (cert, key) = Leaf::daemon().issue(&ca);
-    (daemon_needs(), Fake::healthy(&cert, &key, &ca.pem()))
+    let (cert, key) = Leaf::storage().issue(&ca);
+    (storage_needs(), Fake::healthy(&cert, &key, &ca.pem()))
 }
 
 /// The one problem `report` holds, which must say each of `words`.
@@ -323,7 +280,7 @@ fn only(report: &Report, class: Class, words: &[&str]) {
     assert_eq!(report.problems.len(), 1, "{report:#?}");
     let p = &report.problems[0];
     assert_eq!(p.class, class, "{p:?}");
-    let line = report.render("daemon");
+    let line = report.render("storage");
     for w in words {
         assert!(line.contains(w), "{w:?} not in {line}");
     }
@@ -334,12 +291,12 @@ fn only(report: &Report, class: Class, words: &[&str]) {
 }
 
 #[test]
-fn a_healthy_daemon_passes_with_nothing_printed() {
+fn a_healthy_storage_node_passes_with_nothing_printed() {
     let (needs, host) = healthy();
     let report = check(&needs, &host);
     assert_eq!(report, Report::default());
     assert_eq!(report.exit_status(), None);
-    assert_eq!(report.render("daemon"), "");
+    assert_eq!(report.render("storage"), "");
 }
 
 // ---- files and secrets --------------------------------------------------------------------
@@ -353,7 +310,7 @@ fn a_missing_file_is_refused_naming_the_flag_the_path_and_the_fix() {
     only(
         &report,
         Class::Refused,
-        &["--ca-cert", CA, "does not exist"],
+        &["--storage-client-ca", CA, "does not exist"],
     );
     assert_eq!(report.exit_status(), Some(REFUSED));
 }
@@ -365,7 +322,7 @@ fn a_directory_where_a_file_belongs_is_refused() {
     only(
         &check(&needs, &host),
         Class::Refused,
-        &["--cert", CERT, "not a regular file"],
+        &["--storage-tls-cert", CERT, "not a regular file"],
     );
 }
 
@@ -376,7 +333,7 @@ fn a_key_group_readable_is_refused_with_the_chmod_that_fixes_it() {
     only(
         &check(&needs, &host),
         Class::Refused,
-        &["--key", KEY, "0640", "chmod 600"],
+        &["--storage-tls-key", KEY, "0640", "chmod 600"],
     );
 }
 
@@ -442,7 +399,11 @@ fn a_file_that_cannot_be_statted_for_permission_is_refused() {
 #[test]
 fn a_certificate_ca_or_key_that_stats_but_cannot_be_read_is_refused() {
     // A root-owned 0600 file after a root-run renewal: stat answers, read does not.
-    for (path, flag) in [(CERT, "--cert"), (CA, "--ca-cert"), (KEY, "--key")] {
+    for (path, flag) in [
+        (CERT, "--storage-tls-cert"),
+        (CA, "--storage-client-ca"),
+        (KEY, "--storage-tls-key"),
+    ] {
         let (needs, mut host) = healthy();
         host.read_errors
             .insert(PathBuf::from(path), io::ErrorKind::PermissionDenied);
@@ -459,7 +420,11 @@ fn an_unreadable_file_on_a_busy_file_system_is_not_ready() {
     let (needs, mut host) = healthy();
     host.read_errors
         .insert(PathBuf::from(CERT), io::ErrorKind::TimedOut);
-    only(&check(&needs, &host), Class::NotReady, &["--cert", CERT]);
+    only(
+        &check(&needs, &host),
+        Class::NotReady,
+        &["--storage-tls-cert", CERT],
+    );
 }
 
 #[test]
@@ -470,7 +435,7 @@ fn a_secret_the_owner_cannot_read_is_refused_once() {
         only(
             &check(&needs, &host),
             Class::Refused,
-            &["--key", KEY, "cannot read", "chmod 600"],
+            &["--storage-tls-key", KEY, "cannot read", "chmod 600"],
         );
     }
 }
@@ -486,44 +451,37 @@ fn with_cert(leaf: &Leaf) -> (Needs, Fake) {
 
 #[test]
 fn a_certificate_of_another_role_is_refused() {
-    let mut leaf = Leaf::daemon();
-    leaf.role = Some("storage");
+    let mut leaf = Leaf::storage();
+    leaf.role = Some("frontend");
     let (needs, host) = with_cert(&leaf);
     only(
         &check(&needs, &host),
         Class::Refused,
-        &["--cert", "urn:kbf:role:storage", "urn:kbf:role:daemon"],
+        &[
+            "--storage-tls-cert",
+            "urn:kbf:role:frontend",
+            "urn:kbf:role:storage",
+        ],
     );
 }
 
 #[test]
 fn a_certificate_without_a_role_is_refused() {
-    let mut leaf = Leaf::daemon();
+    let mut leaf = Leaf::storage();
     leaf.role = None;
     let (needs, host) = with_cert(&leaf);
     only(
         &check(&needs, &host),
         Class::Refused,
-        &["names no role", "urn:kbf:role:daemon"],
-    );
-}
-
-#[test]
-fn a_daemon_certificate_that_also_serves_is_refused_for_its_key_usage() {
-    let mut leaf = Leaf::daemon();
-    leaf.ekus = vec![Eku::ServerAuth, Eku::ClientAuth];
-    let (needs, host) = with_cert(&leaf);
-    only(
-        &check(&needs, &host),
-        Class::Refused,
-        &["serverAuth,clientAuth", "not clientAuth"],
+        &["names no role", "urn:kbf:role:storage"],
     );
 }
 
 #[test]
 fn a_certificate_with_an_unnamed_key_usage_is_refused_showing_its_oid() {
-    let mut leaf = Leaf::daemon();
+    let mut leaf = Leaf::storage();
     leaf.ekus = vec![
+        Eku::ServerAuth,
         Eku::ClientAuth,
         Eku::Other(vec![1, 3, 6, 1, 4, 1, 99999, 1]),
     ];
@@ -531,13 +489,16 @@ fn a_certificate_with_an_unnamed_key_usage_is_refused_showing_its_oid() {
     only(
         &check(&needs, &host),
         Class::Refused,
-        &["clientAuth,1.3.6.1.4.1.99999.1", "not clientAuth"],
+        &[
+            "serverAuth,clientAuth,1.3.6.1.4.1.99999.1",
+            "not serverAuth,clientAuth",
+        ],
     );
 }
 
 #[test]
 fn a_certificate_without_key_usage_is_refused() {
-    let mut leaf = Leaf::daemon();
+    let mut leaf = Leaf::storage();
     leaf.ekus = vec![];
     let (needs, host) = with_cert(&leaf);
     only(
@@ -557,10 +518,7 @@ fn a_storage_certificate_must_carry_both_server_and_client_auth() {
         dns: vec!["store.farm.example"],
         validity: None,
     };
-    let mut needs = daemon_needs();
-    needs.mode = "storage";
-    needs.certs[0].row = Row::Storage;
-    needs.certs[0].node_id = None;
+    let needs = storage_needs();
     let (cert, key) = leaf.issue(&ca);
     let host = Fake::healthy(&cert, &key, &ca.pem());
     assert_eq!(check(&needs, &host), Report::default());
@@ -575,54 +533,43 @@ fn a_storage_certificate_must_carry_both_server_and_client_auth() {
 }
 
 #[test]
-fn a_daemon_certificate_that_names_another_node_is_refused() {
-    let mut leaf = Leaf::daemon();
-    leaf.dns = vec!["node-2"];
-    let (needs, host) = with_cert(&leaf);
-    only(
-        &check(&needs, &host),
-        Class::Refused,
-        &["node-2", "node-1", "--node-id"],
-    );
-}
-
-#[test]
-fn a_daemon_certificate_that_names_more_than_its_node_is_refused() {
-    let mut leaf = Leaf::daemon();
-    leaf.dns = vec!["node-1", "node-2"];
-    let (needs, host) = with_cert(&leaf);
-    only(
-        &check(&needs, &host),
-        Class::Refused,
-        &["node-1 node-2", "exactly"],
-    );
-}
-
-#[test]
 fn a_certificate_from_another_ca_is_refused() {
-    let leaf = Leaf::daemon();
+    let leaf = Leaf::storage();
     let other = ca();
     let (needs, host) = healthy();
     let (cert, key) = leaf.issue(&other);
     let host = host
         .file(CERT, 0o644, cert.as_bytes())
         .file(KEY, 0o600, key.as_bytes());
-    only(
-        &check(&needs, &host),
-        Class::Refused,
-        &["--cert", "--ca-cert", "does not chain"],
-    );
+    // The storage row is both a server and a client: the chain is refused for each use.
+    let report = check(&needs, &host);
+    assert_eq!(report.problems.len(), 2, "{report:#?}");
+    for (p, usage) in report.problems.iter().zip(["serverAuth", "clientAuth"]) {
+        assert_eq!(p.class, Class::Refused, "{p:?}");
+        for word in [
+            "--storage-tls-cert",
+            "--storage-client-ca",
+            "does not chain",
+            usage,
+        ] {
+            assert!(p.what.contains(word), "{word:?} not in {p:?}");
+        }
+    }
 }
 
 #[test]
 fn a_key_that_is_not_the_certificates_is_refused_naming_both_flags() {
     let (needs, host) = healthy();
-    let other = Leaf::daemon().issue(&ca()).1;
+    let other = Leaf::storage().issue(&ca()).1;
     let host = host.file(KEY, 0o600, other.as_bytes());
     only(
         &check(&needs, &host),
         Class::Refused,
-        &["--key", "--cert", "is not the private key"],
+        &[
+            "--storage-tls-key",
+            "--storage-tls-cert",
+            "is not the private key",
+        ],
     );
 }
 
@@ -633,7 +580,7 @@ fn a_key_file_that_is_not_pem_is_refused() {
     only(
         &check(&needs, &host),
         Class::Refused,
-        &["--key", "no PEM private key"],
+        &["--storage-tls-key", "no PEM private key"],
     );
 }
 
@@ -645,7 +592,7 @@ fn a_pem_private_key_of_a_kind_tls_cannot_sign_with_is_refused() {
     only(
         &check(&needs, &host),
         Class::Refused,
-        &["--key", "cannot sign with"],
+        &["--storage-tls-key", "cannot sign with"],
     );
 }
 
@@ -664,7 +611,7 @@ fn a_certificate_with_garbage_in_it_is_refused() {
     only(
         &check(&needs, &host),
         Class::Refused,
-        &["--cert", "no certificate"],
+        &["--storage-tls-cert", "no certificate"],
     );
 }
 
@@ -672,7 +619,7 @@ fn a_certificate_with_garbage_in_it_is_refused() {
 fn an_expired_certificate_warns_and_does_not_stop_the_start() {
     // The first load of an expired certificate starts on purpose (kbf-tls reloads the
     // renewed one); the self-check says so out loud instead.
-    let mut leaf = Leaf::daemon();
+    let mut leaf = Leaf::storage();
     leaf.validity = Some(((2020, 1, 1), (2021, 1, 1)));
     let (needs, host) = with_cert(&leaf);
     let report = check(&needs, &host);
@@ -680,13 +627,17 @@ fn an_expired_certificate_warns_and_does_not_stop_the_start() {
     assert_eq!(report.exit_status(), None);
     assert_eq!(report.warnings.len(), 1, "{report:#?}");
     assert!(report.warnings[0].contains("expired"), "{report:#?}");
-    assert!(report.render("daemon").starts_with("kbf daemon: warning: "));
+    assert!(
+        report
+            .render("storage")
+            .starts_with("kbf storage: warning: ")
+    );
 }
 
 #[test]
 fn a_certificate_not_yet_valid_is_not_ready() {
     // A clock behind the issuer's heals; a restart may succeed.
-    let mut leaf = Leaf::daemon();
+    let mut leaf = Leaf::storage();
     leaf.validity = Some(((3000, 1, 1), (3001, 1, 1)));
     let (needs, host) = with_cert(&leaf);
     let report = check(&needs, &host);
@@ -696,8 +647,8 @@ fn a_certificate_not_yet_valid_is_not_ready() {
 
 #[test]
 fn a_certificate_without_a_ca_to_chain_to_is_checked_for_role_and_key_usage_only() {
-    let mut leaf = Leaf::daemon();
-    leaf.role = Some("storage");
+    let mut leaf = Leaf::storage();
+    leaf.role = Some("frontend");
     let other = ca();
     let (mut needs, host) = healthy();
     needs.certs[0].ca = None;
@@ -708,7 +659,7 @@ fn a_certificate_without_a_ca_to_chain_to_is_checked_for_role_and_key_usage_only
     only(
         &check(&needs, &host),
         Class::Refused,
-        &["urn:kbf:role:storage"],
+        &["urn:kbf:role:frontend"],
     );
 }
 
@@ -720,31 +671,19 @@ fn a_certificate_block_that_is_not_a_certificate_is_refused_once() {
     only(
         &check(&needs, &host),
         Class::Refused,
-        &["--cert", "does not parse as a certificate"],
+        &["--storage-tls-cert", "does not parse as a certificate"],
     );
 }
 
 #[test]
 fn a_certificate_naming_two_roles_is_refused() {
-    let mut leaf = Leaf::daemon();
-    leaf.more_roles = vec!["storage"];
+    let mut leaf = Leaf::storage();
+    leaf.more_roles = vec!["frontend"];
     let (needs, host) = with_cert(&leaf);
     only(
         &check(&needs, &host),
         Class::Refused,
-        &["--cert", CERT, "role"],
-    );
-}
-
-#[test]
-fn a_daemon_certificate_with_no_name_is_refused_for_the_node_id() {
-    let mut leaf = Leaf::daemon();
-    leaf.dns = vec![];
-    let (needs, host) = with_cert(&leaf);
-    only(
-        &check(&needs, &host),
-        Class::Refused,
-        &["no DNS name or address", "node-1"],
+        &["--storage-tls-cert", CERT, "role"],
     );
 }
 
@@ -758,15 +697,17 @@ fn a_serving_certificate_with_no_name_is_refused_as_a_server_certificate() {
         dns: vec![],
         validity: None,
     };
-    let mut needs = daemon_needs();
-    needs.certs[0].row = Row::Storage;
-    needs.certs[0].node_id = None;
+    let needs = storage_needs();
     let (cert, key) = leaf.issue(&ca);
     let host = Fake::healthy(&cert, &key, &ca.pem());
     only(
         &check(&needs, &host),
         Class::Refused,
-        &["--cert", "names no DNS name or address", "no TLS client"],
+        &[
+            "--storage-tls-cert",
+            "names no DNS name or address",
+            "no TLS client",
+        ],
     );
 }
 
@@ -777,7 +718,7 @@ fn a_ca_file_with_no_certificate_in_it_is_refused() {
     only(
         &check(&needs, &host),
         Class::Refused,
-        &["--ca-cert", CA, "no usable CA certificate"],
+        &["--storage-client-ca", CA, "no usable CA certificate"],
     );
 }
 
@@ -789,9 +730,7 @@ fn s3_needs() -> Needs {
         files: vec![],
         certs: vec![],
         s3: true,
-        container: None,
         hot_store: None,
-        cpuset: false,
         key: KeyRule::None,
     }
 }
@@ -831,142 +770,6 @@ fn no_s3_cold_store_needs_no_key_pair() {
     assert_eq!(check(&needs, &Fake::empty()), Report::default());
 }
 
-fn container_needs() -> Needs {
-    let mut needs = s3_needs();
-    needs.s3 = false;
-    needs.container = Some(ContainerNeed {
-        oci_runtime: PathBuf::from(CRUN),
-    });
-    needs
-}
-
-fn container_host() -> Fake {
-    let (_, host) = healthy();
-    host
-}
-
-#[test]
-fn a_crun_that_is_not_there_is_refused() {
-    let host = container_host().without(CRUN);
-    only(
-        &check(&container_needs(), &host),
-        Class::Refused,
-        &[CRUN, "--oci-runtime", "install"],
-    );
-}
-
-#[test]
-fn a_crun_without_the_execute_bit_is_refused() {
-    let host = container_host().file(CRUN, 0o644, b"");
-    only(
-        &check(&container_needs(), &host),
-        Class::Refused,
-        &[CRUN, "chmod +x"],
-    );
-}
-
-#[test]
-fn a_crun_that_will_not_report_its_version_is_refused() {
-    let mut host = container_host();
-    host.programs
-        .insert(PathBuf::from(CRUN), Err(io::ErrorKind::PermissionDenied));
-    only(
-        &check(&container_needs(), &host),
-        Class::Refused,
-        &[CRUN, "--version"],
-    );
-    let mut host = container_host();
-    host.programs
-        .insert(PathBuf::from(CRUN), Ok((false, String::new())));
-    only(
-        &check(&container_needs(), &host),
-        Class::Refused,
-        &[CRUN, "--version"],
-    );
-}
-
-#[test]
-fn a_crun_older_than_the_minimum_is_refused_naming_both_versions() {
-    for old in [
-        "crun version 1.13.9\n",
-        "crun version 0.9\n",
-        "crun version 1.8.4\n",
-    ] {
-        let mut host = container_host();
-        host.programs
-            .insert(PathBuf::from(CRUN), Ok((true, old.to_owned())));
-        only(&check(&container_needs(), &host), Class::Refused, &["1.14"]);
-    }
-}
-
-#[test]
-fn a_crun_at_or_above_the_minimum_passes() {
-    for good in [
-        "crun version 1.14\n",
-        "crun version 1.14.1\ncommit: x\n",
-        "crun version 1.20.0\n",
-        "crun version 2.0.1\n",
-    ] {
-        let mut host = container_host();
-        host.programs
-            .insert(PathBuf::from(CRUN), Ok((true, good.to_owned())));
-        assert_eq!(
-            check(&container_needs(), &host),
-            Report::default(),
-            "{good}"
-        );
-    }
-}
-
-#[test]
-fn a_crun_whose_version_cannot_be_read_is_refused() {
-    let mut host = container_host();
-    host.programs
-        .insert(PathBuf::from(CRUN), Ok((true, "hello\n".to_owned())));
-    only(
-        &check(&container_needs(), &host),
-        Class::Refused,
-        &["hello"],
-    );
-}
-
-#[test]
-fn a_crun_host_needs_neither_podman_nor_a_runtime_directory() {
-    // Catches: a self-check that still asks for the programs and directory of the
-    // runtime kbf no longer has (`podman` on PATH, a user runtime directory with linger),
-    // refusing every start on a host that has only crun.
-    let host = container_host();
-    assert!(!host.files.contains_key(Path::new("/usr/bin/podman")));
-    assert!(!host.vars.contains_key("XDG_RUNTIME_DIR"));
-    assert_eq!(check(&container_needs(), &host), Report::default());
-}
-
-#[test]
-fn a_crun_that_cannot_be_statted_is_classed_by_the_error() {
-    for (kind, class) in [
-        (io::ErrorKind::PermissionDenied, Class::Refused),
-        (io::ErrorKind::TimedOut, Class::NotReady),
-    ] {
-        let mut host = container_host();
-        host.stat_errors.insert(PathBuf::from(CRUN), kind);
-        only(
-            &check(&container_needs(), &host),
-            class,
-            &[CRUN, "(--oci-runtime) cannot be read"],
-        );
-    }
-}
-
-#[test]
-fn a_crun_that_is_a_directory_is_refused() {
-    let host = container_host().put(CRUN, Kind::Dir, ME, 0o755, b"");
-    only(
-        &check(&container_needs(), &host),
-        Class::Refused,
-        &[CRUN, "not a regular file"],
-    );
-}
-
 #[test]
 fn a_low_open_file_limit_warns_with_the_number_and_does_not_stop_the_start() {
     let mut host = Fake::empty();
@@ -1000,21 +803,20 @@ fn s3_needs_without_s3() -> Needs {
 fn every_failure_is_reported_together_one_line_each_and_the_start_is_refused() {
     let (mut needs, host) = healthy();
     needs.s3 = true;
-    let host = host.chmod(KEY, ME, 0o644).without(CA).without(CRUN);
+    let host = host.chmod(KEY, ME, 0o644).without(CA);
     let report = check(&needs, &host);
-    let text = report.render("daemon");
-    // The CA file, the key's mode, the S3 pair (2), crun.
-    assert_eq!(report.problems.len(), 5, "{text}");
-    assert_eq!(text.lines().count(), 5, "{text}");
+    let text = report.render("storage");
+    // The CA file, the key's mode, the S3 pair (2).
+    assert_eq!(report.problems.len(), 4, "{text}");
+    assert_eq!(text.lines().count(), 4, "{text}");
     for line in text.lines() {
-        assert!(line.starts_with("kbf daemon: "), "{line}");
+        assert!(line.starts_with("kbf storage: "), "{line}");
     }
     for word in [
-        "--ca-cert",
+        "--storage-client-ca",
         "0644",
         "AWS_ACCESS_KEY_ID",
         "AWS_SECRET_ACCESS_KEY",
-        CRUN,
     ] {
         assert!(text.contains(word), "{word} not in {text}");
     }
@@ -1090,9 +892,9 @@ mod system {
         );
     }
 
-    /// Catches the process's ids and environment names read from anywhere but the process.
+    /// Catches the process's ids read from anywhere but the process.
     #[test]
-    fn the_process_ids_and_environment_are_the_process_own() {
+    fn the_process_ids_are_the_process_own() {
         assert_eq!(System.euid(), rustix::process::geteuid().as_raw());
         assert_eq!(System.egid(), rustix::process::getegid().as_raw());
         let groups: Vec<u32> = rustix::process::getgroups()
@@ -1101,22 +903,6 @@ mod system {
             .map(|g| g.as_raw())
             .collect();
         assert_eq!(System.groups(), groups);
-        assert!(System.var_names().iter().any(|n| n == "PATH"));
-    }
-
-    #[test]
-    fn run_collects_stdout_and_the_exit_status() {
-        let ok = System.run(Path::new("/bin/echo"), &["hi"]).expect("runs");
-        assert!(ok.success);
-        assert_eq!(ok.stdout, "hi\n");
-        let bad = System.run(Path::new("/bin/false"), &[]).expect("runs");
-        assert!(!bad.success);
-        assert_eq!(bad.stdout, "");
-        let gone = System.run(Path::new("/no/such/program"), &[]);
-        assert_eq!(
-            gone.expect_err("absent").kind(),
-            std::io::ErrorKind::NotFound
-        );
     }
 }
 
@@ -1125,15 +911,10 @@ mod wiring {
 
     use super::super::{CertNeed, Needs};
     use super::super::{Row, needs};
-    use super::DAEMON;
 
     fn parse(args: &[&str]) -> Needs {
         let argv = std::iter::once("kbf").chain(args.iter().copied());
-        needs(&crate::parse_internal(argv).expect("flags parse"))
-    }
-
-    fn flags_of(n: &Needs) -> Vec<(&'static str, bool)> {
-        n.files.iter().map(|f| (f.flag, f.secret)).collect()
+        needs(&crate::parse_from(argv).expect("flags parse"))
     }
 
     fn cert<'a>(n: &'a Needs, flag: &str) -> &'a CertNeed {
@@ -1151,46 +932,11 @@ mod wiring {
         parse(&all)
     }
 
-    #[test]
-    fn a_daemon_needs_its_three_files_its_row_and_the_container_programs() {
-        let n = with("daemon", &DAEMON, &[]);
-        assert_eq!(n.mode, "daemon");
-        assert_eq!(
-            flags_of(&n),
-            [("--cert", false), ("--ca-cert", false), ("--key", true)]
-        );
-        let c = cert(&n, "--cert");
-        assert_eq!(c.row, Row::Daemon);
-        assert_eq!(c.node_id.as_deref(), Some("node-1"));
-        assert_eq!(c.key, Some(("--key", PathBuf::from("/c/node.key"))));
-        assert_eq!(c.ca, Some(("--ca-cert", PathBuf::from("/c/ca.pem"))));
-        assert_eq!(
-            n.container.expect("container").oci_runtime,
-            PathBuf::from("/opt/crun")
-        );
-        assert!(!n.s3);
-    }
-
-    /// Catches the host-reading rules of check-units not reaching the flags: the cpuset
-    /// of a daemon on the container driver (and only there), the `file://` hot store of
-    /// the modes that have one, and each mode's rule over the cold store's key.
+    /// Catches the host-reading rules of check-units not reaching the flags: the `file://` hot
+    /// store of the modes that have one, and each mode's rule over the cold store's key.
     #[test]
     fn the_flags_of_each_mode_choose_its_host_rules() {
         use super::super::{KeyRule, key_file};
-        let daemon = with("daemon", &DAEMON, &[]);
-        assert!(daemon.cpuset && daemon.hot_store.is_none());
-        assert_eq!(daemon.key, KeyRule::Absent);
-        let fake: Vec<&str> = DAEMON
-            .iter()
-            .map(|f| {
-                if *f == "--driver=container" {
-                    "--driver=fake"
-                } else {
-                    f
-                }
-            })
-            .collect();
-        assert!(!with("daemon", &fake, &[]).cpuset);
         let hot = ["--hot-store=file:///srv/hot"];
         let s3 = "--cold-store=s3://bucket/p?endpoint=http://127.0.0.1:9000";
         let storage = with("storage", &[s3, "--meta-dir=/m"], &hot);
@@ -1199,43 +945,13 @@ mod wiring {
             storage.key,
             KeyRule::Holder(key_file(std::path::Path::new("/etc/kbf/kbf.toml")))
         );
-        assert!(!storage.cpuset);
-        let both = with("storage-and-daemon", &DAEMON, &[s3, "--meta-dir=/m"]);
-        assert_eq!(
-            both.key,
-            KeyRule::RootAlone(key_file(std::path::Path::new("/etc/kbf/kbf.toml")))
-        );
-        assert!(both.cpuset && both.hot_store.is_none());
         let s3_hot = ["--hot-store=s3://bucket/p?endpoint=http://127.0.0.1:9000"];
         assert_eq!(
             with("storage", &[s3, "--meta-dir=/m"], &s3_hot).hot_store,
             None
         );
-        let aio =
-            |cold: &'static str| with("all-in-one", &DAEMON, &["--meta-dir=/m", cold, hot[0]]);
-        assert_eq!(aio(s3).key, KeyRule::None);
-        assert_eq!(aio("--cold-store=file:///c").key, KeyRule::Absent);
-        assert_eq!(aio(s3).hot_store, Some(PathBuf::from("/srv/hot")));
         let frontend = parse(&["frontend", "--storage=http://127.0.0.1:8983"]);
-        assert_eq!(
-            (frontend.key, frontend.hot_store, frontend.cpuset),
-            (KeyRule::None, None, false)
-        );
-    }
-
-    #[test]
-    fn a_fake_driver_asks_nothing_of_the_container_programs() {
-        let fake: Vec<&str> = DAEMON
-            .iter()
-            .map(|f| {
-                if *f == "--driver=container" {
-                    "--driver=fake"
-                } else {
-                    f
-                }
-            })
-            .collect();
-        assert_eq!(with("daemon", &fake, &[]).container, None);
+        assert_eq!((frontend.key, frontend.hot_store), (KeyRule::None, None));
     }
 
     const STORAGE: [&str; 6] = [
@@ -1266,7 +982,6 @@ mod wiring {
                 .any(|f| f.flag == "--storage-tls-key" && f.secret)
         );
         assert!(n.s3);
-        assert!(n.container.is_none());
     }
 
     /// Catches a preflight that refuses a node for want of `AWS_*` variables when the
@@ -1278,7 +993,6 @@ mod wiring {
         let mut registered = STORAGE.to_vec();
         registered.push("--frontend=https://frontend.example:8981");
         assert!(!with("storage", &registered, &[]).s3);
-        assert!(!with("storage-and-daemon", &registered, &DAEMON).s3);
         assert!(with("storage", &STORAGE, &[]).s3);
     }
 
@@ -1298,36 +1012,6 @@ mod wiring {
     }
 
     #[test]
-    fn storage_and_daemon_needs_both_halves() {
-        let n = with("storage-and-daemon", &STORAGE, &DAEMON);
-        assert_eq!(cert(&n, "--storage-tls-cert").row, Row::Storage);
-        assert_eq!(cert(&n, "--cert").row, Row::Daemon);
-        assert!(n.s3);
-        assert!(n.container.is_some());
-    }
-
-    /// Catches the preflight refusing the layout `kbf-deploy install-units` renders for a
-    /// test-farm node: one data root, the metadata log under it. `kbf-deploy` compares the
-    /// two only for the separate server unit, whose log is another process's.
-    #[test]
-    fn a_storage_and_daemon_node_with_its_meta_dir_under_its_data_dir_passes() {
-        let storage: Vec<&str> = STORAGE
-            .iter()
-            .map(|a| {
-                if a.starts_with("--meta-dir=") {
-                    "--meta-dir=/var/lib/kbf/av2-meta"
-                } else {
-                    *a
-                }
-            })
-            .collect();
-        let n = with("storage-and-daemon", &storage, &DAEMON);
-        let report = super::super::check(&n, &super::Fake::empty());
-        let text = report.render(n.mode);
-        assert!(!text.contains("--meta-dir"), "{text}");
-    }
-
-    #[test]
     fn a_frontend_needs_its_listener_files_and_its_client_certificate_toward_storage() {
         let n = parse(&[
             "frontend",
@@ -1341,6 +1025,7 @@ mod wiring {
             "--api-listen=127.0.0.1:8990",
             "--api-token-file=/c/token",
             "--proxy-auth-file=/c/proxy-secret",
+            "--reapi-auth-policy=/c/policy",
             "--storage-client-cert=/c/fe.pem",
             "--storage-client-key=/c/fe.key",
             "--storage-ca=/c/ca.pem",
@@ -1387,25 +1072,12 @@ mod wiring {
         // The REAPI certificate is the public name's, not a row of the farm's table.
         assert!(n.certs.iter().all(|c| c.flag != "--reapi-tls-cert"));
         assert!(n.files.iter().any(|f| f.flag == "--reapi-tls-cert"));
-        assert!(!n.s3 && n.container.is_none());
-    }
-
-    #[test]
-    fn all_in_one_needs_the_auth_policy() {
-        let n = with(
-            "all-in-one",
-            &DAEMON,
-            &[
-                "--meta-dir=/var/lib/kbf/meta",
-                "--reapi-auth-policy=/c/policy",
-            ],
-        );
-        assert_eq!(n.mode, "all-in-one");
         assert!(
             n.files
                 .iter()
                 .any(|f| f.flag == "--reapi-auth-policy" && !f.secret)
         );
+        assert!(!n.s3);
     }
 
     #[test]

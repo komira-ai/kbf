@@ -1,7 +1,7 @@
 //! `kbf boot-check --mode=<mode>`: the schema step a unit runs before it starts kbf.
 //!
 //! The packaged units run `+/usr/bin/kbf boot-check --mode=<mode>` as the first
-//! `ExecStartPre=`. For a mode that keeps its state in the database (frontend, all-in-one:
+//! `ExecStartPre=`. For a mode that keeps its state in the database (the frontend:
 //! [`names::keeps_state_in_database`]) the state database is brought to the schema this kbf
 //! needs before the unit starts it. The schema is this binary's own: the newest migration it
 //! embeds ([`kbf_pack_index::schema::latest`]), the number `kbf --version --json` prints
@@ -165,7 +165,7 @@ pub fn command() -> Command {
 /// # Errors
 /// What `clap` refuses: no `--mode`, a word that is not a mode, any other flag or word.
 pub fn parse(args: &[OsString]) -> Result<Args, clap::Error> {
-    crate::refuse_all_in_one(args)?;
+    crate::refuse_removed(args)?;
     let argv = args.iter().take(1).chain(args.iter().skip(2));
     let matches = command().try_get_matches_from(argv)?;
     Ok(Args {

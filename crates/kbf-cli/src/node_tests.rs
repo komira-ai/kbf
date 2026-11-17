@@ -101,74 +101,16 @@ fn state(c: &Case, rest: &str) -> String {
     c.root.join("state").join(rest).display().to_string()
 }
 
-/// Catches a daemon-only node started with anything but the flags a `kbf daemon` unit
-/// carries (the server and the blob endpoint from the frontend, the three certificate
-/// files of the daemon role, the node id, the data directory), a `--cas` that is not the
-/// worker endpoint when the frontend names none, or the CPU reserve dropped.
-#[test]
-fn a_daemon_only_node_runs_kbf_daemon_with_the_frontends_endpoints() {
-    let c = case("daemon");
-    let config = config(&c.root, "[daemon]\nreserve_cpus = 2\n");
-    let node = enrolled(&["daemon"], sent(&["daemon"]));
-    let argv = plan(
-        &config,
-        &node,
-        &c.store,
-        Driver::Container,
-        want(names::DAEMON),
-    )
-    .expect("a plan");
-    assert_eq!(
-        strings(&argv),
-        [
-            "kbf".to_owned(),
-            "--mode=daemon".to_owned(),
-            "--driver=container".to_owned(),
-            "--server=https://farm.example:8981".to_owned(),
-            "--cas=https://farm.example:8981".to_owned(),
-            format!("--ca-cert={}", pki(&c, "ca.pem")),
-            format!("--cert={}", pki(&c, "daemon.pem")),
-            format!("--key={}", pki(&c, "daemon.key")),
-            "--node-id=node-02".to_owned(),
-            format!("--data-dir={}", state(&c, "data")),
-            "--reserve-cpus=2".to_owned(),
-        ]
-    );
-    assert!(matches!(parse_from(argv), Ok(Invocation::Daemon(_))));
-
-    let mut stored = sent(&["daemon"]);
-    stored.cas_endpoint = "https://blobs.example:8981".to_owned();
-    let node = enrolled(&["daemon"], stored);
-    let argv = plan(
-        &config,
-        &node,
-        &c.store,
-        Driver::Container,
-        want(names::DAEMON),
-    )
-    .expect("a plan");
-    let argv = strings(&argv);
-    assert!(argv.contains(&"--cas=https://blobs.example:8981".to_owned()));
-    assert!(argv.contains(&"--driver=container".to_owned()));
-}
-
 /// Catches a storage half started on the store URI the frontend sent (defect: the stored
 /// text is the flag again), which is stale after the farm re-points its store: whatever
 /// the frontend sent, the flag is the word `registered`, so the node takes its store from
 /// the registration at each start, and the mode's own parser reads it as that.
 #[test]
-fn kbf_node_passes_registered() {
+fn a_storage_node_passes_registered() {
     let c = case("sent-cold-store");
     let config = config(&c.root, "[storage]\n");
     let node = enrolled(&["storage"], sent(&["storage"]));
-    let argv = plan(
-        &config,
-        &node,
-        &c.store,
-        Driver::Container,
-        want(names::STORAGE),
-    )
-    .expect("a plan");
+    let argv = plan(&config, &node, &c.store, want(names::STORAGE)).expect("a plan");
     let text = strings(&argv);
     assert!(
         text.contains(&"--cold-store=registered".to_owned()),
@@ -197,34 +139,20 @@ fn a_storage_node_told_no_cold_store_still_runs_registered() {
     let mut stored = sent(&["storage"]);
     stored.cold_store.clear();
     let node = enrolled(&["storage"], stored);
-    let argv = plan(
-        &config,
-        &node,
-        &c.store,
-        Driver::Container,
-        want(names::STORAGE),
-    )
-    .expect("a plan");
+    let argv = plan(&config, &node, &c.store, want(names::STORAGE)).expect("a plan");
     assert!(strings(&argv).contains(&"--cold-store=registered".to_owned()));
 }
 
 /// Catches a storage-only node that does not listen where the frontend said, does not
 /// serve with the storage role's own certificate and the farm CA, does not register under
 /// the address callers dial (its `kbf.toml` advertise, else its id and the frontend's
-/// storage port), or starts a daemon.
+/// storage port).
 #[test]
 fn a_storage_only_node_runs_kbf_storage_registered_with_the_frontend() {
     let c = case("storage");
     let config = config(&c.root, "[storage]\n");
     let node = enrolled(&["storage"], sent(&["storage"]));
-    let argv = plan(
-        &config,
-        &node,
-        &c.store,
-        Driver::Container,
-        want(names::STORAGE),
-    )
-    .expect("a plan");
+    let argv = plan(&config, &node, &c.store, want(names::STORAGE)).expect("a plan");
     assert_eq!(
         strings(&argv),
         [
@@ -245,14 +173,7 @@ fn a_storage_only_node_runs_kbf_storage_registered_with_the_frontend() {
     assert!(matches!(parse_from(argv), Ok(Invocation::Storage(_))));
 
     let config = config_with_advertise(&c);
-    let argv = plan(
-        &config,
-        &node,
-        &c.store,
-        Driver::Container,
-        want(names::STORAGE),
-    )
-    .expect("a plan");
+    let argv = plan(&config, &node, &c.store, want(names::STORAGE)).expect("a plan");
     let argv = strings(&argv);
     assert!(argv.contains(&"--advertise-addr=node-02.farm.example:9000".to_owned()));
     assert!(argv.contains(&"--storage-zone=rack-a".to_owned()));
@@ -265,55 +186,27 @@ fn config_with_advertise(c: &Case) -> Config {
     )
 }
 
-/// Catches both roles started as two processes, or as `kbf storage-and-daemon` without
-/// the storage flags or with the daemon's `--cas` (which that mode refuses: its daemon
-/// reads the node's storage in-process), a reload interval the frontend turned off
-/// still passed, and either half's certificate files being another role's.
+/// Catches a node enrolled for more roles than the mode needs (a host that ran a storage and a
+/// daemon before the daemon was removed) started with anything but the storage flags: the plan is
+/// the storage-only one, built from the storage role's certificate files.
 #[test]
-fn a_node_with_both_roles_runs_the_converged_mode() {
+fn a_node_enrolled_for_a_daemon_role_too_runs_storage_on_the_storage_roles() {
     let c = case("both");
     let config = config(&c.root, "");
-    let mut stored = sent(&["storage", "daemon"]);
-    stored.tls_reload_interval_s = 0;
-    let node = enrolled(&["storage", "daemon"], stored);
-    let argv = plan(
-        &config,
-        &node,
-        &c.store,
-        Driver::Container,
-        want(names::STORAGE_AND_DAEMON),
-    )
-    .expect("a plan");
-    let text = strings(&argv);
-    assert_eq!(text[1], "--mode=storage-and-daemon");
-    assert!(text.iter().any(|a| a.starts_with("--storage-listen=")));
-    // The certificate files of each half are the enrolled node's own, by role: the storage
-    // half serves with the storage role's pair and the farm CA, the daemon half dials with
-    // the daemon role's.
-    for (flag, file) in [
-        ("--storage-tls-cert", "storage.pem"),
-        ("--storage-tls-key", "storage.key"),
-        ("--storage-client-ca", "ca.pem"),
-        ("--ca-cert", "ca.pem"),
-        ("--cert", "daemon.pem"),
-        ("--key", "daemon.key"),
-    ] {
-        assert!(
-            text.contains(&format!("{flag}={}", pki(&c, file))),
-            "{flag} is not {file}: {text:?}"
-        );
-    }
-    assert!(!text.iter().any(|a| a.starts_with("--cas=")), "{text:?}");
+    let both = enrolled(&["storage", "daemon"], sent(&["storage", "daemon"]));
+    let only = enrolled(&["storage"], sent(&["storage"]));
+    let plan_of =
+        |node| strings(&plan(&config, node, &c.store, want(names::STORAGE)).expect("a plan"));
+    let text = plan_of(&both);
+    assert_eq!(text, plan_of(&only));
     assert!(
-        !text
-            .iter()
-            .any(|a| a.starts_with("--tls-reload-interval-secs")),
+        text.contains(&format!("--storage-tls-cert={}", pki(&c, "storage.pem"))),
         "{text:?}"
     );
-    assert!(matches!(
-        parse_from(argv),
-        Ok(Invocation::StorageAndDaemon(_))
-    ));
+    assert!(
+        text.iter().all(|a| !a.contains("daemon.")),
+        "no file of the daemon role: {text:?}"
+    );
 }
 
 /// Catches a node that starts with a configuration it cannot run: no worker endpoint, or a
@@ -324,15 +217,15 @@ fn a_configuration_the_node_cannot_run_is_refused_by_name() {
     let config = config(&c.root, "");
     let refuse = |mode: &str, held: &[&str], stored: StoredConfig| {
         let node = enrolled(held, stored);
-        match plan(&config, &node, &c.store, Driver::Container, want(mode)) {
+        match plan(&config, &node, &c.store, want(mode)) {
             Err(Failure::Plan(message)) => message,
             other => panic!("planned: {other:?}"),
         }
     };
 
-    let mut none = sent(&["daemon"]);
+    let mut none = sent(&["storage"]);
     none.worker_endpoint.clear();
-    assert!(refuse(names::DAEMON, &["daemon"], none).contains("worker endpoint"));
+    assert!(refuse(names::STORAGE, &["storage"], none).contains("worker endpoint"));
     for port in [0, 70_000] {
         let mut stored = sent(&["storage"]);
         stored.storage_port = port;
@@ -341,19 +234,16 @@ fn a_configuration_the_node_cannot_run_is_refused_by_name() {
 }
 
 /// Catches the mode table of enrollment: which roles each mode needs, and that the
-/// frontend and all-in-one, which take their files as flags, need none.
+/// frontend, which takes its files as flags, needs none.
 #[test]
 fn each_mode_needs_exactly_its_roles() {
     let roles =
         |mode: &str| Want::of(mode).map(|w| w.roles.iter().map(Role::name).collect::<Vec<_>>());
     assert_eq!(roles(names::STORAGE), Some(vec!["storage"]));
-    assert_eq!(roles(names::DAEMON), Some(vec!["daemon"]));
-    assert_eq!(
-        roles(names::STORAGE_AND_DAEMON),
-        Some(vec!["storage", "daemon"])
-    );
     assert_eq!(roles(names::FRONTEND), None);
-    assert_eq!(roles(names::ALL_IN_ONE), None);
+    for removed in names::REMOVED_MODES {
+        assert_eq!(roles(removed), None, "{removed}");
+    }
     assert_eq!(roles("node"), None);
     for mode in names::MODES {
         assert_eq!(
@@ -372,17 +262,17 @@ fn each_mode_needs_exactly_its_roles() {
 #[test]
 fn the_flag_beats_the_file_and_neither_is_an_error() {
     let path = std::path::Path::new("/etc/kbf/kbf.toml");
-    let (want, note) = resolve_mode(Some(names::DAEMON), None, path).expect("flag");
-    assert_eq!((want.mode, note), (names::DAEMON, None));
+    let (want, note) = resolve_mode(Some(names::STORAGE), None, path).expect("flag");
+    assert_eq!((want.mode, note), (names::STORAGE, None));
     let (want, note) = resolve_mode(None, Some("storage"), path).expect("file");
     assert_eq!((want.mode, note), (names::STORAGE, None));
     let (want, note) = resolve_mode(Some(names::STORAGE), Some("storage"), path).expect("same");
     assert_eq!((want.mode, note), (names::STORAGE, None));
-    let (want, note) = resolve_mode(Some(names::DAEMON), Some("storage"), path).expect("both");
-    assert_eq!(want.mode, names::DAEMON);
+    let (want, note) = resolve_mode(Some(names::STORAGE), Some("frontend"), path).expect("both");
+    assert_eq!(want.mode, names::STORAGE);
     let note = note.expect("the override is said");
     assert!(
-        note.contains("--mode=daemon") && note.contains("\"storage\""),
+        note.contains("--mode=storage") && note.contains("\"frontend\""),
         "{note}"
     );
 
@@ -398,13 +288,22 @@ fn the_flag_beats_the_file_and_neither_is_an_error() {
     let bad = resolve_mode(None, Some("node"), path).expect_err("not a mode");
     assert!(matches!(bad, Failure::BadMode { .. }), "{bad}");
     assert!(bad.to_string().contains("\"node\""), "{bad}");
-    for flags_only in [names::FRONTEND, names::ALL_IN_ONE] {
-        let e = resolve_mode(Some(flags_only), None, path).expect_err("flags only");
-        assert!(
-            matches!(&e, Failure::FlagsOnly(m) if m == flags_only),
-            "{e}"
-        );
-        assert_eq!(e.exit_code(), 2);
+    let e = resolve_mode(Some(names::FRONTEND), None, path).expect_err("flags only");
+    assert!(
+        matches!(&e, Failure::FlagsOnly(m) if m == names::FRONTEND),
+        "{e}"
+    );
+    assert_eq!(e.exit_code(), 2);
+    for removed in names::REMOVED_MODES {
+        for flag in [None, Some(names::STORAGE)] {
+            let e = resolve_mode(flag, Some(removed), path).expect_err("removed");
+            assert!(matches!(e, Failure::RemovedMode { .. }), "{e}");
+            assert_eq!(e.exit_code(), 2);
+            assert_eq!(
+                e.to_string(),
+                format!("/etc/kbf/kbf.toml: mode = {removed:?}: {}", crate::REMOVED)
+            );
+        }
     }
 }
 

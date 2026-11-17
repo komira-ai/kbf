@@ -44,7 +44,7 @@ listen = \"127.0.0.1:9980\"
 #[test]
 fn a_flag_of_ours_with_no_value_is_refused_naming_it() {
     for flag in ["mode", "config"] {
-        let err = refused(&["kbf", "--mode=daemon", &format!("--{flag}")]);
+        let err = refused(&["kbf", "--mode=storage", &format!("--{flag}")]);
         assert_eq!(err.exit_code(), 2, "{flag}");
         let msg = err.to_string();
         assert!(
@@ -64,19 +64,19 @@ fn a_flag_of_ours_with_no_value_is_refused_naming_it() {
 fn the_label_flag_is_refused_with_its_replacement() {
     let tombstone = "--label was removed: placement uses what the node reports (OSFamily, ISA); delete the flag";
     for argv in [
-        &["kbf", "--mode=daemon", "--label", "pool=x"][..],
-        &["kbf", "--mode=daemon", "--label=pool=x"],
-        &["kbf", "--mode=daemon", "--label"],
-        &["kbf", "--label=pool=x", "--mode=storage-and-daemon"],
-        &["kbf", "daemon", "--label", "pool=x"],
+        &["kbf", "--mode=storage", "--label", "pool=x"][..],
+        &["kbf", "--mode=storage", "--label=pool=x"],
+        &["kbf", "--mode=storage", "--label"],
+        &["kbf", "--label=pool=x", "--mode=frontend"],
+        &["kbf", "storage", "--label", "pool=x"],
         &[
             "kbf",
             "--mode",
-            "daemon",
+            "storage",
             "--config=/nonexistent/kbf.toml",
             "--label=a=b",
         ],
-        &["kbf", "--mode=daemon", "--check", "--label=a=b"],
+        &["kbf", "--mode=storage", "--check", "--label=a=b"],
     ] {
         let err = refused(argv);
         assert_eq!(err.exit_code(), 2, "{argv:?}");
@@ -93,10 +93,10 @@ fn the_label_flag_is_refused_with_its_replacement() {
 fn a_flag_that_only_starts_with_one_of_ours_is_an_unknown_flag() {
     for flag in [
         "--configfoo=/nonexistent/kbf.toml",
-        "--modes=daemon",
+        "--modes=storage",
         "--labels=a=b",
     ] {
-        let err = refused(&["kbf", "--mode=daemon", flag]);
+        let err = refused(&["kbf", "--mode=storage", flag]);
         assert_eq!(err.exit_code(), 2, "{flag}");
         let msg = err.to_string();
         assert!(

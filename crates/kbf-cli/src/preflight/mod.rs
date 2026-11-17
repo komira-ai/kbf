@@ -15,25 +15,21 @@
 //! - secrets: every key and token file belongs to the user the process runs as and no
 //!   group or other can read it ([`files`]);
 //! - certificates: the certificate a mode presents names the role and carries the
-//!   extended key usage its row of the farm's table says, a daemon's names exactly its
-//!   `--node-id`, and it chains to its CA now ([`certs`]);
+//!   extended key usage its row of the farm's table says, and it chains to its CA now
+//!   ([`certs`]);
 //! - each certificate's private key is PEM, of a kind TLS can sign with, and the pair of the
 //!   certificate's public key ([`certs`]);
 //! - the cold store's S3 key pair is in the environment ([`env`]);
-//! - the container driver's `crun` ([`env`]);
 //! - the open-file limit in force is the floor the units set ([`env`], a warning);
 //! - a frontend names its state store, with `--state-store` or the `state-store` key
 //!   ([`state_store`]; a function of the flags alone, not of [`Needs`]).
 //! - the host rules `kbf-deploy linux check-units` had (re-homed here; the verb is retired): the directories above a `file://` `--hot-store`
-//!   can be entered by the user kbf runs as ([`traverse`]); the cgroup kbf runs in keeps
-//!   every CPU and NUMA node of the node, for a daemon on the container driver
-//!   ([`cpuset`]); a mode with no storage half has no AWS credential variable in its environment,
-//!   and the cold store's key file beside `kbf.toml`, if there is one, is owned and moded as
-//!   its mode needs ([`credential`]).
+//!   can be entered by the user kbf runs as ([`traverse`]); and the cold store's key file
+//!   beside `kbf.toml`, if there is one, is owned and moded as the storage node needs
+//!   ([`credential`]).
 //!
 //! What it does not repeat, because the mode already refuses it with its fix: subordinate
-//! ids and cgroup delegation (`kbf-driver-container`), image pins, the cold-store URI, the
-//! hot store's room, TLS-or-loopback, and a port already bound.
+//! the cold-store URI, the hot store's room, TLS-or-loopback, and a port already bound.
 //!
 //! Exit codes: a missing or wrong piece is [`REFUSED`] (2), which the units'
 //! `RestartPreventExitStatus=2` leaves down; a piece that heals shortly (a file system
@@ -46,7 +42,6 @@ mod certs;
 mod cold_key_file_tests;
 #[cfg(test)]
 mod cold_registered_tests;
-mod cpuset;
 mod credential;
 mod env;
 mod files;
@@ -78,8 +73,6 @@ pub const NOT_READY: u8 = 75;
 /// The open-file limit the units set (`LimitNOFILE`): below it a burst of uploads fails
 /// with EMFILE.
 pub const NOFILE_FLOOR: u64 = 65_536;
-/// The oldest `crun` the container driver is written against.
-pub const CRUN_MINIMUM: (u64, u64) = (1, 14);
 
 /// Whether a restart could change the outcome.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -178,8 +171,6 @@ pub enum Row {
     Frontend,
     /// A storage node's listener, and its calls to other storage nodes.
     Storage,
-    /// A daemon's client certificate.
-    Daemon,
 }
 
 /// A certificate the mode presents.
@@ -197,15 +188,6 @@ pub struct CertNeed {
     /// The CA it must chain to, and the flag that names it; `None` where the CA the
     /// mode holds is not the one that issued this certificate.
     pub ca: Option<(&'static str, PathBuf)>,
-    /// The node id a daemon's certificate names exactly.
-    pub node_id: Option<String>,
-}
-
-/// What the container driver runs.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ContainerNeed {
-    /// `--oci-runtime`: the program that runs the containers.
-    pub oci_runtime: PathBuf,
 }
 
 /// What one invocation asks of its host.
@@ -219,14 +201,9 @@ pub struct Needs {
     pub certs: Vec<CertNeed>,
     /// The cold store is S3: its key pair is in the environment.
     pub s3: bool,
-    /// The container driver runs.
-    pub container: Option<ContainerNeed>,
     /// The directory of a `file://` hot store: every directory above it that exists is
     /// one the user kbf runs as can enter ([`traverse`]).
     pub hot_store: Option<PathBuf>,
-    /// The container driver places leases on the node's CPUs and NUMA nodes: the cgroup
-    /// kbf runs in keeps all of them ([`cpuset`]).
-    pub cpuset: bool,
     /// How the mode holds the cold store's key ([`credential`]).
     pub key: KeyRule,
 }
@@ -243,14 +220,9 @@ pub enum KeyRule {
     /// Nothing (the frontend).
     #[default]
     None,
-    /// A mode with no storage half: no AWS credential variable in the environment.
-    Absent,
     /// The storage node, which holds the key as a user of its own: the key file, if
     /// there is one, is root's or that user's and no one else can read it.
     Holder(PathBuf),
-    /// The mode that holds the key beside its builds: the key file, if there is one, is
-    /// root's alone, mode 0600.
-    RootAlone(PathBuf),
 }
 
 /// Checks `needs` against `host`, everything, in a fixed order.
@@ -261,7 +233,6 @@ pub fn check(needs: &Needs, host: &dyn Host) -> Report {
     certs::check(needs, host, &mut report);
     env::check(needs, host, &mut report);
     traverse::check(needs, host, &mut report);
-    cpuset::check(needs, host, &mut report);
     credential::check(needs, host, &mut report);
     report
 }

@@ -4,14 +4,11 @@
 
 use std::io::{self, Read};
 
-use kbf_host::{Cmd, Exec, HostPath, Kind, RunUser, Untrusted};
+use kbf_host::{Cmd, Exec, HostPath, RunUser, Untrusted};
 
 use crate::layout::Platform;
 
 pub const SYSTEMCTL: &str = "/usr/bin/systemctl";
-pub const LAUNCHCTL: &str = "/bin/launchctl";
-pub const DSCL: &str = "/usr/bin/dscl";
-const LINGER_DIR: &str = "/var/lib/systemd/linger";
 
 /// The host, as `setup` asks about it.
 pub trait Os {
@@ -29,17 +26,8 @@ pub trait Os {
     fn user(&self, name: &str) -> io::Result<Option<RunUser>>;
     /// The login shell of the account `name` (which exists).
     fn login_shell(&self, name: &str) -> io::Result<String>;
-    /// The text of `/etc/subuid` and `/etc/subgid` (empty when the file is missing).
-    fn subuid(&self) -> io::Result<String>;
-    fn subgid(&self) -> io::Result<String>;
-    /// Whether systemd keeps `user`'s manager alive without a login.
-    fn lingers(&self, user: &str) -> io::Result<bool>;
     /// Whether the systemd unit is enabled.
     fn unit_enabled(&self, unit: &str) -> io::Result<bool>;
-    /// Whether the launchd label is loaded in the system domain.
-    fn launchd_loaded(&self, label: &str) -> io::Result<bool>;
-    /// `dscl . -list <what>` (macOS): `/Users UniqueID` or `/Groups PrimaryGroupID`.
-    fn dscl_list(&self, what: &str) -> io::Result<String>;
     /// `len` bytes from the system's random source.
     fn random(&self, len: usize) -> io::Result<Vec<u8>>;
 }
@@ -96,20 +84,6 @@ impl<'a> SystemOs<'a> {
     fn path(p: &str) -> io::Result<HostPath> {
         HostPath::new(p).map_err(io::Error::other)
     }
-
-    fn text(&self, path: &str) -> io::Result<String> {
-        match self.exec.inspect(&Self::path(path)?)? {
-            Some(kbf_host::Entry::File { bytes, .. }) => {
-                Ok(String::from_utf8_lossy(&bytes).into_owned())
-            }
-            _ => Ok(String::new()),
-        }
-    }
-
-    /// Exit status 0 of a command that changes nothing.
-    fn succeeds(&self, cmd: &Cmd) -> io::Result<bool> {
-        Ok(self.exec.query(cmd)?.status.success())
-    }
 }
 
 impl Os for SystemOs<'_> {
@@ -131,47 +105,18 @@ impl Os for SystemOs<'_> {
     }
 
     fn login_shell(&self, name: &str) -> io::Result<String> {
-        let (cmd, field, sep) = match self.platform {
-            // name:password:uid:gid:gecos:home:shell
-            Platform::Linux => (
-                Cmd::new(Self::path(kbf_host::user::GETENT)?)
-                    .arg("passwd")
-                    .arg("--")
-                    .arg(name),
-                6,
-                ':',
-            ),
-            // `UserShell: /usr/bin/false`
-            Platform::MacOs => (
-                Cmd::new(Self::path(DSCL)?)
-                    .arg(".")
-                    .arg("-read")
-                    .arg(format!("/Users/{name}"))
-                    .arg("UserShell"),
-                1,
-                ' ',
-            ),
-        };
+        // name:password:uid:gid:gecos:home:shell
+        let cmd = Cmd::new(Self::path(kbf_host::user::GETENT)?)
+            .arg("passwd")
+            .arg("--")
+            .arg(name);
         let out = kbf_host::exec::succeeded(&cmd, self.exec.query(&cmd)?)?;
         let text = String::from_utf8_lossy(&out.stdout).into_owned();
         text.trim_end()
-            .split(sep)
-            .nth(field)
+            .split(':')
+            .nth(6)
             .map(str::to_owned)
             .ok_or_else(|| io::Error::other(format!("no login shell of {name} in {text:?}")))
-    }
-
-    fn subuid(&self) -> io::Result<String> {
-        self.text("/etc/subuid")
-    }
-
-    fn subgid(&self) -> io::Result<String> {
-        self.text("/etc/subgid")
-    }
-
-    fn lingers(&self, user: &str) -> io::Result<bool> {
-        let path = Self::path(&format!("{LINGER_DIR}/{user}"))?;
-        Ok(self.exec.stat(&path)?.is_some_and(|m| m.kind == Kind::File))
     }
 
     fn unit_enabled(&self, unit: &str) -> io::Result<bool> {
@@ -183,25 +128,8 @@ impl Os for SystemOs<'_> {
         Ok(out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "enabled")
     }
 
-    fn launchd_loaded(&self, label: &str) -> io::Result<bool> {
-        let cmd = Cmd::new(Self::path(LAUNCHCTL)?)
-            .arg("print")
-            .arg(format!("system/{label}"));
-        self.succeeds(&cmd)
-    }
-
-    fn dscl_list(&self, what: &str) -> io::Result<String> {
-        let mut cmd = Cmd::new(Self::path(DSCL)?).arg(".").arg("-list");
-        for word in what.split(' ') {
-            cmd = cmd.arg(word);
-        }
-        let out = self.exec.query(&cmd)?;
-        kbf_host::exec::succeeded(&cmd, out)
-            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-    }
-
     fn random(&self, len: usize) -> io::Result<Vec<u8>> {
-        // The kernel's source, on Linux and macOS alike (`getrandom` is Linux-only in rustix).
+        // The kernel's source.
         let mut bytes = vec![0u8; len];
         std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
         Ok(bytes)

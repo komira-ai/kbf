@@ -31,18 +31,8 @@ struct Out {
 }
 
 async fn kbf(args: Vec<String>) -> Out {
-    kbf_with_path(args, None).await
-}
-
-/// `kbf` with `PATH` set to `path` (the host's when `None`).
-async fn kbf_with_path(args: Vec<String>, path: Option<PathBuf>) -> Out {
     tokio::task::spawn_blocking(move || {
-        let mut command = Command::new(BIN);
-        command.args(&args);
-        if let Some(path) = path {
-            command.env("PATH", path);
-        }
-        let out = command.output().expect("run kbf");
+        let out = Command::new(BIN).args(&args).output().expect("run kbf");
         Out {
             code: out.status.code(),
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -93,9 +83,9 @@ async fn check_passes_for_a_host_that_is_not_enrolled_yet() {
     token(&root, &run.fake.mint(1, 1).to_line());
 
     for words in [
-        &["--mode=daemon", "--check"][..],
+        &["--mode=storage", "--check"][..],
         &["--check"],
-        &["storage-and-daemon", "--check"],
+        &["storage", "--check"],
     ] {
         let out = kbf(args(words, &path)).await;
         assert_eq!(out.code, Some(0), "{words:?}: {}", out.stderr);
@@ -110,10 +100,13 @@ async fn check_passes_for_a_host_that_is_not_enrolled_yet() {
     assert!(run.fake.enrolls().is_empty(), "--check calls no frontend");
 
     // The flag beats the file and the start says so on stderr.
-    let out = kbf(args(&["--mode=daemon", "--check"], &path)).await;
+    let other = scratch("process-check-override");
+    let over = config(&other, run.enroll_addr.port(), "mode = \"frontend\"\n");
+    token(&other, &run.fake.mint(2, 1).to_line());
+    let out = kbf(args(&["--mode=storage", "--check"], &over)).await;
     assert!(
         out.stderr
-            .contains("--mode=daemon overrides mode = \"storage\""),
+            .contains("--mode=storage overrides mode = \"frontend\""),
         "{}",
         out.stderr
     );
@@ -131,7 +124,7 @@ async fn check_exits_2_for_a_missing_token_a_missing_file_and_no_mode() {
     let root = scratch("process-check-bad");
     let path = config(&root, run.enroll_addr.port(), "");
 
-    let out = kbf(args(&["--mode=daemon", "--check"], &path)).await;
+    let out = kbf(args(&["--mode=storage", "--check"], &path)).await;
     assert_eq!(out.code, Some(2), "{}", out.stderr);
     assert!(out.stderr.contains("enroll.token"), "{}", out.stderr);
     assert!(out.stdout.is_empty(), "{}", out.stdout);
@@ -148,7 +141,11 @@ async fn check_exits_2_for_a_missing_token_a_missing_file_and_no_mode() {
         out.stderr
     );
 
-    let out = kbf(args(&["--mode=daemon", "--check"], &root.join("none.toml"))).await;
+    let out = kbf(args(
+        &["--mode=storage", "--check"],
+        &root.join("none.toml"),
+    ))
+    .await;
     assert_eq!(out.code, Some(2), "{}", out.stderr);
     assert!(out.stderr.contains("none.toml"), "{}", out.stderr);
 }
@@ -166,7 +163,7 @@ async fn a_refused_token_exits_2_with_the_reason_on_stderr() {
     let minted = run.fake.mint(1, 1);
     token(&root, &minted.to_line());
     run.fake.expire(&minted);
-    let out = kbf(args(&["--mode=daemon"], &path)).await;
+    let out = kbf(args(&["--mode=storage"], &path)).await;
     assert_eq!(out.code, Some(2), "{}", out.stderr);
     assert!(
         out.stderr.contains(&format!(
@@ -182,8 +179,8 @@ async fn a_refused_token_exits_2_with_the_reason_on_stderr() {
 
     let run = fake::start();
     let root = scratch("process-lacking");
-    let path = config(&root, run.enroll_addr.port(), "mode = \"daemon\"\n");
-    token(&root, &run.fake.mint_roles(1, 1, &["storage"]).to_line());
+    let path = config(&root, run.enroll_addr.port(), "mode = \"storage\"\n");
+    token(&root, &run.fake.mint_roles(1, 1, &["daemon"]).to_line());
     let out = kbf(args(&[], &path)).await;
     assert_eq!(out.code, Some(2), "{}", out.stderr);
     assert!(
@@ -199,7 +196,7 @@ async fn a_refused_token_exits_2_with_the_reason_on_stderr() {
             .iter()
             .map(|c| c.role.as_str())
             .collect::<Vec<_>>(),
-        ["daemon"],
+        ["storage"],
         "the request asked for the mode's role only"
     );
 }
@@ -211,14 +208,18 @@ async fn a_flag_that_is_not_known_exits_2() {
     let root = scratch("process-usage");
     // A file that exists and is the mode's: the flags are parsed with it.
     let none = config(&root, 1, "");
-    let out = kbf(args(&["--mode=daemon", "--bogus"], &none)).await;
+    let out = kbf(args(&["--mode=storage", "--bogus"], &none)).await;
     assert_eq!(out.code, Some(2), "{}", out.stderr);
     assert!(out.stderr.contains("--bogus"), "{}", out.stderr);
 
-    let out = kbf(args(&["--mode=daemon", "--cold-store=s3://b"], &none)).await;
+    let out = kbf(args(
+        &["--mode=storage", "--worker-listen=127.0.0.1:1"],
+        &none,
+    ))
+    .await;
     assert_eq!(out.code, Some(2), "{}", out.stderr);
     assert!(
-        out.stderr.contains("kbf daemon refuses --cold-store"),
+        out.stderr.contains("kbf storage refuses --worker-listen"),
         "{}",
         out.stderr
     );
@@ -243,8 +244,8 @@ async fn a_flag_that_is_not_known_exits_2() {
 }
 
 /// Catches the mode parser's refusal of what the start built being printed as something
-/// else, or exiting other than 2: an enrolled node whose `kbf.toml` holds a value the daemon
-/// refuses (`actions-memory-max-gib = 0`: a flag's range, checked by the mode's parser, not
+/// else, or exiting other than 2: an enrolled node whose `kbf.toml` holds a value the storage
+/// mode refuses (`store-put-attempts = 0`: a flag's range, checked by the mode's parser, not
 /// by the file's table check) prints clap's message and exits 2.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_flag_the_mode_refuses_exits_2_with_its_message() {
@@ -252,15 +253,15 @@ async fn a_flag_the_mode_refuses_exits_2_with_its_message() {
     let root = scratch("process-mode-refusal");
     let path = config(&root, run.enroll_addr.port(), "");
     let mut text = std::fs::read_to_string(&path).expect("kbf.toml");
-    text.push_str("[containers]\nactions-memory-max-gib = 0\n");
+    text.push_str("[stores]\nstore-put-attempts = 0\n");
     write_config(&path, &text);
     token(&root, &run.fake.mint(1, 1).to_line());
     // Enrolled by a start that stops at its first refusal: the flag's range starts at 1.
-    let out = kbf(args(&["--mode=daemon"], &path)).await;
+    let out = kbf(args(&["--mode=storage"], &path)).await;
 
     assert_eq!(out.code, Some(2), "{}", out.stderr);
     assert!(
-        out.stderr.contains("--actions-memory-max-gib"),
+        out.stderr.contains("--store-put-attempts"),
         "{}",
         out.stderr
     );
@@ -270,44 +271,38 @@ async fn a_flag_the_mode_refuses_exits_2_with_its_message() {
     );
 }
 
-/// Catches a start that, once enrolled, goes on to run the mode without the host checks (a
-/// daemon on a host with no `crun` would start and fail every lease), or whose checks
-/// are not the mode's: enrolled with the frontend, a daemon whose host has an empty `PATH`
-/// is refused by the startup self-check, exit 2 with `(--oci-runtime) does not exist` on stderr,
-/// and the node's files were made all the same.
+/// Catches a start that, once enrolled, goes on to run the mode without the host checks, or
+/// whose checks are not the mode's: enrolled with the frontend, a storage node with an `s3.env`
+/// beside its `kbf.toml` that every user can read is refused by the startup self-check, exit 2
+/// with the file named on stderr, and the node's files were made all the same.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_enrolled_start_runs_the_host_checks_before_the_mode() {
     let run = fake::start();
     let root = scratch("process-host-checks");
-    // The runtime is a path now, not a PATH lookup: name one that is not there, so the test
-    // does not depend on whether this host has /usr/bin/crun.
-    let missing = root.join("no-programs/crun");
-    let path = config(
-        &root,
-        run.enroll_addr.port(),
-        &format!("[containers]\noci-runtime = \"{}\"\n", missing.display()),
-    );
+    let path = config(&root, run.enroll_addr.port(), "");
     token(&root, &run.fake.mint(1, 1).to_line());
-    let empty = root.join("no-programs");
-    std::fs::create_dir_all(&empty).expect("empty PATH dir");
+    let key = root.join("s3.env");
+    std::fs::write(&key, "AWS_ACCESS_KEY_ID=a\n").expect("key file");
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).expect("mode");
 
-    let out = kbf_with_path(args(&["--mode=daemon"], &path), Some(empty)).await;
+    let out = kbf(args(&["--mode=storage"], &path)).await;
 
     assert_eq!(out.code, Some(2), "{}", out.stderr);
     assert!(
-        out.stderr.contains("(--oci-runtime) does not exist"),
+        out.stderr
+            .contains(&format!("{} is mode 0644", key.display())),
         "{}",
         out.stderr
     );
-    assert!(out.stderr.contains("kbf daemon: "), "{}", out.stderr);
+    assert!(out.stderr.contains("kbf storage: "), "{}", out.stderr);
     assert_eq!(run.fake.enrolls().len(), 1);
     assert!(root.join("state/pki/node.json").exists());
 }
 
 /// Catches a top-level `storage = ...` or `daemon = ...` (a value where enrollment's table
 /// is) being ignored, passing `--check`, or refused with a message that names no file: for
-/// a string, a number and a bool, `--mode=<m> --check --config FILE` exits 2 and stderr
+/// a string, a number and a bool, `--mode=storage --check --config FILE` exits 2 and stderr
 /// names the key and the file; a `[storage]` and a `[daemon]` table in the same file stay
 /// fine.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -315,26 +310,24 @@ async fn a_value_where_a_table_of_the_file_is_exits_2_naming_key_and_file() {
     let run = fake::start();
     let root = scratch("process-scalar-table");
     token(&root, &run.fake.mint(1, 1).to_line());
-    for mode in ["storage", "daemon"] {
-        for (key, value) in [
-            ("storage", "\"x\""),
-            ("storage", "true"),
-            ("daemon", "1"),
-            ("daemon", "true"),
-        ] {
-            let top = format!("mode = \"{mode}\"\n{key} = {value}\n");
-            let path = config(&root, run.enroll_addr.port(), &top);
-            let out = kbf(args(&[&format!("--mode={mode}"), "--check"], &path)).await;
-            let want = format!("{mode}/{key} = {value}");
-            assert_eq!(out.code, Some(2), "{want}: {}", out.stderr);
-            assert!(out.stdout.is_empty(), "{want}: {}", out.stdout);
-            assert!(
-                out.stderr.contains(&format!("`{key}`"))
-                    && out.stderr.contains(&path.display().to_string()),
-                "{want}: {}",
-                out.stderr
-            );
-        }
+    for (key, value) in [
+        ("storage", "\"x\""),
+        ("storage", "true"),
+        ("daemon", "1"),
+        ("daemon", "true"),
+    ] {
+        let top = format!("mode = \"storage\"\n{key} = {value}\n");
+        let path = config(&root, run.enroll_addr.port(), &top);
+        let out = kbf(args(&["--mode=storage", "--check"], &path)).await;
+        let want = format!("{key} = {value}");
+        assert_eq!(out.code, Some(2), "{want}: {}", out.stderr);
+        assert!(out.stdout.is_empty(), "{want}: {}", out.stdout);
+        assert!(
+            out.stderr.contains(&format!("`{key}`"))
+                && out.stderr.contains(&path.display().to_string()),
+            "{want}: {}",
+            out.stderr
+        );
     }
     let tables = "mode = \"storage\"\n[storage]\nhot_dir = \"/var/lib/kbf/hot\"\n[daemon]\nreserve_cpus = 1\n";
     let path = config(&root, run.enroll_addr.port(), "");

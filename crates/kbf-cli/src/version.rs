@@ -22,8 +22,7 @@
 //!   skips the raise and loses the commands it does not know). A build that does not print
 //!   the field is unknown, and unknown is not reversible;
 //! - `min_protocol` and `protocol`: the oldest and the newest `kbf.worker.v1` protocol
-//!   version this binary speaks ([`kbf_server::worker`]); the daemon half speaks exactly
-//!   `protocol` (a test pins the two halves equal);
+//!   version this binary speaks ([`kbf_server::worker`]);
 //! - `profile`: the Cargo profile, `release` or `debug` ([`PROFILE`]);
 //! - `relay`: how far this build carries what its host's installer reports to the frontend
 //!   ([`RELAY`]); the installer reads it before it rolls a `release_source = "bundled"` host back

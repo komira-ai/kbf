@@ -85,12 +85,3 @@ fn a_host_with_neither_directory_names_the_new_one() {
         .with_trust_fallback();
     assert_eq!(l.gh().as_str(), "/usr/share/kbf/trust/gh");
 }
-
-/// A Mac has no fallback: its trust directory is the pkg's, whatever a Linux path holds.
-#[test]
-fn a_mac_never_falls_back() {
-    let l = Host::with("mac", &[OLD_DIR])
-        .layout(Platform::MacOs)
-        .with_trust_fallback();
-    assert_eq!(l.gh().as_str(), "/usr/local/kbf-installer/trust/gh");
-}

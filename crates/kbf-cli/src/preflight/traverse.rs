@@ -2,7 +2,7 @@
 //! `--hot-store=file://` names can be reached by the user kbf runs as. Every directory
 //! above it that exists must give that user the execute bit, as its owner, through one of
 //! its groups, or as other (the kernel's order: the first class that matches decides).
-//! One that does not is how a `storage-and-daemon` unit, running as `kbf`, failed to start
+//! One that does not is how a storage unit, running as `kbf`, failed to start
 //! with `--hot-store /var/lib/kbf-server/hot: Permission denied`: the parent is the server
 //! account's, mode 0700.
 //!

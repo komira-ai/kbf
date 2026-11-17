@@ -2,14 +2,13 @@
 //! is asked for one. Each test goes from the flags to the report.
 
 use super::state_store::check;
-use super::tests::DAEMON;
 use super::{Class, REFUSED, Report};
 use crate::Invocation;
 
 /// The invocation of `kbf` run with `args`.
 fn parsed(args: &[&str]) -> Invocation {
     let argv = std::iter::once("kbf").chain(args.iter().copied());
-    crate::parse_internal(argv).expect("flags parse")
+    crate::parse_from(argv).expect("flags parse")
 }
 
 /// The invocation of `kbf frontend` run with `more` beside the one flag it requires.
@@ -63,14 +62,13 @@ fn a_frontend_with_a_state_store_passes() {
     }
 }
 
-/// Asserts that a build node and an all-in-one, which is given the local Postgres when it
-/// names no store, are not asked for a state store.
+/// Asserts that a storage node, which holds no scheduler state, is not asked for a state store.
 #[test]
-fn the_other_modes_are_not_asked_for_a_state_store() {
-    let mut args = vec!["daemon"];
-    args.extend_from_slice(&DAEMON);
-    assert_eq!(found(&parsed(&args)), Report::default());
-    let mut args = vec!["all-in-one", "--meta-dir=/m"];
-    args.extend_from_slice(&DAEMON);
+fn the_storage_mode_is_not_asked_for_a_state_store() {
+    let args = [
+        "storage",
+        "--cold-store=file:///var/lib/kbf-cold",
+        "--meta-dir=/m",
+    ];
     assert_eq!(found(&parsed(&args)), Report::default());
 }

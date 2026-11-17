@@ -13,26 +13,20 @@ fn the_cli_has_exactly_the_tables_modes() {
     let have: Vec<&str> = cmd.get_subcommands().map(clap::Command::get_name).collect();
     let want: Vec<&str> = MODES.iter().map(|m| m.name).collect();
     assert_eq!(have, want);
-    let constants = [
-        names::FRONTEND,
-        names::STORAGE,
-        names::DAEMON,
-        names::STORAGE_AND_DAEMON,
-        names::ALL_IN_ONE,
-    ];
+    let constants = [names::FRONTEND, names::STORAGE];
     assert_eq!(constants.to_vec(), want);
 }
 
-/// Asserts that exactly the frontend and all-in-one keep their state in the database, and that
-/// a word that is not a mode does not.
+/// Asserts that exactly the frontend keeps its state in the database, and that a word that is not
+/// a mode does not.
 #[test]
-fn only_the_frontend_and_all_in_one_keep_their_state_in_the_database() {
+fn only_the_frontend_keeps_its_state_in_the_database() {
     let keeping: Vec<&str> = MODES
         .iter()
         .map(|m| m.name)
         .filter(|n| names::keeps_state_in_database(n))
         .collect();
-    assert_eq!(keeping, [names::FRONTEND, names::ALL_IN_ONE]);
+    assert_eq!(keeping, [names::FRONTEND]);
     assert!(!names::keeps_state_in_database("node"));
 }
 

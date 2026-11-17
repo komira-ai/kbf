@@ -1,4 +1,4 @@
-//! The default of `frontend` and `all-in-one`: given no `--database`, setup makes the local role
+//! The default of `frontend`: given no `--database`, setup makes the local role
 //! and database, and tells the operator what the server must admit. The fake host and the model of
 //! a server are `provision_tests.rs`'s. Each test says the behaviour it asserts.
 
@@ -15,10 +15,6 @@ const HBA: &str =
     "  pg_hba.conf, above the first `local` line: local  kbf  kbf-server  peer map=kbf";
 const IDENT_ROOT: &str = "  pg_ident.conf: kbf  root  kbf-server";
 const IDENT_SERVICE: &str = "  pg_ident.conf: kbf  kbf-server  kbf-server";
-/// The default of an all-in-one host: the same database, reached as `kbf`, the account its one
-/// unit runs as.
-const ALL_IN_ONE_DATABASE: &str = "postgres:///kbf?host=/run/postgresql&user=kbf";
-
 /// The flags of a host that gives no `--database`.
 fn bare(mode: Mode) -> Raw {
     let mut r = raw(mode);
@@ -102,41 +98,13 @@ fn a_frontend_with_no_database_gets_the_local_role_database_and_schema() {
     assert!(schema < kbf_toml);
 }
 
-/// Asserts that an all-in-one host given no `--database` provisions the local database as a
-/// frontend does, as the account its one unit runs as (`kbf`, not the frontend's `kbf-server`),
-/// asks for the schema at that URL, and that `installer.toml` and the one `kbf.toml` carry the
-/// local default, which the rules the logins need name.
-#[test]
-fn an_all_in_one_host_with_no_database_gets_the_local_role_database_and_schema() {
-    let world = Shared::default();
-    let server = Server::fresh();
-    let (exec, out) = setup_on(&world, &server, &bare(Mode::AllInOne), APPLY);
-    let out = out.expect("setup");
-    let made = creates(&world);
-    assert_eq!(made.len(), 2, "{made:?}");
-    let set = "\\set role 'kbf'\n\\set db 'kbf'\n";
-    for script in &made {
-        assert!(script.starts_with(set), "{script}");
-    }
-    let url = ALL_IN_ONE_DATABASE;
-    assert_eq!(
-        *server.asked.borrow(),
-        [format!("reach {url}"), format!("setup {url}")]
-    );
-    let store = format!("state-store = \"{url}\"\n");
-    assert!(text(&exec, KBF_TOML).contains(&store));
-    let database = format!("database = \"{url}\"\n");
-    assert!(text(&exec, INSTALLER_TOML).contains(&database));
-    assert!(out.contains("  pg_ident.conf: kbf  kbf  kbf"), "{out}");
-}
-
-/// Asserts that a daemon setup does not provision: psql is never run, no schema is asked for,
+/// Asserts that a storage setup does not provision: psql is never run, no schema is asked for,
 /// and nothing is said of the server's rules.
 #[test]
-fn a_daemon_setup_does_not_provision_a_database() {
+fn a_storage_setup_does_not_provision_a_database() {
     let world = Shared::default();
     let server = Server::fresh();
-    let (_, out) = setup_on(&world, &server, &raw(Mode::Daemon), APPLY);
+    let (_, out) = setup_on(&world, &server, &raw(Mode::Storage), APPLY);
     let out = out.expect("setup");
     assert!(world.borrow().ran.is_empty());
     assert!(server.asked.borrow().is_empty());
@@ -148,15 +116,13 @@ fn a_daemon_setup_does_not_provision_a_database() {
 /// still made at the URL given.
 #[test]
 fn an_explicit_database_skips_the_provisioning() {
-    for mode in [Mode::Frontend, Mode::AllInOne] {
-        let world = Shared::default();
-        let server = Server::fresh();
-        let (_, out) = setup_on(&world, &server, &raw(mode), APPLY);
-        let out = out.expect("setup");
-        assert!(world.borrow().ran.is_empty());
-        assert!(!out.contains("pg_hba.conf"), "{out}");
-        assert!(out.contains("database step: created the schema"), "{out}");
-    }
+    let world = Shared::default();
+    let server = Server::fresh();
+    let (_, out) = setup_on(&world, &server, &raw(Mode::Frontend), APPLY);
+    let out = out.expect("setup");
+    assert!(world.borrow().ran.is_empty());
+    assert!(!out.contains("pg_hba.conf"), "{out}");
+    assert!(out.contains("database step: created the schema"), "{out}");
 }
 
 /// Asserts that a rerun of the default changes nothing: the host is as the first run left it,
@@ -275,7 +241,7 @@ fn a_host_without_psql_is_refused_with_the_install_command_of_its_family() {
     }
 
     let mut exec = no_psql(ubuntu);
-    let out = go(&linux(), &mut exec, &bare(Mode::AllInOne), DRY);
+    let out = go(&linux(), &mut exec, &bare(Mode::Frontend), DRY);
     assert!(refusal(out).contains(APT));
     assert!(exec.log.is_empty());
 }
@@ -313,7 +279,7 @@ fn a_stopped_server_and_a_missing_server_are_refused_with_the_install_command() 
     world.borrow_mut().broken = Some(2);
     let mut exec = exec_on(&world);
     put(&mut exec, OS_RELEASE, 0o644, ROOT, "ID=fedora\n");
-    let out = go(&linux(), &mut exec, &bare(Mode::AllInOne), APPLY);
+    let out = go(&linux(), &mut exec, &bare(Mode::Frontend), APPLY);
     let said = refusal(out);
     for wanted in ["exit status 2", "start the server", DNF, "--initdb"] {
         assert!(said.contains(wanted), "{wanted}: {said}");
@@ -362,30 +328,27 @@ fn the_rules_the_logins_need_are_printed_in_a_dry_run_and_an_apply() {
 }
 
 /// Asserts that the default names the database `kbf` on the local socket, reached as the
-/// account its unit runs as (`kbf-server` for a frontend, `kbf` for an all-in-one host), whether
-/// or not `--create-local-database` is also given; and that a node mode has no database,
-/// defaulted or not.
+/// account its unit runs as (`kbf-server`), whether or not `--create-local-database` is also
+/// given; and that a node mode has no database, defaulted or not.
 #[test]
 fn the_default_is_the_kbf_database_on_the_local_socket() {
-    for (mode, role) in [(Mode::Frontend, "kbf-server"), (Mode::AllInOne, "kbf")] {
-        for flag in [false, true] {
-            let mut r = bare(mode);
-            r.create_local_database = flag;
-            let valid = r.validate(Platform::Linux).expect("valid");
-            assert!(valid.database_defaulted);
-            let local = valid.local_database.expect("provisioned");
-            assert_eq!(
-                (
-                    local.role.as_str(),
-                    local.name.as_str(),
-                    local.socket_dir.as_str(),
-                    local.port
-                ),
-                (role, "kbf", "/run/postgresql", None)
-            );
-        }
+    for flag in [false, true] {
+        let mut r = bare(Mode::Frontend);
+        r.create_local_database = flag;
+        let valid = r.validate(Platform::Linux).expect("valid");
+        assert!(valid.database_defaulted);
+        let local = valid.local_database.expect("provisioned");
+        assert_eq!(
+            (
+                local.role.as_str(),
+                local.name.as_str(),
+                local.socket_dir.as_str(),
+                local.port
+            ),
+            ("kbf-server", "kbf", "/run/postgresql", None)
+        );
     }
-    let node = bare(Mode::Daemon);
+    let node = bare(Mode::Storage);
     let valid = node.validate(Platform::Linux).expect("valid");
     assert!(!valid.database_defaulted);
     assert!(valid.database.is_none());
@@ -414,20 +377,5 @@ fn a_database_the_installer_toml_names_is_not_replaced_by_the_default() {
     assert!(!said.contains("other"), "{said}");
     assert_eq!(exec.log.len(), steps);
     assert_eq!(text(&exec, INSTALLER_TOML), before);
-    assert!(world.borrow().ran.is_empty());
-}
-
-/// Asserts that a Mac is refused for a frontend with no `--database` before anything is asked of
-/// a server: the default does not reach a platform that has no `postgres` account to switch to.
-#[test]
-fn a_mac_frontend_with_no_database_is_refused_before_a_server_is_asked() {
-    let world = Shared::default();
-    let mut exec = released(host(), Platform::MacOs);
-    let w = Rc::clone(&world);
-    exec.answer = Box::new(move |cmd| psql_answer(&w, cmd));
-    let out = go(&FakeOs::mac(), &mut exec, &bare(Mode::Frontend), APPLY);
-    let err = out.expect_err("refused");
-    assert_eq!(err.exit(), Exit::Usage, "{err}");
-    assert!(err.to_string().contains("a Mac is a node only"), "{err}");
     assert!(world.borrow().ran.is_empty());
 }

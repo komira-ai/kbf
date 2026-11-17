@@ -1,15 +1,13 @@
 //! The `kbf.toml` settings `setup` takes as named flags, for the hosts that do not enroll.
 //!
-//! A node mode (`storage`, `daemon`, `storage-and-daemon`) gets its listeners, certificates and
-//! storage URL from enrollment, so its file is complete with the mode, the frontend URL and
-//! the token path. A `frontend` host serves the public REAPI listener, the worker listener and
-//! the operator API and proxies blobs to a storage node; an `all-in-one` host serves the same
-//! listeners and runs the daemon half in its process, with a cold store of its own. Their
-//! certificates and paths are the operator's, and those are the flags here. A flag sets the
-//! `kbf` flag of its key's name (a few carry a longer name for the setup command line:
-//! `--storage-url` is `storage`, `--daemon-cert` is `cert`) and is written as that key in the
-//! table of its group (`crates/kbf-cli/src/config.rs`, `GROUPS`). A test checks every
-//! `(table, key)` against `kbf`'s own per-mode goldens, so a renamed or moved flag fails there.
+//! A node mode (`storage`) gets its listeners, certificates and storage URL from enrollment, so
+//! its file is complete with the mode, the frontend URL and the token path. A `frontend` host
+//! serves the public REAPI listener, the worker listener and the operator API and proxies blobs
+//! to a storage node. Its certificates and paths are the operator's, and those are the flags
+//! here. A flag sets the `kbf` flag of its key's name (a few carry a longer name for the setup
+//! command line: `--storage-url` is `storage`) and is written as that key in the table of its
+//! group (`crates/kbf-cli/src/config.rs`, `GROUPS`). A test checks every `(table, key)` against
+//! `kbf`'s own per-mode goldens, so a renamed or moved flag fails there.
 //!
 //! The rules, all checked before the host is touched:
 //!
@@ -23,12 +21,10 @@
 //!   (a link is not followed) owned by the service user with no group or other bits and
 //!   readable by its owner, as `kbf` requires; a certificate or CA is a regular file owned by
 //!   root or the service user that neither group nor others can write;
-//! - what the mode cannot start without is required: a frontend its storage URL, an
-//!   all-in-one host its cold store, metadata directory and the daemon half's identity.
+//! - what the mode cannot start without is required: a frontend its storage URL.
 //!
 //! `setup` also writes what the mode needs and has one answer for: the operator API address
-//! (default `127.0.0.1:8982`, as `kbf` documents; the token file `setup` writes requires it)
-//! and, for `all-in-one`, `driver = "container"`, the only driver it accepts.
+//! (default `127.0.0.1:8982`, as `kbf` documents; the token file `setup` writes requires it).
 //!
 //! No message carries a value, only the flag and the rule: a path or a URL a person typed can
 //! hold a secret, and a log keeps what is printed.
@@ -59,44 +55,10 @@ enum Want {
     Key,
     /// `http(s)://host[:port]`; plain `http` only to a loopback host.
     Url,
-    /// `https://host[:port]`.
-    Https,
-    /// `file:///absolute/path`.
-    FileUri,
-    /// An absolute directory path.
-    Dir,
-    /// A node id: a DNS label.
-    NodeId,
 }
 
-/// Which modes take a setting.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Takes {
-    /// `frontend` and `all-in-one`.
-    Serving,
-    /// `frontend` only.
-    Frontend,
-    /// `all-in-one` only.
-    AllInOne,
-}
-
-impl Takes {
-    fn mode(self, mode: Mode) -> bool {
-        match self {
-            Takes::Serving => matches!(mode, Mode::Frontend | Mode::AllInOne),
-            Takes::Frontend => mode == Mode::Frontend,
-            Takes::AllInOne => mode == Mode::AllInOne,
-        }
-    }
-
-    fn who(self) -> &'static str {
-        match self {
-            Takes::Serving => "the modes that serve the API (frontend, all-in-one)",
-            Takes::Frontend => "--mode=frontend",
-            Takes::AllInOne => "--mode=all-in-one",
-        }
-    }
-}
+/// The one mode that takes the settings.
+const TAKEN_BY: &str = "--mode=frontend";
 
 /// Where a setting's value comes from when no flag gives it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,8 +69,6 @@ enum Need {
     Required,
     /// This value when the flag is not given.
     Default(&'static str),
-    /// Always this value, for the modes that take it; there is no flag.
-    Fixed(&'static str),
 }
 
 struct Spec {
@@ -119,20 +79,18 @@ struct Spec {
     /// The key: the name of the `kbf` flag.
     key: &'static str,
     kind: Want,
-    takes: Takes,
     need: Need,
 }
 
 // Macros, not `const fn`s: the table is a constant, and a function run only at compile time
 // has no coverage.
 macro_rules! spec {
-    ($flag:expr, $table:expr, $key:expr, $kind:expr, $takes:expr, $need:expr $(,)?) => {
+    ($flag:expr, $table:expr, $key:expr, $kind:expr, $need:expr $(,)?) => {
         Spec {
             flag: $flag,
             table: $table,
             key: $key,
             kind: $kind,
-            takes: $takes,
             need: $need,
         }
     };
@@ -140,165 +98,52 @@ macro_rules! spec {
 
 /// A setting whose flag has the name of its key.
 macro_rules! same {
-    ($name:expr, $table:expr, $kind:expr, $takes:expr, $need:expr $(,)?) => {
-        spec!(Some($name), $table, $name, $kind, $takes, $need)
+    ($name:expr, $table:expr, $kind:expr, $need:expr $(,)?) => {
+        spec!(Some($name), $table, $name, $kind, $need)
     };
 }
 
 /// A setting whose flag is named differently from its key.
 macro_rules! renamed {
-    ($flag:expr, $table:expr, $key:expr, $kind:expr, $takes:expr, $need:expr $(,)?) => {
-        spec!(Some($flag), $table, $key, $kind, $takes, $need)
+    ($flag:expr, $table:expr, $key:expr, $kind:expr, $need:expr $(,)?) => {
+        spec!(Some($flag), $table, $key, $kind, $need)
     };
 }
 
 /// The settings, in the order of the written file within each table.
-const SPECS: [Spec; 20] = [
-    same!(
-        "listen",
-        "listener",
-        Want::Addr,
-        Takes::Serving,
-        Need::Optional,
-    ),
-    same!(
-        "worker-listen",
-        "listener",
-        Want::Addr,
-        Takes::Serving,
-        Need::Optional,
-    ),
+const SPECS: [Spec; 12] = [
+    same!("listen", "listener", Want::Addr, Need::Optional,),
+    same!("worker-listen", "listener", Want::Addr, Need::Optional,),
     same!(
         "api-listen",
         "listener",
         Want::Addr,
-        Takes::Serving,
         Need::Default("127.0.0.1:8982"),
     ),
-    same!(
-        "reapi-tls-cert",
-        "tls",
-        Want::Cert,
-        Takes::Serving,
-        Need::Optional,
-    ),
-    same!(
-        "reapi-tls-key",
-        "tls",
-        Want::Key,
-        Takes::Serving,
-        Need::Optional,
-    ),
-    same!(
-        "worker-tls-cert",
-        "tls",
-        Want::Cert,
-        Takes::Serving,
-        Need::Optional,
-    ),
-    same!(
-        "worker-tls-key",
-        "tls",
-        Want::Key,
-        Takes::Serving,
-        Need::Optional,
-    ),
-    same!(
-        "worker-client-ca",
-        "tls",
-        Want::Cert,
-        Takes::Serving,
-        Need::Optional,
-    ),
+    same!("reapi-tls-cert", "tls", Want::Cert, Need::Optional,),
+    same!("reapi-tls-key", "tls", Want::Key, Need::Optional,),
+    same!("worker-tls-cert", "tls", Want::Cert, Need::Optional,),
+    same!("worker-tls-key", "tls", Want::Key, Need::Optional,),
+    same!("worker-client-ca", "tls", Want::Cert, Need::Optional,),
     renamed!(
         "storage-url",
         "storage-client",
         "storage",
         Want::Url,
-        Takes::Frontend,
         Need::Required,
     ),
-    same!(
-        "storage-ca",
-        "storage-client",
-        Want::Cert,
-        Takes::Frontend,
-        Need::Optional,
-    ),
+    same!("storage-ca", "storage-client", Want::Cert, Need::Optional,),
     same!(
         "storage-client-cert",
         "storage-client",
         Want::Cert,
-        Takes::Frontend,
         Need::Optional,
     ),
     same!(
         "storage-client-key",
         "storage-client",
         Want::Key,
-        Takes::Frontend,
         Need::Optional,
-    ),
-    same!(
-        "cold-store",
-        "stores",
-        Want::FileUri,
-        Takes::AllInOne,
-        Need::Required,
-    ),
-    same!(
-        "meta-dir",
-        "stores",
-        Want::Dir,
-        Takes::AllInOne,
-        Need::Required,
-    ),
-    renamed!(
-        "daemon-server",
-        "identity",
-        "server",
-        Want::Https,
-        Takes::AllInOne,
-        Need::Required,
-    ),
-    renamed!(
-        "daemon-ca-cert",
-        "identity",
-        "ca-cert",
-        Want::Cert,
-        Takes::AllInOne,
-        Need::Required,
-    ),
-    renamed!(
-        "daemon-cert",
-        "identity",
-        "cert",
-        Want::Cert,
-        Takes::AllInOne,
-        Need::Required,
-    ),
-    renamed!(
-        "daemon-key",
-        "identity",
-        "key",
-        Want::Key,
-        Takes::AllInOne,
-        Need::Required,
-    ),
-    same!(
-        "node-id",
-        "identity",
-        Want::NodeId,
-        Takes::AllInOne,
-        Need::Required,
-    ),
-    spec!(
-        None,
-        "daemon",
-        "driver",
-        Want::Dir,
-        Takes::AllInOne,
-        Need::Fixed("container"),
     ),
 ];
 
@@ -306,22 +151,22 @@ const SPECS: [Spec; 20] = [
 pub fn written(mode: Mode) -> Vec<(&'static str, &'static str)> {
     SPECS
         .iter()
-        .filter(|s| s.takes.mode(mode))
+        .filter(|_| mode == Mode::Frontend)
         .map(|s| (s.table, s.key))
         .collect()
 }
 
 /// The flags as the command line gave them. Each sets the `kbf` key of its name, in the
-/// `kbf.toml` of a `frontend` or `all-in-one` host.
+/// `kbf.toml` of a `frontend` host.
 #[derive(clap::Args, Clone, Debug, Default, PartialEq, Eq)]
 pub struct KbfFlags {
-    /// The public REAPI listener, as IP:PORT (kbf's --listen). frontend, all-in-one.
+    /// The public REAPI listener, as IP:PORT (kbf's --listen). frontend.
     #[arg(long)]
     pub listen: Option<String>,
-    /// The worker listener (daemons and storage nodes dial it), as IP:PORT. frontend, all-in-one.
+    /// The worker listener (storage nodes dial it), as IP:PORT. frontend.
     #[arg(long)]
     pub worker_listen: Option<String>,
-    /// The operator API listener, as IP:PORT; default 127.0.0.1:8982. frontend, all-in-one.
+    /// The operator API listener, as IP:PORT; default 127.0.0.1:8982. frontend.
     #[arg(long)]
     pub api_listen: Option<String>,
     /// The REAPI listener's certificate (PEM file, absolute path); needs --reapi-tls-key.
@@ -336,7 +181,7 @@ pub struct KbfFlags {
     /// The worker listener's private key (a file of mode 0600 owned by the service user).
     #[arg(long)]
     pub worker_tls_key: Option<String>,
-    /// The CA that daemons' and storage nodes' certificates must chain to.
+    /// The CA that storage nodes' certificates must chain to.
     #[arg(long)]
     pub worker_client_ca: Option<String>,
     /// The storage node the frontend proxies blobs to (kbf's --storage), as
@@ -355,37 +200,11 @@ pub struct KbfFlags {
     /// user). frontend.
     #[arg(long)]
     pub storage_client_key: Option<String>,
-    /// The cold store, as file:///absolute/path. Required for all-in-one.
-    #[arg(long)]
-    pub cold_store: Option<String>,
-    /// The directory of the metadata log, an absolute path outside the data directory.
-    /// Required for all-in-one.
-    #[arg(long)]
-    pub meta_dir: Option<String>,
-    /// The worker listener the daemon half dials, as https://host[:port] (kbf's --server); the
-    /// host must be a name of the worker certificate. Required for all-in-one.
-    #[arg(long)]
-    pub daemon_server: Option<String>,
-    /// The CA of the worker certificate, for the daemon half (kbf's --ca-cert). Required for
-    /// all-in-one.
-    #[arg(long)]
-    pub daemon_ca_cert: Option<String>,
-    /// The daemon half's client certificate (kbf's --cert), role daemon. Required for
-    /// all-in-one.
-    #[arg(long)]
-    pub daemon_cert: Option<String>,
-    /// The private key of --daemon-cert (a file of mode 0600 owned by the service user).
-    /// Required for all-in-one.
-    #[arg(long)]
-    pub daemon_key: Option<String>,
-    /// The daemon half's node name, a DNS label unique in the cell. Required for all-in-one.
-    #[arg(long)]
-    pub node_id: Option<String>,
 }
 
 impl KbfFlags {
     /// The flags by name, as given.
-    fn slots(&self) -> [(&'static str, &Option<String>); 19] {
+    fn slots(&self) -> [(&'static str, &Option<String>); 12] {
         [
             ("listen", &self.listen),
             ("worker-listen", &self.worker_listen),
@@ -399,13 +218,6 @@ impl KbfFlags {
             ("storage-ca", &self.storage_ca),
             ("storage-client-cert", &self.storage_client_cert),
             ("storage-client-key", &self.storage_client_key),
-            ("cold-store", &self.cold_store),
-            ("meta-dir", &self.meta_dir),
-            ("daemon-server", &self.daemon_server),
-            ("daemon-ca-cert", &self.daemon_ca_cert),
-            ("daemon-cert", &self.daemon_cert),
-            ("daemon-key", &self.daemon_key),
-            ("node-id", &self.node_id),
         ]
     }
 
@@ -424,22 +236,13 @@ impl KbfFlags {
         let mut bad = false;
         for s in &SPECS {
             let given = s.flag.and_then(|f| self.get(f));
-            if !s.takes.mode(mode) {
+            if mode != Mode::Frontend {
                 if let (Some(flag), Some(_)) = (s.flag, given) {
                     problems.push(format!(
-                        "--{flag} is for {}; --mode={name} does not take it",
-                        s.takes.who()
+                        "--{flag} is for {TAKEN_BY}; --mode={name} does not take it"
                     ));
                     bad = true;
                 }
-                continue;
-            }
-            if let Need::Fixed(v) = s.need {
-                out.push(Setting {
-                    table: s.table,
-                    key: s.key,
-                    value: v.to_owned(),
-                });
                 continue;
             }
             let value = match (given, s.need) {
@@ -526,18 +329,7 @@ fn check_value(kind: Want, value: &str) -> Result<(), &'static str> {
                 }
             }),
         Want::Cert | Want::Key => check_path(value),
-        Want::Dir => check_path(value),
-        Want::Url => check_url(value, false),
-        Want::Https => check_url(value, true),
-        Want::FileUri => match value.strip_prefix("file://") {
-            Some(path) if path.starts_with('/') => check_path(path),
-            Some(_) => Err("must be file:///absolute/path"),
-            None if value.starts_with("s3://") => Err(
-                "an s3:// store needs credentials in the environment, which setup does not manage: use file:///absolute/path",
-            ),
-            None => Err("must be file:///absolute/path"),
-        },
-        Want::NodeId => check_node_id(value),
+        Want::Url => check_url(value),
     }
 }
 
@@ -555,22 +347,6 @@ pub(super) fn check_path(value: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// A DNS label, as `kbf` makes a node id: `[a-z0-9-]`, 1 to 63 bytes, no `-` at either end.
-fn check_node_id(value: &str) -> Result<(), &'static str> {
-    let ok = !value.is_empty()
-        && value.len() <= 63
-        && value
-            .bytes()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
-        && !value.starts_with('-')
-        && !value.ends_with('-');
-    if ok {
-        Ok(())
-    } else {
-        Err("must be a DNS label: a-z, 0-9 and -, 1 to 63 bytes, no - at either end")
-    }
-}
-
 /// Whether `rest` is a host with a lone trailing `/` and nothing else odd.
 fn plain_but_slash(rest: &str) -> bool {
     rest.trim_end_matches('/')
@@ -578,13 +354,12 @@ fn plain_but_slash(rest: &str) -> bool {
         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':' | b'[' | b']'))
 }
 
-/// `http://host[:port]` or `https://host[:port]` (`https` only when `tls_only`), with no
-/// user, password, path, query or fragment. Plain `http` is for a loopback host, as `kbf`
+/// `http://host[:port]` or `https://host[:port]`, with no user, password, path, query or
+/// fragment. Plain `http` is for a loopback host, as `kbf`
 /// refuses it anywhere else.
-fn check_url(value: &str, tls_only: bool) -> Result<(), &'static str> {
+fn check_url(value: &str) -> Result<(), &'static str> {
     let (secure, rest) = match value.strip_prefix("https://") {
         Some(rest) => (true, rest),
-        None if tls_only => return Err("must be an https:// URL"),
         None => (
             false,
             value

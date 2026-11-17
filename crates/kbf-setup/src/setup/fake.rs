@@ -14,13 +14,7 @@ pub struct FakeOs {
     pub users: Vec<RunUser>,
     /// The login shell of an account named here; any other has the shell `setup` makes.
     pub shells: Vec<(String, String)>,
-    pub subuid: String,
-    pub subgid: String,
-    pub lingering: BTreeSet<String>,
     pub enabled: BTreeSet<String>,
-    pub loaded: BTreeSet<String>,
-    pub dscl_users: String,
-    pub dscl_groups: String,
     pub root: Owner,
     pub untrusted: bool,
     /// The bytes `random` returns, repeated to the length asked.
@@ -44,26 +38,12 @@ impl FakeOs {
         FakeOs {
             euid: 0,
             platform: Platform::Linux,
-            users: vec![user("kbf", 990), user("kbf-server", 989)],
+            users: vec![user("kbf-server", 989)],
             shells: Vec::new(),
-            subuid: String::new(),
-            subgid: String::new(),
-            lingering: BTreeSet::new(),
             enabled: BTreeSet::new(),
-            loaded: BTreeSet::new(),
-            dscl_users: String::new(),
-            dscl_groups: String::new(),
             root: Owner { uid: 0, gid: 0 },
             untrusted: false,
             random_byte: 0xab,
-        }
-    }
-
-    pub fn mac() -> FakeOs {
-        FakeOs {
-            platform: Platform::MacOs,
-            users: Vec::new(),
-            ..FakeOs::linux()
         }
     }
 }
@@ -96,10 +76,7 @@ impl Os for FakeOs {
     }
 
     fn login_shell(&self, name: &str) -> io::Result<String> {
-        let made = match self.platform {
-            Platform::Linux => "/usr/sbin/nologin",
-            Platform::MacOs => "/usr/bin/false",
-        };
+        let made = "/usr/sbin/nologin";
         Ok(self
             .shells
             .iter()
@@ -108,32 +85,8 @@ impl Os for FakeOs {
             .to_owned())
     }
 
-    fn subuid(&self) -> io::Result<String> {
-        Ok(self.subuid.clone())
-    }
-
-    fn subgid(&self) -> io::Result<String> {
-        Ok(self.subgid.clone())
-    }
-
-    fn lingers(&self, user: &str) -> io::Result<bool> {
-        Ok(self.lingering.contains(user))
-    }
-
     fn unit_enabled(&self, unit: &str) -> io::Result<bool> {
         Ok(self.enabled.contains(unit))
-    }
-
-    fn launchd_loaded(&self, label: &str) -> io::Result<bool> {
-        Ok(self.loaded.contains(label))
-    }
-
-    fn dscl_list(&self, what: &str) -> io::Result<String> {
-        Ok(if what.starts_with("/Users") {
-            self.dscl_users.clone()
-        } else {
-            self.dscl_groups.clone()
-        })
     }
 
     fn random(&self, len: usize) -> io::Result<Vec<u8>> {

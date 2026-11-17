@@ -9,43 +9,36 @@
 pub const FRONTEND: &str = "frontend";
 /// The storage node (the server half).
 pub const STORAGE: &str = "storage";
-/// The build node.
-pub const DAEMON: &str = "daemon";
-/// Storage and build node in one process.
-pub const STORAGE_AND_DAEMON: &str = "storage-and-daemon";
-/// Frontend, storage and build node in one process.
-pub const ALL_IN_ONE: &str = "all-in-one";
 
-/// Whether `name` is a mode that can read `kbf.toml` and enroll its host: the storage node,
-/// the build node and the two in one process. The frontend and all-in-one take their
-/// files as flags.
+/// The modes that were removed, as `--mode` spelled them ([`kbf_setup::cli::REMOVED_MODES`], one
+/// list for `kbf`, `kbf setup` and `kbf-installer setup`). They are no [`MODES`] rows and no
+/// values of `--mode`: asking for one exits 2 with [`REMOVED`].
+pub use kbf_setup::cli::REMOVED_MODES;
+
+/// What a command line that asks for a removed mode is told: kbf runs no daemon any more
+/// ([`kbf_setup::cli::MODE_REMOVED`]).
+pub use kbf_setup::cli::MODE_REMOVED as REMOVED;
+
+/// Whether `name` is a mode that can read `kbf.toml` and enroll its host: the storage node.
+/// The frontend takes its files as flags.
 #[must_use]
 pub fn is_registered(name: &str) -> bool {
-    matches!(name, STORAGE | DAEMON | STORAGE_AND_DAEMON)
+    name == STORAGE
 }
 
-/// Whether `name` is a mode that keeps its state in the Postgres database: the frontend and
-/// all-in-one. The others keep none, so `kbf boot-check` has nothing to migrate for them.
+/// Whether `name` is a mode that keeps its state in the Postgres database: the frontend. The
+/// storage node keeps none, so `kbf boot-check` has nothing to migrate for it.
 #[must_use]
 pub fn keeps_state_in_database(name: &str) -> bool {
-    matches!(name, FRONTEND | ALL_IN_ONE)
+    name == FRONTEND
 }
 
 /// What a mode runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Entry {
-    /// The worker daemon: `kbf_node::run`, the flags of `kbf-daemon`.
-    Daemon,
-    /// The server and the daemon in one process: `kbf_storage_and_daemon::run`, the flags of
-    /// `kbf-server` and of `kbf-daemon`.
-    AllInOne,
     /// The storage node: `kbf_server::storage_node::run`, `kbf-server`'s store, write and
     /// log flags and its own listener flags.
     Storage,
-    /// The storage node and the daemon in one process:
-    /// `kbf_storage_and_daemon::storage_and_daemon::run`, the flags of `kbf storage` and of
-    /// `kbf-daemon`.
-    StorageAndDaemon,
     /// The frontend: `kbf_server::frontend::run`, `kbf-server`'s listener, scheduler and
     /// log flags and its own storage flags.
     Frontend,
@@ -60,8 +53,8 @@ pub struct Mode {
     pub entry: Entry,
 }
 
-/// Every mode, in help order: exactly five.
-pub const MODES: [Mode; 5] = [
+/// Every mode, in help order: exactly two.
+pub const MODES: [Mode; 2] = [
     Mode {
         name: FRONTEND,
         entry: Entry::Frontend,
@@ -69,17 +62,5 @@ pub const MODES: [Mode; 5] = [
     Mode {
         name: STORAGE,
         entry: Entry::Storage,
-    },
-    Mode {
-        name: DAEMON,
-        entry: Entry::Daemon,
-    },
-    Mode {
-        name: STORAGE_AND_DAEMON,
-        entry: Entry::StorageAndDaemon,
-    },
-    Mode {
-        name: ALL_IN_ONE,
-        entry: Entry::AllInOne,
     },
 ];

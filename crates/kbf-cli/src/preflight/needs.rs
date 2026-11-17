@@ -7,7 +7,7 @@ use kbf_server::Args;
 use kbf_server::proxy_auth::SECRET_BYTES;
 use kbf_server::stores::StoreUri;
 
-use super::{CertNeed, ContainerNeed, FileNeed, KeyRule, Needs, Row, key_file};
+use super::{CertNeed, FileNeed, KeyRule, Needs, Row, key_file};
 use crate::Invocation;
 
 /// The needs of `invocation`.
@@ -24,12 +24,6 @@ pub fn needs_in(invocation: &Invocation, config: &Path) -> Needs {
         // The flags of a start that enrolls are made after it has: the start checks them
         // then (`node::run`).
         Invocation::Registered(start) => Needs::new(start.mode.unwrap_or("kbf")),
-        Invocation::Daemon(cli) => {
-            let mut n = Needs::new("daemon");
-            daemon(&mut n, cli);
-            n.key = KeyRule::Absent;
-            n
-        }
         Invocation::Storage(flags) => {
             let mut n = Needs::new("storage");
             storage(&mut n, flags);
@@ -45,29 +39,9 @@ pub fn needs_in(invocation: &Invocation, config: &Path) -> Needs {
                     Some(("--storage-client-key", key)),
                     Row::Frontend,
                     None,
-                    None,
                 );
                 n.secret("--storage-client-key", key);
                 n.file("--storage-ca", ca);
-            }
-            n
-        }
-        Invocation::StorageAndDaemon(flags) => {
-            let mut n = Needs::new("storage-and-daemon");
-            storage(&mut n, &flags.storage);
-            daemon(&mut n, &flags.daemon);
-            n.key = KeyRule::RootAlone(key_file(config));
-            n
-        }
-        Invocation::AllInOne(flags) => {
-            let mut n = Needs::new("all-in-one");
-            server_files(&mut n, &flags.server);
-            cold_keys(&mut n, &flags.server, true);
-            n.hot_store = hot_dir(&flags.server);
-            daemon(&mut n, &flags.daemon);
-            // An all-in-one with an S3 cold store holds the key on purpose.
-            if !s3(&flags.server) {
-                n.key = KeyRule::Absent;
             }
             n
         }
@@ -81,9 +55,7 @@ impl Needs {
             files: Vec::new(),
             certs: Vec::new(),
             s3: false,
-            container: None,
             hot_store: None,
-            cpuset: false,
             key: KeyRule::None,
         }
     }
@@ -124,7 +96,6 @@ impl Needs {
         key: Option<(&'static str, &Path)>,
         row: Row,
         ca: Option<(&'static str, &Path)>,
-        node_id: Option<&str>,
     ) {
         self.file(flag, path);
         self.certs.push(CertNeed {
@@ -133,7 +104,6 @@ impl Needs {
             row,
             key: key.map(|(flag, path)| (flag, path.to_owned())),
             ca: ca.map(|(flag, path)| (flag, path.to_owned())),
-            node_id: node_id.map(str::to_owned),
         });
     }
 }
@@ -185,7 +155,6 @@ fn server_files(n: &mut Needs, a: &Args) {
                 .map(|key| ("--worker-tls-key", key)),
             Row::Frontend,
             ca.map(|ca| ("--worker-client-ca", ca)),
-            None,
         );
     }
     if let Some(key) = &a.worker_tls_key {
@@ -220,27 +189,8 @@ fn storage(n: &mut Needs, flags: &kbf_server::storage_node::StorageFlags) {
             Some(("--storage-tls-key", key)),
             Row::Storage,
             Some(("--storage-client-ca", ca)),
-            None,
         );
         n.secret("--storage-tls-key", key);
         n.file("--storage-client-ca", ca);
     }
-}
-
-fn daemon(n: &mut Needs, cli: &kbf_node::Cli) {
-    let d = cli.host_needs();
-    n.cert(
-        ("--cert", &d.cert),
-        Some(("--key", &d.key)),
-        Row::Daemon,
-        Some(("--ca-cert", &d.ca_cert)),
-        Some(&d.node_id),
-    );
-    n.file("--ca-cert", &d.ca_cert);
-    n.secret("--key", &d.key);
-    n.container = d.container.map(|c| ContainerNeed {
-        oci_runtime: c.oci_runtime,
-    });
-    // Leases are placed on the node's CPUs and NUMA nodes by the container driver.
-    n.cpuset = n.container.is_some();
 }

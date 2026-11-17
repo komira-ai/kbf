@@ -1,6 +1,6 @@
 //! `kbf frontend` as a separate process in front of a `kbf storage` process
 //! (docs/design/architecture-v2.md, section 13 P2): the REAPI conformance suite
-//! (`kbf-cas-conformance`) run by the daemon's transfer engine over real gRPC to the
+//! (`kbf-cas-conformance`) run by the transfer engine over real gRPC to the
 //! frontend, which proxies to the node; and the start, health and stop of the frontend
 //! process. Nothing is in-process: the frontend, its proxy and the node's store are
 //! children.
@@ -254,6 +254,67 @@ fn a_refused_frontend_start_exits_2() {
         assert!(!err.contains("hunter2"), "{args:?}: {err}");
         assert!(out.stdout.is_empty(), "{args:?}");
     }
+}
+
+/// Catches `kbf --mode=frontend --scheduler-core=js` still starting (a farm that runs the
+/// legacy core while the flag says js), a refusal with a status other than 2, and one whose
+/// message does not name the flag and say the js core was removed: the start ends with status 2
+/// before a start line, its stderr names `--scheduler-core` and says `the js scheduler core was
+/// removed`, it logs no core, and its state store is left uncreated (the refusal comes before
+/// anything opens).
+#[test]
+fn scheduler_core_js_is_refused_with_a_message() {
+    let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "frontend-js-core-refused");
+    let state = dir.join("state.db");
+    let out = refused_core_start(&dir, &state, "--scheduler-core=js");
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{said}");
+    assert!(out.stdout.is_empty(), "the frontend started");
+    assert!(said.contains("--scheduler-core"), "{said}");
+    assert!(said.contains("the js scheduler core was removed"), "{said}");
+    assert!(!said.contains("scheduler core:"), "a core ran: {said}");
+    assert!(!state.exists(), "{} was created", state.display());
+}
+
+/// Catches `--usage-profiles=record` or `--usage-profiles=on`, which needed the removed js
+/// core, starting a frontend, a refusal with a status other than 2, and a message that does
+/// not name the flag and its value: each ends the start with status 2 before a start line, its
+/// stderr holds the whole message for that value, and its state store is left uncreated.
+#[test]
+fn flags_that_needed_the_js_core_are_refused_with_a_message() {
+    let dir = TestDir::under(
+        env!("CARGO_TARGET_TMPDIR"),
+        "frontend-usage-profiles-refused",
+    );
+    for value in ["record", "on"] {
+        let state = dir.join(format!("state-{value}.db"));
+        let flag = format!("--usage-profiles={value}");
+        let out = refused_core_start(&dir, &state, &flag);
+        let said = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{flag}: {said}");
+        assert!(out.stdout.is_empty(), "{flag}: the frontend started");
+        let message = format!(
+            "--usage-profiles {value} needs the js scheduler core, which was removed: \
+             scheduling runs in the job service; leave the flag out or use --usage-profiles off"
+        );
+        assert!(said.contains(&message), "{flag}: {said}");
+        assert!(!state.exists(), "{flag}: {} was created", state.display());
+    }
+}
+
+/// `kbf --mode=frontend` with `flag` added, over a state store at `state`, run to its end.
+fn refused_core_start(dir: &Path, state: &Path, flag: &str) -> std::process::Output {
+    Command::new(BIN)
+        .args([
+            "--mode=frontend".to_owned(),
+            "--listen=127.0.0.1:0".to_owned(),
+            "--storage=http://127.0.0.1:1".to_owned(),
+            format!("--state-store=sqlite://{}", state.display()),
+            kbf_testkit::config::flag(dir),
+            flag.to_owned(),
+        ])
+        .output()
+        .expect("run kbf")
 }
 
 /// Asserts that a frontend given neither `--state-store` nor a settings file with the key

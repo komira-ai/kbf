@@ -12,12 +12,12 @@ fn scratch(name: &str) -> kbf_testkit::dir::TestDir {
 }
 
 /// Catches a start that stops at the first problem, or that goes on to start on a host it
-/// should refuse: a daemon whose CA file is missing, whose certificate file holds no
+/// should refuse: a storage node whose CA file is missing, whose certificate file holds no
 /// certificate and whose key is readable by its group exits 2 naming all three, and
 /// prints nothing on stdout.
 #[test]
-fn a_daemon_on_a_wrong_host_names_every_problem_and_exits_2() {
-    let dir = scratch("preflight-daemon");
+fn a_storage_node_on_a_wrong_host_names_every_problem_and_exits_2() {
+    let dir = scratch("preflight-wrong-host");
     let cert = dir.join("node.pem");
     let key = dir.join("node.key");
     std::fs::write(&cert, "not a certificate").expect("write");
@@ -25,15 +25,21 @@ fn a_daemon_on_a_wrong_host_names_every_problem_and_exits_2() {
     std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o640)).expect("mode");
     let out = Command::new(BIN)
         .args([
-            "daemon",
-            "--driver=native",
-            "--server=https://127.0.0.1:1",
-            "--node-id=n",
+            "storage",
+            "--storage-listen=127.0.0.1:0",
+            "--cold-store-floor-bytes=1",
         ])
-        .arg(format!("--ca-cert={}", dir.join("ca.pem").display()))
-        .arg(format!("--cert={}", cert.display()))
-        .arg(format!("--key={}", key.display()))
-        .arg(format!("--data-dir={}", dir.join("data").display()))
+        .arg(format!(
+            "--cold-store=file://{}",
+            dir.join("cold").display()
+        ))
+        .arg(format!("--meta-dir={}", dir.join("meta").display()))
+        .arg(format!(
+            "--storage-client-ca={}",
+            dir.join("ca.pem").display()
+        ))
+        .arg(format!("--storage-tls-cert={}", cert.display()))
+        .arg(format!("--storage-tls-key={}", key.display()))
         .output()
         .expect("run kbf");
     let err = String::from_utf8_lossy(&out.stderr);
@@ -41,28 +47,31 @@ fn a_daemon_on_a_wrong_host_names_every_problem_and_exits_2() {
     assert!(out.stdout.is_empty());
     let lines: Vec<&str> = err.lines().collect();
     assert_eq!(lines.len(), 3, "{err}");
-    assert!(lines.iter().all(|l| l.starts_with("kbf daemon: ")), "{err}");
     assert!(
-        lines
-            .iter()
-            .any(|l| l.contains("--ca-cert") && l.contains("does not exist")),
+        lines.iter().all(|l| l.starts_with("kbf storage: ")),
         "{err}"
     );
     assert!(
         lines
             .iter()
-            .any(|l| l.contains("--cert") && l.contains("holds no certificate")),
+            .any(|l| l.contains("--storage-client-ca") && l.contains("does not exist")),
         "{err}"
     );
     assert!(
         lines
             .iter()
-            .any(|l| l.contains("--key") && l.contains("chmod 600")),
+            .any(|l| l.contains("--storage-tls-cert") && l.contains("holds no certificate")),
         "{err}"
     );
     assert!(
-        !dir.join("data").exists(),
-        "a refused start made its data directory"
+        lines
+            .iter()
+            .any(|l| l.contains("--storage-tls-key") && l.contains("chmod 600")),
+        "{err}"
+    );
+    assert!(
+        !dir.join("meta").exists(),
+        "a refused start made its metadata directory"
     );
 }
 

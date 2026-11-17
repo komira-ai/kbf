@@ -1,8 +1,7 @@
 //! The host rules `kbf-deploy linux check-units` had (rules `credential` and `traverse`),
 //! in the `kbf` binary: `kbf <mode> --check` refuses what they refused, reading the
-//! process's own environment and ids. (Each rule's cases, and the key file and cgroup
-//! rules, are the unit tests of `src/preflight`; a process test cannot plant
-//! `/etc/kbf/s3.env` or the node's cgroup.) Every run passes `--config` so the host's own
+//! process's own environment and ids. (Each rule's cases, and the key file rule, are the unit
+//! tests of `src/preflight`; a process test cannot plant `/etc/kbf/s3.env`.) Every run passes `--config` so the host's own
 //! `/etc/kbf/kbf.toml` is not read.
 
 use std::os::unix::fs::PermissionsExt as _;
@@ -25,47 +24,8 @@ fn kbf(dir: &std::path::Path, mode: &str, args: &[String]) -> Command {
     c
 }
 
-fn daemon(dir: &std::path::Path) -> Command {
-    kbf(
-        dir,
-        "daemon",
-        &[
-            "--driver=native".to_owned(),
-            "--server=https://127.0.0.1:1".to_owned(),
-            "--node-id=n".to_owned(),
-            format!("--ca-cert={}", dir.join("ca.pem").display()),
-            format!("--cert={}", dir.join("node.pem").display()),
-            format!("--key={}", dir.join("node.key").display()),
-            format!("--data-dir={}", dir.join("data").display()),
-        ],
-    )
-}
-
 fn stderr(out: &Output) -> String {
     String::from_utf8_lossy(&out.stderr).into_owned()
-}
-
-/// Catches rule `credential` not wired to a start: a daemon whose environment holds the
-/// key pair exits 2 naming both variables, and the same daemon without them says nothing
-/// about the environment (its own missing files are the only problems).
-#[test]
-fn a_daemon_with_a_key_in_its_environment_is_refused() {
-    let dir = scratch("aws");
-    let with = daemon(&dir)
-        .env("AWS_ACCESS_KEY_ID", "a")
-        .env("AWS_SECRET_ACCESS_KEY", "b")
-        .output()
-        .expect("run kbf");
-    let err = stderr(&with);
-    assert_eq!(with.status.code(), Some(2), "{err}");
-    assert!(
-        err.contains("the environment sets AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY"),
-        "{err}"
-    );
-    let without = daemon(&dir).output().expect("run kbf");
-    let err = stderr(&without);
-    assert_eq!(without.status.code(), Some(2), "{err}");
-    assert!(!err.contains("the environment sets"), "{err}");
 }
 
 /// Catches rule `traverse` not wired to a start: a storage node whose `--hot-store` is

@@ -1,4 +1,4 @@
-//! The start of `storage`, `daemon` and `storage-and-daemon` when it is given no mode flags:
+//! The start of `storage` when it is given no mode flags:
 //! `kbf --mode=<mode> [--config FILE]`, or `kbf` alone with `mode = "..."` in the file
 //! (`docs/design/install-and-enrollment.md`, section 4.4). There is no `node` word and no
 //! mode that is "a node": the host's config states what it is.
@@ -29,11 +29,7 @@
 //! enrolled `node.json` that does not cover the mode.
 //!
 //! **What the certificate files reach.** A storage node's listener reads its certificate
-//! again every `NodeConfig.tls_reload_interval_s` (`kbf-tls`), and a daemon's connections
-//! to the frontend and to the storage nodes read theirs when they are made
-//! (`kbf-daemon`), so a renewal needs no restart. The daemon's one connection that does
-//! not follow the files is the transfer engine over `--cas` (`kbf-node`), which a daemon
-//! uses only until the frontend sends it a map.
+//! again every `NodeConfig.tls_reload_interval_s` (`kbf-tls`), so a renewal needs no restart.
 //!
 //! **The object store.** A storage node is given no store and no key: it is started with
 //! `--cold-store registered`, so the store is the one the frontend has registered for the
@@ -80,29 +76,6 @@ pub struct Start {
     pub config: PathBuf,
     /// Check the host and exit, starting and enrolling nothing.
     pub check: bool,
-}
-
-/// How the daemon half runs its leases on this platform. The only driver a node started
-/// by `kbf` has is the container driver (Linux): a macOS action runs as a `js-agent` job
-/// on the Mac (`docs/design/actions-as-jobs.md`, section 14), not in a daemon.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Driver {
-    /// Containers: Linux.
-    Container,
-}
-
-impl Driver {
-    /// The driver of the machine this is built for.
-    #[must_use]
-    pub const fn host() -> Self {
-        Self::Container
-    }
-
-    const fn name(self) -> &'static str {
-        match self {
-            Self::Container => "container",
-        }
-    }
 }
 
 /// `--name=value` as one argument.
@@ -159,64 +132,22 @@ fn storage_flags(
     Ok(out)
 }
 
-/// The daemon half's flags; `with_cas` for a daemon with no storage in its process.
-fn daemon_flags(
-    config: &Config,
-    stored: &StoredConfig,
-    store: &Store,
-    driver: Driver,
-    with_cas: bool,
-) -> Vec<OsString> {
-    let mut out = vec![
-        flag("driver", driver.name()),
-        flag("server", &stored.worker_endpoint),
-    ];
-    if with_cas {
-        let cas = if stored.cas_endpoint.is_empty() {
-            &stored.worker_endpoint
-        } else {
-            &stored.cas_endpoint
-        };
-        out.push(flag("cas", cas));
-    }
-    out.extend([
-        flag("ca-cert", store.ca_path()),
-        flag("cert", store.cert_path(Role::Daemon)),
-        flag("key", store.key_path(Role::Daemon)),
-        flag("node-id", config.node_id.as_str()),
-        flag("data-dir", &config.data_dir),
-    ]);
-    if let Some(cpus) = config.reserve_cpus {
-        out.push(flag("reserve-cpus", cpus.to_string()));
-    }
-    out
-}
-
-/// The command line of the mode the node runs, `kbf <mode> <flags>`.
+/// The command line of the mode the node runs, `kbf --mode=<mode> <flags>`.
 ///
 /// # Errors
-/// [`Failure::Plan`]: the frontend sent no worker endpoint, or (for storage) no storage
-/// port.
+/// [`Failure::Plan`]: the frontend sent no worker endpoint or no storage port.
 pub fn plan(
     config: &Config,
     node: &Enrolled,
     store: &Store,
-    driver: Driver,
     want: Want,
 ) -> Result<Vec<OsString>, Failure> {
-    let (mode, roles) = (want.mode, want.roles);
     let stored = &node.config;
     if stored.worker_endpoint.is_empty() {
         return Err(missing("worker endpoint"));
     }
-    let mut argv = vec![OsString::from("kbf"), flag("mode", mode)];
-    if roles.contains(Role::Storage) {
-        argv.extend(storage_flags(config, stored, store)?);
-    }
-    if roles.contains(Role::Daemon) {
-        let with_cas = !roles.contains(Role::Storage);
-        argv.extend(daemon_flags(config, stored, store, driver, with_cas));
-    }
+    let mut argv = vec![OsString::from("kbf"), flag("mode", want.mode)];
+    argv.extend(storage_flags(config, stored, store)?);
     Ok(argv)
 }
 
@@ -400,7 +331,7 @@ fn enroll_with_retry(
 ///
 /// # Errors
 /// [`Failure::NoMode`] when neither names one, [`Failure::BadMode`] for a file that
-/// names something that is not a mode, [`Failure::FlagsOnly`] for a mode that does not
+/// names something that is not a mode, [`Failure::RemovedMode`] for one that names a removed mode, [`Failure::FlagsOnly`] for a mode that does not
 /// read `kbf.toml`.
 pub fn resolve_mode(
     flag: Option<&'static str>,
@@ -409,6 +340,12 @@ pub fn resolve_mode(
 ) -> Result<(Want, Option<String>), Failure> {
     let modes = || names::MODES.map(|m| m.name).join("|");
     let from_file = match file {
+        Some(name) if names::REMOVED_MODES.contains(&name) => {
+            return Err(Failure::RemovedMode {
+                path: path.display().to_string(),
+                value: name.to_owned(),
+            });
+        }
         Some(name) => Some(
             names::MODES
                 .iter()
@@ -444,13 +381,7 @@ pub fn resolve_mode(
 /// A node that is not enrolled yet is checked for what it will enroll with (`kbf.toml`
 /// and its token file); an enrolled one gets the checks of any start
 /// ([`preflight::check_only`]) on the flags its enrollment makes.
-fn check(
-    loaded: &Loaded,
-    path: &Path,
-    want: Want,
-    env: &Env,
-    driver: Driver,
-) -> Result<ExitCode, Failure> {
+fn check(loaded: &Loaded, path: &Path, want: Want, env: &Env) -> Result<ExitCode, Failure> {
     crate::check_settings(want.mode, path).map_err(Failure::Settings)?;
     let Some(node) = enrolled(loaded, want)? else {
         // Not enrolled yet: the token must be there to enroll with (and be a token).
@@ -467,7 +398,7 @@ fn check(
         );
         return Ok(ExitCode::SUCCESS);
     };
-    let argv = plan(&loaded.config, &node, &loaded.store, driver, want)?;
+    let argv = plan(&loaded.config, &node, &loaded.store, want)?;
     let invocation = parse_planned(argv, path).map_err(Failure::Mode)?;
     println!(
         "kbf: --check: mode {} is configured and this node is enrolled as {}",
@@ -485,7 +416,6 @@ fn check(
 pub fn run_with(
     args: &Start,
     env: &Env,
-    driver: Driver,
     launch: &dyn Fn(&Invocation) -> ExitCode,
 ) -> Result<ExitCode, Failure> {
     let loaded = match load(&args.config, env) {
@@ -503,7 +433,7 @@ pub fn run_with(
         eprintln!("kbf: {note}");
     }
     if args.check {
-        return check(&loaded, &args.config, want, env, driver);
+        return check(&loaded, &args.config, want, env);
     }
     // Before the token is spent: a table that is no setting of the mode would be found
     // only after the node had enrolled.
@@ -516,7 +446,7 @@ pub fn run_with(
              build does not, and the object-store client uses the credentials of this process"
         );
     }
-    let argv = plan(&loaded.config, &node, &loaded.store, driver, want)?;
+    let argv = plan(&loaded.config, &node, &loaded.store, want)?;
     let invocation = parse_planned(argv, &args.config).map_err(Failure::Mode)?;
 
     let renewer = Renewer::new(&loaded, &node, env, jitter());
@@ -538,7 +468,7 @@ pub fn run_with(
 #[must_use]
 pub fn run(args: &Start) -> ExitCode {
     // The checks of any start, on the flags the enrollment made.
-    run_with(args, &Env::system(), Driver::host(), &|invocation| {
+    run_with(args, &Env::system(), &|invocation| {
         crate::start(invocation, &args.config)
     })
     .unwrap_or_else(|failure| report(&failure))

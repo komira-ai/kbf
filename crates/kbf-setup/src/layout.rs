@@ -22,12 +22,8 @@
 //!   manifest.json, kbf-<commit>-<platform>.tar.gz, and that file with .sigstore.json
 //! ```
 //!
-//! macOS differs in these paths ([`Platform`]): the configuration directory is
-//! `/usr/local/etc/kbf` (`kbf.toml`, `installer.toml`, the tokens), the installer tree is root's
-//! `/usr/local/kbf-installer` (never a user-owned Homebrew prefix), the state is in
-//! `/var/db/kbf-installer` (with `work/`), the lock is `/var/run/kbf-installer/lock`, and the
-//! trust directory is `/usr/local/kbf-installer/trust` (the pkg's PREFIX/trust) and the seed
-//! directory `/usr/local/kbf-installer/seed/<commit12>` (PREFIX/seed).
+//! The configuration directory is `/etc/kbf` (`kbf.toml`, `installer.toml`, the tokens). Only
+//! Linux hosts run kbf, so [`Platform`] has the one value.
 //!
 //! Nothing else is named anywhere else: `kbf-deploy host ...`, the helper and the tests ask a
 //! [`Layout`]. The kbf runtime's own state, `/var/lib/kbf`, is not here and is never touched.
@@ -43,12 +39,9 @@ use kbf_host::path::{HostPath, Root};
 
 use super::CommitId;
 
-/// The installer's tree, and where its state is, per platform.
+/// The installer's tree, and where its state is.
 const LINUX_ROOT: &str = "/var/lib/kbf-installer";
-const MACOS_ROOT: &str = "/usr/local/kbf-installer";
-const MACOS_STATE_DIR: &str = "/var/db/kbf-installer";
 const LINUX_LOCK: &str = "/run/kbf-installer/lock";
-const MACOS_LOCK: &str = "/var/run/kbf-installer/lock";
 const LINUX_TRUST: &str = "/usr/share/kbf/trust";
 /// Where the trust directory was while the `kbf-installer` package carried it. A host that has
 /// not yet been given the `kbf` package that carries [`LINUX_TRUST`] still has its files here.
@@ -56,24 +49,14 @@ const LINUX_TRUST: &str = "/usr/share/kbf/trust";
 /// REMOVE IN v0.0.9: the release after the first one whose `kbf` package carries the trust
 /// directory (v0.0.8). Delete this constant, [`Layout::with_trust_fallback`] and its callers.
 const LINUX_TRUST_LEGACY: &str = "/usr/share/kbf-installer/trust";
-const MACOS_TRUST: &str = "/usr/local/kbf-installer/trust";
-/// What the package installs: the trust directory and the seed directory are in it. The
-/// Mac pkg installs into the installer's own tree.
+/// What the package installs: the trust directory and the seed directory are in it.
 const LINUX_PACKAGE: &str = "/usr/share/kbf-installer";
-const MACOS_PACKAGE: &str = MACOS_ROOT;
-/// The configuration directory, and the files `setup` keeps in it: `/etc/kbf` on Linux,
-/// `/usr/local/etc/kbf` on macOS (the launchd gate of the installer's job waits on the
-/// `installer.toml` there).
+/// The configuration directory, and the files `setup` keeps in it.
 const LINUX_CONFIG_DIR: &str = "/etc/kbf";
-const MACOS_CONFIG_DIR: &str = "/usr/local/etc/kbf";
 const LINUX_CONFIG: &str = "/etc/kbf/kbf.toml";
-const MACOS_CONFIG: &str = "/usr/local/etc/kbf/kbf.toml";
 const LINUX_INSTALLER_TOML: &str = "/etc/kbf/installer.toml";
-const MACOS_INSTALLER_TOML: &str = "/usr/local/etc/kbf/installer.toml";
 const LINUX_ENROLL_TOKEN: &str = "/etc/kbf/enroll.token";
-const MACOS_ENROLL_TOKEN: &str = "/usr/local/etc/kbf/enroll.token";
 const LINUX_API_TOKEN: &str = "/etc/kbf/api-token";
-const MACOS_API_TOKEN: &str = "/usr/local/etc/kbf/api-token";
 
 /// The directory of the packaged releases, one per build of the installer, in the package's
 /// directory.
@@ -104,132 +87,81 @@ pub const STATE_FILE: &str = "state.json";
 pub const STATE_BACKUP: &str = "state.json.bak";
 
 /// The names inside a release directory: its binaries, its systemd units and the
-/// manifest that lists them. Both platforms' releases hold `kbf`; it is the only binary
-/// a macOS release holds (the LaunchDaemon runs `current/kbf daemon`). A Linux release
-/// may also hold `kbf-daemon`, the separate daemon binary only Linux is built with.
+/// manifest that lists them. A release holds `kbf`, its only binary.
 pub const RELEASE_BINARY: &str = "kbf";
-pub const RELEASE_DAEMON: &str = "kbf-daemon";
 pub const RELEASE_UNITS: &str = "units";
 pub const RELEASE_MANIFEST: &str = "manifest.json";
-/// Every binary a release may hold, in the order they are copied and reported.
-pub const RELEASE_BINARIES: [&str; 2] = [RELEASE_BINARY, RELEASE_DAEMON];
 /// The marker written into a release directory once every check has passed. The verify
 /// pipeline writes it with the commit. (The proxy once kept copies of its own that wrote it with
 /// the sha256 of their binary; that supervision was removed.)
 pub const VERIFIED: &str = "VERIFIED";
 
-/// The operating system a host runs: what decides where its state and lock are.
+/// The operating system a host runs: what decides where its state and lock are. Only Linux
+/// hosts run kbf.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Platform {
     Linux,
-    MacOs,
 }
 
 impl Platform {
-    /// The platform this program was built for: macOS, else Linux.
+    /// The platform this program runs kbf on.
     pub fn current() -> Platform {
-        Platform::named(std::env::consts::OS)
+        Platform::Linux
     }
 
-    /// The user database this platform has: `getent` on Linux, `dscl` on a Mac. The platform
-    /// is the layout's, not the build's, so a rehearsal and a test see the platform they plan.
+    /// The user database this platform has: `getent`.
     pub fn user_db(self) -> kbf_host::user::UserDb {
-        match self {
-            Platform::Linux => kbf_host::user::UserDb::Getent,
-            Platform::MacOs => kbf_host::user::UserDb::Dscl,
-        }
+        kbf_host::user::UserDb::Getent
     }
 
-    /// The platform Rust calls `os` (`macos`, else Linux).
-    pub fn named(os: &str) -> Platform {
-        if os == "macos" {
-            Platform::MacOs
-        } else {
-            Platform::Linux
-        }
-    }
-
-    /// `linux` or `macos`, as the command line spells it.
+    /// `linux`, as the command line spells it.
     pub fn name(self) -> &'static str {
-        match self {
-            Platform::Linux => "linux",
-            Platform::MacOs => "macos",
-        }
+        "linux"
     }
 
     fn root(self) -> &'static str {
-        match self {
-            Platform::Linux => LINUX_ROOT,
-            Platform::MacOs => MACOS_ROOT,
-        }
+        LINUX_ROOT
     }
 
     fn state_dir(self) -> &'static str {
-        match self {
-            Platform::Linux => LINUX_ROOT,
-            Platform::MacOs => MACOS_STATE_DIR,
-        }
+        LINUX_ROOT
     }
 
     fn lock(self) -> &'static str {
-        match self {
-            Platform::Linux => LINUX_LOCK,
-            Platform::MacOs => MACOS_LOCK,
-        }
+        LINUX_LOCK
     }
 
     /// kbf's configuration directory.
     pub fn config_dir(self) -> &'static str {
-        match self {
-            Platform::Linux => LINUX_CONFIG_DIR,
-            Platform::MacOs => MACOS_CONFIG_DIR,
-        }
+        LINUX_CONFIG_DIR
     }
 
     /// The node's `kbf.toml`.
     pub fn kbf_toml(self) -> &'static str {
-        match self {
-            Platform::Linux => LINUX_CONFIG,
-            Platform::MacOs => MACOS_CONFIG,
-        }
+        LINUX_CONFIG
     }
 
     /// The installer's settings, `installer.toml`.
     pub fn installer_toml(self) -> &'static str {
-        match self {
-            Platform::Linux => LINUX_INSTALLER_TOML,
-            Platform::MacOs => MACOS_INSTALLER_TOML,
-        }
+        LINUX_INSTALLER_TOML
     }
 
     /// The enrollment token `setup` places.
     pub fn enroll_token(self) -> &'static str {
-        match self {
-            Platform::Linux => LINUX_ENROLL_TOKEN,
-            Platform::MacOs => MACOS_ENROLL_TOKEN,
-        }
+        LINUX_ENROLL_TOKEN
     }
 
     /// The first operator token.
     pub fn api_token(self) -> &'static str {
-        match self {
-            Platform::Linux => LINUX_API_TOKEN,
-            Platform::MacOs => MACOS_API_TOKEN,
-        }
+        LINUX_API_TOKEN
     }
 
     fn trust(self) -> &'static str {
-        match self {
-            Platform::Linux => LINUX_TRUST,
-            Platform::MacOs => MACOS_TRUST,
-        }
+        LINUX_TRUST
     }
 
     fn package(self) -> &'static str {
-        match self {
-            Platform::Linux => LINUX_PACKAGE,
-            Platform::MacOs => MACOS_PACKAGE,
-        }
+        LINUX_PACKAGE
     }
 }
 
@@ -239,8 +171,7 @@ impl std::str::FromStr for Platform {
     fn from_str(name: &str) -> Result<Platform, String> {
         match name {
             "linux" => Ok(Platform::Linux),
-            "macos" => Ok(Platform::MacOs),
-            _ => Err(format!("{name:?} is not a platform (linux or macos)")),
+            _ => Err(format!("{name:?} is not a platform (linux)")),
         }
     }
 }
@@ -276,10 +207,8 @@ impl Layout {
     /// REMOVE IN v0.0.9, with [`LINUX_TRUST_LEGACY`].
     #[must_use]
     pub fn with_trust_fallback(mut self) -> Layout {
-        if self.platform == Platform::Linux {
-            let is_dir = |dir: &str| self.root.join(&path(dir)).is_dir();
-            self.trust_legacy = !is_dir(LINUX_TRUST) && is_dir(LINUX_TRUST_LEGACY);
-        }
+        let is_dir = |dir: &str| self.root.join(&path(dir)).is_dir();
+        self.trust_legacy = !is_dir(LINUX_TRUST) && is_dir(LINUX_TRUST_LEGACY);
         self
     }
 
@@ -292,7 +221,7 @@ impl Layout {
         }
     }
 
-    /// A Linux host's layout under `root`.
+    /// A host's layout under `root`.
     pub fn linux(root: Root) -> Layout {
         Layout::new(root, Platform::Linux)
     }
@@ -342,7 +271,7 @@ impl Layout {
         )
     }
 
-    /// `releases/<commit>/<name>`, for a name of [`RELEASE_BINARY`], [`RELEASE_DAEMON`],
+    /// `releases/<commit>/<name>`, for a name of [`RELEASE_BINARY`],
     /// [`RELEASE_UNITS`] or [`RELEASE_MANIFEST`].
     pub fn release_file(&self, commit: &CommitId, name: &'static str) -> HostPath {
         path_in(&self.release_dir(commit).to_string(), name)
@@ -357,7 +286,7 @@ impl Layout {
         )
     }
 
-    /// The directory the state is in (the install root on Linux, `/var/db` on macOS).
+    /// The directory the state is in (the install root).
     pub fn state_dir(&self) -> HostPath {
         path(self.platform.state_dir())
     }
@@ -372,15 +301,13 @@ impl Layout {
         path_in(self.platform.state_dir(), STATE_BACKUP)
     }
 
-    /// The state directory, root's: where `status.json` is written. The node no longer reads
-    /// it (the node's update client was removed; a node's `update-dir` is a retired flag).
+    /// The state directory, root's: where `status.json` is written.
     pub fn update_dir(&self) -> HostPath {
         self.state_dir()
     }
 
     /// The order spool, `orders/` in the state directory: owned by the user the node runs
-    /// as (mode 0700, inside root's directory). A node's `kbf.toml` names it as
-    /// `[daemon] orders-dir`.
+    /// as (mode 0700, inside root's directory).
     pub fn orders_dir(&self) -> HostPath {
         path_in(self.platform.state_dir(), ORDERS)
     }
@@ -405,7 +332,7 @@ impl Layout {
         path(self.platform.config_dir())
     }
 
-    /// The installer's settings: the file the launchd gate waits on, on a Mac.
+    /// The installer's settings, `installer.toml`.
     pub fn installer_toml(&self) -> HostPath {
         path(self.platform.installer_toml())
     }

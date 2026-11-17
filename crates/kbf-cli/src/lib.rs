@@ -1,18 +1,17 @@
-//! `kbf`: one binary with five modes (docs/design/cluster.md, sections 1 and 5.1), named
+//! `kbf`: one binary with two modes (docs/design/cluster.md, sections 1 and 5.1), named
 //! and mapped to what they run in one table, [`names::MODES`].
 //!
-//! **The mode is a flag, never a word.** `kbf --mode=frontend|storage|daemon|storage-and-daemon`,
+//! **The mode is a flag, never a word.** `kbf --mode=frontend|storage`,
 //! or `mode = "..."` in `kbf.toml` (`kbf` alone reads it); a flag overrides the file and the
-//! start says so. The old subcommand forms (`kbf frontend`, `kbf storage`, ...) are hidden
+//! start says so. The old subcommand forms (`kbf frontend`, `kbf storage`) are hidden
 //! aliases that run exactly as before, kept until the units and the test farm move
 //! (they are the table's rows, so `kbf --help` lists the modes once, under `--mode`).
 //! Every other word after `kbf` is refused.
 //!
-//! - `daemon`: the build node. Takes exactly the flags `kbf-daemon` takes
-//!   ([`kbf_node::Cli`]) and refuses, by name, every flag of another mode.
-//! - `all-in-one`: removed. Every way to ask for it (`--mode`, the hidden word, `mode =` in
-//!   `kbf.toml`, `--check`, `boot-check`, `setup`) exits 2 with [`ALL_IN_ONE_REMOVED`]; the
-//!   table row and the flags it parsed stay for one release.
+//! - `daemon`, `storage-and-daemon` and `all-in-one`: removed ([`names::REMOVED_MODES`]). Every
+//!   way to ask for one (`--mode`, the hidden word, `mode =` in `kbf.toml`, `--check`,
+//!   `boot-check`, `setup`) exits 2 with [`REMOVED`]: kbf runs no daemon any more, placed actions
+//!   run as js-agent jobs of the frontend, and a storage node runs `--mode=storage`.
 //! - `storage`: the storage node ([`kbf_server::storage_node`]). Takes
 //!   `kbf-server`'s store, write and log flags and its own listener flags, and refuses
 //!   every other flag of `kbf-server` (and so any state-store flag: a storage node
@@ -23,20 +22,15 @@
 //!   flags instead) and the flags of its mutual TLS to the storage node; refuses every other flag of
 //!   `kbf-server` (a frontend holds no stores). It needs a state store too: [`preflight`]
 //!   refuses a start with no `--state-store` (or `state-store` key), `--check` included.
-//! - `storage-and-daemon`: the storage node and the daemon in one process, the
-//!   daemon reading and writing the node's storage in-process
-//!   ([`kbf_storage_and_daemon::storage_and_daemon`]). Takes `storage`'s flags and
-//!   `kbf-daemon`'s.
 //!
-//! **A start with no mode flags reads `kbf.toml`** ([`node`]): `kbf --mode=storage`,
-//! `daemon` or `storage-and-daemon` with at most `--config FILE` (default where the
-//! packages put it), or `kbf` alone. The start enrolls the host on its first
-//! run when the token file is there, for exactly the roles the mode needs, renews without
-//! the token on later runs, and runs the mode on the configuration the frontend sent
-//! ([`node`], [`enroll`]). `--check` checks that host and exits, starting nothing: 0 for
-//! a configured host that is not yet enrolled, 2 for a config, token or enrollment that
-//! cannot work. A start that gives mode flags runs on them and does not read the file.
-//! There is no `node` mode and no `enroll` word: the host's config states what it is.
+//! **A start with no mode flags reads `kbf.toml`** ([`node`]): `kbf --mode=storage` with at
+//! most `--config FILE` (default where the packages put it), or `kbf` alone. The start
+//! enrolls the host on its first run when the token file is there, for exactly the roles the
+//! mode needs, renews without the token on later runs, and runs the mode on the configuration
+//! the frontend sent ([`node`], [`enroll`]). `--check` checks that host and exits, starting
+//! nothing: 0 for a configured host that is not yet enrolled, 2 for a config, token or
+//! enrollment that cannot work. A start that gives mode flags runs on them and does not read
+//! the file. There is no `node` mode and no `enroll` word: the host's config states what it is.
 //!
 //! And words that are not modes: `kbf cluster status|drain|undrain|member|safe-to-stop|denied|epoch-bump|object-store` ([`cluster`]), a
 //! client of the frontend's operator API that starts nothing. It is outside
@@ -58,16 +52,15 @@
 //! one mode is refused by the others with no edit here.
 //!
 //! `kbf --version` prints `kbf <package version>+<commit>`: the commit stamp is
-//! `kbf-server`'s ([`kbf_server::SERVER_VERSION`]), which `kbf all-in-one` links
-//! anyway, so the artifacts workflow can check `kbf` as it checks `kbf-server`.
+//! `kbf-server`'s ([`kbf_server::SERVER_VERSION`]), so the artifacts workflow can check `kbf`
+//! as it checks `kbf-server`.
 //!
 //! `kbf --version --json` ([`version`]) prints one JSON object on one line naming the
 //! commit and the number of commits behind it, the build profile, the protocol versions and
 //! the state schema, so a host can check what it runs.
 //!
 //! Before a mode starts, [`preflight`] checks what it needs of its host (the files its
-//! flags name, its certificate's role, the S3 key pair, the container driver's programs,
-//! ...) and refuses, with every missing piece on stderr, one line each, and exit status 2
+//! flags name, its certificate's role, the S3 key pair, ...) and refuses, with every missing piece on stderr, one line each, and exit status 2
 //! (75 for a piece that heals shortly). `cluster` reads nothing of
 //! the host and skips it.
 //!
@@ -76,7 +69,7 @@
 //! command line overriding its key), and `--check` parses the flags and the file, runs the
 //! startup checks and exits 0, 2 or 75 without starting ([`preflight::check_only`]).
 //!
-//! The `kbf-server`, `kbf-daemon` and `kbf-all-in-one` binaries are unchanged.
+//! The `kbf-server` binary is unchanged.
 
 pub mod boot_check;
 pub mod cluster;
@@ -99,23 +92,15 @@ use std::path::PathBuf;
 use boot_check::BOOT_CHECK;
 use clap::builder::{PossibleValue, PossibleValuesParser};
 use clap::error::ErrorKind;
-use clap::{
-    Arg, ArgAction, ArgMatches, Args as _, Command, CommandFactory as _, FromArgMatches as _,
-};
+use clap::{Arg, ArgAction, ArgMatches, Args as _, Command, FromArgMatches as _};
 use names::{Entry, MODES, Mode};
 use setup::SETUP;
 
 /// A parsed command line. The flags are boxed: the variants differ a lot in size.
 #[derive(Clone, Debug)]
 pub enum Invocation {
-    /// `kbf daemon`.
-    Daemon(Box<kbf_node::Cli>),
-    /// `kbf all-in-one`.
-    AllInOne(Box<kbf_storage_and_daemon::cli::Flags>),
     /// `kbf storage`.
     Storage(Box<kbf_server::storage_node::StorageFlags>),
-    /// `kbf storage-and-daemon`.
-    StorageAndDaemon(Box<kbf_storage_and_daemon::storage_and_daemon::Flags>),
     /// `kbf frontend`.
     Frontend(Box<kbf_server::frontend::FrontendFlags>),
     /// A start that reads `kbf.toml` ([`node`]): `--mode` (or the file's mode) with no
@@ -132,10 +117,7 @@ fn longs(cmd: &Command) -> BTreeSet<String> {
 /// The command line a mode parses.
 fn own_command(entry: Entry) -> Command {
     match entry {
-        Entry::Daemon => kbf_node::Cli::command(),
-        Entry::AllInOne => kbf_storage_and_daemon::cli::command(),
         Entry::Storage => kbf_server::storage_node::command(),
-        Entry::StorageAndDaemon => kbf_storage_and_daemon::storage_and_daemon::command(),
         Entry::Frontend => kbf_server::frontend::command(),
     }
 }
@@ -147,15 +129,6 @@ fn refused_own(entry: Entry) -> BTreeSet<String> {
     match entry {
         Entry::Frontend => kbf_server::frontend::refused_flags(),
         Entry::Storage => kbf_server::storage_node::refused_flags(),
-        // The daemon's flags are its own whatever they are called.
-        Entry::StorageAndDaemon => {
-            let daemon = longs(&kbf_node::Cli::command());
-            kbf_server::storage_node::refused_flags()
-                .into_iter()
-                .filter(|flag| !daemon.contains(flag))
-                .collect()
-        }
-        Entry::Daemon | Entry::AllInOne => BTreeSet::new(),
     }
 }
 
@@ -191,57 +164,40 @@ pub fn refused_by(mode: &str) -> &'static [&'static str] {
 }
 
 /// Why `kbf <mode>` refuses `--flag`.
-fn reason(mode: &str, flag: &str) -> String {
-    if mode == names::DAEMON
-        && ["store", "tls", "token", "auth"]
-            .iter()
-            .any(|w| flag.contains(w))
-    {
-        "a build node holds no store and no credential (docs/design/cluster.md, section 3.3)"
-            .to_owned()
-    } else {
-        format!("the flag belongs to another mode, which `kbf {mode}` does not take")
-    }
+fn reason(mode: &str) -> String {
+    format!("the flag belongs to another mode, which `kbf {mode}` does not take")
 }
 
 fn mode_command(name: &'static str, entry: Entry) -> Command {
-    match entry {
-        Entry::Daemon
-        | Entry::AllInOne
-        | Entry::Storage
-        | Entry::StorageAndDaemon
-        | Entry::Frontend => {
-            // The alias word is hidden: the help of a mode shows the flag form.
-            let mut cmd = own_command(entry)
-                .name(name)
-                .bin_name(format!("kbf --mode={name}"))
-                .hide(true);
-            for flag in refused_by(name) {
-                // The id is the flag's own name: no argument of either has a hyphen in its id.
-                cmd = cmd.arg(Arg::new(*flag).long(*flag).num_args(0..=1).hide(true));
-            }
-            cmd.arg(
-                Arg::new(CONFIG)
-                    .long(CONFIG)
-                    .value_name("FILE")
-                    .value_parser(clap::value_parser!(std::path::PathBuf))
-                    .help(format!(
-                        "Read the mode's settings from this TOML file (default {} when it \
-                         exists); a flag on the command line overrides its key",
-                        config::DEFAULT_PATH
-                    )),
-            )
-            .arg(
-                Arg::new(CHECK)
-                    .long(CHECK)
-                    .action(clap::ArgAction::SetTrue)
-                    .help(
-                        "Parse the flags and the file, run the startup checks, print each \
-                         problem and exit (0 fine, 2 refused, 75 not ready) without starting",
-                    ),
-            )
-        }
+    // The alias word is hidden: the help of a mode shows the flag form.
+    let mut cmd = own_command(entry)
+        .name(name)
+        .bin_name(format!("kbf --mode={name}"))
+        .hide(true);
+    for flag in refused_by(name) {
+        // The id is the flag's own name: no argument of either has a hyphen in its id.
+        cmd = cmd.arg(Arg::new(*flag).long(*flag).num_args(0..=1).hide(true));
     }
+    cmd.arg(
+        Arg::new(CONFIG)
+            .long(CONFIG)
+            .value_name("FILE")
+            .value_parser(clap::value_parser!(std::path::PathBuf))
+            .help(format!(
+                "Read the mode's settings from this TOML file (default {} when it \
+                 exists); a flag on the command line overrides its key",
+                config::DEFAULT_PATH
+            )),
+    )
+    .arg(
+        Arg::new(CHECK)
+            .long(CHECK)
+            .action(clap::ArgAction::SetTrue)
+            .help(
+                "Parse the flags and the file, run the startup checks, print each \
+                 problem and exit (0 fine, 2 refused, 75 not ready) without starting",
+            ),
+    )
 }
 
 /// The whole command line: `kbf --mode=<mode> ...`, the modes of [`names::MODES`]. The
@@ -259,9 +215,7 @@ pub fn command() -> Command {
                 .value_parser(mode_values())
                 .help(
                     "What this process is: `frontend` (the REAPI front end), `storage` (a \
-                     storage node), `daemon` (a build node), `storage-and-daemon` (both in \
-                     one process). Without it the mode is \
-                     `mode` in kbf.toml. `kbf --mode=<mode> --help` lists the mode's flags",
+                     storage node). Without it the mode is `mode` in kbf.toml. `kbf --mode=<mode> --help` lists the mode's flags",
                 ),
         )
         .arg(
@@ -269,7 +223,7 @@ pub fn command() -> Command {
                 .long("config")
                 .value_name("FILE")
                 .help(format!(
-                    "The host's config file, read by a storage, daemon or storage-and-daemon \
+                    "The host's config file, read by a storage \
                      start that is given no other flag of its mode [default: {}]",
                     config::DEFAULT_PATH
                 )),
@@ -356,20 +310,18 @@ struct Split {
 
 /// What a start that still gives `--label` is told. Node labels are gone: placement uses
 /// what the node reports, so there is nothing to carry the flag over to; it names the flag
-/// and the way out, and the daemon does not start.
+/// and the way out, and the start is refused.
 const LABEL_REMOVED: &str =
     "--label was removed: placement uses what the node reports (OSFamily, ISA); delete the flag";
 
-/// What a command line that asks for the `all-in-one` mode is told: the text `kbf setup`
-/// gives too ([`kbf_setup::cli::ALL_IN_ONE_REMOVED`]).
-pub use kbf_setup::cli::ALL_IN_ONE_REMOVED;
+pub use names::REMOVED;
 
-/// Fails with [`ALL_IN_ONE_REMOVED`] when `args` ask for the `all-in-one` mode, as
-/// `--mode=all-in-one`, `--mode all-in-one` or the hidden word `kbf all-in-one`.
+/// Fails with [`REMOVED`] when `args` ask for a removed mode ([`names::REMOVED_MODES`]), as
+/// `--mode=daemon`, `--mode daemon` or the hidden word `kbf daemon`.
 ///
 /// # Errors
 /// The refusal, which exits 2; a `--mode` with no value is clap's to refuse, not this.
-pub fn refuse_all_in_one(args: &[OsString]) -> Result<(), clap::Error> {
+pub fn refuse_removed(args: &[OsString]) -> Result<(), clap::Error> {
     let mut words = args.iter().skip(1);
     let mut first = true;
     while let Some(arg) = words.next() {
@@ -379,36 +331,30 @@ pub fn refuse_all_in_one(args: &[OsString]) -> Result<(), clap::Error> {
             break;
         }
         let asked = if at_start && !text.starts_with('-') {
-            text == names::ALL_IN_ONE
+            Some(OsString::from(text))
         } else {
-            value_of("mode", text, &mut words)
-                .ok()
-                .flatten()
-                .is_some_and(|v| v == names::ALL_IN_ONE)
+            value_of("mode", text, &mut words).ok().flatten()
         };
-        if asked {
-            return Err(command().error(ErrorKind::InvalidValue, ALL_IN_ONE_REMOVED));
+        if asked
+            .as_deref()
+            .and_then(|word| word.to_str())
+            .is_some_and(|word| names::REMOVED_MODES.contains(&word))
+        {
+            return Err(command().error(ErrorKind::InvalidValue, REMOVED));
         }
     }
     Ok(())
 }
 
-/// The values `--mode` takes: the modes, `all-in-one` among them but hidden, so that it is
-/// listed nowhere and `--mode=all-in-one` gets [`ALL_IN_ONE_REMOVED`] from
-/// [`refuse_all_in_one`] before clap reads it.
+/// The values `--mode` takes: the modes of [`names::MODES`]. The removed modes are no values;
+/// [`refuse_removed`] answers them before clap reads the flag.
 pub(crate) fn mode_values() -> PossibleValuesParser {
-    PossibleValuesParser::new(
-        MODES.map(|m| PossibleValue::new(m.name).hide(m.name == names::ALL_IN_ONE)),
-    )
+    PossibleValuesParser::new(MODES.map(|m| PossibleValue::new(m.name)))
 }
 
 /// The names of the modes that can be asked for.
 fn listed_modes() -> Vec<&'static str> {
-    MODES
-        .iter()
-        .map(|m| m.name)
-        .filter(|name| *name != names::ALL_IN_ONE)
-        .collect()
+    MODES.iter().map(|m| m.name).collect()
 }
 
 /// A flag that takes a value, as `--name value` or `--name=value`; `None` for another word.
@@ -540,7 +486,7 @@ pub struct Parsed {
 /// `default_config` when that file exists ([`config::DEFAULT_PATH`] for `kbf`); a flag on
 /// the command line overrides the file's key for it.
 ///
-/// A storage, daemon or storage-and-daemon start given no flag of its mode, on a file
+/// A storage start given no flag of its mode, on a file
 /// that holds enrollment's tables, is [`Invocation::Registered`]: the file and the
 /// enrollment make its flags ([`node`]).
 ///
@@ -556,19 +502,8 @@ where
     T: Into<OsString>,
 {
     let args: Vec<OsString> = args.into_iter().map(Into::into).collect();
-    refuse_all_in_one(&args)?;
+    refuse_removed(&args)?;
     parse_words(args, default_config)
-}
-
-/// [`parse_from`] without the refusal of `all-in-one`, for the tests of the variant that the
-/// refusal leaves in place until it is deleted.
-#[cfg(test)]
-pub(crate) fn parse_internal<I, T>(args: I) -> Result<Invocation, clap::Error>
-where
-    I: IntoIterator<Item = T>,
-    T: Into<OsString>,
-{
-    parse_words(args.into_iter().map(Into::into).collect(), None).map(|parsed| parsed.invocation)
 }
 
 /// [`parse_with`] on the words as the one type, so that the generic wrapper is the only
@@ -694,8 +629,8 @@ fn mode_of_file(
     let Some(file) = file else {
         return Err(no_mode("it sets none"));
     };
-    if file == names::ALL_IN_ONE {
-        return Err(command().error(ErrorKind::InvalidValue, ALL_IN_ONE_REMOVED));
+    if names::REMOVED_MODES.contains(&file.as_str()) {
+        return Err(command().error(ErrorKind::InvalidValue, REMOVED));
     }
     MODES.iter().find(|m| m.name == file).ok_or_else(|| {
         command().error(
@@ -766,28 +701,10 @@ fn parse_invocation(args: &[OsString]) -> Result<Invocation, clap::Error> {
         .find(|mode| mode.name == name)
         .expect("clap matched a mode of the table");
     match mode.entry {
-        Entry::Daemon => {
-            refuse_foreign_flags(mode.name, m)?;
-            Ok(Invocation::Daemon(Box::new(
-                kbf_node::Cli::from_arg_matches(m)?,
-            )))
-        }
-        Entry::AllInOne => {
-            refuse_foreign_flags(mode.name, m)?;
-            Ok(Invocation::AllInOne(Box::new(
-                kbf_storage_and_daemon::cli::parse(m)?,
-            )))
-        }
         Entry::Storage => {
             refuse_foreign_flags(mode.name, m)?;
             Ok(Invocation::Storage(Box::new(
                 kbf_server::storage_node::parse(m)?,
-            )))
-        }
-        Entry::StorageAndDaemon => {
-            refuse_foreign_flags(mode.name, m)?;
-            Ok(Invocation::StorageAndDaemon(Box::new(
-                kbf_storage_and_daemon::storage_and_daemon::parse(m)?,
             )))
         }
         Entry::Frontend => {
@@ -840,7 +757,7 @@ fn refuse_foreign_flags(mode: &str, m: &ArgMatches) -> Result<(), clap::Error> {
     {
         Some(flag) => Err(command().error(
             ErrorKind::ArgumentConflict,
-            format!("kbf {mode} refuses --{flag}: {}", reason(mode, flag)),
+            format!("kbf {mode} refuses --{flag}: {}", reason(mode)),
         )),
         None => Ok(()),
     }
@@ -857,28 +774,19 @@ fn start(invocation: &Invocation, config: &std::path::Path) -> ExitCode {
 #[must_use]
 pub fn run(invocation: &Invocation) -> ExitCode {
     match invocation {
-        Invocation::Daemon(cli) => kbf_node::run(cli),
-        Invocation::AllInOne(flags) => kbf_storage_and_daemon::run(flags),
         Invocation::Storage(flags) => kbf_server::storage_node::run(flags),
-        Invocation::StorageAndDaemon(flags) => {
-            kbf_storage_and_daemon::storage_and_daemon::run(flags)
-        }
         Invocation::Frontend(flags) => kbf_server::frontend::run(flags),
         Invocation::Registered(start) => node::run(start),
     }
 }
 
-/// The `kbf` binary: the daemon's helper re-execs first (a keeper or a `__chown-dirs`
-/// run of this binary never reads the command line as `kbf`'s), then [`version::line`]
+/// The `kbf` binary: [`version::line`]
 /// for `kbf --version --json`, then the command line, then [`cluster::run`] for
 /// `kbf cluster ...`, then [`boot_check::run`] for `kbf boot-check ...`, then [`setup::run`] for
 /// `kbf setup ...`, or else [`preflight::refusal`] and [`run`]. A command line that does not
 /// parse exits 2 (0 for `--help` and `--version`).
 #[must_use]
 pub fn main() -> ExitCode {
-    if let Some(code) = kbf_node::dispatch_helpers() {
-        return code;
-    }
     // A failure leaves the limit as it was: the process still starts, and the first
     // EMFILE names the cause.
     let _ = nofile::raise();
@@ -924,7 +832,5 @@ pub fn main() -> ExitCode {
     }
 }
 
-#[cfg(test)]
-mod daemon_flag_tests;
 #[cfg(test)]
 mod tests;

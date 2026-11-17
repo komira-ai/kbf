@@ -85,7 +85,7 @@ fn a_host_set_up_with_the_backup_timer_loses_the_timer_and_its_dropin() {
 #[test]
 fn a_host_that_never_had_the_backup_timer_gets_no_step_for_it() {
     let mut exec = released(host(), Platform::Linux);
-    let said = go_ok(&FakeOs::linux(), &mut exec, &raw(Mode::AllInOne));
+    let said = go_ok(&FakeOs::linux(), &mut exec, &raw(Mode::Frontend));
     assert!(
         mentions_backup(&exec).is_empty(),
         "{:?}",

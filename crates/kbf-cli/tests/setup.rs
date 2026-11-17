@@ -18,20 +18,20 @@ use kbf_setup::setup::backend::{Backend, Schemas};
 use kbf_setup::setup::os::Os;
 use kbf_setup::setup::{Options, SetupError, raw_from, run};
 
-/// The `kbf.toml` that `kbf-installer setup --mode=daemon` writes for the flags of [`DAEMON`].
-const DAEMON_GOLDEN: &str = include_str!("../../kbf-setup/tests/golden/kbf_toml/daemon.toml");
+/// The `kbf.toml` that `kbf-installer setup --mode=storage` writes for the flags of [`STORAGE`].
+const STORAGE_GOLDEN: &str = include_str!("../../kbf-setup/tests/golden/kbf_toml/storage.toml");
 
 /// Where setup writes the `kbf.toml` of a Linux host, and where the enrollment token is read.
 const KBF_TOML: &str = "/etc/kbf/kbf.toml";
 const TOKEN: &str = "/root/kbf.token";
 
-/// The accounts the package makes: `kbf` (the daemon's) and `kbf-server` (the frontend's).
+/// The accounts the package makes: `kbf` (the storage node's) and `kbf-server` (the frontend's).
 const ACCOUNTS: [(&str, u32); 2] = [("kbf", 990), ("kbf-server", 989)];
 
-/// A daemon host, as the installer's golden case sets it up.
-const DAEMON: [&str; 4] = [
+/// A storage host, as the installer's golden case sets it up.
+const STORAGE: [&str; 4] = [
     "setup",
-    "--mode=daemon",
+    "--mode=storage",
     "--frontend-url=https://farm.example:8443",
     "--token-file=/root/kbf.token",
 ];
@@ -71,28 +71,8 @@ impl Os for HostOs {
         Ok("/usr/sbin/nologin".to_owned())
     }
 
-    fn subuid(&self) -> io::Result<String> {
-        Ok(String::new())
-    }
-
-    fn subgid(&self) -> io::Result<String> {
-        Ok(String::new())
-    }
-
-    fn lingers(&self, _: &str) -> io::Result<bool> {
-        Ok(false)
-    }
-
     fn unit_enabled(&self, _: &str) -> io::Result<bool> {
         Ok(false)
-    }
-
-    fn launchd_loaded(&self, _: &str) -> io::Result<bool> {
-        Ok(false)
-    }
-
-    fn dscl_list(&self, _: &str) -> io::Result<String> {
-        Ok(String::new())
     }
 
     fn random(&self, len: usize) -> io::Result<Vec<u8>> {
@@ -100,7 +80,7 @@ impl Os for HostOs {
     }
 }
 
-/// No server: the daemon keeps no state in the database, so none is asked for.
+/// No server: the storage node keeps no state in the database, so none is asked for.
 struct NoServer;
 
 impl Schemas for NoServer {
@@ -155,18 +135,18 @@ fn file_meta(exec: &FakeExec, path: &str) -> (u32, Owner) {
     }
 }
 
-/// Asserts that `kbf setup` with the flags of the installer's daemon case, applied, writes the
-/// `kbf.toml` of that case byte for byte, as root's file readable by the `kbf` group (0640), and
+/// Asserts that `kbf setup` with the flags of the installer's storage case, applied, writes the
+/// `kbf.toml` of that case byte for byte, as root's file readable by the `kbf-server` group (0640), and
 /// that the steps it prints include the fetch account and the enrollment token.
 #[test]
 fn kbf_setup_writes_the_kbf_toml_the_installer_golden_pins() {
-    let mut words = DAEMON.to_vec();
+    let mut words = STORAGE.to_vec();
     words.push("--apply");
     let (exec, out) = set_up(&parsed(&words));
-    assert_eq!(file_text(&exec, KBF_TOML), DAEMON_GOLDEN);
+    assert_eq!(file_text(&exec, KBF_TOML), STORAGE_GOLDEN);
     let (mode, owner) = file_meta(&exec, KBF_TOML);
     assert_eq!(mode, 0o640);
-    assert_eq!((owner.uid, owner.gid), (0, 990));
+    assert_eq!((owner.uid, owner.gid), (0, 989));
     let steps: Vec<&str> = out.lines().filter(|l| l.starts_with("+ ")).collect();
     assert!(steps.iter().any(|l| l.contains("useradd")), "{out}");
     assert!(steps.iter().any(|l| l.contains("enroll.token")), "{out}");
@@ -177,7 +157,7 @@ fn kbf_setup_writes_the_kbf_toml_the_installer_golden_pins() {
 /// host is not touched.
 #[test]
 fn kbf_setup_without_apply_changes_nothing() {
-    let (exec, out) = set_up(&parsed(&DAEMON));
+    let (exec, out) = set_up(&parsed(&STORAGE));
     assert!(exec.log.is_empty());
     assert!(!exec.entries.contains_key(&hp(KBF_TOML)));
     assert!(!out.lines().any(|l| l.starts_with("+ ")), "{out}");
@@ -190,7 +170,7 @@ fn kbf_setup_without_apply_changes_nothing() {
 /// says to use sudo.
 #[test]
 fn kbf_setup_is_refused_to_a_user_who_is_not_root() {
-    let (code, out, err) = kbf(&DAEMON);
+    let (code, out, err) = kbf(&STORAGE);
     assert_eq!(code, Some(2), "{err}");
     assert_eq!(out, "");
     assert!(err.starts_with("kbf setup: "), "{err}");
@@ -201,7 +181,7 @@ fn kbf_setup_is_refused_to_a_user_who_is_not_root() {
 /// output, with the verb and the stable word of the error, and nothing on standard error.
 #[test]
 fn kbf_setup_with_json_refuses_a_user_who_is_not_root_as_an_object() {
-    let mut words = DAEMON.to_vec();
+    let mut words = STORAGE.to_vec();
     words.push("--json");
     let (code, out, err) = kbf(&words);
     assert_eq!(code, Some(2), "{err}");

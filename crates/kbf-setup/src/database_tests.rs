@@ -267,8 +267,8 @@ fn the_database_step_lines_say_create_migrate_or_nothing() {
         "kbf-installer setup (frontend): database step: dry run: would migrate the schema from 1 to 3"
     );
     assert_eq!(
-        dry_run_line("all-in-one", Some(3), 3),
-        "kbf-installer setup (all-in-one): database step: dry run: the schema is at 3, nothing to do"
+        dry_run_line("frontend", Some(3), 3),
+        "kbf-installer setup (frontend): database step: dry run: the schema is at 3, nothing to do"
     );
     let outcome = Outcome {
         from: None,
@@ -329,9 +329,9 @@ fn the_database_step_prints_what_the_schema_runner_answered() {
         (Some(3), "the schema is at 3, nothing to do"),
     ] {
         assert_eq!(
-            database_step(&fake(Ok((found, 3))), "all-in-one", false)
+            database_step(&fake(Ok((found, 3))), "frontend", false)
                 .unwrap_or_else(|f| panic!("planned: {f}")),
-            format!("kbf-installer setup (all-in-one): database step: dry run: {tail}")
+            format!("kbf-installer setup (frontend): database step: dry run: {tail}")
         );
     }
     let broken = FakeSchema {

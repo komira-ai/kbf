@@ -1,11 +1,10 @@
 //! `kbf-installer setup`: the first configuration of a host (docs/design/kbf-installer.md
 //! sections 2 and 3, docs/design/distribution.md section 4).
 //!
-//! It validates its flags, then makes the host what they say: the fetch account (and for the
-//! modes that run actions, the `kbf` user's subid range and lingering), the installer's tree
-//! with its `orders/` directory, the enrollment token (node modes), the first operator token
-//! (frontend and all-in-one hosts, once), `installer.toml`, `kbf.toml` (both in `/etc/kbf`,
-//! `/usr/local/etc/kbf` on a Mac), and last the units enabled for the mode.
+//! It validates its flags, then makes the host what they say: the fetch account, the installer's
+//! tree with its `orders/` directory, the enrollment token (node modes), the first operator token
+//! (frontend hosts, once), `installer.toml`, `kbf.toml` (both in `/etc/kbf`), and last the units
+//! enabled for the mode.
 //!
 //! - It is root's: [`Os::euid`] is checked first, so only a fake that says 0 gets past it
 //!   without root. It refuses a regular file in `/etc/systemd/system` that shadows the
@@ -19,21 +18,17 @@
 //!   service. An operator floor (`min_generation`) only goes up.
 //! - It installs no release: kbf updates are OS packages. A unit is started only where `kbf` is
 //!   there already (a release at `releases/current`, or `/usr/bin/kbf` from the kbf package),
-//!   and is otherwise enabled and left stopped. On a
-//!   frontend or all-in-one host the state database's schema is created or brought forward
-//!   ([`Schemas`]) once `installer.toml` is written, and a unit that keeps its state there is
-//!   enabled and never started. Such a host given no `--database` gets the local default
-//!   (`postgres:///kbf?host=/run/postgresql&user=kbf-server` for a frontend, `user=kbf` for an
-//!   all-in-one host, which runs as `kbf`), and the plain login role and the database it owns
-//!   are made first ([`provision`]); setup alters neither when it is there and never edits
-//!   `pg_hba.conf`, but prints the rules the logins need.
-//! - `--mode=all-in-one` is the one-process host: `kbf-all-in-one.service` runs `kbf
-//!   --mode=all-in-one`, so `kbf.toml` holds the listeners, certificates, cold store and daemon
-//!   half's identity together, and there is no proxy and no sibling. It sets up no proxy host:
-//!   the host an earlier build set up behind the proxy's two-slot supervision (its
-//!   `installer.toml` names a `frontend_config`) is refused, never moved
-//!   ([`plan::refuse_proxy_layout`], exit 5), and `kbf-installer setup` refuses the proxy's
-//!   flags before it runs (`proxy::ProxyFlags::refusal`, exit 2). A proxy now balances
+//!   and is otherwise enabled and left stopped. On a frontend host the state database's schema
+//!   is created or brought forward ([`Schemas`]) once `installer.toml` is written, and a unit
+//!   that keeps its state there is enabled and never started. Such a host given no `--database`
+//!   gets the local default (`postgres:///kbf?host=/run/postgresql&user=kbf-server`), and the
+//!   plain login role and the database it owns are made first ([`provision`]); setup alters
+//!   neither when it is there and never edits `pg_hba.conf`, but prints the rules the logins
+//!   need.
+//! - `--mode=daemon`, `--mode=storage-and-daemon` and `--mode=all-in-one` are refused when the
+//!   command line is parsed ([`crate::cli::MODE_REMOVED`], exit 2), before the host is looked
+//!   at. Setup sets up no proxy host: `kbf-installer setup` refuses the proxy's flags before it
+//!   runs (`proxy::ProxyFlags::refusal`, exit 2). A proxy now balances
 //!   frontends that run under their own units, configured by hand with `[[proxy.frontend]]`
 //!   tables (docs/design/kbf-proxy-api.md, the pool section). A `[proxy]` table that
 //!   `installer.toml` already has is read and written back as it is.
@@ -64,11 +59,11 @@ pub mod retired;
 pub mod validate;
 
 #[cfg(test)]
-mod all_in_one_refused_tests;
-#[cfg(test)]
 pub(crate) mod fake;
 #[cfg(test)]
 mod fetch_user_tests;
+#[cfg(test)]
+mod removed_modes_tests;
 // The tests of the host's setup are those of `kbf-installer setup`, with the `proxy` feature
 // (they keep a `[proxy]` table); the build without it (`kbf setup`) has `no_proxy_tests`.
 #[cfg(all(test, not(feature = "proxy")))]
@@ -109,10 +104,6 @@ pub enum SetupError {
         "no user {name}: the package creates it (systemd-sysusers); run it, or reinstall the package"
     )]
     NoUser { name: &'static str },
-    #[error("no room for a {0} range of 65536 ids above the existing ones")]
-    SubIdSpace(&'static str),
-    #[error("no free id between 300 and 399 for the fetch account")]
-    NoFreeId,
     #[error(
         "{path} is a regular file and shadows the packaged unit {unit} (systemd reads /etc before /usr/lib, so enabling would keep its old flags): move it aside (mv {path} {path}.old; systemctl daemon-reload) and run setup again; setup never deletes a unit"
     )]
@@ -141,9 +132,7 @@ impl SetupError {
             | SetupError::Unsupported(_)
             | SetupError::NoUser { .. } => Exit::Usage,
             SetupError::NeedsOperator(_) | SetupError::ShadowUnit { .. } => Exit::NeedsOperator,
-            SetupError::SubIdSpace(_)
-            | SetupError::NoFreeId
-            | SetupError::Database(_)
+            SetupError::Database(_)
             | SetupError::Path(_)
             | SetupError::Io(_)
             | SetupError::Host(_) => Exit::Failed,
@@ -159,7 +148,6 @@ impl SetupError {
             SetupError::Token(_) => "token_file",
             SetupError::Unsupported(_) => "unsupported",
             SetupError::NoUser { .. } => "no_user",
-            SetupError::SubIdSpace(_) | SetupError::NoFreeId => "no_room",
             SetupError::NeedsOperator(_) => "needs_operator",
             SetupError::ShadowUnit { .. } => "unit_shadow",
             SetupError::Database(_) => "database",
@@ -252,13 +240,12 @@ fn refuse_proxy_table(text: &str, installer_toml: &str) -> Result<(), SetupError
     Ok(())
 }
 
-/// The role whose certificate and key the fetch child is lent: the daemon's if the host has
-/// one, else the storage node's (contract section 3).
+/// The role whose certificate and key the fetch child is lent: the storage node's
+/// (contract section 3).
 fn node_role(mode: Mode) -> Option<&'static str> {
     match mode {
-        Mode::Daemon | Mode::StorageAndDaemon => Some("daemon"),
         Mode::Storage => Some("storage"),
-        Mode::Frontend | Mode::AllInOne => None,
+        Mode::Frontend => None,
     }
 }
 
@@ -339,16 +326,11 @@ pub fn run(
     if options.apply {
         os.trusted_binary()?;
     }
-    // Before the flags are checked: a host of the proxy layout re-run with the command line that
-    // set a one-process host up is told what it is, not what the flags lack.
-    plan::refuse_proxy_layout(&*exec, raw.mode, os.platform())?;
     let checked = raw.validate(os.platform());
     let valid = checked.map_err(SetupError::Invalid)?;
     let ctx = plan::context(os, valid.mode)?;
-    if ctx.platform == Platform::Linux {
-        find_shadows(&*exec, valid.mode)?;
-    }
-    let service_uid = ctx.service.as_ref().map(|u| u.uid);
+    find_shadows(&*exec, valid.mode)?;
+    let service_uid = Some(ctx.service.uid);
     let mut problems = Vec::new();
     kbf_settings::push_problems(&*exec, &valid.kbf, service_uid, &mut problems);
     if !problems.is_empty() {
@@ -423,12 +405,6 @@ pub fn cli(
     apply: bool,
     out: &mut dyn Write,
 ) -> Result<(), SetupError> {
-    // Before the host is looked at, so that nothing is read or changed for a mode that is gone.
-    if args.mode == Mode::AllInOne {
-        return Err(SetupError::Unsupported(
-            crate::cli::ALL_IN_ONE_REMOVED.to_owned(),
-        ));
-    }
     on_host(root, raw_from(args), args.no_start, apply, out)
 }
 

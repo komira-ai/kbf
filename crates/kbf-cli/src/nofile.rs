@@ -1,7 +1,7 @@
 //! The open-file limit. systemd starts a unit with a soft `RLIMIT_NOFILE` of 1024 unless
 //! the unit says otherwise (the hard limit it shows is only the ceiling), and one storage
 //! node holds a file per open write-tier block, a socket per peer, per client and per
-//! cold-store request, and the daemon's pipes: a build's burst of uploads passes 1024 in
+//! cold-store request: a build's burst of uploads passes 1024 in
 //! a second and every further `open` or `connect` fails with EMFILE.
 
 use std::io;

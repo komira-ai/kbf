@@ -5,7 +5,7 @@
 use std::io::ErrorKind;
 
 use super::super::host::Kind;
-use super::super::tests::{DAEMON, Fake, needs_from};
+use super::super::tests::{Fake, needs_from};
 use super::super::{Class, Report};
 use super::check;
 
@@ -157,23 +157,4 @@ fn only_a_file_hot_store_is_read() {
         check(&needs_from(&all), &host, &mut report);
     }
     assert_eq!(report, Report::default());
-}
-
-/// Catches the flag of the all-in-one mode (its server half's `--hot-store`) not
-/// reaching the rule.
-#[test]
-fn the_all_in_one_hot_store_is_read_too() {
-    let mut flags = vec![
-        "all-in-one",
-        "--meta-dir=/srv/meta",
-        "--hot-store=file:///srv/hot",
-    ];
-    flags.extend(DAEMON);
-    let needs = needs_from(&flags);
-    let host = Fake::empty()
-        .dir("/srv", 0, 0, 0o000)
-        .running_as(1500, 1500, &[1500]);
-    let mut report = Report::default();
-    check(&needs, &host, &mut report);
-    assert!(blocked(&report).is_some(), "{report:#?}");
 }

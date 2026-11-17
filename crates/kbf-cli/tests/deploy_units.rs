@@ -11,16 +11,11 @@
 //! and start lines parse (`package_units.rs`), a key kbf refuses in `kbf.toml` is refused
 //! naming the key and the file (`config_file.rs::an_unknown_key_is_refused_naming_the_key_and_the_file`),
 //! every key `setup` writes is a real flag of its table
-//! (`kbf-setup`'s `kbf_settings_tests`), and the preflight accepts a metadata log
-//! under the node's data root for a storage-and-daemon node
-//! (`preflight/tests.rs::a_storage_and_daemon_node_with_its_meta_dir_under_its_data_dir_passes`).
+//! (`kbf-setup`'s `kbf_settings_tests`).
 //!
-//! The daemon, storage and storage-and-daemon units are a start that enrolls: their
-//! certificate files are the enrolled store's, by role, and the flags they run with are
-//! `node::plan`'s, held by `src/node_tests.rs`
-//! (`a_daemon_only_node_runs_kbf_daemon_with_the_frontends_endpoints`,
-//! `a_storage_only_node_runs_kbf_storage_registered_with_the_frontend` and
-//! `a_node_with_both_roles_runs_the_converged_mode`, which names each half's pair and CA).
+//! The storage unit is a start that enrolls: its certificate files are the enrolled store's, by
+//! role, and the flags it runs with are `node::plan`'s, held by `src/node_tests.rs`
+//! (`a_storage_only_node_runs_kbf_storage_registered_with_the_frontend`).
 
 use std::ffi::OsString;
 use std::os::unix::fs::PermissionsExt as _;
@@ -37,13 +32,8 @@ const PROGRAM: &str = "/usr/bin/kbf";
 /// The `kbf.toml` `kbf-installer setup` writes for `mode`.
 fn setup_file(mode: &str) -> &'static str {
     match mode {
-        "all-in-one" => include_str!("../../kbf-setup/tests/golden/kbf_toml/all-in-one.toml"),
-        "daemon" => include_str!("../../kbf-setup/tests/golden/kbf_toml/daemon.toml"),
         "frontend" => include_str!("../../kbf-setup/tests/golden/kbf_toml/frontend.toml"),
         "storage" => include_str!("../../kbf-setup/tests/golden/kbf_toml/storage.toml"),
-        "storage-and-daemon" => {
-            include_str!("../../kbf-setup/tests/golden/kbf_toml/storage-and-daemon.toml")
-        }
         other => panic!("no setup file for the mode {other}"),
     }
 }
@@ -121,13 +111,13 @@ fn paths(p: [PathBuf; 3]) -> [String; 3] {
 }
 
 /// Catches a packaged unit that starts another mode than its file is named after (a
-/// `--mode=daemon` in `kbf-storage.service`), a unit that gives kbf a flag of its own (the
+/// `--mode=frontend` in `kbf-storage.service`), a unit that gives kbf a flag of its own (the
 /// settings are the file's), and a `kbf.toml` that `setup` writes whose values kbf reads
 /// as other settings than the ones written. Each mode's unit and its setup file are read
-/// by kbf's own parser: the frontend and the all-in-one resolve to their flags (listeners,
-/// certificates toward storage, token file and the Postgres state store as the file
-/// spells them, no flag of the removed handover), and the three modes
-/// that enroll resolve to a start of the mode the unit names, on the file.
+/// by kbf's own parser: the frontend resolves to its flags (listeners, certificates toward
+/// storage, token file and the Postgres state store as the file spells them, no flag of the
+/// removed handover), and the storage mode, which enrolls, resolves to a start of the mode the
+/// unit names, on the file.
 #[test]
 fn each_packaged_mode_unit_starts_its_own_mode_on_the_kbf_toml_setup_writes() {
     let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "packaged-mode-units");
@@ -136,13 +126,6 @@ fn each_packaged_mode_unit_starts_its_own_mode_on_the_kbf_toml_setup_writes() {
         let words = start_words(&unit(&name), &name);
         assert_eq!(words, [format!("--mode={}", mode.name)], "{name}");
         let config = write_config(dir.path(), setup_file(mode.name));
-        if mode.name == "all-in-one" {
-            // Kept for one release; `kbf` refuses the mode the unit names. A follow-up
-            // rewrites this fixture for the replacement nodes.
-            let e = parse_with(argv(&words, &config), None).expect_err("refused");
-            assert!(e.to_string().contains(kbf_cli::ALL_IN_ONE_REMOVED), "{e}");
-            continue;
-        }
         let parsed = match parse_with(argv(&words, &config), None) {
             Ok(parsed) => parsed,
             Err(e) => panic!("kbf {} refuses {name} on its setup file:\n{e}", mode.name),
@@ -189,19 +172,6 @@ fn each_packaged_mode_unit_starts_its_own_mode_on_the_kbf_toml_setup_writes() {
                     flags.retired.warnings().is_empty(),
                     "the file gives a retired flag"
                 );
-            }
-            Invocation::AllInOne(flags) => {
-                assert_eq!(mode.name, "all-in-one");
-                assert_eq!(
-                    flags.server.api_token_file.as_deref(),
-                    Some(Path::new("/etc/kbf/api-token"))
-                );
-                assert_eq!(flags.server.state_store, Some(setup_state_store()));
-                assert_eq!(
-                    flags.server.meta_dir.as_deref(),
-                    Some(Path::new("/var/lib/kbf-meta"))
-                );
-                assert!(flags.server.cold_store.is_some(), "no cold store");
             }
             Invocation::Registered(start) => {
                 assert_eq!(start.mode, Some(mode.name), "{name} starts another mode");
@@ -266,9 +236,6 @@ impl kbf_cli::preflight::Host for EverythingExists {
     fn var(&self, _: &str) -> Option<String> {
         Some("x".to_owned())
     }
-    fn var_names(&self) -> Vec<String> {
-        Vec::new()
-    }
     fn euid(&self) -> u32 {
         0
     }
@@ -280,16 +247,6 @@ impl kbf_cli::preflight::Host for EverythingExists {
     }
     fn nofile(&self) -> u64 {
         1 << 20
-    }
-    fn run(
-        &self,
-        _: &std::path::Path,
-        _: &[&str],
-    ) -> std::io::Result<kbf_cli::preflight::host::Output> {
-        Ok(kbf_cli::preflight::host::Output {
-            success: true,
-            stdout: "crun version 1.14.0\n".to_owned(),
-        })
     }
     fn now(&self) -> std::time::SystemTime {
         std::time::SystemTime::now()
@@ -310,13 +267,6 @@ fn no_packaged_unit_is_refused_over_where_its_directories_are() {
         .map(|m| (m.name, setup_file(m.name).to_owned()))
         .collect();
     cases.push(("storage", STORAGE_BY_HAND.to_owned()));
-    // The mode that runs a node's storage and daemon together, given a metadata directory
-    // as the all-in-one's file has (its setup file names none).
-    let node = format!(
-        "{}\n[stores]\nmeta-dir = \"/var/lib/kbf-server/raft\"\n",
-        setup_file("storage-and-daemon")
-    );
-    cases.push(("storage-and-daemon", node));
     let mut moved = 0;
     for (mode, text) in cases {
         let farm = text
@@ -331,11 +281,6 @@ fn no_packaged_unit_is_refused_over_where_its_directories_are() {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        if mode == "all-in-one" {
-            // `kbf` refuses the mode, so there is no start to check; a follow-up
-            // moves this case to a mode that has a metadata directory.
-            continue;
-        }
         for text in [text.clone(), farm] {
             let name = format!("kbf-{mode}.service");
             let words = start_words(&unit(&name), &name);
@@ -352,7 +297,7 @@ fn no_packaged_unit_is_refused_over_where_its_directories_are() {
             );
         }
     }
-    assert!(moved >= 2, "no setup file names a metadata directory");
+    assert!(moved >= 1, "no file names a metadata directory");
 }
 
 /// A certificate made for each row of the farm's certificate table, as the farm's
@@ -430,7 +375,7 @@ fn each_rows_certificate_names_its_role_as_storage_reads_it() {
 }
 
 /// Catches `kbf` taking a flag an operator added to a packaged unit's `ExecStart=` that it
-/// refuses: an unknown flag, a store flag in the daemon's unit (a build node holds no
+/// refuses: an unknown flag, a store flag in the frontend's unit (a frontend holds no
 /// store), and another mode's flag in the storage unit. The words with that flag are
 /// refused by kbf's own parser, in-process, with the message `kbf --mode=<mode> --check`
 /// prints; the unedited words parse (above).
@@ -444,15 +389,15 @@ fn a_packaged_unit_edited_with_a_flag_kbf_refuses_is_refused_by_its_parser() {
         let config = write_config(dir.path(), setup_file(mode));
         parse_with(argv(&words, &config), None).expect_err(flag)
     };
-    let e = refused("daemon", "--bogus-flag");
+    let e = refused("frontend", "--bogus-flag");
     assert!(
         e.to_string().contains("unexpected argument '--bogus-flag'"),
         "{e}"
     );
     assert_eq!(e.exit_code(), 2);
-    let e = refused("daemon", "--cold-store=file:///x");
+    let e = refused("frontend", "--cold-store=file:///x");
     assert!(
-        e.to_string().contains("kbf daemon refuses --cold-store"),
+        e.to_string().contains("kbf frontend refuses --cold-store"),
         "{e}"
     );
     assert_eq!(e.exit_code(), 2);
@@ -506,7 +451,7 @@ fn no_two_listeners_of_a_mode_share_a_port() {
         assert_eq!(shared_port(text), None, "{}", mode.name);
     }
     assert_eq!(shared_port(STORAGE_BY_HAND), None);
-    assert!(seen >= 6, "{seen} listeners read: the files moved?");
+    assert!(seen >= 3, "{seen} listeners read: the files moved?");
     let planted = "[listener]\nlisten = \"0.0.0.0:8980\"\nworker-listen = \"0.0.0.0:8980\"\n";
     assert_eq!(
         shared_port(planted),

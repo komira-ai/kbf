@@ -4,7 +4,7 @@
 
 use crate::layout::Platform;
 
-/// kbf's configuration directory (root:root 0755): `/etc/kbf`, `/usr/local/etc/kbf` on a Mac.
+/// kbf's configuration directory (root:root 0755): `/etc/kbf`.
 pub fn etc_dir(platform: Platform) -> &'static str {
     platform.config_dir()
 }
@@ -27,13 +27,11 @@ pub fn api_token(platform: Platform) -> &'static str {
 
 /// kbf's own state directory, where enrollment keeps the node's certificates (`pki/`).
 pub fn kbf_state_dir(platform: Platform) -> &'static str {
-    match platform {
-        Platform::Linux => "/var/lib/kbf",
-        Platform::MacOs => "/var/db/kbf",
-    }
+    let Platform::Linux = platform;
+    "/var/lib/kbf"
 }
 
-/// Where enrollment writes the certificate and key of a role (`daemon` or `storage`).
+/// Where enrollment writes the certificate and key of a role (`storage`).
 pub fn node_identity(platform: Platform, role: &str) -> (String, String) {
     let pki = format!("{}/pki", kbf_state_dir(platform));
     (format!("{pki}/{role}.pem"), format!("{pki}/{role}.key"))

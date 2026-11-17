@@ -51,7 +51,7 @@ fn the_flags_after_the_verb_word_are_read() {
     assert!(args.apply);
     assert!(args.json);
     assert!(args.setup.no_start);
-    let argv = words(&["kbf", SETUP, "--mode=daemon"]);
+    let argv = words(&["kbf", SETUP, "--mode=frontend"]);
     let plain = parse(&argv).expect("a command line");
     assert!(!plain.apply);
     assert!(!plain.json);
@@ -64,14 +64,28 @@ fn the_flags_after_the_verb_word_are_read() {
 fn a_command_line_the_verb_does_not_take_is_refused() {
     let cases: [(&[&str], ErrorKind); 3] = [
         (&[], ErrorKind::MissingRequiredArgument),
-        (&["--mode=node"], ErrorKind::InvalidValue),
-        (&["--mode=daemon", "--check"], ErrorKind::UnknownArgument),
+        (&["--mode=node"], ErrorKind::ValueValidation),
+        (&["--mode=storage", "--check"], ErrorKind::UnknownArgument),
     ];
     for (rest, kind) in cases {
         let mut argv = vec!["kbf", SETUP];
         argv.extend_from_slice(rest);
         let refused = parse(&words(&argv)).err();
         assert_eq!(refused.map(|e| e.kind()), Some(kind), "{rest:?}");
+    }
+}
+
+/// Asserts that a removed mode is refused with the one message that says what replaces it, as a
+/// usage error.
+#[test]
+fn a_removed_mode_is_refused_with_the_message() {
+    for removed in crate::names::REMOVED_MODES {
+        let flag = format!("--mode={removed}");
+        let e = parse(&words(&["kbf", SETUP, flag.as_str()]))
+            .err()
+            .expect("refused");
+        assert_eq!(e.exit_code(), 2, "{removed}");
+        assert!(e.to_string().contains(crate::REMOVED), "{removed}: {e}");
     }
 }
 
