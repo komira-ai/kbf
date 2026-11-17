@@ -323,6 +323,32 @@ async fn a_row_the_store_cannot_take_is_retried_before_the_submit() {
     );
 }
 
+/// Catches a prepared job held back for ever, listed, by a store that never takes its row: the
+/// submit has a window of its own from the moment the job was ready, and at its end the `Start`
+/// is dropped as `submit_unanswered`; nothing was submitted, so no job exists, and its lease is
+/// reported at once as infrastructure for the farm to run again.
+#[tokio::test(start_paused = true)]
+async fn a_job_whose_row_is_never_written_is_reported_at_the_end_of_its_submit_window() {
+    let mut harness = Harness::shared().await;
+    let (mut worker, messages) = harness.shared_worker();
+    harness.rig().flaky.fail_writes(true);
+    tell_start(&messages, start(1, 1));
+    step(&harness, &mut worker).await;
+    assert_eq!(worker.listed(), [lease()]);
+    tokio::time::advance(Duration::from_secs(15)).await;
+    let log = Log::default();
+    let guard = log.install();
+    step(&harness, &mut worker).await;
+    drop(guard);
+    assert_eq!(log.field("stage").as_deref(), Some("submit_unanswered"));
+    assert!(matches!(
+        worker.tasks.get(&lease()).map(|task| &task.stage),
+        Some(crate::executor::runs::Stage::Reporting(_))
+    ));
+    assert_eq!(submits(&harness), 0);
+    assert!(row_of(&worker, lease()).is_none());
+}
+
 /// Catches a worker that submits after another process took its row: the job row insert
 /// fails on the worker row, the task is dropped, nothing is submitted, and no job row is
 /// written.

@@ -130,8 +130,14 @@ cancels its jobs; a frontend that is killed (a stop timeout, SIGKILL) leaves the
 their wall limit unless a later `js-agent` start cancels them. The frontend registers `--executor-hosts`
 virtual workers with its farm (default 4), `js:<frontend id>-<n>`, each of `--executor-host-cpus`
 cores (default 32), `--executor-host-memory-gib` GiB (default 128) and `--executor-host-slots`
-actions at once: that is how many actions of which size the farm may have in flight, a ceiling
-this frontend admits and not the hardware, and the job service decides which host runs each job.
+actions at once: that is the least the farm may have in flight, and the job service decides which
+host runs each job. Every 30 s the executor reads the job service's hosts (`ListHosts`), counts
+the whole cores of those that take its jobs (live, no mark, no cordon, no taint, `os=linux` and
+`--executor-arch`), and grows each Linux worker to its share of them, up to 256 slots, its cores
+and memory growing with its slots: the farm then places as many actions as the hosts can run,
+not a constant. A listing that fails keeps the size and is logged once (`the job service's hosts
+could not be read`). `--executor-fixed-slots` keeps the declared shape, a ceiling this frontend
+admits.
 The Macs of the
 job service are virtual workers of their own, `js-mac:<frontend>-<n>`, with
 `--executor-mac-hosts` (0 by default: none, and no macOS action is placed on the executor),
@@ -271,8 +277,9 @@ none: the end of a failed job's standard error, with the job's secrets redacted,
 of the frontend's log, `the end of the standard error of a job that did not end well`; the whole
 output goes with the result as before), `--executor-max-run-secs` and `--executor-default-timeout-secs`
 (3000), `--executor-call-timeout-secs` (5), `--executor-poll-ms` (1000, from 100 to 10000: how often the executor polls the job service), `--executor-prepare-limit-secs` (300: how long a run's input
-tree may take to publish; the `Start` window ends the submit, not the preparation), `--executor-prepare-concurrency` (4: how many of one
-worker's runs prepare at once; the rest wait their turn inside their window), `--executor-work-dir`, `--executor-allow-plain-http-put`, `--executor-allow-plain-http-grant` and `--executor-locate`
+tree may take to publish; a `Start` taken up inside its window is listed to the farm while it
+prepares, so this bounds the preparation, not the window), `--executor-prepare-concurrency` (4: how many of one
+worker's runs prepare at once; the rest wait their turn, listed), `--executor-work-dir`, `--executor-allow-plain-http-put`, `--executor-allow-plain-http-grant` and `--executor-locate`
 (read and checked at start, with no effect on a put-dir job: they belong to the presigned path that a following change deletes), and `--executor-network` (the network every job is given on its host: `allow-list`,
 the default, the endpoints the host's agent is set up to allow and nothing else, so each agent must
 allow the read listener and the pack store before the switch; `none`, no route out, with which

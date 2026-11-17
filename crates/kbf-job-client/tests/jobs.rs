@@ -6,7 +6,7 @@ mod support;
 use std::time::Duration;
 
 use bytes::Bytes;
-use js_proto::v1::{Job, JobState, ListJobsRequest, ListJobsResponse};
+use js_proto::v1::{HostState, Job, JobState, ListHostsRequest, ListJobsRequest, ListJobsResponse};
 use kbf_job_client::fake::{Call, FakeJobServer, Fault};
 use kbf_job_client::{Client, Error, Stuck};
 use prost::Message as _;
@@ -65,6 +65,39 @@ async fn host_silence_shows_on_get_job_and_changes_no_state() {
     );
     assert!(!server.silence_host("host-z"));
     assert!(!server.unsilence_host("host-z"));
+}
+
+/// Asserts `ListHosts`: each host the fake has is answered by id, live while it is heard and
+/// lost while it is silent, with its machine's shape and its `os` and `arch`, and the call is
+/// logged; a fake with no host answers none. Catches a listing that drops a host, reports a
+/// silent host live, or loses its shape.
+#[tokio::test]
+async fn list_hosts_answers_each_host_live_or_lost_with_its_shape() {
+    let (server, client) = fake().await;
+    server.add_host("host-b", machine());
+    assert!(server.silence_host("host-b"));
+    let hosts = client.list_hosts().await.unwrap();
+    let seen: Vec<_> = hosts
+        .iter()
+        .map(|host| (host.id.as_str(), host.state()))
+        .collect();
+    assert_eq!(seen, [(HOST, HostState::Live), ("host-b", HostState::Lost)]);
+    for host in &hosts {
+        assert_eq!(host.shape.as_ref(), Some(&machine().shape));
+        assert_eq!(host.capabilities["os"], "linux");
+        assert_eq!(host.capabilities["arch"], "x86_64");
+    }
+    assert_eq!(server.calls(), [Call::ListHosts(ListHostsRequest {})]);
+    let empty = FakeJobServer::start().await.unwrap();
+    assert!(
+        empty
+            .client()
+            .unwrap()
+            .list_hosts()
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 /// Asserts each branch of the design's cancel: a queued job is cancelled at once and, having

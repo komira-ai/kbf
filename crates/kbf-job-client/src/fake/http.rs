@@ -20,8 +20,8 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::service::TowerToHyperService;
 use js_proto::v1::job_service_server::JobServiceServer;
 use js_proto::v1::{
-    CancelJobRequest, GetJobRequest, GetLogsRequest, GetResultRequest, ListJobsRequest,
-    SubmitJobRequest,
+    CancelJobRequest, GetJobRequest, GetLogsRequest, GetResultRequest, ListHostsRequest,
+    ListJobsRequest, SubmitJobRequest,
 };
 use prost::Message as _;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -190,6 +190,7 @@ fn decode_call(method: &str, message: &[u8]) -> Option<Call> {
         "CancelJob" => Call::CancelJob(CancelJobRequest::decode(message).ok()?),
         "GetResult" => Call::GetResult(GetResultRequest::decode(message).ok()?),
         "GetLogs" => Call::GetLogs(GetLogsRequest::decode(message).ok()?),
+        "ListHosts" => Call::ListHosts(ListHostsRequest::decode(message).ok()?),
         _ => return None,
     };
     Some(call)

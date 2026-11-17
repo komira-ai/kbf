@@ -1,4 +1,4 @@
-//! The job service, as the executor calls it: the six calls it makes, every one bounded.
+//! The job service, as the executor calls it: the seven calls it makes, every one bounded.
 //!
 //! The client gives a call its connect timeout and then 30 s, and a pass of the executor makes
 //! several calls one after another, with the heartbeats and the self-fence between them. A job
@@ -12,7 +12,7 @@
 use std::future::Future;
 use std::time::Duration;
 
-use js_proto::v1::{Job, JobResult, JobSpec, ListJobsRequest};
+use js_proto::v1::{Host, Job, JobResult, JobSpec, ListJobsRequest};
 use kbf_job_client::{Broken, Client, Error};
 
 use crate::executor::output::Tail;
@@ -51,6 +51,11 @@ impl Api<'_> {
     /// `CancelJob`: idempotent on the job.
     pub(crate) async fn cancel_job(&self, id: &str) -> Result<Job, Error> {
         self.within(self.client.cancel_job(id)).await
+    }
+
+    /// `ListHosts`: for the size of the workers ([`capacity`](super::capacity)) only.
+    pub(crate) async fn list_hosts(&self) -> Result<Vec<Host>, Error> {
+        self.within(self.client.list_hosts()).await
     }
 
     /// `GetResult` of an ended job.

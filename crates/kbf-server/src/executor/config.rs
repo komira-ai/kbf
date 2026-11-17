@@ -127,8 +127,13 @@ pub struct Config {
     /// What a virtual worker holds in memory, in bytes: the bookings on it and their hard
     /// caps fit in it ([`Config::booked_memory_gib`]).
     pub memory_bytes: u64,
-    /// The most actions a virtual worker has in flight (`action_slots` of its node report).
+    /// The most actions a virtual worker has in flight (`action_slots` of its node report): with
+    /// [`Config::size_from_hosts`], the fewest a Linux worker takes.
     pub slots: u64,
+    /// Whether the Linux workers are sized from the job service's hosts
+    /// ([`capacity`](super::capacity)), never below the declared shape: on by default, off
+    /// with `--executor-fixed-slots`, which keeps the declared shape whatever the hosts.
+    pub size_from_hosts: bool,
     /// The CPU architecture a job asks its host for.
     pub arch: String,
     /// The longest action timeout the executor runs.
@@ -156,14 +161,13 @@ pub struct Config {
     /// How long a pass goes on starting waiting tasks: past it the rest wait for the next.
     pub pass_budget: Duration,
     /// How long the inputs of one run (its action, its input tree published into the store,
-    /// its keys) may take to prepare. A preparation is not stopped by the `Start`'s window,
-    /// which only the submit must meet: it goes on until this ends, so a tree published by a
-    /// run whose window passed is there for the run the farm starts next.
+    /// its keys) may take to prepare. A `Start` taken up inside its window is listed while it
+    /// prepares, so the window does not bound the preparation: this does, and a run not ready
+    /// by then is an infrastructure failure the farm runs again.
     pub prepare_limit: Duration,
     /// How many of one worker's preparations run at once. A worker the farm gave a full set of
-    /// `Start`s at one instant prepared them all together, each slowed by the rest until none
-    /// was ready inside the window; the `Start`s past this wait their turn, and are dropped
-    /// at their window, unprepared, only if their turn did not come.
+    /// `Start`s at one instant prepared them all together, each slowed by the rest; the
+    /// `Start`s past this wait their turn, listed, and begin as the ones before them end.
     pub prepare_concurrency: usize,
     /// T: how long a worker goes on with its jobs after the farm last acknowledged a
     /// heartbeat, or the job service last answered a call about a job it holds (or, with
@@ -326,6 +330,7 @@ impl Config {
             cpu_millis,
             memory_bytes,
             slots: 8,
+            size_from_hosts: true,
             arch: "x86_64".to_owned(),
             max_run: Duration::from_secs(3000),
             run_margin: Duration::from_secs(300),
@@ -383,9 +388,10 @@ impl Config {
     /// service; if that is the one that cannot be reached, the job goes on to its wall limit,
     /// which wastes the work and is harmless: its pack key is its own.
     ///
-    /// A `Start` submitted at the end of its window ([`START_VALIDITY`]) is then a job whose
-    /// cancel is sent T later, and the farm runs the action again [`START_GRACE`] after the
-    /// `Start`: the window, T and the margin stay under it.
+    /// A `Start` taken up at the end of its window ([`START_VALIDITY`]) is listed by the
+    /// heartbeat that ends that pass, or the worker fences T later, and the farm runs an action
+    /// it never heard listed again [`START_GRACE`] after the `Start`: the window, T and the
+    /// margin stay under it.
     ///
     /// # Errors
     /// The first setting that breaks a rule.
@@ -530,10 +536,7 @@ impl Config {
     /// job service's (its class's history); the farm's booking only paces how many it sends.
     #[must_use]
     pub fn booked_memory_gib(&self) -> u64 {
-        let usable = self
-            .memory_bytes
-            .saturating_sub(self.slots.saturating_mul(HARD_CAP_PAD));
-        usable / 3 * 2 / GIB
+        booked_gib(self.memory_bytes, self.slots)
     }
 
     /// The hard memory cap of a Mac job the farm booked `booking` bytes for: what the job needs.
@@ -549,10 +552,8 @@ impl Config {
         timeout + self.run_margin
     }
 
-    /// The `Hello` of a virtual worker of `os`: what a real node of the shape would report, and
-    /// no more. A Linux worker's drivers are [`DRIVERS`]: `action` and `whole_machine` leases
-    /// are placed on it, a VM lease is not. A Mac worker reports `os=macos`, `arch=arm64` and the
-    /// one driver `native`: only `action` leases are placed on it.
+    /// [`Config::hello_sized`] at the declared slots.
+    #[cfg(test)]
     pub(super) fn hello(
         &self,
         os: WorkerOs,
@@ -560,6 +561,34 @@ impl Config {
         instance: &str,
         predecessor: &str,
     ) -> Hello {
+        self.hello_sized(os, self.slots, node, instance, predecessor)
+    }
+
+    /// The `Hello` of a virtual worker of `os` with `slots` slots: what a real node of the shape
+    /// would report, and no more. A Linux worker's drivers are [`DRIVERS`]: `action` and
+    /// `whole_machine` leases are placed on it, a VM lease is not. A Mac worker reports
+    /// `os=macos`, `arch=arm64` and the one driver `native`: only `action` leases are placed on
+    /// it.
+    ///
+    /// A Linux worker's cores and memory grow with its slots from the declared shape, so each slot keeps the declared share of both and
+    /// what bounds the farm's bookings per slot stays what the flags say. A Mac worker keeps the
+    /// declared shape. The executor sizes its Linux workers from the job service's hosts
+    /// ([`capacity`](super::capacity)), never below the declared slots.
+    pub(super) fn hello_sized(
+        &self,
+        os: WorkerOs,
+        slots: u64,
+        node: &str,
+        instance: &str,
+        predecessor: &str,
+    ) -> Hello {
+        let slots = match os {
+            WorkerOs::Linux => slots.max(self.slots),
+            WorkerOs::Mac => self.slots,
+        };
+        // The declared slots are at least 1 ([`Config::validate`]).
+        let grown = |declared: u64| declared.saturating_mul(slots) / self.slots.max(1);
+        let (cpu_millis, memory_bytes) = (grown(self.cpu_millis), grown(self.memory_bytes));
         let entry = |key: &str, value: String| Capability {
             key: key.to_owned(),
             value,
@@ -569,13 +598,13 @@ impl Config {
             WorkerOs::Mac => (MAC_ARCH, &[MAC_DRIVER], MAC_OS),
         };
         let mut capabilities = vec![
-            entry("action_slots", self.slots.to_string()),
+            entry("action_slots", slots.to_string()),
             entry("arch", arch.to_owned()),
-            entry("cpus", (self.cpu_millis / 1_000).to_string()),
+            entry("cpus", (cpu_millis / 1_000).to_string()),
         ];
         capabilities.extend(drivers.iter().map(|d| entry("drivers", (*d).to_owned())));
         capabilities.extend([
-            entry("mem_gib", self.booked_memory_gib().to_string()),
+            entry("mem_gib", booked_gib(memory_bytes, slots).to_string()),
             entry("os", system.to_owned()),
         ]);
         Hello {
@@ -588,6 +617,13 @@ impl Config {
             ..Hello::default()
         }
     }
+}
+
+/// How many whole GiB of `memory` bytes the farm may book on a worker of `slots` slots
+/// ([`Config::booked_memory_gib`]).
+fn booked_gib(memory: u64, slots: u64) -> u64 {
+    let usable = memory.saturating_sub(slots.saturating_mul(HARD_CAP_PAD));
+    usable / 3 * 2 / GIB
 }
 
 /// An id of this process, in hex: 128 random bits from the operating system's source, then

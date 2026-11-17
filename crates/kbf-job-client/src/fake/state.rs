@@ -5,9 +5,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use js_proto::refusal::refusal_status;
 use js_proto::v1::{
-    ExecMode, GetLogsResponse, Job, JobFile, JobResult, JobSpec, JobState, JobTimes,
-    ListJobsRequest, ListJobsResponse, NetworkLevel, PortForward, RefusalCode, ResultReason, Shape,
-    StartFailureCode,
+    ExecMode, GetLogsResponse, Host as HostView, HostState, Job, JobFile, JobResult, JobSpec,
+    JobState, JobTimes, ListJobsRequest, ListJobsResponse, NetworkLevel, PortForward, RefusalCode,
+    ResultReason, Shape, StartFailureCode,
 };
 use tonic::Status;
 
@@ -295,6 +295,32 @@ impl State {
 
     pub(super) fn add_offer(&mut self, machine: Machine) {
         self.offers.push(machine);
+    }
+
+    /// The hosts as `ListHosts` answers them, by id: live while heard and lost while silent,
+    /// each with its machine's shape and its `os` and `arch` as capabilities.
+    pub(super) fn host_views(&self) -> Vec<HostView> {
+        self.hosts
+            .iter()
+            .map(|(id, host)| {
+                let state = match host.silent_since_ms {
+                    None => HostState::Live,
+                    Some(_) => HostState::Lost,
+                };
+                let machine = &host.machine;
+                HostView {
+                    id: id.clone(),
+                    state: state.into(),
+                    shape: Some(machine.shape.clone()),
+                    capabilities: [
+                        ("arch".to_owned(), machine.arch.clone()),
+                        ("os".to_owned(), machine.os.clone()),
+                    ]
+                    .into(),
+                    ..HostView::default()
+                }
+            })
+            .collect()
     }
 
     /// Marks the host silent from now (kept if it already was); false for no such host.

@@ -439,6 +439,9 @@ impl Rig {
         let api = fake.client().expect("a client");
         let mut cfg = Config::new("front-1", workers, 2_000, gib * GIB);
         cfg.slots = 2;
+        // The declared shape, which most tests here count on: a test of the sizing from the
+        // job service's hosts turns it on (`pool.rs`).
+        cfg.size_from_hosts = false;
         cfg.insecure_argv_secrets = true;
         adjust(&mut cfg);
         let farm = Arc::new(Farm::new(
@@ -742,6 +745,7 @@ pub fn method(call: &Call) -> &'static str {
         Call::CancelJob(_) => "CancelJob",
         Call::GetResult(_) => "GetResult",
         Call::GetLogs(_) => "GetLogs",
+        Call::ListHosts(_) => "ListHosts",
     }
 }
 

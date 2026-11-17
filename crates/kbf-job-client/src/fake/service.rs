@@ -1,14 +1,15 @@
 //! The generated `JobService` over the fake's [`State`](super::State): each call is logged
 //! with its request, then answered by the state's rules. The calls the client does not wrap
-//! (hosts, pools, providers, usage) keep the generated default, `UNIMPLEMENTED`.
+//! (the host operations past `ListHosts`, pools, providers, usage) keep the generated default,
+//! `UNIMPLEMENTED`.
 
 use std::sync::Arc;
 
 use js_proto::v1::job_service_server::JobService;
 use js_proto::v1::{
     CancelJobRequest, CancelJobResponse, GetJobRequest, GetJobResponse, GetLogsRequest,
-    GetLogsResponse, GetResultRequest, GetResultResponse, ListJobsRequest, ListJobsResponse,
-    SubmitJobRequest, SubmitJobResponse,
+    GetLogsResponse, GetResultRequest, GetResultResponse, ListHostsRequest, ListHostsResponse,
+    ListJobsRequest, ListJobsResponse, SubmitJobRequest, SubmitJobResponse,
 };
 use tonic::{Request, Response, Status};
 
@@ -83,5 +84,14 @@ impl JobService for Service {
         self.shared.record(Call::GetLogs(request.clone()));
         let logs = self.shared.state().logs(&request.job_id)?;
         Ok(Response::new(logs))
+    }
+
+    async fn list_hosts(
+        &self,
+        request: Request<ListHostsRequest>,
+    ) -> Result<Response<ListHostsResponse>, Status> {
+        self.shared.record(Call::ListHosts(request.into_inner()));
+        let hosts = self.shared.state().host_views();
+        Ok(Response::new(ListHostsResponse { hosts }))
     }
 }

@@ -142,6 +142,61 @@ async fn a_worker_takes_no_more_actions_than_its_slots() {
     assert_eq!(rig.jobs().len(), 2, "{:?}", rig.jobs());
 }
 
+/// The cores, in thousandths, the farm holds for the worker `name`.
+fn farm_cpu(rig: &Rig, name: &str) -> u64 {
+    let detail = rig.farm.node_detail(&WorkerId::new(name.to_owned()));
+    let detail = detail.expect("the node is read");
+    detail.expect("the farm knows the node").capacity.cpu_millis
+}
+
+/// Catches the farm capped by the declared shape while the job service has hosts to spare (the
+/// farm's queue was the wait, and the hosts idled): two workers of 2 slots and 2 cores over a
+/// job service of two 16-core hosts are each grown to their share of its 32 cores, 16 slots of
+/// 16 cores, and 20 actions placed at once are 20 jobs where the declared shape made 4.
+#[tokio::test(start_paused = true)]
+async fn the_workers_grow_to_their_share_of_the_job_services_cores() {
+    let mut rig = Rig::start(&["node1", "node2"], 2, |cfg| cfg.size_from_hosts = true).await;
+    rig.pump().await;
+    for worker in ["js:front-1-0", "js:front-1-1"] {
+        assert_eq!(farm_cpu(&rig, worker), 16_000, "{worker}");
+    }
+    let callers: Vec<_> = (1..=20).map(|tag| rig.submit(tag)).collect();
+    rig.pump().await;
+    assert_eq!(rig.jobs().len(), 20);
+    drop(callers);
+}
+
+/// Catches a size that only grows: a host the job service no longer hears is left out at the
+/// next reading of its hosts, and the one worker over two 16-core hosts goes from 32 slots to
+/// 16 (its 32 cores to 16); the hosts are read again only once a period has passed.
+#[tokio::test(start_paused = true)]
+async fn a_host_the_job_service_lost_shrinks_the_workers_at_the_next_reading() {
+    let mut rig = Rig::start(&["node1", "node2"], 1, |cfg| cfg.size_from_hosts = true).await;
+    rig.pump().await;
+    assert_eq!(farm_cpu(&rig, "js:front-1-0"), 32_000);
+    assert!(rig.fake.silence_host("node2"));
+    rig.elapse(25).await;
+    assert_eq!(
+        farm_cpu(&rig, "js:front-1-0"),
+        32_000,
+        "read before its period"
+    );
+    rig.elapse(5).await;
+    assert_eq!(farm_cpu(&rig, "js:front-1-0"), 16_000);
+    let listings = rig.methods().iter().filter(|m| **m == "ListHosts").count();
+    assert_eq!(listings, 2);
+}
+
+/// Catches the hosts read, or the shape changed, with `--executor-fixed-slots`: the worker
+/// keeps its declared 2 cores, and the job service is never asked for its hosts.
+#[tokio::test(start_paused = true)]
+async fn with_fixed_slots_the_hosts_are_never_read() {
+    let mut rig = Rig::start(&["node1", "node2"], 1, |cfg| cfg.size_from_hosts = false).await;
+    rig.elapse(60).await;
+    assert_eq!(farm_cpu(&rig, "js:front-1-0"), 2_000);
+    assert!(!rig.methods().contains(&"ListHosts"), "{:?}", rig.methods());
+}
+
 /// Catches an executor that submits what the farm placed before it knows the jobs of an
 /// earlier process, or that takes up the wrong ones. A restarted frontend lists its live jobs
 /// by its own label and submits nothing, with no worker registered, until the process that

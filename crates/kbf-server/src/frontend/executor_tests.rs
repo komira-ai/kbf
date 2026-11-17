@@ -249,6 +249,7 @@ pub(super) fn methods(fake: &FakeJobServer) -> Vec<&'static str> {
             Call::CancelJob(_) => "CancelJob",
             Call::GetResult(_) => "GetResult",
             Call::GetLogs(_) => "GetLogs",
+            Call::ListHosts(_) => "ListHosts",
         })
         .collect()
 }

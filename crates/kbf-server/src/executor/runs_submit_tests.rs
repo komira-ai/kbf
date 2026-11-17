@@ -1,6 +1,6 @@
-//! The arms of a task's submit, each taken by a test here: the window judged after the
-//! prepare, a submit whose answer is lost again after it was already sent, and a refusal that
-//! is the caller's and no twin's. The executor is built twice for coverage (in these unit tests
+//! The arms of a task's submit, each taken by a test here: a `Start` taken up and prepared past
+//! its window, one first seen past it, a submit whose answer is lost again after it was already
+//! sent, and a refusal that is the caller's and no twin's. The executor is built twice for coverage (in these unit tests
 //! and in the farm-level tests of `tests/executor`), and a branch counts as covered only when
 //! one build takes both its sides, so these take them here.
 
@@ -8,12 +8,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use js_proto::v1::JobState;
 use kbf_proto::reapi::Digest;
 use kbf_proto::worker::Start;
 use kbf_types::LeaseId;
 use tokio::sync::Notify;
-use tokio::time::Instant;
 use tonic::Code;
 
 use super::{Stage, counted, reported, status_of, step, submitted_specs, tell_start};
@@ -22,107 +20,38 @@ use crate::executor::host::HostWorker;
 use crate::executor::test_support::{Harness, Log, built_class, start};
 use crate::executor::traits::{ActionFacts, Inputs, InputsError, ReadGrant};
 
-/// An action read that ends at `until`, on the test's held clock: the prepare of a task
-/// takes exactly as long as the test says. It says when the read has begun (`begun`), so the
-/// test moves the clock only then.
-struct ReadUntil {
-    until: Instant,
-    begun: Arc<Notify>,
-}
-
-#[tonic::async_trait]
-impl Inputs for ReadUntil {
-    async fn action(&self, _: &Digest) -> Result<ActionFacts, InputsError> {
-        self.begun.notify_one();
-        tokio::time::sleep_until(self.until).await;
-        Ok(ActionFacts {
-            image: format!("registry.test/app@sha256:{}", "ab".repeat(32)),
-            timeout: Some(Duration::from_secs(20)),
-            system: crate::executor::System::Linux,
-            size_class: built_class(),
-        })
-    }
-
-    async fn read_grant(
-        &self,
-        _: LeaseId,
-        _: &Digest,
-        _: Duration,
-    ) -> Result<ReadGrant, InputsError> {
-        Ok(ReadGrant {
-            url: "https://grant.test:9400".to_owned(),
-            token: Secret::new("token"),
-        })
-    }
-}
-
-/// A `Start` of lease 1.1 whose action read ends `before` the end of its window (counted
-/// from the worker's first heartbeat, at its start, for the `Start`'s `valid_for_ms`), and
-/// what came of it after one step: the harness, whether the task is running, and what the step
-/// logged (a subscriber of its own, so the log's macros run as they do in a server). The
-/// harness holds the clock, so the test moves it: once the read has begun, to the read's end.
-async fn prepared_before_the_end(before: Duration) -> (Harness, bool, String) {
+/// Catches a `Start` dropped because its preparation was slower than its window: the farm then
+/// gave the lease up only after its start grace, and the action paid a whole second attempt.
+/// Taken up inside its window, the `Start` is listed from that pass on; its preparation ends 10 s
+/// past the window and its job is submitted then, once, on its own lease, with nothing dropped.
+#[tokio::test(start_paused = true)]
+async fn a_start_prepared_past_its_window_is_submitted_on_its_lease() {
     let mut harness = Harness::new().await;
     let (mut worker, messages) = harness.worker();
-    let start = start(1, 1);
-    let until = Instant::now() + Duration::from_millis(start.valid_for_ms) - before;
-    let begun = Arc::new(Notify::new());
-    harness.deps.inputs = Arc::new(ReadUntil {
-        until,
-        begun: Arc::clone(&begun),
-    });
-    tell_start(&messages, start);
-    // The pass begins 200 ms before the window ends, so the preparation ends inside the one
-    // poll the pass waits for it, on either side of the window's end.
-    tokio::time::advance(until + before - Instant::now() - Duration::from_millis(200)).await;
-    let read_ends = async {
-        begun.notified().await;
-        tokio::time::advance(until - Instant::now()).await;
-    };
-    let log = Log::default();
-    let guard = log.install();
-    tokio::join!(step(&harness, &mut worker), read_ends);
-    drop(guard);
-    let running = matches!(
-        worker
-            .tasks
-            .get(&LeaseId::new(1, 1))
-            .map(|task| &task.stage),
-        Some(Stage::Running(_))
+    let gate = Gate::new(false);
+    harness.deps.inputs = Arc::new(Arc::clone(&gate));
+    let lease = LeaseId::new(1, 1);
+    let window = Duration::from_millis(start(1, 1).valid_for_ms);
+    tell_start(&messages, start(1, 1));
+    step_ticking(&harness, &mut worker).await;
+    assert_eq!(worker.listed(), [lease]);
+    tokio::time::advance(window + Duration::from_secs(10)).await;
+    step_ticking(&harness, &mut worker).await;
+    assert_eq!(
+        worker.listed(),
+        [lease],
+        "the Start was dropped at its window"
     );
-    (harness, running, log.text())
-}
-
-/// What the worker logs when it drops a `Start` whose window ended before its job was sent.
-const DROPPED: &str = "a Start ran out of its window before its job was submitted and is dropped";
-
-/// What the worker logs of a `Start` whose preparation ended at the very end of its window: the
-/// stage, and the window as the age of the heartbeat it names.
-const PREPARED_LATE: &str = "stage=prepared_late beat_age_ms=14000";
-
-/// Catches a window judged only by the timeout around the prepare: a prepare that ends at
-/// the very instant the window ends finishes inside that timeout, and its job must still
-/// not be submitted, as the `Start` is no longer valid. It is dropped, logged and counted
-/// late, and the service is asked for nothing. Control: a prepare that ends a millisecond
-/// before the end is submitted and its job runs, and nothing is dropped.
-#[tokio::test(start_paused = true)]
-async fn a_task_prepared_at_the_end_of_its_window_is_not_submitted() {
-    let (harness, running, log) = prepared_before_the_end(Duration::ZERO).await;
-    assert!(!running, "a job was submitted for a Start past its window");
-    assert!(log.contains(DROPPED), "{log}");
-    assert!(log.contains(PREPARED_LATE), "{log}");
     assert_eq!(submitted_specs(&harness).len(), 0);
-    assert!(harness.fake.jobs().is_empty());
-    assert_eq!(counted(&harness, "kbf_executor_late_starts_total"), 1);
-
-    let (harness, running, log) = prepared_before_the_end(Duration::from_millis(1)).await;
-    assert!(
-        running,
-        "control: a Start prepared inside its window is not running"
-    );
+    gate.release.notify_one();
+    gate.done.notified().await;
+    step_ticking(&harness, &mut worker).await;
+    assert!(matches!(
+        worker.tasks.get(&lease).map(|task| &task.stage),
+        Some(Stage::Running(_))
+    ));
+    assert_eq!(worker.listed(), [lease]);
     assert_eq!(submitted_specs(&harness).len(), 1);
-    assert_eq!(harness.fake.jobs()[0].state(), JobState::Queued);
-    assert!(!log.contains(DROPPED), "{log}");
     assert_eq!(counted(&harness, "kbf_executor_late_starts_total"), 0);
 }
 
@@ -287,75 +216,107 @@ async fn a_slow_preparation_does_not_hold_the_pass() {
     assert_eq!(counted(&harness, "kbf_executor_late_starts_total"), 0);
 }
 
-/// Asserts that a preparation that outlasts its `Start`'s window is not stopped with it: the
-/// `Start` is dropped late, and the preparation still runs to its end, so what it wrote (the
-/// input tree, kept by the writer's memo) is there when the farm runs the action again.
-/// Catches a preparation cancelled at the window, which redid the same work for every lease of
-/// an action whose tree took longer than the window, and never finished it.
+/// Asserts that a preparation whose `Start` the farm cancelled is not stopped with it: the task
+/// is dropped and no longer listed, and the preparation still runs to its end, so what it wrote
+/// (the input tree, kept by the writer's memo) is there when the farm runs the action again, and
+/// nothing is submitted for the cancelled lease. Catches a preparation stopped with its task,
+/// which redid the same work for every lease of the action.
 #[tokio::test(start_paused = true)]
-async fn a_preparation_outlasting_the_window_runs_to_its_end() {
+async fn a_cancelled_start_drops_its_task_and_its_preparation_runs_to_its_end() {
     let mut harness = Harness::new().await;
     let (mut worker, messages) = harness.worker();
     let gate = Gate::new(false);
     harness.deps.inputs = Arc::new(Arc::clone(&gate));
     let lease = LeaseId::new(1, 1);
-    let window = Duration::from_millis(start(1, 1).valid_for_ms);
     tell_start(&messages, start(1, 1));
     step_ticking(&harness, &mut worker).await;
-    tokio::time::advance(window + Duration::from_secs(1)).await;
-    let log = Log::default();
-    let guard = log.install();
+    super::tell_cancel(&messages, 1, 1);
     step_ticking(&harness, &mut worker).await;
-    drop(guard);
-    assert!(!worker.tasks.contains_key(&lease), "the late task is kept");
-    let stage = log.field("stage");
-    assert_eq!(stage.as_deref(), Some("preparing"), "{}", log.text());
-    assert_eq!(counted(&harness, "kbf_executor_late_starts_total"), 1);
+    assert!(
+        !worker.tasks.contains_key(&lease),
+        "the cancelled task is kept"
+    );
+    assert!(worker.listed().is_empty());
     assert_eq!(gate.finished.load(Ordering::SeqCst), 0);
     gate.release.notify_one();
     gate.done.notified().await;
     assert_eq!(gate.finished.load(Ordering::SeqCst), 1);
+    step_ticking(&harness, &mut worker).await;
     assert_eq!(submitted_specs(&harness).len(), 0);
 }
 
-/// Asserts that the warning of a dropped `Start` says where the `Start` stood and how old the
-/// heartbeat it names was: with room for one preparation at a time, two `Start`s whose
-/// preparation never ends are dropped past the window, the one that began as `preparing` and
-/// the one that never did as `not_begun`, each with the age of the registration heartbeat
-/// they name (the window and the second after it). Catches a drop warning that names neither,
-/// which left a farm's drops unexplained (a preparation slower than the window, or a worker
-/// given more `Start`s than it prepares at once).
+/// Catches a `Start` dropped at its window because it waited for a place under
+/// `prepare_concurrency` (`not_begun`, the drops of a worker given more `Start`s than it prepares
+/// at once): with room for one preparation, two `Start`s are both taken up and listed, still
+/// listed past their window, and the second begins its preparation when the first is done; both
+/// jobs are submitted on their leases, and nothing is dropped.
 #[tokio::test(start_paused = true)]
-async fn a_dropped_start_is_logged_with_its_stage_and_the_age_of_its_heartbeat() {
+async fn a_start_waiting_for_a_place_to_prepare_is_listed_and_prepared_in_turn() {
     let mut harness = Harness::new().await;
     harness.cfg.prepare_concurrency = 1;
     let (mut worker, messages) = harness.worker();
-    harness.deps.inputs = Arc::new(Gate::new(false));
+    let gate = Gate::new(false);
+    harness.deps.inputs = Arc::new(Arc::clone(&gate));
     let window = Duration::from_millis(start(1, 1).valid_for_ms);
+    let leases = [LeaseId::new(1, 1), LeaseId::new(1, 2)];
     tell_start(&messages, start(1, 1));
     tell_start(&messages, start(1, 2));
     step_ticking(&harness, &mut worker).await;
+    assert_eq!(worker.listed(), leases);
+    assert_eq!(gate.begun.load(Ordering::SeqCst), 1);
     tokio::time::advance(window + Duration::from_secs(1)).await;
     let log = Log::default();
     let guard = log.install();
     step_ticking(&harness, &mut worker).await;
     drop(guard);
-    let text = log.text();
-    let lines: Vec<&str> = text
-        .lines()
-        .filter(|line| line.contains("dropped"))
-        .collect();
-    assert_eq!(lines.len(), 2, "{text}");
-    for (line, stage) in lines.iter().zip(["preparing", "not_begun"]) {
-        assert!(line.contains(&format!("stage={stage} ")), "{text}");
-        let age: u64 = line
-            .split_once("beat_age_ms=")
-            .and_then(|(_, tail)| tail.split_whitespace().next())
-            .and_then(|age| age.parse().ok())
-            .unwrap_or_else(|| panic!("no age of the heartbeat in {text}"));
-        assert!((15_000..20_000).contains(&age), "{age} in {text}");
+    assert!(!log.text().contains("dropped"), "{}", log.text());
+    assert_eq!(worker.listed(), leases);
+    for prepared in 1..=2 {
+        gate.release.notify_one();
+        gate.done.notified().await;
+        tokio::task::yield_now().await;
+        step_ticking(&harness, &mut worker).await;
+        assert_eq!(submitted_specs(&harness).len(), prepared);
     }
-    assert_eq!(counted(&harness, "kbf_executor_late_starts_total"), 2);
+    assert_eq!(gate.begun.load(Ordering::SeqCst), 2);
+    assert_eq!(worker.listed(), leases);
+    assert_eq!(counted(&harness, "kbf_executor_late_starts_total"), 0);
+}
+
+/// Catches a `Start` dropped past its window and left to the farm's start grace, and a drop
+/// warning that does not say why: a `Start` the worker first looks at 15 s after the heartbeat it
+/// names is never taken up, nothing of it is submitted, and its lease is reported at once as
+/// infrastructure (listed until the farm acknowledges it), with the warning naming the stage
+/// `not_begun` and the age of the heartbeat, and the run counted as an infrastructure one.
+#[tokio::test(start_paused = true)]
+async fn a_start_first_seen_past_its_window_is_reported_at_once() {
+    let harness = Harness::new().await;
+    let (mut worker, messages) = harness.worker();
+    let lease = LeaseId::new(1, 1);
+    tell_start(&messages, start(1, 1));
+    tokio::time::advance(Duration::from_secs(15)).await;
+    let log = Log::default();
+    let guard = log.install();
+    step(&harness, &mut worker).await;
+    drop(guard);
+    let (code, message) = status_of(reported(&worker, lease));
+    assert_eq!(
+        (code, message),
+        (
+            Code::Unavailable as i32,
+            "the Start's window ended before its job was submitted"
+        )
+    );
+    assert_eq!(worker.listed(), [lease]);
+    let (stage, age) = (log.field("stage"), log.field("beat_age_ms"));
+    assert_eq!(stage.as_deref(), Some("not_begun"), "{}", log.text());
+    assert_eq!(age.as_deref(), Some("15000"), "{}", log.text());
+    assert!(harness.fake.calls().is_empty());
+    assert_eq!(counted(&harness, "kbf_executor_late_starts_total"), 1);
+    assert_eq!(
+        counted(&harness, "kbf_executor_runs_total{outcome=\"infra\"}"),
+        1
+    );
 }
 
 /// Asserts that a `Start` whose job was prepared and whose submit the service did not answer
@@ -469,4 +430,20 @@ async fn a_worker_prepares_only_so_many_runs_at_once() {
     assert_eq!(submitted_specs(&harness).len(), 1);
     assert_eq!(gate.begun.load(Ordering::SeqCst), 3);
     assert_eq!(counted(&harness, "kbf_executor_late_starts_total"), 0);
+}
+
+/// Asserts what a heartbeat lists of a `Start`: nothing before a pass has looked at it, and its
+/// lease from the pass that takes it up, while its preparation runs. Catches a `Start` listed
+/// before the worker has judged its window, and one left out while it prepares (which the farm
+/// gives up after its start grace).
+#[tokio::test(start_paused = true)]
+async fn a_start_is_listed_from_the_pass_that_takes_it_up() {
+    let mut harness = Harness::new().await;
+    let (mut worker, _messages) = harness.worker();
+    harness.deps.inputs = Arc::new(Gate::new(false));
+    worker.accept(&start(1, 1));
+    assert!(worker.listed().is_empty(), "listed before it was taken up");
+    step_ticking(&harness, &mut worker).await;
+    assert_eq!(worker.listed(), [LeaseId::new(1, 1)]);
+    assert_eq!(submitted_specs(&harness).len(), 0);
 }

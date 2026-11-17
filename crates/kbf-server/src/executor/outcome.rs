@@ -222,6 +222,13 @@ pub(super) fn drained() -> Settled {
     Settled::Infra("the frontend is draining and the job had not been placed on a host".to_owned())
 }
 
+/// A `Start` dropped at the end of its window before any submit of its job was sent: no job
+/// exists and nothing ran. Reported, so the farm requeues the lease at once instead of after
+/// its start grace.
+pub(super) fn undelivered() -> Settled {
+    Settled::Infra("the Start's window ended before its job was submitted".to_owned())
+}
+
 /// What a submit that failed with `error` comes to; `None` when nothing is decided, because
 /// nothing was sent or the answer was lost, and the same submit is sent again.
 pub(super) fn refused(error: &Error) -> Option<Refused> {

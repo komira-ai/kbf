@@ -272,6 +272,16 @@ fn executor_locate_is_off_unless_given_and_becomes_the_config() {
     assert!(on.executor.js.expect("js-agent").config.locate);
 }
 
+/// Catches the workers sized from the job service's hosts with `--executor-fixed-slots`, or not
+/// sized without it: sized unless the flag is given.
+#[test]
+fn executor_fixed_slots_turns_off_the_sizing_from_the_hosts() {
+    let sized = js_with(&[]).expect("flags");
+    assert!(sized.executor.js.expect("js-agent").config.size_from_hosts);
+    let fixed = js_with(&["--executor-fixed-slots"]).expect("flags");
+    assert!(!fixed.executor.js.expect("js-agent").config.size_from_hosts);
+}
+
 /// Catches `--executor-locate` accepted where nothing reads it: with no executor no task command
 /// line is built, so it would do nothing and is refused when the flags are read, naming both
 /// flags.
@@ -296,6 +306,7 @@ fn the_defaults_are_the_executors_own() {
     let config = flags.executor.js.expect("js-agent").config;
     let own = Config::new("front-1", 2, 8_000, 32 << 30);
     assert_eq!(config.slots, own.slots);
+    assert_eq!(config.size_from_hosts, own.size_from_hosts);
     assert_eq!(config.arch, own.arch);
     assert_eq!(config.work_dir, own.work_dir);
     assert_eq!(config.allow_plain_http_put, own.allow_plain_http_put);

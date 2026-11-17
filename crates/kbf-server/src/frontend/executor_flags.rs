@@ -64,6 +64,7 @@ const HOSTS: &str = "executor_hosts";
 const CPUS: &str = "executor_host_cpus";
 const MEMORY_GIB: &str = "executor_host_memory_gib";
 const SLOTS: &str = "executor_host_slots";
+const FIXED_SLOTS: &str = "executor_fixed_slots";
 const ARCH: &str = "executor_arch";
 const WORK_DIR: &str = "executor_work_dir";
 const PLAIN_PUT: &str = "executor_allow_plain_http_put";
@@ -224,10 +225,13 @@ pub(super) fn args() -> Vec<Arg> {
             .default_value("4")
             .help(
                 "How many virtual workers the farm places actions on, each of the shape below: \
-                 how many actions of which size the farm may have in flight as jobs. A ceiling \
-                 on what this frontend admits, not the hardware: the job service decides which \
-                 host runs each job and holds the real capacity, so set it lower only to cap \
-                 this frontend. Used only with `--executor js-agent`",
+                 how many actions of which size the farm may have in flight as jobs. The job \
+                 service decides which host runs each job and holds the real capacity: every 30 \
+                 s the executor counts the whole cores of the job service's live Linux hosts of \
+                 `--executor-arch` that take jobs, spreads them over the workers, and grows each \
+                 worker's slots, cores and memory to its share, so this shape is the least each \
+                 worker takes; with `--executor-fixed-slots` it is the shape, a ceiling on what \
+                 this frontend admits. Used only with `--executor js-agent`",
             ),
         Arg::new(CPUS)
             .long("executor-host-cpus")
@@ -237,8 +241,8 @@ pub(super) fn args() -> Vec<Arg> {
             .default_value("32")
             .help(
                 "The CPU cores of a virtual worker: the most the farm books on it at once. At \
-                 least 1. A ceiling, as for `--executor-hosts`. Used only with `--executor \
-                 js-agent`",
+                 least 1. Grown with the worker's slots, as for `--executor-hosts`. Used only \
+                 with `--executor js-agent`",
             ),
         Arg::new(MEMORY_GIB)
             .long("executor-host-memory-gib")
@@ -250,7 +254,7 @@ pub(super) fn args() -> Vec<Arg> {
                 "The memory, in GiB, of a virtual worker. The farm counts each run as 1.5 times \
                  its booking plus 512 MiB (what a Mac job needs; a Linux job names no memory and \
                  the job service sizes it from its class's history), and the bookings of a \
-                 worker add up to what is left after that. A ceiling, as for \
+                 worker add up to what is left after that. Grown with the worker's slots, as for \
                  `--executor-hosts`. Used only with `--executor js-agent`",
             ),
         Arg::new(SLOTS)
@@ -260,8 +264,17 @@ pub(super) fn args() -> Vec<Arg> {
             .default_value("8")
             .help(
                 "The most actions a virtual worker has in flight at once, reported to the farm \
-                 as its action slots. Used only with `--executor js-agent`",
+                 as its action slots: the least, as for `--executor-hosts`, up to 256. Used \
+                 only with `--executor js-agent`",
             ),
+        switch(
+            FIXED_SLOTS,
+            "executor-fixed-slots",
+            "Keeps the virtual workers at the shape the flags declare (`--executor-hosts`, \
+             `--executor-host-slots`, `--executor-host-cpus`, `--executor-host-memory-gib`): \
+             the job service's hosts are not read, and the workers are not grown to them. Off \
+             by default. Used only with `--executor js-agent`",
+        ),
         Arg::new(ARCH)
             .long("executor-arch")
             .value_name("ARCH")
@@ -455,10 +468,10 @@ pub(super) fn args() -> Vec<Arg> {
             PREPARE_LIMIT,
             "executor-prepare-limit-secs",
             "How long the inputs of one run (its action, its input tree published into the \
-             store, its keys) may take to prepare, in seconds. The `Start`'s own window ends \
-             only the submit, not the preparation, which goes on until this limit so the tree \
-             it publishes is there for the run the farm starts next. Used only with \
-             `--executor js-agent`",
+             store, its keys) may take to prepare, in seconds. A `Start` taken up inside its \
+             window is listed to the farm while it prepares, so this, not the window, bounds \
+             the preparation; a run not ready by then is an infrastructure failure the farm \
+             runs again. Used only with `--executor js-agent`",
             "300",
         ),
         Arg::new(PREPARE_CONCURRENCY)
@@ -469,8 +482,8 @@ pub(super) fn args() -> Vec<Arg> {
             .help(
                 "How many runs of one virtual worker prepare their inputs at once. The farm \
                  gives a worker a full set of `Start`s at one instant, and preparing them all \
-                 together slows each until none is ready inside its window; the ones past this \
-                 wait their turn. Used only with `--executor js-agent`",
+                 together slows each; the ones past this wait their turn, listed to the farm, \
+                 and begin as the ones before them end. Used only with `--executor js-agent`",
             ),
         Arg::new(NETWORK)
             .long("executor-network")
@@ -736,6 +749,7 @@ fn js_agent_flags(m: &ArgMatches) -> Result<JsAgentFlags, String> {
         count(MEMORY_GIB).saturating_mul(1 << 30),
     );
     config.slots = count(SLOTS);
+    config.size_from_hosts = !m.get_flag(FIXED_SLOTS);
     config.arch = one(ARCH);
     config.work_dir = m.get_one::<String>(WORK_DIR).cloned();
     if config

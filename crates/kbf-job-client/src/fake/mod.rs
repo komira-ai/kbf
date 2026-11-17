@@ -35,7 +35,9 @@
 //!   `GetLogs` of a live job answers its state with empty tails, as the service answers the
 //!   call without a stream (the one the client makes).
 //! - **Host silence shows on `GetJob`** ([`silence_host`](FakeJobServer::silence_host)) on
-//!   the placed, starting and running jobs of the host, and changes no state.
+//!   the placed, starting and running jobs of the host, and changes no state. `ListHosts`
+//!   answers each host the test added, live while heard and lost while silent, with its
+//!   machine's shape and its `os` and `arch` as capabilities.
 //! - **A network level left unspecified is `none`**, as the released service records it: a
 //!   job submitted without one is answered with `NETWORK_LEVEL_NONE`, and the two are the same
 //!   job to a repeated submit.
@@ -59,7 +61,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use js_proto::v1::{
     CancelJobRequest, GetJobRequest, GetLogsRequest, GetResultRequest, Job, JobSpec,
-    ListJobsRequest, StartFailureCode, SubmitJobRequest,
+    ListHostsRequest, ListJobsRequest, StartFailureCode, SubmitJobRequest,
 };
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
@@ -118,6 +120,8 @@ pub enum Call {
     GetResult(GetResultRequest),
     /// `GetLogs`.
     GetLogs(GetLogsRequest),
+    /// `ListHosts`.
+    ListHosts(ListHostsRequest),
 }
 
 struct Shared {

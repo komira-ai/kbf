@@ -60,10 +60,17 @@
 //!   limit: the work is done twice, and the second copy is not harmed by the first (each job
 //!   writes only its own key). The fence bounds wasted work; it does not stop a job the
 //!   service cannot be asked to cancel.
-//! - A `Start` submitted at the end of its window ([`START_VALIDITY`]) is cancelled `T` after
-//!   the farm last heard the worker, and the farm reruns the action
+//! - A `Start` taken up at the end of its window ([`START_VALIDITY`]) is listed by the heartbeat
+//!   that ends the same pass, as a job submitted then is; if the farm does not acknowledge that
+//!   heartbeat, the worker fences (its jobs cancelled, its tasks dropped) `T` after the farm last
+//!   heard it, and the farm reruns an action it never heard listed only
 //!   [`kbf_sched::fence::START_GRACE`] after the `Start`: the window, `T` and the margin stay
-//!   under it ([`Config::validate`]).
+//!   under it ([`Config::validate`]). Once listed, a `Start`'s preparation is bounded by
+//!   [`Config::prepare_limit`], not by the window.
+//! - The Linux workers' shape is the declared one at registration, and grows with the job
+//!   service's hosts ([`capacity`](super::capacity)).
+//!
+//! [`Config::prepare_limit`]: super::Config::prepare_limit
 //! - A fenced worker stays silent for `G`, by when the farm has requeued every lease it held,
 //!   and then registers again as a new process that names the old one its predecessor.
 //!
@@ -109,6 +116,9 @@ pub(super) struct HostWorker {
     generation: u32,
     stream: StreamId,
     reported: Reported,
+    /// The slots it registered with: the declared ones, or more once the executor sized it from
+    /// the job service's hosts ([`HostWorker::size_to`]).
+    slots: u64,
     inbox: Inbox,
     /// The seq of the newest heartbeat sent.
     seq: u64,
@@ -154,7 +164,8 @@ impl HostWorker {
     /// [`Config::worker_of`](super::Config::worker_of).
     pub(super) fn start_of(ctx: &Ctx<'_>, os: WorkerOs, n: usize, now: Instant) -> Self {
         let id = WorkerId::new(ctx.cfg.worker_of(os, n));
-        let (stream, instance, reported, inbox) = register(ctx, os, &id, 0, "");
+        let slots = ctx.cfg.slots;
+        let (stream, instance, reported, inbox) = register(ctx, os, &id, 0, "", slots);
         Self {
             id,
             os,
@@ -162,6 +173,7 @@ impl HostWorker {
             generation: 0,
             stream,
             reported,
+            slots,
             inbox,
             seq: 0,
             beats: VecDeque::from([(0, now)]),
@@ -292,8 +304,14 @@ impl HostWorker {
         self.inbox.close();
         self.generation += 1;
         let predecessor = std::mem::take(&mut self.instance);
-        let (stream, instance, reported, inbox) =
-            register(ctx, self.os, &self.id, self.generation, &predecessor);
+        let (stream, instance, reported, inbox) = register(
+            ctx,
+            self.os,
+            &self.id,
+            self.generation,
+            &predecessor,
+            self.slots,
+        );
         self.stream = stream;
         self.instance = instance;
         self.reported = reported;
@@ -350,6 +368,32 @@ impl HostWorker {
             .resize(&self.id, self.stream, self.reported.clone());
     }
 
+    /// Tells the farm the worker now has `slots` slots, with the cores and memory that go with
+    /// them ([`Config::hello_sized`](super::Config::hello_sized)), on its current stream: from
+    /// now on the farm places on it as many actions as that shape takes, and keeps those it
+    /// placed already whatever the new size. A Mac worker keeps the declared shape, and a
+    /// draining or silent worker is left as it is; a worker that registers again does so at the
+    /// size it has.
+    pub(super) fn size_to(&mut self, ctx: &Ctx<'_>, slots: u64) {
+        let fixed = [
+            self.os != WorkerOs::Linux,
+            self.slots == slots,
+            self.draining,
+            self.silent_until.is_some(),
+        ];
+        if fixed.into_iter().any(|fixed| fixed) {
+            return;
+        }
+        let mut sized = reported_of(ctx, self.os, &self.id, &self.instance, "", slots);
+        sized.phase = self.reported.phase.clone();
+        tracing::info!(worker = %self.id, from = self.slots, to = slots, "the worker is sized from the job service's hosts");
+        self.slots = slots;
+        self.reported = sized;
+        ctx.deps
+            .farm
+            .resize(&self.id, self.stream, self.reported.clone());
+    }
+
     /// Heartbeats the farm when one is due, and fences when the farm, or the job service while
     /// the worker may hold a job, has been silent for the fence time. The clock is read here,
     /// not taken from the start of the pass: the calls before this took as long as they took,
@@ -401,12 +445,10 @@ fn register(
     id: &WorkerId,
     generation: u32,
     predecessor: &str,
+    slots: u64,
 ) -> (StreamId, String, Reported, Inbox) {
     let instance = HostWorker::farm_instance(ctx, &id.to_string(), generation);
-    let hello = ctx.cfg.hello(os, &id.to_string(), &instance, predecessor);
-    let mut reported =
-        reported(&hello, HostFloor::DEFAULT).expect("a validated config makes a valid Hello");
-    reported.protocol = Some(PROTOCOL_VERSION);
+    let reported = reported_of(ctx, os, id, &instance, predecessor, slots);
     let welcome = ServerMessage {
         message: Some(server_message::Message::Welcome(Welcome {
             protocol_version: PROTOCOL_VERSION,
@@ -425,6 +467,25 @@ fn register(
         welcome,
     );
     (stream, instance, reported, inbox)
+}
+
+/// What the farm is told of a worker of `os` with `slots` slots: the `Hello` a real node of
+/// that shape would send, as the server reads it.
+fn reported_of(
+    ctx: &Ctx<'_>,
+    os: WorkerOs,
+    id: &WorkerId,
+    instance: &str,
+    predecessor: &str,
+    slots: u64,
+) -> Reported {
+    let hello = ctx
+        .cfg
+        .hello_sized(os, slots, &id.to_string(), instance, predecessor);
+    let mut reported =
+        reported(&hello, HostFloor::DEFAULT).expect("a validated config makes a valid Hello");
+    reported.protocol = Some(PROTOCOL_VERSION);
+    reported
 }
 
 #[cfg(test)]

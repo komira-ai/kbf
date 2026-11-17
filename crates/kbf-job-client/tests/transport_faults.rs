@@ -10,7 +10,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use js_proto::v1::{
     CancelJobRequest, GetJobRequest, GetJobResponse, GetLogsRequest, GetResultRequest, Job,
-    ListJobsRequest, ListJobsResponse, SubmitJobRequest,
+    ListHostsRequest, ListJobsRequest, ListJobsResponse, SubmitJobRequest,
 };
 use kbf_job_client::fake::{Call, FakeJobServer, Fault, TOKEN};
 use kbf_job_client::{Broken, Client, Config, Error, Token, Undecodable, Unsent};
@@ -19,13 +19,14 @@ use support::{fake, pki, server_config, spec, status_code};
 use tonic::Code;
 
 /// Every call of the client.
-const METHODS: [&str; 6] = [
+const METHODS: [&str; 7] = [
     "SubmitJob",
     "CancelJob",
     "GetJob",
     "GetResult",
     "ListJobs",
     "GetLogs",
+    "ListHosts",
 ];
 
 /// One call of `method` about the job `j`, its answer dropped.
@@ -40,6 +41,7 @@ async fn call(client: &Client, method: &str) -> Result<(), Error> {
             .await
             .map(|_| ()),
         "GetLogs" => client.get_logs("j").await.map(|_| ()),
+        "ListHosts" => client.list_hosts().await.map(|_| ()),
         other => panic!("no method {other}"),
     }
 }
@@ -59,6 +61,7 @@ fn logged(method: &str) -> Call {
             job_id,
             ..GetLogsRequest::default()
         }),
+        "ListHosts" => Call::ListHosts(ListHostsRequest {}),
         other => panic!("no method {other}"),
     }
 }

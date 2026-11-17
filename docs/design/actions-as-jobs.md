@@ -87,7 +87,14 @@ Settled by the owner and not reopened here:
   (`docs/deploy/job-service-cutover.md`).
 - In `js-agent` mode the frontend's farm (`farm.rs` over `kbf-sched`) still decides which operation runs and how often
   (deduplication, the memory ladder, `FARM_RERUNS` 2, `NOT_STARTED_RERUNS` 3). It places each lease on one of
-  `--executor-hosts` virtual workers, which hold no host; the job service decides the host (`executor/host.rs`).
+  `--executor-hosts` virtual workers, which hold no host; the job service decides the host (`executor/host.rs`). Each Linux
+  worker is grown from the job service's hosts to its share of their cores (`executor/capacity.rs`), never below the
+  declared shape.
+- A `Start` is taken up by the first pass that reads it inside its window and is listed from then on, so its preparation
+  is bounded by `--executor-prepare-limit-secs`, not by the window. A `Start` first read past its window, or whose
+  prepared job the service did not take within a window of being ready, is dropped; if no submit of it was sent, its
+  lease is reported at once as an infrastructure failure (`executor/runs.rs`), and the farm runs the action again on
+  its next pass, charged to `FARM_RERUNS`, instead of after `START_GRACE`.
 - The job today is the kbf OCI image: the farm's base image (`packaging/container/kbf-task/base-<platform>.manifest.json`)
   plus one layer holding `usr/bin/kbf-task` (`crates/xtask/src/pkg_image_asset.rs`). Its id is
   `k<8 hex>-<term>-<seq>-<attempt>` (`executor/submit.rs`; attempt 0 today), which makes the submit idempotent.

@@ -261,6 +261,31 @@ fn a_run_is_capped_as_the_container_driver_caps_it() {
     );
 }
 
+/// The capabilities `slots`, `cpus` and `mem_gib` of the `Hello` of a worker of `os` sized to
+/// `slots` slots, from [`base`] (8 slots, 16 cores, 64 GiB).
+fn sized(os: crate::executor::mac::WorkerOs, slots: u64) -> [String; 3] {
+    let hello = base().hello_sized(os, slots, "js:node1", "inst", "");
+    ["action_slots", "cpus", "mem_gib"].map(|key| {
+        let entry = hello.capabilities.iter().find(|c| c.key == key);
+        entry.expect("the capability").value.clone()
+    })
+}
+
+/// Catches a worker sized from the job service's hosts whose cores or memory do not grow with
+/// its slots (the farm would then place no more than before), one sized below the declared shape,
+/// and a Mac worker sized at all: a Linux worker of three times the declared slots has three
+/// times the cores and the memory (its booked memory less the hard-cap pad of each slot), one of
+/// fewer slots than declared is the declared shape, and a Mac worker keeps it.
+#[test]
+fn a_linux_worker_grows_its_cores_and_memory_with_its_slots() {
+    use crate::executor::mac::WorkerOs::{Linux, Mac};
+    let declared = ["8", "16", "40"].map(str::to_owned);
+    assert_eq!(sized(Linux, 8), declared);
+    assert_eq!(sized(Linux, 24), ["24", "48", "120"].map(str::to_owned));
+    assert_eq!(sized(Linux, 4), declared);
+    assert_eq!(sized(Mac, 24), declared);
+}
+
 /// Catches a Hello that places a VM lease on a host or no whole-machine lease (a driver other
 /// than `container` and `native-whole-machine`, or one of them missing), that omits the slot
 /// cap, or that carries the wrong capacity.

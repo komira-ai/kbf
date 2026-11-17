@@ -3,10 +3,19 @@
 //!
 //! A task is one farm lease. It is `Waiting` from its `Start` until the job service has
 //! answered its submit with the job, `Running` while the job is queued, placed, starting or
-//! running, `Withdrawing` once the farm cancelled it (or its window ended after a submit whose
-//! answer was lost) and until the service answers the cancel, `Ingesting` once the task tool
-//! exited 0 and the frontend reads the pack, and `Reporting` from the moment its `Result` is
-//! formed until the farm acknowledges it.
+//! running, `Withdrawing` once the farm cancelled it (or the window of its submit ended after a
+//! submit whose answer was lost) and until the service answers the cancel, `Ingesting` once the
+//! task tool exited 0 and the frontend reads the pack, and `Reporting` from the moment its
+//! `Result` is formed until the farm acknowledges it.
+//!
+//! A `Start` is taken up by the first pass that looks at it inside its window, and from then
+//! on the worker lists its lease, as a worker lists a run it started: its preparation is
+//! bounded by [`Config::prepare_limit`](super::Config::prepare_limit), not by the window, and a
+//! preparation slower than the window costs the action no new lease. A `Start` first looked at
+//! past its window, or whose prepared job the service did not take within a window of being
+//! ready, is dropped; when no submit of its job was sent, no job exists, and its lease is
+//! reported as infrastructure at once, so the farm runs the action again now and not after its
+//! start grace.
 //!
 //! A `Start` of a `whole_machine` lease takes the same path: it is submitted as a job that
 //! needs the whole host ([`Booking::WholeHost`]), and its end is read as any job's is, by the
@@ -38,7 +47,7 @@ use crate::executor::api::{answered, not_found, note};
 use crate::executor::host::HostWorker;
 use crate::executor::metrics::{IngestEnd, Metrics, RunEnd};
 use crate::executor::outcome::{
-    Settled, Verdict, drained, forgotten, judge, ran, refused, result_of,
+    Settled, Verdict, drained, forgotten, judge, ran, refused, result_of, undelivered,
 };
 use crate::executor::output::{Grants, Output, Tail};
 use crate::executor::phases::{Mark, Timeline};
@@ -79,9 +88,15 @@ pub(super) enum Stage {
 
 #[derive(Clone)]
 pub(super) struct Waiting {
-    /// Until when the `Start` may be acted on; `None` for one that names a heartbeat the
+    /// Until when the `Start` may be taken up; `None` for one that names a heartbeat the
     /// worker did not send.
     deadline: Option<Instant>,
+    /// The `Start` was taken up inside its window: its lease is listed in the heartbeats, and
+    /// the window bounds it no more.
+    pub(super) taken: bool,
+    /// Until when the submit of its prepared job may be sent: a window from the moment the job
+    /// was ready, so a service that does not take the job does not hold the lease for ever.
+    submit_by: Option<Instant>,
     /// When the heartbeat the `Start` names was sent; `None` for one the worker did not send.
     /// The drop warning gives its age.
     beat: Option<Instant>,
@@ -145,30 +160,26 @@ enum Preparing {
 
 /// What came of trying to submit a task.
 enum Submitted {
-    /// Not now: try again while the `Start` is valid.
+    /// Not now: try again on the next pass.
     Wait(Waiting),
     Running(Running),
     Settled(Settled),
-    /// The `Start`'s window ended while the task's submit was not answered, or as the job
-    /// was prepared: dropped, as one that arrived late is, after the job that may exist is
-    /// cancelled.
+    /// The window of the task's submit ended while the submit was not answered: dropped, as
+    /// a `Start` that arrived late is, after the job that may exist is cancelled.
     Late(Option<String>, Dropped),
     /// Another process holds the worker now (shared ownership): dropped, nothing submitted.
     Lost,
 }
 
-/// Where a `Start` stood when its window ended, which the warning of its drop records: the
-/// drops of a farm differ in cause (a worker given more `Start`s than it prepares at once, a
-/// preparation slower than the window, a submit that waited), and the remedies differ too.
+/// Where a `Start` stood when it was dropped, which the warning of its drop records: the
+/// drops of a farm differ in cause (a `Start` the worker first looked at past its window, a
+/// submit that waited), and the remedies differ too.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DroppedAt {
-    /// Its preparation never began: it waited for a place under `prepare_concurrency`.
+    /// It was never taken up: the first pass that looked at it found its window over.
     NotBegun,
-    /// Its preparation was still running.
-    Preparing,
-    /// Its preparation ended, but not before the window did.
-    PreparedLate,
-    /// Its job was prepared and its submit sent, but not answered inside the window.
+    /// Its job was prepared and its submit sent, but not answered inside the window of the
+    /// submit.
     SubmitUnanswered,
 }
 
@@ -176,8 +187,6 @@ impl DroppedAt {
     const fn label(self) -> &'static str {
         match self {
             Self::NotBegun => "not_begun",
-            Self::Preparing => "preparing",
-            Self::PreparedLate => "prepared_late",
             Self::SubmitUnanswered => "submit_unanswered",
         }
     }
@@ -192,16 +201,19 @@ struct Dropped {
 }
 
 impl HostWorker {
-    /// A `Start` from the farm. It is acted on only inside the window it names, counted from
-    /// the heartbeat it names, as a worker does: a `Start` that is late is dropped without a
-    /// result, and the farm, which no longer lists it, runs the lease again. A window of
-    /// zero (a server that names none) is no time at all, the safe way.
+    /// A `Start` from the farm. It is taken up only inside the window it names, counted from
+    /// the heartbeat it names, as a worker does: a `Start` that is late is dropped, and its
+    /// lease reported as infrastructure ([`HostWorker::late`]), so the farm runs the action
+    /// again at once. A window of zero (a server that names none) is no time at all, the safe
+    /// way.
     pub(super) fn accept(&mut self, start: &Start) {
         let lease = start.lease_id.unwrap_or_default();
         let window = Duration::from_millis(start.valid_for_ms).min(START_VALIDITY);
         let beat = self.sent_at(start.heartbeat_seq);
         let waiting = Waiting {
             deadline: beat.map(|sent| sent + window),
+            taken: false,
+            submit_by: None,
             beat,
             booking: Booking::of(start),
             prepared: None,
@@ -249,13 +261,23 @@ impl HostWorker {
         }
     }
 
-    /// The leases a heartbeat lists: those running, and those whose result the farm has
-    /// not acknowledged. A `Start` not yet submitted is not listed, as a worker lists only what
-    /// it started, and nor is a job being withdrawn, which the farm no longer runs here.
+    /// The leases a heartbeat lists: those taken up (preparing or submitting their job),
+    /// running, and those whose result the farm has not acknowledged, as a worker lists what it
+    /// started. A `Start` not yet taken up is not listed, and nor is a job being withdrawn,
+    /// which the farm no longer runs here.
+    ///
+    /// A `Start` is taken up inside its window, and the heartbeat that ends the same pass lists
+    /// it, as one that ends a pass lists a job submitted at the end of the window: the farm
+    /// hears the lease before its start grace, or the worker has fenced by then
+    /// ([`Config::validate`](super::Config::validate)).
     pub(super) fn listed(&self) -> Vec<LeaseId> {
         self.tasks
             .iter()
-            .filter(|(_, task)| !matches!(task.stage, Stage::Waiting(_) | Stage::Withdrawing(_)))
+            .filter(|(_, task)| match &task.stage {
+                Stage::Waiting(w) => w.taken,
+                Stage::Withdrawing(_) => false,
+                _ => true,
+            })
             .map(|(lease, _)| *lease)
             .collect()
     }
@@ -270,9 +292,8 @@ impl HostWorker {
     pub(super) async fn launch(&mut self, ctx: &Ctx<'_>, now: Instant) {
         // Once for the pass, not once for each task: the preparations begun on earlier passes
         // get the runtime before they are looked at.
-        // Once for the pass, not once for each task: the preparations begun on earlier passes
-        // get the runtime before they are looked at.
         tokio::task::yield_now().await;
+        self.take_up(ctx, now);
         let waiting: Vec<_> = self
             .tasks
             .iter()
@@ -289,18 +310,12 @@ impl HostWorker {
             if at.saturating_duration_since(now) >= ctx.cfg.pass_budget {
                 break;
             }
-            let Some(deadline) = w.deadline.filter(|deadline| at < *deadline) else {
-                let Dropped { stage, beat_age_ms } = self.dropped(lease, &w, false, at);
-                tracing::warn!(worker = %self.id, %lease, stage = %stage.label(), %beat_age_ms, "a Start outside its window is dropped");
-                self.late(ctx, lease, w.sent_job());
-                continue;
-            };
-            // Only so many preparations run at once on a worker: the rest of its `Start`s wait,
-            // so the ones that began finish inside their window instead of all of them
-            // finishing after it. A task already preparing is never held back.
+            // Only so many preparations run at once on a worker: the rest of its `Start`s wait
+            // their turn, listed, so the ones that began are not each slowed by all the rest.
+            // A task already preparing is never held back.
             let begin = self.preparing_now() < ctx.cfg.prepare_concurrency;
             self.stamp(lease, Mark::Seen, at, ctx);
-            match self.submit(ctx, lease, &action, w, deadline, begin).await {
+            match self.submit(ctx, lease, &action, w, begin).await {
                 Submitted::Wait(w) => self.set_stage(lease, Stage::Waiting(w)),
                 Submitted::Running(running) => {
                     self.stamp(lease, Mark::Posted, ctx.now(), ctx);
@@ -312,25 +327,40 @@ impl HostWorker {
                 Submitted::Lost => self.drop_task(lease),
                 Submitted::Late(job, Dropped { stage, beat_age_ms }) => {
                     tracing::warn!(worker = %self.id, %lease, stage = %stage.label(), %beat_age_ms, "a Start ran out of its window before its job was submitted and is dropped");
-                    self.late(ctx, lease, job);
+                    self.late(ctx, lease, job, at);
                 }
             }
         }
     }
 
-    /// Where `lease`'s `Start` stood at `at`, when its window ended: `ready` if its job had
-    /// just been prepared.
-    fn dropped(&self, lease: LeaseId, w: &Waiting, ready: bool, at: Instant) -> Dropped {
-        let preparing = self
+    /// Takes up every waiting `Start` inside its window, before any is submitted: a pass whose
+    /// budget ends before it reaches a `Start` still lists it, and the next pass prepares it.
+    /// One first looked at past its window is dropped.
+    fn take_up(&mut self, ctx: &Ctx<'_>, now: Instant) {
+        let untaken: Vec<_> = self
             .tasks
-            .get(&lease)
-            .is_some_and(|task| task.preparing.is_some());
-        let stage = if w.prepared.is_some() {
+            .iter()
+            .filter_map(|(lease, task)| match &task.stage {
+                Stage::Waiting(w) if !w.taken => Some((*lease, w.clone())),
+                _ => None,
+            })
+            .collect();
+        for (lease, w) in untaken {
+            if w.deadline.is_some_and(|deadline| now < deadline) {
+                let taken = Waiting { taken: true, ..w };
+                self.set_stage(lease, Stage::Waiting(taken));
+                continue;
+            }
+            let Dropped { stage, beat_age_ms } = self.dropped(&w, now);
+            tracing::warn!(worker = %self.id, %lease, stage = %stage.label(), %beat_age_ms, "a Start outside its window is dropped");
+            self.late(ctx, lease, None, now);
+        }
+    }
+
+    /// Where `w`'s `Start` stood at `at`, when it was dropped.
+    fn dropped(&self, w: &Waiting, at: Instant) -> Dropped {
+        let stage = if w.taken {
             DroppedAt::SubmitUnanswered
-        } else if ready {
-            DroppedAt::PreparedLate
-        } else if preparing {
-            DroppedAt::Preparing
         } else {
             DroppedAt::NotBegun
         };
@@ -350,13 +380,16 @@ impl HostWorker {
             .count()
     }
 
-    /// Drops a `Start` whose window ended: at once if no job of it may exist, else once the
-    /// job is cancelled.
-    fn late(&mut self, ctx: &Ctx<'_>, lease: LeaseId, job: Option<String>) {
+    /// Drops a `Start` whose window ended. If a submit of its job was sent, the job may exist:
+    /// it is cancelled, and the lease forgotten once the service answers, as a job the farm
+    /// cancelled is. If none was sent, no job exists and nothing ran: the lease is reported at
+    /// once as infrastructure, and the farm runs the action again now instead of after its
+    /// start grace. The task leaves `Waiting`, so no submit of it is sent after.
+    fn late(&mut self, ctx: &Ctx<'_>, lease: LeaseId, job: Option<String>, at: Instant) {
         ctx.deps.metrics.late_start();
         match job {
             Some(job) => self.set_stage(lease, Stage::Withdrawing(job)),
-            None => self.drop_task(lease),
+            None => self.settle_with(lease, &undelivered(), at, &ctx.deps.metrics),
         }
     }
 
@@ -384,11 +417,8 @@ impl HostWorker {
     }
 
     /// The preparation of `lease`'s job: begun on its own task if it has none, and waited for
-    /// for one poll at most. One that ends after the window is judged late by the caller.
-    ///
-    /// A preparation that outlasts the window is not stopped with it: it goes on, bounded by
-    /// [`Config::prepare_limit`], so the input tree it publishes is there, and the memo of the
-    /// writer holds it, when the farm runs the action again.
+    /// for one poll at most. It is bounded by [`Config::prepare_limit`], not by the `Start`'s
+    /// window: the `Start` was taken up, and its lease is listed while it prepares.
     async fn preparing(
         &mut self,
         ctx: &Ctx<'_>,
@@ -444,8 +474,7 @@ impl HostWorker {
         ctx: &Ctx<'_>,
         lease: LeaseId,
         action: &Digest,
-        w: Waiting,
-        deadline: Instant,
+        mut w: Waiting,
         begin: bool,
     ) -> Submitted {
         // What preparing reads (the CAS, the store, the grant service) is not the job
@@ -464,11 +493,13 @@ impl HostWorker {
                 Preparing::Failed(settled) => return Submitted::Settled(settled),
             },
         };
-        // The CAS read, the url and the grant each took as long as the store took: the window
-        // is judged by the clock now, the last moment before the submit.
+        // The submit's window runs from the moment the job was ready, and is judged by the clock
+        // now, the last moment before the submit: a job the service has not taken by its end
+        // is given up, and the farm runs the action again.
         let now = ctx.now();
-        if now >= deadline {
-            let dropped = self.dropped(lease, &w, true, now);
+        let submit_by = *w.submit_by.get_or_insert(now + START_VALIDITY);
+        if now >= submit_by {
+            let dropped = self.dropped(&w, now);
             return Submitted::Late(w.sent_job(), dropped);
         }
         // With shared ownership the row goes in before the job: a process that ends after the

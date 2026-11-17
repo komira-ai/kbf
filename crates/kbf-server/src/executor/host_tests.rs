@@ -38,7 +38,7 @@ fn submits(harness: &Harness) -> usize {
 /// Catches a `Start` acted on that names a heartbeat the worker never sent (a worker refuses
 /// it: it may be a copy from another stream), and one with no window (a server that sent none
 /// bounds nothing, which here is read as no time at all, the safe way): neither is submitted,
-/// and neither is kept.
+/// and each is reported at once as infrastructure, so the farm runs it again.
 #[tokio::test(start_paused = true)]
 async fn a_start_outside_what_it_names_is_dropped_unsubmitted() {
     let harness = Harness::new().await;
@@ -60,7 +60,8 @@ async fn a_start_outside_what_it_names_is_dropped_unsubmitted() {
         .send(message(server_message::Message::Start(no_window)))
         .expect("sent");
     worker.step(&harness.ctx(), Instant::now()).await;
-    assert!(worker.tasks.is_empty());
+    let stages = [1, 2].map(|seq| stage_of(&worker, LeaseId::new(1, seq)));
+    assert_eq!(stages, ["reporting", "reporting"]);
     assert!(harness.fake.calls().is_empty());
     assert!(harness.fake.jobs().is_empty());
 }
@@ -190,4 +191,49 @@ async fn a_worker_that_holds_no_job_is_not_fenced_by_the_job_services_silence() 
     assert!(worker.seq > 1);
     assert_eq!(worker.generation, 0, "registered again");
     assert!(harness.fake.calls().is_empty());
+}
+
+/// The cores, in thousandths, the farm holds for `worker`.
+fn farm_cpu(harness: &Harness, worker: &HostWorker) -> u64 {
+    let detail = harness.farm.node_detail(&worker.id).expect("read");
+    detail
+        .expect("the farm knows the worker")
+        .capacity
+        .cpu_millis
+}
+
+/// Catches a size the farm is not told, or one told to a worker that keeps its shape: a Linux
+/// worker of 2 slots and 2 cores sized to 6 slots is a node of 6 cores in the farm, and its next
+/// registration is at that size too; a Mac worker, a draining one and a silent one keep the
+/// declared shape, and a size equal to the worker's tells the farm nothing new.
+#[tokio::test(start_paused = true)]
+async fn a_linux_worker_is_resized_in_the_farm_and_keeps_its_size_when_it_registers_again() {
+    let harness = Harness::new().await;
+    let ctx = harness.ctx();
+    let now = Instant::now();
+    let mut linux = HostWorker::start(&ctx, 0, now);
+    assert_eq!(farm_cpu(&harness, &linux), 2_000);
+    linux.size_to(&ctx, 6);
+    assert_eq!((linux.slots, farm_cpu(&harness, &linux)), (6, 6_000));
+    linux.size_to(&ctx, 6);
+    assert_eq!((linux.slots, farm_cpu(&harness, &linux)), (6, 6_000));
+    linux.register_again(&ctx, now);
+    assert_eq!(farm_cpu(&harness, &linux), 6_000);
+
+    let mut mac = HostWorker::start_of(&ctx, crate::executor::mac::WorkerOs::Mac, 0, now);
+    mac.size_to(&ctx, 6);
+    let mut draining = HostWorker::start(&ctx, 1, now);
+    draining.begin_drain(&ctx);
+    draining.size_to(&ctx, 6);
+    let mut silent = HostWorker::start(&ctx, 2, now);
+    silent.silent_until = Some(now + Duration::from_secs(60));
+    silent.size_to(&ctx, 6);
+    for kept in [&mac, &draining, &silent] {
+        assert_eq!(
+            (kept.slots, farm_cpu(&harness, kept)),
+            (2, 2_000),
+            "{}",
+            kept.id
+        );
+    }
 }

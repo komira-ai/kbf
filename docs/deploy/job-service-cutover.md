@@ -29,7 +29,7 @@ The switch sets exactly these keys and leaves every other line of the file as it
 | `executor-hosts` | how many virtual workers the frontend registers, `js:<frontend id>-<n>` |
 | `executor-host-cpus` | the cores of each virtual worker |
 | `executor-host-memory-gib` | the memory of each virtual worker, in GiB |
-| `executor-host-slots` | the actions each virtual worker runs at once (default 8) |
+| `executor-host-slots` | the actions each virtual worker runs at once (default 8): the least, as the executor grows the Linux workers to the job service's hosts unless `executor-fixed-slots` is set |
 
 The rest of what `js-agent` needs must be in the file already, and the switch does not write
 it: `executor-frontend-id`, `executor-base-image`, `executor-kbf-image`, `executor-base-tree`

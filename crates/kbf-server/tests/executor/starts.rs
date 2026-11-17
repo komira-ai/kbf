@@ -205,13 +205,13 @@ async fn a_late_start_never_runs_twice() {
     assert_eq!(rig.counter("kbf_executor_late_starts_total"), 1);
 }
 
-/// Catches a `Start` submitted past its window because the window was judged once, at the
-/// start of the pass, and the read of the action then took longer than the window left (a slow
-/// CAS): the farm has given the lease up and runs it again, so the late job would run beside
-/// its retry. The clock is read again just before the submit, the `Start` is dropped, and the
-/// action runs once, after the farm requeues it.
+/// Catches a `Start` dropped because its preparation was slower than its window (a slow CAS):
+/// the farm then gave the lease up only after its start grace, and every such action paid a
+/// whole second attempt. The `Start` is taken up inside its window and listed while its inputs
+/// take 20 s, past the window; its job is submitted on the same lease, the farm, which hears
+/// the lease listed, never gives it up, and the action runs once with no late `Start`.
 #[tokio::test(start_paused = true)]
-async fn a_start_whose_inputs_were_slow_is_not_submitted_past_its_window() {
+async fn a_start_whose_inputs_outlast_its_window_runs_once_on_its_lease() {
     use std::sync::atomic::Ordering;
     let mut rig = Rig::start(&[HOST], 1, |_| {}).await;
     rig.pump().await;
@@ -228,27 +228,29 @@ async fn a_start_whose_inputs_were_slow_is_not_submitted_past_its_window() {
     };
     tokio::join!(exec.step(), slow);
     rig.inputs.hold.store(false, Ordering::SeqCst);
-    assert!(
-        rig.jobs().is_empty(),
-        "a Start was submitted 20 s after its 14 s window"
-    );
-    assert!(submits(&rig.fake.calls()).is_empty());
-    rig.elapse(70).await;
+    rig.pump().await;
     let jobs = rig.jobs_of(1);
     assert_eq!(jobs.len(), 1, "{jobs:?}");
+    // Past the farm's start grace: the lease was listed, so it is not given up.
+    rig.elapse(70).await;
+    assert_eq!(rig.jobs_of(1).len(), 1, "the farm ran the action again");
     rig.host_finishes(jobs[0].id(), HOST, 0);
     assert!(matches!(rig.until_done(&caller, 6).await, Finished::Ran(_)));
-    assert_eq!(rig.jobs_of(1).len(), 1, "the action ran once");
-    assert_eq!(rig.counter("kbf_executor_late_starts_total"), 1);
+    assert_eq!(submits(&rig.fake.calls()).len(), 1);
+    assert_eq!(rig.counter("kbf_executor_late_starts_total"), 0);
 }
 
 /// Catches a read of the CAS that never answers holding the pass, and with it the heartbeats
-/// and the fence: the read is given the `Start`'s window and no more, after which the
-/// `Start` is dropped, as one that arrived late is.
+/// and the fence, or holding the lease for ever: the pass goes on past the window, and the run
+/// is failed as infrastructure at `prepare_limit`, which the farm runs again at once on a new
+/// lease; that run reads the CAS, which answers, and the action runs once.
 #[tokio::test(start_paused = true)]
-async fn a_cas_that_never_answers_is_given_the_window_and_no_more() {
+async fn a_cas_that_never_answers_holds_no_pass_and_fails_the_run_at_the_prepare_limit() {
     use std::sync::atomic::Ordering;
-    let mut rig = Rig::start(&[HOST], 1, |_| {}).await;
+    let mut rig = Rig::start(&[HOST], 1, |cfg| {
+        cfg.prepare_limit = Duration::from_secs(20);
+    })
+    .await;
     rig.pump().await;
     let caller = rig.submit(1);
     rig.farm.tick().await;
@@ -258,11 +260,77 @@ async fn a_cas_that_never_answers_is_given_the_window_and_no_more() {
     rig.inputs.hold.store(false, Ordering::SeqCst);
     assert!(in_time, "the pass waited for the CAS past the window");
     assert!(rig.jobs().is_empty());
-    rig.elapse(70).await;
+    rig.elapse(10).await;
     let jobs = rig.jobs_of(1);
     assert_eq!(jobs.len(), 1, "{jobs:?}");
+    assert_eq!(rig.counter("kbf_executor_runs_total{outcome=\"infra\"}"), 1);
     rig.host_finishes(jobs[0].id(), HOST, 0);
     assert!(matches!(rig.until_done(&caller, 6).await, Finished::Ran(_)));
+    assert_eq!(rig.jobs_of(1).len(), 1, "the action ran twice");
+}
+
+/// The `Start` of the action of `tag` the farm places now, delivered to the worker and left
+/// unread until its window has ended: the executor is not stepped for 15 s.
+async fn a_start_seen_late(rig: &mut Rig) {
+    rig.farm.tick().await;
+    settle().await;
+    rig.advance(Duration::from_secs(15)).await;
+    rig.exec.step().await;
+    settle().await;
+}
+
+/// Catches a dropped `Start` that leaves its lease to the farm's start grace: a `Start` the
+/// worker first reads past its window, before anything of it was submitted, is reported at
+/// once as infrastructure, so the farm runs the action again on a new lease within the next
+/// steps (here 5 s of the held clock, where the grace is 60 s), and the action runs once: the
+/// late lease never had a job.
+#[tokio::test(start_paused = true)]
+async fn a_start_seen_past_its_window_is_run_again_at_once_and_only_once() {
+    let mut rig = Rig::start(&[HOST], 1, |_| {}).await;
+    rig.pump().await;
+    let caller = rig.submit(1);
+    a_start_seen_late(&mut rig).await;
+    assert!(rig.jobs().is_empty(), "the late Start was submitted");
+    assert_eq!(rig.counter("kbf_executor_late_starts_total"), 1);
+    rig.elapse(5).await;
+    let jobs = rig.jobs_of(1);
+    assert_eq!(
+        jobs.len(),
+        1,
+        "the farm did not run the action again: {jobs:?}"
+    );
+    rig.host_finishes(jobs[0].id(), HOST, 0);
+    assert!(matches!(rig.until_done(&caller, 6).await, Finished::Ran(_)));
+    assert_eq!(submits(&rig.fake.calls()).len(), 1, "the action ran twice");
+    assert_eq!(rig.counter("kbf_executor_runs_total{outcome=\"infra\"}"), 1);
+    assert_eq!(rig.counter("kbf_executor_late_starts_total"), 1);
+}
+
+/// Asserts what a late `Start` costs an operation: each is a farm rerun, so an action whose
+/// `Start`s are all read past their window ends as an infrastructure failure (INTERNAL, its
+/// farm reruns used up) at its third, and never had a job. Catches a late `Start` that is rerun without
+/// end.
+#[tokio::test(start_paused = true)]
+async fn an_action_whose_starts_are_all_late_fails_after_the_farm_reruns() {
+    let mut rig = Rig::start(&[HOST], 1, |_| {}).await;
+    rig.pump().await;
+    let caller = rig.submit(1);
+    for _ in 0..3 {
+        a_start_seen_late(&mut rig).await;
+        rig.farm.tick().await;
+        settle().await;
+    }
+    let finished = rig.until_done(&caller, 4).await;
+    assert_eq!(code(&finished), Code::Internal, "{finished:?}");
+    let Finished::Failed(status) = &finished else {
+        unreachable!("a failure, as its code says");
+    };
+    assert!(
+        status.message.contains("its reruns are used up") && status.message.contains("Runs: 3 "),
+        "{status:?}"
+    );
+    assert!(rig.jobs().is_empty());
+    assert_eq!(rig.counter("kbf_executor_late_starts_total"), 3);
 }
 
 /// Catches a pass that starts every waiting task however long the first ones take: the

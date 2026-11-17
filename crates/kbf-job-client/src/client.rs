@@ -12,8 +12,9 @@ use std::time::Duration;
 use http::uri::PathAndQuery;
 use js_proto::v1::{
     CancelJobRequest, CancelJobResponse, GetJobRequest, GetJobResponse, GetLogsRequest,
-    GetLogsResponse, GetResultRequest, GetResultResponse, Job, JobResult, JobSpec, ListJobsRequest,
-    ListJobsResponse, LogStream, SubmitJobRequest, SubmitJobResponse,
+    GetLogsResponse, GetResultRequest, GetResultResponse, Host, Job, JobResult, JobSpec,
+    ListHostsRequest, ListHostsResponse, ListJobsRequest, ListJobsResponse, LogStream,
+    SubmitJobRequest, SubmitJobResponse,
 };
 use prost::Message;
 use tonic::Status;
@@ -33,6 +34,7 @@ const LIST_JOBS: &str = "/jobscheduler.v1.JobService/ListJobs";
 const CANCEL_JOB: &str = "/jobscheduler.v1.JobService/CancelJob";
 const GET_RESULT: &str = "/jobscheduler.v1.JobService/GetResult";
 const GET_LOGS: &str = "/jobscheduler.v1.JobService/GetLogs";
+const LIST_HOSTS: &str = "/jobscheduler.v1.JobService/ListHosts";
 
 /// A client of one job service. Cheap to clone; the clones share one channel, so any number
 /// of calls may be in flight at once.
@@ -232,6 +234,18 @@ impl Client {
             follow: None,
         };
         self.call(GET_LOGS, request).await
+    }
+
+    /// The service's hosts (`ListHosts`), by id: each with its state, its shape, its
+    /// capabilities and what sets it aside from placement (a mark, a cordon, a taint), as an
+    /// operator reads them. Changes nothing, so it may be repeated after any error.
+    ///
+    /// # Errors
+    /// The status of a service that does not let this client read its hosts
+    /// (`PERMISSION_DENIED`, `UNIMPLEMENTED`), and the transport errors.
+    pub async fn list_hosts(&self) -> Result<Vec<Host>, Error> {
+        let answer: ListHostsResponse = self.call(LIST_HOSTS, ListHostsRequest {}).await?;
+        Ok(answer.hosts)
     }
 
     /// One call of the method at `path`: the request checked against the size cap, the token

@@ -38,6 +38,7 @@
 //! [`FrontendHandle::serve`](crate::frontend::FrontendHandle::serve) until the frontend stops.
 
 mod api;
+mod capacity;
 mod config;
 mod driver;
 mod front;
@@ -72,6 +73,7 @@ use kbf_types::WorkerId;
 use tokio::time::Instant;
 
 use crate::Farm;
+use capacity::Sizing;
 use host::HostWorker;
 use pool::{Adopted, Adoption};
 use share::Share;
@@ -187,6 +189,8 @@ pub struct Executor {
     flagged: Twin,
     /// The process's rows, with shared ownership.
     share: Option<Share>,
+    /// The size of the Linux workers, from the job service's hosts.
+    sizing: Sizing,
 }
 
 impl Executor {
@@ -204,6 +208,7 @@ impl Executor {
             (true, None) => return Err(ConfigError::SharedStore),
         };
         Ok(Self {
+            sizing: Sizing::new(cfg.slots),
             cfg,
             deps,
             workers: Vec::new(),
@@ -327,6 +332,7 @@ impl Executor {
                 share: Some(share),
             };
             share.open(&ctx, &mut self.workers, now);
+            size(&ctx, &mut self.sizing, &mut self.workers, now).await;
             join_all(self.workers.iter_mut().map(|worker| worker.step(&ctx, now))).await;
             return;
         }
@@ -351,6 +357,7 @@ impl Executor {
                 }
             }
         }
+        size(&ctx, &mut self.sizing, &mut self.workers, now).await;
         join_all(self.workers.iter_mut().map(|worker| worker.step(&ctx, now))).await;
         self.twin = self.flagged.take();
     }
@@ -375,6 +382,19 @@ impl Executor {
         self.adoption = Adoption::Unread;
         self.twin = None;
         self.flagged.take();
+    }
+}
+
+/// Reads the job service's hosts when it is time to, and gives each worker the size they make
+/// ([`capacity`]): a worker registered since the last read gets it too. Nothing is read with
+/// `--executor-fixed-slots`, and the workers keep the declared shape.
+async fn size(ctx: &Ctx<'_>, sizing: &mut Sizing, workers: &mut [HostWorker], now: Instant) {
+    if !ctx.cfg.size_from_hosts {
+        return;
+    }
+    sizing.check(ctx, now).await;
+    for worker in workers {
+        worker.size_to(ctx, sizing.slots);
     }
 }
 
